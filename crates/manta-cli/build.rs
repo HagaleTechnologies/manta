@@ -2,7 +2,8 @@
 //! build: a Docker context (`.dockerignore` excludes `.git`) or a source
 //! tarball has no git metadata and reports "unknown" -- as does one unpacked
 //! beneath an unrelated repository, whose HEAD is not manta's commit (MAN-83:
-//! git's top level must be this workspace's root). `MANTA_GIT_SHA`
+//! git's top level must be this workspace's root, and an inherited
+//! `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR` is ignored). `MANTA_GIT_SHA`
 //! overrides (for release images that pass it as a build-arg).
 //!
 //! MAN-83: the same commit also feeds `manta --version` and the JSON
@@ -13,8 +14,8 @@
 //! 12 and lowercased, so it matches a native build of that commit; any
 //! other override, such as a long numeric build ID, is kept as given.
 //! This script also exports `MANTA_FEATURES`, the compiled-in Cargo feature
-//! list, derived from Cargo's `CARGO_FEATURE_*` variables and never read
-//! from the environment. Both names are still on `config.rs`'s
+//! list, derived from `CARGO_CFG_FEATURE` (see `compiled_features`); it
+//! never reads `MANTA_FEATURES` itself. Both names are still on `config.rs`'s
 //! `ENV_IGNORED`: `cargo run` and `cargo test` export every `rustc-env`
 //! value into the processes they start, and MAN-261 rejects unknown
 //! `MANTA_*` names. A valid override also sets the `manta_git_sha_override`
@@ -22,8 +23,27 @@
 //! the runtime environment cannot tell them, for the same export reason.
 use std::process::Command;
 
+/// MAN-83: the variables that choose which repository's HEAD git reads and
+/// which top level it reports, overriding discovery from its working
+/// directory. HEAD and the refs it names live in `GIT_DIR` and
+/// `GIT_COMMON_DIR`, and `GIT_WORK_TREE` sets the top level
+/// `in_own_checkout` checks, so a build inheriting `GIT_DIR` and
+/// `GIT_WORK_TREE` for another repository whose work tree is this workspace
+/// would pass that check and embed the other repository's HEAD.
+pub const REPO_ENV_VARS: [&str; 3] = ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"];
+
+/// `git` with `REPO_ENV_VARS` cleared, so it finds the repository by
+/// discovery alone. `pub` for tests/build_identity.rs.
+pub fn git_command() -> Command {
+    let mut cmd = Command::new("git");
+    for var in REPO_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 fn git(args: &[&str]) -> Option<String> {
-    let out = Command::new("git").args(args).output().ok()?;
+    let out = git_command().args(args).output().ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -122,25 +142,28 @@ fn main() {
         }
     }
     println!("cargo:rustc-env=MANTA_GIT_SHA={sha}");
+    println!("cargo:rustc-env=MANTA_FEATURES={}", compiled_features());
+}
 
-    // MAN-83: compiled-in optional features, for `--version` and
-    // `manta_build_info`. Cargo sets CARGO_FEATURE_<NAME> for each enabled
-    // feature and reruns this script when the set changes. `vars_os`, not
-    // `vars`: the latter panics on any non-UTF-8 name or value the build
-    // inherits, while the keys Cargo sets here are always UTF-8.
-    let mut features: Vec<String> = std::env::vars_os()
-        .filter_map(|(k, _)| {
-            k.to_str()?
-                .strip_prefix("CARGO_FEATURE_")
-                .map(|f| f.to_ascii_lowercase().replace('_', "-"))
-        })
-        .filter(|f| f != "default")
+/// MAN-83: compiled-in optional features, for `--version` and
+/// `manta_build_info`, from `CARGO_CFG_FEATURE` -- the `feature` cfg values
+/// Cargo compiles the crate with. Not from `CARGO_FEATURE_<NAME>`: Cargo
+/// sets one per enabled feature but also passes through any the build
+/// inherits, so `CARGO_FEATURE_SOAPY=1 cargo build` would list soapy
+/// without compiling it. Cargo (1.98, measured) sets `CARGO_CFG_FEATURE`
+/// for every build script, empty when no feature is on, replacing an
+/// inherited value, and reruns this script when the set changes. `pub` for
+/// tests/build_identity.rs.
+pub fn compiled_features() -> String {
+    let cfg = std::env::var("CARGO_CFG_FEATURE").unwrap_or_default();
+    let mut features: Vec<&str> = cfg
+        .split(',')
+        .filter(|f| !f.is_empty() && *f != "default")
         .collect();
-    features.sort();
-    let features = if features.is_empty() {
+    features.sort_unstable();
+    if features.is_empty() {
         "none".to_string()
     } else {
         features.join(",")
-    };
-    println!("cargo:rustc-env=MANTA_FEATURES={features}");
+    }
 }

@@ -22,7 +22,7 @@ fn manta() -> Command {
 }
 
 /// What rustc compiled this test crate with, independent of build.rs's
-/// CARGO_FEATURE_* scan. Extend when manta-cli gains a feature.
+/// `CARGO_CFG_FEATURE` read. Extend when manta-cli gains a feature.
 fn expected_features() -> String {
     let on: Vec<&str> = [
         ("hpsdr", cfg!(feature = "hpsdr")),
@@ -43,11 +43,13 @@ fn expected_features() -> String {
 /// or when build.rs's own check finds the repository is not manta's (it then
 /// embeds unknown). `build_script_ignores_an_enclosing_repository` covers
 /// that check, so a check that always failed could not skip this one quietly.
+/// Run through build.rs's `git_command`, which ignores an exported
+/// `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR` as build.rs did.
 fn checkout_head() -> Option<String> {
     if !build_script::in_own_checkout(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))) {
         return None;
     }
-    let out = Command::new("git")
+    let out = build_script::git_command()
         .args([
             "-C",
             env!("CARGO_MANIFEST_DIR"),
@@ -106,11 +108,15 @@ mod build_script;
 /// A source tree with no `.git` of its own (an unpacked archive, a vendored
 /// copy) built beneath an unrelated repository must not take that
 /// repository's HEAD as manta's commit; a checkout rooted at the workspace
-/// root still counts. Skipped when git is unavailable, or when an exported
-/// `GIT_DIR`/`GIT_WORK_TREE` replaces the discovery this test exercises.
+/// root still counts. Skipped when git is unavailable, or when this process
+/// exports one of `build_script::REPO_ENV_VARS`, which the setup's own git
+/// commands would then follow.
 #[test]
 fn build_script_ignores_an_enclosing_repository() {
-    if std::env::var_os("GIT_DIR").is_some() || std::env::var_os("GIT_WORK_TREE").is_some() {
+    if build_script::REPO_ENV_VARS
+        .iter()
+        .any(|v| std::env::var_os(v).is_some())
+    {
         return;
     }
     let outer = tempfile::tempdir().unwrap();
@@ -144,6 +150,154 @@ fn build_script_ignores_an_enclosing_repository() {
         build_script::in_own_checkout(&crate_dir),
         "a checkout rooted at the workspace root was rejected"
     );
+}
+
+/// Runs the `#[ignore]`d test `name` in a child process of this test
+/// binary with `envs` added, so a build.rs function sees an inherited
+/// environment that other tests, running in parallel here, must not.
+/// "1 passed" catches a misspelt `name`, which would run nothing.
+fn run_child_test(name: &str, envs: &[(&str, &std::ffi::OsStr)]) {
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--ignored"])
+        .envs(envs.iter().copied())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "{name}: {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A build that inherits `GIT_DIR` and `GIT_WORK_TREE` for another
+/// repository whose work tree is manta's workspace must not take that
+/// repository's HEAD, with or without a `.git` of manta's own. Skipped
+/// when git is unavailable, or when this process already exports the
+/// variables, which the setup's own git commands would then follow.
+#[test]
+fn build_script_ignores_exported_repository_variables() {
+    if build_script::REPO_ENV_VARS
+        .iter()
+        .any(|v| std::env::var_os(v).is_some())
+    {
+        return;
+    }
+    let git_ok = |at: &std::path::Path, args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(at)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let other = tempfile::tempdir().unwrap();
+    if !git_ok(other.path(), &["init", "-q"])
+        || !git_ok(
+            other.path(),
+            &["commit", "-q", "--allow-empty", "-m", "other"],
+        )
+    {
+        return;
+    }
+    let src = tempfile::tempdir().unwrap();
+    let workspace = src.path().join("manta-src");
+    let crate_dir = workspace.join("crates").join("manta-cli");
+    std::fs::create_dir_all(&crate_dir).unwrap();
+    let other_git_dir = other.path().join(".git");
+    // Precondition: plain git, given these variables, takes the other
+    // repository for one rooted at the workspace root.
+    let cdup = Command::new("git")
+        .arg("-C")
+        .arg(&crate_dir)
+        .args(["rev-parse", "--show-cdup"])
+        .env("GIT_DIR", &other_git_dir)
+        .env("GIT_WORK_TREE", &workspace)
+        .output()
+        .unwrap();
+    assert!(cdup.status.success(), "{cdup:?}");
+    assert_eq!(String::from_utf8_lossy(&cdup.stdout).trim(), "../../");
+    let envs = [
+        ("GIT_DIR", other_git_dir.as_os_str()),
+        ("GIT_WORK_TREE", workspace.as_os_str()),
+        ("BUILD_IDENTITY_CRATE_DIR", crate_dir.as_os_str()),
+    ];
+    // An unpacked archive: no `.git` of its own, so no commit to report.
+    run_child_test("exported_repository_variables_child", &envs);
+    // A checkout of its own: its HEAD, not the other repository's.
+    assert!(git_ok(&workspace, &["init", "-q"]));
+    assert!(git_ok(
+        &workspace,
+        &["commit", "-q", "--allow-empty", "-m", "manta"]
+    ));
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(&workspace)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(head.status.success(), "{head:?}");
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    let mut envs = envs.to_vec();
+    envs.push(("BUILD_IDENTITY_HEAD", std::ffi::OsStr::new(&head)));
+    run_child_test("exported_repository_variables_child", &envs);
+}
+
+/// Child half of `build_script_ignores_exported_repository_variables`,
+/// which supplies the environment; a no-op without it.
+#[test]
+#[ignore = "run by build_script_ignores_exported_repository_variables"]
+fn exported_repository_variables_child() {
+    let Some(crate_dir) = std::env::var_os("BUILD_IDENTITY_CRATE_DIR") else {
+        return;
+    };
+    let crate_dir = std::path::Path::new(&crate_dir);
+    let Ok(want) = std::env::var("BUILD_IDENTITY_HEAD") else {
+        assert!(
+            !build_script::in_own_checkout(crate_dir),
+            "an exported GIT_DIR/GIT_WORK_TREE was taken for manta's checkout"
+        );
+        return;
+    };
+    assert!(build_script::in_own_checkout(crate_dir));
+    let out = build_script::git_command()
+        .arg("-C")
+        .arg(crate_dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), want);
+}
+
+/// Cargo passes an inherited `CARGO_FEATURE_*` through to build scripts, so
+/// `CARGO_FEATURE_SOAPY=1 cargo build` must not list soapy uncompiled. The
+/// child sees what Cargo sets for an hpsdr-only build plus a leaked soapy.
+#[test]
+fn build_script_ignores_inherited_feature_variables() {
+    let one = std::ffi::OsStr::new("1");
+    run_child_test(
+        "inherited_feature_variables_child",
+        &[
+            ("CARGO_CFG_FEATURE", std::ffi::OsStr::new("hpsdr")),
+            ("CARGO_FEATURE_HPSDR", one),
+            ("CARGO_FEATURE_SOAPY", one),
+            ("BUILD_IDENTITY_FEATURES", std::ffi::OsStr::new("hpsdr")),
+        ],
+    );
+}
+
+/// Child half of `build_script_ignores_inherited_feature_variables`; a
+/// no-op without its environment.
+#[test]
+#[ignore = "run by build_script_ignores_inherited_feature_variables"]
+fn inherited_feature_variables_child() {
+    let Ok(want) = std::env::var("BUILD_IDENTITY_FEATURES") else {
+        return;
+    };
+    assert_eq!(build_script::compiled_features(), want);
 }
 
 /// Kills and reaps the daemon on drop, including on a failing assertion, so

@@ -49,7 +49,7 @@ mod tests {
         );
     }
 
-    /// build.rs derives the list from `CARGO_FEATURE_*`; this is what rustc
+    /// build.rs derives the list from `CARGO_CFG_FEATURE`; this is what rustc
     /// itself compiled the crate with. Extend when manta-cli gains a feature.
     #[test]
     fn features_agree_with_the_cfg_flags_rustc_saw() {
@@ -76,7 +76,7 @@ mod tests {
         let build_rs = include_str!("../build.rs");
         assert!(
             !build_rs.contains("env::vars()"),
-            "build.rs must scan the environment with env::vars_os()"
+            "build.rs must not decode the whole environment with env::vars()"
         );
     }
 

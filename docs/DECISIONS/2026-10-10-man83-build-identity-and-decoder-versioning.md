@@ -26,15 +26,19 @@ MAN-128 (`2026-10-05-man128-node-health-metrics.md`, D5) had already added
   `shadow-rs` each need a `[build-dependencies]` entry in the CODEOWNERS-gated
   `crates/manta-cli/Cargo.toml` and `Cargo.lock`, and none adds anything over
   the existing hand-rolled script. The feature list is about 15 lines over
-  `CARGO_FEATURE_*`.
+  `CARGO_CFG_FEATURE`.
 - **D2 — one source of truth, `crates/manta-cli/src/build_info.rs`.** It holds
   `VERSION`, `GIT_SHA`, `FEATURES`, `VERSION_LINE` and `DECODER_VERSION`, all
   compile-time `concat!(env!(...))` constants. `--version`,
   `daemon_build_info()` (the `manta_build_info` gauge) and the JSON stream's
   `decoderVersion` all read it, so they cannot drift. The feature list comes
-  from `build.rs` (generic over `CARGO_FEATURE_*`, sorted, `default`
+  from `build.rs` (generic over `CARGO_CFG_FEATURE`, sorted, `default`
   excluded, `none` when empty) rather than a hand-kept `cfg!` list, so a new
-  feature appears without a code change. A unit test cross-checks it against
+  feature appears without a code change. It reads `CARGO_CFG_FEATURE`, not
+  `CARGO_FEATURE_*`: Cargo passes an inherited `CARGO_FEATURE_SOAPY=1`
+  through to the build script, which would list a backend that was never
+  compiled, while it always sets `CARGO_CFG_FEATURE` itself (empty when no
+  feature is on). A unit test cross-checks it against
   `cfg!` for the features that exist.
 - **D3 — no build date, no dirty flag.** A date makes two builds of one commit
   differ, and the ticket does not ask for one (R-13 did; the ticket narrowed
@@ -135,7 +139,9 @@ MAN-128 (`2026-10-05-man128-node-health-metrics.md`, D5) had already added
   or `unknown`. `build.rs` takes the commit from git only when git's top
   level is the workspace root, so a source tree with no `.git` of its own,
   built beneath some other repository, reports `unknown` rather than that
-  repository's HEAD. `<list>` is the sorted, comma-separated compiled-in Cargo
+  repository's HEAD. Its git calls also clear an inherited `GIT_DIR`,
+  `GIT_WORK_TREE` and `GIT_COMMON_DIR`, which could otherwise point that
+  check and the HEAD lookup at another repository. `<list>` is the sorted, comma-separated compiled-in Cargo
   features, or `none`, and is the same string as `manta_build_info`'s
   `features` label.
 - JSON spot `decoderVersion`: `manta-<version>+<sha>`, for example
