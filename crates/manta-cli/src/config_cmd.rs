@@ -703,18 +703,25 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manta.toml");
+        // Absolute on every OS: "/etc/manta/notch.txt" has no drive prefix,
+        // so Windows treats it as relative and joins it onto the config dir.
+        let notch = std::env::temp_dir().join("etc").join("notch.txt");
         std::fs::write(
             &path,
-            "[spot]\nallowlist = [\"W1AW\", \"K1ABC\"]\nblocklist_path = \"bad.txt\"\n\
-             notch_path = \"/etc/manta/notch.txt\"\n",
+            format!(
+                "[spot]\nallowlist = [\"W1AW\", \"K1ABC\"]\nblocklist_path = \"bad.txt\"\n\
+                 notch_path = '{}'\n",
+                notch.display()
+            ),
         )
         .unwrap();
         let l = config::load(Some(&path), Env::Ignore).unwrap();
         assert_eq!(
             line(&summary("x", &l), "spot:"),
             format!(
-                "spot: allowlist=W1AW,K1ABC blocklist_path={} notch_path=/etc/manta/notch.txt",
-                dir.path().join("bad.txt").display()
+                "spot: allowlist=W1AW,K1ABC blocklist_path={} notch_path={}",
+                dir.path().join("bad.txt").display(),
+                notch.display()
             )
         );
     }

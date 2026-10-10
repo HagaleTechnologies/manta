@@ -5,12 +5,12 @@ kind: howto
 status: current
 maintainer: agent
 sources:
-  - .github/workflows/ci.yml
+  - .github/workflows/ci-full.yml
   - .github/workflows/release.yml
   - docs/superpowers/specs/2026-09-11-man212-windows-platform-support-design.md
 verified:
-  commit: 49002fc
-  date: 2026-09-11
+  commit: 9b3d690
+  date: 2026-10-10
 links:
   - live-hardware-field-testing
 ---
@@ -18,7 +18,7 @@ links:
 
 manta targets `x86_64-pc-windows-msvc` (not MinGW) -- this matches the
 prebuilt release binaries (`.github/workflows/release.yml`) and is the only
-Windows target CI (`.github/workflows/ci.yml`) exercises.
+Windows target CI (`.github/workflows/ci-full.yml`) exercises.
 
 ## Default build (no SoapySDR)
 
@@ -65,7 +65,7 @@ equivalent of Linux's `libsoapysdr-dev`. Two options:
    own README for the exact env vars it checks.
 2. **vcpkg**, for CI or a from-source setup without the GUI installer.
    MAN-212 tried this path in CI and it is not currently viable: `test-soapy`
-   in `.github/workflows/ci.yml` runs only `[ubuntu-latest, macos-latest]` --
+   in `.github/workflows/ci-full.yml` runs only `[ubuntu-latest, macos-latest]` --
    `windows-latest` was dropped after real attempts, and the CI file itself
    no longer shows any trace of the attempt. In order, what was found:
    1. `lukka/run-vcpkg`'s pinned action SHA must resolve to a real commit on
@@ -103,6 +103,22 @@ reliability comparison against the macOS baseline in issues #166/#167/
 #171) is tracked as a follow-up to MAN-212, not yet done as of this page's
 `verified.commit` -- see that follow-up ticket for the up-to-date status
 once it exists.
+
+## Writing tests that pass on the Windows legs
+
+- Three gotchas broke `test`/`test-hpsdr (windows-latest)` after the last
+  green run (MAN-230): (1) a Unix-absolute literal such as `/x/v1.wav` has
+  no drive prefix, so Windows treats it as relative and config path
+  resolution joins it onto the config dir (`C:/x/v1.wav`) -- build
+  absolute test paths from `std::env::temp_dir()` and write them as TOML
+  literal strings (`'...'`), and split `path: msg` lines on `": "`, not
+  `':'`; (2) the runners check text out with CRLF, and `include_str!`
+  embeds those bytes, so normalise `\r\n` before matching `\n`-delimited
+  text; (3) when a test file mixes cross-platform tests with a
+  `#[cfg(unix)]` test, gate the unix-only imports and helpers per item
+  (not `#![cfg(unix)]` on the file, which drops the cross-platform tests
+  too), or `cargo clippy --all-targets -- -D warnings` fails on Windows
+  before `cargo test` starts.
 
 ## Known gaps
 
