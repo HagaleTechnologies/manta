@@ -57,6 +57,11 @@ vendored `cty.dat`/`master.scp` at run time. `run`/`listen`/`soak`/`doctor`/
 `config check` warn when the built-in `cty.dat` is more than 180 days old.
 See docs/DECISIONS/2026-10-10-man79-operator-cty-scp-override.md.
 
+MAN-125: `manta devices` lists audio inputs and optional Soapy selectors;
+`manta check [SOURCE]` reports stream rate, input power and passband noise
+floor without decoding or services. See
+`docs/DECISIONS/2026-10-10-man125-source-diagnostics.md`.
+
 ## Documents (read in this order)
 
 - `README.md` — goals and non-goals
