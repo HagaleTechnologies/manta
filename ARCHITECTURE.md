@@ -279,7 +279,8 @@ transmission may never produce again).
 1. **CQ/DE context parse**: regex-level scan for `CQ <call>`, `CQ TEST <call>`,
    contest framing `CQ <contest> <call>` (an enumerated filler set, e.g.
    `CQ WPX`) and a bare `TEST <call>` (MAN-104; a bare `TEST` between two
-   different callsigns is ambiguous and yields no candidate),
+   different callsigns, or after a sign-off such as `TU`, is ambiguous and
+   yields no candidate),
    `DE <call>`, `<call> UP`, beacon patterns (`V V V <call>`, and `<call> T`
    for NCDXF-style power-step beacons the decoder can't resolve past a
    single trailing dash, MAN-37 — suppressed whenever a bare `CQ`/`TEST`/`DE`

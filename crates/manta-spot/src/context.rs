@@ -47,6 +47,11 @@ pub type ContextMatch = (String, SpotType, Range<usize>, Option<Range<usize>>);
 /// `WPX` -- is rejected downstream, the same as "CQ TEST" always was.
 const CQ_FILLER: &str = "CQ|TEST|CONTEST|WPX|WW|NA|SS|FD|DX";
 
+/// Sign-off words that make a following bare `TEST` the run station's
+/// trailing "TU TEST" form, so the call after it is the next caller's, not
+/// the CQer's (MAN-104; see `parse_named_pattern`).
+const TEST_SIGN_OFF: [&str; 3] = ["TU", "TNX", "QSL"];
+
 static BEACON_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bV\s+V\s+V\s+([A-Z0-9/]{3,15})\b").unwrap());
 static DE_RE: LazyLock<Regex> =
@@ -122,14 +127,22 @@ static POWER_STEP_BEACON_RE: LazyLock<Regex> =
 /// is for.
 ///
 /// `TEST_CALL_RE` is the one family that can pass over a match: a bare
-/// `TEST` whose preceding word is a DIFFERENT plausible callsign is skipped
-/// and the next occurrence tried. The standard run exchange "TU <mycall>
-/// TEST <caller> ..." puts the next caller's call right after `TEST`, and
+/// `TEST` whose preceding word is a DIFFERENT plausible callsign or a
+/// `TEST_SIGN_OFF` word is skipped and the next occurrence tried. The
+/// standard run exchange "TU <mycall> TEST <caller> ..." (or the shorter "TU
+/// TEST <caller> ...") puts the next caller's call right after `TEST`, and
 /// taking it spotted the caller as a CQing station (measured end-to-end
 /// through `Validator`, MAN-104). Such an occurrence is ambiguous -- it may
 /// also be a CQer's "<other> TEST <mycall>" -- so it yields nothing: a
 /// missed scan, never a wrong `Cq`. The same call either side ("W5AU TEST
-/// W5AU") or a non-callsign before it ("5NN 04 TEST W5AU") is unambiguous.
+/// W5AU") or another non-callsign before it ("5NN 04 TEST W5AU") is
+/// unambiguous.
+///
+/// The guard reads only `text`, the rolling window: once the preceding word
+/// ages out, a `TEST` left as the window's first word is accepted. That
+/// gives the caller one evaluation per slide, below the repetition gate on
+/// its own -- measured: a six-QSO run on one track spots only the run
+/// station. Accepted residual, same reasoning as `parse`'s coarse guard.
 fn parse_named_pattern(text: &str) -> Option<(String, SpotType, Range<usize>)> {
     if let Some(caps) = BEACON_RE.captures(text) {
         let m = caps.get(0).unwrap();
@@ -160,8 +173,10 @@ fn parse_named_pattern(text: &str) -> Option<(String, SpotType, Range<usize>)> {
             .split_whitespace()
             .next_back()
             .map(str::to_uppercase);
-        if before.is_some_and(|w| w != call && grammar::is_plausible(&w)) {
-            continue; // TEST between two different calls: can't tell whose TEST it is
+        if before.is_some_and(|w| {
+            (w != call && grammar::is_plausible(&w)) || TEST_SIGN_OFF.contains(&w.as_str())
+        }) {
+            continue; // trailing "<mycall> TEST" / "TU TEST": the call is the next caller's
         }
         return Some((call, SpotType::Cq, m.range()));
     }
@@ -650,6 +665,23 @@ mod tests {
         // ...and a preceding word grammar rejects (here "04") is no call at all.
         assert_eq!(
             parse_types("5NN 04 TEST W5AU"),
+            vec![("W5AU".to_string(), SpotType::Cq)]
+        );
+    }
+
+    #[test]
+    fn bare_test_after_a_sign_off_word_is_ambiguous() {
+        // MAN-104 (self-review): the short sign-off "TU TEST <caller>" also
+        // puts the next caller right after TEST, and "TU" is no callsign, so
+        // the different-call check alone let "TU TEST K1ABC K1ABC 5NN 05",
+        // sent twice through Validator, spot K1ABC as Cq.
+        for sign_off in TEST_SIGN_OFF {
+            let text = format!("{sign_off} TEST K1ABC K1ABC 5NN 05");
+            assert_eq!(parse_types(&text), vec![], "{text}");
+        }
+        // A sign-off before an earlier, leading "TEST <call>" changes nothing.
+        assert_eq!(
+            parse_types("TEST W5AU W5AU TU TEST K1ABC"),
             vec![("W5AU".to_string(), SpotType::Cq)]
         );
     }
