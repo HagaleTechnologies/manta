@@ -63,6 +63,9 @@ fn the_daemon_logs_a_startup_banner_before_any_client_connects() {
             // a deprecation warning to stderr, which would sit AHEAD of
             // the banner and defeat the first-line assertion below.
             "run",
+            // Pin the table to suppress the date-dependent pre-banner age warning.
+            "--cty",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../manta-spot/data/cty.dat"),
             "--source",
             wav.to_str().unwrap(),
             "--dial-freq-hz",

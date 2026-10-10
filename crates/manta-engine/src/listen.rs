@@ -237,14 +237,7 @@ pub fn listen_with_observers(
     let fs = src.sample_rate();
     let center_freq_hz = src.center_freq_hz();
 
-    let mut validator = Validator::bundled(fs)
-        .with_freq_correction_ppm(cfg.freq_correction_ppm)
-        .map_err(|e| anyhow::anyhow!(e))?
-        .with_blocklist(cfg.blocklist.clone())
-        .with_notch(cfg.notch.clone());
-    for call in &cfg.allowlist {
-        validator.allowlist(call);
-    }
+    let mut validator = cfg.validator(fs)?;
 
     // One relaxed store over a count that is a single filtered pass across
     // the (cap-bounded) track map, once per processed chunk and skipped
@@ -437,6 +430,41 @@ pub fn listen_with_observers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn listen_spots_a_call_only_an_override_cty_allocates() {
+        let mut spec = manta_testkit::vectors::v1();
+        spec.duration_s = 30.0;
+        spec.signals[0].text = "CQ CQ DE QQ9ZZZ QQ9ZZZ K".into();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let calls = |cfg: &PipelineConfig| {
+            let src = Box::new(FixedFreqSource {
+                samples: rendered.samples.clone(),
+                cursor: 0,
+                fs: spec.fs,
+                center_freq_hz: spec.center_freq_hz,
+            });
+            let mut calls = Vec::new();
+            listen(
+                src,
+                cfg,
+                Arc::new(AtomicBool::new(false)),
+                |_| {},
+                |s| calls.push(s.callsign.clone()),
+            )
+            .unwrap();
+            calls
+        };
+        assert!(!calls(&PipelineConfig::default()).contains(&"QQ9ZZZ".into()));
+        let table = manta_spot::cty::Table::parse(&format!(
+            "{}Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n",
+            manta_spot::CTY_DAT
+        ));
+        let cfg = PipelineConfig {
+            cty: Some(Arc::new(table)),
+            ..Default::default()
+        };
+        assert!(calls(&cfg).contains(&"QQ9ZZZ".into()));
+    }
 
     /// A minimal in-memory IqSource for testing, reporting a fixed,
     /// caller-chosen `center_freq_hz` (unlike `AudioIqSource`, which always

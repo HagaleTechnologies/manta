@@ -14,6 +14,7 @@ use crate::support::SupportLedger;
 use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_decode::tree::{Glyph, Prosign};
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 /// How many recently-completed words a track remembers for context
 /// parsing. Calls/context keywords always appear within a handful of
@@ -299,8 +300,8 @@ pub struct SuppressionCounts {
 }
 
 pub struct Validator {
-    cty: cty::Table,
-    scp: Option<scp::Set>,
+    cty: Arc<cty::Table>,
+    scp: Option<Arc<scp::Set>>,
     tracks: BTreeMap<u32, TrackState>,
     gate: RepetitionGate,
     dedupe: Dedupe,
@@ -384,10 +385,20 @@ pub struct Validator {
 const SWEEP_INTERVAL_SECONDS: f64 = 10.0;
 
 impl Validator {
+    /// Parses the supplied country and known-callsign tables.
     pub fn new(fs: f64, cty_dat: &str, master_scp: Option<&str>) -> Self {
+        Self::from_tables(
+            fs,
+            Arc::new(cty::Table::parse(cty_dat)),
+            master_scp.map(|s| Arc::new(scp::Set::parse(s))),
+        )
+    }
+
+    /// Shares already parsed tables with other consumers, such as JSON geography lookup.
+    pub fn from_tables(fs: f64, cty: Arc<cty::Table>, scp: Option<Arc<scp::Set>>) -> Self {
         Self {
-            cty: cty::Table::parse(cty_dat),
-            scp: master_scp.map(scp::Set::parse),
+            cty,
+            scp,
             tracks: BTreeMap::new(),
             gate: RepetitionGate::new(fs),
             dedupe: Dedupe::new(fs),
@@ -1477,6 +1488,44 @@ impl Validator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const QQ9_ENTITY: &str =
+        "Test DXpedition:  14:  27:  EU:  50.0:  -5.0:  0.0:  QQ9:\n    QQ9;\n";
+
+    #[test]
+    fn from_tables_spots_a_call_only_the_supplied_table_allocates() {
+        let words = ["DE", "QQ9ZZZ", "K"];
+        let spots_with = |cty: &str| {
+            let mut v = Validator::from_tables(FS, Arc::new(cty::Table::parse(cty)), None);
+            seed_meta(&mut v, 1);
+            let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+            spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+            spots
+        };
+        assert!(
+            spots_with(CTY_FIXTURE).is_empty(),
+            "QQ9 is unallocated in the fixture"
+        );
+        let spots = spots_with(&format!("{CTY_FIXTURE}{QQ9_ENTITY}"));
+        assert_eq!(spots.len(), 1);
+        assert_eq!(spots[0].callsign, "QQ9ZZZ");
+    }
+
+    #[test]
+    fn from_tables_applies_the_supplied_scp_set() {
+        // `apply_scp_boost` (validator.rs:1173-1175) still sees an Arc'd set:
+        // the same QQ9ZZZ spot scores higher when the supplied SCP lists it.
+        let cty = Arc::new(cty::Table::parse(&format!("{CTY_FIXTURE}{QQ9_ENTITY}")));
+        let confidence_with = |scp: &str| {
+            let mut v =
+                Validator::from_tables(FS, cty.clone(), Some(Arc::new(scp::Set::parse(scp))));
+            seed_meta(&mut v, 1);
+            let words = ["DE", "QQ9ZZZ", "K"];
+            let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+            spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+            spots[0].confidence
+        };
+        assert!(confidence_with("QQ9ZZZ\n") > confidence_with("K1ABC\n"));
+    }
 
     const FS: f64 = 96_000.0;
     const CTY_FIXTURE: &str = "\

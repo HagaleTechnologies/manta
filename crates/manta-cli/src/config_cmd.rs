@@ -433,14 +433,24 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             .map_or("none".to_string(), |p| p.display().to_string())
     };
     lines.push(format!(
-        "spot: allowlist={} blocklist_path={} notch_path={}",
+        "spot: allowlist={} blocklist_path={} notch_path={} cty_path={} scp_path={}",
         if loaded.spot.allowlist.is_empty() {
             "none".to_string()
         } else {
             loaded.spot.allowlist.join(",")
         },
         path_or_none(&loaded.spot.blocklist_path),
-        path_or_none(&loaded.spot.notch_path)
+        path_or_none(&loaded.spot.notch_path),
+        loaded
+            .spot
+            .cty_path
+            .as_ref()
+            .map_or("bundled".to_string(), |p| p.display().to_string()),
+        loaded
+            .spot
+            .scp_path
+            .as_ref()
+            .map_or("bundled".to_string(), |p| p.display().to_string())
     ));
 
     let detector = set_keys(loaded, "detector", &[]);
@@ -713,7 +723,7 @@ mod tests {
         let lines = lines_of("");
         assert_eq!(
             line(&lines, "spot:"),
-            "spot: allowlist=none blocklist_path=none notch_path=none"
+            "spot: allowlist=none blocklist_path=none notch_path=none cty_path=bundled scp_path=bundled"
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manta.toml");
@@ -724,7 +734,7 @@ mod tests {
             &path,
             format!(
                 "[spot]\nallowlist = [\"W1AW\", \"K1ABC\"]\nblocklist_path = \"bad.txt\"\n\
-                 notch_path = '{}'\n",
+                 notch_path = '{}'\ncty_path = 'cty.dat'\nscp_path = 'MASTER.SCP'\n",
                 notch.display()
             ),
         )
@@ -733,9 +743,11 @@ mod tests {
         assert_eq!(
             line(&summary("x", &l), "spot:"),
             format!(
-                "spot: allowlist=W1AW,K1ABC blocklist_path={} notch_path={}",
+                "spot: allowlist=W1AW,K1ABC blocklist_path={} notch_path={} cty_path={} scp_path={}",
                 dir.path().join("bad.txt").display(),
-                notch.display()
+                notch.display(),
+                dir.path().join("cty.dat").display(),
+                dir.path().join("MASTER.SCP").display()
             )
         );
     }
@@ -1055,6 +1067,8 @@ mod tests {
         ("input", "replay_epoch"),
         ("spot", "blocklist_path"),
         ("spot", "notch_path"),
+        ("spot", "cty_path"),
+        ("spot", "scp_path"),
     ];
 
     /// `Option` keys whose absence means a built-in value: setting them to
@@ -1314,6 +1328,7 @@ mod tests {
         let body = format!("[spot]\n{}", uncommented("spot", |_| true));
         let l = loaded(&body);
         assert!(l.spot.blocklist_path.is_some() && l.spot.notch_path.is_some());
+        assert!(l.spot.cty_path.is_some() && l.spot.scp_path.is_some());
     }
 
     #[test]

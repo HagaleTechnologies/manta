@@ -162,6 +162,19 @@ station_callsign = "N0CALL"
 # line. Relative to this file's directory. No default.
 #notch_path = "notches.txt"
 
+# AD1C's cty.dat country-prefix file, used in place of the copy built into
+# manta: a call whose prefix it does not list is not spotted. Download the
+# current file from https://www.country-files.com/cty/cty.dat when a new
+# prefix is on the air. Relative to this file's directory. Unset: the
+# built-in copy. --cty overrides it.
+#cty_path = "cty.dat"
+
+# MASTER.SCP known-callsign list, used in place of the copy built into
+# manta: a listed call is spotted with more confidence. Download it from
+# https://www.supercheckpartial.com/MASTER.SCP. Relative to this file's
+# directory. Unset: the built-in copy. --scp overrides it.
+#scp_path = "MASTER.SCP"
+
 
 # --- Signal detection --------------------------------------------------------
 # When a signal becomes a track that gets decoded, and when the track ends.

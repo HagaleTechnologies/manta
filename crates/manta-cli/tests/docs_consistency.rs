@@ -809,7 +809,16 @@ fn spec_documents_every_input_and_spot_key() {
                 "replay_epoch",
             ],
         ),
-        ("spot", &["allowlist", "blocklist_path", "notch_path"]),
+        (
+            "spot",
+            &[
+                "allowlist",
+                "blocklist_path",
+                "notch_path",
+                "cty_path",
+                "scp_path",
+            ],
+        ),
     ];
     for (table, keys) in tables {
         let lines = spec_table_lines(table);
