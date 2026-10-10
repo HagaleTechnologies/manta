@@ -13,6 +13,7 @@ mod build_info;
 mod config;
 mod config_cmd;
 mod reconnect;
+mod text_lines;
 use reconnect::ReconnectingSource;
 
 #[derive(Parser)]
@@ -151,9 +152,11 @@ enum Command {
     /// Decode CW live from a receiver or sound card, or run the spotting
     /// daemon.
     ///
-    /// Prints each decode as it happens. With --config, also runs the full
-    /// spotting daemon: the telnet cluster server, the JSON Lines /
-    /// WebSocket stream, and the metrics endpoint.
+    /// Prints a SPOT: line on stdout for each confirmed spot, and decoded
+    /// text on stderr, one line per track. With --config, also runs the
+    /// full spotting daemon: the telnet cluster server, the JSON Lines /
+    /// WebSocket stream, and the metrics endpoint; decoded text is then
+    /// off unless --decoded-text is given.
     // `run` is the daemon entry point; `listen` stays as a visible alias
     // for ad hoc audio/dev testing (D11/MAN-77, see
     // docs/DECISIONS/2026-09-06-broad-review-decisions.md).
@@ -290,6 +293,15 @@ enum Command {
         /// plain text.
         #[arg(long, help_heading = "Output")]
         json: bool,
+        /// Also print decoded text while the spotting daemon runs.
+        ///
+        /// Decoded text goes to stderr, one line per track, labelled with
+        /// the track number, frequency and speed. It is printed by default,
+        /// except when a `[server]` table starts the spotting daemon, so
+        /// that a service log holds spots and diagnostics only. This flag
+        /// prints it there too.
+        #[arg(long, conflicts_with = "json", help_heading = "Output")]
+        decoded_text: bool,
         /// TOML config file that turns this into the full spotting daemon.
         ///
         /// Needs a `[server]` table with the station callsign and ports.
@@ -3643,6 +3655,7 @@ fn main() -> Result<()> {
             source_iq,
             filters,
             json,
+            decoded_text,
             config,
             dial_freq_hz,
             replay_epoch,
@@ -4024,6 +4037,12 @@ fn main() -> Result<()> {
             // `ready: decoding` for a run that shuts down without ever
             // decoding a chunk.
             let stop_ready = stop.clone();
+            // MAN-123: decoded text is grouped per track (text_lines.rs) and
+            // goes to stderr; stdout carries spots. A daemon -- servers
+            // started from a [server] table -- logs no decoded text unless
+            // asked, so its journal holds spots and diagnostics only.
+            let print_text = !json && (spot_server.is_none() || decoded_text);
+            let mut text_lines = text_lines::TrackLines::default();
             let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
@@ -4033,30 +4052,23 @@ fn main() -> Result<()> {
                     decode_latency: decode_latency.clone(),
                 },
                 |ev| {
-                    use manta_decode::events::DecoderEvent;
                     if json {
                         println!("{}", serde_json::to_string(ev).unwrap());
                         return;
                     }
-                    use std::io::Write as _;
-                    match ev {
-                        DecoderEvent::CharDecoded { glyph, .. } => {
-                            if let Some(c) = glyph.text_char() {
-                                print!("{c}");
-                                let _ = std::io::stdout().flush();
-                            }
-                        }
-                        DecoderEvent::WordBoundary { .. } => {
-                            print!(" ");
-                            let _ = std::io::stdout().flush();
-                        }
-                        _ => {}
+                    if !print_text {
+                        return;
+                    }
+                    if let Some(line) = text_lines.ingest(ev) {
+                        eprintln!("{line}");
                     }
                 },
                 // Provisional CLI-debugging text/JSON printed below is NOT
                 // the ecosystem wire contract -- that's `spot_server`
                 // (manta-server's telnet/JSON-Lines/WebSocket fan-out,
-                // ARCHITECTURE §7), fed here when --config is set.
+                // ARCHITECTURE §7), fed here when --config is set. The
+                // human `SPOT:` line is stdout's product in text mode
+                // (MAN-123); decoded text and diagnostics go to stderr.
                 |spot| {
                     if let Some(server) = &spot_server {
                         server.bus.publish(spot.clone());
@@ -4080,7 +4092,7 @@ fn main() -> Result<()> {
                         println!("{}", serde_json::json!({ "spot": spot }));
                         return;
                     }
-                    eprintln!(
+                    println!(
                         "SPOT: {} ({:?}) {:.1} Hz {:.0} dB {:.0} wpm conf={:.2}",
                         spot.callsign,
                         spot.spot_type,
@@ -4140,6 +4152,14 @@ fn main() -> Result<()> {
                     }
                 },
             );
+
+            // A source read error returns from listen without closing its
+            // tracks, so their partial lines are printed here, on both paths.
+            if print_text {
+                for line in text_lines.finish() {
+                    eprintln!("{line}");
+                }
+            }
 
             // Run the same server-shutdown sequence on BOTH the success and
             // error paths -- an SDR disconnect or WAV read failure from
@@ -6704,7 +6724,15 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("engine", "decode.engine"),
     ];
     /// Flags with no config key, by design.
-    const CLI_ONLY: &[&str] = &["json", "duration", "config", "path", "help", "version"];
+    const CLI_ONLY: &[&str] = &[
+        "json",
+        "decoded_text",
+        "duration",
+        "config",
+        "path",
+        "help",
+        "version",
+    ];
 
     #[test]
     fn every_config_backed_flag_maps_to_a_key() {
