@@ -289,7 +289,10 @@ transmission may never produce again).
    not a loss and is not counted). Context
    determines spot type (CQ / DE / BEACON) — RBN spots carry this flag.
 2. **Callsign plausibility**: structural grammar (prefix-digit-suffix, portable
-   designators `/P /QRP /3`), then prefix lookup against **cty.dat**.
+   designators `/P /QRP /3`), which also rejects, by exact match, a fixed
+   list of non-callsign CW conventions (`5NN`, `599`, `TEST`, `TU`, `QRZ`,
+   `AGN`, `K`, `KN`, …; MAN-105), regardless of cty.dat, then prefix
+   lookup against **cty.dat**.
    A call with an unallocated prefix is rejected. Operators can replace the
    bundled table with `--cty` / `[spot] cty_path`. Live commands warn when
    the built-in copy is more than 180 days old (MAN-79). `cty.dat` is
