@@ -2,6 +2,17 @@
 //! build: a Docker context (`.dockerignore` excludes `.git`) or a source
 //! tarball has no git metadata and reports "unknown". `MANTA_GIT_SHA`
 //! overrides (for release images that pass it as a build-arg).
+//!
+//! MAN-83: the same commit also feeds `manta --version` and the JSON
+//! stream's `decoderVersion` (`manta-<version>+<sha>`), so the override must
+//! be SemVer build metadata (dot-separated `[0-9A-Za-z-]` identifiers, at
+//! most 64 characters); anything else is warned about and ignored. An
+//! all-hex override longer than 12 characters (CI's 40-hex `github.sha`) is
+//! cut to 12 and lowercased, so it matches a native build of that commit.
+//! This script also exports `MANTA_FEATURES`, the compiled-in Cargo feature
+//! list. That one is compile-time only: it is derived from Cargo's
+//! `CARGO_FEATURE_*` variables, never read from the environment, so it is
+//! not on `config.rs`'s `ENV_IGNORED` list.
 use std::process::Command;
 
 fn git(args: &[&str]) -> Option<String> {
@@ -12,11 +23,36 @@ fn git(args: &[&str]) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// SemVer 2.0.0 build metadata: dot-separated, non-empty identifiers of
+/// `[0-9A-Za-z-]`. The 64-character cap keeps `--version` one short line.
+fn is_build_metadata(s: &str) -> bool {
+    s.len() <= 64
+        && s.split('.').all(|id| {
+            !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+/// The `MANTA_GIT_SHA` override, validated (MAN-83 D5). `None` when unset,
+/// empty, or not build metadata -- the last with a `cargo:warning`, and the
+/// caller then falls through to `git` exactly as if it were unset.
+fn sha_override() -> Option<String> {
+    let s = std::env::var("MANTA_GIT_SHA").ok().filter(|s| !s.is_empty())?;
+    if !is_build_metadata(&s) {
+        println!(
+            "cargo:warning=MANTA_GIT_SHA={s:?} is not SemVer build metadata \
+             (dot-separated [0-9A-Za-z-] identifiers, at most 64 characters); ignoring it"
+        );
+        return None;
+    }
+    if s.len() > 12 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(s[..12].to_ascii_lowercase());
+    }
+    Some(s)
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=MANTA_GIT_SHA");
-    let sha = std::env::var("MANTA_GIT_SHA")
-        .ok()
-        .filter(|s| !s.is_empty())
+    let sha = sha_override()
         .or_else(|| git(&["rev-parse", "--short=12", "HEAD"]))
         .unwrap_or_else(|| "unknown".to_string());
 
@@ -42,4 +78,22 @@ fn main() {
         }
     }
     println!("cargo:rustc-env=MANTA_GIT_SHA={sha}");
+
+    // MAN-83: compiled-in optional features, for `--version` and
+    // `manta_build_info`. Cargo sets CARGO_FEATURE_<NAME> for each enabled
+    // feature and reruns this script when the set changes.
+    let mut features: Vec<String> = std::env::vars()
+        .filter_map(|(k, _)| {
+            k.strip_prefix("CARGO_FEATURE_")
+                .map(|f| f.to_ascii_lowercase().replace('_', "-"))
+        })
+        .filter(|f| f != "default")
+        .collect();
+    features.sort();
+    let features = if features.is_empty() {
+        "none".to_string()
+    } else {
+        features.join(",")
+    };
+    println!("cargo:rustc-env=MANTA_FEATURES={features}");
 }
