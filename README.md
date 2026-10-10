@@ -426,7 +426,8 @@ systemd, launchd or Docker Compose) ·
 workspace, data flow, and the channelizer, decoder, validation and output
 design · [docs/DECISIONS/](docs/DECISIONS/) — dated design decisions and
 implementation pins · [wiki/INDEX.md](wiki/INDEX.md) — accumulated
-gotchas.
+gotchas · [CHANGELOG.md](CHANGELOG.md) — changes and the decoder-output
+versioning rule.
 
 **Algorithms and research:** [docs/SPEC-decode-core.md](docs/SPEC-decode-core.md) —
 channelizer constants, noise-floor estimator, track state machine,
@@ -449,6 +450,12 @@ M4 with acceptance criteria.
 Open an issue or a pull request. Main moves only by PR, CI must be green, and
 the golden-vector determinism tests are the bar every decoder change has to
 clear. See [SECURITY.md](SECURITY.md) for vulnerability reporting.
+
+When you report a problem, include the output of `manta --version`. It names
+the exact commit and the compiled-in features. The Docker image is the
+exception for now: its build has no git metadata, so its commit reads
+`unknown`. A change that alters decoder
+output adds a `### Decoder output` entry to [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

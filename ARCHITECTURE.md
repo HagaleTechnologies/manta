@@ -433,7 +433,11 @@ validation (MAN-28). Dedupe (step 5) still applies.
   Its `snr` field keeps the native 2500 Hz measurement (no 500 Hz conversion)
   alongside an explicit `snrRefHz` field naming that bandwidth, so a consumer
   of either surface never has to guess which convention it's reading
-  (MAN-102 / decision D3).
+  (MAN-102 / decision D3). Every spot's `decoderVersion` is
+  `manta-<version>+<commit>` (MAN-83): the commit is SemVer build metadata
+  naming the exact binary, and the part before `+` is the release the
+  decoder-output rule in `CHANGELOG.md` governs. See
+  `docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md`.
 - Both servers are thin fan-out consumers of one broadcast channel; slow clients
   are disconnected, never back-pressure the pipeline. At shutdown each
   client's queued backlog is drained on a best-effort basis bounded by a

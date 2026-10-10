@@ -65,7 +65,7 @@ The tools are [`scripts/field-node.py`](../../scripts/field-node.py) and
   cd /opt/manta
   cargo build --release -p manta-cli --features soapy
   sudo install -m 0755 target/release/manta /usr/local/bin/manta
-  manta --version
+  manta --version   # e.g. manta 0.1.0 (git 1a2b3c4d5e6f; features: soapy) -- check soapy is listed
   git -C /opt/manta rev-parse HEAD   # record this SHA in the field report
   ```
 

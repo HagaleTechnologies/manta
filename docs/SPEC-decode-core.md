@@ -1095,8 +1095,10 @@ cannot be set from the environment.
 
 Unknown tables, unknown keys in a known table, and unknown `MANTA_*`
 variables are errors that name the offender, raised before any source
-I/O. `MANTA_GIT_SHA` is exempt: it is read at build time
-(`crates/manta-cli/build.rs`), never at run time. `decode` and `oracle`
+I/O. `MANTA_GIT_SHA` and `MANTA_FEATURES` are exempt: they are build-time
+values of `crates/manta-cli/build.rs`, never read at run time, and
+`cargo run`/`cargo test` export both into the processes they start
+(MAN-83). `decode` and `oracle`
 read only the file `--config` names and never the environment
 (`MANTA_CONFIG` included), so their output cannot depend on the ambient
 environment; `decode` applies `[detector]`, `[spot]`, `[decode]` and

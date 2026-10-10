@@ -8,6 +8,7 @@ use manta_engine::{decode_wav, PipelineConfig};
 use manta_input::IqSource;
 use std::path::{Path, PathBuf};
 
+mod build_info;
 mod config;
 mod config_cmd;
 mod reconnect;
@@ -22,7 +23,8 @@ use reconnect::ReconnectingSource;
     // tests that assert against it, e.g. crates/manta-cli/tests/cli.rs) is
     // identical across platforms.
     bin_name = "manta",
-    version,
+    // MAN-83: commit + features, so a support request needs nothing else
+    version = build_info::VERSION_LINE,
     about = "Open-source wideband CW skimmer: every CW signal in an SDR passband, decoded at once, emitted as RBN-compatible spots",
     after_help = "\
 Examples:
@@ -2349,26 +2351,15 @@ fn input_health_of(
 
 /// MAN-128: feeds `manta_build_info`. `git_sha` comes from `build.rs`
 /// (`MANTA_GIT_SHA`, "unknown" with no `.git` -- e.g. a Docker build
-/// context, which `.dockerignore` excludes it from). Deliberately separate
-/// from `decoder_version` below: that string is the JSON spot wire
-/// contract and a byte-identical-replay input, neither of which may vary
-/// with the commit a binary happens to be built from.
+/// context, which `.dockerignore` excludes it from). MAN-83: the values are
+/// `build_info`'s constants, the same ones `--version` and the JSON
+/// stream's `decoderVersion` read, so the gauge, the version line and the
+/// spots always name the same build.
 fn daemon_build_info() -> manta_server::metrics::BuildInfo {
-    let mut features = Vec::new();
-    if cfg!(feature = "hpsdr") {
-        features.push("hpsdr");
-    }
-    if cfg!(feature = "soapy") {
-        features.push("soapy");
-    }
     manta_server::metrics::BuildInfo {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        git_sha: env!("MANTA_GIT_SHA").to_string(),
-        features: if features.is_empty() {
-            "none".to_string()
-        } else {
-            features.join(",")
-        },
+        version: build_info::VERSION.to_string(),
+        git_sha: build_info::GIT_SHA.to_string(),
+        features: build_info::FEATURES.to_string(),
     }
 }
 
@@ -2474,13 +2465,14 @@ fn start_spot_server(
     ));
     let metrics = std::sync::Arc::new(manta_server::metrics::Metrics::new());
     metrics.set_build_info(daemon_build_info());
-    // MAN-128: stays SHA-free and feature-free on purpose -- this is the
-    // JSON spot wire contract (ARCHITECTURE §7) and a byte-identical-
-    // replay input (AGENTS.md's "file input -> byte-identical spot logs"
-    // hard requirement), neither of which may vary with the commit or
-    // build flags a given binary happens to carry. `manta_build_info`
-    // above is the right place for that information instead.
-    let decoder_version = format!("manta-{}", env!("CARGO_PKG_VERSION"));
+    // MAN-83: the commit rides as SemVer build metadata, so every spot names
+    // the binary that produced it (`manta-<version>+<sha>`). Same-binary
+    // byte-identity (SPEC §6 item 4) holds because this is a compile-time
+    // constant, and the outputs CI hashes (`decode --json`, `run --json`)
+    // never carry it. Supersedes MAN-128's note keeping this string free of
+    // the commit; see
+    // docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md.
+    let decoder_version = build_info::DECODER_VERSION.to_string();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let tasks = manta_server::tasks::new_client_tasks();
 
