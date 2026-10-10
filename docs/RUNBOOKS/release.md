@@ -7,14 +7,131 @@ this document alone. See
 `docs/DECISIONS/2026-09-05-man65-release-pipeline-hardening.md` for the
 design rationale behind the behaviour described here.
 
+## Release governance and activation (MAN-244)
+
+This is the desired configuration, not proof that live settings have been
+applied or rehearsals have passed. Owner activation and hosted acceptance
+remain pending; MAN-84 stays blocked until the evidence below exists.
+Local tests prove the helper and workflow wiring only.
+
+Configure and verify settings first, merge the owner-reviewed workflow,
+then rehearse and release. Both environments must be protected before this
+workflow edit is merged or used. A workflow can create a named environment
+without protection, so the YAML declaration alone provides no approval gate.
+Owner review of the PR confirms the selected manual-path policy and the
+change to MAN-66's earlier no-reviewer disposition.
+
+### Settings contract
+
+| Setting | Required state |
+|---|---|
+| Release tag ruleset | Existing `release-tags-owner-only`, reported ID `24550865`, verified by name/target before editing; active; target `tag`; include `refs/tags/v*`; no exclusions; creation, update and deletion restricted. Preserve unrelated rules and inspect applicable organization rules. |
+| Bypass identity | Exactly `thagale`, resolved to the numeric user ID, with `actor_type: User`, `bypass_mode: always`. No broad admin/write role, integration, deploy key or extra user bypass. |
+| `ghcr-publish` reviewers | Sole required reviewer `thagale`; self-review allowed because the owner also pushes the tag. |
+| `ghcr-publish` ref policy | Preserve selected tag policy `v*`, without adding branch deployment permission. |
+| `ghcr-test-publish` reviewers | Sole required reviewer `thagale`; self-review allowed; configure before any workflow references the new environment. |
+| `ghcr-test-publish` ref policy | All branches and tags, preserving deliberate manual builds of arbitrary refs. Approval applies whether `publish` is true or false. |
+| Both environments | Disable administrator bypass using Settings → Environments → the environment → uncheck `Allow administrators to bypass configured protection rules`. The documented REST update schema does not list `can_admins_bypass`, so do not depend on an undocumented PUT field. |
+
+The rules API can omit `bypass_actors` unless the caller has ruleset write
+access. An omitted field is not an empty list, and `current_user_can_bypass:
+never` describes the caller only. Do not replace a concealed bypass list from
+a permission-limited response. [GitHub repository rules API](https://docs.github.com/en/rest/repos/rules#get-a-repository-ruleset).
+
+The owner first reads the complete ruleset with an administration-capable identity
+and records the existing settings privately for rollback. If the bypass already
+matches, leave it alone. The current REST schema supports direct user bypass; if
+the live API rejects that type, use a non-secret team with exactly `thagale` as
+its sole effective member, no inherited members, and one `Team` bypass in `always`
+mode. This is a predetermined fallback, never a reason to grant a whole repository
+role. Verify team membership during the trial. [GitHub ruleset
+configuration](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository)
+
+The owner then confirms the selected manual-path policy and MAN-66 note change
+through code review. Settings can be applied before merge; at minimum both
+environments must be protected before merging/using the workflow, and every
+control must be verified before a release tag or manual package-write run.
+
+### Rehearsal sequence
+
+1. **Trial tag restrictions without triggering a release.** Create a temporary
+   active tag ruleset for a unique `man244-rule-trial-<nonce>*` pattern with the
+   same restrictions and bypass. These names match neither release trigger. Using
+   existing appropriately authorized owner and non-owner identities, test
+   creation, movement and deletion independently. The owner seeds tags needed for
+   the negative update/delete attempts. Owner operations must succeed; non-owner
+   operations must fail and leave refs unchanged. Record rule insight entries with
+   actor, ref, operation, timestamp and rule ID. Do not substitute a read-only
+   credential's ordinary push denial for evidence that the ruleset blocked a
+   writer. Clean up the trial tags/rule as the owner.
+2. **Verify production settings.** Read back the full production ruleset and both
+   environment configurations. Preserve the protected `v*` pattern, its broader
+   scope than the trigger, and the owner bypass. Confirm the environment reviewer
+   and admin-bypass states. Export a sanitized evidence record or use owner
+   screenshots; the cloud's permission-limited response is insufficient.
+3. **Merge reviewed workflow changes.** Let the normal PR checks and owner review
+   govern the merge. Confirm the target commit contains the guard, the dispatch
+   environment declaration and the desired dependency chain. Do not tag an earlier
+   commit whose workflow lacks the fix.
+4. **Off-branch negative rehearsal.** From the reviewed commit, create a temporary
+   branch with one harmless non-workflow change. The owner pushes a unique, valid
+   prerelease tag such as `v<workspace-version>-man244.offbranch.<nonce>` pointing
+   to it. It must match `v*`, `v[0-9]*` and the current SemVer validator. Observe
+   `validate-tag` fail ancestry in every retained tag-triggered release workflow,
+   with builds and all publication skipped. Record the run URL and failure/skip
+   results. Owner deletes the tag/temporary branch after evidence capture. Never
+   test using a commit that disables its own guard.
+5. **Positive approval rehearsal, coordinated with MAN-84.** The ticket mentions a
+   proposed MAN-84 rehearsal tag, but the available September artifacts do not
+   name it. Use the agreed MAN-84 tag if supplied; otherwise the fixed default is
+   a unique `v<workspace-version>-man244.rehearsal.<nonce>` prerelease on a
+   reviewed default-branch commit containing this fix. A prerelease exercises
+   version publication without changing `latest`. Before approving, observe a
+   waiting deployment and no image/Release for that tag. Confirm the run's commit
+   and passing ancestry log. The owner approves `ghcr-publish`, handles any later
+   approval prompt for `publish-latest`, and verifies the version image and GitHub
+   Release. Record every approval identity and prompt count. This is a real
+   publication; coordinate its retention/cleanup as part of MAN-84. A subsequent
+   intended stable release verifies the `latest` write after owner approval.
+6. **Manual path.** Dispatch once with `publish=false` on a harmless feature
+   branch and confirm its package-write job waits for `ghcr-test-publish`
+   approval, then builds without a push. A deliberate `publish=true` trial must
+   also wait, then publish only `dispatch-<run_id>` after owner approval. Neither
+   run creates a GitHub Release or updates `latest`. Record run URLs and outcomes.
+
+Do not close live acceptance on a settings screenshot alone. If rule insight
+capture, owner bypass, pending deployment or off-branch failure cannot be
+observed, preserve the pending gate and keep MAN-84 blocked. Owner-controlled
+evidence should record the actual run/actor/ref/results; it need not be committed
+by the cloud worker.
+
+### Rollback and trust limits
+
+Revert the workflow/helper change through a reviewed PR. The owner can restore
+settings from the privately captured prior state; disabling the ruleset or
+removing reviewers reopens the original exposure. Never delete an environment
+while a workflow still references it: a later run can recreate it unprotected.
+Rollback does not remove artifacts already published.
+
+Ancestry checks membership in the default branch at validation time, relying
+on that branch's review controls. A tag runs the workflow at its own commit,
+so an older commit may lack the guard. Select a reviewed commit containing
+this fix. A write-capable identity can introduce a different workflow that
+omits these gates and requests a package-write `GITHUB_TOKEN`. MAN-66's
+accepted credential-boundary risk and the app-permission audit remain outside
+this change. See [the MAN-244 decision](../DECISIONS/2026-10-10-man244-release-governance.md).
+
 ## Cutting a release
 
-1. If the release changes it, bump the workspace `version` in `Cargo.toml`
-   and commit that change on `main` first — the release tag and the crate
-   version are independent today (the Docker/artifact version comes solely
-   from the Git tag), but keeping them in step avoids confusion later.
-2. Tag the commit `vX.Y.Z` (see "Accepted tag grammar" below) and push the
-   tag: `git tag v1.2.3 && git push origin v1.2.3`.
+1. Complete the activation checks above. If the release changes it, bump
+   the workspace `version` in `Cargo.toml` through a reviewed PR and merge
+   it to the default branch. The crate and tag versions are independent,
+   but keeping them in step avoids confusion.
+2. As `thagale`, select the reviewed default-branch commit containing the
+   MAN-244 guard. Tag that explicit commit `vX.Y.Z` (see "Accepted tag
+   grammar" below), then push: `git tag v1.2.3 <reviewed-commit-sha>` and
+   `git push origin refs/tags/v1.2.3`. Only the owner may create, move or
+   delete a release tag.
 3. Pushing the tag triggers both workflows:
    - **`release.yml`** builds and packages all five targets (macOS
      x86_64/arm64, Windows x86_64, Linux x86_64/arm64) and validates the
@@ -22,18 +139,44 @@ design rationale behind the behaviour described here.
      anything; it is a build-only check of the tagged commit (it no longer
      runs on pull requests at all, since HAG-47).
    - **`release-publish.yml`** does the real work, in order:
-     `validate-tag` (rejects an unpublishable tag in seconds, before any
-     platform build starts) → `build` (rebuilds the same five targets) →
+     `validate-tag` (checks tag grammar and default-branch ancestry before
+     any platform build starts) → `build` (rebuilds the same five targets) →
      `docker-publish-release` (pushes the multi-arch image to GHCR as
      `ghcr.io/hagaletechnologies/manta:X.Y.Z`) → `publish-latest` (see
      below) and, in parallel, `release` (creates the GitHub Release from
      the five build artifacts). `docker-publish-release` and
-     `publish-latest` run in the `ghcr-publish` environment (MAN-66).
-4. Watch the `release-publish.yml` run's summary for the GHCR visibility
+     `publish-latest` run in the `ghcr-publish` environment. The build-only
+     workflow has the same ancestry guard before its platform builds.
+4. When `docker-publish-release` waits for deployment approval, the owner
+   verifies the run's commit and ancestry log, then approves `ghcr-publish`.
+   Until then, no version image or GitHub Release is published. A later
+   `publish-latest` job may request a second approval; inspect and approve
+   it too, without removing its protection. Record the actual prompt count.
+5. Watch the `release-publish.yml` run's summary for the GHCR visibility
    warning and the `:latest`-not-updated warning — see below.
-5. **Before announcing the release, run the clean-Windows check** below
+6. **Before announcing the release, run the clean-Windows check** below
    ("Manual check: the Windows ZIP starts without the Visual C++
    Redistributable"). CI cannot prove it.
+
+## Manual builds and ancestry failures
+
+A `workflow_dispatch` against either a branch or a tag keeps the version
+`dispatch-<run_id>`. It skips ancestry validation and does not create a
+version release or update `latest`. After the read-only platform builds,
+`docker-build-dispatch` waits for the owner's `ghcr-test-publish` approval
+in both modes, since the whole job holds package-write permission.
+With `publish=false` it builds without login or push; with `publish=true`
+it logs in and pushes only the dispatch image tag. This environment allows
+all branches and tags, without widening production's tag-only policy.
+
+An ancestry rejection blocks every dependent build, registry login, image
+push, `latest` update and GitHub Release. Check `validate-tag`'s stderr:
+non-ancestor means the selected commit is outside the freshly fetched
+default branch; a fetch/object/history error means membership could not be
+proved. Repair remote access or history errors and retry; do not bypass the
+check or use an old local tracking ref as evidence. For an incorrect tag,
+the owner corrects or deletes it and selects a reviewed commit containing
+the guard. Prefer a new release version if artifacts were already published.
 
 ## Accepted tag grammar
 
@@ -47,9 +190,9 @@ such a tag used to reach Buildx 30 minutes into the build, get rejected
 there, and silently skip the GitHub Release along with it (MAN-65 finding
 1). Today, `validate-tag` rejects it within seconds of the push, before any
 of the five platform builds start, and the job's own log names the
-accepted grammar. If this happens: delete the bad tag
-(`git push origin :refs/tags/v1.2.3+linux`) and re-tag without the
-suffix.
+accepted grammar. If this happens, the owner deletes the bad tag
+(`git push origin :refs/tags/v1.2.3+linux`) and re-tags the reviewed commit
+without the suffix. Non-owners must not attempt to bypass the tag rule.
 
 The tag *trigger* itself is also narrower than a bare `v*` glob
 (`v[0-9]*`), so an unrelated tag like `vendor-freeze` never invokes either

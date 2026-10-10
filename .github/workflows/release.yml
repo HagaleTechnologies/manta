@@ -56,9 +56,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - if: github.event_name == 'push'
         shell: bash
         run: scripts/release-version.sh validate "$GITHUB_REF_NAME"
+
+      - name: Require release commit on the default branch
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: scripts/check-release-ancestry.sh "$RELEASE_COMMIT" "$DEFAULT_BRANCH"
 
   build:
     needs: validate-tag

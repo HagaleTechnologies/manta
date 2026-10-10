@@ -176,6 +176,8 @@ jobs:
       # workflows' ubuntu-latest runners.
       - if: runner.os != 'Windows'
         run: bash scripts/tests/release-version.test.sh
+      - if: runner.os != 'Windows'
+        run: bash scripts/tests/release-ancestry.test.sh
   # Same Dependabot-only pull_request gate as `test` above -- not itself a required check, but
   # matches this job's own pre-migration behavior (ran for a Dependabot PR too, gated only by
   # codex-clean's tolerant skip) rather than silently dropping coverage for a Dependabot bump
