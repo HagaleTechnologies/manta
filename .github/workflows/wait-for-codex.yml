@@ -245,6 +245,53 @@ jobs:
           fi
           gh api "repos/$REPO/issues/$PR/comments" -f body="@codex review" >/dev/null
 
+      # MAN-243: a dispatched ci-full.yml run executes the PR's code in the DEFAULT BRANCH's
+      # context -- main's Actions cache scope, which later push, merge-queue and release runs
+      # restore from -- so only a revision already inside the trust boundary may be dispatched:
+      # a head in THIS repository, opened by a trusted author, and not a draft. Every input
+      # fails closed (a deleted fork's null head repo, an unknown login, an unset draft flag
+      # all mean no dispatch). Anything else is tested by ci-full.yml's own `pull_request`
+      # trigger instead -- GitHub's isolated path (refs/pull/N/merge cache scope; for a fork, a
+      # read-only token, no secrets, and the fork-approval setting). Drafts are never
+      # dispatched, trusted or not: a trusted draft gets CI once it's marked ready for review.
+      # The PR OPENER is the identity checked, not github.actor (on `synchronize` that's
+      # whoever pushed). Keep the list identical to auto-merge-trigger.yml, ci-full.yml's test
+      # jobs and codex-review-response's copy of this step -- and both run: bodies
+      # byte-identical; scripts/tests/test_ci_trust_boundary.py enforces both. See
+      # docs/DECISIONS/2026-10-10-man243-ci-trust-boundary.md.
+      - name: Decide whether this revision may run CI in the default-branch context
+        id: trust
+        env:
+          REPO: ${{ github.repository }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          trusted_authors=(thagale 'catalyst-cloud-connector[bot]')
+          dispatch=false
+          reason=""
+          if [ -z "$HEAD_REPO" ] || [ "$HEAD_REPO" != "$REPO" ]; then
+            reason="head repository '${HEAD_REPO:-<deleted>}' is not $REPO -- tested by ci-full.yml's isolated pull_request run instead"
+          else
+            author_trusted=false
+            for a in "${trusted_authors[@]}"; do
+              if [ "$a" = "$AUTHOR" ]; then author_trusted=true; fi
+            done
+            if [ "$author_trusted" != "true" ]; then
+              reason="author '$AUTHOR' is not on the trusted list -- tested by ci-full.yml's isolated pull_request run instead"
+            elif [ "$IS_DRAFT" != "false" ]; then
+              reason="draft -- ci-full.yml is dispatched once the PR is marked ready for review"
+            else
+              dispatch=true
+            fi
+          fi
+          echo "dispatch=$dispatch" >> "$GITHUB_OUTPUT"
+          if [ "$dispatch" = "true" ]; then
+            echo "Dispatch allowed: in-repository head, trusted author '$AUTHOR', ready for review."
+          else
+            echo "Not dispatching ci-full.yml: $reason."
+          fi
+
       - name: Dispatch full CI (pass-through success -- no Codex round to wait on)
         # Excludes the Dependabot case (Codex review, PR #200 round 1, P1): GitHub withholds
         # ALL custom Actions secrets from a Dependabot-actor-triggered run, so CODEX_REVIEW_PAT
@@ -256,7 +303,9 @@ jobs:
         # no dispatch or PAT needed at all -- the check-run this job already created above
         # (conclusion=success) is a compatibility artifact only; the REAL required checks
         # ("test (ubuntu-latest)"/"test (macos-latest)") come from that native run.
-        if: steps.create-check.outputs.check_run_id != '' && steps.create-check.outputs.conclusion == 'success' && steps.create-check.outputs.is_dependabot != 'true'
+        # MAN-243: also gated on the trust step above -- a draft, a fork head or an untrusted
+        # author never reaches this dispatch.
+        if: steps.create-check.outputs.check_run_id != '' && steps.create-check.outputs.conclusion == 'success' && steps.create-check.outputs.is_dependabot != 'true' && steps.trust.outputs.dispatch == 'true'
         env:
           GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
           REPO: ${{ github.repository }}
@@ -326,9 +375,21 @@ jobs:
           else
             PR="${{ github.event.issue.number }}"
           fi
-          HEAD_SHA=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
-          echo "pr=$PR" >> "$GITHUB_OUTPUT"
-          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          # MAN-243: one fetch serves the head SHA AND the trust step's inputs (head repository,
+          # PR opener, draft flag) -- an issue_comment payload carries none of them, and reading
+          # them from the same response keeps them consistent with the SHA dispatched below.
+          pr_json=$(gh api "repos/$REPO/pulls/$PR")
+          HEAD_SHA=$(jq -r '.head.sha' <<< "$pr_json")
+          head_repo=$(jq -r '.head.repo.full_name // ""' <<< "$pr_json")
+          author=$(jq -r '.user.login // ""' <<< "$pr_json")
+          is_draft=$(jq -r '.draft' <<< "$pr_json")
+          {
+            echo "pr=$PR"
+            echo "head_sha=$HEAD_SHA"
+            echo "head_repo=$head_repo"
+            echo "author=$author"
+            echo "is_draft=$is_draft"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Skip if this review targeted a superseded head
         id: head-check
@@ -337,6 +398,43 @@ jobs:
           if [ "${{ github.event.review.commit_id }}" != "${{ steps.pr-context.outputs.head_sha }}" ]; then
             echo "::notice::This review targeted ${{ github.event.review.commit_id }}, which is no longer the PR's current head (${{ steps.pr-context.outputs.head_sha }}) -- skipping as superseded."
             echo "stale=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # MAN-243: same trust rule as codex-review-request's step of this name (see its comment),
+      # fed from the live PR fetched in "Resolve PR context" rather than the event payload. The
+      # run: body must stay byte-identical to that copy (test_ci_trust_boundary.py enforces it).
+      - name: Decide whether this revision may run CI in the default-branch context
+        id: trust
+        if: steps.head-check.outputs.stale != 'true'
+        env:
+          REPO: ${{ github.repository }}
+          HEAD_REPO: ${{ steps.pr-context.outputs.head_repo }}
+          AUTHOR: ${{ steps.pr-context.outputs.author }}
+          IS_DRAFT: ${{ steps.pr-context.outputs.is_draft }}
+        run: |
+          trusted_authors=(thagale 'catalyst-cloud-connector[bot]')
+          dispatch=false
+          reason=""
+          if [ -z "$HEAD_REPO" ] || [ "$HEAD_REPO" != "$REPO" ]; then
+            reason="head repository '${HEAD_REPO:-<deleted>}' is not $REPO -- tested by ci-full.yml's isolated pull_request run instead"
+          else
+            author_trusted=false
+            for a in "${trusted_authors[@]}"; do
+              if [ "$a" = "$AUTHOR" ]; then author_trusted=true; fi
+            done
+            if [ "$author_trusted" != "true" ]; then
+              reason="author '$AUTHOR' is not on the trusted list -- tested by ci-full.yml's isolated pull_request run instead"
+            elif [ "$IS_DRAFT" != "false" ]; then
+              reason="draft -- ci-full.yml is dispatched once the PR is marked ready for review"
+            else
+              dispatch=true
+            fi
+          fi
+          echo "dispatch=$dispatch" >> "$GITHUB_OUTPUT"
+          if [ "$dispatch" = "true" ]; then
+            echo "Dispatch allowed: in-repository head, trusted author '$AUTHOR', ready for review."
+          else
+            echo "Not dispatching ci-full.yml: $reason."
           fi
 
       - name: Find the most recent request comment for this head
@@ -781,6 +879,9 @@ jobs:
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
           OUTCOME: ${{ steps.compute-verdict.outcome }}
+          # MAN-243: the trust step's verdict; anything but "true" (including empty, if that step
+          # never ran) completes the check-run without dispatching.
+          DISPATCH: ${{ steps.trust.outputs.dispatch }}
         run: |
           # .status == "in_progress" (Codex P2, manta PR #200 review round 3): without this, a
           # SECOND qualifying Codex event for the same request (e.g. a review followed moments
@@ -800,6 +901,12 @@ jobs:
           fi
           if [ "$OUTCOME" = "success" ]; then
             gh api -X PATCH "repos/$REPO/check-runs/$check_id" -f status="completed" -f conclusion="success"
+            # MAN-243: only a trusted, in-repository, ready-for-review head is dispatched into
+            # main's context -- see the trust step's log for why this one isn't.
+            if [ "$DISPATCH" != "true" ]; then
+              echo "Not dispatching ci-full.yml for $HEAD_SHA (MAN-243 trust rule) -- see the 'Decide whether this revision may run CI in the default-branch context' step."
+              exit 0
+            fi
             # Dispatch against the repo's DEFAULT branch, never the PR's own head branch -- a
             # same-repo PR could otherwise replace ci-full.yml with an immediate-success job (or
             # run arbitrary steps with this caller's secrets).

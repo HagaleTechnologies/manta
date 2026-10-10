@@ -29,6 +29,12 @@ design rationale behind the behaviour described here.
      below) and, in parallel, `release` (creates the GitHub Release from
      the five build artifacts). `docker-publish-release` and
      `publish-latest` run in the `ghcr-publish` environment (MAN-66).
+
+   Both workflows build all five targets cold: no build cache is restored
+   (MAN-243, `docs/DECISIONS/2026-10-10-man243-ci-trust-boundary.md`).
+   Platform builds therefore take longer than a warm CI run. On 2026-10-05 a
+   cold dispatch took 1m47s–6m11s per target, while the Docker job took
+   about 24 min and still dominates.
 4. Watch the `release-publish.yml` run's summary for the GHCR visibility
    warning and the `:latest`-not-updated warning — see below.
 5. **Before announcing the release, run the clean-Windows check** below

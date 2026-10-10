@@ -11,16 +11,22 @@ name: CI
 # review/comment event directly, then dispatches THIS file via workflow_dispatch once a
 # revision is confirmed clean -- no more polling for a label from either side.
 #
-# `pull_request` IS still a trigger here (Codex review, PR #200 round 1, P1), scoped narrowly to
-# the one case that structurally needs it: GitHub withholds ALL custom Actions secrets from a
-# Dependabot-actor-triggered run, on every event type including pull_request_target (see
-# auto-merge-trigger.yml's own identical note) -- so wait-for-codex.yml's pass-through dispatch
-# for an excluded Dependabot PR has no CODEX_REVIEW_PAT available to call the workflow_dispatch
-# API (which GITHUB_TOKEN is rejected for outright, regardless of permissions), and with no
-# `pull_request` trigger left here at all, a Dependabot PR would NEVER get its required test
-# checks created -- permanently unmergeable. `test`/`test-soapy`/`test-hpsdr` below gate this
-# native trigger to `github.actor == 'dependabot[bot]'` only, so an ordinary human PR still goes
-# exclusively through the workflow_dispatch path (no double-run).
+# `pull_request` IS still a trigger here (Codex review, PR #200 round 1, P1), for every PR that
+# wait-for-codex.yml will not dispatch. Originally that was only Dependabot: GitHub withholds ALL
+# custom Actions secrets from a Dependabot-actor-triggered run, on every event type including
+# pull_request_target (see auto-merge-trigger.yml's own identical note) -- so wait-for-codex.yml's
+# pass-through dispatch for an excluded Dependabot PR has no CODEX_REVIEW_PAT available to call
+# the workflow_dispatch API (which GITHUB_TOKEN is rejected for outright, regardless of
+# permissions), and with no `pull_request` trigger left here at all, a Dependabot PR would NEVER
+# get its required test checks created -- permanently unmergeable. MAN-243 widened it: a
+# dispatched run executes the PR's code in main's context and Actions cache scope, so
+# wait-for-codex.yml now dispatches only a ready, in-repository PR opened by a trusted author.
+# Every other PR -- a fork head, or an author off the trusted list (Dependabot included) -- runs
+# `test`/`test-soapy`/`test-hpsdr` through this native trigger instead: GitHub's isolated path
+# (refs/pull/N/merge cache scope; for a fork, a read-only token, no secrets, and the
+# fork-approval setting). A trusted in-repository PR is skipped here, so it still goes
+# exclusively through the workflow_dispatch path (no double-run, and no PR ever gets `test (...)`
+# check-runs from two apps). See docs/DECISIONS/2026-10-10-man243-ci-trust-boundary.md.
 on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
@@ -119,11 +125,21 @@ jobs:
   # workflow_dispatch'd once wait-for-codex.yml's codex-review-response job has already
   # confirmed Codex is clean for this revision (or it's a merge_group/push run with no PR
   # review context at all), so there is no mid-review-loop skip state left to account for here.
-  # `pull_request` events are gated to Dependabot only (Codex review, PR #200 round 1, P1) --
-  # see this file's own `on:` block comment. A human-authored pull_request push never reaches
-  # this job via that trigger; only via workflow_dispatch, once Codex confirms clean.
+  #
+  # MAN-243: `pull_request` is the isolated path -- refs/pull/N/merge cache scope; for a fork, a
+  # read-only token, no secrets, and the repo's fork-approval setting. It runs for Dependabot (as
+  # before) and for every PR wait-for-codex.yml will not dispatch: a head outside this repository
+  # or an author off the trusted list. A trusted in-repository PR is skipped here and tested only
+  # through workflow_dispatch, so no PR ever gets both paths (two apps' `test (...)` check-runs on
+  # one SHA). Trusted drafts get no CI until ready for review. Keep the list identical to
+  # wait-for-codex.yml's trust steps and auto-merge-trigger.yml (test_ci_trust_boundary.py).
+  # See docs/DECISIONS/2026-10-10-man243-ci-trust-boundary.md.
   test:
-    if: github.event_name != 'pull_request' || github.actor == 'dependabot[bot]'
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.actor == 'dependabot[bot]' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      !contains(fromJSON('["thagale","catalyst-cloud-connector[bot]"]'), github.event.pull_request.user.login)
     strategy:
       fail-fast: false
       matrix:
@@ -164,7 +180,14 @@ jobs:
       # already the default shell.
       - run: scripts/check-rust-toolchain-pin.sh
         shell: bash
+      # MAN-243: restore-only except on a push to main. Only merged code writes the cache scope that
+      # main and merge-queue runs restore from; dispatched PR runs, merge-group runs and native
+      # pull_request runs restore and never save. Not a security boundary on its own -- code
+      # running in a job can reach the cache credentials -- which is why wait-for-codex.yml only
+      # dispatches trusted heads.
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.1
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
@@ -176,12 +199,20 @@ jobs:
       # workflows' ubuntu-latest runners.
       - if: runner.os != 'Windows'
         run: bash scripts/tests/release-version.test.sh
-  # Same Dependabot-only pull_request gate as `test` above -- not itself a required check, but
-  # matches this job's own pre-migration behavior (ran for a Dependabot PR too, gated only by
-  # codex-clean's tolerant skip) rather than silently dropping coverage for a Dependabot bump
-  # touching soapy-feature code.
+      # MAN-243: the CI trust boundary (who may run in main's context, who writes the shared cache,
+      # cold release builds) rides the already-required `test` check, like release-version above.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_ci_trust_boundary -v
+  # Same MAN-243 routing as `test` above (Dependabot plus every PR wait-for-codex.yml won't
+  # dispatch) -- not itself a required check, but matches this job's own pre-migration behavior
+  # (ran for a Dependabot PR too, gated only by codex-clean's tolerant skip) rather than silently
+  # dropping coverage for a PR touching soapy-feature code.
   test-soapy:
-    if: github.event_name != 'pull_request' || github.actor == 'dependabot[bot]'
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.actor == 'dependabot[bot]' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      !contains(fromJSON('["thagale","catalyst-cloud-connector[bot]"]'), github.event.pull_request.user.login)
     strategy:
       fail-fast: false
       matrix:
@@ -199,12 +230,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
+      # MAN-243: same restore-only rule as `test`'s cache step.
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.1
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: cargo clippy -p manta-input -p manta-cli --all-targets --features soapy -- -D warnings
       - run: cargo test -p manta-input -p manta-cli --features soapy
-  # Same Dependabot-only pull_request gate as `test` above -- see that job's own comment.
+  # Same MAN-243 routing as `test` above -- see that job's own comment.
   test-hpsdr:
-    if: github.event_name != 'pull_request' || github.actor == 'dependabot[bot]'
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.actor == 'dependabot[bot]' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      !contains(fromJSON('["thagale","catalyst-cloud-connector[bot]"]'), github.event.pull_request.user.login)
     strategy:
       fail-fast: false
       matrix:
@@ -220,7 +258,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
+      # MAN-243: same restore-only rule as `test`'s cache step.
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.1
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: cargo clippy -p manta-input -p manta-cli --all-targets --features hpsdr -- -D warnings
       - run: cargo test -p manta-input -p manta-cli --features hpsdr
 
