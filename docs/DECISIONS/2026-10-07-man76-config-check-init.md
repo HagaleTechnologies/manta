@@ -136,7 +136,7 @@ was the only one.
 
 ## Follow-ups (not in this change)
 
-- `run` could also reject unedited placeholders.
+- `run` could also reject unedited placeholders. Addressed for server.station_callsign only by MAN-268 (docs/DECISIONS/2026-10-10-man268-unattended-packaging.md).
 - `--json` output for `check` (needs `Serialize` across the config types).
 - Re-scope the scaffold's `bind_addr` lines when MAN-132 lands
   per-listener bind addresses. Done by MAN-132 (2026-10-08): the
@@ -144,7 +144,10 @@ was the only one.
   and `check`'s notes and duplicate-port rule are per listener — see
   `docs/DECISIONS/2026-10-08-man132-metrics-loopback-bind.md`.
 - Generate a shipped `manta.example.toml` from `manta config init --out -`
-  if MAN-75's packaging goal is revived.
+  if MAN-75's packaging goal is revived. Done by MAN-268 (2026-10-10): the
+  example is the scaffold with its own header and an active `[server]`
+  and station line, pinned to it by a test — see
+  `docs/DECISIONS/2026-10-10-man268-unattended-packaging.md`.
 
 ## References
 

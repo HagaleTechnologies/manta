@@ -46,3 +46,7 @@ regex = { workspace = true }
 sha2 = { workspace = true }
 tungstenite = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+# MAN-268: tests/packaging_examples.rs parses the shipped docker-compose.yml
+# as YAML rather than matching text fragments. Test-only; pinned here, not
+# in [workspace.dependencies], because no other crate reads YAML.
+serde_yaml_ng = "0.10"

@@ -118,30 +118,46 @@ fn reject_placeholders(loaded: &Loaded) -> Result<()> {
             loaded.origin
         );
     }
-    let example = |key: &str| -> Result<()> {
-        bail!(
-            "{}: {key} is still the example \"{EXAMPLE_CALLSIGN}\" -- set your own callsign",
-            loaded.origin
-        )
-    };
-    if let Some(server) = &loaded.server {
-        if server
-            .station_callsign
-            .eq_ignore_ascii_case(EXAMPLE_CALLSIGN)
-        {
-            example("server.station_callsign")?;
-        }
-    }
+    reject_example_station(loaded)?;
     for uplink in &loaded.rbn_uplink {
         if uplink
             .login_callsign
             .as_deref()
             .is_some_and(|c| c.eq_ignore_ascii_case(EXAMPLE_CALLSIGN))
         {
-            example("rbn_uplink.login_callsign")?;
+            return Err(example_callsign(loaded, "rbn_uplink.login_callsign"));
         }
     }
     Ok(())
+}
+
+/// MAN-268: the station half of `reject_placeholders`, which `run` (and
+/// its `listen` alias) also applies, after `prepare_live` and before any
+/// source or listener opens, so an unedited manta.example.toml cannot start
+/// a daemon that spots as N0CALL. `loaded` is after the `MANTA_*` overlay,
+/// so this checks the identity the daemon would use. Only the station:
+/// `run` skips the broad `<...>` scan, because a source flag replaces
+/// `[input]` and its unused placeholders. See
+/// docs/DECISIONS/2026-10-10-man268-unattended-packaging.md.
+pub(crate) fn reject_example_station(loaded: &Loaded) -> Result<()> {
+    match &loaded.server {
+        Some(server)
+            if server
+                .station_callsign
+                .eq_ignore_ascii_case(EXAMPLE_CALLSIGN) =>
+        {
+            Err(example_callsign(loaded, "server.station_callsign"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// D10: `key` still holds the scaffold's example callsign.
+fn example_callsign(loaded: &Loaded, key: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{}: {key} is still the example \"{EXAMPLE_CALLSIGN}\" -- set your own callsign",
+        loaded.origin
+    )
 }
 
 /// The first string value of the form `<...>`, as `(table.key, value)`.
@@ -1425,6 +1441,32 @@ mod tests {
              [input]\ntype = \"kiwi\"\nhost = \"rx.example.org\"\nfreq_hz = 7e6\n",
         );
         assert!(reject_placeholders(&ok).is_ok());
+    }
+
+    /// MAN-268: `run`'s check is the station half of `reject_placeholders`
+    /// with the same diagnostic, and nothing else.
+    #[test]
+    fn reject_example_station_checks_only_the_station() {
+        const STATION: &str =
+            "server.station_callsign is still the example \"N0CALL\" -- set your own callsign";
+        for call in ["N0CALL", "n0call"] {
+            let l = loaded(&format!("[server]\nstation_callsign = \"{call}\"\n"));
+            let err = format!("{:#}", reject_example_station(&l).unwrap_err());
+            assert_eq!(err, format!("{}: {STATION}", l.origin));
+            assert_eq!(format!("{:#}", reject_placeholders(&l).unwrap_err()), err);
+        }
+        // Placeholders `config check` refuses but `run` leaves alone: a
+        // receiver table a source flag may replace, and an uplink login.
+        let l = loaded(
+            "[server]\nstation_callsign = \"W1AW\"\n[[rbn_uplink]]\nenabled = true\n\
+             target_host = \"rbn.example.org\"\ntarget_port = 7000\nlogin_callsign = \"N0CALL\"\n\
+             [input]\ntype = \"kiwi\"\nhost = \"<your-receiver-host>\"\nfreq_hz = 7e6\n",
+        );
+        assert!(reject_placeholders(&l).is_err());
+        assert!(reject_example_station(&l).is_ok());
+        for body in ["", "[server]\nstation_callsign = \"W5AU-1\"\n"] {
+            assert!(reject_example_station(&loaded(body)).is_ok(), "{body:?}");
+        }
     }
 
     #[test]

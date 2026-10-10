@@ -215,28 +215,24 @@ jobs:
           }
           Write-Host "OK: no dynamic MSVC CRT imports."
 
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      # MAN-268: one helper and one asset list for tar.gz and zip alike -- the binary, README,
+      # licences, example config and service kit (scripts/tests/test_package_release.py runs this
+      # step's body). Git Bash on Windows, where the interpreter is `python`, not `python3`.
+      - name: Package
         shell: bash
         run: |
           set -euo pipefail
-          dist="dist/${{ matrix.artifact }}"
-          mkdir -p "$dist"
-          cp "target/${{ matrix.target }}/release/${BIN_NAME}${{ matrix.exe_ext }}" "$dist/"
-          cp README.md LICENSE-MIT LICENSE-APACHE "$dist/" 2>/dev/null || cp README.md "$dist/"
-          tar -C dist -czf "${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $dist = "dist/${{ matrix.artifact }}"
-          New-Item -ItemType Directory -Force -Path $dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}${{ matrix.exe_ext }}" $dist
-          Copy-Item README.md $dist
-          if (Test-Path LICENSE-MIT) { Copy-Item LICENSE-MIT $dist }
-          if (Test-Path LICENSE-APACHE) { Copy-Item LICENSE-APACHE $dist }
-          Compress-Archive -Path $dist -DestinationPath "${{ matrix.artifact }}.zip"
+          format=tar.gz
+          py=python3
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            format=zip
+            py=python
+          fi
+          "$py" scripts/package-release.py \
+            --binary "target/${{ matrix.target }}/release/${BIN_NAME}${{ matrix.exe_ext }}" \
+            --artifact "${{ matrix.artifact }}" \
+            --format "$format" \
+            --out-dir .
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
