@@ -4,7 +4,10 @@
 //!   Scenario: --version identifies the exact build
 //!   Scenario: Every emitted spot carries a real decoder version
 
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::net::TcpStream;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 /// The child must not inherit `MANTA_*` from the test runner (MAN-261's
 /// loader rejects unknown names), same as tests/cli.rs's `manta()`.
@@ -85,4 +88,104 @@ fn version_flag_commit_is_the_checkouts_head() {
         stdout.contains(&format!("(git {head};")),
         "{stdout:?} does not name HEAD {head}"
     );
+}
+
+/// Kills and reaps the daemon on drop, including on a failing assertion, so
+/// a failed test never leaks a `manta` process (node_health_acceptance.rs's
+/// `ChildGuard`).
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A minimal valid `[server]` table -- loopback only, every port 0
+/// (multi-agent hygiene: never bind a fixed port), as in tests/cli.rs.
+const SERVER_TOML: &str = "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n";
+
+/// Scenario 2, end to end: a real `manta run` over a synthetic recording,
+/// read off the JSON stream's wire. The stream keeps no history for late
+/// subscribers and dedupe suppresses re-spots for 600 s of sample time, so
+/// the client connects as soon as the `listening:` banner names the bound
+/// port -- about 2 ms after it, against ~0.9 s to the first spot.
+#[test]
+fn json_spots_carry_the_builds_decoder_version() {
+    let dir = tempfile::tempdir().unwrap();
+    // Full-length V1 (120 s), not tests/cli.rs's 30 s `short_v1()`: its
+    // first W1AW CQ spot still lands ~21 s of sample time in, but the
+    // replay then runs for ~100 s more. At EOF the daemon signals shutdown,
+    // and json_stream drops a client still inside its 500 ms wall-clock
+    // WebSocket-detection peek; a 30 s replay ends under a second after the
+    // banner here, close enough to that peek for a faster runner to lose
+    // the spot.
+    let spec = manta_testkit::vectors::v1();
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let wav = dir.path().join(format!("{}.wav", spec.name));
+    let cfg = dir.path().join("server.toml");
+    std::fs::write(&cfg, SERVER_TOML).unwrap();
+
+    let child = manta()
+        .arg("run")
+        .arg("--source")
+        .arg(&wav)
+        .args(["--source-iq", "--dial-freq-hz", "14000000", "--config"])
+        .arg(&cfg)
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn manta run");
+    let mut guard = ChildGuard(child);
+
+    // The banner names the bound port; ANSI colour codes sit outside the
+    // `json=<addr>` token.
+    let port_re = regex::Regex::new(r"json=127\.0\.0\.1:(\d+)").unwrap();
+    let mut lines = BufReader::new(guard.0.stderr.take().unwrap()).lines();
+    let mut before = Vec::new();
+    let port: u16 = loop {
+        let Some(line) = lines.next() else {
+            panic!(
+                "manta run exited before its listening: banner; stderr:\n{}",
+                before.join("\n")
+            );
+        };
+        let line = line.unwrap();
+        if line.contains("listening:") {
+            if let Some(c) = port_re.captures(&line) {
+                break c[1].parse().unwrap();
+            }
+        }
+        before.push(line);
+    };
+    // Keep draining stderr so a full pipe can never block the daemon.
+    std::thread::spawn(move || lines.map_while(Result::ok).for_each(drop));
+
+    let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    let mut first = String::new();
+    let n = BufReader::new(stream)
+        .read_line(&mut first)
+        .expect("no JSON spot within 60 s");
+    assert!(
+        n > 0,
+        "the JSON stream closed before any spot: the client connected too late \
+         (the stream keeps no history), or the replay produced no spot"
+    );
+    let spot: serde_json::Value = serde_json::from_str(&first).unwrap();
+    let want = format!(
+        "manta-{}+{}",
+        env!("CARGO_PKG_VERSION"),
+        env!("MANTA_GIT_SHA")
+    );
+    assert_eq!(spot["decoderVersion"], want.as_str(), "spot: {first}");
+    if std::env::var_os("MANTA_GIT_SHA").is_none() {
+        if let Some(head) = checkout_head() {
+            assert!(want.ends_with(&format!("+{head}")), "{want} vs HEAD {head}");
+        }
+    }
 }
