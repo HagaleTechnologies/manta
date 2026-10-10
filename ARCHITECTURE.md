@@ -277,9 +277,13 @@ A candidate held back by this gate is retried the moment `TrackMeta` arrives
 transmission may never produce again).
 
 1. **CQ/DE context parse**: regex-level scan for `CQ <call>`, `CQ TEST <call>`,
+   contest framing `CQ <contest> <call>` (an enumerated filler set, e.g.
+   `CQ WPX`) and a bare `TEST <call>` (MAN-104; a bare `TEST` between two
+   different callsigns, or after a sign-off such as `TU`, is ambiguous and
+   yields no candidate),
    `DE <call>`, `<call> UP`, beacon patterns (`V V V <call>`, and `<call> T`
    for NCDXF-style power-step beacons the decoder can't resolve past a
-   single trailing dash, MAN-37 — suppressed whenever a bare `CQ`/`DE`
+   single trailing dash, MAN-37 — suppressed whenever a bare `CQ`/`TEST`/`DE`
    token appears anywhere in the window at all (the token must be a
    complete decoded word, not a substring glued to punctuation inside
    one), a deliberately coarse guard against mistagging an ordinary,

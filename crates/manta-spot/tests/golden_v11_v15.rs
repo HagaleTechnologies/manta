@@ -79,6 +79,10 @@ fn v11_context_parse_sets_spot_type() {
         (&["CQ", "CQ", "DE", "K5ARH", "K5ARH", "K"], SpotType::Cq),
         (&["DE", "K5ARH", "K"], SpotType::De),
         (&["CQ", "TEST", "K5ARH", "K5ARH"], SpotType::Cq),
+        // MAN-104: contest framing -- a filler word between CQ and the call,
+        // and a bare TEST with no CQ.
+        (&["CQ", "WPX", "K5ARH", "K5ARH"], SpotType::Cq),
+        (&["TEST", "K5ARH", "K5ARH"], SpotType::Cq),
         (&["K5ARH", "UP", "UP"], SpotType::De),
         (&["V", "V", "V", "K5ARH", "K5ARH"], SpotType::Beacon),
         (&["K5ARH", "T"], SpotType::Beacon),
