@@ -118,7 +118,26 @@ fn reject_placeholders(loaded: &Loaded) -> Result<()> {
             loaded.origin
         );
     }
-    reject_example_station(loaded)?;
+    reject_example_callsigns(loaded)
+}
+
+/// MAN-268: the callsign half of `reject_placeholders`, which `run` (and
+/// its `listen` alias) also applies, after `prepare_live` and before any
+/// source or listener opens, so an unedited manta.example.toml cannot start
+/// a daemon that spots, or logs in to a collector, as N0CALL. `loaded` is
+/// after the `MANTA_*` overlay, so this checks the identities the daemon
+/// would use. Callsigns only: `run` skips the broad `<...>` scan, because a
+/// source flag replaces `[input]` and its unused placeholders. See
+/// docs/DECISIONS/2026-10-10-man268-unattended-packaging.md.
+pub(crate) fn reject_example_callsigns(loaded: &Loaded) -> Result<()> {
+    if let Some(server) = &loaded.server {
+        if server
+            .station_callsign
+            .eq_ignore_ascii_case(EXAMPLE_CALLSIGN)
+        {
+            return Err(example_callsign(loaded, "server.station_callsign"));
+        }
+    }
     for uplink in &loaded.rbn_uplink {
         if uplink
             .login_callsign
@@ -129,27 +148,6 @@ fn reject_placeholders(loaded: &Loaded) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// MAN-268: the station half of `reject_placeholders`, which `run` (and
-/// its `listen` alias) also applies, after `prepare_live` and before any
-/// source or listener opens, so an unedited manta.example.toml cannot start
-/// a daemon that spots as N0CALL. `loaded` is after the `MANTA_*` overlay,
-/// so this checks the identity the daemon would use. Only the station:
-/// `run` skips the broad `<...>` scan, because a source flag replaces
-/// `[input]` and its unused placeholders. See
-/// docs/DECISIONS/2026-10-10-man268-unattended-packaging.md.
-pub(crate) fn reject_example_station(loaded: &Loaded) -> Result<()> {
-    match &loaded.server {
-        Some(server)
-            if server
-                .station_callsign
-                .eq_ignore_ascii_case(EXAMPLE_CALLSIGN) =>
-        {
-            Err(example_callsign(loaded, "server.station_callsign"))
-        }
-        _ => Ok(()),
-    }
 }
 
 /// D10: `key` still holds the scaffold's example callsign.
@@ -1443,29 +1441,40 @@ mod tests {
         assert!(reject_placeholders(&ok).is_ok());
     }
 
-    /// MAN-268: `run`'s check is the station half of `reject_placeholders`
-    /// with the same diagnostic, and nothing else.
+    /// MAN-268: `run`'s check is the callsign half of `reject_placeholders`
+    /// with the same diagnostics, and nothing else.
     #[test]
-    fn reject_example_station_checks_only_the_station() {
+    fn reject_example_callsigns_checks_only_the_callsigns() {
         const STATION: &str =
             "server.station_callsign is still the example \"N0CALL\" -- set your own callsign";
         for call in ["N0CALL", "n0call"] {
             let l = loaded(&format!("[server]\nstation_callsign = \"{call}\"\n"));
-            let err = format!("{:#}", reject_example_station(&l).unwrap_err());
+            let err = format!("{:#}", reject_example_callsigns(&l).unwrap_err());
             assert_eq!(err, format!("{}: {STATION}", l.origin));
             assert_eq!(format!("{:#}", reject_placeholders(&l).unwrap_err()), err);
         }
-        // Placeholders `config check` refuses but `run` leaves alone: a
-        // receiver table a source flag may replace, and an uplink login.
+        // An uncommented example uplink login is refused too: no flag
+        // replaces [[rbn_uplink]].
+        let uplink = "[server]\nstation_callsign = \"W1AW\"\n[[rbn_uplink]]\nenabled = true\n\
+                      target_host = \"rbn.example.org\"\ntarget_port = 7000\n";
+        let l = loaded(&format!("{uplink}login_callsign = \"N0CALL\"\n"));
+        let err = format!("{:#}", reject_example_callsigns(&l).unwrap_err());
+        assert!(
+            err.contains("rbn_uplink.login_callsign is still the example \"N0CALL\""),
+            "{err}"
+        );
+        assert_eq!(format!("{:#}", reject_placeholders(&l).unwrap_err()), err);
+        assert!(reject_example_callsigns(&loaded(uplink)).is_ok());
+        // A placeholder `config check` refuses but `run` leaves alone: a
+        // receiver table a source flag may replace.
         let l = loaded(
-            "[server]\nstation_callsign = \"W1AW\"\n[[rbn_uplink]]\nenabled = true\n\
-             target_host = \"rbn.example.org\"\ntarget_port = 7000\nlogin_callsign = \"N0CALL\"\n\
+            "[server]\nstation_callsign = \"W1AW\"\n\
              [input]\ntype = \"kiwi\"\nhost = \"<your-receiver-host>\"\nfreq_hz = 7e6\n",
         );
         assert!(reject_placeholders(&l).is_err());
-        assert!(reject_example_station(&l).is_ok());
+        assert!(reject_example_callsigns(&l).is_ok());
         for body in ["", "[server]\nstation_callsign = \"W5AU-1\"\n"] {
-            assert!(reject_example_station(&loaded(body)).is_ok(), "{body:?}");
+            assert!(reject_example_callsigns(&loaded(body)).is_ok(), "{body:?}");
         }
     }
 

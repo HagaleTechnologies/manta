@@ -95,7 +95,8 @@ Error: manta.toml: server.station_callsign is still the example "N0CALL" -- set 
 ```
 
 It exits with status 1 before it opens the receiver or any listener;
-`manta listen` behaves the same. The check reads the effective value, so a
+`manta listen` behaves the same, and so does an uncommented
+`[[rbn_uplink]]` block whose `login_callsign` is still `N0CALL`. The check reads the effective value, so a
 `MANTA_SERVER_STATION_CALLSIGN` variable holding your call also satisfies
 it. Under a service manager the service fails, is started again, and logs
 this line each time until you fix the config.

@@ -136,7 +136,7 @@ was the only one.
 
 ## Follow-ups (not in this change)
 
-- `run` could also reject unedited placeholders. Addressed for server.station_callsign only by MAN-268 (docs/DECISIONS/2026-10-10-man268-unattended-packaging.md).
+- `run` could also reject unedited placeholders. Addressed for server.station_callsign and rbn_uplink.login_callsign only by MAN-268 (docs/DECISIONS/2026-10-10-man268-unattended-packaging.md).
 - `--json` output for `check` (needs `Serialize` across the config types).
 - Re-scope the scaffold's `bind_addr` lines when MAN-132 lands
   per-listener bind addresses. Done by MAN-132 (2026-10-08): the

@@ -14,9 +14,11 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
 import unittest
@@ -668,6 +670,204 @@ class CreateServiceAccountTests(unittest.TestCase):
     def test_writes_target_only_the_service_account(self):
         _, calls, _, _ = self.run_account()
         self.assertEqual({c[3] for c in self.writes(calls)}, {"/Groups/_manta", "/Users/_manta"})
+
+
+
+# --- packaging/README.md: the installation guide ------------------------------------------------
+# Checks the executable ```sh blocks, never prose: every path an install command copies to must
+# be the path the service definition runs from, the macOS account must exist before any plist
+# names it, and every relative link must resolve inside an extracted release archive.
+
+GUIDE = os.path.join(ROOT, "packaging", "README.md")
+UNIT = os.path.join(ROOT, "packaging", "systemd", "manta.service")
+PACKAGE_RELEASE = os.path.join(ROOT, "scripts", "package-release.py")
+
+
+def sh_blocks(path):
+    """Each ```sh fence in `path` as a list of argv lists; comment and blank lines dropped."""
+    with open(path, encoding="utf-8") as f:
+        text = f.read().replace("\r\n", "\n")
+    blocks = []
+    for body in re.findall(r"^```sh\n(.*?)^```$", text, flags=re.S | re.M):
+        argvs = []
+        for line in body.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                argvs.append(shlex.split(line))
+        blocks.append(argvs)
+    return blocks
+
+
+def install_command(argv):
+    """`[sudo] install [-d] [-o O] [-g G] [-m M] operands...` as a dict, or None."""
+    if argv[:1] == ["sudo"]:
+        argv = argv[1:]
+    if argv[:1] != ["install"]:
+        return None
+    parsed = {"dir": False, "owner": None, "group": None, "mode": None, "operands": []}
+    args = iter(argv[1:])
+    for arg in args:
+        if arg == "-d":
+            parsed["dir"] = True
+        elif arg in ("-o", "-g", "-m"):
+            parsed[{"-o": "owner", "-g": "group", "-m": "mode"}[arg]] = next(args)
+        else:
+            parsed["operands"].append(arg)
+    return parsed
+
+
+def installs(block):
+    return [c for c in (install_command(a) for a in block) if c is not None]
+
+
+def file_installs(block):
+    """{destination: (source, install)} for every non-directory install; a destination ending
+    in `/` gets the source's file name, as install(1) does."""
+    out = {}
+    for c in installs(block):
+        if c["dir"]:
+            continue
+        src, dest = c["operands"]
+        if dest.endswith("/"):
+            dest += os.path.basename(src)
+        out[dest] = (src, c)
+    return out
+
+
+def unit_values(path):
+    """A systemd unit as {(section, key): last value}."""
+    values, section = {}, None
+    with open(path, encoding="utf-8") as f:
+        for line in f.read().splitlines():
+            line = line.strip()
+            if not line or line[0] in "#;":
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1]
+            elif "=" in line:
+                key, value = line.split("=", 1)
+                values[(section, key.strip())] = value.strip()
+    return values
+
+
+def block_with(blocks, *words):
+    found = [b for b in blocks if any(all(w in a for w in words) for a in b)]
+    if not found:
+        raise AssertionError("no ```sh block in %s runs %r" % (GUIDE, words))
+    return found[0]
+
+
+class InstallGuideTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.blocks = sh_blocks(GUIDE)
+        cls.daemon = load_plist(DAEMON_PLIST)
+        cls.rotate = load_plist(ROTATE_PLIST)
+
+    def test_systemd_install_paths_match_the_unit(self):
+        block = block_with(self.blocks, "enable", "--now")
+        unit = unit_values(UNIT)
+        files = file_installs(block)
+        exec_start = shlex.split(unit[("Service", "ExecStart")])
+        credential_name, credential_path = unit[("Service", "LoadCredential")].split(":", 1)
+
+        self.assertIn(exec_start[0], files, "binary is installed where ExecStart runs it")
+        self.assertEqual(files[exec_start[0]][0], "./manta")
+        self.assertEqual(exec_start[1:3], ["run", "--config"])
+        self.assertEqual(exec_start[3], "${CREDENTIALS_DIRECTORY}/" + credential_name)
+        self.assertIn(credential_path, files, "config is installed where LoadCredential reads it")
+        self.assertEqual(files[credential_path][0], "manta.toml")
+        self.assertEqual(files[credential_path][1]["mode"], "0600")
+        unit_dest = "/etc/systemd/system/manta.service"
+        self.assertEqual(files[unit_dest][0], os.path.relpath(UNIT, ROOT).replace(os.sep, "/"))
+        self.assertIn(["sudo", exec_start[0], "config", "check", "--config", credential_path], block)
+        self.assertIn(["sudo", "systemd-analyze", "verify", unit_dest], block)
+        self.assertIn(["sudo", "systemctl", "stop", "manta"], block)
+
+    def test_macos_install_paths_match_the_plists(self):
+        block = block_with(self.blocks, "bootstrap")
+        files = file_installs(block)
+        binary, _, _, config = self.daemon["ProgramArguments"]
+        user, group = self.daemon["UserName"], self.daemon["GroupName"]
+
+        self.assertEqual(files[binary][0], "./manta")
+        self.assertEqual(files[config][0], "manta.toml")
+        self.assertEqual((files[config][1]["group"], files[config][1]["mode"]), (group, "0640"))
+        self.assertIn(["sudo", "-u", user, binary, "config", "check", "--config", config], block)
+        rotate_script = self.rotate["ProgramArguments"][1]
+        self.assertEqual(files[rotate_script][0], "packaging/launchd/rotate-log.sh")
+        log_dirs = [c for c in installs(block)
+                    if c["dir"] and c["operands"] == [os.path.dirname(self.daemon["StandardOutPath"])]]
+        self.assertEqual(len(log_dirs), 1, "the log directory is created")
+        self.assertEqual((log_dirs[0]["owner"], log_dirs[0]["group"]), (user, group))
+        for plist in (DAEMON_PLIST, ROTATE_PLIST):
+            name = os.path.basename(plist)
+            dest = "/Library/LaunchDaemons/" + name
+            self.assertEqual(files[dest][0], "packaging/launchd/" + name)
+            self.assertIn(["plutil", "-lint", dest], block)
+            self.assertIn(["sudo", "launchctl", "bootstrap", "system", dest], block)
+        for label in (self.daemon["Label"], self.rotate["Label"]):
+            self.assertIn(["sudo", "launchctl", "bootout", "system/" + label], block)
+
+    def test_account_is_created_before_any_plist_is_installed_or_bootstrapped(self):
+        account = ["sudo", "sh", "packaging/launchd/create-service-account.sh"]
+        checked = 0
+        for block in self.blocks:
+            uses = [i for i, a in enumerate(block)
+                    if "bootstrap" in a
+                    or any(w.endswith(".plist") for w in (install_command(a) or {}).get("operands", []))]
+            if not uses:
+                continue
+            checked += 1
+            self.assertIn(account, block)
+            self.assertLess(block.index(account), min(uses),
+                            "create-service-account.sh runs before %r" % (block[min(uses)],))
+        self.assertGreater(checked, 0)
+
+    def test_copy_sources_and_links_resolve_in_the_extracted_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = os.path.join(tmp, "manta")
+            write_bytes(binary, b"fake manta")
+            subprocess.run([sys.executable, PACKAGE_RELEASE, "--binary", binary,
+                            "--artifact", "manta-test", "--format", "tar.gz", "--out-dir", tmp],
+                           check=True, capture_output=True)
+            with tarfile.open(os.path.join(tmp, "manta-test.tar.gz")) as tar:
+                if hasattr(tarfile, "data_filter"):
+                    tar.extractall(tmp, filter="data")
+                else:  # Python < 3.11.4; the archive is the one just built above
+                    tar.extractall(tmp)
+            top = os.path.join(tmp, "manta-test")
+            guide = os.path.join(top, "packaging", "README.md")
+
+            with open(guide, encoding="utf-8") as f:
+                links = re.findall(r"\]\(([^)\s]+)\)", f.read())
+            relative = [l.split("#")[0] for l in links
+                        if not re.match(r"[a-z]+:", l) and not l.startswith("#")]
+            self.assertTrue(relative)
+            for link in relative:
+                target = os.path.normpath(os.path.join(os.path.dirname(guide), link))
+                self.assertTrue(target.startswith(top + os.sep), link)
+                self.assertTrue(os.path.isfile(target), "%s does not ship" % link)
+
+            sources = [a[1] for b in sh_blocks(guide) for a in b if a[:1] == ["cp"]]
+            sources += [src for b in sh_blocks(guide) for src, _ in file_installs(b).values()]
+            for src in sources:
+                if src in ("./manta", "manta.toml"):
+                    continue  # the binary and the operator's own edited copy
+                self.assertTrue(os.path.isfile(os.path.join(top, src)), "%s does not ship" % src)
+
+
+class GitignoreTests(unittest.TestCase):
+    def ignored(self, path):
+        proc = subprocess.run(["git", "check-ignore", "--no-index", "-q", path], cwd=ROOT)
+        self.assertIn(proc.returncode, (0, 1), "git check-ignore failed")
+        return proc.returncode == 0
+
+    def test_only_the_root_operator_config_is_ignored(self):
+        self.assertTrue(self.ignored("manta.toml"))
+        self.assertFalse(self.ignored("manta.example.toml"))
+        self.assertFalse(self.ignored("docs/RUNBOOKS/field-node/manta.toml"))
+        self.assertFalse(self.ignored("packaging/manta.toml"))
 
 
 if __name__ == "__main__":

@@ -1,11 +1,11 @@
-# 2026-10-10 — MAN-268: unattended service kit and the station-callsign startup guard
+# 2026-10-10 — MAN-268: unattended service kit and the example-callsign startup guard
 
 **Status:** Implemented (branch `MAN-268`). Ships an example config and
 service files for systemd, macOS launchd and Docker Compose, in the
 repository and in every release archive, and makes `run` refuse the
-example station callsign. Supersedes MAN-75 (PR #124, closed unmerged on
-2026-10-06) and resolves its six open review findings. Native installs on
-real systemd, macOS and Docker hosts have not been run (see
+example callsign as the station or an uplink login. Supersedes MAN-75
+(PR #124, closed unmerged on 2026-10-06) and resolves its six open review
+findings. Native installs on real systemd, macOS and Docker hosts have not been run (see
 Consequences). Operator instructions: `packaging/README.md`.
 
 ## Context
@@ -49,26 +49,30 @@ Consequences). Operator instructions: `packaging/README.md`.
   `packaging_examples.rs` applies the edits to the live scaffold and
   compares the result with the file, so a change to `config_init.toml`
   fails the build until the example follows.
-- **D3 — station-only startup guard.** The exact `N0CALL` comparison for
-  `server.station_callsign` (case-insensitive) and its diagnostic, until
-  now inside `config check`, are the crate-visible
-  `config_cmd::reject_example_station`, which both `config check` and the
+- **D3 — callsign-only startup guard.** The exact `N0CALL` comparisons
+  (case-insensitive) for `server.station_callsign` and
+  `rbn_uplink.login_callsign`, and their diagnostics, until now inside
+  `config check`, are the crate-visible
+  `config_cmd::reject_example_callsigns`, which both `config check` and the
   `Command::Run` arm call. `run`, and its alias `listen`, call it right
   after `prepare_live` returns: before `is_rf_aware()` (which can open IQ
   WAVs), the dial-frequency guard and any source or listener I/O. It reads
   the typed config after the `MANTA_*` overlay, so
   `MANTA_SERVER_STATION_CALLSIGN` can supply a real call over the file's
-  placeholder, or reintroduce `N0CALL` over a real one. The failure is
+  placeholder, or reintroduce `N0CALL` over a real one. The station failure
+  is
   `Error: <config>: server.station_callsign is still the example "N0CALL" -- set your own callsign`,
   exit 1, empty stdout. Callsign grammar and SSID handling are unchanged.
   The broad `<...>` scan stays check-only: a CLI source flag replaces the
   whole `[input]` table (MAN-261), so a placeholder left in an unused
   `[input]` is legitimate for `run`, and scanning raw values would refuse
-  valid invocations. An explicit `login_callsign = "N0CALL"` also stays
-  check-only: the example leaves `[[rbn_uplink]]` commented, a login
-  defaults to the station call this guard covers, and `dry_run` defaults
-  to `true`. `decode`, `oracle`, `soak`, `doctor` and `status` get no new
-  refusal.
+  valid invocations. The uplink login is checked at startup too (added in
+  self-review; the plan had the station only): the example tells an
+  operator to uncomment the whole `[[rbn_uplink]]` block, including
+  `login_callsign = "N0CALL"`, no flag replaces that table, and with
+  `dry_run = false` the daemon would send spots to a collector under the
+  placeholder login. `decode`, `oracle`, `soak`, `doctor` and `status` get
+  no new refusal.
 - **D4 — 60-second stop budgets, not the ticket's 30.**
   `TimeoutStopSec=60`, launchd `ExitTimeOut` 60 and Compose
   `stop_grace_period: 60s`. A 30 s budget would SIGKILL a manta that is
@@ -202,9 +206,9 @@ Consequences). Operator instructions: `packaging/README.md`.
 - An operator who copies the example, sets a callsign and a receiver, and
   runs `config check` can install any of the three services from an
   extracted archive.
-- `run` and `listen` now refuse a station callsign of exactly `N0CALL`;
-  anyone deliberately running under it must use their own call. Config
-  precedence is unchanged, `run` still discovers no config file, and no
+- `run` and `listen` now refuse a station callsign or uplink login of
+  exactly `N0CALL`; anyone deliberately running under it must use their
+  own call. Config precedence is unchanged, `run` still discovers no config file, and no
   existing install or operator file is changed.
 - The three stop budgets and `SHUTDOWN_DRAIN_DEADLINE` move together; the
   test enforces it.
