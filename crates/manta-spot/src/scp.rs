@@ -12,7 +12,26 @@ pub struct Set {
     calls: HashSet<String>,
 }
 
+impl std::fmt::Debug for Set {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Set").field("calls", &self.len()).finish()
+    }
+}
+
 impl Set {
+    /// The table built into manta.
+    pub fn bundled() -> Self {
+        Self::parse(crate::MASTER_SCP)
+    }
+    /// Number of distinct calls in the table.
+    pub fn len(&self) -> usize {
+        self.calls.len()
+    }
+    /// Whether the table has no calls.
+    pub fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
+
     /// Parses a `MASTER.SCP` file's full contents.
     pub fn parse(master_scp: &str) -> Self {
         let calls = master_scp
@@ -32,6 +51,25 @@ impl Set {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn len_counts_calls_not_headers() {
+        assert_eq!(Set::parse(FIXTURE).len(), 3);
+    }
+    #[test]
+    fn comment_only_input_is_empty() {
+        assert!(Set::parse("!!header\n# comment\n").is_empty());
+    }
+    #[test]
+    fn debug_summarises_instead_of_dumping_the_set() {
+        let text = format!("{:?}", Set::parse(crate::MASTER_SCP));
+        assert!(text.starts_with("Set { calls: "), "{text}");
+        assert!(text.len() < 64, "{text}");
+    }
+    #[test]
+    fn bundled_is_the_vendored_file() {
+        assert_eq!(Set::bundled().len(), Set::parse(crate::MASTER_SCP).len());
+    }
 
     const FIXTURE: &str = "\
 !!Order,1,1

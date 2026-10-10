@@ -613,3 +613,73 @@ fn unedited_placeholder_fails_check_naming_the_key() {
         "{err}"
     );
 }
+
+#[test]
+fn check_reports_an_unreadable_cty_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(
+        dir.path(),
+        "manta.toml",
+        "[spot]\ncty_path = 'missing.dat'\n",
+    );
+    let err = fails(&check_file(&cfg));
+    assert!(
+        err.contains("reading cty.dat file") && err.contains("missing.dat"),
+        "{err}"
+    );
+}
+
+#[test]
+fn check_summary_shows_the_resolved_cty_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let cty = write_cfg(dir.path(), "cty.dat", manta_spot::CTY_DAT);
+    let cfg = write_cfg(dir.path(), "manta.toml", "[spot]\ncty_path = 'cty.dat'\n");
+    let out = succeeds(&check_file(&cfg));
+    assert!(
+        out.contains(&format!("cty_path={}", cty.display())),
+        "{out}"
+    );
+    assert!(out.contains("scp_path=bundled"), "{out}");
+}
+
+use std::time::SystemTime;
+/// Scenario 2 against the real clock, without depending on today's date:
+/// the binary warns exactly when manta-spot's own age function says the
+/// built-in table is stale. Evaluated before and after the spawn; if the
+/// day rolls over in between, either answer is accepted.
+#[test]
+fn check_warns_about_the_built_in_cty_exactly_when_it_is_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cfg(dir.path(), "manta.toml", "");
+    let before = manta_spot::vintage::stale_cty_dat_age_days(SystemTime::now());
+    let o = check_file(&path);
+    let after = manta_spot::vintage::stale_cty_dat_age_days(SystemTime::now());
+    succeeds(&o);
+    let err = stderr(&o);
+    let warned = err.contains("warning: the built-in cty.dat is ");
+    assert!(
+        warned == before.is_some() || warned == after.is_some(),
+        "{err}"
+    );
+    if warned {
+        // The line names the age the library computes for the same moment.
+        assert!(
+            [before, after]
+                .iter()
+                .flatten()
+                .any(|d| err.contains(&format!("is {d} days old"))),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn check_never_warns_about_cty_age_with_an_override() {
+    // Holds on any date: an operator-supplied table is never age-checked.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("cty.dat"), manta_spot::CTY_DAT).unwrap();
+    let path = write_cfg(dir.path(), "manta.toml", "[spot]\ncty_path = \"cty.dat\"\n");
+    let o = check_file(&path);
+    succeeds(&o);
+    assert!(!stderr(&o).contains("built-in cty.dat"), "{}", stderr(&o));
+}

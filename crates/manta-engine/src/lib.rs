@@ -25,6 +25,7 @@ use manta_decode::events::DecoderEvent;
 use manta_input::{read_all, IqSource, WavIqSource};
 use num_complex::Complex32;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Applies the calibration factor to every event variant that carries a
 /// `freq_hz` (`TrackMeta`, `TrackPromoted`), leaving every other variant
@@ -107,6 +108,40 @@ pub struct PipelineConfig {
     /// Operator's notched-frequency list (MAN-31). Empty by default -- no
     /// suppression until the operator supplies one.
     pub notch: NotchList,
+    /// Operator-supplied cty.dat, parsed once. None uses the bundled table.
+    pub cty: Option<Arc<manta_spot::cty::Table>>,
+    /// Operator-supplied MASTER.SCP, parsed once. None uses the bundled set.
+    pub scp: Option<Arc<manta_spot::scp::Set>>,
+}
+
+impl PipelineConfig {
+    /// The resolved country table, shared with the daemon's geography lookup.
+    pub fn cty_table(&self) -> Arc<manta_spot::cty::Table> {
+        self.cty
+            .clone()
+            .unwrap_or_else(|| Arc::new(manta_spot::cty::Table::bundled()))
+    }
+    /// The resolved known-callsign set.
+    pub fn scp_set(&self) -> Arc<manta_spot::scp::Set> {
+        self.scp
+            .clone()
+            .unwrap_or_else(|| Arc::new(manta_spot::scp::Set::bundled()))
+    }
+    /// Builds the validator used by every production decode path.
+    pub fn validator(&self, fs: f64) -> Result<manta_spot::Validator> {
+        // Keep the checked ppm constructor so callers cannot supply an
+        // unchecked raw calibration factor (MAN-29).
+        let mut validator =
+            manta_spot::Validator::from_tables(fs, self.cty_table(), Some(self.scp_set()))
+                .with_freq_correction_ppm(self.freq_correction_ppm)
+                .map_err(|e| anyhow::anyhow!(e))?
+                .with_blocklist(self.blocklist.clone())
+                .with_notch(self.notch.clone());
+        for call in &self.allowlist {
+            validator.allowlist(call);
+        }
+        Ok(validator)
+    }
 }
 
 impl Default for PipelineConfig {
@@ -118,6 +153,8 @@ impl Default for PipelineConfig {
             allowlist: Vec::new(),
             blocklist: Blocklist::default(),
             notch: NotchList::default(),
+            cty: None,
+            scp: None,
         }
     }
 }
@@ -238,18 +275,7 @@ pub fn decode_samples(
         _ => None,
     });
     let text = events_to_text(&this_track);
-    // Re-derives the same factor already validated above -- kept behind
-    // the ppm-based constructor rather than a raw-factor setter so no
-    // caller of manta-spot's public API can smuggle in an unchecked
-    // factor (MAN-29 review: validate before construction, not after).
-    let mut validator = manta_spot::Validator::bundled(fs)
-        .with_freq_correction_ppm(cfg.freq_correction_ppm)
-        .map_err(|e| anyhow::anyhow!(e))?
-        .with_blocklist(cfg.blocklist.clone())
-        .with_notch(cfg.notch.clone());
-    for call in &cfg.allowlist {
-        validator.allowlist(call);
-    }
+    let mut validator = cfg.validator(fs)?;
     let mut spots = Vec::new();
     for ev in &events {
         spots.extend(validator.ingest(ev));
@@ -292,6 +318,74 @@ pub fn decode_wav(path: &Path, cfg: &PipelineConfig) -> Result<DecodeReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The QQ9ZZZ fixture `cli.rs`'s allowlist test uses: V1, 30 s, an
+    /// unallocated-prefix call.
+    fn qq9zzz_spec() -> manta_testkit::vectors::VectorSpec {
+        let mut spec = manta_testkit::vectors::v1();
+        spec.duration_s = 30.0;
+        spec.signals[0].text = "CQ CQ DE QQ9ZZZ QQ9ZZZ K".into();
+        spec
+    }
+
+    fn cty_with_qq9() -> Arc<manta_spot::cty::Table> {
+        Arc::new(manta_spot::cty::Table::parse(&format!(
+            "{}Test DXpedition:  14:  27:  EU:  50.0:  -5.0:  0.0:  QQ9:\n    QQ9;\n",
+            manta_spot::CTY_DAT
+        )))
+    }
+
+    #[test]
+    fn decode_samples_spots_a_call_only_an_override_cty_allocates() {
+        let spec = qq9zzz_spec();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let calls = |cfg: &PipelineConfig| -> Vec<String> {
+            decode_samples(&rendered.samples, spec.fs, spec.center_freq_hz, cfg)
+                .unwrap()
+                .spots
+                .into_iter()
+                .map(|s| s.callsign)
+                .collect()
+        };
+        assert!(!calls(&PipelineConfig::default()).contains(&"QQ9ZZZ".to_string()));
+        let cfg = PipelineConfig {
+            cty: Some(cty_with_qq9()),
+            ..Default::default()
+        };
+        assert!(
+            calls(&cfg).contains(&"QQ9ZZZ".to_string()),
+            "override must let QQ9ZZZ spot"
+        );
+    }
+
+    #[test]
+    fn default_pipeline_config_uses_the_built_in_tables() {
+        let cfg = PipelineConfig::default();
+        assert!(cfg.cty_table().is_allocated("W1AW"));
+        assert!(!cfg.cty_table().is_allocated("QQ9ZZZ"));
+        assert_eq!(cfg.scp_set().len(), manta_spot::scp::Set::bundled().len());
+    }
+
+    #[test]
+    fn an_override_table_is_shared_not_copied() {
+        let table = cty_with_qq9();
+        let cfg = PipelineConfig {
+            cty: Some(table.clone()),
+            ..Default::default()
+        };
+        assert!(Arc::ptr_eq(&cfg.cty_table(), &table));
+    }
+
+    #[test]
+    fn pipeline_config_debug_stays_short_with_tables_loaded() {
+        let cfg = PipelineConfig {
+            cty: Some(Arc::new(manta_spot::cty::Table::bundled())),
+            scp: Some(Arc::new(manta_spot::scp::Set::bundled())),
+            ..Default::default()
+        };
+        // Loaded tables add a size summary, not ~50k callsigns.
+        let baseline = format!("{:?}", PipelineConfig::default()).len();
+        assert!(format!("{cfg:?}").len() < baseline + 200);
+    }
 
     /// Regression (round-5 review, P1): an early low-track-id candidate
     /// that only ever produced a `TrackPromoted` (promoted, then merged/
