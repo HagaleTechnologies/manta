@@ -439,11 +439,7 @@ async fn connect_and_forward(
         &mut reader,
         &mut wr,
         &mut rx,
-<<<<<<< HEAD
         dry_run,
-=======
-        config,
->>>>>>> 51c0ae0da36c62e814f317e062fc5bb2c3429b3f
         config.spot_types,
         login_callsign,
         bus,
@@ -551,11 +547,7 @@ async fn forward_loop(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
     wr: &mut tokio::net::tcp::OwnedWriteHalf,
     rx: &mut broadcast::Receiver<crate::bus::BusSpot>,
-<<<<<<< HEAD
     dry_run: &AtomicBool,
-=======
-    config: &RbnUplinkConfig,
->>>>>>> 51c0ae0da36c62e814f317e062fc5bb2c3429b3f
     spot_types: UplinkSpotTypes,
     spotter_call: &str,
     bus: &Arc<SpotBus>,
@@ -580,11 +572,7 @@ async fn forward_loop(
                             target.record_suppressed();
                             continue;
                         }
-<<<<<<< HEAD
                         if dry_run.load(Ordering::Relaxed) {
-=======
-                        if config.dry_run {
->>>>>>> 51c0ae0da36c62e814f317e062fc5bb2c3429b3f
                             target.record_suppressed();
                             continue;
                         }
