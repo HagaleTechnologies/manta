@@ -1554,7 +1554,10 @@ async fn rows_for(
     let version = version_line();
     let mut lines = read_lines_until(reader, "the sh/version barrier", |l| l == version).await;
     lines.pop();
-    lines.into_iter().map(|l| l.trim_end().to_string()).collect()
+    lines
+        .into_iter()
+        .map(|l| l.trim_end().to_string())
+        .collect()
 }
 
 fn metric(metrics: &Metrics, name: &str) -> u64 {
@@ -1682,12 +1685,17 @@ async fn sh_dx_count_with_a_mode_suffix_keeps_aggregators_count_meaning() {
     bus.publish(forty);
 
     let (mut reader, mut wr) = connect_and_login(addr).await;
-    assert_eq!(rows_for(&mut reader, &mut wr, "sh/dx 20 CW").await, expected);
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "sh/dx 20 CW").await,
+        expected
+    );
     assert_eq!(
         rows_for(&mut reader, &mut wr, "sh/dx 1 CW").await,
         expected[1..]
     );
-    assert!(rows_for(&mut reader, &mut wr, "sh/dx RTTY").await.is_empty());
+    assert!(rows_for(&mut reader, &mut wr, "sh/dx RTTY")
+        .await
+        .is_empty());
     assert!(rows_for(&mut reader, &mut wr, "sh/dx 20 RTTY")
         .await
         .is_empty());
@@ -1757,7 +1765,10 @@ async fn sh_dx_band_extension_selects_only_that_band_and_leaves_the_live_stream_
         rows_for(&mut reader, &mut wr, "SHOW/DX/1/BAND/20M").await,
         [r2]
     );
-    assert_eq!(rows_for(&mut reader, &mut wr, "sh/dx BAND 40m").await, [r40]);
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "sh/dx BAND 40m").await,
+        [r40]
+    );
     assert!(rows_for(&mut reader, &mut wr, "sh/dx BAND 15m")
         .await
         .is_empty());
@@ -1830,12 +1841,17 @@ async fn scoped_sh_dx_applies_the_unique_filter_after_count_selection_without_ba
     assert!(rows_for(&mut reader, &mut wr, "sh/dx BAND 40m")
         .await
         .is_empty());
-    assert!(rows_for(&mut reader, &mut wr, "sh/dx RTTY").await.is_empty());
+    assert!(rows_for(&mut reader, &mut wr, "sh/dx RTTY")
+        .await
+        .is_empty());
     assert_eq!(
         metric(&metrics, "manta_spots_suppressed_by_filter_total"),
         1
     );
-    assert_eq!(metric(&metrics, "manta_spots_dropped_write_failed_total"), 0);
+    assert_eq!(
+        metric(&metrics, "manta_spots_dropped_write_failed_total"),
+        0
+    );
     assert_eq!(metric(&metrics, "manta_spots_dropped_lagged_total"), 0);
     assert_eq!(metric(&metrics, "manta_spots_replay_abandoned_total"), 0);
 }

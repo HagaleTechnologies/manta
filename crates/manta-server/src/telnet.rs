@@ -1255,12 +1255,10 @@ mod tests {
             ["K12AA", "K13AA", "K14AA"]
         );
         assert!(
-            select_history_at(&bus, &q(HistorySelection::Count(Some(0)), None, None), 0)
-                .is_empty()
+            select_history_at(&bus, &q(HistorySelection::Count(Some(0)), None, None), 0).is_empty()
         );
         assert_eq!(
-            select_history_at(&bus, &q(HistorySelection::Count(Some(1000)), None, None), 0)
-                .len(),
+            select_history_at(&bus, &q(HistorySelection::Count(Some(1000)), None, None), 0).len(),
             15
         );
     }
@@ -1314,7 +1312,11 @@ mod tests {
         assert_eq!(
             calls(&select_history_at(
                 &bus,
-                &q(HistorySelection::Count(None), Some("20m"), Some(QueryMode::Cw)),
+                &q(
+                    HistorySelection::Count(None),
+                    Some("20m"),
+                    Some(QueryMode::Cw)
+                ),
                 0
             )),
             ["K1AAA", "K2BBB", "K3CCC"]

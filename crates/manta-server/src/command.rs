@@ -150,9 +150,7 @@ fn parse_band(token: &str) -> Option<&'static str> {
     crate::band::allocations()
         .iter()
         .map(|(name, _, _)| *name)
-        .find(|name| {
-            name.eq_ignore_ascii_case(token) || name.strip_suffix('m') == Some(token)
-        })
+        .find(|name| name.eq_ignore_ascii_case(token) || name.strip_suffix('m') == Some(token))
 }
 
 #[cfg(test)]
@@ -307,7 +305,14 @@ mod tests {
 
     #[test]
     fn commands_manta_does_not_implement_are_unknown() {
-        for line in ["help", "set/skimmer", "set/nocq", "sh/filter", "   ", "\r\n"] {
+        for line in [
+            "help",
+            "set/skimmer",
+            "set/nocq",
+            "sh/filter",
+            "   ",
+            "\r\n",
+        ] {
             assert_eq!(parse(line), Command::Unknown, "{line:?}");
         }
     }
