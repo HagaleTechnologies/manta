@@ -145,6 +145,7 @@ this change. See [the MAN-244 decision](../DECISIONS/2026-10-10-man244-release-g
      `ghcr.io/hagaletechnologies/manta:X.Y.Z`) → `publish-latest` (see
      below) and, in parallel, `release` (creates the GitHub Release from
      the five build artifacts). `docker-publish-release` and
+<<<<<<< HEAD
      `publish-latest` run in the `ghcr-publish` environment. The build-only
      workflow has the same ancestry guard before its platform builds.
 4. When `docker-publish-release` waits for deployment approval, the owner
@@ -153,6 +154,16 @@ this change. See [the MAN-244 decision](../DECISIONS/2026-10-10-man244-release-g
    `publish-latest` job may request a second approval; inspect and approve
    it too, without removing its protection. Record the actual prompt count.
 5. Watch the `release-publish.yml` run's summary for the GHCR visibility
+=======
+     `publish-latest` run in the `ghcr-publish` environment (MAN-66).
+
+   Both workflows build all five targets cold: no build cache is restored
+   (MAN-243, `docs/DECISIONS/2026-10-10-man243-ci-trust-boundary.md`).
+   Platform builds therefore take longer than a warm CI run. On 2026-10-05 a
+   cold dispatch took 1m47s–6m11s per target, while the Docker job took
+   about 24 min and still dominates.
+4. Watch the `release-publish.yml` run's summary for the GHCR visibility
+>>>>>>> 5894a04afad1e5819f1c0aead5c1b41ce13b7dd5
    warning and the `:latest`-not-updated warning — see below.
 6. **Before announcing the release, run the clean-Windows check** below
    ("Manual check: the Windows ZIP starts without the Visual C++

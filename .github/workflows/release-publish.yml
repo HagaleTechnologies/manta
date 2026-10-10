@@ -182,9 +182,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.1
-        with:
-          key: release-${{ matrix.target }}
+      # MAN-243: no build cache, on purpose. A restored entry carries target/ objects and
+      # ~/.cargo/bin + .crates.toml (rust-cache's paths) from whichever run wrote it -- including a
+      # `cross` that `cargo install cross --version 0.2.5 --locked` below would then treat as already
+      # installed. Release artifacts are built from the tagged tree and a fresh toolchain only; the
+      # extra build time is accepted. See docs/DECISIONS/2026-10-10-man243-ci-trust-boundary.md.
 
       - name: Install cross
         if: matrix.use_cross
