@@ -13,7 +13,7 @@ manta status — daemon up 3h 12m
 RBN uplink: DEGRADED — 1 of 2 enabled targets connected
 
   TARGET                         STATE       SENT    SUPPR   RECONN RECENT(5m)
-  telnet.reversebeacon.net:7000  connected  18001        0        0          0
+  telnet.reversebeacon.net:7000  connected  18001      431        0          0
   backup.example.net:7000        flapping       0        0       37         14
 
 $ echo $?
@@ -22,7 +22,10 @@ $ echo $?
 
 (`SUPPR` and `RECONN` are the suppressed and lifetime-reconnects counts,
 abbreviated so the table stays inside 80 columns even with a long RBN
-hostname.)
+hostname. `SUPPR` counts spots the target received but did not send: every
+spot while `dry_run` is on, and otherwise each DE or untyped spot its
+`spot_types` setting holds back (MAN-91). It is therefore non-zero on a
+healthy live uplink too.)
 
 Or against an explicit address (e.g. from another host, or when you don't
 have the daemon's config file to hand):

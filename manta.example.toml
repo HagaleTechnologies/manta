@@ -77,9 +77,9 @@ station_callsign = "N0CALL"
 
 
 # --- Uplink to an RBN-style collector ----------------------------------------
-# Forwards every spot to an upstream collector. Needs [server]. Delete the
-# `#` in front of [[rbn_uplink]] and the settings below to use it; repeat
-# the block once per collector.
+# Forwards CQ and beacon spots to an upstream collector. Needs [server].
+# Delete the `#` in front of [[rbn_uplink]] and the settings below to use
+# it; repeat the block once per collector.
 
 #[[rbn_uplink]]
 
@@ -91,6 +91,11 @@ station_callsign = "N0CALL"
 # true: connect and log in, but send no spots. Set false only once you mean
 # to send spots to the collector.
 #dry_run = true
+
+# Which spots to send: "cq_beacon" sends only stations calling CQ (or CQ
+# TEST) and beacons, as RBN requires; "all" also sends stations answering
+# a call (DE) and spots with no recognised context.
+#spot_types = "cq_beacon"
 
 
 # --- Receiver ----------------------------------------------------------------

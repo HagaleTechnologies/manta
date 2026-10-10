@@ -8,7 +8,7 @@
 use crate::backoff::{next_backoff, AttemptOutcome as ConnectAttemptError, INITIAL_BACKOFF};
 use crate::bounded_io::{read_line_bounded, read_line_bounded_with_timeout};
 use crate::bus::SpotBus;
-use crate::config::RbnUplinkConfig;
+use crate::config::{RbnUplinkConfig, UplinkSpotTypes};
 use crate::metrics::UplinkTarget;
 use crate::rate_limit::RateLimiter;
 use crate::rbn;
@@ -112,6 +112,7 @@ pub async fn serve(
         tracing::info!(
             target_host = %config.target_host,
             target_port = config.target_port,
+            spot_types = %config.spot_types.as_str(),
             "uplink: dry_run is ON (the default) -- connecting and logging in, \
              but NOT transmitting spots. Set `dry_run = false` in this \
              [[rbn_uplink]] block to transmit for real."
@@ -120,6 +121,7 @@ pub async fn serve(
         tracing::warn!(
             target_host = %config.target_host,
             target_port = config.target_port,
+            spot_types = %config.spot_types.as_str(),
             "uplink: dry_run = false -- transmitting real spots to this target."
         );
     }
@@ -416,6 +418,7 @@ async fn connect_and_forward(
         &mut wr,
         &mut rx,
         config,
+        config.spot_types,
         login_callsign,
         bus,
         target,
@@ -487,6 +490,7 @@ async fn forward_loop(
     wr: &mut tokio::net::tcp::OwnedWriteHalf,
     rx: &mut broadcast::Receiver<crate::bus::BusSpot>,
     config: &RbnUplinkConfig,
+    spot_types: UplinkSpotTypes,
     spotter_call: &str,
     bus: &Arc<SpotBus>,
     target: &Arc<UplinkTarget>,
@@ -500,6 +504,16 @@ async fn forward_loop(
             recv = rx.recv() => {
                 match recv {
                     Ok(bus_spot) => {
+                        // MAN-91: RBN only takes CQ/TEST callers and
+                        // beacons, so by default other types stop here.
+                        // Local telnet/JSON have their own subscriptions
+                        // and still see this spot. Its own parameter, not
+                        // `config.spot_types`, so it stays independent of
+                        // where `dry_run` is read from (MAN-78).
+                        if !spot_types.forwards(bus_spot.spot.spot_type) {
+                            target.record_suppressed();
+                            continue;
+                        }
                         if config.dry_run {
                             target.record_suppressed();
                             continue;
@@ -716,6 +730,7 @@ mod tests {
             target_port: 7300,
             login_callsign: None,
             dry_run: false,
+            spot_types: crate::config::UplinkSpotTypes::default(),
         };
         assert_eq!(cfg.effective_login_callsign("W3XYZ"), "W3XYZ");
     }
@@ -856,6 +871,7 @@ mod tests {
             target_port: port,
             login_callsign: None,
             dry_run: false,
+            spot_types: crate::config::UplinkSpotTypes::default(),
         }
     }
 
