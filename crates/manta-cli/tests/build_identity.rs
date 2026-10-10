@@ -73,11 +73,13 @@ fn version_flag_names_the_commit_and_features() {
 }
 
 /// The SHA is the checkout's real HEAD, not a constant, checked against git
-/// rather than against build.rs. Skipped when the build was overridden
-/// (MANTA_GIT_SHA set) or git is unavailable.
+/// rather than against build.rs. Skipped when the build was overridden or
+/// git is unavailable. The override is read from build.rs's cfg, not from
+/// this process's `MANTA_GIT_SHA`: `cargo test` exports build.rs's
+/// `rustc-env` values to every test, so that variable is always set here.
 #[test]
 fn version_flag_commit_is_the_checkouts_head() {
-    if std::env::var_os("MANTA_GIT_SHA").is_some() {
+    if cfg!(manta_git_sha_override) {
         return;
     }
     let Some(head) = checkout_head() else { return };
@@ -183,7 +185,7 @@ fn json_spots_carry_the_builds_decoder_version() {
         env!("MANTA_GIT_SHA")
     );
     assert_eq!(spot["decoderVersion"], want.as_str(), "spot: {first}");
-    if std::env::var_os("MANTA_GIT_SHA").is_none() {
+    if !cfg!(manta_git_sha_override) {
         if let Some(head) = checkout_head() {
             assert!(want.ends_with(&format!("+{head}")), "{want} vs HEAD {head}");
         }

@@ -10,9 +10,13 @@
 //! all-hex override longer than 12 characters (CI's 40-hex `github.sha`) is
 //! cut to 12 and lowercased, so it matches a native build of that commit.
 //! This script also exports `MANTA_FEATURES`, the compiled-in Cargo feature
-//! list. That one is compile-time only: it is derived from Cargo's
-//! `CARGO_FEATURE_*` variables, never read from the environment, so it is
-//! not on `config.rs`'s `ENV_IGNORED` list.
+//! list, derived from Cargo's `CARGO_FEATURE_*` variables and never read
+//! from the environment. Both names are still on `config.rs`'s
+//! `ENV_IGNORED`: `cargo run` and `cargo test` export every `rustc-env`
+//! value into the processes they start, and MAN-261 rejects unknown
+//! `MANTA_*` names. A valid override also sets the `manta_git_sha_override`
+//! cfg, which tests read to skip their check against the checkout's HEAD --
+//! the runtime environment cannot tell them, for the same export reason.
 use std::process::Command;
 
 fn git(args: &[&str]) -> Option<String> {
@@ -53,7 +57,12 @@ fn sha_override() -> Option<String> {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=MANTA_GIT_SHA");
-    let sha = sha_override()
+    println!("cargo::rustc-check-cfg=cfg(manta_git_sha_override)");
+    let overridden = sha_override();
+    if overridden.is_some() {
+        println!("cargo::rustc-cfg=manta_git_sha_override");
+    }
+    let sha = overridden
         .or_else(|| git(&["rev-parse", "--short=12", "HEAD"]))
         .unwrap_or_else(|| "unknown".to_string());
 

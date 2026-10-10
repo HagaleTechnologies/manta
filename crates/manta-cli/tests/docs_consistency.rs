@@ -1026,3 +1026,60 @@ fn docs_describe_the_separate_metrics_bind_addr() {
         }
     }
 }
+
+/// MAN-83: where `decoderVersion`'s format and the decoder-output versioning
+/// rule are decided.
+const MAN83_DECISION: &str =
+    "docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md";
+
+/// MAN-83: CHANGELOG.md is Keep a Changelog-shaped (Unreleased first) and
+/// states the decoder-output rule downstream benchmark comparisons rely on,
+/// linking the decision doc that makes it normative.
+#[test]
+fn changelog_opens_with_unreleased_and_states_the_decoder_output_rule() {
+    let changelog = doc("CHANGELOG.md");
+    assert_eq!(
+        changelog.lines().find(|l| l.starts_with("## ")),
+        Some("## [Unreleased]"),
+        "CHANGELOG.md's first `## ` heading must be `## [Unreleased]`"
+    );
+    let text = squash_whitespace(&changelog);
+    for needle in [
+        "Keep a Changelog",
+        "Semantic Versioning",
+        "### Decoder output",
+        "MINOR",
+        "PATCH",
+        MAN83_DECISION,
+    ] {
+        assert!(text.contains(needle), "CHANGELOG.md never says {needle:?}");
+    }
+    assert!(
+        repo_root().join(MAN83_DECISION).is_file(),
+        "CHANGELOG.md links {MAN83_DECISION}, which does not exist"
+    );
+}
+
+/// MAN-83: the rule is only a promise if cutting a release applies it.
+#[test]
+fn release_runbook_applies_the_decoder_output_rule() {
+    let runbook = doc("docs/RUNBOOKS/release.md");
+    let cutting = squash_whitespace(section(&runbook, "Cutting a release"));
+    for needle in ["CHANGELOG.md", "### Decoder output", "MINOR"] {
+        assert!(
+            cutting.contains(needle),
+            "release runbook's \"Cutting a release\" never says {needle:?}"
+        );
+    }
+}
+
+/// MAN-83: ARCHITECTURE §7 names `decoderVersion`'s build-identity form and
+/// points at its decision doc.
+#[test]
+fn architecture_section_7_describes_decoder_version() {
+    let arch = doc("ARCHITECTURE.md");
+    let s7 = squash_whitespace(section(&arch, "7. Output layer"));
+    for needle in ["decoderVersion", "manta-<version>+<commit>", MAN83_DECISION] {
+        assert!(s7.contains(needle), "ARCHITECTURE §7 never says {needle:?}");
+    }
+}
