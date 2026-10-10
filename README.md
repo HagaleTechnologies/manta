@@ -275,6 +275,43 @@ receiver, and run `manta config check --config manta.toml` before you
 enable a service. `manta run` refuses to start while the station callsign
 is still `N0CALL`.
 
+## Logs
+
+`manta run` writes its log to stderr: the startup banner, the readiness
+line, a periodic status line, client connections and rejections, and
+uplink events. Under the service kit it lands in the journal (systemd),
+in `/var/log/manta/manta.log` (launchd) or in the container log (Docker).
+
+Log lines are coloured only when stderr is a terminal, so a file, a pipe
+or the journal gets plain text; `NO_COLOR=1` turns colour off on a
+terminal too.
+
+`-v` adds debug detail and `-vv` trace; `-q` keeps warnings and errors,
+`-qq` only errors, `-qqq` nothing; `--log-level` names a level (`off`,
+`error`, `warn`, `info`, `debug`, `trace`). Each is shorthand for the
+`RUST_LOG` environment variable, the underlying mechanism, and overrides
+it. With none of them `RUST_LOG` decides, and `info` is the default. Use
+`RUST_LOG` itself to filter by module:
+
+```sh
+manta run --config manta.toml -q        # warnings and errors only
+RUST_LOG=info,manta_server=debug manta run --config manta.toml
+```
+
+For a log aggregator, `--log-format json` writes one JSON object per line:
+
+```sh
+manta run --config manta.toml --log-format json
+```
+
+Each record has `timestamp`, `level`, `message` and `target`; an event's
+own fields (`ip`, `login`, …) are top-level keys, and events inside a
+client connection carry a `span` object with its `peer`. With
+`--log-format json` every line `manta run` writes to stderr is a JSON
+object, except clap usage errors, the deprecation warning for a retired
+flag spelling, and a panic. stdout (decoded text, or `--json`'s JSON
+Lines) is unchanged.
+
 ## Inputs
 
 | Source | How | Status |
