@@ -12,6 +12,7 @@ mod build_info;
 mod config;
 mod config_cmd;
 mod reconnect;
+mod reload;
 use reconnect::ReconnectingSource;
 
 #[derive(Parser)]
@@ -294,6 +295,10 @@ enum Command {
         /// Needs a `[server]` table with the station callsign and ports.
         /// Starts the telnet cluster server, the JSON Lines / WebSocket
         /// stream, and the metrics endpoint alongside the decode loop.
+        ///
+        /// On Linux and macOS, SIGHUP makes the running daemon re-read this
+        /// file and apply its [spot] lists and each [[rbn_uplink]] dry_run
+        /// without a restart; other settings need a restart.
         // `--server-config` stays as a hidden alias for the flag's old
         // name; help advertises the canonical spelling only (D11/MAN-77).
         #[arg(long, alias = "server-config", help_heading = "Server")]
@@ -1978,6 +1983,30 @@ fn merge_cli_engine(
     file_decode
 }
 
+/// MAN-78 (supersedes MAN-85's ctrlc `termination` feature on Unix):
+/// SIGTERM always drains; SIGHUP drains too unless this is a daemon
+/// (`[server]`), where it requests a reload instead -- the returned
+/// `Signals` buffers it for `reload::spawn`. Installed with ctrlc, before
+/// the `listening:` banner (MAN-122 round 6). ctrlc refuses to share a
+/// signal (`MultipleHandlers`), so it must no longer own SIGTERM/SIGHUP.
+#[cfg(unix)]
+fn install_unix_signal_handlers(
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    daemon: bool,
+) -> Result<Option<signal_hook::iterator::Signals>> {
+    use signal_hook::consts::{SIGHUP, SIGTERM};
+    signal_hook::flag::register(SIGTERM, stop.clone()).context("installing the SIGTERM handler")?;
+    if daemon {
+        let signals = signal_hook::iterator::Signals::new([SIGHUP])
+            .context("installing the SIGHUP handler")?;
+        Ok(Some(signals))
+    } else {
+        signal_hook::flag::register(SIGHUP, stop.clone())
+            .context("installing the SIGHUP handler")?;
+        Ok(None)
+    }
+}
+
 /// Handles what the `Run` on-spot closure needs to feed a running spot server.
 struct SpotServer {
     bus: std::sync::Arc<manta_server::bus::SpotBus>,
@@ -2026,6 +2055,23 @@ struct SpotServer {
     /// tests without guessing or binding a fixed port.
     #[cfg_attr(not(test), allow(dead_code))]
     metrics_addr: std::net::SocketAddr,
+    /// MAN-78: each `[[rbn_uplink]]` task's live `dry_run` flag, in config
+    /// order, for the SIGHUP reload thread (Unix only) to flip.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    uplink_dry_run: Vec<UplinkDryRun>,
+}
+
+/// MAN-78: one `[[rbn_uplink]]` target's live `dry_run` flag, read per
+/// spot by `uplink::serve_with_live_dry_run`, and the same `host:port`
+/// label `/metrics` uses (MAN-128 D7) for the reload's log line.
+#[derive(Clone)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct UplinkDryRun {
+    label: String,
+    /// The entry's `enabled`: a disabled target runs no task, so nothing
+    /// reads its flag.
+    enabled: bool,
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 // MAN-89 (PR #131 review, round 7): the "would `from_spot` emit the
@@ -2477,7 +2523,7 @@ fn start_spot_server(
     let tasks = manta_server::tasks::new_client_tasks();
 
     let rt = tokio::runtime::Runtime::new()?;
-    let (status_line, metrics_addr) = rt.block_on(async {
+    let (status_line, metrics_addr, uplink_dry_run) = rt.block_on(async {
         // MAN-132: metrics binds its own `metrics_bind_addr` (loopback by
         // default), never `bind_addr`. With two configurable addresses
         // "which listener failed?" is a real question, so each bind names
@@ -2647,10 +2693,20 @@ fn start_spot_server(
             .into_iter()
             .zip(uplink_labels)
             .map(|(uplink_cfg, label)| {
-                let target = metrics.register_uplink_target(label, uplink_cfg.enabled);
-                (uplink_cfg, target)
+                let target = metrics.register_uplink_target(label.clone(), uplink_cfg.enabled);
+                // MAN-78: one live flag per entry, seeded from the file.
+                let dry_run = UplinkDryRun {
+                    label,
+                    enabled: uplink_cfg.enabled,
+                    flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                        uplink_cfg.dry_run,
+                    )),
+                };
+                (uplink_cfg, target, dry_run)
             })
             .collect();
+        let uplink_dry_run: Vec<UplinkDryRun> =
+            uplink_tasks.iter().map(|(_, _, d)| d.clone()).collect();
         let metrics_ip_request_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
             manta_server::metrics_http::MAX_METRICS_REQUESTS_PER_IP,
             manta_server::metrics_http::METRICS_REQUEST_RATE_WINDOW,
@@ -2685,12 +2741,13 @@ fn start_spot_server(
         // MAN-128 D6/D7: each target was registered above, before both its
         // `serve` task and the metrics endpoint, so a scrape landing before
         // the first connect attempt still sees it.
-        for (uplink_cfg, target) in uplink_tasks {
-            tokio::spawn(manta_server::uplink::serve(
+        for (uplink_cfg, target, dry_run) in uplink_tasks {
+            tokio::spawn(manta_server::uplink::serve_with_live_dry_run(
                 uplink_cfg,
                 cfg.station_callsign.clone(),
                 bus.clone(),
                 target,
+                dry_run.flag,
                 shutdown_rx.clone(),
             ));
         }
@@ -2708,7 +2765,7 @@ fn start_spot_server(
             shutdown_rx.clone(),
         );
 
-        anyhow::Ok((status_line, metrics_addr))
+        anyhow::Ok((status_line, metrics_addr, uplink_dry_run))
     })?;
 
     Ok((
@@ -2727,12 +2784,15 @@ fn start_spot_server(
             cty,
             status_line: std::sync::Mutex::new(status_line),
             metrics_addr,
+            uplink_dry_run,
         },
     ))
 }
 
 /// The command line's say in source/input/spot selection, before it is
 /// merged over the config file and environment (`resolve`, MAN-261).
+/// `Clone` so a SIGHUP reload (MAN-78) re-resolves with the same flags.
+#[derive(Clone)]
 struct CliOverrides {
     device: Option<String>,
     source: Option<PathBuf>,
@@ -3021,11 +3081,31 @@ fn prepare_live(
 ) -> Result<Prepared> {
     let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
     let config_path = config_flag.or_else(|| config::config_path_from_env(&vars));
-    let loaded = config::load(config_path.as_deref(), config::Env::Read(&vars))?;
-    let resolved = resolve(cli, &loaded)?;
-    for note in &resolved.notes {
+    let prepared = prepare_config(cli, config_path, cli_engine, &vars)?;
+    if let Some(warning) = bundled_cty_warning(
+        prepared.pipeline.cty.is_some(),
+        std::time::SystemTime::now(),
+    ) {
+        eprintln!("{warning}");
+    }
+    for note in &prepared.resolved.notes {
         eprintln!("{note}");
     }
+    Ok(prepared)
+}
+
+/// `prepare_live`'s non-printing core, given the already-chosen config
+/// path and the environment: load + `MANTA_*` overlay, CLI merge, and the
+/// blocklist/notch file reads. A SIGHUP reload (MAN-78) re-runs exactly
+/// this, so `manta config check` passing means a reload passes too.
+fn prepare_config(
+    cli: CliOverrides,
+    config_path: Option<PathBuf>,
+    cli_engine: Option<Engine>,
+    vars: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<Prepared> {
+    let loaded = config::load(config_path.as_deref(), config::Env::Read(vars))?;
+    let resolved = resolve(cli, &loaded)?;
     let decode = merge_cli_engine(cli_engine, loaded.decode.clone());
     let mut pipeline = build_pipeline_config(
         resolved.freq_correction_ppm,
@@ -3034,10 +3114,6 @@ fn prepare_live(
         decode.engine,
     )?;
     pipeline.decode = decode;
-    if let Some(warning) = bundled_cty_warning(pipeline.cty.is_some(), std::time::SystemTime::now())
-    {
-        eprintln!("{warning}");
-    }
     Ok(Prepared {
         config_path,
         loaded,
@@ -3625,49 +3701,51 @@ fn main() -> Result<()> {
                 cty,
                 scp,
             } = filters;
+            let cli = CliOverrides {
+                device,
+                source,
+                source_iq,
+                kiwi: KiwiOpts {
+                    host: kiwi_host,
+                    port: kiwi_port,
+                    freq: kiwi_freq_hz,
+                    password: kiwi_password,
+                },
+                #[cfg(feature = "soapy")]
+                soapy: SoapyOpts {
+                    driver: soapy_driver,
+                    freq: soapy_freq_hz,
+                    rate: soapy_rate_hz,
+                    gain: soapy_gain,
+                },
+                #[cfg(feature = "hpsdr")]
+                hpsdr: HpsdrOpts {
+                    host: hpsdr_host,
+                    port: hpsdr_port,
+                    freq: hpsdr_freq_hz,
+                    rate: hpsdr_rate_hz,
+                },
+                freq_correction_ppm,
+                dial_freq_hz,
+                capture_rate_hz,
+                replay_epoch,
+                allowlist,
+                blocklist,
+                notch,
+                cty,
+                scp,
+            };
+            // MAN-78: a SIGHUP reload re-resolves with the same flags.
+            #[cfg(unix)]
+            let reload_cli = cli.clone();
+            #[cfg(unix)]
+            let vars: Vec<_> = std::env::vars_os().collect();
             let Prepared {
                 config_path,
                 loaded,
                 resolved,
                 pipeline: cfg,
-            } = prepare_live(
-                CliOverrides {
-                    device,
-                    source,
-                    source_iq,
-                    kiwi: KiwiOpts {
-                        host: kiwi_host,
-                        port: kiwi_port,
-                        freq: kiwi_freq_hz,
-                        password: kiwi_password,
-                    },
-                    #[cfg(feature = "soapy")]
-                    soapy: SoapyOpts {
-                        driver: soapy_driver,
-                        freq: soapy_freq_hz,
-                        rate: soapy_rate_hz,
-                        gain: soapy_gain,
-                    },
-                    #[cfg(feature = "hpsdr")]
-                    hpsdr: HpsdrOpts {
-                        host: hpsdr_host,
-                        port: hpsdr_port,
-                        freq: hpsdr_freq_hz,
-                        rate: hpsdr_rate_hz,
-                    },
-                    freq_correction_ppm,
-                    dial_freq_hz,
-                    capture_rate_hz,
-                    replay_epoch,
-                    allowlist,
-                    blocklist,
-                    notch,
-                    cty,
-                    scp,
-                },
-                config,
-                engine,
-            )?;
+            } = prepare_live(cli, config, engine)?;
             // MAN-268: an unedited manta.example.toml must not start a
             // daemon that spots, or logs in to a collector, as N0CALL.
             // Checked first, on the identities after the MANTA_* overlay:
@@ -3705,6 +3783,17 @@ fn main() -> Result<()> {
                 );
             }
             warn_if_audio_source_has_no_rf_reference(has_rf_aware_source, dial_freq_hz);
+            // MAN-78: a daemon's SIGHUP is a reload, so it must not land on
+            // this thread, the decode loop's: see `reload::mask_sighup`.
+            // Blocked before the source, the servers and the reload thread
+            // start, so each inherits the mask and only the reload thread
+            // unblocks it. SIGINT/SIGTERM still reach this thread; they end
+            // the run anyway.
+            #[cfg(unix)]
+            if loaded.server.is_some() {
+                reload::mask_sighup(libc::SIG_BLOCK)
+                    .context("blocking SIGHUP on the decode thread")?;
+            }
             let first = spec.open(resolved.capture_rate_hz, dial_freq_hz)?;
             let replay_epoch = resolved.replay_epoch;
 
@@ -3731,11 +3820,18 @@ fn main() -> Result<()> {
             // banner itself still precedes the listener
             // tasks (see `start_spot_server`), so its ordering against
             // per-connection lines is unchanged.
+            //
+            // MAN-78: ctrlc covers SIGINT, plus Ctrl-C/Ctrl-Break on
+            // Windows; on Unix, `install_unix_signal_handlers` adds SIGTERM
+            // and SIGHUP at the same point, so the same covered window
+            // holds for every signal.
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_handler = stop.clone();
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
+            #[cfg(unix)]
+            let reload_signals = install_unix_signal_handlers(&stop, loaded.server.is_some())?;
 
             // Kept alive for the process lifetime: dropping it would stop
             // the spawned server tasks. `None` when --config wasn't
@@ -3898,6 +3994,37 @@ fn main() -> Result<()> {
                 None => (None, None, None, None, None, None),
             };
 
+            // MAN-78: with a `[server]` table, SIGHUP reloads the `[spot]`
+            // lists and each `[[rbn_uplink]]` `dry_run` (D2). The thread
+            // starts after `start_spot_server`, so its log lines have a
+            // subscriber; a SIGHUP that arrived earlier is buffered by
+            // `Signals` and handled as soon as it starts.
+            let operator_lists = std::sync::Arc::new(manta_engine::OperatorListsUpdate::default());
+            let drain_gate = std::sync::Arc::new(reload::DrainGate::default());
+            #[cfg(unix)]
+            let reload_enabled = match (reload_signals, &spot_server) {
+                (Some(signals), Some(server)) => {
+                    reload::spawn(
+                        signals,
+                        reload::ReloadContext {
+                            config_path: config_path.clone(),
+                            cli: reload_cli,
+                            cli_engine: engine,
+                            vars,
+                            startup_raw: loaded.raw.clone(),
+                            lists: operator_lists.clone(),
+                            uplinks: server.uplink_dry_run.clone(),
+                            drain_gate: drain_gate.clone(),
+                            stop: stop.clone(),
+                        },
+                    )?;
+                    true
+                }
+                _ => false,
+            };
+            #[cfg(not(unix))]
+            let reload_enabled = false;
+
             // MAN-73: wrap every reconnectable source so a later read
             // error/EOF is retried with `manta-server::backoff`'s policy
             // instead of propagating out of `listen()` and ending the
@@ -3974,8 +4101,17 @@ fn main() -> Result<()> {
             // default disposition. If the fuller startup banner (lens 1 #7)
             // ever replaces this line, `READY_MARKER` must be updated to
             // match. stdout stays pure JSON under `--json` (MAN-59
-            // round 6); this goes to stderr.
-            eprintln!("manta: listening; send SIGINT or SIGTERM to stop");
+            // round 6); this goes to stderr. MAN-78: a daemon that reloads
+            // on SIGHUP says so; the `manta: listening;` prefix the tests
+            // wait for is the same either way.
+            if reload_enabled {
+                eprintln!(
+                    "manta: listening; send SIGINT or SIGTERM to stop, SIGHUP to reload \
+                     [spot] lists and dry_run"
+                );
+            } else {
+                eprintln!("manta: listening; send SIGINT or SIGTERM to stop");
+            }
             // Captured before `src` is moved into the pipeline, for the
             // readiness event below.
             let source_sample_rate_hz = src.sample_rate();
@@ -4000,6 +4136,7 @@ fn main() -> Result<()> {
                 manta_engine::ListenObservers {
                     active_tracks: active_tracks.clone(),
                     decode_latency: decode_latency.clone(),
+                    operator_lists: reload_enabled.then(|| operator_lists.clone()),
                 },
                 |ev| {
                     use manta_decode::events::DecoderEvent;
@@ -4109,6 +4246,13 @@ fn main() -> Result<()> {
                     }
                 },
             );
+            // MAN-78 D7: the decode loop has returned, so the daemon is
+            // draining from here on. Closing the gate (under the lock a
+            // reload holds while it applies) and setting `stop` tell the
+            // reload thread to ignore SIGHUP instead of flipping `dry_run`
+            // mid-drain.
+            drain_gate.close();
+            stop_ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
             // Run the same server-shutdown sequence on BOTH the success and
             // error paths -- an SDR disconnect or WAV read failure from
