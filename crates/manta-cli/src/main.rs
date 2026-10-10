@@ -12,6 +12,9 @@ mod build_info;
 mod config;
 mod config_cmd;
 mod reconnect;
+// MAN-123 phase 1: wired into `run` in phase 2.
+#[allow(dead_code)]
+mod text_lines;
 use reconnect::ReconnectingSource;
 
 #[derive(Parser)]
