@@ -132,6 +132,9 @@ docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
 - If the `docker run` above returns an authorization error, the GHCR
   package still needs its one-time "make public" step — see
   [docs/RUNBOOKS/release.md](docs/RUNBOOKS/release.md).
+- Every release also carries a `SHA256SUMS` file and a GitHub
+  build-provenance attestation. Check a download before running it:
+  [Verifying a downloaded release](docs/RUNBOOKS/release.md#verifying-a-downloaded-release).
 
 ## 60-second demo
 
