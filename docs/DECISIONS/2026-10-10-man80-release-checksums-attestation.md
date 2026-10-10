@@ -36,7 +36,12 @@ and README's Installation notes point there.
   `--signer-workflow HagaleTechnologies/manta/.github/workflows/release-publish.yml`**,
   plus `--deny-self-hosted-runners`. Release tags are owner-only (MAN-244),
   so this rejects an attestation made by a modified copy of the workflow
-  dispatched on a branch.
+  dispatched on a branch. That holds only on `gh` 2.102.0 or newer, so
+  the runbook chains a version check before the command. Older `gh`
+  compared `--source-ref` case-insensitively and matched
+  `--signer-workflow` as a prefix (GHSA-4mq3-hpgx-9cx8,
+  GHSA-wjmr-j3rp-mh2g), so an attestation from a `V…` tag or from a
+  workflow whose path starts with `release-publish.yml` could pass.
 
 ## Mechanism
 
@@ -86,7 +91,7 @@ which ref the file was built, not that the source at that tag is benign;
 that still rests on review and MAN-244's owner-only tags. MAN-66's accepted
 residual risk is unchanged: a write-capable identity can add a different
 workflow, but its attestations name that workflow, which
-`--signer-workflow` rejects.
+`--signer-workflow` rejects on `gh` 2.102.0 or newer.
 
 Out of scope, as follow-ons: attesting the Docker image, an SBOM,
 `cargo binstall` metadata, a Homebrew tap, and `release.yml` (build-only;
@@ -101,7 +106,9 @@ and its `subject-checksums` input, and `files: dist/*`. It also checks that
 no other release job can request `id-token` or `attestations`. It runs the
 job's own checksum step over fake archives (when GNU `sha256sum` is
 present) and the runbook's Linux and macOS check commands against a good
-and an altered download.
+and an altered download. It runs the runbook's `gh attestation verify`
+block against fake `gh` versions and checks that a `gh` older than
+2.102.0 never reaches the verify.
 
 No `v*` release exists yet, so neither MAN-80 scenario has run end to end.
 At MAN-84's first release, the owner confirms these and records the run URL
@@ -111,8 +118,10 @@ with MAN-84's evidence:
 - The run summary lists five attestation subjects.
 - `sha256sum -c --ignore-missing SHA256SUMS` prints `OK` for a downloaded
   archive.
-- The runbook's `gh attestation verify` command prints
-  `✓ Verification succeeded!` naming `release-publish.yml@refs/tags/<tag>`.
+- The runbook's `gh attestation verify` block, version check included,
+  prints `✓ Verification succeeded!` naming
+  `release-publish.yml@refs/tags/<tag>`. Record the `gh --version` used;
+  it must be 2.102.0 or newer.
 
 Rollback is reverting the workflow change through a reviewed PR. That stops
 new checksums and attestations only: Rekor entries are permanent, and

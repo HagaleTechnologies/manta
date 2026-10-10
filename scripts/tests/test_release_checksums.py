@@ -49,6 +49,17 @@ ATTEST_FLAGS = (
     "--signer-workflow HagaleTechnologies/manta/.github/workflows/release-publish.yml",
 )
 EXPR = re.compile(r"\$\{\{")
+# gh before 2.102.0 matched --source-ref case-insensitively and --signer-workflow as a prefix
+# (GHSA-4mq3-hpgx-9cx8, GHSA-wjmr-j3rp-mh2g), so the runbook's guard must stop the verify for these.
+GH_TOO_OLD = ("2.101.9", "2.99.0", "1.150.0", "DEV")
+GH_NEW_ENOUGH = ("2.102.0", "2.110.1", "3.0.0")
+FAKE_GH = """#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'gh version %s (2026-09-30)\\nhttps://github.com/cli/cli/releases/latest\\n' "$FAKE_GH_VERSION"
+  exit 0
+fi
+echo "VERIFY RAN: $*"
+"""
 
 
 def executable(body):
@@ -208,6 +219,32 @@ class OperatorDocsTests(unittest.TestCase):
         for command in (LINUX_CHECK, MACOS_CHECK) + ATTEST_FLAGS:
             with self.subTest(command=command):
                 self.assertIn(command, section)
+
+    @unittest.skipIf(shutil.which("sh") is None or shutil.which("awk") is None, "needs sh and awk")
+    def test_verify_block_refuses_gh_older_than_2_102_0(self):
+        text = self.read(RUNBOOK)
+        start = text.index(RUNBOOK_HEADING + "\n")
+        blocks = [b for b in re.findall(r"^```sh\n(.*?)^```$", text[start:], re.M | re.S)
+                  if ATTEST_FLAGS[0] in b]
+        self.assertEqual(len(blocks), 1, f"{RUNBOOK}: expected one sh block running gh attestation verify")
+        with tempfile.TemporaryDirectory() as tmp:
+            gh = os.path.join(tmp, "gh")
+            with open(gh, "w", encoding="utf-8") as f:
+                f.write(FAKE_GH)
+            os.chmod(gh, 0o755)
+            for version, ok in [(v, False) for v in GH_TOO_OLD] + [(v, True) for v in GH_NEW_ENOUGH]:
+                with self.subTest(gh=version):
+                    env = dict(os.environ, PATH=tmp + os.pathsep + os.environ.get("PATH", ""),
+                               FAKE_GH_VERSION=version)
+                    proc = subprocess.run([shutil.which("sh"), "-c", blocks[0]], cwd=tmp, env=env,
+                                          capture_output=True, text=True)
+                    if ok:
+                        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                        self.assertIn("VERIFY RAN: attestation verify", proc.stdout)
+                    else:
+                        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                        self.assertNotIn("VERIFY RAN", proc.stdout, "an old gh must never run the verify")
+                        self.assertIn("need gh 2.102.0 or newer", proc.stdout + proc.stderr)
 
 
 class CiWiringTests(unittest.TestCase):

@@ -415,11 +415,25 @@ file's lower-case one.)
 
 ### Build provenance
 
-With the [GitHub CLI](https://cli.github.com/) signed in
-(`gh auth login`), run this, with your file name and tag in place of
-`manta-linux-x86_64.tar.gz` and `v0.1.0`:
+This needs the [GitHub CLI](https://cli.github.com/) **2.102.0 or newer**,
+signed in (`gh auth login`). Older versions compared `--source-ref`
+case-insensitively and matched `--signer-workflow` against only the start
+of the signer's identity
+([GHSA-4mq3-hpgx-9cx8](https://github.com/cli/cli/security/advisories/GHSA-4mq3-hpgx-9cx8),
+[GHSA-wjmr-j3rp-mh2g](https://github.com/cli/cli/security/advisories/GHSA-wjmr-j3rp-mh2g)).
+On those versions, an attestation from a `V0.1.0` tag, or from a
+workflow whose path starts with `release-publish.yml`, could pass the
+check below. On any system, `gh --version` must report 2.102.0 or newer
+before you trust the result.
+
+Run this, with your file name and tag in place of
+`manta-linux-x86_64.tar.gz` and `v0.1.0`. Its first command prints
+`need gh 2.102.0 or newer` and stops before the check if `gh` is older:
 
 ```sh
+gh --version | awk 'NR == 1 { have = $3; split(have, n, ".") }
+    END { if (n[1] + 0 > 2 || (n[1] + 0 == 2 && n[2] + 0 >= 102)) exit 0
+          print "need gh 2.102.0 or newer, found: " have; exit 1 }' &&
 gh attestation verify manta-linux-x86_64.tar.gz --repo HagaleTechnologies/manta \
     --source-ref refs/tags/v0.1.0 \
     --signer-workflow HagaleTechnologies/manta/.github/workflows/release-publish.yml \
@@ -434,7 +448,7 @@ fails with `Error: expected SourceRepositoryRef to be refs/tags/v0.1.0,
 got …`. Both exit non-zero.
 
 Keep `--source-ref` and `--signer-workflow`. Only the owner can push a
-release tag (MAN-244), so together they reject an attestation made by a
-modified copy of the workflow run from a branch. Why the job is shaped
-this way:
+release tag (MAN-244), so on `gh` 2.102.0 or newer, together they
+reject an attestation made by a modified copy of the workflow run from a
+branch. Why the job is shaped this way:
 [docs/DECISIONS/2026-10-10-man80-release-checksums-attestation.md](../DECISIONS/2026-10-10-man80-release-checksums-attestation.md).
