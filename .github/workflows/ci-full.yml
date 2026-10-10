@@ -199,14 +199,8 @@ jobs:
       # workflows' ubuntu-latest runners.
       - if: runner.os != 'Windows'
         run: bash scripts/tests/release-version.test.sh
-<<<<<<< HEAD
       - if: runner.os != 'Windows'
         run: bash scripts/tests/release-ancestry.test.sh
-  # Same Dependabot-only pull_request gate as `test` above -- not itself a required check, but
-  # matches this job's own pre-migration behavior (ran for a Dependabot PR too, gated only by
-  # codex-clean's tolerant skip) rather than silently dropping coverage for a Dependabot bump
-  # touching soapy-feature code.
-=======
       # MAN-243: the CI trust boundary (who may run in main's context, who writes the shared cache,
       # cold release builds) rides the already-required `test` check, like release-version above.
       - if: runner.os != 'Windows'
@@ -215,7 +209,6 @@ jobs:
   # dispatch) -- not itself a required check, but matches this job's own pre-migration behavior
   # (ran for a Dependabot PR too, gated only by codex-clean's tolerant skip) rather than silently
   # dropping coverage for a PR touching soapy-feature code.
->>>>>>> 5894a04afad1e5819f1c0aead5c1b41ce13b7dd5
   test-soapy:
     if: >-
       github.event_name != 'pull_request' ||
