@@ -342,7 +342,13 @@ target_port = 7000
 # credentials and reachability, but transmits no spots. Set it to false
 # only once you actually intend to feed a live target.
 # dry_run = false
+# spot_types defaults to "cq_beacon": only CQ and beacon spots, as RBN
+# requires. "all" also sends DE and untyped spots.
+# spot_types = "all"
 ```
+
+Spots an uplink holds back still appear on manta's own telnet and JSON
+output; `spot_types` only decides what goes to that target.
 
 The uplink has not yet been verified against a real RBN ingest (see
 [ROADMAP.md](ROADMAP.md)), which is why dry-run is the default. manta logs
