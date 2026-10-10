@@ -31,12 +31,29 @@
 //!     When manta starts
 //!     Then it does not transmit spots to the configured target
 //!
+//! MAN-91 acceptance scenarios:
+//!   Scenario: A CQ spot is forwarded
+//!     Given manta validates a spot classified as a CQing station
+//!     When the RBN uplink is enabled with its default configuration
+//!     Then the spot is forwarded to the configured RBN target
+//!
+//!   Scenario: A DE (answering-station) spot is not forwarded by default
+//!     Given manta validates a spot classified as a station answering another call (type De)
+//!     When the RBN uplink is enabled with its default configuration
+//!     Then the spot is not forwarded to RBN, though it remains visible on
+//!       manta's local telnet/JSON output
+//!
+//!   Scenario: The default is overridable
+//!     Given an operator wants to forward every spot type regardless of RBN's convention
+//!     When they set the uplink's spot-type filter to "all"
+//!     Then every validated spot is forwarded
+//!
 //! The mock listener in this file stands in for RBN's own collection
 //! server -- manta is the connecting *client* here, the reverse of
 //! `telnet_acceptance.rs`'s role.
 
 use manta_server::bus::SpotBus;
-use manta_server::config::RbnUplinkConfig;
+use manta_server::config::{RbnUplinkConfig, UplinkSpotTypes};
 use manta_server::metrics::Metrics;
 use manta_server::rbn;
 use manta_spot::{Spot, SpotType};
@@ -68,7 +85,36 @@ fn uplink_config(target_port: u16, dry_run: bool) -> RbnUplinkConfig {
         target_port,
         login_callsign: None,
         dry_run,
+        spot_types: UplinkSpotTypes::default(),
     }
+}
+
+/// One spot per `SpotType`, each with its own callsign, in the order the
+/// MAN-91 tests publish them: the two RBN holds back by default first.
+fn one_spot_per_type() -> Vec<Spot> {
+    [
+        ("JA1DE", SpotType::De),
+        ("JA1UNK", SpotType::Unknown),
+        ("JA1CQ", SpotType::Cq),
+        ("JA1BCN", SpotType::Beacon),
+    ]
+    .into_iter()
+    .map(|(call, spot_type)| Spot {
+        callsign: call.to_string(),
+        spot_type,
+        ..sample_spot()
+    })
+    .collect()
+}
+
+/// Reads one line off the mock target, failing the test after 5 s.
+async fn read_forwarded_line(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> String {
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for a forwarded spot line")
+        .unwrap();
+    line.trim_end().to_string()
 }
 
 struct Harness {
@@ -206,6 +252,87 @@ async fn dry_run_logs_in_but_does_not_forward_the_spot_line() {
     assert_eq!(harness.metrics.uplink_suppressed_total(), 1);
 
     let _ = harness.shutdown_tx.send(true);
+}
+
+/// MAN-78: a live reload flips `dry_run` through the shared flag; the
+/// next spot honours it on the same connection, with no reconnect.
+#[tokio::test]
+async fn dry_run_flag_flipped_while_connected_applies_to_the_next_spot_without_reconnecting() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
+    let metrics = Arc::new(Metrics::new());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let target = metrics.register_uplink_target(format!("127.0.0.1:{port}"), true);
+    let dry_run = Arc::new(AtomicBool::new(true));
+    // `config.dry_run` deliberately disagrees with the flag: once running,
+    // only the flag may be read.
+    let cfg = uplink_config(port, false);
+    tokio::spawn(manta_server::uplink::serve_with_live_dry_run(
+        cfg,
+        STATION_CALL.to_string(),
+        bus.clone(),
+        target.clone(),
+        dry_run.clone(),
+        shutdown_rx,
+    ));
+
+    let (login_line, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+    assert_eq!(login_line.trim_end(), STATION_CALL);
+
+    bus.publish(sample_spot());
+    let mut line = String::new();
+    let result =
+        tokio::time::timeout(Duration::from_millis(500), reader.read_line(&mut line)).await;
+    assert!(
+        result.is_err(),
+        "dry_run flag on: nothing may be sent, got {line:?}"
+    );
+    assert_eq!(target.suppressed_total(), 1);
+
+    dry_run.store(false, Ordering::Relaxed);
+    let spot = sample_spot();
+    let expected = rbn::format_line(
+        &spot,
+        STATION_CALL,
+        bus.unix_ts_for(spot.sample_ts),
+        rbn::LineFormat::Rbn,
+    );
+    bus.publish(spot);
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for the spot line after dry_run was turned off")
+        .unwrap();
+    assert_eq!(
+        line.trim_end(),
+        expected,
+        "must arrive on the same connection"
+    );
+
+    dry_run.store(true, Ordering::Relaxed);
+    bus.publish(sample_spot());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while target.suppressed_total() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the third spot was never suppressed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut more = String::new();
+    let result =
+        tokio::time::timeout(Duration::from_millis(300), reader.read_line(&mut more)).await;
+    assert!(
+        result.is_err(),
+        "dry_run back on: nothing more may be sent, got {more:?}"
+    );
+    assert_eq!(target.reconnects_total(), 0);
+    assert_eq!(metrics.uplink_sent_total(), 1);
+
+    let _ = shutdown_tx.send(true);
 }
 
 #[tokio::test]
@@ -645,6 +772,143 @@ async fn the_uplink_always_emits_the_rbn_layout() {
     let secs_of_day = unix_ts.rem_euclid(86_400);
     let zulu = format!("{:02}{:02}Z", secs_of_day / 3600, (secs_of_day % 3600) / 60);
     assert_eq!(line.find(&zulu).unwrap() + 1, 71, "line was: {line:?}");
+
+    let _ = harness.shutdown_tx.send(true);
+}
+
+/// MAN-91 scenarios 1 and 2: with `spot_types` left at its default, the CQ
+/// and beacon spots go out and the DE and untyped spots do not. Delivery to
+/// one target is in order, so reading the CQ line first proves the two
+/// earlier spots were never written.
+#[tokio::test]
+async fn default_spot_types_forwards_cq_and_beacon_but_not_de_or_untyped() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let harness = spawn_uplink(addr.port(), false);
+
+    let (_login_line, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+
+    let spots = one_spot_per_type();
+    let expected: Vec<String> = spots
+        .iter()
+        .filter(|s| matches!(s.spot_type, SpotType::Cq | SpotType::Beacon))
+        .map(|s| {
+            rbn::format_line(
+                s,
+                STATION_CALL,
+                harness.bus.unix_ts_for(s.sample_ts),
+                rbn::LineFormat::Rbn,
+            )
+        })
+        .collect();
+    for spot in spots {
+        harness.bus.publish(spot);
+    }
+
+    let first = read_forwarded_line(&mut reader).await;
+    let second = read_forwarded_line(&mut reader).await;
+    assert_eq!(
+        first, expected[0],
+        "the CQ spot must be the first line sent"
+    );
+    assert!(
+        first.contains("JA1CQ") && first.contains(" CQ "),
+        "line was: {first:?}"
+    );
+    assert_eq!(
+        second, expected[1],
+        "the beacon spot must be the second line sent"
+    );
+    assert!(
+        second.contains("JA1BCN") && second.contains("BEACON"),
+        "line was: {second:?}"
+    );
+
+    assert_eq!(harness.metrics.uplink_sent_total(), 2);
+    assert_eq!(
+        harness.metrics.uplink_suppressed_total(),
+        2,
+        "the DE and untyped spots must be counted as suppressed, not dropped silently"
+    );
+
+    let _ = harness.shutdown_tx.send(true);
+}
+
+/// MAN-91 scenario 3: `spot_types = "all"` forwards every type, DE and
+/// untyped included, in publish order.
+#[tokio::test]
+async fn spot_types_all_forwards_every_type() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut cfg = uplink_config(addr.port(), false);
+    cfg.spot_types = UplinkSpotTypes::All;
+    let harness = spawn_uplinks(vec![cfg]);
+
+    let (_login_line, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+
+    let spots = one_spot_per_type();
+    let expected: Vec<String> = spots
+        .iter()
+        .map(|s| {
+            rbn::format_line(
+                s,
+                STATION_CALL,
+                harness.bus.unix_ts_for(s.sample_ts),
+                rbn::LineFormat::Rbn,
+            )
+        })
+        .collect();
+    for spot in spots {
+        harness.bus.publish(spot);
+    }
+
+    let mut received = Vec::new();
+    for _ in 0..expected.len() {
+        received.push(read_forwarded_line(&mut reader).await);
+    }
+    assert_eq!(received, expected);
+    assert!(received[0].contains("JA1DE") && received[0].contains(" DE "));
+    assert!(received[1].contains("JA1UNK"));
+
+    assert_eq!(harness.metrics.uplink_sent_total(), 4);
+    assert_eq!(harness.metrics.uplink_suppressed_total(), 0);
+
+    let _ = harness.shutdown_tx.send(true);
+}
+
+/// MAN-91 scenario 2's second half: a DE spot the uplink holds back must
+/// still reach every other bus subscriber -- the telnet/JSON servers each
+/// take their own subscription, which this second receiver stands in for.
+#[tokio::test]
+async fn a_filtered_de_spot_still_reaches_other_bus_subscribers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let harness = spawn_uplink(addr.port(), false);
+    let (_login_line, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+
+    let mut other_rx = harness.bus.subscribe();
+    let de_spot = Spot {
+        spot_type: SpotType::De,
+        ..sample_spot()
+    };
+    harness.bus.publish(de_spot);
+
+    let received = tokio::time::timeout(Duration::from_secs(5), other_rx.recv())
+        .await
+        .expect("other subscriber timed out")
+        .unwrap();
+    assert_eq!(received.spot.callsign, "JA1ABC");
+    assert_eq!(received.spot.spot_type, SpotType::De);
+
+    let mut line = String::new();
+    let result =
+        tokio::time::timeout(Duration::from_millis(500), reader.read_line(&mut line)).await;
+    assert!(
+        result.is_err(),
+        "the default uplink must not transmit a DE spot, got: {line:?}"
+    );
+    assert_eq!(harness.metrics.uplink_sent_total(), 0);
+    assert_eq!(harness.metrics.uplink_suppressed_total(), 1);
 
     let _ = harness.shutdown_tx.send(true);
 }

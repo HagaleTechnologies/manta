@@ -1,4 +1,4 @@
-//! SPEC-decode-core.md §7.1 V11-V15, V18-V30: manta-spot validator
+//! SPEC-decode-core.md §7.1 V11-V15, V18-V45b: manta-spot validator
 //! vectors. (V16-V17, MAN-31's operator suppression vectors, live in
 //! golden_v16_v17.rs.)
 
@@ -79,6 +79,10 @@ fn v11_context_parse_sets_spot_type() {
         (&["CQ", "CQ", "DE", "K5ARH", "K5ARH", "K"], SpotType::Cq),
         (&["DE", "K5ARH", "K"], SpotType::De),
         (&["CQ", "TEST", "K5ARH", "K5ARH"], SpotType::Cq),
+        // MAN-104: contest framing -- a filler word between CQ and the call,
+        // and a bare TEST with no CQ.
+        (&["CQ", "WPX", "K5ARH", "K5ARH"], SpotType::Cq),
+        (&["TEST", "K5ARH", "K5ARH"], SpotType::Cq),
         (&["K5ARH", "UP", "UP"], SpotType::De),
         (&["V", "V", "V", "K5ARH", "K5ARH"], SpotType::Beacon),
         (&["K5ARH", "T"], SpotType::Beacon),
@@ -1475,5 +1479,108 @@ fn v44_the_measured_w6jq_w6jqa_shape_a_1_rep_rival_still_wins_by_shape() {
          repetition gate in this scene (only 1 observation), so it must \
          not spot either -- matching the real track-90 outcome of no spot \
          at all rather than a bogus one, got {spots:?}"
+    );
+}
+
+/// Every token `grammar::NON_CALLSIGN_TOKENS` lists (MAN-105). Kept as an
+/// independent copy rather than imported, so a token silently dropped from
+/// the production list fails this vector instead of shrinking it.
+const NON_CALLSIGN_CONVENTIONS: [&str; 10] = [
+    "5NN", "4NN", "3NN", "599", "TEST", "TU", "QRZ", "AGN", "K", "KN",
+];
+
+/// V45 (MAN-105): a common non-callsign CW convention never spots, in any
+/// framing, even where its text happens to match an allocated cty.dat
+/// prefix -- `5NN` is Nigeria's `5N`, `3NN` falls inside China's `3H`-`3U`
+/// block. Before MAN-105 both passed grammar and cty, and `5NN` spotted
+/// from all three framings below. Uses the full vendored `cty.dat` (not the local
+/// US-only fixture) so the allocated-prefix premise is real, and asserts
+/// that premise up front so the vector cannot pass vacuously.
+#[test]
+fn v45_non_callsign_conventions_never_spot_even_with_an_allocated_prefix() {
+    let cty = manta_spot::cty::Table::bundled();
+    for allocated in ["5NN", "3NN"] {
+        assert!(
+            cty.is_allocated(allocated),
+            "premise: {allocated} must match an allocated cty.dat prefix"
+        );
+    }
+
+    let framings: [fn(&str) -> Vec<&str>; 3] = [
+        |t| vec!["CQ", "CQ", "DE", t, t, "K"],
+        |t| vec!["DE", t, "K"],
+        |t| vec!["V", "V", "V", t, t],
+    ];
+    let spots_for = |words: &[&str]| {
+        let mut v = Validator::new(FS, manta_spot::CTY_DAT, None);
+        seed_meta(&mut v, 1);
+        let mut spots = run(&transmission_events(1, words, 0), &mut v);
+        spots.extend(run(&transmission_events(1, words, 100_000), &mut v));
+        // A Beacon candidate is only judged at TrackClosed.
+        spots.extend(close_track(&mut v, 1, ClosureKind::SignalEnded));
+        spots
+    };
+
+    for token in NON_CALLSIGN_CONVENTIONS {
+        for framing in framings {
+            let words = framing(token);
+            let spots = spots_for(&words);
+            assert!(
+                spots.is_empty(),
+                "non-callsign convention {token} must never spot, words \
+                 {words:?}, got {spots:?}"
+            );
+        }
+    }
+
+    // Control: the same harness and framings still spot a real call.
+    for framing in framings {
+        let words = framing("K5ARH");
+        let spots = spots_for(&words);
+        assert!(
+            spots.iter().any(|s| s.callsign == "K5ARH"),
+            "control K5ARH must spot, words {words:?}, got {spots:?}"
+        );
+    }
+}
+
+/// V45b (MAN-105): a repeated non-callsign convention never vetoes a real
+/// call through MAN-100's variant arbitration. A contest exchange repeats
+/// `5NN` on the track; `HA5NN` is a real call (not in master.scp here)
+/// that ends in `5NN`. Before MAN-105, `5NN` passed grammar and cty, so it
+/// entered the support ledger, out-supported `HA5NN` as a confusable
+/// suffix rival, and withheld it (measured: no spot, `variant` = 2).
+#[test]
+fn v45b_a_non_callsign_token_never_vetoes_a_real_call() {
+    let mut v = Validator::new(FS, manta_spot::CTY_DAT, None);
+    seed_meta(&mut v, 1);
+
+    let ten_seconds_samples = (10.0 * FS) as u64;
+    let mut spots = Vec::new();
+    for i in 0..4u64 {
+        spots.extend(run(
+            &transmission_events(1, &["K1ABC", "5NN", "05"], i * ten_seconds_samples),
+            &mut v,
+        ));
+    }
+    for i in 4..6u64 {
+        spots.extend(run(
+            &transmission_events(
+                1,
+                &["CQ", "TEST", "HA5NN", "HA5NN"],
+                i * ten_seconds_samples,
+            ),
+            &mut v,
+        ));
+    }
+
+    assert!(
+        spots.iter().any(|s| s.callsign == "HA5NN"),
+        "a real call ending in a repeated convention must still spot, got {spots:?}"
+    );
+    assert_eq!(
+        v.suppression_counts().variant,
+        0,
+        "the convention must never enter the support ledger as a rival"
     );
 }

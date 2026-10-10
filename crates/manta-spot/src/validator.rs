@@ -505,6 +505,22 @@ impl Validator {
         self
     }
 
+    /// MAN-78: replaces the operator's three lists as one unit, for a live
+    /// config reload. Tracks, dedupe, the repetition gate, the ledger and
+    /// `suppression_counts` are untouched; a word already attempted under the
+    /// old lists is not re-evaluated, so the new lists apply from the next
+    /// decoder event.
+    pub fn replace_operator_lists(
+        &mut self,
+        allowlist: &[String],
+        blocklist: Blocklist,
+        notch: NotchList,
+    ) {
+        self.allowlist = allowlist.iter().map(|c| c.to_ascii_uppercase()).collect();
+        self.blocklist = blocklist;
+        self.notch = notch;
+    }
+
     /// Per-reason counts of operator-suppressed spots so far (MAN-31,
     /// ARCHITECTURE §8).
     pub fn suppression_counts(&self) -> SuppressionCounts {
@@ -1421,6 +1437,18 @@ impl Validator {
         pending
             .into_iter()
             .filter_map(|pb| {
+                // MAN-78: the lists can be replaced between capture and
+                // close; a no-op when they were not (capture already passed
+                // the same checks). Before `gate.record`, so a suppressed
+                // beacon never feeds the repetition gate.
+                if self.blocklist.contains(&pb.candidate) {
+                    self.suppression_counts.blocklist += 1;
+                    return None;
+                }
+                if self.notch.contains(pb.freq_hz) {
+                    self.suppression_counts.notch += 1;
+                    return None;
+                }
                 // pb.origin_track_id, not the resolving `track_id`
                 // (Codex review, PR #152, round 14): a migrated
                 // PendingBeacon must keep the identity that ACTUALLY
@@ -1686,6 +1714,135 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
         assert_eq!(spots[0].callsign, "K5ARH");
         assert_eq!(spots[0].spot_type, SpotType::Beacon);
+    }
+
+    /// MAN-78: a K5ARH transmission, then a reload that blocklists
+    /// K5ARH, then the same transmission again -- the second one would
+    /// spot (see `full_pipeline_spots_a_repeated_valid_callsign`) and must
+    /// not.
+    #[test]
+    fn replaced_blocklist_suppresses_the_next_occurrence() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        v.replace_operator_lists(&[], Blocklist::parse("K5ARH\n"), NotchList::default());
+        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().blocklist, 1);
+    }
+
+    #[test]
+    fn replaced_empty_blocklist_lets_later_words_spot() {
+        let mut v =
+            Validator::new(FS, CTY_FIXTURE, None).with_blocklist(Blocklist::parse("K5ARH\n"));
+        seed_meta(&mut v, 1);
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().blocklist, 1);
+        v.replace_operator_lists(&[], Blocklist::default(), NotchList::default());
+        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+        spots.extend(run(&transmission_events(1, &words, 200_000), &mut v));
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].callsign, "K5ARH");
+    }
+
+    #[test]
+    fn replaced_allowlist_is_uppercased_and_replaces_the_old_list() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        v.allowlist("k5arh");
+        v.replace_operator_lists(
+            &["w1aw".to_string()],
+            Blocklist::default(),
+            NotchList::default(),
+        );
+        seed_meta(&mut v, 1);
+        seed_meta(&mut v, 2);
+        let spots = run(&transmission_events(1, &["W1AW"], 0), &mut v);
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].callsign, "W1AW");
+        let spots = run(&transmission_events(2, &["K5ARH"], 0), &mut v);
+        assert!(
+            spots.is_empty(),
+            "the old allowlist must be gone, got {spots:?}"
+        );
+    }
+
+    /// A beacon captured before a reload, resolved at `TrackClosed` after
+    /// it: the new blocklist must still apply (control:
+    /// `only_the_true_final_wpm_at_track_close_decides` spots it).
+    #[test]
+    fn pending_beacon_captured_before_a_blocklist_reload_never_spots() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        v.replace_operator_lists(&[], Blocklist::parse("K5ARH\n"), NotchList::default());
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().blocklist, 1);
+    }
+
+    #[test]
+    fn pending_beacon_without_a_reload_still_spots() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].spot_type, SpotType::Beacon);
+    }
+
+    #[test]
+    fn pending_beacon_in_a_newly_notched_range_never_spots() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        v.replace_operator_lists(
+            &[],
+            Blocklist::default(),
+            NotchList::parse("13999900-14000100\n"),
+        );
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().notch, 1);
+    }
+
+    #[test]
+    fn replacing_lists_keeps_suppression_counts() {
+        let mut v =
+            Validator::new(FS, CTY_FIXTURE, None).with_blocklist(Blocklist::parse("K5ARH\n"));
+        seed_meta(&mut v, 1);
+        let spots = run(&transmission_events(1, &["DE", "K5ARH", "K"], 0), &mut v);
+        assert!(spots.is_empty());
+        let before = v.suppression_counts();
+        assert_eq!(before.blocklist, 1);
+        v.replace_operator_lists(&[], Blocklist::default(), NotchList::default());
+        assert_eq!(v.suppression_counts(), before);
     }
 
     /// Codex review on PR #154, round 3: a blocklisted callsign that

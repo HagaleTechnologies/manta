@@ -105,7 +105,13 @@ pub(crate) fn init(out: &Path, force: bool) -> Result<()> {
 /// misconfiguration -- a `<...>` placeholder string anywhere, or the
 /// example callsign as the station or uplink login.
 fn reject_placeholders(loaded: &Loaded) -> Result<()> {
-    if let Some((key, value)) = find_placeholder(&loaded.raw, "") {
+    reject_placeholders_in(loaded, &loaded.raw)
+}
+
+/// `reject_placeholders`, scanning `raw` (`loaded.raw` or part of it) for
+/// `<...>` strings.
+fn reject_placeholders_in(loaded: &Loaded, raw: &toml::Table) -> Result<()> {
+    if let Some((key, value)) = find_placeholder(raw, "") {
         // Never echo a secret, even one shaped like a placeholder (D5).
         if key.ends_with("password") {
             bail!(
@@ -119,6 +125,23 @@ fn reject_placeholders(loaded: &Loaded) -> Result<()> {
         );
     }
     reject_example_callsigns(loaded)
+}
+
+/// MAN-78: the checks `check` runs beyond `run`'s config stage
+/// (placeholders, example callsigns, duplicate ports), for a SIGHUP
+/// reload: a document they reject applies nothing. With `cli_source` (the
+/// daemon's command line names the source) `[input]` is not scanned for
+/// placeholders: that flag replaced it, so `run` never reads it (MAN-268
+/// D3).
+pub(crate) fn reject_on_reload(loaded: &Loaded, cli_source: bool) -> Result<()> {
+    if cli_source {
+        let mut raw = loaded.raw.clone();
+        raw.remove("input");
+        reject_placeholders_in(loaded, &raw)?;
+    } else {
+        reject_placeholders(loaded)?;
+    }
+    reject_duplicate_ports(loaded)
 }
 
 /// MAN-268: the callsign half of `reject_placeholders`, which `run` (and
@@ -359,11 +382,13 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
         .unwrap_or_default();
     for u in &loaded.rbn_uplink {
         lines.push(format!(
-            "rbn_uplink: target_host={} target_port={} enabled={} dry_run={} login_callsign={}",
+            "rbn_uplink: target_host={} target_port={} enabled={} dry_run={} spot_types={} \
+             login_callsign={}",
             u.target_host,
             u.target_port,
             u.enabled,
             u.dry_run,
+            u.spot_types.as_str(),
             u.effective_login_callsign(station)
         ));
     }
@@ -627,7 +652,7 @@ mod tests {
             "[server]\nstation_callsign = \"W1AW\"\n\
              [[rbn_uplink]]\nenabled = true\ntarget_host = \"a.example.org\"\ntarget_port = 7000\n\
              [[rbn_uplink]]\nenabled = false\ntarget_host = \"b.example.org\"\ntarget_port = 7001\n\
-             login_callsign = \"k1abc\"\ndry_run = false\n",
+             login_callsign = \"k1abc\"\ndry_run = false\nspot_types = \"all\"\n",
         );
         let uplinks: Vec<&String> = lines
             .iter()
@@ -637,9 +662,9 @@ mod tests {
             uplinks,
             [
                 "rbn_uplink: target_host=a.example.org target_port=7000 enabled=true \
-                 dry_run=true login_callsign=W1AW",
+                 dry_run=true spot_types=cq_beacon login_callsign=W1AW",
                 "rbn_uplink: target_host=b.example.org target_port=7001 enabled=false \
-                 dry_run=false login_callsign=K1ABC",
+                 dry_run=false spot_types=all login_callsign=K1ABC",
             ]
         );
     }

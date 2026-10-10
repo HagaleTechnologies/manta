@@ -255,6 +255,32 @@ Forwarding to an upstream RBN-style collector is a `[[rbn_uplink]]`
 block. `dry_run` defaults to `true`, so an uplink connects and logs in but
 transmits nothing until you set it to `false` deliberately.
 
+### Changing lists without a restart
+
+With a `[server]` table, `SIGHUP` makes a running daemon re-read its config
+file and apply the `[spot]` lists (`allowlist` and the `blocklist_path` and
+`notch_path` files) and each `[[rbn_uplink]]` block's `dry_run`. Connected
+clients, the `sh/dx` history and uplink connections stay up (MAN-78).
+
+```sh
+manta config check --config server.toml   # the same checks a reload runs
+kill -HUP "$(pidof manta)"               # systemd: systemctl reload manta
+# Docker: docker kill --signal=HUP <container>
+```
+
+The log reports `reload: applied` with the new list sizes, or
+`reload: rejected; still running the previous configuration` with the
+reason; a rejected reload changes nothing.
+Every other setting still needs a restart: a reload that finds one changed
+applies the lists anyway and names the setting in a warning.
+That includes `cty_path` and `scp_path`: a reload checks that those
+files still parse, but keeps the tables manta started with, so a new
+cty.dat or master.scp, even at the same path, needs a restart.
+Command-line `--allowlist`/`--blocklist`/`--notch` keep overriding the file. Without a
+`[server]` table, `SIGHUP` stops manta just as `SIGINT` and `SIGTERM` do.
+Windows has no `SIGHUP`, so no reload. During shutdown the daemon logs
+`SIGHUP ignored; the daemon is shutting down` at INFO and applies nothing.
+
 `bind_addr` has no loopback default — omit it and the telnet and JSON
 servers bind `0.0.0.0`, every interface, as a public cluster node expects.
 The example above pins `127.0.0.1` on purpose. Metrics is the exception:
@@ -342,7 +368,13 @@ target_port = 7000
 # credentials and reachability, but transmits no spots. Set it to false
 # only once you actually intend to feed a live target.
 # dry_run = false
+# spot_types defaults to "cq_beacon": only CQ and beacon spots, as RBN
+# requires. "all" also sends DE and untyped spots.
+# spot_types = "all"
 ```
+
+Spots an uplink holds back still appear on manta's own telnet and JSON
+output; `spot_types` only decides what goes to that target.
 
 The uplink has not yet been verified against a real RBN ingest (see
 [ROADMAP.md](ROADMAP.md)), which is why dry-run is the default. manta logs
@@ -420,7 +452,8 @@ systemd, launchd or Docker Compose) ·
 workspace, data flow, and the channelizer, decoder, validation and output
 design · [docs/DECISIONS/](docs/DECISIONS/) — dated design decisions and
 implementation pins · [wiki/INDEX.md](wiki/INDEX.md) — accumulated
-gotchas.
+gotchas · [CHANGELOG.md](CHANGELOG.md) — changes and the decoder-output
+versioning rule.
 
 **Algorithms and research:** [docs/SPEC-decode-core.md](docs/SPEC-decode-core.md) —
 channelizer constants, noise-floor estimator, track state machine,
@@ -443,6 +476,12 @@ M4 with acceptance criteria.
 Open an issue or a pull request. Main moves only by PR, CI must be green, and
 the golden-vector determinism tests are the bar every decoder change has to
 clear. See [SECURITY.md](SECURITY.md) for vulnerability reporting.
+
+When you report a problem, include the output of `manta --version`. It names
+the exact commit and the compiled-in features. The Docker image is the
+exception for now: its build has no git metadata, so its commit reads
+`unknown`. A change that alters decoder
+output adds a `### Decoder output` entry to [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
