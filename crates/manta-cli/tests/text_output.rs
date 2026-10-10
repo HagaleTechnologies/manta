@@ -111,7 +111,10 @@ fn run(wav: &Path, extra: &[&str]) -> Output {
 
 /// The decoded-text lines of a run's stderr.
 fn track_lines(stderr: &str) -> Vec<&str> {
-    stderr.lines().filter(|l| l.starts_with("[track ")).collect()
+    stderr
+        .lines()
+        .filter(|l| l.starts_with("[track "))
+        .collect()
 }
 
 /// stdout holds at least one line, and every line is a spot.

@@ -245,10 +245,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         let (at, line) = &out[0];
         assert_eq!(*at, LINE_MAX_CHARS - 1, "the 64th character cuts the line");
-        assert_eq!(
-            line,
-            &format!("[track 6] {}", "T".repeat(LINE_MAX_CHARS))
-        );
+        assert_eq!(line, &format!("[track 6] {}", "T".repeat(LINE_MAX_CHARS)));
         assert_eq!(
             lines.ingest(&closed(6)),
             Some(format!("[track 6] {}", "T".repeat(6)))
