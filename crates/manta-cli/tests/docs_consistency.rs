@@ -1036,14 +1036,14 @@ fn docs_describe_the_separate_metrics_bind_addr() {
     }
 }
 
-<<<<<<< HEAD
 /// MAN-116: the README and ARCHITECTURE name the sensitivity benchmark so a
 /// reader can find how a sensitivity claim was produced.
 #[test]
 fn docs_name_the_sensitivity_benchmark() {
     assert!(doc("README.md").contains("manta bench sensitivity"));
     assert!(doc("ARCHITECTURE.md").contains("manta bench sensitivity"));
-=======
+}
+
 /// MAN-83: where `decoderVersion`'s format and the decoder-output versioning
 /// rule are decided.
 const MAN83_DECISION: &str =
@@ -1099,5 +1099,4 @@ fn architecture_section_7_describes_decoder_version() {
     for needle in ["decoderVersion", "manta-<version>+<commit>", MAN83_DECISION] {
         assert!(s7.contains(needle), "ARCHITECTURE §7 never says {needle:?}");
     }
->>>>>>> 51c0ae0da36c62e814f317e062fc5bb2c3429b3f
 }

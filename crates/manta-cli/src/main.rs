@@ -8,11 +8,8 @@ use manta_engine::{decode_wav, PipelineConfig};
 use manta_input::IqSource;
 use std::path::{Path, PathBuf};
 
-<<<<<<< HEAD
 mod bench;
-=======
 mod build_info;
->>>>>>> 51c0ae0da36c62e814f317e062fc5bb2c3429b3f
 mod config;
 mod config_cmd;
 mod reconnect;
