@@ -1048,6 +1048,14 @@ fn docs_describe_the_separate_metrics_bind_addr() {
     }
 }
 
+/// MAN-116: the README and ARCHITECTURE name the sensitivity benchmark so a
+/// reader can find how a sensitivity claim was produced.
+#[test]
+fn docs_name_the_sensitivity_benchmark() {
+    assert!(doc("README.md").contains("manta bench sensitivity"));
+    assert!(doc("ARCHITECTURE.md").contains("manta bench sensitivity"));
+}
+
 /// MAN-83: where `decoderVersion`'s format and the decoder-output versioning
 /// rule are decided.
 const MAN83_DECISION: &str =
