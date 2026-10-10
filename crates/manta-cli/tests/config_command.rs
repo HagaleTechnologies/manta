@@ -613,3 +613,147 @@ fn unedited_placeholder_fails_check_naming_the_key() {
         "{err}"
     );
 }
+
+// ---- MAN-268: `run` refuses the example callsigns, and only those
+
+/// `run`'s guard for a `[server]` config whose audio/file source has no dial
+/// frequency: the next check after the station guard, reached without I/O.
+const DIAL_REQUIRED: &str = "--dial-freq-hz is required with --config";
+const STATION_REFUSAL: &str =
+    "server.station_callsign is still the example \"N0CALL\" -- set your own callsign";
+
+fn run_with(dir: &Path, config: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
+    let mut cmd = manta();
+    cmd.current_dir(dir).args(["run", "--config"]).arg(config);
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().unwrap()
+}
+
+/// MAN-268: `run` checks the station after the `MANTA_*` overlay, so the
+/// identity it refuses is the one it would have spotted as.
+#[test]
+fn run_checks_the_station_after_the_environment_overlay() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = write_cfg(dir.path(), "real.toml", SERVER_TOML);
+    let o = run_with(
+        dir.path(),
+        &real,
+        &[("MANTA_SERVER_STATION_CALLSIGN", "N0CALL")],
+        &[],
+    );
+    let err = fails(&o);
+    assert!(err.contains(STATION_REFUSAL), "{err}");
+    assert!(!err.contains(DIAL_REQUIRED), "{err}");
+    assert!(stdout(&o).is_empty(), "{}", stdout(&o));
+
+    let placeholder = write_cfg(
+        dir.path(),
+        "placeholder.toml",
+        &SERVER_TOML.replace("W1AW", "N0CALL"),
+    );
+    let err = fails(&run_with(dir.path(), &placeholder, &[], &[]));
+    assert!(err.contains(STATION_REFUSAL), "{err}");
+    let err = fails(&run_with(
+        dir.path(),
+        &placeholder,
+        &[("MANTA_SERVER_STATION_CALLSIGN", "W3XYZ")],
+        &[],
+    ));
+    assert!(
+        err.contains(DIAL_REQUIRED) && !err.contains("station_callsign"),
+        "a real call from the environment must pass the station guard: {err}"
+    );
+}
+
+/// MAN-268 refuses exactly N0CALL; every callsign form the loader already
+/// accepts still reaches the same no-dial error as before.
+#[test]
+fn run_accepts_real_callsigns_including_portable_and_ssid_forms() {
+    let dir = tempfile::tempdir().unwrap();
+    for call in [
+        "W3XYZ",
+        "w3xyz",
+        "W5AU-1",
+        "K5ARH/QRP",
+        "JW/LB2PG",
+        "GB3LER/B",
+    ] {
+        let path = write_cfg(dir.path(), "manta.toml", &SERVER_TOML.replace("W1AW", call));
+        let err = fails(&run_with(dir.path(), &path, &[], &[]));
+        assert!(
+            err.contains(DIAL_REQUIRED) && !err.contains("station_callsign"),
+            "{call}: {err}"
+        );
+    }
+}
+
+/// A source flag replaces the whole `[input]` table (MAN-261), so `run`
+/// must not refuse an unused placeholder there: the broad `<...>` scan stays
+/// in `config check`, and only the station identity is checked at startup.
+#[test]
+fn run_lets_a_source_flag_replace_a_placeholder_receiver_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cfg(
+        dir.path(),
+        "manta.toml",
+        &format!(
+            "{SERVER_TOML}[input]\ntype = \"kiwi\"\nhost = \"<your-receiver-host>\"\n\
+             freq_hz = 7030000.0\n"
+        ),
+    );
+    let err = fails(&check_file(&path));
+    assert!(
+        err.contains("input.host is still a placeholder (\"<your-receiver-host>\")"),
+        "{err}"
+    );
+
+    // The missing WAV stops `run` at its first source read, after every
+    // startup check, without contacting the placeholder host.
+    let o = run_with(
+        dir.path(),
+        &path,
+        &[],
+        &["--source", "missing.wav", "--dial-freq-hz", "14060000"],
+    );
+    let err = fails(&o);
+    assert!(
+        err.contains("note: --source selects the source; ignoring [input] (type = \"kiwi\")"),
+        "{err}"
+    );
+    assert!(err.contains("(os error 2)"), "{err}");
+    assert!(!err.contains("placeholder"), "{err}");
+    assert!(!err.contains("station_callsign"), "{err}");
+}
+
+/// MAN-268: an uncommented example uplink login is refused by `run` too --
+/// no source flag replaces `[[rbn_uplink]]` -- before the no-dial guard.
+#[test]
+fn run_refuses_the_example_uplink_login() {
+    let dir = tempfile::tempdir().unwrap();
+    let uplink = "\n[[rbn_uplink]]\nenabled = true\ntarget_host = \"rbn.example.org\"\n\
+                  target_port = 7000\ndry_run = true\n";
+    let path = write_cfg(
+        dir.path(),
+        "manta.toml",
+        &format!("{SERVER_TOML}{uplink}login_callsign = \"n0call\"\n"),
+    );
+    let o = run_with(dir.path(), &path, &[], &[]);
+    let err = fails(&o);
+    assert!(
+        err.contains("rbn_uplink.login_callsign is still the example \"N0CALL\""),
+        "{err}"
+    );
+    assert!(!err.contains(DIAL_REQUIRED), "{err}");
+    assert!(stdout(&o).is_empty(), "{}", stdout(&o));
+
+    let path = write_cfg(
+        dir.path(),
+        "manta.toml",
+        &format!("{SERVER_TOML}{uplink}login_callsign = \"W3XYZ\"\n"),
+    );
+    let err = fails(&run_with(dir.path(), &path, &[], &[]));
+    assert!(err.contains(DIAL_REQUIRED), "{err}");
+}

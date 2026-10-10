@@ -336,17 +336,24 @@ Both should report the same digest.
 
 ## What each artifact contains
 
-- **Windows** (`manta-windows-x86_64.zip`): `manta.exe`, `README.md`, and
-  the two license files. The binary links the MSVC C runtime **statically**
-  (MAN-65 finding 2), so it needs no Visual C++ Redistributable installed —
-  unpack and run.
+- **Windows** (`manta-windows-x86_64.zip`): `manta.exe`, `README.md`,
+  the two license files, and the unattended-service kit listed below. The
+  binary links the MSVC C runtime **statically** (MAN-65 finding 2), so it
+  needs no Visual C++ Redistributable installed — unpack and run.
 - **macOS** (`manta-macos-{x86_64,arm64}.tar.gz`) and **Linux**
   (`manta-linux-{x86_64,arm64}.tar.gz`): the `manta` binary, `README.md`,
-  and the two license files. **Linux binaries need `libasound2` installed**
-  (`sudo apt install libasound2` on Debian/Ubuntu/Raspberry Pi OS, or the
+  the two license files, and the unattended-service kit. **Linux binaries
+  need `libasound2` installed** (`sudo apt install libasound2` on
+  Debian/Ubuntu/Raspberry Pi OS, or the
   equivalent ALSA runtime package elsewhere) — audio input is an
   unconditional dependency even for file/KiwiSDR/HPSDR-only use, and
   without it the binary fails to start.
+- **Unattended-service kit** (MAN-268, every archive, assembled by
+  `scripts/package-release.py`): `manta.example.toml`, `docker-compose.yml`,
+  `packaging/README.md`, `packaging/systemd/manta.service`,
+  `packaging/launchd/` (both plists, `create-service-account.sh`,
+  `rotate-log.sh`) and `docs/RUNBOOKS/network-exposure.md`. See
+  [docs/DECISIONS/2026-10-10-man268-unattended-packaging.md](../DECISIONS/2026-10-10-man268-unattended-packaging.md).
 - **Docker image** (`ghcr.io/hagaletechnologies/manta`): multi-arch
   (`linux/amd64`, `linux/arm64`), tagged `:X.Y.Z` for every release and
   `:latest` for the newest stable release only.

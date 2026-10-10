@@ -1,5 +1,8 @@
 /target
 
+# An operator's edited copy of manta.example.toml (MAN-268); the example stays tracked.
+/manta.toml
+
 # Agent harness scratch state (worktrees, session ledgers) -- never source.
 .claude/
 .worktrees/

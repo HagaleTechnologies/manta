@@ -205,6 +205,15 @@ jobs:
       # cold release builds) rides the already-required `test` check, like release-version above.
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_ci_trust_boundary -v
+      # MAN-268: the service kit's shell and account-helper tests are Unix-only; the release-archive
+      # tests run on all three legs so Windows keeps its zip coverage (`python` in Git Bash there).
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_packaging -v
+      - shell: bash
+        run: |
+          py=python3
+          if [ "${{ runner.os }}" = "Windows" ]; then py=python; fi
+          "$py" -m unittest scripts.tests.test_package_release -v
   # Same MAN-243 routing as `test` above (Dependabot plus every PR wait-for-codex.yml won't
   # dispatch) -- not itself a required check, but matches this job's own pre-migration behavior
   # (ran for a Dependabot PR too, gated only by codex-clean's tolerant skip) rather than silently
