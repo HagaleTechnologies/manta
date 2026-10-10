@@ -415,6 +415,7 @@ class ReleaseColdBuildTests(unittest.TestCase):
 
 
 DECISION_PATH_RE = re.compile(r"docs/DECISIONS/[0-9]{4}-[0-9]{2}-[0-9]{2}-man243-[A-Za-z0-9._-]*?\.md")
+DOC_PATH_RE = re.compile(r"docs/[A-Za-z0-9/._-]*?man243[A-Za-z0-9._-]*?\.md")
 RUNBOOK_PATH = "docs/RUNBOOKS/ci-trust-boundary.md"
 
 
@@ -423,13 +424,14 @@ class DocsReferenceTests(unittest.TestCase):
         files = ["wait-for-codex.yml", "ci-full.yml"] + [os.path.basename(p) for p in release_workflows()]
         for name in files:
             text = read(name)
-            refs = set(DECISION_PATH_RE.findall(text))
             with self.subTest(file=name):
-                self.assertTrue(refs, f"{name} never names the MAN-243 decision record")
+                self.assertTrue(DECISION_PATH_RE.search(text), f"{name} never names the MAN-243 decision record")
+                refs = set(DOC_PATH_RE.findall(text))
                 if RUNBOOK_PATH in text:
                     refs.add(RUNBOOK_PATH)
                 for ref in sorted(refs):
                     self.assertTrue(os.path.isfile(os.path.join(ROOT, ref)), f"{name} names missing {ref}")
+
 
 if __name__ == "__main__":
     unittest.main()
