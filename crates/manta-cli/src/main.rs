@@ -4737,7 +4737,7 @@ mod tests {
             GEOGRAPHY_DXCC_FIXTURE,
         ));
         let loaded = loaded_from("[server]\nstation_callsign = 'W1AW'\nbind_addr = '127.0.0.1'\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n");
-        let (rt, server) = start_spot_server(
+        let (test_runtime, server) = start_spot_server(
             loaded.server.unwrap(),
             vec![],
             SourceInfo {
@@ -4760,7 +4760,7 @@ mod tests {
             ("NA", 5, 40.0, -75.0)
         );
         let _ = server.shutdown_tx.send(true);
-        rt.shutdown_timeout(std::time::Duration::from_secs(1));
+        test_runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     }
     #[test]
     fn help_lists_cty_and_scp_for_every_validating_command() {

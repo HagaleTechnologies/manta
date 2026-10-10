@@ -614,7 +614,6 @@ fn unedited_placeholder_fails_check_naming_the_key() {
     );
 }
 
-<<<<<<< HEAD
 #[test]
 fn check_reports_an_unreadable_cty_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -670,7 +669,10 @@ fn check_warns_about_the_built_in_cty_exactly_when_it_is_stale() {
                 .flatten()
                 .any(|d| err.contains(&format!("is {d} days old"))),
             "{err}"
-=======
+        );
+    }
+}
+
 // ---- MAN-268: `run` refuses the example callsigns, and only those
 
 /// `run`'s guard for a `[server]` config whose audio/file source has no dial
@@ -743,12 +745,10 @@ fn run_accepts_real_callsigns_including_portable_and_ssid_forms() {
         assert!(
             err.contains(DIAL_REQUIRED) && !err.contains("station_callsign"),
             "{call}: {err}"
->>>>>>> 99c70e46911277efc41551a3193159341f8de30c
         );
     }
 }
 
-<<<<<<< HEAD
 #[test]
 fn check_never_warns_about_cty_age_with_an_override() {
     // Holds on any date: an operator-supplied table is never age-checked.
@@ -758,7 +758,8 @@ fn check_never_warns_about_cty_age_with_an_override() {
     let o = check_file(&path);
     succeeds(&o);
     assert!(!stderr(&o).contains("built-in cty.dat"), "{}", stderr(&o));
-=======
+}
+
 /// A source flag replaces the whole `[input]` table (MAN-261), so `run`
 /// must not refuse an unused placeholder there: the broad `<...>` scan stays
 /// in `config check`, and only the station identity is checked at startup.
@@ -825,5 +826,4 @@ fn run_refuses_the_example_uplink_login() {
     );
     let err = fails(&run_with(dir.path(), &path, &[], &[]));
     assert!(err.contains(DIAL_REQUIRED), "{err}");
->>>>>>> 99c70e46911277efc41551a3193159341f8de30c
 }
