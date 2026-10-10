@@ -147,7 +147,7 @@ impl InputKind {
     pub(crate) fn keys(self) -> &'static [&'static str] {
         match self {
             InputKind::Audio => &["device"],
-            InputKind::File => &["path", "iq"],
+            InputKind::File => &["path", "iq", "realtime", "loop"],
             InputKind::Kiwi => &["host", "port", "freq_hz", "password"],
             InputKind::Soapy => &["driver", "freq_hz", "rate_hz", "gain_db"],
             InputKind::Hpsdr => &["host", "port", "freq_hz", "rate_hz"],
@@ -163,6 +163,9 @@ struct InputToml {
     device: Option<String>,
     path: Option<PathBuf>,
     iq: Option<bool>,
+    realtime: Option<bool>,
+    #[serde(rename = "loop")]
+    looped: Option<bool>,
     host: Option<String>,
     port: Option<u16>,
     freq_hz: Option<f64>,
@@ -198,9 +201,13 @@ pub(crate) enum SourceFromFile {
     Audio {
         device: Option<String>,
     },
+    /// `realtime`/`looped` are MAN-269's paced and looping replay; `run`
+    /// applies them, `soak`/`doctor` ignore them with a note.
     File {
         path: PathBuf,
         iq: bool,
+        realtime: bool,
+        looped: bool,
     },
     Kiwi {
         host: String,
@@ -442,10 +449,12 @@ fn validate_input(
             .map(|v| crate::check_replay_epoch("input.replay_epoch", v))
             .transpose()?,
     };
-    let set: [(&str, bool); 10] = [
+    let set: [(&str, bool); 12] = [
         ("device", t.device.is_some()),
         ("path", t.path.is_some()),
         ("iq", t.iq.is_some()),
+        ("realtime", t.realtime.is_some()),
+        ("loop", t.looped.is_some()),
         ("host", t.host.is_some()),
         ("port", t.port.is_some()),
         ("freq_hz", t.freq_hz.is_some()),
@@ -491,6 +500,8 @@ fn validate_input(
         InputKind::File => SourceFromFile::File {
             path: resolve_path(req(t.path.clone(), "path", name)?),
             iq: t.iq.unwrap_or(false),
+            realtime: t.realtime.unwrap_or(false),
+            looped: t.looped.unwrap_or(false),
         },
         InputKind::Kiwi => SourceFromFile::Kiwi {
             port: port(8073)?,
@@ -1003,6 +1014,8 @@ mod tests {
             Some(SourceFromFile::File {
                 path: dir.path().join("v1.wav"),
                 iq: false,
+                realtime: false,
+                looped: false,
             })
         );
     }
@@ -1053,6 +1066,60 @@ mod tests {
             Some(SourceFromFile::File {
                 path: PathBuf::from("x.wav"),
                 iq: true,
+                realtime: false,
+                looped: false,
+            })
+        );
+    }
+
+    // ---- MAN-269: paced and looping file replay
+
+    #[test]
+    fn input_realtime_and_loop_are_file_keys() {
+        // Absolute on every OS (a bare "/x.wav" is relative on Windows).
+        let wav = std::env::temp_dir().join("x.wav");
+        let loaded = load_file(&format!(
+            "[input]\ntype = \"file\"\npath = '{}'\nrealtime = true\nloop = true\n",
+            wav.display()
+        ))
+        .unwrap();
+        assert_eq!(
+            loaded.input.source,
+            Some(SourceFromFile::File {
+                path: wav,
+                iq: false,
+                realtime: true,
+                looped: true,
+            })
+        );
+        let err = err_of("[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7e6\nloop = true\n");
+        assert!(
+            err.contains(
+                "input.loop does not apply to input.type = \"kiwi\" (kiwi takes host, port, \
+                 freq_hz, password)"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn manta_input_loop_env_sets_the_loop_key() {
+        let loaded = load_env(
+            None,
+            &[
+                ("MANTA_INPUT_TYPE", "file"),
+                ("MANTA_INPUT_PATH", "x.wav"),
+                ("MANTA_INPUT_LOOP", "true"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.input.source,
+            Some(SourceFromFile::File {
+                path: PathBuf::from("x.wav"),
+                iq: false,
+                realtime: false,
+                looped: true,
             })
         );
     }
@@ -1204,6 +1271,8 @@ mod tests {
             Some(SourceFromFile::File {
                 path: PathBuf::from("x.wav"),
                 iq: false,
+                realtime: false,
+                looped: false,
             })
         );
         assert_eq!(loaded.input.shared.freq_correction_ppm, None);

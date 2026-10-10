@@ -51,6 +51,10 @@ MAN-132: the metrics listener (`/metrics`, `/healthz`) binds
 `[server].metrics_bind_addr`, default `127.0.0.1`, while telnet/JSON keep
 `bind_addr` (`0.0.0.0`) — see
 docs/DECISIONS/2026-10-08-man132-metrics-loopback-bind.md.
+MAN-269: `run --realtime`/`--loop` (`input.realtime`/`input.loop`) pace and
+loop file replay so a hardware-free replay can feed telnet/JSON clients; IQ
+WAVs declaring more than 10 MS/s are rejected at open — see
+docs/DECISIONS/2026-10-10-man269-paced-looping-replay.md.
 
 ## Documents (read in this order)
 

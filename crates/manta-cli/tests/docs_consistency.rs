@@ -796,6 +796,8 @@ fn spec_documents_every_input_and_spot_key() {
                 "device",
                 "path",
                 "iq",
+                "realtime",
+                "loop",
                 "host",
                 "port",
                 "freq_hz",

@@ -11,6 +11,9 @@ pub use kiwi::KiwiIqSource;
 pub mod decimate;
 pub use decimate::DecimatingSource;
 
+pub mod replay;
+pub use replay::{LoopingSource, PacedSource, Reopen};
+
 #[cfg(feature = "soapy")]
 pub mod soapy;
 #[cfg(feature = "soapy")]
@@ -183,6 +186,19 @@ pub struct Sidecar {
     pub center_freq_hz: f64,
 }
 
+/// The highest sample rate an IQ WAV may declare, in Hz (MAN-269).
+///
+/// `WavIqSource::open` checks only the size here, not the shape: whether
+/// `fs / 93.75` is a power of two stays `Channelizer::new`'s job, with its
+/// own error message. The size check exists because a shape-valid but absurd
+/// rate (393 216 000 Hz = 93.75 * 2^22, in a 76-byte header) passes the
+/// channelizer and then asks `FloorBank::new` for 3.36 GB, before the
+/// calibration buffer is even sized. 10 MS/s matches `manta-cli`'s
+/// `MAX_HPSDR_RATE_HZ`; at the largest table rate it admits (6.144 MS/s) a
+/// replay peaked at 163 MiB RSS. See
+/// docs/DECISIONS/2026-10-10-man269-paced-looping-replay.md.
+pub const MAX_IQ_WAV_RATE_HZ: f64 = 10_000_000.0;
+
 /// Stereo WAV file (ch0=I, ch1=Q) as an IqSource, with an optional `<stem>.json` sidecar for center frequency. ARCHITECTURE §3.
 pub struct WavIqSource {
     samples: Vec<Complex32>,
@@ -199,6 +215,18 @@ impl WavIqSource {
         let spec = reader.spec();
         if spec.channels != 2 {
             bail!("IQ WAV must have 2 channels (I, Q); got {}", spec.channels);
+        }
+        // Before any sample is read: every rate-sized allocation downstream
+        // trusts this number (MAN-269, MAX_IQ_WAV_RATE_HZ).
+        let fs = f64::from(spec.sample_rate);
+        if fs <= 0.0 || fs > MAX_IQ_WAV_RATE_HZ {
+            bail!(
+                "IQ WAV {} declares a sample rate of {} Hz; IQ replay needs a rate above 0 \
+                 and at most {} Hz",
+                path.display(),
+                spec.sample_rate,
+                MAX_IQ_WAV_RATE_HZ as u64
+            );
         }
         let interleaved: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
             (hound::SampleFormat::Float, 32) => {
@@ -231,7 +259,7 @@ impl WavIqSource {
         Ok(WavIqSource {
             samples,
             cursor: 0,
-            fs: spec.sample_rate as f64,
+            fs,
             center_freq_hz,
         })
     }
@@ -353,6 +381,75 @@ mod tests {
         w.write_sample(0.0f32).unwrap();
         w.finalize().unwrap();
         assert!(WavIqSource::open(&wav).is_err());
+    }
+
+    /// A float32 stereo WAV header declaring `rate` and `frames` frames of
+    /// silence, written byte by byte so the test never depends on
+    /// `hound::WavWriter` accepting an absurd rate.
+    fn header_only_iq_wav(path: &std::path::Path, rate: u32, frames: u32) {
+        let data_len = frames * 8;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data_len).to_le_bytes());
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
+        b.extend_from_slice(&2u16.to_le_bytes()); // I, Q
+        b.extend_from_slice(&rate.to_le_bytes());
+        b.extend_from_slice(&rate.wrapping_mul(8).to_le_bytes()); // byte rate
+        b.extend_from_slice(&8u16.to_le_bytes()); // block align
+        b.extend_from_slice(&32u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data_len.to_le_bytes());
+        b.resize(b.len() + data_len as usize, 0);
+        std::fs::write(path, b).unwrap();
+    }
+
+    fn open_at(rate: u32) -> Result<WavIqSource> {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("rate.wav");
+        header_only_iq_wav(&wav, rate, 4);
+        WavIqSource::open(&wav)
+    }
+
+    // MAN-269: the two PR #135 findings -- validate/cap the replay rate
+    // before anything is allocated from it.
+
+    #[test]
+    fn iq_wav_declaring_a_rate_above_the_replay_ceiling_is_rejected() {
+        // 393_216_000 = 93.75 * 2^22: shape-valid for the channelizer, so only
+        // a magnitude bound stops it (measured: FloorBank::new asked for
+        // 3.36 GB).
+        let err = open_at(393_216_000).err().unwrap().to_string();
+        assert!(err.contains("393216000 Hz"), "{err}");
+        assert!(
+            err.contains("IQ replay needs a rate above 0 and at most 10000000 Hz"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn iq_wav_rate_ceiling_is_inclusive() {
+        let src = open_at(10_000_000).unwrap();
+        assert_eq!(src.sample_rate(), 10_000_000.0);
+        let err = open_at(10_000_001).err().unwrap().to_string();
+        assert!(err.contains("10000001 Hz"), "{err}");
+    }
+
+    #[test]
+    fn iq_wav_at_the_largest_admitted_table_rate_opens() {
+        // 6_144_000 = 93.75 * 2^16, the largest channelizer table rate under
+        // the ceiling.
+        let mut src = open_at(6_144_000).unwrap();
+        assert_eq!(src.sample_rate(), 6_144_000.0);
+        assert_eq!(read_all(&mut src).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn iq_wav_declaring_zero_hz_is_rejected() {
+        let err = open_at(0).err().unwrap().to_string();
+        assert!(err.contains("a sample rate of 0 Hz"), "{err}");
     }
 
     // MAN-56: input-layer health counters.
