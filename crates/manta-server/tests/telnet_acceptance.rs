@@ -1637,6 +1637,14 @@ async fn sh_version_identifies_the_server_and_the_session_continues() {
         assert_eq!(line, version_line(), "reply to {command:?}");
     }
 
+    wr.write_all(b"SKIMMER/SETT\r\n").await.unwrap();
+    let mut sett = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut sett))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sett, "SETT: vlNormal 14000.0-14088.0\r\n");
+
     let spot = sample_spot();
     let expected = rbn_row(&bus, &spot);
     bus.publish(spot);
