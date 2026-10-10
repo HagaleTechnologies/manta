@@ -57,6 +57,10 @@ pub struct AudioIqSource {
     center_freq_hz: f64,
 }
 
+fn missing_device(name: &str) -> anyhow::Error {
+    anyhow!("no input device matching '{}'", name.escape_debug())
+}
+
 impl AudioIqSource {
     /// Wrap an already-started AudioSource at TARGET_RATE_HZ.
     pub fn new(src: Box<dyn AudioSource>) -> Result<Self> {
@@ -105,8 +109,9 @@ impl AudioIqSource {
     pub fn from_device(name: Option<&str>) -> Result<Self> {
         use cpal::traits::{DeviceTrait, HostTrait};
         let device = match name {
-            Some(n) => coppa_audio::find_input_device_by_name(n)
-                .ok_or_else(|| anyhow!("no input device matching {n:?}"))?,
+            Some(n) => {
+                coppa_audio::find_input_device_by_name(n).ok_or_else(|| missing_device(n))?
+            }
             None => cpal::default_host()
                 .default_input_device()
                 .ok_or_else(|| anyhow!("no default input device"))?,
@@ -157,6 +162,15 @@ impl IqSource for AudioIqSource {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn missing_device_text_is_quoted_and_control_safe() {
+        assert_eq!(
+            missing_device("  USB\nAudio  ").to_string(),
+            "no input device matching '  USB\\nAudio  '"
+        );
+    }
+
     use super::*;
 
     #[test]

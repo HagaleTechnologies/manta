@@ -37,12 +37,12 @@ pub struct StartupInfo<'a> {
 /// `format_pipeline_ready`.
 pub fn format_startup_banner(info: &StartupInfo<'_>) -> String {
     format!(
-        "manta {} listening: source={} sample_rate_hz={:.0} dial_freq_hz={:.0} station={} \
+        "manta {} listening: source={} sample_rate_hz={:.0} dial_frequency={} station={} \
          telnet={} json={} metrics={}",
         info.version,
         info.source,
         info.sample_rate_hz,
-        info.dial_freq_hz,
+        crate::human::khz(info.dial_freq_hz),
         info.station_callsign,
         info.telnet_addr,
         info.json_addr,
@@ -315,7 +315,7 @@ mod tests {
             "0.1.0",
             "source=file",
             "sample_rate_hz=48000",
-            "dial_freq_hz=14060000",
+            "dial_frequency=14060.0 kHz",
             "telnet=127.0.0.1:7300",
             "json=127.0.0.1:7301",
             "metrics=127.0.0.1:7302",

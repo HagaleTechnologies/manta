@@ -272,10 +272,10 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                         if src.center_freq_hz() != self.center_freq_hz {
                             anyhow::bail!(
                                 "source {} reopened with a different center frequency \
-                                 ({} Hz, expected {} Hz)",
+                                 ({}, expected {})",
                                 self.name,
-                                src.center_freq_hz(),
-                                self.center_freq_hz
+                                manta_server::human::khz(src.center_freq_hz()),
+                                manta_server::human::khz(self.center_freq_hz)
                             );
                         }
                         if let Some(totals) = &self.input_health {
@@ -288,9 +288,10 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                     }
                     Err(e) => {
                         self.backoff = next_backoff(self.backoff, &AttemptOutcome::NeverConnected);
-                        eprintln!(
-                            "source {} reconnect attempt failed: {e:#}; retrying in {}s",
+                        crate::fmt::diagnostic!(
+                            "source {} reconnect attempt failed: {}; retrying in {}s",
                             self.name,
+                            crate::fmt::cause_text(&e),
                             self.backoff.as_secs()
                         );
                         continue;
@@ -319,7 +320,7 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                             let gap = (outage.as_secs_f64() * self.fs).round() as u64;
                             self.discontinuity = Some(gap);
                             self.reopened = false;
-                            eprintln!(
+                            crate::fmt::diagnostic!(
                                 "source {} reconnected after {:.1}s",
                                 self.name,
                                 outage.as_secs_f64()
@@ -341,9 +342,10 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                         totals.retire_current();
                     }
                     self.backoff = next_backoff(self.backoff, &outcome);
-                    eprintln!(
-                        "source {} lost: {e:#}; reconnecting in {}s",
+                    crate::fmt::diagnostic!(
+                        "source {} lost: {}; reconnecting in {}s",
                         self.name,
+                        crate::fmt::cause_text(&e),
                         self.backoff.as_secs()
                     );
                     self.report_health(false);
@@ -887,7 +889,7 @@ mod tests {
         src.read(&mut b).unwrap();
         let err = src.read(&mut b).unwrap_err();
         assert!(
-            err.to_string().contains("center frequency"),
+            err.to_string() == format!("source test reopened with a different center frequency ({:.1} kHz, expected {:.1} kHz)", (CENTER + 1000.0) / 1000.0, CENTER / 1000.0),
             "error must mention the center frequency mismatch, got: {err}"
         );
     }

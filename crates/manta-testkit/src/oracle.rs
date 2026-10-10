@@ -52,9 +52,10 @@ pub struct OracleSummary {
 /// `days_from_civil`'s unchecked arithmetic instead of erroring) and that
 /// no trailing garbage follows the expected component count.
 pub fn parse_utc_timestamp(s: &str) -> Result<i64> {
+    let quoted = format!("'{}'", s.escape_debug());
     let sep = s
         .find(['T', ' '])
-        .with_context(|| format!("no date/time separator in {s:?}"))?;
+        .with_context(|| format!("no date/time separator in {quoted}"))?;
     let (date, time) = (&s[..sep], &s[sep + 1..]);
     let time = time.trim_end_matches('Z');
     // Accept an explicit +00:00/-00:00 (or +0000/-0000) UTC offset -- the
@@ -72,9 +73,10 @@ pub fn parse_utc_timestamp(s: &str) -> Result<i64> {
                 clock
             } else {
                 bail!(
-                    "unsupported non-UTC offset {offset:?} in {s:?} -- only Z or a zero UTC \
+                    "unsupported non-UTC offset '{}' in {quoted} -- only Z or a zero UTC \
                      offset (+00:00/-00:00) is supported, since this parser does no offset \
-                     arithmetic"
+                     arithmetic",
+                    offset.escape_debug()
                 );
             }
         }
@@ -85,61 +87,61 @@ pub fn parse_utc_timestamp(s: &str) -> Result<i64> {
         .next()
         .context("year")?
         .parse()
-        .with_context(|| format!("year in {s:?}"))?;
+        .with_context(|| format!("year in {quoted}"))?;
     let mo: i64 = d
         .next()
         .context("month")?
         .parse()
-        .with_context(|| format!("month in {s:?}"))?;
+        .with_context(|| format!("month in {quoted}"))?;
     let da: i64 = d
         .next()
         .context("day")?
         .parse()
-        .with_context(|| format!("day in {s:?}"))?;
+        .with_context(|| format!("day in {quoted}"))?;
     if d.next().is_some() {
-        bail!("unexpected extra date component in {s:?}");
+        bail!("unexpected extra date component in {quoted}");
     }
     let mut t = time.split(':');
     let h: i64 = t
         .next()
         .context("hour")?
         .parse()
-        .with_context(|| format!("hour in {s:?}"))?;
+        .with_context(|| format!("hour in {quoted}"))?;
     let mi: i64 = t
         .next()
         .context("minute")?
         .parse()
-        .with_context(|| format!("minute in {s:?}"))?;
+        .with_context(|| format!("minute in {quoted}"))?;
     let se: i64 = t
         .next()
         .context("second")?
         .parse()
-        .with_context(|| format!("second in {s:?}"))?;
+        .with_context(|| format!("second in {quoted}"))?;
     if t.next().is_some() {
-        bail!("unexpected extra time component in {s:?}");
+        bail!("unexpected extra time component in {quoted}");
     }
     // Codex review, PR #161 round 2: an extreme but syntactically valid
     // year (e.g. i64::MAX) reaches `days_from_civil`'s unchecked arithmetic
     // and panics with an overflow instead of returning the intended parse
     // error. No real capture date needs a year outside this range.
     if !(1..=9999).contains(&y) {
-        bail!("year out of range 1-9999 in {s:?}: {y}");
+        bail!("year out of range 1-9999 in {quoted}: {y}");
     }
     if !(1..=12).contains(&mo) {
-        bail!("month out of range 1-12 in {s:?}: {mo}");
+        bail!("month out of range 1-12 in {quoted}: {mo}");
     }
     let dim = days_in_month(y, mo);
     if da < 1 || da > dim {
-        bail!("day out of range 1-{dim} for {y:04}-{mo:02} in {s:?}: {da}");
+        bail!("day out of range 1-{dim} for {y:04}-{mo:02} in {quoted}: {da}");
     }
     if !(0..=23).contains(&h) {
-        bail!("hour out of range 0-23 in {s:?}: {h}");
+        bail!("hour out of range 0-23 in {quoted}: {h}");
     }
     if !(0..=59).contains(&mi) {
-        bail!("minute out of range 0-59 in {s:?}: {mi}");
+        bail!("minute out of range 0-59 in {quoted}: {mi}");
     }
     if !(0..=59).contains(&se) {
-        bail!("second out of range 0-59 in {s:?}: {se}");
+        bail!("second out of range 0-59 in {quoted}: {se}");
     }
     Ok(days_from_civil(y, mo, da) * 86400 + h * 3600 + mi * 60 + se)
 }

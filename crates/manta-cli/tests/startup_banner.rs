@@ -85,7 +85,7 @@ fn the_daemon_logs_a_startup_banner_before_any_client_connects() {
         env!("CARGO_PKG_VERSION"),
         "source=file",
         "sample_rate_hz=48000",
-        "dial_freq_hz=14060000",
+        "dial_frequency=14060.0 kHz",
         "telnet=127.0.0.1:",
         "json=127.0.0.1:",
         "metrics=127.0.0.1:",

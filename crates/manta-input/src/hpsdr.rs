@@ -262,9 +262,9 @@ pub fn demux_metis_packet(
     }
     if packet[0..4] != METIS_IQ_ENDPOINT_HEADER {
         bail!(
-            "Metis packet header {:02x?} does not match the IQ endpoint 6 header {:02x?}",
-            &packet[0..4],
-            METIS_IQ_ENDPOINT_HEADER
+            "Metis packet header {} does not match the IQ endpoint 6 header {}",
+            hex_bytes(&packet[0..4]),
+            hex_bytes(&METIS_IQ_ENDPOINT_HEADER)
         );
     }
     if out.len() < num_receivers {
@@ -277,13 +277,25 @@ pub fn demux_metis_packet(
         let frame_start = METIS_HEADER_LEN + frame * USB_FRAME_LEN;
         let sync = &packet[frame_start..frame_start + 3];
         if sync != USB_SYNC {
-            bail!("USB frame {frame} has bad sync bytes {sync:02x?}, expected {USB_SYNC:02x?}");
+            bail!(
+                "USB frame {frame} has bad sync bytes {}, expected {}",
+                hex_bytes(sync),
+                hex_bytes(&USB_SYNC)
+            );
         }
         let payload_start = frame_start + USB_SUBHEADER_LEN;
         let payload = &packet[payload_start..payload_start + USB_PAYLOAD_LEN];
         demux_usb_payload(payload, num_receivers, out);
     }
     Ok(())
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Cadence-based UDP loss/reorder detector for a Protocol 1 stream that
@@ -980,6 +992,28 @@ impl IqSource for HpsdrIqSource {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn packet_errors_use_deliberate_hex_byte_lists() {
+        let mut pkt = synth_metis_packet(1, |_| Complex32::new(0.0, 0.0));
+        let mut out = vec![Vec::new(); 1];
+        pkt[0] = 0;
+        assert_eq!(
+            demux_metis_packet(&pkt, 1, &mut out)
+                .unwrap_err()
+                .to_string(),
+            "Metis packet header 00 fe 01 06 does not match the IQ endpoint 6 header ef fe 01 06"
+        );
+        pkt[0] = 0xef;
+        pkt[METIS_HEADER_LEN] = 0;
+        assert_eq!(
+            demux_metis_packet(&pkt, 1, &mut out)
+                .unwrap_err()
+                .to_string(),
+            "USB frame 0 has bad sync bytes 00 7f 7f, expected 7f 7f 7f"
+        );
+    }
+
     use super::*;
     use std::net::UdpSocket as StdUdpSocket;
 

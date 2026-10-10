@@ -515,9 +515,8 @@ async fn handle_client(
     }
     let Some(login) = sanitize_login(&login_line) else {
         if log_enabled {
-            // Debug (`?`), never Display -- the whole point is that this
-            // value is untrusted and may carry CR/ANSI escapes.
-            tracing::info!(login = ?login_line, "telnet: implausible login callsign, disconnecting");
+            // Explicit quoting escapes untrusted CR/ANSI and C1 controls.
+            tracing::info!(login = %crate::human::quoted(&login_line), "telnet: implausible login callsign, disconnecting");
         }
         // One attempt, then close: this listener is unauthenticated by
         // design, and a retry loop is free budget for a scanner.
@@ -531,16 +530,10 @@ async fn handle_client(
         }
         return Ok(());
     };
-    // MAN-59 review: the login line is client-supplied and unvalidated --
-    // Display (`%`) writes it into the log verbatim, letting an
-    // unauthenticated client embed CRs/ANSI escapes to forge additional
-    // bogus log lines or manipulate terminal output. Debug (`?`) escapes
-    // control characters instead -- still Debug-escaped even though
-    // `sanitize_login` already excluded control characters (defence in
-    // depth, and it keeps this call site correct if the check is ever
-    // loosened).
+    // Keep explicit quoting even after validation, so future grammar changes
+    // cannot let client control bytes forge terminal or audit-log records.
     if log_enabled {
-        tracing::info!(login = ?login, "telnet: client logged in");
+        tracing::info!(login = %crate::human::quoted(&login), "telnet: client logged in");
     }
 
     let banner = format!("de {}-# >\r\n", profile.call);
@@ -731,11 +724,9 @@ async fn handle_client(
                 // recorded, leaving the audit trail unable to reconstruct
                 // what happened -- only the over-budget disconnect above
                 // was logged. Logs the PARSED, normalized command
-                // (`Command`'s own Debug -- an enum variant plus already-
-                // validated numeric fields, e.g. `ShowDx { count: Some(50) }`
-                // or bare `Unknown`), never the raw client-supplied line,
-                // which is unescaped and could otherwise inject the same
-                // way the login field could (see the fix just above).
+                // with validated numeric fields, rendered as canonical text.
+                // Never log the raw client line, which could inject controls
+                // just like the login field above.
                 //
                 // MAN-87 remediation (code-review finding 1): trimmed with
                 // the same predicate as the login line before parsing.
@@ -749,7 +740,7 @@ async fn handle_client(
                 // the trim happens at this call site instead of inside it.
                 let parsed_command = command::parse(trim_login(&cmd_line));
                 if log_enabled {
-                    tracing::info!(command = ?parsed_command, "telnet: command received");
+                    tracing::info!(command = %command_description(&parsed_command), "telnet: command received");
                 }
                 match parsed_command {
                     Command::ShowDx { count } => {
@@ -1098,8 +1089,37 @@ fn trim_login(raw: &str) -> &str {
     raw.trim_matches(|c: char| c.is_whitespace() || c == '\u{0}')
 }
 
+/// Canonical audit text uses parsed fields only, never untrusted raw input.
+fn command_description(command: &Command) -> String {
+    match command {
+        Command::ShowDx { count: Some(n) } => format!("sh/dx/{n}"),
+        Command::ShowDx { count: None } => "sh/dx".into(),
+        Command::SetFilterUnique { min } => format!("set dx filter unique > {min}"),
+        Command::Sett => "SKIMMER/SETT".into(),
+        Command::Bye => "BYE".into(),
+        Command::Unknown => "unknown".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn command_audit_text_keeps_validated_arguments_without_debug_variants() {
+        for (command, expected) in [
+            (Command::ShowDx { count: None }, "sh/dx"),
+            (Command::ShowDx { count: Some(50) }, "sh/dx/50"),
+            (
+                Command::SetFilterUnique { min: 2 },
+                "set dx filter unique > 2",
+            ),
+            (Command::Sett, "SKIMMER/SETT"),
+            (Command::Bye, "BYE"),
+            (Command::Unknown, "unknown"),
+        ] {
+            assert_eq!(command_description(&command), expected);
+        }
+    }
+
     use super::*;
 
     #[test]

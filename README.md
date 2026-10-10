@@ -297,9 +297,19 @@ only if that config also carries at least one `[[rbn_uplink]]` block.
   source-health counters. Some gauges are still placeholders;
   ARCHITECTURE §8 says which.
 
-`decode` and `listen` also print decoded text or `--json` events on
-stdout. That output is a debugging aid, not a stable interface — the
-servers above are.
+`decode` prints decoded text on stdout and a measurement summary on stderr.
+`run` prints confirmed spots on stdout; its character monitor, startup messages
+and diagnostics go to stderr. Capture them separately:
+
+```sh
+manta run --config manta.toml > spots.log 2> monitor.log
+```
+
+`listen` remains a compatibility alias. `run --json` and `decode --json` keep
+full-precision JSON on stdout. These CLI JSON reports are diagnostic interfaces;
+the servers above provide the ecosystem wire contract. Human units, report
+streams and error conventions are defined in the
+[command output style decision](docs/DECISIONS/2026-10-10-man270-cli-output-style.md).
 
 The decode path is deterministic: the same file in produces byte-identical
 spot logs out. That is a hard requirement, and CI enforces it with golden

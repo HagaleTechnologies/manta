@@ -22,6 +22,17 @@ pub enum SpotType {
     Unknown,
 }
 
+impl std::fmt::Display for SpotType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(match self {
+            Self::Cq => "CQ",
+            Self::De => "DE",
+            Self::Beacon => "BEACON",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
 /// One `parse` match: callsign (uppercased), spot type, the full match's
 /// byte range, and -- for a power-step-origin match only -- the exact
 /// range of the callsign capture itself. See `parse`'s own docs for what
@@ -258,6 +269,19 @@ pub fn power_step_candidates(text: &str) -> Vec<(String, Range<usize>, Range<usi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn human_labels_and_padding() {
+        for (kind, label) in [
+            (SpotType::Cq, "CQ"),
+            (SpotType::De, "DE"),
+            (SpotType::Beacon, "BEACON"),
+            (SpotType::Unknown, "unknown"),
+        ] {
+            assert_eq!(kind.to_string(), label);
+        }
+        assert_eq!(format!("{:>4}", SpotType::Cq), "  CQ");
+    }
+
     use super::*;
 
     /// Asserts only the candidate/type of every returned match, ignoring

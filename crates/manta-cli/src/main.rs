@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 mod config;
 mod config_cmd;
+mod fmt;
 mod reconnect;
 use reconnect::ReconnectingSource;
 
@@ -1083,7 +1084,7 @@ impl IqSource for FixedCenterFreqSource {
 /// regressing it.
 fn warn_if_audio_source_has_no_rf_reference(has_rf_aware_source: bool, dial_freq_hz: Option<f64>) {
     if !has_rf_aware_source && dial_freq_hz.is_none() {
-        eprintln!(
+        crate::fmt::diagnostic!(
             "warning: no --dial-freq-hz given for an audio source -- \
              reported frequencies are baseband offsets within the \
              audio passband, not absolute RF frequencies. Pass the \
@@ -1132,9 +1133,7 @@ const MIN_CAPTURE_RATE_HZ: f64 = 1_000.0;
 /// of obviously-bad input (e.g. a negative or degenerately tiny value that
 /// would otherwise reach `Channelizer::new` with `hop == 0` and hang).
 fn parse_capture_rate_hz(s: &str) -> std::result::Result<f64, String> {
-    let hz: f64 = s
-        .parse()
-        .map_err(|e| format!("invalid --capture-rate-hz {s:?}: {e}"))?;
+    let hz: f64 = s.parse().map_err(|e| format!("{e}"))?;
     check_capture_rate_hz("--capture-rate-hz", hz)
 }
 
@@ -1154,9 +1153,7 @@ fn check_capture_rate_hz(name: &str, hz: f64) -> std::result::Result<f64, String
 /// same validation `manta_spot::calibration_factor_from_ppm` applies
 /// (MAN-29 review).
 fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
-    let ppm: f64 = s
-        .parse()
-        .map_err(|e| format!("invalid --freq-correction-ppm {s:?}: {e}"))?;
+    let ppm: f64 = s.parse().map_err(|e| format!("{e}"))?;
     check_freq_correction_ppm(ppm)
 }
 
@@ -1314,7 +1311,7 @@ fn session_nonce_for_replay_path(path: &std::path::Path) -> Result<u128> {
 /// to the actual recording start (Codex review, PR #161).
 fn parse_capture_start(s: &str) -> std::result::Result<i64, String> {
     manta_testkit::oracle::parse_utc_timestamp(s)
-        .map_err(|e| format!("invalid --capture-start {s:?}: {e}"))
+        .map_err(|e| manta_server::status_doc::escape_for_terminal(&e.to_string()))
 }
 
 // Codex review, PR #161 round 2: a negative --window-s makes run_oracle's
@@ -1324,9 +1321,7 @@ fn parse_capture_start(s: &str) -> std::result::Result<i64, String> {
 // function's doc comment -- but a CLI-level rejection gives a clap usage
 // error instead of a bail! from inside the command's execution path).
 fn parse_window_s(s: &str) -> std::result::Result<f64, String> {
-    let window_s: f64 = s
-        .parse()
-        .map_err(|e| format!("invalid --window-s {s:?}: {e}"))?;
+    let window_s: f64 = s.parse().map_err(|e| format!("{e}"))?;
     if !window_s.is_finite() || window_s <= 0.0 {
         return Err(format!(
             "--window-s must be finite and positive, got {window_s}"
@@ -1336,9 +1331,7 @@ fn parse_window_s(s: &str) -> std::result::Result<f64, String> {
 }
 
 fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
-    let hz: f64 = s
-        .parse()
-        .map_err(|e| format!("invalid --dial-freq-hz {s:?}: {e}"))?;
+    let hz: f64 = s.parse().map_err(|e| format!("{e}"))?;
     check_dial_freq_hz("--dial-freq-hz", hz)
 }
 
@@ -1385,9 +1378,7 @@ const _: () = assert!(HPSDR_CONTROL_PORT == manta_input::hpsdr::CONTROL_PORT);
 /// `parse_dial_freq_hz`'s pattern.
 #[cfg(feature = "hpsdr")]
 fn parse_hpsdr_rate_hz(s: &str) -> std::result::Result<f64, String> {
-    let hz: f64 = s
-        .parse()
-        .map_err(|e| format!("invalid --hpsdr-rate-hz {s:?}: {e}"))?;
+    let hz: f64 = s.parse().map_err(|e| format!("{e}"))?;
     check_hpsdr_rate_hz("--hpsdr-rate-hz", hz)
 }
 
@@ -1411,9 +1402,7 @@ fn check_hpsdr_rate_hz(name: &str, hz: f64) -> std::result::Result<f64, String> 
 /// every emitted spot's frequency field).
 #[cfg(feature = "hpsdr")]
 fn parse_hpsdr_freq_hz(s: &str) -> std::result::Result<f64, String> {
-    let hz: f64 = s
-        .parse()
-        .map_err(|e| format!("invalid --hpsdr-freq-hz {s:?}: {e}"))?;
+    let hz: f64 = s.parse().map_err(|e| format!("{e}"))?;
     check_hpsdr_freq_hz("--hpsdr-freq-hz", hz)
 }
 
@@ -1447,9 +1436,7 @@ const MAX_REPLAY_EPOCH_SECS: i64 = 4_102_444_800;
 /// recording tool's own metadata, `date +%s`) can produce Unix seconds
 /// directly.
 fn parse_replay_epoch(s: &str) -> std::result::Result<i64, String> {
-    let secs: i64 = s
-        .parse()
-        .map_err(|e| format!("invalid --replay-epoch {s:?}: {e}"))?;
+    let secs: i64 = s.parse().map_err(|e| format!("{e}"))?;
     check_replay_epoch("--replay-epoch", secs)
 }
 
@@ -2426,7 +2413,7 @@ fn start_spot_server(
     // real consumers and breaks deterministic-replay byte-identity.
     // stderr is a separate stream a JSON-Lines consumer never reads.
     let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(fmt::monitor_aware_stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -2464,16 +2451,18 @@ fn start_spot_server(
                 .await
                 .with_context(|| {
                     format!(
-                        "binding the telnet server (bind_addr = {:?}, telnet_port = {})",
-                        cfg.bind_addr, cfg.telnet_port
+                        "binding the telnet server (bind_addr = {}, telnet_port = {})",
+                        fmt::quoted(&cfg.bind_addr),
+                        cfg.telnet_port
                     )
                 })?;
         let json_listener = tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.json_port))
             .await
             .with_context(|| {
                 format!(
-                    "binding the JSON server (bind_addr = {:?}, json_port = {})",
-                    cfg.bind_addr, cfg.json_port
+                    "binding the JSON server (bind_addr = {}, json_port = {})",
+                    fmt::quoted(&cfg.bind_addr),
+                    cfg.json_port
                 )
             })?;
         let metrics_listener =
@@ -2481,8 +2470,9 @@ fn start_spot_server(
                 .await
                 .with_context(|| {
                     format!(
-                        "binding the metrics server (metrics_bind_addr = {:?}, metrics_port = {})",
-                        cfg.metrics_bind_addr, cfg.metrics_port
+                        "binding the metrics server (metrics_bind_addr = {}, metrics_port = {})",
+                        fmt::quoted(&cfg.metrics_bind_addr),
+                        cfg.metrics_port
                     )
                 })?;
         let metrics_addr = metrics_listener.local_addr()?;
@@ -2973,7 +2963,7 @@ fn prepare_live(
     let loaded = config::load(config_path.as_deref(), config::Env::Read(&vars))?;
     let resolved = resolve(cli, &loaded)?;
     for note in &resolved.notes {
-        eprintln!("{note}");
+        crate::fmt::diagnostic!("{note}");
     }
     let decode = merge_cli_engine(cli_engine, loaded.decode.clone());
     let mut pipeline = build_pipeline_config(
@@ -3003,7 +2993,7 @@ fn note_ignored_tables(loaded: &config::Loaded, command: &str, applied: &[&str])
         .filter(|t| !applied.contains(t))
         .collect();
     if !ignored.is_empty() {
-        eprintln!(
+        crate::fmt::diagnostic!(
             "note: {command} ignores [{}] from {}",
             ignored.join("], ["),
             loaded.origin
@@ -3047,10 +3037,10 @@ fn resolve_status_addr(
         use std::net::ToSocketAddrs;
         let addrs: Vec<_> = addr
             .to_socket_addrs()
-            .with_context(|| format!("invalid --addr {addr:?}"))?
+            .with_context(|| format!("invalid --addr {}", fmt::quoted(addr)))?
             .collect();
         if addrs.is_empty() {
-            bail!("--addr {addr:?} resolved to no addresses");
+            bail!("--addr {} resolved to no addresses", fmt::quoted(addr));
         }
         return Ok(addrs);
     }
@@ -3079,10 +3069,15 @@ fn resolve_status_addr(
                 use std::net::ToSocketAddrs;
                 let addrs: Vec<_> = (other, server.metrics_port)
                     .to_socket_addrs()
-                    .with_context(|| format!("resolving server.metrics_bind_addr {other:?}"))?
+                    .with_context(|| {
+                        format!("resolving server.metrics_bind_addr {}", fmt::quoted(other))
+                    })?
                     .collect();
                 if addrs.is_empty() {
-                    bail!("server.metrics_bind_addr {other:?} resolved to no addresses");
+                    bail!(
+                        "server.metrics_bind_addr {} resolved to no addresses",
+                        fmt::quoted(other)
+                    );
                 }
                 Ok(addrs)
             }
@@ -3192,7 +3187,7 @@ fn run_status(
 /// third case -- `2`, "could not reach or parse the daemon's status at
 /// all" -- is returned directly by `Command::Status`'s handler, since it
 /// never gets as far as a `StatusDoc` to pass here.)
-fn status_exit_code(doc: &manta_server::status_doc::StatusDoc) -> i32 {
+fn status_exit_code(doc: &manta_server::status_doc::StatusDoc) -> u8 {
     use manta_server::metrics::OverallUplinkHealth;
     match doc.uplink.health {
         OverallUplinkHealth::Ok | OverallUplinkHealth::Disabled => 0,
@@ -3200,14 +3195,9 @@ fn status_exit_code(doc: &manta_server::status_doc::StatusDoc) -> i32 {
     }
 }
 
-/// What `Command::Status` prints to stderr before exiting 2. Not escaped
-/// here as a whole: local diagnostics such as a `--config` TOML error carry
-/// a multi-line source snippet that must stay readable. Peer-supplied text
-/// is escaped where it enters the error instead -- the status line in
-/// `fetch_status_inner`, serde_json's quoted values in `parse_status_doc`
-/// (Codex review, PR #95).
+/// Status uses the application error style while retaining exit code 2.
 fn status_failure_message(e: &anyhow::Error) -> String {
-    format!("manta status: {e:#}")
+    fmt::render_error(e)
 }
 
 /// Bounds a fetched status document's body size (MAN-44): a real status
@@ -3418,7 +3408,17 @@ fn invalid_status_doc(e: serde_json::Error) -> anyhow::Error {
     )
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match run_command() {
+        Ok(code) => code,
+        Err(err) => {
+            crate::fmt::diagnostic!("{}", fmt::render_error(&err));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_command() -> Result<std::process::ExitCode> {
     warn_deprecations();
     match Cli::parse().command {
         Command::Decode {
@@ -3445,7 +3445,7 @@ fn main() -> Result<()> {
                 || shared.capture_rate_hz.is_some()
                 || shared.replay_epoch.is_some()
             {
-                eprintln!(
+                crate::fmt::diagnostic!(
                     "note: decode applies only input.freq_correction_ppm from [input] in {}",
                     loaded.origin
                 );
@@ -3468,8 +3468,7 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string(&report)?);
             } else {
                 println!("{}", report.text);
-                eprintln!("freq_hz: {:.1}  wpm: {:?}", report.freq_hz, report.wpm);
-                eprintln!("spots: {}", report.spots.len());
+                crate::fmt::diagnostic!("{}", fmt::decode_summary(&report));
             }
         }
         Command::Oracle {
@@ -3518,18 +3517,19 @@ fn main() -> Result<()> {
                 "vr7" => manta_testkit::vectors::vr7(),
                 "vr8" => manta_testkit::vectors::vr8(),
                 other => bail!(
-                    "unknown vector {other:?} (available: v1-v6, vr1-vr5, vr6a, vr6b, vr7-vr8)"
+                    "unknown vector '{}' (available: v1-v6, vr1-vr5, vr6a, vr6b, vr7-vr8)",
+                    manta_server::status_doc::escape_for_terminal(other).replace('\'', "\\'")
                 ),
             };
             std::fs::create_dir_all(&out)?;
             let manifest = manta_testkit::vectors::write_fixture_set(&spec, &out)?;
-            eprintln!(
-                "wrote {}/{{{}.wav,{}.json,{}.manifest.json}} (expected freq {:.1} Hz)",
+            crate::fmt::diagnostic!(
+                "wrote {}/{{{}.wav,{}.json,{}.manifest.json}} (expected frequency {})",
                 out.display(),
                 spec.name,
                 spec.name,
                 spec.name,
-                manifest.expected_freq_hz
+                manta_server::human::khz(manifest.expected_freq_hz)
             );
         }
         Command::Run {
@@ -3633,7 +3633,7 @@ fn main() -> Result<()> {
                 );
             }
             if config_path.is_some() && loaded.server.is_none() {
-                eprintln!(
+                crate::fmt::diagnostic!(
                     "note: {} has no [server] table; the telnet/JSON/metrics servers are not \
                      started",
                     loaded.origin
@@ -3893,7 +3893,7 @@ fn main() -> Result<()> {
                 });
             }
 
-            // Printed via `eprintln!` rather than `tracing::info!` because
+            // Printed via the coordinated stderr writer because
             // the subscriber is only initialized inside
             // `start_spot_server` -- a plain `listen` (no --server-config)
             // has no subscriber at all. Two jobs: `listen` otherwise prints
@@ -3909,7 +3909,7 @@ fn main() -> Result<()> {
             // ever replaces this line, `READY_MARKER` must be updated to
             // match. stdout stays pure JSON under `--json` (MAN-59
             // round 6); this goes to stderr.
-            eprintln!("manta: listening; send SIGINT or SIGTERM to stop");
+            crate::fmt::diagnostic!("manta: listening; send SIGINT or SIGTERM to stop");
             // Captured before `src` is moved into the pipeline, for the
             // readiness event below.
             let source_sample_rate_hz = src.sample_rate();
@@ -3941,17 +3941,14 @@ fn main() -> Result<()> {
                         println!("{}", serde_json::to_string(ev).unwrap());
                         return;
                     }
-                    use std::io::Write as _;
                     match ev {
                         DecoderEvent::CharDecoded { glyph, .. } => {
                             if let Some(c) = glyph.text_char() {
-                                print!("{c}");
-                                let _ = std::io::stdout().flush();
+                                fmt::monitor_write(&c.to_string());
                             }
                         }
                         DecoderEvent::WordBoundary { .. } => {
-                            print!(" ");
-                            let _ = std::io::stdout().flush();
+                            fmt::monitor_write(" ");
                         }
                         _ => {}
                     }
@@ -3983,15 +3980,7 @@ fn main() -> Result<()> {
                         println!("{}", serde_json::json!({ "spot": spot }));
                         return;
                     }
-                    eprintln!(
-                        "SPOT: {} ({:?}) {:.1} Hz {:.0} dB {:.0} wpm conf={:.2}",
-                        spot.callsign,
-                        spot.spot_type,
-                        spot.freq_hz,
-                        spot.snr_db,
-                        spot.wpm,
-                        spot.confidence
-                    );
+                    println!("{}", fmt::spot_line(spot));
                 },
                 // MAN-122 review round 1: the live track gauge comes from
                 // `TrackManager`'s own lifecycle -- how many tracks are
@@ -4043,6 +4032,8 @@ fn main() -> Result<()> {
                     }
                 },
             );
+
+            fmt::end_monitor_line();
 
             // Run the same server-shutdown sequence on BOTH the success and
             // error paths -- an SDR disconnect or WAV read failure from
@@ -4226,7 +4217,7 @@ fn main() -> Result<()> {
                 None,
             )?;
             if loaded.server.is_some() {
-                eprintln!(
+                crate::fmt::diagnostic!(
                     "note: soak does not start the spot servers; ignoring [server] from {}",
                     loaded.origin
                 );
@@ -4236,9 +4227,9 @@ fn main() -> Result<()> {
             let src: Box<dyn IqSource> =
                 spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz)?;
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
-            eprintln!("{report:?}");
+            print!("{}", fmt::soak_report(&report));
             if !manta_engine::soak_passed(&report) {
-                std::process::exit(1);
+                return Ok(std::process::ExitCode::FAILURE);
             }
         }
         Command::Status {
@@ -4260,8 +4251,8 @@ fn main() -> Result<()> {
             let doc = match run_status(config.as_deref(), addr.as_deref(), timeout_secs) {
                 Ok(doc) => doc,
                 Err(e) => {
-                    eprintln!("{}", status_failure_message(&e));
-                    std::process::exit(2);
+                    crate::fmt::diagnostic!("{}", status_failure_message(&e));
+                    return Ok(std::process::ExitCode::from(2));
                 }
             };
             if json {
@@ -4269,7 +4260,7 @@ fn main() -> Result<()> {
             } else {
                 print!("{}", manta_server::status_doc::render_human(&doc));
             }
-            std::process::exit(status_exit_code(&doc));
+            return Ok(std::process::ExitCode::from(status_exit_code(&doc)));
         }
         Command::Doctor {
             duration,
@@ -4365,7 +4356,7 @@ fn main() -> Result<()> {
                 None,
             )?;
             if loaded.server.is_some() {
-                eprintln!(
+                crate::fmt::diagnostic!(
                     "note: doctor does not start the spot servers; ignoring [server] from {}",
                     loaded.origin
                 );
@@ -4390,13 +4381,13 @@ fn main() -> Result<()> {
                 }
                 println!("{}", serde_json::to_string(&value)?);
             } else {
-                print_doctor_report(&report);
+                print!("{}", fmt::doctor_report(&report));
             }
         }
         Command::Config(ConfigCommand::Check { config }) => config_cmd::check(config)?,
         Command::Config(ConfigCommand::Init { out, force }) => config_cmd::init(&out, force)?,
     }
-    Ok(())
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 /// Which replaced CLI spelling the operator typed, if any.
@@ -4449,51 +4440,16 @@ fn warn_deprecations() {
     let argv = std::env::args_os().map(|a| a.to_string_lossy().into_owned());
     for d in deprecations(argv) {
         match d {
-            Deprecation::ListenVerb => eprintln!(
+            Deprecation::ListenVerb => crate::fmt::diagnostic!(
                 "warning: starting the daemon with `manta listen` is deprecated and will be \
                  removed in a future release; use `manta run --config` instead."
             ),
-            Deprecation::ServerConfigFlag => eprintln!(
+            Deprecation::ServerConfigFlag => crate::fmt::diagnostic!(
                 "warning: `--server-config` is deprecated and will be removed in a future \
                  release; use `--config` instead."
             ),
         }
     }
-}
-
-/// Human-readable `manta doctor` summary. `--json` bypasses this entirely
-/// in favor of the raw `DoctorReport`.
-fn print_doctor_report(report: &manta_engine::DoctorReport) {
-    println!(
-        "source: {:.0} Hz sample rate, {:.1} Hz center, observed for {:.1}s",
-        report.sample_rate_hz,
-        report.center_freq_hz,
-        report.duration.as_secs_f64()
-    );
-    println!(
-        "tracks: {} promoted, {} TrackMeta updates, {} closed",
-        report.tracks_promoted, report.track_meta_count, report.tracks_closed
-    );
-    match (report.snr_db_min, report.snr_db_median, report.snr_db_max) {
-        (Some(min), Some(median), Some(max)) => {
-            println!("snr_2500_db: min={min:.1} median={median:.1} max={max:.1}");
-        }
-        // `tracks_promoted` is verdict()'s own authoritative signal for
-        // "did anything really happen" -- match its logic exactly rather
-        // than re-deriving it from a different combination of fields.
-        _ if report.tracks_promoted == 0 => {
-            println!("snr_2500_db: no TrackMeta events -- no track ever promoted")
-        }
-        _ => println!(
-            "snr_2500_db: a track was promoted but no TrackMeta ever landed for it before this \
-             run ended"
-        ),
-    }
-    println!(
-        "decode: {} chars ({} distinct), {} confirmed spots",
-        report.chars_decoded, report.distinct_chars, report.spots_confirmed
-    );
-    println!("verdict: {}", report.verdict().summary());
 }
 
 #[cfg(test)]
@@ -6961,20 +6917,19 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(message.contains(r"\u{1b}[2J\npwned"), "{message:?}");
     }
 
-    /// The escaping above is applied where peer text enters the error, not
-    /// to the whole chain at the stderr sink: a local `--config` TOML
-    /// error's multi-line source snippet must still print as lines.
+    /// Local snippets keep their source and caret, with visible line breaks.
     #[test]
-    fn status_config_parse_errors_keep_their_multi_line_snippet() {
+    fn status_config_parse_errors_keep_their_escaped_snippet() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.toml");
         std::fs::write(&path, "[server]\nbind_addr = \n").unwrap();
         let err = run_status(Some(&path), None, 5).expect_err("a broken config must not parse");
         let message = status_failure_message(&err);
         assert!(message.contains("TOML parse error"), "{message:?}");
+        assert!(message.contains("bind_addr = ") && message.contains('^'));
         assert!(
-            message.contains('\n') && !message.contains(r"\n"),
-            "the TOML snippet must keep its real line breaks: {message:?}"
+            !message.chars().any(char::is_control) && message.contains(r"\n"),
+            "the TOML snippet must keep visible line breaks: {message:?}"
         );
     }
 

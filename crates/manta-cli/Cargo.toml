@@ -46,3 +46,5 @@ regex = { workspace = true }
 sha2 = { workspace = true }
 tungstenite = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
