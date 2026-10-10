@@ -727,7 +727,7 @@ enum ConfigCommand {
 //     ppm per the spec's contract.
 //   - allowlist: the Operator Watch List of ARCHITECTURE §6 / MAN-28.
 //     Legacy precedent: CW Skimmer's Watch List (Aggregator manual App. A2).
-//   - blocklist / notch: MAN-31.
+//   - blocklist / notch: MAN-31. cty / scp: MAN-79.
 /// Flags that decide which decodes become spots. Shared by `decode`,
 /// `listen` and `soak`.
 #[derive(clap::Args, Clone, Debug)]
@@ -767,6 +767,21 @@ struct FilterOpts {
     /// per line.
     #[arg(long)]
     notch: Option<PathBuf>,
+    /// Country-prefix file (AD1C's cty.dat) to check callsigns against, in place of the copy built into manta.
+    ///
+    /// A call whose prefix this file does not list is not spotted unless --allowlist names it,
+    /// so a new prefix or DXpedition is rejected until the file lists it. Download the current
+    /// file from https://www.country-files.com/cty/cty.dat to accept such calls without waiting
+    /// for a new manta release. Defaults to the built-in copy, or to `spot.cty_path` from --config.
+    #[arg(long)]
+    cty: Option<PathBuf>,
+    /// Known-callsign list (MASTER.SCP) to use in place of the copy built into manta.
+    ///
+    /// A call on the list is spotted with more confidence; a call missing from it can still
+    /// be spotted. Download the current list from https://www.supercheckpartial.com/MASTER.SCP.
+    /// Defaults to the built-in copy, or to `spot.scp_path` from --config.
+    #[arg(long)]
+    scp: Option<PathBuf>,
 }
 
 /// KiwiSDR connection flags, grouped to keep `open_source`'s arity down.
@@ -1482,28 +1497,44 @@ fn strip_bom(text: &str) -> &str {
 /// defaults.
 fn build_pipeline_config(
     freq_correction_ppm: f64,
-    allowlist: Vec<String>,
-    blocklist: Option<PathBuf>,
-    notch: Option<PathBuf>,
+    spot: &SpotResolved,
     detector: manta_engine::DetectorConfig,
     engine: Engine,
 ) -> Result<PipelineConfig> {
     let mut cfg = PipelineConfig {
         freq_correction_ppm,
-        allowlist,
+        allowlist: spot.allowlist.clone(),
         detector,
         ..Default::default()
     };
     cfg.decode.engine = engine;
-    if let Some(path) = blocklist {
-        let text = std::fs::read_to_string(&path)
+    if let Some(path) = &spot.blocklist {
+        let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading blocklist file {}", path.display()))?;
         cfg.blocklist = manta_engine::Blocklist::parse(strip_bom(&text));
     }
-    if let Some(path) = notch {
-        let text = std::fs::read_to_string(&path)
+    if let Some(path) = &spot.notch {
+        let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading notch file {}", path.display()))?;
         cfg.notch = manta_engine::NotchList::parse(strip_bom(&text));
+    }
+    if let Some(path) = &spot.cty {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading cty.dat file {}", path.display()))?;
+        let table = manta_spot::cty::Table::parse(strip_bom(&text));
+        if table.is_empty() {
+            bail!("cty.dat file {} lists no callsign prefixes; is it AD1C's cty.dat (not cty.csv or a saved web page)?", path.display());
+        }
+        cfg.cty = Some(std::sync::Arc::new(table));
+    }
+    if let Some(path) = &spot.scp {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading master.scp file {}", path.display()))?;
+        let set = manta_spot::scp::Set::parse(strip_bom(&text));
+        if set.is_empty() {
+            bail!("master.scp file {} lists no callsigns", path.display());
+        }
+        cfg.scp = Some(std::sync::Arc::new(set));
     }
     Ok(cfg)
 }
@@ -1962,7 +1993,7 @@ struct SpotServer {
     /// `SHUTDOWN_DRAIN_DEADLINE`) instead of guessing a fixed sleep
     /// duration -- see `shutdown_runtime_after_drain`.
     tasks: manta_server::tasks::ClientTasks,
-    /// MAN-136/MAN-45: the same `cty::Table` handed to `JsonStreamConfig`,
+    /// The run's resolved table, shared with the validator and `JsonStreamConfig`,
     /// kept here too so the publish callback can check resolvability once
     /// per spot for `manta_spots_unresolved_geography_total` -- checking
     /// inside `SpotMessage::from_spot` would scale with connected client
@@ -2396,6 +2427,7 @@ fn start_spot_server(
     source: SourceInfo<'_>,
     epoch: std::time::SystemTime,
     session_nonce: u128,
+    cty: std::sync::Arc<manta_spot::cty::Table>,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
     // MAN-59: the daemon's only durable record of connection events/
     // rejections was the live Prometheus counters (no history, reset on
@@ -2433,6 +2465,7 @@ fn start_spot_server(
     ));
     let metrics = std::sync::Arc::new(manta_server::metrics::Metrics::new());
     metrics.set_build_info(daemon_build_info());
+<<<<<<< HEAD
     let cty = std::sync::Arc::new(manta_spot::cty::Table::parse(manta_spot::CTY_DAT));
     // MAN-83: the commit rides as SemVer build metadata, so every spot names
     // the binary that produced it (`manta-<version>+<sha>`). Same-binary
@@ -2442,6 +2475,15 @@ fn start_spot_server(
     // the commit; see
     // docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md.
     let decoder_version = build_info::DECODER_VERSION.to_string();
+=======
+    // MAN-128: stays SHA-free and feature-free on purpose -- this is the
+    // JSON spot wire contract (ARCHITECTURE §7) and a byte-identical-
+    // replay input (AGENTS.md's "file input -> byte-identical spot logs"
+    // hard requirement), neither of which may vary with the commit or
+    // build flags a given binary happens to carry. `manta_build_info`
+    // above is the right place for that information instead.
+    let decoder_version = format!("manta-{}", env!("CARGO_PKG_VERSION"));
+>>>>>>> 0f9c2f8edb354d38141f0f6195685db85e2051b8
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let tasks = manta_server::tasks::new_client_tasks();
 
@@ -2718,6 +2760,8 @@ struct CliOverrides {
     allowlist: Vec<String>,
     blocklist: Option<PathBuf>,
     notch: Option<PathBuf>,
+    cty: Option<PathBuf>,
+    scp: Option<PathBuf>,
 }
 
 impl CliOverrides {
@@ -2755,6 +2799,8 @@ impl CliOverrides {
             allowlist: Vec::new(),
             blocklist: None,
             notch: None,
+            cty: None,
+            scp: None,
         }
     }
 
@@ -2810,6 +2856,8 @@ struct SpotResolved {
     allowlist: Vec<String>,
     blocklist: Option<PathBuf>,
     notch: Option<PathBuf>,
+    cty: Option<PathBuf>,
+    scp: Option<PathBuf>,
 }
 
 /// A non-empty `--allowlist` replaces the file's list (never concatenated);
@@ -2818,6 +2866,8 @@ fn resolve_spot(
     cli_allowlist: Vec<String>,
     cli_blocklist: Option<PathBuf>,
     cli_notch: Option<PathBuf>,
+    cli_cty: Option<PathBuf>,
+    cli_scp: Option<PathBuf>,
     spot: &config::SpotFile,
 ) -> SpotResolved {
     SpotResolved {
@@ -2828,6 +2878,8 @@ fn resolve_spot(
         },
         blocklist: cli_blocklist.or_else(|| spot.blocklist_path.clone()),
         notch: cli_notch.or_else(|| spot.notch_path.clone()),
+        cty: cli_cty.or_else(|| spot.cty_path.clone()),
+        scp: cli_scp.or_else(|| spot.scp_path.clone()),
     }
 }
 
@@ -2850,6 +2902,8 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
         cli.allowlist.clone(),
         cli.blocklist.clone(),
         cli.notch.clone(),
+        cli.cty.clone(),
+        cli.scp.clone(),
         &loaded.spot,
     );
     let mut shared = loaded.input.shared.clone();
@@ -2955,6 +3009,22 @@ struct Prepared {
     pipeline: PipelineConfig,
 }
 
+/// MAN-79 scenario 2: one stderr line when the built-in cty.dat is in use
+/// and older than manta_spot::vintage::CTY_DAT_STALE_AFTER_DAYS. `now` is a
+/// parameter so tests never depend on today's date.
+fn bundled_cty_warning(cty_overridden: bool, now: std::time::SystemTime) -> Option<String> {
+    if cty_overridden {
+        return None;
+    }
+    let days = manta_spot::vintage::stale_cty_dat_age_days(now)?;
+    Some(format!(
+        "warning: the built-in cty.dat is {days} days old (retrieved {}), so calls from \
+         prefixes allocated since then are not spotted. Download the current file from \
+         https://www.country-files.com/cty/cty.dat and pass it with --cty or set spot.cty_path.",
+        manta_spot::vintage::CTY_DAT_RETRIEVED
+    ))
+}
+
 fn prepare_live(
     cli: CliOverrides,
     config_flag: Option<PathBuf>,
@@ -2970,13 +3040,15 @@ fn prepare_live(
     let decode = merge_cli_engine(cli_engine, loaded.decode.clone());
     let mut pipeline = build_pipeline_config(
         resolved.freq_correction_ppm,
-        resolved.spot.allowlist.clone(),
-        resolved.spot.blocklist.clone(),
-        resolved.spot.notch.clone(),
+        &resolved.spot,
         loaded.detector,
         decode.engine,
     )?;
     pipeline.decode = decode;
+    if let Some(warning) = bundled_cty_warning(pipeline.cty.is_some(), std::time::SystemTime::now())
+    {
+        eprintln!("{warning}");
+    }
     Ok(Prepared {
         config_path,
         loaded,
@@ -3425,6 +3497,8 @@ fn main() -> Result<()> {
                 allowlist,
                 blocklist,
                 notch,
+                cty,
+                scp,
             } = filters;
             // D7/D8: the whole file is validated, the environment is never
             // read; [decode], [detector], [spot] and input.freq_correction_ppm
@@ -3442,15 +3516,13 @@ fn main() -> Result<()> {
                     loaded.origin
                 );
             }
-            let spot = resolve_spot(allowlist, blocklist, notch, &loaded.spot);
+            let spot = resolve_spot(allowlist, blocklist, notch, cty, scp, &loaded.spot);
             let decode_cfg = merge_cli_engine(engine, loaded.decode.clone());
             let mut cfg = build_pipeline_config(
                 freq_correction_ppm
                     .or(loaded.input.shared.freq_correction_ppm)
                     .unwrap_or(0.0),
-                spot.allowlist,
-                spot.blocklist,
-                spot.notch,
+                &spot,
                 loaded.detector,
                 decode_cfg.engine,
             )?;
@@ -3561,6 +3633,8 @@ fn main() -> Result<()> {
                 allowlist,
                 blocklist,
                 notch,
+                cty,
+                scp,
             } = filters;
             let Prepared {
                 config_path,
@@ -3599,6 +3673,8 @@ fn main() -> Result<()> {
                     allowlist,
                     blocklist,
                     notch,
+                    cty,
+                    scp,
                 },
                 config,
                 engine,
@@ -3746,6 +3822,7 @@ fn main() -> Result<()> {
                         },
                         epoch,
                         session_nonce,
+                        cfg.cty_table(),
                     )?;
                     // MAN-45 (round-9 finding): the daemon's own copy of the
                     // gauge `manta_engine::listen_with_observers` updates as
@@ -4183,6 +4260,8 @@ fn main() -> Result<()> {
                 allowlist,
                 blocklist,
                 notch,
+                cty,
+                scp,
             } = filters;
             let Prepared {
                 loaded,
@@ -4221,6 +4300,8 @@ fn main() -> Result<()> {
                     allowlist,
                     blocklist,
                     notch,
+                    cty,
+                    scp,
                 },
                 config,
                 None,
@@ -4307,6 +4388,8 @@ fn main() -> Result<()> {
                 allowlist,
                 blocklist,
                 notch,
+                cty,
+                scp,
             } = filters;
             // Checked before any source is opened -- otherwise an invalid
             // --duration only surfaces after a KiwiSDR/SoapySDR/HPSDR
@@ -4360,6 +4443,8 @@ fn main() -> Result<()> {
                     allowlist,
                     blocklist,
                     notch,
+                    cty,
+                    scp,
                 },
                 config,
                 None,
@@ -4499,6 +4584,203 @@ fn print_doctor_report(report: &manta_engine::DoctorReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    // Derived from manta_spot's constant, never hardcoded, so a cty.dat refresh
+    // does not break these tests.
+    fn at_day(d: u64) -> SystemTime {
+        manta_spot::vintage::cty_dat_retrieved_at().unwrap() + Duration::from_secs(d * 86_400)
+    }
+
+    #[test]
+    fn bundled_cty_warning_names_the_age_and_the_fix() {
+        let w = bundled_cty_warning(false, at_day(200)).expect("stale");
+        let head = format!(
+            "warning: the built-in cty.dat is 200 days old (retrieved {})",
+            manta_spot::vintage::CTY_DAT_RETRIEVED
+        );
+        assert!(w.starts_with(&head), "{w}");
+        for needle in [
+            "https://www.country-files.com/cty/cty.dat",
+            "--cty",
+            "spot.cty_path",
+        ] {
+            assert!(w.contains(needle), "{needle}: {w}");
+        }
+        assert!(!w.contains('\n'), "one line: {w}");
+        // Other suites assert these never appear on these commands' stderr.
+        for absent in [
+            "deprecated",
+            "--dial-freq-hz",
+            "telnet=",
+            "listening:",
+            "station_callsign",
+            "(os error 2)",
+        ] {
+            assert!(!w.contains(absent), "{absent}: {w}");
+        }
+    }
+
+    #[test]
+    fn no_warning_at_or_below_the_threshold() {
+        assert_eq!(bundled_cty_warning(false, at_day(180)), None);
+        assert_eq!(bundled_cty_warning(false, at_day(0)), None);
+    }
+
+    #[test]
+    fn no_warning_with_an_override() {
+        assert_eq!(bundled_cty_warning(true, at_day(10_000)), None);
+    }
+
+    #[test]
+    fn no_warning_when_the_clock_reads_before_the_retrieval_date() {
+        assert_eq!(bundled_cty_warning(false, UNIX_EPOCH), None);
+    }
+
+    const QQ9_ENTITY: &str = "Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n";
+
+    #[test]
+    fn cli_cty_beats_cty_path() {
+        let spot = config::SpotFile {
+            cty_path: Some("file.dat".into()),
+            scp_path: Some("file.scp".into()),
+            ..Default::default()
+        };
+        let r = resolve_spot(vec![], None, None, Some("cli.dat".into()), None, &spot);
+        assert_eq!(r.cty, Some("cli.dat".into()));
+        assert_eq!(r.scp, Some("file.scp".into()));
+    }
+    #[test]
+    fn cli_scp_beats_scp_path() {
+        let spot = config::SpotFile {
+            cty_path: Some("file.dat".into()),
+            scp_path: Some("file.scp".into()),
+            ..Default::default()
+        };
+        let r = resolve_spot(vec![], None, None, None, Some("cli.scp".into()), &spot);
+        assert_eq!(r.cty, Some("file.dat".into()));
+        assert_eq!(r.scp, Some("cli.scp".into()));
+    }
+    #[test]
+    fn unset_cty_and_scp_stay_built_in() {
+        let r = resolve_spot(vec![], None, None, None, None, &config::SpotFile::default());
+        let cfg = build_pipeline_config(0.0, &r, Default::default(), Engine::Legacy).unwrap();
+        assert!(cfg.cty.is_none() && cfg.scp.is_none());
+    }
+    fn tables_config(cty: Option<PathBuf>, scp: Option<PathBuf>) -> Result<PipelineConfig> {
+        let spot = resolve_spot(vec![], None, None, cty, scp, &config::SpotFile::default());
+        build_pipeline_config(0.0, &spot, Default::default(), Engine::Legacy)
+    }
+    #[test]
+    fn build_pipeline_config_loads_an_override_cty_and_scp() {
+        let cty = write_temp_file(format!("{}{QQ9_ENTITY}", manta_spot::CTY_DAT).as_bytes());
+        let scp = write_temp_file(b"QQ9ZZZ\nW1AW\n");
+        let cfg = tables_config(Some(cty.path().into()), Some(scp.path().into())).unwrap();
+        assert!(cfg.cty_table().is_allocated("QQ9ZZZ"));
+        assert!(cfg.scp_set().contains("QQ9ZZZ"));
+        assert_eq!(cfg.scp_set().len(), 2);
+    }
+    #[test]
+    fn build_pipeline_config_rejects_a_cty_file_with_no_prefixes() {
+        let cty =
+            write_temp_file(b"1A,Sov Mil Order of Malta,246,EU,15,28,41.90,-12.43,-1.0,1A;\n");
+        let err = tables_config(Some(cty.path().into()), None)
+            .unwrap_err()
+            .to_string();
+        for needle in [
+            "cty.dat file",
+            cty.path().to_str().unwrap(),
+            "lists no callsign prefixes",
+        ] {
+            assert!(err.contains(needle), "{err}");
+        }
+    }
+    #[test]
+    fn build_pipeline_config_rejects_an_scp_file_with_no_callsigns() {
+        let scp = write_temp_file(b"# comment\n!!header\n");
+        let err = tables_config(None, Some(scp.path().into()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("master.scp file") && err.contains("lists no callsigns"),
+            "{err}"
+        );
+    }
+    #[test]
+    fn build_pipeline_config_reports_a_missing_cty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = tables_config(Some(dir.path().join("missing.dat")), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("reading cty.dat file"), "{err}");
+    }
+    #[test]
+    fn build_pipeline_config_strips_a_bom_from_cty() {
+        let cty = write_temp_file(format!("\u{feff}{QQ9_ENTITY}").as_bytes());
+        assert!(tables_config(Some(cty.path().into()), None)
+            .unwrap()
+            .cty_table()
+            .is_allocated("QQ9ZZZ"));
+    }
+    #[test]
+    fn build_pipeline_config_rejects_non_utf8_tables() {
+        let file = write_temp_file(&[0xff, 0xfe]);
+        for (cty, scp, label) in [
+            (Some(file.path().into()), None, "cty.dat"),
+            (None, Some(file.path().into()), "master.scp"),
+        ] {
+            let err = tables_config(cty, scp).unwrap_err().to_string();
+            assert!(err.contains(&format!("reading {label} file")), "{err}");
+            assert!(err.contains(file.path().to_str().unwrap()), "{err}");
+        }
+    }
+    #[test]
+    fn start_spot_server_uses_the_cty_table_it_is_given() {
+        let table = std::sync::Arc::new(manta_spot::cty::Table::parse_with_dxcc(
+            &GEOGRAPHY_CTY_FIXTURE.replace("K,W,N;", "K,W,N,QQ9;"),
+            GEOGRAPHY_DXCC_FIXTURE,
+        ));
+        let loaded = loaded_from("[server]\nstation_callsign = 'W1AW'\nbind_addr = '127.0.0.1'\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n");
+        let (test_runtime, server) = start_spot_server(
+            loaded.server.unwrap(),
+            vec![],
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0),
+                freq_calibration: 1.0,
+            },
+            std::time::UNIX_EPOCH,
+            0,
+            table.clone(),
+        )
+        .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&server.cty, &table));
+        assert!(!geography_is_unresolved(&server.cty, "QQ9ZZZ"));
+        let entry = server.cty.lookup("QQ9ZZZ").unwrap();
+        assert_eq!(
+            (&*entry.continent, entry.cq_zone, entry.lat, entry.lon),
+            ("NA", 5, 40.0, -75.0)
+        );
+        let _ = server.shutdown_tx.send(true);
+        test_runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    }
+    #[test]
+    fn help_lists_cty_and_scp_for_every_validating_command() {
+        use clap::CommandFactory;
+        let cli = Cli::command();
+        for name in ["decode", "run", "listen", "soak", "doctor"] {
+            let command = cli.find_subcommand(name).unwrap();
+            for flag in ["cty", "scp"] {
+                assert!(
+                    command
+                        .get_arguments()
+                        .any(|arg| arg.get_long() == Some(flag)),
+                    "{name} --{flag}"
+                );
+            }
+        }
+    }
 
     fn write_temp_file(contents: &[u8]) -> tempfile::NamedTempFile {
         use std::io::Write as _;
@@ -4768,6 +5050,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
         )
         .unwrap();
 
@@ -5598,6 +5881,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
         )
         .unwrap();
 
@@ -5656,6 +5940,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
         )
         .unwrap();
 
@@ -5712,6 +5997,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
         );
         assert!(
             result.is_ok(),
@@ -5767,6 +6053,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
         )
         .unwrap();
 
@@ -6266,7 +6553,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             allowlist: vec!["W1AW".into()],
             ..Default::default()
         };
-        let r = resolve_spot(vec!["K1ABC".into()], None, None, &spot);
+        let r = resolve_spot(vec!["K1ABC".into()], None, None, None, None, &spot);
         assert_eq!(r.allowlist, vec!["K1ABC".to_string()]);
     }
 
@@ -6276,7 +6563,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             allowlist: vec!["W1AW".into()],
             ..Default::default()
         };
-        let r = resolve_spot(Vec::new(), None, None, &spot);
+        let r = resolve_spot(Vec::new(), None, None, None, None, &spot);
         assert_eq!(r.allowlist, vec!["W1AW".to_string()]);
     }
 
@@ -6287,7 +6574,14 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             notch_path: Some(PathBuf::from("/cfg/n.txt")),
             ..Default::default()
         };
-        let r = resolve_spot(Vec::new(), Some(PathBuf::from("cli.txt")), None, &spot);
+        let r = resolve_spot(
+            Vec::new(),
+            Some(PathBuf::from("cli.txt")),
+            None,
+            None,
+            None,
+            &spot,
+        );
         assert_eq!(r.blocklist, Some(PathBuf::from("cli.txt")));
         assert_eq!(r.notch, Some(PathBuf::from("/cfg/n.txt")));
     }
@@ -6384,6 +6678,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("allowlist", "spot.allowlist"),
         ("blocklist", "spot.blocklist_path"),
         ("notch", "spot.notch_path"),
+        ("cty", "spot.cty_path"),
+        ("scp", "spot.scp_path"),
         ("engine", "decode.engine"),
     ];
     /// Flags with no config key, by design.
@@ -6441,6 +6737,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 "[spot]\nblocklist_path = \"b.txt\"\n",
             ),
             ("spot.notch_path", "[spot]\nnotch_path = \"n.txt\"\n"),
+            ("spot.cty_path", "[spot]\ncty_path = 'cty.dat'\n"),
+            ("spot.scp_path", "[spot]\nscp_path = 'MASTER.SCP'\n"),
             ("decode.engine", "[decode]\nengine = \"legacy\"\n"),
         ];
         for (_, key) in FLAG_KEYS {
@@ -6600,6 +6898,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
         )
         .unwrap();
 
@@ -6646,6 +6945,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
         )
         .unwrap();
 

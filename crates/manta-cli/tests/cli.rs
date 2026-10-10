@@ -2521,3 +2521,123 @@ fn status_with_a_missing_server_config_fails_with_exit_code_two_not_one() {
         );
     }
 }
+
+// MAN-79: the decoded call is valid only in the operator's updated table.
+fn qq9_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+    let mut spec = short_v1();
+    spec.signals[0].text = "CQ CQ DE QQ9ZZZ QQ9ZZZ K".into();
+    let wav = write_fixture(dir, &spec);
+    let cty = write_cfg(
+        dir,
+        "cty-new.dat",
+        &format!(
+            "{}Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n",
+            manta_spot::CTY_DAT
+        ),
+    );
+    (wav, cty)
+}
+
+#[test]
+fn decode_cty_flag_lets_a_newly_allocated_prefix_spot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, cty) = qq9_fixture(dir.path());
+    let before = manta()
+        .args(["decode", "--json"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(decode_spots(&before).is_empty());
+    let after = manta()
+        .args(["decode", "--json", "--cty"])
+        .arg(cty)
+        .arg(wav)
+        .output()
+        .unwrap();
+    let spots = decode_spots(&after);
+    assert_eq!(spots.len(), 1);
+    assert_eq!(spots[0]["callsign"], "QQ9ZZZ");
+}
+
+#[test]
+fn decode_cty_path_in_a_config_file_lets_a_newly_allocated_prefix_spot() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("config");
+    std::fs::create_dir(&sub).unwrap();
+    let (wav, _) = qq9_fixture(&sub);
+    let config = write_cfg(&sub, "manta.toml", "[spot]\ncty_path = 'cty-new.dat'\n");
+    let out = manta()
+        .current_dir(dir.path())
+        .args(["decode", "--json", "--config"])
+        .arg(config)
+        .arg(wav)
+        .output()
+        .unwrap();
+    let spots = decode_spots(&out);
+    assert_eq!(spots.len(), 1);
+    assert_eq!(spots[0]["callsign"], "QQ9ZZZ");
+}
+
+#[test]
+fn run_reads_cty_path_from_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, cty) = qq9_fixture(dir.path());
+    let out = manta()
+        .args(["run", "--json", "--source-iq", "--source"])
+        .arg(wav)
+        .env("MANTA_SPOT_CTY_PATH", cty)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(run_spots(&out.stdout)
+        .iter()
+        .any(|s| s["callsign"] == "QQ9ZZZ"));
+}
+
+#[test]
+fn decode_scp_flag_is_accepted_and_still_spots() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture(dir.path());
+    let scp = write_cfg(dir.path(), "MASTER.SCP", "W1AW\n");
+    let out = manta()
+        .args(["decode", "--json", "--scp"])
+        .arg(scp)
+        .arg(wav)
+        .output()
+        .unwrap();
+    assert!(decode_spots(&out).iter().any(|s| s["callsign"] == "W1AW"));
+}
+
+#[test]
+fn a_cty_file_with_no_prefixes_is_rejected_before_source_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let cty = write_cfg(
+        dir.path(),
+        "cty.csv",
+        "1A,Sov Mil Order of Malta,246,EU,15,28,41.90,-12.43,-1.0,1A;\n",
+    );
+    let out = manta()
+        .args(["run", "--source", "does-not-exist.wav", "--cty"])
+        .arg(cty)
+        .output()
+        .unwrap();
+    assert_rejected_before_source_io("cty.csv", &out, &["cty.csv", "lists no callsign prefixes"]);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn decode_never_prints_the_cty_age_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture(dir.path());
+    let out = manta()
+        .args(["decode", "--json"])
+        .arg(wav)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("built-in cty.dat"));
+}

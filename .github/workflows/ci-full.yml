@@ -205,6 +205,10 @@ jobs:
       # cold release builds) rides the already-required `test` check, like release-version above.
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_ci_trust_boundary -v
+      # MAN-80: the release job's SHA256SUMS and attestation steps, plus the operator's checksum
+      # commands (GNU sha256sum on ubuntu, macOS shasum on macos), ride the required `test` check.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_release_checksums -v
       # MAN-268: the service kit's shell and account-helper tests are Unix-only; the release-archive
       # tests run on all three legs so Windows keeps its zip coverage (`python` in Git Bash there).
       - if: runner.os != 'Windows'

@@ -289,8 +289,10 @@ transmission may never produce again).
    not a loss and is not counted). Context
    determines spot type (CQ / DE / BEACON) — RBN spots carry this flag.
 2. **Callsign plausibility**: structural grammar (prefix-digit-suffix, portable
-   designators `/P /QRP /3`), then prefix lookup against **cty.dat** (bundled,
-   refreshable) — a call with an unallocated prefix is rejected. `cty.dat` is
+   designators `/P /QRP /3`), then prefix lookup against **cty.dat**.
+   A call with an unallocated prefix is rejected. Operators can replace the
+   bundled table with `--cty` / `[spot] cty_path`. Live commands warn when
+   the built-in copy is more than 180 days old (MAN-79). `cty.dat` is
    also joined, on that same primary-prefix field, against a small vendored
    ADIF DXCC entity-number table (`data/dxcc.tsv`, MAN-136) — refreshed
    together, see `crates/manta-spot/data/SOURCES.md` — which is what lets
@@ -298,6 +300,7 @@ transmission may never produce again).
 3. **SCP cross-check** (optional, default on if file present): membership in
    `master.scp` (contest super-check-partial list) *raises* confidence; absence
    only lowers it (new/rare calls must still spot, not just well-known ones).
+   `--scp` / `[spot] scp_path` supplies a replacement known-callsign list.
 4. **Repetition requirement**: a callsign must decode ≥ 2 times within 90 s
    before first spot (CW ops repeat their calls; single decodes are
    overwhelmingly garble). **Deviates from "the same track" (MAN-166,
@@ -482,17 +485,17 @@ validation (MAN-28). Dedupe (step 5) still applies.
   bind address; ports),
   `[[rbn_uplink]]`, `[input]` (source type and its keys, dial frequency,
   capture rate, ppm correction), `[spot]` (watch list, blocklist and notch
-  files), `[detector]` (thresholds, timers, track cap) and `[decode]` —
+  files, and `cty.dat`/`master.scp` overrides), `[detector]` (thresholds, timers, track cap) and `[decode]` —
   read by `run`, `soak` and `doctor` (`--config`, else `MANTA_CONFIG`) and
   by `decode`/`oracle`. Precedence is flag, then `MANTA_<TABLE>_<KEY>`
   environment variable, then file, then default; `decode` and `oracle`
   never read the environment. Unknown tables, keys and `MANTA_*` variables
   are errors. `docs/SPEC-decode-core.md` §9 is the key table. Not yet
-  configurable: a band plan (CW segment limits), cty/scp paths, and the
+  configurable: a band plan (CW segment limits) and the
   compile-time constants SPEC §9 marks `not configurable yet`.
   `manta config check` runs `run`'s config pipeline up to its first source
   I/O (load, environment overlay, source resolution, blocklist/notch
-  reads), then prints a per-table summary of the resolved settings without
+  and cty/scp reads), then prints a per-table summary of the resolved settings without
   opening the receiver or binding a port; `manta config init` writes a
   scaffold with every key commented out at its default, pinned to the code
   defaults and the loader's key list by tests (MAN-76,

@@ -52,6 +52,11 @@ MAN-132: the metrics listener (`/metrics`, `/healthz`) binds
 `bind_addr` (`0.0.0.0`) — see
 docs/DECISIONS/2026-10-08-man132-metrics-loopback-bind.md.
 
+MAN-79: `--cty`/`--scp` and `[spot].cty_path`/`scp_path` override the
+vendored `cty.dat`/`master.scp` at run time. `run`/`listen`/`soak`/`doctor`/
+`config check` warn when the built-in `cty.dat` is more than 180 days old.
+See docs/DECISIONS/2026-10-10-man79-operator-cty-scp-override.md.
+
 ## Documents (read in this order)
 
 - `README.md` — goals and non-goals

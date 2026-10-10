@@ -151,8 +151,10 @@ this change. See [the MAN-244 decision](../DECISIONS/2026-10-10-man244-release-g
      any platform build starts) → `build` (rebuilds the same five targets) →
      `docker-publish-release` (pushes the multi-arch image to GHCR as
      `ghcr.io/hagaletechnologies/manta:X.Y.Z`) → `publish-latest` (see
-     below) and, in parallel, `release` (creates the GitHub Release from
-     the five build artifacts). `docker-publish-release` and
+     below) and, in parallel, `release` (writes `SHA256SUMS` over the five
+     build artifacts, attests their build provenance, then creates the
+     GitHub Release from the archives and `SHA256SUMS`; MAN-80, see
+     "Verifying a downloaded release" below). `docker-publish-release` and
      `publish-latest` run in the `ghcr-publish` environment. The build-only
      workflow has the same ancestry guard before its platform builds.
 
@@ -171,6 +173,13 @@ this change. See [the MAN-244 decision](../DECISIONS/2026-10-10-man244-release-g
 6. **Before announcing the release, run the clean-Windows check** below
    ("Manual check: the Windows ZIP starts without the Visual C++
    Redistributable"). CI cannot prove it.
+7. **Before announcing the release, verify a download.** Once the Release
+   is published, download one archive and `SHA256SUMS` from it and run both
+   checks in "Verifying a downloaded release" below. The `release` job
+   attests before it creates the Release, so if the attestation step
+   failed, no Release exists: re-run the failed `release` job ("Re-run
+   failed jobs"; it has no deployment environment, so no new approval, and
+   the Docker jobs that already succeeded do not run again).
 
 ## Manual builds and ancestry failures
 
@@ -362,6 +371,92 @@ Both should report the same digest.
   `packaging/launchd/` (both plists, `create-service-account.sh`,
   `rotate-log.sh`) and `docs/RUNBOOKS/network-exposure.md`. See
   [docs/DECISIONS/2026-10-10-man268-unattended-packaging.md](../DECISIONS/2026-10-10-man268-unattended-packaging.md).
+- **`SHA256SUMS`** (MAN-80, every Release): one `<sha256>  <archive>` line
+  per archive above, bare file names, in `sha256sum` format. The same
+  digests are the subjects of the Release's build-provenance attestation.
+  See "Verifying a downloaded release" below.
 - **Docker image** (`ghcr.io/hagaletechnologies/manta`): multi-arch
   (`linux/amd64`, `linux/arm64`), tagged `:X.Y.Z` for every release and
   `:latest` for the newest stable release only.
+
+## Verifying a downloaded release
+
+Every GitHub Release carries a `SHA256SUMS` file next to its five
+archives, and a GitHub build-provenance attestation covers each archive
+(MAN-80). Run both checks before you run a downloaded binary:
+
+- **The checksum** catches a corrupted or swapped download: the file you
+  have is byte-for-byte the file the Release published.
+- **The attestation** proves `release-publish.yml` built the file from the
+  release tag in this repository. Someone who can edit the Release can
+  replace both an archive and `SHA256SUMS`, but cannot forge the
+  attestation: it is signed through Sigstore with a certificate GitHub
+  issues only to that workflow run.
+
+### Checksum
+
+Download the archive and `SHA256SUMS` from the same Release into one
+folder and run the command for your system there. `--ignore-missing`
+skips the archives you did not download.
+
+```console
+$ sha256sum -c --ignore-missing SHA256SUMS          # Linux
+manta-linux-x86_64.tar.gz: OK
+$ shasum -a 256 -c --ignore-missing SHA256SUMS      # macOS
+manta-macos-arm64.tar.gz: OK
+```
+
+A line ending in `FAILED`, or `no file was verified`, means stop: do not
+run the file. Download both files again; if the check still fails, report
+it as described in [SECURITY.md](../../SECURITY.md).
+
+On Windows, in PowerShell, from the download folder:
+
+```powershell
+$want = (Select-String -Path SHA256SUMS -SimpleMatch '  manta-windows-x86_64.zip').Line.Split(' ')[0]
+$got  = (Get-FileHash manta-windows-x86_64.zip -Algorithm SHA256).Hash
+if ($got -eq $want) { 'OK' } else { 'MISMATCH: do not run this file' }
+```
+
+(`-eq` ignores case, so `Get-FileHash`'s upper-case digest matches the
+file's lower-case one.)
+
+### Build provenance
+
+This needs the [GitHub CLI](https://cli.github.com/) **2.102.0 or newer**,
+signed in (`gh auth login`). Older versions compared `--source-ref`
+case-insensitively and matched `--signer-workflow` against only the start
+of the signer's identity
+([GHSA-4mq3-hpgx-9cx8](https://github.com/cli/cli/security/advisories/GHSA-4mq3-hpgx-9cx8),
+[GHSA-wjmr-j3rp-mh2g](https://github.com/cli/cli/security/advisories/GHSA-wjmr-j3rp-mh2g)).
+On those versions, an attestation from a `V0.1.0` tag, or from a
+workflow whose path starts with `release-publish.yml`, could pass the
+check below. On any system, `gh --version` must report 2.102.0 or newer
+before you trust the result.
+
+Run this, with your file name and tag in place of
+`manta-linux-x86_64.tar.gz` and `v0.1.0`. Its first command prints
+`need gh 2.102.0 or newer` and stops before the check if `gh` is older:
+
+```sh
+gh --version | awk 'NR == 1 { have = $3; split(have, n, ".") }
+    END { if (n[1] + 0 > 2 || (n[1] + 0 == 2 && n[2] + 0 >= 102)) exit 0
+          print "need gh 2.102.0 or newer, found: " have; exit 1 }' &&
+gh attestation verify manta-linux-x86_64.tar.gz --repo HagaleTechnologies/manta \
+    --source-ref refs/tags/v0.1.0 \
+    --signer-workflow HagaleTechnologies/manta/.github/workflows/release-publish.yml \
+    --deny-self-hosted-runners
+```
+
+Success prints `✓ Verification succeeded!` and names
+`.github/workflows/release-publish.yml@refs/tags/v0.1.0` as both the build
+and the signer workflow. A file that is not the one the workflow built
+fails with `Error: no attestations found`; a file built from any other ref
+fails with `Error: expected SourceRepositoryRef to be refs/tags/v0.1.0,
+got …`. Both exit non-zero.
+
+Keep `--source-ref` and `--signer-workflow`. Only the owner can push a
+release tag (MAN-244), so on `gh` 2.102.0 or newer, together they
+reject an attestation made by a modified copy of the workflow run from a
+branch. Why the job is shaped this way:
+[docs/DECISIONS/2026-10-10-man80-release-checksums-attestation.md](../DECISIONS/2026-10-10-man80-release-checksums-attestation.md).

@@ -1005,6 +1005,17 @@ allowlist = []
 # Notched frequency ranges, one `low_hz-high_hz` per line (MAN-31). Same
 # path rule; --notch overrides it.
 # notch_path = "notches.txt"
+# AD1C's cty.dat replaces the bundled country-prefix table (MAN-79).
+# A prefix missing from this file is rejected unless the call is allowlisted.
+# Download: https://www.country-files.com/cty/cty.dat
+# A relative path resolves against this config file's directory.
+# Unset: bundled. --cty overrides it.
+# cty_path = "cty.dat"
+# MASTER.SCP replaces the bundled known-callsign list. Membership raises
+# confidence; absence alone never rejects a call.
+# Download: https://www.supercheckpartial.com/MASTER.SCP
+# Same path rule. Unset: bundled. --scp overrides it.
+# scp_path = "MASTER.SCP"
 
 # [server] key line_format (MAN-88), set inside your real [server] table:
 # Which fixed-column wire layout the INBOUND telnet cluster server renders
@@ -1075,7 +1086,8 @@ always taken verbatim: `server.station_callsign`, `server.bind_addr`,
 `server.metrics_bind_addr`, `server.operator_name`,
 `server.operator_qth`, `server.operator_grid`, `input.type`,
 `input.device`, `input.path`, `input.host`, `input.password`,
-`input.driver`, `spot.blocklist_path`, `spot.notch_path` and
+`input.driver`, `spot.blocklist_path`, `spot.notch_path`,
+`spot.cty_path`, `spot.scp_path` and
 `decode.engine`. Relative paths from the file
 resolve against the file's directory; those from a flag or the
 environment resolve against the working directory. `[[rbn_uplink]]`

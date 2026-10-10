@@ -16,7 +16,6 @@ use crate::PipelineConfig;
 use anyhow::Result;
 use manta_decode::events::DecoderEvent;
 use manta_input::IqSource;
-use manta_spot::Validator;
 use num_complex::Complex32;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -202,14 +201,7 @@ pub fn soak_with_metrics(
             cfg.detector,
             cfg.decode.clone(),
         );
-        let mut validator = Validator::bundled(fs)
-            .with_freq_correction_ppm(cfg.freq_correction_ppm)
-            .map_err(|e| anyhow::anyhow!(e))?
-            .with_blocklist(cfg.blocklist.clone())
-            .with_notch(cfg.notch.clone());
-        for call in &cfg.allowlist {
-            validator.allowlist(call);
-        }
+        let mut validator = cfg.validator(fs)?;
 
         let pad_samples = ch.filter_len();
         let pad_hops = (pad_samples as u64).div_ceil(hop);

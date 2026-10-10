@@ -132,6 +132,9 @@ docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
 - If the `docker run` above returns an authorization error, the GHCR
   package still needs its one-time "make public" step — see
   [docs/RUNBOOKS/release.md](docs/RUNBOOKS/release.md).
+- Every release also carries a `SHA256SUMS` file and a GitHub
+  build-provenance attestation. Check a download before running it:
+  [Verifying a downloaded release](docs/RUNBOOKS/release.md#verifying-a-downloaded-release).
 
 ## 60-second demo
 
@@ -228,6 +231,10 @@ variables (`MANTA_INPUT_FREQ_HZ=14030000`). `[spot]`, `[detector]` and
 [docs/SPEC-decode-core.md](docs/SPEC-decode-core.md) §9 lists every key,
 its default and its precedence. An unknown table or key is an error, not
 silently ignored.
+
+Keep `cty.dat` current by downloading it and pointing `[spot] cty_path`
+(or `--cty`) at it. manta warns at startup when its built-in copy is more
+than 180 days old.
 
 Then probe it from a second terminal:
 
@@ -447,3 +454,38 @@ output adds a `### Decoder output` entry to [CHANGELOG.md](CHANGELOG.md).
 MIT OR Apache-2.0, at your option. Unless you explicitly state otherwise, any
 contribution intentionally submitted for inclusion in this project shall be
 dual licensed as above, without any additional terms or conditions.
+
+## Keeping the prefix table current
+
+A new prefix must appear in the country table before manta can spot it.
+Download AD1C's `cty.dat`, set its path under `[spot]` in your config,
+check the config, and restart the daemon:
+
+```sh
+sudo curl -fsSL -o /etc/manta/cty.dat https://www.country-files.com/cty/cty.dat
+sudoedit /etc/manta/manta.toml
+# Under [spot], set cty_path = "/etc/manta/cty.dat"
+sudo manta config check --config /etc/manta/manta.toml
+# If manta is installed as a systemd service:
+sudo systemctl restart manta
+```
+
+Use `scp_path` or `--scp` for an updated known-callsign list downloaded
+from https://www.supercheckpartial.com/MASTER.SCP. Both settings replace
+only their own table and take effect on restart. A missing, unreadable,
+non-UTF-8 or empty table stops startup; `config check` catches the same
+errors before opening a receiver or binding a port. Its `spot:` line
+shows the resolved paths, or `bundled` for a table built into manta.
+
+Config-file paths are relative to that config's directory. Flag values
+and `MANTA_SPOT_CTY_PATH` / `MANTA_SPOT_SCP_PATH` are relative to the
+working directory; flags override environment values, which override
+the file. `decode` accepts flags and config keys but ignores environment
+variables and never prints an age warning.
+
+For a systemd config copied into a credentials directory, use absolute
+paths for `cty_path`, `scp_path`, `blocklist_path` and `notch_path`. On
+macOS, keep the table readable by the service account (`_manta` when
+using that account) and restart the launchd service. In Docker, mount
+each table read-only at the configured container path and restart the
+container. Mounting the config alone does not mount the tables it names.

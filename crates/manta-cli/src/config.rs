@@ -74,6 +74,8 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("input", "driver"),
     ("spot", "blocklist_path"),
     ("spot", "notch_path"),
+    ("spot", "cty_path"),
+    ("spot", "scp_path"),
     ("decode", "engine"),
 ];
 
@@ -113,6 +115,8 @@ pub(crate) struct SpotFile {
     pub allowlist: Vec<String>,
     pub blocklist_path: Option<PathBuf>,
     pub notch_path: Option<PathBuf>,
+    pub cty_path: Option<PathBuf>,
+    pub scp_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -121,6 +125,8 @@ struct SpotToml {
     allowlist: Option<Vec<String>>,
     blocklist_path: Option<PathBuf>,
     notch_path: Option<PathBuf>,
+    cty_path: Option<PathBuf>,
+    scp_path: Option<PathBuf>,
 }
 
 /// `input.type` (D5).
@@ -294,6 +300,12 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         notch_path: spot_toml
             .notch_path
             .map(|p| resolve_path("spot", "notch_path", p)),
+        cty_path: spot_toml
+            .cty_path
+            .map(|p| resolve_path("spot", "cty_path", p)),
+        scp_path: spot_toml
+            .scp_path
+            .map(|p| resolve_path("spot", "scp_path", p)),
     };
     let input_toml = take_typed::<InputToml>(&doc, "input", &origin, &overlay)?.unwrap_or_default();
     let input = validate_input(input_toml, &|p| resolve_path("input", "path", p))
@@ -653,6 +665,25 @@ fn levenshtein(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_cty_and_scp_paths_are_string_typed_and_cwd_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manta.toml");
+        std::fs::write(
+            &path,
+            "[spot]\ncty_path = 'file.dat'\nscp_path = 'file.scp'\n",
+        )
+        .unwrap();
+        let v = vars(&[
+            ("MANTA_SPOT_CTY_PATH", "2026"),
+            ("MANTA_SPOT_SCP_PATH", "2027"),
+        ]);
+        let loaded = load(Some(&path), Env::Read(&v)).unwrap();
+        assert_eq!(loaded.spot.cty_path, Some(PathBuf::from("2026")));
+        assert_eq!(loaded.spot.scp_path, Some(PathBuf::from("2027")));
+    }
+
     use std::io::Write;
 
     fn write_cfg(body: &str) -> tempfile::NamedTempFile {
@@ -843,13 +874,18 @@ mod tests {
         let path = dir.path().join("manta.toml");
         std::fs::write(
             &path,
-            "[spot]\nallowlist = [\"W1AW\"]\nblocklist_path = \"bad.txt\"\n",
+            "[spot]\nallowlist = [\"W1AW\"]\nblocklist_path = \"bad.txt\"\ncty_path = \"cty.dat\"\nscp_path = \"sub/MASTER.SCP\"\n",
         )
         .unwrap();
         let loaded = load(Some(&path), Env::Ignore).unwrap();
         assert_eq!(loaded.spot.allowlist, vec!["W1AW".to_string()]);
         assert_eq!(loaded.spot.blocklist_path, Some(dir.path().join("bad.txt")));
         assert_eq!(loaded.spot.notch_path, None);
+        assert_eq!(loaded.spot.cty_path, Some(dir.path().join("cty.dat")));
+        assert_eq!(
+            loaded.spot.scp_path,
+            Some(dir.path().join("sub/MASTER.SCP"))
+        );
     }
 
     #[test]
@@ -857,6 +893,10 @@ mod tests {
         let err = err_of("[spot]\nblocklist = \"x\"\n");
         assert!(err.contains("unknown field"), "{err}");
         assert!(err.contains("blocklist_path"), "{err}");
+        assert!(
+            err.contains("cty_path") && err.contains("scp_path"),
+            "{err}"
+        );
     }
 
     // ---- Phase 3: [input]

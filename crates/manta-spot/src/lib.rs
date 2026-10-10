@@ -24,12 +24,12 @@ pub use validator::{
 };
 
 /// AD1C's `cty.dat` country/prefix table, vendored under `data/` -- see
-/// `data/SOURCES.md` for provenance and refresh instructions.
+/// `data/SOURCES.md` for provenance and refresh instructions. Override with `--cty`.
 pub const CTY_DAT: &str = include_str!("../data/cty.dat");
 
 /// The `MASTER.SCP` super-check-partial callsign list, vendored under
 /// `data/` -- see `data/SOURCES.md` for provenance and refresh
-/// instructions.
+/// instructions. Override with `--scp`.
 pub const MASTER_SCP: &str = include_str!("../data/master.scp");
 
 /// Per-entity ADIF DXCC entity numbers keyed on `cty.dat`'s primary-prefix
@@ -38,3 +38,5 @@ pub const MASTER_SCP: &str = include_str!("../data/master.scp");
 /// because AD1C's `cty.dat` carries no ADIF entity numbers at all (MAN-136,
 /// broad-review decision D10).
 pub const DXCC_TSV: &str = include_str!("../data/dxcc.tsv");
+
+pub mod vintage;
