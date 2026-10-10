@@ -260,6 +260,18 @@ no password. Read
 [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 before you widen either.
 
+## Running unattended
+
+To run a node as a service that starts at boot and restarts after a
+failure, use the kit in [packaging/README.md](packaging/README.md): a
+systemd unit, a macOS LaunchDaemon and a Docker Compose file, with install
+steps for each. Release archives carry the same files next to the binary.
+Start from [manta.example.toml](manta.example.toml): copy it to
+`manta.toml`, replace `N0CALL` with your station callsign, configure your
+receiver, and run `manta config check --config manta.toml` before you
+enable a service. `manta run` refuses to start while the station callsign
+is still `N0CALL`.
+
 ## Inputs
 
 | Source | How | Status |
@@ -395,6 +407,8 @@ criteria.
 
 **Running a node:** [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 (exposing the servers safely) · the "Run it as a node" section above ·
+[packaging/README.md](packaging/README.md) (running unattended under
+systemd, launchd or Docker Compose) ·
 [docs/RUNBOOKS/secondary-skimmer-field-node.md](docs/RUNBOOKS/secondary-skimmer-field-node.md)
 (a 30-day secondary-skimmer field node behind an RBN Aggregator, MAN-96) ·
 `manta <subcommand> --help` for every flag.

@@ -1,0 +1,39 @@
+# manta as a systemd service (MAN-268). Install steps, receiver setup and
+# log retention: packaging/README.md.
+#
+# Needs systemd 247 or newer, for LoadCredential= and ${CREDENTIALS_DIRECTORY}
+# in ExecStart=. systemd copies the root-owned, mode-0600 /etc/manta/manta.toml
+# into a private credentials directory the DynamicUser= identity can read,
+# so a receiver password in it never has to be world-readable.
+#
+# manta reads that copy from the credentials directory, so relative paths in
+# it resolve there: give [input] path, [spot] blocklist_path and notch_path
+# as absolute paths.
+#
+# TimeoutStopSec=60 covers manta's SIGTERM drain: up to 50 s for clients
+# (SHUTDOWN_DRAIN_DEADLINE in crates/manta-cli/src/main.rs), 2 s of runtime
+# shutdown, and margin. A shorter timeout, such as an earlier 30 s, SIGKILLs
+# a daemon that is still draining. systemd's default SIGTERM is the right
+# stop signal; do not override it. See
+# docs/DECISIONS/2026-10-10-man268-unattended-packaging.md.
+
+[Unit]
+Description=manta wideband CW skimmer
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+DynamicUser=yes
+LoadCredential=manta.toml:/etc/manta/manta.toml
+ExecStart=/usr/local/bin/manta run --config ${CREDENTIALS_DIRECTORY}/manta.toml
+Restart=always
+RestartSec=10
+TimeoutStopSec=60
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=manta
+
+[Install]
+WantedBy=multi-user.target

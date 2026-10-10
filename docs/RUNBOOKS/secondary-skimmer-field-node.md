@@ -75,6 +75,10 @@ The tools are [`scripts/field-node.py`](../../scripts/field-node.py) and
 
 ## 3. Install
 
+This kit is specific to the field run. For a general unattended node, use the
+[service kit](../../packaging/README.md) (systemd, macOS launchd or Docker Compose); the
+field node keeps its own static `manta` user and units below.
+
 The kit lives in `docs/RUNBOOKS/field-node/`:
 
 | File | Installs to |

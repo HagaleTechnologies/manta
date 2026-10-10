@@ -3676,6 +3676,14 @@ fn main() -> Result<()> {
                 config,
                 engine,
             )?;
+            // MAN-268: an unedited manta.example.toml must not start a
+            // daemon that spots, or logs in to a collector, as N0CALL.
+            // Checked first, on the identities after the MANTA_* overlay:
+            // before `is_rf_aware()` (which opens IQ WAVs), the
+            // dial-frequency guard, and any source or listener. Callsigns
+            // only; `config check` keeps the broad placeholder scan. See
+            // docs/DECISIONS/2026-10-10-man268-unattended-packaging.md.
+            config_cmd::reject_example_callsigns(&loaded)?;
             let spec = &resolved.spec;
             let dial_freq_hz = resolved.dial_freq_hz;
             // Needed to derive a recording-specific replay epoch/nonce.

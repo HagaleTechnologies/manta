@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- MAN-268: manta LaunchDaemon. Create the _manta account first; install steps: packaging/README.md -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hagaletechnologies.manta</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/manta</string>
+    <string>run</string>
+    <string>--config</string>
+    <string>/usr/local/etc/manta/manta.toml</string>
+  </array>
+  <key>UserName</key>
+  <string>_manta</string>
+  <key>GroupName</key>
+  <string>_manta</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ExitTimeOut</key>
+  <integer>60</integer>
+  <key>StandardOutPath</key>
+  <string>/var/log/manta/manta.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/manta/manta.log</string>
+</dict>
+</plist>
