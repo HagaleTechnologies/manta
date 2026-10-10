@@ -27,16 +27,17 @@ fn git(args: &[&str]) -> Option<String> {
 /// `[0-9A-Za-z-]`. The 64-character cap keeps `--version` one short line.
 fn is_build_metadata(s: &str) -> bool {
     s.len() <= 64
-        && s.split('.').all(|id| {
-            !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
+        && s.split('.')
+            .all(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
 }
 
 /// The `MANTA_GIT_SHA` override, validated (MAN-83 D5). `None` when unset,
 /// empty, or not build metadata -- the last with a `cargo:warning`, and the
 /// caller then falls through to `git` exactly as if it were unset.
 fn sha_override() -> Option<String> {
-    let s = std::env::var("MANTA_GIT_SHA").ok().filter(|s| !s.is_empty())?;
+    let s = std::env::var("MANTA_GIT_SHA")
+        .ok()
+        .filter(|s| !s.is_empty())?;
     if !is_build_metadata(&s) {
         println!(
             "cargo:warning=MANTA_GIT_SHA={s:?} is not SemVer build metadata \

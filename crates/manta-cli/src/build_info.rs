@@ -21,8 +21,12 @@ pub const VERSION_LINE: &str = concat!(
 );
 /// JSON spot `decoderVersion`: SemVer with the commit as build metadata.
 /// Features stay out on purpose -- they choose input drivers, never decoding.
-pub const DECODER_VERSION: &str =
-    concat!("manta-", env!("CARGO_PKG_VERSION"), "+", env!("MANTA_GIT_SHA"));
+pub const DECODER_VERSION: &str = concat!(
+    "manta-",
+    env!("CARGO_PKG_VERSION"),
+    "+",
+    env!("MANTA_GIT_SHA")
+);
 
 #[cfg(test)]
 mod tests {
