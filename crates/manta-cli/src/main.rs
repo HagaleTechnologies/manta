@@ -6692,7 +6692,15 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("engine", "decode.engine"),
     ];
     /// Flags with no config key, by design.
-    const CLI_ONLY: &[&str] = &["json", "duration", "config", "path", "help", "version"];
+    const CLI_ONLY: &[&str] = &[
+        "json",
+        "decoded_text",
+        "duration",
+        "config",
+        "path",
+        "help",
+        "version",
+    ];
 
     #[test]
     fn every_config_backed_flag_maps_to_a_key() {

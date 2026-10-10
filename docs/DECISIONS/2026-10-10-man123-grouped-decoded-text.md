@@ -63,7 +63,8 @@ broad review, lens 1 #8 and #29, lens 2 #19 (consolidated O-03).
    harmless outside daemon mode. It conflicts with `--json`, so
    `run --json --decoded-text` is a clap usage error (exit 2) rather than a
    silently ignored flag. There is no config key or `MANTA_*` variable for
-   it, as there is none for `--json`: it is a debugging choice.
+   it, as there is none for `--json`: it is a debugging choice. It is on the
+   `CLI_ONLY` list of `every_config_backed_flag_maps_to_a_key` (MAN-261 D10).
 7. **No state on `TrackPromoted`.** `TrackManager` emits `TrackClosed` only
    for a track that produced decoder output (`has_emitted`, MAN-19). A bare
    promotion never gets a close, so the grouper creates per-track state only
