@@ -6,11 +6,19 @@
 //! Helpers are copied from `startup_banner.rs` and
 //! `node_health_acceptance.rs`; the repo's test files are self-contained.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output};
+// Used only by the unix-gated reachability test at the bottom of this file.
+#[cfg(unix)]
+use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+#[cfg(unix)]
+use std::process::{Child, Stdio};
+#[cfg(unix)]
 use std::sync::mpsc;
+#[cfg(unix)]
 use std::time::Duration;
 
 /// `seconds` of 48 kHz mono silence. The banner is emitted before the
@@ -167,8 +175,10 @@ fn a_failed_bind_names_the_listener_and_its_address() {
 
 /// Kills and reaps the daemon child process on drop, including on a
 /// failing assertion, so a failing assert never leaks a `manta` process.
+#[cfg(unix)]
 struct ChildGuard(Child);
 
+#[cfg(unix)]
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -178,6 +188,7 @@ impl Drop for ChildGuard {
 
 /// This machine's IPv4 address on the default route, or `None` when there
 /// is none. A UDP `connect` only picks a route; it sends nothing.
+#[cfg(unix)]
 fn non_loopback_ipv4() -> Option<Ipv4Addr> {
     let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect("192.0.2.1:9").ok()?; // TEST-NET-1

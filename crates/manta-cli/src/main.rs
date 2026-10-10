@@ -6242,15 +6242,21 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             source_iq: true,
             ..cli_overrides()
         };
+        // Absolute on every OS: "/x/v1.wav" has no drive prefix, so Windows
+        // treats it as relative and joins it onto the config dir.
+        let wav = std::env::temp_dir().join("x").join("v1.wav");
         let r = resolve(
             cli,
-            &loaded_from("[input]\ntype = \"file\"\npath = \"/x/v1.wav\"\n"),
+            &loaded_from(&format!(
+                "[input]\ntype = \"file\"\npath = '{}'\n",
+                wav.display()
+            )),
         )
         .unwrap();
         let LiveSourceSpec::File { path, source_iq } = &r.spec else {
             panic!("expected the file source from [input]");
         };
-        assert_eq!(path, &PathBuf::from("/x/v1.wav"));
+        assert_eq!(path, &wav);
         assert!(*source_iq);
     }
 

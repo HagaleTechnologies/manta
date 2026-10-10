@@ -401,7 +401,8 @@ fn check_prints_one_summary_line_per_table() {
     let out = succeeds(&check_file(&path));
     let prefixes: Vec<&str> = out
         .lines()
-        .map(|l| l.split_once(':').map_or(l, |(p, _)| p))
+        // `": "`, not `':'`: a Windows path's drive colon is followed by `\`.
+        .map(|l| l.split_once(": ").map_or(l, |(p, _)| p))
         .collect();
     assert_eq!(
         prefixes,
@@ -559,7 +560,10 @@ fn init_then_check_round_trips() {
 fn init_with_server(dir: &Path, call: &str) -> PathBuf {
     succeeds(&init_in(dir, &[]));
     let path = dir.join("manta.toml");
-    let text = std::fs::read_to_string(&path).unwrap();
+    // The scaffold is include_str!'d, so a CRLF (Windows) checkout writes CRLF.
+    let text = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("\r\n", "\n");
     assert!(text.contains("\n#[server]\n") && text.contains("\n#station_callsign = \"N0CALL\"\n"));
     let edited = text.replacen("\n#[server]\n", "\n[server]\n", 1).replacen(
         "\n#station_callsign = \"N0CALL\"\n",
