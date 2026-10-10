@@ -380,6 +380,39 @@ fn roadmap_m3_remaining_work_names_every_open_acceptance_gate() {
     }
 }
 
+/// MAN-269: ROADMAP M3 points at the README's paced-replay demo. "60-second
+/// demo" is that README section's title, not the replay's length -- the
+/// `gen v1` replay keeps the server up for 120 seconds -- so the pointer must
+/// link the section and state the real length rather than read as a
+/// 60-second run.
+#[test]
+fn roadmap_m3_replay_demo_pointer_states_the_real_length() {
+    let roadmap = doc("ROADMAP.md");
+    let m3 = squash_whitespace(section(&roadmap, "M3"));
+    let idx = m3
+        .find("Since MAN-269")
+        .expect("M3 MAN-269 replay sentence");
+    let sentence = &m3[idx..idx + m3[idx..].find(").").expect("sentence end") + 2];
+    assert!(
+        sentence.contains("(README.md#60-second-demo)"),
+        "ROADMAP M3's replay pointer does not link the README section: {sentence}"
+    );
+    assert!(
+        sentence.contains("120 seconds"),
+        "ROADMAP M3's replay pointer does not state the 120-second replay: {sentence}"
+    );
+    let readme = doc("README.md");
+    // `section()` prefix-matches; the anchor only resolves on this exact heading.
+    assert!(
+        readme.contains("\n## 60-second demo\n"),
+        "README's `## 60-second demo` heading changed; ROADMAP M3's #60-second-demo link is broken"
+    );
+    assert!(
+        squash_whitespace(section(&readme, "60-second demo")).contains("full 120 seconds"),
+        "README's demo no longer says the replay runs 120 seconds; update ROADMAP M3 too"
+    );
+}
+
 /// The input rates of the normative rate table in `docs/SPEC-decode-core.md`
 /// §1.1, in kS/s (`96`, `192`, `384`, `768`). The README's supported-rate
 /// list must name every one of them: a rate the SPEC admits but the README
@@ -796,6 +829,8 @@ fn spec_documents_every_input_and_spot_key() {
                 "device",
                 "path",
                 "iq",
+                "realtime",
+                "loop",
                 "host",
                 "port",
                 "freq_hz",

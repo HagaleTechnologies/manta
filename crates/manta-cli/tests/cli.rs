@@ -2521,3 +2521,172 @@ fn status_with_a_missing_server_config_fails_with_exit_code_two_not_one() {
         );
     }
 }
+
+// ---- MAN-269: IQ WAV rate ceiling, and paced/looping file replay
+
+/// A float32 stereo WAV header declaring `rate` and four frames of silence:
+/// 108 bytes, written by hand because `hound::WavWriter` is not the thing
+/// under test and might refuse an absurd rate.
+fn header_only_iq_wav(path: &Path, rate: u32) {
+    let frames = 4u32;
+    let data_len = frames * 8;
+    let mut b = Vec::new();
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(36 + data_len).to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    b.extend_from_slice(&16u32.to_le_bytes());
+    b.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
+    b.extend_from_slice(&2u16.to_le_bytes()); // I, Q
+    b.extend_from_slice(&rate.to_le_bytes());
+    b.extend_from_slice(&rate.wrapping_mul(8).to_le_bytes());
+    b.extend_from_slice(&8u16.to_le_bytes());
+    b.extend_from_slice(&32u16.to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&data_len.to_le_bytes());
+    b.resize(b.len() + data_len as usize, 0);
+    std::fs::write(path, b).unwrap();
+}
+
+/// 393 216 000 Hz = 93.75 * 2^22 is shape-valid for the channelizer, so
+/// before MAN-269 it reached `FloorBank::new`'s 3.36 GB allocation and
+/// aborted (exit 134) or was SIGKILLed (137).
+fn assert_rate_bomb_is_refused(out: &Output) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("at most 10000000 Hz"), "stderr: {stderr}");
+    assert!(stderr.contains("393216000 Hz"), "stderr: {stderr}");
+    assert!(!stderr.contains("memory allocation"), "stderr: {stderr}");
+}
+
+#[test]
+fn run_rejects_an_iq_wav_whose_declared_rate_would_exhaust_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("bomb.wav");
+    header_only_iq_wav(&wav, 393_216_000);
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(&wav)
+        .arg("--source-iq")
+        .output()
+        .unwrap();
+    assert_rate_bomb_is_refused(&out);
+}
+
+#[test]
+fn decode_rejects_an_iq_wav_whose_declared_rate_would_exhaust_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("bomb.wav");
+    header_only_iq_wav(&wav, 393_216_000);
+    let out = manta().arg("decode").arg(&wav).output().unwrap();
+    assert_rate_bomb_is_refused(&out);
+}
+
+/// `dir/v1.wav`: V1 rendered for `duration_s` seconds.
+fn v1_of(dir: &Path, duration_s: f64) -> PathBuf {
+    write_fixture(
+        dir,
+        &manta_testkit::vectors::VectorSpec {
+            duration_s,
+            ..manta_testkit::vectors::v1()
+        },
+    )
+}
+
+/// `run --source <wav> --source-iq --json <extra>`: its output and wall time.
+fn replay_json(wav: &Path, extra: &[&str]) -> (Output, std::time::Duration) {
+    let start = std::time::Instant::now();
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(wav)
+        .args(["--source-iq", "--json"])
+        .args(extra)
+        .output()
+        .unwrap();
+    let took = start.elapsed();
+    assert!(
+        out.status.success(),
+        "run {extra:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out, took)
+}
+
+#[test]
+fn realtime_replay_is_byte_identical_to_unpaced_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_of(dir.path(), 8.0);
+    let (unpaced, _) = replay_json(&wav, &[]);
+    let unpaced_stdout = String::from_utf8(unpaced.stdout).unwrap();
+    assert!(
+        unpaced_stdout.contains("\"CharDecoded\""),
+        "premise: an 8 s V1 decodes characters, so equality below means something:\n\
+         {unpaced_stdout}"
+    );
+    let (paced, took) = replay_json(&wav, &["--realtime"]);
+    assert_eq!(String::from_utf8(paced.stdout).unwrap(), unpaced_stdout);
+    // Lower bound only: an 8 s recording cannot finish sooner than 8 s.
+    assert!(
+        took >= std::time::Duration::from_secs_f64(7.5),
+        "an 8 s --realtime replay took only {took:?}"
+    );
+}
+
+#[test]
+fn realtime_paces_a_decimated_replay_at_the_decimated_rate() {
+    // Pacing against the 96 kS/s file rate instead of the 48 kS/s decimated
+    // rate would finish this 4 s recording in about 2 s.
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_of(dir.path(), 4.0);
+    let (unpaced, _) = replay_json(&wav, &["--capture-rate-hz", "48000"]);
+    let (paced, took) = replay_json(&wav, &["--capture-rate-hz", "48000", "--realtime"]);
+    assert_eq!(
+        String::from_utf8(paced.stdout).unwrap(),
+        String::from_utf8(unpaced.stdout).unwrap()
+    );
+    assert!(
+        took >= std::time::Duration::from_secs_f64(3.5),
+        "a 4 s decimated --realtime replay took only {took:?}"
+    );
+}
+
+#[test]
+fn realtime_with_a_live_source_fails_before_any_io() {
+    for (flag, message) in [
+        ("--realtime", "--realtime only applies to a file replay"),
+        ("--loop", "--loop only applies to a file replay"),
+    ] {
+        let out = manta()
+            .args(["run", "--device", "manta-test-no-such-device", flag])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{flag}: {stderr}");
+        assert!(stderr.contains(message), "{flag}: {stderr}");
+    }
+}
+
+#[test]
+fn soak_ignores_input_realtime_with_a_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_of(dir.path(), 4.0);
+    let cfg = write_cfg(
+        dir.path(),
+        "soak.toml",
+        &format!(
+            "[input]\ntype = \"file\"\npath = '{}'\niq = true\nrealtime = true\n",
+            wav.display()
+        ),
+    );
+    let out = manta()
+        .args(["soak", "--duration", "1", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "note: soak replays files as fast as it can; ignoring input.realtime/input.loop from"
+        ),
+        "stderr: {stderr}"
+    );
+}

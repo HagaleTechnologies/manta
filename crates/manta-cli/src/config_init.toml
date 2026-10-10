@@ -107,6 +107,8 @@
 # type = "file", a WAV recording replayed as if live:
 #path = "capture.wav"                # required; relative to this file's directory
 #iq = false                          # true for a two-channel IQ recording, not mono audio
+#realtime = false                    # true to replay at the recording's own pace, so clients can watch (run only)
+#loop = false                        # true to replay again from the start each time it ends; implies realtime (run only)
 
 # type = "kiwi", a KiwiSDR web receiver, and type = "hpsdr", an
 # HPSDR/Hermes radio (hpsdr needs a manta built with hpsdr support):

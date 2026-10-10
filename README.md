@@ -166,13 +166,32 @@ which among the rates recorders commonly produce means 24, 48, 96, 192,
 interpreted, so a recording at an off-table rate (100 or 250 kS/s, say) is
 rejected with `unsupported sample rate …: fs/93.75 must be a power of two`.
 That list is examples, not the whole set: divide your own rate by 93.75,
-and it replays if the answer is a power of two of at least 4.
+and it replays if the answer is a power of two of at least 4 and the rate
+is at most 10 MS/s.
 `--capture-rate-hz` decimates by a power of two into a *lower* table rate
 (`--capture-rate-hz 48000` on a 192 kS/s capture, to spend less CPU on a
 narrower passband); it is not a general resampler and cannot rescue an
-off-table recording. Replay runs faster than realtime, so the hardware-free
-path above stops at `decode`; a paced replay that can drive the servers
-below is being worked on.
+off-table recording.
+
+Replay runs as fast as the machine manages unless you add `--realtime`,
+which plays the file at the recording's own pace, so a hardware-free replay
+can drive the servers described below:
+
+```sh
+cat > /tmp/v1/demo.toml <<'EOF'
+[server]
+station_callsign = "W5AU"   # your call; becomes `DX de W5AU-#:`
+bind_addr = "127.0.0.1"     # this machine only
+EOF
+manta run --source /tmp/v1/v1.wav --source-iq --realtime --config /tmp/v1/demo.toml
+```
+
+In a second terminal, within about 20 seconds, run `telnet localhost 7300`
+and enter any callsign at the prompt: W1AW's CQ arrives as a `DX de` line
+about 21 seconds into the replay, and the server stays up for the full 120
+seconds. Connected later than that? Type `sh/dx` to list the spots already
+sent. Add `--loop` to keep a recording playing until you press Ctrl-C (a
+station is spotted again at most every 10 minutes).
 
 `manta --help` lists every subcommand and flag.
 
