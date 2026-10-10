@@ -8,6 +8,7 @@ pub mod bus;
 pub mod command;
 pub mod config;
 pub mod health;
+pub mod human;
 pub mod iac;
 pub mod json_stream;
 pub mod metrics;

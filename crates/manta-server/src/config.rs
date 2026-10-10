@@ -172,7 +172,8 @@ fn check_operator_callsign(call: &str) -> Result<(), String> {
     };
     if ssid.is_some_and(|s| !is_valid_ssid(s)) {
         return Err(format!(
-            "{call:?} is not a plausible callsign (an SSID must be -1 through -99)"
+            "{} is not a plausible callsign (an SSID must be -1 through -99)",
+            crate::human::quoted(call)
         ));
     }
     // Base length: `MIN_CALLSIGN_LEN` (the call itself cannot be shorter, so
@@ -180,20 +181,27 @@ fn check_operator_callsign(call: &str) -> Result<(), String> {
     // triple with room to spare) -- an outer bound on what gets interpolated
     // into every output line, not a claim about callsign structure.
     if base.len() < MIN_CALLSIGN_LEN || base.len() > 20 {
-        return Err(format!("{call:?} is not a plausible callsign (length)"));
+        return Err(format!(
+            "{} is not a plausible callsign (length)",
+            crate::human::quoted(call)
+        ));
     }
     if !base.chars().all(|c| c.is_ascii_alphanumeric() || c == '/') {
         // Covers control characters, CR/LF, whitespace and non-ASCII in one rule.
         return Err(format!(
-            "{call:?} is not a plausible callsign \
-             (only A-Z, 0-9, '/' and a trailing -N SSID are allowed)"
+            "{} is not a plausible callsign \
+             (only A-Z, 0-9, '/' and a trailing -N SSID are allowed)",
+            crate::human::quoted(call)
         ));
     }
     // At most prefix/base/suffix, each non-empty and no longer than any real
     // designator.
     let segments: Vec<&str> = base.split('/').collect();
     if segments.len() > 3 || segments.iter().any(|s| s.is_empty() || s.len() > 10) {
-        return Err(format!("{call:?} is not a plausible callsign (structure)"));
+        return Err(format!(
+            "{} is not a plausible callsign (structure)",
+            crate::human::quoted(call)
+        ));
     }
     // The letter-and-digit rule belongs to the SEGMENT that is the actual
     // call, not to the whole string (PR #131 review): applied whole-string it
@@ -208,9 +216,10 @@ fn check_operator_callsign(call: &str) -> Result<(), String> {
     // running to the END of the segment; see `is_complete_callsign`.
     if !segments.iter().any(|s| is_complete_callsign(s)) {
         return Err(format!(
-            "{call:?} is not a plausible callsign (one segment must be a complete \
+            "{} is not a plausible callsign (one segment must be a complete \
              callsign: a prefix, a separating digit, and a letter suffix, as in \
-             {MIN_CALLSIGN_LEN}-character W1A)"
+             {MIN_CALLSIGN_LEN}-character W1A)",
+            crate::human::quoted(call)
         ));
     }
     Ok(())
@@ -276,7 +285,10 @@ fn check_grid(value: &str) -> Result<(), String> {
         // Short-circuits before indexing c[4]/c[5] on a 4-char locator.
         && (c.len() == 4 || (('A'..='X').contains(&c[4]) && ('A'..='X').contains(&c[5])));
     if !ok {
-        return Err(format!("{value:?} is not a Maidenhead grid square"));
+        return Err(format!(
+            "{} is not a Maidenhead grid square",
+            crate::human::quoted(value)
+        ));
     }
     Ok(())
 }

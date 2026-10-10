@@ -208,7 +208,7 @@ impl WavIqSource {
                 .samples::<i16>()
                 .map(|s| s.map(|v| v as f32 / 32768.0))
                 .collect::<Result<_, _>>()?,
-            (f, b) => bail!("unsupported WAV format {f:?}/{b}-bit (need Float32 or Int16)"),
+            (f, b) => return Err(unsupported_wav(f, b)),
         };
         let samples = interleaved
             .as_chunks::<2>()
@@ -267,8 +267,29 @@ pub fn read_all(src: &mut dyn IqSource) -> Result<Vec<Complex32>> {
     }
 }
 
+fn unsupported_wav(format: hound::SampleFormat, bits: u16) -> anyhow::Error {
+    let name = match format {
+        hound::SampleFormat::Float => "Float",
+        hound::SampleFormat::Int => "Int",
+    };
+    anyhow::anyhow!("unsupported WAV format {name}/{bits}-bit (need Float32 or Int16)")
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn unsupported_wav_text_names_sample_formats() {
+        assert_eq!(
+            unsupported_wav(hound::SampleFormat::Float, 64).to_string(),
+            "unsupported WAV format Float/64-bit (need Float32 or Int16)"
+        );
+        assert_eq!(
+            unsupported_wav(hound::SampleFormat::Int, 24).to_string(),
+            "unsupported WAV format Int/24-bit (need Float32 or Int16)"
+        );
+    }
+
     use super::*;
     use num_complex::Complex32;
     use std::io::Write;

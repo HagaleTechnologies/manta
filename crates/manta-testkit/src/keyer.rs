@@ -133,7 +133,7 @@ fn push_word(
     let chars: Vec<char> = word.chars().collect();
     for (ci, c) in chars.iter().enumerate() {
         let Some(pattern) = pattern_for(*c) else {
-            bail!("character {c:?} has no Morse encoding");
+            bail!("character '{}' has no Morse encoding", c.escape_debug());
         };
         let els: Vec<char> = pattern.chars().collect();
         for (ei, e) in els.iter().enumerate() {

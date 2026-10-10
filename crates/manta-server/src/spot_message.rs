@@ -316,6 +316,26 @@ impl SpotMessage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn human_rounding_never_changes_wire_confidence_frequency_or_snr_reference() {
+        let mut spot = sample_spot();
+        spot.freq_hz = 14_012_349.9;
+        spot.confidence = 0.269_430_5;
+        spot.snr_db = 20.4;
+        let cty = manta_spot::cty::Table::parse(CTY_FIXTURE);
+        let msg = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-test", 0, 0);
+        assert_eq!(msg.decode_confidence, Some(spot.confidence));
+        // Preserve the existing whole-Hz wire contract, never human kHz rounding.
+        assert_eq!(msg.frequency, 14_012_350);
+        assert_eq!(msg.snr, Some(20));
+        assert_eq!(msg.snr_ref_hz, 2500);
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            json["decodeConfidence"].as_f64().unwrap() as f32,
+            spot.confidence
+        );
+    }
+
     use super::*;
     use manta_spot::SpotType;
 
