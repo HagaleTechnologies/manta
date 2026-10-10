@@ -92,6 +92,8 @@ interval if you need an ongoing liveness check, not just a post-start one.)
   `manta_build_info{git_sha="unknown"}` means the binary was built from a
   context with no `.git` directory (e.g. a Docker build — `.dockerignore`
   excludes `.git` on purpose) rather than a build failure.
+  `manta --version` on the host prints the same commit and feature list, and
+  the same `unknown` caveat applies.
 - `manta_uplink_target_*{target="host:port"}` — every uplink counter now
   has a per-target series (`enabled`, `connected`, `sent_total`,
   `suppressed_total`, `dropped_lagged_total`, `dropped_write_failed_total`,

@@ -54,7 +54,9 @@ const ENV_TABLES: &[(&str, &str)] = &[
     ("DECODE_", "decode"),
 ];
 /// Build-time only (crates/manta-cli/build.rs), never runtime config.
-const ENV_IGNORED: &[&str] = &["MANTA_GIT_SHA"];
+/// `cargo run`/`cargo test` export build.rs's `rustc-env` values into the
+/// processes they start, so these must not trip the unknown-name check.
+const ENV_IGNORED: &[&str] = &["MANTA_GIT_SHA", "MANTA_FEATURES"];
 /// String-typed keys: an env value is taken verbatim, never TOML-probed, so
 /// `MANTA_INPUT_PASSWORD=12345678` stays a string.
 const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
@@ -1313,18 +1315,22 @@ mod tests {
         assert!(loaded.env_vars.is_empty(), "{:?}", loaded.env_vars);
     }
 
+    /// Both the names build.rs reads (`rerun-if-env-changed=`) and the ones
+    /// it exports (`rustc-env=`, MAN-83): Cargo puts the latter into the
+    /// environment of `cargo run`/`cargo test` children.
     #[test]
     fn every_build_rs_env_name_is_ignored() {
         let build_rs = include_str!("../build.rs");
-        let names: Vec<&str> = build_rs
-            .split("rerun-if-env-changed=")
-            .skip(1)
+        let names: Vec<&str> = ["rerun-if-env-changed=", "rustc-env="]
+            .into_iter()
+            .flat_map(|directive| build_rs.split(directive).skip(1))
             .filter_map(|rest| {
                 rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                     .next()
             })
             .filter(|name| name.starts_with(ENV_PREFIX))
             .collect();
+        assert!(names.contains(&"MANTA_FEATURES"), "{names:?}");
         assert!(!names.is_empty());
         for name in names {
             assert!(ENV_IGNORED.contains(&name), "{name} must be in ENV_IGNORED");

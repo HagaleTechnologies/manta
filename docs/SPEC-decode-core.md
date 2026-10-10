@@ -839,14 +839,14 @@ M0 = V1 passing end-to-end from a WAV file. M1 = V1–V6. V7–V10 and V8w gate 
 
 Unlike V1–V10 (testkit-synthesized IQ), these operate at the
 `DecoderEvent`-stream level -- hand-built event sequences feeding
-`Validator::ingest` directly, no IQ synthesis involved. V11-V15, V18-V30
+`Validator::ingest` directly, no IQ synthesis involved. V11-V15, V18-V45b
 are implemented in `crates/manta-spot/tests/golden_v11_v15.rs`; V16-V17
 (operator suppression, MAN-31 -- orthogonal to this pipeline, see
 ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 
 | # | Name | Scenario | Pass criteria |
 |---|---|---|---|
-| V11 | context-parse | Each of `CQ <call>`, `CQ TEST <call>`, `DE <call>`, `<call> UP`, `V V V <call>`, `<call> T` | Correct `SpotType` assigned per pattern family |
+| V11 | context-parse | Each of `CQ <call>`, `CQ TEST <call>`, `CQ <contest> <call>` (e.g. `CQ WPX`; filler set per `manta-spot::context`), `TEST <call>`, `DE <call>`, `<call> UP`, `V V V <call>`, `<call> T` | Correct `SpotType` assigned per pattern family |
 | V12 | bogus-prefix | Structurally-valid callsign with a prefix absent from cty.dat | 0 spots, even though grammar passes |
 | V13 | scp-boost | Same callsign/confidences with vs. without SCP membership | `c_call` strictly higher when a member; absence never rejects |
 | V14 | repetition-gate | 1 decode vs. 2 decodes of the same callsign within 90 s, non-beacon spot type | 1 rep never spots; 2 reps does |
@@ -873,6 +873,8 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V42 | beacon-exempt-from-arbitration | A confusable rival of a `BEACON`-tagged candidate reaches more reps than the genuine, once-per-cycle beacon | The genuine beacon still spots -- `BEACON` candidates are exempt from step 4b arbitration (MAN-100 remediation C3) |
 | V43 | short-id-ordinary-cadence-unspotted | A 2-word ID ("DE `<CALL>`") repeated only twice, 20 s apart -- below both `MIN_MESSAGE_WORD_GAP` and `MIN_MESSAGE_TIME_GAP_SECONDS` | Not spotted -- an accepted, bounded recall cost (MAN-100 remediation C2, quantified), not tightened further |
 | V44 | 1-rep-rival-still-wins-by-shape | The literal, measured V8w track-90 shape: a 3-rep truncation ("W6JQ") vs. its genuine, longer form ("W6JQA") observed only once on the track | The truncation is withheld -- shape decides a prefix-containment pair once the rival has been observed at all, regardless of how few reps it has (MAN-100 remediation round 3; a rival-side rep floor tried in remediation C5 excluded this exact case and was reverted) |
+| V45 | non-callsign-convention | Each listed CW convention (`5NN`, `3NN`, `599`, `TEST`, …) sent as a CQ/DE/beacon candidate, some of which match an allocated cty.dat prefix (`5N` Nigeria) | 0 spots — rejected by grammar regardless of cty.dat (MAN-105) |
+| V45b | convention-never-vetoes | A track that repeats `5NN` exchanges, then a real non-SCP call ending in `5NN` (`HA5NN`) | The real call spots — the convention never enters the MAN-100 support ledger (MAN-105) |
 
 ---
 
@@ -1095,8 +1097,10 @@ cannot be set from the environment.
 
 Unknown tables, unknown keys in a known table, and unknown `MANTA_*`
 variables are errors that name the offender, raised before any source
-I/O. `MANTA_GIT_SHA` is exempt: it is read at build time
-(`crates/manta-cli/build.rs`), never at run time. `decode` and `oracle`
+I/O. `MANTA_GIT_SHA` and `MANTA_FEATURES` are exempt: they are build-time
+values of `crates/manta-cli/build.rs`, never read at run time, and
+`cargo run`/`cargo test` export both into the processes they start
+(MAN-83). `decode` and `oracle`
 read only the file `--config` names and never the environment
 (`MANTA_CONFIG` included), so their output cannot depend on the ambient
 environment; `decode` applies `[detector]`, `[spot]`, `[decode]` and

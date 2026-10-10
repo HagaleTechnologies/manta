@@ -9,6 +9,7 @@ sources:
   - README.md
   - CLAUDE.md
   - docs/DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md
+  - docs/DECISIONS/2026-10-10-man92-telnet-commands.md
 verified:
   commit: 01d1ea1
   date: 2026-09-07
@@ -19,12 +20,14 @@ manta produces spots on two surfaces: a **telnet DX cluster server** (default :7
 
 ## Pointers
 
-- RBN telnet format and the command grammar manta supports (`sh/dx`, filters, `SKIMMER/SETT`, `BYE`): ARCHITECTURE §7. Ports and station-callsign spotter ID are TOML config keys (ARCHITECTURE §8).
+- RBN telnet format and the command grammar manta supports (`sh/dx`, filters, `SKIMMER/SETT`, `BYE`, `sh/version`): ARCHITECTURE §7. Ports and station-callsign spotter ID are TOML config keys (ARCHITECTURE §8).
 - **Aggregator compatibility is a gate, not a nicety** (MAN-86): RBN's Aggregator will not forward spots from a source that never answers `SKIMMER/SETT`, so the greeting banner, the `SETT` reply and the `BYE` close are an RBN *admission requirement* on this surface, not a convenience — that is the one thing worth knowing before you touch it. Every wire detail (what the banner lines contain, the `SETT` reply grammar, the close text) is normative in `docs/DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md`, together with the four primary sources it was reconstructed from, and summarized in ARCHITECTURE §7 — read it there; this page deliberately does not restate it. The operator identity the banner reports comes from the `[server]` `operator_name`/`operator_qth`/`operator_grid` keys in the canonical config-key table (docs/SPEC-decode-core.md §9).
+- Gotcha (MAN-92): in `sh/dx`, `20m` means the last twenty **minutes**, not the 20 m band. This follows Aggregator manual §10.5, and `sh/dx 20` is a count. Band selection is manta's own `BAND` keyword (`sh/dx BAND 20m`). Unknown or malformed commands now get `Unknown command` instead of silence. The grammar, the selection order and the fifty-entry history limit are normative in `docs/DECISIONS/2026-10-10-man92-telnet-commands.md`.
 - Gotcha (MAN-87): IAC (telnet option negotiation) is `0xFF`, never valid UTF-8 — a strictly-UTF-8 line reader on the telnet listener rejects any real client that negotiates on connect (Windows `telnet.exe`, PuTTY telnet mode). manta strips and refuses negotiation before UTF-8 validation runs; see `docs/DECISIONS/2026-09-07-man87-telnet-iac-policy.md` for the normative design.
 - What an operator may spell in `station_callsign`/`login_callsign` — including RBN's per-band `CALL-N` SSID, which the de-side identity on both surfaces carries verbatim while the `cty.dat` geography lookup behind `deContinent`/`deLat`/`deLon` sees it stripped: `docs/DECISIONS/2026-09-07-man-89-station-callsign-ssid-grammar.md`. That record, not this page, is authoritative for the grammar; the server still appends its own `-#`.
 - JSON spot schema: **the schema is an ecosystem contract that lives in the `dispensa` repo** (`contracts/spots/spots.v1.schema.json`, ADR-0011 — noted in CLAUDE.md and ARCHITECTURE §7), not solely in this repo. Do not restate fields here; the contract is authoritative.
 - **Unresolvable geography for an allowlisted call**: MAN-28's Watch List allowlist can make the validator emit a spot for a callsign `cty.lookup` can't resolve. `dxContinent`/`dxCqZone` emit out-of-domain sentinels rather than the contract-forbidden `null` (those two fields are required/non-nullable on the wire); `dxLat`/`dxLon` are already nullable and are the contract-legal "unknown" signal. See `docs/DECISIONS/2026-09-04-man45-unresolved-geography-sentinels.md` for the full rationale and the cross-repo question proposed to dispensa.
+- `decoderVersion` is build identity, not decoder output: `manta-<crate version>+<commit>` (MAN-83), the commit as SemVer build metadata. A consumer comparing decoder behaviour across releases compares the part before `+`; the whole string names the exact binary. When decoder output may change between versions is normative in `docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md` (summarised in `CHANGELOG.md`).
 - cqdx is the intended first-class JSON ingest consumer (README "Relationship to sibling projects"); the boundary is referenced across repos, not linked from this wiki.
 
 ## Status caveat
@@ -37,7 +40,7 @@ The telnet/RBN-uplink surface and the JSON surface quote SNR in two different re
 
 ## Third surface: outbound RBN uplink
 
-manta can also act as a telnet *client*, logging into an RBN spot-collection endpoint and forwarding its own spots there (`crates/manta-server/src/uplink.rs`, one task per `[[rbn_uplink]]` config entry) — the mirror direction of the telnet server above. It ships **dry-run by default** (MAN-159): an entry with no `dry_run` key connects and logs in but transmits nothing, and each target logs its mode at startup. See README's "Outbound RBN uplink" section for the config shape; the uplink itself is unverified against a real RBN ingest pending MAN-90.
+manta can also act as a telnet *client*, logging into an RBN spot-collection endpoint and forwarding its own spots there (`crates/manta-server/src/uplink.rs`, one task per `[[rbn_uplink]]` config entry) — the mirror direction of the telnet server above. It ships **dry-run by default** (MAN-159): an entry with no `dry_run` key connects and logs in but transmits nothing, and each target logs its mode at startup. By default it forwards only CQ and beacon spots, RBN's own submission rule; DE and untyped spots still reach telnet/JSON, and `spot_types = "all"` sends every type (MAN-91, `docs/DECISIONS/2026-10-10-man91-uplink-spot-type-filter.md`). See README's "Outbound RBN uplink" section for the config shape; the uplink itself is unverified against a real RBN ingest pending MAN-90.
 
 ## Audio-sourced spot frequencies (MAN-34)
 

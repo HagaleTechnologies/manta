@@ -277,9 +277,13 @@ A candidate held back by this gate is retried the moment `TrackMeta` arrives
 transmission may never produce again).
 
 1. **CQ/DE context parse**: regex-level scan for `CQ <call>`, `CQ TEST <call>`,
+   contest framing `CQ <contest> <call>` (an enumerated filler set, e.g.
+   `CQ WPX`) and a bare `TEST <call>` (MAN-104; a bare `TEST` between two
+   different callsigns, or after a sign-off such as `TU`, is ambiguous and
+   yields no candidate),
    `DE <call>`, `<call> UP`, beacon patterns (`V V V <call>`, and `<call> T`
    for NCDXF-style power-step beacons the decoder can't resolve past a
-   single trailing dash, MAN-37 — suppressed whenever a bare `CQ`/`DE`
+   single trailing dash, MAN-37 — suppressed whenever a bare `CQ`/`TEST`/`DE`
    token appears anywhere in the window at all (the token must be a
    complete decoded word, not a substring glued to punctuation inside
    one), a deliberately coarse guard against mistagging an ordinary,
@@ -289,7 +293,10 @@ transmission may never produce again).
    not a loss and is not counted). Context
    determines spot type (CQ / DE / BEACON) — RBN spots carry this flag.
 2. **Callsign plausibility**: structural grammar (prefix-digit-suffix, portable
-   designators `/P /QRP /3`), then prefix lookup against **cty.dat**.
+   designators `/P /QRP /3`), which also rejects, by exact match, a fixed
+   list of non-callsign CW conventions (`5NN`, `599`, `TEST`, `TU`, `QRZ`,
+   `AGN`, `K`, `KN`, …; MAN-105), regardless of cty.dat, then prefix
+   lookup against **cty.dat**.
    A call with an unallocated prefix is rejected. Operators can replace the
    bundled table with `--cty` / `[spot] cty_path`. Live commands warn when
    the built-in copy is more than 180 days old (MAN-79). `cty.dat` is
@@ -407,7 +414,16 @@ validation (MAN-28). Dedupe (step 5) still applies.
   operators running manta behind W3OA's Aggregator, which expects CW
   Skimmer's own layout rather than the RBN relay's.
   Read-mostly protocol; enough command grammar (`sh/dx`, filters, `SKIMMER/
-  SETT`, `BYE`) for common clients — and RBN's own Aggregator — not to choke.
+  SETT`, `BYE`, `sh/version`) for common clients — and RBN's own Aggregator —
+  not to choke. An unrecognised or malformed command gets a fixed
+  `Unknown command` reply, and `sh/version` gets `manta <version>`.
+  Valid `sh/dx` queries with no results send no reply (no error, header or
+  trailer).
+  `sh/dx` follows Aggregator's documented forms: `sh/dx N` is a count and
+  `sh/dx Nm` a minutes window, never a band. Either can take a ` CW`/` RTTY`
+  suffix, and the manta extension `BAND <band>` selects a band. Every query
+  reaches back at most the fifty retained spots. See
+  `docs/DECISIONS/2026-10-10-man92-telnet-commands.md`.
   `SKIMMER/SETT` replies with validation level and the live decodable
   passband (`SETT: vlNormal 14000.0-14070.0`); Aggregator will not forward
   spots from a source that never answers it (Aggregator manual v6.0 §9.2).
@@ -433,7 +449,11 @@ validation (MAN-28). Dedupe (step 5) still applies.
   Its `snr` field keeps the native 2500 Hz measurement (no 500 Hz conversion)
   alongside an explicit `snrRefHz` field naming that bandwidth, so a consumer
   of either surface never has to guess which convention it's reading
-  (MAN-102 / decision D3).
+  (MAN-102 / decision D3). Every spot's `decoderVersion` is
+  `manta-<version>+<commit>` (MAN-83): the commit is SemVer build metadata
+  naming the exact binary, and the part before `+` is the release the
+  decoder-output rule in `CHANGELOG.md` governs. See
+  `docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md`.
 - Both servers are thin fan-out consumers of one broadcast channel; slow clients
   are disconnected, never back-pressure the pipeline. At shutdown each
   client's queued backlog is drained on a best-effort basis bounded by a

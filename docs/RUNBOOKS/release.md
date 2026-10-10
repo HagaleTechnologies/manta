@@ -123,10 +123,18 @@ this change. See [the MAN-244 decision](../DECISIONS/2026-10-10-man244-release-g
 
 ## Cutting a release
 
-1. Complete the activation checks above. If the release changes it, bump
-   the workspace `version` in `Cargo.toml` through a reviewed PR and merge
-   it to the default branch. The crate and tag versions are independent,
-   but keeping them in step avoids confusion.
+1. Complete the activation checks above. Move `CHANGELOG.md`'s
+   `## [Unreleased]` entries under `## [X.Y.Z] - YYYY-MM-DD`. If they
+   include a `### Decoder output` section, X.Y.Z must bump at least the
+   MINOR version over the previous release. A PATCH release never changes
+   decoder output (see
+   [the MAN-83 decision](../DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md)).
+   `manta --version` and the JSON stream's `decoderVersion` carry the
+   workspace version, so tag the release with that same version. If the
+   release changes it, bump the workspace `version` in `Cargo.toml` through
+   a reviewed PR and merge it to the default branch. The workflows do not
+   compare the crate and tag versions, so keeping them equal is this step's
+   job.
 2. As `thagale`, select the reviewed default-branch commit containing the
    MAN-244 guard. Tag that explicit commit `vX.Y.Z` (see "Accepted tag
    grammar" below), then push: `git tag v1.2.3 <reviewed-commit-sha>` and

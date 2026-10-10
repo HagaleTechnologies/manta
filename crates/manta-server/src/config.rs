@@ -536,6 +536,48 @@ pub struct RbnUplinkConfig {
     /// `docs/DECISIONS/2026-09-01-legacy-capability-matrix.md:91`.
     #[serde(default = "default_dry_run")]
     pub dry_run: bool,
+    /// Which spot types this target is sent (MAN-91). Omitted means
+    /// `cq_beacon`, RBN's own submission rule; `all` forwards every type.
+    /// Applies only to this uplink: telnet/JSON still carry every spot.
+    #[serde(default)]
+    pub spot_types: UplinkSpotTypes,
+}
+
+/// Which validated spots an `[[rbn_uplink]]` target is sent -- MAN-91.
+/// RBN only accepts a non-beacon station that is calling CQ or TEST, so the
+/// default forwards `Cq` (which `manta-spot`'s context parser also assigns
+/// to `CQ TEST <call>`) and `Beacon` only, and holds back `De` (a station
+/// answering someone else) and `Unknown` (no CQ evidence at all). `all` is
+/// the operator override for a collector that wants every type. A spot held
+/// back here is counted in the target's `suppressed` counter, alongside
+/// dry-run, per ARCHITECTURE §8's "every suppressed item is counted".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UplinkSpotTypes {
+    /// CQ and beacon spots only -- RBN's own rule, and the default.
+    #[default]
+    CqBeacon,
+    /// Every spot type, including DE and untyped spots.
+    All,
+}
+
+impl UplinkSpotTypes {
+    /// Whether a spot of type `t` is sent to the target.
+    pub fn forwards(self, t: manta_spot::SpotType) -> bool {
+        use manta_spot::SpotType;
+        match self {
+            UplinkSpotTypes::All => true,
+            UplinkSpotTypes::CqBeacon => matches!(t, SpotType::Cq | SpotType::Beacon),
+        }
+    }
+
+    /// The TOML spelling, for `config check` and the startup log.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UplinkSpotTypes::CqBeacon => "cq_beacon",
+            UplinkSpotTypes::All => "all",
+        }
+    }
 }
 
 impl RbnUplinkConfig {
@@ -1193,6 +1235,59 @@ mod tests {
         // to a real target without the operator opting in explicitly.
         assert!(uplink.dry_run);
         assert_eq!(uplink.login_callsign, None);
+        // MAN-91: an omitted `spot_types` key means RBN's own rule.
+        assert_eq!(uplink.spot_types, UplinkSpotTypes::CqBeacon);
+    }
+
+    fn parse_spot_types(value: &str) -> Result<DaemonConfigFile, toml::de::Error> {
+        toml::from_str(&format!(
+            r#"
+            [server]
+            station_callsign = "W3XYZ"
+            [[rbn_uplink]]
+            enabled = true
+            target_host = "example.invalid"
+            target_port = 7300
+            spot_types = "{value}"
+            "#
+        ))
+    }
+
+    #[test]
+    fn uplink_spot_types_all_parses() {
+        let file = parse_spot_types("all").unwrap();
+        assert_eq!(file.rbn_uplink[0].spot_types, UplinkSpotTypes::All);
+        let file = parse_spot_types("cq_beacon").unwrap();
+        assert_eq!(file.rbn_uplink[0].spot_types, UplinkSpotTypes::CqBeacon);
+    }
+
+    /// A typo must fail loudly rather than fall back to the default -- same
+    /// reasoning as `line_format`.
+    #[test]
+    fn uplink_spot_types_rejects_an_unknown_value() {
+        let err = parse_spot_types("de").unwrap_err().to_string();
+        assert!(err.contains("spot_types"), "error was: {err}");
+        assert!(
+            err.contains("cq_beacon") && err.contains("all"),
+            "error was: {err}"
+        );
+    }
+
+    #[test]
+    fn uplink_spot_types_forwards_table() {
+        use manta_spot::SpotType;
+        let cases = [
+            (SpotType::Cq, true, true),
+            (SpotType::Beacon, true, true),
+            (SpotType::De, false, true),
+            (SpotType::Unknown, false, true),
+        ];
+        for (t, cq_beacon, all) in cases {
+            assert_eq!(UplinkSpotTypes::CqBeacon.forwards(t), cq_beacon, "{t:?}");
+            assert_eq!(UplinkSpotTypes::All.forwards(t), all, "{t:?}");
+        }
+        assert_eq!(UplinkSpotTypes::CqBeacon.as_str(), "cq_beacon");
+        assert_eq!(UplinkSpotTypes::All.as_str(), "all");
     }
 
     #[test]
@@ -1316,6 +1411,7 @@ mod tests {
             target_port: 7300,
             login_callsign: None,
             dry_run: false,
+            spot_types: UplinkSpotTypes::default(),
         };
         assert_eq!(uplink.effective_login_callsign("W3XYZ"), "W3XYZ");
 

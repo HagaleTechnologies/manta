@@ -359,11 +359,13 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
         .unwrap_or_default();
     for u in &loaded.rbn_uplink {
         lines.push(format!(
-            "rbn_uplink: target_host={} target_port={} enabled={} dry_run={} login_callsign={}",
+            "rbn_uplink: target_host={} target_port={} enabled={} dry_run={} spot_types={} \
+             login_callsign={}",
             u.target_host,
             u.target_port,
             u.enabled,
             u.dry_run,
+            u.spot_types.as_str(),
             u.effective_login_callsign(station)
         ));
     }
@@ -627,7 +629,7 @@ mod tests {
             "[server]\nstation_callsign = \"W1AW\"\n\
              [[rbn_uplink]]\nenabled = true\ntarget_host = \"a.example.org\"\ntarget_port = 7000\n\
              [[rbn_uplink]]\nenabled = false\ntarget_host = \"b.example.org\"\ntarget_port = 7001\n\
-             login_callsign = \"k1abc\"\ndry_run = false\n",
+             login_callsign = \"k1abc\"\ndry_run = false\nspot_types = \"all\"\n",
         );
         let uplinks: Vec<&String> = lines
             .iter()
@@ -637,9 +639,9 @@ mod tests {
             uplinks,
             [
                 "rbn_uplink: target_host=a.example.org target_port=7000 enabled=true \
-                 dry_run=true login_callsign=W1AW",
+                 dry_run=true spot_types=cq_beacon login_callsign=W1AW",
                 "rbn_uplink: target_host=b.example.org target_port=7001 enabled=false \
-                 dry_run=false login_callsign=K1ABC",
+                 dry_run=false spot_types=all login_callsign=K1ABC",
             ]
         );
     }
