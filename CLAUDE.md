@@ -89,18 +89,16 @@ MAN-138: JSON spots' `deGrid`/`deLat`/`deLon` are the operator's
 centroid; an inconsistent location fails config loading before I/O. See
 `docs/DECISIONS/2026-10-11-man138-station-location.md`.
 
-<<<<<<< HEAD
 MAN-149: `docs/CONFIG.md` (every key's default and what reads it),
 `docs/METRICS.md`, `docs/SPOT-SCHEMA.md`, `docs/README.md` (start here, by
 audience) and `docs/DECISIONS/README.md`. A new config key, metric family,
 wire field, runbook or decision record needs a row in its document; tests
 in `docs_consistency.rs` and `spot_message.rs` enforce it — see
 docs/DECISIONS/2026-10-11-man149-docs-reference-and-index.md.
-=======
+
 MAN-172: high-SNR track churn fixed in `TrackManager` (local-peak spawn
 rule, incumbent-wins merge ties); VR3/VR4 pass, VR1/VR2 pass CER but not
 WPM. See docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md.
->>>>>>> 44d5ed35341136addd454eba4316ce4dfc864699
 
 ## Documents (read in this order)
 
