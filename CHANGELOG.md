@@ -22,12 +22,11 @@ the git history and `docs/DECISIONS/`.
 
 ## [Unreleased]
 
-<<<<<<< HEAD
 ## [0.1.0] - 2026-10-11
 
 Pre-stability alpha, expect breakage: manta has not cleared its own M2/M3
 acceptance gates.
-=======
+
 ### Decoder output
 
 - Strong signals (about +24 dB SNR or more in 2500 Hz) no longer spawn
@@ -35,7 +34,6 @@ acceptance gates.
   fraction of a second. They retain one continuous track and recover their
   text and frequency (MAN-172). HSMM's VR1/VR2 reported-speed gates remain
   open.
->>>>>>> ef294a2c78c55a5e10b004f9d8684d0214d9b5d1
 
 ### Added
 
