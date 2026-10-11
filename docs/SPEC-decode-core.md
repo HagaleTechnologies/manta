@@ -178,8 +178,32 @@ edges); the `min` guarantees a parked carrier can never raise its own
 detection threshold by more than 3 dB relative to its neighbors.
 
 Startup: for the first 10 s the ring is partially filled; the quantile is
-taken over whatever is present, and track creation is inhibited for the first
-**2 s** (`detector.warmup_ms = 2000`) to avoid floor-transient garbage.
+taken over whatever is present. Three things keep that young floor honest
+(MAN-115, `docs/DECISIONS/2026-10-11-man115-startup-latency.md`; this
+replaces SPEC v1's 2 s inhibit):
+
+- **Pre-roll skip.** The `filter_len` zero samples a decode path prepends
+  (`pad_hops` hops, all-zero or partial windows) never reach the floor, the
+  gate or the warm-up count; the segment's first real hop is its hop 0.
+- **Block-median seed.** While a channel's ring holds fewer than 25 entries
+  taken since its block's leading silence ended (that block's first 1 s of
+  input), its effective floor is raised to at least its block's seed: the
+  running
+  mean, over the block's first 25 decimated hops, of the median raw `PdB`
+  across the block's 32 channels, minus 3.8 dB (`10·log10(ln 2 / ln(4/3))`,
+  the median-to-lower-quartile gap of a chi-squared 2-DOF power). Block
+  medians below −140 dBFS (digital silence, e.g. a source still opening)
+  are left out of that mean; a block's leading silence lasts until its
+  first decimated hop with a median at or above −140 dBFS. The seed only
+  raises `F[k]`; `F_ch` stays raw.
+- **Leading silence.** The histogram bottom-bin entries a channel's ring
+  takes during its block's leading silence are left out of the `F_ch[k]`
+  and `F_blk` that `F[k]` uses until they leave the ring (10 s); counted,
+  they would pin the lower quartile at −140 dBFS. Removing bottom-bin
+  entries can only raise a quantile. Bottom-bin entries after the leading
+  silence count as usual.
+- **Warm-up.** Track creation is inhibited for the first **25 ms**
+  (`detector.warmup_ms = 25`, 9 hops) of real hops.
 
 ### 2.3 Gate
 
@@ -920,7 +944,7 @@ off_snr_db = 3.0
 confirm_ms = 50                     # 19 hops
 hang_ms = 5000                      # 1875 hops
 gc_ms = 30000                       # 11250 hops
-warmup_ms = 2000                    # 750 hops
+warmup_ms = 25                      # 9 hops
 # Max concurrent tracks (ARCHITECTURE §4); 1200 per
 # docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md.
 track_cap = 1200
