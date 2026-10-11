@@ -1148,6 +1148,36 @@ fn architecture_section_7_describes_decoder_version() {
     }
 }
 
+/// MAN-127: the README's node section tells an operator how to measure
+/// `freq_correction_ppm`, and ARCHITECTURE §8 says which command edits the
+/// config file in place.
+#[test]
+fn readme_and_architecture_mention_calibrate() {
+    let readme = doc("README.md");
+    let commands = fenced_commands(section(&readme, "Run it as a node"));
+    assert!(
+        commands
+            .iter()
+            .any(|c| c.trim_start().starts_with("manta calibrate")),
+        "README node section has no `manta calibrate` command: {commands:?}"
+    );
+    let arch = doc("ARCHITECTURE.md");
+    let s8 = squash_whitespace(section(&arch, "8. Configuration"));
+    for needle in [
+        "`manta calibrate`",
+        "input.freq_correction_ppm",
+        "docs/DECISIONS/2026-10-11-man127-calibrate-command.md",
+    ] {
+        assert!(s8.contains(needle), "ARCHITECTURE §8 never says {needle:?}");
+    }
+    assert!(
+        repo_root()
+            .join("docs/DECISIONS/2026-10-11-man127-calibrate-command.md")
+            .is_file(),
+        "ARCHITECTURE §8 links the MAN-127 decision doc, which does not exist"
+    );
+}
+
 // ---- MAN-124: the log's level and format controls, documented and real ----
 
 /// MAN-124: README's `## Logs` documents `RUST_LOG` as the underlying
