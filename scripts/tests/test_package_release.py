@@ -38,6 +38,18 @@ KIT = (
     "packaging/launchd/create-service-account.sh",
     "packaging/launchd/rotate-log.sh",
     "docs/RUNBOOKS/network-exposure.md",
+    "docs/GUIDES/rbn-node.md",
+    "docs/GUIDES/kiwisdr.md",
+    "docs/GUIDES/raspberry-pi.md",
+    "docs/RUNBOOKS/node-health.md",
+    "docs/RUNBOOKS/uplink-health.md",
+    "docs/RUNBOOKS/release.md",
+    "docs/RUNBOOKS/secondary-skimmer-field-node.md",
+    "docs/RUNBOOKS/m2-pi4-cpu-budget.md",
+    "docs/DECISIONS/2026-07-25-m2-kiwisdr-input-pins.md",
+    "docs/DECISIONS/2026-09-06-broad-review-decisions.md",
+    "docs/SPEC-decode-core.md",
+    "rust-toolchain.toml",
 )
 EXECUTABLE_KIT = {"packaging/launchd/create-service-account.sh", "packaging/launchd/rotate-log.sh"}
 FAKE_BINARY = b"\x7fELF fake manta\x00\x01\x02"
@@ -137,6 +149,21 @@ class ArchiveAssertions(unittest.TestCase):
             if os.name == "posix" and path.endswith(".tar.gz"):
                 for rel in (binary_name,) + tuple(EXECUTABLE_KIT):
                     self.assertTrue(os.access(os.path.join(tmp, artifact, *rel.split("/")), os.X_OK), rel)
+            # Operators can read the guides from the extracted release, including
+            # their linked config reference, service kit and operational runbooks.
+            top = os.path.join(tmp, artifact)
+            for rel in KIT:
+                if not rel.startswith("docs/GUIDES/"):
+                    continue
+                guide = os.path.join(top, *rel.split("/"))
+                with open(guide, encoding="utf-8") as f:
+                    links = re.findall(r"\]\(([^)\s]+)\)", f.read())
+                for link in links:
+                    if re.match(r"[a-z]+:", link) or link.startswith("#"):
+                        continue
+                    target = os.path.normpath(os.path.join(os.path.dirname(guide), link.split("#")[0]))
+                    self.assertTrue(target.startswith(top + os.sep), link)
+                    self.assertTrue(os.path.isfile(target), f"{rel}: {link} does not ship")
 
 
 class HelperArchiveTests(ArchiveAssertions):
