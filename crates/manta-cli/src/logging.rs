@@ -170,6 +170,19 @@ pub fn init(opts: &LogOpts) {
     tracing::debug!(target: "manta", filter = %shown, source, "log filter");
 }
 
+/// `main`'s fatal error under `--log-format json`: one ERROR record, written
+/// by a JSON subscriber of its own so that the level filter (`-qqq`,
+/// `--log-level off`, a target-only `RUST_LOG`) cannot drop it.
+pub fn fatal(message: &str) {
+    let sub = subscriber(
+        LogFormat::Json,
+        EnvFilter::new("error"),
+        false,
+        std::io::stderr,
+    );
+    tracing::subscriber::with_default(sub, || tracing::error!(target: "manta", "{message}"));
+}
+
 /// A `note: ...`-style stderr line: unchanged text, or an INFO record under
 /// `--log-format json`.
 pub fn note(line: &str) {

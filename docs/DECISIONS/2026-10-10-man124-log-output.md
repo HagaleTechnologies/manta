@@ -57,9 +57,11 @@ raw `ESC[..m` bytes. The only verbosity control was the undocumented
   `wpm` and `confidence`.
 - **D8. A fatal error under JSON.** `main` wraps `real_main`; an `Err` under
   JSON is one `ERROR` record (message trimmed of trailing newlines) and exit
-  status 1. Text mode keeps Rust's `Error: …` line, and so does JSON mode
-  when the level filter (`-qqq`, `--log-level off`, a target-only
-  `RUST_LOG`) would drop the record: a fatal error is never silent.
+  status 1. Text mode keeps Rust's `Error: …` line. Under JSON the record is
+  written by a JSON subscriber of its own (`logging::fatal`), so the level
+  filter (`-qqq`, `--log-level off`, a target-only `RUST_LOG`) cannot drop
+  it or turn it back into the plain `Error: …` line. A panic stays one of
+  the plain-text exceptions below.
 
 ## Reviewer questions, with the defaults built
 

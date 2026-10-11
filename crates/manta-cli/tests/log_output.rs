@@ -305,6 +305,7 @@ fn json_format_fatal_error_survives_a_filter_that_drops_it() {
     std::fs::write(&cfg, BAD_CONFIG).unwrap();
     for (args, envs) in [
         (&["--log-format", "json", "--log-level", "off"][..], &[][..]),
+        (&["--log-format", "json", "-qqq"][..], &[][..]),
         (
             &["--log-format", "json"][..],
             &[("RUST_LOG", "manta_server=debug")][..],
@@ -313,9 +314,16 @@ fn json_format_fatal_error_survives_a_filter_that_drops_it() {
         let out = daemon_with(dir.path(), &cfg, args, envs);
         let stderr = String::from_utf8(out.stderr.clone()).unwrap();
         assert_eq!(out.status.code(), Some(1), "{args:?} {envs:?}: {stderr}");
+        // Still JSON, not Rust's plain `Error: …` line.
+        let records = json_records(&stderr);
+        assert_eq!(records.len(), 1, "{args:?} {envs:?}: {stderr}");
+        assert_eq!(records[0]["level"], "ERROR", "{args:?} {envs:?}: {stderr}");
         assert!(
-            stderr.contains("unknown field `bogus_key`"),
-            "{args:?} {envs:?}: fatal error swallowed: {stderr:?}"
+            records[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown field `bogus_key`"),
+            "{args:?} {envs:?}: {stderr}"
         );
     }
 }

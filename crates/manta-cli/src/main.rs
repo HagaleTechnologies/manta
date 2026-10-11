@@ -3487,11 +3487,10 @@ fn main() -> Result<()> {
     let result = real_main();
     if let Err(e) = &result {
         // MAN-124: under --log-format json the error is a log record too,
-        // not Rust's plain `Error: …` line; exit status stays 1. When the
-        // level filter (`-qqq`, `--log-level off`, a target-only RUST_LOG)
-        // would drop that record, the plain line below still reports it.
-        if logging::is_json() && tracing::enabled!(target: "manta", tracing::Level::ERROR) {
-            tracing::error!(target: "manta", "{}", format!("{e:#}").trim_end());
+        // not Rust's plain `Error: …` line, whatever the level filter;
+        // exit status stays 1.
+        if logging::is_json() {
+            logging::fatal(format!("{e:#}").trim_end());
             std::process::exit(1);
         }
     }
