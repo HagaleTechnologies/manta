@@ -30,7 +30,17 @@ commands apply the `MANTA_*` variables. `decode`, `oracle` and
 `bench sensitivity` read only the file `--config` names and never the
 environment, so their output does not depend on it. `[[rbn_uplink]]` cannot be
 set from the environment. An unknown table, key or `MANTA_*` variable is an
-error that names it. A relative path set in the file resolves against the
+error that names it; `MANTA_GIT_SHA` and `MANTA_FEATURES` are build-time
+variables and are skipped at run time.
+
+A `MANTA_*` variable set to the empty string counts as unset: it does not
+override or clear the file's value. `MANTA_INPUT_PASSWORD=""` therefore keeps
+a password set in the file, even alongside a `MANTA_INPUT_HOST` that points at
+a different receiver; to drop a file password, remove it from the file.
+`MANTA_INPUT_TYPE` set to a type other than the file's `input.type` discards
+the file's whole `[input]` table, shared keys such as `freq_correction_ppm`,
+`center_freq_hz` and `capture_rate_hz` included, before the other
+`MANTA_INPUT_*` variables apply. A relative path set in the file resolves against the
 file's directory; one from a flag or a `MANTA_*` variable resolves against the
 working directory. [SPEC §9](SPEC-decode-core.md#9-configuration-keys) gives
 the full rules, including how variable values are typed.
@@ -153,7 +163,10 @@ nothing, and flags an example `login_callsign`.
 
 The receiver. `decode` never reads the source keys, and a command-line source
 flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`)
-replaces a typed `[input]` whole, its shared keys included.
+replaces a typed `[input]` whole, its shared keys included. So does a
+`MANTA_INPUT_TYPE` that differs from the file's `type` (see
+[Precedence](#precedence)): only the `MANTA_INPUT_*` variables then set
+`[input]`.
 
 | Key | Default | Wired | Notes |
 |---|---|---|---|
