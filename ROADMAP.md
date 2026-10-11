@@ -159,7 +159,10 @@ stream, and the stock DX-cluster client (`telnet`, N1MM) session against a
 running node. That last one is *not* discharged by the servers' automated
 acceptance suites: those drive scripted TCP clients, which exercise the
 wire format but say nothing about how a real contest logger behaves
-against it.
+against it. Since MAN-269 anyone can run that session without an SDR, by
+replaying `manta gen v1` output with `manta run --realtime` (see the
+README's [60-second demo](README.md#60-second-demo) section, whose replay
+keeps the server up for 120 seconds).
 
 **RBN admission** is pre-1.0 work, not deferred: the near-term path is a
 Skimmer-Server-compatible handshake so existing aggregators can accept a

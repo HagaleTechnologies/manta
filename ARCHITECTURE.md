@@ -171,6 +171,25 @@ audio spliced across the gap and no zero-fill (see
 was rejected). File replay is exempt: its errors and EOF must reach
 `listen()` unchanged for byte-identical replay.
 
+**Paced and looping replay (MAN-269).** File replay normally runs as fast
+as the machine decodes. `run --realtime` (`input.realtime`) wraps the file
+source in `manta_input::PacedSource`, which sleeps after each read until the
+recording's own clock (cumulative samples / `sample_rate()`, started at the
+first read) has caught up, so a 120 s file keeps the servers up for 120 s
+and a spot reaches the wire when it would have live. `run --loop`
+(`input.loop`) adds `manta_input::LoopingSource`, which reopens the file
+through the same `LiveSourceSpec::open` at each end and fails if a later
+pass changes sample rate or centre frequency; `--loop` implies `--realtime`.
+The loop sits inside the pacing, so one clock spans every pass, and the wrap
+reports no discontinuity (that would restart `listen()`'s calibration fill
+forever on a file shorter than 2 s). Both decide only when samples arrive,
+never which, so paced output is byte-identical to unpaced output. Both
+flags are refused for a live source, and `soak`/`doctor` ignore the keys.
+Separately, `WavIqSource::open` rejects an IQ WAV declaring 0 Hz or more
+than 10 MS/s (`MAX_IQ_WAV_RATE_HZ`) before reading samples, so a shape-valid
+but absurd header rate cannot reach the rate-sized allocations downstream.
+See `docs/DECISIONS/2026-10-10-man269-paced-looping-replay.md`.
+
 ## 4. Channelizer (`manta-dsp`)
 
 **Implemented** as of M2 sub-project 1 (`manta-dsp::channelizer`) -- the
