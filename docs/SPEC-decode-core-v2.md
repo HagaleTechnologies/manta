@@ -2,12 +2,13 @@
 
 Status: **implemented, stage-2 gate FAILED** (2026-09-09, MAN-166). §1
 (Evidence), §2 (noise reference), §4-6 (HSMM decoder + determinism), §7
-(config), §8.2-8.3 (golden vectors + oracle) are implemented; §3 (narrowband
-refiner) is implemented as a standalone module with its `manta-engine` call
-site deferred to MAN-168; §2.2's spectral-CFAR reference term
-(`FloorBank::spectral_reference_db`) has no production caller yet, also
-pending the MAN-168 call site (see §2.3's note below). The stage-2 gate
-(§8.4) was measured and **failed** —
+(config), §8.2-8.3 (golden vectors + oracle) are implemented. §3 (narrowband
+refiner) and §2.2's spectral-CFAR reference term
+(`FloorBank::spectral_reference_db`) are wired into `manta-engine`'s
+`TrackManager` since MAN-168/MAN-194 (see §2.3's update and §3's note
+below); when this spec was first written both were deferred, and the
+stage-2 gate (§8.4) was measured before either was wired. That gate
+**failed** —
 `docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md` has the full
 result; `decode.engine` stays default `legacy`. Companion to
 `docs/superpowers/specs/2026-09-09-decode-core-real-hf-design.md` (the
@@ -182,12 +183,17 @@ track with fractional centroid `c_f` (v1 §1.4) and nearest channel
 Recommended `refine_bw_hz = 30` (10–90 % step rise ≈ 16 ms, measured by
 direct step-response simulation of the shipped 11-tap filter at
 `fo = 375 Hz`; at 45 WPM a dit is ≈ 27 ms, so this fills roughly half a
-dit -- MAN-168 should re-derive this budget against the real
-implementation before wiring the engine call site). The channel
-selection `c` follows the centroid; a change
+dit). The channel selection `c` follows the centroid; a change
 of `c` resets the FIR history (one lost hop of evidence, `llr = 0`).
-The call site is `manta-engine`'s per-hop track feed (one line); this
-section specifies the module, not the engine change.
+This section specifies the module, not the engine change.
+
+**Update (2026-10-11, MAN-149):** the call site is live. Since
+MAN-168/MAN-194, `manta-engine`'s `TrackManager` (`track.rs`) feeds each
+track through a per-track `Refiner` whenever `refine_bw_hz > 0`, under every
+engine except `oracle`. Historical note: when this section was written the
+call site was deferred to MAN-168, and the text asked MAN-168 to re-derive
+the 16 ms rise-time budget against the real implementation before wiring
+it.
 
 ---
 
