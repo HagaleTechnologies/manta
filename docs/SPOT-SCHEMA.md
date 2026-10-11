@@ -40,11 +40,12 @@ The behaviour above is implemented in
 ## Example
 
 This line was captured from `manta run --config` replaying the output of
-`manta gen v1`, with `replay_epoch = 1700000000` and `station_callsign` set to
-`W1AW`:
+`manta gen v1`, with `replay_epoch = 1700000000`, `station_callsign` set to
+`W1AW` and no station location configured, so `deGrid`/`deLat`/`deLon` are
+`null`:
 
 ```json
-{"id":"W1AW:12534119743695398054:1:2006272:W1AW","source":"skimmer","timestamp":1700000020,"ingestedAt":1700000020,"frequency":14012362,"band":"20m","mode":"CW","dxCall":"W1AW","dxGrid":null,"dxLat":37.6,"dxLon":-91.87,"dxDxcc":291,"dxContinent":"NA","dxCqZone":5,"deCall":"W1AW","deGrid":null,"deLat":37.6,"deLon":-91.87,"deDxcc":291,"deContinent":"NA","snr":21,"snrRefHz":2500,"wpm":20,"decodeConfidence":0.5541629,"decoderVersion":"manta-0.1.0+d3bfa7c0c47a","channelizerResolutionHz":null}
+{"id":"W1AW:12534119743695398054:1:2006272:W1AW","source":"skimmer","timestamp":1700000020,"ingestedAt":1700000020,"frequency":14012362,"band":"20m","mode":"CW","dxCall":"W1AW","dxGrid":null,"dxLat":37.6,"dxLon":-91.87,"dxDxcc":291,"dxContinent":"NA","dxCqZone":5,"deCall":"W1AW","deGrid":null,"deLat":null,"deLon":null,"deDxcc":291,"deContinent":"NA","snr":21,"snrRefHz":2500,"wpm":20,"decodeConfidence":0.5541629,"decoderVersion":"manta-0.1.0+d3bfa7c0c47a","channelizerResolutionHz":null}
 ```
 
 ## Fields
@@ -57,7 +58,9 @@ cannot be `null`, "always" means manta sends `null` on every spot today, and
 The `dx*` fields describe the station heard. The `de*` fields describe the
 reporting station, `[server].station_callsign`. Geography comes from the
 vendored `cty.dat` (or the file given by `--cty` or `[spot].cty_path`) and
-the vendored ADIF entity table `dxcc.tsv`.
+the vendored ADIF entity table `dxcc.tsv`, except the reporting station's
+position: `deGrid`/`deLat`/`deLon` come only from the `[server]` location
+keys (MAN-138), never `cty.dat`.
 
 | Field | JSON type | Null? | Meaning |
 |---|---|---|---|
@@ -75,10 +78,10 @@ the vendored ADIF entity table `dxcc.tsv`.
 | `dxDxcc` | integer | never | ADIF DXCC entity number, for example `291` for the United States. `-1` (`UNKNOWN_DXCC`) when the call does not resolve. `0` (ADIF "not in any DXCC entity") when the call carries `/MM` or `/AM` after its first segment (MAN-136). |
 | `dxContinent` | string | never | Two-letter continent code from `cty.dat`: `AF`, `AN`, `AS`, `EU`, `NA`, `OC` or `SA`. Empty string `""` (`UNKNOWN_CONTINENT`) when the call does not resolve or carries `/MM` or `/AM`. |
 | `dxCqZone` | integer | never | CQ zone, 1 to 40. `0` (`UNKNOWN_CQ_ZONE`) when the call does not resolve or carries `/MM` or `/AM`. |
-| `deCall` | string | never | `[server].station_callsign`, uppercased, including any RBN `-N` SSID (MAN-89). The SSID is stripped before the geography lookup for the `de*` fields below. |
-| `deGrid` | null | always | Maidenhead locator of the reporting station. Reserved by the contract; manta does not fill it. |
-| `deLat` | number or null | when unresolved | As `dxLat`, for the reporting station's callsign. |
-| `deLon` | number or null | when unresolved | As `dxLon`, for the reporting station's callsign. |
+| `deCall` | string | never | `[server].station_callsign`, uppercased, including any RBN `-N` SSID (MAN-89). The SSID is stripped before the geography lookup for `deDxcc` and `deContinent`. |
+| `deGrid` | string or null | when unconfigured | Maidenhead locator of the reporting station: `[server].operator_grid`, or the 6-character square containing `operator_lat`/`operator_lon` when only those are set. Field and square uppercase, subsquare lowercase (`FN31pr`). `null` when none of the three keys is set (MAN-138). |
+| `deLat` | number or null | when unconfigured | Latitude in degrees, north positive, of the reporting station: `[server].operator_lat`, or the centre of `operator_grid`'s square when only the grid is set. Never a `cty.dat` centroid. `null` when no location key is set (MAN-138). |
+| `deLon` | number or null | when unconfigured | Longitude in degrees, east positive: `[server].operator_lon`, or the centre of `operator_grid`'s square. `null` in the same cases as `deLat`. |
 | `deDxcc` | integer | never | As `dxDxcc`, for the reporting station's callsign: `-1` when it does not resolve, `0` for `/MM` or `/AM`. |
 | `deContinent` | string | never | As `dxContinent`, for the reporting station's callsign. |
 | `snr` | integer | not today | Signal-to-noise ratio in dB, rounded, referenced to a 2500 Hz noise bandwidth (see `snrRefHz`). Telnet and the RBN uplink quote the same spot in 500 Hz, about 7 dB higher (MAN-102, decision D3). |
@@ -130,3 +133,5 @@ That format is not stable and is not described here.
   `/AM` rule.
 - [DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md](DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md)
   (MAN-83): the `decoderVersion` format and the decoder-output rule.
+- [DECISIONS/2026-10-11-man138-station-location.md](DECISIONS/2026-10-11-man138-station-location.md)
+  (MAN-138): `deGrid`/`deLat`/`deLon` from the configured station location.

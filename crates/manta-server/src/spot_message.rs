@@ -853,7 +853,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
     #[test]
     fn every_wire_field_is_documented() {
         let cty = cty::Table::parse(CTY_FIXTURE);
-        let msg = SpotMessage::from_spot(&sample_spot(), "W1AW", &cty, "v", 0, 1);
+        let msg = SpotMessage::from_spot(&sample_spot(), "W1AW", None, &cty, "v", 0, 1);
         let json = serde_json::to_value(&msg).unwrap();
         let keys: Vec<&String> = json.as_object().expect("an object").keys().collect();
 
