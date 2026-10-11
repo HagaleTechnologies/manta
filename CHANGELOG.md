@@ -31,16 +31,36 @@ git history and `docs/DECISIONS/`.
 
 ### Added
 
+- `manta doctor` checks the whole setup before its signal check: the config
+  (`manta run`'s example-callsign and dial-frequency refusals), the audio
+  library and sound-card inputs, that each `[server]` port is free, the
+  clock against an NTP server (and, on Linux, the kernel's NTP sync), and
+  that each enabled `[[rbn_uplink]]` target accepts a connection. Each
+  check prints `PASS`, `WARN`, `FAIL` or `SKIP`, every problem with a
+  `fix:` line, followed by a summary naming each failed and warned check
+  (MAN-126). See `docs/RUNBOOKS/setup-checks.md`.
+- `manta doctor --ntp-server HOST[:PORT]` names the clock check's server
+  (default `pool.ntp.org`).
+- `manta doctor --json` adds `checks` and `checks_status`; every existing
+  key is unchanged.
+- `manta doctor` exits 1 when any check fails. Scripts may now see exit 1
+  for a held port, an unreachable uplink, a clock 60 s or more off, the
+  example callsign, or a missing dial frequency with `[server]`. The signal
+  verdict still does not change the exit code.
 - Operator guides for [running an RBN node](docs/GUIDES/rbn-node.md),
   [KiwiSDR etiquette](docs/GUIDES/kiwisdr.md), and
   [Raspberry Pi installation and service setup](docs/GUIDES/raspberry-pi.md) (MAN-148).
-
 - `manta run` takes `-v`/`-vv` and `-q`/`-qq`/`-qqq` and
   `--log-level <LEVEL>`, each shorthand for `RUST_LOG=<level>` that
   overrides it, and `--log-format json`, which writes every stderr log line
   as one JSON object for a log aggregator (MAN-124).
 - Contributor setup and review guidance, bug and hardware report templates,
   feature requests, and a MAN-linked pull request template (MAN-151).
+- `manta decode --center-freq-hz HZ` sets the recording's RF centre
+  frequency, overriding its `<name>.json` sidecar. Without the flag, a
+  recording with no sidecar (or a sidecar whose `center_freq_hz` is not
+  positive) gets a warning that its frequencies are baseband offsets,
+  and is decoded at a 0.0 centre (MAN-131).
 
 ### Fixed
 
@@ -51,15 +71,29 @@ git history and `docs/DECISIONS/`.
   sound card's capture buffer is momentarily empty, instead of stopping
   with exit 0 or `audio source ended during startup calibration`. A device
   that delivers nothing for 5 s is reported as an error (MAN-231).
+- Audio device errors name the device and the 48000 Hz requirement and
+  say what to check next, with a macOS microphone-permission hint, and a
+  device delivering only digital silence gets a warning (MAN-131).
+  Decoder output is unchanged.
 
 ### Changed
 
+<<<<<<< HEAD
 - `sh/dx` history now retains every spot heard in the last
   `[server].history_minutes` minutes (default 30; at least the 50 newest,
   at most 10,000). `manta_spots_history_truncated_total` counts spots the
   ceiling drops early (MAN-93). Bare `sh/dx` still shows the last 10;
   loggers can request `sh/dx 30m`.
 
+=======
+- `manta doctor` no longer prints `note: doctor does not start the spot
+  servers; ignoring [server]`: it checks `[server]`'s ports instead, still
+  starting no server.
+- A receiver that `manta doctor` cannot open is a named `FAIL  receiver:`
+  line with a fix rather than an `Error:` chain (still exit 1). With
+  `--json`, doctor then prints an object holding only `checks` and
+  `checks_status` instead of nothing.
+>>>>>>> 5346c333efd8eb6c9704b2218523f539e3c68b1a
 - JSON spots' `deGrid`/`deLat`/`deLon` are the operator's configured
   station position (`[server].operator_grid`, or the new `operator_lat`/
   `operator_lon`), and `null` when none is configured, instead of the

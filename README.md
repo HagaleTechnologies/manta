@@ -147,6 +147,11 @@ manta decode /tmp/v1/v1.wav
 # CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K CQ …
 ```
 
+`decode` reads the recording's RF centre frequency from the `<name>.json`
+sidecar next to it (`gen` writes `v1.json`). Without one it warns that
+reported frequencies are baseband offsets; `--center-freq-hz 14000000`
+supplies or overrides the centre.
+
 Then point it at a real signal — a public KiwiSDR needs no hardware of
 your own. `<your-kiwi-host>` is a placeholder: pick a receiver that covers
 the band you want from the public KiwiSDR directory at
@@ -217,6 +222,17 @@ and the problem when something is wrong:
 ```sh
 manta config init                         # writes ./manta.toml; never replaces one
 manta config check --config manta.toml
+```
+
+Then `manta doctor` checks the machine itself: the audio library, that the
+server ports are free, the clock against an NTP server, that each enabled
+RBN uplink target accepts a connection, and that the receiver opens and
+hears something. Each check prints `PASS`, `WARN`, `FAIL` or `SKIP` with a
+fix for every problem, and it exits 1 when a check fails. See
+[docs/RUNBOOKS/setup-checks.md](docs/RUNBOOKS/setup-checks.md).
+
+```sh
+manta doctor --config manta.toml
 ```
 
 Start the server in one terminal. It runs in the foreground until you stop it:
@@ -413,6 +429,15 @@ go to stderr; `--json` emits one report on stdout. A sampling deadline exits 1
 and retains any measurements. The deadline is duration plus five seconds after
 opening, checked between reads. Native open/read calls can exceed it, so
 `--duration` is not a hard wall-clock timeout. No reconnect loop runs.
+
+Audio input errors name the input (as `manta devices` spells it) and the
+48000 Hz requirement, and say what to check next. A sound card that delivers
+no samples for 5 seconds is an error; one that delivers only exact zeros for
+2 seconds gets a `warning: ... is delivering digital silence` line. On macOS
+either usually means the microphone permission is denied: allow the app
+running manta in System Settings > Privacy & Security > Microphone, quit and
+reopen that app, then confirm with `manta check`. See
+[MAN-131](docs/DECISIONS/2026-10-11-man131-actionable-errors.md).
 
 Targets Linux (x86-64 and ARM, Raspberry Pi 4 class), macOS, and Windows.
 The CPU budget is a full 192 kS/s passband inside one Raspberry Pi 4 core,
