@@ -277,9 +277,13 @@ A candidate held back by this gate is retried the moment `TrackMeta` arrives
 transmission may never produce again).
 
 1. **CQ/DE context parse**: regex-level scan for `CQ <call>`, `CQ TEST <call>`,
+   contest framing `CQ <contest> <call>` (an enumerated filler set, e.g.
+   `CQ WPX`) and a bare `TEST <call>` (MAN-104; a bare `TEST` between two
+   different callsigns, or after a sign-off such as `TU`, is ambiguous and
+   yields no candidate),
    `DE <call>`, `<call> UP`, beacon patterns (`V V V <call>`, and `<call> T`
    for NCDXF-style power-step beacons the decoder can't resolve past a
-   single trailing dash, MAN-37 — suppressed whenever a bare `CQ`/`DE`
+   single trailing dash, MAN-37 — suppressed whenever a bare `CQ`/`TEST`/`DE`
    token appears anywhere in the window at all (the token must be a
    complete decoded word, not a substring glued to punctuation inside
    one), a deliberately coarse guard against mistagging an ordinary,
@@ -289,8 +293,13 @@ transmission may never produce again).
    not a loss and is not counted). Context
    determines spot type (CQ / DE / BEACON) — RBN spots carry this flag.
 2. **Callsign plausibility**: structural grammar (prefix-digit-suffix, portable
-   designators `/P /QRP /3`), then prefix lookup against **cty.dat** (bundled,
-   refreshable) — a call with an unallocated prefix is rejected. `cty.dat` is
+   designators `/P /QRP /3`), which also rejects, by exact match, a fixed
+   list of non-callsign CW conventions (`5NN`, `599`, `TEST`, `TU`, `QRZ`,
+   `AGN`, `K`, `KN`, …; MAN-105), regardless of cty.dat, then prefix
+   lookup against **cty.dat**.
+   A call with an unallocated prefix is rejected. Operators can replace the
+   bundled table with `--cty` / `[spot] cty_path`. Live commands warn when
+   the built-in copy is more than 180 days old (MAN-79). `cty.dat` is
    also joined, on that same primary-prefix field, against a small vendored
    ADIF DXCC entity-number table (`data/dxcc.tsv`, MAN-136) — refreshed
    together, see `crates/manta-spot/data/SOURCES.md` — which is what lets
@@ -298,6 +307,7 @@ transmission may never produce again).
 3. **SCP cross-check** (optional, default on if file present): membership in
    `master.scp` (contest super-check-partial list) *raises* confidence; absence
    only lowers it (new/rare calls must still spot, not just well-known ones).
+   `--scp` / `[spot] scp_path` supplies a replacement known-callsign list.
 4. **Repetition requirement**: a callsign must decode ≥ 2 times within 90 s
    before first spot (CW ops repeat their calls; single decodes are
    overwhelmingly garble). **Deviates from "the same track" (MAN-166,
@@ -404,7 +414,16 @@ validation (MAN-28). Dedupe (step 5) still applies.
   operators running manta behind W3OA's Aggregator, which expects CW
   Skimmer's own layout rather than the RBN relay's.
   Read-mostly protocol; enough command grammar (`sh/dx`, filters, `SKIMMER/
-  SETT`, `BYE`) for common clients — and RBN's own Aggregator — not to choke.
+  SETT`, `BYE`, `sh/version`) for common clients — and RBN's own Aggregator —
+  not to choke. An unrecognised or malformed command gets a fixed
+  `Unknown command` reply, and `sh/version` gets `manta <version>`.
+  Valid `sh/dx` queries with no results send no reply (no error, header or
+  trailer).
+  `sh/dx` follows Aggregator's documented forms: `sh/dx N` is a count and
+  `sh/dx Nm` a minutes window, never a band. Either can take a ` CW`/` RTTY`
+  suffix, and the manta extension `BAND <band>` selects a band. Every query
+  reaches back at most the fifty retained spots. See
+  `docs/DECISIONS/2026-10-10-man92-telnet-commands.md`.
   `SKIMMER/SETT` replies with validation level and the live decodable
   passband (`SETT: vlNormal 14000.0-14070.0`); Aggregator will not forward
   spots from a source that never answers it (Aggregator manual v6.0 §9.2).
@@ -427,10 +446,18 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `dxCqZone` (and their `de*` counterparts) carry named, out-of-domain
   `UNKNOWN_*` sentinels rather than `null` or a fabricated-looking value —
   see `docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md`.
+  `deGrid`/`deLat`/`deLon` are the operator's configured station position
+  (`[server].operator_grid`/`operator_lat`/`operator_lon`), `null` when none
+  is configured, never a `cty.dat` centroid (MAN-138; see
+  `docs/DECISIONS/2026-10-11-man138-station-location.md`).
   Its `snr` field keeps the native 2500 Hz measurement (no 500 Hz conversion)
   alongside an explicit `snrRefHz` field naming that bandwidth, so a consumer
   of either surface never has to guess which convention it's reading
-  (MAN-102 / decision D3).
+  (MAN-102 / decision D3). Every spot's `decoderVersion` is
+  `manta-<version>+<commit>` (MAN-83): the commit is SemVer build metadata
+  naming the exact binary, and the part before `+` is the release the
+  decoder-output rule in `CHANGELOG.md` governs. See
+  `docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md`.
 - Both servers are thin fan-out consumers of one broadcast channel; slow clients
   are disconnected, never back-pressure the pipeline. At shutdown each
   client's queued backlog is drained on a best-effort basis bounded by a
@@ -478,28 +505,49 @@ validation (MAN-28). Dedupe (step 5) still applies.
   bind address; ports),
   `[[rbn_uplink]]`, `[input]` (source type and its keys, dial frequency,
   capture rate, ppm correction), `[spot]` (watch list, blocklist and notch
-  files), `[detector]` (thresholds, timers, track cap) and `[decode]` —
-  read by `run`, `soak` and `doctor` (`--config`, else `MANTA_CONFIG`) and
-  by `decode`/`oracle`. Precedence is flag, then `MANTA_<TABLE>_<KEY>`
-  environment variable, then file, then default; `decode` and `oracle`
-  never read the environment. Unknown tables, keys and `MANTA_*` variables
-  are errors. `docs/SPEC-decode-core.md` §9 is the key table. Not yet
-  configurable: a band plan (CW segment limits), cty/scp paths, and the
+  files, and `cty.dat`/`master.scp` overrides), `[detector]` (thresholds, timers, track cap) and `[decode]` —
+  read by `run`, `soak`, `doctor` and `check` (`--config`, else
+  `MANTA_CONFIG`) and by `decode`/`oracle`, and by `bench sensitivity`
+  (which reads only `[decode]`/`[detector]`, never the environment).
+  Precedence is flag, then `MANTA_<TABLE>_<KEY>` environment variable, then
+  file, then default; `decode` and `oracle` never read the environment.
+  Unknown tables, keys and `MANTA_*` variables
+  are errors. `docs/CONFIG.md` is the per-key reference (default, and
+  which commands and engines each key affects); `docs/SPEC-decode-core.md`
+  §9 stays normative for the decode-core defaults. Not yet
+  configurable: a band plan (CW segment limits) and the
   compile-time constants SPEC §9 marks `not configurable yet`.
   `manta config check` runs `run`'s config pipeline up to its first source
   I/O (load, environment overlay, source resolution, blocklist/notch
-  reads), then prints a per-table summary of the resolved settings without
+  and cty/scp reads), then prints a per-table summary of the resolved settings without
   opening the receiver or binding a port; `manta config init` writes a
   scaffold with every key commented out at its default, pinned to the code
   defaults and the loader's key list by tests (MAN-76,
   `docs/DECISIONS/2026-10-07-man76-config-check-init.md`).
+  With `[server]`, SIGHUP re-runs that same pipeline and swaps the `[spot]`
+  lists into the live validator and `dry_run` into each uplink task; other
+  keys need a restart, and an invalid reload is logged and changes nothing
+  (MAN-78, `docs/DECISIONS/2026-10-10-man78-live-reload.md`).
+- **Source diagnostics (MAN-125)**: `manta devices` enumerates audio inputs
+  and, when compiled, SoapySDR selectors without opening capture streams.
+  `manta check [SOURCE]` shares typed config/source resolution and source wrappers
+  with `run`, then calls `manta_engine::check::check_source`. It drives only
+  `Channelizer` and `FloorBank`, with no detector, decoder, validator or services.
+  Input power uses real delivered IQ; noise floor summarizes raw channel
+  quartiles inside the source passband, clipped to delivered Nyquist. The
+  effective neighborhood floor used by decoding is unchanged. See
+  `docs/DECISIONS/2026-10-10-man125-source-diagnostics.md` for units, stop reasons
+  and the cooperative deadline's blocking-call limitation.
 - **`tracing` + `tracing-subscriber` with `EnvFilter`, implemented for
   `manta-server`'s three listeners (telnet, JSON/WS, metrics)** — landed
   2026-09-03 (MAN-59, `docs/DECISIONS/2026-09-03-man59-connection-audit-logging.md`):
   connect/login/disconnect events, per-IP quota and rate-limit rejections,
   `bounded_io` read rejections, malformed-WS-frame disconnects, and
-  rejected metrics-endpoint requests are all logged (plain `fmt` output,
-  `RUST_LOG`-controlled, default `info`) to give an operator a durable
+  rejected metrics-endpoint requests are all logged (text, coloured only
+  when stderr is a terminal, or JSON Lines with `--log-format json`; level
+  from `-v`/`-q`/`--log-level`, else `RUST_LOG`, default `info`; installed
+  by `manta-cli/src/logging.rs` at the top of `run`, MAN-124,
+  `docs/DECISIONS/2026-10-10-man124-log-output.md`) to give an operator a durable
   record to reconstruct an abuse incident after the fact. **The daemon
   also logs its own liveness** — landed 2026-09-07 (MAN-122,
   `docs/DECISIONS/2026-09-07-man122-operator-liveness-logging.md`): one
@@ -541,7 +589,8 @@ validation (MAN-28). Dedupe (step 5) still applies.
   Unlike `/healthz`, which deliberately ignores the uplink (MAN-128 D10),
   `/status` is about the uplink. Inherits `/metrics`'s unauthenticated,
   `0.0.0.0`-by-default exposure posture
-  (`docs/RUNBOOKS/network-exposure.md`). Prometheus text
+  (`docs/RUNBOOKS/network-exposure.md`). `docs/METRICS.md` lists every
+  rendered family with its type, labels and when it has samples. Prometheus text
   endpoint (compiled in unconditionally, no feature flag — the "(feature
   `metrics`)" phrasing in older revisions of this doc was stale, no Cargo
   `metrics` feature has ever existed; the endpoint is served whenever
@@ -720,6 +769,11 @@ truth with realistic HF impairment already exists.**
   WPM/SNR envelope; criterion benches gate the CPU budget (§4).
 - End-to-end: daemon run from an IQ file must produce byte-identical spot logs
   across platforms (determinism requirement; no wall-clock in the decode path).
+- Sensitivity curve: `manta bench sensitivity` sweeps condition × WPM × SNR
+  over `manta_testkit::sensitivity` recordings (ten looped CQ stations per
+  recording, AWGN or Watterson good/poor) and reports recall/CER vs SNR in
+  500 Hz; same build and flags, same bytes
+  (`docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md`).
 
 ## 10. Concurrency model
 

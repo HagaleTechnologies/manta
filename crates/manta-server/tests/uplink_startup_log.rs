@@ -95,6 +95,8 @@ async fn startup_log_warns_when_the_operator_has_opted_into_transmitting() {
     let out = logs_from_serve(&format!("{NO_DRY_RUN_KEY}dry_run = false\n")).await;
     assert!(out.contains("WARN"), "live transmit must warn: {out}");
     assert!(out.contains("transmitting real spots"), "{out}");
+    // MAN-91: the line names which spot types this target is sent.
+    assert!(out.contains("spot_types=cq_beacon"), "{out}");
 }
 
 #[tokio::test]

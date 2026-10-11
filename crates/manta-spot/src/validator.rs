@@ -14,6 +14,7 @@ use crate::support::SupportLedger;
 use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_decode::tree::{Glyph, Prosign};
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 /// How many recently-completed words a track remembers for context
 /// parsing. Calls/context keywords always appear within a handful of
@@ -299,8 +300,8 @@ pub struct SuppressionCounts {
 }
 
 pub struct Validator {
-    cty: cty::Table,
-    scp: Option<scp::Set>,
+    cty: Arc<cty::Table>,
+    scp: Option<Arc<scp::Set>>,
     tracks: BTreeMap<u32, TrackState>,
     gate: RepetitionGate,
     dedupe: Dedupe,
@@ -384,10 +385,20 @@ pub struct Validator {
 const SWEEP_INTERVAL_SECONDS: f64 = 10.0;
 
 impl Validator {
+    /// Parses the supplied country and known-callsign tables.
     pub fn new(fs: f64, cty_dat: &str, master_scp: Option<&str>) -> Self {
+        Self::from_tables(
+            fs,
+            Arc::new(cty::Table::parse(cty_dat)),
+            master_scp.map(|s| Arc::new(scp::Set::parse(s))),
+        )
+    }
+
+    /// Shares already parsed tables with other consumers, such as JSON geography lookup.
+    pub fn from_tables(fs: f64, cty: Arc<cty::Table>, scp: Option<Arc<scp::Set>>) -> Self {
         Self {
-            cty: cty::Table::parse(cty_dat),
-            scp: master_scp.map(scp::Set::parse),
+            cty,
+            scp,
             tracks: BTreeMap::new(),
             gate: RepetitionGate::new(fs),
             dedupe: Dedupe::new(fs),
@@ -492,6 +503,22 @@ impl Validator {
     pub fn with_notch(mut self, notch: NotchList) -> Self {
         self.notch = notch;
         self
+    }
+
+    /// MAN-78: replaces the operator's three lists as one unit, for a live
+    /// config reload. Tracks, dedupe, the repetition gate, the ledger and
+    /// `suppression_counts` are untouched; a word already attempted under the
+    /// old lists is not re-evaluated, so the new lists apply from the next
+    /// decoder event.
+    pub fn replace_operator_lists(
+        &mut self,
+        allowlist: &[String],
+        blocklist: Blocklist,
+        notch: NotchList,
+    ) {
+        self.allowlist = allowlist.iter().map(|c| c.to_ascii_uppercase()).collect();
+        self.blocklist = blocklist;
+        self.notch = notch;
     }
 
     /// Per-reason counts of operator-suppressed spots so far (MAN-31,
@@ -1389,6 +1416,22 @@ impl Validator {
     /// fixed ~20-22 WPM, well under `MAX_PLAUSIBLE_WPM`. A single WPM
     /// value covers every pending candidate on this track -- it's a
     /// track-level property, not a per-candidate one.
+    /// MAN-78: the lists can be replaced between a beacon's capture and its
+    /// track's close. Counts and reports a pending beacon the current lists
+    /// suppress; a no-op when they were not replaced, since capture already
+    /// passed the same checks.
+    fn operator_suppressed(&mut self, pb: &PendingBeacon) -> bool {
+        if self.blocklist.contains(&pb.candidate) {
+            self.suppression_counts.blocklist += 1;
+            return true;
+        }
+        if self.notch.contains(pb.freq_hz) {
+            self.suppression_counts.notch += 1;
+            return true;
+        }
+        false
+    }
+
     fn resolve_pending_beacons(&mut self, track_id: u32) -> Vec<Spot> {
         let (wpm, wpm_confirmed, pending) = {
             let Some(track) = self.tracks.get_mut(&track_id) else {
@@ -1404,12 +1447,26 @@ impl Validator {
         // a genuine slow speed -- refuse to resolve rather than let a
         // never-measured survivor pass the plausibility check on a
         // placeholder value (round 10).
-        if pending.is_empty() || !wpm_confirmed || wpm > MAX_PLAUSIBLE_WPM {
+        if pending.is_empty() {
+            return Vec::new();
+        }
+        if !wpm_confirmed || wpm > MAX_PLAUSIBLE_WPM {
+            // Operator suppression takes precedence over the automatic
+            // speed rejection (`blocklisted_beacon_above_max_wpm_still_counts_as_suppressed`),
+            // so lists reloaded since capture are still counted here (MAN-78).
+            for pb in &pending {
+                self.operator_suppressed(pb);
+            }
             return Vec::new();
         }
         pending
             .into_iter()
             .filter_map(|pb| {
+                // Before `gate.record`, so a suppressed beacon never feeds
+                // the repetition gate.
+                if self.operator_suppressed(&pb) {
+                    return None;
+                }
                 // pb.origin_track_id, not the resolving `track_id`
                 // (Codex review, PR #152, round 14): a migrated
                 // PendingBeacon must keep the identity that ACTUALLY
@@ -1477,6 +1534,44 @@ impl Validator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const QQ9_ENTITY: &str =
+        "Test DXpedition:  14:  27:  EU:  50.0:  -5.0:  0.0:  QQ9:\n    QQ9;\n";
+
+    #[test]
+    fn from_tables_spots_a_call_only_the_supplied_table_allocates() {
+        let words = ["DE", "QQ9ZZZ", "K"];
+        let spots_with = |cty: &str| {
+            let mut v = Validator::from_tables(FS, Arc::new(cty::Table::parse(cty)), None);
+            seed_meta(&mut v, 1);
+            let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+            spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+            spots
+        };
+        assert!(
+            spots_with(CTY_FIXTURE).is_empty(),
+            "QQ9 is unallocated in the fixture"
+        );
+        let spots = spots_with(&format!("{CTY_FIXTURE}{QQ9_ENTITY}"));
+        assert_eq!(spots.len(), 1);
+        assert_eq!(spots[0].callsign, "QQ9ZZZ");
+    }
+
+    #[test]
+    fn from_tables_applies_the_supplied_scp_set() {
+        // `apply_scp_boost` (validator.rs:1173-1175) still sees an Arc'd set:
+        // the same QQ9ZZZ spot scores higher when the supplied SCP lists it.
+        let cty = Arc::new(cty::Table::parse(&format!("{CTY_FIXTURE}{QQ9_ENTITY}")));
+        let confidence_with = |scp: &str| {
+            let mut v =
+                Validator::from_tables(FS, cty.clone(), Some(Arc::new(scp::Set::parse(scp))));
+            seed_meta(&mut v, 1);
+            let words = ["DE", "QQ9ZZZ", "K"];
+            let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+            spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+            spots[0].confidence
+        };
+        assert!(confidence_with("QQ9ZZZ\n") > confidence_with("K1ABC\n"));
+    }
 
     const FS: f64 = 96_000.0;
     const CTY_FIXTURE: &str = "\
@@ -1637,6 +1732,161 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
         assert_eq!(spots[0].callsign, "K5ARH");
         assert_eq!(spots[0].spot_type, SpotType::Beacon);
+    }
+
+    /// MAN-78: a K5ARH transmission, then a reload that blocklists
+    /// K5ARH, then the same transmission again -- the second one would
+    /// spot (see `full_pipeline_spots_a_repeated_valid_callsign`) and must
+    /// not.
+    #[test]
+    fn replaced_blocklist_suppresses_the_next_occurrence() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        v.replace_operator_lists(&[], Blocklist::parse("K5ARH\n"), NotchList::default());
+        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().blocklist, 1);
+    }
+
+    #[test]
+    fn replaced_empty_blocklist_lets_later_words_spot() {
+        let mut v =
+            Validator::new(FS, CTY_FIXTURE, None).with_blocklist(Blocklist::parse("K5ARH\n"));
+        seed_meta(&mut v, 1);
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().blocklist, 1);
+        v.replace_operator_lists(&[], Blocklist::default(), NotchList::default());
+        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+        spots.extend(run(&transmission_events(1, &words, 200_000), &mut v));
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].callsign, "K5ARH");
+    }
+
+    #[test]
+    fn replaced_allowlist_is_uppercased_and_replaces_the_old_list() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        v.allowlist("k5arh");
+        v.replace_operator_lists(
+            &["w1aw".to_string()],
+            Blocklist::default(),
+            NotchList::default(),
+        );
+        seed_meta(&mut v, 1);
+        seed_meta(&mut v, 2);
+        let spots = run(&transmission_events(1, &["W1AW"], 0), &mut v);
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].callsign, "W1AW");
+        let spots = run(&transmission_events(2, &["K5ARH"], 0), &mut v);
+        assert!(
+            spots.is_empty(),
+            "the old allowlist must be gone, got {spots:?}"
+        );
+    }
+
+    /// A beacon captured before a reload, resolved at `TrackClosed` after
+    /// it: the new blocklist must still apply (control:
+    /// `only_the_true_final_wpm_at_track_close_decides` spots it).
+    #[test]
+    fn pending_beacon_captured_before_a_blocklist_reload_never_spots() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        v.replace_operator_lists(&[], Blocklist::parse("K5ARH\n"), NotchList::default());
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().blocklist, 1);
+    }
+
+    /// Codex review on PR #232: a beacon blocklisted by a reload and then
+    /// closed above `MAX_PLAUSIBLE_WPM` still counts as operator
+    /// suppression, matching `blocklisted_beacon_above_max_wpm_still_counts_as_suppressed`.
+    #[test]
+    fn pending_beacon_blocklisted_by_a_reload_then_too_fast_counts_as_suppressed() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        v.replace_operator_lists(&[], Blocklist::parse("K5ARH\n"), NotchList::default());
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 60.0,
+        });
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().blocklist, 1);
+    }
+
+    #[test]
+    fn pending_beacon_without_a_reload_still_spots() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].spot_type, SpotType::Beacon);
+    }
+
+    #[test]
+    fn pending_beacon_in_a_newly_notched_range_never_spots() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        v.replace_operator_lists(
+            &[],
+            Blocklist::default(),
+            NotchList::parse("13999900-14000100\n"),
+        );
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().notch, 1);
+    }
+
+    #[test]
+    fn replacing_lists_keeps_suppression_counts() {
+        let mut v =
+            Validator::new(FS, CTY_FIXTURE, None).with_blocklist(Blocklist::parse("K5ARH\n"));
+        seed_meta(&mut v, 1);
+        let spots = run(&transmission_events(1, &["DE", "K5ARH", "K"], 0), &mut v);
+        assert!(spots.is_empty());
+        let before = v.suppression_counts();
+        assert_eq!(before.blocklist, 1);
+        v.replace_operator_lists(&[], Blocklist::default(), NotchList::default());
+        assert_eq!(v.suppression_counts(), before);
     }
 
     /// Codex review on PR #154, round 3: a blocklisted callsign that

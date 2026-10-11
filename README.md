@@ -132,6 +132,9 @@ docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
 - If the `docker run` above returns an authorization error, the GHCR
   package still needs its one-time "make public" step — see
   [docs/RUNBOOKS/release.md](docs/RUNBOOKS/release.md).
+- Every release also carries a `SHA256SUMS` file and a GitHub
+  build-provenance attestation. Check a download before running it:
+  [Verifying a downloaded release](docs/RUNBOOKS/release.md#verifying-a-downloaded-release).
 
 ## 60-second demo
 
@@ -143,6 +146,11 @@ manta gen v1 --out /tmp/v1              # 120 s of synthetic CW, 20 WPM, +20 dB
 manta decode /tmp/v1/v1.wav
 # CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K CQ …
 ```
+
+`decode` reads the recording's RF centre frequency from the `<name>.json`
+sidecar next to it (`gen` writes `v1.json`). Without one it warns that
+reported frequencies are baseband offsets; `--center-freq-hz 14000000`
+supplies or overrides the centre.
 
 Then point it at a real signal — a public KiwiSDR needs no hardware of
 your own. `<your-kiwi-host>` is a placeholder: pick a receiver that covers
@@ -157,6 +165,8 @@ flag entirely when yours is on 8073:
 ```sh
 manta listen --kiwi-host <your-kiwi-host> --kiwi-port <your-kiwi-port> --kiwi-freq-hz 7030000
 ```
+
+Someone else's KiwiSDR is shared: read [docs/GUIDES/kiwisdr.md](docs/GUIDES/kiwisdr.md) before you leave manta connected to one.
 
 File replay (`listen --source`) takes 48 kHz mono audio, or a raw complex-IQ
 WAV with `--source-iq`. IQ replay is not resampled: the channelizer runs
@@ -177,6 +187,8 @@ below is being worked on.
 `manta --help` lists every subcommand and flag.
 
 ## Run it as a node
+
+For a step-by-step walk from install to a firewalled node with the uplink in dry-run, follow [docs/GUIDES/rbn-node.md](docs/GUIDES/rbn-node.md).
 
 One TOML file describes a node: the station and servers in `[server]`, the
 receiver in `[input]`. With a `[server]` table, `run --config` starts the
@@ -212,6 +224,17 @@ manta config init                         # writes ./manta.toml; never replaces 
 manta config check --config manta.toml
 ```
 
+Then `manta doctor` checks the machine itself: the audio library, that the
+server ports are free, the clock against an NTP server, that each enabled
+RBN uplink target accepts a connection, and that the receiver opens and
+hears something. Each check prints `PASS`, `WARN`, `FAIL` or `SKIP` with a
+fix for every problem, and it exits 1 when a check fails. See
+[docs/RUNBOOKS/setup-checks.md](docs/RUNBOOKS/setup-checks.md).
+
+```sh
+manta doctor --config manta.toml
+```
+
 Start the server in one terminal. It runs in the foreground until you stop it:
 
 ```sh
@@ -228,6 +251,10 @@ variables (`MANTA_INPUT_FREQ_HZ=14030000`). `[spot]`, `[detector]` and
 [docs/SPEC-decode-core.md](docs/SPEC-decode-core.md) §9 lists every key,
 its default and its precedence. An unknown table or key is an error, not
 silently ignored.
+
+Keep `cty.dat` current by downloading it and pointing `[spot] cty_path`
+(or `--cty`) at it. manta warns at startup when its built-in copy is more
+than 180 days old.
 
 Then probe it from a second terminal:
 
@@ -248,6 +275,32 @@ Forwarding to an upstream RBN-style collector is a `[[rbn_uplink]]`
 block. `dry_run` defaults to `true`, so an uplink connects and logs in but
 transmits nothing until you set it to `false` deliberately.
 
+### Changing lists without a restart
+
+With a `[server]` table, `SIGHUP` makes a running daemon re-read its config
+file and apply the `[spot]` lists (`allowlist` and the `blocklist_path` and
+`notch_path` files) and each `[[rbn_uplink]]` block's `dry_run`. Connected
+clients, the `sh/dx` history and uplink connections stay up (MAN-78).
+
+```sh
+manta config check --config server.toml   # the same checks a reload runs
+kill -HUP "$(pidof manta)"               # systemd: systemctl reload manta
+# Docker: docker kill --signal=HUP <container>
+```
+
+The log reports `reload: applied` with the new list sizes, or
+`reload: rejected; still running the previous configuration` with the
+reason; a rejected reload changes nothing.
+Every other setting still needs a restart: a reload that finds one changed
+applies the lists anyway and names the setting in a warning.
+That includes `cty_path` and `scp_path`: a reload checks that those
+files still parse, but keeps the tables manta started with, so a new
+cty.dat or master.scp, even at the same path, needs a restart.
+Command-line `--allowlist`/`--blocklist`/`--notch` keep overriding the file. Without a
+`[server]` table, `SIGHUP` stops manta just as `SIGINT` and `SIGTERM` do.
+Windows has no `SIGHUP`, so no reload. During shutdown the daemon logs
+`SIGHUP ignored; the daemon is shutting down` at INFO and applies nothing.
+
 `bind_addr` has no loopback default — omit it and the telnet and JSON
 servers bind `0.0.0.0`, every interface, as a public cluster node expects.
 The example above pins `127.0.0.1` on purpose. Metrics is the exception:
@@ -255,6 +308,65 @@ it listens on `metrics_bind_addr`, `127.0.0.1` by default, because it has
 no password. Read
 [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 before you widen either.
+
+## Running unattended
+
+To run a node as a service that starts at boot and restarts after a
+failure, use the kit in [packaging/README.md](packaging/README.md): a
+systemd unit, a macOS LaunchDaemon and a Docker Compose file, with install
+steps for each. Release archives carry the same files next to the binary.
+Start from [manta.example.toml](manta.example.toml): copy it to
+`manta.toml`, replace `N0CALL` with your station callsign, configure your
+receiver, and run `manta config check --config manta.toml` before you
+enable a service. `manta run` refuses to start while the station callsign
+is still `N0CALL`.
+
+## Logs
+
+`manta run` writes its log to stderr: the startup banner, the readiness
+line, a periodic status line, client connections and rejections, and
+uplink events. Under the service kit it lands in the journal (systemd),
+in `/var/log/manta/manta.log` (launchd) or in the container log (Docker).
+
+Log lines are coloured only when stderr is a terminal, so a file, a pipe
+or the journal gets plain text; `NO_COLOR=1` turns colour off on a
+terminal too.
+
+For leveled records, `-v` adds debug detail and `-vv` trace; `-q` keeps
+warnings and errors, `-qq` only errors, `-qqq` none. `--log-level` names a
+level (`off`, `error`, `warn`, `info`, `debug`, `trace`). Each is shorthand for the
+`RUST_LOG` environment variable, the underlying mechanism, and overrides
+it. With none of them `RUST_LOG` decides, and `info` is the default. Use
+`RUST_LOG` itself to filter by module.
+
+In text format, startup notes, plain warnings, the `manta: listening;`
+readiness marker and source-reconnect lines are unfiltered, even with
+`-qqq` or `--log-level off`. In JSON format these become INFO or WARN
+records and follow the selected filter. Fatal errors remain visible in
+both formats at every level. Decoded text in text format and stdout's
+`SPOT:` lines are product output and are not controlled by the log level.
+
+For example:
+
+```sh
+manta run --config manta.toml -q        # leveled warnings and errors, plus unfiltered text lines
+RUST_LOG=info,manta_server=debug manta run --config manta.toml
+```
+
+For a log aggregator, `--log-format json` writes one JSON object per line:
+
+```sh
+manta run --config manta.toml --log-format json
+```
+
+Each record has `timestamp`, `level`, `message` and `target`; an event's
+own fields (`ip`, `login`, …) are top-level keys, and events inside a
+client connection carry a `span` object with its `peer`. With
+`--log-format json` every line `manta run` writes to stderr is a JSON
+object, except clap usage errors, the deprecation warning for a retired
+flag spelling, and a panic. Decoded text on stderr, when enabled, becomes
+INFO records with target `manta::text`. stdout (`SPOT:` lines, or `--json`'s
+JSON Lines) is unchanged.
 
 ## Inputs
 
@@ -270,6 +382,62 @@ The source frequency and rate flags end in `-hz`: `--kiwi-freq-hz`,
 `--soapy-freq-hz`, `--soapy-rate-hz`, `--hpsdr-freq-hz` and
 `--hpsdr-rate-hz`. The older `--kiwi-freq` / `--soapy-freq` /
 `--soapy-rate` / `--hpsdr-freq` / `--hpsdr-rate` spellings still work.
+
+### Check that samples reach manta
+
+List inputs, check the selected source, then use `doctor` to assess decoding:
+
+```sh
+manta devices
+manta check --device "USB Audio"
+manta check --config manta.toml --json
+manta check capture.wav --source-iq
+manta doctor --config manta.toml --duration 10
+```
+
+Audio selectors are names matched case-insensitively by substring, not numeric
+indexes. `devices` lists input-capable devices without opening a stream. With
+`--features soapy`, it also lists complete Soapy selector strings for
+`--soapy-driver`. HPSDR discovery is not supported; use `--hpsdr-host HOST`
+with an `hpsdr` build. KiwiSDR uses `--kiwi-host HOST`. `devices --json` reports
+empty, unavailable and failed enumeration separately; a backend error exits 1
+while retaining the other results.
+
+`check [SOURCE]` treats SOURCE as an audio WAV path, equivalent to `--source`.
+Audio files must be mono at 48000 Hz; add `--source-iq` for complex stereo IQ.
+Only one source selector is accepted. It replaces a configured input wholesale,
+just like `run`. With no selector, `check` uses `--config`, then `MANTA_CONFIG`,
+then environment/default settings; it does not search for `./manta.toml`.
+`manta config check` validates configuration without opening a receiver;
+`manta check` opens it and reads samples without decoding, listeners or uplinks.
+It validates typed config but does not read unused spot asset files.
+
+The default window is three seconds of delivered samples; `--duration` accepts
+1 to 60 seconds. The report shows the actual **stream sample rate** after
+resampling and `--capture-rate-hz` decimation, center frequency, passband,
+received sample count, input power and a brief per-channel noise-floor estimate.
+KiwiSDR's stream rate is 96000 Hz after resampling, not its native receiver rate.
+Power is relative dBFS, not calibrated RF power, dBm or spot SNR. The floor is
+the lower quartile in each eligible channel, summarized across the passband.
+See the [measurement definition](docs/DECISIONS/2026-10-10-man125-source-diagnostics.md).
+
+Digital silence is reported explicitly and can exit 0 because samples arrived.
+It does not prove that an antenna is connected. Empty input or input too short
+for a complete channelizer hop has no floor and exits 1; a shorter file with a
+measured floor exits 0 and reports its actual duration and end of file. Errors
+go to stderr; `--json` emits one report on stdout. A sampling deadline exits 1
+and retains any measurements. The deadline is duration plus five seconds after
+opening, checked between reads. Native open/read calls can exceed it, so
+`--duration` is not a hard wall-clock timeout. No reconnect loop runs.
+
+Audio input errors name the input (as `manta devices` spells it) and the
+48000 Hz requirement, and say what to check next. A sound card that delivers
+no samples for 5 seconds is an error; one that delivers only exact zeros for
+2 seconds gets a `warning: ... is delivering digital silence` line. On macOS
+either usually means the microphone permission is denied: allow the app
+running manta in System Settings > Privacy & Security > Microphone, quit and
+reopen that app, then confirm with `manta check`. See
+[MAN-131](docs/DECISIONS/2026-10-11-man131-actionable-errors.md).
 
 Targets Linux (x86-64 and ARM, Raspberry Pi 4 class), macOS, and Windows.
 The CPU budget is a full 192 kS/s passband inside one Raspberry Pi 4 core,
@@ -297,18 +465,21 @@ only if that config also carries at least one `[[rbn_uplink]]` block.
   source-health counters. Some gauges are still placeholders;
   ARCHITECTURE §8 says which.
 
-`decode` prints decoded text on stdout and a measurement summary on stderr.
-`run` prints confirmed spots on stdout; its character monitor, startup messages
-and diagnostics go to stderr. Capture them separately:
+`run` (alias `listen`) prints a `SPOT:` line on stdout for each confirmed
+spot, and decoded text on stderr, one line per track labelled with its track
+number, frequency and speed. With a `[server]` table the decoded text is off
+unless you pass `--decoded-text`, so a service log holds spots and diagnostics
+only. Startup messages, warnings and errors also go to stderr, so the two
+streams can be captured separately:
 
 ```sh
 manta run --config manta.toml > spots.log 2> monitor.log
 ```
 
-`listen` remains a compatibility alias. `run --json` and `decode --json` keep
-full-precision JSON on stdout. These CLI JSON reports are diagnostic interfaces;
-the servers above provide the ecosystem wire contract. Human units, report
-streams and error conventions are defined in the
+`decode` prints decoded text on stdout and a measurement summary on stderr.
+`run --json` and `decode --json` keep full-precision JSON on stdout. This
+terminal output is a debugging aid, not a stable interface — the servers above
+are. Human units, report streams and error conventions are defined in the
 [command output style decision](docs/DECISIONS/2026-10-10-man270-cli-output-style.md).
 
 The decode path is deterministic: the same file in produces byte-identical
@@ -333,7 +504,13 @@ target_port = 7000
 # credentials and reachability, but transmits no spots. Set it to false
 # only once you actually intend to feed a live target.
 # dry_run = false
+# spot_types defaults to "cq_beacon": only CQ and beacon spots, as RBN
+# requires. "all" also sends DE and untyped spots.
+# spot_types = "all"
 ```
+
+Spots an uplink holds back still appear on manta's own telnet and JSON
+output; `spot_types` only decides what goes to that target.
 
 The uplink has not yet been verified against a real RBN ingest (see
 [ROADMAP.md](ROADMAP.md)), which is why dry-run is the default. manta logs
@@ -367,6 +544,10 @@ Pre-1.0, and pre-first-release. What is true today:
   over `legacy` (`as_word` 27%→56%, `framed` 13%→32%) but falls short of
   the 60%/40% bar, and most VR/V golden vectors still fail. Not yet a
   default-engine candidate.
+- **Measured sensitivity:** `manta bench sensitivity` regenerates recall
+  and character error rate against SNR (500 Hz) on synthetic AWGN and
+  Watterson-faded signals; the curve at landing is in
+  [docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md](docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md).
 - **No tagged release yet**, so the container image above is empty until
   the first tag.
 
@@ -399,23 +580,39 @@ criteria.
 
 ## Documentation
 
-**Running a node:** [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
+[docs/README.md](docs/README.md) says where operators, contributors and
+researchers each start, and lists every runbook.
+
+**Running a node:** [docs/GUIDES/rbn-node.md](docs/GUIDES/rbn-node.md)
+(from install to a running node) · [docs/GUIDES/kiwisdr.md](docs/GUIDES/kiwisdr.md)
+(KiwiSDR etiquette) · [docs/GUIDES/raspberry-pi.md](docs/GUIDES/raspberry-pi.md)
+(Pi install and service) · [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 (exposing the servers safely) · the "Run it as a node" section above ·
+[docs/CONFIG.md](docs/CONFIG.md) (every config key, its default and what
+reads it) · [docs/METRICS.md](docs/METRICS.md) (every `/metrics` family,
+`/healthz` and `/status`) · [docs/SPOT-SCHEMA.md](docs/SPOT-SCHEMA.md)
+(every field of the `:7301` JSON spot stream) ·
+[packaging/README.md](packaging/README.md) (running unattended under
+systemd, launchd or Docker Compose) ·
 [docs/RUNBOOKS/secondary-skimmer-field-node.md](docs/RUNBOOKS/secondary-skimmer-field-node.md)
 (a 30-day secondary-skimmer field node behind an RBN Aggregator, MAN-96) ·
 `manta <subcommand> --help` for every flag.
 
-**Contributing:** [ARCHITECTURE.md](ARCHITECTURE.md) — the nine-crate
+**Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) — setup, build and
+test commands, golden-vector rules and the pull request review process ·
+[ARCHITECTURE.md](ARCHITECTURE.md) — the nine-crate
 workspace, data flow, and the channelizer, decoder, validation and output
 design · [docs/DECISIONS/](docs/DECISIONS/) — dated design decisions and
 implementation pins · [wiki/INDEX.md](wiki/INDEX.md) — accumulated
-gotchas.
+gotchas · [CHANGELOG.md](CHANGELOG.md) — changes and the decoder-output
+versioning rule.
 
 **Algorithms and research:** [docs/SPEC-decode-core.md](docs/SPEC-decode-core.md) —
 channelizer constants, noise-floor estimator, track state machine,
 decoder equations, confidence formulas, determinism rules, golden
 vectors, config-key table · [ROADMAP.md](ROADMAP.md) — milestones M0 to
-M4 with acceptance criteria.
+M4 with acceptance criteria · `manta bench sensitivity` — the
+recall/CER-vs-SNR curve on synthetic signals, regenerable from any build.
 
 ## Related projects
 
@@ -429,12 +626,60 @@ M4 with acceptance criteria.
 
 ## Contributing
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, build and test commands,
+golden-vector rules, and the pull request review process.
+
 Open an issue or a pull request. Main moves only by PR, CI must be green, and
 the golden-vector determinism tests are the bar every decoder change has to
 clear. See [SECURITY.md](SECURITY.md) for vulnerability reporting.
+
+When you report a problem, include the output of `manta --version`. It names
+the exact commit and the compiled-in features. The Docker image is the
+exception for now: its build has no git metadata, so its commit reads
+`unknown`. A change that alters decoder
+output adds a `### Decoder output` entry to [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
 MIT OR Apache-2.0, at your option. Unless you explicitly state otherwise, any
 contribution intentionally submitted for inclusion in this project shall be
 dual licensed as above, without any additional terms or conditions.
+
+Read the [MIT license](LICENSE-MIT) or the
+[Apache-2.0 license](LICENSE-APACHE). The
+[contributor guide](CONTRIBUTING.md#license) explains GitHub's license display.
+
+## Keeping the prefix table current
+
+A new prefix must appear in the country table before manta can spot it.
+Download AD1C's `cty.dat`, set its path under `[spot]` in your config,
+check the config, and restart the daemon:
+
+```sh
+sudo curl -fsSL -o /etc/manta/cty.dat https://www.country-files.com/cty/cty.dat
+sudoedit /etc/manta/manta.toml
+# Under [spot], set cty_path = "/etc/manta/cty.dat"
+sudo manta config check --config /etc/manta/manta.toml
+# If manta is installed as a systemd service:
+sudo systemctl restart manta
+```
+
+Use `scp_path` or `--scp` for an updated known-callsign list downloaded
+from https://www.supercheckpartial.com/MASTER.SCP. Both settings replace
+only their own table and take effect on restart. A missing, unreadable,
+non-UTF-8 or empty table stops startup; `config check` catches the same
+errors before opening a receiver or binding a port. Its `spot:` line
+shows the resolved paths, or `bundled` for a table built into manta.
+
+Config-file paths are relative to that config's directory. Flag values
+and `MANTA_SPOT_CTY_PATH` / `MANTA_SPOT_SCP_PATH` are relative to the
+working directory; flags override environment values, which override
+the file. `decode` accepts flags and config keys but ignores environment
+variables and never prints an age warning.
+
+For a systemd config copied into a credentials directory, use absolute
+paths for `cty_path`, `scp_path`, `blocklist_path` and `notch_path`. On
+macOS, keep the table readable by the service account (`_manta` when
+using that account) and restart the launchd service. In Docker, mount
+each table read-only at the configured container path and restart the
+container. Mounting the config alone does not mount the tables it names.

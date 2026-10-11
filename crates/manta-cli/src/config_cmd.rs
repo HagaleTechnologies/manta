@@ -5,6 +5,7 @@
 
 use crate::config::{Loaded, SourceFromFile};
 use anyhow::{bail, Context, Result};
+use manta_server::config::ServerConfig;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -16,7 +17,7 @@ pub(crate) const DEFAULT_PATH: &str = "manta.toml";
 pub(crate) const SCAFFOLD: &str = include_str!("config_init.toml");
 
 /// The callsign the scaffold shows where a real one belongs (D10).
-const EXAMPLE_CALLSIGN: &str = "N0CALL";
+pub(crate) const EXAMPLE_CALLSIGN: &str = "N0CALL";
 
 /// Where `check` found the file it checked (D2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +63,7 @@ pub(crate) fn check(config_flag: Option<PathBuf>) -> Result<()> {
     }
     stdout.flush()?;
     for note in notes(&prepared.loaded, &prepared.resolved, source) {
-        crate::fmt::diagnostic!("{note}");
+        eprintln!("{note}");
     }
     Ok(())
 }
@@ -93,7 +94,7 @@ pub(crate) fn init(out: &Path, force: bool) -> Result<()> {
     };
     file.write_all(SCAFFOLD.as_bytes())
         .with_context(|| format!("writing {}", out.display()))?;
-    crate::fmt::diagnostic!(
+    eprintln!(
         "wrote {path} (every setting commented out at its default); edit it, then run \
          `manta config check --config {path}`",
         path = out.display()
@@ -105,7 +106,13 @@ pub(crate) fn init(out: &Path, force: bool) -> Result<()> {
 /// misconfiguration -- a `<...>` placeholder string anywhere, or the
 /// example callsign as the station or uplink login.
 fn reject_placeholders(loaded: &Loaded) -> Result<()> {
-    if let Some((key, value)) = find_placeholder(&loaded.raw, "") {
+    reject_placeholders_in(loaded, &loaded.raw)
+}
+
+/// `reject_placeholders`, scanning `raw` (`loaded.raw` or part of it) for
+/// `<...>` strings.
+fn reject_placeholders_in(loaded: &Loaded, raw: &toml::Table) -> Result<()> {
+    if let Some((key, value)) = find_placeholder(raw, "") {
         // Never echo a secret, even one shaped like a placeholder (D5).
         if key.ends_with("password") {
             bail!(
@@ -119,30 +126,71 @@ fn reject_placeholders(loaded: &Loaded) -> Result<()> {
             crate::fmt::quoted(&value)
         );
     }
-    let example = |key: &str| -> Result<()> {
-        bail!(
-            "{}: {key} is still the example \"{EXAMPLE_CALLSIGN}\" -- set your own callsign",
-            loaded.origin
-        )
-    };
+    reject_example_callsigns(loaded)
+}
+
+/// MAN-78: the checks `check` runs beyond `run`'s config stage
+/// (placeholders, example callsigns, duplicate ports), for a SIGHUP
+/// reload: a document they reject applies nothing. With `cli_source` (the
+/// daemon's command line names the source) `[input]` is not scanned for
+/// placeholders: that flag replaced it, so `run` never reads it (MAN-268
+/// D3).
+pub(crate) fn reject_on_reload(loaded: &Loaded, cli_source: bool) -> Result<()> {
+    if cli_source {
+        let mut raw = loaded.raw.clone();
+        raw.remove("input");
+        reject_placeholders_in(loaded, &raw)?;
+    } else {
+        reject_placeholders(loaded)?;
+    }
+    reject_duplicate_ports(loaded)
+}
+
+/// MAN-268: the callsign half of `reject_placeholders`, which `run` (and
+/// its `listen` alias) also applies, after `prepare_live` and before any
+/// source or listener opens, so an unedited manta.example.toml cannot start
+/// a daemon that spots, or logs in to a collector, as N0CALL. `loaded` is
+/// after the `MANTA_*` overlay, so this checks the identities the daemon
+/// would use. Callsigns only: `run` skips the broad `<...>` scan, because a
+/// source flag replaces `[input]` and its unused placeholders. See
+/// docs/DECISIONS/2026-10-10-man268-unattended-packaging.md.
+pub(crate) fn reject_example_callsigns(loaded: &Loaded) -> Result<()> {
+    match example_callsign_key(loaded) {
+        Some(key) => Err(example_callsign(loaded, key)),
+        None => Ok(()),
+    }
+}
+
+/// The first identity key still holding the example callsign, as `run`
+/// checks them. Shared with `manta doctor`'s `config` check (MAN-126), so
+/// the two cannot drift.
+pub(crate) fn example_callsign_key(loaded: &Loaded) -> Option<&'static str> {
     if let Some(server) = &loaded.server {
         if server
             .station_callsign
             .eq_ignore_ascii_case(EXAMPLE_CALLSIGN)
         {
-            example("server.station_callsign")?;
+            return Some("server.station_callsign");
         }
     }
-    for uplink in &loaded.rbn_uplink {
-        if uplink
-            .login_callsign
-            .as_deref()
-            .is_some_and(|c| c.eq_ignore_ascii_case(EXAMPLE_CALLSIGN))
-        {
-            example("rbn_uplink.login_callsign")?;
-        }
-    }
-    Ok(())
+    loaded
+        .rbn_uplink
+        .iter()
+        .any(|uplink| {
+            uplink
+                .login_callsign
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case(EXAMPLE_CALLSIGN))
+        })
+        .then_some("rbn_uplink.login_callsign")
+}
+
+/// D10: `key` still holds the scaffold's example callsign.
+fn example_callsign(loaded: &Loaded, key: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{}: {key} is still the example \"{EXAMPLE_CALLSIGN}\" -- set your own callsign",
+        loaded.origin
+    )
 }
 
 /// The first string value of the form `<...>`, as `(table.key, value)`.
@@ -176,48 +224,86 @@ fn reject_duplicate_ports(loaded: &Loaded) -> Result<()> {
     let Some(server) = &loaded.server else {
         return Ok(());
     };
-    let listeners = [
-        (
-            "telnet_port",
-            "bind_addr",
-            server.bind_addr.as_str(),
-            server.telnet_port,
-        ),
-        (
-            "json_port",
-            "bind_addr",
-            server.bind_addr.as_str(),
-            server.json_port,
-        ),
-        (
-            "metrics_port",
-            "metrics_bind_addr",
-            server.metrics_bind_addr.as_str(),
-            server.metrics_port,
-        ),
-    ];
-    for (i, (key, addr_key, addr, port)) in listeners.iter().enumerate() {
-        if *port == 0 {
-            continue;
-        }
-        let Some((first, first_addr_key, first_addr, _)) = listeners[..i]
-            .iter()
-            .find(|(_, _, a, p)| p == port && may_overlap(a, addr))
-        else {
+    let listeners = server_listeners(server);
+    for (i, l) in listeners.iter().enumerate() {
+        let Some(first) = duplicate_of(&listeners, i) else {
             continue;
         };
-        let overlap = if addr == first_addr {
+        let overlap = if l.addr == first.addr {
             String::new()
         } else {
-            format!(", and {addr_key} \"{addr}\" overlaps {first_addr_key} \"{first_addr}\"")
+            format!(
+                ", and {} \"{}\" overlaps {} \"{}\"",
+                l.addr_key, l.addr, first.addr_key, first.addr
+            )
         };
         bail!(
-            "{}: [server]: {key} {port} is the same as {first}{overlap}; each server needs its \
-             own port",
-            loaded.origin
+            "{}: [server]: {} {} is the same as {}{overlap}; each server needs its own port",
+            loaded.origin,
+            l.port_key,
+            l.port,
+            first.port_key
         );
     }
     Ok(())
+}
+
+/// One `[server]` listener: what `run` binds, and the keys that set it.
+/// MAN-132: telnet and JSON share `bind_addr`, metrics has its own
+/// `metrics_bind_addr`.
+pub(crate) struct Listener {
+    /// `telnet`, `json` or `metrics`.
+    pub name: &'static str,
+    pub port_key: &'static str,
+    pub addr_key: &'static str,
+    pub addr: String,
+    pub port: u16,
+}
+
+/// `[server]`'s three listeners, in the order `run` binds them.
+pub(crate) fn server_listeners(server: &ServerConfig) -> [Listener; 3] {
+    let listener = |name, port_key, addr_key, addr: &str, port| Listener {
+        name,
+        port_key,
+        addr_key,
+        addr: addr.to_string(),
+        port,
+    };
+    [
+        listener(
+            "telnet",
+            "telnet_port",
+            "bind_addr",
+            &server.bind_addr,
+            server.telnet_port,
+        ),
+        listener(
+            "json",
+            "json_port",
+            "bind_addr",
+            &server.bind_addr,
+            server.json_port,
+        ),
+        listener(
+            "metrics",
+            "metrics_port",
+            "metrics_bind_addr",
+            &server.metrics_bind_addr,
+            server.metrics_port,
+        ),
+    ]
+}
+
+/// D3: the earlier listener that `listeners[i]` can never bind beside --
+/// one non-zero port on overlapping addresses.
+pub(crate) fn duplicate_of(listeners: &[Listener], i: usize) -> Option<&Listener> {
+    let l = &listeners[i];
+    if l.port == 0 {
+        return None;
+    }
+    listeners[..i]
+        .iter()
+        .find(|first| first.port == l.port && may_overlap(&first.addr, &l.addr))
 }
 
 /// Whether two listeners on one port could fail to both bind. Only two
@@ -332,6 +418,14 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             if let Some(v) = &s.operator_grid {
                 l.push_str(&format!(" operator_grid={v}"));
             }
+            // MAN-138: the station position. `f64`'s Display prints the
+            // value as written (`43.9375`, `-72` as `-72`).
+            if let Some(v) = s.operator_lat {
+                l.push_str(&format!(" operator_lat={v}"));
+            }
+            if let Some(v) = s.operator_lon {
+                l.push_str(&format!(" operator_lon={v}"));
+            }
             l
         }
     });
@@ -346,11 +440,13 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
         .unwrap_or_default();
     for u in &loaded.rbn_uplink {
         lines.push(format!(
-            "rbn_uplink: target_host={} target_port={} enabled={} dry_run={} login_callsign={}",
+            "rbn_uplink: target_host={} target_port={} enabled={} dry_run={} spot_types={} \
+             login_callsign={}",
             u.target_host,
             u.target_port,
             u.enabled,
             u.dry_run,
+            u.spot_types.as_str(),
             u.effective_login_callsign(station)
         ));
     }
@@ -421,14 +517,24 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             .map_or("none".to_string(), |p| p.display().to_string())
     };
     lines.push(format!(
-        "spot: allowlist={} blocklist_path={} notch_path={}",
+        "spot: allowlist={} blocklist_path={} notch_path={} cty_path={} scp_path={}",
         if loaded.spot.allowlist.is_empty() {
             "none".to_string()
         } else {
             loaded.spot.allowlist.join(",")
         },
         path_or_none(&loaded.spot.blocklist_path),
-        path_or_none(&loaded.spot.notch_path)
+        path_or_none(&loaded.spot.notch_path),
+        loaded
+            .spot
+            .cty_path
+            .as_ref()
+            .map_or("bundled".to_string(), |p| p.display().to_string()),
+        loaded
+            .spot
+            .scp_path
+            .as_ref()
+            .map_or("bundled".to_string(), |p| p.display().to_string())
     ));
 
     let detector = set_keys(loaded, "detector", &[]);
@@ -472,6 +578,15 @@ fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> V
             "note: manta run with this config needs your radio's dial frequency -- set \
              input.center_freq_hz, MANTA_INPUT_CENTER_FREQ_HZ or --dial-freq-hz (an IQ \
              recording whose sidecar names its centre frequency does not need it)"
+                .to_string(),
+        );
+    }
+    // MAN-138. `load` already rejected an `Err` (an inconsistent location),
+    // so only a config with no location key at all gets the note.
+    if matches!(server.station_location(), Ok(None)) {
+        notes.push(
+            "note: JSON spots will carry no station position (deGrid, deLat and deLon are \
+             null) -- set [server].operator_grid, or operator_lat and operator_lon"
                 .to_string(),
         );
     }
@@ -587,6 +702,16 @@ mod tests {
             ),
             "{server}"
         );
+        // MAN-138: the position keys follow the grid, printed as written.
+        let lines = lines_of(
+            "[server]\nstation_callsign = \"HB9H\"\noperator_grid = \"FN03gw\"\n\
+             operator_lat = 43.9375\noperator_lon = -79.4583\n",
+        );
+        let server = line(&lines, "server:");
+        assert!(
+            server.ends_with(" operator_grid=FN03gw operator_lat=43.9375 operator_lon=-79.4583"),
+            "{server}"
+        );
     }
 
     #[test]
@@ -605,7 +730,7 @@ mod tests {
             "[server]\nstation_callsign = \"W1AW\"\n\
              [[rbn_uplink]]\nenabled = true\ntarget_host = \"a.example.org\"\ntarget_port = 7000\n\
              [[rbn_uplink]]\nenabled = false\ntarget_host = \"b.example.org\"\ntarget_port = 7001\n\
-             login_callsign = \"k1abc\"\ndry_run = false\n",
+             login_callsign = \"k1abc\"\ndry_run = false\nspot_types = \"all\"\n",
         );
         let uplinks: Vec<&String> = lines
             .iter()
@@ -615,9 +740,9 @@ mod tests {
             uplinks,
             [
                 "rbn_uplink: target_host=a.example.org target_port=7000 enabled=true \
-                 dry_run=true login_callsign=W1AW",
+                 dry_run=true spot_types=cq_beacon login_callsign=W1AW",
                 "rbn_uplink: target_host=b.example.org target_port=7001 enabled=false \
-                 dry_run=false login_callsign=K1ABC",
+                 dry_run=false spot_types=all login_callsign=K1ABC",
             ]
         );
     }
@@ -701,7 +826,7 @@ mod tests {
         let lines = lines_of("");
         assert_eq!(
             line(&lines, "spot:"),
-            "spot: allowlist=none blocklist_path=none notch_path=none"
+            "spot: allowlist=none blocklist_path=none notch_path=none cty_path=bundled scp_path=bundled"
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manta.toml");
@@ -712,7 +837,7 @@ mod tests {
             &path,
             format!(
                 "[spot]\nallowlist = [\"W1AW\", \"K1ABC\"]\nblocklist_path = \"bad.txt\"\n\
-                 notch_path = '{}'\n",
+                 notch_path = '{}'\ncty_path = 'cty.dat'\nscp_path = 'MASTER.SCP'\n",
                 notch.display()
             ),
         )
@@ -721,9 +846,11 @@ mod tests {
         assert_eq!(
             line(&summary("x", &l), "spot:"),
             format!(
-                "spot: allowlist=W1AW,K1ABC blocklist_path={} notch_path={}",
+                "spot: allowlist=W1AW,K1ABC blocklist_path={} notch_path={} cty_path={} scp_path={}",
                 dir.path().join("bad.txt").display(),
-                notch.display()
+                notch.display(),
+                dir.path().join("cty.dat").display(),
+                dir.path().join("MASTER.SCP").display()
             )
         );
     }
@@ -783,6 +910,41 @@ mod tests {
 
     fn has(notes: &[String], prefix: &str) -> bool {
         notes.iter().any(|n| n.starts_with(prefix))
+    }
+
+    const POSITION_NOTE: &str = "note: JSON spots will carry no station position";
+
+    /// MAN-138: an unconfigured position is legal (every JSON spot then says
+    /// `null`), so it is a note, not an error -- and only for a config that
+    /// starts the servers.
+    #[test]
+    fn note_station_position_only_when_no_location_is_configured() {
+        let server = "[server]\nstation_callsign = \"W1AW\"\n";
+        let n = notes_of(server);
+        let note = n
+            .iter()
+            .find(|x| x.starts_with(POSITION_NOTE))
+            .unwrap_or_else(|| panic!("no position note in {n:?}"));
+        assert_eq!(
+            note,
+            "note: JSON spots will carry no station position (deGrid, deLat and deLon are \
+             null) -- set [server].operator_grid, or operator_lat and operator_lon"
+        );
+        assert!(!has(
+            &notes_of(&format!("{server}operator_grid = \"FN31pr\"\n")),
+            POSITION_NOTE
+        ));
+        assert!(!has(
+            &notes_of(&format!(
+                "{server}operator_lat = 41.714775\noperator_lon = -72.72726\n"
+            )),
+            POSITION_NOTE
+        ));
+        assert!(!has(
+            &notes_of("[decode]\nengine = \"legacy\"\n"),
+            POSITION_NOTE
+        ));
+        assert!(!has(&notes_of(""), POSITION_NOTE));
     }
 
     #[test]
@@ -1026,6 +1188,8 @@ mod tests {
         ("server", "operator_name"),
         ("server", "operator_qth"),
         ("server", "operator_grid"),
+        ("server", "operator_lat"),
+        ("server", "operator_lon"),
         ("rbn_uplink", "enabled"),
         ("rbn_uplink", "target_host"),
         ("rbn_uplink", "target_port"),
@@ -1043,6 +1207,8 @@ mod tests {
         ("input", "replay_epoch"),
         ("spot", "blocklist_path"),
         ("spot", "notch_path"),
+        ("spot", "cty_path"),
+        ("spot", "scp_path"),
     ];
 
     /// `Option` keys whose absence means a built-in value: setting them to
@@ -1302,6 +1468,7 @@ mod tests {
         let body = format!("[spot]\n{}", uncommented("spot", |_| true));
         let l = loaded(&body);
         assert!(l.spot.blocklist_path.is_some() && l.spot.notch_path.is_some());
+        assert!(l.spot.cty_path.is_some() && l.spot.scp_path.is_some());
     }
 
     #[test]
@@ -1427,6 +1594,43 @@ mod tests {
              [input]\ntype = \"kiwi\"\nhost = \"rx.example.org\"\nfreq_hz = 7e6\n",
         );
         assert!(reject_placeholders(&ok).is_ok());
+    }
+
+    /// MAN-268: `run`'s check is the callsign half of `reject_placeholders`
+    /// with the same diagnostics, and nothing else.
+    #[test]
+    fn reject_example_callsigns_checks_only_the_callsigns() {
+        const STATION: &str =
+            "server.station_callsign is still the example \"N0CALL\" -- set your own callsign";
+        for call in ["N0CALL", "n0call"] {
+            let l = loaded(&format!("[server]\nstation_callsign = \"{call}\"\n"));
+            let err = format!("{:#}", reject_example_callsigns(&l).unwrap_err());
+            assert_eq!(err, format!("{}: {STATION}", l.origin));
+            assert_eq!(format!("{:#}", reject_placeholders(&l).unwrap_err()), err);
+        }
+        // An uncommented example uplink login is refused too: no flag
+        // replaces [[rbn_uplink]].
+        let uplink = "[server]\nstation_callsign = \"W1AW\"\n[[rbn_uplink]]\nenabled = true\n\
+                      target_host = \"rbn.example.org\"\ntarget_port = 7000\n";
+        let l = loaded(&format!("{uplink}login_callsign = \"N0CALL\"\n"));
+        let err = format!("{:#}", reject_example_callsigns(&l).unwrap_err());
+        assert!(
+            err.contains("rbn_uplink.login_callsign is still the example \"N0CALL\""),
+            "{err}"
+        );
+        assert_eq!(format!("{:#}", reject_placeholders(&l).unwrap_err()), err);
+        assert!(reject_example_callsigns(&loaded(uplink)).is_ok());
+        // A placeholder `config check` refuses but `run` leaves alone: a
+        // receiver table a source flag may replace.
+        let l = loaded(
+            "[server]\nstation_callsign = \"W1AW\"\n\
+             [input]\ntype = \"kiwi\"\nhost = \"<your-receiver-host>\"\nfreq_hz = 7e6\n",
+        );
+        assert!(reject_placeholders(&l).is_err());
+        assert!(reject_example_callsigns(&l).is_ok());
+        for body in ["", "[server]\nstation_callsign = \"W5AU-1\"\n"] {
+            assert!(reject_example_callsigns(&loaded(body)).is_ok(), "{body:?}");
+        }
     }
 
     #[test]

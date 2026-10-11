@@ -149,7 +149,7 @@ fn command_reports_own_their_streams_and_json_preserves_measurements() {
     let dir = tempfile::tempdir().unwrap();
     let wav = fixture(dir.path());
     let cfg = manta_engine::PipelineConfig::default();
-    let report = manta_engine::decode_wav(&wav, &cfg).unwrap();
+    let report = manta_engine::decode_wav(&wav, None, &cfg).unwrap();
     let out = manta().arg("decode").arg(&wav).output().unwrap();
     assert!(
         out.status.success(),
@@ -221,10 +221,21 @@ fn command_reports_own_their_streams_and_json_preserves_measurements() {
         .unwrap();
     assert!(out.status.success());
     assert!(out.stderr.is_empty());
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(),
-        serde_json::from_str::<serde_json::Value>(&expected.to_string()).unwrap()
-    );
+    // Every pre-existing key keeps its exact value; MAN-126's `checks` and
+    // `checks_status` are the only additions.
+    let actual = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap();
+    let expected = serde_json::from_str::<serde_json::Value>(&expected.to_string()).unwrap();
+    let actual = actual.as_object().unwrap();
+    for (key, value) in expected.as_object().unwrap() {
+        assert_eq!(actual.get(key), Some(value), "{key}");
+    }
+    let mut extra: Vec<&str> = actual
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !expected.as_object().unwrap().contains_key(*k))
+        .collect();
+    extra.sort_unstable();
+    assert_eq!(extra, ["checks", "checks_status"]);
     let out = manta()
         .args(["doctor", "--source-iq", "--source"])
         .arg(&wav)
@@ -234,15 +245,20 @@ fn command_reports_own_their_streams_and_json_preserves_measurements() {
     assert!(out.status.success());
     assert!(out.stderr.is_empty());
     let text = String::from_utf8(out.stdout).unwrap();
+    // MAN-126's setup-check lines precede the report and its summary line
+    // follows it; the report block itself is contiguous.
     assert!(
-        text.starts_with(&format!(
-            "source: {:.0} Hz sample rate, 14000.0 kHz center, observed for 10.0s\n",
+        text.contains(&format!(
+            "\n\nsource: {:.0} Hz sample rate, 14000.0 kHz center, observed for 10.0s\n",
             report.sample_rate_hz
         )),
         "{text}"
     );
     assert!(text.contains("SNR (2500 Hz reference):"));
-    assert!(text.ends_with(&format!("verdict: {}\n", report.verdict().summary())));
+    assert!(
+        text.contains(&format!("verdict: {}\n", report.verdict().summary())),
+        "{text}"
+    );
     if let (Some(min), Some(median), Some(max)) =
         (report.snr_db_min, report.snr_db_median, report.snr_db_max)
     {

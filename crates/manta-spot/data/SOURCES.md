@@ -10,8 +10,10 @@
   (N1MM+, Win-Test, CQRLOG, TR4W) follows. No separate license file is
   published upstream. Flagged here for visibility, not treated as a
   blocker; revisit if this ever needs a stricter provenance trail.
-- Refresh: re-run the `curl` in this crate's implementation plan (Task 1)
-  and replace this file by hand -- no refresh automation yet.
+- Refresh: download the source above and replace `data/cty.dat`. Update
+  `CTY_DAT_RETRIEVED` in `src/vintage.rs` and this section's retrieval date
+  together; a test enforces the match. Operators can use `--cty` or
+  `[spot] cty_path` to supply a newer file without a manta release.
 
 ## dxcc.tsv
 
@@ -46,5 +48,6 @@
 - License/redistribution: same convention as cty.dat -- bundled by contest
   logging software as a matter of course; no separate license published
   upstream. Same flag-not-block note applies.
-- Refresh: re-run the `curl` in this crate's implementation plan (Task 1)
-  and replace this file by hand -- no refresh automation yet.
+- Refresh: download the source above and replace `data/master.scp`.
+  Operators can use `--scp` or `[spot] scp_path` to supply a newer file
+  without a manta release.

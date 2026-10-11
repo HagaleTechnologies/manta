@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
 
 [[bin]]
 name = "manta"
@@ -18,6 +22,8 @@ hpsdr = ["manta-input/hpsdr"]
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+# MAN-126: `manta doctor`'s audio check lists sound-card inputs.
+coppa-audio = { workspace = true }
 ctrlc = { workspace = true }
 hound = { workspace = true }
 serde_json = { workspace = true }
@@ -34,6 +40,15 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# MAN-78: SIGTERM, and SIGHUP (reload with a [server] table, drain
+# without one); ctrlc keeps SIGINT and Windows' console events.
+[target.'cfg(unix)'.dependencies]
+signal-hook = { workspace = true }
+# MAN-78: `pthread_sigmask`, to keep a daemon's SIGHUP off the decode thread.
+# MAN-126: `manta doctor`'s clock check reads the kernel's NTP-sync state
+# with `adjtimex` (Linux only; gated by cfg in clock_check.rs).
+libc = { workspace = true }
+
 [dev-dependencies]
 coppa-audio = { workspace = true }
 libc = { workspace = true }
@@ -48,3 +63,7 @@ tungstenite = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 syn = { version = "2", features = ["full", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
+# MAN-268: tests/packaging_examples.rs parses the shipped docker-compose.yml
+# as YAML rather than matching text fragments. Test-only; pinned here, not
+# in [workspace.dependencies], because no other crate reads YAML.
+serde_yaml_ng = "0.10"

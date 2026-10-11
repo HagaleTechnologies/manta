@@ -288,6 +288,9 @@ impl UplinkTarget {
         self.sent.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A spot this target received but deliberately did not send: either
+    /// `dry_run` is on, or its type is outside the target's `spot_types`
+    /// (MAN-91).
     pub fn record_suppressed(&self) {
         self.suppressed.fetch_add(1, Ordering::Relaxed);
     }
@@ -1220,7 +1223,7 @@ impl Metrics {
         ));
 
         out.push_str(
-            "# HELP manta_uplink_suppressed_total Spots suppressed by dry-run instead of sent to the RBN uplink target.\n",
+            "# HELP manta_uplink_suppressed_total Spots not sent to the RBN uplink target because of dry-run or its spot_types setting.\n",
         );
         out.push_str("# TYPE manta_uplink_suppressed_total counter\n");
         out.push_str(&format!(
@@ -1308,7 +1311,7 @@ impl Metrics {
             ));
         }
 
-        out.push_str("# HELP manta_uplink_target_suppressed_total Spots suppressed by dry-run instead of sent to this RBN uplink target.\n");
+        out.push_str("# HELP manta_uplink_target_suppressed_total Spots not sent to this RBN uplink target because of dry-run or its spot_types setting.\n");
         out.push_str("# TYPE manta_uplink_target_suppressed_total counter\n");
         for t in targets.iter() {
             out.push_str(&format!(

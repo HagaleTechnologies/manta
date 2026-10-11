@@ -10,6 +10,9 @@ MAN-132) — see `docs/RUNBOOKS/network-exposure.md` for exposure posture;
 `/healthz` carries exactly the same posture as `/metrics`, since it's the
 same listener.
 
+[`docs/METRICS.md`](../METRICS.md) lists every family the endpoint renders,
+with its type, labels and when it has samples.
+
 ## `/healthz` as a liveness probe
 
 `GET /healthz` returns:
@@ -92,6 +95,8 @@ interval if you need an ongoing liveness check, not just a post-start one.)
   `manta_build_info{git_sha="unknown"}` means the binary was built from a
   context with no `.git` directory (e.g. a Docker build — `.dockerignore`
   excludes `.git` on purpose) rather than a build failure.
+  `manta --version` on the host prints the same commit and feature list, and
+  the same `unknown` caveat applies.
 - `manta_uplink_target_*{target="host:port"}` — every uplink counter now
   has a per-target series (`enabled`, `connected`, `sent_total`,
   `suppressed_total`, `dropped_lagged_total`, `dropped_write_failed_total`,

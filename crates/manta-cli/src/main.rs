@@ -8,10 +8,19 @@ use manta_engine::{decode_wav, PipelineConfig};
 use manta_input::IqSource;
 use std::path::{Path, PathBuf};
 
+mod bench;
+mod build_info;
+mod clock_check;
 mod config;
 mod config_cmd;
+mod devices;
+mod doctor_checks;
 mod fmt;
+mod logging;
 mod reconnect;
+mod reload;
+mod source_check;
+mod text_lines;
 use reconnect::ReconnectingSource;
 
 #[derive(Parser)]
@@ -23,7 +32,8 @@ use reconnect::ReconnectingSource;
     // tests that assert against it, e.g. crates/manta-cli/tests/cli.rs) is
     // identical across platforms.
     bin_name = "manta",
-    version,
+    // MAN-83: commit + features, so a support request needs nothing else
+    version = build_info::VERSION_LINE,
     about = "Open-source wideband CW skimmer: every CW signal in an SDR passband, decoded at once, emitted as RBN-compatible spots",
     after_help = "\
 Examples:
@@ -42,6 +52,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// List audio inputs and available SDR devices.
+    Devices {
+        /// Print one JSON report.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read a short source sample and report its level without decoding.
+    #[command(
+        long_about = "Read a short source sample and report its level without decoding. SOURCE is an audio WAV path, equivalent to --source PATH; use --source-iq for complex IQ. Without a selector, use the configured input or default audio input. The sampling deadline is duration + 5 seconds after opening, checked between reads. Native open/read calls can exceed it."
+    )]
+    Check(source_check::Args),
     /// Decode CW from a recorded IQ WAV file.
     ///
     /// Reads a stereo WAV file (channel 0 = I, channel 1 = Q), decodes the
@@ -49,8 +70,15 @@ enum Command {
     /// deterministic: the same file always produces the same output.
     Decode {
         /// Stereo IQ WAV file. Its centre frequency is read from the
-        /// matching `<name>.json` sidecar next to it.
+        /// matching `<name>.json` sidecar next to it, unless
+        /// --center-freq-hz is given.
         path: PathBuf,
+        /// RF centre frequency of the recording, in Hz, overriding its sidecar.
+        ///
+        /// Without this flag or a sidecar, reported frequencies are baseband
+        /// offsets from the recording's centre, and manta prints a warning.
+        #[arg(long, value_name = "HZ", value_parser = parse_center_freq_hz)]
+        center_freq_hz: Option<f64>,
         /// Print the full decode report as one JSON object.
         #[arg(long, help_heading = "Output")]
         json: bool,
@@ -149,9 +177,11 @@ enum Command {
     /// Decode CW live from a receiver or sound card, or run the spotting
     /// daemon.
     ///
-    /// Prints each decode as it happens. With --config, also runs the full
-    /// spotting daemon: the telnet cluster server, the JSON Lines /
-    /// WebSocket stream, and the metrics endpoint.
+    /// Prints a SPOT: line on stdout for each confirmed spot, and decoded
+    /// text on stderr, one line per track. With --config, also runs the
+    /// full spotting daemon: the telnet cluster server, the JSON Lines /
+    /// WebSocket stream, and the metrics endpoint; decoded text is then
+    /// off unless --decoded-text is given.
     // `run` is the daemon entry point; `listen` stays as a visible alias
     // for ad hoc audio/dev testing (D11/MAN-77, see
     // docs/DECISIONS/2026-09-06-broad-review-decisions.md).
@@ -288,11 +318,24 @@ enum Command {
         /// plain text.
         #[arg(long, help_heading = "Output")]
         json: bool,
+        /// Also print decoded text while the spotting daemon runs.
+        ///
+        /// Decoded text goes to stderr, one line per track, labelled with
+        /// the track number, frequency and speed. It is printed by default,
+        /// except when a `[server]` table starts the spotting daemon, so
+        /// that a service log holds spots and diagnostics only. This flag
+        /// prints it there too.
+        #[arg(long, conflicts_with = "json", help_heading = "Output")]
+        decoded_text: bool,
         /// TOML config file that turns this into the full spotting daemon.
         ///
         /// Needs a `[server]` table with the station callsign and ports.
         /// Starts the telnet cluster server, the JSON Lines / WebSocket
         /// stream, and the metrics endpoint alongside the decode loop.
+        ///
+        /// On Linux and macOS, SIGHUP makes the running daemon re-read this
+        /// file and apply its [spot] lists and each [[rbn_uplink]] dry_run
+        /// without a restart; other settings need a restart.
         // `--server-config` stays as a hidden alias for the flag's old
         // name; help advertises the canonical spelling only (D11/MAN-77).
         #[arg(long, alias = "server-config", help_heading = "Server")]
@@ -343,6 +386,8 @@ enum Command {
         engine: Option<Engine>,
         #[command(flatten)]
         filters: FilterOpts,
+        #[command(flatten)]
+        logging: logging::LogOpts,
     },
     /// Run the live decoder for a fixed duration as a stability check.
     ///
@@ -524,12 +569,16 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         timeout_secs: u64,
     },
-    /// Check whether a source is hearing anything, and say what it found.
+    /// Check that this machine is ready to run manta, then whether the
+    /// receiver hears anything.
     ///
-    /// Runs the real decode pipeline for --duration seconds, then reports
-    /// track, SNR and spot counts plus a verdict. Tells "nothing is coming
-    /// in" apart from "signal is coming in but nothing decodes" and from
-    /// "working end to end" -- which a quiet `listen` run cannot.
+    /// First checks the config, the audio library, that the server ports
+    /// are free, the clock against an NTP server, and that each enabled RBN
+    /// uplink target accepts a connection. Then opens the receiver, runs the
+    /// real decode pipeline for --duration seconds and reports track, SNR
+    /// and spot counts plus a verdict. Each check prints PASS, WARN, FAIL or
+    /// SKIP, with a fix for every problem. Exits 1 when a check fails.
+    // MAN-126: the setup checks live in doctor_checks.rs and clock_check.rs.
     Doctor {
         /// How long to listen for, in seconds (3 to 3600).
         #[arg(long, default_value_t = 10)]
@@ -671,9 +720,22 @@ enum Command {
         ///
         /// Falls back to $MANTA_CONFIG. Flags override the file, and
         /// MANTA_<TABLE>_<KEY> environment variables sit between the two.
-        /// `doctor` never starts the spot servers.
+        /// doctor checks [server]'s ports and each [[rbn_uplink]] target,
+        /// but never starts a server or logs in to a collector.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// NTP server the clock check asks for the time, as HOST or
+        /// HOST:PORT.
+        ///
+        /// doctor sends it one time request over UDP port 123. Name a server
+        /// on your own network when outbound NTP is blocked.
+        #[arg(
+            long,
+            default_value = clock_check::DEFAULT_NTP_SERVER,
+            value_parser = clock_check::parse_ntp_server,
+            help_heading = "Setup checks"
+        )]
+        ntp_server: clock_check::NtpServer,
         /// Print the full report as one JSON object instead of a readable
         /// summary.
         #[arg(long, help_heading = "Output")]
@@ -684,6 +746,28 @@ enum Command {
     /// Check or create a config file, without starting anything.
     #[command(subcommand)]
     Config(ConfigCommand),
+    /// Measure decode quality on synthetic signals, no radio needed.
+    #[command(subcommand)]
+    Bench(BenchCommand),
+}
+
+// MAN-116: `manta bench sensitivity`; see bench.rs and
+// docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md.
+#[derive(Subcommand)]
+enum BenchCommand {
+    /// Measure how recall and copy accuracy fall off as SNR drops.
+    ///
+    /// Generates synthetic CW recordings for every combination of channel
+    /// condition, speed and SNR, decodes each one with the same pipeline
+    /// `manta decode` uses, and prints a recall and character-error-rate
+    /// table. Each recording holds ten stations sending "CQ CQ DE <call>
+    /// <call> K" for its whole length. The same manta version and flags
+    /// always print the same table, so a published result can be
+    /// regenerated and checked.
+    ///
+    /// SNR is quoted the way RBN and CW Skimmer quote it: the transmitted
+    /// carrier against the noise in a 500 Hz bandwidth.
+    Sensitivity(bench::SensitivityArgs),
 }
 
 // MAN-76: `manta config check` / `manta config init`; see config_cmd.rs and
@@ -726,7 +810,7 @@ enum ConfigCommand {
 //     ppm per the spec's contract.
 //   - allowlist: the Operator Watch List of ARCHITECTURE §6 / MAN-28.
 //     Legacy precedent: CW Skimmer's Watch List (Aggregator manual App. A2).
-//   - blocklist / notch: MAN-31.
+//   - blocklist / notch: MAN-31. cty / scp: MAN-79.
 /// Flags that decide which decodes become spots. Shared by `decode`,
 /// `listen` and `soak`.
 #[derive(clap::Args, Clone, Debug)]
@@ -766,6 +850,21 @@ struct FilterOpts {
     /// per line.
     #[arg(long)]
     notch: Option<PathBuf>,
+    /// Country-prefix file (AD1C's cty.dat) to check callsigns against, in place of the copy built into manta.
+    ///
+    /// A call whose prefix this file does not list is not spotted unless --allowlist names it,
+    /// so a new prefix or DXpedition is rejected until the file lists it. Download the current
+    /// file from https://www.country-files.com/cty/cty.dat to accept such calls without waiting
+    /// for a new manta release. Defaults to the built-in copy, or to `spot.cty_path` from --config.
+    #[arg(long)]
+    cty: Option<PathBuf>,
+    /// Known-callsign list (MASTER.SCP) to use in place of the copy built into manta.
+    ///
+    /// A call on the list is spotted with more confidence; a call missing from it can still
+    /// be spotted. Download the current list from https://www.supercheckpartial.com/MASTER.SCP.
+    /// Defaults to the built-in copy, or to `spot.scp_path` from --config.
+    #[arg(long)]
+    scp: Option<PathBuf>,
 }
 
 /// KiwiSDR connection flags, grouped to keep `open_source`'s arity down.
@@ -920,9 +1019,12 @@ impl LiveSourceSpec {
                 let mut sources = manta_input::hpsdr::HpsdrDevice::open(cfg)?;
                 Box::new(sources.remove(0))
             }
-            LiveSourceSpec::AudioDevice(device) => {
-                Box::new(manta_input::AudioIqSource::from_device(device.as_deref())?)
-            }
+            // Each (re)open gets its own one-shot silence notice (MAN-131).
+            LiveSourceSpec::AudioDevice(device) => Box::new(
+                manta_input::AudioIqSource::from_device(device.as_deref())?.with_silence_notice(
+                    Box::new(|device| logging::warning(&audio_silence_warning(device))),
+                ),
+            ),
             LiveSourceSpec::File { path, source_iq } => {
                 open_audio_source(None, Some(path.clone()), *source_iq, None)?
             }
@@ -1084,13 +1186,48 @@ impl IqSource for FixedCenterFreqSource {
 /// regressing it.
 fn warn_if_audio_source_has_no_rf_reference(has_rf_aware_source: bool, dial_freq_hz: Option<f64>) {
     if !has_rf_aware_source && dial_freq_hz.is_none() {
-        crate::fmt::diagnostic!(
+        logging::warning(
             "warning: no --dial-freq-hz given for an audio source -- \
              reported frequencies are baseband offsets within the \
              audio passband, not absolute RF frequencies. Pass the \
-             rig's dial frequency, e.g. --dial-freq-hz 14030000."
+             rig's dial frequency, e.g. --dial-freq-hz 14030000.",
         );
     }
+}
+
+/// MAN-131: a live audio input delivering exact zeros is, on macOS, the
+/// usual sign of a denied microphone permission (cpal cannot see TCC; the
+/// stream opens and the callback hands over silence). A warning, not an
+/// error: a muted input is a legitimate state, and `doctor` still reports
+/// NO_SIGNAL on its own.
+fn audio_silence_warning(device: &str) -> String {
+    format!(
+        "warning: audio input {device} is delivering digital silence at {} Hz \
+         (every sample is exactly zero) -- {}",
+        manta_input::TARGET_RATE_HZ,
+        manta_input::audio::audio_input_hint()
+    )
+}
+
+/// MAN-131: `decode`'s analogue of `warn_if_audio_source_has_no_rf_reference`.
+/// `sidecar_center_hz` is `None` when `<stem>.json` does not exist. When this
+/// returns `Some`, the `Decode` handler decodes at a 0.0 centre, so a
+/// negative sidecar value cannot contradict the warning.
+fn recording_center_warning(wav: &Path, sidecar_center_hz: Option<f64>) -> Option<String> {
+    let sidecar = manta_input::sidecar_path(wav);
+    let why = match sidecar_center_hz {
+        Some(hz) if hz > 0.0 => return None,
+        Some(hz) => format!(
+            "sidecar {} gives center_freq_hz = {hz}, not an RF frequency",
+            sidecar.display()
+        ),
+        None => format!("no sidecar {} next to {}", sidecar.display(), wav.display()),
+    };
+    Some(format!(
+        "warning: {why} -- reported frequencies are baseband offsets from the \
+         recording's centre, not absolute RF frequencies. Pass the centre \
+         frequency, e.g. --center-freq-hz 14000000."
+    ))
 }
 
 /// Wrap `src` in a `DecimatingSource` targeting `capture_rate_hz`, unless
@@ -1335,8 +1472,18 @@ fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
     check_dial_freq_hz("--dial-freq-hz", hz)
 }
 
+/// `decode --center-freq-hz` (MAN-131). The parse error is just the
+/// `ParseFloatError` text: clap already prints the flag and the value.
+fn parse_center_freq_hz(s: &str) -> std::result::Result<f64, String> {
+    let hz: f64 = s
+        .parse()
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+    check_dial_freq_hz("--center-freq-hz", hz)
+}
+
 /// `parse_dial_freq_hz`'s check, shared with `input.center_freq_hz`
-/// (MAN-261); `name` is the flag or config key the message cites.
+/// (MAN-261) and `decode --center-freq-hz` (MAN-131); `name` is the flag
+/// or config key the message cites.
 fn check_dial_freq_hz(name: &str, hz: f64) -> std::result::Result<f64, String> {
     if !hz.is_finite() || hz <= 0.0 {
         return Err(format!(
@@ -1467,28 +1614,44 @@ fn strip_bom(text: &str) -> &str {
 /// defaults.
 fn build_pipeline_config(
     freq_correction_ppm: f64,
-    allowlist: Vec<String>,
-    blocklist: Option<PathBuf>,
-    notch: Option<PathBuf>,
+    spot: &SpotResolved,
     detector: manta_engine::DetectorConfig,
     engine: Engine,
 ) -> Result<PipelineConfig> {
     let mut cfg = PipelineConfig {
         freq_correction_ppm,
-        allowlist,
+        allowlist: spot.allowlist.clone(),
         detector,
         ..Default::default()
     };
     cfg.decode.engine = engine;
-    if let Some(path) = blocklist {
-        let text = std::fs::read_to_string(&path)
+    if let Some(path) = &spot.blocklist {
+        let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading blocklist file {}", path.display()))?;
         cfg.blocklist = manta_engine::Blocklist::parse(strip_bom(&text));
     }
-    if let Some(path) = notch {
-        let text = std::fs::read_to_string(&path)
+    if let Some(path) = &spot.notch {
+        let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading notch file {}", path.display()))?;
         cfg.notch = manta_engine::NotchList::parse(strip_bom(&text));
+    }
+    if let Some(path) = &spot.cty {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading cty.dat file {}", path.display()))?;
+        let table = manta_spot::cty::Table::parse(strip_bom(&text));
+        if table.is_empty() {
+            bail!("cty.dat file {} lists no callsign prefixes; is it AD1C's cty.dat (not cty.csv or a saved web page)?", path.display());
+        }
+        cfg.cty = Some(std::sync::Arc::new(table));
+    }
+    if let Some(path) = &spot.scp {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading master.scp file {}", path.display()))?;
+        let set = manta_spot::scp::Set::parse(strip_bom(&text));
+        if set.is_empty() {
+            bail!("master.scp file {} lists no callsigns", path.display());
+        }
+        cfg.scp = Some(std::sync::Arc::new(set));
     }
     Ok(cfg)
 }
@@ -1932,6 +2095,30 @@ fn merge_cli_engine(
     file_decode
 }
 
+/// MAN-78 (supersedes MAN-85's ctrlc `termination` feature on Unix):
+/// SIGTERM always drains; SIGHUP drains too unless this is a daemon
+/// (`[server]`), where it requests a reload instead -- the returned
+/// `Signals` buffers it for `reload::spawn`. Installed with ctrlc, before
+/// the `listening:` banner (MAN-122 round 6). ctrlc refuses to share a
+/// signal (`MultipleHandlers`), so it must no longer own SIGTERM/SIGHUP.
+#[cfg(unix)]
+fn install_unix_signal_handlers(
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    daemon: bool,
+) -> Result<Option<signal_hook::iterator::Signals>> {
+    use signal_hook::consts::{SIGHUP, SIGTERM};
+    signal_hook::flag::register(SIGTERM, stop.clone()).context("installing the SIGTERM handler")?;
+    if daemon {
+        let signals = signal_hook::iterator::Signals::new([SIGHUP])
+            .context("installing the SIGHUP handler")?;
+        Ok(Some(signals))
+    } else {
+        signal_hook::flag::register(SIGHUP, stop.clone())
+            .context("installing the SIGHUP handler")?;
+        Ok(None)
+    }
+}
+
 /// Handles what the `Run` on-spot closure needs to feed a running spot server.
 struct SpotServer {
     bus: std::sync::Arc<manta_server::bus::SpotBus>,
@@ -1947,7 +2134,7 @@ struct SpotServer {
     /// `SHUTDOWN_DRAIN_DEADLINE`) instead of guessing a fixed sleep
     /// duration -- see `shutdown_runtime_after_drain`.
     tasks: manta_server::tasks::ClientTasks,
-    /// MAN-136/MAN-45: the same `cty::Table` handed to `JsonStreamConfig`,
+    /// The run's resolved table, shared with the validator and `JsonStreamConfig`,
     /// kept here too so the publish callback can check resolvability once
     /// per spot for `manta_spots_unresolved_geography_total` -- checking
     /// inside `SpotMessage::from_spot` would scale with connected client
@@ -1980,6 +2167,27 @@ struct SpotServer {
     /// tests without guessing or binding a fixed port.
     #[cfg_attr(not(test), allow(dead_code))]
     metrics_addr: std::net::SocketAddr,
+    /// The JSON listener's real bound address, so a port-0 bind is reachable
+    /// by tests -- `metrics_addr`'s MAN-44 precedent.
+    #[cfg_attr(not(test), allow(dead_code))]
+    json_addr: std::net::SocketAddr,
+    /// MAN-78: each `[[rbn_uplink]]` task's live `dry_run` flag, in config
+    /// order, for the SIGHUP reload thread (Unix only) to flip.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    uplink_dry_run: Vec<UplinkDryRun>,
+}
+
+/// MAN-78: one `[[rbn_uplink]]` target's live `dry_run` flag, read per
+/// spot by `uplink::serve_with_live_dry_run`, and the same `host:port`
+/// label `/metrics` uses (MAN-128 D7) for the reload's log line.
+#[derive(Clone)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct UplinkDryRun {
+    label: String,
+    /// The entry's `enabled`: a disabled target runs no task, so nothing
+    /// reads its flag.
+    enabled: bool,
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 // MAN-89 (PR #131 review, round 7): the "would `from_spot` emit the
@@ -2305,26 +2513,15 @@ fn input_health_of(
 
 /// MAN-128: feeds `manta_build_info`. `git_sha` comes from `build.rs`
 /// (`MANTA_GIT_SHA`, "unknown" with no `.git` -- e.g. a Docker build
-/// context, which `.dockerignore` excludes it from). Deliberately separate
-/// from `decoder_version` below: that string is the JSON spot wire
-/// contract and a byte-identical-replay input, neither of which may vary
-/// with the commit a binary happens to be built from.
+/// context, which `.dockerignore` excludes it from). MAN-83: the values are
+/// `build_info`'s constants, the same ones `--version` and the JSON
+/// stream's `decoderVersion` read, so the gauge, the version line and the
+/// spots always name the same build.
 fn daemon_build_info() -> manta_server::metrics::BuildInfo {
-    let mut features = Vec::new();
-    if cfg!(feature = "hpsdr") {
-        features.push("hpsdr");
-    }
-    if cfg!(feature = "soapy") {
-        features.push("soapy");
-    }
     manta_server::metrics::BuildInfo {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        git_sha: env!("MANTA_GIT_SHA").to_string(),
-        features: if features.is_empty() {
-            "none".to_string()
-        } else {
-            features.join(",")
-        },
+        version: build_info::VERSION.to_string(),
+        git_sha: build_info::GIT_SHA.to_string(),
+        features: build_info::FEATURES.to_string(),
     }
 }
 
@@ -2392,36 +2589,23 @@ fn start_spot_server(
     source: SourceInfo<'_>,
     epoch: std::time::SystemTime,
     session_nonce: u128,
+    cty: std::sync::Arc<manta_spot::cty::Table>,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
-    // MAN-59: the daemon's only durable record of connection events/
-    // rejections was the live Prometheus counters (no history, reset on
-    // restart) -- nothing to reconstruct WHAT happened or FROM WHERE
-    // after an abuse incident. `try_init` (not `init`, which panics on a
-    // second call) since this function is the sole place the daemon's
-    // Tokio runtime is constructed, but a defensive no-op on an
-    // already-initialized global subscriber costs nothing. `RUST_LOG`
-    // overrides; unset defaults to `info` -- connection/rejection events
-    // below are logged at `info`/`warn`, so an operator gets useful
-    // output with zero configuration, and can raise verbosity for deeper
-    // debugging without a code change.
-    //
-    // MAN-59 review round 6 (P1): `fmt()` writes to stdout by default,
-    // but `Command::Run --json` ALSO writes DecoderEvents/spots as
-    // JSON Lines to stdout (below) -- AGENTS.md's "file input ->
-    // byte-identical spot logs" hard requirement means any interleaved
-    // non-JSON tracing line corrupts that machine-readable stream for
-    // real consumers and breaks deterministic-replay byte-identity.
-    // stderr is a separate stream a JSON-Lines consumer never reads.
-    let _ = tracing_subscriber::fmt()
-        .with_writer(fmt::monitor_aware_stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init();
+    // MAN-59 connection/rejection events below are logged at `info`/
+    // `warn`. `start_spot_server` no longer installs the subscriber:
+    // `logging::init` does, at the top of `run` (MAN-124), and its module
+    // doc carries the stderr-not-stdout reasoning (MAN-59 round 6).
 
     // MAN-261: `[server]`/`[[rbn_uplink]]` arrive already parsed and
     // validated by `config::load`, before any source was opened.
+    //
+    // MAN-138: `config::load` already rejected an inconsistent location
+    // before I/O; this re-resolution obtains the value every JSON spot
+    // carries, and still rejects one for a caller that built its
+    // `ServerConfig` directly.
+    let station_location = cfg
+        .station_location()
+        .map_err(|e| anyhow!("[server]: {e}"))?;
     let bus = std::sync::Arc::new(manta_server::bus::SpotBus::new(
         source.sample_rate_hz,
         epoch,
@@ -2429,19 +2613,19 @@ fn start_spot_server(
     ));
     let metrics = std::sync::Arc::new(manta_server::metrics::Metrics::new());
     metrics.set_build_info(daemon_build_info());
-    let cty = std::sync::Arc::new(manta_spot::cty::Table::parse(manta_spot::CTY_DAT));
-    // MAN-128: stays SHA-free and feature-free on purpose -- this is the
-    // JSON spot wire contract (ARCHITECTURE §7) and a byte-identical-
-    // replay input (AGENTS.md's "file input -> byte-identical spot logs"
-    // hard requirement), neither of which may vary with the commit or
-    // build flags a given binary happens to carry. `manta_build_info`
-    // above is the right place for that information instead.
-    let decoder_version = format!("manta-{}", env!("CARGO_PKG_VERSION"));
+    // MAN-83: the commit rides as SemVer build metadata, so every spot names
+    // the binary that produced it (`manta-<version>+<sha>`). Same-binary
+    // byte-identity (SPEC §6 item 4) holds because this is a compile-time
+    // constant, and the outputs CI hashes (`decode --json`, `run --json`)
+    // never carry it. Supersedes MAN-128's note keeping this string free of
+    // the commit; see
+    // docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md.
+    let decoder_version = build_info::DECODER_VERSION.to_string();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let tasks = manta_server::tasks::new_client_tasks();
 
     let rt = tokio::runtime::Runtime::new()?;
-    let (status_line, metrics_addr) = rt.block_on(async {
+    let (status_line, metrics_addr, json_addr, uplink_dry_run) = rt.block_on(async {
         // MAN-132: metrics binds its own `metrics_bind_addr` (loopback by
         // default), never `bind_addr`. With two configurable addresses
         // "which listener failed?" is a real question, so each bind names
@@ -2476,6 +2660,7 @@ fn start_spot_server(
                     )
                 })?;
         let metrics_addr = metrics_listener.local_addr()?;
+        let json_addr = json_listener.local_addr()?;
 
         // MAN-122 scenario 1. Emitted after every bind succeeds (so a bind
         // failure never produces a banner at all) but BEFORE any listener task is
@@ -2530,6 +2715,14 @@ fn start_spot_server(
                  (Aggregator manual v6.0 §9.2)"
             );
         }
+        // MAN-138: without a configured position every JSON spot's
+        // deGrid/deLat/deLon is null -- legal, but a map shows nothing.
+        if station_location.is_none() {
+            tracing::warn!(
+                "JSON spots will carry no station position -- set [server].operator_grid, or \
+                 operator_lat and operator_lon, so deGrid/deLat/deLon name this node's location"
+            );
+        }
         let profile = std::sync::Arc::new(station_profile(
             &cfg,
             source.dial_freq_hz,
@@ -2574,6 +2767,7 @@ fn start_spot_server(
                     metrics: metrics.clone(),
                     cty: cty.clone(),
                     station_call: cfg.station_callsign.clone(),
+                    station_location,
                     decoder_version,
                     // .clone(): MAN-32/MAN-42's uplink::serve spawns below also
                     // need shutdown_rx -- can't let this be the moving consumer
@@ -2614,10 +2808,20 @@ fn start_spot_server(
             .into_iter()
             .zip(uplink_labels)
             .map(|(uplink_cfg, label)| {
-                let target = metrics.register_uplink_target(label, uplink_cfg.enabled);
-                (uplink_cfg, target)
+                let target = metrics.register_uplink_target(label.clone(), uplink_cfg.enabled);
+                // MAN-78: one live flag per entry, seeded from the file.
+                let dry_run = UplinkDryRun {
+                    label,
+                    enabled: uplink_cfg.enabled,
+                    flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                        uplink_cfg.dry_run,
+                    )),
+                };
+                (uplink_cfg, target, dry_run)
             })
             .collect();
+        let uplink_dry_run: Vec<UplinkDryRun> =
+            uplink_tasks.iter().map(|(_, _, d)| d.clone()).collect();
         let metrics_ip_request_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
             manta_server::metrics_http::MAX_METRICS_REQUESTS_PER_IP,
             manta_server::metrics_http::METRICS_REQUEST_RATE_WINDOW,
@@ -2652,12 +2856,13 @@ fn start_spot_server(
         // MAN-128 D6/D7: each target was registered above, before both its
         // `serve` task and the metrics endpoint, so a scrape landing before
         // the first connect attempt still sees it.
-        for (uplink_cfg, target) in uplink_tasks {
-            tokio::spawn(manta_server::uplink::serve(
+        for (uplink_cfg, target, dry_run) in uplink_tasks {
+            tokio::spawn(manta_server::uplink::serve_with_live_dry_run(
                 uplink_cfg,
                 cfg.station_callsign.clone(),
                 bus.clone(),
                 target,
+                dry_run.flag,
                 shutdown_rx.clone(),
             ));
         }
@@ -2675,7 +2880,7 @@ fn start_spot_server(
             shutdown_rx.clone(),
         );
 
-        anyhow::Ok((status_line, metrics_addr))
+        anyhow::Ok((status_line, metrics_addr, json_addr, uplink_dry_run))
     })?;
 
     Ok((
@@ -2694,12 +2899,16 @@ fn start_spot_server(
             cty,
             status_line: std::sync::Mutex::new(status_line),
             metrics_addr,
+            json_addr,
+            uplink_dry_run,
         },
     ))
 }
 
 /// The command line's say in source/input/spot selection, before it is
 /// merged over the config file and environment (`resolve`, MAN-261).
+/// `Clone` so a SIGHUP reload (MAN-78) re-resolves with the same flags.
+#[derive(Clone)]
 struct CliOverrides {
     device: Option<String>,
     source: Option<PathBuf>,
@@ -2716,6 +2925,8 @@ struct CliOverrides {
     allowlist: Vec<String>,
     blocklist: Option<PathBuf>,
     notch: Option<PathBuf>,
+    cty: Option<PathBuf>,
+    scp: Option<PathBuf>,
 }
 
 impl CliOverrides {
@@ -2753,6 +2964,8 @@ impl CliOverrides {
             allowlist: Vec::new(),
             blocklist: None,
             notch: None,
+            cty: None,
+            scp: None,
         }
     }
 
@@ -2808,6 +3021,8 @@ struct SpotResolved {
     allowlist: Vec<String>,
     blocklist: Option<PathBuf>,
     notch: Option<PathBuf>,
+    cty: Option<PathBuf>,
+    scp: Option<PathBuf>,
 }
 
 /// A non-empty `--allowlist` replaces the file's list (never concatenated);
@@ -2816,6 +3031,8 @@ fn resolve_spot(
     cli_allowlist: Vec<String>,
     cli_blocklist: Option<PathBuf>,
     cli_notch: Option<PathBuf>,
+    cli_cty: Option<PathBuf>,
+    cli_scp: Option<PathBuf>,
     spot: &config::SpotFile,
 ) -> SpotResolved {
     SpotResolved {
@@ -2826,6 +3043,8 @@ fn resolve_spot(
         },
         blocklist: cli_blocklist.or_else(|| spot.blocklist_path.clone()),
         notch: cli_notch.or_else(|| spot.notch_path.clone()),
+        cty: cli_cty.or_else(|| spot.cty_path.clone()),
+        scp: cli_scp.or_else(|| spot.scp_path.clone()),
     }
 }
 
@@ -2848,6 +3067,8 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
         cli.allowlist.clone(),
         cli.blocklist.clone(),
         cli.notch.clone(),
+        cli.cty.clone(),
+        cli.scp.clone(),
         &loaded.spot,
     );
     let mut shared = loaded.input.shared.clone();
@@ -2941,6 +3162,59 @@ fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Resul
     })
 }
 
+/// `run`'s dial guard (MAN-34): with `[server]`, a receiver that reports no
+/// real RF frequency needs a dial frequency, or every spot is a baseband
+/// offset. Shared with `manta doctor`'s `config` check (MAN-126).
+fn needs_dial_freq(has_server: bool, rf_aware: bool, dial_freq_hz: Option<f64>) -> bool {
+    has_server && !rf_aware && dial_freq_hz.is_none()
+}
+
+/// How `manta doctor` names the configured receiver. Never includes the
+/// KiwiSDR password.
+fn receiver_desc(spec: &LiveSourceSpec) -> doctor_checks::ReceiverDesc {
+    use doctor_checks::{ReceiverDesc, ReceiverKind};
+    let (kind, description) = match spec {
+        LiveSourceSpec::Kiwi(kiwi) => (
+            ReceiverKind::Kiwi,
+            format!(
+                "KiwiSDR {}:{}",
+                kiwi.host.as_deref().unwrap_or_default(),
+                kiwi.port
+            ),
+        ),
+        #[cfg(feature = "soapy")]
+        LiveSourceSpec::Soapy(soapy) => (
+            ReceiverKind::Soapy,
+            format!(
+                "SoapySDR device \"{}\"",
+                soapy.driver.as_deref().unwrap_or_default()
+            ),
+        ),
+        #[cfg(feature = "hpsdr")]
+        LiveSourceSpec::Hpsdr(hpsdr) => (
+            ReceiverKind::Hpsdr,
+            format!(
+                "HPSDR radio {}:{}",
+                hpsdr.host.as_deref().unwrap_or_default(),
+                hpsdr.port
+            ),
+        ),
+        LiveSourceSpec::AudioDevice(None) => (
+            ReceiverKind::SoundCard,
+            "the system default sound-card input".to_string(),
+        ),
+        LiveSourceSpec::AudioDevice(Some(name)) => (
+            ReceiverKind::SoundCard,
+            format!("the sound-card input matching \"{name}\""),
+        ),
+        LiveSourceSpec::File { path, .. } => (
+            ReceiverKind::File,
+            format!("the WAV file {}", path.display()),
+        ),
+    };
+    ReceiverDesc { kind, description }
+}
+
 /// `run`/`soak`/`doctor`'s shared start: load the config (`--config`, else
 /// `MANTA_CONFIG`) with the `MANTA_*` overlay, merge the CLI over it, print
 /// the merge notes, and build the pipeline config. The environment is read
@@ -2953,6 +3227,38 @@ struct Prepared {
     pipeline: PipelineConfig,
 }
 
+/// MAN-79 scenario 2: one stderr line when the built-in cty.dat is in use
+/// and older than manta_spot::vintage::CTY_DAT_STALE_AFTER_DAYS. `now` is a
+/// parameter so tests never depend on today's date.
+fn bundled_cty_warning(cty_overridden: bool, now: std::time::SystemTime) -> Option<String> {
+    if cty_overridden {
+        return None;
+    }
+    let days = manta_spot::vintage::stale_cty_dat_age_days(now)?;
+    Some(format!(
+        "warning: the built-in cty.dat is {days} days old (retrieved {}), so calls from \
+         prefixes allocated since then are not spotted. Download the current file from \
+         https://www.country-files.com/cty/cty.dat and pass it with --cty or set spot.cty_path.",
+        manta_spot::vintage::CTY_DAT_RETRIEVED
+    ))
+}
+
+/// Shared typed config and source resolution, with no pipeline assets or I/O.
+struct SourcePrepared {
+    resolved: Resolved,
+}
+
+fn prepare_source(cli: CliOverrides, config_flag: Option<PathBuf>) -> Result<SourcePrepared> {
+    let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+    let config_path = config_flag.or_else(|| config::config_path_from_env(&vars));
+    let loaded = config::load(config_path.as_deref(), config::Env::Read(&vars))?;
+    let resolved = resolve(cli, &loaded)?;
+    for note in &resolved.notes {
+        logging::note(note);
+    }
+    Ok(SourcePrepared { resolved })
+}
+
 fn prepare_live(
     cli: CliOverrides,
     config_flag: Option<PathBuf>,
@@ -2960,17 +3266,35 @@ fn prepare_live(
 ) -> Result<Prepared> {
     let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
     let config_path = config_flag.or_else(|| config::config_path_from_env(&vars));
-    let loaded = config::load(config_path.as_deref(), config::Env::Read(&vars))?;
-    let resolved = resolve(cli, &loaded)?;
-    for note in &resolved.notes {
-        crate::fmt::diagnostic!("{note}");
+    let prepared = prepare_config(cli, config_path, cli_engine, &vars)?;
+    for note in &prepared.resolved.notes {
+        logging::note(note);
     }
+    if let Some(warning) = bundled_cty_warning(
+        prepared.pipeline.cty.is_some(),
+        std::time::SystemTime::now(),
+    ) {
+        logging::warning(&warning);
+    }
+    Ok(prepared)
+}
+
+/// `prepare_live`'s non-printing core, given the already-chosen config
+/// path and the environment: load + `MANTA_*` overlay, CLI merge, and the
+/// blocklist/notch file reads. A SIGHUP reload (MAN-78) re-runs exactly
+/// this, so `manta config check` passing means a reload passes too.
+fn prepare_config(
+    cli: CliOverrides,
+    config_path: Option<PathBuf>,
+    cli_engine: Option<Engine>,
+    vars: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<Prepared> {
+    let loaded = config::load(config_path.as_deref(), config::Env::Read(vars))?;
+    let resolved = resolve(cli, &loaded)?;
     let decode = merge_cli_engine(cli_engine, loaded.decode.clone());
     let mut pipeline = build_pipeline_config(
         resolved.freq_correction_ppm,
-        resolved.spot.allowlist.clone(),
-        resolved.spot.blocklist.clone(),
-        resolved.spot.notch.clone(),
+        &resolved.spot,
         loaded.detector,
         decode.engine,
     )?;
@@ -2986,19 +3310,27 @@ fn prepare_live(
 /// `decode`/`oracle`: one stderr note naming the tables present in the file
 /// that the command does not apply (D7).
 fn note_ignored_tables(loaded: &config::Loaded, command: &str, applied: &[&str]) {
+    if let Some(note) = ignored_tables_note(loaded, command, applied) {
+        eprintln!("{note}");
+    }
+}
+
+/// The text of `note_ignored_tables`'s note, or `None` when every present
+/// table applies (`bench sensitivity` returns it instead of printing it).
+fn ignored_tables_note(loaded: &config::Loaded, command: &str, applied: &[&str]) -> Option<String> {
     let ignored: Vec<&str> = loaded
         .present
         .iter()
         .map(String::as_str)
         .filter(|t| !applied.contains(t))
         .collect();
-    if !ignored.is_empty() {
-        crate::fmt::diagnostic!(
+    (!ignored.is_empty()).then(|| {
+        format!(
             "note: {command} ignores [{}] from {}",
             ignored.join("], ["),
             loaded.origin
-        );
-    }
+        )
+    })
 }
 
 /// Resolves the address(es) `manta status` should DIAL to reach a running
@@ -3412,7 +3744,14 @@ fn main() -> std::process::ExitCode {
     match run_command() {
         Ok(code) => code,
         Err(err) => {
-            crate::fmt::diagnostic!("{}", fmt::render_error(&err));
+            // MAN-124: under --log-format json the error is a log record too,
+            // whatever the level filter; exit status stays 1. MAN-270: in
+            // text mode it is one escaped `error:` line.
+            if logging::is_json() {
+                logging::fatal(&fmt::cause_text(&err));
+            } else {
+                eprintln!("{}", fmt::render_error(&err));
+            }
             std::process::ExitCode::FAILURE
         }
     }
@@ -3421,8 +3760,20 @@ fn main() -> std::process::ExitCode {
 fn run_command() -> Result<std::process::ExitCode> {
     warn_deprecations();
     match Cli::parse().command {
+        Command::Devices { json } => std::process::exit(devices::run(json)?),
+        Command::Check(args) => {
+            let code = match source_check::run(args) {
+                Ok(code) => code,
+                Err(error) => {
+                    eprintln!("{}", fmt::render_error(&error));
+                    1
+                }
+            };
+            std::process::exit(code);
+        }
         Command::Decode {
             path,
+            center_freq_hz,
             json,
             filters,
             config,
@@ -3433,6 +3784,8 @@ fn run_command() -> Result<std::process::ExitCode> {
                 allowlist,
                 blocklist,
                 notch,
+                cty,
+                scp,
             } = filters;
             // D7/D8: the whole file is validated, the environment is never
             // read; [decode], [detector], [spot] and input.freq_correction_ppm
@@ -3445,30 +3798,43 @@ fn run_command() -> Result<std::process::ExitCode> {
                 || shared.capture_rate_hz.is_some()
                 || shared.replay_epoch.is_some()
             {
-                crate::fmt::diagnostic!(
+                eprintln!(
                     "note: decode applies only input.freq_correction_ppm from [input] in {}",
                     loaded.origin
                 );
             }
-            let spot = resolve_spot(allowlist, blocklist, notch, &loaded.spot);
+            let spot = resolve_spot(allowlist, blocklist, notch, cty, scp, &loaded.spot);
             let decode_cfg = merge_cli_engine(engine, loaded.decode.clone());
             let mut cfg = build_pipeline_config(
                 freq_correction_ppm
                     .or(loaded.input.shared.freq_correction_ppm)
                     .unwrap_or(0.0),
-                spot.allowlist,
-                spot.blocklist,
-                spot.notch,
+                &spot,
                 loaded.detector,
                 decode_cfg.engine,
             )?;
             cfg.decode = decode_cfg;
-            let report = decode_wav(&path, &cfg)?;
+            // MAN-131: say so before decoding when the reported frequencies
+            // will be baseband offsets. Only for an existing file, so a
+            // missing WAV still fails with just its `open WAV` error.
+            let mut center_freq_hz = center_freq_hz;
+            if center_freq_hz.is_none() && path.is_file() {
+                let sidecar = manta_input::read_sidecar(&path)?;
+                if let Some(warning) =
+                    recording_center_warning(&path, sidecar.map(|sc| sc.center_freq_hz))
+                {
+                    eprintln!("{warning}");
+                    // Keep the warning true: a negative sidecar centre
+                    // decodes at 0.0, not shifted by itself.
+                    center_freq_hz = Some(0.0);
+                }
+            }
+            let report = decode_wav(&path, center_freq_hz, &cfg)?;
             if json {
                 println!("{}", serde_json::to_string(&report)?);
             } else {
                 println!("{}", report.text);
-                crate::fmt::diagnostic!("{}", fmt::decode_summary(&report));
+                eprintln!("{}", fmt::decode_summary(&report));
             }
         }
         Command::Oracle {
@@ -3523,7 +3889,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             };
             std::fs::create_dir_all(&out)?;
             let manifest = manta_testkit::vectors::write_fixture_set(&spec, &out)?;
-            crate::fmt::diagnostic!(
+            eprintln!(
                 "wrote {}/{{{}.wav,{}.json,{}.manifest.json}} (expected frequency {})",
                 out.display(),
                 spec.name,
@@ -3559,58 +3925,77 @@ fn run_command() -> Result<std::process::ExitCode> {
             source_iq,
             filters,
             json,
+            decoded_text,
             config,
             dial_freq_hz,
             replay_epoch,
             engine,
+            logging: log_opts,
         } => {
+            // MAN-124: first, so every later stderr line of `run` (startup
+            // notes, a fatal config error) exists after the subscriber does.
+            logging::init(&log_opts);
             let FilterOpts {
                 freq_correction_ppm,
                 allowlist,
                 blocklist,
                 notch,
+                cty,
+                scp,
             } = filters;
+            let cli = CliOverrides {
+                device,
+                source,
+                source_iq,
+                kiwi: KiwiOpts {
+                    host: kiwi_host,
+                    port: kiwi_port,
+                    freq: kiwi_freq_hz,
+                    password: kiwi_password,
+                },
+                #[cfg(feature = "soapy")]
+                soapy: SoapyOpts {
+                    driver: soapy_driver,
+                    freq: soapy_freq_hz,
+                    rate: soapy_rate_hz,
+                    gain: soapy_gain,
+                },
+                #[cfg(feature = "hpsdr")]
+                hpsdr: HpsdrOpts {
+                    host: hpsdr_host,
+                    port: hpsdr_port,
+                    freq: hpsdr_freq_hz,
+                    rate: hpsdr_rate_hz,
+                },
+                freq_correction_ppm,
+                dial_freq_hz,
+                capture_rate_hz,
+                replay_epoch,
+                allowlist,
+                blocklist,
+                notch,
+                cty,
+                scp,
+            };
+            // MAN-78: a SIGHUP reload re-resolves with the same flags.
+            #[cfg(unix)]
+            let reload_cli = cli.clone();
+            #[cfg(unix)]
+            let vars: Vec<_> = std::env::vars_os().collect();
             let Prepared {
                 config_path,
                 loaded,
                 resolved,
                 pipeline: cfg,
-            } = prepare_live(
-                CliOverrides {
-                    device,
-                    source,
-                    source_iq,
-                    kiwi: KiwiOpts {
-                        host: kiwi_host,
-                        port: kiwi_port,
-                        freq: kiwi_freq_hz,
-                        password: kiwi_password,
-                    },
-                    #[cfg(feature = "soapy")]
-                    soapy: SoapyOpts {
-                        driver: soapy_driver,
-                        freq: soapy_freq_hz,
-                        rate: soapy_rate_hz,
-                        gain: soapy_gain,
-                    },
-                    #[cfg(feature = "hpsdr")]
-                    hpsdr: HpsdrOpts {
-                        host: hpsdr_host,
-                        port: hpsdr_port,
-                        freq: hpsdr_freq_hz,
-                        rate: hpsdr_rate_hz,
-                    },
-                    freq_correction_ppm,
-                    dial_freq_hz,
-                    capture_rate_hz,
-                    replay_epoch,
-                    allowlist,
-                    blocklist,
-                    notch,
-                },
-                config,
-                engine,
-            )?;
+            } = prepare_live(cli, config, engine)?;
+            // MAN-268: an unedited manta.example.toml must not start a
+            // daemon that spots, or logs in to a collector, as N0CALL.
+            // Checked first, on the identities after the MANTA_* overlay:
+            // before `is_rf_aware()` (which opens IQ WAVs), the
+            // dial-frequency guard, and any source or listener. Callsigns
+            // only; `config check` keeps the broad placeholder scan. See
+            // docs/DECISIONS/2026-10-10-man268-unattended-packaging.md.
+            config_cmd::reject_example_callsigns(&loaded)?;
             let spec = &resolved.spec;
             let dial_freq_hz = resolved.dial_freq_hz;
             // Needed to derive a recording-specific replay epoch/nonce.
@@ -3623,7 +4008,7 @@ fn run_command() -> Result<std::process::ExitCode> {
 
             // Servers start iff the resolved config has a [server] table
             // (D7); the guard runs after the load and before any source I/O.
-            if loaded.server.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
+            if needs_dial_freq(loaded.server.is_some(), has_rf_aware_source, dial_freq_hz) {
                 bail!(
                     "--dial-freq-hz is required with --config when using a plain \
                      audio device or --source WAV file -- neither reports a real RF \
@@ -3633,13 +4018,24 @@ fn run_command() -> Result<std::process::ExitCode> {
                 );
             }
             if config_path.is_some() && loaded.server.is_none() {
-                crate::fmt::diagnostic!(
+                logging::note(&format!(
                     "note: {} has no [server] table; the telnet/JSON/metrics servers are not \
                      started",
                     loaded.origin
-                );
+                ));
             }
             warn_if_audio_source_has_no_rf_reference(has_rf_aware_source, dial_freq_hz);
+            // MAN-78: a daemon's SIGHUP is a reload, so it must not land on
+            // this thread, the decode loop's: see `reload::mask_sighup`.
+            // Blocked before the source, the servers and the reload thread
+            // start, so each inherits the mask and only the reload thread
+            // unblocks it. SIGINT/SIGTERM still reach this thread; they end
+            // the run anyway.
+            #[cfg(unix)]
+            if loaded.server.is_some() {
+                reload::mask_sighup(libc::SIG_BLOCK)
+                    .context("blocking SIGHUP on the decode thread")?;
+            }
             let first = spec.open(resolved.capture_rate_hz, dial_freq_hz)?;
             let replay_epoch = resolved.replay_epoch;
 
@@ -3666,11 +4062,18 @@ fn run_command() -> Result<std::process::ExitCode> {
             // banner itself still precedes the listener
             // tasks (see `start_spot_server`), so its ordering against
             // per-connection lines is unchanged.
+            //
+            // MAN-78: ctrlc covers SIGINT, plus Ctrl-C/Ctrl-Break on
+            // Windows; on Unix, `install_unix_signal_handlers` adds SIGTERM
+            // and SIGHUP at the same point, so the same covered window
+            // holds for every signal.
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_handler = stop.clone();
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
+            #[cfg(unix)]
+            let reload_signals = install_unix_signal_handlers(&stop, loaded.server.is_some())?;
 
             // Kept alive for the process lifetime: dropping it would stop
             // the spawned server tasks. `None` when --config wasn't
@@ -3746,6 +4149,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                         },
                         epoch,
                         session_nonce,
+                        cfg.cty_table(),
                     )?;
                     // MAN-45 (round-9 finding): the daemon's own copy of the
                     // gauge `manta_engine::listen_with_observers` updates as
@@ -3832,6 +4236,37 @@ fn run_command() -> Result<std::process::ExitCode> {
                 None => (None, None, None, None, None, None),
             };
 
+            // MAN-78: with a `[server]` table, SIGHUP reloads the `[spot]`
+            // lists and each `[[rbn_uplink]]` `dry_run` (D2). The thread
+            // starts after `start_spot_server`, so its log lines have a
+            // subscriber; a SIGHUP that arrived earlier is buffered by
+            // `Signals` and handled as soon as it starts.
+            let operator_lists = std::sync::Arc::new(manta_engine::OperatorListsUpdate::default());
+            let drain_gate = std::sync::Arc::new(reload::DrainGate::default());
+            #[cfg(unix)]
+            let reload_enabled = match (reload_signals, &spot_server) {
+                (Some(signals), Some(server)) => {
+                    reload::spawn(
+                        signals,
+                        reload::ReloadContext {
+                            config_path: config_path.clone(),
+                            cli: reload_cli,
+                            cli_engine: engine,
+                            vars,
+                            startup_raw: loaded.raw.clone(),
+                            lists: operator_lists.clone(),
+                            uplinks: server.uplink_dry_run.clone(),
+                            drain_gate: drain_gate.clone(),
+                            stop: stop.clone(),
+                        },
+                    )?;
+                    true
+                }
+                _ => false,
+            };
+            #[cfg(not(unix))]
+            let reload_enabled = false;
+
             // MAN-73: wrap every reconnectable source so a later read
             // error/EOF is retried with `manta-server::backoff`'s policy
             // instead of propagating out of `listen()` and ending the
@@ -3893,10 +4328,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                 });
             }
 
-            // Printed via the coordinated stderr writer because
-            // the subscriber is only initialized inside
-            // `start_spot_server` -- a plain `listen` (no --server-config)
-            // has no subscriber at all. Two jobs: `listen` otherwise prints
+            // A plain stderr line in text mode rather than `tracing::info!`,
+            // so `-q`/`RUST_LOG` never hide it there; under `--log-format
+            // json` it is a leveled INFO record (MAN-124). Two jobs: `listen` otherwise prints
             // nothing at startup (2026-09-05 review, lens 1 #4/#7), and it
             // is the readiness handshake `tests/signal_shutdown.rs` waits
             // for. It remains AFTER `ctrlc::set_handler`, which as of
@@ -3908,8 +4342,17 @@ fn run_command() -> Result<std::process::ExitCode> {
             // default disposition. If the fuller startup banner (lens 1 #7)
             // ever replaces this line, `READY_MARKER` must be updated to
             // match. stdout stays pure JSON under `--json` (MAN-59
-            // round 6); this goes to stderr.
-            crate::fmt::diagnostic!("manta: listening; send SIGINT or SIGTERM to stop");
+            // round 6); this goes to stderr. MAN-78: a daemon that reloads
+            // on SIGHUP says so; the `manta: listening;` prefix the tests
+            // wait for is the same either way.
+            if reload_enabled {
+                logging::note(
+                    "manta: listening; send SIGINT or SIGTERM to stop, SIGHUP to reload \
+                     [spot] lists and dry_run",
+                );
+            } else {
+                logging::note("manta: listening; send SIGINT or SIGTERM to stop");
+            }
             // Captured before `src` is moved into the pipeline, for the
             // readiness event below.
             let source_sample_rate_hz = src.sample_rate();
@@ -3927,6 +4370,12 @@ fn run_command() -> Result<std::process::ExitCode> {
             // `ready: decoding` for a run that shuts down without ever
             // decoding a chunk.
             let stop_ready = stop.clone();
+            // MAN-123: decoded text is grouped per track (text_lines.rs) and
+            // goes to stderr; stdout carries spots. A daemon -- servers
+            // started from a [server] table -- logs no decoded text unless
+            // asked, so its journal holds spots and diagnostics only.
+            let print_text = !json && (spot_server.is_none() || decoded_text);
+            let mut text_lines = text_lines::TrackLines::default();
             let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
@@ -3934,29 +4383,30 @@ fn run_command() -> Result<std::process::ExitCode> {
                 manta_engine::ListenObservers {
                     active_tracks: active_tracks.clone(),
                     decode_latency: decode_latency.clone(),
+                    operator_lists: reload_enabled.then(|| operator_lists.clone()),
                 },
                 |ev| {
-                    use manta_decode::events::DecoderEvent;
                     if json {
                         println!("{}", serde_json::to_string(ev).unwrap());
                         return;
                     }
-                    match ev {
-                        DecoderEvent::CharDecoded { glyph, .. } => {
-                            if let Some(c) = glyph.text_char() {
-                                fmt::monitor_write(&c.to_string());
-                            }
+                    if !print_text {
+                        return;
+                    }
+                    if let Some(line) = text_lines.ingest(ev) {
+                        if logging::is_json() {
+                            tracing::info!(target: "manta::text", "{line}");
+                        } else {
+                            eprintln!("{line}");
                         }
-                        DecoderEvent::WordBoundary { .. } => {
-                            fmt::monitor_write(" ");
-                        }
-                        _ => {}
                     }
                 },
                 // Provisional CLI-debugging text/JSON printed below is NOT
                 // the ecosystem wire contract -- that's `spot_server`
                 // (manta-server's telnet/JSON-Lines/WebSocket fan-out,
-                // ARCHITECTURE §7), fed here when --config is set.
+                // ARCHITECTURE §7), fed here when --config is set. The
+                // human `SPOT:` line is stdout's product in text mode
+                // (MAN-123); decoded text and diagnostics go to stderr.
                 |spot| {
                     if let Some(server) = &spot_server {
                         server.bus.publish(spot.clone());
@@ -4032,8 +4482,25 @@ fn run_command() -> Result<std::process::ExitCode> {
                     }
                 },
             );
+            // MAN-78 D7: the decode loop has returned, so the daemon is
+            // draining from here on. Closing the gate (under the lock a
+            // reload holds while it applies) and setting `stop` tell the
+            // reload thread to ignore SIGHUP instead of flipping `dry_run`
+            // mid-drain.
+            drain_gate.close();
+            stop_ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
-            fmt::end_monitor_line();
+            // A source read error returns from listen without closing its
+            // tracks, so their partial lines are printed here, on both paths.
+            if print_text {
+                for line in text_lines.finish() {
+                    if logging::is_json() {
+                        tracing::info!(target: "manta::text", "{line}");
+                    } else {
+                        eprintln!("{line}");
+                    }
+                }
+            }
 
             // Run the same server-shutdown sequence on BOTH the success and
             // error paths -- an SDR disconnect or WAV read failure from
@@ -4174,6 +4641,8 @@ fn run_command() -> Result<std::process::ExitCode> {
                 allowlist,
                 blocklist,
                 notch,
+                cty,
+                scp,
             } = filters;
             let Prepared {
                 loaded,
@@ -4212,12 +4681,14 @@ fn run_command() -> Result<std::process::ExitCode> {
                     allowlist,
                     blocklist,
                     notch,
+                    cty,
+                    scp,
                 },
                 config,
                 None,
             )?;
             if loaded.server.is_some() {
-                crate::fmt::diagnostic!(
+                eprintln!(
                     "note: soak does not start the spot servers; ignoring [server] from {}",
                     loaded.origin
                 );
@@ -4251,7 +4722,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             let doc = match run_status(config.as_deref(), addr.as_deref(), timeout_secs) {
                 Ok(doc) => doc,
                 Err(e) => {
-                    crate::fmt::diagnostic!("{}", status_failure_message(&e));
+                    eprintln!("{}", status_failure_message(&e));
                     return Ok(std::process::ExitCode::from(2));
                 }
             };
@@ -4291,6 +4762,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             source_iq,
             dial_freq_hz,
             config,
+            ntp_server,
             json,
         } => {
             let FilterOpts {
@@ -4298,6 +4770,8 @@ fn run_command() -> Result<std::process::ExitCode> {
                 allowlist,
                 blocklist,
                 notch,
+                cty,
+                scp,
             } = filters;
             // Checked before any source is opened -- otherwise an invalid
             // --duration only surfaces after a KiwiSDR/SoapySDR/HPSDR
@@ -4315,10 +4789,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                 );
             }
             let Prepared {
+                config_path,
                 loaded,
                 resolved,
                 pipeline: cfg,
-                ..
             } = prepare_live(
                 CliOverrides {
                     device,
@@ -4351,41 +4825,98 @@ fn run_command() -> Result<std::process::ExitCode> {
                     allowlist,
                     blocklist,
                     notch,
+                    cty,
+                    scp,
                 },
                 config,
                 None,
             )?;
-            if loaded.server.is_some() {
-                crate::fmt::diagnostic!(
-                    "note: doctor does not start the spot servers; ignoring [server] from {}",
-                    loaded.origin
-                );
-            }
+            // MAN-126: named setup checks first, each printed as it is
+            // known; the receiver and signal stages become check lines too,
+            // so a failure is named rather than ending in a generic error.
             let spec = &resolved.spec;
-            warn_if_audio_source_has_no_rf_reference(spec.is_rf_aware(), resolved.dial_freq_hz);
-            let src: Box<dyn IqSource> =
-                spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz)?;
-            let report = manta_engine::doctor(src, &cfg, std::time::Duration::from_secs(duration))?;
+            let rf_aware = spec.is_rf_aware();
+            let receiver = receiver_desc(spec);
+            let mut sink = doctor_checks::Sink::new(json);
+            doctor_checks::run_setup_checks(
+                &doctor_checks::SetupInputs {
+                    config_path: config_path.as_deref(),
+                    loaded: &loaded,
+                    needs_dial: needs_dial_freq(
+                        loaded.server.is_some(),
+                        rf_aware,
+                        resolved.dial_freq_hz,
+                    ),
+                    receiver: &receiver,
+                    ntp_server: &ntp_server,
+                },
+                &mut sink,
+            );
+            warn_if_audio_source_has_no_rf_reference(rf_aware, resolved.dial_freq_hz);
+            let report = match spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz) {
+                Err(e) => {
+                    sink.push(doctor_checks::receiver_check(&receiver, Err(&e)));
+                    None
+                }
+                Ok(src) => {
+                    sink.push(doctor_checks::receiver_check(
+                        &receiver,
+                        Ok(src.sample_rate()),
+                    ));
+                    match manta_engine::doctor(src, &cfg, std::time::Duration::from_secs(duration))
+                    {
+                        Ok(report) => {
+                            if !json {
+                                println!();
+                                print!("{}", fmt::doctor_report(&report));
+                            }
+                            Some(report)
+                        }
+                        Err(e) => {
+                            sink.push(doctor_checks::signal_check(&e));
+                            None
+                        }
+                    }
+                }
+            };
+            let checks = sink.checks;
             if json {
                 // `verdict()` is computed, not a stored field, so a plain
                 // `serde_json::to_string(&report)` omits the command's
                 // primary health classification entirely -- merge it in as
                 // an extra key rather than making JSON consumers duplicate
                 // the classification policy themselves.
-                let mut value = serde_json::to_value(&report)?;
-                if let serde_json::Value::Object(ref mut map) = value {
+                let mut map = serde_json::Map::new();
+                if let Some(report) = &report {
+                    if let serde_json::Value::Object(fields) = serde_json::to_value(report)? {
+                        map = fields;
+                    }
                     map.insert(
                         "verdict".to_string(),
                         serde_json::to_value(report.verdict())?,
                     );
                 }
-                println!("{}", serde_json::to_string(&value)?);
+                map.insert("checks".to_string(), serde_json::to_value(&checks)?);
+                map.insert(
+                    "checks_status".to_string(),
+                    serde_json::to_value(doctor_checks::worst(&checks))?,
+                );
+                println!("{}", serde_json::to_string(&map)?);
             } else {
-                print!("{}", fmt::doctor_report(&report));
+                println!();
+                println!("{}", doctor_checks::summary(&checks));
+            }
+            // As `manta status` does: the specific lines above are the
+            // whole story, so no generic `Error:` line follows them.
+            use std::io::Write as _;
+            std::io::stdout().flush()?;
+            if doctor_checks::worst(&checks) == doctor_checks::Status::Fail {
+                return Ok(std::process::ExitCode::FAILURE);
             }
         }
         Command::Config(ConfigCommand::Check { config }) => config_cmd::check(config)?,
         Command::Config(ConfigCommand::Init { out, force }) => config_cmd::init(&out, force)?,
+        Command::Bench(BenchCommand::Sensitivity(args)) => bench::sensitivity(args)?,
     }
     Ok(std::process::ExitCode::SUCCESS)
 }
@@ -4424,10 +4955,11 @@ fn deprecations<I: IntoIterator<Item = String>>(args: I) -> Vec<Deprecation> {
     out
 }
 
-/// stderr, not `tracing::warn!`: the only `tracing_subscriber` init in this
-/// binary lives inside `start_spot_server`, so a parse-time `warn!` would be
+/// stderr, not `tracing::warn!`: this runs before `Cli::parse()`, and the
+/// only `tracing_subscriber` init in this binary (`logging::init`, MAN-124)
+/// runs after it at the top of `run`, so a parse-time `warn!` would be
 /// dropped. stderr is also the stream `--json`'s JSON Lines consumer never
-/// reads (see `start_spot_server`'s MAN-59 round-6 note), so this cannot
+/// reads (see `logging`'s MAN-59 round-6 note), so this cannot
 /// corrupt the byte-identical spot log AGENTS.md requires.
 ///
 /// Known, accepted limitation: a flag *value* that is literally the string
@@ -4440,11 +4972,11 @@ fn warn_deprecations() {
     let argv = std::env::args_os().map(|a| a.to_string_lossy().into_owned());
     for d in deprecations(argv) {
         match d {
-            Deprecation::ListenVerb => crate::fmt::diagnostic!(
+            Deprecation::ListenVerb => eprintln!(
                 "warning: starting the daemon with `manta listen` is deprecated and will be \
                  removed in a future release; use `manta run --config` instead."
             ),
-            Deprecation::ServerConfigFlag => crate::fmt::diagnostic!(
+            Deprecation::ServerConfigFlag => eprintln!(
                 "warning: `--server-config` is deprecated and will be removed in a future \
                  release; use `--config` instead."
             ),
@@ -4455,6 +4987,264 @@ fn warn_deprecations() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    // Derived from manta_spot's constant, never hardcoded, so a cty.dat refresh
+    // does not break these tests.
+    fn at_day(d: u64) -> SystemTime {
+        manta_spot::vintage::cty_dat_retrieved_at().unwrap() + Duration::from_secs(d * 86_400)
+    }
+
+    #[test]
+    fn audio_silence_warning_names_the_device_the_rate_and_the_hint() {
+        let w = audio_silence_warning("\"Test Mic\"");
+        assert!(
+            w.starts_with(
+                "warning: audio input \"Test Mic\" is delivering digital silence at 48000 Hz \
+                 (every sample is exactly zero) -- "
+            ),
+            "{w}"
+        );
+        assert!(w.ends_with(manta_input::audio::audio_input_hint()), "{w}");
+    }
+
+    #[test]
+    fn recording_center_warning_covers_a_missing_and_a_non_positive_sidecar() {
+        let wav = Path::new("/rec/x.wav");
+        let missing = recording_center_warning(wav, None).unwrap();
+        assert!(
+            missing.starts_with("warning: no sidecar /rec/x.json next to /rec/x.wav -- "),
+            "{missing}"
+        );
+        let zero = recording_center_warning(wav, Some(0.0)).unwrap();
+        for w in [&missing, &zero] {
+            assert!(
+                w.contains("baseband offsets") && w.contains("--center-freq-hz 14000000"),
+                "{w}"
+            );
+        }
+        assert!(
+            zero.starts_with(
+                "warning: sidecar /rec/x.json gives center_freq_hz = 0, not an RF frequency -- "
+            ),
+            "{zero}"
+        );
+        assert!(recording_center_warning(wav, Some(-5.0)).is_some());
+        assert!(recording_center_warning(wav, Some(14_000_000.0)).is_none());
+    }
+
+    #[test]
+    fn bundled_cty_warning_names_the_age_and_the_fix() {
+        let w = bundled_cty_warning(false, at_day(200)).expect("stale");
+        let head = format!(
+            "warning: the built-in cty.dat is 200 days old (retrieved {})",
+            manta_spot::vintage::CTY_DAT_RETRIEVED
+        );
+        assert!(w.starts_with(&head), "{w}");
+        for needle in [
+            "https://www.country-files.com/cty/cty.dat",
+            "--cty",
+            "spot.cty_path",
+        ] {
+            assert!(w.contains(needle), "{needle}: {w}");
+        }
+        assert!(!w.contains('\n'), "one line: {w}");
+        // Other suites assert these never appear on these commands' stderr.
+        for absent in [
+            "deprecated",
+            "--dial-freq-hz",
+            "telnet=",
+            "listening:",
+            "station_callsign",
+            "(os error 2)",
+        ] {
+            assert!(!w.contains(absent), "{absent}: {w}");
+        }
+    }
+
+    #[test]
+    fn no_warning_at_or_below_the_threshold() {
+        assert_eq!(bundled_cty_warning(false, at_day(180)), None);
+        assert_eq!(bundled_cty_warning(false, at_day(0)), None);
+    }
+
+    #[test]
+    fn no_warning_with_an_override() {
+        assert_eq!(bundled_cty_warning(true, at_day(10_000)), None);
+    }
+
+    #[test]
+    fn no_warning_when_the_clock_reads_before_the_retrieval_date() {
+        assert_eq!(bundled_cty_warning(false, UNIX_EPOCH), None);
+    }
+
+    const QQ9_ENTITY: &str = "Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n";
+
+    #[test]
+    fn cli_cty_beats_cty_path() {
+        let spot = config::SpotFile {
+            cty_path: Some("file.dat".into()),
+            scp_path: Some("file.scp".into()),
+            ..Default::default()
+        };
+        let r = resolve_spot(vec![], None, None, Some("cli.dat".into()), None, &spot);
+        assert_eq!(r.cty, Some("cli.dat".into()));
+        assert_eq!(r.scp, Some("file.scp".into()));
+    }
+    #[test]
+    fn cli_scp_beats_scp_path() {
+        let spot = config::SpotFile {
+            cty_path: Some("file.dat".into()),
+            scp_path: Some("file.scp".into()),
+            ..Default::default()
+        };
+        let r = resolve_spot(vec![], None, None, None, Some("cli.scp".into()), &spot);
+        assert_eq!(r.cty, Some("file.dat".into()));
+        assert_eq!(r.scp, Some("cli.scp".into()));
+    }
+    #[test]
+    fn unset_cty_and_scp_stay_built_in() {
+        let r = resolve_spot(vec![], None, None, None, None, &config::SpotFile::default());
+        let cfg = build_pipeline_config(0.0, &r, Default::default(), Engine::Legacy).unwrap();
+        assert!(cfg.cty.is_none() && cfg.scp.is_none());
+    }
+    fn tables_config(cty: Option<PathBuf>, scp: Option<PathBuf>) -> Result<PipelineConfig> {
+        let spot = resolve_spot(vec![], None, None, cty, scp, &config::SpotFile::default());
+        build_pipeline_config(0.0, &spot, Default::default(), Engine::Legacy)
+    }
+    #[test]
+    fn build_pipeline_config_loads_an_override_cty_and_scp() {
+        let cty = write_temp_file(format!("{}{QQ9_ENTITY}", manta_spot::CTY_DAT).as_bytes());
+        let scp = write_temp_file(b"QQ9ZZZ\nW1AW\n");
+        let cfg = tables_config(Some(cty.path().into()), Some(scp.path().into())).unwrap();
+        assert!(cfg.cty_table().is_allocated("QQ9ZZZ"));
+        assert!(cfg.scp_set().contains("QQ9ZZZ"));
+        assert_eq!(cfg.scp_set().len(), 2);
+    }
+    #[test]
+    fn build_pipeline_config_rejects_a_cty_file_with_no_prefixes() {
+        let cty =
+            write_temp_file(b"1A,Sov Mil Order of Malta,246,EU,15,28,41.90,-12.43,-1.0,1A;\n");
+        let err = tables_config(Some(cty.path().into()), None)
+            .unwrap_err()
+            .to_string();
+        for needle in [
+            "cty.dat file",
+            cty.path().to_str().unwrap(),
+            "lists no callsign prefixes",
+        ] {
+            assert!(err.contains(needle), "{err}");
+        }
+    }
+    #[test]
+    fn build_pipeline_config_rejects_an_scp_file_with_no_callsigns() {
+        let scp = write_temp_file(b"# comment\n!!header\n");
+        let err = tables_config(None, Some(scp.path().into()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("master.scp file") && err.contains("lists no callsigns"),
+            "{err}"
+        );
+    }
+    #[test]
+    fn build_pipeline_config_reports_a_missing_cty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = tables_config(Some(dir.path().join("missing.dat")), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("reading cty.dat file"), "{err}");
+    }
+    #[test]
+    fn build_pipeline_config_strips_a_bom_from_cty() {
+        let cty = write_temp_file(format!("\u{feff}{QQ9_ENTITY}").as_bytes());
+        assert!(tables_config(Some(cty.path().into()), None)
+            .unwrap()
+            .cty_table()
+            .is_allocated("QQ9ZZZ"));
+    }
+    #[test]
+    fn build_pipeline_config_rejects_non_utf8_tables() {
+        let file = write_temp_file(&[0xff, 0xfe]);
+        for (cty, scp, label) in [
+            (Some(file.path().into()), None, "cty.dat"),
+            (None, Some(file.path().into()), "master.scp"),
+        ] {
+            let err = tables_config(cty, scp).unwrap_err().to_string();
+            assert!(err.contains(&format!("reading {label} file")), "{err}");
+            assert!(err.contains(file.path().to_str().unwrap()), "{err}");
+        }
+    }
+    #[test]
+    fn start_spot_server_uses_the_cty_table_it_is_given() {
+        let table = std::sync::Arc::new(manta_spot::cty::Table::parse_with_dxcc(
+            &GEOGRAPHY_CTY_FIXTURE.replace("K,W,N;", "K,W,N,QQ9;"),
+            GEOGRAPHY_DXCC_FIXTURE,
+        ));
+        let loaded = loaded_from("[server]\nstation_callsign = 'W1AW'\nbind_addr = '127.0.0.1'\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n");
+        let (test_runtime, server) = start_spot_server(
+            loaded.server.unwrap(),
+            vec![],
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0),
+                freq_calibration: 1.0,
+            },
+            std::time::UNIX_EPOCH,
+            0,
+            table.clone(),
+        )
+        .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&server.cty, &table));
+        assert!(!geography_is_unresolved(&server.cty, "QQ9ZZZ"));
+        let entry = server.cty.lookup("QQ9ZZZ").unwrap();
+        assert_eq!(
+            (&*entry.continent, entry.cq_zone, entry.lat, entry.lon),
+            ("NA", 5, 40.0, -75.0)
+        );
+        let _ = server.shutdown_tx.send(true);
+        test_runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    }
+    /// MAN-126: doctor's help names the clock check's server flag, the four
+    /// statuses, and the exit rule scripts rely on.
+    #[test]
+    fn doctor_help_lists_ntp_server_and_the_exit_rule() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let doctor = cli.find_subcommand_mut("doctor").unwrap();
+        let help = doctor.render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "--ntp-server",
+            "Setup checks",
+            "PASS, WARN, FAIL or SKIP",
+            "Exits 1 when a check fails",
+            "pool.ntp.org",
+        ] {
+            assert!(
+                flat.contains(needle),
+                "doctor --help lacks {needle:?}:\n{help}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_lists_cty_and_scp_for_every_validating_command() {
+        use clap::CommandFactory;
+        let cli = Cli::command();
+        for name in ["decode", "run", "listen", "soak", "doctor"] {
+            let command = cli.find_subcommand(name).unwrap();
+            for flag in ["cty", "scp"] {
+                assert!(
+                    command
+                        .get_arguments()
+                        .any(|arg| arg.get_long() == Some(flag)),
+                    "{name} --{flag}"
+                );
+            }
+        }
+    }
 
     fn write_temp_file(contents: &[u8]) -> tempfile::NamedTempFile {
         use std::io::Write as _;
@@ -4724,6 +5514,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
         )
         .unwrap();
 
@@ -5554,6 +6345,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
         )
         .unwrap();
 
@@ -5612,6 +6404,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
         )
         .unwrap();
 
@@ -5668,12 +6461,149 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
         );
         assert!(
             result.is_ok(),
             "a config with the operator-identity keys present must still start: {:?}",
             result.err()
         );
+    }
+
+    /// MAN-138: starts the daemon's servers from a real config file (through
+    /// `config::load` and `start_spot_server`, as `run` does), publishes one
+    /// spot and returns the line a raw TCP client reads from the JSON port.
+    fn json_spot_from_a_daemon(callsign: &str, location_keys: &str) -> serde_json::Value {
+        let cfg_file = write_temp_file(
+            format!(
+                "[server]\nstation_callsign = \"{callsign}\"\nbind_addr = '127.0.0.1'\n\
+                 telnet_port = 0\njson_port = 0\nmetrics_port = 0\n{location_keys}"
+            )
+            .as_bytes(),
+        );
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
+        let (rt, server) = start_spot_server(
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0),
+                freq_calibration: 1.0,
+            },
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+        )
+        .unwrap();
+
+        let line = rt.block_on(async {
+            use tokio::io::AsyncBufReadExt;
+            let stream = tokio::net::TcpStream::connect(server.json_addr)
+                .await
+                .unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            // Let the listener accept and subscribe before the publish (the
+            // json_stream_acceptance precedent).
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            server.bus.publish(manta_spot::Spot {
+                callsign: "JA1ABC".to_string(),
+                freq_hz: 14_027_100.0,
+                snr_db: 23.0,
+                wpm: 28.0,
+                spot_type: manta_spot::SpotType::Cq,
+                confidence: 0.9,
+                track_id: 7,
+                sample_ts: 12_345,
+            });
+            let mut line = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                reader.read_line(&mut line),
+            )
+            .await
+            .expect("timed out waiting for a JSON spot")
+            .unwrap();
+            line
+        });
+
+        let _ = server.shutdown_tx.send(true);
+        shutdown_runtime_after_drain(rt, &server.tasks);
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("{line:?}: {e}"))
+    }
+
+    /// MAN-138's Gherkin scenario, end to end: an operator configures their
+    /// station's grid square, and every JSON spot names that location as
+    /// deGrid/deLat/deLon -- not the cty.dat centroid (37.6, -91.87) that
+    /// every US-based spotter used to share.
+    #[test]
+    fn a_configured_station_grid_reaches_json_spots_as_the_receiver_position() {
+        let mut positions = Vec::new();
+        for (call, grid) in [("W1AW", "FN31pr"), ("W5AU", "EM12kp")] {
+            let spot = json_spot_from_a_daemon(call, &format!("operator_grid = \"{grid}\"\n"));
+            let (lat, lon) = manta_server::maidenhead::square(grid).unwrap().center();
+            assert_eq!(spot["deCall"], call, "{spot}");
+            assert_eq!(spot["deGrid"], grid, "{spot}");
+            let de_lat = spot["deLat"].as_f64().expect("deLat is a number");
+            let de_lon = spot["deLon"].as_f64().expect("deLon is a number");
+            assert!(
+                (de_lat - lat).abs() < 1e-9,
+                "{call}: deLat {de_lat}, want {lat}"
+            );
+            assert!(
+                (de_lon - lon).abs() < 1e-9,
+                "{call}: deLon {de_lon}, want {lon}"
+            );
+            assert_ne!((de_lat, de_lon), (37.6, -91.87), "{call}: the US centroid");
+            // Entity-level fields still follow the callsign.
+            assert_eq!(spot["deDxcc"], 291, "{spot}");
+            positions.push((de_lat, de_lon));
+        }
+        assert_ne!(
+            positions[0], positions[1],
+            "two stations in one country must not share a position"
+        );
+    }
+
+    /// With no location configured, the daemon sends the contract-legal
+    /// "unknown" (`null`), never a country centroid in its place.
+    #[test]
+    fn a_station_without_a_configured_location_sends_null_position_not_a_country_centroid() {
+        let spot = json_spot_from_a_daemon("W1AW", "");
+        for key in ["deGrid", "deLat", "deLon"] {
+            assert!(spot[key].is_null(), "{key}: {spot}");
+        }
+        assert_eq!(spot["deDxcc"], 291, "{spot}");
+    }
+
+    /// The belt-and-braces path for a caller that skips `config::load`: a
+    /// hand-built config with half a lat/lon pair never starts a listener.
+    #[test]
+    fn start_spot_server_rejects_an_inconsistent_station_location() {
+        let cfg = manta_server::config::ServerConfig {
+            operator_lat: Some(41.7),
+            ..test_server_config("W1AW")
+        };
+        let Err(err) = start_spot_server(
+            cfg,
+            Vec::new(),
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0),
+                freq_calibration: 1.0,
+            },
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+        ) else {
+            panic!("half a lat/lon pair must not start the servers");
+        };
+        let err = format!("{err:#}");
+        assert!(err.contains("operator_lon"), "{err}");
+        assert!(err.starts_with("[server]: "), "{err}");
     }
 
     #[test]
@@ -5723,6 +6653,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
         )
         .unwrap();
 
@@ -6222,7 +7153,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             allowlist: vec!["W1AW".into()],
             ..Default::default()
         };
-        let r = resolve_spot(vec!["K1ABC".into()], None, None, &spot);
+        let r = resolve_spot(vec!["K1ABC".into()], None, None, None, None, &spot);
         assert_eq!(r.allowlist, vec!["K1ABC".to_string()]);
     }
 
@@ -6232,7 +7163,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             allowlist: vec!["W1AW".into()],
             ..Default::default()
         };
-        let r = resolve_spot(Vec::new(), None, None, &spot);
+        let r = resolve_spot(Vec::new(), None, None, None, None, &spot);
         assert_eq!(r.allowlist, vec!["W1AW".to_string()]);
     }
 
@@ -6243,7 +7174,14 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             notch_path: Some(PathBuf::from("/cfg/n.txt")),
             ..Default::default()
         };
-        let r = resolve_spot(Vec::new(), Some(PathBuf::from("cli.txt")), None, &spot);
+        let r = resolve_spot(
+            Vec::new(),
+            Some(PathBuf::from("cli.txt")),
+            None,
+            None,
+            None,
+            &spot,
+        );
         assert_eq!(r.blocklist, Some(PathBuf::from("cli.txt")));
         assert_eq!(r.notch, Some(PathBuf::from("/cfg/n.txt")));
     }
@@ -6340,16 +7278,101 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("allowlist", "spot.allowlist"),
         ("blocklist", "spot.blocklist_path"),
         ("notch", "spot.notch_path"),
+        ("cty", "spot.cty_path"),
+        ("scp", "spot.scp_path"),
         ("engine", "decode.engine"),
     ];
     /// Flags with no config key, by design.
-    const CLI_ONLY: &[&str] = &["json", "duration", "config", "path", "help", "version"];
+    const CLI_ONLY: &[&str] = &[
+        "json",
+        "decoded_text",
+        "duration",
+        "config",
+        "path",
+        // `decode --center-freq-hz` (MAN-131 D8): a recording's centre, not
+        // the live receiver's `input.center_freq_hz`.
+        "center_freq_hz",
+        "help",
+        "version",
+        "ntp_server",
+        "verbose",
+        "quiet",
+        "log_level",
+        "log_format",
+    ];
+
+    /// MAN-124: `run`'s `Logging` flags, parsed (or refused) by clap.
+    fn run_log_opts(extra: &[&str]) -> Result<logging::LogOpts, clap::Error> {
+        let argv = ["manta", "run"].iter().chain(extra);
+        match Cli::try_parse_from(argv)?.command {
+            Command::Run { logging, .. } => Ok(logging),
+            _ => unreachable!("parsed `run`"),
+        }
+    }
+
+    #[test]
+    fn log_level_flags_are_mutually_exclusive() {
+        use clap::error::ErrorKind;
+        for argv in [
+            &["-v", "-q"][..],
+            &["-v", "--log-level", "warn"],
+            &["-q", "--log-level", "warn"],
+        ] {
+            let err = run_log_opts(argv).expect_err("conflicting flags parsed");
+            assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{argv:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn log_flag_values_are_a_closed_set() {
+        use clap::error::ErrorKind;
+        let err = run_log_opts(&["--log-level", "loud"]).expect_err("`loud` parsed");
+        assert_eq!(err.kind(), ErrorKind::InvalidValue, "{err}");
+        let err = run_log_opts(&["--log-format", "yaml"]).expect_err("`yaml` parsed");
+        assert_eq!(err.kind(), ErrorKind::InvalidValue, "{err}");
+    }
+
+    #[test]
+    fn log_flags_parse_on_run_and_its_listen_alias() {
+        let o = run_log_opts(&["-vv"]).unwrap();
+        assert_eq!(o.verbose, 2);
+        assert_eq!(
+            o.log_format,
+            logging::LogFormat::Text,
+            "text is the default"
+        );
+        let o = run_log_opts(&["--log-format", "json", "--log-level", "debug"]).unwrap();
+        assert_eq!(o.log_format, logging::LogFormat::Json);
+        assert_eq!(o.log_level, Some(logging::LogLevel::Debug));
+        match Cli::try_parse_from(["manta", "listen", "-q"])
+            .unwrap()
+            .command
+        {
+            Command::Run { logging, .. } => assert_eq!(logging.quiet, 1),
+            _ => panic!("`listen` is `run`'s alias"),
+        }
+    }
+
+    #[test]
+    fn log_flags_are_scoped_to_run() {
+        use clap::error::ErrorKind;
+        for argv in [
+            &["manta", "decode", "-v", "x.wav"][..],
+            &["manta", "-v", "run"],
+        ] {
+            let err = match Cli::try_parse_from(argv) {
+                Ok(_) => panic!("{argv:?} parsed"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{argv:?}: {err}");
+        }
+    }
 
     #[test]
     fn every_config_backed_flag_maps_to_a_key() {
         use clap::CommandFactory;
         let cli = Cli::command();
-        for name in ["run", "soak", "doctor", "decode"] {
+        for name in ["run", "soak", "doctor", "decode", "check"] {
             let sub = cli.find_subcommand(name).unwrap();
             for arg in sub.get_arguments() {
                 let id = arg.get_id().as_str();
@@ -6397,6 +7420,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 "[spot]\nblocklist_path = \"b.txt\"\n",
             ),
             ("spot.notch_path", "[spot]\nnotch_path = \"n.txt\"\n"),
+            ("spot.cty_path", "[spot]\ncty_path = 'cty.dat'\n"),
+            ("spot.scp_path", "[spot]\nscp_path = 'MASTER.SCP'\n"),
             ("decode.engine", "[decode]\nengine = \"legacy\"\n"),
         ];
         for (_, key) in FLAG_KEYS {
@@ -6556,6 +7581,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
         )
         .unwrap();
 
@@ -6602,6 +7628,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
         )
         .unwrap();
 

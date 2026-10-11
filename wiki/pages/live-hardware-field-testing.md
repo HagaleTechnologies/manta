@@ -14,9 +14,10 @@ sources:
   - docs/DECISIONS/2026-09-09-soapy-gain-is-inverted-attenuation-scale.md
   - docs/DECISIONS/2026-09-10-antenna-path-fix-resolves-detection-gap.md
   - docs/DECISIONS/2026-09-10-post-antenna-fix-90min-soak-and-service-reliability.md
+  - docs/DECISIONS/2026-10-11-man131-actionable-errors.md
 verified:
-  commit: 0495f37
-  date: 2026-09-10
+  commit: 9644a7f
+  date: 2026-10-11
 links:
   - spot-validation
   - overview
@@ -31,9 +32,19 @@ this distills are `docs/DECISIONS/2026-09-08-first-live-rsp1b-run.md` and
 `docs/DECISIONS/2026-09-09-overnight-40m-soapy-field-test.md` — read
 those for the full evidence and reasoning.
 
+## Check sample delivery first
+
+Run `manta devices` to find an audio name or Soapy selector, then
+`manta check` with that selector or `--config manta.toml`. This measures samples
+without starting decoding. Use `doctor` next to inspect decoder activity.
+The [source diagnostics decision](../../docs/DECISIONS/2026-10-10-man125-source-diagnostics.md)
+defines the reported stream rate, dBFS floor, incomplete-input statuses and
+blocking-call limitation. These diagnostics add no new hardware acceptance
+claim to the historical findings below.
+
 ## `doctor` vs `listen` for a field test
 
-- `manta doctor --duration <secs> --json` is the right first check: bounded,
+- `manta doctor --duration <secs> --json` assesses decoding after checking sample delivery: bounded,
   self-terminating, gives a verdict from track/SNR/decode stats —
   `NoSignal` (no decoder evidence at all), `ActivityNoSnr` (a track opened
   or decoded characters, but the run ended before any `TrackMeta` landed —
@@ -251,6 +262,17 @@ outright). Also: a single `ErrorCode::Overflow` on a live USB stream used
 to kill the whole session outright — fixed in `crates/manta-input/src/
 soapy.rs` (#146, 2026-09-09) with its own bounded retry, so this is no
 longer something you need to work around.
+
+**Sound-card input before MAN-131 ended on an empty capture buffer.**
+coppa's `CpalSource::read` is non-blocking, and an empty ring read as end
+of stream, so `listen --device` failed at startup with `audio source ended
+during startup calibration` or exited 0 a few seconds in — a manta bug, not
+the device. Live audio reads now wait, and a device that delivers nothing
+for 5 s is an error naming it, 48000 Hz and what to check. A denied macOS
+microphone gives silence or no callbacks, never an open error: expect the
+stall error or the digital-silence warning, and fix it in System Settings >
+Privacy & Security > Microphone. See
+`docs/DECISIONS/2026-10-11-man131-actionable-errors.md`.
 
 **`--soapy-gain` is a gain-*reduction* (attenuation) scale on this
 driver, not a gain scale — bigger number means less sensitive, not

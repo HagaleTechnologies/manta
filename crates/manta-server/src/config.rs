@@ -273,24 +273,20 @@ fn check_operator_text(field: &str, value: &str) -> Result<(), String> {
 }
 
 /// Maidenhead locator: two letters A-R, two digits, optionally two letters
-/// A-X. A malformed grid is worse than an absent one -- Aggregator would
-/// record garbage as this node's location.
+/// A-X (`maidenhead::square` is the one parser). A malformed grid is worse
+/// than an absent one -- Aggregator, and every JSON spot's `deGrid`, would
+/// carry garbage as this node's location.
 fn check_grid(value: &str) -> Result<(), String> {
-    let c: Vec<char> = value.chars().map(|c| c.to_ascii_uppercase()).collect();
-    let ok = matches!(c.len(), 4 | 6)
-        && ('A'..='R').contains(&c[0])
-        && ('A'..='R').contains(&c[1])
-        && c[2].is_ascii_digit()
-        && c[3].is_ascii_digit()
-        // Short-circuits before indexing c[4]/c[5] on a 4-char locator.
-        && (c.len() == 4 || (('A'..='X').contains(&c[4]) && ('A'..='X').contains(&c[5])));
-    if !ok {
-        return Err(format!(
-            "{} is not a Maidenhead grid square",
-            crate::human::quoted(value)
-        ));
-    }
-    Ok(())
+    crate::maidenhead::square(value)
+        .map(|_| ())
+        .ok_or_else(|| not_a_grid(value))
+}
+
+fn not_a_grid(value: &str) -> String {
+    format!(
+        "{} is not a Maidenhead grid square",
+        crate::human::quoted(value)
+    )
 }
 
 fn deserialize_optional_operator_name<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -322,6 +318,40 @@ where
     let value: Option<String> = Option::deserialize(deserializer)?;
     if let Some(value) = &value {
         check_grid(value).map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
+}
+
+/// A decimal-degree coordinate within `-limit..=limit`. NaN and the
+/// infinities are rejected explicitly: TOML spells them `nan`/`inf`, and
+/// serde hands them to an `f64` like any other number.
+fn check_coordinate(key: &str, value: f64, limit: f64) -> Result<(), String> {
+    if !value.is_finite() || value.abs() > limit {
+        return Err(format!(
+            "{key} must be a number from -{limit} to {limit}, got {value}"
+        ));
+    }
+    Ok(())
+}
+
+fn deserialize_optional_latitude<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: Option<f64> = Option::deserialize(deserializer)?;
+    if let Some(value) = value {
+        check_coordinate("operator_lat", value, 90.0).map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
+}
+
+fn deserialize_optional_longitude<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: Option<f64> = Option::deserialize(deserializer)?;
+    if let Some(value) = value {
+        check_coordinate("operator_lon", value, 180.0).map_err(serde::de::Error::custom)?;
     }
     Ok(value)
 }
@@ -476,14 +506,18 @@ pub struct ServerConfig {
     /// against. `uplink::forward_loop` pins `LineFormat::Rbn`.
     #[serde(default)]
     pub line_format: crate::rbn::LineFormat,
-    // The three `operator_*` keys below feed the telnet greeting banner
-    // (MAN-86). They are ALSO listed, with these same defaults and
-    // validation rules, in `docs/SPEC-decode-core.md` §9's `[server]`
-    // block -- the repository's canonical config-key table, and the only
-    // place an operator who has not read this source file will look for
-    // them. Renaming a key, changing a default, or changing a validation
-    // rule here means changing it there too; each field's own doc comment
-    // below restates the rule so the two can be diffed by eye.
+    // The five `operator_*` keys below feed the telnet greeting banner
+    // (`operator_name`/`operator_qth`/`operator_grid`, MAN-86) and the
+    // station position every JSON spot carries (`operator_grid`/
+    // `operator_lat`/`operator_lon` as `deGrid`/`deLat`/`deLon`, MAN-138;
+    // see `ServerConfig::station_location`). They are ALSO listed, with
+    // these same defaults and validation rules, in
+    // `docs/SPEC-decode-core.md` §9's `[server]` block -- the repository's
+    // canonical config-key table, and the only place an operator who has
+    // not read this source file will look for them. Renaming a key,
+    // changing a default, or changing a validation rule here means
+    // changing it there too; each field's own doc comment below restates
+    // the rule so the two can be diffed by eye.
     /// Operator's given name, e.g. `"Art"`. **Optional; default: absent**
     /// (the field is omitted from the greeting line rather than rendered
     /// as an empty placeholder). Appears in the telnet greeting banner CW
@@ -511,9 +545,112 @@ pub struct ServerConfig {
     /// field letters `A`-`R`, square digits `0`-`9`, and (when 6)
     /// subsquare letters `A`-`X`; case-insensitive. A malformed grid is
     /// worse than an absent one -- Aggregator would record garbage as
-    /// this node's location.
+    /// this node's location. Also every JSON spot's `deGrid`, in its
+    /// canonical spelling (`FN03gw`), and -- unless `operator_lat`/
+    /// `operator_lon` give an exact point -- the square's centre as
+    /// `deLat`/`deLon` (MAN-138).
     #[serde(default, deserialize_with = "deserialize_optional_grid")]
     pub operator_grid: Option<String>,
+    /// Station latitude in decimal degrees, north positive, e.g.
+    /// `43.9375`. **Optional; default: absent.** **Validated at
+    /// deserialize time** by `check_coordinate`: a finite number from -90
+    /// to 90. Every JSON spot's `deLat` (MAN-138). Set together with
+    /// `operator_lon` or not at all; alongside `operator_grid` the point
+    /// must lie inside that square -- both checked by
+    /// `ServerConfig::station_location`.
+    #[serde(default, deserialize_with = "deserialize_optional_latitude")]
+    pub operator_lat: Option<f64>,
+    /// Station longitude in decimal degrees, east positive (west is
+    /// negative), e.g. `-79.4583`. **Optional; default: absent.**
+    /// **Validated at deserialize time** by `check_coordinate`: a finite
+    /// number from -180 to 180. Every JSON spot's `deLon` (MAN-138). The
+    /// same pair and inside-the-grid rules as `operator_lat`.
+    #[serde(default, deserialize_with = "deserialize_optional_longitude")]
+    pub operator_lon: Option<f64>,
+}
+
+/// This station's position as every JSON spot reports it -- `deGrid`,
+/// `deLat`, `deLon` (MAN-138) -- resolved from `operator_grid`/
+/// `operator_lat`/`operator_lon` by `ServerConfig::station_location`.
+/// All three fields or none: a station either has a configured position
+/// or every spot says `null`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StationLocation {
+    pub grid: String,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+impl ServerConfig {
+    /// The cross-key rules serde's per-field validators cannot express:
+    /// lat and lon come as a pair, and a point given alongside a grid must
+    /// lie inside it -- otherwise `deGrid` and `deLat`/`deLon` would
+    /// disagree on the wire. `Ok(None)` when no location key is set.
+    ///
+    /// Re-runs the per-field checks too, so a hand-built `ServerConfig`
+    /// that never went through serde gets an `Err`, never a panic or a
+    /// clamped position.
+    pub fn station_location(&self) -> Result<Option<StationLocation>, String> {
+        let point = match (self.operator_lat, self.operator_lon) {
+            (None, None) => None,
+            (Some(lat), Some(lon)) => {
+                check_coordinate("operator_lat", lat, 90.0)?;
+                check_coordinate("operator_lon", lon, 180.0)?;
+                Some((lat, lon))
+            }
+            (Some(_), None) => {
+                return Err(
+                    "operator_lat is set but operator_lon is not -- set both, or neither".into(),
+                )
+            }
+            (None, Some(_)) => {
+                return Err(
+                    "operator_lon is set but operator_lat is not -- set both, or neither".into(),
+                )
+            }
+        };
+        let Some(grid) = &self.operator_grid else {
+            return Ok(point.map(|(lat, lon)| StationLocation {
+                grid: crate::maidenhead::locator(lat, lon),
+                lat,
+                lon,
+            }));
+        };
+        // `check_grid`'s rule and message: a hand-built config never went
+        // through `deserialize_optional_grid`.
+        let (Some(sq), Some(canonical)) = (
+            crate::maidenhead::square(grid),
+            crate::maidenhead::canonical(grid),
+        ) else {
+            return Err(not_a_grid(grid));
+        };
+        let (lat, lon) = match point {
+            None => sq.center(),
+            Some((lat, lon)) if sq.contains(lat, lon) => (lat, lon),
+            Some((lat, lon)) => return Err(outside_grid_message(grid, &sq, lat, lon)),
+        };
+        Ok(Some(StationLocation {
+            grid: canonical,
+            lat,
+            lon,
+        }))
+    }
+}
+
+/// `station_location`'s error for a point that is not inside the
+/// configured square, naming the square's bounds so the operator can see
+/// which of the two values is wrong.
+fn outside_grid_message(grid: &str, sq: &crate::maidenhead::Square, lat: f64, lon: f64) -> String {
+    format!(
+        "operator_lat = {lat}, operator_lon = {lon} is outside operator_grid {} \
+         (latitude {:.4} to {:.4}, longitude {:.4} to {:.4}) -- fix whichever is wrong, or \
+         set only one of operator_grid and operator_lat/operator_lon",
+        crate::human::quoted(grid),
+        sq.south,
+        sq.south + sq.height,
+        sq.west,
+        sq.west + sq.width,
+    )
 }
 
 /// One `[[rbn_uplink]]` TOML array-of-tables entry -- MAN-32/MAN-42.
@@ -548,6 +685,48 @@ pub struct RbnUplinkConfig {
     /// `docs/DECISIONS/2026-09-01-legacy-capability-matrix.md:91`.
     #[serde(default = "default_dry_run")]
     pub dry_run: bool,
+    /// Which spot types this target is sent (MAN-91). Omitted means
+    /// `cq_beacon`, RBN's own submission rule; `all` forwards every type.
+    /// Applies only to this uplink: telnet/JSON still carry every spot.
+    #[serde(default)]
+    pub spot_types: UplinkSpotTypes,
+}
+
+/// Which validated spots an `[[rbn_uplink]]` target is sent -- MAN-91.
+/// RBN only accepts a non-beacon station that is calling CQ or TEST, so the
+/// default forwards `Cq` (which `manta-spot`'s context parser also assigns
+/// to `CQ TEST <call>`) and `Beacon` only, and holds back `De` (a station
+/// answering someone else) and `Unknown` (no CQ evidence at all). `all` is
+/// the operator override for a collector that wants every type. A spot held
+/// back here is counted in the target's `suppressed` counter, alongside
+/// dry-run, per ARCHITECTURE §8's "every suppressed item is counted".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UplinkSpotTypes {
+    /// CQ and beacon spots only -- RBN's own rule, and the default.
+    #[default]
+    CqBeacon,
+    /// Every spot type, including DE and untyped spots.
+    All,
+}
+
+impl UplinkSpotTypes {
+    /// Whether a spot of type `t` is sent to the target.
+    pub fn forwards(self, t: manta_spot::SpotType) -> bool {
+        use manta_spot::SpotType;
+        match self {
+            UplinkSpotTypes::All => true,
+            UplinkSpotTypes::CqBeacon => matches!(t, SpotType::Cq | SpotType::Beacon),
+        }
+    }
+
+    /// The TOML spelling, for `config check` and the startup log.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UplinkSpotTypes::CqBeacon => "cq_beacon",
+            UplinkSpotTypes::All => "all",
+        }
+    }
 }
 
 impl RbnUplinkConfig {
@@ -741,6 +920,177 @@ mod tests {
         assert_eq!(cfg.operator_name, None);
         assert_eq!(cfg.operator_qth, None);
         assert_eq!(cfg.operator_grid, None);
+    }
+
+    #[test]
+    fn operator_lat_and_lon_are_optional_and_default_to_none() {
+        let cfg: ServerConfig = toml::from_str(r#"station_callsign = "W3XYZ""#).unwrap();
+        assert_eq!(cfg.operator_lat, None);
+        assert_eq!(cfg.operator_lon, None);
+    }
+
+    /// MAN-138: TOML integers coerce, so `operator_lon = -72` works as written.
+    #[test]
+    fn operator_lat_and_lon_parse_integers_and_decimals() {
+        let cfg: ServerConfig = toml::from_str(
+            "station_callsign = \"W1AW\"\noperator_lat = 41.714775\noperator_lon = -72\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.operator_lat, Some(41.714775));
+        assert_eq!(cfg.operator_lon, Some(-72.0));
+    }
+
+    #[test]
+    fn operator_lat_and_lon_reject_out_of_range_and_non_finite_values() {
+        for (bad, message) in [
+            (
+                "operator_lat = 95",
+                "operator_lat must be a number from -90 to 90",
+            ),
+            (
+                "operator_lat = -90.5",
+                "operator_lat must be a number from -90 to 90",
+            ),
+            (
+                "operator_lon = 180.5",
+                "operator_lon must be a number from -180 to 180",
+            ),
+            (
+                "operator_lat = nan",
+                "operator_lat must be a number from -90 to 90",
+            ),
+            (
+                "operator_lon = inf",
+                "operator_lon must be a number from -180 to 180",
+            ),
+            (
+                "operator_lon = -inf",
+                "operator_lon must be a number from -180 to 180",
+            ),
+        ] {
+            let src = format!("station_callsign = \"W1AW\"\n{bad}\n");
+            let err = toml::from_str::<ServerConfig>(&src)
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains(message), "{bad}: {err}");
+        }
+        for good in [
+            "operator_lat = 90\noperator_lon = 180",
+            "operator_lat = -90\noperator_lon = -180",
+        ] {
+            let src = format!("station_callsign = \"W1AW\"\n{good}\n");
+            assert!(toml::from_str::<ServerConfig>(&src).is_ok(), "{good}");
+        }
+    }
+
+    fn server_with(location_keys: &str) -> ServerConfig {
+        toml::from_str(&format!("station_callsign = \"W1AW\"\n{location_keys}"))
+            .unwrap_or_else(|e| panic!("{location_keys:?}: {e}"))
+    }
+
+    #[test]
+    fn station_location_is_none_when_no_location_key_is_set() {
+        assert_eq!(server_with("").station_location(), Ok(None));
+        // The greeting-only keys are not a position.
+        let cfg = server_with("operator_qth = \"Newington, CT\"\n");
+        assert_eq!(cfg.station_location(), Ok(None));
+    }
+
+    #[test]
+    fn station_location_from_a_grid_alone_is_its_canonical_spelling_and_centre() {
+        let loc = server_with("operator_grid = \"fn31PR\"\n")
+            .station_location()
+            .unwrap()
+            .unwrap();
+        assert_eq!(loc.grid, "FN31pr");
+        assert_eq!(
+            (loc.lat, loc.lon),
+            crate::maidenhead::square("FN31pr").unwrap().center()
+        );
+    }
+
+    #[test]
+    fn station_location_from_lat_lon_alone_derives_the_six_character_grid() {
+        let loc = server_with("operator_lat = 41.714775\noperator_lon = -72.72726\n")
+            .station_location()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loc,
+            StationLocation {
+                grid: "FN31pr".to_string(),
+                lat: 41.714775,
+                lon: -72.72726,
+            }
+        );
+    }
+
+    #[test]
+    fn station_location_with_all_three_keeps_the_configured_grid_and_point() {
+        let loc = server_with(
+            "operator_grid = \"FN31\"\noperator_lat = 41.714775\noperator_lon = -72.72726\n",
+        )
+        .station_location()
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            loc,
+            StationLocation {
+                grid: "FN31".to_string(),
+                lat: 41.714775,
+                lon: -72.72726,
+            }
+        );
+    }
+
+    #[test]
+    fn station_location_rejects_a_point_outside_the_configured_grid() {
+        let err =
+            server_with("operator_grid = \"FN31pr\"\noperator_lat = 40.0\noperator_lon = -74.0\n")
+                .station_location()
+                .unwrap_err();
+        assert!(
+            err.contains(
+                "operator_lat = 40, operator_lon = -74 is outside operator_grid \"FN31pr\""
+            ),
+            "{err}"
+        );
+        assert!(
+            err.contains("(latitude 41.7083 to 41.7500, longitude -72.7500 to -72.6667)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn station_location_rejects_lat_without_lon_and_lon_without_lat() {
+        assert_eq!(
+            server_with("operator_lat = 41.7\n").station_location(),
+            Err("operator_lat is set but operator_lon is not -- set both, or neither".to_string())
+        );
+        assert_eq!(
+            server_with("operator_lon = -72.7\n").station_location(),
+            Err("operator_lon is set but operator_lat is not -- set both, or neither".to_string())
+        );
+    }
+
+    /// A `ServerConfig` built in code skips serde's validators; the
+    /// resolver must still answer `Err`, never panic or clamp.
+    #[test]
+    fn station_location_rejects_hand_built_invalid_values() {
+        let cfg = ServerConfig {
+            operator_grid: Some("ZZ99xx".to_string()),
+            ..server_with("")
+        };
+        assert_eq!(
+            cfg.station_location(),
+            Err("\"ZZ99xx\" is not a Maidenhead grid square".to_string())
+        );
+        let cfg = ServerConfig {
+            operator_lat: Some(95.0),
+            operator_lon: Some(0.0),
+            ..server_with("")
+        };
+        assert!(cfg.station_location().unwrap_err().contains("operator_lat"));
     }
 
     #[test]
@@ -1205,6 +1555,59 @@ mod tests {
         // to a real target without the operator opting in explicitly.
         assert!(uplink.dry_run);
         assert_eq!(uplink.login_callsign, None);
+        // MAN-91: an omitted `spot_types` key means RBN's own rule.
+        assert_eq!(uplink.spot_types, UplinkSpotTypes::CqBeacon);
+    }
+
+    fn parse_spot_types(value: &str) -> Result<DaemonConfigFile, toml::de::Error> {
+        toml::from_str(&format!(
+            r#"
+            [server]
+            station_callsign = "W3XYZ"
+            [[rbn_uplink]]
+            enabled = true
+            target_host = "example.invalid"
+            target_port = 7300
+            spot_types = "{value}"
+            "#
+        ))
+    }
+
+    #[test]
+    fn uplink_spot_types_all_parses() {
+        let file = parse_spot_types("all").unwrap();
+        assert_eq!(file.rbn_uplink[0].spot_types, UplinkSpotTypes::All);
+        let file = parse_spot_types("cq_beacon").unwrap();
+        assert_eq!(file.rbn_uplink[0].spot_types, UplinkSpotTypes::CqBeacon);
+    }
+
+    /// A typo must fail loudly rather than fall back to the default -- same
+    /// reasoning as `line_format`.
+    #[test]
+    fn uplink_spot_types_rejects_an_unknown_value() {
+        let err = parse_spot_types("de").unwrap_err().to_string();
+        assert!(err.contains("spot_types"), "error was: {err}");
+        assert!(
+            err.contains("cq_beacon") && err.contains("all"),
+            "error was: {err}"
+        );
+    }
+
+    #[test]
+    fn uplink_spot_types_forwards_table() {
+        use manta_spot::SpotType;
+        let cases = [
+            (SpotType::Cq, true, true),
+            (SpotType::Beacon, true, true),
+            (SpotType::De, false, true),
+            (SpotType::Unknown, false, true),
+        ];
+        for (t, cq_beacon, all) in cases {
+            assert_eq!(UplinkSpotTypes::CqBeacon.forwards(t), cq_beacon, "{t:?}");
+            assert_eq!(UplinkSpotTypes::All.forwards(t), all, "{t:?}");
+        }
+        assert_eq!(UplinkSpotTypes::CqBeacon.as_str(), "cq_beacon");
+        assert_eq!(UplinkSpotTypes::All.as_str(), "all");
     }
 
     #[test]
@@ -1328,6 +1731,7 @@ mod tests {
             target_port: 7300,
             login_callsign: None,
             dry_run: false,
+            spot_types: UplinkSpotTypes::default(),
         };
         assert_eq!(uplink.effective_login_callsign("W3XYZ"), "W3XYZ");
 

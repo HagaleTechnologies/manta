@@ -34,27 +34,32 @@ SPOT: W1AW (CQ) 14000.8 kHz 29 dB 20 WPM conf=0.79
 | Command | stdout | stderr |
 |---|---|---|
 | `decode` | Decoded text or existing JSON report | Text-mode summary and diagnostics |
-| `run`, alias `listen` | Human spot lines or existing JSON Lines | Character monitor, startup, logs, warnings, errors |
+| `run`, alias `listen` | Human spot lines or existing JSON Lines | Per-track decoded-text lines (MAN-123), startup, logs, warnings, errors |
 | `gen` | Empty | Fixture-written confirmation or error |
 | `soak` | Human report | Warnings or execution errors |
-| `doctor` | Human report or existing JSON | Warnings or execution errors |
+| `doctor` | Setup checks (MAN-126), human report, or existing JSON plus `checks` | Warnings or execution errors |
 | `status` | Existing human or JSON status document | Query/config errors |
 | `config check` | Existing exact-value configuration summary | Notes and errors |
 | `config init` | TOML only with `--out -` | Written-file confirmation or error |
 | `oracle` | Existing JSON summary | Diagnostics and errors |
 
 `manta run --config manta.toml > spots.log 2> monitor.log` now captures spots
-in the first file and monitor text plus diagnostics in the second. Scripts
+in the first file and decoded text plus diagnostics in the second. Scripts
 previously collecting spots from stderr must change their redirection.
 
-The monitor ends its partial line at EOF or error. Diagnostics terminate any
-partial monitor line before writing a complete record. Monitor state and writes
-are coordinated; tracing holds the stderr lock for the entire record. Spot
+Merged after MAN-123 and MAN-124: decoded text is written as whole labelled
+lines per track (`[track 5 14060.6 kHz 20 WPM] CQ DE W1AW`, using the shared
+formatters below), so no partial monitor line exists for a diagnostic to
+interrupt and the earlier monitor-line coordination was removed. Notes and
+warnings go through MAN-124's `logging::note`/`logging::warning` (plain stderr
+lines in text mode, leveled records under `--log-format json`). Spot
 publishing, server draining, timing and JSON serializers are unchanged.
 
 ## Errors and quoting
 
-Application errors occupy one physical stderr line, beginning `error:`. Context
+Application errors occupy one physical stderr line, beginning `error:`.
+Under `run --log-format json` (MAN-124) the same escaped cause chain is the
+message of one ERROR record instead. Context
 and cause Display text retain their order, separated by `: `. Empty causes do
 not introduce empty segments. Control characters become visible escapes, such
 as `\n`, `\t` or `\u{1b}`. Leading, interior and trailing spaces, ordinary Unicode

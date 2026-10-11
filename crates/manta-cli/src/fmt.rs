@@ -87,80 +87,6 @@ verdict: {}\n",
     )
 }
 
-// All monitor state and writes share this lock. A diagnostic also holds the
-// stderr lock for its entire record, including the preceding newline.
-use std::io::Write;
-use std::sync::{Mutex, MutexGuard};
-
-#[derive(Default)]
-struct MonitorLine {
-    open: bool,
-}
-
-impl MonitorLine {
-    fn append(&mut self, writer: &mut impl Write, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        let _ = writer.write_all(text.as_bytes());
-        let _ = writer.flush();
-        self.open = !text.ends_with('\n');
-    }
-
-    fn terminate(&mut self, writer: &mut impl Write) {
-        if self.open {
-            let _ = writer.write_all(b"\n");
-            let _ = writer.flush();
-            self.open = false;
-        }
-    }
-}
-
-static STDERR_MONITOR: Mutex<MonitorLine> = Mutex::new(MonitorLine { open: false });
-
-pub fn monitor_write(text: &str) {
-    let mut monitor = STDERR_MONITOR.lock().expect("monitor lock poisoned");
-    monitor.append(&mut std::io::stderr().lock(), text);
-}
-
-pub fn end_monitor_line() {
-    let mut monitor = STDERR_MONITOR.lock().expect("monitor lock poisoned");
-    monitor.terminate(&mut std::io::stderr().lock());
-}
-
-pub struct DiagnosticWriter {
-    _monitor: MutexGuard<'static, MonitorLine>,
-    stderr: std::io::StderrLock<'static>,
-}
-
-impl Write for DiagnosticWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.stderr.write(bytes)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.stderr.flush()
-    }
-}
-
-/// Tracing retains this writer (and both locks) until the record is complete.
-pub fn monitor_aware_stderr() -> DiagnosticWriter {
-    let mut monitor = STDERR_MONITOR.lock().expect("monitor lock poisoned");
-    let mut stderr = std::io::stderr().lock();
-    monitor.terminate(&mut stderr);
-    DiagnosticWriter {
-        _monitor: monitor,
-        stderr,
-    }
-}
-
-macro_rules! diagnostic {
-    ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        let _ = writeln!($crate::fmt::monitor_aware_stderr(), $($arg)*);
-    }};
-}
-pub(crate) use diagnostic;
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -175,28 +101,6 @@ mod tests {
         assert_eq!(
             decode_summary(&report),
             "frequency: 14012.3 kHz  speed: unknown  spots: 0"
-        );
-    }
-
-    #[test]
-    fn monitor_diagnostics_error_and_eof_have_complete_lines() {
-        let mut monitor = MonitorLine::default();
-        let mut out = Vec::new();
-        monitor.terminate(&mut out);
-        monitor.append(&mut out, "CQ DE ");
-        monitor.append(&mut out, "W1AW");
-        monitor.terminate(&mut out);
-        out.extend_from_slice(b"log record\n");
-        monitor.append(&mut out, "K");
-        monitor.terminate(&mut out);
-        out.extend_from_slice(b"error: disconnected\n");
-        monitor.terminate(&mut out);
-        monitor.append(&mut out, "CQ");
-        monitor.terminate(&mut out);
-        monitor.terminate(&mut out);
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "CQ DE W1AW\nlog record\nK\nerror: disconnected\nCQ\n"
         );
     }
 
