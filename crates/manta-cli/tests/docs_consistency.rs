@@ -1211,6 +1211,33 @@ fn config_reference_documents_environment_server_activation() {
     );
 }
 
+/// MAN-149 PR #251 review: metrics_http::handle_request charges EOF,
+/// header-timeout and header-read-error connections against
+/// metrics_max_requests_per_ip, but answers only the request path with 429.
+#[test]
+fn metrics_reference_documents_non_request_budget_charges() {
+    let md = doc(METRICS_REF);
+    let scraping = squash_whitespace(section(&md, "Scraping"));
+    assert!(
+        !scraping.contains("caps completed requests"),
+        "{METRICS_REF} still describes metrics_max_requests_per_ip as a completed-request cap"
+    );
+    for charged in [
+        "closes without sending a byte",
+        "times out reading its headers",
+        "hits a read error",
+    ] {
+        assert!(
+            scraping.contains(charged),
+            "{METRICS_REF} must say a connection that {charged} is charged"
+        );
+    }
+    assert!(
+        scraping.contains("is charged but never refused"),
+        "{METRICS_REF} must say those connections are never answered with 429"
+    );
+}
+
 /// MAN-149 M2: config deserialization uppercases the station identity;
 /// SpotMessage uses that identity for both deCall and the id prefix.
 #[test]

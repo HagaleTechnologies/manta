@@ -33,11 +33,17 @@ Two per-source-IP limits apply to all three paths together:
 - `metrics_max_connections_per_ip` caps concurrent connections from one
   address. The default is 8; `0` removes the per-IP cap, leaving only the
   listener's total of 64.
-- `metrics_max_requests_per_ip` caps completed requests from one address
-  per 60 s. The default is 60. An over-budget request gets
-  `429 Too Many Requests` with an empty body. A liveness probe polling
-  `/healthz` from a scraper's address shares that scraper's budget. `0`
-  disables this limit.
+- `metrics_max_requests_per_ip` is a budget of 60 charges per address
+  per fixed 60 s window by default. Each admitted connection is charged
+  once. A connection that closes without sending a byte, times out
+  reading its headers, or hits a read error (a reset, or a line that is
+  over-long or not valid UTF-8) is charged but never refused. Every
+  other connection counts as a request, valid HTTP or not, and is
+  refused once over budget: it gets `429 Too Many Requests` with an
+  empty body, whatever the path. So a TCP liveness probe or a broken
+  client can spend the budget and earn the next request from that
+  address a 429. A liveness probe polling `/healthz` from a scraper's
+  address shares that scraper's budget. `0` disables this limit.
 
 Both keys are under `[server]`; see [CONFIG.md](CONFIG.md#server).
 
