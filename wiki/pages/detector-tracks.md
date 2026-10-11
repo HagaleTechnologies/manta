@@ -27,3 +27,10 @@ The detector estimates a per-channel noise floor by order statistics (a quantile
 ## Why it is shaped this way
 
 Order statistics rather than a mean floor is the load-bearing choice: CW is bursty, and a mean would let a strong keyed signal raise the threshold above weaker neighbors. The hysteresis + hang timing exists to survive QSB and inter-word gaps without dropping a track mid-QSO. Active tracks feed the [[decode-chain]].
+
+## Gotchas
+
+- High-SNR PFB skirt leakage can cross the detector threshold outside an
+  incumbent's owned channels. MAN-172 adds local-peak spawn eligibility
+  and incumbent-wins merge ties; see the
+  [decision record](../../docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md).

@@ -78,18 +78,29 @@ MAN-125: `manta devices` lists audio inputs and optional Soapy selectors;
 floor without decoding or services. See
 `docs/DECISIONS/2026-10-10-man125-source-diagnostics.md`.
 
+MAN-131: live audio reads wait for samples (5 s stall error naming the
+device, 48000 Hz and a macOS microphone-permission hint); digital-silence
+warning; `decode` warns without a sidecar and takes `--center-freq-hz` —
+see docs/DECISIONS/2026-10-11-man131-actionable-errors.md.
+
 MAN-138: JSON spots' `deGrid`/`deLat`/`deLon` are the operator's
 `[server].operator_grid` (its square's centre) or the new `operator_lat`/
 `operator_lon`, `null` when none is set, never a `cty.dat` country
 centroid; an inconsistent location fails config loading before I/O. See
 `docs/DECISIONS/2026-10-11-man138-station-location.md`.
 
+<<<<<<< HEAD
 MAN-81: with no arguments the Docker image runs the daemon from a config
 mounted at `/etc/manta/manta.toml` (or `MANTA_CONFIG`), else prints
 `--help`; its `HEALTHCHECK` runs the new `manta health` (exit 0/1 from
 `/healthz`, metrics address read from the daemon's config); the image is
 also built for `linux/arm/v7`. See
 `docs/DECISIONS/2026-10-11-man81-docker-config-mount-and-healthcheck.md`.
+=======
+MAN-172: high-SNR track churn fixed in `TrackManager` (local-peak spawn
+rule, incumbent-wins merge ties); VR3/VR4 pass, VR1/VR2 pass CER but not
+WPM. See docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md.
+>>>>>>> 44d5ed35341136addd454eba4316ce4dfc864699
 
 ## Documents (read in this order)
 
