@@ -49,15 +49,28 @@ fn a_missing_audio_input_names_itself_the_rate_and_manta_devices_in_every_comman
         vec!["check", "--device", name],
     ] {
         let out = manta().args(&args).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
         let want = format!(
             "no audio input matching \"{name}\" (manta needs a 48000 Hz input) -- \
              run `manta devices` to list the inputs --device can select"
         );
+        // MAN-126: doctor reports a receiver it cannot open as its stdout
+        // `FAIL  receiver:` check line, not an `Error:` chain on stderr;
+        // every other command errors on stderr.
+        let shown = if args[0] == "doctor" {
+            stdout
+                .lines()
+                .find(|l| l.starts_with("FAIL  receiver: "))
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            stderr.to_string()
+        };
         assert!(
-            stderr.contains(&want),
-            "{args:?}: {want:?} missing from {stderr}"
+            shown.contains(&want),
+            "{args:?}: {want:?} missing from stdout={stdout}\nstderr={stderr}"
         );
     }
 }
