@@ -547,17 +547,13 @@ criteria.
 
 ## Documentation
 
-<<<<<<< HEAD
 [docs/README.md](docs/README.md) says where operators, contributors and
 researchers each start, and lists every runbook.
 
-**Running a node:** [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
-=======
 **Running a node:** [docs/GUIDES/rbn-node.md](docs/GUIDES/rbn-node.md)
 (from install to a running node) · [docs/GUIDES/kiwisdr.md](docs/GUIDES/kiwisdr.md)
 (KiwiSDR etiquette) · [docs/GUIDES/raspberry-pi.md](docs/GUIDES/raspberry-pi.md)
 (Pi install and service) · [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
->>>>>>> ac909b26e876a3f2a095f2f21b2afa3811dba28d
 (exposing the servers safely) · the "Run it as a node" section above ·
 [docs/CONFIG.md](docs/CONFIG.md) (every config key, its default and what
 reads it) · [docs/METRICS.md](docs/METRICS.md) (every `/metrics` family,
