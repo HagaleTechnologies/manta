@@ -40,6 +40,15 @@ station_callsign = "N0CALL"
 #operator_qth = "Richmond Hill, ON"  # your location
 #operator_grid = "FN03GW"            # Maidenhead grid square, 4 or 6 characters
 
+# Your station's position, sent with every JSON spot as deGrid, deLat and
+# deLon. operator_grid above is enough: spots then carry the centre of the
+# grid square. Add operator_lat and operator_lon for an exact point. When
+# all three are set, the point must lie inside the grid square. With none
+# of them set, JSON spots carry no station position. Decimal degrees;
+# south and west are negative.
+#operator_lat = 43.9375              # -90 to 90
+#operator_lon = -79.4583             # -180 to 180
+
 # Address the telnet and JSON servers listen on. The default, 0.0.0.0,
 # accepts connections on every network interface, as a public cluster
 # node expects. Set "127.0.0.1" to accept connections from this machine

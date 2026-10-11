@@ -2106,6 +2106,10 @@ struct SpotServer {
     /// tests without guessing or binding a fixed port.
     #[cfg_attr(not(test), allow(dead_code))]
     metrics_addr: std::net::SocketAddr,
+    /// The JSON listener's real bound address, so a port-0 bind is reachable
+    /// by tests -- `metrics_addr`'s MAN-44 precedent.
+    #[cfg_attr(not(test), allow(dead_code))]
+    json_addr: std::net::SocketAddr,
     /// MAN-78: each `[[rbn_uplink]]` task's live `dry_run` flag, in config
     /// order, for the SIGHUP reload thread (Unix only) to flip.
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -2533,6 +2537,14 @@ fn start_spot_server(
 
     // MAN-261: `[server]`/`[[rbn_uplink]]` arrive already parsed and
     // validated by `config::load`, before any source was opened.
+    //
+    // MAN-138: `config::load` already rejected an inconsistent location
+    // before I/O; this re-resolution obtains the value every JSON spot
+    // carries, and still rejects one for a caller that built its
+    // `ServerConfig` directly.
+    let station_location = cfg
+        .station_location()
+        .map_err(|e| anyhow!("[server]: {e}"))?;
     let bus = std::sync::Arc::new(manta_server::bus::SpotBus::new(
         source.sample_rate_hz,
         epoch,
@@ -2552,7 +2564,7 @@ fn start_spot_server(
     let tasks = manta_server::tasks::new_client_tasks();
 
     let rt = tokio::runtime::Runtime::new()?;
-    let (status_line, metrics_addr, uplink_dry_run) = rt.block_on(async {
+    let (status_line, metrics_addr, json_addr, uplink_dry_run) = rt.block_on(async {
         // MAN-132: metrics binds its own `metrics_bind_addr` (loopback by
         // default), never `bind_addr`. With two configurable addresses
         // "which listener failed?" is a real question, so each bind names
@@ -2584,6 +2596,7 @@ fn start_spot_server(
                     )
                 })?;
         let metrics_addr = metrics_listener.local_addr()?;
+        let json_addr = json_listener.local_addr()?;
 
         // MAN-122 scenario 1. Emitted after every bind succeeds (so a bind
         // failure never produces a banner at all) but BEFORE any listener task is
@@ -2638,6 +2651,14 @@ fn start_spot_server(
                  (Aggregator manual v6.0 §9.2)"
             );
         }
+        // MAN-138: without a configured position every JSON spot's
+        // deGrid/deLat/deLon is null -- legal, but a map shows nothing.
+        if station_location.is_none() {
+            tracing::warn!(
+                "JSON spots will carry no station position -- set [server].operator_grid, or \
+                 operator_lat and operator_lon, so deGrid/deLat/deLon name this node's location"
+            );
+        }
         let profile = std::sync::Arc::new(station_profile(
             &cfg,
             source.dial_freq_hz,
@@ -2682,6 +2703,7 @@ fn start_spot_server(
                     metrics: metrics.clone(),
                     cty: cty.clone(),
                     station_call: cfg.station_callsign.clone(),
+                    station_location,
                     decoder_version,
                     // .clone(): MAN-32/MAN-42's uplink::serve spawns below also
                     // need shutdown_rx -- can't let this be the moving consumer
@@ -2794,7 +2816,7 @@ fn start_spot_server(
             shutdown_rx.clone(),
         );
 
-        anyhow::Ok((status_line, metrics_addr, uplink_dry_run))
+        anyhow::Ok((status_line, metrics_addr, json_addr, uplink_dry_run))
     })?;
 
     Ok((
@@ -2813,6 +2835,7 @@ fn start_spot_server(
             cty,
             status_line: std::sync::Mutex::new(status_line),
             metrics_addr,
+            json_addr,
             uplink_dry_run,
         },
     ))
@@ -6236,6 +6259,142 @@ mod tests {
             "a config with the operator-identity keys present must still start: {:?}",
             result.err()
         );
+    }
+
+    /// MAN-138: starts the daemon's servers from a real config file (through
+    /// `config::load` and `start_spot_server`, as `run` does), publishes one
+    /// spot and returns the line a raw TCP client reads from the JSON port.
+    fn json_spot_from_a_daemon(callsign: &str, location_keys: &str) -> serde_json::Value {
+        let cfg_file = write_temp_file(
+            format!(
+                "[server]\nstation_callsign = \"{callsign}\"\nbind_addr = '127.0.0.1'\n\
+                 telnet_port = 0\njson_port = 0\nmetrics_port = 0\n{location_keys}"
+            )
+            .as_bytes(),
+        );
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
+        let (rt, server) = start_spot_server(
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0),
+                freq_calibration: 1.0,
+            },
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+        )
+        .unwrap();
+
+        let line = rt.block_on(async {
+            use tokio::io::AsyncBufReadExt;
+            let stream = tokio::net::TcpStream::connect(server.json_addr)
+                .await
+                .unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            // Let the listener accept and subscribe before the publish (the
+            // json_stream_acceptance precedent).
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            server.bus.publish(manta_spot::Spot {
+                callsign: "JA1ABC".to_string(),
+                freq_hz: 14_027_100.0,
+                snr_db: 23.0,
+                wpm: 28.0,
+                spot_type: manta_spot::SpotType::Cq,
+                confidence: 0.9,
+                track_id: 7,
+                sample_ts: 12_345,
+            });
+            let mut line = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                reader.read_line(&mut line),
+            )
+            .await
+            .expect("timed out waiting for a JSON spot")
+            .unwrap();
+            line
+        });
+
+        let _ = server.shutdown_tx.send(true);
+        shutdown_runtime_after_drain(rt, &server.tasks);
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("{line:?}: {e}"))
+    }
+
+    /// MAN-138's Gherkin scenario, end to end: an operator configures their
+    /// station's grid square, and every JSON spot names that location as
+    /// deGrid/deLat/deLon -- not the cty.dat centroid (37.6, -91.87) that
+    /// every US-based spotter used to share.
+    #[test]
+    fn a_configured_station_grid_reaches_json_spots_as_the_receiver_position() {
+        let mut positions = Vec::new();
+        for (call, grid) in [("W1AW", "FN31pr"), ("W5AU", "EM12kp")] {
+            let spot = json_spot_from_a_daemon(call, &format!("operator_grid = \"{grid}\"\n"));
+            let (lat, lon) = manta_server::maidenhead::square(grid).unwrap().center();
+            assert_eq!(spot["deCall"], call, "{spot}");
+            assert_eq!(spot["deGrid"], grid, "{spot}");
+            let de_lat = spot["deLat"].as_f64().expect("deLat is a number");
+            let de_lon = spot["deLon"].as_f64().expect("deLon is a number");
+            assert!(
+                (de_lat - lat).abs() < 1e-9,
+                "{call}: deLat {de_lat}, want {lat}"
+            );
+            assert!(
+                (de_lon - lon).abs() < 1e-9,
+                "{call}: deLon {de_lon}, want {lon}"
+            );
+            assert_ne!((de_lat, de_lon), (37.6, -91.87), "{call}: the US centroid");
+            // Entity-level fields still follow the callsign.
+            assert_eq!(spot["deDxcc"], 291, "{spot}");
+            positions.push((de_lat, de_lon));
+        }
+        assert_ne!(
+            positions[0], positions[1],
+            "two stations in one country must not share a position"
+        );
+    }
+
+    /// With no location configured, the daemon sends the contract-legal
+    /// "unknown" (`null`), never a country centroid in its place.
+    #[test]
+    fn a_station_without_a_configured_location_sends_null_position_not_a_country_centroid() {
+        let spot = json_spot_from_a_daemon("W1AW", "");
+        for key in ["deGrid", "deLat", "deLon"] {
+            assert!(spot[key].is_null(), "{key}: {spot}");
+        }
+        assert_eq!(spot["deDxcc"], 291, "{spot}");
+    }
+
+    /// The belt-and-braces path for a caller that skips `config::load`: a
+    /// hand-built config with half a lat/lon pair never starts a listener.
+    #[test]
+    fn start_spot_server_rejects_an_inconsistent_station_location() {
+        let cfg = manta_server::config::ServerConfig {
+            operator_lat: Some(41.7),
+            ..test_server_config("W1AW")
+        };
+        let Err(err) = start_spot_server(
+            cfg,
+            Vec::new(),
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0),
+                freq_calibration: 1.0,
+            },
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+        ) else {
+            panic!("half a lat/lon pair must not start the servers");
+        };
+        let err = format!("{err:#}");
+        assert!(err.contains("operator_lon"), "{err}");
+        assert!(err.starts_with("[server]: "), "{err}");
     }
 
     #[test]
