@@ -57,11 +57,21 @@ both emitted `"deGrid":null,"deLat":37.6,"deLon":-91.87`.
    lat/lon-only config does not add a derived grid to it), `SKIMMER/SETT`,
    the RBN uplink and decoder output are unchanged. No CLI flags: no
    `[server]` key has one.
-8. **dispensa.** Types and nullability are unchanged, so the schema needs
-   no change. A field description ready to lift into ADR-0011:
-   "`deGrid`/`deLat`/`deLon`: the reporting station's operator-configured
-   position; `null` when the operator configured none; `deLat`/`deLon` are
-   a grid-square centre when only `deGrid` was configured."
+8. **dispensa.** Types and nullability are unchanged, so the schema's
+   types need no change. The fields' meaning did change, and ADR-0011 is
+   where a consumer reads it. A field description ready to lift into
+   ADR-0011 or the `spots.v1.schema.json` descriptions:
+   "`deGrid`/`deLat`/`deLon`: the reporting station's position as its
+   operator configured it. All three are `null` together when none was
+   configured. `deGrid` is a 4- or 6-character Maidenhead locator, field
+   and square uppercase and subsquare lowercase (`FN31`, `FN31pr`): the
+   configured grid, or the 6-character subsquare containing the configured
+   point when only a point was configured. `deLat`/`deLon` are decimal
+   degrees, north and east positive: the configured point, or the centre
+   of the area the configured grid names (its square for 4 characters, its
+   subsquare for 6) when only a grid was configured."
+   Landing it in dispensa is a follow-up outside this repo, as it was for
+   MAN-102's `snrRefHz` (dispensa Q-0065) and MAN-83's `decoderVersion`.
 
 ## Evidence and tests
 
