@@ -32,7 +32,8 @@ impl std::str::FromStr for Engine {
             "edge-legacy" => Ok(Engine::EdgeLegacy),
             "hsmm" => Ok(Engine::Hsmm),
             o => Err(format!(
-                "unknown decode engine {o:?} (legacy | edge-legacy | hsmm)"
+                "unknown decode engine '{}' (legacy | edge-legacy | hsmm)",
+                o.escape_debug()
             )),
         }
     }

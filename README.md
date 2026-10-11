@@ -491,14 +491,22 @@ only if that config also carries at least one `[[rbn_uplink]]` block.
   source-health counters. Some gauges are still placeholders;
   ARCHITECTURE §8 says which.
 
-`run` (alias `listen`) also prints a `SPOT:` line on stdout for each
-confirmed spot, and decoded text on stderr, one line per track labelled
-with its track number, frequency and speed. With a `[server]` table the
-decoded text is off unless you pass `--decoded-text`, so a service log
-holds spots and diagnostics only. `--json` prints every decoder event and
-spot as JSON Lines on stdout instead. `decode` prints its decoded text on
-stdout. This terminal output is a debugging aid, not a stable interface —
-the servers above are.
+`run` (alias `listen`) prints a `SPOT:` line on stdout for each confirmed
+spot, and decoded text on stderr, one line per track labelled with its track
+number, frequency and speed. With a `[server]` table the decoded text is off
+unless you pass `--decoded-text`, so a service log holds spots and diagnostics
+only. Startup messages, warnings and errors also go to stderr, so the two
+streams can be captured separately:
+
+```sh
+manta run --config manta.toml > spots.log 2> monitor.log
+```
+
+`decode` prints decoded text on stdout and a measurement summary on stderr.
+`run --json` and `decode --json` keep full-precision JSON on stdout. This
+terminal output is a debugging aid, not a stable interface — the servers above
+are. Human units, report streams and error conventions are defined in the
+[command output style decision](docs/DECISIONS/2026-10-10-man270-cli-output-style.md).
 
 The decode path is deterministic: the same file in produces byte-identical
 spot logs out. That is a hard requirement, and CI enforces it with golden
