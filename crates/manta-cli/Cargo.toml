@@ -50,8 +50,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
 ] }
 
-# MAN-127: config_edit.rs also uses libc (Linux) to copy the config's POSIX
-# access ACL onto the temp file it replaces the config with.
+# MAN-127: config_edit.rs also uses libc to copy the config's POSIX (Linux)
+# or extended (macOS) ACL onto the temp file it replaces the config with.
 # MAN-78: SIGTERM, and SIGHUP (reload with a [server] table, drain
 # without one); ctrlc keeps SIGINT and Windows' console events.
 [target.'cfg(unix)'.dependencies]

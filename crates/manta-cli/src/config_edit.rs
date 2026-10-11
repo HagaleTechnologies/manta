@@ -99,13 +99,29 @@ impl Drop for TempGuard {
 }
 
 /// Saves to the file at `path` (following symlinks), returns the previous value.
-pub(crate) fn save_freq_correction_ppm(path: &Path, ppm: f64) -> Result<Option<f64>> {
+/// With `expected`, refuses when the file no longer holds exactly that text:
+/// `calibrate` passes what it read before measuring, so a config rewritten
+/// or retargeted during the measurement (possibly describing another
+/// receiver) is never given that measurement.
+pub(crate) fn save_freq_correction_ppm(
+    path: &Path,
+    ppm: f64,
+    expected: Option<&str>,
+) -> Result<Option<f64>> {
     let target = fs::canonicalize(path)
         .with_context(|| format!("cannot resolve config file {}", path.display()))?;
     let bytes =
         fs::read(&target).with_context(|| format!("reading config file {}", target.display()))?;
     let text = String::from_utf8(bytes)
         .map_err(|e| anyhow!("config file {} is not valid UTF-8: {e}", target.display()))?;
+    if let Some(expected) = expected {
+        ensure!(
+            text == expected,
+            "{} left unchanged: it changed after calibrate read it, so it may no longer \
+             describe the receiver that was measured; re-run calibrate",
+            target.display()
+        );
+    }
     let (new_text, previous) =
         set_freq_correction_ppm(&text, ppm).with_context(|| target.display().to_string())?;
     let ppm = if ppm == 0.0 { 0.0 } else { ppm };
@@ -147,6 +163,8 @@ pub(crate) fn save_freq_correction_ppm(path: &Path, ppm: f64) -> Result<Option<f
     };
     #[cfg(windows)]
     keep_dacl(&target, &file, ppm)?;
+    #[cfg(target_os = "macos")]
+    keep_acl(&target, &file, ppm)?;
     file.write_all(new_text.as_bytes())
         .and_then(|()| file.sync_all())
         .with_context(|| format!("writing temp file {}", temp.display()))?;
@@ -256,6 +274,64 @@ fn keep_acl(target: &Path, temp: &fs::File, ppm: f64) -> Result<()> {
                 _ => Err(Error::last_os_error()),
             }
         }
+    };
+    result.map_err(fail)
+}
+
+/// Gives the still-empty temp file the original's extended ACL, or an empty
+/// one when the original has none. A new file inherits its directory's
+/// inheritable ACEs, which can grant principals the config's own ACL and
+/// mode exclude, and `set_permissions` carries only the mode bits. ENOTSUP
+/// means the filesystem has no extended ACLs.
+#[cfg(target_os = "macos")]
+fn keep_acl(target: &Path, temp: &fs::File, ppm: f64) -> Result<()> {
+    use std::ffi::{c_int, c_void};
+    use std::io::Error;
+    use std::os::unix::io::AsRawFd;
+    // <sys/acl.h>; libc does not bind these.
+    const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+    extern "C" {
+        fn acl_get_fd_np(fd: c_int, ty: c_int) -> *mut c_void;
+        fn acl_set_fd_np(fd: c_int, acl: *mut c_void, ty: c_int) -> c_int;
+        fn acl_init(count: c_int) -> *mut c_void;
+        fn acl_free(obj: *mut c_void) -> c_int;
+    }
+    let fail = |e: Error| {
+        anyhow!(
+            "cannot keep {}'s permissions: {e}; set {KEY} = {} by hand",
+            target.display(),
+            literal(ppm)
+        )
+    };
+    let errno = |e: &Error| e.raw_os_error().unwrap_or(0);
+    let original = fs::File::open(target).map_err(fail)?;
+    // SAFETY: a live fd. A non-null result is an acl_t we own and free below.
+    let mut acl = unsafe { acl_get_fd_np(original.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        match Error::last_os_error() {
+            e if errno(&e) == libc::ENOTSUP => return Ok(()),
+            // No ACL on the original: give the temp file an empty one.
+            e if errno(&e) == libc::ENOENT => {
+                // SAFETY: allocates an empty acl_t we own and free below.
+                acl = unsafe { acl_init(0) };
+                if acl.is_null() {
+                    return Err(fail(Error::last_os_error()));
+                }
+            }
+            e => return Err(fail(e)),
+        }
+    }
+    // SAFETY: a live fd and the acl_t from above, freed once after use.
+    let result = unsafe {
+        let r = match acl_set_fd_np(temp.as_raw_fd(), acl, ACL_TYPE_EXTENDED) {
+            0 => Ok(()),
+            _ => match Error::last_os_error() {
+                e if errno(&e) == libc::ENOTSUP => Ok(()),
+                e => Err(e),
+            },
+        };
+        acl_free(acl);
+        r
     };
     result.map_err(fail)
 }
@@ -468,7 +544,7 @@ mod tests {
             "manta.toml",
             "[input]\nfreq_correction_ppm = 0.5\n",
         );
-        let previous = save_freq_correction_ppm(&p, -1.42).unwrap();
+        let previous = save_freq_correction_ppm(&p, -1.42, None).unwrap();
         assert_eq!(previous, Some(0.5));
         let loaded = load(Some(&p), Env::Ignore).unwrap();
         assert_eq!(loaded.input.shared.freq_correction_ppm, Some(-1.42));
@@ -478,15 +554,34 @@ mod tests {
     fn save_leaves_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "manta.toml", "[input]\n");
-        assert_eq!(save_freq_correction_ppm(&p, 2.5).unwrap(), None);
+        assert_eq!(save_freq_correction_ppm(&p, 2.5, None).unwrap(), None);
         assert_eq!(entries(dir.path()), ["manta.toml"]);
 
         let bad_body = "[input]\nfreq_correction_ppm = 0.5\n\n[bogus]\nx = 1\n";
         let bad = write(dir.path(), "bad.toml", bad_body);
-        let err = save_freq_correction_ppm(&bad, -1.42).unwrap_err();
+        let err = save_freq_correction_ppm(&bad, -1.42, None).unwrap_err();
         assert!(format!("{err:#}").contains("left unchanged"), "{err:#}");
         assert_eq!(fs::read_to_string(&bad).unwrap(), bad_body);
         assert_eq!(entries(dir.path()), ["bad.toml", "manta.toml"]);
+    }
+
+    #[test]
+    fn save_refuses_a_file_changed_since_it_was_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "[input]\nfreq_correction_ppm = 0.5\n";
+        let p = write(dir.path(), "manta.toml", body);
+        let read_before = "[input]\ndevice = \"other\"\n";
+        let err = save_freq_correction_ppm(&p, -1.42, Some(read_before)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("changed after calibrate read it"),
+            "{err:#}"
+        );
+        assert_eq!(fs::read_to_string(&p).unwrap(), body);
+        assert_eq!(entries(dir.path()), ["manta.toml"]);
+        assert_eq!(
+            save_freq_correction_ppm(&p, -1.42, Some(body)).unwrap(),
+            Some(0.5)
+        );
     }
 
     #[cfg(unix)]
@@ -496,7 +591,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "manta.toml", "[input]\n");
         fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
-        save_freq_correction_ppm(&p, -1.42).unwrap();
+        save_freq_correction_ppm(&p, -1.42, None).unwrap();
         let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o600);
     }
@@ -514,7 +609,10 @@ mod tests {
         );
         let link = dir.path().join("link.toml");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert_eq!(save_freq_correction_ppm(&link, -1.42).unwrap(), Some(1.0));
+        assert_eq!(
+            save_freq_correction_ppm(&link, -1.42, None).unwrap(),
+            Some(1.0)
+        );
         assert!(fs::symlink_metadata(&link)
             .unwrap()
             .file_type()
@@ -608,7 +706,7 @@ mod tests {
             return;
         }
         assert_eq!(access_acl(&p), None);
-        save_freq_correction_ppm(&p, -1.42).unwrap();
+        save_freq_correction_ppm(&p, -1.42, None).unwrap();
         assert_eq!(
             access_acl(&p),
             None,
@@ -622,9 +720,66 @@ mod tests {
         assert!(set_acl(&q, c"system.posix_acl_access"));
         let acl = access_acl(&q);
         assert!(acl.is_some());
-        save_freq_correction_ppm(&q, -1.42).unwrap();
+        save_freq_correction_ppm(&q, -1.42, None).unwrap();
         assert_eq!(access_acl(&q), acl, "the saved config lost its ACL");
         assert_eq!(mode(&q), 0o640);
+    }
+
+    /// `ls -le`'s ACL lines for `path`, one per ACE.
+    #[cfg(target_os = "macos")]
+    fn extended_acl(path: &Path) -> Vec<String> {
+        let out = std::process::Command::new("/bin/ls")
+            .arg("-led")
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|l| l.trim().to_string())
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn chmod_acl(path: &Path, ace: &str) -> bool {
+        std::process::Command::new("/bin/chmod")
+            .arg("+a")
+            .arg(ace)
+            .arg(path)
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn save_keeps_the_extended_acl() {
+        // A config with no ACL in a directory whose inheritable ACE, added
+        // after the config was written, grants everyone read.
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "manta.toml", "[input]\n");
+        if !chmod_acl(dir.path(), "everyone allow read,file_inherit") {
+            eprintln!("skipped: {} has no extended ACLs", dir.path().display());
+            return;
+        }
+        assert!(extended_acl(&p).is_empty());
+        save_freq_correction_ppm(&p, -1.42, None).unwrap();
+        assert_eq!(
+            extended_acl(&p),
+            Vec::<String>::new(),
+            "the saved config took the directory's inheritable ACE"
+        );
+
+        // A config with its own ACL keeps it.
+        let dir = tempfile::tempdir().unwrap();
+        let q = write(dir.path(), "manta.toml", "[input]\n");
+        assert!(chmod_acl(&q, "user:nobody allow read"));
+        let acl = extended_acl(&q);
+        assert_eq!(acl.len(), 1, "{acl:?}");
+        save_freq_correction_ppm(&q, -1.42, None).unwrap();
+        assert_eq!(extended_acl(&q), acl, "the saved config lost its ACL");
     }
 
     /// Whether `path`'s DACL is protected from inheritance, after making it
@@ -699,7 +854,7 @@ mod tests {
         let p = write(dir.path(), "manta.toml", "[input]\n");
         dacl_protected(&p, true);
         assert!(dacl_protected(&p, false));
-        save_freq_correction_ppm(&p, -1.42).unwrap();
+        save_freq_correction_ppm(&p, -1.42, None).unwrap();
         assert!(
             dacl_protected(&p, false),
             "the saved config took the directory's inherited ACL"
@@ -707,7 +862,7 @@ mod tests {
         // An inheriting DACL stays inheriting.
         let q = write(dir.path(), "other.toml", "[input]\n");
         assert!(!dacl_protected(&q, false));
-        save_freq_correction_ppm(&q, -1.42).unwrap();
+        save_freq_correction_ppm(&q, -1.42, None).unwrap();
         assert!(!dacl_protected(&q, false));
     }
 }

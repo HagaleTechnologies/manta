@@ -336,12 +336,22 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
         reference_hz: args.reference_hz,
         live: !matches!(resolved.spec, LiveSourceSpec::File { .. }),
     };
+    // The config's text as it is before measuring. The file's own value
+    // comes from it, and the save refuses a file that no longer holds it:
+    // a config rewritten or retargeted during the measurement may describe
+    // another receiver.
+    let config_text = match config_path.as_deref() {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("reading config file {}", path.display()))?,
+        ),
+        None => None,
+    };
     let replaced_by = match (resolved.replaced_file_source, config_path.as_deref()) {
         (Some(flag), _) => Some(flag),
         (None, Some(path)) => {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("reading config file {}", path.display()))?;
-            env_replaced_file_source(&loaded.env_vars, &text)
+            let text = config_text.as_deref().unwrap_or_default();
+            env_replaced_file_source(&loaded.env_vars, text)
                 .with_context(|| format!("parsing config file {}", path.display()))?
         }
         (None, None) => None,
@@ -386,11 +396,8 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
 
     // The file's own value, read from its text: the loaded config already
     // carries the environment overlay.
-    let file_value = match config_path.as_deref() {
-        Some(path) => {
-            let text = std::fs::read_to_string(path)?;
-            config_edit::set_freq_correction_ppm(&text, 0.0)?.1
-        }
+    let file_value = match config_text.as_deref() {
+        Some(text) => config_edit::set_freq_correction_ppm(text, 0.0)?.1,
         None => None,
     };
     let origin = configured_origin(&resolved, &loaded, config_path.as_deref(), file_value);
@@ -434,9 +441,13 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
         );
         let run_hint = format!("pass --freq-correction-ppm {value:?} to manta run");
         let outcome = match (decision, config_path.as_deref()) {
-            (SaveDecision::Save, Some(path)) => {
-                Some(save(path, value, &mut written, &mut save_error))
-            }
+            (SaveDecision::Save, Some(path)) => Some(save(
+                path,
+                value,
+                config_text.as_deref(),
+                &mut written,
+                &mut save_error,
+            )),
             (SaveDecision::Ask, Some(path)) => {
                 let prompt = format!(
                     "Save freq_correction_ppm = {value:?} to [input] in {}?",
@@ -447,7 +458,13 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
                     &mut std::io::stdin().lock(),
                     &prompt,
                 ) {
-                    Some(save(path, value, &mut written, &mut save_error))
+                    Some(save(
+                        path,
+                        value,
+                        config_text.as_deref(),
+                        &mut written,
+                        &mut save_error,
+                    ))
                 } else {
                     Some("not saved: answered no".to_string())
                 }
@@ -497,10 +514,11 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
 fn save(
     path: &Path,
     value: f64,
+    read_before: Option<&str>,
     written: &mut bool,
     save_error: &mut Option<anyhow::Error>,
 ) -> String {
-    match config_edit::save_freq_correction_ppm(path, value) {
+    match config_edit::save_freq_correction_ppm(path, value, read_before) {
         Ok(previous) => {
             *written = true;
             format!(
