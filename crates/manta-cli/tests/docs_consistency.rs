@@ -1307,6 +1307,54 @@ fn man90_runbook_checks_the_restarted_connection() {
     }
 }
 
+/// MAN-90: after its restart Aggregator may reach RBN at a different address,
+/// a second endpoint or over UDP. A `host <address from step 1>` capture
+/// filter drops all of that, yet the file settles C1 and C2. The operator
+/// steps must capture without that filter, list Aggregator's addresses again
+/// after the restart, and send only those addresses' packets. The developer
+/// steps must use every listed address. Checks text, not Wireshark behaviour.
+#[test]
+fn man90_runbook_keeps_every_endpoint_aggregator_uses() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let operator = squash_whitespace(section(&runbook, "Operator steps"));
+    for stale in ["host <address from step 1>", "capture filter `"] {
+        assert!(
+            !operator.contains(stale),
+            "Operator steps still set a capture filter (`{stale}`)"
+        );
+    }
+    for needle in [
+        "no capture filter",
+        "after the restart",
+        "Export Specified Packets",
+    ] {
+        assert!(
+            operator.contains(needle),
+            "Operator steps never say `{needle}`"
+        );
+    }
+    let steps = squash_whitespace(section(&runbook, "Developer steps"));
+    assert!(
+        steps.contains("every address the operator noted"),
+        "Developer steps never use every address the operator noted"
+    );
+}
+
+/// MAN-90: C3, C4 and C7 compare exact bytes. tshark's `ascii` follow mode
+/// turns non-printable bytes into dots, so the developer steps must also write
+/// a `raw` (hex) transcript of each TCP stream and UDP flow.
+#[test]
+fn man90_runbook_writes_exact_byte_transcripts() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let steps = section(&runbook, "Developer steps");
+    for needle in ["-z follow,tcp,raw,$N", "-z follow,udp,raw,$N"] {
+        assert!(
+            steps.contains(needle),
+            "Developer steps never run `{needle}`"
+        );
+    }
+}
+
 /// MAN-90: README calls the uplink experimental everywhere it offers it, and
 /// "Run it as a node" names the Aggregator route before the uplink block.
 #[test]
