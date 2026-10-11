@@ -317,7 +317,7 @@ fn run_refuses_the_unedited_example_before_the_dial_frequency_check() {
     let o = manta_in(dir.path(), &["run", "--config", "manta.toml"]);
     let err = assert_station_refused(&o, "run");
     // The complete output contract, with no MANTA_* override applied.
-    assert_eq!(err, format!("Error: manta.toml: {STATION_REFUSAL}\n"));
+    assert_eq!(err, format!("error: manta.toml: {STATION_REFUSAL}\n"));
     assert!(!err.contains(DIAL_REQUIRED), "{err}");
 }
 
@@ -338,7 +338,7 @@ fn listen_alias_refuses_the_unedited_example() {
     // `listen` first warns that it is deprecated; the refusal ends stderr.
     assert_eq!(
         err.lines().last(),
-        Some(format!("Error: manta.toml: {STATION_REFUSAL}").as_str()),
+        Some(format!("error: manta.toml: {STATION_REFUSAL}").as_str()),
         "{err}"
     );
 }
@@ -534,7 +534,7 @@ mod startup {
         let banner = child.banner();
         for needle in [
             "station=W3XYZ",
-            "dial_freq_hz=14060000",
+            "dial_frequency=14060.0 kHz",
             "telnet=127.0.0.1:",
             "json=127.0.0.1:",
             "metrics=127.0.0.1:",

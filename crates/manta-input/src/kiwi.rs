@@ -207,10 +207,15 @@ fn run_with_overall_timeout<T: Send + 'static>(
     });
     match rx.recv_timeout(OVERALL_CONNECT_TIMEOUT) {
         Ok(outcome) => outcome.with_context(|| format!("TCP connect to {host}:{port}")),
-        Err(_) => Err(anyhow!(
-            "TCP connect to {host}:{port} timed out (DNS resolution or connect exceeded {OVERALL_CONNECT_TIMEOUT:?})"
-        )),
+        Err(_) => Err(connect_timeout(host, port)),
     }
+}
+
+fn connect_timeout(host: &str, port: u16) -> anyhow::Error {
+    anyhow!(
+        "TCP connect to {host}:{port} timed out (DNS resolution or connect exceeded {}s)",
+        OVERALL_CONNECT_TIMEOUT.as_secs_f64()
+    )
 }
 
 /// TCP read timeout: bounds how long a single `socket.read()` call blocks,
@@ -695,6 +700,18 @@ impl IqSource for KiwiIqSource {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn connect_timeout_text_uses_seconds() {
+        assert_eq!(
+            connect_timeout("localhost", 8073).to_string(),
+            format!(
+                "TCP connect to localhost:8073 timed out (DNS resolution or connect exceeded {}s)",
+                OVERALL_CONNECT_TIMEOUT.as_secs_f64()
+            )
+        );
+    }
+
     use super::*;
 
     #[test]
