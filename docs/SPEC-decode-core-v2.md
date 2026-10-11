@@ -149,6 +149,12 @@ plan's Global Constraints) — wiring this term is therefore part of MAN-168's
 scope, not yet done. The stage-2 gate's oracle/RBN numbers and VR5
 (co-channel) were measured with this term OFF.
 
+**Update (2026-10-11, MAN-149):** the term is now live. Since MAN-168/MAN-194,
+`manta-engine`'s `TrackManager` (`track.rs`, `compute_spectral_ref_power`)
+feeds `FloorBank::spectral_reference_db` to every track under `edge-legacy`
+and `hsmm`; `legacy` and `oracle` still pass `spectral_ref_power: None`. The
+note above stands as the record of what the stage-2 numbers measured.
+
 ### 2.4 Calibration test
 
 On a noise-only channelizer output (testkit AWGN, no signal), the mean

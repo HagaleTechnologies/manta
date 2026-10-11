@@ -207,7 +207,8 @@ station_callsign = "N0CALL"
 # --engine overrides this.
 #engine = "legacy"
 
-# Keying and character decoding:
+# Keying and character decoding, legacy and edge-legacy engines
+# (hyst_frac, tau_lo_ms and tau_hi_bounds_ms: legacy only):
 #timing_sigma = 0.25                 # timing tolerance when matching dots and dashes
 #beam_width = 4                      # character guesses kept at each step
 #debounce_ms = 12.0                  # shortest key-down or key-up accepted, ms
@@ -216,7 +217,8 @@ station_callsign = "N0CALL"
 #tau_hi_bounds_ms = [100.0, 400.0]   # signal-level tracking time constant, [low, high] ms
 #flush_gap_dits = 7.0                # silence, in dot lengths, that ends a word
 
-# Evidence and noise front end, edge-legacy and hsmm only:
+# Evidence and noise front end, edge-legacy and hsmm engines
+# (sigma_u, llr_clip and fallback_hops change hsmm only):
 #sigma_u = 0.3                       # keying-edge timing spread
 #llr_clip = 10.0                     # cap on per-sample mark/space evidence
 #hold_dits = 4.0                     # mark-level hold window, dot lengths
@@ -225,7 +227,9 @@ station_callsign = "N0CALL"
 #noise_min_bias_db = 2.16            # noise-floor minimum correction, dB
 #spectral_min_bias_db = 1.5          # neighbouring-channel noise correction, dB
 #spectral_beta = 0.5                 # weight of the neighbouring-channel noise estimate
-#refine_bw_hz = 0.0                  # reserved, no effect yet; 0 = off
+
+# Any engine:
+#refine_bw_hz = 0.0                  # narrowband refiner bandwidth before decoding, Hz; 0 = off
 
 # hsmm only:
 #dur_sigma = 0.22                    # element-length tolerance

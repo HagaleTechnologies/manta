@@ -1122,6 +1122,11 @@ constants: listener ports and the per-listener connection/rate quotas
 (MAN-57/MAN-61) are documented on `manta_server::config::ServerConfig`'s
 own fields, with the exposure policy in ARCHITECTURE §7.
 
+`docs/CONFIG.md` is the operator's per-key reference: every key of every
+table, `[[rbn_uplink]]` included, with its default and which commands and
+engines it affects. This section stays normative for the decode-core
+defaults.
+
 ## 10. Deviations from ARCHITECTURE.md
 
 1. **Kaiser prototype is new code, not reused** (§1.2): `coppa-dsp::filter`

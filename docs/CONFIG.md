@@ -1,0 +1,241 @@
+# manta configuration reference
+
+One TOML file configures `manta run`, `soak` and `doctor`. `manta config init`
+writes a scaffold that lists every key, commented out at its default, and
+`manta config check --config FILE` validates a file without opening a receiver
+or binding a port. [`manta.example.toml`](../manta.example.toml) is that
+scaffold with `[server]` and `station_callsign` already uncommented, ready to
+copy to `manta.toml`. The design is recorded in
+[DECISIONS/2026-10-06-man261-config-surface.md](DECISIONS/2026-10-06-man261-config-surface.md).
+
+This page gives each key's default, which commands act on it, and the flag that
+overrides it. For what a decode-core key means, follow the link in its Notes
+cell to [SPEC §9](SPEC-decode-core.md#9-configuration-keys) or
+[SPEC-v2 §7](SPEC-decode-core-v2.md#7-configuration-keys-v1-9-additive); this
+page does not repeat them.
+
+## Precedence
+
+A value comes from the first of these that sets it:
+
+1. a command-line flag;
+2. a `MANTA_<TABLE>_<KEY>` environment variable, such as
+   `MANTA_INPUT_FREQ_HZ` for `input.freq_hz`;
+3. the config file;
+4. the built-in default.
+
+`--config FILE` names the file. Without it, `run`, `soak`, `doctor`, `check`,
+`status` and `config check` read the path from `MANTA_CONFIG`. The same six
+commands apply the `MANTA_*` variables. `decode`, `oracle` and
+`bench sensitivity` read only the file `--config` names and never the
+environment, so their output does not depend on it. `[[rbn_uplink]]` cannot be
+set from the environment. An unknown table, key or `MANTA_*` variable is an
+error that names it. [SPEC §9](SPEC-decode-core.md#9-configuration-keys) gives
+the full rules, including how variable values are typed and how relative paths
+resolve.
+
+## Which commands read which tables
+
+Every command that takes `--config` validates the whole file. Only the tables
+listed here change what the command does.
+
+| Command | Tables it applies | Environment |
+|---|---|---|
+| `run` (alias `listen`) | all six | yes |
+| `soak`, `doctor` | `[input]` `[spot]` `[detector]` `[decode]`; `[server]` is ignored with a note | yes |
+| `config check` | all six, resolved exactly as `run` resolves them | yes |
+| `check` | `[input]`: the source, `capture_rate_hz` and `center_freq_hz` | yes |
+| `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes |
+| `decode` | `[decode]` `[detector]` `[spot]` and `input.freq_correction_ppm` | no |
+| `oracle` | `[decode]` | no |
+| `bench sensitivity` | `[decode]` `[detector]` | no |
+
+`run` starts the telnet, JSON and metrics servers, and any uplink, only when
+the file has a `[server]` table.
+
+## Checking a file
+
+```console
+$ manta config init --out manta.toml
+$ manta config check --config manta.toml
+manta.toml: valid (from --config)
+environment: none
+server: none (manta run starts no servers)
+rbn_uplink: none
+input: type=unset (the default sound card, unless a command-line flag picks the source)
+spot: allowlist=none blocklist_path=none notch_path=none cty_path=bundled scp_path=bundled
+detector: defaults
+decode: engine=legacy (other keys default)
+```
+
+`config check` runs `run`'s config stage, `MANTA_*` variables included, and
+prints one line per table on stdout: the keys the file or environment set, plus
+the values that matter for that table. Notes go to stderr, for example a
+warning that the built-in `cty.dat` is more than 180 days old. It exits 0 when
+the file is valid and 1, naming the key and the problem, when it is not. It
+also rejects an uncommented `<...>` placeholder, the example callsign `N0CALL`
+and two servers on one port. Without `--config` or `MANTA_CONFIG` it checks
+`manta.toml` in the current directory, which `run` never reads on its own.
+`manta config init --out -` prints the scaffold instead of writing it, and
+`init` will not replace an existing file without `--force`. See
+[DECISIONS/2026-10-07-man76-config-check-init.md](DECISIONS/2026-10-07-man76-config-check-init.md).
+
+**Reloading without a restart.** On Unix, `SIGHUP` to a `run` daemon (a config
+with a `[server]` table) re-reads the file and applies `[spot]` `allowlist`,
+`blocklist_path` and `notch_path`, and each `[[rbn_uplink]]` block's `dry_run`.
+Every other key, `cty_path` and `scp_path` included, needs a restart; a reload
+logs the changed keys it did not apply. A file that fails the checks above is
+logged and ignored. See
+[DECISIONS/2026-10-10-man78-live-reload.md](DECISIONS/2026-10-10-man78-live-reload.md).
+
+## Columns
+
+- **Default** is the built-in value. A key with no default reads
+  `none; example ...`, with the scaffold's example value, followed by what
+  leaving it unset means.
+- **Wired** says when the key changes behaviour. `live` means every command
+  that applies the table (see the matrix above) acts on it.
+  `live: <condition>` means only under that condition. `; reloads on SIGHUP`
+  marks the keys a reload applies.
+- **Notes** gives units, range and the flag that overrides the key, if any.
+
+## [server]
+
+The telnet, JSON and metrics servers. Only `run` reads this table, and it
+needs `station_callsign`.
+
+| Key | Default | Wired | Notes |
+|---|---|---|---|
+| `station_callsign` | none; example `"N0CALL"`; required whenever `[server]` is present | live: `run` with `[server]` | Sent as the spotter of every spot. `run` and `config check` reject `N0CALL`; the accepted forms are in [SPEC §9](SPEC-decode-core.md#9-configuration-keys). |
+| `operator_name` | none; example `"Art"`; unset leaves it out of the greeting | live: `run` with `[server]` | Your name in the telnet greeting that clients and RBN's Aggregator read. Free text, no control characters. |
+| `operator_qth` | none; example `"Richmond Hill, ON"`; unset leaves it out of the greeting | live: `run` with `[server]` | Your location in the telnet greeting. Free text, no control characters. |
+| `operator_grid` | none; example `"FN03GW"`; unset leaves it out of the greeting | live: `run` with `[server]` | Maidenhead locator for the greeting, 4 or 6 characters. |
+| `bind_addr` | `"0.0.0.0"` | live: `run` with `[server]` | Address the telnet and JSON servers listen on; it does not move the metrics listener. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
+| `metrics_bind_addr` | `"127.0.0.1"` | live: `run` with `[server]`, and `status` | Address of `/metrics` and `/healthz`, which have no password. See [DECISIONS/2026-10-08-man132-metrics-loopback-bind.md](DECISIONS/2026-10-08-man132-metrics-loopback-bind.md). |
+| `telnet_port` | `7300` | live: `run` with `[server]` | DX-cluster telnet port. |
+| `json_port` | `7301` | live: `run` with `[server]` | JSON Lines and WebSocket spot stream; both share this port. |
+| `metrics_port` | `7302` | live: `run` with `[server]`, and `status` | Prometheus metrics port; `manta status` dials it when given `--config`. |
+| `line_format` | `"rbn"` | live: `run` with `[server]` | Telnet spot-line layout, `"rbn"` or `"skimmer"`. The uplink always sends the `"rbn"` layout. |
+| `status_interval_secs` | `60` | live: `run` with `[server]` | Seconds between one-line status reports in the log; `0` turns them off. |
+| `telnet_max_connections_per_ip` | `16` | live: `run` with `[server]` | Open telnet connections per client IP; `0` removes the limit. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
+| `json_max_connections_per_ip` | `16` | live: `run` with `[server]` | Open JSON and WebSocket connections per client IP; `0` removes the limit. |
+| `metrics_max_connections_per_ip` | `8` | live: `run` with `[server]` | Open metrics connections per client IP; `0` removes the limit. |
+| `telnet_max_commands_per_ip` | `30` | live: `run` with `[server]` | Telnet commands per client IP per 10 seconds; `0` removes the limit. |
+| `json_max_pings_per_ip` | `10` | live: `run` with `[server]` | WebSocket pings per client IP per 60 seconds; `0` removes the limit. |
+| `metrics_max_requests_per_ip` | `60` | live: `run` with `[server]` | Metrics connections per client IP per 60 seconds; `0` removes the limit. |
+
+## [[rbn_uplink]]
+
+One block per upstream collector. A block needs a `[server]` table, and the
+environment cannot set these keys.
+
+| Key | Default | Wired | Notes |
+|---|---|---|---|
+| `enabled` | none; example `true`; required in every block | live: `run` with `[server]` | `false` keeps the block but does not connect. |
+| `target_host` | none; example `"<collector-host>"`; required | live: `run` with `[server]` | The collector's host name. `config check` rejects the `<...>` placeholder. |
+| `target_port` | none; example `7000`; required | live: `run` with `[server]` | The collector's port. |
+| `login_callsign` | none; example `"N0CALL"`; unset logs in as `station_callsign` | live: `run` with `[server]` | Callsign sent at login. `run` and `config check` reject `N0CALL`. |
+| `dry_run` | `true` | live: `run` with `[server]`; reloads on SIGHUP | `true` connects and logs in but sends no spots. See [RUNBOOKS/uplink-health.md](RUNBOOKS/uplink-health.md). |
+| `spot_types` | `"cq_beacon"` | live: `run` with `[server]` | `"cq_beacon"` sends CQ and beacon spots only, as RBN requires; `"all"` sends every spot. Telnet and JSON still carry every spot. |
+
+## [input]
+
+The receiver. `decode` never reads the source keys, and a command-line source
+flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`)
+replaces a typed `[input]` whole, its shared keys included.
+
+| Key | Default | Wired | Notes |
+|---|---|---|---|
+| `type` | none; example `"kiwi"`; unset uses the default sound card, or the source the command line names | live: `run`, `soak`, `doctor`, `check` | `"audio"`, `"file"`, `"kiwi"`, `"soapy"` or `"hpsdr"`. Each type accepts only its own keys below. |
+| `device` | none; example `"USB Audio"`; unset uses the system's default input | live: `type = "audio"` | Part of the device's name; `manta devices` lists them. `--device` overrides it. |
+| `path` | none; example `"capture.wav"`; required for `type = "file"` | live: `type = "file"` | WAV recording replayed as if live, relative to the config file's directory. `--source` overrides it. |
+| `iq` | `false` | live: `type = "file"` | `true` for a two-channel IQ recording. `--source-iq` sets it. |
+| `host` | none; example `"<your-receiver-host>"`; required for kiwi and hpsdr | live: `type = "kiwi"` or `"hpsdr"` (hpsdr needs the build feature) | Receiver host name. `--kiwi-host` or `--hpsdr-host` overrides it. |
+| `port` | `8073`; `1024` for hpsdr | live: `type = "kiwi"` or `"hpsdr"` (hpsdr needs the build feature) | Receiver port, 1 to 65535. `--kiwi-port` or `--hpsdr-port` overrides it. |
+| `password` | `""` | live: `type = "kiwi"` | KiwiSDR password; empty for a public receiver. `config check` prints only whether it is set. `--kiwi-password` overrides it. |
+| `driver` | none; example `"driver=rtlsdr"`; required for soapy | live: `type = "soapy"` (needs the build feature) | SoapySDR device arguments. `--soapy-driver` overrides it. |
+| `gain_db` | none; example `30.0`; unset uses the device's automatic gain | live: `type = "soapy"` (needs the build feature) | Receiver gain, dB. `--soapy-gain` overrides it. |
+| `freq_hz` | none; example `7030000.0`; required for kiwi, soapy and hpsdr | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"` | Receiver centre frequency, Hz. `--kiwi-freq-hz`, `--soapy-freq-hz` or `--hpsdr-freq-hz` overrides it. |
+| `rate_hz` | none; example `192000.0`; required for soapy and hpsdr | live: `type = "soapy"` or `"hpsdr"` | Sample rate, Hz. `--soapy-rate-hz` or `--hpsdr-rate-hz` overrides it. |
+| `freq_correction_ppm` | `0.0` | live: `run`, `soak`, `doctor`, `decode`; dropped when a source flag replaces a typed `[input]` | Oscillator correction, ppm, -1000 to 1000. `--freq-correction-ppm` overrides it. |
+| `center_freq_hz` | none; example `14030000.0`; unset leaves frequencies as audio offsets, and `run` with `[server]` refuses a source that carries no frequency of its own | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Your radio's dial frequency, Hz, for a source that carries none. `--dial-freq-hz` overrides it. |
+| `capture_rate_hz` | none; example `48000.0`; unset decodes at the receiver's own rate | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Decimated sample rate, Hz; it must divide the receiver's rate by a power of two. `--capture-rate-hz` overrides it. |
+| `replay_epoch` | none; example `1700000000`; unset uses the file's modification time | live: `run` with `[server]` and a file source; ignored elsewhere | Unix seconds that the recording's first sample stands for. `--replay-epoch` overrides it. |
+
+## [spot]
+
+Which decodes become spots. `allowlist`, `blocklist_path` and `notch_path`
+reload on SIGHUP; `cty_path` and `scp_path` need a restart.
+
+| Key | Default | Wired | Notes |
+|---|---|---|---|
+| `allowlist` | `[]` | live: `run`, `soak`, `doctor`, `decode`; reloads on SIGHUP | Callsigns always spotted, skipping the plausibility checks. A non-empty `--allowlist` replaces the list. |
+| `blocklist_path` | none; example `"bad-calls.txt"`; unset blocks no callsign | live: `run`, `soak`, `doctor`, `decode`; reloads on SIGHUP | File of callsigns never spotted, one per line, relative to the config file. `--blocklist` overrides it. |
+| `notch_path` | none; example `"notches.txt"`; unset notches no frequency | live: `run`, `soak`, `doctor`, `decode`; reloads on SIGHUP | File of `low_hz-high_hz` ranges never spotted, one per line, relative to the config file. `--notch` overrides it. |
+| `cty_path` | none; example `"cty.dat"`; unset uses the built-in `cty.dat` | live: `run`, `soak`, `doctor`, `decode` | AD1C's country-prefix file, relative to the config file. `--cty` overrides it; see [DECISIONS/2026-10-10-man79-operator-cty-scp-override.md](DECISIONS/2026-10-10-man79-operator-cty-scp-override.md). |
+| `scp_path` | none; example `"MASTER.SCP"`; unset uses the built-in `master.scp` | live: `run`, `soak`, `doctor`, `decode` | Known-callsign list that raises confidence, relative to the config file. `--scp` overrides it. |
+
+## [detector]
+
+When a signal becomes a decoded track and when the track ends. Durations are in
+milliseconds, 0 to 3600000.
+
+| Key | Default | Wired | Notes |
+|---|---|---|---|
+| `on_snr_db` | `12.0` | live | SNR, dB, that starts a track; 0 to 100. See [SPEC §9](SPEC-decode-core.md#9-configuration-keys). |
+| `off_snr_db` | `3.0` | live | SNR, dB, below which a track counts as silent; 0 to `on_snr_db`. |
+| `confirm_ms` | `50.0` | live | How long a signal must last before it is decoded; must round to at least one hop. |
+| `hang_ms` | `5000.0` | live | How long a silent track waits before it closes; must round to at least one hop. |
+| `gc_ms` | `30000.0` | live | A track that decodes no character for this long is closed; must round to at least one hop. |
+| `warmup_ms` | `2000.0` | live | Start-up time spent measuring the noise; no track opens before it ends. |
+| `track_cap` | `1200` | live | Most tracks decoded at once; at least 1. |
+| `silent_respawn_cooldown_ms` | `30000.0` | live | Wait before a channel whose track went silent may start another. |
+
+## [decode]
+
+Expert tuning. Which keys take effect depends on the engine. The defaults are
+the measured best values.
+
+| Key | Default | Wired | Notes |
+|---|---|---|---|
+| `engine` | `"legacy"` | live | `"legacy"`, `"edge-legacy"` or `"hsmm"`. `--engine` overrides it on `run`, `decode`, `oracle` and `bench sensitivity`; `hsmm` is experimental, see [DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md](DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md). |
+| `timing_sigma` | `0.25` | live: legacy and edge-legacy | Timing tolerance when matching dots and dashes; at least 0.001. See [SPEC §9](SPEC-decode-core.md#9-configuration-keys). |
+| `beam_width` | `4` | live: legacy and edge-legacy | Character guesses kept at each step; at least 1. |
+| `debounce_ms` | `12.0` | live: legacy and edge-legacy | Shortest key-down or key-up accepted, ms. |
+| `hyst_frac` | `0.15` | live: legacy only | Keying-threshold hysteresis as a fraction of keying depth, above 0 and below 0.5. See [SPEC §9](SPEC-decode-core.md#9-configuration-keys). |
+| `tau_lo_ms` | `500.0` | live: legacy only | Noise-level tracking time constant, ms; above 0. |
+| `tau_hi_bounds_ms` | `[100.0, 400.0]` | live: legacy only | Signal-level tracking time constant, `[low, high]` ms, with 0 < low <= high. |
+| `flush_gap_dits` | `7.0` | live: legacy and edge-legacy | Silence, in dot lengths, that ends a word. |
+| `sigma_u` | `0.3` | live: hsmm only | Keying-edge timing spread; at least 0.001. edge-legacy reads it but uses only the sign of the evidence, which this key cannot change; see [SPEC-v2 §7](SPEC-decode-core-v2.md#7-configuration-keys-v1-9-additive). |
+| `llr_clip` | `10.0` | live: hsmm only | Cap on per-sample mark/space evidence. edge-legacy reads it but uses only the sign of the evidence, which a positive cap cannot change. |
+| `hold_dits` | `4.0` | live: edge-legacy and hsmm | Mark-level hold window, dot lengths; above 0. See [SPEC-v2 §7](SPEC-decode-core-v2.md#7-configuration-keys-v1-9-additive). |
+| `fallback_hops` | `8` | live: hsmm only | Evidence interval when no keying edge is seen; at least 1. edge-legacy computes these anchors but never reads them. |
+| `noise_window_ms` | `1500.0` | live: edge-legacy and hsmm | Noise-floor window, ms. |
+| `noise_min_bias_db` | `2.16` | live: edge-legacy and hsmm | Noise-floor minimum correction, dB. |
+| `spectral_min_bias_db` | `1.5` | live: edge-legacy and hsmm; not `oracle` | Neighbouring-channel noise correction, dB. |
+| `spectral_beta` | `0.5` | live: edge-legacy and hsmm; not `oracle` | Weight of the neighbouring-channel noise estimate; 0 or more. |
+| `refine_bw_hz` | `0.0` | live: every engine; not `oracle` | Narrowband refiner bandwidth before decoding, Hz; `0` turns it off. The track manager applies it, and `oracle` decodes without one. |
+| `dur_sigma` | `0.22` | live: hsmm only | Element-length tolerance; at least 0.001. See [SPEC-v2 §7](SPEC-decode-core-v2.md#7-configuration-keys-v1-9-additive). |
+| `mark_insert_penalty` | `-1.5` | live: hsmm only | Penalty against reading noise as an extra element. |
+| `beam` | `12` | live: hsmm only | Hypotheses kept per step; at least 1. |
+| `lookahead_dits` | `25.0` | live: hsmm only | How far ahead, in dot lengths, the decoder looks before a character is final. |
+| `speed_alpha` | `0.2` | live: hsmm only | How quickly the speed estimate follows the sender; 0 or more. |
+| `seed_units_hops` | `[9.0, 13.0, 18.0, 26.0, 38.0]` | live: hsmm only | Starting dot lengths tried, hops; at least one, each positive. |
+| `conf_kappa` | `6.0` | live: hsmm only | Confidence scale; above 0. |
+
+## Not settable (compile-time constants)
+
+[SPEC §9](SPEC-decode-core.md#9-configuration-keys) lists these keys with their
+values, commented out. They are still constants in the code: the loader rejects
+each one with "not configurable yet" rather than ignoring it.
+
+| Key | Table | Fixed in |
+|---|---|---|
+| `floor_quantile` | `[detector]` | `manta-dsp::floor` |
+| `floor_window_ms` | `[detector]` | `manta-dsp::floor` |
+| `block_channels` | `[detector]` | `manta-dsp::floor` |
+| `block_allowance_db` | `[detector]` | `manta-dsp::floor` |
+| `mu_ratio_bounds` | `[decode]` | `manta-decode::timing` |
+| `char_gap_dits` | `[decode]` | `manta-decode::timing` |
+| `word_gap_dits` | `[decode]` | `manta-decode::timing` |
+| `cluster_alpha` | `[decode]` | `manta-decode::timing` |
