@@ -14,8 +14,8 @@ SoapySDR input; KiwiSDR input) — see docs/DECISIONS/2026-07-1[7-9]*.md and
 2026-07-2[4-5]*.md. V1/V3/V4/V7/V8/V9/V10 green; V2's WPM gate is green too
 (MAN-7/103's near-channel-edge WPM bug is fixed — keying-threshold placement
 and a symmetric mark/gap dit-period estimate, see
-docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md) — V2's separate
-CER gate stays open (SPEC §2.1 warmup-floor dilution, unrelated to WPM).
+docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md) — and V2's
+separate CER gate is green since MAN-115 removed its warmup-floor dilution.
 V6 now passes and V8w meets its 0-bogus criterion with a >= 20/50
 validated floor (MAN-213's fade-tracking keying rails, measured 28/50 — see
 docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md). **V5's
@@ -92,6 +92,13 @@ centroid; an inconsistent location fails config loading before I/O. See
 MAN-172: high-SNR track churn fixed in `TrackManager` (local-peak spawn
 rule, incumbent-wins merge ties); VR3/VR4 pass, VR1/VR2 pass CER but not
 WPM. See docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md.
+
+MAN-115: `TrackManager` skips the channelizer's zero pre-roll, `FloorBank`
+seeds a young channel's effective floor from its block median for 1 s, and
+`[detector].warmup_ms` defaults to 25 (was 2000). V1 promotes at 0.07 s
+(was 2.06 s) and decodes its first character at 0.62 s (was 2.66 s).
+`TrackMeta` is still not emitted at promotion. See
+docs/DECISIONS/2026-10-11-man115-startup-latency.md.
 
 ## Documents (read in this order)
 

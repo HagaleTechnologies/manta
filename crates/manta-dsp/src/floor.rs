@@ -16,6 +16,18 @@ const FLOOR_QUANTILE: f64 = 0.25;
 /// SPEC §2.2.
 const BLOCK_CHANNELS: usize = 32;
 const BLOCK_ALLOWANCE_DB: f64 = 3.0;
+/// SPEC §2.2 "Startup", MAN-115: for a channel's first 25 ring pushes (1 s
+/// at 25 Hz decimation) its effective floor is never below its block's
+/// seed. A 1-4 entry ring's lower quartile is just its minimum, which sits
+/// far below the true floor on chi-squared noise and would let noise pass
+/// `rise` almost everywhere; the seed is what makes a sub-second warm-up
+/// safe (docs/DECISIONS/2026-10-11-man115-startup-latency.md).
+const SEED_PUSHES: usize = 25;
+/// SPEC §2.2 "Startup", MAN-115: the seed is the running mean of the
+/// block median of raw power minus 10*log10(ln 2 / ln(4/3)) ~ 3.8 dB, the
+/// median-to-lower-quartile gap of a chi-squared 2-DOF power, so it
+/// estimates the same quantity the ring converges to.
+const SEED_OFFSET_DB: f64 = 3.8;
 
 /// SPEC §2.3: tau=40ms at the channelizer's fixed 375 Hz hop rate ->
 /// alpha = 1 - e^(-2.667/40).
@@ -120,6 +132,10 @@ pub struct FloorBank {
     /// selected minimum back to dB when read.
     smoothed_lin: Vec<f64>,
     smoothed_init: bool,
+    /// MAN-115: per-block sum of the block median of raw power over the
+    /// first `SEED_PUSHES` decimated hops, and how many were summed.
+    seed_sum_db: Vec<f64>,
+    seed_pushes: Vec<u32>,
 }
 
 /// `10^(db/10)`, the inverse of `manta_dsp::channelizer::power_db`'s
@@ -130,7 +146,10 @@ fn db_to_linear(db: f64) -> f64 {
 }
 
 impl FloorBank {
-    /// A fresh floor bank for `n_channels` channels, all floors starting at the histogram's minimum (-140 dBFS) until the ring warms up. SPEC §2.1.
+    /// A fresh floor bank for `n_channels` channels, all floors starting at
+    /// the histogram's minimum (-140 dBFS) until the first `update`. For
+    /// the first second after that, `effective_floor_db` is held at or
+    /// above the block-median seed while each ring fills. SPEC §2.1-2.2.
     pub fn new(n_channels: usize) -> Self {
         let n_blocks = n_channels.div_ceil(BLOCK_CHANNELS);
         FloorBank {
@@ -140,6 +159,8 @@ impl FloorBank {
             hop_counter: 0,
             smoothed_lin: vec![db_to_linear(HIST_MIN_DB); n_channels],
             smoothed_init: false,
+            seed_sum_db: vec![0.0; n_blocks],
+            seed_pushes: vec![0; n_blocks],
         }
     }
 
@@ -180,6 +201,10 @@ impl FloorBank {
                 let start = b * BLOCK_CHANNELS;
                 let end = (start + BLOCK_CHANNELS).min(self.channels.len());
                 *block_floor = median(&self.floor_db[start..end]);
+                if (self.seed_pushes[b] as usize) < SEED_PUSHES {
+                    self.seed_sum_db[b] += median(&power_db[start..end]);
+                    self.seed_pushes[b] += 1;
+                }
             }
         }
         self.hop_counter += 1;
@@ -192,9 +217,20 @@ impl FloorBank {
     }
 
     /// Effective floor `F[k] = min(F_ch[k], F_blk[k/32] + 3dB)`. SPEC §2.2.
+    /// MAN-115: while channel `k`'s ring holds fewer than `SEED_PUSHES`
+    /// entries, raised to at least its block's seed (the mean block median
+    /// of raw power so far, minus `SEED_OFFSET_DB`). The seed only ever
+    /// raises the floor, so a wrong seed costs sensitivity for at most 1 s
+    /// and never adds tracks. `channel_floor_db` stays raw.
     pub fn effective_floor_db(&self, k: usize) -> f64 {
         let block = k / BLOCK_CHANNELS;
-        self.floor_db[k].min(self.block_floor_db[block] + BLOCK_ALLOWANCE_DB)
+        let f = self.floor_db[k].min(self.block_floor_db[block] + BLOCK_ALLOWANCE_DB);
+        let pushes = self.seed_pushes[block];
+        if self.channels[k].filled < SEED_PUSHES && pushes > 0 {
+            f.max(self.seed_sum_db[block] / pushes as f64 - SEED_OFFSET_DB)
+        } else {
+            f
+        }
     }
 
     /// SPEC v2 §2.2: minimum of the 40 ms-smoothed power over the six
@@ -374,6 +410,65 @@ mod tests {
             (f - (-90.0)).abs() < 1.0,
             "uniform-noise floor should read near -90 dB, got {f}"
         );
+    }
+
+    /// MAN-115: one decimated push of a block where every channel but one
+    /// sits at -90 dB and channel 3 reads a chi-squared-style low draw at
+    /// -110 dB. A 1-entry ring's lower quartile is that draw itself, so
+    /// without the seed channel 3's effective floor would be -110 dB.
+    fn young_bank() -> FloorBank {
+        let mut bank = FloorBank::new(64);
+        let mut p = vec![-90.0; 64];
+        p[3] = -110.0;
+        bank.update(&p);
+        bank
+    }
+
+    #[test]
+    fn young_ring_effective_floor_is_at_least_the_block_seed() {
+        let bank = young_bank();
+        let seed = -90.0 - SEED_OFFSET_DB;
+        let f = bank.effective_floor_db(3);
+        assert!(
+            f >= seed - 1e-9,
+            "young-ring effective floor {f} must not sit below the block seed {seed}"
+        );
+        assert!(
+            (f - seed).abs() < 1e-9,
+            "the seed should be the binding term here, got {f} vs seed {seed}"
+        );
+    }
+
+    #[test]
+    fn seed_does_not_change_the_raw_channel_floor() {
+        let bank = young_bank();
+        // -110.0 falls in the [-110.0, -109.5) bin; its centre is -109.75.
+        assert_eq!(bank.channel_floor_db(3), -109.75);
+    }
+
+    #[test]
+    fn seed_stops_applying_after_seed_pushes() {
+        // The block median of raw power is -90 dB on every push, so the
+        // seed is -93.8 dB; channel 3 always reads -110 dB, so once the
+        // seed lapses its effective floor is its own -109.75 dB quartile.
+        let mut bank = FloorBank::new(64);
+        let mut p = vec![-90.0; 64];
+        p[3] = -110.0;
+        let seed = -90.0 - SEED_OFFSET_DB;
+        for push in 1..=SEED_PUSHES + 1 {
+            for _ in 0..DECIMATION_HOPS {
+                bank.update(&p);
+            }
+            let f = bank.effective_floor_db(3);
+            if push < SEED_PUSHES {
+                assert!(
+                    (f - seed).abs() < 1e-9,
+                    "push {push}: expected the seed {seed}, got {f}"
+                );
+            } else {
+                assert_eq!(f, -109.75, "push {push}: the seed must have lapsed");
+            }
+        }
     }
 
     fn warmed_up_bank(n: usize, floor_db: f64) -> FloorBank {
