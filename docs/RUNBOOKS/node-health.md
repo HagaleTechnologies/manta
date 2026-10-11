@@ -10,6 +10,9 @@ MAN-132) — see `docs/RUNBOOKS/network-exposure.md` for exposure posture;
 `/healthz` carries exactly the same posture as `/metrics`, since it's the
 same listener.
 
+[`docs/METRICS.md`](../METRICS.md) lists every family the endpoint renders,
+with its type, labels and when it has samples.
+
 ## `/healthz` as a liveness probe
 
 `GET /healthz` returns:

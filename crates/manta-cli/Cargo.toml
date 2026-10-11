@@ -22,6 +22,8 @@ hpsdr = ["manta-input/hpsdr"]
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+# MAN-126: `manta doctor`'s audio check lists sound-card inputs.
+coppa-audio = { workspace = true }
 ctrlc = { workspace = true }
 hound = { workspace = true }
 serde_json = { workspace = true }
@@ -57,6 +59,8 @@ windows-sys = { version = "0.61", features = [
 [target.'cfg(unix)'.dependencies]
 signal-hook = { workspace = true }
 # MAN-78: `pthread_sigmask`, to keep a daemon's SIGHUP off the decode thread.
+# MAN-126: `manta doctor`'s clock check reads the kernel's NTP-sync state
+# with `adjtimex` (Linux only; gated by cfg in clock_check.rs).
 libc = { workspace = true }
 
 [dev-dependencies]
