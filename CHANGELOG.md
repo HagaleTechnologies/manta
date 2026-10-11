@@ -23,6 +23,10 @@ git history and `docs/DECISIONS/`.
 
 ### Added
 
+- Operator guides for [running an RBN node](docs/GUIDES/rbn-node.md),
+  [KiwiSDR etiquette](docs/GUIDES/kiwisdr.md), and
+  [Raspberry Pi installation and service setup](docs/GUIDES/raspberry-pi.md) (MAN-148).
+
 - `manta run` takes `-v`/`-vv` and `-q`/`-qq`/`-qqq` and
   `--log-level <LEVEL>`, each shorthand for `RUST_LOG=<level>` that
   overrides it, and `--log-format json`, which writes every stderr log line
