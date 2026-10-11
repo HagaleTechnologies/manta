@@ -512,7 +512,9 @@ validation (MAN-28). Dedupe (step 5) still applies.
   Precedence is flag, then `MANTA_<TABLE>_<KEY>` environment variable, then
   file, then default; `decode` and `oracle` never read the environment.
   Unknown tables, keys and `MANTA_*` variables
-  are errors. `docs/SPEC-decode-core.md` §9 is the key table. Not yet
+  are errors. `docs/CONFIG.md` is the per-key reference (default, and
+  which commands and engines each key affects); `docs/SPEC-decode-core.md`
+  §9 stays normative for the decode-core defaults. Not yet
   configurable: a band plan (CW segment limits) and the
   compile-time constants SPEC §9 marks `not configurable yet`.
   `manta config check` runs `run`'s config pipeline up to its first source
@@ -587,7 +589,8 @@ validation (MAN-28). Dedupe (step 5) still applies.
   Unlike `/healthz`, which deliberately ignores the uplink (MAN-128 D10),
   `/status` is about the uplink. Inherits `/metrics`'s unauthenticated,
   `0.0.0.0`-by-default exposure posture
-  (`docs/RUNBOOKS/network-exposure.md`). Prometheus text
+  (`docs/RUNBOOKS/network-exposure.md`). `docs/METRICS.md` lists every
+  rendered family with its type, labels and when it has samples. Prometheus text
   endpoint (compiled in unconditionally, no feature flag — the "(feature
   `metrics`)" phrasing in older revisions of this doc was stale, no Cargo
   `metrics` feature has ever existed; the endpoint is served whenever

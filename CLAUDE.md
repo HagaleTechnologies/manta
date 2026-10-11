@@ -96,12 +96,21 @@ MAN-138: JSON spots' `deGrid`/`deLat`/`deLon` are the operator's
 centroid; an inconsistent location fails config loading before I/O. See
 `docs/DECISIONS/2026-10-11-man138-station-location.md`.
 
+MAN-149: `docs/CONFIG.md` (every key's default and what reads it),
+`docs/METRICS.md`, `docs/SPOT-SCHEMA.md`, `docs/README.md` (start here, by
+audience) and `docs/DECISIONS/README.md`. A new config key, metric family,
+wire field, runbook or decision record needs a row in its document; tests
+in `docs_consistency.rs` and `spot_message.rs` enforce it — see
+docs/DECISIONS/2026-10-11-man149-docs-reference-and-index.md.
+
 MAN-172: high-SNR track churn fixed in `TrackManager` (local-peak spawn
 rule, incumbent-wins merge ties); VR3/VR4 pass, VR1/VR2 pass CER but not
 WPM. See docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md.
 
 ## Documents (read in this order)
 
+- `docs/README.md` — where operators, contributors and researchers each
+  start; every runbook and reference doc
 - `README.md` — goals and non-goals
 - `ARCHITECTURE.md` — 9-crate workspace, data flow, channelizer/decoder/
   validation/output design
@@ -155,7 +164,8 @@ descriptive and always loses conflicts with code and docs/.
 - CPU budget: full 192 kS/s passband within one Raspberry Pi 4 core, enforced
   by criterion benches.
 - JSON spot schema is an ecosystem contract — belongs in the `dispensa` repo
-  (ADR pending), not solely here.
+  (ADR-0011 `spots.v1`), not solely here. dispensa is private, so
+  `docs/SPOT-SCHEMA.md` is the in-repo field reference.
 - No GUI: daemon + CLI. Outputs: RBN-format cluster telnet (:7300) and JSON
   Lines/WebSocket (:7301) for cqdx ingest.
 - M0 testkit generates its own ref-bandwidth AWGN (see
