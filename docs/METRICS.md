@@ -95,7 +95,7 @@ missing series as "no loss" or "no traffic".
 | `manta_uplink_dropped_lagged_total` | counter | — | Spots the uplink fell behind on and lost before its next reconnect; the sum over every configured target. | Always, one series. Stays 0 with no `[[rbn_uplink]]` configured. |
 | `manta_uplink_dropped_write_failed_total` | counter | — | Spots dropped because a write to an RBN uplink target's socket timed out or failed; the sum over every configured target. | Always, one series. Stays 0 with no `[[rbn_uplink]]` configured. |
 | `manta_uplink_dropped_disconnected_total` | counter | — | Spots dropped when an RBN uplink connection was torn down for a reason other than a failed write (rate limit, protocol violation, stalled login, shutdown); the sum over every configured target. | Always, one series. Stays 0 with no `[[rbn_uplink]]` configured. |
-| `manta_uplink_reconnects_total` | counter | — | Times an RBN uplink connection was re-established after dropping; the sum over every configured target. | Always, one series. Stays 0 with no `[[rbn_uplink]]` configured. |
+| `manta_uplink_reconnects_total` | counter | — | Reconnect attempts by the RBN uplink: one per failed or dropped connection, including attempts that never connected (an unreachable target counts on every retry); the sum over every configured target. | Always, one series. Stays 0 with no `[[rbn_uplink]]` configured. |
 | `manta_uplink_connected` | gauge | — | Count of configured RBN uplink targets currently connected. A raw instantaneous count: a flapping target can read as connected here. | Always, one series. 0 with no `[[rbn_uplink]]` configured. |
 | `manta_uplink_target_enabled` | gauge | `target` | Whether this configured RBN uplink target is enabled (1) or configured but disabled (0). | One series per `[[rbn_uplink]]` entry, disabled entries included. `target` is `host:port`; the second and later exact duplicates get `#N` appended. No `[[rbn_uplink]]`: no samples. |
 | `manta_uplink_target_connected` | gauge | `target` | Whether this RBN uplink target is currently connected (1) or not (0). | One series per `[[rbn_uplink]]` entry, as for `manta_uplink_target_enabled`. |
@@ -104,8 +104,8 @@ missing series as "no loss" or "no traffic".
 | `manta_uplink_target_dropped_lagged_total` | counter | `target` | Spots this target fell behind on and lost before its next reconnect. | One series per `[[rbn_uplink]]` entry, starting at 0. |
 | `manta_uplink_target_dropped_write_failed_total` | counter | `target` | Spots dropped because a write to this target's socket timed out or failed. | One series per `[[rbn_uplink]]` entry, starting at 0. |
 | `manta_uplink_target_dropped_disconnected_total` | counter | `target` | Spots dropped when this target's connection was torn down for a reason other than a failed write. | One series per `[[rbn_uplink]]` entry, starting at 0. |
-| `manta_uplink_target_reconnects_total` | counter | `target` | Times this RBN uplink target's connection was re-established after dropping. | One series per `[[rbn_uplink]]` entry, starting at 0. |
-| `manta_uplink_target_recent_reconnects` | gauge | `target` | Reconnects for this RBN uplink target within the last 300 s (the MAN-44 flapping window). 3 or more makes `/status` report the target `flapping`. | One series per `[[rbn_uplink]]` entry, starting at 0. |
+| `manta_uplink_target_reconnects_total` | counter | `target` | Reconnect attempts for this RBN uplink target: one per failed or dropped connection, including attempts that never connected. The `# HELP` text says "reestablished", but a never-reachable target counts on every retry. | One series per `[[rbn_uplink]]` entry, starting at 0. |
+| `manta_uplink_target_recent_reconnects` | gauge | `target` | Reconnect attempts (failed or dropped connections, as counted by `manta_uplink_target_reconnects_total`) for this RBN uplink target within the last 300 s (the MAN-44 flapping window). 3 or more makes `/status` report the target `flapping`, so an unreachable target reads `flapping` rather than `down` once it has retried 3 times. | One series per `[[rbn_uplink]]` entry, starting at 0. |
 | `manta_start_time_seconds` | gauge | — | Unix time at which this daemon's spot server and metrics endpoint started. A change means the daemon restarted. | Always. |
 | `manta_uptime_seconds` | gauge | — | Seconds since this daemon's spot server and metrics endpoint started, from a monotonic clock. | Always. |
 | `manta_build_info` | gauge | `version`, `git_sha`, `features` | Build metadata; the value is always 1. Labels carry the crate version, the git commit (`unknown` for a build without `.git`, such as the Docker image) and the compiled-in optional features (`none` if there are none). | Always in the daemon, one series. |
@@ -210,13 +210,14 @@ document.
 | `uplink.enabled_targets` | Enabled targets. |
 | `uplink.sent_total`, `uplink.suppressed_total`, `uplink.reconnects_total` | Sums over all targets, matching the aggregate uplink counters. |
 | `uplink.reconnect_window_seconds` | The flapping window, 300. |
-| `uplink.flapping_threshold` | Recent reconnects that mark a target flapping, 3. |
+| `uplink.flapping_threshold` | Recent reconnect attempts that mark a target flapping, 3. |
 | `uplink.targets` | One object per `[[rbn_uplink]]` entry in config order, disabled entries included. |
 
 Each `uplink.targets` object has `target` (the same `host:port` label as
 the per-target metrics), `enabled`, `connected`, `sent`, `suppressed`,
 `lagged`, `write_failed`, `disconnected`, `reconnects`, `recent_reconnects`
-and `health`. A target's `health` is `disabled` if it is not enabled,
+and `health`. `reconnects` and `recent_reconnects` count reconnect
+attempts, failed ones included, not successful reconnections. A target's `health` is `disabled` if it is not enabled,
 otherwise `flapping` if `recent_reconnects` is 3 or more, otherwise
 `connected` or `down`. `flapping` takes precedence over `connected`, so
 `/status` can report a target as flapping while

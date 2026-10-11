@@ -194,7 +194,7 @@ milliseconds, 0 to 3600000.
 | `hang_ms` | `5000.0` | live | How long a silent track waits before it closes; must round to at least one hop. |
 | `gc_ms` | `30000.0` | live | A track that decodes no character for this long is closed; must round to at least one hop. |
 | `warmup_ms` | `2000.0` | live | Start-up time spent measuring the noise; no track opens before it ends. |
-| `track_cap` | `1200` | live | Most tracks decoded at once; at least 1. |
+| `track_cap` | `1200` | live | Most tracks open at once, counting unconfirmed candidates that have no decoder yet; past it the lowest-SNR track is evicted. At least 1. |
 | `silent_respawn_cooldown_ms` | `30000.0` | live | Wait before a channel whose track went silent may start another. |
 
 ## [decode]

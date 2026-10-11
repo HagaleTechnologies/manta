@@ -196,7 +196,7 @@
 #hang_ms = 5000.0                    # how long a silent track waits before it closes
 #gc_ms = 30000.0                     # a track that decodes no character this long is closed
 #warmup_ms = 2000.0                  # start-up time spent measuring the noise; no tracks before it
-#track_cap = 1200                    # most signals decoded at once
+#track_cap = 1200                    # most open tracks, candidates included
 #silent_respawn_cooldown_ms = 30000.0  # wait before a channel whose track went silent starts another
 
 
