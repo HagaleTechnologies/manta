@@ -43,7 +43,8 @@ listed here change what the command does.
 | Command | Tables it applies | Environment |
 |---|---|---|
 | `run` (alias `listen`) | all six | yes |
-| `soak`, `doctor` | `[input]` `[spot]` `[detector]` `[decode]`; `[server]` is ignored with a note | yes |
+| `soak` | `[input]` `[spot]` `[detector]` `[decode]`; `[server]` is ignored with a note | yes |
+| `doctor` | `[input]` `[spot]` `[detector]` `[decode]`, plus `[server]` and `[[rbn_uplink]]` to check them without starting a server or logging in (MAN-126; see [RUNBOOKS/setup-checks.md](RUNBOOKS/setup-checks.md)) | yes |
 | `config check` | all six, resolved exactly as `run` resolves them | yes |
 | `check` | `[input]`: the source, `capture_rate_hz` and `center_freq_hz` | yes |
 | `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes, but `MANTA_SERVER_*` only alongside a config file |
@@ -103,7 +104,9 @@ logged and ignored. See
 
 ## [server]
 
-The telnet, JSON and metrics servers. Only `run` starts them. `status` reads
+The telnet, JSON and metrics servers. Only `run` starts them. `doctor` reads
+the table to check that each listener's address and port can bind right now
+and that `station_callsign` is not the example `N0CALL`. `status` reads
 `metrics_bind_addr` and `metrics_port` to find a running daemon, from the file
 `--config` or `MANTA_CONFIG` names plus any `MANTA_SERVER_*` overrides; with
 neither it dials `127.0.0.1:7302`. The table needs `station_callsign`.
@@ -133,7 +136,9 @@ neither it dials `127.0.0.1:7302`. The table needs `station_callsign`.
 ## [[rbn_uplink]]
 
 One block per upstream collector. A block needs a `[server]` table, and the
-environment cannot set these keys.
+environment cannot set these keys. Only `run` logs in; `doctor` opens and
+immediately closes one TCP connection to each enabled target, sending
+nothing, and flags an example `login_callsign`.
 
 | Key | Default | Wired | Notes |
 |---|---|---|---|
