@@ -103,9 +103,11 @@ adding to it.
      measurement describes a different receiver. `--tune-hz` is the way to
      point the configured receiver at a reference. The same refusal applies
      when the file's `[input]` has a `type` and `MANTA_INPUT_TYPE`,
-     `_DEVICE`, `_PATH`, `_HOST`, `_PORT` or `_DRIVER` is set, because that
-     variable picks the receiver the way a selector flag does, even when it
-     repeats the file's own value.
+     `_DEVICE`, `_PATH`, `_HOST`, `_PORT`, `_DRIVER` or `_IQ` is set, because
+     that variable picks the receiver (or, for `_IQ`, how a recording is
+     read) the way a selector flag does, even when it repeats the file's own
+     value; and to `--source-iq` over a `type = "file"` input without
+     `iq = true`, which reads that recording as IQ instead of audio.
    - When the file already holds the rounded value, it says so and writes
      nothing.
    - When `MANTA_INPUT_FREQ_CORRECTION_PPM` is set, it warns that the

@@ -20,7 +20,8 @@ use std::time::Duration;
 const PPM_ENV_VAR: &str = "MANTA_INPUT_FREQ_CORRECTION_PPM";
 /// The `MANTA_INPUT_*` variables that pick the receiver, as `--source`,
 /// `--device`, `--kiwi-host`, `--soapy-driver` and `--hpsdr-host` do, plus
-/// the port that, with the host, names a KiwiSDR or HPSDR receiver.
+/// the port that, with the host, names a KiwiSDR or HPSDR receiver, and
+/// `MANTA_INPUT_IQ`, which changes how a file input's recording is read.
 const SOURCE_ENV_VARS: &[&str] = &[
     "MANTA_INPUT_TYPE",
     "MANTA_INPUT_DEVICE",
@@ -28,6 +29,7 @@ const SOURCE_ENV_VARS: &[&str] = &[
     "MANTA_INPUT_HOST",
     "MANTA_INPUT_PORT",
     "MANTA_INPUT_DRIVER",
+    "MANTA_INPUT_IQ",
 ];
 
 /// Everything `manta calibrate` was given on the command line.

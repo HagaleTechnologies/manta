@@ -257,6 +257,43 @@ fn calibrate_write_refuses_a_receiver_the_environment_selects() {
     assert_eq!(std::fs::read_to_string(&cfg).unwrap(), body);
 }
 
+/// A typed `[input]` reading the IQ fixture as audio (`iq` unset): an IQ
+/// override measures something that config never opens.
+#[test]
+fn calibrate_write_refuses_an_iq_override_of_an_audio_file_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = fixture(dir.path(), Some(CARRIER_2_5_PPM), CENTRE);
+    let body = format!(
+        "[input]\ntype = \"file\"\npath = {:?}\n",
+        wav.to_str().unwrap()
+    );
+    let cfg = write_cfg(dir.path(), &body);
+    let out = calibrate(&cfg, &["--source-iq", "--write"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("--write would save a measurement of the receiver --source-iq names"),
+        "{stderr}"
+    );
+    assert!(out.stdout.is_empty());
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), body);
+
+    let out = manta()
+        .env("MANTA_INPUT_IQ", "true")
+        .args(["calibrate", "--duration", "12", "--write", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("--write would save a measurement of the receiver MANTA_INPUT_IQ names"),
+        "{stderr}"
+    );
+    assert!(out.stdout.is_empty());
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), body);
+}
+
 #[test]
 fn calibrate_explains_an_empty_passband() {
     let dir = tempfile::tempdir().unwrap();
