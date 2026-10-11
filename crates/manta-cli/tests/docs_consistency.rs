@@ -1185,7 +1185,6 @@ fn architecture_logging_bullet_is_current() {
     );
 }
 
-<<<<<<< HEAD
 // ---- MAN-90 ----
 
 const MAN90_DECISION: &str = "docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md";
@@ -1241,6 +1240,35 @@ fn man90_records_relative_links_resolve() {
             checked += 1;
         }
         assert!(checked > 0, "{rel}: no relative links checked");
+    }
+}
+
+/// MAN-90: the capture starts before Aggregator restarts, so the runbook's
+/// Developer steps must list stream indices from SYN packets and check and
+/// follow a chosen stream across the whole file. They must not cap packets
+/// (`-c` counts every packet read) or follow stream 0, which can be the old
+/// connection. Checks text in that section, not shell semantics.
+#[test]
+fn man90_runbook_checks_the_restarted_connection() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let steps = section(&runbook, "Developer steps");
+    for needle in [
+        "-Y 'tcp.flags.syn == 1 && tcp.flags.ack == 0'",
+        "-e tcp.stream",
+        "-Y \"tcp.stream == $N && (tls || tcp.payload[0:2] == 16:03)\"",
+        "-z follow,tcp,ascii,$N",
+        "-e udp.stream",
+    ] {
+        assert!(
+            steps.contains(needle),
+            "Developer steps never run `{needle}`"
+        );
+    }
+    for stale in [" -c ", "follow,tcp,ascii,0"] {
+        assert!(
+            !steps.contains(stale),
+            "Developer steps still run `{stale}`"
+        );
     }
 }
 
@@ -1302,7 +1330,8 @@ fn architecture_output_layer_describes_the_experimental_uplink() {
 #[test]
 fn uplink_health_runbook_example_is_not_an_rbn_server() {
     assert!(!doc("docs/RUNBOOKS/uplink-health.md").contains("reversebeacon.net"));
-=======
+}
+
 // ---- MAN-149: the reference docs and indexes cover everything they list ----
 
 const CONFIG_REF: &str = "docs/CONFIG.md";
@@ -1715,5 +1744,4 @@ fn reference_docs_relative_links_resolve() {
             "{file} has relative links that do not resolve: {broken:?}"
         );
     }
->>>>>>> 891a66e16a9396219e1db38c08aa85aa24b15937
 }

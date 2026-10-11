@@ -66,17 +66,41 @@ Send something like this, and keep the written reply:
 
 ## Developer steps
 
-`tshark` ships with Wireshark.
+`tshark` ships with Wireshark. Recording started before Aggregator restarted,
+so the file can hold two connections to RBN: the old one, with no login, and
+the restarted one. Only the restarted one is useful. First list the
+endpoints, then every TCP connection opened while recording, with its stream
+index:
 
 ```sh
-tshark -r aggregator-rbn.pcapng -q -z conv,tcp -z conv,udp       # C1, C2: which streams exist
-tshark -r aggregator-rbn.pcapng -Y tls -c 5                      # any output: C2 = TLS, stop at C2
-tshark -r aggregator-rbn.pcapng -q -z follow,tcp,ascii,0 > transcript.txt   # stream index from conv
+tshark -r aggregator-rbn.pcapng -q -z conv,tcp -z conv,udp       # C1, C2: which endpoints exist
+tshark -r aggregator-rbn.pcapng -Y 'tcp.flags.syn == 1 && tcp.flags.ack == 0' \
+  -T fields -e frame.time -e tcp.stream -e ip.dst -e ipv6.dst -e tcp.dstport
 ```
 
-Use `follow,udp,ascii,N` for a UDP stream. Then fill a C1–C7 table by comparing
-`transcript.txt` with the decision record's reference session (the bytes
-`the_uplink_session_bytes_match_the_man90_reference` pins):
+Each row whose destination is RBN's address (operator step 1) is a connection
+Aggregator opened while recording, normally the one after the restart. The old
+connection opened before recording started, so it has no row. It is often
+stream 0. If no row goes to RBN's address, the restart was not recorded: ask
+the operator to record it again. Set `N` to a row's `tcp.stream` value and run,
+over the whole file:
+
+```sh
+N=1   # the tcp.stream value from that row
+tshark -r aggregator-rbn.pcapng -Y "tcp.stream == $N && (tls || tcp.payload[0:2] == 16:03)"   # any output: C2 = TLS, stop at C2
+tshark -r aggregator-rbn.pcapng -q -z follow,tcp,ascii,$N > transcript-$N.txt
+```
+
+Do this for every row to RBN's address, one transcript each (C1). A refused or
+failed attempt gives an empty transcript, so skip it. The `16:03` test catches
+a TLS handshake on a port tshark does not decode as TLS. If Aggregator reaches
+RBN over UDP instead, list its flows with
+`tshark -r aggregator-rbn.pcapng -Y udp -T fields -e udp.stream -e ip.dst -e ipv6.dst -e udp.dstport | sort -u`
+and write each flow to RBN's address to a transcript with
+`tshark -r aggregator-rbn.pcapng -q -z follow,udp,ascii,$N > transcript-udp-$N.txt`.
+Then fill a C1–C7 table by comparing each transcript with the decision record's
+reference session (the bytes `the_uplink_session_bytes_match_the_man90_reference`
+pins):
 
 - **C1:** the remote endpoint(s) Aggregator holds open to RBN, and whether any
   is a login service.
