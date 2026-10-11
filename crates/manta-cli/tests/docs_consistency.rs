@@ -1216,3 +1216,35 @@ fn docker_docs_describe_the_bare_run_and_the_health_check() {
         "README.md never says manta health"
     );
 }
+
+/// MAN-81: no command line in packaging/README.md's ```sh blocks ends in a
+/// `\` continuation. scripts/tests/test_packaging.py's `sh_blocks` runs
+/// `shlex.split` on each of those lines on its own, which fails on an
+/// unescaped trailing `\` (`No escaped character`), and that test only runs
+/// in CI, not in `cargo test`. Fences, blank lines and comment lines are
+/// read the way `sh_blocks` reads them.
+#[test]
+fn packaging_readme_sh_blocks_have_no_line_continuations() {
+    let guide = doc("packaging/README.md");
+    let mut inside = false;
+    let mut checked = 0;
+    for line in guide.lines() {
+        if inside && line == "```" {
+            inside = false;
+        } else if !inside && line == "```sh" {
+            inside = true;
+        } else if inside {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let trailing = line.len() - line.trim_end_matches('\\').len();
+            assert!(
+                trailing.is_multiple_of(2),
+                "packaging/README.md: a ```sh line continues onto the next: {line}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no ```sh commands in packaging/README.md");
+}

@@ -367,10 +367,7 @@ With no arguments, the image runs the daemon from a config mounted at
 `/etc/manta/manta.toml`:
 
 ```sh
-docker run -d --name manta --restart unless-stopped --stop-timeout 60 \
-    --mount type=bind,src="$PWD/manta.toml",dst=/etc/manta/manta.toml,readonly \
-    -p 7300:7300 -p 7301:7301 \
-    ghcr.io/hagaletechnologies/manta:latest
+docker run -d --name manta --restart unless-stopped --stop-timeout 60 --mount type=bind,src="$PWD/manta.toml",dst=/etc/manta/manta.toml,readonly -p 7300:7300 -p 7301:7301 ghcr.io/hagaletechnologies/manta:latest
 docker logs -f manta
 docker ps    # STATUS shows (healthy) once the daemon answers
 ```
