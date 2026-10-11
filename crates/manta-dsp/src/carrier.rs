@@ -204,7 +204,8 @@ impl CarrierEstimator {
         Some((peak as f64 - self.k_max as f64) * self.bin_hz())
     }
 
-    fn bin_hz(&self) -> f64 {
+    /// Width (Hz) of one bin of the per-segment and averaged spectra.
+    pub fn bin_hz(&self) -> f64 {
         self.fs_dec / self.seg_len as f64
     }
 

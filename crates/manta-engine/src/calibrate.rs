@@ -13,7 +13,7 @@
 // docs/DECISIONS/2026-10-11-man127-calibrate-command.md.
 
 use anyhow::{anyhow, bail, Result};
-use manta_dsp::carrier::{CarrierEstimator, AMBIGUITY_EXCLUSION_HZ, MIN_HALF_WIDTH_HZ};
+use manta_dsp::carrier::{CarrierEstimator, MIN_HALF_WIDTH_HZ};
 use manta_input::IqSource;
 use num_complex::Complex32;
 use std::time::{Duration, Instant};
@@ -36,6 +36,9 @@ pub const MIN_SEGMENT_PEAK_OVER_FLOOR_DB: f64 = 15.0;
 pub const MIN_VALID_SEGMENTS: usize = 10;
 /// Below this averaged-spectrum margin the reference is ambiguous.
 pub const MIN_AMBIGUITY_MARGIN_DB: f64 = 6.0;
+/// Most the segments' median offset may differ from the averaged
+/// spectrum's peak bin, in bins, before the reference is `ambiguous`.
+pub const MAX_PEAK_DISAGREEMENT_BINS: f64 = 2.0;
 /// Fraction of the delivered passband trimmed from each edge.
 pub const PASSBAND_EDGE_FRACTION: f64 = 0.05;
 /// Distance kept from an IQ receiver's centre (its DC spur), Hz.
@@ -547,9 +550,10 @@ fn evaluate(p: &PlannedReference, est: &CarrierEstimator) -> Result<ReferenceRes
     }
     // The margin is the averaged spectrum's; the estimate is the segments'
     // median. When they point at different carriers (two alternating across
-    // segments), the margin says nothing about the carrier measured.
+    // segments, however close), the margin says nothing about the carrier
+    // measured. The averaged peak is a whole bin, the median interpolated.
     if let Some(averaged) = est.averaged_peak_offset_hz() {
-        if (averaged - offset).abs() > AMBIGUITY_EXCLUSION_HZ {
+        if (averaged - offset).abs() > MAX_PEAK_DISAGREEMENT_BINS * est.bin_hz() {
             out.status = ReferenceStatus::Ambiguous;
             out.peak_offset_hz = Some(offset);
             out.runner_up_offset_hz = Some(averaged);
@@ -977,9 +981,16 @@ mod tests {
 
     #[test]
     fn alternating_carriers_where_the_median_and_the_spectrum_disagree_are_ambiguous() {
-        // 11 one-second segments of a weak interferer 180 Hz up and 10 of
-        // the reference 12 dB stronger: the median picks the interferer,
-        // while the averaged spectrum's peak is the reference.
+        // 11 one-second segments of a weak interferer up in frequency and
+        // 10 of the reference 12 dB stronger: the median picks the
+        // interferer, while the averaged spectrum's peak is the reference.
+        // At +20 Hz the interferer also sits inside the margin's exclusion.
+        for interferer_hz in [180.0, 20.0] {
+            alternating_carriers_are_ambiguous(interferer_hz);
+        }
+    }
+
+    fn alternating_carriers_are_ambiguous(interferer_hz: f64) {
         let secs = 21.0;
         let mut s = carrier(PPM_2_5_HZ, CENTRE, secs, |t| {
             if !(t as u64).is_multiple_of(2) {
@@ -988,7 +999,7 @@ mod tests {
                 0.0
             }
         });
-        let other = carrier(PPM_2_5_HZ + 180.0, CENTRE, secs, |t| {
+        let other = carrier(PPM_2_5_HZ + interferer_hz, CENTRE, secs, |t| {
             if (t as u64).is_multiple_of(2) {
                 1.0
             } else {

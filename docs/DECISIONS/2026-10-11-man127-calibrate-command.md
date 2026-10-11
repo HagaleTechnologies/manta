@@ -46,8 +46,9 @@ adding to it.
    at least 6 dB, otherwise the status is `ambiguous`. The 25 Hz exclusion,
    rather than a few bins, comes from the prototype: keying sidebands pulled
    a keyed beacon's margin down to 7.6 dB with a ±5-bin exclusion. The
-   status is also `ambiguous` when that averaged peak lies more than 25 Hz
-   from the median of the valid segments' offsets: two carriers alternating
+   status is also `ambiguous` when that averaged peak lies more than 2 bins
+   (`MAX_PEAK_DISAGREEMENT_BINS`) from the median of the valid segments'
+   offsets, however close the two carriers: two carriers alternating
    across segments can give the median one carrier and the margin the
    other. The result is the first reference, in plan order, whose status is `measured`;
    the others print as cross-checks.
@@ -166,6 +167,7 @@ These are fixed, not configurable.
 | `MIN_VALID_SEGMENTS` | 10 |
 | `AMBIGUITY_EXCLUSION_HZ` | 25.0 |
 | `MIN_AMBIGUITY_MARGIN_DB` | 6.0 |
+| `MAX_PEAK_DISAGREEMENT_BINS` | 2.0 |
 | `MIN_HALF_WIDTH_HZ` | 100.0 |
 | `PASSBAND_EDGE_FRACTION` | 0.05 (use the inner 90 % of `rf_passband_hz`) |
 | `DC_GUARD_HZ` | 25.0 |
