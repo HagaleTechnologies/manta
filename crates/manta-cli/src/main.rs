@@ -2106,12 +2106,10 @@ struct SpotServer {
     /// tests without guessing or binding a fixed port.
     #[cfg_attr(not(test), allow(dead_code))]
     metrics_addr: std::net::SocketAddr,
-<<<<<<< HEAD
     /// The JSON listener's real bound address, so a port-0 bind is reachable
     /// by tests -- `metrics_addr`'s MAN-44 precedent.
     #[cfg_attr(not(test), allow(dead_code))]
     json_addr: std::net::SocketAddr,
-=======
     /// MAN-78: each `[[rbn_uplink]]` task's live `dry_run` flag, in config
     /// order, for the SIGHUP reload thread (Unix only) to flip.
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -2129,7 +2127,6 @@ struct UplinkDryRun {
     /// reads its flag.
     enabled: bool,
     flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
->>>>>>> d3bfa7c0c47a8b6527985955d446147718ff20cd
 }
 
 // MAN-89 (PR #131 review, round 7): the "would `from_spot` emit the
@@ -2567,11 +2564,7 @@ fn start_spot_server(
     let tasks = manta_server::tasks::new_client_tasks();
 
     let rt = tokio::runtime::Runtime::new()?;
-<<<<<<< HEAD
-    let (status_line, metrics_addr, json_addr) = rt.block_on(async {
-=======
-    let (status_line, metrics_addr, uplink_dry_run) = rt.block_on(async {
->>>>>>> d3bfa7c0c47a8b6527985955d446147718ff20cd
+    let (status_line, metrics_addr, json_addr, uplink_dry_run) = rt.block_on(async {
         // MAN-132: metrics binds its own `metrics_bind_addr` (loopback by
         // default), never `bind_addr`. With two configurable addresses
         // "which listener failed?" is a real question, so each bind names
@@ -2823,11 +2816,7 @@ fn start_spot_server(
             shutdown_rx.clone(),
         );
 
-<<<<<<< HEAD
-        anyhow::Ok((status_line, metrics_addr, json_addr))
-=======
-        anyhow::Ok((status_line, metrics_addr, uplink_dry_run))
->>>>>>> d3bfa7c0c47a8b6527985955d446147718ff20cd
+        anyhow::Ok((status_line, metrics_addr, json_addr, uplink_dry_run))
     })?;
 
     Ok((
@@ -2846,11 +2835,8 @@ fn start_spot_server(
             cty,
             status_line: std::sync::Mutex::new(status_line),
             metrics_addr,
-<<<<<<< HEAD
             json_addr,
-=======
             uplink_dry_run,
->>>>>>> d3bfa7c0c47a8b6527985955d446147718ff20cd
         },
     ))
 }
