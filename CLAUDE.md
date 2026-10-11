@@ -78,12 +78,20 @@ MAN-125: `manta devices` lists audio inputs and optional Soapy selectors;
 floor without decoding or services. See
 `docs/DECISIONS/2026-10-10-man125-source-diagnostics.md`.
 
+<<<<<<< HEAD
 MAN-149: `docs/CONFIG.md` (every key's default and what reads it),
 `docs/METRICS.md`, `docs/SPOT-SCHEMA.md`, `docs/README.md` (start here, by
 audience) and `docs/DECISIONS/README.md`. A new config key, metric family,
 wire field, runbook or decision record needs a row in its document; tests
 in `docs_consistency.rs` and `spot_message.rs` enforce it — see
 docs/DECISIONS/2026-10-11-man149-docs-reference-and-index.md.
+=======
+MAN-138: JSON spots' `deGrid`/`deLat`/`deLon` are the operator's
+`[server].operator_grid` (its square's centre) or the new `operator_lat`/
+`operator_lon`, `null` when none is set, never a `cty.dat` country
+centroid; an inconsistent location fails config loading before I/O. See
+`docs/DECISIONS/2026-10-11-man138-station-location.md`.
+>>>>>>> ec8b0ca4df7703b5572b3a798519e5279ff7c8c0
 
 ## Documents (read in this order)
 
