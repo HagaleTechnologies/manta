@@ -354,14 +354,19 @@ fn bucket(freq_hz: f64) -> i64 {
 }
 
 struct GateEntry {
-    /// `freq_hz` of the most recent `record` call that touched this entry,
-    /// accepted or rejected as a near-duplicate, deferred Beacon replays
-    /// included (MAN-175). The entry's map key always moves to that same
-    /// call's `bucket(freq_hz)`, so `bucket(anchor_freq_hz)` is always this
-    /// entry's own bucket, and the anchor follows a drifting signal
-    /// forward hop by hop the same way the key does. `record`'s neighbor
-    /// search only joins this entry from an adjacent bucket when the new
-    /// decode is within `SAME_SIGNAL_MAX_HZ` of it.
+    /// `freq_hz` of this entry's latest touch by `sample_ts` (the one
+    /// `most_recent` reports; on a tie, the later `record` call), accepted
+    /// or rejected as a near-duplicate (MAN-175). A deferred Beacon replay
+    /// (`Validator::resolve_pending_beacons`) older than that touch moves
+    /// neither this anchor nor the entry's map key (Codex review, PR
+    /// #255), just as it can't rewind `most_recent` or
+    /// `last_seen_by_track`. Every touch that does move the anchor also
+    /// moves the key to its own `bucket(freq_hz)`, so
+    /// `bucket(anchor_freq_hz)` is always this entry's own bucket, and the
+    /// anchor follows a drifting signal forward hop by hop the same way
+    /// the key does. `record`'s neighbor search only joins this entry from
+    /// an adjacent bucket when the new decode is within
+    /// `SAME_SIGNAL_MAX_HZ` of it.
     anchor_freq_hz: f64,
     /// `(sample_ts, word_seq, track_id, message_distinct, anchor_ts)` of
     /// every *accepted* (distinct, non-near-duplicate) occurrence. The
@@ -503,7 +508,10 @@ impl RepetitionGate {
     /// always keying strictly by its own freshly-computed bucket -- this
     /// keeps a drifting signal's anchor following it forward across
     /// successive hops, each individually within the +-1 tolerance, so a
-    /// later hop's own neighbor search can still find it. Bucket
+    /// later hop's own neighbor search can still find it. A deferred
+    /// replay older than the found entry's latest touch joins that entry
+    /// where it is instead (MAN-175, Codex review PR #255): moving it
+    /// would drag the key back to where the signal used to be. Bucket
     /// adjacency is necessary but not sufficient (MAN-175): a neighbor's
     /// entry is only joined when this decode lies within
     /// `SAME_SIGNAL_MAX_HZ` (one channel) of that entry's
@@ -598,7 +606,8 @@ impl RepetitionGate {
         // genuine boundary-drift case -- and even then it only ever
         // *moves* (renames) a neighbor's entry into an empty home, never
         // merges two already-populated entries together.
-        if !self.seen.contains_key(&home_key) {
+        let mut entry_key = home_key;
+        if !self.seen.contains_key(&entry_key) {
             // Among both neighbors, join whichever existing entry is
             // *freshest* (see `GateEntry::most_recent`), not just the
             // lowest-numbered one that happens to still exist -- sweeps
@@ -608,7 +617,7 @@ impl RepetitionGate {
             // is eligible (MAN-175): an adjacent bucket alone can be up
             // to ~200 Hz away, i.e. a different real signal. Filtering
             // here, before the freshest pick, gates the move below too.
-            let matched_key = (b - 1..=b + 1)
+            let matched = (b - 1..=b + 1)
                 .filter(|&candidate| candidate != b)
                 .map(|candidate| (candidate, callsign.to_string()))
                 .filter_map(|k| {
@@ -619,20 +628,31 @@ impl RepetitionGate {
                     let ts = neighbor.most_recent()?;
                     Some((k, ts))
                 })
-                .max_by_key(|(_, ts)| *ts)
-                .map(|(k, _)| k);
-            if let Some(found_key) = matched_key {
-                let moved = self.seen.remove(&found_key).unwrap();
-                self.seen.insert(home_key.clone(), moved);
+                .max_by_key(|(_, ts)| *ts);
+            if let Some((found_key, found_latest)) = matched {
+                // MAN-175 (Codex review, PR #255): a deferred replay older
+                // than the neighbor's latest touch joins it in place. The
+                // key stays with that latest touch, as the anchor does
+                // below.
+                if sample_ts >= found_latest {
+                    let moved = self.seen.remove(&found_key).unwrap();
+                    self.seen.insert(entry_key.clone(), moved);
+                } else {
+                    entry_key = found_key;
+                }
             }
         }
         let entry = self
             .seen
-            .entry(home_key)
+            .entry(entry_key)
             .or_insert_with(|| GateEntry::new(freq_hz));
-        // MAN-175: the anchor follows this call, like the entry's key
-        // just did -- see `GateEntry::anchor_freq_hz`.
-        entry.anchor_freq_hz = freq_hz;
+        // MAN-175: the anchor follows this call only when it is the
+        // entry's latest touch (Codex review, PR #255) -- see
+        // `GateEntry::anchor_freq_hz`. Read before this call updates the
+        // entry below.
+        if entry.most_recent().is_none_or(|latest| sample_ts >= latest) {
+            entry.anchor_freq_hz = freq_hz;
+        }
         // Codex review, PR #152, round 8: a track's own previous touch
         // only exempts a NEW touch from the cross-track near-duplicate
         // check when that previous touch is itself recent -- a genuine
@@ -1404,6 +1424,76 @@ mod tests {
             outside.record(2, 14_000_094.0, "K5ARH", 300_000, 10, |tid| tid != 1),
             1,
             "94 Hz from the anchor is beyond one channel: a different signal"
+        );
+    }
+
+    /// MAN-175 (Codex review, PR #255): `Validator::resolve_pending_beacons`
+    /// can replay a deferred candidate whose `sample_ts` is older than the
+    /// entry's latest touch. That replay must not rewind the entry's
+    /// spatial identity (map key or anchor frequency), just as it can't
+    /// rewind its time watermarks (`most_recent`, `last_seen_by_track`).
+    /// A signal decoded at 14,000,100 Hz (t=10 s), replayed from
+    /// 14,000,049 Hz (t=5 s), then decoded at 14,000,149 Hz (t=20 s) is
+    /// 49 Hz from its latest position, so it is still one signal. When the
+    /// replay moved the entry to its own bucket and anchor, that last
+    /// decode was 100 Hz away and its count restarted at 1.
+    #[test]
+    fn an_older_deferred_replay_does_not_restart_a_drifting_signals_count() {
+        let mut gate = RepetitionGate::new(FS);
+        assert_eq!(
+            gate.record(2, 14_000_100.0, "K5ARH", 10 * FS as u64, 0, always_active),
+            1
+        );
+        // The deferred replay: an older sample_ts, arriving last in call
+        // order.
+        gate.record(1, 14_000_049.0, "K5ARH", 5 * FS as u64, 0, always_active);
+        assert_eq!(
+            gate.record(3, 14_000_149.0, "K5ARH", 20 * FS as u64, 10, |tid| {
+                tid != 2
+            }),
+            2,
+            "49 Hz from the chronologically latest decode is the same signal"
+        );
+    }
+
+    /// MAN-175 (Codex review, PR #255): the same older replay must not move
+    /// the entry's map key back to the replay's bucket either. The key and
+    /// the anchor both stay with the latest touch. Moved back to bucket
+    /// 140000, the entry would take a decode at 13,999,960 Hz through the
+    /// home-bucket path, which checks no distance, though that decode is
+    /// 140 Hz from the signal's latest position.
+    #[test]
+    fn an_older_deferred_replay_does_not_move_the_entry_back_to_its_bucket() {
+        let mut gate = RepetitionGate::new(FS);
+        gate.record(2, 14_000_100.0, "K5ARH", 10 * FS as u64, 0, always_active);
+        gate.record(1, 14_000_049.0, "K5ARH", 5 * FS as u64, 0, always_active);
+        assert_eq!(gate.len(), 1, "the replay joins the existing entry");
+        assert_eq!(
+            gate.record(3, 13_999_960.0, "K5ARH", 20 * FS as u64, 10, |tid| {
+                tid != 2
+            }),
+            1,
+            "140 Hz from the chronologically latest decode is a different signal"
+        );
+    }
+
+    /// MAN-175 (Codex review, PR #255): an older replay that lands in the
+    /// entry's own bucket must not rewind its anchor either. The entry sits
+    /// at 14,000,140 Hz (t=10 s) and the replay at 14,000,051 Hz (t=5 s),
+    /// both in bucket 140001. A decode at 14,000,220 Hz (t=20 s, bucket
+    /// 140002) is 80 Hz from the latest touch, so it joins as a neighbor.
+    /// It would be 169 Hz from the rewound anchor and start a new entry.
+    #[test]
+    fn an_older_deferred_replay_does_not_rewind_the_entrys_anchor() {
+        let mut gate = RepetitionGate::new(FS);
+        gate.record(2, 14_000_140.0, "K5ARH", 10 * FS as u64, 0, always_active);
+        gate.record(1, 14_000_051.0, "K5ARH", 5 * FS as u64, 0, always_active);
+        assert_eq!(
+            gate.record(3, 14_000_220.0, "K5ARH", 20 * FS as u64, 10, |tid| {
+                tid != 2
+            }),
+            2,
+            "80 Hz from the chronologically latest decode is the same signal"
         );
     }
 
