@@ -226,7 +226,7 @@ the measured best values.
 | `beam` | `12` | live: hsmm only | Hypotheses kept per step; at least 1. |
 | `lookahead_dits` | `25.0` | live: hsmm only | How far ahead, in dot lengths, the decoder looks before a character is final. |
 | `speed_alpha` | `0.2` | live: hsmm only | How quickly the speed estimate follows the sender; 0 or more. |
-| `seed_units_hops` | `[9.0, 13.0, 18.0, 26.0, 38.0]` | live: hsmm only | Starting dot lengths tried, hops; at least one, each positive. |
+| `seed_units_hops` | `[9.0, 13.0, 18.0, 26.0, 38.0]` | live: hsmm only | Starting dot lengths tried, hops; at least one, each within the HSMM decoder's supported speed range of 7.5 to 56 hops per dit (fixed, not configurable); `manta config check` and startup reject anything outside it. |
 | `conf_kappa` | `6.0` | live: hsmm only | Confidence scale; above 0. |
 
 ## Not settable (compile-time constants)
