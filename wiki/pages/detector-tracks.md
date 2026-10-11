@@ -38,7 +38,10 @@ Order statistics rather than a mean floor is the load-bearing choice: CW is burs
   floor (`TrackManager::skip_preroll_hops`); a young ring's lower quartile
   is its minimum, so they would pin the floor near -140 dB. The 25 ms
   default warm-up is safe only together with `FloorBank`'s 1 s
-  block-median seed (SPEC §2.2 "Startup"). V8w's 0-bogus and V1's 10 Hz
+  block-median seed (SPEC §2.2 "Startup"). Never extend the seed on a
+  ring's bottom-bin count: one later entry revives a stale seed for 10 s;
+  leading silence is left out of the effective floor's quartile instead.
+  V8w's 0-bogus and V1's 10 Hz
   frequency gates move with the promotion hop, so re-run them after any
   warm-up change; see the MAN-115
   [decision record](../../docs/DECISIONS/2026-10-11-man115-startup-latency.md).

@@ -185,14 +185,22 @@ replaces SPEC v1's 2 s inhibit):
   (`pad_hops` hops, all-zero or partial windows) never reach the floor, the
   gate or the warm-up count; the segment's first real hop is its hop 0.
 - **Block-median seed.** While a channel's ring holds fewer than 25 entries
-  (its first 1 s), its effective floor is raised to at least its block's
-  seed: the running mean, over the block's first 25 decimated hops, of the
-  median raw `PdB` across the block's 32 channels, minus 3.8 dB
-  (`10·log10(ln 2 / ln(4/3))`, the median-to-lower-quartile gap of a
-  chi-squared 2-DOF power). Block medians below −140 dBFS (digital
-  silence, e.g. a source still opening) are left out of that mean, and the
-  seed also holds while the channel's ring still contains entries in the
-  histogram's bottom bin. The seed only raises `F[k]`; `F_ch` stays raw.
+  taken since its block's leading silence ended (that block's first 1 s of
+  input), its effective floor is raised to at least its block's seed: the
+  running
+  mean, over the block's first 25 decimated hops, of the median raw `PdB`
+  across the block's 32 channels, minus 3.8 dB (`10·log10(ln 2 / ln(4/3))`,
+  the median-to-lower-quartile gap of a chi-squared 2-DOF power). Block
+  medians below −140 dBFS (digital silence, e.g. a source still opening)
+  are left out of that mean; a block's leading silence lasts until its
+  first decimated hop with a median at or above −140 dBFS. The seed only
+  raises `F[k]`; `F_ch` stays raw.
+- **Leading silence.** The histogram bottom-bin entries a channel's ring
+  takes during its block's leading silence are left out of the `F_ch[k]`
+  and `F_blk` that `F[k]` uses until they leave the ring (10 s); counted,
+  they would pin the lower quartile at −140 dBFS. Removing bottom-bin
+  entries can only raise a quantile. Bottom-bin entries after the leading
+  silence count as usual.
 - **Warm-up.** Track creation is inhibited for the first **25 ms**
   (`detector.warmup_ms = 25`, 9 hops) of real hops.
 

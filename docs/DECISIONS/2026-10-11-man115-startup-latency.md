@@ -150,16 +150,35 @@ Applying it only inside `effective_floor_db` keeps that test green.
   median-to-lower-quartile gap of a chi-squared 2-DOF power, so the seed
   estimates the same quantity the ring converges to (5.4 dB was also clean
   on 250 noise seeds). The seed only raises the effective floor (`max`): a
-  wrong seed costs sensitivity for at most 1 s and never adds tracks.
+  wrong seed costs sensitivity for at most the first second after a
+  block's leading silence and never adds tracks.
   Self-review found that a live stream opening with exact zeros broke
   this: one -200 dB push dragged the dB-domain mean ~50 dB low, and the
   silent ring entries pinned the young quartile at -140 dB. Block medians
-  below -140 dBFS are now left out of the seed, and the seed holds while a
-  ring still has bottom-bin entries
-  (`leading_digital_silence_neither_lowers_nor_ends_the_seed`). Noise
-  never reaches that bin, so neither rule changes any measured number
-  above. Leading silence still delays the first real ring entries; the
-  pre-MAN-115 2 s warm-up tolerated about 0.5 s of it.
+  below -140 dBFS are now left out of the seed
+  (`leading_digital_silence_neither_lowers_nor_ends_the_seed`).
+  The first fix for the pinned quartile held the seed while a ring had any
+  bottom-bin entry. Validation showed that a single later bottom-bin entry
+  in a mature ring, even a nonzero -139.6 dB one, brought the startup
+  seed back for up to 10 s and hid signals the old floor passed, and that
+  320 ms of leading silence kept the seed for 10.3 s. Now each ring counts
+  the bottom-bin entries it took during its block's leading silence, the
+  pushes before the first block median at or above -140 dBFS. They are
+  left out of the quartile and block median that `effective_floor_db`
+  uses until they leave the ring, and the seed holds for the 25 pushes
+  after the silence. Later bottom-bin entries count as usual, as on
+  `main`: a dropout or a `--loop` wrap into zeros mid-stream still pins
+  the quartile once it fills a quarter of the ring
+  (`later_bottom_bin_entry_does_not_revive_the_seed`,
+  `quiet_channel_in_a_live_block_loses_the_seed_after_seed_pushes`,
+  `effective_floor_follows_real_input_past_leading_silence`).
+  `channel_floor_db` still counts every entry. An instrumented build
+  found no channel on V1, V2, V8 or V8w whose first ring entry was in the
+  bottom bin, so no block there has leading silence, and no hop where the
+  old and new rules gave a different effective floor. V1 still promotes
+  at 0.0720 s with its first character at 0.6187 s, and V8w still
+  validates 27/50 with 0 bogus. V1 with 0.5 s of zeros prepended promotes
+  once, at 0.536 s, with its first character at 1.12 s.
 - **D2. No extra `TrackMeta` at promotion.** On the default `legacy`
   engine the first `TrackMeta` and the first `CharDecoded` leave the
   decoder in the same `push_hop` call (demod init at hop 375, where
