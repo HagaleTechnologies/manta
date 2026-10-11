@@ -88,7 +88,7 @@ keys (MAN-138), never `cty.dat`.
 | `snrRefHz` | integer | never | The reference bandwidth `snr` is quoted in, in Hz. Always `2500`. Not yet in the dispensa contract. |
 | `wpm` | integer | not today | Keying speed in words per minute, rounded. |
 | `decodeConfidence` | number | not today | Callsign confidence from 0 to 1 (SPEC-decode-core §4.6): the geometric mean of the per-character confidences times a repetition factor `1 - 0.5^r`, multiplied by 1.15 and capped at 1 when the call is in `master.scp`. |
-| `decoderVersion` | string | not today | Build identity, `manta-<version>+<commit>`, for example `manta-0.1.0+d3bfa7c0c47a`. The commit is 12 hex digits, an override from `MANTA_GIT_SHA`, or `unknown`. Compare the part before `+` across releases; the whole string names the exact binary. It is not decoder output (MAN-83). |
+| `decoderVersion` | string | not today | Build identity, `manta-<version>+<commit>`, for example `manta-0.1.0+d3bfa7c0c47a`. The part after `+` is the commit as 12 lowercase hex digits, `unknown` (no `.git`), or a build-time `MANTA_GIT_SHA` override: any SemVer build-metadata string (dot-separated `[0-9A-Za-z-]` identifiers, at most 64 characters) kept verbatim, except that a full 40- or 64-hex commit is shortened to 12 digits. So it can be, for example, `20261010123045` or `release.1`; don't validate it as a SHA. Compare the part before `+` across releases; the whole string names the exact binary. It is not decoder output (MAN-83). |
 | `channelizerResolutionHz` | null | always | Reserved by the contract; manta does not fill it. |
 
 There is no `deCqZone` field. The contract has none, and manta does not send
