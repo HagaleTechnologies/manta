@@ -78,13 +78,11 @@ git history and `docs/DECISIONS/`.
 
 ### Changed
 
-<<<<<<< HEAD
 - `sh/dx` history now retains every spot heard in the last
   `[server].history_minutes` minutes (default 30; at least the 50 newest,
   at most 10,000). `manta_spots_history_truncated_total` counts spots the
   ceiling drops early (MAN-93). Bare `sh/dx` still shows the last 10;
   loggers can request `sh/dx 30m`.
-=======
 - Command output reads as finished text rather than debug prints (MAN-270).
   Human reports use shared units: frequencies as `14012.3 kHz`, SNR as
   integer `dB`, speed as integer `WPM`, confidence to two decimals, and spot
@@ -96,7 +94,6 @@ git history and `docs/DECISIONS/`.
   `dial_frequency=14060.0 kHz`. JSON output, the RBN wire format and decoder
   output are unchanged. See
   [docs/DECISIONS/2026-10-10-man270-cli-output-style.md](docs/DECISIONS/2026-10-10-man270-cli-output-style.md).
->>>>>>> 7715fd70ecd6b481f20020ba52579670372a7727
 - `manta doctor` no longer prints `note: doctor does not start the spot
   servers; ignoring [server]`: it checks `[server]`'s ports instead, still
   starting no server.
