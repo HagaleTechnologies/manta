@@ -99,6 +99,7 @@ impl Drop for TempGuard {
 }
 
 /// A config file as calibrate read it before measuring.
+#[derive(Debug, PartialEq)]
 pub(crate) struct ReadBefore {
     /// `path` canonicalized.
     pub(crate) target: PathBuf,

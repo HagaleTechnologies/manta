@@ -8,7 +8,7 @@
 use crate::{
     config, config_edit, prepare_source, CliOverrides, LiveSourceSpec, Resolved, SourcePrepared,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use manta_engine::calibrate::{
     check_duration, plan_references, CalibrateOptions, CalibrationReport, PlannedReference,
     ReferenceResult, ReferenceStatus, MIN_AMBIGUITY_MARGIN_DB, MIN_VALID_SEGMENTS, SPREAD_WARN_HZ,
@@ -325,6 +325,16 @@ fn is_audio(spec: &LiveSourceSpec) -> bool {
 pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
     let duration = Duration::from_secs(args.duration_secs);
     check_duration(duration)?;
+    // Snapshot the config before and after prepare_source loads it, so the
+    // receiver `resolved` describes and the text the save is checked against
+    // come from the same file and bytes.
+    let snapshot_before = {
+        let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+        args.config
+            .clone()
+            .or_else(|| config::config_path_from_env(&vars))
+            .map(|path| config_edit::ReadBefore::read(&path).ok())
+    };
     let SourcePrepared {
         config_path,
         loaded,
@@ -344,6 +354,13 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
         .as_deref()
         .map(config_edit::ReadBefore::read)
         .transpose()?;
+    if let (Some(path), Some(before)) = (config_path.as_deref(), snapshot_before) {
+        ensure!(
+            before.as_ref() == read_before.as_ref(),
+            "config file {} changed while calibrate was loading it; re-run calibrate",
+            path.display()
+        );
+    }
     let config_text = read_before.as_ref().map(|r| r.text.as_str());
     let replaced_by = match (resolved.replaced_file_source, config_path.as_deref()) {
         (Some(flag), _) => Some(flag),
