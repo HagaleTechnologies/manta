@@ -23,6 +23,11 @@ git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- JSON spots' `deGrid`/`deLat`/`deLon` are the operator's configured
+  station position (`[server].operator_grid`, or the new `operator_lat`/
+  `operator_lon`), and `null` when none is configured, instead of the
+  station's country centroid from `cty.dat` (MAN-138). Decoder output is
+  unchanged.
 - `manta --version` (and `-V`) names the exact build: crate version, git
   commit and compiled-in features, for example
   `manta 0.1.0 (git 1a2b3c4d5e6f; features: hpsdr)` (MAN-83).

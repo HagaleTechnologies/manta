@@ -49,7 +49,9 @@ Copy the example, replace N0CALL with your station callsign, and configure your 
 **Station.** Under `[server]`, edit the active `station_callsign = "N0CALL"`
 line, not the commented reference line above it. Your call is sent as the
 spotter of every spot; an RBN SSID such as `-1` is allowed. The
-`operator_*` lines are optional.
+`operator_*` lines are optional. Set `operator_grid` (or `operator_lat` and
+`operator_lon`) to put your station's position on JSON spots; without it
+they carry none.
 
 **Receiver.** For a KiwiSDR, find these lines in the `[input]` table that
 is already in the file, delete the `#` at the start of each, and edit the

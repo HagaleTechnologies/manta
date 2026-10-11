@@ -446,6 +446,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `dxCqZone` (and their `de*` counterparts) carry named, out-of-domain
   `UNKNOWN_*` sentinels rather than `null` or a fabricated-looking value —
   see `docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md`.
+  `deGrid`/`deLat`/`deLon` are the operator's configured station position
+  (`[server].operator_grid`/`operator_lat`/`operator_lon`), `null` when none
+  is configured, never a `cty.dat` centroid (MAN-138; see
+  `docs/DECISIONS/2026-10-11-man138-station-location.md`).
   Its `snr` field keeps the native 2500 Hz measurement (no 500 Hz conversion)
   alongside an explicit `snrRefHz` field naming that bandwidth, so a consumer
   of either surface never has to guess which convention it's reading
