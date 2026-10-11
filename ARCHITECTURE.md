@@ -522,6 +522,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   scaffold with every key commented out at its default, pinned to the code
   defaults and the loader's key list by tests (MAN-76,
   `docs/DECISIONS/2026-10-07-man76-config-check-init.md`).
+  With `[server]`, SIGHUP re-runs that same pipeline and swaps the `[spot]`
+  lists into the live validator and `dry_run` into each uplink task; other
+  keys need a restart, and an invalid reload is logged and changes nothing
+  (MAN-78, `docs/DECISIONS/2026-10-10-man78-live-reload.md`).
 - **Source diagnostics (MAN-125)**: `manta devices` enumerates audio inputs
   and, when compiled, SoapySDR selectors without opening capture streams.
   `manta check [SOURCE]` shares typed config/source resolution and source wrappers
@@ -537,8 +541,11 @@ validation (MAN-28). Dedupe (step 5) still applies.
   2026-09-03 (MAN-59, `docs/DECISIONS/2026-09-03-man59-connection-audit-logging.md`):
   connect/login/disconnect events, per-IP quota and rate-limit rejections,
   `bounded_io` read rejections, malformed-WS-frame disconnects, and
-  rejected metrics-endpoint requests are all logged (plain `fmt` output,
-  `RUST_LOG`-controlled, default `info`) to give an operator a durable
+  rejected metrics-endpoint requests are all logged (text, coloured only
+  when stderr is a terminal, or JSON Lines with `--log-format json`; level
+  from `-v`/`-q`/`--log-level`, else `RUST_LOG`, default `info`; installed
+  by `manta-cli/src/logging.rs` at the top of `run`, MAN-124,
+  `docs/DECISIONS/2026-10-10-man124-log-output.md`) to give an operator a durable
   record to reconstruct an abuse incident after the fact. **The daemon
   also logs its own liveness** — landed 2026-09-07 (MAN-122,
   `docs/DECISIONS/2026-09-07-man122-operator-liveness-logging.md`): one
