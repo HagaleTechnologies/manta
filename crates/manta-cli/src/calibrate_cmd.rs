@@ -332,6 +332,8 @@ fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<Str
         dial_freq_hz,
         capture_rate_hz,
         replay_epoch,
+        realtime,
+        loop_replay,
         // Exempt: the value being calibrated (calibrate has no such flag).
         freq_correction_ppm: _,
         // Exempt: spot filtering after decoding, not the input (calibrate
@@ -363,6 +365,9 @@ fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<Str
     flag(dial_freq_hz.is_some(), "--dial-freq-hz");
     flag(capture_rate_hz.is_some(), "--capture-rate-hz");
     flag(replay_epoch.is_some(), "--replay-epoch");
+    // `run`'s file pacing (MAN-269); calibrate has no such flags today.
+    flag(*realtime, "--realtime");
+    flag(*loop_replay, "--loop");
     // Not overrides, each by design: --duration, --reference-hz and
     // --search-ppm shape the measurement, not the input; --json and --write
     // shape the output; --config names the file being saved to. --tune-hz
@@ -815,6 +820,7 @@ mod tests {
             spot: crate::resolve_spot(Vec::new(), None, None, None, None, &Default::default()),
             notes: Vec::new(),
             replaced_file_source: None,
+            replay: crate::ReplayMode::default(),
         }
     }
 

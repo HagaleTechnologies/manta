@@ -103,7 +103,9 @@ adding to it.
      `calibrate_cmd.rs`): any flag that changes the source, receiver,
      centre/dial frequency, IQ mode, sample rate, device or file (`--source`,
      `--device`, `--source-iq`, `--kiwi-host`, `--kiwi-freq-hz`,
-     `--soapy-driver`, `--hpsdr-host`, `--dial-freq-hz`, `--capture-rate-hz`),
+     `--soapy-driver`, `--hpsdr-host`, `--dial-freq-hz`, `--capture-rate-hz`,
+     and `run`'s `--replay-epoch`, `--realtime` and `--loop` should calibrate
+     ever take them),
      and every environment variable starting with `MANTA_INPUT_`, matched by
      prefix so new ones are covered, except `MANTA_INPUT_FREQ_CORRECTION_PPM`,
      the value being calibrated. A measurement taken with any of them may not
