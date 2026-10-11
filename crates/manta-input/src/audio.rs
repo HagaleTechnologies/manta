@@ -16,12 +16,14 @@
 //! Live devices (`from_device`) sit behind coppa's non-blocking callback
 //! ring, where an empty read means "nothing captured yet", not end of
 //! stream. `read` therefore waits for samples, and fails after
-//! `DEVICE_STALL_TIMEOUT` if none arrive, so the `IqSource` contract
-//! `0 = EOF` holds for every source (MAN-231). File-backed sources keep
-//! returning 0 at end of file.
+//! `DEVICE_STALL_TIMEOUT` with an error naming the device, the rate and
+//! the likely cause, so the `IqSource` contract `0 = EOF` holds for every
+//! source (MAN-231, MAN-131). File-backed sources keep returning 0 at end
+//! of file.
 
+use crate::devices::quoted_name;
 use crate::IqSource;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use coppa_audio::AudioSource;
 use manta_dsp::hilbert::HilbertTransformer;
 use num_complex::Complex32;
@@ -65,12 +67,108 @@ pub const DEVICE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// The ring holds 8192 samples, ~170 ms at 48 kHz, so a 10 ms poll cannot
 /// let it overflow.
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Exact-zero samples from open before the digital-silence notice fires:
+/// two seconds, the length of `listen`'s startup window.
+const SILENCE_NOTICE_SAMPLES: u64 = 2 * TARGET_RATE_HZ as u64;
+
+/// Called at most once per opened device, with its quoted name. See
+/// `AudioIqSource::with_silence_notice`.
+pub type SilenceNotice = Box<dyn FnOnce(&str) + Send>;
+
+/// What a live audio input most likely needs checked when it fails to open
+/// or delivers nothing (MAN-131). macOS denies microphone access silently
+/// -- the stream opens, then no callbacks arrive or every buffer is zero --
+/// so permission is the likely cause there.
+pub fn audio_input_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "on macOS this is usually microphone permission: allow the app \
+         running manta in System Settings > Privacy & Security > Microphone, \
+         quit and reopen that app, then confirm with `manta check`"
+    } else {
+        "check that the input is connected, unmuted and not held by another \
+         program, then confirm with `manta check`"
+    }
+}
+
+/// `--device NAME` matched no input.
+fn no_matching_input(requested: &str) -> anyhow::Error {
+    anyhow!(
+        "no audio input matching {} (manta needs a {TARGET_RATE_HZ} Hz input) -- \
+         run `manta devices` to list the inputs --device can select",
+        quoted_name(requested)
+    )
+}
+
+/// No `--device` and the host has no default input.
+fn no_default_input() -> anyhow::Error {
+    anyhow!(
+        "no default audio input (manta needs a {TARGET_RATE_HZ} Hz input) -- \
+         run `manta devices` to list the inputs --device can select"
+    )
+}
+
+/// The device exists but its config query, stream build or start failed.
+fn did_not_open(label: &str, cause: &anyhow::Error) -> anyhow::Error {
+    anyhow!(
+        "audio input {label} did not open at {TARGET_RATE_HZ} Hz: {cause:#} -- {}",
+        audio_input_hint()
+    )
+}
+
+/// The device's native rate is not `TARGET_RATE_HZ`; M1 does not resample.
+fn wrong_rate(label: &str, native: u32) -> anyhow::Error {
+    let where_to_set = if cfg!(target_os = "macos") {
+        "the system's audio settings (Audio MIDI Setup on macOS)"
+    } else {
+        "the system's audio settings"
+    };
+    anyhow!(
+        "audio input {label} runs at {native} Hz, but manta needs {TARGET_RATE_HZ} Hz \
+         and does not resample -- set that input to {TARGET_RATE_HZ} Hz in \
+         {where_to_set}, or choose another with --device"
+    )
+}
+
+/// A live device delivered nothing for `waited`.
+fn no_samples(label: &str, waited: Duration) -> anyhow::Error {
+    anyhow!(
+        "audio input {label} delivered no samples in {} s at {TARGET_RATE_HZ} Hz -- {}",
+        waited.as_secs_f64(),
+        audio_input_hint()
+    )
+}
 
 /// A capture device behind a non-blocking callback ring (coppa's
 /// `CpalSource`): `read` must wait for samples, because an empty ring is
 /// not end of stream.
 struct LiveDevice {
+    /// The device's name as `manta devices` spells it (quoted).
+    label: String,
     stall_timeout: Duration,
+    /// Armed until it fires or a non-zero sample arrives.
+    silence_notice: Option<SilenceNotice>,
+    /// Exact-zero samples read since open, while the notice is armed.
+    zero_samples: u64,
+}
+
+impl LiveDevice {
+    /// Fire the silence notice once `SILENCE_NOTICE_SAMPLES` exact zeros
+    /// have arrived since open; disarm it on the first non-zero sample.
+    fn watch_for_silence(&mut self, samples: &[f32]) {
+        if self.silence_notice.is_none() {
+            return;
+        }
+        if samples.iter().any(|&s| s != 0.0) {
+            self.silence_notice = None;
+            return;
+        }
+        self.zero_samples += samples.len() as u64;
+        if self.zero_samples >= SILENCE_NOTICE_SAMPLES {
+            if let Some(notice) = self.silence_notice.take() {
+                notice(&self.label);
+            }
+        }
+    }
 }
 
 /// A real audio source (device or file) converted to analytic Complex32,
@@ -105,10 +203,26 @@ impl AudioIqSource {
 
     /// Wrap a started live device: `read` waits up to `stall_timeout` for
     /// samples instead of reporting an empty ring as end of stream.
-    fn live(src: Box<dyn AudioSource>, stall_timeout: Duration) -> Result<Self> {
+    fn live(src: Box<dyn AudioSource>, label: String, stall_timeout: Duration) -> Result<Self> {
         let mut source = Self::new(src)?;
-        source.live = Some(LiveDevice { stall_timeout });
+        source.live = Some(LiveDevice {
+            label,
+            stall_timeout,
+            silence_notice: None,
+            zero_samples: 0,
+        });
         Ok(source)
+    }
+
+    /// Call `notice` once, with the device's quoted name, if the first two
+    /// seconds a live device delivers are all exact zeros -- on macOS the
+    /// usual sign of a denied microphone permission (MAN-131). A no-op for
+    /// file-backed sources: silent WAV fixtures are routine.
+    pub fn with_silence_notice(mut self, notice: SilenceNotice) -> Self {
+        if let Some(live) = &mut self.live {
+            live.silence_notice = Some(notice);
+        }
+        self
     }
 
     /// Attach the operator-supplied RF dial frequency the rig is tuned to
@@ -139,26 +253,41 @@ impl AudioIqSource {
 
     /// Open the named input device (default device if `None`). Requires the
     /// device's native rate to be exactly TARGET_RATE_HZ (48000) -- M1 does
-    /// not resample; see AudioIqSource::new for the rate-mismatch error.
+    /// not resample, and the rate is checked before the stream starts.
     ///
-    /// The returned source is live: `read` waits for samples and fails
-    /// after `DEVICE_STALL_TIMEOUT` of none (MAN-231).
+    /// Every failure names the device (as `manta devices` spells it, or
+    /// what was requested), states the 48000 Hz requirement and says what
+    /// to check next (MAN-131). The returned source is live: `read` waits
+    /// for samples and fails after `DEVICE_STALL_TIMEOUT` of none (MAN-231).
     pub fn from_device(name: Option<&str>) -> Result<Self> {
         use cpal::traits::{DeviceTrait, HostTrait};
         let device = match name {
-            Some(n) => coppa_audio::find_input_device_by_name(n)
-                .ok_or_else(|| anyhow!("no input device matching {n:?}"))?,
+            Some(n) => {
+                coppa_audio::find_input_device_by_name(n).ok_or_else(|| no_matching_input(n))?
+            }
             None => cpal::default_host()
                 .default_input_device()
-                .ok_or_else(|| anyhow!("no default input device"))?,
+                .ok_or_else(no_default_input)?,
+        };
+        let label = match device.description() {
+            Ok(description) => quoted_name(description.name()),
+            Err(_) => match name {
+                Some(n) => format!("matching {}", quoted_name(n)),
+                None => "(system default)".to_string(),
+            },
         };
         let native_rate = device
             .default_input_config()
-            .context("query device default input config")?
+            .context("query its default input config")
+            .map_err(|e| did_not_open(&label, &e))?
             .sample_rate();
-        let mut cpal_src = coppa_audio::CpalSource::from_device(device, native_rate, 8192)?;
-        cpal_src.start()?;
-        AudioIqSource::live(Box::new(cpal_src), DEVICE_STALL_TIMEOUT)
+        if native_rate != TARGET_RATE_HZ {
+            return Err(wrong_rate(&label, native_rate));
+        }
+        let mut cpal_src = coppa_audio::CpalSource::from_device(device, native_rate, 8192)
+            .map_err(|e| did_not_open(&label, &e))?;
+        cpal_src.start().map_err(|e| did_not_open(&label, &e))?;
+        AudioIqSource::live(Box::new(cpal_src), label, DEVICE_STALL_TIMEOUT)
     }
 
     /// Open a WAV file, replayed as an audio source (soak harness / `listen
@@ -190,6 +319,9 @@ impl IqSource for AudioIqSource {
         if got == 0 {
             return Ok(0);
         }
+        if let Some(live) = &mut self.live {
+            live.watch_for_silence(&real[..got]);
+        }
         let analytic = self.hilbert.process(&real[..got]);
         buf[..got].copy_from_slice(&analytic);
         Ok(got)
@@ -215,10 +347,7 @@ impl AudioIqSource {
                 return Ok(got);
             }
             if started.elapsed() >= live.stall_timeout {
-                bail!(
-                    "audio input delivered no samples in {} s at {TARGET_RATE_HZ} Hz",
-                    live.stall_timeout.as_secs_f64()
-                );
+                return Err(no_samples(&live.label, live.stall_timeout));
             }
             std::thread::sleep(DEVICE_POLL_INTERVAL);
         }
@@ -229,19 +358,21 @@ impl AudioIqSource {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
 
     /// A fake capture ring with the semantics of coppa's `CpalSource`: each
-    /// read pops the next scripted sample count (0 = empty ring); an
-    /// exhausted script reads as an empty ring forever, like a callback
-    /// that never fires.
+    /// read pops the next `(count, value)` (count 0 = empty ring) and fills
+    /// that many samples of `value`; an exhausted script reads as an empty
+    /// ring forever, like a callback that never fires.
     struct ScriptedRing {
-        script: VecDeque<usize>,
+        script: VecDeque<(usize, f32)>,
     }
 
     impl AudioSource for ScriptedRing {
         fn read(&mut self, buf: &mut [f32]) -> Result<usize> {
-            let n = self.script.pop_front().unwrap_or(0).min(buf.len());
-            buf[..n].fill(0.5);
+            let (count, value) = self.script.pop_front().unwrap_or((0, 0.0));
+            let n = count.min(buf.len());
+            buf[..n].fill(value);
             Ok(n)
         }
         fn sample_rate(&self) -> u32 {
@@ -255,18 +386,43 @@ mod tests {
         }
     }
 
-    fn scripted(script: &[usize], stall: Duration) -> AudioIqSource {
+    fn scripted(script: &[(usize, f32)], stall: Duration) -> AudioIqSource {
         let ring = ScriptedRing {
             script: script.iter().copied().collect(),
         };
-        AudioIqSource::live(Box::new(ring), stall).unwrap()
+        AudioIqSource::live(Box::new(ring), "\"Test Mic\"".to_string(), stall).unwrap()
+    }
+
+    /// A notice that records each name it is called with.
+    fn recording_notice() -> (SilenceNotice, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        (
+            Box::new(move |name: &str| sink.lock().unwrap().push(name.to_string())),
+            seen,
+        )
     }
 
     #[test]
     fn a_live_device_waits_out_an_empty_capture_ring() {
-        let mut aiq = scripted(&[0, 0, 0, 480], Duration::from_secs(1));
+        let mut aiq = scripted(
+            &[(0, 0.0), (0, 0.0), (0, 0.0), (480, 0.5)],
+            Duration::from_secs(1),
+        );
         let mut buf = vec![Complex32::new(0.0, 0.0); 1024];
         assert_eq!(aiq.read(&mut buf).unwrap(), 480);
+    }
+
+    #[test]
+    fn a_live_device_that_never_delivers_names_itself_the_rate_and_the_hint() {
+        let mut aiq = scripted(&[], Duration::from_millis(30));
+        let mut buf = vec![Complex32::new(0.0, 0.0); 1024];
+        let err = aiq.read(&mut buf).unwrap_err().to_string();
+        assert!(
+            err.contains("audio input \"Test Mic\" delivered no samples in 0.03 s at 48000 Hz -- "),
+            "{err}"
+        );
+        assert!(err.ends_with(audio_input_hint()), "{err}");
     }
 
     #[test]
@@ -277,10 +433,9 @@ mod tests {
         let started = Instant::now();
         let err = aiq.read(&mut buf).unwrap_err().to_string();
         let elapsed = started.elapsed();
-        assert!(err.contains("delivered no samples"), "{err}");
-        assert_eq!(
-            err,
-            "audio input delivered no samples in 0.05 s at 48000 Hz"
+        assert!(
+            err.contains("delivered no samples in 0.05 s at 48000 Hz"),
+            "{err}"
         );
         assert!(
             elapsed >= stall && elapsed < Duration::from_secs(1),
@@ -294,6 +449,111 @@ mod tests {
         let started = Instant::now();
         assert_eq!(aiq.read(&mut []).unwrap(), 0);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn digital_silence_notice_fires_once_after_two_seconds_of_exact_zeros() {
+        let (notice, seen) = recording_notice();
+        let mut aiq =
+            scripted(&[(4800, 0.0); 50], Duration::from_secs(1)).with_silence_notice(notice);
+        let mut buf = vec![Complex32::new(0.0, 0.0); 4800];
+        for read in 1..=50u64 {
+            assert_eq!(aiq.read(&mut buf).unwrap(), 4800);
+            let fired = seen.lock().unwrap().len();
+            // 20 reads x 4800 = 96 000 samples = 2 s at 48 kHz.
+            let expected = usize::from(read * 4800 >= 2 * TARGET_RATE_HZ as u64);
+            assert_eq!(fired, expected, "after read {read}");
+        }
+        assert_eq!(*seen.lock().unwrap(), ["\"Test Mic\""]);
+    }
+
+    #[test]
+    fn digital_silence_notice_never_fires_after_a_nonzero_sample() {
+        let (notice, seen) = recording_notice();
+        let mut script = vec![(4800, 1e-4)];
+        script.extend([(4800, 0.0); 50]);
+        let mut aiq = scripted(&script, Duration::from_secs(1)).with_silence_notice(notice);
+        let mut buf = vec![Complex32::new(0.0, 0.0); 4800];
+        for _ in 0..script.len() {
+            assert_eq!(aiq.read(&mut buf).unwrap(), 4800);
+        }
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_file_backed_source_ignores_a_silence_notice() {
+        let (notice, seen) = recording_notice();
+        let samples = vec![0.0; 5 * TARGET_RATE_HZ as usize];
+        let src: Box<dyn AudioSource> = Box::new(coppa_audio::WavSource::from_samples(
+            samples,
+            TARGET_RATE_HZ,
+        ));
+        let mut aiq = AudioIqSource::new(src).unwrap().with_silence_notice(notice);
+        let mut buf = vec![Complex32::new(0.0, 0.0); 4800];
+        while aiq.read(&mut buf).unwrap() > 0 {}
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_hint_names_the_macos_privacy_setting() {
+        let hint = audio_input_hint();
+        assert!(
+            hint.contains("System Settings > Privacy & Security > Microphone"),
+            "{hint}"
+        );
+        assert!(hint.contains("manta check"), "{hint}");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_hint_is_generic_off_macos() {
+        let hint = audio_input_hint();
+        assert!(hint.contains("manta check"), "{hint}");
+        assert!(!hint.contains("Privacy"), "{hint}");
+    }
+
+    #[test]
+    fn open_failure_messages_name_the_device_and_the_rate() {
+        assert_eq!(
+            no_matching_input("NoSuchCard").to_string(),
+            "no audio input matching \"NoSuchCard\" (manta needs a 48000 Hz input) -- \
+             run `manta devices` to list the inputs --device can select"
+        );
+        assert_eq!(
+            no_default_input().to_string(),
+            "no default audio input (manta needs a 48000 Hz input) -- \
+             run `manta devices` to list the inputs --device can select"
+        );
+        let rate = wrong_rate("\"Mic\"", 44_100).to_string();
+        assert!(
+            rate.starts_with(
+                "audio input \"Mic\" runs at 44100 Hz, but manta needs 48000 Hz \
+                 and does not resample -- set that input to 48000 Hz in "
+            ),
+            "{rate}"
+        );
+        assert!(
+            rate.ends_with(", or choose another with --device"),
+            "{rate}"
+        );
+        assert_eq!(
+            rate.contains("Audio MIDI Setup"),
+            cfg!(target_os = "macos"),
+            "{rate}"
+        );
+        assert_eq!(
+            did_not_open("\"Mic\"", &anyhow!("boom")).to_string(),
+            format!(
+                "audio input \"Mic\" did not open at 48000 Hz: boom -- {}",
+                audio_input_hint()
+            )
+        );
+        // A context chain is flattened onto the one line.
+        let chained = anyhow!("not available").context("query its default input config");
+        assert!(did_not_open("\"Mic\"", &chained).to_string().contains(
+            "did not open at 48000 Hz: query its default input config: not available -- "
+        ));
     }
 
     #[test]

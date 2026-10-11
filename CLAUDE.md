@@ -56,6 +56,13 @@ MAN-78: SIGHUP to a `[server]` daemon reloads `[spot]` lists and
 `cty_path`/`scp_path` and every other key need a restart. See
 docs/DECISIONS/2026-10-10-man78-live-reload.md.
 
+MAN-126: `manta doctor` runs named setup checks (config refusals, audio,
+server ports, clock via SNTP plus Linux `adjtimex`, RBN uplink TCP reach)
+before its signal check, prints PASS/WARN/FAIL/SKIP with a fix per problem,
+and exits 1 on any FAIL — see
+docs/DECISIONS/2026-10-10-man126-doctor-setup-checks.md and
+docs/RUNBOOKS/setup-checks.md.
+
 MAN-79: `--cty`/`--scp` and `[spot].cty_path`/`scp_path` override the
 vendored `cty.dat`/`master.scp` at run time. `run`/`listen`/`soak`/`doctor`/
 `config check` warn when the built-in `cty.dat` is more than 180 days old.
@@ -83,6 +90,11 @@ MAN-125: `manta devices` lists audio inputs and optional Soapy selectors;
 `manta check [SOURCE]` reports stream rate, input power and passband noise
 floor without decoding or services. See
 `docs/DECISIONS/2026-10-10-man125-source-diagnostics.md`.
+
+MAN-131: live audio reads wait for samples (5 s stall error naming the
+device, 48000 Hz and a macOS microphone-permission hint); digital-silence
+warning; `decode` warns without a sidecar and takes `--center-freq-hz` —
+see docs/DECISIONS/2026-10-11-man131-actionable-errors.md.
 
 MAN-138: JSON spots' `deGrid`/`deLat`/`deLon` are the operator's
 `[server].operator_grid` (its square's centre) or the new `operator_lat`/
