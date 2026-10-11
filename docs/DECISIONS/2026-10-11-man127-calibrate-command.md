@@ -46,7 +46,10 @@ adding to it.
    at least 6 dB, otherwise the status is `ambiguous`. The 25 Hz exclusion,
    rather than a few bins, comes from the prototype: keying sidebands pulled
    a keyed beacon's margin down to 7.6 dB with a ±5-bin exclusion. The
-   result is the first reference, in plan order, whose status is `measured`;
+   status is also `ambiguous` when that averaged peak lies more than 25 Hz
+   from the median of the valid segments' offsets: two carriers alternating
+   across segments can give the median one carrier and the margin the
+   other. The result is the first reference, in plan order, whose status is `measured`;
    the others print as cross-checks.
 4. **Report numbers.** `(±x ppm)` is the standard error of the median,
    `1.2533 × spread / √valid`, never printed below 0.01 ppm. `spread` is

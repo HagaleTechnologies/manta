@@ -196,6 +196,14 @@ impl CarrierEstimator {
         Some((runner as f64 - self.k_max as f64) * self.bin_hz())
     }
 
+    /// Offset (Hz, same frame as `SegmentEstimate::offset_hz`) of the
+    /// averaged spectrum's strongest bin; `None` before one segment
+    /// completes.
+    pub fn averaged_peak_offset_hz(&self) -> Option<f64> {
+        let (peak, _) = self.ambiguity_bins()?;
+        Some((peak as f64 - self.k_max as f64) * self.bin_hz())
+    }
+
     fn bin_hz(&self) -> f64 {
         self.fs_dec / self.seg_len as f64
     }

@@ -13,7 +13,7 @@
 // docs/DECISIONS/2026-10-11-man127-calibrate-command.md.
 
 use anyhow::{anyhow, bail, Result};
-use manta_dsp::carrier::{CarrierEstimator, MIN_HALF_WIDTH_HZ};
+use manta_dsp::carrier::{CarrierEstimator, AMBIGUITY_EXCLUSION_HZ, MIN_HALF_WIDTH_HZ};
 use manta_input::IqSource;
 use num_complex::Complex32;
 use std::time::{Duration, Instant};
@@ -545,6 +545,17 @@ fn evaluate(p: &PlannedReference, est: &CarrierEstimator) -> Result<ReferenceRes
         out.runner_up_offset_hz = est.ambiguity_runner_up_offset_hz();
         return Ok(out);
     }
+    // The margin is the averaged spectrum's; the estimate is the segments'
+    // median. When they point at different carriers (two alternating across
+    // segments), the margin says nothing about the carrier measured.
+    if let Some(averaged) = est.averaged_peak_offset_hz() {
+        if (averaged - offset).abs() > AMBIGUITY_EXCLUSION_HZ {
+            out.status = ReferenceStatus::Ambiguous;
+            out.peak_offset_hz = Some(offset);
+            out.runner_up_offset_hz = Some(averaged);
+            return Ok(out);
+        }
+    }
     let deviations: Vec<f64> = offsets.iter().map(|o| (o - offset).abs()).collect();
     let spread = 1.4826 * median(&deviations);
     let measured = p.reference.hz + offset;
@@ -961,6 +972,42 @@ mod tests {
         assert_eq!(r.status, ReferenceStatus::Ambiguous, "{r:?}");
         assert!(r.ambiguity_margin_db.unwrap() < MIN_AMBIGUITY_MARGIN_DB);
         assert!(r.runner_up_offset_hz.is_some());
+        assert_eq!(report.result(), None);
+    }
+
+    #[test]
+    fn alternating_carriers_where_the_median_and_the_spectrum_disagree_are_ambiguous() {
+        // 11 one-second segments of a weak interferer 180 Hz up and 10 of
+        // the reference 12 dB stronger: the median picks the interferer,
+        // while the averaged spectrum's peak is the reference.
+        let secs = 21.0;
+        let mut s = carrier(PPM_2_5_HZ, CENTRE, secs, |t| {
+            if !(t as u64).is_multiple_of(2) {
+                4.0
+            } else {
+                0.0
+            }
+        });
+        let other = carrier(PPM_2_5_HZ + 180.0, CENTRE, secs, |t| {
+            if (t as u64).is_multiple_of(2) {
+                1.0
+            } else {
+                0.0
+            }
+        });
+        add(&mut s, &other);
+        let report = calibrate(
+            source(with_noise(s, 9), CENTRE),
+            &only(10e6, ReferenceKind::TimeStandard),
+            &opts(21),
+        )
+        .unwrap();
+        let r = &report.references[0];
+        assert_eq!(r.status, ReferenceStatus::Ambiguous, "{r:?}");
+        assert!(
+            r.ambiguity_margin_db.unwrap() >= MIN_AMBIGUITY_MARGIN_DB,
+            "{r:?}"
+        );
         assert_eq!(report.result(), None);
     }
 
