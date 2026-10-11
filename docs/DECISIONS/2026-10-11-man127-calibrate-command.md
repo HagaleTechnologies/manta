@@ -127,7 +127,10 @@ adding to it.
     POSIX access ACL, or remove the one it took from the directory's default
     ACL when the original has none, because copying the mode would unmask
     that ACL's named entries; copy the mode; validate the temp file with
-    `config::load`; then rename it over the target. If the Unix owner, the
+    `config::load` and the process's `MANTA_*` overlay (a file may rely on
+    it, as `run` does), minus `MANTA_INPUT_FREQ_CORRECTION_PPM`, which would
+    mask the new value; re-read the target and stop if it changed; then
+    rename it over the target. If the Unix owner, the
     Linux or macOS ACL or the Windows DACL cannot be kept, the save fails and names
     the value to set by hand. (Windows keeps the DACL, not the owner: the
     saved file belongs to whoever ran calibrate. Other ACL kinds, such as

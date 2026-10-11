@@ -2,6 +2,7 @@
 //! while keeping every other byte, then validates the result with the real
 //! loader and atomically replaces the file.
 
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -121,10 +122,25 @@ impl ReadBefore {
 /// target holding exactly that text: `calibrate` passes what it read before
 /// measuring, so a config rewritten or retargeted during the measurement
 /// (possibly describing another receiver) is never given that measurement.
+/// The edited file is validated with this process's `MANTA_*` overlay (a
+/// file can rely on it, as `run` and `calibrate` do), minus the ppm
+/// variable, which would mask the value just written.
 pub(crate) fn save_freq_correction_ppm(
     path: &Path,
     ppm: f64,
     expected: Option<&ReadBefore>,
+) -> Result<Option<f64>> {
+    let vars: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    save_with_env(path, ppm, expected, &vars)
+}
+
+const PPM_ENV_VAR: &str = "MANTA_INPUT_FREQ_CORRECTION_PPM";
+
+fn save_with_env(
+    path: &Path,
+    ppm: f64,
+    expected: Option<&ReadBefore>,
+    vars: &[(OsString, OsString)],
 ) -> Result<Option<f64>> {
     let target = fs::canonicalize(path)
         .with_context(|| format!("cannot resolve config file {}", path.display()))?;
@@ -202,8 +218,13 @@ pub(crate) fn save_freq_correction_ppm(
         .with_context(|| format!("setting the permissions of {}", temp.display()))?;
     drop(file);
 
+    let vars: Vec<(OsString, OsString)> = vars
+        .iter()
+        .filter(|(k, _)| k != PPM_ENV_VAR)
+        .cloned()
+        .collect();
     let loaded =
-        crate::config::load(Some(&temp), crate::config::Env::Ignore).with_context(|| {
+        crate::config::load(Some(&temp), crate::config::Env::Read(&vars)).with_context(|| {
             format!(
                 "{} left unchanged: the edited file does not load",
                 target.display()
@@ -601,6 +622,25 @@ mod tests {
         assert!(format!("{err:#}").contains("left unchanged"), "{err:#}");
         assert_eq!(fs::read_to_string(&bad).unwrap(), bad_body);
         assert_eq!(entries(dir.path()), ["bad.toml", "manta.toml"]);
+    }
+
+    #[test]
+    fn save_validates_with_the_environment_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        // Valid only with the environment's station callsign.
+        let p = write(dir.path(), "manta.toml", "[input]\n\n[server]\n");
+        let var = |k: &str, v: &str| (OsString::from(k), OsString::from(v));
+        assert!(save_with_env(&p, -1.42, None, &[]).is_err());
+        let vars = [
+            var("MANTA_SERVER_STATION_CALLSIGN", "W1AW"),
+            // Ignored: it would mask the value just written.
+            var(PPM_ENV_VAR, "3.0"),
+        ];
+        assert_eq!(save_with_env(&p, -1.42, None, &vars).unwrap(), None);
+        assert_eq!(
+            fs::read_to_string(&p).unwrap(),
+            "[input]\nfreq_correction_ppm = -1.42\n\n[server]\n"
+        );
     }
 
     #[test]
