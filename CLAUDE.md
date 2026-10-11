@@ -93,6 +93,13 @@ MAN-172: high-SNR track churn fixed in `TrackManager` (local-peak spawn
 rule, incumbent-wins merge ties); VR3/VR4 pass, VR1/VR2 pass CER but not
 WPM. See docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md.
 
+MAN-90: the direct `[[rbn_uplink]]` is experimental (docs, a `config check`
+note, and the live-transmit WARN lines); the Aggregator path is the supported
+route into RBN. Claims C1–C7 stay open until a consenting Aggregator
+operator's capture — see
+docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md and
+docs/RUNBOOKS/aggregator-rbn-capture.md.
+
 ## Documents (read in this order)
 
 - `README.md` — goals and non-goals

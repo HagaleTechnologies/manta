@@ -477,6 +477,27 @@ fn check_notes_go_to_stderr_and_do_not_change_the_exit_code() {
     );
 }
 
+/// MAN-90: an enabled uplink gets a stderr note that it is experimental; the
+/// exit code and stdout summary are unchanged.
+#[test]
+fn check_notes_that_an_enabled_uplink_is_experimental() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cfg(
+        dir.path(),
+        "manta.toml",
+        "[server]\nstation_callsign = \"W1AW\"\n\
+         [[rbn_uplink]]\nenabled = true\ntarget_host = \"a.example.org\"\ntarget_port = 7000\n",
+    );
+    let o = check_file(&path);
+    let out = succeeds(&o);
+    assert!(!out.contains("experimental"), "{out}");
+    let err = stderr(&o);
+    assert!(
+        err.contains("note: [[rbn_uplink]] is experimental"),
+        "{err}"
+    );
+}
+
 // ---- Scenario 3: a fresh config is scaffolded
 
 fn init_in(dir: &Path, args: &[&str]) -> Output {

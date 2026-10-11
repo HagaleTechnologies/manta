@@ -7,14 +7,15 @@ receiver. Run them from the manta source checkout or an extracted release kit.
 Replace every `<...>` placeholder before running a command; omit the angle brackets.
 
 What this guide does not do: it does not get you admitted to the Reverse Beacon
-Network. The RBN team admits skimmers, and manta's uplink has not yet been verified
-against a real RBN ingest. See [Outputs](../../README.md#outputs).
-Arrange a collector and login with its operator before step 5.
-
-One manta process covers one receiver passband on one band. To feed an RBN
-Aggregator as a secondary skimmer, use the
+Network. The RBN team admits skimmers. The supported route into RBN is an RBN
+Aggregator reading manta's telnet server: follow steps 1–4 here, then the
 [secondary-skimmer field-node runbook](../RUNBOOKS/secondary-skimmer-field-node.md),
-which includes the private soak and spot-quality checks required for that path.
+which adds the private soak and spot-quality checks that path requires. Step 5's
+direct uplink is experimental. Its login and spot format are unverified against
+RBN's real ingest, so this guide keeps it in dry-run. Arrange a collector and
+login with its operator before step 5.
+
+One manta process covers one receiver passband on one band.
 
 ## 1. Install manta
 
@@ -115,7 +116,7 @@ It prints `manta.toml: valid (from --config)` and the resolved settings. Check t
 override both. Validation does not contact the receiver. The full captured output
 below includes the uplink added in step 5; before that, your uplink line differs.
 `W5AU`, `kiwi.example.net` and `collector.example.net` are substituted example
-values, not a receiver or collector to connect to. The final note is on stderr.
+values, not a receiver or collector to connect to. The final notes are on stderr.
 
 ```console
 $ manta config check --config manta.toml
@@ -127,7 +128,9 @@ input: type=kiwi host=kiwi.example.net port=8073 freq_hz=7030000 password=none
 spot: allowlist=none blocklist_path=none notch_path=none cty_path=bundled scp_path=bundled
 detector: defaults
 decode: engine=legacy (other keys default)
+note: JSON spots will carry no station position (deGrid, deLat and deLon are null) -- set [server].operator_grid, or operator_lat and operator_lon
 note: the telnet and JSON servers listen on every network interface (bind_addr = "0.0.0.0"), as a public cluster node does -- set bind_addr = "127.0.0.1" to keep them local
+note: [[rbn_uplink]] is experimental -- its login and spot format are unverified against RBN's real ingest; to reach RBN today, let an RBN Aggregator read this node's telnet server (docs/RUNBOOKS/secondary-skimmer-field-node.md)
 ```
 
 Before the first run on an internet-reachable host, apply the firewall in step 6.
@@ -181,7 +184,9 @@ before arranging live forwarding.
 Stop the foreground daemon with Ctrl+C. Append this block to `manta.toml`, replacing
 the host and port with the collector operator's values. The login defaults to
 `station_callsign`; if the collector assigned a different login, set
-`login_callsign` in this block to that callsign.
+`login_callsign` in this block to that callsign. The uplink is experimental (see
+[the MAN-90 record](../DECISIONS/2026-10-11-man90-uplink-protocol-verification.md));
+do not point it at an RBN server.
 
 ```toml
 [[rbn_uplink]]
@@ -219,7 +224,8 @@ targets. Dry-run does not suppress local telnet or JSON spots.
 ### Going live
 
 Keep dry-run on for the rest of this tutorial. Only after the collector's operator
-agrees to accept your spots, set `dry_run = false`. For the service in step 7, edit
+agrees to accept your spots and confirms their collector expects manta's login and
+`DX de` lines, set `dry_run = false`. For the service in step 7, edit
 `/etc/manta/manta.toml`, validate it with
 `sudo manta config check --config /etc/manta/manta.toml`, then run
 `sudo systemctl restart manta`. The kit uses `LoadCredential`, so

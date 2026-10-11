@@ -1184,3 +1184,121 @@ fn architecture_logging_bullet_is_current() {
         "ARCHITECTURE.md never says --log-format json"
     );
 }
+
+// ---- MAN-90 ----
+
+const MAN90_DECISION: &str = "docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md";
+const MAN90_RUNBOOK: &str = "docs/RUNBOOKS/aggregator-rbn-capture.md";
+/// Same literal as uplink_acceptance.rs's MAN90_REFERENCE_SPOT (minus CRLF):
+/// the decision record must quote the bytes the uplink really writes.
+const MAN90_REFERENCE_SPOT: &str =
+    "DX de W3XYZ-#:  14027.10  JA1ABC         CW    30 dB  28 WPM  CQ      2213Z";
+
+/// MAN-90: the decision record lists every open claim, quotes the uplink's
+/// real bytes, and it and the capture runbook link each other.
+#[test]
+fn man90_records_list_every_open_claim_and_link_each_other() {
+    let decision = doc(MAN90_DECISION);
+    let runbook = doc(MAN90_RUNBOOK);
+    for id in ["C1", "C2", "C3", "C4", "C5", "C6", "C7"] {
+        assert!(
+            decision.contains(&format!("| {id} |")),
+            "decision record has no {id} row"
+        );
+        assert!(runbook.contains(id), "capture runbook never mentions {id}");
+    }
+    assert!(
+        decision.contains(MAN90_REFERENCE_SPOT),
+        "decision record misquotes the uplink's bytes"
+    );
+    assert!(decision.contains("aggregator-rbn-capture.md"));
+    assert!(runbook.contains("2026-10-11-man90-uplink-protocol-verification.md"));
+    assert!(
+        runbook.contains("\n## Captures"),
+        "runbook has no Captures log"
+    );
+}
+
+/// MAN-90: every relative link in the two records resolves.
+#[test]
+fn man90_records_relative_links_resolve() {
+    // Same link grammar as operator_guides.rs::guide_relative_links_resolve.
+    let link = regex::Regex::new(r#"\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)"#).unwrap();
+    for rel in [MAN90_DECISION, MAN90_RUNBOOK] {
+        let base = repo_root().join(rel).parent().unwrap().to_path_buf();
+        let mut checked = 0;
+        for cap in link.captures_iter(&doc(rel)) {
+            let target = &cap[1];
+            if target.starts_with("http")
+                || target.starts_with('#')
+                || target.starts_with("mailto:")
+            {
+                continue;
+            }
+            let path = target.split('#').next().unwrap();
+            assert!(base.join(path).exists(), "{rel}: broken link {target}");
+            checked += 1;
+        }
+        assert!(checked > 0, "{rel}: no relative links checked");
+    }
+}
+
+/// MAN-90: README calls the uplink experimental everywhere it offers it, and
+/// "Run it as a node" names the Aggregator route before the uplink block.
+#[test]
+fn readme_marks_the_uplink_experimental_and_leads_with_the_aggregator_route() {
+    let readme = doc("README.md");
+    let outputs = squash_whitespace(section(&readme, "Outputs"));
+    for needle in [
+        "**Outbound RBN uplink (experimental)**",
+        "**Experimental.**",
+        "supported route into RBN",
+        MAN90_DECISION,
+        MAN90_RUNBOOK,
+    ] {
+        assert!(
+            outputs.contains(needle),
+            "README Outputs never says `{needle}`"
+        );
+    }
+    let node = squash_whitespace(section(&readme, "Run it as a node"));
+    let aggregator = node
+        .find("RBN Aggregator")
+        .expect("Run it as a node never names the Aggregator route");
+    let uplink = node
+        .find("`[[rbn_uplink]]`")
+        .expect("Run it as a node never names the uplink block");
+    assert!(
+        aggregator < uplink,
+        "Run it as a node offers the uplink before the Aggregator route"
+    );
+    assert!(
+        node.contains("experimental"),
+        "Run it as a node never calls the uplink experimental"
+    );
+    let status = squash_whitespace(section(&readme, "Status"));
+    assert!(
+        status.contains("outbound RBN uplink is experimental"),
+        "README Status"
+    );
+}
+
+/// MAN-90: ARCHITECTURE §7 enumerates the uplink as an output surface.
+#[test]
+fn architecture_output_layer_describes_the_experimental_uplink() {
+    let s7 = squash_whitespace(section(&doc("ARCHITECTURE.md"), "7. Output layer"));
+    for needle in [
+        "**Outbound RBN uplink (experimental)**",
+        "`uplink.rs`",
+        "Aggregator",
+        MAN90_DECISION,
+    ] {
+        assert!(s7.contains(needle), "ARCHITECTURE §7 never says `{needle}`");
+    }
+}
+
+/// MAN-90: no uplink example names an RBN server as its target.
+#[test]
+fn uplink_health_runbook_example_is_not_an_rbn_server() {
+    assert!(!doc("docs/RUNBOOKS/uplink-health.md").contains("reversebeacon.net"));
+}
