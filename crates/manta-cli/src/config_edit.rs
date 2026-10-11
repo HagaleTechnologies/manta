@@ -80,7 +80,7 @@ fn replace(old: &mut Value, ppm: f64) -> Result<Option<f64>> {
 }
 
 /// The value as `set_freq_correction_ppm` writes it, e.g. `-1.42`.
-fn literal(ppm: f64) -> String {
+pub(crate) fn literal(ppm: f64) -> String {
     let ppm = if ppm == 0.0 { 0.0 } else { ppm };
     Value::from(ppm).to_string().trim().to_string()
 }
@@ -235,8 +235,9 @@ fn save_with_env(
     let got = loaded.input.shared.freq_correction_ppm;
     ensure!(
         got == Some(ppm),
-        "{} left unchanged: the edited file reads {KEY} = {got:?}, expected {}",
+        "{} left unchanged: the edited file reads {KEY} = {}, expected {}",
         target.display(),
+        got.map_or_else(|| "nothing".to_string(), literal),
         literal(ppm)
     );
     // Re-check right before the replace, so an edit made while the temp

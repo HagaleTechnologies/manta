@@ -1688,14 +1688,14 @@ fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
 fn parse_reference_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
-        .map_err(|e| format!("invalid --reference-hz {s:?}: {e}"))?;
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
     check_dial_freq_hz("--reference-hz", hz)
 }
 
 fn parse_tune_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
-        .map_err(|e| format!("invalid --tune-hz {s:?}: {e}"))?;
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
     check_dial_freq_hz("--tune-hz", hz)
 }
 
@@ -1703,7 +1703,7 @@ fn parse_search_ppm(s: &str) -> std::result::Result<f64, String> {
     use manta_engine::calibrate::{MAX_SEARCH_PPM, MIN_SEARCH_PPM};
     let ppm: f64 = s
         .parse()
-        .map_err(|e| format!("invalid --search-ppm {s:?}: {e}"))?;
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
     if !ppm.is_finite() || !(MIN_SEARCH_PPM..=MAX_SEARCH_PPM).contains(&ppm) {
         return Err(format!(
             "--search-ppm must be between {MIN_SEARCH_PPM} and {MAX_SEARCH_PPM}, got {s}"

@@ -505,7 +505,9 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
             args.json,
             interactive,
         );
-        let run_hint = format!("pass --freq-correction-ppm {value:?} to manta run");
+        // The TOML literal, as saved: `2.0`, never `2`.
+        let value_lit = config_edit::literal(value);
+        let run_hint = format!("pass --freq-correction-ppm {value_lit} to manta run");
         let outcome = match (decision, config_path.as_deref()) {
             (SaveDecision::Save, Some(path)) => Some(save(
                 path,
@@ -516,7 +518,7 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
             )),
             (SaveDecision::Ask, Some(path)) => {
                 let prompt = format!(
-                    "Save freq_correction_ppm = {value:?} to [input] in {}?",
+                    "Save freq_correction_ppm = {value_lit} to [input] in {}?",
                     path.display()
                 );
                 if confirm(
@@ -537,7 +539,7 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
             }
             (SaveDecision::Skip, _) => None,
             (SaveDecision::AlreadySet, Some(path)) => Some(format!(
-                "not saved: {} already has freq_correction_ppm = {value:?}",
+                "not saved: {} already has freq_correction_ppm = {value_lit}",
                 path.display()
             )),
             (SaveDecision::Overridden(list), Some(path)) => Some(format!(
@@ -585,19 +587,20 @@ fn save(
     written: &mut bool,
     save_error: &mut Option<anyhow::Error>,
 ) -> String {
+    let value_lit = config_edit::literal(value);
     match config_edit::save_freq_correction_ppm(path, value, read_before) {
         Ok(previous) => {
             *written = true;
             format!(
-                "saved: freq_correction_ppm = {value:?} in [input] of {} (was {}); restart manta \
+                "saved: freq_correction_ppm = {value_lit} in [input] of {} (was {}); restart manta \
                  to apply it",
                 path.display(),
-                previous.map_or("not set".to_string(), |p| format!("{p:?}"))
+                previous.map_or_else(|| "not set".to_string(), config_edit::literal)
             )
         }
         Err(e) => {
             *save_error = Some(e.context(format!(
-                "could not save freq_correction_ppm = {value:?}; set it in [input] of {} by hand",
+                "could not save freq_correction_ppm = {value_lit}; set it in [input] of {} by hand",
                 path.display()
             )));
             "not saved: the config file could not be written".to_string()
