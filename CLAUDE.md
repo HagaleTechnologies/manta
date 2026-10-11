@@ -106,6 +106,10 @@ docs/DECISIONS/2026-10-11-man149-docs-reference-and-index.md.
 MAN-172: high-SNR track churn fixed in `TrackManager` (local-peak spawn
 rule, incumbent-wins merge ties); VR3/VR4 pass, VR1/VR2 pass CER but not
 WPM. See docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md.
+MAN-269: `run --realtime`/`--loop` (`input.realtime`/`input.loop`) pace and
+loop file replay so a hardware-free replay can feed telnet/JSON clients; IQ
+WAVs declaring more than 10 MS/s are rejected at open — see
+docs/DECISIONS/2026-10-10-man269-paced-looping-replay.md.
 
 ## Documents (read in this order)
 
