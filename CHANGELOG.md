@@ -37,11 +37,9 @@ acceptance gates.
 
 ### Added
 
-<<<<<<< HEAD
 - Prebuilt archives for Linux (x86-64, arm64), macOS (x86-64, arm64) and
   Windows (x86-64) on each GitHub Release, with `SHA256SUMS` and a
   build-provenance attestation (MAN-298).
-=======
 - `manta doctor` checks the whole setup before its signal check: the config
   (`manta run`'s example-callsign and dial-frequency refusals), the audio
   library and sound-card inputs, that each `[server]` port is free, the
@@ -58,7 +56,6 @@ acceptance gates.
   for a held port, an unreachable uplink, a clock 60 s or more off, the
   example callsign, or a missing dial frequency with `[server]`. The signal
   verdict still does not change the exit code.
->>>>>>> 5346c333efd8eb6c9704b2218523f539e3c68b1a
 - Operator guides for [running an RBN node](docs/GUIDES/rbn-node.md),
   [KiwiSDR etiquette](docs/GUIDES/kiwisdr.md), and
   [Raspberry Pi installation and service setup](docs/GUIDES/raspberry-pi.md) (MAN-148).
