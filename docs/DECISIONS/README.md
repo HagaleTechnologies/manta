@@ -15,6 +15,7 @@ Add a row here in the same change that adds a record:
 | 2026-10-11 | MAN-149 | [MAN-149: config, metrics and spot-schema references, and a docs index](2026-10-11-man149-docs-reference-and-index.md) |
 | 2026-10-11 | MAN-138 | [MAN-138: a JSON spot's `deGrid`/`deLat`/`deLon` are the configured station position](2026-10-11-man138-station-location.md) |
 | 2026-10-11 | MAN-131 | [MAN-131: errors say what to check next](2026-10-11-man131-actionable-errors.md) |
+| 2026-10-11 | MAN-93 | [MAN-93: a configurable heard-time window for `sh/dx` history](2026-10-11-man93-sh-dx-history-window.md) |
 | 2026-10-10 | MAN-126 | [MAN-126: `manta doctor` checks the whole setup and names each failing check](2026-10-10-man126-doctor-setup-checks.md) |
 | 2026-10-10 | MAN-92 | [MAN-92: telnet replies for unknown commands, `sh/version`, scoped `sh/dx`](2026-10-10-man92-telnet-commands.md) |
 | 2026-10-10 | MAN-91 | [MAN-91: the RBN uplink forwards CQ and beacon spots by default](2026-10-10-man91-uplink-spot-type-filter.md) |
