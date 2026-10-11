@@ -269,6 +269,12 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
     reject_constant_only_keys(&doc, &origin)?;
 
     let server = take_typed::<ServerConfig>(&doc, "server", &origin, &overlay)?;
+    // MAN-138: the location keys' cross-key rules, before any source or
+    // listener opens (the same point `[input]`'s `validate_input` runs).
+    if let Some(s) = &server {
+        s.station_location()
+            .map_err(|e| anyhow!("{origin}: [server]: {e}{}", overlay.suffix("server")))?;
+    }
     let rbn_uplink = take_uplinks(&doc, &origin)?;
     if !rbn_uplink.is_empty() && server.is_none() {
         bail!(
@@ -790,6 +796,62 @@ mod tests {
         let err = format!("{:#}", load(Some(f.path()), Env::Ignore).unwrap_err());
         assert!(err.contains("telnet_port"), "{err}");
         assert!(err.contains(&f.path().display().to_string()), "{err}");
+    }
+
+    /// MAN-138: the numeric location keys load from the file and from
+    /// `MANTA_SERVER_*`, TOML-probed like every other number.
+    #[test]
+    fn server_location_keys_load_from_the_file_and_the_environment() {
+        let body = format!("{SERVER}operator_lat = 41.714775\n");
+        let loaded = load_env(Some(&body), &[("MANTA_SERVER_OPERATOR_LON", "-72.72726")]).unwrap();
+        let server = loaded.server.unwrap();
+        assert_eq!(server.operator_lat, Some(41.714775));
+        assert_eq!(server.operator_lon, Some(-72.72726));
+
+        let loaded = load_env(
+            Some(SERVER),
+            &[
+                ("MANTA_SERVER_OPERATOR_LAT", "41"),
+                ("MANTA_SERVER_OPERATOR_LON", "-72.72726"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(loaded.server.unwrap().operator_lat, Some(41.0));
+    }
+
+    #[test]
+    fn an_inconsistent_station_location_is_rejected_before_io() {
+        for (keys, message) in [
+            (
+                "operator_lat = 41.7\n",
+                "operator_lat is set but operator_lon is not",
+            ),
+            (
+                "operator_lon = -72.7\n",
+                "operator_lon is set but operator_lat is not",
+            ),
+            (
+                "operator_grid = \"FN31pr\"\noperator_lat = 40.0\noperator_lon = -74.0\n",
+                "is outside operator_grid \"FN31pr\"",
+            ),
+        ] {
+            let f = write_cfg(&format!("{SERVER}{keys}"));
+            let err = format!("{:#}", load(Some(f.path()), Env::Ignore).unwrap_err());
+            assert!(
+                err.starts_with(&format!("{}: [server]: ", f.path().display())),
+                "{err}"
+            );
+            assert!(err.contains(message), "{err}");
+        }
+        // A variable that supplied the value is named, as for typed errors.
+        let err = format!(
+            "{:#}",
+            load_env(Some(SERVER), &[("MANTA_SERVER_OPERATOR_LAT", "41.7")]).unwrap_err()
+        );
+        assert!(
+            err.contains("(environment: MANTA_SERVER_OPERATOR_LAT)"),
+            "{err}"
+        );
     }
 
     #[test]

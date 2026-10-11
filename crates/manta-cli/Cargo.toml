@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
 
 [[bin]]
 name = "manta"
@@ -33,6 +37,13 @@ tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "io-ut
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+# MAN-78: SIGTERM, and SIGHUP (reload with a [server] table, drain
+# without one); ctrlc keeps SIGINT and Windows' console events.
+[target.'cfg(unix)'.dependencies]
+signal-hook = { workspace = true }
+# MAN-78: `pthread_sigmask`, to keep a daemon's SIGHUP off the decode thread.
+libc = { workspace = true }
 
 [dev-dependencies]
 coppa-audio = { workspace = true }

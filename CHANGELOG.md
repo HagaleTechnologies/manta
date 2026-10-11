@@ -23,18 +23,42 @@ git history and `docs/DECISIONS/`.
 
 ### Added
 
+- Operator guides for [running an RBN node](docs/GUIDES/rbn-node.md),
+  [KiwiSDR etiquette](docs/GUIDES/kiwisdr.md), and
+  [Raspberry Pi installation and service setup](docs/GUIDES/raspberry-pi.md) (MAN-148).
+
 - `manta run` takes `-v`/`-vv` and `-q`/`-qq`/`-qqq` and
   `--log-level <LEVEL>`, each shorthand for `RUST_LOG=<level>` that
   overrides it, and `--log-format json`, which writes every stderr log line
   as one JSON object for a log aggregator (MAN-124).
+<<<<<<< HEAD
 - `manta decode --center-freq-hz HZ` sets the recording's RF centre
   frequency, overriding its `<name>.json` sidecar. Without the flag, a
   recording with no sidecar (or a sidecar whose `center_freq_hz` is not
   positive) gets a warning that its frequencies are baseband offsets,
   and is decoded at a 0.0 centre (MAN-131).
+=======
+- Contributor setup and review guidance, bug and hardware report templates,
+  feature requests, and a MAN-linked pull request template (MAN-151).
+
+### Fixed
+
+- `manta run`'s log lines carry no colour escape codes when stderr is not a
+  terminal (a file, a pipe, the journal or a container log); `NO_COLOR` is
+  still honoured on a terminal (MAN-124).
+- `manta run`/`listen`/`soak`/`doctor --device` keep running when the
+  sound card's capture buffer is momentarily empty, instead of stopping
+  with exit 0 or `audio source ended during startup calibration`. A device
+  that delivers nothing for 5 s is reported as an error (MAN-231).
+>>>>>>> 73a7bf64bb59a2838a29becdfb4418b0fd6ae277
 
 ### Changed
 
+- JSON spots' `deGrid`/`deLat`/`deLon` are the operator's configured
+  station position (`[server].operator_grid`, or the new `operator_lat`/
+  `operator_lon`), and `null` when none is configured, instead of the
+  station's country centroid from `cty.dat` (MAN-138). Decoder output is
+  unchanged.
 - `manta --version` (and `-V`) names the exact build: crate version, git
   commit and compiled-in features, for example
   `manta 0.1.0 (git 1a2b3c4d5e6f; features: hpsdr)` (MAN-83).
