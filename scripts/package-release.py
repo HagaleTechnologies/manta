@@ -43,6 +43,20 @@ ASSETS = (
     "packaging/launchd/create-service-account.sh",
     "packaging/launchd/rotate-log.sh",
     "docs/RUNBOOKS/network-exposure.md",
+    # MAN-148: the service kit links the operator guides. Keep their direct
+    # relative-link targets available when reading an extracted release too.
+    "docs/GUIDES/rbn-node.md",
+    "docs/GUIDES/kiwisdr.md",
+    "docs/GUIDES/raspberry-pi.md",
+    "docs/RUNBOOKS/node-health.md",
+    "docs/RUNBOOKS/uplink-health.md",
+    "docs/RUNBOOKS/release.md",
+    "docs/RUNBOOKS/secondary-skimmer-field-node.md",
+    "docs/RUNBOOKS/m2-pi4-cpu-budget.md",
+    "docs/DECISIONS/2026-07-25-m2-kiwisdr-input-pins.md",
+    "docs/DECISIONS/2026-09-06-broad-review-decisions.md",
+    "docs/SPEC-decode-core.md",
+    "rust-toolchain.toml",
 )
 
 FORMATS = {"tar.gz": ".tar.gz", "zip": ".zip"}

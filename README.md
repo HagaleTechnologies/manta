@@ -161,6 +161,8 @@ flag entirely when yours is on 8073:
 manta listen --kiwi-host <your-kiwi-host> --kiwi-port <your-kiwi-port> --kiwi-freq-hz 7030000
 ```
 
+Someone else's KiwiSDR is shared: read [docs/GUIDES/kiwisdr.md](docs/GUIDES/kiwisdr.md) before you leave manta connected to one.
+
 File replay (`listen --source`) takes 48 kHz mono audio, or a raw complex-IQ
 WAV with `--source-iq`. IQ replay is not resampled: the channelizer runs
 only at its table rates — any rate whose `fs / 93.75` is a power of two,
@@ -180,6 +182,8 @@ below is being worked on.
 `manta --help` lists every subcommand and flag.
 
 ## Run it as a node
+
+For a step-by-step walk from install to a firewalled node with the uplink in dry-run, follow [docs/GUIDES/rbn-node.md](docs/GUIDES/rbn-node.md).
 
 One TOML file describes a node: the station and servers in `[server]`, the
 receiver in `[input]`. With a `[server]` table, `run --config` starts the
@@ -543,7 +547,10 @@ criteria.
 
 ## Documentation
 
-**Running a node:** [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
+**Running a node:** [docs/GUIDES/rbn-node.md](docs/GUIDES/rbn-node.md)
+(from install to a running node) · [docs/GUIDES/kiwisdr.md](docs/GUIDES/kiwisdr.md)
+(KiwiSDR etiquette) · [docs/GUIDES/raspberry-pi.md](docs/GUIDES/raspberry-pi.md)
+(Pi install and service) · [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 (exposing the servers safely) · the "Run it as a node" section above ·
 [packaging/README.md](packaging/README.md) (running unattended under
 systemd, launchd or Docker Compose) ·
