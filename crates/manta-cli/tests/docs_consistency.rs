@@ -1340,6 +1340,70 @@ fn man90_runbook_keeps_every_endpoint_aggregator_uses() {
     );
 }
 
+/// MAN-90: `ip.addr == <address>` keeps every packet to or from that address,
+/// whichever program sent it, so a browser open on an RBN page that shares the
+/// address would pass step 5 and could be read as Aggregator's connection.
+/// Steps 1 and 3 must note each connection's ports, and step 5 must pair every
+/// `ip.addr`/`ipv6.addr` term with ports, then check the Conversations list.
+/// Checks text, not Wireshark behaviour.
+#[test]
+fn man90_runbook_exports_only_aggregators_connections() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let operator = squash_whitespace(section(&runbook, "Operator steps"));
+    let step = |start: &str, end: &str| -> String {
+        let from = operator
+            .find(start)
+            .unwrap_or_else(|| panic!("Operator steps have no `{start}` step"));
+        let to = operator[from..]
+            .find(end)
+            .map_or(operator.len(), |i| from + i);
+        operator[from..to].to_string()
+    };
+    let find = step("1. **Find", "2. **");
+    let restart = step("3. **Restart", "4. **");
+    // Step 5 is the last step, so it runs to the end of the section.
+    let export = step("5. **Stop", "6. **");
+    for (name, text, needles) in [
+        (
+            "Step 1",
+            &find,
+            &[
+                "LocalPort, RemoteAddress and RemotePort",
+                "Get-NetUDPEndpoint -OwningProcess $p.Id",
+            ][..],
+        ),
+        (
+            "Step 3",
+            &restart,
+            &["LocalPort, RemoteAddress and RemotePort", "TCP Connections"][..],
+        ),
+        (
+            "Step 5",
+            &export,
+            &[
+                "(ip.addr == <RemoteAddress> && tcp.port == <LocalPort> && tcp.port == <RemotePort>)",
+                "(ip.addr == <address> && udp.port == <LocalPort>)",
+                "Statistics → Conversations",
+            ][..],
+        ),
+    ] {
+        for needle in needles {
+            assert!(text.contains(needle), "{name} never says `{needle}`");
+        }
+    }
+    for field in ["ip.addr == <", "ipv6.addr == <"] {
+        for (i, _) in export.match_indices(field) {
+            let rest = &export[i + field.len()..];
+            let close = rest.find('>').expect("placeholder closes");
+            assert!(
+                rest[close + 1..].starts_with(" && "),
+                "Step 5 exports by address alone: {}",
+                &export[i..]
+            );
+        }
+    }
+}
+
 /// MAN-90: C3, C4 and C7 compare exact bytes. tshark's `ascii` follow mode
 /// turns non-printable bytes into dots, so the developer steps must also write
 /// a `raw` (hex) transcript of each TCP stream and UDP flow.

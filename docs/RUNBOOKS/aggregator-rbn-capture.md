@@ -31,7 +31,7 @@ Send something like this, and keep the written reply:
 > - **What is recorded:** your Aggregator host's traffic with RBN's servers.
 >   That includes Aggregator's RBN login and the spots it sends. Wireshark
 >   records everything on that network card while it runs, so before sending
->   you keep only the packets to and from the addresses Aggregator used, and
+>   you keep only the packets of the connections Aggregator itself made, and
 >   delete the rest.
 > - **What happens to it:** the raw file stays private with me and is deleted
 >   whenever you ask.
@@ -48,13 +48,18 @@ Send something like this, and keep the written reply:
    ```powershell
    $p = Get-Process | Where-Object ProcessName -like 'Aggregator*'
    Get-NetTCPConnection -OwningProcess $p.Id | Select-Object LocalPort,RemoteAddress,RemotePort,State
+   Get-NetUDPEndpoint -OwningProcess $p.Id | Select-Object LocalAddress,LocalPort
    ```
 
    The established connection whose RemoteAddress is not `127.0.0.1` or a LAN
-   address is RBN's server. Note its address and port. If there is none, open
-   Resource Monitor (`resmon.exe`), go to Network, tick Aggregator, and note
-   the remote addresses under Network Activity. That view shows UDP as well
-   (this answers part of C2).
+   address is RBN's server. Note its LocalPort, RemoteAddress and RemotePort.
+   If there is none, open Resource Monitor (`resmon.exe`), go to Network, tick
+   Aggregator, and note the remote addresses under Network Activity. That view
+   shows UDP as well (this answers part of C2). For UDP, also note the
+   LocalPort values the third line lists. If the first line finds no process,
+   Aggregator runs under another name: change `'Aggregator*'`. Once it finds
+   the process, a line that prints an error means Aggregator has no
+   connection of that kind.
 2. **Start recording.** Open Resource Monitor (`resmon.exe`) on the Network
    tab and leave it open. Open Wireshark on the internet-facing interface with
    no capture filter, and start the capture. After its restart Aggregator may
@@ -64,25 +69,35 @@ Send something like this, and keep the written reply:
 3. **Restart Aggregator** (close it, then start it again) so its RBN login is
    recorded. In Resource Monitor tick the restarted Aggregator (it has a new
    PID) and watch Network Activity while it reconnects. Confirm that "RBN
-   Connection Status" turns green, then run both PowerShell lines from step 1
-   again (the first finds the restarted process). Note every remote address
-   Aggregator uses after the restart, TCP or UDP, that is not `127.0.0.1`, a
-   LAN address, or one of the Skimmers Aggregator reads. Leave it running for
-   at least 15 minutes while the band is active, until the Skimmer Traffic tab
-   shows at least 20 spots marked `+` (sent to RBN, manual §6.2.1). Check
-   Network Activity once more just before you stop, and note any new address.
+   Connection Status" turns green, then run the PowerShell lines from step 1
+   again (the first finds the restarted process). Note every connection
+   Aggregator holds after the restart, TCP or UDP, whose remote address is not
+   `127.0.0.1`, a LAN address, or one of the Skimmers Aggregator reads. For
+   TCP note its LocalPort, RemoteAddress and RemotePort, from the second line
+   or from Resource Monitor's TCP Connections pane. Watch that pane while
+   Aggregator reconnects, so a connection that closes within seconds is noted
+   too. For UDP note every LocalPort the third line lists. Also note every
+   such remote address Network Activity lists for Aggregator. Leave it
+   running for at least 15 minutes while the band is active, until the
+   Skimmer Traffic tab shows at least 20 spots marked `+` (sent to RBN, manual
+   §6.2.1). Check Network Activity and TCP Connections once more just before
+   you stop, and note anything new.
 4. **Copy the Skimmer Traffic tab** for the same window ("Copy to Clipboard",
    manual §6.3) into a text file. Note the Aggregator version shown in its
    title bar.
 5. **Stop and keep only Aggregator's traffic.** Stop Wireshark. In the display
-   filter bar enter every address from steps 1 and 3, as
-   `ip.addr == <address> || ip.addr == <address>` (`ipv6.addr` for an IPv6
-   address), and apply it. Then use File → Export Specified Packets, choose
-   "All packets" and "Displayed", and save as `aggregator-rbn.pcapng`. Open
-   the saved file and check that Statistics → Endpoints lists only your own
-   address and the ones you noted. Send that file, the text file and the list
-   of addresses to the developer privately, then delete the unfiltered
-   capture.
+   filter bar enter one term per TCP connection from steps 1 and 3,
+   `(ip.addr == <RemoteAddress> && tcp.port == <LocalPort> && tcp.port == <RemotePort>)`,
+   and one per pair of a noted address and a noted UDP LocalPort,
+   `(ip.addr == <address> && udp.port == <LocalPort>)`, all joined with `||`
+   (`ipv6.addr` for an IPv6 address). Apply it. A filter on the address alone
+   would also keep any other program on this host that talks to the same
+   address, such as a browser open on an RBN page. Then use File → Export
+   Specified Packets, choose "All packets" and "Displayed", and save as
+   `aggregator-rbn.pcapng`. Open the saved file and check that the TCP and UDP
+   tabs of Statistics → Conversations list only the connections you noted.
+   Send that file, the text file and your notes of connections and addresses
+   to the developer privately, then delete the unfiltered capture.
 
 ## Developer steps
 
@@ -98,15 +113,17 @@ tshark -r aggregator-rbn.pcapng -Y 'tcp.flags.syn == 1 && tcp.flags.ack == 0' \
   -T fields -e frame.time -e tcp.stream -e ip.dst -e ipv6.dst -e tcp.dstport
 ```
 
-The file holds only traffic with the addresses the operator noted before and
-after the restart (operator steps 1 and 3). Anything Aggregator exchanged with
-an address the operator did not note was removed in step 5, so the file
-cannot show it. Each row whose destination is one of them is a connection
-Aggregator opened while recording, normally the one after the restart. The old
-connection opened before recording started, so it has no row. It is often
-stream 0. If no row goes to any of those addresses, the restart was not
-recorded: ask the operator to record it again. Set `N` to a row's
-`tcp.stream` value and run, over the whole file:
+The file holds only the connections the operator noted before and after the
+restart (operator steps 1 and 3), each matched on its address and ports. Any
+connection the operator did not note, Aggregator's or another program's, was
+removed in step 5, so the file cannot show it. A noted address with no
+conversation in the file is such a connection: list it under C1 as not
+recorded. Each row is a connection Aggregator opened while recording,
+normally the one after the restart. The old connection opened before
+recording started, so it has no row. It is often stream 0. If no row goes to
+any of the addresses the operator noted, the restarted connection was either
+not recorded or not noted: ask the operator to record it again. Set `N` to a
+row's `tcp.stream` value and run, over the whole file:
 
 ```sh
 N=1   # the tcp.stream value from that row
