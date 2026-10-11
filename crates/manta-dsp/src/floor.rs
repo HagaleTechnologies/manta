@@ -201,8 +201,12 @@ impl FloorBank {
                 let start = b * BLOCK_CHANNELS;
                 let end = (start + BLOCK_CHANNELS).min(self.channels.len());
                 *block_floor = median(&self.floor_db[start..end]);
-                if (self.seed_pushes[b] as usize) < SEED_PUSHES {
-                    self.seed_sum_db[b] += median(&power_db[start..end]);
+                // A block median below the histogram's range is digital
+                // silence (a source still opening), not noise: averaged in
+                // dB, one -200 dB push would drag the seed ~50 dB low.
+                let block_median = median(&power_db[start..end]);
+                if (self.seed_pushes[b] as usize) < SEED_PUSHES && block_median >= HIST_MIN_DB {
+                    self.seed_sum_db[b] += block_median;
                     self.seed_pushes[b] += 1;
                 }
             }
@@ -222,11 +226,18 @@ impl FloorBank {
     /// of raw power so far, minus `SEED_OFFSET_DB`). The seed only ever
     /// raises the floor, so a wrong seed costs sensitivity for at most 1 s
     /// and never adds tracks. `channel_floor_db` stays raw.
+    ///
+    /// The seed also holds while the ring still contains digital-silence
+    /// entries (the histogram's bottom bin): a stream that opens with exact
+    /// zeros would otherwise leave the lower quartile pinned at -140 dB
+    /// once the first second is over. Noise never reaches that bin, so on
+    /// a live signal this changes nothing.
     pub fn effective_floor_db(&self, k: usize) -> f64 {
         let block = k / BLOCK_CHANNELS;
         let f = self.floor_db[k].min(self.block_floor_db[block] + BLOCK_ALLOWANCE_DB);
         let pushes = self.seed_pushes[block];
-        if self.channels[k].filled < SEED_PUSHES && pushes > 0 {
+        let ch = &self.channels[k];
+        if (ch.filled < SEED_PUSHES || ch.hist[0] > 0) && pushes > 0 {
             f.max(self.seed_sum_db[block] / pushes as f64 - SEED_OFFSET_DB)
         } else {
             f
@@ -469,6 +480,37 @@ mod tests {
                 assert_eq!(f, -109.75, "push {push}: the seed must have lapsed");
             }
         }
+    }
+
+    /// MAN-115 review: a stream that opens with digital silence (exact
+    /// zeros read as -200 dB) must neither drag the seed down nor leave the
+    /// young ring's -140 dB quartile in charge once the first second ends.
+    #[test]
+    fn leading_digital_silence_neither_lowers_nor_ends_the_seed() {
+        let mut bank = FloorBank::new(64);
+        let seed = -90.0 - SEED_OFFSET_DB;
+        // Eight silent decimated pushes (320 ms), then noise at -90 dB.
+        for _ in 0..8 * DECIMATION_HOPS {
+            bank.update(&[-200.0; 64]);
+        }
+        bank.update(&[-90.0; 64]);
+        let f = bank.effective_floor_db(3);
+        assert!(
+            (f - seed).abs() < 1e-9,
+            "the first real push sets the seed to {seed}, got {f}"
+        );
+        // 29 ring entries, past SEED_PUSHES: the quartile rank is
+        // ceil(29/4) = 8, so the eight silent entries still hold the raw
+        // quartile at -140 dB and the seed must still apply.
+        for _ in 0..20 * DECIMATION_HOPS {
+            bank.update(&[-90.0; 64]);
+        }
+        assert_eq!(bank.channel_floor_db(3), -139.75);
+        let f = bank.effective_floor_db(3);
+        assert!(
+            (f - seed).abs() < 1e-9,
+            "silent ring entries keep the seed in force at {seed}, got {f}"
+        );
     }
 
     fn warmed_up_bank(n: usize, floor_db: f64) -> FloorBank {

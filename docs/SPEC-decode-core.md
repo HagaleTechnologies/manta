@@ -189,7 +189,10 @@ replaces SPEC v1's 2 s inhibit):
   seed: the running mean, over the block's first 25 decimated hops, of the
   median raw `PdB` across the block's 32 channels, minus 3.8 dB
   (`10·log10(ln 2 / ln(4/3))`, the median-to-lower-quartile gap of a
-  chi-squared 2-DOF power). The seed only raises `F[k]`; `F_ch` stays raw.
+  chi-squared 2-DOF power). Block medians below −140 dBFS (digital
+  silence, e.g. a source still opening) are left out of that mean, and the
+  seed also holds while the channel's ring still contains entries in the
+  histogram's bottom bin. The seed only raises `F[k]`; `F_ch` stays raw.
 - **Warm-up.** Track creation is inhibited for the first **25 ms**
   (`detector.warmup_ms = 25`, 9 hops) of real hops.
 

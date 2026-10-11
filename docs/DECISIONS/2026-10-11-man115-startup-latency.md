@@ -41,6 +41,11 @@ On V1 (20 WPM, +20 dB, keyed from t = 0, fs 96 kHz):
 | promoted tracks | 1 | 1 |
 | decoded text starts | `CQ DE W1AW` (first `CQ ` lost) | `FQ CQ DE W1AW` |
 
+With `warmup_ms = 2000` this change reproduces `main` exactly on V1
+(promotion 2.0587 s, first character 2.6587 s, first `TrackMeta`
+3.056 s, frequency 14 012 349.89 Hz), and `golden_v8_v8w` passes with the
+default temporarily set back to 750 hops.
+
 V2, V3 and V4 promote at 0.0720 s (main: 1.9627 s) and emit their first
 `TrackMeta` at 1.0693 s (main: 2.96 s). A streaming probe that fed the
 data in 2048-sample chunks, as `listen` does, put main's first
@@ -146,6 +151,15 @@ Applying it only inside `effective_floor_db` keeps that test green.
   estimates the same quantity the ring converges to (5.4 dB was also clean
   on 250 noise seeds). The seed only raises the effective floor (`max`): a
   wrong seed costs sensitivity for at most 1 s and never adds tracks.
+  Self-review found that a live stream opening with exact zeros broke
+  this: one -200 dB push dragged the dB-domain mean ~50 dB low, and the
+  silent ring entries pinned the young quartile at -140 dB. Block medians
+  below -140 dBFS are now left out of the seed, and the seed holds while a
+  ring still has bottom-bin entries
+  (`leading_digital_silence_neither_lowers_nor_ends_the_seed`). Noise
+  never reaches that bin, so neither rule changes any measured number
+  above. Leading silence still delays the first real ring entries; the
+  pre-MAN-115 2 s warm-up tolerated about 0.5 s of it.
 - **D2. No extra `TrackMeta` at promotion.** On the default `legacy`
   engine the first `TrackMeta` and the first `CharDecoded` leave the
   decoder in the same `push_hop` call (demod init at hop 375, where
