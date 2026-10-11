@@ -30,9 +30,10 @@ commands apply the `MANTA_*` variables. `decode`, `oracle` and
 `bench sensitivity` read only the file `--config` names and never the
 environment, so their output does not depend on it. `[[rbn_uplink]]` cannot be
 set from the environment. An unknown table, key or `MANTA_*` variable is an
-error that names it. [SPEC §9](SPEC-decode-core.md#9-configuration-keys) gives
-the full rules, including how variable values are typed and how relative paths
-resolve.
+error that names it. A relative path set in the file resolves against the
+file's directory; one from a flag or a `MANTA_*` variable resolves against the
+working directory. [SPEC §9](SPEC-decode-core.md#9-configuration-keys) gives
+the full rules, including how variable values are typed.
 
 ## Which commands read which tables
 
@@ -45,7 +46,7 @@ listed here change what the command does.
 | `soak`, `doctor` | `[input]` `[spot]` `[detector]` `[decode]`; `[server]` is ignored with a note | yes |
 | `config check` | all six, resolved exactly as `run` resolves them | yes |
 | `check` | `[input]`: the source, `capture_rate_hz` and `center_freq_hz` | yes |
-| `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes |
+| `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes, but `MANTA_SERVER_*` only alongside a config file |
 | `decode` | `[decode]` `[detector]` `[spot]` and `input.freq_correction_ppm` | no |
 | `oracle` | `[decode]` | no |
 | `bench sensitivity` | `[decode]` `[detector]` | no |
@@ -102,8 +103,10 @@ logged and ignored. See
 
 ## [server]
 
-The telnet, JSON and metrics servers. Only `run` reads this table, and it
-needs `station_callsign`.
+The telnet, JSON and metrics servers. Only `run` starts them. `status` reads
+`metrics_bind_addr` and `metrics_port` to find a running daemon, from the file
+`--config` or `MANTA_CONFIG` names plus any `MANTA_SERVER_*` overrides; with
+neither it dials `127.0.0.1:7302`. The table needs `station_callsign`.
 
 | Key | Default | Wired | Notes |
 |---|---|---|---|
@@ -151,7 +154,7 @@ replaces a typed `[input]` whole, its shared keys included.
 |---|---|---|---|
 | `type` | none; example `"kiwi"`; unset uses the default sound card, or the source the command line names | live: `run`, `soak`, `doctor`, `check` | `"audio"`, `"file"`, `"kiwi"`, `"soapy"` or `"hpsdr"`. Each type accepts only its own keys below. |
 | `device` | none; example `"USB Audio"`; unset uses the system's default input | live: `type = "audio"` | Part of the device's name; `manta devices` lists them. `--device` overrides it. |
-| `path` | none; example `"capture.wav"`; required for `type = "file"` | live: `type = "file"` | WAV recording replayed as if live, relative to the config file's directory. `--source` overrides it. |
+| `path` | none; example `"capture.wav"`; required for `type = "file"` | live: `type = "file"` | WAV recording replayed as if live. A relative path set in the file is relative to the file's directory; from `--source`, which overrides it, or `MANTA_INPUT_PATH` it is relative to the working directory. |
 | `iq` | `false` | live: `type = "file"` | `true` for a two-channel IQ recording. `--source-iq` sets it. |
 | `host` | none; example `"<your-receiver-host>"`; required for kiwi and hpsdr | live: `type = "kiwi"` or `"hpsdr"` (hpsdr needs the build feature) | Receiver host name. `--kiwi-host` or `--hpsdr-host` overrides it. |
 | `port` | `8073`; `1024` for hpsdr | live: `type = "kiwi"` or `"hpsdr"` (hpsdr needs the build feature) | Receiver port, 1 to 65535. `--kiwi-port` or `--hpsdr-port` overrides it. |
@@ -173,10 +176,10 @@ reload on SIGHUP; `cty_path` and `scp_path` need a restart.
 | Key | Default | Wired | Notes |
 |---|---|---|---|
 | `allowlist` | `[]` | live: `run`, `soak`, `doctor`, `decode`; reloads on SIGHUP | Callsigns always spotted, skipping the plausibility checks. A non-empty `--allowlist` replaces the list. |
-| `blocklist_path` | none; example `"bad-calls.txt"`; unset blocks no callsign | live: `run`, `soak`, `doctor`, `decode`; reloads on SIGHUP | File of callsigns never spotted, one per line, relative to the config file. `--blocklist` overrides it. |
-| `notch_path` | none; example `"notches.txt"`; unset notches no frequency | live: `run`, `soak`, `doctor`, `decode`; reloads on SIGHUP | File of `low_hz-high_hz` ranges never spotted, one per line, relative to the config file. `--notch` overrides it. |
-| `cty_path` | none; example `"cty.dat"`; unset uses the built-in `cty.dat` | live: `run`, `soak`, `doctor`, `decode` | AD1C's country-prefix file, relative to the config file. `--cty` overrides it; see [DECISIONS/2026-10-10-man79-operator-cty-scp-override.md](DECISIONS/2026-10-10-man79-operator-cty-scp-override.md). |
-| `scp_path` | none; example `"MASTER.SCP"`; unset uses the built-in `master.scp` | live: `run`, `soak`, `doctor`, `decode` | Known-callsign list that raises confidence, relative to the config file. `--scp` overrides it. |
+| `blocklist_path` | none; example `"bad-calls.txt"`; unset blocks no callsign | live: `run`, `soak`, `doctor`, `decode`; reloads on SIGHUP | File of callsigns never spotted, one per line. A relative path set in the file is relative to the file's directory; from `--blocklist`, which overrides it, or `MANTA_SPOT_BLOCKLIST_PATH` it is relative to the working directory. |
+| `notch_path` | none; example `"notches.txt"`; unset notches no frequency | live: `run`, `soak`, `doctor`, `decode`; reloads on SIGHUP | File of `low_hz-high_hz` ranges never spotted, one per line. A relative path set in the file is relative to the file's directory; from `--notch`, which overrides it, or `MANTA_SPOT_NOTCH_PATH` it is relative to the working directory. |
+| `cty_path` | none; example `"cty.dat"`; unset uses the built-in `cty.dat` | live: `run`, `soak`, `doctor`, `decode` | AD1C's country-prefix file. A relative path set in the file is relative to the file's directory; from `--cty`, which overrides it, or `MANTA_SPOT_CTY_PATH` it is relative to the working directory. See [DECISIONS/2026-10-10-man79-operator-cty-scp-override.md](DECISIONS/2026-10-10-man79-operator-cty-scp-override.md). |
+| `scp_path` | none; example `"MASTER.SCP"`; unset uses the built-in `master.scp` | live: `run`, `soak`, `doctor`, `decode` | Known-callsign list that raises confidence. A relative path set in the file is relative to the file's directory; from `--scp`, which overrides it, or `MANTA_SPOT_SCP_PATH` it is relative to the working directory. |
 
 ## [detector]
 

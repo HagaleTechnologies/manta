@@ -1211,6 +1211,64 @@ fn config_reference_documents_environment_server_activation() {
     );
 }
 
+/// MAN-149 PR #251 review: run_status loads [server] from --config or
+/// MANTA_CONFIG and dials metrics_bind_addr:metrics_port, so `run` is not
+/// the table's only reader. With no config path it skips the MANTA_*
+/// overlay and resolve_status_addr dials 127.0.0.1:7302.
+#[test]
+fn config_reference_names_status_as_a_server_reader() {
+    let md = doc(CONFIG_REF);
+    let server = section(&md, "[server]");
+    let intro = squash_whitespace(&server[..server.find("\n|").unwrap_or(server.len())]);
+    assert!(
+        !intro.contains("Only `run` reads this table"),
+        "{CONFIG_REF} [server] still says only `run` reads the table"
+    );
+    assert!(
+        intro.contains("`status` reads `metrics_bind_addr` and `metrics_port`"),
+        "{CONFIG_REF} [server] must say `status` reads metrics_bind_addr and metrics_port"
+    );
+    assert!(
+        intro.contains("with neither it dials `127.0.0.1:7302`"),
+        "{CONFIG_REF} [server] must say `status` without a config file dials the default"
+    );
+}
+
+/// MAN-149 PR #251 review: config::load joins a relative path to the
+/// config file's directory only when the file set it; a `MANTA_*` value
+/// or a flag stays relative to the working directory.
+#[test]
+fn config_reference_documents_path_resolution_by_source() {
+    let md = doc(CONFIG_REF);
+    for (table, key, flag) in [
+        ("input", "path", "--source"),
+        ("spot", "blocklist_path", "--blocklist"),
+        ("spot", "notch_path", "--notch"),
+        ("spot", "cty_path", "--cty"),
+        ("spot", "scp_path", "--scp"),
+    ] {
+        let rows = backticked_rows(config_ref_table_section(&md, table));
+        let row = rows
+            .iter()
+            .find(|r| r[0] == format!("`{key}`"))
+            .unwrap_or_else(|| panic!("{CONFIG_REF} has no [{table}] `{key}` row"));
+        let notes = squash_whitespace(row.last().unwrap());
+        let var = format!("`MANTA_{}_{}`", table.to_uppercase(), key.to_uppercase());
+        for wanted in [
+            "the file's directory",
+            "the working directory",
+            &var,
+            &format!("`{flag}`"),
+        ] {
+            assert!(
+                notes.contains(wanted),
+                "{CONFIG_REF} [{table}] `{key}` must say how a relative path resolves \
+                 from the file versus {flag}/{var}; its Notes cell lacks {wanted}"
+            );
+        }
+    }
+}
+
 /// MAN-149 PR #251 review: metrics_http::handle_request charges EOF,
 /// header-timeout and header-read-error connections against
 /// metrics_max_requests_per_ip, but answers only the request path with 429.
