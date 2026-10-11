@@ -10,9 +10,11 @@ use std::path::{Path, PathBuf};
 
 mod bench;
 mod build_info;
+mod clock_check;
 mod config;
 mod config_cmd;
 mod devices;
+mod doctor_checks;
 mod logging;
 mod reconnect;
 mod reload;
@@ -190,9 +192,10 @@ enum Command {
         device: Option<String>,
         /// Replay a WAV file instead of listening to a live device.
         ///
-        /// Decoded as fast as the machine manages, not in real time, so a
-        /// 60-second file usually finishes sooner than that. Useful for
-        /// demos and repeatable testing.
+        /// Decoded as fast as the machine manages, so a 60-second file usually
+        /// finishes sooner than that; add --realtime to replay it at its own
+        /// pace, or --loop to keep it playing. Useful for demos and repeatable
+        /// testing.
         #[arg(long, conflicts_with = "device", help_heading = "Audio input")]
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
@@ -311,6 +314,29 @@ enum Command {
         /// told apart from the WAV header alone, so say which you have.
         #[arg(long)]
         source_iq: bool,
+        /// Replay the file at the recording's own pace instead of as fast as
+        /// possible.
+        ///
+        /// A 120-second file takes 120 seconds, so telnet and JSON clients have
+        /// time to connect and watch spots arrive. The decoded output is the same,
+        /// byte for byte, as an unpaced replay; only its timing changes. Only for
+        /// file replay: a live receiver already runs in real time. Also set by
+        /// input.realtime in the config file.
+        // No `requires = "source"`: the file source can come from the config
+        // file, so the check runs after `resolve` (MAN-269 D4).
+        #[arg(long)]
+        realtime: bool,
+        /// Start the file again from the beginning each time it ends, until
+        /// stopped.
+        ///
+        /// Implies --realtime. Keeps a short recording playing for a demo; stop it
+        /// with Ctrl-C or SIGTERM. The jump from the last sample back to the first
+        /// is not smoothed, and a station already spotted is not spotted again for
+        /// 10 minutes, so a looped recording yields a fresh spot about every 10
+        /// minutes (type sh/dx on the telnet port to list earlier ones). Only for
+        /// file replay. Also set by input.loop in the config file.
+        #[arg(long = "loop")]
+        loop_replay: bool,
         /// Print each decode as a JSON object, one per line, instead of
         /// plain text.
         #[arg(long, help_heading = "Output")]
@@ -566,12 +592,16 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         timeout_secs: u64,
     },
-    /// Check whether a source is hearing anything, and say what it found.
+    /// Check that this machine is ready to run manta, then whether the
+    /// receiver hears anything.
     ///
-    /// Runs the real decode pipeline for --duration seconds, then reports
-    /// track, SNR and spot counts plus a verdict. Tells "nothing is coming
-    /// in" apart from "signal is coming in but nothing decodes" and from
-    /// "working end to end" -- which a quiet `listen` run cannot.
+    /// First checks the config, the audio library, that the server ports
+    /// are free, the clock against an NTP server, and that each enabled RBN
+    /// uplink target accepts a connection. Then opens the receiver, runs the
+    /// real decode pipeline for --duration seconds and reports track, SNR
+    /// and spot counts plus a verdict. Each check prints PASS, WARN, FAIL or
+    /// SKIP, with a fix for every problem. Exits 1 when a check fails.
+    // MAN-126: the setup checks live in doctor_checks.rs and clock_check.rs.
     Doctor {
         /// How long to listen for, in seconds (3 to 3600).
         #[arg(long, default_value_t = 10)]
@@ -713,9 +743,22 @@ enum Command {
         ///
         /// Falls back to $MANTA_CONFIG. Flags override the file, and
         /// MANTA_<TABLE>_<KEY> environment variables sit between the two.
-        /// `doctor` never starts the spot servers.
+        /// doctor checks [server]'s ports and each [[rbn_uplink]] target,
+        /// but never starts a server or logs in to a collector.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// NTP server the clock check asks for the time, as HOST or
+        /// HOST:PORT.
+        ///
+        /// doctor sends it one time request over UDP port 123. Name a server
+        /// on your own network when outbound NTP is blocked.
+        #[arg(
+            long,
+            default_value = clock_check::DEFAULT_NTP_SERVER,
+            value_parser = clock_check::parse_ntp_server,
+            help_heading = "Setup checks"
+        )]
+        ntp_server: clock_check::NtpServer,
         /// Print the full report as one JSON object instead of a readable
         /// summary.
         #[arg(long, help_heading = "Output")]
@@ -2904,6 +2947,9 @@ struct CliOverrides {
     device: Option<String>,
     source: Option<PathBuf>,
     source_iq: bool,
+    /// `run --realtime`/`--loop` (MAN-269); always false for soak/doctor.
+    realtime: bool,
+    loop_replay: bool,
     kiwi: KiwiOpts,
     #[cfg(feature = "soapy")]
     soapy: SoapyOpts,
@@ -2928,6 +2974,8 @@ impl CliOverrides {
             device: None,
             source: None,
             source_iq: false,
+            realtime: false,
+            loop_replay: false,
             kiwi: KiwiOpts {
                 host: None,
                 port: 8073,
@@ -3039,9 +3087,30 @@ fn resolve_spot(
     }
 }
 
+/// How a file replay is delivered (MAN-269): `paced` plays it at the
+/// recording's own clock, `looped` reopens it at each end. Only `run`
+/// applies it, and only to `LiveSourceSpec::File`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReplayMode {
+    paced: bool,
+    looped: bool,
+}
+
+impl ReplayMode {
+    /// `--loop` implies `--realtime` (D2): an unpaced loop would decode
+    /// endlessly and stamp spots ever further into the future.
+    fn from_flags(realtime: bool, looped: bool) -> Self {
+        ReplayMode {
+            paced: realtime || looped,
+            looped,
+        }
+    }
+}
+
 /// Everything a live command needs after CLI > env > file > default.
 struct Resolved {
     spec: LiveSourceSpec,
+    replay: ReplayMode,
     freq_correction_ppm: f64,
     dial_freq_hz: Option<f64>,
     capture_rate_hz: Option<f64>,
@@ -3069,6 +3138,13 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
         cli.capture_rate_hz,
         cli.replay_epoch,
     );
+    let (cli_realtime, cli_loop) = (cli.realtime, cli.loop_replay);
+    // MAN-269 D3: a config `type = "file"` source contributes its own
+    // realtime/loop only when no CLI flag selects the source.
+    let file_replay = match (cli.source_selector(), &loaded.input.source) {
+        (None, Some(source)) => Some(source),
+        _ => None,
+    };
     let spec = match (cli.source_selector(), &loaded.input.source) {
         (Some(flag), Some(file_source)) => {
             // A typed [input] describes one receiver: its ppm and dial
@@ -3085,8 +3161,10 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
         (Some(_), None) | (None, None) => cli.into_spec(),
         (None, Some(file_source)) => spec_from_file(file_source, cli.source_iq)?,
     };
+    let replay = resolve_replay_mode(cli_realtime, cli_loop, file_replay, &spec)?;
     Ok(Resolved {
         spec,
+        replay,
         freq_correction_ppm: freq_correction_ppm
             .or(shared.freq_correction_ppm)
             .unwrap_or(0.0),
@@ -3103,7 +3181,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
 fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Result<LiveSourceSpec> {
     Ok(match source {
         config::SourceFromFile::Audio { device } => LiveSourceSpec::AudioDevice(device.clone()),
-        config::SourceFromFile::File { path, iq } => LiveSourceSpec::File {
+        config::SourceFromFile::File { path, iq, .. } => LiveSourceSpec::File {
             path: path.clone(),
             source_iq: *iq || cli_source_iq,
         },
@@ -3151,6 +3229,125 @@ fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Resul
             bail!("input.type = \"hpsdr\" needs a manta built with --features hpsdr")
         }
     })
+}
+
+/// MAN-269 D3/D4: the CLI's `--realtime`/`--loop` ORed with the config file
+/// source's `realtime`/`loop` (`file_source` is `Some` only when no CLI flag
+/// selected the source), then refused unless the resolved source is a file.
+/// Runs inside `prepare_live`, before any source I/O.
+fn resolve_replay_mode(
+    cli_realtime: bool,
+    cli_loop: bool,
+    file_source: Option<&config::SourceFromFile>,
+    spec: &LiveSourceSpec,
+) -> Result<ReplayMode> {
+    let (file_realtime, file_loop) = match file_source {
+        Some(config::SourceFromFile::File {
+            realtime, looped, ..
+        }) => (*realtime, *looped),
+        _ => (false, false),
+    };
+    let replay = ReplayMode::from_flags(cli_realtime || file_realtime, cli_loop || file_loop);
+    if replay != ReplayMode::default() && !matches!(spec, LiveSourceSpec::File { .. }) {
+        // `validate_input` already refuses realtime/loop on a non-file
+        // [input], so only a CLI flag can get here.
+        if cli_realtime {
+            bail!(
+                "--realtime only applies to a file replay (--source, or input.type = \"file\"); \
+                 a live source already runs in real time"
+            );
+        }
+        bail!(
+            "--loop only applies to a file replay (--source, or input.type = \"file\"); a live \
+             source never reaches an end to loop from"
+        );
+    }
+    Ok(replay)
+}
+
+/// `soak`/`doctor`'s note for config-file realtime/loop they do not apply
+/// (MAN-269 D5); `None` when neither is set.
+fn replay_mode_ignored_note(command: &str, replay: ReplayMode, origin: &str) -> Option<String> {
+    (replay != ReplayMode::default()).then(|| {
+        format!(
+            "note: {command} replays files as fast as it can; ignoring \
+             input.realtime/input.loop from {origin}"
+        )
+    })
+}
+
+/// Wraps an opened file replay for `mode` (MAN-269 D8): the loop sits inside
+/// the pacing, so one clock spans every pass. `reopen` opens each later pass.
+/// The default mode returns `first` unchanged.
+fn wrap_file_replay(
+    first: Box<dyn IqSource>,
+    mode: ReplayMode,
+    label: String,
+    reopen: manta_input::Reopen,
+) -> Result<Box<dyn IqSource>> {
+    let src: Box<dyn IqSource> = if mode.looped {
+        Box::new(manta_input::LoopingSource::new(label, first, reopen))
+    } else {
+        first
+    };
+    Ok(if mode.paced {
+        Box::new(manta_input::PacedSource::new(src)?)
+    } else {
+        src
+    })
+}
+
+/// `run`'s dial guard (MAN-34): with `[server]`, a receiver that reports no
+/// real RF frequency needs a dial frequency, or every spot is a baseband
+/// offset. Shared with `manta doctor`'s `config` check (MAN-126).
+fn needs_dial_freq(has_server: bool, rf_aware: bool, dial_freq_hz: Option<f64>) -> bool {
+    has_server && !rf_aware && dial_freq_hz.is_none()
+}
+
+/// How `manta doctor` names the configured receiver. Never includes the
+/// KiwiSDR password.
+fn receiver_desc(spec: &LiveSourceSpec) -> doctor_checks::ReceiverDesc {
+    use doctor_checks::{ReceiverDesc, ReceiverKind};
+    let (kind, description) = match spec {
+        LiveSourceSpec::Kiwi(kiwi) => (
+            ReceiverKind::Kiwi,
+            format!(
+                "KiwiSDR {}:{}",
+                kiwi.host.as_deref().unwrap_or_default(),
+                kiwi.port
+            ),
+        ),
+        #[cfg(feature = "soapy")]
+        LiveSourceSpec::Soapy(soapy) => (
+            ReceiverKind::Soapy,
+            format!(
+                "SoapySDR device \"{}\"",
+                soapy.driver.as_deref().unwrap_or_default()
+            ),
+        ),
+        #[cfg(feature = "hpsdr")]
+        LiveSourceSpec::Hpsdr(hpsdr) => (
+            ReceiverKind::Hpsdr,
+            format!(
+                "HPSDR radio {}:{}",
+                hpsdr.host.as_deref().unwrap_or_default(),
+                hpsdr.port
+            ),
+        ),
+        LiveSourceSpec::AudioDevice(None) => (
+            ReceiverKind::SoundCard,
+            "the system default sound-card input".to_string(),
+        ),
+        LiveSourceSpec::AudioDevice(Some(name)) => (
+            ReceiverKind::SoundCard,
+            format!("the sound-card input matching \"{name}\""),
+        ),
+        LiveSourceSpec::File { path, .. } => (
+            ReceiverKind::File,
+            format!("the WAV file {}", path.display()),
+        ),
+    };
+    ReceiverDesc { kind, description }
 }
 
 /// `run`/`soak`/`doctor`'s shared start: load the config (`--config`, else
@@ -3858,6 +4055,8 @@ fn real_main() -> Result<()> {
             hpsdr_rate_hz,
             capture_rate_hz,
             source_iq,
+            realtime,
+            loop_replay,
             filters,
             json,
             decoded_text,
@@ -3882,6 +4081,8 @@ fn real_main() -> Result<()> {
                 device,
                 source,
                 source_iq,
+                realtime,
+                loop_replay,
                 kiwi: KiwiOpts {
                     host: kiwi_host,
                     port: kiwi_port,
@@ -3933,6 +4134,10 @@ fn real_main() -> Result<()> {
             config_cmd::reject_example_callsigns(&loaded)?;
             let spec = &resolved.spec;
             let dial_freq_hz = resolved.dial_freq_hz;
+            // The resolved (CLI > env > file) capture rate, for the first open
+            // and every reopen below: binding the CLI's raw value here dropped a
+            // config/env capture rate on a MAN-73 reconnect.
+            let capture_rate_hz = resolved.capture_rate_hz;
             // Needed to derive a recording-specific replay epoch/nonce.
             let replay_path = match spec {
                 LiveSourceSpec::File { path, .. } => Some(path.clone()),
@@ -3943,7 +4148,22 @@ fn real_main() -> Result<()> {
 
             // Servers start iff the resolved config has a [server] table
             // (D7); the guard runs after the load and before any source I/O.
-            if loaded.server.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
+            if needs_dial_freq(loaded.server.is_some(), has_rf_aware_source, dial_freq_hz) {
+                // MAN-269 review (P2): `is_rf_aware()` reads an IQ WAV's
+                // sidecar by opening it and maps any open error to "no RF
+                // frequency". For a file that exists, that error (an
+                // unsupported sample rate, a malformed header) is the real
+                // problem, so report it rather than asking for a dial
+                // frequency that would not help.
+                if let LiveSourceSpec::File {
+                    path,
+                    source_iq: true,
+                } = spec
+                {
+                    if path.exists() {
+                        manta_input::WavIqSource::open(path)?;
+                    }
+                }
                 bail!(
                     "--dial-freq-hz is required with --config when using a plain \
                      audio device or --source WAV file -- neither reports a real RF \
@@ -3971,7 +4191,7 @@ fn real_main() -> Result<()> {
                 reload::mask_sighup(libc::SIG_BLOCK)
                     .context("blocking SIGHUP on the decode thread")?;
             }
-            let first = spec.open(resolved.capture_rate_hz, dial_freq_hz)?;
+            let first = spec.open(capture_rate_hz, dial_freq_hz)?;
             let replay_epoch = resolved.replay_epoch;
 
             // MAN-122 review round 6 (P2): installed HERE -- before
@@ -4230,7 +4450,19 @@ fn real_main() -> Result<()> {
                 Box::new(wrapped)
             } else {
                 input_health = reconnect::InputHealthTotals::for_source(first.as_ref());
-                first
+                // MAN-269: `--realtime`/`--loop` pace and loop a file replay;
+                // every loop pass reopens through `spec.open`, so it gets a
+                // fresh decimator and the same dial override.
+                let reopen_spec = spec.clone();
+                let label = replay_path
+                    .as_ref()
+                    .map_or_else(String::new, |p| p.display().to_string());
+                wrap_file_replay(
+                    first,
+                    resolved.replay,
+                    label,
+                    Box::new(move || reopen_spec.open(capture_rate_hz, dial_freq_hz)),
+                )?
             };
 
             // MAN-56: a source's packet loss/malformed counters are
@@ -4597,6 +4829,8 @@ fn real_main() -> Result<()> {
                     device,
                     source,
                     source_iq,
+                    realtime: false,
+                    loop_replay: false,
                     kiwi: KiwiOpts {
                         host: kiwi_host,
                         port: kiwi_port,
@@ -4635,6 +4869,9 @@ fn real_main() -> Result<()> {
                     "note: soak does not start the spot servers; ignoring [server] from {}",
                     loaded.origin
                 );
+            }
+            if let Some(note) = replay_mode_ignored_note("soak", resolved.replay, &loaded.origin) {
+                eprintln!("{note}");
             }
             let spec = &resolved.spec;
             warn_if_audio_source_has_no_rf_reference(spec.is_rf_aware(), resolved.dial_freq_hz);
@@ -4705,6 +4942,7 @@ fn real_main() -> Result<()> {
             source_iq,
             dial_freq_hz,
             config,
+            ntp_server,
             json,
         } => {
             let FilterOpts {
@@ -4731,15 +4969,17 @@ fn real_main() -> Result<()> {
                 );
             }
             let Prepared {
+                config_path,
                 loaded,
                 resolved,
                 pipeline: cfg,
-                ..
             } = prepare_live(
                 CliOverrides {
                     device,
                     source,
                     source_iq,
+                    realtime: false,
+                    loop_replay: false,
                     kiwi: KiwiOpts {
                         host: kiwi_host,
                         port: kiwi_port,
@@ -4773,33 +5013,91 @@ fn real_main() -> Result<()> {
                 config,
                 None,
             )?;
-            if loaded.server.is_some() {
-                eprintln!(
-                    "note: doctor does not start the spot servers; ignoring [server] from {}",
-                    loaded.origin
-                );
+            if let Some(note) = replay_mode_ignored_note("doctor", resolved.replay, &loaded.origin)
+            {
+                eprintln!("{note}");
             }
+            // MAN-126: named setup checks first, each printed as it is
+            // known; the receiver and signal stages become check lines too,
+            // so a failure is named rather than ending in a generic error.
             let spec = &resolved.spec;
-            warn_if_audio_source_has_no_rf_reference(spec.is_rf_aware(), resolved.dial_freq_hz);
-            let src: Box<dyn IqSource> =
-                spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz)?;
-            let report = manta_engine::doctor(src, &cfg, std::time::Duration::from_secs(duration))?;
+            let rf_aware = spec.is_rf_aware();
+            let receiver = receiver_desc(spec);
+            let mut sink = doctor_checks::Sink::new(json);
+            doctor_checks::run_setup_checks(
+                &doctor_checks::SetupInputs {
+                    config_path: config_path.as_deref(),
+                    loaded: &loaded,
+                    needs_dial: needs_dial_freq(
+                        loaded.server.is_some(),
+                        rf_aware,
+                        resolved.dial_freq_hz,
+                    ),
+                    receiver: &receiver,
+                    ntp_server: &ntp_server,
+                },
+                &mut sink,
+            );
+            warn_if_audio_source_has_no_rf_reference(rf_aware, resolved.dial_freq_hz);
+            let report = match spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz) {
+                Err(e) => {
+                    sink.push(doctor_checks::receiver_check(&receiver, Err(&e)));
+                    None
+                }
+                Ok(src) => {
+                    sink.push(doctor_checks::receiver_check(
+                        &receiver,
+                        Ok(src.sample_rate()),
+                    ));
+                    match manta_engine::doctor(src, &cfg, std::time::Duration::from_secs(duration))
+                    {
+                        Ok(report) => {
+                            if !json {
+                                println!();
+                                print_doctor_report(&report);
+                            }
+                            Some(report)
+                        }
+                        Err(e) => {
+                            sink.push(doctor_checks::signal_check(&e));
+                            None
+                        }
+                    }
+                }
+            };
+            let checks = sink.checks;
             if json {
                 // `verdict()` is computed, not a stored field, so a plain
                 // `serde_json::to_string(&report)` omits the command's
                 // primary health classification entirely -- merge it in as
                 // an extra key rather than making JSON consumers duplicate
                 // the classification policy themselves.
-                let mut value = serde_json::to_value(&report)?;
-                if let serde_json::Value::Object(ref mut map) = value {
+                let mut map = serde_json::Map::new();
+                if let Some(report) = &report {
+                    if let serde_json::Value::Object(fields) = serde_json::to_value(report)? {
+                        map = fields;
+                    }
                     map.insert(
                         "verdict".to_string(),
                         serde_json::to_value(report.verdict())?,
                     );
                 }
-                println!("{}", serde_json::to_string(&value)?);
+                map.insert("checks".to_string(), serde_json::to_value(&checks)?);
+                map.insert(
+                    "checks_status".to_string(),
+                    serde_json::to_value(doctor_checks::worst(&checks))?,
+                );
+                println!("{}", serde_json::to_string(&map)?);
             } else {
-                print_doctor_report(&report);
+                println!();
+                println!("{}", doctor_checks::summary(&checks));
+            }
+            // As `manta status` does: the specific lines above are the
+            // whole story, so no generic `Error:` line follows them.
+            use std::io::Write as _;
+            std::io::stdout().flush()?;
+            if doctor_checks::worst(&checks) == doctor_checks::Status::Fail {
+                std::process::exit(1);
             }
         }
         Command::Config(ConfigCommand::Check { config }) => config_cmd::check(config)?,
@@ -5129,6 +5427,29 @@ mod tests {
         let _ = server.shutdown_tx.send(true);
         test_runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     }
+    /// MAN-126: doctor's help names the clock check's server flag, the four
+    /// statuses, and the exit rule scripts rely on.
+    #[test]
+    fn doctor_help_lists_ntp_server_and_the_exit_rule() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let doctor = cli.find_subcommand_mut("doctor").unwrap();
+        let help = doctor.render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "--ntp-server",
+            "Setup checks",
+            "PASS, WARN, FAIL or SKIP",
+            "Exits 1 when a check fails",
+            "pool.ntp.org",
+        ] {
+            assert!(
+                flat.contains(needle),
+                "doctor --help lacks {needle:?}:\n{help}"
+            );
+        }
+    }
+
     #[test]
     fn help_lists_cty_and_scp_for_every_validating_command() {
         use clap::CommandFactory;
@@ -7047,6 +7368,251 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(*source_iq);
     }
 
+    // ---- MAN-269: paced and looping file replay
+
+    const FILE_INPUT: &str = "[input]\ntype = \"file\"\npath = \"/x/v1.wav\"\niq = true\n";
+
+    #[test]
+    fn realtime_flag_paces_a_cli_file_source() {
+        let cli = CliOverrides {
+            source: Some(PathBuf::from("x.wav")),
+            realtime: true,
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded_from("")).unwrap();
+        assert_eq!(
+            r.replay,
+            ReplayMode {
+                paced: true,
+                looped: false
+            }
+        );
+    }
+
+    #[test]
+    fn loop_flag_implies_pacing() {
+        let cli = CliOverrides {
+            source: Some(PathBuf::from("x.wav")),
+            loop_replay: true,
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded_from("")).unwrap();
+        assert_eq!(
+            r.replay,
+            ReplayMode {
+                paced: true,
+                looped: true
+            }
+        );
+    }
+
+    #[test]
+    fn input_realtime_and_loop_keys_apply_to_a_config_file_source() {
+        let loaded = loaded_from(&format!("{FILE_INPUT}realtime = true\nloop = true\n"));
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        assert!(matches!(r.spec, LiveSourceSpec::File { .. }));
+        assert_eq!(
+            r.replay,
+            ReplayMode {
+                paced: true,
+                looped: true
+            }
+        );
+        let r = resolve(
+            cli_overrides(),
+            &loaded_from(&format!("{FILE_INPUT}realtime = true\n")),
+        )
+        .unwrap();
+        assert_eq!(
+            r.replay,
+            ReplayMode {
+                paced: true,
+                looped: false
+            }
+        );
+    }
+
+    #[test]
+    fn cli_realtime_adds_to_a_config_file_source() {
+        let cli = CliOverrides {
+            realtime: true,
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded_from(FILE_INPUT)).unwrap();
+        assert_eq!(
+            r.replay,
+            ReplayMode {
+                paced: true,
+                looped: false
+            }
+        );
+        let cli = CliOverrides {
+            loop_replay: true,
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded_from(&format!("{FILE_INPUT}realtime = true\n"))).unwrap();
+        assert_eq!(
+            r.replay,
+            ReplayMode {
+                paced: true,
+                looped: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_cli_source_selector_discards_the_files_realtime_and_loop() {
+        let loaded = loaded_from(&format!("{FILE_INPUT}realtime = true\nloop = true\n"));
+        let cli = CliOverrides {
+            source: Some(PathBuf::from("y.wav")),
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded).unwrap();
+        assert_eq!(r.replay, ReplayMode::default());
+        let LiveSourceSpec::File { path, .. } = &r.spec else {
+            panic!("expected the CLI file source");
+        };
+        assert_eq!(path, &PathBuf::from("y.wav"));
+    }
+
+    #[test]
+    fn realtime_with_a_live_source_is_an_error() {
+        let cli = CliOverrides {
+            kiwi: KiwiOpts {
+                host: Some("192.0.2.1".into()),
+                port: 8073,
+                freq: Some(7_030_000.0),
+                password: String::new(),
+            },
+            realtime: true,
+            loop_replay: true,
+            ..cli_overrides()
+        };
+        let err = resolve(cli, &loaded_from("")).err().unwrap().to_string();
+        assert_eq!(
+            err,
+            "--realtime only applies to a file replay (--source, or input.type = \"file\"); a \
+             live source already runs in real time"
+        );
+    }
+
+    #[test]
+    fn loop_with_the_default_audio_device_is_an_error() {
+        let cli = CliOverrides {
+            loop_replay: true,
+            ..cli_overrides()
+        };
+        let err = resolve(cli, &loaded_from("")).err().unwrap().to_string();
+        assert_eq!(
+            err,
+            "--loop only applies to a file replay (--source, or input.type = \"file\"); a live \
+             source never reaches an end to loop from"
+        );
+        // The same for a typed non-file [input] the CLI adds --loop to.
+        let cli = CliOverrides {
+            loop_replay: true,
+            ..cli_overrides()
+        };
+        let err = resolve(cli, &loaded_from(KIWI_INPUT))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.starts_with("--loop only applies to a file replay"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn replay_mode_note_names_the_ignored_keys() {
+        let mode = ReplayMode::from_flags(true, false);
+        assert_eq!(
+            replay_mode_ignored_note("soak", mode, "demo.toml").as_deref(),
+            Some(
+                "note: soak replays files as fast as it can; ignoring input.realtime/input.loop \
+                 from demo.toml"
+            )
+        );
+        assert_eq!(
+            replay_mode_ignored_note("doctor", ReplayMode::default(), "demo.toml"),
+            None
+        );
+    }
+
+    /// `n` samples of a ramp at `fs`, for the `wrap_file_replay` tests.
+    struct RampSource {
+        n: usize,
+        cursor: usize,
+        fs: f64,
+    }
+
+    impl IqSource for RampSource {
+        fn sample_rate(&self) -> f64 {
+            self.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            0.0
+        }
+        fn read(&mut self, buf: &mut [num_complex::Complex32]) -> Result<usize> {
+            let k = buf.len().min(self.n - self.cursor);
+            for (i, s) in buf[..k].iter_mut().enumerate() {
+                *s = num_complex::Complex32::new((self.cursor + i) as f32, 0.0);
+            }
+            self.cursor += k;
+            Ok(k)
+        }
+    }
+
+    fn ramp(n: usize, fs: f64) -> Box<dyn IqSource> {
+        Box::new(RampSource { n, cursor: 0, fs })
+    }
+
+    #[test]
+    fn wrap_file_replay_is_identity_for_the_default_mode() {
+        let first = ramp(10, 1000.0);
+        let before = &*first as *const dyn IqSource as *const ();
+        let wrapped = wrap_file_replay(
+            first,
+            ReplayMode::default(),
+            "x.wav".into(),
+            Box::new(|| bail!("the default mode never reopens")),
+        )
+        .unwrap();
+        assert_eq!(&*wrapped as *const dyn IqSource as *const (), before);
+    }
+
+    #[test]
+    fn wrap_file_replay_loops_inside_pacing() {
+        // 100 samples at 1 kS/s, read 300 times over: three passes of one
+        // paced clock take >= 300 ms. Lower bound only.
+        let mut src = wrap_file_replay(
+            ramp(100, 1000.0),
+            ReplayMode::from_flags(false, true),
+            "x.wav".into(),
+            Box::new(|| Ok(ramp(100, 1000.0))),
+        )
+        .unwrap();
+        let mut buf = vec![num_complex::Complex32::new(0.0, 0.0); 300];
+        let start = std::time::Instant::now();
+        let mut filled = 0;
+        while filled < buf.len() {
+            let n = src.read(&mut buf[filled..]).unwrap();
+            assert!(n > 0, "the loop ended after {filled} samples");
+            filled += n;
+        }
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(290),
+            "300 paced samples at 1 kS/s took only {:?}",
+            start.elapsed()
+        );
+        assert_eq!(buf[99].re, 99.0);
+        assert_eq!(
+            buf[100].re, 0.0,
+            "the second pass starts from the first sample"
+        );
+        assert_eq!(buf[299].re, 99.0);
+    }
+
     #[test]
     fn cli_allowlist_replaces_file_allowlist() {
         let spot = config::SpotFile {
@@ -7159,6 +7725,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("device", "input.device"),
         ("source", "input.path"),
         ("source_iq", "input.iq"),
+        ("realtime", "input.realtime"),
+        ("loop_replay", "input.loop"),
         ("kiwi_host", "input.host"),
         ("kiwi_port", "input.port"),
         ("kiwi_freq_hz", "input.freq_hz"),
@@ -7194,6 +7762,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         "center_freq_hz",
         "help",
         "version",
+        "ntp_server",
         "verbose",
         "quiet",
         "log_level",
@@ -7288,7 +7857,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn every_flag_key_is_accepted_by_the_loader() {
         const TYPED: &[(&str, &str)] = &[
             ("audio", "type = \"audio\"\ndevice = \"d\"\n"),
-            ("file", "type = \"file\"\npath = \"x.wav\"\niq = true\n"),
+            (
+                "file",
+                "type = \"file\"\npath = \"x.wav\"\niq = true\nrealtime = true\nloop = true\n",
+            ),
             (
                 "kiwi",
                 "type = \"kiwi\"\nhost = \"h\"\nport = 8073\nfreq_hz = 7e6\npassword = \"\"\n",

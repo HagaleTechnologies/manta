@@ -176,13 +176,32 @@ which among the rates recorders commonly produce means 24, 48, 96, 192,
 interpreted, so a recording at an off-table rate (100 or 250 kS/s, say) is
 rejected with `unsupported sample rate …: fs/93.75 must be a power of two`.
 That list is examples, not the whole set: divide your own rate by 93.75,
-and it replays if the answer is a power of two of at least 4.
+and it replays if the answer is a power of two of at least 4 and the rate
+is at most 10 MS/s.
 `--capture-rate-hz` decimates by a power of two into a *lower* table rate
 (`--capture-rate-hz 48000` on a 192 kS/s capture, to spend less CPU on a
 narrower passband); it is not a general resampler and cannot rescue an
-off-table recording. Replay runs faster than realtime, so the hardware-free
-path above stops at `decode`; a paced replay that can drive the servers
-below is being worked on.
+off-table recording.
+
+Replay runs as fast as the machine manages unless you add `--realtime`,
+which plays the file at the recording's own pace, so a hardware-free replay
+can drive the servers described below:
+
+```sh
+cat > /tmp/v1/demo.toml <<'EOF'
+[server]
+station_callsign = "W5AU"   # your call; becomes `DX de W5AU-#:`
+bind_addr = "127.0.0.1"     # this machine only
+EOF
+manta run --source /tmp/v1/v1.wav --source-iq --realtime --config /tmp/v1/demo.toml
+```
+
+In a second terminal, within about 20 seconds, run `telnet localhost 7300`
+and enter any callsign at the prompt: W1AW's CQ arrives as a `DX de` line
+about 21 seconds into the replay, and the server stays up for the full 120
+seconds. Connected later than that? Type `sh/dx` to list the spots already
+sent. Add `--loop` to keep a recording playing until you press Ctrl-C (a
+station is spotted again at most every 10 minutes).
 
 `manta --help` lists every subcommand and flag.
 
@@ -222,6 +241,17 @@ and the problem when something is wrong:
 ```sh
 manta config init                         # writes ./manta.toml; never replaces one
 manta config check --config manta.toml
+```
+
+Then `manta doctor` checks the machine itself: the audio library, that the
+server ports are free, the clock against an NTP server, that each enabled
+RBN uplink target accepts a connection, and that the receiver opens and
+hears something. Each check prints `PASS`, `WARN`, `FAIL` or `SKIP` with a
+fix for every problem, and it exits 1 when a check fails. See
+[docs/RUNBOOKS/setup-checks.md](docs/RUNBOOKS/setup-checks.md).
+
+```sh
+manta doctor --config manta.toml
 ```
 
 Start the server in one terminal. It runs in the foreground until you stop it:
@@ -561,11 +591,18 @@ criteria.
 
 ## Documentation
 
+[docs/README.md](docs/README.md) says where operators, contributors and
+researchers each start, and lists every runbook.
+
 **Running a node:** [docs/GUIDES/rbn-node.md](docs/GUIDES/rbn-node.md)
 (from install to a running node) · [docs/GUIDES/kiwisdr.md](docs/GUIDES/kiwisdr.md)
 (KiwiSDR etiquette) · [docs/GUIDES/raspberry-pi.md](docs/GUIDES/raspberry-pi.md)
 (Pi install and service) · [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 (exposing the servers safely) · the "Run it as a node" section above ·
+[docs/CONFIG.md](docs/CONFIG.md) (every config key, its default and what
+reads it) · [docs/METRICS.md](docs/METRICS.md) (every `/metrics` family,
+`/healthz` and `/status`) · [docs/SPOT-SCHEMA.md](docs/SPOT-SCHEMA.md)
+(every field of the `:7301` JSON spot stream) ·
 [packaging/README.md](packaging/README.md) (running unattended under
 systemd, launchd or Docker Compose) ·
 [docs/RUNBOOKS/secondary-skimmer-field-node.md](docs/RUNBOOKS/secondary-skimmer-field-node.md)

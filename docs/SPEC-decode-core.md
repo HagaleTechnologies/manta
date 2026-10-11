@@ -969,7 +969,7 @@ flush_gap_dits = 7.0
 # device, or when command-line flags pick the source. Each type takes only
 # its own source keys (required ones marked *):
 #   audio: device
-#   file:  path*, iq
+#   file:  path*, iq, realtime, loop
 #   kiwi:  host*, freq_hz*, port, password
 #   soapy: driver*, freq_hz*, rate_hz*, gain_db   (build with --features soapy)
 #   hpsdr: host*, freq_hz*, rate_hz*, port        (build with --features hpsdr)
@@ -985,6 +985,8 @@ flush_gap_dits = 7.0
 # device = "USB Audio"        # audio: device-name substring; omit for the default device
 # path = "capture.wav"        # file: relative to this file's directory
 # iq = false                  # file: true for a raw complex-IQ WAV (--source-iq)
+# realtime = false            # file: replay at the recording's own pace (run only; --realtime)
+# loop = false                # file: replay again from the start each time it ends, until stopped; implies realtime (run only; --loop)
 # driver = "driver=rtlsdr"    # soapy: SoapySDR device args
 # rate_hz = 192000.0          # soapy, hpsdr: sample rate, Hz
 # gain_db = 30.0              # soapy: omit for the device's AGC
@@ -1157,6 +1159,11 @@ that takes `--config` (`run`, `soak`, `doctor`, `decode`, `oracle`) reads
 constants: listener ports and the per-listener connection/rate quotas
 (MAN-57/MAN-61) are documented on `manta_server::config::ServerConfig`'s
 own fields, with the exposure policy in ARCHITECTURE §7.
+
+`docs/CONFIG.md` is the operator's per-key reference: every key of every
+table, `[[rbn_uplink]]` included, with its default and which commands and
+engines it affects. This section stays normative for the decode-core
+defaults.
 
 ## 10. Deviations from ARCHITECTURE.md
 
