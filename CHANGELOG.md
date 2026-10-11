@@ -29,16 +29,12 @@ acceptance gates.
 
 ### Added
 
-<<<<<<< HEAD
 - Prebuilt archives for Linux (x86-64, arm64), macOS (x86-64, arm64) and
   Windows (x86-64) on each GitHub Release, with `SHA256SUMS` and a
   build-provenance attestation (MAN-298).
-=======
 - Operator guides for [running an RBN node](docs/GUIDES/rbn-node.md),
   [KiwiSDR etiquette](docs/GUIDES/kiwisdr.md), and
   [Raspberry Pi installation and service setup](docs/GUIDES/raspberry-pi.md) (MAN-148).
-
->>>>>>> ec8b0ca4df7703b5572b3a798519e5279ff7c8c0
 - `manta run` takes `-v`/`-vv` and `-q`/`-qq`/`-qqq` and
   `--log-level <LEVEL>`, each shorthand for `RUST_LOG=<level>` that
   overrides it, and `--log-format json`, which writes every stderr log line
