@@ -48,7 +48,10 @@ query, clock classifier). `manta_engine::doctor()`, `DoctorReport`,
   `--ntp-server`; there is no switch to turn the check off, and on Linux the
   kernel state still gives a PASS when the server cannot be reached.
 - **D6 — Uplink.** Each enabled target is resolved, then each address is
-  tried with a 5 s connect timeout, all within 10 s per target. The first
+  tried with up to a 5 s connect timeout, all within 10 s per target; an
+  attempt never takes so much that a later address is left under 1 s (or
+  under an even share of what remains), so black-holed early addresses
+  cannot starve a reachable later one the daemon would reach. The first
   accepted connection is dropped at once. Doctor reads no prompt and sends
   no login: a collector's prompt may lack a newline, and the login exchange
   is `manta status`'s territory once the daemon runs. Rows use the daemon's

@@ -337,6 +337,9 @@ pub(crate) fn classify_bind_error(l: &Listener, e: &io::Error) -> Check {
 pub(crate) const UPLINK_BUDGET: Duration = Duration::from_secs(10);
 /// One address's connect limit, inside `UPLINK_BUDGET`.
 const UPLINK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// What an earlier address's attempt always leaves each later one: a slow
+/// link's TCP handshake, with room to spare.
+const UPLINK_ATTEMPT_RESERVE: Duration = Duration::from_secs(1);
 /// How long past its own budget a network check's thread is waited for;
 /// a stalled name lookup cannot be cancelled, so it is abandoned.
 const THREAD_GRACE: Duration = Duration::from_secs(1);
@@ -363,6 +366,10 @@ fn connect_host(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
 
 /// Resolve `host`, then try each address until one accepts, all within
 /// `budget`. The accepted connection is dropped at once: nothing is sent.
+/// Each attempt is capped so that every later address still has
+/// `UPLINK_ATTEMPT_RESERVE` (or an even share of what is left, when that is
+/// smaller): black-holed addresses cannot spend the time a reachable later
+/// one needs, as `manta run` would also try it.
 pub(crate) fn uplink_probe(
     host: &str,
     port: u16,
@@ -376,13 +383,13 @@ pub(crate) fn uplink_probe(
         return Err(ProbeError::Resolve("no addresses".to_string()));
     }
     let mut last = None;
-    for addr in &addrs {
+    for (i, addr) in addrs.iter().enumerate() {
         let remaining = budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             break;
         }
         let attempt = Instant::now();
-        match connect(addr, remaining.min(UPLINK_CONNECT_TIMEOUT)) {
+        match connect(addr, uplink_attempt(remaining, addrs.len() - i)) {
             Ok(stream) => {
                 let took = attempt.elapsed();
                 drop(stream);
@@ -399,6 +406,19 @@ pub(crate) fn uplink_probe(
             _ => ProbeError::Other(e.to_string()),
         },
     })
+}
+
+/// One address's connect limit when `left` addresses (this one included)
+/// share `remaining`: at most `UPLINK_CONNECT_TIMEOUT`, and no more than
+/// leaves each later address `UPLINK_ATTEMPT_RESERVE`, but never less than
+/// an even share of `remaining` (capped by the same timeout).
+fn uplink_attempt(remaining: Duration, left: usize) -> Duration {
+    let left = u32::try_from(left.max(1)).unwrap_or(u32::MAX);
+    let reserved = UPLINK_ATTEMPT_RESERVE.saturating_mul(left - 1);
+    let share = remaining / left;
+    UPLINK_CONNECT_TIMEOUT
+        .min(remaining.saturating_sub(reserved).max(share))
+        .min(remaining)
 }
 
 /// The only place uplink detail and fix strings are written.
@@ -1232,6 +1252,64 @@ mod tests {
     fn black_hole(_: &SocketAddr, _: Duration) -> io::Result<TcpStream> {
         std::thread::sleep(Duration::from_millis(300));
         Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"))
+    }
+
+    #[test]
+    fn each_later_address_keeps_time_to_connect() {
+        // The default budget over three addresses: 5 s, 4 s, then the last 1 s.
+        assert_eq!(uplink_attempt(UPLINK_BUDGET, 1), UPLINK_CONNECT_TIMEOUT);
+        assert_eq!(uplink_attempt(UPLINK_BUDGET, 3), UPLINK_CONNECT_TIMEOUT);
+        assert_eq!(
+            uplink_attempt(Duration::from_secs(5), 2),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            uplink_attempt(Duration::from_secs(1), 1),
+            Duration::from_secs(1)
+        );
+        // More addresses than whole reserves: an even share each.
+        assert_eq!(
+            uplink_attempt(Duration::from_secs(10), 20),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn a_third_address_is_reached_after_two_black_holes() {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        fn three(_: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+            Ok(vec![
+                SocketAddr::from(([192, 0, 2, 1], port)),
+                SocketAddr::from(([192, 0, 2, 2], port)),
+                SocketAddr::from(([127, 0, 0, 1], port)),
+            ])
+        }
+        // The first two addresses swallow their whole timeout, as a
+        // black-holing firewall would.
+        fn two_black_holes(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            if addr.ip().is_loopback() {
+                return TcpStream::connect_timeout(addr, timeout);
+            }
+            std::thread::sleep(timeout);
+            Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"))
+        }
+        // A budget below one reserve: each address gets an even share, so
+        // the first black hole cannot spend all of it.
+        let got = uplink_probe(
+            "h",
+            port,
+            Duration::from_millis(600),
+            three,
+            two_black_holes,
+        );
+        assert!(got.is_ok(), "{got:?}");
+        assert_eq!(CALLS.load(Ordering::SeqCst), 3);
+        drop(listener);
     }
 
     #[test]
