@@ -404,6 +404,11 @@ pub struct ReferenceResult {
     pub peak_offset_hz: Option<f64>,
     #[serde(skip)]
     pub runner_up_offset_hz: Option<f64>,
+    /// Ambiguous because the segments' median carrier is not the averaged
+    /// spectrum's peak (`peak_offset_hz` and `runner_up_offset_hz`), not
+    /// because the margin is under `MIN_AMBIGUITY_MARGIN_DB`.
+    #[serde(skip)]
+    pub peaks_disagree: bool,
 }
 
 /// Everything a calibration run measured.
@@ -534,6 +539,7 @@ fn evaluate(p: &PlannedReference, est: &CarrierEstimator) -> Result<ReferenceRes
         ambiguity_margin_db: None,
         peak_offset_hz: None,
         runner_up_offset_hz: None,
+        peaks_disagree: false,
     };
     if valid.len() < MIN_VALID_SEGMENTS {
         return Ok(out);
@@ -557,6 +563,7 @@ fn evaluate(p: &PlannedReference, est: &CarrierEstimator) -> Result<ReferenceRes
             out.status = ReferenceStatus::Ambiguous;
             out.peak_offset_hz = Some(offset);
             out.runner_up_offset_hz = Some(averaged);
+            out.peaks_disagree = true;
             return Ok(out);
         }
     }
@@ -1019,6 +1026,7 @@ mod tests {
             r.ambiguity_margin_db.unwrap() >= MIN_AMBIGUITY_MARGIN_DB,
             "{r:?}"
         );
+        assert!(r.peaks_disagree, "{r:?}");
         assert_eq!(report.result(), None);
     }
 

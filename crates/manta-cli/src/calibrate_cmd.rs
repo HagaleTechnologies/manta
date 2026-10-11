@@ -187,6 +187,14 @@ fn segments_text(r: &ReferenceResult) -> String {
 /// Why `r` was not measured.
 fn failure_text(r: &ReferenceResult) -> String {
     match r.status {
+        ReferenceStatus::Ambiguous if r.peaks_disagree => format!(
+            "two carriers alternate in the ±{:.1} Hz search window: most one-second segments \
+             put it at {:+.1} Hz, the average over the run at {:+.1} Hz; pass --reference-hz \
+             to use another reference, or measure at another time",
+            r.search_half_width_hz,
+            r.peak_offset_hz.unwrap_or(0.0),
+            r.runner_up_offset_hz.unwrap_or(0.0)
+        ),
         ReferenceStatus::Ambiguous => format!(
             "two carriers within {MIN_AMBIGUITY_MARGIN_DB:.0} dB of each other in the \
              ±{:.1} Hz search window ({:+.1} Hz and {:+.1} Hz); narrow --search-ppm or pass \
@@ -606,6 +614,7 @@ mod tests {
             ambiguity_margin_db: None,
             peak_offset_hz: None,
             runner_up_offset_hz: None,
+            peaks_disagree: false,
         }
     }
 
@@ -706,6 +715,24 @@ mod tests {
              ±705.0 Hz search window (+12.3 Hz and +410.8 Hz); narrow --search-ppm or pass \
              --reference-hz"
         ));
+        // The median/average disagreement, with a margin over 6 dB, is not
+        // reported as two carriers within 6 dB.
+        let disagree = report(vec![ReferenceResult {
+            ambiguity_margin_db: Some(11.6),
+            peaks_disagree: true,
+            ..ambiguous.references[0].clone()
+        }]);
+        let text = render_human(&disagree, 0.0, "nothing set");
+        assert!(
+            text.contains(
+                "tried: 14100000.0 Hz, NCDXF beacon: two carriers alternate in the ±705.0 Hz \
+                 search window: most one-second segments put it at +12.3 Hz, the average over \
+                 the run at +410.8 Hz; pass --reference-hz to use another reference, or measure \
+                 at another time"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("within 6 dB"), "{text}");
     }
 
     #[test]
