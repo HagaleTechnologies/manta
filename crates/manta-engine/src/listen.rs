@@ -1014,6 +1014,10 @@ mod tests {
             |_| {},
         )
         .unwrap();
+        // warmup_hops = 0 starts on the uninitialised -140 dB floor and
+        // spawns hundreds of noise tracks. Their bogus calls depend on the
+        // spawn layout; these tests measure when lists apply to W1AW.
+        spots.retain(|(call, _)| call == "W1AW");
         (spots, reads.load(Ordering::Relaxed))
     }
 

@@ -4,14 +4,14 @@
 //! Farnsworth-free spacing) -- the gap that let the real-signal timing
 //! defect motivating this redesign go undetected.
 //!
-//! All nine tests here run `manta decode --json --engine hsmm` (SPEC v2's
-//! stage-2 engine). Task 12 (2026-09-09) measured the real `HsmmDecoder`
-//! against every one and un-ignored the three that clear their bars
-//! (vr6a, vr6b, vr7); the other six (vr1-vr5, vr8) stay
-//! `#[ignore = "stage-2 gate, un-ignored by Task 12"]` -- see
-//! docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md for the
-//! measured CER/WPM/word-boundary numbers and failure-kind analysis. The
-//! overall stage-2 gate (SPEC v2 §8.4) is FAIL.
+//! Full gates use `manta decode --json --engine hsmm` (SPEC v2's stage-2
+//! engine). MAN-172 fixes detector churn and enables VR3/VR4 alongside
+//! VR6a/VR6b/VR7. VR1/VR2 pass CER but still miss their reported-WPM bars;
+//! a separate test pins their one-track/CER invariant under both engines.
+//! VR5/VR8 remain ignored for co-channel/fading failures. See
+//! docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md and the original
+//! docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md. The overall
+//! stage-2 gate (SPEC v2 §8.4) remains FAIL.
 
 use std::collections::HashSet;
 use std::process::Command;
@@ -19,10 +19,17 @@ use std::process::Command;
 fn decode_report(
     spec: &manta_testkit::vectors::VectorSpec,
 ) -> (serde_json::Value, manta_testkit::vectors::Manifest) {
+    decode_report_with_engine(spec, "hsmm")
+}
+
+fn decode_report_with_engine(
+    spec: &manta_testkit::vectors::VectorSpec,
+    engine: &str,
+) -> (serde_json::Value, manta_testkit::vectors::Manifest) {
     let dir = tempfile::tempdir().unwrap();
     let manifest = manta_testkit::vectors::write_fixture_set(spec, dir.path()).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_manta"))
-        .args(["decode", "--json", "--engine", "hsmm"])
+        .args(["decode", "--json", "--engine", engine])
         .arg(dir.path().join(format!("{}.wav", spec.name)))
         .output()
         .unwrap();
@@ -360,8 +367,44 @@ fn word_boundary_fraction_forgives_the_drop_independently_of_other_errors() {
     assert!((wb - 2.0 / 3.0).abs() < 1e-9, "got {wb}");
 }
 
+/// Pin MAN-172's one-track/CER invariant while the full VR1/VR2 gates
+/// wait on the HSMM reported-WPM follow-up.
 #[test]
-#[ignore = "stage-2 gate, un-ignored by Task 12"]
+fn vr1_vr2_high_snr_signal_holds_one_track_and_decodes() {
+    for (spec, char_gate) in [
+        (manta_testkit::vectors::vr1(), 0.05),
+        (manta_testkit::vectors::vr2(), 0.10),
+    ] {
+        for engine in ["hsmm", "legacy"] {
+            let (report, manifest) = decode_report_with_engine(&spec, engine);
+            let decoded = report["text"].as_str().unwrap();
+            let promoted = report["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|ev| ev["event"] == "TrackPromoted")
+                .count();
+            assert_eq!(promoted, 1, "{} {engine}: decoded {decoded:?}", spec.name);
+            let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
+            assert!(
+                cer <= char_gate,
+                "{} {engine}: CER {cer} > {char_gate}\nexpected: {}\ndecoded:  {decoded}",
+                spec.name,
+                manifest.keyed_texts[0]
+            );
+            if spec.name == "vr1" && engine == "hsmm" {
+                let wb = word_boundary_fraction(&manifest.keyed_texts[0], decoded);
+                assert!(
+                    wb >= 0.95,
+                    "VR1 word boundaries must be >= 95%, got {wb}; decoded {decoded:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "MAN-172 fixed the empty decode (CER passes); WPM gate still fails on HSMM's noisy reported speed (measured 36.10 vs 40±2) -- follow-up"]
 fn vr1_contest_40_passes_end_to_end() {
     let spec = manta_testkit::vectors::vr1();
     let (report, manifest) = decode_report(&spec);
@@ -380,7 +423,7 @@ fn vr1_contest_40_passes_end_to_end() {
 }
 
 #[test]
-#[ignore = "stage-2 gate, un-ignored by Task 12"]
+#[ignore = "MAN-172 fixed the empty decode (CER passes); WPM gate still fails on HSMM's noisy reported speed (measured 41.24 vs 45±3) -- follow-up"]
 fn vr2_contest_45_passes_end_to_end() {
     let spec = manta_testkit::vectors::vr2();
     let (report, manifest) = decode_report(&spec);
@@ -397,7 +440,6 @@ fn vr2_contest_45_passes_end_to_end() {
 }
 
 #[test]
-#[ignore = "stage-2 gate, un-ignored by Task 12"]
 fn vr3_deep_keying_passes_end_to_end() {
     let spec = manta_testkit::vectors::vr3();
     let (report, manifest) = decode_report(&spec);
@@ -421,7 +463,6 @@ fn vr3_deep_keying_passes_end_to_end() {
 }
 
 #[test]
-#[ignore = "stage-2 gate, un-ignored by Task 12"]
 fn vr4_hard_edges_passes_end_to_end() {
     let spec = manta_testkit::vectors::vr4();
     let (report, manifest) = decode_report(&spec);

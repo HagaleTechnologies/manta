@@ -21,6 +21,14 @@ git history and `docs/DECISIONS/`.
 
 ## [Unreleased]
 
+### Decoder output
+
+- Strong signals (about +24 dB SNR or more in 2500 Hz) no longer spawn
+  duplicate tracks on adjacent channels that take over their decoder every
+  fraction of a second. They retain one continuous track and recover their
+  text and frequency (MAN-172). HSMM's VR1/VR2 reported-speed gates remain
+  open.
+
 ### Added
 
 - Operator guides for [running an RBN node](docs/GUIDES/rbn-node.md),
@@ -33,12 +41,25 @@ git history and `docs/DECISIONS/`.
   as one JSON object for a log aggregator (MAN-124).
 - Contributor setup and review guidance, bug and hardware report templates,
   feature requests, and a MAN-linked pull request template (MAN-151).
+- `manta decode --center-freq-hz HZ` sets the recording's RF centre
+  frequency, overriding its `<name>.json` sidecar. Without the flag, a
+  recording with no sidecar (or a sidecar whose `center_freq_hz` is not
+  positive) gets a warning that its frequencies are baseband offsets,
+  and is decoded at a 0.0 centre (MAN-131).
 
 ### Fixed
 
 - `manta run`'s log lines carry no colour escape codes when stderr is not a
   terminal (a file, a pipe, the journal or a container log); `NO_COLOR` is
   still honoured on a terminal (MAN-124).
+- `manta run`/`listen`/`soak`/`doctor --device` keep running when the
+  sound card's capture buffer is momentarily empty, instead of stopping
+  with exit 0 or `audio source ended during startup calibration`. A device
+  that delivers nothing for 5 s is reported as an error (MAN-231).
+- Audio device errors name the device and the 48000 Hz requirement and
+  say what to check next, with a macOS microphone-permission hint, and a
+  device delivering only digital silence gets a warning (MAN-131).
+  Decoder output is unchanged.
 
 ### Changed
 

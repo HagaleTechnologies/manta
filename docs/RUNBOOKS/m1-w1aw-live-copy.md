@@ -39,3 +39,38 @@ copying speed for a first pass.
 ## Runs
 
 (append entries here as you run this)
+
+### 2026-10-11 — MAN-231 before: `listen --device` on main @ ec8b0ca
+
+Recorded during MAN-231 planning. Input: ALSA's software null capture
+device (`manta devices`: "Discard all samples (playback) or generate zero
+samples (capture)"), in a headless container, not rig audio. It delivers
+zeros and is not paced to real time. Binary: `cargo build -p manta-cli
+--bin manta`.
+
+| Procedure | Result |
+|---|---|
+| 5 × `timeout --preserve-status -s INT -k 10 60 manta listen --device "generate zero" --dial-freq-hz 14030000` | 5 of 5 exited **0** on their own before 60 s: after 14.23 s, 4.09 s, 9.48 s, 38.69 s and 10.27 s. Stderr held only the `manta: listening; …` banner, no error. |
+| Same command, SIGINT at 2 s, 5 trials | 2 of 5 had already exited 0 on their own (0.66 s, 1.05 s); the other 3 stopped 5–7 ms after SIGINT. |
+
+This reproduces MAN-231's early clean exit. It does not reproduce the
+literal `audio source ended during startup calibration`: the null device
+fills the 2 s calibration buffer before its ring runs empty. The real-rig
+60 s run and the W1AW copy are still outstanding.
+
+### 2026-10-11 — MAN-231 after: `listen --device` on branch MAN-231 @ 1302a0c
+
+Same input (ALSA's software null capture device in a headless container,
+not rig audio), same binary build, same command.
+
+| Procedure | Result |
+|---|---|
+| 3 × `timeout --preserve-status -s INT -k 10 60 manta listen --device "generate zero" --dial-freq-hz 14030000` | 3 of 3 still running at 60 s; each exited 0 at 60.01 s after SIGINT. Stderr held only the banner. |
+| Same command, SIGINT at 2 s, 5 trials | 5 of 5 still running at 2 s; exited 0 at 2.008 s, 2.016 s, 2.009 s, 2.010 s and 2.009 s, i.e. 8–16 ms after SIGINT. |
+
+A device that delivers nothing now fails its read after 5 s
+(`audio input delivered no samples in 5 s at 48000 Hz`) instead of ending
+the run as exit 0: `soak` and `doctor` exit 1, and `run`/`listen` log the
+loss and reopen the device (MAN-73). That path is covered by unit tests in
+`crates/manta-input/src/audio.rs`, since this container has no device that
+stalls. The real-rig 60 s run and the W1AW copy are still outstanding.

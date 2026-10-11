@@ -265,6 +265,27 @@ but that's real algorithm work, not a cheap one-line knob flip, and
 belongs in a dedicated MAN-166 follow-up ticket, not an open-ended
 tuning session inside a measurement task).
 
+### 2026-10-11 addendum: MAN-172 fixes high-SNR track churn
+
+VR1-VR4's total or near-total decode collapse came from `TrackManager`
+creating candidates on PFB leakage skirts, then discarding the incumbent
+on exact-SNR merge ties. Both legacy and HSMM had the same promotion
+churn. MAN-172 requires a local smoothed-power peak for a spawn decision
+and preserves the older track on equal-SNR merges.
+
+Post-fix VR3 and VR4 pass their full gates and run in CI. VR1 and VR2
+pass CER, and VR1 passes word-boundary accuracy, but their HSMM WPM
+reports remain outside the full gates: 36.10 versus 40 +/- 2 and 41.24
+versus 45 +/- 3. A new non-ignored test covers one-track continuity and
+CER under both engines. VR1/VR2's full tests remain ignored for WPM.
+
+This corrects the original VR4 element-split/merge attribution above:
+VR4 shared the track-churn defect. V10's boundary failure and V1's
+startup CER gap are separate. The original measurements remain intact;
+the overall stage-2 verdict remains FAIL. See
+[MAN-172's decision record](2026-10-11-man172-high-snr-track-churn.md)
+for the trace, before/after counts and speed-reporting follow-ups.
+
 ## 5. Determinism
 
 `crates/manta-cli/tests/determinism_hsmm.rs` (Task 11): asserts three
