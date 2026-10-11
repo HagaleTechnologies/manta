@@ -51,20 +51,15 @@ fn v2_wpm_is_within_spec_tolerance() {
     assert!((wpm - 35.0).abs() < 2.0, "wpm {wpm}");
 }
 
-/// CER only: SPEC §2.1 warmup-floor dilution, unrelated to MAN-103. That
-/// pin (docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md, pin 7/8)
-/// blamed keying jitter interacting with the channelizer's transient
-/// response at V2's near-channel-edge offset, measuring 8.94-23 % CER under
-/// the old placeholder detector. Under the real detector this is CER 0.0325
-/// (full 90 s V2 scene, with jitter) / 0.0203 (jitter removed) -- jitter now
-/// contributes ~1.2 points, not 8-23. Both numbers match pure SPEC §2.1
-/// warmup-floor dilution: CER shrinks with scene duration (90s: 0.0325,
-/// 200s: 0.0128, 400s: 0.0064, converging toward 0), with a clean decode
-/// throughout the middle of the scene. Left `#[ignore]`d rather than
-/// widened -- its own separate investigation, out of MAN-103's scope
-/// (docs/DECISIONS/2026-09-06-broad-review-decisions.md D8).
+/// CER only. Was `#[ignore]`d for SPEC §2.1 warmup-floor dilution
+/// (unrelated to MAN-103): under the old 2 s detector warm-up V2's track
+/// promoted at ~1.96 s, losing the scene's leading "CQ " (CER 0.0325 on the
+/// full 90 s scene, shrinking with duration toward 0). MAN-115 replaced
+/// that warm-up with the pre-roll skip, the block-median floor seed and a
+/// 25 ms inhibit (SPEC §2.2 "Startup"), so V2 now promotes at the start of
+/// the scene and clears SPEC §7's CER <= 0.01 -- see
+/// docs/DECISIONS/2026-10-11-man115-startup-latency.md.
 #[test]
-#[ignore]
 fn v2_char_accuracy_meets_spec() {
     let spec = manta_testkit::vectors::v2();
     let (report, manifest) = decode_report(&spec);

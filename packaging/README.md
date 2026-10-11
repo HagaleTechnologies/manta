@@ -109,7 +109,7 @@ sends no spots until you set `dry_run = false`.
 
 ```console
 $ ./manta run --config manta.toml
-Error: manta.toml: server.station_callsign is still the example "N0CALL" -- set your own callsign
+error: manta.toml: server.station_callsign is still the example "N0CALL" -- set your own callsign
 ```
 
 It exits with status 1 before it opens the receiver or any listener;

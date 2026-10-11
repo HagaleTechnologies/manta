@@ -189,10 +189,12 @@ fn cpu_budget_scene() -> (Vec<Complex32>, f64, f64, PipelineConfig) {
 /// `cfg.detector.warmup_hops` (see `track.rs`'s `DetectorConfig`) inhibits
 /// ALL track creation for this many hops -- no decoder-pool work happens
 /// in that window, only channelizer + noise-floor-estimator cost. At the
-/// default 750 hops / `FO_HZ` (375 Hz hop rate), that's exactly 2.0s.
+/// pre-MAN-115 default of 750 hops / `FO_HZ` (375 Hz hop rate) that was
+/// 2.0s; MAN-115's 9-hop default makes it 24 ms, so the correction is now
+/// negligible but kept for configs that raise `warmup_ms`.
 /// Dividing a ratio by the FULL scene duration therefore dilutes the
 /// steady-state (all-300-tracks-active) cost by warmup/duration -- 2s of
-/// 15s, ~13% -- understating the ratio relative to what ROADMAP.md's
+/// 15s, ~13%, under the old default -- understating the ratio relative to what ROADMAP.md's
 /// "< X% of one core" criterion means (found via Codex review on this
 /// PR). `decode_samples` has no public API to time only the post-warmup
 /// portion of a single call (adding one would be a `manta-engine`
