@@ -29,13 +29,22 @@ acceptance gates.
 
 ### Added
 
+<<<<<<< HEAD
 - Prebuilt archives for Linux (x86-64, arm64), macOS (x86-64, arm64) and
   Windows (x86-64) on each GitHub Release, with `SHA256SUMS` and a
   build-provenance attestation (MAN-298).
+=======
+- Operator guides for [running an RBN node](docs/GUIDES/rbn-node.md),
+  [KiwiSDR etiquette](docs/GUIDES/kiwisdr.md), and
+  [Raspberry Pi installation and service setup](docs/GUIDES/raspberry-pi.md) (MAN-148).
+
+>>>>>>> ec8b0ca4df7703b5572b3a798519e5279ff7c8c0
 - `manta run` takes `-v`/`-vv` and `-q`/`-qq`/`-qqq` and
   `--log-level <LEVEL>`, each shorthand for `RUST_LOG=<level>` that
   overrides it, and `--log-format json`, which writes every stderr log line
   as one JSON object for a log aggregator (MAN-124).
+- Contributor setup and review guidance, bug and hardware report templates,
+  feature requests, and a MAN-linked pull request template (MAN-151).
 
 ### Fixed
 
@@ -45,6 +54,11 @@ acceptance gates.
 
 ### Changed
 
+- JSON spots' `deGrid`/`deLat`/`deLon` are the operator's configured
+  station position (`[server].operator_grid`, or the new `operator_lat`/
+  `operator_lon`), and `null` when none is configured, instead of the
+  station's country centroid from `cty.dat` (MAN-138). Decoder output is
+  unchanged.
 - `manta --version` (and `-V`) names the exact build: crate version, git
   commit and compiled-in features, for example
   `manta 0.1.0 (git 1a2b3c4d5e6f; features: hpsdr)` (MAN-83).

@@ -116,6 +116,7 @@ struct ClientCtx {
     metrics: Arc<Metrics>,
     cty: Arc<Table>,
     station_call: String,
+    station_location: Option<crate::config::StationLocation>,
     decoder_version: String,
     shutdown: watch::Receiver<bool>,
     drain_deadline: Duration,
@@ -127,6 +128,7 @@ impl ClientCtx {
         let msg = SpotMessage::from_spot(
             &bus_spot.spot,
             &self.station_call,
+            self.station_location.as_ref(),
             &self.cty,
             &self.decoder_version,
             unix_ts,
@@ -146,6 +148,10 @@ pub struct JsonStreamConfig {
     pub metrics: Arc<Metrics>,
     pub cty: Arc<Table>,
     pub station_call: String,
+    /// This station's `deGrid`/`deLat`/`deLon` (MAN-138), resolved once at
+    /// start-up by `ServerConfig::station_location`; `None` sends null
+    /// position fields.
+    pub station_location: Option<crate::config::StationLocation>,
     pub decoder_version: String,
     pub shutdown: watch::Receiver<bool>,
     /// MAN-45 (round-16 finding): the per-client shutdown-drain deadline --
@@ -197,6 +203,7 @@ pub async fn serve(
         metrics: config.metrics,
         cty: config.cty,
         station_call: config.station_call,
+        station_location: config.station_location,
         decoder_version: config.decoder_version,
         shutdown: config.shutdown,
         drain_deadline: config.drain_deadline,

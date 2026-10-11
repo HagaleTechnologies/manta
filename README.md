@@ -205,6 +205,8 @@ flag entirely when yours is on 8073:
 manta listen --kiwi-host <your-kiwi-host> --kiwi-port <your-kiwi-port> --kiwi-freq-hz 7030000
 ```
 
+Someone else's KiwiSDR is shared: read [docs/GUIDES/kiwisdr.md](docs/GUIDES/kiwisdr.md) before you leave manta connected to one.
+
 File replay (`listen --source`) takes 48 kHz mono audio, or a raw complex-IQ
 WAV with `--source-iq`. IQ replay is not resampled: the channelizer runs
 only at its table rates — any rate whose `fs / 93.75` is a power of two,
@@ -224,6 +226,8 @@ below is being worked on.
 `manta --help` lists every subcommand and flag.
 
 ## Run it as a node
+
+For a step-by-step walk from install to a firewalled node with the uplink in dry-run, follow [docs/GUIDES/rbn-node.md](docs/GUIDES/rbn-node.md).
 
 One TOML file describes a node: the station and servers in `[server]`, the
 receiver in `[input]`. With a `[server]` table, `run --config` starts the
@@ -298,6 +302,32 @@ manta status --config server.toml
 Forwarding to an upstream RBN-style collector is a `[[rbn_uplink]]`
 block. `dry_run` defaults to `true`, so an uplink connects and logs in but
 transmits nothing until you set it to `false` deliberately.
+
+### Changing lists without a restart
+
+With a `[server]` table, `SIGHUP` makes a running daemon re-read its config
+file and apply the `[spot]` lists (`allowlist` and the `blocklist_path` and
+`notch_path` files) and each `[[rbn_uplink]]` block's `dry_run`. Connected
+clients, the `sh/dx` history and uplink connections stay up (MAN-78).
+
+```sh
+manta config check --config server.toml   # the same checks a reload runs
+kill -HUP "$(pidof manta)"               # systemd: systemctl reload manta
+# Docker: docker kill --signal=HUP <container>
+```
+
+The log reports `reload: applied` with the new list sizes, or
+`reload: rejected; still running the previous configuration` with the
+reason; a rejected reload changes nothing.
+Every other setting still needs a restart: a reload that finds one changed
+applies the lists anyway and names the setting in a warning.
+That includes `cty_path` and `scp_path`: a reload checks that those
+files still parse, but keeps the tables manta started with, so a new
+cty.dat or master.scp, even at the same path, needs a restart.
+Command-line `--allowlist`/`--blocklist`/`--notch` keep overriding the file. Without a
+`[server]` table, `SIGHUP` stops manta just as `SIGINT` and `SIGTERM` do.
+Windows has no `SIGHUP`, so no reload. During shutdown the daemon logs
+`SIGHUP ignored; the daemon is shutting down` at INFO and applies nothing.
 
 `bind_addr` has no loopback default — omit it and the telnet and JSON
 servers bind `0.0.0.0`, every interface, as a public cluster node expects.
@@ -562,7 +592,10 @@ criteria.
 
 ## Documentation
 
-**Running a node:** [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
+**Running a node:** [docs/GUIDES/rbn-node.md](docs/GUIDES/rbn-node.md)
+(from install to a running node) · [docs/GUIDES/kiwisdr.md](docs/GUIDES/kiwisdr.md)
+(KiwiSDR etiquette) · [docs/GUIDES/raspberry-pi.md](docs/GUIDES/raspberry-pi.md)
+(Pi install and service) · [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 (exposing the servers safely) · the "Run it as a node" section above ·
 [packaging/README.md](packaging/README.md) (running unattended under
 systemd, launchd or Docker Compose) ·
@@ -570,7 +603,9 @@ systemd, launchd or Docker Compose) ·
 (a 30-day secondary-skimmer field node behind an RBN Aggregator, MAN-96) ·
 `manta <subcommand> --help` for every flag.
 
-**Contributing:** [ARCHITECTURE.md](ARCHITECTURE.md) — the nine-crate
+**Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) — setup, build and
+test commands, golden-vector rules and the pull request review process ·
+[ARCHITECTURE.md](ARCHITECTURE.md) — the nine-crate
 workspace, data flow, and the channelizer, decoder, validation and output
 design · [docs/DECISIONS/](docs/DECISIONS/) — dated design decisions and
 implementation pins · [wiki/INDEX.md](wiki/INDEX.md) — accumulated
@@ -596,6 +631,9 @@ recall/CER-vs-SNR curve on synthetic signals, regenerable from any build.
 
 ## Contributing
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, build and test commands,
+golden-vector rules, and the pull request review process.
+
 Open an issue or a pull request. Main moves only by PR, CI must be green, and
 the golden-vector determinism tests are the bar every decoder change has to
 clear. See [SECURITY.md](SECURITY.md) for vulnerability reporting.
@@ -611,6 +649,10 @@ output adds a `### Decoder output` entry to [CHANGELOG.md](CHANGELOG.md).
 MIT OR Apache-2.0, at your option. Unless you explicitly state otherwise, any
 contribution intentionally submitted for inclusion in this project shall be
 dual licensed as above, without any additional terms or conditions.
+
+Read the [MIT license](LICENSE-MIT) or the
+[Apache-2.0 license](LICENSE-APACHE). The
+[contributor guide](CONTRIBUTING.md#license) explains GitHub's license display.
 
 ## Keeping the prefix table current
 

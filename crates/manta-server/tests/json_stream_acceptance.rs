@@ -6,6 +6,7 @@
 
 use futures_util::StreamExt;
 use manta_server::bus::SpotBus;
+use manta_server::config::StationLocation;
 use manta_server::metrics::Metrics;
 use manta_spot::cty::Table;
 use manta_spot::{Spot, SpotType};
@@ -44,6 +45,31 @@ async fn spawn_server_with_drain_deadline(
     Arc<Metrics>,
     tokio::sync::watch::Sender<bool>,
 ) {
+    spawn_server_with(drain_deadline, None).await
+}
+
+/// MAN-138: a server whose station has a configured position, the value
+/// `ServerConfig::station_location` hands the daemon's JSON listener.
+async fn spawn_server_with_location(
+    station_location: Option<StationLocation>,
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    spawn_server_with(manta_server::tasks::CLIENT_DRAIN_DEADLINE, station_location).await
+}
+
+async fn spawn_server_with(
+    drain_deadline: Duration,
+    station_location: Option<StationLocation>,
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+) {
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
     let metrics = Arc::new(Metrics::new());
     let cty = Arc::new(Table::parse(CTY_FIXTURE));
@@ -65,6 +91,7 @@ async fn spawn_server_with_drain_deadline(
                 metrics: metrics2,
                 cty,
                 station_call: STATION_CALL.to_string(),
+                station_location,
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
                 drain_deadline,
@@ -130,6 +157,44 @@ async fn tcp_client_receives_spot_as_json_lines_message() {
     // (no telnet/uplink +7 dB conversion) plus an explicit reference field.
     assert_eq!(value["snr"], 23);
     assert_eq!(value["snrRefHz"], 2500);
+    // MAN-138: no configured station position, so none on the wire -- not
+    // the cty.dat centroid of STATION_CALL's country.
+    assert!(
+        value["deGrid"].is_null() && value["deLat"].is_null() && value["deLon"].is_null(),
+        "{value}"
+    );
+}
+
+/// MAN-138: the configured station position reaches a real TCP client as
+/// `deGrid`/`deLat`/`deLon`.
+#[tokio::test]
+async fn tcp_client_receives_the_configured_station_position() {
+    let (lat, lon) = manta_server::maidenhead::square("FN31pr").unwrap().center();
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server_with_location(Some(StationLocation {
+        grid: "FN31pr".to_string(),
+        lat,
+        lon,
+    }))
+    .await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    bus.publish(sample_spot());
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for JSON line")
+        .unwrap();
+
+    let value: serde_json::Value = serde_json::from_str(&line).expect("valid JSON line");
+    assert_eq!(value["deGrid"], "FN31pr");
+    let de_lat = value["deLat"].as_f64().expect("deLat is a number");
+    let de_lon = value["deLon"].as_f64().expect("deLon is a number");
+    assert!((de_lat - 41.729_166_666_666_67).abs() < 1e-9, "{de_lat}");
+    assert!((de_lon - -72.708_333_333_333_33).abs() < 1e-9, "{de_lon}");
+    // The dx side still comes from cty.dat.
+    assert_eq!(value["dxDxcc"], 339);
 }
 
 #[tokio::test]
@@ -573,6 +638,7 @@ async fn websocket_client_receives_spot_as_json_message() {
                 metrics,
                 cty,
                 station_call: STATION_CALL.to_string(),
+                station_location: None,
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
                 drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
@@ -676,6 +742,7 @@ async fn websocket_client_sending_an_oversized_message_is_disconnected() {
                 metrics,
                 cty,
                 station_call: STATION_CALL.to_string(),
+                station_location: None,
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
                 drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
@@ -743,6 +810,7 @@ async fn websocket_client_sending_an_unsolicited_pong_is_disconnected() {
                 metrics,
                 cty,
                 station_call: STATION_CALL.to_string(),
+                station_location: None,
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
                 drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
@@ -816,6 +884,7 @@ async fn websocket_client_sending_a_structurally_malformed_frame_is_disconnected
                 metrics,
                 cty,
                 station_call: STATION_CALL.to_string(),
+                station_location: None,
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
                 drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
@@ -942,6 +1011,7 @@ async fn websocket_client_flooding_pings_past_the_budget_is_disconnected() {
                 metrics,
                 cty,
                 station_call: STATION_CALL.to_string(),
+                station_location: None,
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
                 drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
