@@ -78,17 +78,15 @@ MAN-125: `manta devices` lists audio inputs and optional Soapy selectors;
 floor without decoding or services. See
 `docs/DECISIONS/2026-10-10-man125-source-diagnostics.md`.
 
-<<<<<<< HEAD
-MAN-172: high-SNR track churn fixed in `TrackManager` (local-peak spawn
-rule, incumbent-wins merge ties); VR3/VR4 pass, VR1/VR2 pass CER but not
-WPM. See docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md.
-=======
 MAN-138: JSON spots' `deGrid`/`deLat`/`deLon` are the operator's
 `[server].operator_grid` (its square's centre) or the new `operator_lat`/
 `operator_lon`, `null` when none is set, never a `cty.dat` country
 centroid; an inconsistent location fails config loading before I/O. See
 `docs/DECISIONS/2026-10-11-man138-station-location.md`.
->>>>>>> 40b6cf0adf9a80c82a077805371dd53aa5c5b25d
+
+MAN-172: high-SNR track churn fixed in `TrackManager` (local-peak spawn
+rule, incumbent-wins merge ties); VR3/VR4 pass, VR1/VR2 pass CER but not
+WPM. See docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md.
 
 ## Documents (read in this order)
 
