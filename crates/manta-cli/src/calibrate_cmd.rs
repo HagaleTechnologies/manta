@@ -336,21 +336,19 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
         reference_hz: args.reference_hz,
         live: !matches!(resolved.spec, LiveSourceSpec::File { .. }),
     };
-    // The config's text as it is before measuring. The file's own value
-    // comes from it, and the save refuses a file that no longer holds it:
-    // a config rewritten or retargeted during the measurement may describe
-    // another receiver.
-    let config_text = match config_path.as_deref() {
-        Some(path) => Some(
-            std::fs::read_to_string(path)
-                .with_context(|| format!("reading config file {}", path.display()))?,
-        ),
-        None => None,
-    };
+    // The config's canonical target and text before measuring. The file's
+    // own value comes from that text, and the save refuses a path that no
+    // longer resolves to that file holding it: a config rewritten or
+    // retargeted during the measurement may describe another receiver.
+    let read_before = config_path
+        .as_deref()
+        .map(config_edit::ReadBefore::read)
+        .transpose()?;
+    let config_text = read_before.as_ref().map(|r| r.text.as_str());
     let replaced_by = match (resolved.replaced_file_source, config_path.as_deref()) {
         (Some(flag), _) => Some(flag),
         (None, Some(path)) => {
-            let text = config_text.as_deref().unwrap_or_default();
+            let text = config_text.unwrap_or_default();
             env_replaced_file_source(&loaded.env_vars, text)
                 .with_context(|| format!("parsing config file {}", path.display()))?
         }
@@ -396,7 +394,7 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
 
     // The file's own value, read from its text: the loaded config already
     // carries the environment overlay.
-    let file_value = match config_text.as_deref() {
+    let file_value = match config_text {
         Some(text) => config_edit::set_freq_correction_ppm(text, 0.0)?.1,
         None => None,
     };
@@ -444,7 +442,7 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
             (SaveDecision::Save, Some(path)) => Some(save(
                 path,
                 value,
-                config_text.as_deref(),
+                read_before.as_ref(),
                 &mut written,
                 &mut save_error,
             )),
@@ -461,7 +459,7 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
                     Some(save(
                         path,
                         value,
-                        config_text.as_deref(),
+                        read_before.as_ref(),
                         &mut written,
                         &mut save_error,
                     ))
@@ -514,7 +512,7 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
 fn save(
     path: &Path,
     value: f64,
-    read_before: Option<&str>,
+    read_before: Option<&config_edit::ReadBefore>,
     written: &mut bool,
     save_error: &mut Option<anyhow::Error>,
 ) -> String {

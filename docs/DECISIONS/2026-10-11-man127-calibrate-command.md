@@ -120,16 +120,21 @@ adding to it.
     its target and the link stays a link; write a `create_new` temp file in
     the same directory (owner-only on Unix; on Windows, opened unshared and
     given the original's DACL before anything is written, because a new file
-    takes the directory's ACL) and `sync_all` it; on Unix, `chown` to the
+    takes the directory's ACL; on macOS, given the original's extended ACL,
+    or an empty one when it has none, before anything is written, because a
+    new file inherits the directory's inheritable ACEs) and `sync_all` it; on Unix, `chown` to the
     original uid and gid when they differ; on Linux, give it the original's
     POSIX access ACL, or remove the one it took from the directory's default
     ACL when the original has none, because copying the mode would unmask
     that ACL's named entries; copy the mode; validate the temp file with
     `config::load`; then rename it over the target. If the Unix owner, the
-    Linux ACL or the Windows DACL cannot be kept, the save fails and names
+    Linux or macOS ACL or the Windows DACL cannot be kept, the save fails and names
     the value to set by hand. (Windows keeps the DACL, not the owner: the
     saved file belongs to whoever ran calibrate. Other ACL kinds, such as
-    macOS extended or NFSv4 ACLs, are not copied.) A drop guard removes the
+    NFSv4 ACLs, are not copied.) Before measuring, calibrate records the
+    config's canonical target and text; the save refuses, naming the value
+    to set by hand, when the path now resolves to another file or that file
+    no longer holds the same text, because it may describe another receiver. A drop guard removes the
     temp file on every error path, and an invalid file is left
     byte-identical.
 11. **Refusals before I/O.** These are refused before any receiver is

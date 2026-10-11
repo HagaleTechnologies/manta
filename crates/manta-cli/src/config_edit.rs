@@ -98,15 +98,32 @@ impl Drop for TempGuard {
     }
 }
 
+/// A config file as calibrate read it before measuring.
+pub(crate) struct ReadBefore {
+    /// `path` canonicalized.
+    pub(crate) target: PathBuf,
+    pub(crate) text: String,
+}
+
+impl ReadBefore {
+    pub(crate) fn read(path: &Path) -> Result<Self> {
+        let target = fs::canonicalize(path)
+            .with_context(|| format!("cannot resolve config file {}", path.display()))?;
+        let text = fs::read_to_string(&target)
+            .with_context(|| format!("reading config file {}", path.display()))?;
+        Ok(Self { target, text })
+    }
+}
+
 /// Saves to the file at `path` (following symlinks), returns the previous value.
-/// With `expected`, refuses when the file no longer holds exactly that text:
-/// `calibrate` passes what it read before measuring, so a config rewritten
-/// or retargeted during the measurement (possibly describing another
-/// receiver) is never given that measurement.
+/// With `expected`, refuses unless `path` still resolves to that canonical
+/// target holding exactly that text: `calibrate` passes what it read before
+/// measuring, so a config rewritten or retargeted during the measurement
+/// (possibly describing another receiver) is never given that measurement.
 pub(crate) fn save_freq_correction_ppm(
     path: &Path,
     ppm: f64,
-    expected: Option<&str>,
+    expected: Option<&ReadBefore>,
 ) -> Result<Option<f64>> {
     let target = fs::canonicalize(path)
         .with_context(|| format!("cannot resolve config file {}", path.display()))?;
@@ -116,7 +133,15 @@ pub(crate) fn save_freq_correction_ppm(
         .map_err(|e| anyhow!("config file {} is not valid UTF-8: {e}", target.display()))?;
     if let Some(expected) = expected {
         ensure!(
-            text == expected,
+            target == expected.target,
+            "{} left unchanged: it now resolves to {}, not {}, which may describe another \
+             receiver than the one measured; re-run calibrate",
+            path.display(),
+            target.display(),
+            expected.target.display()
+        );
+        ensure!(
+            text == expected.text,
             "{} left unchanged: it changed after calibrate read it, so it may no longer \
              describe the receiver that was measured; re-run calibrate",
             target.display()
@@ -570,18 +595,40 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let body = "[input]\nfreq_correction_ppm = 0.5\n";
         let p = write(dir.path(), "manta.toml", body);
-        let read_before = "[input]\ndevice = \"other\"\n";
-        let err = save_freq_correction_ppm(&p, -1.42, Some(read_before)).unwrap_err();
+        let before = ReadBefore::read(&p).unwrap();
+        let changed = "[input]\ndevice = \"other\"\n";
+        fs::write(&p, changed).unwrap();
+        let err = save_freq_correction_ppm(&p, -1.42, Some(&before)).unwrap_err();
         assert!(
             format!("{err:#}").contains("changed after calibrate read it"),
             "{err:#}"
         );
-        assert_eq!(fs::read_to_string(&p).unwrap(), body);
+        assert_eq!(fs::read_to_string(&p).unwrap(), changed);
         assert_eq!(entries(dir.path()), ["manta.toml"]);
+        fs::write(&p, body).unwrap();
         assert_eq!(
-            save_freq_correction_ppm(&p, -1.42, Some(body)).unwrap(),
+            save_freq_correction_ppm(&p, -1.42, Some(&before)).unwrap(),
             Some(0.5)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_a_symlink_retargeted_since_it_was_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "[input]\npath = \"rx.wav\"\n";
+        let a = write(dir.path(), "a.toml", body);
+        let b = write(dir.path(), "b.toml", body);
+        let link = dir.path().join("manta.toml");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        let before = ReadBefore::read(&link).unwrap();
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&b, &link).unwrap();
+        // Byte-identical, but another file.
+        let err = save_freq_correction_ppm(&link, -1.42, Some(&before)).unwrap_err();
+        assert!(format!("{err:#}").contains("now resolves to"), "{err:#}");
+        assert_eq!(fs::read_to_string(&a).unwrap(), body);
+        assert_eq!(fs::read_to_string(&b).unwrap(), body);
     }
 
     #[cfg(unix)]
