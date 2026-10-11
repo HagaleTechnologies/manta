@@ -161,6 +161,8 @@ flag entirely when yours is on 8073:
 manta listen --kiwi-host <your-kiwi-host> --kiwi-port <your-kiwi-port> --kiwi-freq-hz 7030000
 ```
 
+Someone else's KiwiSDR is shared: read [docs/GUIDES/kiwisdr.md](docs/GUIDES/kiwisdr.md) before you leave manta connected to one.
+
 File replay (`listen --source`) takes 48 kHz mono audio, or a raw complex-IQ
 WAV with `--source-iq`. IQ replay is not resampled: the channelizer runs
 only at its table rates — any rate whose `fs / 93.75` is a power of two,
@@ -180,6 +182,8 @@ below is being worked on.
 `manta --help` lists every subcommand and flag.
 
 ## Run it as a node
+
+For a step-by-step walk from install to a firewalled node with the uplink in dry-run, follow [docs/GUIDES/rbn-node.md](docs/GUIDES/rbn-node.md).
 
 One TOML file describes a node: the station and servers in `[server]`, the
 receiver in `[input]`. With a `[server]` table, `run --config` starts the
@@ -543,7 +547,10 @@ criteria.
 
 ## Documentation
 
-**Running a node:** [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
+**Running a node:** [docs/GUIDES/rbn-node.md](docs/GUIDES/rbn-node.md)
+(from install to a running node) · [docs/GUIDES/kiwisdr.md](docs/GUIDES/kiwisdr.md)
+(KiwiSDR etiquette) · [docs/GUIDES/raspberry-pi.md](docs/GUIDES/raspberry-pi.md)
+(Pi install and service) · [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 (exposing the servers safely) · the "Run it as a node" section above ·
 [packaging/README.md](packaging/README.md) (running unattended under
 systemd, launchd or Docker Compose) ·
@@ -551,7 +558,9 @@ systemd, launchd or Docker Compose) ·
 (a 30-day secondary-skimmer field node behind an RBN Aggregator, MAN-96) ·
 `manta <subcommand> --help` for every flag.
 
-**Contributing:** [ARCHITECTURE.md](ARCHITECTURE.md) — the nine-crate
+**Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) — setup, build and
+test commands, golden-vector rules and the pull request review process ·
+[ARCHITECTURE.md](ARCHITECTURE.md) — the nine-crate
 workspace, data flow, and the channelizer, decoder, validation and output
 design · [docs/DECISIONS/](docs/DECISIONS/) — dated design decisions and
 implementation pins · [wiki/INDEX.md](wiki/INDEX.md) — accumulated
@@ -577,6 +586,9 @@ recall/CER-vs-SNR curve on synthetic signals, regenerable from any build.
 
 ## Contributing
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, build and test commands,
+golden-vector rules, and the pull request review process.
+
 Open an issue or a pull request. Main moves only by PR, CI must be green, and
 the golden-vector determinism tests are the bar every decoder change has to
 clear. See [SECURITY.md](SECURITY.md) for vulnerability reporting.
@@ -592,6 +604,10 @@ output adds a `### Decoder output` entry to [CHANGELOG.md](CHANGELOG.md).
 MIT OR Apache-2.0, at your option. Unless you explicitly state otherwise, any
 contribution intentionally submitted for inclusion in this project shall be
 dual licensed as above, without any additional terms or conditions.
+
+Read the [MIT license](LICENSE-MIT) or the
+[Apache-2.0 license](LICENSE-APACHE). The
+[contributor guide](CONTRIBUTING.md#license) explains GitHub's license display.
 
 ## Keeping the prefix table current
 

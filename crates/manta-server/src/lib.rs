@@ -10,6 +10,7 @@ pub mod config;
 pub mod health;
 pub mod iac;
 pub mod json_stream;
+pub mod maidenhead;
 pub mod metrics;
 pub mod metrics_http;
 pub mod rate_limit;

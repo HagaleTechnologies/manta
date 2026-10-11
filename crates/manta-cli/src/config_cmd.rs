@@ -368,6 +368,14 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             if let Some(v) = &s.operator_grid {
                 l.push_str(&format!(" operator_grid={v}"));
             }
+            // MAN-138: the station position. `f64`'s Display prints the
+            // value as written (`43.9375`, `-72` as `-72`).
+            if let Some(v) = s.operator_lat {
+                l.push_str(&format!(" operator_lat={v}"));
+            }
+            if let Some(v) = s.operator_lon {
+                l.push_str(&format!(" operator_lon={v}"));
+            }
             l
         }
     });
@@ -522,6 +530,15 @@ fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> V
                 .to_string(),
         );
     }
+    // MAN-138. `load` already rejected an `Err` (an inconsistent location),
+    // so only a config with no location key at all gets the note.
+    if matches!(server.station_location(), Ok(None)) {
+        notes.push(
+            "note: JSON spots will carry no station position (deGrid, deLat and deLon are \
+             null) -- set [server].operator_grid, or operator_lat and operator_lon"
+                .to_string(),
+        );
+    }
     bind_notes(&mut notes, "bind_addr", &server.bind_addr, |addr| {
         format!(
             "note: the telnet and JSON servers listen on every network interface (bind_addr = \
@@ -632,6 +649,16 @@ mod tests {
             server.ends_with(
                 " operator_name=\"Art\" operator_qth=\"Richmond Hill, ON\" operator_grid=FN03gw"
             ),
+            "{server}"
+        );
+        // MAN-138: the position keys follow the grid, printed as written.
+        let lines = lines_of(
+            "[server]\nstation_callsign = \"HB9H\"\noperator_grid = \"FN03gw\"\n\
+             operator_lat = 43.9375\noperator_lon = -79.4583\n",
+        );
+        let server = line(&lines, "server:");
+        assert!(
+            server.ends_with(" operator_grid=FN03gw operator_lat=43.9375 operator_lon=-79.4583"),
             "{server}"
         );
     }
@@ -832,6 +859,41 @@ mod tests {
 
     fn has(notes: &[String], prefix: &str) -> bool {
         notes.iter().any(|n| n.starts_with(prefix))
+    }
+
+    const POSITION_NOTE: &str = "note: JSON spots will carry no station position";
+
+    /// MAN-138: an unconfigured position is legal (every JSON spot then says
+    /// `null`), so it is a note, not an error -- and only for a config that
+    /// starts the servers.
+    #[test]
+    fn note_station_position_only_when_no_location_is_configured() {
+        let server = "[server]\nstation_callsign = \"W1AW\"\n";
+        let n = notes_of(server);
+        let note = n
+            .iter()
+            .find(|x| x.starts_with(POSITION_NOTE))
+            .unwrap_or_else(|| panic!("no position note in {n:?}"));
+        assert_eq!(
+            note,
+            "note: JSON spots will carry no station position (deGrid, deLat and deLon are \
+             null) -- set [server].operator_grid, or operator_lat and operator_lon"
+        );
+        assert!(!has(
+            &notes_of(&format!("{server}operator_grid = \"FN31pr\"\n")),
+            POSITION_NOTE
+        ));
+        assert!(!has(
+            &notes_of(&format!(
+                "{server}operator_lat = 41.714775\noperator_lon = -72.72726\n"
+            )),
+            POSITION_NOTE
+        ));
+        assert!(!has(
+            &notes_of("[decode]\nengine = \"legacy\"\n"),
+            POSITION_NOTE
+        ));
+        assert!(!has(&notes_of(""), POSITION_NOTE));
     }
 
     #[test]
@@ -1075,6 +1137,8 @@ mod tests {
         ("server", "operator_name"),
         ("server", "operator_qth"),
         ("server", "operator_grid"),
+        ("server", "operator_lat"),
+        ("server", "operator_lon"),
         ("rbn_uplink", "enabled"),
         ("rbn_uplink", "target_host"),
         ("rbn_uplink", "target_port"),

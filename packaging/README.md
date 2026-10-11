@@ -24,7 +24,7 @@ there.
   every build supports and which needs no device permissions. An HPSDR
   radio on the network works the same way. None of the recipes gives manta
   access to a local sound card or USB SDR. Release binaries include
-  KiwiSDR and HPSDR support, not SoapySDR.
+  KiwiSDR and HPSDR support, not SoapySDR. Before you run the service against a receiver you don't own, read [the KiwiSDR guide](../docs/GUIDES/kiwisdr.md).
 - **Linux:** the binary needs the ALSA runtime library even when it never
   opens a sound card: `sudo apt install libasound2` on Debian, Ubuntu and
   Raspberry Pi OS (`libasound2t64` on Debian 13).
@@ -49,7 +49,9 @@ Copy the example, replace N0CALL with your station callsign, and configure your 
 **Station.** Under `[server]`, edit the active `station_callsign = "N0CALL"`
 line, not the commented reference line above it. Your call is sent as the
 spotter of every spot; an RBN SSID such as `-1` is allowed. The
-`operator_*` lines are optional.
+`operator_*` lines are optional. Set `operator_grid` (or `operator_lat` and
+`operator_lon`) to put your station's position on JSON spots; without it
+they carry none.
 
 **Receiver.** For a KiwiSDR, find these lines in the `[input]` table that
 is already in the file, delete the `#` at the start of each, and edit the
