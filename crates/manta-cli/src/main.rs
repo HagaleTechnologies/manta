@@ -7076,17 +7076,14 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         "path",
         "help",
         "version",
-<<<<<<< HEAD
         "reference_hz",
         "search_ppm",
         "tune_hz",
         "write",
-=======
         "verbose",
         "quiet",
         "log_level",
         "log_format",
->>>>>>> 5c3c64e0d15dd23f1f34f890357312e208119611
     ];
 
     /// MAN-124: `run`'s `Logging` flags, parsed (or refused) by clap.

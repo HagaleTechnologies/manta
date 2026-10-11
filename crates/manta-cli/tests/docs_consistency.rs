@@ -1113,7 +1113,6 @@ fn architecture_section_7_describes_decoder_version() {
     }
 }
 
-<<<<<<< HEAD
 /// MAN-127: the README's node section tells an operator how to measure
 /// `freq_correction_ppm`, and ARCHITECTURE §8 says which command edits the
 /// config file in place.
@@ -1141,7 +1140,9 @@ fn readme_and_architecture_mention_calibrate() {
             .join("docs/DECISIONS/2026-10-11-man127-calibrate-command.md")
             .is_file(),
         "ARCHITECTURE §8 links the MAN-127 decision doc, which does not exist"
-=======
+    );
+}
+
 // ---- MAN-124: the log's level and format controls, documented and real ----
 
 /// MAN-124: README's `## Logs` documents `RUST_LOG` as the underlying
@@ -1211,6 +1212,5 @@ fn architecture_logging_bullet_is_current() {
     assert!(
         arch.contains("--log-format json"),
         "ARCHITECTURE.md never says --log-format json"
->>>>>>> 5c3c64e0d15dd23f1f34f890357312e208119611
     );
 }

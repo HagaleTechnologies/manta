@@ -23,11 +23,9 @@ git history and `docs/DECISIONS/`.
 
 ### Added
 
-<<<<<<< HEAD
 - `manta calibrate` measures the receiver's frequency error against a WWV,
   WWVH, BPM, RWM or NCDXF beacon carrier and, after confirmation, saves
   `freq_correction_ppm` to `[input]` in the config file (MAN-127).
-=======
 - `manta run` takes `-v`/`-vv` and `-q`/`-qq`/`-qqq` and
   `--log-level <LEVEL>`, each shorthand for `RUST_LOG=<level>` that
   overrides it, and `--log-format json`, which writes every stderr log line
@@ -38,7 +36,6 @@ git history and `docs/DECISIONS/`.
 - `manta run`'s log lines carry no colour escape codes when stderr is not a
   terminal (a file, a pipe, the journal or a container log); `NO_COLOR` is
   still honoured on a terminal (MAN-124).
->>>>>>> 5c3c64e0d15dd23f1f34f890357312e208119611
 
 ### Changed
 
