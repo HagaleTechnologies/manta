@@ -224,6 +224,17 @@ manta config init                         # writes ./manta.toml; never replaces 
 manta config check --config manta.toml
 ```
 
+Then `manta doctor` checks the machine itself: the audio library, that the
+server ports are free, the clock against an NTP server, that each enabled
+RBN uplink target accepts a connection, and that the receiver opens and
+hears something. Each check prints `PASS`, `WARN`, `FAIL` or `SKIP` with a
+fix for every problem, and it exits 1 when a check fails. See
+[docs/RUNBOOKS/setup-checks.md](docs/RUNBOOKS/setup-checks.md).
+
+```sh
+manta doctor --config manta.toml
+```
+
 Start the server in one terminal. It runs in the foreground until you stop it:
 
 ```sh
@@ -579,11 +590,18 @@ criteria.
 
 ## Documentation
 
+[docs/README.md](docs/README.md) says where operators, contributors and
+researchers each start, and lists every runbook.
+
 **Running a node:** [docs/GUIDES/rbn-node.md](docs/GUIDES/rbn-node.md)
 (from install to a running node) · [docs/GUIDES/kiwisdr.md](docs/GUIDES/kiwisdr.md)
 (KiwiSDR etiquette) · [docs/GUIDES/raspberry-pi.md](docs/GUIDES/raspberry-pi.md)
 (Pi install and service) · [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 (exposing the servers safely) · the "Run it as a node" section above ·
+[docs/CONFIG.md](docs/CONFIG.md) (every config key, its default and what
+reads it) · [docs/METRICS.md](docs/METRICS.md) (every `/metrics` family,
+`/healthz` and `/status`) · [docs/SPOT-SCHEMA.md](docs/SPOT-SCHEMA.md)
+(every field of the `:7301` JSON spot stream) ·
 [packaging/README.md](packaging/README.md) (running unattended under
 systemd, launchd or Docker Compose) ·
 [docs/RUNBOOKS/secondary-skimmer-field-node.md](docs/RUNBOOKS/secondary-skimmer-field-node.md)
