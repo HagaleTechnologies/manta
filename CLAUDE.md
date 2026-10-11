@@ -118,6 +118,10 @@ seeds a young channel's effective floor from its block median for 1 s, and
 `TrackMeta` is still not emitted at promotion. See
 docs/DECISIONS/2026-10-11-man115-startup-latency.md.
 
+MAN-127: `manta calibrate` measures the receiver's ppm offset against a
+known carrier and saves `[input].freq_correction_ppm` after confirmation —
+see docs/DECISIONS/2026-10-11-man127-calibrate-command.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each

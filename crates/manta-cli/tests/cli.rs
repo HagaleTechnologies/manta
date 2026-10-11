@@ -127,9 +127,10 @@ fn closed_ntp_server() -> String {
     format!("127.0.0.1:{port}")
 }
 
-/// `run`, `decode`, `soak` and `doctor`, each given `--config cfg` and a
-/// nonexistent WAV, so a config error is the only way to fail before I/O.
-fn every_config_command(cfg: &Path) -> [(&'static str, Command); 4] {
+/// `run`, `decode`, `soak`, `doctor` and `calibrate`, each given `--config
+/// cfg` and a nonexistent WAV, so a config error is the only way to fail
+/// before I/O.
+fn every_config_command(cfg: &Path) -> [(&'static str, Command); 5] {
     let mut run = manta();
     run.args([
         "run",
@@ -166,11 +167,22 @@ fn every_config_command(cfg: &Path) -> [(&'static str, Command); 4] {
             "--config",
         ])
         .arg(cfg);
+    let mut calibrate = manta();
+    calibrate
+        .args([
+            "calibrate",
+            "--source",
+            "/nonexistent.wav",
+            "--source-iq",
+            "--config",
+        ])
+        .arg(cfg);
     [
         ("run", run),
         ("decode", decode),
         ("soak", soak),
         ("doctor", doctor),
+        ("calibrate", calibrate),
     ]
 }
 
@@ -2097,7 +2109,8 @@ fn out_of_range_freq_correction_ppm_in_input_is_rejected_like_the_flag() {
     }
 }
 
-/// MAN-261 scenario 3 (table) on the two commands that gained `--config`.
+/// MAN-261 scenario 3 (table) on the commands that gained `--config`:
+/// soak, doctor and (MAN-127) calibrate.
 #[test]
 fn unknown_table_in_config_fails_for_soak_and_doctor() {
     let dir = tempfile::tempdir().unwrap();

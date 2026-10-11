@@ -31,6 +31,9 @@ git history and `docs/DECISIONS/`.
 
 ### Added
 
+- `manta calibrate` measures the receiver's frequency error against a WWV,
+  WWVH, BPM, RWM or NCDXF beacon carrier and, after confirmation, saves
+  `freq_correction_ppm` to `[input]` in the config file (MAN-127).
 - `manta doctor` checks the whole setup before its signal check: the config
   (`manta run`'s example-callsign and dial-frequency refusals), the audio
   library and sound-card inputs, that each `[server]` port is free, the

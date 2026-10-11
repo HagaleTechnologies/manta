@@ -37,9 +37,23 @@ manta-spot = { workspace = true }
 manta-testkit = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "io-util", "macros"] }
 toml = { workspace = true }
+toml_edit = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# MAN-127: config_edit.rs copies the config's DACL onto the temp file it
+# replaces the config with; std's set_permissions carries only the
+# read-only attribute on Windows.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+] }
+
+# MAN-127: config_edit.rs also uses libc to copy the config's POSIX (Linux)
+# or extended (macOS) ACL onto the temp file it replaces the config with.
 # MAN-78: SIGTERM, and SIGHUP (reload with a [server] table, drain
 # without one); ctrlc keeps SIGINT and Windows' console events.
 [target.'cfg(unix)'.dependencies]
