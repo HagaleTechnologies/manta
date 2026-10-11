@@ -1311,7 +1311,7 @@ fn man90_runbook_checks_the_restarted_connection() {
 /// a second endpoint or over UDP. A `host <address from step 1>` capture
 /// filter drops all of that, yet the file settles C1 and C2. The operator
 /// steps must capture without that filter, list Aggregator's addresses again
-/// after the restart, and send only those addresses' packets. The developer
+/// after the restart, and send only Aggregator's packets. The developer
 /// steps must use every listed address. Checks text, not Wireshark behaviour.
 #[test]
 fn man90_runbook_keeps_every_endpoint_aggregator_uses() {
@@ -1382,7 +1382,7 @@ fn man90_runbook_exports_only_aggregators_connections() {
             &export,
             &[
                 "(ip.addr == <RemoteAddress> && tcp.port == <LocalPort> && tcp.port == <RemotePort>)",
-                "(ip.addr == <address> && udp.port == <LocalPort>)",
+                "`udp.port == <LocalPort>`",
                 "Statistics → Conversations",
             ][..],
         ),
@@ -1402,6 +1402,39 @@ fn man90_runbook_exports_only_aggregators_connections() {
             );
         }
     }
+}
+
+/// MAN-90: `Get-NetUDPEndpoint` lists Aggregator's UDP LocalPorts, but its UDP
+/// peers come only from Resource Monitor's live view, which can miss one. Step
+/// 5 must keep UDP by the restarted Aggregator's ports alone, not by a noted
+/// address and port, and the developer steps must follow every UDP flow in
+/// the file, not only flows to noted addresses. A port-only term would keep a
+/// step 1 port another program takes after the restart, so step 5 must use
+/// step 3's ports only and check the saved file. Checks text, not Wireshark
+/// behaviour.
+#[test]
+fn man90_runbook_keeps_udp_to_unnoted_addresses() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let operator = squash_whitespace(section(&runbook, "Operator steps"));
+    // Step 5 is the last step, so it runs to the end of the section.
+    let export = &operator[operator
+        .find("5. **Stop")
+        .expect("Operator steps have no `5. **Stop` step")..];
+    for needle in [
+        "one per UDP LocalPort from step 3, `udp.port == <LocalPort>`",
+        "Open the saved file and check",
+    ] {
+        assert!(export.contains(needle), "Step 5 never says `{needle}`");
+    }
+    assert!(
+        !export.contains("&& udp.port =="),
+        "Step 5 keeps UDP only to an address the operator noted"
+    );
+    let steps = squash_whitespace(section(&runbook, "Developer steps"));
+    assert!(
+        steps.contains("including one to an address the operator did not note"),
+        "Developer steps never follow UDP flows to addresses the operator did not note"
+    );
 }
 
 /// MAN-90: C3, C4 and C7 compare exact bytes. tshark's `ascii` follow mode

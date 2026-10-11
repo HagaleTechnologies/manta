@@ -87,17 +87,25 @@ Send something like this, and keep the written reply:
    title bar.
 5. **Stop and keep only Aggregator's traffic.** Stop Wireshark. In the display
    filter bar enter one term per TCP connection from steps 1 and 3,
-   `(ip.addr == <RemoteAddress> && tcp.port == <LocalPort> && tcp.port == <RemotePort>)`,
-   and one per pair of a noted address and a noted UDP LocalPort,
-   `(ip.addr == <address> && udp.port == <LocalPort>)`, all joined with `||`
-   (`ipv6.addr` for an IPv6 address). Apply it. A filter on the address alone
-   would also keep any other program on this host that talks to the same
-   address, such as a browser open on an RBN page. Then use File → Export
-   Specified Packets, choose "All packets" and "Displayed", and save as
-   `aggregator-rbn.pcapng`. Open the saved file and check that the TCP and UDP
-   tabs of Statistics → Conversations list only the connections you noted.
-   Send that file, the text file and your notes of connections and addresses
-   to the developer privately, then delete the unfiltered capture.
+   `(ip.addr == <RemoteAddress> && tcp.port == <LocalPort> && tcp.port == <RemotePort>)`
+   (`ipv6.addr` for an IPv6 address), and one per UDP LocalPort from step 3,
+   `udp.port == <LocalPort>`, all joined with `||`. Apply it. A TCP term on
+   the address alone would also keep any other program on this host that
+   talks to the same address, such as a browser open on an RBN page. The UDP
+   term names no address, so it keeps what Aggregator sent from that port
+   even to an address Resource Monitor showed too briefly to note. It uses
+   only the restarted Aggregator's ports: a step 1 port is freed at the
+   restart, and another program may then take its number. Open Statistics →
+   Conversations and tick "Limit to display filter". The TCP tab must list
+   only the connections you noted. On the UDP tab, the port next to this
+   host's own address must be a noted UDP LocalPort, and the other address
+   must not be a LAN address or one of your Skimmers. Right-click every other
+   UDP row and choose Apply as Filter → …and not Selected → A ↔ B. Then use
+   File → Export Specified Packets, choose "All packets" and "Displayed", and
+   save as `aggregator-rbn.pcapng`. Open the saved file and check that the
+   TCP and UDP tabs of Statistics → Conversations list only the rows you
+   kept. Send that file, the text file and your notes of connections and
+   addresses to the developer privately, then delete the unfiltered capture.
 
 ## Developer steps
 
@@ -113,17 +121,20 @@ tshark -r aggregator-rbn.pcapng -Y 'tcp.flags.syn == 1 && tcp.flags.ack == 0' \
   -T fields -e frame.time -e tcp.stream -e ip.dst -e ipv6.dst -e tcp.dstport
 ```
 
-The file holds only the connections the operator noted before and after the
-restart (operator steps 1 and 3), each matched on its address and ports. Any
-connection the operator did not note, Aggregator's or another program's, was
-removed in step 5, so the file cannot show it. A noted address with no
-conversation in the file is such a connection: list it under C1 as not
-recorded. Each row is a connection Aggregator opened while recording,
-normally the one after the restart. The old connection opened before
-recording started, so it has no row. It is often stream 0. If no row goes to
-any of the addresses the operator noted, the restarted connection was either
-not recorded or not noted: ask the operator to record it again. Set `N` to a
-row's `tcp.stream` value and run, over the whole file:
+The file holds only the TCP connections the operator noted before and after
+the restart (operator steps 1 and 3), each matched on its address and ports,
+and the UDP traffic on the UDP LocalPorts noted after the restart, with any
+address but a LAN address or one of the operator's Skimmers. Any TCP
+connection the operator did not note, Aggregator's or another program's, and
+any UDP on a port the operator did not note after the restart, was removed in
+step 5, so the file cannot show it. A noted address with no conversation in
+the file is such a connection: list it under C1 as not recorded. Each row is a
+connection Aggregator opened while recording, normally the one after the
+restart. The old connection opened before recording started, so it has no row.
+It is often stream 0. If no row goes to any of the addresses the operator
+noted, the restarted connection was either not recorded or not noted: ask the
+operator to record it again. Set `N` to a row's `tcp.stream` value and run,
+over the whole file:
 
 ```sh
 N=1   # the tcp.stream value from that row
@@ -141,7 +152,8 @@ CR, LF or CRLF. The `.hex` view (`raw` mode) keeps every byte as hex, so take
 the bytes for C2, C3, C4 and C7 from it. If Aggregator reaches RBN over UDP
 instead, list its flows with
 `tshark -r aggregator-rbn.pcapng -Y udp -T fields -e udp.stream -e ip.dst -e ipv6.dst -e udp.dstport | sort -u`
-and write each flow to one of those addresses to a pair of transcripts with
+and write each flow, including one to an address the operator did not note,
+to a pair of transcripts with
 `tshark -r aggregator-rbn.pcapng -q -z follow,udp,ascii,$N > transcript-udp-$N.txt`
 and
 `tshark -r aggregator-rbn.pcapng -q -z follow,udp,raw,$N > transcript-udp-$N.hex`.
