@@ -216,6 +216,18 @@ pub(crate) fn save_freq_correction_ppm(
         target.display(),
         literal(ppm)
     );
+    // Re-check right before the replace, so an edit made while the temp
+    // file was written and validated is not silently overwritten. (Not a
+    // lock: a writer racing this last read can still lose; the window is
+    // the gap between this read and the rename.)
+    let current =
+        fs::read(&target).with_context(|| format!("reading config file {}", target.display()))?;
+    ensure!(
+        current == text.as_bytes(),
+        "{} left unchanged: it changed while calibrate was saving; set {KEY} = {} by hand",
+        target.display(),
+        literal(ppm)
+    );
     fs::rename(&temp, &target)
         .with_context(|| format!("replacing {} with {}", target.display(), temp.display()))?;
     guard.armed = false;
