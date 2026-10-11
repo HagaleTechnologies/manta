@@ -9,8 +9,8 @@
 //! (MAN-22/23 harden this listener further).
 
 use crate::bounded_io::{read_line_bounded_telnet, read_line_bounded_telnet_with_timeout};
-use crate::bus::SpotBus;
-use crate::command::{self, Command};
+use crate::bus::{BusSpot, SpotBus};
+use crate::command::{self, Command, HistorySelection, QueryMode, ShowDxQuery};
 use crate::iac::IacFilter;
 use crate::metrics::Metrics;
 use crate::rate_limit::IpRateLimiter;
@@ -18,7 +18,7 @@ use crate::rbn;
 use crate::tasks::{ClientTasks, ConnectionLimiter, IpQuota};
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
@@ -561,8 +561,6 @@ async fn handle_client(
         }
     }
 
-    // `sh/dx` default when the client didn't specify a count.
-    const DEFAULT_SHOW_DX_COUNT: usize = 10;
     let mut min_unique: Option<u32> = None;
     // Not cleared at the top of the loop, deliberately: `tokio::select!`
     // can cancel `read_line_bounded_telnet` mid-line (a spot arrived
@@ -732,8 +730,9 @@ async fn handle_client(
                 // what happened -- only the over-budget disconnect above
                 // was logged. Logs the PARSED, normalized command
                 // (`Command`'s own Debug -- an enum variant plus already-
-                // validated numeric fields, e.g. `ShowDx { count: Some(50) }`
-                // or bare `Unknown`), never the raw client-supplied line,
+                // validated fields, e.g. `ShowDx(ShowDxQuery { selection:
+                // Count(Some(50)), .. })` or bare `Unknown`; a band is the
+                // allocation table's own name), never the raw client-supplied line,
                 // which is unescaped and could otherwise inject the same
                 // way the login field could (see the fix just above).
                 //
@@ -752,16 +751,24 @@ async fn handle_client(
                     tracing::info!(command = ?parsed_command, "telnet: command received");
                 }
                 match parsed_command {
-                    Command::ShowDx { count } => {
-                        let n = count.unwrap_or(DEFAULT_SHOW_DX_COUNT);
+                    Command::ShowDx(query) => {
+                        // MAN-92: band/mode/count/minutes selection happens
+                        // first, entirely off-socket; only the selected
+                        // entries reach the loop below. Entries the query
+                        // didn't ask for are outside the result, not lost
+                        // spots, so nothing is counted for them.
+                        //
                         // Apply the SAME `min_unique` predicate the live
                         // stream uses -- a spot suppressed live must stay
                         // suppressed when replayed via `sh/dx`, not leak
                         // through unfiltered and uncounted (round-11
                         // review finding). `bus.recent` carries each
                         // spot's publish-time occurrence_count precisely
-                        // so this comparison is possible here.
-                        let mut history = bus.recent(n).into_iter();
+                        // so this comparison is possible here. Applied
+                        // AFTER count selection, without backfilling, as
+                        // before MAN-92.
+                        let mut history =
+                            select_history_at(&bus, &query, unix_now_secs()).into_iter();
                         loop {
                             // MAN-45 remediate (round-16 P1, finding 2):
                             // checked BEFORE pulling the next history
@@ -964,10 +971,37 @@ async fn handle_client(
                         }
                         return Ok(());
                     }
-                    // Read-mostly protocol: any other line (unrecognized
-                    // commands the client sent) is accepted without
-                    // choking the connection.
-                    Command::Unknown => {}
+                    Command::ShowVersion => {
+                        // MAN-92: the same compiled version the greeting
+                        // banner reports. Same control-write accounting as
+                        // SETT above.
+                        if write_with_timeout(
+                            &mut wr,
+                            format!("manta {}\r\n", env!("CARGO_PKG_VERSION")).as_bytes(),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            if log_enabled {
+                                tracing::warn!("telnet: version reply write failed, disconnecting");
+                            }
+                            metrics.record_write_failed(rx.len() as u64);
+                            return Ok(());
+                        }
+                    }
+                    // MAN-92: anything else (an unimplemented command, or a
+                    // known one with malformed arguments) gets a fixed
+                    // reply instead of silence, and the connection stays
+                    // up. Fixed text: the client's line is never echoed.
+                    Command::Unknown => {
+                        if write_with_timeout(&mut wr, b"Unknown command\r\n").await.is_err() {
+                            if log_enabled {
+                                tracing::warn!("telnet: unknown-command reply write failed, disconnecting");
+                            }
+                            metrics.record_write_failed(rx.len() as u64);
+                            return Ok(());
+                        }
+                    }
                 }
                 cmd_line.clear(); // a full line was consumed and processed
             }
@@ -1058,6 +1092,59 @@ async fn handle_client(
     }
 }
 
+/// `sh/dx` default when the client asked for neither a count nor a
+/// minutes window (Aggregator manual v6.0 §10.5: "Shows the last 10 spots").
+const DEFAULT_SHOW_DX_COUNT: usize = 10;
+
+/// The retained history entries one `sh/dx` request replays, oldest first
+/// (MAN-92). Pure: no socket, no clock read (`now_unix_secs` is the
+/// caller's), no bus mutation.
+///
+/// Band, mode and minutes filtering run over the whole retained history
+/// BEFORE count truncation, so `sh/dx 5 BAND 20m` returns the five newest
+/// 20m entries even when newer 40m ones exist. A minutes window keeps every
+/// match (no ten-row default); it is matched against each entry's heard
+/// time -- the Zulu time the row shows -- inclusive at both ends, so an
+/// entry stamped in the future is excluded. Every request is still bounded
+/// by the bus's retained history (fifty entries, `RECENT_HISTORY_CAP` in
+/// `bus.rs`).
+fn select_history_at(bus: &SpotBus, query: &ShowDxQuery, now_unix_secs: i64) -> Vec<BusSpot> {
+    // manta decodes CW only: CW matches every spot, RTTY none.
+    if query.mode == Some(QueryMode::Rtty) {
+        return Vec::new();
+    }
+    let in_band = |entry: &BusSpot| {
+        query
+            .band
+            .is_none_or(|band| crate::band::band_for_freq_hz(entry.spot.freq_hz) == band)
+    };
+    let history = bus.recent(usize::MAX).into_iter().filter(in_band);
+    match query.selection {
+        HistorySelection::Count(n) => {
+            let mut selected: Vec<BusSpot> = history.collect();
+            let n = n.unwrap_or(DEFAULT_SHOW_DX_COUNT);
+            selected.drain(..selected.len().saturating_sub(n));
+            selected
+        }
+        // An explicit zero-minute window selects nothing, like `sh/dx 0`.
+        HistorySelection::Window { secs: 0 } => Vec::new(),
+        HistorySelection::Window { secs } => {
+            let oldest = now_unix_secs.saturating_sub(secs).max(0);
+            history
+                .filter(|entry| {
+                    (oldest..=now_unix_secs).contains(&bus.unix_ts_for(entry.spot.sample_ts))
+                })
+                .collect()
+        }
+    }
+}
+
+fn unix_now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
 async fn write_spot_line(
     wr: &mut tokio::net::tcp::OwnedWriteHalf,
     bus: &SpotBus,
@@ -1101,6 +1188,288 @@ fn trim_login(raw: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use manta_spot::{Spot, SpotType};
+
+    /// One sample per second, so a spot's `sample_ts` is its heard time in
+    /// seconds after `SELECTOR_EPOCH_SECS`.
+    const SELECTOR_EPOCH_SECS: i64 = 1_700_000_000;
+
+    fn selector_bus() -> SpotBus {
+        SpotBus::new(
+            1.0,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(SELECTOR_EPOCH_SECS as u64),
+            0,
+        )
+    }
+
+    fn heard(callsign: &str, freq_hz: f64, secs_after_epoch: u64) -> Spot {
+        Spot {
+            callsign: callsign.to_string(),
+            freq_hz,
+            snr_db: 20.0,
+            wpm: 25.0,
+            spot_type: SpotType::Cq,
+            confidence: 0.9,
+            track_id: 1,
+            sample_ts: secs_after_epoch,
+        }
+    }
+
+    fn calls(selected: &[BusSpot]) -> Vec<&str> {
+        selected.iter().map(|e| e.spot.callsign.as_str()).collect()
+    }
+
+    fn q(
+        selection: HistorySelection,
+        band: Option<&'static str>,
+        mode: Option<QueryMode>,
+    ) -> ShowDxQuery {
+        ShowDxQuery {
+            selection,
+            band,
+            mode,
+        }
+    }
+
+    const TWENTY: f64 = 14_027_100.0;
+    const FORTY: f64 = 7_027_000.0;
+
+    #[test]
+    fn legacy_count_selection_returns_the_newest_entries_oldest_first() {
+        let bus = selector_bus();
+        assert!(select_history_at(&bus, &ShowDxQuery::DEFAULT, 0).is_empty());
+        for i in 0..15 {
+            bus.publish(heard(&format!("K{i}AA"), TWENTY, i));
+        }
+        let expected_default: Vec<String> = (5..15).map(|i| format!("K{i}AA")).collect();
+        assert_eq!(
+            calls(&select_history_at(&bus, &ShowDxQuery::DEFAULT, 0)),
+            expected_default
+        );
+        assert_eq!(
+            calls(&select_history_at(
+                &bus,
+                &q(HistorySelection::Count(Some(3)), None, None),
+                0
+            )),
+            ["K12AA", "K13AA", "K14AA"]
+        );
+        assert!(
+            select_history_at(&bus, &q(HistorySelection::Count(Some(0)), None, None), 0).is_empty()
+        );
+        assert_eq!(
+            select_history_at(&bus, &q(HistorySelection::Count(Some(1000)), None, None), 0).len(),
+            15
+        );
+    }
+
+    #[test]
+    fn selection_never_reaches_past_the_fifty_retained_entries() {
+        let bus = selector_bus();
+        for i in 0..60 {
+            bus.publish(heard(&format!("K{i}AA"), TWENTY, i));
+        }
+        let all = select_history_at(
+            &bus,
+            &q(HistorySelection::Count(Some(usize::MAX)), None, None),
+            0,
+        );
+        let expected: Vec<String> = (10..60).map(|i| format!("K{i}AA")).collect();
+        assert_eq!(calls(&all), expected);
+        let window = select_history_at(
+            &bus,
+            &q(HistorySelection::Window { secs: i64::MAX }, None, None),
+            SELECTOR_EPOCH_SECS + 1_000,
+        );
+        assert_eq!(calls(&window), expected);
+    }
+
+    #[test]
+    fn band_filtering_runs_before_count_truncation() {
+        // Newer 40m entries outnumber the requested count: truncating
+        // first would return nothing on 20m.
+        let bus = selector_bus();
+        for (call, freq) in [
+            ("K1AAA", TWENTY),
+            ("K2BBB", TWENTY),
+            ("K3CCC", TWENTY),
+            ("W4DDD", FORTY),
+            ("W5EEE", FORTY),
+            ("W6FFF", FORTY),
+            ("W7GGG", FORTY),
+            ("W8HHH", FORTY),
+        ] {
+            bus.publish(heard(call, freq, 0));
+        }
+        assert_eq!(
+            calls(&select_history_at(
+                &bus,
+                &q(HistorySelection::Count(Some(2)), Some("20m"), None),
+                0
+            )),
+            ["K2BBB", "K3CCC"]
+        );
+        assert_eq!(
+            calls(&select_history_at(
+                &bus,
+                &q(
+                    HistorySelection::Count(None),
+                    Some("20m"),
+                    Some(QueryMode::Cw)
+                ),
+                0
+            )),
+            ["K1AAA", "K2BBB", "K3CCC"]
+        );
+        assert!(select_history_at(
+            &bus,
+            &q(HistorySelection::Count(None), Some("15m"), None),
+            0
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn band_edges_are_inclusive_and_cover_every_allocation() {
+        let bus = selector_bus();
+        for (call, freq) in [
+            ("K1LOW", 14_000_000.0),
+            ("K1HIGH", 14_350_000.0),
+            ("K1BELOW", 13_999_999.0),
+            ("K1ABOVE", 14_350_001.0),
+            ("K1GAP", 15_000_000.0),
+            ("K1LF", 136_000.0),
+            ("K1SIX", 50_100_000.0),
+        ] {
+            bus.publish(heard(call, freq, 0));
+        }
+        let band = |name| {
+            calls(&select_history_at(
+                &bus,
+                &q(HistorySelection::Count(None), Some(name), None),
+                0,
+            ))
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(band("20m"), ["K1LOW", "K1HIGH"]);
+        assert_eq!(band("2200m"), ["K1LF"]);
+        assert_eq!(band("6m"), ["K1SIX"]);
+        // Every name the parser accepts selects something here or nothing,
+        // never an out-of-allocation frequency.
+        let named: usize = crate::band::allocations()
+            .iter()
+            .map(|(name, _, _)| band(name).len())
+            .sum();
+        assert_eq!(named, 4, "K1BELOW/K1ABOVE/K1GAP match no named band");
+    }
+
+    #[test]
+    fn minutes_window_bounds_are_inclusive_and_exclude_the_future() {
+        let bus = selector_bus();
+        // Published out of heard-time order on purpose: selection keeps
+        // publication order and never sorts by timestamp.
+        for (call, at) in [
+            ("K1NOW", 1_000),
+            ("K1EDGE", 940),
+            ("K1STALE", 939),
+            ("K1FUTURE", 1_001),
+            ("K1MID", 970),
+        ] {
+            bus.publish(heard(call, TWENTY, at));
+        }
+        let now = SELECTOR_EPOCH_SECS + 1_000;
+        let one_minute = q(HistorySelection::Window { secs: 60 }, None, None);
+        assert_eq!(
+            calls(&select_history_at(&bus, &one_minute, now)),
+            ["K1NOW", "K1EDGE", "K1MID"]
+        );
+        assert!(select_history_at(
+            &bus,
+            &q(HistorySelection::Window { secs: 0 }, None, None),
+            now
+        )
+        .is_empty());
+        assert_eq!(
+            calls(&select_history_at(
+                &bus,
+                &q(HistorySelection::Window { secs: i64::MAX }, None, None),
+                now
+            )),
+            ["K1NOW", "K1EDGE", "K1STALE", "K1MID"]
+        );
+    }
+
+    #[test]
+    fn a_minutes_window_is_not_truncated_to_the_default_count() {
+        let bus = selector_bus();
+        for i in 0..15 {
+            bus.publish(heard(&format!("K{i}AA"), TWENTY, 100 + i));
+        }
+        let now = SELECTOR_EPOCH_SECS + 200;
+        assert_eq!(
+            select_history_at(
+                &bus,
+                &q(HistorySelection::Window { secs: 600 }, None, None),
+                now
+            )
+            .len(),
+            15
+        );
+    }
+
+    #[test]
+    fn minutes_band_and_mode_combine() {
+        let bus = selector_bus();
+        bus.publish(heard("K1OLD", TWENTY, 0));
+        bus.publish(heard("K2NEW", TWENTY, 3_500));
+        bus.publish(heard("W3NEW", FORTY, 3_550));
+        let now = SELECTOR_EPOCH_SECS + 3_600;
+        let window = HistorySelection::Window { secs: 20 * 60 };
+        assert_eq!(
+            calls(&select_history_at(&bus, &q(window, None, None), now)),
+            ["K2NEW", "W3NEW"]
+        );
+        assert_eq!(
+            calls(&select_history_at(
+                &bus,
+                &q(window, Some("20m"), Some(QueryMode::Cw)),
+                now
+            )),
+            ["K2NEW"]
+        );
+    }
+
+    #[test]
+    fn cw_matches_all_of_mantas_spots_and_rtty_none() {
+        let bus = selector_bus();
+        bus.publish(heard("K1AAA", TWENTY, 0));
+        bus.publish(heard("W2BBB", FORTY, 1));
+        let unfiltered = calls(&select_history_at(&bus, &ShowDxQuery::DEFAULT, 0))
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls(&select_history_at(
+                &bus,
+                &q(HistorySelection::Count(None), None, Some(QueryMode::Cw)),
+                0
+            )),
+            unfiltered
+        );
+        for selection in [
+            HistorySelection::Count(None),
+            HistorySelection::Window { secs: i64::MAX },
+        ] {
+            assert!(select_history_at(
+                &bus,
+                &q(selection, None, Some(QueryMode::Rtty)),
+                SELECTOR_EPOCH_SECS + 10
+            )
+            .is_empty());
+        }
+    }
 
     #[test]
     fn trim_login_strips_the_cr_nul_a_real_telnet_client_sends() {

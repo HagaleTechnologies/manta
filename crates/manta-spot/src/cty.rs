@@ -44,9 +44,10 @@ pub struct Entry {
     pub lon: f64,
     /// ADIF DXCC entity number for this entity, joined from the vendored
     /// `dxcc.tsv` on the `cty.dat` header's primary-prefix field (MAN-136).
-    /// `None` only if the two vendored files have drifted -- which
-    /// `every_entity_in_the_vendored_cty_dat_resolves_an_adif_dxcc_number`
-    /// exists to catch. Callers must treat `None` as "unknown", never as a
+    /// `None` if an operator-supplied country table introduces an entity
+    /// absent from the bundled DXCC table, or if the two vendored files
+    /// have drifted. The latter is caught by
+    /// `every_entity_in_the_vendored_cty_dat_resolves_an_adif_dxcc_number`. Callers must treat `None` as "unknown", never as a
     /// number: ADIF's code 0 means "confirmed NOT in any DXCC entity", a
     /// different and false claim.
     pub dxcc: Option<u16>,
@@ -72,7 +73,28 @@ pub struct Table {
     entries: Vec<Row>,
 }
 
+impl std::fmt::Debug for Table {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Table")
+            .field("prefixes", &self.len())
+            .finish()
+    }
+}
+
 impl Table {
+    /// The table built into manta.
+    pub fn bundled() -> Self {
+        Self::parse(crate::CTY_DAT)
+    }
+    /// Number of distinct prefixes in the table.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    /// Whether the table has no prefixes.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Parses a `cty.dat` file's full contents, joining each entity against
     /// the vendored ADIF DXCC number table.
     pub fn parse(cty_dat: &str) -> Self {
@@ -275,6 +297,36 @@ fn clean_alias(raw: &str) -> Option<(String, bool, Option<u16>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_cty_csv_file_parses_to_an_empty_table() {
+        // AD1C's other download, mistaken for cty.dat: no `;`-terminated
+        // `name: zone: ...: prefix:` entries, so nothing is allocated.
+        let t = Table::parse("1A,Sov Mil Order of Malta,246,EU,15,28,41.90,-12.43,-1.0,1A;\n");
+        assert!(t.is_empty());
+        assert_eq!(t.len(), 0);
+        assert!(Table::parse("").is_empty());
+        assert!(!Table::parse(FIXTURE).is_empty());
+    }
+
+    #[test]
+    fn crlf_line_endings_parse_like_lf() {
+        let crlf = Table::parse(&crate::CTY_DAT.replace('\n', "\r\n"));
+        let lf = Table::parse(crate::CTY_DAT);
+        assert_eq!(crlf.len(), lf.len());
+        assert_eq!(crlf.lookup("W1AW"), lf.lookup("W1AW"));
+    }
+
+    #[test]
+    fn debug_summarises_instead_of_dumping_the_table() {
+        let text = format!("{:?}", Table::parse(crate::CTY_DAT));
+        assert!(text.starts_with("Table { prefixes: "), "{text}");
+        assert!(text.len() < 64, "{text}");
+    }
+
+    #[test]
+    fn bundled_is_the_vendored_file() {
+        assert_eq!(Table::bundled().len(), Table::parse(crate::CTY_DAT).len());
+    }
 
     const FIXTURE: &str = "\
 United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:

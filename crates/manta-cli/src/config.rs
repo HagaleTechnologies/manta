@@ -54,7 +54,9 @@ const ENV_TABLES: &[(&str, &str)] = &[
     ("DECODE_", "decode"),
 ];
 /// Build-time only (crates/manta-cli/build.rs), never runtime config.
-const ENV_IGNORED: &[&str] = &["MANTA_GIT_SHA"];
+/// `cargo run`/`cargo test` export build.rs's `rustc-env` values into the
+/// processes they start, so these must not trip the unknown-name check.
+const ENV_IGNORED: &[&str] = &["MANTA_GIT_SHA", "MANTA_FEATURES"];
 /// String-typed keys: an env value is taken verbatim, never TOML-probed, so
 /// `MANTA_INPUT_PASSWORD=12345678` stays a string.
 const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
@@ -72,6 +74,8 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("input", "driver"),
     ("spot", "blocklist_path"),
     ("spot", "notch_path"),
+    ("spot", "cty_path"),
+    ("spot", "scp_path"),
     ("decode", "engine"),
 ];
 
@@ -111,6 +115,8 @@ pub(crate) struct SpotFile {
     pub allowlist: Vec<String>,
     pub blocklist_path: Option<PathBuf>,
     pub notch_path: Option<PathBuf>,
+    pub cty_path: Option<PathBuf>,
+    pub scp_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -119,6 +125,8 @@ struct SpotToml {
     allowlist: Option<Vec<String>>,
     blocklist_path: Option<PathBuf>,
     notch_path: Option<PathBuf>,
+    cty_path: Option<PathBuf>,
+    scp_path: Option<PathBuf>,
 }
 
 /// `input.type` (D5).
@@ -268,6 +276,12 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
     reject_constant_only_keys(&doc, &origin)?;
 
     let server = take_typed::<ServerConfig>(&doc, "server", &origin, &overlay)?;
+    // MAN-138: the location keys' cross-key rules, before any source or
+    // listener opens (the same point `[input]`'s `validate_input` runs).
+    if let Some(s) = &server {
+        s.station_location()
+            .map_err(|e| anyhow!("{origin}: [server]: {e}{}", overlay.suffix("server")))?;
+    }
     let rbn_uplink = take_uplinks(&doc, &origin)?;
     if !rbn_uplink.is_empty() && server.is_none() {
         bail!(
@@ -299,6 +313,12 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         notch_path: spot_toml
             .notch_path
             .map(|p| resolve_path("spot", "notch_path", p)),
+        cty_path: spot_toml
+            .cty_path
+            .map(|p| resolve_path("spot", "cty_path", p)),
+        scp_path: spot_toml
+            .scp_path
+            .map(|p| resolve_path("spot", "scp_path", p)),
     };
     let input_toml = take_typed::<InputToml>(&doc, "input", &origin, &overlay)?.unwrap_or_default();
     let input = validate_input(input_toml, &|p| resolve_path("input", "path", p))
@@ -662,6 +682,25 @@ fn levenshtein(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_cty_and_scp_paths_are_string_typed_and_cwd_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manta.toml");
+        std::fs::write(
+            &path,
+            "[spot]\ncty_path = 'file.dat'\nscp_path = 'file.scp'\n",
+        )
+        .unwrap();
+        let v = vars(&[
+            ("MANTA_SPOT_CTY_PATH", "2026"),
+            ("MANTA_SPOT_SCP_PATH", "2027"),
+        ]);
+        let loaded = load(Some(&path), Env::Read(&v)).unwrap();
+        assert_eq!(loaded.spot.cty_path, Some(PathBuf::from("2026")));
+        assert_eq!(loaded.spot.scp_path, Some(PathBuf::from("2027")));
+    }
+
     use std::io::Write;
 
     fn write_cfg(body: &str) -> tempfile::NamedTempFile {
@@ -770,6 +809,62 @@ mod tests {
         assert!(err.contains(&f.path().display().to_string()), "{err}");
     }
 
+    /// MAN-138: the numeric location keys load from the file and from
+    /// `MANTA_SERVER_*`, TOML-probed like every other number.
+    #[test]
+    fn server_location_keys_load_from_the_file_and_the_environment() {
+        let body = format!("{SERVER}operator_lat = 41.714775\n");
+        let loaded = load_env(Some(&body), &[("MANTA_SERVER_OPERATOR_LON", "-72.72726")]).unwrap();
+        let server = loaded.server.unwrap();
+        assert_eq!(server.operator_lat, Some(41.714775));
+        assert_eq!(server.operator_lon, Some(-72.72726));
+
+        let loaded = load_env(
+            Some(SERVER),
+            &[
+                ("MANTA_SERVER_OPERATOR_LAT", "41"),
+                ("MANTA_SERVER_OPERATOR_LON", "-72.72726"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(loaded.server.unwrap().operator_lat, Some(41.0));
+    }
+
+    #[test]
+    fn an_inconsistent_station_location_is_rejected_before_io() {
+        for (keys, message) in [
+            (
+                "operator_lat = 41.7\n",
+                "operator_lat is set but operator_lon is not",
+            ),
+            (
+                "operator_lon = -72.7\n",
+                "operator_lon is set but operator_lat is not",
+            ),
+            (
+                "operator_grid = \"FN31pr\"\noperator_lat = 40.0\noperator_lon = -74.0\n",
+                "is outside operator_grid \"FN31pr\"",
+            ),
+        ] {
+            let f = write_cfg(&format!("{SERVER}{keys}"));
+            let err = format!("{:#}", load(Some(f.path()), Env::Ignore).unwrap_err());
+            assert!(
+                err.starts_with(&format!("{}: [server]: ", f.path().display())),
+                "{err}"
+            );
+            assert!(err.contains(message), "{err}");
+        }
+        // A variable that supplied the value is named, as for typed errors.
+        let err = format!(
+            "{:#}",
+            load_env(Some(SERVER), &[("MANTA_SERVER_OPERATOR_LAT", "41.7")]).unwrap_err()
+        );
+        assert!(
+            err.contains("(environment: MANTA_SERVER_OPERATOR_LAT)"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn decode_validation_messages_are_unchanged() {
         let f = write_cfg("[decode]\nbeam_width = 0\n");
@@ -852,13 +947,18 @@ mod tests {
         let path = dir.path().join("manta.toml");
         std::fs::write(
             &path,
-            "[spot]\nallowlist = [\"W1AW\"]\nblocklist_path = \"bad.txt\"\n",
+            "[spot]\nallowlist = [\"W1AW\"]\nblocklist_path = \"bad.txt\"\ncty_path = \"cty.dat\"\nscp_path = \"sub/MASTER.SCP\"\n",
         )
         .unwrap();
         let loaded = load(Some(&path), Env::Ignore).unwrap();
         assert_eq!(loaded.spot.allowlist, vec!["W1AW".to_string()]);
         assert_eq!(loaded.spot.blocklist_path, Some(dir.path().join("bad.txt")));
         assert_eq!(loaded.spot.notch_path, None);
+        assert_eq!(loaded.spot.cty_path, Some(dir.path().join("cty.dat")));
+        assert_eq!(
+            loaded.spot.scp_path,
+            Some(dir.path().join("sub/MASTER.SCP"))
+        );
     }
 
     #[test]
@@ -866,6 +966,10 @@ mod tests {
         let err = err_of("[spot]\nblocklist = \"x\"\n");
         assert!(err.contains("unknown field"), "{err}");
         assert!(err.contains("blocklist_path"), "{err}");
+        assert!(
+            err.contains("cty_path") && err.contains("scp_path"),
+            "{err}"
+        );
     }
 
     // ---- Phase 3: [input]
@@ -1342,18 +1446,22 @@ mod tests {
         assert!(loaded.env_vars.is_empty(), "{:?}", loaded.env_vars);
     }
 
+    /// Both the names build.rs reads (`rerun-if-env-changed=`) and the ones
+    /// it exports (`rustc-env=`, MAN-83): Cargo puts the latter into the
+    /// environment of `cargo run`/`cargo test` children.
     #[test]
     fn every_build_rs_env_name_is_ignored() {
         let build_rs = include_str!("../build.rs");
-        let names: Vec<&str> = build_rs
-            .split("rerun-if-env-changed=")
-            .skip(1)
+        let names: Vec<&str> = ["rerun-if-env-changed=", "rustc-env="]
+            .into_iter()
+            .flat_map(|directive| build_rs.split(directive).skip(1))
             .filter_map(|rest| {
                 rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                     .next()
             })
             .filter(|name| name.starts_with(ENV_PREFIX))
             .collect();
+        assert!(names.contains(&"MANTA_FEATURES"), "{names:?}");
         assert!(!names.is_empty());
         for name in names {
             assert!(ENV_IGNORED.contains(&name), "{name} must be in ENV_IGNORED");

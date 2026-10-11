@@ -51,6 +51,61 @@ MAN-132: the metrics listener (`/metrics`, `/healthz`) binds
 `[server].metrics_bind_addr`, default `127.0.0.1`, while telnet/JSON keep
 `bind_addr` (`0.0.0.0`) — see
 docs/DECISIONS/2026-10-08-man132-metrics-loopback-bind.md.
+MAN-78: SIGHUP to a `[server]` daemon reloads `[spot]` lists and
+`[[rbn_uplink]]` `dry_run`; invalid reloads are logged and ignored.
+`cty_path`/`scp_path` and every other key need a restart. See
+docs/DECISIONS/2026-10-10-man78-live-reload.md.
+
+MAN-126: `manta doctor` runs named setup checks (config refusals, audio,
+server ports, clock via SNTP plus Linux `adjtimex`, RBN uplink TCP reach)
+before its signal check, prints PASS/WARN/FAIL/SKIP with a fix per problem,
+and exits 1 on any FAIL — see
+docs/DECISIONS/2026-10-10-man126-doctor-setup-checks.md and
+docs/RUNBOOKS/setup-checks.md.
+
+MAN-79: `--cty`/`--scp` and `[spot].cty_path`/`scp_path` override the
+vendored `cty.dat`/`master.scp` at run time. `run`/`listen`/`soak`/`doctor`/
+`config check` warn when the built-in `cty.dat` is more than 180 days old.
+See docs/DECISIONS/2026-10-10-man79-operator-cty-scp-override.md.
+MAN-124: `run`'s log is plain text off a terminal (colour only on a TTY,
+`NO_COLOR` honoured); `-v`/`-q`/`--log-level` are shorthand for `RUST_LOG`;
+`--log-format json` makes every stderr line a JSON record — see
+docs/DECISIONS/2026-10-10-man124-log-output.md.
+MAN-116: `manta bench sensitivity` produces the recall/CER-vs-SNR (500 Hz)
+table over AWGN/Watterson good/poor × WPM, deterministic per build and
+flags — see docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md.
+
+MAN-123: `run`'s plain-text mode prints decoded text on stderr grouped one
+line per track and `SPOT:` lines on stdout; with a `[server]` table decoded
+text is off unless `--decoded-text` — see
+docs/DECISIONS/2026-10-10-man123-grouped-decoded-text.md.
+
+MAN-125: `manta devices` lists audio inputs and optional Soapy selectors;
+`manta check [SOURCE]` reports stream rate, input power and passband noise
+floor without decoding or services. See
+`docs/DECISIONS/2026-10-10-man125-source-diagnostics.md`.
+
+MAN-131: live audio reads wait for samples (5 s stall error naming the
+device, 48000 Hz and a macOS microphone-permission hint); digital-silence
+warning; `decode` warns without a sidecar and takes `--center-freq-hz` —
+see docs/DECISIONS/2026-10-11-man131-actionable-errors.md.
+
+MAN-138: JSON spots' `deGrid`/`deLat`/`deLon` are the operator's
+`[server].operator_grid` (its square's centre) or the new `operator_lat`/
+`operator_lon`, `null` when none is set, never a `cty.dat` country
+centroid; an inconsistent location fails config loading before I/O. See
+`docs/DECISIONS/2026-10-11-man138-station-location.md`.
+
+MAN-149: `docs/CONFIG.md` (every key's default and what reads it),
+`docs/METRICS.md`, `docs/SPOT-SCHEMA.md`, `docs/README.md` (start here, by
+audience) and `docs/DECISIONS/README.md`. A new config key, metric family,
+wire field, runbook or decision record needs a row in its document; tests
+in `docs_consistency.rs` and `spot_message.rs` enforce it — see
+docs/DECISIONS/2026-10-11-man149-docs-reference-and-index.md.
+
+MAN-172: high-SNR track churn fixed in `TrackManager` (local-peak spawn
+rule, incumbent-wins merge ties); VR3/VR4 pass, VR1/VR2 pass CER but not
+WPM. See docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md.
 MAN-269: `run --realtime`/`--loop` (`input.realtime`/`input.loop`) pace and
 loop file replay so a hardware-free replay can feed telnet/JSON clients; IQ
 WAVs declaring more than 10 MS/s are rejected at open — see
@@ -58,6 +113,8 @@ docs/DECISIONS/2026-10-10-man269-paced-looping-replay.md.
 
 ## Documents (read in this order)
 
+- `docs/README.md` — where operators, contributors and researchers each
+  start; every runbook and reference doc
 - `README.md` — goals and non-goals
 - `ARCHITECTURE.md` — 9-crate workspace, data flow, channelizer/decoder/
   validation/output design
@@ -111,7 +168,8 @@ descriptive and always loses conflicts with code and docs/.
 - CPU budget: full 192 kS/s passband within one Raspberry Pi 4 core, enforced
   by criterion benches.
 - JSON spot schema is an ecosystem contract — belongs in the `dispensa` repo
-  (ADR pending), not solely here.
+  (ADR-0011 `spots.v1`), not solely here. dispensa is private, so
+  `docs/SPOT-SCHEMA.md` is the in-repo field reference.
 - No GUI: daemon + CLI. Outputs: RBN-format cluster telnet (:7300) and JSON
   Lines/WebSocket (:7301) for cqdx ingest.
 - M0 testkit generates its own ref-bandwidth AWGN (see

@@ -545,21 +545,59 @@ jobs:
           VERSION: ${{ needs.validate-tag.outputs.version }}
         run: docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE:$VERSION"
 
+  # MAN-80: every Release carries a SHA256SUMS asset and a SLSA build-provenance
+  # attestation over the same five archives, so an operator can check a download
+  # with `sha256sum -c` and `gh attestation verify` (docs/RUNBOOKS/release.md,
+  # "Verifying a downloaded release"). Signing happens HERE, not in `build`: the
+  # build legs run dependency build scripts and `cross` containers, and keeping
+  # id-token: write out of them limits who can mint a signing token. See
+  # docs/DECISIONS/2026-10-10-man80-release-checksums-attestation.md.
   release:
     needs: [build, docker-publish-release]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    # id-token + attestations: the Sigstore signing certificate and the attestation
+    # upload. No artifact-metadata: write -- storage records are a push-to-registry
+    # feature, and this job pushes nothing to a registry.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
+      # Only the build legs' `manta-*` artifacts: docker/build-push-action also uploads a
+      # `*.dockerbuild` build record to this run, which must not be checksummed, attested or
+      # published as a release asset.
       - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
+          pattern: manta-*
           path: dist
           merge-multiple: true
 
       - name: List downloaded artifacts
         run: find dist -type f
 
+      # Run inside dist/ so the file lists bare archive names: `sha256sum -c` in an
+      # operator's download folder finds nothing to verify against `dist/...` paths.
+      # The glob expands before the redirect creates SHA256SUMS, so it never lists
+      # itself; an empty dist/ fails the step on the literal '*'.
+      - name: Write SHA256SUMS
+        shell: bash
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      # Fail closed: attest BEFORE the Release exists, so a failed attestation leaves
+      # no Release rather than one operators cannot verify. Recovery is re-running
+      # this job. The subjects are the digests SHA256SUMS lists, so the published
+      # file is the single source of both checks.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      # `files: dist/*` picks up SHA256SUMS alongside the archives.
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: dist/*

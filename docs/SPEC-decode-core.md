@@ -236,16 +236,22 @@ All timers are hop-counted (integers), never wall-clock.
   `{round(c) − 1, round(c), round(c) + 1}`.
 - A CANDIDATE in an owned channel is absorbed: no new track; ownership stays
   with the incumbent.
+- A rising, unowned channel `k` may start a spawn decision only if its
+  smoothed power `S[k]` is ≥ both `S[k−1]` and `S[k+1]` (a local maximum;
+  neighbours wrap). (MAN-172, see docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md)
 - Each hop, the track's demod input is taken from the **max-power channel
   among its owned set** (per ARCHITECTURE §4 "max-power selection"); the
   owned set follows `round(c)` as the centroid drifts, which is how drifting
   signals (§7 test 9) are followed without retuning.
 - If two channels `k` and `k+1` meet the rise condition on the *same hop* and
-  neither is owned, one CANDIDATE is created at the higher-power channel.
+  neither is owned, a spawn decision at `k` creates one CANDIDATE at the
+  higher instantaneous-power channel. This existing pairing rule can select
+  `k+1` even when only `k` is a smoothed-power local maximum.
 - Two tracks whose centers converge within 1.0 channel (interference or
   drift-collision) are merged: the lower-SNR track is CLOSED with reason
   `merged` (counted); its decoder state is discarded (text already emitted
-  stands).
+  stands). On equal SNR the older track (lower `track_id`) survives.
+  (MAN-172, see docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md)
 
 ---
 
@@ -839,14 +845,14 @@ M0 = V1 passing end-to-end from a WAV file. M1 = V1–V6. V7–V10 and V8w gate 
 
 Unlike V1–V10 (testkit-synthesized IQ), these operate at the
 `DecoderEvent`-stream level -- hand-built event sequences feeding
-`Validator::ingest` directly, no IQ synthesis involved. V11-V15, V18-V30
+`Validator::ingest` directly, no IQ synthesis involved. V11-V15, V18-V45b
 are implemented in `crates/manta-spot/tests/golden_v11_v15.rs`; V16-V17
 (operator suppression, MAN-31 -- orthogonal to this pipeline, see
 ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 
 | # | Name | Scenario | Pass criteria |
 |---|---|---|---|
-| V11 | context-parse | Each of `CQ <call>`, `CQ TEST <call>`, `DE <call>`, `<call> UP`, `V V V <call>`, `<call> T` | Correct `SpotType` assigned per pattern family |
+| V11 | context-parse | Each of `CQ <call>`, `CQ TEST <call>`, `CQ <contest> <call>` (e.g. `CQ WPX`; filler set per `manta-spot::context`), `TEST <call>`, `DE <call>`, `<call> UP`, `V V V <call>`, `<call> T` | Correct `SpotType` assigned per pattern family |
 | V12 | bogus-prefix | Structurally-valid callsign with a prefix absent from cty.dat | 0 spots, even though grammar passes |
 | V13 | scp-boost | Same callsign/confidences with vs. without SCP membership | `c_call` strictly higher when a member; absence never rejects |
 | V14 | repetition-gate | 1 decode vs. 2 decodes of the same callsign within 90 s, non-beacon spot type | 1 rep never spots; 2 reps does |
@@ -873,6 +879,8 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V42 | beacon-exempt-from-arbitration | A confusable rival of a `BEACON`-tagged candidate reaches more reps than the genuine, once-per-cycle beacon | The genuine beacon still spots -- `BEACON` candidates are exempt from step 4b arbitration (MAN-100 remediation C3) |
 | V43 | short-id-ordinary-cadence-unspotted | A 2-word ID ("DE `<CALL>`") repeated only twice, 20 s apart -- below both `MIN_MESSAGE_WORD_GAP` and `MIN_MESSAGE_TIME_GAP_SECONDS` | Not spotted -- an accepted, bounded recall cost (MAN-100 remediation C2, quantified), not tightened further |
 | V44 | 1-rep-rival-still-wins-by-shape | The literal, measured V8w track-90 shape: a 3-rep truncation ("W6JQ") vs. its genuine, longer form ("W6JQA") observed only once on the track | The truncation is withheld -- shape decides a prefix-containment pair once the rival has been observed at all, regardless of how few reps it has (MAN-100 remediation round 3; a rival-side rep floor tried in remediation C5 excluded this exact case and was reverted) |
+| V45 | non-callsign-convention | Each listed CW convention (`5NN`, `3NN`, `599`, `TEST`, …) sent as a CQ/DE/beacon candidate, some of which match an allocated cty.dat prefix (`5N` Nigeria) | 0 spots — rejected by grammar regardless of cty.dat (MAN-105) |
+| V45b | convention-never-vetoes | A track that repeats `5NN` exchanges, then a real non-SCP call ending in `5NN` (`HA5NN`) | The real call spots — the convention never enters the MAN-100 support ledger (MAN-105) |
 
 ---
 
@@ -996,6 +1004,7 @@ freq_correction_ppm = 0.0
 # replay_epoch = 1700000000
 
 [spot]
+# allowlist, blocklist_path and notch_path are re-read on SIGHUP when the config has a [server] table (MAN-78); cty_path and scp_path need a restart.
 # Operator Watch List (§6, MAN-28): callsigns here bypass grammar/cty
 # validation and the repetition gate entirely in manta-spot's validator.
 # A non-empty --allowlist replaces this list.
@@ -1007,6 +1016,17 @@ allowlist = []
 # Notched frequency ranges, one `low_hz-high_hz` per line (MAN-31). Same
 # path rule; --notch overrides it.
 # notch_path = "notches.txt"
+# AD1C's cty.dat replaces the bundled country-prefix table (MAN-79).
+# A prefix missing from this file is rejected unless the call is allowlisted.
+# Download: https://www.country-files.com/cty/cty.dat
+# A relative path resolves against this config file's directory.
+# Unset: bundled. --cty overrides it.
+# cty_path = "cty.dat"
+# MASTER.SCP replaces the bundled known-callsign list. Membership raises
+# confidence; absence alone never rejects a call.
+# Download: https://www.supercheckpartial.com/MASTER.SCP
+# Same path rule. Unset: bundled. --scp overrides it.
+# scp_path = "MASTER.SCP"
 
 # [server] key line_format (MAN-88), set inside your real [server] table:
 # Which fixed-column wire layout the INBOUND telnet cluster server renders
@@ -1047,10 +1067,24 @@ allowlist = []
 # characters (they are interpolated verbatim into every client's banner,
 # so an embedded CR/LF would forge cluster lines), `operator_grid` as a 4-
 # or 6-character Maidenhead locator.
+#
+# `operator_grid`, `operator_lat` and `operator_lon` also set every JSON
+# spot's `deGrid`/`deLat`/`deLon`, the receiving station's position
+# (MAN-138, `docs/DECISIONS/2026-10-11-man138-station-location.md`): a
+# grid alone gives its square's centre, a lat/lon pair alone gives the
+# 6-character square containing it, and with none set all three are
+# `null` -- never a `cty.dat` country centroid. `operator_lat` is a finite
+# number from -90 to 90 and `operator_lon` from -180 to 180 (decimal
+# degrees, south and west negative), checked at deserialize time. The two
+# are set together or not at all, and alongside `operator_grid` the point
+# must lie inside that square; both rules fail config loading before any
+# I/O.
 # station_callsign = "W3XYZ"    # required, no default
 # operator_name = "Art"         # optional, default: absent
 # operator_qth = "Switzerland"  # optional, default: absent
 # operator_grid = "JN46la"      # optional, default: absent
+# operator_lat = 46.0208        # optional, default: absent
+# operator_lon = 8.9583         # optional, default: absent
 
 # [server] and [[rbn_uplink]] (manta_server::config) configure the
 # telnet/JSON/metrics servers and the RBN uplink; README.md's "Run it as a
@@ -1077,7 +1111,8 @@ always taken verbatim: `server.station_callsign`, `server.bind_addr`,
 `server.metrics_bind_addr`, `server.operator_name`,
 `server.operator_qth`, `server.operator_grid`, `input.type`,
 `input.device`, `input.path`, `input.host`, `input.password`,
-`input.driver`, `spot.blocklist_path`, `spot.notch_path` and
+`input.driver`, `spot.blocklist_path`, `spot.notch_path`,
+`spot.cty_path`, `spot.scp_path` and
 `decode.engine`. Relative paths from the file
 resolve against the file's directory; those from a flag or the
 environment resolve against the working directory. `[[rbn_uplink]]`
@@ -1085,8 +1120,10 @@ cannot be set from the environment.
 
 Unknown tables, unknown keys in a known table, and unknown `MANTA_*`
 variables are errors that name the offender, raised before any source
-I/O. `MANTA_GIT_SHA` is exempt: it is read at build time
-(`crates/manta-cli/build.rs`), never at run time. `decode` and `oracle`
+I/O. `MANTA_GIT_SHA` and `MANTA_FEATURES` are exempt: they are build-time
+values of `crates/manta-cli/build.rs`, never read at run time, and
+`cargo run`/`cargo test` export both into the processes they start
+(MAN-83). `decode` and `oracle`
 read only the file `--config` names and never the environment
 (`MANTA_CONFIG` included), so their output cannot depend on the ambient
 environment; `decode` applies `[detector]`, `[spot]`, `[decode]` and
@@ -1106,6 +1143,11 @@ that takes `--config` (`run`, `soak`, `doctor`, `decode`, `oracle`) reads
 constants: listener ports and the per-listener connection/rate quotas
 (MAN-57/MAN-61) are documented on `manta_server::config::ServerConfig`'s
 own fields, with the exposure policy in ARCHITECTURE §7.
+
+`docs/CONFIG.md` is the operator's per-key reference: every key of every
+table, `[[rbn_uplink]]` included, with its default and which commands and
+engines it affects. This section stays normative for the decode-core
+defaults.
 
 ## 10. Deviations from ARCHITECTURE.md
 

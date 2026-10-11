@@ -4,9 +4,13 @@
 //! ALL required and non-nullable on that contract -- see
 //! docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md.
 //! `dxDxcc`/`deDxcc` are resolved from the vendored `dxcc.tsv` ADIF entity-
-//! number table (MAN-136); `dxContinent`/`dxCqZone`/`dxLat`/`dxLon` (and the
-//! `de*` counterparts) are resolved from the same vendored `cty.dat` the
+//! number table (MAN-136); `dxContinent`/`dxCqZone`/`dxLat`/`dxLon` and
+//! `deContinent` are resolved from the same vendored `cty.dat` the
 //! validator already trusts for the plausibility gate (`manta_spot::cty`).
+//! `deGrid`/`deLat`/`deLon` are NOT: they are the operator's configured
+//! station position (`[server].operator_grid`/`operator_lat`/`operator_lon`,
+//! MAN-138), `null` when none is configured -- never a `cty.dat` country
+//! centroid, which would put every station in one country on one point.
 //! When a callsign isn't cty-resolvable, each required field gets a named
 //! out-of-domain `UNKNOWN_*` sentinel below rather than a fabricated-looking
 //! real value or (where the contract forbids it) `null`. A maritime-mobile
@@ -133,8 +137,9 @@ pub fn station_geography_unresolved(cty: &cty::Table, station_call: &str) -> boo
 
 /// The contract-required geography fields for ONE side of a spot, resolved
 /// together so `dxDxcc` can never disagree with the continent/CQ zone/lat/lon
-/// emitted beside it. `cq_zone` has no `de` counterpart on the wire schema
-/// and is simply unused for that side.
+/// emitted beside it. `cq_zone`, `lat` and `lon` are unused for the de side:
+/// `cq_zone` has no `de` counterpart on the wire schema, and `deLat`/`deLon`
+/// are the operator's configured position (MAN-138), not a country centroid.
 struct Geography {
     dxcc: i64,
     continent: String,
@@ -234,9 +239,16 @@ impl SpotMessage {
     /// before a track's first `TrackMeta`, all stamped by the metadata-
     /// arrival retry with that track's saved timestamp) -- without the
     /// callsign, those would collide too.
+    ///
+    /// `station_location` is this station's configured position
+    /// (`ServerConfig::station_location`, MAN-138), copied verbatim into
+    /// `deGrid`/`deLat`/`deLon`; `None` sends all three as `null`. The de
+    /// side's `deDxcc`/`deContinent` still come from `station_call` through
+    /// `cty.dat` -- they are entity-level fields, right at that granularity.
     pub fn from_spot(
         spot: &Spot,
         station_call: &str,
+        station_location: Option<&crate::config::StationLocation>,
         cty: &cty::Table,
         decoder_version: &str,
         unix_ts_secs: i64,
@@ -299,9 +311,12 @@ impl SpotMessage {
             dx_continent: dx.continent,
             dx_cq_zone: dx.cq_zone,
             de_call: station_call.to_string(),
-            de_grid: None,
-            de_lat: de.lat,
-            de_lon: de.lon,
+            // MAN-138: the operator's statement of where this station is,
+            // never `de.lat`/`de.lon` -- a country centroid would stack every
+            // station in one DXCC entity on a single map point.
+            de_grid: station_location.map(|l| l.grid.clone()),
+            de_lat: station_location.map(|l| l.lat),
+            de_lon: station_location.map(|l| l.lon),
             de_dxcc: de.dxcc,
             de_continent: de.continent,
             snr: Some(spot.snr_db.round() as i32),
@@ -339,6 +354,80 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         }
     }
 
+    /// A config-free `StationLocation` at `grid`'s centre -- what
+    /// `ServerConfig::station_location` resolves for a grid-only config.
+    fn location(grid: &str) -> crate::config::StationLocation {
+        let (lat, lon) = crate::maidenhead::square(grid).unwrap().center();
+        crate::config::StationLocation {
+            grid: crate::maidenhead::canonical(grid).unwrap(),
+            lat,
+            lon,
+        }
+    }
+
+    /// MAN-138, the ticket's scenario at the message level: two US stations
+    /// whose callsigns resolve to the SAME cty.dat entity, but whose operators
+    /// configured different locations, must report different positions --
+    /// never the shared US centroid (37.6, -91.87).
+    #[test]
+    fn de_position_is_the_configured_station_location_not_a_country_centroid() {
+        let cty = cty::Table::parse(manta_spot::CTY_DAT);
+        let w1aw = location("FN31pr");
+        let w5au = location("EM12kp");
+        let a = SpotMessage::from_spot(&sample_spot(), "W1AW", Some(&w1aw), &cty, "v", 0, 1);
+        let b = SpotMessage::from_spot(&sample_spot(), "W5AU", Some(&w5au), &cty, "v", 0, 1);
+        assert_eq!(a.de_grid.as_deref(), Some("FN31pr"));
+        assert_eq!(b.de_grid.as_deref(), Some("EM12kp"));
+        assert_eq!((a.de_lat, a.de_lon), (Some(w1aw.lat), Some(w1aw.lon)));
+        assert_ne!((a.de_lat, a.de_lon), (b.de_lat, b.de_lon));
+        for m in [&a, &b] {
+            assert_ne!((m.de_lat, m.de_lon), (Some(37.6), Some(-91.87)));
+            assert_eq!(m.de_dxcc, 291); // entity-level fields still from the callsign
+            assert_eq!(m.de_continent, "NA");
+        }
+    }
+
+    /// No configured location: all three are null -- the contract-legal
+    /// "unknown" -- even though the callsign resolves fine in cty.dat.
+    #[test]
+    fn an_unconfigured_station_sends_a_null_position() {
+        let cty = cty::Table::parse(manta_spot::CTY_DAT);
+        let msg = SpotMessage::from_spot(&sample_spot(), "W1AW", None, &cty, "v", 0, 1);
+        assert_eq!(msg.de_dxcc, 291, "test premise: the callsign resolves");
+        assert_eq!((&msg.de_grid, msg.de_lat, msg.de_lon), (&None, None, None));
+        let json = serde_json::to_value(&msg).unwrap();
+        for key in ["deGrid", "deLat", "deLon"] {
+            assert!(json.get(key).is_some_and(|v| v.is_null()), "{key}: {json}");
+        }
+    }
+
+    /// The configured position is the operator's statement and wins even for a
+    /// /MM station; the entity number still follows the callsign rule.
+    #[test]
+    fn a_mobile_station_with_a_configured_location_reports_it() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let here = location("FN31pr");
+        let msg = SpotMessage::from_spot(&sample_spot(), "W3XYZ/MM", Some(&here), &cty, "v", 0, 1);
+        assert_eq!(msg.de_dxcc, NO_DXCC_ENTITY);
+        assert_eq!(msg.de_grid.as_deref(), Some("FN31pr"));
+        assert_eq!((msg.de_lat, msg.de_lon), (Some(here.lat), Some(here.lon)));
+    }
+
+    /// The dx side is untouched by MAN-138.
+    #[test]
+    fn dx_geography_is_unchanged_by_a_configured_station_location() {
+        let cty = cty::Table::parse(manta_spot::CTY_DAT);
+        let here = location("FN31pr");
+        let with = SpotMessage::from_spot(&sample_spot(), "W1AW", Some(&here), &cty, "v", 0, 1);
+        let without = SpotMessage::from_spot(&sample_spot(), "W1AW", None, &cty, "v", 0, 1);
+        assert_eq!((with.dx_lat, with.dx_lon), (without.dx_lat, without.dx_lon));
+        assert!(with.dx_lat.is_some(), "test premise: JA1ABC resolves");
+        assert_eq!(with.dx_grid, None);
+        assert_eq!(with.dx_dxcc, without.dx_dxcc);
+        assert_eq!(with.dx_continent, without.dx_continent);
+        assert_eq!(with.dx_cq_zone, without.dx_cq_zone);
+    }
+
     /// MAN-89: `station_callsign` may now carry a `-N` SSID, but `cty.dat`'s
     /// exact-call alias rows (`prefix_entry`, cty.rs:143-154) only tolerate a
     /// `/`-portable suffix, never `-` -- so an operator whose OWN callsign has an
@@ -350,13 +439,13 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
     #[test]
     fn de_geography_ignores_the_ssid_on_an_exact_alias_callsign() {
         let cty = cty::Table::parse(manta_spot::CTY_DAT);
-        let bare = SpotMessage::from_spot(&sample_spot(), "4U1UN", &cty, "v", 0, 1);
-        let ssid = SpotMessage::from_spot(&sample_spot(), "4U1UN-1", &cty, "v", 0, 1);
+        let bare = SpotMessage::from_spot(&sample_spot(), "4U1UN", None, &cty, "v", 0, 1);
+        let ssid = SpotMessage::from_spot(&sample_spot(), "4U1UN-1", None, &cty, "v", 0, 1);
 
         assert_eq!(ssid.de_dxcc, bare.de_dxcc);
         assert_eq!(ssid.de_continent, bare.de_continent);
-        assert_eq!(ssid.de_lat, bare.de_lat);
-        assert_eq!(ssid.de_lon, bare.de_lon);
+        // MAN-138: the position no longer comes from the callsign at all.
+        assert!(ssid.de_lat.is_none() && bare.de_lat.is_none());
         // The wire identity keeps the SSID -- geography is stripped, identity is not.
         assert_eq!(ssid.de_call, "4U1UN-1");
         assert!(ssid.id.starts_with("4U1UN-1:"));
@@ -367,11 +456,11 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
     #[test]
     fn de_geography_is_unchanged_for_an_ordinary_prefix_callsign() {
         let cty = cty::Table::parse(manta_spot::CTY_DAT);
-        let bare = SpotMessage::from_spot(&sample_spot(), "W5AU", &cty, "v", 0, 1);
-        let ssid = SpotMessage::from_spot(&sample_spot(), "W5AU-1", &cty, "v", 0, 1);
+        let bare = SpotMessage::from_spot(&sample_spot(), "W5AU", None, &cty, "v", 0, 1);
+        let ssid = SpotMessage::from_spot(&sample_spot(), "W5AU-1", None, &cty, "v", 0, 1);
         assert_eq!(ssid.de_dxcc, bare.de_dxcc);
         assert_eq!(ssid.de_continent, bare.de_continent);
-        assert_eq!(ssid.de_lat, bare.de_lat);
+        assert!(ssid.de_lat.is_none() && bare.de_lat.is_none());
     }
 
     #[test]
@@ -387,7 +476,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         let cty = cty::Table::parse(CTY_FIXTURE);
         let mut spot = sample_spot();
         spot.freq_hz = 13_999_999.6;
-        let msg = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 0);
+        let msg = SpotMessage::from_spot(&spot, "W3XYZ", None, &cty, "manta-0.1.0", 0, 0);
 
         assert_eq!(msg.frequency, 14_000_000);
         assert_eq!(msg.band, "20m");
@@ -399,6 +488,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         let msg = SpotMessage::from_spot(
             &sample_spot(),
             "W3XYZ",
+            None,
             &cty,
             "manta-0.1.0",
             1_700_000_000,
@@ -422,6 +512,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         let msg = SpotMessage::from_spot(
             &sample_spot(),
             "W3XYZ",
+            None,
             &cty,
             "manta-0.1.0",
             0,
@@ -441,7 +532,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
     #[test]
     fn a_resolvable_callsign_carries_its_real_adif_dxcc_entity_number() {
         let cty = cty::Table::parse(CTY_FIXTURE);
-        let msg = SpotMessage::from_spot(&sample_spot(), "W3XYZ", &cty, "manta-0.1.0", 0, 0);
+        let msg = SpotMessage::from_spot(&sample_spot(), "W3XYZ", None, &cty, "manta-0.1.0", 0, 0);
 
         assert_eq!(msg.dx_dxcc, 339, "JA1ABC -> Japan");
         assert_eq!(msg.de_dxcc, 291, "W3XYZ -> United States");
@@ -468,7 +559,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         spot.callsign = "QQ1AAA".to_string();
         assert!(cty.lookup(&spot.callsign).is_none(), "test premise");
 
-        let msg = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 0);
+        let msg = SpotMessage::from_spot(&spot, "W3XYZ", None, &cty, "manta-0.1.0", 0, 0);
 
         assert_eq!(msg.dx_dxcc, UNKNOWN_DXCC);
         assert_eq!(msg.dx_continent, UNKNOWN_CONTINENT);
@@ -492,7 +583,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
     #[test]
     fn an_unresolvable_station_callsign_also_gets_the_sentinels() {
         let cty = cty::Table::parse(manta_spot::CTY_DAT);
-        let msg = SpotMessage::from_spot(&sample_spot(), "QQ1AAA", &cty, "manta-0.1.0", 0, 0);
+        let msg = SpotMessage::from_spot(&sample_spot(), "QQ1AAA", None, &cty, "manta-0.1.0", 0, 0);
 
         assert_eq!(msg.de_dxcc, UNKNOWN_DXCC);
         assert_eq!(msg.de_continent, UNKNOWN_CONTINENT);
@@ -519,7 +610,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
             );
             let mut spot = sample_spot();
             spot.callsign = call.to_string();
-            let msg = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 0);
+            let msg = SpotMessage::from_spot(&spot, "W3XYZ", None, &cty, "manta-0.1.0", 0, 0);
 
             assert_eq!(msg.dx_dxcc, NO_DXCC_ENTITY, "{call}");
             assert_eq!(msg.dx_continent, UNKNOWN_CONTINENT, "{call}");
@@ -538,7 +629,8 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
     #[test]
     fn a_mobile_station_callsign_also_emits_adif_entity_zero() {
         let cty = cty::Table::parse(CTY_FIXTURE);
-        let msg = SpotMessage::from_spot(&sample_spot(), "W3XYZ/MM", &cty, "manta-0.1.0", 0, 0);
+        let msg =
+            SpotMessage::from_spot(&sample_spot(), "W3XYZ/MM", None, &cty, "manta-0.1.0", 0, 0);
 
         assert_eq!(msg.de_dxcc, NO_DXCC_ENTITY);
         assert_eq!(msg.de_continent, UNKNOWN_CONTINENT);
@@ -558,7 +650,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         for call in ["K5ARH/P", "K5ARH/QRP", "K5ARH/M", "K5ARH/3", "K5ARH"] {
             let mut spot = sample_spot();
             spot.callsign = call.to_string();
-            let msg = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 0);
+            let msg = SpotMessage::from_spot(&spot, "W3XYZ", None, &cty, "manta-0.1.0", 0, 0);
 
             assert_eq!(msg.dx_dxcc, 291, "{call}");
             assert_eq!(msg.dx_continent, "NA", "{call}");
@@ -582,7 +674,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         for call in ["KP4/K5ARH/MM", "K5ARH/MM/QRP", "K5ARH/AM/P"] {
             let mut spot = sample_spot();
             spot.callsign = call.to_string();
-            let msg = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 0);
+            let msg = SpotMessage::from_spot(&spot, "W3XYZ", None, &cty, "manta-0.1.0", 0, 0);
 
             assert_eq!(msg.dx_dxcc, NO_DXCC_ENTITY, "{call}");
             assert_eq!(msg.dx_cq_zone, UNKNOWN_CQ_ZONE, "{call}");
@@ -628,6 +720,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         let msg = SpotMessage::from_spot(
             &sample_spot(),
             "W3XYZ",
+            None,
             &cty,
             "manta-0.1.0",
             0,
@@ -648,6 +741,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         let msg = SpotMessage::from_spot(
             &sample_spot(),
             "W3XYZ",
+            None,
             &cty,
             "manta-0.1.0",
             0,
@@ -676,8 +770,8 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         assert_eq!(spot_a.track_id, spot_b.track_id);
         assert_eq!(spot_a.sample_ts, spot_b.sample_ts);
 
-        let msg_a = SpotMessage::from_spot(&spot_a, "W3XYZ", &cty, "manta-0.1.0", 0, 1_000);
-        let msg_b = SpotMessage::from_spot(&spot_b, "W3XYZ", &cty, "manta-0.1.0", 0, 1_000);
+        let msg_a = SpotMessage::from_spot(&spot_a, "W3XYZ", None, &cty, "manta-0.1.0", 0, 1_000);
+        let msg_b = SpotMessage::from_spot(&spot_b, "W3XYZ", None, &cty, "manta-0.1.0", 0, 1_000);
 
         assert_ne!(
             msg_a.id, msg_b.id,
@@ -690,9 +784,10 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         let cty = cty::Table::parse(CTY_FIXTURE);
         let spot = sample_spot();
 
-        let station_a = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 1_000);
-        let station_b = SpotMessage::from_spot(&spot, "N0CALL", &cty, "manta-0.1.0", 0, 1_000);
-        let restarted = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 2_000);
+        let station_a = SpotMessage::from_spot(&spot, "W3XYZ", None, &cty, "manta-0.1.0", 0, 1_000);
+        let station_b =
+            SpotMessage::from_spot(&spot, "N0CALL", None, &cty, "manta-0.1.0", 0, 1_000);
+        let restarted = SpotMessage::from_spot(&spot, "W3XYZ", None, &cty, "manta-0.1.0", 0, 2_000);
 
         assert_ne!(
             station_a.id, station_b.id,
@@ -710,6 +805,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         let msg = SpotMessage::from_spot(
             &sample_spot(),
             "W3XYZ",
+            None,
             &cty,
             "manta-0.1.0",
             0,
@@ -729,7 +825,13 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
             "dxDxcc",
             "dxContinent",
             "dxCqZone",
+            "dxGrid",
+            "dxLat",
+            "dxLon",
             "deCall",
+            "deGrid",
+            "deLat",
+            "deLon",
             "deDxcc",
             "deContinent",
             "snr",
@@ -743,5 +845,45 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         }
         assert_eq!(json["dxDxcc"], 339);
         assert!(!json["dxDxcc"].is_null());
+    }
+
+    /// MAN-149: dispensa's contract is private, so `docs/SPOT-SCHEMA.md` is
+    /// the field reference outside developers read. Its field table must
+    /// have exactly one row per key this struct puts on the wire.
+    #[test]
+    fn every_wire_field_is_documented() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let msg = SpotMessage::from_spot(&sample_spot(), "W1AW", None, &cty, "v", 0, 1);
+        let json = serde_json::to_value(&msg).unwrap();
+        let keys: Vec<&String> = json.as_object().expect("an object").keys().collect();
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/SPOT-SCHEMA.md");
+        let schema = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("reading {path}: {e}"))
+            .replace("\r\n", "\n");
+        let rows: Vec<&str> = schema
+            .lines()
+            .filter_map(|l| l.strip_prefix("| `"))
+            .filter_map(|l| l.split_once("` |"))
+            .map(|(field, _)| field)
+            .collect();
+
+        for key in &keys {
+            assert!(
+                rows.contains(&key.as_str()),
+                "docs/SPOT-SCHEMA.md has no `| `{key}` |` row: add one to its Fields table"
+            );
+        }
+        for row in &rows {
+            assert!(
+                keys.iter().any(|k| k == row),
+                "docs/SPOT-SCHEMA.md documents `{row}`, which SpotMessage does not serialize"
+            );
+        }
+        assert_eq!(
+            rows.len(),
+            keys.len(),
+            "docs/SPOT-SCHEMA.md's Fields table must have exactly one row per wire field"
+        );
     }
 }

@@ -101,12 +101,30 @@ fn assert_rejected_before_source_io(what: &str, out: &Output, needles: &[&str]) 
     for needle in needles {
         assert!(stderr.contains(needle), "{what}: no {needle:?} in {stderr}");
     }
+    // MAN-126: `doctor` reports a source that will not open as a check
+    // line on stdout, so stdout must be clean too.
+    let stdout = String::from_utf8_lossy(&out.stdout);
     for io in ["open WAV", "No such file", "os error 2"] {
         assert!(
             !stderr.contains(io),
             "{what}: the config must be rejected before any source I/O: {stderr}"
         );
+        assert!(
+            !stdout.contains(io),
+            "{what}: the config must be rejected before any source I/O: {stdout}"
+        );
     }
+}
+
+/// A UDP port nothing answers on: `doctor --ntp-server 127.0.0.1:<it>`
+/// keeps the clock check off the internet (MAN-126).
+fn closed_ntp_server() -> String {
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    format!("127.0.0.1:{port}")
 }
 
 /// `run`, `decode`, `soak` and `doctor`, each given `--config cfg` and a
@@ -778,7 +796,8 @@ fn doctor_accepts_and_applies_dial_freq_hz_for_an_audio_source() {
     let out = manta()
         .args(["doctor", "--duration", "3", "--json", "--source"])
         .arg(&wav)
-        .args(["--dial-freq-hz", "14030000"])
+        .args(["--dial-freq-hz", "14030000", "--ntp-server"])
+        .arg(closed_ntp_server())
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -2223,6 +2242,8 @@ fn doctor_reports_center_freq_hz_from_the_config_file() {
     let out = manta()
         .args(["doctor", "--duration", "3", "--json", "--config"])
         .arg(&cfg)
+        .arg("--ntp-server")
+        .arg(closed_ntp_server())
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -2258,31 +2279,63 @@ fn soak_runs_from_a_config_file_source() {
     assert!(stderr.contains("SoakReport"), "stderr: {stderr}");
 }
 
-/// MAN-261 D7: `soak` and `doctor` never start the spot servers; a
-/// `[server]` table in their config earns a note instead.
+/// MAN-261 D7: `soak` never starts the spot servers; a `[server]` table in
+/// its config earns a note instead. MAN-126 D10
+/// (docs/DECISIONS/2026-10-10-man126-doctor-setup-checks.md): `doctor` now
+/// checks `[server]`'s ports instead of ignoring the table, still starting
+/// no server; every port here is 0, so each port row is a SKIP.
 #[test]
-fn soak_and_doctor_note_an_ignored_server_table() {
+fn soak_notes_an_ignored_server_table_and_doctor_checks_its_ports() {
     let dir = tempfile::tempdir().unwrap();
     v1_fixture(dir.path());
     let cfg = write_cfg(
         dir.path(),
         "manta.toml",
-        &format!("{SERVER_TOML}[input]\ntype = \"file\"\npath = \"v1.wav\"\niq = true\n"),
+        &format!(
+            "{SERVER_TOML}[input]\ntype = \"file\"\npath = \"v1.wav\"\niq = true\n\
+             center_freq_hz = 7030000.0\n"
+        ),
     );
 
-    for args in [
-        ["soak", "--duration", "2", "--config"].as_slice(),
-        ["doctor", "--duration", "3", "--json", "--config"].as_slice(),
-    ] {
-        let out = manta().args(args).arg(&cfg).output().unwrap();
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(out.status.success(), "{}: stderr: {stderr}", args[0]);
-        assert!(
-            stderr.contains("does not start the spot servers"),
-            "{}: stderr: {stderr}",
-            args[0]
-        );
-        assert!(!stderr.contains("telnet="), "{}: {stderr}", args[0]);
+    let out = manta()
+        .args(["soak", "--duration", "2", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "soak: stderr: {stderr}");
+    assert!(
+        stderr.contains("does not start the spot servers"),
+        "soak: stderr: {stderr}"
+    );
+    assert!(!stderr.contains("telnet="), "soak: {stderr}");
+
+    let out = manta()
+        .args(["doctor", "--duration", "3", "--json", "--config"])
+        .arg(&cfg)
+        .arg("--ntp-server")
+        .arg(closed_ntp_server())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "doctor: stdout: {stdout} stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("does not start the spot servers"),
+        "doctor: stderr: {stderr}"
+    );
+    assert!(!stderr.contains("telnet="), "doctor: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let checks = report["checks"].as_array().unwrap();
+    for name in ["telnet port", "json port", "metrics port"] {
+        let row = checks
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("no {name} row in {report}"));
+        assert_eq!(row["status"], "skip", "{row}");
     }
 }
 
@@ -2522,6 +2575,126 @@ fn status_with_a_missing_server_config_fails_with_exit_code_two_not_one() {
     }
 }
 
+// MAN-79: the decoded call is valid only in the operator's updated table.
+fn qq9_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+    let mut spec = short_v1();
+    spec.signals[0].text = "CQ CQ DE QQ9ZZZ QQ9ZZZ K".into();
+    let wav = write_fixture(dir, &spec);
+    let cty = write_cfg(
+        dir,
+        "cty-new.dat",
+        &format!(
+            "{}Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n",
+            manta_spot::CTY_DAT
+        ),
+    );
+    (wav, cty)
+}
+
+#[test]
+fn decode_cty_flag_lets_a_newly_allocated_prefix_spot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, cty) = qq9_fixture(dir.path());
+    let before = manta()
+        .args(["decode", "--json"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(decode_spots(&before).is_empty());
+    let after = manta()
+        .args(["decode", "--json", "--cty"])
+        .arg(cty)
+        .arg(wav)
+        .output()
+        .unwrap();
+    let spots = decode_spots(&after);
+    assert_eq!(spots.len(), 1);
+    assert_eq!(spots[0]["callsign"], "QQ9ZZZ");
+}
+
+#[test]
+fn decode_cty_path_in_a_config_file_lets_a_newly_allocated_prefix_spot() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("config");
+    std::fs::create_dir(&sub).unwrap();
+    let (wav, _) = qq9_fixture(&sub);
+    let config = write_cfg(&sub, "manta.toml", "[spot]\ncty_path = 'cty-new.dat'\n");
+    let out = manta()
+        .current_dir(dir.path())
+        .args(["decode", "--json", "--config"])
+        .arg(config)
+        .arg(wav)
+        .output()
+        .unwrap();
+    let spots = decode_spots(&out);
+    assert_eq!(spots.len(), 1);
+    assert_eq!(spots[0]["callsign"], "QQ9ZZZ");
+}
+
+#[test]
+fn run_reads_cty_path_from_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, cty) = qq9_fixture(dir.path());
+    let out = manta()
+        .args(["run", "--json", "--source-iq", "--source"])
+        .arg(wav)
+        .env("MANTA_SPOT_CTY_PATH", cty)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(run_spots(&out.stdout)
+        .iter()
+        .any(|s| s["callsign"] == "QQ9ZZZ"));
+}
+
+#[test]
+fn decode_scp_flag_is_accepted_and_still_spots() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture(dir.path());
+    let scp = write_cfg(dir.path(), "MASTER.SCP", "W1AW\n");
+    let out = manta()
+        .args(["decode", "--json", "--scp"])
+        .arg(scp)
+        .arg(wav)
+        .output()
+        .unwrap();
+    assert!(decode_spots(&out).iter().any(|s| s["callsign"] == "W1AW"));
+}
+
+#[test]
+fn a_cty_file_with_no_prefixes_is_rejected_before_source_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let cty = write_cfg(
+        dir.path(),
+        "cty.csv",
+        "1A,Sov Mil Order of Malta,246,EU,15,28,41.90,-12.43,-1.0,1A;\n",
+    );
+    let out = manta()
+        .args(["run", "--source", "does-not-exist.wav", "--cty"])
+        .arg(cty)
+        .output()
+        .unwrap();
+    assert_rejected_before_source_io("cty.csv", &out, &["cty.csv", "lists no callsign prefixes"]);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn decode_never_prints_the_cty_age_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture(dir.path());
+    let out = manta()
+        .args(["decode", "--json"])
+        .arg(wav)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("built-in cty.dat"));
+}
+
 // ---- MAN-269: IQ WAV rate ceiling, and paced/looping file replay
 
 /// A float32 stereo WAV header declaring `rate` and four frames of silence:
@@ -2570,6 +2743,36 @@ fn run_rejects_an_iq_wav_whose_declared_rate_would_exhaust_memory() {
         .output()
         .unwrap();
     assert_rate_bomb_is_refused(&out);
+}
+
+/// MAN-269 review (P2): with `[server]` and no dial frequency, `run`'s dial
+/// guard used to report "--dial-freq-hz is required" for an over-rate IQ WAV
+/// (its open error was read as "no RF frequency"), hiding the rate error.
+#[test]
+fn daemon_run_reports_the_rate_error_not_the_dial_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("bomb.wav");
+    header_only_iq_wav(&wav, 393_216_000);
+    std::fs::write(
+        dir.path().join("bomb.json"),
+        "{\"center_freq_hz\": 14030000.0}",
+    )
+    .unwrap();
+    let cfg = write_cfg(dir.path(), "server.toml", SERVER_TOML);
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(&wav)
+        .arg("--source-iq")
+        .arg("--config")
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert_rate_bomb_is_refused(&out);
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("--dial-freq-hz is required"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
