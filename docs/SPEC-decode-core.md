@@ -237,16 +237,22 @@ All timers are hop-counted (integers), never wall-clock.
   `{round(c) − 1, round(c), round(c) + 1}`.
 - A CANDIDATE in an owned channel is absorbed: no new track; ownership stays
   with the incumbent.
+- A rising, unowned channel `k` may start a spawn decision only if its
+  smoothed power `S[k]` is ≥ both `S[k−1]` and `S[k+1]` (a local maximum;
+  neighbours wrap). (MAN-172, see docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md)
 - Each hop, the track's demod input is taken from the **max-power channel
   among its owned set** (per ARCHITECTURE §4 "max-power selection"); the
   owned set follows `round(c)` as the centroid drifts, which is how drifting
   signals (§7 test 9) are followed without retuning.
 - If two channels `k` and `k+1` meet the rise condition on the *same hop* and
-  neither is owned, one CANDIDATE is created at the higher-power channel.
+  neither is owned, a spawn decision at `k` creates one CANDIDATE at the
+  higher instantaneous-power channel. This existing pairing rule can select
+  `k+1` even when only `k` is a smoothed-power local maximum.
 - Two tracks whose centers converge within 1.0 channel (interference or
   drift-collision) are merged: the lower-SNR track is CLOSED with reason
   `merged` (counted); its decoder state is discarded (text already emitted
-  stands).
+  stands). On equal SNR the older track (lower `track_id`) survives.
+  (MAN-172, see docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md)
 
 ---
 

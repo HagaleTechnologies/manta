@@ -21,6 +21,14 @@ git history and `docs/DECISIONS/`.
 
 ## [Unreleased]
 
+### Decoder output
+
+- Strong signals (about +24 dB SNR or more in 2500 Hz) no longer spawn
+  duplicate tracks on adjacent channels that take over their decoder every
+  fraction of a second. They retain one continuous track and recover their
+  text and frequency (MAN-172). HSMM's VR1/VR2 reported-speed gates remain
+  open.
+
 ### Added
 
 - `manta calibrate` measures the receiver's frequency error against a WWV,
