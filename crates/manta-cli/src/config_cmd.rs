@@ -326,6 +326,7 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             );
             let optional = [
                 ("status_interval_secs", s.status_interval_secs),
+                ("history_minutes", s.history_minutes.map(u64::from)),
                 (
                     "telnet_max_connections_per_ip",
                     s.telnet_max_connections_per_ip.map(|v| v as u64),
@@ -1164,6 +1165,7 @@ mod tests {
     /// that value changes the typed config (None -> Some) but not behaviour.
     const BUILTIN_EQUIVALENT: &[(&str, &str)] = &[
         ("server", "status_interval_secs"),
+        ("server", "history_minutes"),
         ("server", "telnet_max_connections_per_ip"),
         ("server", "json_max_connections_per_ip"),
         ("server", "metrics_max_connections_per_ip"),
@@ -1339,6 +1341,10 @@ mod tests {
         assert_eq!(
             int("status_interval_secs"),
             status::DEFAULT_STATUS_INTERVAL.as_secs()
+        );
+        assert_eq!(
+            int("history_minutes"),
+            u64::from(manta_server::bus::DEFAULT_HISTORY_MINUTES)
         );
         // `resolve` falls back to 0.0 when no ppm is set.
         let ppm = scaffold_number("input", "freq_correction_ppm");
@@ -1597,5 +1603,13 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "sentinel");
         init(&path, true).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), SCAFFOLD);
+    }
+
+    #[test]
+    fn summary_server_line_shows_history_minutes_only_when_set() {
+        let lines = lines_of("[server]\nstation_callsign = \"W1AW\"\nhistory_minutes = 90\n");
+        assert!(line(&lines, "server:").ends_with(" history_minutes=90"));
+        let lines = lines_of("[server]\nstation_callsign = \"W1AW\"\n");
+        assert!(!line(&lines, "server:").contains("history_minutes"));
     }
 }

@@ -70,6 +70,13 @@
 # Seconds between the one-line status reports in the log; 0 turns them off.
 #status_interval_secs = 60
 
+# Minutes of spot history a telnet client can replay with sh/dx after it
+# connects; a logger fills its band map with "sh/dx 30m". manta always
+# keeps the 50 newest spots and never more than 10000, so a very busy band
+# can keep less than this. 0 keeps only the 50 newest. 0 to 1440; the
+# history starts empty whenever manta starts.
+#history_minutes = 30
+
 # Limits per client IP address; 0 removes a limit. Raise them when clients
 # reach manta through a reverse proxy, where they all share its address.
 #telnet_max_connections_per_ip = 16  # open telnet connections

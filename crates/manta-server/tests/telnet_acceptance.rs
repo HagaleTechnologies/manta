@@ -46,6 +46,7 @@ async fn spawn_server_with_format(
         manta_server::tasks::CLIENT_DRAIN_DEADLINE,
         line_format,
         fixed_epoch(),
+        None,
     )
     .await
 }
@@ -65,6 +66,7 @@ async fn spawn_server_with_epoch(
         manta_server::tasks::CLIENT_DRAIN_DEADLINE,
         rbn::LineFormat::Rbn,
         epoch,
+        None,
     )
     .await
 }
@@ -82,7 +84,7 @@ async fn spawn_server_with_drain_deadline(
     tokio::sync::watch::Sender<bool>,
     manta_server::tasks::ClientTasks,
 ) {
-    spawn_server_with(drain_deadline, rbn::LineFormat::Rbn, fixed_epoch()).await
+    spawn_server_with(drain_deadline, rbn::LineFormat::Rbn, fixed_epoch(), None).await
 }
 
 /// The single spawn body the helpers above delegate to -- MAN-45's drain
@@ -92,6 +94,7 @@ async fn spawn_server_with(
     drain_deadline: Duration,
     line_format: rbn::LineFormat,
     epoch: SystemTime,
+    history_minutes: Option<u32>,
 ) -> (
     std::net::SocketAddr,
     Arc<SpotBus>,
@@ -99,7 +102,11 @@ async fn spawn_server_with(
     tokio::sync::watch::Sender<bool>,
     manta_server::tasks::ClientTasks,
 ) {
-    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
+    let mut bus = SpotBus::new(SAMPLE_RATE_HZ, epoch, 0);
+    if let Some(minutes) = history_minutes {
+        bus = bus.with_history_minutes(minutes);
+    }
+    let bus = Arc::new(bus);
     let metrics = Arc::new(Metrics::new());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1862,4 +1869,75 @@ async fn scoped_sh_dx_applies_the_unique_filter_after_count_selection_without_ba
     );
     assert_eq!(metric(&metrics, "manta_spots_dropped_lagged_total"), 0);
     assert_eq!(metric(&metrics, "manta_spots_replay_abandoned_total"), 0);
+}
+
+// MAN-93: both clusters are published before login, so only history can deliver them.
+fn publish_hour_of_history(bus: &SpotBus) -> Vec<String> {
+    (0..600)
+        .map(|i| {
+            let seconds = if i < 300 {
+                300 + i * 1200 / 299
+            } else {
+                2100 + (i - 300) * 1440 / 299
+            };
+            let mut spot = spot_on(&format!("K{i}AA"), 14_027_000.0);
+            spot.sample_ts = seconds * SAMPLE_RATE_HZ as u64;
+            let row = rbn_row(bus, &spot);
+            bus.publish(spot);
+            row
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn sh_dx_history_is_a_time_window_not_the_last_50_spots() {
+    let epoch = SystemTime::now() - Duration::from_secs(3600);
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server_with_epoch(epoch).await;
+    let expected = publish_hour_of_history(&bus);
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    let rows = rows_for(&mut reader, &mut wr, "sh/dx 30m").await;
+    assert_eq!(rows.len(), 300);
+    assert_eq!(rows, expected[300..]);
+    for command in ["sh/dx 100000", "sh/dx 60m"] {
+        assert_eq!(
+            rows_for(&mut reader, &mut wr, command).await,
+            expected[300..]
+        );
+    }
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "sh/dx").await,
+        expected[590..]
+    );
+}
+
+async fn spawn_server_with_history(
+    epoch: SystemTime,
+    minutes: u32,
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+    manta_server::tasks::ClientTasks,
+) {
+    spawn_server_with(
+        manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+        rbn::LineFormat::Rbn,
+        epoch,
+        Some(minutes),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn sh_dx_history_window_is_configurable() {
+    let epoch = SystemTime::now() - Duration::from_secs(3600);
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server_with_history(epoch, 90).await;
+    let expected = publish_hour_of_history(&bus);
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    assert_eq!(rows_for(&mut reader, &mut wr, "sh/dx 60m").await, expected);
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "sh/dx 30m").await,
+        expected[300..]
+    );
 }

@@ -428,7 +428,10 @@ only if that config also carries at least one `[[rbn_uplink]]` block.
 - **DX cluster telnet server** (`:7300`) — standard login prompt and
   RBN-format `DX de` lines, with enough command grammar (`sh/dx`,
   `set/dx/filter`) for stock clients. This is the RBN/aggregator
-  compatibility surface.
+  compatibility surface. A logger can request the last 30 minutes with
+  `sh/dx 30m`; `[server].history_minutes` sets retained history depth
+  (default 30). A bare `sh/dx` shows the last 10. See
+  [history limits](docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md).
 - **JSON Lines / WebSocket stream** (`:7301`) — one full-fidelity spot
   object per line; a raw TCP client and a WebSocket client share the
   port. This is the [cqdx](https://cqdx.app) ingest surface.

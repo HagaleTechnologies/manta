@@ -45,8 +45,8 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// legitimately sends very few commands (`sh/dx`, an occasional filter
 /// change) -- but with no budget at all, an unauthenticated client could
 /// send an unlimited sequence of complete commands (e.g. repeated
-/// `sh/dx/50`), each one real CPU/bandwidth work formatting and writing up
-/// to 50 history entries (round-14 review finding). A RATE, not a
+/// `sh/dx/10000`), each one real CPU/bandwidth work formatting and writing up
+/// to `bus::MAX_HISTORY_SPOTS` history entries (MAN-93). A RATE, not a
 /// lifetime total (see `json_stream`'s identical reasoning for its Ping
 /// budget) -- a long session that occasionally issues commands must never
 /// be disconnected just for staying connected a long time.
@@ -776,9 +776,9 @@ async fn handle_client(
                             // `shutdown` between commands -- `select!` only
                             // polls its other branches once THIS one's
                             // future resolves, so a full un-checked replay
-                            // of up to `RECENT_HISTORY_CAP` entries (each
+                            // of up to `bus::MAX_HISTORY_SPOTS` entries (each
                             // up to two `WRITE_TIMEOUT`s) could otherwise
-                            // run for up to ~1000s after shutdown was
+                            // run far beyond the drain deadline after shutdown was
                             // already signalled, invisible to the shutdown-
                             // drain branch below the whole time. `has_changed`
                             // (never `changed`, which this loop doesn't own
@@ -1106,8 +1106,8 @@ const DEFAULT_SHOW_DX_COUNT: usize = 10;
 /// match (no ten-row default); it is matched against each entry's heard
 /// time -- the Zulu time the row shows -- inclusive at both ends, so an
 /// entry stamped in the future is excluded. Every request is still bounded
-/// by the bus's retained history (fifty entries, `RECENT_HISTORY_CAP` in
-/// `bus.rs`).
+/// by the bus's heard-time window, newest-entry floor and `bus::MAX_HISTORY_SPOTS`
+/// ceiling (MAN-93).
 fn select_history_at(bus: &SpotBus, query: &ShowDxQuery, now_unix_secs: i64) -> Vec<BusSpot> {
     // manta decodes CW only: CW matches every spot, RTTY none.
     if query.mode == Some(QueryMode::Rtty) {
@@ -1118,23 +1118,21 @@ fn select_history_at(bus: &SpotBus, query: &ShowDxQuery, now_unix_secs: i64) -> 
             .band
             .is_none_or(|band| crate::band::band_for_freq_hz(entry.spot.freq_hz) == band)
     };
-    let history = bus.recent(usize::MAX).into_iter().filter(in_band);
     match query.selection {
         HistorySelection::Count(n) => {
-            let mut selected: Vec<BusSpot> = history.collect();
-            let n = n.unwrap_or(DEFAULT_SHOW_DX_COUNT);
-            selected.drain(..selected.len().saturating_sub(n));
-            selected
+            bus.select_recent(in_band, n.unwrap_or(DEFAULT_SHOW_DX_COUNT))
         }
         // An explicit zero-minute window selects nothing, like `sh/dx 0`.
         HistorySelection::Window { secs: 0 } => Vec::new(),
         HistorySelection::Window { secs } => {
             let oldest = now_unix_secs.saturating_sub(secs).max(0);
-            history
-                .filter(|entry| {
-                    (oldest..=now_unix_secs).contains(&bus.unix_ts_for(entry.spot.sample_ts))
-                })
-                .collect()
+            bus.select_recent(
+                |entry| {
+                    in_band(entry)
+                        && (oldest..=now_unix_secs).contains(&bus.unix_ts_for(entry.spot.sample_ts))
+                },
+                usize::MAX,
+            )
         }
     }
 }
@@ -1264,24 +1262,46 @@ mod tests {
     }
 
     #[test]
-    fn selection_never_reaches_past_the_fifty_retained_entries() {
+    fn a_minutes_window_and_a_large_count_reach_every_retained_spot() {
         let bus = selector_bus();
-        for i in 0..60 {
+        for i in 0..600 {
             bus.publish(heard(&format!("K{i}AA"), TWENTY, i));
         }
-        let all = select_history_at(
-            &bus,
-            &q(HistorySelection::Count(Some(usize::MAX)), None, None),
-            0,
+        let expected: Vec<String> = (0..600).map(|i| format!("K{i}AA")).collect();
+        for selection in [
+            HistorySelection::Count(Some(1000)),
+            HistorySelection::Window { secs: 1800 },
+        ] {
+            assert_eq!(
+                calls(&select_history_at(
+                    &bus,
+                    &q(selection, None, None),
+                    SELECTOR_EPOCH_SECS + 600
+                )),
+                expected
+            );
+        }
+        assert_eq!(
+            calls(&select_history_at(&bus, &ShowDxQuery::DEFAULT, 0)),
+            expected[590..]
         );
-        let expected: Vec<String> = (10..60).map(|i| format!("K{i}AA")).collect();
-        assert_eq!(calls(&all), expected);
-        let window = select_history_at(
-            &bus,
-            &q(HistorySelection::Window { secs: i64::MAX }, None, None),
-            SELECTOR_EPOCH_SECS + 1_000,
+    }
+
+    #[test]
+    fn selection_never_reaches_past_the_retained_history() {
+        let bus = selector_bus().with_history_minutes(1);
+        for i in 0..200 {
+            bus.publish(heard(&format!("K{i}AA"), TWENTY, i));
+        }
+        let expected: Vec<String> = (139..200).map(|i| format!("K{i}AA")).collect();
+        assert_eq!(
+            calls(&select_history_at(
+                &bus,
+                &q(HistorySelection::Count(Some(usize::MAX)), None, None),
+                0
+            )),
+            expected
         );
-        assert_eq!(calls(&window), expected);
     }
 
     #[test]

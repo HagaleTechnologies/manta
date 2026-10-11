@@ -2522,6 +2522,18 @@ fn spawn_tracked_listener(
     });
 }
 
+fn spot_bus_for(
+    cfg: &manta_server::config::ServerConfig,
+    sample_rate_hz: f64,
+    epoch: std::time::SystemTime,
+    session_nonce: u128,
+) -> manta_server::bus::SpotBus {
+    manta_server::bus::SpotBus::new(sample_rate_hz, epoch, session_nonce).with_history_minutes(
+        cfg.history_minutes
+            .unwrap_or(manta_server::bus::DEFAULT_HISTORY_MINUTES),
+    )
+}
+
 fn start_spot_server(
     cfg: manta_server::config::ServerConfig,
     rbn_uplink_cfgs: Vec<manta_server::config::RbnUplinkConfig>,
@@ -2545,7 +2557,8 @@ fn start_spot_server(
     let station_location = cfg
         .station_location()
         .map_err(|e| anyhow!("[server]: {e}"))?;
-    let bus = std::sync::Arc::new(manta_server::bus::SpotBus::new(
+    let bus = std::sync::Arc::new(spot_bus_for(
+        &cfg,
         source.sample_rate_hz,
         epoch,
         session_nonce,
@@ -4273,7 +4286,10 @@ fn real_main() -> Result<()> {
                 // (MAN-123); decoded text and diagnostics go to stderr.
                 |spot| {
                     if let Some(server) = &spot_server {
-                        server.bus.publish(spot.clone());
+                        let truncated = server.bus.publish(spot.clone());
+                        if truncated > 0 {
+                            server.metrics.record_history_truncated(truncated as u64);
+                        }
                         server.metrics.record_spot(spot);
                         // MAN-136/MAN-45: counted ONCE per spot here, NOT
                         // inside `SpotMessage::from_spot` -- that runs once
@@ -7891,5 +7907,18 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             started.elapsed() < std::time::Duration::from_secs(2),
             "must not have hung past the configured timeout"
         );
+    }
+
+    #[test]
+    fn spot_bus_for_uses_configured_history_or_the_default() {
+        let mut cfg = test_server_config("W1AW");
+        let bus = spot_bus_for(&cfg, 1.0, std::time::SystemTime::UNIX_EPOCH, 0);
+        assert_eq!(
+            bus.history_minutes(),
+            manta_server::bus::DEFAULT_HISTORY_MINUTES
+        );
+        cfg.history_minutes = Some(90);
+        let bus = spot_bus_for(&cfg, 1.0, std::time::SystemTime::UNIX_EPOCH, 0);
+        assert_eq!(bus.history_minutes(), 90);
     }
 }

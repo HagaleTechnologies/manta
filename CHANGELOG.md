@@ -42,6 +42,12 @@ git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- `sh/dx` history now retains every spot heard in the last
+  `[server].history_minutes` minutes (default 30; at least the 50 newest,
+  at most 10,000). `manta_spots_history_truncated_total` counts spots the
+  ceiling drops early (MAN-93). Bare `sh/dx` still shows the last 10;
+  loggers can request `sh/dx 30m`.
+
 - JSON spots' `deGrid`/`deLat`/`deLon` are the operator's configured
   station position (`[server].operator_grid`, or the new `operator_lat`/
   `operator_lon`), and `null` when none is configured, instead of the

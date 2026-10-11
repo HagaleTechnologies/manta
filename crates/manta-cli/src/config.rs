@@ -1398,4 +1398,14 @@ mod tests {
             assert!(ENV_IGNORED.contains(&name), "{name} must be in ENV_IGNORED");
         }
     }
+
+    #[test]
+    fn env_overrides_server_history_minutes() {
+        let loaded = load_env(
+            Some("[server]\nstation_callsign = \"W1AW\"\nhistory_minutes = 30\n"),
+            &[("MANTA_SERVER_HISTORY_MINUTES", "45")],
+        )
+        .unwrap();
+        assert_eq!(loaded.server.unwrap().history_minutes, Some(45));
+    }
 }
