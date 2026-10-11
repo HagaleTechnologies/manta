@@ -997,6 +997,7 @@ freq_correction_ppm = 0.0
 # replay_epoch = 1700000000
 
 [spot]
+# allowlist, blocklist_path and notch_path are re-read on SIGHUP when the config has a [server] table (MAN-78); cty_path and scp_path need a restart.
 # Operator Watch List (§6, MAN-28): callsigns here bypass grammar/cty
 # validation and the repetition gate entirely in manta-spot's validator.
 # A non-empty --allowlist replaces this list.
@@ -1059,10 +1060,24 @@ allowlist = []
 # characters (they are interpolated verbatim into every client's banner,
 # so an embedded CR/LF would forge cluster lines), `operator_grid` as a 4-
 # or 6-character Maidenhead locator.
+#
+# `operator_grid`, `operator_lat` and `operator_lon` also set every JSON
+# spot's `deGrid`/`deLat`/`deLon`, the receiving station's position
+# (MAN-138, `docs/DECISIONS/2026-10-11-man138-station-location.md`): a
+# grid alone gives its square's centre, a lat/lon pair alone gives the
+# 6-character square containing it, and with none set all three are
+# `null` -- never a `cty.dat` country centroid. `operator_lat` is a finite
+# number from -90 to 90 and `operator_lon` from -180 to 180 (decimal
+# degrees, south and west negative), checked at deserialize time. The two
+# are set together or not at all, and alongside `operator_grid` the point
+# must lie inside that square; both rules fail config loading before any
+# I/O.
 # station_callsign = "W3XYZ"    # required, no default
 # operator_name = "Art"         # optional, default: absent
 # operator_qth = "Switzerland"  # optional, default: absent
 # operator_grid = "JN46la"      # optional, default: absent
+# operator_lat = 46.0208        # optional, default: absent
+# operator_lon = 8.9583         # optional, default: absent
 
 # [server] and [[rbn_uplink]] (manta_server::config) configure the
 # telnet/JSON/metrics servers and the RBN uplink; README.md's "Run it as a

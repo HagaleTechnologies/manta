@@ -446,6 +446,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `dxCqZone` (and their `de*` counterparts) carry named, out-of-domain
   `UNKNOWN_*` sentinels rather than `null` or a fabricated-looking value —
   see `docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md`.
+  `deGrid`/`deLat`/`deLon` are the operator's configured station position
+  (`[server].operator_grid`/`operator_lat`/`operator_lon`), `null` when none
+  is configured, never a `cty.dat` centroid (MAN-138; see
+  `docs/DECISIONS/2026-10-11-man138-station-location.md`).
   Its `snr` field keeps the native 2500 Hz measurement (no 500 Hz conversion)
   alongside an explicit `snrRefHz` field naming that bandwidth, so a consumer
   of either surface never has to guess which convention it's reading
@@ -518,6 +522,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   scaffold with every key commented out at its default, pinned to the code
   defaults and the loader's key list by tests (MAN-76,
   `docs/DECISIONS/2026-10-07-man76-config-check-init.md`).
+  With `[server]`, SIGHUP re-runs that same pipeline and swaps the `[spot]`
+  lists into the live validator and `dry_run` into each uplink task; other
+  keys need a restart, and an invalid reload is logged and changes nothing
+  (MAN-78, `docs/DECISIONS/2026-10-10-man78-live-reload.md`).
   `manta calibrate` resolves `[input]` the way `doctor` does, measures the
   receiver's frequency error against a known carrier
   (`manta-dsp::carrier` estimates it, `manta-engine::calibrate` picks the
