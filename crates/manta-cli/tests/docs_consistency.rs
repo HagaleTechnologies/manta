@@ -1185,7 +1185,6 @@ fn architecture_logging_bullet_is_current() {
     );
 }
 
-<<<<<<< HEAD
 /// MAN-81: an operator reading the Docker docs learns that a bare
 /// `docker run` runs a mounted config, that the image reports health through
 /// `manta health`, and how to turn the check off.
@@ -1248,7 +1247,8 @@ fn packaging_readme_sh_blocks_have_no_line_continuations() {
         }
     }
     assert!(checked > 0, "no ```sh commands in packaging/README.md");
-=======
+}
+
 // ---- MAN-149: the reference docs and indexes cover everything they list ----
 
 const CONFIG_REF: &str = "docs/CONFIG.md";
@@ -1661,5 +1661,4 @@ fn reference_docs_relative_links_resolve() {
             "{file} has relative links that do not resolve: {broken:?}"
         );
     }
->>>>>>> 891a66e16a9396219e1db38c08aa85aa24b15937
 }
