@@ -195,12 +195,12 @@ milliseconds, 0 to 3600000.
 |---|---|---|---|
 | `on_snr_db` | `12.0` | live | SNR, dB, that starts a track; 0 to 100. See [SPEC §9](SPEC-decode-core.md#9-configuration-keys). |
 | `off_snr_db` | `3.0` | live | SNR, dB, below which a track counts as silent; 0 to `on_snr_db`. |
-| `confirm_ms` | `50.0` | live | How long a signal must last before it is decoded; must round to at least one hop. |
-| `hang_ms` | `5000.0` | live | How long a silent track waits before it closes; must round to at least one hop. |
-| `gc_ms` | `30000.0` | live | A track that decodes no character for this long is closed; must round to at least one hop. |
-| `warmup_ms` | `2000.0` | live | Start-up time spent measuring the noise; no track opens before it ends. |
+| `confirm_ms` | `50.0` | live | How long a signal must last before it is decoded; at most 3600000 (1 h), and must round to at least one hop. |
+| `hang_ms` | `5000.0` | live | How long a silent track waits before it closes; at most 3600000 (1 h), and must round to at least one hop. |
+| `gc_ms` | `30000.0` | live | A track that decodes no character for this long is closed; at most 3600000 (1 h), and must round to at least one hop. |
+| `warmup_ms` | `2000.0` | live | Start-up time spent measuring the noise; no track opens before it ends. 0 to 3600000 (1 h); 0 means no warmup. |
 | `track_cap` | `1200` | live | Most tracks open at once, counting unconfirmed candidates that have no decoder yet; past it the lowest-SNR track is evicted. At least 1. |
-| `silent_respawn_cooldown_ms` | `30000.0` | live | Wait before a channel whose track went silent may start another. |
+| `silent_respawn_cooldown_ms` | `30000.0` | live | Wait before a channel whose track went silent may start another. 0 to 3600000 (1 h); 0 means no cooldown. |
 
 ## [decode]
 
@@ -212,24 +212,24 @@ the measured best values.
 | `engine` | `"legacy"` | live | `"legacy"`, `"edge-legacy"` or `"hsmm"`. `--engine` overrides it on `run`, `decode`, `oracle` and `bench sensitivity`; `hsmm` is experimental, see [DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md](DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md). |
 | `timing_sigma` | `0.25` | live: legacy and edge-legacy | Timing tolerance when matching dots and dashes; at least 0.001. See [SPEC §9](SPEC-decode-core.md#9-configuration-keys). |
 | `beam_width` | `4` | live: legacy and edge-legacy | Character guesses kept at each step; at least 1. |
-| `debounce_ms` | `12.0` | live: legacy and edge-legacy | Shortest key-down or key-up accepted, ms. |
+| `debounce_ms` | `12.0` | live: legacy and edge-legacy | Shortest key-down or key-up accepted, ms; above 0. |
 | `hyst_frac` | `0.15` | live: legacy only | Keying-threshold hysteresis as a fraction of keying depth, above 0 and below 0.5. See [SPEC §9](SPEC-decode-core.md#9-configuration-keys). |
 | `tau_lo_ms` | `500.0` | live: legacy only | Noise-level tracking time constant, ms; above 0. |
 | `tau_hi_bounds_ms` | `[100.0, 400.0]` | live: legacy only | Signal-level tracking time constant, `[low, high]` ms, with 0 < low <= high. |
-| `flush_gap_dits` | `7.0` | live: legacy and edge-legacy | Silence, in dot lengths, that ends a word. |
+| `flush_gap_dits` | `7.0` | live: legacy and edge-legacy | Silence, in dot lengths, that ends a word; above 0. |
 | `sigma_u` | `0.3` | live: hsmm only | Keying-edge timing spread; at least 0.001. edge-legacy reads it but uses only the sign of the evidence, which this key cannot change; see [SPEC-v2 §7](SPEC-decode-core-v2.md#7-configuration-keys-v1-9-additive). |
-| `llr_clip` | `10.0` | live: hsmm only | Cap on per-sample mark/space evidence. edge-legacy reads it but uses only the sign of the evidence, which a positive cap cannot change. |
-| `hold_dits` | `4.0` | live: edge-legacy and hsmm | Mark-level hold window, dot lengths; above 0. See [SPEC-v2 §7](SPEC-decode-core-v2.md#7-configuration-keys-v1-9-additive). |
+| `llr_clip` | `10.0` | live: hsmm only | Cap on per-sample mark/space evidence; above 0. edge-legacy reads it but uses only the sign of the evidence, which a positive cap cannot change. |
+| `hold_dits` | `4.0` | live: edge-legacy and hsmm | Mark-level hold window, dot lengths; above 0 and below about 73.1: `round(hold_dits × 56)` (56 hops/dit is the fixed HSMM `u_max`) must stay under the 4096-sample evidence retention limit, under every engine. See [SPEC-v2 §7](SPEC-decode-core-v2.md#7-configuration-keys-v1-9-additive). |
 | `fallback_hops` | `8` | live: hsmm only | Evidence interval when no keying edge is seen; at least 1. edge-legacy computes these anchors but never reads them. |
-| `noise_window_ms` | `1500.0` | live: edge-legacy and hsmm | Noise-floor window, ms. |
+| `noise_window_ms` | `1500.0` | live: edge-legacy and hsmm | Noise-floor window, ms; above 0. |
 | `noise_min_bias_db` | `2.16` | live: edge-legacy and hsmm | Noise-floor minimum correction, dB. |
 | `spectral_min_bias_db` | `1.5` | live: edge-legacy and hsmm; not `oracle` | Neighbouring-channel noise correction, dB. |
 | `spectral_beta` | `0.5` | live: edge-legacy and hsmm; not `oracle` | Weight of the neighbouring-channel noise estimate; 0 or more. |
-| `refine_bw_hz` | `0.0` | live: every engine; not `oracle` | Narrowband refiner bandwidth before decoding, Hz; `0` turns it off. The track manager applies it, and `oracle` decodes without one. |
+| `refine_bw_hz` | `0.0` | live: every engine; not `oracle` | Narrowband refiner bandwidth before decoding, Hz; 0 or more, and `0` turns it off. The track manager applies it, and `oracle` decodes without one. |
 | `dur_sigma` | `0.22` | live: hsmm only | Element-length tolerance; at least 0.001. See [SPEC-v2 §7](SPEC-decode-core-v2.md#7-configuration-keys-v1-9-additive). |
 | `mark_insert_penalty` | `-1.5` | live: hsmm only | Penalty against reading noise as an extra element. |
 | `beam` | `12` | live: hsmm only | Hypotheses kept per step; at least 1. |
-| `lookahead_dits` | `25.0` | live: hsmm only | How far ahead, in dot lengths, the decoder looks before a character is final. |
+| `lookahead_dits` | `25.0` | live: hsmm only | How far ahead, in dot lengths, the decoder looks before a character is final; 0 or more. |
 | `speed_alpha` | `0.2` | live: hsmm only | How quickly the speed estimate follows the sender; 0 or more. |
 | `seed_units_hops` | `[9.0, 13.0, 18.0, 26.0, 38.0]` | live: hsmm only | Starting dot lengths tried, hops; at least one, each within the HSMM decoder's supported speed range of 7.5 to 56 hops per dit (fixed, not configurable); `manta config check` and startup reject anything outside it. |
 | `conf_kappa` | `6.0` | live: hsmm only | Confidence scale; above 0. |
