@@ -15,11 +15,8 @@ mod config;
 mod config_cmd;
 mod devices;
 mod doctor_checks;
-<<<<<<< HEAD
-mod health_cmd;
-=======
 mod fmt;
->>>>>>> 7715fd70ecd6b481f20020ba52579670372a7727
+mod health_cmd;
 mod logging;
 mod reconnect;
 mod reload;

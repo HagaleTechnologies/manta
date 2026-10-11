@@ -111,21 +111,19 @@ loop file replay so a hardware-free replay can feed telnet/JSON clients; IQ
 WAVs declaring more than 10 MS/s are rejected at open — see
 docs/DECISIONS/2026-10-10-man269-paced-looping-replay.md.
 
-<<<<<<< HEAD
-MAN-81: with no arguments the Docker image runs the daemon from a config
-mounted at `/etc/manta/manta.toml` (or `MANTA_CONFIG`), else prints
-`--help`; its `HEALTHCHECK` runs the new `manta health` (exit 0/1 from
-`/healthz`, metrics address read from the daemon's config); the image is
-also built for `linux/arm/v7`. See
-`docs/DECISIONS/2026-10-11-man81-docker-config-mount-and-healthcheck.md`.
-=======
 MAN-115: `TrackManager` skips the channelizer's zero pre-roll, `FloorBank`
 seeds a young channel's effective floor from its block median for 1 s, and
 `[detector].warmup_ms` defaults to 25 (was 2000). V1 promotes at 0.07 s
 (was 2.06 s) and decodes its first character at 0.62 s (was 2.66 s).
 `TrackMeta` is still not emitted at promotion. See
 docs/DECISIONS/2026-10-11-man115-startup-latency.md.
->>>>>>> 7715fd70ecd6b481f20020ba52579670372a7727
+
+MAN-81: with no arguments the Docker image runs the daemon from a config
+mounted at `/etc/manta/manta.toml` (or `MANTA_CONFIG`), else prints
+`--help`; its `HEALTHCHECK` runs the new `manta health` (exit 0/1 from
+`/healthz`, metrics address read from the daemon's config); the image is
+also built for `linux/arm/v7`. See
+`docs/DECISIONS/2026-10-11-man81-docker-config-mount-and-healthcheck.md`.
 
 ## Documents (read in this order)
 

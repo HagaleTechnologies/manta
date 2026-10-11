@@ -11,11 +11,8 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
-<<<<<<< HEAD
 | 2026-10-11 | MAN-81 | [MAN-81: the Docker image runs a mounted config and reports its own health](2026-10-11-man81-docker-config-mount-and-healthcheck.md) |
-=======
 | 2026-10-11 | MAN-115 | [MAN-115: start-up latency before the first decode](2026-10-11-man115-startup-latency.md) |
->>>>>>> 7715fd70ecd6b481f20020ba52579670372a7727
 | 2026-10-11 | MAN-172 | [MAN-172: high-SNR track churn](2026-10-11-man172-high-snr-track-churn.md) |
 | 2026-10-11 | MAN-149 | [MAN-149: config, metrics and spot-schema references, and a docs index](2026-10-11-man149-docs-reference-and-index.md) |
 | 2026-10-11 | MAN-138 | [MAN-138: a JSON spot's `deGrid`/`deLat`/`deLon` are the configured station position](2026-10-11-man138-station-location.md) |
