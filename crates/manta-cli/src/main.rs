@@ -3323,16 +3323,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
             cli.into_spec()
         }
         (Some(_), None) | (None, None) => cli.into_spec(),
-        (None, Some(file_source)) => {
-            // `--source-iq` over an `iq = false` file reads the recording
-            // as IQ, a different signal from the one this [input] opens.
-            if cli.source_iq
-                && matches!(file_source, config::SourceFromFile::File { iq: false, .. })
-            {
-                replaced_file_source = Some("--source-iq");
-            }
-            spec_from_file(file_source, cli.source_iq)?
-        }
+        (None, Some(file_source)) => spec_from_file(file_source, cli.source_iq)?,
     };
     Ok(Resolved {
         spec,

@@ -8,29 +8,21 @@
 use crate::{
     config, config_edit, prepare_source, CliOverrides, LiveSourceSpec, Resolved, SourcePrepared,
 };
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{bail, ensure, Result};
 use manta_engine::calibrate::{
     check_duration, plan_references, CalibrateOptions, CalibrationReport, PlannedReference,
     ReferenceResult, ReferenceStatus, MIN_AMBIGUITY_MARGIN_DB, MIN_VALID_SEGMENTS, SPREAD_WARN_HZ,
 };
+use std::ffi::OsString;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const PPM_ENV_VAR: &str = "MANTA_INPUT_FREQ_CORRECTION_PPM";
-/// The `MANTA_INPUT_*` variables that pick the receiver, as `--source`,
-/// `--device`, `--kiwi-host`, `--soapy-driver` and `--hpsdr-host` do, plus
-/// the port that, with the host, names a KiwiSDR or HPSDR receiver, and
-/// `MANTA_INPUT_IQ`, which changes how a file input's recording is read.
-const SOURCE_ENV_VARS: &[&str] = &[
-    "MANTA_INPUT_TYPE",
-    "MANTA_INPUT_DEVICE",
-    "MANTA_INPUT_PATH",
-    "MANTA_INPUT_HOST",
-    "MANTA_INPUT_PORT",
-    "MANTA_INPUT_DRIVER",
-    "MANTA_INPUT_IQ",
-];
+/// Every environment variable with this prefix shapes the input `[input]`
+/// describes; `calibrate --write` refuses when any but [`PPM_ENV_VAR`] is
+/// set. Matched by prefix, not listed, so a variable added later is covered.
+const INPUT_ENV_PREFIX: &str = "MANTA_INPUT_";
 
 /// Everything `manta calibrate` was given on the command line.
 pub(crate) struct CalibrateArgs {
@@ -49,8 +41,9 @@ pub(crate) struct CalibrateArgs {
 pub(crate) enum SaveDecision {
     /// No config file was given.
     NoConfig,
-    /// The named flag replaced the receiver `[input]` describes.
-    OtherReceiver(&'static str),
+    /// Input overrides (named, comma-separated) were in effect, so the
+    /// measurement may not be of the input the file describes.
+    Overridden(String),
     /// The file already holds the value.
     AlreadySet,
     /// Save without asking (`--write`).
@@ -66,7 +59,7 @@ pub(crate) enum SaveDecision {
 /// The save rule, in priority order.
 pub(crate) fn save_decision(
     has_config: bool,
-    replaced_by: Option<&'static str>,
+    overrides: &[String],
     already_set: bool,
     write: bool,
     json: bool,
@@ -74,8 +67,8 @@ pub(crate) fn save_decision(
 ) -> SaveDecision {
     if !has_config {
         SaveDecision::NoConfig
-    } else if let Some(flag) = replaced_by {
-        SaveDecision::OtherReceiver(flag)
+    } else if !overrides.is_empty() {
+        SaveDecision::Overridden(overrides.join(", "))
     } else if already_set {
         SaveDecision::AlreadySet
     } else if write {
@@ -87,20 +80,6 @@ pub(crate) fn save_decision(
     } else {
         SaveDecision::Ask
     }
-}
-
-/// The source-selecting variable among `env_vars` when `file_text` has a
-/// typed `[input]`: that variable, like a selector flag, means the receiver
-/// being measured is not the one the file's `[input]` describes.
-fn env_replaced_file_source(env_vars: &[String], file_text: &str) -> Result<Option<&'static str>> {
-    let doc: toml::Table = toml::from_str(crate::strip_bom(file_text))?;
-    if doc.get("input").and_then(|t| t.get("type")).is_none() {
-        return Ok(None);
-    }
-    Ok(SOURCE_ENV_VARS
-        .iter()
-        .copied()
-        .find(|v| env_vars.iter().any(|e| e == v)))
 }
 
 /// Write `prompt` and read one answer: true only for `y` or `yes`, in any
@@ -332,19 +311,103 @@ fn is_audio(spec: &LiveSourceSpec) -> bool {
     }
 }
 
+/// Every input override in effect, deny-by-default: each command-line flag
+/// that changes the source, receiver, centre/dial frequency, IQ mode, sample
+/// rate, device or file, and every `MANTA_INPUT_*` variable but
+/// [`PPM_ENV_VAR`]. A measurement taken with any of them may not be of the
+/// input the config opens, so it is never saved there (MAN-127).
+///
+/// `CliOverrides` is destructured without `..`, so a field added to it does
+/// not compile until it is classified here.
+fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<String> {
+    let CliOverrides {
+        device,
+        source,
+        source_iq,
+        kiwi,
+        #[cfg(feature = "soapy")]
+        soapy,
+        #[cfg(feature = "hpsdr")]
+        hpsdr,
+        dial_freq_hz,
+        capture_rate_hz,
+        replay_epoch,
+        // Exempt: the value being calibrated (calibrate has no such flag).
+        freq_correction_ppm: _,
+        // Exempt: spot filtering after decoding, not the input (calibrate
+        // has none of these flags).
+        allowlist: _,
+        blocklist: _,
+        notch: _,
+        cty: _,
+        scp: _,
+    } = cli;
+    let mut found: Vec<String> = Vec::new();
+    let mut flag = |set: bool, name: &str| {
+        if set {
+            found.push(name.to_string());
+        }
+    };
+    flag(device.is_some(), "--device");
+    flag(source.is_some(), "--source");
+    flag(*source_iq, "--source-iq");
+    // --kiwi-port and --kiwi-password require --kiwi-host, so the host
+    // stands for them.
+    flag(kiwi.host.is_some(), "--kiwi-host");
+    flag(kiwi.freq.is_some(), "--kiwi-freq-hz");
+    // Likewise every other --soapy-* / --hpsdr-* flag requires these.
+    #[cfg(feature = "soapy")]
+    flag(soapy.driver.is_some(), "--soapy-driver");
+    #[cfg(feature = "hpsdr")]
+    flag(hpsdr.host.is_some(), "--hpsdr-host");
+    flag(dial_freq_hz.is_some(), "--dial-freq-hz");
+    flag(capture_rate_hz.is_some(), "--capture-rate-hz");
+    flag(replay_epoch.is_some(), "--replay-epoch");
+    // Not overrides, each by design: --duration, --reference-hz and
+    // --search-ppm shape the measurement, not the input; --json and --write
+    // shape the output; --config names the file being saved to. --tune-hz
+    // retunes the configured receiver itself (the source reports the centre
+    // it actually tuned, nothing is relabelled), and a ppm correction is a
+    // property of the receiver's oscillator that holds at every frequency,
+    // so retuning to reach a reference does not change what is measured.
+    let mut env: Vec<String> = vars
+        .iter()
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .filter(|k| k.starts_with(INPUT_ENV_PREFIX) && k != PPM_ENV_VAR)
+        .collect();
+    env.sort();
+    env.dedup();
+    found.extend(env);
+    found
+}
+
 pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
     let duration = Duration::from_secs(args.duration_secs);
     check_duration(duration)?;
+    let vars: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    // Before the config is even loaded, so an unknown MANTA_INPUT_* name is
+    // refused for what it is.
+    let overrides = input_overrides(&args.cli, &vars);
+    let config_flag_or_env = args
+        .config
+        .clone()
+        .or_else(|| config::config_path_from_env(&vars));
+    if args.write && config_flag_or_env.is_none() {
+        bail!("--write needs a config file: pass --config or set MANTA_CONFIG");
+    }
+    if args.write && !overrides.is_empty() {
+        bail!(
+            "--write refuses to save a measurement taken with input overrides: {}. The saved \
+             value would apply to the input the config describes, not the one measured; \
+             persist these settings in [input] of the config file, then re-run calibrate \
+             without them",
+            overrides.join(", ")
+        );
+    }
     // Snapshot the config before and after prepare_source loads it, so the
     // receiver `resolved` describes and the text the save is checked against
     // come from the same file and bytes.
-    let snapshot_before = {
-        let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
-        args.config
-            .clone()
-            .or_else(|| config::config_path_from_env(&vars))
-            .map(|path| config_edit::ReadBefore::read(&path).ok())
-    };
+    let snapshot_before = config_flag_or_env.map(|path| config_edit::ReadBefore::read(&path).ok());
     let SourcePrepared {
         config_path,
         loaded,
@@ -372,35 +435,8 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
         );
     }
     let config_text = read_before.as_ref().map(|r| r.text.as_str());
-    let replaced_by = match (resolved.replaced_file_source, config_path.as_deref()) {
-        (Some(flag), _) => Some(flag),
-        (None, Some(path)) => {
-            let text = config_text.unwrap_or_default();
-            env_replaced_file_source(&loaded.env_vars, text)
-                .with_context(|| format!("parsing config file {}", path.display()))?
-        }
-        (None, None) => None,
-    };
     if let Some(tune_hz) = args.tune_hz {
         apply_tune_hz(&mut resolved, tune_hz)?;
-    }
-    if args.write {
-        let Some(path) = config_path.as_deref() else {
-            bail!("--write needs a config file: pass --config or set MANTA_CONFIG");
-        };
-        if let Some(flag) = replaced_by {
-            let drop = if flag.starts_with("MANTA_") {
-                "unset"
-            } else {
-                "drop"
-            };
-            bail!(
-                "--write would save a measurement of the receiver {flag} names into [input] of \
-                 {}, which describes a different receiver; {drop} {flag} and use --tune-hz to \
-                 point the configured receiver at a reference",
-                path.display()
-            );
-        }
     }
     let spec = &resolved.spec;
     if !spec.is_rf_aware() && resolved.dial_freq_hz.is_none() {
@@ -447,7 +483,7 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
             }
         }
         if let Some(path) = config_path.as_deref() {
-            if replaced_by.is_none() && loaded.env_vars.iter().any(|v| v == PPM_ENV_VAR) {
+            if overrides.is_empty() && loaded.env_vars.iter().any(|v| v == PPM_ENV_VAR) {
                 eprintln!(
                     "warning: {PPM_ENV_VAR} is set and overrides freq_correction_ppm from {} for \
                      run, soak and doctor; unset it to use the saved value",
@@ -458,7 +494,7 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
         let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
         let decision = save_decision(
             config_path.is_some(),
-            replaced_by,
+            &overrides,
             file_value == Some(value),
             args.write,
             args.json,
@@ -499,9 +535,10 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
                 "not saved: {} already has freq_correction_ppm = {value:?}",
                 path.display()
             )),
-            (SaveDecision::OtherReceiver(flag), Some(path)) => Some(format!(
-                "not saved: {flag} replaced the receiver [input] describes in {}; {run_hint} \
-                 with the same flags and environment",
+            (SaveDecision::Overridden(list), Some(path)) => Some(format!(
+                "not saved: input overrides were in effect ({list}); persist them in [input] of \
+                 {} and re-run calibrate without them, or {run_hint} with the same flags and \
+                 environment",
                 path.display()
             )),
             (SaveDecision::NotInteractive, _) => Some(format!(
@@ -741,52 +778,31 @@ mod tests {
     fn save_decision_table() {
         use SaveDecision::*;
         assert_eq!(
-            save_decision(false, None, false, true, false, true),
+            save_decision(false, &[], false, true, false, true),
             NoConfig
         );
         assert_eq!(
-            save_decision(true, Some("--kiwi-host"), false, true, false, true),
-            OtherReceiver("--kiwi-host")
+            save_decision(
+                true,
+                &["--kiwi-host".to_string(), "MANTA_INPUT_FOO".to_string()],
+                false,
+                true,
+                false,
+                true
+            ),
+            Overridden("--kiwi-host, MANTA_INPUT_FOO".to_string())
         );
         assert_eq!(
-            save_decision(true, None, true, true, false, true),
+            save_decision(true, &[], true, true, false, true),
             AlreadySet
         );
-        assert_eq!(save_decision(true, None, false, true, true, false), Save);
-        assert_eq!(save_decision(true, None, false, false, true, true), Skip);
+        assert_eq!(save_decision(true, &[], false, true, true, false), Save);
+        assert_eq!(save_decision(true, &[], false, false, true, true), Skip);
         assert_eq!(
-            save_decision(true, None, false, false, false, false),
+            save_decision(true, &[], false, false, false, false),
             NotInteractive
         );
-        assert_eq!(save_decision(true, None, false, false, false, true), Ask);
-    }
-
-    #[test]
-    fn a_source_env_var_replaces_only_a_typed_file_input() {
-        let vars = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let typed = "[input]\ntype = \"kiwi\"\nhost = \"a\"\nport = 1\nfreq_hz = 7030000.0\n";
-        let host = vars(&["MANTA_INPUT_HOST"]);
-        assert_eq!(
-            env_replaced_file_source(&host, typed).unwrap(),
-            Some("MANTA_INPUT_HOST")
-        );
-        assert_eq!(
-            env_replaced_file_source(&vars(&["MANTA_INPUT_PATH", "MANTA_INPUT_TYPE"]), typed)
-                .unwrap(),
-            Some("MANTA_INPUT_TYPE")
-        );
-        assert_eq!(
-            env_replaced_file_source(&vars(&["MANTA_INPUT_PORT"]), typed).unwrap(),
-            Some("MANTA_INPUT_PORT")
-        );
-        assert_eq!(
-            env_replaced_file_source(&vars(&["MANTA_INPUT_FREQ_HZ", PPM_ENV_VAR]), typed).unwrap(),
-            None
-        );
-        assert_eq!(
-            env_replaced_file_source(&host, "[input]\nfreq_correction_ppm = 1.0\n").unwrap(),
-            None
-        );
+        assert_eq!(save_decision(true, &[], false, false, false, true), Ask);
     }
 
     fn resolved_with(spec: LiveSourceSpec) -> Resolved {

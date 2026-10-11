@@ -226,7 +226,7 @@ fn calibrate_write_refuses_a_replaced_receiver() {
     assert_eq!(out.status.code(), Some(1));
     let stderr = text(&out.stderr);
     assert!(
-        stderr.contains("--write would save a measurement of the receiver --source names"),
+        stderr.contains("--write refuses to save a measurement taken with input overrides: --source, --source-iq."),
         "{stderr}"
     );
     assert!(out.stdout.is_empty());
@@ -250,7 +250,7 @@ fn calibrate_write_refuses_a_receiver_the_environment_selects() {
     assert_eq!(out.status.code(), Some(1));
     let stderr = text(&out.stderr);
     assert!(
-        stderr.contains("--write would save a measurement of the receiver MANTA_INPUT_TYPE names"),
+        stderr.contains("--write refuses to save a measurement taken with input overrides: MANTA_INPUT_IQ, MANTA_INPUT_PATH, MANTA_INPUT_TYPE."),
         "{stderr}"
     );
     assert!(out.stdout.is_empty());
@@ -272,7 +272,9 @@ fn calibrate_write_refuses_an_iq_override_of_an_audio_file_input() {
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
     let stderr = text(&out.stderr);
     assert!(
-        stderr.contains("--write would save a measurement of the receiver --source-iq names"),
+        stderr.contains(
+            "--write refuses to save a measurement taken with input overrides: --source-iq."
+        ),
         "{stderr}"
     );
     assert!(out.stdout.is_empty());
@@ -287,11 +289,71 @@ fn calibrate_write_refuses_an_iq_override_of_an_audio_file_input() {
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
     let stderr = text(&out.stderr);
     assert!(
-        stderr.contains("--write would save a measurement of the receiver MANTA_INPUT_IQ names"),
+        stderr.contains(
+            "--write refuses to save a measurement taken with input overrides: MANTA_INPUT_IQ."
+        ),
         "{stderr}"
     );
     assert!(out.stdout.is_empty());
     assert_eq!(std::fs::read_to_string(&cfg).unwrap(), body);
+}
+
+/// Deny-by-default (MAN-127): any input override refuses `--write`,
+/// including a centre-frequency relabel and a `MANTA_INPUT_*` name manta
+/// does not know (the prefix rule, checked before the config loads), and
+/// the refusal says to persist them in the config first.
+#[test]
+fn calibrate_write_refuses_any_input_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = fixture(dir.path(), Some(CARRIER_2_5_PPM), CENTRE);
+    let body = format!(
+        "[input]\ntype = \"file\"\npath = {:?}\niq = true\n",
+        wav.to_str().unwrap()
+    );
+    let cfg = write_cfg(dir.path(), &body);
+    type Case<'a> = (&'a [(&'a str, &'a str)], &'a [&'a str], &'a str);
+    let cases: [Case; 3] = [
+        (&[], &["--dial-freq-hz", "9998510"], "--dial-freq-hz"),
+        (
+            &[("MANTA_INPUT_CENTER_FREQ_HZ", "9998510")],
+            &[],
+            "MANTA_INPUT_CENTER_FREQ_HZ",
+        ),
+        (&[("MANTA_INPUT_FOO", "1")], &[], "MANTA_INPUT_FOO"),
+    ];
+    for (env, flags, named) in cases {
+        let mut cmd = manta();
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd
+            .args(["calibrate", "--duration", "12", "--write", "--config"])
+            .arg(&cfg)
+            .args(flags)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{named}: {}", text(&out.stderr));
+        let stderr = text(&out.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "--write refuses to save a measurement taken with input overrides: {named}."
+            )),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("persist these settings in [input] of the config file"),
+            "{stderr}"
+        );
+        assert!(out.stdout.is_empty(), "{named}");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), body, "{named}");
+    }
+
+    // No overrides: the same config is measured and saved.
+    let out = calibrate(&cfg, &["--write"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let saved = std::fs::read_to_string(&cfg).unwrap();
+    assert!(saved.starts_with(&body), "{saved}");
+    assert!(saved.contains("freq_correction_ppm = "), "{saved}");
 }
 
 #[test]

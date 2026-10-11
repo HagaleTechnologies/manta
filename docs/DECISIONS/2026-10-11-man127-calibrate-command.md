@@ -97,17 +97,26 @@ adding to it.
    - Without a terminal it never saves unless `--write` is given. A piped
      `y` is not confirmation. `--json` never prompts and saves only with
      `--write`.
-   - `--write` is refused before any receiver is opened when there is no
-     config file, or when a source-selector flag (`--source`, `--device`,
-     `--kiwi-host`, and so on) replaced the file's `[input]`: that
-     measurement describes a different receiver. `--tune-hz` is the way to
-     point the configured receiver at a reference. The same refusal applies
-     when the file's `[input]` has a `type` and `MANTA_INPUT_TYPE`,
-     `_DEVICE`, `_PATH`, `_HOST`, `_PORT`, `_DRIVER` or `_IQ` is set, because
-     that variable picks the receiver (or, for `_IQ`, how a recording is
-     read) the way a selector flag does, even when it repeats the file's own
-     value; and to `--source-iq` over a `type = "file"` input without
-     `iq = true`, which reads that recording as IQ instead of audio.
+   - `--write` is refused before the config is loaded or any receiver is
+     opened when there is no config file, or when any input override is in
+     effect (deny-by-default; one check, `input_overrides` in
+     `calibrate_cmd.rs`): any flag that changes the source, receiver,
+     centre/dial frequency, IQ mode, sample rate, device or file (`--source`,
+     `--device`, `--source-iq`, `--kiwi-host`, `--kiwi-freq-hz`,
+     `--soapy-driver`, `--hpsdr-host`, `--dial-freq-hz`, `--capture-rate-hz`),
+     and every environment variable starting with `MANTA_INPUT_`, matched by
+     prefix so new ones are covered, except `MANTA_INPUT_FREQ_CORRECTION_PPM`,
+     the value being calibrated. A measurement taken with any of them may not
+     be of the input the config opens (a relabelled centre frequency alone
+     shifts the result), so the refusal names them and says to persist them
+     in `[input]` first. Without `--write` the same overrides mean the prompt
+     is never offered. Exempt, each by design: `--duration`, `--reference-hz`
+     and `--search-ppm` (the measurement, not the input), `--json` and
+     `--write` (output), `--config` (the file saved to), and `--tune-hz`,
+     which retunes the configured receiver itself, without relabelling, to
+     reach a reference; a ppm correction belongs to the receiver's
+     oscillator and holds at every frequency. This supersedes the earlier
+     per-flag "replaced receiver" rule.
    - When the file already holds the rounded value, it says so and writes
      nothing.
    - When `MANTA_INPUT_FREQ_CORRECTION_PPM` is set, it warns that the
