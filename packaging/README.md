@@ -24,7 +24,7 @@ there.
   every build supports and which needs no device permissions. An HPSDR
   radio on the network works the same way. None of the recipes gives manta
   access to a local sound card or USB SDR. Release binaries include
-  KiwiSDR and HPSDR support, not SoapySDR.
+  KiwiSDR and HPSDR support, not SoapySDR. Before you run the service against a receiver you don't own, read [the KiwiSDR guide](../docs/GUIDES/kiwisdr.md).
 - **Linux:** the binary needs the ALSA runtime library even when it never
   opens a sound card: `sudo apt install libasound2` on Debian, Ubuntu and
   Raspberry Pi OS (`libasound2t64` on Debian 13). Without it, `./manta`
@@ -52,7 +52,9 @@ Copy the example, replace N0CALL with your station callsign, and configure your 
 **Station.** Under `[server]`, edit the active `station_callsign = "N0CALL"`
 line, not the commented reference line above it. Your call is sent as the
 spotter of every spot; an RBN SSID such as `-1` is allowed. The
-`operator_*` lines are optional.
+`operator_*` lines are optional. Set `operator_grid` (or `operator_lat` and
+`operator_lon`) to put your station's position on JSON spots; without it
+they carry none.
 
 **Receiver.** For a KiwiSDR, find these lines in the `[input]` table that
 is already in the file, delete the `#` at the start of each, and edit the
@@ -154,6 +156,15 @@ verify` must report no errors for the unit.
   made each time the service starts: after editing
   `/etc/manta/manta.toml`, run the `config check` line again, then
   `sudo systemctl restart manta`.
+- **Changing lists without a restart.** `sudo systemctl reload manta`
+  sends SIGHUP, which re-reads the `[spot]` lists and each
+  `[[rbn_uplink]]` `dry_run` while clients, the `sh/dx` history and
+  uplink connections stay up (MAN-78). It re-reads the start-time
+  credential copy of the config, so it picks up edits to the
+  `blocklist_path` and `notch_path` files, which the config names by
+  absolute path; an edit to `/etc/manta/manta.toml` itself still needs a
+  restart. `journalctl -u manta` shows `reload: applied` or
+  `reload: rejected` with the reason; a rejected reload changes nothing.
 - **Absolute paths.** manta resolves a relative path in the config against
   the config's directory, and at run time that is the credentials
   directory, not `/etc/manta`. Give `path` under `[input]`, and
@@ -250,8 +261,8 @@ each file.
   larger than 10 MiB, it keeps the final 1 MiB in place: it copies that
   tail to a temporary file in the same directory, overwrites the log with
   it, and removes the temporary file. The log keeps its inode because
-  manta never reopens its stdout and stderr, and SIGHUP shuts manta down
-  instead of reopening anything. A rename-based rotator such as newsyslog
+  manta never reopens its stdout and stderr, and SIGHUP reloads the
+  `[spot]` lists (MAN-78) instead of reopening anything. A rename-based rotator such as newsyslog
   would leave manta writing to the renamed file. Limits: the log can grow
   past 10 MiB between runs, or while the job cannot run, and lines manta
   writes during the copy can be lost. This is operational log retention,
