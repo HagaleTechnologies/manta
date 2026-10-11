@@ -14,11 +14,8 @@ mod clock_check;
 mod config;
 mod config_cmd;
 mod devices;
-<<<<<<< HEAD
-mod health_cmd;
-=======
 mod doctor_checks;
->>>>>>> 5346c333efd8eb6c9704b2218523f539e3c68b1a
+mod health_cmd;
 mod logging;
 mod reconnect;
 mod reload;
@@ -572,7 +569,6 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         timeout_secs: u64,
     },
-<<<<<<< HEAD
     /// Ask a running daemon whether it is healthy.
     ///
     /// Prints the daemon's health report, one check per line. Exits 0 when
@@ -594,11 +590,8 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         timeout_secs: u64,
     },
-    /// Check whether a source is hearing anything, and say what it found.
-=======
     /// Check that this machine is ready to run manta, then whether the
     /// receiver hears anything.
->>>>>>> 5346c333efd8eb6c9704b2218523f539e3c68b1a
     ///
     /// First checks the config, the audio library, that the server ports
     /// are free, the clock against an NTP server, and that each enabled RBN

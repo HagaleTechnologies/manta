@@ -31,7 +31,6 @@ git history and `docs/DECISIONS/`.
 
 ### Added
 
-<<<<<<< HEAD
 - `manta health` asks a running daemon's `/healthz` and exits 0 when it
   reports healthy, 1 otherwise, reading the metrics port from the same config
   and `MANTA_*` overrides as `run` (MAN-81).
@@ -41,7 +40,6 @@ git history and `docs/DECISIONS/`.
   `manta health`. Arguments still run `manta <arguments>` unchanged (MAN-81).
 - A `linux/arm/v7` Docker image for 32-bit Raspberry Pi OS, alongside
   `linux/amd64` and `linux/arm64` (MAN-81).
-=======
 - `manta doctor` checks the whole setup before its signal check: the config
   (`manta run`'s example-callsign and dial-frequency refusals), the audio
   library and sound-card inputs, that each `[server]` port is free, the
@@ -58,7 +56,6 @@ git history and `docs/DECISIONS/`.
   for a held port, an unreachable uplink, a clock 60 s or more off, the
   example callsign, or a missing dial frequency with `[server]`. The signal
   verdict still does not change the exit code.
->>>>>>> 5346c333efd8eb6c9704b2218523f539e3c68b1a
 - Operator guides for [running an RBN node](docs/GUIDES/rbn-node.md),
   [KiwiSDR etiquette](docs/GUIDES/kiwisdr.md), and
   [Raspberry Pi installation and service setup](docs/GUIDES/raspberry-pi.md) (MAN-148).
