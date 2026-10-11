@@ -27,6 +27,8 @@ git history and `docs/DECISIONS/`.
   `--log-level <LEVEL>`, each shorthand for `RUST_LOG=<level>` that
   overrides it, and `--log-format json`, which writes every stderr log line
   as one JSON object for a log aggregator (MAN-124).
+- Contributor setup and review guidance, bug and hardware report templates,
+  feature requests, and a MAN-linked pull request template (MAN-151).
 
 ### Fixed
 
