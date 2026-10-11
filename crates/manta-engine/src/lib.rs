@@ -222,6 +222,7 @@ pub fn decode_samples(
         cfg.detector,
         cfg.decode.clone(),
     );
+    tm.skip_preroll_hops(pad_hops);
     // Feed the channelizer/track-manager in bounded chunks rather than one
     // `ch.process(&padded_iq)` + one `tm.process_hops(...)` call over the
     // whole file. `Channelizer::process` is chunk-size-invariant (proved by

@@ -2276,7 +2276,8 @@ fn soak_runs_from_a_config_file_source() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stderr: {stderr}");
-    assert!(stderr.contains("SoakReport"), "stderr: {stderr}");
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("soak: passed\nevents: "));
 }
 
 /// MAN-261 D7: `soak` never starts the spot servers; a `[server]` table in
@@ -2569,7 +2570,7 @@ fn status_with_a_missing_server_config_fails_with_exit_code_two_not_one() {
             "`manta status {spelling}` stderr: {stderr}"
         );
         assert!(
-            stderr.contains("manta status:") && stderr.contains("/nonexistent/manta.toml"),
+            stderr.contains("error:") && stderr.contains("/nonexistent/manta.toml"),
             "`manta status {spelling}` must fail reading the config, not on clap usage: {stderr}"
         );
     }

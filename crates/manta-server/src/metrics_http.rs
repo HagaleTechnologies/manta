@@ -382,11 +382,9 @@ async fn handle_request(
         // internet-facing endpoint (a wrong method, an unknown path) was
         // otherwise absent from the audit trail entirely -- only header
         // read failures were logged, never a request that completed but
-        // didn't match. Debug (`?`), not Display, for the same reason the
-        // telnet login field uses it: `request_line` is client-supplied
-        // and unvalidated.
+        // didn't match. Quote explicitly to escape client-supplied controls.
         if connection_log_limiter.allow(peer.ip()) {
-            tracing::warn!(peer = %peer, request_line = ?request_line.trim_end(), "metrics_http: rejected request, returning 404");
+            tracing::warn!(peer = %peer, request_line = %crate::human::quoted(request_line.trim_end()), "metrics_http: rejected request, returning 404");
         }
     }
 

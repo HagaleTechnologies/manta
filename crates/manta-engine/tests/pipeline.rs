@@ -2,16 +2,14 @@ use manta_engine::{decode_samples, PipelineConfig};
 use manta_testkit::cer::cer;
 use manta_testkit::scene::{render_scene, SignalSpec};
 
-/// SPEC §2.1's 750-hop (2.0 s) mandatory warmup floor deterministically
-/// loses this 20 s scene's leading "CQ " prefix before the real detector
-/// ever promotes a track -- not a bug. Same structural cause as
-/// `track.rs::active_track_decodes_real_text`'s `CER < 0.02` (that test's
-/// 120 s scene measures a 0.0155 floor; this 20 s scene loses the same
-/// ~2.05 s absolute prefix, a much larger fraction of the shorter clip).
-/// Measured empirically (Task 11 Step 0): CER = 0.09375, deterministic
-/// (fixed `noise_seed=1`). 0.12 gives headroom above that floor, roughly
-/// matching `track.rs`'s own floor-to-threshold ratio. See
-/// docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md.
+/// The 0.12 CER bound was pinned against the old 750-hop (2.0 s) warmup
+/// floor, which lost this 20 s scene's leading "CQ " before the detector
+/// promoted a track (Task 11 Step 0: CER 0.09375, fixed `noise_seed=1`;
+/// docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md). MAN-115's
+/// 25 ms warmup after the pre-roll (SPEC §2.2 "Startup") promotes within
+/// ~0.07 s, so only the first, mid-element character is still at risk; the
+/// bound is kept as an upper limit, not re-tightened. See
+/// docs/DECISIONS/2026-10-11-man115-startup-latency.md.
 #[test]
 fn v1_lite_decodes_end_to_end() {
     // 20 s slice of the V1 scene: same parameters, faster test. The full
@@ -51,8 +49,8 @@ fn v1_lite_decodes_end_to_end() {
     let cer_val = cer(&texts[0], &report.text);
     assert!(
         cer_val < 0.12,
-        "expected CER < 0.12 (measured floor 0.09375; SPEC §2.1's ~2.05 s warmup+confirm floor \
-         loses this scene's leading \"CQ \", see this test's doc comment), got {cer_val:.4}\n\
+        "expected CER < 0.12 (bound pinned under the pre-MAN-115 2 s warmup floor, see this \
+         test's doc comment), got {cer_val:.4}\n\
          expected {:?}\ngot      {:?}",
         texts[0],
         report.text
