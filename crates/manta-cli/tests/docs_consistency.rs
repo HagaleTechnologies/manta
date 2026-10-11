@@ -1184,3 +1184,35 @@ fn architecture_logging_bullet_is_current() {
         "ARCHITECTURE.md never says --log-format json"
     );
 }
+
+/// MAN-81: an operator reading the Docker docs learns that a bare
+/// `docker run` runs a mounted config, that the image reports health through
+/// `manta health`, and how to turn the check off.
+#[test]
+fn docker_docs_describe_the_bare_run_and_the_health_check() {
+    let norm = |s: &str| squash_whitespace(s).to_lowercase();
+    let guide = doc("packaging/README.md");
+    let docker = norm(section(&guide, "Docker Compose"));
+    for needle in [
+        "/etc/manta/manta.toml",
+        "manta health",
+        "--no-healthcheck",
+        "--mount",
+    ] {
+        assert!(
+            docker.contains(needle),
+            "packaging/README.md's Docker section never says {needle:?}"
+        );
+    }
+    let runbook = norm(&doc("docs/RUNBOOKS/node-health.md"));
+    for needle in ["manta health", "healthcheck"] {
+        assert!(
+            runbook.contains(needle),
+            "docs/RUNBOOKS/node-health.md never says {needle:?}"
+        );
+    }
+    assert!(
+        norm(&doc("README.md")).contains("manta health"),
+        "README.md never says manta health"
+    );
+}

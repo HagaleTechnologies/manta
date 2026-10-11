@@ -13,6 +13,7 @@ mod build_info;
 mod config;
 mod config_cmd;
 mod devices;
+mod health_cmd;
 mod logging;
 mod reconnect;
 mod reload;
@@ -557,6 +558,27 @@ enum Command {
         json: bool,
         /// Give up after this many seconds if the daemon doesn't answer.
         #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+    },
+    /// Ask a running daemon whether it is healthy.
+    ///
+    /// Prints the daemon's health report, one check per line. Exits 0 when
+    /// the daemon reports healthy, and 1 when it reports unhealthy, cannot
+    /// be reached, or does not answer within --timeout-secs. These are the
+    /// exit codes a container health check expects.
+    // MAN-81: the image's HEALTHCHECK. Never exits 2 -- Docker reserves it.
+    Health {
+        /// Daemon config to read metrics_bind_addr/metrics_port from, with the
+        /// same MANTA_* overrides `run` applies (falls back to MANTA_CONFIG). A
+        /// wildcard address (0.0.0.0/::) is dialled on loopback.
+        #[arg(long, conflicts_with = "addr")]
+        config: Option<PathBuf>,
+        /// Explicit host:port of the daemon's metrics listener (default
+        /// 127.0.0.1:7302).
+        #[arg(long)]
+        addr: Option<String>,
+        /// Give up after this many seconds if the daemon doesn't answer.
+        #[arg(long, default_value_t = 3)]
         timeout_secs: u64,
     },
     /// Check whether a source is hearing anything, and say what it found.
@@ -3320,7 +3342,7 @@ fn format_addrs(addrs: &[std::net::SocketAddr]) -> String {
 /// asked for.
 ///
 /// Resolution and the fetch share ONE end-to-end deadline rather than a
-/// timeout window each (see `deadline`/`remaining` in the body): giving
+/// timeout window each (see `deadline`/`remaining` in `query_daemon`): giving
 /// each leg its own full `timeout` would let `--timeout-secs 5` take
 /// nearly ten seconds, twice the give-up bound the flag advertises.
 fn run_status(
@@ -3328,22 +3350,63 @@ fn run_status(
     addr: Option<&str>,
     timeout_secs: u64,
 ) -> Result<manta_server::status_doc::StatusDoc> {
-    // MAN-261: the same loader and `MANTA_*` overlay `run` uses, so the
-    // port `status` dials is the port the daemon bound -- including a
-    // `MANTA_SERVER_METRICS_PORT` override and the `MANTA_CONFIG` fallback.
     // An explicit `--addr` needs no config at all.
     let server = if addr.is_some() {
         None
     } else {
-        let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
-        let config_path = server_config
-            .map(std::path::Path::to_path_buf)
-            .or_else(|| config::config_path_from_env(&vars));
-        match config_path {
-            Some(path) => config::load(Some(&path), config::Env::Read(&vars))?.server,
-            None => None,
-        }
+        daemon_server_config(server_config)?.1
     };
+    query_daemon(
+        addr,
+        server,
+        timeout_secs,
+        |targets, remaining| async move {
+            fetch_status(&targets, remaining)
+                .await
+                .with_context(|| format!("could not reach daemon at {}", format_addrs(&targets)))
+        },
+    )
+}
+
+/// The daemon's `[server]` table as `run` would load it: `--config`, else
+/// `MANTA_CONFIG`, with the `MANTA_*` overlay. `(None, None)` when neither
+/// names a file. Shared by `manta status` and `manta health` (MAN-81).
+fn daemon_server_config(
+    config: Option<&std::path::Path>,
+) -> Result<(
+    Option<std::path::PathBuf>,
+    Option<manta_server::config::ServerConfig>,
+)> {
+    // MAN-261: the same loader and `MANTA_*` overlay `run` uses, so the
+    // port a client dials is the port the daemon bound -- including a
+    // `MANTA_SERVER_METRICS_PORT` override and the `MANTA_CONFIG` fallback.
+    let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+    let config_path = config
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| config::config_path_from_env(&vars));
+    match config_path {
+        Some(path) => {
+            let server = config::load(Some(&path), config::Env::Read(&vars))?.server;
+            Ok((Some(path), server))
+        }
+        None => Ok((None, None)),
+    }
+}
+
+/// Resolves `addr`/`server` on the blocking pool and runs `fetch` against
+/// the resolved candidates within ONE end-to-end deadline, then detaches
+/// the runtime. The MAN-44 plumbing, moved here unchanged from
+/// `run_status` so `manta health` (MAN-81) shares the hardened copy.
+fn query_daemon<T, F, Fut>(
+    addr: Option<&str>,
+    server: Option<manta_server::config::ServerConfig>,
+    timeout_secs: u64,
+    fetch: F,
+) -> Result<T>
+where
+    F: FnOnce(Vec<std::net::SocketAddr>, std::time::Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
     let timeout = std::time::Duration::from_secs(timeout_secs);
     let addr_owned = addr.map(str::to_string);
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -3367,13 +3430,11 @@ fn run_status(
         .map_err(|_| anyhow!("resolving the daemon's address timed out"))?
         .context("resolving the daemon's address panicked")??;
         // Only what's LEFT of the deadline goes to the fetch. A zero
-        // remainder is not special-cased: `fetch_status` bounds itself with
-        // this duration and reports the same "timed out talking to ..."
-        // error it would for any other exhausted budget.
+        // remainder is not special-cased: `fetch` bounds itself with this
+        // duration and reports the same "timed out talking to ..." error
+        // it would for any other exhausted budget.
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        fetch_status(&targets, remaining)
-            .await
-            .with_context(|| format!("could not reach daemon at {}", format_addrs(&targets)))
+        fetch(targets, remaining).await
     });
     // MAN-44 review: the timeout above only DROPS the JoinHandle -- a
     // `spawn_blocking` task cannot be aborted once it is running, so a
@@ -3386,7 +3447,8 @@ fn run_status(
     // detaches the runtime instead of joining it, so the bound the
     // operator asked for is the bound they get; the orphaned lookup is
     // pure-read, owns no caller-visible state, and dies with the process
-    // (which `Command::Status` reaches immediately after this returns).
+    // (which `Command::Status` and `Command::Health` reach immediately
+    // after this returns).
     rt.shutdown_background();
     outcome
 }
@@ -3508,30 +3570,64 @@ async fn fetch_status_inner(
     addrs: &[std::net::SocketAddr],
     timeout: std::time::Duration,
 ) -> Result<manta_server::status_doc::StatusDoc> {
-    use manta_server::bounded_io::read_line_bounded;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-
-    let (mut stream, addr) = connect_any(addrs, timeout)
-        .await
-        .with_context(|| format!("connecting to {}", format_addrs(addrs)))?;
-    stream
-        .write_all(
-            format!("GET /status HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
-        )
-        .await
-        .context("writing the status request")?;
-
-    let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    read_line_bounded(&mut reader, &mut status_line)
-        .await
-        .context("reading the status line")?;
+    let (_, status_line, reader) = http_get(addrs, "/status", "status", timeout).await?;
     if !status_line.starts_with("HTTP/1.1 200") {
         bail!(
             "daemon returned {}",
             manta_server::status_doc::escape_for_terminal(status_line.trim_end())
         );
     }
+    let body = read_http_body(reader, MAX_STATUS_BODY_BYTES, "status").await?;
+    parse_status_doc(&body)
+}
+
+/// One hand-rolled `GET {path}` against the first of `addrs` that accepts
+/// a connection within `timeout`: writes the request and reads the HTTP
+/// status line (bounded). Returns the address dialled, the status line and
+/// the reader, positioned at the header block for `read_http_body`. `what`
+/// names the request in errors ("status", "health"). Shared by
+/// `manta status` and `manta health` (MAN-81).
+async fn http_get(
+    addrs: &[std::net::SocketAddr],
+    path: &str,
+    what: &str,
+    timeout: std::time::Duration,
+) -> Result<(
+    std::net::SocketAddr,
+    String,
+    tokio::io::BufReader<tokio::net::TcpStream>,
+)> {
+    use manta_server::bounded_io::read_line_bounded;
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    let (mut stream, addr) = connect_any(addrs, timeout)
+        .await
+        .with_context(|| format!("connecting to {}", format_addrs(addrs)))?;
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .with_context(|| format!("writing the {what} request"))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    read_line_bounded(&mut reader, &mut status_line)
+        .await
+        .context("reading the status line")?;
+    Ok((addr, status_line, reader))
+}
+
+/// Skips the header block `http_get` left unread (at most
+/// `MAX_STATUS_HEADER_LINES` lines) and reads the body, capped at
+/// `max_body` bytes, as UTF-8.
+async fn read_http_body(
+    mut reader: tokio::io::BufReader<tokio::net::TcpStream>,
+    max_body: u64,
+    what: &str,
+) -> Result<String> {
+    use manta_server::bounded_io::read_line_bounded;
+    use tokio::io::AsyncReadExt;
 
     for _ in 0..MAX_STATUS_HEADER_LINES {
         let mut line = String::new();
@@ -3545,12 +3641,11 @@ async fn fetch_status_inner(
 
     let mut body = Vec::new();
     reader
-        .take(MAX_STATUS_BODY_BYTES)
+        .take(max_body)
         .read_to_end(&mut body)
         .await
-        .context("reading the status body")?;
-    let body = String::from_utf8(body).context("status body was not valid UTF-8")?;
-    parse_status_doc(&body)
+        .with_context(|| format!("reading the {what} body"))?;
+    String::from_utf8(body).with_context(|| format!("{what} body was not valid UTF-8"))
 }
 
 /// Parses a `/status` body AND enforces its `schema_version` (Codex
@@ -4604,6 +4699,17 @@ fn real_main() -> Result<()> {
                 print!("{}", manta_server::status_doc::render_human(&doc));
             }
             std::process::exit(status_exit_code(&doc));
+        }
+        Command::Health {
+            config,
+            addr,
+            timeout_secs,
+        } => {
+            std::process::exit(health_cmd::run(
+                config.as_deref(),
+                addr.as_deref(),
+                timeout_secs,
+            ));
         }
         Command::Doctor {
             duration,

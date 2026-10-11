@@ -129,6 +129,17 @@ docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
   `MANTA_SERVER_METRICS_BIND_ADDR=0.0.0.0` and publish it as
   `-p 127.0.0.1:7302:7302`, which keeps it on the host — see
   [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md).
+- With no arguments, the image runs the daemon from a config mounted at
+  `/etc/manta/manta.toml` (or the file `MANTA_CONFIG` names), and prints
+  `--help` when there is none. Any arguments run `manta <arguments>`
+  unchanged. The image reports its health to `docker ps` and orchestrators
+  by running `manta health`, which asks the daemon's own `/healthz` from
+  inside the container, so the metrics endpoint can stay on loopback. Setup,
+  timing and how to turn the check off are in
+  [packaging/README.md](packaging/README.md#docker-compose).
+- The image is built for `linux/amd64`, `linux/arm64` and `linux/arm/v7`.
+  `linux/arm/v7` is for 32-bit Raspberry Pi OS; its decode CPU budget is
+  unmeasured.
 - If the `docker run` above returns an authorization error, the GHCR
   package still needs its one-time "make public" step — see
   [docs/RUNBOOKS/release.md](docs/RUNBOOKS/release.md).
