@@ -184,16 +184,22 @@ Recommended `refine_bw_hz = 30` (10–90 % step rise ≈ 16 ms, measured by
 direct step-response simulation of the shipped 11-tap filter at
 `fo = 375 Hz`; at 45 WPM a dit is ≈ 27 ms, so this fills roughly half a
 dit). The channel selection `c` follows the centroid; a change
-of `c` resets the FIR history (one lost hop of evidence, `llr = 0`).
+of `c` resets the FIR history (one lost hop of evidence, `llr = 0`;
+superseded by MAN-194, see the update below).
 This section specifies the module, not the engine change.
 
 **Update (2026-10-11, MAN-149):** the call site is live. Since
 MAN-168/MAN-194, `manta-engine`'s `TrackManager` (`track.rs`) feeds each
 track through a per-track `Refiner` whenever `refine_bw_hz > 0`, under every
-engine except `oracle`. Historical note: when this section was written the
-call site was deferred to MAN-168, and the text asked MAN-168 to re-derive
-the 16 ms rise-time budget against the real implementation before wiring
-it.
+engine except `oracle`. The reset rule above is also superseded by MAN-194's delay compensation: on a
+change of `c`, `Track::decoder_input` first emits every hop still buffered
+for the old channel (at raw magnitude), resets the FIR, then withholds
+output for the new channel for `GROUP_DELAY_HOPS` hops, reports each due
+(delayed) hop's raw magnitude until the 11-tap history is full, and only
+then reports the FIR output. No hop is dropped and none is fed as
+`llr = 0`. Historical note: when this section was written the call site was
+deferred to MAN-168, and the text asked MAN-168 to re-derive the 16 ms
+rise-time budget against the real implementation before wiring it.
 
 ---
 
