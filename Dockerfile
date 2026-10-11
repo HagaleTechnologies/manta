@@ -107,7 +107,13 @@ EXPOSE 7300 7301 7302
 # -- with the same MANTA_SERVER_* overrides, so a metrics_port or
 # metrics_bind_addr set in manta.toml is the one dialled; a curl at a fixed
 # port would misreport that daemon (and the image carries no curl). It
-# probes from inside the container, so metrics_bind_addr can stay 127.0.0.1.
+# re-reads the file at every check, while the daemon keeps the listener it
+# started with (both keys are restart-only; SIGHUP reloads only [spot] lists
+# and dry_run): until the container restarts, an edit to either key can
+# send the check to an address the daemon is not listening on, and an edit
+# after which the file no longer loads, or has no [server] table, fails the
+# check until the file is fixed. It probes from inside the container, so
+# metrics_bind_addr can stay 127.0.0.1.
 # Shell form, so /bin/sh expands ${MANTA_CONFIG:-...} at check time (Docker
 # does no variable substitution in HEALTHCHECK).
 #  - start-period 60s: a KiwiSDR source may take up to its 30 s connect

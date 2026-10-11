@@ -43,7 +43,15 @@ The `/healthz` endpoint the ticket depends on shipped with MAN-128
    (`Couldn't connect to server`) -- a healthy container marked unhealthy.
    `manta health` resolves the address with `run`'s loader and `MANTA_*`
    overlay (the `manta status` precedent), is tested in required CI, and
-   adds no apt packages or CVE-scan surface to the image.
+   adds no apt packages or CVE-scan surface to the image. It re-reads the
+   file at every check, so it follows the daemon's listener only while
+   `metrics_port` and `metrics_bind_addr` match what the daemon started
+   with. Both are restart-only (MAN-78), so after an edit the check can
+   dial an address the daemon does not listen on until the container
+   restarts, and a file that no longer loads, or has no `[server]` table,
+   fails the check until it is fixed.
+   The Dockerfile, `packaging/README.md` and `node-health.md` say so
+   (PR #257 review).
 5. **Exit codes and output.** 0 when `/healthz` answers 200 with first body
    line `ok`; 1 on a 503 `unhealthy` report (printed to stdout), on any
    other reply ("did not answer like a manta health endpoint"), on a
@@ -96,6 +104,10 @@ The `/healthz` endpoint the ticket depends on shipped with MAN-128
   `--config` or `MANTA_CONFIG` (`config_cmd.rs`). The image supplies the
   path, as systemd and Compose do.
 - No `healthcheck:` block in `docker-compose.yml`; it inherits the image's.
+- No record of the daemon's active metrics address for `manta health` to
+  read. Probing the running listener rather than the current file (PR #257
+  review) needs a new daemon-to-probe contract, such as a runtime file
+  `run` writes after binding; that is left to a follow-up decision.
 - No native `armv7-unknown-linux-gnueabihf` release archive, and no PR-time
   Docker build: the entrypoint and health-check behaviour reach required CI
   through `crates/manta-cli/tests/docker_image.rs` and

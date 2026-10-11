@@ -71,8 +71,15 @@ HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=3 \
 
 `manta health` reads the config the daemon runs (the mounted
 `/etc/manta/manta.toml`, or `MANTA_CONFIG`) with the same `MANTA_SERVER_*`
-overrides, so it dials the `metrics_port` and `metrics_bind_addr` the
-daemon bound, and a wildcard bind is dialled on loopback. It asks
+overrides, so it dials the `metrics_port` and `metrics_bind_addr` that file
+sets, and a wildcard bind is dialled on loopback. It re-reads the file at
+every check, while the daemon keeps the listener it started with: both keys
+are restart-only (SIGHUP reloads only `[spot]` lists and `dry_run`). After
+editing either one, restart the container: until then the check dials the
+new address, and reports unhealthy if the daemon is not listening there.
+An edit after which the file no longer loads, or has no `[server]` table,
+also fails the check, with the reason in the health log, until it is fixed
+or reverted. It asks
 `/healthz` and exits 0 on `200 ok`, 1 on anything else, and prints the
 report, which `docker inspect --format '{{json .State.Health.Log}}'`
 shows. It probes from inside the container, so `metrics_bind_addr` can

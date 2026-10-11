@@ -62,6 +62,13 @@ fn probe(config: Option<&Path>, addr: Option<&str>, timeout_secs: u64) -> Result
     let server = if addr.is_some() {
         None
     } else {
+        // Re-read on every probe: the address is the one the file names
+        // now, which is the daemon's own only until `metrics_port` or
+        // `metrics_bind_addr` is edited. Both are restart-only (MAN-78),
+        // so such an edit can point the probe away from the running
+        // listener until a restart, and an edit after which the file no
+        // longer loads, or has no `[server]` table, fails the probe until
+        // it is fixed. The operator docs say so.
         let (path, server) = crate::daemon_server_config(config)?;
         // A config with no `[server]` table is one `run` serves no
         // listener for; falling back to 127.0.0.1:7302 would probe

@@ -362,9 +362,15 @@ is invalid.
   `manta health --config "${MANTA_CONFIG:-/etc/manta/manta.toml}"` inside
   the container every 10 seconds. `manta health` reads the same config the
   daemon runs, with the same `MANTA_SERVER_*` overrides, asks the daemon's
-  own `/healthz`, and exits 0 or 1. `docker ps` shows `(health: starting)`
-  for up to 60 seconds after start (long enough for a KiwiSDR to connect),
-  then `(healthy)`, or `(unhealthy)` after three failed checks in a row.
+  own `/healthz`, and exits 0 or 1. It re-reads `manta.toml` at every check,
+  and `metrics_port` and `metrics_bind_addr` take effect only after a
+  restart, so restart the container after editing them; until then the
+  check dials the new address, where the daemon may not be listening. An
+  edit after which `manta.toml` no longer loads, or has no `[server]`
+  table, also fails the check until it is fixed. `docker ps` shows
+  `(health: starting)` for up to 60 seconds after start (long enough for a
+  KiwiSDR to connect), then `(healthy)`, or `(unhealthy)` after three
+  failed checks in a row.
   `docker inspect --format '{{json .State.Health.Log}}' <container>` shows
   the daemon's own reasons, such as `decode: stalled 12s`. The check runs
   inside the container, so `metrics_bind_addr` can stay `127.0.0.1`; it
