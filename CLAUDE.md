@@ -89,18 +89,16 @@ MAN-138: JSON spots' `deGrid`/`deLat`/`deLon` are the operator's
 centroid; an inconsistent location fails config loading before I/O. See
 `docs/DECISIONS/2026-10-11-man138-station-location.md`.
 
-<<<<<<< HEAD
+MAN-172: high-SNR track churn fixed in `TrackManager` (local-peak spawn
+rule, incumbent-wins merge ties); VR3/VR4 pass, VR1/VR2 pass CER but not
+WPM. See docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md.
+
 MAN-81: with no arguments the Docker image runs the daemon from a config
 mounted at `/etc/manta/manta.toml` (or `MANTA_CONFIG`), else prints
 `--help`; its `HEALTHCHECK` runs the new `manta health` (exit 0/1 from
 `/healthz`, metrics address read from the daemon's config); the image is
 also built for `linux/arm/v7`. See
 `docs/DECISIONS/2026-10-11-man81-docker-config-mount-and-healthcheck.md`.
-=======
-MAN-172: high-SNR track churn fixed in `TrackManager` (local-peak spawn
-rule, incumbent-wins merge ties); VR3/VR4 pass, VR1/VR2 pass CER but not
-WPM. See docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md.
->>>>>>> 44d5ed35341136addd454eba4316ce4dfc864699
 
 ## Documents (read in this order)
 
