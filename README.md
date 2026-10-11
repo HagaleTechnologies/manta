@@ -551,7 +551,9 @@ systemd, launchd or Docker Compose) ·
 (a 30-day secondary-skimmer field node behind an RBN Aggregator, MAN-96) ·
 `manta <subcommand> --help` for every flag.
 
-**Contributing:** [ARCHITECTURE.md](ARCHITECTURE.md) — the nine-crate
+**Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) — setup, build and
+test commands, golden-vector rules and the pull request review process ·
+[ARCHITECTURE.md](ARCHITECTURE.md) — the nine-crate
 workspace, data flow, and the channelizer, decoder, validation and output
 design · [docs/DECISIONS/](docs/DECISIONS/) — dated design decisions and
 implementation pins · [wiki/INDEX.md](wiki/INDEX.md) — accumulated
@@ -577,6 +579,9 @@ recall/CER-vs-SNR curve on synthetic signals, regenerable from any build.
 
 ## Contributing
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, build and test commands,
+golden-vector rules, and the pull request review process.
+
 Open an issue or a pull request. Main moves only by PR, CI must be green, and
 the golden-vector determinism tests are the bar every decoder change has to
 clear. See [SECURITY.md](SECURITY.md) for vulnerability reporting.
@@ -592,6 +597,10 @@ output adds a `### Decoder output` entry to [CHANGELOG.md](CHANGELOG.md).
 MIT OR Apache-2.0, at your option. Unless you explicitly state otherwise, any
 contribution intentionally submitted for inclusion in this project shall be
 dual licensed as above, without any additional terms or conditions.
+
+Read the [MIT license](LICENSE-MIT) or the
+[Apache-2.0 license](LICENSE-APACHE). The
+[contributor guide](CONTRIBUTING.md#license) explains GitHub's license display.
 
 ## Keeping the prefix table current
 
