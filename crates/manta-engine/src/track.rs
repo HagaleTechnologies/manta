@@ -1266,15 +1266,18 @@ impl TrackManager {
         });
         self.recompute_ownership();
 
-        // Same-hop simultaneous-rise tie-break (SPEC §2.5): scan channels in
-        // ascending order; a rise on an unowned channel spawns a CANDIDATE
-        // unless a higher-power unowned neighbor also rose this hop, in
-        // which case only the higher-power one spawns.
+        // SPEC §2.5 / MAN-172: scan rising, unowned local maxima of the
+        // gate's smoothed power. Falling leakage skirts cannot start a
+        // spawn decision. Preserve the same-hop adjacent-rise arbitration.
         if past_warmup {
             let n = self.n_channels();
             let mut k = 0;
             while k < n {
-                if rise[k] && self.owner_of[k].is_none() && !self.channel_cooling_down(k) {
+                if rise[k]
+                    && self.owner_of[k].is_none()
+                    && !self.channel_cooling_down(k)
+                    && self.is_local_peak(k)
+                {
                     let mut winner = k;
                     if k + 1 < n
                         && rise[k + 1]
@@ -1330,6 +1333,19 @@ impl TrackManager {
         (closed_with_kind, promoted_events, closure_flush_events)
     }
 
+    /// MAN-172 / SPEC §2.5: a rising channel must be a local maximum of
+    /// smoothed power to start a spawn decision (ties qualify). Same-hop
+    /// pairing still chooses between adjacent rises by raw power. At high SNR a
+    /// tone's falling skirt crosses the rise threshold outside its owned
+    /// channels; suppressing those births prevents duplicate decoders.
+    /// Neighbours wrap, like `Track::owned`.
+    /// See docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md.
+    fn is_local_peak(&self, k: usize) -> bool {
+        let n = self.n_channels();
+        let s = self.gate.smoothed_db(k);
+        s >= self.gate.smoothed_db((k + n - 1) % n) && s >= self.gate.smoothed_db((k + 1) % n)
+    }
+
     /// MAN-171: is `k` still serving out a post-`Silent`-closure spawn
     /// cooldown (`DetectorConfig::silent_respawn_cooldown_hops`)?
     fn channel_cooling_down(&self, k: usize) -> bool {
@@ -1378,8 +1394,11 @@ impl TrackManager {
                 }
                 let (ca, cb) = (self.tracks[&a].center, self.tracks[&b].center);
                 if (ca - cb).abs() < 1.0 {
+                    // MAN-172: ids are ascending, so `a` is the incumbent.
+                    // Converged tracks often select the same channel and tie
+                    // exactly. Keep its established decoder on that tie.
                     let (loser, survivor) =
-                        if self.tracks[&a].current_snr_db <= self.tracks[&b].current_snr_db {
+                        if self.tracks[&a].current_snr_db < self.tracks[&b].current_snr_db {
                             (a, b)
                         } else {
                             (b, a)
@@ -3015,6 +3034,61 @@ mod tests {
     }
 
     #[test]
+    fn leakage_skirt_beside_an_owned_channel_does_not_spawn() {
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        for (k, db) in [(19, 30.0), (20, 40.0), (21, 30.0), (22, 15.0)] {
+            power[k] = 1e-9 * 10f32.powf(db / 10.0);
+        }
+        let mut promotions = 0;
+        for m in (250 * 15)..(250 * 15 + 400) {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            promotions += promoted.len();
+        }
+        assert_eq!(
+            promotions, 1,
+            "a falling leakage skirt must not create another track"
+        );
+        assert_eq!(
+            tm.close_counts().merged,
+            0,
+            "one signal must not churn through merges"
+        );
+    }
+
+    #[test]
+    fn a_real_second_peak_three_channels_away_still_spawns() {
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        for (k, db) in [(19, 30.0), (20, 40.0), (21, 30.0), (22, 5.0), (23, 20.0)] {
+            power[k] = 1e-9 * 10f32.powf(db / 10.0);
+        }
+        let mut promotions = 0;
+        for m in (250 * 15)..(250 * 15 + 400) {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            promotions += promoted.len();
+        }
+        assert_eq!(
+            promotions, 2,
+            "an independent local maximum must still promote"
+        );
+    }
+
+    #[test]
     fn adjacent_strong_channel_is_absorbed_not_a_new_track() {
         let mut tm = TrackManager::new(
             64,
@@ -3154,6 +3228,41 @@ mod tests {
     }
 
     #[test]
+    fn merge_on_an_exact_snr_tie_keeps_the_older_track() {
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        tm.spawn(10);
+        tm.spawn(40);
+        for (id, center) in [(1, 20.4), (2, 21.1)] {
+            let track = tm.tracks.get_mut(&id).unwrap();
+            track.center = center;
+            track.current_snr_db = 18.0;
+            track.has_emitted = true;
+        }
+        let (closed, _) = tm.merge_converged();
+        assert!(
+            tm.tracks.contains_key(&1),
+            "the incumbent decoder must survive an exact SNR tie"
+        );
+        assert!(!tm.tracks.contains_key(&2));
+        assert_eq!(tm.close_counts().merged, 1);
+        assert_eq!(
+            closed,
+            vec![(
+                2,
+                ClosureKind::Bookkeeping {
+                    survivor_track_id: Some(1)
+                }
+            )]
+        );
+    }
+
+    #[test]
     fn merge_closes_the_lower_snr_track_when_centers_converge() {
         // SPEC §2.5: "Two tracks whose centers converge within 1.0 channel
         // (interference or drift-collision) are merged: the lower-SNR
@@ -3173,7 +3282,7 @@ mod tests {
         // moment of merge, and the actual survivor is decided by BTreeMap
         // id order, not SNR -- and the stronger signal reliably reaches its
         // rise threshold (and so spawns, and gets its id) first, which is
-        // exactly the id the tie-break closes. Confirmed empirically across
+        // the id the old tie-break closed (fixed by MAN-172). Confirmed across
         // several parameter choices while developing this test; not a
         // tautology to route around, a real property of this design when
         // two tracks are driven onto the *same physical channel*.

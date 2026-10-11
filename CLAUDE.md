@@ -78,6 +78,10 @@ MAN-125: `manta devices` lists audio inputs and optional Soapy selectors;
 floor without decoding or services. See
 `docs/DECISIONS/2026-10-10-man125-source-diagnostics.md`.
 
+MAN-172: high-SNR track churn fixed in `TrackManager` (local-peak spawn
+rule, incumbent-wins merge ties); VR3/VR4 pass, VR1/VR2 pass CER but not
+WPM. See docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md.
+
 ## Documents (read in this order)
 
 - `README.md` — goals and non-goals
