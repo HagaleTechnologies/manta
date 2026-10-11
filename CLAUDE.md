@@ -84,16 +84,14 @@ MAN-138: JSON spots' `deGrid`/`deLat`/`deLon` are the operator's
 centroid; an inconsistent location fails config loading before I/O. See
 `docs/DECISIONS/2026-10-11-man138-station-location.md`.
 
-<<<<<<< HEAD
 MAN-93: `[server].history_minutes` controls telnet replay retention
 (default 30 minutes, newest-50 floor, 10,000 ceiling). Bare `sh/dx` stays
 at 10 rows; loggers request `sh/dx 30m`. Changes need a restart. See
 `docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md`.
-=======
+
 MAN-172: high-SNR track churn fixed in `TrackManager` (local-peak spawn
 rule, incumbent-wins merge ties); VR3/VR4 pass, VR1/VR2 pass CER but not
 WPM. See docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md.
->>>>>>> ef294a2c78c55a5e10b004f9d8684d0214d9b5d1
 
 ## Documents (read in this order)
 
