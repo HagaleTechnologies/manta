@@ -1298,6 +1298,59 @@ fn config_reference_names_status_as_a_server_reader() {
     );
 }
 
+/// MAN-81 PR #257 review: health_cmd::probe loads [server] through the same
+/// daemon_server_config as `status`, so the reference must name `health`
+/// wherever it names `status` as a reader of the metrics keys -- and say
+/// that a resolved config with no [server] table is an error for it.
+#[test]
+fn config_reference_names_health_as_a_server_reader() {
+    let md = doc(CONFIG_REF);
+    let precedence = squash_whitespace(section(&md, "Precedence"));
+    assert!(
+        precedence
+            .contains("`status`, `health` and `config check` read the path from `MANTA_CONFIG`"),
+        "{CONFIG_REF} Precedence must list `health` among the MANTA_CONFIG readers"
+    );
+    let matrix = backticked_rows(section(&md, "Which commands read which tables"));
+    let row = matrix
+        .iter()
+        .find(|r| r[0] == "`health`")
+        .unwrap_or_else(|| panic!("{CONFIG_REF} command matrix has no `health` row"));
+    assert!(
+        row[1].contains("`metrics_bind_addr` and `metrics_port`"),
+        "{CONFIG_REF} `health` row must name metrics_bind_addr and metrics_port"
+    );
+    assert!(
+        row[1].contains("resolves to no `[server]` table is an error"),
+        "{CONFIG_REF} `health` row must say a config with no [server] table is an error"
+    );
+    assert!(
+        row[2].contains("`MANTA_SERVER_*` only alongside a config file"),
+        "{CONFIG_REF} `health` row must say MANTA_SERVER_* needs a config file"
+    );
+    let server = section(&md, "[server]");
+    let intro = squash_whitespace(&server[..server.find("\n|").unwrap_or(server.len())]);
+    assert!(
+        intro.contains("`health` reads the same two keys"),
+        "{CONFIG_REF} [server] must say `health` reads metrics_bind_addr and metrics_port"
+    );
+    assert!(
+        intro.contains("exits 1 when the named file plus overrides resolve to no `[server]` table"),
+        "{CONFIG_REF} [server] must say `health` rejects a config with no [server] table"
+    );
+    let rows = backticked_rows(server);
+    for key in ["metrics_bind_addr", "metrics_port"] {
+        let row = rows
+            .iter()
+            .find(|r| r[0] == format!("`{key}`"))
+            .unwrap_or_else(|| panic!("{CONFIG_REF} [server] has no `{key}` row"));
+        assert!(
+            row[2].contains("`health`"),
+            "{CONFIG_REF} [server] `{key}`'s Wired cell must name `health`"
+        );
+    }
+}
+
 /// MAN-149 PR #251 review: config::load joins a relative path to the
 /// config file's directory only when the file set it; a `MANTA_*` value
 /// or a flag stays relative to the working directory.
