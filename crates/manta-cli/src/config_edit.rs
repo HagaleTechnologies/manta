@@ -214,7 +214,9 @@ fn save_with_env(
     keep_owner(&target, &meta, &temp, ppm)?;
     #[cfg(target_os = "linux")]
     keep_acl(&target, &file, ppm)?;
-    fs::set_permissions(&temp, meta.permissions())
+    // Through the open handle: on Windows it is unshared, so a path-based
+    // call could be refused a second handle.
+    file.set_permissions(meta.permissions())
         .with_context(|| format!("setting the permissions of {}", temp.display()))?;
     drop(file);
 
