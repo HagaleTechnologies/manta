@@ -1002,7 +1002,7 @@ impl LiveSourceSpec {
             // Each (re)open gets its own one-shot silence notice (MAN-131).
             LiveSourceSpec::AudioDevice(device) => Box::new(
                 manta_input::AudioIqSource::from_device(device.as_deref())?.with_silence_notice(
-                    Box::new(|device| eprintln!("{}", audio_silence_warning(device))),
+                    Box::new(|device| logging::warning(&audio_silence_warning(device))),
                 ),
             ),
             LiveSourceSpec::File { path, source_iq } => {

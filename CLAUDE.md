@@ -78,18 +78,16 @@ MAN-125: `manta devices` lists audio inputs and optional Soapy selectors;
 floor without decoding or services. See
 `docs/DECISIONS/2026-10-10-man125-source-diagnostics.md`.
 
-<<<<<<< HEAD
 MAN-131: live audio reads wait for samples (5 s stall error naming the
 device, 48000 Hz and a macOS microphone-permission hint); digital-silence
 warning; `decode` warns without a sidecar and takes `--center-freq-hz` —
 see docs/DECISIONS/2026-10-11-man131-actionable-errors.md.
-=======
+
 MAN-138: JSON spots' `deGrid`/`deLat`/`deLon` are the operator's
 `[server].operator_grid` (its square's centre) or the new `operator_lat`/
 `operator_lon`, `null` when none is set, never a `cty.dat` country
 centroid; an inconsistent location fails config loading before I/O. See
 `docs/DECISIONS/2026-10-11-man138-station-location.md`.
->>>>>>> 73a7bf64bb59a2838a29becdfb4418b0fd6ae277
 
 ## Documents (read in this order)
 

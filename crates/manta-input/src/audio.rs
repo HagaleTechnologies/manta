@@ -16,19 +16,14 @@
 //! Live devices (`from_device`) sit behind coppa's non-blocking callback
 //! ring, where an empty read means "nothing captured yet", not end of
 //! stream. `read` therefore waits for samples, and fails after
-<<<<<<< HEAD
 //! `DEVICE_STALL_TIMEOUT` with an error naming the device, the rate and
 //! the likely cause, so the `IqSource` contract `0 = EOF` holds for every
-//! source (MAN-131). File-backed sources keep returning 0 at end of file.
-=======
-//! `DEVICE_STALL_TIMEOUT` if none arrive, so the `IqSource` contract
-//! `0 = EOF` holds for every source (MAN-231). File-backed sources keep
-//! returning 0 at end of file.
->>>>>>> 73a7bf64bb59a2838a29becdfb4418b0fd6ae277
+//! source (MAN-231, MAN-131). File-backed sources keep returning 0 at end
+//! of file.
 
 use crate::devices::quoted_name;
 use crate::IqSource;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use coppa_audio::AudioSource;
 use manta_dsp::hilbert::HilbertTransformer;
 use num_complex::Complex32;
@@ -62,13 +57,15 @@ pub const AUDIO_PASSBAND_LO_HZ: f64 = 300.0;
 pub const AUDIO_PASSBAND_HI_HZ: f64 = 3_000.0;
 
 /// How long a live device's `read` waits for a sample before failing
-<<<<<<< HEAD
-/// (MAN-131). Below the ~10 s network-source bound (hpsdr.rs/kiwi.rs):
+/// (MAN-231). Below the ~10 s network-source bound (hpsdr.rs/kiwi.rs):
 /// local audio callbacks arrive every ~10 ms, and an operator whose device
 /// delivers nothing should hear so quickly. A read in flight is not
-/// interruptible, so this also bounds Ctrl-C latency during a stall.
+/// interruptible, so this also bounds Ctrl-C latency during a stall; on a
+/// delivering device each read returns within one callback period.
 pub const DEVICE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Sleep between polls of an empty capture ring (matches `manta check`).
+/// The ring holds 8192 samples, ~170 ms at 48 kHz, so a 10 ms poll cannot
+/// let it overflow.
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Exact-zero samples from open before the digital-silence notice fires:
 /// two seconds, the length of `listen`'s startup window.
@@ -140,24 +137,11 @@ fn no_samples(label: &str, waited: Duration) -> anyhow::Error {
         audio_input_hint()
     )
 }
-=======
-/// (MAN-231). Below the ~10 s network-source bound (hpsdr.rs/kiwi.rs):
-/// local audio callbacks arrive every ~10 ms, and an operator whose device
-/// delivers nothing should hear so quickly. A read in flight is not
-/// interruptible, so this also bounds Ctrl-C latency during a stall; on a
-/// delivering device each read returns within one callback period.
-pub const DEVICE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
-/// Sleep between polls of an empty capture ring (matches `manta check`).
-/// The ring holds 8192 samples, ~170 ms at 48 kHz, so a 10 ms poll cannot
-/// let it overflow.
-const DEVICE_POLL_INTERVAL: Duration = Duration::from_millis(10);
->>>>>>> 73a7bf64bb59a2838a29becdfb4418b0fd6ae277
 
 /// A capture device behind a non-blocking callback ring (coppa's
 /// `CpalSource`): `read` must wait for samples, because an empty ring is
 /// not end of stream.
 struct LiveDevice {
-<<<<<<< HEAD
     /// The device's name as `manta devices` spells it (quoted).
     label: String,
     stall_timeout: Duration,
@@ -185,9 +169,6 @@ impl LiveDevice {
             }
         }
     }
-=======
-    stall_timeout: Duration,
->>>>>>> 73a7bf64bb59a2838a29becdfb4418b0fd6ae277
 }
 
 /// A real audio source (device or file) converted to analytic Complex32,
@@ -222,7 +203,6 @@ impl AudioIqSource {
 
     /// Wrap a started live device: `read` waits up to `stall_timeout` for
     /// samples instead of reporting an empty ring as end of stream.
-<<<<<<< HEAD
     fn live(src: Box<dyn AudioSource>, label: String, stall_timeout: Duration) -> Result<Self> {
         let mut source = Self::new(src)?;
         source.live = Some(LiveDevice {
@@ -245,14 +225,6 @@ impl AudioIqSource {
         self
     }
 
-=======
-    fn live(src: Box<dyn AudioSource>, stall_timeout: Duration) -> Result<Self> {
-        let mut source = Self::new(src)?;
-        source.live = Some(LiveDevice { stall_timeout });
-        Ok(source)
-    }
-
->>>>>>> 73a7bf64bb59a2838a29becdfb4418b0fd6ae277
     /// Attach the operator-supplied RF dial frequency the rig is tuned to
     /// (MAN-34). An audio passband carries no RF reference of its own, so
     /// without this a track's reported frequency is a bare audio-tone
@@ -281,19 +253,12 @@ impl AudioIqSource {
 
     /// Open the named input device (default device if `None`). Requires the
     /// device's native rate to be exactly TARGET_RATE_HZ (48000) -- M1 does
-<<<<<<< HEAD
     /// not resample, and the rate is checked before the stream starts.
     ///
     /// Every failure names the device (as `manta devices` spells it, or
     /// what was requested), states the 48000 Hz requirement and says what
     /// to check next (MAN-131). The returned source is live: `read` waits
-    /// for samples and fails after `DEVICE_STALL_TIMEOUT` of none.
-=======
-    /// not resample; see AudioIqSource::new for the rate-mismatch error.
-    ///
-    /// The returned source is live: `read` waits for samples and fails
-    /// after `DEVICE_STALL_TIMEOUT` of none (MAN-231).
->>>>>>> 73a7bf64bb59a2838a29becdfb4418b0fd6ae277
+    /// for samples and fails after `DEVICE_STALL_TIMEOUT` of none (MAN-231).
     pub fn from_device(name: Option<&str>) -> Result<Self> {
         use cpal::traits::{DeviceTrait, HostTrait};
         let device = match name {
@@ -316,7 +281,6 @@ impl AudioIqSource {
             .context("query its default input config")
             .map_err(|e| did_not_open(&label, &e))?
             .sample_rate();
-<<<<<<< HEAD
         if native_rate != TARGET_RATE_HZ {
             return Err(wrong_rate(&label, native_rate));
         }
@@ -324,11 +288,6 @@ impl AudioIqSource {
             .map_err(|e| did_not_open(&label, &e))?;
         cpal_src.start().map_err(|e| did_not_open(&label, &e))?;
         AudioIqSource::live(Box::new(cpal_src), label, DEVICE_STALL_TIMEOUT)
-=======
-        let mut cpal_src = coppa_audio::CpalSource::from_device(device, native_rate, 8192)?;
-        cpal_src.start()?;
-        AudioIqSource::live(Box::new(cpal_src), DEVICE_STALL_TIMEOUT)
->>>>>>> 73a7bf64bb59a2838a29becdfb4418b0fd6ae277
     }
 
     /// Open a WAV file, replayed as an audio source (soak harness / `listen
@@ -388,14 +347,7 @@ impl AudioIqSource {
                 return Ok(got);
             }
             if started.elapsed() >= live.stall_timeout {
-<<<<<<< HEAD
                 return Err(no_samples(&live.label, live.stall_timeout));
-=======
-                bail!(
-                    "audio input delivered no samples in {} s at {TARGET_RATE_HZ} Hz",
-                    live.stall_timeout.as_secs_f64()
-                );
->>>>>>> 73a7bf64bb59a2838a29becdfb4418b0fd6ae277
             }
             std::thread::sleep(DEVICE_POLL_INTERVAL);
         }
@@ -406,7 +358,6 @@ impl AudioIqSource {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-<<<<<<< HEAD
     use std::sync::{Arc, Mutex};
 
     /// A fake capture ring with the semantics of coppa's `CpalSource`: each
@@ -415,27 +366,13 @@ mod tests {
     /// ring forever, like a callback that never fires.
     struct ScriptedRing {
         script: VecDeque<(usize, f32)>,
-=======
-
-    /// A fake capture ring with the semantics of coppa's `CpalSource`: each
-    /// read pops the next scripted sample count (0 = empty ring); an
-    /// exhausted script reads as an empty ring forever, like a callback
-    /// that never fires.
-    struct ScriptedRing {
-        script: VecDeque<usize>,
->>>>>>> 73a7bf64bb59a2838a29becdfb4418b0fd6ae277
     }
 
     impl AudioSource for ScriptedRing {
         fn read(&mut self, buf: &mut [f32]) -> Result<usize> {
-<<<<<<< HEAD
             let (count, value) = self.script.pop_front().unwrap_or((0, 0.0));
             let n = count.min(buf.len());
             buf[..n].fill(value);
-=======
-            let n = self.script.pop_front().unwrap_or(0).min(buf.len());
-            buf[..n].fill(0.5);
->>>>>>> 73a7bf64bb59a2838a29becdfb4418b0fd6ae277
             Ok(n)
         }
         fn sample_rate(&self) -> u32 {
@@ -449,7 +386,6 @@ mod tests {
         }
     }
 
-<<<<<<< HEAD
     fn scripted(script: &[(usize, f32)], stall: Duration) -> AudioIqSource {
         let ring = ScriptedRing {
             script: script.iter().copied().collect(),
@@ -465,31 +401,19 @@ mod tests {
             Box::new(move |name: &str| sink.lock().unwrap().push(name.to_string())),
             seen,
         )
-=======
-    fn scripted(script: &[usize], stall: Duration) -> AudioIqSource {
-        let ring = ScriptedRing {
-            script: script.iter().copied().collect(),
-        };
-        AudioIqSource::live(Box::new(ring), stall).unwrap()
->>>>>>> 73a7bf64bb59a2838a29becdfb4418b0fd6ae277
     }
 
     #[test]
     fn a_live_device_waits_out_an_empty_capture_ring() {
-<<<<<<< HEAD
         let mut aiq = scripted(
             &[(0, 0.0), (0, 0.0), (0, 0.0), (480, 0.5)],
             Duration::from_secs(1),
         );
-=======
-        let mut aiq = scripted(&[0, 0, 0, 480], Duration::from_secs(1));
->>>>>>> 73a7bf64bb59a2838a29becdfb4418b0fd6ae277
         let mut buf = vec![Complex32::new(0.0, 0.0); 1024];
         assert_eq!(aiq.read(&mut buf).unwrap(), 480);
     }
 
     #[test]
-<<<<<<< HEAD
     fn a_live_device_that_never_delivers_names_itself_the_rate_and_the_hint() {
         let mut aiq = scripted(&[], Duration::from_millis(30));
         let mut buf = vec![Complex32::new(0.0, 0.0); 1024];
@@ -499,7 +423,9 @@ mod tests {
             "{err}"
         );
         assert!(err.ends_with(audio_input_hint()), "{err}");
-=======
+    }
+
+    #[test]
     fn a_live_device_that_never_delivers_fails_within_its_stall_timeout() {
         let stall = Duration::from_millis(50);
         let mut aiq = scripted(&[], stall);
@@ -507,16 +433,14 @@ mod tests {
         let started = Instant::now();
         let err = aiq.read(&mut buf).unwrap_err().to_string();
         let elapsed = started.elapsed();
-        assert!(err.contains("delivered no samples"), "{err}");
-        assert_eq!(
-            err,
-            "audio input delivered no samples in 0.05 s at 48000 Hz"
+        assert!(
+            err.contains("delivered no samples in 0.05 s at 48000 Hz"),
+            "{err}"
         );
         assert!(
             elapsed >= stall && elapsed < Duration::from_secs(1),
             "elapsed={elapsed:?}"
         );
->>>>>>> 73a7bf64bb59a2838a29becdfb4418b0fd6ae277
     }
 
     #[test]
@@ -526,7 +450,6 @@ mod tests {
         assert_eq!(aiq.read(&mut []).unwrap(), 0);
         assert!(started.elapsed() < Duration::from_secs(1));
     }
-<<<<<<< HEAD
 
     #[test]
     fn digital_silence_notice_fires_once_after_two_seconds_of_exact_zeros() {
@@ -632,8 +555,6 @@ mod tests {
             "did not open at 48000 Hz: query its default input config: not available -- "
         ));
     }
-=======
->>>>>>> 73a7bf64bb59a2838a29becdfb4418b0fd6ae277
 
     #[test]
     fn converts_real_samples_to_analytic_iq() {
