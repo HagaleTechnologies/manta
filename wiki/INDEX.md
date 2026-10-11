@@ -45,4 +45,8 @@
 - [How do I list devices and check whether samples arrive?](../docs/DECISIONS/2026-10-10-man125-source-diagnostics.md) — MAN-125: device identities, source-only measurement, delivered stream rate and passband quartiles.
 - [Why does an audio input fail, and what does `decode` do without a sidecar?](../docs/DECISIONS/2026-10-11-man131-actionable-errors.md) — MAN-131: live audio reads wait for samples (5 s stall error naming the device, 48000 Hz and a macOS microphone-permission hint), a digital-silence warning, port-conflict messages pinned for all three listeners, and `decode`'s missing-sidecar warning plus `--center-freq-hz`.
 - [Where do a JSON spot's `deGrid`/`deLat`/`deLon` come from?](../docs/DECISIONS/2026-10-11-man138-station-location.md) — MAN-138: the operator's `[server].operator_grid`/`operator_lat`/`operator_lon`, `null` when unset, never a `cty.dat` centroid.
+<<<<<<< HEAD
 - [How does the Docker image pick its config and report health?](../docs/DECISIONS/2026-10-11-man81-docker-config-mount-and-healthcheck.md) — MAN-81: a bare `docker run` runs `/etc/manta/manta.toml` (or `MANTA_CONFIG`), else `--help`; arguments pass through; `HEALTHCHECK` runs `manta health`, which reads the daemon's own config for the metrics port (a fixed-port curl misses a TOML-set port); `linux/arm/v7` image added.
+=======
+- [How do I replay a recording slowly enough for a client to watch it?](../docs/DECISIONS/2026-10-10-man269-paced-looping-replay.md) — MAN-269: `run --realtime` paces a file replay to the recording's own clock and `--loop` keeps it playing, so a hardware-free `manta gen v1` replay reaches a telnet client; IQ WAVs over 10 MS/s are refused at open.
+>>>>>>> 865118a94d83b81af829245ae2716231cf0fdcf6
