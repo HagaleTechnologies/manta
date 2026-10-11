@@ -15,6 +15,7 @@ Add a row here in the same change that adds a record:
 | 2026-10-11 | MAN-149 | [MAN-149: config, metrics and spot-schema references, and a docs index](2026-10-11-man149-docs-reference-and-index.md) |
 | 2026-10-11 | MAN-138 | [MAN-138: a JSON spot's `deGrid`/`deLat`/`deLon` are the configured station position](2026-10-11-man138-station-location.md) |
 | 2026-10-11 | MAN-131 | [MAN-131: errors say what to check next](2026-10-11-man131-actionable-errors.md) |
+| 2026-10-10 | MAN-270 | [MAN-270: command output style — human units, stdout/stderr routing, one-line escaped errors](2026-10-10-man270-cli-output-style.md) |
 | 2026-10-10 | MAN-269 | [MAN-269: paced and looping file replay](2026-10-10-man269-paced-looping-replay.md) |
 | 2026-10-10 | MAN-126 | [MAN-126: `manta doctor` checks the whole setup and names each failing check](2026-10-10-man126-doctor-setup-checks.md) |
 | 2026-10-10 | MAN-92 | [MAN-92: telnet replies for unknown commands, `sh/version`, scoped `sh/dx`](2026-10-10-man92-telnet-commands.md) |
