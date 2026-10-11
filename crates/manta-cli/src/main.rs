@@ -10,11 +10,14 @@ use std::path::{Path, PathBuf};
 
 mod bench;
 mod build_info;
+mod calibrate_cmd;
 mod clock_check;
 mod config;
 mod config_cmd;
+mod config_edit;
 mod devices;
 mod doctor_checks;
+mod fmt;
 mod logging;
 mod reconnect;
 mod reload;
@@ -192,9 +195,10 @@ enum Command {
         device: Option<String>,
         /// Replay a WAV file instead of listening to a live device.
         ///
-        /// Decoded as fast as the machine manages, not in real time, so a
-        /// 60-second file usually finishes sooner than that. Useful for
-        /// demos and repeatable testing.
+        /// Decoded as fast as the machine manages, so a 60-second file usually
+        /// finishes sooner than that; add --realtime to replay it at its own
+        /// pace, or --loop to keep it playing. Useful for demos and repeatable
+        /// testing.
         #[arg(long, conflicts_with = "device", help_heading = "Audio input")]
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
@@ -313,6 +317,29 @@ enum Command {
         /// told apart from the WAV header alone, so say which you have.
         #[arg(long)]
         source_iq: bool,
+        /// Replay the file at the recording's own pace instead of as fast as
+        /// possible.
+        ///
+        /// A 120-second file takes 120 seconds, so telnet and JSON clients have
+        /// time to connect and watch spots arrive. The decoded output is the same,
+        /// byte for byte, as an unpaced replay; only its timing changes. Only for
+        /// file replay: a live receiver already runs in real time. Also set by
+        /// input.realtime in the config file.
+        // No `requires = "source"`: the file source can come from the config
+        // file, so the check runs after `resolve` (MAN-269 D4).
+        #[arg(long)]
+        realtime: bool,
+        /// Start the file again from the beginning each time it ends, until
+        /// stopped.
+        ///
+        /// Implies --realtime. Keeps a short recording playing for a demo; stop it
+        /// with Ctrl-C or SIGTERM. The jump from the last sample back to the first
+        /// is not smoothed, and a station already spotted is not spotted again for
+        /// 10 minutes, so a looped recording yields a fresh spot about every 10
+        /// minutes (type sh/dx on the telnet port to list earlier ones). Only for
+        /// file replay. Also set by input.loop in the config file.
+        #[arg(long = "loop")]
+        loop_replay: bool,
         /// Print each decode as a JSON object, one per line, instead of
         /// plain text.
         #[arg(long, help_heading = "Output")]
@@ -741,6 +768,192 @@ enum Command {
         json: bool,
         #[command(flatten)]
         filters: FilterOpts,
+    },
+    /// Measure the receiver's frequency error against a known signal.
+    ///
+    /// Listens for --duration seconds to a carrier whose frequency is known
+    /// exactly -- a time-signal station (WWV, WWVH, BPM, RWM) or an NCDXF
+    /// beacon -- and reports the freq_correction_ppm that corrects the
+    /// receiver. It picks a reference inside the receiver's passband by
+    /// itself; --tune-hz points the configured receiver at one, and
+    /// --reference-hz names any other carrier you know. Offers to save the
+    /// value to the config file.
+    // MAN-127: see calibrate_cmd.rs and
+    // docs/DECISIONS/2026-10-11-man127-calibrate-command.md. The source flag
+    // block is copied from `Doctor`, as run/soak/doctor each copy it.
+    Calibrate {
+        /// How long to measure, in seconds (10 to 3600). NCDXF beacons take
+        /// turns on each frequency, so give them 180.
+        #[arg(long, default_value_t = 60)]
+        duration: u64,
+        /// Measure against this carrier, in Hz, instead of the built-in list.
+        /// Use only a signal whose frequency you know to a fraction of a
+        /// hertz.
+        #[arg(long, value_parser = parse_reference_hz)]
+        reference_hz: Option<f64>,
+        /// How far from the reference to look, in parts per million (1 to
+        /// 1000). Widen it for a receiver without a temperature-compensated
+        /// oscillator.
+        #[arg(long, default_value_t = manta_engine::calibrate::DEFAULT_SEARCH_PPM, value_parser = parse_search_ppm)]
+        search_ppm: f64,
+        /// Retune the configured receiver to this centre frequency, in Hz,
+        /// for this measurement only. KiwiSDR, SoapySDR and HPSDR sources.
+        /// Keep the reference 1 to 2 kHz from the centre, e.g. 9998500 for
+        /// the 10 MHz time signal.
+        #[arg(long, value_parser = parse_tune_hz)]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(conflicts_with_all = ["kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(conflicts_with_all = ["kiwi_host", "hpsdr_host"]))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(conflicts_with_all = ["kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(
+            not(any(feature = "hpsdr", feature = "soapy")),
+            arg(conflicts_with = "kiwi_host")
+        )]
+        tune_hz: Option<f64>,
+        /// Sound-card input device; matched by substring. Defaults to the
+        /// system default input.
+        #[arg(long, conflicts_with = "source", help_heading = "Audio input")]
+        device: Option<String>,
+        /// Replay a WAV file instead of listening to a live device.
+        ///
+        /// Decoded as fast as the machine manages, not in real time, so a
+        /// 60-second file usually finishes sooner than that. Useful for
+        /// demos and repeatable testing.
+        #[arg(long, conflicts_with = "device", help_heading = "Audio input")]
+        source: Option<PathBuf>,
+        /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
+        #[arg(help_heading = "KiwiSDR source")]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
+        kiwi_host: Option<String>,
+        /// KiwiSDR receiver port.
+        #[arg(
+            long,
+            default_value = "8073",
+            requires = "kiwi_host",
+            help_heading = "KiwiSDR source"
+        )]
+        kiwi_port: u16,
+        /// Receiver centre frequency, in Hz. Required with --kiwi-host.
+        #[arg(
+            long = "kiwi-freq-hz",
+            alias = "kiwi-freq",
+            requires = "kiwi_host",
+            help_heading = "KiwiSDR source"
+        )]
+        kiwi_freq_hz: Option<f64>,
+        /// KiwiSDR password. Leave empty for public receivers that do not
+        /// ask for one.
+        #[arg(
+            long,
+            requires = "kiwi_host",
+            default_value = "",
+            help_heading = "KiwiSDR source"
+        )]
+        kiwi_password: String,
+        /// SoapySDR device arguments, e.g. "driver=rtlsdr".
+        ///
+        /// Requires --soapy-freq-hz and --soapy-rate-hz. Available only in
+        /// builds made with the `soapy` feature.
+        #[cfg(feature = "soapy")]
+        #[arg(help_heading = "SoapySDR source")]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        soapy_driver: Option<String>,
+        /// Receiver centre frequency, in Hz. Required with --soapy-driver.
+        #[cfg(feature = "soapy")]
+        #[arg(
+            long = "soapy-freq-hz",
+            alias = "soapy-freq",
+            requires = "soapy_driver",
+            help_heading = "SoapySDR source"
+        )]
+        soapy_freq_hz: Option<f64>,
+        /// Sample rate, in Hz. Required with --soapy-driver.
+        #[cfg(feature = "soapy")]
+        #[arg(
+            long = "soapy-rate-hz",
+            alias = "soapy-rate",
+            requires = "soapy_driver",
+            help_heading = "SoapySDR source"
+        )]
+        soapy_rate_hz: Option<f64>,
+        /// Receiver gain, in dB. Omit to let the device use AGC.
+        #[cfg(feature = "soapy")]
+        #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
+        soapy_gain: Option<f64>,
+        /// HPSDR/Hermes device hostname or IP address.
+        ///
+        /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Available only in
+        /// builds made with the `hpsdr` feature.
+        #[cfg(feature = "hpsdr")]
+        #[arg(help_heading = "HPSDR source")]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        hpsdr_host: Option<String>,
+        /// HPSDR/Hermes control port.
+        #[cfg(feature = "hpsdr")]
+        #[arg(
+            long,
+            default_value_t = manta_input::hpsdr::CONTROL_PORT,
+            requires = "hpsdr_host",
+            help_heading = "HPSDR source"
+        )]
+        hpsdr_port: u16,
+        /// Receiver centre frequency, in Hz. Required with --hpsdr-host.
+        #[cfg(feature = "hpsdr")]
+        #[arg(
+            long = "hpsdr-freq-hz",
+            alias = "hpsdr-freq",
+            requires = "hpsdr_host",
+            value_parser = parse_hpsdr_freq_hz,
+            help_heading = "HPSDR source"
+        )]
+        hpsdr_freq_hz: Option<f64>,
+        /// Sample rate, in Hz. Required with --hpsdr-host.
+        #[cfg(feature = "hpsdr")]
+        #[arg(
+            long = "hpsdr-rate-hz",
+            alias = "hpsdr-rate",
+            requires = "hpsdr_host",
+            value_parser = parse_hpsdr_rate_hz,
+            help_heading = "HPSDR source"
+        )]
+        hpsdr_rate_hz: Option<f64>,
+        /// Decimate the source to this sample rate, in Hz, before decoding.
+        ///
+        /// Must divide the source's own rate by a power of two, and the
+        /// result must itself be a rate the channelizer supports. Omit to
+        /// decode at the source's native rate.
+        #[arg(long, value_parser = parse_capture_rate_hz)]
+        capture_rate_hz: Option<f64>,
+        /// Read --source as a raw complex-IQ recording rather than ordinary
+        /// mono audio.
+        ///
+        /// Without this, --source is taken as mono real audio at 48000 Hz.
+        /// A stereo audio recording and a two-channel IQ capture cannot be
+        /// told apart from the WAV header alone, so say which you have.
+        #[arg(long)]
+        source_iq: bool,
+        /// Radio dial frequency, in Hz. See `run --dial-freq-hz`; without it
+        /// an audio source's reported frequencies, and the report's
+        /// `center_freq_hz`, are baseband offsets.
+        #[arg(long, value_parser = parse_dial_freq_hz, help_heading = "Audio input")]
+        dial_freq_hz: Option<f64>,
+        /// TOML config file whose [input] table names the receiver. The
+        /// measured value is saved to that table.
+        ///
+        /// Falls back to $MANTA_CONFIG. Flags override the file, and
+        /// MANTA_INPUT_<KEY> environment variables sit between the two.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Save the measured value to the config file without asking.
+        #[arg(long)]
+        write: bool,
+        /// Print the report as one JSON object. Never asks before saving.
+        #[arg(long, help_heading = "Output")]
+        json: bool,
     },
     /// Check or create a config file, without starting anything.
     #[command(subcommand)]
@@ -1269,9 +1482,7 @@ const MIN_CAPTURE_RATE_HZ: f64 = 1_000.0;
 /// of obviously-bad input (e.g. a negative or degenerately tiny value that
 /// would otherwise reach `Channelizer::new` with `hop == 0` and hang).
 fn parse_capture_rate_hz(s: &str) -> std::result::Result<f64, String> {
-    let hz: f64 = s
-        .parse()
-        .map_err(|e| format!("invalid --capture-rate-hz {s:?}: {e}"))?;
+    let hz: f64 = s.parse().map_err(|e| format!("{e}"))?;
     check_capture_rate_hz("--capture-rate-hz", hz)
 }
 
@@ -1291,9 +1502,7 @@ fn check_capture_rate_hz(name: &str, hz: f64) -> std::result::Result<f64, String
 /// same validation `manta_spot::calibration_factor_from_ppm` applies
 /// (MAN-29 review).
 fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
-    let ppm: f64 = s
-        .parse()
-        .map_err(|e| format!("invalid --freq-correction-ppm {s:?}: {e}"))?;
+    let ppm: f64 = s.parse().map_err(|e| format!("{e}"))?;
     check_freq_correction_ppm(ppm)
 }
 
@@ -1451,7 +1660,7 @@ fn session_nonce_for_replay_path(path: &std::path::Path) -> Result<u128> {
 /// to the actual recording start (Codex review, PR #161).
 fn parse_capture_start(s: &str) -> std::result::Result<i64, String> {
     manta_testkit::oracle::parse_utc_timestamp(s)
-        .map_err(|e| format!("invalid --capture-start {s:?}: {e}"))
+        .map_err(|e| manta_server::status_doc::escape_for_terminal(&e.to_string()))
 }
 
 // Codex review, PR #161 round 2: a negative --window-s makes run_oracle's
@@ -1461,9 +1670,7 @@ fn parse_capture_start(s: &str) -> std::result::Result<i64, String> {
 // function's doc comment -- but a CLI-level rejection gives a clap usage
 // error instead of a bail! from inside the command's execution path).
 fn parse_window_s(s: &str) -> std::result::Result<f64, String> {
-    let window_s: f64 = s
-        .parse()
-        .map_err(|e| format!("invalid --window-s {s:?}: {e}"))?;
+    let window_s: f64 = s.parse().map_err(|e| format!("{e}"))?;
     if !window_s.is_finite() || window_s <= 0.0 {
         return Err(format!(
             "--window-s must be finite and positive, got {window_s}"
@@ -1473,10 +1680,36 @@ fn parse_window_s(s: &str) -> std::result::Result<f64, String> {
 }
 
 fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
+    let hz: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    check_dial_freq_hz("--dial-freq-hz", hz)
+}
+
+// MAN-127: `calibrate`'s frequency/ppm flags.
+fn parse_reference_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
-        .map_err(|e| format!("invalid --dial-freq-hz {s:?}: {e}"))?;
-    check_dial_freq_hz("--dial-freq-hz", hz)
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+    check_dial_freq_hz("--reference-hz", hz)
+}
+
+fn parse_tune_hz(s: &str) -> std::result::Result<f64, String> {
+    let hz: f64 = s
+        .parse()
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+    check_dial_freq_hz("--tune-hz", hz)
+}
+
+fn parse_search_ppm(s: &str) -> std::result::Result<f64, String> {
+    use manta_engine::calibrate::{MAX_SEARCH_PPM, MIN_SEARCH_PPM};
+    let ppm: f64 = s
+        .parse()
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+    if !ppm.is_finite() || !(MIN_SEARCH_PPM..=MAX_SEARCH_PPM).contains(&ppm) {
+        return Err(format!(
+            "--search-ppm must be between {MIN_SEARCH_PPM} and {MAX_SEARCH_PPM}, got {s}"
+        ));
+    }
+    Ok(ppm)
 }
 
 /// `decode --center-freq-hz` (MAN-131). The parse error is just the
@@ -1532,9 +1765,7 @@ const _: () = assert!(HPSDR_CONTROL_PORT == manta_input::hpsdr::CONTROL_PORT);
 /// `parse_dial_freq_hz`'s pattern.
 #[cfg(feature = "hpsdr")]
 fn parse_hpsdr_rate_hz(s: &str) -> std::result::Result<f64, String> {
-    let hz: f64 = s
-        .parse()
-        .map_err(|e| format!("invalid --hpsdr-rate-hz {s:?}: {e}"))?;
+    let hz: f64 = s.parse().map_err(|e| format!("{e}"))?;
     check_hpsdr_rate_hz("--hpsdr-rate-hz", hz)
 }
 
@@ -1558,9 +1789,7 @@ fn check_hpsdr_rate_hz(name: &str, hz: f64) -> std::result::Result<f64, String> 
 /// every emitted spot's frequency field).
 #[cfg(feature = "hpsdr")]
 fn parse_hpsdr_freq_hz(s: &str) -> std::result::Result<f64, String> {
-    let hz: f64 = s
-        .parse()
-        .map_err(|e| format!("invalid --hpsdr-freq-hz {s:?}: {e}"))?;
+    let hz: f64 = s.parse().map_err(|e| format!("{e}"))?;
     check_hpsdr_freq_hz("--hpsdr-freq-hz", hz)
 }
 
@@ -1594,9 +1823,7 @@ const MAX_REPLAY_EPOCH_SECS: i64 = 4_102_444_800;
 /// recording tool's own metadata, `date +%s`) can produce Unix seconds
 /// directly.
 fn parse_replay_epoch(s: &str) -> std::result::Result<i64, String> {
-    let secs: i64 = s
-        .parse()
-        .map_err(|e| format!("invalid --replay-epoch {s:?}: {e}"))?;
+    let secs: i64 = s.parse().map_err(|e| format!("{e}"))?;
     check_replay_epoch("--replay-epoch", secs)
 }
 
@@ -2648,16 +2875,18 @@ fn start_spot_server(
                 .await
                 .with_context(|| {
                     format!(
-                        "binding the telnet server (bind_addr = {:?}, telnet_port = {})",
-                        cfg.bind_addr, cfg.telnet_port
+                        "binding the telnet server (bind_addr = {}, telnet_port = {})",
+                        fmt::quoted(&cfg.bind_addr),
+                        cfg.telnet_port
                     )
                 })?;
         let json_listener = tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.json_port))
             .await
             .with_context(|| {
                 format!(
-                    "binding the JSON server (bind_addr = {:?}, json_port = {})",
-                    cfg.bind_addr, cfg.json_port
+                    "binding the JSON server (bind_addr = {}, json_port = {})",
+                    fmt::quoted(&cfg.bind_addr),
+                    cfg.json_port
                 )
             })?;
         let metrics_listener =
@@ -2665,8 +2894,9 @@ fn start_spot_server(
                 .await
                 .with_context(|| {
                     format!(
-                        "binding the metrics server (metrics_bind_addr = {:?}, metrics_port = {})",
-                        cfg.metrics_bind_addr, cfg.metrics_port
+                        "binding the metrics server (metrics_bind_addr = {}, metrics_port = {})",
+                        fmt::quoted(&cfg.metrics_bind_addr),
+                        cfg.metrics_port
                     )
                 })?;
         let metrics_addr = metrics_listener.local_addr()?;
@@ -2923,6 +3153,9 @@ struct CliOverrides {
     device: Option<String>,
     source: Option<PathBuf>,
     source_iq: bool,
+    /// `run --realtime`/`--loop` (MAN-269); always false for soak/doctor.
+    realtime: bool,
+    loop_replay: bool,
     kiwi: KiwiOpts,
     #[cfg(feature = "soapy")]
     soapy: SoapyOpts,
@@ -2947,6 +3180,8 @@ impl CliOverrides {
             device: None,
             source: None,
             source_iq: false,
+            realtime: false,
+            loop_replay: false,
             kiwi: KiwiOpts {
                 host: None,
                 port: 8073,
@@ -3058,9 +3293,30 @@ fn resolve_spot(
     }
 }
 
+/// How a file replay is delivered (MAN-269): `paced` plays it at the
+/// recording's own clock, `looped` reopens it at each end. Only `run`
+/// applies it, and only to `LiveSourceSpec::File`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReplayMode {
+    paced: bool,
+    looped: bool,
+}
+
+impl ReplayMode {
+    /// `--loop` implies `--realtime` (D2): an unpaced loop would decode
+    /// endlessly and stamp spots ever further into the future.
+    fn from_flags(realtime: bool, looped: bool) -> Self {
+        ReplayMode {
+            paced: realtime || looped,
+            looped,
+        }
+    }
+}
+
 /// Everything a live command needs after CLI > env > file > default.
 struct Resolved {
     spec: LiveSourceSpec,
+    replay: ReplayMode,
     freq_correction_ppm: f64,
     dial_freq_hz: Option<f64>,
     capture_rate_hz: Option<f64>,
@@ -3068,6 +3324,9 @@ struct Resolved {
     spot: SpotResolved,
     /// Printed to stderr by the caller, never stdout.
     notes: Vec<String>,
+    /// The flag that replaced a typed `[input]` from the file, if one did:
+    /// that file's receiver is then not the one being opened (MAN-127).
+    replaced_file_source: Option<&'static str>,
 }
 
 /// D6: merges the command line over the loaded file + environment layer.
@@ -3088,8 +3347,17 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
         cli.capture_rate_hz,
         cli.replay_epoch,
     );
+    let mut replaced_file_source = None;
+    let (cli_realtime, cli_loop) = (cli.realtime, cli.loop_replay);
+    // MAN-269 D3: a config `type = "file"` source contributes its own
+    // realtime/loop only when no CLI flag selects the source.
+    let file_replay = match (cli.source_selector(), &loaded.input.source) {
+        (None, Some(source)) => Some(source),
+        _ => None,
+    };
     let spec = match (cli.source_selector(), &loaded.input.source) {
         (Some(flag), Some(file_source)) => {
+            replaced_file_source = Some(flag);
             // A typed [input] describes one receiver: its ppm and dial
             // belong to it, not to whatever the command line names instead.
             notes.push(format!(
@@ -3104,8 +3372,10 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
         (Some(_), None) | (None, None) => cli.into_spec(),
         (None, Some(file_source)) => spec_from_file(file_source, cli.source_iq)?,
     };
+    let replay = resolve_replay_mode(cli_realtime, cli_loop, file_replay, &spec)?;
     Ok(Resolved {
         spec,
+        replay,
         freq_correction_ppm: freq_correction_ppm
             .or(shared.freq_correction_ppm)
             .unwrap_or(0.0),
@@ -3114,6 +3384,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
         replay_epoch: replay_epoch.or(shared.replay_epoch),
         spot,
         notes,
+        replaced_file_source,
     })
 }
 
@@ -3122,7 +3393,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
 fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Result<LiveSourceSpec> {
     Ok(match source {
         config::SourceFromFile::Audio { device } => LiveSourceSpec::AudioDevice(device.clone()),
-        config::SourceFromFile::File { path, iq } => LiveSourceSpec::File {
+        config::SourceFromFile::File { path, iq, .. } => LiveSourceSpec::File {
             path: path.clone(),
             source_iq: *iq || cli_source_iq,
         },
@@ -3169,6 +3440,72 @@ fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Resul
         config::SourceFromFile::Hpsdr { .. } => {
             bail!("input.type = \"hpsdr\" needs a manta built with --features hpsdr")
         }
+    })
+}
+
+/// MAN-269 D3/D4: the CLI's `--realtime`/`--loop` ORed with the config file
+/// source's `realtime`/`loop` (`file_source` is `Some` only when no CLI flag
+/// selected the source), then refused unless the resolved source is a file.
+/// Runs inside `prepare_live`, before any source I/O.
+fn resolve_replay_mode(
+    cli_realtime: bool,
+    cli_loop: bool,
+    file_source: Option<&config::SourceFromFile>,
+    spec: &LiveSourceSpec,
+) -> Result<ReplayMode> {
+    let (file_realtime, file_loop) = match file_source {
+        Some(config::SourceFromFile::File {
+            realtime, looped, ..
+        }) => (*realtime, *looped),
+        _ => (false, false),
+    };
+    let replay = ReplayMode::from_flags(cli_realtime || file_realtime, cli_loop || file_loop);
+    if replay != ReplayMode::default() && !matches!(spec, LiveSourceSpec::File { .. }) {
+        // `validate_input` already refuses realtime/loop on a non-file
+        // [input], so only a CLI flag can get here.
+        if cli_realtime {
+            bail!(
+                "--realtime only applies to a file replay (--source, or input.type = \"file\"); \
+                 a live source already runs in real time"
+            );
+        }
+        bail!(
+            "--loop only applies to a file replay (--source, or input.type = \"file\"); a live \
+             source never reaches an end to loop from"
+        );
+    }
+    Ok(replay)
+}
+
+/// `soak`/`doctor`'s note for config-file realtime/loop they do not apply
+/// (MAN-269 D5); `None` when neither is set.
+fn replay_mode_ignored_note(command: &str, replay: ReplayMode, origin: &str) -> Option<String> {
+    (replay != ReplayMode::default()).then(|| {
+        format!(
+            "note: {command} replays files as fast as it can; ignoring \
+             input.realtime/input.loop from {origin}"
+        )
+    })
+}
+
+/// Wraps an opened file replay for `mode` (MAN-269 D8): the loop sits inside
+/// the pacing, so one clock spans every pass. `reopen` opens each later pass.
+/// The default mode returns `first` unchanged.
+fn wrap_file_replay(
+    first: Box<dyn IqSource>,
+    mode: ReplayMode,
+    label: String,
+    reopen: manta_input::Reopen,
+) -> Result<Box<dyn IqSource>> {
+    let src: Box<dyn IqSource> = if mode.looped {
+        Box::new(manta_input::LoopingSource::new(label, first, reopen))
+    } else {
+        first
+    };
+    Ok(if mode.paced {
+        Box::new(manta_input::PacedSource::new(src)?)
+    } else {
+        src
     })
 }
 
@@ -3253,8 +3590,11 @@ fn bundled_cty_warning(cty_overridden: bool, now: std::time::SystemTime) -> Opti
     ))
 }
 
-/// Shared typed config and source resolution, with no pipeline assets or I/O.
+/// Shared typed config and source resolution, with no pipeline assets or I/O:
+/// the part of `prepare_live` that `check` and `calibrate` share.
 struct SourcePrepared {
+    config_path: Option<PathBuf>,
+    loaded: config::Loaded,
     resolved: Resolved,
 }
 
@@ -3266,7 +3606,11 @@ fn prepare_source(cli: CliOverrides, config_flag: Option<PathBuf>) -> Result<Sou
     for note in &resolved.notes {
         logging::note(note);
     }
-    Ok(SourcePrepared { resolved })
+    Ok(SourcePrepared {
+        config_path,
+        loaded,
+        resolved,
+    })
 }
 
 fn prepare_live(
@@ -3379,10 +3723,10 @@ fn resolve_status_addr(
         use std::net::ToSocketAddrs;
         let addrs: Vec<_> = addr
             .to_socket_addrs()
-            .with_context(|| format!("invalid --addr {addr:?}"))?
+            .with_context(|| format!("invalid --addr {}", fmt::quoted(addr)))?
             .collect();
         if addrs.is_empty() {
-            bail!("--addr {addr:?} resolved to no addresses");
+            bail!("--addr {} resolved to no addresses", fmt::quoted(addr));
         }
         return Ok(addrs);
     }
@@ -3411,10 +3755,15 @@ fn resolve_status_addr(
                 use std::net::ToSocketAddrs;
                 let addrs: Vec<_> = (other, server.metrics_port)
                     .to_socket_addrs()
-                    .with_context(|| format!("resolving server.metrics_bind_addr {other:?}"))?
+                    .with_context(|| {
+                        format!("resolving server.metrics_bind_addr {}", fmt::quoted(other))
+                    })?
                     .collect();
                 if addrs.is_empty() {
-                    bail!("server.metrics_bind_addr {other:?} resolved to no addresses");
+                    bail!(
+                        "server.metrics_bind_addr {} resolved to no addresses",
+                        fmt::quoted(other)
+                    );
                 }
                 Ok(addrs)
             }
@@ -3524,7 +3873,7 @@ fn run_status(
 /// third case -- `2`, "could not reach or parse the daemon's status at
 /// all" -- is returned directly by `Command::Status`'s handler, since it
 /// never gets as far as a `StatusDoc` to pass here.)
-fn status_exit_code(doc: &manta_server::status_doc::StatusDoc) -> i32 {
+fn status_exit_code(doc: &manta_server::status_doc::StatusDoc) -> u8 {
     use manta_server::metrics::OverallUplinkHealth;
     match doc.uplink.health {
         OverallUplinkHealth::Ok | OverallUplinkHealth::Disabled => 0,
@@ -3532,14 +3881,9 @@ fn status_exit_code(doc: &manta_server::status_doc::StatusDoc) -> i32 {
     }
 }
 
-/// What `Command::Status` prints to stderr before exiting 2. Not escaped
-/// here as a whole: local diagnostics such as a `--config` TOML error carry
-/// a multi-line source snippet that must stay readable. Peer-supplied text
-/// is escaped where it enters the error instead -- the status line in
-/// `fetch_status_inner`, serde_json's quoted values in `parse_status_doc`
-/// (Codex review, PR #95).
+/// Status uses the application error style while retaining exit code 2.
 fn status_failure_message(e: &anyhow::Error) -> String {
-    format!("manta status: {e:#}")
+    fmt::render_error(e)
 }
 
 /// Bounds a fetched status document's body size (MAN-44): a real status
@@ -3750,21 +4094,24 @@ fn invalid_status_doc(e: serde_json::Error) -> anyhow::Error {
     )
 }
 
-fn main() -> Result<()> {
-    let result = real_main();
-    if let Err(e) = &result {
-        // MAN-124: under --log-format json the error is a log record too,
-        // not Rust's plain `Error: …` line, whatever the level filter;
-        // exit status stays 1.
-        if logging::is_json() {
-            logging::fatal(format!("{e:#}").trim_end());
-            std::process::exit(1);
+fn main() -> std::process::ExitCode {
+    match run_command() {
+        Ok(code) => code,
+        Err(err) => {
+            // MAN-124: under --log-format json the error is a log record too,
+            // whatever the level filter; exit status stays 1. MAN-270: in
+            // text mode it is one escaped `error:` line.
+            if logging::is_json() {
+                logging::fatal(&fmt::cause_text(&err));
+            } else {
+                eprintln!("{}", fmt::render_error(&err));
+            }
+            std::process::ExitCode::FAILURE
         }
     }
-    result
 }
 
-fn real_main() -> Result<()> {
+fn run_command() -> Result<std::process::ExitCode> {
     warn_deprecations();
     match Cli::parse().command {
         Command::Devices { json } => std::process::exit(devices::run(json)?),
@@ -3772,7 +4119,7 @@ fn real_main() -> Result<()> {
             let code = match source_check::run(args) {
                 Ok(code) => code,
                 Err(error) => {
-                    eprintln!("error: {error:#}");
+                    eprintln!("{}", fmt::render_error(&error));
                     1
                 }
             };
@@ -3841,8 +4188,7 @@ fn real_main() -> Result<()> {
                 println!("{}", serde_json::to_string(&report)?);
             } else {
                 println!("{}", report.text);
-                eprintln!("freq_hz: {:.1}  wpm: {:?}", report.freq_hz, report.wpm);
-                eprintln!("spots: {}", report.spots.len());
+                eprintln!("{}", fmt::decode_summary(&report));
             }
         }
         Command::Oracle {
@@ -3891,18 +4237,19 @@ fn real_main() -> Result<()> {
                 "vr7" => manta_testkit::vectors::vr7(),
                 "vr8" => manta_testkit::vectors::vr8(),
                 other => bail!(
-                    "unknown vector {other:?} (available: v1-v6, vr1-vr5, vr6a, vr6b, vr7-vr8)"
+                    "unknown vector '{}' (available: v1-v6, vr1-vr5, vr6a, vr6b, vr7-vr8)",
+                    manta_server::status_doc::escape_for_terminal(other).replace('\'', "\\'")
                 ),
             };
             std::fs::create_dir_all(&out)?;
             let manifest = manta_testkit::vectors::write_fixture_set(&spec, &out)?;
             eprintln!(
-                "wrote {}/{{{}.wav,{}.json,{}.manifest.json}} (expected freq {:.1} Hz)",
+                "wrote {}/{{{}.wav,{}.json,{}.manifest.json}} (expected frequency {})",
                 out.display(),
                 spec.name,
                 spec.name,
                 spec.name,
-                manifest.expected_freq_hz
+                manta_server::human::khz(manifest.expected_freq_hz)
             );
         }
         Command::Run {
@@ -3930,6 +4277,8 @@ fn real_main() -> Result<()> {
             hpsdr_rate_hz,
             capture_rate_hz,
             source_iq,
+            realtime,
+            loop_replay,
             filters,
             json,
             decoded_text,
@@ -3954,6 +4303,8 @@ fn real_main() -> Result<()> {
                 device,
                 source,
                 source_iq,
+                realtime,
+                loop_replay,
                 kiwi: KiwiOpts {
                     host: kiwi_host,
                     port: kiwi_port,
@@ -4005,6 +4356,10 @@ fn real_main() -> Result<()> {
             config_cmd::reject_example_callsigns(&loaded)?;
             let spec = &resolved.spec;
             let dial_freq_hz = resolved.dial_freq_hz;
+            // The resolved (CLI > env > file) capture rate, for the first open
+            // and every reopen below: binding the CLI's raw value here dropped a
+            // config/env capture rate on a MAN-73 reconnect.
+            let capture_rate_hz = resolved.capture_rate_hz;
             // Needed to derive a recording-specific replay epoch/nonce.
             let replay_path = match spec {
                 LiveSourceSpec::File { path, .. } => Some(path.clone()),
@@ -4016,6 +4371,21 @@ fn real_main() -> Result<()> {
             // Servers start iff the resolved config has a [server] table
             // (D7); the guard runs after the load and before any source I/O.
             if needs_dial_freq(loaded.server.is_some(), has_rf_aware_source, dial_freq_hz) {
+                // MAN-269 review (P2): `is_rf_aware()` reads an IQ WAV's
+                // sidecar by opening it and maps any open error to "no RF
+                // frequency". For a file that exists, that error (an
+                // unsupported sample rate, a malformed header) is the real
+                // problem, so report it rather than asking for a dial
+                // frequency that would not help.
+                if let LiveSourceSpec::File {
+                    path,
+                    source_iq: true,
+                } = spec
+                {
+                    if path.exists() {
+                        manta_input::WavIqSource::open(path)?;
+                    }
+                }
                 bail!(
                     "--dial-freq-hz is required with --config when using a plain \
                      audio device or --source WAV file -- neither reports a real RF \
@@ -4043,7 +4413,7 @@ fn real_main() -> Result<()> {
                 reload::mask_sighup(libc::SIG_BLOCK)
                     .context("blocking SIGHUP on the decode thread")?;
             }
-            let first = spec.open(resolved.capture_rate_hz, dial_freq_hz)?;
+            let first = spec.open(capture_rate_hz, dial_freq_hz)?;
             let replay_epoch = resolved.replay_epoch;
 
             // MAN-122 review round 6 (P2): installed HERE -- before
@@ -4302,7 +4672,19 @@ fn real_main() -> Result<()> {
                 Box::new(wrapped)
             } else {
                 input_health = reconnect::InputHealthTotals::for_source(first.as_ref());
-                first
+                // MAN-269: `--realtime`/`--loop` pace and loop a file replay;
+                // every loop pass reopens through `spec.open`, so it gets a
+                // fresh decimator and the same dial override.
+                let reopen_spec = spec.clone();
+                let label = replay_path
+                    .as_ref()
+                    .map_or_else(String::new, |p| p.display().to_string());
+                wrap_file_replay(
+                    first,
+                    resolved.replay,
+                    label,
+                    Box::new(move || reopen_spec.open(capture_rate_hz, dial_freq_hz)),
+                )?
             };
 
             // MAN-56: a source's packet loss/malformed counters are
@@ -4437,15 +4819,7 @@ fn real_main() -> Result<()> {
                         println!("{}", serde_json::json!({ "spot": spot }));
                         return;
                     }
-                    println!(
-                        "SPOT: {} ({:?}) {:.1} Hz {:.0} dB {:.0} wpm conf={:.2}",
-                        spot.callsign,
-                        spot.spot_type,
-                        spot.freq_hz,
-                        spot.snr_db,
-                        spot.wpm,
-                        spot.confidence
-                    );
+                    println!("{}", fmt::spot_line(spot));
                 },
                 // MAN-122 review round 1: the live track gauge comes from
                 // `TrackManager`'s own lifecycle -- how many tracks are
@@ -4669,6 +5043,8 @@ fn real_main() -> Result<()> {
                     device,
                     source,
                     source_iq,
+                    realtime: false,
+                    loop_replay: false,
                     kiwi: KiwiOpts {
                         host: kiwi_host,
                         port: kiwi_port,
@@ -4708,14 +5084,17 @@ fn real_main() -> Result<()> {
                     loaded.origin
                 );
             }
+            if let Some(note) = replay_mode_ignored_note("soak", resolved.replay, &loaded.origin) {
+                eprintln!("{note}");
+            }
             let spec = &resolved.spec;
             warn_if_audio_source_has_no_rf_reference(spec.is_rf_aware(), resolved.dial_freq_hz);
             let src: Box<dyn IqSource> =
                 spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz)?;
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
-            eprintln!("{report:?}");
+            print!("{}", fmt::soak_report(&report));
             if !manta_engine::soak_passed(&report) {
-                std::process::exit(1);
+                return Ok(std::process::ExitCode::FAILURE);
             }
         }
         Command::Status {
@@ -4738,7 +5117,7 @@ fn real_main() -> Result<()> {
                 Ok(doc) => doc,
                 Err(e) => {
                     eprintln!("{}", status_failure_message(&e));
-                    std::process::exit(2);
+                    return Ok(std::process::ExitCode::from(2));
                 }
             };
             if json {
@@ -4746,7 +5125,7 @@ fn real_main() -> Result<()> {
             } else {
                 print!("{}", manta_server::status_doc::render_human(&doc));
             }
-            std::process::exit(status_exit_code(&doc));
+            return Ok(std::process::ExitCode::from(status_exit_code(&doc)));
         }
         Command::Doctor {
             duration,
@@ -4813,6 +5192,8 @@ fn real_main() -> Result<()> {
                     device,
                     source,
                     source_iq,
+                    realtime: false,
+                    loop_replay: false,
                     kiwi: KiwiOpts {
                         host: kiwi_host,
                         port: kiwi_port,
@@ -4846,6 +5227,10 @@ fn real_main() -> Result<()> {
                 config,
                 None,
             )?;
+            if let Some(note) = replay_mode_ignored_note("doctor", resolved.replay, &loaded.origin)
+            {
+                eprintln!("{note}");
+            }
             // MAN-126: named setup checks first, each printed as it is
             // known; the receiver and signal stages become check lines too,
             // so a failure is named rather than ending in a generic error.
@@ -4883,7 +5268,7 @@ fn real_main() -> Result<()> {
                         Ok(report) => {
                             if !json {
                                 println!();
-                                print_doctor_report(&report);
+                                print!("{}", fmt::doctor_report(&report));
                             }
                             Some(report)
                         }
@@ -4926,14 +5311,84 @@ fn real_main() -> Result<()> {
             use std::io::Write as _;
             std::io::stdout().flush()?;
             if doctor_checks::worst(&checks) == doctor_checks::Status::Fail {
-                std::process::exit(1);
+                return Ok(std::process::ExitCode::FAILURE);
             }
         }
+        Command::Calibrate {
+            duration,
+            reference_hz,
+            search_ppm,
+            tune_hz,
+            device,
+            source,
+            kiwi_host,
+            kiwi_port,
+            kiwi_freq_hz,
+            kiwi_password,
+            #[cfg(feature = "soapy")]
+            soapy_driver,
+            #[cfg(feature = "soapy")]
+            soapy_freq_hz,
+            #[cfg(feature = "soapy")]
+            soapy_rate_hz,
+            #[cfg(feature = "soapy")]
+            soapy_gain,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_host,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_port,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_freq_hz,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_rate_hz,
+            capture_rate_hz,
+            source_iq,
+            dial_freq_hz,
+            config,
+            write,
+            json,
+        } => calibrate_cmd::run(calibrate_cmd::CalibrateArgs {
+            duration_secs: duration,
+            reference_hz,
+            search_ppm,
+            tune_hz,
+            write,
+            json,
+            config,
+            cli: CliOverrides {
+                device,
+                source,
+                source_iq,
+                kiwi: KiwiOpts {
+                    host: kiwi_host,
+                    port: kiwi_port,
+                    freq: kiwi_freq_hz,
+                    password: kiwi_password,
+                },
+                #[cfg(feature = "soapy")]
+                soapy: SoapyOpts {
+                    driver: soapy_driver,
+                    freq: soapy_freq_hz,
+                    rate: soapy_rate_hz,
+                    gain: soapy_gain,
+                },
+                #[cfg(feature = "hpsdr")]
+                hpsdr: HpsdrOpts {
+                    host: hpsdr_host,
+                    port: hpsdr_port,
+                    freq: hpsdr_freq_hz,
+                    rate: hpsdr_rate_hz,
+                },
+                capture_rate_hz,
+                dial_freq_hz,
+                ..CliOverrides::none()
+            },
+        })?,
         Command::Config(ConfigCommand::Check { config }) => config_cmd::check(config)?,
         Command::Config(ConfigCommand::Init { out, force }) => config_cmd::init(&out, force)?,
         Command::Bench(BenchCommand::Sensitivity(args)) => bench::sensitivity(args)?,
     }
-    Ok(())
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 /// Which replaced CLI spelling the operator typed, if any.
@@ -4997,41 +5452,6 @@ fn warn_deprecations() {
             ),
         }
     }
-}
-
-/// Human-readable `manta doctor` summary. `--json` bypasses this entirely
-/// in favor of the raw `DoctorReport`.
-fn print_doctor_report(report: &manta_engine::DoctorReport) {
-    println!(
-        "source: {:.0} Hz sample rate, {:.1} Hz center, observed for {:.1}s",
-        report.sample_rate_hz,
-        report.center_freq_hz,
-        report.duration.as_secs_f64()
-    );
-    println!(
-        "tracks: {} promoted, {} TrackMeta updates, {} closed",
-        report.tracks_promoted, report.track_meta_count, report.tracks_closed
-    );
-    match (report.snr_db_min, report.snr_db_median, report.snr_db_max) {
-        (Some(min), Some(median), Some(max)) => {
-            println!("snr_2500_db: min={min:.1} median={median:.1} max={max:.1}");
-        }
-        // `tracks_promoted` is verdict()'s own authoritative signal for
-        // "did anything really happen" -- match its logic exactly rather
-        // than re-deriving it from a different combination of fields.
-        _ if report.tracks_promoted == 0 => {
-            println!("snr_2500_db: no TrackMeta events -- no track ever promoted")
-        }
-        _ => println!(
-            "snr_2500_db: a track was promoted but no TrackMeta ever landed for it before this \
-             run ended"
-        ),
-    }
-    println!(
-        "decode: {} chars ({} distinct), {} confirmed spots",
-        report.chars_decoded, report.distinct_chars, report.spots_confirmed
-    );
-    println!("verdict: {}", report.verdict().summary());
 }
 
 #[cfg(test)]
@@ -7197,6 +7617,251 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(*source_iq);
     }
 
+    // ---- MAN-269: paced and looping file replay
+
+    const FILE_INPUT: &str = "[input]\ntype = \"file\"\npath = \"/x/v1.wav\"\niq = true\n";
+
+    #[test]
+    fn realtime_flag_paces_a_cli_file_source() {
+        let cli = CliOverrides {
+            source: Some(PathBuf::from("x.wav")),
+            realtime: true,
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded_from("")).unwrap();
+        assert_eq!(
+            r.replay,
+            ReplayMode {
+                paced: true,
+                looped: false
+            }
+        );
+    }
+
+    #[test]
+    fn loop_flag_implies_pacing() {
+        let cli = CliOverrides {
+            source: Some(PathBuf::from("x.wav")),
+            loop_replay: true,
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded_from("")).unwrap();
+        assert_eq!(
+            r.replay,
+            ReplayMode {
+                paced: true,
+                looped: true
+            }
+        );
+    }
+
+    #[test]
+    fn input_realtime_and_loop_keys_apply_to_a_config_file_source() {
+        let loaded = loaded_from(&format!("{FILE_INPUT}realtime = true\nloop = true\n"));
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        assert!(matches!(r.spec, LiveSourceSpec::File { .. }));
+        assert_eq!(
+            r.replay,
+            ReplayMode {
+                paced: true,
+                looped: true
+            }
+        );
+        let r = resolve(
+            cli_overrides(),
+            &loaded_from(&format!("{FILE_INPUT}realtime = true\n")),
+        )
+        .unwrap();
+        assert_eq!(
+            r.replay,
+            ReplayMode {
+                paced: true,
+                looped: false
+            }
+        );
+    }
+
+    #[test]
+    fn cli_realtime_adds_to_a_config_file_source() {
+        let cli = CliOverrides {
+            realtime: true,
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded_from(FILE_INPUT)).unwrap();
+        assert_eq!(
+            r.replay,
+            ReplayMode {
+                paced: true,
+                looped: false
+            }
+        );
+        let cli = CliOverrides {
+            loop_replay: true,
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded_from(&format!("{FILE_INPUT}realtime = true\n"))).unwrap();
+        assert_eq!(
+            r.replay,
+            ReplayMode {
+                paced: true,
+                looped: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_cli_source_selector_discards_the_files_realtime_and_loop() {
+        let loaded = loaded_from(&format!("{FILE_INPUT}realtime = true\nloop = true\n"));
+        let cli = CliOverrides {
+            source: Some(PathBuf::from("y.wav")),
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded).unwrap();
+        assert_eq!(r.replay, ReplayMode::default());
+        let LiveSourceSpec::File { path, .. } = &r.spec else {
+            panic!("expected the CLI file source");
+        };
+        assert_eq!(path, &PathBuf::from("y.wav"));
+    }
+
+    #[test]
+    fn realtime_with_a_live_source_is_an_error() {
+        let cli = CliOverrides {
+            kiwi: KiwiOpts {
+                host: Some("192.0.2.1".into()),
+                port: 8073,
+                freq: Some(7_030_000.0),
+                password: String::new(),
+            },
+            realtime: true,
+            loop_replay: true,
+            ..cli_overrides()
+        };
+        let err = resolve(cli, &loaded_from("")).err().unwrap().to_string();
+        assert_eq!(
+            err,
+            "--realtime only applies to a file replay (--source, or input.type = \"file\"); a \
+             live source already runs in real time"
+        );
+    }
+
+    #[test]
+    fn loop_with_the_default_audio_device_is_an_error() {
+        let cli = CliOverrides {
+            loop_replay: true,
+            ..cli_overrides()
+        };
+        let err = resolve(cli, &loaded_from("")).err().unwrap().to_string();
+        assert_eq!(
+            err,
+            "--loop only applies to a file replay (--source, or input.type = \"file\"); a live \
+             source never reaches an end to loop from"
+        );
+        // The same for a typed non-file [input] the CLI adds --loop to.
+        let cli = CliOverrides {
+            loop_replay: true,
+            ..cli_overrides()
+        };
+        let err = resolve(cli, &loaded_from(KIWI_INPUT))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.starts_with("--loop only applies to a file replay"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn replay_mode_note_names_the_ignored_keys() {
+        let mode = ReplayMode::from_flags(true, false);
+        assert_eq!(
+            replay_mode_ignored_note("soak", mode, "demo.toml").as_deref(),
+            Some(
+                "note: soak replays files as fast as it can; ignoring input.realtime/input.loop \
+                 from demo.toml"
+            )
+        );
+        assert_eq!(
+            replay_mode_ignored_note("doctor", ReplayMode::default(), "demo.toml"),
+            None
+        );
+    }
+
+    /// `n` samples of a ramp at `fs`, for the `wrap_file_replay` tests.
+    struct RampSource {
+        n: usize,
+        cursor: usize,
+        fs: f64,
+    }
+
+    impl IqSource for RampSource {
+        fn sample_rate(&self) -> f64 {
+            self.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            0.0
+        }
+        fn read(&mut self, buf: &mut [num_complex::Complex32]) -> Result<usize> {
+            let k = buf.len().min(self.n - self.cursor);
+            for (i, s) in buf[..k].iter_mut().enumerate() {
+                *s = num_complex::Complex32::new((self.cursor + i) as f32, 0.0);
+            }
+            self.cursor += k;
+            Ok(k)
+        }
+    }
+
+    fn ramp(n: usize, fs: f64) -> Box<dyn IqSource> {
+        Box::new(RampSource { n, cursor: 0, fs })
+    }
+
+    #[test]
+    fn wrap_file_replay_is_identity_for_the_default_mode() {
+        let first = ramp(10, 1000.0);
+        let before = &*first as *const dyn IqSource as *const ();
+        let wrapped = wrap_file_replay(
+            first,
+            ReplayMode::default(),
+            "x.wav".into(),
+            Box::new(|| bail!("the default mode never reopens")),
+        )
+        .unwrap();
+        assert_eq!(&*wrapped as *const dyn IqSource as *const (), before);
+    }
+
+    #[test]
+    fn wrap_file_replay_loops_inside_pacing() {
+        // 100 samples at 1 kS/s, read 300 times over: three passes of one
+        // paced clock take >= 300 ms. Lower bound only.
+        let mut src = wrap_file_replay(
+            ramp(100, 1000.0),
+            ReplayMode::from_flags(false, true),
+            "x.wav".into(),
+            Box::new(|| Ok(ramp(100, 1000.0))),
+        )
+        .unwrap();
+        let mut buf = vec![num_complex::Complex32::new(0.0, 0.0); 300];
+        let start = std::time::Instant::now();
+        let mut filled = 0;
+        while filled < buf.len() {
+            let n = src.read(&mut buf[filled..]).unwrap();
+            assert!(n > 0, "the loop ended after {filled} samples");
+            filled += n;
+        }
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(290),
+            "300 paced samples at 1 kS/s took only {:?}",
+            start.elapsed()
+        );
+        assert_eq!(buf[99].re, 99.0);
+        assert_eq!(
+            buf[100].re, 0.0,
+            "the second pass starts from the first sample"
+        );
+        assert_eq!(buf[299].re, 99.0);
+    }
+
     #[test]
     fn cli_allowlist_replaces_file_allowlist() {
         let spot = config::SpotFile {
@@ -7309,6 +7974,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("device", "input.device"),
         ("source", "input.path"),
         ("source_iq", "input.iq"),
+        ("realtime", "input.realtime"),
+        ("loop_replay", "input.loop"),
         ("kiwi_host", "input.host"),
         ("kiwi_port", "input.port"),
         ("kiwi_freq_hz", "input.freq_hz"),
@@ -7344,6 +8011,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         "center_freq_hz",
         "help",
         "version",
+        "reference_hz",
+        "search_ppm",
+        "tune_hz",
+        "write",
         "ntp_server",
         "verbose",
         "quiet",
@@ -7422,7 +8093,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn every_config_backed_flag_maps_to_a_key() {
         use clap::CommandFactory;
         let cli = Cli::command();
-        for name in ["run", "soak", "doctor", "decode", "check"] {
+        for name in ["run", "soak", "doctor", "decode", "check", "calibrate"] {
             let sub = cli.find_subcommand(name).unwrap();
             for arg in sub.get_arguments() {
                 let id = arg.get_id().as_str();
@@ -7439,7 +8110,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn every_flag_key_is_accepted_by_the_loader() {
         const TYPED: &[(&str, &str)] = &[
             ("audio", "type = \"audio\"\ndevice = \"d\"\n"),
-            ("file", "type = \"file\"\npath = \"x.wav\"\niq = true\n"),
+            (
+                "file",
+                "type = \"file\"\npath = \"x.wav\"\niq = true\nrealtime = true\nloop = true\n",
+            ),
             (
                 "kiwi",
                 "type = \"kiwi\"\nhost = \"h\"\nport = 8073\nfreq_hz = 7e6\npassword = \"\"\n",
@@ -7994,20 +8668,19 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(message.contains(r"\u{1b}[2J\npwned"), "{message:?}");
     }
 
-    /// The escaping above is applied where peer text enters the error, not
-    /// to the whole chain at the stderr sink: a local `--config` TOML
-    /// error's multi-line source snippet must still print as lines.
+    /// Local snippets keep their source and caret, with visible line breaks.
     #[test]
-    fn status_config_parse_errors_keep_their_multi_line_snippet() {
+    fn status_config_parse_errors_keep_their_escaped_snippet() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.toml");
         std::fs::write(&path, "[server]\nbind_addr = \n").unwrap();
         let err = run_status(Some(&path), None, 5).expect_err("a broken config must not parse");
         let message = status_failure_message(&err);
         assert!(message.contains("TOML parse error"), "{message:?}");
+        assert!(message.contains("bind_addr = ") && message.contains('^'));
         assert!(
-            message.contains('\n') && !message.contains(r"\n"),
-            "the TOML snippet must keep its real line breaks: {message:?}"
+            !message.chars().any(char::is_control) && message.contains(r"\n"),
+            "the TOML snippet must keep visible line breaks: {message:?}"
         );
     }
 

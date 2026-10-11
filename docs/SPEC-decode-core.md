@@ -107,6 +107,7 @@ Per hop, for a track with peak channel `k₀`:
 With ≥ 100 key-down hops (any real CW transmission) the estimator's standard
 error is ≪ 10 Hz; absolute accuracy is then bounded by the SDR's reference
 oscillator, which is out of scope (config `input.freq_correction_ppm` exists).
+`manta calibrate` measures it against a known carrier.
 This ≪ 10 Hz claim is empirically channel-table-size (N) dependent: it was
 measured at N = 1024 (the 96 kHz table V1 uses); V31's 48 kHz/N = 512 table
 measures ~17 Hz instead (see the V31 row below; tracked in issue #177).
@@ -177,8 +178,32 @@ edges); the `min` guarantees a parked carrier can never raise its own
 detection threshold by more than 3 dB relative to its neighbors.
 
 Startup: for the first 10 s the ring is partially filled; the quantile is
-taken over whatever is present, and track creation is inhibited for the first
-**2 s** (`detector.warmup_ms = 2000`) to avoid floor-transient garbage.
+taken over whatever is present. Three things keep that young floor honest
+(MAN-115, `docs/DECISIONS/2026-10-11-man115-startup-latency.md`; this
+replaces SPEC v1's 2 s inhibit):
+
+- **Pre-roll skip.** The `filter_len` zero samples a decode path prepends
+  (`pad_hops` hops, all-zero or partial windows) never reach the floor, the
+  gate or the warm-up count; the segment's first real hop is its hop 0.
+- **Block-median seed.** While a channel's ring holds fewer than 25 entries
+  taken since its block's leading silence ended (that block's first 1 s of
+  input), its effective floor is raised to at least its block's seed: the
+  running
+  mean, over the block's first 25 decimated hops, of the median raw `PdB`
+  across the block's 32 channels, minus 3.8 dB (`10·log10(ln 2 / ln(4/3))`,
+  the median-to-lower-quartile gap of a chi-squared 2-DOF power). Block
+  medians below −140 dBFS (digital silence, e.g. a source still opening)
+  are left out of that mean; a block's leading silence lasts until its
+  first decimated hop with a median at or above −140 dBFS. The seed only
+  raises `F[k]`; `F_ch` stays raw.
+- **Leading silence.** The histogram bottom-bin entries a channel's ring
+  takes during its block's leading silence are left out of the `F_ch[k]`
+  and `F_blk` that `F[k]` uses until they leave the ring (10 s); counted,
+  they would pin the lower quartile at −140 dBFS. Removing bottom-bin
+  entries can only raise a quantile. Bottom-bin entries after the leading
+  silence count as usual.
+- **Warm-up.** Track creation is inhibited for the first **25 ms**
+  (`detector.warmup_ms = 25`, 9 hops) of real hops.
 
 ### 2.3 Gate
 
@@ -919,7 +944,7 @@ off_snr_db = 3.0
 confirm_ms = 50                     # 19 hops
 hang_ms = 5000                      # 1875 hops
 gc_ms = 30000                       # 11250 hops
-warmup_ms = 2000                    # 750 hops
+warmup_ms = 25                      # 9 hops
 # Max concurrent tracks (ARCHITECTURE §4); 1200 per
 # docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md.
 track_cap = 1200
@@ -953,7 +978,7 @@ flush_gap_dits = 7.0
 # device, or when command-line flags pick the source. Each type takes only
 # its own source keys (required ones marked *):
 #   audio: device
-#   file:  path*, iq
+#   file:  path*, iq, realtime, loop
 #   kiwi:  host*, freq_hz*, port, password
 #   soapy: driver*, freq_hz*, rate_hz*, gain_db   (build with --features soapy)
 #   hpsdr: host*, freq_hz*, rate_hz*, port        (build with --features hpsdr)
@@ -969,6 +994,8 @@ flush_gap_dits = 7.0
 # device = "USB Audio"        # audio: device-name substring; omit for the default device
 # path = "capture.wav"        # file: relative to this file's directory
 # iq = false                  # file: true for a raw complex-IQ WAV (--source-iq)
+# realtime = false            # file: replay at the recording's own pace (run only; --realtime)
+# loop = false                # file: replay again from the start each time it ends, until stopped; implies realtime (run only; --loop)
 # driver = "driver=rtlsdr"    # soapy: SoapySDR device args
 # rate_hz = 192000.0          # soapy, hpsdr: sample rate, Hz
 # gain_db = 30.0              # soapy: omit for the device's AGC
@@ -1097,9 +1124,9 @@ addresses, per-IP connection and command budgets) are deployment settings
 rather than normative constants of this spec, and
 `crates/manta-server/src/config.rs` is their reference.
 
-**Precedence and the environment.** `run`, `soak` and `doctor` resolve
-every key as: command-line flag, then `MANTA_<TABLE>_<KEY>` environment
-variable (`MANTA_INPUT_FREQ_CORRECTION_PPM` is `input.freq_correction_ppm`;
+**Precedence and the environment.** `run`, `soak`, `doctor` and
+`calibrate` resolve every key as: command-line flag, then
+`MANTA_<TABLE>_<KEY>` environment variable (`MANTA_INPUT_FREQ_CORRECTION_PPM` is `input.freq_correction_ppm`;
 `<TABLE>` is one of `SERVER`, `INPUT`, `SPOT`, `DETECTOR`, `DECODE`), then
 the config file, then the default above. `--config` names the file;
 without it they read `MANTA_CONFIG`. An environment value is parsed as a
@@ -1114,7 +1141,10 @@ always taken verbatim: `server.station_callsign`, `server.bind_addr`,
 `decode.engine`. Relative paths from the file
 resolve against the file's directory; those from a flag or the
 environment resolve against the working directory. `[[rbn_uplink]]`
-cannot be set from the environment.
+cannot be set from the environment. `calibrate` is the only command that
+edits an existing config file, and it writes only `input.freq_correction_ppm`, after
+confirmation (MAN-127,
+`docs/DECISIONS/2026-10-11-man127-calibrate-command.md`).
 
 Unknown tables, unknown keys in a known table, and unknown `MANTA_*`
 variables are errors that name the offender, raised before any source
@@ -1141,6 +1171,11 @@ that takes `--config` (`run`, `soak`, `doctor`, `decode`, `oracle`) reads
 constants: listener ports and the per-listener connection/rate quotas
 (MAN-57/MAN-61) are documented on `manta_server::config::ServerConfig`'s
 own fields, with the exposure policy in ARCHITECTURE §7.
+
+`docs/CONFIG.md` is the operator's per-key reference: every key of every
+table, `[[rbn_uplink]]` included, with its default and which commands and
+engines it affects. This section stays normative for the decode-core
+defaults.
 
 ## 10. Deviations from ARCHITECTURE.md
 

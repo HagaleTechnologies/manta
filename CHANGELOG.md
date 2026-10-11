@@ -37,9 +37,15 @@ acceptance gates.
 
 ### Added
 
+<<<<<<< HEAD
 - Prebuilt archives for Linux (x86-64, arm64), macOS (x86-64, arm64) and
   Windows (x86-64) on each GitHub Release, with `SHA256SUMS` and a
   build-provenance attestation (MAN-298).
+=======
+- `manta calibrate` measures the receiver's frequency error against a WWV,
+  WWVH, BPM, RWM or NCDXF beacon carrier and, after confirmation, saves
+  `freq_correction_ppm` to `[input]` in the config file (MAN-127).
+>>>>>>> 2589b5dfd9435f04a09ce2ab8a0f6b6cc0d96c34
 - `manta doctor` checks the whole setup before its signal check: the config
   (`manta run`'s example-callsign and dial-frequency refusals), the audio
   library and sound-card inputs, that each `[server]` port is free, the
@@ -87,6 +93,17 @@ acceptance gates.
 
 ### Changed
 
+- Command output reads as finished text rather than debug prints (MAN-270).
+  Human reports use shared units: frequencies as `14012.3 kHz`, SNR as
+  integer `dB`, speed as integer `WPM`, confidence to two decimals, and spot
+  types as `CQ`/`DE`/`BEACON`/`unknown`; for example
+  `SPOT: W1AW (CQ) 14000.8 kHz 29 dB 20 WPM conf=0.79`. An application error
+  is one escaped `error: ...` line on stderr instead of Rust's `Error:` chain
+  (still exit 1). `decode` prints its summary on stderr, `soak` and `doctor`
+  print plain reports, and `run`'s startup banner shows
+  `dial_frequency=14060.0 kHz`. JSON output, the RBN wire format and decoder
+  output are unchanged. See
+  [docs/DECISIONS/2026-10-10-man270-cli-output-style.md](docs/DECISIONS/2026-10-10-man270-cli-output-style.md).
 - `manta doctor` no longer prints `note: doctor does not start the spot
   servers; ignoring [server]`: it checks `[server]`'s ports instead, still
   starting no server.
