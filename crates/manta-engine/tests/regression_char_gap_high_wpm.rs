@@ -12,7 +12,12 @@ use manta_engine::{decode_samples, PipelineConfig};
 use manta_testkit::cer::cer;
 use manta_testkit::scene::{render_scene, SignalSpec};
 
-/// SPEC §2.1's ~2.05 s mandatory warmup(750 hops)+confirm(19 hops) floor:
+/// MAN-115 cut the warmup to 25 ms after the pre-roll (SPEC §2.2
+/// "Startup"), so a track now promotes within ~0.07 s of the first keyed
+/// element; the looped 30 s scene below is kept, and the history explains
+/// why it exists. See docs/DECISIONS/2026-10-11-man115-startup-latency.md.
+///
+/// SPEC §2.1's old ~2.05 s warmup(750 hops)+confirm(19 hops) floor:
 /// this scene's original duration (`keyed_length + 1.5 s` ≈ 2.1 s) put the
 /// entire once-keyed "AB" signal *before* hop 750 -- the real detector
 /// (unlike the old placeholder) refuses to promote any track before then,
@@ -51,8 +56,9 @@ fn ab_at_33wpm_does_not_merge_into_one_character() {
     let snr = 24.410885f32;
     let offset_khz = -7i32;
     let noise_seed = 694100648224208083u64;
-    // Comfortably past the ~2.05 s warmup+confirm floor, plus several more
-    // seconds so multiple "AB" repetitions decode after track promotion.
+    // Sized against the pre-MAN-115 ~2.05 s warmup+confirm floor, plus
+    // several more seconds so multiple "AB" repetitions decode after track
+    // promotion; kept so the CER bound below stays comparable.
     let duration_s = 30.0;
 
     let sig = SignalSpec {
