@@ -61,7 +61,7 @@ the vendored ADIF entity table `dxcc.tsv`.
 
 | Field | JSON type | Null? | Meaning |
 |---|---|---|---|
-| `id` | string | never | Unique key for this spot. Built today as `station_callsign:session_nonce:track_id:sample_ts:dxCall`. `session_nonce` is a hash of the file's contents when replaying a recording, so replaying the same recording again gives the same ids; for live input it is the session start time in nanoseconds. Treat `id` as an opaque key: do not parse it, because the composition may change. |
+| `id` | string | never | Unique key for this spot. Built today as `station_callsign:session_nonce:track_id:sample_ts:dxCall`, with `station_callsign` uppercased, including any RBN `-N` SSID. `session_nonce` is a hash of the file's contents when replaying a recording, so replaying the same recording again gives the same ids; for live input it is the session start time in nanoseconds. Treat `id` as an opaque key: do not parse it, because the composition may change. |
 | `source` | string | never | Always `"skimmer"`. |
 | `timestamp` | integer | never | When the spot was heard, in Unix seconds (UTC, whole seconds). It is the session start time plus the spot's offset into the stream. For a replayed file the start time is the file's modification time, or `[input].replay_epoch` when set. |
 | `ingestedAt` | integer | never | Unix seconds. manta sends the same value as `timestamp`; cqdx overwrites it with its own receipt time. |
@@ -75,7 +75,7 @@ the vendored ADIF entity table `dxcc.tsv`.
 | `dxDxcc` | integer | never | ADIF DXCC entity number, for example `291` for the United States. `-1` (`UNKNOWN_DXCC`) when the call does not resolve. `0` (ADIF "not in any DXCC entity") when the call carries `/MM` or `/AM` after its first segment (MAN-136). |
 | `dxContinent` | string | never | Two-letter continent code from `cty.dat`: `AF`, `AN`, `AS`, `EU`, `NA`, `OC` or `SA`. Empty string `""` (`UNKNOWN_CONTINENT`) when the call does not resolve or carries `/MM` or `/AM`. |
 | `dxCqZone` | integer | never | CQ zone, 1 to 40. `0` (`UNKNOWN_CQ_ZONE`) when the call does not resolve or carries `/MM` or `/AM`. |
-| `deCall` | string | never | `[server].station_callsign` exactly as configured, including any RBN `-N` SSID (MAN-89). The SSID is stripped before the geography lookup for the `de*` fields below. |
+| `deCall` | string | never | `[server].station_callsign`, uppercased, including any RBN `-N` SSID (MAN-89). The SSID is stripped before the geography lookup for the `de*` fields below. |
 | `deGrid` | null | always | Maidenhead locator of the reporting station. Reserved by the contract; manta does not fill it. |
 | `deLat` | number or null | when unresolved | As `dxLat`, for the reporting station's callsign. |
 | `deLon` | number or null | when unresolved | As `dxLon`, for the reporting station's callsign. |

@@ -51,7 +51,8 @@ listed here change what the command does.
 | `bench sensitivity` | `[decode]` `[detector]` | no |
 
 `run` starts the telnet, JSON and metrics servers, and any uplink, only when
-the file has a `[server]` table.
+the resolved config has a `[server]` table. The table can come from the file
+or a `MANTA_SERVER_*` environment variable.
 
 ## Checking a file
 

@@ -1192,6 +1192,47 @@ const METRICS_REF: &str = "docs/METRICS.md";
 const DOCS_INDEX: &str = "docs/README.md";
 const DECISIONS_INDEX: &str = "docs/DECISIONS/README.md";
 
+/// MAN-149 M1: config::load creates [server] from MANTA_SERVER_* too.
+#[test]
+fn config_reference_documents_environment_server_activation() {
+    let md = doc(CONFIG_REF);
+    let commands = squash_whitespace(section(&md, "Which commands read which tables"));
+    assert!(
+        commands.contains("only when the resolved config has a `[server]` table"),
+        "{CONFIG_REF} must tie server startup to the resolved config"
+    );
+    assert!(
+        commands.contains("`MANTA_SERVER_*`"),
+        "{CONFIG_REF} must say the environment can supply [server]"
+    );
+    assert!(
+        !commands.contains("only when the file has"),
+        "{CONFIG_REF} still restricts server startup to a table in the file"
+    );
+}
+
+/// MAN-149 M2: config deserialization uppercases the station identity;
+/// SpotMessage uses that identity for both deCall and the id prefix.
+#[test]
+fn spot_schema_documents_uppercased_station_identity() {
+    let md = doc("docs/SPOT-SCHEMA.md");
+    let rows = backticked_rows(section(&md, "Fields"));
+    for field in ["deCall", "id"] {
+        let row = rows
+            .iter()
+            .find(|r| r[0] == format!("`{field}`"))
+            .unwrap_or_else(|| panic!("SPOT-SCHEMA.md is missing {field}"));
+        assert!(
+            row.last().unwrap().contains("uppercased"),
+            "SPOT-SCHEMA.md {field} must describe the uppercased station callsign"
+        );
+        assert!(
+            !row.last().unwrap().contains("exactly as configured"),
+            "SPOT-SCHEMA.md {field} still promises to preserve config casing"
+        );
+    }
+}
+
 /// Every `#key = value` line of the `manta config init` scaffold, as
 /// `(table, key, value_src)` -- the same two patterns `config_cmd.rs`'s
 /// scaffold drift tests parse it with. `value_src` keeps any trailing
