@@ -1467,6 +1467,47 @@ fn man90_runbook_keeps_udp_to_unnoted_addresses() {
     );
 }
 
+/// MAN-90: steps 1 and 3 note only the connections the operator sees in
+/// PowerShell or Resource Monitor, so a TCP connection Aggregator opens and
+/// closes between two looks would be left out of step 5's export. Step 2 must
+/// turn on Windows' per-program connection log (Security event 5156), step 5
+/// must take TCP connections from it as well and restore the audit settings,
+/// and the developer steps must check every logged connection is in the file.
+/// Checks text, not Windows behaviour.
+#[test]
+fn man90_runbook_takes_aggregators_connections_from_the_windows_log() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let operator = squash_whitespace(section(&runbook, "Operator steps"));
+    let start = operator
+        .find("2. **Start")
+        .expect("Operator steps have no `2. **Start` step");
+    let record = &operator[start..start + operator[start..].find("3. **").unwrap()];
+    for needle in [
+        "auditpol /backup /file:",
+        "auditpol /set /subcategory:'{0CCE9226-69AE-11D9-BED3-505054503030}' /success:enable",
+    ] {
+        assert!(record.contains(needle), "Step 2 never runs `{needle}`");
+    }
+    // Step 5 is the last step, so it runs to the end of the section.
+    let export = &operator[operator
+        .find("5. **Stop")
+        .expect("Operator steps have no `5. **Stop` step")..];
+    for needle in [
+        "Id=5156",
+        "auditpol /restore /file:",
+        "one term per TCP connection from step 1, step 3 or the saved list",
+    ] {
+        assert!(export.contains(needle), "Step 5 never says `{needle}`");
+    }
+    let steps = squash_whitespace(section(&runbook, "Developer steps"));
+    assert!(
+        steps.contains(
+            "a row of `aggregator-connections.csv`, with no conversation in the file was not recorded"
+        ),
+        "Developer steps never check the file against the connection log"
+    );
+}
+
 /// MAN-90: C3, C4 and C7 compare exact bytes. tshark's `ascii` follow mode
 /// turns non-printable bytes into dots, so the developer steps must also write
 /// a `raw` (hex) transcript of each TCP stream and UDP flow.
