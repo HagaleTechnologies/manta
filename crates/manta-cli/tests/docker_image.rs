@@ -274,7 +274,8 @@ fn dockerfile_healthcheck_probes_the_daemon_config() {
         .iter()
         .filter_map(|v| v["target"].as_str())
         .collect();
-    assert_eq!(targets, [CONFIG_PATH]);
+    // MAN-316: the second mount is the manta-lists cache volume.
+    assert_eq!(targets, [CONFIG_PATH, "/var/cache/manta"]);
 }
 
 #[test]

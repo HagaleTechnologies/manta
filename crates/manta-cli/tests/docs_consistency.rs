@@ -911,6 +911,12 @@ fn spec_documents_every_input_and_spot_key() {
                 "notch_path",
                 "cty_path",
                 "scp_path",
+                "refresh_lists",
+                "list_cache_dir",
+                "cty_url",
+                "scp_url",
+                "cty_sha256",
+                "scp_sha256",
             ],
         ),
     ];

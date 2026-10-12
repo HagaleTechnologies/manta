@@ -677,6 +677,22 @@ fn systemd_unit_runs_the_credential_config_and_outlasts_the_drain() {
     for key in ["User", "Group"] {
         assert_eq!(service(key), None, "DynamicUser allocates the identity");
     }
+    // MAN-316: the DynamicUser identity gets a writable /var/cache/manta,
+    // and [spot].list_cache_dir points at it, so a refresh_lists download
+    // survives a restart.
+    assert_eq!(service("CacheDirectory").as_deref(), Some("manta"));
+    let environment: Vec<String> = entries
+        .iter()
+        .filter(|(s, k, _)| s == "Service" && k == "Environment")
+        .map(|(_, _, v)| v.clone())
+        .collect();
+    assert!(
+        environment
+            .iter()
+            .any(|v| v == "MANTA_SPOT_LIST_CACHE_DIR=/var/cache/manta"),
+        "{SYSTEMD_UNIT} must set Environment=MANTA_SPOT_LIST_CACHE_DIR=/var/cache/manta; \
+         got {environment:?}"
+    );
     assert_eq!(service("Restart").as_deref(), Some("always"));
     assert_eq!(service("RestartSec").as_deref(), Some("10"));
     assert_eq!(
@@ -800,7 +816,11 @@ fn compose_runs_the_mounted_config_and_outlasts_the_drain() {
     );
 
     let volumes = manta["volumes"].as_sequence().expect("a volumes list");
-    assert_eq!(volumes.len(), 1, "one mount: the config file");
+    assert_eq!(
+        volumes.len(),
+        2,
+        "two mounts: the config file and the manta-lists cache (MAN-316)"
+    );
     let config = &volumes[0];
     assert_eq!(str_of(&config["type"]).as_deref(), Some("bind"));
     assert_eq!(str_of(&config["source"]).as_deref(), Some("./manta.toml"));
@@ -816,6 +836,30 @@ fn compose_runs_the_mounted_config_and_outlasts_the_drain() {
     );
     assert_eq!(str_of(&config["bind"]["selinux"]).as_deref(), Some("Z"));
 
+    // MAN-316: a named volume holds [spot].list_cache_dir, so downloaded
+    // lists outlive the container; the Dockerfile creates its mount point
+    // owned by manta, which the volume inherits on first mount.
+    let lists = &volumes[1];
+    assert_eq!(str_of(&lists["type"]).as_deref(), Some("volume"));
+    assert_eq!(str_of(&lists["source"]).as_deref(), Some("manta-lists"));
+    assert_eq!(
+        str_of(&lists["target"]).as_deref(),
+        Some("/var/cache/manta")
+    );
+    assert!(
+        compose["volumes"]
+            .as_mapping()
+            .is_some_and(|m| m.contains_key("manta-lists")),
+        "{COMPOSE} must declare the manta-lists named volume at top level"
+    );
+    assert!(
+        dockerfile
+            .lines()
+            .any(|l| l.trim()
+                == "RUN mkdir -p /var/cache/manta && chown manta:manta /var/cache/manta"),
+        "the Dockerfile must create /var/cache/manta owned by manta"
+    );
+
     // Metrics listens on the container's 0.0.0.0 so a published port can
     // reach it, and is published on the host's loopback only (MAN-132).
     let env = &manta["environment"];
@@ -824,6 +868,11 @@ fn compose_runs_the_mounted_config_and_outlasts_the_drain() {
         Some("0.0.0.0")
     );
     assert_eq!(str_of(&env["RUST_LOG"]).as_deref(), Some("info"));
+    assert_eq!(
+        str_of(&env["MANTA_SPOT_LIST_CACHE_DIR"]).as_deref(),
+        str_of(&lists["target"]).as_deref(),
+        "MANTA_SPOT_LIST_CACHE_DIR must name the manta-lists mount"
+    );
     let (telnet, json, metrics) = default_ports();
     let ports: BTreeSet<String> = manta["ports"]
         .as_sequence()

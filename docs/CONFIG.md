@@ -78,7 +78,7 @@ environment: none
 server: none (manta run starts no servers)
 rbn_uplink: none
 input: type=unset (the default sound card, unless a command-line flag picks the source)
-spot: allowlist=none blocklist_path=none notch_path=none cty_path=bundled scp_path=bundled
+spot: allowlist=none blocklist_path=none notch_path=none cty_path=bundled scp_path=bundled cty_sha256=none scp_sha256=none refresh_lists=off list_cache_dir=none cty_url=http://www.country-files.com/cty/cty.dat scp_url=http://www.supercheckpartial.com/MASTER.SCP
 detector: defaults
 decode: engine=legacy (other keys default)
 ```
@@ -98,8 +98,10 @@ and two servers on one port. Without `--config` or `MANTA_CONFIG` it checks
 **Reloading without a restart.** On Unix, `SIGHUP` to a `run` daemon (a config
 with a `[server]` table) re-reads the file and applies `[spot]` `allowlist`,
 `blocklist_path` and `notch_path`, and each `[[rbn_uplink]]` block's `dry_run`.
-Every other key, `cty_path` and `scp_path` included, needs a restart; a reload
-logs the changed keys it did not apply. A file that fails the checks above is
+Every other key, `cty_path`, `scp_path` and the list-refresh keys included,
+needs a restart; a reload logs the changed keys it did not apply. A
+`refresh_lists` download replaces `cty.dat` or `MASTER.SCP` on its own
+schedule, not on `SIGHUP`. A file that fails the checks above is
 logged and ignored. See
 [DECISIONS/2026-10-10-man78-live-reload.md](DECISIONS/2026-10-10-man78-live-reload.md).
 
@@ -197,7 +199,10 @@ replaces a typed `[input]` whole, its shared keys included. So does a
 ## [spot]
 
 Which decodes become spots. `allowlist`, `blocklist_path` and `notch_path`
-reload on SIGHUP; `cty_path` and `scp_path` need a restart.
+reload on SIGHUP; every other key needs a restart. With `refresh_lists` on,
+`run` from a live receiver also replaces `cty.dat` and `MASTER.SCP` on its
+own schedule. See
+[DECISIONS/2026-10-12-man316-reference-list-refresh.md](DECISIONS/2026-10-12-man316-reference-list-refresh.md).
 
 | Key | Default | Wired | Notes |
 |---|---|---|---|
@@ -206,6 +211,12 @@ reload on SIGHUP; `cty_path` and `scp_path` need a restart.
 | `notch_path` | none; example `"notches.txt"`; unset notches no frequency | live: `run`, `soak`, `doctor`, `decode`; reloads on SIGHUP | File of `low_hz-high_hz` ranges never spotted, one per line. A relative path set in the file is relative to the file's directory; from `--notch`, which overrides it, or `MANTA_SPOT_NOTCH_PATH` it is relative to the working directory. |
 | `cty_path` | none; example `"cty.dat"`; unset uses the built-in `cty.dat` | live: `run`, `soak`, `doctor`, `decode` | AD1C's country-prefix file. A relative path set in the file is relative to the file's directory; from `--cty`, which overrides it, or `MANTA_SPOT_CTY_PATH` it is relative to the working directory. See [DECISIONS/2026-10-10-man79-operator-cty-scp-override.md](DECISIONS/2026-10-10-man79-operator-cty-scp-override.md). |
 | `scp_path` | none; example `"MASTER.SCP"`; unset uses the built-in `master.scp` | live: `run`, `soak`, `doctor`, `decode` | Known-callsign list that raises confidence. A relative path set in the file is relative to the file's directory; from `--scp`, which overrides it, or `MANTA_SPOT_SCP_PATH` it is relative to the working directory. |
+| `refresh_lists` | `false` | live: `run` with a live source; file replay ignores it | Downloads `cty.dat` every 7 days and `MASTER.SCP` every day from `cty_url` and `scp_url`, with `If-Modified-Since`. A download replaces the list in use only after it parses and passes the completeness checks; a failed or rejected one is logged as a `warning: list refresh:` line, counted in `manta_list_refresh_total{outcome="failed"}` and retried an hour later, and the list in use stays. Skipped for a list that `cty_path`/`scp_path` or `cty_sha256`/`scp_sha256` sets. `soak`, `decode` and file replay never download. Needs outbound TCP port 80. |
+| `list_cache_dir` | none; example `"/var/cache/manta"`; unset keeps downloads in memory only | live: `run` with a live source; file replay ignores it | Where accepted downloads are kept (`cty/<sha256>.dat`, `scp/<sha256>.scp`, each list's `state.json`; the 30 newest versions per list), so a restart starts from the last good download. `cty_sha256`/`scp_sha256` pins also look here, for every validating command. A relative path set in the file is relative to the file's directory; from `MANTA_SPOT_LIST_CACHE_DIR` it is relative to the working directory. The systemd unit and Compose file set it to `/var/cache/manta`. |
+| `cty_url` | `"http://www.country-files.com/cty/cty.dat"` | live: `run` with a live source; file replay ignores it | Where `refresh_lists` downloads `cty.dat`. Only `http://` URLs: `https://` is refused at load, because manta has no TLS support. Redirects and chunked responses count as failures. Point it at a local mirror to share one download. |
+| `scp_url` | `"http://www.supercheckpartial.com/MASTER.SCP"` | live: `run` with a live source; file replay ignores it | Where `refresh_lists` downloads `MASTER.SCP`. Same rules as `cty_url`. |
+| `cty_sha256` | none; example `"e9ff91a3c3ab28c5f7dbcffb4280944a84645ed53d41cb4c68a41f132ee13fd1"`; unset uses `cty_path`, the cache or the built-in copy | live: `run`, `soak`, `doctor`, `decode` | Use exactly the `cty.dat` whose SHA-256 is this (64 hex digits, as in the `lists:` log line). manta looks in `cty_path`, then the built-in copy, then `list_cache_dir`, and stops before reading the source if none matches. A pinned list is never refreshed. `--cty-sha256` overrides it; `MANTA_SPOT_CTY_SHA256` sets it. |
+| `scp_sha256` | none; example `"00692208fa86b1498dcd6fc0f88e14d2a1a0462ba5d481855da5de69be4e3cf0"`; unset uses `scp_path`, the cache or the built-in copy | live: `run`, `soak`, `doctor`, `decode` | Use exactly the `MASTER.SCP` whose SHA-256 is this, looked up like `cty_sha256`. `--scp-sha256` overrides it; `MANTA_SPOT_SCP_SHA256` sets it. |
 
 ## [detector]
 
