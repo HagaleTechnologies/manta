@@ -34,13 +34,11 @@ Order statistics rather than a mean floor is the load-bearing choice: CW is burs
   incumbent's owned channels. MAN-172 adds local-peak spawn eligibility
   and incumbent-wins merge ties; see the
   [decision record](../../docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md).
-<<<<<<< HEAD
 - A splatter rule must never close existing tracks: key-up gaps put real
   CW below any relative-level threshold. MAN-314's RTTY shadow therefore
   vetoes spawns only, and closes use the RTTY hard span alone; see the
   [decision record](../../docs/DECISIONS/2026-10-11-man314-rtty-recognition.md)
   and SPEC-decode-core.md §2.6.
-=======
 - Start-up: a padded decode path's zero pre-roll hops must stay out of the
   floor (`TrackManager::skip_preroll_hops`); a young ring's lower quartile
   is its minimum, so they would pin the floor near -140 dB. The 25 ms
@@ -52,4 +50,3 @@ Order statistics rather than a mean floor is the load-bearing choice: CW is burs
   frequency gates move with the promotion hop, so re-run them after any
   warm-up change; see the MAN-115
   [decision record](../../docs/DECISIONS/2026-10-11-man115-startup-latency.md).
->>>>>>> aa54496fe41182ed6f7c81134c0372f1f2825870

@@ -97,6 +97,8 @@ mod tests {
             text: String::new(),
             events: Vec::new(),
             spots: Vec::new(),
+            rtty: Vec::new(),
+            sample_rate_hz: 48_000.0,
         };
         assert_eq!(
             decode_summary(&report),

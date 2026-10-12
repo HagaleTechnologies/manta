@@ -2622,7 +2622,10 @@ const ACTIVE_TRACKS_POLL_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// the reconnecting `read()`, so it can't publish a count itself, and the
 /// poller above would keep exporting the pre-drop tracks -- MAN-45's ghost
 /// count. `listen()` publishes the real count again after its first
-/// post-reconnect chunk.
+/// post-reconnect chunk. MAN-314: `manta_rtty_signals` is zeroed here for
+/// the same reason; it is published only from the per-batch callback,
+/// which cannot run during the outage, and the reconnect's discontinuity
+/// restarts the RTTY set that callback publishes next.
 fn source_health_sink(
     name: &'static str,
     metrics: Option<std::sync::Arc<manta_server::metrics::Metrics>>,
@@ -2632,6 +2635,9 @@ fn source_health_sink(
         if !healthy {
             if let Some(gauge) = &active_tracks {
                 gauge.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(metrics) = &metrics {
+                metrics.set_rtty_signals(&[]);
             }
         }
         if let Some(metrics) = &metrics {
@@ -4296,13 +4302,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                 println!("{}", serde_json::to_string(&report)?);
             } else {
                 println!("{}", report.text);
-<<<<<<< HEAD
-                eprintln!("freq_hz: {:.1}  wpm: {:?}", report.freq_hz, report.wpm);
-                eprintln!("spots: {}", report.spots.len());
-                eprintln!("{}", rtty_line(&report.rtty, report.sample_rate_hz));
-=======
                 eprintln!("{}", fmt::decode_summary(&report));
->>>>>>> aa54496fe41182ed6f7c81134c0372f1f2825870
+                // MAN-314: only when RTTY was marked, so a CW-only decode
+                // keeps MAN-270's one-line summary.
+                if !report.rtty.is_empty() {
+                    eprintln!("{}", rtty_line(&report.rtty, report.sample_rate_hz));
+                }
             }
         }
         Command::Oracle {
@@ -5593,43 +5598,8 @@ fn warn_deprecations() {
     }
 }
 
-<<<<<<< HEAD
-/// Human-readable `manta doctor` summary. `--json` bypasses this entirely
-/// in favor of the raw `DoctorReport`.
-fn print_doctor_report(report: &manta_engine::DoctorReport) {
-    println!(
-        "source: {:.0} Hz sample rate, {:.1} Hz center, observed for {:.1}s",
-        report.sample_rate_hz,
-        report.center_freq_hz,
-        report.duration.as_secs_f64()
-    );
-    println!(
-        "tracks: {} promoted, {} TrackMeta updates, {} closed",
-        report.tracks_promoted, report.track_meta_count, report.tracks_closed
-    );
-    match (report.snr_db_min, report.snr_db_median, report.snr_db_max) {
-        (Some(min), Some(median), Some(max)) => {
-            println!("snr_2500_db: min={min:.1} median={median:.1} max={max:.1}");
-        }
-        // `tracks_promoted` is verdict()'s own authoritative signal for
-        // "did anything really happen" -- match its logic exactly rather
-        // than re-deriving it from a different combination of fields.
-        _ if report.tracks_promoted == 0 => {
-            println!("snr_2500_db: no TrackMeta events -- no track ever promoted")
-        }
-        _ => println!(
-            "snr_2500_db: a track was promoted but no TrackMeta ever landed for it before this \
-             run ended"
-        ),
-    }
-    println!(
-        "decode: {} chars ({} distinct), {} confirmed spots",
-        report.chars_decoded, report.distinct_chars, report.spots_confirmed
-    );
-    println!("verdict: {}", report.verdict().summary());
-}
-
-/// MAN-314: `decode`'s RTTY summary line, `rtty: 0` without RTTY.
+/// MAN-314: `decode`'s RTTY summary line, `rtty: 0` without RTTY;
+/// `decode` prints it only when RTTY was marked.
 fn rtty_line(signals: &[manta_engine::RttySignalReport], fs: f64) -> String {
     if signals.is_empty() {
         return "rtty: 0".into();
@@ -5703,8 +5673,6 @@ impl RttyLogState {
     }
 }
 
-=======
->>>>>>> aa54496fe41182ed6f7c81134c0372f1f2825870
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7564,6 +7532,33 @@ mod tests {
         assert!(metrics
             .render_prometheus_text()
             .contains(r#"manta_source_health{source="kiwi"} 0"#));
+    }
+
+    /// MAN-314: `manta_rtty_signals` is published only from the per-batch
+    /// callback, which cannot run while `listen()` is blocked in the
+    /// reconnecting `read()`, so the unhealthy transition must zero it or
+    /// it exports the pre-outage RTTY counts for the whole outage.
+    #[test]
+    fn source_health_sink_zeroes_rtty_signals_when_the_source_goes_unhealthy() {
+        use std::sync::Arc;
+
+        let metrics = Arc::new(manta_server::metrics::Metrics::new());
+        metrics.set_rtty_signals(&[14_080_000.0, 14_086_000.0]);
+        let mut sink = source_health_sink("kiwi", Some(metrics.clone()), None);
+
+        sink(true);
+        assert!(
+            metrics
+                .render_prometheus_text()
+                .contains(r#"manta_rtty_signals{band="20m"} 2"#),
+            "a healthy report leaves the marked RTTY set alone"
+        );
+        sink(false);
+        let text = metrics.render_prometheus_text();
+        assert!(
+            text.contains(r#"manta_rtty_signals{band="20m"} 0"#),
+            "an unhealthy source has no marked RTTY signals: {text}"
+        );
     }
 
     /// MAN-96: a reconnecting source's healthy -> unhealthy -> healthy

@@ -45,7 +45,8 @@ pub const STANDARD_SHIFTS_HZ: [f64; 5] = [170.0, 200.0, 425.0, 450.0, 850.0];
 pub const HOLD_BLOCKS: u32 = 30;
 /// Hard span = `[low tone channel - GUARD, high tone channel + GUARD]`.
 pub const GUARD_CHANNELS: usize = 1;
-/// Spawn-only splatter shadow: hard span +/- this many channels ...
+/// Spawn-only splatter shadow: the signal's `span_j` (not its hard span)
+/// +/- this many channels ...
 pub const SHADOW_WIDTH_CHANNELS: usize = 10;
 /// ... for candidates more than this many dB below the RTTY's key-down level.
 pub const SHADOW_DEPTH_DB: f64 = 40.0;

@@ -28,7 +28,8 @@ From then on the `TrackManager`:
 detector and reproduces the previous behaviour exactly. The marked set is
 exposed as:
 
-- the `rtty` array in `decode --json`, and an `rtty:` line in plain `decode`;
+- the `rtty` array in `decode --json`, and an `rtty:` line in plain `decode`
+  when RTTY was marked (a CW-only decode keeps MAN-270's one-line summary);
 - `RTTY marked:`/`RTTY cleared:` log lines in `run`;
 - the gauge `manta_rtty_signals{band}`, a count of marked signals per
   amateur band (`manta_server::band::band_for_freq_hz` of the mark

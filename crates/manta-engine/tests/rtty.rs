@@ -114,7 +114,14 @@ fn assert_scenario1(snr: f32) {
     assert_eq!(r.shift_hz, 170.0);
     assert!((r.mark_hz - mark).abs() < 25.0, "mark {}", r.mark_hz);
     let t = r.marked_sample_ts as f64 / FS;
-    assert!((20.0..=22.0).contains(&t), "marked at {t} s");
+    // A hop's `sample_ts` is its first sample, so the hop that completes
+    // 20 s of signal (7500 hops, MAN-115's pre-roll skip leaving none of
+    // them to the zero padding) is stamped one hop before 20 s.
+    let hop = (FS / manta_decode::FO_HZ) as u64;
+    assert!(
+        r.marked_sample_ts + hop >= (20.0 * FS) as u64 && t <= 22.0,
+        "marked at {t} s"
+    );
     let late = promotions_after(
         &report,
         r.marked_sample_ts,

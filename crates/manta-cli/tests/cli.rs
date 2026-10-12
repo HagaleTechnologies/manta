@@ -1300,7 +1300,8 @@ fn decode_plain_prints_rtty_line() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("rtty: 0"));
+    // No RTTY, no line: MAN-270 keeps a CW-only decode's summary one line.
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("rtty:"));
 
     let wav = write_rtty_wav(dir.path());
     let out = manta().arg("decode").arg(&wav).output().unwrap();

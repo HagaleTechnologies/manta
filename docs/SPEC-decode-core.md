@@ -303,7 +303,7 @@ Constants (compile-time, like the floor constants):
 | standard shifts | 170, 200, 425, 450, 850 Hz | the nominal shift is the nearest |
 | `HOLD_BLOCKS` | 30 | evidence and mark survive 30 blocks without a pass |
 | `GUARD_CHANNELS` | 1 | hard span = pair channels ± 1 |
-| `SHADOW_WIDTH_CHANNELS` | 10 | shadow = hard span ± 10 channels … |
+| `SHADOW_WIDTH_CHANNELS` | 10 | shadow = span ± 10 channels (not the hard span) … |
 | `SHADOW_DEPTH_DB` | 40.0 | … for candidates more than 40 dB below the key-down level |
 
 Per hop, for every channel: `snr = PdB[k] − F_eff[k]` is stored in the

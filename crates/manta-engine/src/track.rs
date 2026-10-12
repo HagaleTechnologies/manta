@@ -915,7 +915,9 @@ pub struct TrackManager {
     /// `DetectorConfig::silent_respawn_cooldown_hops`). `0` (the default,
     /// always `<= hop_counter`) means no active cooldown.
     channel_cooldown_until: Vec<u64>,
-<<<<<<< HEAD
+    /// MAN-115: channelizer hops with `m` below this are the zero-padding
+    /// pre-roll and are skipped by `process_hops`. See `skip_preroll_hops`.
+    preroll_hops: u64,
     /// MAN-314 (SPEC §2.6): the RTTY detector, `None` when
     /// `DetectorConfig::rtty_filter` is off.
     fsk: Option<FskDetector>,
@@ -948,11 +950,6 @@ pub struct RttyLogEntry {
     pub marked_sample_ts: u64,
     /// Sample timestamp of the hop that cleared it; `None` while marked.
     pub cleared_sample_ts: Option<u64>,
-=======
-    /// MAN-115: channelizer hops with `m` below this are the zero-padding
-    /// pre-roll and are skipped by `process_hops`. See `skip_preroll_hops`.
-    preroll_hops: u64,
->>>>>>> aa54496fe41182ed6f7c81134c0372f1f2825870
 }
 
 impl TrackManager {
@@ -979,16 +976,13 @@ impl TrackManager {
             channel_spacing_hz: fs / n_channels as f64,
             close_counts: CloseCounts::default(),
             channel_cooldown_until: vec![0; n_channels],
-<<<<<<< HEAD
+            preroll_hops: 0,
             fsk: detector_cfg.rtty_filter.then(|| {
                 let blocks = detector_cfg.rtty_dwell_hops / FSK_BLOCK_HOPS as u64;
                 FskDetector::new(n_channels, u32::try_from(blocks).unwrap_or(u32::MAX))
             }),
             rtty_log: Vec::new(),
             rtty_changes: 0,
-=======
-            preroll_hops: 0,
->>>>>>> aa54496fe41182ed6f7c81134c0372f1f2825870
         }
     }
 

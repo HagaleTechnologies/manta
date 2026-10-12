@@ -35,11 +35,10 @@ git history and `docs/DECISIONS/`.
 
 ### Added
 
-<<<<<<< HEAD
 - `[detector] rtty_filter`/`rtty_dwell_ms`; `manta_rtty_signals{band}`
-  gauge; `rtty` array in `decode --json` and an `rtty:` line in plain
-  `decode`; `RTTY marked`/`RTTY cleared` log lines in `run` (MAN-314).
-=======
+  gauge; `rtty` array in `decode --json` and, when RTTY was marked, an
+  `rtty:` line in plain `decode`; `RTTY marked`/`RTTY cleared` log lines in
+  `run` (MAN-314).
 - `manta health` asks a running daemon's `/healthz` and exits 0 when it
   reports healthy, 1 otherwise, reading the metrics port from the same config
   and `MANTA_*` overrides as `run` (MAN-81).
@@ -52,7 +51,6 @@ git history and `docs/DECISIONS/`.
 - `manta calibrate` measures the receiver's frequency error against a WWV,
   WWVH, BPM, RWM or NCDXF beacon carrier and, after confirmation, saves
   `freq_correction_ppm` to `[input]` in the config file (MAN-127).
->>>>>>> aa54496fe41182ed6f7c81134c0372f1f2825870
 - `manta doctor` checks the whole setup before its signal check: the config
   (`manta run`'s example-callsign and dial-frequency refusals), the audio
   library and sound-card inputs, that each `[server]` port is free, the
