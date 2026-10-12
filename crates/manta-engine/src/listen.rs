@@ -348,15 +348,13 @@ fn new_segment(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit(
     events: Vec<DecoderEvent>,
     validator: &mut Validator,
     lists: Option<&OperatorListsUpdate>,
-<<<<<<< HEAD
     mut references: Option<&mut ReferenceWatch>,
-=======
     quality: Option<&DecodeQualityObserver>,
->>>>>>> 0072662d322084656490cb9bd0cc47b74e685c81
     calibration_factor: f64,
     on_event: &mut impl FnMut(&DecoderEvent),
     on_spot: &mut impl FnMut(&crate::Spot),
@@ -564,11 +562,8 @@ pub fn listen_with_observers(
         events,
         &mut validator,
         observers.operator_lists.as_deref(),
-<<<<<<< HEAD
         references.as_mut(),
-=======
         observers.decode_quality.as_deref(),
->>>>>>> 0072662d322084656490cb9bd0cc47b74e685c81
         calibration_factor,
         &mut on_event,
         &mut on_spot,
@@ -585,11 +580,8 @@ pub fn listen_with_observers(
         events,
         &mut validator,
         observers.operator_lists.as_deref(),
-<<<<<<< HEAD
         references.as_mut(),
-=======
         observers.decode_quality.as_deref(),
->>>>>>> 0072662d322084656490cb9bd0cc47b74e685c81
         calibration_factor,
         &mut on_event,
         &mut on_spot,
@@ -634,11 +626,8 @@ pub fn listen_with_observers(
                 finish_events,
                 &mut validator,
                 observers.operator_lists.as_deref(),
-<<<<<<< HEAD
                 references.as_mut(),
-=======
                 observers.decode_quality.as_deref(),
->>>>>>> 0072662d322084656490cb9bd0cc47b74e685c81
                 calibration_factor,
                 &mut on_event,
                 &mut on_spot,
@@ -662,11 +651,8 @@ pub fn listen_with_observers(
                 events,
                 &mut validator,
                 observers.operator_lists.as_deref(),
-<<<<<<< HEAD
                 references.as_mut(),
-=======
                 observers.decode_quality.as_deref(),
->>>>>>> 0072662d322084656490cb9bd0cc47b74e685c81
                 calibration_factor,
                 &mut on_event,
                 &mut on_spot,
@@ -687,11 +673,8 @@ pub fn listen_with_observers(
             events,
             &mut validator,
             observers.operator_lists.as_deref(),
-<<<<<<< HEAD
             references.as_mut(),
-=======
             observers.decode_quality.as_deref(),
->>>>>>> 0072662d322084656490cb9bd0cc47b74e685c81
             calibration_factor,
             &mut on_event,
             &mut on_spot,
@@ -710,11 +693,8 @@ pub fn listen_with_observers(
         events,
         &mut validator,
         observers.operator_lists.as_deref(),
-<<<<<<< HEAD
         references.as_mut(),
-=======
         observers.decode_quality.as_deref(),
->>>>>>> 0072662d322084656490cb9bd0cc47b74e685c81
         calibration_factor,
         &mut on_event,
         &mut on_spot,

@@ -514,7 +514,9 @@ impl Refresher {
         let run = &mut self.runs[index];
         let kind = run.in_use.kind;
         let fresh_last_modified = body.as_ref().and_then(|(_, lm)| lm.clone());
-        let state = match run.state.take() {
+        // `known`: the state already named this version before this check,
+        // so a failed write leaves it no less accurate than it was.
+        let (state, known) = match run.state.take() {
             Some(mut state)
                 if state.sha256 == run.in_use.sha256 && state.url == run.url.as_str() =>
             {
@@ -522,16 +524,20 @@ impl Refresher {
                 if fresh_last_modified.is_some() {
                     state.last_modified = fresh_last_modified;
                 }
-                state
+                (state, true)
             }
-            _ => State {
-                sha256: run.in_use.sha256.clone(),
-                url: run.url.as_str().to_string(),
-                downloaded_at: unix_secs(now),
-                checked_at: unix_secs(now),
-                last_modified: fresh_last_modified,
-            },
+            _ => (
+                State {
+                    sha256: run.in_use.sha256.clone(),
+                    url: run.url.as_str().to_string(),
+                    downloaded_at: unix_secs(now),
+                    checked_at: unix_secs(now),
+                    last_modified: fresh_last_modified,
+                },
+                false,
+            ),
         };
+        let mut keep = true;
         if let Some(cache) = &self.cache {
             let written = match body {
                 // The cache may lack these bytes (the built-in copy is in
@@ -544,9 +550,12 @@ impl Refresher {
                     "warning: list cache: writing {}: {error}",
                     cache.state_path(kind).display()
                 ));
+                // As in `updated`: no conditional request for bytes the
+                // cache may not hold.
+                keep = known;
             }
         }
-        run.state = Some(state);
+        run.state = keep.then_some(state);
         run.in_use.confirmed_at = Some(now);
         run.next = now + kind.interval();
         run.scheduled_at = now;
@@ -578,11 +587,11 @@ impl Refresher {
             checked_at: unix_secs(now),
             last_modified: last_modified.clone(),
         };
+        let mut stored = true;
         if let Some(cache) = &self.cache {
-            let saved = cache
-                .store(kind, body, &state)
-                .and_then(|()| cache.prune(kind, &sha256));
-            if let Err(error) = saved {
+            let saved = cache.store(kind, body, &state);
+            stored = saved.is_ok();
+            if let Err(error) = saved.and_then(|()| cache.prune(kind, &sha256)) {
                 crate::logging::warning(&format!(
                     "warning: list cache: saving {}: {error}; the download is in use, but a \
                      restart starts from the previous copy",
@@ -590,7 +599,11 @@ impl Refresher {
                 ));
             }
         }
-        run.state = Some(state);
+        // A state whose version did not reach the cache must not make the
+        // next request conditional: a 304 would then write a state.json
+        // naming a file the cache lacks. With no state, the next check
+        // fetches the whole list and stores it.
+        run.state = stored.then_some(state);
         run.in_use = InUse {
             kind,
             sha256: sha256.clone(),
@@ -1202,6 +1215,52 @@ mod tests {
         assert_eq!(st.checked_at, unix_secs(later));
         let requests = server.requests.lock().unwrap();
         assert!(requests[1].contains("If-Modified-Since: Fri, 09 Oct 2026 00:00:00 GMT"));
+    }
+
+    #[test]
+    fn a_version_the_cache_failed_to_save_is_fetched_whole_next_time() {
+        // While the cache cannot be written, a conditional check could get
+        // a 304 that writes a state.json naming a version file never saved.
+        const LM: &str = "Tue, 15 Sep 2026 20:52:28 GMT";
+        let now = at(1_800_000_000);
+        let body = qq9_cty();
+        let sha = sha256_hex(body.as_bytes());
+        let (base, server) = serve(vec![ok(body.as_bytes(), Some(LM))]);
+        let url = HttpUrl::parse(&format!("{base}/cty.dat")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the cache directory should be: every write fails.
+        let cache_dir = dir.path().join("cache");
+        std::fs::write(&cache_dir, b"not a directory").unwrap();
+        let cache = Cache::new(cache_dir.clone());
+        let lists = Arc::new(bundled_lists());
+        let mut refresher =
+            refresher_for(ListKind::Cty, url, Some(cache.clone()), lists.clone(), now);
+        let if_modified_since = |i: usize| server.requests.lock().unwrap()[i].contains(LM);
+
+        // The download is in use but not saved.
+        assert_eq!(
+            refresher.refresh_once(ListKind::Cty, now),
+            ListRefreshOutcome::Updated
+        );
+        assert!(lists.cty.load().is_allocated("QQ9ZZZ"));
+        // A week on, still unwritable: the same bytes again, not saved.
+        assert_eq!(
+            refresher.refresh_once(ListKind::Cty, now + 7 * DAY),
+            ListRefreshOutcome::Unchanged
+        );
+        assert!(!if_modified_since(1));
+        // The disk recovers: a whole fetch, and this time it is saved.
+        std::fs::remove_file(&cache_dir).unwrap();
+        assert_eq!(
+            refresher.refresh_once(ListKind::Cty, now + 14 * DAY),
+            ListRefreshOutcome::Unchanged
+        );
+        assert!(!if_modified_since(2));
+        let (st, _) = cache.load_current(ListKind::Cty).unwrap().unwrap();
+        assert_eq!(st.sha256, sha);
+        // Saved, so the next check is conditional again.
+        refresher.refresh_once(ListKind::Cty, now + 21 * DAY);
+        assert!(if_modified_since(3));
     }
 
     #[test]

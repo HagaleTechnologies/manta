@@ -64,11 +64,7 @@ ignored. Any other path or any method other than `GET` gets
 
 ## Metric families
 
-<<<<<<< HEAD
-All 55 families, in the order `/metrics` renders them. Every family's
-=======
-All 56 families, in the order `/metrics` renders them. Every family's
->>>>>>> 0072662d322084656490cb9bd0cc47b74e685c81
+All 59 families, in the order `/metrics` renders them. Every family's
 `# HELP` and `# TYPE` lines are always rendered, except the ten
 RBN comparison families (MAN-301) at the end of the table, which are
 rendered only when `[rbn_compare]` is enabled. "Present when" says when

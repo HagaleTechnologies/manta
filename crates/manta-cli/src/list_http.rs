@@ -5,8 +5,9 @@
 //! can act on. See the MAN-316 plan, D7.
 
 use std::fmt;
-use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv6Addr, TcpStream, ToSocketAddrs};
+use std::io::{self, ErrorKind, Read, Write};
+use std::net::{Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 const DEFAULT_PORT: u16 = 80;
@@ -133,7 +134,8 @@ impl fmt::Display for HttpUrl {
 pub(crate) struct FetchLimits {
     /// Per resolved address.
     pub(crate) connect_timeout: Duration,
-    /// For the whole fetch, connect included; checked between reads.
+    /// For the whole fetch, name resolution and connect included; checked
+    /// between reads.
     pub(crate) deadline: Duration,
     pub(crate) max_body: u64,
     pub(crate) max_head: usize,
@@ -173,12 +175,15 @@ impl fmt::Display for FetchError {
 }
 
 /// One `GET`, with `If-Modified-Since` when given. Blocks for at most
-/// `limits.deadline` after name resolution.
+/// `limits.deadline`, name resolution included.
 pub(crate) fn get(
     url: &HttpUrl,
     if_modified_since: Option<&str>,
     limits: &FetchLimits,
 ) -> Result<Fetched, FetchError> {
+    // The value comes from an earlier response; a CR or LF in it would
+    // split the request, so it is dropped rather than sent.
+    let if_modified_since = if_modified_since.filter(|v| !v.chars().any(|c| c.is_control()));
     let mut conn = Conn::open(url, limits)?;
     conn.send(&request(url, if_modified_since))?;
 
@@ -198,7 +203,13 @@ pub(crate) fn get(
     };
     match response.code {
         200 => {}
-        304 => return Ok(Fetched::NotModified),
+        304 if if_modified_since.is_some() => return Ok(Fetched::NotModified),
+        // Nothing was asked of it, so it vouches for no copy.
+        304 => {
+            return Err(FetchError(format!(
+                "{status} to a request that sent no If-Modified-Since"
+            )))
+        }
         300..=399 => {
             return Err(FetchError(match header("location") {
                 Some(loc) if loc.to_ascii_lowercase().starts_with("http://") => format!(
@@ -286,9 +297,8 @@ fn request(url: &HttpUrl, if_modified_since: Option<&str>) -> Vec<u8> {
         url.host_header(),
         env!("CARGO_PKG_VERSION"),
     );
-    // The value comes from an earlier response; a CR or LF in it would
-    // split the request, so it is dropped rather than sent.
-    if let Some(ims) = if_modified_since.filter(|v| !v.chars().any(|c| c.is_control())) {
+    // `get` has already dropped a value carrying a control character.
+    if let Some(ims) = if_modified_since {
         req.push_str(&format!("If-Modified-Since: {ims}\r\n"));
     }
     req.push_str("\r\n");
@@ -308,10 +318,19 @@ impl Conn {
         let host_port = url.host_port();
         let connect_err =
             |e: &dyn fmt::Display| FetchError(format!("connecting to {host_port}: {e}"));
-        let addrs = (url.host.as_str(), url.port)
-            .to_socket_addrs()
-            .map_err(|e| connect_err(&e))?;
+        // The deadline starts before name resolution, so a slow resolver
+        // spends the fetch's time, not more of its own.
         let deadline = Instant::now() + limits.deadline;
+        let (host, port) = (url.host.clone(), url.port);
+        let lookup = move || {
+            (host.as_str(), port)
+                .to_socket_addrs()
+                .map(Iterator::collect)
+        };
+        let addrs = match resolve_within(lookup, limits.deadline) {
+            Some(result) => result.map_err(|e| connect_err(&e))?,
+            None => return Err(timed_out(limits.deadline)),
+        };
         let mut last_err = None;
         for addr in addrs {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -466,6 +485,31 @@ fn parse_head(head: &[u8]) -> Result<Head, FetchError> {
     })
 }
 
+/// Runs `lookup` on its own thread and waits at most `within` for it.
+/// `None` when it has not answered by then; it is left to finish, or not,
+/// on that thread, which nothing joins.
+fn resolve_within<F>(lookup: F, within: Duration) -> Option<io::Result<Vec<SocketAddr>>>
+where
+    F: FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("manta-lists-dns".into())
+        .spawn(move || {
+            let _ = tx.send(lookup());
+        });
+    if let Err(e) = spawned {
+        return Some(Err(e));
+    }
+    match rx.recv_timeout(within) {
+        Ok(result) => Some(result),
+        Err(RecvTimeoutError::Timeout) => None,
+        Err(RecvTimeoutError::Disconnected) => Some(Err(io::Error::other(
+            "the name lookup ended without an answer",
+        ))),
+    }
+}
+
 fn timed_out(allowed: Duration) -> FetchError {
     let secs = if allowed.subsec_nanos() == 0 {
         allowed.as_secs().to_string()
@@ -605,6 +649,41 @@ mod tests {
             req.contains(&format!("\r\nIf-Modified-Since: {LM}\r\n")),
             "{req}"
         );
+    }
+
+    #[test]
+    fn a_304_to_a_request_without_if_modified_since_is_a_failure() {
+        // No value, and a value `get` drops for its control character:
+        // neither request is conditional, so neither 304 vouches for a copy.
+        for ims in [None, Some("Tue, 15 Sep 2026\n20:52:28 GMT")] {
+            let (url, server) = serve(
+                "/MASTER.SCP",
+                Then::Close,
+                canned("HTTP/1.1 304 Not Modified\r\n\r\n"),
+            );
+            assert_eq!(
+                get(&url, ims, &quick()).unwrap_err().to_string(),
+                "HTTP 304 Not Modified to a request that sent no If-Modified-Since"
+            );
+            let req = server.join().unwrap();
+            assert!(!req.contains("If-Modified-Since"), "{req}");
+        }
+    }
+
+    #[test]
+    fn a_slow_name_lookup_spends_the_fetch_deadline() {
+        let started = Instant::now();
+        let slow = || {
+            std::thread::sleep(Duration::from_secs(3));
+            Ok(Vec::new())
+        };
+        assert!(resolve_within(slow, Duration::from_millis(200)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let addr: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        let quick_lookup = move || Ok(vec![addr]);
+        let got = resolve_within(quick_lookup, Duration::from_secs(5));
+        assert_eq!(got.unwrap().unwrap(), vec![addr]);
     }
 
     #[test]
