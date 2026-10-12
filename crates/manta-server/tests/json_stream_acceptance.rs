@@ -1127,3 +1127,146 @@ async fn a_second_ws_connection_from_the_same_ip_cannot_multiply_the_ping_rate_b
         ),
     }
 }
+
+// ---- MAN-301: `spotGrade` records share the JSON stream ----
+
+const GRADE_LINE: &str = r#"{"kind":"spotGrade","spotId":"W3XYZ:0:1:0:JA1ABC","call":"JA1ABC","band":"20m","spotTime":1791720000,"windowClose":1791720180,"windowS":180,"grade":"match","disagreements":[],"mantaFreqHz":14027100,"mantaWpm":28,"rbnModalFreqHz":14027000,"rbnMedianWpm":28.0,"rbnSkimmers":1,"rbnReports":1,"freqOffsetHz":100,"rbnBands":["20m"],"spotterFilter":[]}"#;
+
+fn scraped(metrics: &Metrics, series: &str) -> u64 {
+    metrics
+        .render_prometheus_text()
+        .lines()
+        .find_map(|l| l.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+        .unwrap_or_else(|| panic!("{series} not rendered"))
+}
+
+/// MAN-301: a published grade line reaches raw-TCP and WebSocket clients
+/// verbatim, after the spot it grades.
+#[tokio::test]
+async fn grade_lines_reach_raw_tcp_and_websocket_clients() {
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let mut tcp = BufReader::new(TcpStream::connect(addr).await.unwrap());
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+        .await
+        .expect("ws connect failed");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    bus.publish(sample_spot());
+    bus.publish_grade(Arc::from(GRADE_LINE));
+
+    let mut lines = Vec::new();
+    for _ in 0..2 {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), tcp.read_line(&mut line))
+            .await
+            .expect("timed out waiting for a TCP line")
+            .unwrap();
+        lines.push(line);
+    }
+    let spot: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    assert_eq!(spot["dxCall"], "JA1ABC");
+    assert_eq!(
+        lines[1],
+        format!("{GRADE_LINE}\n"),
+        "TCP grade line verbatim"
+    );
+
+    let mut texts = Vec::new();
+    for _ in 0..2 {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("timed out waiting for a ws message")
+            .expect("stream ended")
+            .expect("ws error");
+        texts.push(msg.into_text().expect("text frame").to_string());
+    }
+    let spot: serde_json::Value = serde_json::from_str(&texts[0]).unwrap();
+    assert_eq!(spot["dxCall"], "JA1ABC");
+    assert_eq!(texts[1], GRADE_LINE, "WebSocket grade message verbatim");
+
+    let _ = ws.close(None).await;
+}
+
+/// MAN-301: with no grade ever published, a client sees exactly the spot
+/// lines it saw before the JSON channel learned to carry grades -- no
+/// extra line, no `kind` key. (The 19 pre-MAN-301 tests in this file stay
+/// unmodified for the same guarantee.)
+#[tokio::test]
+async fn stream_is_unchanged_when_no_grades_are_published() {
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let mut tcp = BufReader::new(TcpStream::connect(addr).await.unwrap());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for track_id in 1..=3u32 {
+        let mut spot = sample_spot();
+        spot.track_id = track_id;
+        bus.publish(spot);
+    }
+
+    for _ in 0..3 {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), tcp.read_line(&mut line))
+            .await
+            .expect("timed out waiting for a spot line")
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["dxCall"], "JA1ABC");
+        assert!(value.get("kind").is_none(), "{line}");
+    }
+    let mut extra = String::new();
+    let more = tokio::time::timeout(Duration::from_millis(300), tcp.read_line(&mut extra)).await;
+    assert!(
+        more.is_err(),
+        "no line beyond the three spots, got {extra:?}"
+    );
+}
+
+/// MAN-301: grades count against a slow client's lag budget exactly as
+/// spots do -- it is disconnected, and every grade it never received is
+/// counted in `manta_spots_dropped_lagged_total`.
+#[tokio::test]
+async fn a_lagging_client_is_disconnected_and_lost_grades_are_counted() {
+    // `bus::CHANNEL_CAPACITY` (1024) plus a margin, published without
+    // yielding so the (current-thread) handler cannot drain in between.
+    const BURST: u64 = 1024 + 10;
+
+    let (addr, bus, metrics, _shutdown_tx) = spawn_server().await;
+    let mut tcp = BufReader::new(TcpStream::connect(addr).await.unwrap());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Prove the client is in its stream loop before the burst.
+    bus.publish(sample_spot());
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), tcp.read_line(&mut line))
+        .await
+        .expect("timed out waiting for the first spot")
+        .unwrap();
+
+    for _ in 0..BURST {
+        bus.publish_grade(Arc::from(GRADE_LINE));
+    }
+
+    let mut delivered = 0u64;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            match tcp.read_line(&mut line).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {
+                    assert_eq!(line, format!("{GRADE_LINE}\n"));
+                    delivered += 1;
+                }
+            }
+        }
+    })
+    .await
+    .expect("a lagging client must be disconnected");
+
+    let lost = scraped(&metrics, "manta_spots_dropped_lagged_total");
+    assert!(lost > 0, "the burst must have lagged the client");
+    assert_eq!(
+        delivered + lost,
+        BURST,
+        "every grade is delivered or counted, never neither"
+    );
+}

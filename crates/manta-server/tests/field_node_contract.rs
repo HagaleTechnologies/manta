@@ -91,3 +91,65 @@ fn the_committed_live_fixture_carries_every_required_metric() {
         );
     }
 }
+
+/// MAN-301: `scripts/field-node.py`'s `validate_spot_line` accepts any JSON
+/// object carrying `dxCall`, `frequency` and `timestamp` as a spot. A
+/// `spotGrade` record sharing the stream must never carry those three keys,
+/// or every grade would be archived (and later loaded by
+/// `shadow-compare.py`) as a second spot. Pinned here for every grade kind.
+#[test]
+fn grade_records_never_look_like_spots_to_field_node() {
+    use manta_server::rbn_compare::grade::{grade_spot, GradeConfig, GradeInput, RbnReport};
+
+    let cfg = GradeConfig::default();
+    let spot = GradeInput {
+        spot_id: "W3XYZ-1:1791719990000000000:7:960000:W1AW".to_string(),
+        call: "W1AW".to_string(),
+        time: 1_791_720_000,
+        freq_hz: 14_025_100,
+        wpm: Some(25),
+    };
+    let rbn = |spotter: &str, freq_hz: f64, wpm: f64| RbnReport {
+        spotter: spotter.to_string(),
+        call: "W1AW".to_string(),
+        freq_hz,
+        wpm: Some(wpm),
+        time: 1_791_720_030,
+    };
+    let near = [rbn("K5TR", 14_025_000.0, 24.0)];
+    let far = [rbn("K5TR", 14_027_000.0, 24.0)];
+    let elsewhere = [rbn("K5TR", 7_025_000.0, 24.0)];
+    let cases: [(&[RbnReport], bool); 5] = [
+        (&near, true),
+        (&far, true),
+        (&elsewhere, true),
+        (&[], true),
+        (&[], false),
+    ];
+
+    let mut kinds = std::collections::BTreeSet::new();
+    for (reports, covered) in cases {
+        let candidates: Vec<&RbnReport> = reports.iter().collect();
+        let grade = grade_spot(&spot, &candidates, covered, &cfg);
+        let value = serde_json::to_value(&grade).unwrap();
+        let obj = value.as_object().expect("a grade is a JSON object");
+        for key in ["dxCall", "frequency", "timestamp"] {
+            assert!(
+                !obj.contains_key(key),
+                "a {} grade carries `{key}`, which field-node.py reads as a spot: {value}",
+                value["grade"]
+            );
+        }
+        assert_eq!(value["kind"], "spotGrade", "{value}");
+        assert!(value["windowClose"].is_i64(), "{value}");
+        kinds.insert(value["grade"].as_str().unwrap().to_string());
+    }
+    assert_eq!(
+        kinds,
+        ["disagree", "elsewhere", "match", "none", "unknown"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        "every grade kind is covered"
+    );
+}

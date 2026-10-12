@@ -1190,6 +1190,8 @@ mod tests {
             text: String::new(),
             events,
             spots,
+            rtty: Vec::new(),
+            sample_rate_hz: 192_000.0,
         }
     }
 

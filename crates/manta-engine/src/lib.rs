@@ -6,6 +6,7 @@ pub mod config_file;
 pub mod listen;
 pub use listen::{
     listen, listen_with_observers, ListenObservers, OperatorLists, OperatorListsUpdate,
+    RttyObserver,
 };
 pub mod latency;
 pub use latency::{DecodeLatencyObserver, DecodeLatencySnapshot, DECODE_LATENCY_BUCKETS_SECONDS};
@@ -180,6 +181,48 @@ pub struct DecodeReport {
     /// Validated spots (`manta-spot::Validator`, ARCHITECTURE §6), run
     /// over the full multi-track event stream above.
     pub spots: Vec<Spot>,
+    /// MAN-314: every RTTY signal the detector marked (SPEC §2.6); empty
+    /// for input without RTTY or with `rtty_filter` off.
+    pub rtty: Vec<RttySignalReport>,
+    /// Input sample rate, for turning `rtty` sample timestamps into
+    /// seconds; not serialized.
+    #[serde(skip)]
+    pub sample_rate_hz: f64,
+}
+
+/// MAN-314: one marked RTTY signal (SPEC §2.6), frequencies calibrated
+/// like `TrackMeta::freq_hz`. `marked_sample_ts`/`cleared_sample_ts` are
+/// stream sample timestamps; `cleared_sample_ts` is `None` while marked.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RttySignalReport {
+    /// Upper tone.
+    pub mark_hz: f64,
+    /// Lower tone.
+    pub space_hz: f64,
+    /// Nearest standard shift (170/200/425/450/850 Hz).
+    pub shift_hz: f64,
+    /// Measured `mark_hz - space_hz`, uncalibrated.
+    pub measured_shift_hz: f64,
+    pub marked_sample_ts: u64,
+    pub cleared_sample_ts: Option<u64>,
+    /// Detector id, stable while marked; not serialized.
+    #[serde(skip)]
+    pub id: u32,
+}
+
+impl RttySignalReport {
+    /// `entry` with its frequencies multiplied by `calibration_factor`.
+    pub(crate) fn from_entry(entry: &track::RttyLogEntry, calibration_factor: f64) -> Self {
+        RttySignalReport {
+            mark_hz: entry.mark_hz * calibration_factor,
+            space_hz: entry.space_hz * calibration_factor,
+            shift_hz: entry.shift_hz,
+            measured_shift_hz: entry.measured_shift_hz,
+            marked_sample_ts: entry.marked_sample_ts,
+            cleared_sample_ts: entry.cleared_sample_ts,
+            id: entry.id,
+        }
+    }
 }
 
 /// M0 pipeline: estimate frequency, extract one channel, decode. SPEC
@@ -226,6 +269,9 @@ pub fn decode_samples(
         cfg.decode.clone(),
     );
     tm.skip_preroll_hops(pad_hops);
+    // MAN-314: `DecodeReport::rtty` lists every marked signal, so the
+    // streaming cap on the RTTY log does not apply to a file decode.
+    tm.keep_full_rtty_history();
     // Feed the channelizer/track-manager in bounded chunks rather than one
     // `ch.process(&padded_iq)` + one `tm.process_hops(...)` call over the
     // whole file. `Channelizer::process` is chunk-size-invariant (proved by
@@ -255,17 +301,26 @@ pub fn decode_samples(
     if !any_hops {
         bail!("no signal found (input shorter than one filter length or empty)");
     }
+    let rtty: Vec<RttySignalReport> = tm
+        .rtty_signals()
+        .iter()
+        .map(|e| RttySignalReport::from_entry(e, calibration_factor))
+        .collect();
     events.extend(tm.finish());
 
-    if events.is_empty() {
+    // MAN-314: a marked RTTY signal is a finding on its own, so input with
+    // RTTY but no CW decoder output still returns a report (empty CW
+    // fields, `rtty` filled) instead of "no signal found".
+    if events.is_empty() && rtty.is_empty() {
         bail!("no signal found (input shorter than one filter length or empty)");
     }
-    let Some(min_track_id) = primary_track_id(&events) else {
+    let min_track_id = primary_track_id(&events);
+    if min_track_id.is_none() && rtty.is_empty() {
         bail!("no signal found (only detector promotion events, no decoder output)");
-    };
+    }
     let this_track: Vec<DecoderEvent> = events
         .iter()
-        .filter(|e| track::event_track_id(e) == min_track_id)
+        .filter(|e| Some(track::event_track_id(e)) == min_track_id)
         .cloned()
         .collect();
     let freq_hz = this_track
@@ -309,6 +364,8 @@ pub fn decode_samples(
         text,
         events,
         spots,
+        rtty,
+        sample_rate_hz: fs,
     })
 }
 
