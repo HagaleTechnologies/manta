@@ -94,9 +94,12 @@ list to the build matrix's `artifact:` entries.
 
 `## [Unreleased]` entries move under `## [0.1.0] - 2026-10-11`, above an
 empty `## [Unreleased]`, so the tagged tree carries the right CHANGELOG.
-None of them is under `### Decoder output`, so `0.1.0` needs no version
-bump. If the tag slips by days, the heading's date may differ from the tag
-date by that much; the owner can amend it in review.
+The `0.1.0` section includes MAN-172's `### Decoder output` entry. It still
+needs no version bump: the runbook's "Cutting a release" step 1 requires a
+release with a `### Decoder output` section to be at least a MINOR bump over
+the previous release, and `0.1.0`, the workspace's current version, is the
+first release. If the tag slips by days, the heading's date may differ from
+the tag date by that much; the owner can amend it in review.
 
 ### D6: the MAN-244 positive approval rehearsal is v0.1.0 itself
 
