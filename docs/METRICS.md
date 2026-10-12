@@ -68,8 +68,10 @@ in `RUNBOOKS/monitoring/`; see
 
 ## Metric families
 
-All 41 families, in the order `/metrics` renders them. Every family's
-`# HELP` and `# TYPE` lines are always rendered. "Present when" says when
+All 56 families, in the order `/metrics` renders them. Every family's
+`# HELP` and `# TYPE` lines are always rendered, except the ten
+RBN comparison families (MAN-301) at the end of the table, which are
+rendered only when `[rbn_compare]` is enabled. "Present when" says when
 the family also carries samples. Where it says a family has no samples, the
 value is absent, not zero: the node does not measure it, so do not read the
 missing series as "no loss" or "no traffic".
@@ -89,6 +91,7 @@ missing series as "no loss" or "no traffic".
 | `manta_json_clients_connected` | gauge | — | Currently connected JSON Lines clients. | Always. |
 | `manta_ws_clients_connected` | gauge | — | Currently connected WebSocket clients. | Always. |
 | `manta_active_tracks` | gauge | — | Currently active decoder tracks. Copied from the decode loop every 250 ms; set to 0 while the source is in an outage. | Always. |
+| `manta_rtty_signals` | gauge | `band` | RTTY (two-tone FSK) signals the detector currently marks, by amateur band. CW tracks are not started on a marked signal ([MAN-314](DECISIONS/2026-10-11-man314-rtty-recognition.md)). `band` is a band name such as `20m`, or `unknown` outside every band. Copied from the decode loop on every change; set to 0 while the source is in an outage and at shutdown. | One series per band after the first RTTY mark in that band; the series stays (at 0) after its signals clear. No samples before the first mark. |
 | `manta_source_health` | gauge | `source` | Health of each input source: 1 healthy, 0 unhealthy. `source` is the input type: `file`, `audio`, `kiwi`, `soapy` or `hpsdr`. | One series per registered source, from the first health report. A file replay reports 1 at startup. Reconnecting sources report on each connect and disconnect; HPSDR reads 0 until the radio is confirmed live. |
 | `manta_source_outages_total` | counter | `source` | Times each input source went from healthy to unhealthy (a lost connection or failed read). A source that starts unhealthy has not had an outage. | Same `source` set as `manta_source_health`; starts at 0. |
 | `manta_source_down_seconds_total` | counter | `source` | Seconds each input source spent in outages that have ended. An outage still in progress is added when it ends; until then it shows only as `manta_source_health` 0. | Same `source` set as `manta_source_health`; starts at 0. |
@@ -115,8 +118,22 @@ missing series as "no loss" or "no traffic".
 | `manta_uptime_seconds` | gauge | — | Seconds since this daemon's spot server and metrics endpoint started, from a monotonic clock. | Always. |
 | `manta_build_info` | gauge | `version`, `git_sha`, `features` | Build metadata; the value is always 1. Labels carry the crate version, the git commit (`unknown` for a build without `.git`, such as the Docker image; a build-time `MANTA_GIT_SHA` override is used verbatim if it is SemVer build metadata, so it need not be a hex SHA — see `decoderVersion` in [SPOT-SCHEMA.md](SPOT-SCHEMA.md)) and the compiled-in optional features (`none` if there are none). | Always in the daemon, one series. |
 | `manta_decode_latency_seconds` | histogram | `le` | Wall-clock time the decode thread spent processing one input chunk (channelize, track, decode, validate), excluding the wait for source data. To keep up with real time each observation must stay below that chunk's own duration, n samples / sample rate. A full chunk is 2048 samples, but KiwiSDR, HPSDR and the last read of a file can return shorter ones, so 2048 / sample rate is only the full-chunk upper bound, not a threshold every observation can be compared with. Buckets: 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5 s and `+Inf`, plus `_sum` and `_count`. | From startup: the daemon publishes an all-zero histogram just before the decode loop starts, then refreshes it every 250 ms. A scrape in the instant before that sees the `# TYPE` line only. |
+| `manta_decode_chars_total` | counter | — | Characters decoded across every track (`CharDecoded` events). The denominator for the garble rate below. | From startup at 0: the daemon publishes it just before the decode loop starts, then refreshes it every 250 ms with `manta_decode_latency_seconds`. |
+| `manta_decode_garbles_total` | counter | — | Characters the decoder could not match to any Morse character (every beam branch rejected the marks), across every track. Engines `legacy` and `edge-legacy` produce garbles; `hsmm` never does. Rare on a healthy node: the beam usually commits a wrong character instead (V8w: 3 garbles in 9,690 characters), so read a sudden rise as a fault. See [MAN-118](DECISIONS/2026-10-12-man118-decode-quality-metrics.md). | As `manta_decode_chars_total`. |
+| `manta_track_rail_ratio` | histogram | `le` | Keying-rail ratio (mark rail / space rail amplitude) of each decoding track, sampled once per second per track at the same hop `TrackMeta` reports on. Deep, clean keying reads high (V1: median 22); fading or QRM eating the keying depth pulls it toward 2, the floor the rails collapse to (V5's CCIR-poor fading: median 3.3). `le="2"` counts samples at that floor. Buckets: 2, 2.5, 3, 4, 6, 10, 16, 25, 40, 63 and `+Inf`, plus `_sum` and `_count`. `legacy` engine only. No `track_id` label: each observation is one track's value. | As `manta_decode_chars_total`. Buckets stay at 0 until a track's rails initialise, and always under `[decode] engine = "edge-legacy"` or `"hsmm"`, which have no keying rails. |
+| `manta_candidate_repetitions` | histogram | `le` | One observation per callsign candidate the repetition gate scored: how many message-distinct decodes of that call near that frequency it had seen within the trailing 90 s, this one included. A candidate needs 2 to spot, so the `le="1"` share is the share of candidates nobody repeated (a busted-call proxy). Buckets: 1, 2, 3, 4, 5, 6, 8, 10, 15, 20 and `+Inf`, plus `_sum` and `_count`. | As `manta_decode_chars_total`. |
 | `manta_healthy` | gauge | — | Whether `/healthz` currently reports this node healthy (1) or not (0). Same evaluation as `/healthz`. | Always. |
 | `manta_listener_up` | gauge | `listener` | Whether each listener is currently up (1) or down (0). `listener` is `telnet`, `json` or `metrics`. | One series per listener once the listeners have started; a listener whose task ends reads 0. |
+| `manta_rbn_compare_grades_total` | counter | `band`, `grade` | Spots graded against the RBN feed since start, by the spot's band and grade (`match`, `disagree`, `elsewhere`, `none`, `unknown`). | Only with `[rbn_compare]` enabled: the family's `# HELP`/`# TYPE` lines are absent otherwise. One series per (band, grade) pair after its first grade. |
+| `manta_rbn_compare_grades_last_hour` | gauge | `band`, `grade` | Spots graded in the last hour, by band and grade. | Only with `[rbn_compare]` enabled, as for `manta_rbn_compare_grades_total`. |
+| `manta_rbn_compare_disagreements_last_hour` | gauge | `band`, `kind` | Spots graded `disagree` in the last hour, by band and the tolerance that failed (`frequency` or `speed`); a spot failing both counts under each. | Only with `[rbn_compare]` enabled. |
+| `manta_rbn_compare_freq_offset_median_hz` | gauge | `band` | Median of manta's frequency minus RBN's modal frequency, in Hz, over spots graded `match` or `disagree` in the last hour. | Only with `[rbn_compare]` enabled, per band with at least one such spot. |
+| `manta_rbn_compare_freq_offset_samples` | gauge | `band` | Spots the median frequency offset is computed over. | As for `manta_rbn_compare_freq_offset_median_hz`. |
+| `manta_rbn_compare_feed_connected` | gauge | — | Whether the RBN feed is logged in and delivering lines (1) or not (0). | Only with `[rbn_compare]` enabled. |
+| `manta_rbn_compare_feed_reports_total` | counter | — | CW reports accepted from the RBN feed. | Only with `[rbn_compare]` enabled; starts at 0. |
+| `manta_rbn_compare_feed_reconnects_total` | counter | — | RBN feed connections lost or failed. | Only with `[rbn_compare]` enabled; starts at 0. |
+| `manta_rbn_compare_pending` | gauge | — | Spots not yet graded: waiting for their comparison window to close, or held past the close while the feed is silent. | Only with `[rbn_compare]` enabled. |
+| `manta_rbn_compare_ungraded_total` | counter | — | Spots never graded: the pending queue was full, or the comparator lagged the spot bus. | Only with `[rbn_compare]` enabled; starts at 0. |
 
 ### Sample
 
@@ -274,5 +291,10 @@ For what each uplink state means and what to do about it, see
   source outage counters.
 - [MAN-132](DECISIONS/2026-10-08-man132-metrics-loopback-bind.md): the
   loopback default for `metrics_bind_addr`.
+<<<<<<< HEAD
 - [MAN-129](DECISIONS/2026-10-12-man129-dashboard-and-alerts.md): the shipped
   Grafana dashboard and Prometheus alert rules.
+=======
+- [MAN-301](DECISIONS/2026-10-11-man301-live-rbn-comparison.md): the
+  RBN comparison families.
+>>>>>>> 0072662d322084656490cb9bd0cc47b74e685c81
