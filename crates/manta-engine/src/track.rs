@@ -529,6 +529,23 @@ fn publish_garbles(
     }
 }
 
+/// MAN-118: one rail-ratio sample per track per SPEC §5 reporting interval
+/// (1 Hz), on the hop `TrackMeta` fires on. Called after every queued hop's
+/// `push_hop`, in `drain_pool` and both `finish_decoder*` flushes, so a
+/// boundary is sampled whichever path drains it. `None` before the rails
+/// initialize and for engines without them records nothing.
+fn sample_rail_ratio_at_boundary(decoder: &TrackDecoder, quality: Option<&DecodeQualityObserver>) {
+    if !decoder
+        .hop_count()
+        .is_multiple_of(manta_decode::META_INTERVAL_HOPS)
+    {
+        return;
+    }
+    if let (Some(q), Some(ratio)) = (quality, decoder.rail_ratio()) {
+        q.observe_rail_ratio(ratio);
+    }
+}
+
 /// SPEC §1.1 f(k) mapping: signed channel offset from center, FFT bin order.
 fn wrapped_channel_offset(k: usize, n_channels: usize) -> f64 {
     let half = n_channels as i64 / 2;
@@ -782,7 +799,8 @@ impl Track {
     /// for Merged/Evicted, where forcing finalization would fabricate
     /// content instead (round 7).
     ///
-    /// MAN-118: garbles the flush produces are published to `quality`.
+    /// MAN-118: garbles the flush produces, and the rail ratio at each
+    /// reporting boundary it crosses, are published to `quality`.
     fn finish_decoder(&mut self, quality: Option<&DecodeQualityObserver>) -> Vec<DecoderEvent> {
         let Some(decoder) = self.decoder.as_mut() else {
             return Vec::new();
@@ -800,6 +818,7 @@ impl Track {
             if decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0 {
                 self.snr_peak_db = f32::NEG_INFINITY;
             }
+            sample_rail_ratio_at_boundary(decoder, quality);
             events.extend(hop_events);
         }
         events.extend(decoder.finish());
@@ -819,7 +838,8 @@ impl Track {
     /// synthesize a "T" character, forming the exact `<call> T` Beacon
     /// pattern out of noise.
     ///
-    /// MAN-118: garbles the flush produces are published to `quality`.
+    /// MAN-118: garbles the flush produces, and the rail ratio at each
+    /// reporting boundary it crosses, are published to `quality`.
     fn finish_decoder_speed_only(
         &mut self,
         quality: Option<&DecodeQualityObserver>,
@@ -840,6 +860,7 @@ impl Track {
             if decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0 {
                 self.snr_peak_db = f32::NEG_INFINITY;
             }
+            sample_rail_ratio_at_boundary(decoder, quality);
             events.extend(hop_events);
         }
         events.extend(decoder.finish_speed_only());
@@ -949,11 +970,9 @@ pub struct TrackManager {
     /// MAN-115: channelizer hops with `m` below this are the zero-padding
     /// pre-roll and are skipped by `process_hops`. See `skip_preroll_hops`.
     preroll_hops: u64,
-<<<<<<< HEAD
     /// MAN-118: where garbles and per-track rail ratios are published.
     /// `None` (the default) skips both. See `set_quality_observer`.
     quality: Option<Arc<DecodeQualityObserver>>,
-=======
     /// MAN-314 (SPEC §2.6): the RTTY detector, `None` when
     /// `DetectorConfig::rtty_filter` is off.
     fsk: Option<FskDetector>,
@@ -995,7 +1014,6 @@ pub struct RttyLogEntry {
     pub marked_sample_ts: u64,
     /// Sample timestamp of the hop that cleared it; `None` while marked.
     pub cleared_sample_ts: Option<u64>,
->>>>>>> 2c7a2f50a96ba2bbba78de3ffb9aca9b5a28fd85
 }
 
 impl TrackManager {
@@ -1023,9 +1041,7 @@ impl TrackManager {
             close_counts: CloseCounts::default(),
             channel_cooldown_until: vec![0; n_channels],
             preroll_hops: 0,
-<<<<<<< HEAD
             quality: None,
-=======
             fsk: detector_cfg.rtty_filter.then(|| {
                 let blocks = detector_cfg.rtty_dwell_hops / FSK_BLOCK_HOPS as u64;
                 FskDetector::new(n_channels, u32::try_from(blocks).unwrap_or(u32::MAX))
@@ -1034,7 +1050,6 @@ impl TrackManager {
             rtty_log_capped: true,
             rtty_changes: 0,
             rtty_changed_sample_ts: 0,
->>>>>>> 2c7a2f50a96ba2bbba78de3ffb9aca9b5a28fd85
         }
     }
 
@@ -2022,16 +2037,8 @@ impl TrackManager {
                     let hop_events = decoder.push_hop(amp, raw_power, spectral_ref_power, ts);
                     if decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0 {
                         *peak = f32::NEG_INFINITY;
-                        // MAN-118: one rail-ratio sample per track per
-                        // reporting interval (1 Hz), the hop `TrackMeta`
-                        // fires on. `None` before the rails initialize and
-                        // for engines without them.
-                        if let Some(q) = quality {
-                            if let Some(ratio) = decoder.rail_ratio() {
-                                q.observe_rail_ratio(ratio);
-                            }
-                        }
                     }
+                    sample_rail_ratio_at_boundary(decoder, quality);
                     out.extend(hop_events);
                 }
                 publish_garbles(decoder, garbles_published, quality);
@@ -2258,6 +2265,50 @@ mod tests {
             hang_hops: 10,
             gc_hops: 20,
             ..DetectorConfig::default()
+        }
+    }
+
+    /// MAN-118 PR #277 review: a closing track's flush drains its queued
+    /// hops through the decoder, so a 1 Hz reporting boundary it crosses
+    /// must reach `manta_track_rail_ratio` just as one `drain_pool` crosses
+    /// does. One interval of keyed envelope initializes the `Legacy` rails
+    /// by its last hop, the boundary, so each path records one sample.
+    #[test]
+    fn every_pending_drain_samples_the_rail_ratio_at_a_reporting_boundary() {
+        let keyed: Vec<f32> = (0..12)
+            .flat_map(|_| [1.0f32; 15].into_iter().chain([0.01f32; 15]))
+            .chain([1.0f32; 15])
+            .collect();
+        assert_eq!(keyed.len() as u64, manta_decode::META_INTERVAL_HOPS);
+        let queue = || -> Vec<(f32, f32, Option<f32>, u64, f32)> {
+            keyed
+                .iter()
+                .enumerate()
+                .map(|(i, &a)| (a, a * a, None, i as u64 * 256, 20.0))
+                .collect()
+        };
+        let rail_samples = |path: &str| {
+            let obs = Arc::new(DecodeQualityObserver::new());
+            let mut tm =
+                TrackManager::new(64, 96_000.0, 14_000_000.0, cfg(), DecodeConfig::default());
+            tm.set_quality_observer(Some(obs.clone()));
+            tm.spawn(10);
+            let track = tm.tracks.values_mut().next().unwrap();
+            track.decoder = Some(TrackDecoder::new(track.id, DecodeConfig::default()));
+            track.pending = queue();
+            match path {
+                "drain_pool" => drop(tm.drain_pool()),
+                "finish_decoder" => drop(track.finish_decoder(Some(&obs))),
+                _ => drop(track.finish_decoder_speed_only(Some(&obs))),
+            }
+            obs.snapshot().rail_ratio_count
+        };
+        for path in ["drain_pool", "finish_decoder", "finish_decoder_speed_only"] {
+            assert_eq!(
+                rail_samples(path),
+                1,
+                "{path} must sample the boundary it crosses"
+            );
         }
     }
 

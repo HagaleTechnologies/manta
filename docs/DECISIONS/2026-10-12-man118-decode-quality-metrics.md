@@ -41,8 +41,10 @@ the decode loop (found by the 2026-09-05 broad review, lens 3, hit-list
 - **D3 — the rail ratio is sampled once per second per track,** at the
   hop each track crosses its SPEC §5 `META_INTERVAL_HOPS` boundary, the same
   hop `TrackMeta` reports on and `drain_pool` already resets the SNR peak
-  on. Buckets 2, 2.5, 3, 4, 6, 10, 16, 25, 40, 63 cover the measured range
-  (2.0 to about 65) and put the rail-collapse floor in its own bucket:
+  on. A closing track's `finish_decoder*` flush samples the boundaries its
+  queued hops cross the same way. Buckets 2, 2.5, 3, 4, 6, 10, 16, 25, 40,
+  63 cover the measured range (2.0 to about 65) and put the rail-collapse
+  floor in its own bucket:
   `envelope.rs` keeps `E_hi >= 2·E_lo`, so floor samples read exactly 2.
 - **D4 — the rail ratio is `legacy`-engine only.** `edge-legacy` and
   `hsmm` have no `Demod` rails; `TrackDecoder::rail_ratio()` returns `None`
