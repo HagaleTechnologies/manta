@@ -100,6 +100,15 @@ MAN-172: high-SNR track churn fixed in `TrackManager` (local-peak spawn
 rule, incumbent-wins merge ties); VR3/VR4 pass, VR1/VR2 pass CER but not
 WPM. See docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md.
 
+MAN-301: `[rbn_compare]` (off by default, needs `[server]`) reads RBN's
+CW telnet feed read-only (login callsign only) and grades each spot
+`match`/`disagree`/`elsewhere`/`none`/`unknown` after a 180 s window, as a
+`spotGrade` record on :7301 and `manta_rbn_compare_*` metrics; `manta
+grade` and `score-against-rbn.py --node-log` replay offline through the
+same Rust engine. RBN's real login prompt and the live/offline agreement
+rate are unmeasured. See
+docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
+
 ## Documents (read in this order)
 
 - `README.md` — goals and non-goals

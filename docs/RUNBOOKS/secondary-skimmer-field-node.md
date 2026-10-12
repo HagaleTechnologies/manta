@@ -30,10 +30,19 @@ The evidence files, all on the node:
 |---|---|---|
 | `/var/lib/manta-field/ledger.jsonl` | `manta-field-ledger.service` | one sample per minute (`/healthz`, `/metrics`), notes, watchdog recoveries |
 | `/var/lib/manta-field/spots/spots-YYYY-MM-DD.jsonl` | `manta-field-spots.service` | every spot from the JSON Lines port, verbatim, one file per UTC day |
+| `/var/lib/manta-field/spots/grades-YYYY-MM-DD.jsonl` | `manta-field-spots.service` | only with `[rbn_compare]` enabled (MAN-301): every `spotGrade` record from the JSON Lines port, verbatim, one file per UTC day of its `windowClose` |
 
 The tools are [`scripts/field-node.py`](../../scripts/field-node.py) and
 [`scripts/shadow-compare.py`](../../scripts/shadow-compare.py). For what `/healthz` and each
 `/metrics` family mean, see [node-health.md](node-health.md).
+
+With `[rbn_compare]` enabled, the JSON Lines port also carries one grade line per spot,
+marked `"kind":"spotGrade"`. `record-spots` writes those to the `grades-*.jsonl` files and
+counts them, never to `spots-*.jsonl`. `shadow-compare.py` skips a grade line found in a
+`spots-*.jsonl` file and reports how many it skipped on its "Node spots" input line, so
+grades never count as spots. The grades and what they mean are in
+[rbn-comparison.md](rbn-comparison.md); `manta grade` replays the `spots/` directory against
+an unzipped RBN archive with the same grading code.
 
 ## 2. Before you start
 

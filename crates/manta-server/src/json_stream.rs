@@ -7,7 +7,7 @@
 //! server push), so a peek timeout with no bytes is itself the "not a
 //! WebSocket handshake" signal, not an error.
 
-use crate::bus::{BusSpot, SpotBus};
+use crate::bus::{JsonItem, SpotBus};
 use crate::metrics::Metrics;
 use crate::rate_limit::IpRateLimiter;
 use crate::spot_message::SpotMessage;
@@ -123,7 +123,13 @@ struct ClientCtx {
 }
 
 impl ClientCtx {
-    fn render(&self, bus_spot: &BusSpot) -> String {
+    /// One stream line: a spot rendered as today, or a MAN-301 `spotGrade`
+    /// record, already serialised, passed through verbatim.
+    fn render(&self, item: &JsonItem) -> String {
+        let bus_spot = match item {
+            JsonItem::Spot(bus_spot) => bus_spot,
+            JsonItem::Grade(line) => return line.to_string(),
+        };
         let unix_ts = self.bus.unix_ts_for(bus_spot.spot.sample_ts);
         let msg = SpotMessage::from_spot(
             &bus_spot.spot,
@@ -253,7 +259,7 @@ pub async fn serve(
         // broadcast channel's no-history-for-late-subscribers semantics on
         // a busy runtime or a high-rate stream (round-7 review finding;
         // same fix applied to the telnet accept path below).
-        let rx = ctx.bus.subscribe();
+        let rx = ctx.bus.subscribe_json();
         let ctx = ctx.clone();
         let peer_ip = peer.ip();
         let ip_ping_limiter = ip_ping_limiter.clone();
@@ -420,7 +426,7 @@ async fn looks_like_websocket_handshake(
 )]
 async fn handle_tcp_client(
     mut socket: TcpStream,
-    mut rx: broadcast::Receiver<BusSpot>,
+    mut rx: broadcast::Receiver<JsonItem>,
     mut ctx: ClientCtx,
     peer: std::net::SocketAddr,
     log_enabled: bool,
@@ -639,7 +645,7 @@ fn is_ws_protocol_violation(e: &tokio_tungstenite::tungstenite::Error) -> bool {
 )]
 async fn handle_ws_client(
     socket: TcpStream,
-    mut rx: broadcast::Receiver<BusSpot>,
+    mut rx: broadcast::Receiver<JsonItem>,
     mut ctx: ClientCtx,
     peer: std::net::SocketAddr,
     peer_ip: IpAddr,

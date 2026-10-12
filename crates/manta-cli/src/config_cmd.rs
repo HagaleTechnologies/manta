@@ -182,6 +182,14 @@ pub(crate) fn example_callsign_key(loaded: &Loaded) -> Option<&'static str> {
                 .is_some_and(|c| c.eq_ignore_ascii_case(EXAMPLE_CALLSIGN))
         })
         .then_some("rbn_uplink.login_callsign")
+        .or_else(|| {
+            loaded
+                .rbn_compare
+                .as_ref()
+                .and_then(|rc| rc.login_callsign.as_deref())
+                .is_some_and(|c| c.eq_ignore_ascii_case(EXAMPLE_CALLSIGN))
+                .then_some("rbn_compare.login_callsign")
+        })
 }
 
 /// D10: `key` still holds the scaffold's example callsign.
@@ -351,6 +359,32 @@ fn set_keys(loaded: &Loaded, table: &str, skip: &[&str]) -> Vec<String> {
 
 /// D6: one line per table, `key=value` tokens named as the config keys.
 /// Never prints a secret; deterministic (no timestamps, no bound ports).
+/// MAN-301: `config check`'s `[rbn_compare]` line. `f64`'s Display prints
+/// a whole tolerance without a fraction (`500`, not `500.0`).
+fn rbn_compare_summary(rc: &manta_server::config::RbnCompareConfig, station: &str) -> String {
+    let list = |calls: &[String], empty: &str| {
+        if calls.is_empty() {
+            empty.to_string()
+        } else {
+            calls.join(",")
+        }
+    };
+    format!(
+        "rbn_compare: enabled={} feed={}:{} login_callsign={} window_secs={} freq_tol_hz={} \
+         speed_tol={} WPM/{}% spotters={} exclude_spotters={}",
+        rc.enabled,
+        rc.feed_host,
+        rc.feed_port,
+        rc.effective_login_callsign(station),
+        rc.window_secs,
+        rc.freq_tol_hz,
+        rc.speed_tol_wpm,
+        rc.speed_tol_pct,
+        list(&rc.spotters, "all"),
+        list(&rc.exclude_spotters, "none"),
+    )
+}
+
 fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
     let mut lines = vec![origin_line.to_string()];
     lines.push(if loaded.env_vars.is_empty() {
@@ -449,6 +483,11 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             u.effective_login_callsign(station)
         ));
     }
+
+    lines.push(match &loaded.rbn_compare {
+        None => "rbn_compare: none".to_string(),
+        Some(rc) => rbn_compare_summary(rc, station),
+    });
 
     let mut input = match &loaded.input.source {
         None => "input: type=unset (the default sound card, unless a command-line flag picks \
@@ -720,6 +759,31 @@ mod tests {
             "server: none (manta run starts no servers)"
         );
         assert_eq!(line(&lines, "rbn_uplink:"), "rbn_uplink: none");
+    }
+
+    #[test]
+    fn config_check_prints_rbn_compare_summary() {
+        let lines =
+            lines_of("[server]\nstation_callsign = \"W3XYZ-1\"\n[rbn_compare]\nenabled = true\n");
+        assert_eq!(
+            line(&lines, "rbn_compare:"),
+            "rbn_compare: enabled=true feed=telnet.reversebeacon.net:7000 \
+             login_callsign=W3XYZ-1 window_secs=180 freq_tol_hz=500 speed_tol=3 WPM/20% \
+             spotters=all exclude_spotters=none"
+        );
+        let lines = lines_of(
+            "[server]\nstation_callsign = \"W3XYZ-1\"\n[rbn_compare]\nenabled = true\n\
+             feed_port = 7001\nlogin_callsign = \"k1abc\"\nfreq_tol_hz = 250.5\n\
+             spotters = [\"K5TR\", \"n0xyz\"]\nexclude_spotters = [\"W1AW\"]\n",
+        );
+        assert_eq!(
+            line(&lines, "rbn_compare:"),
+            "rbn_compare: enabled=true feed=telnet.reversebeacon.net:7001 \
+             login_callsign=K1ABC window_secs=180 freq_tol_hz=250.5 speed_tol=3 WPM/20% \
+             spotters=K5TR,N0XYZ exclude_spotters=W1AW"
+        );
+        let lines = lines_of("[decode]\nengine = \"legacy\"\n");
+        assert_eq!(line(&lines, "rbn_compare:"), "rbn_compare: none");
     }
 
     #[test]
@@ -1192,6 +1256,7 @@ mod tests {
         ("rbn_uplink", "target_host"),
         ("rbn_uplink", "target_port"),
         ("rbn_uplink", "login_callsign"),
+        ("rbn_compare", "login_callsign"),
         ("input", "type"),
         ("input", "device"),
         ("input", "path"),
@@ -1311,6 +1376,7 @@ mod tests {
         match table {
             "server" => a.server == b.server,
             "rbn_uplink" => a.rbn_uplink == b.rbn_uplink,
+            "rbn_compare" => a.rbn_compare == b.rbn_compare,
             "input" => a.input == b.input,
             "spot" => a.spot == b.spot,
             "detector" => a.detector == b.detector,

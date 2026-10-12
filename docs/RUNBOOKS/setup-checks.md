@@ -34,6 +34,7 @@ PASS  json port: 0.0.0.0:7301 is free
 PASS  metrics port: 127.0.0.1:7302 is free
 PASS  clock: within 0.004 s of pool.ntp.org, and NTP is keeping it in sync
 PASS  rbn uplink telnet.reversebeacon.net:7000: accepted a connection in 36 ms
+SKIP  rbn compare feed: [rbn_compare] is off
 PASS  receiver: opened KiwiSDR kiwi.example.net:8073 (12000 Hz)
 
 source: 12000 Hz sample rate, 7030000.0 Hz center, observed for 10.0s
@@ -59,6 +60,7 @@ not open, the object holds only `checks` and `checks_status`.
 | `ports` | One `SKIP` row instead of the three above when there is no `[server]` table, because `manta run` then starts no servers | |
 | `clock` | This clock is within 1 s of the NTP server (`--ntp-server`, default `pool.ntp.org`). On Linux, the kernel also reports that a time daemon (chrony, systemd-timesyncd or ntpd) is keeping it in sync | That the server itself is right |
 | `rbn uplink <host:port>` | Each enabled `[[rbn_uplink]]` target resolves and accepts a TCP connection within 10 s. Disabled targets are a `SKIP`. With no `[[rbn_uplink]]` block, one `SKIP` row named `rbn uplink` | That the collector accepts your callsign. Doctor sends nothing on the connection: no login, no callsign, no spot. Once the daemon runs, `manta status` shows the login (see [uplink-health](uplink-health.md)) |
+| `rbn compare feed <host:port>` | With `[rbn_compare]` enabled, its `feed_host` resolves and accepts a TCP connection on `feed_port` within 10 s. With `[rbn_compare]` off or absent, one `SKIP` row named `rbn compare feed` | That RBN accepts your login, or that the feed delivers spots. Doctor sends nothing on the connection. Once the daemon runs, `manta_rbn_compare_feed_connected` on `/metrics` shows the login (see [rbn-comparison](rbn-comparison.md)) |
 | `receiver` | The configured receiver opens, at the sample rate shown | That it hears anything; the signal report answers that |
 | `signal` | Printed only when the receiver opened but the decode run stopped with an error | |
 
@@ -98,6 +100,9 @@ non-standard port.
 | `rbn uplink ...: could not look up <host>` | Check `target_host`, and this machine's DNS (`nslookup <host>`) |
 | `rbn uplink ...: refused the connection` | Check `target_port`; otherwise the collector is down or not accepting connections |
 | `rbn uplink ...: did not answer within 10 s` | A firewall may be dropping outbound TCP to that port |
+| `rbn compare feed ...: could not look up <host>` | Check `[rbn_compare].feed_host`, and this machine's DNS (`nslookup <host>`) |
+| `rbn compare feed ...: refused the connection` | Check `[rbn_compare].feed_port`; otherwise the feed is down or not accepting connections |
+| `rbn compare feed ...: did not answer within 10 s` | A firewall may be dropping outbound TCP to that port. The daemon needs it open to grade spots |
 | `receiver: could not open ...` | Sound card: connect it, or choose one with `--device`/`input.device`. WAV file: check `--source`/`input.path`. KiwiSDR: check `--kiwi-host`/`--kiwi-port` and that it has a free channel. SoapySDR: check `--soapy-driver` and `SoapySDRUtil --find`. HPSDR: check `--hpsdr-host` and that the radio is on this network |
 | `signal: the receiver opened, but the signal check stopped` | A WAV file must hold at least 3 seconds of audio; a live receiver must keep delivering samples |
 
@@ -116,6 +121,8 @@ Allow these outbound if a firewall sits between the node and the internet:
 - One SNTP request (48 bytes, UDP port 123) to the `--ntp-server` host.
 - One TCP connection to each enabled `[[rbn_uplink]]` target, closed as soon
   as it opens.
+- With `[rbn_compare]` enabled, one TCP connection to its
+  `feed_host:feed_port`, closed as soon as it opens.
 
 ## manta will not start at all
 

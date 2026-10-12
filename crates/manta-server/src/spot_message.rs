@@ -223,6 +223,33 @@ pub struct SpotMessage {
     pub channelizer_resolution_hz: Option<f64>,
 }
 
+/// A spot's JSON `id`: `{station_call}:{session_nonce}:{track_id}:{sample_ts}:{callsign}`.
+/// See `SpotMessage::from_spot` for why every component is needed.
+/// MAN-301: extracted so the live RBN comparator keys its `spotGrade`
+/// record on exactly the `id` the spot line carried, without building a
+/// whole `SpotMessage` (which needs `cty.dat`) per spot.
+pub fn spot_id(station_call: &str, session_nonce: u128, spot: &Spot) -> String {
+    format!(
+        "{station_call}:{session_nonce}:{}:{}:{}",
+        spot.track_id, spot.sample_ts, spot.callsign
+    )
+}
+
+/// A spot's JSON `frequency`: `freq_hz` rounded to whole Hz. MAN-301: the
+/// live comparator grades this value, not the unrounded one, so a live
+/// grade and an offline `manta grade` replay of the archived spot line see
+/// the same number (and the same band, near an edge).
+pub fn wire_frequency_hz(spot: &Spot) -> i64 {
+    spot.freq_hz.round() as i64
+}
+
+/// A spot's JSON `wpm`: the decoder's estimate rounded to whole WPM.
+/// MAN-301: shared with the live comparator for the same reason as
+/// [`wire_frequency_hz`].
+pub fn wire_wpm(spot: &Spot) -> Option<i32> {
+    Some(spot.wpm.round() as i32)
+}
+
 impl SpotMessage {
     /// Builds the wire message for one validated spot. `unix_ts_secs` is
     /// the spot's wall-clock time (see `rbn::format_line`'s doc comment on
@@ -289,19 +316,16 @@ impl SpotMessage {
         // `frequency` near a band edge, e.g. 13_999_999.6 Hz rounds up
         // into 20m's `frequency` while the unrounded value alone still
         // reads as 40m's `band`.
-        let frequency_hz = spot.freq_hz.round();
+        let frequency_hz = wire_frequency_hz(spot);
 
         Self {
-            id: format!(
-                "{station_call}:{session_nonce}:{}:{}:{}",
-                spot.track_id, spot.sample_ts, spot.callsign
-            ),
+            id: spot_id(station_call, session_nonce, spot),
             source: "skimmer",
             timestamp: unix_ts_secs,
             // cqdx overwrites this on receipt; see the field's schema doc.
             ingested_at: unix_ts_secs,
-            frequency: frequency_hz as i64,
-            band: crate::band::band_for_freq_hz(frequency_hz).to_string(),
+            frequency: frequency_hz,
+            band: crate::band::band_for_freq_hz(frequency_hz as f64).to_string(),
             mode: "CW",
             dx_call: spot.callsign.clone(),
             dx_grid: None,
@@ -321,7 +345,7 @@ impl SpotMessage {
             de_continent: de.continent,
             snr: Some(spot.snr_db.round() as i32),
             snr_ref_hz: SNR_REF_HZ,
-            wpm: Some(spot.wpm.round() as i32),
+            wpm: wire_wpm(spot),
             decode_confidence: Some(spot.confidence),
             decoder_version: Some(decoder_version.to_string()),
             channelizer_resolution_hz: None,
@@ -845,5 +869,52 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         }
         assert_eq!(json["dxDxcc"], 339);
         assert!(!json["dxDxcc"].is_null());
+    }
+
+    /// MAN-301: the comparator's `spotGrade.spotId` must be byte-identical
+    /// to the `id` of the spot line it grades.
+    #[test]
+    fn spot_id_helper_matches_from_spot() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let spot = sample_spot();
+        let nonce = 1_791_719_990_000_000_000u128;
+        let msg = SpotMessage::from_spot(&spot, "W3XYZ-1", None, &cty, "v", 0, nonce);
+        assert_eq!(spot_id("W3XYZ-1", nonce, &spot), msg.id);
+        assert_eq!(msg.id, "W3XYZ-1:1791719990000000000:7:12345:JA1ABC");
+    }
+
+    /// MAN-301: the comparator's frequency and WPM are the spot line's
+    /// `frequency`/`wpm`, including at the band edge where rounding moves
+    /// 13_999_999.6 Hz into 20m (see `from_spot`'s comment).
+    #[test]
+    fn wire_frequency_and_wpm_helpers_match_from_spot() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        for (freq_hz, wpm) in [
+            (14_027_100.0, 28.0),
+            (13_999_999.6, 24.5),
+            (7_012_349.4, 17.4),
+        ] {
+            let spot = Spot {
+                freq_hz,
+                wpm,
+                ..sample_spot()
+            };
+            let msg = SpotMessage::from_spot(&spot, "W1AW", None, &cty, "v", 0, 1);
+            assert_eq!(wire_frequency_hz(&spot), msg.frequency);
+            assert_eq!(wire_wpm(&spot), msg.wpm);
+            assert_eq!(
+                crate::band::band_for_freq_hz(wire_frequency_hz(&spot) as f64),
+                msg.band
+            );
+        }
+        let edge = Spot {
+            freq_hz: 13_999_999.6,
+            ..sample_spot()
+        };
+        assert_eq!(wire_frequency_hz(&edge), 14_000_000);
+        assert_eq!(
+            crate::band::band_for_freq_hz(wire_frequency_hz(&edge) as f64),
+            "20m"
+        );
     }
 }

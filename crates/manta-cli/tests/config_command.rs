@@ -411,6 +411,7 @@ fn check_prints_one_summary_line_per_table() {
             "environment",
             "server",
             "rbn_uplink",
+            "rbn_compare",
             "input",
             "spot",
             "detector",

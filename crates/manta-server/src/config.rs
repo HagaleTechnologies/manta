@@ -722,6 +722,240 @@ impl RbnUplinkConfig {
     }
 }
 
+fn default_rbn_feed_host() -> String {
+    "telnet.reversebeacon.net".to_string()
+}
+
+/// MAN-301: the `[rbn_compare]` table -- live grading of every published
+/// spot against what RBN's public CW telnet feed heard within
+/// `window_secs` of it. Off unless `enabled = true` or `--rbn-compare`.
+/// Every key needs a restart (MAN-78's SIGHUP reload does not apply it).
+///
+/// `deny_unknown_fields` for the reason `RbnUplinkConfig` gives: a typo
+/// such as `window-secs` must fail loudly rather than silently grading
+/// with the default. Deliberately NOT a field of `DaemonConfigFile`:
+/// strictness about which tables exist stays in `manta-cli`'s loader
+/// (MAN-74's lesson, see `DaemonConfigFile`'s doc comment).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RbnCompareConfig {
+    /// Default `false`: grading opens an outbound connection to a public
+    /// service, so it is an explicit operator choice (MAN-301).
+    pub enabled: bool,
+    /// RBN's public telnet feed. Default `telnet.reversebeacon.net`, the
+    /// host RBN documents for its aggregate feed.
+    pub feed_host: String,
+    /// Default 7000: RBN's CW and RTTY feed (manta keeps CW only); 7001 is
+    /// the digital-modes feed, which carries no CW.
+    pub feed_port: u16,
+    /// The callsign sent at the feed's login prompt -- the only line manta
+    /// ever writes to it. Defaults to `[server].station_callsign` verbatim,
+    /// the same rule as `[[rbn_uplink]].login_callsign`; see
+    /// `effective_login_callsign`.
+    #[serde(deserialize_with = "deserialize_optional_callsign")]
+    pub login_callsign: Option<String>,
+    /// How far either side of a spot's time an RBN report still counts, in
+    /// seconds. Default 180: RBN skimmers re-spot a CQing station every few
+    /// minutes, so a shorter window misses real reports and a longer one
+    /// pairs unrelated activity. Bounded 30 to 3600 by `validate`.
+    pub window_secs: i64,
+    /// A spot further than this from RBN's modal frequency, in Hz, is a
+    /// frequency disagreement. Default 500 Hz: RBN's own dupe/QSY threshold
+    /// is of this order, and skimmer calibration spread is well inside it.
+    pub freq_tol_hz: f64,
+    /// A speed disagreement needs manta's WPM to differ from RBN's median
+    /// by more than this many WPM. Default 3: skimmer speed estimates
+    /// commonly differ by 1-2 WPM on the same signal.
+    pub speed_tol_wpm: f64,
+    /// ...and by more than this percent of RBN's median. Default 20%: at
+    /// high speeds a few WPM is ordinary estimator spread.
+    pub speed_tol_pct: f64,
+    /// Only these RBN skimmers' reports count. Default empty: every
+    /// skimmer counts. `--rbn-spotter` replaces this list.
+    #[serde(deserialize_with = "deserialize_callsign_list_spotters")]
+    pub spotters: Vec<String>,
+    /// Never count these skimmers. Default empty; this station's own
+    /// callsign, with and without its SSID, is always excluded on top
+    /// (`grade_config`), so a node never confirms itself.
+    #[serde(deserialize_with = "deserialize_callsign_list_exclude")]
+    pub exclude_spotters: Vec<String>,
+}
+
+impl Default for RbnCompareConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            feed_host: default_rbn_feed_host(),
+            feed_port: 7000,
+            login_callsign: None,
+            window_secs: 180,
+            freq_tol_hz: 500.0,
+            speed_tol_wpm: 3.0,
+            speed_tol_pct: 20.0,
+            spotters: Vec::new(),
+            exclude_spotters: Vec::new(),
+        }
+    }
+}
+
+/// `[rbn_compare]`'s `window_secs` bounds (MAN-301).
+pub const RBN_COMPARE_WINDOW_SECS: std::ops::RangeInclusive<i64> = 30..=3600;
+
+/// A tolerance must be a finite number from 0 to `max`.
+fn check_tolerance(key: &str, value: f64, max: f64) -> Result<(), String> {
+    if !value.is_finite() || !(0.0..=max).contains(&value) {
+        return Err(format!(
+            "[rbn_compare].{key} must be a number from 0 to {max}, got {value}"
+        ));
+    }
+    Ok(())
+}
+
+/// A callsign list entry: `check_operator_callsign`, then uppercased.
+fn normalize_callsign_list(key: &str, calls: Vec<String>) -> Result<Vec<String>, String> {
+    calls
+        .into_iter()
+        .map(|call| {
+            check_operator_callsign(&call).map_err(|e| format!("{key} {e}"))?;
+            Ok(call.to_ascii_uppercase())
+        })
+        .collect()
+}
+
+fn deserialize_callsign_list_spotters<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    normalize_callsign_list("spotters", Vec::<String>::deserialize(deserializer)?)
+        .map_err(serde::de::Error::custom)
+}
+
+fn deserialize_callsign_list_exclude<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    normalize_callsign_list(
+        "exclude_spotters",
+        Vec::<String>::deserialize(deserializer)?,
+    )
+    .map_err(serde::de::Error::custom)
+}
+
+/// `--rbn-spotter`'s value check: the same rule and normalisation as an
+/// entry of `[rbn_compare].spotters`.
+pub fn normalize_rbn_spotter(call: &str) -> Result<String, String> {
+    check_operator_callsign(call)?;
+    Ok(call.to_ascii_uppercase())
+}
+
+/// An RBN spotter or exclusion entry as the grader compares it: uppercase,
+/// without the RBN `-#` skimmer suffix.
+fn grade_call(call: &str) -> String {
+    let upper = call.to_ascii_uppercase();
+    upper
+        .strip_suffix("-#")
+        .map(str::to_string)
+        .unwrap_or(upper)
+}
+
+impl RbnCompareConfig {
+    pub fn effective_login_callsign<'a>(&'a self, station_callsign: &'a str) -> &'a str {
+        self.login_callsign.as_deref().unwrap_or(station_callsign)
+    }
+
+    /// The range and shape checks serde's types cannot express. Every
+    /// message names the key as `[rbn_compare].<key>`; the loader prefixes
+    /// the file. Re-checks the callsign fields too, so a hand-built config
+    /// that never went through serde gets an `Err`, never a bad login line.
+    pub fn validate(&self) -> Result<(), String> {
+        if !RBN_COMPARE_WINDOW_SECS.contains(&self.window_secs) {
+            return Err(format!(
+                "[rbn_compare].window_secs must be {} to {}, got {}",
+                RBN_COMPARE_WINDOW_SECS.start(),
+                RBN_COMPARE_WINDOW_SECS.end(),
+                self.window_secs
+            ));
+        }
+        check_tolerance("freq_tol_hz", self.freq_tol_hz, 10_000.0)?;
+        check_tolerance("speed_tol_wpm", self.speed_tol_wpm, 20.0)?;
+        check_tolerance("speed_tol_pct", self.speed_tol_pct, 100.0)?;
+        if self.feed_port == 0 {
+            return Err("[rbn_compare].feed_port must be between 1 and 65535, got 0".into());
+        }
+        if self.feed_host.is_empty()
+            || self
+                .feed_host
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(format!(
+                "[rbn_compare].feed_host must be a host name or address without spaces or \
+                 control characters, got {:?}",
+                self.feed_host
+            ));
+        }
+        if let Some(call) = &self.login_callsign {
+            check_operator_callsign(call)
+                .map_err(|e| format!("[rbn_compare].login_callsign {e}"))?;
+        }
+        for (key, list) in [
+            ("spotters", &self.spotters),
+            ("exclude_spotters", &self.exclude_spotters),
+        ] {
+            for call in list {
+                check_operator_callsign(call).map_err(|e| format!("[rbn_compare].{key} {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The `spotters` entry that is this station's own callsign (with or
+    /// without its SSID), if any. Its reports are always excluded
+    /// (`grade_config`), so listing it would grade every spot `none`.
+    pub fn own_call_spotter<'a>(&'a self, station_call: &str) -> Option<&'a str> {
+        let own = [
+            grade_call(station_call),
+            grade_call(strip_ssid(station_call)),
+        ];
+        self.spotters
+            .iter()
+            .map(String::as_str)
+            .find(|s| own.contains(&grade_call(s)))
+    }
+
+    /// The refusal for `own_call_spotter`, naming the entry as listed.
+    pub fn check_spotters_against_station(&self, station_call: &str) -> Result<(), String> {
+        match self.own_call_spotter(station_call) {
+            Some(call) => Err(format!(
+                "[rbn_compare].spotters lists {call}, this station's own callsign: its reports \
+                 are always excluded, so every spot would grade none"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// The grading engine's view of this table: callsign sets uppercased
+    /// with any RBN `-#` suffix stripped, and this station's own callsign,
+    /// with and without its SSID, always excluded.
+    pub fn grade_config(&self, station_call: &str) -> crate::rbn_compare::grade::GradeConfig {
+        let mut exclude_spotters: std::collections::BTreeSet<String> = self
+            .exclude_spotters
+            .iter()
+            .map(|c| grade_call(c))
+            .collect();
+        exclude_spotters.insert(grade_call(station_call));
+        exclude_spotters.insert(grade_call(strip_ssid(station_call)));
+        crate::rbn_compare::grade::GradeConfig {
+            window_secs: self.window_secs,
+            freq_tol_hz: self.freq_tol_hz,
+            speed_tol_wpm: self.speed_tol_wpm,
+            speed_tol_pct: self.speed_tol_pct,
+            spotters: self.spotters.iter().map(|c| grade_call(c)).collect(),
+            exclude_spotters,
+        }
+    }
+}
+
 /// The real on-disk daemon config file's shape: a `[server]` TOML table
 /// (this is the file `manta run --config <path>` reads; `manta listen`
 /// and `--server-config` remain deprecated aliases, D11/MAN-77) --
@@ -1727,5 +1961,140 @@ mod tests {
             ..uplink
         };
         assert_eq!(uplink_override.effective_login_callsign("W3XYZ"), "W3XYZ-2");
+    }
+
+    // ---- MAN-301: [rbn_compare]
+
+    fn rbn_compare(body: &str) -> Result<RbnCompareConfig, String> {
+        toml::from_str::<RbnCompareConfig>(body).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn rbn_compare_defaults() {
+        let cfg = rbn_compare("").unwrap();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.feed_host, "telnet.reversebeacon.net");
+        assert_eq!(cfg.feed_port, 7000);
+        assert_eq!(cfg.login_callsign, None);
+        assert_eq!(cfg.window_secs, 180);
+        assert_eq!(cfg.freq_tol_hz, 500.0);
+        assert_eq!(cfg.speed_tol_wpm, 3.0);
+        assert_eq!(cfg.speed_tol_pct, 20.0);
+        assert!(cfg.spotters.is_empty());
+        assert!(cfg.exclude_spotters.is_empty());
+        assert_eq!(cfg, RbnCompareConfig::default());
+        assert_eq!(cfg.validate(), Ok(()));
+        assert_eq!(cfg.effective_login_callsign("W3XYZ-1"), "W3XYZ-1");
+    }
+
+    #[test]
+    fn rbn_compare_unknown_key_is_a_parse_error() {
+        let err = rbn_compare("window-secs = 60\n").unwrap_err();
+        assert!(err.contains("unknown field `window-secs`"), "{err}");
+    }
+
+    #[test]
+    fn rbn_compare_rejects_out_of_range_values() {
+        let cases: &[(&str, &str)] = &[
+            ("window_secs = 29", "window_secs must be 30 to 3600, got 29"),
+            (
+                "window_secs = 3601",
+                "window_secs must be 30 to 3600, got 3601",
+            ),
+            ("freq_tol_hz = -1.0", "freq_tol_hz"),
+            ("freq_tol_hz = nan", "freq_tol_hz"),
+            ("freq_tol_hz = inf", "freq_tol_hz"),
+            ("freq_tol_hz = 10000.5", "freq_tol_hz"),
+            ("speed_tol_wpm = -0.5", "speed_tol_wpm"),
+            ("speed_tol_wpm = 20.5", "speed_tol_wpm"),
+            ("speed_tol_pct = -1.0", "speed_tol_pct"),
+            ("speed_tol_pct = 100.5", "speed_tol_pct"),
+            ("feed_port = 0", "feed_port"),
+            ("feed_host = \"\"", "feed_host"),
+            ("feed_host = \"telnet. reversebeacon.net\"", "feed_host"),
+            ("feed_host = \"telnet.reversebeacon.net\\n\"", "feed_host"),
+        ];
+        for (body, want) in cases {
+            let cfg = rbn_compare(body).unwrap();
+            let err = cfg.validate().unwrap_err();
+            assert!(err.starts_with("[rbn_compare]."), "{body}: {err}");
+            assert!(err.contains(want), "{body}: {err}");
+        }
+        // The bounds themselves are accepted.
+        for body in [
+            "window_secs = 30",
+            "window_secs = 3600",
+            "freq_tol_hz = 0.0",
+            "freq_tol_hz = 10000.0",
+            "speed_tol_wpm = 20.0",
+            "speed_tol_pct = 100.0",
+            "feed_port = 65535",
+        ] {
+            assert_eq!(rbn_compare(body).unwrap().validate(), Ok(()), "{body}");
+        }
+    }
+
+    #[test]
+    fn rbn_compare_callsigns_are_validated_and_uppercased() {
+        let cfg = rbn_compare(
+            "login_callsign = \"w3xyz-1\"\nspotters = [\"k5tr\"]\n\
+             exclude_spotters = [\"w1aw/p\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.login_callsign.as_deref(), Some("W3XYZ-1"));
+        assert_eq!(cfg.spotters, vec!["K5TR".to_string()]);
+        assert_eq!(cfg.exclude_spotters, vec!["W1AW/P".to_string()]);
+        for key in ["login_callsign", "spotters", "exclude_spotters"] {
+            for bad in ["K5TR-#", "not a call"] {
+                let body = if key == "login_callsign" {
+                    format!("{key} = \"{bad}\"\n")
+                } else {
+                    format!("{key} = [\"{bad}\"]\n")
+                };
+                let err = rbn_compare(&body).unwrap_err();
+                assert!(err.contains(key), "{body}: {err}");
+                assert!(err.contains("not a plausible callsign"), "{body}: {err}");
+            }
+        }
+        assert_eq!(normalize_rbn_spotter("k5tr").as_deref(), Ok("K5TR"));
+        assert!(normalize_rbn_spotter("K5TR-#").is_err());
+        // A hand-built config that skipped serde is still checked.
+        let hand_built = RbnCompareConfig {
+            spotters: vec!["not a call".into()],
+            ..RbnCompareConfig::default()
+        };
+        assert!(hand_built.validate().unwrap_err().contains("spotters"));
+    }
+
+    #[test]
+    fn rbn_compare_grade_config_adds_own_call_with_and_without_ssid() {
+        let cfg = RbnCompareConfig {
+            window_secs: 240,
+            spotters: vec!["K5TR".into()],
+            exclude_spotters: vec!["N0ABC".into()],
+            ..RbnCompareConfig::default()
+        };
+        let grade = cfg.grade_config("W3XYZ-1");
+        assert_eq!(grade.window_secs, 240);
+        assert_eq!(grade.freq_tol_hz, 500.0);
+        assert_eq!(grade.speed_tol_wpm, 3.0);
+        assert_eq!(grade.speed_tol_pct, 20.0);
+        assert_eq!(
+            grade.spotters,
+            ["K5TR"].into_iter().map(String::from).collect()
+        );
+        for call in ["W3XYZ-1", "W3XYZ", "N0ABC"] {
+            assert!(grade.exclude_spotters.contains(call), "{call}");
+        }
+        assert_eq!(cfg.check_spotters_against_station("W3XYZ-1"), Ok(()));
+        let own = RbnCompareConfig {
+            spotters: vec!["K5TR".into(), "W3XYZ".into()],
+            ..RbnCompareConfig::default()
+        };
+        assert_eq!(
+            own.check_spotters_against_station("W3XYZ-1").unwrap_err(),
+            "[rbn_compare].spotters lists W3XYZ, this station's own callsign: its reports are \
+             always excluded, so every spot would grade none"
+        );
     }
 }

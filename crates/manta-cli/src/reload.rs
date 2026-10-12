@@ -730,6 +730,30 @@ blocklist_path = \"bl.txt\"
         );
     }
 
+    /// MAN-301: every `[rbn_compare]` key needs a restart; a SIGHUP that
+    /// changes one names it and still applies the lists.
+    #[test]
+    fn rbn_compare_changes_need_a_restart() {
+        let f = start(
+            &format!("{BASE}\n[rbn_compare]\nenabled = false\nwindow_secs = 180\n"),
+            CliOverrides::none(),
+        );
+        write(
+            &f.path("manta.toml"),
+            &format!("{BASE}\n[rbn_compare]\nenabled = false\nwindow_secs = 240\n"),
+        );
+        let report = applied(&f.ctx);
+        assert_eq!(report.restart_needed, vec!["rbn_compare.window_secs"]);
+        assert!(!report.dry_run_skipped);
+        assert!(f.ctx.lists.take().is_some());
+        let old = table("[rbn_compare]\nenabled = false\n");
+        let new = table("[rbn_compare]\nenabled = true\nspotters = [\"K5TR\"]\n");
+        assert_eq!(
+            restart_only_changes(&old, &new),
+            vec!["rbn_compare.enabled", "rbn_compare.spotters"]
+        );
+    }
+
     #[test]
     fn restart_only_changes_reports_a_server_key() {
         let old = table("[server]\ntelnet_port = 7300\n");

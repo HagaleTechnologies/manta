@@ -1100,9 +1100,9 @@ rather than normative constants of this spec, and
 **Precedence and the environment.** `run`, `soak` and `doctor` resolve
 every key as: command-line flag, then `MANTA_<TABLE>_<KEY>` environment
 variable (`MANTA_INPUT_FREQ_CORRECTION_PPM` is `input.freq_correction_ppm`;
-`<TABLE>` is one of `SERVER`, `INPUT`, `SPOT`, `DETECTOR`, `DECODE`), then
-the config file, then the default above. `--config` names the file;
-without it they read `MANTA_CONFIG`. An environment value is parsed as a
+`<TABLE>` is one of `SERVER`, `RBN_COMPARE`, `INPUT`, `SPOT`, `DETECTOR`,
+`DECODE`), then the config file, then the default above. `--config`
+names the file; without it they read `MANTA_CONFIG`. An environment value is parsed as a
 TOML value (`9300` is an integer, `["W1AW","K1ABC"]` an array), falling
 back to a bare string -- except for the string-typed keys, which are
 always taken verbatim: `server.station_callsign`, `server.bind_addr`,
@@ -1110,11 +1110,14 @@ always taken verbatim: `server.station_callsign`, `server.bind_addr`,
 `server.operator_qth`, `server.operator_grid`, `input.type`,
 `input.device`, `input.path`, `input.host`, `input.password`,
 `input.driver`, `spot.blocklist_path`, `spot.notch_path`,
-`spot.cty_path`, `spot.scp_path` and
-`decode.engine`. Relative paths from the file
-resolve against the file's directory; those from a flag or the
+`spot.cty_path`, `spot.scp_path`, `decode.engine`,
+`rbn_compare.feed_host` and `rbn_compare.login_callsign`. Relative
+paths from the file resolve against the file's directory; those from a flag or the
 environment resolve against the working directory. `[[rbn_uplink]]`
-cannot be set from the environment.
+cannot be set from the environment. `[rbn_compare]` (MAN-301) is, like
+`[server]`, operational rather than a decode-core constant, so the key
+block above omits it; its keys and defaults are in
+`docs/RUNBOOKS/rbn-comparison.md`.
 
 Unknown tables, unknown keys in a known table, and unknown `MANTA_*`
 variables are errors that name the offender, raised before any source

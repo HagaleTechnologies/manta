@@ -102,6 +102,26 @@
 #spot_types = "cq_beacon"
 
 
+# --- Comparison with the Reverse Beacon Network -------------------------------
+# Grades each spot against what RBN's public telnet feed heard within
+# window_secs of it, and publishes the grade on the JSON stream and
+# /metrics. Needs [server]. manta only reads the feed: it logs in with a
+# callsign and sends nothing else.
+
+#[rbn_compare]
+
+#enabled = false                     # --rbn-compare turns it on for one run
+#feed_host = "telnet.reversebeacon.net"  # RBN's public telnet feed
+#feed_port = 7000                     # RBN's CW and RTTY feed; manta keeps CW only
+#login_callsign = "N0CALL"            # default: station_callsign from [server]
+#window_secs = 180                    # 30 to 3600; RBN reports this close to a spot count
+#freq_tol_hz = 500.0                  # further than this from RBN's modal frequency: frequency disagreement
+#speed_tol_wpm = 3.0                  # a speed disagreement needs more than this many WPM
+#speed_tol_pct = 20.0                 # and more than this percent of RBN's median speed
+#spotters = []                        # only these RBN skimmers count, e.g. ["K5TR"]; --rbn-spotter replaces it
+#exclude_spotters = []                # never count these skimmers; your own callsign is always excluded
+
+
 # --- Receiver ----------------------------------------------------------------
 # With `type` and every receiver setting commented out, manta listens to
 # the system's default sound card, or to whatever source the command line

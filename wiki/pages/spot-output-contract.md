@@ -10,6 +10,8 @@ sources:
   - CLAUDE.md
   - docs/DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md
   - docs/DECISIONS/2026-10-10-man92-telnet-commands.md
+  - docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md
+  - docs/RUNBOOKS/rbn-comparison.md
 verified:
   commit: 01d1ea1
   date: 2026-09-07
@@ -42,6 +44,10 @@ The telnet/RBN-uplink surface and the JSON surface quote SNR in two different re
 ## Third surface: outbound RBN uplink
 
 manta can also act as a telnet *client*, logging into an RBN spot-collection endpoint and forwarding its own spots there (`crates/manta-server/src/uplink.rs`, one task per `[[rbn_uplink]]` config entry) — the mirror direction of the telnet server above. It ships **dry-run by default** (MAN-159): an entry with no `dry_run` key connects and logs in but transmits nothing, and each target logs its mode at startup. By default it forwards only CQ and beacon spots, RBN's own submission rule; DE and untyped spots still reach telnet/JSON, and `spot_types = "all"` sends every type (MAN-91, `docs/DECISIONS/2026-10-10-man91-uplink-spot-type-filter.md`). See README's "Outbound RBN uplink" section for the config shape; the uplink itself is unverified against a real RBN ingest pending MAN-90.
+
+## Spot grades: a second record kind on the JSON stream (MAN-301)
+
+With `[rbn_compare]` enabled, :7301 also carries a `spotGrade` record per spot, after the spot's comparison window closes, grading it against RBN's live CW feed (`match`/`disagree`/`elsewhere`/`none`/`unknown`). Telnet and the uplink never see grades; without the table the stream is byte-identical to before. The gotcha for any consumer or script reading :7301: **split the stream on the `kind` key** (spot lines have none). Grades deliberately carry no `dxCall`/`frequency`/`timestamp`, so old `field-node.py`/`shadow-compare.py` copies reject rather than double-count them. The record shape, field rules and the proposed dispensa `spotGrade` schema fragment are normative in `docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md`; the operator view is `docs/RUNBOOKS/rbn-comparison.md`. The feed client is a new outbound connection and is read-only toward RBN: it writes only its login callsign.
 
 ## Audio-sourced spot frequencies (MAN-34)
 
