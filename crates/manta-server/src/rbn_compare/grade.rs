@@ -454,20 +454,53 @@ fn sort_grades(grades: &mut [SpotGrade]) {
     grades.sort_by(|a, b| (a.window_close, &a.spot_id).cmp(&(b.window_close, &b.spot_id)));
 }
 
-/// Offline grading (`manta grade`): coverage is `[earliest, latest]` report
-/// time across all reports (none: nothing is covered). Returns grades sorted
-/// by `(window_close, spot_id)`, the order [`Grader::close_due`] emits.
+/// Offline archives whose report spans overlap or lie at most this far
+/// apart join into one coverage span: the live feed's idle timeout, the
+/// silence it treats as an outage. Consecutive daily dumps meet at midnight
+/// well inside it; a day left out between two dumps does not.
+pub const ARCHIVE_JOIN_SECS: i64 = super::feed::FEED_IDLE_TIMEOUT.as_secs() as i64;
+
+/// Offline grading (`manta grade`), one report list per archive (CSV file).
+/// Each archive covers `[earliest, latest]` of its own report times (an
+/// empty one covers nothing), and spans that overlap or lie at most
+/// [`ARCHIVE_JOIN_SECS`] apart join, so a gap between archives is not
+/// covered. Returns grades sorted by `(window_close, spot_id)`, the order
+/// [`Grader::close_due`] emits.
 pub fn grade_batch(
     spots: &[GradeInput],
-    mut reports: Vec<RbnReport>,
+    archives: Vec<Vec<RbnReport>>,
     cfg: &GradeConfig,
 ) -> Vec<SpotGrade> {
-    reports.sort_by_key(|r| r.time);
+    let mut spans: Vec<(i64, i64)> = archives
+        .iter()
+        .filter_map(|a| {
+            let first = a.iter().map(|r| r.time).min()?;
+            let last = a.iter().map(|r| r.time).max()?;
+            Some((first, last))
+        })
+        .collect();
+    spans.sort_unstable();
     let mut coverage = Coverage::empty();
-    if let (Some(first), Some(last)) = (reports.first(), reports.last()) {
-        coverage.up(first.time);
-        coverage.down(last.time);
+    let mut joined: Option<(i64, i64)> = None;
+    for (first, last) in spans {
+        joined = match joined {
+            Some((from, to)) if first.saturating_sub(to) <= ARCHIVE_JOIN_SECS => {
+                Some((from, to.max(last)))
+            }
+            Some((from, to)) => {
+                coverage.up(from);
+                coverage.down(to);
+                Some((first, last))
+            }
+            None => Some((first, last)),
+        };
     }
+    if let Some((from, to)) = joined {
+        coverage.up(from);
+        coverage.down(to);
+    }
+    let mut reports: Vec<RbnReport> = archives.into_iter().flatten().collect();
+    reports.sort_by_key(|r| r.time);
     let filter = SpotterFilter::new(cfg);
     // Archives hold every call RBN heard all day; index only spotted ones.
     let wanted: BTreeSet<String> = spots
@@ -1031,6 +1064,44 @@ mod tests {
     }
 
     #[test]
+    fn offline_gap_between_archives_is_not_covered() {
+        // K5XYZ at T0 + 600, heard by nobody: its window is
+        // [T0 + 420, T0 + 780].
+        let (s, _) = scenario2();
+        let edge = |t: i64| rep("K5TR", "N0EDGE", 14010.0, None, t);
+        let grade = |archives: Vec<Vec<RbnReport>>| {
+            grade_batch(std::slice::from_ref(&s), archives, &cfg())[0].grade
+        };
+        // One archive spanning the window covers it.
+        assert_eq!(grade(vec![vec![edge(T0), edge(T0 + 2000)]]), Grade::None);
+        // Two archives with the window in the gap between them do not, as
+        // when a day is left out between two daily dumps.
+        assert_eq!(
+            grade(vec![vec![edge(T0), edge(T0 + 100)], vec![edge(T0 + 2000)]]),
+            Grade::Unknown
+        );
+        // Archives at most ARCHIVE_JOIN_SECS apart join, in any order...
+        let to = T0 + 500;
+        assert_eq!(
+            grade(vec![
+                vec![edge(to + ARCHIVE_JOIN_SECS), edge(T0 + 2000)],
+                vec![edge(T0), edge(to)],
+            ]),
+            Grade::None
+        );
+        // ... and one second further apart they do not.
+        assert_eq!(
+            grade(vec![
+                vec![edge(T0), edge(to)],
+                vec![edge(to + ARCHIVE_JOIN_SECS + 1), edge(T0 + 2000)],
+            ]),
+            Grade::Unknown
+        );
+        // An empty archive covers nothing.
+        assert_eq!(grade(vec![Vec::new()]), Grade::Unknown);
+    }
+
+    #[test]
     fn out_of_band_spot_correlates_by_frequency_tolerance() {
         let s = spot("id", "W1AW", 4_500_000, Some(25), T0);
         let near = vec![rep("K5TR", "W1AW", 4500.2, Some(25.0), T0)];
@@ -1067,7 +1138,7 @@ mod tests {
         // Coverage edges well outside every window.
         reports.push(rep("K5TR", "N0EDGE", 14010.0, None, T0 - 1000));
         reports.push(rep("K5TR", "N0EDGE", 14010.0, None, T0 + 5000));
-        let lines: Vec<String> = grade_batch(&spots, reports, &cfg())
+        let lines: Vec<String> = grade_batch(&spots, vec![reports], &cfg())
             .iter()
             .map(|g| serde_json::to_string(g).unwrap())
             .collect();
@@ -1214,7 +1285,7 @@ mod tests {
             });
         }
 
-        let want = grade_batch(&spots, reports.clone(), &c);
+        let want = grade_batch(&spots, vec![reports.clone()], &c);
         let grades: BTreeSet<Grade> = want.iter().map(|g| g.grade).collect();
         assert!(
             grades.len() >= 4,

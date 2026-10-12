@@ -8,6 +8,9 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use manta_server::config::{
+    RBN_COMPARE_MAX_FREQ_TOL_HZ, RBN_COMPARE_MAX_SPEED_TOL_PCT, RBN_COMPARE_MAX_SPEED_TOL_WPM,
+};
 use manta_server::rbn_compare::grade::{
     grade_batch, normalize_spotter, parse_spot_message_line, Grade, GradeConfig, GradeInput,
     RbnReport, SpotGrade,
@@ -41,14 +44,15 @@ pub(crate) struct Args {
     #[arg(long, value_name = "SECS")]
     window_secs: Option<i64>,
     /// Further than this many Hz from RBN's modal frequency is a frequency
-    /// disagreement (default 500).
+    /// disagreement (0 to 10000; default 500).
     #[arg(long, value_name = "HZ")]
     freq_tol_hz: Option<f64>,
-    /// A speed disagreement needs more than this many WPM (default 3).
+    /// A speed disagreement needs more than this many WPM (0 to 20;
+    /// default 3).
     #[arg(long, value_name = "WPM")]
     speed_tol_wpm: Option<f64>,
     /// A speed disagreement also needs more than this percent of RBN's
-    /// median speed (default 20).
+    /// median speed (0 to 100; default 20).
     #[arg(long, value_name = "PCT")]
     speed_tol_pct: Option<f64>,
     /// Take the [rbn_compare] tolerances from this config file, so a node's
@@ -105,14 +109,11 @@ fn render(args: &Args, out: &mut String) -> Result<()> {
     }
     let (mut cfg, excludes) = grade_config(args)?;
     let (spots, spot_stats) = load_node_spots(&args.spots)?;
-    let (mut reports, rbn_stats) = load_rbn_csv(&args.rbn)?;
+    let (mut archives, rbn_stats) = load_rbn_csv(&args.rbn)?;
     cfg.exclude_spotters = excludes.iter().cloned().collect();
-    let time_range = reports
-        .iter()
-        .map(|r| r.time)
-        .min()
-        .zip(reports.iter().map(|r| r.time).max());
-    let n_reports = reports.len();
+    let times = || archives.iter().flatten().map(|r| r.time);
+    let time_range = times().min().zip(times().max());
+    let n_reports = archives.iter().map(Vec::len).sum::<usize>();
 
     // shadow-compare's rule: a node's own reports never count, with and
     // without its SSID. Each node's spots are graded apart, excluding only
@@ -130,9 +131,9 @@ fn render(args: &Args, out: &mut String) -> Result<()> {
         node_cfg.exclude_spotters.extend(own_calls(de));
         // The last node takes the reports; earlier ones grade a copy.
         let node_reports = if nodes.peek().is_some() {
-            reports.clone()
+            archives.clone()
         } else {
-            std::mem::take(&mut reports)
+            std::mem::take(&mut archives)
         };
         grades.extend(grade_batch(&node_spots, node_reports, &node_cfg));
     }
@@ -353,22 +354,30 @@ fn grade_config(args: &Args) -> Result<(GradeConfig, Vec<String>)> {
         }
         cfg.window_secs = w;
     }
-    for (flag, value, slot) in [
-        ("--freq-tol-hz", args.freq_tol_hz, &mut cfg.freq_tol_hz),
+    // The same maximums `RbnCompareConfig::validate` puts on the keys.
+    for (flag, value, max, slot) in [
+        (
+            "--freq-tol-hz",
+            args.freq_tol_hz,
+            RBN_COMPARE_MAX_FREQ_TOL_HZ,
+            &mut cfg.freq_tol_hz,
+        ),
         (
             "--speed-tol-wpm",
             args.speed_tol_wpm,
+            RBN_COMPARE_MAX_SPEED_TOL_WPM,
             &mut cfg.speed_tol_wpm,
         ),
         (
             "--speed-tol-pct",
             args.speed_tol_pct,
+            RBN_COMPARE_MAX_SPEED_TOL_PCT,
             &mut cfg.speed_tol_pct,
         ),
     ] {
         if let Some(v) = value {
-            if !v.is_finite() || v < 0.0 {
-                bail!("{flag} must be a finite number >= 0, got {v}");
+            if !v.is_finite() || !(0.0..=max).contains(&v) {
+                bail!("{flag} must be a number from 0 to {max}, got {v}");
             }
             *slot = v;
         }
@@ -491,10 +500,11 @@ fn load_node_spots(paths: &[PathBuf]) -> Result<(Vec<(String, GradeInput)>, Spot
 /// (`shadow-compare.py`'s `RBN_REQUIRED_COLUMNS`).
 const RBN_REQUIRED_COLUMNS: [&str; 4] = ["callsign", "freq", "dx", "date"];
 
-/// RBN daily-dump CSVs to CW reports: rows whose `tx_mode` (when the column
+/// RBN daily-dump CSVs to CW reports, one list per file (`grade_batch`
+/// covers each file's own span): rows whose `tx_mode` (when the column
 /// exists) is not `CW` are dropped and counted; `freq` is in kHz; `date` is
 /// UTC; spotters lose a `-#` suffix.
-fn load_rbn_csv(paths: &[PathBuf]) -> Result<(Vec<RbnReport>, RbnStats)> {
+fn load_rbn_csv(paths: &[PathBuf]) -> Result<(Vec<Vec<RbnReport>>, RbnStats)> {
     let files = expand_paths(paths, "*.csv", |n| {
         Path::new(n)
             .extension()
@@ -504,10 +514,11 @@ fn load_rbn_csv(paths: &[PathBuf]) -> Result<(Vec<RbnReport>, RbnStats)> {
         files: files.len(),
         ..RbnStats::default()
     };
-    let mut reports = Vec::new();
+    let mut archives = Vec::new();
     for path in &files {
         let body = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read {}", path.display()))?;
+        let mut reports = Vec::new();
         let mut lines = body.lines().enumerate();
         let header = loop {
             match lines.next() {
@@ -571,8 +582,9 @@ fn load_rbn_csv(paths: &[PathBuf]) -> Result<(Vec<RbnReport>, RbnStats)> {
                 time,
             });
         }
+        archives.push(reports);
     }
-    Ok((reports, stats))
+    Ok((archives, stats))
 }
 
 /// One CSV line's fields, trimmed, with surrounding double quotes removed

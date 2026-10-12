@@ -840,6 +840,11 @@ impl Default for RbnCompareConfig {
 
 /// `[rbn_compare]`'s `window_secs` bounds (MAN-301).
 pub const RBN_COMPARE_WINDOW_SECS: std::ops::RangeInclusive<i64> = 30..=3600;
+/// `[rbn_compare]`'s tolerance maximums (MAN-301); `manta grade`'s
+/// tolerance flags are checked against the same ones.
+pub const RBN_COMPARE_MAX_FREQ_TOL_HZ: f64 = 10_000.0;
+pub const RBN_COMPARE_MAX_SPEED_TOL_WPM: f64 = 20.0;
+pub const RBN_COMPARE_MAX_SPEED_TOL_PCT: f64 = 100.0;
 
 /// A tolerance must be a finite number from 0 to `max`.
 fn check_tolerance(key: &str, value: f64, max: f64) -> Result<(), String> {
@@ -916,9 +921,17 @@ impl RbnCompareConfig {
                 self.window_secs
             ));
         }
-        check_tolerance("freq_tol_hz", self.freq_tol_hz, 10_000.0)?;
-        check_tolerance("speed_tol_wpm", self.speed_tol_wpm, 20.0)?;
-        check_tolerance("speed_tol_pct", self.speed_tol_pct, 100.0)?;
+        check_tolerance("freq_tol_hz", self.freq_tol_hz, RBN_COMPARE_MAX_FREQ_TOL_HZ)?;
+        check_tolerance(
+            "speed_tol_wpm",
+            self.speed_tol_wpm,
+            RBN_COMPARE_MAX_SPEED_TOL_WPM,
+        )?;
+        check_tolerance(
+            "speed_tol_pct",
+            self.speed_tol_pct,
+            RBN_COMPARE_MAX_SPEED_TOL_PCT,
+        )?;
         if self.feed_port == 0 {
             return Err("[rbn_compare].feed_port must be between 1 and 65535, got 0".into());
         }

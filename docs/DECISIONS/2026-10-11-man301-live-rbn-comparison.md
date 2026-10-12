@@ -128,8 +128,10 @@ close, or for at most `FEED_SILENCE_GRACE_SECS` (70 s). By then a silent
 feed has been declared down and the spot grades `unknown`; a feed still up
 was delivering lines (non-CW ones, say), and the spot grades on the
 interval. Reports a held spot's window needs are not pruned while it waits.
-Offline coverage is the earliest to the latest report time across the CSVs
-given.
+Offline coverage is each CSV's earliest to latest CW report time. Spans that
+overlap or lie at most 60 s apart (the feed's idle timeout,
+`ARCHIVE_JOIN_SECS`) join, so consecutive daily dumps cover a window across
+midnight, while a day left out between two CSVs is not covered.
 
 ### 7. The record shape
 

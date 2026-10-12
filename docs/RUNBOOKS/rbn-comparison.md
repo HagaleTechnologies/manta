@@ -262,13 +262,17 @@ total      4      1         1          1     1        0
 - `--spotter`, `--exclude-spotter`, `--window-secs`, `--freq-tol-hz`,
   `--speed-tol-wpm` and `--speed-tol-pct` match the config keys, and are
   checked the same way: a `--spotter` or `--exclude-spotter` value that is
-  not a plausible callsign is refused.
+  not a plausible callsign is refused, and a tolerance past its key's
+  maximum (10000 Hz, 20 WPM, 100%) is refused.
   `--config FILE` reads that file's `[rbn_compare]` tolerances, and flags
   win, so a node's own config replays with its live settings.
 - `manta grade` never reads `MANTA_*` variables. Its output depends only on
   its inputs and flags.
-- A spot whose window reaches past the first or last RBN report in the
-  CSVs grades `unknown` unless matched, so give it the whole day's archive.
+- Each CSV covers only the span from its first to its last CW report.
+  Spans join when they overlap or lie at most 60 s apart, as consecutive
+  daily dumps do at midnight. A spot whose window reaches outside the
+  joined spans, past either end or into a day left out between two CSVs,
+  grades `unknown` unless matched, so give it the whole day's archive.
 
 `scripts/score-against-rbn.py --node-log` wraps `manta grade` and unzips
 the archive for you:

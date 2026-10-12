@@ -453,3 +453,119 @@ fn grade_rejects_rbn_csv_missing_required_columns() {
         "stderr: {err}"
     );
 }
+
+/// The fixture CSV split into two files with a 29-minute gap of no reports
+/// between them (12:00:50 to 12:30:15), standing in for a day left out
+/// between two daily dumps. Returns the directory and both paths.
+fn split_rbn_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = read_fixture("rbn-20261011.csv");
+    let lines: Vec<&str> = csv.lines().collect();
+    let (header, rows) = (lines[0], &lines[1..]);
+    let first: Vec<&str> = rows
+        .iter()
+        .copied()
+        .filter(|r| r.contains("2026-10-11 11:") || r.contains("2026-10-11 12:00:"))
+        .collect();
+    let second: Vec<&str> = rows
+        .iter()
+        .copied()
+        .filter(|r| {
+            r.contains("2026-10-11 12:3")
+                || r.contains("2026-10-11 12:4")
+                || r.contains("2026-10-11 13:")
+        })
+        .collect();
+    let a = dir.path().join("rbn-a.csv");
+    let b = dir.path().join("rbn-b.csv");
+    std::fs::write(&a, format!("{header}\n{}\n", first.join("\n"))).unwrap();
+    std::fs::write(&b, format!("{header}\n{}\n", second.join("\n"))).unwrap();
+    (dir, a, b)
+}
+
+/// One record's `"grade"` value, found by the spot id fragment.
+fn grade_of(json: &str, id_fragment: &str) -> String {
+    let line = json
+        .lines()
+        .find(|l| l.contains(id_fragment))
+        .unwrap_or_else(|| panic!("no {id_fragment} record in:\n{json}"));
+    let v: serde_json::Value = serde_json::from_str(line).unwrap();
+    v["grade"].to_string()
+}
+
+#[test]
+fn grade_does_not_cover_a_gap_between_rbn_files() {
+    let (_dir, a, b) = split_rbn_fixture();
+    let out = manta()
+        .args(["grade", "--json", "--spots"])
+        .arg(fixture("spots-2026-10-11.jsonl"))
+        .arg("--rbn")
+        .arg(&a)
+        .arg(&b)
+        .output()
+        .unwrap();
+    assert_success(&out);
+    let json = stdout(&out);
+    // K5XYZ (12:10, window 12:07 to 12:13) lies in the gap: no file covers
+    // it, so it is `unknown`, not `none`.
+    assert_eq!(grade_of(&json, ":9:58560000:K5XYZ"), "\"unknown\"");
+    // The other three grade as they do from the whole CSV: a match or a
+    // disagreement needs no coverage, and DL1ABC's window lies inside the
+    // second file's span.
+    assert_eq!(grade_of(&json, ":7:960000:W1AW"), "\"match\"");
+    assert_eq!(grade_of(&json, ":12:173760000:W1AW"), "\"disagree\"");
+    assert_eq!(grade_of(&json, ":15:260160000:DL1ABC"), "\"elsewhere\"");
+
+    // Files 45 s apart join. The first ends with an extra report of an
+    // unspotted call at 12:09:45 and the second starts at 12:10:30, so the
+    // join falls inside K5XYZ's window: only joined spans cover it, and its
+    // `none`, like every other grade, is the one-file result.
+    let dir = tempfile::tempdir().unwrap();
+    let csv = read_fixture("rbn-20261011.csv");
+    let lines: Vec<&str> = csv.lines().collect();
+    let (head, tail) = lines[1..].split_at(4);
+    assert!(tail[0].contains("2026-10-11 12:10:30"), "{}", tail[0]);
+    let edge = "K5TR,K,NA,14010.0,20m,N0EDGE,K,NA,CQ,10,2026-10-11 12:09:45,20,CW";
+    let c = dir.path().join("rbn-c.csv");
+    let d = dir.path().join("rbn-d.csv");
+    std::fs::write(&c, format!("{}\n{}\n{edge}\n", lines[0], head.join("\n"))).unwrap();
+    std::fs::write(&d, format!("{}\n{}\n", lines[0], tail.join("\n"))).unwrap();
+    let out = manta()
+        .args(["grade", "--json", "--spots"])
+        .arg(fixture("spots-2026-10-11.jsonl"))
+        .arg("--rbn")
+        .arg(&c)
+        .arg(&d)
+        .output()
+        .unwrap();
+    assert_success(&out);
+    assert_lines_eq(&stdout(&out), &read_fixture("expected-all.jsonl"));
+}
+
+#[test]
+fn grade_refuses_a_tolerance_flag_past_its_config_key_maximum() {
+    for (flag, too_big, max) in [
+        ("--freq-tol-hz", "10000.5", "10000"),
+        ("--speed-tol-wpm", "20.5", "20"),
+        ("--speed-tol-pct", "1000", "100"),
+    ] {
+        let out = grade_fixture(&["--json", flag, too_big]);
+        assert!(!out.status.success(), "{flag} {too_big} was accepted");
+        let err = stderr(&out);
+        assert!(
+            err.contains(&format!(
+                "{flag} must be a number from 0 to {max}, got {too_big}"
+            )),
+            "{flag} {too_big}: stderr: {err}"
+        );
+        // The maximum itself is accepted, as the config key's is.
+        assert_success(&grade_fixture(&["--json", flag, max]));
+    }
+    let out = grade_fixture(&["--json", "--speed-tol-wpm=-1"]);
+    assert!(!out.status.success(), "--speed-tol-wpm -1 was accepted");
+    assert!(
+        stderr(&out).contains("--speed-tol-wpm must be a number from 0 to 20, got -1"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
