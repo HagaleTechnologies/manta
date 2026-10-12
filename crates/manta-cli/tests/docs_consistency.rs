@@ -1528,6 +1528,29 @@ fn man90_runbook_takes_only_outbound_connections_from_the_windows_log() {
     );
 }
 
+/// MAN-90: a TLS session leaves only ciphertext, so the developer steps must
+/// say what a TLS result records for C2–C7 and hand the rest to D-5's rework
+/// ticket rather than just "stop" (Codex P2 on PR #259). Checks text only.
+#[test]
+fn man90_runbook_says_what_a_tls_session_records() {
+    let steps = squash_whitespace(section(&doc(MAN90_RUNBOOK), "Developer steps"));
+    for needle in [
+        "`differs: TLS`",
+        "`not observable: TLS`",
+        "D-5",
+        "session keys",
+    ] {
+        assert!(
+            steps.contains(needle),
+            "the runbook's developer steps never say {needle:?} for a TLS session"
+        );
+    }
+    assert!(
+        !steps.contains("stop at C2"),
+        "the runbook still says only \"stop at C2\" for a TLS session"
+    );
+}
+
 /// MAN-90: C3, C4 and C7 compare exact bytes. tshark's `ascii` follow mode
 /// turns non-printable bytes into dots, so the developer steps must also write
 /// a `raw` (hex) transcript of each TCP stream and UDP flow.

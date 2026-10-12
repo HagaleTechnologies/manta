@@ -201,14 +201,22 @@ recorded or not noted: ask the operator to record it again. Set `N` to a row's
 
 ```sh
 N=1   # the tcp.stream value from that row
-tshark -r aggregator-rbn.pcapng -Y "tcp.stream == $N && (tls || tcp.payload[0:2] == 16:03)"   # any output: C2 = TLS, stop at C2
+tshark -r aggregator-rbn.pcapng -Y "tcp.stream == $N && (tls || tcp.payload[0:2] == 16:03)"   # any output: C2 = TLS, see below
 tshark -r aggregator-rbn.pcapng -q -z follow,tcp,ascii,$N > transcript-$N.txt
 tshark -r aggregator-rbn.pcapng -q -z follow,tcp,raw,$N > transcript-$N.hex
 ```
 
 Do this for every row to every address the operator noted or the list names,
 one pair of transcripts each (C1). A refused or failed attempt gives an empty
-transcript, so skip it. The `16:03` test catches a TLS handshake on a port
+transcript, so skip it.
+
+If the first command prints anything for a stream, that session is TLS and
+the file holds only ciphertext for it. Record C2 as `differs: TLS` and C3–C7
+as `not observable: TLS`, take no bytes from that stream's transcripts, and
+open the rework ticket the decision record's D-5 asks for: a TLS session is
+not the line-oriented ingest the uplink logs into. Settling C3–C7 for that
+session needs its TLS session keys or decrypted payload; that ticket decides
+how to get them, and this runbook does not collect them. The `16:03` test catches a TLS handshake on a port
 tshark does not decode as TLS. The `.txt` view is for reading: `ascii` mode
 turns non-printable bytes into dots, and a text view hides whether a line ends
 in CR, LF or CRLF. The `.hex` view (`raw` mode) keeps every byte as hex, so
