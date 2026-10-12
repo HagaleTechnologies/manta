@@ -58,10 +58,52 @@ more than one implementation of it, on more than one operating system.
 
 ## Installation
 
-There is no tagged release yet, so there is no prebuilt binary or Docker
-image to pull — build from source. You need Rust 1.98+ and a `git`
-executable on `PATH`. Git is a build-time requirement, not just a way to
-clone this repo: manta depends on
+### Download a release
+
+Each tagged release on the
+[Releases page](https://github.com/HagaleTechnologies/manta/releases) has a
+prebuilt archive for every supported platform. You need neither Rust nor a
+clone of this repository.
+
+| Platform | Archive |
+|---|---|
+| Linux x86-64 | `manta-linux-x86_64.tar.gz` |
+| Linux arm64 (64-bit Raspberry Pi OS and other ARM boards) | `manta-linux-arm64.tar.gz` |
+| macOS, Intel | `manta-macos-x86_64.tar.gz` |
+| macOS, Apple silicon | `manta-macos-arm64.tar.gz` |
+| Windows x86-64 | `manta-windows-x86_64.zip` |
+
+On Linux or macOS, put your archive's name in place of
+`manta-linux-x86_64.tar.gz`:
+
+```sh
+curl -fLO https://github.com/HagaleTechnologies/manta/releases/latest/download/manta-linux-x86_64.tar.gz
+curl -fLO https://github.com/HagaleTechnologies/manta/releases/latest/download/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+tar xzf manta-linux-x86_64.tar.gz
+cd manta-linux-x86_64
+./manta --version
+```
+
+On macOS, check the download with `shasum -a 256 -c --ignore-missing
+SHA256SUMS` instead. On Windows, download the ZIP and `SHA256SUMS` from the
+Releases page, check them as
+[Verifying a downloaded release](docs/RUNBOOKS/release.md#verifying-a-downloaded-release)
+shows, unzip, and run `.\manta.exe --version` in the unpacked folder.
+
+Each archive holds the binary, this README, both licence files, an example
+config and the kit for running manta as a service
+([packaging/README.md](packaging/README.md)). Release binaries read
+KiwiSDR, HPSDR, audio and WAV input; SoapySDR needs a build from source.
+Linux binaries need the ALSA runtime library (`libasound2`, see the notes
+below). macOS binaries are not signed or notarized: if macOS refuses to run
+one you downloaded in a browser, clear the flag with
+`xattr -d com.apple.quarantine ./manta`.
+
+### Build from source
+
+You need Rust 1.98+ and a `git` executable on `PATH`. Git is a build-time
+requirement, not just a way to clone this repo: manta depends on
 [`coppa`](https://github.com/HagaleTechnologies/coppa) as a rev-pinned git
 dependency, and `.cargo/config.toml` sets `[net] git-fetch-with-cli = true`
 so cargo fetches it through the `git` binary rather than its built-in
@@ -83,15 +125,17 @@ the `--features hpsdr` across: drop it and the binary has no `--hpsdr-host`
 flag at all, so it no longer matches the install above or the HPSDR row in
 the Inputs table below.
 
-A binary and a Docker image publish automatically, for every platform,
-from the first tag:
+### Docker
+
+Each release also publishes a multi-arch image (`linux/amd64`,
+`linux/arm64`, `linux/arm/v7`) to GitHub Container Registry:
 
 ```sh
-# once a release exists:
 docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
 ```
 
-**Notes:**
+### Notes
+
 - Building on Linux compiles the ALSA bindings (audio input is an
   unconditional dependency, even if you only ever use file, KiwiSDR, or
   HPSDR input), so the build host needs the ALSA development headers and
@@ -301,9 +345,12 @@ connection and reconnect state per target) instead of reading its logs:
 manta status --config server.toml
 ```
 
-Forwarding to an upstream RBN-style collector is a `[[rbn_uplink]]`
-block. `dry_run` defaults to `true`, so an uplink connects and logs in but
-transmits nothing until you set it to `false` deliberately.
+The supported route into the Reverse Beacon Network is an RBN Aggregator
+reading this node's telnet server (see the
+[secondary-skimmer field-node runbook](docs/RUNBOOKS/secondary-skimmer-field-node.md)).
+Forwarding straight to an upstream collector is an experimental
+`[[rbn_uplink]]` block. `dry_run` defaults to `true`, so an uplink connects
+and logs in but transmits nothing until you set it to `false` deliberately.
 
 ### Changing lists without a restart
 
@@ -507,17 +554,21 @@ only if that config also carries at least one `[[rbn_uplink]]` block.
 - **DX cluster telnet server** (`:7300`) — standard login prompt and
   RBN-format `DX de` lines, with enough command grammar (`sh/dx`,
   `set/dx/filter`) for stock clients. This is the RBN/aggregator
-  compatibility surface. A logger can request the last 30 minutes with
+  compatibility surface and the supported route into RBN: an RBN Aggregator
+  reads it as it reads CW Skimmer Server, following the published CW Skimmer
+  and Aggregator manuals. A logger can request the last 30 minutes with
   `sh/dx 30m`; `[server].history_minutes` sets retained history depth
   (default 30). A bare `sh/dx` shows the last 10. See
   [history limits](docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md).
 - **JSON Lines / WebSocket stream** (`:7301`) — one full-fidelity spot
   object per line; a raw TCP client and a WebSocket client share the
   port. This is the [cqdx](https://cqdx.app) ingest surface.
-- **Outbound RBN uplink** — forwards validated spots to an upstream
-  collector in the same `DX de` wire format, with reconnect and multiple
-  simultaneous targets. Working against a collector; **not yet validated
-  against RBN's live ingest**.
+- **Outbound RBN uplink (experimental)** — forwards validated spots to an
+  upstream collector as `DX de` lines, with reconnect and multiple
+  simultaneous targets. Tested only against manta's own mock collector: RBN
+  publishes nothing about what its ingest accepts, so the login and line
+  format are manta's assumption, and the uplink ships in dry-run. To reach
+  RBN today, let an RBN Aggregator read the telnet server above.
 - **Prometheus metrics** (`:7302/metrics`) — spot, client, uplink and
   source-health counters. Some gauges are still placeholders;
   ARCHITECTURE §8 says which.
@@ -545,9 +596,15 @@ test vectors.
 
 ### Outbound RBN uplink
 
-manta can also log into an RBN spot-collection endpoint as a client and
-forward its own spots there. Add one `[[rbn_uplink]]` block per target to
-the daemon config:
+**Experimental.** manta can also log into a spot collector as a client and
+forward its own spots there. RBN has not published what its own ingest
+accepts, and this uplink has only been tested against a mock collector, so it
+may not work against RBN's servers. To get spots into RBN today, run manta's
+telnet server behind an RBN Aggregator; the
+[secondary-skimmer field-node runbook](docs/RUNBOOKS/secondary-skimmer-field-node.md)
+walks through it.
+
+Add one `[[rbn_uplink]]` block per target to the daemon config:
 
 ```toml
 [server]
@@ -569,13 +626,20 @@ target_port = 7000
 Spots an uplink holds back still appear on manta's own telnet and JSON
 output; `spot_types` only decides what goes to that target.
 
-The uplink has not yet been verified against a real RBN ingest (see
-[ROADMAP.md](ROADMAP.md)), which is why dry-run is the default. manta logs
-which mode each target is in at startup.
+What the uplink sends, and each part of that still unverified, is recorded
+in
+[docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md](docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md).
+The capture that would settle it is described in
+[docs/RUNBOOKS/aggregator-rbn-capture.md](docs/RUNBOOKS/aggregator-rbn-capture.md).
+That is also why dry-run is the default. manta logs which mode each target is
+in at startup.
 
 ## Status
 
-Pre-1.0, and pre-first-release. What is true today:
+**Pre-stability alpha, expect breakage.** manta has not cleared its own
+M2/M3 acceptance gates ([ROADMAP.md](ROADMAP.md)), and command-line flags,
+configuration keys and output formats can change between releases before
+1.0. What is true today:
 
 - **Shipped:** the full wideband pipeline — polyphase channelizer,
   noise-floor detector, track manager, decoder pool — with five input
@@ -591,8 +655,9 @@ Pre-1.0, and pre-first-release. What is true today:
   fading on several golden vectors, and at low SNR the validator still
   admits occasional bogus callsigns from noise. Closing the fading gap is
   classical-DSP work in flight, with ML fusion behind it at M4. The
-  outbound RBN uplink is unverified against a real RBN ingest and ships
-  dry-run by default until that verification lands.
+  outbound RBN uplink is experimental: its login and line format are
+  unverified against RBN's real ingest (MAN-90), and it ships dry-run by
+  default.
 - **Decode engine:** `decode.engine` defaults to `legacy`. A rewritten
   `hsmm` engine (decode-core-v2, `docs/SPEC-decode-core-v2.md`) is
   implemented and reachable via `--engine hsmm`, but its stage-2
@@ -605,8 +670,6 @@ Pre-1.0, and pre-first-release. What is true today:
   and character error rate against SNR (500 Hz) on synthetic AWGN and
   Watterson-faded signals; the curve at landing is in
   [docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md](docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md).
-- **No tagged release yet**, so the container image above is empty until
-  the first tag.
 
 [ROADMAP.md](ROADMAP.md) has the milestone breakdown with acceptance
 criteria.

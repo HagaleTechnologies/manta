@@ -191,9 +191,9 @@ pub fn escape_for_terminal(s: &str) -> String {
 }
 
 /// One screen an operator can read without a manual (MAN-44). Fixed-width
-/// columns, kept inside 80 (the target table renders 78 for the plan's own
-/// worked example -- `telnet.reversebeacon.net:7000`, the longest
-/// realistic RBN hostname, plus a 5-digit sent count); the uplink verdict
+/// columns, kept inside 80 (the target table renders 78 for the runbook's own
+/// worked example -- a 29-character `host:port`, as long as RBN-style
+/// hostnames get -- plus a 5-digit sent count); the uplink verdict
 /// comes first because that is the question `manta status` exists to
 /// answer.
 pub fn render_human(doc: &StatusDoc) -> String {
@@ -428,11 +428,12 @@ mod tests {
     fn rendered_target_table_fits_in_eighty_columns_for_the_longest_documented_hostname() {
         // D3: the plan's manual verification step is "confirm the summary
         // fits in 80 columns with a long RBN hostname" -- exercised here
-        // with the real hostname the runbook and ADR both use as that
-        // "long" example, plus a 5-digit sent count matching the
-        // runbook's own sample.
+        // with the runbook's own 29-character worked-example target (as
+        // long as RBN-style hostnames get; MAN-90 replaced RBN's outbound
+        // relay host there, which is not an uplink target), plus a 5-digit
+        // sent count matching the runbook's own sample.
         let m = Metrics::new();
-        let a = m.register_uplink_target("telnet.reversebeacon.net:7000".to_string(), true);
+        let a = m.register_uplink_target("collector-01.example.net:7000".to_string(), true);
         a.mark_connected();
         for _ in 0..18001 {
             a.record_sent();

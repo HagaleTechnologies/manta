@@ -48,9 +48,13 @@
 //!     When they set the uplink's spot-type filter to "all"
 //!     Then every validated spot is forwarded
 //!
-//! The mock listener in this file stands in for RBN's own collection
-//! server -- manta is the connecting *client* here, the reverse of
-//! `telnet_acceptance.rs`'s role.
+//! MAN-90: `the_uplink_session_bytes_match_the_man90_reference` pins the
+//! exact login and spot bytes the uplink writes -- the manta side of the
+//! Aggregator->RBN capture comparison in docs/RUNBOOKS/aggregator-rbn-capture.md.
+//!
+//! The mock listener in this file stands in for an RBN-style collector;
+//! what RBN's real ingest expects is unverified (MAN-90) -- manta is the
+//! connecting *client* here, the reverse of `telnet_acceptance.rs`'s role.
 
 use manta_server::bus::SpotBus;
 use manta_server::config::{RbnUplinkConfig, UplinkSpotTypes};
@@ -909,6 +913,34 @@ async fn a_filtered_de_spot_still_reaches_other_bus_subscribers() {
     );
     assert_eq!(harness.metrics.uplink_sent_total(), 0);
     assert_eq!(harness.metrics.uplink_suppressed_total(), 1);
+
+    let _ = harness.shutdown_tx.send(true);
+}
+
+/// MAN-90: the exact bytes the uplink writes for one login and one CQ spot,
+/// pinned literally rather than through `rbn::format_line`. This is the manta
+/// side of docs/RUNBOOKS/aggregator-rbn-capture.md's comparison and is quoted in
+/// docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md (which
+/// docs_consistency.rs checks); change all three together.
+const MAN90_REFERENCE_LOGIN: &str = "W3XYZ\r\n";
+const MAN90_REFERENCE_SPOT: &str =
+    "DX de W3XYZ-#:  14027.10  JA1ABC         CW    30 dB  28 WPM  CQ      2213Z\r\n";
+
+#[tokio::test]
+async fn the_uplink_session_bytes_match_the_man90_reference() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let harness = spawn_uplink(listener.local_addr().unwrap().port(), false);
+
+    let (login_line, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+    assert_eq!(login_line, MAN90_REFERENCE_LOGIN);
+
+    harness.bus.publish(sample_spot());
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for the forwarded spot line")
+        .unwrap();
+    assert_eq!(line, MAN90_REFERENCE_SPOT);
 
     let _ = harness.shutdown_tx.send(true);
 }

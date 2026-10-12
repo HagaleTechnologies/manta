@@ -94,6 +94,9 @@ station_callsign = "N0CALL"
 
 # --- Uplink to an RBN-style collector ----------------------------------------
 # Forwards CQ and beacon spots to an upstream collector. Needs [server].
+# Experimental: its login and spot format are unverified against RBN's
+# real ingest. To reach RBN today, let an RBN Aggregator read the telnet
+# server instead (docs/RUNBOOKS/secondary-skimmer-field-node.md).
 # Delete the `#` in front of [[rbn_uplink]] and the settings below to use
 # it; repeat the block once per collector.
 

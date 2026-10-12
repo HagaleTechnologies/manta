@@ -75,6 +75,12 @@ MAN-116: `manta bench sensitivity` produces the recall/CER-vs-SNR (500 Hz)
 table over AWGN/Watterson good/poor × WPM, deterministic per build and
 flags — see docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md.
 
+MAN-298: v0.1.0 release prep. The GitHub Release shares
+`docker-publish-release`'s `ghcr-publish` approval but not its outcome, so a
+failed image push no longer skips it; release notes and README say
+"pre-stability alpha, expect breakage". Tony pushes the tag. See
+docs/DECISIONS/2026-10-11-man298-first-release.md.
+
 MAN-123: `run`'s plain-text mode prints decoded text on stderr grouped one
 line per track and `SPOT:` lines on stdout; with a `[server]` table decoded
 text is off unless `--decoded-text` — see
@@ -115,6 +121,13 @@ MAN-269: `run --realtime`/`--loop` (`input.realtime`/`input.loop`) pace and
 loop file replay so a hardware-free replay can feed telnet/JSON clients; IQ
 WAVs declaring more than 10 MS/s are rejected at open — see
 docs/DECISIONS/2026-10-10-man269-paced-looping-replay.md.
+
+MAN-90: the direct `[[rbn_uplink]]` is experimental (docs, a `config check`
+note, and the live-transmit WARN lines); the Aggregator path is the supported
+route into RBN. Claims C1–C7 stay open until a consenting Aggregator
+operator's capture — see
+docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md and
+docs/RUNBOOKS/aggregator-rbn-capture.md.
 
 MAN-115: `TrackManager` skips the channelizer's zero pre-roll, `FloorBank`
 seeds a young channel's effective floor from its block median for 1 s, and

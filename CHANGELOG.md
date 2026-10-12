@@ -16,10 +16,16 @@ version. A PATCH release never changes decoder output. The JSON stream's
 output. See
 [docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md](docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md).
 
-No release has been tagged yet. Changes before this file started are in the
-git history and `docs/DECISIONS/`.
+`0.1.0` is the first tagged release; its GitHub Release notes list every
+pull request merged before it. Changes before this file started are also in
+the git history and `docs/DECISIONS/`.
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-10-11
+
+Pre-stability alpha, expect breakage: manta has not cleared its own M2/M3
+acceptance gates.
 
 ### Decoder output
 
@@ -35,10 +41,16 @@ git history and `docs/DECISIONS/`.
 
 ### Added
 
+<<<<<<< HEAD
 - `[detector] rtty_filter`/`rtty_dwell_ms`; `manta_rtty_signals{band}`
   gauge; `rtty` array in `decode --json` and, when RTTY was marked, an
   `rtty:` line in plain `decode`; `RTTY marked`/`RTTY cleared` log lines in
   `run` (MAN-314).
+=======
+- Prebuilt archives for Linux (x86-64, arm64), macOS (x86-64, arm64) and
+  Windows (x86-64) on each GitHub Release, with `SHA256SUMS` and a
+  build-provenance attestation (MAN-298).
+>>>>>>> f6a41cc0551a69e5007e7b3979643a6c4c9ecf27
 - `manta health` asks a running daemon's `/healthz` and exits 0 when it
   reports healthy, 1 otherwise, reading the metrics port from the same config
   and `MANTA_*` overrides as `run` (MAN-81).
