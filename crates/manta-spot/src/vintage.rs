@@ -1,14 +1,23 @@
-//! Age of the built-in cty.dat for the startup warning.
+//! Age of the built-in cty.dat for the startup warning, and the retrieval
+//! date of the built-in MASTER.SCP (MAN-316).
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// UTC retrieval date of data/cty.dat, pinned to data/SOURCES.md by a test.
 pub const CTY_DAT_RETRIEVED: &str = "2026-07-25";
+/// UTC retrieval date of data/master.scp, pinned to data/SOURCES.md by a
+/// test (MAN-316).
+pub const MASTER_SCP_RETRIEVED: &str = "2026-07-25";
 /// Startup warns after this many whole days.
 pub const CTY_DAT_STALE_AFTER_DAYS: u64 = 180;
 
 /// Retrieval midnight in UTC; None only for a malformed constant.
 pub fn cty_dat_retrieved_at() -> Option<SystemTime> {
     date_at_midnight_utc(CTY_DAT_RETRIEVED)
+}
+/// MASTER.SCP's retrieval midnight in UTC; None only for a malformed
+/// constant.
+pub fn master_scp_retrieved_at() -> Option<SystemTime> {
+    date_at_midnight_utc(MASTER_SCP_RETRIEVED)
 }
 /// Whole days since retrieval, or None for a clock before retrieval.
 pub fn cty_dat_age_days(now: SystemTime) -> Option<u64> {
@@ -77,9 +86,11 @@ fn days_from_civil(mut y: i64, m: u32, d: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // No test here may hardcode CTY_DAT_RETRIEVED's value: refreshing the
-    // vendored file changes it, and only `cty_dat_retrieved_matches_sources_md`
-    // should then need attention (and it passes once SOURCES.md matches).
+    // No test here may hardcode CTY_DAT_RETRIEVED's or MASTER_SCP_RETRIEVED's
+    // value: refreshing the vendored file changes it, and only
+    // `cty_dat_retrieved_matches_sources_md` or
+    // `master_scp_retrieved_matches_sources_md` should then need attention
+    // (and it passes once SOURCES.md matches).
     const DAY: u64 = 86_400;
 
     fn at(secs: u64) -> SystemTime {
@@ -108,6 +119,28 @@ mod tests {
         assert!(
             cty_dat_retrieved_at().is_some(),
             "{CTY_DAT_RETRIEVED} must be YYYY-MM-DD"
+        );
+    }
+
+    #[test]
+    fn master_scp_retrieved_matches_sources_md() {
+        // The `- Retrieved: YYYY-MM-DD` line under `## master.scp` in data/SOURCES.md.
+        let sources = include_str!("../data/SOURCES.md");
+        let section = sources
+            .split("## ")
+            .find(|s| s.starts_with("master.scp"))
+            .unwrap();
+        let line = section
+            .lines()
+            .find(|l| l.starts_with("- Retrieved: "))
+            .unwrap();
+        assert_eq!(
+            line.trim_start_matches("- Retrieved: ").trim(),
+            MASTER_SCP_RETRIEVED
+        );
+        assert!(
+            master_scp_retrieved_at().is_some(),
+            "{MASTER_SCP_RETRIEVED} must be YYYY-MM-DD"
         );
     }
 

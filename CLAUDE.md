@@ -147,6 +147,14 @@ MAN-127: `manta calibrate` measures the receiver's ppm offset against a
 known carrier and saves `[input].freq_correction_ppm` after confirmation —
 see docs/DECISIONS/2026-10-11-man127-calibrate-command.md.
 
+MAN-316: `[spot].refresh_lists` (default off) makes `run` from a live
+receiver download `cty.dat` every 7 days and `MASTER.SCP` daily over plain
+HTTP, swap a download that passes the acceptance checks into the
+validator, spot geography and JSON stream without a restart, and keep it
+under `[spot].list_cache_dir`; a failure keeps the list in use. File replay
+never downloads; `--cty-sha256`/`--scp-sha256` pin a version by hash. See
+docs/DECISIONS/2026-10-12-man316-reference-list-refresh.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each

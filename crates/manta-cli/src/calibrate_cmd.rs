@@ -343,6 +343,8 @@ fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<Str
         notch: _,
         cty: _,
         scp: _,
+        cty_sha256: _,
+        scp_sha256: _,
     } = cli;
     let mut found: Vec<String> = Vec::new();
     let mut flag = |set: bool, name: &str| {

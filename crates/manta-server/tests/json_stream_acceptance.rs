@@ -9,6 +9,8 @@ use manta_server::bus::SpotBus;
 use manta_server::config::StationLocation;
 use manta_server::metrics::Metrics;
 use manta_spot::cty::Table;
+use manta_spot::reference::ReferenceLists;
+use manta_spot::scp;
 use manta_spot::{Spot, SpotType};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -23,6 +25,15 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
 Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
     JA,JD,JE,JF,JG,JH,JI,JJ,JK,JL,JM,JN,JO,JP,JQ,JR,JS;
 ";
+
+/// MAN-316: the stream reads `cty.dat` through the run's live
+/// `ReferenceLists`; these tests never swap it.
+fn fixture_lists() -> Arc<ReferenceLists> {
+    Arc::new(ReferenceLists::new(
+        Arc::new(Table::parse(CTY_FIXTURE)),
+        Arc::new(scp::Set::bundled()),
+    ))
+}
 
 async fn spawn_server() -> (
     std::net::SocketAddr,
@@ -72,7 +83,7 @@ async fn spawn_server_with(
 ) {
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
     let metrics = Arc::new(Metrics::new());
-    let cty = Arc::new(Table::parse(CTY_FIXTURE));
+    let lists = fixture_lists();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -89,7 +100,7 @@ async fn spawn_server_with(
             manta_server::json_stream::JsonStreamConfig {
                 bus: bus2,
                 metrics: metrics2,
-                cty,
+                lists,
                 station_call: STATION_CALL.to_string(),
                 station_location,
                 decoder_version: "manta-test".to_string(),
@@ -620,7 +631,7 @@ async fn tcp_and_websocket_clients_share_the_same_port() {
 async fn websocket_client_receives_spot_as_json_message() {
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
     let metrics = Arc::new(Metrics::new());
-    let cty = Arc::new(Table::parse(CTY_FIXTURE));
+    let lists = fixture_lists();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -636,7 +647,7 @@ async fn websocket_client_receives_spot_as_json_message() {
             manta_server::json_stream::JsonStreamConfig {
                 bus: bus2,
                 metrics,
-                cty,
+                lists,
                 station_call: STATION_CALL.to_string(),
                 station_location: None,
                 decoder_version: "manta-test".to_string(),
@@ -725,7 +736,7 @@ async fn websocket_client_sending_an_oversized_message_is_disconnected() {
 
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
     let metrics = Arc::new(Metrics::new());
-    let cty = Arc::new(Table::parse(CTY_FIXTURE));
+    let lists = fixture_lists();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -740,7 +751,7 @@ async fn websocket_client_sending_an_oversized_message_is_disconnected() {
             manta_server::json_stream::JsonStreamConfig {
                 bus,
                 metrics,
-                cty,
+                lists,
                 station_call: STATION_CALL.to_string(),
                 station_location: None,
                 decoder_version: "manta-test".to_string(),
@@ -793,7 +804,7 @@ async fn websocket_client_sending_an_unsolicited_pong_is_disconnected() {
 
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
     let metrics = Arc::new(Metrics::new());
-    let cty = Arc::new(Table::parse(CTY_FIXTURE));
+    let lists = fixture_lists();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -808,7 +819,7 @@ async fn websocket_client_sending_an_unsolicited_pong_is_disconnected() {
             manta_server::json_stream::JsonStreamConfig {
                 bus,
                 metrics,
-                cty,
+                lists,
                 station_call: STATION_CALL.to_string(),
                 station_location: None,
                 decoder_version: "manta-test".to_string(),
@@ -860,7 +871,7 @@ async fn websocket_client_sending_a_structurally_malformed_frame_is_disconnected
 
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
     let metrics = Arc::new(Metrics::new());
-    let cty = Arc::new(Table::parse(CTY_FIXTURE));
+    let lists = fixture_lists();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -882,7 +893,7 @@ async fn websocket_client_sending_a_structurally_malformed_frame_is_disconnected
             manta_server::json_stream::JsonStreamConfig {
                 bus,
                 metrics,
-                cty,
+                lists,
                 station_call: STATION_CALL.to_string(),
                 station_location: None,
                 decoder_version: "manta-test".to_string(),
@@ -994,7 +1005,7 @@ async fn websocket_client_flooding_pings_past_the_budget_is_disconnected() {
 
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
     let metrics = Arc::new(Metrics::new());
-    let cty = Arc::new(Table::parse(CTY_FIXTURE));
+    let lists = fixture_lists();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -1009,7 +1020,7 @@ async fn websocket_client_flooding_pings_past_the_budget_is_disconnected() {
             manta_server::json_stream::JsonStreamConfig {
                 bus,
                 metrics,
-                cty,
+                lists,
                 station_call: STATION_CALL.to_string(),
                 station_location: None,
                 decoder_version: "manta-test".to_string(),
