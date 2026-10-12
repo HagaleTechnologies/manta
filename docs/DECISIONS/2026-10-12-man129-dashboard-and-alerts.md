@@ -44,6 +44,7 @@ The kit:
 | D15 | `CLAUDE.md` is not edited. | It is owner-gated; `docs/README.md` and this index make the kit discoverable. |
 | D16 | No panels for MAN-118 or MAN-316 families. | Their PRs are unmerged. |
 | D17 | `uplink-health.md`'s stale "bound to `[server].bind_addr`" now says `[server].metrics_bind_addr` (`127.0.0.1`). | It contradicted `docs/METRICS.md` since MAN-132. |
+| D18 | The Overview stat tiles are instant queries, and Spots / min and Active tracks draw no sparkline. | Validate killed a node and its Health tile still read green "Healthy", with Uptime, Spots / min and Active tracks frozen: a range query reduced to its last non-null value keeps a dead node's last sample for the whole 6-hour range. Gating on `up` would not change that, since `lastNotNull` still finds the sample from before the node died. An instant query returns nothing for a series Prometheus marked stale at a failed scrape. The **Spot rate** and **Active tracks** time series keep the history. A test enforces the instant queries. |
 
 ## What the prototype found
 

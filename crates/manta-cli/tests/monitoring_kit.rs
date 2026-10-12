@@ -771,6 +771,28 @@ fn mapped_panels_colour_each_state_one_way() {
 }
 
 #[test]
+fn stat_tiles_query_the_current_value() {
+    let d = dashboard();
+    for p in panels(&d) {
+        if p["type"].as_str() != Some("stat") {
+            continue;
+        }
+        let title = p["title"].as_str().unwrap_or("?");
+        let targets = p["targets"]
+            .as_array()
+            .unwrap_or_else(|| panic!("stat {title:?} has no targets"));
+        for t in targets {
+            assert!(
+                t["instant"].as_bool() == Some(true) && t["range"].as_bool() != Some(true),
+                "stat {title:?} must be an instant query: a range query reduced to its last \
+                 non-null value keeps showing a node Prometheus no longer scrapes (a killed \
+                 node's Health read green Healthy)"
+            );
+        }
+    }
+}
+
+#[test]
 fn dashboard_layout_is_tidy() {
     let d = dashboard();
     let mut ids = BTreeSet::new();

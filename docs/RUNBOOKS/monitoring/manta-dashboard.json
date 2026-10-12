@@ -125,8 +125,8 @@
           "expr": "manta_healthy{instance=~\"$instance\"}",
           "legendFormat": "{{instance}}",
           "refId": "A",
-          "range": true,
-          "instant": false
+          "range": false,
+          "instant": true
         }
       ],
       "gridPos": {
@@ -207,8 +207,8 @@
           "expr": "manta_uptime_seconds{instance=~\"$instance\"}",
           "legendFormat": "{{instance}}",
           "refId": "A",
-          "range": true,
-          "instant": false
+          "range": false,
+          "instant": true
         }
       ],
       "gridPos": {
@@ -321,8 +321,8 @@
           "expr": "sum by (instance) (rate(manta_spots_total{instance=~\"$instance\"}[$__rate_interval])) * 60",
           "legendFormat": "{{instance}}",
           "refId": "A",
-          "range": true,
-          "instant": false
+          "range": false,
+          "instant": true
         }
       ],
       "gridPos": {
@@ -346,7 +346,7 @@
           "values": false
         },
         "colorMode": "none",
-        "graphMode": "area",
+        "graphMode": "none",
         "textMode": "auto",
         "justifyMode": "auto",
         "orientation": "auto"
@@ -370,8 +370,8 @@
           "expr": "manta_active_tracks{instance=~\"$instance\"}",
           "legendFormat": "{{instance}}",
           "refId": "A",
-          "range": true,
-          "instant": false
+          "range": false,
+          "instant": true
         }
       ],
       "gridPos": {
@@ -395,7 +395,7 @@
           "values": false
         },
         "colorMode": "none",
-        "graphMode": "area",
+        "graphMode": "none",
         "textMode": "auto",
         "justifyMode": "auto",
         "orientation": "auto"

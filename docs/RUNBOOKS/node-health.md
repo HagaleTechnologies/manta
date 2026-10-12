@@ -162,10 +162,9 @@ interval if you need an ongoing liveness check, not just a post-start one.)
   30-day field-node ledger reads both
   (`docs/RUNBOOKS/secondary-skimmer-field-node.md`).
 
-<<<<<<< HEAD
 A ready Grafana dashboard and Prometheus alerts built on these queries are in
 [monitoring.md](monitoring.md) (MAN-129).
-=======
+
 ## Decode quality (MAN-118)
 
 The families above say whether the node is running. Four more say whether
@@ -202,7 +201,6 @@ why they are node-wide, with no `track_id` label.
   ```
   A high share at `le="1"` means candidates are not confirming: busted
   calls, or signals too short-lived to repeat.
->>>>>>> 0072662d322084656490cb9bd0cc47b74e685c81
 
 ## Known gaps
 

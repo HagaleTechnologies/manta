@@ -291,10 +291,7 @@ For what each uplink state means and what to do about it, see
   source outage counters.
 - [MAN-132](DECISIONS/2026-10-08-man132-metrics-loopback-bind.md): the
   loopback default for `metrics_bind_addr`.
-<<<<<<< HEAD
-- [MAN-129](DECISIONS/2026-10-12-man129-dashboard-and-alerts.md): the shipped
-  Grafana dashboard and Prometheus alert rules.
-=======
 - [MAN-301](DECISIONS/2026-10-11-man301-live-rbn-comparison.md): the
   RBN comparison families.
->>>>>>> 0072662d322084656490cb9bd0cc47b74e685c81
+- [MAN-129](DECISIONS/2026-10-12-man129-dashboard-and-alerts.md): the shipped
+  Grafana dashboard and Prometheus alert rules.

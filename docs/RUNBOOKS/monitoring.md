@@ -88,6 +88,12 @@ What each row shows:
 - **Overview**: **Health** (`manta_healthy`, the same verdict as
   `GET /healthz`), **Uptime**, **Restarts** in the selected range,
   **Spots / min**, **Active tracks** and **Version** (`manta_build_info`).
+  Except Restarts, these tiles show each node's value now, not the last one
+  in the range. A node Prometheus can no longer scrape drops off them at its
+  first failed scrape, or after 5 minutes if Prometheus recorded no stale
+  marker for it (a Prometheus restart during the outage, say). Spots / min
+  keeps it until its rate window, which widens with the time range, has
+  passed. [MantaNodeDown](#mantanodedown) fires after 2 minutes down.
 - **Spots**: **Spot rate** per node from `manta_spots_total`, and
   **Spot rate by band** from `manta_spots_by_band_total`.
 - **Decoder**: **Active tracks** over time (`manta_active_tracks`), and
@@ -117,7 +123,7 @@ When a panel has nothing to show, it says why:
 
 | Panel | Text | Meaning |
 |---|---|---|
-| Health | `No data: is Prometheus scraping this node?` | No `manta_healthy` sample for the selected nodes. |
+| Health | `No data: is Prometheus scraping this node?` | No current `manta_healthy` sample for the selected nodes: Prometheus is not scraping them, or their last scrape failed. |
 | Spot rate by band | `No spots yet` | A band has a series only after its first spot. |
 | Input packets lost | `Not measured for this source` | Only HPSDR and KiwiSDR sources count lost packets. Other sources have no series, not a zero. |
 | Uplink spots sent / min, Uplink reconnects (5 min) | `No [[rbn_uplink]] configured` | The node has no uplink target. |
