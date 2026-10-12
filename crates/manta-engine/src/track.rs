@@ -18,7 +18,8 @@ pub struct DetectorConfig {
     pub hang_hops: u64,
     /// SPEC §2.4: no character emitted for this many hops (30000ms) -> CLOSED (garbage collect).
     pub gc_hops: u64,
-    /// SPEC §2.1: track creation inhibited for this many hops (2000ms) after start.
+    /// SPEC §2.2: track creation inhibited for this many hops (25ms) after
+    /// the first real (non-pre-roll) hop. MAN-115: was 750 (2000ms).
     pub warmup_hops: u64,
     /// ARCHITECTURE §4 (not SPEC §9): max concurrent ACTIVE tracks.
     pub track_cap: usize,
@@ -133,6 +134,26 @@ impl Default for DetectorConfig {
     /// picking an arbitrarily huge number. (Any relationship to manta's
     /// Pi4 CPU-budget gate, MAN-18/MAN-49, is explicitly out of scope for
     /// this change -- see that decision doc.)
+    ///
+    /// **`warmup_hops` deviates from SPEC v1's 750 (2 s)**, cut to 9 hops
+    /// (25 ms), MAN-115, measured and pinned in
+    /// `docs/DECISIONS/2026-10-11-man115-startup-latency.md`. The 2 s
+    /// inhibit existed because the floor was garbage early on, and almost
+    /// all of that garbage was the channelizer's zero pre-roll: hop 0 is an
+    /// all-zero window (-200 dB) and hops 1-31 are partial, and a young
+    /// ring's lower quartile is its minimum, so the floor sat near -140 dB
+    /// (395 bogus V1 promotions at 0 ms, 391 of them inside the pre-roll).
+    /// `TrackManager::skip_preroll_hops` now keeps the pre-roll out of the
+    /// floor, and `FloorBank`'s 1 s block-median seed keeps a 1-4 entry
+    /// ring from reading a single low chi-squared draw as the floor (0
+    /// bogus promotions over 250 pure-noise seeds x 4 s at 0 ms). With
+    /// both, the warm-up only has to cover the gate EMA's own first hops.
+    /// 9 hops rather than 0: three golden asserts (V8w's 0-bogus, V1's
+    /// 10 Hz frequency read and `spots.rs`'s report/spot frequency
+    /// agreement) are single draws that move with the hop a track promotes
+    /// on, and 25 ms is the value measured to clear all three; 0 ms turns
+    /// V8w's garbled fading W8WLR decode into a bogus `<call> T` Beacon
+    /// spot. `warmup_ms = 2000` restores the old behaviour.
     fn default() -> Self {
         DetectorConfig {
             on_snr_db: 12.0,
@@ -140,7 +161,7 @@ impl Default for DetectorConfig {
             confirm_hops: 19,
             hang_hops: 1875,
             gc_hops: 11250,
-            warmup_hops: 750,
+            warmup_hops: 9,
             track_cap: 1200,
             // MAN-171: same order as `gc_hops` itself -- a channel that
             // stayed silent for the whole GC window earns an equally long
@@ -876,6 +897,9 @@ pub struct TrackManager {
     /// `DetectorConfig::silent_respawn_cooldown_hops`). `0` (the default,
     /// always `<= hop_counter`) means no active cooldown.
     channel_cooldown_until: Vec<u64>,
+    /// MAN-115: channelizer hops with `m` below this are the zero-padding
+    /// pre-roll and are skipped by `process_hops`. See `skip_preroll_hops`.
+    preroll_hops: u64,
 }
 
 impl TrackManager {
@@ -902,6 +926,7 @@ impl TrackManager {
             channel_spacing_hz: fs / n_channels as f64,
             close_counts: CloseCounts::default(),
             channel_cooldown_until: vec![0; n_channels],
+            preroll_hops: 0,
         }
     }
 
@@ -922,6 +947,17 @@ impl TrackManager {
     /// are never reused within a session.
     pub fn resume_track_ids_from(&mut self, next: u32) {
         self.next_id = next;
+    }
+
+    /// Ignore every channelizer hop with `m < n`. MAN-115: callers that
+    /// prepend `filter_len` zero samples (`decode_samples`, `listen`'s
+    /// segments, `soak`) pass their `pad_hops`. Those hops' windows are
+    /// all-zero or partial, read as -200 dB or far below the real noise,
+    /// and would otherwise drag the floor (SPEC §2.1) to garbage and count
+    /// against `warmup_hops`. Skipped hops never reach the floor, the gate
+    /// or `hop_counter`.
+    pub fn skip_preroll_hops(&mut self, n: u64) {
+        self.preroll_hops = n;
     }
 
     /// SPEC v2 §2.2's min-of-six-neighbors spectral reference for a
@@ -1495,6 +1531,9 @@ impl TrackManager {
         let mut promoted_events: Vec<DecoderEvent> = Vec::new();
         let mut closure_flush_events: Vec<DecoderEvent> = Vec::new();
         for h in hops {
+            if h.m < self.preroll_hops {
+                continue;
+            }
             let (closed, promoted, closure_flush) = self.step_hop(h, hop_to_sample_ts(h.m));
             closed_ids.extend(closed);
             promoted_events.extend(promoted);
@@ -3347,6 +3386,44 @@ mod tests {
         );
     }
 
+    /// MAN-115: hops below `skip_preroll_hops`' bound are the zero-padding
+    /// pre-roll. They must not count toward `warmup_hops` nor reach the
+    /// floor: a -200 dB all-zero window would otherwise become the young
+    /// ring's lower quartile.
+    #[test]
+    fn preroll_hops_do_not_advance_hop_counter_or_floor() {
+        let n = 64;
+        let mut tm = TrackManager::new(
+            n,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        tm.skip_preroll_hops(32);
+        let zeros: Vec<HopOutput> = (0..32).map(|m| hop(m, vec![0.0; n])).collect();
+        tm.process_hops(&zeros, |m| m * 256);
+        assert_eq!(
+            tm.hop_counter, 0,
+            "pre-roll hops must not advance hop_counter"
+        );
+        assert_eq!(
+            tm.floor.channel_floor_db(0),
+            -140.0,
+            "pre-roll hops must not reach the floor"
+        );
+        tm.process_hops(&[hop(32, quiet_power(n))], |m| m * 256);
+        assert_eq!(
+            tm.hop_counter, 1,
+            "the first real hop is hop 0 of the segment"
+        );
+        assert!(
+            (tm.floor.channel_floor_db(0) - -90.0).abs() < 0.5,
+            "the first real hop seeds the ring at the real -90 dB noise, got {}",
+            tm.floor.channel_floor_db(0)
+        );
+    }
+
     /// MAN-73: `listen()`'s segment restart resumes id assignment from the
     /// prior segment's `next_track_id()` so ids are never reused within a
     /// session.
@@ -3641,11 +3718,12 @@ mod tests {
     /// a continuously-keyed signal is not force-closed every `gc_hops` (~30 s)
     /// and re-spawned as a new track.
     ///
-    /// CER is asserted `< 0.03`, not `== 0.0`: SPEC §2.1's 2 s floor warmup
-    /// (`warmup_hops = 750`) inhibits all track creation for the first 2 s, so
-    /// the leading ~2.66 s of the 120 s stream (warmup + confirm) is
-    /// structurally unrecoverable -- a deterministic ~0.0155 CER floor
-    /// (measured identical across five noise seeds), i.e. 98.4% char accuracy.
+    /// CER is asserted `< 0.02`, not `== 0.0`. Under the old 2 s floor warmup
+    /// (`warmup_hops = 750`) the leading ~2.66 s of the 120 s stream (warmup
+    /// plus confirm) was structurally unrecoverable -- a deterministic ~0.0155
+    /// CER floor (measured identical across five noise seeds). MAN-115's
+    /// 9-hop warmup promotes near the start of the stream, so only the
+    /// first, mid-element character is still at risk; the bound is kept.
     #[test]
     fn active_track_decodes_real_text() {
         use manta_dsp::channelizer::Channelizer;
@@ -3677,7 +3755,7 @@ mod tests {
         let cer = manta_testkit::cer::cer(&rendered.keyed_texts[0], &text);
         assert!(
             cer < 0.02,
-            "expected CER < 0.02 (2 s warmup floor ~0.0155), got {cer:.4}\nexpected {:?}\ngot      {:?}",
+            "expected CER < 0.02 (pre-MAN-115 2 s warmup floor was ~0.0155), got {cer:.4}\nexpected {:?}\ngot      {:?}",
             rendered.keyed_texts[0],
             text
         );

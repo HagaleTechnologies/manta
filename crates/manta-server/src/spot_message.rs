@@ -331,6 +331,26 @@ impl SpotMessage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn human_rounding_never_changes_wire_confidence_frequency_or_snr_reference() {
+        let mut spot = sample_spot();
+        spot.freq_hz = 14_012_349.9;
+        spot.confidence = 0.269_430_5;
+        spot.snr_db = 20.4;
+        let cty = manta_spot::cty::Table::parse(CTY_FIXTURE);
+        let msg = SpotMessage::from_spot(&spot, "W3XYZ", None, &cty, "manta-test", 0, 0);
+        assert_eq!(msg.decode_confidence, Some(spot.confidence));
+        // Preserve the existing whole-Hz wire contract, never human kHz rounding.
+        assert_eq!(msg.frequency, 14_012_350);
+        assert_eq!(msg.snr, Some(20));
+        assert_eq!(msg.snr_ref_hz, 2500);
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            json["decodeConfidence"].as_f64().unwrap() as f32,
+            spot.confidence
+        );
+    }
+
     use super::*;
     use manta_spot::SpotType;
 
@@ -845,5 +865,45 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         }
         assert_eq!(json["dxDxcc"], 339);
         assert!(!json["dxDxcc"].is_null());
+    }
+
+    /// MAN-149: dispensa's contract is private, so `docs/SPOT-SCHEMA.md` is
+    /// the field reference outside developers read. Its field table must
+    /// have exactly one row per key this struct puts on the wire.
+    #[test]
+    fn every_wire_field_is_documented() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let msg = SpotMessage::from_spot(&sample_spot(), "W1AW", None, &cty, "v", 0, 1);
+        let json = serde_json::to_value(&msg).unwrap();
+        let keys: Vec<&String> = json.as_object().expect("an object").keys().collect();
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/SPOT-SCHEMA.md");
+        let schema = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("reading {path}: {e}"))
+            .replace("\r\n", "\n");
+        let rows: Vec<&str> = schema
+            .lines()
+            .filter_map(|l| l.strip_prefix("| `"))
+            .filter_map(|l| l.split_once("` |"))
+            .map(|(field, _)| field)
+            .collect();
+
+        for key in &keys {
+            assert!(
+                rows.contains(&key.as_str()),
+                "docs/SPOT-SCHEMA.md has no `| `{key}` |` row: add one to its Fields table"
+            );
+        }
+        for row in &rows {
+            assert!(
+                keys.iter().any(|k| k == row),
+                "docs/SPOT-SCHEMA.md documents `{row}`, which SpotMessage does not serialize"
+            );
+        }
+        assert_eq!(
+            rows.len(),
+            keys.len(),
+            "docs/SPOT-SCHEMA.md's Fields table must have exactly one row per wire field"
+        );
     }
 }

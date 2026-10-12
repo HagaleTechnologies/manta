@@ -466,6 +466,8 @@ pub struct Metrics {
     /// here makes the loss VISIBLE (ARCHITECTURE §8: no silent loss)
     /// without corrupting the live-delivery arithmetic.
     spots_replay_abandoned_total: AtomicU64,
+    /// In-window spots evicted by the history ceiling (MAN-93).
+    spots_history_truncated_total: AtomicU64,
     /// MAN-136/MAN-45: a spot's dx or de callsign couldn't be resolved
     /// against `cty.dat` -- or resolved only through the base prefix of a
     /// `/MM`/`/AM` call, whose real position is unknowable from it -- so it
@@ -624,6 +626,15 @@ impl Metrics {
     /// acceptance test can assert replay loss independently of live loss.
     pub fn spots_replay_abandoned_total(&self) -> u64 {
         self.spots_replay_abandoned_total.load(Ordering::Relaxed)
+    }
+
+    pub fn record_history_truncated(&self, n: u64) {
+        self.spots_history_truncated_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn spots_history_truncated_total(&self) -> u64 {
+        self.spots_history_truncated_total.load(Ordering::Relaxed)
     }
 
     /// MAN-136/MAN-45: call once per spot (not per connected client) when
@@ -1084,6 +1095,12 @@ impl Metrics {
         out.push_str(&format!(
             "manta_spots_replay_abandoned_total {}\n",
             self.spots_replay_abandoned_total.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP manta_spots_history_truncated_total Spots dropped from the sh/dx history at its 10000-spot ceiling while still inside [server].history_minutes. Non-zero means sh/dx reaches back less than the configured window.\n");
+        out.push_str("# TYPE manta_spots_history_truncated_total counter\n");
+        out.push_str(&format!(
+            "manta_spots_history_truncated_total {}\n",
+            self.spots_history_truncated_total()
         ));
 
         out.push_str(
@@ -2511,5 +2528,18 @@ mod tests {
         assert!(
             text.contains(r#"manta_uplink_target_recent_reconnects{target="a.example:7000"} 2"#)
         );
+    }
+
+    #[test]
+    fn history_truncation_is_counted_and_rendered() {
+        let metrics = Metrics::new();
+        assert_eq!(metrics.spots_history_truncated_total(), 0);
+        metrics.record_history_truncated(2);
+        metrics.record_history_truncated(3);
+        assert_eq!(metrics.spots_history_truncated_total(), 5);
+        let text = metrics.render_prometheus_text();
+        assert!(text.contains("# HELP manta_spots_history_truncated_total Spots dropped from the sh/dx history at its 10000-spot ceiling while still inside [server].history_minutes. Non-zero means sh/dx reaches back less than the configured window.\n"));
+        assert!(text.contains("# TYPE manta_spots_history_truncated_total counter\n"));
+        assert!(text.contains("manta_spots_history_truncated_total 5\n"));
     }
 }

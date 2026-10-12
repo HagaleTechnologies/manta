@@ -317,7 +317,7 @@ fn run_refuses_the_unedited_example_before_the_dial_frequency_check() {
     let o = manta_in(dir.path(), &["run", "--config", "manta.toml"]);
     let err = assert_station_refused(&o, "run");
     // The complete output contract, with no MANTA_* override applied.
-    assert_eq!(err, format!("Error: manta.toml: {STATION_REFUSAL}\n"));
+    assert_eq!(err, format!("error: manta.toml: {STATION_REFUSAL}\n"));
     assert!(!err.contains(DIAL_REQUIRED), "{err}");
 }
 
@@ -338,7 +338,7 @@ fn listen_alias_refuses_the_unedited_example() {
     // `listen` first warns that it is deprecated; the refusal ends stderr.
     assert_eq!(
         err.lines().last(),
-        Some(format!("Error: manta.toml: {STATION_REFUSAL}").as_str()),
+        Some(format!("error: manta.toml: {STATION_REFUSAL}").as_str()),
         "{err}"
     );
 }
@@ -534,7 +534,7 @@ mod startup {
         let banner = child.banner();
         for needle in [
             "station=W3XYZ",
-            "dial_freq_hz=14060000",
+            "dial_frequency=14060.0 kHz",
             "telnet=127.0.0.1:",
             "json=127.0.0.1:",
             "metrics=127.0.0.1:",
@@ -762,7 +762,10 @@ fn compose_runs_the_mounted_config_and_outlasts_the_drain() {
         .collect();
     assert_eq!(command, ["run", "--config", "/etc/manta/manta.toml"]);
 
-    // `command` is only manta's arguments if the image's entrypoint is manta.
+    // `command` is manta's arguments because the image's entrypoint script
+    // passes any arguments through to manta unchanged (MAN-81), which
+    // docker_image.rs's `arguments_pass_through_unchanged` proves with this
+    // file's own `command:`.
     let dockerfile = doc("Dockerfile");
     let entrypoint = dockerfile
         .lines()
@@ -771,7 +774,7 @@ fn compose_runs_the_mounted_config_and_outlasts_the_drain() {
         .expect("the Dockerfile sets an ENTRYPOINT");
     let entrypoint: Vec<String> =
         serde_json::from_str(entrypoint.trim()).expect("an exec-form ENTRYPOINT");
-    assert_eq!(entrypoint, ["manta"]);
+    assert_eq!(entrypoint, ["/usr/local/bin/docker-entrypoint.sh"]);
 
     let grace = compose_seconds(&str_of(&manta["stop_grace_period"]).expect("stop_grace_period"));
     let floor = stop_budget_floor();

@@ -147,9 +147,10 @@ impl DoctorReport {
         // `tracks_promoted` is the detector's own ground truth, not a
         // decode-timing proxy (TrackMeta/CharDecoded/TrackClosed all
         // depend on the decoder getting further than mere promotion --
-        // e.g. TrackMeta needs ~1s of decoder init on top of the ~2.05s
-        // worst-case warmup+confirm-hops promotion latency, which a short
-        // --duration run can end before reaching at all). Promotion alone
+        // e.g. TrackMeta needs ~1s of decoder init on top of the
+        // promotion latency -- ~0.07s since MAN-115's 25 ms warmup, ~2.05s
+        // before it or with `warmup_ms = 2000` -- which a short --duration
+        // run can end before reaching at all). Promotion alone
         // is what "the detector found a candidate" means.
         if self.tracks_promoted == 0 {
             return Verdict::NoSignal;
@@ -647,7 +648,8 @@ mod tests {
     }
 
     /// Regression (round-4 review finding): a real signal rising just
-    /// after the ~2s detector warmup can reach `finish()` having only
+    /// after the detector warmup (~2s before MAN-115, 25 ms now) or near
+    /// the end of a short run can reach `finish()` having only
     /// promoted -- no TrackMeta (needs ~1s more decoder init), no
     /// CharDecoded, no eventful TrackClosed (has_emitted stays false for a
     /// promoted-but-otherwise-silent track). `TrackPromoted` is the one
