@@ -1508,6 +1508,26 @@ fn man90_runbook_takes_aggregators_connections_from_the_windows_log() {
     );
 }
 
+/// MAN-90: event 5156 logs inbound connections as well as outbound ones, and
+/// Microsoft's page for it disagrees with itself on which end of an inbound
+/// row is the Source. Step 5 reads SourcePort as Aggregator's LocalPort and
+/// DestAddress as the remote peer, which holds only for a connection
+/// Aggregator opened, so its query must keep outbound rows (`%%14593`) only
+/// (Codex P2 on PR #259). Checks text, not Windows behaviour.
+#[test]
+fn man90_runbook_takes_only_outbound_connections_from_the_windows_log() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let filter = section(&runbook, "Operator steps")
+        .lines()
+        .find(|line| line.contains("Split-Path $_.Application"))
+        .expect("Step 5 never filters the log by Aggregator's executable");
+    assert!(
+        filter.contains("$_.Direction -eq '%%14593'"),
+        "Step 5 keeps inbound 5156 rows: `{}`",
+        filter.trim()
+    );
+}
+
 /// MAN-90: C3, C4 and C7 compare exact bytes. tshark's `ascii` follow mode
 /// turns non-printable bytes into dots, so the developer steps must also write
 /// a `raw` (hex) transcript of each TCP stream and UDP flow.

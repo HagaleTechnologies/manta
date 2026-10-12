@@ -106,13 +106,13 @@ Send something like this, and keep the written reply:
    title bar.
 5. **Stop and keep only Aggregator's traffic.** Stop Wireshark. In the
    administrator PowerShell from step 2, list every connection Windows logged
-   for Aggregator since recording started, save the list, and restore your
-   audit settings:
+   Aggregator opening since recording started, save the list, and restore
+   your audit settings:
 
    ```powershell
    $log = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=5156; StartTime=$start} |
      ForEach-Object { $d = @{}; ([xml]$_.ToXml()).Event.EventData.Data | ForEach-Object { $d[$_.Name] = $_.'#text' }; [pscustomobject]$d } |
-     Where-Object { (Split-Path $_.Application -Leaf) -like 'Aggregator*' } |
+     Where-Object { $_.Direction -eq '%%14593' -and (Split-Path $_.Application -Leaf) -like 'Aggregator*' } |
      Sort-Object ProcessID,Protocol,SourceAddress,SourcePort,DestAddress,DestPort -Unique
    $log | Format-Table ProcessID,Protocol,SourceAddress,SourcePort,DestAddress,DestPort
    (Get-WinEvent -LogName Security -MaxEvents 1 -Oldest).TimeCreated -lt $start
@@ -120,13 +120,20 @@ Send something like this, and keep the written reply:
    ```
 
    Change `'Aggregator*'` as in step 1 if you had to there. Each row is one
-   connection: `Protocol` 6 is TCP and 17 is UDP, SourcePort is the LocalPort,
-   and DestAddress and DestPort are the RemoteAddress and RemotePort. Every
-   connection you noted in step 3 should be listed; if none is, the log did
-   not run, so record again. The line before `auditpol /restore` must print
-   `True`. `False` means the Security log filled up and overwrote connections
-   from early in the recording: enlarge it (Event Viewer → Windows Logs →
-   Security → Properties → Maximum log size), record again, and set it back
+   connection Aggregator opened: `%%14593` is Windows' code for Outbound.
+   Windows logs connections Aggregator accepted too, but Microsoft's page for
+   event 5156 disagrees with itself on which end of an accepted connection is
+   the Source, so its ports could be read the wrong way round. The query
+   leaves those rows out, so the export below keeps an accepted TCP
+   connection only if you noted it in step 1 or 3, and accepted UDP only on
+   a LocalPort you noted in step 3. `Protocol` 6 is TCP and 17 is UDP,
+   SourcePort is the LocalPort, and DestAddress and DestPort are the
+   RemoteAddress and RemotePort. Every connection you noted in step 3 should
+   be listed unless Aggregator accepted it; if none is, the log did not run,
+   so record again. The line before `auditpol /restore` must print `True`.
+   `False` means the Security log filled up and overwrote connections from
+   early in the recording: enlarge it (Event Viewer → Windows Logs → Security
+   → Properties → Maximum log size), record again, and set it back
    afterwards. That check assumes the same Properties page says "Overwrite
    events as needed", Windows' default; if it says anything else, tell the
    developer. Leave out rows whose DestAddress is `127.0.0.1`, `::1`, a LAN
@@ -175,11 +182,11 @@ tshark -r aggregator-rbn.pcapng -Y 'tcp.flags.syn == 1 && tcp.flags.ack == 0' \
 ```
 
 The file holds only the TCP connections the operator noted before and after
-the restart (operator steps 1 and 3) or Windows logged for Aggregator while
-recording (`aggregator-connections.csv`, step 5), each matched on its address
-and ports. It also holds the UDP traffic on the restarted Aggregator's UDP
-LocalPorts from step 3 or that list, with any address but a LAN address or one
-of the operator's Skimmers. Windows logs a connection however briefly it
+the restart (operator steps 1 and 3) or Windows logged Aggregator opening
+while recording (`aggregator-connections.csv`, step 5), each matched on its
+address and ports. It also holds the UDP traffic on the restarted Aggregator's
+UDP LocalPorts from step 3 or that list, with any address but a LAN address or
+one of the operator's Skimmers. Windows logs a connection however briefly it
 lasted, so one Aggregator opened and closed between the operator's looks is
 still in the list. Any other TCP connection, and any UDP on another port, was
 removed in step 5, so the file cannot show it. A noted address, or a row of
