@@ -268,6 +268,9 @@ pub fn decode_samples(
         cfg.decode.clone(),
     );
     tm.skip_preroll_hops(pad_hops);
+    // MAN-314: `DecodeReport::rtty` lists every marked signal, so the
+    // streaming cap on the RTTY log does not apply to a file decode.
+    tm.keep_full_rtty_history();
     // Feed the channelizer/track-manager in bounded chunks rather than one
     // `ch.process(&padded_iq)` + one `tm.process_hops(...)` call over the
     // whole file. `Channelizer::process` is chunk-size-invariant (proved by

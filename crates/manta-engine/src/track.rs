@@ -922,8 +922,12 @@ pub struct TrackManager {
     /// `DetectorConfig::rtty_filter` is off.
     fsk: Option<FskDetector>,
     /// MAN-314: every RTTY signal ever marked, in marking order (the
-    /// oldest cleared entries are dropped past `RTTY_LOG_CAP`).
+    /// oldest cleared entries are dropped past `RTTY_LOG_CAP` while
+    /// `rtty_log_capped`).
     rtty_log: Vec<RttyLogEntry>,
+    /// MAN-314: apply `RTTY_LOG_CAP` to `rtty_log`; true unless
+    /// `keep_full_rtty_history` was called.
+    rtty_log_capped: bool,
     /// MAN-314: bumped whenever a block changes the marked set or a marked
     /// signal's metadata.
     rtty_changes: u64,
@@ -933,7 +937,8 @@ pub struct TrackManager {
 }
 
 /// MAN-314: bound on `TrackManager::rtty_signals` for a long-running
-/// daemon; past it the oldest cleared entries are dropped.
+/// daemon; past it the oldest cleared entries are dropped. Not applied
+/// after `TrackManager::keep_full_rtty_history`.
 const RTTY_LOG_CAP: usize = 4096;
 
 /// MAN-314: one RTTY signal the detector marked (SPEC §2.6). Frequencies
@@ -986,6 +991,7 @@ impl TrackManager {
                 FskDetector::new(n_channels, u32::try_from(blocks).unwrap_or(u32::MAX))
             }),
             rtty_log: Vec::new(),
+            rtty_log_capped: true,
             rtty_changes: 0,
             rtty_changed_sample_ts: 0,
         }
@@ -1007,9 +1013,20 @@ impl TrackManager {
 
     /// MAN-314: every RTTY signal marked so far (SPEC §2.6), in marking
     /// order; the currently marked set is the entries whose
-    /// `cleared_sample_ts` is `None`.
+    /// `cleared_sample_ts` is `None`. Past `RTTY_LOG_CAP` entries the
+    /// oldest cleared ones are dropped, unless `keep_full_rtty_history`
+    /// was called.
     pub fn rtty_signals(&self) -> &[RttyLogEntry] {
         &self.rtty_log
+    }
+
+    /// MAN-314: keep every `rtty_signals` entry instead of dropping the
+    /// oldest cleared ones past `RTTY_LOG_CAP`. For `decode_samples`,
+    /// whose `DecodeReport::rtty` lists every marked signal of a finite
+    /// input; a stream keeps the cap. Call it before the first
+    /// `process_hops`: entries already dropped are not restored.
+    pub fn keep_full_rtty_history(&mut self) {
+        self.rtty_log_capped = false;
     }
 
     /// MAN-314: sync `rtty_log` with the detector's marked set after a
@@ -1051,7 +1068,7 @@ impl TrackManager {
                 }),
             }
         }
-        while self.rtty_log.len() > RTTY_LOG_CAP {
+        while self.rtty_log_capped && self.rtty_log.len() > RTTY_LOG_CAP {
             match self
                 .rtty_log
                 .iter()
@@ -2126,6 +2143,47 @@ mod tests {
         }
         assert!(tm_off.rtty_signals().is_empty());
         assert_eq!(tm_off.close_counts().rtty, 0);
+    }
+
+    /// MAN-314: past `RTTY_LOG_CAP` a stream's log drops the oldest
+    /// cleared entries; after `keep_full_rtty_history` (what
+    /// `decode_samples` calls) every entry stays.
+    #[test]
+    fn rtty_log_cap_is_lifted_by_keep_full_rtty_history() {
+        let fill = |tm: &mut TrackManager| {
+            for id in 0..=RTTY_LOG_CAP as u32 {
+                tm.rtty_log.push(RttyLogEntry {
+                    id,
+                    mark_hz: 14_085_170.0,
+                    space_hz: 14_085_000.0,
+                    shift_hz: 170.0,
+                    measured_shift_hz: 170.0,
+                    marked_sample_ts: u64::from(id),
+                    cleared_sample_ts: Some(u64::from(id) + 1),
+                });
+            }
+            tm.update_rtty_log(RTTY_LOG_CAP as u64 + 2);
+        };
+        let new_tm = || {
+            TrackManager::new(
+                64,
+                96_000.0,
+                0.0,
+                DetectorConfig::default(),
+                DecodeConfig::default(),
+            )
+        };
+
+        let mut stream = new_tm();
+        fill(&mut stream);
+        assert_eq!(stream.rtty_signals().len(), RTTY_LOG_CAP);
+        assert_eq!(stream.rtty_signals()[0].id, 1);
+
+        let mut file = new_tm();
+        file.keep_full_rtty_history();
+        fill(&mut file);
+        assert_eq!(file.rtty_signals().len(), RTTY_LOG_CAP + 1);
+        assert_eq!(file.rtty_signals()[0].id, 0);
     }
 
     fn cfg() -> DetectorConfig {
