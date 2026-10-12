@@ -363,6 +363,29 @@ class ShadowCompareTest(unittest.TestCase):
         self.assertEqual(s["agreement"]["node_spots"], 1)
         self.assertEqual(s["inputs"]["node_malformed_lines"], 1)
 
+    def test_load_node_spots_skips_grade_records(self):
+        npath = os.path.join(self.d, "spots-2026-09-09.jsonl")
+        grade = json.dumps({
+            "kind": "spotGrade", "spotId": "N0CALL-1:1:7:960000:W1AW", "call": "W1AW",
+            "band": "20m", "spotTime": ts("2026-09-09 12:00:00"),
+            "windowClose": ts("2026-09-09 12:03:00"), "windowS": 180, "grade": "match",
+            "disagreements": [], "mantaFreqHz": 14025000, "mantaWpm": 20,
+            "rbnModalFreqHz": 14025100, "rbnMedianWpm": 22.0, "rbnSkimmers": 1,
+            "rbnReports": 1, "freqOffsetHz": -100, "rbnBands": ["20m"], "spotterFilter": []},
+            separators=(",", ":"))
+        write_lines(npath, [NODE_DAY1[0], grade, NODE_DAY1[1]])
+
+        spots, _, malformed, grades = sc.load_node_spots([npath])
+        self.assertEqual([sp["callsign"] for sp in spots], ["W1AW", "K1ABC"])
+        self.assertEqual((malformed, grades), (0, 1))
+
+        code, md, _, s = self.run_tool(node=[npath])
+        self.assertEqual(code, 0)
+        self.assertEqual(s["agreement"]["node_spots"], 2)
+        self.assertEqual(s["inputs"]["grade_records_skipped"], 1)
+        self.assertEqual(s["inputs"]["node_malformed_lines"], 0)
+        self.assertIn("- Node spots: 2 loaded, 0 malformed lines skipped, 1 grade records skipped,", md)
+
     def test_empty_window_reports_zero_without_dividing_by_zero(self):
         code, md, _, s = self.run_tool(window=["--start", "2020-01-01T00:00:00Z",
                                                "--end", "2020-01-02T00:00:00Z"])

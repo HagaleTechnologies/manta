@@ -352,6 +352,22 @@ Forwarding straight to an upstream collector is an experimental
 `[[rbn_uplink]]` block. `dry_run` defaults to `true`, so an uplink connects
 and logs in but transmits nothing until you set it to `false` deliberately.
 
+To see, live, whether RBN heard what manta spots, add an `[rbn_compare]`
+table (MAN-301). manta then reads RBN's public CW feed, read-only, and
+publishes a grade for each spot on the JSON stream and `/metrics` about
+3 minutes after the spot. Allow outbound TCP to
+`telnet.reversebeacon.net:7000`:
+
+```toml
+[rbn_compare]
+enabled = true             # or pass --rbn-compare for a single run
+# spotters = ["K5TR"]     # grade against one co-located skimmer only
+```
+
+[docs/RUNBOOKS/rbn-comparison.md](docs/RUNBOOKS/rbn-comparison.md) explains
+each grade and metric, and `manta grade` for replaying a recorded node's
+spot log against RBN's daily archive.
+
 ### Changing lists without a restart
 
 With a `[server]` table, `SIGHUP` makes a running daemon re-read its config
@@ -563,6 +579,13 @@ only if that config also carries at least one `[[rbn_uplink]]` block.
 - **JSON Lines / WebSocket stream** (`:7301`) — one full-fidelity spot
   object per line; a raw TCP client and a WebSocket client share the
   port. This is the [cqdx](https://cqdx.app) ingest surface.
+- **Live comparison with the RBN** — with `[rbn_compare]` enabled, manta
+  reads RBN's public CW telnet feed and grades each spot `match`,
+  `disagree`, `elsewhere`, `none` or `unknown` against what RBN's
+  skimmers heard within 3 minutes of it. Each grade is a `spotGrade`
+  record on the `:7301` stream and a per-band count on `/metrics`;
+  `manta grade` replays a recorded spot log against RBN's daily archive.
+  manta only reads the feed: it sends its login callsign and nothing else.
 - **Outbound RBN uplink (experimental)** — forwards validated spots to an
   upstream collector as `DX de` lines, with reconnect and multiple
   simultaneous targets. Tested only against manta's own mock collector: RBN
