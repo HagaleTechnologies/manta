@@ -70,7 +70,8 @@ the decode loop (found by the 2026-09-05 broad review, lens 3, hit-list
   keying off latency.
 - **D7 — output is unchanged.** The observer is write-only from the decode
   path. `listen()`, `soak`, `doctor` and the CPU-budget bench pass no
-  observer and pay one `Option` check per drained track per batch;
+  observer and pay one `Option` check per drained hop (rail ratio) plus
+  one per track drain, batch or closing flush (garbles);
   `listen_with_observers_publishes_decode_quality_without_changing_spots`
   checks the spot list is identical with and without it.
 

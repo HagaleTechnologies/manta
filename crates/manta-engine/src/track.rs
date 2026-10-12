@@ -533,15 +533,20 @@ fn publish_garbles(
 /// (1 Hz), on the hop `TrackMeta` fires on. Called after every queued hop's
 /// `push_hop`, in `drain_pool` and both `finish_decoder*` flushes, so a
 /// boundary is sampled whichever path drains it. `None` before the rails
-/// initialize and for engines without them records nothing.
+/// initialize and for engines without them records nothing. Without an
+/// observer it returns before the boundary test, so those paths pay only
+/// the `Option` check per hop.
 fn sample_rail_ratio_at_boundary(decoder: &TrackDecoder, quality: Option<&DecodeQualityObserver>) {
+    let Some(q) = quality else {
+        return;
+    };
     if !decoder
         .hop_count()
         .is_multiple_of(manta_decode::META_INTERVAL_HOPS)
     {
         return;
     }
-    if let (Some(q), Some(ratio)) = (quality, decoder.rail_ratio()) {
+    if let Some(ratio) = decoder.rail_ratio() {
         q.observe_rail_ratio(ratio);
     }
 }
