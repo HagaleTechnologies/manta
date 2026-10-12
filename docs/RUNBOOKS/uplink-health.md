@@ -120,9 +120,11 @@ scripting or an existing monitoring stack. Per-target series are also on
 `GET /metrics` (`manta_uplink_target_connected`, `_sent_total`,
 `_suppressed_total`, `_reconnects_total`, `_recent_reconnects`, labeled
 `target="host:port"`) for anyone who already scrapes Prometheus.
+MantaUplinkDisconnected in [monitoring.md](monitoring.md) alerts on the same
+verdict `/status` gives.
 
 Both endpoints share `/metrics`'s exposure posture — unauthenticated,
-bound to `[server].bind_addr` (`0.0.0.0` by default) — see
+bound to `[server].metrics_bind_addr` (`127.0.0.1` by default, MAN-132) — see
 `docs/RUNBOOKS/network-exposure.md` if you need to restrict access.
 Design rationale: `docs/DECISIONS/2026-09-04-man44-uplink-status-surface.md`.
 

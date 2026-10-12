@@ -15,6 +15,8 @@ Then:
   `/status`.
 - [packaging/README.md](../packaging/README.md): running unattended under
   systemd, launchd or Docker Compose.
+- [RUNBOOKS/monitoring.md](RUNBOOKS/monitoring.md): a ready Grafana dashboard
+  and Prometheus alerts.
 - The [runbooks](#runbooks) below.
 - `manta <command> --help` for every flag.
 
@@ -69,6 +71,7 @@ Then:
 | [network-exposure.md](RUNBOOKS/network-exposure.md) | Operators | Deciding which listeners to expose, and to whom. |
 | [node-health.md](RUNBOOKS/node-health.md) | Operators | Telling whether a running node is healthy from `/healthz` and `/metrics`. |
 | [uplink-health.md](RUNBOOKS/uplink-health.md) | Operators | Checking an RBN uplink with `manta status`. |
+| [monitoring.md](RUNBOOKS/monitoring.md) | Operators | Setting up the shipped Grafana dashboard and Prometheus alerts (MAN-129). |
 | [setup-checks.md](RUNBOOKS/setup-checks.md) | Operators | Checking a whole setup with `manta doctor` before and after installing it as a service (MAN-126). |
 | [rbn-comparison.md](RUNBOOKS/rbn-comparison.md) | Operators | Grading a live node's spots against the RBN feed with `[rbn_compare]`, and replaying a node's spot log with `manta grade` (MAN-301). |
 | [secondary-skimmer-field-node.md](RUNBOOKS/secondary-skimmer-field-node.md) | Operators | Running a 30-day secondary-skimmer field node behind an RBN Aggregator (MAN-96). Its kit is in [RUNBOOKS/field-node/](RUNBOOKS/field-node/). |

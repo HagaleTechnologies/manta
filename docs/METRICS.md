@@ -62,6 +62,10 @@ on its own connection (`Connection: close`); a query string on the path is
 ignored. Any other path or any method other than `GET` gets
 `404 Not Found` with an empty body.
 
+A Grafana dashboard and Prometheus alert rules built on these families ship
+in `RUNBOOKS/monitoring/`; see
+[RUNBOOKS/monitoring.md](RUNBOOKS/monitoring.md).
+
 ## Metric families
 
 All 56 families, in the order `/metrics` renders them. Every family's
@@ -289,3 +293,5 @@ For what each uplink state means and what to do about it, see
   loopback default for `metrics_bind_addr`.
 - [MAN-301](DECISIONS/2026-10-11-man301-live-rbn-comparison.md): the
   RBN comparison families.
+- [MAN-129](DECISIONS/2026-10-12-man129-dashboard-and-alerts.md): the shipped
+  Grafana dashboard and Prometheus alert rules.

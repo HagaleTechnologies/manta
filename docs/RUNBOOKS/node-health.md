@@ -162,6 +162,9 @@ interval if you need an ongoing liveness check, not just a post-start one.)
   30-day field-node ledger reads both
   (`docs/RUNBOOKS/secondary-skimmer-field-node.md`).
 
+A ready Grafana dashboard and Prometheus alerts built on these queries are in
+[monitoring.md](monitoring.md) (MAN-129).
+
 ## Decode quality (MAN-118)
 
 The families above say whether the node is running. Four more say whether
