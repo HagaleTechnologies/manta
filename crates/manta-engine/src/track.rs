@@ -1775,7 +1775,8 @@ fn event_sample_ts(e: &DecoderEvent) -> u64 {
         DecoderEvent::CharDecoded { sample_ts, .. }
         | DecoderEvent::WordBoundary { sample_ts, .. }
         | DecoderEvent::TrackPromoted { sample_ts, .. }
-        | DecoderEvent::TrackMeta { sample_ts, .. } => *sample_ts,
+        | DecoderEvent::TrackMeta { sample_ts, .. }
+        | DecoderEvent::TimingUpdate { sample_ts, .. } => *sample_ts,
         DecoderEvent::SpeedUpdate { .. } => 0,
         DecoderEvent::TrackClosed { .. } => u64::MAX,
     }
@@ -1846,6 +1847,7 @@ pub(crate) fn event_track_id(e: &DecoderEvent) -> u32 {
         | DecoderEvent::WordBoundary { track_id, .. }
         | DecoderEvent::SpeedUpdate { track_id, .. }
         | DecoderEvent::TrackMeta { track_id, .. }
+        | DecoderEvent::TimingUpdate { track_id, .. }
         | DecoderEvent::TrackPromoted { track_id, .. }
         | DecoderEvent::TrackClosed { track_id, .. } => *track_id,
     }
@@ -3878,6 +3880,8 @@ mod tests {
         let fs = 96_000.0;
         let center_freq_hz = 14_000_000.0;
         let sig = SignalSpec {
+            dit_units: 1.0,
+            element_gap_units: 1.0,
             text: "CQ CQ DE W1AW W1AW K".into(),
             loop_text: true,
             wpm: 20.0,

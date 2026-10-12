@@ -166,7 +166,7 @@ enum Command {
     /// produces the same file.
     Gen {
         /// Which test recording to generate: v1 to v6, vr1 to vr5, vr6a,
-        /// vr6b, vr7 or vr8.
+        /// vr6b, vr7, vr8, or vw1 to vw5.
         vector: String,
         /// Directory to write `<name>.wav`, `<name>.json` and
         /// `<name>.manifest.json` into.
@@ -3842,6 +3842,10 @@ fn real_main() -> Result<()> {
             } else {
                 println!("{}", report.text);
                 eprintln!("freq_hz: {:.1}  wpm: {:?}", report.freq_hz, report.wpm);
+                // MAN-315: the primary track's learned sender timing.
+                if let Some(timing) = &report.timing {
+                    eprintln!("timing (dits, mean ± sd): {}", timing.display_line());
+                }
                 eprintln!("spots: {}", report.spots.len());
             }
         }
@@ -3890,8 +3894,13 @@ fn real_main() -> Result<()> {
                 "vr6b" => manta_testkit::vectors::vr6b(),
                 "vr7" => manta_testkit::vectors::vr7(),
                 "vr8" => manta_testkit::vectors::vr8(),
+                "vw1" => manta_testkit::vectors::vw1(),
+                "vw2" => manta_testkit::vectors::vw2(),
+                "vw3" => manta_testkit::vectors::vw3(),
+                "vw4" => manta_testkit::vectors::vw4(),
+                "vw5" => manta_testkit::vectors::vw5(),
                 other => bail!(
-                    "unknown vector {other:?} (available: v1-v6, vr1-vr5, vr6a, vr6b, vr7-vr8)"
+                    "unknown vector {other:?} (available: v1-v6, vr1-vr5, vr6a, vr6b, vr7-vr8, vw1-vw5)"
                 ),
             };
             std::fs::create_dir_all(&out)?;

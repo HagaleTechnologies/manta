@@ -48,6 +48,7 @@ fn track_id(e: &DecoderEvent) -> u32 {
         | DecoderEvent::WordBoundary { track_id, .. }
         | DecoderEvent::SpeedUpdate { track_id, .. }
         | DecoderEvent::TrackMeta { track_id, .. }
+        | DecoderEvent::TimingUpdate { track_id, .. }
         | DecoderEvent::TrackPromoted { track_id, .. }
         | DecoderEvent::TrackClosed { track_id, .. } => *track_id,
     }
@@ -59,7 +60,8 @@ fn event_sample_ts(e: &DecoderEvent) -> Option<u64> {
     match e {
         DecoderEvent::CharDecoded { sample_ts, .. }
         | DecoderEvent::WordBoundary { sample_ts, .. }
-        | DecoderEvent::TrackPromoted { sample_ts, .. } => Some(*sample_ts),
+        | DecoderEvent::TrackPromoted { sample_ts, .. }
+        | DecoderEvent::TimingUpdate { sample_ts, .. } => Some(*sample_ts),
         DecoderEvent::SpeedUpdate { .. }
         | DecoderEvent::TrackMeta { .. }
         | DecoderEvent::TrackClosed { .. } => None,
@@ -159,6 +161,8 @@ fn cpu_budget_scene() -> (Vec<Complex32>, f64, f64, PipelineConfig) {
         .map(|i| {
             let offset_hz = -90_000.0 + i as f64 * (180_000.0 / (N_SIGNALS - 1) as f64);
             SignalSpec {
+                dit_units: 1.0,
+                element_gap_units: 1.0,
                 text: "CQ CQ DE K1BNC K1BNC K".into(),
                 loop_text: true,
                 wpm: 20.0,

@@ -230,6 +230,52 @@ fn gen_then_decode_prints_text() {
     );
 }
 
+/// MAN-315 scenario 3: `manta decode` prints the primary track's learned
+/// sender timing on stderr, after `freq_hz`; stdout stays the decoded text
+/// alone. With `--json`, the report's top-level `timing` carries it.
+#[test]
+fn decode_prints_timing_line_for_primary_track() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::VectorSpec {
+        duration_s: 15.0,
+        ..manta_testkit::vectors::v1()
+    };
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let wav = dir.path().join("v1.wav");
+
+    let out = manta().arg("decode").arg(&wav).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "stdout: {stdout:?}");
+    assert!(!stdout.contains("timing"), "stdout: {stdout:?}");
+    let lines: Vec<&str> = stderr.lines().collect();
+    let freq = lines
+        .iter()
+        .position(|l| l.starts_with("freq_hz: "))
+        .expect("no freq_hz line");
+    assert!(
+        lines[freq + 1].starts_with("timing (dits, mean ± sd): dot "),
+        "stderr: {stderr}"
+    );
+    assert!(lines[freq + 1].contains("  word gap "), "stderr: {stderr}");
+    assert!(lines[freq + 2].starts_with("spots: "), "stderr: {stderr}");
+
+    let out = manta()
+        .args(["decode", "--json"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(report["timing"]["dash"]["mean_dits"].as_f64().is_some());
+    assert!(report["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["event"] == "TimingUpdate"));
+}
+
 #[test]
 fn gen_subcommand_writes_fixture_set() {
     let dir = tempfile::tempdir().unwrap();
@@ -258,6 +304,11 @@ fn unknown_vector_errors() {
         .output()
         .unwrap();
     assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("vr7-vr8, vw1-vw5)"),
+        "the error lists MAN-315's VW vectors: {stderr}"
+    );
 }
 
 /// `Engine::Hsmm` is a fully implemented, reviewed engine since Task 8

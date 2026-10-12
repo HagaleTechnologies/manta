@@ -44,6 +44,8 @@ pub fn v1() -> VectorSpec {
         center_freq_hz: 14_000_000.0,
         noise_seed: 0x534B_494D_5631, // "SKIMV1"
         signals: vec![SignalSpec {
+            dit_units: 1.0,
+            element_gap_units: 1.0,
             text: "CQ CQ DE W1AW W1AW K".into(),
             loop_text: true,
             wpm: 20.0,
@@ -71,6 +73,8 @@ pub fn v2() -> VectorSpec {
         center_freq_hz: 14_000_000.0,
         noise_seed: 0x534B_494D_5632, // "SKIMV2"
         signals: vec![SignalSpec {
+            dit_units: 1.0,
+            element_gap_units: 1.0,
             text: "CQ CQ DE JA1ABC JA1ABC K".into(),
             loop_text: true,
             wpm: 35.0,
@@ -101,6 +105,8 @@ pub fn v3() -> VectorSpec {
         center_freq_hz: 14_000_000.0,
         noise_seed: 0x534B_494D_5633, // "SKIMV3"
         signals: vec![SignalSpec {
+            dit_units: 1.0,
+            element_gap_units: 1.0,
             text: "CQ CQ DE VK9DX VK9DX K".into(),
             loop_text: true,
             wpm: 12.0,
@@ -131,6 +137,8 @@ pub fn v6() -> VectorSpec {
         center_freq_hz: 14_000_000.0,
         noise_seed: 0x534B_494D_5636, // "SKIMV6"
         signals: vec![SignalSpec {
+            dit_units: 1.0,
+            element_gap_units: 1.0,
             text: "CQ CQ DE K5ZZZ K5ZZZ K".into(),
             loop_text: true,
             wpm: 20.0,
@@ -158,6 +166,8 @@ pub fn v4() -> VectorSpec {
         center_freq_hz: 14_000_000.0,
         noise_seed: 0x534B_494D_5634, // "SKIMV4"
         signals: vec![SignalSpec {
+            dit_units: 1.0,
+            element_gap_units: 1.0,
             text: "CQ CQ DE DL1ABC DL1ABC K".into(),
             loop_text: true,
             wpm: 25.0,
@@ -188,6 +198,8 @@ pub fn v5() -> VectorSpec {
         center_freq_hz: 14_000_000.0,
         noise_seed: 0x534B_494D_5635, // "SKIMV5"
         signals: vec![SignalSpec {
+            dit_units: 1.0,
+            element_gap_units: 1.0,
             text: "CQ CQ DE ZL2XYZ ZL2XYZ K".into(),
             loop_text: true,
             wpm: 22.0,
@@ -238,6 +250,8 @@ pub fn v7() -> VectorSpec {
         noise_seed: 0x534B_494D_5637, // "SKIMV7"
         signals: vec![
             SignalSpec {
+                dit_units: 1.0,
+                element_gap_units: 1.0,
                 text: "CQ CQ DE N1AA N1AA K".into(),
                 loop_text: true,
                 wpm: 24.0,
@@ -253,6 +267,8 @@ pub fn v7() -> VectorSpec {
                 rise_ms: 5.0,
             },
             SignalSpec {
+                dit_units: 1.0,
+                element_gap_units: 1.0,
                 text: "CQ CQ DE N2BB N2BB K".into(),
                 loop_text: true,
                 wpm: 28.0,
@@ -290,6 +306,8 @@ pub fn v9() -> VectorSpec {
         center_freq_hz: 14_000_000.0,
         noise_seed: 0x534B_494D_5639, // "SKIMV9"
         signals: vec![SignalSpec {
+            dit_units: 1.0,
+            element_gap_units: 1.0,
             text: "CQ CQ DE EA8AAA EA8AAA K".into(),
             loop_text: true,
             wpm: 18.0,
@@ -322,6 +340,8 @@ pub fn v10() -> VectorSpec {
         center_freq_hz: 14_000_000.0,
         noise_seed: 0x534B_494D_5610, // "SKIMV10" truncated to fit
         signals: vec![SignalSpec {
+            dit_units: 1.0,
+            element_gap_units: 1.0,
             text: "CQ CQ DE G4XXX G4XXX K".into(),
             loop_text: true,
             wpm: 15.0,
@@ -365,6 +385,8 @@ fn pileup_scene(name: &'static str, watterson: Option<WattersonPreset>) -> Vecto
 
     let signals = (0..50)
         .map(|i| SignalSpec {
+            dit_units: 1.0,
+            element_gap_units: 1.0,
             text: format!("CQ CQ DE {0} {0} K", calls[i]),
             loop_text: true,
             wpm: 10.0 + crate::u01(&mut rng) as f32 * 25.0,
@@ -435,6 +457,8 @@ fn single(
         center_freq_hz: 14_000_000.0,
         noise_seed,
         signals: vec![SignalSpec {
+            dit_units: 1.0,
+            element_gap_units: 1.0,
             text: text.to_string(),
             loop_text: true,
             wpm,
@@ -529,6 +553,8 @@ pub fn vr5() -> VectorSpec {
         noise_seed: 0x5652_0005,
         signals: vec![
             SignalSpec {
+                dit_units: 1.0,
+                element_gap_units: 1.0,
                 text: "CQ TEST W1AA W1AA TEST".into(),
                 loop_text: true,
                 wpm: 30.0,
@@ -544,6 +570,8 @@ pub fn vr5() -> VectorSpec {
                 rise_ms: 5.0,
             },
             SignalSpec {
+                dit_units: 1.0,
+                element_gap_units: 1.0,
                 text: "CQ TEST W2BB W2BB TEST".into(),
                 loop_text: true,
                 wpm: 24.0,
@@ -626,6 +654,149 @@ pub fn vr8() -> VectorSpec {
         seed: 0x5652_0009,
     });
     v
+}
+
+/// MAN-315 VW vectors (W = weighting; SPEC-decode-core.md §7.2): senders
+/// who do not key ideal 1:3 / 3 / 7 timing. Shared shape: 96 kHz, 14 MHz
+/// centre, +12.34 kHz, 5 ms edges, AWGN, looped text, 60 s.
+fn weighted(
+    name: &'static str,
+    wpm: f32,
+    snr_2500_db: f32,
+    text: &str,
+    noise_seed: u64,
+    jitter: Jitter,
+) -> VectorSpec {
+    let mut v = single(name, wpm, snr_2500_db, text, noise_seed, Some(jitter));
+    v.duration_s = 60.0;
+    v
+}
+
+/// VW1 "heavy-dash": 25 WPM, dashes 4.0 dits, +10 dB, 8 % jitter. MAN-315
+/// scenario 1: a noise fragment seeds the dit cluster on this noise seed
+/// (measured: real dits decoded as dashes for ~20 s on the base decoder).
+/// Pass: the first exact K1ABC within the first 10 words, then no dash/dot
+/// confusion; CER <= 0.15; learned dash 3.6-4.4 dits.
+pub fn vw1() -> VectorSpec {
+    let mut v = weighted(
+        "vw1",
+        25.0,
+        10.0,
+        "CQ TEST K1ABC K1ABC TEST",
+        0x3153,
+        Jitter {
+            sigma: 0.08,
+            seed: 3,
+        },
+    );
+    v.signals[0].weight = 4.0;
+    v
+}
+
+/// VW2 "long-gaps": 25 WPM, letter gaps 4.5 dits, word gaps 9, +15 dB, 8 %
+/// jitter. MAN-315 scenario 2. Pass: CER <= 0.06; word boundaries >= 95 %;
+/// learned char gap 4.0-5.0 and word gap 8.0-10.0 dits.
+pub fn vw2() -> VectorSpec {
+    let mut v = weighted(
+        "vw2",
+        25.0,
+        15.0,
+        "CQ TEST W1AW",
+        0x3173,
+        Jitter {
+            sigma: 0.08,
+            seed: 3,
+        },
+    );
+    v.signals[0].char_gap_units = 4.5;
+    v.signals[0].word_gap_units = 9.0;
+    v
+}
+
+/// VW3 "bug-key": 22 WPM, short 0.85-dit dots, 4.5-dit dashes, 3.5/8 gaps,
+/// +12 dB, 10 % jitter. Pass: CER <= 0.08; learned dash > 4.0 dits.
+pub fn vw3() -> VectorSpec {
+    let mut v = weighted(
+        "vw3",
+        22.0,
+        12.0,
+        "CQ DX DE W9BUG W9BUG K",
+        0x5657_0003,
+        Jitter {
+            sigma: 0.10,
+            seed: 5,
+        },
+    );
+    let s = &mut v.signals[0];
+    s.dit_units = 0.85;
+    s.weight = 4.5;
+    s.element_gap_units = 1.0;
+    s.char_gap_units = 3.5;
+    s.word_gap_units = 8.0;
+    v
+}
+
+/// VW4 "heavy hand-key": 18 WPM, long 1.2-dit dots, 0.8-dit element gaps,
+/// 3.6-dit dashes, 4/9 gaps, +15 dB, 12 % jitter. Pass: CER <= 0.08.
+pub fn vw4() -> VectorSpec {
+    let mut v = weighted(
+        "vw4",
+        18.0,
+        15.0,
+        "CQ CQ DE G4HND G4HND K",
+        0x5657_0004,
+        Jitter {
+            sigma: 0.12,
+            seed: 6,
+        },
+    );
+    let s = &mut v.signals[0];
+    s.dit_units = 1.2;
+    s.element_gap_units = 0.8;
+    s.weight = 3.6;
+    s.char_gap_units = 4.0;
+    s.word_gap_units = 9.0;
+    v
+}
+
+/// VW5 "keyboard + heavy, adjacent": A is a 28 WPM keyboard sender (ideal
+/// 3:1, 3/7, no jitter) at +12.34 kHz; B a 22 WPM heavy sender (4.0-dit
+/// dashes, 4.5/9 gaps, 5 % jitter) three channels (281.25 Hz) above. Both
+/// +20 dB, 90 s. MAN-315 scenario 3. Pass: two tracks, CER <= 0.06 each,
+/// each track's own learned timing (A dash 2.6-3.4, char gap 2.5-3.5; B
+/// dash 3.6-4.4, char gap 4.0-5.0).
+pub fn vw5() -> VectorSpec {
+    let mut a = single(
+        "vw5",
+        28.0,
+        20.0,
+        "CQ TEST N1AA N1AA TEST",
+        0x5657_0005,
+        None,
+    )
+    .signals
+    .remove(0);
+    a.text = "CQ TEST N1AA N1AA TEST".into();
+    let mut b = a.clone();
+    b.text = "CQ TEST N2BB N2BB TEST".into();
+    b.wpm = 22.0;
+    b.offset_hz = 12_340.0 + 3.0 * 93.75;
+    b.weight = 4.0;
+    b.char_gap_units = 4.5;
+    b.word_gap_units = 9.0;
+    b.jitter = Some(Jitter {
+        sigma: 0.05,
+        seed: 7,
+    });
+    VectorSpec {
+        name: "vw5",
+        fs: 96_000.0,
+        duration_s: 90.0,
+        center_freq_hz: 14_000_000.0,
+        noise_seed: 0x5657_0005,
+        signals: vec![a, b],
+        rise_ms: 5.0,
+    }
 }
 
 /// A rendered vector: samples, ground-truth keyed text per signal, expected
@@ -821,6 +992,29 @@ pub fn write_v9_fixture_set(spec: &VectorSpec, dir: &Path) -> Result<Manifest> {
 mod tests {
     use super::*;
     use manta_input::{IqSource, WavIqSource};
+
+    /// FNV-1a over the f32 bit patterns of `samples` (re, then im).
+    fn digest(samples: &[Complex32]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for c in samples {
+            for v in [c.re, c.im] {
+                for b in v.to_bits().to_le_bytes() {
+                    h ^= u64::from(b);
+                    h = h.wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+        }
+        h
+    }
+
+    /// MAN-315 D9: the keyer's new `dit_units`/`element_gap_units` (1.0 for
+    /// every existing vector) leave existing vectors bit-identical. The
+    /// digest was computed on the base commit, before the fields existed.
+    #[test]
+    fn existing_vectors_render_unchanged() {
+        let r = render(&v1()).unwrap();
+        assert_eq!(digest(&r.samples[..96_000]), 0x7658_9e64_016d_9839);
+    }
 
     #[test]
     fn v1_spec_matches_spec_table() {

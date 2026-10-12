@@ -7,7 +7,8 @@ use crate::events::DecoderEvent;
 use crate::evidence::{Evidence, EvidenceConfig, HopEvidence};
 use crate::hsmm::{Committed, HsmmConfig, HsmmDecoder};
 use crate::noise::{NoiseConfig, NoiseTracker};
-use crate::timing::{GapClass, GapClassifier, SpeedTracker};
+use crate::timing::{GapClass, GapClassifier, SenderTiming, SpeedTracker, TimingClass};
+use crate::tree::{pattern_for, Glyph};
 use crate::HOP_MS;
 use std::collections::VecDeque;
 
@@ -128,6 +129,17 @@ pub struct TrackDecoder {
     /// by a word of two or more characters or by a flushed garble; a
     /// one-character word that `classify` closes leaves it as it is.
     single_flush_gaps: Vec<f32>,
+    /// The sender's learned dot/dash/gap durations (MAN-315). Legacy and
+    /// EdgeLegacy only; `Hsmm` keeps its own per-token speed.
+    sender: SenderTiming,
+    /// Set by `check_flush`/`check_flush_edge` to the flushed gap's length
+    /// so far, in ms; the remainder arrives as the space run `process_run`
+    /// skips, and the sum is the word gap's closed length (MAN-315 D2).
+    flushed_gap_ms: Option<f32>,
+    /// The `SpeedTracker::regime` `sender` was learned in (MAN-315 D7).
+    sender_regime: u32,
+    /// `sender.total_count()` at the last `TimingUpdate` (MAN-315 D8).
+    last_timing_total: u64,
     last_reported_wpm: Option<f32>,
     freq_hz: f64,
     hop_count: u64,
@@ -189,6 +201,10 @@ impl TrackDecoder {
             word_decoded: 0,
             single_flush_ms: None,
             single_flush_gaps: Vec::new(),
+            sender: SenderTiming::new(),
+            flushed_gap_ms: None,
+            sender_regime: 0,
+            last_timing_total: 0,
             last_reported_wpm: None,
             freq_hz: 0.0,
             hop_count: 0,
@@ -420,7 +436,28 @@ impl TrackDecoder {
                     freq_hz: self.freq_hz,
                 });
             }
+            self.emit_timing(events);
         }
+    }
+
+    /// SPEC §5 `TimingUpdate` (MAN-315 D8): the sender's learned timing,
+    /// on the `TrackMeta` cadence and at track finish, only when a class
+    /// gained an observation since the last one. Never for `Hsmm`, which
+    /// does not feed `sender`.
+    fn emit_timing(&mut self, events: &mut Vec<DecoderEvent>) {
+        let total = self.sender.total_count();
+        if self.cfg.engine == Engine::Hsmm
+            || !self.tracker.ready()
+            || total <= self.last_timing_total
+        {
+            return;
+        }
+        self.last_timing_total = total;
+        events.push(DecoderEvent::TimingUpdate {
+            track_id: self.track_id,
+            sample_ts: self.last_ts,
+            timing: self.sender.estimates(self.tracker.dit_estimate_ms()),
+        });
     }
 
     /// SPEC v2 §2.3: SNR from the evidence front end's own mark/noise
@@ -588,6 +625,7 @@ impl TrackDecoder {
             }
         }
         self.flush_final_speed(&mut events);
+        self.emit_timing(&mut events);
         events
     }
 
@@ -634,6 +672,7 @@ impl TrackDecoder {
             self.on_run(run, &mut events);
         }
         self.flush_final_speed(&mut events);
+        self.emit_timing(&mut events);
         events
     }
 
@@ -664,6 +703,7 @@ impl TrackDecoder {
         if !self.tracker.ready() {
             if run.mark {
                 self.tracker.on_mark(run.hops as f32 * HOP_MS as f32);
+                self.sync_sender_regime();
             }
             self.pending.push(run);
             if self.tracker.ready() {
@@ -683,8 +723,12 @@ impl TrackDecoder {
     fn process_run(&mut self, run: Run, live: bool, events: &mut Vec<DecoderEvent>) {
         let dur_ms = run.hops as f32 * HOP_MS as f32;
         if run.mark {
+            // A flushed gap whose space closed without a separate remainder
+            // run: its closed length is unknown, so it teaches nothing.
+            self.flushed_gap_ms = None;
             if live {
                 self.tracker.on_mark(dur_ms);
+                self.sync_sender_regime();
                 self.demod.set_dit_ms(self.tracker.mu_dit_ms());
                 if let Some(w) = self.tracker.wpm() {
                     self.report_wpm(w, events);
@@ -694,17 +738,23 @@ impl TrackDecoder {
             self.word_flushed = false;
         } else {
             if self.word_flushed {
-                // This gap was already handled by the 7-dit flush.
+                // This gap was already handled by the 7-dit flush. Its
+                // closed length is the sender's word gap (MAN-315 D2).
+                if let Some(flushed_ms) = self.flushed_gap_ms.take() {
+                    self.observe_gap(GapClass::InterWord, flushed_ms + dur_ms);
+                }
                 if let Some(flushed_ms) = self.single_flush_ms.take() {
                     self.observe_single_flush(flushed_ms + dur_ms);
                 }
                 return;
             }
-            match self.gaps.classify(dur_ms, self.tracker.mu_dit_ms()) {
+            let class = self.gaps.classify(dur_ms, self.gap_unit_ms());
+            self.observe_gap(class, dur_ms);
+            match class {
                 GapClass::InterElement => {
-                    if live {
-                        self.tracker.on_element_gap(dur_ms);
-                    }
+                    // MAN-315 D3: also during the `pending` replay, whose
+                    // element gaps were never fed (nothing double-counts).
+                    self.tracker.on_element_gap(dur_ms);
                 }
                 GapClass::InterChar => self.emit_char(run.start_ts, events),
                 GapClass::InterWord => {
@@ -712,14 +762,85 @@ impl TrackDecoder {
                     events.push(DecoderEvent::word_boundary(self.track_id, run.start_ts));
                     if self.word_decoded > 1 {
                         self.single_flush_gaps.clear();
-                        self.gaps
-                            .confirm_rebuilt(dur_ms, self.tracker.mu_dit_ms(), None);
+                        self.gaps.confirm_rebuilt(dur_ms, self.gap_unit_ms(), None);
                     }
                     self.word_chars = 0;
                     self.word_decoded = 0;
                 }
             }
         }
+    }
+
+    /// The dit period gaps are measured in: `SpeedTracker::dit_estimate_ms`,
+    /// the symmetric mark/gap period, not the mark centroid `mu_dit_ms`. The
+    /// transmitter's rise time shortens every mark and lengthens every gap
+    /// by the same amount, so in mark dits every gap read long and a
+    /// 4.5-dit letter gap crossed the word boundary. SPEC §4.2
+    /// **[DEVIATION]** (MAN-315 D3).
+    fn gap_unit_ms(&self) -> f32 {
+        self.tracker.dit_estimate_ms()
+    }
+
+    /// Fold one gap of `class`, `dur_ms` long, into the sender's timing and
+    /// refresh the sender word boundary the classifier uses (MAN-315 D2,
+    /// D4). A word gap of pause length is not the sender's spacing and is
+    /// not learned.
+    fn observe_gap(&mut self, class: GapClass, dur_ms: f32) {
+        let unit = self.gap_unit_ms();
+        let class = match class {
+            GapClass::InterElement => TimingClass::ElementGap,
+            GapClass::InterChar => TimingClass::CharGap,
+            GapClass::InterWord => {
+                if self.sender.is_pause(dur_ms / unit) {
+                    return;
+                }
+                TimingClass::WordGap
+            }
+        };
+        self.sender.observe(class, dur_ms, unit);
+        self.gaps
+            .set_sender_word_dits(self.sender.sender_word_dits());
+    }
+
+    /// Drop the sender's timing when the tracker has rebuilt its mark
+    /// scale: the statistics were learned in the old scale's dits
+    /// (MAN-315 D7).
+    fn sync_sender_regime(&mut self) {
+        let regime = self.tracker.regime();
+        if regime == self.sender_regime {
+            return;
+        }
+        self.sender_regime = regime;
+        self.sender.reset();
+        self.last_timing_total = 0;
+        self.gaps.set_sender_word_dits(None);
+        self.tracker.set_ratio_hint(None);
+    }
+
+    /// Learn the marks of a decoded character, labelled by its pattern, and
+    /// hand the tracker the sender's dash/dot ratio as its re-anchor target
+    /// (MAN-315 D2, D5). Garbles, prosigns and a pattern of another length
+    /// teach nothing.
+    fn observe_marks(&mut self, glyph: Glyph, marks: &[f32]) {
+        let Glyph::Char(c) = glyph else {
+            return;
+        };
+        let Some(pattern) = pattern_for(c) else {
+            return;
+        };
+        if pattern.len() != marks.len() {
+            return;
+        }
+        let unit = self.tracker.dit_estimate_ms();
+        for (e, &m) in pattern.chars().zip(marks) {
+            let class = if e == '.' {
+                TimingClass::Dot
+            } else {
+                TimingClass::Dash
+            };
+            self.sender.observe(class, m, unit);
+        }
+        self.tracker.set_ratio_hint(self.sender.dash_dot_ratio());
     }
 
     /// SPEC §4.2: a trailing space reaching 7*mu_dit forces char + word flush.
@@ -743,7 +864,7 @@ impl TrackDecoder {
         ) {
             let gap_ms = hops as f32 * HOP_MS as f32;
             let flush_dits = self.gaps.flush_threshold_dits(self.cfg.flush_gap_dits);
-            if gap_ms >= flush_dits * self.tracker.mu_dit_ms() {
+            if gap_ms >= flush_dits * self.gap_unit_ms() {
                 // This gap never reaches `classify` (it's resolved here,
                 // by the safety net) -- fold it into the Farnsworth
                 // long-gap statistics directly (MAN-103 D8). `gap_ms` is
@@ -763,7 +884,7 @@ impl TrackDecoder {
                 // flushed after one-character words (`observe_single_flush`).
                 // Both are folded in below, after the final character's
                 // decode is known, at the dit length measured here.
-                let mu_dit_ms = self.tracker.mu_dit_ms();
+                let mu_dit_ms = self.gap_unit_ms();
                 // Drain any held mark into cur_marks (live: it's a real
                 // keyed event and should count for speed tracking); the
                 // drained space itself is not separately gap-classified —
@@ -800,6 +921,7 @@ impl TrackDecoder {
                 self.word_chars = 0;
                 self.word_decoded = 0;
                 self.word_flushed = true;
+                self.flushed_gap_ms = Some(gap_ms);
             }
         }
     }
@@ -810,8 +932,7 @@ impl TrackDecoder {
     /// clusters -- heavy Farnsworth spacing the censored `observe_flushed`
     /// cannot see (`GapClassifier::reinit_from_flushed`).
     fn observe_single_flush(&mut self, gap_ms: f32) {
-        self.single_flush_gaps
-            .push(gap_ms / self.tracker.mu_dit_ms());
+        self.single_flush_gaps.push(gap_ms / self.gap_unit_ms());
         if self.single_flush_gaps.len() > SINGLE_FLUSH_REINIT {
             self.single_flush_gaps.remove(0);
         }
@@ -836,7 +957,7 @@ impl TrackDecoder {
         if let Some((hops, ts)) = self.edge.open_space() {
             let gap_ms = hops as f32 * HOP_MS as f32;
             let flush_dits = self.gaps.flush_threshold_dits(self.cfg.flush_gap_dits);
-            if gap_ms >= flush_dits * self.tracker.mu_dit_ms() {
+            if gap_ms >= flush_dits * self.gap_unit_ms() {
                 for run in self.edge.finish() {
                     if run.mark {
                         self.process_run(run, true, events);
@@ -849,6 +970,7 @@ impl TrackDecoder {
                 self.word_chars = 0;
                 self.word_decoded = 0;
                 self.word_flushed = true;
+                self.flushed_gap_ms = Some(gap_ms);
             }
         }
     }
@@ -877,6 +999,7 @@ impl TrackDecoder {
         ) {
             Some(cd) => {
                 self.word_decoded = self.word_decoded.saturating_add(1);
+                self.observe_marks(cd.glyph, &marks);
                 events.push(DecoderEvent::char_decoded(
                     self.track_id,
                     sample_ts,
@@ -2022,5 +2145,172 @@ mod tests {
                 .collect();
             assert_eq!(decode_with(Engine::Legacy, &env), text, "{name}");
         }
+    }
+
+    /// `rect_envelope` with a `dash`-dit dash, `cgap`-dit character gap and
+    /// `wgap`-dit word gap (MAN-315).
+    fn weighted_envelope(text: &str, dit_hops: u32, dash: f32, cgap: f32, wgap: f32) -> Vec<f32> {
+        let n = |dits: f32| (dits * dit_hops as f32).round() as usize;
+        let mut env = Vec::new();
+        for (wi, word) in text.split_whitespace().enumerate() {
+            if wi > 0 {
+                env.extend(std::iter::repeat_n(0.0, n(wgap)));
+            }
+            for (ci, c) in word.chars().enumerate() {
+                if ci > 0 {
+                    env.extend(std::iter::repeat_n(0.0, n(cgap)));
+                }
+                for (ei, e) in pattern_for(c).unwrap().chars().enumerate() {
+                    if ei > 0 {
+                        env.extend(std::iter::repeat_n(0.0, dit_hops as usize));
+                    }
+                    let len = if e == '.' { dit_hops as usize } else { n(dash) };
+                    env.extend(std::iter::repeat_n(1.0, len));
+                }
+            }
+        }
+        env.extend(std::iter::repeat_n(0.0, n(wgap.max(8.0)) + 450));
+        env
+    }
+
+    fn decode_events(engine: Engine, env: &[f32]) -> Vec<DecoderEvent> {
+        let mut dec = TrackDecoder::new(
+            1,
+            DecodeConfig {
+                engine,
+                ..Default::default()
+            },
+        );
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        events
+    }
+
+    fn last_timing(events: &[DecoderEvent]) -> Option<&crate::timing::TimingEstimates> {
+        events.iter().rev().find_map(|e| match e {
+            DecoderEvent::TimingUpdate { timing, .. } => Some(timing),
+            _ => None,
+        })
+    }
+
+    /// MAN-315 D7: a drift re-init drops the sender timing learned in the
+    /// old scale. Only dits follow the speed step, so a reset leaves the
+    /// dash class empty.
+    #[test]
+    fn sender_timing_reset_on_drift_reinit() {
+        let mut env = rect_envelope("PARIS PARIS", 22);
+        env.extend(rect_envelope(&["E"; 30].join(" "), 12));
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut dashes_before_step = 0;
+        let step_at = rect_envelope("PARIS PARIS", 22).len();
+        for (i, &a) in env.iter().enumerate() {
+            dec.push_envelope(a, i as u64 * 256);
+            if i + 1 == step_at {
+                dashes_before_step = dec.sender.count(TimingClass::Dash);
+            }
+        }
+        assert!(dashes_before_step > 0);
+        assert!(dec.tracker.regime() >= 1, "no drift re-init");
+        assert_eq!(dec.sender_regime, dec.tracker.regime());
+        assert_eq!(dec.sender.count(TimingClass::Dash), 0);
+        assert!(dec.sender.count(TimingClass::Dot) > 0);
+    }
+
+    /// MAN-315 (measured on the RF heavy-dash scene): a 13 ms noise
+    /// fragment seeds the dit cluster, real dits join the dash cluster and
+    /// decode as dashes. With the 6.0 ratio ceiling (D5) the tracker heals
+    /// within the first callsigns instead of never (dit stuck at 20 ms).
+    #[test]
+    fn noise_seeded_scale_recovers_within_three_callsigns() {
+        let mut runs = Vec::new();
+        let mut ts = 0u64;
+        let mut push = |mark: bool, hops: u32| {
+            runs.push(Run {
+                mark,
+                start_ts: ts,
+                hops,
+            });
+            ts += hops as u64 * 256;
+        };
+        // [13, 51, 51, 53, 45] ms, then a word gap.
+        for (i, h) in [5u32, 19, 19, 20, 17].into_iter().enumerate() {
+            if i > 0 {
+                push(false, 18);
+            }
+            push(true, h);
+        }
+        let calls = 8;
+        for _ in 0..calls {
+            push(false, 126);
+            for (ci, c) in "K1ABC".chars().enumerate() {
+                if ci > 0 {
+                    push(false, 54);
+                }
+                for (ei, e) in pattern_for(c).unwrap().chars().enumerate() {
+                    if ei > 0 {
+                        push(false, 18);
+                    }
+                    push(true, if e == '.' { 18 } else { 72 });
+                }
+            }
+        }
+        push(false, 126);
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for r in runs {
+            dec.on_run(r, &mut events);
+        }
+        events.extend(dec.finish());
+        let text = events_to_text(&events);
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let first = words
+            .iter()
+            .position(|w| *w == "K1ABC")
+            .unwrap_or_else(|| panic!("no K1ABC in {text:?}"));
+        let after = &words[first..];
+        assert!(
+            after.iter().all(|w| *w == "K1ABC"),
+            "text after the first K1ABC is not exact: {text:?}"
+        );
+        // Measured: the 3rd callsign is the first exact one.
+        assert!(
+            after.len() >= calls - 2,
+            "first K1ABC is not within the first 3 callsigns: {text:?}"
+        );
+    }
+
+    /// MAN-315 D8 / scenario 3: the Legacy chain reports the sender's own
+    /// dash length.
+    #[test]
+    fn legacy_emits_timing_update_after_meta_tick() {
+        let text = ["CQ CQ DE K1ABC K1ABC K"; 3].join(" ");
+        let events = decode_events(Engine::Legacy, &weighted_envelope(&text, 18, 4.0, 3.0, 7.0));
+        assert_eq!(events_to_text(&events), text);
+        let updates: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, DecoderEvent::TimingUpdate { .. }))
+            .collect();
+        assert!(updates.len() >= 2, "{updates:?}");
+        let t = last_timing(&events).unwrap();
+        let dash = t.dash.unwrap().mean_dits;
+        assert!((3.6..=4.4).contains(&dash), "dash {dash} in {t:?}");
+        let dot = t.dot.unwrap().mean_dits;
+        assert!((0.8..=1.2).contains(&dot), "dot {dot}");
+        let cg = t.char_gap.unwrap().mean_dits;
+        assert!((2.6..=3.4).contains(&cg), "char gap {cg}");
+        assert!(t.element_gap.is_some() && t.word_gap.is_some(), "{t:?}");
+        assert!((t.dit_ms - 48.0).abs() < 5.0, "dit_ms {}", t.dit_ms);
+    }
+
+    #[test]
+    fn hsmm_emits_no_timing_update() {
+        let events = decode_events(Engine::Hsmm, &rect_envelope("CQ CQ DE W1AW W1AW K", 18));
+        assert!(!events_to_text(&events).is_empty());
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, DecoderEvent::TimingUpdate { .. })));
     }
 }

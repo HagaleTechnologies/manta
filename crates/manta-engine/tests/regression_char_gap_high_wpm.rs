@@ -56,6 +56,8 @@ fn ab_at_33wpm_does_not_merge_into_one_character() {
     let duration_s = 30.0;
 
     let sig = SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: text.clone(),
         loop_text: true,
         wpm,

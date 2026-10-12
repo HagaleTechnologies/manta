@@ -4,7 +4,13 @@ use std::collections::VecDeque;
 
 const CLUSTER_ALPHA: f32 = 0.15; // SPEC §9 decode.cluster_alpha
 const RATIO_MIN: f32 = 2.2; // SPEC §9 decode.mu_ratio_bounds
-const RATIO_MAX: f32 = 4.5;
+                            // SPEC §9 decode.mu_ratio_bounds upper end, **[DEVIATION]** (MAN-315 D5):
+                            // raised from 4.5 to 6.0. Heavy-dash senders (bug keys, weight 4-5) sit at
+                            // or above 4.5, so the old ceiling re-anchored their dash centroid to
+                            // 3 * mu_dit on every mark and a noise-seeded dit cluster never healed
+                            // (measured: dit stuck at 20 ms for weight 4 and 5). See
+                            // docs/DECISIONS/2026-10-11-man315-sender-timing.md.
+const RATIO_MAX: f32 = 6.0;
 const DIT_CLAMP_MS: (f32, f32) = (20.0, 150.0); // SPEC §4.1 (60..8 WPM)
 const WPM_ALPHA: f32 = 0.1; // SPEC §4.1 reporting EMA
 const DRIFT_LEN: usize = 12; // SPEC §4.1 regime-change rule
@@ -66,6 +72,21 @@ const FARNS_LONG_U: f32 = CHAR_GAP_DITS;
 // needs its own full-suite/multi-WPM validation, out of this task's scope.
 const FARNS_MIN_COUNT: u32 = 5;
 const FARNS_MIN_RATIO: f32 = 1.8;
+/// Bounds of the sender word boundary `SenderTiming::sender_word_dits`
+/// hands `GapClassifier`, in dits. The floor keeps it above the 2.0
+/// element/character boundary; gaps past the flush are flushed anyway.
+/// SPEC §4.2 **[DEVIATION]** (MAN-315 D4).
+const SENDER_WORD_DITS_CLAMP: (f32, f32) = (3.0, 12.0);
+/// Observations both mark classes need before their mean ratio becomes
+/// `SpeedTracker`'s re-anchor target (MAN-315 D5).
+const RATIO_HINT_MIN_COUNT: u32 = 3;
+/// Nominal word-gap/char-gap ratio (7/3): before any word gap is learned,
+/// the sender word boundary sits at `char_gap * sqrt(7/3)`, the geometric
+/// mean of the learned char gap and its nominal word gap (MAN-315 D4).
+const NOMINAL_WORD_CHAR_RATIO: f32 = 7.0 / 3.0;
+/// A closed word gap at or above `max(this, 4 * char-gap mean)` dits is a
+/// pause, not the sender's word spacing, and is not learned (MAN-315 D2).
+pub const PAUSE_MIN_DITS: f32 = 15.0;
 
 fn mean(xs: &[f32]) -> f32 {
     let mut acc = 0.0f64;
@@ -250,6 +271,14 @@ pub struct SpeedTracker {
     /// Inter-element gap centroid, in ms. SPEC §4.1 **[DEVIATION]** (MAN-103
     /// D6): feeds `dit_estimate_ms`'s mark/gap symmetry correction.
     mu_egap_ms: Option<f32>,
+    /// The sender's learned dash/dot ratio, the re-anchor target
+    /// `apply_constraints` uses in place of the ideal 3.0. SPEC §4.1
+    /// **[DEVIATION]** (MAN-315 D5).
+    ratio_hint: Option<f32>,
+    /// Generation counter, bumped whenever a drift re-init rebuilds the
+    /// mark scale, so a caller holding statistics in the old scale's units
+    /// knows to drop them (MAN-315 D7).
+    regime: u32,
 }
 
 impl SpeedTracker {
@@ -262,6 +291,8 @@ impl SpeedTracker {
             wpm_ema: None,
             recent: VecDeque::with_capacity(5),
             mu_egap_ms: None,
+            ratio_hint: None,
+            regime: 0,
         }
     }
 
@@ -288,6 +319,21 @@ impl SpeedTracker {
     /// EMA-smoothed PARIS WPM (SPEC §4.1a: 1200/dit_estimate_ms, alpha 0.1). None until ready.
     pub fn wpm(&self) -> Option<f32> {
         self.wpm_ema
+    }
+
+    /// Set (or clear) the dash/dot ratio `apply_constraints` re-anchors
+    /// `mu_dah` to when the ratio leaves `[2.2, 6.0]`. `None` restores the
+    /// ideal 3.0. The hint is clamped to the same bounds. SPEC §4.1
+    /// **[DEVIATION]** (MAN-315 D5).
+    pub fn set_ratio_hint(&mut self, hint: Option<f32>) {
+        self.ratio_hint = hint
+            .filter(|r| r.is_finite())
+            .map(|r| r.clamp(RATIO_MIN, RATIO_MAX));
+    }
+
+    /// The mark-scale generation, bumped by a drift re-init (MAN-315 D7).
+    pub fn regime(&self) -> u32 {
+        self.regime
     }
 
     /// Current inter-element gap centroid, in milliseconds, if any
@@ -321,9 +367,12 @@ impl SpeedTracker {
     /// exactly the transmitter's own raised-cosine rise time (shortening
     /// every mark between its 50 % points and lengthening every gap by the
     /// same amount). `mu_dit_ms()` itself stays uncorrected: its other
-    /// consumers (SPEC §4.2's `u`, §4.3's beam likelihoods, §3.2's `tau_hi`)
-    /// want a centroid consistent with the marks actually being classified;
-    /// only the WPM *report* wants the absolute physical estimate.
+    /// consumers (§4.3's beam likelihoods, §3.2's `tau_hi`) want a centroid
+    /// consistent with the marks actually being classified. Gaps are the
+    /// other side of that boundary, so since MAN-315 (D3) SPEC §4.2's `u`
+    /// measures them in this symmetric period too: in mark dits the rise
+    /// time made every gap read long, and a 4.5-dit letter gap crossed the
+    /// 5.0 word boundary.
     pub fn dit_estimate_ms(&self) -> f32 {
         let mu_dit = self.pair.lo;
         let Some(g) = self.mu_egap_ms else {
@@ -363,11 +412,13 @@ impl SpeedTracker {
     }
 
     fn apply_constraints(&mut self) {
-        // SPEC §4.1: clamp mu_dit to [20, 150] ms; enforce 2.2 <= ratio <= 4.5.
+        // SPEC §4.1: clamp mu_dit to [20, 150] ms; enforce 2.2 <= ratio <= 6.0
+        // (MAN-315 D5: was 4.5), re-anchoring to the sender's learned ratio
+        // when one is known, else the ideal 3.0.
         self.pair.lo = self.pair.lo.clamp(DIT_CLAMP_MS.0, DIT_CLAMP_MS.1);
         let ratio = self.pair.hi / self.pair.lo;
         if !(RATIO_MIN..=RATIO_MAX).contains(&ratio) {
-            self.pair.hi = 3.0 * self.pair.lo;
+            self.pair.hi = self.ratio_hint.unwrap_or(3.0) * self.pair.lo;
         }
     }
 
@@ -408,6 +459,7 @@ impl SpeedTracker {
             // A stale gap centroid from the old speed regime must not carry
             // into the new one's dit_estimate_ms correction (MAN-103 D6).
             self.mu_egap_ms = None;
+            self.regime = self.regime.wrapping_add(1);
         }
     }
 }
@@ -437,6 +489,10 @@ pub struct GapClassifier {
     /// a rebuild: `WORD_GAP_DITS`, or less when the flush is configured
     /// below it (`reinit_from_flushed`).
     rebuilt_disproof_dits: f32,
+    /// The sender's own character/word boundary, in dits, used by
+    /// `classify` in place of `WORD_GAP_DITS` while Farnsworth is not
+    /// active. SPEC §4.2 **[DEVIATION]** (MAN-315 D4).
+    sender_word_dits: Option<f32>,
 }
 
 impl GapClassifier {
@@ -459,7 +515,16 @@ impl GapClassifier {
             rebuilt: false,
             rebuilt_confirms: 0,
             rebuilt_disproof_dits: WORD_GAP_DITS,
+            sender_word_dits: None,
         }
+    }
+
+    /// Set (or clear) the sender word boundary, in dits, that `classify`
+    /// uses while Farnsworth is not active; `None` restores the nominal
+    /// `WORD_GAP_DITS`. The Farnsworth pair still wins when active. SPEC
+    /// §4.2 **[DEVIATION]** (MAN-315 D4).
+    pub fn set_sender_word_dits(&mut self, dits: Option<f32>) {
+        self.sender_word_dits = dits.filter(|d| d.is_finite());
     }
 
     fn farnsworth_active(&self) -> bool {
@@ -635,7 +700,8 @@ impl GapClassifier {
         let word_thr = if active {
             self.pair.boundary() // sqrt(mu_cgap * mu_wgap), in dit units
         } else {
-            WORD_GAP_DITS
+            // MAN-315 D4: the sender's own boundary when one is learned.
+            self.sender_word_dits.unwrap_or(WORD_GAP_DITS)
         };
         let class = if u < self.char_gap_dits {
             GapClass::InterElement
@@ -649,6 +715,195 @@ impl GapClassifier {
             self.long_seen += 1;
         }
         class
+    }
+}
+
+/// One of the five per-sender duration classes `SenderTiming` learns.
+/// SPEC §4.1b (MAN-315).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimingClass {
+    Dot,
+    Dash,
+    ElementGap,
+    CharGap,
+    WordGap,
+}
+
+impl TimingClass {
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Exponentially weighted mean and variance of one class, in dits.
+#[derive(Debug, Clone, Copy, Default)]
+struct ClassStats {
+    mean: f32,
+    var: f32,
+    n: u32,
+}
+
+impl ClassStats {
+    /// SPEC §4.1b: `d = x - mean; mean += a*d; var = (1-a)*(var + a*d^2)`,
+    /// `a = CLUSTER_ALPHA`; the first sample sets `mean = x`, `var = 0`.
+    fn observe(&mut self, x: f32) {
+        if self.n == 0 {
+            self.mean = x;
+            self.var = 0.0;
+        } else {
+            let d = x - self.mean;
+            self.mean += CLUSTER_ALPHA * d;
+            self.var = (1.0 - CLUSTER_ALPHA) * (self.var + CLUSTER_ALPHA * d * d);
+        }
+        self.n = self.n.saturating_add(1);
+    }
+
+    fn estimate(&self) -> Option<ClassEstimate> {
+        (self.n > 0).then_some(ClassEstimate {
+            mean_dits: self.mean,
+            var_dits2: self.var,
+            n: self.n,
+        })
+    }
+}
+
+/// One class's learned duration: mean and variance in dits, and how many
+/// observations they rest on. SPEC §4.1b / §5 `TimingUpdate`.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ClassEstimate {
+    pub mean_dits: f32,
+    pub var_dits2: f32,
+    pub n: u32,
+}
+
+/// A track's five learned duration classes, in dits of `dit_ms` (the
+/// symmetric dit period `SpeedTracker::dit_estimate_ms`, the one WPM is
+/// reported from). `None` for a class with no observations yet. SPEC §5
+/// `TimingUpdate` (MAN-315 D8).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TimingEstimates {
+    pub dit_ms: f32,
+    pub dot: Option<ClassEstimate>,
+    pub dash: Option<ClassEstimate>,
+    pub element_gap: Option<ClassEstimate>,
+    pub char_gap: Option<ClassEstimate>,
+    pub word_gap: Option<ClassEstimate>,
+}
+
+impl TimingEstimates {
+    /// One-line human rendering, `dot 0.91 ± 0.05  dash 2.93 ± 0.12 ...`
+    /// (mean ± standard deviation, dits; `-` for a class with no
+    /// observations). Used by `manta decode`'s timing line.
+    pub fn display_line(&self) -> String {
+        let fmt = |c: &Option<ClassEstimate>| match c {
+            Some(c) => format!("{:.2} ± {:.2}", c.mean_dits, c.var_dits2.max(0.0).sqrt()),
+            None => "-".to_string(),
+        };
+        format!(
+            "dot {}  dash {}  element gap {}  char gap {}  word gap {}",
+            fmt(&self.dot),
+            fmt(&self.dash),
+            fmt(&self.element_gap),
+            fmt(&self.char_gap),
+            fmt(&self.word_gap)
+        )
+    }
+}
+
+/// Per-sender timing model (MAN-315): dot, dash, element-gap, char-gap and
+/// word-gap durations, each an exponentially weighted mean and variance in
+/// dits with an observation count. One per `TrackDecoder`, so each track
+/// learns its own sender. SPEC §4.1b.
+///
+/// Values are stored in dits of the dit period at observation time (the
+/// caller passes `SpeedTracker::dit_estimate_ms`), so ratios survive slow
+/// speed drift. MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses)
+/// read `estimates()`; this model itself uses only the means.
+#[derive(Debug, Clone, Default)]
+pub struct SenderTiming {
+    stats: [ClassStats; 5],
+}
+
+impl SenderTiming {
+    /// A model with no observations.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one duration of `class`, `dur_ms` long, measured against a dit
+    /// of `dit_ms`. Non-finite or non-positive values are ignored.
+    pub fn observe(&mut self, class: TimingClass, dur_ms: f32, dit_ms: f32) {
+        let x = dur_ms / dit_ms;
+        if !(dur_ms > 0.0 && dit_ms > 0.0 && x.is_finite()) {
+            return;
+        }
+        self.stats[class.index()].observe(x);
+    }
+
+    /// The learned mean of `class`, in dits, if it has any observations.
+    pub fn mean_dits(&self, class: TimingClass) -> Option<f32> {
+        let s = &self.stats[class.index()];
+        (s.n > 0).then_some(s.mean)
+    }
+
+    /// Observations of `class` so far.
+    pub fn count(&self, class: TimingClass) -> u32 {
+        self.stats[class.index()].n
+    }
+
+    /// Observations across all classes (the `TimingUpdate` change test).
+    pub fn total_count(&self) -> u64 {
+        self.stats.iter().map(|s| u64::from(s.n)).sum()
+    }
+
+    /// The sender's dash/dot ratio, once both mark classes have at least
+    /// `RATIO_HINT_MIN_COUNT` observations (MAN-315 D5).
+    pub fn dash_dot_ratio(&self) -> Option<f32> {
+        let dot = &self.stats[TimingClass::Dot.index()];
+        let dash = &self.stats[TimingClass::Dash.index()];
+        (dot.n >= RATIO_HINT_MIN_COUNT && dash.n >= RATIO_HINT_MIN_COUNT && dot.mean > 0.0)
+            .then(|| dash.mean / dot.mean)
+            .filter(|r| r.is_finite())
+    }
+
+    /// The sender's character/word boundary, in dits (MAN-315 D4): the
+    /// geometric mean of the learned char-gap and word-gap means; with no
+    /// word gap learned yet, the char gap times `sqrt(7/3)`; `None` before
+    /// any char gap. Clamped to `SENDER_WORD_DITS_CLAMP`.
+    pub fn sender_word_dits(&self) -> Option<f32> {
+        let cg = self.mean_dits(TimingClass::CharGap)?;
+        let b = match self.mean_dits(TimingClass::WordGap) {
+            Some(wg) => (cg * wg).sqrt(),
+            None => cg * NOMINAL_WORD_CHAR_RATIO.sqrt(),
+        };
+        b.is_finite()
+            .then(|| b.clamp(SENDER_WORD_DITS_CLAMP.0, SENDER_WORD_DITS_CLAMP.1))
+    }
+
+    /// Whether a closed word gap of `dits` is a pause rather than the
+    /// sender's word spacing: at least `max(PAUSE_MIN_DITS, 4 * char-gap
+    /// mean)` (MAN-315 D2).
+    pub fn is_pause(&self, dits: f32) -> bool {
+        let cg = self.mean_dits(TimingClass::CharGap).unwrap_or(0.0);
+        dits >= PAUSE_MIN_DITS.max(4.0 * cg)
+    }
+
+    /// Forget every class (a new speed regime, MAN-315 D7).
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The five classes as a report, with `dit_ms` the reference dit.
+    pub fn estimates(&self, dit_ms: f32) -> TimingEstimates {
+        let e = |c: TimingClass| self.stats[c.index()].estimate();
+        TimingEstimates {
+            dit_ms,
+            dot: e(TimingClass::Dot),
+            dash: e(TimingClass::Dash),
+            element_gap: e(TimingClass::ElementGap),
+            char_gap: e(TimingClass::CharGap),
+            word_gap: e(TimingClass::WordGap),
+        }
     }
 }
 
@@ -696,12 +951,222 @@ mod tests {
         let mut t = SpeedTracker::new();
         feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
         // Drag mu_dah down toward mu_dit with implausibly short dahs;
-        // constraint 2.2..4.5 must re-anchor mu_dah = 3*mu_dit. SPEC §4.1.
+        // constraint 2.2..6.0 must re-anchor mu_dah = 3*mu_dit. SPEC §4.1.
+        // MAN-315 D5: the upper bound was 4.5.
         for _ in 0..40 {
             t.on_mark(115.0);
         }
         let ratio = t.mu_dah_ms() / t.mu_dit_ms();
-        assert!((2.2..=4.5).contains(&ratio), "ratio {ratio}");
+        assert!((2.2..=6.0).contains(&ratio), "ratio {ratio}");
+    }
+
+    /// MAN-315 D1: per-class EW mean and variance, in dits.
+    #[test]
+    fn sender_timing_learns_heavy_dash_mean_and_variance() {
+        let mut st = SenderTiming::new();
+        for i in 0..40 {
+            st.observe(TimingClass::Dot, 48.0, 48.0);
+            let jitter = if i % 2 == 0 { 4.0 } else { -4.0 };
+            st.observe(TimingClass::Dash, 192.0 + jitter, 48.0);
+        }
+        let est = st.estimates(48.0);
+        let dash = est.dash.unwrap();
+        let dot = est.dot.unwrap();
+        assert!((dash.mean_dits - 4.0).abs() < 0.05, "dash {dash:?}");
+        assert!((dot.mean_dits - 1.0).abs() < 1e-6, "dot {dot:?}");
+        assert!(dash.var_dits2 > 0.0, "dash {dash:?}");
+        assert_eq!(dot.var_dits2, 0.0);
+        assert_eq!((dot.n, dash.n), (40, 40));
+        assert!((st.dash_dot_ratio().unwrap() - 4.0).abs() < 0.05);
+        assert_eq!(st.total_count(), 80);
+        assert!(est.element_gap.is_none() && est.char_gap.is_none() && est.word_gap.is_none());
+        // Non-finite and non-positive durations are ignored.
+        st.observe(TimingClass::Dot, 0.0, 48.0);
+        st.observe(TimingClass::Dot, 48.0, 0.0);
+        st.observe(TimingClass::Dot, f32::NAN, 48.0);
+        assert_eq!(st.count(TimingClass::Dot), 40);
+    }
+
+    #[test]
+    fn sender_timing_classes_are_independent() {
+        let mut st = SenderTiming::new();
+        for _ in 0..10 {
+            st.observe(TimingClass::Dot, 50.0, 50.0);
+            st.observe(TimingClass::Dash, 150.0, 50.0);
+        }
+        let marks = (
+            st.mean_dits(TimingClass::Dot),
+            st.mean_dits(TimingClass::Dash),
+        );
+        for _ in 0..10 {
+            st.observe(TimingClass::ElementGap, 60.0, 50.0);
+            st.observe(TimingClass::CharGap, 225.0, 50.0);
+            st.observe(TimingClass::WordGap, 450.0, 50.0);
+        }
+        assert_eq!(
+            (
+                st.mean_dits(TimingClass::Dot),
+                st.mean_dits(TimingClass::Dash)
+            ),
+            marks
+        );
+        assert!((st.mean_dits(TimingClass::ElementGap).unwrap() - 1.2).abs() < 1e-5);
+        assert!((st.mean_dits(TimingClass::CharGap).unwrap() - 4.5).abs() < 1e-5);
+        assert!((st.mean_dits(TimingClass::WordGap).unwrap() - 9.0).abs() < 1e-5);
+        st.reset();
+        assert_eq!(st.total_count(), 0);
+        assert!(st.dash_dot_ratio().is_none());
+    }
+
+    /// MAN-315 D4: the sender word boundary and its clamp.
+    #[test]
+    fn sender_word_dits_rules() {
+        let mut st = SenderTiming::new();
+        assert_eq!(st.sender_word_dits(), None);
+        st.observe(TimingClass::WordGap, 9.1, 1.0); // a word gap alone sets nothing
+        assert_eq!(st.sender_word_dits(), None);
+        let mut st = SenderTiming::new();
+        st.observe(TimingClass::CharGap, 4.6, 1.0);
+        let b = st.sender_word_dits().unwrap();
+        assert!((b - 7.027).abs() < 0.01, "char only: {b}");
+        st.observe(TimingClass::WordGap, 9.1, 1.0);
+        let b = st.sender_word_dits().unwrap();
+        assert!((b - 6.470).abs() < 0.01, "char + word: {b}");
+        let mut st = SenderTiming::new();
+        st.observe(TimingClass::CharGap, 1.5, 1.0);
+        st.observe(TimingClass::WordGap, 1.6, 1.0);
+        assert_eq!(st.sender_word_dits(), Some(3.0));
+        let mut st = SenderTiming::new();
+        st.observe(TimingClass::CharGap, 20.0, 1.0);
+        st.observe(TimingClass::WordGap, 40.0, 1.0);
+        assert_eq!(st.sender_word_dits(), Some(12.0));
+    }
+
+    #[test]
+    fn pause_rule_scales_with_the_char_gap() {
+        let mut st = SenderTiming::new();
+        assert!(!st.is_pause(14.9));
+        assert!(st.is_pause(15.0));
+        st.observe(TimingClass::CharGap, 5.0, 1.0);
+        assert!(!st.is_pause(19.9));
+        assert!(st.is_pause(20.0));
+    }
+
+    /// MAN-315 D5: a weight-5 sender's dashes are not re-anchored to 3:1.
+    #[test]
+    fn ratio_ceiling_admits_heavy_dashes() {
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[48.0, 192.0, 48.0, 48.0, 192.0]);
+        for _ in 0..40 {
+            t.on_mark(240.0);
+            t.on_mark(48.0);
+        }
+        let ratio = t.mu_dah_ms() / t.mu_dit_ms();
+        assert!(ratio <= 6.0, "ratio {ratio}");
+        assert!(t.mu_dah_ms() > 216.0, "mu_dah {}", t.mu_dah_ms());
+    }
+
+    /// Marks of `text` at `dit_ms` with dashes `weight` dits long, each
+    /// mark alternately `jitter` (fractional) long and short.
+    fn weighted_marks(text: &str, dit_ms: f32, weight: f32, jitter: f32) -> Vec<f32> {
+        let mut out = Vec::new();
+        for c in text.chars() {
+            for e in crate::tree::pattern_for(c).unwrap().chars() {
+                let base = if e == '.' { dit_ms } else { weight * dit_ms };
+                let sign = if out.len() % 2 == 0 { 1.0 } else { -1.0 };
+                out.push(base * (1.0 + sign * jitter));
+            }
+        }
+        out
+    }
+
+    /// MAN-315 D5 (measured in planning): a 13 ms noise fragment seeds the
+    /// dit cluster, real 48 ms dits join the dash cluster, and with the old
+    /// 4.5 ceiling the 3:1 re-anchor kept the dit at 20 ms indefinitely.
+    #[test]
+    fn noise_seeded_init_heals_within_a_callsign_for_heavy_dashes() {
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[13.3, 50.7, 50.7, 53.3, 45.3]);
+        let marks = weighted_marks("CQTESTK1ABCK1ABCTESTCQTEST", 48.0, 4.0, 0.08);
+        let healed_at = marks.iter().position(|&m| {
+            t.on_mark(m);
+            (t.mu_dit_ms() - 48.0).abs() < 10.0 && (t.mu_dah_ms() / t.mu_dit_ms() - 4.0).abs() < 0.8
+        });
+        assert!(
+            healed_at.is_some_and(|i| i < 60),
+            "healed at {healed_at:?}: mu_dit {} mu_dah {}",
+            t.mu_dit_ms(),
+            t.mu_dah_ms()
+        );
+    }
+
+    /// MAN-315 D5: the re-anchor target is the sender's ratio, not 3.0.
+    #[test]
+    fn ratio_hint_sets_reanchor_target() {
+        for (hint, want) in [(None, 3.0f32), (Some(4.0), 4.0), (Some(9.0), 6.0)] {
+            let mut t = SpeedTracker::new();
+            feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+            t.set_ratio_hint(hint);
+            let mut fired = None;
+            for _ in 0..40 {
+                let pre = t.mu_dah_ms();
+                t.on_mark(115.0);
+                if t.mu_dah_ms() > pre {
+                    fired = Some(t.mu_dah_ms() / t.mu_dit_ms());
+                    break;
+                }
+            }
+            let r = fired.expect("collapse must trigger the ratio re-anchor");
+            assert!((r - want).abs() < 1e-3, "hint {hint:?}: ratio {r}");
+        }
+    }
+
+    #[test]
+    fn drift_reinit_bumps_the_regime() {
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        assert_eq!(t.regime(), 0);
+        for _ in 0..14 {
+            t.on_mark(34.0);
+        }
+        assert_eq!(t.regime(), 1);
+    }
+
+    /// MAN-315 D4: the sender boundary replaces the nominal 5.0 but not an
+    /// active Farnsworth pair.
+    #[test]
+    fn sender_word_dits_overrides_nominal_but_not_farnsworth() {
+        let mut g = GapClassifier::new();
+        let mu = 48.0;
+        assert_eq!(g.classify(6.0 * mu, mu), GapClass::InterWord);
+        g.set_sender_word_dits(Some(7.0));
+        assert_eq!(g.classify(6.0 * mu, mu), GapClass::InterChar);
+        assert_eq!(g.classify(7.5 * mu, mu), GapClass::InterWord);
+        assert_eq!(g.classify(1.5 * mu, mu), GapClass::InterElement);
+        g.set_sender_word_dits(None);
+        assert_eq!(g.classify(6.0 * mu, mu), GapClass::InterWord);
+
+        let mut g = GapClassifier::new();
+        for _ in 0..5 {
+            g.classify(6.0 * mu, mu);
+            g.classify(14.0 * mu, mu);
+        }
+        g.set_sender_word_dits(Some(5.0));
+        // Farnsworth active: the pair's ~9.2-dit boundary wins over 5.0.
+        assert_eq!(g.classify(6.0 * mu, mu), GapClass::InterChar);
+        assert_eq!(g.classify(14.0 * mu, mu), GapClass::InterWord);
+    }
+
+    #[test]
+    fn timing_estimates_display_line() {
+        let mut st = SenderTiming::new();
+        st.observe(TimingClass::Dot, 1.0, 1.0);
+        st.observe(TimingClass::Dot, 1.2, 1.0);
+        let line = st.estimates(48.0).display_line();
+        assert_eq!(
+            line,
+            "dot 1.03 ± 0.07  dash -  element gap -  char gap -  word gap -"
+        );
     }
 
     #[test]
