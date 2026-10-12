@@ -120,6 +120,14 @@ interval. A same-band report found anyway still grades `match` or
 Live coverage is the feed's list of up and down intervals, plus the
 horizon below which buffered reports were pruned: a spot whose window
 starts behind that horizon has lost reports and is treated as not covered.
+A feed that goes silent is declared down only by its 60 s idle timeout, at
+its last line. Until then the still-open interval cannot vouch for a window
+that closed during the silence, so a spot whose window only that interval
+covers is held past its close until a report arrives at or after the
+close, or for at most `FEED_SILENCE_GRACE_SECS` (70 s). By then a silent
+feed has been declared down and the spot grades `unknown`; a feed still up
+was delivering lines (non-CW ones, say), and the spot grades on the
+interval. Reports a held spot's window needs are not pruned while it waits.
 Offline coverage is the earliest to the latest report time across the CSVs
 given.
 

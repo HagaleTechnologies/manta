@@ -10,12 +10,9 @@ sources:
   - CLAUDE.md
   - docs/DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md
   - docs/DECISIONS/2026-10-10-man92-telnet-commands.md
-<<<<<<< HEAD
   - docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md
   - docs/RUNBOOKS/rbn-comparison.md
-=======
   - docs/SPOT-SCHEMA.md
->>>>>>> dfec33e19656c7e22aa66c970436cb62f620f9a7
 verified:
   commit: 01d1ea1
   date: 2026-09-07

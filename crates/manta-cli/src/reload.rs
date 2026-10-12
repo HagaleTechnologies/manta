@@ -95,6 +95,7 @@ pub(crate) fn reload_once(ctx: &ReloadContext) -> Result<ReloadOutcome> {
         ctx.cli_engine,
         &ctx.vars,
     )?;
+    crate::refuse_rbn_compare_replay(&prepared.resolved, ctx.cli.source.is_some())?;
     config_cmd::reject_on_reload(&prepared.loaded, ctx.cli.source_selector().is_some())?;
     let restart_needed = restart_only_changes(&ctx.startup_raw, &prepared.loaded.raw);
     let dry_run_skipped = restart_needed.iter().any(|p| p.starts_with("rbn_uplink"))
@@ -661,6 +662,31 @@ blocklist_path = \"bl.txt\"
             assert!(f.ctx.lists.take().is_none());
             assert_eq!(flags(&f.ctx), vec![true]);
         }
+    }
+
+    /// MAN-301: `run`'s replay refusal rejects a reload that enables
+    /// `[rbn_compare]` on a daemon replaying a recording, before anything
+    /// applies.
+    #[test]
+    fn rbn_compare_on_a_replay_rejects_the_reload() {
+        let cli = CliOverrides {
+            source: Some(PathBuf::from("x.wav")),
+            ..CliOverrides::none()
+        };
+        let f = start(BASE, cli);
+        write(
+            &f.path("manta.toml"),
+            &format!("{BASE}\n[rbn_compare]\nenabled = true\n"),
+        );
+        let err = format!("{:#}", reload_once(&f.ctx).unwrap_err());
+        assert!(
+            err.starts_with(
+                "RBN comparison grades spots against the live RBN feed, but this run \
+                 replays a recording (--source)."
+            ),
+            "{err}"
+        );
+        assert!(f.ctx.lists.take().is_none());
     }
 
     /// MAN-268 D3: a command-line source flag replaces `[input]`, so its

@@ -501,9 +501,13 @@ fn load_rbn_csv(paths: &[PathBuf]) -> Result<(Vec<RbnReport>, RbnStats)> {
                 .parse()
                 .ok()
                 .filter(|f: &f64| f.is_finite())
-                .with_context(|| format!("{}: bad freq {:?}", at(), field(c_freq)))?;
-            let time = manta_testkit::oracle::parse_utc_timestamp(field(c_date))
-                .with_context(|| format!("{}: bad date {:?}", at(), field(c_date)))?;
+                .with_context(|| {
+                    format!("{}: bad freq {}", at(), crate::fmt::quoted(field(c_freq)))
+                })?;
+            let time =
+                manta_testkit::oracle::parse_utc_timestamp(field(c_date)).with_context(|| {
+                    format!("{}: bad date {}", at(), crate::fmt::quoted(field(c_date)))
+                })?;
             let wpm = c_speed
                 .and_then(|c| field(c).parse::<f64>().ok())
                 .filter(|w| w.is_finite() && *w > 0.0);

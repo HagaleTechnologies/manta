@@ -903,8 +903,8 @@ impl RbnCompareConfig {
         {
             return Err(format!(
                 "[rbn_compare].feed_host must be a host name or address without spaces or \
-                 control characters, got {:?}",
-                self.feed_host
+                 control characters, got {}",
+                crate::human::quoted(&self.feed_host)
             ));
         }
         if let Some(call) = &self.login_callsign {

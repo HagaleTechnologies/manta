@@ -28,6 +28,14 @@ pub const MAX_PENDING_SPOTS: usize = 20_000;
 /// Report retention is `2 * window_secs + RETENTION_SLACK_SECS` behind the
 /// close time: enough for a spot submitted (and graded) a little late.
 pub const RETENTION_SLACK_SECS: i64 = 60;
+/// How long past its window close [`Grader::close_due`] holds a spot whose
+/// window only the open feed span covers, while no report has arrived at
+/// or after the close: the feed's idle timeout plus 10 s of scheduling
+/// margin. By then a feed that went silent before the close has been
+/// declared down at its last line, so the silent stretch grades `unknown`
+/// rather than `none`/`elsewhere`; a feed still up then was delivering
+/// (non-CW) lines.
+pub const FEED_SILENCE_GRACE_SECS: i64 = super::feed::FEED_IDLE_TIMEOUT.as_secs() as i64 + 10;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GradeConfig {
@@ -226,11 +234,14 @@ impl ReportIndex {
 /// When the RBN feed was known to be up: closed `(from, to)` spans, the
 /// currently open span, and the report-buffer `horizon` below which reports
 /// may have been pruned (so data there is gone, as if the feed were down).
+/// `seen` is the latest time the feed showed it was alive (its `Up` or a
+/// report's arrival).
 #[derive(Debug, Clone)]
 struct Coverage {
     closed: Vec<(i64, i64)>,
     open: Option<i64>,
     horizon: i64,
+    seen: i64,
 }
 
 impl Coverage {
@@ -239,6 +250,7 @@ impl Coverage {
             closed: Vec::new(),
             open: None,
             horizon: i64::MIN,
+            seen: i64::MIN,
         }
     }
 
@@ -246,6 +258,11 @@ impl Coverage {
         if self.open.is_none() {
             self.open = Some(at);
         }
+        self.alive(at);
+    }
+
+    fn alive(&mut self, at: i64) {
+        self.seen = self.seen.max(at);
     }
 
     fn down(&mut self, at: i64) {
@@ -266,6 +283,13 @@ impl Coverage {
         lo >= self.horizon
             && (self.closed.iter().any(|&(a, b)| a <= lo && hi <= b)
                 || self.open.is_some_and(|a| a <= lo))
+    }
+
+    /// Only the open span would cover `[lo, hi]`, but the feed has not
+    /// shown it was alive at `hi`: it may have gone silent inside the
+    /// window, with its idle timeout not yet fired.
+    fn unconfirmed(&self, lo: i64, hi: i64) -> bool {
+        lo >= self.horizon && self.open.is_some_and(|a| a <= lo) && self.seen < hi
     }
 }
 
@@ -503,6 +527,8 @@ impl Grader {
     /// rejected it. Past the cap the oldest report is evicted and the
     /// coverage horizon moves past it.
     pub fn observe(&mut self, r: RbnReport) -> bool {
+        // Any report shows the feed alive, filtered out or not.
+        self.coverage.alive(r.time);
         let Some(r) = self.filter.admit(r) else {
             return false;
         };
@@ -540,15 +566,24 @@ impl Grader {
     /// Grades every pending spot whose window closed at or before `now`,
     /// sorted by `(window_close, spot_id)`, then prunes reports older than
     /// `now - (2 * window + RETENTION_SLACK_SECS)` and raises the coverage
-    /// horizon to that cutoff.
+    /// horizon to that cutoff. A spot whose window only the open feed span
+    /// covers waits while no report has arrived at or after its close, up
+    /// to [`FEED_SILENCE_GRACE_SECS`] past it: a silent feed is not yet
+    /// down, and its silence must not grade `none`/`elsewhere`. The prune
+    /// never passes a waiting spot's window start.
     pub fn close_due(&mut self, now: i64) -> Vec<SpotGrade> {
         let mut out = Vec::new();
         while let Some(entry) = self.pending.first_entry() {
             if entry.key().0 > now {
                 break;
             }
+            let (lo, hi) = window_of(entry.get(), &self.cfg);
+            // Later spots close no earlier, so they wait too.
+            if self.coverage.unconfirmed(lo, hi) && now < hi.saturating_add(FEED_SILENCE_GRACE_SECS)
+            {
+                break;
+            }
             let spot = entry.remove();
-            let (lo, hi) = window_of(&spot, &self.cfg);
             let call = spot.call.trim().to_ascii_uppercase();
             let candidates = self.index.candidates(&call, lo, hi);
             let covered = self.coverage.covers(lo, hi);
@@ -560,7 +595,10 @@ impl Grader {
                 &self.filter,
             ));
         }
-        let cutoff = now.saturating_sub(2 * self.cfg.window_secs + RETENTION_SLACK_SECS);
+        let mut cutoff = now.saturating_sub(2 * self.cfg.window_secs + RETENTION_SLACK_SECS);
+        if let Some(spot) = self.pending.values().next() {
+            cutoff = cutoff.min(window_of(spot, &self.cfg).0);
+        }
         self.index.prune_before(cutoff);
         self.coverage.raise_horizon(cutoff);
         out
@@ -1182,6 +1220,62 @@ mod tests {
         assert_eq!(grader.pending(), 0);
         sort_grades(&mut got);
         assert_eq!(got, want);
+    }
+
+    /// Code review (MAN-301 validate): the feed's last line is at `L` and it
+    /// goes silent; its idle timeout fires only at `L + 60`. A window that
+    /// closes in between is not graded `none` on the silent stretch: it
+    /// waits, then grades `unknown` once the feed is declared down at `L`,
+    /// or grades once a later report shows the feed was alive at the close.
+    #[test]
+    fn silent_feed_before_its_idle_timeout_does_not_grade_none() {
+        let (s, _) = scenario2();
+        let l = T0 + 150;
+
+        let mut grader = Grader::new(cfg());
+        grader.feed_up(T0 - 1000);
+        grader.observe(rep("K5TR", "N4RV", 7021.0, None, l));
+        grader.submit(GradeInput {
+            time: T0,
+            ..s.clone()
+        });
+        // Window [T0 - 180, T0 + 180] closes 30 s into the silence.
+        assert!(grader.close_due(T0 + 185).is_empty());
+        assert_eq!(grader.pending(), 1);
+        grader.feed_down(l);
+        let grades = grader.close_due(l + 60);
+        assert_eq!(grades.len(), 1);
+        assert_eq!(grades[0].grade, Grade::Unknown);
+
+        // A report at or after the close confirms coverage at once.
+        let mut grader = Grader::new(cfg());
+        grader.feed_up(T0 - 1000);
+        grader.submit(GradeInput {
+            time: T0,
+            ..s.clone()
+        });
+        assert!(grader.close_due(T0 + 185).is_empty());
+        grader.observe(rep("K5TR", "N4RV", 7021.0, None, T0 + 186));
+        let grades = grader.close_due(T0 + 186);
+        assert_eq!(grades.len(), 1);
+        assert_eq!(grades[0].grade, Grade::None);
+
+        // A feed still up after the grace was delivering lines (non-CW,
+        // say): the spot grades on the open span, and the report at its
+        // window start was kept while it waited (the prune cutoff passes
+        // T0 - 178 from now = T0 + 243 on).
+        let mut grader = Grader::new(cfg());
+        grader.feed_up(T0 - 1000);
+        grader.observe(rep("K5TR", "W1AW", 14025.0, None, T0 - 178));
+        grader.submit(scenario1().0);
+        let grace_end = T0 + 180 + FEED_SILENCE_GRACE_SECS;
+        for now in (T0 + 180..grace_end).step_by(5) {
+            assert!(grader.close_due(now).is_empty(), "{now}");
+        }
+        let grades = grader.close_due(grace_end);
+        assert_eq!(grades.len(), 1);
+        assert_eq!(grades[0].grade, Grade::Match);
+        assert_eq!(grades[0].rbn_skimmers, 1);
     }
 
     #[test]

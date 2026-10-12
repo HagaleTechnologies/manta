@@ -64,8 +64,10 @@ ignored. Any other path or any method other than `GET` gets
 
 ## Metric families
 
-All 40 families, in the order `/metrics` renders them. Every family's
-`# HELP` and `# TYPE` lines are always rendered. "Present when" says when
+All 50 families, in the order `/metrics` renders them. Every family's
+`# HELP` and `# TYPE` lines are always rendered, except the ten
+RBN comparison families (MAN-301) at the end of the table, which are
+rendered only when `[rbn_compare]` is enabled. "Present when" says when
 the family also carries samples. Where it says a family has no samples, the
 value is absent, not zero: the node does not measure it, so do not read the
 missing series as "no loss" or "no traffic".
@@ -112,6 +114,16 @@ missing series as "no loss" or "no traffic".
 | `manta_decode_latency_seconds` | histogram | `le` | Wall-clock time the decode thread spent processing one input chunk (channelize, track, decode, validate), excluding the wait for source data. To keep up with real time each observation must stay below that chunk's own duration, n samples / sample rate. A full chunk is 2048 samples, but KiwiSDR, HPSDR and the last read of a file can return shorter ones, so 2048 / sample rate is only the full-chunk upper bound, not a threshold every observation can be compared with. Buckets: 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5 s and `+Inf`, plus `_sum` and `_count`. | From startup: the daemon publishes an all-zero histogram just before the decode loop starts, then refreshes it every 250 ms. A scrape in the instant before that sees the `# TYPE` line only. |
 | `manta_healthy` | gauge | — | Whether `/healthz` currently reports this node healthy (1) or not (0). Same evaluation as `/healthz`. | Always. |
 | `manta_listener_up` | gauge | `listener` | Whether each listener is currently up (1) or down (0). `listener` is `telnet`, `json` or `metrics`. | One series per listener once the listeners have started; a listener whose task ends reads 0. |
+| `manta_rbn_compare_grades_total` | counter | `band`, `grade` | Spots graded against the RBN feed since start, by the spot's band and grade (`match`, `disagree`, `elsewhere`, `none`, `unknown`). | Only with `[rbn_compare]` enabled: the family's `# HELP`/`# TYPE` lines are absent otherwise. One series per (band, grade) pair after its first grade. |
+| `manta_rbn_compare_grades_last_hour` | gauge | `band`, `grade` | Spots graded in the last hour, by band and grade. | Only with `[rbn_compare]` enabled, as for `manta_rbn_compare_grades_total`. |
+| `manta_rbn_compare_disagreements_last_hour` | gauge | `band`, `kind` | Spots graded `disagree` in the last hour, by band and the tolerance that failed (`frequency` or `speed`); a spot failing both counts under each. | Only with `[rbn_compare]` enabled. |
+| `manta_rbn_compare_freq_offset_median_hz` | gauge | `band` | Median of manta's frequency minus RBN's modal frequency, in Hz, over spots graded `match` or `disagree` in the last hour. | Only with `[rbn_compare]` enabled, per band with at least one such spot. |
+| `manta_rbn_compare_freq_offset_samples` | gauge | `band` | Spots the median frequency offset is computed over. | As for `manta_rbn_compare_freq_offset_median_hz`. |
+| `manta_rbn_compare_feed_connected` | gauge | — | Whether the RBN feed is logged in and delivering lines (1) or not (0). | Only with `[rbn_compare]` enabled. |
+| `manta_rbn_compare_feed_reports_total` | counter | — | CW reports accepted from the RBN feed. | Only with `[rbn_compare]` enabled; starts at 0. |
+| `manta_rbn_compare_feed_reconnects_total` | counter | — | RBN feed connections lost or failed. | Only with `[rbn_compare]` enabled; starts at 0. |
+| `manta_rbn_compare_pending` | gauge | — | Spots not yet graded: waiting for their comparison window to close, or held past the close while the feed is silent. | Only with `[rbn_compare]` enabled. |
+| `manta_rbn_compare_ungraded_total` | counter | — | Spots never graded: the pending queue was full, or the comparator lagged the spot bus. | Only with `[rbn_compare]` enabled; starts at 0. |
 
 ### Sample
 
@@ -269,3 +281,5 @@ For what each uplink state means and what to do about it, see
   source outage counters.
 - [MAN-132](DECISIONS/2026-10-08-man132-metrics-loopback-bind.md): the
   loopback default for `metrics_bind_addr`.
+- [MAN-301](DECISIONS/2026-10-11-man301-live-rbn-comparison.md): the
+  RBN comparison families.

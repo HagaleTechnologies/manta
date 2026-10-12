@@ -321,6 +321,11 @@ around those spots. Spots published in the first `window_secs` after the
 daemon starts can also grade `unknown`, because the feed was not yet up
 for the start of their window.
 
+A feed that goes silent is declared down only after 60 s without a line.
+A spot whose window closes during that silence is held, and counted in
+`manta_rbn_compare_pending`, for up to 70 s past its close: it grades as
+soon as a report arrives, or `unknown` once the feed is declared down.
+
 ### Grades never appear
 
 - Check that `manta_rbn_compare_pending` rises as spots publish. If no

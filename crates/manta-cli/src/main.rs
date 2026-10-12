@@ -17,12 +17,9 @@ mod config_cmd;
 mod config_edit;
 mod devices;
 mod doctor_checks;
-<<<<<<< HEAD
-mod grade_cmd;
-=======
 mod fmt;
+mod grade_cmd;
 mod health_cmd;
->>>>>>> dfec33e19656c7e22aa66c970436cb62f620f9a7
 mod logging;
 mod reconnect;
 mod reload;
@@ -3782,9 +3779,8 @@ fn prepare_config(
 ) -> Result<Prepared> {
     let loaded = config::load(config_path.as_deref(), config::Env::Read(vars))?;
     let rbn_opts = cli.rbn.clone();
-    let source_flag = cli.source.is_some();
     let resolved = resolve(cli, &loaded)?;
-    check_rbn_compare(&rbn_opts, &loaded, &resolved, source_flag)?;
+    check_rbn_compare(&rbn_opts, &loaded, &resolved)?;
     let decode = merge_cli_engine(cli_engine, loaded.decode.clone());
     let mut pipeline = build_pipeline_config(
         resolved.freq_correction_ppm,
@@ -3803,14 +3799,16 @@ fn prepare_config(
 
 /// MAN-301's refusals that need the merged command line: `--rbn-spotter`
 /// without comparison, comparison turned on by the flag without `[server]`
-/// (the loader refuses the file's own `enabled = true`), a replayed
-/// recording, and `--rbn-spotter` naming this station. Run before any
-/// source or listener opens, and by `manta config check`.
+/// (the loader refuses the file's own `enabled = true`), and `--rbn-spotter`
+/// naming this station. Run before any source or listener opens, and by
+/// `manta config check`. The replayed-recording refusal is
+/// [`refuse_rbn_compare_replay`], which only `run` (and its SIGHUP reload)
+/// and `config check` call: `soak` and `doctor` share this path but never
+/// start the comparator.
 fn check_rbn_compare(
     cli: &RbnCompareOpts,
     loaded: &config::Loaded,
     resolved: &Resolved,
-    source_flag: bool,
 ) -> Result<()> {
     let enabled = resolved.rbn_compare.as_ref().is_some_and(|c| c.enabled);
     if !cli.rbn_spotter.is_empty() && !enabled {
@@ -3825,6 +3823,27 @@ fn check_rbn_compare(
     let Some(server) = &loaded.server else {
         bail!("{}", config::rbn_compare_needs_server(&loaded.origin));
     };
+    if !cli.rbn_spotter.is_empty() {
+        if let Some(call) = rbn_compare.own_call_spotter(&server.station_callsign) {
+            bail!(
+                "--rbn-spotter {call} is this station's own callsign: its reports are always \
+                 excluded, so every spot would grade none"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// MAN-301: RBN comparison enabled on a run that replays a recording is
+/// refused, since the live feed's reports would never line up with the
+/// recording's spot times. `run` calls this after `prepare_live`, before any
+/// source or listener opens; its SIGHUP reload and `manta config check` call
+/// it too. `soak` and `doctor` do not, because neither starts the comparator.
+/// `source_flag` is whether `--source` chose the file.
+fn refuse_rbn_compare_replay(resolved: &Resolved, source_flag: bool) -> Result<()> {
+    if !resolved.rbn_compare.as_ref().is_some_and(|c| c.enabled) {
+        return Ok(());
+    }
     if let LiveSourceSpec::File { .. } = resolved.spec {
         let how = if source_flag {
             "--source"
@@ -3835,14 +3854,6 @@ fn check_rbn_compare(
             "RBN comparison grades spots against the live RBN feed, but this run replays a \
              recording ({how}). Grade a recorded node's spot log with `manta grade` instead."
         );
-    }
-    if !cli.rbn_spotter.is_empty() {
-        if let Some(call) = rbn_compare.own_call_spotter(&server.station_callsign) {
-            bail!(
-                "--rbn-spotter {call} is this station's own callsign: its reports are always \
-                 excluded, so every spot would grade none"
-            );
-        }
     }
     Ok(())
 }
@@ -4601,12 +4612,14 @@ fn run_command() -> Result<std::process::ExitCode> {
             let reload_cli = cli.clone();
             #[cfg(unix)]
             let vars: Vec<_> = std::env::vars_os().collect();
+            let source_flag = cli.source.is_some();
             let Prepared {
                 config_path,
                 loaded,
                 resolved,
                 pipeline: cfg,
             } = prepare_live(cli, config, engine)?;
+            refuse_rbn_compare_replay(&resolved, source_flag)?;
             // MAN-268: an unedited manta.example.toml must not start a
             // daemon that spots, or logs in to a collector, as N0CALL.
             // Checked first, on the identities after the MANTA_* overlay:
@@ -9165,6 +9178,13 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         prepare_config(cli, Some(f.path().to_path_buf()), None, &[])
     }
 
+    /// `prepare_rbn` followed by `run`'s replay refusal.
+    fn run_rbn(body: &str, rbn: RbnCompareOpts, source: Option<&str>) -> Result<Prepared> {
+        let prepared = prepare_rbn(body, rbn, source)?;
+        refuse_rbn_compare_replay(&prepared.resolved, source.is_some())?;
+        Ok(prepared)
+    }
+
     #[test]
     fn rbn_compare_flag_enables_comparison() {
         let rbn = run_rbn_opts(&["--rbn-compare"]).unwrap();
@@ -9269,7 +9289,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let enabled = format!("{RBN_SERVER}[rbn_compare]\nenabled = true\n");
         let err = format!(
             "{:#}",
-            prepare_rbn(&enabled, RbnCompareOpts::default(), Some("x.wav"))
+            run_rbn(&enabled, RbnCompareOpts::default(), Some("x.wav"))
                 .err()
                 .unwrap()
         );
@@ -9279,11 +9299,11 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
              recording (--source). Grade a recorded node's spot log with `manta grade` instead."
         );
         let flag = run_rbn_opts(&["--rbn-compare"]).unwrap();
-        assert!(prepare_rbn(RBN_SERVER, flag, Some("x.wav")).is_err());
+        assert!(run_rbn(RBN_SERVER, flag, Some("x.wav")).is_err());
         let file_input = format!("{enabled}[input]\ntype = \"file\"\npath = \"/x.wav\"\n");
         let err = format!(
             "{:#}",
-            prepare_rbn(&file_input, RbnCompareOpts::default(), None)
+            run_rbn(&file_input, RbnCompareOpts::default(), None)
                 .err()
                 .unwrap()
         );
@@ -9295,6 +9315,19 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             "{err}"
         );
         // A replay with comparison off is unaffected.
-        assert!(prepare_rbn(RBN_SERVER, RbnCompareOpts::default(), Some("x.wav")).is_ok());
+        assert!(run_rbn(RBN_SERVER, RbnCompareOpts::default(), Some("x.wav")).is_ok());
+    }
+
+    /// `soak` and `doctor` share `prepare_config` with `run` but never start
+    /// the comparator, so a node config with `[rbn_compare]` enabled still
+    /// prepares over a replayed recording; only `run` refuses it.
+    #[test]
+    fn soak_and_doctor_prepare_a_replay_with_rbn_compare_enabled() {
+        let enabled = format!("{RBN_SERVER}[rbn_compare]\nenabled = true\n");
+        let p = prepare_rbn(&enabled, RbnCompareOpts::default(), Some("x.wav")).unwrap();
+        assert!(p.resolved.rbn_compare.is_some_and(|c| c.enabled));
+        let file_input = format!("{enabled}[input]\ntype = \"file\"\npath = \"/x.wav\"\n");
+        assert!(prepare_rbn(&file_input, RbnCompareOpts::default(), None).is_ok());
+        assert!(run_rbn(&file_input, RbnCompareOpts::default(), None).is_err());
     }
 }

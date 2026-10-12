@@ -891,7 +891,6 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         assert!(!json["dxDxcc"].is_null());
     }
 
-<<<<<<< HEAD
     /// MAN-301: the comparator's `spotGrade.spotId` must be byte-identical
     /// to the `id` of the spot line it grades.
     #[test]
@@ -936,7 +935,9 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         assert_eq!(
             crate::band::band_for_freq_hz(wire_frequency_hz(&edge) as f64),
             "20m"
-=======
+        );
+    }
+
     /// MAN-149: dispensa's contract is private, so `docs/SPOT-SCHEMA.md` is
     /// the field reference outside developers read. Its field table must
     /// have exactly one row per key this struct puts on the wire.
@@ -974,7 +975,6 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
             rows.len(),
             keys.len(),
             "docs/SPOT-SCHEMA.md's Fields table must have exactly one row per wire field"
->>>>>>> dfec33e19656c7e22aa66c970436cb62f620f9a7
         );
     }
 }

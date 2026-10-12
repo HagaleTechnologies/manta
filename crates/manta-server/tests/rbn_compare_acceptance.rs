@@ -516,7 +516,9 @@ fn scenario_spot(n: usize) -> (i64, Spot) {
 }
 
 /// Shared body of the four scenario tests: the spot alone, before its
-/// window closes, then its grade within 1 s of the clock passing it.
+/// window closes, then its grade within 1 s of a feed line arriving after
+/// the close (a feed silent since inside the window may be dead, so its
+/// silence alone never grades).
 async fn run_scenario(spot_index: usize, reports: Vec<Report>, expected: &str) {
     let (t, spot) = scenario_spot(spot_index);
     let mut h = Harness::start(&[], t - 400).await;
@@ -532,7 +534,7 @@ async fn run_scenario(spot_index: usize, reports: Vec<Report>, expected: &str) {
     assert_eq!(h.spot_lines(), 1);
     assert!(h.grade_lines().is_empty(), "{:?}", h.grade_lines());
 
-    h.set_clock(t + 181);
+    h.send(&warm_up(t + 181)).await;
     let grades = h.wait_grades(1, Duration::from_secs(1)).await;
     assert_eq!(grades, vec![expected.to_string()]);
     // The spot line came first.
@@ -652,6 +654,29 @@ async fn feed_outage_grades_unknown() {
         h.metric(r#"manta_rbn_compare_grades_last_hour{band="20m",grade="unknown"}"#),
         Some(1.0)
     );
+    h.stop().await;
+}
+
+/// Code review (MAN-301 validate): the feed goes quiet inside the window and
+/// its idle timeout has not fired yet. The spot is held past its close
+/// rather than graded `none` on the silent stretch; once the feed shows
+/// life after the close, it grades.
+#[tokio::test]
+async fn silent_feed_holds_the_grade_until_the_feed_shows_life() {
+    let (t, spot) = scenario_spot(1);
+    let mut h = Harness::start(&[], t - 400).await;
+    h.send(&warm_up(t - 300)).await;
+    h.publish(t, spot).await;
+
+    h.set_clock(t + 200);
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert!(h.grade_lines().is_empty(), "{:?}", h.grade_lines());
+    assert_eq!(h.metric("manta_rbn_compare_pending"), Some(1.0));
+
+    h.send(&warm_up(t + 201)).await;
+    let grades = h.wait_grades(1, Duration::from_secs(1)).await;
+    let v: serde_json::Value = serde_json::from_str(&grades[0]).unwrap();
+    assert_eq!(v["grade"], "none", "{}", grades[0]);
     h.stop().await;
 }
 

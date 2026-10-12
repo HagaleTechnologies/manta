@@ -1250,7 +1250,6 @@ fn architecture_logging_bullet_is_current() {
     );
 }
 
-<<<<<<< HEAD
 // ---- MAN-301: live RBN comparison, documented ----
 
 /// Every `manta_rbn_compare_*` family the design names (MAN-301 plan §7).
@@ -1394,7 +1393,10 @@ fn spec_precedence_paragraph_lists_rbn_compare_env_prefix() {
         assert!(
             paragraph.contains(needle),
             "SPEC §9's precedence paragraph never says {needle:?}"
-=======
+        );
+    }
+}
+
 /// MAN-81: an operator reading the Docker docs learns that a bare
 /// `docker run` runs a mounted config, that the image reports health through
 /// `manta health`, and how to turn the check off.
@@ -1922,7 +1924,6 @@ fn reference_docs_relative_links_resolve() {
         assert!(
             broken.is_empty(),
             "{file} has relative links that do not resolve: {broken:?}"
->>>>>>> dfec33e19656c7e22aa66c970436cb62f620f9a7
         );
     }
 }

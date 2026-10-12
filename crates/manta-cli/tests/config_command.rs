@@ -148,6 +148,29 @@ fn check_does_not_open_a_file_source() {
     assert!(out.contains("input: type=file path="), "{out}");
 }
 
+/// MAN-301: `config check` refuses what `run` refuses: `[rbn_compare]`
+/// enabled while `[input]` replays a recording.
+#[test]
+fn check_refuses_rbn_compare_on_a_file_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cfg(
+        dir.path(),
+        "manta.toml",
+        &format!(
+            "{SERVER_TOML}[rbn_compare]\nenabled = true\n\
+             [input]\ntype = \"file\"\npath = \"missing.wav\"\n"
+        ),
+    );
+    let err = fails(&check_file(&path));
+    assert!(
+        err.contains(
+            "RBN comparison grades spots against the live RBN feed, but this run replays a \
+             recording ([input] type = \"file\")."
+        ),
+        "{err}"
+    );
+}
+
 // ---- Scenario 2: an invalid config is rejected naming field and problem
 
 #[test]
