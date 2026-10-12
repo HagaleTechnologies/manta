@@ -185,7 +185,7 @@ Stop the foreground daemon with Ctrl+C. Append this block to `manta.toml`, repla
 the host and port with the collector operator's values. The login defaults to
 `station_callsign`; if the collector assigned a different login, set
 `login_callsign` in this block to that callsign. The uplink is experimental (see
-[the MAN-90 record](../DECISIONS/2026-10-11-man90-uplink-protocol-verification.md));
+[the MAN-90 record](https://github.com/HagaleTechnologies/manta/blob/main/docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md));
 do not point it at an RBN server.
 
 ```toml
