@@ -1298,12 +1298,15 @@ mod tests {
             std::thread::sleep(timeout);
             Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"))
         }
-        // A budget below one reserve: each address gets an even share, so
-        // the first black hole cannot spend all of it.
+        // A budget below the reserves two later addresses would need: each
+        // address gets an even share (500 ms), so the first black hole
+        // cannot spend all of it. The share leaves room for the black holes'
+        // sleeps to overrun on a loaded runner; at 600 ms (200 ms shares) a
+        // macOS CI oversleep left the loopback attempt nothing.
         let got = uplink_probe(
             "h",
             port,
-            Duration::from_millis(600),
+            Duration::from_millis(1500),
             three,
             two_black_holes,
         );
