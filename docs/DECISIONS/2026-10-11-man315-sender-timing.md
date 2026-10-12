@@ -165,3 +165,20 @@ Run in the implement phase, 2026-10-12:
   ever promoted.
 - The first gap of a stream, before any class is learned, can still
   mis-split under ≥ 8 % jitter.
+- `edge-legacy` under heavy Farnsworth (Codex review, PR #273):
+  `check_flush_edge` has none of `check_flush`'s Farnsworth bookkeeping
+  (`observe_flushed`, `confirm_rebuilt`, the one-character-word closed
+  lengths for `reinit_from_flushed`; MAN-103 D8, MAN-264). At 18/5 to
+  30/12 WPM `edge-legacy` decodes every character as its own word for the
+  whole transmission, as it does on main, and at 20/8 to 30/12 WPM
+  `SenderTiming` learns those flushed ~14.5-dit character gaps as word
+  gaps, which is how the decoder classified them. Copying the bookkeeping
+  into `check_flush_edge` fixes the decode at all four speeds, but it
+  merges every later word in the cold-start inputs of
+  `legacy_pauses_after_one_char_words_do_not_merge_later_words` and
+  `legacy_one_char_words_after_a_false_rebuild_do_not_confirm_it` run
+  under `edge-legacy`, which decode correctly without it. Traced:
+  `edge-legacy`'s cold start classifies a 15-dit first gap, and with three
+  censored 7-dit flushed gaps the long-gap pair becomes Farnsworth-shaped.
+  That is no `reinit_from_flushed` rebuild, so the tail's 3-dit character
+  gaps do not undo it. Both need fixing together.
