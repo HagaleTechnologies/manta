@@ -140,6 +140,9 @@ pub struct TrackDecoder {
     sender_regime: u32,
     /// `sender.total_count()` at the last `TimingUpdate` (MAN-315 D8).
     last_timing_total: u64,
+    /// Cleared by `finish` for the space the stream ends inside: its length
+    /// is a truncation, not the sender's gap, so `observe_gap` skips it.
+    learn_gaps: bool,
     last_reported_wpm: Option<f32>,
     freq_hz: f64,
     hop_count: u64,
@@ -205,6 +208,7 @@ impl TrackDecoder {
             flushed_gap_ms: None,
             sender_regime: 0,
             last_timing_total: 0,
+            learn_gaps: true,
             last_reported_wpm: None,
             freq_hz: 0.0,
             hop_count: 0,
@@ -566,9 +570,8 @@ impl TrackDecoder {
         let mut events = Vec::new();
         match self.cfg.engine {
             Engine::Legacy => {
-                for run in self.demod.finish() {
-                    self.on_run(run, &mut events);
-                }
+                let runs = self.demod.finish();
+                self.finish_runs(runs, &mut events);
             }
             Engine::EdgeLegacy => {
                 for ev in self.evidence.flush() {
@@ -577,9 +580,8 @@ impl TrackDecoder {
                         self.on_run(run, &mut events);
                     }
                 }
-                for run in self.edge.finish() {
-                    self.on_run(run, &mut events);
-                }
+                let runs = self.edge.finish();
+                self.finish_runs(runs, &mut events);
             }
             Engine::Hsmm => {
                 // Codex review, PR #161 round 4: drain one hop at a time
@@ -627,6 +629,18 @@ impl TrackDecoder {
         self.flush_final_speed(&mut events);
         self.emit_timing(&mut events);
         events
+    }
+
+    /// Process the runs a demod's `finish` closed. The stream ends inside a
+    /// trailing space, so that space's length teaches the sender timing
+    /// nothing (MAN-315); it is still classified as before.
+    fn finish_runs(&mut self, runs: Vec<Run>, events: &mut Vec<DecoderEvent>) {
+        let last = runs.len().saturating_sub(1);
+        for (i, run) in runs.into_iter().enumerate() {
+            self.learn_gaps = !(i == last && !run.mark);
+            self.on_run(run, events);
+        }
+        self.learn_gaps = true;
     }
 
     /// Codex review on PR #154, round 7: a track closed via Merged/Evicted
@@ -786,6 +800,9 @@ impl TrackDecoder {
     /// D4). A word gap of pause length is not the sender's spacing and is
     /// not learned.
     fn observe_gap(&mut self, class: GapClass, dur_ms: f32) {
+        if !self.learn_gaps {
+            return;
+        }
         let unit = self.gap_unit_ms();
         let class = match class {
             GapClass::InterElement => TimingClass::ElementGap,
@@ -2303,6 +2320,18 @@ mod tests {
         assert!((2.6..=3.4).contains(&cg), "char gap {cg}");
         assert!(t.element_gap.is_some() && t.word_gap.is_some(), "{t:?}");
         assert!((t.dit_ms - 48.0).abs() < 5.0, "dit_ms {}", t.dit_ms);
+    }
+
+    /// MAN-315 review: the stream ends inside the trailing space, so its
+    /// cut-off length is not a word gap. An ideal 7-dit sender's learned
+    /// word gap stays at 7.0 with no spread (an 8-dit tail used to be
+    /// learned: mean 7.15, variance 0.13).
+    #[test]
+    fn trailing_space_at_finish_is_not_learned() {
+        let events = decode_events(Engine::Legacy, &rect_envelope("CQ CQ DE W1AW W1AW K", 18));
+        let wg = last_timing(&events).unwrap().word_gap.unwrap();
+        assert!((wg.mean_dits - 7.0).abs() < 0.1, "{wg:?}");
+        assert!(wg.var_dits2 < 0.01, "{wg:?}");
     }
 
     #[test]

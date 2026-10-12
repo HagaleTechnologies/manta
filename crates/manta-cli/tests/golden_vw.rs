@@ -257,6 +257,11 @@ fn vw2_long_gaps_keep_word_boundaries() {
 fn vw3_bug_key_decodes() {
     let (_, _, _, cer, timing) = decode_single(&manta_testkit::vectors::vw3());
     assert!(cer <= 0.08, "VW3 CER {cer} > 0.08");
+    // Not worse than the base decoder (measured 0.0349, MAN-315 decision doc).
+    assert!(
+        cer <= 0.035,
+        "VW3 CER {cer} worse than the base decoder's 0.0349"
+    );
     let dash = mean_dits(&timing, "dash");
     assert!(dash > 4.0, "VW3 learned dash {dash}");
 }
@@ -267,6 +272,11 @@ fn vw3_bug_key_decodes() {
 fn vw4_heavy_hand_key_decodes() {
     let (_, _, _, cer, _) = decode_single(&manta_testkit::vectors::vw4());
     assert!(cer <= 0.08, "VW4 CER {cer} > 0.08");
+    // Not worse than the base decoder (measured 0.0375, MAN-315 decision doc).
+    assert!(
+        cer <= 0.038,
+        "VW4 CER {cer} worse than the base decoder's 0.0375"
+    );
 }
 
 /// MAN-315 scenario 3: two senders three channels apart, one keyboard and

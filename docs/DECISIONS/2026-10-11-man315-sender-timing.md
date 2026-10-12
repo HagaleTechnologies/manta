@@ -68,11 +68,11 @@ climb far enough for real dits to fall below the boundary
 
 | vector | base CER | MAN-315 CER | learned timing (last `TimingUpdate`, dits) |
 |---|---|---|---|
-| VW1 heavy-dash | 0.5169 (dash/dot confusion past word 20) | 0.2034 (exact from word 9) | dash ≈ 4.06 |
+| VW1 heavy-dash | 0.5169 (dash/dot confusion past word 20) | 0.2034 (exact from word 9) | dot 0.95, dash 4.06 |
 | VW2 long-gaps | 0.0492 | 0.0410 | char gap 4.53, word gap 8.87 |
 | VW3 bug-key | 0.0349 | 0.0349 | dot 0.86, dash 4.80, element gap 1.18 |
 | VW4 heavy hand-key | 0.0375 | 0.0375 | dot 1.19, dash 3.38, element gap 0.85 |
-| VW5 A / B | 0.0193 / 0.0197 | 0.0193 / 0.0197 | A dash 2.96, char gap 3.15; B dash 4.13, char gap 4.46 |
+| VW5 A / B | 0.0193 / 0.0197 | 0.0193 / 0.0197 | A dash 2.96, char gap 3.00, word gap 7.00; B dash 4.13, char gap 4.50, word gap 9.14 |
 
 Base measured on commit `5346c33` with only the testkit's VW vectors added
 (a throwaway probe calling `decode_samples`); MAN-315 by `golden_vw.rs`.
@@ -138,9 +138,14 @@ Run in the implement phase, 2026-10-12:
   both the base and the MAN-315 decoder, so the test matches a track
   within half a channel (46.875 Hz) rather than the planned 15 Hz. Both
   decodes are exact; the offset is a frequency-estimate matter.
-- Ignored legacy-engine gates and the char-gap sweep: recorded in the PR
-  description from the implement-phase run (V2-CER, V5 and V8w ≥ 90 % are
-  bounded by the plan at ≤ 0.0244, ≤ 0.80 and ≥ 6/34).
+- Ignored legacy-engine gates (`-- --ignored --skip hsmm`), still failing
+  as before and not worse: V2-CER 0.0244 (base 0.0244), V5 0.7604 (base
+  0.750; bound 0.80), V8w ≥ 90 % 6/34 (base 6/34).
+  `char_gap_dits_failure_sweep_envelope` (ignored) passes.
+- Code review: the space a stream ends inside was learned as a word or
+  letter gap at `finish` (V1 reported word gap 7.82 ± 1.89 for an ideal
+  7-dit sender). `finish` now classifies that space without learning it
+  (`trailing_space_at_finish_is_not_learned`).
 
 ## Follow-ups
 
