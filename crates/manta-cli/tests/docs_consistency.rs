@@ -1529,7 +1529,8 @@ fn man90_runbook_writes_exact_byte_transcripts() {
 #[test]
 fn man90_runbook_consent_covers_every_connection_aggregator_has_open() {
     let runbook = doc(MAN90_RUNBOOK);
-    let consent = squash_whitespace(section(&runbook, "Asking for consent"));
+    // The request is a blockquote; drop the `>` markers before matching.
+    let consent = squash_whitespace(&section(&runbook, "Asking for consent").replace("\n>", "\n"));
     assert!(
         !consent.contains("traffic with RBN's servers")
             && !consent.contains("traffic with the RBN server"),
@@ -1539,7 +1540,10 @@ fn man90_runbook_consent_covers_every_connection_aggregator_has_open() {
         "every internet connection Aggregator has open while you record",
         "not only its connection to RBN",
     ] {
-        assert!(consent.contains(needle), "consent text never says `{needle}`");
+        assert!(
+            consent.contains(needle),
+            "consent text never says `{needle}`"
+        );
     }
 }
 
