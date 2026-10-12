@@ -11,6 +11,7 @@ pub mod dedupe;
 pub mod gate;
 pub mod grammar;
 pub mod notch;
+pub mod reference;
 pub mod scp;
 pub mod support;
 pub mod validator;

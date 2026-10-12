@@ -8,6 +8,7 @@ use crate::PipelineConfig;
 use anyhow::Result;
 use manta_decode::events::DecoderEvent;
 use manta_input::IqSource;
+use manta_spot::reference::ReferenceLists;
 use manta_spot::{Blocklist, NotchList, Validator};
 use num_complex::Complex32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -53,6 +54,14 @@ pub struct ListenObservers {
     /// running `Validator`. `None` (the default) skips the check
     /// entirely, so `listen()`'s existing callers pay nothing.
     pub operator_lists: Option<Arc<OperatorListsUpdate>>,
+    /// MAN-316: the country table and known-call set a scheduled list
+    /// refresh replaces. The running `Validator` takes their current tables
+    /// at the start (so the caller builds this from the same
+    /// `PipelineConfig`, `ReferenceLists::new(cfg.cty_table(),
+    /// cfg.scp_set())`) and again before the next decoder event after a
+    /// `store`. `None` (the default) skips the check entirely, so `listen()`'s
+    /// existing callers pay nothing.
+    pub reference_lists: Option<Arc<ReferenceLists>>,
 }
 
 /// MAN-78: the operator lists a live reload replaces, as one unit.
@@ -91,6 +100,50 @@ impl OperatorListsUpdate {
             return None;
         }
         self.next.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+/// MAN-316: the decode loop's view of `ListenObservers::reference_lists`:
+/// the generation of each list its validator already holds, so a `store`
+/// costs one table swap and an unchanged list costs two atomic loads per
+/// event.
+struct ReferenceWatch {
+    lists: Arc<ReferenceLists>,
+    seen_cty: u64,
+    seen_scp: u64,
+}
+
+impl ReferenceWatch {
+    /// Starts in step with `lists`: `validator` takes their current tables,
+    /// so a `store` made before `listen()` began is not missed.
+    fn new(lists: Arc<ReferenceLists>, validator: &mut Validator) -> Self {
+        let mut watch = Self {
+            lists,
+            seen_cty: 0,
+            seen_scp: 0,
+        };
+        watch.apply(validator);
+        watch
+    }
+
+    /// Hands `validator` the current tables if either list moved since the
+    /// last call.
+    fn sync(&mut self, validator: &mut Validator) {
+        if self.lists.cty.generation() != self.seen_cty
+            || self.lists.scp.generation() != self.seen_scp
+        {
+            self.apply(validator);
+        }
+    }
+
+    fn apply(&mut self, validator: &mut Validator) {
+        // Generations before values: a `store` landing in between leaves a
+        // generation behind its value, so the next `sync` swaps again rather
+        // than recording the new generation against the old table.
+        let (cty_gen, scp_gen) = (self.lists.cty.generation(), self.lists.scp.generation());
+        validator.replace_reference_tables(self.lists.cty.load(), Some(self.lists.scp.load()));
+        self.seen_cty = cty_gen;
+        self.seen_scp = scp_gen;
     }
 }
 
@@ -176,6 +229,7 @@ fn emit(
     events: Vec<DecoderEvent>,
     validator: &mut Validator,
     lists: Option<&OperatorListsUpdate>,
+    mut references: Option<&mut ReferenceWatch>,
     calibration_factor: f64,
     on_event: &mut impl FnMut(&DecoderEvent),
     on_spot: &mut impl FnMut(&crate::Spot),
@@ -186,6 +240,10 @@ fn emit(
         // and end-of-stream batches alike.
         if let Some(l) = lists.and_then(OperatorListsUpdate::take) {
             validator.replace_operator_lists(&l.allowlist, l.blocklist, l.notch);
+        }
+        // MAN-316: likewise for a list refresh's new cty/scp tables.
+        if let Some(watch) = references.as_deref_mut() {
+            watch.sync(validator);
         }
         on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
         for spot in validator.ingest(&ev) {
@@ -290,6 +348,10 @@ pub fn listen_with_observers(
     let center_freq_hz = src.center_freq_hz();
 
     let mut validator = cfg.validator(fs)?;
+    let mut references = observers
+        .reference_lists
+        .clone()
+        .map(|lists| ReferenceWatch::new(lists, &mut validator));
 
     // One relaxed store over a count that is a single filtered pass across
     // the (cap-bounded) track map, once per processed chunk and skipped
@@ -363,6 +425,7 @@ pub fn listen_with_observers(
         events,
         &mut validator,
         observers.operator_lists.as_deref(),
+        references.as_mut(),
         calibration_factor,
         &mut on_event,
         &mut on_spot,
@@ -378,6 +441,7 @@ pub fn listen_with_observers(
         events,
         &mut validator,
         observers.operator_lists.as_deref(),
+        references.as_mut(),
         calibration_factor,
         &mut on_event,
         &mut on_spot,
@@ -420,6 +484,7 @@ pub fn listen_with_observers(
                 finish_events,
                 &mut validator,
                 observers.operator_lists.as_deref(),
+                references.as_mut(),
                 calibration_factor,
                 &mut on_event,
                 &mut on_spot,
@@ -435,6 +500,7 @@ pub fn listen_with_observers(
                 events,
                 &mut validator,
                 observers.operator_lists.as_deref(),
+                references.as_mut(),
                 calibration_factor,
                 &mut on_event,
                 &mut on_spot,
@@ -455,6 +521,7 @@ pub fn listen_with_observers(
             events,
             &mut validator,
             observers.operator_lists.as_deref(),
+            references.as_mut(),
             calibration_factor,
             &mut on_event,
             &mut on_spot,
@@ -472,6 +539,7 @@ pub fn listen_with_observers(
         events,
         &mut validator,
         observers.operator_lists.as_deref(),
+        references.as_mut(),
         calibration_factor,
         &mut on_event,
         &mut on_spot,
@@ -1051,6 +1119,186 @@ mod tests {
         assert_eq!(control, vec![("W1AW".to_string(), total)]);
         let (spots, _) = fast_w1aw(60.0, Some(205_000), Some(total));
         assert!(spots.is_empty(), "got {spots:?}");
+    }
+
+    /// MAN-316: the bundled country table plus an entity for QQ9, which no
+    /// real `cty.dat` allocates.
+    fn cty_with_qq9() -> Arc<manta_spot::cty::Table> {
+        Arc::new(manta_spot::cty::Table::parse(&format!(
+            "{}Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n",
+            manta_spot::CTY_DAT
+        )))
+    }
+
+    fn bundled_reference_lists() -> Arc<ReferenceLists> {
+        Arc::new(ReferenceLists::new(
+            Arc::new(manta_spot::cty::Table::bundled()),
+            Arc::new(manta_spot::scp::Set::bundled()),
+        ))
+    }
+
+    /// Stores `cty_with_qq9()` from inside a read, including the EOF read:
+    /// `OfferingSource` for a list refresh.
+    struct StoringSource {
+        inner: FixedFreqSource,
+        lists: Arc<ReferenceLists>,
+        store_at: Option<u64>,
+        reads: Arc<AtomicU64>,
+    }
+
+    impl IqSource for StoringSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.sample_rate()
+        }
+
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz()
+        }
+
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            let k = self.reads.fetch_add(1, Ordering::Relaxed) + 1;
+            if self.store_at == Some(k) {
+                self.lists.cty.store(cty_with_qq9());
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    /// A V1-style scene sending `text` once at `wpm` for `seconds` (looped
+    /// when `loop_text`), through `listen_with_observers` with a
+    /// `ReferenceLists` observer that `StoringSource` stores `cty_with_qq9()`
+    /// into at read `store_at`. Returns the spots of calls under QQ9 (which
+    /// only `cty_with_qq9()` allocates), each with the reads made when it
+    /// came out, and the total reads. With `reference_lists` set, the
+    /// validator starts from the observer's tables.
+    fn qq9_spots(
+        seconds: f64,
+        wpm: f32,
+        text: &str,
+        loop_text: bool,
+        store_at: Option<u64>,
+    ) -> (Vec<(String, u64)>, u64) {
+        let mut spec = manta_testkit::vectors::v1();
+        spec.duration_s = seconds;
+        spec.signals[0].wpm = wpm;
+        spec.signals[0].text = text.into();
+        spec.signals[0].loop_text = loop_text;
+        let samples = manta_testkit::vectors::render(&spec).unwrap().samples;
+        let lists = bundled_reference_lists();
+        let reads = Arc::new(AtomicU64::new(0));
+        let src = StoringSource {
+            inner: FixedFreqSource {
+                samples,
+                cursor: 0,
+                fs: spec.fs,
+                center_freq_hz: spec.center_freq_hz,
+            },
+            lists: lists.clone(),
+            store_at,
+            reads: reads.clone(),
+        };
+        let mut cfg = PipelineConfig::default();
+        cfg.detector.warmup_hops = 0;
+        let mut spots = Vec::new();
+        listen_with_observers(
+            Box::new(src),
+            &cfg,
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                reference_lists: Some(lists),
+                ..Default::default()
+            },
+            |_| {},
+            |s| spots.push((s.callsign.clone(), reads.load(Ordering::Relaxed))),
+            |_| {},
+        )
+        .unwrap();
+        spots.retain(|(call, _)| call.starts_with("QQ9"));
+        (spots, reads.load(Ordering::Relaxed))
+    }
+
+    /// "CQ CQ DE QQ9ZZZ QQ9ZZZ K" looped for 10 s at 60 WPM: two
+    /// transmissions, so the repetition gate's second message (word 9) is
+    /// decoded in the steady-state loop, about read 360 of 377.
+    fn looped_qq9(store_at: Option<u64>) -> (Vec<(String, u64)>, u64) {
+        qq9_spots(10.0, 60.0, "CQ CQ DE QQ9ZZZ QQ9ZZZ K", true, store_at)
+    }
+
+    #[test]
+    fn reference_lists_swapped_mid_stream_apply_to_the_next_event() {
+        let (control, _) = looped_qq9(None);
+        assert!(
+            control.is_empty(),
+            "QQ9 is unallocated in the bundled table: {control:?}"
+        );
+        for k in [2, 40] {
+            let (spots, _) = looped_qq9(Some(k));
+            assert!(
+                spots.iter().any(|(call, _)| call == "QQ9ZZZ"),
+                "a store at read {k} must let QQ9ZZZ spot, got {spots:?}"
+            );
+            assert!(
+                spots.iter().all(|(_, read)| *read >= k),
+                "no spot may come out before the store at read {k}: {spots:?}"
+            );
+        }
+    }
+
+    /// MAN-78 remediate-9 timing, for a list refresh: "V DE QQ9E K DE QQ9E
+    /// K" sent once at 72 WPM puts the first QQ9E in the two-second
+    /// calibration buffer (read 1) and the confirming one in the steady
+    /// state. A store during the calibration read reaches the calibration
+    /// buffer's events, so the first QQ9E counts and the second spots; a
+    /// store one read later misses it, leaving one occurrence and no spot.
+    #[test]
+    fn reference_lists_stored_during_calibration_apply_to_the_calibration_buffer() {
+        let scene = |store_at| qq9_spots(4.0, 72.0, "V DE QQ9E K DE QQ9E K", false, store_at);
+        let (control, _) = scene(None);
+        assert!(control.is_empty(), "got {control:?}");
+        let (spots, _) = scene(Some(1));
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].0, "QQ9E");
+        let (late, _) = scene(Some(2));
+        assert!(
+            late.is_empty(),
+            "a store after the calibration buffer was evaluated must miss its QQ9E, got {late:?}"
+        );
+    }
+
+    /// V7 through `listen_with_observers`, with `observers`; every spot's
+    /// `Debug` rendering, so any field that moved shows.
+    fn v7_spot_records(observers: ListenObservers) -> Vec<String> {
+        let spec = manta_testkit::vectors::v7();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let mut spots = Vec::new();
+        listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            observers,
+            |_| {},
+            |spot| spots.push(format!("{spot:?}")),
+            |_| {},
+        )
+        .unwrap();
+        spots
+    }
+
+    #[test]
+    fn no_reference_lists_observer_is_byte_identical() {
+        let without = v7_spot_records(ListenObservers::default());
+        assert!(!without.is_empty(), "V7 must spot something");
+        let with = v7_spot_records(ListenObservers {
+            reference_lists: Some(bundled_reference_lists()),
+            ..Default::default()
+        });
+        assert_eq!(with, without);
     }
 
     /// MAN-78: lists offered mid-run reach the live validator before a

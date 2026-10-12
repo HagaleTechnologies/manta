@@ -712,6 +712,42 @@ blocklist_path = \"bl.txt\"
         );
     }
 
+    /// MAN-316: the refresher starts once, at `run`'s startup, so its keys
+    /// and the pins need a restart; the operator lists still reload.
+    #[test]
+    fn restart_only_changes_reports_refresh_keys() {
+        let pin = "e9ff91a3c3ab28c5f7dbcffb4280944a84645ed53d41cb4c68a41f132ee13fd1";
+        let old = table("[spot]\nrefresh_lists = false\nallowlist = [\"A\"]\n");
+        let new = table(&format!(
+            "[spot]\nrefresh_lists = true\nallowlist = [\"B\"]\n\
+             list_cache_dir = \"/var/cache/manta\"\ncty_url = \"http://mirror.lan/cty.dat\"\n\
+             scp_url = \"http://mirror.lan/MASTER.SCP\"\ncty_sha256 = \"{pin}\"\n\
+             scp_sha256 = \"{pin}\"\n"
+        ));
+        assert_eq!(
+            restart_only_changes(&old, &new),
+            vec![
+                "spot.cty_sha256",
+                "spot.cty_url",
+                "spot.list_cache_dir",
+                "spot.refresh_lists",
+                "spot.scp_sha256",
+                "spot.scp_url",
+            ]
+        );
+        for key in [
+            "refresh_lists",
+            "list_cache_dir",
+            "cty_url",
+            "scp_url",
+            "cty_sha256",
+            "scp_sha256",
+        ] {
+            assert!(!is_reloadable(&format!("spot.{key}")), "{key}");
+        }
+        assert!(is_reloadable("spot.allowlist"));
+    }
+
     #[test]
     fn restart_only_changes_reports_a_spot_table_appearing_with_cty_path() {
         let new = table("[spot]\nallowlist = [\"K1A\"]\ncty_path = \"/a/cty.dat\"\n");
