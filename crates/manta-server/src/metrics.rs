@@ -14,7 +14,7 @@ use manta_spot::SpotType;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Rolling window over which "recent" reconnects are counted (MAN-44).
@@ -534,6 +534,300 @@ pub struct Metrics {
     /// MAN-128: the decode loop's own liveness, as last observed by the
     /// daemon wiring layer -- see `crate::health::DecodeWatch`.
     decode_watch: Mutex<DecodeWatch>,
+    /// MAN-301: set once by `enable_rbn_compare`; `None` renders no
+    /// `manta_rbn_compare_*` family at all.
+    rbn_compare: OnceLock<RbnCompareMetrics>,
+}
+
+/// MAN-301: the trailing window `manta_rbn_compare_*_last_hour` gauges and
+/// the per-band median frequency offset cover, measured from each grade's
+/// emission time.
+pub const GRADE_WINDOW: Duration = Duration::from_secs(3600);
+/// Hard cap on retained grade timestamps per `(band, grade)`,
+/// `(band, kind)` or per-band offset key. A node grading far faster than
+/// the window would otherwise grow these unbounded; the cumulative
+/// `manta_rbn_compare_grades_total` counter stays exact regardless, only
+/// the last-hour gauges saturate. 20,000 per key is well over any real
+/// band's hourly spot rate. Same bounded-cardinality discipline as
+/// `MAX_TRACKED_RECONNECTS` and MAN-62's `OccurrenceTracker`.
+const MAX_RECENT_GRADES: usize = 20_000;
+
+fn grade_label(g: crate::rbn_compare::grade::Grade) -> &'static str {
+    use crate::rbn_compare::grade::Grade;
+    match g {
+        Grade::Match => "match",
+        Grade::Disagree => "disagree",
+        Grade::Elsewhere => "elsewhere",
+        Grade::None => "none",
+        Grade::Unknown => "unknown",
+    }
+}
+
+fn disagreement_label(d: crate::rbn_compare::grade::Disagreement) -> &'static str {
+    use crate::rbn_compare::grade::Disagreement;
+    match d {
+        Disagreement::Frequency => "frequency",
+        Disagreement::Speed => "speed",
+    }
+}
+
+fn push_bounded<T>(ring: &mut VecDeque<T>, item: T) {
+    if ring.len() == MAX_RECENT_GRADES {
+        ring.pop_front();
+    }
+    ring.push_back(item);
+}
+
+fn grade_expired(at: Instant, now: Instant) -> bool {
+    // saturating: a synthetic `now` earlier than an entry (only from a
+    // test driving `_at` out of order) must not panic.
+    now.saturating_duration_since(at) > GRADE_WINDOW
+}
+
+/// MAN-301 per-grade bookkeeping, one lock for all of it so a scrape sees
+/// one consistent set.
+#[derive(Default)]
+struct RbnGradeBook {
+    total: BTreeMap<(&'static str, &'static str), u64>,
+    recent: BTreeMap<(&'static str, &'static str), VecDeque<Instant>>,
+    disagreements: BTreeMap<(&'static str, &'static str), VecDeque<Instant>>,
+    offsets: BTreeMap<&'static str, VecDeque<(Instant, i64)>>,
+}
+
+impl RbnGradeBook {
+    fn prune(&mut self, now: Instant) {
+        for ring in self
+            .recent
+            .values_mut()
+            .chain(self.disagreements.values_mut())
+        {
+            while ring.front().is_some_and(|at| grade_expired(*at, now)) {
+                ring.pop_front();
+            }
+        }
+        for ring in self.offsets.values_mut() {
+            while ring.front().is_some_and(|(at, _)| grade_expired(*at, now)) {
+                ring.pop_front();
+            }
+        }
+    }
+}
+
+/// MAN-301: the `manta_rbn_compare_*` families. Present on `Metrics` only
+/// once `enable_rbn_compare` has run, so a node without `[rbn_compare]`
+/// renders none of them.
+#[derive(Default)]
+struct RbnCompareMetrics {
+    grades: Mutex<RbnGradeBook>,
+    feed_connected: AtomicBool,
+    feed_reports_total: AtomicU64,
+    feed_reconnects_total: AtomicU64,
+    pending: AtomicU64,
+    ungraded_total: AtomicU64,
+}
+
+fn median_of(values: &mut [i64]) -> f64 {
+    values.sort_unstable();
+    let n = values.len();
+    if n % 2 == 1 {
+        values[n / 2] as f64
+    } else {
+        (values[n / 2 - 1] as f64 + values[n / 2] as f64) / 2.0
+    }
+}
+
+/// MAN-301: the live comparator's metrics. Every method is a no-op until
+/// `enable_rbn_compare` has been called.
+impl Metrics {
+    pub fn enable_rbn_compare(&self) {
+        let _ = self.rbn_compare.set(RbnCompareMetrics::default());
+    }
+
+    pub fn record_rbn_grade(&self, grade: &crate::rbn_compare::grade::SpotGrade) {
+        self.record_rbn_grade_at(grade, Instant::now());
+    }
+
+    pub fn record_rbn_grade_at(&self, grade: &crate::rbn_compare::grade::SpotGrade, now: Instant) {
+        use crate::rbn_compare::grade::Grade;
+        let Some(rc) = self.rbn_compare.get() else {
+            return;
+        };
+        let band = grade.band;
+        let label = grade_label(grade.grade);
+        let mut book = rc.grades.lock().expect("rbn_compare grades lock poisoned");
+        *book.total.entry((band, label)).or_insert(0) += 1;
+        push_bounded(book.recent.entry((band, label)).or_default(), now);
+        if grade.grade == Grade::Disagree {
+            let mut kinds: Vec<&'static str> = grade
+                .disagreements
+                .iter()
+                .map(|d| disagreement_label(*d))
+                .collect();
+            kinds.sort_unstable();
+            kinds.dedup();
+            for kind in kinds {
+                push_bounded(book.disagreements.entry((band, kind)).or_default(), now);
+            }
+        }
+        if matches!(grade.grade, Grade::Match | Grade::Disagree) {
+            if let Some(offset) = grade.freq_offset_hz {
+                push_bounded(book.offsets.entry(band).or_default(), (now, offset));
+            }
+        }
+    }
+
+    pub fn set_rbn_feed_connected(&self, connected: bool) {
+        if let Some(rc) = self.rbn_compare.get() {
+            rc.feed_connected.store(connected, Ordering::Relaxed);
+        }
+    }
+
+    pub fn inc_rbn_feed_reports(&self) {
+        if let Some(rc) = self.rbn_compare.get() {
+            rc.feed_reports_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn inc_rbn_feed_reconnects(&self) {
+        if let Some(rc) = self.rbn_compare.get() {
+            rc.feed_reconnects_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn set_rbn_pending(&self, pending: usize) {
+        if let Some(rc) = self.rbn_compare.get() {
+            rc.pending.store(pending as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn add_rbn_ungraded(&self, n: u64) {
+        if let Some(rc) = self.rbn_compare.get() {
+            rc.ungraded_total.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    fn render_rbn_compare_at(&self, out: &mut String, now: Instant) {
+        let Some(rc) = self.rbn_compare.get() else {
+            return;
+        };
+        let mut book = rc.grades.lock().expect("rbn_compare grades lock poisoned");
+        book.prune(now);
+
+        out.push_str(
+            "# HELP manta_rbn_compare_grades_total Spots graded against the RBN feed since start, by the spot's band and grade.\n",
+        );
+        out.push_str("# TYPE manta_rbn_compare_grades_total counter\n");
+        for ((band, grade), count) in book.total.iter() {
+            out.push_str(&format!(
+                "manta_rbn_compare_grades_total{{band=\"{band}\",grade=\"{grade}\"}} {count}\n"
+            ));
+        }
+
+        out.push_str(&format!(
+            "# HELP manta_rbn_compare_grades_last_hour Spots graded against the RBN feed in the last {} s, by the spot's band and grade.\n",
+            GRADE_WINDOW.as_secs()
+        ));
+        out.push_str("# TYPE manta_rbn_compare_grades_last_hour gauge\n");
+        for ((band, grade), ring) in book.recent.iter() {
+            out.push_str(&format!(
+                "manta_rbn_compare_grades_last_hour{{band=\"{band}\",grade=\"{grade}\"}} {}\n",
+                ring.len()
+            ));
+        }
+
+        out.push_str(&format!(
+            "# HELP manta_rbn_compare_disagreements_last_hour Spots graded disagree in the last {} s, by band and the tolerance that failed (frequency or speed); a spot failing both counts under each.\n",
+            GRADE_WINDOW.as_secs()
+        ));
+        out.push_str("# TYPE manta_rbn_compare_disagreements_last_hour gauge\n");
+        for ((band, kind), ring) in book.disagreements.iter() {
+            out.push_str(&format!(
+                "manta_rbn_compare_disagreements_last_hour{{band=\"{band}\",kind=\"{kind}\"}} {}\n",
+                ring.len()
+            ));
+        }
+
+        let medians: Vec<(&'static str, f64, usize)> = book
+            .offsets
+            .iter()
+            .filter(|(_, ring)| !ring.is_empty())
+            .map(|(band, ring)| {
+                let mut values: Vec<i64> = ring.iter().map(|(_, o)| *o).collect();
+                (*band, median_of(&mut values), values.len())
+            })
+            .collect();
+        drop(book);
+
+        out.push_str(&format!(
+            "# HELP manta_rbn_compare_freq_offset_median_hz Median of manta's frequency minus RBN's modal frequency, in Hz, over spots graded match or disagree in the last {} s.\n",
+            GRADE_WINDOW.as_secs()
+        ));
+        out.push_str("# TYPE manta_rbn_compare_freq_offset_median_hz gauge\n");
+        for (band, median, _) in medians.iter() {
+            out.push_str(&format!(
+                "manta_rbn_compare_freq_offset_median_hz{{band=\"{band}\"}} {median}\n"
+            ));
+        }
+
+        out.push_str(
+            "# HELP manta_rbn_compare_freq_offset_samples Spots the median frequency offset is computed over.\n",
+        );
+        out.push_str("# TYPE manta_rbn_compare_freq_offset_samples gauge\n");
+        for (band, _, samples) in medians.iter() {
+            out.push_str(&format!(
+                "manta_rbn_compare_freq_offset_samples{{band=\"{band}\"}} {samples}\n"
+            ));
+        }
+
+        out.push_str(
+            "# HELP manta_rbn_compare_feed_connected Whether the RBN feed is logged in and delivering lines.\n",
+        );
+        out.push_str("# TYPE manta_rbn_compare_feed_connected gauge\n");
+        out.push_str(&format!(
+            "manta_rbn_compare_feed_connected {}\n",
+            if rc.feed_connected.load(Ordering::Relaxed) {
+                1
+            } else {
+                0
+            }
+        ));
+
+        out.push_str(
+            "# HELP manta_rbn_compare_feed_reports_total CW reports accepted from the RBN feed.\n",
+        );
+        out.push_str("# TYPE manta_rbn_compare_feed_reports_total counter\n");
+        out.push_str(&format!(
+            "manta_rbn_compare_feed_reports_total {}\n",
+            rc.feed_reports_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP manta_rbn_compare_feed_reconnects_total RBN feed connections lost or failed.\n",
+        );
+        out.push_str("# TYPE manta_rbn_compare_feed_reconnects_total counter\n");
+        out.push_str(&format!(
+            "manta_rbn_compare_feed_reconnects_total {}\n",
+            rc.feed_reconnects_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP manta_rbn_compare_pending Spots waiting for their RBN comparison window to close.\n",
+        );
+        out.push_str("# TYPE manta_rbn_compare_pending gauge\n");
+        out.push_str(&format!(
+            "manta_rbn_compare_pending {}\n",
+            rc.pending.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP manta_rbn_compare_ungraded_total Spots never graded: the pending queue was full, or the comparator lagged the spot bus.\n",
+        );
+        out.push_str("# TYPE manta_rbn_compare_ungraded_total counter\n");
+        out.push_str(&format!(
+            "manta_rbn_compare_ungraded_total {}\n",
+            rc.ungraded_total.load(Ordering::Relaxed)
+        ));
+    }
 }
 
 impl Metrics {
@@ -1070,7 +1364,7 @@ impl Metrics {
         }
 
         out.push_str(
-            "# HELP manta_spots_dropped_lagged_total Spots dropped because a slow client fell behind and was disconnected.\n",
+            "# HELP manta_spots_dropped_lagged_total Spots (with [rbn_compare], spot grades too) dropped because a slow client fell behind and was disconnected.\n",
         );
         out.push_str("# TYPE manta_spots_dropped_lagged_total counter\n");
         out.push_str(&format!(
@@ -1089,7 +1383,7 @@ impl Metrics {
         ));
 
         out.push_str(
-            "# HELP manta_spots_dropped_write_failed_total Spots dropped because a client's socket write timed out or failed before a lag/close error was observed.\n",
+            "# HELP manta_spots_dropped_write_failed_total Spots (with [rbn_compare], spot grades too) dropped because a client's socket write timed out or failed before a lag/close error was observed.\n",
         );
         out.push_str("# TYPE manta_spots_dropped_write_failed_total counter\n");
         out.push_str(&format!(
@@ -1099,7 +1393,7 @@ impl Metrics {
         ));
 
         out.push_str(
-            "# HELP manta_spots_dropped_shutdown_total Spots abandoned because the daemon shut down while a client was still in its pre-login/handshake phase, before any socket write timed out or failed.\n",
+            "# HELP manta_spots_dropped_shutdown_total Spots (with [rbn_compare], spot grades too) abandoned because the daemon shut down while a client was still in its pre-login/handshake phase, before any socket write timed out or failed.\n",
         );
         out.push_str("# TYPE manta_spots_dropped_shutdown_total counter\n");
         out.push_str(&format!(
@@ -1523,6 +1817,8 @@ impl Metrics {
                 if *up { 1 } else { 0 }
             ));
         }
+
+        self.render_rbn_compare_at(&mut out, Instant::now());
 
         out
     }
@@ -2586,6 +2882,381 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(
             text.contains(r#"manta_uplink_target_recent_reconnects{target="a.example:7000"} 2"#)
+        );
+    }
+
+    // ---- MAN-301: manta_rbn_compare_* ----
+
+    use crate::rbn_compare::grade::{Disagreement, Grade, SpotGrade};
+
+    fn spot_grade(band: &'static str, grade: Grade, offset: Option<i64>) -> SpotGrade {
+        SpotGrade {
+            kind: "spotGrade",
+            spot_id: "W3XYZ-1:1:1:1:W1AW".to_string(),
+            call: "W1AW".to_string(),
+            band,
+            spot_time: 1_791_720_000,
+            window_close: 1_791_720_180,
+            window_s: 180,
+            grade,
+            disagreements: Vec::new(),
+            manta_freq_hz: 14_025_100,
+            manta_wpm: Some(25),
+            rbn_modal_freq_hz: offset.map(|o| 14_025_100 - o),
+            rbn_median_wpm: offset.map(|_| 24.0),
+            rbn_skimmers: u32::from(offset.is_some()),
+            rbn_reports: u32::from(offset.is_some()),
+            freq_offset_hz: offset,
+            rbn_bands: Vec::new(),
+            spotter_filter: Vec::new(),
+        }
+    }
+
+    fn rbn_line_value(text: &str, series: &str) -> Option<String> {
+        text.lines().find_map(|l| {
+            l.strip_prefix(series)?
+                .strip_prefix(' ')
+                .map(str::to_string)
+        })
+    }
+
+    #[test]
+    fn rbn_compare_families_absent_until_enabled() {
+        let m = Metrics::new();
+        m.record_rbn_grade(&spot_grade("20m", Grade::Match, Some(40)));
+        m.set_rbn_feed_connected(true);
+        m.inc_rbn_feed_reports();
+        m.inc_rbn_feed_reconnects();
+        m.set_rbn_pending(3);
+        m.add_rbn_ungraded(2);
+        assert!(
+            !m.render_prometheus_text().contains("manta_rbn_compare_"),
+            "no rbn_compare family before enable_rbn_compare"
+        );
+
+        m.enable_rbn_compare();
+        let text = m.render_prometheus_text();
+        for family in [
+            "manta_rbn_compare_grades_total",
+            "manta_rbn_compare_grades_last_hour",
+            "manta_rbn_compare_disagreements_last_hour",
+            "manta_rbn_compare_freq_offset_median_hz",
+            "manta_rbn_compare_freq_offset_samples",
+            "manta_rbn_compare_feed_connected",
+            "manta_rbn_compare_feed_reports_total",
+            "manta_rbn_compare_feed_reconnects_total",
+            "manta_rbn_compare_pending",
+            "manta_rbn_compare_ungraded_total",
+        ] {
+            assert!(text.contains(&format!("# TYPE {family} ")), "{family}");
+        }
+        // Calls made before enabling were not recorded.
+        assert_eq!(
+            rbn_line_value(&text, "manta_rbn_compare_feed_reports_total").as_deref(),
+            Some("0")
+        );
+        assert!(!text.contains("manta_rbn_compare_grades_total{"));
+    }
+
+    #[test]
+    fn hundred_grades_render_per_band_last_hour_counts() {
+        let m = Metrics::new();
+        m.enable_rbn_compare();
+        let t0 = Instant::now();
+        let plan = [
+            ("20m", Grade::Match, 52),
+            ("20m", Grade::Disagree, 6),
+            ("20m", Grade::Elsewhere, 2),
+            ("20m", Grade::None, 9),
+            ("40m", Grade::Match, 23),
+            ("40m", Grade::None, 8),
+        ];
+        for (band, grade, n) in plan {
+            for _ in 0..n {
+                m.record_rbn_grade_at(&spot_grade(band, grade, Some(0)), t0);
+            }
+        }
+        let mut out = String::new();
+        m.render_rbn_compare_at(&mut out, t0 + Duration::from_secs(10));
+
+        let mut last_hour_sum = 0u64;
+        let mut total_sum = 0u64;
+        for (band, grade, n) in plan {
+            let label = grade_label(grade);
+            let last = rbn_line_value(
+                &out,
+                &format!("manta_rbn_compare_grades_last_hour{{band=\"{band}\",grade=\"{label}\"}}"),
+            )
+            .unwrap_or_else(|| panic!("{band}/{label} missing:\n{out}"));
+            assert_eq!(last, n.to_string(), "{band}/{label}");
+            last_hour_sum += last.parse::<u64>().unwrap();
+            let total = rbn_line_value(
+                &out,
+                &format!("manta_rbn_compare_grades_total{{band=\"{band}\",grade=\"{label}\"}}"),
+            )
+            .unwrap();
+            assert_eq!(total, n.to_string(), "{band}/{label} total");
+            total_sum += total.parse::<u64>().unwrap();
+        }
+        assert_eq!(last_hour_sum, 100);
+        assert_eq!(total_sum, 100);
+        assert_eq!(
+            out.lines()
+                .filter(|l| l.starts_with("manta_rbn_compare_grades_last_hour{"))
+                .count(),
+            6
+        );
+    }
+
+    #[test]
+    fn grades_older_than_an_hour_leave_the_last_hour_gauge_but_not_the_total() {
+        let m = Metrics::new();
+        m.enable_rbn_compare();
+        let t0 = Instant::now();
+        m.record_rbn_grade_at(&spot_grade("20m", Grade::Match, Some(10)), t0);
+        m.record_rbn_grade_at(
+            &spot_grade("20m", Grade::Match, Some(30)),
+            t0 + Duration::from_secs(1800),
+        );
+
+        let mut out = String::new();
+        m.render_rbn_compare_at(&mut out, t0 + GRADE_WINDOW + Duration::from_secs(1));
+        assert_eq!(
+            rbn_line_value(
+                &out,
+                r#"manta_rbn_compare_grades_last_hour{band="20m",grade="match"}"#
+            )
+            .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            rbn_line_value(
+                &out,
+                r#"manta_rbn_compare_grades_total{band="20m",grade="match"}"#
+            )
+            .as_deref(),
+            Some("2")
+        );
+        // The expired grade left the median too.
+        assert_eq!(
+            rbn_line_value(
+                &out,
+                r#"manta_rbn_compare_freq_offset_median_hz{band="20m"}"#
+            )
+            .as_deref(),
+            Some("30")
+        );
+        assert_eq!(
+            rbn_line_value(&out, r#"manta_rbn_compare_freq_offset_samples{band="20m"}"#).as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn last_hour_series_stays_at_zero_once_seen() {
+        let m = Metrics::new();
+        m.enable_rbn_compare();
+        let t0 = Instant::now();
+        let mut g = spot_grade("40m", Grade::Disagree, Some(900));
+        g.disagreements = vec![Disagreement::Frequency];
+        m.record_rbn_grade_at(&g, t0);
+
+        let mut out = String::new();
+        m.render_rbn_compare_at(&mut out, t0 + GRADE_WINDOW * 2);
+        assert_eq!(
+            rbn_line_value(
+                &out,
+                r#"manta_rbn_compare_grades_last_hour{band="40m",grade="disagree"}"#
+            )
+            .as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            rbn_line_value(
+                &out,
+                r#"manta_rbn_compare_disagreements_last_hour{band="40m",kind="frequency"}"#
+            )
+            .as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            rbn_line_value(
+                &out,
+                r#"manta_rbn_compare_grades_total{band="40m",grade="disagree"}"#
+            )
+            .as_deref(),
+            Some("1")
+        );
+        // A median over no grades is absent, not zero.
+        assert!(!out.contains(r#"manta_rbn_compare_freq_offset_median_hz{band="40m"}"#));
+        assert!(!out.contains(r#"manta_rbn_compare_freq_offset_samples{band="40m"}"#));
+    }
+
+    #[test]
+    fn median_offset_is_per_band_over_match_and_disagree_only() {
+        let m = Metrics::new();
+        m.enable_rbn_compare();
+        let t0 = Instant::now();
+        // 20m, odd count over match + disagree: {-10, 40, 50} -> 40.
+        m.record_rbn_grade_at(&spot_grade("20m", Grade::Match, Some(50)), t0);
+        m.record_rbn_grade_at(&spot_grade("20m", Grade::Match, Some(-10)), t0);
+        let mut d = spot_grade("20m", Grade::Disagree, Some(40));
+        d.disagreements = vec![Disagreement::Speed];
+        m.record_rbn_grade_at(&d, t0);
+        // Offsets carried by other grades never count.
+        m.record_rbn_grade_at(&spot_grade("20m", Grade::Elsewhere, Some(9_999)), t0);
+        m.record_rbn_grade_at(&spot_grade("20m", Grade::Unknown, Some(-9_999)), t0);
+        // 40m, even count: {-30, -20, -10, 15} -> -15.
+        for o in [-20, -10, 15, -30] {
+            m.record_rbn_grade_at(&spot_grade("40m", Grade::Match, Some(o)), t0);
+        }
+        // 80m: only `none` grades -> no median.
+        m.record_rbn_grade_at(&spot_grade("80m", Grade::None, None), t0);
+        // 15m, even count with a half-Hz median: {10, 11} -> 10.5.
+        m.record_rbn_grade_at(&spot_grade("15m", Grade::Match, Some(11)), t0);
+        m.record_rbn_grade_at(&spot_grade("15m", Grade::Match, Some(10)), t0);
+
+        let mut out = String::new();
+        m.render_rbn_compare_at(&mut out, t0);
+        let median = |band: &str| {
+            rbn_line_value(
+                &out,
+                &format!("manta_rbn_compare_freq_offset_median_hz{{band=\"{band}\"}}"),
+            )
+        };
+        let samples = |band: &str| {
+            rbn_line_value(
+                &out,
+                &format!("manta_rbn_compare_freq_offset_samples{{band=\"{band}\"}}"),
+            )
+        };
+        assert_eq!(median("20m").as_deref(), Some("40"));
+        assert_eq!(samples("20m").as_deref(), Some("3"));
+        assert_eq!(median("40m").as_deref(), Some("-15"));
+        assert_eq!(samples("40m").as_deref(), Some("4"));
+        assert_eq!(median("15m").as_deref(), Some("10.5"));
+        assert_eq!(samples("15m").as_deref(), Some("2"));
+        assert_eq!(median("80m"), None);
+        assert_eq!(samples("80m"), None);
+    }
+
+    #[test]
+    fn disagreement_kinds_count_separately() {
+        let m = Metrics::new();
+        m.enable_rbn_compare();
+        let t0 = Instant::now();
+        let mut both = spot_grade("20m", Grade::Disagree, Some(1400));
+        both.disagreements = vec![Disagreement::Frequency, Disagreement::Speed];
+        m.record_rbn_grade_at(&both, t0);
+        let mut speed = spot_grade("20m", Grade::Disagree, Some(0));
+        speed.disagreements = vec![Disagreement::Speed];
+        m.record_rbn_grade_at(&speed, t0);
+
+        let mut out = String::new();
+        m.render_rbn_compare_at(&mut out, t0);
+        assert_eq!(
+            rbn_line_value(
+                &out,
+                r#"manta_rbn_compare_disagreements_last_hour{band="20m",kind="frequency"}"#
+            )
+            .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            rbn_line_value(
+                &out,
+                r#"manta_rbn_compare_disagreements_last_hour{band="20m",kind="speed"}"#
+            )
+            .as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            rbn_line_value(
+                &out,
+                r#"manta_rbn_compare_grades_last_hour{band="20m",grade="disagree"}"#
+            )
+            .as_deref(),
+            Some("2"),
+            "one spot with both kinds is still one disagree grade"
+        );
+    }
+
+    #[test]
+    fn recent_rings_are_bounded() {
+        let m = Metrics::new();
+        m.enable_rbn_compare();
+        let t0 = Instant::now();
+        let mut g = spot_grade("20m", Grade::Disagree, Some(5));
+        g.disagreements = vec![Disagreement::Frequency];
+        for _ in 0..(MAX_RECENT_GRADES + 50) {
+            m.record_rbn_grade_at(&g, t0);
+        }
+        {
+            let rc = m.rbn_compare.get().unwrap();
+            let book = rc.grades.lock().unwrap();
+            assert_eq!(book.recent[&("20m", "disagree")].len(), MAX_RECENT_GRADES);
+            assert_eq!(
+                book.disagreements[&("20m", "frequency")].len(),
+                MAX_RECENT_GRADES
+            );
+            assert_eq!(book.offsets["20m"].len(), MAX_RECENT_GRADES);
+        }
+        let mut out = String::new();
+        m.render_rbn_compare_at(&mut out, t0);
+        assert_eq!(
+            rbn_line_value(
+                &out,
+                r#"manta_rbn_compare_grades_total{band="20m",grade="disagree"}"#
+            ),
+            Some((MAX_RECENT_GRADES + 50).to_string()),
+            "the cumulative counter stays exact past the cap"
+        );
+    }
+
+    #[test]
+    fn feed_and_pending_gauges_render() {
+        let m = Metrics::new();
+        m.enable_rbn_compare();
+        let text = m.render_prometheus_text();
+        assert_eq!(
+            rbn_line_value(&text, "manta_rbn_compare_feed_connected").as_deref(),
+            Some("0")
+        );
+
+        m.set_rbn_feed_connected(true);
+        for _ in 0..7 {
+            m.inc_rbn_feed_reports();
+        }
+        m.inc_rbn_feed_reconnects();
+        m.inc_rbn_feed_reconnects();
+        m.set_rbn_pending(12);
+        m.add_rbn_ungraded(3);
+        m.add_rbn_ungraded(4);
+        let text = m.render_prometheus_text();
+        for (series, value) in [
+            ("manta_rbn_compare_feed_connected", "1"),
+            ("manta_rbn_compare_feed_reports_total", "7"),
+            ("manta_rbn_compare_feed_reconnects_total", "2"),
+            ("manta_rbn_compare_pending", "12"),
+            ("manta_rbn_compare_ungraded_total", "7"),
+        ] {
+            assert_eq!(
+                rbn_line_value(&text, series).as_deref(),
+                Some(value),
+                "{series}"
+            );
+        }
+
+        m.set_rbn_feed_connected(false);
+        m.set_rbn_pending(0);
+        let text = m.render_prometheus_text();
+        assert_eq!(
+            rbn_line_value(&text, "manta_rbn_compare_feed_connected").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            rbn_line_value(&text, "manta_rbn_compare_pending").as_deref(),
+            Some("0")
         );
     }
 

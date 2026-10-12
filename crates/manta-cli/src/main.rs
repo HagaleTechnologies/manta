@@ -18,6 +18,7 @@ mod config_edit;
 mod devices;
 mod doctor_checks;
 mod fmt;
+mod grade_cmd;
 mod health_cmd;
 mod logging;
 mod reconnect;
@@ -413,6 +414,8 @@ enum Command {
         engine: Option<Engine>,
         #[command(flatten)]
         filters: FilterOpts,
+        #[command(flatten)]
+        rbn: RbnCompareOpts,
         #[command(flatten)]
         logging: logging::LogOpts,
     },
@@ -983,6 +986,18 @@ enum Command {
     /// Measure decode quality on synthetic signals, no radio needed.
     #[command(subcommand)]
     Bench(BenchCommand),
+    /// Grade a node's spot log against RBN reports, offline.
+    ///
+    /// Reads SpotMessage JSON Lines (the `field-node.py record-spots`
+    /// archive) and RBN daily-dump CSVs, and grades every spot the way
+    /// `[rbn_compare]` grades it live: match, disagree, elsewhere, none or
+    /// unknown. Prints a per-band summary, or the grade records with
+    /// --json. Never reads MANTA_* variables: the output depends only on
+    /// the inputs and flags.
+    Grade {
+        #[command(flatten)]
+        args: grade_cmd::Args,
+    },
 }
 
 // MAN-116: `manta bench sensitivity`; see bench.rs and
@@ -1045,6 +1060,36 @@ enum ConfigCommand {
 //   - allowlist: the Operator Watch List of ARCHITECTURE §6 / MAN-28.
 //     Legacy precedent: CW Skimmer's Watch List (Aggregator manual App. A2).
 //   - blocklist / notch: MAN-31. cty / scp: MAN-79.
+/// MAN-301: `run`'s live RBN comparison flags, merged over
+/// `[rbn_compare]` in `resolve`.
+#[derive(clap::Args, Clone, Debug, Default)]
+#[command(next_help_heading = "RBN comparison")]
+struct RbnCompareOpts {
+    // `help`, not a doc comment: clap drops a one-paragraph doc comment's
+    // final period, and this text is the design's (MAN-301 §2).
+    #[arg(
+        long,
+        help = "Grade each spot against RBN's public telnet feed and publish the grades on the \
+                JSON stream and /metrics. Needs --config with a [server] table. Same as \
+                [rbn_compare].enabled = true."
+    )]
+    rbn_compare: bool,
+    #[arg(
+        long = "rbn-spotter",
+        value_name = "CALL",
+        value_parser = parse_rbn_spotter,
+        help = "Count only this RBN skimmer's reports when grading, for example a co-located \
+                skimmer on the same antenna. Repeatable. Replaces [rbn_compare].spotters."
+    )]
+    rbn_spotter: Vec<String>,
+}
+
+/// `--rbn-spotter`: the same callsign rule and uppercasing as an entry of
+/// `[rbn_compare].spotters`.
+fn parse_rbn_spotter(s: &str) -> std::result::Result<String, String> {
+    manta_server::config::normalize_rbn_spotter(s)
+}
+
 /// Flags that decide which decodes become spots. Shared by `decode`,
 /// `listen` and `soak`.
 #[derive(clap::Args, Clone, Debug)]
@@ -2424,6 +2469,11 @@ struct SpotServer {
     /// await. `Mutex<Option<..>>` because shutdown only ever holds
     /// `&SpotServer` and must `take()` the handle to join it.
     status_line: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// MAN-301: the live RBN comparator's task, `None` when `[rbn_compare]`
+    /// is off. Retained for the same reason as `status_line`: shutdown
+    /// joins it right after `shutdown_tx.send(true)`, so no `spotGrade`
+    /// lands in the middle of the client drain.
+    rbn_compare: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The metrics/status HTTP listener's real bound address (MAN-44),
     /// from `TcpListener::local_addr()`, so a port-0 bind is reachable by
     /// tests without guessing or binding a fixed port.
@@ -2866,6 +2916,7 @@ fn spot_bus_for(
 fn start_spot_server(
     cfg: manta_server::config::ServerConfig,
     rbn_uplink_cfgs: Vec<manta_server::config::RbnUplinkConfig>,
+    rbn_compare_cfg: Option<manta_server::config::RbnCompareConfig>,
     source: SourceInfo<'_>,
     epoch: std::time::SystemTime,
     session_nonce: u128,
@@ -2906,7 +2957,7 @@ fn start_spot_server(
     let tasks = manta_server::tasks::new_client_tasks();
 
     let rt = tokio::runtime::Runtime::new()?;
-    let (status_line, metrics_addr, json_addr, uplink_dry_run) = rt.block_on(async {
+    let (status_line, metrics_addr, json_addr, uplink_dry_run, rbn_task) = rt.block_on(async {
         // MAN-132: metrics binds its own `metrics_bind_addr` (loopback by
         // default), never `bind_addr`. With two configurable addresses
         // "which listener failed?" is a real question, so each bind names
@@ -3103,6 +3154,13 @@ fn start_spot_server(
             .collect();
         let uplink_dry_run: Vec<UplinkDryRun> =
             uplink_tasks.iter().map(|(_, _, d)| d.clone()).collect();
+        // MAN-301: enabled before the metrics endpoint spawns below, for
+        // MAN-44's reason: a scrape racing startup must already see the
+        // `manta_rbn_compare_*` families of a comparator that is starting.
+        let rbn_compare_cfg = rbn_compare_cfg.filter(|c| c.enabled);
+        if rbn_compare_cfg.is_some() {
+            metrics.enable_rbn_compare();
+        }
         let metrics_ip_request_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
             manta_server::metrics_http::MAX_METRICS_REQUESTS_PER_IP,
             manta_server::metrics_http::METRICS_REQUEST_RATE_WINDOW,
@@ -3147,6 +3205,28 @@ fn start_spot_server(
                 shutdown_rx.clone(),
             ));
         }
+        // MAN-301: the live comparator reads the same bus the uplinks do
+        // and publishes grades back onto it. Its metric families were
+        // enabled above, before the metrics endpoint was spawned.
+        let rbn_compare = rbn_compare_cfg.map(|rc| {
+            let station_callsign = cfg.station_callsign.clone();
+            manta_server::rbn_compare::live::spawn(
+                manta_server::rbn_compare::live::LiveConfig {
+                    feed: manta_server::rbn_compare::feed::FeedConfig {
+                        host: rc.feed_host.clone(),
+                        port: rc.feed_port,
+                        login_callsign: rc.effective_login_callsign(&station_callsign).to_string(),
+                    },
+                    grade: rc.grade_config(&station_callsign),
+                    station_callsign,
+                    tick: manta_server::rbn_compare::live::TICK,
+                },
+                bus.clone(),
+                metrics.clone(),
+                manta_server::rbn_compare::system_clock(),
+                shutdown_rx.clone(),
+            )
+        });
 
         // MAN-122 scenario 2. The handle travels out of this block and
         // into `SpotServer::status_line` so shutdown can join the task --
@@ -3161,7 +3241,13 @@ fn start_spot_server(
             shutdown_rx.clone(),
         );
 
-        anyhow::Ok((status_line, metrics_addr, json_addr, uplink_dry_run))
+        anyhow::Ok((
+            status_line,
+            metrics_addr,
+            json_addr,
+            uplink_dry_run,
+            rbn_compare,
+        ))
     })?;
 
     Ok((
@@ -3179,6 +3265,7 @@ fn start_spot_server(
             station_geography_unresolved: station_geography_unresolved(&cty, &cfg.station_callsign),
             cty,
             status_line: std::sync::Mutex::new(status_line),
+            rbn_compare: std::sync::Mutex::new(rbn_task),
             metrics_addr,
             json_addr,
             uplink_dry_run,
@@ -3211,6 +3298,8 @@ struct CliOverrides {
     notch: Option<PathBuf>,
     cty: Option<PathBuf>,
     scp: Option<PathBuf>,
+    /// MAN-301: `--rbn-compare`/`--rbn-spotter` (`run` only).
+    rbn: RbnCompareOpts,
 }
 
 impl CliOverrides {
@@ -3252,6 +3341,7 @@ impl CliOverrides {
             notch: None,
             cty: None,
             scp: None,
+            rbn: RbnCompareOpts::default(),
         }
     }
 
@@ -3363,6 +3453,9 @@ struct Resolved {
     capture_rate_hz: Option<f64>,
     replay_epoch: Option<i64>,
     spot: SpotResolved,
+    /// MAN-301: `[rbn_compare]` with `--rbn-compare`/`--rbn-spotter`
+    /// merged over it; `None` when neither the file nor the flags set it.
+    rbn_compare: Option<manta_server::config::RbnCompareConfig>,
     /// Printed to stderr by the caller, never stdout.
     notes: Vec<String>,
     /// The flag that replaced a typed `[input]` from the file, if one did:
@@ -3370,9 +3463,27 @@ struct Resolved {
     replaced_file_source: Option<&'static str>,
 }
 
+/// MAN-301: the flag enables; a non-empty `--rbn-spotter` replaces
+/// `[rbn_compare].spotters` (never concatenated, like `--allowlist`).
+fn resolve_rbn_compare(
+    cli: &RbnCompareOpts,
+    file: Option<&manta_server::config::RbnCompareConfig>,
+) -> Option<manta_server::config::RbnCompareConfig> {
+    if !cli.rbn_compare && cli.rbn_spotter.is_empty() {
+        return file.cloned();
+    }
+    let mut cfg = file.cloned().unwrap_or_default();
+    cfg.enabled |= cli.rbn_compare;
+    if !cli.rbn_spotter.is_empty() {
+        cfg.spotters = cli.rbn_spotter.clone();
+    }
+    Some(cfg)
+}
+
 /// D6: merges the command line over the loaded file + environment layer.
 fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
-    let mut notes = Vec::new();
+    let mut notes = loaded.notes.clone();
+    let rbn_compare = resolve_rbn_compare(&cli.rbn, loaded.rbn_compare.as_ref());
     let spot = resolve_spot(
         cli.allowlist.clone(),
         cli.blocklist.clone(),
@@ -3424,6 +3535,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
         capture_rate_hz: capture_rate_hz.or(shared.capture_rate_hz),
         replay_epoch: replay_epoch.or(shared.replay_epoch),
         spot,
+        rbn_compare,
         notes,
         replaced_file_source,
     })
@@ -3685,7 +3797,9 @@ fn prepare_config(
     vars: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> Result<Prepared> {
     let loaded = config::load(config_path.as_deref(), config::Env::Read(vars))?;
+    let rbn_opts = cli.rbn.clone();
     let resolved = resolve(cli, &loaded)?;
+    check_rbn_compare(&rbn_opts, &loaded, &resolved)?;
     let decode = merge_cli_engine(cli_engine, loaded.decode.clone());
     let mut pipeline = build_pipeline_config(
         resolved.freq_correction_ppm,
@@ -3700,6 +3814,73 @@ fn prepare_config(
         resolved,
         pipeline,
     })
+}
+
+/// MAN-301's refusals that need the merged command line: `--rbn-spotter`
+/// without comparison, comparison turned on by the flag without `[server]`
+/// (the loader refuses the file's own `enabled = true`), and `--rbn-spotter`
+/// naming this station. Run before any source or listener opens, and by
+/// `manta config check`. The replayed-recording refusal is
+/// [`refuse_rbn_compare_replay`], which only `run` (and its SIGHUP reload)
+/// and `config check` call: `soak` and `doctor` share this path but never
+/// start the comparator.
+fn check_rbn_compare(
+    cli: &RbnCompareOpts,
+    loaded: &config::Loaded,
+    resolved: &Resolved,
+) -> Result<()> {
+    let enabled = resolved.rbn_compare.as_ref().is_some_and(|c| c.enabled);
+    if !cli.rbn_spotter.is_empty() && !enabled {
+        bail!(
+            "--rbn-spotter needs RBN comparison: add --rbn-compare or set \
+             [rbn_compare].enabled = true"
+        );
+    }
+    let Some(rbn_compare) = resolved.rbn_compare.as_ref().filter(|c| c.enabled) else {
+        return Ok(());
+    };
+    let Some(server) = &loaded.server else {
+        bail!("{}", config::rbn_compare_needs_server(&loaded.origin));
+    };
+    if !cli.rbn_spotter.is_empty() {
+        if let Some(call) = rbn_compare.own_call_spotter(&server.station_callsign) {
+            bail!(
+                "--rbn-spotter {call} is this station's own callsign: its reports are always \
+                 excluded, so every spot would grade none"
+            );
+        }
+        if let Some(call) = rbn_compare.excluded_spotter() {
+            bail!(
+                "--rbn-spotter {call} is in [rbn_compare].exclude_spotters: its reports would \
+                 never count"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// MAN-301: RBN comparison enabled on a run that replays a recording is
+/// refused, since the live feed's reports would never line up with the
+/// recording's spot times. `run` calls this after `prepare_live`, before any
+/// source or listener opens; its SIGHUP reload and `manta config check` call
+/// it too. `soak` and `doctor` do not, because neither starts the comparator.
+/// `source_flag` is whether `--source` chose the file.
+fn refuse_rbn_compare_replay(resolved: &Resolved, source_flag: bool) -> Result<()> {
+    if !resolved.rbn_compare.as_ref().is_some_and(|c| c.enabled) {
+        return Ok(());
+    }
+    if let LiveSourceSpec::File { .. } = resolved.spec {
+        let how = if source_flag {
+            "--source"
+        } else {
+            "[input] type = \"file\""
+        };
+        bail!(
+            "RBN comparison grades spots against the live RBN feed, but this run replays a \
+             recording ({how}). Grade a recorded node's spot log with `manta grade` instead."
+        );
+    }
+    Ok(())
 }
 
 /// `decode`/`oracle`: one stderr note naming the tables present in the file
@@ -4405,6 +4586,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             dial_freq_hz,
             replay_epoch,
             engine,
+            rbn,
             logging: log_opts,
         } => {
             // MAN-124: first, so every later stderr line of `run` (startup
@@ -4453,18 +4635,21 @@ fn run_command() -> Result<std::process::ExitCode> {
                 notch,
                 cty,
                 scp,
+                rbn,
             };
             // MAN-78: a SIGHUP reload re-resolves with the same flags.
             #[cfg(unix)]
             let reload_cli = cli.clone();
             #[cfg(unix)]
             let vars: Vec<_> = std::env::vars_os().collect();
+            let source_flag = cli.source.is_some();
             let Prepared {
                 config_path,
                 loaded,
                 resolved,
                 pipeline: cfg,
             } = prepare_live(cli, config, engine)?;
+            refuse_rbn_compare_replay(&resolved, source_flag)?;
             // MAN-268: an unedited manta.example.toml must not start a
             // daemon that spots, or logs in to a collector, as N0CALL.
             // Checked first, on the identities after the MANTA_* overlay:
@@ -4636,6 +4821,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     let (rt, server) = start_spot_server(
                         server_cfg,
                         loaded.rbn_uplink.clone(),
+                        resolved.rbn_compare.clone(),
                         SourceInfo {
                             name: source_name,
                             sample_rate_hz: first.sample_rate(),
@@ -5118,6 +5304,20 @@ fn run_command() -> Result<std::process::ExitCode> {
                         let _ = rt.block_on(status_line);
                     }
                 }
+                // MAN-301: the comparator watches the same shutdown signal;
+                // joined like the status line, bounded so a stuck feed
+                // connect can never hold the drain past its deadline.
+                if let Some(rbn_compare) = server
+                    .rbn_compare
+                    .lock()
+                    .expect("rbn_compare handle mutex poisoned")
+                    .take()
+                {
+                    if let Some(rt) = server_runtime.as_ref() {
+                        let _ =
+                            rt.block_on(tokio::time::timeout(SHUTDOWN_DRAIN_DEADLINE, rbn_compare));
+                    }
+                }
             }
             // `server_runtime`/`spot_server` are always constructed as a
             // matched pair (both `Some` or both `None`, see their
@@ -5207,6 +5407,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     notch,
                     cty,
                     scp,
+                    rbn: RbnCompareOpts::default(),
                 },
                 config,
                 None,
@@ -5367,6 +5568,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     notch,
                     cty,
                     scp,
+                    rbn: RbnCompareOpts::default(),
                 },
                 config,
                 None,
@@ -5531,6 +5733,7 @@ fn run_command() -> Result<std::process::ExitCode> {
         Command::Config(ConfigCommand::Check { config }) => config_cmd::check(config)?,
         Command::Config(ConfigCommand::Init { out, force }) => config_cmd::init(&out, force)?,
         Command::Bench(BenchCommand::Sensitivity(args)) => bench::sensitivity(args)?,
+        Command::Grade { args } => grade_cmd::run(args)?,
     }
     Ok(std::process::ExitCode::SUCCESS)
 }
@@ -5947,6 +6150,7 @@ mod tests {
         let (test_runtime, server) = start_spot_server(
             loaded.server.unwrap(),
             vec![],
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -6268,6 +6472,7 @@ mod tests {
         let (rt, server) = start_spot_server(
             loaded.server.unwrap(),
             loaded.rbn_uplink,
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -7099,6 +7304,7 @@ mod tests {
         let (rt, _server) = start_spot_server(
             loaded.server.unwrap(),
             loaded.rbn_uplink,
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -7158,6 +7364,7 @@ mod tests {
         let (rt, _server) = start_spot_server(
             loaded.server.unwrap(),
             loaded.rbn_uplink,
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -7215,6 +7422,7 @@ mod tests {
         let result = start_spot_server(
             loaded.server.unwrap(),
             loaded.rbn_uplink,
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -7248,6 +7456,7 @@ mod tests {
         let (rt, server) = start_spot_server(
             loaded.server.unwrap(),
             loaded.rbn_uplink,
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -7351,6 +7560,7 @@ mod tests {
         let Err(err) = start_spot_server(
             cfg,
             Vec::new(),
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -7407,6 +7617,7 @@ mod tests {
         let (rt, _server) = start_spot_server(
             loaded.server.unwrap(),
             loaded.rbn_uplink,
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -8318,6 +8529,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("cty", "spot.cty_path"),
         ("scp", "spot.scp_path"),
         ("engine", "decode.engine"),
+        ("rbn_compare", "rbn_compare.enabled"),
+        ("rbn_spotter", "rbn_compare.spotters"),
     ];
     /// Flags with no config key, by design.
     const CLI_ONLY: &[&str] = &[
@@ -8467,6 +8680,15 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             ("spot.cty_path", "[spot]\ncty_path = 'cty.dat'\n"),
             ("spot.scp_path", "[spot]\nscp_path = 'MASTER.SCP'\n"),
             ("decode.engine", "[decode]\nengine = \"legacy\"\n"),
+            (
+                "rbn_compare.enabled",
+                "[server]\nstation_callsign = \"W1AW\"\n[rbn_compare]\nenabled = true\n",
+            ),
+            (
+                "rbn_compare.spotters",
+                "[server]\nstation_callsign = \"W1AW\"\n[rbn_compare]\n\
+                 spotters = [\"K5TR\"]\n",
+            ),
         ];
         for (_, key) in FLAG_KEYS {
             let body = match SHARED.iter().find(|(k, _)| k == key) {
@@ -8616,6 +8838,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let (_rt, server) = start_spot_server(
             loaded.server.unwrap(),
             loaded.rbn_uplink,
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -8663,6 +8886,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let (rt, server) = start_spot_server(
             loaded.server.unwrap(),
             loaded.rbn_uplink,
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -9147,6 +9371,193 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             started.elapsed() < std::time::Duration::from_secs(2),
             "must not have hung past the configured timeout"
         );
+    }
+
+    // ---- MAN-301: `run --rbn-compare` / `--rbn-spotter`
+
+    /// `run`'s parsed RBN comparison flags.
+    fn run_rbn_opts(extra: &[&str]) -> Result<RbnCompareOpts, clap::Error> {
+        let argv = ["manta", "run"].iter().chain(extra);
+        match Cli::try_parse_from(argv)?.command {
+            Command::Run { rbn, .. } => Ok(rbn),
+            _ => unreachable!("`manta run` parses as Command::Run"),
+        }
+    }
+
+    const RBN_SERVER: &str = "[server]\nstation_callsign = \"W3XYZ-1\"\n";
+
+    /// `prepare_config` over a config file `body` and the given flags, with
+    /// no environment (the same path `run` and `config check` take).
+    fn prepare_rbn(body: &str, rbn: RbnCompareOpts, source: Option<&str>) -> Result<Prepared> {
+        let f = write_temp_file(body.as_bytes());
+        let cli = CliOverrides {
+            source: source.map(PathBuf::from),
+            rbn,
+            ..CliOverrides::none()
+        };
+        prepare_config(cli, Some(f.path().to_path_buf()), None, &[])
+    }
+
+    /// `prepare_rbn` followed by `run`'s replay refusal.
+    fn run_rbn(body: &str, rbn: RbnCompareOpts, source: Option<&str>) -> Result<Prepared> {
+        let prepared = prepare_rbn(body, rbn, source)?;
+        refuse_rbn_compare_replay(&prepared.resolved, source.is_some())?;
+        Ok(prepared)
+    }
+
+    #[test]
+    fn rbn_compare_flag_enables_comparison() {
+        let rbn = run_rbn_opts(&["--rbn-compare"]).unwrap();
+        assert!(rbn.rbn_compare);
+        assert!(run_rbn_opts(&[]).unwrap().rbn_spotter.is_empty());
+        // `listen` is `run`'s alias and takes the same flags.
+        assert!(Cli::try_parse_from(["manta", "listen", "--rbn-compare"]).is_ok());
+        // The flag alone (no [rbn_compare] table) enables with defaults.
+        let p = prepare_rbn(RBN_SERVER, rbn.clone(), None).unwrap();
+        let rc = p.resolved.rbn_compare.expect("the flag creates the table");
+        assert!(rc.enabled);
+        assert_eq!(rc.window_secs, 180);
+        // Over a disabled table, the flag enables and keeps its keys.
+        let body = format!("{RBN_SERVER}[rbn_compare]\nenabled = false\nwindow_secs = 300\n");
+        let rc = prepare_rbn(&body, rbn.clone(), None)
+            .unwrap()
+            .resolved
+            .rbn_compare
+            .unwrap();
+        assert!(rc.enabled);
+        assert_eq!(rc.window_secs, 300);
+        // Without the flag, the file decides.
+        let rc = prepare_rbn(&body, RbnCompareOpts::default(), None)
+            .unwrap()
+            .resolved
+            .rbn_compare
+            .unwrap();
+        assert!(!rc.enabled);
+        assert!(prepare_rbn(RBN_SERVER, RbnCompareOpts::default(), None)
+            .unwrap()
+            .resolved
+            .rbn_compare
+            .is_none());
+        // The flag without [server] is the table's own needs-[server] refusal.
+        let err = format!(
+            "{:#}",
+            prepare_rbn("[decode]\nengine = \"legacy\"\n", rbn, None)
+                .err()
+                .unwrap()
+        );
+        assert!(
+            err.ends_with(
+                ": [rbn_compare] needs a [server] table (grades are published on the JSON \
+                 stream and /metrics, which only the daemon runs)"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rbn_spotter_flag_replaces_file_spotters() {
+        let rbn = run_rbn_opts(&["--rbn-spotter", "k5tr", "--rbn-spotter", "N0XYZ"]).unwrap();
+        assert_eq!(
+            rbn.rbn_spotter,
+            vec!["K5TR".to_string(), "N0XYZ".to_string()]
+        );
+        assert!(run_rbn_opts(&["--rbn-spotter", "K5TR-#"]).is_err());
+        assert!(run_rbn_opts(&["--rbn-spotter", "not a call"]).is_err());
+        let body = format!("{RBN_SERVER}[rbn_compare]\nenabled = true\nspotters = [\"W1AW\"]\n");
+        let rc = prepare_rbn(&body, rbn, None)
+            .unwrap()
+            .resolved
+            .rbn_compare
+            .unwrap();
+        assert_eq!(rc.spotters, vec!["K5TR".to_string(), "N0XYZ".to_string()]);
+        let rc = prepare_rbn(&body, RbnCompareOpts::default(), None)
+            .unwrap()
+            .resolved
+            .rbn_compare
+            .unwrap();
+        assert_eq!(rc.spotters, vec!["W1AW".to_string()]);
+        // --rbn-spotter naming this station is refused like the file's list.
+        let own = run_rbn_opts(&["--rbn-spotter", "w3xyz"]).unwrap();
+        let err = format!("{:#}", prepare_rbn(&body, own, None).err().unwrap());
+        assert_eq!(
+            err,
+            "--rbn-spotter W3XYZ is this station's own callsign: its reports are always \
+             excluded, so every spot would grade none"
+        );
+        // So is one the file's exclude_spotters names.
+        let body = format!("{body}exclude_spotters = [\"N0XYZ\"]\n");
+        let excluded = run_rbn_opts(&["--rbn-spotter", "K5TR", "--rbn-spotter", "n0xyz"]).unwrap();
+        let err = format!("{:#}", prepare_rbn(&body, excluded, None).err().unwrap());
+        assert_eq!(
+            err,
+            "--rbn-spotter N0XYZ is in [rbn_compare].exclude_spotters: its reports would never \
+             count"
+        );
+    }
+
+    #[test]
+    fn rbn_spotter_without_comparison_is_refused() {
+        let rbn = run_rbn_opts(&["--rbn-spotter", "K5TR"]).unwrap();
+        for body in [
+            RBN_SERVER.to_string(),
+            format!("{RBN_SERVER}[rbn_compare]\nenabled = false\n"),
+        ] {
+            let err = format!("{:#}", prepare_rbn(&body, rbn.clone(), None).err().unwrap());
+            assert_eq!(
+                err,
+                "--rbn-spotter needs RBN comparison: add --rbn-compare or set \
+                 [rbn_compare].enabled = true"
+            );
+        }
+        let with_flag = run_rbn_opts(&["--rbn-compare", "--rbn-spotter", "K5TR"]).unwrap();
+        assert!(prepare_rbn(RBN_SERVER, with_flag, None).is_ok());
+    }
+
+    #[test]
+    fn rbn_compare_with_file_replay_is_refused() {
+        let enabled = format!("{RBN_SERVER}[rbn_compare]\nenabled = true\n");
+        let err = format!(
+            "{:#}",
+            run_rbn(&enabled, RbnCompareOpts::default(), Some("x.wav"))
+                .err()
+                .unwrap()
+        );
+        assert_eq!(
+            err,
+            "RBN comparison grades spots against the live RBN feed, but this run replays a \
+             recording (--source). Grade a recorded node's spot log with `manta grade` instead."
+        );
+        let flag = run_rbn_opts(&["--rbn-compare"]).unwrap();
+        assert!(run_rbn(RBN_SERVER, flag, Some("x.wav")).is_err());
+        let file_input = format!("{enabled}[input]\ntype = \"file\"\npath = \"/x.wav\"\n");
+        let err = format!(
+            "{:#}",
+            run_rbn(&file_input, RbnCompareOpts::default(), None)
+                .err()
+                .unwrap()
+        );
+        assert!(
+            err.starts_with(
+                "RBN comparison grades spots against the live RBN feed, but this run replays a \
+                 recording ([input] type = \"file\")."
+            ),
+            "{err}"
+        );
+        // A replay with comparison off is unaffected.
+        assert!(run_rbn(RBN_SERVER, RbnCompareOpts::default(), Some("x.wav")).is_ok());
+    }
+
+    /// `soak` and `doctor` share `prepare_config` with `run` but never start
+    /// the comparator, so a node config with `[rbn_compare]` enabled still
+    /// prepares over a replayed recording; only `run` refuses it.
+    #[test]
+    fn soak_and_doctor_prepare_a_replay_with_rbn_compare_enabled() {
+        let enabled = format!("{RBN_SERVER}[rbn_compare]\nenabled = true\n");
+        let p = prepare_rbn(&enabled, RbnCompareOpts::default(), Some("x.wav")).unwrap();
+        assert!(p.resolved.rbn_compare.is_some_and(|c| c.enabled));
+        let file_input = format!("{enabled}[input]\ntype = \"file\"\npath = \"/x.wav\"\n");
+        assert!(prepare_rbn(&file_input, RbnCompareOpts::default(), None).is_ok());
+        assert!(run_rbn(&file_input, RbnCompareOpts::default(), None).is_err());
     }
 
     #[test]

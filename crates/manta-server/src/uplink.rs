@@ -28,7 +28,7 @@ use tokio::sync::{broadcast, watch, Semaphore};
 /// (commonly minutes), blocking shutdown the whole time -- this attempt
 /// is additionally raced against `shutdown.changed()` below, but the
 /// timeout still bounds worst-case time when shutdown never fires.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounds the WHOLE multi-address attempt in `connect_first_reachable`
 /// (MAN-67, PR #80 review round 9): each candidate address already gets
 /// its own `CONNECT_TIMEOUT`, but with no cap on the loop as a whole, a
@@ -43,7 +43,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// succeeded can still be cut off if earlier ones ate the whole window,
 /// but the alternative (no cap) is worse -- shutdown remains the only
 /// hard bound otherwise.
-const OVERALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const OVERALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Every outbound write to the uplink target gets this long before being
 /// treated as stalled (MAN-58 comment finding 2) -- matches `telnet.rs`'s
 /// identical `WRITE_TIMEOUT` for the same class of risk on the inbound
@@ -322,7 +322,7 @@ async fn connect_first_reachable(addrs: Vec<std::net::SocketAddr>) -> std::io::R
 /// that block (or a gateway that rejects it) gets an immediate
 /// `NetworkUnreachable` instead of a hang, silently turning the deadline
 /// test into a no-op everywhere that's true.
-async fn connect_first_reachable_bounded<T, F, Fut>(
+pub(crate) async fn connect_first_reachable_bounded<T, F, Fut>(
     addrs: Vec<std::net::SocketAddr>,
     per_addr_timeout: Duration,
     overall_timeout: Duration,
