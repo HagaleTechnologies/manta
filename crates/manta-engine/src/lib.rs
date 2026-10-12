@@ -181,6 +181,10 @@ pub struct DecodeReport {
     /// MAN-314: every RTTY signal the detector marked (SPEC §2.6); empty
     /// for input without RTTY or with `rtty_filter` off.
     pub rtty: Vec<RttySignalReport>,
+    /// Input sample rate, for turning `rtty` sample timestamps into
+    /// seconds; not serialized.
+    #[serde(skip)]
+    pub sample_rate_hz: f64,
 }
 
 /// MAN-314: one marked RTTY signal (SPEC §2.6), frequencies calibrated
@@ -350,6 +354,7 @@ pub fn decode_samples(
         events,
         spots,
         rtty,
+        sample_rate_hz: fs,
     })
 }
 

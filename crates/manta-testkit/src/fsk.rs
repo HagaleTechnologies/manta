@@ -264,8 +264,12 @@ mod tests {
             }
         }
         top.sort_by(f64::total_cmp);
-        assert!((top[0] - 830.0).abs() <= bin + 1e-9, "space {top:?}");
-        assert!((top[1] - 1_000.0).abs() <= bin + 1e-9, "mark {top:?}");
+        // Keyed FSK is a line spectrum: the strongest lines sit a few Hz
+        // from the nominal tones (measured -6.5/+5.5 Hz for RYRY at 45.45
+        // Bd), so allow a quarter of the baud rate.
+        let tol = 45.45 / 4.0;
+        assert!((top[0] - 830.0).abs() <= tol, "space {top:?}");
+        assert!((top[1] - 1_000.0).abs() <= tol, "mark {top:?}");
     }
 
     #[test]

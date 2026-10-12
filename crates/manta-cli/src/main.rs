@@ -3843,9 +3843,7 @@ fn real_main() -> Result<()> {
                 println!("{}", report.text);
                 eprintln!("freq_hz: {:.1}  wpm: {:?}", report.freq_hz, report.wpm);
                 eprintln!("spots: {}", report.spots.len());
-                let fs =
-                    manta_input::WavIqSource::open_with_center_freq_hz(&path, 0.0)?.sample_rate();
-                eprintln!("{}", rtty_line(&report.rtty, fs));
+                eprintln!("{}", rtty_line(&report.rtty, report.sample_rate_hz));
             }
         }
         Command::Oracle {
