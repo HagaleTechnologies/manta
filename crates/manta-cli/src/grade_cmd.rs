@@ -108,7 +108,25 @@ fn render(args: &Args, out: &mut String) -> Result<()> {
         }
     }
     let (mut cfg, excludes) = grade_config(args)?;
+    // The exclusion wins, so a spotter on both lists would grade every spot
+    // it alone covers `none`: refuse it, as `[rbn_compare]` does.
+    if let Some(call) = cfg.spotters.iter().find(|s| excludes.contains(s)) {
+        bail!(
+            "spotter {call} is both counted (--spotter or [rbn_compare].spotters) and \
+             excluded (--exclude-spotter or [rbn_compare].exclude_spotters): its reports \
+             would never count"
+        );
+    }
     let (spots, spot_stats) = load_node_spots(&args.spots)?;
+    // Likewise a node's own call, which its spots always exclude.
+    for de in &spot_stats.de_calls {
+        if let Some(call) = own_calls(de).into_iter().find(|c| cfg.spotters.contains(c)) {
+            bail!(
+                "spotter {call} is node {de}'s own call: its reports never count for that \
+                 node's spots, so every one would grade none"
+            );
+        }
+    }
     let (mut archives, rbn_stats) = load_rbn_csv(&args.rbn)?;
     cfg.exclude_spotters = excludes.iter().cloned().collect();
     let times = || archives.iter().flatten().map(|r| r.time);

@@ -3843,6 +3843,12 @@ fn check_rbn_compare(
                  excluded, so every spot would grade none"
             );
         }
+        if let Some(call) = rbn_compare.excluded_spotter() {
+            bail!(
+                "--rbn-spotter {call} is in [rbn_compare].exclude_spotters: its reports would \
+                 never count"
+            );
+        }
     }
     Ok(())
 }
@@ -9279,6 +9285,15 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             err,
             "--rbn-spotter W3XYZ is this station's own callsign: its reports are always \
              excluded, so every spot would grade none"
+        );
+        // So is one the file's exclude_spotters names.
+        let body = format!("{body}exclude_spotters = [\"N0XYZ\"]\n");
+        let excluded = run_rbn_opts(&["--rbn-spotter", "K5TR", "--rbn-spotter", "n0xyz"]).unwrap();
+        let err = format!("{:#}", prepare_rbn(&body, excluded, None).err().unwrap());
+        assert_eq!(
+            err,
+            "--rbn-spotter N0XYZ is in [rbn_compare].exclude_spotters: its reports would never \
+             count"
         );
     }
 

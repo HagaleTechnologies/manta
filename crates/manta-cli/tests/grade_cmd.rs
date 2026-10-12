@@ -301,6 +301,41 @@ fn grade_refuses_an_implausible_spotter_callsign() {
     assert_lines_eq(&stdout(&out), &read_fixture("expected-k5tr.jsonl"));
 }
 
+/// A spotter that is also excluded, by the flags or a node's own call,
+/// would grade every spot it alone covers `none`, so it is refused.
+#[test]
+fn grade_refuses_a_spotter_that_is_also_excluded() {
+    let out = grade_fixture(&["--json", "--spotter", "K5TR", "--exclude-spotter", "k5tr"]);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    let err = stderr(&out);
+    assert!(
+        err.contains(
+            "spotter K5TR is both counted (--spotter or [rbn_compare].spotters) and excluded \
+             (--exclude-spotter or [rbn_compare].exclude_spotters): its reports would never \
+             count"
+        ),
+        "stderr: {err}"
+    );
+    for call in ["W3XYZ-1", "w3xyz"] {
+        let out = grade_fixture(&["--json", "--spotter", call]);
+        assert!(!out.status.success(), "--spotter {call} was accepted");
+        assert!(out.stdout.is_empty());
+        let err = stderr(&out);
+        let upper = call.to_ascii_uppercase();
+        assert!(
+            err.contains(&format!(
+                "spotter {upper} is node W3XYZ-1's own call: its reports never count for \
+                 that node's spots, so every one would grade none"
+            )),
+            "stderr: {err}"
+        );
+    }
+    // A disjoint pair still grades.
+    let out = grade_fixture(&["--json", "--spotter", "K5TR", "--exclude-spotter", "N0ABC"]);
+    assert_success(&out);
+}
+
 #[test]
 fn grade_errors_on_a_malformed_middle_line() {
     let dir = tempfile::tempdir().unwrap();

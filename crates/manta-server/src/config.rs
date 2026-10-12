@@ -959,7 +959,28 @@ impl RbnCompareConfig {
                 check_operator_callsign(call).map_err(|e| format!("[rbn_compare].{key} {e}"))?;
             }
         }
+        if let Some(call) = self.excluded_spotter() {
+            return Err(format!(
+                "[rbn_compare].spotters lists {call}, which exclude_spotters also lists: its \
+                 reports would never count"
+            ));
+        }
         Ok(())
+    }
+
+    /// The `spotters` entry that `exclude_spotters` also lists, compared as
+    /// the grader compares them, if any. The exclusion wins, so that
+    /// spotter's reports would never count.
+    pub fn excluded_spotter(&self) -> Option<&str> {
+        let excluded: std::collections::BTreeSet<String> = self
+            .exclude_spotters
+            .iter()
+            .map(|c| grade_call(c))
+            .collect();
+        self.spotters
+            .iter()
+            .map(String::as_str)
+            .find(|s| excluded.contains(&grade_call(s)))
     }
 
     /// The `spotters` entry that is this station's own callsign (with or
@@ -2149,6 +2170,19 @@ mod tests {
             "[rbn_compare].spotters lists W3XYZ, this station's own callsign: its reports are \
              always excluded, so every spot would grade none"
         );
+
+        let both = RbnCompareConfig {
+            spotters: vec!["K5TR".into(), "n0abc".into()],
+            exclude_spotters: vec!["N0ABC".into()],
+            ..RbnCompareConfig::default()
+        };
+        assert_eq!(both.excluded_spotter(), Some("n0abc"));
+        assert_eq!(
+            both.validate().unwrap_err(),
+            "[rbn_compare].spotters lists n0abc, which exclude_spotters also lists: its \
+             reports would never count"
+        );
+        assert_eq!(cfg.excluded_spotter(), None);
     }
 
     #[test]

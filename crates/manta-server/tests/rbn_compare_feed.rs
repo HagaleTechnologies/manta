@@ -141,14 +141,16 @@ async fn logs_in_after_a_newline_terminated_prompt() {
     assert_stops_within(feed, Duration::from_secs(2)).await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn logs_in_after_10_s_of_silence() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let feed = spawn_feed(listener.local_addr().unwrap().port(), tokio_clock(0));
 
-    // Measured from before the accept: paused time auto-advances whenever
-    // every task waits, including on socket I/O, so the clock may already
-    // have moved by the time `accept` returns.
+    // Real time, so this waits the full 10 s. A paused clock auto-advances
+    // whenever every task waits, including on socket I/O, so it can jump
+    // past the client's 10 s connect timeout before the I/O driver reports
+    // the connect done; on macOS it did on most runs, even when paused only
+    // after `accept`, and the client hung up without logging in.
     let start = Instant::now();
     let (mut sock, _) = listener.accept().await.unwrap();
     // Send nothing at all.
