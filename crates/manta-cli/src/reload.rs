@@ -772,4 +772,14 @@ blocklist_path = \"bl.txt\"
             vec!["decode.engine", "server.json_port", "server.telnet_port"]
         );
     }
+
+    #[test]
+    fn restart_only_changes_reports_history_minutes() {
+        let old = table("[server]\nhistory_minutes = 30\n");
+        let new = table("[server]\nhistory_minutes = 60\n");
+        assert_eq!(
+            restart_only_changes(&old, &new),
+            vec!["server.history_minutes"]
+        );
+    }
 }

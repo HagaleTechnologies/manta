@@ -141,6 +141,7 @@ the config for both. The table needs `station_callsign`.
 | `metrics_port` | `7302` | live: `run` with `[server]`, `status` and `health` | Prometheus metrics port; `manta status` and `manta health` dial it when given `--config` or `MANTA_CONFIG`. |
 | `line_format` | `"rbn"` | live: `run` with `[server]` | Telnet spot-line layout, `"rbn"` or `"skimmer"`. The uplink always sends the `"rbn"` layout. |
 | `status_interval_secs` | `60` | live: `run` with `[server]` | Seconds between one-line status reports in the log; `0` turns them off. |
+| `history_minutes` | `30` | live: `run` with `[server]`; restart required | Telnet replay retention in whole minutes, 0–1440, measured from the newest published spot's sample timestamp. Keeps at least the newest 50 spots and at most 10,000; `0` keeps only the newest 50. Loggers request `sh/dx 30m`; bare `sh/dx` returns 10 rows. See [MAN-93](DECISIONS/2026-10-11-man93-sh-dx-history-window.md). |
 | `telnet_max_connections_per_ip` | `16` | live: `run` with `[server]` | Open telnet connections per client IP; `0` removes the limit. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
 | `json_max_connections_per_ip` | `16` | live: `run` with `[server]` | Open JSON and WebSocket connections per client IP; `0` removes the limit. |
 | `metrics_max_connections_per_ip` | `8` | live: `run` with `[server]` | Open metrics connections per client IP; `0` removes the limit. |
