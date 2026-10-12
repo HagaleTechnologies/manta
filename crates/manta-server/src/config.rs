@@ -334,6 +334,27 @@ fn check_coordinate(key: &str, value: f64, limit: f64) -> Result<(), String> {
     Ok(())
 }
 
+fn check_history_minutes(value: u32) -> Result<(), String> {
+    if value > crate::bus::MAX_HISTORY_MINUTES {
+        return Err(format!(
+            "history_minutes must be a whole number of minutes from 0 to {}, got {value}",
+            crate::bus::MAX_HISTORY_MINUTES
+        ));
+    }
+    Ok(())
+}
+
+fn deserialize_optional_history_minutes<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: Option<u32> = Option::deserialize(deserializer)?;
+    if let Some(value) = value {
+        check_history_minutes(value).map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
+}
+
 fn deserialize_optional_latitude<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
 where
     D: Deserializer<'de>,
@@ -489,6 +510,12 @@ pub struct ServerConfig {
     /// line entirely, for operators who ship logs by the byte.
     #[serde(default)]
     pub status_interval_secs: Option<u64>,
+    /// Telnet history window in heard-time minutes (default 30, range 0..=1440).
+    /// Always retains the newest 50 publications, never more than 10,000.
+    /// Zero restores count-only history of 50 spots. Changes need a restart.
+    /// See `docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md`.
+    #[serde(default, deserialize_with = "deserialize_optional_history_minutes")]
+    pub history_minutes: Option<u32>,
     /// Which telnet wire layout the INBOUND cluster server emits
     /// (MAN-88). Defaults to `"rbn"`, the RBN relay's fixed-column AK1A
     /// layout that downstream loggers parse today. `"skimmer"` selects
@@ -1740,5 +1767,36 @@ mod tests {
             ..uplink
         };
         assert_eq!(uplink_override.effective_login_callsign("W3XYZ"), "W3XYZ-2");
+    }
+
+    #[test]
+    fn history_minutes_is_optional_and_accepts_0_through_1440() {
+        assert_eq!(server_with("").history_minutes, None);
+        for minutes in [0, 30, 1440] {
+            assert_eq!(
+                server_with(&format!("history_minutes = {minutes}")).history_minutes,
+                Some(minutes)
+            );
+        }
+    }
+
+    #[test]
+    fn history_minutes_out_of_range_is_rejected_naming_the_key() {
+        for minutes in [1441, 5000] {
+            let error = toml::from_str::<ServerConfig>(&format!(
+                "station_callsign = \"W1AW\"\nhistory_minutes = {minutes}"
+            ))
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("history_minutes must be a whole number of minutes from 0 to 1440, got"));
+        }
+        for invalid in ["-1", "1.5", "\"30\""] {
+            let error = toml::from_str::<ServerConfig>(&format!(
+                "station_callsign = \"W1AW\"\nhistory_minutes = {invalid}"
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("history_minutes"));
+        }
     }
 }

@@ -440,9 +440,13 @@ validation (MAN-28). Dedupe (step 5) still applies.
   trailer).
   `sh/dx` follows Aggregator's documented forms: `sh/dx N` is a count and
   `sh/dx Nm` a minutes window, never a band. Either can take a ` CW`/` RTTY`
-  suffix, and the manta extension `BAND <band>` selects a band. Every query
-  reaches back at most the fifty retained spots. See
-  `docs/DECISIONS/2026-10-10-man92-telnet-commands.md`.
+  suffix, and the manta extension `BAND <band>` selects a band. History
+  retains a heard-time window (`[server].history_minutes`, default 30),
+  with a floor of the newest 50 spots and a ceiling of 10,000. Bare `sh/dx`
+  returns ten rows; loggers can request `sh/dx 30m`. Window changes need a
+  restart. See [MAN-93](docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md)
+  for retention and `docs/DECISIONS/2026-10-10-man92-telnet-commands.md`
+  for query semantics.
   `SKIMMER/SETT` replies with validation level and the live decodable
   passband (`SETT: vlNormal 14000.0-14070.0`); Aggregator will not forward
   spots from a source that never answers it (Aggregator manual v6.0 §9.2).
@@ -662,6 +666,9 @@ validation (MAN-28). Dedupe (step 5) still applies.
   replayed because the replay write failed or shutdown intervened — kept
   out of the write-failure counter because a replay entry was already
   counted once in `manta_spots_total`),
+  `manta_spots_history_truncated_total` (in-window history entries evicted
+  at the ceiling; normal ageing is not counted, see
+  [MAN-93](docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md)),
   `manta_spots_unresolved_geography_total` (MAN-136/MAN-45 — a spot that
   went out carrying an `UNKNOWN_*` sentinel on either side, i.e. its dx or
   de callsign didn't resolve against `cty.dat`, *or* it resolved but its

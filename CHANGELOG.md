@@ -31,6 +31,15 @@ git history and `docs/DECISIONS/`.
 
 ### Added
 
+- `manta health` asks a running daemon's `/healthz` and exits 0 when it
+  reports healthy, 1 otherwise, reading the metrics port from the same config
+  and `MANTA_*` overrides as `run` (MAN-81).
+- The Docker image runs the daemon from a config mounted at
+  `/etc/manta/manta.toml` (or `MANTA_CONFIG`) when started with no arguments,
+  instead of printing `--help`, and carries a `HEALTHCHECK` that runs
+  `manta health`. Arguments still run `manta <arguments>` unchanged (MAN-81).
+- A `linux/arm/v7` Docker image for 32-bit Raspberry Pi OS, alongside
+  `linux/amd64` and `linux/arm64` (MAN-81).
 - `manta calibrate` measures the receiver's frequency error against a WWV,
   WWVH, BPM, RWM or NCDXF beacon carrier and, after confirmation, saves
   `freq_correction_ppm` to `[input]` in the config file (MAN-127).
@@ -81,6 +90,11 @@ git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- `sh/dx` history now retains every spot heard in the last
+  `[server].history_minutes` minutes (default 30; at least the 50 newest,
+  at most 10,000). `manta_spots_history_truncated_total` counts spots the
+  ceiling drops early (MAN-93). Bare `sh/dx` still shows the last 10;
+  loggers can request `sh/dx 30m`.
 - Command output reads as finished text rather than debug prints (MAN-270).
   Human reports use shared units: frequencies as `14012.3 kHz`, SNR as
   integer `dB`, speed as integer `WPM`, confidence to two decimals, and spot

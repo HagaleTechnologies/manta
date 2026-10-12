@@ -129,6 +129,17 @@ docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
   `MANTA_SERVER_METRICS_BIND_ADDR=0.0.0.0` and publish it as
   `-p 127.0.0.1:7302:7302`, which keeps it on the host — see
   [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md).
+- With no arguments, the image runs the daemon from a config mounted at
+  `/etc/manta/manta.toml` (or the file `MANTA_CONFIG` names), and prints
+  `--help` when there is none. Any arguments run `manta <arguments>`
+  unchanged. The image reports its health to `docker ps` and orchestrators
+  by running `manta health`, which asks the daemon's own `/healthz` from
+  inside the container, so the metrics endpoint can stay on loopback. Setup,
+  timing and how to turn the check off are in
+  [packaging/README.md](packaging/README.md#docker-compose).
+- The image is built for `linux/amd64`, `linux/arm64` and `linux/arm/v7`.
+  `linux/arm/v7` is for 32-bit Raspberry Pi OS; its decode CPU budget is
+  unmeasured.
 - If the `docker run` above returns an authorization error, the GHCR
   package still needs its one-time "make public" step — see
   [docs/RUNBOOKS/release.md](docs/RUNBOOKS/release.md).
@@ -501,7 +512,10 @@ only if that config also carries at least one `[[rbn_uplink]]` block.
   `set/dx/filter`) for stock clients. This is the RBN/aggregator
   compatibility surface and the supported route into RBN: an RBN Aggregator
   reads it as it reads CW Skimmer Server, following the published CW Skimmer
-  and Aggregator manuals.
+  and Aggregator manuals. A logger can request the last 30 minutes with
+  `sh/dx 30m`; `[server].history_minutes` sets retained history depth
+  (default 30). A bare `sh/dx` shows the last 10. See
+  [history limits](docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md).
 - **JSON Lines / WebSocket stream** (`:7301`) — one full-fidelity spot
   object per line; a raw TCP client and a WebSocket client share the
   port. This is the [cqdx](https://cqdx.app) ingest surface.

@@ -96,6 +96,11 @@ MAN-138: JSON spots' `deGrid`/`deLat`/`deLon` are the operator's
 centroid; an inconsistent location fails config loading before I/O. See
 `docs/DECISIONS/2026-10-11-man138-station-location.md`.
 
+MAN-93: `[server].history_minutes` controls telnet replay retention
+(default 30 minutes, newest-50 floor, 10,000 ceiling). Bare `sh/dx` stays
+at 10 rows; loggers request `sh/dx 30m`. Changes need a restart. See
+`docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md`.
+
 MAN-149: `docs/CONFIG.md` (every key's default and what reads it),
 `docs/METRICS.md`, `docs/SPOT-SCHEMA.md`, `docs/README.md` (start here, by
 audience) and `docs/DECISIONS/README.md`. A new config key, metric family,
@@ -124,6 +129,13 @@ seeds a young channel's effective floor from its block median for 1 s, and
 (was 2.06 s) and decodes its first character at 0.62 s (was 2.66 s).
 `TrackMeta` is still not emitted at promotion. See
 docs/DECISIONS/2026-10-11-man115-startup-latency.md.
+
+MAN-81: with no arguments the Docker image runs the daemon from a config
+mounted at `/etc/manta/manta.toml` (or `MANTA_CONFIG`), else prints
+`--help`; its `HEALTHCHECK` runs the new `manta health` (exit 0/1 from
+`/healthz`, metrics address read from the daemon's config); the image is
+also built for `linux/arm/v7`. See
+`docs/DECISIONS/2026-10-11-man81-docker-config-mount-and-healthcheck.md`.
 
 MAN-127: `manta calibrate` measures the receiver's ppm offset against a
 known carrier and saves `[input].freq_correction_ppm` after confirmation —

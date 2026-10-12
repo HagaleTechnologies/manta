@@ -157,6 +157,15 @@ de W5AU-# >
 DX de W5AU-#:   14012.36  W1AW           CW    28 dB  20 WPM  CQ      0719Z
 ```
 
+To fill a logger's band map when it connects, add `sh/dx 30m` to its
+cluster connect commands. With the default `[server].history_minutes`,
+manta retains the last 30 minutes for replay. A bare `sh/dx` shows the
+last 10. The newest 50 spots are always retained, up to a ceiling of
+10,000. Changes to the configured window need a restart. While
+`manta_spots_history_truncated_total` on the
+[metrics endpoint](../RUNBOOKS/node-health.md) is rising, the ceiling is
+cutting history short of the configured window.
+
 Wait for calls on an active band. A login prompt proves that the listener is up;
 a `DX de` line proves a spot reached the client. Exit telnet with Ctrl+] then
 `quit`. In another terminal, watch the JSON stream:
