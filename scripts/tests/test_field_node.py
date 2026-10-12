@@ -432,6 +432,40 @@ class RecordSpotsTests(unittest.TestCase):
         self.assertEqual(self.read("spots-2026-10-01.jsonl"), good + b"\n")
         self.assertEqual(sum(1 for m in logs if m.startswith("invalid line")), 5)
 
+    def test_record_spots_archives_grades_separately(self):
+        spot_ts = int(datetime(2026, 10, 11, 23, 58, tzinfo=timezone.utc).timestamp())
+        spot = spot_line("W1AW", spot_ts)
+        # Graded after its window closes, past midnight: filed by windowClose.
+        grade = json.dumps({
+            "kind": "spotGrade", "spotId": "N0CALL-1:1:7:960000:W1AW", "call": "W1AW",
+            "band": "20m", "spotTime": spot_ts, "windowClose": spot_ts + 180, "windowS": 180,
+            "grade": "match", "disagreements": [], "mantaFreqHz": 14012362, "mantaWpm": 25,
+            "rbnModalFreqHz": 14012400, "rbnMedianWpm": 24.0, "rbnSkimmers": 2,
+            "rbnReports": 2, "freqOffsetHz": -38, "rbnBands": ["20m"], "spotterFilter": [],
+        }, separators=(",", ":")).encode()
+        later = spot_line("K1JT", spot_ts + 1)
+        srv = LineServer([spot + b"\n" + grade + b"\n" + later + b"\n"])
+        logs = []
+        stats = self.run_until(srv, 1, logs=logs)
+        self.assertEqual(stats["written"], 2)
+        self.assertEqual(stats["grades"], 1)
+        self.assertEqual(stats["invalid"], 0)
+        self.assertFalse([m for m in logs if m.startswith("invalid line")], logs)
+        self.assertEqual(self.files(), ["grades-2026-10-12.jsonl", "spots-2026-10-11.jsonl"])
+        self.assertEqual(self.read("spots-2026-10-11.jsonl"), spot + b"\n" + later + b"\n")
+        self.assertEqual(self.read("grades-2026-10-12.jsonl"), grade + b"\n")
+        # The report's spot counter never reads a grade file.
+        self.assertEqual(fn.load_recorded_spots(self.out), {"2026-10-11": 2})
+
+    def test_classify_line_needs_a_numeric_window_close(self):
+        kind, obj = fn.classify_line(b'{"kind":"spotGrade","windowClose":1791720180}')
+        self.assertEqual(kind, "grade")
+        self.assertEqual(obj["windowClose"], 1791720180)
+        with self.assertRaises(ValueError):
+            fn.classify_line(b'{"kind":"spotGrade","windowClose":"soon"}')
+        kind, _ = fn.classify_line(spot_line("W1AW", 1791720000))
+        self.assertEqual(kind, "spot")
+
     def test_reconnects_after_server_closes(self):
         ts = int(datetime(2026, 10, 1, 12, tzinfo=timezone.utc).timestamp())
         a, b = spot_line("W1AW", ts), spot_line("K1JT", ts + 1)

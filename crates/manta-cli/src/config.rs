@@ -15,7 +15,7 @@ use manta_decode::config_file::DecodeConfigToml;
 use manta_decode::decoder::DecodeConfig;
 use manta_engine::config_file::DetectorConfigToml;
 use manta_engine::DetectorConfig;
-use manta_server::config::{RbnUplinkConfig, ServerConfig};
+use manta_server::config::{RbnCompareConfig, RbnUplinkConfig, ServerConfig};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 pub(crate) const KNOWN_TABLES: &[&str] = &[
     "server",
     "rbn_uplink",
+    "rbn_compare",
     "input",
     "spot",
     "detector",
@@ -48,6 +49,7 @@ const ENV_PREFIX: &str = "MANTA_";
 pub(crate) const ENV_CONFIG: &str = "MANTA_CONFIG";
 const ENV_TABLES: &[(&str, &str)] = &[
     ("SERVER_", "server"),
+    ("RBN_COMPARE_", "rbn_compare"),
     ("INPUT_", "input"),
     ("SPOT_", "spot"),
     ("DETECTOR_", "detector"),
@@ -66,6 +68,8 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("server", "operator_name"),
     ("server", "operator_qth"),
     ("server", "operator_grid"),
+    ("rbn_compare", "feed_host"),
+    ("rbn_compare", "login_callsign"),
     ("input", "type"),
     ("input", "device"),
     ("input", "path"),
@@ -94,6 +98,11 @@ pub(crate) struct Loaded {
     pub origin: String,
     pub server: Option<ServerConfig>,
     pub rbn_uplink: Vec<RbnUplinkConfig>,
+    /// MAN-301: `[rbn_compare]` as written, validated (`None` when the
+    /// table is absent). Present even when `enabled = false`: `manta grade
+    /// --config` reads its tolerances. `run` merges `--rbn-compare`/
+    /// `--rbn-spotter` over it in `resolve`.
+    pub rbn_compare: Option<RbnCompareConfig>,
     pub decode: DecodeConfig,
     pub detector: DetectorConfig,
     pub spot: SpotFile,
@@ -106,6 +115,9 @@ pub(crate) struct Loaded {
     pub raw: toml::Table,
     /// The `MANTA_<TABLE>_<KEY>` variables the overlay applied, sorted.
     pub env_vars: Vec<String>,
+    /// Stderr notes about the file itself (an inert table), printed by the
+    /// caller with `resolve`'s merge notes.
+    pub notes: Vec<String>,
 }
 
 /// `[spot]`, with relative file paths already resolved (file values against
@@ -289,6 +301,19 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
              the servers publish)"
         );
     }
+    let mut notes = Vec::new();
+    let rbn_compare = take_typed::<RbnCompareConfig>(&doc, "rbn_compare", &origin, &overlay)?;
+    if let Some(rc) = &rbn_compare {
+        rc.validate()
+            .map_err(|e| anyhow!("{origin}: {e}{}", overlay.suffix("rbn_compare")))?;
+        match &server {
+            None if rc.enabled => bail!("{}", rbn_compare_needs_server(&origin)),
+            None => notes.push(RBN_COMPARE_INERT_NOTE.to_string()),
+            Some(s) => rc
+                .check_spotters_against_station(&s.station_callsign)
+                .map_err(|e| anyhow!("{origin}: {e}{}", overlay.suffix("rbn_compare")))?,
+        }
+    }
     let decode_toml =
         take_typed::<DecodeConfigToml>(&doc, "decode", &origin, &overlay)?.unwrap_or_default();
     let decode = crate::validate_decode_config(decode_toml.into_decode_config(), &origin)?;
@@ -330,6 +355,7 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         origin,
         server,
         rbn_uplink,
+        rbn_compare,
         decode,
         detector,
         spot,
@@ -337,7 +363,34 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         present: doc.keys().cloned().collect(),
         raw: doc,
         env_vars,
+        notes,
     })
+}
+
+/// MAN-301: an enabled `[rbn_compare]` (from the file, the environment or
+/// `--rbn-compare`) without `[server]`.
+pub(crate) fn rbn_compare_needs_server(origin: &str) -> String {
+    format!(
+        "{origin}: [rbn_compare] needs a [server] table (grades are published on the JSON \
+         stream and /metrics, which only the daemon runs)"
+    )
+}
+
+/// MAN-301: a disabled `[rbn_compare]` without `[server]` is inert.
+pub(crate) const RBN_COMPARE_INERT_NOTE: &str = "note: [rbn_compare] is off and ignored";
+
+/// `check_top_level`'s list of the tables manta reads, built from
+/// `KNOWN_TABLES` so a new table cannot drift it. `rbn_uplink` is an array
+/// of tables, so it keeps its double brackets.
+fn known_tables_list() -> String {
+    KNOWN_TABLES
+        .iter()
+        .map(|t| match *t {
+            "rbn_uplink" => format!("[[{t}]]"),
+            _ => format!("[{t}]"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn read_doc(p: &Path) -> Result<toml::Table> {
@@ -370,8 +423,8 @@ fn check_top_level(doc: &toml::Table, origin: &str) -> Result<()> {
                 .map(|known| format!(" (did you mean [{known}]?)"))
                 .unwrap_or_default();
             bail!(
-                "unrecognized table [{key}] in {origin}{suggestion} -- manta reads [server], \
-                 [[rbn_uplink]], [input], [spot], [detector], [decode]"
+                "unrecognized table [{key}] in {origin}{suggestion} -- manta reads {}",
+                known_tables_list()
             );
         }
         match (key.as_str(), value) {
@@ -600,7 +653,7 @@ fn apply_env_overlay(doc: &mut toml::Table, vars: &[(OsString, OsString)]) -> Re
         }) else {
             bail!(
                 "unrecognized environment variable {name} (manta reads {ENV_CONFIG} and \
-                 MANTA_<SERVER|INPUT|SPOT|DETECTOR|DECODE>_<KEY>)"
+                 MANTA_<SERVER|RBN_COMPARE|INPUT|SPOT|DETECTOR|DECODE>_<KEY>)"
             );
         };
         let Some(value) = value.to_str() else {
@@ -1136,6 +1189,18 @@ mod tests {
         assert_eq!(loaded.input.shared.freq_correction_ppm, Some(3.0));
     }
 
+    /// MAN-314: `MANTA_DETECTOR_RTTY_FILTER=false` overrides the file.
+    #[test]
+    fn env_rtty_filter_overrides_the_file() {
+        let loaded = load_env(
+            Some("[detector]\nrtty_filter = true\nrtty_dwell_ms = 30000\n"),
+            &[("MANTA_DETECTOR_RTTY_FILTER", "false")],
+        )
+        .unwrap();
+        assert!(!loaded.detector.rtty_filter);
+        assert_eq!(loaded.detector.rtty_dwell_hops, 11250);
+    }
+
     #[test]
     fn env_values_are_typed_by_toml_probe() {
         let loaded = load_env(
@@ -1466,6 +1531,136 @@ mod tests {
         for name in names {
             assert!(ENV_IGNORED.contains(&name), "{name} must be in ENV_IGNORED");
         }
+    }
+
+    // ---- MAN-301: [rbn_compare]
+
+    #[test]
+    fn rbn_compare_is_a_known_table() {
+        assert!(KNOWN_TABLES.contains(&"rbn_compare"));
+        let loaded = load_file(&format!(
+            "{SERVER}[rbn_compare]\nenabled = true\nwindow_secs = 240\nspotters = [\"k5tr\"]\n"
+        ))
+        .unwrap();
+        let rc = loaded.rbn_compare.expect("[rbn_compare] reaches Loaded");
+        assert!(rc.enabled);
+        assert_eq!(rc.window_secs, 240);
+        assert_eq!(rc.spotters, vec!["K5TR".to_string()]);
+        assert!(loaded.notes.is_empty(), "{:?}", loaded.notes);
+        assert!(load_file(SERVER).unwrap().rbn_compare.is_none());
+    }
+
+    #[test]
+    fn rbn_compare_enabled_without_server_is_rejected() {
+        let f = write_cfg("[rbn_compare]\nenabled = true\n");
+        let err = format!("{:#}", load(Some(f.path()), Env::Ignore).unwrap_err());
+        assert_eq!(
+            err,
+            format!(
+                "{}: [rbn_compare] needs a [server] table (grades are published on the JSON \
+                 stream and /metrics, which only the daemon runs)",
+                f.path().display()
+            )
+        );
+        // The rbn_uplink refusal still applies alongside.
+        let err = err_of("[[rbn_uplink]]\nenabled = false\ntarget_host = \"x\"\ntarget_port = 1\n");
+        assert!(
+            err.contains("[[rbn_uplink]] needs a [server] table"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rbn_compare_disabled_without_server_is_a_note() {
+        let loaded = load_file("[rbn_compare]\nenabled = false\n").unwrap();
+        assert_eq!(
+            loaded.notes,
+            vec!["note: [rbn_compare] is off and ignored".to_string()]
+        );
+        assert!(loaded.server.is_none());
+        assert!(loaded.rbn_compare.is_some_and(|rc| !rc.enabled));
+        // A bad value in an inert table is still an error.
+        let err = err_of("[rbn_compare]\nwindow_secs = 10\n");
+        assert!(
+            err.ends_with(": [rbn_compare].window_secs must be 30 to 3600, got 10"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rbn_compare_env_overlay() {
+        let body = format!("{SERVER}[rbn_compare]\nenabled = true\nwindow_secs = 120\n");
+        let loaded = load_env(Some(&body), &[("MANTA_RBN_COMPARE_WINDOW_SECS", "240")]).unwrap();
+        assert_eq!(loaded.rbn_compare.unwrap().window_secs, 240);
+        assert_eq!(
+            loaded.env_vars,
+            vec!["MANTA_RBN_COMPARE_WINDOW_SECS".to_string()]
+        );
+        let loaded =
+            load_env(Some(&body), &[("MANTA_RBN_COMPARE_FEED_HOST", "127.0.0.1")]).unwrap();
+        assert_eq!(loaded.rbn_compare.unwrap().feed_host, "127.0.0.1");
+        // String-typed: `12345` reaches the callsign check as a string, not
+        // an integer type error, and is then refused as a callsign.
+        let err = format!(
+            "{:#}",
+            load_env(
+                Some(&body),
+                &[("MANTA_RBN_COMPARE_LOGIN_CALLSIGN", "12345")]
+            )
+            .unwrap_err()
+        );
+        assert!(
+            err.contains("login_callsign \"12345\" is not a plausible callsign"),
+            "{err}"
+        );
+        assert!(err.contains("MANTA_RBN_COMPARE_LOGIN_CALLSIGN"), "{err}");
+        let err = format!(
+            "{:#}",
+            load_env(Some(&body), &[("MANTA_RBN_COMPARE_FOO", "1")]).unwrap_err()
+        );
+        assert!(err.contains("unknown field `foo`"), "{err}");
+        assert!(err.contains("MANTA_RBN_COMPARE_FOO"), "{err}");
+        // The environment alone can turn it on, and then needs [server].
+        let err = format!(
+            "{:#}",
+            load_env(None, &[("MANTA_RBN_COMPARE_ENABLED", "true")]).unwrap_err()
+        );
+        assert!(
+            err.starts_with("environment: [rbn_compare] needs a [server] table"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rbn_compare_spotters_must_not_be_own_call() {
+        let body = "[server]\nstation_callsign = \"W3XYZ-1\"\n[rbn_compare]\nenabled = true\n";
+        let f = write_cfg(&format!("{body}spotters = [\"K5TR\", \"w3xyz\"]\n"));
+        let err = format!("{:#}", load(Some(f.path()), Env::Ignore).unwrap_err());
+        assert_eq!(
+            err,
+            format!(
+                "{}: [rbn_compare].spotters lists W3XYZ, this station's own callsign: its \
+                 reports are always excluded, so every spot would grade none",
+                f.path().display()
+            )
+        );
+        let err = err_of(&format!("{body}spotters = [\"W3XYZ-1\"]\n"));
+        assert!(err.contains("spotters lists W3XYZ-1"), "{err}");
+        assert!(load_file(&format!("{body}spotters = [\"K5TR\"]\n")).is_ok());
+    }
+
+    #[test]
+    fn unknown_table_message_lists_rbn_compare() {
+        let err = err_of("[telemetry]\nx = 1\n");
+        assert!(
+            err.ends_with(
+                "-- manta reads [server], [[rbn_uplink]], [rbn_compare], [input], [spot], \
+                 [detector], [decode]"
+            ),
+            "{err}"
+        );
+        let err = err_of("[rbn_compar]\nenabled = true\n");
+        assert!(err.contains("did you mean [rbn_compare]?"), "{err}");
     }
 
     #[test]

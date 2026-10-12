@@ -47,6 +47,14 @@ pub struct DetectorConfig {
     /// track-manager bookkeeping) that don't imply "this channel is a
     /// standing artifact."
     pub silent_respawn_cooldown_hops: u64,
+    /// MAN-314 (SPEC §2.6): recognise two-tone FSK (RTTY) signals and
+    /// start no CW track on them or their keying sidebands once marked.
+    /// `false` restores the pre-MAN-314 behaviour exactly.
+    pub rtty_filter: bool,
+    /// MAN-314: how long an FSK signal must last before it is marked as
+    /// RTTY, in hops. The detector works in whole 375-hop blocks
+    /// (`rtty_dwell_hops / manta_dsp::fsk::BLOCK_HOPS`).
+    pub rtty_dwell_hops: u64,
 }
 
 impl Default for DetectorConfig {
@@ -172,6 +180,9 @@ impl Default for DetectorConfig {
             // host a real signal again later, so this is a rate limit, not
             // a permanent denylist.
             silent_respawn_cooldown_hops: 11250,
+            // MAN-314: on; 7500 hops = 20 s = 20 detector blocks.
+            rtty_filter: true,
+            rtty_dwell_hops: 7500,
         }
     }
 }
@@ -202,6 +213,9 @@ pub(crate) enum CloseReason {
     /// Track cap exceeded; this was the lowest-current-SNR track
     /// (ARCHITECTURE §4).
     Evicted,
+    /// MAN-314 (SPEC §2.6): the track sits on a marked RTTY signal's hard
+    /// span.
+    Rtty,
 }
 
 /// Per-`CloseReason` close counters (issue #26: SPEC §2.5 / ARCHITECTURE §4,
@@ -216,6 +230,8 @@ pub struct CloseCounts {
     pub silent: u64,
     pub merged: u64,
     pub evicted: u64,
+    /// MAN-314: closed because the track sat on a marked RTTY signal.
+    pub rtty: u64,
 }
 
 impl CloseCounts {
@@ -226,6 +242,7 @@ impl CloseCounts {
             CloseReason::Silent => self.silent += 1,
             CloseReason::Merged => self.merged += 1,
             CloseReason::Evicted => self.evicted += 1,
+            CloseReason::Rtty => self.rtty += 1,
         }
     }
 }
@@ -357,6 +374,7 @@ use manta_dsp::channelizer::{
     interpolate_offset, odd_channel_sign_correction, power_db, HopOutput,
 };
 use manta_dsp::floor::{FloorBank, Gate};
+use manta_dsp::fsk::{FskDetector, BLOCK_HOPS as FSK_BLOCK_HOPS};
 use manta_dsp::refine::{Refiner, GROUP_DELAY_HOPS};
 use smallvec::{smallvec, SmallVec};
 use std::collections::{BTreeMap, VecDeque};
@@ -931,9 +949,53 @@ pub struct TrackManager {
     /// MAN-115: channelizer hops with `m` below this are the zero-padding
     /// pre-roll and are skipped by `process_hops`. See `skip_preroll_hops`.
     preroll_hops: u64,
+<<<<<<< HEAD
     /// MAN-118: where garbles and per-track rail ratios are published.
     /// `None` (the default) skips both. See `set_quality_observer`.
     quality: Option<Arc<DecodeQualityObserver>>,
+=======
+    /// MAN-314 (SPEC §2.6): the RTTY detector, `None` when
+    /// `DetectorConfig::rtty_filter` is off.
+    fsk: Option<FskDetector>,
+    /// MAN-314: every RTTY signal ever marked, in marking order (the
+    /// oldest cleared entries are dropped past `RTTY_LOG_CAP` while
+    /// `rtty_log_capped`).
+    rtty_log: Vec<RttyLogEntry>,
+    /// MAN-314: apply `RTTY_LOG_CAP` to `rtty_log`; true unless
+    /// `keep_full_rtty_history` was called.
+    rtty_log_capped: bool,
+    /// MAN-314: bumped whenever a block changes the marked set or a marked
+    /// signal's metadata.
+    rtty_changes: u64,
+    /// MAN-314: sample timestamp of the hop whose block made the latest
+    /// `rtty_changes` bump; 0 before the first.
+    rtty_changed_sample_ts: u64,
+}
+
+/// MAN-314: bound on `TrackManager::rtty_signals` for a long-running
+/// daemon; past it the oldest cleared entries are dropped. Not applied
+/// after `TrackManager::keep_full_rtty_history`.
+const RTTY_LOG_CAP: usize = 4096;
+
+/// MAN-314: one RTTY signal the detector marked (SPEC §2.6). Frequencies
+/// are absolute Hz before any ppm calibration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RttyLogEntry {
+    /// `manta_dsp::fsk::FskSignal::id`, stable while the signal is marked.
+    pub id: u32,
+    /// Upper tone.
+    pub mark_hz: f64,
+    /// Lower tone.
+    pub space_hz: f64,
+    /// Nearest standard shift (170/200/425/450/850 Hz).
+    pub shift_hz: f64,
+    /// `mark_hz - space_hz` as measured.
+    pub measured_shift_hz: f64,
+    /// Sample timestamp of the hop that marked it.
+    pub marked_sample_ts: u64,
+    /// Sample timestamp of the hop that cleared it; `None` while marked.
+    pub cleared_sample_ts: Option<u64>,
+>>>>>>> 2c7a2f50a96ba2bbba78de3ffb9aca9b5a28fd85
 }
 
 impl TrackManager {
@@ -961,8 +1023,120 @@ impl TrackManager {
             close_counts: CloseCounts::default(),
             channel_cooldown_until: vec![0; n_channels],
             preroll_hops: 0,
+<<<<<<< HEAD
             quality: None,
+=======
+            fsk: detector_cfg.rtty_filter.then(|| {
+                let blocks = detector_cfg.rtty_dwell_hops / FSK_BLOCK_HOPS as u64;
+                FskDetector::new(n_channels, u32::try_from(blocks).unwrap_or(u32::MAX))
+            }),
+            rtty_log: Vec::new(),
+            rtty_log_capped: true,
+            rtty_changes: 0,
+            rtty_changed_sample_ts: 0,
+>>>>>>> 2c7a2f50a96ba2bbba78de3ffb9aca9b5a28fd85
         }
+    }
+
+    /// MAN-314: how many blocks changed the marked RTTY set or a marked
+    /// signal's metadata; a consumer re-reads `rtty_signals` when this
+    /// moves.
+    pub fn rtty_changes(&self) -> u64 {
+        self.rtty_changes
+    }
+
+    /// MAN-314: sample timestamp of the hop whose block made the latest
+    /// `rtty_changes` bump, so the stream time at which `rtty_signals`
+    /// last changed; 0 before the first change.
+    pub fn rtty_changed_sample_ts(&self) -> u64 {
+        self.rtty_changed_sample_ts
+    }
+
+    /// MAN-314: every RTTY signal marked so far (SPEC §2.6), in marking
+    /// order; the currently marked set is the entries whose
+    /// `cleared_sample_ts` is `None`. Past `RTTY_LOG_CAP` entries the
+    /// oldest cleared ones are dropped, unless `keep_full_rtty_history`
+    /// was called.
+    pub fn rtty_signals(&self) -> &[RttyLogEntry] {
+        &self.rtty_log
+    }
+
+    /// MAN-314: keep every `rtty_signals` entry instead of dropping the
+    /// oldest cleared ones past `RTTY_LOG_CAP`. For `decode_samples`,
+    /// whose `DecodeReport::rtty` lists every marked signal of a finite
+    /// input; a stream keeps the cap. Call it before the first
+    /// `process_hops`: entries already dropped are not restored.
+    pub fn keep_full_rtty_history(&mut self) {
+        self.rtty_log_capped = false;
+    }
+
+    /// MAN-314: sync `rtty_log` with the detector's marked set after a
+    /// block that changed it.
+    fn update_rtty_log(&mut self, sample_ts: u64) {
+        let Some(fsk) = self.fsk.as_ref() else {
+            return;
+        };
+        let n = self.owner_of.len() as f64;
+        let to_hz =
+            |j: f64| self.center_freq_hz + (j - (n / 2.0).floor()) * self.channel_spacing_hz;
+        for e in self.rtty_log.iter_mut() {
+            if e.cleared_sample_ts.is_none() && !fsk.signals().iter().any(|s| s.id == e.id) {
+                e.cleared_sample_ts = Some(sample_ts);
+            }
+        }
+        for s in fsk.signals() {
+            let mark_hz = to_hz(s.high_j);
+            let space_hz = to_hz(s.low_j);
+            match self
+                .rtty_log
+                .iter_mut()
+                .find(|e| e.id == s.id && e.cleared_sample_ts.is_none())
+            {
+                Some(e) => {
+                    e.mark_hz = mark_hz;
+                    e.space_hz = space_hz;
+                    e.shift_hz = s.nominal_shift_hz;
+                    e.measured_shift_hz = s.measured_shift_hz;
+                }
+                None => self.rtty_log.push(RttyLogEntry {
+                    id: s.id,
+                    mark_hz,
+                    space_hz,
+                    shift_hz: s.nominal_shift_hz,
+                    measured_shift_hz: s.measured_shift_hz,
+                    marked_sample_ts: sample_ts,
+                    cleared_sample_ts: None,
+                }),
+            }
+        }
+        while self.rtty_log_capped && self.rtty_log.len() > RTTY_LOG_CAP {
+            match self
+                .rtty_log
+                .iter()
+                .position(|e| e.cleared_sample_ts.is_some())
+            {
+                Some(i) => {
+                    self.rtty_log.remove(i);
+                }
+                None => break,
+            }
+        }
+        self.rtty_changes += 1;
+        self.rtty_changed_sample_ts = sample_ts;
+    }
+
+    /// MAN-314 (SPEC §2.6): may no CW candidate spawn on channel `k`? True
+    /// inside a marked RTTY signal's hard span, or inside its shadow below
+    /// the shadow depth.
+    fn rtty_vetoes_spawn(&self, k: usize) -> bool {
+        let Some(fsk) = self.fsk.as_ref() else {
+            return false;
+        };
+        fsk.in_hard_span(k)
+            || fsk.shadow_vetoes_spawn(
+                k,
+                self.gate.smoothed_db(k) - self.floor.effective_floor_db(k),
+            )
     }
 
     fn n_channels(&self) -> usize {
@@ -1116,6 +1290,13 @@ impl TrackManager {
         let power_db_vals: Vec<f64> = hop.power.iter().map(|&p| power_db(p)).collect();
         self.floor.update(&power_db_vals);
         let (rise, drop) = self.gate.update(&power_db_vals, &self.floor);
+        // MAN-314 (SPEC §2.6): feed the RTTY detector the same power and
+        // floor; a block that changed the marked set updates the log.
+        if let Some(fsk) = self.fsk.as_mut() {
+            if fsk.push_hop(hop, &power_db_vals, &self.floor) {
+                self.update_rtty_log(sample_ts);
+            }
+        }
         // MAN-171 (Codex review, PR #174 round 4, correct): clear a
         // channel's respawn cooldown the moment its own `rise` genuinely
         // drops. `CloseReason::Silent` does NOT prove the RF signal ended
@@ -1297,6 +1478,20 @@ impl TrackManager {
         // samples still queued in `pending` THIS batch first -- without
         // that, `finish()` alone would reflect only whatever the decoder
         // processed as of the end of the PREVIOUS `process_hops` batch.
+        // MAN-314 (SPEC §2.4/§2.6): close every open track whose centre
+        // channel sits on a marked RTTY signal's hard span. Hard span only:
+        // the splatter shadow must never close an existing track, since a
+        // real CW track's key-up gaps put it below any relative level.
+        if let Some(fsk) = self.fsk.as_ref() {
+            let n = self.n_channels();
+            for (&id, track) in &self.tracks {
+                if !close_reasons.contains_key(&id) && fsk.in_hard_span(track.owned(n)[1]) {
+                    self.close_counts.record(CloseReason::Rtty);
+                    close_reasons.insert(id, CloseReason::Rtty);
+                    closed.push(id);
+                }
+            }
+        }
         let mut closure_flush_events: Vec<DecoderEvent> = Vec::new();
         let quality = self.quality.clone();
         closed.retain(|id| {
@@ -1356,12 +1551,14 @@ impl TrackManager {
                     && self.owner_of[k].is_none()
                     && !self.channel_cooling_down(k)
                     && self.is_local_peak(k)
+                    && !self.rtty_vetoes_spawn(k)
                 {
                     let mut winner = k;
                     if k + 1 < n
                         && rise[k + 1]
                         && self.owner_of[k + 1].is_none()
                         && !self.channel_cooling_down(k + 1)
+                        && !self.rtty_vetoes_spawn(k + 1)
                     {
                         if hop.power[k + 1] > hop.power[winner] {
                             winner = k + 1;
@@ -1953,6 +2150,107 @@ pub(crate) fn event_track_id(e: &DecoderEvent) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_detector_config_has_rtty_on_and_7500_dwell_hops() {
+        let d = DetectorConfig::default();
+        assert!(d.rtty_filter);
+        assert_eq!(d.rtty_dwell_hops, 7500);
+        assert_eq!(d.rtty_dwell_hops / FSK_BLOCK_HOPS as u64, 20);
+    }
+
+    /// MAN-314: a 30 dB RTTY signal's tracks close as `CloseReason::Rtty`
+    /// once it is marked, counted in `CloseCounts::rtty`, and its marked
+    /// entry lands in `rtty_signals`.
+    #[test]
+    fn rtty_close_is_counted_and_bookkeeping() {
+        use manta_testkit::fsk::{add_fsk, FskSpec};
+        let fs = 96_000.0;
+        let (mut iq, _) = manta_testkit::scene::render_scene(&[], fs, 40.0, Some(11)).unwrap();
+        add_fsk(
+            &mut iq,
+            fs,
+            &FskSpec {
+                mark_offset_hz: 15_000.0,
+                shift_hz: 170.0,
+                baud: 45.45,
+                snr_2500_db: 30.0,
+                text: "CQ TEST DE W1AW W1AW RYRYRY 599 001 ".into(),
+                start_s: 0.0,
+                watterson: None,
+                seed: 1,
+            },
+        );
+        let mut ch = manta_dsp::channelizer::Channelizer::new(fs, 0.0).unwrap();
+        let hop = ch.hop() as u64;
+        let mut tm = TrackManager::new(
+            ch.n_channels(),
+            fs,
+            0.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        let mut events = Vec::new();
+        for chunk in iq.chunks(4096) {
+            events.extend(tm.process_hops(&ch.process(chunk), |m| m * hop));
+        }
+        assert_eq!(tm.rtty_signals().len(), 1, "{:?}", tm.rtty_signals());
+        assert!(tm.rtty_changes() >= 1);
+        assert!(tm.close_counts().rtty >= 1, "{:?}", tm.close_counts());
+
+        let off = DetectorConfig {
+            rtty_filter: false,
+            ..DetectorConfig::default()
+        };
+        let mut ch = manta_dsp::channelizer::Channelizer::new(fs, 0.0).unwrap();
+        let mut tm_off = TrackManager::new(ch.n_channels(), fs, 0.0, off, DecodeConfig::default());
+        for chunk in iq.chunks(4096) {
+            tm_off.process_hops(&ch.process(chunk), |m| m * hop);
+        }
+        assert!(tm_off.rtty_signals().is_empty());
+        assert_eq!(tm_off.close_counts().rtty, 0);
+    }
+
+    /// MAN-314: past `RTTY_LOG_CAP` a stream's log drops the oldest
+    /// cleared entries; after `keep_full_rtty_history` (what
+    /// `decode_samples` calls) every entry stays.
+    #[test]
+    fn rtty_log_cap_is_lifted_by_keep_full_rtty_history() {
+        let fill = |tm: &mut TrackManager| {
+            for id in 0..=RTTY_LOG_CAP as u32 {
+                tm.rtty_log.push(RttyLogEntry {
+                    id,
+                    mark_hz: 14_085_170.0,
+                    space_hz: 14_085_000.0,
+                    shift_hz: 170.0,
+                    measured_shift_hz: 170.0,
+                    marked_sample_ts: u64::from(id),
+                    cleared_sample_ts: Some(u64::from(id) + 1),
+                });
+            }
+            tm.update_rtty_log(RTTY_LOG_CAP as u64 + 2);
+        };
+        let new_tm = || {
+            TrackManager::new(
+                64,
+                96_000.0,
+                0.0,
+                DetectorConfig::default(),
+                DecodeConfig::default(),
+            )
+        };
+
+        let mut stream = new_tm();
+        fill(&mut stream);
+        assert_eq!(stream.rtty_signals().len(), RTTY_LOG_CAP);
+        assert_eq!(stream.rtty_signals()[0].id, 1);
+
+        let mut file = new_tm();
+        file.keep_full_rtty_history();
+        fill(&mut file);
+        assert_eq!(file.rtty_signals().len(), RTTY_LOG_CAP + 1);
+        assert_eq!(file.rtty_signals()[0].id, 0);
+    }
 
     fn cfg() -> DetectorConfig {
         DetectorConfig {

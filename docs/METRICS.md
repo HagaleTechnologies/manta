@@ -64,8 +64,15 @@ ignored. Any other path or any method other than `GET` gets
 
 ## Metric families
 
+<<<<<<< HEAD
 All 45 families, in the order `/metrics` renders them. Every family's
 `# HELP` and `# TYPE` lines are always rendered. "Present when" says when
+=======
+All 52 families, in the order `/metrics` renders them. Every family's
+`# HELP` and `# TYPE` lines are always rendered, except the ten
+RBN comparison families (MAN-301) at the end of the table, which are
+rendered only when `[rbn_compare]` is enabled. "Present when" says when
+>>>>>>> 2c7a2f50a96ba2bbba78de3ffb9aca9b5a28fd85
 the family also carries samples. Where it says a family has no samples, the
 value is absent, not zero: the node does not measure it, so do not read the
 missing series as "no loss" or "no traffic".
@@ -85,6 +92,7 @@ missing series as "no loss" or "no traffic".
 | `manta_json_clients_connected` | gauge | — | Currently connected JSON Lines clients. | Always. |
 | `manta_ws_clients_connected` | gauge | — | Currently connected WebSocket clients. | Always. |
 | `manta_active_tracks` | gauge | — | Currently active decoder tracks. Copied from the decode loop every 250 ms; set to 0 while the source is in an outage. | Always. |
+| `manta_rtty_signals` | gauge | `band` | RTTY (two-tone FSK) signals the detector currently marks, by amateur band. CW tracks are not started on a marked signal ([MAN-314](DECISIONS/2026-10-11-man314-rtty-recognition.md)). `band` is a band name such as `20m`, or `unknown` outside every band. Copied from the decode loop on every change; set to 0 while the source is in an outage and at shutdown. | One series per band after the first RTTY mark in that band; the series stays (at 0) after its signals clear. No samples before the first mark. |
 | `manta_source_health` | gauge | `source` | Health of each input source: 1 healthy, 0 unhealthy. `source` is the input type: `file`, `audio`, `kiwi`, `soapy` or `hpsdr`. | One series per registered source, from the first health report. A file replay reports 1 at startup. Reconnecting sources report on each connect and disconnect; HPSDR reads 0 until the radio is confirmed live. |
 | `manta_source_outages_total` | counter | `source` | Times each input source went from healthy to unhealthy (a lost connection or failed read). A source that starts unhealthy has not had an outage. | Same `source` set as `manta_source_health`; starts at 0. |
 | `manta_source_down_seconds_total` | counter | `source` | Seconds each input source spent in outages that have ended. An outage still in progress is added when it ends; until then it shows only as `manta_source_health` 0. | Same `source` set as `manta_source_health`; starts at 0. |
@@ -117,6 +125,16 @@ missing series as "no loss" or "no traffic".
 | `manta_candidate_repetitions` | histogram | `le` | One observation per callsign candidate the repetition gate scored: how many message-distinct decodes of that call near that frequency it had seen within the trailing 90 s, this one included. A candidate needs 2 to spot, so the `le="1"` share is the share of candidates nobody repeated (a busted-call proxy). Buckets: 1, 2, 3, 4, 5, 6, 8, 10, 15, 20 and `+Inf`, plus `_sum` and `_count`. | As `manta_decode_chars_total`. |
 | `manta_healthy` | gauge | — | Whether `/healthz` currently reports this node healthy (1) or not (0). Same evaluation as `/healthz`. | Always. |
 | `manta_listener_up` | gauge | `listener` | Whether each listener is currently up (1) or down (0). `listener` is `telnet`, `json` or `metrics`. | One series per listener once the listeners have started; a listener whose task ends reads 0. |
+| `manta_rbn_compare_grades_total` | counter | `band`, `grade` | Spots graded against the RBN feed since start, by the spot's band and grade (`match`, `disagree`, `elsewhere`, `none`, `unknown`). | Only with `[rbn_compare]` enabled: the family's `# HELP`/`# TYPE` lines are absent otherwise. One series per (band, grade) pair after its first grade. |
+| `manta_rbn_compare_grades_last_hour` | gauge | `band`, `grade` | Spots graded in the last hour, by band and grade. | Only with `[rbn_compare]` enabled, as for `manta_rbn_compare_grades_total`. |
+| `manta_rbn_compare_disagreements_last_hour` | gauge | `band`, `kind` | Spots graded `disagree` in the last hour, by band and the tolerance that failed (`frequency` or `speed`); a spot failing both counts under each. | Only with `[rbn_compare]` enabled. |
+| `manta_rbn_compare_freq_offset_median_hz` | gauge | `band` | Median of manta's frequency minus RBN's modal frequency, in Hz, over spots graded `match` or `disagree` in the last hour. | Only with `[rbn_compare]` enabled, per band with at least one such spot. |
+| `manta_rbn_compare_freq_offset_samples` | gauge | `band` | Spots the median frequency offset is computed over. | As for `manta_rbn_compare_freq_offset_median_hz`. |
+| `manta_rbn_compare_feed_connected` | gauge | — | Whether the RBN feed is logged in and delivering lines (1) or not (0). | Only with `[rbn_compare]` enabled. |
+| `manta_rbn_compare_feed_reports_total` | counter | — | CW reports accepted from the RBN feed. | Only with `[rbn_compare]` enabled; starts at 0. |
+| `manta_rbn_compare_feed_reconnects_total` | counter | — | RBN feed connections lost or failed. | Only with `[rbn_compare]` enabled; starts at 0. |
+| `manta_rbn_compare_pending` | gauge | — | Spots not yet graded: waiting for their comparison window to close, or held past the close while the feed is silent. | Only with `[rbn_compare]` enabled. |
+| `manta_rbn_compare_ungraded_total` | counter | — | Spots never graded: the pending queue was full, or the comparator lagged the spot bus. | Only with `[rbn_compare]` enabled; starts at 0. |
 
 ### Sample
 
@@ -274,3 +292,5 @@ For what each uplink state means and what to do about it, see
   source outage counters.
 - [MAN-132](DECISIONS/2026-10-08-man132-metrics-loopback-bind.md): the
   loopback default for `metrics_bind_addr`.
+- [MAN-301](DECISIONS/2026-10-11-man301-live-rbn-comparison.md): the
+  RBN comparison families.
