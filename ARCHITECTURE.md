@@ -481,6 +481,21 @@ validation (MAN-28). Dedupe (step 5) still applies.
   naming the exact binary, and the part before `+` is the release the
   decoder-output rule in `CHANGELOG.md` governs. See
   `docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md`.
+- **Outbound RBN uplink (experimental)** (`uplink.rs`): one client task per
+  enabled `[[rbn_uplink]]`. It connects to `target_host:target_port`, reads
+  one line and ignores it, and sends the login callsign plus CRLF. Each spot
+  `spot_types` lets through (CQ and beacon by default, MAN-91) is then written
+  as a `DX de` line, always in `LineFormat::Rbn` whatever `[server].line_format`
+  says, unless `dry_run` (default `true`, MAN-159) holds it back. Failed
+  connections are retried with 1 s→60 s backoff. That handshake and layout are
+  manta's assumption. RBN publishes nothing about what its ingest accepts. The
+  AK1A layout was measured on RBN's *outbound* relay
+  (`telnet.reversebeacon.net:7000`, MAN-88), not on any ingest. The uplink has
+  only run against in-process mock collectors. The supported route into RBN is
+  the telnet server above behind an RBN Aggregator (broad-review D1, MAN-86).
+  The open claims and the capture that would settle them are in
+  `docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md` and
+  `docs/RUNBOOKS/aggregator-rbn-capture.md`.
 - Both servers are thin fan-out consumers of one broadcast channel; slow clients
   are disconnected, never back-pressure the pipeline. At shutdown each
   client's queued backlog is drained on a best-effort basis bounded by a

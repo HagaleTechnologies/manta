@@ -291,6 +291,8 @@ fn an_invalid_reload_is_logged_and_the_previous_lists_stay() {
         &[
             "WARN",
             "dry_run = false -- transmitting real spots",
+            // MAN-90: the reload WARN also says the uplink is experimental.
+            "unverified against RBN's real ingest",
             &format!("target=127.0.0.1:{uplink_port}"),
         ],
         LINE_TIMEOUT,
