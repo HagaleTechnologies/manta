@@ -182,16 +182,11 @@ fn bundled_retrieved_at(kind: ListKind) -> Option<SystemTime> {
 /// state or a `checked_at` in the future (the clock moved back), else
 /// `checked_at + interval`.
 pub(crate) fn next_due(now: SystemTime, state: Option<&State>, kind: ListKind) -> SystemTime {
-    match state {
-        None => now,
-        Some(state) => {
-            let checked = from_unix_secs(state.checked_at);
-            if checked > now {
-                now
-            } else {
-                checked + kind.interval()
-            }
-        }
+    match state.and_then(|state| from_unix_secs(state.checked_at)) {
+        Some(checked) if checked <= now => checked + kind.interval(),
+        // No state, or a `checked_at` past `now` (or past what
+        // `SystemTime` holds, which `load_state` refuses anyway).
+        _ => now,
     }
 }
 
@@ -301,7 +296,13 @@ fn from_cache(cache: &Cache, kind: ListKind, bundled: &Bundled) -> Option<(Accep
             return None;
         }
     };
-    let downloaded_at = from_unix_secs(state.downloaded_at);
+    // `load_state` refuses a state whose times `SystemTime` cannot hold.
+    let (Some(downloaded_at), Some(checked_at)) = (
+        from_unix_secs(state.downloaded_at),
+        from_unix_secs(state.checked_at),
+    ) else {
+        return None;
+    };
     if bundled_retrieved_at(kind).is_some_and(|retrieved| downloaded_at <= retrieved) {
         return None;
     }
@@ -309,7 +310,7 @@ fn from_cache(cache: &Cache, kind: ListKind, bundled: &Bundled) -> Option<(Accep
         Ok(accepted) => {
             let mut in_use =
                 InUse::new(kind, state.sha256.clone(), Origin::Cache { downloaded_at });
-            in_use.confirmed_at = Some(from_unix_secs(state.checked_at));
+            in_use.confirmed_at = Some(checked_at);
             Some((accepted, in_use))
         }
         Err(reason) => {
@@ -365,6 +366,9 @@ struct ListRun {
     /// The cache's `state.json`, or the in-memory equivalent without one.
     state: Option<State>,
     next: SystemTime,
+    /// When `next` was set (startup or the last attempt). A `now` before
+    /// it means the clock moved back, so the list is due at once (D8).
+    scheduled_at: SystemTime,
 }
 
 /// The refresher's whole state; [`Refresher::refresh_once`] is the
@@ -410,11 +414,19 @@ impl Refresher {
                 } else {
                     next_due(now, schedule, kind)
                 };
+                // A list not yet due counts from its `checked_at`, so the
+                // clock must move back past that, as D8 says, to make it due.
+                let scheduled_at = if next > now {
+                    next - kind.interval()
+                } else {
+                    now
+                };
                 ListRun {
                     url: list.url,
                     in_use: list.in_use,
                     state,
                     next,
+                    scheduled_at,
                 }
             })
             .collect();
@@ -479,6 +491,7 @@ impl Refresher {
     fn failed(&mut self, index: usize, now: SystemTime, what: &str) -> ListRefreshOutcome {
         let run = &mut self.runs[index];
         run.next = now + RETRY_AFTER_FAILURE;
+        run.scheduled_at = now;
         crate::logging::warning(&format!(
             "warning: list refresh: {} {what}; still using sha256 {} ({}); next try in 1 hour",
             run.in_use.kind.name(),
@@ -536,6 +549,7 @@ impl Refresher {
         run.state = Some(state);
         run.in_use.confirmed_at = Some(now);
         run.next = now + kind.interval();
+        run.scheduled_at = now;
         crate::logging::note(&format!(
             "list refresh: {} unchanged ({why}); next check {}",
             kind.name(),
@@ -584,6 +598,7 @@ impl Refresher {
             confirmed_at: Some(now),
         };
         run.next = now + kind.interval();
+        run.scheduled_at = now;
         if let Some(metrics) = &self.metrics {
             metrics.set_list_in_use(kind.name(), &sha256, ListOrigin::Download);
         }
@@ -598,7 +613,9 @@ impl Refresher {
         ListRefreshOutcome::Updated
     }
 
-    /// Every list due at `now`, in `ListKind` order, until `stop` is set.
+    /// Every list due at `now`, in `ListKind` order, until `stop` is set:
+    /// its next check has come, or the clock has moved back past the time
+    /// that check was set.
     fn run_due(&mut self, now: SystemTime, stop: &AtomicBool) {
         for kind in ListKind::ALL {
             if stop.load(Ordering::Relaxed) {
@@ -607,7 +624,7 @@ impl Refresher {
             if self
                 .runs
                 .iter()
-                .any(|run| run.in_use.kind == kind && now >= run.next)
+                .any(|run| run.in_use.kind == kind && (now >= run.next || now < run.scheduled_at))
             {
                 self.refresh_once(kind, now);
             }
@@ -719,7 +736,7 @@ mod tests {
     }
 
     fn at(secs: u64) -> SystemTime {
-        from_unix_secs(secs)
+        from_unix_secs(secs).unwrap()
     }
 
     #[test]
@@ -773,6 +790,81 @@ mod tests {
         let lists = Arc::new(bundled_lists());
         let refresher = refresher_for(ListKind::Cty, closed_url(), Some(cache), lists, now);
         assert_eq!(refresher.next_wake(), Some(now - HOUR + 7 * DAY));
+    }
+
+    #[test]
+    fn a_cache_time_out_of_range_falls_back_instead_of_panicking() {
+        let now = at(1_800_000_000);
+        let mut far = state("a", now);
+        far.checked_at = u64::MAX;
+        assert!(due(now, Some(&far), ListKind::Cty));
+
+        // A valid version whose state.json says it was downloaded at
+        // u64::MAX seconds: a cache warning and the built-in copy.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
+        let bytes = qq9_cty();
+        write_cache(&cache, ListKind::Cty, bytes.as_bytes(), SystemTime::now());
+        let mut st = cache.load_state(ListKind::Cty).unwrap().unwrap();
+        st.downloaded_at = u64::MAX;
+        cache.write_state(ListKind::Cty, &st).unwrap();
+        let (lists, in_use) = resolve_startup(
+            Arc::new(cty::Table::bundled()),
+            InUse::bundled(ListKind::Cty),
+            Arc::new(scp::Set::bundled()),
+            InUse::bundled(ListKind::Scp),
+            true,
+            Some(&cache),
+        );
+        assert_eq!(in_use[0], InUse::bundled(ListKind::Cty));
+        assert!(!lists.cty.load().is_allocated("QQ9ZZZ"));
+        let refresher = refresher_for(ListKind::Cty, closed_url(), Some(cache), lists.into(), now);
+        assert_eq!(refresher.next_wake(), Some(now));
+    }
+
+    #[test]
+    fn a_clock_that_moves_back_while_running_makes_the_list_due_at_once() {
+        // A node booted with its clock a year fast checks at `now`, then
+        // NTP steps the clock back: the next check must not wait a year.
+        let now = at(1_800_000_000);
+        let (base, server) = serve(vec![ok(manta_spot::MASTER_SCP.as_bytes(), None)]);
+        let url = HttpUrl::parse(&format!("{base}/MASTER.SCP")).unwrap();
+        let lists = Arc::new(bundled_lists());
+        let mut refresher = refresher_for(ListKind::Scp, url, None, lists, now);
+        let stop = AtomicBool::new(false);
+        refresher.run_due(now, &stop);
+        assert_eq!(refresher.next_wake(), Some(now + DAY));
+        // An hour on, nothing is due.
+        refresher.run_due(now + HOUR, &stop);
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+
+        let corrected = now - 365 * DAY;
+        refresher.run_due(corrected, &stop);
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        assert_eq!(refresher.next_wake(), Some(corrected + DAY));
+        // That check reset the schedule: no second fetch at once.
+        refresher.run_due(corrected + HOUR, &stop);
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+
+        // At startup a persisted schedule counts from `checked_at`: a step
+        // back that stays after it changes nothing, one before it is due.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
+        cache
+            .write_state(
+                ListKind::Cty,
+                &state(&bundled_sha256(ListKind::Cty), now - HOUR),
+            )
+            .unwrap();
+        let lists = Arc::new(bundled_lists());
+        let mut refresher = refresher_for(ListKind::Cty, closed_url(), Some(cache), lists, now);
+        refresher.run_due(now - Duration::from_secs(2), &stop);
+        assert_eq!(refresher.next_wake(), Some(now - HOUR + 7 * DAY));
+        refresher.run_due(now - 2 * HOUR, &stop);
+        assert_eq!(
+            refresher.next_wake(),
+            Some(now - 2 * HOUR + RETRY_AFTER_FAILURE)
+        );
     }
 
     #[test]

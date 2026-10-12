@@ -112,8 +112,8 @@ impl Cache {
     }
 
     /// `Ok(None)` when there is no `state.json`; `Err` (naming the path)
-    /// when it cannot be read, is not a state file, or names something
-    /// other than a SHA-256.
+    /// when it cannot be read, is not a state file, names something
+    /// other than a SHA-256, or holds a time `SystemTime` cannot hold.
     pub(crate) fn load_state(&self, kind: ListKind) -> Result<Option<State>, String> {
         let path = self.state_path(kind);
         let bytes = match fs::read(&path) {
@@ -129,6 +129,17 @@ impl Cache {
                 path.display(),
                 state.sha256
             ));
+        }
+        for (key, secs) in [
+            ("downloaded_at", state.downloaded_at),
+            ("checked_at", state.checked_at),
+        ] {
+            if from_unix_secs(secs).is_none() {
+                return Err(format!(
+                    "{} has {key} {secs}, which is out of range",
+                    path.display()
+                ));
+            }
         }
         Ok(Some(state))
     }
@@ -265,8 +276,9 @@ pub(crate) fn unix_secs(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-pub(crate) fn from_unix_secs(s: u64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(s)
+/// `None` when `s` is past what `SystemTime` can hold on this platform.
+pub(crate) fn from_unix_secs(s: u64) -> Option<SystemTime> {
+    UNIX_EPOCH.checked_add(Duration::from_secs(s))
 }
 
 fn is_sha256_hex(s: &str) -> bool {
@@ -380,7 +392,10 @@ mod tests {
             sha256_hex(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
-        assert_eq!(unix_secs(from_unix_secs(1_791_158_400)), 1_791_158_400);
+        assert_eq!(
+            unix_secs(from_unix_secs(1_791_158_400).unwrap()),
+            1_791_158_400
+        );
 
         // A state.json written before `last_modified` existed still loads.
         let old = format!(
@@ -447,6 +462,25 @@ mod tests {
         let err = cache.load_current(ListKind::Cty).unwrap_err();
         assert!(err.contains("is not a SHA-256"), "{err}");
 
+        // A time past what `SystemTime` holds is an error, not a panic.
+        let sha = sha256_hex(b"cty;\n");
+        for (downloaded_at, checked_at, key) in
+            [(u64::MAX, 2, "downloaded_at"), (1, u64::MAX, "checked_at")]
+        {
+            fs::write(
+                &path,
+                format!(
+                    "{{\"sha256\":\"{sha}\",\"url\":\"http://h/c\",\
+                     \"downloaded_at\":{downloaded_at},\"checked_at\":{checked_at}}}"
+                ),
+            )
+            .unwrap();
+            let err = cache.load_state(ListKind::Cty).unwrap_err();
+            assert!(err.starts_with(&path.display().to_string()), "{err}");
+            assert!(err.contains(&format!("{key} {}", u64::MAX)), "{err}");
+            assert!(err.contains("out of range"), "{err}");
+        }
+
         // The next download replaces it.
         let bytes = b"cty;\n";
         let state = state_for(bytes, 7);
@@ -499,7 +533,7 @@ mod tests {
         let cache = Cache::new(tmp.path().to_path_buf());
         let dir = tmp.path().join("cty");
         fs::create_dir_all(&dir).unwrap();
-        let base = from_unix_secs(1_790_000_000);
+        let base = from_unix_secs(1_790_000_000).unwrap();
         let shas: Vec<String> = (0..35u64)
             .map(|i| {
                 let bytes = format!("version {i};\n");

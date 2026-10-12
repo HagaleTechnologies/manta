@@ -83,10 +83,12 @@ its SHA-256 for a repeatable replay.
 8. **D8. A persisted schedule.** A list is due when it has no state, when
    `now >= checked_at + interval` (7 days for `cty.dat`, 1 day for
    `MASTER.SCP`), or when `checked_at` is in the future (the clock moved
-   back). After a failure the next try is 1 hour later. Failures are not
-   persisted, so a restart retries at once, at most once per restart. The
-   intervals and the retry are constants, as MAN-79's 180-day staleness
-   threshold is.
+   back). The running refresher applies the same rule to its own
+   schedule: when the clock moves back past the time a list's next check
+   was set, that list is due at once. After a failure the next try is 1
+   hour later. Failures are not persisted, so a restart retries at once,
+   at most once per restart. The intervals and the retry are constants,
+   as MAN-79's 180-day staleness threshold is.
 9. **D9. `sha2` moves from `[dev-dependencies]` to `[dependencies]` in
    `manta-cli` only.** It was already in `Cargo.lock`, so no crate is
    added. `manta-spot` stays free of hashing and I/O. A hash is taken over
