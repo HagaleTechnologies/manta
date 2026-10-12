@@ -2805,6 +2805,30 @@ fn latency_histogram_of(
     }
 }
 
+/// MAN-118: as `latency_histogram_of`, attaching the engine's rail-ratio
+/// bounds and the repetition gate's bucket bounds to their snapshots.
+fn decode_quality_of(
+    s: &manta_engine::DecodeQualitySnapshot,
+) -> manta_server::metrics::DecodeQuality {
+    manta_server::metrics::DecodeQuality {
+        chars_total: s.chars_total,
+        garbles_total: s.garbles_total,
+        rail_ratio: manta_server::metrics::ValueHistogram {
+            bounds: manta_engine::RAIL_RATIO_BUCKETS.to_vec(),
+            bucket_counts: s.rail_ratio_bucket_counts.clone(),
+            sum: s.rail_ratio_sum,
+        },
+        repetitions: manta_server::metrics::ValueHistogram {
+            bounds: manta_spot::REPETITION_BUCKETS
+                .iter()
+                .map(|&b| f64::from(b))
+                .collect(),
+            bucket_counts: s.repetition_bucket_counts.clone(),
+            sum: s.repetition_sum as f64,
+        },
+    }
+}
+
 /// How often the daemon samples an input source's `InputHealthCounters`
 /// into `Metrics` (MAN-56). An order of magnitude below any realistic
 /// Prometheus scrape interval, so a scrape never sees more than ~1 s of
@@ -4772,6 +4796,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 mut active_tracks_poller,
                 decode_latency,
                 mut decode_latency_poller,
+                decode_quality,
             ) = match loaded.server.clone() {
                 Some(server_cfg) => {
                     // `epoch` feeds SpotBus's wall-clock conversion (every
@@ -4874,14 +4899,25 @@ fn run_command() -> Result<std::process::ExitCode> {
                     server
                         .metrics
                         .set_decode_latency(latency_histogram_of(&decode_latency.snapshot()));
+                    // MAN-118: the decode-quality observer rides the same
+                    // poller; its all-zero snapshot is published now so
+                    // the families carry samples from startup.
+                    let decode_quality =
+                        std::sync::Arc::new(manta_engine::DecodeQualityObserver::new());
+                    server
+                        .metrics
+                        .set_decode_quality(decode_quality_of(&decode_quality.snapshot()));
                     let decode_latency_poller = {
                         let obs = decode_latency.clone();
+                        let quality = decode_quality.clone();
                         let latency_metrics = server.metrics.clone();
                         rt.spawn(async move {
                             loop {
                                 tokio::time::sleep(DECODE_LATENCY_POLL_INTERVAL).await;
                                 latency_metrics
                                     .set_decode_latency(latency_histogram_of(&obs.snapshot()));
+                                latency_metrics
+                                    .set_decode_quality(decode_quality_of(&quality.snapshot()));
                             }
                         })
                     };
@@ -4913,9 +4949,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                         Some(active_tracks_poller),
                         Some(decode_latency),
                         Some(decode_latency_poller),
+                        Some(decode_quality),
                     )
                 }
-                None => (None, None, None, None, None, None),
+                None => (None, None, None, None, None, None, None),
             };
 
             // MAN-78: with a `[server]` table, SIGHUP reloads the `[spot]`
@@ -5081,6 +5118,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 manta_engine::ListenObservers {
                     active_tracks: active_tracks.clone(),
                     decode_latency: decode_latency.clone(),
+                    decode_quality: decode_quality.clone(),
                     operator_lists: reload_enabled.then(|| operator_lists.clone()),
                     rtty: Some(rtty_observer.clone()),
                 },
@@ -5234,6 +5272,11 @@ fn run_command() -> Result<std::process::ExitCode> {
                     server
                         .metrics
                         .set_decode_latency(latency_histogram_of(&obs.snapshot()));
+                }
+                if let Some(obs) = &decode_quality {
+                    server
+                        .metrics
+                        .set_decode_quality(decode_quality_of(&obs.snapshot()));
                 }
                 server.metrics.mark_decode_stopped();
                 if let Some(poller) = decode_latency_poller.take() {
@@ -7937,6 +7980,31 @@ mod tests {
             manta_engine::DECODE_LATENCY_BUCKETS_SECONDS
         );
         assert_eq!(h.bucket_counts.iter().sum::<u64>(), 1);
+    }
+
+    #[test]
+    fn decode_quality_of_attaches_the_engines_bucket_bounds() {
+        let obs = manta_engine::DecodeQualityObserver::new();
+        obs.add_chars(4);
+        obs.add_garbles(1);
+        obs.observe_rail_ratio(3.5);
+        let q = decode_quality_of(&obs.snapshot());
+        assert_eq!(q.chars_total, 4);
+        assert_eq!(q.garbles_total, 1);
+        assert_eq!(q.rail_ratio.bounds, manta_engine::RAIL_RATIO_BUCKETS);
+        assert_eq!(
+            q.rail_ratio.bucket_counts.len(),
+            q.rail_ratio.bounds.len() + 1
+        );
+        assert_eq!(q.rail_ratio.bucket_counts.iter().sum::<u64>(), 1);
+        assert_eq!(
+            q.repetitions.bounds,
+            manta_spot::REPETITION_BUCKETS.map(f64::from)
+        );
+        assert_eq!(
+            q.repetitions.bucket_counts.len(),
+            q.repetitions.bounds.len() + 1
+        );
     }
 
     #[test]

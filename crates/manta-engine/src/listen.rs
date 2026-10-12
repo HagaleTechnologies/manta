@@ -4,6 +4,7 @@
 //! ring-thread split; see design doc §4.
 
 use crate::latency::DecodeLatencyObserver;
+use crate::quality::DecodeQualityObserver;
 use crate::PipelineConfig;
 use anyhow::Result;
 use manta_decode::events::DecoderEvent;
@@ -48,6 +49,12 @@ pub struct ListenObservers {
     /// `None` (the default) skips both the `Instant::now()` calls and the
     /// observation entirely, so `listen()`'s existing callers pay nothing.
     pub decode_latency: Option<Arc<DecodeLatencyObserver>>,
+    /// MAN-118: decode-quality signals -- characters decoded, garbles, each
+    /// `legacy` track's keying-rail ratio once per second, and the
+    /// validator's repetition-gate results. Write-only from the decode
+    /// path, so output is unchanged. `None` (the default) skips every
+    /// count and sample, so `listen()`'s existing callers pay nothing.
+    pub decode_quality: Option<Arc<DecodeQualityObserver>>,
     /// MAN-78: the one inbound field -- replacement operator lists from a
     /// live config reload, taken before each decoder event reaches the
     /// running `Validator`. `None` (the default) skips the check
@@ -262,6 +269,7 @@ fn new_segment(
     center_freq_hz: f64,
     cfg: &PipelineConfig,
     next_id: u32,
+    quality: Option<Arc<DecodeQualityObserver>>,
 ) -> Result<Segment> {
     let ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -277,6 +285,8 @@ fn new_segment(
     );
     tm.resume_track_ids_from(next_id);
     tm.skip_preroll_hops(pad_hops);
+    // MAN-118: a post-discontinuity segment keeps reporting.
+    tm.set_quality_observer(quality);
     Ok(Segment {
         ch,
         tm,
@@ -289,11 +299,16 @@ fn emit(
     events: Vec<DecoderEvent>,
     validator: &mut Validator,
     lists: Option<&OperatorListsUpdate>,
+    quality: Option<&DecodeQualityObserver>,
     calibration_factor: f64,
     on_event: &mut impl FnMut(&DecoderEvent),
     on_spot: &mut impl FnMut(&crate::Spot),
 ) {
+    let mut chars = 0u64;
     for ev in events {
+        if matches!(ev, DecoderEvent::CharDecoded { .. }) {
+            chars += 1;
+        }
         // MAN-78: the one place the validator is fed, so the one place a
         // reload's lists are taken, for calibration, steady state, outage
         // and end-of-stream batches alike.
@@ -304,6 +319,12 @@ fn emit(
         for spot in validator.ingest(&ev) {
             on_spot(&spot);
         }
+    }
+    // MAN-118: once per batch. The validator's repetition counts are
+    // already cumulative, so they overwrite rather than add.
+    if let Some(q) = quality {
+        q.add_chars(chars);
+        q.store_repetitions(validator.repetition_counts());
     }
 }
 
@@ -426,7 +447,7 @@ pub fn listen_with_observers(
         }
     };
 
-    let mut seg = new_segment(fs, center_freq_hz, cfg, 1)?;
+    let mut seg = new_segment(fs, center_freq_hz, cfg, 1, observers.decode_quality.clone())?;
     let mut seg_base: u64 = 0;
 
     let padding = vec![Complex32::new(0.0, 0.0); seg.ch.filter_len()];
@@ -478,6 +499,7 @@ pub fn listen_with_observers(
         events,
         &mut validator,
         observers.operator_lists.as_deref(),
+        observers.decode_quality.as_deref(),
         calibration_factor,
         &mut on_event,
         &mut on_spot,
@@ -494,6 +516,7 @@ pub fn listen_with_observers(
         events,
         &mut validator,
         observers.operator_lists.as_deref(),
+        observers.decode_quality.as_deref(),
         calibration_factor,
         &mut on_event,
         &mut on_spot,
@@ -538,6 +561,7 @@ pub fn listen_with_observers(
                 finish_events,
                 &mut validator,
                 observers.operator_lists.as_deref(),
+                observers.decode_quality.as_deref(),
                 calibration_factor,
                 &mut on_event,
                 &mut on_spot,
@@ -547,7 +571,13 @@ pub fn listen_with_observers(
             rtty.restart(seg_base + seg_consumed);
             seg_base += seg_consumed + gap;
             seg_consumed = 0;
-            seg = new_segment(fs, center_freq_hz, cfg, next_id)?;
+            seg = new_segment(
+                fs,
+                center_freq_hz,
+                cfg,
+                next_id,
+                observers.decode_quality.clone(),
+            )?;
             let events = seg.tm.process_hops(&seg.ch.process(&padding), |m| {
                 seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
             });
@@ -555,6 +585,7 @@ pub fn listen_with_observers(
                 events,
                 &mut validator,
                 observers.operator_lists.as_deref(),
+                observers.decode_quality.as_deref(),
                 calibration_factor,
                 &mut on_event,
                 &mut on_spot,
@@ -575,6 +606,7 @@ pub fn listen_with_observers(
             events,
             &mut validator,
             observers.operator_lists.as_deref(),
+            observers.decode_quality.as_deref(),
             calibration_factor,
             &mut on_event,
             &mut on_spot,
@@ -593,6 +625,7 @@ pub fn listen_with_observers(
         events,
         &mut validator,
         observers.operator_lists.as_deref(),
+        observers.decode_quality.as_deref(),
         calibration_factor,
         &mut on_event,
         &mut on_spot,
@@ -1912,6 +1945,71 @@ mod tests {
         .unwrap();
 
         assert_eq!(obs.snapshot().count, 4);
+    }
+
+    /// MAN-118: V1 through `listen_with_observers` with only the
+    /// decode-quality observer set publishes every signal, and leaves the
+    /// spot output byte-for-byte what a run without it produces.
+    #[test]
+    fn listen_with_observers_publishes_decode_quality_without_changing_spots() {
+        use crate::quality::DecodeQualityObserver;
+
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let run = |observers: ListenObservers| {
+            let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+                samples: rendered.samples.clone(),
+                cursor: 0,
+                fs: spec.fs,
+                center_freq_hz: spec.center_freq_hz,
+            });
+            let mut chars_seen = 0u64;
+            let mut spots = Vec::new();
+            listen_with_observers(
+                src,
+                &PipelineConfig::default(),
+                Arc::new(AtomicBool::new(false)),
+                observers,
+                |ev| {
+                    if matches!(ev, DecoderEvent::CharDecoded { .. }) {
+                        chars_seen += 1;
+                    }
+                },
+                |spot| spots.push(spot.clone()),
+                |_n| {},
+            )
+            .unwrap();
+            (chars_seen, spots)
+        };
+
+        let obs = Arc::new(DecodeQualityObserver::new());
+        let (chars_seen, spots_observed) = run(ListenObservers {
+            decode_quality: Some(obs.clone()),
+            ..Default::default()
+        });
+        let snap = obs.snapshot();
+        assert!(chars_seen > 0, "V1 must decode characters");
+        assert_eq!(snap.chars_total, chars_seen);
+        assert!(
+            snap.rail_ratio_count >= 100,
+            "V1's ~119 track-seconds give one rail sample each, got {}",
+            snap.rail_ratio_count
+        );
+        assert_eq!(
+            snap.rail_ratio_bucket_counts[0], 0,
+            "V1's clean keying never sits at the collapse floor"
+        );
+        assert!(
+            snap.repetition_bucket_counts.iter().sum::<u64>() >= 1,
+            "V1's repeated call must reach the repetition gate"
+        );
+
+        let (_, spots_plain) = run(ListenObservers::default());
+        assert!(!spots_plain.is_empty(), "V1 must spot");
+        assert_eq!(
+            spots_observed, spots_plain,
+            "the observer must not change decode output"
+        );
     }
 
     /// The default path must stay exactly as cheap as before: no observer
