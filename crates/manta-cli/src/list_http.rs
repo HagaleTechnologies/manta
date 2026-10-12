@@ -7,7 +7,8 @@
 use std::fmt;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const DEFAULT_PORT: u16 = 80;
@@ -327,7 +328,7 @@ impl Conn {
                 .to_socket_addrs()
                 .map(Iterator::collect)
         };
-        let addrs = match resolve_within(lookup, limits.deadline) {
+        let addrs = match resolve_within(&host_port, lookup, limits.deadline) {
             Some(result) => result.map_err(|e| connect_err(&e))?,
             None => return Err(timed_out(limits.deadline)),
         };
@@ -485,25 +486,60 @@ fn parse_head(head: &[u8]) -> Result<Head, FetchError> {
     })
 }
 
-/// Runs `lookup` on its own thread and waits at most `within` for it.
-/// `None` when it has not answered by then; it is left to finish, or not,
-/// on that thread, which nothing joins.
-fn resolve_within<F>(lookup: F, within: Duration) -> Option<io::Result<Vec<SocketAddr>>>
+type Lookup = io::Result<Vec<SocketAddr>>;
+
+/// Name lookups that outlived the fetch that started them, by `host:port`.
+static PENDING_LOOKUPS: Mutex<Vec<(String, Receiver<Lookup>)>> = Mutex::new(Vec::new());
+
+/// Runs `lookup` for `key` (`host:port`) on its own thread and waits at
+/// most `within` for it. `None` when it has not answered by then; the
+/// thread is kept as `key`'s pending lookup. The next call for `key` takes
+/// it over instead of starting another: it waits on it while it runs, uses
+/// its addresses if they came meanwhile, and starts afresh only after a
+/// failed or lost one. With calls made one at a time, as the `manta-lists`
+/// thread makes them, a resolver that never answers holds one thread per
+/// name, not one per attempt.
+fn resolve_within<F>(key: &str, lookup: F, within: Duration) -> Option<Lookup>
 where
-    F: FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
+    F: FnOnce() -> Lookup + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("manta-lists-dns".into())
-        .spawn(move || {
-            let _ = tx.send(lookup());
-        });
-    if let Err(e) = spawned {
-        return Some(Err(e));
+    let pending = {
+        let mut pending = PENDING_LOOKUPS.lock().unwrap_or_else(|e| e.into_inner());
+        let found = pending.iter().position(|(k, _)| k == key);
+        found.map(|i| pending.swap_remove(i).1)
+    };
+    let mut running = None;
+    if let Some(rx) = pending {
+        match rx.try_recv() {
+            Err(TryRecvError::Empty) => running = Some(rx),
+            Ok(Ok(addrs)) => return Some(Ok(addrs)),
+            Ok(Err(_)) | Err(TryRecvError::Disconnected) => {}
+        }
     }
+    let rx = match running {
+        Some(rx) => rx,
+        None => {
+            let (tx, rx) = mpsc::channel();
+            let spawned = std::thread::Builder::new()
+                .name("manta-lists-dns".into())
+                .spawn(move || {
+                    let _ = tx.send(lookup());
+                });
+            if let Err(e) = spawned {
+                return Some(Err(e));
+            }
+            rx
+        }
+    };
     match rx.recv_timeout(within) {
         Ok(result) => Some(result),
-        Err(RecvTimeoutError::Timeout) => None,
+        Err(RecvTimeoutError::Timeout) => {
+            PENDING_LOOKUPS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((key.to_string(), rx));
+            None
+        }
         Err(RecvTimeoutError::Disconnected) => Some(Err(io::Error::other(
             "the name lookup ended without an answer",
         ))),
@@ -677,12 +713,44 @@ mod tests {
             std::thread::sleep(Duration::from_secs(3));
             Ok(Vec::new())
         };
-        assert!(resolve_within(slow, Duration::from_millis(200)).is_none());
+        assert!(resolve_within("slow.invalid:80", slow, Duration::from_millis(200)).is_none());
         assert!(started.elapsed() < Duration::from_secs(2));
 
         let addr: SocketAddr = "127.0.0.1:80".parse().unwrap();
         let quick_lookup = move || Ok(vec![addr]);
-        let got = resolve_within(quick_lookup, Duration::from_secs(5));
+        let got = resolve_within("quick.invalid:80", quick_lookup, Duration::from_secs(5));
+        assert_eq!(got.unwrap().unwrap(), vec![addr]);
+    }
+
+    #[test]
+    fn a_lookup_still_running_is_taken_over_not_started_again() {
+        const KEY: &str = "wedged.invalid:80";
+        let addr: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        let (release, wedged) = mpsc::channel::<()>();
+        let hung = move || {
+            let _ = wedged.recv();
+            Ok(vec![addr])
+        };
+        let within = Duration::from_millis(100);
+        assert!(resolve_within(KEY, hung, within).is_none());
+        // Started, this one would answer at once; it is not started.
+        assert!(resolve_within(KEY, || Ok(Vec::new()), within).is_none());
+        // Released, the hung lookup's answer is the next call's, whether it
+        // came before that call or during it.
+        release.send(()).unwrap();
+        let got = resolve_within(KEY, || Ok(Vec::new()), Duration::from_secs(5));
+        assert_eq!(got.unwrap().unwrap(), vec![addr]);
+    }
+
+    #[test]
+    fn a_lookup_that_failed_while_nobody_waited_is_tried_again() {
+        const KEY: &str = "failed.invalid:80";
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err(io::Error::other("no answer from the name server")))
+            .unwrap();
+        PENDING_LOOKUPS.lock().unwrap().push((KEY.to_string(), rx));
+        let addr: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        let got = resolve_within(KEY, move || Ok(vec![addr]), Duration::from_secs(5));
         assert_eq!(got.unwrap().unwrap(), vec![addr]);
     }
 

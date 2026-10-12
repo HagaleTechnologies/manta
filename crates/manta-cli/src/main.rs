@@ -3069,8 +3069,9 @@ struct RunLists {
 
 /// Builds `run`'s shared lists from `cfg`'s tables. With a live source and
 /// `refresh_lists` on, a list no pin or path chose may start from the cache
-/// (D3) and is handed to the refresher; otherwise the tables are `cfg`'s,
-/// and file replay never reads the cache (D4).
+/// (D3) and is handed to the refresher, and the stale built-in cty.dat
+/// warning is printed here, judged on the copy chosen; otherwise the tables
+/// are `cfg`'s, and file replay never reads the cache (D4).
 fn prepare_run_lists(
     live: bool,
     spot: &SpotResolved,
@@ -3097,6 +3098,9 @@ fn prepare_run_lists(
         true,
         cache.as_ref(),
     );
+    if let Some(warning) = stale_cty_warning(&in_use[0], std::time::SystemTime::now()) {
+        logging::warning(&warning);
+    }
     let mut managed = Vec::new();
     for (list, url) in in_use.iter().zip([&spot.cty_url, &spot.scp_url]) {
         if !list.is_operator_choice() {
@@ -4045,6 +4049,15 @@ fn bundled_cty_warning(cty_overridden: bool, now: std::time::SystemTime) -> Opti
     ))
 }
 
+/// [`bundled_cty_warning`] for `cty`, the cty.dat a command decodes with:
+/// silent unless it is the built-in copy because nothing chose another (a
+/// path, a pin, even of the built-in bytes, or the cache). A live `run`
+/// with refresh on may start from the cache's copy (MAN-316), so
+/// `prepare_run_lists` asks once it has chosen.
+fn stale_cty_warning(cty: &list_refresh::InUse, now: std::time::SystemTime) -> Option<String> {
+    bundled_cty_warning(cty.origin != list_refresh::Origin::Bundled, now)
+}
+
 /// Shared typed config and source resolution, with no pipeline assets or I/O:
 /// the part of `prepare_live` that `check` and `calibrate` share.
 struct SourcePrepared {
@@ -4068,10 +4081,13 @@ fn prepare_source(cli: CliOverrides, config_flag: Option<PathBuf>) -> Result<Sou
     })
 }
 
+/// `warn_stale_cty`: print [`stale_cty_warning`] here. `run` passes false
+/// and prints it itself once it knows which cty.dat it starts with.
 fn prepare_live(
     cli: CliOverrides,
     config_flag: Option<PathBuf>,
     cli_engine: Option<Engine>,
+    warn_stale_cty: bool,
 ) -> Result<Prepared> {
     let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
     let config_path = config_flag.or_else(|| config::config_path_from_env(&vars));
@@ -4079,11 +4095,12 @@ fn prepare_live(
     for note in &prepared.resolved.notes {
         logging::note(note);
     }
-    if let Some(warning) = bundled_cty_warning(
-        prepared.pipeline.cty.is_some(),
-        std::time::SystemTime::now(),
-    ) {
-        logging::warning(&warning);
+    if warn_stale_cty {
+        if let Some(warning) =
+            stale_cty_warning(&prepared.lists_in_use[0], std::time::SystemTime::now())
+        {
+            logging::warning(&warning);
+        }
     }
     Ok(prepared)
 }
@@ -4970,7 +4987,19 @@ fn run_command() -> Result<std::process::ExitCode> {
                 resolved,
                 pipeline: cfg,
                 lists_in_use,
-            } = prepare_live(cli, config, engine)?;
+            } = prepare_live(cli, config, engine, false)?;
+            // MAN-79's stale built-in cty.dat warning, before any I/O,
+            // unless the cache may replace that copy: `prepare_run_lists`
+            // warns then, once it has chosen (MAN-316).
+            let cache_may_choose_cty =
+                resolved.spec.is_reconnectable() && resolved.spot.refresh_lists;
+            if !cache_may_choose_cty {
+                if let Some(warning) =
+                    stale_cty_warning(&lists_in_use[0], std::time::SystemTime::now())
+                {
+                    logging::warning(&warning);
+                }
+            }
             refuse_rbn_compare_replay(&resolved, source_flag)?;
             // MAN-268: an unedited manta.example.toml must not start a
             // daemon that spots, or logs in to a collector, as N0CALL.
@@ -5784,6 +5813,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 },
                 config,
                 None,
+                true,
             )?;
             if loaded.server.is_some() {
                 eprintln!(
@@ -5958,6 +5988,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 },
                 config,
                 None,
+                true,
             )?;
             note_pinned_lists(&resolved.spot, &lists_in_use);
             if let Some(note) = replay_mode_ignored_note("doctor", resolved.replay, &loaded.origin)
@@ -6428,6 +6459,28 @@ mod tests {
     #[test]
     fn no_warning_when_the_clock_reads_before_the_retrieval_date() {
         assert_eq!(bundled_cty_warning(false, UNIX_EPOCH), None);
+    }
+
+    #[test]
+    fn the_stale_cty_warning_is_judged_on_the_cty_in_use() {
+        // MAN-316: a live `run` with refresh on may start from the cache's
+        // copy; the built-in copy's age alone must not warn then.
+        let built_in = list_refresh::InUse::bundled(ListKind::Cty);
+        assert!(stale_cty_warning(&built_in, at_day(200)).is_some());
+        let cached = list_refresh::InUse::new(
+            ListKind::Cty,
+            built_in.sha256.clone(),
+            list_refresh::Origin::Cache {
+                downloaded_at: at_day(190),
+            },
+        );
+        assert_eq!(stale_cty_warning(&cached, at_day(200)), None);
+        let pinned = list_refresh::InUse::new(
+            ListKind::Cty,
+            built_in.sha256.clone(),
+            list_refresh::Origin::Pinned(list_refresh::PinSource::Bundled),
+        );
+        assert_eq!(stale_cty_warning(&pinned, at_day(200)), None);
     }
 
     const QQ9_ENTITY: &str = "Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n";
