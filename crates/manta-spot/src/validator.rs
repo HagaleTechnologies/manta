@@ -6,7 +6,7 @@ use crate::confidence;
 use crate::context::{self, SpotType};
 use crate::cty;
 use crate::dedupe::Dedupe;
-use crate::gate::{RepetitionGate, WINDOW_SECONDS as GATE_WINDOW_SECONDS};
+use crate::gate::{RepetitionCounts, RepetitionGate, WINDOW_SECONDS as GATE_WINDOW_SECONDS};
 use crate::grammar;
 use crate::notch::NotchList;
 use crate::scp;
@@ -489,6 +489,14 @@ impl Validator {
     /// `forget_track`'s teardown) was ever exercised at all.
     pub fn gate_records_total(&self) -> u64 {
         self.gate.records_total()
+    }
+
+    /// MAN-118: the distribution of every `RepetitionGate::record` result
+    /// so far, cumulative for life, for the daemon's
+    /// `manta_candidate_repetitions` histogram. Read after `ingest`, as
+    /// `suppression_counts` is.
+    pub fn repetition_counts(&self) -> RepetitionCounts {
+        self.gate.repetition_counts()
     }
 
     /// Sets the operator's bad-callsign blocklist (MAN-31). Empty by

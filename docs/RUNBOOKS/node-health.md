@@ -162,6 +162,43 @@ interval if you need an ongoing liveness check, not just a post-start one.)
   30-day field-node ledger reads both
   (`docs/RUNBOOKS/secondary-skimmer-field-node.md`).
 
+## Decode quality (MAN-118)
+
+The families above say whether the node is running. Four more say whether
+its decoding looks healthy; see
+[MAN-118](../DECISIONS/2026-10-12-man118-decode-quality-metrics.md) for
+why they are node-wide, with no `track_id` label.
+
+- **Garble share.** `manta_decode_garbles_total` counts characters the
+  beam rejected outright; `manta_decode_chars_total` counts every decoded
+  character.
+  ```promql
+  rate(manta_decode_garbles_total[5m])
+    / (rate(manta_decode_garbles_total[5m]) + rate(manta_decode_chars_total[5m]))
+  ```
+  Expect this near 0 even on a hard band: the beam usually commits a wrong
+  character rather than a garble (the V8w pileup gave 3 in 9,690). A
+  sudden rise is a fault signal. The `hsmm` engine never garbles.
+- **Keying depth.** `manta_track_rail_ratio` samples each decoding track's
+  mark-rail / space-rail ratio once per second (`legacy` engine only).
+  ```promql
+  histogram_quantile(0.5, rate(manta_track_rail_ratio_bucket[5m]))
+  rate(manta_track_rail_ratio_bucket{le="2"}[5m]) / rate(manta_track_rail_ratio_count[5m])
+  ```
+  A clean strong signal reads around 20 to 30; the V5 CCIR-poor fading
+  vector reads a median of 3.3. A falling median, or a growing share at
+  `le="2"` (the floor the rails collapse to), means fading or QRM is eating
+  the keying depth the decoder relies on.
+- **Unconfirmed candidates.** `manta_candidate_repetitions` records, for
+  each callsign candidate the repetition gate scores, how many distinct
+  decodes of that call near that frequency it has seen in the last 90 s.
+  A candidate needs 2 to spot.
+  ```promql
+  rate(manta_candidate_repetitions_bucket{le="1"}[15m]) / rate(manta_candidate_repetitions_count[15m])
+  ```
+  A high share at `le="1"` means candidates are not confirming: busted
+  calls, or signals too short-lived to repeat.
+
 ## Known gaps
 
 - Signal-to-spot (track onset → first spot) latency is not yet a metric —

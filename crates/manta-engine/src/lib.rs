@@ -10,6 +10,8 @@ pub use listen::{
 };
 pub mod latency;
 pub use latency::{DecodeLatencyObserver, DecodeLatencySnapshot, DECODE_LATENCY_BUCKETS_SECONDS};
+pub mod quality;
+pub use quality::{DecodeQualityObserver, DecodeQualitySnapshot, RAIL_RATIO_BUCKETS};
 pub mod calibrate;
 pub use calibrate::{calibrate, CalibrateOptions, CalibrationReport};
 pub mod doctor;

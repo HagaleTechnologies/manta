@@ -19,6 +19,7 @@ pub mod variant;
 
 pub use blocklist::Blocklist;
 pub use context::SpotType;
+pub use gate::{RepetitionCounts, REPETITION_BUCKETS};
 pub use notch::{FreqRange, NotchList};
 pub use validator::{
     calibration_factor_from_ppm, InvalidCalibration, Spot, SuppressionCounts, Validator,
