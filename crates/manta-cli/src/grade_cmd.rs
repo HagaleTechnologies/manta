@@ -31,8 +31,9 @@ pub(crate) struct Args {
     #[arg(long, value_name = "CALL", value_parser = parse_spotter)]
     spotter: Vec<String>,
     /// Never count this RBN skimmer's reports. Repeatable. Replaces
-    /// [rbn_compare].exclude_spotters from --config. The spots' own `deCall`
-    /// is always excluded, with and without its SSID.
+    /// [rbn_compare].exclude_spotters from --config. Each spot's own
+    /// `deCall`, with and without its SSID, is always excluded from that
+    /// spot's grade.
     #[arg(long, value_name = "CALL", value_parser = parse_spotter)]
     exclude_spotter: Vec<String>,
     /// RBN reports this many seconds either side of a spot count (30 to
@@ -102,18 +103,9 @@ fn render(args: &Args, out: &mut String) -> Result<()> {
             );
         }
     }
-    let (mut cfg, mut excludes) = grade_config(args)?;
+    let (mut cfg, excludes) = grade_config(args)?;
     let (spots, spot_stats) = load_node_spots(&args.spots)?;
-    let (reports, rbn_stats) = load_rbn_csv(&args.rbn)?;
-    // shadow-compare's rule: the node's own reports never count, with and
-    // without its SSID.
-    for de in &spot_stats.de_calls {
-        push_unique(&mut excludes, normalize_spotter(de));
-        push_unique(
-            &mut excludes,
-            normalize_spotter(manta_server::config::strip_ssid(de)),
-        );
-    }
+    let (mut reports, rbn_stats) = load_rbn_csv(&args.rbn)?;
     cfg.exclude_spotters = excludes.iter().cloned().collect();
     let time_range = reports
         .iter()
@@ -122,7 +114,28 @@ fn render(args: &Args, out: &mut String) -> Result<()> {
         .zip(reports.iter().map(|r| r.time).max());
     let n_reports = reports.len();
 
-    let mut grades = grade_batch(&spots, reports, &cfg);
+    // shadow-compare's rule: a node's own reports never count, with and
+    // without its SSID. Each node's spots are graded apart, excluding only
+    // that node's call, as its live comparator does, so a second node's
+    // archive in `--spots` never hides that node's reports from the first.
+    let mut nodes: BTreeMap<&str, Vec<GradeInput>> = BTreeMap::new();
+    for (de, spot) in &spots {
+        nodes.entry(de.as_str()).or_default().push(spot.clone());
+    }
+    let n_nodes = nodes.len();
+    let mut grades = Vec::new();
+    let mut nodes = nodes.into_iter().peekable();
+    while let Some((de, node_spots)) = nodes.next() {
+        let mut node_cfg = cfg.clone();
+        node_cfg.exclude_spotters.extend(own_calls(de));
+        // The last node takes the reports; earlier ones grade a copy.
+        let node_reports = if nodes.peek().is_some() {
+            reports.clone()
+        } else {
+            std::mem::take(&mut reports)
+        };
+        grades.extend(grade_batch(&node_spots, node_reports, &node_cfg));
+    }
     grades.sort_by(|a, b| (a.window_close, &a.spot_id).cmp(&(b.window_close, &b.spot_id)));
 
     if args.json {
@@ -169,13 +182,31 @@ fn render(args: &Args, out: &mut String) -> Result<()> {
     } else {
         cfg.spotters.iter().cloned().collect::<Vec<_>>().join(", ")
     };
-    if excludes.is_empty() {
+    // One node's own calls join the exclusion list. Several nodes' (spots
+    // with no `deCall` count as a node) are listed apart: each is excluded
+    // from its own node's spots only.
+    let mut shown = excludes;
+    let mut own = Vec::new();
+    for de in &spot_stats.de_calls {
+        for c in own_calls(de) {
+            push_unique(&mut own, c);
+        }
+    }
+    if n_nodes <= 1 {
+        for c in own.drain(..) {
+            push_unique(&mut shown, c);
+        }
+    }
+    if shown.is_empty() {
         writeln!(out, "spotters: {spotters}")?;
     } else {
+        writeln!(out, "spotters: {spotters} (excluding {})", shown.join(", "))?;
+    }
+    if !own.is_empty() {
         writeln!(
             out,
-            "spotters: {spotters} (excluding {})",
-            excludes.join(", ")
+            "own calls, excluded only from that node's spots: {}",
+            own.join(", ")
         )?;
     }
     writeln!(
@@ -281,6 +312,18 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+/// A node's `deCall` as the spotters its own spots exclude: as given and
+/// without its SSID. None for a spot with no `deCall`.
+fn own_calls(de: &str) -> Vec<String> {
+    if de.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        normalize_spotter(de),
+        normalize_spotter(manta_server::config::strip_ssid(de)),
+    ]
+}
+
 fn push_unique(v: &mut Vec<String>, s: String) {
     if !s.is_empty() && !v.contains(&s) {
         v.push(s);
@@ -376,11 +419,12 @@ fn expand_paths(
     Ok(files)
 }
 
-/// SpotMessage JSON Lines to grade inputs. Lines carrying a `kind` key
+/// SpotMessage JSON Lines to grade inputs, each with its `deCall`
+/// (uppercase; empty when absent). Lines carrying a `kind` key
 /// (`spotGrade` records) are skipped and counted. Only a file's final line
 /// with no newline (a write torn by a kill) may be malformed; any other
 /// malformed line is an error naming the file and line.
-fn load_node_spots(paths: &[PathBuf]) -> Result<(Vec<GradeInput>, SpotStats)> {
+fn load_node_spots(paths: &[PathBuf]) -> Result<(Vec<(String, GradeInput)>, SpotStats)> {
     let files = expand_paths(paths, "spots-*.jsonl", |n| {
         n.starts_with("spots-") && n.ends_with(".jsonl")
     })?;
@@ -429,13 +473,15 @@ fn load_node_spots(paths: &[PathBuf]) -> Result<(Vec<GradeInput>, SpotStats)> {
                 }
                 Err(e) => return Err(malformed(e)),
             };
-            if let Some(de) = value.get("deCall").and_then(|d| d.as_str()) {
-                let de = de.trim().to_ascii_uppercase();
-                if !de.is_empty() && !stats.de_calls.contains(&de) {
-                    stats.de_calls.push(de);
-                }
+            let de = value
+                .get("deCall")
+                .and_then(|d| d.as_str())
+                .map(|d| d.trim().to_ascii_uppercase())
+                .unwrap_or_default();
+            if !de.is_empty() && !stats.de_calls.contains(&de) {
+                stats.de_calls.push(de.clone());
             }
-            spots.push(spot);
+            spots.push((de, spot));
         }
     }
     Ok((spots, stats))

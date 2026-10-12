@@ -249,6 +249,12 @@ total      4      1         1          1     1        0
 - `--spots` takes the `field-node.py record-spots` archive: SpotMessage
   JSON Lines files, or directories (which expand to `spots-*.jsonl`).
   Grade lines in them are skipped, and so is a torn last line.
+- Each spot excludes its own node's `deCall`, with and without SSID, as
+  that node's live comparator does. Archives from several nodes can be
+  graded together. Their calls are then listed on an `own calls, excluded
+  only from that node's spots` line, and one node's RBN reports can confirm
+  another node's spot. To stop that, for example for the primary a
+  secondary forwards through, pass `--exclude-spotter`.
 - `--rbn` takes RBN daily-archive CSVs, or directories of them. Unzip the
   archive first: `manta grade` refuses a `.zip`.
 - `--json` prints the grade records, one per line, in the live stream's

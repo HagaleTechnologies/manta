@@ -1297,7 +1297,6 @@ fn architecture_logging_bullet_is_current() {
     );
 }
 
-<<<<<<< HEAD
 // ---- MAN-301: live RBN comparison, documented ----
 
 /// Every `manta_rbn_compare_*` family the design names (MAN-301 plan §7).
@@ -1441,7 +1440,10 @@ fn spec_precedence_paragraph_lists_rbn_compare_env_prefix() {
         assert!(
             paragraph.contains(needle),
             "SPEC §9's precedence paragraph never says {needle:?}"
-=======
+        );
+    }
+}
+
 // ---- MAN-90 ----
 
 const MAN90_DECISION: &str = "docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md";
@@ -1525,13 +1527,10 @@ fn man90_runbook_checks_the_restarted_connection() {
         assert!(
             !steps.contains(stale),
             "Developer steps still run `{stale}`"
->>>>>>> f6a41cc0551a69e5007e7b3979643a6c4c9ecf27
         );
     }
 }
 
-<<<<<<< HEAD
-=======
 /// MAN-90: after its restart Aggregator may reach RBN at a different address,
 /// a second endpoint or over UDP. A `host <address from step 1>` capture
 /// filter drops all of that, yet the file settles C1 and C2. The operator
@@ -1845,7 +1844,6 @@ fn uplink_health_runbook_example_is_not_an_rbn_server() {
     assert!(!doc("docs/RUNBOOKS/uplink-health.md").contains("reversebeacon.net"));
 }
 
->>>>>>> f6a41cc0551a69e5007e7b3979643a6c4c9ecf27
 /// MAN-81: an operator reading the Docker docs learns that a bare
 /// `docker run` runs a mounted config, that the image reports health through
 /// `manta health`, and how to turn the check off.

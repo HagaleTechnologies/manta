@@ -177,6 +177,89 @@ fn grade_reads_spots_directories_and_skips_grade_records_and_a_torn_last_line() 
     );
 }
 
+/// Each spot excludes only its own node's reports, as that node's live
+/// comparator does: a second node's archive in `--spots` (here K5TR's,
+/// itself an RBN skimmer) leaves the first node's grades unchanged, and the
+/// summary does not list K5TR as excluded from every spot.
+#[test]
+fn grade_excludes_a_nodes_own_reports_only_from_that_nodes_spots() {
+    let dir = tempfile::tempdir().unwrap();
+    let spots = read_fixture("spots-2026-10-11.jsonl");
+    let first = spots.lines().next().unwrap();
+    let other = first
+        .replace("\"deCall\":\"W3XYZ-1\"", "\"deCall\":\"K5TR\"")
+        .replacen("W3XYZ-1:", "K5TR:", 1);
+    assert!(other.contains("\"deCall\":\"K5TR\"") && other.contains("\"id\":\"K5TR:"));
+    let other_node = dir.path().join("spots-k5tr.jsonl");
+    std::fs::write(&other_node, format!("{other}\n")).unwrap();
+    let grade = |json: bool| {
+        let mut cmd = manta();
+        cmd.arg("grade");
+        if json {
+            cmd.arg("--json");
+        }
+        let out = cmd
+            .arg("--spots")
+            .arg(fixture("spots-2026-10-11.jsonl"))
+            .arg(&other_node)
+            .arg("--rbn")
+            .arg(fixture("rbn-20261011.csv"))
+            .output()
+            .unwrap();
+        assert_success(&out);
+        stdout(&out)
+    };
+    let json = grade(true);
+    let own: Vec<&str> = json
+        .lines()
+        .filter(|l| l.contains("\"spotId\":\"W3XYZ-1:"))
+        .collect();
+    assert_eq!(
+        own,
+        read_fixture("expected-all.jsonl")
+            .lines()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(json.lines().count(), 5);
+    let summary = grade(false);
+    let header: Vec<&str> = summary.lines().take(4).collect();
+    assert_eq!(header[2], "spotters: all");
+    assert_eq!(
+        header[3],
+        "own calls, excluded only from that node's spots: W3XYZ-1, W3XYZ, K5TR"
+    );
+}
+
+/// A spot line with no `deCall` excludes no own call, so the summary does
+/// not list the other spots' node as excluded from every spot.
+#[test]
+fn grade_summary_lists_own_calls_apart_when_a_spot_has_no_de_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let spots = read_fixture("spots-2026-10-11.jsonl");
+    let first = spots.lines().next().unwrap();
+    let anonymous = first
+        .replace("\"deCall\":\"W3XYZ-1\",", "")
+        .replacen("W3XYZ-1:", "ANON:", 1);
+    assert!(!anonymous.contains("deCall"));
+    let path = dir.path().join("spots-2026-10-11.jsonl");
+    std::fs::write(&path, format!("{first}\n{anonymous}\n")).unwrap();
+    let out = manta()
+        .args(["grade", "--spots"])
+        .arg(&path)
+        .arg("--rbn")
+        .arg(fixture("rbn-20261011.csv"))
+        .output()
+        .unwrap();
+    assert_success(&out);
+    let text = stdout(&out);
+    let header: Vec<&str> = text.lines().take(4).collect();
+    assert_eq!(header[2], "spotters: all");
+    assert_eq!(
+        header[3],
+        "own calls, excluded only from that node's spots: W3XYZ-1, W3XYZ"
+    );
+}
+
 #[test]
 fn grade_refuses_zip_with_the_unzip_hint() {
     let dir = tempfile::tempdir().unwrap();

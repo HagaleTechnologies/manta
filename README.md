@@ -579,7 +579,6 @@ only if that config also carries at least one `[[rbn_uplink]]` block.
 - **JSON Lines / WebSocket stream** (`:7301`) — one full-fidelity spot
   object per line; a raw TCP client and a WebSocket client share the
   port. This is the [cqdx](https://cqdx.app) ingest surface.
-<<<<<<< HEAD
 - **Live comparison with the RBN** — with `[rbn_compare]` enabled, manta
   reads RBN's public CW telnet feed and grades each spot `match`,
   `disagree`, `elsewhere`, `none` or `unknown` against what RBN's
@@ -587,18 +586,12 @@ only if that config also carries at least one `[[rbn_uplink]]` block.
   record on the `:7301` stream and a per-band count on `/metrics`;
   `manta grade` replays a recorded spot log against RBN's daily archive.
   manta only reads the feed: it sends its login callsign and nothing else.
-- **Outbound RBN uplink** — forwards validated spots to an upstream
-  collector in the same `DX de` wire format, with reconnect and multiple
-  simultaneous targets. Working against a collector; **not yet validated
-  against RBN's live ingest**.
-=======
 - **Outbound RBN uplink (experimental)** — forwards validated spots to an
   upstream collector as `DX de` lines, with reconnect and multiple
   simultaneous targets. Tested only against manta's own mock collector: RBN
   publishes nothing about what its ingest accepts, so the login and line
   format are manta's assumption, and the uplink ships in dry-run. To reach
   RBN today, let an RBN Aggregator read the telnet server above.
->>>>>>> f6a41cc0551a69e5007e7b3979643a6c4c9ecf27
 - **Prometheus metrics** (`:7302/metrics`) — spot, client, uplink and
   source-health counters. Some gauges are still placeholders;
   ARCHITECTURE §8 says which.
