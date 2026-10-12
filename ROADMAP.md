@@ -148,7 +148,9 @@ both emitting real `Spot`s -- see
 `docs/superpowers/specs/2026-07-26-m3-engine-wiring-design.md`.
 `manta-server` has also landed: the telnet cluster server, the
 JSON/WebSocket stream, TOML config, the metrics endpoint, and the
-outbound RBN uplink are all shipped and tested. Remaining M3 sub-projects:
+outbound RBN uplink are all shipped and tested. The uplink is tested only
+against mock collectors and stays experimental until MAN-90's capture shows
+what RBN's ingest accepts. Remaining M3 sub-projects:
 just the RBN parity benchmark (needs ≥ 2 h of recorded contest-weekend IQ
 with RBN reference spots -- a data dependency not yet resolved).
 

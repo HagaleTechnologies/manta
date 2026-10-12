@@ -605,7 +605,7 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
 
 /// D3/D4: stderr notes that never change the exit code. I/O-free: the dial
 /// note matches the source kind rather than calling `is_rf_aware()`, which
-/// opens IQ WAVs.
+/// opens IQ WAVs. MAN-90: an enabled uplink is experimental.
 fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> Vec<String> {
     let mut notes = Vec::new();
     match source {
@@ -663,6 +663,16 @@ fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> V
             )
         },
     );
+    // MAN-90: before going live, operators run `config check` (the node guide
+    // sends them here); say the uplink is experimental and what to use instead.
+    if loaded.rbn_uplink.iter().any(|u| u.enabled) {
+        notes.push(
+            "note: [[rbn_uplink]] is experimental -- its login and spot format are unverified \
+             against RBN's real ingest; to reach RBN today, let an RBN Aggregator read this \
+             node's telnet server (docs/RUNBOOKS/secondary-skimmer-field-node.md)"
+                .to_string(),
+        );
+    }
     notes
 }
 
@@ -1005,6 +1015,52 @@ mod tests {
     }
 
     const POSITION_NOTE: &str = "note: JSON spots will carry no station position";
+    const UPLINK_NOTE: &str = "note: [[rbn_uplink]] is experimental";
+
+    /// MAN-90: any enabled uplink gets one note, whatever its dry_run says.
+    #[test]
+    fn note_uplink_is_experimental_only_when_an_uplink_is_enabled() {
+        let server = "[server]\nstation_callsign = \"W1AW\"\noperator_grid = \"FN31pr\"\n";
+        let uplink = |enabled: bool, host: &str| {
+            format!(
+                "[[rbn_uplink]]\nenabled = {enabled}\ntarget_host = \"{host}\"\ntarget_port = 7000\n"
+            )
+        };
+        let n = notes_of(&format!("{server}{}", uplink(true, "a.example.org")));
+        let hits: Vec<&String> = n.iter().filter(|x| x.starts_with(UPLINK_NOTE)).collect();
+        assert_eq!(
+            hits,
+            [
+                &"note: [[rbn_uplink]] is experimental -- its login and spot format are \
+               unverified against RBN's real ingest; to reach RBN today, let an RBN \
+               Aggregator read this node's telnet server \
+               (docs/RUNBOOKS/secondary-skimmer-field-node.md)"
+                    .to_string()
+            ]
+        );
+        let two = notes_of(&format!(
+            "{server}{}{}",
+            uplink(true, "a.example.org"),
+            uplink(true, "b.example.org")
+        ));
+        assert_eq!(two.iter().filter(|x| x.starts_with(UPLINK_NOTE)).count(), 1);
+        assert!(!has(
+            &notes_of(&format!("{server}{}", uplink(false, "a.example.org"))),
+            UPLINK_NOTE
+        ));
+        assert!(!has(&notes_of(server), UPLINK_NOTE));
+    }
+
+    /// MAN-90: the scaffold's uplink block says it is experimental and where
+    /// the supported route is documented.
+    #[test]
+    fn scaffold_marks_the_uplink_experimental() {
+        let start = SCAFFOLD.find("# --- Uplink").unwrap();
+        let end = SCAFFOLD.find("# --- Receiver").unwrap();
+        let block = &SCAFFOLD[start..end];
+        assert!(block.contains("\n# Experimental:"), "{block}");
+        assert!(block.contains("secondary-skimmer-field-node.md"), "{block}");
+    }
 
     /// MAN-138: an unconfigured position is legal (every JSON spot then says
     /// `null`), so it is a note, not an error -- and only for a config that

@@ -1297,6 +1297,7 @@ fn architecture_logging_bullet_is_current() {
     );
 }
 
+<<<<<<< HEAD
 // ---- MAN-301: live RBN comparison, documented ----
 
 /// Every `manta_rbn_compare_*` family the design names (MAN-301 plan §7).
@@ -1440,10 +1441,411 @@ fn spec_precedence_paragraph_lists_rbn_compare_env_prefix() {
         assert!(
             paragraph.contains(needle),
             "SPEC §9's precedence paragraph never says {needle:?}"
+=======
+// ---- MAN-90 ----
+
+const MAN90_DECISION: &str = "docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md";
+const MAN90_RUNBOOK: &str = "docs/RUNBOOKS/aggregator-rbn-capture.md";
+/// Same literal as uplink_acceptance.rs's MAN90_REFERENCE_SPOT (minus CRLF):
+/// the decision record must quote the bytes the uplink really writes.
+const MAN90_REFERENCE_SPOT: &str =
+    "DX de W3XYZ-#:  14027.10  JA1ABC         CW    30 dB  28 WPM  CQ      2213Z";
+
+/// MAN-90: the decision record lists every open claim, quotes the uplink's
+/// real bytes, and it and the capture runbook link each other.
+#[test]
+fn man90_records_list_every_open_claim_and_link_each_other() {
+    let decision = doc(MAN90_DECISION);
+    let runbook = doc(MAN90_RUNBOOK);
+    for id in ["C1", "C2", "C3", "C4", "C5", "C6", "C7"] {
+        assert!(
+            decision.contains(&format!("| {id} |")),
+            "decision record has no {id} row"
+        );
+        assert!(runbook.contains(id), "capture runbook never mentions {id}");
+    }
+    assert!(
+        decision.contains(MAN90_REFERENCE_SPOT),
+        "decision record misquotes the uplink's bytes"
+    );
+    assert!(decision.contains("aggregator-rbn-capture.md"));
+    assert!(runbook.contains("2026-10-11-man90-uplink-protocol-verification.md"));
+    assert!(
+        runbook.contains("\n## Captures"),
+        "runbook has no Captures log"
+    );
+}
+
+/// MAN-90: every relative link in the two records resolves.
+#[test]
+fn man90_records_relative_links_resolve() {
+    // Same link grammar as operator_guides.rs::guide_relative_links_resolve.
+    let link = regex::Regex::new(r#"\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)"#).unwrap();
+    for rel in [MAN90_DECISION, MAN90_RUNBOOK] {
+        let base = repo_root().join(rel).parent().unwrap().to_path_buf();
+        let mut checked = 0;
+        for cap in link.captures_iter(&doc(rel)) {
+            let target = &cap[1];
+            if target.starts_with("http")
+                || target.starts_with('#')
+                || target.starts_with("mailto:")
+            {
+                continue;
+            }
+            let path = target.split('#').next().unwrap();
+            assert!(base.join(path).exists(), "{rel}: broken link {target}");
+            checked += 1;
+        }
+        assert!(checked > 0, "{rel}: no relative links checked");
+    }
+}
+
+/// MAN-90: the capture starts before Aggregator restarts, so the runbook's
+/// Developer steps must list stream indices from SYN packets and check and
+/// follow a chosen stream across the whole file. They must not cap packets
+/// (`-c` counts every packet read) or follow stream 0, which can be the old
+/// connection. Checks text in that section, not shell semantics.
+#[test]
+fn man90_runbook_checks_the_restarted_connection() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let steps = section(&runbook, "Developer steps");
+    for needle in [
+        "-Y 'tcp.flags.syn == 1 && tcp.flags.ack == 0'",
+        "-e tcp.stream",
+        "-Y \"tcp.stream == $N && (tls || tcp.payload[0:2] == 16:03)\"",
+        "-z follow,tcp,ascii,$N",
+        "-e udp.stream",
+    ] {
+        assert!(
+            steps.contains(needle),
+            "Developer steps never run `{needle}`"
+        );
+    }
+    for stale in [" -c ", "follow,tcp,ascii,0"] {
+        assert!(
+            !steps.contains(stale),
+            "Developer steps still run `{stale}`"
+>>>>>>> f6a41cc0551a69e5007e7b3979643a6c4c9ecf27
         );
     }
 }
 
+<<<<<<< HEAD
+=======
+/// MAN-90: after its restart Aggregator may reach RBN at a different address,
+/// a second endpoint or over UDP. A `host <address from step 1>` capture
+/// filter drops all of that, yet the file settles C1 and C2. The operator
+/// steps must capture without that filter, list Aggregator's addresses again
+/// after the restart, and send only Aggregator's packets. The developer
+/// steps must use every listed address. Checks text, not Wireshark behaviour.
+#[test]
+fn man90_runbook_keeps_every_endpoint_aggregator_uses() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let operator = squash_whitespace(section(&runbook, "Operator steps"));
+    for stale in ["host <address from step 1>", "capture filter `"] {
+        assert!(
+            !operator.contains(stale),
+            "Operator steps still set a capture filter (`{stale}`)"
+        );
+    }
+    for needle in [
+        "no capture filter",
+        "after the restart",
+        "Export Specified Packets",
+    ] {
+        assert!(
+            operator.contains(needle),
+            "Operator steps never say `{needle}`"
+        );
+    }
+    let steps = squash_whitespace(section(&runbook, "Developer steps"));
+    assert!(
+        steps.contains("every address the operator noted"),
+        "Developer steps never use every address the operator noted"
+    );
+}
+
+/// MAN-90: `ip.addr == <address>` keeps every packet to or from that address,
+/// whichever program sent it, so a browser open on an RBN page that shares the
+/// address would pass step 5 and could be read as Aggregator's connection.
+/// Steps 1 and 3 must note each connection's ports, and step 5 must pair every
+/// `ip.addr`/`ipv6.addr` term with ports, then check the Conversations list.
+/// Checks text, not Wireshark behaviour.
+#[test]
+fn man90_runbook_exports_only_aggregators_connections() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let operator = squash_whitespace(section(&runbook, "Operator steps"));
+    let step = |start: &str, end: &str| -> String {
+        let from = operator
+            .find(start)
+            .unwrap_or_else(|| panic!("Operator steps have no `{start}` step"));
+        let to = operator[from..]
+            .find(end)
+            .map_or(operator.len(), |i| from + i);
+        operator[from..to].to_string()
+    };
+    let find = step("1. **Find", "2. **");
+    let restart = step("3. **Restart", "4. **");
+    // Step 5 is the last step, so it runs to the end of the section.
+    let export = step("5. **Stop", "6. **");
+    for (name, text, needles) in [
+        (
+            "Step 1",
+            &find,
+            &[
+                "LocalPort, RemoteAddress and RemotePort",
+                "Get-NetUDPEndpoint -OwningProcess $p.Id",
+            ][..],
+        ),
+        (
+            "Step 3",
+            &restart,
+            &["LocalPort, RemoteAddress and RemotePort", "TCP Connections"][..],
+        ),
+        (
+            "Step 5",
+            &export,
+            &[
+                "(ip.addr == <RemoteAddress> && tcp.port == <LocalPort> && tcp.port == <RemotePort>)",
+                "`udp.port == <LocalPort>`",
+                "Statistics → Conversations",
+            ][..],
+        ),
+    ] {
+        for needle in needles {
+            assert!(text.contains(needle), "{name} never says `{needle}`");
+        }
+    }
+    for field in ["ip.addr == <", "ipv6.addr == <"] {
+        for (i, _) in export.match_indices(field) {
+            let rest = &export[i + field.len()..];
+            let close = rest.find('>').expect("placeholder closes");
+            assert!(
+                rest[close + 1..].starts_with(" && "),
+                "Step 5 exports by address alone: {}",
+                &export[i..]
+            );
+        }
+    }
+}
+
+/// MAN-90: `Get-NetUDPEndpoint` lists Aggregator's UDP LocalPorts, but its UDP
+/// peers come only from Resource Monitor's live view, which can miss one. Step
+/// 5 must keep UDP by the restarted Aggregator's ports alone, not by a noted
+/// address and port, and the developer steps must follow every UDP flow in
+/// the file, not only flows to noted addresses. A port-only term would keep a
+/// step 1 port another program takes after the restart, so step 5 must use
+/// step 3's ports only and check the saved file. Checks text, not Wireshark
+/// behaviour.
+#[test]
+fn man90_runbook_keeps_udp_to_unnoted_addresses() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let operator = squash_whitespace(section(&runbook, "Operator steps"));
+    // Step 5 is the last step, so it runs to the end of the section.
+    let export = &operator[operator
+        .find("5. **Stop")
+        .expect("Operator steps have no `5. **Stop` step")..];
+    for needle in [
+        "one per UDP LocalPort from step 3, `udp.port == <LocalPort>`",
+        "Open the saved file and check",
+    ] {
+        assert!(export.contains(needle), "Step 5 never says `{needle}`");
+    }
+    assert!(
+        !export.contains("&& udp.port =="),
+        "Step 5 keeps UDP only to an address the operator noted"
+    );
+    let steps = squash_whitespace(section(&runbook, "Developer steps"));
+    assert!(
+        steps.contains("including one to an address the operator did not note"),
+        "Developer steps never follow UDP flows to addresses the operator did not note"
+    );
+}
+
+/// MAN-90: steps 1 and 3 note only the connections the operator sees in
+/// PowerShell or Resource Monitor, so a TCP connection Aggregator opens and
+/// closes between two looks would be left out of step 5's export. Step 2 must
+/// turn on Windows' per-program connection log (Security event 5156), step 5
+/// must take TCP connections from it as well and restore the audit settings,
+/// and the developer steps must check every logged connection is in the file.
+/// Checks text, not Windows behaviour.
+#[test]
+fn man90_runbook_takes_aggregators_connections_from_the_windows_log() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let operator = squash_whitespace(section(&runbook, "Operator steps"));
+    let start = operator
+        .find("2. **Start")
+        .expect("Operator steps have no `2. **Start` step");
+    let record = &operator[start..start + operator[start..].find("3. **").unwrap()];
+    for needle in [
+        "auditpol /backup /file:",
+        "auditpol /set /subcategory:'{0CCE9226-69AE-11D9-BED3-505054503030}' /success:enable",
+    ] {
+        assert!(record.contains(needle), "Step 2 never runs `{needle}`");
+    }
+    // Step 5 is the last step, so it runs to the end of the section.
+    let export = &operator[operator
+        .find("5. **Stop")
+        .expect("Operator steps have no `5. **Stop` step")..];
+    for needle in [
+        "Id=5156",
+        "auditpol /restore /file:",
+        "one term per TCP connection from step 1, step 3 or the saved list",
+    ] {
+        assert!(export.contains(needle), "Step 5 never says `{needle}`");
+    }
+    let steps = squash_whitespace(section(&runbook, "Developer steps"));
+    assert!(
+        steps.contains(
+            "a row of `aggregator-connections.csv`, with no conversation in the file was not recorded"
+        ),
+        "Developer steps never check the file against the connection log"
+    );
+}
+
+/// MAN-90: event 5156 logs inbound connections as well as outbound ones, and
+/// Microsoft's page for it disagrees with itself on which end of an inbound
+/// row is the Source. Step 5 reads SourcePort as Aggregator's LocalPort and
+/// DestAddress as the remote peer, which holds only for a connection
+/// Aggregator opened, so its query must keep outbound rows (`%%14593`) only
+/// (Codex P2 on PR #259). Checks text, not Windows behaviour.
+#[test]
+fn man90_runbook_takes_only_outbound_connections_from_the_windows_log() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let filter = section(&runbook, "Operator steps")
+        .lines()
+        .find(|line| line.contains("Split-Path $_.Application"))
+        .expect("Step 5 never filters the log by Aggregator's executable");
+    assert!(
+        filter.contains("$_.Direction -eq '%%14593'"),
+        "Step 5 keeps inbound 5156 rows: `{}`",
+        filter.trim()
+    );
+}
+
+/// MAN-90: a TLS session leaves only ciphertext, so the developer steps must
+/// say what a TLS result records for C2–C7 and hand the rest to D-5's rework
+/// ticket rather than just "stop" (Codex P2 on PR #259). Checks text only.
+#[test]
+fn man90_runbook_says_what_a_tls_session_records() {
+    let steps = squash_whitespace(section(&doc(MAN90_RUNBOOK), "Developer steps"));
+    for needle in [
+        "`differs: TLS`",
+        "`not observable: TLS`",
+        "D-5",
+        "session keys",
+    ] {
+        assert!(
+            steps.contains(needle),
+            "the runbook's developer steps never say {needle:?} for a TLS session"
+        );
+    }
+    assert!(
+        !steps.contains("stop at C2"),
+        "the runbook still says only \"stop at C2\" for a TLS session"
+    );
+}
+
+/// MAN-90: C3, C4 and C7 compare exact bytes. tshark's `ascii` follow mode
+/// turns non-printable bytes into dots, so the developer steps must also write
+/// a `raw` (hex) transcript of each TCP stream and UDP flow.
+#[test]
+fn man90_runbook_writes_exact_byte_transcripts() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let steps = section(&runbook, "Developer steps");
+    for needle in ["-z follow,tcp,raw,$N", "-z follow,udp,raw,$N"] {
+        assert!(
+            steps.contains(needle),
+            "Developer steps never run `{needle}`"
+        );
+    }
+}
+
+/// MAN-90: step 5 exports every Aggregator connection outside the LAN and the
+/// Skimmers, not only RBN's, so the consent text must say so (Codex P2 on
+/// PR #259).
+#[test]
+fn man90_runbook_consent_covers_every_connection_aggregator_has_open() {
+    let runbook = doc(MAN90_RUNBOOK);
+    // The request is a blockquote; drop the `>` markers before matching.
+    let consent = squash_whitespace(&section(&runbook, "Asking for consent").replace("\n>", "\n"));
+    assert!(
+        !consent.contains("traffic with RBN's servers")
+            && !consent.contains("traffic with the RBN server"),
+        "consent text still promises only RBN traffic"
+    );
+    for needle in [
+        "every internet connection Aggregator has open while you record",
+        "not only its connection to RBN",
+    ] {
+        assert!(
+            consent.contains(needle),
+            "consent text never says `{needle}`"
+        );
+    }
+}
+
+/// MAN-90: README calls the uplink experimental everywhere it offers it, and
+/// "Run it as a node" names the Aggregator route before the uplink block.
+#[test]
+fn readme_marks_the_uplink_experimental_and_leads_with_the_aggregator_route() {
+    let readme = doc("README.md");
+    let outputs = squash_whitespace(section(&readme, "Outputs"));
+    for needle in [
+        "**Outbound RBN uplink (experimental)**",
+        "**Experimental.**",
+        "supported route into RBN",
+        MAN90_DECISION,
+        MAN90_RUNBOOK,
+    ] {
+        assert!(
+            outputs.contains(needle),
+            "README Outputs never says `{needle}`"
+        );
+    }
+    let node = squash_whitespace(section(&readme, "Run it as a node"));
+    let aggregator = node
+        .find("RBN Aggregator")
+        .expect("Run it as a node never names the Aggregator route");
+    let uplink = node
+        .find("`[[rbn_uplink]]`")
+        .expect("Run it as a node never names the uplink block");
+    assert!(
+        aggregator < uplink,
+        "Run it as a node offers the uplink before the Aggregator route"
+    );
+    assert!(
+        node.contains("experimental"),
+        "Run it as a node never calls the uplink experimental"
+    );
+    let status = squash_whitespace(section(&readme, "Status"));
+    assert!(
+        status.contains("outbound RBN uplink is experimental"),
+        "README Status"
+    );
+}
+
+/// MAN-90: ARCHITECTURE §7 enumerates the uplink as an output surface.
+#[test]
+fn architecture_output_layer_describes_the_experimental_uplink() {
+    let s7 = squash_whitespace(section(&doc("ARCHITECTURE.md"), "7. Output layer"));
+    for needle in [
+        "**Outbound RBN uplink (experimental)**",
+        "`uplink.rs`",
+        "Aggregator",
+        MAN90_DECISION,
+    ] {
+        assert!(s7.contains(needle), "ARCHITECTURE §7 never says `{needle}`");
+    }
+}
+
+/// MAN-90: no uplink example names an RBN server as its target.
+#[test]
+fn uplink_health_runbook_example_is_not_an_rbn_server() {
+    assert!(!doc("docs/RUNBOOKS/uplink-health.md").contains("reversebeacon.net"));
+}
+
+>>>>>>> f6a41cc0551a69e5007e7b3979643a6c4c9ecf27
 /// MAN-81: an operator reading the Docker docs learns that a bare
 /// `docker run` runs a mounted config, that the image reports health through
 /// `manta health`, and how to turn the check off.

@@ -251,7 +251,8 @@ pub(crate) fn log_applied(report: &ReloadReport) {
         } else {
             tracing::warn!(
                 target = %label,
-                "reload: dry_run = false -- transmitting real spots to this target."
+                "reload: dry_run = false -- transmitting real spots to this target. {}",
+                manta_server::uplink::EXPERIMENTAL_NOTICE
             );
         }
     }

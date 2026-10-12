@@ -13,7 +13,7 @@ manta status — daemon up 3h 12m
 RBN uplink: DEGRADED — 1 of 2 enabled targets connected
 
   TARGET                         STATE       SENT    SUPPR   RECONN RECENT(5m)
-  telnet.reversebeacon.net:7000  connected  18001      431        0          0
+  collector-01.example.net:7000  connected  18001      431        0          0
   backup.example.net:7000        flapping       0        0       37         14
 
 $ echo $?

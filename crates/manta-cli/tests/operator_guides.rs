@@ -398,3 +398,22 @@ fn entry_points_link_the_guides() {
     }
     assert!(doc("packaging/README.md").contains("](../docs/GUIDES/kiwisdr.md)"));
 }
+
+/// MAN-90: the node guide names the Aggregator route before the uplink step
+/// and calls the uplink experimental in that step.
+#[test]
+fn node_guide_leads_with_the_aggregator_route_and_marks_the_uplink_experimental() {
+    let guide = doc(GUIDES[0]);
+    let step5 = guide.find("\n## 5.").expect("no step 5");
+    let route = guide
+        .find("supported route into RBN")
+        .expect("guide never names the supported route");
+    assert!(
+        route < step5,
+        "the supported route appears only after step 5"
+    );
+    assert!(
+        section(&guide, "5. Connect the uplink in dry-run").contains("experimental"),
+        "step 5 never calls the uplink experimental"
+    );
+}

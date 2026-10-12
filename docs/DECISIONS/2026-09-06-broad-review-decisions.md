@@ -58,6 +58,12 @@ default and how to opt out of it. The substantive part of D2 stands
 unchanged: nobody should point the uplink at a real RBN target until MAN-90
 confirms what that target accepts.
 
+**Update 2026-10-11 (MAN-90):** the uplink is now labelled experimental in
+docs and at run time, and the capture procedure and open claims are in
+`docs/RUNBOOKS/aggregator-rbn-capture.md` and
+`docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md`. The
+capture itself is still outstanding.
+
 ### D3 — Wire SNR convention: dual-referenced
 
 Telnet and the RBN uplink report SNR in the 500 Hz reference bandwidth RBN/CW Skimmer use (so manta
