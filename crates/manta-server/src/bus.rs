@@ -23,11 +23,14 @@ use tokio::sync::broadcast;
 /// it starts missing spots (and its next `recv()` returns `Lagged`).
 const CHANNEL_CAPACITY: usize = 1024;
 
-/// How many of the most recently published spots `recent()` can return --
-/// backs the telnet server's `sh/dx` command (MAN-12 scope, per the
-/// 2026-09-02 ticket clarification: real command grammar, not just
-/// "don't disconnect").
-const RECENT_HISTORY_CAP: usize = 50;
+/// Default `[server].history_minutes` (MAN-93).
+pub const DEFAULT_HISTORY_MINUTES: u32 = 30;
+/// Largest accepted `[server].history_minutes`: one day.
+pub const MAX_HISTORY_MINUTES: u32 = 1440;
+/// Keep at least this many newest publications, even on quiet bands.
+pub const MIN_HISTORY_SPOTS: usize = 50;
+/// Bound history memory and the size of one telnet replay.
+pub const MAX_HISTORY_SPOTS: usize = 10_000;
 
 /// Bounds how many distinct callsigns `occurrence_counts` tracks at once
 /// (MAN-62). `docs/DECISIONS/2026-09-02-man23-threat-model.md` finding 2
@@ -119,13 +122,44 @@ impl OccurrenceTracker {
     }
 }
 
+struct History {
+    entries: VecDeque<BusSpot>,
+    /// Highest heard timestamp ever published; late entries cannot rewind it.
+    newest_sample_ts: u64,
+}
+
+impl History {
+    fn push(&mut self, entry: BusSpot, window_samples: u64) -> usize {
+        self.newest_sample_ts = self.newest_sample_ts.max(entry.spot.sample_ts);
+        self.entries.push_back(entry);
+        let mut truncated = 0;
+        while self.entries.len() > MIN_HISTORY_SPOTS {
+            let front = self.entries.front().expect("history is nonempty");
+            let in_window =
+                self.newest_sample_ts.saturating_sub(front.spot.sample_ts) <= window_samples;
+            let over_ceiling = self.entries.len() > MAX_HISTORY_SPOTS;
+            // Zero restores the old count-only history even for equal timestamps.
+            if window_samples != 0 && in_window && !over_ceiling {
+                break;
+            }
+            if over_ceiling && in_window && window_samples != 0 {
+                truncated += 1;
+            }
+            self.entries.pop_front();
+        }
+        truncated
+    }
+}
+
 pub struct SpotBus {
     tx: broadcast::Sender<BusSpot>,
     json_tx: broadcast::Sender<JsonItem>,
     epoch: SystemTime,
     session_nonce: u128,
     sample_rate_hz: f64,
-    recent: Mutex<VecDeque<BusSpot>>,
+    recent: Mutex<History>,
+    history_minutes: u32,
+    window_samples: u64,
     occurrence_counts: Mutex<OccurrenceTracker>,
 }
 
@@ -153,15 +187,36 @@ impl SpotBus {
             epoch,
             session_nonce,
             sample_rate_hz,
-            recent: Mutex::new(VecDeque::with_capacity(RECENT_HISTORY_CAP)),
+            recent: Mutex::new(History {
+                entries: VecDeque::with_capacity(MIN_HISTORY_SPOTS),
+                newest_sample_ts: 0,
+            }),
+            history_minutes: DEFAULT_HISTORY_MINUTES,
+            window_samples: 0,
             occurrence_counts: Mutex::new(OccurrenceTracker::new()),
         }
+        .with_history_minutes(DEFAULT_HISTORY_MINUTES)
+    }
+
+    /// Retain the heard-time window plus the floor, up to the ceiling.
+    /// Config bounds minutes to 0..=MAX_HISTORY_MINUTES; larger values saturate.
+    pub fn with_history_minutes(mut self, minutes: u32) -> Self {
+        self.history_minutes = minutes;
+        self.window_samples =
+            (f64::from(self.history_minutes()) * 60.0 * self.sample_rate_hz).ceil() as u64;
+        self
+    }
+
+    pub fn history_minutes(&self) -> u32 {
+        self.history_minutes
     }
 
     /// Publishes one validated spot to every current subscriber. No-op
     /// (not an error) when there are zero subscribers -- a spot server
     /// with no connected clients is the common case, not a failure.
-    pub fn publish(&self, spot: Spot) {
+    /// Returns ceiling evictions still inside the window, for the caller to count.
+    /// Ordinary window ageing and zero-minute count-only eviction are not loss.
+    pub fn publish(&self, spot: Spot) -> usize {
         // Increment and read back under one lock acquisition -- this *is*
         // the fix: the occurrence count a spot carries is fixed at the
         // instant of this publish, before any subscriber can observe it.
@@ -176,21 +231,24 @@ impl SpotBus {
             spot,
             occurrence_count,
         };
-        {
+        let truncated = {
             let mut recent = self.recent.lock().expect("recent lock poisoned");
-            if recent.len() == RECENT_HISTORY_CAP {
-                recent.pop_front();
-            }
             // `recent` retains the SAME occurrence_count as the live
             // broadcast, not just the bare Spot -- otherwise a caller
             // replaying history (`sh/dx`) has no way to apply the same
             // occurrence-based filter the live stream already honors, and
             // a spot suppressed live could leak through history replay,
             // uncounted (round-11 review finding).
+<<<<<<< HEAD
             recent.push_back(bus_spot.clone());
         }
         let _ = self.json_tx.send(JsonItem::Spot(bus_spot.clone()));
+=======
+            recent.push(bus_spot.clone(), self.window_samples)
+        };
+>>>>>>> a0d514c01ca518d421b77a5db3bf0eb0653a2543
         let _ = self.tx.send(bus_spot);
+        truncated
     }
 
     /// Publishes one serialised `spotGrade` line (MAN-301) to JSON-stream
@@ -226,9 +284,28 @@ impl SpotBus {
     /// `publish`'s doc comment for why history must retain this, not just
     /// the bare `Spot`.
     pub fn recent(&self, n: usize) -> Vec<BusSpot> {
+        self.select_recent(|_| true, n)
+    }
+
+    /// Newest `limit` matching retained entries, in publication order (oldest first).
+    /// Filters under the history lock and clones only selected entries. `keep`
+    /// must not call a method that locks history; `unix_ts_for` is safe.
+    pub fn select_recent(
+        &self,
+        mut keep: impl FnMut(&BusSpot) -> bool,
+        limit: usize,
+    ) -> Vec<BusSpot> {
         let recent = self.recent.lock().expect("recent lock poisoned");
-        let skip = recent.len().saturating_sub(n);
-        recent.iter().skip(skip).cloned().collect()
+        let mut selected: Vec<_> = recent
+            .entries
+            .iter()
+            .rev()
+            .filter(|entry| keep(entry))
+            .take(limit)
+            .cloned()
+            .collect();
+        selected.reverse();
+        selected
     }
 
     /// Converts a spot's `sample_ts` (samples since session start) to a
@@ -594,5 +671,131 @@ mod tests {
         let b = SpotBus::new(1000.0, epoch, 222);
         assert_ne!(a.session_nonce(), b.session_nonce());
         assert_eq!(a.unix_ts_for(0), b.unix_ts_for(0));
+    }
+
+    fn retained_times(bus: &SpotBus) -> Vec<u64> {
+        bus.recent(usize::MAX)
+            .iter()
+            .map(|e| e.spot.sample_ts)
+            .collect()
+    }
+
+    #[test]
+    fn history_keeps_every_spot_heard_within_the_window() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0);
+        for ts in 0..3600 {
+            bus.publish(sample_spot(ts));
+        }
+        assert_eq!(retained_times(&bus), (1799..3600).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn history_never_drops_below_the_fifty_newest_spots() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0).with_history_minutes(1);
+        for ts in 0..60 {
+            bus.publish(sample_spot(ts * 3600));
+        }
+        assert_eq!(
+            retained_times(&bus),
+            (10..60).map(|ts| ts * 3600).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn zero_minutes_keeps_exactly_the_fifty_newest_like_before_man93() {
+        for spacing in [0, 1] {
+            let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0).with_history_minutes(0);
+            for i in 0..60 {
+                let mut spot = sample_spot(i * spacing);
+                spot.track_id = i as u32;
+                assert_eq!(bus.publish(spot), 0);
+            }
+            assert_eq!(
+                bus.recent(usize::MAX)
+                    .iter()
+                    .map(|e| e.spot.track_id)
+                    .collect::<Vec<_>>(),
+                (10..60).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn history_is_capped_at_the_ceiling_and_publish_reports_in_window_evictions() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0);
+        let mut truncated = 0;
+        for i in 0..MAX_HISTORY_SPOTS + 5 {
+            let mut spot = sample_spot(1);
+            spot.track_id = i as u32;
+            truncated += bus.publish(spot);
+        }
+        let entries = bus.recent(usize::MAX);
+        assert_eq!(entries.len(), MAX_HISTORY_SPOTS);
+        assert_eq!(entries[0].spot.track_id, 5);
+        assert_eq!(truncated, 5);
+    }
+
+    #[test]
+    fn ageing_out_of_the_window_is_not_reported_as_truncation() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0);
+        for i in 0..100 {
+            assert_eq!(bus.publish(sample_spot(i * 600)), 0);
+        }
+        assert_eq!(bus.recent(usize::MAX).len(), MIN_HISTORY_SPOTS);
+    }
+
+    #[test]
+    fn an_out_of_order_publish_never_evicts_an_entry_inside_the_window() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0).with_history_minutes(1);
+        for ts in 100..200 {
+            bus.publish(sample_spot(ts));
+        }
+        bus.publish(sample_spot(0));
+        assert_eq!(
+            retained_times(&bus),
+            (139..200).chain([0]).collect::<Vec<_>>()
+        );
+        bus.publish(sample_spot(200));
+        assert_eq!(
+            retained_times(&bus),
+            (140..200).chain([0, 200]).collect::<Vec<_>>()
+        );
+        // The high-water mark cannot move backwards on a late publish.
+        assert_eq!(bus.recent.lock().unwrap().newest_sample_ts, 200);
+    }
+
+    #[test]
+    fn select_recent_returns_the_newest_matching_entries_oldest_first() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0);
+        for ts in 0..10 {
+            bus.publish(sample_spot(ts));
+        }
+        let even = |entry: &BusSpot| entry.spot.sample_ts.is_multiple_of(2);
+        let selected = bus.select_recent(even, 3);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|e| e.spot.sample_ts)
+                .collect::<Vec<_>>(),
+            [4, 6, 8]
+        );
+        assert!(bus.select_recent(even, 0).is_empty());
+        assert_eq!(
+            bus.select_recent(even, 100)
+                .iter()
+                .map(|e| e.spot.sample_ts)
+                .collect::<Vec<_>>(),
+            [0, 2, 4, 6, 8]
+        );
+    }
+
+    #[test]
+    fn new_defaults_to_thirty_minutes_and_huge_values_do_not_panic() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0);
+        assert_eq!(bus.history_minutes(), DEFAULT_HISTORY_MINUTES);
+        assert_eq!(DEFAULT_HISTORY_MINUTES, 30);
+        let bus = bus.with_history_minutes(u32::MAX);
+        bus.publish(sample_spot(u64::MAX));
+        assert_eq!(bus.recent(1).len(), 1);
     }
 }

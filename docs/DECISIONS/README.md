@@ -11,7 +11,11 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+<<<<<<< HEAD
 | 2026-10-11 | MAN-301 | [MAN-301: grade every manta spot live against what the RBN heard](2026-10-11-man301-live-rbn-comparison.md) |
+=======
+| 2026-10-11 | MAN-298 | [MAN-298: the first release (v0.1.0)](2026-10-11-man298-first-release.md) |
+>>>>>>> a0d514c01ca518d421b77a5db3bf0eb0653a2543
 | 2026-10-11 | MAN-81 | [MAN-81: the Docker image runs a mounted config and reports its own health](2026-10-11-man81-docker-config-mount-and-healthcheck.md) |
 | 2026-10-11 | MAN-115 | [MAN-115: start-up latency before the first decode](2026-10-11-man115-startup-latency.md) |
 | 2026-10-11 | MAN-172 | [MAN-172: high-SNR track churn](2026-10-11-man172-high-snr-track-churn.md) |
@@ -19,6 +23,7 @@ Add a row here in the same change that adds a record:
 | 2026-10-11 | MAN-138 | [MAN-138: a JSON spot's `deGrid`/`deLat`/`deLon` are the configured station position](2026-10-11-man138-station-location.md) |
 | 2026-10-11 | MAN-131 | [MAN-131: errors say what to check next](2026-10-11-man131-actionable-errors.md) |
 | 2026-10-11 | MAN-127 | [MAN-127: `manta calibrate` measures the receiver's frequency offset](2026-10-11-man127-calibrate-command.md) |
+| 2026-10-11 | MAN-93 | [MAN-93: a configurable heard-time window for `sh/dx` history](2026-10-11-man93-sh-dx-history-window.md) |
 | 2026-10-10 | MAN-270 | [MAN-270: command output style — human units, stdout/stderr routing, one-line escaped errors](2026-10-10-man270-cli-output-style.md) |
 | 2026-10-10 | MAN-269 | [MAN-269: paced and looping file replay](2026-10-10-man269-paced-looping-replay.md) |
 | 2026-10-10 | MAN-126 | [MAN-126: `manta doctor` checks the whole setup and names each failing check](2026-10-10-man126-doctor-setup-checks.md) |

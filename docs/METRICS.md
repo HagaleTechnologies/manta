@@ -64,10 +64,15 @@ ignored. Any other path or any method other than `GET` gets
 
 ## Metric families
 
+<<<<<<< HEAD
 All 50 families, in the order `/metrics` renders them. Every family's
 `# HELP` and `# TYPE` lines are always rendered, except the ten
 RBN comparison families (MAN-301) at the end of the table, which are
 rendered only when `[rbn_compare]` is enabled. "Present when" says when
+=======
+All 41 families, in the order `/metrics` renders them. Every family's
+`# HELP` and `# TYPE` lines are always rendered. "Present when" says when
+>>>>>>> a0d514c01ca518d421b77a5db3bf0eb0653a2543
 the family also carries samples. Where it says a family has no samples, the
 value is absent, not zero: the node does not measure it, so do not read the
 missing series as "no loss" or "no traffic".
@@ -81,6 +86,7 @@ missing series as "no loss" or "no traffic".
 | `manta_spots_dropped_write_failed_total` | counter | — | Spots dropped because a client's socket write timed out or failed before a lag or close error was observed. | Always; starts at 0. |
 | `manta_spots_dropped_shutdown_total` | counter | — | Spots abandoned because the daemon shut down while a client was still in its pre-login or handshake phase, before any socket write timed out or failed. | Always; starts at 0. |
 | `manta_spots_replay_abandoned_total` | counter | — | `sh/dx` history entries abandoned without being replayed, because the replay write failed or the daemon shut down mid-replay. These are re-sends of spots already counted in `manta_spots_total`, so they are counted apart from live-delivery loss. | Always; starts at 0. |
+| `manta_spots_history_truncated_total` | counter | — | Spots evicted from `sh/dx` history at its 10,000-spot ceiling while still inside `[server].history_minutes`. Normal ageing does not increment it; a nonzero value means the ceiling has shortened the retained window. See [MAN-93](DECISIONS/2026-10-11-man93-sh-dx-history-window.md). | Always; starts at 0. |
 | `manta_spots_unresolved_geography_total` | counter | — | Spots emitted with an `UNKNOWN_DXCC`, `UNKNOWN_CONTINENT` or `UNKNOWN_CQ_ZONE` sentinel on the dx or de side. The callsign did not resolve against `cty.dat`, or its entity has no row in the vendored `dxcc.tsv`, or it carries a `/MM` or `/AM` designator that places it outside any DXCC entity. | Always; starts at 0. |
 | `manta_telnet_clients_connected` | gauge | — | Currently connected telnet clients. | Always. |
 | `manta_json_clients_connected` | gauge | — | Currently connected JSON Lines clients. | Always. |

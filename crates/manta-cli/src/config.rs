@@ -1521,6 +1521,7 @@ mod tests {
         }
     }
 
+<<<<<<< HEAD
     // ---- MAN-301: [rbn_compare]
 
     #[test]
@@ -1649,5 +1650,15 @@ mod tests {
         );
         let err = err_of("[rbn_compar]\nenabled = true\n");
         assert!(err.contains("did you mean [rbn_compare]?"), "{err}");
+=======
+    #[test]
+    fn env_overrides_server_history_minutes() {
+        let loaded = load_env(
+            Some("[server]\nstation_callsign = \"W1AW\"\nhistory_minutes = 30\n"),
+            &[("MANTA_SERVER_HISTORY_MINUTES", "45")],
+        )
+        .unwrap();
+        assert_eq!(loaded.server.unwrap().history_minutes, Some(45));
+>>>>>>> a0d514c01ca518d421b77a5db3bf0eb0653a2543
     }
 }

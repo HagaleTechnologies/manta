@@ -16,10 +16,16 @@ version. A PATCH release never changes decoder output. The JSON stream's
 output. See
 [docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md](docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md).
 
-No release has been tagged yet. Changes before this file started are in the
-git history and `docs/DECISIONS/`.
+`0.1.0` is the first tagged release; its GitHub Release notes list every
+pull request merged before it. Changes before this file started are also in
+the git history and `docs/DECISIONS/`.
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-10-11
+
+Pre-stability alpha, expect breakage: manta has not cleared its own M2/M3
+acceptance gates.
 
 ### Decoder output
 
@@ -31,6 +37,9 @@ git history and `docs/DECISIONS/`.
 
 ### Added
 
+- Prebuilt archives for Linux (x86-64, arm64), macOS (x86-64, arm64) and
+  Windows (x86-64) on each GitHub Release, with `SHA256SUMS` and a
+  build-provenance attestation (MAN-298).
 - `manta health` asks a running daemon's `/healthz` and exits 0 when it
   reports healthy, 1 otherwise, reading the metrics port from the same config
   and `MANTA_*` overrides as `run` (MAN-81).
@@ -117,6 +126,11 @@ git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- `sh/dx` history now retains every spot heard in the last
+  `[server].history_minutes` minutes (default 30; at least the 50 newest,
+  at most 10,000). `manta_spots_history_truncated_total` counts spots the
+  ceiling drops early (MAN-93). Bare `sh/dx` still shows the last 10;
+  loggers can request `sh/dx 30m`.
 - Command output reads as finished text rather than debug prints (MAN-270).
   Human reports use shared units: frequencies as `14012.3 kHz`, SNR as
   integer `dB`, speed as integer `WPM`, confidence to two decimals, and spot

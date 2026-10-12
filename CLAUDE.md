@@ -75,6 +75,12 @@ MAN-116: `manta bench sensitivity` produces the recall/CER-vs-SNR (500 Hz)
 table over AWGN/Watterson good/poor × WPM, deterministic per build and
 flags — see docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md.
 
+MAN-298: v0.1.0 release prep. The GitHub Release shares
+`docker-publish-release`'s `ghcr-publish` approval but not its outcome, so a
+failed image push no longer skips it; release notes and README say
+"pre-stability alpha, expect breakage". Tony pushes the tag. See
+docs/DECISIONS/2026-10-11-man298-first-release.md.
+
 MAN-123: `run`'s plain-text mode prints decoded text on stderr grouped one
 line per track and `SPOT:` lines on stdout; with a `[server]` table decoded
 text is off unless `--decoded-text` — see
@@ -95,6 +101,11 @@ MAN-138: JSON spots' `deGrid`/`deLat`/`deLon` are the operator's
 `operator_lon`, `null` when none is set, never a `cty.dat` country
 centroid; an inconsistent location fails config loading before I/O. See
 `docs/DECISIONS/2026-10-11-man138-station-location.md`.
+
+MAN-93: `[server].history_minutes` controls telnet replay retention
+(default 30 minutes, newest-50 floor, 10,000 ceiling). Bare `sh/dx` stays
+at 10 rows; loggers request `sh/dx 30m`. Changes need a restart. See
+`docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md`.
 
 MAN-149: `docs/CONFIG.md` (every key's default and what reads it),
 `docs/METRICS.md`, `docs/SPOT-SCHEMA.md`, `docs/README.md` (start here, by
