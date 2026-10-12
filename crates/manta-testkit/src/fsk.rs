@@ -165,21 +165,28 @@ pub fn add_fsk(iq: &mut [Complex32], fs: f64, spec: &FskSpec) {
             }
         }
         Some((preset, seed)) => {
-            // Same real-domain path as `scene::render_scene`'s Watterson
-            // branch: a real passband signal from the offsets' magnitudes,
-            // faded, Hilbert-converted, conjugated for negative offsets.
-            let negative = mark < 0.0;
+            // Real-domain like `scene::render_scene`'s Watterson branch, but
+            // a real tone cannot carry its sign, and mark and space straddle
+            // DC when 0 < mark < shift. So shift the continuous-phase signal
+            // up until the pair is centred on fs/4 (both tones positive and
+            // mid-band for the Hilbert FIR), fade its real part,
+            // Hilbert-convert and shift back down: both tones keep their
+            // signs and share one channel.
+            let dup = std::f64::consts::TAU * (fs / 4.0 - (mark + space) / 2.0) / fs;
             let mut real = vec![0.0f32; iq.len()];
             for (i, r) in real.iter_mut().enumerate() {
                 let Some(f) = freq_at(i) else { continue };
-                *r = amp / MASTER_SCALE * phi.cos() as f32;
-                phi = wrap(phi + std::f64::consts::TAU * f.abs() / fs);
+                *r = amp / MASTER_SCALE * (phi + dup * i as f64).cos() as f32;
+                phi = wrap(phi + std::f64::consts::TAU * f / fs);
             }
             let faded = coppa_channel::watterson::watterson_preset(&real, fs as f32, preset, seed);
-            let analytic = manta_dsp::hilbert::HilbertTransformer::new().process(&faded);
-            for (out, a) in iq.iter_mut().zip(analytic.iter()) {
-                let a = if negative { a.conj() } else { *a };
-                *out += a * MASTER_SCALE;
+            let mut hilbert = manta_dsp::hilbert::HilbertTransformer::new();
+            // The Hilbert output lags its input by `delay()` samples.
+            let lag = hilbert.delay() as f64;
+            let analytic = hilbert.process(&faded);
+            for (i, (out, a)) in iq.iter_mut().zip(analytic.iter()).enumerate() {
+                let (s, c) = (-dup * (i as f64 - lag)).sin_cos();
+                *out += a * Complex32::new(c as f32, s as f32) * MASTER_SCALE;
             }
         }
     }
@@ -270,6 +277,48 @@ mod tests {
         let tol = 45.45 / 4.0;
         assert!((top[0] - 830.0).abs() <= tol, "space {top:?}");
         assert!((top[1] - 1_000.0).abs() <= tol, "mark {top:?}");
+    }
+
+    /// Mean power within about +-25 Hz of `f`: mix `f` to DC, then a 20 ms
+    /// boxcar.
+    fn band_power(iq: &[Complex32], fs: f64, f: f64) -> f64 {
+        let w = (fs / 50.0) as usize;
+        let mixed: Vec<num_complex::Complex64> = iq
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let ph = -std::f64::consts::TAU * f * i as f64 / fs;
+                num_complex::Complex64::new(s.re as f64, s.im as f64)
+                    * num_complex::Complex64::from_polar(1.0, ph)
+            })
+            .collect();
+        let sums: Vec<f64> = mixed
+            .chunks_exact(w)
+            .map(|c| (c.iter().sum::<num_complex::Complex64>() / w as f64).norm_sqr())
+            .collect();
+        sums.iter().sum::<f64>() / sums.len() as f64
+    }
+
+    #[test]
+    fn faded_tones_keep_their_signs_across_dc() {
+        // Mark +100 Hz, 850 Hz shift: space at -750 Hz. At 96 kS/s the
+        // mark is far below the Hilbert FIR's passband edge.
+        let fs = 96_000.0;
+        let mut iq = vec![Complex32::new(0.0, 0.0); 192_000];
+        let mut s = spec("RYRYRYRYRYRYRYRY");
+        s.mark_offset_hz = 100.0;
+        s.shift_hz = 850.0;
+        s.baud = 50.0;
+        s.watterson = Some((coppa_channel::watterson::WattersonPreset::Good, 7));
+        add_fsk(&mut iq, fs, &s);
+        // Each tone over its mirror; the faded mark's mirror band holds the
+        // keyed spectrum's own sidebands (measured 19.6 dB), a mirrored tone
+        // reads below 0 dB.
+        let db = |a: f64, b: f64| 10.0 * (a / b).log10();
+        let space = db(band_power(&iq, fs, -750.0), band_power(&iq, fs, 750.0));
+        let mark = db(band_power(&iq, fs, 100.0), band_power(&iq, fs, -100.0));
+        assert!(space > 10.0, "space -750 vs +750 Hz: {space} dB");
+        assert!(mark > 10.0, "mark +100 vs -100 Hz: {mark} dB");
     }
 
     #[test]
