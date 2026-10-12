@@ -54,7 +54,6 @@ pub struct ListenObservers {
     /// running `Validator`. `None` (the default) skips the check
     /// entirely, so `listen()`'s existing callers pay nothing.
     pub operator_lists: Option<Arc<OperatorListsUpdate>>,
-<<<<<<< HEAD
     /// MAN-316: the country table and known-call set a scheduled list
     /// refresh replaces. The running `Validator` takes their current tables
     /// at the start (so the caller builds this from the same
@@ -63,7 +62,6 @@ pub struct ListenObservers {
     /// `store`. `None` (the default) skips the check entirely, so `listen()`'s
     /// existing callers pay nothing.
     pub reference_lists: Option<Arc<ReferenceLists>>,
-=======
     /// MAN-314: the currently marked RTTY signals (SPEC §2.6), stored
     /// whenever the marked set or a marked signal's metadata changes (so a
     /// store is not by itself a mark or clear), emptied on a segment
@@ -177,7 +175,6 @@ impl Drop for RttyPublisher {
     fn drop(&mut self) {
         self.clear();
     }
->>>>>>> 2c7a2f50a96ba2bbba78de3ffb9aca9b5a28fd85
 }
 
 /// MAN-78: the operator lists a live reload replaces, as one unit.

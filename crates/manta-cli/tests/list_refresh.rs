@@ -11,8 +11,10 @@
 //!
 //! Every wait is bounded, every port is ephemeral (the `listening:` banner,
 //! or a bind-then-drop for a port nobody listens on), and every age and
-//! hash is computed here from `SystemTime::now()` and the bundled bytes, so
-//! nothing depends on today's date or on which lists are vendored.
+//! hash is computed here from `SystemTime::now()`, the bundled bytes and the
+//! bundled retrieval dates (`manta_spot::vintage`; a seeded download always
+//! postdates them), so nothing depends on today's date or on which lists
+//! are vendored.
 #![cfg(unix)]
 
 mod common;
@@ -101,9 +103,30 @@ fn closed_port() -> u16 {
         .port()
 }
 
+/// The vendored copy's retrieval date (`manta_spot::vintage`) for `list`.
+fn vendored_retrieved_at(list: &str) -> Option<SystemTime> {
+    match list {
+        "cty" => manta_spot::vintage::cty_dat_retrieved_at(),
+        "scp" => manta_spot::vintage::master_scp_retrieved_at(),
+        other => panic!("no list {other:?}"),
+    }
+}
+
+/// `downloaded_ago` seconds before `now`, moved to one second after
+/// `retrieved` when that is later. Startup ignores a cached copy downloaded
+/// on or before the vendored copy's retrieval date (D3), so a seeded copy
+/// must postdate it whichever date the vendored lists carry; only
+/// `checked_at` decides when a list is due.
+fn seeded_downloaded_at(retrieved: Option<SystemTime>, now: u64, downloaded_ago: u64) -> u64 {
+    let retrieved = retrieved.map_or(0, |at| at.duration_since(UNIX_EPOCH).unwrap().as_secs());
+    (now - downloaded_ago).max(retrieved + 1)
+}
+
 /// Writes `<cache>/<list>/<sha>.<ext>` and a `state.json` naming it, with
-/// `downloaded_at`/`checked_at` the given number of seconds ago. Returns the
-/// state file's path.
+/// `checked_at` the given number of seconds ago and `downloaded_at` the given
+/// number of seconds ago or just after the vendored copy's retrieval date,
+/// whichever is later (`seeded_downloaded_at`). Returns the state file's
+/// path.
 fn seed_cache(
     cache: &Path,
     list: &str,
@@ -121,7 +144,7 @@ fn seed_cache(
     let state = serde_json::json!({
         "sha256": sha,
         "url": url,
-        "downloaded_at": now - downloaded_ago,
+        "downloaded_at": seeded_downloaded_at(vendored_retrieved_at(list), now, downloaded_ago),
         "checked_at": now - checked_ago,
         "last_modified": null,
     });
@@ -472,6 +495,29 @@ fn assert_success(out: &Output, what: &str) {
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Scenarios 1 and 2 need startup to take the seeded cache, which it does
+/// only for a download after the vendored copy's retrieval date. A list
+/// vendored today, or after the requested age, still loses to the seed; an
+/// older one leaves the requested age alone.
+#[test]
+fn a_seeded_download_postdates_the_vendored_copy_whatever_its_date() {
+    let now: u64 = 1_791_763_200 + 3_600; // 2026-10-12 01:00 UTC
+    let midnight = now - now % DAY;
+    let at = |secs: u64| Some(UNIX_EPOCH + Duration::from_secs(secs));
+    for (retrieved, ago) in [(midnight, 8 * DAY), (now - DAY, 2 * DAY), (now, DAY)] {
+        let downloaded = seeded_downloaded_at(at(retrieved), now, ago);
+        assert!(
+            downloaded > retrieved,
+            "{downloaded} does not postdate {retrieved}"
+        );
+    }
+    assert_eq!(
+        seeded_downloaded_at(at(now - 100 * DAY), now, 8 * DAY),
+        now - 8 * DAY
+    );
+    assert_eq!(seeded_downloaded_at(None, now, 2 * DAY), now - 2 * DAY);
 }
 
 #[test]

@@ -1027,7 +1027,7 @@ mod tests {
             shutdown,
             drain_deadline: Duration::from_secs(1),
         };
-        let spot = BusSpot {
+        let spot = JsonItem::Spot(crate::bus::BusSpot {
             spot: Spot {
                 callsign: "QQ9ZZZ".to_string(),
                 freq_hz: 14_025_000.0,
@@ -1039,7 +1039,7 @@ mod tests {
                 sample_ts: 0,
             },
             occurrence_count: 1,
-        };
+        });
         let render = |ctx: &ClientCtx| -> serde_json::Value {
             serde_json::from_str(&ctx.render(&spot)).expect("render emits JSON")
         };

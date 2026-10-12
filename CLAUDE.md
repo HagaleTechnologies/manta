@@ -147,15 +147,6 @@ MAN-127: `manta calibrate` measures the receiver's ppm offset against a
 known carrier and saves `[input].freq_correction_ppm` after confirmation —
 see docs/DECISIONS/2026-10-11-man127-calibrate-command.md.
 
-<<<<<<< HEAD
-MAN-316: `[spot].refresh_lists` (default off) makes `run` from a live
-receiver download `cty.dat` every 7 days and `MASTER.SCP` daily over plain
-HTTP, swap a download that passes the acceptance checks into the
-validator, spot geography and JSON stream without a restart, and keep it
-under `[spot].list_cache_dir`; a failure keeps the list in use. File replay
-never downloads; `--cty-sha256`/`--scp-sha256` pin a version by hash. See
-docs/DECISIONS/2026-10-12-man316-reference-list-refresh.md.
-=======
 MAN-314: RTTY (two-tone FSK) is recognised after `[detector] rtty_dwell_ms`
 (20 s) and starts no CW track on its tones or keying sidebands
 (`manta-dsp::fsk`, SPEC §2.6); `decode --json` gains `rtty`, `run` logs
@@ -170,7 +161,14 @@ grade` and `score-against-rbn.py --node-log` replay offline through the
 same Rust engine. RBN's real login prompt and the live/offline agreement
 rate are unmeasured. See
 docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
->>>>>>> 2c7a2f50a96ba2bbba78de3ffb9aca9b5a28fd85
+
+MAN-316: `[spot].refresh_lists` (default off) makes `run` from a live
+receiver download `cty.dat` every 7 days and `MASTER.SCP` daily over plain
+HTTP, swap a download that passes the acceptance checks into the
+validator, spot geography and JSON stream without a restart, and keep it
+under `[spot].list_cache_dir`; a failure keeps the list in use. File replay
+never downloads; `--cty-sha256`/`--scp-sha256` pin a version by hash. See
+docs/DECISIONS/2026-10-12-man316-reference-list-refresh.md.
 
 ## Documents (read in this order)
 

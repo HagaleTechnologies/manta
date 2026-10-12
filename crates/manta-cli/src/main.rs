@@ -3520,14 +3520,11 @@ struct CliOverrides {
     notch: Option<PathBuf>,
     cty: Option<PathBuf>,
     scp: Option<PathBuf>,
-<<<<<<< HEAD
     /// MAN-316: `--cty-sha256`/`--scp-sha256`.
     cty_sha256: Option<String>,
     scp_sha256: Option<String>,
-=======
     /// MAN-301: `--rbn-compare`/`--rbn-spotter` (`run` only).
     rbn: RbnCompareOpts,
->>>>>>> 2c7a2f50a96ba2bbba78de3ffb9aca9b5a28fd85
 }
 
 impl CliOverrides {
@@ -3569,12 +3566,9 @@ impl CliOverrides {
             notch: None,
             cty: None,
             scp: None,
-<<<<<<< HEAD
             cty_sha256: None,
             scp_sha256: None,
-=======
             rbn: RbnCompareOpts::default(),
->>>>>>> 2c7a2f50a96ba2bbba78de3ffb9aca9b5a28fd85
         }
     }
 
@@ -3760,14 +3754,9 @@ fn resolve_rbn_compare(
 
 /// D6: merges the command line over the loaded file + environment layer.
 fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
-<<<<<<< HEAD
-    let mut notes = Vec::new();
-    let spot = resolve_spot_pinned(
-=======
     let mut notes = loaded.notes.clone();
     let rbn_compare = resolve_rbn_compare(&cli.rbn, loaded.rbn_compare.as_ref());
-    let spot = resolve_spot(
->>>>>>> 2c7a2f50a96ba2bbba78de3ffb9aca9b5a28fd85
+    let spot = resolve_spot_pinned(
         cli.allowlist.clone(),
         cli.blocklist.clone(),
         cli.notch.clone(),
@@ -4941,12 +4930,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                 notch,
                 cty,
                 scp,
-<<<<<<< HEAD
                 cty_sha256,
                 scp_sha256,
-=======
                 rbn,
->>>>>>> 2c7a2f50a96ba2bbba78de3ffb9aca9b5a28fd85
             };
             // MAN-78: a SIGHUP reload re-resolves with the same flags.
             #[cfg(unix)]
@@ -5417,11 +5403,8 @@ fn run_command() -> Result<std::process::ExitCode> {
                     active_tracks: active_tracks.clone(),
                     decode_latency: decode_latency.clone(),
                     operator_lists: reload_enabled.then(|| operator_lists.clone()),
-<<<<<<< HEAD
                     reference_lists,
-=======
                     rtty: Some(rtty_observer.clone()),
->>>>>>> 2c7a2f50a96ba2bbba78de3ffb9aca9b5a28fd85
                 },
                 |ev| {
                     if json {
@@ -5752,12 +5735,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                     notch,
                     cty,
                     scp,
-<<<<<<< HEAD
                     cty_sha256,
                     scp_sha256,
-=======
                     rbn: RbnCompareOpts::default(),
->>>>>>> 2c7a2f50a96ba2bbba78de3ffb9aca9b5a28fd85
                 },
                 config,
                 None,
@@ -5929,12 +5909,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                     notch,
                     cty,
                     scp,
-<<<<<<< HEAD
                     cty_sha256,
                     scp_sha256,
-=======
                     rbn: RbnCompareOpts::default(),
->>>>>>> 2c7a2f50a96ba2bbba78de3ffb9aca9b5a28fd85
                 },
                 config,
                 None,
@@ -6748,6 +6725,7 @@ mod tests {
         let (test_runtime, server) = start_spot_server(
             loaded.server.unwrap(),
             vec![],
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,

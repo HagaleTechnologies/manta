@@ -343,14 +343,11 @@ fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<Str
         notch: _,
         cty: _,
         scp: _,
-<<<<<<< HEAD
         cty_sha256: _,
         scp_sha256: _,
-=======
         // Exempt: RBN comparison grades spots after decoding, not the
         // input (calibrate has no --rbn-compare/--rbn-spotter flags).
         rbn: _,
->>>>>>> 2c7a2f50a96ba2bbba78de3ffb9aca9b5a28fd85
     } = cli;
     let mut found: Vec<String> = Vec::new();
     let mut flag = |set: bool, name: &str| {
