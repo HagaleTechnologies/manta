@@ -128,7 +128,7 @@ the Inputs table below.
 ### Docker
 
 Each release also publishes a multi-arch image (`linux/amd64`,
-`linux/arm64`) to GitHub Container Registry:
+`linux/arm64`, `linux/arm/v7`) to GitHub Container Registry:
 
 ```sh
 docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
