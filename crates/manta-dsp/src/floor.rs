@@ -16,6 +16,19 @@ const FLOOR_QUANTILE: f64 = 0.25;
 /// SPEC §2.2.
 const BLOCK_CHANNELS: usize = 32;
 const BLOCK_ALLOWANCE_DB: f64 = 3.0;
+/// SPEC §2.2 "Startup", MAN-115: for a channel's first 25 ring pushes (1 s
+/// at 25 Hz decimation) after its block's leading silence, its effective
+/// floor is never below its block's seed. A 1-4 entry ring's lower
+/// quartile is just its minimum, which sits far below the true floor on
+/// chi-squared noise and would let noise pass `rise` almost everywhere;
+/// the seed is what makes a sub-second warm-up safe
+/// (docs/DECISIONS/2026-10-11-man115-startup-latency.md).
+const SEED_PUSHES: usize = 25;
+/// SPEC §2.2 "Startup", MAN-115: the seed is the running mean of the
+/// block median of raw power minus 10*log10(ln 2 / ln(4/3)) ~ 3.8 dB, the
+/// median-to-lower-quartile gap of a chi-squared 2-DOF power, so it
+/// estimates the same quantity the ring converges to.
+const SEED_OFFSET_DB: f64 = 3.8;
 
 /// SPEC §2.3: tau=40ms at the channelizer's fixed 375 Hz hop rate ->
 /// alpha = 1 - e^(-2.667/40).
@@ -34,6 +47,10 @@ struct ChannelFloor {
     hist: [u8; HIST_BINS],
     ring_pos: usize,
     filled: usize,
+    /// MAN-115: bottom-bin entries pushed before the block's first
+    /// non-silent push (a source opening with digital silence) still in
+    /// the ring. The ring is FIFO, so they are always its oldest entries.
+    lead_silent: u16,
 }
 
 impl ChannelFloor {
@@ -43,6 +60,7 @@ impl ChannelFloor {
             hist: [0; HIST_BINS],
             ring_pos: 0,
             filled: 0,
+            lead_silent: 0,
         }
     }
 
@@ -51,6 +69,10 @@ impl ChannelFloor {
         if self.filled == RING_LEN {
             let evict_bin = self.ring[self.ring_pos] as usize;
             self.hist[evict_bin] = self.hist[evict_bin].saturating_sub(1);
+            // While any leading silence is left it is the oldest entry.
+            if evict_bin == 0 {
+                self.lead_silent = self.lead_silent.saturating_sub(1);
+            }
         } else {
             self.filled += 1;
         }
@@ -60,15 +82,21 @@ impl ChannelFloor {
     }
 
     /// SPEC §2.1: 25th percentile via cumulative histogram scan. Startup
-    /// (ring partially filled): quantile is taken over whatever's present.
-    fn quantile_db(&self, q: f64) -> f64 {
-        if self.filled == 0 {
+    /// (ring partially filled): quantile is taken over whatever's present,
+    /// less `skip` bottom-bin entries.
+    fn quantile_db(&self, q: f64, skip: usize) -> f64 {
+        let n = self.filled - skip;
+        if n == 0 {
             return HIST_MIN_DB;
         }
-        let target = ((q * self.filled as f64).ceil() as usize).max(1);
+        let target = ((q * n as f64).ceil() as usize).max(1);
         let mut cum = 0usize;
         for (b, &c) in self.hist.iter().enumerate() {
-            cum += c as usize;
+            cum += if b == 0 {
+                c as usize - skip
+            } else {
+                c as usize
+            };
             if cum >= target {
                 return HIST_MIN_DB + (b as f64 + 0.5) * BIN_WIDTH_DB;
             }
@@ -77,7 +105,23 @@ impl ChannelFloor {
     }
 
     fn floor_db(&self) -> f64 {
-        self.quantile_db(FLOOR_QUANTILE)
+        self.quantile_db(FLOOR_QUANTILE, 0)
+    }
+
+    /// MAN-115: the lower quartile without the leading silence, or the raw
+    /// one when the ring holds nothing else. Never below `floor_db`.
+    fn usable_floor_db(&self) -> f64 {
+        let skip = self.lead_silent as usize;
+        if skip == self.filled {
+            self.floor_db()
+        } else {
+            self.quantile_db(FLOOR_QUANTILE, skip)
+        }
+    }
+
+    /// Ring entries pushed since the block's leading silence ended.
+    fn usable_len(&self) -> usize {
+        self.filled - self.lead_silent as usize
     }
 }
 
@@ -102,6 +146,10 @@ fn median(vals: &[f64]) -> f64 {
 pub struct FloorBank {
     channels: Vec<ChannelFloor>,
     floor_db: Vec<f64>,
+    /// MAN-115: `floor_db` without each ring's leading silence; equal to
+    /// it once that silence has left the ring. `block_floor_db` is the
+    /// block median of these.
+    usable_floor_db: Vec<f64>,
     block_floor_db: Vec<f64>,
     hop_counter: u64,
     /// Per-hop EMA (tau = 40 ms, same alpha as Gate) of each channel's
@@ -120,6 +168,10 @@ pub struct FloorBank {
     /// selected minimum back to dB when read.
     smoothed_lin: Vec<f64>,
     smoothed_init: bool,
+    /// MAN-115: per-block sum of the block median of raw power over the
+    /// first `SEED_PUSHES` decimated hops, and how many were summed.
+    seed_sum_db: Vec<f64>,
+    seed_pushes: Vec<u32>,
 }
 
 /// `10^(db/10)`, the inverse of `manta_dsp::channelizer::power_db`'s
@@ -130,16 +182,23 @@ fn db_to_linear(db: f64) -> f64 {
 }
 
 impl FloorBank {
-    /// A fresh floor bank for `n_channels` channels, all floors starting at the histogram's minimum (-140 dBFS) until the ring warms up. SPEC §2.1.
+    /// A fresh floor bank for `n_channels` channels, all floors starting at
+    /// the histogram's minimum (-140 dBFS) until the first `update`. For
+    /// the first second after each block's leading silence,
+    /// `effective_floor_db` is held at or above the block-median seed
+    /// while the rings fill. SPEC §2.1-2.2.
     pub fn new(n_channels: usize) -> Self {
         let n_blocks = n_channels.div_ceil(BLOCK_CHANNELS);
         FloorBank {
             channels: (0..n_channels).map(|_| ChannelFloor::new()).collect(),
             floor_db: vec![HIST_MIN_DB; n_channels],
+            usable_floor_db: vec![HIST_MIN_DB; n_channels],
             block_floor_db: vec![HIST_MIN_DB; n_blocks],
             hop_counter: 0,
             smoothed_lin: vec![db_to_linear(HIST_MIN_DB); n_channels],
             smoothed_init: false,
+            seed_sum_db: vec![0.0; n_blocks],
+            seed_pushes: vec![0; n_blocks],
         }
     }
 
@@ -170,16 +229,37 @@ impl FloorBank {
             self.smoothed_init = true;
         }
         if self.hop_counter.is_multiple_of(DECIMATION_HOPS) {
-            for (ch, &p) in self.channels.iter_mut().zip(power_db) {
+            for b in 0..self.block_floor_db.len() {
+                let start = b * BLOCK_CHANNELS;
+                let end = (start + BLOCK_CHANNELS).min(self.channels.len());
+                // A block median below the histogram's range is digital
+                // silence (a source still opening), not noise: averaged in
+                // dB, one -200 dB push would drag the seed ~50 dB low.
+                let block_median = median(&power_db[start..end]);
+                if (self.seed_pushes[b] as usize) < SEED_PUSHES && block_median >= HIST_MIN_DB {
+                    self.seed_sum_db[b] += block_median;
+                    self.seed_pushes[b] += 1;
+                }
+            }
+            for (k, (ch, &p)) in self.channels.iter_mut().zip(power_db).enumerate() {
                 ch.push(p);
+                // A block with no seed push yet is still in leading silence.
+                if bin_index(p) == 0 && self.seed_pushes[k / BLOCK_CHANNELS] == 0 {
+                    ch.lead_silent += 1;
+                }
             }
             for (k, ch) in self.channels.iter().enumerate() {
                 self.floor_db[k] = ch.floor_db();
+                self.usable_floor_db[k] = if ch.lead_silent == 0 {
+                    self.floor_db[k]
+                } else {
+                    ch.usable_floor_db()
+                };
             }
             for (b, block_floor) in self.block_floor_db.iter_mut().enumerate() {
                 let start = b * BLOCK_CHANNELS;
                 let end = (start + BLOCK_CHANNELS).min(self.channels.len());
-                *block_floor = median(&self.floor_db[start..end]);
+                *block_floor = median(&self.usable_floor_db[start..end]);
             }
         }
         self.hop_counter += 1;
@@ -192,9 +272,26 @@ impl FloorBank {
     }
 
     /// Effective floor `F[k] = min(F_ch[k], F_blk[k/32] + 3dB)`. SPEC §2.2.
+    /// MAN-115: while channel `k`'s ring holds fewer than `SEED_PUSHES`
+    /// entries taken since its block's leading silence ended, raised to at
+    /// least its block's seed (the mean block median of raw power so far,
+    /// minus `SEED_OFFSET_DB`). The seed only ever raises the floor, so a
+    /// wrong seed costs sensitivity for at most the first second after the
+    /// leading silence and never adds tracks. `channel_floor_db` stays raw.
+    ///
+    /// Bottom-bin entries a ring took during that leading silence (a
+    /// stream that opens with exact zeros) are left out of `F_ch` and
+    /// `F_blk` here until they leave the ring; counted, they would pin the
+    /// lower quartile at -140 dB. Later bottom-bin entries count as usual.
     pub fn effective_floor_db(&self, k: usize) -> f64 {
         let block = k / BLOCK_CHANNELS;
-        self.floor_db[k].min(self.block_floor_db[block] + BLOCK_ALLOWANCE_DB)
+        let f = self.usable_floor_db[k].min(self.block_floor_db[block] + BLOCK_ALLOWANCE_DB);
+        let pushes = self.seed_pushes[block];
+        if self.channels[k].usable_len() < SEED_PUSHES && pushes > 0 {
+            f.max(self.seed_sum_db[block] / pushes as f64 - SEED_OFFSET_DB)
+        } else {
+            f
+        }
     }
 
     /// SPEC v2 §2.2: minimum of the 40 ms-smoothed power over the six
@@ -374,6 +471,161 @@ mod tests {
             (f - (-90.0)).abs() < 1.0,
             "uniform-noise floor should read near -90 dB, got {f}"
         );
+    }
+
+    /// MAN-115: one decimated push of a block where every channel but one
+    /// sits at -90 dB and channel 3 reads a chi-squared-style low draw at
+    /// -110 dB. A 1-entry ring's lower quartile is that draw itself, so
+    /// without the seed channel 3's effective floor would be -110 dB.
+    fn young_bank() -> FloorBank {
+        let mut bank = FloorBank::new(64);
+        let mut p = vec![-90.0; 64];
+        p[3] = -110.0;
+        bank.update(&p);
+        bank
+    }
+
+    #[test]
+    fn young_ring_effective_floor_is_at_least_the_block_seed() {
+        let bank = young_bank();
+        let seed = -90.0 - SEED_OFFSET_DB;
+        let f = bank.effective_floor_db(3);
+        assert!(
+            f >= seed - 1e-9,
+            "young-ring effective floor {f} must not sit below the block seed {seed}"
+        );
+        assert!(
+            (f - seed).abs() < 1e-9,
+            "the seed should be the binding term here, got {f} vs seed {seed}"
+        );
+    }
+
+    #[test]
+    fn seed_does_not_change_the_raw_channel_floor() {
+        let bank = young_bank();
+        // -110.0 falls in the [-110.0, -109.5) bin; its centre is -109.75.
+        assert_eq!(bank.channel_floor_db(3), -109.75);
+    }
+
+    #[test]
+    fn seed_stops_applying_after_seed_pushes() {
+        // The block median of raw power is -90 dB on every push, so the
+        // seed is -93.8 dB; channel 3 always reads -110 dB, so once the
+        // seed lapses its effective floor is its own -109.75 dB quartile.
+        let mut bank = FloorBank::new(64);
+        let mut p = vec![-90.0; 64];
+        p[3] = -110.0;
+        let seed = -90.0 - SEED_OFFSET_DB;
+        for push in 1..=SEED_PUSHES + 1 {
+            for _ in 0..DECIMATION_HOPS {
+                bank.update(&p);
+            }
+            let f = bank.effective_floor_db(3);
+            if push < SEED_PUSHES {
+                assert!(
+                    (f - seed).abs() < 1e-9,
+                    "push {push}: expected the seed {seed}, got {f}"
+                );
+            } else {
+                assert_eq!(f, -109.75, "push {push}: the seed must have lapsed");
+            }
+        }
+    }
+
+    /// MAN-115 review: a stream that opens with digital silence (exact
+    /// zeros read as -200 dB) must neither drag the seed down nor end it
+    /// before the channel has a second of non-silent input. Channel 3's
+    /// low -110 dB draws make the seed the binding term.
+    #[test]
+    fn leading_digital_silence_neither_lowers_nor_ends_the_seed() {
+        let mut bank = FloorBank::new(64);
+        let seed = -90.0 - SEED_OFFSET_DB;
+        let mut p = vec![-90.0; 64];
+        p[3] = -110.0;
+        // Eight silent decimated pushes (320 ms), then noise at -90 dB.
+        for _ in 0..8 * DECIMATION_HOPS {
+            bank.update(&[-200.0; 64]);
+        }
+        bank.update(&p);
+        let f = bank.effective_floor_db(3);
+        assert!(
+            (f - seed).abs() < 1e-9,
+            "the first real push sets the seed to {seed}, got {f}"
+        );
+        // 29 ring entries, past SEED_PUSHES but only 21 after the silence;
+        // the raw quartile rank ceil(29/4) = 8 is still a silent entry.
+        for _ in 0..20 * DECIMATION_HOPS {
+            bank.update(&p);
+        }
+        assert_eq!(bank.channel_floor_db(3), -139.75);
+        let f = bank.effective_floor_db(3);
+        assert!(
+            (f - seed).abs() < 1e-9,
+            "silent ring entries keep the seed in force at {seed}, got {f}"
+        );
+    }
+
+    /// MAN-115 validate R1: a bottom-bin entry in a mature ring, whether a
+    /// nonzero -139.6 dB draw or exact digital silence, must not bring the
+    /// startup seed (here -93.8 dB, from the first -90 dB second) back.
+    #[test]
+    fn later_bottom_bin_entry_does_not_revive_the_seed() {
+        for low in [-139.6, -200.0] {
+            let mut bank = FloorBank::new(64);
+            for _ in 0..RING_LEN as u64 * DECIMATION_HOPS {
+                bank.update(&[-90.0; 64]);
+            }
+            for _ in 0..RING_LEN as u64 * DECIMATION_HOPS {
+                bank.update(&[-110.0; 64]);
+            }
+            let mut p = vec![-110.0; 64];
+            p[3] = low;
+            for _ in 0..DECIMATION_HOPS {
+                bank.update(&p);
+            }
+            assert_eq!(
+                bank.effective_floor_db(3),
+                -109.75,
+                "a {low} dB entry revived the startup seed"
+            );
+        }
+    }
+
+    /// MAN-115 validate R1: a channel that reads digital silence while the
+    /// rest of its block carries noise is not in leading silence, so its
+    /// seed lapses after `SEED_PUSHES` like any other channel's.
+    #[test]
+    fn quiet_channel_in_a_live_block_loses_the_seed_after_seed_pushes() {
+        let mut bank = FloorBank::new(64);
+        let mut p = vec![-90.0; 64];
+        p[3] = -200.0;
+        for _ in 0..SEED_PUSHES as u64 * DECIMATION_HOPS {
+            bank.update(&p);
+        }
+        assert_eq!(bank.effective_floor_db(3), -139.75);
+    }
+
+    /// MAN-115 validate R1: leading silence long enough to pin the raw
+    /// quartile at -140 dB leaves the effective floor on the real input
+    /// once the seed lapses, and it follows that input down at once rather
+    /// than holding the seed until the silence leaves the ring (10 s).
+    #[test]
+    fn effective_floor_follows_real_input_past_leading_silence() {
+        let mut bank = FloorBank::new(64);
+        for _ in 0..20 * DECIMATION_HOPS {
+            bank.update(&[-200.0; 64]);
+        }
+        for _ in 0..SEED_PUSHES as u64 * DECIMATION_HOPS {
+            bank.update(&[-90.0; 64]);
+        }
+        // 45 entries, quartile rank 12: the raw floor is a silent entry.
+        assert_eq!(bank.channel_floor_db(3), -139.75);
+        assert_eq!(bank.effective_floor_db(3), -89.75);
+        for _ in 0..SEED_PUSHES as u64 * DECIMATION_HOPS {
+            bank.update(&[-110.0; 64]);
+        }
+        assert_eq!(bank.channel_floor_db(3), -139.75);
+        assert_eq!(bank.effective_floor_db(3), -109.75);
     }
 
     fn warmed_up_bank(n: usize, floor_db: f64) -> FloorBank {

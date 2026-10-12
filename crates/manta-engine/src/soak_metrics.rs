@@ -205,6 +205,7 @@ pub fn soak_with_metrics(
 
         let pad_samples = ch.filter_len();
         let pad_hops = (pad_samples as u64).div_ceil(hop);
+        tm.skip_preroll_hops(pad_hops);
         let padding = vec![Complex32::new(0.0, 0.0); pad_samples];
         for ev in tm.process_hops(&ch.process(&padding), |m| m.saturating_sub(pad_hops) * hop) {
             event_count += 1;

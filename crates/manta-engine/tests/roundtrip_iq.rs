@@ -65,7 +65,11 @@ fn text_strategy() -> impl Strategy<Value = String> {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(16))]
-    // SPEC §2.1's ~2.05 s mandatory warmup(750 hops)+confirm(19 hops) floor:
+    // MAN-115 cut this floor to a 25 ms warmup after the pre-roll (SPEC
+    // §2.2 "Startup"); the history below explains the 12 s looped scene,
+    // which is kept.
+    //
+    // SPEC §2.1's old ~2.05 s warmup(750 hops)+confirm(19 hops) floor:
     // the old `keyed_length + 1.5 s`, once-keyed, non-looping scene duration
     // fell entirely under that floor for many generated cases, so the real
     // detector never promoted a track before the clip ended and
@@ -116,7 +120,8 @@ proptest! {
         let fs = 96_000.0;
         // Scene long enough for the whole text + flush tail, floored at 12 s
         // so even the slowest/shortest generated cases loop several times
-        // past the ~2.05 s warmup+confirm floor before the clip ends.
+        // (originally sized against the pre-MAN-115 ~2.05 s warmup+confirm
+        // floor) before the clip ends.
         let (probe_env, _) = key_text(&text, &KeyerSpec::new(wpm), fs).unwrap();
         let duration_s = (probe_env.len() as f64 / fs + 1.5).max(12.0);
         let sig = SignalSpec {

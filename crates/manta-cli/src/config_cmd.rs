@@ -121,8 +121,9 @@ fn reject_placeholders_in(loaded: &Loaded, raw: &toml::Table) -> Result<()> {
             );
         }
         bail!(
-            "{}: {key} is still a placeholder ({value:?}) -- replace it",
-            loaded.origin
+            "{}: {key} is still a placeholder ({}) -- replace it",
+            loaded.origin,
+            crate::fmt::quoted(&value)
         );
     }
     reject_example_callsigns(loaded)
@@ -443,10 +444,10 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             // QTH with spaces stays one token; the grid is validated as a
             // bare locator.
             if let Some(v) = &s.operator_name {
-                l.push_str(&format!(" operator_name={v:?}"));
+                l.push_str(&format!(" operator_name={}", crate::fmt::quoted(v)));
             }
             if let Some(v) = &s.operator_qth {
-                l.push_str(&format!(" operator_qth={v:?}"));
+                l.push_str(&format!(" operator_qth={}", crate::fmt::quoted(v)));
             }
             if let Some(v) = &s.operator_grid {
                 l.push_str(&format!(" operator_grid={v}"));
@@ -494,11 +495,24 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
                  the source)"
             .to_string(),
         Some(SourceFromFile::Audio { device }) => match device {
-            Some(d) => format!("input: type=audio device={d:?}"),
+            Some(d) => format!("input: type=audio device={}", crate::fmt::quoted(d)),
             None => "input: type=audio device=default".to_string(),
         },
-        Some(SourceFromFile::File { path, iq }) => {
-            format!("input: type=file path={} iq={iq}", path.display())
+        Some(SourceFromFile::File {
+            path,
+            iq,
+            realtime,
+            looped,
+        }) => {
+            // MAN-269: shown only when set, so existing summaries are unchanged.
+            let mut line = format!("input: type=file path={} iq={iq}", path.display());
+            if *realtime {
+                line.push_str(" realtime=true");
+            }
+            if *looped {
+                line.push_str(" loop=true");
+            }
+            line
         }
         Some(SourceFromFile::Kiwi {
             host,
@@ -515,7 +529,8 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             rate_hz,
             gain_db,
         }) => format!(
-            "input: type=soapy driver={driver:?} freq_hz={freq_hz} rate_hz={rate_hz} gain_db={}",
+            "input: type=soapy driver={} freq_hz={freq_hz} rate_hz={rate_hz} gain_db={}",
+            crate::fmt::quoted(driver),
             gain_db.map_or("auto".to_string(), |g| g.to_string())
         ),
         Some(SourceFromFile::Hpsdr {
@@ -837,6 +852,19 @@ mod tests {
             line(&summary("x", &l), "input:"),
             format!(
                 "input: type=file path={} iq=true center_freq_hz=14000000",
+                dir.path().join("rec.wav").display()
+            )
+        );
+        std::fs::write(
+            &path,
+            "[input]\ntype = \"file\"\npath = \"rec.wav\"\niq = true\nrealtime = true\nloop = true\n",
+        )
+        .unwrap();
+        let l = config::load(Some(&path), Env::Ignore).unwrap();
+        assert_eq!(
+            line(&summary("x", &l), "input:"),
+            format!(
+                "input: type=file path={} iq=true realtime=true loop=true",
                 dir.path().join("rec.wav").display()
             )
         );
@@ -1365,7 +1393,9 @@ mod tests {
                 "[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7030000.0\n".to_string()
             }
             // Absolute, so both loads resolve it the same from their temp dirs.
-            ("input", "iq") => "[input]\ntype = \"file\"\npath = \"/x.wav\"\n".to_string(),
+            ("input", "iq" | "realtime" | "loop") => {
+                "[input]\ntype = \"file\"\npath = \"/x.wav\"\n".to_string()
+            }
             _ => format!("[{table}]\n"),
         }
     }

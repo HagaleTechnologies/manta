@@ -289,14 +289,16 @@ fn json_format_reports_a_fatal_error_as_one_record() {
 }
 
 #[test]
-fn text_format_fatal_error_is_unchanged() {
+fn text_format_fatal_error_is_one_error_line() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("bad.toml");
     std::fs::write(&cfg, BAD_CONFIG).unwrap();
     let out = daemon_with(dir.path(), &cfg, &[], &[]);
     let stderr = String::from_utf8(out.stderr.clone()).unwrap();
     assert_eq!(out.status.code(), Some(1), "{stderr}");
-    assert!(stderr.starts_with("Error: "), "{stderr}");
+    // MAN-270: one escaped `error:` line.
+    assert!(stderr.starts_with("error: "), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
     assert!(stderr.contains("bogus_key"), "{stderr}");
 }
 

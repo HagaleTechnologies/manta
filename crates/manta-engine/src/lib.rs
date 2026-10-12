@@ -9,6 +9,8 @@ pub use listen::{
 };
 pub mod latency;
 pub use latency::{DecodeLatencyObserver, DecodeLatencySnapshot, DECODE_LATENCY_BUCKETS_SECONDS};
+pub mod calibrate;
+pub use calibrate::{calibrate, CalibrateOptions, CalibrationReport};
 pub mod doctor;
 pub use doctor::{doctor, DoctorReport, Verdict, MAX_DURATION, MIN_DURATION};
 pub mod soak;
@@ -222,6 +224,7 @@ pub fn decode_samples(
         cfg.detector,
         cfg.decode.clone(),
     );
+    tm.skip_preroll_hops(pad_hops);
     // Feed the channelizer/track-manager in bounded chunks rather than one
     // `ch.process(&padded_iq)` + one `tm.process_hops(...)` call over the
     // whole file. `Channelizer::process` is chunk-size-invariant (proved by

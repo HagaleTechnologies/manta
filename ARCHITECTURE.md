@@ -171,6 +171,25 @@ audio spliced across the gap and no zero-fill (see
 was rejected). File replay is exempt: its errors and EOF must reach
 `listen()` unchanged for byte-identical replay.
 
+**Paced and looping replay (MAN-269).** File replay normally runs as fast
+as the machine decodes. `run --realtime` (`input.realtime`) wraps the file
+source in `manta_input::PacedSource`, which sleeps after each read until the
+recording's own clock (cumulative samples / `sample_rate()`, started at the
+first read) has caught up, so a 120 s file keeps the servers up for 120 s
+and a spot reaches the wire when it would have live. `run --loop`
+(`input.loop`) adds `manta_input::LoopingSource`, which reopens the file
+through the same `LiveSourceSpec::open` at each end and fails if a later
+pass changes sample rate or centre frequency; `--loop` implies `--realtime`.
+The loop sits inside the pacing, so one clock spans every pass, and the wrap
+reports no discontinuity (that would restart `listen()`'s calibration fill
+forever on a file shorter than 2 s). Both decide only when samples arrive,
+never which, so paced output is byte-identical to unpaced output. Both
+flags are refused for a live source, and `soak`/`doctor` ignore the keys.
+Separately, `WavIqSource::open` rejects an IQ WAV declaring 0 Hz or more
+than 10 MS/s (`MAX_IQ_WAV_RATE_HZ`) before reading samples, so a shape-valid
+but absurd header rate cannot reach the rate-sized allocations downstream.
+See `docs/DECISIONS/2026-10-10-man269-paced-looping-replay.md`.
+
 ## 4. Channelizer (`manta-dsp`)
 
 **Implemented** as of M2 sub-project 1 (`manta-dsp::channelizer`) -- the
@@ -533,13 +552,15 @@ validation (MAN-28). Dedupe (step 5) still applies.
   feed; needs `[server]`), `[input]` (source type and its keys, dial frequency,
   capture rate, ppm correction), `[spot]` (watch list, blocklist and notch
   files, and `cty.dat`/`master.scp` overrides), `[detector]` (thresholds, timers, track cap) and `[decode]` —
-  read by `run`, `soak`, `doctor` and `check` (`--config`, else
+  read by `run`, `soak`, `doctor`, `check` and `calibrate` (`--config`, else
   `MANTA_CONFIG`) and by `decode`/`oracle`, and by `bench sensitivity`
   (which reads only `[decode]`/`[detector]`, never the environment).
   Precedence is flag, then `MANTA_<TABLE>_<KEY>` environment variable, then
   file, then default; `decode` and `oracle` never read the environment.
   Unknown tables, keys and `MANTA_*` variables
-  are errors. `docs/SPEC-decode-core.md` §9 is the key table. Not yet
+  are errors. `docs/CONFIG.md` is the per-key reference (default, and
+  which commands and engines each key affects); `docs/SPEC-decode-core.md`
+  §9 stays normative for the decode-core defaults. Not yet
   configurable: a band plan (CW segment limits) and the
   compile-time constants SPEC §9 marks `not configurable yet`.
   `manta config check` runs `run`'s config pipeline up to its first source
@@ -553,6 +574,13 @@ validation (MAN-28). Dedupe (step 5) still applies.
   lists into the live validator and `dry_run` into each uplink task; other
   keys need a restart, and an invalid reload is logged and changes nothing
   (MAN-78, `docs/DECISIONS/2026-10-10-man78-live-reload.md`).
+  `manta calibrate` resolves `[input]` the way `doctor` does, measures the
+  receiver's frequency error against a known carrier
+  (`manta-dsp::carrier` estimates it, `manta-engine::calibrate` picks the
+  reference and gates the result), and after confirmation edits only
+  `input.freq_correction_ppm` in place in the file it read, keeping every
+  other byte, the file's mode and owner (MAN-127,
+  `docs/DECISIONS/2026-10-11-man127-calibrate-command.md`).
 - **Source diagnostics (MAN-125)**: `manta devices` enumerates audio inputs
   and, when compiled, SoapySDR selectors without opening capture streams.
   `manta check [SOURCE]` shares typed config/source resolution and source wrappers
@@ -614,7 +642,8 @@ validation (MAN-28). Dedupe (step 5) still applies.
   Unlike `/healthz`, which deliberately ignores the uplink (MAN-128 D10),
   `/status` is about the uplink. Inherits `/metrics`'s unauthenticated,
   `0.0.0.0`-by-default exposure posture
-  (`docs/RUNBOOKS/network-exposure.md`). Prometheus text
+  (`docs/RUNBOOKS/network-exposure.md`). `docs/METRICS.md` lists every
+  rendered family with its type, labels and when it has samples. Prometheus text
   endpoint (compiled in unconditionally, no feature flag — the "(feature
   `metrics`)" phrasing in older revisions of this doc was stale, no Cargo
   `metrics` feature has ever existed; the endpoint is served whenever
