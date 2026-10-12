@@ -67,7 +67,8 @@ pub struct ListenObservers {
 #[derive(Debug, Default)]
 pub struct RttyObserver {
     generation: AtomicU64,
-    signals: Mutex<Vec<crate::RttySignalReport>>,
+    /// The marked signals and the stream sample timestamp they reflect.
+    signals: Mutex<(Vec<crate::RttySignalReport>, u64)>,
 }
 
 impl RttyObserver {
@@ -78,14 +79,24 @@ impl RttyObserver {
 
     /// The currently marked signals.
     pub fn snapshot(&self) -> Vec<crate::RttySignalReport> {
+        self.snapshot_with_sample_ts().0
+    }
+
+    /// The currently marked signals and the stream sample timestamp of the
+    /// store that published them: the hop whose block changed the marked
+    /// set, or the end of the segment when an outage restart, a read error
+    /// or the end of the stream emptied it. A signal missing here but
+    /// present in an earlier snapshot cleared at this timestamp if the
+    /// poller saw every store, and no later than it otherwise.
+    pub fn snapshot_with_sample_ts(&self) -> (Vec<crate::RttySignalReport>, u64) {
         self.signals
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 
-    fn store(&self, signals: Vec<crate::RttySignalReport>) {
-        *self.signals.lock().unwrap_or_else(|e| e.into_inner()) = signals;
+    fn store(&self, signals: Vec<crate::RttySignalReport>, sample_ts: u64) {
+        *self.signals.lock().unwrap_or_else(|e| e.into_inner()) = (signals, sample_ts);
         self.generation.fetch_add(1, Ordering::Release);
     }
 }
@@ -97,6 +108,9 @@ struct RttyPublisher {
     observer: Option<Arc<RttyObserver>>,
     seen_changes: u64,
     calibration_factor: f64,
+    /// Stream sample timestamp of the latest store or restart, for the
+    /// clear on drop.
+    last_sample_ts: u64,
 }
 
 impl RttyPublisher {
@@ -105,6 +119,7 @@ impl RttyPublisher {
             observer,
             seen_changes: 0,
             calibration_factor,
+            last_sample_ts: 0,
         };
         p.clear();
         p
@@ -113,14 +128,17 @@ impl RttyPublisher {
     fn clear(&self) {
         if let Some(obs) = &self.observer {
             if !obs.snapshot().is_empty() {
-                obs.store(Vec::new());
+                obs.store(Vec::new(), self.last_sample_ts);
             }
         }
     }
 
     /// A fresh segment's track manager starts with nothing marked.
-    fn restart(&mut self) {
+    /// `end_sample_ts` is the stream sample timestamp at which the ending
+    /// segment's marks clear.
+    fn restart(&mut self, end_sample_ts: u64) {
         self.seen_changes = 0;
+        self.last_sample_ts = end_sample_ts;
         self.clear();
     }
 
@@ -132,12 +150,14 @@ impl RttyPublisher {
             return;
         }
         self.seen_changes = tm.rtty_changes();
+        self.last_sample_ts = tm.rtty_changed_sample_ts();
         obs.store(
             tm.rtty_signals()
                 .iter()
                 .filter(|e| e.cleared_sample_ts.is_none())
                 .map(|e| crate::RttySignalReport::from_entry(e, self.calibration_factor))
                 .collect(),
+            self.last_sample_ts,
         );
     }
 }
@@ -502,7 +522,7 @@ pub fn listen_with_observers(
             Ok(n) => n,
             Err(e) => {
                 report_active_tracks(0);
-                rtty.restart();
+                rtty.restart(seg_base + seg_consumed);
                 on_tracks(0);
                 return Err(e);
             }
@@ -523,10 +543,11 @@ pub fn listen_with_observers(
                 &mut on_spot,
             );
             let next_id = seg.tm.next_track_id();
+            // The old segment's marks clear where its samples end.
+            rtty.restart(seg_base + seg_consumed);
             seg_base += seg_consumed + gap;
             seg_consumed = 0;
             seg = new_segment(fs, center_freq_hz, cfg, next_id)?;
-            rtty.restart();
             let events = seg.tm.process_hops(&seg.ch.process(&padding), |m| {
                 seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
             });
@@ -581,7 +602,7 @@ pub fn listen_with_observers(
     // observers must settle back to 0 rather than be left holding the last
     // live value after a source disconnects or a replay hits EOF.
     report_active_tracks(0);
-    rtty.restart();
+    rtty.restart(seg_base + seg_consumed);
     on_tracks(0);
     Ok(())
 }
@@ -1223,7 +1244,7 @@ mod tests {
         let obs = Arc::new(RttyObserver::default());
         let seen = obs.clone();
         let mut marked_before_gap = false;
-        let mut first_after_gap: Option<usize> = None;
+        let mut first_after_gap: Option<(usize, u64)> = None;
         listen_with_observers(
             Box::new(src),
             &PipelineConfig::default(),
@@ -1235,9 +1256,9 @@ mod tests {
             |_ev| {},
             |_spot| {},
             |_n| {
-                let snap = seen.snapshot();
+                let (snap, sample_ts) = seen.snapshot_with_sample_ts();
                 if gap_taken.load(Ordering::Relaxed) {
-                    first_after_gap.get_or_insert(snap.len());
+                    first_after_gap.get_or_insert((snap.len(), sample_ts));
                 } else if snap.len() == 1 && snap[0].shift_hz == 170.0 {
                     marked_before_gap = true;
                 }
@@ -1245,8 +1266,64 @@ mod tests {
         )
         .unwrap();
         assert!(marked_before_gap, "the RTTY signal was never published");
-        assert_eq!(first_after_gap, Some(0), "the restart must empty the set");
+        // Emptied at the end of the pre-gap segment's 25 s of samples.
+        assert_eq!(
+            first_after_gap,
+            Some((0, 2_400_000)),
+            "the restart must empty the set, stamped where the segment ended"
+        );
         assert!(obs.snapshot().is_empty());
+    }
+
+    /// Codex review on PR #272: `run` logs how long a signal was marked
+    /// from these timestamps, so both must be stream sample times -- a
+    /// file decodes far faster than real time.
+    #[test]
+    fn rtty_observer_stamps_marks_and_clears_in_stream_samples() {
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rtty_scene(),
+            cursor: 0,
+            fs: 96_000.0,
+            center_freq_hz: 14_070_000.0,
+        });
+        let obs = Arc::new(RttyObserver::default());
+        let seen = obs.clone();
+        let mut marked: Option<(u64, u64)> = None;
+        let mut cleared_at: Option<u64> = None;
+        listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                rtty: Some(obs.clone()),
+                ..Default::default()
+            },
+            |_ev| {},
+            |_spot| {},
+            |_n| {
+                let (snap, sample_ts) = seen.snapshot_with_sample_ts();
+                match (snap.first(), marked) {
+                    (Some(s), None) => marked = Some((s.marked_sample_ts, sample_ts)),
+                    (None, Some(_)) => {
+                        cleared_at.get_or_insert(sample_ts);
+                    }
+                    _ => {}
+                }
+            },
+        )
+        .unwrap();
+        let (marked_sample_ts, store_ts) = marked.expect("the RTTY signal was never published");
+        assert_eq!(
+            store_ts, marked_sample_ts,
+            "the marking store carries its hop"
+        );
+        assert!(
+            // 20 s dwell, less one 256-sample hop of slack.
+            (20.0 * 96_000.0 - 256.0..=22.0 * 96_000.0).contains(&(marked_sample_ts as f64)),
+            "{marked_sample_ts}"
+        );
+        // Still marked at the end of the 25 s file: cleared at its last sample.
+        assert_eq!(cleared_at, Some(2_400_000));
     }
 
     #[test]

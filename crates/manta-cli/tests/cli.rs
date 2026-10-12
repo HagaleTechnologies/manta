@@ -1315,6 +1315,35 @@ fn decode_plain_prints_rtty_line() {
     assert!(stderr.contains("shift 170 Hz"), "{stderr}");
 }
 
+/// Codex review on PR #272: `run`'s `RTTY cleared` line counts the
+/// recording's time, not the wall time a faster-than-real-time file replay
+/// took. The signal is marked about 21 s into the 25 s file and cleared at
+/// its end.
+#[test]
+fn run_logs_rtty_marked_for_in_stream_seconds() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = write_rtty_wav(dir.path());
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(&wav)
+        .arg("--source-iq")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("RTTY cleared:"))
+        .unwrap_or_else(|| panic!("no RTTY cleared line: {stderr}"));
+    let secs: u64 = line
+        .split("marked for ")
+        .nth(1)
+        .and_then(|rest| rest.strip_suffix(" s"))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("unparsable line: {line}"));
+    assert!((3..=5).contains(&secs), "{line}");
+}
+
 /// MAN-28 Watch List: an operator running `manta decode` on a real
 /// recording must be able to force-spot a callsign that fails automatic
 /// validation, via `--allowlist`. `decode` is the only subcommand

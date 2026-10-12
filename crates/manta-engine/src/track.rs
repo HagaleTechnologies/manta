@@ -927,6 +927,9 @@ pub struct TrackManager {
     /// MAN-314: bumped whenever a block changes the marked set or a marked
     /// signal's metadata.
     rtty_changes: u64,
+    /// MAN-314: sample timestamp of the hop whose block made the latest
+    /// `rtty_changes` bump; 0 before the first.
+    rtty_changed_sample_ts: u64,
 }
 
 /// MAN-314: bound on `TrackManager::rtty_signals` for a long-running
@@ -984,6 +987,7 @@ impl TrackManager {
             }),
             rtty_log: Vec::new(),
             rtty_changes: 0,
+            rtty_changed_sample_ts: 0,
         }
     }
 
@@ -992,6 +996,13 @@ impl TrackManager {
     /// moves.
     pub fn rtty_changes(&self) -> u64 {
         self.rtty_changes
+    }
+
+    /// MAN-314: sample timestamp of the hop whose block made the latest
+    /// `rtty_changes` bump, so the stream time at which `rtty_signals`
+    /// last changed; 0 before the first change.
+    pub fn rtty_changed_sample_ts(&self) -> u64 {
+        self.rtty_changed_sample_ts
     }
 
     /// MAN-314: every RTTY signal marked so far (SPEC §2.6), in marking
@@ -1053,6 +1064,7 @@ impl TrackManager {
             }
         }
         self.rtty_changes += 1;
+        self.rtty_changed_sample_ts = sample_ts;
     }
 
     /// MAN-314 (SPEC §2.6): may no CW candidate spawn on channel `k`? True

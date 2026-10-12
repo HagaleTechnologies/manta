@@ -4887,7 +4887,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             // MAN-314: the engine's marked RTTY set, logged on change and
             // copied into `manta_rtty_signals` from the per-batch callback.
             let rtty_observer = std::sync::Arc::new(manta_engine::RttyObserver::default());
-            let mut rtty_log = RttyLogState::default();
+            let mut rtty_log = RttyLogState::new(source_sample_rate_hz);
             let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
@@ -5637,15 +5637,36 @@ fn format_rtty_cleared(s: &manta_engine::RttySignalReport, marked_for_secs: u64)
     )
 }
 
+/// MAN-314: whole seconds of stream time from `s`'s mark to
+/// `cleared_sample_ts`, at `fs` samples per second. Stream time, not wall
+/// time: a file replay without `--realtime` runs far faster than real time
+/// (Codex review on PR #272).
+fn rtty_marked_for_secs(
+    s: &manta_engine::RttySignalReport,
+    cleared_sample_ts: u64,
+    fs: f64,
+) -> u64 {
+    (cleared_sample_ts.saturating_sub(s.marked_sample_ts) as f64 / fs) as u64
+}
+
 /// MAN-314: what `run` last saw of the engine's marked RTTY set, so a
 /// change logs one line per newly marked or cleared signal.
-#[derive(Default)]
 struct RttyLogState {
+    /// The source's sample rate, for the engine's sample timestamps.
+    sample_rate_hz: f64,
     generation: u64,
-    current: std::collections::BTreeMap<u32, (manta_engine::RttySignalReport, std::time::Instant)>,
+    current: std::collections::BTreeMap<u32, manta_engine::RttySignalReport>,
 }
 
 impl RttyLogState {
+    fn new(sample_rate_hz: f64) -> Self {
+        Self {
+            sample_rate_hz,
+            generation: 0,
+            current: std::collections::BTreeMap::new(),
+        }
+    }
+
     /// Logs the marks and clears since the last call. Returns the current
     /// mark frequencies when the set changed, `None` otherwise.
     fn poll(&mut self, obs: &manta_engine::RttyObserver) -> Option<Vec<f64>> {
@@ -5654,12 +5675,14 @@ impl RttyLogState {
             return None;
         }
         self.generation = generation;
-        let snapshot = obs.snapshot();
+        let (snapshot, sample_ts) = obs.snapshot_with_sample_ts();
         let ids: Vec<u32> = snapshot.iter().map(|s| s.id).collect();
-        self.current.retain(|id, (s, since)| {
+        let fs = self.sample_rate_hz;
+        self.current.retain(|id, s| {
             let keep = ids.contains(id);
             if !keep {
-                tracing::info!("{}", format_rtty_cleared(s, since.elapsed().as_secs()));
+                let secs = rtty_marked_for_secs(s, sample_ts, fs);
+                tracing::info!("{}", format_rtty_cleared(s, secs));
             }
             keep
         });
@@ -5667,12 +5690,12 @@ impl RttyLogState {
             match self.current.entry(s.id) {
                 std::collections::btree_map::Entry::Vacant(slot) => {
                     tracing::info!("{}", format_rtty_marked(s));
-                    slot.insert((s.clone(), std::time::Instant::now()));
+                    slot.insert(s.clone());
                 }
                 // Still marked: keep its clear line on the current
                 // frequency and shift.
                 std::collections::btree_map::Entry::Occupied(mut slot) => {
-                    slot.get_mut().0 = s.clone();
+                    *slot.get_mut() = s.clone();
                 }
             }
         }
@@ -5707,6 +5730,17 @@ mod tests {
             format_rtty_cleared(&rtty_sig(), 446),
             "RTTY cleared: 14080.002 kHz shift 170 Hz, marked for 446 s"
         );
+    }
+
+    /// Codex review on PR #272: the duration is the stream time between
+    /// the engine's mark and clear timestamps, whatever the replay pace.
+    #[test]
+    fn rtty_marked_for_counts_stream_seconds() {
+        // Marked at 21.0 s, cleared 446.9 s later at 96 kHz.
+        let cleared = 2_016_000 + 42_902_400;
+        assert_eq!(rtty_marked_for_secs(&rtty_sig(), cleared, 96_000.0), 446);
+        assert_eq!(rtty_marked_for_secs(&rtty_sig(), 2_016_000, 96_000.0), 0);
+        assert_eq!(rtty_marked_for_secs(&rtty_sig(), 0, 96_000.0), 0);
     }
 
     #[test]
