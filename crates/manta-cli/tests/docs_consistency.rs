@@ -392,6 +392,39 @@ fn roadmap_m3_remaining_work_names_every_open_acceptance_gate() {
     }
 }
 
+/// MAN-269: ROADMAP M3 points at the README's paced-replay demo. "60-second
+/// demo" is that README section's title, not the replay's length -- the
+/// `gen v1` replay keeps the server up for 120 seconds -- so the pointer must
+/// link the section and state the real length rather than read as a
+/// 60-second run.
+#[test]
+fn roadmap_m3_replay_demo_pointer_states_the_real_length() {
+    let roadmap = doc("ROADMAP.md");
+    let m3 = squash_whitespace(section(&roadmap, "M3"));
+    let idx = m3
+        .find("Since MAN-269")
+        .expect("M3 MAN-269 replay sentence");
+    let sentence = &m3[idx..idx + m3[idx..].find(").").expect("sentence end") + 2];
+    assert!(
+        sentence.contains("(README.md#60-second-demo)"),
+        "ROADMAP M3's replay pointer does not link the README section: {sentence}"
+    );
+    assert!(
+        sentence.contains("120 seconds"),
+        "ROADMAP M3's replay pointer does not state the 120-second replay: {sentence}"
+    );
+    let readme = doc("README.md");
+    // `section()` prefix-matches; the anchor only resolves on this exact heading.
+    assert!(
+        readme.contains("\n## 60-second demo\n"),
+        "README's `## 60-second demo` heading changed; ROADMAP M3's #60-second-demo link is broken"
+    );
+    assert!(
+        squash_whitespace(section(&readme, "60-second demo")).contains("full 120 seconds"),
+        "README's demo no longer says the replay runs 120 seconds; update ROADMAP M3 too"
+    );
+}
+
 /// The input rates of the normative rate table in `docs/SPEC-decode-core.md`
 /// §1.1, in kS/s (`96`, `192`, `384`, `768`). The README's supported-rate
 /// list must name every one of them: a rate the SPEC admits but the README
@@ -810,6 +843,8 @@ fn spec_documents_every_input_and_spot_key() {
                 "device",
                 "path",
                 "iq",
+                "realtime",
+                "loop",
                 "host",
                 "port",
                 "freq_hz",
@@ -1115,6 +1150,36 @@ fn architecture_section_7_describes_decoder_version() {
     }
 }
 
+/// MAN-127: the README's node section tells an operator how to measure
+/// `freq_correction_ppm`, and ARCHITECTURE §8 says which command edits the
+/// config file in place.
+#[test]
+fn readme_and_architecture_mention_calibrate() {
+    let readme = doc("README.md");
+    let commands = fenced_commands(section(&readme, "Run it as a node"));
+    assert!(
+        commands
+            .iter()
+            .any(|c| c.trim_start().starts_with("manta calibrate")),
+        "README node section has no `manta calibrate` command: {commands:?}"
+    );
+    let arch = doc("ARCHITECTURE.md");
+    let s8 = squash_whitespace(section(&arch, "8. Configuration"));
+    for needle in [
+        "`manta calibrate`",
+        "input.freq_correction_ppm",
+        "docs/DECISIONS/2026-10-11-man127-calibrate-command.md",
+    ] {
+        assert!(s8.contains(needle), "ARCHITECTURE §8 never says {needle:?}");
+    }
+    assert!(
+        repo_root()
+            .join("docs/DECISIONS/2026-10-11-man127-calibrate-command.md")
+            .is_file(),
+        "ARCHITECTURE §8 links the MAN-127 decision doc, which does not exist"
+    );
+}
+
 // ---- MAN-124: the log's level and format controls, documented and real ----
 
 /// MAN-124: README's `## Logs` documents `RUST_LOG` as the underlying
@@ -1185,4 +1250,535 @@ fn architecture_logging_bullet_is_current() {
         arch.contains("--log-format json"),
         "ARCHITECTURE.md never says --log-format json"
     );
+}
+
+/// MAN-81: an operator reading the Docker docs learns that a bare
+/// `docker run` runs a mounted config, that the image reports health through
+/// `manta health`, and how to turn the check off.
+#[test]
+fn docker_docs_describe_the_bare_run_and_the_health_check() {
+    let norm = |s: &str| squash_whitespace(s).to_lowercase();
+    let guide = doc("packaging/README.md");
+    let docker = norm(section(&guide, "Docker Compose"));
+    for needle in [
+        "/etc/manta/manta.toml",
+        "manta health",
+        "--no-healthcheck",
+        "--mount",
+    ] {
+        assert!(
+            docker.contains(needle),
+            "packaging/README.md's Docker section never says {needle:?}"
+        );
+    }
+    let runbook = norm(&doc("docs/RUNBOOKS/node-health.md"));
+    for needle in ["manta health", "healthcheck"] {
+        assert!(
+            runbook.contains(needle),
+            "docs/RUNBOOKS/node-health.md never says {needle:?}"
+        );
+    }
+    assert!(
+        norm(&doc("README.md")).contains("manta health"),
+        "README.md never says manta health"
+    );
+}
+
+/// MAN-81: no command line in packaging/README.md's ```sh blocks ends in a
+/// `\` continuation. scripts/tests/test_packaging.py's `sh_blocks` runs
+/// `shlex.split` on each of those lines on its own, which fails on an
+/// unescaped trailing `\` (`No escaped character`), and that test only runs
+/// in CI, not in `cargo test`. Fences, blank lines and comment lines are
+/// read the way `sh_blocks` reads them.
+#[test]
+fn packaging_readme_sh_blocks_have_no_line_continuations() {
+    let guide = doc("packaging/README.md");
+    let mut inside = false;
+    let mut checked = 0;
+    for line in guide.lines() {
+        if inside && line == "```" {
+            inside = false;
+        } else if !inside && line == "```sh" {
+            inside = true;
+        } else if inside {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let trailing = line.len() - line.trim_end_matches('\\').len();
+            assert!(
+                trailing.is_multiple_of(2),
+                "packaging/README.md: a ```sh line continues onto the next: {line}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no ```sh commands in packaging/README.md");
+}
+
+// ---- MAN-149: the reference docs and indexes cover everything they list ----
+
+const CONFIG_REF: &str = "docs/CONFIG.md";
+const METRICS_REF: &str = "docs/METRICS.md";
+const DOCS_INDEX: &str = "docs/README.md";
+const DECISIONS_INDEX: &str = "docs/DECISIONS/README.md";
+
+/// MAN-149 M1: config::load creates [server] from MANTA_SERVER_* too.
+#[test]
+fn config_reference_documents_environment_server_activation() {
+    let md = doc(CONFIG_REF);
+    let commands = squash_whitespace(section(&md, "Which commands read which tables"));
+    assert!(
+        commands.contains("only when the resolved config has a `[server]` table"),
+        "{CONFIG_REF} must tie server startup to the resolved config"
+    );
+    assert!(
+        commands.contains("`MANTA_SERVER_*`"),
+        "{CONFIG_REF} must say the environment can supply [server]"
+    );
+    assert!(
+        !commands.contains("only when the file has"),
+        "{CONFIG_REF} still restricts server startup to a table in the file"
+    );
+}
+
+/// MAN-149 PR #251 review: run_status loads [server] from --config or
+/// MANTA_CONFIG and dials metrics_bind_addr:metrics_port, so `run` is not
+/// the table's only reader. With no config path it skips the MANTA_*
+/// overlay and resolve_status_addr dials 127.0.0.1:7302.
+#[test]
+fn config_reference_names_status_as_a_server_reader() {
+    let md = doc(CONFIG_REF);
+    let server = section(&md, "[server]");
+    let intro = squash_whitespace(&server[..server.find("\n|").unwrap_or(server.len())]);
+    assert!(
+        !intro.contains("Only `run` reads this table"),
+        "{CONFIG_REF} [server] still says only `run` reads the table"
+    );
+    assert!(
+        intro.contains("`status` reads `metrics_bind_addr` and `metrics_port`"),
+        "{CONFIG_REF} [server] must say `status` reads metrics_bind_addr and metrics_port"
+    );
+    assert!(
+        intro.contains("with neither it dials `127.0.0.1:7302`"),
+        "{CONFIG_REF} [server] must say `status` without a config file dials the default"
+    );
+}
+
+/// MAN-81 PR #257 review: health_cmd::probe loads [server] through the same
+/// daemon_server_config as `status`, so the reference must name `health`
+/// wherever it names `status` as a reader of the metrics keys -- and say
+/// that a resolved config with no [server] table is an error for it.
+#[test]
+fn config_reference_names_health_as_a_server_reader() {
+    let md = doc(CONFIG_REF);
+    let precedence = squash_whitespace(section(&md, "Precedence"));
+    assert!(
+        precedence
+            .contains("`status`, `health` and `config check` read the path from `MANTA_CONFIG`"),
+        "{CONFIG_REF} Precedence must list `health` among the MANTA_CONFIG readers"
+    );
+    let matrix = backticked_rows(section(&md, "Which commands read which tables"));
+    let row = matrix
+        .iter()
+        .find(|r| r[0] == "`health`")
+        .unwrap_or_else(|| panic!("{CONFIG_REF} command matrix has no `health` row"));
+    assert!(
+        row[1].contains("`metrics_bind_addr` and `metrics_port`"),
+        "{CONFIG_REF} `health` row must name metrics_bind_addr and metrics_port"
+    );
+    assert!(
+        row[1].contains("resolves to no `[server]` table is an error"),
+        "{CONFIG_REF} `health` row must say a config with no [server] table is an error"
+    );
+    assert!(
+        row[2].contains("`MANTA_SERVER_*` only alongside a config file"),
+        "{CONFIG_REF} `health` row must say MANTA_SERVER_* needs a config file"
+    );
+    let server = section(&md, "[server]");
+    let intro = squash_whitespace(&server[..server.find("\n|").unwrap_or(server.len())]);
+    assert!(
+        intro.contains("`health` reads the same two keys"),
+        "{CONFIG_REF} [server] must say `health` reads metrics_bind_addr and metrics_port"
+    );
+    assert!(
+        intro.contains("exits 1 when the named file plus overrides resolve to no `[server]` table"),
+        "{CONFIG_REF} [server] must say `health` rejects a config with no [server] table"
+    );
+    let rows = backticked_rows(server);
+    for key in ["metrics_bind_addr", "metrics_port"] {
+        let row = rows
+            .iter()
+            .find(|r| r[0] == format!("`{key}`"))
+            .unwrap_or_else(|| panic!("{CONFIG_REF} [server] has no `{key}` row"));
+        assert!(
+            row[2].contains("`health`"),
+            "{CONFIG_REF} [server] `{key}`'s Wired cell must name `health`"
+        );
+    }
+}
+
+/// MAN-149 PR #251 review: config::load joins a relative path to the
+/// config file's directory only when the file set it; a `MANTA_*` value
+/// or a flag stays relative to the working directory.
+#[test]
+fn config_reference_documents_path_resolution_by_source() {
+    let md = doc(CONFIG_REF);
+    for (table, key, flag) in [
+        ("input", "path", "--source"),
+        ("spot", "blocklist_path", "--blocklist"),
+        ("spot", "notch_path", "--notch"),
+        ("spot", "cty_path", "--cty"),
+        ("spot", "scp_path", "--scp"),
+    ] {
+        let rows = backticked_rows(config_ref_table_section(&md, table));
+        let row = rows
+            .iter()
+            .find(|r| r[0] == format!("`{key}`"))
+            .unwrap_or_else(|| panic!("{CONFIG_REF} has no [{table}] `{key}` row"));
+        let notes = squash_whitespace(row.last().unwrap());
+        let var = format!("`MANTA_{}_{}`", table.to_uppercase(), key.to_uppercase());
+        for wanted in [
+            "the file's directory",
+            "the working directory",
+            &var,
+            &format!("`{flag}`"),
+        ] {
+            assert!(
+                notes.contains(wanted),
+                "{CONFIG_REF} [{table}] `{key}` must say how a relative path resolves \
+                 from the file versus {flag}/{var}; its Notes cell lacks {wanted}"
+            );
+        }
+    }
+}
+
+/// MAN-149 PR #251 review: metrics_http::handle_request charges EOF,
+/// header-timeout and header-read-error connections against
+/// metrics_max_requests_per_ip, but answers only the request path with 429.
+#[test]
+fn metrics_reference_documents_non_request_budget_charges() {
+    let md = doc(METRICS_REF);
+    let scraping = squash_whitespace(section(&md, "Scraping"));
+    assert!(
+        !scraping.contains("caps completed requests"),
+        "{METRICS_REF} still describes metrics_max_requests_per_ip as a completed-request cap"
+    );
+    for charged in [
+        "closes without sending a byte",
+        "times out reading its headers",
+        "hits a read error",
+    ] {
+        assert!(
+            scraping.contains(charged),
+            "{METRICS_REF} must say a connection that {charged} is charged"
+        );
+    }
+    assert!(
+        scraping.contains("is charged but never refused"),
+        "{METRICS_REF} must say those connections are never answered with 429"
+    );
+}
+
+/// MAN-149 M2: config deserialization uppercases the station identity;
+/// SpotMessage uses that identity for both deCall and the id prefix.
+#[test]
+fn spot_schema_documents_uppercased_station_identity() {
+    let md = doc("docs/SPOT-SCHEMA.md");
+    let rows = backticked_rows(section(&md, "Fields"));
+    for field in ["deCall", "id"] {
+        let row = rows
+            .iter()
+            .find(|r| r[0] == format!("`{field}`"))
+            .unwrap_or_else(|| panic!("SPOT-SCHEMA.md is missing {field}"));
+        assert!(
+            row.last().unwrap().contains("uppercased"),
+            "SPOT-SCHEMA.md {field} must describe the uppercased station callsign"
+        );
+        assert!(
+            !row.last().unwrap().contains("exactly as configured"),
+            "SPOT-SCHEMA.md {field} still promises to preserve config casing"
+        );
+    }
+}
+
+/// Every `#key = value` line of the `manta config init` scaffold, as
+/// `(table, key, value_src)` -- the same two patterns `config_cmd.rs`'s
+/// scaffold drift tests parse it with. `value_src` keeps any trailing
+/// `# comment`, which TOML ignores.
+fn scaffold_settings() -> Vec<(String, String, String)> {
+    let header = regex::Regex::new(r"^#?\[\[?([a-z_]+)\]\]?\s*$").unwrap();
+    let setting = regex::Regex::new(r"^#([a-z_]+) = (.*)$").unwrap();
+    let mut table = None;
+    let mut out = Vec::new();
+    for line in doc("crates/manta-cli/src/config_init.toml").lines() {
+        if let Some(c) = header.captures(line) {
+            table = Some(c[1].to_string());
+        } else if let Some(c) = setting.captures(line) {
+            let t = table
+                .clone()
+                .unwrap_or_else(|| panic!("scaffold setting `{line}` before any table"));
+            out.push((t, c[1].to_string(), c[2].to_string()));
+        }
+    }
+    assert!(!out.is_empty(), "no settings parsed from the scaffold");
+    out
+}
+
+/// `src` as the TOML value of `v = <src>`.
+fn toml_value(src: &str) -> toml::Value {
+    let mut t: toml::Table = toml::from_str(&format!("v = {src}"))
+        .unwrap_or_else(|e| panic!("`{src}` is not a TOML value: {e}"));
+    t.remove("v").expect("v")
+}
+
+/// The cells of every `` | `name` | … `` table row in `md`, trimmed, with
+/// the leading and trailing empty cells dropped.
+fn backticked_rows(md: &str) -> Vec<Vec<String>> {
+    md.lines()
+        .filter(|l| l.starts_with("| `"))
+        .map(|l| {
+            let cells: Vec<String> = l.split('|').map(|c| c.trim().to_string()).collect();
+            cells[1..cells.len() - 1].to_vec()
+        })
+        .collect()
+}
+
+/// The first `` `code span` `` in `cell`.
+fn first_code_span(cell: &str) -> Option<&str> {
+    let start = cell.find('`')? + 1;
+    let len = cell[start..].find('`')?;
+    Some(&cell[start..start + len])
+}
+
+/// `docs/CONFIG.md`'s section for a TOML table: `## [[t]]` when it has one,
+/// else `## [t]`.
+fn config_ref_table_section<'a>(md: &'a str, table: &str) -> &'a str {
+    if md.contains(&format!("\n## [[{table}]]")) {
+        section(md, &format!("[[{table}]]"))
+    } else {
+        section(md, &format!("[{table}]"))
+    }
+}
+
+/// Scenario 1: an operator looking a key up finds its default and whether
+/// it is wired to behaviour. The Default column is pinned to the scaffold,
+/// which `config_cmd.rs` pins to the code, and a row for a key the loader
+/// no longer accepts fails too.
+#[test]
+fn config_reference_lists_every_scaffold_key_with_its_default() {
+    let md = doc(CONFIG_REF);
+    let settings = scaffold_settings();
+    let mut tables: Vec<&str> = settings.iter().map(|(t, _, _)| t.as_str()).collect();
+    tables.dedup();
+    for table in tables {
+        let rows = backticked_rows(config_ref_table_section(&md, table));
+        for (_, key, value) in settings.iter().filter(|(t, _, _)| t == table) {
+            let wanted = format!("`{key}`");
+            let row = rows.iter().find(|r| r[0] == wanted).unwrap_or_else(|| {
+                panic!("{CONFIG_REF} has no `| `{key}` |` row under its [{table}] heading")
+            });
+            assert!(
+                row.len() >= 3,
+                "{CONFIG_REF} [{table}] `{key}` row needs Key, Default and Wired cells"
+            );
+            let span = first_code_span(&row[1]).unwrap_or_else(|| {
+                panic!("{CONFIG_REF} [{table}] `{key}`: the Default cell has no `code span`")
+            });
+            assert_eq!(
+                toml_value(span),
+                toml_value(value),
+                "{CONFIG_REF} [{table}] `{key}`: the Default cell's first code span `{span}` \
+                 is not the scaffold's value `{value}` (crates/manta-cli/src/config_init.toml)"
+            );
+            assert!(
+                !row[2].is_empty(),
+                "{CONFIG_REF} [{table}] `{key}`: the Wired cell is empty"
+            );
+        }
+        for row in &rows {
+            assert!(
+                settings
+                    .iter()
+                    .any(|(t, k, _)| t == table && row[0] == format!("`{k}`")),
+                "{CONFIG_REF} [{table}] documents {}, which the scaffold (and so the loader) \
+                 does not list",
+                row[0]
+            );
+        }
+    }
+}
+
+/// SPEC §9's `not configurable yet` keys are names an operator may try;
+/// CONFIG.md must say the loader rejects them.
+#[test]
+fn config_reference_lists_every_constant_only_key() {
+    let md = doc(CONFIG_REF);
+    let not_settable = section(&md, "Not settable");
+    let key = regex::Regex::new(r"^#\s*([a-z_]+)\s*=").unwrap();
+    let constants: Vec<String> = spec_section_9_toml()
+        .lines()
+        .filter(|l| l.contains("not configurable yet"))
+        .filter_map(|l| key.captures(l.trim_start()).map(|c| c[1].to_string()))
+        .collect();
+    assert!(
+        !constants.is_empty(),
+        "SPEC §9 has no `not configurable yet` keys"
+    );
+    for k in constants {
+        assert!(
+            not_settable.contains(&format!("| `{k}` |")),
+            "{CONFIG_REF}'s \"Not settable\" section has no `| `{k}` |` row"
+        );
+    }
+}
+
+/// Every family `metrics.rs` renders has a row with its Prometheus type,
+/// and the page names no family that does not exist.
+#[test]
+fn metrics_reference_lists_every_rendered_family() {
+    let md = doc(METRICS_REF);
+    let src = doc("crates/manta-server/src/metrics.rs");
+    let type_line = regex::Regex::new(r"# TYPE (manta_[a-z0-9_]+) ([a-z]+)").unwrap();
+    let mut families: Vec<(String, String)> = type_line
+        .captures_iter(&src)
+        .map(|c| (c[1].to_string(), c[2].to_string()))
+        .collect();
+    families.sort();
+    families.dedup();
+    assert!(
+        !families.is_empty(),
+        "no `# TYPE` lines found in metrics.rs"
+    );
+    for (name, kind) in &families {
+        assert!(
+            md.contains(&format!("| `{name}` | {kind} |")),
+            "{METRICS_REF} has no `| `{name}` | {kind} |` row"
+        );
+    }
+    let token = regex::Regex::new(r"\bmanta_[a-z0-9_]+").unwrap();
+    let mut unknown: Vec<&str> = token
+        .find_iter(&md)
+        .map(|m| m.as_str())
+        .filter(|raw| {
+            let name = ["_bucket", "_sum", "_count"]
+                .iter()
+                .find_map(|s| raw.strip_suffix(s))
+                .unwrap_or(raw);
+            !families.iter().any(|(f, _)| f == name)
+        })
+        .collect();
+    unknown.sort();
+    unknown.dedup();
+    assert!(
+        unknown.is_empty(),
+        "{METRICS_REF} names metrics crates/manta-server/src/metrics.rs does not render: \
+         {unknown:?}"
+    );
+}
+
+/// The `[text](target)` link targets in `md`.
+fn link_targets(md: &str) -> Vec<String> {
+    let link = regex::Regex::new(r#"\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)"#).unwrap();
+    link.captures_iter(md).map(|c| c[1].to_string()).collect()
+}
+
+/// Whether a relative link target in `from` (a repo-relative path) names
+/// a file or directory that exists; `#anchors` are ignored.
+fn relative_link_resolves(from: &str, target: &str) -> bool {
+    let path = target.split('#').next().unwrap_or(target);
+    let base = repo_root().join(from);
+    base.parent().expect("a directory").join(path).exists()
+}
+
+/// Scenario 3: each audience has one entry point, and it opens.
+#[test]
+fn docs_index_names_a_start_here_per_audience() {
+    let md = doc(DOCS_INDEX);
+    for audience in ["Operators", "Contributors", "Researchers"] {
+        let body = section(&md, audience);
+        let line = body
+            .lines()
+            .find(|l| l.starts_with("Start here:"))
+            .unwrap_or_else(|| panic!("{DOCS_INDEX} `## {audience}` has no `Start here:` line"));
+        let targets = link_targets(line);
+        let target = targets.first().unwrap_or_else(|| {
+            panic!("{DOCS_INDEX} `## {audience}`'s `Start here:` line has no link")
+        });
+        assert!(
+            relative_link_resolves(DOCS_INDEX, target),
+            "{DOCS_INDEX} `## {audience}`'s `Start here:` link `{target}` does not resolve"
+        );
+    }
+}
+
+/// The `.md` file names directly inside a repo-relative directory.
+fn md_files_in(dir: &str) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(repo_root().join(dir))
+        .unwrap_or_else(|e| panic!("reading {dir}: {e}"))
+        .map(|e| {
+            e.expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|n| n.ends_with(".md") && n != "README.md")
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn docs_index_links_every_runbook() {
+    let targets = link_targets(&doc(DOCS_INDEX));
+    let runbooks = md_files_in("docs/RUNBOOKS");
+    assert!(!runbooks.is_empty(), "docs/RUNBOOKS has no runbooks");
+    for name in runbooks {
+        let want = format!("RUNBOOKS/{name}");
+        assert!(
+            targets
+                .iter()
+                .any(|t| t.split('#').next() == Some(want.as_str())),
+            "{DOCS_INDEX} does not link docs/{want}: add a row to its Runbooks table"
+        );
+    }
+}
+
+#[test]
+fn decisions_index_links_every_record() {
+    let targets = link_targets(&doc(DECISIONS_INDEX));
+    let records = md_files_in("docs/DECISIONS");
+    assert!(!records.is_empty(), "docs/DECISIONS has no records");
+    for name in records {
+        assert!(
+            targets.iter().any(|t| t.split('#').next() == Some(name.as_str())),
+            "{DECISIONS_INDEX} does not link {name}: add a `| date | ticket | [title]({name}) |` row"
+        );
+    }
+}
+
+#[test]
+fn reference_docs_relative_links_resolve() {
+    for file in [
+        CONFIG_REF,
+        METRICS_REF,
+        "docs/SPOT-SCHEMA.md",
+        DOCS_INDEX,
+        DECISIONS_INDEX,
+    ] {
+        let broken: Vec<String> = link_targets(&doc(file))
+            .into_iter()
+            .filter(|t| {
+                !(t.starts_with("http://")
+                    || t.starts_with("https://")
+                    || t.starts_with("mailto:")
+                    || t.starts_with('#'))
+            })
+            .filter(|t| !relative_link_resolves(file, t))
+            .collect();
+        assert!(
+            broken.is_empty(),
+            "{file} has relative links that do not resolve: {broken:?}"
+        );
+    }
 }

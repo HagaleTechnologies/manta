@@ -10,6 +10,9 @@ MAN-132) — see `docs/RUNBOOKS/network-exposure.md` for exposure posture;
 `/healthz` carries exactly the same posture as `/metrics`, since it's the
 same listener.
 
+[`docs/METRICS.md`](../METRICS.md) lists every family the endpoint renders,
+with its type, labels and when it has samples.
+
 ## `/healthz` as a liveness probe
 
 `GET /healthz` returns:
@@ -35,8 +38,9 @@ The kubelet's `httpGet` probe connects to the pod IP, not to the
 container's loopback, so it needs the metrics listener widened: set
 `metrics_bind_addr = "0.0.0.0"` under `[server]` (or
 `MANTA_SERVER_METRICS_BIND_ADDR=0.0.0.0` in the pod spec), and restrict
-the port with a NetworkPolicy. The runtime image has no `curl` for an
-`exec` probe.
+the port with a NetworkPolicy. The runtime image has no `curl`, but an
+`exec` probe can run `manta health --config <the pod's config path>`
+instead (MAN-81), which needs no widened listener.
 
 Each probe counts against the metrics listener's per-IP request budget
 (`[server].metrics_max_requests_per_ip`, 60 per 60 s per source address by
@@ -56,6 +60,35 @@ livenessProbe:
   failureThreshold: 3
 ```
 
+### Docker
+
+The published image carries its own `HEALTHCHECK` (MAN-81):
+
+```dockerfile
+HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=3 \
+    CMD manta health --config "${MANTA_CONFIG:-/etc/manta/manta.toml}" --timeout-secs 3
+```
+
+`manta health` reads the config the daemon runs (the mounted
+`/etc/manta/manta.toml`, or `MANTA_CONFIG`) with the same `MANTA_SERVER_*`
+overrides, so it dials the `metrics_port` and `metrics_bind_addr` that file
+sets, and a wildcard bind is dialled on loopback. It re-reads the file at
+every check, while the daemon keeps the listener it started with: both keys
+are restart-only (SIGHUP reloads only `[spot]` lists and `dry_run`). After
+editing either one, restart the container: until then the check dials the
+new address, and reports unhealthy if the daemon is not listening there.
+An edit after which the file no longer loads, or has no `[server]` table,
+also fails the check, with the reason in the health log, until it is fixed
+or reverted. It asks
+`/healthz` and exits 0 on `200 ok`, 1 on anything else, and prints the
+report, which `docker inspect --format '{{json .State.Health.Log}}'`
+shows. It probes from inside the container, so `metrics_bind_addr` can
+stay `127.0.0.1`. Its 6 probes a minute count against the loopback
+address's per-IP budget (60 per 60 s by default). A container that is not
+running the daemon reports unhealthy; turn the check off with
+`docker run --no-healthcheck` or Compose's `healthcheck: disable: true`.
+Setup is in `packaging/README.md`.
+
 ### systemd
 
 ```ini
@@ -63,6 +96,10 @@ livenessProbe:
 ExecStartPost=/usr/bin/curl -f -s --retry 5 --retry-delay 2 \
   http://127.0.0.1:7302/healthz
 ```
+
+`manta health --config /path/to/manta.toml` is a config-aware alternative
+to the `curl` line: it dials the metrics port the config sets rather than a
+fixed 7302, and exits 0 only on a healthy report.
 
 (systemd has no native HTTP health-check unit type; pair this with a
 `Restart=on-failure` watchdog script polling the same endpoint on an

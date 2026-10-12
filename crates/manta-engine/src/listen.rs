@@ -254,6 +254,7 @@ fn new_segment(
         cfg.decode.clone(),
     );
     tm.resume_track_ids_from(next_id);
+    tm.skip_preroll_hops(pad_hops);
     Ok(Segment {
         ch,
         tm,
@@ -1113,9 +1114,12 @@ mod tests {
             |_| {},
         )
         .unwrap();
-        // warmup_hops = 0 starts on the uninitialised -140 dB floor and
-        // spawns hundreds of noise tracks. Their bogus calls depend on the
-        // spawn layout; these tests measure when lists apply to W1AW.
+        // warmup_hops = 0 lets W1AW promote on the first real hop. Before
+        // MAN-115 this started on the uninitialised -140 dB floor and spawned
+        // hundreds of noise tracks; the pre-roll skip and block-median seed
+        // removed that, but any stray noise call still depends on the spawn
+        // layout, so only W1AW's spots are kept: these tests measure when
+        // lists apply to W1AW.
         spots.retain(|(call, _)| call == "W1AW");
         (spots, reads.load(Ordering::Relaxed))
     }

@@ -129,6 +129,17 @@ docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
   `MANTA_SERVER_METRICS_BIND_ADDR=0.0.0.0` and publish it as
   `-p 127.0.0.1:7302:7302`, which keeps it on the host — see
   [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md).
+- With no arguments, the image runs the daemon from a config mounted at
+  `/etc/manta/manta.toml` (or the file `MANTA_CONFIG` names), and prints
+  `--help` when there is none. Any arguments run `manta <arguments>`
+  unchanged. The image reports its health to `docker ps` and orchestrators
+  by running `manta health`, which asks the daemon's own `/healthz` from
+  inside the container, so the metrics endpoint can stay on loopback. Setup,
+  timing and how to turn the check off are in
+  [packaging/README.md](packaging/README.md#docker-compose).
+- The image is built for `linux/amd64`, `linux/arm64` and `linux/arm/v7`.
+  `linux/arm/v7` is for 32-bit Raspberry Pi OS; its decode CPU budget is
+  unmeasured.
 - If the `docker run` above returns an authorization error, the GHCR
   package still needs its one-time "make public" step — see
   [docs/RUNBOOKS/release.md](docs/RUNBOOKS/release.md).
@@ -176,13 +187,32 @@ which among the rates recorders commonly produce means 24, 48, 96, 192,
 interpreted, so a recording at an off-table rate (100 or 250 kS/s, say) is
 rejected with `unsupported sample rate …: fs/93.75 must be a power of two`.
 That list is examples, not the whole set: divide your own rate by 93.75,
-and it replays if the answer is a power of two of at least 4.
+and it replays if the answer is a power of two of at least 4 and the rate
+is at most 10 MS/s.
 `--capture-rate-hz` decimates by a power of two into a *lower* table rate
 (`--capture-rate-hz 48000` on a 192 kS/s capture, to spend less CPU on a
 narrower passband); it is not a general resampler and cannot rescue an
-off-table recording. Replay runs faster than realtime, so the hardware-free
-path above stops at `decode`; a paced replay that can drive the servers
-below is being worked on.
+off-table recording.
+
+Replay runs as fast as the machine manages unless you add `--realtime`,
+which plays the file at the recording's own pace, so a hardware-free replay
+can drive the servers described below:
+
+```sh
+cat > /tmp/v1/demo.toml <<'EOF'
+[server]
+station_callsign = "W5AU"   # your call; becomes `DX de W5AU-#:`
+bind_addr = "127.0.0.1"     # this machine only
+EOF
+manta run --source /tmp/v1/v1.wav --source-iq --realtime --config /tmp/v1/demo.toml
+```
+
+In a second terminal, within about 20 seconds, run `telnet localhost 7300`
+and enter any callsign at the prompt: W1AW's CQ arrives as a `DX de` line
+about 21 seconds into the replay, and the server stays up for the full 120
+seconds. Connected later than that? Type `sh/dx` to list the spots already
+sent. Add `--loop` to keep a recording playing until you press Ctrl-C (a
+station is spotted again at most every 10 minutes).
 
 `manta --help` lists every subcommand and flag.
 
@@ -308,6 +338,30 @@ it listens on `metrics_bind_addr`, `127.0.0.1` by default, because it has
 no password. Read
 [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 before you widen either.
+
+### Calibrate the receiver's frequency
+
+Spot frequencies are only as accurate as the receiver's oscillator.
+`manta calibrate` listens to a carrier whose frequency is known exactly (the
+WWV, WWVH, BPM or RWM time signals, or an NCDXF beacon) and reports the
+`freq_correction_ppm` that corrects the receiver. Stop `manta run` first if
+your receiver serves only one program at a time.
+
+```sh
+manta calibrate --config manta.toml
+manta calibrate --config manta.toml --tune-hz 9998500
+```
+
+The first command measures a reference that already sits inside the
+configured receiver's passband. The second retunes a KiwiSDR, SoapySDR or
+HPSDR receiver to 9998500 Hz for this measurement only, which puts the
+10 MHz time signal 1.5 kHz above centre; the 40 m example above needs it.
+Either way, manta prints the measured frequency, the correction and the
+evidence for it, then asks before it saves `freq_correction_ppm` to
+`[input]` in your config file. Nothing else in the file changes. Restart
+`manta run` to apply the new value. In a script, `--write` saves without
+asking. A measurement takes 60 seconds; NCDXF beacons share each frequency
+in turns, so give them `--duration 180`.
 
 ## Running unattended
 
@@ -453,7 +507,10 @@ only if that config also carries at least one `[[rbn_uplink]]` block.
 - **DX cluster telnet server** (`:7300`) — standard login prompt and
   RBN-format `DX de` lines, with enough command grammar (`sh/dx`,
   `set/dx/filter`) for stock clients. This is the RBN/aggregator
-  compatibility surface.
+  compatibility surface. A logger can request the last 30 minutes with
+  `sh/dx 30m`; `[server].history_minutes` sets retained history depth
+  (default 30). A bare `sh/dx` shows the last 10. See
+  [history limits](docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md).
 - **JSON Lines / WebSocket stream** (`:7301`) — one full-fidelity spot
   object per line; a raw TCP client and a WebSocket client share the
   port. This is the [cqdx](https://cqdx.app) ingest surface.
@@ -465,14 +522,22 @@ only if that config also carries at least one `[[rbn_uplink]]` block.
   source-health counters. Some gauges are still placeholders;
   ARCHITECTURE §8 says which.
 
-`run` (alias `listen`) also prints a `SPOT:` line on stdout for each
-confirmed spot, and decoded text on stderr, one line per track labelled
-with its track number, frequency and speed. With a `[server]` table the
-decoded text is off unless you pass `--decoded-text`, so a service log
-holds spots and diagnostics only. `--json` prints every decoder event and
-spot as JSON Lines on stdout instead. `decode` prints its decoded text on
-stdout. This terminal output is a debugging aid, not a stable interface —
-the servers above are.
+`run` (alias `listen`) prints a `SPOT:` line on stdout for each confirmed
+spot, and decoded text on stderr, one line per track labelled with its track
+number, frequency and speed. With a `[server]` table the decoded text is off
+unless you pass `--decoded-text`, so a service log holds spots and diagnostics
+only. Startup messages, warnings and errors also go to stderr, so the two
+streams can be captured separately:
+
+```sh
+manta run --config manta.toml > spots.log 2> monitor.log
+```
+
+`decode` prints decoded text on stdout and a measurement summary on stderr.
+`run --json` and `decode --json` keep full-precision JSON on stdout. This
+terminal output is a debugging aid, not a stable interface — the servers above
+are. Human units, report streams and error conventions are defined in the
+[command output style decision](docs/DECISIONS/2026-10-10-man270-cli-output-style.md).
 
 The decode path is deterministic: the same file in produces byte-identical
 spot logs out. That is a hard requirement, and CI enforces it with golden
@@ -574,11 +639,18 @@ criteria.
 
 ## Documentation
 
+[docs/README.md](docs/README.md) says where operators, contributors and
+researchers each start, and lists every runbook.
+
 **Running a node:** [docs/GUIDES/rbn-node.md](docs/GUIDES/rbn-node.md)
 (from install to a running node) · [docs/GUIDES/kiwisdr.md](docs/GUIDES/kiwisdr.md)
 (KiwiSDR etiquette) · [docs/GUIDES/raspberry-pi.md](docs/GUIDES/raspberry-pi.md)
 (Pi install and service) · [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 (exposing the servers safely) · the "Run it as a node" section above ·
+[docs/CONFIG.md](docs/CONFIG.md) (every config key, its default and what
+reads it) · [docs/METRICS.md](docs/METRICS.md) (every `/metrics` family,
+`/healthz` and `/status`) · [docs/SPOT-SCHEMA.md](docs/SPOT-SCHEMA.md)
+(every field of the `:7301` JSON spot stream) ·
 [packaging/README.md](packaging/README.md) (running unattended under
 systemd, launchd or Docker Compose) ·
 [docs/RUNBOOKS/secondary-skimmer-field-node.md](docs/RUNBOOKS/secondary-skimmer-field-node.md)

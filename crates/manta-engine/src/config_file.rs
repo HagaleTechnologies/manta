@@ -191,7 +191,7 @@ mod tests {
             confirm_ms = 50.0
             hang_ms = 5000.0
             gc_ms = 30000.0
-            warmup_ms = 2000.0
+            warmup_ms = 25.0
             track_cap = 1200
             silent_respawn_cooldown_ms = 30000.0
             rtty_filter = true
@@ -203,7 +203,7 @@ mod tests {
         assert_eq!(cfg.confirm_hops, 19);
         assert_eq!(cfg.hang_hops, 1875);
         assert_eq!(cfg.gc_hops, 11250);
-        assert_eq!(cfg.warmup_hops, 750);
+        assert_eq!(cfg.warmup_hops, 9);
         assert_eq!(cfg.silent_respawn_cooldown_hops, 11250);
         assert_eq!(cfg.rtty_dwell_hops, 7500);
     }

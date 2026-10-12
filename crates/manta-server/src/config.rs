@@ -172,7 +172,8 @@ fn check_operator_callsign(call: &str) -> Result<(), String> {
     };
     if ssid.is_some_and(|s| !is_valid_ssid(s)) {
         return Err(format!(
-            "{call:?} is not a plausible callsign (an SSID must be -1 through -99)"
+            "{} is not a plausible callsign (an SSID must be -1 through -99)",
+            crate::human::quoted(call)
         ));
     }
     // Base length: `MIN_CALLSIGN_LEN` (the call itself cannot be shorter, so
@@ -180,20 +181,27 @@ fn check_operator_callsign(call: &str) -> Result<(), String> {
     // triple with room to spare) -- an outer bound on what gets interpolated
     // into every output line, not a claim about callsign structure.
     if base.len() < MIN_CALLSIGN_LEN || base.len() > 20 {
-        return Err(format!("{call:?} is not a plausible callsign (length)"));
+        return Err(format!(
+            "{} is not a plausible callsign (length)",
+            crate::human::quoted(call)
+        ));
     }
     if !base.chars().all(|c| c.is_ascii_alphanumeric() || c == '/') {
         // Covers control characters, CR/LF, whitespace and non-ASCII in one rule.
         return Err(format!(
-            "{call:?} is not a plausible callsign \
-             (only A-Z, 0-9, '/' and a trailing -N SSID are allowed)"
+            "{} is not a plausible callsign \
+             (only A-Z, 0-9, '/' and a trailing -N SSID are allowed)",
+            crate::human::quoted(call)
         ));
     }
     // At most prefix/base/suffix, each non-empty and no longer than any real
     // designator.
     let segments: Vec<&str> = base.split('/').collect();
     if segments.len() > 3 || segments.iter().any(|s| s.is_empty() || s.len() > 10) {
-        return Err(format!("{call:?} is not a plausible callsign (structure)"));
+        return Err(format!(
+            "{} is not a plausible callsign (structure)",
+            crate::human::quoted(call)
+        ));
     }
     // The letter-and-digit rule belongs to the SEGMENT that is the actual
     // call, not to the whole string (PR #131 review): applied whole-string it
@@ -208,9 +216,10 @@ fn check_operator_callsign(call: &str) -> Result<(), String> {
     // running to the END of the segment; see `is_complete_callsign`.
     if !segments.iter().any(|s| is_complete_callsign(s)) {
         return Err(format!(
-            "{call:?} is not a plausible callsign (one segment must be a complete \
+            "{} is not a plausible callsign (one segment must be a complete \
              callsign: a prefix, a separating digit, and a letter suffix, as in \
-             {MIN_CALLSIGN_LEN}-character W1A)"
+             {MIN_CALLSIGN_LEN}-character W1A)",
+            crate::human::quoted(call)
         ));
     }
     Ok(())
@@ -274,7 +283,10 @@ fn check_grid(value: &str) -> Result<(), String> {
 }
 
 fn not_a_grid(value: &str) -> String {
-    format!("{value:?} is not a Maidenhead grid square")
+    format!(
+        "{} is not a Maidenhead grid square",
+        crate::human::quoted(value)
+    )
 }
 
 fn deserialize_optional_operator_name<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -320,6 +332,27 @@ fn check_coordinate(key: &str, value: f64, limit: f64) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn check_history_minutes(value: u32) -> Result<(), String> {
+    if value > crate::bus::MAX_HISTORY_MINUTES {
+        return Err(format!(
+            "history_minutes must be a whole number of minutes from 0 to {}, got {value}",
+            crate::bus::MAX_HISTORY_MINUTES
+        ));
+    }
+    Ok(())
+}
+
+fn deserialize_optional_history_minutes<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: Option<u32> = Option::deserialize(deserializer)?;
+    if let Some(value) = value {
+        check_history_minutes(value).map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
 }
 
 fn deserialize_optional_latitude<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
@@ -477,6 +510,12 @@ pub struct ServerConfig {
     /// line entirely, for operators who ship logs by the byte.
     #[serde(default)]
     pub status_interval_secs: Option<u64>,
+    /// Telnet history window in heard-time minutes (default 30, range 0..=1440).
+    /// Always retains the newest 50 publications, never more than 10,000.
+    /// Zero restores count-only history of 50 spots. Changes need a restart.
+    /// See `docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md`.
+    #[serde(default, deserialize_with = "deserialize_optional_history_minutes")]
+    pub history_minutes: Option<u32>,
     /// Which telnet wire layout the INBOUND cluster server emits
     /// (MAN-88). Defaults to `"rbn"`, the RBN relay's fixed-column AK1A
     /// layout that downstream loggers parse today. `"skimmer"` selects
@@ -630,9 +669,10 @@ impl ServerConfig {
 /// which of the two values is wrong.
 fn outside_grid_message(grid: &str, sq: &crate::maidenhead::Square, lat: f64, lon: f64) -> String {
     format!(
-        "operator_lat = {lat}, operator_lon = {lon} is outside operator_grid {grid:?} \
+        "operator_lat = {lat}, operator_lon = {lon} is outside operator_grid {} \
          (latitude {:.4} to {:.4}, longitude {:.4} to {:.4}) -- fix whichever is wrong, or \
          set only one of operator_grid and operator_lat/operator_lon",
+        crate::human::quoted(grid),
         sq.south,
         sq.south + sq.height,
         sq.west,
@@ -1727,5 +1767,36 @@ mod tests {
             ..uplink
         };
         assert_eq!(uplink_override.effective_login_callsign("W3XYZ"), "W3XYZ-2");
+    }
+
+    #[test]
+    fn history_minutes_is_optional_and_accepts_0_through_1440() {
+        assert_eq!(server_with("").history_minutes, None);
+        for minutes in [0, 30, 1440] {
+            assert_eq!(
+                server_with(&format!("history_minutes = {minutes}")).history_minutes,
+                Some(minutes)
+            );
+        }
+    }
+
+    #[test]
+    fn history_minutes_out_of_range_is_rejected_naming_the_key() {
+        for minutes in [1441, 5000] {
+            let error = toml::from_str::<ServerConfig>(&format!(
+                "station_callsign = \"W1AW\"\nhistory_minutes = {minutes}"
+            ))
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("history_minutes must be a whole number of minutes from 0 to 1440, got"));
+        }
+        for invalid in ["-1", "1.5", "\"30\""] {
+            let error = toml::from_str::<ServerConfig>(&format!(
+                "station_callsign = \"W1AW\"\nhistory_minutes = {invalid}"
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("history_minutes"));
+        }
     }
 }

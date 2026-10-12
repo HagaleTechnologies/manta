@@ -86,11 +86,9 @@ fn default_spectral_beta() -> f32 {
     NoiseConfig::default().spectral_beta
 }
 /// SPEC v2 §3's narrowband refiner bandwidth in Hz (0 = off). Not sourced
-/// from any `Default` impl -- the refiner itself (`manta-dsp::refine::
-/// Refiner`) is a later task, and wiring it into the decode pipeline is
-/// explicitly out of scope even there (MAN-168). Parsed and carried on
-/// `DecodeConfig::refine_bw_hz` now so the full v2 §7 key list round-trips
-/// through config today, ahead of MAN-168 having a field to read.
+/// from any `Default` impl. Live under every engine via `manta-engine`'s
+/// `TrackManager`, which builds a `manta-dsp::refine::Refiner` per track
+/// when this is > 0 (MAN-168/MAN-194); `oracle` does not apply it.
 fn default_refine_bw_hz() -> f32 {
     0.0
 }
@@ -171,8 +169,8 @@ pub struct DecodeConfigToml {
     pub spectral_min_bias_db: f32,
     #[serde(default = "default_spectral_beta")]
     pub spectral_beta: f32,
-    // SPEC v2 §3 (narrowband refiner; not yet wired to any effect, see
-    // `default_refine_bw_hz`)
+    // SPEC v2 §3 (narrowband refiner; live under every engine via
+    // `manta-engine`'s `TrackManager`, 0 = off; `oracle` does not apply it)
     #[serde(default = "default_refine_bw_hz")]
     pub refine_bw_hz: f32,
     // SPEC v2 §4 (HsmmConfig)

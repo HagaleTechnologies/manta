@@ -14,8 +14,8 @@ SoapySDR input; KiwiSDR input) — see docs/DECISIONS/2026-07-1[7-9]*.md and
 2026-07-2[4-5]*.md. V1/V3/V4/V7/V8/V9/V10 green; V2's WPM gate is green too
 (MAN-7/103's near-channel-edge WPM bug is fixed — keying-threshold placement
 and a symmetric mark/gap dit-period estimate, see
-docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md) — V2's separate
-CER gate stays open (SPEC §2.1 warmup-floor dilution, unrelated to WPM).
+docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md) — and V2's
+separate CER gate is green since MAN-115 removed its warmup-floor dilution.
 V6 now passes and V8w meets its 0-bogus criterion with a >= 20/50
 validated floor (MAN-213's fade-tracking keying rails, measured 28/50 — see
 docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md). **V5's
@@ -96,9 +96,43 @@ MAN-138: JSON spots' `deGrid`/`deLat`/`deLon` are the operator's
 centroid; an inconsistent location fails config loading before I/O. See
 `docs/DECISIONS/2026-10-11-man138-station-location.md`.
 
+MAN-93: `[server].history_minutes` controls telnet replay retention
+(default 30 minutes, newest-50 floor, 10,000 ceiling). Bare `sh/dx` stays
+at 10 rows; loggers request `sh/dx 30m`. Changes need a restart. See
+`docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md`.
+
+MAN-149: `docs/CONFIG.md` (every key's default and what reads it),
+`docs/METRICS.md`, `docs/SPOT-SCHEMA.md`, `docs/README.md` (start here, by
+audience) and `docs/DECISIONS/README.md`. A new config key, metric family,
+wire field, runbook or decision record needs a row in its document; tests
+in `docs_consistency.rs` and `spot_message.rs` enforce it — see
+docs/DECISIONS/2026-10-11-man149-docs-reference-and-index.md.
+
 MAN-172: high-SNR track churn fixed in `TrackManager` (local-peak spawn
 rule, incumbent-wins merge ties); VR3/VR4 pass, VR1/VR2 pass CER but not
 WPM. See docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md.
+MAN-269: `run --realtime`/`--loop` (`input.realtime`/`input.loop`) pace and
+loop file replay so a hardware-free replay can feed telnet/JSON clients; IQ
+WAVs declaring more than 10 MS/s are rejected at open — see
+docs/DECISIONS/2026-10-10-man269-paced-looping-replay.md.
+
+MAN-115: `TrackManager` skips the channelizer's zero pre-roll, `FloorBank`
+seeds a young channel's effective floor from its block median for 1 s, and
+`[detector].warmup_ms` defaults to 25 (was 2000). V1 promotes at 0.07 s
+(was 2.06 s) and decodes its first character at 0.62 s (was 2.66 s).
+`TrackMeta` is still not emitted at promotion. See
+docs/DECISIONS/2026-10-11-man115-startup-latency.md.
+
+MAN-81: with no arguments the Docker image runs the daemon from a config
+mounted at `/etc/manta/manta.toml` (or `MANTA_CONFIG`), else prints
+`--help`; its `HEALTHCHECK` runs the new `manta health` (exit 0/1 from
+`/healthz`, metrics address read from the daemon's config); the image is
+also built for `linux/arm/v7`. See
+`docs/DECISIONS/2026-10-11-man81-docker-config-mount-and-healthcheck.md`.
+
+MAN-127: `manta calibrate` measures the receiver's ppm offset against a
+known carrier and saves `[input].freq_correction_ppm` after confirmation —
+see docs/DECISIONS/2026-10-11-man127-calibrate-command.md.
 
 MAN-314: RTTY (two-tone FSK) is recognised after `[detector] rtty_dwell_ms`
 (20 s) and starts no CW track on its tones or keying sidebands
@@ -108,6 +142,8 @@ docs/DECISIONS/2026-10-11-man314-rtty-recognition.md.
 
 ## Documents (read in this order)
 
+- `docs/README.md` — where operators, contributors and researchers each
+  start; every runbook and reference doc
 - `README.md` — goals and non-goals
 - `ARCHITECTURE.md` — 9-crate workspace, data flow, channelizer/decoder/
   validation/output design
@@ -161,7 +197,8 @@ descriptive and always loses conflicts with code and docs/.
 - CPU budget: full 192 kS/s passband within one Raspberry Pi 4 core, enforced
   by criterion benches.
 - JSON spot schema is an ecosystem contract — belongs in the `dispensa` repo
-  (ADR pending), not solely here.
+  (ADR-0011 `spots.v1`), not solely here. dispensa is private, so
+  `docs/SPOT-SCHEMA.md` is the in-repo field reference.
 - No GUI: daemon + CLI. Outputs: RBN-format cluster telnet (:7300) and JSON
   Lines/WebSocket (:7301) for cqdx ingest.
 - M0 testkit generates its own ref-bandwidth AWGN (see

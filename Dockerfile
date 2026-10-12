@@ -9,9 +9,16 @@
 # feature set as the native release binaries (.github/workflows/release.yml).
 # `soapy` is deliberately excluded -- see that workflow's comment for why.
 #
-# Built for linux/amd64 and linux/arm64 via `docker buildx build
-# --platform linux/amd64,linux/arm64` (release.yml); a plain `docker build`
-# on either architecture also works natively, cross-compiling nothing.
+# Built for linux/amd64, linux/arm64 and linux/arm/v7 (32-bit Raspberry Pi
+# OS) via `docker buildx build --platform
+# linux/amd64,linux/arm64,linux/arm/v7` (release.yml); a plain `docker build`
+# on any of those architectures also works natively, cross-compiling nothing.
+#
+# MAN-81: the entrypoint is packaging/docker/docker-entrypoint.sh. With no
+# arguments it runs the daemon from a config mounted at
+# /etc/manta/manta.toml (or MANTA_CONFIG); with arguments it runs
+# `manta <arguments>` unchanged. HEALTHCHECK asks the daemon through
+# `manta health`.
 
 FROM rust:1-slim-bookworm AS builder
 
@@ -45,6 +52,8 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     && useradd --system --create-home --home-dir /home/manta manta
 
 COPY --from=builder /build/target/release/manta /usr/local/bin/manta
+# No `--chmod` (BuildKit-only): git's 100755 mode carries the execute bit.
+COPY packaging/docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 USER manta
 WORKDIR /home/manta
@@ -91,5 +100,40 @@ EXPOSE 7300 7301 7302
 # exact silent truncation MAN-45 exists to remove. 60 leaves margin over
 # the 50s registry-wide deadline; if SHUTDOWN_DRAIN_DEADLINE ever grows
 # again, this number and README's must grow with it.
-ENTRYPOINT ["manta"]
-CMD ["--help"]
+
+# MAN-81: Docker health. `manta health` asks the daemon's own /healthz and
+# exits 0 (healthy) or 1, never Docker's reserved 2. It reads the same config
+# the entrypoint runs -- MANTA_CONFIG, else the mounted /etc/manta/manta.toml
+# -- with the same MANTA_SERVER_* overrides, so a metrics_port or
+# metrics_bind_addr set in manta.toml is the one dialled; a curl at a fixed
+# port would misreport that daemon (and the image carries no curl). It
+# re-reads the file at every check, while the daemon keeps the listener it
+# started with (both keys are restart-only; SIGHUP reloads only [spot] lists
+# and dry_run): until the container restarts, an edit to either key can
+# send the check to an address the daemon is not listening on, and an edit
+# after which the file no longer loads, or has no [server] table, fails the
+# check until the file is fixed. It probes from inside the container, so
+# metrics_bind_addr can stay 127.0.0.1.
+# Shell form, so /bin/sh expands ${MANTA_CONFIG:-...} at check time (Docker
+# does no variable substitution in HEALTHCHECK).
+#  - start-period 60s: a KiwiSDR source may take up to its 30 s connect
+#    bound (crates/manta-input/src/kiwi.rs) plus its handshake before
+#    /healthz answers; the first passing check ends the period early.
+#  - interval 10s x retries 3: the Kubernetes probe in
+#    docs/RUNBOOKS/node-health.md; at most ~35 s from a 503 to (unhealthy).
+#  - `--timeout-secs 3` inside Docker's 5s timeout: the probe prints its own
+#    reason before Docker kills it, and docker inspect shows it.
+#  - no --start-interval: it needs Docker Engine 25+, and an older builder
+#    rejects it at build time.
+# A container started for something other than the daemon (`decode`, or
+# `listen` without a config) has nothing to probe and reports unhealthy:
+# turn the check off with `docker run --no-healthcheck` or Compose's
+# `healthcheck: disable: true`. The RBN uplink is not part of the verdict
+# (MAN-128 D9): `manta status` reports it.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=3 \
+    CMD manta health --config "${MANTA_CONFIG:-/etc/manta/manta.toml}" --timeout-secs 3
+
+# There is deliberately no CMD: setting ENTRYPOINT resets the base image's
+# CMD, so a bare `docker run` passes the script no arguments, and the script
+# picks the daemon (a mounted config or MANTA_CONFIG) or `manta --help`.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
