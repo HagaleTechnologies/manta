@@ -162,6 +162,9 @@ interval if you need an ongoing liveness check, not just a post-start one.)
   30-day field-node ledger reads both
   (`docs/RUNBOOKS/secondary-skimmer-field-node.md`).
 
+A ready Grafana dashboard and Prometheus alerts built on these queries are in
+[monitoring.md](monitoring.md) (MAN-129).
+
 ## Known gaps
 
 - Signal-to-spot (track onset → first spot) latency is not yet a metric —

@@ -22,6 +22,14 @@ the git history and `docs/DECISIONS/`.
 
 ## [Unreleased]
 
+### Added
+
+- A Grafana dashboard (spot rate, active tracks, source health, per-target
+  uplink status) and Prometheus alert rules (node down, node unhealthy, no
+  spots for 30 minutes, uplink target down or flapping) for a node's
+  `/metrics`, with promtool tests. See `docs/RUNBOOKS/monitoring.md`
+  (MAN-129).
+
 ## [0.1.0] - 2026-10-11
 
 Pre-stability alpha, expect breakage: manta has not cleared its own M2/M3
