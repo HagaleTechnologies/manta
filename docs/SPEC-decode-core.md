@@ -218,7 +218,7 @@ States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`.
 
 | Transition | Condition |
 |---|---|
-| IDLE → CANDIDATE | rise condition first met on channel `k`, and `k` is not owned by an existing track (§2.5) |
+| IDLE → CANDIDATE | rise condition first met on channel `k`, `k` is not owned by an existing track (§2.5), and `k` is not RTTY-vetoed (§2.6) |
 | CANDIDATE → ACTIVE | rise sustained 19 hops → lease decoder from pool |
 | CANDIDATE → IDLE | rise condition lost before 19 hops |
 | ACTIVE → HANG | drop condition met (below off threshold) |
@@ -226,6 +226,7 @@ States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`.
 | HANG → CLOSED | hang timer (5 000 ms) expires → decoder returned, final spots flushed |
 | ACTIVE/HANG → CLOSED | **garbage collect:** no character emitted for 30 000 ms (`detector.gc_ms`) — carrier or non-CW signal; the channel is marked *suppressed* for 60 s (re-detection allowed but logged) |
 | any → CLOSED | eviction: track cap reached and this is the lowest-SNR track (counted in metrics, per ARCHITECTURE §4) |
+| ACTIVE/HANG/CANDIDATE → CLOSED | `round(c)` inside a marked RTTY signal's hard span (§2.6) → closed as bookkeeping (`CloseReason` `rtty`, counted) |
 
 All timers are hop-counted (integers), never wall-clock.
 
@@ -252,6 +253,74 @@ All timers are hop-counted (integers), never wall-clock.
   `merged` (counted); its decoder state is discarded (text already emitted
   stands). On equal SNR the older track (lower `track_id`) survives.
   (MAN-172, see docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md)
+
+### 2.6 Two-tone FSK (RTTY) recognition
+
+MAN-314, `manta-dsp::fsk::FskDetector`, see
+docs/DECISIONS/2026-10-11-man314-rtty-recognition.md. With
+`detector.rtty_filter = true` (the default) the track manager feeds the
+detector every hop, after the floor and gate update, with the same
+`PdB[k]` and `FloorBank`. Channels are judged in frequency order
+`j = (k + N/2) mod N`; pairs never wrap across Nyquist.
+
+Constants (compile-time, like the floor constants):
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `BLOCK_HOPS` | 375 | one detector block, 1.000 s |
+| `LAGS` | 1, 2, 3, 4, 5, 9, 10 | pair distances `d` in channels (170–850 Hz at any offset) |
+| `HOT_MEAN_DB` | 6.0 | both channels' block-mean SNR must reach this |
+| `RHO_MAX` | −0.5 | Pearson ρ of the pair's per-hop SNR (dB) must be ≤ this |
+| `FILL_DB`, `FILL_MIN` | 10.0 dB, 0.8 | `max(a, b) ≥ FILL_DB` in ≥ 80 % of hops (constant envelope) |
+| `DOM_DB`, `DOM_MIN` | 6.0 dB, 0.1 | each tone leads the other by ≥ 6 dB in ≥ 10 % of hops |
+| `PHASE_SNR_DB` | 10.0 | hops at or above this feed the frequency estimator |
+| shift windows | [130, 230], [395, 475], [820, 885] Hz | measured shifts that count as RTTY |
+| standard shifts | 170, 200, 425, 450, 850 Hz | the nominal shift is the nearest |
+| `HOLD_BLOCKS` | 30 | evidence and mark survive 30 blocks without a pass |
+| `GUARD_CHANNELS` | 1 | hard span = pair channels ± 1 |
+| `SHADOW_WIDTH_CHANNELS` | 10 | shadow = hard span ± 10 channels … |
+| `SHADOW_DEPTH_DB` | 40.0 | … for candidates more than 40 dB below the key-down level |
+
+Per hop, for every channel: `snr = PdB[k] − F_eff[k]` is stored in the
+block buffer; if `snr ≥ PHASE_SNR_DB`, `z[j] += x̃[k]·conj(x̃_prev[k])`
+where `x̃ = X[k]·odd_channel_sign_correction(m, k)`.
+
+At each block end, for each pair `(j, j+d)` with both channels hot:
+
+1. ρ > 0 → **contra**: the pair's evidence drops by 2 (saturating at 0).
+2. Shape check: ρ ≤ `RHO_MAX`, fill ≥ `FILL_MIN`, both dominance
+   fractions ≥ `DOM_MIN`; otherwise **neutral** (no change).
+3. Tone positions: for each tone, `j_peak` is the channel among `c − 1 … c + 1`
+   with the highest mean SNR over the hops that tone leads; the position
+   is `j_peak + arg(z[j_peak]) / 2π · 4` (hop = N/4, so one cycle per hop
+   spans four channels). Shift = (high − low) · 93.75 Hz.
+4. A shift inside a window is a **pass**: evidence + 1, the pass count and
+   the tone positions accumulate, and the level (block mean of
+   `max(a, b)`) is stored. Anything else is neutral.
+
+A pair with `HOLD_BLOCKS` consecutive blocks without a pass is dropped. A
+pair is **marked** once its evidence reaches
+`rtty_dwell_blocks = floor(rtty_dwell_hops / 375)` and stays marked until
+dropped. Marked pairs whose channel intervals overlap or touch within one
+channel form one signal; its tones are the pass-averaged positions of the
+pair with the most passes (ties → lower `j`), its span is the union of the
+group's pair channels and tone channels, and it keeps a stable id while
+its span overlaps the previous block's signal.
+
+Effects on the track manager (§2.4/§2.5):
+
+- **Hard span** (span ± `GUARD_CHANNELS`): no spawn decision at `k` (nor
+  the same-hop `k+1` pairing), and every open track whose `round(c)` lies
+  inside it closes as `CloseReason::Rtty` (`ClosureKind::Bookkeeping`, no
+  survivor; counted in `CloseCounts::rtty`).
+- **Shadow** (span ± `SHADOW_WIDTH_CHANNELS`): a spawn decision at `k` is
+  vetoed when `S[k] − F_eff[k] < level − SHADOW_DEPTH_DB`. The shadow never
+  closes an existing track: a real CW track's key-up gaps put it below any
+  relative level.
+
+Determinism: no RNG and no clock; pairs iterate in frequency order through
+a `BTreeMap`; sums run in index order with `f64` accumulators.
+`rtty_filter = false` builds no detector and leaves every output as before.
 
 ---
 
@@ -891,6 +960,7 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | §1 channelizer, prototype | `manta-dsp::pfb`, `manta-dsp::proto` |
 | §1.4 interpolation | `manta-dsp::centroid` |
 | §2 floor + gate + state machine | `manta-dsp::floor`, `manta-engine::track` |
+| §2.6 RTTY recognition | `manta-dsp::fsk` |
 | §3 demod | `manta-decode::envelope` |
 | §4.1–4.2 timing | `manta-decode::timing` |
 | §4.3–4.5 beam decode | `manta-decode::beam`, `manta-decode::tree` |
@@ -926,6 +996,9 @@ track_cap = 1200
 # MAN-171: a channel whose track closed Silent may not spawn a new
 # CANDIDATE for this long.
 silent_respawn_cooldown_ms = 30000  # 11250 hops
+# MAN-314: two-tone FSK (RTTY) recognition, §2.6. rtty_dwell_ms >= 1000.
+rtty_filter = true
+rtty_dwell_ms = 20000   # 7500 hops; whole 1 s blocks
 # floor_quantile = 0.25       # not configurable yet: compile-time constant in manta-dsp::floor
 # floor_window_ms = 10000     # not configurable yet: compile-time constant in manta-dsp::floor
 # block_channels = 32         # not configurable yet: compile-time constant in manta-dsp::floor

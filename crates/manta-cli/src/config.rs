@@ -1123,6 +1123,18 @@ mod tests {
         assert_eq!(loaded.input.shared.freq_correction_ppm, Some(3.0));
     }
 
+    /// MAN-314: `MANTA_DETECTOR_RTTY_FILTER=false` overrides the file.
+    #[test]
+    fn env_rtty_filter_overrides_the_file() {
+        let loaded = load_env(
+            Some("[detector]\nrtty_filter = true\nrtty_dwell_ms = 30000\n"),
+            &[("MANTA_DETECTOR_RTTY_FILTER", "false")],
+        )
+        .unwrap();
+        assert!(!loaded.detector.rtty_filter);
+        assert_eq!(loaded.detector.rtty_dwell_hops, 11250);
+    }
+
     #[test]
     fn env_values_are_typed_by_toml_probe() {
         let loaded = load_env(

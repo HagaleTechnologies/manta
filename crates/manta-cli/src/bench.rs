@@ -1190,6 +1190,7 @@ mod tests {
             text: String::new(),
             events,
             spots,
+            rtty: Vec::new(),
         }
     }
 

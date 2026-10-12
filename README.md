@@ -552,6 +552,8 @@ criteria.
   waterfall.
 - Not a general digital-mode skimmer. FT8 and RTTY are out of scope for 1.0,
   though the channelizer architecture does not preclude them later.
+  Decoding RTTY stays a non-goal for now; recognising it so that its tones
+  never become CW tracks is in scope (MAN-314).
 - Not a cluster network. `manta` is a spot source, not an aggregator.
 - Not a logger. No QSO state.
 - Not a multi-process orchestrator. `manta` is a single Rust binary, not a

@@ -23,6 +23,10 @@ git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-314: RTTY (two-tone FSK, 170/200/425/450/850 Hz shift) is recognised
+  after 20 s and no CW track starts on it or its keying sidebands; open
+  tracks on it close (`rtty` close count). `[detector] rtty_filter = false`
+  restores the previous behaviour.
 - Strong signals (about +24 dB SNR or more in 2500 Hz) no longer spawn
   duplicate tracks on adjacent channels that take over their decoder every
   fraction of a second. They retain one continuous track and recover their
@@ -31,6 +35,9 @@ git history and `docs/DECISIONS/`.
 
 ### Added
 
+- `[detector] rtty_filter`/`rtty_dwell_ms`; `manta_rtty_signals{band}`
+  gauge; `rtty` array in `decode --json` and an `rtty:` line in plain
+  `decode`; `RTTY marked`/`RTTY cleared` log lines in `run` (MAN-314).
 - `manta doctor` checks the whole setup before its signal check: the config
   (`manta run`'s example-callsign and dial-frequency refusals), the audio
   library and sound-card inputs, that each `[server]` port is free, the

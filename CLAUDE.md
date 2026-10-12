@@ -100,6 +100,12 @@ MAN-172: high-SNR track churn fixed in `TrackManager` (local-peak spawn
 rule, incumbent-wins merge ties); VR3/VR4 pass, VR1/VR2 pass CER but not
 WPM. See docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md.
 
+MAN-314: RTTY (two-tone FSK) is recognised after `[detector] rtty_dwell_ms`
+(20 s) and starts no CW track on its tones or keying sidebands
+(`manta-dsp::fsk`, SPEC §2.6); `decode --json` gains `rtty`, `run` logs
+marks/clears and `/metrics` gains `manta_rtty_signals{band}`. See
+docs/DECISIONS/2026-10-11-man314-rtty-recognition.md.
+
 ## Documents (read in this order)
 
 - `README.md` — goals and non-goals

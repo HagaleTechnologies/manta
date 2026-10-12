@@ -53,6 +53,97 @@ pub struct ListenObservers {
     /// running `Validator`. `None` (the default) skips the check
     /// entirely, so `listen()`'s existing callers pay nothing.
     pub operator_lists: Option<Arc<OperatorListsUpdate>>,
+    /// MAN-314: the currently marked RTTY signals (SPEC §2.6), stored
+    /// whenever the marked set changes, emptied on a segment restart, a
+    /// read error and every exit. `None` (the default) skips it entirely.
+    pub rtty: Option<Arc<RttyObserver>>,
+}
+
+/// MAN-314: the decode loop's currently marked RTTY signals, calibrated.
+/// `generation` moves on every store, so a poller re-reads `snapshot` only
+/// when it changed.
+#[derive(Debug, Default)]
+pub struct RttyObserver {
+    generation: AtomicU64,
+    signals: Mutex<Vec<crate::RttySignalReport>>,
+}
+
+impl RttyObserver {
+    /// Bumped on every store.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// The currently marked signals.
+    pub fn snapshot(&self) -> Vec<crate::RttySignalReport> {
+        self.signals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn store(&self, signals: Vec<crate::RttySignalReport>) {
+        *self.signals.lock().unwrap_or_else(|e| e.into_inner()) = signals;
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// MAN-314: empties the RTTY observer on construction and on every exit
+/// path, like `ActiveTracksGuard`, and publishes the segment's marked set
+/// when the track manager reports a change.
+struct RttyPublisher {
+    observer: Option<Arc<RttyObserver>>,
+    seen_changes: u64,
+    calibration_factor: f64,
+}
+
+impl RttyPublisher {
+    fn new(observer: Option<Arc<RttyObserver>>, calibration_factor: f64) -> Self {
+        let p = Self {
+            observer,
+            seen_changes: 0,
+            calibration_factor,
+        };
+        p.clear();
+        p
+    }
+
+    fn clear(&self) {
+        if let Some(obs) = &self.observer {
+            if !obs.snapshot().is_empty() {
+                obs.store(Vec::new());
+            }
+        }
+    }
+
+    /// A fresh segment's track manager starts with nothing marked.
+    fn restart(&mut self) {
+        self.seen_changes = 0;
+        self.clear();
+    }
+
+    fn update(&mut self, tm: &crate::track::TrackManager) {
+        let Some(obs) = &self.observer else {
+            return;
+        };
+        if tm.rtty_changes() == self.seen_changes {
+            return;
+        }
+        self.seen_changes = tm.rtty_changes();
+        obs.store(
+            tm.rtty_signals()
+                .iter()
+                .filter(|e| e.cleared_sample_ts.is_none())
+                .map(|e| crate::RttySignalReport::from_entry(e, self.calibration_factor))
+                .collect(),
+        );
+    }
+}
+
+impl Drop for RttyPublisher {
+    fn drop(&mut self) {
+        self.clear();
+    }
 }
 
 /// MAN-78: the operator lists a live reload replaces, as one unit.
@@ -285,6 +376,8 @@ pub fn listen_with_observers(
     let calibration_factor = manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
         .map_err(|e| anyhow::anyhow!(e))?;
 
+    let mut rtty = RttyPublisher::new(observers.rtty.clone(), calibration_factor);
+
     let fs = src.sample_rate();
     let center_freq_hz = src.center_freq_hz();
 
@@ -368,6 +461,7 @@ pub fn listen_with_observers(
     );
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
+    rtty.update(&seg.tm);
     on_tracks(n_tracks);
     // `..filled`: the whole buffer unless a stop request cut the fill short.
     let events = seg.tm.process_hops(&seg.ch.process(&calib[..filled]), |m| {
@@ -383,6 +477,7 @@ pub fn listen_with_observers(
     );
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
+    rtty.update(&seg.tm);
     on_tracks(n_tracks);
     let mut seg_consumed: u64 = filled as u64;
 
@@ -404,6 +499,7 @@ pub fn listen_with_observers(
             Ok(n) => n,
             Err(e) => {
                 report_active_tracks(0);
+                rtty.restart();
                 on_tracks(0);
                 return Err(e);
             }
@@ -427,6 +523,7 @@ pub fn listen_with_observers(
             seg_base += seg_consumed + gap;
             seg_consumed = 0;
             seg = new_segment(fs, center_freq_hz, cfg, next_id)?;
+            rtty.restart();
             let events = seg.tm.process_hops(&seg.ch.process(&padding), |m| {
                 seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
             });
@@ -460,6 +557,7 @@ pub fn listen_with_observers(
         );
         let n_tracks = seg.tm.decoding_track_count();
         report_active_tracks(n_tracks);
+        rtty.update(&seg.tm);
         on_tracks(n_tracks);
         if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
             obs.observe(t0.elapsed());
@@ -480,6 +578,7 @@ pub fn listen_with_observers(
     // observers must settle back to 0 rather than be left holding the last
     // live value after a source disconnects or a replay hits EOF.
     report_active_tracks(0);
+    rtty.restart();
     on_tracks(0);
     Ok(())
 }
@@ -1090,6 +1189,89 @@ mod tests {
     /// afterward (`TrackManager::finish()` closes every track). MAN-122: the
     /// number published here is `decoding_track_count()`, so an unconfirmed
     /// noise candidate can never lift it off 0.
+    /// MAN-314: a 25 s scene holding one 30 dB, 170 Hz RTTY signal.
+    fn rtty_scene() -> Vec<Complex32> {
+        let fs = 96_000.0;
+        let (mut iq, _) = manta_testkit::scene::render_scene(&[], fs, 25.0, Some(2)).unwrap();
+        manta_testkit::fsk::add_fsk(
+            &mut iq,
+            fs,
+            &manta_testkit::fsk::FskSpec {
+                mark_offset_hz: 15_000.0,
+                shift_hz: 170.0,
+                baud: 45.45,
+                snr_2500_db: 30.0,
+                text: "CQ TEST DE W1AW W1AW RYRYRY 599 001 ".into(),
+                start_s: 0.0,
+                watterson: None,
+                seed: 1,
+            },
+        );
+        iq
+    }
+
+    #[test]
+    fn rtty_observer_publishes_marks_and_clears_on_segment_restart() {
+        let src = GapSource::new(rtty_scene(), 96_000.0, 14_070_000.0, 96_000);
+        let gap_taken = src.gap_taken.clone();
+        let obs = Arc::new(RttyObserver::default());
+        let seen = obs.clone();
+        let mut marked_before_gap = false;
+        let mut first_after_gap: Option<usize> = None;
+        listen_with_observers(
+            Box::new(src),
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                rtty: Some(obs.clone()),
+                ..Default::default()
+            },
+            |_ev| {},
+            |_spot| {},
+            |_n| {
+                let snap = seen.snapshot();
+                if gap_taken.load(Ordering::Relaxed) {
+                    first_after_gap.get_or_insert(snap.len());
+                } else if snap.len() == 1 && snap[0].shift_hz == 170.0 {
+                    marked_before_gap = true;
+                }
+            },
+        )
+        .unwrap();
+        assert!(marked_before_gap, "the RTTY signal was never published");
+        assert_eq!(first_after_gap, Some(0), "the restart must empty the set");
+        assert!(obs.snapshot().is_empty());
+    }
+
+    #[test]
+    fn rtty_observer_zeroed_on_drop() {
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rtty_scene(),
+            cursor: 0,
+            fs: 96_000.0,
+            center_freq_hz: 14_070_000.0,
+        });
+        let obs = Arc::new(RttyObserver::default());
+        let seen = obs.clone();
+        let mut peak = 0;
+        listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                rtty: Some(obs.clone()),
+                ..Default::default()
+            },
+            |_ev| {},
+            |_spot| {},
+            |_n| peak = peak.max(seen.snapshot().len()),
+        )
+        .unwrap();
+        assert_eq!(peak, 1);
+        assert!(obs.generation() >= 2, "marked, then cleared");
+        assert!(obs.snapshot().is_empty(), "cleared at exit");
+    }
+
     #[test]
     fn listen_with_observers_publishes_a_live_active_track_count() {
         use std::sync::atomic::AtomicU64;

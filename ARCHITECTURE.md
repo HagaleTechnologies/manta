@@ -207,6 +207,15 @@ its ceiling for the entire duration of a real 15-minute recording,
 lowest-SNR eviction; evictions are counted and reported (no silent
 coverage loss).
 
+RTTY (MAN-314): a two-tone FSK detector (`manta-dsp::fsk`) reads the same
+per-hop power and floor. A tone pair with anti-correlated per-hop SNR, a
+constant envelope and a standard shift (170/200/425/450/850 Hz) that lasts
+`detector.rtty_dwell_ms` (20 s) is marked as RTTY. No CW track starts on
+its tones (± 1 channel) or on splatter-level candidates nearby, and open
+tracks on its tones close. The marked set is reported in `decode --json`,
+the `run` log and the `manta_rtty_signals{band}` gauge. SPEC-decode-core.md
+§2.6 is normative.
+
 **CPU budget** (the reason this whole design is viable):
 
 | Stage | Cost at 192 kS/s | Notes |
