@@ -693,10 +693,16 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `manta_uplink_target_*{target="host:port"}` (per-target labels for every
   uplink counter, derived-sum aggregates preserved under their old
   unlabeled names); and `manta_healthy`/`manta_listener_up{listener}`
-  (the same verdict `/healthz`, below, reports). What's still genuinely
-  missing: per-stage queue depths, spots/min, spot-confidence histogram,
-  and **ring**-overrun counting for live audio (§3 — blocked on
-  a `coppa-audio` API addition, `manta-engine::soak`'s documented
+  (the same verdict `/healthz`, below, reports). **MAN-118 added**
+  decode-quality families with no `track_id` label:
+  `manta_decode_chars_total`/`manta_decode_garbles_total` (counters),
+  `manta_track_rail_ratio` (each `legacy` track's keying-rail ratio, once
+  per second) and `manta_candidate_repetitions` (the repetition gate's
+  count per candidate), fed by `manta_engine::DecodeQualityObserver` — see
+  [MAN-118](docs/DECISIONS/2026-10-12-man118-decode-quality-metrics.md).
+  What's still genuinely missing: per-stage queue depths, spots/min,
+  spot-confidence histogram, and **ring**-overrun counting for live audio
+  (§3 — blocked on a `coppa-audio` API addition, `manta-engine::soak`'s documented
   deviation, a different gap from MAN-56's wire-level packet counters).
   The three `manta_input_*` series are published only for sources that
   actually count wire-level packet loss (HPSDR and KiwiSDR — MAN-128

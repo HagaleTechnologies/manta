@@ -216,6 +216,41 @@ impl LatencyHistogram {
     }
 }
 
+/// A unitless histogram snapshot (MAN-118), shaped like `LatencyHistogram`:
+/// `bucket_counts` is NON-cumulative, length `bounds.len() + 1`, the last
+/// being the `+Inf` overflow bucket.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValueHistogram {
+    pub bounds: Vec<f64>,
+    pub bucket_counts: Vec<u64>,
+    pub sum: f64,
+}
+
+/// A snapshot of `manta-engine`'s decode-quality observer (MAN-118): the
+/// four families that report whether the decode itself looks healthy, as
+/// opposed to whether the daemon is running at all.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodeQuality {
+    pub chars_total: u64,
+    pub garbles_total: u64,
+    pub rail_ratio: ValueHistogram,
+    pub repetitions: ValueHistogram,
+}
+
+/// Writes `h` as Prometheus histogram samples under `name`: cumulative
+/// `_bucket{le=...}` lines, `+Inf`, `_sum` and `_count` (equal to `+Inf`).
+fn push_histogram_samples(out: &mut String, name: &str, h: &ValueHistogram) {
+    let mut cumulative = 0u64;
+    for (bound, count) in h.bounds.iter().zip(h.bucket_counts.iter()) {
+        cumulative += count;
+        out.push_str(&format!("{name}_bucket{{le=\"{bound}\"}} {cumulative}\n"));
+    }
+    cumulative += h.bucket_counts.get(h.bounds.len()).copied().unwrap_or(0);
+    out.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {cumulative}\n"));
+    out.push_str(&format!("{name}_sum {}\n", h.sum));
+    out.push_str(&format!("{name}_count {cumulative}\n"));
+}
+
 /// Captured once, at `Metrics::new()` -- the moment the metrics endpoint
 /// comes into existence. `instant` (monotonic) backs `manta_uptime_seconds`
 /// so an NTP step never distorts it; `unix_seconds` (wall-clock) backs
@@ -522,6 +557,9 @@ pub struct Metrics {
     started: StartedAt,
     build_info: RwLock<Option<BuildInfo>>,
     decode_latency: RwLock<Option<LatencyHistogram>>,
+    /// MAN-118: the decode-quality families' latest snapshot; `None` (no
+    /// decode loop yet) renders their headers only.
+    decode_quality: RwLock<Option<DecodeQuality>>,
     /// MAN-128: which listeners (telnet/json/metrics) are currently up, per
     /// `/healthz`'s "listeners are up" check and the `manta_listener_up`
     /// gauge.
@@ -957,6 +995,16 @@ impl Metrics {
             .lock()
             .expect("decode_watch lock poisoned")
             .observe_progress(now, total_count);
+    }
+
+    /// MAN-118: replaces the decode-quality snapshot. Unlike
+    /// `set_decode_latency` this does not feed the decode watchdog, which
+    /// keeps keying off latency alone.
+    pub fn set_decode_quality(&self, q: DecodeQuality) {
+        *self
+            .decode_quality
+            .write()
+            .expect("decode_quality lock poisoned") = Some(q);
     }
 
     /// Evaluates `/healthz`'s verdict (and `manta_healthy`/
@@ -1460,6 +1508,40 @@ impl Metrics {
             out.push_str(&format!(
                 "manta_decode_latency_seconds_count {cumulative}\n"
             ));
+        }
+
+        // MAN-118: decode-quality families. Literal `# TYPE` lines, one per
+        // family, so `docs_consistency.rs` can find each one in this source.
+        let quality = self
+            .decode_quality
+            .read()
+            .expect("decode_quality lock poisoned")
+            .clone();
+        out.push_str("# HELP manta_decode_chars_total Characters decoded across every track.\n");
+        out.push_str("# TYPE manta_decode_chars_total counter\n");
+        if let Some(q) = &quality {
+            out.push_str(&format!("manta_decode_chars_total {}\n", q.chars_total));
+        }
+        out.push_str(
+            "# HELP manta_decode_garbles_total Characters the decoder could not match to any Morse character (every beam branch rejected the marks), across every track.\n",
+        );
+        out.push_str("# TYPE manta_decode_garbles_total counter\n");
+        if let Some(q) = &quality {
+            out.push_str(&format!("manta_decode_garbles_total {}\n", q.garbles_total));
+        }
+        out.push_str(
+            "# HELP manta_track_rail_ratio Keying-rail ratio (mark rail / space rail amplitude) of each decoding track, sampled once per second per track. 2 is the floor the rails collapse to.\n",
+        );
+        out.push_str("# TYPE manta_track_rail_ratio histogram\n");
+        if let Some(q) = &quality {
+            push_histogram_samples(&mut out, "manta_track_rail_ratio", &q.rail_ratio);
+        }
+        out.push_str(
+            "# HELP manta_candidate_repetitions Message-distinct decodes of the same call near the same frequency within the trailing 90 s, for each callsign candidate the repetition gate scored. A candidate needs 2 to spot.\n",
+        );
+        out.push_str("# TYPE manta_candidate_repetitions histogram\n");
+        if let Some(q) = &quality {
+            push_histogram_samples(&mut out, "manta_candidate_repetitions", &q.repetitions);
         }
 
         // MAN-128: health gauges, computed from the SAME `health_at` that
@@ -2226,6 +2308,96 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(inf, count);
+    }
+
+    // MAN-118: decode-quality families.
+
+    fn sample_decode_quality() -> DecodeQuality {
+        DecodeQuality {
+            chars_total: 9690,
+            garbles_total: 3,
+            rail_ratio: ValueHistogram {
+                bounds: vec![2.0, 2.5, 63.0],
+                bucket_counts: vec![6, 304, 5725, 4],
+                sum: 61022.4,
+            },
+            repetitions: ValueHistogram {
+                bounds: vec![1.0, 2.0],
+                bucket_counts: vec![116, 38, 120],
+                sum: 899.0,
+            },
+        }
+    }
+
+    #[test]
+    fn decode_quality_families_render_header_only_when_never_set() {
+        let text = Metrics::new().render_prometheus_text();
+        for (name, kind) in [
+            ("manta_decode_chars_total", "counter"),
+            ("manta_decode_garbles_total", "counter"),
+            ("manta_track_rail_ratio", "histogram"),
+            ("manta_candidate_repetitions", "histogram"),
+        ] {
+            assert!(text.contains(&format!("# HELP {name} ")), "{name} HELP");
+            assert!(
+                text.contains(&format!("# TYPE {name} {kind}\n")),
+                "{name} TYPE"
+            );
+            assert!(
+                !text.lines().any(|l| l.starts_with(name)),
+                "{name} must render no samples before set_decode_quality"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_quality_counters_render_their_values() {
+        let m = Metrics::new();
+        m.set_decode_quality(sample_decode_quality());
+        let text = m.render_prometheus_text();
+        assert!(text.contains("manta_decode_chars_total 9690\n"));
+        assert!(text.contains("manta_decode_garbles_total 3\n"));
+    }
+
+    #[test]
+    fn decode_quality_histograms_are_cumulative_with_inf_equal_to_count() {
+        let m = Metrics::new();
+        m.set_decode_quality(sample_decode_quality());
+        let text = m.render_prometheus_text();
+        assert!(text.contains(r#"manta_track_rail_ratio_bucket{le="2"} 6"#));
+        assert!(text.contains(r#"manta_track_rail_ratio_bucket{le="2.5"} 310"#));
+        assert!(text.contains(r#"manta_track_rail_ratio_bucket{le="63"} 6035"#));
+        assert!(text.contains(r#"manta_track_rail_ratio_bucket{le="+Inf"} 6039"#));
+        assert!(text.contains("manta_track_rail_ratio_sum 61022.4\n"));
+        assert!(text.contains("manta_track_rail_ratio_count 6039\n"));
+        assert!(text.contains(r#"manta_candidate_repetitions_bucket{le="1"} 116"#));
+        assert!(text.contains(r#"manta_candidate_repetitions_bucket{le="2"} 154"#));
+        assert!(text.contains(r#"manta_candidate_repetitions_bucket{le="+Inf"} 274"#));
+        assert!(text.contains("manta_candidate_repetitions_sum 899\n"));
+        assert!(text.contains("manta_candidate_repetitions_count 274\n"));
+    }
+
+    #[test]
+    fn decode_quality_renders_between_decode_latency_and_healthy() {
+        let m = Metrics::new();
+        m.set_decode_quality(sample_decode_quality());
+        let text = m.render_prometheus_text();
+        let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let latency = at("# TYPE manta_decode_latency_seconds histogram");
+        let chars = at("# TYPE manta_decode_chars_total counter");
+        let reps = at("# TYPE manta_candidate_repetitions histogram");
+        let healthy = at("# TYPE manta_healthy gauge");
+        assert!(latency < chars && chars < reps && reps < healthy);
+    }
+
+    #[test]
+    fn decode_quality_does_not_feed_the_decode_watchdog() {
+        let m = Metrics::new();
+        let now = Instant::now();
+        m.arm_decode_watchdog_at(now);
+        let before = m.health_at(now);
+        m.set_decode_quality(sample_decode_quality());
+        assert_eq!(m.health_at(now), before);
     }
 
     #[test]

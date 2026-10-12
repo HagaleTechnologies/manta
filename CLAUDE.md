@@ -147,6 +147,13 @@ MAN-127: `manta calibrate` measures the receiver's ppm offset against a
 known carrier and saves `[input].freq_correction_ppm` after confirmation —
 see docs/DECISIONS/2026-10-11-man127-calibrate-command.md.
 
+MAN-118: `/metrics` reports decode quality node-wide, with no `track_id`
+label: `manta_decode_chars_total`/`manta_decode_garbles_total`,
+`manta_track_rail_ratio` (each `legacy` track's keying-rail ratio once per
+second) and `manta_candidate_repetitions` (the repetition gate's count per
+candidate), via `manta_engine::DecodeQualityObserver` — see
+docs/DECISIONS/2026-10-12-man118-decode-quality-metrics.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each
