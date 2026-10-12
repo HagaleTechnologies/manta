@@ -124,6 +124,13 @@ seeds a young channel's effective floor from its block median for 1 s, and
 `TrackMeta` is still not emitted at promotion. See
 docs/DECISIONS/2026-10-11-man115-startup-latency.md.
 
+MAN-81: with no arguments the Docker image runs the daemon from a config
+mounted at `/etc/manta/manta.toml` (or `MANTA_CONFIG`), else prints
+`--help`; its `HEALTHCHECK` runs the new `manta health` (exit 0/1 from
+`/healthz`, metrics address read from the daemon's config); the image is
+also built for `linux/arm/v7`. See
+`docs/DECISIONS/2026-10-11-man81-docker-config-mount-and-healthcheck.md`.
+
 MAN-127: `manta calibrate` measures the receiver's ppm offset against a
 known carrier and saves `[input].freq_correction_ppm` after confirmation —
 see docs/DECISIONS/2026-10-11-man127-calibrate-command.md.

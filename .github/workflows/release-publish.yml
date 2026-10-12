@@ -295,7 +295,7 @@ jobs:
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           # The version tag only. `:latest` is no longer written HERE at all
           # (MAN-65 finding 3) -- see `publish-latest` below. Version and image
@@ -387,7 +387,7 @@ jobs:
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: ${{ inputs.publish == true }}
           # `:latest` is reserved for real tag pushes only (`publish-latest`) --
           # a workflow_dispatch run with publish=true can target any branch, not

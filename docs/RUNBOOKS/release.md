@@ -436,8 +436,12 @@ Both should report the same digest.
   digests are the subjects of the Release's build-provenance attestation.
   See "Verifying a downloaded release" below.
 - **Docker image** (`ghcr.io/hagaletechnologies/manta`): multi-arch
-  (`linux/amd64`, `linux/arm64`), tagged `:X.Y.Z` for every release and
-  `:latest` for the newest stable release only.
+  (`linux/amd64`, `linux/arm64`, `linux/arm/v7`), tagged `:X.Y.Z` for
+  every release and `:latest` for the newest stable release only. The
+  `linux/arm/v7` image is for 32-bit Raspberry Pi OS; its decode CPU budget
+  is unmeasured (MAN-81). With no arguments the image runs the daemon from
+  a config mounted at `/etc/manta/manta.toml`, and its `HEALTHCHECK` runs
+  `manta health` (see `packaging/README.md`).
 
 ## Verifying a downloaded release
 

@@ -71,6 +71,10 @@ Cargo.toml           @thagale
 # release-publish.yml or a version bump.
 /Dockerfile          @thagale
 
+# The image's entrypoint script (MAN-81) decides what a bare `docker run` of the published image
+# does -- it changes the image's behaviour as much as the Dockerfile does.
+/packaging/docker/   @thagale
+
 /SECURITY.md         @thagale
 
 # Whole directory, not an enumerated subset: scripts/ includes CI/release-safety-critical checks

@@ -37,9 +37,21 @@ acceptance gates.
 
 ### Added
 
+<<<<<<< HEAD
 - Prebuilt archives for Linux (x86-64, arm64), macOS (x86-64, arm64) and
   Windows (x86-64) on each GitHub Release, with `SHA256SUMS` and a
   build-provenance attestation (MAN-298).
+=======
+- `manta health` asks a running daemon's `/healthz` and exits 0 when it
+  reports healthy, 1 otherwise, reading the metrics port from the same config
+  and `MANTA_*` overrides as `run` (MAN-81).
+- The Docker image runs the daemon from a config mounted at
+  `/etc/manta/manta.toml` (or `MANTA_CONFIG`) when started with no arguments,
+  instead of printing `--help`, and carries a `HEALTHCHECK` that runs
+  `manta health`. Arguments still run `manta <arguments>` unchanged (MAN-81).
+- A `linux/arm/v7` Docker image for 32-bit Raspberry Pi OS, alongside
+  `linux/amd64` and `linux/arm64` (MAN-81).
+>>>>>>> dfec33e19656c7e22aa66c970436cb62f620f9a7
 - `manta calibrate` measures the receiver's frequency error against a WWV,
   WWVH, BPM, RWM or NCDXF beacon carrier and, after confirmation, saves
   `freq_correction_ppm` to `[input]` in the config file (MAN-127).

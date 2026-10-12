@@ -762,7 +762,10 @@ fn compose_runs_the_mounted_config_and_outlasts_the_drain() {
         .collect();
     assert_eq!(command, ["run", "--config", "/etc/manta/manta.toml"]);
 
-    // `command` is only manta's arguments if the image's entrypoint is manta.
+    // `command` is manta's arguments because the image's entrypoint script
+    // passes any arguments through to manta unchanged (MAN-81), which
+    // docker_image.rs's `arguments_pass_through_unchanged` proves with this
+    // file's own `command:`.
     let dockerfile = doc("Dockerfile");
     let entrypoint = dockerfile
         .lines()
@@ -771,7 +774,7 @@ fn compose_runs_the_mounted_config_and_outlasts_the_drain() {
         .expect("the Dockerfile sets an ENTRYPOINT");
     let entrypoint: Vec<String> =
         serde_json::from_str(entrypoint.trim()).expect("an exec-form ENTRYPOINT");
-    assert_eq!(entrypoint, ["manta"]);
+    assert_eq!(entrypoint, ["/usr/local/bin/docker-entrypoint.sh"]);
 
     let grace = compose_seconds(&str_of(&manta["stop_grace_period"]).expect("stop_grace_period"));
     let floor = stop_budget_floor();
