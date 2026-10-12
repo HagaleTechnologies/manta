@@ -149,11 +149,12 @@ impl FskDetector {
 
     fn push_snr(&mut self, m: u64, x: &[Complex32], snr: &[f32]) -> bool {
         let n = self.n;
-        for k in 0..n {
+        for (k, &s) in snr.iter().enumerate().take(n) {
             let j = (k + n / 2) % n;
-            let s = snr[k];
             self.buf[j * BLOCK_HOPS + self.pos] = s;
-            let xc = x[k] * odd_channel_sign_correction(m, k);
+            // A hop without its complex spectrum (power-only test hops)
+            // feeds no phase; the shape tests still run on `snr`.
+            let xc = x.get(k).copied().unwrap_or_default() * odd_channel_sign_correction(m, k);
             if s >= PHASE_SNR_DB {
                 let d = xc * self.prev[j].conj();
                 self.z[j] += Complex64::new(d.re as f64, d.im as f64);
