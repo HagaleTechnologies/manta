@@ -1523,6 +1523,26 @@ fn man90_runbook_writes_exact_byte_transcripts() {
     }
 }
 
+/// MAN-90: step 5 exports every Aggregator connection outside the LAN and the
+/// Skimmers, not only RBN's, so the consent text must say so (Codex P2 on
+/// PR #259).
+#[test]
+fn man90_runbook_consent_covers_every_connection_aggregator_has_open() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let consent = squash_whitespace(section(&runbook, "Asking for consent"));
+    assert!(
+        !consent.contains("traffic with RBN's servers")
+            && !consent.contains("traffic with the RBN server"),
+        "consent text still promises only RBN traffic"
+    );
+    for needle in [
+        "every internet connection Aggregator has open while you record",
+        "not only its connection to RBN",
+    ] {
+        assert!(consent.contains(needle), "consent text never says `{needle}`");
+    }
+}
+
 /// MAN-90: README calls the uplink experimental everywhere it offers it, and
 /// "Run it as a node" names the Aggregator route before the uplink block.
 #[test]

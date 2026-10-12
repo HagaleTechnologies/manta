@@ -24,15 +24,15 @@ had not been asked as of 2026-10-11.
 
 Send something like this, and keep the written reply:
 
-> Would you record about 15 minutes of your Aggregator's traffic with the RBN
-> server, so manta can check its RBN uplink against what Aggregator really
-> sends?
+> Would you record about 15 minutes of your Aggregator's internet traffic, so
+> manta can check its RBN uplink against what Aggregator really sends?
 >
-> - **What is recorded:** your Aggregator host's traffic with RBN's servers.
->   That includes Aggregator's RBN login and the spots it sends. Wireshark
->   records everything on that network card while it runs, so before sending
->   you keep only the packets of the connections Aggregator itself made, and
->   delete the rest.
+> - **What is recorded:** every internet connection Aggregator has open while
+>   you record, not only its connection to RBN. That includes Aggregator's RBN
+>   login and the spots it sends, and also any other service Aggregator talks
+>   to in that window, such as an update check. Wireshark records everything
+>   on that network card while it runs, so before sending you keep only the
+>   packets of Aggregator's own connections, and delete the rest.
 > - **What happens to it:** the raw file stays private with me and is deleted
 >   whenever you ask.
 > - **What gets published:** only a short excerpt that you approve first, with
