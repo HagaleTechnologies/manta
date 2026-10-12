@@ -124,7 +124,8 @@ struct ClientCtx {
 
 impl ClientCtx {
     /// One stream line: a spot rendered as today, or a MAN-301 `spotGrade`
-    /// record, already serialised, passed through verbatim.
+    /// record, already serialised, passed through verbatim. Both shapes,
+    /// and the `kind` key that tells them apart, are in `docs/SPOT-SCHEMA.md`.
     fn render(&self, item: &JsonItem) -> String {
         let bus_spot = match item {
             JsonItem::Spot(bus_spot) => bus_spot,

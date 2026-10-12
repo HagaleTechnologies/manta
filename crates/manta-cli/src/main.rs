@@ -9169,7 +9169,6 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
     }
 
-<<<<<<< HEAD
     // ---- MAN-301: `run --rbn-compare` / `--rbn-spotter`
 
     /// `run`'s parsed RBN comparison flags.
@@ -9346,7 +9345,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let file_input = format!("{enabled}[input]\ntype = \"file\"\npath = \"/x.wav\"\n");
         assert!(prepare_rbn(&file_input, RbnCompareOpts::default(), None).is_ok());
         assert!(run_rbn(&file_input, RbnCompareOpts::default(), None).is_err());
-=======
+    }
+
     #[test]
     fn spot_bus_for_uses_configured_history_or_the_default() {
         let mut cfg = test_server_config("W1AW");
@@ -9358,6 +9358,5 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         cfg.history_minutes = Some(90);
         let bus = spot_bus_for(&cfg, 1.0, std::time::SystemTime::UNIX_EPOCH, 0);
         assert_eq!(bus.history_minutes(), 90);
->>>>>>> a0d514c01ca518d421b77a5db3bf0eb0653a2543
     }
 }

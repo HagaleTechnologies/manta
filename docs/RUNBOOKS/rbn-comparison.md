@@ -99,7 +99,8 @@ WARN manta_server::rbn_compare::feed: rbn_compare: feed lost (no line for 60 s);
 
 Spot lines on `:7301` do not change. With comparison on, each spot is
 followed, once its window has closed (`window_secs` after the spot, plus up
-to 5 s), by one grade line on the same stream, raw TCP and WebSocket alike:
+to 5 s; up to 75 s while the feed is silent, see "Many unknown grades"), by
+one grade line on the same stream, raw TCP and WebSocket alike:
 
 ```json
 {"kind":"spotGrade","spotId":"W3XYZ-1:1791719990000000000:7:960000:W1AW","call":"W1AW","band":"20m","spotTime":1791720000,"windowClose":1791720180,"windowS":180,"grade":"match","disagreements":[],"mantaFreqHz":14025100,"mantaWpm":25,"rbnModalFreqHz":14025000,"rbnMedianWpm":24.0,"rbnSkimmers":3,"rbnReports":3,"freqOffsetHz":100,"rbnBands":["20m"],"spotterFilter":[]}
@@ -253,7 +254,9 @@ total      4      1         1          1     1        0
 - `--json` prints the grade records, one per line, in the live stream's
   shape.
 - `--spotter`, `--exclude-spotter`, `--window-secs`, `--freq-tol-hz`,
-  `--speed-tol-wpm` and `--speed-tol-pct` match the config keys.
+  `--speed-tol-wpm` and `--speed-tol-pct` match the config keys, and are
+  checked the same way: a `--spotter` or `--exclude-spotter` value that is
+  not a plausible callsign is refused.
   `--config FILE` reads that file's `[rbn_compare]` tolerances, and flags
   win, so a node's own config replays with its live settings.
 - `manta grade` never reads `MANTA_*` variables. Its output depends only on

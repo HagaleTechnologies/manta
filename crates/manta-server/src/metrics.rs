@@ -2826,7 +2826,6 @@ mod tests {
         );
     }
 
-<<<<<<< HEAD
     // ---- MAN-301: manta_rbn_compare_* ----
 
     use crate::rbn_compare::grade::{Disagreement, Grade, SpotGrade};
@@ -3200,7 +3199,8 @@ mod tests {
             rbn_line_value(&text, "manta_rbn_compare_pending").as_deref(),
             Some("0")
         );
-=======
+    }
+
     #[test]
     fn history_truncation_is_counted_and_rendered() {
         let metrics = Metrics::new();
@@ -3212,6 +3212,5 @@ mod tests {
         assert!(text.contains("# HELP manta_spots_history_truncated_total Spots dropped from the sh/dx history at its 10000-spot ceiling while still inside [server].history_minutes. Non-zero means sh/dx reaches back less than the configured window.\n"));
         assert!(text.contains("# TYPE manta_spots_history_truncated_total counter\n"));
         assert!(text.contains("manta_spots_history_truncated_total 5\n"));
->>>>>>> a0d514c01ca518d421b77a5db3bf0eb0653a2543
     }
 }

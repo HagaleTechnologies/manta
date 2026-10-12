@@ -200,6 +200,24 @@ fn grade_refuses_zip_with_the_unzip_hint() {
     assert!(stderr(&out).contains(&expected), "stderr: {}", stderr(&out));
 }
 
+/// A mistyped skimmer call is refused, as `[rbn_compare].spotters` and
+/// `run --rbn-spotter` refuse it, rather than filtering out every report.
+#[test]
+fn grade_refuses_an_implausible_spotter_callsign() {
+    for flag in ["--spotter", "--exclude-spotter"] {
+        let out = grade_fixture(&["--json", flag, "K5T-R"]);
+        assert!(!out.status.success(), "{flag} K5T-R was accepted");
+        assert!(out.stdout.is_empty());
+        let err = stderr(&out);
+        assert!(err.contains(flag), "stderr: {err}");
+        assert!(err.contains("not a plausible callsign"), "stderr: {err}");
+    }
+    // A lowercase call is still accepted, and uppercased.
+    let out = grade_fixture(&["--json", "--spotter", "k5tr"]);
+    assert_success(&out);
+    assert_lines_eq(&stdout(&out), &read_fixture("expected-k5tr.jsonl"));
+}
+
 #[test]
 fn grade_errors_on_a_malformed_middle_line() {
     let dir = tempfile::tempdir().unwrap();

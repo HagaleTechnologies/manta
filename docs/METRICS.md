@@ -64,15 +64,10 @@ ignored. Any other path or any method other than `GET` gets
 
 ## Metric families
 
-<<<<<<< HEAD
-All 50 families, in the order `/metrics` renders them. Every family's
+All 51 families, in the order `/metrics` renders them. Every family's
 `# HELP` and `# TYPE` lines are always rendered, except the ten
 RBN comparison families (MAN-301) at the end of the table, which are
 rendered only when `[rbn_compare]` is enabled. "Present when" says when
-=======
-All 41 families, in the order `/metrics` renders them. Every family's
-`# HELP` and `# TYPE` lines are always rendered. "Present when" says when
->>>>>>> a0d514c01ca518d421b77a5db3bf0eb0653a2543
 the family also carries samples. Where it says a family has no samples, the
 value is absent, not zero: the node does not measure it, so do not read the
 missing series as "no loss" or "no traffic".

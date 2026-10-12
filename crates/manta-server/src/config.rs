@@ -2003,7 +2003,6 @@ mod tests {
         assert_eq!(uplink_override.effective_login_callsign("W3XYZ"), "W3XYZ-2");
     }
 
-<<<<<<< HEAD
     // ---- MAN-301: [rbn_compare]
 
     fn rbn_compare(body: &str) -> Result<RbnCompareConfig, String> {
@@ -2072,21 +2071,10 @@ mod tests {
             "feed_port = 65535",
         ] {
             assert_eq!(rbn_compare(body).unwrap().validate(), Ok(()), "{body}");
-=======
-    #[test]
-    fn history_minutes_is_optional_and_accepts_0_through_1440() {
-        assert_eq!(server_with("").history_minutes, None);
-        for minutes in [0, 30, 1440] {
-            assert_eq!(
-                server_with(&format!("history_minutes = {minutes}")).history_minutes,
-                Some(minutes)
-            );
->>>>>>> a0d514c01ca518d421b77a5db3bf0eb0653a2543
         }
     }
 
     #[test]
-<<<<<<< HEAD
     fn rbn_compare_callsigns_are_validated_and_uppercased() {
         let cfg = rbn_compare(
             "login_callsign = \"w3xyz-1\"\nspotters = [\"k5tr\"]\n\
@@ -2148,7 +2136,20 @@ mod tests {
             "[rbn_compare].spotters lists W3XYZ, this station's own callsign: its reports are \
              always excluded, so every spot would grade none"
         );
-=======
+    }
+
+    #[test]
+    fn history_minutes_is_optional_and_accepts_0_through_1440() {
+        assert_eq!(server_with("").history_minutes, None);
+        for minutes in [0, 30, 1440] {
+            assert_eq!(
+                server_with(&format!("history_minutes = {minutes}")).history_minutes,
+                Some(minutes)
+            );
+        }
+    }
+
+    #[test]
     fn history_minutes_out_of_range_is_rejected_naming_the_key() {
         for minutes in [1441, 5000] {
             let error = toml::from_str::<ServerConfig>(&format!(
@@ -2166,6 +2167,5 @@ mod tests {
             .unwrap_err();
             assert!(error.to_string().contains("history_minutes"));
         }
->>>>>>> a0d514c01ca518d421b77a5db3bf0eb0653a2543
     }
 }

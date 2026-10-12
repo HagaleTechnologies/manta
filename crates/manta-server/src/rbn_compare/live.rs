@@ -205,6 +205,14 @@ async fn run_ticks(
         tokio::select! {
             _ = shutdown.changed() => {}
             _ = interval.tick() => {
+                // `select!` picks a ready branch at random: a tick ready on
+                // the same poll as shutdown must not publish grades the JSON
+                // clients, already draining, may never send. Due spots stay
+                // pending and are counted in the stop log. A shutdown that
+                // lands after this check is not caught here.
+                if is_shutdown(&shutdown) {
+                    return;
+                }
                 let (grades, pending) = {
                     let mut g = lock(&grader);
                     let grades = g.close_due(clock());
@@ -226,5 +234,63 @@ fn emit(grades: &[SpotGrade], bus: &SpotBus, metrics: &Metrics) {
             .into();
         bus.publish_grade(line);
         metrics.record_rbn_grade(grade);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::task::Poll;
+
+    /// Polls `fut` exactly once; true when it completed.
+    async fn poll_once(mut fut: std::pin::Pin<&mut impl Future<Output = ()>>) -> bool {
+        std::future::poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx).is_ready())).await
+    }
+
+    /// Shutdown and a due tick both ready when `run_ticks` is next polled:
+    /// whichever branch `select!` picks, no grade reaches the JSON stream.
+    /// `select!` starts at a random branch, so 32 rounds all pass only if
+    /// the tick branch honours shutdown too.
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_ready_with_shutdown_publishes_no_grade() {
+        for round in 0..32 {
+            let bus = Arc::new(SpotBus::new(1.0, std::time::SystemTime::UNIX_EPOCH, 0));
+            let mut json = bus.subscribe_json();
+            let metrics = Arc::new(Metrics::new());
+            let grader: SharedGrader = Arc::new(Mutex::new(Grader::new(GradeConfig::default())));
+            let (tx, rx) = watch::channel(false);
+            let clock: Clock = Arc::new(|| 10_000);
+            let ticks = run_ticks(
+                Duration::from_secs(1),
+                Arc::clone(&grader),
+                Arc::clone(&bus),
+                metrics,
+                clock,
+                rx,
+            );
+            tokio::pin!(ticks);
+            // The interval's first tick is immediate and finds nothing due.
+            assert!(!poll_once(ticks.as_mut()).await);
+            lock(&grader).submit(GradeInput {
+                spot_id: format!("spot-{round}"),
+                call: "W1AW".into(),
+                time: 0,
+                freq_hz: 14_025_000,
+                wpm: Some(20),
+            });
+            // The next tick fires, and shutdown lands, before the next poll.
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tx.send(true).unwrap();
+            assert!(
+                poll_once(ticks.as_mut()).await,
+                "round {round}: still running"
+            );
+            assert!(
+                json.try_recv().is_err(),
+                "round {round}: a grade was published after shutdown"
+            );
+            assert_eq!(lock(&grader).pending(), 1, "round {round}");
+        }
     }
 }

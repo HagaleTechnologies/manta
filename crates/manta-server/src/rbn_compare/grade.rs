@@ -1095,6 +1095,42 @@ mod tests {
         }
     }
 
+    /// `docs/SPOT-SCHEMA.md` is the stream's field reference, so its
+    /// `spotGrade` section must list exactly the keys this record sends.
+    #[test]
+    fn every_grade_field_is_documented_in_spot_schema() {
+        let g = graded(scenario3(), true, &cfg());
+        let line = serde_json::to_string(&g).unwrap();
+        let v = serde_json::to_value(&g).unwrap();
+        let mut keys: Vec<&str> = v
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        // Wire order, whatever order the Map iterates in.
+        keys.sort_by_key(|k| line.find(&format!("\"{k}\":")).expect("key on the wire"));
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/SPOT-SCHEMA.md");
+        let schema = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("reading {path}: {e}"))
+            .replace("\r\n", "\n");
+        let (_, rest) = schema
+            .split_once("\n## `spotGrade` records\n")
+            .expect("docs/SPOT-SCHEMA.md has no `## `spotGrade` records` section");
+        let section = rest.split("\n## ").next().unwrap_or(rest);
+        let rows: Vec<&str> = section
+            .lines()
+            .filter_map(|l| l.strip_prefix("- `"))
+            .filter_map(|l| l.split_once("` ("))
+            .map(|(field, _)| field)
+            .collect();
+        assert_eq!(
+            rows, keys,
+            "docs/SPOT-SCHEMA.md's spotGrade list must name every key, in wire order"
+        );
+        assert!(section.contains(&format!("all {} keys", keys.len())));
+    }
+
     #[test]
     fn parse_spot_message_line_reads_the_wire_fields() {
         let line = r#"{"id":"W3XYZ-1:12534119743695398054:1:2006272:W1AW","source":"skimmer","timestamp":1760205620,"ingestedAt":1760205620,"frequency":14012362,"band":"20m","mode":"CW","dxCall":"W1AW","dxGrid":null,"dxLat":37.6,"dxLon":-91.87,"dxDxcc":291,"dxContinent":"NA","dxCqZone":5,"deCall":"W3XYZ-1","deGrid":null,"deLat":null,"deLon":null,"deDxcc":291,"deContinent":"NA","snr":21,"snrRefHz":2500,"wpm":20,"decodeConfidence":0.5541629,"decoderVersion":"manta-0.1.0+5346c333efd8","channelizerResolutionHz":null}"#;

@@ -239,14 +239,9 @@ impl SpotBus {
             // occurrence-based filter the live stream already honors, and
             // a spot suppressed live could leak through history replay,
             // uncounted (round-11 review finding).
-<<<<<<< HEAD
-            recent.push_back(bus_spot.clone());
-        }
-        let _ = self.json_tx.send(JsonItem::Spot(bus_spot.clone()));
-=======
             recent.push(bus_spot.clone(), self.window_samples)
         };
->>>>>>> a0d514c01ca518d421b77a5db3bf0eb0653a2543
+        let _ = self.json_tx.send(JsonItem::Spot(bus_spot.clone()));
         let _ = self.tx.send(bus_spot);
         truncated
     }

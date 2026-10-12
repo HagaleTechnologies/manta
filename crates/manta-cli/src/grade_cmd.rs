@@ -28,12 +28,12 @@ pub(crate) struct Args {
     rbn: Vec<PathBuf>,
     /// Count only this RBN skimmer's reports, for example a co-located
     /// skimmer. Repeatable. Replaces [rbn_compare].spotters from --config.
-    #[arg(long, value_name = "CALL")]
+    #[arg(long, value_name = "CALL", value_parser = parse_spotter)]
     spotter: Vec<String>,
     /// Never count this RBN skimmer's reports. Repeatable. Replaces
     /// [rbn_compare].exclude_spotters from --config. The spots' own `deCall`
     /// is always excluded, with and without its SSID.
-    #[arg(long, value_name = "CALL")]
+    #[arg(long, value_name = "CALL", value_parser = parse_spotter)]
     exclude_spotter: Vec<String>,
     /// RBN reports this many seconds either side of a spot count (30 to
     /// 3600; default 180).
@@ -59,6 +59,12 @@ pub(crate) struct Args {
     /// windowClose then spotId, instead of the summary.
     #[arg(long)]
     json: bool,
+}
+
+/// `--spotter`/`--exclude-spotter`: the same callsign rule as
+/// `[rbn_compare].spotters` and `run --rbn-spotter`.
+fn parse_spotter(s: &str) -> std::result::Result<String, String> {
+    manta_server::config::normalize_rbn_spotter(s)
 }
 
 pub(crate) fn run(args: Args) -> Result<()> {
