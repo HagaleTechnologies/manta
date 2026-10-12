@@ -304,15 +304,19 @@ pub fn decode_samples(
         .collect();
     events.extend(tm.finish());
 
-    if events.is_empty() {
+    // MAN-314: a marked RTTY signal is a finding on its own, so input with
+    // RTTY but no CW decoder output still returns a report (empty CW
+    // fields, `rtty` filled) instead of "no signal found".
+    if events.is_empty() && rtty.is_empty() {
         bail!("no signal found (input shorter than one filter length or empty)");
     }
-    let Some(min_track_id) = primary_track_id(&events) else {
+    let min_track_id = primary_track_id(&events);
+    if min_track_id.is_none() && rtty.is_empty() {
         bail!("no signal found (only detector promotion events, no decoder output)");
-    };
+    }
     let this_track: Vec<DecoderEvent> = events
         .iter()
-        .filter(|e| track::event_track_id(e) == min_track_id)
+        .filter(|e| Some(track::event_track_id(e)) == min_track_id)
         .cloned()
         .collect();
     let freq_hz = this_track

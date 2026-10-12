@@ -353,3 +353,19 @@ fn decode_report_rtty_is_empty_without_rtty() {
     .unwrap();
     assert!(report.rtty.is_empty());
 }
+
+/// A marked RTTY signal is reported even when no CW decoder ever ran: its
+/// tone runs never outlast a confirmation window no CW track can reach.
+#[test]
+fn decode_report_keeps_rtty_without_cw_output() {
+    let iq = scene(&[], &[rtty(15_000.0, 170.0, 30.0)], 4.0);
+    let mut cfg = PipelineConfig::default();
+    cfg.detector.rtty_dwell_hops = manta_dsp::fsk::BLOCK_HOPS as u64;
+    cfg.detector.confirm_hops = 1_000_000;
+    let report = decode_samples(&iq, FS, CENTER, &cfg).unwrap();
+    assert_eq!(report.rtty.len(), 1, "{:?}", report.rtty);
+    assert_eq!(report.rtty[0].shift_hz, 170.0);
+    assert!(report.text.is_empty(), "{:?}", report.text);
+    assert!(report.spots.is_empty());
+    assert_eq!(report.wpm, None);
+}

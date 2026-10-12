@@ -5664,9 +5664,16 @@ impl RttyLogState {
             keep
         });
         for s in &snapshot {
-            if let std::collections::btree_map::Entry::Vacant(slot) = self.current.entry(s.id) {
-                tracing::info!("{}", format_rtty_marked(s));
-                slot.insert((s.clone(), std::time::Instant::now()));
+            match self.current.entry(s.id) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    tracing::info!("{}", format_rtty_marked(s));
+                    slot.insert((s.clone(), std::time::Instant::now()));
+                }
+                // Still marked: keep its clear line on the current
+                // frequency and shift.
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    slot.get_mut().0 = s.clone();
+                }
             }
         }
         Some(snapshot.iter().map(|s| s.mark_hz).collect())

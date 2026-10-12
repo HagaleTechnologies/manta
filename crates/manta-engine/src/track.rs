@@ -924,7 +924,8 @@ pub struct TrackManager {
     /// MAN-314: every RTTY signal ever marked, in marking order (the
     /// oldest cleared entries are dropped past `RTTY_LOG_CAP`).
     rtty_log: Vec<RttyLogEntry>,
-    /// MAN-314: bumped whenever the marked set changes.
+    /// MAN-314: bumped whenever a block changes the marked set or a marked
+    /// signal's metadata.
     rtty_changes: u64,
 }
 
@@ -986,8 +987,9 @@ impl TrackManager {
         }
     }
 
-    /// MAN-314: how many times the marked RTTY set has changed; a
-    /// consumer re-reads `rtty_signals` when this moves.
+    /// MAN-314: how many blocks changed the marked RTTY set or a marked
+    /// signal's metadata; a consumer re-reads `rtty_signals` when this
+    /// moves.
     pub fn rtty_changes(&self) -> u64 {
         self.rtty_changes
     }

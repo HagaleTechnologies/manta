@@ -22,6 +22,20 @@ the git history and `docs/DECISIONS/`.
 
 ## [Unreleased]
 
+### Decoder output
+
+- MAN-314: RTTY (two-tone FSK, 170/200/425/450/850 Hz shift) is recognised
+  after 20 s and no CW track starts on it or its keying sidebands; open
+  tracks on it close (`rtty` close count). `[detector] rtty_filter = false`
+  restores the previous behaviour.
+
+### Added
+
+- `[detector] rtty_filter`/`rtty_dwell_ms`; `manta_rtty_signals{band}`
+  gauge; `rtty` array in `decode --json` and, when RTTY was marked, an
+  `rtty:` line in plain `decode`; `RTTY marked`/`RTTY cleared` log lines in
+  `run` (MAN-314).
+
 ## [0.1.0] - 2026-10-11
 
 Pre-stability alpha, expect breakage: manta has not cleared its own M2/M3
@@ -29,10 +43,6 @@ acceptance gates.
 
 ### Decoder output
 
-- MAN-314: RTTY (two-tone FSK, 170/200/425/450/850 Hz shift) is recognised
-  after 20 s and no CW track starts on it or its keying sidebands; open
-  tracks on it close (`rtty` close count). `[detector] rtty_filter = false`
-  restores the previous behaviour.
 - Strong signals (about +24 dB SNR or more in 2500 Hz) no longer spawn
   duplicate tracks on adjacent channels that take over their decoder every
   fraction of a second. They retain one continuous track and recover their
@@ -41,16 +51,9 @@ acceptance gates.
 
 ### Added
 
-<<<<<<< HEAD
-- `[detector] rtty_filter`/`rtty_dwell_ms`; `manta_rtty_signals{band}`
-  gauge; `rtty` array in `decode --json` and, when RTTY was marked, an
-  `rtty:` line in plain `decode`; `RTTY marked`/`RTTY cleared` log lines in
-  `run` (MAN-314).
-=======
 - Prebuilt archives for Linux (x86-64, arm64), macOS (x86-64, arm64) and
   Windows (x86-64) on each GitHub Release, with `SHA256SUMS` and a
   build-provenance attestation (MAN-298).
->>>>>>> f6a41cc0551a69e5007e7b3979643a6c4c9ecf27
 - `manta health` asks a running daemon's `/healthz` and exits 0 when it
   reports healthy, 1 otherwise, reading the metrics port from the same config
   and `MANTA_*` overrides as `run` (MAN-81).

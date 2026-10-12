@@ -54,8 +54,10 @@ pub struct ListenObservers {
     /// entirely, so `listen()`'s existing callers pay nothing.
     pub operator_lists: Option<Arc<OperatorListsUpdate>>,
     /// MAN-314: the currently marked RTTY signals (SPEC §2.6), stored
-    /// whenever the marked set changes, emptied on a segment restart, a
-    /// read error and every exit. `None` (the default) skips it entirely.
+    /// whenever the marked set or a marked signal's metadata changes (so a
+    /// store is not by itself a mark or clear), emptied on a segment
+    /// restart, a read error and every exit. `None` (the default) skips it
+    /// entirely.
     pub rtty: Option<Arc<RttyObserver>>,
 }
 

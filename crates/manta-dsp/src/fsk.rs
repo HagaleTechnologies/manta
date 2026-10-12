@@ -137,7 +137,8 @@ impl FskDetector {
 
     /// Feeds one hop (`power_db[k]` = `channelizer::power_db(hop.power[k])`,
     /// `floor` already updated with it). Returns true when a block
-    /// completed and the set of marked signal ids changed.
+    /// completed and changed the marked signals: one was marked or
+    /// cleared, or a marked one's tones, shift, level or span moved.
     pub fn push_hop(&mut self, hop: &HopOutput, power_db: &[f64], floor: &FloorBank) -> bool {
         let mut snr = std::mem::take(&mut self.snr);
         for (k, s) in snr.iter_mut().enumerate() {
@@ -343,7 +344,8 @@ impl FskDetector {
     }
 
     /// Groups marked pairs into signals, keeps ids stable, rebuilds the
-    /// hard span. Returns whether the marked id set changed.
+    /// hard span. Returns whether any marked signal was added, removed or
+    /// changed.
     fn regroup(&mut self, m: u64) -> bool {
         let n = self.n;
         let mut groups: Vec<Vec<(usize, usize)>> = Vec::new();
@@ -423,9 +425,9 @@ impl FskDetector {
                 self.hard[(j + n - n / 2) % n] = true;
             }
         }
-        let old_ids: Vec<u32> = old.iter().map(|s| s.id).collect();
-        let new_ids: Vec<u32> = self.signals.iter().map(|s| s.id).collect();
-        old_ids != new_ids
+        // A surviving id's metadata changes too (pass-averaged tones,
+        // drift), and the track manager's RTTY log must follow it.
+        old != self.signals
     }
 }
 
@@ -536,6 +538,24 @@ mod tests {
         let s = &det.signals()[0];
         assert_eq!(s.nominal_shift_hz, 170.0);
         assert_eq!(s.marked_hop, 20 * BLOCK_HOPS as u64 - 1);
+    }
+
+    #[test]
+    fn marked_signal_moving_reports_a_change() {
+        let mut det = FskDetector::new(N, 2);
+        let (m, changed) = feed_pair(&mut det, 0, 2, LOW, HIGH, "rtty");
+        assert!(changed);
+        let before = det.signals()[0].clone();
+        let (_, changed) = feed_pair(&mut det, m, 1, (20, 0.25), (22, HIGH.1 + 0.25), "rtty");
+        assert!(changed, "same id, moved tones");
+        let after = &det.signals()[0];
+        assert_eq!(after.id, before.id);
+        assert!(
+            after.low_j > before.low_j,
+            "{} vs {}",
+            after.low_j,
+            before.low_j
+        );
     }
 
     #[test]

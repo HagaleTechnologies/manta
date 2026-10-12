@@ -29,7 +29,10 @@ detector and reproduces the previous behaviour exactly. The marked set is
 exposed as:
 
 - the `rtty` array in `decode --json`, and an `rtty:` line in plain `decode`
-  when RTTY was marked (a CW-only decode keeps MAN-270's one-line summary);
+  when RTTY was marked (a CW-only decode keeps MAN-270's one-line summary;
+  a decode that marked RTTY but produced no CW decoder output still returns
+  a report instead of "no signal found": no text, speed or spots, and
+  `freq_hz` falls back to the centre frequency);
 - `RTTY marked:`/`RTTY cleared:` log lines in `run`;
 - the gauge `manta_rtty_signals{band}`, a count of marked signals per
   amateur band (`manta_server::band::band_for_freq_hz` of the mark

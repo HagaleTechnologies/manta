@@ -11,11 +11,8 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
-<<<<<<< HEAD
 | 2026-10-11 | MAN-314 | [MAN-314: RTTY recognition keeps RTTY out of CW tracks](2026-10-11-man314-rtty-recognition.md) |
-=======
 | 2026-10-11 | MAN-298 | [MAN-298: the first release (v0.1.0)](2026-10-11-man298-first-release.md) |
->>>>>>> f6a41cc0551a69e5007e7b3979643a6c4c9ecf27
 | 2026-10-11 | MAN-81 | [MAN-81: the Docker image runs a mounted config and reports its own health](2026-10-11-man81-docker-config-mount-and-healthcheck.md) |
 | 2026-10-11 | MAN-115 | [MAN-115: start-up latency before the first decode](2026-10-11-man115-startup-latency.md) |
 | 2026-10-11 | MAN-172 | [MAN-172: high-SNR track churn](2026-10-11-man172-high-snr-track-churn.md) |
