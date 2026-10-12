@@ -2672,7 +2672,10 @@ const ACTIVE_TRACKS_POLL_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// the reconnecting `read()`, so it can't publish a count itself, and the
 /// poller above would keep exporting the pre-drop tracks -- MAN-45's ghost
 /// count. `listen()` publishes the real count again after its first
-/// post-reconnect chunk.
+/// post-reconnect chunk. MAN-314: `manta_rtty_signals` is zeroed here for
+/// the same reason; it is published only from the per-batch callback,
+/// which cannot run during the outage, and the reconnect's discontinuity
+/// restarts the RTTY set that callback publishes next.
 fn source_health_sink(
     name: &'static str,
     metrics: Option<std::sync::Arc<manta_server::metrics::Metrics>>,
@@ -2682,6 +2685,9 @@ fn source_health_sink(
         if !healthy {
             if let Some(gauge) = &active_tracks {
                 gauge.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(metrics) = &metrics {
+                metrics.set_rtty_signals(&[]);
             }
         }
         if let Some(metrics) = &metrics {
@@ -4478,6 +4484,11 @@ fn run_command() -> Result<std::process::ExitCode> {
             } else {
                 println!("{}", report.text);
                 eprintln!("{}", fmt::decode_summary(&report));
+                // MAN-314: only when RTTY was marked, so a CW-only decode
+                // keeps MAN-270's one-line summary.
+                if !report.rtty.is_empty() {
+                    eprintln!("{}", rtty_line(&report.rtty, report.sample_rate_hz));
+                }
             }
         }
         Command::Oracle {
@@ -5059,6 +5070,10 @@ fn run_command() -> Result<std::process::ExitCode> {
             // asked, so its journal holds spots and diagnostics only.
             let print_text = !json && (spot_server.is_none() || decoded_text);
             let mut text_lines = text_lines::TrackLines::default();
+            // MAN-314: the engine's marked RTTY set, logged on change and
+            // copied into `manta_rtty_signals` from the per-batch callback.
+            let rtty_observer = std::sync::Arc::new(manta_engine::RttyObserver::default());
+            let mut rtty_log = RttyLogState::new(source_sample_rate_hz);
             let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
@@ -5067,6 +5082,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     active_tracks: active_tracks.clone(),
                     decode_latency: decode_latency.clone(),
                     operator_lists: reload_enabled.then(|| operator_lists.clone()),
+                    rtty: Some(rtty_observer.clone()),
                 },
                 |ev| {
                     if json {
@@ -5135,6 +5151,11 @@ fn run_command() -> Result<std::process::ExitCode> {
                 // only thing that lets the status line say "stalled"
                 // instead of republishing a frozen `tracks=N` forever.
                 |n_tracks| {
+                    if let Some(marks_hz) = rtty_log.poll(&rtty_observer) {
+                        if let Some(server) = &spot_server {
+                            server.metrics.set_rtty_signals(&marks_hz);
+                        }
+                    }
                     if let Some(server) = &spot_server {
                         server.metrics.set_active_tracks(n_tracks as u64);
                         server.metrics.record_pipeline_batch();
@@ -5247,6 +5268,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     }
                 }
                 server.metrics.set_active_tracks(0);
+                server.metrics.set_rtty_signals(&[]);
                 // Before `shutdown_tx.send(true)`, not after: ordering is
                 // what makes this observable at all (MAN-64) -- writing it
                 // after the drain would guarantee no scraper still
@@ -5779,10 +5801,159 @@ fn warn_deprecations() {
     }
 }
 
+/// MAN-314: `decode`'s RTTY summary line, `rtty: 0` without RTTY;
+/// `decode` prints it only when RTTY was marked.
+fn rtty_line(signals: &[manta_engine::RttySignalReport], fs: f64) -> String {
+    if signals.is_empty() {
+        return "rtty: 0".into();
+    }
+    let parts: Vec<String> = signals
+        .iter()
+        .map(|s| {
+            format!(
+                "{:.3} kHz shift {} Hz from {:.1} s",
+                s.mark_hz / 1000.0,
+                s.shift_hz,
+                s.marked_sample_ts as f64 / fs
+            )
+        })
+        .collect();
+    format!("rtty: {} ({})", signals.len(), parts.join("; "))
+}
+
+/// MAN-314: `run`'s log line when the detector marks an RTTY signal.
+fn format_rtty_marked(s: &manta_engine::RttySignalReport) -> String {
+    format!(
+        "RTTY marked: {:.3} kHz shift {} Hz (measured {:.1} Hz); no CW tracks there while it lasts",
+        s.mark_hz / 1000.0,
+        s.shift_hz,
+        s.measured_shift_hz
+    )
+}
+
+/// MAN-314: `run`'s log line when a marked RTTY signal clears.
+fn format_rtty_cleared(s: &manta_engine::RttySignalReport, marked_for_secs: u64) -> String {
+    format!(
+        "RTTY cleared: {:.3} kHz shift {} Hz, marked for {marked_for_secs} s",
+        s.mark_hz / 1000.0,
+        s.shift_hz
+    )
+}
+
+/// MAN-314: whole seconds of stream time from `s`'s mark to
+/// `cleared_sample_ts`, at `fs` samples per second. Stream time, not wall
+/// time: a file replay without `--realtime` runs far faster than real time
+/// (Codex review on PR #272).
+fn rtty_marked_for_secs(
+    s: &manta_engine::RttySignalReport,
+    cleared_sample_ts: u64,
+    fs: f64,
+) -> u64 {
+    (cleared_sample_ts.saturating_sub(s.marked_sample_ts) as f64 / fs) as u64
+}
+
+/// MAN-314: what `run` last saw of the engine's marked RTTY set, so a
+/// change logs one line per newly marked or cleared signal.
+struct RttyLogState {
+    /// The source's sample rate, for the engine's sample timestamps.
+    sample_rate_hz: f64,
+    generation: u64,
+    current: std::collections::BTreeMap<u32, manta_engine::RttySignalReport>,
+}
+
+impl RttyLogState {
+    fn new(sample_rate_hz: f64) -> Self {
+        Self {
+            sample_rate_hz,
+            generation: 0,
+            current: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Logs the marks and clears since the last call. Returns the current
+    /// mark frequencies when the set changed, `None` otherwise.
+    fn poll(&mut self, obs: &manta_engine::RttyObserver) -> Option<Vec<f64>> {
+        let generation = obs.generation();
+        if generation == self.generation {
+            return None;
+        }
+        self.generation = generation;
+        let (snapshot, sample_ts) = obs.snapshot_with_sample_ts();
+        let ids: Vec<u32> = snapshot.iter().map(|s| s.id).collect();
+        let fs = self.sample_rate_hz;
+        self.current.retain(|id, s| {
+            let keep = ids.contains(id);
+            if !keep {
+                let secs = rtty_marked_for_secs(s, sample_ts, fs);
+                tracing::info!("{}", format_rtty_cleared(s, secs));
+            }
+            keep
+        });
+        for s in &snapshot {
+            match self.current.entry(s.id) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    tracing::info!("{}", format_rtty_marked(s));
+                    slot.insert(s.clone());
+                }
+                // Still marked: keep its clear line on the current
+                // frequency and shift.
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    *slot.get_mut() = s.clone();
+                }
+            }
+        }
+        Some(snapshot.iter().map(|s| s.mark_hz).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn rtty_sig() -> manta_engine::RttySignalReport {
+        manta_engine::RttySignalReport {
+            mark_hz: 14_080_002.4,
+            space_hz: 14_079_832.6,
+            shift_hz: 170.0,
+            measured_shift_hz: 169.8,
+            marked_sample_ts: 2_016_000,
+            cleared_sample_ts: None,
+            id: 1,
+        }
+    }
+
+    #[test]
+    fn rtty_log_lines_match_the_design() {
+        assert_eq!(
+            format_rtty_marked(&rtty_sig()),
+            "RTTY marked: 14080.002 kHz shift 170 Hz (measured 169.8 Hz); no CW tracks there while it lasts"
+        );
+        assert_eq!(
+            format_rtty_cleared(&rtty_sig(), 446),
+            "RTTY cleared: 14080.002 kHz shift 170 Hz, marked for 446 s"
+        );
+    }
+
+    /// Codex review on PR #272: the duration is the stream time between
+    /// the engine's mark and clear timestamps, whatever the replay pace.
+    #[test]
+    fn rtty_marked_for_counts_stream_seconds() {
+        // Marked at 21.0 s, cleared 446.9 s later at 96 kHz.
+        let cleared = 2_016_000 + 42_902_400;
+        assert_eq!(rtty_marked_for_secs(&rtty_sig(), cleared, 96_000.0), 446);
+        assert_eq!(rtty_marked_for_secs(&rtty_sig(), 2_016_000, 96_000.0), 0);
+        assert_eq!(rtty_marked_for_secs(&rtty_sig(), 0, 96_000.0), 0);
+    }
+
+    #[test]
+    fn rtty_decode_line_lists_each_signal() {
+        assert_eq!(rtty_line(&[], 96_000.0), "rtty: 0");
+        assert_eq!(
+            rtty_line(&[rtty_sig()], 96_000.0),
+            "rtty: 1 (14080.002 kHz shift 170 Hz from 21.0 s)"
+        );
+    }
     // Derived from manta_spot's constant, never hardcoded, so a cty.dat refresh
     // does not break these tests.
     fn at_day(d: u64) -> SystemTime {
@@ -7613,6 +7784,33 @@ mod tests {
         assert!(metrics
             .render_prometheus_text()
             .contains(r#"manta_source_health{source="kiwi"} 0"#));
+    }
+
+    /// MAN-314: `manta_rtty_signals` is published only from the per-batch
+    /// callback, which cannot run while `listen()` is blocked in the
+    /// reconnecting `read()`, so the unhealthy transition must zero it or
+    /// it exports the pre-outage RTTY counts for the whole outage.
+    #[test]
+    fn source_health_sink_zeroes_rtty_signals_when_the_source_goes_unhealthy() {
+        use std::sync::Arc;
+
+        let metrics = Arc::new(manta_server::metrics::Metrics::new());
+        metrics.set_rtty_signals(&[14_080_000.0, 14_086_000.0]);
+        let mut sink = source_health_sink("kiwi", Some(metrics.clone()), None);
+
+        sink(true);
+        assert!(
+            metrics
+                .render_prometheus_text()
+                .contains(r#"manta_rtty_signals{band="20m"} 2"#),
+            "a healthy report leaves the marked RTTY set alone"
+        );
+        sink(false);
+        let text = metrics.render_prometheus_text();
+        assert!(
+            text.contains(r#"manta_rtty_signals{band="20m"} 0"#),
+            "an unhealthy source has no marked RTTY signals: {text}"
+        );
     }
 
     /// MAN-96: a reconnecting source's healthy -> unhealthy -> healthy

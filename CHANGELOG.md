@@ -22,6 +22,20 @@ the git history and `docs/DECISIONS/`.
 
 ## [Unreleased]
 
+### Decoder output
+
+- MAN-314: RTTY (two-tone FSK, 170/200/425/450/850 Hz shift) is recognised
+  after 20 s and no CW track starts on it or its keying sidebands; open
+  tracks on it close (`rtty` close count). `[detector] rtty_filter = false`
+  restores the previous behaviour.
+
+### Added
+
+- `[detector] rtty_filter`/`rtty_dwell_ms`; `manta_rtty_signals{band}`
+  gauge; `rtty` array in `decode --json` and, when RTTY was marked, an
+  `rtty:` line in plain `decode`; `RTTY marked`/`RTTY cleared` log lines in
+  `run` (MAN-314).
+
 ## [0.1.0] - 2026-10-11
 
 Pre-stability alpha, expect breakage: manta has not cleared its own M2/M3

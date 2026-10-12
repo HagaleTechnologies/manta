@@ -488,6 +488,11 @@ pub struct Metrics {
     json_clients: AtomicI64,
     ws_clients: AtomicI64,
     active_tracks: AtomicU64,
+    /// MAN-314: `manta_rtty_signals{band}` -- RTTY signals the engine's
+    /// detector currently marks, by amateur band. A band's series appears
+    /// at its first mark and stays (at 0) after its signals clear; bounded
+    /// by the fixed `band::BANDS_HZ` table plus `"unknown"`.
+    rtty_by_band: Mutex<BTreeMap<&'static str, u64>>,
     /// Monotonic count of batches the decode pipeline has processed, bumped
     /// once per pipeline batch by the daemon wiring layer (MAN-122 review
     /// round 2). Its VALUE is meaningless to an operator; what matters is
@@ -970,6 +975,20 @@ impl Metrics {
         self.active_tracks.store(count, Ordering::Relaxed);
     }
 
+    /// MAN-314: the engine's currently marked RTTY signals, by mark
+    /// frequency in Hz. Replaces the previous set: every existing band
+    /// series drops to 0 first, then each mark counts toward its band.
+    /// `&[]` zeroes the family (outage, shutdown).
+    pub fn set_rtty_signals(&self, marks_hz: &[f64]) {
+        let mut by_band = self.rtty_by_band.lock().unwrap_or_else(|e| e.into_inner());
+        by_band.values_mut().for_each(|v| *v = 0);
+        for &hz in marks_hz {
+            *by_band
+                .entry(crate::band::band_for_freq_hz(hz.round()))
+                .or_insert(0) += 1;
+        }
+    }
+
     /// Live-state getters for MAN-122's periodic status line. `Metrics` is
     /// already the daemon's one shared, synchronously-readable handle on live
     /// state (every subsystem holds an `Arc` clone of it), so the status task
@@ -1438,6 +1457,19 @@ impl Metrics {
         ));
 
         out.push_str(
+            "# HELP manta_rtty_signals RTTY (two-tone FSK) signals currently marked by the detector, by amateur band; no CW tracks start on them.\n",
+        );
+        out.push_str("# TYPE manta_rtty_signals gauge\n");
+        for (band, count) in self
+            .rtty_by_band
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            out.push_str(&format!("manta_rtty_signals{{band=\"{band}\"}} {count}\n"));
+        }
+
+        out.push_str(
             "# HELP manta_source_health Per-input-source health (1 = healthy, 0 = unhealthy).\n",
         );
         out.push_str("# TYPE manta_source_health gauge\n");
@@ -1893,6 +1925,33 @@ mod tests {
         m.record_spot(&spot(13_999_999.6, SpotType::Cq)); // rounds to 14_000_000.0
         let text = m.render_prometheus_text();
         assert!(text.contains(r#"manta_spots_by_band_total{band="20m",type="cq"} 1"#));
+    }
+
+    #[test]
+    fn rtty_signals_render_per_band() {
+        let m = Metrics::new();
+        m.set_rtty_signals(&[14_080_002.4, 14_086_002.3, 7_045_000.0]);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# HELP manta_rtty_signals RTTY (two-tone FSK) signals"));
+        assert!(text.contains("# TYPE manta_rtty_signals gauge"));
+        assert!(text.contains(r#"manta_rtty_signals{band="20m"} 2"#));
+        assert!(text.contains(r#"manta_rtty_signals{band="40m"} 1"#));
+    }
+
+    #[test]
+    fn rtty_band_series_stays_at_zero_after_clear() {
+        let m = Metrics::new();
+        m.set_rtty_signals(&[14_080_002.4]);
+        m.set_rtty_signals(&[]);
+        let text = m.render_prometheus_text();
+        assert!(text.contains(r#"manta_rtty_signals{band="20m"} 0"#));
+    }
+
+    #[test]
+    fn no_rtty_samples_before_first_mark() {
+        let text = Metrics::new().render_prometheus_text();
+        assert!(text.contains("# TYPE manta_rtty_signals gauge"));
+        assert!(!text.contains("manta_rtty_signals{"));
     }
 
     #[test]

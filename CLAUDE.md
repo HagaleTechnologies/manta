@@ -147,6 +147,12 @@ MAN-127: `manta calibrate` measures the receiver's ppm offset against a
 known carrier and saves `[input].freq_correction_ppm` after confirmation —
 see docs/DECISIONS/2026-10-11-man127-calibrate-command.md.
 
+MAN-314: RTTY (two-tone FSK) is recognised after `[detector] rtty_dwell_ms`
+(20 s) and starts no CW track on its tones or keying sidebands
+(`manta-dsp::fsk`, SPEC §2.6); `decode --json` gains `rtty`, `run` logs
+marks/clears and `/metrics` gains `manta_rtty_signals{band}`. See
+docs/DECISIONS/2026-10-11-man314-rtty-recognition.md.
+
 MAN-301: `[rbn_compare]` (off by default, needs `[server]`) reads RBN's
 CW telnet feed read-only (login callsign only) and grades each spot
 `match`/`disagree`/`elsewhere`/`none`/`unknown` after a 180 s window, as a

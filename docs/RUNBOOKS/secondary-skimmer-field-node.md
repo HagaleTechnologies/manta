@@ -528,3 +528,8 @@ On FAIL, the report records why. Fix the cause and restart from Stage 2 with a n
   [the MAN-86 record](../DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md)).
 - **`/healthz` says `unhealthy`.** The per-check lines say which source, listener or decode check
   failed; [node-health.md](node-health.md) explains each.
+- **`manta_rtty_signals` stays above 0.** That is normal while the passband covers an RTTY
+  segment: the detector has marked those signals and starts no CW track on them
+  ([the MAN-314 record](../DECISIONS/2026-10-11-man314-rtty-recognition.md)). It covers
+  two-tone FSK only: FT8 around 14074–14077 kHz is *not* recognised and still produces CW
+  tracks that decode garbage.

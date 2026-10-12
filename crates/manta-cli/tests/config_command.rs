@@ -213,6 +213,16 @@ fn check_rejects_out_of_range_values_naming_the_key() {
     }
 }
 
+/// MAN-314: an RTTY dwell shorter than one detector block is refused.
+#[test]
+fn check_rejects_an_rtty_dwell_below_one_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cfg(dir.path(), "bad.toml", "[detector]\nrtty_dwell_ms = 500\n");
+    let err = fails(&check_file(&path));
+    assert!(err.contains("detector.rtty_dwell_ms"), "{err}");
+    assert!(err.contains("at least 1000"), "{err}");
+}
+
 #[test]
 fn check_with_no_flag_reads_manta_toml_in_the_current_directory() {
     let dir = tempfile::tempdir().unwrap();

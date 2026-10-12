@@ -244,6 +244,8 @@ milliseconds, 0 to 3600000.
 | `warmup_ms` | `25.0` | live | Start-up time spent measuring the noise; no track opens before it ends. 0 to 3600000 (1 h); 0 means no warmup. |
 | `track_cap` | `1200` | live | Most tracks open at once, counting unconfirmed candidates that have no decoder yet; past it the lowest-SNR track is evicted. At least 1. |
 | `silent_respawn_cooldown_ms` | `30000.0` | live | Wait before a channel whose track went silent may start another. 0 to 3600000 (1 h); 0 means no cooldown. |
+| `rtty_filter` | `true` | live | Recognise RTTY (two-tone FSK) signals and start no CW track on them or their keying sidebands; `false` restores the previous behaviour. See [SPEC §2.6](SPEC-decode-core.md#26-two-tone-fsk-rtty-recognition) and [MAN-314](DECISIONS/2026-10-11-man314-rtty-recognition.md). |
+| `rtty_dwell_ms` | `20000.0` | live | How long an FSK signal must last before it is marked as RTTY; 1000 to 3600000 (1 h), counted in whole 1000 ms detector blocks. |
 
 ## [decode]
 
