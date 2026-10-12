@@ -509,7 +509,7 @@ the first sample sets `mean = x`, `var = 0`.
 | dot / dash | the marks of a character decoded as a plain `Char` whose pattern has as many elements as there were marks, labelled by that pattern; garbles, prosigns and length mismatches feed nothing |
 | element gap | gaps classified inter-element (§4.2), live and replayed |
 | char gap | closed gaps classified inter-character |
-| word gap | closed gaps classified inter-word, and flushed gaps at their closed length (flush length + the space that follows); a gap ≥ `max(15, 4·char-gap mean)` dits is a pause and is not learned |
+| word gap | closed gaps classified inter-word, and flushed gaps at their closed length (flush length + the space that follows, or the flush length alone when the next mark absorbs a remainder shorter than the demod's debounce window); a gap ≥ `max(15, 4·char-gap mean)` dits is a pause and is not learned |
 
 Uses: §4.1's ratio re-anchor target and §4.2's sender word boundary.
 MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses) read the means
@@ -820,8 +820,8 @@ TimingUpdate   { track_id, sample_ts: u64, dit_ms: f32, dot, dash, element_gap,
 ```
 
 `manta decode --json` also reports the primary track's last `TimingUpdate`
-(without `track_id`/`sample_ts`) as the top-level `timing`, and plain
-`manta decode` prints it on stderr as
+(without `track_id`/`sample_ts`) as the top-level `timing`, and
+`manta decode --timing` prints it on stderr, after the summary line, as
 `timing (dits, mean ± sd): dot … dash … element gap … char gap … word gap …`.
 
 `TrackMeta.snr_2500_db` is §2.3's floor-based `S − F` estimate (peak-held

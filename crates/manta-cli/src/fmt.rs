@@ -97,6 +97,7 @@ mod tests {
             text: String::new(),
             events: Vec::new(),
             spots: Vec::new(),
+            timing: None,
         };
         assert_eq!(
             decode_summary(&report),

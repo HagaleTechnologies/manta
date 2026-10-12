@@ -13,8 +13,10 @@ each track's sender timing instead of assuming 1 / 3 / 1 / 3 / 7:
    variance in dits of `dit_estimate_ms` with an observation count. One per
    `TrackDecoder`. Marks are labelled by the decoded character's pattern;
    gaps by their classification; flushed word gaps enter at their closed
-   length; a word gap of `max(15, 4 × char gap)` dits or more is a pause and
-   is not learned. A drift re-init resets it.
+   length, or at the flush length when the next mark absorbs a remainder
+   shorter than the demod's debounce window; a word gap of
+   `max(15, 4 × char gap)` dits or more is a pause and is not learned. A
+   drift re-init resets it.
 2. **Gap unit** (D3): every gap that meets `GapClassifier` (classify, the
    safety-net flush threshold, the Farnsworth flushed-gap folds) is measured
    in `dit_estimate_ms`, the symmetric mark/gap period, not `mu_dit_ms`.
@@ -27,8 +29,10 @@ each track's sender timing instead of assuming 1 / 3 / 1 / 3 / 7:
    classes have 3 observations).
 5. **Diagnostics** (D8): a `TimingUpdate` decoder event per track on the
    `TrackMeta` cadence when a class gained an observation, plus once at
-   finish; `manta decode --json` adds top-level `timing`; plain `manta
-   decode` prints a `timing (dits, mean ± sd): …` stderr line.
+   finish; `manta decode --json` adds top-level `timing`; `manta decode
+   --timing` prints a `timing (dits, mean ± sd): …` stderr line after the
+   summary. It is opt-in so that plain `decode`'s stderr stays MAN-270's
+   single summary line.
 6. **Testkit and vectors** (D9, D10): `KeyerSpec`/`SignalSpec` gain
    `dit_units` and `element_gap_units` (1.0 everywhere before, V1 renders
    bit-identically: `existing_vectors_render_unchanged`); VW1–VW5 in
@@ -117,7 +121,8 @@ hsmm`): see Implementation verification.
   `drift_reinit_bumps_the_regime`, `timing_estimates_display_line`.
 - `crates/manta-decode/src/decoder.rs`: `sender_timing_reset_on_drift_reinit`,
   `noise_seeded_scale_recovers_within_three_callsigns`,
-  `legacy_emits_timing_update_after_meta_tick`, `hsmm_emits_no_timing_update`.
+  `legacy_emits_timing_update_after_meta_tick`, `hsmm_emits_no_timing_update`,
+  `flushed_word_gap_closed_by_the_next_mark_is_learned`.
 - `crates/manta-decode/src/events.rs`: `timing_update_json_shape`,
   `timing_update_roundtrips`.
 - `crates/manta-testkit/tests/roundtrip_envelope.rs`: the table above.

@@ -134,7 +134,9 @@ pub struct TrackDecoder {
     sender: SenderTiming,
     /// Set by `check_flush`/`check_flush_edge` to the flushed gap's length
     /// so far, in ms; the remainder arrives as the space run `process_run`
-    /// skips, and the sum is the word gap's closed length (MAN-315 D2).
+    /// skips, and the sum is the word gap's closed length (MAN-315 D2). A
+    /// remainder under the debounce window has no run of its own: the next
+    /// mark absorbs it and this length alone is learned.
     flushed_gap_ms: Option<f32>,
     /// The `SpeedTracker::regime` `sender` was learned in (MAN-315 D7).
     sender_regime: u32,
@@ -737,9 +739,13 @@ impl TrackDecoder {
     fn process_run(&mut self, run: Run, live: bool, events: &mut Vec<DecoderEvent>) {
         let dur_ms = run.hops as f32 * HOP_MS as f32;
         if run.mark {
-            // A flushed gap whose space closed without a separate remainder
-            // run: its closed length is unknown, so it teaches nothing.
-            self.flushed_gap_ms = None;
+            // A flushed gap this mark closed without a separate remainder
+            // run: the demod folded a remainder shorter than its debounce
+            // window into this mark, so the length at the flush is the
+            // closed length, short by less than that window (MAN-315 D2).
+            if let Some(flushed_ms) = self.flushed_gap_ms.take() {
+                self.observe_gap(GapClass::InterWord, flushed_ms);
+            }
             if live {
                 self.tracker.on_mark(dur_ms);
                 self.sync_sender_regime();
@@ -2332,6 +2338,24 @@ mod tests {
         let wg = last_timing(&events).unwrap().word_gap.unwrap();
         assert!((wg.mean_dits - 7.0).abs() < 0.1, "{wg:?}");
         assert!(wg.var_dits2 < 0.01, "{wg:?}");
+    }
+
+    /// MAN-315 D2: a word gap the safety flush resolves still teaches the
+    /// sender's word gap when the next mark starts within the demod's
+    /// debounce window of the flush, so no separate remainder space run
+    /// closes it. 7.1-dit gaps cross the 7-dit flush 2 hops before the mark,
+    /// which absorbs that sub-debounce remainder.
+    #[test]
+    fn flushed_word_gap_closed_by_the_next_mark_is_learned() {
+        let env = weighted_envelope("CQ TEST W1AW TEST DE", 18, 3.0, 3.0, 7.1);
+        let events = decode_events(Engine::Legacy, &env);
+        assert_eq!(events_to_text(&events), "CQ TEST W1AW TEST DE");
+        let wg = last_timing(&events)
+            .unwrap()
+            .word_gap
+            .expect("no word gap learned");
+        assert_eq!(wg.n, 4, "{wg:?}");
+        assert!((wg.mean_dits - 7.1).abs() < 0.3, "{wg:?}");
     }
 
     #[test]

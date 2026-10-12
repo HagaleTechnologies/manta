@@ -242,9 +242,10 @@ fn gen_then_decode_prints_text() {
     );
 }
 
-/// MAN-315 scenario 3: `manta decode` prints the primary track's learned
-/// sender timing on stderr, after `freq_hz`; stdout stays the decoded text
-/// alone. With `--json`, the report's top-level `timing` carries it.
+/// MAN-315 scenario 3: `manta decode --timing` prints the primary track's
+/// learned sender timing on stderr, after the summary line; stdout stays the
+/// decoded text alone, and without `--timing` stderr is the summary alone
+/// (MAN-270). With `--json`, the report's top-level `timing` carries it.
 #[test]
 fn decode_prints_timing_line_for_primary_track() {
     let dir = tempfile::tempdir().unwrap();
@@ -258,20 +259,32 @@ fn decode_prints_timing_line_for_primary_track() {
     let out = manta().arg("decode").arg(&wav).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stderr: {stderr}");
+    assert!(!stderr.contains("timing"), "stderr: {stderr}");
+
+    let out = manta()
+        .args(["decode", "--timing"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert_eq!(stdout.lines().count(), 1, "stdout: {stdout:?}");
     assert!(!stdout.contains("timing"), "stdout: {stdout:?}");
     let lines: Vec<&str> = stderr.lines().collect();
-    let freq = lines
+    let summary = lines
         .iter()
-        .position(|l| l.starts_with("freq_hz: "))
-        .expect("no freq_hz line");
+        .position(|l| l.starts_with("frequency: "))
+        .expect("no summary line");
+    assert_eq!(lines.len(), summary + 2, "stderr: {stderr}");
     assert!(
-        lines[freq + 1].starts_with("timing (dits, mean ± sd): dot "),
+        lines[summary + 1].starts_with("timing (dits, mean ± sd): dot "),
         "stderr: {stderr}"
     );
-    assert!(lines[freq + 1].contains("  word gap "), "stderr: {stderr}");
-    assert!(lines[freq + 2].starts_with("spots: "), "stderr: {stderr}");
+    assert!(
+        lines[summary + 1].contains("  word gap "),
+        "stderr: {stderr}"
+    );
 
     let out = manta()
         .args(["decode", "--json"])

@@ -136,11 +136,11 @@ see docs/DECISIONS/2026-10-11-man127-calibrate-command.md.
 
 MAN-315: the legacy decoder learns per-track dot/dash/gap timing
 (`SenderTiming`, SPEC §4.1b; `TimingUpdate` event, `decode --json`
-`timing`, a `decode` stderr line); gaps are measured in the symmetric dit
-(`dit_estimate_ms`), the word boundary is the sender's own, and the dash/dot
-ceiling is 6.0. VW1–VW5 (SPEC §7.2, `golden_vw.rs`) pass. Open: MAN-111
-(scored boundaries) and MAN-113 (WPM hypotheses; the planned dash re-split
-was dropped after a bogus V8w spot). See
+`timing`, a `decode --timing` stderr line); gaps are measured in the
+symmetric dit (`dit_estimate_ms`), the word boundary is the sender's own,
+and the dash/dot ceiling is 6.0. VW1–VW5 (SPEC §7.2, `golden_vw.rs`)
+pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
+planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
 ## Documents (read in this order)

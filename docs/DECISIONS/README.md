@@ -11,6 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-11 | MAN-315 | [MAN-315: per-sender dot, dash and gap timing in the legacy decoder](2026-10-11-man315-sender-timing.md) |
 | 2026-10-11 | MAN-81 | [MAN-81: the Docker image runs a mounted config and reports its own health](2026-10-11-man81-docker-config-mount-and-healthcheck.md) |
 | 2026-10-11 | MAN-115 | [MAN-115: start-up latency before the first decode](2026-10-11-man115-startup-latency.md) |
 | 2026-10-11 | MAN-172 | [MAN-172: high-SNR track churn](2026-10-11-man172-high-snr-track-churn.md) |
