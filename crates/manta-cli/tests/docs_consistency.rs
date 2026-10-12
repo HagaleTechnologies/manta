@@ -1250,6 +1250,70 @@ fn architecture_logging_bullet_is_current() {
     );
 }
 
+/// MAN-81: an operator reading the Docker docs learns that a bare
+/// `docker run` runs a mounted config, that the image reports health through
+/// `manta health`, and how to turn the check off.
+#[test]
+fn docker_docs_describe_the_bare_run_and_the_health_check() {
+    let norm = |s: &str| squash_whitespace(s).to_lowercase();
+    let guide = doc("packaging/README.md");
+    let docker = norm(section(&guide, "Docker Compose"));
+    for needle in [
+        "/etc/manta/manta.toml",
+        "manta health",
+        "--no-healthcheck",
+        "--mount",
+    ] {
+        assert!(
+            docker.contains(needle),
+            "packaging/README.md's Docker section never says {needle:?}"
+        );
+    }
+    let runbook = norm(&doc("docs/RUNBOOKS/node-health.md"));
+    for needle in ["manta health", "healthcheck"] {
+        assert!(
+            runbook.contains(needle),
+            "docs/RUNBOOKS/node-health.md never says {needle:?}"
+        );
+    }
+    assert!(
+        norm(&doc("README.md")).contains("manta health"),
+        "README.md never says manta health"
+    );
+}
+
+/// MAN-81: no command line in packaging/README.md's ```sh blocks ends in a
+/// `\` continuation. scripts/tests/test_packaging.py's `sh_blocks` runs
+/// `shlex.split` on each of those lines on its own, which fails on an
+/// unescaped trailing `\` (`No escaped character`), and that test only runs
+/// in CI, not in `cargo test`. Fences, blank lines and comment lines are
+/// read the way `sh_blocks` reads them.
+#[test]
+fn packaging_readme_sh_blocks_have_no_line_continuations() {
+    let guide = doc("packaging/README.md");
+    let mut inside = false;
+    let mut checked = 0;
+    for line in guide.lines() {
+        if inside && line == "```" {
+            inside = false;
+        } else if !inside && line == "```sh" {
+            inside = true;
+        } else if inside {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let trailing = line.len() - line.trim_end_matches('\\').len();
+            assert!(
+                trailing.is_multiple_of(2),
+                "packaging/README.md: a ```sh line continues onto the next: {line}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no ```sh commands in packaging/README.md");
+}
+
 // ---- MAN-149: the reference docs and indexes cover everything they list ----
 
 const CONFIG_REF: &str = "docs/CONFIG.md";
@@ -1297,6 +1361,59 @@ fn config_reference_names_status_as_a_server_reader() {
         intro.contains("with neither it dials `127.0.0.1:7302`"),
         "{CONFIG_REF} [server] must say `status` without a config file dials the default"
     );
+}
+
+/// MAN-81 PR #257 review: health_cmd::probe loads [server] through the same
+/// daemon_server_config as `status`, so the reference must name `health`
+/// wherever it names `status` as a reader of the metrics keys -- and say
+/// that a resolved config with no [server] table is an error for it.
+#[test]
+fn config_reference_names_health_as_a_server_reader() {
+    let md = doc(CONFIG_REF);
+    let precedence = squash_whitespace(section(&md, "Precedence"));
+    assert!(
+        precedence
+            .contains("`status`, `health` and `config check` read the path from `MANTA_CONFIG`"),
+        "{CONFIG_REF} Precedence must list `health` among the MANTA_CONFIG readers"
+    );
+    let matrix = backticked_rows(section(&md, "Which commands read which tables"));
+    let row = matrix
+        .iter()
+        .find(|r| r[0] == "`health`")
+        .unwrap_or_else(|| panic!("{CONFIG_REF} command matrix has no `health` row"));
+    assert!(
+        row[1].contains("`metrics_bind_addr` and `metrics_port`"),
+        "{CONFIG_REF} `health` row must name metrics_bind_addr and metrics_port"
+    );
+    assert!(
+        row[1].contains("resolves to no `[server]` table is an error"),
+        "{CONFIG_REF} `health` row must say a config with no [server] table is an error"
+    );
+    assert!(
+        row[2].contains("`MANTA_SERVER_*` only alongside a config file"),
+        "{CONFIG_REF} `health` row must say MANTA_SERVER_* needs a config file"
+    );
+    let server = section(&md, "[server]");
+    let intro = squash_whitespace(&server[..server.find("\n|").unwrap_or(server.len())]);
+    assert!(
+        intro.contains("`health` reads the same two keys"),
+        "{CONFIG_REF} [server] must say `health` reads metrics_bind_addr and metrics_port"
+    );
+    assert!(
+        intro.contains("exits 1 when the named file plus overrides resolve to no `[server]` table"),
+        "{CONFIG_REF} [server] must say `health` rejects a config with no [server] table"
+    );
+    let rows = backticked_rows(server);
+    for key in ["metrics_bind_addr", "metrics_port"] {
+        let row = rows
+            .iter()
+            .find(|r| r[0] == format!("`{key}`"))
+            .unwrap_or_else(|| panic!("{CONFIG_REF} [server] has no `{key}` row"));
+        assert!(
+            row[2].contains("`health`"),
+            "{CONFIG_REF} [server] `{key}`'s Wired cell must name `health`"
+        );
+    }
 }
 
 /// MAN-149 PR #251 review: config::load joins a relative path to the

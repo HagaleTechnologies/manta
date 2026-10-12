@@ -8,3 +8,7 @@ thoughts
 *.md
 !README.md
 docs
+# MAN-81: an operator's own config (possibly holding a receiver password),
+# created in the checkout by the Compose guide, must not be copied into the
+# builder layer by the Dockerfile's `COPY . .`.
+manta.toml

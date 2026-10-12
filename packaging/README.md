@@ -358,8 +358,59 @@ is invalid.
   and keeps 3 files (`max-size: "10m"`, `max-file: "3"`), about 30 MB in
   all. `RUST_LOG=info` sets the log level. For JSON log lines, append
   `"--log-format", "json"` to `command:`.
+- **Health.** The image carries a `HEALTHCHECK` that runs
+  `manta health --config "${MANTA_CONFIG:-/etc/manta/manta.toml}"` inside
+  the container every 10 seconds. `manta health` reads the same config the
+  daemon runs, with the same `MANTA_SERVER_*` overrides, asks the daemon's
+  own `/healthz`, and exits 0 or 1. It re-reads `manta.toml` at every check,
+  and `metrics_port` and `metrics_bind_addr` take effect only after a
+  restart, so restart the container after editing them; until then the
+  check dials the new address, where the daemon may not be listening. An
+  edit after which `manta.toml` no longer loads, or has no `[server]`
+  table, also fails the check until it is fixed. `docker ps` shows
+  `(health: starting)` for up to 60 seconds after start (long enough for a
+  KiwiSDR to connect), then `(healthy)`, or `(unhealthy)` after three
+  failed checks in a row.
+  `docker inspect --format '{{json .State.Health.Log}}' <container>` shows
+  the daemon's own reasons, such as `decode: stalled 12s`. The check runs
+  inside the container, so `metrics_bind_addr` can stay `127.0.0.1`; it
+  costs 6 of the metrics listener's 60 requests a minute per address. The
+  RBN uplink is not part of the verdict: `manta status` reports it. A
+  container started for something other than the daemon (`decode`, or
+  `listen` without a config) has nothing to probe and shows `(unhealthy)`.
+  Turn the check off for those with `docker run --no-healthcheck`, or with
+  `healthcheck: disable: true` under the service in Compose.
 - **Not enabled.** No device passthrough, privileged mode or host
   networking: use a network receiver.
+
+### Without Compose
+
+With no arguments, the image runs the daemon from a config mounted at
+`/etc/manta/manta.toml`:
+
+```sh
+docker run -d --name manta --restart unless-stopped --stop-timeout 60 --mount type=bind,src="$PWD/manta.toml",dst=/etc/manta/manta.toml,readonly -p 7300:7300 -p 7301:7301 ghcr.io/hagaletechnologies/manta:latest
+docker logs -f manta
+docker ps    # STATUS shows (healthy) once the daemon answers
+```
+
+- Use `--mount`, not `-v`. When `manta.toml` is missing on the host,
+  `--mount` refuses to start the container. `-v` creates an empty
+  directory in its place instead, which manta then reports as
+  `Is a directory (os error 21)` and exits.
+- `--stop-timeout 60` gives manta's 50-second client drain time to finish
+  before Docker's SIGKILL, as `stop_grace_period` does in Compose.
+- To mount the config somewhere else, also set `MANTA_CONFIG` to that
+  path (`-e MANTA_CONFIG=/config/manta.toml`): the daemon and the health
+  check both read it. Passing `run --config <path>` as arguments works for
+  the daemon, but the health check still reads `/etc/manta/manta.toml`.
+- With no config mounted and no `MANTA_CONFIG`, the container prints
+  `manta --help` and exits 0. Any arguments run `manta <arguments>`
+  unchanged, for example
+  `docker run --rm ghcr.io/hagaletechnologies/manta:latest --version`.
+- The image is built for `linux/amd64`, `linux/arm64` and `linux/arm/v7`
+  (32-bit Raspberry Pi OS). The `linux/arm/v7` image's decode CPU budget
+  is unmeasured.
 
 ## Windows
 

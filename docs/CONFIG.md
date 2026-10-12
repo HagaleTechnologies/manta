@@ -25,10 +25,11 @@ A value comes from the first of these that sets it:
 4. the built-in default.
 
 `--config FILE` names the file. Without it, `run`, `soak`, `doctor`, `check`,
-`status` and `config check` read the path from `MANTA_CONFIG`. The same six
-commands apply the `MANTA_*` variables. `decode`, `oracle` and
-`bench sensitivity` read only the file `--config` names and never the
-environment, so their output does not depend on it. `[[rbn_uplink]]` cannot be
+`status`, `health` and `config check` read the path from `MANTA_CONFIG`. The
+same seven commands apply the `MANTA_*` variables, though `status` and `health`
+apply them only when `--config` or `MANTA_CONFIG` names a file. `decode`,
+`oracle` and `bench sensitivity` read only the file `--config` names and never
+the environment, so their output does not depend on it. `[[rbn_uplink]]` cannot be
 set from the environment. An unknown table, key or `MANTA_*` variable is an
 error that names it; `MANTA_GIT_SHA` and `MANTA_FEATURES` are build-time
 variables and are skipped at run time.
@@ -58,6 +59,7 @@ listed here change what the command does.
 | `config check` | all six, resolved exactly as `run` resolves them | yes |
 | `check` | `[input]`: the source, `capture_rate_hz` and `center_freq_hz` | yes |
 | `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes, but `MANTA_SERVER_*` only alongside a config file |
+| `health` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon's `/healthz`; a named config that resolves to no `[server]` table is an error | yes, but `MANTA_SERVER_*` only alongside a config file |
 | `decode` | `[decode]` `[detector]` `[spot]` and `input.freq_correction_ppm` | no |
 | `oracle` | `[decode]` | no |
 | `bench sensitivity` | `[decode]` `[detector]` | no |
@@ -119,7 +121,10 @@ the table to check that each listener's address and port can bind right now
 and that `station_callsign` is not the example `N0CALL`. `status` reads
 `metrics_bind_addr` and `metrics_port` to find a running daemon, from the file
 `--config` or `MANTA_CONFIG` names plus any `MANTA_SERVER_*` overrides; with
-neither it dials `127.0.0.1:7302`. The table needs `station_callsign`.
+neither it dials `127.0.0.1:7302`. `health` reads the same two keys the same
+way to probe `/healthz`, but exits 1 when the named file plus overrides resolve
+to no `[server]` table, since `run` then serves no `/healthz`. `--addr` skips
+the config for both. The table needs `station_callsign`.
 
 | Key | Default | Wired | Notes |
 |---|---|---|---|
@@ -130,10 +135,10 @@ neither it dials `127.0.0.1:7302`. The table needs `station_callsign`.
 | `operator_lat` | none; example `43.9375`; unset with no `operator_grid` sends `deLat` as `null` | live: `run` with `[server]` | Station latitude for JSON spots' `deLat`, decimal degrees, -90 to 90, south negative. Set with `operator_lon` or not at all; alongside `operator_grid` the point must lie inside that square, or config loading fails. See [DECISIONS/2026-10-11-man138-station-location.md](DECISIONS/2026-10-11-man138-station-location.md). |
 | `operator_lon` | none; example `-79.4583`; unset with no `operator_grid` sends `deLon` as `null` | live: `run` with `[server]` | Station longitude for JSON spots' `deLon`, decimal degrees, -180 to 180, west negative. Same pair and inside-the-grid rules as `operator_lat`. |
 | `bind_addr` | `"0.0.0.0"` | live: `run` with `[server]` | Address the telnet and JSON servers listen on; it does not move the metrics listener. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
-| `metrics_bind_addr` | `"127.0.0.1"` | live: `run` with `[server]`, and `status` | Address of `/metrics` and `/healthz`, which have no password. See [DECISIONS/2026-10-08-man132-metrics-loopback-bind.md](DECISIONS/2026-10-08-man132-metrics-loopback-bind.md). |
+| `metrics_bind_addr` | `"127.0.0.1"` | live: `run` with `[server]`, `status` and `health` | Address of `/metrics` and `/healthz`, which have no password. See [DECISIONS/2026-10-08-man132-metrics-loopback-bind.md](DECISIONS/2026-10-08-man132-metrics-loopback-bind.md). |
 | `telnet_port` | `7300` | live: `run` with `[server]` | DX-cluster telnet port. |
 | `json_port` | `7301` | live: `run` with `[server]` | JSON Lines and WebSocket spot stream; both share this port. |
-| `metrics_port` | `7302` | live: `run` with `[server]`, and `status` | Prometheus metrics port; `manta status` dials it when given `--config`. |
+| `metrics_port` | `7302` | live: `run` with `[server]`, `status` and `health` | Prometheus metrics port; `manta status` and `manta health` dial it when given `--config` or `MANTA_CONFIG`. |
 | `line_format` | `"rbn"` | live: `run` with `[server]` | Telnet spot-line layout, `"rbn"` or `"skimmer"`. The uplink always sends the `"rbn"` layout. |
 | `status_interval_secs` | `60` | live: `run` with `[server]` | Seconds between one-line status reports in the log; `0` turns them off. |
 | `telnet_max_connections_per_ip` | `16` | live: `run` with `[server]` | Open telnet connections per client IP; `0` removes the limit. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
