@@ -205,10 +205,10 @@ enum Command {
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -241,8 +241,8 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -272,8 +272,8 @@ enum Command {
         /// builds made with the `hpsdr` feature.
         #[cfg(feature = "hpsdr")]
         #[arg(help_heading = "HPSDR source")]
-        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
         #[cfg(feature = "hpsdr")]
@@ -304,6 +304,39 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_rate_hz: Option<f64>,
+        /// Multicast data group of a ka9q-radio (radiod) IQ channel
+        ///
+        /// An IPv4 multicast address, or the name in the channel's `data =`
+        /// line (for example cw-20m.local) when this machine resolves mDNS
+        /// names. manta joins the group and reads the channel's sample rate,
+        /// encoding and frequency from radiod's status packets; it does not
+        /// create or retune channels.
+        #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        ka9q_group: Option<String>,
+        /// RTP data port of the group.
+        #[arg(
+            long,
+            default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            requires = "ka9q_group",
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_port: u16,
+        /// SSRC of the channel to read, when the group carries more than one.
+        #[arg(long, requires = "ka9q_group", help_heading = "ka9q-radio source")]
+        ka9q_ssrc: Option<u32>,
+        /// IPv4 address of the local interface to join the group on. manta
+        /// also joins on 127.0.0.1, for a radiod on this machine.
+        #[arg(
+            long,
+            requires = "ka9q_group",
+            value_parser = clap::value_parser!(std::net::Ipv4Addr),
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_interface: Option<std::net::Ipv4Addr>,
         /// Decimate the source to this sample rate, in Hz, before decoding.
         ///
         /// Must divide the source's own rate by a power of two, and the
@@ -371,9 +404,10 @@ enum Command {
         /// Radio dial frequency, in Hz.
         ///
         /// For a sound card or an ordinary (real-audio) --source WAV this
-        /// becomes the source's centre frequency; for KiwiSDR, SoapySDR and
-        /// HPSDR inputs, and for a --source-iq recording whose sidecar already
-        /// carries a centre frequency, it overrides what the source reports.
+        /// becomes the source's centre frequency; for KiwiSDR, SoapySDR, HPSDR
+        /// and ka9q-radio inputs, and for a --source-iq recording whose
+        /// sidecar already carries a centre frequency, it overrides what the
+        /// source reports.
         /// Required with --config when the input is a sound card or a
         /// real-audio --source WAV, because neither knows what frequency the
         /// radio was on -- without it, spots would be published at the audio
@@ -442,10 +476,10 @@ enum Command {
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -478,8 +512,8 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -509,8 +543,8 @@ enum Command {
         /// builds made with the `hpsdr` feature.
         #[cfg(feature = "hpsdr")]
         #[arg(help_heading = "HPSDR source")]
-        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
         #[cfg(feature = "hpsdr")]
@@ -541,6 +575,39 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_rate_hz: Option<f64>,
+        /// Multicast data group of a ka9q-radio (radiod) IQ channel
+        ///
+        /// An IPv4 multicast address, or the name in the channel's `data =`
+        /// line (for example cw-20m.local) when this machine resolves mDNS
+        /// names. manta joins the group and reads the channel's sample rate,
+        /// encoding and frequency from radiod's status packets; it does not
+        /// create or retune channels.
+        #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        ka9q_group: Option<String>,
+        /// RTP data port of the group.
+        #[arg(
+            long,
+            default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            requires = "ka9q_group",
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_port: u16,
+        /// SSRC of the channel to read, when the group carries more than one.
+        #[arg(long, requires = "ka9q_group", help_heading = "ka9q-radio source")]
+        ka9q_ssrc: Option<u32>,
+        /// IPv4 address of the local interface to join the group on. manta
+        /// also joins on 127.0.0.1, for a radiod on this machine.
+        #[arg(
+            long,
+            requires = "ka9q_group",
+            value_parser = clap::value_parser!(std::net::Ipv4Addr),
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_interface: Option<std::net::Ipv4Addr>,
         /// Decimate the source to this sample rate, in Hz, before decoding.
         ///
         /// Must divide the source's own rate by a power of two, and the
@@ -647,10 +714,10 @@ enum Command {
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -683,8 +750,8 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -714,8 +781,8 @@ enum Command {
         /// builds made with the `hpsdr` feature.
         #[cfg(feature = "hpsdr")]
         #[arg(help_heading = "HPSDR source")]
-        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
         #[cfg(feature = "hpsdr")]
@@ -746,6 +813,39 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_rate_hz: Option<f64>,
+        /// Multicast data group of a ka9q-radio (radiod) IQ channel
+        ///
+        /// An IPv4 multicast address, or the name in the channel's `data =`
+        /// line (for example cw-20m.local) when this machine resolves mDNS
+        /// names. manta joins the group and reads the channel's sample rate,
+        /// encoding and frequency from radiod's status packets; it does not
+        /// create or retune channels.
+        #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        ka9q_group: Option<String>,
+        /// RTP data port of the group.
+        #[arg(
+            long,
+            default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            requires = "ka9q_group",
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_port: u16,
+        /// SSRC of the channel to read, when the group carries more than one.
+        #[arg(long, requires = "ka9q_group", help_heading = "ka9q-radio source")]
+        ka9q_ssrc: Option<u32>,
+        /// IPv4 address of the local interface to join the group on. manta
+        /// also joins on 127.0.0.1, for a radiod on this machine.
+        #[arg(
+            long,
+            requires = "ka9q_group",
+            value_parser = clap::value_parser!(std::net::Ipv4Addr),
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_interface: Option<std::net::Ipv4Addr>,
         /// Decimate the source to this sample rate, in Hz, before decoding.
         ///
         /// Must divide the source's own rate by a power of two, and the
@@ -847,10 +947,10 @@ enum Command {
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -883,8 +983,8 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -914,8 +1014,8 @@ enum Command {
         /// builds made with the `hpsdr` feature.
         #[cfg(feature = "hpsdr")]
         #[arg(help_heading = "HPSDR source")]
-        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
         #[cfg(feature = "hpsdr")]
@@ -946,6 +1046,39 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_rate_hz: Option<f64>,
+        /// Multicast data group of a ka9q-radio (radiod) IQ channel
+        ///
+        /// An IPv4 multicast address, or the name in the channel's `data =`
+        /// line (for example cw-20m.local) when this machine resolves mDNS
+        /// names. manta joins the group and reads the channel's sample rate,
+        /// encoding and frequency from radiod's status packets; it does not
+        /// create or retune channels.
+        #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        ka9q_group: Option<String>,
+        /// RTP data port of the group.
+        #[arg(
+            long,
+            default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            requires = "ka9q_group",
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_port: u16,
+        /// SSRC of the channel to read, when the group carries more than one.
+        #[arg(long, requires = "ka9q_group", help_heading = "ka9q-radio source")]
+        ka9q_ssrc: Option<u32>,
+        /// IPv4 address of the local interface to join the group on. manta
+        /// also joins on 127.0.0.1, for a radiod on this machine.
+        #[arg(
+            long,
+            requires = "ka9q_group",
+            value_parser = clap::value_parser!(std::net::Ipv4Addr),
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_interface: Option<std::net::Ipv4Addr>,
         /// Decimate the source to this sample rate, in Hz, before decoding.
         ///
         /// Must divide the source's own rate by a power of two, and the
@@ -1177,6 +1310,28 @@ struct HpsdrOpts {
     rate: Option<f64>,
 }
 
+/// ka9q-radio (radiod) multicast flags, grouped for the same reason. No
+/// build feature: the source is in every build (MAN-140 D2).
+#[derive(Clone)]
+struct Ka9qOpts {
+    group: Option<String>,
+    port: u16,
+    ssrc: Option<u32>,
+    interface: Option<std::net::Ipv4Addr>,
+}
+
+impl Ka9qOpts {
+    /// No `--ka9q-*` flag given: the defaults `CliOverrides::none` uses.
+    fn unset() -> Self {
+        Ka9qOpts {
+            group: None,
+            port: manta_input::ka9q::wire::DATA_PORT,
+            ssrc: None,
+            interface: None,
+        }
+    }
+}
+
 /// Everything needed to (re)open the configured live input. MAN-73: a
 /// reconnectable kind (every variant but `File`) is re-opened by
 /// `ReconnectingSource` after a loss; `File` (deterministic replay) never
@@ -1189,6 +1344,7 @@ enum LiveSourceSpec {
     Soapy(SoapyOpts),
     #[cfg(feature = "hpsdr")]
     Hpsdr(HpsdrOpts),
+    Ka9q(Ka9qOpts),
     AudioDevice(Option<String>),
     /// `source_iq` selects `WavIqSource` over `AudioIqSource`; see
     /// `open_audio_source`.
@@ -1206,12 +1362,13 @@ impl LiveSourceSpec {
             LiveSourceSpec::Soapy(_) => "soapy",
             #[cfg(feature = "hpsdr")]
             LiveSourceSpec::Hpsdr(_) => "hpsdr",
+            LiveSourceSpec::Ka9q(_) => "ka9q",
             LiveSourceSpec::AudioDevice(_) => "audio",
             LiveSourceSpec::File { .. } => "file",
         }
     }
 
-    /// Kiwi/Soapy/Hpsdr, or an IQ WAV whose sidecar reports a real (> 0)
+    /// Kiwi/Soapy/Hpsdr/Ka9q, or an IQ WAV whose sidecar reports a real (> 0)
     /// center frequency: a source that already knows its own tuned
     /// frequency, so `--dial-freq-hz` is an override and not a requirement.
     fn is_rf_aware(&self) -> bool {
@@ -1297,6 +1454,23 @@ impl LiveSourceSpec {
                 };
                 let mut sources = manta_input::hpsdr::HpsdrDevice::open(cfg)?;
                 Box::new(sources.remove(0))
+            }
+            LiveSourceSpec::Ka9q(ka9q) => {
+                let group = ka9q
+                    .group
+                    .clone()
+                    .expect("LiveSourceSpec::Ka9q always carries a group");
+                let mut cfg = manta_input::ka9q::Ka9qConfig::new(group);
+                cfg.port = ka9q.port;
+                cfg.ssrc = ka9q.ssrc;
+                cfg.interface = ka9q.interface;
+                let src = manta_input::ka9q::Ka9qIqSource::open(cfg)?;
+                // MAN-140 D18: printed on each (re)open, as the audio
+                // silence notice is; manta still starts.
+                if src.agc_on() {
+                    logging::warning(&ka9q_agc_warning(src.ssrc()));
+                }
+                Box::new(src)
             }
             // Each (re)open gets its own one-shot silence notice (MAN-131).
             LiveSourceSpec::AudioDevice(device) => Box::new(
@@ -1485,6 +1659,17 @@ fn audio_silence_warning(device: &str) -> String {
          (every sample is exactly zero) -- {}",
         manta_input::TARGET_RATE_HZ,
         manta_input::audio::audio_input_hint()
+    )
+}
+
+/// MAN-140 D18: a radiod channel with AGC on rescales every signal in its
+/// passband whenever one strong signal comes and goes. A warning on each
+/// open, not an error: some operators run AGC on purpose.
+fn ka9q_agc_warning(ssrc: u32) -> String {
+    format!(
+        "warning: ka9q-radio channel ssrc {ssrc} has AGC on; set agc = off and a fixed gain \
+         in its radiod section, or one strong signal changes the gain for every signal in \
+         the passband"
     )
 }
 
@@ -1858,6 +2043,14 @@ fn check_hpsdr_rate_hz(name: &str, hz: f64) -> std::result::Result<f64, String> 
 fn parse_hpsdr_freq_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s.parse().map_err(|e| format!("{e}"))?;
     check_hpsdr_freq_hz("--hpsdr-freq-hz", hz)
+}
+
+/// Clap value parser for `--ka9q-group`: the same check `input.group` gets
+/// at load (MAN-140 D16), an IPv4 multicast literal or a host name, never
+/// resolved here.
+fn parse_ka9q_group(s: &str) -> std::result::Result<String, String> {
+    manta_input::ka9q::check_group(s)?;
+    Ok(s.to_string())
 }
 
 /// `parse_hpsdr_freq_hz`'s check, un-gated like `check_hpsdr_rate_hz`.
@@ -3313,6 +3506,7 @@ struct CliOverrides {
     soapy: SoapyOpts,
     #[cfg(feature = "hpsdr")]
     hpsdr: HpsdrOpts,
+    ka9q: Ka9qOpts,
     freq_correction_ppm: Option<f64>,
     dial_freq_hz: Option<f64>,
     capture_rate_hz: Option<f64>,
@@ -3356,6 +3550,7 @@ impl CliOverrides {
                 freq: None,
                 rate: None,
             },
+            ka9q: Ka9qOpts::unset(),
             freq_correction_ppm: None,
             dial_freq_hz: None,
             capture_rate_hz: None,
@@ -3372,6 +3567,9 @@ impl CliOverrides {
     /// The flag that selects a source, if any: given one, the command line
     /// defines the whole source (D6).
     fn source_selector(&self) -> Option<&'static str> {
+        if self.ka9q.group.is_some() {
+            return Some("--ka9q-group");
+        }
         #[cfg(feature = "hpsdr")]
         if self.hpsdr.host.is_some() {
             return Some("--hpsdr-host");
@@ -3391,9 +3589,14 @@ impl CliOverrides {
         }
     }
 
-    /// The source the flags describe, in today's priority order: hpsdr,
-    /// then kiwi, then soapy, then a WAV file or audio device.
+    /// The source the flags describe, in today's priority order: ka9q,
+    /// then hpsdr, then kiwi, then soapy, then a WAV file or audio device.
+    /// clap lets at most one selector through, so the order only matters
+    /// for a hand-built `CliOverrides`.
     fn into_spec(self) -> LiveSourceSpec {
+        if self.ka9q.group.is_some() {
+            return LiveSourceSpec::Ka9q(self.ka9q);
+        }
         #[cfg(feature = "hpsdr")]
         if self.hpsdr.host.is_some() {
             return LiveSourceSpec::Hpsdr(self.hpsdr);
@@ -3617,6 +3820,17 @@ fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Resul
         config::SourceFromFile::Hpsdr { .. } => {
             bail!("input.type = \"hpsdr\" needs a manta built with --features hpsdr")
         }
+        config::SourceFromFile::Ka9q {
+            group,
+            port,
+            ssrc,
+            interface,
+        } => LiveSourceSpec::Ka9q(Ka9qOpts {
+            group: Some(group.clone()),
+            port: *port,
+            ssrc: *ssrc,
+            interface: *interface,
+        }),
     })
 }
 
@@ -3721,6 +3935,15 @@ fn receiver_desc(spec: &LiveSourceSpec) -> doctor_checks::ReceiverDesc {
                 "HPSDR radio {}:{}",
                 hpsdr.host.as_deref().unwrap_or_default(),
                 hpsdr.port
+            ),
+        ),
+        LiveSourceSpec::Ka9q(ka9q) => (
+            ReceiverKind::Ka9q,
+            format!(
+                "ka9q-radio group {}:{}{}",
+                ka9q.group.as_deref().unwrap_or_default(),
+                ka9q.port,
+                ka9q.ssrc.map(|s| format!(" ssrc {s}")).unwrap_or_default()
             ),
         ),
         LiveSourceSpec::AudioDevice(None) => (
@@ -4599,6 +4822,10 @@ fn run_command() -> Result<std::process::ExitCode> {
             hpsdr_freq_hz,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
             capture_rate_hz,
             source_iq,
             realtime,
@@ -4649,6 +4876,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                     port: hpsdr_port,
                     freq: hpsdr_freq_hz,
                     rate: hpsdr_rate_hz,
+                },
+                ka9q: Ka9qOpts {
+                    group: ka9q_group,
+                    port: ka9q_port,
+                    ssrc: ka9q_ssrc,
+                    interface: ka9q_interface,
                 },
                 freq_correction_ppm,
                 dial_freq_hz,
@@ -5395,6 +5628,10 @@ fn run_command() -> Result<std::process::ExitCode> {
             hpsdr_freq_hz,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
             capture_rate_hz,
             source_iq,
             filters,
@@ -5440,6 +5677,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                         port: hpsdr_port,
                         freq: hpsdr_freq_hz,
                         rate: hpsdr_rate_hz,
+                    },
+                    ka9q: Ka9qOpts {
+                        group: ka9q_group,
+                        port: ka9q_port,
+                        ssrc: ka9q_ssrc,
+                        interface: ka9q_interface,
                     },
                     freq_correction_ppm,
                     dial_freq_hz,
@@ -5540,6 +5783,10 @@ fn run_command() -> Result<std::process::ExitCode> {
             hpsdr_freq_hz,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
             capture_rate_hz,
             source_iq,
             dial_freq_hz,
@@ -5601,6 +5848,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                         port: hpsdr_port,
                         freq: hpsdr_freq_hz,
                         rate: hpsdr_rate_hz,
+                    },
+                    ka9q: Ka9qOpts {
+                        group: ka9q_group,
+                        port: ka9q_port,
+                        ssrc: ka9q_ssrc,
+                        interface: ka9q_interface,
                     },
                     freq_correction_ppm,
                     dial_freq_hz,
@@ -5730,6 +5983,10 @@ fn run_command() -> Result<std::process::ExitCode> {
             hpsdr_freq_hz,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
             capture_rate_hz,
             source_iq,
             dial_freq_hz,
@@ -5767,6 +6024,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                     port: hpsdr_port,
                     freq: hpsdr_freq_hz,
                     rate: hpsdr_rate_hz,
+                },
+                ka9q: Ka9qOpts {
+                    group: ka9q_group,
+                    port: ka9q_port,
+                    ssrc: ka9q_ssrc,
+                    interface: ka9q_interface,
                 },
                 capture_rate_hz,
                 dial_freq_hz,
@@ -8568,6 +8831,149 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
     }
 
+    // ---- MAN-140: the ka9q-radio source
+
+    fn ka9q_opts(ssrc: Option<u32>) -> Ka9qOpts {
+        Ka9qOpts {
+            group: Some("239.101.6.1".into()),
+            port: manta_input::ka9q::wire::DATA_PORT,
+            ssrc,
+            interface: None,
+        }
+    }
+
+    #[test]
+    fn ka9q_flag_selects_the_source_and_replaces_a_typed_input() {
+        let cli = CliOverrides {
+            ka9q: Ka9qOpts {
+                interface: Some(std::net::Ipv4Addr::new(192, 168, 1, 20)),
+                ..ka9q_opts(Some(14_100_000))
+            },
+            ..cli_overrides()
+        };
+        assert_eq!(cli.source_selector(), Some("--ka9q-group"));
+        let LiveSourceSpec::Ka9q(k) = cli.clone().into_spec() else {
+            panic!("expected the ka9q source from --ka9q-group");
+        };
+        assert_eq!(k.group.as_deref(), Some("239.101.6.1"));
+        assert_eq!(k.port, 5004);
+        assert_eq!(k.ssrc, Some(14_100_000));
+        assert_eq!(k.interface, Some(std::net::Ipv4Addr::new(192, 168, 1, 20)));
+
+        // A typed [input] is replaced whole, its shared keys included.
+        let r = resolve(cli, &loaded_from(KIWI_INPUT)).unwrap();
+        assert!(matches!(r.spec, LiveSourceSpec::Ka9q(_)));
+        assert_eq!(r.replaced_file_source, Some("--ka9q-group"));
+        assert_eq!(r.freq_correction_ppm, 0.0);
+        assert_eq!(r.dial_freq_hz, None);
+        assert!(
+            r.notes[0]
+                .contains("--ka9q-group selects the source; ignoring [input] (type = \"kiwi\")"),
+            "{:?}",
+            r.notes
+        );
+
+        // The flags as clap parses them, defaults included.
+        let parsed = Cli::try_parse_from([
+            "manta",
+            "run",
+            "--ka9q-group",
+            "239.101.6.1",
+            "--ka9q-ssrc",
+            "14100000",
+            "--ka9q-interface",
+            "192.168.1.20",
+        ])
+        .unwrap();
+        let Command::Run {
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
+            ..
+        } = parsed.command
+        else {
+            unreachable!("parsed `run`");
+        };
+        assert_eq!(ka9q_group.as_deref(), Some("239.101.6.1"));
+        assert_eq!(ka9q_port, 5004);
+        assert_eq!(ka9q_ssrc, Some(14_100_000));
+        assert_eq!(
+            ka9q_interface,
+            Some(std::net::Ipv4Addr::new(192, 168, 1, 20))
+        );
+        // --ka9q-interface takes an address, not an interface name.
+        assert!(Cli::try_parse_from([
+            "manta",
+            "run",
+            "--ka9q-group",
+            "239.101.6.1",
+            "--ka9q-interface",
+            "eth0",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn spec_from_file_maps_a_ka9q_input() {
+        let loaded = loaded_from(
+            "[input]\ntype = \"ka9q\"\ngroup = \"239.101.6.1\"\nport = 5010\nssrc = 14100000\n\
+             interface = \"192.168.1.20\"\n",
+        );
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        let LiveSourceSpec::Ka9q(k) = &r.spec else {
+            panic!("expected the ka9q source from [input]");
+        };
+        assert_eq!(k.group.as_deref(), Some("239.101.6.1"));
+        assert_eq!(k.port, 5010);
+        assert_eq!(k.ssrc, Some(14_100_000));
+        assert_eq!(k.interface, Some(std::net::Ipv4Addr::new(192, 168, 1, 20)));
+        assert_eq!(r.replaced_file_source, None);
+
+        let loaded = loaded_from("[input]\ntype = \"ka9q\"\ngroup = \"cw-20m.local\"\n");
+        let LiveSourceSpec::Ka9q(k) = resolve(cli_overrides(), &loaded).unwrap().spec else {
+            panic!("expected the ka9q source from [input]");
+        };
+        assert_eq!(k.group.as_deref(), Some("cw-20m.local"));
+        assert_eq!(k.port, 5004);
+        assert_eq!(k.ssrc, None);
+        assert_eq!(k.interface, None);
+    }
+
+    #[test]
+    fn ka9q_spec_is_rf_aware_and_reconnectable_and_named_ka9q() {
+        let spec = LiveSourceSpec::Ka9q(ka9q_opts(None));
+        // radiod reports the channel's frequency, so --dial-freq-hz is an
+        // override, not a requirement.
+        assert!(spec.is_rf_aware());
+        assert!(!needs_dial_freq(true, spec.is_rf_aware(), None));
+        assert!(spec.is_reconnectable());
+        // The `source` label of manta_source_health and manta_input_*.
+        assert_eq!(spec.name(), "ka9q");
+    }
+
+    #[test]
+    fn receiver_desc_names_the_ka9q_group() {
+        let d = receiver_desc(&LiveSourceSpec::Ka9q(ka9q_opts(None)));
+        assert_eq!(d.kind, doctor_checks::ReceiverKind::Ka9q);
+        assert_eq!(d.description, "ka9q-radio group 239.101.6.1:5004");
+        let d = receiver_desc(&LiveSourceSpec::Ka9q(ka9q_opts(Some(14_100_000))));
+        assert_eq!(
+            d.description,
+            "ka9q-radio group 239.101.6.1:5004 ssrc 14100000"
+        );
+    }
+
+    #[test]
+    fn ka9q_agc_warning_is_design_section_3s_text() {
+        assert_eq!(
+            ka9q_agc_warning(14_100_000),
+            "warning: ka9q-radio channel ssrc 14100000 has AGC on; set agc = off and a fixed \
+             gain in its radiod section, or one strong signal changes the gain for every \
+             signal in the passband"
+        );
+    }
+
     /// D10: every config-backed flag maps to the key it overrides.
     const FLAG_KEYS: &[(&str, &str)] = &[
         ("device", "input.device"),
@@ -8587,6 +8993,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("hpsdr_port", "input.port"),
         ("hpsdr_freq_hz", "input.freq_hz"),
         ("hpsdr_rate_hz", "input.rate_hz"),
+        ("ka9q_group", "input.group"),
+        ("ka9q_port", "input.port"),
+        ("ka9q_ssrc", "input.ssrc"),
+        ("ka9q_interface", "input.interface"),
         ("freq_correction_ppm", "input.freq_correction_ppm"),
         ("dial_freq_hz", "input.center_freq_hz"),
         ("capture_rate_hz", "input.capture_rate_hz"),
@@ -8726,6 +9136,11 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             (
                 "hpsdr",
                 "type = \"hpsdr\"\nhost = \"h\"\nport = 1024\nfreq_hz = 7e6\nrate_hz = 48000.0\n",
+            ),
+            (
+                "ka9q",
+                "type = \"ka9q\"\ngroup = \"239.1.2.3\"\nport = 5004\nssrc = 1\n\
+                 interface = \"127.0.0.1\"\n",
             ),
         ];
         const SHARED: &[(&str, &str)] = &[

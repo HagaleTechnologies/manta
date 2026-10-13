@@ -123,6 +123,11 @@ pub(crate) fn apply_tune_hz(resolved: &mut Resolved, tune_hz: f64) -> Result<()>
                 crate::check_hpsdr_freq_hz("--tune-hz", tune_hz).map_err(|e| anyhow::anyhow!(e))?,
             )
         }
+        // MAN-140 D17: manta joins a radiod channel, it never retunes one.
+        LiveSourceSpec::Ka9q(_) => bail!(
+            "--tune-hz cannot retune a ka9q-radio channel; retune it in radiod so the reference \
+             sits inside its passband, then run calibrate without --tune-hz"
+        ),
         LiveSourceSpec::AudioDevice(_) => bail!(
             "--tune-hz cannot retune a sound card; tune the radio so the reference sits 1 to 2 \
              kHz above its dial and pass --dial-freq-hz"
@@ -329,6 +334,7 @@ fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<Str
         soapy,
         #[cfg(feature = "hpsdr")]
         hpsdr,
+        ka9q,
         dial_freq_hz,
         capture_rate_hz,
         replay_epoch,
@@ -365,6 +371,8 @@ fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<Str
     flag(soapy.driver.is_some(), "--soapy-driver");
     #[cfg(feature = "hpsdr")]
     flag(hpsdr.host.is_some(), "--hpsdr-host");
+    // --ka9q-port, --ka9q-ssrc and --ka9q-interface require --ka9q-group.
+    flag(ka9q.group.is_some(), "--ka9q-group");
     flag(dial_freq_hz.is_some(), "--dial-freq-hz");
     flag(capture_rate_hz.is_some(), "--capture-rate-hz");
     flag(replay_epoch.is_some(), "--replay-epoch");
@@ -882,5 +890,36 @@ mod tests {
         });
         let e = apply_tune_hz(&mut r, 9_998_500.0).unwrap_err();
         assert!(e.to_string().contains("cannot retune a recording"), "{e}");
+    }
+
+    /// MAN-140 D17: a radiod channel is retuned in radiod, never by manta.
+    #[test]
+    fn tune_hz_refuses_a_ka9q_source() {
+        let mut r = resolved_with(LiveSourceSpec::Ka9q(crate::Ka9qOpts {
+            group: Some("239.101.6.1".into()),
+            port: 5004,
+            ssrc: None,
+            interface: None,
+        }));
+        let e = apply_tune_hz(&mut r, 9_998_500.0).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "--tune-hz cannot retune a ka9q-radio channel; retune it in radiod so the reference \
+             sits inside its passband, then run calibrate without --tune-hz"
+        );
+        // The configured receiver is left as it was.
+        assert_eq!(r.dial_freq_hz, Some(7_000_000.0));
+        // `input_overrides` classifies the ka9q flags: --ka9q-group stands
+        // for the three flags that require it.
+        let cli = CliOverrides {
+            ka9q: crate::Ka9qOpts {
+                group: Some("239.101.6.1".into()),
+                port: 5010,
+                ssrc: Some(14_100_000),
+                interface: None,
+            },
+            ..CliOverrides::none()
+        };
+        assert_eq!(input_overrides(&cli, &[]), vec!["--ka9q-group".to_string()]);
     }
 }
