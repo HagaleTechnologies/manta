@@ -44,6 +44,17 @@ the git history and `docs/DECISIONS/`.
   gauge; `rtty` array in `decode --json` and, when RTTY was marked, an
   `rtty:` line in plain `decode`; `RTTY marked`/`RTTY cleared` log lines in
   `run` (MAN-314).
+- A live-state stream for dashboards, off unless `[server].live_port` is
+  set (`live_bind_addr` defaults to `127.0.0.1`): `bandState` (per-band
+  noise floor, occupancy and decoding tracks, every second), `trackState`
+  (each track's frequency, speed, SNR, decoded text and candidate calls),
+  `candidateDecision` (every validation decision with its reason, and the
+  spot's `id` when spotted) and `trackClosed` records, as JSON Lines or
+  WebSocket frames on their own port. `/metrics` gains
+  `manta_live_clients_connected`, `manta_live_records_total{kind}`,
+  `manta_live_records_dropped_total{reason}` and
+  `manta_listener_up{listener="live"}` when it is on. Spot output is
+  unchanged. See `docs/LIVE-STATE.md` (MAN-324).
 - A Grafana dashboard (spot rate, active tracks, source health, per-target
   uplink status) and Prometheus alert rules (node down, node unhealthy, no
   spots for 30 minutes, uplink target down or flapping) for a node's

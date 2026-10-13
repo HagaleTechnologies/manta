@@ -258,6 +258,37 @@ impl SupportLedger {
         best
     }
 
+    /// MAN-324: every text observed on `track_id` with at least one
+    /// message of support inside the window ending at `now`, strongest
+    /// first (`Support::strictly_better_than`), ties by text ascending.
+    /// The same range scan and support values `better_supported_rival`
+    /// and `support` use.
+    pub fn candidates(&self, track_id: u32, now: u64) -> Vec<(String, Support)> {
+        let mut out: Vec<(String, Support)> = self
+            .seen
+            .range((track_id, String::new())..)
+            .take_while(|((tid, _), _)| *tid == track_id)
+            .map(|((tid, text), obs)| {
+                let s = Self::support_in_window(
+                    *tid,
+                    obs,
+                    now,
+                    self.window_samples,
+                    self.time_gap_samples,
+                );
+                (text.clone(), s)
+            })
+            .filter(|(_, s)| s.reps >= 1)
+            .collect();
+        out.sort_by(|(ta, a), (tb, b)| {
+            b.reps
+                .cmp(&a.reps)
+                .then(b.conf_sum.total_cmp(&a.conf_sum))
+                .then_with(|| ta.cmp(tb))
+        });
+        out
+    }
+
     /// Drops every recorded observation for `track_id`. Mirrors
     /// `RepetitionGate::forget_track` (MAN-19) -- without this, `seen`'s
     /// key space grows forever under sustained track churn.
@@ -279,6 +310,30 @@ mod tests {
     use super::*;
 
     const FS: f64 = 96_000.0;
+
+    #[test]
+    fn candidates_enumerates_only_this_tracks_keys_within_the_window() {
+        let mut ledger = SupportLedger::new(FS);
+        let window_samples = (WINDOW_SECONDS * FS) as u64;
+        ledger.observe(1, "K5OLD", 0, 0, 1.0);
+        ledger.observe(1, "K5ARH", 10, window_samples, 0.9);
+        ledger.observe(1, "K5ARH", 13, window_samples + 10_000, 0.8);
+        ledger.observe(1, "K5ARX", 16, window_samples + 20_000, 0.7);
+        ledger.observe(2, "W1AW", 1, window_samples + 20_000, 1.0);
+        let now = window_samples + 20_000;
+        let got = ledger.candidates(1, now);
+        let calls: Vec<&str> = got.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(
+            calls,
+            ["K5ARH", "K5ARX"],
+            "aged-out and other tracks' words are absent"
+        );
+        for (call, s) in &got {
+            assert_eq!(*s, ledger.support(1, call, now));
+        }
+        assert_eq!(got[0].1.reps, 2);
+        assert!(ledger.candidates(3, now).is_empty());
+    }
 
     #[test]
     fn an_unobserved_call_has_no_support() {

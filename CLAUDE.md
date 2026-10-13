@@ -175,12 +175,31 @@ same Rust engine. RBN's real login prompt and the live/offline agreement
 rate are unmeasured. See
 docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
 
+MAN-324: `[server].live_port` (unset = off; `live_bind_addr` default
+`127.0.0.1`) starts a live-state stream for dashboards: `bandState`,
+`trackState`, `candidateDecision` (the why-not-spotted record, from the
+validator's opt-in decision log) and `trackClosed` records on their own
+port and broadcast channel, served by `json_stream`'s fan-out code (4096
+lag, 32 clients), plus `manta_live_*` metrics. Spot output is unchanged.
+Fields: `docs/LIVE-STATE.md`; see
+docs/DECISIONS/2026-10-12-man324-live-state-stream.md. The dispensa
+`liveState.v1` fragment is not yet filed.
+
 MAN-133: `manta completions <shell>` (bash/zsh/fish/powershell/elvish) and
 `manta man-pages --out DIR` render from the clap tree `--help` uses; every
 release archive ships `man/man1/*.1` rendered natively by the release
 workflows' `validate-tag` job. clap_complete publishes hidden commands
 and flags, so nothing in the CLI may be hidden. See
 docs/DECISIONS/2026-10-13-man133-shell-completions-and-man-pages.md.
+
+MAN-156: CI denies rustdoc warnings (`RUSTDOCFLAGS=-D warnings cargo doc
+--no-deps --workspace --locked` in `test (ubuntu-latest)`; `manta-cli`'s
+clap help text is exempt). The "Supply Chain" check runs `cargo deny
+--locked check` against `deny.toml` (advisories, licenses, bans, sources;
+also daily on main). Trusted PRs get a non-required `test (windows-latest)`
+check-run. `release-publish.yml` refuses a tag whose CI push run failed any
+test leg. The `PR title` check requires a Conventional Commits title. See
+docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md.
 
 ## Documents (read in this order)
 
@@ -265,6 +284,9 @@ in other clones, branches, or worktrees.
 - **Flush at the end:** push (`--force-with-lease` only) and open/update your
   PR before finishing. Unpushed work is invisible work.
 - **Main moves only by PR merge.**
+- **PR titles are commit subjects:** squash merge uses the title, so it must
+  read `<type>(<scope>): <subject>`; the `PR title` check enforces it
+  (MAN-156).
 - **Auto-merge is on, repo-wide** (overrides the global "Tony merges"
   default for this repo specifically): every PR gets `gh pr merge --auto
   --squash` right after opening; GitHub merges it unattended once required
