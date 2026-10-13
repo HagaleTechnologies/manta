@@ -1,6 +1,17 @@
 //! `manta` CLI: decode CW from a recorded file or a live receiver, and run
 //! the spotting daemon.
 
+// MAN-156: this binary's `///` comments are clap `--help` and man-page text,
+// printed verbatim, so they keep plain-text placeholders such as `<TABLE>`
+// and `[spot]` that rustdoc would parse as HTML tags and links. CI's
+// `RUSTDOCFLAGS=-D warnings` doc build still applies these lints to every
+// library crate.
+#![allow(
+    rustdoc::broken_intra_doc_links,
+    rustdoc::invalid_html_tags,
+    rustdoc::bare_urls
+)]
+
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use manta_decode::decoder::Engine;

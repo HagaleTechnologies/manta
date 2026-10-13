@@ -5,7 +5,7 @@
 //! `TEST <call>`, `DE <call>`, `<call> UP`, `V V V <call>`, `<call> T`).
 //! Contest framing (MAN-104) is recognized through an enumerated set of
 //! filler words (`CQ_FILLER`) skipped between `CQ`/`TEST` and the call --
-//! "CQ WPX <call>", "CQ TEST CQ TEST <call>", a bare "TEST <call>" -- and a
+//! `CQ WPX <call>`, `CQ TEST CQ TEST <call>`, a bare `TEST <call>` -- and a
 //! bare `TEST` word suppresses the power-step fallback wherever a bare `CQ`
 //! does, but promotes only the `DE <call>` it directly precedes.
 //! The set is closed on purpose: a word outside it is captured as the
@@ -282,7 +282,7 @@ fn parse_power_step_beacons(text: &str) -> Vec<(String, SpotType, Range<usize>, 
 /// is also the single most common garbled/noise decode in CW, so without
 /// SOME guard, an ordinary, unrecognized CQ/DE call (one whose own
 /// adjacency-strict pattern merely failed to match, e.g. a garbled word
-/// in "CQ EE <call>") would get mistagged `Beacon` and wrongly bypass
+/// in `CQ EE <call>`) would get mistagged `Beacon` and wrongly bypass
 /// the repetition gate. Three rounds of review (Codex review on PR #65,
 /// rounds 3-6) tried increasingly precise position/range-based versions of
 /// this guard -- scoped to the fallback's own vicinity, then to whether a
@@ -321,8 +321,8 @@ fn parse_power_step_beacons(text: &str) -> Vec<(String, SpotType, Range<usize>, 
 /// A `DE <call>` match is classified `Cq` (not `De`) when a bare `CQ`
 /// token also appears anywhere in `text`, or when a bare `TEST` directly
 /// precedes that match (`CQ_FILLER` words allowed between) and
-/// `test_is_a_sign_off` does not reject it -- the common "CQ CQ DE <call>"
-/// (or contest "TEST DE <call>") transmission shape, where the callsign
+/// `test_is_a_sign_off` does not reject it -- the common `CQ CQ DE <call>`
+/// (or contest `TEST DE <call>`) transmission shape, where the callsign
 /// always follows `DE` but the operator is calling CQ, not answering one.
 ///
 /// The 4th element of each returned tuple is `Some(exact call-word range)`

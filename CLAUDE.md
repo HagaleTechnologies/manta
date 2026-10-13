@@ -182,6 +182,15 @@ workflows' `validate-tag` job. clap_complete publishes hidden commands
 and flags, so nothing in the CLI may be hidden. See
 docs/DECISIONS/2026-10-13-man133-shell-completions-and-man-pages.md.
 
+MAN-156: CI denies rustdoc warnings (`RUSTDOCFLAGS=-D warnings cargo doc
+--no-deps --workspace --locked` in `test (ubuntu-latest)`; `manta-cli`'s
+clap help text is exempt). The "Supply Chain" check runs `cargo deny
+--locked check` against `deny.toml` (advisories, licenses, bans, sources;
+also daily on main). Trusted PRs get a non-required `test (windows-latest)`
+check-run. `release-publish.yml` refuses a tag whose CI push run failed any
+test leg. The `PR title` check requires a Conventional Commits title. See
+docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md.
+
 MAN-315: the legacy decoder learns per-track dot/dash/gap timing
 (`SenderTiming`, SPEC §4.1b; `TimingUpdate` event, `decode --json`
 `timing`, a `decode --timing` stderr line); gaps are measured in the
@@ -274,6 +283,9 @@ in other clones, branches, or worktrees.
 - **Flush at the end:** push (`--force-with-lease` only) and open/update your
   PR before finishing. Unpushed work is invisible work.
 - **Main moves only by PR merge.**
+- **PR titles are commit subjects:** squash merge uses the title, so it must
+  read `<type>(<scope>): <subject>`; the `PR title` check enforces it
+  (MAN-156).
 - **Auto-merge is on, repo-wide** (overrides the global "Tony merges"
   default for this repo specifically): every PR gets `gh pr merge --auto
   --squash` right after opening; GitHub merges it unattended once required

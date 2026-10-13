@@ -337,14 +337,14 @@ impl SpeedTracker {
     }
 
     /// Current inter-element gap centroid, in milliseconds, if any
-    /// inter-element gaps have been observed yet. SPEC §4.1 **[DEVIATION]**.
+    /// inter-element gaps have been observed yet. SPEC §4.1 **\[DEVIATION\]**.
     pub fn mu_egap_ms(&self) -> Option<f32> {
         self.mu_egap_ms
     }
 
     /// Feed one inter-element gap duration (SPEC §4.2's `InterElement`
     /// class), updating the gap centroid `dit_estimate_ms` uses. SPEC §4.1
-    /// **[DEVIATION]** (MAN-103 D6/D8).
+    /// **\[DEVIATION\]** (MAN-103 D6/D8).
     pub fn on_element_gap(&mut self, dur_ms: f32) {
         if !dur_ms.is_finite() || dur_ms <= 0.0 {
             return;
@@ -357,7 +357,7 @@ impl SpeedTracker {
 
     /// The dit period used for PARIS WPM reporting: `mu_dit` corrected by
     /// half the mark/gap asymmetry against `mu_egap`, two-sided-capped at
-    /// `DIT_BIAS_CAP_FRAC * mu_dit`. SPEC §4.1 **[DEVIATION]** (MAN-103 D6,
+    /// `DIT_BIAS_CAP_FRAC * mu_dit`. SPEC §4.1 **\[DEVIATION\]** (MAN-103 D6,
     /// adopting MAN-7's symmetric-period design with a two-sided cap -- see
     /// docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md). A
     /// keying-edge crossing only moves the mark/space *boundary*; it
