@@ -1,6 +1,7 @@
 //! Golden test vectors. SPEC §7: definitions live here
 //! (module map §8: "§7 vectors -> manta-testkit::vectors").
 
+use crate::crash::Crash;
 use crate::keyer::Jitter;
 use crate::scene::{render_scene, QsbSine, SignalSpec, WattersonFade};
 use crate::wav::write_fixture;
@@ -752,12 +753,29 @@ pub struct Manifest {
     pub expected_freqs_hz: Vec<f64>,
     pub keyed_texts: Vec<String>,
     pub generator: String,
+    /// MAN-312: the broadband crashes `crash::write_crash_fixture_set`
+    /// added to the rendered scene. Empty, and left out of the JSON, for
+    /// every other fixture, so existing manifests stay byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crashes: Vec<Crash>,
 }
 
 /// Write `<name>.wav`, `<name>.json`, `<name>.manifest.json` into `dir`.
 /// Pinned decision 15.
 pub fn write_fixture_set(spec: &VectorSpec, dir: &Path) -> Result<Manifest> {
     let rendered = render(spec)?;
+    write_rendered_fixture_set(spec, rendered, Vec::new(), dir)
+}
+
+/// The WAV, sidecar and manifest writes behind `write_fixture_set`, shared
+/// with MAN-312's `crash::write_crash_fixture_set` so both produce the same
+/// shape. `crashes` is recorded in the manifest (omitted when empty).
+pub(crate) fn write_rendered_fixture_set(
+    spec: &VectorSpec,
+    rendered: RenderedVector,
+    crashes: Vec<Crash>,
+    dir: &Path,
+) -> Result<Manifest> {
     write_fixture(
         dir,
         spec.name,
@@ -780,6 +798,7 @@ pub fn write_fixture_set(spec: &VectorSpec, dir: &Path) -> Result<Manifest> {
         expected_freqs_hz,
         keyed_texts: rendered.keyed_texts,
         generator: concat!("manta-testkit ", env!("CARGO_PKG_VERSION")).to_string(),
+        crashes,
     };
     std::fs::write(
         dir.join(format!("{}.manifest.json", spec.name)),
@@ -809,6 +828,7 @@ pub fn write_v9_fixture_set(spec: &VectorSpec, dir: &Path) -> Result<Manifest> {
         expected_freqs_hz: vec![rendered.expected_freq_hz],
         keyed_texts: rendered.keyed_texts,
         generator: concat!("manta-testkit ", env!("CARGO_PKG_VERSION")).to_string(),
+        crashes: Vec::new(),
     };
     std::fs::write(
         dir.join(format!("{}.manifest.json", spec.name)),

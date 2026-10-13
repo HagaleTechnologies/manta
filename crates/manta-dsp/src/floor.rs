@@ -9,7 +9,7 @@ const DECIMATION_HOPS: u64 = 15;
 /// SPEC §2.1: 280 bins, 0.5 dB wide, spanning -140..0 dBFS.
 const HIST_BINS: usize = 280;
 const BIN_WIDTH_DB: f64 = 0.5;
-const HIST_MIN_DB: f64 = -140.0;
+pub(crate) const HIST_MIN_DB: f64 = -140.0;
 /// SPEC §2.1: floor = 25th percentile (median would be inflated by CW
 /// key-down duty cycle up to 50-60% on a busy channel).
 const FLOOR_QUANTILE: f64 = 0.25;
@@ -32,7 +32,7 @@ const SEED_OFFSET_DB: f64 = 3.8;
 
 /// SPEC §2.3: tau=40ms at the channelizer's fixed 375 Hz hop rate ->
 /// alpha = 1 - e^(-2.667/40).
-const GATE_EMA_ALPHA: f64 = 0.0645;
+pub(crate) const GATE_EMA_ALPHA: f64 = 0.0645;
 
 fn bin_index(power_db: f64) -> usize {
     (((power_db - HIST_MIN_DB) / BIN_WIDTH_DB).floor() as isize).clamp(0, HIST_BINS as isize - 1)
@@ -210,6 +210,18 @@ impl FloorBank {
     /// One hop's per-channel dB power. Internally decimates to 25 Hz (every
     /// 15th hop) per SPEC §2.1; cheap to call every hop.
     pub fn update(&mut self, power_db: &[f64]) {
+        self.update_holding_reference(power_db, false);
+    }
+
+    /// `update`, except that with `hold_reference` set the spectral
+    /// reference's EMA (`smoothed_lin`, SPEC v2 §2.2) does not step this
+    /// hop. MAN-312 (SPEC §2.7): a static crash lifts every channel at
+    /// once, so it would lift a running track's neighbour reference along
+    /// with the track; the decoder hold keeps the reference from before
+    /// the crash. The floor rings still take their decimated push, so the
+    /// order-statistic floor and its timing are unchanged. The first call
+    /// always seeds the reference: there is nothing to hold yet.
+    pub fn update_holding_reference(&mut self, power_db: &[f64], hold_reference: bool) {
         assert_eq!(
             power_db.len(),
             self.channels.len(),
@@ -217,16 +229,16 @@ impl FloorBank {
             power_db.len(),
             self.channels.len()
         );
-        if self.smoothed_init {
-            for (s, &p) in self.smoothed_lin.iter_mut().zip(power_db) {
-                let p_lin = db_to_linear(p);
-                *s += GATE_EMA_ALPHA * (p_lin - *s);
-            }
-        } else {
+        if !self.smoothed_init {
             for (s, &p) in self.smoothed_lin.iter_mut().zip(power_db) {
                 *s = db_to_linear(p);
             }
             self.smoothed_init = true;
+        } else if !hold_reference {
+            for (s, &p) in self.smoothed_lin.iter_mut().zip(power_db) {
+                let p_lin = db_to_linear(p);
+                *s += GATE_EMA_ALPHA * (p_lin - *s);
+            }
         }
         if self.hop_counter.is_multiple_of(DECIMATION_HOPS) {
             for b in 0..self.block_floor_db.len() {
@@ -354,11 +366,44 @@ impl Gate {
                 self.initialized[k] = true;
                 power_db[k]
             };
-            let f = floor.effective_floor_db(k);
-            rise[k] = self.smoothed_db[k] >= f + self.on_snr_db as f64;
-            drop[k] = self.smoothed_db[k] < f + self.off_snr_db as f64;
+            (rise[k], drop[k]) = self.judge(k, floor);
         }
         (rise, drop)
+    }
+
+    /// MAN-312 (SPEC §2.7): this hop's rise/drop booleans from the current
+    /// smoothed power, without stepping the EMA, against `floor`'s current
+    /// effective floor. During a static crash the band-wide energy would
+    /// otherwise carry every channel's `S[k]` over the rise threshold and
+    /// keep it there for tens of hops after the crash ends. A channel no
+    /// `update` has seeded yet reports `(false, false)`.
+    pub fn hold(&self, floor: &FloorBank) -> (Vec<bool>, Vec<bool>) {
+        assert_eq!(
+            floor.n_channels(),
+            self.smoothed_db.len(),
+            "Gate::hold: floor has {} channels, gate has {}",
+            floor.n_channels(),
+            self.smoothed_db.len()
+        );
+        let n = self.smoothed_db.len();
+        let mut rise = vec![false; n];
+        let mut drop = vec![false; n];
+        for k in 0..n {
+            if self.initialized[k] {
+                (rise[k], drop[k]) = self.judge(k, floor);
+            }
+        }
+        (rise, drop)
+    }
+
+    /// SPEC §2.3: rise = S >= F + on_snr_db; drop = S < F + off_snr_db,
+    /// for channel `k`'s current smoothed power.
+    fn judge(&self, k: usize, floor: &FloorBank) -> (bool, bool) {
+        let f = floor.effective_floor_db(k);
+        (
+            self.smoothed_db[k] >= f + self.on_snr_db as f64,
+            self.smoothed_db[k] < f + self.off_snr_db as f64,
+        )
     }
 
     /// The current EMA-smoothed power `S[k,m]` for channel `k`. SPEC §2.3.
@@ -777,5 +822,77 @@ mod tests {
             "expected the linear-power EMA answer (~-42 dB) after a one-hop transient across \
              every guard-band neighbor, got {r}"
         );
+    }
+
+    /// MAN-312: `Gate::hold` re-judges the held `S[k]` against whatever
+    /// floor it is given and never moves `S[k]`; a channel `update` has
+    /// not seeded reports neither rise nor drop.
+    #[test]
+    fn gate_hold_does_not_advance_the_ema() {
+        let fresh = Gate::new(2, 6.0, 3.0);
+        assert_eq!(
+            fresh.hold(&warmed_up_bank(2, -90.0)),
+            (vec![false, false], vec![false, false]),
+            "an uninitialised channel must report (false, false)"
+        );
+
+        let quiet = warmed_up_bank(2, -90.0);
+        let mut gate = Gate::new(2, 6.0, 3.0);
+        let mut last = (Vec::new(), Vec::new());
+        for _ in 0..200 {
+            last = gate.update(&[-80.0, -90.0], &quiet);
+        }
+        let before = [gate.smoothed_db(0), gate.smoothed_db(1)];
+        for _ in 0..50 {
+            assert_eq!(gate.hold(&quiet), last, "hold must match the last update");
+        }
+        assert_eq!([gate.smoothed_db(0), gate.smoothed_db(1)], before);
+        assert_eq!(last, (vec![true, false], vec![false, true]));
+
+        // Against a floor 20 dB higher the same held S[0] = -80 dB drops.
+        let loud = warmed_up_bank(2, -70.0);
+        assert_eq!(gate.hold(&loud), (vec![false, false], vec![true, true]));
+        assert_eq!([gate.smoothed_db(0), gate.smoothed_db(1)], before);
+    }
+
+    /// MAN-312: holding the reference skips only the `smoothed_lin` EMA
+    /// step. The decimated ring push lands on the same hop either way.
+    #[test]
+    fn update_holding_reference_freezes_only_the_spectral_reference() {
+        let mut plain = FloorBank::new(64);
+        let mut held = FloorBank::new(64);
+        // The first hop seeds the reference even when asked to hold it.
+        plain.update(&[-90.0; 64]);
+        held.update_holding_reference(&[-90.0; 64], true);
+        assert_eq!(held.smoothed_lin, plain.smoothed_lin);
+        for _ in 1..DECIMATION_HOPS {
+            plain.update(&[-90.0; 64]);
+            held.update(&[-90.0; 64]);
+        }
+        let ref_before = held.spectral_reference_db(10);
+        assert_eq!(plain.channel_floor_db(10), -89.75);
+
+        // Hop 15 is a decimated push: the -120 dB entry becomes the
+        // lower quartile of a two-entry ring in both banks.
+        plain.update_holding_reference(&[-120.0; 64], false);
+        held.update_holding_reference(&[-120.0; 64], true);
+        assert_eq!(held.spectral_reference_db(10), ref_before);
+        let stepped = plain.spectral_reference_db(10);
+        assert!(
+            (stepped - ref_before).abs() > 0.2,
+            "the unheld reference must step, {stepped} vs {ref_before}"
+        );
+        for k in 0..64 {
+            assert_eq!(held.channel_floor_db(k), -119.75);
+            assert_eq!(held.channel_floor_db(k), plain.channel_floor_db(k));
+            assert_eq!(held.effective_floor_db(k), plain.effective_floor_db(k));
+        }
+        assert_eq!(held.hop_counter, plain.hop_counter);
+
+        // Released, the reference steps again from its held value.
+        held.update_holding_reference(&[-120.0; 64], false);
+        let lin = db_to_linear(-90.0);
+        let want = 10.0 * (lin + GATE_EMA_ALPHA * (db_to_linear(-120.0) - lin)).log10();
+        assert!((held.spectral_reference_db(10) - want).abs() < 1e-9);
     }
 }
