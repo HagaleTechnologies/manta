@@ -1172,6 +1172,36 @@ mod tests {
     }
 
     #[test]
+    fn a_busy_live_port_fails_the_server_ports_check() {
+        let held = TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = held.local_addr().unwrap().port();
+        let s = server(&format!(
+            "bind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n\
+             live_port = {p}\n"
+        ));
+        let checks = port_checks(Some(&s));
+        assert_eq!(checks.len(), 4);
+        let check = &checks[3];
+        assert_eq!(check.name, "live port");
+        assert_eq!(check.status, Status::Fail);
+        assert_eq!(check.detail, format!("127.0.0.1:{p} is already in use"));
+        assert!(
+            check.fix.as_deref().unwrap().contains("live_port"),
+            "{check:?}"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn no_live_check_without_live_port() {
+        let s =
+            server("bind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n");
+        let checks = port_checks(Some(&s));
+        assert_eq!(checks.len(), 3);
+        assert!(checks.iter().all(|c| !c.name.contains("live")));
+    }
+
+    #[test]
     fn a_duplicate_port_fails_without_binding() {
         let p = free_port();
         let s = server(&format!(
@@ -1198,7 +1228,9 @@ mod tests {
             "bind_addr = \"0.0.0.0\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = \
              7300\njson_port = 7301\nmetrics_port = 7302\n",
         );
-        let [telnet, _json, metrics] = config_cmd::server_listeners(&s);
+        let mut listeners = config_cmd::server_listeners(&s);
+        let metrics = listeners.remove(2);
+        let telnet = listeners.remove(0);
         let err = |kind| io::Error::new(kind, "boom");
         let cases: &[(&Listener, io::ErrorKind, &str, &[&str])] = &[
             (

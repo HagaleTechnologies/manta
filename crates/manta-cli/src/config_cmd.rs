@@ -269,8 +269,9 @@ pub(crate) struct Listener {
     pub port: u16,
 }
 
-/// `[server]`'s three listeners, in the order `run` binds them.
-pub(crate) fn server_listeners(server: &ServerConfig) -> [Listener; 3] {
+/// `[server]`'s listeners, in the order `run` binds them: telnet, JSON,
+/// metrics, then (MAN-324) the live-state listener when `live_port` is set.
+pub(crate) fn server_listeners(server: &ServerConfig) -> Vec<Listener> {
     let listener = |name, port_key, addr_key, addr: &str, port| Listener {
         name,
         port_key,
@@ -278,7 +279,7 @@ pub(crate) fn server_listeners(server: &ServerConfig) -> [Listener; 3] {
         addr: addr.to_string(),
         port,
     };
-    [
+    let mut listeners = vec![
         listener(
             "telnet",
             "telnet_port",
@@ -300,7 +301,17 @@ pub(crate) fn server_listeners(server: &ServerConfig) -> [Listener; 3] {
             &server.metrics_bind_addr,
             server.metrics_port,
         ),
-    ]
+    ];
+    if let Some(live_port) = server.live_port {
+        listeners.push(listener(
+            "live",
+            "live_port",
+            "live_bind_addr",
+            &server.live_bind_addr,
+            live_port,
+        ));
+    }
+    listeners
 }
 
 /// D3: the earlier listener that `listeners[i]` can never bind beside --
@@ -409,6 +420,14 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
                 s.metrics_port,
                 line_format_name(s.line_format)
             );
+            // MAN-324: only when the live-state listener is on, so a
+            // config without `live_port` prints the same line as before.
+            if let Some(live_port) = s.live_port {
+                l.push_str(&format!(
+                    " live_port={live_port} live_bind_addr={}",
+                    s.live_bind_addr
+                ));
+            }
             let optional = [
                 ("status_interval_secs", s.status_interval_secs),
                 ("history_minutes", s.history_minutes.map(u64::from)),
@@ -663,6 +682,22 @@ fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> V
             )
         },
     );
+    // MAN-324: the live-state stream carries every track's decoded text.
+    if server.live_port.is_some() {
+        bind_notes(
+            &mut notes,
+            "live_bind_addr",
+            &server.live_bind_addr,
+            |addr| {
+                format!(
+                    "note: the live-state stream listens on every network interface \
+                 (live_bind_addr = \"{addr}\") and has no password; it carries every track's \
+                 decoded text -- firewall live_port to the dashboards that read it, or set \
+                 live_bind_addr = \"127.0.0.1\""
+                )
+            },
+        );
+    }
     // MAN-90: before going live, operators run `config check` (the node guide
     // sends them here); say the uplink is experimental and what to use instead.
     if loaded.rbn_uplink.iter().any(|u| u.enabled) {
@@ -725,6 +760,84 @@ mod tests {
     }
 
     // ---- Phase 2: the summary and notes
+
+    #[test]
+    fn server_listeners_includes_live_only_when_live_port_is_set() {
+        let without = load_text("[server]\nstation_callsign = \"W1AW\"\n").unwrap();
+        let names: Vec<&str> = server_listeners(without.server.as_ref().unwrap())
+            .iter()
+            .map(|l| l.name)
+            .collect();
+        assert_eq!(names, ["telnet", "json", "metrics"]);
+        let with = load_text("[server]\nstation_callsign = \"W1AW\"\nlive_port = 7303\n").unwrap();
+        let listeners = server_listeners(with.server.as_ref().unwrap());
+        let live = listeners.last().unwrap();
+        assert_eq!(
+            (
+                live.name,
+                live.port_key,
+                live.addr_key,
+                live.addr.as_str(),
+                live.port
+            ),
+            ("live", "live_port", "live_bind_addr", "127.0.0.1", 7303)
+        );
+    }
+
+    #[test]
+    fn a_live_port_equal_to_json_port_is_refused() {
+        let err = load_text(
+            "[server]\nstation_callsign = \"W1AW\"\nlive_port = 7301\nlive_bind_addr = \"0.0.0.0\"\n",
+        )
+        .and_then(|loaded| reject_duplicate_ports(&loaded))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("live_port 7301 is the same as json_port"),
+            "{err}"
+        );
+        // A loopback live listener beside a specific-address JSON listener
+        // on another IP binds fine.
+        let ok = load_text(
+            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"192.0.2.1\"\nlive_port = 7301\n",
+        )
+        .unwrap();
+        assert!(reject_duplicate_ports(&ok).is_ok());
+    }
+
+    #[test]
+    fn summary_names_live_port_and_bind_addr_only_when_set() {
+        let without = lines_of("[server]\nstation_callsign = \"W1AW\"\n");
+        let server = without.iter().find(|l| l.starts_with("server:")).unwrap();
+        assert!(!server.contains("live_"), "{server}");
+        let with = lines_of(
+            "[server]\nstation_callsign = \"W1AW\"\nlive_port = 7303\nlive_bind_addr = \"0.0.0.0\"\n",
+        );
+        let server = with.iter().find(|l| l.starts_with("server:")).unwrap();
+        assert!(
+            server.ends_with("line_format=rbn live_port=7303 live_bind_addr=0.0.0.0"),
+            "{server}"
+        );
+    }
+
+    #[test]
+    fn note_live_bind_addr_on_every_interface() {
+        let note = "note: the live-state stream listens on every network interface \
+                    (live_bind_addr = \"0.0.0.0\") and has no password; it carries every \
+                    track's decoded text -- firewall live_port to the dashboards that read it, \
+                    or set live_bind_addr = \"127.0.0.1\"";
+        let wide = notes_of(
+            "[server]\nstation_callsign = \"W1AW\"\nlive_port = 7303\nlive_bind_addr = \"0.0.0.0\"\n",
+        );
+        assert!(wide.iter().any(|l| l == note), "{wide:#?}");
+        let local = notes_of("[server]\nstation_callsign = \"W1AW\"\nlive_port = 7303\n");
+        assert!(
+            !local.iter().any(|l| l.contains("live-state")),
+            "{local:#?}"
+        );
+        let off = notes_of("[server]\nstation_callsign = \"W1AW\"\nlive_bind_addr = \"0.0.0.0\"\n");
+        assert!(!off.iter().any(|l| l.contains("live-state")), "{off:#?}");
+    }
 
     #[test]
     fn summary_server_line_shows_configured_ports_and_defaults() {
@@ -1332,6 +1445,7 @@ mod tests {
 
     /// Keys with no built-in default: the scaffold shows an example (D10).
     const NO_DEFAULT: &[(&str, &str)] = &[
+        ("server", "live_port"),
         ("server", "station_callsign"),
         ("server", "operator_name"),
         ("server", "operator_qth"),

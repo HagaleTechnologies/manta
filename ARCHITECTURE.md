@@ -506,6 +506,25 @@ validation (MAN-28). Dedupe (step 5) still applies.
   archive and RBN's daily CSV. See
   `docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md` and
   `docs/RUNBOOKS/rbn-comparison.md`.
+- **Live-state stream (MAN-324, opt-in)**: with `[server].live_port` set,
+  a fourth listener pushes what the node hears between spots, for
+  dashboards: `bandState` (per-band noise floor, occupancy and decoding
+  tracks, once per second of stream time), `trackState` (each track's
+  frequency, speed, SNR, newest 128 characters of text and up to 8
+  candidate calls with their support), `candidateDecision` (every
+  validation decision with its reason, e.g. `withheld`/`repetition`, and
+  for a spot the `:7301` `id` as `spotId`) and `trackClosed`. It has its
+  own port and its own broadcast channel on `SpotBus` (4096 records deep),
+  and runs the same `json_stream::serve` fan-out code as :7301 (raw TCP and
+  WebSocket, 10 s write timeout, lag-means-disconnect), capped at 32
+  clients. It binds `[server].live_bind_addr`, default `127.0.0.1`, because
+  it has no password and carries every track's decoded text. Unset, no
+  socket opens and the decode loop does no live work; set, records are
+  serialized on the decode thread only while a client is connected, never
+  block it, and never change spot output. The why-not-spotted record is the
+  validator's opt-in decision log (`manta_spot::Decision`). Field
+  reference: `docs/LIVE-STATE.md`; design and measured rates:
+  `docs/DECISIONS/2026-10-12-man324-live-state-stream.md`.
 - **Inbound RBN feed client (MAN-301)**: the comparator's
   `rbn_compare::feed` connects out to `[rbn_compare].feed_host:feed_port`
   (`telnet.reversebeacon.net:7000`), reconnecting on `backoff.rs`'s
