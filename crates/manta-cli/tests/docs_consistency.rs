@@ -822,7 +822,12 @@ fn spec_detector_values_equal_the_code_defaults() {
         "warmup_ms",
         "track_cap",
         "silent_respawn_cooldown_ms",
+<<<<<<< HEAD
         "crash_filter",
+=======
+        "rtty_filter",
+        "rtty_dwell_ms",
+>>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
     ] {
         assert!(
             table.contains_key(key),
@@ -1296,6 +1301,153 @@ fn architecture_logging_bullet_is_current() {
         arch.contains("--log-format json"),
         "ARCHITECTURE.md never says --log-format json"
     );
+}
+
+// ---- MAN-301: live RBN comparison, documented ----
+
+/// Every `manta_rbn_compare_*` family the design names (MAN-301 plan §7).
+/// The runbook test below also checks the rendered families against this
+/// list, so a stubbed or partial renderer cannot pass it vacuously.
+const RBN_COMPARE_FAMILIES: [&str; 10] = [
+    "manta_rbn_compare_grades_total",
+    "manta_rbn_compare_grades_last_hour",
+    "manta_rbn_compare_disagreements_last_hour",
+    "manta_rbn_compare_freq_offset_median_hz",
+    "manta_rbn_compare_freq_offset_samples",
+    "manta_rbn_compare_feed_connected",
+    "manta_rbn_compare_feed_reports_total",
+    "manta_rbn_compare_feed_reconnects_total",
+    "manta_rbn_compare_pending",
+    "manta_rbn_compare_ungraded_total",
+];
+
+/// One grade of `grade` for `call` on 20m, with same-band statistics when
+/// the grade has them.
+fn rbn_grade(
+    grade: manta_server::rbn_compare::grade::Grade,
+    disagreements: Vec<manta_server::rbn_compare::grade::Disagreement>,
+) -> manta_server::rbn_compare::grade::SpotGrade {
+    use manta_server::rbn_compare::grade::{Grade, SpotGrade};
+    let same_band = matches!(grade, Grade::Match | Grade::Disagree);
+    SpotGrade {
+        kind: "spotGrade",
+        spot_id: format!("W3XYZ-1:1:1:960000:W1AW-{grade:?}"),
+        call: "W1AW".to_string(),
+        band: "20m",
+        spot_time: 1_791_720_000,
+        window_close: 1_791_720_180,
+        window_s: 180,
+        grade,
+        disagreements,
+        manta_freq_hz: 14_025_100,
+        manta_wpm: Some(25),
+        rbn_modal_freq_hz: same_band.then_some(14_025_000),
+        rbn_median_wpm: same_band.then_some(24.0),
+        rbn_skimmers: if same_band { 3 } else { 0 },
+        rbn_reports: if same_band { 3 } else { 0 },
+        freq_offset_hz: same_band.then_some(100),
+        rbn_bands: match grade {
+            Grade::Match | Grade::Disagree => vec!["20m"],
+            Grade::Elsewhere => vec!["40m"],
+            Grade::None | Grade::Unknown => vec![],
+        },
+        spotter_filter: vec![],
+    }
+}
+
+/// MAN-301: `docs/RUNBOOKS/rbn-comparison.md` explains every
+/// `manta_rbn_compare_*` family `/metrics` renders once comparison is on.
+/// The family list comes from the real renderer, fed one grade of each
+/// kind plus the feed and pending setters, so a family added later without
+/// a runbook entry fails here.
+#[test]
+fn rbn_comparison_runbook_names_every_rbn_compare_metric() {
+    use manta_server::rbn_compare::grade::{Disagreement, Grade};
+    let metrics = manta_server::metrics::Metrics::new();
+    metrics.enable_rbn_compare();
+    for (grade, disagreements) in [
+        (Grade::Match, vec![]),
+        (
+            Grade::Disagree,
+            vec![Disagreement::Frequency, Disagreement::Speed],
+        ),
+        (Grade::Elsewhere, vec![]),
+        (Grade::None, vec![]),
+        (Grade::Unknown, vec![]),
+    ] {
+        metrics.record_rbn_grade(&rbn_grade(grade, disagreements));
+    }
+    metrics.set_rbn_feed_connected(true);
+    metrics.inc_rbn_feed_reports();
+    metrics.inc_rbn_feed_reconnects();
+    metrics.set_rbn_pending(1);
+    metrics.add_rbn_ungraded(1);
+    let text = metrics.render_prometheus_text();
+
+    let mut rendered: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("# TYPE "))
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|name| name.starts_with("manta_rbn_compare_"))
+        .collect();
+    rendered.dedup();
+    assert!(
+        !rendered.is_empty(),
+        "an enabled Metrics renders no manta_rbn_compare_* family"
+    );
+    for family in RBN_COMPARE_FAMILIES {
+        assert!(
+            rendered.contains(&family),
+            "an enabled Metrics with one grade of each kind does not render {family}"
+        );
+    }
+
+    let runbook = doc("docs/RUNBOOKS/rbn-comparison.md");
+    for family in &rendered {
+        assert!(
+            runbook.contains(family),
+            "docs/RUNBOOKS/rbn-comparison.md never names {family}"
+        );
+    }
+}
+
+/// MAN-301: README documents the `[rbn_compare]` table, and ARCHITECTURE §7
+/// says the JSON stream can carry `spotGrade` records.
+#[test]
+fn readme_and_architecture_mention_rbn_compare() {
+    let readme = doc("README.md");
+    assert!(
+        readme.contains("[rbn_compare]"),
+        "README.md never mentions the [rbn_compare] table"
+    );
+    let arch = doc("ARCHITECTURE.md");
+    let s7 = section(&arch, "7. Output layer");
+    assert!(
+        s7.contains("spotGrade"),
+        "ARCHITECTURE §7 never mentions spotGrade records"
+    );
+}
+
+/// MAN-301: SPEC §9's precedence paragraph lists the `RBN_COMPARE`
+/// environment prefix and `[rbn_compare]`'s two string-typed keys.
+#[test]
+fn spec_precedence_paragraph_lists_rbn_compare_env_prefix() {
+    let spec = doc("docs/SPEC-decode-core.md");
+    let start = spec
+        .find("**Precedence and the environment.**")
+        .expect("SPEC §9 has no precedence paragraph");
+    let rest = &spec[start..];
+    let paragraph = squash_whitespace(&rest[..rest.find("\n\n").unwrap_or(rest.len())]);
+    for needle in [
+        "RBN_COMPARE",
+        "rbn_compare.feed_host",
+        "rbn_compare.login_callsign",
+    ] {
+        assert!(
+            paragraph.contains(needle),
+            "SPEC §9's precedence paragraph never says {needle:?}"
+        );
+    }
 }
 
 // ---- MAN-90 ----

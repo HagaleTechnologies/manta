@@ -3,7 +3,9 @@
 `manta run` with a `[server]` table publishes every validated spot as a JSON
 object on `[server].json_port` (default 7301). This stream is the ingest
 surface for cqdx and other consumers that want more than the RBN telnet line
-on port 7300. This page lists every field of that object.
+on port 7300. This page lists every field of that object. With
+`[rbn_compare]` enabled the same stream also carries one `spotGrade` record
+per graded spot (MAN-301); see [`spotGrade` records](#spotgrade-records).
 
 ## Transport
 
@@ -13,15 +15,17 @@ on port 7300. This page lists every field of that object.
   `\n`. It should send nothing. A client that sends nothing for 500 ms is
   classified as raw TCP. Any bytes it sends later close the connection.
 - A client whose first bytes are an HTTP `GET` WebSocket upgrade request gets
-  one WebSocket text frame per spot. It must complete the handshake within
+  one WebSocket text frame per record (a spot, or a `spotGrade` record).
+  It must complete the handshake within
   10 s. After that it may send Ping and Close frames only. Text, Binary and
   Pong frames close the connection, as does any inbound frame over 16 KiB.
 - The server only pushes. There is no request, subscription or filter
-  message, and no history: a client receives the spots published after it
-  connects.
+  message, and no history: a client receives the spots, and grades,
+  published after it connects.
 - Slow clients are disconnected, never back-pressured. A client is
   disconnected when a single write takes longer than 10 s, or when it falls
-  more than 1024 spots behind the broadcast channel.
+  more than 1024 records (spots and `spotGrade` records together) behind
+  the broadcast channel.
 - Connection limits: at most 512 concurrent clients in total, and 16 per
   source IP by default. A connection over the per-IP quota is closed at once.
   `[server].json_max_connections_per_ip` overrides the per-IP quota (`0`
@@ -50,7 +54,7 @@ This line was captured from `manta run --config` replaying the output of
 
 ## Fields
 
-Every object carries all 26 keys, in this order. Keys are never omitted; a
+Every spot object carries all 26 keys, in this order. Keys are never omitted; a
 missing value is JSON `null`. In the "Null?" column, "never" means the field
 cannot be `null`, "always" means manta sends `null` on every spot today, and
 "not today" means the field's type allows `null` but manta always fills it.
@@ -100,6 +104,70 @@ exception is a `cty.dat` that has been replaced without regenerating
 `manta_spots_unresolved_geography_total` counter counts every spot sent with
 unresolved geography on either side, including `/MM` and `/AM`.
 
+## `spotGrade` records
+
+Only a node with `[rbn_compare]` enabled sends these; without it the stream
+carries spots only, byte-identical to a node built before MAN-301. A
+graded spot is followed, once its comparison window has closed
+(`window_secs` after the spot plus up to 5 s; up to 75 s while the RBN
+feed is silent), by one grade line on the same stream, raw TCP and
+WebSocket alike. Telnet and the RBN uplink never carry grades.
+
+Not every spot gets a grade. Spots refused because the comparator's pending
+queue was full, or lost because it fell behind the spot bus, are counted in
+`manta_rbn_compare_ungraded_total`. Spots still pending when the daemon
+stops are never graded. Do not wait for a grade that may not come.
+
+Tell the two record shapes apart by the `kind` key. A spot has no `kind`
+key; a grade always has `"kind":"spotGrade"`. A consumer that wants spots
+only skips every object that has a `kind` key. A grade has no `dxCall`,
+`frequency` or `timestamp` key, so a consumer that requires those keys
+rejects it rather than mistaking it for a spot.
+
+```json
+{"kind":"spotGrade","spotId":"W3XYZ-1:1791719990000000000:12:173760000:W1AW","call":"W1AW","band":"20m","spotTime":1791721800,"windowClose":1791721980,"windowS":180,"grade":"disagree","disagreements":["frequency","speed"],"mantaFreqHz":14026400,"mantaWpm":30,"rbnModalFreqHz":14025000,"rbnMedianWpm":20.0,"rbnSkimmers":2,"rbnReports":2,"freqOffsetHz":1400,"rbnBands":["20m"],"spotterFilter":[]}
+```
+
+Every grade carries all 18 keys, in this order. Keys are never omitted; a
+missing value is JSON `null`. The "same-band" values describe the RBN
+reports of the call on the spot's band within the window, and are `null`
+or `0` unless `grade` is `match` or `disagree`.
+
+- `kind` (string, never null): always `"spotGrade"`.
+- `spotId` (string, never null): the graded spot's `id`.
+- `call` (string, never null): the graded spot's `dxCall`.
+- `band` (string, never null): the band of `mantaFreqHz`, labelled as the
+  spot's `band`; `"unknown"` outside every band.
+- `spotTime` (integer, never null): the spot's `timestamp`, Unix seconds.
+- `windowClose` (integer, never null): `spotTime + windowS`, Unix seconds.
+  It is not when the line was sent.
+- `windowS` (integer, never null): the comparison window,
+  `[rbn_compare].window_secs`, 30 to 3600.
+- `grade` (string, never null): `match`, `disagree`, `elsewhere`, `none`
+  or `unknown`. See
+  [RUNBOOKS/rbn-comparison.md](RUNBOOKS/rbn-comparison.md#reading-a-grade)
+  for what each means.
+- `disagreements` (array of strings, never null): which tolerances failed,
+  `frequency`, `speed` or both. Empty unless `grade` is `disagree`.
+- `mantaFreqHz` (integer, never null): the spot's `frequency`, Hz.
+- `mantaWpm` (integer or null): the spot's `wpm`.
+- `rbnModalFreqHz` (integer or null): the most common same-band RBN
+  frequency, Hz, at 100 Hz resolution.
+- `rbnMedianWpm` (number or null): the median same-band RBN speed; also
+  `null` when no same-band report carried a speed.
+- `rbnSkimmers` (integer, never null): distinct RBN skimmers among the
+  same-band reports.
+- `rbnReports` (integer, never null): same-band RBN reports.
+- `freqOffsetHz` (integer or null): `mantaFreqHz` minus `rbnModalFreqHz`.
+- `rbnBands` (array of strings, never null): every band RBN reported the
+  call on in the window, in band-table order, including other bands.
+- `spotterFilter` (array of strings, never null): the
+  `[rbn_compare].spotters` list the grade was made with; `[]` means every
+  RBN skimmer.
+
+`spots.v1` does not describe this record. The proposed dispensa
+`spotGrade` schema fragment is in the MAN-301 decision record below.
+
 ## Contract and stability
 
 The cross-repo contract for this object is dispensa's
@@ -135,3 +203,8 @@ That format is not stable and is not described here.
   (MAN-83): the `decoderVersion` format and the decoder-output rule.
 - [DECISIONS/2026-10-11-man138-station-location.md](DECISIONS/2026-10-11-man138-station-location.md)
   (MAN-138): `deGrid`/`deLat`/`deLon` from the configured station location.
+- [`crates/manta-server/src/rbn_compare/grade.rs`](../crates/manta-server/src/rbn_compare/grade.rs)
+  and
+  [DECISIONS/2026-10-11-man301-live-rbn-comparison.md](DECISIONS/2026-10-11-man301-live-rbn-comparison.md)
+  (MAN-301): the `SpotGrade` struct that builds every `spotGrade` field, the
+  grading rules, and the proposed `spotGrade` contract fragment.

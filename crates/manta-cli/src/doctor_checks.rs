@@ -7,7 +7,7 @@
 use crate::clock_check::{self, NtpServer};
 use crate::config::Loaded;
 use crate::config_cmd::{self, Listener};
-use manta_server::config::{RbnUplinkConfig, ServerConfig};
+use manta_server::config::{RbnCompareConfig, RbnUplinkConfig, ServerConfig};
 use manta_server::status_doc::escape_for_terminal;
 use std::io::{self, Write as _};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -201,10 +201,17 @@ pub(crate) fn run_setup_checks(inputs: &SetupInputs<'_>, sink: &mut Sink) {
         resolve_host,
         connect_host,
     );
+    let rbn_compare = start_rbn_compare_check(
+        inputs.loaded.rbn_compare.as_ref(),
+        UPLINK_BUDGET,
+        resolve_host,
+        connect_host,
+    );
     sink.push(clock.finish());
     for uplink in uplinks {
         sink.push(uplink.finish());
     }
+    sink.push(rbn_compare.finish());
 }
 
 /// `manta run`'s two refusals before any I/O: the example callsign, and a
@@ -421,9 +428,39 @@ fn uplink_attempt(remaining: Duration, left: usize) -> Duration {
         .min(remaining)
 }
 
-/// The only place uplink detail and fix strings are written.
+/// Which config keys a TCP-reach row's fixes name, and what is at the far
+/// end: the only difference between an `rbn uplink` row and the
+/// `rbn compare feed` row (MAN-301).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReachKeys {
+    /// Where the host is set, as the DNS fix names it.
+    host: &'static str,
+    /// Where the port is set, as the refused fix names it.
+    port: &'static str,
+    /// The host key alone, as the firewall fix names it.
+    host_key: &'static str,
+    /// The far end, as the refused fix names it.
+    peer: &'static str,
+}
+
+const UPLINK_KEYS: ReachKeys = ReachKeys {
+    host: "target_host in this [[rbn_uplink]] block",
+    port: "target_port in this [[rbn_uplink]] block",
+    host_key: "target_host",
+    peer: "the collector",
+};
+
+const RBN_COMPARE_KEYS: ReachKeys = ReachKeys {
+    host: "[rbn_compare].feed_host",
+    port: "[rbn_compare].feed_port",
+    host_key: "[rbn_compare].feed_host",
+    peer: "RBN's feed",
+};
+
+/// The only place uplink and feed detail and fix strings are written.
 fn uplink_check(
     name: String,
+    keys: ReachKeys,
     host: &str,
     port: u16,
     budget: Duration,
@@ -438,22 +475,26 @@ fn uplink_check(
             name,
             format!("could not look up {host}: {e}"),
             format!(
-                "check target_host in this [[rbn_uplink]] block, and this machine's DNS (try \
-                 nslookup {host})"
+                "check {}, and this machine's DNS (try nslookup {host})",
+                keys.host
             ),
         ),
         Err(ProbeError::Refused(e)) => Check::fail(
             name,
             format!("refused the connection ({e})"),
-            "check target_port in this [[rbn_uplink]] block; if it is right, the collector is \
-             down or not accepting connections, so try again later or ask its operator",
+            format!(
+                "check {}; if it is right, {} is down or not accepting connections, so try \
+                 again later or ask its operator",
+                keys.port, keys.peer
+            ),
         ),
         Err(ProbeError::TimedOut) => Check::fail(
             name,
             format!("did not answer within {}", clock_check::fmt_budget(budget)),
             format!(
                 "a firewall may be dropping outbound TCP to port {port}; check this machine's \
-                 and the network's firewall rules, and target_host"
+                 and the network's firewall rules, and {}",
+                keys.host_key
             ),
         ),
         Err(ProbeError::Other(e)) => Check::fail(
@@ -527,6 +568,7 @@ pub(crate) enum PendingUplink {
     Done(Check),
     Probing {
         name: String,
+        keys: ReachKeys,
         host: String,
         port: u16,
         budget: Duration,
@@ -540,13 +582,14 @@ impl PendingUplink {
             PendingUplink::Done(check) => check,
             PendingUplink::Probing {
                 name,
+                keys,
                 host,
                 port,
                 budget,
                 pending,
             } => {
                 let result = pending.wait().unwrap_or(Err(ProbeError::TimedOut));
-                uplink_check(name, &host, port, budget, result)
+                uplink_check(name, keys, &host, port, budget, result)
             }
         }
     }
@@ -582,6 +625,7 @@ pub(crate) fn start_uplink_checks(
             let target = host.clone();
             PendingUplink::Probing {
                 name,
+                keys: UPLINK_KEYS,
                 host,
                 port,
                 budget,
@@ -591,6 +635,32 @@ pub(crate) fn start_uplink_checks(
             }
         })
         .collect()
+}
+
+/// MAN-301: the `rbn compare feed` row, after the `rbn uplink` rows and
+/// probed at the same time as them. `uplink_probe`'s TCP connect, closed at
+/// once: nothing is sent, not even the login callsign.
+pub(crate) fn start_rbn_compare_check(
+    config: Option<&RbnCompareConfig>,
+    budget: Duration,
+    resolve: ResolveFn,
+    connect: ConnectFn,
+) -> PendingUplink {
+    let Some(config) = config.filter(|c| c.enabled) else {
+        return PendingUplink::Done(Check::skip("rbn compare feed", "[rbn_compare] is off"));
+    };
+    let (host, port) = (config.feed_host.clone(), config.feed_port);
+    let target = host.clone();
+    PendingUplink::Probing {
+        name: format!("rbn compare feed {}", host_port(&host, port)),
+        keys: RBN_COMPARE_KEYS,
+        host,
+        port,
+        budget,
+        pending: Pending::spawn(budget, move || {
+            uplink_probe(&target, port, budget, resolve, connect)
+        }),
+    }
 }
 
 /// Every `rbn uplink` row, probed concurrently, in config order.
@@ -981,6 +1051,23 @@ mod tests {
         assert!(check.fix.unwrap().contains("rbn_uplink.login_callsign"));
     }
 
+    /// MAN-301: the scaffold's `[rbn_compare]` example login is refused
+    /// like the uplink's, so a node never logs in to RBN as N0CALL.
+    #[test]
+    fn config_check_fails_on_the_example_rbn_compare_login() {
+        let (_dir, path, l) = loaded(
+            "[server]\nstation_callsign = \"W1AW\"\n[rbn_compare]\nenabled = true\n\
+             login_callsign = \"N0CALL\"\n",
+        );
+        let check = config_check(Some(&path), &l, false);
+        assert_eq!(check.status, Status::Fail);
+        assert_eq!(
+            check.detail,
+            "rbn_compare.login_callsign is still the example \"N0CALL\", so manta run refuses \
+             to start"
+        );
+    }
+
     #[test]
     fn config_check_fails_when_run_would_demand_a_dial_frequency() {
         let (_dir, path, l) = loaded(
@@ -1298,12 +1385,15 @@ mod tests {
             std::thread::sleep(timeout);
             Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"))
         }
-        // A budget below one reserve: each address gets an even share, so
-        // the first black hole cannot spend all of it.
+        // A budget below the reserves two later addresses would need: each
+        // address gets an even share (500 ms), so the first black hole
+        // cannot spend all of it. The share leaves room for the black holes'
+        // sleeps to overrun on a loaded runner; at 600 ms (200 ms shares) a
+        // macOS CI oversleep left the loopback attempt nothing.
         let got = uplink_probe(
             "h",
             port,
-            Duration::from_millis(600),
+            Duration::from_millis(1500),
             three,
             two_black_holes,
         );
@@ -1601,5 +1691,137 @@ mod tests {
                 assert!(text.contains(needle), "{rel} lacks {needle}");
             }
         }
+    }
+
+    // --- rbn compare feed (MAN-301) ---------------------------------------
+
+    fn rbn_compare_cfg(body: &str) -> Option<RbnCompareConfig> {
+        let (_dir, _path, l) = loaded(&format!(
+            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\ntelnet_port = \
+             0\njson_port = 0\nmetrics_port = 0\n{body}"
+        ));
+        l.rbn_compare
+    }
+
+    fn rbn_compare_row(
+        cfg: Option<&RbnCompareConfig>,
+        resolve: ResolveFn,
+        connect: ConnectFn,
+    ) -> Check {
+        start_rbn_compare_check(cfg, Duration::from_millis(200), resolve, connect).finish()
+    }
+
+    #[test]
+    fn rbn_compare_feed_check_skips_when_off() {
+        for cfg in [None, rbn_compare_cfg("[rbn_compare]\nenabled = false\n")] {
+            let check = rbn_compare_row(cfg.as_ref(), resolve_host, connect_host);
+            assert_eq!(
+                render(&check),
+                "SKIP  rbn compare feed: [rbn_compare] is off\n"
+            );
+        }
+    }
+
+    fn refused(_: &SocketAddr, _: Duration) -> io::Result<TcpStream> {
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ))
+    }
+
+    fn unresolvable(_: &str, _: u16) -> io::Result<Vec<SocketAddr>> {
+        Err(io::Error::other("failed to lookup address information"))
+    }
+
+    fn unreachable_net(_: &SocketAddr, _: Duration) -> io::Result<TcpStream> {
+        Err(io::Error::other("network is unreachable"))
+    }
+
+    #[test]
+    fn rbn_compare_feed_check_reports_pass_and_each_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cfg = rbn_compare_cfg(&format!(
+            "[rbn_compare]\nenabled = true\nfeed_host = \"127.0.0.1\"\nfeed_port = {port}\n"
+        ));
+        let pass = rbn_compare_row(cfg.as_ref(), resolve_host, connect_host);
+        assert_eq!(pass.name, format!("rbn compare feed 127.0.0.1:{port}"));
+        assert_eq!(pass.status, Status::Pass, "{pass:?}");
+        assert!(
+            pass.detail.starts_with("accepted a connection in ") && pass.detail.ends_with(" ms"),
+            "{}",
+            pass.detail
+        );
+
+        let cfg = rbn_compare_cfg("[rbn_compare]\nenabled = true\n");
+        let name = "rbn compare feed telnet.reversebeacon.net:7000";
+        let dns = rbn_compare_row(cfg.as_ref(), unresolvable, connect_host);
+        assert_eq!(dns.name, name);
+        assert_eq!(dns.status, Status::Fail);
+        assert!(
+            dns.detail
+                .starts_with("could not look up telnet.reversebeacon.net"),
+            "{}",
+            dns.detail
+        );
+        assert_eq!(
+            dns.fix.as_deref(),
+            Some(
+                "check [rbn_compare].feed_host, and this machine's DNS (try nslookup \
+                 telnet.reversebeacon.net)"
+            )
+        );
+        let refused_row = rbn_compare_row(cfg.as_ref(), loopback, refused);
+        assert_eq!(refused_row.status, Status::Fail);
+        assert!(refused_row.detail.starts_with("refused the connection ("));
+        let fix = refused_row.fix.as_deref().unwrap();
+        assert!(
+            fix.starts_with("check [rbn_compare].feed_port; if it is right, RBN's feed is down"),
+            "{fix}"
+        );
+        let timed_out = rbn_compare_row(cfg.as_ref(), loopback, black_hole);
+        assert_eq!(timed_out.status, Status::Fail);
+        assert_eq!(timed_out.detail, "did not answer within 0.2 s");
+        let fix = timed_out.fix.as_deref().unwrap();
+        assert!(
+            fix.contains("firewall") && fix.ends_with("and [rbn_compare].feed_host"),
+            "{fix}"
+        );
+        let other = rbn_compare_row(cfg.as_ref(), loopback, unreachable_net);
+        assert_eq!(other.status, Status::Fail);
+        assert_eq!(other.detail, "could not connect: network is unreachable");
+        // The uplink rows keep their own key names.
+        let uplink = uplink_checks(
+            &uplinks(&uplink_block("h", 1, true)),
+            Duration::from_millis(200),
+            unresolvable,
+            connect_host,
+        );
+        assert!(uplink[0]
+            .fix
+            .as_deref()
+            .unwrap()
+            .starts_with("check target_host in this [[rbn_uplink]] block"));
+    }
+
+    #[test]
+    fn rbn_compare_feed_check_sends_nothing() {
+        use std::io::Read as _;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cfg = rbn_compare_cfg(&format!(
+            "[rbn_compare]\nenabled = true\nfeed_host = \"127.0.0.1\"\nfeed_port = {port}\n\
+             login_callsign = \"W1AW\"\n"
+        ));
+        let check = rbn_compare_row(cfg.as_ref(), resolve_host, connect_host);
+        assert_eq!(check.status, Status::Pass, "{check:?}");
+        let (mut conn, _) = listener.accept().unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = Vec::new();
+        assert_eq!(
+            conn.read_to_end(&mut buf).unwrap(),
+            0,
+            "doctor sent {buf:?}"
+        );
     }
 }

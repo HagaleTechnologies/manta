@@ -6,10 +6,16 @@
 //! decode pipeline, and a subscriber that falls too far behind gets
 //! `RecvError::Lagged` instead of stalling the sender -- callers should
 //! treat `Lagged` as "disconnect this client," not "catch up."
+//!
+//! Two channels carry the same spots (MAN-301): telnet and the RBN uplink
+//! read [`SpotBus::subscribe`], spots only; the JSON stream reads
+//! [`SpotBus::subscribe_json`], which carries every spot plus, with
+//! `[rbn_compare]` enabled, each `spotGrade` record in publish order. With
+//! no grades published the JSON channel carries exactly the spots.
 
 use manta_spot::Spot;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::broadcast;
 
@@ -54,6 +60,14 @@ const MAX_OCCURRENCE_ENTRIES: usize = 20_000;
 pub struct BusSpot {
     pub spot: Spot,
     pub occurrence_count: u32,
+}
+
+/// One item on the JSON stream's channel (MAN-301): a spot, or one already
+/// serialised `spotGrade` line, written to clients verbatim.
+#[derive(Debug, Clone)]
+pub enum JsonItem {
+    Spot(BusSpot),
+    Grade(Arc<str>),
 }
 
 /// Bounded, LRU-on-touch tracker for `SpotBus::occurrence_counts` (MAN-62).
@@ -139,6 +153,7 @@ impl History {
 
 pub struct SpotBus {
     tx: broadcast::Sender<BusSpot>,
+    json_tx: broadcast::Sender<JsonItem>,
     epoch: SystemTime,
     session_nonce: u128,
     sample_rate_hz: f64,
@@ -165,8 +180,10 @@ impl SpotBus {
     /// reconflate them.
     pub fn new(sample_rate_hz: f64, epoch: SystemTime, session_nonce: u128) -> Self {
         let (tx, _rx) = broadcast::channel(CHANNEL_CAPACITY);
+        let (json_tx, _json_rx) = broadcast::channel(CHANNEL_CAPACITY);
         Self {
             tx,
+            json_tx,
             epoch,
             session_nonce,
             sample_rate_hz,
@@ -224,12 +241,25 @@ impl SpotBus {
             // uncounted (round-11 review finding).
             recent.push(bus_spot.clone(), self.window_samples)
         };
+        let _ = self.json_tx.send(JsonItem::Spot(bus_spot.clone()));
         let _ = self.tx.send(bus_spot);
         truncated
     }
 
+    /// Publishes one serialised `spotGrade` line (MAN-301) to JSON-stream
+    /// subscribers only. Telnet and the uplink never see it.
+    pub fn publish_grade(&self, line: Arc<str>) {
+        let _ = self.json_tx.send(JsonItem::Grade(line));
+    }
+
+    /// Spots only: the telnet server, the RBN uplink and the comparator.
     pub fn subscribe(&self) -> broadcast::Receiver<BusSpot> {
         self.tx.subscribe()
+    }
+
+    /// Spots and grades in publish order: the JSON/WebSocket stream.
+    pub fn subscribe_json(&self) -> broadcast::Receiver<JsonItem> {
+        self.json_tx.subscribe()
     }
 
     /// Opaque session identity -- combined (alongside `track_id`/
@@ -284,7 +314,7 @@ impl SpotBus {
     }
 }
 
-/// Total spots a subscriber will never receive once disconnected right
+/// Total items (spots, or on the JSON channel spots and grades) a subscriber will never receive once disconnected right
 /// after a `Lagged(n)` error: `n` (already evicted from the channel) plus
 /// whatever's still retained in `rx`'s own buffer (`rx.len()`) that a
 /// caller choosing to disconnect (ARCHITECTURE §7: slow clients are
@@ -293,7 +323,7 @@ impl SpotBus {
 /// item counted, not just the evicted portion (round-9 review finding).
 /// Shared by the telnet, JSON/TCP, and WebSocket handlers so all three
 /// count loss the same way.
-pub fn total_lag_loss(n: u64, rx: &broadcast::Receiver<BusSpot>) -> u64 {
+pub fn total_lag_loss<T: Clone>(n: u64, rx: &broadcast::Receiver<T>) -> u64 {
     n + rx.len() as u64
 }
 
@@ -389,6 +419,79 @@ mod tests {
             other => panic!("expected Lagged, got {other:?}"),
         };
         assert_eq!(total_lag_loss(n, &rx), total_published);
+    }
+
+    #[tokio::test]
+    async fn json_subscribers_receive_spots_and_grades_in_publish_order() {
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
+        let mut rx = bus.subscribe_json();
+
+        bus.publish(sample_spot(0));
+        bus.publish_grade(Arc::from("{\"kind\":\"spotGrade\",\"n\":1}"));
+        bus.publish(sample_spot(1));
+        bus.publish_grade(Arc::from("{\"kind\":\"spotGrade\",\"n\":2}"));
+
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(match rx.recv().await.unwrap() {
+                JsonItem::Spot(s) => format!("spot:{}", s.spot.sample_ts),
+                JsonItem::Grade(line) => format!("grade:{line}"),
+            });
+        }
+        assert_eq!(
+            seen,
+            vec![
+                "spot:0".to_string(),
+                "grade:{\"kind\":\"spotGrade\",\"n\":1}".to_string(),
+                "spot:1".to_string(),
+                "grade:{\"kind\":\"spotGrade\",\"n\":2}".to_string(),
+            ]
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn spot_subscribers_never_receive_grades() {
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
+        let mut rx = bus.subscribe();
+
+        bus.publish_grade(Arc::from("{\"kind\":\"spotGrade\"}"));
+        bus.publish(sample_spot(7));
+        bus.publish_grade(Arc::from("{\"kind\":\"spotGrade\"}"));
+
+        assert_eq!(rx.recv().await.unwrap().spot.sample_ts, 7);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn with_no_grades_published_the_json_channel_carries_exactly_the_spots() {
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
+        let mut spots = bus.subscribe();
+        let mut json = bus.subscribe_json();
+
+        for i in 0..5u64 {
+            bus.publish(sample_spot(i));
+        }
+
+        for _ in 0..5 {
+            let a = spots.recv().await.unwrap();
+            let b = match json.recv().await.unwrap() {
+                JsonItem::Spot(s) => s,
+                JsonItem::Grade(line) => panic!("unexpected grade {line}"),
+            };
+            assert_eq!(a.spot, b.spot);
+            assert_eq!(a.occurrence_count, b.occurrence_count);
+        }
+        assert!(matches!(
+            json.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

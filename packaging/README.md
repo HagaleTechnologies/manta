@@ -433,6 +433,9 @@ accepts connections only from the same machine
 health. Read [network-exposure.md](../docs/RUNBOOKS/network-exposure.md)
 before you change either address.
 
+For a Grafana dashboard and Prometheus alerts, see
+[monitoring](https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md).
+
 ## Upgrading or reinstalling
 
 Stop the service, replace the binary and any kit files that changed, keep

@@ -20,8 +20,11 @@ into a PASS/FAIL verdict. Four subcommands:
                 `end`.
   record-spots  Archive the node's own spots from its JSON Lines port
                 (raw TCP, newline-delimited) into spots-<UTC date>.jsonl
-                files, byte-identical to the wire. Reconnects with the same
-                1 s -> 60 s backoff as crates/manta-server/src/backoff.rs.
+                files, byte-identical to the wire. A node with
+                [rbn_compare] also sends spotGrade records (MAN-301); those
+                go to grades-<UTC date of windowClose>.jsonl. Reconnects
+                with the same 1 s -> 60 s backoff as
+                crates/manta-server/src/backoff.rs.
   report        Turn the ledger (and optionally the spot archive) into a
                 markdown or JSON report with one PASS/FAIL line per
                 criterion (availability D-A, Aggregator connected D-B, a spot
@@ -537,16 +540,38 @@ def validate_spot_line(line):
     return obj
 
 
+def classify_line(body):
+    """Return ("grade", obj) for a MAN-301 `spotGrade` record (`kind` is
+    "spotGrade" and `windowClose` is numeric) or ("spot", obj) for a
+    SpotMessage `validate_spot_line` accepts; else raise ValueError. A grade
+    deliberately carries no dxCall/frequency/timestamp, so it is never
+    mistaken for a spot."""
+    try:
+        obj = json.loads(body.decode("utf-8"))
+    except (ValueError, RecursionError):  # bad UTF-8/JSON, or nested too deep
+        obj = None
+    if isinstance(obj, dict) and obj.get("kind") == "spotGrade":
+        wc = obj.get("windowClose")
+        if not isinstance(wc, bool) and isinstance(wc, (int, float)):
+            try:
+                _utc_day(float(wc))
+            except (OverflowError, OSError, ValueError) as e:
+                raise ValueError("bad windowClose: %s" % e)
+            return "grade", obj
+    return "spot", validate_spot_line(body)
+
+
 class _SpotWriter:
-    def __init__(self, out_dir):
+    def __init__(self, out_dir, prefix="spots-"):
         self.out_dir = out_dir
+        self.prefix = prefix
         self.day = None
         self.fh = None
 
     def write(self, day, raw):
         if day != self.day:
             self.close()
-            self.fh = open(os.path.join(self.out_dir, "spots-%s.jsonl" % day), "ab")
+            self.fh = open(os.path.join(self.out_dir, "%s%s.jsonl" % (self.prefix, day)), "ab")
             self.day = day
         self.fh.write(raw)
         self.fh.flush()
@@ -571,17 +596,20 @@ def record_spots(host, port, out_dir, sleep=time.sleep, should_stop=lambda: Fals
                  stats_out=None):
     """Archive spots from the JSON Lines port until should_stop() is true.
     A connection is productive (resets backoff to 1 s) once it delivered a
-    line or stayed open >= 60 s. Returns counters {connections,
-    disconnects, written, invalid}; `stats_out["stats"]` (if given) is the
+    line or stayed open >= 60 s. MAN-301 `spotGrade` records (a node with
+    [rbn_compare]) go to grades-<UTC date of windowClose>.jsonl instead.
+    Returns counters {connections, disconnects, written, grades, invalid};
+    `written` counts spots only. `stats_out["stats"]` (if given) is the
     same live dict, for tests driving should_stop."""
     if log is None:
         def log(msg):
             print("record-spots: " + msg, file=sys.stderr, flush=True)
     os.makedirs(out_dir, exist_ok=True)
-    stats = {"connections": 0, "disconnects": 0, "written": 0, "invalid": 0}
+    stats = {"connections": 0, "disconnects": 0, "written": 0, "grades": 0, "invalid": 0}
     if stats_out is not None:
         stats_out["stats"] = stats
     writer = _SpotWriter(out_dir)
+    grade_writer = _SpotWriter(out_dir, prefix="grades-")
     backoff = BACKOFF_INITIAL_S
     try:
         while not should_stop():
@@ -615,10 +643,15 @@ def record_spots(host, port, out_dir, sleep=time.sleep, should_stop=lambda: Fals
                             if not body.strip():
                                 continue
                             try:
-                                obj = validate_spot_line(body)
+                                kind, obj = classify_line(body)
                             except ValueError as e:
                                 stats["invalid"] += 1
                                 log("invalid line skipped (%s): %r" % (e, line[:200]))
+                                continue
+                            if kind == "grade":
+                                grade_writer.write(_utc_day(float(obj["windowClose"])),
+                                                   line + b"\n")
+                                stats["grades"] += 1
                                 continue
                             writer.write(_utc_day(float(obj["timestamp"])), line + b"\n")
                             stats["written"] += 1
@@ -638,6 +671,7 @@ def record_spots(host, port, out_dir, sleep=time.sleep, should_stop=lambda: Fals
             backoff = next_backoff(backoff, False)
     finally:
         writer.close()
+        grade_writer.close()
     return stats
 
 
@@ -1408,7 +1442,9 @@ def build_parser():
     rp_ = sub.add_parser("record-spots", help="archive the node's spots from its JSON Lines port",
                          formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     rp_.add_argument("--json-addr", required=True, help="HOST:PORT of the node's JSON Lines listener")
-    rp_.add_argument("--out-dir", required=True, help="directory for spots-YYYY-MM-DD.jsonl files")
+    rp_.add_argument("--out-dir", required=True,
+                     help="directory for spots-YYYY-MM-DD.jsonl files (and, from a node with "
+                          "[rbn_compare], grades-YYYY-MM-DD.jsonl)")
 
     rep = sub.add_parser("report",
         help="turn the ledger into the scenario-1 PASS/FAIL report",

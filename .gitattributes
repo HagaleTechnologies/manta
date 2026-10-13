@@ -1,0 +1,3 @@
+# Byte-exact test fixtures: Windows checkouts must not rewrite them to CRLF
+# (manta grade writes LF; grade_cmd.rs compares byte for byte).
+crates/manta-cli/tests/fixtures/rbn_grade/** text eol=lf

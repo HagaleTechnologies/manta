@@ -14,6 +14,7 @@ pub mod crash;
 pub mod decimate;
 pub mod floor;
 pub mod freqest;
+pub mod fsk;
 pub mod hilbert;
 pub mod proto;
 pub mod refine;

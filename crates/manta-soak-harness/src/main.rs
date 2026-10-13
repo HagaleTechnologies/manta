@@ -452,6 +452,7 @@ fn main() -> Result<()> {
                 "silent": s.close_counts.silent,
                 "merged": s.close_counts.merged,
                 "evicted": s.close_counts.evicted,
+                "rtty": s.close_counts.rtty,
             },
             "static_crashes": s.static_crashes,
         });
@@ -576,6 +577,7 @@ fn main() -> Result<()> {
             "silent": report.final_close_counts.silent,
             "merged": report.final_close_counts.merged,
             "evicted": report.final_close_counts.evicted,
+            "rtty": report.final_close_counts.rtty,
         },
         "static_crashes": report.final_static_crashes,
         "man19_criteria": {

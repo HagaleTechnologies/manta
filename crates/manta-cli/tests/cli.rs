@@ -1231,6 +1231,119 @@ fn decode_json_includes_spots_field() {
     );
 }
 
+/// MAN-314: writes a 25 s, 96 kHz WAV holding one 30 dB, 170 Hz RTTY
+/// signal (mark 15 kHz above a 14.07 MHz centre) and returns its path.
+fn write_rtty_wav(dir: &Path) -> PathBuf {
+    let fs = 96_000.0;
+    let (mut iq, _) = manta_testkit::scene::render_scene(&[], fs, 25.0, Some(5)).unwrap();
+    manta_testkit::fsk::add_fsk(
+        &mut iq,
+        fs,
+        &manta_testkit::fsk::FskSpec {
+            mark_offset_hz: 15_000.0,
+            shift_hz: 170.0,
+            baud: 45.45,
+            snr_2500_db: 30.0,
+            text: "CQ TEST DE W1AW W1AW RYRYRY 599 001 ".into(),
+            start_s: 0.0,
+            watterson: None,
+            seed: 1,
+        },
+    );
+    manta_testkit::wav::write_fixture(dir, "rtty", &iq, fs, 14_070_000.0).unwrap()
+}
+
+#[test]
+fn decode_json_has_rtty_array() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = short_v1();
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let out = manta()
+        .args(["decode", "--json"])
+        .arg(dir.path().join(format!("{}.wav", spec.name)))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["rtty"], serde_json::json!([]));
+
+    let wav = write_rtty_wav(dir.path());
+    let out = manta()
+        .args(["decode", "--json"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rtty = report["rtty"].as_array().unwrap();
+    assert_eq!(rtty.len(), 1, "{report}");
+    assert_eq!(rtty[0]["shift_hz"], 170.0);
+    assert!(rtty[0]["cleared_sample_ts"].is_null());
+}
+
+#[test]
+fn decode_plain_prints_rtty_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = short_v1();
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let out = manta()
+        .arg("decode")
+        .arg(dir.path().join(format!("{}.wav", spec.name)))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    // No RTTY, no line: MAN-270 keeps a CW-only decode's summary one line.
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("rtty:"));
+
+    let wav = write_rtty_wav(dir.path());
+    let out = manta().arg("decode").arg(&wav).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("rtty: 1 ("), "{stderr}");
+    assert!(stderr.contains("shift 170 Hz"), "{stderr}");
+}
+
+/// Codex review on PR #272: `run`'s `RTTY cleared` line counts the
+/// recording's time, not the wall time a faster-than-real-time file replay
+/// took. The signal is marked about 21 s into the 25 s file and cleared at
+/// its end.
+#[test]
+fn run_logs_rtty_marked_for_in_stream_seconds() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = write_rtty_wav(dir.path());
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(&wav)
+        .arg("--source-iq")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("RTTY cleared:"))
+        .unwrap_or_else(|| panic!("no RTTY cleared line: {stderr}"));
+    let secs: u64 = line
+        .split("marked for ")
+        .nth(1)
+        .and_then(|rest| rest.strip_suffix(" s"))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("unparsable line: {line}"));
+    assert!((3..=5).contains(&secs), "{line}");
+}
+
 /// MAN-28 Watch List: an operator running `manta decode` on a real
 /// recording must be able to force-spot a callsign that fails automatic
 /// validation, via `--allowlist`. `decode` is the only subcommand

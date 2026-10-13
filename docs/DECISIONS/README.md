@@ -11,7 +11,14 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+<<<<<<< HEAD
 | 2026-10-13 | MAN-312 | [MAN-312: band-wide static crashes start no tracks and are not decoded](2026-10-13-man312-static-crash-filter.md) |
+=======
+| 2026-10-12 | MAN-129 | [MAN-129: a shipped Grafana dashboard and Prometheus alert rules](2026-10-12-man129-dashboard-and-alerts.md) |
+| 2026-10-12 | MAN-118 | [MAN-118: decode-quality signals on `/metrics`](2026-10-12-man118-decode-quality-metrics.md) |
+| 2026-10-11 | MAN-314 | [MAN-314: RTTY recognition keeps RTTY out of CW tracks](2026-10-11-man314-rtty-recognition.md) |
+| 2026-10-11 | MAN-301 | [MAN-301: grade every manta spot live against what the RBN heard](2026-10-11-man301-live-rbn-comparison.md) |
+>>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
 | 2026-10-11 | MAN-298 | [MAN-298: the first release (v0.1.0)](2026-10-11-man298-first-release.md) |
 | 2026-10-11 | MAN-81 | [MAN-81: the Docker image runs a mounted config and reports its own health](2026-10-11-man81-docker-config-mount-and-healthcheck.md) |
 | 2026-10-11 | MAN-115 | [MAN-115: start-up latency before the first decode](2026-10-11-man115-startup-latency.md) |
