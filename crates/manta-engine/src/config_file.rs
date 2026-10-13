@@ -15,9 +15,10 @@
 //!
 //! Keys are SPEC §9's `on_snr_db`, `off_snr_db`, `confirm_ms`, `hang_ms`,
 //! `gc_ms` and `warmup_ms`, plus `track_cap` (ARCHITECTURE §4, configurable per §8) and
-//! `silent_respawn_cooldown_ms` (MAN-171), plus `rtty_filter` and
+//! `silent_respawn_cooldown_ms` (MAN-171), `rtty_filter` and
 //! `rtty_dwell_ms` (MAN-314, SPEC §2.6; the dwell must be at least one
-//! 1000 ms detector block). Every key is an `Option`
+//! 1000 ms detector block), and `crash_filter` (MAN-312, SPEC §2.7:
+//! `"full"`, `"starts-only"` or `"off"`). Every key is an `Option`
 //! overlaid on `DetectorConfig::default()`, so an absent key keeps the exact
 //! default hop count instead of round-tripping it through milliseconds.
 //! Millisecond keys convert with `manta_decode::ms_to_hops`, SPEC §1.1's
@@ -39,7 +40,7 @@
 //! fields here; `manta-cli` rejects them with a specific "not configurable
 //! yet" message before this struct ever sees them.
 
-use crate::track::DetectorConfig;
+use crate::track::{CrashFilter, DetectorConfig};
 use manta_decode::{ms_to_hops, HOP_MS};
 use serde::Deserialize;
 
@@ -61,6 +62,8 @@ pub struct DetectorConfigToml {
     pub warmup_ms: Option<f64>,
     pub track_cap: Option<usize>,
     pub silent_respawn_cooldown_ms: Option<f64>,
+    /// MAN-312 (SPEC §2.7): `"full"`, `"starts-only"` or `"off"`.
+    pub crash_filter: Option<CrashFilter>,
     pub rtty_filter: Option<bool>,
     pub rtty_dwell_ms: Option<f64>,
 }
@@ -91,6 +94,7 @@ impl DetectorConfigToml {
                 d.silent_respawn_cooldown_hops,
                 false,
             )?,
+            crash_filter: self.crash_filter.unwrap_or(d.crash_filter),
             rtty_filter: self.rtty_filter.unwrap_or(d.rtty_filter),
             rtty_dwell_hops: rtty_dwell(self.rtty_dwell_ms, d.rtty_dwell_hops)?,
         })
@@ -180,6 +184,28 @@ mod tests {
     #[test]
     fn empty_table_is_the_default() {
         assert_eq!(parse("").unwrap(), DetectorConfig::default());
+        assert_eq!(parse("").unwrap().crash_filter, CrashFilter::Full);
+    }
+
+    #[test]
+    fn crash_filter_values_parse() {
+        for (v, want) in [
+            ("full", CrashFilter::Full),
+            ("starts-only", CrashFilter::StartsOnly),
+            ("off", CrashFilter::Off),
+        ] {
+            let cfg = parse(&format!("crash_filter = \"{v}\"")).unwrap();
+            assert_eq!(cfg.crash_filter, want, "{v}");
+            assert_eq!(v.parse::<CrashFilter>(), Ok(want), "{v}");
+        }
+    }
+
+    #[test]
+    fn bad_crash_filter_is_rejected() {
+        let e = err("crash_filter = \"sometimes\"");
+        assert!(e.contains("sometimes"), "{e}");
+        assert!(e.contains("starts-only"), "{e}");
+        assert!("sometimes".parse::<CrashFilter>().is_err());
     }
 
     #[test]

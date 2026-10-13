@@ -147,6 +147,12 @@ MAN-127: `manta calibrate` measures the receiver's ppm offset against a
 known carrier and saves `[input].freq_correction_ppm` after confirmation —
 see docs/DECISIONS/2026-10-11-man127-calibrate-command.md.
 
+MAN-312: `[detector].crash_filter` (`full` default / `starts-only` / `off`)
+stops band-wide static crashes (≥ 3 dB on three quarters of the passband's
+channels for ≥ 8 ms) from starting tracks or decoding inside them; counted
+as `manta_static_crashes_total`; VC1–VC3 vectors — see
+docs/DECISIONS/2026-10-13-man312-static-crash-filter.md.
+
 MAN-118: `/metrics` reports decode quality node-wide, with no `track_id`
 label: `manta_decode_chars_total`/`manta_decode_garbles_total`,
 `manta_track_rail_ratio` (each `legacy` track's keying-rail ratio once per
