@@ -432,7 +432,10 @@ impl Validator {
     /// The decisions recorded since the last call, oldest first. Empty
     /// when recording is off.
     pub fn take_decisions(&mut self) -> Vec<Decision> {
-        self.decisions.as_mut().map(std::mem::take).unwrap_or_default()
+        self.decisions
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// MAN-324: the grammar- and cty-plausible words decoded on
@@ -1564,9 +1567,7 @@ impl Validator {
             // speed rejection (`blocklisted_beacon_above_max_wpm_still_counts_as_suppressed`),
             // so lists reloaded since capture are still counted here (MAN-78).
             for pb in &pending {
-                let reason = self
-                    .operator_suppressed(pb)
-                    .unwrap_or(Reason::BeaconSpeed);
+                let reason = self.operator_suppressed(pb).unwrap_or(Reason::BeaconSpeed);
                 self.decide(|| beacon_decision(track_id, pb, reason));
             }
             return Vec::new();
@@ -1831,7 +1832,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             .filter(|d| d.reason == Some(Reason::Variant))
             .collect();
         assert!(!variant.is_empty(), "{log:?}");
-        let rival = variant[0].rival.as_ref().expect("a variant withhold names its rival");
+        let rival = variant[0]
+            .rival
+            .as_ref()
+            .expect("a variant withhold names its rival");
         assert_eq!(rival.call, "K5ARH");
         assert_eq!(rival.support.reps, 2);
         assert_eq!(variant[0].verdict, Verdict::Withheld);
@@ -1897,13 +1901,19 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn a_beacon_is_deferred_then_decided_when_its_track_ends() {
         // Deferred, then spotted at a plausible final speed.
         let mut v = recording(CTY_FIXTURE);
-        run(&transmission_events(1, &["V", "V", "V", "K5ARH", "K"], 0), &mut v);
+        run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH", "K"], 0),
+            &mut v,
+        );
         let log = v.take_decisions();
         let d = decisions_for(&log, "K5ARH");
         assert_eq!(d.len(), 1, "{log:?}");
         assert_eq!(d[0].verdict, Verdict::Deferred);
         assert_eq!(d[0].reason, Some(Reason::BeaconPending));
-        v.ingest(&DecoderEvent::SpeedUpdate { track_id: 1, wpm: 22.0 });
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
         let spots = v.ingest(&DecoderEvent::TrackClosed {
             track_id: 1,
             closure: ClosureKind::SignalEnded,
@@ -1916,9 +1926,15 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
 
         // Rejected for speed.
         let mut v = recording(CTY_FIXTURE);
-        run(&transmission_events(1, &["V", "V", "V", "K5ARH", "K"], 0), &mut v);
+        run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH", "K"], 0),
+            &mut v,
+        );
         v.take_decisions();
-        v.ingest(&DecoderEvent::SpeedUpdate { track_id: 1, wpm: 60.0 });
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 60.0,
+        });
         v.ingest(&DecoderEvent::TrackClosed {
             track_id: 1,
             closure: ClosureKind::SignalEnded,
@@ -1929,7 +1945,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
 
         // Discarded on a bookkeeping close with no survivor.
         let mut v = recording(CTY_FIXTURE);
-        run(&transmission_events(1, &["V", "V", "V", "K5ARH", "K"], 0), &mut v);
+        run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH", "K"], 0),
+            &mut v,
+        );
         v.take_decisions();
         v.ingest(&DecoderEvent::TrackClosed {
             track_id: 1,
@@ -2002,8 +2021,14 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let mut v = recording(CTY_FIXTURE);
         seed_meta(&mut v, 2);
         run(&transmission_events(1, &["DE", "K5ARH", "K"], 0), &mut v);
-        run(&transmission_events(1, &["DE", "K5ARX", "K"], 100_000), &mut v);
-        run(&transmission_events(1, &["DE", "K5ARH", "K"], 400_000), &mut v);
+        run(
+            &transmission_events(1, &["DE", "K5ARX", "K"], 100_000),
+            &mut v,
+        );
+        run(
+            &transmission_events(1, &["DE", "K5ARH", "K"], 400_000),
+            &mut v,
+        );
         run(&transmission_events(2, &["DE", "W1AW", "K"], 0), &mut v);
         let got = v.candidates_for(1, 500_000);
         let calls: Vec<&str> = got.iter().map(|c| c.call.as_str()).collect();

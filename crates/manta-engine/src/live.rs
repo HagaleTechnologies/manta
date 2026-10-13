@@ -424,7 +424,13 @@ pub(crate) mod tests {
         let recs = sink.take();
         let t = tracks(&recs)[0];
         assert_eq!((t.freq_hz, t.wpm, t.snr_2500_db), (None, None, None));
-        tap.observe(&DecoderEvent::SpeedUpdate { track_id: 1, wpm: 21.4 }, &v);
+        tap.observe(
+            &DecoderEvent::SpeedUpdate {
+                track_id: 1,
+                wpm: 21.4,
+            },
+            &v,
+        );
         chars(&mut tap, &v, 1, "B", &mut ts);
         tap.end_batch(&v);
         assert_eq!(tracks(&sink.take())[0].wpm, Some(21.4));
@@ -438,13 +444,26 @@ pub(crate) mod tests {
         let mut ts = 0;
         chars(&mut tap, &v, 3, "ABC", &mut ts);
         chars(&mut tap, &v, 1, "XYZ", &mut ts);
-        tap.observe(&DecoderEvent::SpeedUpdate { track_id: 2, wpm: 20.0 }, &v);
+        tap.observe(
+            &DecoderEvent::SpeedUpdate {
+                track_id: 2,
+                wpm: 20.0,
+            },
+            &v,
+        );
         tap.end_batch(&v);
         let recs = sink.take();
         let ids: Vec<u32> = tracks(&recs).iter().map(|t| t.track_id).collect();
-        assert_eq!(ids, [1, 3], "one record per dirty track, none for a speed-only track");
+        assert_eq!(
+            ids,
+            [1, 3],
+            "one record per dirty track, none for a speed-only track"
+        );
         tap.end_batch(&v);
-        assert!(sink.take().is_empty(), "nothing changed in the second batch");
+        assert!(
+            sink.take().is_empty(),
+            "nothing changed in the second batch"
+        );
     }
 
     #[test]
@@ -513,7 +532,11 @@ pub(crate) mod tests {
         ts += 2 * fs;
         tap.maybe_tick(&mut tm, ts);
         let recs = sink.take();
-        assert_eq!(recs.len(), 1, "a long batch gives one sample, not one per second");
+        assert_eq!(
+            recs.len(),
+            1,
+            "a long batch gives one sample, not one per second"
+        );
         let LiveRecord::Bands(b) = &recs[0] else {
             panic!("{recs:?}")
         };

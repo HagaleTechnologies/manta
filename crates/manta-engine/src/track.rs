@@ -2920,7 +2920,13 @@ mod tests {
         let center = 14_000_000.0;
         let ch = manta_dsp::channelizer::Channelizer::new(fs, center).unwrap();
         let n = ch.n_channels();
-        let mut tm = TrackManager::new(n, fs, center, DetectorConfig::default(), DecodeConfig::default());
+        let mut tm = TrackManager::new(
+            n,
+            fs,
+            center,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
         let levels = tm.take_channel_levels();
         assert_eq!(levels.len(), n);
         for w in levels.windows(2) {
@@ -2936,7 +2942,13 @@ mod tests {
 
     #[test]
     fn occupancy_window_reports_a_channel_that_rose_once_then_resets() {
-        let mut tm = TrackManager::new(64, 96_000.0, 14_000_000.0, DetectorConfig::default(), DecodeConfig::default());
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
         tm.enable_occupancy_window();
         feed_warmup(&mut tm, 64);
         tm.take_channel_levels();
@@ -2959,7 +2971,9 @@ mod tests {
             .collect();
         let k10_freq = 14_000_000.0 + wrapped_channel_offset(10, 64) * 1500.0;
         assert!(
-            levels.iter().any(|l| l.occupied && (l.freq_hz - k10_freq).abs() < 1e-6),
+            levels
+                .iter()
+                .any(|l| l.occupied && (l.freq_hz - k10_freq).abs() < 1e-6),
             "{occupied:?}"
         );
         for m in (m0 + 400)..(m0 + 800) {
@@ -2971,7 +2985,13 @@ mod tests {
     #[test]
     fn occupancy_tracking_never_changes_events() {
         let run = |occupancy: bool| {
-            let mut tm = TrackManager::new(64, 96_000.0, 14_000_000.0, DetectorConfig::default(), DecodeConfig::default());
+            let mut tm = TrackManager::new(
+                64,
+                96_000.0,
+                14_000_000.0,
+                DetectorConfig::default(),
+                DecodeConfig::default(),
+            );
             if occupancy {
                 tm.enable_occupancy_window();
             }
@@ -2992,7 +3012,13 @@ mod tests {
 
     #[test]
     fn decoding_track_freqs_lists_only_tracks_holding_a_decoder() {
-        let mut tm = TrackManager::new(64, 96_000.0, 14_000_000.0, DetectorConfig::default(), DecodeConfig::default());
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
         feed_warmup(&mut tm, 64);
         assert!(tm.decoding_track_freqs_hz().is_empty());
         let mut power = quiet_power(64);

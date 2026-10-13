@@ -323,7 +323,11 @@ mod tests {
         let now = window_samples + 20_000;
         let got = ledger.candidates(1, now);
         let calls: Vec<&str> = got.iter().map(|(c, _)| c.as_str()).collect();
-        assert_eq!(calls, ["K5ARH", "K5ARX"], "aged-out and other tracks' words are absent");
+        assert_eq!(
+            calls,
+            ["K5ARH", "K5ARX"],
+            "aged-out and other tracks' words are absent"
+        );
         for (call, s) in &got {
             assert_eq!(*s, ledger.support(1, call, now));
         }

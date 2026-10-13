@@ -114,7 +114,10 @@ fn sample_spot() -> Spot {
 async fn wait_for_live_subscribers(bus: &SpotBus, n: usize) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while bus.live_receiver_count() < n {
-        assert!(Instant::now() < deadline, "live subscribers never reached {n}");
+        assert!(
+            Instant::now() < deadline,
+            "live subscribers never reached {n}"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -217,7 +220,10 @@ async fn a_live_client_that_stops_reading_is_dropped_and_publishing_never_blocks
                 .await
                 .expect("the reading client stalled")
                 .unwrap();
-            assert!(n > 0, "the reading client was disconnected after {got} lines");
+            assert!(
+                n > 0,
+                "the reading client was disconnected after {got} lines"
+            );
             let idx: usize = line[..line.find(' ').unwrap()].parse().unwrap();
             assert_eq!(idx, got, "lines arrive in order");
             got += 1;
@@ -250,7 +256,10 @@ async fn a_live_client_that_stops_reading_is_dropped_and_publishing_never_blocks
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        assert!(Instant::now() < deadline, "the stalled client was never dropped");
+        assert!(
+            Instant::now() < deadline,
+            "the stalled client was never dropped"
+        );
         match tokio::time::timeout(Duration::from_secs(30), stalled.read(&mut buf)).await {
             Ok(Ok(0)) | Ok(Err(_)) => break,
             Ok(Ok(_)) => continue,
@@ -259,7 +268,10 @@ async fn a_live_client_that_stops_reading_is_dropped_and_publishing_never_blocks
     }
     assert!(node.metrics.live_records_dropped() > 0);
     let text = node.metrics.render_prometheus_text();
-    assert!(text.contains("manta_spots_dropped_lagged_total 0\n"), "{text}");
+    assert!(
+        text.contains("manta_spots_dropped_lagged_total 0\n"),
+        "{text}"
+    );
     assert_eq!(node.metrics.spots_dropped_write_failed_total(), 0);
     assert_eq!(node.metrics.spots_dropped_shutdown_total(), 0);
 }
@@ -274,7 +286,10 @@ async fn the_live_listener_admits_at_most_32_clients() {
     }
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     assert_eq!(node.bus.live_receiver_count(), MAX_LIVE_STREAM_CONNECTIONS);
-    assert_eq!(node.metrics.live_clients(), MAX_LIVE_STREAM_CONNECTIONS as i64);
+    assert_eq!(
+        node.metrics.live_clients(),
+        MAX_LIVE_STREAM_CONNECTIONS as i64
+    );
     // Freeing one slot admits a waiting client.
     drop(clients.remove(0));
     tokio::time::sleep(Duration::from_millis(1_000)).await;

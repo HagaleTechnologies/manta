@@ -10,10 +10,10 @@ pub use listen::{
 };
 pub mod latency;
 pub mod live;
+pub use latency::{DecodeLatencyObserver, DecodeLatencySnapshot, DECODE_LATENCY_BUCKETS_SECONDS};
 pub use live::{
     BandSample, LiveRecord, LiveStateSink, TrackSnapshot, LIVE_MAX_CANDIDATES, LIVE_TEXT_CHARS,
 };
-pub use latency::{DecodeLatencyObserver, DecodeLatencySnapshot, DECODE_LATENCY_BUCKETS_SECONDS};
 pub mod quality;
 pub use quality::{DecodeQualityObserver, DecodeQualitySnapshot, RAIL_RATIO_BUCKETS};
 pub mod calibrate;

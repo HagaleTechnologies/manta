@@ -552,7 +552,13 @@ pub fn listen_with_observers(
     let events = seg.tm.process_hops(&seg.ch.process(&padding), |m| {
         seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
     });
-    emit(events, &mut validator, &mut ctx, &mut on_event, &mut on_spot);
+    emit(
+        events,
+        &mut validator,
+        &mut ctx,
+        &mut on_event,
+        &mut on_spot,
+    );
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
     rtty.update(&seg.tm);
@@ -561,7 +567,13 @@ pub fn listen_with_observers(
     let events = seg.tm.process_hops(&seg.ch.process(&calib[..filled]), |m| {
         seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
     });
-    emit(events, &mut validator, &mut ctx, &mut on_event, &mut on_spot);
+    emit(
+        events,
+        &mut validator,
+        &mut ctx,
+        &mut on_event,
+        &mut on_spot,
+    );
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
     rtty.update(&seg.tm);
@@ -624,7 +636,13 @@ pub fn listen_with_observers(
             let events = seg.tm.process_hops(&seg.ch.process(&padding), |m| {
                 seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
             });
-            emit(events, &mut validator, &mut ctx, &mut on_event, &mut on_spot);
+            emit(
+                events,
+                &mut validator,
+                &mut ctx,
+                &mut on_event,
+                &mut on_spot,
+            );
         }
         // MAN-128: steady-state chunk latency, timed from here (after the
         // read and after any outage-segment rebuild above, so a one-off
@@ -637,7 +655,13 @@ pub fn listen_with_observers(
         let events = seg.tm.process_hops(&seg.ch.process(&chunk[..n]), |m| {
             seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
         });
-        emit(events, &mut validator, &mut ctx, &mut on_event, &mut on_spot);
+        emit(
+            events,
+            &mut validator,
+            &mut ctx,
+            &mut on_event,
+            &mut on_spot,
+        );
         let n_tracks = seg.tm.decoding_track_count();
         report_active_tracks(n_tracks);
         rtty.update(&seg.tm);
@@ -652,7 +676,13 @@ pub fn listen_with_observers(
         }
     }
     let events = seg.tm.finish();
-    emit(events, &mut validator, &mut ctx, &mut on_event, &mut on_spot);
+    emit(
+        events,
+        &mut validator,
+        &mut ctx,
+        &mut on_event,
+        &mut on_spot,
+    );
     // `finish()` flushes and drops every decoder and closes every remaining
     // track: nothing is being decoded once the stream has ended, so both
     // observers must settle back to 0 rather than be left holding the last
@@ -747,7 +777,12 @@ mod tests {
     #[test]
     fn live_tap_sends_v1_band_state_every_stream_second() {
         let sink = RecordingSink::wanting();
-        run_vector(&v1_30s(), &PipelineConfig::default(), Some(sink.clone()), |_| {});
+        run_vector(
+            &v1_30s(),
+            &PipelineConfig::default(),
+            Some(sink.clone()),
+            |_| {},
+        );
         let records = sink.take();
         let bands: Vec<&crate::BandSample> = records
             .iter()
@@ -764,7 +799,12 @@ mod tests {
             .collect();
         assert!(!with_track.is_empty());
         for b in with_track {
-            assert_eq!(b.decoding_track_freqs_hz.len(), 1, "{:?}", b.decoding_track_freqs_hz);
+            assert_eq!(
+                b.decoding_track_freqs_hz.len(),
+                1,
+                "{:?}",
+                b.decoding_track_freqs_hz
+            );
             let f = b.decoding_track_freqs_hz[0];
             assert!((14_000_000.0..14_350_000.0).contains(&f), "{f}");
         }
@@ -773,7 +813,12 @@ mod tests {
     #[test]
     fn live_tap_reports_w1aw_text_candidates_and_its_repetition_decision() {
         let sink = RecordingSink::wanting();
-        let spots = run_vector(&v1_30s(), &PipelineConfig::default(), Some(sink.clone()), |_| {});
+        let spots = run_vector(
+            &v1_30s(),
+            &PipelineConfig::default(),
+            Some(sink.clone()),
+            |_| {},
+        );
         let w1aw = spots
             .iter()
             .find(|s| s.callsign == "W1AW")
@@ -823,9 +868,8 @@ mod tests {
         let sink = RecordingSink::wanting();
         let mut seen_freqs = Vec::new();
         run_vector(&v1_30s(), &cfg, Some(sink.clone()), |ev| match ev {
-            DecoderEvent::TrackMeta { freq_hz, .. } | DecoderEvent::TrackPromoted { freq_hz, .. } => {
-                seen_freqs.push(*freq_hz)
-            }
+            DecoderEvent::TrackMeta { freq_hz, .. }
+            | DecoderEvent::TrackPromoted { freq_hz, .. } => seen_freqs.push(*freq_hz),
             _ => {}
         });
         let records = sink.take();
@@ -836,7 +880,12 @@ mod tests {
                     let n = b.channels.len() as f64;
                     for (i, c) in b.channels.iter().enumerate() {
                         let raw = 14_000_000.0 + (i as f64 - n / 2.0) * 93.75;
-                        assert!((c.freq_hz - raw * factor).abs() < 1e-3, "{} vs {}", c.freq_hz, raw * factor);
+                        assert!(
+                            (c.freq_hz - raw * factor).abs() < 1e-3,
+                            "{} vs {}",
+                            c.freq_hz,
+                            raw * factor
+                        );
                     }
                     for f in &b.decoding_track_freqs_hz {
                         assert!(seen_freqs.iter().any(|s| (s - f).abs() < 93.75), "{f}");
@@ -845,7 +894,10 @@ mod tests {
                 LiveRecord::Track(t) => {
                     if let Some(f) = t.freq_hz {
                         saw_track = true;
-                        assert!(seen_freqs.contains(&f), "{f} is a calibrated event frequency");
+                        assert!(
+                            seen_freqs.contains(&f),
+                            "{f} is a calibrated event frequency"
+                        );
                     }
                 }
                 _ => {}

@@ -1689,7 +1689,8 @@ fn recording_decisions_never_changes_spots() {
 United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     K,W,N,AA,AB,AC,DE;
 ";
-    let scenarios: [(&str, &str, &dyn Fn(&mut Validator) -> Vec<Spot>); 6] = [
+    type Scenario<'a> = (&'a str, &'a str, &'a dyn Fn(&mut Validator) -> Vec<Spot>);
+    let scenarios: [Scenario; 6] = [
         ("v14", CTY_FIXTURE, &v14),
         ("v15", CTY_FIXTURE, &v15),
         ("v38", CTY_FIXTURE, &v38),

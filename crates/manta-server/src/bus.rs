@@ -267,9 +267,10 @@ impl SpotBus {
 
     /// Spots only: the telnet server, the RBN uplink and the comparator.
     /// MAN-324: publishes one serialized live-state record to the live
-    /// channel. Never blocks; with no subscriber the line is dropped.
-    pub fn publish_live(&self, line: Arc<str>) {
-        let _ = self.live_tx.send(JsonItem::Live(line));
+    /// channel. Never blocks; with no subscriber the line is dropped and
+    /// this returns false.
+    pub fn publish_live(&self, line: Arc<str>) -> bool {
+        self.live_tx.send(JsonItem::Live(line)).is_ok()
     }
 
     /// MAN-324: a receiver on the live-state channel.

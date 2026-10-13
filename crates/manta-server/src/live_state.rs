@@ -85,15 +85,15 @@ pub fn band_rollup(input: BandInput<'_>) -> Vec<BandRow> {
         std::collections::BTreeMap::new();
     for c in input.channels {
         let band = band_for_freq_hz(c.freq_hz.round());
-        groups
-            .entry((band_order(band), band))
-            .or_default()
-            .push(*c);
+        groups.entry((band_order(band), band)).or_default().push(*c);
     }
     groups
         .into_iter()
         .map(|((_, band), chans)| {
-            let lo = chans.iter().map(|c| c.freq_hz).fold(f64::INFINITY, f64::min);
+            let lo = chans
+                .iter()
+                .map(|c| c.freq_hz)
+                .fold(f64::INFINITY, f64::min);
             let hi = chans
                 .iter()
                 .map(|c| c.freq_hz)
@@ -367,7 +367,10 @@ mod tests {
 
     #[test]
     fn band_rollup_counts_decoding_tracks_per_band() {
-        let channels = [ch(13_999_000.0, -60.0, false), ch(14_001_000.0, -60.0, false)];
+        let channels = [
+            ch(13_999_000.0, -60.0, false),
+            ch(14_001_000.0, -60.0, false),
+        ];
         let rows = rollup(&channels, &[14_012_000.0, 14_020_000.0, 13_990_000.0]);
         assert_eq!(rows[0].band, "20m");
         assert_eq!(rows[0].active_tracks, 2);
@@ -487,8 +490,13 @@ mod tests {
             },
         });
         assert_eq!(
-            serde_json::to_string(&CandidateDecisionRecord::new("W1AW", 1_700_000_044, &d, None))
-                .unwrap(),
+            serde_json::to_string(&CandidateDecisionRecord::new(
+                "W1AW",
+                1_700_000_044,
+                &d,
+                None
+            ))
+            .unwrap(),
             r#"{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000044,"trackId":9,"call":"W4KTNL","frequency":14031200,"band":"20m","spotType":"de","decision":"withheld","reason":"variant","reps":2,"requiredReps":2,"rival":{"call":"W4KCL","reps":2,"confSum":1.016},"spotId":null}"#
         );
         let spot = Spot {
@@ -514,18 +522,53 @@ mod tests {
             r#"{"kind":"candidateDecision","deCall":"W1AW","timestamp":1,"trackId":9,"call":"W4KTNL","frequency":14031200,"band":"20m","spotType":"de","decision":"spotted","reason":null,"reps":2,"requiredReps":2,"rival":null,"spotId":"W1AW:1:9:0:W4KTNL"}"#
         );
         let cases = [
-            (Verdict::Withheld, Reason::Blocklist, "withheld", "blocklist"),
+            (
+                Verdict::Withheld,
+                Reason::Blocklist,
+                "withheld",
+                "blocklist",
+            ),
             (Verdict::Withheld, Reason::Notch, "withheld", "notch"),
             (Verdict::Withheld, Reason::Grammar, "withheld", "grammar"),
             (Verdict::Withheld, Reason::Cty, "withheld", "cty"),
-            (Verdict::Withheld, Reason::Repetition, "withheld", "repetition"),
+            (
+                Verdict::Withheld,
+                Reason::Repetition,
+                "withheld",
+                "repetition",
+            ),
             (Verdict::Withheld, Reason::Variant, "withheld", "variant"),
             (Verdict::Withheld, Reason::Dedupe, "withheld", "dedupe"),
-            (Verdict::Withheld, Reason::PowerStepGuard, "withheld", "powerStepGuard"),
-            (Verdict::Deferred, Reason::BeaconPending, "deferred", "beaconPending"),
-            (Verdict::Withheld, Reason::BeaconSpeed, "withheld", "beaconSpeed"),
-            (Verdict::Withheld, Reason::BeaconOverflow, "withheld", "beaconOverflow"),
-            (Verdict::Withheld, Reason::BeaconDiscarded, "withheld", "beaconDiscarded"),
+            (
+                Verdict::Withheld,
+                Reason::PowerStepGuard,
+                "withheld",
+                "powerStepGuard",
+            ),
+            (
+                Verdict::Deferred,
+                Reason::BeaconPending,
+                "deferred",
+                "beaconPending",
+            ),
+            (
+                Verdict::Withheld,
+                Reason::BeaconSpeed,
+                "withheld",
+                "beaconSpeed",
+            ),
+            (
+                Verdict::Withheld,
+                Reason::BeaconOverflow,
+                "withheld",
+                "beaconOverflow",
+            ),
+            (
+                Verdict::Withheld,
+                Reason::BeaconDiscarded,
+                "withheld",
+                "beaconDiscarded",
+            ),
         ];
         for (verdict, reason, decision_s, reason_s) in cases {
             let line = serde_json::to_string(&CandidateDecisionRecord::new(
@@ -536,7 +579,9 @@ mod tests {
             ))
             .unwrap();
             assert!(
-                line.contains(&format!(r#""decision":"{decision_s}","reason":"{reason_s}","#)),
+                line.contains(&format!(
+                    r#""decision":"{decision_s}","reason":"{reason_s}","#
+                )),
                 "{line}"
             );
         }
@@ -615,7 +660,10 @@ mod tests {
                 .skip(1)
                 .take_while(|l| !l.starts_with("## "))
                 .collect();
-            assert!(!section.is_empty(), "docs/LIVE-STATE.md has no `{header}` section");
+            assert!(
+                !section.is_empty(),
+                "docs/LIVE-STATE.md has no `{header}` section"
+            );
             let rows: std::collections::BTreeSet<String> = section
                 .iter()
                 .filter_map(|l| l.strip_prefix("| `"))

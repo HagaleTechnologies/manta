@@ -165,8 +165,20 @@ always wants records, and prints records/s per kind and the wall time with
 and without the tap:
 
 ```
-PENDING-MEASUREMENT
+$ cargo run --release --locked -p manta-engine --example man324_live_rates
+V1: 120 s, 1 spots; records/s bandState=0.99 trackState=1.16 candidateDecision=0.15 trackClosed=0.01; wall without tap 4.32 s, with tap 4.25 s (-1.6%)
+V8: 120 s, 53 spots; records/s bandState=0.99 trackState=67.10 candidateDecision=7.54 trackClosed=0.42; wall without tap 6.05 s, with tap 6.81 s (+12.5%)
+V8w: 120 s, 34 spots; records/s bandState=0.99 trackState=80.12 candidateDecision=3.22 trackClosed=0.43; wall without tap 10.22 s, with tap 9.66 s (-5.4%)
 ```
+
+Measured 2026-10-13 in the implementing container, one run each, while
+other builds shared the CPU, so the wall-time deltas (-5.4% to +12.5%)
+are within run-to-run noise rather than a measured cost. The tap's
+record rates are deterministic per build. `trackState` runs at about
+80 records/s on V8w because a snapshot goes out whenever a track's text
+changes (once per decoded character batch or word boundary), not once
+per second; the counting sink does not serialize, so serialization cost
+is not in these wall times.
 
 ## Proposed dispensa `liveState.v1` schema fragment
 
