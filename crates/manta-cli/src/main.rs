@@ -321,6 +321,7 @@ enum Command {
         #[arg(
             long,
             default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            value_parser = clap::value_parser!(u16).range(1..),
             requires = "ka9q_group",
             help_heading = "ka9q-radio source"
         )]
@@ -592,6 +593,7 @@ enum Command {
         #[arg(
             long,
             default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            value_parser = clap::value_parser!(u16).range(1..),
             requires = "ka9q_group",
             help_heading = "ka9q-radio source"
         )]
@@ -830,6 +832,7 @@ enum Command {
         #[arg(
             long,
             default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            value_parser = clap::value_parser!(u16).range(1..),
             requires = "ka9q_group",
             help_heading = "ka9q-radio source"
         )]
@@ -1063,6 +1066,7 @@ enum Command {
         #[arg(
             long,
             default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            value_parser = clap::value_parser!(u16).range(1..),
             requires = "ka9q_group",
             help_heading = "ka9q-radio source"
         )]
@@ -8877,6 +8881,40 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     }
 
     // ---- MAN-140: the ka9q-radio source
+
+    #[test]
+    fn every_live_command_rejects_zero_ka9q_port() {
+        let mut accepted_invalid = Vec::new();
+        for command in ["run", "listen", "soak", "doctor", "calibrate", "check"] {
+            let mut args = vec!["manta", command, "--ka9q-group", "239.101.6.1"];
+            if command == "soak" {
+                args.extend(["--duration", "1"]);
+            }
+            assert!(
+                Cli::try_parse_from(&args).is_ok(),
+                "{command}: default port"
+            );
+            for port in ["1", "5004", "65535"] {
+                assert!(
+                    Cli::try_parse_from(args.iter().copied().chain(["--ka9q-port", port])).is_ok(),
+                    "{command}: valid port {port}"
+                );
+            }
+            for port in ["0", "65536"] {
+                match Cli::try_parse_from(args.iter().copied().chain(["--ka9q-port", port])) {
+                    Ok(_) => accepted_invalid.push(format!("{command}: {port}")),
+                    Err(error) => {
+                        assert_eq!(error.exit_code(), 2);
+                        assert!(error.to_string().contains("--ka9q-port"), "{error}");
+                    }
+                }
+            }
+        }
+        assert!(
+            accepted_invalid.is_empty(),
+            "accepted invalid ports: {accepted_invalid:?}"
+        );
+    }
 
     fn ka9q_opts(ssrc: Option<u32>) -> Ka9qOpts {
         Ka9qOpts {

@@ -146,6 +146,7 @@ pub(crate) struct Args {
     #[arg(
         long,
         default_value_t = manta_input::ka9q::wire::DATA_PORT,
+        value_parser = clap::value_parser!(u16).range(1..),
         requires = "ka9q_group",
         help_heading = "ka9q-radio source"
     )]
