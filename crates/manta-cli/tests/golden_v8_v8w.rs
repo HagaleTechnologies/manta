@@ -400,8 +400,9 @@ fn decode_report_hsmm(
     (serde_json::from_slice(&out.stdout).unwrap(), manifest)
 }
 
+// Passes since MAN-189 (was failing on the bogus spot K2ST, real call
+// K2STA); see docs/DECISIONS/2026-10-13-man189-hsmm-commit-frontier.md.
 #[test]
-#[ignore = "stage-2 gate, un-ignored by Task 12 only if measured passing"]
 fn v8_pileup_validates_at_least_45_of_50_with_hsmm_engine() {
     let spec = manta_testkit::vectors::v8();
     let (report, manifest) = decode_report_hsmm(&spec);

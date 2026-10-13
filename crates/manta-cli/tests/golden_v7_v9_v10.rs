@@ -170,8 +170,9 @@ fn v10_passes_end_to_end_from_wav() {
 // 2026-09-09 -- see
 // docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
 
+// Passes since MAN-189 (was CER 0.0540 from a duplicated B, "N2BBB"); see
+// docs/DECISIONS/2026-10-13-man189-hsmm-commit-frontier.md.
 #[test]
-#[ignore = "stage-2 gate, un-ignored by Task 12 only if measured passing"]
 fn v7_passes_end_to_end_with_hsmm_engine() {
     let spec = manta_testkit::vectors::v7();
     let dir = tempfile::tempdir().unwrap();
