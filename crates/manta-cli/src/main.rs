@@ -4523,6 +4523,10 @@ fn run_command() -> Result<std::process::ExitCode> {
             }
             let first = spec.open(capture_rate_hz, dial_freq_hz)?;
             let replay_epoch = resolved.replay_epoch;
+            // MAN-312 (SPEC §2.7): read here, while `first` is in hand;
+            // logged just before decoding starts (below).
+            let crash_live =
+                manta_engine::crash_live_channels(first.sample_rate(), first.rf_passband_hz());
 
             // MAN-122 review round 6 (P2): installed HERE -- before
             // `start_spot_server` binds the sockets and logs the
@@ -4842,6 +4846,21 @@ fn run_command() -> Result<std::process::ExitCode> {
             // round 6); this goes to stderr. MAN-78: a daemon that reloads
             // on SIGHUP says so; the `manta: listening;` prefix the tests
             // wait for is the same either way.
+            //
+            // MAN-312 (SPEC §2.7): the static-crash filter fails open on a
+            // narrow source; say so once rather than leave an operator who
+            // set `crash_filter` believing it acts. Logged after the servers
+            // bound, so a failed start still prints exactly one `error:`
+            // line (MAN-270), and before the readiness marker, so a reader
+            // that stops at the marker never leaves it unread.
+            if cfg.detector.crash_filter != manta_engine::CrashFilter::Off
+                && crash_live < manta_engine::CRASH_MIN_LIVE_CHANNELS
+            {
+                tracing::info!(
+                    "static-crash filter inactive: the source passband holds {crash_live} channels, fewer than the {} it needs",
+                    manta_engine::CRASH_MIN_LIVE_CHANNELS
+                );
+            }
             if reload_enabled {
                 logging::note(
                     "manta: listening; send SIGINT or SIGTERM to stop, SIGHUP to reload \
@@ -4873,6 +4892,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             // asked, so its journal holds spots and diagnostics only.
             let print_text = !json && (spot_server.is_none() || decoded_text);
             let mut text_lines = text_lines::TrackLines::default();
+            // MAN-312: `listen` stores its running crash count here before
+            // each `on_tracks` call, which copies it into `Metrics`.
+            let static_crashes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
@@ -4881,6 +4903,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     active_tracks: active_tracks.clone(),
                     decode_latency: decode_latency.clone(),
                     operator_lists: reload_enabled.then(|| operator_lists.clone()),
+                    static_crashes: Some(static_crashes.clone()),
                 },
                 |ev| {
                     if json {
@@ -4951,6 +4974,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                 |n_tracks| {
                     if let Some(server) = &spot_server {
                         server.metrics.set_active_tracks(n_tracks as u64);
+                        server.metrics.set_static_crashes_total(
+                            static_crashes.load(std::sync::atomic::Ordering::Relaxed),
+                        );
                         server.metrics.record_pipeline_batch();
                         // The first batch is the earliest moment the daemon
                         // can honestly claim to be decoding: `listen`'s
