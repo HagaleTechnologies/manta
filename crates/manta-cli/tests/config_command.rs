@@ -189,6 +189,37 @@ fn check_rejects_an_unknown_field_naming_file_table_and_key() {
     assert!(stdout(&o).is_empty(), "no summary for an invalid config");
 }
 
+/// MAN-312: `crash_filter` is a closed set; a typo is refused before I/O.
+#[test]
+fn check_rejects_an_unknown_crash_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cfg(
+        dir.path(),
+        "bad.toml",
+        "[detector]\ncrash_filter = \"sometimes\"\n",
+    );
+    let err = fails(&check_file(&path));
+    assert!(err.contains("unknown variant"), "{err}");
+    assert!(err.contains("sometimes"), "{err}");
+    assert!(err.contains("starts-only"), "{err}");
+}
+
+/// MAN-312: a set `crash_filter` shows in the summary's `detector:` line.
+#[test]
+fn check_summary_shows_a_set_crash_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cfg(
+        dir.path(),
+        "good.toml",
+        "[detector]\ncrash_filter = \"starts-only\"\n",
+    );
+    let out = succeeds(&check_file(&path));
+    assert!(
+        out.contains("detector: crash_filter=\"starts-only\" (other keys default)"),
+        "{out}"
+    );
+}
+
 #[test]
 fn check_rejects_out_of_range_values_naming_the_key() {
     let dir = tempfile::tempdir().unwrap();

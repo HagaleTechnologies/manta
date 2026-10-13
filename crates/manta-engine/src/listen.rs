@@ -61,6 +61,12 @@ pub struct ListenObservers {
     /// running `Validator`. `None` (the default) skips the check
     /// entirely, so `listen()`'s existing callers pay nothing.
     pub operator_lists: Option<Arc<OperatorListsUpdate>>,
+    /// MAN-312: static crashes detected so far this session
+    /// (`TrackManager::static_crash_count`, summed across the segments a
+    /// discontinuity starts), stored with `fetch_max` after each processed
+    /// chunk so the published value never goes backwards. A counter, so it
+    /// is never zeroed on exit. `None` (the default) skips the store.
+    pub static_crashes: Option<Arc<AtomicU64>>,
     /// MAN-314: the currently marked RTTY signals (SPEC §2.6), stored
     /// whenever the marked set or a marked signal's metadata changes (so a
     /// store is not by itself a mark or clear), emptied on a segment
@@ -275,6 +281,7 @@ struct Segment {
 fn new_segment(
     fs: f64,
     center_freq_hz: f64,
+    rf_passband_hz: (f64, f64),
     cfg: &PipelineConfig,
     next_id: u32,
     quality: Option<Arc<DecodeQualityObserver>>,
@@ -294,6 +301,9 @@ fn new_segment(
     );
     tm.resume_track_ids_from(next_id);
     tm.skip_preroll_hops(pad_hops);
+    // MAN-312 (SPEC §2.7): judge static crashes over the source's real
+    // passband, not channels that only carry the stream's residual noise.
+    tm.set_rf_passband_hz(rf_passband_hz.0, rf_passband_hz.1);
     // MAN-118: a post-discontinuity segment keeps reporting.
     tm.set_quality_observer(quality);
     // MAN-324: a post-discontinuity segment keeps the live occupancy window.
@@ -461,6 +471,7 @@ pub fn listen_with_observers(
 
     let fs = src.sample_rate();
     let center_freq_hz = src.center_freq_hz();
+    let rf_passband_hz = src.rf_passband_hz();
 
     let mut validator = cfg.validator(fs)?;
     // MAN-324: the live tap records the validator's decisions; off, the
@@ -497,6 +508,7 @@ pub fn listen_with_observers(
         }
     };
 
+<<<<<<< HEAD
     let mut seg = new_segment(
         fs,
         center_freq_hz,
@@ -504,6 +516,23 @@ pub fn listen_with_observers(
         1,
         observers.decode_quality.clone(),
         occupancy,
+=======
+    // MAN-312: crashes counted by segments a discontinuity already replaced.
+    let mut crash_base: u64 = 0;
+    let report_static_crashes = |n: u64| {
+        if let Some(counter) = &observers.static_crashes {
+            counter.fetch_max(n, Ordering::Relaxed);
+        }
+    };
+
+    let mut seg = new_segment(
+        fs,
+        center_freq_hz,
+        rf_passband_hz,
+        cfg,
+        1,
+        observers.decode_quality.clone(),
+>>>>>>> b7fb51c73796204ecc9f2340276c15dd0c118551
     )?;
     let mut seg_base: u64 = 0;
 
@@ -561,6 +590,7 @@ pub fn listen_with_observers(
     );
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
+    report_static_crashes(crash_base + seg.tm.static_crash_count());
     rtty.update(&seg.tm);
     on_tracks(n_tracks);
     // `..filled`: the whole buffer unless a stop request cut the fill short.
@@ -576,6 +606,7 @@ pub fn listen_with_observers(
     );
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
+    report_static_crashes(crash_base + seg.tm.static_crash_count());
     rtty.update(&seg.tm);
     on_tracks(n_tracks);
     let mut seg_consumed: u64 = filled as u64;
@@ -621,6 +652,7 @@ pub fn listen_with_observers(
                 &mut on_spot,
             );
             let next_id = seg.tm.next_track_id();
+            crash_base += seg.tm.static_crash_count();
             // The old segment's marks clear where its samples end.
             rtty.restart(seg_base + seg_consumed);
             seg_base += seg_consumed + gap;
@@ -628,6 +660,7 @@ pub fn listen_with_observers(
             seg = new_segment(
                 fs,
                 center_freq_hz,
+                rf_passband_hz,
                 cfg,
                 next_id,
                 observers.decode_quality.clone(),
@@ -664,6 +697,7 @@ pub fn listen_with_observers(
         );
         let n_tracks = seg.tm.decoding_track_count();
         report_active_tracks(n_tracks);
+        report_static_crashes(crash_base + seg.tm.static_crash_count());
         rtty.update(&seg.tm);
         on_tracks(n_tracks);
         if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
@@ -683,6 +717,7 @@ pub fn listen_with_observers(
         &mut on_event,
         &mut on_spot,
     );
+    report_static_crashes(crash_base + seg.tm.static_crash_count());
     // `finish()` flushes and drops every decoder and closes every remaining
     // track: nothing is being decoded once the stream has ended, so both
     // observers must settle back to 0 rather than be left holding the last
@@ -930,6 +965,92 @@ mod tests {
             self.cursor += n;
             Ok(n)
         }
+    }
+
+    /// MAN-312: a source whose RF passband is narrower than its stream,
+    /// like rig audio.
+    struct NarrowSource {
+        inner: FixedFreqSource,
+        rf_passband_hz: (f64, f64),
+    }
+
+    impl manta_input::IqSource for NarrowSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.sample_rate()
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz()
+        }
+        fn rf_passband_hz(&self) -> (f64, f64) {
+            self.rf_passband_hz
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    /// Runs `listen_with_observers` with a static-crash observer, returning
+    /// the value it held at every `on_tracks` call.
+    fn static_crash_readings(src: Box<dyn manta_input::IqSource>) -> Vec<u64> {
+        let counter = Arc::new(AtomicU64::new(0));
+        let mut readings = Vec::new();
+        listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                static_crashes: Some(counter.clone()),
+                ..Default::default()
+            },
+            |_| {},
+            |_| {},
+            |_| readings.push(counter.load(Ordering::Relaxed)),
+        )
+        .unwrap();
+        readings.push(counter.load(Ordering::Relaxed));
+        readings
+    }
+
+    /// MAN-312: the crash count reaches the observer, and a discontinuity's
+    /// fresh segment adds to it rather than restarting it at 0.
+    #[test]
+    fn listen_publishes_static_crashes_across_a_discontinuity() {
+        let fs = 96_000.0;
+        let mut iq = manta_testkit::crash::vc1_scene(fs);
+        manta_testkit::crash::add_crash(
+            &mut iq,
+            fs,
+            &manta_testkit::crash::vc1_crash(fs, 5.0, 40.0),
+        );
+        let readings = static_crash_readings(Box::new(GapSource::new(iq, fs, 0.0, 48_000)));
+        assert!(readings.windows(2).all(|w| w[0] <= w[1]), "{readings:?}");
+        assert!(readings.contains(&1), "{readings:?}");
+        assert_eq!(readings.last(), Some(&2), "{readings:?}");
+    }
+
+    /// MAN-312: a source whose passband holds fewer than
+    /// `CRASH_MIN_LIVE_CHANNELS` channels gets an inactive detector.
+    #[test]
+    fn a_narrow_passband_source_counts_no_static_crash() {
+        let fs = 48_000.0;
+        let mut iq = manta_testkit::crash::vc1_scene(fs);
+        manta_testkit::crash::add_crash(
+            &mut iq,
+            fs,
+            &manta_testkit::crash::vc1_crash(fs, 5.0, 40.0),
+        );
+        assert!(crate::crash_live_channels(fs, (300.0, 3000.0)) < crate::CRASH_MIN_LIVE_CHANNELS);
+        let src = NarrowSource {
+            inner: FixedFreqSource {
+                samples: iq,
+                cursor: 0,
+                fs,
+                center_freq_hz: 0.0,
+            },
+            rf_passband_hz: (300.0, 3000.0),
+        };
+        let readings = static_crash_readings(Box::new(src));
+        assert_eq!(readings.last(), Some(&0), "{readings:?}");
     }
 
     /// MAN-73 test double: serves `samples` on a loop. Once the cumulative

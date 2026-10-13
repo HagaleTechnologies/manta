@@ -523,6 +523,9 @@ pub struct Metrics {
     json_clients: AtomicI64,
     ws_clients: AtomicI64,
     active_tracks: AtomicU64,
+    /// MAN-312: static crashes the engine has detected, injected by the
+    /// daemon wiring layer like `active_tracks`.
+    static_crashes_total: AtomicU64,
     /// MAN-314: `manta_rtty_signals{band}` -- RTTY signals the engine's
     /// detector currently marks, by amateur band. A band's series appears
     /// at its first mark and stays (at 0) after its signals clear; bounded
@@ -1139,6 +1142,14 @@ impl Metrics {
         self.active_tracks.store(count, Ordering::Relaxed);
     }
 
+    /// MAN-312: the engine's running static-crash count. `fetch_max`, so a
+    /// stale or out-of-order injection can never make the counter go
+    /// backwards.
+    pub fn set_static_crashes_total(&self, count: u64) {
+        self.static_crashes_total
+            .fetch_max(count, Ordering::Relaxed);
+    }
+
     /// MAN-314: the engine's currently marked RTTY signals, by mark
     /// frequency in Hz. Replaces the previous set: every existing band
     /// series drops to 0 first, then each mark counts toward its band.
@@ -1628,6 +1639,15 @@ impl Metrics {
         out.push_str(&format!(
             "manta_active_tracks {}\n",
             self.active_tracks.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP manta_static_crashes_total Static crashes detected (>= 3 dB lift on at least three quarters of the passband's channels for >= 8 ms), counted once per crash.\n",
+        );
+        out.push_str("# TYPE manta_static_crashes_total counter\n");
+        out.push_str(&format!(
+            "manta_static_crashes_total {}\n",
+            self.static_crashes_total.load(Ordering::Relaxed)
         ));
 
         out.push_str(
@@ -2233,6 +2253,19 @@ mod tests {
         m.set_active_tracks(12);
         let text = m.render_prometheus_text();
         assert!(text.contains("manta_active_tracks 12"));
+    }
+
+    #[test]
+    fn static_crashes_total_never_goes_backwards() {
+        let m = Metrics::new();
+        assert!(m
+            .render_prometheus_text()
+            .contains("\nmanta_static_crashes_total 0\n"));
+        m.set_static_crashes_total(3);
+        m.set_static_crashes_total(2);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_static_crashes_total counter\n"));
+        assert!(text.contains("\nmanta_static_crashes_total 3\n"), "{text}");
     }
 
     #[test]
