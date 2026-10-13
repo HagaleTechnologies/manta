@@ -67,15 +67,18 @@ pub fn margin(tokens: &[Token], j: usize, cfg: &HsmmConfig) -> (f32, Vec<(Glyph,
 /// entry's `sample_ts` lies in time that is already decided: it is the
 /// same character again under a different closing anchor, or a
 /// segmentation that contradicts what was emitted. A word boundary is
-/// decided once one was emitted at or after its character's start, or
-/// when its gap began before the latest emitted entry. Both checks are
-/// O(1) and need no pruning.
+/// decided once one was emitted at or after its character's start, when
+/// its gap began before the latest emitted entry, or when its character
+/// is decided but is not the character last emitted (it follows a
+/// contradicting segmentation). Every check is O(1) and needs no pruning.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Frontier {
     /// `sample_ts` of the latest emitted entry of either kind.
     last_ts: Option<u64>,
     /// `sample_ts` of the latest emitted word boundary.
     last_word_ts: Option<u64>,
+    /// `char_start_ts` of the latest emitted character.
+    last_char_start: Option<u64>,
 }
 
 impl Frontier {
@@ -85,7 +88,11 @@ impl Frontier {
             Some(_) => self.last_ts.is_some_and(|t| e.char_start_ts <= t),
             None => {
                 self.last_word_ts.is_some_and(|w| e.char_start_ts <= w)
-                    || self.last_ts.is_some_and(|t| e.sample_ts < t)
+                    || self.last_ts.is_some_and(|t| {
+                        e.sample_ts < t
+                            || (e.char_start_ts <= t
+                                && self.last_char_start != Some(e.char_start_ts))
+                    })
             }
         }
     }
@@ -95,6 +102,8 @@ impl Frontier {
         self.last_ts = self.last_ts.max(Some(e.sample_ts));
         if e.glyph.is_none() {
             self.last_word_ts = self.last_word_ts.max(Some(e.sample_ts));
+        } else {
+            self.last_char_start = Some(e.char_start_ts);
         }
     }
 }
@@ -300,6 +309,26 @@ mod tests {
         let mut tokens = vec![token(5.0, 13.0, vec![entry(None, 40, 100)])];
         let out = commit(&mut tokens, FORCE, &cfg, &mut frontier);
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn commit_does_not_emit_a_word_boundary_after_a_contradicting_character() {
+        // A straggler reads Y over the emitted X's time. Y is stripped;
+        // its trailing boundary must go too, or it would emit a space
+        // and push the frontier past the real next character.
+        let cfg = HsmmConfig::default();
+        let mut frontier = after(&[entry(Some('X'), 40, 100)]);
+        let mut tokens = vec![token(
+            5.0,
+            13.0,
+            vec![
+                entry(Some('Y'), 60, 130),
+                entry(None, 60, 130),
+                entry(Some('E'), 160, 180),
+            ],
+        )];
+        let out = commit(&mut tokens, FORCE, &cfg, &mut frontier);
+        assert_eq!(emitted(&out), vec![(Some(Glyph::Char('E')), 180)]);
     }
 
     #[test]

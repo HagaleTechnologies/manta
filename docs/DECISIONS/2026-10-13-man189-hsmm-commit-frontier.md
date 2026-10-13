@@ -10,16 +10,21 @@ no longer records what it has committed as a list of exact
 Each history entry (`token::HistEntry`) also records `char_start_ts`, the
 input sample counter at the anchor where its character's first mark
 began; a word boundary carries the character it follows. A
-`commit::Frontier` holds the latest emitted `sample_ts` (`last_ts`) and
-the latest emitted word-boundary `sample_ts` (`last_word_ts`):
+`commit::Frontier` holds the latest emitted `sample_ts` (`last_ts`), the
+latest emitted word-boundary `sample_ts` (`last_word_ts`) and the latest
+emitted character's `char_start_ts` (`last_char_start`):
 
 - **Character entry:** decided if `char_start_ts <= last_ts`.
 - **Word boundary entry:** decided if `char_start_ts <= last_word_ts`,
   meaning a boundary was already emitted at or after its character began,
   *or* if `sample_ts < last_ts`, meaning its gap began before something
-  already emitted.
+  already emitted, *or* if `char_start_ts <= last_ts` and
+  `char_start_ts != last_char_start`, meaning its character is decided
+  but is not the character last emitted, so the boundary follows a
+  contradicting segmentation.
 - **Emitting:** `last_ts = max(last_ts, sample_ts)`; for a word boundary,
-  also `last_word_ts = max(last_word_ts, sample_ts)`.
+  also `last_word_ts = max(last_word_ts, sample_ts)`; for a character,
+  `last_char_start = char_start_ts`.
 
 `commit::commit()` strips decided entries from the front of every token
 at the top of each loop iteration. `finish()` removes them from every
@@ -45,6 +50,15 @@ Consequences, each pinned by a unit test in `hsmm::commit::tests` or
 6. A second word boundary for the same character is stripped.
 7. A late word boundary behind a later character is stripped.
 8. Output `sample_ts` never decreases within a track.
+9. A word boundary that follows a stripped, contradicting character is
+   stripped too. Otherwise it would emit a space and move `last_ts` past
+   the real next character, which would then be dropped as decided.
+
+Rule 9's `last_char_start` condition was added in the implement phase
+after self-review found the leak; the plan's rule had only the first two
+word-boundary conditions. Re-measured on the implement build, it removes
+5 spurious word boundaries from V5 (CER 1.1771 → 1.1406) and leaves the
+decoded text of the other 14 vectors unchanged.
 
 ## Mechanism and evidence
 
@@ -94,7 +108,7 @@ the track nearest each expected frequency):
 | vector | CER main | CER frontier | chars main→frontier |
 |---|---|---|---|
 | V1, V2, V3, V4, V6, VR1, VR2, VR3, VR4, VR6b, VR7 | unchanged | unchanged (identical text) | unchanged |
-| V5 | 1.4062 | 1.1771 | 237→205 |
+| V5 | 1.4062 | 1.1771 (1.1406 with rule 9) | 237→205 |
 | VR5 (sig 0 / sig 1) | 0.1582 / 0.7228 | 0.1497 / 0.6966 | 308→300 |
 | VR6a | 0.0065 | 0.0032 | 248→247 |
 | VR8 | 0.6687 | 0.5604 | 316→289 |
