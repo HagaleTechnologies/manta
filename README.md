@@ -494,6 +494,7 @@ JSON Lines) is unchanged.
 | KiwiSDR over the network | `listen --kiwi-host` — any receiver from the public directory at <https://kiwisdr.com/public/> | Working |
 | OpenHPSDR / Hermes (Hermes-Lite 2, Red Pitaya, QMTech) | `listen --hpsdr-host`, feature `hpsdr` — on in the install line above, no native dependency | Working; protocol verified against reference sources, not yet against hardware |
 | RTL-SDR, Airspy, SDRplay, HackRF, anything SoapySDR drives | `listen --soapy-driver`, feature `soapy` — **not** in the install line above; needs the SoapySDR system library, then `--features hpsdr,soapy` | Working, needs hardware soak |
+| ka9q-radio (radiod) multicast IQ channel: RX-888, Airspy, anything radiod drives | `listen --ka9q-group`; no build feature | Working; protocol checked against ka9q-radio's docs and headers, not yet against a live radiod |
 
 The source frequency and rate flags end in `-hz`: `--kiwi-freq-hz`,
 `--soapy-freq-hz`, `--soapy-rate-hz`, `--hpsdr-freq-hz` and
@@ -516,7 +517,9 @@ Audio selectors are names matched case-insensitively by substring, not numeric
 indexes. `devices` lists input-capable devices without opening a stream. With
 `--features soapy`, it also lists complete Soapy selector strings for
 `--soapy-driver`. HPSDR discovery is not supported; use `--hpsdr-host HOST`
-with an `hpsdr` build. KiwiSDR uses `--kiwi-host HOST`. `devices --json` reports
+with an `hpsdr` build. KiwiSDR uses `--kiwi-host HOST`. ka9q-radio uses
+`--ka9q-group GROUP`, the data group of a radiod IQ channel;
+`avahi-browse -rt _rtp._udp` lists them. `devices --json` reports
 empty, unavailable and failed enumeration separately; a backend error exits 1
 while retaining the other results.
 
@@ -534,6 +537,9 @@ The default window is three seconds of delivered samples; `--duration` accepts
 resampling and `--capture-rate-hz` decimation, center frequency, passband,
 received sample count, input power and a brief per-channel noise-floor estimate.
 KiwiSDR's stream rate is 96000 Hz after resampling, not its native receiver rate.
+With `--ka9q-group`, the rate and center frequency are the ones the radiod
+channel's status packets report, and the passband is its `low`/`high` filter
+edges ([ka9q-radio guide](docs/GUIDES/ka9q-radio.md#6-check-the-stream)).
 Power is relative dBFS, not calibrated RF power, dBm or spot SNR. The floor is
 the lower quartile in each eligible channel, summarized across the passband.
 See the [measurement definition](docs/DECISIONS/2026-10-10-man125-source-diagnostics.md).
@@ -731,7 +737,9 @@ researchers each start, and lists every runbook.
 **Running a node:** [docs/GUIDES/rbn-node.md](docs/GUIDES/rbn-node.md)
 (from install to a running node) · [docs/GUIDES/kiwisdr.md](docs/GUIDES/kiwisdr.md)
 (KiwiSDR etiquette) · [docs/GUIDES/raspberry-pi.md](docs/GUIDES/raspberry-pi.md)
-(Pi install and service) · [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
+(Pi install and service) · [docs/GUIDES/ka9q-radio.md](docs/GUIDES/ka9q-radio.md)
+(a ka9q-radio (radiod) channel over multicast) ·
+[docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 (exposing the servers safely) · the "Run it as a node" section above ·
 [docs/CONFIG.md](docs/CONFIG.md) (every config key, its default and what
 reads it) · [docs/METRICS.md](docs/METRICS.md) (every `/metrics` family,

@@ -17,6 +17,8 @@ Then:
   systemd, launchd or Docker Compose.
 - [RUNBOOKS/monitoring.md](RUNBOOKS/monitoring.md): a ready Grafana dashboard
   and Prometheus alerts.
+- [GUIDES/ka9q-radio.md](GUIDES/ka9q-radio.md): feeding manta one
+  ka9q-radio (radiod) channel over multicast.
 - The [runbooks](#runbooks) below.
 - `manta <command> --help` for every flag.
 

@@ -40,6 +40,8 @@ the git history and `docs/DECISIONS/`.
   spots for 30 minutes, uplink target down or flapping) for a node's
   `/metrics`, with promtool tests. See `docs/RUNBOOKS/monitoring.md`
   (MAN-129).
+- MAN-140: `--ka9q-group` / `[input] type = "ka9q"` reads one ka9q-radio
+  (radiod) IQ channel over RTP multicast; see docs/GUIDES/ka9q-radio.md
 
 ## [0.1.0] - 2026-10-11
 
