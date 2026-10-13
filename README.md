@@ -430,7 +430,10 @@ Windows has no `SIGHUP`, so no reload. During shutdown the daemon logs
 servers bind `0.0.0.0`, every interface, as a public cluster node expects.
 The example above pins `127.0.0.1` on purpose. Metrics is the exception:
 it listens on `metrics_bind_addr`, `127.0.0.1` by default, because it has
-no password. Read
+no password. The optional live-state stream for dashboards is another
+exception: set `live_port` (for example `7303`) to start it, and it listens
+on `live_bind_addr`, also `127.0.0.1` by default, for the same reason
+([docs/LIVE-STATE.md](docs/LIVE-STATE.md)). Read
 [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 before you widen either.
 
@@ -600,10 +603,11 @@ enforced by criterion benches.
 
 ## Outputs
 
-All four ship today. `manta run --config <file>` starts the telnet
+All of these ship today. `manta run --config <file>` starts the telnet
 server, the JSON/WebSocket stream and the metrics endpoint together when
 the file has a `[server]` table; the outbound uplink starts alongside them
-only if that config also carries at least one `[[rbn_uplink]]` block.
+only if that config also carries at least one `[[rbn_uplink]]` block, and
+the live-state stream only if it sets `[server].live_port`.
 
 - **DX cluster telnet server** (`:7300`) — standard login prompt and
   RBN-format `DX de` lines, with enough command grammar (`sh/dx`,
@@ -617,6 +621,13 @@ only if that config also carries at least one `[[rbn_uplink]]` block.
 - **JSON Lines / WebSocket stream** (`:7301`) — one full-fidelity spot
   object per line; a raw TCP client and a WebSocket client share the
   port. This is the [cqdx](https://cqdx.app) ingest surface.
+- **Live-state stream** (optional, on `live_port`, for example `:7303`) —
+  for dashboards: each band's noise floor and activity every second, each
+  track's decoded text and candidate calls, and why each candidate was or
+  was not spotted. Off unless `[server].live_port` is set. It has no
+  password and carries every track's decoded text, so it listens on
+  `127.0.0.1` unless `live_bind_addr` says otherwise. Same raw TCP and
+  WebSocket rules as `:7301`; see [docs/LIVE-STATE.md](docs/LIVE-STATE.md).
 - **Live comparison with the RBN** — with `[rbn_compare]` enabled, manta
   reads RBN's public CW telnet feed and grades each spot `match`,
   `disagree`, `elsewhere`, `none` or `unknown` against what RBN's
@@ -705,7 +716,7 @@ configuration keys and output formats can change between releases before
 - **Shipped:** the full wideband pipeline — polyphase channelizer,
   noise-floor detector, track manager, decoder pool — with five input
   sources, callsign validation (cty.dat, SCP, CQ/DE parsing, dedupe), and
-  all four output surfaces above.
+  every output surface above.
 - **Not yet measured:** the RBN parity benchmark (recall vs. RBN on
   recorded contest IQ), the Raspberry Pi 4 CPU budget, and a 24-hour
   live-SDR soak. The first needs reference data; the other two need

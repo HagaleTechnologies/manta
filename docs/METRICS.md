@@ -68,10 +68,11 @@ in `RUNBOOKS/monitoring/`; see
 
 ## Metric families
 
-All 57 families, in the order `/metrics` renders them. Every family's
-`# HELP` and `# TYPE` lines are always rendered, except the ten
-RBN comparison families (MAN-301) at the end of the table, which are
-rendered only when `[rbn_compare]` is enabled. "Present when" says when
+All 60 families, in the order `/metrics` renders them. Every family's
+`# HELP` and `# TYPE` lines are always rendered, except two groups at the
+end of the table: the ten RBN comparison families (MAN-301), rendered only
+when `[rbn_compare]` is enabled, and the three live-state families
+(MAN-324), rendered only when `[server].live_port` is set. "Present when" says when
 the family also carries samples. Where it says a family has no samples, the
 value is absent, not zero: the node does not measure it, so do not read the
 missing series as "no loss" or "no traffic".
@@ -124,7 +125,7 @@ missing series as "no loss" or "no traffic".
 | `manta_track_rail_ratio` | histogram | `le` | Keying-rail ratio (mark rail / space rail amplitude) of each decoding track, sampled once per second per track at the same hop `TrackMeta` reports on. Deep, clean keying reads high (V1: median 22); fading or QRM eating the keying depth pulls it toward 2, the floor the rails collapse to (V5's CCIR-poor fading: median 3.3). `le="2"` counts samples at that floor. Buckets: 2, 2.5, 3, 4, 6, 10, 16, 25, 40, 63 and `+Inf`, plus `_sum` and `_count`. `legacy` engine only. No `track_id` label: each observation is one track's value. | As `manta_decode_chars_total`. Buckets stay at 0 until a track's rails initialise, and always under `[decode] engine = "edge-legacy"` or `"hsmm"`, which have no keying rails. |
 | `manta_candidate_repetitions` | histogram | `le` | One observation per callsign candidate the repetition gate scored: how many message-distinct decodes of that call near that frequency it had seen within the trailing 90 s, this one included. A candidate needs 2 to spot, so the `le="1"` share is the share of candidates nobody repeated (a busted-call proxy). Buckets: 1, 2, 3, 4, 5, 6, 8, 10, 15, 20 and `+Inf`, plus `_sum` and `_count`. | As `manta_decode_chars_total`. |
 | `manta_healthy` | gauge | — | Whether `/healthz` currently reports this node healthy (1) or not (0). Same evaluation as `/healthz`. | Always. |
-| `manta_listener_up` | gauge | `listener` | Whether each listener is currently up (1) or down (0). `listener` is `telnet`, `json` or `metrics`. | One series per listener once the listeners have started; a listener whose task ends reads 0. |
+| `manta_listener_up` | gauge | `listener` | Whether each listener is currently up (1) or down (0). `listener` is `telnet`, `json`, `metrics`, or `live` for the live-state stream. | One series per listener once the listeners have started; a listener whose task ends reads 0. The `live` series is registered only when `[server].live_port` is set. |
 | `manta_rbn_compare_grades_total` | counter | `band`, `grade` | Spots graded against the RBN feed since start, by the spot's band and grade (`match`, `disagree`, `elsewhere`, `none`, `unknown`). | Only with `[rbn_compare]` enabled: the family's `# HELP`/`# TYPE` lines are absent otherwise. One series per (band, grade) pair after its first grade. |
 | `manta_rbn_compare_grades_last_hour` | gauge | `band`, `grade` | Spots graded in the last hour, by band and grade. | Only with `[rbn_compare]` enabled, as for `manta_rbn_compare_grades_total`. |
 | `manta_rbn_compare_disagreements_last_hour` | gauge | `band`, `kind` | Spots graded `disagree` in the last hour, by band and the tolerance that failed (`frequency` or `speed`); a spot failing both counts under each. | Only with `[rbn_compare]` enabled. |
@@ -135,6 +136,9 @@ missing series as "no loss" or "no traffic".
 | `manta_rbn_compare_feed_reconnects_total` | counter | — | RBN feed connections lost or failed. | Only with `[rbn_compare]` enabled; starts at 0. |
 | `manta_rbn_compare_pending` | gauge | — | Spots not yet graded: waiting for their comparison window to close, or held past the close while the feed is silent. | Only with `[rbn_compare]` enabled. |
 | `manta_rbn_compare_ungraded_total` | counter | — | Spots never graded: the pending queue was full, or the comparator lagged the spot bus. | Only with `[rbn_compare]` enabled; starts at 0. |
+| `manta_live_clients_connected` | gauge | — | Live-state stream clients connected now, raw TCP and WebSocket together. Live clients are not counted in `manta_json_clients_connected` or `manta_ws_clients_connected`. See [LIVE-STATE.md](LIVE-STATE.md). | Only with `[server].live_port` set: the family's `# HELP`/`# TYPE` lines are absent otherwise. |
+| `manta_live_records_total` | counter | `kind` | Live-state records published to at least one connected client, by `kind`: `bandState`, `trackState`, `candidateDecision` or `trackClosed`. Records are built only while a live client is connected, so nothing is counted while none is. | Only with `[server].live_port` set, as for `manta_live_clients_connected`. |
+| `manta_live_records_dropped_total` | counter | `reason` | Live-state records a disconnected client never received, by `reason`: `lagged` (the client fell more than 4096 records behind), `write_failed` (a write, or the client's WebSocket handshake, timed out or failed) or `shutdown` (unsent when the daemon stopped). The spot-loss counters (`manta_spots_dropped_lagged_total`, `manta_spots_dropped_write_failed_total`, `manta_spots_dropped_shutdown_total`) never count live records, so they still mean spots. | Only with `[server].live_port` set, as for `manta_live_clients_connected`. |
 
 ### Sample
 
@@ -180,7 +184,8 @@ One line per check follows, in this order:
 1. Sources, by name: `source <name>: healthy` or `source <name>: unhealthy`.
    If no source has reported yet, the single line is
    `source: none registered`, which fails the check.
-2. Listeners, by name (`json`, `metrics`, `telnet`):
+2. Listeners, by name (`json`, `metrics`, `telnet`, and `live` when
+   `[server].live_port` is set):
    `listener <name>: up` or `listener <name>: down`. If none has started,
    the line is `listener: none registered`, which fails the check.
 3. The decode loop, one of:
@@ -294,5 +299,7 @@ For what each uplink state means and what to do about it, see
   loopback default for `metrics_bind_addr`.
 - [MAN-301](DECISIONS/2026-10-11-man301-live-rbn-comparison.md): the
   RBN comparison families.
+- [MAN-324](DECISIONS/2026-10-12-man324-live-state-stream.md): the
+  live-state families and the `live` listener.
 - [MAN-129](DECISIONS/2026-10-12-man129-dashboard-and-alerts.md): the shipped
   Grafana dashboard and Prometheus alert rules.

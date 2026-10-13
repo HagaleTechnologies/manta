@@ -184,6 +184,17 @@ status radiod sends to the data group on port 5006; manta also joins on
 Written clean-room from ka9q-radio's docs and headers at `f44b3a3ee8dd`;
 six facts (D-HW) still need a live radiod. See docs/GUIDES/ka9q-radio.md
 and docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md.
+
+MAN-324: `[server].live_port` (unset = off; `live_bind_addr` default
+`127.0.0.1`) starts a live-state stream for dashboards: `bandState`,
+`trackState`, `candidateDecision` (the why-not-spotted record, from the
+validator's opt-in decision log) and `trackClosed` records on their own
+port and broadcast channel, served by `json_stream`'s fan-out code (4096
+lag, 32 clients), plus `manta_live_*` metrics. Spot output is unchanged.
+Fields: `docs/LIVE-STATE.md`; see
+docs/DECISIONS/2026-10-12-man324-live-state-stream.md. The dispensa
+`liveState.v1` fragment is not yet filed.
+
 MAN-133: `manta completions <shell>` (bash/zsh/fish/powershell/elvish) and
 `manta man-pages --out DIR` render from the clap tree `--help` uses; every
 release archive ships `man/man1/*.1` rendered natively by the release

@@ -328,6 +328,7 @@ impl Harness {
                     decoder_version: "manta-test".to_string(),
                     shutdown: json_shutdown_rx,
                     drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                    stream: manta_server::json_stream::StreamKind::Spots,
                 },
                 manta_server::tasks::new_client_tasks(),
                 manta_server::tasks::new_connection_limiter(

@@ -32,6 +32,7 @@ mod doctor_checks;
 mod fmt;
 mod grade_cmd;
 mod health_cmd;
+mod live_state;
 mod logging;
 mod reconnect;
 mod reload;
@@ -2726,6 +2727,13 @@ struct SpotServer {
     /// by tests -- `metrics_addr`'s MAN-44 precedent.
     #[cfg_attr(not(test), allow(dead_code))]
     json_addr: std::net::SocketAddr,
+    /// MAN-324: the live-state listener's bound address; `None` when
+    /// `[server].live_port` is unset, in which case the decode loop runs
+    /// no live tap.
+    live_addr: Option<std::net::SocketAddr>,
+    /// MAN-324: `deCall` on every live record, and the station half of a
+    /// spotted decision's `spotId`.
+    station_callsign: String,
     /// MAN-78: each `[[rbn_uplink]]` task's live `dry_run` flag, in config
     /// order, for the SIGHUP reload thread (Unix only) to flip.
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -3146,6 +3154,9 @@ fn station_profile(
 const LISTENER_TELNET: &str = "telnet";
 const LISTENER_JSON: &str = "json";
 const LISTENER_METRICS: &str = "metrics";
+/// MAN-324: the live-state listener, registered only when
+/// `[server].live_port` is set.
+const LISTENER_LIVE: &str = "live";
 
 /// Spawns `fut` as a tracked listener task: `metrics` reports `name` down
 /// the moment that task ends, whether by panic or by returning (the
@@ -3224,298 +3235,369 @@ fn start_spot_server(
     let tasks = manta_server::tasks::new_client_tasks();
 
     let rt = tokio::runtime::Runtime::new()?;
-    let (status_line, metrics_addr, json_addr, uplink_dry_run, rbn_task) = rt.block_on(async {
-        // MAN-132: metrics binds its own `metrics_bind_addr` (loopback by
-        // default), never `bind_addr`. With two configurable addresses
-        // "which listener failed?" is a real question, so each bind names
-        // its listener, address key and port.
-        let telnet_listener =
-            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.telnet_port))
-                .await
-                .with_context(|| {
-                    format!(
-                        "binding the telnet server (bind_addr = {}, telnet_port = {})",
-                        fmt::quoted(&cfg.bind_addr),
-                        cfg.telnet_port
-                    )
-                })?;
-        let json_listener = tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.json_port))
-            .await
-            .with_context(|| {
-                format!(
-                    "binding the JSON server (bind_addr = {}, json_port = {})",
-                    fmt::quoted(&cfg.bind_addr),
-                    cfg.json_port
-                )
-            })?;
-        let metrics_listener =
-            tokio::net::TcpListener::bind((cfg.metrics_bind_addr.as_str(), cfg.metrics_port))
-                .await
-                .with_context(|| {
-                    format!(
+    let (status_line, metrics_addr, json_addr, live_addr, uplink_dry_run, rbn_task) =
+        rt.block_on(async {
+            // MAN-132: metrics binds its own `metrics_bind_addr` (loopback by
+            // default), never `bind_addr`. With two configurable addresses
+            // "which listener failed?" is a real question, so each bind names
+            // its listener, address key and port.
+            let telnet_listener =
+                tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.telnet_port))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "binding the telnet server (bind_addr = {}, telnet_port = {})",
+                            fmt::quoted(&cfg.bind_addr),
+                            cfg.telnet_port
+                        )
+                    })?;
+            let json_listener =
+                tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.json_port))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "binding the JSON server (bind_addr = {}, json_port = {})",
+                            fmt::quoted(&cfg.bind_addr),
+                            cfg.json_port
+                        )
+                    })?;
+            let metrics_listener =
+                tokio::net::TcpListener::bind((cfg.metrics_bind_addr.as_str(), cfg.metrics_port))
+                    .await
+                    .with_context(|| {
+                        format!(
                         "binding the metrics server (metrics_bind_addr = {}, metrics_port = {})",
                         fmt::quoted(&cfg.metrics_bind_addr),
                         cfg.metrics_port
                     )
-                })?;
-        let metrics_addr = metrics_listener.local_addr()?;
-        let json_addr = json_listener.local_addr()?;
+                    })?;
+            let metrics_addr = metrics_listener.local_addr()?;
+            let json_addr = json_listener.local_addr()?;
+            // MAN-324: the live-state listener, only when `live_port` is set.
+            let live_listener = match cfg.live_port {
+                Some(live_port) => Some(
+                    tokio::net::TcpListener::bind((cfg.live_bind_addr.as_str(), live_port))
+                        .await
+                        .with_context(|| {
+                            format!(
+                            "binding the live-state server (live_bind_addr = {}, live_port = {})",
+                            fmt::quoted(&cfg.live_bind_addr),
+                            live_port
+                        )
+                        })?,
+                ),
+                None => None,
+            };
+            let live_addr = live_listener
+                .as_ref()
+                .map(tokio::net::TcpListener::local_addr)
+                .transpose()?;
 
-        // MAN-122 scenario 1. Emitted after every bind succeeds (so a bind
-        // failure never produces a banner at all) but BEFORE any listener task is
-        // spawned -- on a multi-thread runtime a spawned accept loop can admit a
-        // client immediately, and its per-connection line would otherwise be able
-        // to land ahead of the banner. `local_addr()`, not the configured port,
-        // so a `*_port = 0` (ephemeral) config still names the real address.
-        //
-        // Review round 2: this line says `listening:`, not `ready:`. Three
-        // bound sockets are not evidence that anything will ever be decoded --
-        // a replay shorter than `manta_engine`'s two-second calibration window,
-        // or a live source that fails its first reads, exits here with the
-        // pipeline never having started. The readiness event proper is emitted
-        // from the decode loop's first batch (see `format_pipeline_ready`'s
-        // call site).
-        tracing::info!(
-            "{}",
-            manta_server::status::format_startup_banner(&manta_server::status::StartupInfo {
-                version: env!("CARGO_PKG_VERSION"),
-                source: source.name,
-                sample_rate_hz: source.sample_rate_hz,
-                dial_freq_hz: source.dial_freq_hz,
-                station_callsign: &cfg.station_callsign,
-                telnet_addr: telnet_listener.local_addr()?,
-                json_addr: json_listener.local_addr()?,
-                metrics_addr: metrics_listener.local_addr()?,
-            })
-        );
+            // MAN-122 scenario 1. Emitted after every bind succeeds (so a bind
+            // failure never produces a banner at all) but BEFORE any listener task is
+            // spawned -- on a multi-thread runtime a spawned accept loop can admit a
+            // client immediately, and its per-connection line would otherwise be able
+            // to land ahead of the banner. `local_addr()`, not the configured port,
+            // so a `*_port = 0` (ephemeral) config still names the real address.
+            //
+            // Review round 2: this line says `listening:`, not `ready:`. Three
+            // bound sockets are not evidence that anything will ever be decoded --
+            // a replay shorter than `manta_engine`'s two-second calibration window,
+            // or a live source that fails its first reads, exits here with the
+            // pipeline never having started. The readiness event proper is emitted
+            // from the decode loop's first batch (see `format_pipeline_ready`'s
+            // call site).
+            tracing::info!(
+                "{}",
+                manta_server::status::format_startup_banner(&manta_server::status::StartupInfo {
+                    version: env!("CARGO_PKG_VERSION"),
+                    source: source.name,
+                    sample_rate_hz: source.sample_rate_hz,
+                    dial_freq_hz: source.dial_freq_hz,
+                    station_callsign: &cfg.station_callsign,
+                    telnet_addr: telnet_listener.local_addr()?,
+                    json_addr: json_listener.local_addr()?,
+                    metrics_addr: metrics_listener.local_addr()?,
+                    live_addr,
+                })
+            );
 
-        // MAN-128: all three binds above already succeeded (a failed bind
-        // returns via `?` before this point), so every listener starts
-        // "up" -- `spawn_tracked_listener` below flips each back to "down"
-        // the moment its own task actually ends.
-        metrics.set_listener_up(LISTENER_TELNET, true);
-        metrics.set_listener_up(LISTENER_JSON, true);
-        metrics.set_listener_up(LISTENER_METRICS, true);
+            // MAN-128: all three binds above already succeeded (a failed bind
+            // returns via `?` before this point), so every listener starts
+            // "up" -- `spawn_tracked_listener` below flips each back to "down"
+            // the moment its own task actually ends.
+            metrics.set_listener_up(LISTENER_TELNET, true);
+            metrics.set_listener_up(LISTENER_JSON, true);
+            metrics.set_listener_up(LISTENER_METRICS, true);
+            if live_listener.is_some() {
+                metrics.enable_live();
+                metrics.set_listener_up(LISTENER_LIVE, true);
+            }
 
-        let telnet_ip_command_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
-            manta_server::telnet::MAX_TELNET_COMMANDS,
-            manta_server::telnet::COMMAND_RATE_WINDOW,
-            cfg.telnet_max_commands_per_ip,
-        );
-        manta_server::rate_limit::spawn_stale_entry_reaper(telnet_ip_command_limiter.clone());
-        // MAN-86: Aggregator will not forward spots from a source that
-        // never answers SKIMMER/SETT (Aggregator manual v6.0 §9.2) --
-        // `profile` carries the operator identity for the greeting banner
-        // and the live-passband segments for the SETT reply.
-        if cfg.operator_grid.is_none() || cfg.operator_qth.is_none() {
-            tracing::warn!(
-                "telnet greeting will omit QTH/grid -- set [server].operator_qth and \
+            let telnet_ip_command_limiter =
+                manta_server::rate_limit::IpRateLimiter::new_with_override(
+                    manta_server::telnet::MAX_TELNET_COMMANDS,
+                    manta_server::telnet::COMMAND_RATE_WINDOW,
+                    cfg.telnet_max_commands_per_ip,
+                );
+            manta_server::rate_limit::spawn_stale_entry_reaper(telnet_ip_command_limiter.clone());
+            // MAN-86: Aggregator will not forward spots from a source that
+            // never answers SKIMMER/SETT (Aggregator manual v6.0 §9.2) --
+            // `profile` carries the operator identity for the greeting banner
+            // and the live-passband segments for the SETT reply.
+            if cfg.operator_grid.is_none() || cfg.operator_qth.is_none() {
+                tracing::warn!(
+                    "telnet greeting will omit QTH/grid -- set [server].operator_qth and \
                  operator_grid so RBN Aggregator can record this node's location \
                  (Aggregator manual v6.0 §9.2)"
-            );
-        }
-        // MAN-138: without a configured position every JSON spot's
-        // deGrid/deLat/deLon is null -- legal, but a map shows nothing.
-        if station_location.is_none() {
-            tracing::warn!(
-                "JSON spots will carry no station position -- set [server].operator_grid, or \
+                );
+            }
+            // MAN-138: without a configured position every JSON spot's
+            // deGrid/deLat/deLon is null -- legal, but a map shows nothing.
+            if station_location.is_none() {
+                tracing::warn!(
+                    "JSON spots will carry no station position -- set [server].operator_grid, or \
                  operator_lat and operator_lon, so deGrid/deLat/deLon name this node's location"
-            );
-        }
-        let profile = std::sync::Arc::new(station_profile(
-            &cfg,
-            source.dial_freq_hz,
-            source.rf_passband_hz,
-            source.freq_calibration,
-        ));
-        spawn_tracked_listener(
-            LISTENER_TELNET,
-            metrics.clone(),
-            manta_server::telnet::serve(
-                telnet_listener,
-                bus.clone(),
-                metrics.clone(),
-                profile,
-                shutdown_rx.clone(),
-                tasks.clone(),
-                manta_server::tasks::new_connection_limiter(
-                    manta_server::telnet::MAX_TELNET_CONNECTIONS,
-                ),
-                manta_server::tasks::IpQuota::new_with_override(
-                    manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP,
-                    cfg.telnet_max_connections_per_ip,
-                ),
-                telnet_ip_command_limiter,
-                manta_server::tasks::CLIENT_DRAIN_DEADLINE,
-                cfg.line_format,
-            ),
-        );
-        let json_ip_ping_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
-            manta_server::json_stream::MAX_INBOUND_PINGS,
-            manta_server::json_stream::PING_RATE_WINDOW,
-            cfg.json_max_pings_per_ip,
-        );
-        manta_server::rate_limit::spawn_stale_entry_reaper(json_ip_ping_limiter.clone());
-        spawn_tracked_listener(
-            LISTENER_JSON,
-            metrics.clone(),
-            manta_server::json_stream::serve(
-                json_listener,
-                manta_server::json_stream::JsonStreamConfig {
-                    bus: bus.clone(),
-                    metrics: metrics.clone(),
-                    cty: cty.clone(),
-                    station_call: cfg.station_callsign.clone(),
-                    station_location,
-                    decoder_version,
-                    // .clone(): MAN-32/MAN-42's uplink::serve spawns below also
-                    // need shutdown_rx -- can't let this be the moving consumer
-                    // anymore now that there are more consumers.
-                    shutdown: shutdown_rx.clone(),
-                    drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
-                },
-                tasks.clone(),
-                manta_server::tasks::new_connection_limiter(
-                    manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS,
-                ),
-                manta_server::tasks::IpQuota::new_with_override(
-                    manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
-                    cfg.json_max_connections_per_ip,
-                ),
-                json_ip_ping_limiter,
-            ),
-        );
-        // Reaps completed per-client tasks continuously, independent of
-        // shutdown -- without this, `tasks` only ever shrinks at
-        // shutdown_runtime_after_drain's one-time `await_all`, so ordinary
-        // connect/disconnect churn grows it without bound for the life of
-        // the process (round-11 review finding).
-        manta_server::tasks::spawn_reaper(tasks.clone());
-        // MAN-44: the WHOLE uplink registry is published before the
-        // metrics/status endpoint is spawned below. On this multi-thread
-        // runtime that endpoint accepts on another worker the instant its
-        // task is spawned, so a probe racing a later registration loop
-        // could read a half-registered (or empty) registry and be told
-        // `disabled` -- `manta status` exit 0 -- for a daemon whose
-        // configured targets are in fact down. Registered-but-unconnected
-        // reads as down, the honest startup answer. `target_labels`
-        // assigns the Prometheus label (`host:port`, `#N`-suffixed only on
-        // an exact duplicate; MAN-128 D7).
-        let uplink_labels = manta_server::uplink::target_labels(&rbn_uplink_cfgs);
-        let enabled_uplinks = rbn_uplink_cfgs.iter().filter(|u| u.enabled).count();
-        let uplink_tasks: Vec<_> = rbn_uplink_cfgs
-            .into_iter()
-            .zip(uplink_labels)
-            .map(|(uplink_cfg, label)| {
-                let target = metrics.register_uplink_target(label.clone(), uplink_cfg.enabled);
-                // MAN-78: one live flag per entry, seeded from the file.
-                let dry_run = UplinkDryRun {
-                    label,
-                    enabled: uplink_cfg.enabled,
-                    flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                        uplink_cfg.dry_run,
-                    )),
-                };
-                (uplink_cfg, target, dry_run)
-            })
-            .collect();
-        let uplink_dry_run: Vec<UplinkDryRun> =
-            uplink_tasks.iter().map(|(_, _, d)| d.clone()).collect();
-        // MAN-301: enabled before the metrics endpoint spawns below, for
-        // MAN-44's reason: a scrape racing startup must already see the
-        // `manta_rbn_compare_*` families of a comparator that is starting.
-        let rbn_compare_cfg = rbn_compare_cfg.filter(|c| c.enabled);
-        if rbn_compare_cfg.is_some() {
-            metrics.enable_rbn_compare();
-        }
-        let metrics_ip_request_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
-            manta_server::metrics_http::MAX_METRICS_REQUESTS_PER_IP,
-            manta_server::metrics_http::METRICS_REQUEST_RATE_WINDOW,
-            cfg.metrics_max_requests_per_ip,
-        );
-        manta_server::rate_limit::spawn_stale_entry_reaper(metrics_ip_request_limiter.clone());
-        spawn_tracked_listener(
-            LISTENER_METRICS,
-            metrics.clone(),
-            manta_server::metrics_http::serve(
-                metrics_listener,
-                metrics.clone(),
-                manta_server::tasks::new_connection_limiter(
-                    manta_server::metrics_http::MAX_METRICS_CONNECTIONS,
-                ),
-                manta_server::tasks::IpQuota::new_with_override(
-                    manta_server::metrics_http::MAX_METRICS_CONNECTIONS_PER_IP,
-                    cfg.metrics_max_connections_per_ip,
-                ),
-                metrics_ip_request_limiter,
-            ),
-        );
-        // MAN-32/MAN-42: one independent uplink::serve task per configured
-        // [[rbn_uplink]] entry -- the common case for existing single-node
-        // operators is no [[rbn_uplink]] tables at all (empty Vec, loop
-        // body never runs), and uplink::serve itself also no-ops when
-        // `enabled = false` (belt-and-suspenders, not a duplicate check:
-        // this loop additionally avoids spawning a task at all when the
-        // Vec is empty). Each task owns its own SpotBus subscription and
-        // backoff state, so one target being down never affects another's
-        // delivery or retry timing.
-        // MAN-128 D6/D7: each target was registered above, before both its
-        // `serve` task and the metrics endpoint, so a scrape landing before
-        // the first connect attempt still sees it.
-        for (uplink_cfg, target, dry_run) in uplink_tasks {
-            tokio::spawn(manta_server::uplink::serve_with_live_dry_run(
-                uplink_cfg,
-                cfg.station_callsign.clone(),
-                bus.clone(),
-                target,
-                dry_run.flag,
-                shutdown_rx.clone(),
+                );
+            }
+            let profile = std::sync::Arc::new(station_profile(
+                &cfg,
+                source.dial_freq_hz,
+                source.rf_passband_hz,
+                source.freq_calibration,
             ));
-        }
-        // MAN-301: the live comparator reads the same bus the uplinks do
-        // and publishes grades back onto it. Its metric families were
-        // enabled above, before the metrics endpoint was spawned.
-        let rbn_compare = rbn_compare_cfg.map(|rc| {
-            let station_callsign = cfg.station_callsign.clone();
-            manta_server::rbn_compare::live::spawn(
-                manta_server::rbn_compare::live::LiveConfig {
-                    feed: manta_server::rbn_compare::feed::FeedConfig {
-                        host: rc.feed_host.clone(),
-                        port: rc.feed_port,
-                        login_callsign: rc.effective_login_callsign(&station_callsign).to_string(),
-                    },
-                    grade: rc.grade_config(&station_callsign),
-                    station_callsign,
-                    tick: manta_server::rbn_compare::live::TICK,
-                },
-                bus.clone(),
+            spawn_tracked_listener(
+                LISTENER_TELNET,
                 metrics.clone(),
-                manta_server::rbn_compare::system_clock(),
+                manta_server::telnet::serve(
+                    telnet_listener,
+                    bus.clone(),
+                    metrics.clone(),
+                    profile,
+                    shutdown_rx.clone(),
+                    tasks.clone(),
+                    manta_server::tasks::new_connection_limiter(
+                        manta_server::telnet::MAX_TELNET_CONNECTIONS,
+                    ),
+                    manta_server::tasks::IpQuota::new_with_override(
+                        manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP,
+                        cfg.telnet_max_connections_per_ip,
+                    ),
+                    telnet_ip_command_limiter,
+                    manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                    cfg.line_format,
+                ),
+            );
+            let json_ip_ping_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
+                manta_server::json_stream::MAX_INBOUND_PINGS,
+                manta_server::json_stream::PING_RATE_WINDOW,
+                cfg.json_max_pings_per_ip,
+            );
+            manta_server::rate_limit::spawn_stale_entry_reaper(json_ip_ping_limiter.clone());
+            // MAN-324: the live-state listener is the same fan-out code on the
+            // bus's live channel, with its own client cap, per-IP quota and
+            // ping budget (built from the same `json_*` keys).
+            if let Some(live_listener) = live_listener {
+                let live_ip_ping_limiter =
+                    manta_server::rate_limit::IpRateLimiter::new_with_override(
+                        manta_server::json_stream::MAX_INBOUND_PINGS,
+                        manta_server::json_stream::PING_RATE_WINDOW,
+                        cfg.json_max_pings_per_ip,
+                    );
+                manta_server::rate_limit::spawn_stale_entry_reaper(live_ip_ping_limiter.clone());
+                spawn_tracked_listener(
+                    LISTENER_LIVE,
+                    metrics.clone(),
+                    manta_server::json_stream::serve(
+                        live_listener,
+                        manta_server::json_stream::JsonStreamConfig {
+                            bus: bus.clone(),
+                            metrics: metrics.clone(),
+                            cty: cty.clone(),
+                            station_call: cfg.station_callsign.clone(),
+                            station_location: station_location.clone(),
+                            decoder_version: decoder_version.clone(),
+                            shutdown: shutdown_rx.clone(),
+                            drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                            stream: manta_server::json_stream::StreamKind::Live,
+                        },
+                        tasks.clone(),
+                        manta_server::tasks::new_connection_limiter(
+                            manta_server::json_stream::MAX_LIVE_STREAM_CONNECTIONS,
+                        ),
+                        manta_server::tasks::IpQuota::new_with_override(
+                            manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
+                            cfg.json_max_connections_per_ip,
+                        ),
+                        live_ip_ping_limiter,
+                    ),
+                );
+            }
+            spawn_tracked_listener(
+                LISTENER_JSON,
+                metrics.clone(),
+                manta_server::json_stream::serve(
+                    json_listener,
+                    manta_server::json_stream::JsonStreamConfig {
+                        bus: bus.clone(),
+                        metrics: metrics.clone(),
+                        cty: cty.clone(),
+                        station_call: cfg.station_callsign.clone(),
+                        station_location,
+                        decoder_version,
+                        // .clone(): MAN-32/MAN-42's uplink::serve spawns below also
+                        // need shutdown_rx -- can't let this be the moving consumer
+                        // anymore now that there are more consumers.
+                        shutdown: shutdown_rx.clone(),
+                        drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                        stream: manta_server::json_stream::StreamKind::Spots,
+                    },
+                    tasks.clone(),
+                    manta_server::tasks::new_connection_limiter(
+                        manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS,
+                    ),
+                    manta_server::tasks::IpQuota::new_with_override(
+                        manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
+                        cfg.json_max_connections_per_ip,
+                    ),
+                    json_ip_ping_limiter,
+                ),
+            );
+            // Reaps completed per-client tasks continuously, independent of
+            // shutdown -- without this, `tasks` only ever shrinks at
+            // shutdown_runtime_after_drain's one-time `await_all`, so ordinary
+            // connect/disconnect churn grows it without bound for the life of
+            // the process (round-11 review finding).
+            manta_server::tasks::spawn_reaper(tasks.clone());
+            // MAN-44: the WHOLE uplink registry is published before the
+            // metrics/status endpoint is spawned below. On this multi-thread
+            // runtime that endpoint accepts on another worker the instant its
+            // task is spawned, so a probe racing a later registration loop
+            // could read a half-registered (or empty) registry and be told
+            // `disabled` -- `manta status` exit 0 -- for a daemon whose
+            // configured targets are in fact down. Registered-but-unconnected
+            // reads as down, the honest startup answer. `target_labels`
+            // assigns the Prometheus label (`host:port`, `#N`-suffixed only on
+            // an exact duplicate; MAN-128 D7).
+            let uplink_labels = manta_server::uplink::target_labels(&rbn_uplink_cfgs);
+            let enabled_uplinks = rbn_uplink_cfgs.iter().filter(|u| u.enabled).count();
+            let uplink_tasks: Vec<_> = rbn_uplink_cfgs
+                .into_iter()
+                .zip(uplink_labels)
+                .map(|(uplink_cfg, label)| {
+                    let target = metrics.register_uplink_target(label.clone(), uplink_cfg.enabled);
+                    // MAN-78: one live flag per entry, seeded from the file.
+                    let dry_run = UplinkDryRun {
+                        label,
+                        enabled: uplink_cfg.enabled,
+                        flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                            uplink_cfg.dry_run,
+                        )),
+                    };
+                    (uplink_cfg, target, dry_run)
+                })
+                .collect();
+            let uplink_dry_run: Vec<UplinkDryRun> =
+                uplink_tasks.iter().map(|(_, _, d)| d.clone()).collect();
+            // MAN-301: enabled before the metrics endpoint spawns below, for
+            // MAN-44's reason: a scrape racing startup must already see the
+            // `manta_rbn_compare_*` families of a comparator that is starting.
+            let rbn_compare_cfg = rbn_compare_cfg.filter(|c| c.enabled);
+            if rbn_compare_cfg.is_some() {
+                metrics.enable_rbn_compare();
+            }
+            let metrics_ip_request_limiter =
+                manta_server::rate_limit::IpRateLimiter::new_with_override(
+                    manta_server::metrics_http::MAX_METRICS_REQUESTS_PER_IP,
+                    manta_server::metrics_http::METRICS_REQUEST_RATE_WINDOW,
+                    cfg.metrics_max_requests_per_ip,
+                );
+            manta_server::rate_limit::spawn_stale_entry_reaper(metrics_ip_request_limiter.clone());
+            spawn_tracked_listener(
+                LISTENER_METRICS,
+                metrics.clone(),
+                manta_server::metrics_http::serve(
+                    metrics_listener,
+                    metrics.clone(),
+                    manta_server::tasks::new_connection_limiter(
+                        manta_server::metrics_http::MAX_METRICS_CONNECTIONS,
+                    ),
+                    manta_server::tasks::IpQuota::new_with_override(
+                        manta_server::metrics_http::MAX_METRICS_CONNECTIONS_PER_IP,
+                        cfg.metrics_max_connections_per_ip,
+                    ),
+                    metrics_ip_request_limiter,
+                ),
+            );
+            // MAN-32/MAN-42: one independent uplink::serve task per configured
+            // [[rbn_uplink]] entry -- the common case for existing single-node
+            // operators is no [[rbn_uplink]] tables at all (empty Vec, loop
+            // body never runs), and uplink::serve itself also no-ops when
+            // `enabled = false` (belt-and-suspenders, not a duplicate check:
+            // this loop additionally avoids spawning a task at all when the
+            // Vec is empty). Each task owns its own SpotBus subscription and
+            // backoff state, so one target being down never affects another's
+            // delivery or retry timing.
+            // MAN-128 D6/D7: each target was registered above, before both its
+            // `serve` task and the metrics endpoint, so a scrape landing before
+            // the first connect attempt still sees it.
+            for (uplink_cfg, target, dry_run) in uplink_tasks {
+                tokio::spawn(manta_server::uplink::serve_with_live_dry_run(
+                    uplink_cfg,
+                    cfg.station_callsign.clone(),
+                    bus.clone(),
+                    target,
+                    dry_run.flag,
+                    shutdown_rx.clone(),
+                ));
+            }
+            // MAN-301: the live comparator reads the same bus the uplinks do
+            // and publishes grades back onto it. Its metric families were
+            // enabled above, before the metrics endpoint was spawned.
+            let rbn_compare = rbn_compare_cfg.map(|rc| {
+                let station_callsign = cfg.station_callsign.clone();
+                manta_server::rbn_compare::live::spawn(
+                    manta_server::rbn_compare::live::LiveConfig {
+                        feed: manta_server::rbn_compare::feed::FeedConfig {
+                            host: rc.feed_host.clone(),
+                            port: rc.feed_port,
+                            login_callsign: rc
+                                .effective_login_callsign(&station_callsign)
+                                .to_string(),
+                        },
+                        grade: rc.grade_config(&station_callsign),
+                        station_callsign,
+                        tick: manta_server::rbn_compare::live::TICK,
+                    },
+                    bus.clone(),
+                    metrics.clone(),
+                    manta_server::rbn_compare::system_clock(),
+                    shutdown_rx.clone(),
+                )
+            });
+
+            // MAN-122 scenario 2. The handle travels out of this block and
+            // into `SpotServer::status_line` so shutdown can join the task --
+            // see that field's doc comment.
+            let status_line = manta_server::status::spawn_status_line(
+                metrics.clone(),
+                cfg.status_interval_secs
+                    .map_or(manta_server::status::DEFAULT_STATUS_INTERVAL, |secs| {
+                        std::time::Duration::from_secs(secs)
+                    }),
+                enabled_uplinks,
                 shutdown_rx.clone(),
-            )
-        });
+            );
 
-        // MAN-122 scenario 2. The handle travels out of this block and
-        // into `SpotServer::status_line` so shutdown can join the task --
-        // see that field's doc comment.
-        let status_line = manta_server::status::spawn_status_line(
-            metrics.clone(),
-            cfg.status_interval_secs
-                .map_or(manta_server::status::DEFAULT_STATUS_INTERVAL, |secs| {
-                    std::time::Duration::from_secs(secs)
-                }),
-            enabled_uplinks,
-            shutdown_rx.clone(),
-        );
-
-        anyhow::Ok((
-            status_line,
-            metrics_addr,
-            json_addr,
-            uplink_dry_run,
-            rbn_compare,
-        ))
-    })?;
+            anyhow::Ok((
+                status_line,
+                metrics_addr,
+                json_addr,
+                live_addr,
+                uplink_dry_run,
+                rbn_compare,
+            ))
+        })?;
 
     Ok((
         rt,
@@ -3535,6 +3617,8 @@ fn start_spot_server(
             rbn_compare: std::sync::Mutex::new(rbn_task),
             metrics_addr,
             json_addr,
+            live_addr,
+            station_callsign: cfg.station_callsign.clone(),
             uplink_dry_run,
         },
     ))
@@ -5429,6 +5513,18 @@ fn run_command() -> Result<std::process::ExitCode> {
                     operator_lists: reload_enabled.then(|| operator_lists.clone()),
                     static_crashes: Some(static_crashes.clone()),
                     rtty: Some(rtty_observer.clone()),
+                    // MAN-324: only with a live-state listener.
+                    live_state: spot_server
+                        .as_ref()
+                        .filter(|server| server.live_addr.is_some())
+                        .map(|server| {
+                            std::sync::Arc::new(live_state::LiveSink::new(
+                                server.bus.clone(),
+                                server.metrics.clone(),
+                                &server.station_callsign,
+                            ))
+                                as std::sync::Arc<dyn manta_engine::LiveStateSink>
+                        }),
                 },
                 |ev| {
                     if json {

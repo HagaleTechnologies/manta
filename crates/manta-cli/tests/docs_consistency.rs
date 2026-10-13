@@ -154,7 +154,7 @@ fn readme_outputs_describes_shipped_servers() {
         !outputs.contains("in progress"),
         "README Outputs still calls a shipped server \"in progress\""
     );
-    for needle in ["7300", "7301", "7302", "uplink", "--config"] {
+    for needle in ["7300", "7301", "7302", "7303", "uplink", "--config"] {
         assert!(
             outputs.contains(needle),
             "README Outputs never mentions `{needle}`"
@@ -2362,6 +2362,7 @@ fn reference_docs_relative_links_resolve() {
         CONFIG_REF,
         METRICS_REF,
         "docs/SPOT-SCHEMA.md",
+        "docs/LIVE-STATE.md",
         DOCS_INDEX,
         DECISIONS_INDEX,
     ] {
