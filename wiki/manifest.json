@@ -356,7 +356,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:5630cac755cbdb331752eef82799c7515016abd42c583af63198a521b28589ee",
+      "hash": "sha256:afd7c0b5a6c37114fc3be8b64cde36fd8be4366aa0a182b02b0bf59e2d1f6e01",
       "id": "windows-build-setup",
       "kind": "howto",
       "links": [
@@ -368,11 +368,13 @@
       "sources": [
         ".github/workflows/ci-full.yml",
         ".github/workflows/release.yml",
-        "docs/superpowers/specs/2026-09-11-man212-windows-platform-support-design.md"
+        ".github/workflows/release-publish.yml",
+        "docs/superpowers/specs/2026-09-11-man212-windows-platform-support-design.md",
+        "docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md"
       ],
       "status": "current",
       "title": "How do I build and test manta on Windows?",
-      "verified_commit": "d286147",
+      "verified_commit": "de525d1",
       "verified_date": "2026-10-13",
       "visibility": "public"
     }

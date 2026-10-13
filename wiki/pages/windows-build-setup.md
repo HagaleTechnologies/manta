@@ -11,11 +11,7 @@ sources:
   - docs/superpowers/specs/2026-09-11-man212-windows-platform-support-design.md
   - docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md
 verified:
-<<<<<<< HEAD
-  commit: d286147
-=======
   commit: de525d1
->>>>>>> 30e6f416f55a1dec54c4c803178c13dd3720972c
   date: 2026-10-13
 links:
   - live-hardware-field-testing
