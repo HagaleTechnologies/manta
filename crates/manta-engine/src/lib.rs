@@ -9,7 +9,11 @@ pub use listen::{
     RttyObserver,
 };
 pub mod latency;
+pub mod live;
 pub use latency::{DecodeLatencyObserver, DecodeLatencySnapshot, DECODE_LATENCY_BUCKETS_SECONDS};
+pub use live::{
+    BandSample, LiveRecord, LiveStateSink, TrackSnapshot, LIVE_MAX_CANDIDATES, LIVE_TEXT_CHARS,
+};
 pub mod quality;
 pub use quality::{DecodeQualityObserver, DecodeQualitySnapshot, RAIL_RATIO_BUCKETS};
 pub mod calibrate;
@@ -25,7 +29,7 @@ pub use soak_metrics::{
 };
 
 mod track;
-pub use track::DetectorConfig;
+pub use track::{ChannelLevel, DetectorConfig};
 
 use anyhow::{bail, Context, Result};
 use manta_decode::decoder::{events_to_text, DecodeConfig};

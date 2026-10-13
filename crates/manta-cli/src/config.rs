@@ -862,6 +862,24 @@ mod tests {
         assert!(err.contains(&f.path().display().to_string()), "{err}");
     }
 
+    /// MAN-324: the live-state keys get `MANTA_SERVER_*` variables from
+    /// the generic overlay, and the environment beats the file.
+    #[test]
+    fn manta_server_live_port_overrides_the_file() {
+        let body = format!("{SERVER}live_port = 7303\n");
+        let loaded = load_env(
+            Some(&body),
+            &[
+                ("MANTA_SERVER_LIVE_PORT", "17303"),
+                ("MANTA_SERVER_LIVE_BIND_ADDR", "0.0.0.0"),
+            ],
+        )
+        .unwrap();
+        let server = loaded.server.unwrap();
+        assert_eq!(server.live_port, Some(17303));
+        assert_eq!(server.live_bind_addr, "0.0.0.0");
+    }
+
     /// MAN-138: the numeric location keys load from the file and from
     /// `MANTA_SERVER_*`, TOML-probed like every other number.
     #[test]

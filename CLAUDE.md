@@ -169,6 +169,16 @@ same Rust engine. RBN's real login prompt and the live/offline agreement
 rate are unmeasured. See
 docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
 
+MAN-324: `[server].live_port` (unset = off; `live_bind_addr` default
+`127.0.0.1`) starts a live-state stream for dashboards: `bandState`,
+`trackState`, `candidateDecision` (the why-not-spotted record, from the
+validator's opt-in decision log) and `trackClosed` records on their own
+port and broadcast channel, served by `json_stream`'s fan-out code (4096
+lag, 32 clients), plus `manta_live_*` metrics. Spot output is unchanged.
+Fields: `docs/LIVE-STATE.md`; see
+docs/DECISIONS/2026-10-12-man324-live-state-stream.md. The dispensa
+`liveState.v1` fragment is not yet filed.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each

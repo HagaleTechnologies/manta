@@ -180,7 +180,7 @@ pub(crate) fn escape_label_value(v: &str) -> String {
         .replace('\n', "\\n")
 }
 
-fn spot_type_metric_label(t: SpotType) -> &'static str {
+pub(crate) fn spot_type_metric_label(t: SpotType) -> &'static str {
     match t {
         SpotType::Cq => "cq",
         SpotType::De => "de",
@@ -575,6 +575,132 @@ pub struct Metrics {
     /// MAN-301: set once by `enable_rbn_compare`; `None` renders no
     /// `manta_rbn_compare_*` family at all.
     rbn_compare: OnceLock<RbnCompareMetrics>,
+    /// MAN-324: set once by `enable_live`; `None` renders no
+    /// `manta_live_*` family at all.
+    live: OnceLock<LiveMetrics>,
+}
+
+/// MAN-324: the live-state stream's families, kept apart from the spot
+/// families so `manta_spots_dropped_*` still counts only spots.
+#[derive(Default)]
+struct LiveMetrics {
+    clients: AtomicI64,
+    /// Per `crate::live_state::LIVE_RECORD_KINDS` entry.
+    records: [AtomicU64; 4],
+    dropped_lagged: AtomicU64,
+    dropped_write_failed: AtomicU64,
+    dropped_shutdown: AtomicU64,
+}
+
+/// MAN-324: the live-state stream's metrics. Every method is a no-op until
+/// `enable_live` has been called.
+impl Metrics {
+    pub fn enable_live(&self) {
+        let _ = self.live.set(LiveMetrics::default());
+    }
+
+    /// One record of `kind` published to at least one subscriber.
+    pub fn record_live_published(&self, kind: &str) {
+        let Some(live) = self.live.get() else {
+            return;
+        };
+        if let Some(i) = crate::live_state::LIVE_RECORD_KINDS
+            .iter()
+            .position(|k| *k == kind)
+        {
+            live.records[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A live client fell `n` records behind and was disconnected.
+    pub fn record_live_lagged(&self, n: u64) {
+        if let Some(live) = self.live.get() {
+            live.dropped_lagged.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// A live client's write failed or timed out with `n` records unsent.
+    pub fn record_live_write_failed(&self, n: u64) {
+        if let Some(live) = self.live.get() {
+            live.dropped_write_failed.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// `n` records were still unsent to a live client at shutdown.
+    pub fn record_live_dropped_shutdown(&self, n: u64) {
+        if let Some(live) = self.live.get() {
+            live.dropped_shutdown.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    pub fn inc_live_clients(&self) {
+        if let Some(live) = self.live.get() {
+            live.clients.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn dec_live_clients(&self) {
+        if let Some(live) = self.live.get() {
+            live.clients.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Live clients connected now; 0 when the live stream is off.
+    pub fn live_clients(&self) -> i64 {
+        self.live
+            .get()
+            .map_or(0, |l| l.clients.load(Ordering::Relaxed))
+    }
+
+    /// Live records lost to disconnected clients, all reasons.
+    pub fn live_records_dropped(&self) -> u64 {
+        self.live.get().map_or(0, |l| {
+            l.dropped_lagged.load(Ordering::Relaxed)
+                + l.dropped_write_failed.load(Ordering::Relaxed)
+                + l.dropped_shutdown.load(Ordering::Relaxed)
+        })
+    }
+
+    fn render_live(&self, out: &mut String) {
+        let Some(live) = self.live.get() else {
+            return;
+        };
+        out.push_str(
+            "# HELP manta_live_clients_connected Live-state stream clients connected now, raw TCP and WebSocket together.\n",
+        );
+        out.push_str("# TYPE manta_live_clients_connected gauge\n");
+        out.push_str(&format!(
+            "manta_live_clients_connected {}\n",
+            live.clients.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP manta_live_records_total Live-state records published to at least one subscriber, by kind.\n",
+        );
+        out.push_str("# TYPE manta_live_records_total counter\n");
+        for (kind, count) in crate::live_state::LIVE_RECORD_KINDS
+            .iter()
+            .zip(&live.records)
+        {
+            out.push_str(&format!(
+                "manta_live_records_total{{kind=\"{kind}\"}} {}\n",
+                count.load(Ordering::Relaxed)
+            ));
+        }
+        out.push_str(
+            "# HELP manta_live_records_dropped_total Live-state records a disconnected client never received, by reason.\n",
+        );
+        out.push_str("# TYPE manta_live_records_dropped_total counter\n");
+        for (reason, count) in [
+            ("lagged", &live.dropped_lagged),
+            ("write_failed", &live.dropped_write_failed),
+            ("shutdown", &live.dropped_shutdown),
+        ] {
+            out.push_str(&format!(
+                "manta_live_records_dropped_total{{reason=\"{reason}\"}} {}\n",
+                count.load(Ordering::Relaxed)
+            ));
+        }
+    }
 }
 
 /// MAN-301: the trailing window `manta_rbn_compare_*_last_hour` gauges and
@@ -1901,6 +2027,7 @@ impl Metrics {
         }
 
         self.render_rbn_compare_at(&mut out, Instant::now());
+        self.render_live(&mut out);
 
         out
     }
@@ -2060,6 +2187,30 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains("# TYPE manta_spots_dropped_lagged_total counter"));
         assert!(text.contains("manta_spots_dropped_lagged_total 7"));
+    }
+
+    #[test]
+    fn live_families_render_only_once_enabled_and_never_touch_spot_loss() {
+        let m = Metrics::new();
+        m.record_live_lagged(5);
+        m.inc_live_clients();
+        assert!(!m.render_prometheus_text().contains("manta_live_"));
+        m.enable_live();
+        m.inc_live_clients();
+        m.record_live_published("trackState");
+        m.record_live_published("trackState");
+        m.record_live_lagged(7);
+        m.record_live_write_failed(2);
+        m.record_live_dropped_shutdown(1);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("manta_live_clients_connected 1\n"), "{text}");
+        assert!(text.contains("manta_live_records_total{kind=\"trackState\"} 2\n"));
+        assert!(text.contains("manta_live_records_total{kind=\"bandState\"} 0\n"));
+        assert!(text.contains("manta_live_records_dropped_total{reason=\"lagged\"} 7\n"));
+        assert!(text.contains("manta_live_records_dropped_total{reason=\"write_failed\"} 2\n"));
+        assert!(text.contains("manta_live_records_dropped_total{reason=\"shutdown\"} 1\n"));
+        assert!(text.contains("manta_spots_dropped_lagged_total 0\n"));
+        assert_eq!(m.live_records_dropped(), 10);
     }
 
     #[test]
