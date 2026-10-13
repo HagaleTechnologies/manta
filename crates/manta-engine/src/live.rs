@@ -136,6 +136,12 @@ impl LiveTap {
         }
     }
 
+    /// Whether anyone is subscribed: the decode loop records validation
+    /// decisions only while this is true, so an idle listener stays cheap.
+    pub(crate) fn wants_records(&self) -> bool {
+        self.sink.wants_records()
+    }
+
     /// Updates per-track state from one calibrated event. On `TrackClosed`
     /// it flushes that track's pending snapshot while `validator` still
     /// holds its candidates; call it before `validator.ingest`.

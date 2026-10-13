@@ -315,3 +315,39 @@ async fn the_live_per_ip_quota_is_counted_apart_from_the_spot_streams() {
     node.bus.publish_live(Arc::from("{}"));
     assert_eq!(read_line(&mut l1).await, "{}\n");
 }
+
+/// Codex P2 on #281: a peer that opens a WebSocket handshake is subscribed
+/// on accept, so records queue for it; when the handshake is then
+/// rejected, those records are charged to `write_failed`, not lost
+/// silently.
+#[tokio::test]
+async fn records_queued_for_a_failed_websocket_handshake_are_counted_as_dropped() {
+    use tokio::io::AsyncWriteExt;
+    let node = spawn_node(16).await;
+    let mut stream = TcpStream::connect(node.live).await.unwrap();
+    // Classified as a WebSocket client, but no upgrade headers yet.
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+        .await
+        .unwrap();
+    wait_for_live_subscribers(&node.bus, 1).await;
+    for i in 0..3 {
+        node.bus
+            .publish_live(Arc::from(format!(r#"{{"kind":"bandState","n":{i}}}"#)));
+    }
+    // Completing a plain (non-upgrade) request makes the handshake fail.
+    stream.write_all(b"\r\n").await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while node.metrics.live_records_dropped() < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            node.metrics.render_prometheus_text()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(node
+        .metrics
+        .render_prometheus_text()
+        .contains("manta_live_records_dropped_total{reason=\"write_failed\"} 3\n"));
+}

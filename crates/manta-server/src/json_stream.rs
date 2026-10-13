@@ -161,6 +161,20 @@ impl ClientCtx {
         }
     }
 
+    /// MAN-324: the live stream subscribes on accept, so records are built
+    /// and queued for a peer whose WebSocket handshake then fails or times
+    /// out; charge them to `write_failed` so the live loss counter stays
+    /// complete. The spot stream's counters keep their existing meaning.
+    fn record_failed_handshake(&self, still_queued: usize) {
+        if self.stream == StreamKind::Live {
+            self.metrics
+                .record_live_write_failed(crate::metrics::abandoned_spot_count(
+                    false,
+                    still_queued,
+                ));
+        }
+    }
+
     fn inc_clients(&self, ws: bool) {
         match (self.stream, ws) {
             (StreamKind::Spots, true) => self.metrics.inc_ws_clients(),
@@ -750,12 +764,14 @@ async fn handle_ws_client(
             if log_enabled {
                 tracing::warn!(error = %e, "json_stream: WS handshake rejected");
             }
+            ctx.record_failed_handshake(rx.len());
             return Err(WsClientError::Logged);
         }
         Err(_) => {
             if log_enabled {
                 tracing::warn!("json_stream: WS handshake timed out");
             }
+            ctx.record_failed_handshake(rx.len());
             return Err(WsClientError::Logged);
         }
     };

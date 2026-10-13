@@ -335,6 +335,14 @@ fn emit(
     on_event: &mut impl FnMut(&DecoderEvent),
     on_spot: &mut impl FnMut(&crate::Spot),
 ) {
+    // MAN-324: record decisions only while the live stream has a
+    // subscriber, so an idle listener allocates nothing per decision.
+    if let Some(tap) = ctx.live.as_ref() {
+        let want = tap.wants_records();
+        if want != validator.records_decisions() {
+            validator.record_decisions(want);
+        }
+    }
     let mut chars = 0u64;
     for ev in events {
         if matches!(ev, DecoderEvent::CharDecoded { .. }) {
@@ -474,12 +482,12 @@ pub fn listen_with_observers(
     let rf_passband_hz = src.rf_passband_hz();
 
     let mut validator = cfg.validator(fs)?;
-    // MAN-324: the live tap records the validator's decisions; off, the
-    // validator records nothing.
-    let live = observers.live_state.clone().map(|sink| {
-        validator.record_decisions(true);
-        LiveTap::new(sink, fs, calibration_factor)
-    });
+    // MAN-324: the live tap turns the validator's decision log on per
+    // batch, only while someone is subscribed (`emit`).
+    let live = observers
+        .live_state
+        .clone()
+        .map(|sink| LiveTap::new(sink, fs, calibration_factor));
     let occupancy = live.is_some();
     let mut ctx = EmitCtx {
         lists: observers.operator_lists.as_deref(),

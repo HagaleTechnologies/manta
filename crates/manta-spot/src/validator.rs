@@ -429,6 +429,11 @@ impl Validator {
         self.decisions = if on { Some(Vec::new()) } else { None };
     }
 
+    /// Whether `record_decisions` is on.
+    pub fn records_decisions(&self) -> bool {
+        self.decisions.is_some()
+    }
+
     /// The decisions recorded since the last call, oldest first. Empty
     /// when recording is off.
     pub fn take_decisions(&mut self) -> Vec<Decision> {
