@@ -6,11 +6,8 @@
 
 mod callsigns;
 pub mod cer;
-<<<<<<< HEAD
 pub mod crash;
-=======
 pub mod fsk;
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
 pub mod keyer;
 pub mod noise;
 pub mod oracle;

@@ -5126,16 +5126,13 @@ fn run_command() -> Result<std::process::ExitCode> {
             // asked, so its journal holds spots and diagnostics only.
             let print_text = !json && (spot_server.is_none() || decoded_text);
             let mut text_lines = text_lines::TrackLines::default();
-<<<<<<< HEAD
             // MAN-312: `listen` stores its running crash count here before
             // each `on_tracks` call, which copies it into `Metrics`.
             let static_crashes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-=======
             // MAN-314: the engine's marked RTTY set, logged on change and
             // copied into `manta_rtty_signals` from the per-batch callback.
             let rtty_observer = std::sync::Arc::new(manta_engine::RttyObserver::default());
             let mut rtty_log = RttyLogState::new(source_sample_rate_hz);
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
             let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
@@ -5145,11 +5142,8 @@ fn run_command() -> Result<std::process::ExitCode> {
                     decode_latency: decode_latency.clone(),
                     decode_quality: decode_quality.clone(),
                     operator_lists: reload_enabled.then(|| operator_lists.clone()),
-<<<<<<< HEAD
                     static_crashes: Some(static_crashes.clone()),
-=======
                     rtty: Some(rtty_observer.clone()),
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
                 },
                 |ev| {
                     if json {

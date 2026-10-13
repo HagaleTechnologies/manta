@@ -60,14 +60,12 @@ pub struct ListenObservers {
     /// running `Validator`. `None` (the default) skips the check
     /// entirely, so `listen()`'s existing callers pay nothing.
     pub operator_lists: Option<Arc<OperatorListsUpdate>>,
-<<<<<<< HEAD
     /// MAN-312: static crashes detected so far this session
     /// (`TrackManager::static_crash_count`, summed across the segments a
     /// discontinuity starts), stored with `fetch_max` after each processed
     /// chunk so the published value never goes backwards. A counter, so it
     /// is never zeroed on exit. `None` (the default) skips the store.
     pub static_crashes: Option<Arc<AtomicU64>>,
-=======
     /// MAN-314: the currently marked RTTY signals (SPEC §2.6), stored
     /// whenever the marked set or a marked signal's metadata changes (so a
     /// store is not by itself a mark or clear), emptied on a segment
@@ -181,7 +179,6 @@ impl Drop for RttyPublisher {
     fn drop(&mut self) {
         self.clear();
     }
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
 }
 
 /// MAN-78: the operator lists a live reload replaces, as one unit.
@@ -295,14 +292,11 @@ fn new_segment(
     );
     tm.resume_track_ids_from(next_id);
     tm.skip_preroll_hops(pad_hops);
-<<<<<<< HEAD
     // MAN-312 (SPEC §2.7): judge static crashes over the source's real
     // passband, not channels that only carry the stream's residual noise.
     tm.set_rf_passband_hz(rf_passband_hz.0, rf_passband_hz.1);
-=======
     // MAN-118: a post-discontinuity segment keeps reporting.
     tm.set_quality_observer(quality);
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
     Ok(Segment {
         ch,
         tm,
@@ -464,7 +458,6 @@ pub fn listen_with_observers(
         }
     };
 
-<<<<<<< HEAD
     // MAN-312: crashes counted by segments a discontinuity already replaced.
     let mut crash_base: u64 = 0;
     let report_static_crashes = |n: u64| {
@@ -473,10 +466,14 @@ pub fn listen_with_observers(
         }
     };
 
-    let mut seg = new_segment(fs, center_freq_hz, rf_passband_hz, cfg, 1)?;
-=======
-    let mut seg = new_segment(fs, center_freq_hz, cfg, 1, observers.decode_quality.clone())?;
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
+    let mut seg = new_segment(
+        fs,
+        center_freq_hz,
+        rf_passband_hz,
+        cfg,
+        1,
+        observers.decode_quality.clone(),
+    )?;
     let mut seg_base: u64 = 0;
 
     let padding = vec![Complex32::new(0.0, 0.0); seg.ch.filter_len()];
@@ -535,11 +532,8 @@ pub fn listen_with_observers(
     );
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
-<<<<<<< HEAD
     report_static_crashes(crash_base + seg.tm.static_crash_count());
-=======
     rtty.update(&seg.tm);
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
     on_tracks(n_tracks);
     // `..filled`: the whole buffer unless a stop request cut the fill short.
     let events = seg.tm.process_hops(&seg.ch.process(&calib[..filled]), |m| {
@@ -556,11 +550,8 @@ pub fn listen_with_observers(
     );
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
-<<<<<<< HEAD
     report_static_crashes(crash_base + seg.tm.static_crash_count());
-=======
     rtty.update(&seg.tm);
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
     on_tracks(n_tracks);
     let mut seg_consumed: u64 = filled as u64;
 
@@ -604,12 +595,7 @@ pub fn listen_with_observers(
                 &mut on_spot,
             );
             let next_id = seg.tm.next_track_id();
-<<<<<<< HEAD
             crash_base += seg.tm.static_crash_count();
-            seg_base += seg_consumed + gap;
-            seg_consumed = 0;
-            seg = new_segment(fs, center_freq_hz, rf_passband_hz, cfg, next_id)?;
-=======
             // The old segment's marks clear where its samples end.
             rtty.restart(seg_base + seg_consumed);
             seg_base += seg_consumed + gap;
@@ -617,11 +603,11 @@ pub fn listen_with_observers(
             seg = new_segment(
                 fs,
                 center_freq_hz,
+                rf_passband_hz,
                 cfg,
                 next_id,
                 observers.decode_quality.clone(),
             )?;
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
             let events = seg.tm.process_hops(&seg.ch.process(&padding), |m| {
                 seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
             });
@@ -657,11 +643,8 @@ pub fn listen_with_observers(
         );
         let n_tracks = seg.tm.decoding_track_count();
         report_active_tracks(n_tracks);
-<<<<<<< HEAD
         report_static_crashes(crash_base + seg.tm.static_crash_count());
-=======
         rtty.update(&seg.tm);
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
         on_tracks(n_tracks);
         if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
             obs.observe(t0.elapsed());

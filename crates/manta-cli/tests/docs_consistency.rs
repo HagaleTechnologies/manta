@@ -822,12 +822,9 @@ fn spec_detector_values_equal_the_code_defaults() {
         "warmup_ms",
         "track_cap",
         "silent_respawn_cooldown_ms",
-<<<<<<< HEAD
         "crash_filter",
-=======
         "rtty_filter",
         "rtty_dwell_ms",
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
     ] {
         assert!(
             table.contains_key(key),

@@ -15,14 +15,10 @@
 //!
 //! Keys are SPEC §9's `on_snr_db`, `off_snr_db`, `confirm_ms`, `hang_ms`,
 //! `gc_ms` and `warmup_ms`, plus `track_cap` (ARCHITECTURE §4, configurable per §8) and
-<<<<<<< HEAD
-//! `silent_respawn_cooldown_ms` (MAN-171), and `crash_filter` (MAN-312,
-//! SPEC §2.7: `"full"`, `"starts-only"` or `"off"`). Every key is an `Option`
-=======
-//! `silent_respawn_cooldown_ms` (MAN-171), plus `rtty_filter` and
+//! `silent_respawn_cooldown_ms` (MAN-171), `rtty_filter` and
 //! `rtty_dwell_ms` (MAN-314, SPEC §2.6; the dwell must be at least one
-//! 1000 ms detector block). Every key is an `Option`
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
+//! 1000 ms detector block), and `crash_filter` (MAN-312, SPEC §2.7:
+//! `"full"`, `"starts-only"` or `"off"`). Every key is an `Option`
 //! overlaid on `DetectorConfig::default()`, so an absent key keeps the exact
 //! default hop count instead of round-tripping it through milliseconds.
 //! Millisecond keys convert with `manta_decode::ms_to_hops`, SPEC §1.1's
@@ -66,13 +62,10 @@ pub struct DetectorConfigToml {
     pub warmup_ms: Option<f64>,
     pub track_cap: Option<usize>,
     pub silent_respawn_cooldown_ms: Option<f64>,
-<<<<<<< HEAD
     /// MAN-312 (SPEC §2.7): `"full"`, `"starts-only"` or `"off"`.
     pub crash_filter: Option<CrashFilter>,
-=======
     pub rtty_filter: Option<bool>,
     pub rtty_dwell_ms: Option<f64>,
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
 }
 
 impl DetectorConfigToml {
@@ -101,12 +94,9 @@ impl DetectorConfigToml {
                 d.silent_respawn_cooldown_hops,
                 false,
             )?,
-<<<<<<< HEAD
             crash_filter: self.crash_filter.unwrap_or(d.crash_filter),
-=======
             rtty_filter: self.rtty_filter.unwrap_or(d.rtty_filter),
             rtty_dwell_hops: rtty_dwell(self.rtty_dwell_ms, d.rtty_dwell_hops)?,
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
         })
     }
 }

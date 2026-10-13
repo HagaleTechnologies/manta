@@ -47,7 +47,14 @@ pub struct DetectorConfig {
     /// track-manager bookkeeping) that don't imply "this channel is a
     /// standing artifact."
     pub silent_respawn_cooldown_hops: u64,
-<<<<<<< HEAD
+    /// MAN-314 (SPEC §2.6): recognise two-tone FSK (RTTY) signals and
+    /// start no CW track on them or their keying sidebands once marked.
+    /// `false` restores the pre-MAN-314 behaviour exactly.
+    pub rtty_filter: bool,
+    /// MAN-314: how long an FSK signal must last before it is marked as
+    /// RTTY, in hops. The detector works in whole 375-hop blocks
+    /// (`rtty_dwell_hops / manta_dsp::fsk::BLOCK_HOPS`).
+    pub rtty_dwell_hops: u64,
     /// MAN-312 (SPEC §2.7): what a band-wide static crash does to track
     /// starts and to running tracks' decoder input. Not in SPEC §9's
     /// original table; `[detector].crash_filter`.
@@ -84,16 +91,6 @@ impl std::str::FromStr for CrashFilter {
             )),
         }
     }
-=======
-    /// MAN-314 (SPEC §2.6): recognise two-tone FSK (RTTY) signals and
-    /// start no CW track on them or their keying sidebands once marked.
-    /// `false` restores the pre-MAN-314 behaviour exactly.
-    pub rtty_filter: bool,
-    /// MAN-314: how long an FSK signal must last before it is marked as
-    /// RTTY, in hops. The detector works in whole 375-hop blocks
-    /// (`rtty_dwell_hops / manta_dsp::fsk::BLOCK_HOPS`).
-    pub rtty_dwell_hops: u64,
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
 }
 
 impl Default for DetectorConfig {
@@ -219,13 +216,10 @@ impl Default for DetectorConfig {
             // host a real signal again later, so this is a rate limit, not
             // a permanent denylist.
             silent_respawn_cooldown_hops: 11250,
-<<<<<<< HEAD
             crash_filter: CrashFilter::Full,
-=======
             // MAN-314: on; 7500 hops = 20 s = 20 detector blocks.
             rtty_filter: true,
             rtty_dwell_hops: 7500,
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
         }
     }
 }
@@ -553,7 +547,6 @@ pub(crate) struct Track {
     /// whenever this track's refiner stops receiving new input: a channel
     /// reset (inside `decoder_input` itself), or a closure/end-of-stream
     /// (`TrackManager`, Task 3/4).
-<<<<<<< HEAD
     refiner_backlog: VecDeque<DecoderInputEntry>,
     /// MAN-312 (SPEC §2.7): the last `CRASH_MIN_HOPS` crash-free
     /// `(amplitude, raw_power)` pairs queued for the decoder, oldest first.
@@ -561,8 +554,6 @@ pub(crate) struct Track {
     /// front entry is the value from before the lift crossed the threshold:
     /// the one `queue_input` substitutes for every held crash entry.
     clean_hist: VecDeque<(f32, f32)>,
-=======
-    refiner_backlog: VecDeque<(f32, f32, Option<f32>, u64, f32)>,
     /// MAN-118: how much of this track's `TrackDecoder::garble_count` has
     /// already been added to the decode-quality observer, so each drain
     /// publishes only the new garbles. See `publish_garbles`.
@@ -603,7 +594,6 @@ fn sample_rail_ratio_at_boundary(decoder: &TrackDecoder, quality: Option<&Decode
     if let Some(ratio) = decoder.rail_ratio() {
         q.observe_rail_ratio(ratio);
     }
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
 }
 
 /// SPEC §1.1 f(k) mapping: signed channel offset from center, FFT bin order.
@@ -641,11 +631,8 @@ impl Track {
             refiner_channel: None,
             refiner_hops_since_reset: 0,
             refiner_backlog: VecDeque::new(),
-<<<<<<< HEAD
             clean_hist: VecDeque::new(),
-=======
             garbles_published: 0,
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
         }
     }
 
@@ -1068,7 +1055,25 @@ pub struct TrackManager {
     /// MAN-115: channelizer hops with `m` below this are the zero-padding
     /// pre-roll and are skipped by `process_hops`. See `skip_preroll_hops`.
     preroll_hops: u64,
-<<<<<<< HEAD
+    /// MAN-118: where garbles and per-track rail ratios are published.
+    /// `None` (the default) skips both. See `set_quality_observer`.
+    quality: Option<Arc<DecodeQualityObserver>>,
+    /// MAN-314 (SPEC §2.6): the RTTY detector, `None` when
+    /// `DetectorConfig::rtty_filter` is off.
+    fsk: Option<FskDetector>,
+    /// MAN-314: every RTTY signal ever marked, in marking order (the
+    /// oldest cleared entries are dropped past `RTTY_LOG_CAP` while
+    /// `rtty_log_capped`).
+    rtty_log: Vec<RttyLogEntry>,
+    /// MAN-314: apply `RTTY_LOG_CAP` to `rtty_log`; true unless
+    /// `keep_full_rtty_history` was called.
+    rtty_log_capped: bool,
+    /// MAN-314: bumped whenever a block changes the marked set or a marked
+    /// signal's metadata.
+    rtty_changes: u64,
+    /// MAN-314: sample timestamp of the hop whose block made the latest
+    /// `rtty_changes` bump; 0 before the first.
+    rtty_changed_sample_ts: u64,
     /// MAN-312 (SPEC §2.7): the band-wide static-crash detector. Every
     /// channel is live until `set_rf_passband_hz` narrows it to the
     /// source's real passband.
@@ -1109,26 +1114,6 @@ pub fn crash_live_channels(sample_rate_hz: f64, rf_passband_hz: (f64, f64)) -> u
     let n_channels =
         ((sample_rate_hz / manta_dsp::channelizer::CHANNEL_SPACING_HZ).round() as usize).max(1);
     crash_live_set(sample_rate_hz, rf_passband_hz, n_channels).len()
-=======
-    /// MAN-118: where garbles and per-track rail ratios are published.
-    /// `None` (the default) skips both. See `set_quality_observer`.
-    quality: Option<Arc<DecodeQualityObserver>>,
-    /// MAN-314 (SPEC §2.6): the RTTY detector, `None` when
-    /// `DetectorConfig::rtty_filter` is off.
-    fsk: Option<FskDetector>,
-    /// MAN-314: every RTTY signal ever marked, in marking order (the
-    /// oldest cleared entries are dropped past `RTTY_LOG_CAP` while
-    /// `rtty_log_capped`).
-    rtty_log: Vec<RttyLogEntry>,
-    /// MAN-314: apply `RTTY_LOG_CAP` to `rtty_log`; true unless
-    /// `keep_full_rtty_history` was called.
-    rtty_log_capped: bool,
-    /// MAN-314: bumped whenever a block changes the marked set or a marked
-    /// signal's metadata.
-    rtty_changes: u64,
-    /// MAN-314: sample timestamp of the hop whose block made the latest
-    /// `rtty_changes` bump; 0 before the first.
-    rtty_changed_sample_ts: u64,
 }
 
 /// MAN-314: bound on `TrackManager::rtty_signals` for a long-running
@@ -1154,7 +1139,6 @@ pub struct RttyLogEntry {
     pub marked_sample_ts: u64,
     /// Sample timestamp of the hop that cleared it; `None` while marked.
     pub cleared_sample_ts: Option<u64>,
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
 }
 
 impl TrackManager {
@@ -1182,7 +1166,15 @@ impl TrackManager {
             close_counts: CloseCounts::default(),
             channel_cooldown_until: vec![0; n_channels],
             preroll_hops: 0,
-<<<<<<< HEAD
+            quality: None,
+            fsk: detector_cfg.rtty_filter.then(|| {
+                let blocks = detector_cfg.rtty_dwell_hops / FSK_BLOCK_HOPS as u64;
+                FskDetector::new(n_channels, u32::try_from(blocks).unwrap_or(u32::MAX))
+            }),
+            rtty_log: Vec::new(),
+            rtty_log_capped: true,
+            rtty_changes: 0,
+            rtty_changed_sample_ts: 0,
             crash: CrashDetector::new(n_channels),
         }
     }
@@ -1200,17 +1192,6 @@ impl TrackManager {
     /// `crash_filter` mode (including `"off"`).
     pub fn static_crash_count(&self) -> u64 {
         self.crash.count()
-=======
-            quality: None,
-            fsk: detector_cfg.rtty_filter.then(|| {
-                let blocks = detector_cfg.rtty_dwell_hops / FSK_BLOCK_HOPS as u64;
-                FskDetector::new(n_channels, u32::try_from(blocks).unwrap_or(u32::MAX))
-            }),
-            rtty_log: Vec::new(),
-            rtty_log_capped: true,
-            rtty_changes: 0,
-            rtty_changed_sample_ts: 0,
-        }
     }
 
     /// MAN-314: how many blocks changed the marked RTTY set or a marked
@@ -1312,7 +1293,6 @@ impl TrackManager {
                 k,
                 self.gate.smoothed_db(k) - self.floor.effective_floor_db(k),
             )
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
     }
 
     fn n_channels(&self) -> usize {
@@ -1464,7 +1444,6 @@ impl TrackManager {
             self.n_channels()
         );
         let power_db_vals: Vec<f64> = hop.power.iter().map(|&p| power_db(p)).collect();
-<<<<<<< HEAD
         // MAN-312 (SPEC §2.7): a static crash is band-wide, so each channel
         // judging it on its own (the gate's 19-hop confirm) cannot reject
         // it -- the channelizer smears a few-ms crash over ~85 ms of every
@@ -1487,9 +1466,6 @@ impl TrackManager {
         } else {
             self.gate.update(&power_db_vals, &self.floor)
         };
-=======
-        self.floor.update(&power_db_vals);
-        let (rise, drop) = self.gate.update(&power_db_vals, &self.floor);
         // MAN-314 (SPEC §2.6): feed the RTTY detector the same power and
         // floor; a block that changed the marked set updates the log.
         if let Some(fsk) = self.fsk.as_mut() {
@@ -1497,7 +1473,6 @@ impl TrackManager {
                 self.update_rtty_log(sample_ts);
             }
         }
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
         // MAN-171 (Codex review, PR #174 round 4, correct): clear a
         // channel's respawn cooldown the moment its own `rise` genuinely
         // drops. `CloseReason::Silent` does NOT prove the RF signal ended

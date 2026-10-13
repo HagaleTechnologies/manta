@@ -523,17 +523,14 @@ pub struct Metrics {
     json_clients: AtomicI64,
     ws_clients: AtomicI64,
     active_tracks: AtomicU64,
-<<<<<<< HEAD
     /// MAN-312: static crashes the engine has detected, injected by the
     /// daemon wiring layer like `active_tracks`.
     static_crashes_total: AtomicU64,
-=======
     /// MAN-314: `manta_rtty_signals{band}` -- RTTY signals the engine's
     /// detector currently marks, by amateur band. A band's series appears
     /// at its first mark and stays (at 0) after its signals clear; bounded
     /// by the fixed `band::BANDS_HZ` table plus `"unknown"`.
     rtty_by_band: Mutex<BTreeMap<&'static str, u64>>,
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
     /// Monotonic count of batches the decode pipeline has processed, bumped
     /// once per pipeline batch by the daemon wiring layer (MAN-122 review
     /// round 2). Its VALUE is meaningless to an operator; what matters is
@@ -1019,14 +1016,14 @@ impl Metrics {
         self.active_tracks.store(count, Ordering::Relaxed);
     }
 
-<<<<<<< HEAD
     /// MAN-312: the engine's running static-crash count. `fetch_max`, so a
     /// stale or out-of-order injection can never make the counter go
     /// backwards.
     pub fn set_static_crashes_total(&self, count: u64) {
         self.static_crashes_total
             .fetch_max(count, Ordering::Relaxed);
-=======
+    }
+
     /// MAN-314: the engine's currently marked RTTY signals, by mark
     /// frequency in Hz. Replaces the previous set: every existing band
     /// series drops to 0 first, then each mark counts toward its band.
@@ -1039,7 +1036,6 @@ impl Metrics {
                 .entry(crate::band::band_for_freq_hz(hz.round()))
                 .or_insert(0) += 1;
         }
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
     }
 
     /// Live-state getters for MAN-122's periodic status line. `Metrics` is
@@ -1520,7 +1516,6 @@ impl Metrics {
         ));
 
         out.push_str(
-<<<<<<< HEAD
             "# HELP manta_static_crashes_total Static crashes detected (>= 3 dB lift on at least three quarters of the passband's channels for >= 8 ms), counted once per crash.\n",
         );
         out.push_str("# TYPE manta_static_crashes_total counter\n");
@@ -1528,7 +1523,8 @@ impl Metrics {
             "manta_static_crashes_total {}\n",
             self.static_crashes_total.load(Ordering::Relaxed)
         ));
-=======
+
+        out.push_str(
             "# HELP manta_rtty_signals RTTY (two-tone FSK) signals currently marked by the detector, by amateur band; no CW tracks start on them.\n",
         );
         out.push_str("# TYPE manta_rtty_signals gauge\n");
@@ -1540,7 +1536,6 @@ impl Metrics {
         {
             out.push_str(&format!("manta_rtty_signals{{band=\"{band}\"}} {count}\n"));
         }
->>>>>>> cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d
 
         out.push_str(
             "# HELP manta_source_health Per-input-source health (1 = healthy, 0 = unhealthy).\n",
