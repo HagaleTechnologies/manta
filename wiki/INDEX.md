@@ -1,7 +1,7 @@
 # manta wiki index
 
-This in-repo wiki is manta's only wiki: GitHub's built-in Wiki feature is
-disabled ([decision](../docs/DECISIONS/2026-10-13-man152-one-wiki.md)).
+This in-repo wiki is manta's canonical wiki. GitHub's built-in Wiki tab is
+not used; disabling it remains an owner step ([decision](../docs/DECISIONS/2026-10-13-man152-one-wiki.md)).
 
 - [manta — what is this and where do things live?](pages/overview.md) — manta is an open-source, cross-platform, wideband multi-signal CW skimmer (Rust) that consumes ...
 - [How does the per-track CW decode chain work?](pages/decode-chain.md) — Each active track runs a classical CW decode chain on its ~375 Hz complex channel stream: envelop...

@@ -52,9 +52,9 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
-- The in-repo `wiki/` is the project's only wiki: GitHub's built-in Wiki
-  feature is disabled, and the wiki's stale `verified` stamps and
-  `manifest.json` are refreshed and CI-pinned (MAN-152).
+- The in-repo `wiki/` is the project's canonical wiki. GitHub's Wiki tab
+  is not used; disabling it remains an owner step. The wiki's stale
+  `verified` stamps and `manifest.json` are refreshed and CI-pinned (MAN-152).
 
 ## [0.1.0] - 2026-10-11
 

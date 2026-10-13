@@ -32,8 +32,8 @@ Then:
   review-convergence policy.
 - [DECISIONS/README.md](DECISIONS/README.md): every dated decision record,
   newest first.
-- [wiki/INDEX.md](../wiki/INDEX.md): accumulated gotchas — manta's only wiki;
-  GitHub's Wiki feature is off
+- [wiki/INDEX.md](../wiki/INDEX.md): accumulated gotchas, manta's canonical wiki.
+  GitHub's Wiki tab is not used; disabling it remains an owner step
   ([MAN-152](DECISIONS/2026-10-13-man152-one-wiki.md)). The wiki points at
   the code and these docs; it loses any conflict with them.
 - [CHANGELOG.md](../CHANGELOG.md): changes, and the rule for when decoder

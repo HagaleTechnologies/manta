@@ -651,20 +651,56 @@ fn wiki_verified_stamp(rel: &str) -> (String, String) {
     (field("commit:"), field("date:"))
 }
 
+fn wiki_page_body(page: &str) -> &str {
+    page.strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n"))
+        .map(|(_, body)| body)
+        .expect("wiki page has a complete frontmatter block")
+}
+
+fn wiki_page_stems(names: Vec<String>) -> Vec<String> {
+    let mut stems: Vec<String> = names
+        .into_iter()
+        .map(|n| n.trim_end_matches(".md").to_string())
+        .collect();
+    stems.sort();
+    stems
+}
+
+#[test]
+fn wiki_manifest_hash_input_excludes_frontmatter() {
+    for page in [
+        "---\nid: example\n---\nBody.\n",
+        "---\nid: renamed\n---\nBody.\n",
+    ] {
+        assert_eq!(wiki_page_body(page), "Body.\n");
+    }
+}
+
+#[test]
+fn wiki_manifest_orders_prefix_ids_by_stem() {
+    // md_files_in sorts these filenames in this order, before removing .md.
+    let names = vec!["determinism-ci.md".into(), "determinism.md".into()];
+    assert_eq!(wiki_page_stems(names), ["determinism", "determinism-ci"]);
+}
+
 /// `wiki/manifest.json` is the wiki's index, and each page's `verified`
 /// stamp is what a reader uses to judge how stale it is. The 2026-09-05
 /// broad review found both three months old: all ten manifest hashes
 /// stale, seven pages missing from it, two pages with no frontmatter, and
 /// stamps older than the decision records their own pages cite. A page
 /// edit now has to carry the manifest with it. A hash is the SHA-256 of
-/// the page as `doc()` reads it (CRLF normalised to LF), so a Windows
-/// checkout hashes the same.
+/// the body after the closing frontmatter delimiter, matching wiki-manifest/v1.
+/// `doc()` normalises CRLF to LF, so a Windows checkout hashes the same.
 #[test]
 fn wiki_manifest_lists_every_page_with_a_matching_hash() {
     use sha2::{Digest, Sha256};
 
     let manifest: serde_json::Value =
         serde_json::from_str(&doc("wiki/manifest.json")).expect("parse wiki/manifest.json");
+    assert_eq!(manifest["schema"], "wiki-manifest/v1");
+    assert_eq!(manifest["repo"], "manta");
+    assert_eq!(manifest["visibility"], "public");
     let entries = manifest["pages"]
         .as_array()
         .expect("wiki/manifest.json has a `pages` array");
@@ -677,10 +713,7 @@ fn wiki_manifest_lists_every_page_with_a_matching_hash() {
 
     let mut ids: Vec<String> = entries.iter().map(|e| str_field(e, "id")).collect();
     ids.sort();
-    let stems: Vec<String> = md_files_in("wiki/pages")
-        .into_iter()
-        .map(|n| n.trim_end_matches(".md").to_string())
-        .collect();
+    let stems = wiki_page_stems(md_files_in("wiki/pages"));
     for stem in &stems {
         assert!(
             ids.contains(stem),
@@ -706,9 +739,10 @@ fn wiki_manifest_lists_every_page_with_a_matching_hash() {
             "wiki/manifest.json entry `{id}` names {rel}, which does not exist"
         );
 
+        let page = doc(&rel);
         let want = format!(
             "sha256:{}",
-            Sha256::digest(doc(&rel).as_bytes())
+            Sha256::digest(wiki_page_body(&page).as_bytes())
                 .iter()
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()

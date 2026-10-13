@@ -3,7 +3,7 @@
   "head_commit": "d286147",
   "pages": [
     {
-      "hash": "sha256:c25a4e65844df4515c0dac8443cc65e70c1281248b5122ff19f6e6808d458f2c",
+      "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
       "id": "coppa-reuse",
       "kind": "interface",
       "links": [
@@ -26,7 +26,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:5298a71f3f2213fb8ab250e61446bbf470ba47779246cd751d06df0bad3fe407",
+      "hash": "sha256:0e91b33af6e0f25a784ffe4f9e542b188ad7ee870217bfca9deba496f84e1365",
       "id": "decode-chain",
       "kind": "subsystem",
       "links": [
@@ -47,7 +47,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:392272870fe756174e0362f90fb20cac968077a0c161e0da255ead5f4eb54ca8",
+      "hash": "sha256:e93d08f09bc48c925e63c8d03f32c831ddbfc4df7b3a1646d42474a3150c9786",
       "id": "dependabot-cargo-unlock",
       "kind": "gotcha",
       "links": [],
@@ -66,7 +66,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:2db431d1f2a2e193f25a5ef83d277f5413e663597095003b390f2c4187d26db4",
+      "hash": "sha256:26ef231581374d51b05844d2a5a562a8a4ca7166bfbd6ca8f2e6b35026c221e5",
       "id": "detector-tracks",
       "kind": "subsystem",
       "links": [
@@ -87,7 +87,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:d5039842a550c9f220ee12710eee0ed3764d1585bc2cef2b4f1968bd489c4e82",
+      "hash": "sha256:154bf602cb12c818b2f9b941c24d920487fc5fcca053f8a3de4848e88a3db7ad",
       "id": "determinism",
       "kind": "gotcha",
       "links": [
@@ -107,7 +107,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:43b7ceb94f4114fe83cbb21880fffdf6f11be05d5eb9b8c53a0b4a7f93e78e0f",
+      "hash": "sha256:9587c83d6f3b97fe1fa52f44824d875dad9cf6d2fdfa8f7f1f307dfd024397db",
       "id": "fleet-checkout-layout",
       "kind": "gotcha",
       "links": [],
@@ -127,7 +127,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:3f01a86235e867300114eb226de68b40a5c40054f45a6c2a411e76db91e51114",
+      "hash": "sha256:0cccb4a7a1a77e625b66ea796b5ccbd69dae288834d83d599e273484a1dae56b",
       "id": "golden-vector-freeze",
       "kind": "decision-digest",
       "links": [
@@ -148,7 +148,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:5d4aec4b6f92b88fe19379e09d211b958c8b4097d5fb65ac39578c99f3183623",
+      "hash": "sha256:bf44087476bbcc5b0804e515aa41f1e24f96e9118bdeeffeee4ee76ed0def60a",
       "id": "live-hardware-field-testing",
       "kind": "howto",
       "links": [
@@ -177,7 +177,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:0b3ab60e5e3a8e6454d963c3f5b771f92e9ea31b1c49981769c7ea03b228cf8b",
+      "hash": "sha256:14e5baea5e7b27c990f35fe2b9596c69653452d659a23fe98aa0132e2b8ecbc3",
       "id": "overview",
       "kind": "overview",
       "links": [
@@ -201,7 +201,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:367f62089482c613e908b0bdcc7cf93dae7fbcdb4803d88e7f1aedc02627845f",
+      "hash": "sha256:a73e645854380e782f0d916f378ac5ce759f47c2c894ba2bb2fdf373548f1d8f",
       "id": "pfb-channelizer",
       "kind": "subsystem",
       "links": [
@@ -223,7 +223,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:df5ea57f1e83b149940094f4b437831e1120d20fc9d009470dd96f3406fe9bfa",
+      "hash": "sha256:3b3bcc1ad0594f3cd4441ae8a1202798f61b1e3e3705c845e22d47081add9db8",
       "id": "replay-spots-harness",
       "kind": "gotcha",
       "links": [
@@ -243,7 +243,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:468134eda76b771d9bff7793a634d151996eaef481651e7c884195ff86bcb565",
+      "hash": "sha256:a3a5ddee297926a3692ac3116f60c4fce8e53dcdd830a0947f8406186d69e2c1",
       "id": "source-reconnect",
       "kind": "gotcha",
       "links": [
@@ -265,7 +265,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:921b0d1ad9a3aaf6f38f5e729704718a637ffe01948ff0212c2d17190aab9977",
+      "hash": "sha256:04757f2ab7ba62b79be3f2d7b3bc267985dad2edbd317ff6e64f91d102a00105",
       "id": "spot-output-contract",
       "kind": "interface",
       "links": [
@@ -291,7 +291,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:7d695f725bed94880758da6f55a5b4cce59458a83b19c07de707350fecb7ada5",
+      "hash": "sha256:4b66c15bd9234d018a610ba8f375ea1c4c753fb35c9cbe23c78c847a6c2fc887",
       "id": "spot-validation",
       "kind": "subsystem",
       "links": [
@@ -314,7 +314,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:d764d5d4556fb104ebe24a84d98648fbd5d8b41862b1efb4baf559ed6c56d52c",
+      "hash": "sha256:7ff72f447f8b2dd8d04c8ce0ea03c30ea4176fb5c436a0ed101aee68b4adf217",
       "id": "uplink-health-observability",
       "kind": "interface",
       "links": [
@@ -335,7 +335,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:c7ce5949bc0132575ce934136bd1f02d71c7ad2b5e384637ccc6c71a92512e51",
+      "hash": "sha256:a1b0cb72a041d380c3acfb6f371e1f03f5ca33fda0cacefee0bdf1ac1385ec6c",
       "id": "watterson-dependency",
       "kind": "gotcha",
       "links": [
@@ -356,7 +356,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:34d3598c4eb65d4de3d2c2a83f03497e415a53cd111da235819fda6cf5057746",
+      "hash": "sha256:5630cac755cbdb331752eef82799c7515016abd42c583af63198a521b28589ee",
       "id": "windows-build-setup",
       "kind": "howto",
       "links": [
@@ -376,5 +376,8 @@
       "verified_date": "2026-10-13",
       "visibility": "public"
     }
-  ]
+  ],
+  "repo": "manta",
+  "schema": "wiki-manifest/v1",
+  "visibility": "public"
 }
