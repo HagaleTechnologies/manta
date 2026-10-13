@@ -46,6 +46,7 @@ pub(crate) fn check(config_flag: Option<PathBuf>) -> Result<()> {
     // Never `spec.open()`, never `is_rf_aware()` (it opens IQ WAVs), never
     // `start_spot_server`.
     let prepared = crate::prepare_live(crate::CliOverrides::none(), path.clone(), None)?;
+    crate::refuse_rbn_compare_replay(&prepared.resolved, false)?;
     reject_placeholders(&prepared.loaded)?;
     reject_duplicate_ports(&prepared.loaded)?;
 
@@ -183,6 +184,14 @@ pub(crate) fn example_callsign_key(loaded: &Loaded) -> Option<&'static str> {
                 .is_some_and(|c| c.eq_ignore_ascii_case(EXAMPLE_CALLSIGN))
         })
         .then_some("rbn_uplink.login_callsign")
+        .or_else(|| {
+            loaded
+                .rbn_compare
+                .as_ref()
+                .and_then(|rc| rc.login_callsign.as_deref())
+                .is_some_and(|c| c.eq_ignore_ascii_case(EXAMPLE_CALLSIGN))
+                .then_some("rbn_compare.login_callsign")
+        })
 }
 
 /// D10: `key` still holds the scaffold's example callsign.
@@ -352,6 +361,32 @@ fn set_keys(loaded: &Loaded, table: &str, skip: &[&str]) -> Vec<String> {
 
 /// D6: one line per table, `key=value` tokens named as the config keys.
 /// Never prints a secret; deterministic (no timestamps, no bound ports).
+/// MAN-301: `config check`'s `[rbn_compare]` line. `f64`'s Display prints
+/// a whole tolerance without a fraction (`500`, not `500.0`).
+fn rbn_compare_summary(rc: &manta_server::config::RbnCompareConfig, station: &str) -> String {
+    let list = |calls: &[String], empty: &str| {
+        if calls.is_empty() {
+            empty.to_string()
+        } else {
+            calls.join(",")
+        }
+    };
+    format!(
+        "rbn_compare: enabled={} feed={}:{} login_callsign={} window_secs={} freq_tol_hz={} \
+         speed_tol={} WPM/{}% spotters={} exclude_spotters={}",
+        rc.enabled,
+        rc.feed_host,
+        rc.feed_port,
+        rc.effective_login_callsign(station),
+        rc.window_secs,
+        rc.freq_tol_hz,
+        rc.speed_tol_wpm,
+        rc.speed_tol_pct,
+        list(&rc.spotters, "all"),
+        list(&rc.exclude_spotters, "none"),
+    )
+}
+
 fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
     let mut lines = vec![origin_line.to_string()];
     lines.push(if loaded.env_vars.is_empty() {
@@ -451,6 +486,11 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             u.effective_login_callsign(station)
         ));
     }
+
+    lines.push(match &loaded.rbn_compare {
+        None => "rbn_compare: none".to_string(),
+        Some(rc) => rbn_compare_summary(rc, station),
+    });
 
     let mut input = match &loaded.input.source {
         None => "input: type=unset (the default sound card, unless a command-line flag picks \
@@ -565,7 +605,7 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
 
 /// D3/D4: stderr notes that never change the exit code. I/O-free: the dial
 /// note matches the source kind rather than calling `is_rf_aware()`, which
-/// opens IQ WAVs.
+/// opens IQ WAVs. MAN-90: an enabled uplink is experimental.
 fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> Vec<String> {
     let mut notes = Vec::new();
     match source {
@@ -623,6 +663,16 @@ fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> V
             )
         },
     );
+    // MAN-90: before going live, operators run `config check` (the node guide
+    // sends them here); say the uplink is experimental and what to use instead.
+    if loaded.rbn_uplink.iter().any(|u| u.enabled) {
+        notes.push(
+            "note: [[rbn_uplink]] is experimental -- its login and spot format are unverified \
+             against RBN's real ingest; to reach RBN today, let an RBN Aggregator read this \
+             node's telnet server (docs/RUNBOOKS/secondary-skimmer-field-node.md)"
+                .to_string(),
+        );
+    }
     notes
 }
 
@@ -736,6 +786,31 @@ mod tests {
             "server: none (manta run starts no servers)"
         );
         assert_eq!(line(&lines, "rbn_uplink:"), "rbn_uplink: none");
+    }
+
+    #[test]
+    fn config_check_prints_rbn_compare_summary() {
+        let lines =
+            lines_of("[server]\nstation_callsign = \"W3XYZ-1\"\n[rbn_compare]\nenabled = true\n");
+        assert_eq!(
+            line(&lines, "rbn_compare:"),
+            "rbn_compare: enabled=true feed=telnet.reversebeacon.net:7000 \
+             login_callsign=W3XYZ-1 window_secs=180 freq_tol_hz=500 speed_tol=3 WPM/20% \
+             spotters=all exclude_spotters=none"
+        );
+        let lines = lines_of(
+            "[server]\nstation_callsign = \"W3XYZ-1\"\n[rbn_compare]\nenabled = true\n\
+             feed_port = 7001\nlogin_callsign = \"k1abc\"\nfreq_tol_hz = 250.5\n\
+             spotters = [\"K5TR\", \"n0xyz\"]\nexclude_spotters = [\"W1AW\"]\n",
+        );
+        assert_eq!(
+            line(&lines, "rbn_compare:"),
+            "rbn_compare: enabled=true feed=telnet.reversebeacon.net:7001 \
+             login_callsign=K1ABC window_secs=180 freq_tol_hz=250.5 speed_tol=3 WPM/20% \
+             spotters=K5TR,N0XYZ exclude_spotters=W1AW"
+        );
+        let lines = lines_of("[decode]\nengine = \"legacy\"\n");
+        assert_eq!(line(&lines, "rbn_compare:"), "rbn_compare: none");
     }
 
     #[test]
@@ -940,6 +1015,52 @@ mod tests {
     }
 
     const POSITION_NOTE: &str = "note: JSON spots will carry no station position";
+    const UPLINK_NOTE: &str = "note: [[rbn_uplink]] is experimental";
+
+    /// MAN-90: any enabled uplink gets one note, whatever its dry_run says.
+    #[test]
+    fn note_uplink_is_experimental_only_when_an_uplink_is_enabled() {
+        let server = "[server]\nstation_callsign = \"W1AW\"\noperator_grid = \"FN31pr\"\n";
+        let uplink = |enabled: bool, host: &str| {
+            format!(
+                "[[rbn_uplink]]\nenabled = {enabled}\ntarget_host = \"{host}\"\ntarget_port = 7000\n"
+            )
+        };
+        let n = notes_of(&format!("{server}{}", uplink(true, "a.example.org")));
+        let hits: Vec<&String> = n.iter().filter(|x| x.starts_with(UPLINK_NOTE)).collect();
+        assert_eq!(
+            hits,
+            [
+                &"note: [[rbn_uplink]] is experimental -- its login and spot format are \
+               unverified against RBN's real ingest; to reach RBN today, let an RBN \
+               Aggregator read this node's telnet server \
+               (docs/RUNBOOKS/secondary-skimmer-field-node.md)"
+                    .to_string()
+            ]
+        );
+        let two = notes_of(&format!(
+            "{server}{}{}",
+            uplink(true, "a.example.org"),
+            uplink(true, "b.example.org")
+        ));
+        assert_eq!(two.iter().filter(|x| x.starts_with(UPLINK_NOTE)).count(), 1);
+        assert!(!has(
+            &notes_of(&format!("{server}{}", uplink(false, "a.example.org"))),
+            UPLINK_NOTE
+        ));
+        assert!(!has(&notes_of(server), UPLINK_NOTE));
+    }
+
+    /// MAN-90: the scaffold's uplink block says it is experimental and where
+    /// the supported route is documented.
+    #[test]
+    fn scaffold_marks_the_uplink_experimental() {
+        let start = SCAFFOLD.find("# --- Uplink").unwrap();
+        let end = SCAFFOLD.find("# --- Receiver").unwrap();
+        let block = &SCAFFOLD[start..end];
+        assert!(block.contains("\n# Experimental:"), "{block}");
+        assert!(block.contains("secondary-skimmer-field-node.md"), "{block}");
+    }
 
     /// MAN-138: an unconfigured position is legal (every JSON spot then says
     /// `null`), so it is a note, not an error -- and only for a config that
@@ -1221,6 +1342,7 @@ mod tests {
         ("rbn_uplink", "target_host"),
         ("rbn_uplink", "target_port"),
         ("rbn_uplink", "login_callsign"),
+        ("rbn_compare", "login_callsign"),
         ("input", "type"),
         ("input", "device"),
         ("input", "path"),
@@ -1343,6 +1465,7 @@ mod tests {
         match table {
             "server" => a.server == b.server,
             "rbn_uplink" => a.rbn_uplink == b.rbn_uplink,
+            "rbn_compare" => a.rbn_compare == b.rbn_compare,
             "input" => a.input == b.input,
             "spot" => a.spot == b.spot,
             "detector" => a.detector == b.detector,

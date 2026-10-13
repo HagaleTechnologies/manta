@@ -95,6 +95,7 @@ pub(crate) fn reload_once(ctx: &ReloadContext) -> Result<ReloadOutcome> {
         ctx.cli_engine,
         &ctx.vars,
     )?;
+    crate::refuse_rbn_compare_replay(&prepared.resolved, ctx.cli.source.is_some())?;
     config_cmd::reject_on_reload(&prepared.loaded, ctx.cli.source_selector().is_some())?;
     let restart_needed = restart_only_changes(&ctx.startup_raw, &prepared.loaded.raw);
     let dry_run_skipped = restart_needed.iter().any(|p| p.starts_with("rbn_uplink"))
@@ -250,7 +251,8 @@ pub(crate) fn log_applied(report: &ReloadReport) {
         } else {
             tracing::warn!(
                 target = %label,
-                "reload: dry_run = false -- transmitting real spots to this target."
+                "reload: dry_run = false -- transmitting real spots to this target. {}",
+                manta_server::uplink::EXPERIMENTAL_NOTICE
             );
         }
     }
@@ -663,6 +665,31 @@ blocklist_path = \"bl.txt\"
         }
     }
 
+    /// MAN-301: `run`'s replay refusal rejects a reload that enables
+    /// `[rbn_compare]` on a daemon replaying a recording, before anything
+    /// applies.
+    #[test]
+    fn rbn_compare_on_a_replay_rejects_the_reload() {
+        let cli = CliOverrides {
+            source: Some(PathBuf::from("x.wav")),
+            ..CliOverrides::none()
+        };
+        let f = start(BASE, cli);
+        write(
+            &f.path("manta.toml"),
+            &format!("{BASE}\n[rbn_compare]\nenabled = true\n"),
+        );
+        let err = format!("{:#}", reload_once(&f.ctx).unwrap_err());
+        assert!(
+            err.starts_with(
+                "RBN comparison grades spots against the live RBN feed, but this run \
+                 replays a recording (--source)."
+            ),
+            "{err}"
+        );
+        assert!(f.ctx.lists.take().is_none());
+    }
+
     /// MAN-268 D3: a command-line source flag replaces `[input]`, so its
     /// placeholders do not reject a reload; without one they do.
     #[test]
@@ -727,6 +754,30 @@ blocklist_path = \"bl.txt\"
         assert_eq!(
             restart_only_changes(&old, &new),
             vec!["rbn_uplink[0].spot_types"]
+        );
+    }
+
+    /// MAN-301: every `[rbn_compare]` key needs a restart; a SIGHUP that
+    /// changes one names it and still applies the lists.
+    #[test]
+    fn rbn_compare_changes_need_a_restart() {
+        let f = start(
+            &format!("{BASE}\n[rbn_compare]\nenabled = false\nwindow_secs = 180\n"),
+            CliOverrides::none(),
+        );
+        write(
+            &f.path("manta.toml"),
+            &format!("{BASE}\n[rbn_compare]\nenabled = false\nwindow_secs = 240\n"),
+        );
+        let report = applied(&f.ctx);
+        assert_eq!(report.restart_needed, vec!["rbn_compare.window_secs"]);
+        assert!(!report.dry_run_skipped);
+        assert!(f.ctx.lists.take().is_some());
+        let old = table("[rbn_compare]\nenabled = false\n");
+        let new = table("[rbn_compare]\nenabled = true\nspotters = [\"K5TR\"]\n");
+        assert_eq!(
+            restart_only_changes(&old, &new),
+            vec!["rbn_compare.enabled", "rbn_compare.spotters"]
         );
     }
 

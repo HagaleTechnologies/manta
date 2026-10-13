@@ -170,6 +170,26 @@ impl From<std::io::Error> for ClientError {
     }
 }
 
+/// MAN-134: whether a client's socket error is a transport-level
+/// disconnect (`ConnectionReset`/`ConnectionAborted` -- the peer reset the
+/// connection; `BrokenPipe` -- a write to a peer that already closed)
+/// rather than a rejection-shaped one (`bounded_io`'s `InvalidData`
+/// oversized/negotiation-flood/invalid-UTF-8 lines, its `TimedOut` idle
+/// read, or any other socket error). A health probe, load balancer or
+/// port-check script that connects and resets before logging in is
+/// routine churn, not a security-relevant rejection -- the same split
+/// `json_stream::is_ws_protocol_violation` makes on the WS path (MAN-68
+/// round 8). Only the log level and wording depend on this; the connection
+/// closes, and its line rides the same `log_enabled` budget, either way.
+fn is_transport_disconnect(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+    )
+}
+
 /// Everything a connected client is told about this station: the identity
 /// that appears in the greeting banner and every spot line, plus the
 /// settings `SKIMMER/SETT` reports. One struct rather than five positional
@@ -358,9 +378,15 @@ pub async fn serve(
             // Logged means a specific branch (login/command read
             // rejection) already reported this exact error, and a second
             // generic warning for it would just double the audit record.
+            // MAN-134: a reset during the greeting write (a probe that
+            // never reads) is a routine disconnect, not a failure.
             if log_enabled {
                 if let Err(ClientError::Unlogged(e)) = &result {
-                    tracing::warn!(peer = %peer, error = %e, "telnet: client task ended with an error");
+                    if is_transport_disconnect(e) {
+                        tracing::info!(peer = %peer, error = %e, "telnet: client disconnected (transport error)");
+                    } else {
+                        tracing::warn!(peer = %peer, error = %e, "telnet: client task ended with an error");
+                    }
                 }
             }
             metrics.dec_telnet_clients();
@@ -490,8 +516,15 @@ async fn handle_client(
         }
         Ok(_) => {}
         Err(e) => {
+            // MAN-134: a probe that resets after reading the banner is a
+            // routine disconnect -- only malformed, oversized or timed-out
+            // input keeps the rejection warning.
             if log_enabled {
-                tracing::warn!(error = %e, "telnet: login read rejected (oversized/malformed line or timeout), disconnecting");
+                if is_transport_disconnect(&e) {
+                    tracing::info!(error = %e, "telnet: client disconnected before completing login (transport error)");
+                } else {
+                    tracing::warn!(error = %e, "telnet: login read rejected (oversized/malformed line or timeout), disconnecting");
+                }
             }
             return Err(ClientError::Logged);
         }
@@ -1638,6 +1671,63 @@ mod tests {
                 None,
                 "{bad:?} should have been rejected"
             );
+        }
+    }
+
+    /// MAN-134: a transport-level disconnect (a health probe, load
+    /// balancer or NAT dropping the connection with a reset) is routine
+    /// churn, not a security-relevant rejection -- same split as
+    /// `json_stream::is_ws_protocol_violation` (MAN-68 round 8).
+    #[test]
+    fn transport_level_errors_are_classified_as_disconnects() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+        ] {
+            assert!(
+                is_transport_disconnect(&Error::new(kind, "x")),
+                "{kind:?} should be a transport disconnect"
+            );
+        }
+        // The exact error the ticket's probe produced: the OS error a
+        // `fill_buf` read surfaces on an RST, not a hand-built one.
+        assert!(is_transport_disconnect(&Error::from_raw_os_error(
+            raw_econnreset()
+        )));
+    }
+
+    /// MAN-134: every rejection-shaped login-read error `bounded_io` can
+    /// produce -- oversized line, negotiation flood, invalid UTF-8, idle
+    /// timeout -- and any other socket error must keep the WARN rejection
+    /// line, not be downgraded to a routine disconnect.
+    #[test]
+    fn rejection_shaped_errors_are_not_classified_as_disconnects() {
+        use std::io::{Error, ErrorKind};
+        for e in [
+            Error::new(ErrorKind::InvalidData, "line exceeds maximum length"),
+            Error::new(ErrorKind::InvalidData, "excessive protocol negotiation"),
+            Error::new(ErrorKind::InvalidData, "line contains invalid UTF-8"),
+            Error::new(ErrorKind::TimedOut, "read timed out"),
+            Error::new(ErrorKind::PermissionDenied, "x"),
+        ] {
+            assert!(
+                !is_transport_disconnect(&e),
+                "{e:?} should stay a rejection"
+            );
+        }
+    }
+
+    /// ECONNRESET's raw value: 104 on Linux, 54 on macOS/BSD, 10054
+    /// (WSAECONNRESET) on Windows.
+    fn raw_econnreset() -> i32 {
+        if cfg!(target_os = "linux") {
+            104
+        } else if cfg!(windows) {
+            10054
+        } else {
+            54
         }
     }
 }

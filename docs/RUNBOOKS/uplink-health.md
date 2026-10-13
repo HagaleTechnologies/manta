@@ -13,7 +13,7 @@ manta status — daemon up 3h 12m
 RBN uplink: DEGRADED — 1 of 2 enabled targets connected
 
   TARGET                         STATE       SENT    SUPPR   RECONN RECENT(5m)
-  telnet.reversebeacon.net:7000  connected  18001      431        0          0
+  collector-01.example.net:7000  connected  18001      431        0          0
   backup.example.net:7000        flapping       0        0       37         14
 
 $ echo $?
@@ -120,9 +120,11 @@ scripting or an existing monitoring stack. Per-target series are also on
 `GET /metrics` (`manta_uplink_target_connected`, `_sent_total`,
 `_suppressed_total`, `_reconnects_total`, `_recent_reconnects`, labeled
 `target="host:port"`) for anyone who already scrapes Prometheus.
+MantaUplinkDisconnected in [monitoring.md](monitoring.md) alerts on the same
+verdict `/status` gives.
 
 Both endpoints share `/metrics`'s exposure posture — unauthenticated,
-bound to `[server].bind_addr` (`0.0.0.0` by default) — see
+bound to `[server].metrics_bind_addr` (`127.0.0.1` by default, MAN-132) — see
 `docs/RUNBOOKS/network-exposure.md` if you need to restrict access.
 Design rationale: `docs/DECISIONS/2026-09-04-man44-uplink-status-surface.md`.
 

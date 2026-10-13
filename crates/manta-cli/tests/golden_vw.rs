@@ -1,4 +1,4 @@
-//! MAN-315 golden gates VW1-VW5 (SPEC-decode-core.md §7.2): senders who
+//! MAN-315 golden gates VW1-VW5 (SPEC-decode-core.md §7.3): senders who
 //! do not key ideal 1:3 / 3 / 7 timing -- heavy dashes, long letter and
 //! word gaps, a bug key, a heavy hand key, and a keyboard sender beside a
 //! heavy sender on an adjacent channel. Run on the default `legacy`

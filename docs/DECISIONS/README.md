@@ -11,7 +11,13 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-13 | MAN-133 | [MAN-133: shell completions and a man page for the manta CLI](2026-10-13-man133-shell-completions-and-man-pages.md) |
+| 2026-10-13 | MAN-312 | [MAN-312: band-wide static crashes start no tracks and are not decoded](2026-10-13-man312-static-crash-filter.md) |
+| 2026-10-12 | MAN-129 | [MAN-129: a shipped Grafana dashboard and Prometheus alert rules](2026-10-12-man129-dashboard-and-alerts.md) |
+| 2026-10-12 | MAN-118 | [MAN-118: decode-quality signals on `/metrics`](2026-10-12-man118-decode-quality-metrics.md) |
 | 2026-10-11 | MAN-315 | [MAN-315: per-sender dot, dash and gap timing in the legacy decoder](2026-10-11-man315-sender-timing.md) |
+| 2026-10-11 | MAN-314 | [MAN-314: RTTY recognition keeps RTTY out of CW tracks](2026-10-11-man314-rtty-recognition.md) |
+| 2026-10-11 | MAN-301 | [MAN-301: grade every manta spot live against what the RBN heard](2026-10-11-man301-live-rbn-comparison.md) |
 | 2026-10-11 | MAN-298 | [MAN-298: the first release (v0.1.0)](2026-10-11-man298-first-release.md) |
 | 2026-10-11 | MAN-81 | [MAN-81: the Docker image runs a mounted config and reports its own health](2026-10-11-man81-docker-config-mount-and-healthcheck.md) |
 | 2026-10-11 | MAN-115 | [MAN-115: start-up latency before the first decode](2026-10-11-man115-startup-latency.md) |
@@ -19,6 +25,7 @@ Add a row here in the same change that adds a record:
 | 2026-10-11 | MAN-149 | [MAN-149: config, metrics and spot-schema references, and a docs index](2026-10-11-man149-docs-reference-and-index.md) |
 | 2026-10-11 | MAN-138 | [MAN-138: a JSON spot's `deGrid`/`deLat`/`deLon` are the configured station position](2026-10-11-man138-station-location.md) |
 | 2026-10-11 | MAN-131 | [MAN-131: errors say what to check next](2026-10-11-man131-actionable-errors.md) |
+| 2026-10-11 | MAN-90 | [MAN-90: the direct RBN uplink's protocol is unverified — known gaps and the capture that would close them](2026-10-11-man90-uplink-protocol-verification.md) |
 | 2026-10-11 | MAN-127 | [MAN-127: `manta calibrate` measures the receiver's frequency offset](2026-10-11-man127-calibrate-command.md) |
 | 2026-10-11 | MAN-93 | [MAN-93: a configurable heard-time window for `sh/dx` history](2026-10-11-man93-sh-dx-history-window.md) |
 | 2026-10-10 | MAN-270 | [MAN-270: command output style — human units, stdout/stderr routing, one-line escaped errors](2026-10-10-man270-cli-output-style.md) |

@@ -98,6 +98,8 @@ mod tests {
             events: Vec::new(),
             spots: Vec::new(),
             timing: None,
+            rtty: Vec::new(),
+            sample_rate_hz: 48_000.0,
         };
         assert_eq!(
             decode_summary(&report),

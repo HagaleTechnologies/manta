@@ -254,6 +254,18 @@ impl TrackDecoder {
         self.hop_count
     }
 
+    /// MAN-118: the `Legacy` engine's keying-rail ratio (`Demod::rail_ratio`),
+    /// for the daemon's `manta_track_rail_ratio` histogram. `None` before
+    /// the rails initialize, and always for `EdgeLegacy`/`Hsmm`, whose front
+    /// ends have no `Demod` rails.
+    pub fn rail_ratio(&self) -> Option<f32> {
+        if self.cfg.engine == Engine::Legacy {
+            self.demod.rail_ratio()
+        } else {
+            None
+        }
+    }
+
     /// One hop: linear amplitude, linear power, optional spectral noise
     /// reference power (SPEC v2 §2.2), input sample counter.
     pub fn push_hop(
@@ -1477,6 +1489,29 @@ mod tests {
         }
         env.extend(std::iter::repeat_n(1.0f32, 15));
         env
+    }
+
+    /// MAN-118: `rail_ratio` reports the `Legacy` demod's rails once they
+    /// initialize, and nothing for an engine without them.
+    #[test]
+    fn rail_ratio_is_reported_under_legacy_only() {
+        let feed = |engine: Engine| {
+            let mut dec = TrackDecoder::new(
+                1,
+                DecodeConfig {
+                    engine,
+                    ..DecodeConfig::default()
+                },
+            );
+            assert_eq!(dec.rail_ratio(), None, "{engine:?} before any input");
+            for (i, a) in keyed_envelope_for_tests().into_iter().enumerate() {
+                dec.push_envelope(a, i as u64 * 256);
+            }
+            dec.rail_ratio()
+        };
+        let legacy = feed(Engine::Legacy).expect("legacy rails initialize within one interval");
+        assert!(legacy >= 2.0, "legacy rail ratio {legacy}");
+        assert_eq!(feed(Engine::Hsmm), None);
     }
 
     #[test]

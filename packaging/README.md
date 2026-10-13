@@ -103,7 +103,9 @@ service, not while it runs. See
 
 **Uplinks.** Leave the `[[rbn_uplink]]` block commented out. If you enable
 an uplink later, `dry_run` defaults to `true`: it connects and logs in but
-sends no spots until you set `dry_run = false`.
+sends no spots until you set `dry_run = false`. The uplink is experimental:
+its login and spot format are unverified against RBN's real ingest. To reach
+RBN, let an RBN Aggregator read the telnet server.
 
 **If `N0CALL` is left in place**, manta refuses to start:
 
@@ -430,6 +432,9 @@ accepts connections only from the same machine
 `curl -s http://127.0.0.1:7302/healthz` on that machine reports the node's
 health. Read [network-exposure.md](../docs/RUNBOOKS/network-exposure.md)
 before you change either address.
+
+For a Grafana dashboard and Prometheus alerts, see
+[monitoring](https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md).
 
 ## Upgrading or reinstalling
 

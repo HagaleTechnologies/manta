@@ -92,7 +92,8 @@ Releases page, check them as
 shows, unzip, and run `.\manta.exe --version` in the unpacked folder.
 
 Each archive holds the binary, this README, both licence files, an example
-config and the kit for running manta as a service
+config, the man pages (see [Tab completion and man pages](#tab-completion-and-man-pages))
+and the kit for running manta as a service
 ([packaging/README.md](packaging/README.md)). Release binaries read
 KiwiSDR, HPSDR, audio and WAV input; SoapySDR needs a build from source.
 Linux binaries need the ALSA runtime library (`libasound2`, see the notes
@@ -133,6 +134,37 @@ Each release also publishes a multi-arch image (`linux/amd64`,
 ```sh
 docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
 ```
+
+### Tab completion and man pages
+
+`manta completions <shell>` prints a tab-completion script for `bash`,
+`zsh`, `fish`, `powershell` or `elvish`. Load it from your shell's startup
+file:
+
+| Shell | Where | What to add or run |
+|---|---|---|
+| bash | `~/.bashrc` | `eval "$(manta completions bash)"` |
+| zsh | `~/.zshrc`, after `autoload -Uz compinit && compinit` | `eval "$(manta completions zsh)"` |
+| fish | run once | `manta completions fish > ~/.config/fish/completions/manta.fish` |
+| PowerShell | `$PROFILE` | `manta completions powershell \| Out-String \| Invoke-Expression` |
+| elvish | `~/.config/elvish/rc.elv` | `eval (manta completions elvish \| slurp)` |
+
+The script covers the commands and flags of the binary that printed it, so
+run the fish line again after an upgrade; the other shells reload it with
+every new shell.
+
+Each release archive carries man pages in `man/man1`: `manta.1` and one
+page per command (`manta-run.1`, `manta-config-check.1`, ...). On Linux or
+macOS, from the unpacked archive:
+
+```sh
+sudo install -d /usr/local/share/man/man1
+sudo install -m 0644 man/man1/*.1 /usr/local/share/man/man1/
+man manta
+```
+
+After a build from source, `manta man-pages --out <dir>` writes the same
+pages into `<dir>`.
 
 ### Notes
 
@@ -345,9 +377,28 @@ connection and reconnect state per target) instead of reading its logs:
 manta status --config server.toml
 ```
 
-Forwarding to an upstream RBN-style collector is a `[[rbn_uplink]]`
-block. `dry_run` defaults to `true`, so an uplink connects and logs in but
-transmits nothing until you set it to `false` deliberately.
+The supported route into the Reverse Beacon Network is an RBN Aggregator
+reading this node's telnet server (see the
+[secondary-skimmer field-node runbook](docs/RUNBOOKS/secondary-skimmer-field-node.md)).
+Forwarding straight to an upstream collector is an experimental
+`[[rbn_uplink]]` block. `dry_run` defaults to `true`, so an uplink connects
+and logs in but transmits nothing until you set it to `false` deliberately.
+
+To see, live, whether RBN heard what manta spots, add an `[rbn_compare]`
+table (MAN-301). manta then reads RBN's public CW feed, read-only, and
+publishes a grade for each spot on the JSON stream and `/metrics` about
+3 minutes after the spot. Allow outbound TCP to
+`telnet.reversebeacon.net:7000`:
+
+```toml
+[rbn_compare]
+enabled = true             # or pass --rbn-compare for a single run
+# spotters = ["K5TR"]     # grade against one co-located skimmer only
+```
+
+[docs/RUNBOOKS/rbn-comparison.md](docs/RUNBOOKS/rbn-comparison.md) explains
+each grade and metric, and `manta grade` for replaying a recorded node's
+spot log against RBN's daily archive.
 
 ### Changing lists without a restart
 
@@ -551,17 +602,28 @@ only if that config also carries at least one `[[rbn_uplink]]` block.
 - **DX cluster telnet server** (`:7300`) — standard login prompt and
   RBN-format `DX de` lines, with enough command grammar (`sh/dx`,
   `set/dx/filter`) for stock clients. This is the RBN/aggregator
-  compatibility surface. A logger can request the last 30 minutes with
+  compatibility surface and the supported route into RBN: an RBN Aggregator
+  reads it as it reads CW Skimmer Server, following the published CW Skimmer
+  and Aggregator manuals. A logger can request the last 30 minutes with
   `sh/dx 30m`; `[server].history_minutes` sets retained history depth
   (default 30). A bare `sh/dx` shows the last 10. See
   [history limits](docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md).
 - **JSON Lines / WebSocket stream** (`:7301`) — one full-fidelity spot
   object per line; a raw TCP client and a WebSocket client share the
   port. This is the [cqdx](https://cqdx.app) ingest surface.
-- **Outbound RBN uplink** — forwards validated spots to an upstream
-  collector in the same `DX de` wire format, with reconnect and multiple
-  simultaneous targets. Working against a collector; **not yet validated
-  against RBN's live ingest**.
+- **Live comparison with the RBN** — with `[rbn_compare]` enabled, manta
+  reads RBN's public CW telnet feed and grades each spot `match`,
+  `disagree`, `elsewhere`, `none` or `unknown` against what RBN's
+  skimmers heard within 3 minutes of it. Each grade is a `spotGrade`
+  record on the `:7301` stream and a per-band count on `/metrics`;
+  `manta grade` replays a recorded spot log against RBN's daily archive.
+  manta only reads the feed: it sends its login callsign and nothing else.
+- **Outbound RBN uplink (experimental)** — forwards validated spots to an
+  upstream collector as `DX de` lines, with reconnect and multiple
+  simultaneous targets. Tested only against manta's own mock collector: RBN
+  publishes nothing about what its ingest accepts, so the login and line
+  format are manta's assumption, and the uplink ships in dry-run. To reach
+  RBN today, let an RBN Aggregator read the telnet server above.
 - **Prometheus metrics** (`:7302/metrics`) — spot, client, uplink and
   source-health counters. Some gauges are still placeholders;
   ARCHITECTURE §8 says which.
@@ -589,9 +651,15 @@ test vectors.
 
 ### Outbound RBN uplink
 
-manta can also log into an RBN spot-collection endpoint as a client and
-forward its own spots there. Add one `[[rbn_uplink]]` block per target to
-the daemon config:
+**Experimental.** manta can also log into a spot collector as a client and
+forward its own spots there. RBN has not published what its own ingest
+accepts, and this uplink has only been tested against a mock collector, so it
+may not work against RBN's servers. To get spots into RBN today, run manta's
+telnet server behind an RBN Aggregator; the
+[secondary-skimmer field-node runbook](docs/RUNBOOKS/secondary-skimmer-field-node.md)
+walks through it.
+
+Add one `[[rbn_uplink]]` block per target to the daemon config:
 
 ```toml
 [server]
@@ -613,9 +681,13 @@ target_port = 7000
 Spots an uplink holds back still appear on manta's own telnet and JSON
 output; `spot_types` only decides what goes to that target.
 
-The uplink has not yet been verified against a real RBN ingest (see
-[ROADMAP.md](ROADMAP.md)), which is why dry-run is the default. manta logs
-which mode each target is in at startup.
+What the uplink sends, and each part of that still unverified, is recorded
+in
+[docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md](docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md).
+The capture that would settle it is described in
+[docs/RUNBOOKS/aggregator-rbn-capture.md](docs/RUNBOOKS/aggregator-rbn-capture.md).
+That is also why dry-run is the default. manta logs which mode each target is
+in at startup.
 
 ## Status
 
@@ -638,8 +710,9 @@ configuration keys and output formats can change between releases before
   fading on several golden vectors, and at low SNR the validator still
   admits occasional bogus callsigns from noise. Closing the fading gap is
   classical-DSP work in flight, with ML fusion behind it at M4. The
-  outbound RBN uplink is unverified against a real RBN ingest and ships
-  dry-run by default until that verification lands.
+  outbound RBN uplink is experimental: its login and line format are
+  unverified against RBN's real ingest (MAN-90), and it ships dry-run by
+  default.
 - **Decode engine:** `decode.engine` defaults to `legacy`. A rewritten
   `hsmm` engine (decode-core-v2, `docs/SPEC-decode-core-v2.md`) is
   implemented and reachable via `--engine hsmm`, but its stage-2
@@ -662,6 +735,8 @@ criteria.
   waterfall.
 - Not a general digital-mode skimmer. FT8 and RTTY are out of scope for 1.0,
   though the channelizer architecture does not preclude them later.
+  Decoding RTTY stays a non-goal for now; recognising it so that its tones
+  never become CW tracks is in scope (MAN-314).
 - Not a cluster network. `manta` is a spot source, not an aggregator.
 - Not a logger. No QSO state.
 - Not a multi-process orchestrator. `manta` is a single Rust binary, not a

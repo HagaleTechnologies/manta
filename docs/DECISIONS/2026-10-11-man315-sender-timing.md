@@ -1,7 +1,7 @@
 # MAN-315: per-sender dot, dash and gap timing in the legacy decoder
 
 Date: 2026-10-11. Ticket: MAN-315. Normative text: SPEC-decode-core.md
-§4.1, §4.1a, §4.1b, §4.2, §5, §7.2 and §9.
+§4.1, §4.1a, §4.1b, §4.2, §5, §7.3 and §9.
 
 ## Decision
 

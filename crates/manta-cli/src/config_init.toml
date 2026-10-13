@@ -89,6 +89,9 @@
 
 # --- Uplink to an RBN-style collector ----------------------------------------
 # Forwards CQ and beacon spots to an upstream collector. Needs [server].
+# Experimental: its login and spot format are unverified against RBN's
+# real ingest. To reach RBN today, let an RBN Aggregator read the telnet
+# server instead (docs/RUNBOOKS/secondary-skimmer-field-node.md).
 # Delete the `#` in front of [[rbn_uplink]] and the settings below to use
 # it; repeat the block once per collector.
 
@@ -107,6 +110,26 @@
 # TEST) and beacons, as RBN requires; "all" also sends stations answering
 # a call (DE) and spots with no recognised context.
 #spot_types = "cq_beacon"
+
+
+# --- Comparison with the Reverse Beacon Network -------------------------------
+# Grades each spot against what RBN's public telnet feed heard within
+# window_secs of it, and publishes the grade on the JSON stream and
+# /metrics. Needs [server]. manta only reads the feed: it logs in with a
+# callsign and sends nothing else.
+
+#[rbn_compare]
+
+#enabled = false                     # --rbn-compare turns it on for one run
+#feed_host = "telnet.reversebeacon.net"  # RBN's public telnet feed
+#feed_port = 7000                     # RBN's CW and RTTY feed; manta keeps CW only
+#login_callsign = "N0CALL"            # default: station_callsign from [server]
+#window_secs = 180                    # 30 to 3600; RBN reports this close to a spot count
+#freq_tol_hz = 500.0                  # further than this from RBN's modal frequency: frequency disagreement
+#speed_tol_wpm = 3.0                  # a speed disagreement needs more than this many WPM
+#speed_tol_pct = 20.0                 # and more than this percent of RBN's median speed
+#spotters = []                        # only these RBN skimmers count, e.g. ["K5TR"]; --rbn-spotter replaces it
+#exclude_spotters = []                # never count these skimmers; your own callsign is always excluded
 
 
 # --- Receiver ----------------------------------------------------------------
@@ -207,6 +230,9 @@
 #warmup_ms = 25.0                    # start-up time spent measuring the noise; no tracks before it
 #track_cap = 1200                    # most open tracks, candidates included
 #silent_respawn_cooldown_ms = 30000.0  # wait before a channel whose track went silent starts another
+#crash_filter = "full"               # static crashes: "full" ignores them, "starts-only" only blocks new tracks, "off"
+#rtty_filter = true                  # recognise RTTY (FSK) signals and start no CW track on them
+#rtty_dwell_ms = 20000.0             # how long an FSK signal must last before it is marked as RTTY
 
 
 # --- Decoder -----------------------------------------------------------------

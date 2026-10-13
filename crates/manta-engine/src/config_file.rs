@@ -15,7 +15,10 @@
 //!
 //! Keys are SPEC §9's `on_snr_db`, `off_snr_db`, `confirm_ms`, `hang_ms`,
 //! `gc_ms` and `warmup_ms`, plus `track_cap` (ARCHITECTURE §4, configurable per §8) and
-//! `silent_respawn_cooldown_ms` (MAN-171). Every key is an `Option`
+//! `silent_respawn_cooldown_ms` (MAN-171), `rtty_filter` and
+//! `rtty_dwell_ms` (MAN-314, SPEC §2.6; the dwell must be at least one
+//! 1000 ms detector block), and `crash_filter` (MAN-312, SPEC §2.7:
+//! `"full"`, `"starts-only"` or `"off"`). Every key is an `Option`
 //! overlaid on `DetectorConfig::default()`, so an absent key keeps the exact
 //! default hop count instead of round-tripping it through milliseconds.
 //! Millisecond keys convert with `manta_decode::ms_to_hops`, SPEC §1.1's
@@ -37,7 +40,7 @@
 //! fields here; `manta-cli` rejects them with a specific "not configurable
 //! yet" message before this struct ever sees them.
 
-use crate::track::DetectorConfig;
+use crate::track::{CrashFilter, DetectorConfig};
 use manta_decode::{ms_to_hops, HOP_MS};
 use serde::Deserialize;
 
@@ -59,6 +62,10 @@ pub struct DetectorConfigToml {
     pub warmup_ms: Option<f64>,
     pub track_cap: Option<usize>,
     pub silent_respawn_cooldown_ms: Option<f64>,
+    /// MAN-312 (SPEC §2.7): `"full"`, `"starts-only"` or `"off"`.
+    pub crash_filter: Option<CrashFilter>,
+    pub rtty_filter: Option<bool>,
+    pub rtty_dwell_ms: Option<f64>,
 }
 
 impl DetectorConfigToml {
@@ -87,8 +94,25 @@ impl DetectorConfigToml {
                 d.silent_respawn_cooldown_hops,
                 false,
             )?,
+            crash_filter: self.crash_filter.unwrap_or(d.crash_filter),
+            rtty_filter: self.rtty_filter.unwrap_or(d.rtty_filter),
+            rtty_dwell_hops: rtty_dwell(self.rtty_dwell_ms, d.rtty_dwell_hops)?,
         })
     }
+}
+
+/// MAN-314: `rtty_dwell_ms`, bounded like every `*_ms` key and at least
+/// one 1000 ms detector block (SPEC §2.6).
+fn rtty_dwell(value: Option<f64>, default: u64) -> Result<u64, String> {
+    let h = hops("rtty_dwell_ms", value, default, false)?;
+    if let Some(ms) = value {
+        if ms < 1000.0 {
+            return Err(format!(
+                "detector.rtty_dwell_ms = {ms} is shorter than one 1000 ms detector block; it must be at least 1000"
+            ));
+        }
+    }
+    Ok(h)
 }
 
 /// A dB key: finite and in `[0, 100]`, stored as `f32`.
@@ -160,6 +184,28 @@ mod tests {
     #[test]
     fn empty_table_is_the_default() {
         assert_eq!(parse("").unwrap(), DetectorConfig::default());
+        assert_eq!(parse("").unwrap().crash_filter, CrashFilter::Full);
+    }
+
+    #[test]
+    fn crash_filter_values_parse() {
+        for (v, want) in [
+            ("full", CrashFilter::Full),
+            ("starts-only", CrashFilter::StartsOnly),
+            ("off", CrashFilter::Off),
+        ] {
+            let cfg = parse(&format!("crash_filter = \"{v}\"")).unwrap();
+            assert_eq!(cfg.crash_filter, want, "{v}");
+            assert_eq!(v.parse::<CrashFilter>(), Ok(want), "{v}");
+        }
+    }
+
+    #[test]
+    fn bad_crash_filter_is_rejected() {
+        let e = err("crash_filter = \"sometimes\"");
+        assert!(e.contains("sometimes"), "{e}");
+        assert!(e.contains("starts-only"), "{e}");
+        assert!("sometimes".parse::<CrashFilter>().is_err());
     }
 
     #[test]
@@ -174,6 +220,8 @@ mod tests {
             warmup_ms = 25.0
             track_cap = 1200
             silent_respawn_cooldown_ms = 30000.0
+            rtty_filter = true
+            rtty_dwell_ms = 20000.0
             "#,
         )
         .unwrap();
@@ -183,6 +231,43 @@ mod tests {
         assert_eq!(cfg.gc_hops, 11250);
         assert_eq!(cfg.warmup_hops, 9);
         assert_eq!(cfg.silent_respawn_cooldown_hops, 11250);
+        assert_eq!(cfg.rtty_dwell_hops, 7500);
+    }
+
+    #[test]
+    fn rtty_keys_default_to_on_and_20000_ms() {
+        let cfg = parse("").unwrap();
+        assert!(cfg.rtty_filter);
+        assert_eq!(cfg.rtty_dwell_hops, 7500);
+    }
+
+    #[test]
+    fn rtty_filter_false_is_accepted() {
+        let cfg = parse("rtty_filter = false").unwrap();
+        assert!(!cfg.rtty_filter);
+    }
+
+    #[test]
+    fn rtty_dwell_ms_below_one_block_is_rejected() {
+        assert_eq!(
+            err("rtty_dwell_ms = 500"),
+            "detector.rtty_dwell_ms = 500 is shorter than one 1000 ms detector block; it must be at least 1000"
+        );
+        assert!(err("rtty_dwell_ms = 1").contains("at least 1000"));
+    }
+
+    #[test]
+    fn rtty_dwell_ms_above_one_hour_is_rejected() {
+        let e = err("rtty_dwell_ms = 3600001");
+        assert!(e.contains("detector.rtty_dwell_ms"), "{e}");
+        assert!(e.contains("[0, 3600000]"), "{e}");
+    }
+
+    #[test]
+    fn rtty_filter_must_be_a_boolean() {
+        let e = err(r#"rtty_filter = "yes""#);
+        assert!(e.contains("rtty_filter"), "{e}");
+        assert!(e.contains("expected a boolean"), "{e}");
     }
 
     #[test]

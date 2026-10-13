@@ -122,6 +122,13 @@ loop file replay so a hardware-free replay can feed telnet/JSON clients; IQ
 WAVs declaring more than 10 MS/s are rejected at open — see
 docs/DECISIONS/2026-10-10-man269-paced-looping-replay.md.
 
+MAN-90: the direct `[[rbn_uplink]]` is experimental (docs, a `config check`
+note, and the live-transmit WARN lines); the Aggregator path is the supported
+route into RBN. Claims C1–C7 stay open until a consenting Aggregator
+operator's capture — see
+docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md and
+docs/RUNBOOKS/aggregator-rbn-capture.md.
+
 MAN-115: `TrackManager` skips the channelizer's zero pre-roll, `FloorBank`
 seeds a young channel's effective floor from its block median for 1 s, and
 `[detector].warmup_ms` defaults to 25 (was 2000). V1 promotes at 0.07 s
@@ -140,11 +147,46 @@ MAN-127: `manta calibrate` measures the receiver's ppm offset against a
 known carrier and saves `[input].freq_correction_ppm` after confirmation —
 see docs/DECISIONS/2026-10-11-man127-calibrate-command.md.
 
+MAN-312: `[detector].crash_filter` (`full` default / `starts-only` / `off`)
+stops band-wide static crashes (≥ 3 dB on three quarters of the passband's
+channels for ≥ 8 ms) from starting tracks or decoding inside them; counted
+as `manta_static_crashes_total`; VC1–VC3 vectors — see
+docs/DECISIONS/2026-10-13-man312-static-crash-filter.md.
+
+MAN-118: `/metrics` reports decode quality node-wide, with no `track_id`
+label: `manta_decode_chars_total`/`manta_decode_garbles_total`,
+`manta_track_rail_ratio` (each `legacy` track's keying-rail ratio once per
+second) and `manta_candidate_repetitions` (the repetition gate's count per
+candidate), via `manta_engine::DecodeQualityObserver` — see
+docs/DECISIONS/2026-10-12-man118-decode-quality-metrics.md.
+
+MAN-314: RTTY (two-tone FSK) is recognised after `[detector] rtty_dwell_ms`
+(20 s) and starts no CW track on its tones or keying sidebands
+(`manta-dsp::fsk`, SPEC §2.6); `decode --json` gains `rtty`, `run` logs
+marks/clears and `/metrics` gains `manta_rtty_signals{band}`. See
+docs/DECISIONS/2026-10-11-man314-rtty-recognition.md.
+
+MAN-301: `[rbn_compare]` (off by default, needs `[server]`) reads RBN's
+CW telnet feed read-only (login callsign only) and grades each spot
+`match`/`disagree`/`elsewhere`/`none`/`unknown` after a 180 s window, as a
+`spotGrade` record on :7301 and `manta_rbn_compare_*` metrics; `manta
+grade` and `score-against-rbn.py --node-log` replay offline through the
+same Rust engine. RBN's real login prompt and the live/offline agreement
+rate are unmeasured. See
+docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
+
+MAN-133: `manta completions <shell>` (bash/zsh/fish/powershell/elvish) and
+`manta man-pages --out DIR` render from the clap tree `--help` uses; every
+release archive ships `man/man1/*.1` rendered natively by the release
+workflows' `validate-tag` job. clap_complete publishes hidden commands
+and flags, so nothing in the CLI may be hidden. See
+docs/DECISIONS/2026-10-13-man133-shell-completions-and-man-pages.md.
+
 MAN-315: the legacy decoder learns per-track dot/dash/gap timing
 (`SenderTiming`, SPEC §4.1b; `TimingUpdate` event, `decode --json`
 `timing`, a `decode --timing` stderr line); gaps are measured in the
 symmetric dit (`dit_estimate_ms`), the word boundary is the sender's own,
-and the dash/dot ceiling is 6.0. VW1–VW5 (SPEC §7.2, `golden_vw.rs`)
+and the dash/dot ceiling is 6.0. VW1–VW5 (SPEC §7.3, `golden_vw.rs`)
 pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
 planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.

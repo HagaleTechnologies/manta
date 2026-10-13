@@ -508,11 +508,18 @@ fn calibrate_write_keeps_mode_0600() {
 fn top_level_help_lists_calibrate() {
     let out = manta().arg("--help").output().unwrap();
     assert!(out.status.success());
-    assert!(
-        text(&out.stdout)
-            .contains("calibrate  Measure the receiver's frequency error against a known signal"),
-        "{}",
-        text(&out.stdout)
+    // MAN-133's `completions` (a longer name than `calibrate`) widened
+    // clap's Commands alignment column, so the row is matched with the
+    // whitespace collapsed rather than pinning the gap width.
+    let help = text(&out.stdout);
+    let line = help
+        .lines()
+        .find(|l| l.trim_start().starts_with("calibrate"))
+        .unwrap_or_else(|| panic!("no calibrate row in {help}"));
+    assert_eq!(
+        line.split_whitespace().collect::<Vec<_>>().join(" "),
+        "calibrate Measure the receiver's frequency error against a known signal",
+        "{help}"
     );
 }
 

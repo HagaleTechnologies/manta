@@ -1,0 +1,61 @@
+# Prometheus alerting rules for manta nodes. See docs/RUNBOOKS/monitoring.md.
+# Load with `rule_files:` (see prometheus.yml beside this file); check with
+# `promtool check rules manta-alerts.yml` and `promtool test rules manta-alerts.test.yml`.
+groups:
+  - name: manta
+    rules:
+      # Prometheus cannot scrape the node. Needs the scrape job to be named "manta".
+      - alert: MantaNodeDown
+        expr: up{job="manta"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "manta node {{ $labels.instance }} is down"
+          description: "Prometheus has failed to scrape {{ $labels.instance }} for 2 minutes: the daemon is not running, or its metrics port is unreachable from Prometheus."
+          runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantanodedown"
+
+      # The node answers but /healthz fails: a source is unhealthy, a listener is
+      # down, or the decode loop has made no progress for 10 s.
+      - alert: MantaNodeUnhealthy
+        expr: manta_healthy == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "manta node {{ $labels.instance }} reports itself unhealthy"
+          description: "GET /healthz on {{ $labels.instance }} has failed for 2 minutes: a source is unhealthy, a listener is down or the decode loop has stalled."
+          runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantanodeunhealthy"
+
+      # The spot count is where it was 30 minutes ago and this process has run for
+      # at least 30 minutes. `offset` finds no sample across a scrape gap, so the
+      # alert stays quiet for 30 minutes after one; the uptime term keeps a restart
+      # inside the window from comparing two processes' counts.
+      - alert: MantaNoSpots
+        expr: |
+          (manta_spots_total - manta_spots_total offset 30m) == 0
+          and on(instance, job) manta_uptime_seconds >= 1800
+        labels:
+          severity: warning
+        annotations:
+          summary: "manta node {{ $labels.instance }} has published no spots for 30 minutes"
+          description: "manta_spots_total on {{ $labels.instance }} has not increased in 30 minutes of uptime."
+          runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantanospots"
+
+      # An enabled [[rbn_uplink]] target that GET /status would not call
+      # "connected": down, or flapping (3 or more reconnect attempts in the last
+      # 300 s, even while connected). `for` is longer than that 300 s window, so a
+      # target that reconnects after a short burst does not fire.
+      - alert: MantaUplinkDisconnected
+        expr: |
+          manta_uplink_target_enabled == 1
+          unless on(instance, job, target)
+            (manta_uplink_target_connected == 1
+              and on(instance, job, target) manta_uplink_target_recent_reconnects < 3)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RBN uplink {{ $labels.target }} on {{ $labels.instance }} is not connected"
+          description: "{{ $labels.target }} has been down or flapping for 10 minutes."
+          runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantauplinkdisconnected"
