@@ -861,6 +861,28 @@ fn wiki_manifest_lists_every_page_with_a_matching_hash() {
     }
 }
 
+/// MAN-152 re-stamped spot-output-contract.md as verified, but its opening
+/// still said manta "consumes no external spot contract". MAN-301's
+/// `[rbn_compare]` parses RBN's `DX de` feed, so the page names that parser.
+#[test]
+fn spot_output_contract_names_the_rbn_feed_manta_reads() {
+    let page = squash_whitespace(&doc("wiki/pages/spot-output-contract.md"));
+    assert!(
+        !page.contains("consumes no external spot contract"),
+        "wiki/pages/spot-output-contract.md says manta consumes no external spot \
+         contract, but `[rbn_compare]` parses RBN's `DX de` feed (MAN-301)"
+    );
+    let parser = "crates/manta-server/src/rbn_compare/ak1a.rs";
+    assert!(
+        repo_root().join(parser).is_file(),
+        "{parser} is gone: point wiki/pages/spot-output-contract.md at the RBN feed parser"
+    );
+    assert!(
+        page.contains(parser),
+        "wiki/pages/spot-output-contract.md must name {parser}, the RBN feed parser"
+    );
+}
+
 // ---- MAN-261: SPEC §9 is the loadable key table; README's node is one file ----
 
 fn manta() -> std::process::Command {
