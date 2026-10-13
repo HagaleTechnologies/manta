@@ -2427,12 +2427,12 @@ fn readme_installation_documents_completions_and_man_pages() {
     );
 }
 
-/// MAN-133: the release runbook names the job that renders the pages and
+/// MAN-133: the release runbook names the steps that render the pages and
 /// where they land in each archive.
 #[test]
 fn release_runbook_lists_the_man_pages() {
     let runbook = squash_whitespace(&doc("docs/RUNBOOKS/release.md"));
-    for needle in ["man/man1", "the `man-pages` job"] {
+    for needle in ["man/man1", "the `validate-tag` job's man-page steps"] {
         assert!(
             runbook.contains(needle),
             "docs/RUNBOOKS/release.md never says {needle:?}"

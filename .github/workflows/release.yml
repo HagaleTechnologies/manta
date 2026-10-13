@@ -49,9 +49,10 @@ jobs:
   # platform builds (PR #107 review). The push-only condition sits on the
   # STEP, not the job: a job skipped by its own `if:` also skips everything
   # that needs it, which would silently skip the entire build matrix on
-  # every `workflow_dispatch` run. On a dispatch this job runs and succeeds
-  # as a no-op: a dispatch is a manual build of whatever ref was picked
-  # (branch or tag), not a tag push, and this file never publishes it.
+  # every `workflow_dispatch` run. On a dispatch the tag checks are no-ops
+  # (the man pages below are still rendered): a dispatch is a manual build
+  # of whatever ref was picked (branch or tag), not a tag push, and this
+  # file never publishes it.
   validate-tag:
     runs-on: ubuntu-latest
     steps:
@@ -70,18 +71,15 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: scripts/check-release-ancestry.sh "$RELEASE_COMMIT" "$DEFAULT_BRANCH"
 
-  # MAN-133: the man pages every archive ships, rendered once from a native
-  # build. Their text depends only on Cargo features -- the same as every
-  # build leg's, pinned by scripts/tests/test_package_release.py -- never on
-  # the target, and the aarch64 leg's cross-built binary cannot run on its
-  # runner. Named so the release job's `manta-*` download never publishes it.
-  man-pages:
-    needs: validate-tag
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      # MAN-133: the man pages every archive ships, rendered once from a native
+      # build. Their text depends only on Cargo features -- the same as every
+      # build leg's, pinned by scripts/tests/test_package_release.py -- never on
+      # the target, and the aarch64 leg's cross-built binary cannot run on its
+      # runner. Here, after the tag checks, so a bad tag still fails before any
+      # build, and `build` keeps needing only this job (release-version.test.sh
+      # and release-ancestry.test.sh in scripts/tests/). A failure from here on
+      # says nothing about the tag. The artifact is named so the release job's
+      # `manta-*` download never publishes it.
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       # MAN-243: no build cache here either; this binary is never shipped.
@@ -97,7 +95,7 @@ jobs:
           retention-days: 14
 
   build:
-    needs: [validate-tag, man-pages]
+    needs: validate-tag
     strategy:
       fail-fast: false
       matrix:
@@ -241,7 +239,7 @@ jobs:
           }
           Write-Host "OK: no dynamic MSVC CRT imports."
 
-      # MAN-133: the pages the man-pages job rendered; Package ships them in man/man1.
+      # MAN-133: the pages validate-tag rendered; Package ships them in man/man1.
       - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           name: man-pages

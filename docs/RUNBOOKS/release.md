@@ -144,14 +144,15 @@ this change. See [the MAN-244 decision](../DECISIONS/2026-10-10-man244-release-g
       x86_64/arm64, Windows x86_64, Linux x86_64/arm64) and validates the
       multi-arch Docker build (`push: false`) — this run never publishes
       anything; it is a build-only check of the tagged commit (it no longer
-      runs on pull requests at all, since HAG-47). Its `man-pages` job
-      renders the man pages every archive ships (see "What each artifact
-      contains") from one native Linux build before the matrix starts.
+      runs on pull requests at all, since HAG-47). The `validate-tag` job's
+      man-page steps render the man pages every archive ships (see "What
+      each artifact contains") from one native Linux build, after the tag
+      checks and before the matrix starts.
     - **`release-publish.yml`** does the real work: `validate-tag` (checks
       tag grammar and default-branch ancestry before any platform build
-      starts) → `man-pages` (renders the pages once from a native Linux
-      build with the same `--features` as every build leg) → `build`
-      (rebuilds the same five targets and needs `man-pages`) → two jobs
+      starts, then renders the man pages once from a native Linux build
+      with the same `--features` as every build leg) → `build` (rebuilds
+      the same five targets and needs only `validate-tag`) → two jobs
       side by side, both in the `ghcr-publish` environment:
       `docker-publish-release` (pushes the multi-arch image to GHCR as
       `ghcr.io/hagaletechnologies/manta:X.Y.Z`, then `publish-latest` runs
@@ -257,6 +258,8 @@ proved. Repair remote access or history errors and retry; do not bypass the
 check or use an old local tracking ref as evidence. For an incorrect tag,
 the owner corrects or deletes it and selects a reviewed commit containing
 the guard. Prefer a new release version if artifacts were already published.
+A failure in `validate-tag`'s man-page steps (after both checks) says nothing
+about the tag: fix the cause or re-run the job; keep the tag.
 
 ## Accepted tag grammar
 
@@ -436,7 +439,7 @@ Both should report the same digest.
   `rotate-log.sh`) and `docs/RUNBOOKS/network-exposure.md`. See
   [docs/DECISIONS/2026-10-10-man268-unattended-packaging.md](../DECISIONS/2026-10-10-man268-unattended-packaging.md).
 - **Man pages** (MAN-133, every archive): `man/man1/manta.1` and one page
-  per command, rendered by the `man-pages` job running
+  per command, rendered by the `validate-tag` job's man-page steps running
   `manta man-pages`; `scripts/package-release.py --man-dir` refuses to
   build an archive without them.
 - **`SHA256SUMS`** (MAN-80, every Release): one `<sha256>  <archive>` line

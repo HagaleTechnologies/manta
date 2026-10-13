@@ -413,8 +413,8 @@ class WorkflowPackageStepTests(ArchiveAssertions):
             write_file(os.path.join(work, "scripts", "package-release.py"), repo_bytes("scripts/package-release.py"))
             write_file(os.path.join(work, "target", entry["target"], "release", exe), FAKE_BINARY)
             write_file(os.path.join(work, "dist", entry["artifact"], "stale.txt"), b"old staging\n")
-            # The download-artifact step materialises the man-pages job's
-            # output at work/man-pages/ before this step runs; the name is
+            # The download-artifact step materialises validate-tag's man-pages
+            # artifact at work/man-pages/ before this step runs; the name is
             # the workflow's, so no space here.
             fake_man_dir(work, "man-pages")
             log = os.path.join(tmp, "interpreters.log")
@@ -440,7 +440,8 @@ class WorkflowPackageStepTests(ArchiveAssertions):
 
 
 class ManPagesJobTests(unittest.TestCase):
-    """MAN-133: the job that renders every archive's man pages once, natively."""
+    """MAN-133: validate-tag renders every archive's man pages once, natively, after its tag
+    checks; `build` needs only validate-tag (scripts/tests/release-version.test.sh)."""
 
     def features_of(self, body):
         m = re.search(r"--features (\S+)", body)
@@ -450,22 +451,27 @@ class ManPagesJobTests(unittest.TestCase):
     def test_man_pages_job_renders_once_natively(self):
         for name in RELEASE_WORKFLOWS:
             with self.subTest(workflow=name):
-                job = wf.job_block(wf.read(name), "man-pages")
-                self.assertTrue(job, f"{name} has no man-pages job")
-                self.assertEqual(wf.field(job, "needs"), "validate-tag")
+                self.assertFalse(wf.job_block(wf.read(name), "man-pages"),
+                                 f"{name}: a separate man-pages job would need `build` to need it too")
+                job = wf.job_block(wf.read(name), "validate-tag")
+                self.assertTrue(job, f"{name} has no validate-tag job")
                 self.assertEqual(wf.field(job, "runs-on"), "ubuntu-latest")
                 steps = wf.steps(job)
-                self.assertTrue(steps, "man-pages job has no steps")
+                self.assertTrue(steps, "validate-tag has no steps")
                 checkout = [s for s in steps
                             if (wf.field(s, "uses") or "").startswith("actions/checkout@")]
                 self.assertEqual(len(checkout), 1, "expected exactly one checkout step")
-                with_block = wf.sub(checkout[0], "with")
-                self.assertIsNotNone(with_block, "the checkout has no with:")
-                self.assertEqual(wf.field(with_block, "persist-credentials"), "false")
                 bodies = [executable(wf.run_body(s)) for s in steps if wf.run_body(s)]
-                build = [b for b in bodies if "cargo build --release -p manta-cli" in b]
+                build = [i for i, s in enumerate(steps)
+                         if "cargo build --release -p manta-cli" in executable(wf.run_body(s))]
                 self.assertEqual(len(build), 1, "expected exactly one host build step")
-                self.assertRegex(build[0], r"--features \S+")
+                self.assertRegex(executable(wf.run_body(steps[build[0]])), r"--features \S+")
+                checks = [i for i, s in enumerate(steps)
+                          if re.search(r"release-version\.sh|check-release-ancestry\.sh",
+                                       executable(wf.run_body(s)))]
+                self.assertTrue(checks, "validate-tag lost its tag checks")
+                self.assertLess(max(checks), build[0],
+                                "the man-page build must come after every tag check")
                 self.assertTrue(
                     any("target/release/manta man-pages --out man-pages" in b for b in bodies),
                     "no step runs `target/release/manta man-pages --out man-pages`")
@@ -481,11 +487,11 @@ class ManPagesJobTests(unittest.TestCase):
     def test_man_pages_use_the_build_legs_features(self):
         for name in RELEASE_WORKFLOWS:
             with self.subTest(workflow=name):
-                job = wf.job_block(wf.read(name), "man-pages")
+                job = wf.job_block(wf.read(name), "validate-tag")
                 man_bodies = [executable(wf.run_body(s)) for s in wf.steps(job) if wf.run_body(s)]
                 want = {self.features_of(b) for b in man_bodies
                         if "cargo build --release -p manta-cli" in b}
-                self.assertEqual(len(want), 1, f"man-pages job builds with several feature sets: {want}")
+                self.assertEqual(len(want), 1, f"validate-tag builds with several feature sets: {want}")
                 want = next(iter(want))
                 build = wf.job_block(wf.read(name), "build")
                 checked = 0
@@ -493,7 +499,7 @@ class ManPagesJobTests(unittest.TestCase):
                     if wf.field(step, "name") in ("Build (native)", "Build (cross)"):
                         self.assertEqual(
                             self.features_of(executable(wf.run_body(step))), want,
-                            "the man-pages job's --features must equal every build leg's")
+                            "the man-page build's --features must equal every build leg's")
                         checked += 1
                 self.assertEqual(checked, 2, "build lost its native/cross build steps")
 
@@ -501,7 +507,7 @@ class ManPagesJobTests(unittest.TestCase):
         for name in RELEASE_WORKFLOWS:
             with self.subTest(workflow=name):
                 build = wf.job_block(wf.read(name), "build")
-                self.assertIn("man-pages", wf.field(build, "needs"))
+                self.assertEqual(wf.field(build, "needs"), "validate-tag")
                 steps = wf.steps(build)
                 pkg = [i for i, s in enumerate(steps)
                        if "scripts/package-release.py" in executable(wf.run_body(s))]
