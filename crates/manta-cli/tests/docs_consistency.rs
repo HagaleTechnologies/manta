@@ -2438,3 +2438,36 @@ fn release_runbook_lists_the_man_pages() {
         );
     }
 }
+
+/// No `docs/DECISIONS/` path CLAUDE.md cites is glued to the word before it,
+/// and each one that is not a glob names a `.md` file that exists. MAN-133's
+/// reflow once joined `See` onto the MAN-314 record's path
+/// (`Seedocs/DECISIONS/…`).
+#[test]
+fn claude_md_decision_paths_start_a_word_and_resolve() {
+    let claude = doc("CLAUDE.md");
+    for (at, _) in claude.match_indices("docs/DECISIONS/") {
+        let line = claude[..at].matches('\n').count() + 1;
+        assert!(
+            !claude[..at]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric),
+            "CLAUDE.md:{line}: a `docs/DECISIONS/` path is glued to the word before it"
+        );
+        let token = claude[at..].split(char::is_whitespace).next().unwrap();
+        let path = token
+            .find(".md")
+            .map(|end| &token[..end + 3])
+            .unwrap_or_else(|| {
+                panic!("CLAUDE.md:{line}: `{token}` is not a whole .md path (split across lines?)")
+            });
+        if path.contains(['[', '*']) {
+            continue;
+        }
+        assert!(
+            repo_root().join(path).is_file(),
+            "CLAUDE.md:{line} cites {path}, which does not exist"
+        );
+    }
+}
