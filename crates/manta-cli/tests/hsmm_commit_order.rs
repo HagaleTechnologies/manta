@@ -47,10 +47,7 @@ fn backwards_commits(spec: &manta_testkit::vectors::VectorSpec) -> Vec<String> {
 
 #[test]
 fn hsmm_commits_never_move_backwards_in_time() {
-    for spec in [
-        manta_testkit::vectors::vr6a(),
-        manta_testkit::vectors::v7(),
-    ] {
+    for spec in [manta_testkit::vectors::vr6a(), manta_testkit::vectors::v7()] {
         let bad = backwards_commits(&spec);
         assert!(bad.is_empty(), "{}: {bad:?}", spec.name);
     }

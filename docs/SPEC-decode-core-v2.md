@@ -244,9 +244,14 @@ explained as `E`).
 
 ```
 Token { node: NodeId, phase: AfterMark | AfterSpace, u: f32,
-        score: f32, hist: RingBuf<Entry, 8>, anchor: u64 }
-Entry = Glyph(Glyph) | Word
+        score: f32, hist: RingBuf<Entry, 8>, anchor: u64,
+        char_start: u64 }
+Entry = (Glyph(Glyph) | Word, sample_ts, char_start)
 ```
+
+`char_start` is the input sample counter at the anchor where the
+character's first mark began (MAN-189); a `Word` entry carries the
+character it follows.
 
 `u` is updated after every `Dit`/`Dah`/`EGap`/`CGap` of observed `d`:
 `u ← u + α_u · (d/k − u)`, `α_u` = `speed_alpha`, default 0.2, then
@@ -291,6 +296,14 @@ After pruning at anchor `t`:
 - **Forced**: if the best token's oldest `hist` entry was appended more
   than `lookahead_dits · u_best` hops ago (default 25), emit it, remove
   it from tokens that agree, and drop tokens that disagree.
+- **Committed time is final** (MAN-189): each token entry records the
+  start of its character's first mark. An entry is removed without
+  emission when its character began at or before the latest emitted
+  entry's `sample_ts`, or, for a `Word` entry, when a `Word` was already
+  emitted at or after its character's start, or its gap began before the
+  latest emitted entry. This is checked before the consensus and forced
+  rules and again after every emission, and by `finish()` (§4.10).
+  Emitted `sample_ts` therefore never decreases within a track.
 - A `Glyph` entry emits `CharDecoded { sample_ts = start of the closing
   space segment, glyph, confidence, alternatives }`; a `Word` entry emits
   `WordBoundary { sample_ts = start of the word gap, confidence }` (v1
@@ -315,7 +328,8 @@ the best token whose entry `j` is not `Word`.
 `finish()` performs a forced commit of the best token's whole `hist`
 and, if its phase is `AfterMark` at a glyph-bearing node, emits that
 glyph with confidence `σ(0)·q` (the last character is not closed by a
-gap).
+gap). Entries §4.8's "committed time is final" rule calls decided,
+including that unclosed glyph, are not emitted.
 
 ---
 
