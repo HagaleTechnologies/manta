@@ -1,0 +1,47 @@
+# cargo-deny policy (MAN-156). The "Supply Chain" required check
+# (.github/workflows/supply-chain.yml) runs `cargo deny --locked check` when
+# Cargo.lock, a Cargo.toml or this file changes, on merge groups, and daily
+# on main. See docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md.
+
+[graph]
+# Every feature, so the soapy and hpsdr dependency trees are checked too.
+all-features = true
+
+[advisories]
+# A yanked version was pulled by its publisher; move off it.
+yanked = "deny"
+# Every ignore needs a reason. Re-check it whenever its parent crate moves.
+ignore = [
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained and has no fixed release; it reaches only manta-cli's tests, through the dev-dependency serde_yaml_ng" },
+]
+
+[licenses]
+# Permissive licenses compatible with shipping manta as MIT OR Apache-2.0.
+# Anything else, copyleft included, needs a deliberate edit here.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+# No `version = "*"` on a registry dependency. Workspace path dependencies are
+# fine: every workspace crate is `publish = false` (MAN-154).
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The pinned coppa revision in the workspace Cargo.toml.
+allow-git = ["https://github.com/HagaleTechnologies/coppa.git"]

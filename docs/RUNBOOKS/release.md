@@ -135,7 +135,10 @@ this change. See [the MAN-244 decision](../DECISIONS/2026-10-10-man244-release-g
    compare the crate and tag versions, so keeping them equal is this step's
    job.
 2. As `thagale`, select the reviewed default-branch commit containing the
-   MAN-244 guard. Tag that explicit commit `vX.Y.Z` (see "Accepted tag
+   MAN-244 guard **whose CI push run passed every test leg, Windows
+   included** (MAN-156: `release-publish.yml` refuses any other; see "If
+   'Require a green CI run on the release commit' fails" below). Tag that
+   explicit commit `vX.Y.Z` (see "Accepted tag
    grammar" below), then push: `git tag v1.2.3 <reviewed-commit-sha>` and
    `git push origin refs/tags/v1.2.3`. Only the owner may create, move or
    delete a release tag.
@@ -150,7 +153,9 @@ this change. See [the MAN-244 decision](../DECISIONS/2026-10-10-man244-release-g
       checks and before the matrix starts.
     - **`release-publish.yml`** does the real work: `validate-tag` (checks
       tag grammar and default-branch ancestry before any platform build
-      starts, then renders the man pages once from a native Linux build
+      starts, and that the tagged commit's `ci-full.yml` push run passed
+      every `test` and `test-hpsdr` leg, Windows included (MAN-156), then
+      renders the man pages once from a native Linux build
       with the same `--features` as every build leg) → `build` (rebuilds
       the same five targets and needs only `validate-tag`) → two jobs
       side by side, both in the `ghcr-publish` environment:
@@ -260,6 +265,30 @@ the owner corrects or deletes it and selects a reviewed commit containing
 the guard. Prefer a new release version if artifacts were already published.
 A failure in `validate-tag`'s man-page steps (after both checks) says nothing
 about the tag: fix the cause or re-run the job; keep the tag.
+
+## If 'Require a green CI run on the release commit' fails
+
+Windows legs are not required for merge, so a commit on the default branch
+can carry a failed Windows test (MAN-156,
+`docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md`). `validate-tag`
+therefore runs `scripts/check-release-ci.py`, which reads the newest
+`ci-full.yml` push run for the tagged commit and requires it completed and
+successful, with `test (ubuntu-latest)`, `test (macos-latest)`,
+`test (windows-latest)` and their three `test-hpsdr` siblings present and
+green. Nothing is built or published until it passes. Its error names the
+run and each failed or missing leg:
+
+- **A flaky leg.** Open the named run, choose **Re-run failed jobs**, and
+  wait for it to finish green; the run's latest attempt is what counts.
+  Then re-run the release workflow's failed jobs. Keep the tag.
+- **A real failure.** Fix it on the default branch through a reviewed PR,
+  then tag a later commit whose push run passed. Prefer a new version if
+  artifacts were already published.
+- **A run still in progress.** Wait for it to finish, then re-run the
+  release workflow's failed jobs.
+- **No run.** GitHub keeps runs for 90 days, and a commit that never landed
+  on the default branch by a push has none. Tag a recent default-branch
+  commit instead.
 
 ## Accepted tag grammar
 
