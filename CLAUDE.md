@@ -175,7 +175,6 @@ same Rust engine. RBN's real login prompt and the live/offline agreement
 rate are unmeasured. See
 docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
 
-<<<<<<< HEAD
 MAN-324: `[server].live_port` (unset = off; `live_bind_addr` default
 `127.0.0.1`) starts a live-state stream for dashboards: `bandState`,
 `trackState`, `candidateDecision` (the why-not-spotted record, from the
@@ -185,14 +184,13 @@ lag, 32 clients), plus `manta_live_*` metrics. Spot output is unchanged.
 Fields: `docs/LIVE-STATE.md`; see
 docs/DECISIONS/2026-10-12-man324-live-state-stream.md. The dispensa
 `liveState.v1` fragment is not yet filed.
-=======
+
 MAN-133: `manta completions <shell>` (bash/zsh/fish/powershell/elvish) and
 `manta man-pages --out DIR` render from the clap tree `--help` uses; every
 release archive ships `man/man1/*.1` rendered natively by the release
 workflows' `validate-tag` job. clap_complete publishes hidden commands
 and flags, so nothing in the CLI may be hidden. See
 docs/DECISIONS/2026-10-13-man133-shell-completions-and-man-pages.md.
->>>>>>> de525d13c1c85fc1545b789ea961335918299ae5
 
 ## Documents (read in this order)
 
