@@ -67,6 +67,16 @@ climb far enough for real dits to fall below the boundary
 (`noise_seeded_init_heals_within_a_callsign_for_heavy_dashes`: healed within
 60 marks; `noise_seeded_scale_recovers_within_three_callsigns`).
 
+Since MAN-115 (#260, merged into this branch on 2026-10-13) the full
+pipeline no longer reproduces this start: the base decoder decodes VW1
+exactly too (CER 0.0000, first `K1ABC` at word 2). A sweep on the merged
+tree found no VW1 variant the base decoder fails: noise seeds
+`0x3100`–`0x313B` at +10 dB, `0x3100`–`0x3117` at +6 and +3 dB, and dash
+weights 4.5, 5.0 and 5.5 on `0x3150`–`0x3157`. So VW1 now pins only that
+heavy dashes keep decoding and are learned as heavy (dash 4.06 dits); the
+two unit tests above, which feed the noise-seeded start to the decoder
+directly, are the guard against a regression of scenario 1.
+
 **Scenario 3 (per-track timing).** Each `TrackDecoder` owns its
 `SenderTiming`; VW5's two senders report their own estimates on their own
 `track_id`s.
@@ -75,16 +85,19 @@ climb far enough for real dits to fall below the boundary
 
 | vector | base CER | MAN-315 CER | learned timing (last `TimingUpdate`, dits) |
 |---|---|---|---|
-| VW1 heavy-dash | 0.5169 (dash/dot confusion past word 20) | 0.2034 (exact from word 9) | dot 0.95, dash 4.06 |
-| VW2 long-gaps | 0.0492 | 0.0410 | char gap 4.53, word gap 8.87 |
-| VW3 bug-key | 0.0349 | 0.0349 | dot 0.86, dash 4.80, element gap 1.18 |
-| VW4 heavy hand-key | 0.0375 | 0.0375 | dot 1.19, dash 3.38, element gap 0.85 |
-| VW5 A / B | 0.0193 / 0.0197 | 0.0193 / 0.0197 | A dash 2.96, char gap 3.00, word gap 7.00; B dash 4.13, char gap 4.50, word gap 9.14 |
+| VW1 heavy-dash | 0.0000 (exact from word 2) | 0.0000 (exact from word 2) | dot 0.95, dash 4.06 |
+| VW2 long-gaps | 0.0738 | 0.0082 | char gap 4.53, word gap 8.90 |
+| VW3 bug-key | 0.0116 | 0.0000 | dot 0.86, dash 4.80, element gap 1.18 |
+| VW4 heavy hand-key | 0.0125 | 0.0125 | dot 1.19, dash 3.38, element gap 0.85 |
+| VW5 A / B | 0.0039 / 0.0000 | 0.0039 / 0.0000 | A dash 2.96, char gap 3.00, word gap 7.01; B dash 4.13, char gap 4.50, word gap 9.07 |
 
-Base measured on commit `5346c33` with only the testkit's VW vectors added
-(a throwaway probe calling `decode_samples`); MAN-315 by `golden_vw.rs`.
-VW3 and VW4 pass their gates on both decoders; they pin that the learned
-non-ideal weighting does not regress them.
+Measured 2026-10-13 on the tree with main merged (`de525d1`, after
+MAN-115/MAN-312/MAN-314): base is `de525d1`'s `manta decode --json
+--engine legacy` on the WAVs this branch's testkit renders; MAN-315 by
+`golden_vw.rs`. Before MAN-115, on `5346c33`, the base decoder failed VW1
+(CER 0.5169, dash/dot confusion past word 20) and MAN-315 reached 0.2034;
+see Scenario 1 above. VW3 and VW4 pass their gates on both decoders; they
+pin that the learned non-ideal weighting does not regress them.
 
 ### Regression
 
@@ -106,14 +119,14 @@ hsmm`): see Implementation verification.
   boundaries own it, from these variances.
 - **Degenerate-scale dash re-split (planned D6), dropped.** When the marks
   labelled as dashes were bimodal, the plan re-split the mark scale from
-  them. It healed VW1 a callsign sooner (first exact `K1ABC` at word 7,
-  CER 0.110), but it also fired on a fading V8w track and spotted a bogus
+  them. Measured before MAN-115 merged, it healed VW1 a callsign sooner
+  (first exact `K1ABC` at word 7, CER 0.110, against 0.2034), but it also fired on a fading V8w track and spotted a bogus
   call: `v8w_pileup_fading_spots_no_bogus_callsigns` failed with `AC3N`
   (1 of 29 spotted). Requiring the short side at ≥ 2 × `mu_dit` and the long
   side at ≥ 1.4 × `mu_dah` still spotted `AC3N`; with the rule disabled the
   test passes. It is left to MAN-113's WPM hypotheses, which the plan
-  already expected to subsume it. VW1's CER bound is 0.25 accordingly
-  (measured 0.2034 without the rule).
+  already expected to subsume it. VW1's CER bound of 0.25 was set from
+  that pre-MAN-115 0.2034; it now measures 0.0000.
 
 ## Test fixtures
 

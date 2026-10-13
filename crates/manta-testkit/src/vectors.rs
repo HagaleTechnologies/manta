@@ -674,8 +674,9 @@ fn weighted(
 }
 
 /// VW1 "heavy-dash": 25 WPM, dashes 4.0 dits, +10 dB, 8 % jitter. MAN-315
-/// scenario 1: a noise fragment seeds the dit cluster on this noise seed
-/// (measured: real dits decoded as dashes for ~20 s on the base decoder).
+/// scenario 1: a noise fragment seeded the dit cluster on this noise seed
+/// (real dits decoded as dashes for ~20 s on the base decoder before
+/// MAN-115; since then the base decoder decodes it exactly too).
 /// Pass: the first exact K1ABC within the first 10 words, then no dash/dot
 /// confusion; CER <= 0.15; learned dash 3.6-4.4 dits.
 pub fn vw1() -> VectorSpec {

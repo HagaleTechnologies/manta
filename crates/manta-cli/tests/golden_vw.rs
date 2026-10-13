@@ -210,8 +210,11 @@ fn decode_single(
 
 /// MAN-315 scenario 1: a 25 WPM sender with 4-dit dashes, on a noise seed
 /// where a noise fragment seeds the dit cluster (base decoder, measured:
-/// real dits decoded as dashes past the 20th word, CER 0.517; now exact
-/// from the 10th word, CER 0.203).
+/// real dits decoded as dashes past the 20th word, CER 0.517; MAN-315
+/// exact from the 10th word, CER 0.203). Since MAN-115 the base decoder
+/// decodes this exactly too (CER 0.0000), so this pins that heavy dashes
+/// keep decoding and are learned as heavy; the decoder unit tests
+/// `noise_seeded_*` guard the noise-seeded start (MAN-315 decision doc).
 #[test]
 fn vw1_heavy_dash_decodes_without_dash_dot_confusion() {
     let (_, _, decoded, cer, timing) = decode_single(&manta_testkit::vectors::vw1());
@@ -231,8 +234,8 @@ fn vw1_heavy_dash_decodes_without_dash_dot_confusion() {
         settled.iter().all(|w| ["CQ", "TEST", "K1ABC"].contains(w)),
         "decode after the first K1ABC is not exact: {decoded:?}"
     );
-    // CER counts the warm-up before the scale heals (base decoder 0.517;
-    // measured 0.203 -- see the MAN-315 decision doc).
+    // CER counts any warm-up before the scale heals (0.203 before MAN-115
+    // merged, 0.0000 since -- see the MAN-315 decision doc).
     assert!(cer <= 0.25, "VW1 CER {cer} > 0.25");
     let dash = mean_dits(&timing, "dash");
     assert!((3.6..=4.4).contains(&dash), "VW1 learned dash {dash}");
@@ -257,10 +260,10 @@ fn vw2_long_gaps_keep_word_boundaries() {
 fn vw3_bug_key_decodes() {
     let (_, _, _, cer, timing) = decode_single(&manta_testkit::vectors::vw3());
     assert!(cer <= 0.08, "VW3 CER {cer} > 0.08");
-    // Not worse than the base decoder (measured 0.0349, MAN-315 decision doc).
+    // Not worse than the base decoder (measured 0.0116, MAN-315 decision doc).
     assert!(
-        cer <= 0.035,
-        "VW3 CER {cer} worse than the base decoder's 0.0349"
+        cer <= 0.012,
+        "VW3 CER {cer} worse than the base decoder's 0.0116"
     );
     let dash = mean_dits(&timing, "dash");
     assert!(dash > 4.0, "VW3 learned dash {dash}");
@@ -272,10 +275,10 @@ fn vw3_bug_key_decodes() {
 fn vw4_heavy_hand_key_decodes() {
     let (_, _, _, cer, _) = decode_single(&manta_testkit::vectors::vw4());
     assert!(cer <= 0.08, "VW4 CER {cer} > 0.08");
-    // Not worse than the base decoder (measured 0.0375, MAN-315 decision doc).
+    // Not worse than the base decoder (measured 0.0125, MAN-315 decision doc).
     assert!(
-        cer <= 0.038,
-        "VW4 CER {cer} worse than the base decoder's 0.0375"
+        cer <= 0.013,
+        "VW4 CER {cer} worse than the base decoder's 0.0125"
     );
 }
 
