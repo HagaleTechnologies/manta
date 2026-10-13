@@ -1547,8 +1547,8 @@ mod tests {
         // of silence: long enough for the anchor that stamped K's hist
         // entry to age out of `reach_sil` while a newer, still-live
         // anchor's frozen token carries the inherited entry -- the exact
-        // window round 3's `min_hist_ts`-only prune bound could
-        // (non-structurally) fail to cover.
+        // window round 3's anchor-history-only prune bound (removed by
+        // MAN-189) could (non-structurally) fail to cover.
         let lo = 10f32.powf(-40.0 / 20.0);
         let mut env = vec![lo; 4];
         env.extend(rect_envelope_depth("K", 13, 40.0));

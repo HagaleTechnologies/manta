@@ -1,5 +1,5 @@
 //! Partial-traceback commit and posterior margins. SPEC v2 §4.8–4.9.
-use super::token::{glyph_rank, token_order, Token};
+use super::token::{glyph_rank, token_order, HistEntry, Token};
 use super::{Committed, HsmmConfig};
 use crate::tree::Glyph;
 
@@ -59,104 +59,84 @@ pub fn margin(tokens: &[Token], j: usize, cfg: &HsmmConfig) -> (f32, Vec<(Glyph,
     (confidence, alternatives)
 }
 
+/// MAN-189: what this decoder has already emitted, kept as a time
+/// frontier rather than a list of exact timestamps.
+///
+/// Emitted entries form one time-ordered segmentation of the signal. A
+/// character whose first mark began at or before the latest emitted
+/// entry's `sample_ts` lies in time that is already decided: it is the
+/// same character again under a different closing anchor, or a
+/// segmentation that contradicts what was emitted. A word boundary is
+/// decided once one was emitted at or after its character's start, or
+/// when its gap began before the latest emitted entry. Both checks are
+/// O(1) and need no pruning.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Frontier {
+    /// `sample_ts` of the latest emitted entry of either kind.
+    last_ts: Option<u64>,
+    /// `sample_ts` of the latest emitted word boundary.
+    last_word_ts: Option<u64>,
+}
+
+impl Frontier {
+    /// Whether `e` covers time already emitted, so must not be emitted.
+    pub fn is_decided(&self, e: &HistEntry) -> bool {
+        match e.glyph {
+            Some(_) => self.last_ts.is_some_and(|t| e.char_start_ts <= t),
+            None => {
+                self.last_word_ts.is_some_and(|w| e.char_start_ts <= w)
+                    || self.last_ts.is_some_and(|t| e.sample_ts < t)
+            }
+        }
+    }
+
+    /// Record that `e` was emitted.
+    pub fn advance(&mut self, e: &HistEntry) {
+        self.last_ts = self.last_ts.max(Some(e.sample_ts));
+        if e.glyph.is_none() {
+            self.last_word_ts = self.last_word_ts.max(Some(e.sample_ts));
+        }
+    }
+}
+
 /// Emit the consensus prefix and any entry older than the lookahead;
 /// remove emitted entries from every token; drop tokens that disagree
 /// with a forced commit. `tokens` is sorted best-first on entry and
 /// stays sorted.
 ///
-/// [Task 8 fix, execution 2026-09-09]: `sealed` is a list, owned by
-/// `HsmmDecoder` and threaded through every call, of `(sample_ts, glyph)`
-/// pairs this decoder has ever actually committed. `HsmmDecoder::push`
-/// keeps a handful of past `Anchor`s alive (up to `reach_sil` hops back,
-/// SPEC v2 §4.6) so a later hop can still generate a candidate token by
-/// transitioning directly from an *older* anchor's frozen token snapshot.
-/// For a still-`AfterMark` ancestor sitting in one of those old anchors,
-/// SPEC v2 §4.3's flat Silence duration prior stays satisfiable across a
-/// *wide*, still-growing window ([10u, 80u] hops) -- so at every
-/// subsequent anchor step, `HsmmDecoder::push` re-derives a *fresh*
-/// candidate closing the SAME gap with a *larger* `d`, and
-/// `Token::successor` stamps that fresh `HistEntry` with `born_hop =
-/// end_hop` (the current hop, correct per its own doc comment -- this is
-/// a new, better-evidenced re-estimate of "how long the gap has run so
-/// far"). Because `born_hop` legitimately keeps advancing on every
-/// re-derivation, a watermark keyed on it (the fix's first cut) cannot
-/// tell "the same decision, re-estimated" apart from "a genuinely new
-/// decision", and the `forced` check below re-fires on literally every
-/// subsequent anchor step for as long as the gap keeps growing --
-/// reproduced directly: an isolated "C" followed by a long trailing
-/// silence committed the same glyph, at the same `sample_ts`, six times
-/// over (three during the run, three more at `finish`), and the full
-/// "CQ TEST W5AU W5AU TEST" scene came out as
-/// "CCCQQQQ TESTT T WW5AUU WW5AUU TEST".
-///
-/// `HistEntry::sample_ts`, by contrast, is pinned to the *anchor's own*
-/// `sample_ts` (`Token::successor`'s `seg_start_ts` parameter) -- fixed
-/// once when that ancestor anchor was created, identical across every
-/// re-derivation from it no matter how large `d` grows. Sealing on
-/// `(sample_ts, is_char)` instead correctly recognizes every re-derived
-/// candidate as the same already-decided instant and strips it before
-/// the consensus/forced check ever sees it, while still letting a
-/// legitimately different word-boundary entry at that same instant
-/// (same `sample_ts`, `glyph: None` vs `Some(_)`, since a closing
-/// transition emits at most one of each) commit in its own right once
-/// evidence resolves it.
-///
-/// [Task 8 fix, review round 6, Codex on PR #161]: the seal key is
-/// `(sample_ts, is_char)` -- whether the entry is a character at all,
-/// NOT the specific glyph -- because a retained older anchor re-deriving
-/// an already-committed gap under a different node/speed hypothesis can
-/// disagree with the winning hypothesis on WHICH character it is while
-/// agreeing on WHEN and THAT it's a character. Sealing on the exact
-/// `(sample_ts, glyph)` pair (the original design) only strips a
-/// re-derivation that happens to name the same glyph already committed;
-/// once the winning hypothesis's token falls outside its valid
-/// silence-duration window and stops being re-derived, a runner-up
-/// lineage's disagreeing glyph at that same `sample_ts` was never in
-/// `sealed` at all and could surface as a second, contradictory
-/// `CharDecoded` for an instant already resolved -- the validator then
-/// appends both characters into corrupted spot text. At most one
-/// character and one word-boundary decision can ever be correct for a
-/// given `sample_ts` (a closing transition emits at most one of each),
-/// so sealing by kind rather than by value is exactly as permissive as
-/// the real invariant requires.
-///
-/// [Task 8 fix, review round 2]: the strip runs at the *top of every loop
-/// iteration*, not just once on entry. Committing one entry can reveal a
-/// new front entry on some token that a *different* token/anchor lineage
-/// already sealed independently in an earlier call (e.g. one surviving
-/// token holds `[X@ts1, Y@ts2, ...]` while the beam already committed a
-/// different glyph `X'` at `ts1` from a sibling token, sealing `(ts1,
-/// X')` -- this token's own, disagreeing `(ts1, X)` front entry must be
-/// silently dropped, not re-committed as a duplicate/contradictory event,
-/// once it becomes the front after some earlier removal in this same
-/// call). Re-checking every iteration catches that without needing a
-/// second, separately-maintained check.
+/// `HsmmDecoder::push` keeps past anchors alive (up to `reach_sil` hops
+/// back, SPEC v2 §4.6), so a later hop can re-derive a gap this decoder
+/// already committed: from the same anchor with a larger `d` (PR #161,
+/// Task 8), with a different glyph (round 6), or, MAN-189, with an
+/// agreeing glyph closed at a different anchor and so a different
+/// `sample_ts`. Every such entry's character began at or before
+/// `frontier`, so it is stripped at the top of every loop iteration,
+/// before the consensus/forced check sees it. Character starts strictly
+/// increase along a token's `hist` (a word boundary shares its
+/// character's start and closing `sample_ts`), so decided entries always
+/// form a prefix and the front-only strip is complete.
 pub fn commit(
     tokens: &mut Vec<Token>,
     now_hop: u64,
     cfg: &HsmmConfig,
-    sealed: &mut Vec<(u64, bool)>,
+    frontier: &mut Frontier,
 ) -> Vec<Committed> {
     let mut out = Vec::new();
     loop {
         for t in tokens.iter_mut() {
-            while t
-                .hist
-                .first()
-                .is_some_and(|e| sealed.contains(&(e.sample_ts, e.glyph.is_some())))
-            {
+            while t.hist.first().is_some_and(|e| frontier.is_decided(e)) {
                 t.hist.remove(0);
             }
         }
-        // Codex review, PR #161 round 15: stripping sealed entries
+        // Codex review, PR #161 round 15: stripping decided entries
         // removes a DIFFERENT number of leading entries per token
         // (unlike the uniform consensus-glyph removal near the end of
         // this loop, which strips the same shared leading entry from
         // every survivor and so can never change their relative lexical
-        // order) -- two equal-score tokens whose sealed leading glyphs
+        // order) -- two equal-score tokens whose decided leading glyphs
         // differ can have their SPEC v2 §6.2 tie-break order silently
-        // invalidated once stripped, e.g. `[A(sealed), Z]` and
-        // `[B(sealed), A]` are ordered first-then-second before
+        // invalidated once stripped, e.g. `[A(decided), Z]` and
+        // `[B(decided), A]` are ordered first-then-second before
         // stripping but should reverse after (`[Z]` vs `[A]`). Re-sort
         // so `tokens[0]` below, the forced-commit check, and `margin`
         // all see the correct deterministic best token.
@@ -188,7 +168,7 @@ pub fn commit(
         for t in tokens.iter_mut() {
             t.hist.remove(0);
         }
-        sealed.push((head.sample_ts, head.glyph.is_some()));
+        frontier.advance(&head);
     }
     out
 }
@@ -198,62 +178,183 @@ mod tests {
     use super::super::token::Phase;
     use super::*;
 
+    fn entry(glyph: Option<char>, char_start_ts: u64, sample_ts: u64) -> HistEntry {
+        HistEntry {
+            glyph: glyph.map(Glyph::Char),
+            sample_ts,
+            born_hop: 1,
+            char_start_ts,
+        }
+    }
+
+    fn token(score: f32, u: f32, hist: Vec<HistEntry>) -> Token {
+        Token {
+            node: 0,
+            phase: Phase::AfterSpace,
+            u,
+            score,
+            hist,
+            anchor_hop: 2,
+            char_start_ts: 0,
+        }
+    }
+
+    /// The frontier after emitting `entries` in order.
+    fn after(entries: &[HistEntry]) -> Frontier {
+        let mut f = Frontier::default();
+        for e in entries {
+            f.advance(e);
+        }
+        f
+    }
+
+    fn emitted(out: &[Committed]) -> Vec<(Option<Glyph>, u64)> {
+        out.iter().map(|c| (c.glyph, c.sample_ts)).collect()
+    }
+
+    // Far enough past every entry's `born_hop` to force a commit.
+    const FORCE: u64 = 1000;
+
     #[test]
-    fn commit_resorts_after_stripping_sealed_prefixes_of_differing_length() {
-        // Codex review, PR #161 round 15: stripping sealed entries removes
-        // a DIFFERENT number of leading entries per token, which can
-        // invalidate the SPEC v2 §6.2 deterministic tie-break order among
-        // equal-score tokens. Before stripping, [A(sealed), Z] correctly
-        // sorts ahead of [B(sealed), A] (glyph_rank('A') < glyph_rank('B')).
-        // After both leading (sealed) entries are stripped, the survivors
-        // are [Z] vs [A] -- the order must REVERSE (glyph_rank('A') <
-        // glyph_rank('Z')), which only happens if commit() re-sorts.
+    fn commit_does_not_reemit_a_glyph_under_another_agreeing_timestamp() {
+        // MAN-189's scenario: two lineages agree on Q and its start but
+        // close it at different anchors. The best token's Q@100 commits;
+        // the runner-up's agreeing Q@130 must not surface later.
         let cfg = HsmmConfig::default();
-        let token1 = Token {
-            node: 0,
-            phase: Phase::AfterSpace,
-            u: 13.0,
-            score: 5.0,
-            hist: vec![
-                super::super::token::HistEntry {
-                    glyph: Some(Glyph::Char('A')),
-                    sample_ts: 100,
-                    born_hop: 1,
-                },
-                super::super::token::HistEntry {
-                    glyph: Some(Glyph::Char('Z')),
-                    sample_ts: 200,
-                    born_hop: 2,
-                },
+        let mut frontier = Frontier::default();
+        let mut tokens = vec![
+            token(5.0, 13.0, vec![entry(Some('Q'), 40, 100)]),
+            token(4.0, 13.0, vec![entry(Some('Q'), 40, 130)]),
+        ];
+        let out = commit(&mut tokens, FORCE, &cfg, &mut frontier);
+        assert_eq!(emitted(&out), vec![(Some(Glyph::Char('Q')), 100)]);
+
+        let mut tokens = vec![token(4.0, 13.0, vec![entry(Some('Q'), 40, 130)])];
+        let out = commit(&mut tokens, FORCE, &cfg, &mut frontier);
+        assert!(out.is_empty(), "re-emitted the committed Q: {out:?}");
+        assert!(tokens[0].hist.is_empty(), "{:?}", tokens[0].hist);
+    }
+
+    #[test]
+    fn commit_does_not_reemit_a_glyph_whose_first_mark_was_placed_later() {
+        let cfg = HsmmConfig::default();
+        let mut frontier = after(&[entry(Some('Q'), 40, 100)]);
+        let mut tokens = vec![token(5.0, 13.0, vec![entry(Some('Q'), 52, 104)])];
+        let out = commit(&mut tokens, FORCE, &cfg, &mut frontier);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn commit_still_emits_the_same_glyph_again_when_it_starts_after_the_commit() {
+        // Sealing by glyph value would be wrong: VR3's N5ZZ holds two Zs.
+        let cfg = HsmmConfig::default();
+        let mut frontier = after(&[entry(Some('Z'), 40, 100)]);
+        let mut tokens = vec![token(5.0, 13.0, vec![entry(Some('Z'), 140, 200)])];
+        let out = commit(&mut tokens, FORCE, &cfg, &mut frontier);
+        assert_eq!(emitted(&out), vec![(Some(Glyph::Char('Z')), 200)]);
+    }
+
+    #[test]
+    fn commit_never_emits_a_character_that_overlaps_emitted_time() {
+        // A conflicting segmentation that closes before the committed B
+        // would be emitted out of order ("T after B").
+        let cfg = HsmmConfig::default();
+        let mut frontier = after(&[entry(Some('B'), 150, 200)]);
+        let mut tokens = vec![token(
+            5.0,
+            13.0,
+            vec![entry(Some('T'), 120, 180), entry(Some('E'), 240, 260)],
+        )];
+        let out = commit(&mut tokens, FORCE, &cfg, &mut frontier);
+        assert_eq!(emitted(&out), vec![(Some(Glyph::Char('E')), 260)]);
+    }
+
+    #[test]
+    fn commit_emits_a_word_boundary_after_its_already_emitted_character() {
+        // The WGap lineage can win the boundary after the CGap lineage
+        // won the character at the same gap; the boundary still counts.
+        let cfg = HsmmConfig::default();
+        let mut frontier = after(&[entry(Some('G'), 40, 100)]);
+        let mut tokens = vec![token(5.0, 13.0, vec![entry(None, 40, 100)])];
+        let out = commit(&mut tokens, FORCE, &cfg, &mut frontier);
+        assert_eq!(emitted(&out), vec![(None, 100)]);
+    }
+
+    #[test]
+    fn commit_does_not_emit_a_second_word_boundary_for_the_same_character() {
+        let cfg = HsmmConfig::default();
+        let mut frontier = after(&[entry(Some('G'), 40, 100), entry(None, 40, 100)]);
+        let mut tokens = vec![token(
+            5.0,
+            13.0,
+            vec![entry(Some('G'), 40, 130), entry(None, 40, 130)],
+        )];
+        let out = commit(&mut tokens, FORCE, &cfg, &mut frontier);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn commit_does_not_emit_a_word_boundary_behind_a_later_character() {
+        let cfg = HsmmConfig::default();
+        let mut frontier = after(&[entry(Some('G'), 40, 100), entry(Some('H'), 150, 200)]);
+        let mut tokens = vec![token(5.0, 13.0, vec![entry(None, 40, 100)])];
+        let out = commit(&mut tokens, FORCE, &cfg, &mut frontier);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn commit_output_never_moves_backwards_in_time() {
+        let cfg = HsmmConfig::default();
+        let mut frontier = Frontier::default();
+        let calls = [
+            vec![entry(Some('C'), 40, 100), entry(Some('Q'), 140, 200)],
+            // A straggler re-reads Q closed one anchor early, then T.
+            vec![entry(Some('Q'), 140, 190), entry(Some('T'), 240, 300)],
+            vec![
+                entry(Some('T'), 240, 310),
+                entry(None, 240, 310),
+                entry(Some('E'), 350, 400),
             ],
-            anchor_hop: 2,
-        };
-        let token2 = Token {
-            node: 0,
-            phase: Phase::AfterSpace,
-            u: 13.0,
-            score: 5.0, // tied with token1
-            hist: vec![
-                super::super::token::HistEntry {
-                    glyph: Some(Glyph::Char('B')),
-                    sample_ts: 100,
-                    born_hop: 1,
-                },
-                super::super::token::HistEntry {
-                    glyph: Some(Glyph::Char('A')),
-                    sample_ts: 250,
-                    born_hop: 2,
-                },
-            ],
-            anchor_hop: 2,
-        };
+        ];
+        let mut all = Vec::new();
+        for hist in calls {
+            let mut tokens = vec![token(5.0, 13.0, hist)];
+            all.extend(emitted(&commit(&mut tokens, FORCE, &cfg, &mut frontier)));
+        }
+        let ts: Vec<u64> = all.iter().map(|&(_, ts)| ts).collect();
+        assert!(ts.windows(2).all(|w| w[0] <= w[1]), "{all:?}");
+        assert_eq!(ts.last(), Some(&400), "{all:?}");
+    }
+
+    #[test]
+    fn commit_resorts_after_stripping_decided_prefixes_of_differing_length() {
+        // Codex review, PR #161 round 15: stripping decided entries
+        // removes a DIFFERENT number of leading entries per token, which
+        // can invalidate the SPEC v2 §6.2 deterministic tie-break order
+        // among equal-score tokens. Before stripping, [A(decided), Z]
+        // correctly sorts ahead of [B(decided), A] (glyph_rank('A') <
+        // glyph_rank('B')). After both leading (decided) entries are
+        // stripped, the survivors are [Z] vs [A] -- the order must REVERSE
+        // (glyph_rank('A') < glyph_rank('Z')), which only happens if
+        // commit() re-sorts.
+        let cfg = HsmmConfig::default();
+        let token1 = token(
+            5.0,
+            13.0,
+            vec![entry(Some('A'), 40, 100), entry(Some('Z'), 150, 200)],
+        );
+        let token2 = token(
+            5.0, // tied with token1
+            13.0,
+            vec![entry(Some('B'), 40, 100), entry(Some('A'), 150, 250)],
+        );
         // Pre-strip order is already correct per token_order (token1's
         // [A, Z] sorts ahead of token2's [B, A]) -- exactly what a real
         // caller's `cands.sort_by(token_order)` would have produced.
         let mut tokens = vec![token1, token2];
-        let mut sealed = vec![(100, true)]; // both leading entries already sealed
-        let now_hop = 1000; // forces a commit regardless of consensus
-        let out = commit(&mut tokens, now_hop, &cfg, &mut sealed);
+        // Both leading entries cover time already emitted.
+        let mut frontier = after(&[entry(Some('X'), 40, 100)]);
+        let out = commit(&mut tokens, FORCE, &cfg, &mut frontier);
         assert_eq!(
             out.first().map(|c| (c.glyph, c.sample_ts)),
             Some((Some(Glyph::Char('A')), 250)),
