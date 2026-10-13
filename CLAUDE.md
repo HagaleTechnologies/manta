@@ -175,6 +175,7 @@ same Rust engine. RBN's real login prompt and the live/offline agreement
 rate are unmeasured. See
 docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
 
+<<<<<<< HEAD
 MAN-140: `--ka9q-group` (with `--ka9q-port`/`--ka9q-ssrc`/
 `--ka9q-interface`) or `[input] type = "ka9q"` reads one existing
 ka9q-radio (radiod) IQ channel over RTP multicast, in every build (no
@@ -184,6 +185,14 @@ status radiod sends to the data group on port 5006; manta also joins on
 Written clean-room from ka9q-radio's docs and headers at `f44b3a3ee8dd`;
 six facts (D-HW) still need a live radiod. See docs/GUIDES/ka9q-radio.md
 and docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md.
+=======
+MAN-133: `manta completions <shell>` (bash/zsh/fish/powershell/elvish) and
+`manta man-pages --out DIR` render from the clap tree `--help` uses; every
+release archive ships `man/man1/*.1` rendered natively by the release
+workflows' `validate-tag` job. clap_complete publishes hidden commands
+and flags, so nothing in the CLI may be hidden. See
+docs/DECISIONS/2026-10-13-man133-shell-completions-and-man-pages.md.
+>>>>>>> de525d13c1c85fc1545b789ea961335918299ae5
 
 ## Documents (read in this order)
 
