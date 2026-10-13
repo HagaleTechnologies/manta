@@ -625,6 +625,114 @@ fn wiki_overview_verified_stamp_is_not_the_pre_rewrite_one() {
     );
 }
 
+// ---- MAN-152: wiki/manifest.json is a true index of wiki/pages ----
+
+/// The `verified: {commit, date}` stamp in a wiki page's frontmatter, as
+/// written (not YAML-typed, so an all-digit or `1e5`-shaped short hash stays
+/// text).
+fn wiki_verified_stamp(rel: &str) -> (String, String) {
+    let page = doc(rel);
+    let front = page
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---").map(|(f, _)| f))
+        .unwrap_or_else(|| panic!("{rel} has no `---` frontmatter block"));
+    let verified: Vec<&str> = front
+        .lines()
+        .skip_while(|l| *l != "verified:")
+        .skip(1)
+        .take_while(|l| l.starts_with(' '))
+        .collect();
+    let field = |key: &str| -> String {
+        verified
+            .iter()
+            .find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().to_string()))
+            .unwrap_or_else(|| panic!("{rel} frontmatter has no `verified.{key}` field"))
+    };
+    (field("commit:"), field("date:"))
+}
+
+/// `wiki/manifest.json` is the wiki's index, and each page's `verified`
+/// stamp is what a reader uses to judge how stale it is. The 2026-09-05
+/// broad review found both three months old: all ten manifest hashes
+/// stale, seven pages missing from it, two pages with no frontmatter, and
+/// stamps older than the decision records their own pages cite. A page
+/// edit now has to carry the manifest with it. A hash is the SHA-256 of
+/// the page as `doc()` reads it (CRLF normalised to LF), so a Windows
+/// checkout hashes the same.
+#[test]
+fn wiki_manifest_lists_every_page_with_a_matching_hash() {
+    use sha2::{Digest, Sha256};
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&doc("wiki/manifest.json")).expect("parse wiki/manifest.json");
+    let entries = manifest["pages"]
+        .as_array()
+        .expect("wiki/manifest.json has a `pages` array");
+    let str_field = |entry: &serde_json::Value, key: &str| -> String {
+        entry[key]
+            .as_str()
+            .unwrap_or_else(|| panic!("wiki/manifest.json entry has no string `{key}`: {entry}"))
+            .to_string()
+    };
+
+    let mut ids: Vec<String> = entries.iter().map(|e| str_field(e, "id")).collect();
+    ids.sort();
+    let stems: Vec<String> = md_files_in("wiki/pages")
+        .into_iter()
+        .map(|n| n.trim_end_matches(".md").to_string())
+        .collect();
+    for stem in &stems {
+        assert!(
+            ids.contains(stem),
+            "wiki/pages/{stem}.md has no wiki/manifest.json entry: add one"
+        );
+    }
+    assert_eq!(
+        ids, stems,
+        "wiki/manifest.json ids must be exactly the wiki/pages/*.md file stems, once each"
+    );
+
+    for entry in entries {
+        let id = str_field(entry, "id");
+        let path = str_field(entry, "path");
+        assert_eq!(
+            path,
+            format!("pages/{id}.md"),
+            "wiki/manifest.json entry `{id}` names the wrong path"
+        );
+        let rel = format!("wiki/{path}");
+        assert!(
+            repo_root().join(&rel).is_file(),
+            "wiki/manifest.json entry `{id}` names {rel}, which does not exist"
+        );
+
+        let want = format!(
+            "sha256:{}",
+            Sha256::digest(doc(&rel).as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        assert_eq!(
+            str_field(entry, "hash"),
+            want,
+            "wiki/manifest.json's hash for `{id}` does not match {rel}: the page changed \
+             without the manifest; regenerate its entry"
+        );
+
+        let (commit, date) = wiki_verified_stamp(&rel);
+        assert_eq!(
+            (
+                str_field(entry, "verified_commit"),
+                str_field(entry, "verified_date")
+            ),
+            (commit, date),
+            "wiki/manifest.json's verified_commit/verified_date for `{id}` disagree with \
+             {rel}'s `verified` frontmatter"
+        );
+    }
+}
+
 // ---- MAN-261: SPEC §9 is the loadable key table; README's node is one file ----
 
 fn manta() -> std::process::Command {

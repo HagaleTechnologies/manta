@@ -9,8 +9,8 @@ sources:
   - .github/workflows/release.yml
   - docs/superpowers/specs/2026-09-11-man212-windows-platform-support-design.md
 verified:
-  commit: 9b3d690
-  date: 2026-10-10
+  commit: d286147
+  date: 2026-10-13
 links:
   - live-hardware-field-testing
 ---
@@ -100,9 +100,8 @@ installer is separate from SoapySDR/PothosSDR entirely -- install it from
 SDRplay's own site, then SoapySDRPlay3's module on top of that. This
 repo's own live-hardware validation on Windows (RSP1B, SDRplay-service
 reliability comparison against the macOS baseline in issues #166/#167/
-#171) is tracked as a follow-up to MAN-212, not yet done as of this page's
-`verified.commit` -- see that follow-up ticket for the up-to-date status
-once it exists.
+#171) is tracked in issue #187, still open (not yet done); see D-J in
+`docs/DECISIONS/2026-10-07-man96-secondary-skimmer-field-node.md`.
 
 ## Writing tests that pass on the Windows legs
 
