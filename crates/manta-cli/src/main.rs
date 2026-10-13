@@ -99,6 +99,10 @@ enum Command {
         /// Print the full decode report as one JSON object.
         #[arg(long, help_heading = "Output")]
         json: bool,
+        /// Also print the main signal's learned dot, dash and gap lengths
+        /// (in dits) on stderr. `--json` always includes them.
+        #[arg(long, help_heading = "Output")]
+        timing: bool,
         /// TOML config file; the whole file is validated.
         ///
         /// Its `[decode]` values are the baseline; an explicit --engine
@@ -184,7 +188,7 @@ enum Command {
     /// produces the same file.
     Gen {
         /// Which test recording to generate: v1 to v6, vr1 to vr5, vr6a,
-        /// vr6b, vr7 or vr8.
+        /// vr6b, vr7, vr8, or vw1 to vw5.
         vector: String,
         /// Directory to write `<name>.wav`, `<name>.json` and
         /// `<name>.manifest.json` into.
@@ -4564,6 +4568,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             path,
             center_freq_hz,
             json,
+            timing,
             filters,
             config,
             engine,
@@ -4629,6 +4634,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                 if !report.rtty.is_empty() {
                     eprintln!("{}", rtty_line(&report.rtty, report.sample_rate_hz));
                 }
+                // MAN-315: the primary track's learned sender timing, on
+                // request only, so the default stderr stays the summary.
+                if timing {
+                    if let Some(estimates) = &report.timing {
+                        eprintln!("timing (dits, mean ± sd): {}", estimates.display_line());
+                    }
+                }
             }
         }
         Command::Oracle {
@@ -4676,8 +4688,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                 "vr6b" => manta_testkit::vectors::vr6b(),
                 "vr7" => manta_testkit::vectors::vr7(),
                 "vr8" => manta_testkit::vectors::vr8(),
+                "vw1" => manta_testkit::vectors::vw1(),
+                "vw2" => manta_testkit::vectors::vw2(),
+                "vw3" => manta_testkit::vectors::vw3(),
+                "vw4" => manta_testkit::vectors::vw4(),
+                "vw5" => manta_testkit::vectors::vw5(),
                 other => bail!(
-                    "unknown vector '{}' (available: v1-v6, vr1-vr5, vr6a, vr6b, vr7-vr8)",
+                    "unknown vector '{}' (available: v1-v6, vr1-vr5, vr6a, vr6b, vr7-vr8, vw1-vw5)",
                     manta_server::status_doc::escape_for_terminal(other).replace('\'', "\\'")
                 ),
             };
@@ -8800,6 +8817,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         // `decode --center-freq-hz` (MAN-131 D8): a recording's centre, not
         // the live receiver's `input.center_freq_hz`.
         "center_freq_hz",
+        // `decode --timing` (MAN-315): an output choice, like `json`.
+        "timing",
         "help",
         "version",
         "reference_hz",
