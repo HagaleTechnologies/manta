@@ -18,7 +18,9 @@ Then:
 - [RUNBOOKS/monitoring.md](RUNBOOKS/monitoring.md): a ready Grafana dashboard
   and Prometheus alerts.
 - The [runbooks](#runbooks) below.
-- `manta <command> --help` for every flag.
+- `manta <command> --help` for every flag, or `man manta` once the man
+  pages are installed
+  ([README](../README.md#tab-completion-and-man-pages)).
 
 ## Contributors — changing the code
 

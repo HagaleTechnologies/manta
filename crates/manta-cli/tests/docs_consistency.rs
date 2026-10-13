@@ -2485,3 +2485,98 @@ fn reference_docs_relative_links_resolve() {
         );
     }
 }
+
+// ---- MAN-133: completions and man pages, documented and real ----
+
+/// MAN-133: README's Installation documents how to load the completion
+/// script for every shell the binary supports and how to read `man manta`,
+/// and never suggests `source <(…)` (a silent no-op on macOS's bash 3.2;
+/// decision D11).
+#[test]
+fn readme_installation_documents_completions_and_man_pages() {
+    let install = squash_whitespace(section(&doc("README.md"), "Installation"));
+    assert!(
+        install.contains("### Tab completion and man pages"),
+        "README Installation has no `### Tab completion and man pages` subsection"
+    );
+    let completions_help = manta().args(["completions", "--help"]).output().unwrap();
+    assert!(completions_help.status.success());
+    let help = String::from_utf8(completions_help.stdout).unwrap();
+    let values = help
+        .lines()
+        .find(|l| l.contains("[possible values: "))
+        .expect("`manta completions --help` lists no possible values");
+    for shell in values
+        .split("[possible values: ")
+        .nth(1)
+        .unwrap()
+        .trim_end_matches(']')
+        .split(", ")
+    {
+        assert!(
+            install.contains(&format!("manta completions {shell}")),
+            "README Installation never shows `manta completions {shell}`"
+        );
+    }
+    for needle in ["man/man1", "manta man-pages --out", "man manta"] {
+        assert!(
+            install.contains(needle),
+            "README Installation never says {needle:?}"
+        );
+    }
+    assert!(
+        install.contains("eval \"$(manta completions bash)\""),
+        "README's bash row must use eval \"$(…)\", not source <(…)"
+    );
+    assert!(
+        !install.contains("source <(manta completions"),
+        "README still suggests `source <(manta completions …)`, a silent no-op on \
+         macOS's bash 3.2 (MAN-133 D11)"
+    );
+}
+
+/// MAN-133: the release runbook names the steps that render the pages and
+/// where they land in each archive.
+#[test]
+fn release_runbook_lists_the_man_pages() {
+    let runbook = squash_whitespace(&doc("docs/RUNBOOKS/release.md"));
+    for needle in ["man/man1", "the `validate-tag` job's man-page steps"] {
+        assert!(
+            runbook.contains(needle),
+            "docs/RUNBOOKS/release.md never says {needle:?}"
+        );
+    }
+}
+
+/// No `docs/DECISIONS/` path CLAUDE.md cites is glued to the word before it,
+/// and each one that is not a glob names a `.md` file that exists. MAN-133's
+/// reflow once joined `See` onto the MAN-314 record's path
+/// (`Seedocs/DECISIONS/…`).
+#[test]
+fn claude_md_decision_paths_start_a_word_and_resolve() {
+    let claude = doc("CLAUDE.md");
+    for (at, _) in claude.match_indices("docs/DECISIONS/") {
+        let line = claude[..at].matches('\n').count() + 1;
+        assert!(
+            !claude[..at]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric),
+            "CLAUDE.md:{line}: a `docs/DECISIONS/` path is glued to the word before it"
+        );
+        let token = claude[at..].split(char::is_whitespace).next().unwrap();
+        let path = token
+            .find(".md")
+            .map(|end| &token[..end + 3])
+            .unwrap_or_else(|| {
+                panic!("CLAUDE.md:{line}: `{token}` is not a whole .md path (split across lines?)")
+            });
+        if path.contains(['[', '*']) {
+            continue;
+        }
+        assert!(
+            repo_root().join(path).is_file(),
+            "CLAUDE.md:{line} cites {path}, which does not exist"
+        );
+    }
+}
