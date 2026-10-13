@@ -58,6 +58,38 @@ reachable from the host only, and firewall it like any other widened
 metrics port otherwise. `docs/RUNBOOKS/node-health.md` shows the
 Kubernetes probe.
 
+**The live-state stream (MAN-324) is opt-in and loopback by default.**
+It starts only when `[server].live_port` is set (for example `7303`), and
+binds its own `[server].live_bind_addr`, which defaults to `127.0.0.1`.
+Like metrics, it is not part of the public DX-cluster contract: it has no
+password and carries every track's decoded text, including text that never
+became a spot, and every validation decision
+(`docs/LIVE-STATE.md`,
+`docs/DECISIONS/2026-10-12-man324-live-state-stream.md` D2). `bind_addr`
+does not move it, and `live_bind_addr` moves nothing else.
+
+- **To keep it private, leave `live_bind_addr` unset.** A dashboard on the
+  same machine connects to `127.0.0.1:7303`. A dashboard elsewhere can reach
+  a loopback listener through an SSH tunnel
+  (`ssh -L 7303:127.0.0.1:7303 <node>`) without widening anything.
+- **To let a dashboard on another machine connect directly,** set
+  `live_bind_addr = "0.0.0.0"` (or `MANTA_SERVER_LIVE_BIND_ADDR=0.0.0.0`),
+  or better, one interface's address. `manta config check` prints a note
+  whenever `live_bind_addr` is a wildcard. **Firewall `live_port`** to the
+  dashboards that read it: the firewall is the access control.
+- **Behind a reverse proxy** (for example to add TLS for a browser
+  dashboard), every dashboard shares the proxy's IP. The live listener
+  applies `json_max_connections_per_ip` and `json_max_pings_per_ip`,
+  counted separately from the JSON spot port's, so raising or disabling
+  those keys for one proxy raises them for both listeners. The live
+  listener's total cap of 32 clients still applies. As with any proxy,
+  block direct access to `live_port` itself, per the bypass note below.
+- **Docker.** The image does not `EXPOSE` 7303. Publish it to the host
+  only with `-p 127.0.0.1:7303:7303`, and set
+  `MANTA_SERVER_LIVE_BIND_ADDR=0.0.0.0` inside the container: Docker
+  forwards to the container's own interface, never to its loopback, as for
+  metrics above.
+
 **A reverse proxy alone is NOT access control for a widened listener —
 it's a routing convenience, unless you separately block direct access to
 the real port it's proxying.** manta itself always binds telnet and JSON

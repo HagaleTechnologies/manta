@@ -3130,6 +3130,7 @@ fn start_spot_server(
                     // anymore now that there are more consumers.
                     shutdown: shutdown_rx.clone(),
                     drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                    stream: manta_server::json_stream::StreamKind::Spots,
                 },
                 tasks.clone(),
                 manta_server::tasks::new_connection_limiter(

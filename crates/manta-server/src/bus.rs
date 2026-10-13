@@ -23,6 +23,12 @@ use tokio::sync::broadcast;
 /// it starts missing spots (and its next `recv()` returns `Lagged`).
 const CHANNEL_CAPACITY: usize = 1024;
 
+/// MAN-324: the live-state channel's capacity -- how many records a live
+/// subscriber may fall behind before it is disconnected. Larger than the
+/// spot channels' because the live stream carries roughly 290 times the
+/// spot rate (docs/DECISIONS/2026-10-12-man324-live-state-stream.md).
+pub const LIVE_CHANNEL_CAPACITY: usize = 4096;
+
 /// Default `[server].history_minutes` (MAN-93).
 pub const DEFAULT_HISTORY_MINUTES: u32 = 30;
 /// Largest accepted `[server].history_minutes`: one day.
@@ -68,6 +74,9 @@ pub struct BusSpot {
 pub enum JsonItem {
     Spot(BusSpot),
     Grade(Arc<str>),
+    /// MAN-324: one serialized live-state record, sent verbatim. Only ever
+    /// on the live channel, never on the spot stream's.
+    Live(Arc<str>),
 }
 
 /// Bounded, LRU-on-touch tracker for `SpotBus::occurrence_counts` (MAN-62).
@@ -154,6 +163,8 @@ impl History {
 pub struct SpotBus {
     tx: broadcast::Sender<BusSpot>,
     json_tx: broadcast::Sender<JsonItem>,
+    /// MAN-324: the live-state stream's own channel.
+    live_tx: broadcast::Sender<JsonItem>,
     epoch: SystemTime,
     session_nonce: u128,
     sample_rate_hz: f64,
@@ -181,9 +192,11 @@ impl SpotBus {
     pub fn new(sample_rate_hz: f64, epoch: SystemTime, session_nonce: u128) -> Self {
         let (tx, _rx) = broadcast::channel(CHANNEL_CAPACITY);
         let (json_tx, _json_rx) = broadcast::channel(CHANNEL_CAPACITY);
+        let (live_tx, _live_rx) = broadcast::channel(LIVE_CHANNEL_CAPACITY);
         Self {
             tx,
             json_tx,
+            live_tx,
             epoch,
             session_nonce,
             sample_rate_hz,
@@ -253,6 +266,23 @@ impl SpotBus {
     }
 
     /// Spots only: the telnet server, the RBN uplink and the comparator.
+    /// MAN-324: publishes one serialized live-state record to the live
+    /// channel. Never blocks; with no subscriber the line is dropped.
+    pub fn publish_live(&self, line: Arc<str>) {
+        let _ = self.live_tx.send(JsonItem::Live(line));
+    }
+
+    /// MAN-324: a receiver on the live-state channel.
+    pub fn subscribe_live(&self) -> broadcast::Receiver<JsonItem> {
+        self.live_tx.subscribe()
+    }
+
+    /// MAN-324: live-state subscribers right now; the decode loop builds
+    /// records only when this is nonzero.
+    pub fn live_receiver_count(&self) -> usize {
+        self.live_tx.receiver_count()
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<BusSpot> {
         self.tx.subscribe()
     }
@@ -331,6 +361,66 @@ pub fn total_lag_loss<T: Clone>(n: u64, rx: &broadcast::Receiver<T>) -> u64 {
 mod tests {
     use super::*;
     use manta_spot::SpotType;
+
+    fn live_bus() -> SpotBus {
+        SpotBus::new(96_000.0, SystemTime::UNIX_EPOCH, 1)
+    }
+
+    #[test]
+    fn live_subscribers_receive_live_lines_only() {
+        let bus = live_bus();
+        let mut live = bus.subscribe_live();
+        bus.publish(sample_spot(1));
+        bus.publish_grade(Arc::from("{\"kind\":\"spotGrade\"}"));
+        bus.publish_live(Arc::from("{\"kind\":\"bandState\"}"));
+        match live.try_recv() {
+            Ok(JsonItem::Live(line)) => assert_eq!(&*line, "{\"kind\":\"bandState\"}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(live.try_recv().is_err());
+    }
+
+    #[test]
+    fn spot_and_json_subscribers_never_receive_live_lines() {
+        let bus = live_bus();
+        let mut spots = bus.subscribe();
+        let mut json = bus.subscribe_json();
+        bus.publish_live(Arc::from("{}"));
+        assert!(spots.try_recv().is_err());
+        assert!(json.try_recv().is_err());
+    }
+
+    #[test]
+    fn live_receiver_count_follows_subscribers() {
+        let bus = live_bus();
+        assert_eq!(bus.live_receiver_count(), 0);
+        let a = bus.subscribe_live();
+        let b = bus.subscribe_live();
+        assert_eq!(bus.live_receiver_count(), 2);
+        drop(a);
+        assert_eq!(bus.live_receiver_count(), 1);
+        drop(b);
+        assert_eq!(bus.live_receiver_count(), 0);
+        let _json = bus.subscribe_json();
+        assert_eq!(bus.live_receiver_count(), 0);
+    }
+
+    #[test]
+    fn a_lagging_live_subscriber_is_told_to_disconnect_after_4096() {
+        let bus = live_bus();
+        let mut rx = bus.subscribe_live();
+        let published = LIVE_CHANNEL_CAPACITY + 10;
+        for i in 0..published {
+            bus.publish_live(Arc::from(format!("{i}")));
+        }
+        match rx.try_recv() {
+            Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                assert_eq!(n, 10);
+                assert_eq!(total_lag_loss(n, &rx), published as u64);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 
     fn sample_spot(sample_ts: u64) -> Spot {
         Spot {
@@ -436,6 +526,7 @@ mod tests {
             seen.push(match rx.recv().await.unwrap() {
                 JsonItem::Spot(s) => format!("spot:{}", s.spot.sample_ts),
                 JsonItem::Grade(line) => format!("grade:{line}"),
+                JsonItem::Live(line) => format!("live:{line}"),
             });
         }
         assert_eq!(
@@ -483,7 +574,7 @@ mod tests {
             let a = spots.recv().await.unwrap();
             let b = match json.recv().await.unwrap() {
                 JsonItem::Spot(s) => s,
-                JsonItem::Grade(line) => panic!("unexpected grade {line}"),
+                JsonItem::Grade(line) | JsonItem::Live(line) => panic!("unexpected line {line}"),
             };
             assert_eq!(a.spot, b.spot);
             assert_eq!(a.occurrence_count, b.occurrence_count);
