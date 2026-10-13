@@ -332,12 +332,21 @@ impl Ka9qIqSource {
         // kernel meanwhile.
         let data = join_socket(group, cfg.port, cfg.interface)?;
         let status_sock = join_socket(group, cfg.status_port, cfg.interface)?;
-        let status = wait_for_status(&status_sock, &cfg)?;
+        // The data socket is non-blocking for the wait: `wait_for_status`
+        // drains it into a stash each round (the kernel's grant alone
+        // holds less than the settle window at Linux's default
+        // `rmem_max`), and the stash is replayed below so the queueing
+        // the join exists for is not lost to an overflow.
+        data.set_nonblocking(true)
+            .context("ka9q-radio: set data socket non-blocking")?;
+        let (status, stash) = wait_for_status(&status_sock, &data, &cfg)?;
         let enc = validate(&status, cfg.port)?;
+        data.set_nonblocking(false)
+            .context("ka9q-radio: restore data socket blocking mode")?;
         status_sock
             .set_nonblocking(true)
             .context("ka9q-radio: set status socket non-blocking")?;
-        Ok(Self {
+        let mut src = Self {
             data,
             status_sock,
             group_label: cfg.group.clone(),
@@ -354,7 +363,15 @@ impl Ka9qIqSource {
             stall_timeout: cfg.stall_timeout,
             confirmed_live: Arc::new(AtomicBool::new(false)),
             counters: Arc::new(InputHealthCounters::new()),
-        })
+        };
+        // Replay what the wait stashed, exactly as if it arrived now, so
+        // the stream starts at its first received packet with no startup
+        // gap.
+        for pkt in &stash {
+            src.recv_buf[..pkt.len()].copy_from_slice(pkt);
+            src.accept_rtp(pkt.len());
+        }
+        Ok(src)
     }
 
     /// The SSRC of the channel being read.
@@ -466,12 +483,48 @@ impl Ka9qIqSource {
     }
 }
 
-fn wait_for_status(sock: &UdpSocket, cfg: &Ka9qConfig) -> Result<ChannelStatus> {
+/// Drains the data socket into `stash` while `open` waits for status, so
+/// the kernel's receive buffer cannot overflow while nothing reads it: on
+/// Linux's default grant it holds only ~0.17 s of 192 kS/s `f32` IQ, less
+/// than the 1.5 s no-SSRC settle window. Everything that arrived is kept,
+/// in arrival order, up to `RCVBUF_BYTES` in total (the same bound the
+/// source asks the kernel for, plus the one datagram that exhausts it);
+/// past that the drain stops and the kernel's own rule (keep the oldest,
+/// drop the newest) applies as it would without the stash. `open` replays
+/// the stash through `accept_rtp` once the channel is chosen.
+fn stash_data(
+    sock: &UdpSocket,
+    buf: &mut [u8],
+    stash: &mut Vec<Vec<u8>>,
+    budget: &mut usize,
+) -> Result<()> {
+    while *budget > 0 {
+        match sock.recv(buf) {
+            Ok(n) => {
+                *budget -= (*budget).min(n);
+                stash.push(buf[..n].to_vec());
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Ok(())
+            }
+            Err(e) => return Err(e).context("ka9q-radio: data socket"),
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_status(
+    sock: &UdpSocket,
+    data: &UdpSocket,
+    cfg: &Ka9qConfig,
+) -> Result<(ChannelStatus, Vec<Vec<u8>>)> {
     let start = Instant::now();
     let mut seen: BTreeMap<u32, ChannelStatus> = BTreeMap::new();
     let mut more = false;
     let mut first_at: Option<Instant> = None;
     let mut buf = vec![0u8; RECV_BUF_LEN];
+    let mut stash: Vec<Vec<u8>> = Vec::new();
+    let mut budget: usize = RCVBUF_BYTES;
     loop {
         if let (None, Some(t)) = (cfg.ssrc, first_at) {
             if t.elapsed() >= cfg.settle {
@@ -481,6 +534,7 @@ fn wait_for_status(sock: &UdpSocket, cfg: &Ka9qConfig) -> Result<ChannelStatus> 
         if start.elapsed() >= cfg.open_timeout {
             break;
         }
+        stash_data(data, &mut buf, &mut stash, &mut budget)?;
         match sock.recv(&mut buf) {
             Ok(n) => {
                 let Ok(Some(s)) = wire::parse_status_packet(&buf[..n]) else {
@@ -488,7 +542,7 @@ fn wait_for_status(sock: &UdpSocket, cfg: &Ka9qConfig) -> Result<ChannelStatus> 
                 };
                 let Some(id) = s.ssrc else { continue };
                 if cfg.ssrc == Some(id) {
-                    return Ok(s);
+                    return Ok((s, stash));
                 }
                 first_at.get_or_insert_with(Instant::now);
                 if seen.len() < MAX_SEEN_CHANNELS || seen.contains_key(&id) {
@@ -524,7 +578,7 @@ fn wait_for_status(sock: &UdpSocket, cfg: &Ka9qConfig) -> Result<ChannelStatus> 
     }
     match seen.len() {
         0 => bail!(no_status_message(cfg)),
-        1 => Ok(seen.into_values().next().expect("one channel")),
+        1 => Ok((seen.into_values().next().expect("one channel"), stash)),
         n => {
             let list: Vec<String> = seen.values().map(describe).collect();
             bail!(
@@ -920,6 +974,66 @@ mod tests {
             f.send_rtp(b, 1, Encoding::F32Le, &want);
             assert_eq!(read_n(&mut src, 180), want);
             assert_eq!(src.counters.malformed_packets(), 0);
+        }
+
+        /// Codex review round 3 (PR #284): with no `ssrc`, the 1.5 s settle
+        /// window used to leave the data socket undrained, so a stream
+        /// faster than the kernel's default receive grant (~416 KiB) was
+        /// dropped from the inside of the window onward and the first read
+        /// reported a startup gap. `open` now drains the data socket into a
+        /// stash while it waits, so the stream starts at its first received
+        /// packet with no gap.
+        #[test]
+        fn open_without_ssrc_keeps_the_stream_contiguous_through_the_settle_window() {
+            let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
+            let mut cfg = f.config(None);
+            cfg.settle = Duration::from_millis(700);
+            cfg.open_timeout = Duration::from_millis(1500);
+            // ~1.1 MB/s of 1452-byte f32le RTP: 700 packets overflow the
+            // default grant inside the window, while no 250 ms slice (the
+            // drain cadence, the status socket's read timeout) does.
+            const PACKETS: usize = 700;
+            let stop = Arc::new(AtomicBool::new(false));
+            let sender = {
+                let (stop, group, port) = (stop.clone(), f.group, f.data_port);
+                std::thread::spawn(move || {
+                    let tx = sender();
+                    let payload = wire::encode_iq(Encoding::F32Le, &ramp(180, 0));
+                    // Let open() join the group first: a datagram sent
+                    // before the join is never received and cannot be part
+                    // of the expected stream.
+                    std::thread::sleep(Duration::from_millis(200));
+                    for seq in 0..PACKETS as u16 {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let h = RtpHeader {
+                            payload_type: 111,
+                            seq,
+                            timestamp: u32::from(seq) * 180,
+                            ssrc: SSRC,
+                            marker: false,
+                        };
+                        let _ = tx.send_to(
+                            &wire::encode_rtp(&h, &payload),
+                            SocketAddrV4::new(group, port),
+                        );
+                        std::thread::sleep(Duration::from_micros(1250));
+                    }
+                })
+            };
+            let mut src = Ka9qIqSource::open(cfg).unwrap();
+            let one = ramp(180, 0);
+            let want: Vec<Complex32> = (0..PACKETS).flat_map(|_| one.iter().copied()).collect();
+            assert_eq!(read_n(&mut src, want.len()), want);
+            stop.store(true, Ordering::Relaxed);
+            sender.join().unwrap();
+            let c = src.health_counters().unwrap();
+            assert_eq!(
+                (c.gaps_detected(), c.dropped_packets()),
+                (0, 0),
+                "the settle window must not lose the stream's opening"
+            );
         }
 
         #[test]

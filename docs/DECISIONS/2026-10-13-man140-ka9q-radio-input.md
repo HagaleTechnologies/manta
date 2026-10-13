@@ -124,7 +124,16 @@ a configured interface that cannot be joined is an error naming it, and so is
 every join failing. Request a 4 MiB `SO_RCVBUF` and accept a smaller grant; the
 guide tells operators to raise `net.core.rmem_max`, since Linux grants 416 KiB
 by default. One reused 64 KiB receive buffer, for HPSDR's `RECV_BUF_LEN`
-reason.
+reason. While `open` waits for status it also drains the data socket —
+non-blocking, once per wait round — into an app-side stash of up to the same
+4 MiB (past that the drain stops and the kernel's own keep-the-oldest rule
+applies), and replays the stash through `accept_rtp` once the channel is
+chosen (added in PR review round 3: without the drain, a grant smaller than
+the no-SSRC settle window overflows while nothing reads the socket — Linux's
+default holds ~0.17 s at 192 kS/s `f32` against a 1.5 s window — and the
+first `read` reports the loss as a startup gap). The sockets still join
+before the wait, so RTP queues in the kernel during it exactly as the plan's
+open order requires; the stash extends that queueing past the kernel grant.
 
 **D10 — Read path.** Pull-based, no thread. Each `read()` first drains the
 non-blocking status socket, then blocks on the data socket with a 250 ms

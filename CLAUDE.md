@@ -175,7 +175,7 @@ same Rust engine. RBN's real login prompt and the live/offline agreement
 rate are unmeasured. See
 docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
 
-MAN-140: `--ka9q-group` (with `--ka9q-port`/`--ka9q-ssrc/
+MAN-140: `--ka9q-group` (with `--ka9q-port`/`--ka9q-ssrc`/
 `--ka9q-interface`) or `[input] type = "ka9q"` reads one existing
 ka9q-radio (radiod) IQ channel over RTP multicast, in every build (no
 Cargo feature). Rate, encoding, frequency and filter edges come from the
