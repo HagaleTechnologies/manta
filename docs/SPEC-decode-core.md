@@ -1420,12 +1420,13 @@ names the file; without it they read `MANTA_CONFIG`. An environment value is par
 TOML value (`9300` is an integer, `["W1AW","K1ABC"]` an array), falling
 back to a bare string -- except for the string-typed keys, which are
 always taken verbatim: `server.station_callsign`, `server.bind_addr`,
-`server.metrics_bind_addr`, `server.operator_name`,
-`server.operator_qth`, `server.operator_grid`, `input.type`,
-`input.device`, `input.path`, `input.host`, `input.password`,
-`input.driver`, `spot.blocklist_path`, `spot.notch_path`,
-`spot.cty_path`, `spot.scp_path`, `decode.engine`,
-`rbn_compare.feed_host` and `rbn_compare.login_callsign`. Relative
+`server.metrics_bind_addr`, `server.live_bind_addr`,
+`server.operator_name`, `server.operator_qth`, `server.operator_grid`,
+`input.type`, `input.device`, `input.path`, `input.host`,
+`input.password`, `input.driver`, `spot.blocklist_path`,
+`spot.notch_path`, `spot.cty_path`, `spot.scp_path`, `decode.engine`,
+`detector.crash_filter`, `rbn_compare.feed_host` and
+`rbn_compare.login_callsign`. Relative
 paths from the file resolve against the file's directory; those from a flag or the
 environment resolve against the working directory. `[[rbn_uplink]]`
 cannot be set from the environment. `[rbn_compare]` (MAN-301) is, like

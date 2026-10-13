@@ -9,7 +9,11 @@ pub use listen::{
     RttyObserver,
 };
 pub mod latency;
+pub mod live;
 pub use latency::{DecodeLatencyObserver, DecodeLatencySnapshot, DECODE_LATENCY_BUCKETS_SECONDS};
+pub use live::{
+    BandSample, LiveRecord, LiveStateSink, TrackSnapshot, LIVE_MAX_CANDIDATES, LIVE_TEXT_CHARS,
+};
 pub mod quality;
 pub use quality::{DecodeQualityObserver, DecodeQualitySnapshot, RAIL_RATIO_BUCKETS};
 pub mod calibrate;
@@ -28,7 +32,7 @@ pub use soak_metrics::{
 mod static_crash_tests;
 mod track;
 pub use manta_dsp::crash::CRASH_MIN_LIVE_CHANNELS;
-pub use track::{crash_live_channels, CrashFilter, DetectorConfig};
+pub use track::{crash_live_channels, ChannelLevel, CrashFilter, DetectorConfig};
 
 use anyhow::{bail, Context, Result};
 use manta_decode::decoder::{events_to_text, DecodeConfig};
