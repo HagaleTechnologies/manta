@@ -10,6 +10,9 @@ pub use audio::{AudioIqSource, AUDIO_PASSBAND_HI_HZ, AUDIO_PASSBAND_LO_HZ, TARGE
 pub mod kiwi;
 pub use kiwi::KiwiIqSource;
 
+pub mod ka9q;
+pub use ka9q::{Ka9qConfig, Ka9qIqSource};
+
 pub mod decimate;
 pub use decimate::DecimatingSource;
 

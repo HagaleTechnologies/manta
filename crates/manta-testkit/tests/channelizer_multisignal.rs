@@ -15,6 +15,8 @@ fn channel_for_offset(offset_hz: f64, n: usize, fs: f64) -> usize {
 
 fn signal(offset_hz: f64) -> SignalSpec {
     SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: "VVV VVV VVV".into(),
         loop_text: true,
         wpm: 20.0,

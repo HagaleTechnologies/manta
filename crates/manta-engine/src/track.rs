@@ -609,6 +609,21 @@ fn wrapped_channel_offset(k: usize, n_channels: usize) -> f64 {
 /// against V9 in Task 9 and pinned there.
 const CENTER_EMA_ALPHA: f64 = 0.01;
 
+/// MAN-324: one channel's state for the live-state stream's band rollup,
+/// read by `TrackManager::take_channel_levels`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChannelLevel {
+    /// The channel's centre, Hz, uncalibrated (the caller applies the
+    /// frequency calibration).
+    pub freq_hz: f64,
+    /// `FloorBank::effective_floor_db` for the channel: dB of per-channel
+    /// power, not calibrated to dBm.
+    pub floor_db: f32,
+    /// The detector's rise test passed on at least one hop since the
+    /// previous take.
+    pub occupied: bool,
+}
+
 impl Track {
     /// A brand-new track: `Lifecycle` seeded fresh, `center` initialized to
     /// its birth channel, decoder unleased. SPEC §2.4/§2.5.
@@ -1074,6 +1089,14 @@ pub struct TrackManager {
     /// MAN-314: sample timestamp of the hop whose block made the latest
     /// `rtty_changes` bump; 0 before the first.
     rtty_changed_sample_ts: u64,
+    /// MAN-324: per channel, whether the rise test passed on any hop since
+    /// the last `take_channel_levels`. `None` (the default) skips it; no
+    /// decode logic reads it.
+    rise_seen: Option<Vec<bool>>,
+    /// MAN-324: per channel, whether its centre lies inside the source's
+    /// RF passband, for `take_channel_levels`. `None` (full Nyquist band,
+    /// the default) reports every channel.
+    rf_channels: Option<Vec<bool>>,
     /// MAN-312 (SPEC §2.7): the band-wide static-crash detector. Every
     /// channel is live until `set_rf_passband_hz` narrows it to the
     /// source's real passband.
@@ -1175,8 +1198,58 @@ impl TrackManager {
             rtty_log_capped: true,
             rtty_changes: 0,
             rtty_changed_sample_ts: 0,
+            rise_seen: None,
+            rf_channels: None,
             crash: CrashDetector::new(n_channels),
         }
+    }
+
+    /// MAN-324: start recording, per channel, whether the rise test passed
+    /// on any hop, for `take_channel_levels`' `occupied`. Write-only from
+    /// the detector's point of view, so events are unchanged.
+    pub fn enable_occupancy_window(&mut self) {
+        self.rise_seen = Some(vec![false; self.n_channels()]);
+    }
+
+    /// MAN-324: every channel's centre (raw Hz), effective noise floor and
+    /// occupancy since the previous take, ascending in frequency. Only
+    /// channels whose centre lies inside the source's RF passband
+    /// (`set_rf_passband_hz`), so band state never describes spectrum the
+    /// source does not deliver. Resets the occupancy window. `occupied` is
+    /// always false unless `enable_occupancy_window` was called.
+    pub fn take_channel_levels(&mut self) -> Vec<ChannelLevel> {
+        let n = self.n_channels();
+        let mut levels: Vec<ChannelLevel> = (0..n)
+            .filter(|&k| self.rf_channels.as_ref().is_none_or(|r| r[k]))
+            .map(|k| ChannelLevel {
+                freq_hz: self.center_freq_hz
+                    + wrapped_channel_offset(k, n) * self.channel_spacing_hz,
+                floor_db: self.floor.effective_floor_db(k) as f32,
+                occupied: self.rise_seen.as_ref().is_some_and(|r| r[k]),
+            })
+            .collect();
+        levels.sort_by(|a, b| a.freq_hz.total_cmp(&b.freq_hz));
+        if let Some(r) = self.rise_seen.as_mut() {
+            r.iter_mut().for_each(|x| *x = false);
+        }
+        levels
+    }
+
+    /// Whether a track is still open, including a bare promotion that
+    /// will not receive TrackClosed. Used to retire live-tap state.
+    pub(crate) fn contains_track(&self, track_id: u32) -> bool {
+        self.tracks.contains_key(&track_id)
+    }
+
+    /// MAN-324: the raw frequency of every track holding a decoder (the
+    /// tracks `decoding_track_count` counts), in track-id order.
+    pub fn decoding_track_freqs_hz(&self) -> Vec<f64> {
+        let n = self.n_channels();
+        self.tracks
+            .values()
+            .filter(|t| t.decoder.is_some())
+            .map(|t| t.freq_hz(self.center_freq_hz, self.channel_spacing_hz, n))
+            .collect()
     }
 
     /// MAN-312 (SPEC §2.7): judge static crashes over the channels inside
@@ -1186,6 +1259,20 @@ impl TrackManager {
         let n = self.n_channels();
         let fs = self.channel_spacing_hz * n as f64;
         self.crash.set_live(crash_live_set(fs, (lo, hi), n));
+        // MAN-324: live band state covers the delivered passband only.
+        self.rf_channels = if lo <= -fs / 2.0 && hi >= fs / 2.0 {
+            None
+        } else {
+            let spacing = self.channel_spacing_hz;
+            Some(
+                (0..n)
+                    .map(|k| {
+                        let f = wrapped_channel_offset(k, n) * spacing;
+                        f >= lo && f <= hi
+                    })
+                    .collect(),
+            )
+        };
     }
 
     /// MAN-312: static crashes detected by this manager so far, in every
@@ -1466,6 +1553,13 @@ impl TrackManager {
         } else {
             self.gate.update(&power_db_vals, &self.floor)
         };
+        // MAN-324: the live-state occupancy window; one `Option` check
+        // when off.
+        if let Some(seen) = self.rise_seen.as_mut() {
+            for (s, &r) in seen.iter_mut().zip(&rise) {
+                *s |= r;
+            }
+        }
         // MAN-314 (SPEC §2.6): feed the RTTY detector the same power and
         // floor; a block that changed the marked set updates the log.
         if let Some(fsk) = self.fsk.as_mut() {
@@ -2259,7 +2353,8 @@ fn event_sample_ts(e: &DecoderEvent) -> u64 {
         DecoderEvent::CharDecoded { sample_ts, .. }
         | DecoderEvent::WordBoundary { sample_ts, .. }
         | DecoderEvent::TrackPromoted { sample_ts, .. }
-        | DecoderEvent::TrackMeta { sample_ts, .. } => *sample_ts,
+        | DecoderEvent::TrackMeta { sample_ts, .. }
+        | DecoderEvent::TimingUpdate { sample_ts, .. } => *sample_ts,
         DecoderEvent::SpeedUpdate { .. } => 0,
         DecoderEvent::TrackClosed { .. } => u64::MAX,
     }
@@ -2330,6 +2425,7 @@ pub(crate) fn event_track_id(e: &DecoderEvent) -> u32 {
         | DecoderEvent::WordBoundary { track_id, .. }
         | DecoderEvent::SpeedUpdate { track_id, .. }
         | DecoderEvent::TrackMeta { track_id, .. }
+        | DecoderEvent::TimingUpdate { track_id, .. }
         | DecoderEvent::TrackPromoted { track_id, .. }
         | DecoderEvent::TrackClosed { track_id, .. } => *track_id,
     }
@@ -3024,6 +3120,170 @@ mod tests {
     /// (2026-09-09) depends on this being real, ground-truth signal, not
     /// just an internal state-machine transition nothing outside
     /// `TrackManager` ever observes.
+    // ---- MAN-324: live-state accessors ----
+
+    #[test]
+    fn channel_levels_cover_every_channel_in_ascending_frequency() {
+        let fs = 96_000.0;
+        let center = 14_000_000.0;
+        let ch = manta_dsp::channelizer::Channelizer::new(fs, center).unwrap();
+        let n = ch.n_channels();
+        let mut tm = TrackManager::new(
+            n,
+            fs,
+            center,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        let levels = tm.take_channel_levels();
+        assert_eq!(levels.len(), n);
+        for w in levels.windows(2) {
+            assert!((w[1].freq_hz - w[0].freq_hz - 93.75).abs() < 1e-6, "{w:?}");
+        }
+        let mut expected: Vec<f64> = (0..n).map(|k| ch.channel_freq_hz(k)).collect();
+        expected.sort_by(f64::total_cmp);
+        for (l, e) in levels.iter().zip(&expected) {
+            assert!((l.freq_hz - e).abs() < 1e-6);
+            assert!(!l.occupied, "occupancy is off by default");
+        }
+    }
+
+    /// Codex P2 on #281: an audio or KiwiSDR source delivers RF only inside
+    /// its passband; band state must not report the rest of the
+    /// channelizer span.
+    #[test]
+    fn channel_levels_cover_only_the_source_rf_passband() {
+        let fs = 48_000.0;
+        let center = 14_000_000.0;
+        let n = manta_dsp::channelizer::Channelizer::new(fs, center)
+            .unwrap()
+            .n_channels();
+        let mut tm = TrackManager::new(
+            n,
+            fs,
+            center,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        tm.set_rf_passband_hz(300.0, 2700.0);
+        let levels = tm.take_channel_levels();
+        assert!(!levels.is_empty());
+        for l in &levels {
+            let off = l.freq_hz - center;
+            assert!((300.0..=2700.0).contains(&off), "{l:?}");
+        }
+        // ~2400 Hz of passband at 93.75 Hz spacing.
+        assert!((25..=27).contains(&levels.len()), "{}", levels.len());
+        tm.set_rf_passband_hz(-fs / 2.0, fs / 2.0);
+        assert_eq!(
+            tm.take_channel_levels().len(),
+            n,
+            "full band: every channel"
+        );
+    }
+
+    #[test]
+    fn occupancy_window_reports_a_channel_that_rose_once_then_resets() {
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        tm.enable_occupancy_window();
+        feed_warmup(&mut tm, 64);
+        tm.take_channel_levels();
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(30.0 / 10.0);
+        let m0 = 250 * 15;
+        // A short burst (smoothed power must cross on_snr_db once).
+        for m in m0..(m0 + 30) {
+            tm.step_hop(&hop(m, power.clone()), m);
+        }
+        for m in (m0 + 30)..(m0 + 400) {
+            tm.step_hop(&hop(m, quiet_power(64)), m);
+        }
+        let levels = tm.take_channel_levels();
+        let occupied: Vec<usize> = levels
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.occupied)
+            .map(|(i, _)| i)
+            .collect();
+        let k10_freq = 14_000_000.0 + wrapped_channel_offset(10, 64) * 1500.0;
+        assert!(
+            levels
+                .iter()
+                .any(|l| l.occupied && (l.freq_hz - k10_freq).abs() < 1e-6),
+            "{occupied:?}"
+        );
+        for m in (m0 + 400)..(m0 + 800) {
+            tm.step_hop(&hop(m, quiet_power(64)), m);
+        }
+        assert!(tm.take_channel_levels().iter().all(|l| !l.occupied));
+    }
+
+    #[test]
+    fn occupancy_tracking_never_changes_events() {
+        let run = |occupancy: bool| {
+            let mut tm = TrackManager::new(
+                64,
+                96_000.0,
+                14_000_000.0,
+                DetectorConfig::default(),
+                DecodeConfig::default(),
+            );
+            if occupancy {
+                tm.enable_occupancy_window();
+            }
+            let mut out = Vec::new();
+            for m in 0..(250 * 15 + 2_000) {
+                let mut power = quiet_power(64);
+                if m >= 250 * 15 && (m / 40) % 2 == 0 {
+                    power[10] = 1e-9 * 10f32.powf(25.0 / 10.0);
+                }
+                let (closed, promoted, flush) = tm.step_hop(&hop(m, power), m);
+                out.push(format!("{closed:?}{promoted:?}{flush:?}"));
+            }
+            out.push(format!("{:?}", tm.finish()));
+            out
+        };
+        assert_eq!(run(false), run(true));
+    }
+
+    #[test]
+    fn decoding_track_freqs_lists_only_tracks_holding_a_decoder() {
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, 64);
+        assert!(tm.decoding_track_freqs_hz().is_empty());
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        let mut m = 250 * 15;
+        let mut saw_candidate = false;
+        while tm.decoding_track_count() == 0 && m < 250 * 15 + 400 {
+            tm.step_hop(&hop(m, power.clone()), m);
+            if tm.active_track_count() > tm.decoding_track_count() {
+                // A CANDIDATE holds no decoder yet.
+                saw_candidate = true;
+                assert!(tm.decoding_track_freqs_hz().is_empty());
+            }
+            m += 1;
+        }
+        assert!(saw_candidate);
+        let freqs = tm.decoding_track_freqs_hz();
+        assert_eq!(freqs.len(), tm.decoding_track_count());
+        assert_eq!(freqs.len(), 1);
+        let k10_freq = 14_000_000.0 + wrapped_channel_offset(10, 64) * 1500.0;
+        assert!((freqs[0] - k10_freq).abs() < 1500.0, "{freqs:?}");
+    }
+
     #[test]
     fn step_hop_emits_track_promoted_at_the_promotion_hop() {
         let mut tm = TrackManager::new(
@@ -4548,6 +4808,8 @@ mod tests {
         let fs = 96_000.0;
         let center_freq_hz = 14_000_000.0;
         let sig = SignalSpec {
+            dit_units: 1.0,
+            element_gap_units: 1.0,
             text: "CQ CQ DE W1AW W1AW K".into(),
             loop_text: true,
             wpm: 20.0,
