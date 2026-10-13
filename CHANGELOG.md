@@ -22,6 +22,17 @@ the git history and `docs/DECISIONS/`.
 
 ## [Unreleased]
 
+### Decoder output
+
+- A band-wide static crash (lightning) no longer starts tracks across the
+  band, and running tracks no longer decode it as extra dits; new
+  `[detector].crash_filter`, default `"full"` (MAN-312).
+
+### Added
+
+- `manta_static_crashes_total` metric; `[detector].crash_filter`
+  (`full`/`starts-only`/`off`) (MAN-312).
+
 ## [0.1.0] - 2026-10-11
 
 Pre-stability alpha, expect breakage: manta has not cleared its own M2/M3

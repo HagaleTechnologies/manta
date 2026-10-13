@@ -6,6 +6,7 @@
 
 mod callsigns;
 pub mod cer;
+pub mod crash;
 pub mod keyer;
 pub mod noise;
 pub mod oracle;

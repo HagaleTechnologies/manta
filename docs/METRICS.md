@@ -64,7 +64,7 @@ ignored. Any other path or any method other than `GET` gets
 
 ## Metric families
 
-All 41 families, in the order `/metrics` renders them. Every family's
+All 42 families, in the order `/metrics` renders them. Every family's
 `# HELP` and `# TYPE` lines are always rendered. "Present when" says when
 the family also carries samples. Where it says a family has no samples, the
 value is absent, not zero: the node does not measure it, so do not read the
@@ -85,6 +85,7 @@ missing series as "no loss" or "no traffic".
 | `manta_json_clients_connected` | gauge | — | Currently connected JSON Lines clients. | Always. |
 | `manta_ws_clients_connected` | gauge | — | Currently connected WebSocket clients. | Always. |
 | `manta_active_tracks` | gauge | — | Currently active decoder tracks. Copied from the decode loop every 250 ms; set to 0 while the source is in an outage. | Always. |
+| `manta_static_crashes_total` | counter | — | Static crashes detected: times at least three quarters of the passband's channels rose 3 dB or more together for 8 ms or more, counted once per crash. A sudden band-wide level step (a gain change, or the input returning from digital silence) also counts once. Counted with any `[detector].crash_filter` value, including `"off"`. Stays 0 when the passband holds fewer than 96 channels. See [SPEC §2.7](SPEC-decode-core.md#27-band-wide-static-crash-detection-man-312) and [MAN-312](DECISIONS/2026-10-13-man312-static-crash-filter.md). | Always; starts at 0. Summed across source reconnects. |
 | `manta_source_health` | gauge | `source` | Health of each input source: 1 healthy, 0 unhealthy. `source` is the input type: `file`, `audio`, `kiwi`, `soapy` or `hpsdr`. | One series per registered source, from the first health report. A file replay reports 1 at startup. Reconnecting sources report on each connect and disconnect; HPSDR reads 0 until the radio is confirmed live. |
 | `manta_source_outages_total` | counter | `source` | Times each input source went from healthy to unhealthy (a lost connection or failed read). A source that starts unhealthy has not had an outage. | Same `source` set as `manta_source_health`; starts at 0. |
 | `manta_source_down_seconds_total` | counter | `source` | Seconds each input source spent in outages that have ended. An outage still in progress is added when it ends; until then it shows only as `manta_source_health` 0. | Same `source` set as `manta_source_health`; starts at 0. |

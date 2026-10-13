@@ -215,6 +215,7 @@ station_callsign = "N0CALL"
 #warmup_ms = 25.0                    # start-up time spent measuring the noise; no tracks before it
 #track_cap = 1200                    # most open tracks, candidates included
 #silent_respawn_cooldown_ms = 30000.0  # wait before a channel whose track went silent starts another
+#crash_filter = "full"               # static crashes: "full" ignores them, "starts-only" only blocks new tracks, "off"
 
 
 # --- Decoder -----------------------------------------------------------------

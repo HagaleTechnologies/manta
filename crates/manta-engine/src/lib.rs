@@ -21,8 +21,11 @@ pub use soak_metrics::{
     soak_metrics_passed, soak_with_metrics, SoakCloseCounts, SoakMetricsReport, SoakMetricsSample,
 };
 
+#[cfg(test)]
+mod static_crash_tests;
 mod track;
-pub use track::DetectorConfig;
+pub use manta_dsp::crash::CRASH_MIN_LIVE_CHANNELS;
+pub use track::{crash_live_channels, CrashFilter, DetectorConfig};
 
 use anyhow::{bail, Context, Result};
 use manta_decode::decoder::{events_to_text, DecodeConfig};
