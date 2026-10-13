@@ -124,10 +124,15 @@ jobs:
             -f name="test (ubuntu-latest)" -f head_sha="$HEAD_SHA" -f status="in_progress" --jq '.id')
           macos_id=$(gh api -X POST "repos/$REPO/check-runs" \
             -f name="test (macos-latest)" -f head_sha="$HEAD_SHA" -f status="in_progress" --jq '.id')
-          windows_id=$(gh api -X POST "repos/$REPO/check-runs" \
-            -f name="test (windows-latest)" -f head_sha="$HEAD_SHA" -f status="in_progress" --jq '.id')
           echo "ubuntu_check_id=$ubuntu_id" >> "$GITHUB_OUTPUT"
           echo "macos_check_id=$macos_id" >> "$GITHUB_OUTPUT"
+          # MAN-156: the Windows check-run is not required, so failing to create it must not cost
+          # the two required ones their relay; relay-check-runs warns and skips an empty id.
+          windows_id=$(gh api -X POST "repos/$REPO/check-runs" \
+            -f name="test (windows-latest)" -f head_sha="$HEAD_SHA" -f status="in_progress" --jq '.id') || {
+            echo "::warning::Could not create the test (windows-latest) check-run; this PR will not show its Windows result."
+            windows_id=""
+          }
           echo "windows_check_id=$windows_id" >> "$GITHUB_OUTPUT"
 
   # No longer gated on codex-clean (HAG-46): this whole workflow only ever gets
