@@ -34,11 +34,13 @@ use wire::{ChannelStatus, Encoding, SeqObservation, SeqTracker};
 const READ_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// The status socket's receive timeout while `open` waits for status. The
-/// data socket is drained between status receives, so this bounds how long
-/// RTP queues unread in the kernel during the wait: Linux's default 416 KiB
-/// grant holds ~70 ms of a 768 kS/s `f32le` channel, so 250 ms would let it
-/// overflow between drains.
-const WAIT_POLL: Duration = Duration::from_millis(10);
+/// data socket is drained (one `DRAIN_BATCH` per pass) between status
+/// receives, so this bounds how long RTP queues unread in the kernel and how
+/// many datagrams per second the wait can drain: 1 ms allows 256 000/s,
+/// ~7x the ~34 000/s radiod sends for the fastest accepted channel
+/// (6.144 MS/s in 180-sample packets), and 1 ms of that channel (~49 KB of
+/// `f32`) fits Linux's default 416 KiB grant many times over.
+const WAIT_POLL: Duration = Duration::from_millis(1);
 
 /// One reused receive buffer sized to the largest UDP payload, so `recv`
 /// can never truncate a datagram (HPSDR's `RECV_BUF_LEN` reasoning).
@@ -72,8 +74,8 @@ const STASH_MAX_SAMPLES: usize = RCVBUF_BYTES / 4;
 /// before returning, so a flood that keeps a socket readable (status
 /// spam, another channel on the group, or RTP faster than the drain) can
 /// never starve the caller's deadline checks. Far above what any accepted
-/// rate delivers between passes (a 768 kS/s `f32le` channel sends ~45
-/// datagrams per 10 ms `WAIT_POLL`).
+/// rate delivers between passes (the fastest, 6.144 MS/s, sends ~34
+/// datagrams per 1 ms `WAIT_POLL`).
 const DRAIN_BATCH: usize = 256;
 
 /// The most channels `open` remembers while choosing one (D7), so status
@@ -830,6 +832,19 @@ mod tests {
             e.kind(),
             ErrorKind::WouldBlock,
             "the socket must be drained"
+        );
+    }
+
+    /// The status wait drains one `DRAIN_BATCH` per `WAIT_POLL`, which must
+    /// outpace the fastest accepted channel (6.144 MS/s in radiod's
+    /// 180-sample packets) with headroom, or the settle window overflows.
+    #[test]
+    fn startup_drain_capacity_outpaces_the_fastest_accepted_rate() {
+        let capacity_per_s = DRAIN_BATCH as f64 / WAIT_POLL.as_secs_f64();
+        let fastest_datagrams_per_s = 6_144_000.0 / 180.0;
+        assert!(
+            capacity_per_s >= 4.0 * fastest_datagrams_per_s,
+            "{capacity_per_s} datagrams/s vs {fastest_datagrams_per_s}"
         );
     }
 

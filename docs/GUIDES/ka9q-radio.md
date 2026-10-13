@@ -255,7 +255,7 @@ echo 'net.core.rmem_max = 4194304' | sudo tee /etc/sysctl.d/90-manta-ka9q.conf
 
 Restart manta afterwards; it asks for the buffer when it opens the channel.
 (While `open` waits for the channel's status manta also drains the socket
-itself, every 10 ms, into a stash that keeps the newest 4 MiB, so the 1.5 s
+itself, every millisecond, into a stash that keeps the newest 4 MiB, so the 1.5 s
 no-`ssrc` settle window does not overflow the default grant at any rate manta
 accepts; the raised limit is about steady-state reading.)
 Lost packets show on manta's [metrics endpoint](../METRICS.md) as

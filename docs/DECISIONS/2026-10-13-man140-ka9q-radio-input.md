@@ -125,8 +125,9 @@ every join failing. Request a 4 MiB `SO_RCVBUF` and accept a smaller grant; the
 guide tells operators to raise `net.core.rmem_max`, since Linux grants 416 KiB
 by default. One reused 64 KiB receive buffer, for HPSDR's `RECV_BUF_LEN`
 reason. While `open` waits for status it also drains the data socket —
-non-blocking, to empty, between status receives that wait at most 10 ms
-(`WAIT_POLL`) — into an app-side stash that keeps the newest 4 MiB (each
+non-blocking, up to 256 datagrams a pass, between status receives that wait
+at most 1 ms (`WAIT_POLL`, so ~256 000 datagrams/s, ~7x radiod's fastest
+accepted channel) — into an app-side stash that keeps the newest 4 MiB (each
 packet charged its length plus 64 bytes, so a flood of empty datagrams is
 bounded too), dropping its own oldest packets past that, and replays the stash through `accept_rtp`
 once the channel is chosen. The drain never stops, so no `validate`-accepted
