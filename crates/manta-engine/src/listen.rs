@@ -508,15 +508,6 @@ pub fn listen_with_observers(
         }
     };
 
-<<<<<<< HEAD
-    let mut seg = new_segment(
-        fs,
-        center_freq_hz,
-        cfg,
-        1,
-        observers.decode_quality.clone(),
-        occupancy,
-=======
     // MAN-312: crashes counted by segments a discontinuity already replaced.
     let mut crash_base: u64 = 0;
     let report_static_crashes = |n: u64| {
@@ -532,7 +523,7 @@ pub fn listen_with_observers(
         cfg,
         1,
         observers.decode_quality.clone(),
->>>>>>> b7fb51c73796204ecc9f2340276c15dd0c118551
+        occupancy,
     )?;
     let mut seg_base: u64 = 0;
 

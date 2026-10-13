@@ -65,6 +65,7 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("server", "station_callsign"),
     ("server", "bind_addr"),
     ("server", "metrics_bind_addr"),
+    ("server", "live_bind_addr"),
     ("server", "operator_name"),
     ("server", "operator_qth"),
     ("server", "operator_grid"),
@@ -867,18 +868,20 @@ mod tests {
     /// the generic overlay, and the environment beats the file.
     #[test]
     fn manta_server_live_port_overrides_the_file() {
-        let body = format!("{SERVER}live_port = 7303\n");
-        let loaded = load_env(
-            Some(&body),
-            &[
-                ("MANTA_SERVER_LIVE_PORT", "17303"),
-                ("MANTA_SERVER_LIVE_BIND_ADDR", "0.0.0.0"),
-            ],
-        )
-        .unwrap();
-        let server = loaded.server.unwrap();
-        assert_eq!(server.live_port, Some(17303));
-        assert_eq!(server.live_bind_addr, "0.0.0.0");
+        let body = format!("{SERVER}live_port = 7303\nlive_bind_addr = \"127.0.0.1\"\n");
+        for raw in ["0.0.0.0", "0", "true"] {
+            let loaded = load_env(
+                Some(&body),
+                &[
+                    ("MANTA_SERVER_LIVE_PORT", "17303"),
+                    ("MANTA_SERVER_LIVE_BIND_ADDR", raw),
+                ],
+            )
+            .unwrap_or_else(|err| panic!("live_bind_addr={raw}: {err:#}"));
+            let server = loaded.server.unwrap();
+            assert_eq!(server.live_port, Some(17303));
+            assert_eq!(server.live_bind_addr, raw);
+        }
     }
 
     /// MAN-138: the numeric location keys load from the file and from

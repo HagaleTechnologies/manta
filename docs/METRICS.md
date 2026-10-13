@@ -68,18 +68,11 @@ in `RUNBOOKS/monitoring/`; see
 
 ## Metric families
 
-<<<<<<< HEAD
-All 59 families, in the order `/metrics` renders them. Every family's
+All 60 families, in the order `/metrics` renders them. Every family's
 `# HELP` and `# TYPE` lines are always rendered, except two groups at the
 end of the table: the ten RBN comparison families (MAN-301), rendered only
 when `[rbn_compare]` is enabled, and the three live-state families
 (MAN-324), rendered only when `[server].live_port` is set. "Present when" says when
-=======
-All 57 families, in the order `/metrics` renders them. Every family's
-`# HELP` and `# TYPE` lines are always rendered, except the ten
-RBN comparison families (MAN-301) at the end of the table, which are
-rendered only when `[rbn_compare]` is enabled. "Present when" says when
->>>>>>> b7fb51c73796204ecc9f2340276c15dd0c118551
 the family also carries samples. Where it says a family has no samples, the
 value is absent, not zero: the node does not measure it, so do not read the
 missing series as "no loss" or "no traffic".

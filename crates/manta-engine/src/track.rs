@@ -1089,12 +1089,10 @@ pub struct TrackManager {
     /// MAN-314: sample timestamp of the hop whose block made the latest
     /// `rtty_changes` bump; 0 before the first.
     rtty_changed_sample_ts: u64,
-<<<<<<< HEAD
     /// MAN-324: per channel, whether the rise test passed on any hop since
     /// the last `take_channel_levels`. `None` (the default) skips it; no
     /// decode logic reads it.
     rise_seen: Option<Vec<bool>>,
-=======
     /// MAN-312 (SPEC §2.7): the band-wide static-crash detector. Every
     /// channel is live until `set_rf_passband_hz` narrows it to the
     /// source's real passband.
@@ -1135,7 +1133,6 @@ pub fn crash_live_channels(sample_rate_hz: f64, rf_passband_hz: (f64, f64)) -> u
     let n_channels =
         ((sample_rate_hz / manta_dsp::channelizer::CHANNEL_SPACING_HZ).round() as usize).max(1);
     crash_live_set(sample_rate_hz, rf_passband_hz, n_channels).len()
->>>>>>> b7fb51c73796204ecc9f2340276c15dd0c118551
 }
 
 /// MAN-314: bound on `TrackManager::rtty_signals` for a long-running
@@ -1197,8 +1194,8 @@ impl TrackManager {
             rtty_log_capped: true,
             rtty_changes: 0,
             rtty_changed_sample_ts: 0,
-<<<<<<< HEAD
             rise_seen: None,
+            crash: CrashDetector::new(n_channels),
         }
     }
 
@@ -1245,9 +1242,6 @@ impl TrackManager {
             .filter(|t| t.decoder.is_some())
             .map(|t| t.freq_hz(self.center_freq_hz, self.channel_spacing_hz, n))
             .collect()
-=======
-            crash: CrashDetector::new(n_channels),
-        }
     }
 
     /// MAN-312 (SPEC §2.7): judge static crashes over the channels inside
@@ -1263,7 +1257,6 @@ impl TrackManager {
     /// `crash_filter` mode (including `"off"`).
     pub fn static_crash_count(&self) -> u64 {
         self.crash.count()
->>>>>>> b7fb51c73796204ecc9f2340276c15dd0c118551
     }
 
     /// MAN-314: how many blocks changed the marked RTTY set or a marked
@@ -1516,17 +1509,6 @@ impl TrackManager {
             self.n_channels()
         );
         let power_db_vals: Vec<f64> = hop.power.iter().map(|&p| power_db(p)).collect();
-<<<<<<< HEAD
-        self.floor.update(&power_db_vals);
-        let (rise, drop) = self.gate.update(&power_db_vals, &self.floor);
-        // MAN-324: the live-state occupancy window; one `Option` check
-        // when off.
-        if let Some(seen) = self.rise_seen.as_mut() {
-            for (s, &r) in seen.iter_mut().zip(&rise) {
-                *s |= r;
-            }
-        }
-=======
         // MAN-312 (SPEC §2.7): a static crash is band-wide, so each channel
         // judging it on its own (the gate's 19-hop confirm) cannot reject
         // it -- the channelizer smears a few-ms crash over ~85 ms of every
@@ -1549,7 +1531,13 @@ impl TrackManager {
         } else {
             self.gate.update(&power_db_vals, &self.floor)
         };
->>>>>>> b7fb51c73796204ecc9f2340276c15dd0c118551
+        // MAN-324: the live-state occupancy window; one `Option` check
+        // when off.
+        if let Some(seen) = self.rise_seen.as_mut() {
+            for (s, &r) in seen.iter_mut().zip(&rise) {
+                *s |= r;
+            }
+        }
         // MAN-314 (SPEC §2.6): feed the RTTY detector the same power and
         // floor; a block that changed the marked set updates the log.
         if let Some(fsk) = self.fsk.as_mut() {
