@@ -396,6 +396,12 @@ impl Ka9qIqSource {
             s.encoding.map(wire::encoding_name),
         )?;
         changed("output channel count", n(old.channels), n(s.channels))?;
+        // A mid-stream switch to envelope or independent-sideband mode
+        // keeps the channel count and payload type, so it needs its own
+        // comparison; an absent tag counts as off, as at open.
+        let b = |v: Option<bool>| Some(if v == Some(true) { "on" } else { "off" }.to_string());
+        changed("envelope setting", b(old.envelope), b(s.envelope))?;
+        changed("independent-sideband setting", b(old.isb), b(s.isb))?;
         changed(
             "RTP payload type",
             old.rtp_pt.map(|p| p.to_string()),
@@ -1126,6 +1132,33 @@ mod tests {
             let e = format!("{:#}", src.read(&mut buf).err().unwrap());
             assert!(
                 e.contains("changed its encoding from f32le to s16be"),
+                "{e}"
+            );
+        }
+
+        #[test]
+        fn an_envelope_or_isb_switch_in_the_status_ends_read() {
+            let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
+            let mut src = Ka9qIqSource::open(f.config(Some(SSRC))).unwrap();
+            f.statuses.lock().unwrap()[0].envelope = Some(true);
+            std::thread::sleep(Duration::from_millis(250));
+            let mut buf = vec![Complex32::new(0.0, 0.0); 64];
+            let e = format!("{:#}", src.read(&mut buf).err().unwrap());
+            assert!(
+                e.contains("changed its envelope setting from off to on"),
+                "{e}"
+            );
+
+            // ISB turning on after an absent tag (absent counts as off).
+            let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
+            f.statuses.lock().unwrap()[0].isb = None;
+            let mut src = Ka9qIqSource::open(f.config(Some(SSRC))).unwrap();
+            f.statuses.lock().unwrap()[0].isb = Some(true);
+            std::thread::sleep(Duration::from_millis(250));
+            let mut buf = vec![Complex32::new(0.0, 0.0); 64];
+            let e = format!("{:#}", src.read(&mut buf).err().unwrap());
+            assert!(
+                e.contains("changed its independent-sideband setting from off to on"),
                 "{e}"
             );
         }

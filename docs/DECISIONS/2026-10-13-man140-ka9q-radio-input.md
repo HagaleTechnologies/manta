@@ -162,8 +162,11 @@ source does not override `take_discontinuity()`.
 
 **D13 — A retune or format change ends `read()`.** If the channel's status
 reports a different frequency (by more than 1 mHz), rate, encoding, channel
-count or payload type than at open, `read()` returns an error naming the old
-and new values. `ReconnectingSource` reopens; if the frequency or rate
+count, payload type, envelope setting or independent-sideband setting than at
+open (an absent envelope/ISB tag counts as off, as at open, because a switch
+to those modes keeps the channel count and payload type while the second
+component stops being Q), `read()` returns an error naming the old and
+new values. `ReconnectingSource` reopens; if the frequency or rate
 differs, its existing check ends the run with exit 1, and a supervisor
 (systemd `Restart=always`, Compose `restart: unless-stopped`) starts it again
 at the new frequency. Following a retune live would mean changing the centre
