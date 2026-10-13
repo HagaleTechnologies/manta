@@ -246,10 +246,16 @@ impl LiveTap {
         }));
     }
 
-    /// Once per second of stream time, publishes a band sample. Reads and
-    /// resets the track manager's occupancy window either way, so each
-    /// sample covers about one second.
+    /// After each batch, forgets tracks the manager has removed. Once per
+    /// second of stream time, publishes a band sample. Reads and resets
+    /// the occupancy window either way, so each sample covers about one
+    /// second.
     pub(crate) fn maybe_tick(&mut self, tm: &mut TrackManager, stream_ts: u64) {
+        // Bare promotions never earn TrackClosed (MAN-19). Keep their
+        // frequencies while open, but use the manager's lifecycle to
+        // retire them, including after an input discontinuity. Run even
+        // before a band tick and without subscribers.
+        self.tracks.retain(|id, _| tm.contains_track(*id));
         if stream_ts < self.next_tick {
             return;
         }
@@ -337,6 +343,70 @@ pub(crate) mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn bare_promotions_are_forgotten_when_no_longer_in_the_track_manager() {
+        // Silent promotions receive no TrackClosed, including across an
+        // input discontinuity. Cleanup must also work without subscribers
+        // and before the next band tick.
+        for wants in [false, true] {
+            let sink = Arc::new(RecordingSink::default());
+            sink.wants.store(wants, Ordering::Relaxed);
+            let mut tap = LiveTap::new(sink.clone(), FS, 1.0);
+            let v = validator();
+            let mut tm = TrackManager::new(
+                64,
+                FS,
+                14_000_000.0,
+                crate::DetectorConfig::default(),
+                manta_decode::decoder::DecodeConfig::default(),
+            );
+            // A real unmodulated carrier promotes but decodes nothing.
+            let hops: Vec<_> = (0..3_870)
+                .map(|m| {
+                    let mut power = vec![1e-9; 64];
+                    if m >= 3_750 {
+                        power[10] = 1e-7;
+                    }
+                    manta_dsp::channelizer::HopOutput {
+                        m,
+                        x: vec![],
+                        power,
+                    }
+                })
+                .collect();
+            let events = tm.process_hops(&hops, |m| m);
+            assert!(matches!(
+                events.as_slice(),
+                [DecoderEvent::TrackPromoted { .. }]
+            ));
+            for event in &events {
+                tap.observe(event, &v);
+            }
+            tap.end_batch(&v);
+            tap.maybe_tick(&mut tm, 3_870);
+            assert_eq!(tap.tracks.len(), 1, "keep the open carrier's frequency");
+            assert!(tm.finish_for_discontinuity().is_empty());
+            tap.maybe_tick(&mut tm, 3_871);
+            assert!(tap.tracks.is_empty(), "retained a closed carrier");
+
+            for track_id in 2..=100 {
+                tap.observe(
+                    &DecoderEvent::TrackPromoted {
+                        track_id,
+                        sample_ts: 4_000 + u64::from(track_id),
+                        freq_hz: 14_010_000.0,
+                    },
+                    &v,
+                );
+                tap.end_batch(&v);
+                // The manager has already removed the silent track.
+                tap.maybe_tick(&mut tm, 4_000 + u64::from(track_id));
+                assert!(tap.tracks.is_empty(), "retained silent track {track_id}");
+            }
+            assert!(sink.take().is_empty());
+        }
     }
 
     #[test]

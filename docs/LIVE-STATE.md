@@ -85,7 +85,9 @@ client limit and a larger lag allowance:
   quota is `[server].json_max_connections_per_ip` (default 16, `0` means no
   per-IP cap), counted apart from the spot stream's: connections to
   `json_port` do not use up an address's live quota, nor the other way
-  round. A connection over either limit is closed at once.
+  round. A connection over the per-IP quota is closed at once. A
+  connection over the 32-client total cap waits, unserved, until a slot
+  frees; further connections wait in the operating system's backlog.
 - Ping limits: a WebSocket client may send at most 10 Pings per 60 s,
   counted both per connection and per source IP. The per-IP budget is
   `[server].json_max_pings_per_ip`, again counted apart from the spot

@@ -1106,6 +1106,12 @@ impl TrackManager {
         levels
     }
 
+    /// Whether a track is still open, including a bare promotion that
+    /// will not receive TrackClosed. Used to retire live-tap state.
+    pub(crate) fn contains_track(&self, track_id: u32) -> bool {
+        self.tracks.contains_key(&track_id)
+    }
+
     /// MAN-324: the raw frequency of every track holding a decoder (the
     /// tracks `decoding_track_count` counts), in track-id order.
     pub fn decoding_track_freqs_hz(&self) -> Vec<f64> {
