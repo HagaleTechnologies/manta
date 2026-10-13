@@ -2376,3 +2376,65 @@ fn reference_docs_relative_links_resolve() {
         );
     }
 }
+
+// ---- MAN-133: completions and man pages, documented and real ----
+
+/// MAN-133: README's Installation documents how to load the completion
+/// script for every shell the binary supports and how to read `man manta`,
+/// and never suggests `source <(…)` (a silent no-op on macOS's bash 3.2;
+/// decision D11).
+#[test]
+fn readme_installation_documents_completions_and_man_pages() {
+    let install = squash_whitespace(section(&doc("README.md"), "Installation"));
+    assert!(
+        install.contains("### Tab completion and man pages"),
+        "README Installation has no `### Tab completion and man pages` subsection"
+    );
+    let completions_help = manta().args(["completions", "--help"]).output().unwrap();
+    assert!(completions_help.status.success());
+    let help = String::from_utf8(completions_help.stdout).unwrap();
+    let values = help
+        .lines()
+        .find(|l| l.contains("[possible values: "))
+        .expect("`manta completions --help` lists no possible values");
+    for shell in values
+        .split("[possible values: ")
+        .nth(1)
+        .unwrap()
+        .trim_end_matches(']')
+        .split(", ")
+    {
+        assert!(
+            install.contains(&format!("manta completions {shell}")),
+            "README Installation never shows `manta completions {shell}`"
+        );
+    }
+    for needle in ["man/man1", "manta man-pages --out", "man manta"] {
+        assert!(
+            install.contains(needle),
+            "README Installation never says {needle:?}"
+        );
+    }
+    assert!(
+        install.contains("eval \"$(manta completions bash)\""),
+        "README's bash row must use eval \"$(…)\", not source <(…)"
+    );
+    assert!(
+        !install.contains("source <(manta completions"),
+        "README still suggests `source <(manta completions …)`, a silent no-op on \
+         macOS's bash 3.2 (MAN-133 D11)"
+    );
+}
+
+/// MAN-133: the release runbook names the job that renders the pages and
+/// where they land in each archive.
+#[test]
+fn release_runbook_lists_the_man_pages() {
+    let runbook = squash_whitespace(&doc("docs/RUNBOOKS/release.md"));
+    for needle in ["man/man1", "the `man-pages` job"] {
+        assert!(
+            runbook.contains(needle),
+            "docs/RUNBOOKS/release.md never says {needle:?}"
+        );
+    }
+}

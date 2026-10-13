@@ -157,8 +157,7 @@ docs/DECISIONS/2026-10-12-man118-decode-quality-metrics.md.
 MAN-314: RTTY (two-tone FSK) is recognised after `[detector] rtty_dwell_ms`
 (20 s) and starts no CW track on its tones or keying sidebands
 (`manta-dsp::fsk`, SPEC §2.6); `decode --json` gains `rtty`, `run` logs
-marks/clears and `/metrics` gains `manta_rtty_signals{band}`. See
-docs/DECISIONS/2026-10-11-man314-rtty-recognition.md.
+marks/clears and `/metrics` gains `manta_rtty_signals{band}`. Seedocs/DECISIONS/2026-10-11-man314-rtty-recognition.md.
 
 MAN-301: `[rbn_compare]` (off by default, needs `[server]`) reads RBN's
 CW telnet feed read-only (login callsign only) and grades each spot
@@ -168,6 +167,13 @@ grade` and `score-against-rbn.py --node-log` replay offline through the
 same Rust engine. RBN's real login prompt and the live/offline agreement
 rate are unmeasured. See
 docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
+
+MAN-133: `manta completions <shell>` (bash/zsh/fish/powershell/elvish) and
+`manta man-pages --out DIR` render from the clap tree `--help` uses; every
+release archive ships `man/man1/*.1` from a native `man-pages` release
+job. clap_complete publishes hidden commands and flags, so nothing in the
+CLI may be hidden. See
+docs/DECISIONS/2026-10-13-man133-shell-completions-and-man-pages.md.
 
 ## Documents (read in this order)
 

@@ -22,6 +22,10 @@ hpsdr = ["manta-input/hpsdr"]
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+# MAN-133: `manta completions` and `manta man-pages`, both rendered from
+# the clap tree that prints `--help`.
+clap_complete = "4.6"
+clap_mangen = "0.3"
 # MAN-126: `manta doctor`'s audio check lists sound-card inputs.
 coppa-audio = { workspace = true }
 ctrlc = { workspace = true }

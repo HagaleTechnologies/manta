@@ -31,6 +31,10 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- `manta completions <shell>` prints a tab-completion script for bash, zsh,
+  fish, PowerShell or elvish; `manta man-pages --out <dir>` writes `manta.1`
+  and one page per command, and every release archive carries them in
+  `man/man1` (MAN-133).
 - `[detector] rtty_filter`/`rtty_dwell_ms`; `manta_rtty_signals{band}`
   gauge; `rtty` array in `decode --json` and, when RTTY was marked, an
   `rtty:` line in plain `decode`; `RTTY marked`/`RTTY cleared` log lines in
