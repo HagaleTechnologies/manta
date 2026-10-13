@@ -106,6 +106,10 @@ pub(crate) struct LiveTap {
     sink: Arc<dyn LiveStateSink>,
     tracks: BTreeMap<u32, LiveTrack>,
     dirty: BTreeSet<u32>,
+    /// Decisions held until the batch's `trackState` records are out, so
+    /// a client never sees a decision before the state naming its
+    /// candidate.
+    pending_decisions: Vec<Decision>,
     /// Stream sample timestamp of the next band sample.
     next_tick: u64,
     tick_samples: u64,
@@ -124,6 +128,7 @@ impl LiveTap {
             sink,
             tracks: BTreeMap::new(),
             dirty: BTreeSet::new(),
+            pending_decisions: Vec::new(),
             next_tick: tick_samples,
             tick_samples,
             factor,
@@ -193,21 +198,23 @@ impl LiveTap {
         }
     }
 
-    /// Publishes the validator's decisions for the event just ingested,
-    /// or drops them while no one is subscribed.
+    /// Queues the validator's decisions for the event just ingested; they
+    /// go out after the batch's snapshots (`end_batch`), or at the next
+    /// closure. Dropped while no one is subscribed.
     pub(crate) fn decisions(&mut self, decisions: Vec<Decision>) {
         if decisions.is_empty() || !self.sink.wants_records() {
             return;
         }
-        for d in decisions {
-            self.sink.publish(LiveRecord::Decision(d));
-        }
+        self.pending_decisions.extend(decisions);
     }
 
-    /// A track closed: forget it and publish its closure.
-    pub(crate) fn closed(&mut self, track_id: u32, closure: ClosureKind) {
+    /// A track closed: publish every pending snapshot, then the queued
+    /// decisions (its closure's among them), then the closure, and forget
+    /// the track.
+    pub(crate) fn closed(&mut self, track_id: u32, closure: ClosureKind, validator: &Validator) {
         self.tracks.remove(&track_id);
         self.dirty.remove(&track_id);
+        self.flush(validator);
         if self.sink.wants_records() {
             self.sink.publish(LiveRecord::TrackClosed {
                 track_id,
@@ -218,11 +225,22 @@ impl LiveTap {
     }
 
     /// End of a decode batch: one snapshot per track whose text changed,
-    /// in track-id order.
+    /// in track-id order, then the batch's decisions.
     pub(crate) fn end_batch(&mut self, validator: &Validator) {
+        self.flush(validator);
+    }
+
+    fn flush(&mut self, validator: &Validator) {
         let dirty = std::mem::take(&mut self.dirty);
         for track_id in dirty {
             self.publish_track(track_id, validator);
+        }
+        let decisions = std::mem::take(&mut self.pending_decisions);
+        if !self.sink.wants_records() {
+            return;
+        }
+        for d in decisions {
+            self.sink.publish(LiveRecord::Decision(d));
         }
     }
 
@@ -548,19 +566,54 @@ pub(crate) mod tests {
             closure: ClosureKind::SignalEnded,
         };
         tap.observe(&closed, &v);
-        tap.closed(1, ClosureKind::SignalEnded);
+        tap.decisions(vec![withheld(1, "W1AW")]);
+        tap.closed(1, ClosureKind::SignalEnded, &v);
         tap.end_batch(&v);
         let recs = sink.take();
-        assert_eq!(recs.len(), 2, "{recs:?}");
+        assert_eq!(recs.len(), 3, "{recs:?}");
         assert!(matches!(&recs[0], LiveRecord::Track(t) if t.text == "W1AW"));
+        assert!(matches!(&recs[1], LiveRecord::Decision(d) if d.call == "W1AW"));
         assert!(matches!(
-            recs[1],
+            recs[2],
             LiveRecord::TrackClosed {
                 track_id: 1,
                 closure: ClosureKind::SignalEnded,
                 ..
             }
         ));
+    }
+
+    fn withheld(track_id: u32, call: &str) -> Decision {
+        Decision {
+            track_id,
+            sample_ts: 0,
+            call: call.to_owned(),
+            freq_hz: 14_025_000.0,
+            spot_type: manta_spot::SpotType::Cq,
+            verdict: manta_spot::Verdict::Withheld,
+            reason: Some(manta_spot::Reason::Repetition),
+            reps: Some(1),
+            rival: None,
+            spot: None,
+        }
+    }
+
+    /// Codex P1 on #281: a decision made at a word boundary mid-batch must
+    /// not reach a client before the `trackState` carrying its candidate.
+    #[test]
+    fn decisions_follow_the_batch_track_states() {
+        let sink = RecordingSink::wanting();
+        let mut tap = LiveTap::new(sink.clone(), FS, 1.0);
+        let v = validator();
+        let mut ts = 0;
+        chars(&mut tap, &v, 1, "W1AW ", &mut ts);
+        tap.decisions(vec![withheld(1, "W1AW")]);
+        assert!(sink.take().is_empty(), "nothing before the batch ends");
+        tap.end_batch(&v);
+        let recs = sink.take();
+        assert_eq!(recs.len(), 2, "{recs:?}");
+        assert!(matches!(&recs[0], LiveRecord::Track(t) if t.track_id == 1));
+        assert!(matches!(&recs[1], LiveRecord::Decision(d) if d.call == "W1AW"));
     }
 
     #[test]

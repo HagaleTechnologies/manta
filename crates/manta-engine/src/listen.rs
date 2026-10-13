@@ -349,8 +349,8 @@ fn emit(
         let calibrated = crate::calibrate_freq_events(&ev, ctx.calibration_factor);
         on_event(&calibrated);
         // MAN-324: state first (a closing track's last text is flushed
-        // while the validator still holds its candidates), then the
-        // validator's decisions for this event, then the closure.
+        // while the validator still holds its candidates); decisions are
+        // queued and go out after the batch's states, or before a closure.
         if let Some(tap) = ctx.live.as_mut() {
             tap.observe(&calibrated, validator);
         }
@@ -360,7 +360,7 @@ fn emit(
         if let Some(tap) = ctx.live.as_mut() {
             tap.decisions(validator.take_decisions());
             if let DecoderEvent::TrackClosed { track_id, closure } = &ev {
-                tap.closed(*track_id, *closure);
+                tap.closed(*track_id, *closure, validator);
             }
         }
     }

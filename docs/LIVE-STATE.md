@@ -186,7 +186,9 @@ One per decision validation makes about a candidate callsign. Validation
 runs at a track's word boundaries, once more at the track's first SNR
 update, and for deferred beacons when the track ends. The possible
 `decision`/`reason` pairs are under
-[Decisions and reasons](#decisions-and-reasons).
+[Decisions and reasons](#decisions-and-reasons). A decision is sent after
+the same batch's `trackState` records, so the state naming its candidate
+always arrives first.
 
 ```json
 {"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000044,"trackId":9,"call":"W4KTNL","frequency":14031200,"band":"20m","spotType":"de","decision":"withheld","reason":"variant","reps":2,"requiredReps":2,"rival":{"call":"W4KCL","reps":2,"confSum":1.016},"spotId":null}

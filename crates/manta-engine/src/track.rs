@@ -1093,6 +1093,10 @@ pub struct TrackManager {
     /// the last `take_channel_levels`. `None` (the default) skips it; no
     /// decode logic reads it.
     rise_seen: Option<Vec<bool>>,
+    /// MAN-324: per channel, whether its centre lies inside the source's
+    /// RF passband, for `take_channel_levels`. `None` (full Nyquist band,
+    /// the default) reports every channel.
+    rf_channels: Option<Vec<bool>>,
     /// MAN-312 (SPEC §2.7): the band-wide static-crash detector. Every
     /// channel is live until `set_rf_passband_hz` narrows it to the
     /// source's real passband.
@@ -1195,6 +1199,7 @@ impl TrackManager {
             rtty_changes: 0,
             rtty_changed_sample_ts: 0,
             rise_seen: None,
+            rf_channels: None,
             crash: CrashDetector::new(n_channels),
         }
     }
@@ -1207,12 +1212,15 @@ impl TrackManager {
     }
 
     /// MAN-324: every channel's centre (raw Hz), effective noise floor and
-    /// occupancy since the previous take, ascending in frequency. Resets
-    /// the occupancy window. `occupied` is always false unless
-    /// `enable_occupancy_window` was called.
+    /// occupancy since the previous take, ascending in frequency. Only
+    /// channels whose centre lies inside the source's RF passband
+    /// (`set_rf_passband_hz`), so band state never describes spectrum the
+    /// source does not deliver. Resets the occupancy window. `occupied` is
+    /// always false unless `enable_occupancy_window` was called.
     pub fn take_channel_levels(&mut self) -> Vec<ChannelLevel> {
         let n = self.n_channels();
         let mut levels: Vec<ChannelLevel> = (0..n)
+            .filter(|&k| self.rf_channels.as_ref().is_none_or(|r| r[k]))
             .map(|k| ChannelLevel {
                 freq_hz: self.center_freq_hz
                     + wrapped_channel_offset(k, n) * self.channel_spacing_hz,
@@ -1251,6 +1259,20 @@ impl TrackManager {
         let n = self.n_channels();
         let fs = self.channel_spacing_hz * n as f64;
         self.crash.set_live(crash_live_set(fs, (lo, hi), n));
+        // MAN-324: live band state covers the delivered passband only.
+        self.rf_channels = if lo <= -fs / 2.0 && hi >= fs / 2.0 {
+            None
+        } else {
+            let spacing = self.channel_spacing_hz;
+            Some(
+                (0..n)
+                    .map(|k| {
+                        let f = wrapped_channel_offset(k, n) * spacing;
+                        f >= lo && f <= hi
+                    })
+                    .collect(),
+            )
+        };
     }
 
     /// MAN-312: static crashes detected by this manager so far, in every
@@ -3122,6 +3144,40 @@ mod tests {
             assert!((l.freq_hz - e).abs() < 1e-6);
             assert!(!l.occupied, "occupancy is off by default");
         }
+    }
+
+    /// Codex P2 on #281: an audio or KiwiSDR source delivers RF only inside
+    /// its passband; band state must not report the rest of the
+    /// channelizer span.
+    #[test]
+    fn channel_levels_cover_only_the_source_rf_passband() {
+        let fs = 48_000.0;
+        let center = 14_000_000.0;
+        let n = manta_dsp::channelizer::Channelizer::new(fs, center)
+            .unwrap()
+            .n_channels();
+        let mut tm = TrackManager::new(
+            n,
+            fs,
+            center,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        tm.set_rf_passband_hz(300.0, 2700.0);
+        let levels = tm.take_channel_levels();
+        assert!(!levels.is_empty());
+        for l in &levels {
+            let off = l.freq_hz - center;
+            assert!((300.0..=2700.0).contains(&off), "{l:?}");
+        }
+        // ~2400 Hz of passband at 93.75 Hz spacing.
+        assert!((25..=27).contains(&levels.len()), "{}", levels.len());
+        tm.set_rf_passband_hz(-fs / 2.0, fs / 2.0);
+        assert_eq!(
+            tm.take_channel_levels().len(),
+            n,
+            "full band: every channel"
+        );
     }
 
     #[test]
