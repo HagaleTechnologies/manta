@@ -1070,7 +1070,11 @@ TimingUpdate   { track_id, sample_ts: u64, dit_ms: f32, dot, dash, element_gap,
                  observation, in dits of dit_ms = dit_estimate. On the
                  TrackMeta cadence when a class gained an observation since
                  the last one, and once at track finish if anything changed.
-                 Legacy/EdgeLegacy only.)
+                 A drift re-init (§4.1b) that wipes timing an update already
+                 reported counts as a change: the next update goes out even
+                 with no new observation, wiped classes null, so a stale
+                 update never stands as the track's last. Legacy/EdgeLegacy
+                 only.)
 ```
 
 `manta decode --json` also reports the primary track's last `TimingUpdate`

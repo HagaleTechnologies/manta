@@ -60,7 +60,9 @@ pub enum DecoderEvent {
     /// element-gap, char-gap and word-gap durations, mean and variance in
     /// dits of `dit_ms`, `null` for a class with no observations. Emitted
     /// on the `TrackMeta` cadence when a class gained an observation since
-    /// the last one, and at track finish. Legacy and EdgeLegacy only. The
+    /// the last one or a drift re-init wiped timing already reported (the
+    /// wiped classes then read `null`), and at track finish. Legacy and
+    /// EdgeLegacy only. The
     /// estimates are flattened into the event object. SPEC §5.
     TimingUpdate {
         track_id: u32,

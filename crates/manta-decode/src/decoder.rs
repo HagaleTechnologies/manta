@@ -142,6 +142,10 @@ pub struct TrackDecoder {
     sender_regime: u32,
     /// `sender.total_count()` at the last `TimingUpdate` (MAN-315 D8).
     last_timing_total: u64,
+    /// A drift re-init wiped timing a `TimingUpdate` had already reported,
+    /// so the next one must go out even with no new observation, or the
+    /// stale update would stand as the track's last (MAN-315 D8).
+    timing_reset_pending: bool,
     /// Cleared by `finish` for the space the stream ends inside: its length
     /// is a truncation, not the sender's gap, so `observe_gap` skips it.
     learn_gaps: bool,
@@ -210,6 +214,7 @@ impl TrackDecoder {
             flushed_gap_ms: None,
             sender_regime: 0,
             last_timing_total: 0,
+            timing_reset_pending: false,
             learn_gaps: true,
             last_reported_wpm: None,
             freq_hz: 0.0,
@@ -460,17 +465,19 @@ impl TrackDecoder {
 
     /// SPEC §5 `TimingUpdate` (MAN-315 D8): the sender's learned timing,
     /// on the `TrackMeta` cadence and at track finish, only when a class
-    /// gained an observation since the last one. Never for `Hsmm`, which
-    /// does not feed `sender`.
+    /// gained an observation since the last one or a drift re-init wiped
+    /// timing already reported. Never for `Hsmm`, which does not feed
+    /// `sender`.
     fn emit_timing(&mut self, events: &mut Vec<DecoderEvent>) {
         let total = self.sender.total_count();
         if self.cfg.engine == Engine::Hsmm
             || !self.tracker.ready()
-            || total <= self.last_timing_total
+            || (total <= self.last_timing_total && !self.timing_reset_pending)
         {
             return;
         }
         self.last_timing_total = total;
+        self.timing_reset_pending = false;
         events.push(DecoderEvent::TimingUpdate {
             track_id: self.track_id,
             sample_ts: self.last_ts,
@@ -846,6 +853,9 @@ impl TrackDecoder {
             return;
         }
         self.sender_regime = regime;
+        // `|=`: a second re-init before the next update must not drop a
+        // reset that has not been reported yet.
+        self.timing_reset_pending |= self.last_timing_total > 0;
         self.sender.reset();
         self.last_timing_total = 0;
         self.gaps.set_sender_word_dits(None);
@@ -2391,6 +2401,42 @@ mod tests {
             .expect("no word gap learned");
         assert_eq!(wg.n, 4, "{wg:?}");
         assert!((wg.mean_dits - 7.1).abs() < 0.3, "{wg:?}");
+    }
+
+    /// MAN-315 D8 (Codex, PR #273): a drift re-init after a reported
+    /// `TimingUpdate` is itself reported, once, with the wiped classes
+    /// `null`, even when nothing new is observed before the track closes.
+    /// Two re-inits in a row still report it.
+    #[test]
+    fn timing_update_reports_a_drift_reset_with_no_new_observation() {
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        for (i, &a) in rect_envelope("PARIS PARIS", 22).iter().enumerate() {
+            dec.push_envelope(a, i as u64 * 256);
+        }
+        let mut events = Vec::new();
+        dec.emit_timing(&mut events);
+        assert_eq!(events.len(), 1, "no first TimingUpdate: {events:?}");
+        for _ in 0..2 {
+            dec.sender_regime = dec.tracker.regime().wrapping_add(1);
+            dec.sync_sender_regime();
+        }
+        assert_eq!(dec.sender.total_count(), 0);
+        let mut events = Vec::new();
+        dec.emit_timing(&mut events);
+        let [DecoderEvent::TimingUpdate { timing, .. }] = events.as_slice() else {
+            panic!("the reset was not reported: {events:?}");
+        };
+        assert!(
+            timing.dot.is_none()
+                && timing.dash.is_none()
+                && timing.element_gap.is_none()
+                && timing.char_gap.is_none()
+                && timing.word_gap.is_none(),
+            "{timing:?}"
+        );
+        let mut events = Vec::new();
+        dec.emit_timing(&mut events);
+        assert!(events.is_empty(), "the reset was reported twice: {events:?}");
     }
 
     #[test]

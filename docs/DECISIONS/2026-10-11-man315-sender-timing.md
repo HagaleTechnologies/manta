@@ -29,7 +29,10 @@ each track's sender timing instead of assuming 1 / 3 / 1 / 3 / 7:
    classes have 3 observations).
 5. **Diagnostics** (D8): a `TimingUpdate` decoder event per track on the
    `TrackMeta` cadence when a class gained an observation, plus once at
-   finish; `manta decode --json` adds top-level `timing`; `manta decode
+   finish. A drift re-init that wipes timing already reported also
+   triggers one (wiped classes `null`; Codex on PR #273), so a track that
+   closes before relearning does not leave the old scale's update as its
+   last; `manta decode --json` adds top-level `timing`; `manta decode
    --timing` prints a `timing (dits, mean ± sd): …` stderr line after the
    summary. It is opt-in so that plain `decode`'s stderr stays MAN-270's
    single summary line.
@@ -122,7 +125,8 @@ hsmm`): see Implementation verification.
 - `crates/manta-decode/src/decoder.rs`: `sender_timing_reset_on_drift_reinit`,
   `noise_seeded_scale_recovers_within_three_callsigns`,
   `legacy_emits_timing_update_after_meta_tick`, `hsmm_emits_no_timing_update`,
-  `flushed_word_gap_closed_by_the_next_mark_is_learned`.
+  `flushed_word_gap_closed_by_the_next_mark_is_learned`,
+  `timing_update_reports_a_drift_reset_with_no_new_observation`.
 - `crates/manta-decode/src/events.rs`: `timing_update_json_shape`,
   `timing_update_roundtrips`.
 - `crates/manta-testkit/tests/roundtrip_envelope.rs`: the table above.
