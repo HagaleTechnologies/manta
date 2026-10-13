@@ -175,6 +175,11 @@ same Rust engine. RBN's real login prompt and the live/offline agreement
 rate are unmeasured. See
 docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
 
+MAN-152: the in-repo `wiki/` is manta's only wiki (GitHub's Wiki feature
+is disabled); the wiki pages' `verified` stamps and `manifest.json` are
+refreshed and pinned by a `docs_consistency` test. See
+`docs/DECISIONS/2026-10-13-man152-one-wiki.md`.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each

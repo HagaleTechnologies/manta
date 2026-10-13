@@ -46,6 +46,12 @@ the git history and `docs/DECISIONS/`.
   `/metrics`, with promtool tests. See `docs/RUNBOOKS/monitoring.md`
   (MAN-129).
 
+### Changed
+
+- The in-repo `wiki/` is the project's only wiki: GitHub's built-in Wiki
+  feature is disabled, and the wiki's stale `verified` stamps and
+  `manifest.json` are refreshed and CI-pinned (MAN-152).
+
 ## [0.1.0] - 2026-10-11
 
 Pre-stability alpha, expect breakage: manta has not cleared its own M2/M3
