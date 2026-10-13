@@ -139,26 +139,31 @@ this change. See [the MAN-244 decision](../DECISIONS/2026-10-10-man244-release-g
    grammar" below), then push: `git tag v1.2.3 <reviewed-commit-sha>` and
    `git push origin refs/tags/v1.2.3`. Only the owner may create, move or
    delete a release tag.
-3. Pushing the tag triggers both workflows:
-   - **`release.yml`** builds and packages all five targets (macOS
-     x86_64/arm64, Windows x86_64, Linux x86_64/arm64) and validates the
-     multi-arch Docker build (`push: false`) — this run never publishes
-     anything; it is a build-only check of the tagged commit (it no longer
-     runs on pull requests at all, since HAG-47).
-   - **`release-publish.yml`** does the real work: `validate-tag` (checks
-     tag grammar and default-branch ancestry before any platform build
-     starts) → `build` (rebuilds the same five targets) → two jobs side by
-     side, both in the `ghcr-publish` environment:
-     `docker-publish-release` (pushes the multi-arch image to GHCR as
-     `ghcr.io/hagaletechnologies/manta:X.Y.Z`, then `publish-latest` runs
-     after it; see below) and `release` (writes `SHA256SUMS` over the five
-     build artifacts, attests their build provenance, then creates the
-     GitHub Release from the archives and `SHA256SUMS`; MAN-80, see
-     "Verifying a downloaded release" below). The Release notes open with
-     the pre-stability label above GitHub's generated list of merged pull
-     requests. `release` does not wait for the image; see "If the image
-     publish fails" below. The build-only workflow has the same ancestry
-     guard before its platform builds.
+ 3. Pushing the tag triggers both workflows:
+    - **`release.yml`** builds and packages all five targets (macOS
+      x86_64/arm64, Windows x86_64, Linux x86_64/arm64) and validates the
+      multi-arch Docker build (`push: false`) — this run never publishes
+      anything; it is a build-only check of the tagged commit (it no longer
+      runs on pull requests at all, since HAG-47). The `validate-tag` job's
+      man-page steps render the man pages every archive ships (see "What
+      each artifact contains") from one native Linux build, after the tag
+      checks and before the matrix starts.
+    - **`release-publish.yml`** does the real work: `validate-tag` (checks
+      tag grammar and default-branch ancestry before any platform build
+      starts, then renders the man pages once from a native Linux build
+      with the same `--features` as every build leg) → `build` (rebuilds
+      the same five targets and needs only `validate-tag`) → two jobs
+      side by side, both in the `ghcr-publish` environment:
+      `docker-publish-release` (pushes the multi-arch image to GHCR as
+      `ghcr.io/hagaletechnologies/manta:X.Y.Z`, then `publish-latest` runs
+      after it; see below) and `release` (writes `SHA256SUMS` over the five
+      build artifacts, attests their build provenance, then creates the
+      GitHub Release from the archives and `SHA256SUMS`; MAN-80, see
+      "Verifying a downloaded release" below). The Release notes open with
+      the pre-stability label above GitHub's generated list of merged pull
+      requests. `release` does not wait for the image; see "If the image
+      publish fails" below. The build-only workflow has the same ancestry
+      guard before its platform builds.
 
    Both workflows build all five targets cold: no build cache is restored
    (MAN-243, `docs/DECISIONS/2026-10-10-man243-ci-trust-boundary.md`).
@@ -253,6 +258,8 @@ proved. Repair remote access or history errors and retry; do not bypass the
 check or use an old local tracking ref as evidence. For an incorrect tag,
 the owner corrects or deletes it and selects a reviewed commit containing
 the guard. Prefer a new release version if artifacts were already published.
+A failure in `validate-tag`'s man-page steps (after both checks) says nothing
+about the tag: fix the cause or re-run the job; keep the tag.
 
 ## Accepted tag grammar
 
@@ -431,6 +438,10 @@ Both should report the same digest.
   `packaging/launchd/` (both plists, `create-service-account.sh`,
   `rotate-log.sh`) and `docs/RUNBOOKS/network-exposure.md`. See
   [docs/DECISIONS/2026-10-10-man268-unattended-packaging.md](../DECISIONS/2026-10-10-man268-unattended-packaging.md).
+- **Man pages** (MAN-133, every archive): `man/man1/manta.1` and one page
+  per command, rendered by the `validate-tag` job's man-page steps running
+  `manta man-pages`; `scripts/package-release.py --man-dir` refuses to
+  build an archive without them.
 - **`SHA256SUMS`** (MAN-80, every Release): one `<sha256>  <archive>` line
   per archive above, bare file names, in `sha256sum` format. The same
   digests are the subjects of the Release's build-provenance attestation.

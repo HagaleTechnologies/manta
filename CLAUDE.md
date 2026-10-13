@@ -175,6 +175,13 @@ same Rust engine. RBN's real login prompt and the live/offline agreement
 rate are unmeasured. See
 docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
 
+MAN-133: `manta completions <shell>` (bash/zsh/fish/powershell/elvish) and
+`manta man-pages --out DIR` render from the clap tree `--help` uses; every
+release archive ships `man/man1/*.1` rendered natively by the release
+workflows' `validate-tag` job. clap_complete publishes hidden commands
+and flags, so nothing in the CLI may be hidden. See
+docs/DECISIONS/2026-10-13-man133-shell-completions-and-man-pages.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each

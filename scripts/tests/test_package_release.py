@@ -4,6 +4,7 @@ stdlib unittest only. Builds real tar.gz and zip archives from the repository's 
 binary, then executes the workflows' own Package run: bodies against the helper.
 Run: python3 -m unittest scripts.tests.test_package_release -v
 """
+import fnmatch
 import importlib.util
 import os
 import re
@@ -55,6 +56,22 @@ EXECUTABLE_KIT = {"packaging/launchd/create-service-account.sh", "packaging/laun
 FAKE_BINARY = b"\x7fELF fake manta\x00\x01\x02"
 RELEASE_WORKFLOWS = ("release.yml", "release-publish.yml")
 OLD_PACKAGING = ("tar -C dist", "Compress-Archive")
+
+# What `manta man-pages --out` produces, faked: two distinct pages (the set
+# and per-page bytes are both asserted) plus a stray file that must NOT ship.
+FAKE_MAN_PAGES = {
+    "manta.1": b".TH manta 1 \"\" \"manta 0.0.0\" \"User Commands\"\n",
+    "manta-run.1": b".TH manta-run 1 \"\" \"manta 0.0.0\" \"User Commands\"\n",
+}
+
+
+def fake_man_dir(parent, name="man pages"):
+    """A directory holding the fake pages and a stray file; returns its path."""
+    man_dir = os.path.join(parent, name)  # a space in the default, like every other path
+    for name, data in FAKE_MAN_PAGES.items():
+        write_file(os.path.join(man_dir, name), data)
+    write_file(os.path.join(man_dir, "notes.txt"), b"not a man page\n")
+    return man_dir
 
 
 def repo_bytes(rel):
@@ -127,25 +144,32 @@ def executable(body):
 
 
 class ArchiveAssertions(unittest.TestCase):
-    def assert_release_archive(self, path, artifact, binary_name, binary_bytes):
+    def assert_release_archive(self, path, artifact, binary_name, binary_bytes,
+                               man_pages=FAKE_MAN_PAGES):
         members = read_archive(path)
         self.assertEqual({n.split("/")[0] for n in members}, {artifact}, "exactly one top-level directory")
         self.assertEqual(members.get(artifact, ("missing",))[0], "dir")
         for name in members:
             self.assertFalse(name.startswith("/") or ".." in name.split("/"), name)
         files = {n[len(artifact) + 1:]: v for n, v in members.items() if v[0] != "dir"}
-        self.assertEqual(sorted(files), sorted((binary_name,) + KIT))
+        page_rels = tuple(f"man/man1/{n}" for n in man_pages)
+        self.assertEqual(sorted(files), sorted((binary_name,) + KIT + page_rels))
         self.assertEqual({v[0] for v in files.values()}, {"file"}, "only regular files")
         self.assertEqual(files[binary_name][2], binary_bytes)
         for rel in KIT:
             self.assertEqual(files[rel][2], repo_bytes(rel), rel)
+        for rel in page_rels:
+            self.assertEqual(files[rel][2], man_pages[os.path.basename(rel)], rel)
+            self.assertEqual(files[rel][1], 0o644, f"{rel} must be readable, not executable")
         for rel in (binary_name,) + tuple(EXECUTABLE_KIT):
             self.assertEqual(files[rel][1] & 0o755, 0o755, f"{rel} lost its executable mode")
         with tempfile.TemporaryDirectory() as tmp:
             extract(path, tmp)
-            for rel in (binary_name,) + KIT:
+            for rel in (binary_name,) + KIT + page_rels:
                 with open(os.path.join(tmp, artifact, *rel.split("/")), "rb") as f:
-                    self.assertEqual(f.read(), binary_bytes if rel == binary_name else repo_bytes(rel), rel)
+                    expected = binary_bytes if rel == binary_name else (
+                        man_pages[os.path.basename(rel)] if rel in page_rels else repo_bytes(rel))
+                    self.assertEqual(f.read(), expected, rel)
             if os.name == "posix" and path.endswith(".tar.gz"):
                 for rel in (binary_name,) + tuple(EXECUTABLE_KIT):
                     self.assertTrue(os.access(os.path.join(tmp, artifact, *rel.split("/")), os.X_OK), rel)
@@ -172,6 +196,7 @@ class HelperArchiveTests(ArchiveAssertions):
         self.tmp = os.path.join(self._tmp.name, "release work")  # a space in every path
         self.out = os.path.join(self.tmp, "out dir")
         os.makedirs(self.out)
+        self.man = fake_man_dir(self.tmp)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -184,7 +209,7 @@ class HelperArchiveTests(ArchiveAssertions):
     def test_tar_gz_contains_the_binary_readme_licences_and_kit(self):
         artifact = "manta-linux-x86_64"
         proc = run_helper("--binary", self.fake_binary("manta"), "--artifact", artifact,
-                          "--format", "tar.gz", "--out-dir", self.out)
+                          "--format", "tar.gz", "--out-dir", self.out, "--man-dir", self.man)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         path = os.path.join(self.out, artifact + ".tar.gz")
         self.assertIn(path, proc.stdout)
@@ -198,7 +223,7 @@ class HelperArchiveTests(ArchiveAssertions):
     def test_zip_contains_the_binary_readme_licences_and_kit(self):
         artifact = "manta-windows-x86_64"
         proc = run_helper("--binary", self.fake_binary("manta.exe"), "--artifact", artifact,
-                          "--format", "zip", "--out-dir", self.out)
+                          "--format", "zip", "--out-dir", self.out, "--man-dir", self.man)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         path = os.path.join(self.out, artifact + ".zip")
         self.assertEqual(os.listdir(self.out), [artifact + ".zip"])
@@ -214,7 +239,7 @@ class HelperArchiveTests(ArchiveAssertions):
         for fmt, ext in (("tar.gz", ".tar.gz"), ("zip", ".zip")):
             with self.subTest(format=fmt):
                 proc = run_helper("--binary", self.fake_binary("manta"), "--artifact", artifact,
-                                  "--format", fmt, "--out-dir", self.out)
+                                  "--format", fmt, "--out-dir", self.out, "--man-dir", self.man)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assert_release_archive(os.path.join(self.out, artifact + ext), artifact, "manta",
                                             FAKE_BINARY)
@@ -230,14 +255,16 @@ class HelperArchiveTests(ArchiveAssertions):
                         os.makedirs(out)
                         copy_kit(root, skip=rel)
                         proc = run_helper("--binary", binary, "--artifact", "manta-linux-arm64",
-                                          "--format", fmt, "--out-dir", out, root=root)
+                                          "--format", fmt, "--out-dir", out,
+                                          "--man-dir", self.man, root=root)
                         self.assertNotEqual(proc.returncode, 0, f"archive built without {rel}")
                         self.assertIn(rel.split("/")[-1], proc.stderr)
                         self.assertEqual(os.listdir(out), [], "no archive or partial file may be left")
 
     def test_missing_binary_fails_without_writing_an_archive(self):
         proc = run_helper("--binary", os.path.join(self.tmp, "no such dir", "manta"),
-                          "--artifact", "manta-linux-x86_64", "--format", "tar.gz", "--out-dir", self.out)
+                          "--artifact", "manta-linux-x86_64", "--format", "tar.gz",
+                          "--out-dir", self.out, "--man-dir", self.man)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("no such dir", proc.stderr)
         self.assertEqual(os.listdir(self.out), [])
@@ -247,7 +274,8 @@ class HelperArchiveTests(ArchiveAssertions):
         root = os.path.join(self.tmp, "repo copy")
         copy_kit(root)
         proc = run_helper("--binary", self.fake_binary("manta"), "--artifact", "manta-linux-arm64",
-                          "--format", "tar.gz", "--out-dir", self.out, root=root)
+                          "--format", "tar.gz", "--out-dir", self.out,
+                          "--man-dir", self.man, root=root)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assert_release_archive(os.path.join(self.out, "manta-linux-arm64.tar.gz"), "manta-linux-arm64",
                                     "manta", FAKE_BINARY)
@@ -256,9 +284,37 @@ class HelperArchiveTests(ArchiveAssertions):
         for artifact in ("", "..", "dist/manta-linux-x86_64", "..\\manta"):
             with self.subTest(artifact=artifact):
                 proc = run_helper("--binary", self.fake_binary("manta"), "--artifact", artifact,
-                                  "--format", "tar.gz", "--out-dir", self.out)
+                                  "--format", "tar.gz", "--out-dir", self.out,
+                                  "--man-dir", self.man)
                 self.assertEqual(proc.returncode, 2, proc.stderr)
                 self.assertEqual(os.listdir(self.out), [])
+
+    def test_man_dir_is_required(self):
+        proc = run_helper("--binary", self.fake_binary("manta"), "--artifact", "manta-linux-x86_64",
+                          "--format", "tar.gz", "--out-dir", self.out)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("--man-dir", proc.stderr)
+        self.assertEqual(os.listdir(self.out), [])
+
+    def test_missing_man_pages_fail_without_writing_an_archive(self):
+        binary = self.fake_binary("manta")
+        empty = os.path.join(self.tmp, "empty man dir")
+        os.makedirs(empty)
+        only_run = os.path.join(self.tmp, "only manta-run")
+        write_file(os.path.join(only_run, "manta-run.1"), FAKE_MAN_PAGES["manta-run.1"])
+        cases = (os.path.join(self.tmp, "no such dir"), only_run, empty)
+        for fmt in ("tar.gz", "zip"):
+            for man_dir in cases:
+                with self.subTest(format=fmt, man_dir=man_dir):
+                    out = os.path.join(self.tmp, f"out {fmt}")
+                    os.makedirs(out, exist_ok=True)
+                    proc = run_helper("--binary", binary, "--artifact", "manta-linux-arm64",
+                                      "--format", fmt, "--out-dir", out, "--man-dir", man_dir)
+                    self.assertNotEqual(proc.returncode, 0,
+                                        f"an archive was built from {man_dir}")
+                    self.assertIn("manta.1", proc.stderr)
+                    self.assertEqual(os.listdir(out), [],
+                                     "no archive or partial file may be left")
 
 
 def package_steps(name):
@@ -296,7 +352,8 @@ class WorkflowPackageStepTests(ArchiveAssertions):
                 self.assertEqual(wf.field(step, "shell"), "bash")
                 self.assertIsNone(wf.field(step, "if"), "the Package step must run on every OS")
                 body = executable(wf.run_body(step))
-                for arg in ("--binary ", '--artifact "${{ matrix.artifact }}"', "--format ", "--out-dir "):
+                for arg in ("--binary ", '--artifact "${{ matrix.artifact }}"', "--format ",
+                            "--man-dir man-pages", "--out-dir "):
                     self.assertIn(arg, body)
                 self.assertIn("matrix.target", body)
 
@@ -356,6 +413,10 @@ class WorkflowPackageStepTests(ArchiveAssertions):
             write_file(os.path.join(work, "scripts", "package-release.py"), repo_bytes("scripts/package-release.py"))
             write_file(os.path.join(work, "target", entry["target"], "release", exe), FAKE_BINARY)
             write_file(os.path.join(work, "dist", entry["artifact"], "stale.txt"), b"old staging\n")
+            # The download-artifact step materialises validate-tag's man-pages
+            # artifact at work/man-pages/ before this step runs; the name is
+            # the workflow's, so no space here.
+            fake_man_dir(work, "man-pages")
             log = os.path.join(tmp, "interpreters.log")
             # Functions shadow PATH lookup, so the run: body's own python/python3 choice is recorded
             # and still runs this interpreter on hosts that lack one of the two names.
@@ -376,6 +437,98 @@ class WorkflowPackageStepTests(ArchiveAssertions):
             self.assertEqual(archives, [entry["artifact"] + ext])
             self.assert_release_archive(os.path.join(work, entry["artifact"] + ext), entry["artifact"],
                                         exe, FAKE_BINARY)
+
+
+class ManPagesJobTests(unittest.TestCase):
+    """MAN-133: validate-tag renders every archive's man pages once, natively, after its tag
+    checks; `build` needs only validate-tag (scripts/tests/release-version.test.sh)."""
+
+    def features_of(self, body):
+        m = re.search(r"--features (\S+)", body)
+        self.assertIsNotNone(m, f"no --features in:\n{body}")
+        return m.group(1)
+
+    def test_man_pages_job_renders_once_natively(self):
+        for name in RELEASE_WORKFLOWS:
+            with self.subTest(workflow=name):
+                self.assertFalse(wf.job_block(wf.read(name), "man-pages"),
+                                 f"{name}: a separate man-pages job would need `build` to need it too")
+                job = wf.job_block(wf.read(name), "validate-tag")
+                self.assertTrue(job, f"{name} has no validate-tag job")
+                self.assertEqual(wf.field(job, "runs-on"), "ubuntu-latest")
+                steps = wf.steps(job)
+                self.assertTrue(steps, "validate-tag has no steps")
+                checkout = [s for s in steps
+                            if (wf.field(s, "uses") or "").startswith("actions/checkout@")]
+                self.assertEqual(len(checkout), 1, "expected exactly one checkout step")
+                bodies = [executable(wf.run_body(s)) for s in steps if wf.run_body(s)]
+                build = [i for i, s in enumerate(steps)
+                         if "cargo build --release -p manta-cli" in executable(wf.run_body(s))]
+                self.assertEqual(len(build), 1, "expected exactly one host build step")
+                self.assertRegex(executable(wf.run_body(steps[build[0]])), r"--features \S+")
+                checks = [i for i, s in enumerate(steps)
+                          if re.search(r"release-version\.sh|check-release-ancestry\.sh",
+                                       executable(wf.run_body(s)))]
+                self.assertTrue(checks, "validate-tag lost its tag checks")
+                self.assertLess(max(checks), build[0],
+                                "the man-page build must come after every tag check")
+                self.assertTrue(
+                    any("target/release/manta man-pages --out man-pages" in b for b in bodies),
+                    "no step runs `target/release/manta man-pages --out man-pages`")
+                uploads = [s for s in steps
+                           if (wf.field(s, "uses") or "").startswith("actions/upload-artifact@")]
+                matched = [s for s in uploads
+                           if wf.field(wf.sub(s, "with"), "name") == "man-pages"]
+                self.assertEqual(len(matched), 1, "expected exactly one man-pages upload")
+                with_block = wf.sub(matched[0], "with")
+                self.assertEqual(wf.field(with_block, "path"), "man-pages")
+                self.assertEqual(wf.field(with_block, "if-no-files-found"), "error")
+
+    def test_man_pages_use_the_build_legs_features(self):
+        for name in RELEASE_WORKFLOWS:
+            with self.subTest(workflow=name):
+                job = wf.job_block(wf.read(name), "validate-tag")
+                man_bodies = [executable(wf.run_body(s)) for s in wf.steps(job) if wf.run_body(s)]
+                want = {self.features_of(b) for b in man_bodies
+                        if "cargo build --release -p manta-cli" in b}
+                self.assertEqual(len(want), 1, f"validate-tag builds with several feature sets: {want}")
+                want = next(iter(want))
+                build = wf.job_block(wf.read(name), "build")
+                checked = 0
+                for step in wf.steps(build):
+                    if wf.field(step, "name") in ("Build (native)", "Build (cross)"):
+                        self.assertEqual(
+                            self.features_of(executable(wf.run_body(step))), want,
+                            "the man-page build's --features must equal every build leg's")
+                        checked += 1
+                self.assertEqual(checked, 2, "build lost its native/cross build steps")
+
+    def test_build_downloads_the_man_pages_before_packaging(self):
+        for name in RELEASE_WORKFLOWS:
+            with self.subTest(workflow=name):
+                build = wf.job_block(wf.read(name), "build")
+                self.assertEqual(wf.field(build, "needs"), "validate-tag")
+                steps = wf.steps(build)
+                pkg = [i for i, s in enumerate(steps)
+                       if "scripts/package-release.py" in executable(wf.run_body(s))]
+                self.assertEqual(len(pkg), 1)
+                downloads = [i for i, s in enumerate(steps)
+                             if (wf.field(s, "uses") or "").startswith("actions/download-artifact@")
+                             and wf.field(wf.sub(s, "with"), "name") == "man-pages"]
+                self.assertEqual(len(downloads), 1, "expected exactly one man-pages download step")
+                self.assertLess(downloads[0], pkg[0], "the download must come before Package")
+                self.assertEqual(wf.field(wf.sub(steps[downloads[0]], "with"), "path"), "man-pages")
+                self.assertIn("--man-dir man-pages", executable(wf.run_body(steps[pkg[0]])))
+
+    def test_man_pages_artifact_is_never_a_release_asset(self):
+        # D7's naming rule: the release job downloads `manta-*` and publishes
+        # everything it downloads, so `man-pages` must not match that glob.
+        self.assertFalse(fnmatch.fnmatchcase("man-pages", "manta-*"))
+        release = wf.job_block(wf.read("release-publish.yml"), "release")
+        downloads = [s for s in wf.steps(release)
+                     if (wf.field(s, "uses") or "").startswith("actions/download-artifact@")]
+        self.assertEqual(len(downloads), 1, "release job's artifact download changed")
+        self.assertEqual(wf.field(wf.sub(downloads[0], "with"), "pattern"), "manta-*")
 
 
 class CiFullTests(unittest.TestCase):

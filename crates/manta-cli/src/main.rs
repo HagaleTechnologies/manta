@@ -2,7 +2,7 @@
 //! the spotting daemon.
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use manta_decode::decoder::Engine;
 use manta_engine::{decode_wav, PipelineConfig};
 use manta_input::IqSource;
@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 mod bench;
 mod build_info;
 mod calibrate_cmd;
+mod cli_docs;
 mod clock_check;
 mod config;
 mod config_cmd;
@@ -997,6 +998,26 @@ enum Command {
     Grade {
         #[command(flatten)]
         args: grade_cmd::Args,
+    },
+    /// Print a tab-completion script for your shell.
+    ///
+    /// Load it from your shell's startup file, for example by adding
+    /// `eval "$(manta completions bash)"` to ~/.bashrc. The script covers
+    /// this build's commands and flags, so load it again after an upgrade.
+    Completions {
+        /// Shell to print the script for.
+        shell: clap_complete::aot::Shell,
+    },
+    /// Write manta's man pages into a directory.
+    ///
+    /// Writes manta.1 and one page per command (manta-run.1,
+    /// manta-config-check.1, ...), replacing older copies. Release archives
+    /// already carry these pages in man/man1.
+    ManPages {
+        /// Directory to write the pages into, created if missing, for
+        /// example /usr/local/share/man/man1.
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
     },
 }
 
@@ -5803,6 +5824,13 @@ fn run_command() -> Result<std::process::ExitCode> {
         Command::Config(ConfigCommand::Init { out, force }) => config_cmd::init(&out, force)?,
         Command::Bench(BenchCommand::Sensitivity(args)) => bench::sensitivity(args)?,
         Command::Grade { args } => grade_cmd::run(args)?,
+        Command::Completions { shell } => {
+            cli_docs::write_completions(shell, &mut Cli::command(), &mut std::io::stdout().lock())?
+        }
+        Command::ManPages { out } => {
+            let n = cli_docs::write_man_pages(Cli::command(), &out)?;
+            eprintln!("wrote {n} man pages to {}", out.display());
+        }
     }
     Ok(std::process::ExitCode::SUCCESS)
 }
@@ -5979,6 +6007,35 @@ impl RttyLogState {
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn cli_definition_passes_clap_debug_assert() {
+        Cli::command().debug_assert();
+    }
+
+    /// MAN-133: clap_complete 4.6 writes hidden subcommands and flags into
+    /// every shell's script, so hiding one would still offer it on <TAB>.
+    /// Filter them in cli_docs before hiding anything.
+    #[test]
+    fn no_command_or_flag_is_hidden() {
+        fn walk(cmd: &clap::Command, path: &str, hidden: &mut Vec<String>) {
+            for arg in cmd.get_arguments().filter(|a| a.is_hide_set()) {
+                hidden.push(format!("{path} --{}", arg.get_id()));
+            }
+            for sub in cmd.get_subcommands() {
+                let p = format!("{path} {}", sub.get_name());
+                if sub.is_hide_set() {
+                    hidden.push(p.clone());
+                }
+                walk(sub, &p, hidden);
+            }
+        }
+        let mut hidden = Vec::new();
+        let mut cmd = Cli::command();
+        cmd.build();
+        walk(&cmd, "manta", &mut hidden);
+        assert!(hidden.is_empty(), "hidden: {hidden:?}");
+    }
 
     fn rtty_sig() -> manta_engine::RttySignalReport {
         manta_engine::RttySignalReport {
