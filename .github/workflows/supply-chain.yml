@@ -6,19 +6,24 @@ name: Supply Chain
 #
 # WHY THIS RUNS ON EVERY PR/PUSH: the job named "Supply Chain" below is a ruleset-required status
 # check on main. A required check that only ran on some events would leave every other PR stuck
-# at "Expected -- waiting for status" forever, so this workflow always runs; the audit step is
-# gated behind a Cargo.lock/Cargo.toml-changed filter so it only actually does work when a
-# dependency changed.
+# at "Expected -- waiting for status" forever, so this workflow always runs; the scan step is
+# gated behind a Cargo.lock/Cargo.toml/deny.toml-changed filter so it only actually does work when
+# a dependency or the policy changed. MAN-156: a daily scheduled run on main always scans, so an
+# advisory published against an unchanged Cargo.lock still turns something red.
 #
-# WHAT IT DOES: `rustsec/audit-check` runs `cargo audit` against the checked-out Cargo.lock,
-# scanning every resolved crate against the RustSec advisory database (github.com/RustSec/advisory-db)
-# -- CVEs and known-malicious-crate reports both. Unlike widdershins' `osv-scanner` PR-diff mode,
-# this blocks on ANY advisory present in the current lockfile, not just ones newly introduced by
-# this PR -- cargo-audit has no first-class diff-only mode, and a base-vs-head manual diff is
-# meaningfully more custom logic to get right. Confirmed 2026-09-12 that manta's current Cargo.lock
-# has zero known advisories (`cargo audit` exit 0, 264 crates scanned), so this starts clean; if a
-# PRE-EXISTING advisory blocks an unrelated future PR, allowlist it in `audit.toml`
-# (https://docs.rs/cargo-audit -- an [advisories] ignore list), not by weakening this workflow.
+# WHAT IT DOES (MAN-156): `cargo deny --locked check` (cargo-deny 0.20.2) checks every resolved
+# crate in the checked-out Cargo.lock, all features included, against the policy in deny.toml:
+# advisories from the same RustSec database cargo audit used (github.com/RustSec/advisory-db --
+# CVEs and known-malicious-crate reports), plus licenses, bans (wildcard requirements, duplicate
+# versions) and sources (crates.io and the pinned coppa git repository only). Unlike cargo audit,
+# it fails on unmaintained, unsound and yanked crates too, and every failure names the crate and
+# the advisory or rule it broke. Like cargo audit, it blocks on ANY finding in the current
+# lockfile, not just ones newly introduced by this PR -- cargo-deny has no first-class diff-only
+# mode, and a base-vs-head manual diff is meaningfully more custom logic to get right. On
+# 2026-10-13 the only finding was RUSTSEC-2024-0449 (unsafe-libyaml, unmaintained, dev-only), now
+# ignored with a reason. If a PRE-EXISTING advisory or license blocks an unrelated future PR, add
+# an `[advisories] ignore` or `[licenses] allow` entry with a reason to deny.toml (code-owned),
+# not a weaker workflow. See docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md.
 #
 # THREAT MODEL / KNOWN LIMIT: same as widdershins' equivalent -- this defends against malicious
 # DEPENDENCY CONTENT, not a PR author rewriting this file itself. `pull_request` (not
@@ -30,27 +35,29 @@ on:
     branches: [main]
   merge_group:
     types: [checks_requested]
+  # MAN-156: a daily full scan of main, so an advisory published against an unchanged Cargo.lock
+  # still turns something red instead of waiting for the next dependency PR.
+  schedule:
+    - cron: '17 6 * * *'
 
 permissions:
   contents: read
   pull-requests: read
-  # rustsec/audit-check's own README lists checks: write as its "typically used" permission --
-  # without it, the action still fails this job on a real advisory (that's just this step's own
-  # exit code), but degrades its separate check-run/annotation output silently on a same-repo PR.
-  # Granting it avoids that ambiguity rather than relying on the degraded fallback path.
-  checks: write
 
 jobs:
   changes:
     name: Detect dependency changes
     runs-on: ubuntu-latest
     outputs:
-      deps: ${{ steps.filter.outputs.deps }}
+      # A scheduled run has no diff to filter: it always scans.
+      deps: ${{ github.event_name == 'schedule' && 'true' || steps.filter.outputs.deps }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name != 'schedule'
         with:
           fetch-depth: 0
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        if: github.event_name != 'schedule'
         id: filter
         with:
           base: ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref }}
@@ -60,11 +67,11 @@ jobs:
               - 'Cargo.lock'
               - 'Cargo.toml'
               - 'crates/**/Cargo.toml'
-              # An audit.toml-only PR (the documented remediation for allowlisting a
-              # false-positive advisory) previously took the trivial-pass path -- a typo'd or
-              # ineffective exemption could land unexercised against the current lockfile, since
-              # green PRs auto-merge here (Codex P2, round 2).
-              - 'audit.toml'
+              # A deny.toml-only PR (the documented remediation for allowlisting an advisory or
+              # a license) must not take the trivial-pass path -- a typo'd or ineffective
+              # exemption could land unexercised against the current lockfile, since green PRs
+              # auto-merge here (Codex P2, round 2, for the former audit.toml).
+              - 'deny.toml'
 
   audit:
     name: Supply Chain
@@ -88,7 +95,7 @@ jobs:
 
       - name: Pass trivially (no dependency manifest/lockfile changed)
         if: needs.changes.result == 'success' && needs.changes.outputs.deps != 'true'
-        run: echo "No Cargo.lock/Cargo.toml change in this diff -- nothing to scan."
+        run: echo "No Cargo.lock/Cargo.toml/deny.toml change in this diff -- nothing to scan."
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.changes.result == 'success' && needs.changes.outputs.deps == 'true'
@@ -96,7 +103,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         if: needs.changes.result == 'success' && needs.changes.outputs.deps == 'true'
 
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+      # MAN-156: a prebuilt, checksum-verified cargo-deny (taiki-e/install-action's manifest carries
+      # its SHA-256), not a 4-minute source build; this workflow keeps no build cache (MAN-243).
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         if: needs.changes.result == 'success' && needs.changes.outputs.deps == 'true'
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-deny@0.20.2
+
+      - name: cargo deny check (advisories, bans, licenses, sources)
+        if: needs.changes.result == 'success' && needs.changes.outputs.deps == 'true'
+        run: cargo deny --locked check

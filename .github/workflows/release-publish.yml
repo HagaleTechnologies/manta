@@ -85,6 +85,10 @@ jobs:
   # man pages every archive ships (minutes, not seconds; see the steps).
   validate-tag:
     runs-on: ubuntu-latest
+    # MAN-156: actions: read lets the CI gate below read the release commit's CI run.
+    permissions:
+      contents: read
+      actions: read
     outputs:
       version: ${{ steps.v.outputs.version }}
       image: ${{ steps.v.outputs.image }}
@@ -120,6 +124,16 @@ jobs:
           RELEASE_COMMIT: ${{ github.sha }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: scripts/check-release-ancestry.sh "$RELEASE_COMMIT" "$DEFAULT_BRANCH"
+
+      # MAN-156: Windows legs are not required for merge, so a Windows-only failure can reach main.
+      # Never publish a commit whose ci-full.yml push run did not pass every test leg; a flaky leg
+      # re-run to green counts. Runs before the man-page build, like the other tag checks.
+      - name: Require a green CI run on the release commit
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: python3 scripts/check-release-ci.py "$GITHUB_REPOSITORY" "$RELEASE_COMMIT"
 
       # MAN-133: the man pages every archive ships, rendered once from a native
       # build. Their text depends only on Cargo features -- the same as every
