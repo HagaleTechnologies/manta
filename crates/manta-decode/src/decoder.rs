@@ -2436,7 +2436,10 @@ mod tests {
         );
         let mut events = Vec::new();
         dec.emit_timing(&mut events);
-        assert!(events.is_empty(), "the reset was reported twice: {events:?}");
+        assert!(
+            events.is_empty(),
+            "the reset was reported twice: {events:?}"
+        );
     }
 
     #[test]
