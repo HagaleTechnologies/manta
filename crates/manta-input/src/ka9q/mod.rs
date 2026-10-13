@@ -765,7 +765,6 @@ impl IqSource for Ka9qIqSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     #[test]
     fn group_literal_must_be_ipv4_multicast() {
@@ -924,6 +923,7 @@ mod tests {
     mod sockets {
         use super::*;
         use std::sync::atomic::AtomicU8;
+        use std::sync::Mutex;
         use std::thread::JoinHandle;
         use wire::RtpHeader;
 
