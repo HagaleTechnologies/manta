@@ -68,6 +68,14 @@ const QUEUE_CAP_S: f64 = 3.0;
 /// smallest IQ sample (4 bytes, `s16`/`f16`).
 const STASH_MAX_SAMPLES: usize = RCVBUF_BYTES / 4;
 
+/// The most datagrams one non-blocking drain pass takes from a socket
+/// before returning, so a flood that keeps a socket readable (status
+/// spam, another channel on the group, or RTP faster than the drain) can
+/// never starve the caller's deadline checks. Far above what any accepted
+/// rate delivers between passes (a 768 kS/s `f32le` channel sends ~45
+/// datagrams per 10 ms `WAIT_POLL`).
+const DRAIN_BATCH: usize = 256;
+
 /// The most channels `open` remembers while choosing one (D7), so status
 /// packets with ever-new SSRCs from a host on the group cannot grow memory
 /// for the whole open wait.
@@ -469,7 +477,7 @@ impl Ka9qIqSource {
     }
 
     fn drain_status(&mut self) -> Result<()> {
-        loop {
+        for _ in 0..DRAIN_BATCH {
             match self.status_sock.recv(&mut self.recv_buf) {
                 Ok(n) => match wire::parse_status_packet(&self.recv_buf[..n]) {
                     Ok(Some(s)) if s.ssrc == Some(self.ssrc) => self.check_status(&s)?,
@@ -482,10 +490,12 @@ impl Ka9qIqSource {
                 Err(e) => return Err(e).context("ka9q-radio: status socket"),
             }
         }
+        Ok(())
     }
 
-    /// Accepts every RTP packet already waiting in the socket without
-    /// blocking, up to the replay plus `QUEUE_CAP_S` seconds of samples.
+    /// Accepts the RTP packets already waiting in the socket without
+    /// blocking, up to the replay plus `QUEUE_CAP_S` seconds of samples and
+    /// at most `DRAIN_BATCH` datagrams per call.
     fn drain_ready_rtp(&mut self) -> Result<()> {
         let cap = STASH_MAX_SAMPLES + (self.fs * QUEUE_CAP_S) as usize;
         if self.queue.len() >= cap {
@@ -494,20 +504,22 @@ impl Ka9qIqSource {
         self.data
             .set_nonblocking(true)
             .context("ka9q-radio: set data socket non-blocking")?;
-        let res = loop {
+        let mut res = Ok(());
+        for _ in 0..DRAIN_BATCH {
             match self.data.recv(&mut self.recv_buf) {
                 Ok(n) => {
                     self.accept_rtp(n);
                     if self.queue.len() >= cap {
-                        break Ok(());
+                        break;
                     }
                 }
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                    break Ok(())
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => break,
+                Err(e) => {
+                    res = Err(e).context("ka9q-radio: data socket");
+                    break;
                 }
-                Err(e) => break Err(e).context("ka9q-radio: data socket"),
             }
-        };
+        }
         self.data
             .set_nonblocking(false)
             .context("ka9q-radio: restore data socket blocking mode")?;
@@ -557,8 +569,10 @@ impl Ka9qIqSource {
 /// Drains the data socket into `stash` while `open` waits for status, so
 /// the kernel's receive buffer cannot overflow while nothing reads it: on
 /// Linux's default grant it holds only ~0.17 s of 192 kS/s `f32` IQ, less
-/// than the 1.5 s no-SSRC settle window. It always drains the socket to
-/// empty. The stash keeps the newest `cap` bytes (each packet charged its
+/// than the 1.5 s no-SSRC settle window. Each call drains the socket to
+/// empty or takes `DRAIN_BATCH` datagrams, whichever comes first, so a
+/// flood cannot keep `wait_for_status` from its status read and open
+/// timeout. The stash keeps the newest `cap` bytes (each packet charged its
 /// length plus `STASH_PACKET_OVERHEAD`, so empty datagrams count too),
 /// dropping its own oldest packets past that, so a fast
 /// channel never overflows the kernel and the replay in `open` runs
@@ -571,7 +585,7 @@ fn stash_data(
     stashed: &mut usize,
     cap: usize,
 ) -> Result<()> {
-    loop {
+    for _ in 0..DRAIN_BATCH {
         match sock.recv(buf) {
             Ok(n) => {
                 stash.push_back(buf[..n].to_vec());
@@ -587,6 +601,7 @@ fn stash_data(
             Err(e) => return Err(e).context("ka9q-radio: data socket"),
         }
     }
+    Ok(())
 }
 
 fn wait_for_status(
@@ -815,6 +830,28 @@ mod tests {
             e.kind(),
             ErrorKind::WouldBlock,
             "the socket must be drained"
+        );
+    }
+
+    /// One call takes at most `DRAIN_BATCH` datagrams, so a flood that keeps
+    /// the socket readable cannot keep `wait_for_status` from its deadline.
+    #[test]
+    fn stash_takes_at_most_one_batch_per_call() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for _ in 0..DRAIN_BATCH + 20 {
+            tx.send_to(&[1; 8], rx.local_addr().unwrap()).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let mut buf = vec![0u8; RECV_BUF_LEN];
+        let mut stash = VecDeque::new();
+        let mut stashed = 0;
+        stash_data(&rx, &mut buf, &mut stash, &mut stashed, RCVBUF_BYTES).unwrap();
+        assert_eq!(stash.len(), DRAIN_BATCH);
+        assert!(
+            rx.recv(&mut buf).is_ok(),
+            "the rest is left for the next pass"
         );
     }
 
@@ -1383,6 +1420,50 @@ mod tests {
             assert_eq!(src.read(&mut one).unwrap(), 1);
             assert_eq!(src.queue.len(), 62 + 128, "waiting packets must be drained");
             assert_eq!(src.counters.gaps_detected(), 0);
+        }
+
+        /// A status flood (here another channel's statuses) is drained one
+        /// `DRAIN_BATCH` per `read` pass, so it cannot starve RTP and the
+        /// stall deadline.
+        #[test]
+        fn status_draining_takes_at_most_one_batch_per_pass() {
+            let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
+            let mut src = Ka9qIqSource::open(f.config(Some(SSRC))).unwrap();
+            let other = wire::encode_status_packet(&channel(SSRC + 1, 7e6));
+            for _ in 0..DRAIN_BATCH + 20 {
+                f.tx.send_to(&other, SocketAddrV4::new(f.group, f.status_port))
+                    .unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            src.drain_status().unwrap();
+            let mut buf = vec![0u8; RECV_BUF_LEN];
+            assert!(
+                src.status_sock.recv(&mut buf).is_ok(),
+                "the rest is left for the next pass"
+            );
+        }
+
+        /// Foreign-SSRC packets never fill the queue toward its cap, so the
+        /// drain while queued samples remain is bounded by `DRAIN_BATCH`.
+        #[test]
+        fn rtp_draining_while_samples_are_queued_takes_at_most_one_batch() {
+            let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
+            let mut src = Ka9qIqSource::open(f.config(Some(SSRC))).unwrap();
+            let mut one = [Complex32::new(0.0, 0.0); 1];
+            f.send_rtp(SSRC, 1, Encoding::F32Le, &ramp(64, 0));
+            assert_eq!(src.read(&mut one).unwrap(), 1);
+            for k in 0..DRAIN_BATCH + 20 {
+                f.send_rtp(SSRC + 1, k as u16, Encoding::F32Le, &ramp(8, k));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            src.drain_ready_rtp().unwrap();
+            assert_eq!(src.queue.len(), 63);
+            src.data.set_nonblocking(true).unwrap();
+            let mut buf = vec![0u8; RECV_BUF_LEN];
+            assert!(
+                src.data.recv(&mut buf).is_ok(),
+                "the rest is left for the next pass"
+            );
         }
 
         #[test]
