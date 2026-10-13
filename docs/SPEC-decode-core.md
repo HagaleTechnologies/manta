@@ -1348,12 +1348,13 @@ flush_gap_dits = 7.0
 #   kiwi:  host*, freq_hz*, port, password
 #   soapy: driver*, freq_hz*, rate_hz*, gain_db   (build with --features soapy)
 #   hpsdr: host*, freq_hz*, rate_hz*, port        (build with --features hpsdr)
+#   ka9q:  group*, port, ssrc, interface
 # Any source flag on the command line (--device, --source, --kiwi-host,
-# --soapy-driver, --hpsdr-host) replaces a typed [input] table whole,
-# its shared keys below included. Example:
-# type = "kiwi"               # audio | file | kiwi | soapy | hpsdr
+# --soapy-driver, --hpsdr-host, --ka9q-group) replaces a typed [input]
+# table whole, its shared keys below included. Example:
+# type = "kiwi"               # audio | file | kiwi | soapy | hpsdr | ka9q
 # host = "<your-kiwi-host>"   # kiwi, hpsdr
-# port = 8073                 # kiwi (default 8073), hpsdr (default 1024)
+# port = 8073                 # kiwi (default 8073), hpsdr (default 1024), ka9q (default 5004)
 # freq_hz = 7030000.0         # kiwi, soapy, hpsdr: RF center frequency, Hz
 # password = ""               # kiwi (default "")
 # The other types' keys:
@@ -1365,6 +1366,9 @@ flush_gap_dits = 7.0
 # driver = "driver=rtlsdr"    # soapy: SoapySDR device args
 # rate_hz = 192000.0          # soapy, hpsdr: sample rate, Hz
 # gain_db = 30.0              # soapy: omit for the device's AGC
+# group = "239.101.6.1"       # ka9q: the radiod channel's multicast data group, IPv4 address or host name (--ka9q-group)
+# ssrc = 14100000             # ka9q: the channel's SSRC, 0 to 4294967295; omit when the group carries one channel (--ka9q-ssrc)
+# interface = "192.168.1.20"  # ka9q: local IPv4 address to join the group on; omit for the kernel's choice (127.0.0.1 is always joined too) (--ka9q-interface)
 
 # Shared keys, valid with any type or none:
 

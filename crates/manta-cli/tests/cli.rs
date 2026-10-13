@@ -1692,6 +1692,98 @@ fn hpsdr_host_conflicts_with_kiwi_host() {
     );
 }
 
+/// MAN-140: `--ka9q-group` is a source selector like the others, so naming
+/// another source with it is clap's conflict error (exit 2), before any I/O.
+#[test]
+fn ka9q_group_conflicts_with_every_other_source_flag() {
+    #[allow(unused_mut)]
+    let mut others: Vec<Vec<&str>> = vec![
+        vec!["--kiwi-host", "x", "--kiwi-freq-hz", "7030000"],
+        vec!["--device", "USB Audio"],
+        vec!["--source", "v1.wav"],
+    ];
+    #[cfg(feature = "hpsdr")]
+    others.push(vec![
+        "--hpsdr-host",
+        "192.168.1.100",
+        "--hpsdr-freq-hz",
+        "14000000",
+        "--hpsdr-rate-hz",
+        "192000",
+    ]);
+    #[cfg(feature = "soapy")]
+    others.push(vec![
+        "--soapy-driver",
+        "driver=rtlsdr",
+        "--soapy-freq-hz",
+        "14000000",
+        "--soapy-rate-hz",
+        "192000",
+    ]);
+    for other in &others {
+        for order in [true, false] {
+            let mut args = vec!["run"];
+            if order {
+                args.extend(["--ka9q-group", "239.1.2.3"]);
+                args.extend(other.iter().copied());
+            } else {
+                args.extend(other.iter().copied());
+                args.extend(["--ka9q-group", "239.1.2.3"]);
+            }
+            let out = manta().args(&args).output().unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+            assert!(
+                stderr.contains("cannot be used with"),
+                "{args:?}: expected a clap conflict error, got: {stderr}"
+            );
+        }
+    }
+}
+
+/// MAN-140: `--ka9q-port`, `--ka9q-ssrc` and `--ka9q-interface` describe the
+/// group's channel, so each needs `--ka9q-group`.
+#[test]
+fn ka9q_port_ssrc_interface_require_the_group() {
+    for (flag, value) in [
+        ("--ka9q-port", "5004"),
+        ("--ka9q-ssrc", "14100000"),
+        ("--ka9q-interface", "192.168.1.20"),
+    ] {
+        let out = manta().args(["run", flag, value]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{flag}: {stderr}");
+        assert!(
+            stderr.contains("the following required arguments were not provided")
+                && stderr.contains("--ka9q-group"),
+            "{flag}: expected clap's missing --ka9q-group error, got: {stderr}"
+        );
+    }
+}
+
+/// MAN-140: every command that opens a live source takes the four
+/// `--ka9q-*` flags under their own help heading (`listen` is `run`'s alias).
+#[test]
+fn every_live_command_takes_the_ka9q_flags() {
+    for command in ["run", "listen", "soak", "doctor", "calibrate", "check"] {
+        let out = manta().args([command, "--help"]).output().unwrap();
+        assert!(out.status.success(), "{command} --help failed");
+        let help = String::from_utf8_lossy(&out.stdout);
+        for needle in [
+            "ka9q-radio source:",
+            "--ka9q-group <KA9Q_GROUP>",
+            "--ka9q-port <KA9Q_PORT>",
+            "--ka9q-ssrc <KA9Q_SSRC>",
+            "--ka9q-interface <KA9Q_INTERFACE>",
+        ] {
+            assert!(
+                help.contains(needle),
+                "`manta {command} --help` lacks {needle:?}:\n{help}"
+            );
+        }
+    }
+}
+
 /// MAN-135 renamed the Hz-valued flags to a consistent `-hz` suffix and
 /// kept the old spellings as hidden aliases. Anyone's existing scripts
 /// and systemd units must keep working; this test is what says so.
