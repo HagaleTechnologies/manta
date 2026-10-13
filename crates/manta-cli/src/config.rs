@@ -84,6 +84,7 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("spot", "cty_path"),
     ("spot", "scp_path"),
     ("decode", "engine"),
+    ("detector", "crash_filter"),
 ];
 
 /// Whether `load` applies the `MANTA_*` overlay. `decode`/`oracle` pass
@@ -1035,6 +1036,23 @@ mod tests {
     fn detector_table_reaches_loaded() {
         let loaded = load_file("[detector]\non_snr_db = 20.0\n").unwrap();
         assert_eq!(loaded.detector.on_snr_db, 20.0);
+    }
+
+    /// MAN-312: `crash_filter` is string-typed, so `MANTA_DETECTOR_CRASH_FILTER=off`
+    /// reaches the loader as the string `"off"` and beats the file.
+    #[test]
+    fn env_crash_filter_overrides_the_file() {
+        let loaded = load_file("[detector]\ncrash_filter = \"starts-only\"\n").unwrap();
+        assert_eq!(
+            loaded.detector.crash_filter,
+            manta_engine::CrashFilter::StartsOnly
+        );
+        let loaded = load_env(
+            Some("[detector]\ncrash_filter = \"starts-only\"\n"),
+            &[("MANTA_DETECTOR_CRASH_FILTER", "off")],
+        )
+        .unwrap();
+        assert_eq!(loaded.detector.crash_filter, manta_engine::CrashFilter::Off);
     }
 
     #[test]

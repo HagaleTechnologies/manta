@@ -823,6 +823,7 @@ fn spec_detector_values_equal_the_code_defaults() {
         "warmup_ms",
         "track_cap",
         "silent_respawn_cooldown_ms",
+        "crash_filter",
         "rtty_filter",
         "rtty_dwell_ms",
     ] {

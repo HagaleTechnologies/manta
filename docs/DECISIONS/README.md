@@ -11,7 +11,11 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+<<<<<<< HEAD
 | 2026-10-13 | MAN-140 | [MAN-140: a ka9q-radio (radiod) multicast IQ input](2026-10-13-man140-ka9q-radio-input.md) |
+=======
+| 2026-10-13 | MAN-312 | [MAN-312: band-wide static crashes start no tracks and are not decoded](2026-10-13-man312-static-crash-filter.md) |
+>>>>>>> d286147e2baff020ede5d4e8002d9d4a9659371f
 | 2026-10-12 | MAN-129 | [MAN-129: a shipped Grafana dashboard and Prometheus alert rules](2026-10-12-man129-dashboard-and-alerts.md) |
 | 2026-10-12 | MAN-118 | [MAN-118: decode-quality signals on `/metrics`](2026-10-12-man118-decode-quality-metrics.md) |
 | 2026-10-11 | MAN-314 | [MAN-314: RTTY recognition keeps RTTY out of CW tracks](2026-10-11-man314-rtty-recognition.md) |

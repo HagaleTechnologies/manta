@@ -24,6 +24,9 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- A band-wide static crash (lightning) no longer starts tracks across the
+  band, and running tracks no longer decode it as extra dits; new
+  `[detector].crash_filter`, default `"full"` (MAN-312).
 - MAN-314: RTTY (two-tone FSK, 170/200/425/450/850 Hz shift) is recognised
   after 20 s and no CW track starts on it or its keying sidebands; open
   tracks on it close (`rtty` close count). `[detector] rtty_filter = false`
@@ -31,6 +34,8 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- `manta_static_crashes_total` metric; `[detector].crash_filter`
+  (`full`/`starts-only`/`off`) (MAN-312).
 - `[detector] rtty_filter`/`rtty_dwell_ms`; `manta_rtty_signals{band}`
   gauge; `rtty` array in `decode --json` and, when RTTY was marked, an
   `rtty:` line in plain `decode`; `RTTY marked`/`RTTY cleared` log lines in

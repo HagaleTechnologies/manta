@@ -309,6 +309,15 @@ impl IqSource for LoopingAudioIqSource {
         0.0 // audio has no RF reference, matches AudioIqSource
     }
 
+    // MAN-312: matches AudioIqSource, so `soak_with_metrics` judges static
+    // crashes over the same rig-audio passband `manta run` does.
+    fn rf_passband_hz(&self) -> (f64, f64) {
+        (
+            manta_input::AUDIO_PASSBAND_LO_HZ,
+            manta_input::AUDIO_PASSBAND_HI_HZ,
+        )
+    }
+
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
         let mut real = vec![0.0f32; buf.len()];
         let mut filled = 0;
@@ -445,6 +454,7 @@ fn main() -> Result<()> {
                 "evicted": s.close_counts.evicted,
                 "rtty": s.close_counts.rtty,
             },
+            "static_crashes": s.static_crashes,
         });
         let text = match serde_json::to_string(&line) {
             Ok(t) => t,
@@ -569,6 +579,7 @@ fn main() -> Result<()> {
             "evicted": report.final_close_counts.evicted,
             "rtty": report.final_close_counts.rtty,
         },
+        "static_crashes": report.final_static_crashes,
         "man19_criteria": {
             "no_crash": no_crash,
             "no_input_overrun_by_construction": no_input_overrun,

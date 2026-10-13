@@ -153,6 +153,11 @@ pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
     reported_healthy: bool,
     fs: f64,
     center_freq_hz: f64,
+    /// MAN-312: the first connection's `rf_passband_hz`, reported through
+    /// outages like `fs`/`center_freq_hz`, so `listen`'s static-crash
+    /// detector judges the real passband (a KiwiSDR's ±5 kHz, rig audio's
+    /// one-sided band) rather than the trait's full-Nyquist default.
+    rf_passband_hz: (f64, f64),
     backoff: Duration,
     /// Whether the current `inner` has returned at least one real sample
     /// since it was (re)opened -- decides `Disconnected` vs
@@ -205,6 +210,7 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
         on_health(initial_healthy);
         let fs = first.sample_rate();
         let center_freq_hz = first.center_freq_hz();
+        let rf_passband_hz = first.rf_passband_hz();
         let last_ok = env.now();
         let input_health = InputHealthTotals::for_source(first.as_ref());
         ReconnectingSource {
@@ -217,6 +223,7 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
             reported_healthy: initial_healthy,
             fs,
             center_freq_hz,
+            rf_passband_hz,
             backoff: INITIAL_BACKOFF,
             productive: false,
             reopened: false,
@@ -249,6 +256,10 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
 
     fn center_freq_hz(&self) -> f64 {
         self.center_freq_hz
+    }
+
+    fn rf_passband_hz(&self) -> (f64, f64) {
+        self.rf_passband_hz
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {
@@ -488,6 +499,40 @@ mod tests {
 
     fn buf(n: usize) -> Vec<Complex32> {
         vec![Complex32::new(0.0, 0.0); n]
+    }
+
+    /// MAN-312: the wrapper reports the wrapped source's passband, not the
+    /// trait's full-Nyquist default.
+    #[test]
+    fn reports_the_first_sources_rf_passband() {
+        struct Narrow(ScriptedSource);
+        impl IqSource for Narrow {
+            fn sample_rate(&self) -> f64 {
+                self.0.sample_rate()
+            }
+            fn center_freq_hz(&self) -> f64 {
+                self.0.center_freq_hz()
+            }
+            fn rf_passband_hz(&self) -> (f64, f64) {
+                (-5000.0, 5000.0)
+            }
+            fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {
+                self.0.read(buf)
+            }
+        }
+        let first = Narrow(scripted(FS, CENTER, vec![ok_chunk(8)]));
+        let (opener, _calls) = opener_from(VecDeque::new());
+        let (health, _log) = health_recorder();
+        let src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            FakeEnv::new(),
+        );
+        assert_eq!(src.rf_passband_hz(), (-5000.0, 5000.0));
     }
 
     #[test]
