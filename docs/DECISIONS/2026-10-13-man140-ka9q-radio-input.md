@@ -125,10 +125,16 @@ every join failing. Request a 4 MiB `SO_RCVBUF` and accept a smaller grant; the
 guide tells operators to raise `net.core.rmem_max`, since Linux grants 416 KiB
 by default. One reused 64 KiB receive buffer, for HPSDR's `RECV_BUF_LEN`
 reason. While `open` waits for status it also drains the data socket —
-non-blocking, once per wait round — into an app-side stash of up to the same
-4 MiB (past that the drain stops and the kernel's own keep-the-oldest rule
-applies), and replays the stash through `accept_rtp` once the channel is
-chosen (added in PR review round 3: without the drain, a grant smaller than
+non-blocking, to empty, between status receives that wait at most 10 ms
+(`WAIT_POLL`) — into an app-side stash that keeps the newest 4 MiB, dropping
+its own oldest packets past that, and replays the stash through `accept_rtp`
+once the channel is chosen. The drain never stops, so no `validate`-accepted
+rate can overflow the kernel during the wait (Linux's default grant holds
+~70 ms of 768 kS/s `f32le`), and keeping the newest packets means the replay
+runs straight into the socket's next packet with no gap; only how much
+startup history is kept is bounded (PR review round 4 replaced a stash that
+stopped draining at 4 MiB, which a 768 kS/s channel overflows in the 1.5 s
+settle window). (Added in PR review round 3: without the drain, a grant smaller than
 the no-SSRC settle window overflows while nothing reads the socket — Linux's
 default holds ~0.17 s at 192 kS/s `f32` against a 1.5 s window — and the
 first `read` reports the loss as a startup gap). The sockets still join
@@ -171,12 +177,14 @@ source does not override `take_discontinuity()`.
 
 **D13 — A retune or format change ends `read()`.** If the channel's status
 reports a different frequency (by more than 1 mHz), rate, encoding, channel
-count, payload type, envelope setting or independent-sideband setting than at
+count, payload type, envelope setting, independent-sideband setting or filter
+edges (by more than 1 mHz, compared only when both statuses carry usable
+edges, so D14's passband never goes stale) than at
 open (an absent envelope/ISB tag counts as off, as at open, because a switch
 to those modes keeps the channel count and payload type while the second
 component stops being Q), `read()` returns an error naming the old and
-new values. `ReconnectingSource` reopens; if the frequency or rate
-differs, its existing check ends the run with exit 1, and a supervisor
+new values. `ReconnectingSource` reopens; if the frequency, rate or
+passband differs, its check ends the run with exit 1, and a supervisor
 (systemd `Restart=always`, Compose `restart: unless-stopped`) starts it again
 at the new frequency. Following a retune live would mean changing the centre
 frequency under the running engine, SpotBus and SETT, which nothing supports.

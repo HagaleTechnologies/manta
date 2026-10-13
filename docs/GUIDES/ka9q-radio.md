@@ -255,9 +255,9 @@ echo 'net.core.rmem_max = 4194304' | sudo tee /etc/sysctl.d/90-manta-ka9q.conf
 
 Restart manta afterwards; it asks for the buffer when it opens the channel.
 (While `open` waits for the channel's status manta also drains the socket
-itself, into a stash of up to 4 MiB, so the 1.5 s no-`ssrc` settle window
-does not by itself overflow the default grant; the raised limit is about
-steady-state reading.)
+itself, every 10 ms, into a stash that keeps the newest 4 MiB, so the 1.5 s
+no-`ssrc` settle window does not overflow the default grant at any rate manta
+accepts; the raised limit is about steady-state reading.)
 Lost packets show on manta's [metrics endpoint](../METRICS.md) as
 `manta_input_dropped_packets_total{source="ka9q"}`, counted from RTP sequence
 numbers, and `manta_input_gaps_detected_total{source="ka9q"}`:
@@ -313,7 +313,9 @@ new frequency: the systemd unit (`Restart=always`, after 10 s) in
 `restart: unless-stopped`. A stream that stops for 10 s is a different case:
 manta logs `source ka9q lost: ka9q-radio stream stalled: ...` and reconnects,
 waiting 1 s at first and up to 60 s, until radiod is back. A change of encoding
-alone reopens cleanly.
+alone reopens cleanly. Changing the channel's `low` or `high` filter edge ends
+the run the same way as a retune (`reopened with a different passband`), since
+manta decodes and reports only the passband it opened with.
 
 ## 10. Choose an encoding
 

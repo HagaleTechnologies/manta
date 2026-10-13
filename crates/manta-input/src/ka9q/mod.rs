@@ -33,6 +33,13 @@ use wire::{ChannelStatus, Encoding, SeqObservation, SeqTracker};
 /// feature-gated and must not become a dependency of this module.
 const READ_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// The status socket's receive timeout while `open` waits for status. The
+/// data socket is drained between status receives, so this bounds how long
+/// RTP queues unread in the kernel during the wait: Linux's default 416 KiB
+/// grant holds ~70 ms of a 768 kS/s `f32le` channel, so 250 ms would let it
+/// overflow between drains.
+const WAIT_POLL: Duration = Duration::from_millis(10);
+
 /// One reused receive buffer sized to the largest UDP payload, so `recv`
 /// can never truncate a datagram (HPSDR's `RECV_BUF_LEN` reasoning).
 const RECV_BUF_LEN: usize = 65536;
@@ -304,6 +311,14 @@ fn validate(s: &ChannelStatus, port: u16) -> Result<Encoding> {
     Ok(enc)
 }
 
+/// A status's filter edges when both are present, finite and ordered.
+fn usable_edges(s: &ChannelStatus) -> Option<(f64, f64)> {
+    match (s.low_edge_hz, s.high_edge_hz) {
+        (Some(lo), Some(hi)) if lo.is_finite() && hi.is_finite() && lo < hi => Some((lo, hi)),
+        _ => None,
+    }
+}
+
 /// One radiod IQ channel as an [`IqSource`].
 pub struct Ka9qIqSource {
     data: UdpSocket,
@@ -424,6 +439,16 @@ impl Ka9qIqSource {
             old.rtp_pt.map(|p| p.to_string()),
             s.rtp_pt.map(|p| p.to_string()),
         )?;
+        // D14: `rf_passband_hz` is the open-time filter, so a live edge
+        // change would leave it (and everything built on it) stale. Only
+        // compared when both statuses carry usable edges, as at open.
+        if let (Some((lo0, hi0)), Some((lo1, hi1))) = (usable_edges(old), usable_edges(s)) {
+            if (lo1 - lo0).abs() > 1e-3 || (hi1 - hi0).abs() > 1e-3 {
+                bail!(
+                    "ka9q-radio channel ssrc {ssrc} changed its filter edges from {lo0} .. {hi0} Hz to {lo1} .. {hi1} Hz"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -486,23 +511,28 @@ impl Ka9qIqSource {
 /// Drains the data socket into `stash` while `open` waits for status, so
 /// the kernel's receive buffer cannot overflow while nothing reads it: on
 /// Linux's default grant it holds only ~0.17 s of 192 kS/s `f32` IQ, less
-/// than the 1.5 s no-SSRC settle window. Everything that arrived is kept,
-/// in arrival order, up to `RCVBUF_BYTES` in total (the same bound the
-/// source asks the kernel for, plus the one datagram that exhausts it);
-/// past that the drain stops and the kernel's own rule (keep the oldest,
-/// drop the newest) applies as it would without the stash. `open` replays
-/// the stash through `accept_rtp` once the channel is chosen.
+/// than the 1.5 s no-SSRC settle window. It always drains the socket to
+/// empty. The stash keeps the newest `cap` bytes (plus the datagram that
+/// crosses it), dropping its own oldest packets past that, so a fast
+/// channel never overflows the kernel and the replay in `open` runs
+/// straight into the socket's next packet with no gap. `open` replays the
+/// stash through `accept_rtp` once the channel is chosen.
 fn stash_data(
     sock: &UdpSocket,
     buf: &mut [u8],
-    stash: &mut Vec<Vec<u8>>,
-    budget: &mut usize,
+    stash: &mut VecDeque<Vec<u8>>,
+    stashed: &mut usize,
+    cap: usize,
 ) -> Result<()> {
-    while *budget > 0 {
+    loop {
         match sock.recv(buf) {
             Ok(n) => {
-                *budget -= (*budget).min(n);
-                stash.push(buf[..n].to_vec());
+                stash.push_back(buf[..n].to_vec());
+                *stashed += n;
+                while *stashed > cap && stash.len() > 1 {
+                    let old = stash.pop_front().expect("len > 1");
+                    *stashed -= old.len();
+                }
             }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 return Ok(())
@@ -510,21 +540,22 @@ fn stash_data(
             Err(e) => return Err(e).context("ka9q-radio: data socket"),
         }
     }
-    Ok(())
 }
 
 fn wait_for_status(
     sock: &UdpSocket,
     data: &UdpSocket,
     cfg: &Ka9qConfig,
-) -> Result<(ChannelStatus, Vec<Vec<u8>>)> {
+) -> Result<(ChannelStatus, VecDeque<Vec<u8>>)> {
     let start = Instant::now();
+    sock.set_read_timeout(Some(WAIT_POLL))
+        .context("ka9q-radio: set status wait timeout")?;
     let mut seen: BTreeMap<u32, ChannelStatus> = BTreeMap::new();
     let mut more = false;
     let mut first_at: Option<Instant> = None;
     let mut buf = vec![0u8; RECV_BUF_LEN];
-    let mut stash: Vec<Vec<u8>> = Vec::new();
-    let mut budget: usize = RCVBUF_BYTES;
+    let mut stash: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut stashed: usize = 0;
     loop {
         if let (None, Some(t)) = (cfg.ssrc, first_at) {
             if t.elapsed() >= cfg.settle {
@@ -534,7 +565,7 @@ fn wait_for_status(
         if start.elapsed() >= cfg.open_timeout {
             break;
         }
-        stash_data(data, &mut buf, &mut stash, &mut budget)?;
+        stash_data(data, &mut buf, &mut stash, &mut stashed, RCVBUF_BYTES)?;
         match sock.recv(&mut buf) {
             Ok(n) => {
                 let Ok(Some(s)) = wire::parse_status_packet(&buf[..n]) else {
@@ -611,8 +642,8 @@ impl IqSource for Ka9qIqSource {
     /// D14: the channel's filter edges, clamped to the Nyquist span.
     fn rf_passband_hz(&self) -> (f64, f64) {
         let half = self.fs / 2.0;
-        match (self.status.low_edge_hz, self.status.high_edge_hz) {
-            (Some(lo), Some(hi)) if lo.is_finite() && hi.is_finite() && lo < hi => {
+        match usable_edges(&self.status) {
+            Some((lo, hi)) => {
                 let (lo, hi) = (lo.max(-half), hi.min(half));
                 if lo < hi {
                     (lo, hi)
@@ -706,6 +737,33 @@ mod tests {
         let e = check_joins(Some(eth), &[(eth, fail()), (lo, Ok(()))]).unwrap_err();
         assert!(e.contains("192.168.1.20"), "{e}");
         assert!(check_joins(Some(eth), &[(eth, Ok(())), (lo, fail())]).is_ok());
+    }
+
+    /// The stash never stops draining: past its cap it drops its own
+    /// oldest packets and leaves the socket empty, so a fast channel
+    /// cannot overflow the kernel during the status wait.
+    #[test]
+    fn stash_keeps_the_newest_packets_and_drains_the_socket_past_its_cap() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for i in 0..10u8 {
+            tx.send_to(&[i; 100], rx.local_addr().unwrap()).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let mut buf = vec![0u8; RECV_BUF_LEN];
+        let mut stash = VecDeque::new();
+        let mut stashed = 0;
+        stash_data(&rx, &mut buf, &mut stash, &mut stashed, 300).unwrap();
+        let kept: Vec<u8> = stash.iter().map(|p| p[0]).collect();
+        assert_eq!(kept, vec![7, 8, 9]);
+        assert_eq!(stashed, 300);
+        let e = rx.recv(&mut buf).unwrap_err();
+        assert_eq!(
+            e.kind(),
+            ErrorKind::WouldBlock,
+            "the socket must be drained"
+        );
     }
 
     #[test]
@@ -1234,6 +1292,34 @@ mod tests {
             let mut buf = vec![Complex32::new(0.0, 0.0); 64];
             let e = format!("{:#}", src.read(&mut buf).err().unwrap());
             assert!(e.contains("retuned from 14000.0 kHz to 14050.0 kHz"), "{e}");
+        }
+
+        #[test]
+        fn a_filter_edge_change_in_the_status_ends_read() {
+            let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
+            let mut src = Ka9qIqSource::open(f.config(Some(SSRC))).unwrap();
+            assert_eq!(src.rf_passband_hz(), (-45_000.0, 45_000.0));
+            f.statuses.lock().unwrap()[0].high_edge_hz = Some(30_000.0);
+            std::thread::sleep(Duration::from_millis(250));
+            let mut buf = vec![Complex32::new(0.0, 0.0); 64];
+            let e = format!("{:#}", src.read(&mut buf).err().unwrap());
+            assert!(
+                e.contains(
+                    "changed its filter edges from -45000 .. 45000 Hz to -45000 .. 30000 Hz"
+                ),
+                "{e}"
+            );
+        }
+
+        #[test]
+        fn a_status_without_usable_edges_does_not_end_read() {
+            let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
+            let mut src = Ka9qIqSource::open(f.config(Some(SSRC))).unwrap();
+            f.statuses.lock().unwrap()[0].low_edge_hz = None;
+            std::thread::sleep(Duration::from_millis(250));
+            f.send_rtp(SSRC, 1, Encoding::F32Le, &ramp(64, 0));
+            let mut buf = vec![Complex32::new(0.0, 0.0); 64];
+            assert!(src.read(&mut buf).unwrap() > 0);
         }
 
         #[test]
