@@ -45,8 +45,12 @@ Run the core checks before requesting review:
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --locked
 cargo test --workspace --locked
 ```
+
+In `manta-cli`, `///` comments are `--help` and man-page text, so write
+them plainly; that crate is exempt from rustdoc's link and HTML lints.
 
 These mirror the core Rust checks in
 [CI](.github/workflows/ci-full.yml). CI also runs release, packaging and
@@ -54,6 +58,14 @@ workflow checks and tests other platforms. Consult the workflow for those
 commands when changing the corresponding files. Keep Cargo.lock committed;
 do not drop `--locked` from verification to hide dependency drift. If you
 intentionally change dependencies, regenerate and review the lockfile.
+
+A change to `Cargo.lock`, any `Cargo.toml` or [deny.toml](deny.toml) is
+checked by the "Supply Chain" CI job with `cargo deny --locked check`
+(advisories, licenses, bans and sources). To run it locally, install the
+version [the workflow](.github/workflows/supply-chain.yml) pins:
+`cargo install cargo-deny --locked --version 0.20.2`. A failing advisory or
+license goes to an `ignore` or `allow` entry with a reason in `deny.toml`,
+which the code owner reviews.
 
 For changes affecting HPSDR, also run:
 
@@ -116,6 +128,12 @@ passing required CI. Describe the problem, the resulting behavior and the
 checks you ran. Use the PR template to link the MAN ticket or public issue.
 Mark a draft ready when it is ready for review; a draft from a trusted
 in-repository author does not receive the normal CI run until then.
+
+Squash merge makes the PR title the commit subject on main, so the title
+must read `<type>(<scope>): <subject>`, with type one of `build`, `chore`,
+`ci`, `docs`, `feat`, `fix`, `perf`, `refactor`, `revert`, `style` or
+`test`; the scope is optional. The `PR title` check enforces it and re-runs
+when the title is edited.
 
 The [review convergence policy](docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md)
 applies across human and automated reviews:
