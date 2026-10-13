@@ -258,9 +258,6 @@ impl SupportLedger {
         best
     }
 
-    /// Drops every recorded observation for `track_id`. Mirrors
-    /// `RepetitionGate::forget_track` (MAN-19) -- without this, `seen`'s
-    /// key space grows forever under sustained track churn.
     /// MAN-324: every text observed on `track_id` with at least one
     /// message of support inside the window ending at `now`, strongest
     /// first (`Support::strictly_better_than`), ties by text ascending.
@@ -292,6 +289,9 @@ impl SupportLedger {
         out
     }
 
+    /// Drops every recorded observation for `track_id`. Mirrors
+    /// `RepetitionGate::forget_track` (MAN-19) -- without this, `seen`'s
+    /// key space grows forever under sustained track churn.
     pub fn forget_track(&mut self, track_id: u32) {
         let keys: Vec<(u32, String)> = self
             .seen
