@@ -57,6 +57,17 @@ const SEQ_WINDOW_S: f64 = 10.0;
 /// of zero-length or tiny datagrams cannot grow the stash without bound.
 const STASH_PACKET_OVERHEAD: usize = 64;
 
+/// How many seconds of samples `read` lets queue up, on top of the largest
+/// possible startup stash replay, while it still has samples to return:
+/// past that it stops draining the socket and the kernel's own overflow
+/// rule applies, so a reader slower than real time cannot grow the queue
+/// without bound.
+const QUEUE_CAP_S: f64 = 3.0;
+
+/// The most samples the startup stash can replay: its byte cap at the
+/// smallest IQ sample (4 bytes, `s16`/`f16`).
+const STASH_MAX_SAMPLES: usize = RCVBUF_BYTES / 4;
+
 /// The most channels `open` remembers while choosing one (D7), so status
 /// packets with ever-new SSRCs from a host on the group cannot grow memory
 /// for the whole open wait.
@@ -473,6 +484,36 @@ impl Ka9qIqSource {
         }
     }
 
+    /// Accepts every RTP packet already waiting in the socket without
+    /// blocking, up to the replay plus `QUEUE_CAP_S` seconds of samples.
+    fn drain_ready_rtp(&mut self) -> Result<()> {
+        let cap = STASH_MAX_SAMPLES + (self.fs * QUEUE_CAP_S) as usize;
+        if self.queue.len() >= cap {
+            return Ok(());
+        }
+        self.data
+            .set_nonblocking(true)
+            .context("ka9q-radio: set data socket non-blocking")?;
+        let res = loop {
+            match self.data.recv(&mut self.recv_buf) {
+                Ok(n) => {
+                    self.accept_rtp(n);
+                    if self.queue.len() >= cap {
+                        break Ok(());
+                    }
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    break Ok(())
+                }
+                Err(e) => break Err(e).context("ka9q-radio: data socket"),
+            }
+        };
+        self.data
+            .set_nonblocking(false)
+            .context("ka9q-radio: restore data socket blocking mode")?;
+        res
+    }
+
     fn accept_rtp(&mut self, n: usize) {
         let Ok((h, payload)) = wire::parse_rtp(&self.recv_buf[..n]) else {
             self.counters.record_malformed();
@@ -668,6 +709,10 @@ impl IqSource for Ka9qIqSource {
         loop {
             self.drain_status()?;
             if !self.queue.is_empty() {
+                // Keep receiving while queued samples (above all the
+                // startup stash replay) are returned, so the kernel's
+                // grant does not overflow before the queue empties.
+                self.drain_ready_rtp()?;
                 let n = buf.len().min(self.queue.len());
                 for (dst, src) in buf.iter_mut().zip(self.queue.drain(..n)) {
                     *dst = src;
@@ -1319,6 +1364,25 @@ mod tests {
             let mut buf = vec![Complex32::new(0.0, 0.0); 64];
             let e = format!("{:#}", src.read(&mut buf).err().unwrap());
             assert!(e.contains("retuned from 14000.0 kHz to 14050.0 kHz"), "{e}");
+        }
+
+        /// While queued samples remain (the startup stash replay), `read`
+        /// still drains packets already waiting in the socket, so the
+        /// kernel's grant cannot overflow before the queue empties.
+        #[test]
+        fn read_keeps_receiving_while_it_returns_queued_samples() {
+            let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
+            let mut src = Ka9qIqSource::open(f.config(Some(SSRC))).unwrap();
+            let mut one = [Complex32::new(0.0, 0.0); 1];
+            f.send_rtp(SSRC, 1, Encoding::F32Le, &ramp(64, 0));
+            assert_eq!(src.read(&mut one).unwrap(), 1);
+            assert_eq!(src.queue.len(), 63);
+            f.send_rtp(SSRC, 2, Encoding::F32Le, &ramp(64, 1));
+            f.send_rtp(SSRC, 3, Encoding::F32Le, &ramp(64, 2));
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(src.read(&mut one).unwrap(), 1);
+            assert_eq!(src.queue.len(), 62 + 128, "waiting packets must be drained");
+            assert_eq!(src.counters.gaps_detected(), 0);
         }
 
         #[test]

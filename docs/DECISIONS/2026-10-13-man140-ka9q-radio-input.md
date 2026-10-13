@@ -145,7 +145,12 @@ open order requires; the stash extends that queueing past the kernel grant.
 **D10 — Read path.** Pull-based, no thread. Each `read()` first drains the
 non-blocking status socket, then blocks on the data socket with a 250 ms
 timeout until its channel's queue has samples, then returns what is queued
-(HPSDR's shape). A wall-clock stall deadline, 10 s since the channel's last
+(HPSDR's shape). While the queue still holds samples — above all the startup
+stash replay, up to 1.5 s of samples — each `read()` also accepts every packet
+already waiting in the data socket without blocking, up to the largest
+possible replay (4 MiB of 4-byte samples) plus 3 s of samples (`QUEUE_CAP_S`), so the kernel's grant (~0.27 s at 192 kS/s `f32`)
+cannot overflow while the replay is consumed; past the cap the kernel's own
+overflow rule applies, so a reader slower than real time cannot grow memory. A wall-clock stall deadline, 10 s since the channel's last
 accepted packet, turns silence, or a flood of other channels' or malformed
 traffic, into an error. A count bound alone would never fire under a
 continuous foreign flood.
