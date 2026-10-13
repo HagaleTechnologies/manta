@@ -92,7 +92,8 @@ Releases page, check them as
 shows, unzip, and run `.\manta.exe --version` in the unpacked folder.
 
 Each archive holds the binary, this README, both licence files, an example
-config and the kit for running manta as a service
+config, the man pages (see [Tab completion and man pages](#tab-completion-and-man-pages))
+and the kit for running manta as a service
 ([packaging/README.md](packaging/README.md)). Release binaries read
 KiwiSDR, HPSDR, audio and WAV input; SoapySDR needs a build from source.
 Linux binaries need the ALSA runtime library (`libasound2`, see the notes
@@ -133,6 +134,37 @@ Each release also publishes a multi-arch image (`linux/amd64`,
 ```sh
 docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
 ```
+
+### Tab completion and man pages
+
+`manta completions <shell>` prints a tab-completion script for `bash`,
+`zsh`, `fish`, `powershell` or `elvish`. Load it from your shell's startup
+file:
+
+| Shell | Where | What to add or run |
+|---|---|---|
+| bash | `~/.bashrc` | `eval "$(manta completions bash)"` |
+| zsh | `~/.zshrc`, after `autoload -Uz compinit && compinit` | `eval "$(manta completions zsh)"` |
+| fish | run once | `manta completions fish > ~/.config/fish/completions/manta.fish` |
+| PowerShell | `$PROFILE` | `manta completions powershell \| Out-String \| Invoke-Expression` |
+| elvish | `~/.config/elvish/rc.elv` | `eval (manta completions elvish \| slurp)` |
+
+The script covers the commands and flags of the binary that printed it, so
+run the fish line again after an upgrade; the other shells reload it with
+every new shell.
+
+Each release archive carries man pages in `man/man1`: `manta.1` and one
+page per command (`manta-run.1`, `manta-config-check.1`, ...). On Linux or
+macOS, from the unpacked archive:
+
+```sh
+sudo install -d /usr/local/share/man/man1
+sudo install -m 0644 man/man1/*.1 /usr/local/share/man/man1/
+man manta
+```
+
+After a build from source, `manta man-pages --out <dir>` writes the same
+pages into `<dir>`.
 
 ### Notes
 
