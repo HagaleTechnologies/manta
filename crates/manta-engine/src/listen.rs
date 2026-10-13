@@ -66,6 +66,12 @@ pub struct ListenObservers {
     /// restart, a read error and every exit. `None` (the default) skips it
     /// entirely.
     pub rtty: Option<Arc<RttyObserver>>,
+    /// MAN-313: every CANDIDATE -> ACTIVE confirmation the detector has
+    /// made since `listen()` started (`TrackManager::confirmations`),
+    /// whether or not the track went on to qualify as keyed CW. Summed
+    /// across outage segments, so it only ever grows. Stored wherever the
+    /// active-track count is. `None` (the default) skips it entirely.
+    pub detector_confirmations: Option<Arc<AtomicU64>>,
 }
 
 /// MAN-314: the decode loop's currently marked RTTY signals, calibrated.
@@ -447,6 +453,16 @@ pub fn listen_with_observers(
         }
     };
 
+    // MAN-313: each segment has its own `TrackManager`, so its
+    // confirmation count restarts at 0; `confirmations_base` holds the
+    // closed segments' totals so the published count never goes back.
+    let mut confirmations_base: u64 = 0;
+    let report_confirmations = |n: u64| {
+        if let Some(counter) = &observers.detector_confirmations {
+            counter.store(n, Ordering::Relaxed);
+        }
+    };
+
     let mut seg = new_segment(fs, center_freq_hz, cfg, 1, observers.decode_quality.clone())?;
     let mut seg_base: u64 = 0;
 
@@ -506,6 +522,7 @@ pub fn listen_with_observers(
     );
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
+    report_confirmations(confirmations_base + seg.tm.confirmations());
     rtty.update(&seg.tm);
     on_tracks(n_tracks);
     // `..filled`: the whole buffer unless a stop request cut the fill short.
@@ -523,6 +540,7 @@ pub fn listen_with_observers(
     );
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
+    report_confirmations(confirmations_base + seg.tm.confirmations());
     rtty.update(&seg.tm);
     on_tracks(n_tracks);
     let mut seg_consumed: u64 = filled as u64;
@@ -567,6 +585,7 @@ pub fn listen_with_observers(
                 &mut on_spot,
             );
             let next_id = seg.tm.next_track_id();
+            confirmations_base += seg.tm.confirmations();
             // The old segment's marks clear where its samples end.
             rtty.restart(seg_base + seg_consumed);
             seg_base += seg_consumed + gap;
@@ -613,6 +632,7 @@ pub fn listen_with_observers(
         );
         let n_tracks = seg.tm.decoding_track_count();
         report_active_tracks(n_tracks);
+        report_confirmations(confirmations_base + seg.tm.confirmations());
         rtty.update(&seg.tm);
         on_tracks(n_tracks);
         if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
@@ -635,6 +655,7 @@ pub fn listen_with_observers(
     // observers must settle back to 0 rather than be left holding the last
     // live value after a source disconnects or a replay hits EOF.
     report_active_tracks(0);
+    report_confirmations(confirmations_base + seg.tm.confirmations());
     rtty.restart(seg_base + seg_consumed);
     on_tracks(0);
     Ok(())
@@ -1386,6 +1407,63 @@ mod tests {
         assert_eq!(peak, 1);
         assert!(obs.generation() >= 2, "marked, then cleared");
         assert!(obs.snapshot().is_empty(), "cleared at exit");
+    }
+
+    /// MAN-313 test scene: noise plus a steady unkeyed carrier 10 kHz above
+    /// centre at +20 dB in 2500 Hz -- confirmed by the detector within
+    /// ~50 ms, never keyed CW.
+    fn steady_carrier_scene(duration_s: f64) -> Vec<Complex32> {
+        let fs = 96_000.0;
+        let (mut iq, _) = manta_testkit::scene::render_scene(&[], fs, duration_s, Some(5)).unwrap();
+        let noise_pow = iq.iter().map(|z| z.norm_sqr() as f64).sum::<f64>() / iq.len() as f64;
+        let amp = (100.0 * noise_pow * 2500.0 / fs).sqrt() as f32;
+        let w = 2.0 * std::f64::consts::PI * 10_000.0 / fs;
+        for (n, z) in iq.iter_mut().enumerate() {
+            let ph = w * n as f64;
+            *z += Complex32::new(amp * ph.cos() as f32, amp * ph.sin() as f32);
+        }
+        iq
+    }
+
+    /// MAN-313: the detector-confirmation counter is published while the
+    /// stream runs, summed across an outage restart (each segment's
+    /// `TrackManager` counts from 0), and never goes back.
+    #[test]
+    fn listen_publishes_detector_confirmations() {
+        let samples = steady_carrier_scene(6.0);
+        let src = GapSource::new(samples, 96_000.0, 14_000_000.0, 96_000);
+        let gap_taken = src.gap_taken.clone();
+        let counter = Arc::new(AtomicU64::new(0));
+        let seen = counter.clone();
+        let mut last = 0u64;
+        let mut before_gap = 0u64;
+        listen_with_observers(
+            Box::new(src),
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                detector_confirmations: Some(counter.clone()),
+                ..Default::default()
+            },
+            |_ev| {},
+            |_spot| {},
+            |_n| {
+                let now = seen.load(Ordering::Relaxed);
+                assert!(now >= last, "the count went back from {last} to {now}");
+                last = now;
+                if !gap_taken.load(Ordering::Relaxed) {
+                    before_gap = now;
+                }
+            },
+        )
+        .unwrap();
+        let total = counter.load(Ordering::Relaxed);
+        assert!(before_gap >= 1, "the carrier is confirmed before the gap");
+        assert!(
+            total > before_gap,
+            "the post-gap segment's confirmation adds to the pre-gap count \
+             ({before_gap} before the gap, {total} at the end)"
+        );
     }
 
     #[test]

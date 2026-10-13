@@ -50,3 +50,18 @@ Order statistics rather than a mean floor is the load-bearing choice: CW is burs
   frequency gates move with the promotion hop, so re-run them after any
   warm-up change; see the MAN-115
   [decision record](../../docs/DECISIONS/2026-10-11-man115-startup-latency.md).
+- MAN-313 lazy lease: with `[detector] non_cw_filter` on, a promoted
+  track has no decoder and emits no `TrackPromoted` until it qualifies as
+  keyed CW; the event then carries the promotion `sample_ts`/`freq_hz`.
+  Tests that expect a decoder or `TrackPromoted` at the promotion hop
+  need the filter off. `drain_pool` must skip queued tracks that hold no
+  decoder, or it panics on the unwrap.
+- MAN-313 flatness: the per-track neighbourhood test must tolerate a
+  louder neighbour. Requiring `PdB[k]` to beat its ±2/±3 channels kept
+  weak CW 300 Hz from a loud RTTY mark from ever qualifying; only a
+  neighbourhood within 6 dB counts as flat.
+- MAN-313 co-modulation: lags start at 3 so a tone's own key clicks never
+  count, and the span's strong test uses window peaks, not means, or a
+  loud keyed tone's click skirt forms a span over the tone itself. See
+  SPEC-decode-core.md §2.7 and the
+  [decision record](../../docs/DECISIONS/2026-10-13-man313-non-cw-rejection.md).

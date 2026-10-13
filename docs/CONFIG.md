@@ -246,6 +246,8 @@ milliseconds, 0 to 3600000.
 | `silent_respawn_cooldown_ms` | `30000.0` | live | Wait before a channel whose track went silent may start another. 0 to 3600000 (1 h); 0 means no cooldown. |
 | `rtty_filter` | `true` | live | Recognise RTTY (two-tone FSK) signals and start no CW track on them or their keying sidebands; `false` restores the previous behaviour. See [SPEC §2.6](SPEC-decode-core.md#26-two-tone-fsk-rtty-recognition) and [MAN-314](DECISIONS/2026-10-11-man314-rtty-recognition.md). |
 | `rtty_dwell_ms` | `20000.0` | live | How long an FSK signal must last before it is marked as RTTY; 1000 to 3600000 (1 h), counted in whole 1000 ms detector blocks. |
+| `non_cw_filter` | `true` | live | A new track is decoded only once it shows CW keying. Speech (SSB), noise-like wideband data and swept carriers never start a CW track, and a track whose signal stops keying closes after `unkeyed_close_ms`. `false` restores the pre-MAN-313 behaviour. See [SPEC §2.7](SPEC-decode-core.md#27-non-cw-rejection) and [MAN-313](DECISIONS/2026-10-13-man313-non-cw-rejection.md). Restart required (every `[detector]` key is). |
+| `unkeyed_close_ms` | `10000.0` | live | With `non_cw_filter` on, two limits: how long a qualified track may stay key-down with no keying, no decoded character and no callsign read before it closes; and how long a new track may take to show CW keying. Range 1000 to 3600000 (1 h). |
 
 ## [decode]
 

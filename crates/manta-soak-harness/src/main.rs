@@ -444,6 +444,8 @@ fn main() -> Result<()> {
                 "merged": s.close_counts.merged,
                 "evicted": s.close_counts.evicted,
                 "rtty": s.close_counts.rtty,
+                "not_cw": s.close_counts.not_cw,
+                "unkeyed": s.close_counts.unkeyed,
             },
         });
         let text = match serde_json::to_string(&line) {
@@ -568,6 +570,8 @@ fn main() -> Result<()> {
             "merged": report.final_close_counts.merged,
             "evicted": report.final_close_counts.evicted,
             "rtty": report.final_close_counts.rtty,
+            "not_cw": report.final_close_counts.not_cw,
+            "unkeyed": report.final_close_counts.unkeyed,
         },
         "man19_criteria": {
             "no_crash": no_crash,

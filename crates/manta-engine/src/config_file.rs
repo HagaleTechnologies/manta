@@ -17,7 +17,9 @@
 //! `gc_ms` and `warmup_ms`, plus `track_cap` (ARCHITECTURE §4, configurable per §8) and
 //! `silent_respawn_cooldown_ms` (MAN-171), plus `rtty_filter` and
 //! `rtty_dwell_ms` (MAN-314, SPEC §2.6; the dwell must be at least one
-//! 1000 ms detector block). Every key is an `Option`
+//! 1000 ms detector block), plus `non_cw_filter` and `unkeyed_close_ms`
+//! (MAN-313, SPEC §2.7; the timeout must be at least 1000 ms). Every key
+//! is an `Option`
 //! overlaid on `DetectorConfig::default()`, so an absent key keeps the exact
 //! default hop count instead of round-tripping it through milliseconds.
 //! Millisecond keys convert with `manta_decode::ms_to_hops`, SPEC §1.1's
@@ -63,6 +65,8 @@ pub struct DetectorConfigToml {
     pub silent_respawn_cooldown_ms: Option<f64>,
     pub rtty_filter: Option<bool>,
     pub rtty_dwell_ms: Option<f64>,
+    pub non_cw_filter: Option<bool>,
+    pub unkeyed_close_ms: Option<f64>,
 }
 
 impl DetectorConfigToml {
@@ -93,6 +97,8 @@ impl DetectorConfigToml {
             )?,
             rtty_filter: self.rtty_filter.unwrap_or(d.rtty_filter),
             rtty_dwell_hops: rtty_dwell(self.rtty_dwell_ms, d.rtty_dwell_hops)?,
+            non_cw_filter: self.non_cw_filter.unwrap_or(d.non_cw_filter),
+            unkeyed_close_hops: unkeyed_close(self.unkeyed_close_ms, d.unkeyed_close_hops)?,
         })
     }
 }
@@ -105,6 +111,21 @@ fn rtty_dwell(value: Option<f64>, default: u64) -> Result<u64, String> {
         if ms < 1000.0 {
             return Err(format!(
                 "detector.rtty_dwell_ms = {ms} is shorter than one 1000 ms detector block; it must be at least 1000"
+            ));
+        }
+    }
+    Ok(h)
+}
+
+/// MAN-313: `unkeyed_close_ms`, bounded like every `*_ms` key and at
+/// least 1000 ms (SPEC §2.7): shorter would close a keyed track during an
+/// ordinary pause and give a new track too little time to show keying.
+fn unkeyed_close(value: Option<f64>, default: u64) -> Result<u64, String> {
+    let h = hops("unkeyed_close_ms", value, default, false)?;
+    if let Some(ms) = value {
+        if ms < 1000.0 {
+            return Err(format!(
+                "detector.unkeyed_close_ms = {ms} is shorter than 1000 ms; it must be at least 1000"
             ));
         }
     }
@@ -196,6 +217,8 @@ mod tests {
             silent_respawn_cooldown_ms = 30000.0
             rtty_filter = true
             rtty_dwell_ms = 20000.0
+            non_cw_filter = true
+            unkeyed_close_ms = 10000.0
             "#,
         )
         .unwrap();
@@ -206,6 +229,7 @@ mod tests {
         assert_eq!(cfg.warmup_hops, 9);
         assert_eq!(cfg.silent_respawn_cooldown_hops, 11250);
         assert_eq!(cfg.rtty_dwell_hops, 7500);
+        assert_eq!(cfg.unkeyed_close_hops, 3750);
     }
 
     #[test]
@@ -235,6 +259,41 @@ mod tests {
         let e = err("rtty_dwell_ms = 3600001");
         assert!(e.contains("detector.rtty_dwell_ms"), "{e}");
         assert!(e.contains("[0, 3600000]"), "{e}");
+    }
+
+    #[test]
+    fn non_cw_keys_default_to_on_and_10000_ms() {
+        let cfg = parse("").unwrap();
+        assert!(cfg.non_cw_filter);
+        assert_eq!(cfg.unkeyed_close_hops, 3750);
+    }
+
+    #[test]
+    fn non_cw_filter_false_is_accepted() {
+        let cfg = parse("non_cw_filter = false").unwrap();
+        assert!(!cfg.non_cw_filter);
+    }
+
+    #[test]
+    fn unkeyed_close_ms_below_one_second_is_rejected() {
+        assert_eq!(
+            err("unkeyed_close_ms = 500"),
+            "detector.unkeyed_close_ms = 500 is shorter than 1000 ms; it must be at least 1000"
+        );
+        assert!(err("unkeyed_close_ms = 0").contains("at least 1000"));
+        assert_eq!(
+            parse("unkeyed_close_ms = 1000").unwrap().unkeyed_close_hops,
+            375
+        );
+    }
+
+    #[test]
+    fn unkeyed_close_ms_above_one_hour_is_rejected() {
+        assert_eq!(
+            err("unkeyed_close_ms = 4000000"),
+            "detector.unkeyed_close_ms must be finite and in [0, 3600000] ms, got 4000000"
+        );
+        assert!(err("unkeyed_close_ms = nan").contains("[0, 3600000]"));
     }
 
     #[test]

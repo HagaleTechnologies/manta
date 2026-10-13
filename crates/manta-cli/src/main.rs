@@ -5121,6 +5121,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     decode_quality: decode_quality.clone(),
                     operator_lists: reload_enabled.then(|| operator_lists.clone()),
                     rtty: Some(rtty_observer.clone()),
+                    detector_confirmations: None,
                 },
                 |ev| {
                     if json {

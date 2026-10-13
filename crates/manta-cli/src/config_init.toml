@@ -232,6 +232,8 @@
 #silent_respawn_cooldown_ms = 30000.0  # wait before a channel whose track went silent starts another
 #rtty_filter = true                  # recognise RTTY (FSK) signals and start no CW track on them
 #rtty_dwell_ms = 20000.0             # how long an FSK signal must last before it is marked as RTTY
+#non_cw_filter = true                # start no CW track on speech, wideband data or a swept carrier
+#unkeyed_close_ms = 10000.0          # close a track that stops keying (and read no callsign) after this long
 
 
 # --- Decoder -----------------------------------------------------------------

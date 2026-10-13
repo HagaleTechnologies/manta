@@ -9,6 +9,7 @@
 
 pub mod carrier;
 pub mod channelizer;
+pub mod comod;
 pub mod decimate;
 pub mod floor;
 pub mod freqest;

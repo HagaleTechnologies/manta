@@ -824,6 +824,8 @@ fn spec_detector_values_equal_the_code_defaults() {
         "silent_respawn_cooldown_ms",
         "rtty_filter",
         "rtty_dwell_ms",
+        "non_cw_filter",
+        "unkeyed_close_ms",
     ] {
         assert!(
             table.contains_key(key),
