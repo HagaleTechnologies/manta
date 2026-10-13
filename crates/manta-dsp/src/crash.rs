@@ -7,7 +7,9 @@
 //! hundreds of tracks. This detector judges it once per hop across the
 //! channels inside the source's real RF passband (the "live channels"):
 //!
+//! ```text
 //! lift[m] = Q25 over live channels k of (P[k,m] − R[k]) + 2.8 dB
+//! ```
 //!
 //! where P is this hop's channel power in dB and R is the detector's own
 //! per-channel dB reference, an EMA with the gate's alpha that is frozen

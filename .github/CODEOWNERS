@@ -17,6 +17,10 @@
 Cargo.toml           @thagale
 /Cargo.lock          @thagale
 
+# deny.toml decides which advisories, licenses and dependency sources pass the "Supply Chain"
+# required check (MAN-156); an unowned edit could allowlist its way past it.
+/deny.toml           @thagale
+
 # Cross.toml controls the exact cross-compilation toolchain/image used to build release
 # artifacts -- an unowned edit here can substitute a different (unverified) build environment
 # for release builds without touching release.yml itself.

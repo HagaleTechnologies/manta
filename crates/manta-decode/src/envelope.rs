@@ -4,11 +4,11 @@
 use crate::{ms_to_hops, HOP_MS};
 use std::collections::VecDeque;
 
-/// SPEC §9 [decode] table defaults.
+/// SPEC §9 `[decode]` table defaults.
 #[derive(Debug, Clone)]
 pub struct DemodConfig {
     /// Half-width of the keying decision band, as a fraction of the keying
-    /// depth (E_hi - E_lo). SPEC §3.3 **[DEVIATION]**: replaces the
+    /// depth (E_hi - E_lo). SPEC §3.3 **\[DEVIATION\]**: replaces the
     /// multiplicative 1.25/0.80 band -- see
     /// docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md.
     pub hyst_frac: f32,

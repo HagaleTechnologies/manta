@@ -1,5 +1,5 @@
 //! MAN-301: the live comparator. Reads published spots off the [`SpotBus`],
-//! RBN reports off the [`feed`](super::feed), and every [`TICK`] closes the
+//! RBN reports off the [`feed`], and every [`TICK`] closes the
 //! spots whose comparison window has passed: each grade is serialised once
 //! and published on the JSON stream ([`SpotBus::publish_grade`]) and the
 //! `manta_rbn_compare_*` metrics.

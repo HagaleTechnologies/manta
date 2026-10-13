@@ -1,0 +1,49 @@
+name: PR Title
+
+# MAN-156: main-protection's merge queue squash-merges, so a pull request's title becomes the
+# commit subject on main and must be a Conventional Commits header. scripts/check-pr-title.py holds
+# the rule; scripts/tests/test_ci_gates.py tests it and this file. `edited` re-runs the check when
+# only the title changes.
+#
+# `pull_request`, like supply-chain.yml: no secret, a read-only token for forks and Dependabot, and
+# the PR's own definition of this file (see supply-chain.yml's THREAT MODEL note). The title
+# reaches the script only through `env:`, never `${{ }}` inside `run:`, so a title cannot inject
+# shell.
+#
+# merge_group: once the owner adds "PR title" to main-protection's required checks (decision
+# record, step O4), a merge-group entry needs this check on its own SHA. The title was checked on
+# the PR, so it passes there. Like "Codex review clean", it cannot fail on merge_group, so
+# queue-retry-handler.yml does not need to listen to this workflow.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  title:
+    name: PR title
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Pass on a merge group (the PR's title was checked before it was queued)
+        if: github.event_name == 'merge_group'
+        run: echo "A merge group has no title of its own; nothing to check."
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/check-pr-title.py
+          sparse-checkout-cone-mode: false
+      - name: Check the title is a Conventional Commits header
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: python3 scripts/check-pr-title.py "$PR_TITLE"
