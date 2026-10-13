@@ -22,6 +22,40 @@ the git history and `docs/DECISIONS/`.
 
 ## [Unreleased]
 
+### Decoder output
+
+- MAN-314: RTTY (two-tone FSK, 170/200/425/450/850 Hz shift) is recognised
+  after 20 s and no CW track starts on it or its keying sidebands; open
+  tracks on it close (`rtty` close count). `[detector] rtty_filter = false`
+  restores the previous behaviour.
+- MAN-313: noise-like wideband data and swept carriers start no CW track,
+  SSB voice starts far fewer (7 in band against 81 at +30 dB with the
+  testkit voice, none spotted), and a track that stops keying closes 10 s after its last
+  key-down edge unless a callsign was read. A new track is decoded only
+  once it shows CW keying, so its `TrackPromoted` arrives 0.5–1.5 s of
+  stream later, with the same `sample_ts`; decoded text and spots are
+  unchanged on the golden vectors. `manta decode` on a non-empty input with
+  no keyed CW now fails with `no signal found (no keyed CW signal in the
+  input)`. `manta_active_tracks` counts only keyed CW tracks.
+  `[detector] non_cw_filter = false` restores the previous behaviour.
+
+### Added
+
+- `[detector] rtty_filter`/`rtty_dwell_ms`; `manta_rtty_signals{band}`
+  gauge; `rtty` array in `decode --json` and, when RTTY was marked, an
+  `rtty:` line in plain `decode`; `RTTY marked`/`RTTY cleared` log lines in
+  `run` (MAN-314).
+- `[detector] non_cw_filter` (default `true`) and `unkeyed_close_ms`
+  (default 10000, at least 1000), also as `MANTA_DETECTOR_NON_CW_FILTER`/
+  `MANTA_DETECTOR_UNKEYED_CLOSE_MS`; a `NOT_CW` verdict and a
+  `detector_confirmations` count in `manta doctor` for a band with signals
+  but no keyed CW (MAN-313).
+- A Grafana dashboard (spot rate, active tracks, source health, per-target
+  uplink status) and Prometheus alert rules (node down, node unhealthy, no
+  spots for 30 minutes, uplink target down or flapping) for a node's
+  `/metrics`, with promtool tests. See `docs/RUNBOOKS/monitoring.md`
+  (MAN-129).
+
 ## [0.1.0] - 2026-10-11
 
 Pre-stability alpha, expect breakage: manta has not cleared its own M2/M3
@@ -82,6 +116,33 @@ acceptance gates.
   recording with no sidecar (or a sidecar whose `center_freq_hz` is not
   positive) gets a warning that its frequencies are baseband offsets,
   and is decoded at a 0.0 centre (MAN-131).
+- Live comparison with the Reverse Beacon Network (MAN-301). With a new
+  `[rbn_compare]` table enabled, a `[server]` daemon reads RBN's public CW
+  telnet feed and grades each spot, once a window around its time closes
+  (`window_secs`, default 180 s), as `match`, `disagree`, `elsewhere`,
+  `none` or `unknown`. Each grade is a `spotGrade` record on the `:7301`
+  JSON stream, referencing the spot's `id`, and is counted in new
+  `manta_rbn_compare_*` metric families: per-band grade counts over the
+  last hour and the per-band median frequency offset from RBN. manta only
+  reads the feed: it sends its login callsign and nothing else. The table
+  is off by default; without it the JSON stream and `/metrics` are
+  unchanged and no connection is made. Spots themselves do not change.
+  See `docs/RUNBOOKS/rbn-comparison.md`.
+- `manta run --rbn-compare` turns comparison on for one run, and
+  `--rbn-spotter CALL` (repeatable) grades against only that RBN skimmer,
+  for example a co-located one.
+- `manta grade` grades a recorded node's spot log (`field-node.py
+  record-spots`'s `spots-*.jsonl`) against RBN daily-archive CSVs with the
+  daemon's grading code, printing a per-band summary or, with `--json`,
+  the same `spotGrade` records the live stream carries.
+- `scripts/score-against-rbn.py --node-log` replays a node's spot log
+  through `manta grade`, unzipping RBN's archive first; `--spotter K5TR`
+  restricts it to one skimmer as before.
+- `manta doctor` checks that `[rbn_compare]`'s feed accepts a TCP
+  connection (`rbn compare feed`), sending nothing on it.
+- `field-node.py record-spots` writes grade lines to
+  `grades-<UTC day>.jsonl`, and `shadow-compare.py` skips grade lines
+  instead of counting them as spots.
 
 ### Fixed
 

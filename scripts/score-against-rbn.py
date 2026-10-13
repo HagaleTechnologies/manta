@@ -30,14 +30,33 @@ under-count recall (same review). `_is_plausible_callsign` below is a
 Python port of that Rust function -- keep it in sync if grammar.rs
 changes.
 
+Replaying a node's log (MAN-301): `--node-log PATH... --rbn PATH...`
+grades a node's SpotMessage archive (the `field-node.py record-spots`
+files, or directories of them) against RBN daily dumps (`.csv`, or RBN's
+`.zip`, which this script unzips into a temporary directory). The grading
+code is `manta grade`'s, in Rust -- the same engine `[rbn_compare]` runs
+live -- not Python's: this mode only finds the binary (--manta, then
+$MANTA_BIN, then `manta` on PATH, then target/release/manta, then
+target/debug/manta under the repo root), maps --spotter,
+--exclude-spotter, --window-s and --freq-tol-hz onto its flags, and relays
+its stdout and exit status verbatim. The decode-report-only options
+(--capture-start, --sample-rate-hz, --time-tol-s, --min-spotters,
+--show-samples) are refused there.
+
 Usage:
   score-against-rbn.py <decode_report.json> <rbn_truth_csv> \
       --capture-start 2025-11-29T00:00:00Z --sample-rate-hz 192000
+  score-against-rbn.py --node-log node/ --rbn 20261011.zip --spotter K5TR
 """
 import sys
 import json
 import csv
 import argparse
+import os
+import shutil
+import subprocess
+import tempfile
+import zipfile
 from datetime import datetime, timedelta, timezone
 
 
@@ -200,22 +219,161 @@ def _finite(name, *, min_exclusive=None, min_inclusive=None):
     return parse
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("decode_report")
-    ap.add_argument("rbn_truth_csv")
-    ap.add_argument("--capture-start", required=True, type=parse_iso,
+PROG = "score-against-rbn.py"
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# --node-log refuses these: they describe a decode report, not a node log.
+DECODE_REPORT_ONLY = ("--capture-start", "--sample-rate-hz", "--time-tol-s",
+                      "--min-spotters", "--show-samples")
+
+
+def resolve_manta(explicit, environ=None, repo_root=None):
+    """The `manta` binary for --node-log: --manta, then $MANTA_BIN, then
+    `manta` on PATH, then target/release/manta, then target/debug/manta
+    under the repo root. None when there is none."""
+    environ = os.environ if environ is None else environ
+    repo_root = REPO_ROOT if repo_root is None else repo_root
+    if explicit:
+        return explicit
+    if environ.get("MANTA_BIN"):
+        return environ["MANTA_BIN"]
+    on_path = shutil.which("manta", path=environ.get("PATH"))
+    if on_path:
+        return on_path
+    for build in ("release", "debug"):
+        candidate = os.path.join(repo_root, "target", build, "manta")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _display_path(path):
+    rel = os.path.relpath(path)
+    return path if rel.startswith("..") else rel
+
+
+def _unzip_rbn(path, into):
+    """Extracts a zip's .csv members (by base name, never a member's own
+    directory part) into a fresh subdirectory of `into`; returns their paths."""
+    out_dir = tempfile.mkdtemp(dir=into)
+    extracted = []
+    with zipfile.ZipFile(path) as zf:
+        for info in zf.infolist():
+            name = os.path.basename(info.filename)
+            if info.is_dir() or not name.lower().endswith(".csv"):
+                continue
+            target = os.path.join(out_dir, name)
+            with zf.open(info) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            extracted.append(target)
+    if not extracted:
+        raise ValueError("%s holds no .csv file" % path)
+    return sorted(extracted)
+
+
+def run_node_log(args):
+    """--node-log: run `manta grade` and relay its stdout and exit status."""
+    manta = resolve_manta(args.manta)
+    if manta is None:
+        sys.stderr.write("%s: error: no manta binary found; build one "
+                         "(cargo build --release -p manta-cli) or pass --manta PATH\n" % PROG)
+        return 2
+    with tempfile.TemporaryDirectory(prefix="score-against-rbn-") as tmp:
+        rbn_paths, unzipped = [], []
+        for path in args.rbn:
+            if path.lower().endswith(".zip"):
+                try:
+                    rbn_paths.extend(_unzip_rbn(path, tmp))
+                except (OSError, ValueError, zipfile.BadZipFile) as e:
+                    sys.stderr.write("%s: error: cannot unzip %s: %s\n" % (PROG, path, e))
+                    return 2
+                unzipped.append(os.path.basename(path))
+            else:
+                rbn_paths.append(path)
+        cmd = [manta, "grade"]
+        for path in args.node_log:
+            cmd += ["--spots", path]
+        for path in rbn_paths:
+            cmd += ["--rbn", path]
+        for call in args.spotter or []:
+            cmd += ["--spotter", call]
+        for call in args.exclude_spotter or []:
+            cmd += ["--exclude-spotter", call]
+        if args.window_s is not None:
+            cmd += ["--window-secs", str(args.window_s)]
+        if args.freq_tol_hz is not None:
+            cmd += ["--freq-tol-hz", repr(args.freq_tol_hz)]
+        note = " (unzipped %s)" % ", ".join(unzipped) if unzipped else ""
+        sys.stderr.write("%s: grading with %s grade%s\n" % (PROG, _display_path(manta), note))
+        sys.stderr.flush()
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+        except OSError as e:
+            sys.stderr.write("%s: error: cannot run %s: %s\n" % (PROG, manta, e))
+            return 2
+        sys.stdout.write(proc.stdout)
+        sys.stdout.flush()
+        return proc.returncode
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog=PROG, description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("decode_report", nargs="?",
+                    help="manta decode --json report (decode-report scoring; not with --node-log)")
+    ap.add_argument("rbn_truth_csv", nargs="?",
+                    help="RBN daily-dump CSV for the recording's window (decode-report scoring)")
+    ap.add_argument("--capture-start", type=parse_iso, default=None,
                      help="Recording's capture start, ISO-8601 UTC (e.g. 2025-11-29T00:00:00Z)")
-    ap.add_argument("--sample-rate-hz", required=True, type=_finite("--sample-rate-hz", min_exclusive=0))
-    ap.add_argument("--freq-tol-hz", type=_finite("--freq-tol-hz", min_inclusive=0), default=500.0)
-    ap.add_argument("--time-tol-s", type=_finite("--time-tol-s", min_inclusive=0), default=90.0,
+    ap.add_argument("--sample-rate-hz", type=_finite("--sample-rate-hz", min_exclusive=0), default=None)
+    ap.add_argument("--freq-tol-hz", type=_finite("--freq-tol-hz", min_inclusive=0), default=None,
+                     help="Frequency tolerance in Hz (default: 500)")
+    ap.add_argument("--time-tol-s", type=_finite("--time-tol-s", min_inclusive=0), default=None,
                      help="Max seconds between a manta spot and some real RBN observation of that call+freq (default: 90s, matching RepetitionGate's own window)")
-    ap.add_argument("--show-samples", type=int, default=10)
+    ap.add_argument("--show-samples", type=int, default=None)
     ap.add_argument("--spotter", action="append", default=None,
                      help="Only use truth rows from this spotter callsign (repeatable), e.g. --spotter K5TR for the co-located reference")
-    ap.add_argument("--min-spotters", type=int, default=1,
+    ap.add_argument("--min-spotters", type=int, default=None,
                      help="Only count call+kHz bins heard by at least N distinct spotters")
-    args = ap.parse_args()
+    node = ap.add_argument_group("replaying a node's log (MAN-301; graded by `manta grade`)")
+    node.add_argument("--node-log", nargs="+", metavar="PATH",
+                      help="SpotMessage JSON Lines files or directories (spots-*.jsonl) to grade")
+    node.add_argument("--rbn", nargs="+", metavar="PATH",
+                      help="RBN daily-dump .csv or .zip files, or directories of CSVs")
+    node.add_argument("--exclude-spotter", action="append", default=None, metavar="CALL",
+                      help="Never count this RBN skimmer (repeatable)")
+    node.add_argument("--window-s", type=int, default=None,
+                      help="Seconds either side of a spot an RBN report counts (manta grade --window-secs)")
+    node.add_argument("--manta", metavar="PATH", help="The manta binary to run")
+    args = ap.parse_args(argv)
+
+    if args.node_log is not None:
+        for opt in DECODE_REPORT_ONLY:
+            if getattr(args, opt[2:].replace("-", "_")) is not None:
+                ap.error("%s applies to decode-report scoring, not --node-log" % opt)
+        if args.decode_report is not None:
+            ap.error("the positional decode_report/rbn_truth_csv apply to decode-report scoring, not --node-log")
+        if not args.rbn:
+            ap.error("--node-log needs --rbn PATH")
+        return run_node_log(args)
+
+    for opt in ("--rbn", "--exclude-spotter", "--window-s", "--manta"):
+        if getattr(args, opt[2:].replace("-", "_")) is not None:
+            ap.error("%s applies to --node-log, not decode-report scoring" % opt)
+    if args.decode_report is None or args.rbn_truth_csv is None:
+        ap.error("the following arguments are required: decode_report, rbn_truth_csv (or --node-log)")
+    if args.capture_start is None:
+        ap.error("the following arguments are required: --capture-start")
+    if args.sample_rate_hz is None:
+        ap.error("the following arguments are required: --sample-rate-hz")
+    if args.freq_tol_hz is None:
+        args.freq_tol_hz = 500.0
+    if args.time_tol_s is None:
+        args.time_tol_s = 90.0
+    if args.show_samples is None:
+        args.show_samples = 10
+    if args.min_spotters is None:
+        args.min_spotters = 1
 
     manta_spots = load_manta_spots(args.decode_report, args.capture_start, args.sample_rate_hz)
     spotters = {s.upper() for s in args.spotter} if args.spotter else None
@@ -267,7 +425,8 @@ def main():
         print(f"\n--- sample false negatives (RBN heard, manta missed; up to {n}) ---")
         for k in list(fn_keys)[:n]:
             print(f"  {k[0]:12s} ~{k[1]} kHz")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

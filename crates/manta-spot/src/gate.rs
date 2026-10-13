@@ -474,6 +474,36 @@ pub struct RepetitionGate {
     /// workload-activity check while never calling `record`, leaving
     /// `sweep`'s half of the leak fix completely unexercised.
     records_total: u64,
+    /// MAN-118: what every `record()` call returned, as non-cumulative
+    /// counts over `REPETITION_BUCKETS` (`le`-inclusive, last slot the
+    /// overflow), plus their sum. See `repetition_counts`.
+    repetitions: RepetitionCounts,
+}
+
+/// MAN-118: upper bounds of the `manta_candidate_repetitions` histogram's
+/// buckets, over the counts `RepetitionGate::record` returns. A candidate
+/// needs 2 to spot, so 1 and 2 get their own buckets.
+pub const REPETITION_BUCKETS: [u32; 10] = [1, 2, 3, 4, 5, 6, 8, 10, 15, 20];
+
+/// MAN-118: cumulative distribution of `RepetitionGate::record`'s return
+/// values. `bucket_counts` is non-cumulative, one slot per
+/// `REPETITION_BUCKETS` bound (`le`-inclusive) plus a final overflow slot;
+/// `sum` adds every returned value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RepetitionCounts {
+    pub bucket_counts: [u64; REPETITION_BUCKETS.len() + 1],
+    pub sum: u64,
+}
+
+impl RepetitionCounts {
+    fn observe(&mut self, reps: usize) {
+        let idx = REPETITION_BUCKETS
+            .iter()
+            .position(|&bound| reps <= bound as usize)
+            .unwrap_or(REPETITION_BUCKETS.len());
+        self.bucket_counts[idx] += 1;
+        self.sum += reps as u64;
+    }
 }
 
 impl RepetitionGate {
@@ -484,6 +514,7 @@ impl RepetitionGate {
             time_gap_samples: (MIN_MESSAGE_TIME_GAP_SECONDS * fs) as u64,
             seen: BTreeMap::new(),
             records_total: 0,
+            repetitions: RepetitionCounts::default(),
         }
     }
 
@@ -565,7 +596,33 @@ impl RepetitionGate {
     /// signal happens to already occupy there -- bucket 0 in particular
     /// is already a live sentinel elsewhere in this codebase for "unknown
     /// center frequency" (`WavIqSource`'s missing-sidecar default).
+    ///
+    /// MAN-118: every returned value, including that 0, is also counted
+    /// into `repetition_counts`.
     pub fn record(
+        &mut self,
+        track_id: u32,
+        freq_hz: f64,
+        callsign: &str,
+        sample_ts: u64,
+        word_seq: u64,
+        is_track_active: impl Fn(u32) -> bool,
+    ) -> usize {
+        let reps = self.record_inner(
+            track_id,
+            freq_hz,
+            callsign,
+            sample_ts,
+            word_seq,
+            is_track_active,
+        );
+        self.repetitions.observe(reps);
+        reps
+    }
+
+    /// `record`'s body; split out so its several early returns all pass
+    /// through `record`'s MAN-118 counting.
+    fn record_inner(
         &mut self,
         track_id: u32,
         freq_hz: f64,
@@ -755,6 +812,11 @@ impl RepetitionGate {
         self.records_total
     }
 
+    /// MAN-118: the distribution of every `record()` return value so far.
+    pub fn repetition_counts(&self) -> RepetitionCounts {
+        self.repetitions
+    }
+
     /// Count of distinct (frequency bucket, callsign) entries currently
     /// held, for tests and future observability (ARCHITECTURE §8) -- the
     /// direct way to confirm `sweep` is actually keeping this bounded
@@ -814,6 +876,44 @@ mod tests {
     fn first_decode_counts_as_one() {
         let mut gate = RepetitionGate::new(FS);
         assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", 0, 0, always_active), 1);
+    }
+
+    /// MAN-118: every `record` result lands in its `le`-inclusive bucket,
+    /// the non-finite-frequency 0 included, and the sum adds them all.
+    #[test]
+    fn repetition_counts_bucket_every_record_result() {
+        let mut gate = RepetitionGate::new(FS);
+        let returned = vec![
+            gate.record(1, 7_080_000.0, "K5ARH", 0, 0, always_active),
+            gate.record(1, 7_080_000.0, "K5ARH", 300_000, 10, always_active),
+            gate.record(1, 7_080_000.0, "K5ARH", 600_000, 20, always_active),
+            gate.record(2, 14_020_000.0, "W1AW", 0, 0, always_active),
+            gate.record(3, f64::NAN, "N0CALL", 0, 0, always_active),
+        ];
+        assert_eq!(returned, vec![1, 2, 3, 1, 0]);
+
+        let counts = gate.repetition_counts();
+        let mut expected = [0u64; REPETITION_BUCKETS.len() + 1];
+        expected[0] = 3; // le="1": the two first decodes and the NaN's 0
+        expected[1] = 1; // le="2"
+        expected[2] = 1; // le="3"
+        assert_eq!(counts.bucket_counts, expected);
+        assert_eq!(
+            counts.bucket_counts.iter().sum::<u64>(),
+            gate.records_total()
+        );
+        assert_eq!(counts.sum, returned.iter().sum::<usize>() as u64);
+    }
+
+    /// MAN-118: a count past every bound lands in the overflow slot.
+    #[test]
+    fn repetition_counts_overflow_past_the_last_bound() {
+        let mut counts = RepetitionCounts::default();
+        counts.observe(20);
+        counts.observe(21);
+        assert_eq!(counts.bucket_counts[REPETITION_BUCKETS.len() - 1], 1);
+        assert_eq!(counts.bucket_counts[REPETITION_BUCKETS.len()], 1);
+        assert_eq!(counts.sum, 41);
     }
 
     #[test]

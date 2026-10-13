@@ -9,12 +9,12 @@
 //! `listen --json` output) against a real SDRplay RSP1B -- see
 //! docs/DECISIONS/2026-09-08-first-live-rsp1b-run.md.
 
-use crate::{listen, PipelineConfig};
+use crate::{listen_with_observers, ListenObservers, PipelineConfig};
 use anyhow::Result;
 use manta_decode::events::DecoderEvent;
 use manta_input::IqSource;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,12 @@ pub enum Verdict {
     /// track. Check the antenna, the gain, and that the tuned passband
     /// actually overlaps where you expect signal.
     NoSignal,
+    /// MAN-313: the detector confirmed at least one signal
+    /// (`detector_confirmations` is nonzero) but none qualified as keyed
+    /// CW, so no track was promoted -- speech, wideband data, or a swept or
+    /// steady carrier. The receiver chain works; there is just no CW where
+    /// it is tuned.
+    NotCw,
     /// Decoder evidence exists (a closed track, or decoded characters),
     /// but not one `TrackMeta` landed before the last such track closed --
     /// no SNR was ever measured. Distinct from `NoisyNoDecode`: this is
@@ -65,6 +71,11 @@ impl Verdict {
                 "NO_SIGNAL -- no decoder evidence at all (no track, no decoded character, no \
                  spot). Check antenna, gain, and that the tuned passband overlaps where you \
                  expect signal."
+            }
+            Verdict::NotCw => {
+                "NOT_CW -- the detector saw signals but none was keyed CW (speech, data, or a \
+                 swept or steady carrier). The receiver chain works; tune to where CW activity \
+                 is, or set [detector] non_cw_filter = false to decode everything."
             }
             Verdict::ActivityNoSnr => {
                 "ACTIVITY_NO_SNR -- the detector promoted a candidate (possibly closing, possibly \
@@ -105,12 +116,23 @@ pub struct DoctorReport {
     /// paced to real time, so the two coincide there.
     pub duration: Duration,
     /// Number of `TrackPromoted` events seen -- the detector's own ground
-    /// truth for "found a candidate signal," independent of whether the
+    /// truth for "found a keyed CW signal," independent of whether the
     /// decoder ever got far enough to produce a `TrackMeta`/`CharDecoded`/
-    /// `TrackClosed` afterward. This, not any decode-timing proxy, is what
-    /// `verdict()`'s `NoSignal` check keys off (see
+    /// `TrackClosed` afterward. Since MAN-313 (with `[detector]
+    /// non_cw_filter` on, the default) a track is promoted only once it
+    /// shows CW keying, so speech, data and swept or steady carriers are
+    /// not counted here; `detector_confirmations` counts them. This, not
+    /// any decode-timing proxy, is what `verdict()`'s `NoSignal`/`NotCw`
+    /// checks key off (see
     /// docs/DECISIONS/2026-09-09-doctor-track-promoted-event.md).
     pub tracks_promoted: usize,
+    /// MAN-313: every CANDIDATE -> ACTIVE confirmation the detector made
+    /// during the run, whether or not the track qualified as keyed CW
+    /// (`TrackManager::confirmations`, read through
+    /// `ListenObservers::detector_confirmations`). Nonzero with
+    /// `tracks_promoted == 0` means signals were present but none was
+    /// keyed CW (`Verdict::NotCw`).
+    pub detector_confirmations: usize,
     /// Number of `TrackMeta` events seen (one per track, per hop it's
     /// updated -- a proxy for how much decoder activity there was, not a
     /// distinct-track count).
@@ -153,6 +175,12 @@ impl DoctorReport {
         // run can end before reaching at all). Promotion alone
         // is what "the detector found a candidate" means.
         if self.tracks_promoted == 0 {
+            // MAN-313: no keyed CW track, but the detector did confirm
+            // signals -- the receiver chain works, the band just holds no
+            // CW (speech, data, a swept or steady carrier).
+            if self.detector_confirmations > 0 {
+                return Verdict::NotCw;
+            }
             return Verdict::NoSignal;
         }
         // Based on the STRONGEST track seen (max), not the median: a
@@ -348,11 +376,16 @@ pub fn doctor(
     let mut chars_decoded = 0usize;
     let mut distinct_chars: HashSet<char> = HashSet::new();
     let mut spots_confirmed = 0usize;
+    let confirmations = Arc::new(AtomicU64::new(0));
 
-    let result = listen(
+    let result = listen_with_observers(
         src,
         cfg,
         stop.clone(),
+        ListenObservers {
+            detector_confirmations: Some(confirmations.clone()),
+            ..ListenObservers::default()
+        },
         |ev| match ev {
             DecoderEvent::TrackPromoted { .. } => tracks_promoted += 1,
             DecoderEvent::TrackMeta { snr_2500_db, .. } => {
@@ -369,6 +402,7 @@ pub fn doctor(
             _ => {}
         },
         |_spot| spots_confirmed += 1,
+        |_n| {},
     );
     listen_done.store(true, Ordering::Relaxed);
     let _ = watchdog.join();
@@ -397,6 +431,8 @@ pub fn doctor(
         center_freq_hz,
         duration: observed_duration,
         tracks_promoted,
+        detector_confirmations: usize::try_from(confirmations.load(Ordering::Relaxed))
+            .unwrap_or(usize::MAX),
         track_meta_count,
         tracks_closed,
         snr_db_min,
@@ -547,6 +583,7 @@ mod tests {
             center_freq_hz: 14_025_000.0,
             duration: Duration::from_secs(10),
             tracks_promoted: 3,
+            detector_confirmations: 0,
             track_meta_count: 5,
             tracks_closed: 3,
             snr_db_min: Some(-8.0),
@@ -566,6 +603,7 @@ mod tests {
             center_freq_hz: 14_025_000.0,
             duration: Duration::from_secs(10),
             tracks_promoted: 1,
+            detector_confirmations: 0,
             track_meta_count: 5,
             tracks_closed: 1,
             snr_db_min: Some(5.0),
@@ -589,6 +627,7 @@ mod tests {
             center_freq_hz: 14_025_000.0,
             duration: Duration::from_secs(10),
             tracks_promoted: 16,
+            detector_confirmations: 0,
             track_meta_count: 20,
             tracks_closed: 15,
             snr_db_min: Some(-8.0),
@@ -612,6 +651,7 @@ mod tests {
             center_freq_hz: 0.0,
             duration: Duration::from_secs(3),
             tracks_promoted: 1,
+            detector_confirmations: 0,
             track_meta_count: 0,
             tracks_closed: 0,
             snr_db_min: None,
@@ -635,6 +675,7 @@ mod tests {
             center_freq_hz: 0.0,
             duration: Duration::from_secs(3),
             tracks_promoted: 1,
+            detector_confirmations: 0,
             track_meta_count: 0,
             tracks_closed: 1,
             snr_db_min: None,
@@ -662,6 +703,7 @@ mod tests {
             center_freq_hz: 0.0,
             duration: Duration::from_secs(3),
             tracks_promoted: 1,
+            detector_confirmations: 0,
             track_meta_count: 0,
             tracks_closed: 0,
             snr_db_min: None,
@@ -670,6 +712,60 @@ mod tests {
             chars_decoded: 0,
             distinct_chars: 0,
             spots_confirmed: 0,
+        };
+        assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
+    }
+
+    fn no_promotion_report(detector_confirmations: usize) -> DoctorReport {
+        DoctorReport {
+            sample_rate_hz: 96_000.0,
+            center_freq_hz: 14_000_000.0,
+            duration: Duration::from_secs(10),
+            tracks_promoted: 0,
+            detector_confirmations,
+            track_meta_count: 0,
+            tracks_closed: 0,
+            snr_db_min: None,
+            snr_db_max: None,
+            snr_db_median: None,
+            chars_decoded: 0,
+            distinct_chars: 0,
+            spots_confirmed: 0,
+        }
+    }
+
+    /// MAN-313: signals confirmed but none keyed CW (speech, data, a swept
+    /// or steady carrier) is not "no signal" -- the receiver chain works.
+    #[test]
+    fn verdict_is_not_cw_when_confirmations_but_no_promotions() {
+        let report = no_promotion_report(14);
+        assert_eq!(report.verdict(), Verdict::NotCw);
+        assert!(
+            report.verdict().summary().starts_with(
+                "NOT_CW -- the detector saw signals but none was keyed CW (speech, data, or a \
+                 swept or steady carrier). The receiver chain works; tune to where CW activity \
+                 is, or set [detector] non_cw_filter = false to decode everything."
+            ),
+            "{}",
+            report.verdict().summary()
+        );
+    }
+
+    #[test]
+    fn verdict_stays_no_signal_with_zero_confirmations() {
+        assert_eq!(no_promotion_report(0).verdict(), Verdict::NoSignal);
+    }
+
+    #[test]
+    fn verdict_prefers_decoding_over_not_cw() {
+        let report = DoctorReport {
+            spots_confirmed: 1,
+            ..no_promotion_report(5)
+        };
+        assert_eq!(report.verdict(), Verdict::Decoding);
+        let report = DoctorReport {
+            tracks_promoted: 1,
+            ..no_promotion_report(5)
         };
         assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
     }

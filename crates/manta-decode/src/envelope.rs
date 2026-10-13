@@ -168,6 +168,16 @@ impl Demod {
         Some(20.0 * (self.e_hi / self.e_lo.max(E_LO_FLOOR)).log10() - SNR_BW_CORR_DB)
     }
 
+    /// MAN-118: the linear keying-rail ratio `E_hi / E_lo` that
+    /// `snr_2500_db` is derived from, `None` until the rails initialize.
+    /// The rail update keeps `E_hi >= 2*E_lo` (SPEC §3.2), so 2 is the
+    /// floor a collapsing keying depth reads (lower only if `E_lo` sinks
+    /// under the 1e-6 divisor floor `snr_2500_db` also applies).
+    pub fn rail_ratio(&self) -> Option<f32> {
+        self.running()
+            .then(|| self.e_hi / self.e_lo.max(E_LO_FLOOR))
+    }
+
     /// Feed one raw envelope sample at 375 Hz; returns any runs completed by
     /// it. SPEC §3.
     pub fn push(&mut self, a_raw: f32, sample_ts: u64) -> Vec<Run> {
@@ -433,6 +443,31 @@ mod tests {
         assert!((alpha_from_tau_ms(500.0) - 0.00532).abs() < 1e-4);
         // SPEC §2.3 gives the same formula shape for tau = 40 ms: 0.0645
         assert!((alpha_from_tau_ms(40.0) - 0.0645).abs() < 5e-4);
+    }
+
+    /// MAN-118: the rail ratio is absent until the rails initialize, then
+    /// reads at or above the SPEC §3.2 collapse floor of 2.
+    #[test]
+    fn rail_ratio_is_none_before_init_and_at_least_two_after() {
+        let mut d = Demod::new(DemodConfig::default());
+        assert_eq!(d.rail_ratio(), None);
+        let mut ts = 0u64;
+        for _ in 0..40 {
+            for &(level, hops) in &[(1.0f32, 30u32), (0.01f32, 30u32)] {
+                for _ in 0..hops {
+                    d.push(level, ts);
+                    ts += 256;
+                }
+            }
+        }
+        assert!(d.running(), "40 keyed cycles must initialize the rails");
+        let r = d.rail_ratio().expect("running rails report a ratio");
+        assert!(r >= 2.0, "rail ratio {r} below the collapse floor");
+        let snr = d.snr_2500_db().unwrap();
+        assert!(
+            (20.0 * r.log10() - SNR_BW_CORR_DB - snr).abs() < 1e-4,
+            "snr_2500_db must be derived from this ratio"
+        );
     }
 
     #[test]

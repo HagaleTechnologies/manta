@@ -9,9 +9,11 @@
 
 pub mod carrier;
 pub mod channelizer;
+pub mod comod;
 pub mod decimate;
 pub mod floor;
 pub mod freqest;
+pub mod fsk;
 pub mod hilbert;
 pub mod proto;
 pub mod refine;

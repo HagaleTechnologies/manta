@@ -17,3 +17,12 @@ num-complex = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "fsk"
+harness = false
+
+[[bench]]
+name = "comod"
+harness = false

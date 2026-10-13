@@ -65,6 +65,14 @@ pub enum DecoderEvent {
     /// candidate," which `manta_engine::doctor()`'s `NoSignal` check needs
     /// directly rather than inferring it from decode-timing side effects
     /// (see docs/DECISIONS/2026-09-09-doctor-track-promoted-event.md).
+    ///
+    /// MAN-313 (SPEC §2.7): with `DetectorConfig::non_cw_filter` on (the
+    /// default) it is emitted lazily, when the track qualifies as keyed
+    /// CW and leases its decoder -- typically 0.5-1.5 s after promotion --
+    /// but still carries the promotion hop's `sample_ts` and `freq_hz`. A
+    /// track that never qualifies (speech, wideband data, a swept or
+    /// unkeyed carrier) never emits it. With the filter off it is emitted
+    /// at the promotion hop itself.
     TrackPromoted {
         track_id: u32,
         sample_ts: u64,

@@ -147,6 +147,37 @@ MAN-127: `manta calibrate` measures the receiver's ppm offset against a
 known carrier and saves `[input].freq_correction_ppm` after confirmation —
 see docs/DECISIONS/2026-10-11-man127-calibrate-command.md.
 
+MAN-118: `/metrics` reports decode quality node-wide, with no `track_id`
+label: `manta_decode_chars_total`/`manta_decode_garbles_total`,
+`manta_track_rail_ratio` (each `legacy` track's keying-rail ratio once per
+second) and `manta_candidate_repetitions` (the repetition gate's count per
+candidate), via `manta_engine::DecodeQualityObserver` — see
+docs/DECISIONS/2026-10-12-man118-decode-quality-metrics.md.
+
+MAN-314: RTTY (two-tone FSK) is recognised after `[detector] rtty_dwell_ms`
+(20 s) and starts no CW track on its tones or keying sidebands
+(`manta-dsp::fsk`, SPEC §2.6); `decode --json` gains `rtty`, `run` logs
+marks/clears and `/metrics` gains `manta_rtty_signals{band}`. See
+docs/DECISIONS/2026-10-11-man314-rtty-recognition.md.
+
+MAN-313: with `[detector] non_cw_filter` (default on) a promoted track
+leases a decoder and emits `TrackPromoted` only once it qualifies as keyed
+CW, so noise-like data and swept carriers start no CW track and SSB
+voice starts far fewer (`manta-dsp::comod`, SPEC §2.7; a residual of 7
+in-band tracks at +30 dB with the testkit voice, none spotted, is an open
+follow-up); a track key-down for `unkeyed_close_ms`
+(10 s) with no callsign read closes `Unkeyed`; doctor gains `NOT_CW`. See
+docs/DECISIONS/2026-10-13-man313-non-cw-rejection.md.
+
+MAN-301: `[rbn_compare]` (off by default, needs `[server]`) reads RBN's
+CW telnet feed read-only (login callsign only) and grades each spot
+`match`/`disagree`/`elsewhere`/`none`/`unknown` after a 180 s window, as a
+`spotGrade` record on :7301 and `manta_rbn_compare_*` metrics; `manta
+grade` and `score-against-rbn.py --node-log` replay offline through the
+same Rust engine. RBN's real login prompt and the live/offline agreement
+rate are unmeasured. See
+docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each

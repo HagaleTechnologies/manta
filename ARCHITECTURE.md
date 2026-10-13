@@ -226,6 +226,15 @@ its ceiling for the entire duration of a real 15-minute recording,
 lowest-SNR eviction; evictions are counted and reported (no silent
 coverage loss).
 
+RTTY (MAN-314): a two-tone FSK detector (`manta-dsp::fsk`) reads the same
+per-hop power and floor. A tone pair with anti-correlated per-hop SNR, a
+constant envelope and a standard shift (170/200/425/450/850 Hz) that lasts
+`detector.rtty_dwell_ms` (20 s) is marked as RTTY. No CW track starts on
+its tones (± 1 channel) or on splatter-level candidates nearby, and open
+tracks on its tones close. The marked set is reported in `decode --json`,
+the `run` log and the `manta_rtty_signals{band}` gauge. SPEC-decode-core.md
+§2.6 is normative.
+
 **CPU budget** (the reason this whole design is viable):
 
 | Stage | Cost at 192 kS/s | Notes |
@@ -481,6 +490,32 @@ validation (MAN-28). Dedupe (step 5) still applies.
   naming the exact binary, and the part before `+` is the release the
   decoder-output rule in `CHANGELOG.md` governs. See
   `docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md`.
+- **Spot grades on the JSON stream (MAN-301)**: with `[rbn_compare]` enabled,
+  the :7301 stream (raw TCP and WebSocket) also carries one `spotGrade`
+  record per spot, published after the spot's comparison window closes
+  (`window_secs`, default 180 s). It references the spot's `id` as `spotId`
+  and grades it `match`, `disagree`, `elsewhere`, `none` or `unknown`
+  against what RBN's skimmers reported. Spot lines are unchanged and have
+  no `kind` key; a grade line always has `"kind":"spotGrade"` and
+  deliberately no `dxCall`/`frequency`/`timestamp`, so a consumer that
+  wants spots only skips lines with a `kind` key, and MAN-96's field-node
+  scripts can never count a grade as a spot. Without the table the stream
+  is byte-identical to before. Telnet and the RBN uplink never see grades.
+  The grading engine (`manta_server::rbn_compare::grade`) is pure and
+  deterministic; `manta grade` runs it offline over a node's `spots-*.jsonl`
+  archive and RBN's daily CSV. See
+  `docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md` and
+  `docs/RUNBOOKS/rbn-comparison.md`.
+- **Inbound RBN feed client (MAN-301)**: the comparator's
+  `rbn_compare::feed` connects out to `[rbn_compare].feed_host:feed_port`
+  (`telnet.reversebeacon.net:7000`), reconnecting on `backoff.rs`'s
+  ladder, and turns `DX de` CW lines into reports. It is **read-only toward
+  RBN (normative)**: it writes exactly one line, `login_callsign` plus CRLF,
+  and never a command, filter or spot (`sends_nothing_but_the_login`).
+  It sends that login when the server's text ends a line, ends in `:`, or
+  falls silent for 10 s, so a prompt without a trailing newline cannot
+  hang it (MAN-90 finding C7). Live reports are timed by arrival, because
+  the feed's `HHMMZ` field has no date.
 - **Outbound RBN uplink (experimental)** (`uplink.rs`): one client task per
   enabled `[[rbn_uplink]]`. It connects to `target_host:target_port`, reads
   one line and ignores it, and sends the login callsign plus CRLF. Each spot
@@ -496,7 +531,7 @@ validation (MAN-28). Dedupe (step 5) still applies.
   The open claims and the capture that would settle them are in
   `docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md` and
   `docs/RUNBOOKS/aggregator-rbn-capture.md`.
-- Both servers are thin fan-out consumers of one broadcast channel; slow clients
+- Both servers are thin fan-out consumers of the spot bus; slow clients
   are disconnected, never back-pressure the pipeline. At shutdown each
   client's queued backlog is drained on a best-effort basis bounded by a
   per-client deadline (`tasks::CLIENT_DRAIN_DEADLINE`) that starts once the
@@ -536,12 +571,13 @@ validation (MAN-28). Dedupe (step 5) still applies.
 ## 8. Configuration & observability
 
 - **Single TOML config** (MAN-261,
-  `docs/DECISIONS/2026-10-06-man261-config-surface.md`): one file with six
+  `docs/DECISIONS/2026-10-06-man261-config-surface.md`): one file with seven
   tables — `[server]` (station callsign, which may carry an RBN `-N`
   per-band SSID per
   `docs/DECISIONS/2026-09-07-man-89-station-callsign-ssid-grammar.md`;
   bind address; ports),
-  `[[rbn_uplink]]`, `[input]` (source type and its keys, dial frequency,
+  `[[rbn_uplink]]`, `[rbn_compare]` (MAN-301: live grading against RBN's
+  feed; needs `[server]`), `[input]` (source type and its keys, dial frequency,
   capture rate, ppm correction), `[spot]` (watch list, blocklist and notch
   files, and `cty.dat`/`master.scp` overrides), `[detector]` (thresholds, timers, track cap) and `[decode]` —
   read by `run`, `soak`, `doctor`, `check` and `calibrate` (`--config`, else
@@ -693,10 +729,16 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `manta_uplink_target_*{target="host:port"}` (per-target labels for every
   uplink counter, derived-sum aggregates preserved under their old
   unlabeled names); and `manta_healthy`/`manta_listener_up{listener}`
-  (the same verdict `/healthz`, below, reports). What's still genuinely
-  missing: per-stage queue depths, spots/min, spot-confidence histogram,
-  and **ring**-overrun counting for live audio (§3 — blocked on
-  a `coppa-audio` API addition, `manta-engine::soak`'s documented
+  (the same verdict `/healthz`, below, reports). **MAN-118 added**
+  decode-quality families with no `track_id` label:
+  `manta_decode_chars_total`/`manta_decode_garbles_total` (counters),
+  `manta_track_rail_ratio` (each `legacy` track's keying-rail ratio, once
+  per second) and `manta_candidate_repetitions` (the repetition gate's
+  count per candidate), fed by `manta_engine::DecodeQualityObserver` — see
+  [MAN-118](docs/DECISIONS/2026-10-12-man118-decode-quality-metrics.md).
+  What's still genuinely missing: per-stage queue depths, spots/min,
+  spot-confidence histogram, and **ring**-overrun counting for live audio
+  (§3 — blocked on a `coppa-audio` API addition, `manta-engine::soak`'s documented
   deviation, a different gap from MAN-56's wire-level packet counters).
   The three `manta_input_*` series are published only for sources that
   actually count wire-level packet loss (HPSDR and KiwiSDR — MAN-128
@@ -705,6 +747,32 @@ validation (MAN-28). Dedupe (step 5) still applies.
   every other source — "absent means not measured", so an operator never
   reads a placeholder as live data; the same distinction that motivated
   the `manta_active_tracks` caveat before it was populated.
+- **RBN comparison (MAN-301)**: `[rbn_compare]` is opt-in and disabled by
+  default; disabled, it opens no connection, adds no JSON line and renders
+  no metric family. Enabled (a `[server]` table is required, and a file
+  replay is refused), `rbn_compare::live` runs three tasks beside the
+  uplink tasks: one reads the spot bus with `subscribe()` and queues each
+  spot in a pure `Grader`, one runs the feed client (§7), and a 5 s tick
+  grades every spot whose window has closed and publishes the record with
+  `SpotBus::publish_grade`. The bus has a second broadcast channel for the
+  JSON stream only: `subscribe_json()` carries every spot plus grade lines
+  in publish order, and telnet and the uplink keep `subscribe()`, which
+  carries spots only. Every `[rbn_compare]` key needs a restart; a SIGHUP
+  reload names a changed one in its restart warning. The comparator runs
+  in the async server layer, not the decode loop, so decode determinism
+  and the CPU-budget benches are untouched. Metrics, rendered only when
+  enabled: `manta_rbn_compare_grades_total{band,grade}`,
+  `manta_rbn_compare_grades_last_hour{band,grade}`,
+  `manta_rbn_compare_disagreements_last_hour{band,kind}`,
+  `manta_rbn_compare_freq_offset_median_hz{band}` and `_samples{band}`
+  (the median is a receiver-calibration signal, MAN-127),
+  `manta_rbn_compare_feed_connected`, `_feed_reports_total`,
+  `_feed_reconnects_total`, `manta_rbn_compare_pending` and
+  `manta_rbn_compare_ungraded_total`. The trailing-hour gauges keep a
+  bounded ring per key, pruned at scrape, as
+  `manta_uplink_target_recent_reconnects` does. `manta doctor` adds an
+  `rbn compare feed` reachability row that sends nothing. See
+  `docs/RUNBOOKS/rbn-comparison.md`.
 - **Source-outage counters (MAN-96)**: `manta_source_outages_total{source}`
   (healthy → unhealthy edges) and `manta_source_down_seconds_total{source}`
   (seconds in outages that have ended), counted in

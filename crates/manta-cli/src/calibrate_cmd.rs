@@ -343,6 +343,9 @@ fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<Str
         notch: _,
         cty: _,
         scp: _,
+        // Exempt: RBN comparison grades spots after decoding, not the
+        // input (calibrate has no --rbn-compare/--rbn-spotter flags).
+        rbn: _,
     } = cli;
     let mut found: Vec<String> = Vec::new();
     let mut flag = |set: bool, name: &str| {
@@ -821,6 +824,7 @@ mod tests {
             capture_rate_hz: None,
             replay_epoch: None,
             spot: crate::resolve_spot(Vec::new(), None, None, None, None, &Default::default()),
+            rbn_compare: None,
             notes: Vec::new(),
             replaced_file_source: None,
             replay: crate::ReplayMode::default(),

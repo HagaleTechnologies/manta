@@ -53,16 +53,17 @@ listed here change what the command does.
 
 | Command | Tables it applies | Environment |
 |---|---|---|
-| `run` (alias `listen`) | all six | yes |
+| `run` (alias `listen`) | all seven | yes |
 | `soak` | `[input]` `[spot]` `[detector]` `[decode]`; `[server]` is ignored with a note | yes |
-| `doctor` | `[input]` `[spot]` `[detector]` `[decode]`, plus `[server]` and `[[rbn_uplink]]` to check them without starting a server or logging in (MAN-126; see [RUNBOOKS/setup-checks.md](RUNBOOKS/setup-checks.md)) | yes |
-| `config check` | all six, resolved exactly as `run` resolves them | yes |
+| `doctor` | `[input]` `[spot]` `[detector]` `[decode]`, plus `[server]`, `[[rbn_uplink]]` and `[rbn_compare]` to check them without starting a server or logging in (MAN-126; see [RUNBOOKS/setup-checks.md](RUNBOOKS/setup-checks.md)) | yes |
+| `config check` | all seven, resolved exactly as `run` resolves them | yes |
 | `check` | `[input]`: the source, `capture_rate_hz` and `center_freq_hz` | yes |
 | `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes, but `MANTA_SERVER_*` only alongside a config file |
 | `health` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon's `/healthz`; a named config that resolves to no `[server]` table is an error | yes, but `MANTA_SERVER_*` only alongside a config file |
 | `decode` | `[decode]` `[detector]` `[spot]` and `input.freq_correction_ppm` | no |
 | `oracle` | `[decode]` | no |
 | `bench sensitivity` | `[decode]` `[detector]` | no |
+| `grade` | `[rbn_compare]` `window_secs`, the tolerances and the spotter lists, from the file `--config` names; its flags win | no |
 
 `run` starts the telnet, JSON and metrics servers, and any uplink, only when
 the resolved config has a `[server]` table. The table can come from the file
@@ -165,6 +166,27 @@ nothing, and flags an example `login_callsign`.
 | `dry_run` | `true` | live: `run` with `[server]`; reloads on SIGHUP | `true` connects and logs in but sends no spots. See [RUNBOOKS/uplink-health.md](RUNBOOKS/uplink-health.md). |
 | `spot_types` | `"cq_beacon"` | live: `run` with `[server]` | `"cq_beacon"` sends CQ and beacon spots only, as RBN requires; `"all"` sends every spot. Telnet and JSON still carry every spot. |
 
+## [rbn_compare]
+
+Live comparison with the Reverse Beacon Network (MAN-301), off by default.
+Enabling it needs a `[server]` table. `run` (and so `config check` and a
+SIGHUP reload) refuses it on a replayed recording; `soak` never starts it. `doctor` opens and immediately closes
+one TCP connection to `feed_host:feed_port`, sending nothing. See
+[RUNBOOKS/rbn-comparison.md](RUNBOOKS/rbn-comparison.md).
+
+| Key | Default | Wired | Notes |
+|---|---|---|---|
+| `enabled` | `false` | live: `run` with `[server]` | `--rbn-compare` turns it on for one run. |
+| `feed_host` | `"telnet.reversebeacon.net"` | live: `run` with `[server]`; `doctor` | RBN's public telnet feed. manta logs in and sends nothing else. |
+| `feed_port` | `7000` | live: `run` with `[server]`; `doctor` | RBN's CW and RTTY feed; manta keeps CW reports only. |
+| `login_callsign` | none; example `"N0CALL"`; unset logs in as `station_callsign` | live: `run` with `[server]` | Callsign sent at login. |
+| `window_secs` | `180` | live: `run` with `[server]`; `grade` | 30 to 3600. RBN reports within this many seconds of a spot count. |
+| `freq_tol_hz` | `500.0` | live: `run` with `[server]`; `grade` | Further than this from RBN's modal frequency is a frequency disagreement. |
+| `speed_tol_wpm` | `3.0` | live: `run` with `[server]`; `grade` | A speed disagreement needs more than this many WPM ... |
+| `speed_tol_pct` | `20.0` | live: `run` with `[server]`; `grade` | ... and more than this percent of RBN's median speed. |
+| `spotters` | `[]` | live: `run` with `[server]`; `grade` | Only these RBN skimmers count. `--rbn-spotter` replaces it. |
+| `exclude_spotters` | `[]` | live: `run` with `[server]`; `grade` | Never count these skimmers. This station's own callsign is always excluded. |
+
 ## [input]
 
 The receiver. `decode` never reads the source keys, and a command-line source
@@ -222,6 +244,10 @@ milliseconds, 0 to 3600000.
 | `warmup_ms` | `25.0` | live | Start-up time spent measuring the noise; no track opens before it ends. 0 to 3600000 (1 h); 0 means no warmup. |
 | `track_cap` | `1200` | live | Most tracks open at once, counting unconfirmed candidates that have no decoder yet; past it the lowest-SNR track is evicted. At least 1. |
 | `silent_respawn_cooldown_ms` | `30000.0` | live | Wait before a channel whose track went silent may start another. 0 to 3600000 (1 h); 0 means no cooldown. |
+| `rtty_filter` | `true` | live | Recognise RTTY (two-tone FSK) signals and start no CW track on them or their keying sidebands; `false` restores the previous behaviour. See [SPEC §2.6](SPEC-decode-core.md#26-two-tone-fsk-rtty-recognition) and [MAN-314](DECISIONS/2026-10-11-man314-rtty-recognition.md). |
+| `rtty_dwell_ms` | `20000.0` | live | How long an FSK signal must last before it is marked as RTTY; 1000 to 3600000 (1 h), counted in whole 1000 ms detector blocks. |
+| `non_cw_filter` | `true` | live | A new track is decoded only once it shows CW keying. Speech (SSB), noise-like wideband data and swept carriers never start a CW track, and a track whose signal stops keying closes after `unkeyed_close_ms`. `false` restores the pre-MAN-313 behaviour. See [SPEC §2.7](SPEC-decode-core.md#27-non-cw-rejection) and [MAN-313](DECISIONS/2026-10-13-man313-non-cw-rejection.md). Restart required (every `[detector]` key is). |
+| `unkeyed_close_ms` | `10000.0` | live | With `non_cw_filter` on, two limits: how long a qualified track may stay key-down with no keying, no decoded character and no callsign read before it closes; and how long a new track may take to show CW keying. Range 1000 to 3600000 (1 h). |
 
 ## [decode]
 

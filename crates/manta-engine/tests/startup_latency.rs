@@ -95,9 +95,7 @@ fn pure_noise_from_segment_start_promotes_nothing() {
         // or the "only detector promotion events" error) means a noise
         // track was promoted.
         match decode_samples(&iq, FS, CENTER_HZ, &PipelineConfig::default()) {
-            Err(e)
-                if e.to_string()
-                    .contains("input shorter than one filter length or empty") => {}
+            Err(e) if e.to_string() == "no signal found (no keyed CW signal in the input)" => {}
             Err(e) => panic!("noise seed {seed}: expected no promoted tracks, got: {e}"),
             Ok(report) => {
                 let promoted = report
