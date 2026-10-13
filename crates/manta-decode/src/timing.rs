@@ -17,7 +17,7 @@ const DRIFT_LEN: usize = 12; // SPEC §4.1 regime-change rule
 const DRIFT_CV_MAX: f64 = 0.35;
 const DRIFT_OFF_FRAC: f64 = 0.40;
 /// Two-sided cap on the mark/gap symmetry correction (`dit_estimate_ms`),
-/// as a fraction of `mu_dit`. SPEC §4.1 **[DEVIATION]** (MAN-103 D6). Bounds
+/// as a fraction of `mu_dit`. SPEC §4.1 **\[DEVIATION\]** (MAN-103 D6). Bounds
 /// a runaway if mark/gap pairing ever breaks down (e.g. element gaps
 /// swallowed by the 12 ms debounce at extreme WPM) while still admitting
 /// the correction a correctly-placed SPEC §3.3 keying threshold requires --
@@ -75,7 +75,7 @@ const FARNS_MIN_RATIO: f32 = 1.8;
 /// Bounds of the sender word boundary `SenderTiming::sender_word_dits`
 /// hands `GapClassifier`, in dits. The floor keeps it above the 2.0
 /// element/character boundary; gaps past the flush are flushed anyway.
-/// SPEC §4.2 **[DEVIATION]** (MAN-315 D4).
+/// SPEC §4.2 **\[DEVIATION\]** (MAN-315 D4).
 const SENDER_WORD_DITS_CLAMP: (f32, f32) = (3.0, 12.0);
 /// Observations both mark classes need before their mean ratio becomes
 /// `SpeedTracker`'s re-anchor target (MAN-315 D5).
@@ -268,12 +268,12 @@ pub struct SpeedTracker {
     ring: VecDeque<(f32, bool, f32, f32)>, // (dur_ms, assigned_dit, pre_lo, pre_hi)
     wpm_ema: Option<f32>,
     recent: VecDeque<f32>, // last 5 marks, reinit source
-    /// Inter-element gap centroid, in ms. SPEC §4.1 **[DEVIATION]** (MAN-103
+    /// Inter-element gap centroid, in ms. SPEC §4.1 **\[DEVIATION\]** (MAN-103
     /// D6): feeds `dit_estimate_ms`'s mark/gap symmetry correction.
     mu_egap_ms: Option<f32>,
     /// The sender's learned dash/dot ratio, the re-anchor target
     /// `apply_constraints` uses in place of the ideal 3.0. SPEC §4.1
-    /// **[DEVIATION]** (MAN-315 D5).
+    /// **\[DEVIATION\]** (MAN-315 D5).
     ratio_hint: Option<f32>,
     /// Generation counter, bumped whenever a drift re-init rebuilds the
     /// mark scale, so a caller holding statistics in the old scale's units
@@ -324,7 +324,7 @@ impl SpeedTracker {
     /// Set (or clear) the dash/dot ratio `apply_constraints` re-anchors
     /// `mu_dah` to when the ratio leaves `[2.2, 6.0]`. `None` restores the
     /// ideal 3.0. The hint is clamped to the same bounds. SPEC §4.1
-    /// **[DEVIATION]** (MAN-315 D5).
+    /// **\[DEVIATION\]** (MAN-315 D5).
     pub fn set_ratio_hint(&mut self, hint: Option<f32>) {
         self.ratio_hint = hint
             .filter(|r| r.is_finite())
@@ -491,7 +491,7 @@ pub struct GapClassifier {
     rebuilt_disproof_dits: f32,
     /// The sender's own character/word boundary, in dits, used by
     /// `classify` in place of `WORD_GAP_DITS` while Farnsworth is not
-    /// active. SPEC §4.2 **[DEVIATION]** (MAN-315 D4).
+    /// active. SPEC §4.2 **\[DEVIATION\]** (MAN-315 D4).
     sender_word_dits: Option<f32>,
 }
 
@@ -522,7 +522,7 @@ impl GapClassifier {
     /// Set (or clear) the sender word boundary, in dits, that `classify`
     /// uses while Farnsworth is not active; `None` restores the nominal
     /// `WORD_GAP_DITS`. The Farnsworth pair still wins when active. SPEC
-    /// §4.2 **[DEVIATION]** (MAN-315 D4).
+    /// §4.2 **\[DEVIATION\]** (MAN-315 D4).
     pub fn set_sender_word_dits(&mut self, dits: Option<f32>) {
         self.sender_word_dits = dits.filter(|d| d.is_finite());
     }
