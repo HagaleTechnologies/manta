@@ -658,6 +658,58 @@ fn wiki_page_body(page: &str) -> &str {
         .expect("wiki page has a complete frontmatter block")
 }
 
+/// The frontmatter fields a `wiki/manifest.json` entry copies from its page,
+/// in the manifest's shape: `locked` is `false` unless the page says
+/// otherwise, and `links: []` is an empty list.
+fn wiki_mirrored_frontmatter(rel: &str, page: &str) -> serde_json::Value {
+    let front = page
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n"))
+        .map(|(front, _)| front)
+        .unwrap_or_else(|| panic!("{rel} has no complete `---` frontmatter block"));
+    let lines: Vec<&str> = front.lines().collect();
+    let scalar = |key: &str| -> Option<&str> {
+        lines
+            .iter()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix(':').map(str::trim))
+    };
+    let required = |key: &str| -> &str {
+        scalar(key).unwrap_or_else(|| panic!("{rel} frontmatter has no `{key}` field"))
+    };
+    let list = |key: &str| -> Vec<&str> {
+        match required(key) {
+            "[]" => Vec::new(),
+            "" => lines
+                .iter()
+                .skip_while(|l| {
+                    l.strip_prefix(key)
+                        .and_then(|r| r.strip_prefix(':'))
+                        .is_none()
+                })
+                .skip(1)
+                .map_while(|l| l.strip_prefix("  - "))
+                .map(str::trim)
+                .collect(),
+            other => panic!("{rel} frontmatter `{key}: {other}` is not a list"),
+        }
+    };
+    let locked = match scalar("locked") {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => panic!("{rel} frontmatter `locked: {other}` is not a boolean"),
+    };
+    serde_json::json!({
+        "id": required("id"),
+        "title": required("title"),
+        "kind": required("kind"),
+        "status": required("status"),
+        "maintainer": required("maintainer"),
+        "locked": locked,
+        "sources": list("sources"),
+        "links": list("links"),
+    })
+}
+
 fn wiki_page_stems(names: Vec<String>) -> Vec<String> {
     let mut stems: Vec<String> = names
         .into_iter()
@@ -678,6 +730,30 @@ fn wiki_manifest_hash_input_excludes_frontmatter() {
 }
 
 #[test]
+fn wiki_manifest_mirrors_every_copied_frontmatter_field() {
+    let page = "---\nid: example\ntitle: What is this?\nkind: gotcha\nstatus: current\n\
+                maintainer: agent\nsources:\n  - README.md\n  - docs/X.md#anchor\n\
+                verified:\n  commit: abc1234\n  date: 2026-10-13\nlinks: []\n---\nBody.\n";
+    assert_eq!(
+        wiki_mirrored_frontmatter("example.md", page),
+        serde_json::json!({
+            "id": "example",
+            "title": "What is this?",
+            "kind": "gotcha",
+            "status": "current",
+            "maintainer": "agent",
+            "locked": false,
+            "sources": ["README.md", "docs/X.md#anchor"],
+            "links": [],
+        })
+    );
+    let locked = page.replace("links: []\n", "locked: true\nlinks: \n  - overview\n");
+    let fields = wiki_mirrored_frontmatter("example.md", &locked);
+    assert_eq!(fields["locked"], true);
+    assert_eq!(fields["links"], serde_json::json!(["overview"]));
+}
+
+#[test]
 fn wiki_manifest_orders_prefix_ids_by_stem() {
     // md_files_in sorts these filenames in this order, before removing .md.
     let names = vec!["determinism-ci.md".into(), "determinism.md".into()];
@@ -691,6 +767,9 @@ fn wiki_manifest_orders_prefix_ids_by_stem() {
 /// stamps older than the decision records their own pages cite. A page
 /// edit now has to carry the manifest with it. A hash is the SHA-256 of
 /// the body after the closing frontmatter delimiter, matching wiki-manifest/v1.
+/// The hash does not cover the frontmatter, so each entry's `id`, `title`,
+/// `kind`, `status`, `maintainer`, `locked`, `sources`, `links` and
+/// `verified_*` are compared with the page's frontmatter separately.
 /// `doc()` normalises CRLF to LF, so a Windows checkout hashes the same.
 #[test]
 fn wiki_manifest_lists_every_page_with_a_matching_hash() {
@@ -752,6 +831,21 @@ fn wiki_manifest_lists_every_page_with_a_matching_hash() {
             want,
             "wiki/manifest.json's hash for `{id}` does not match {rel}: the page changed \
              without the manifest; regenerate its entry"
+        );
+
+        let mirrored = wiki_mirrored_frontmatter(&rel, &page);
+        for (key, want) in mirrored.as_object().expect("mirrored fields are an object") {
+            assert_eq!(
+                &entry[key.as_str()],
+                want,
+                "wiki/manifest.json's `{key}` for `{id}` disagrees with {rel}'s frontmatter: \
+                 the page changed without the manifest; regenerate its entry"
+            );
+        }
+        // A public repository's pages are all public, whatever a page asks for.
+        assert_eq!(
+            entry["visibility"], manifest["visibility"],
+            "wiki/manifest.json entry `{id}` must carry the repository's visibility"
         );
 
         let (commit, date) = wiki_verified_stamp(&rel);
