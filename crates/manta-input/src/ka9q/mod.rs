@@ -52,6 +52,11 @@ const RCVBUF_BYTES: usize = 4 << 20;
 /// as many packets as fit in 10 s, the HPSDR/Kiwi stall bound.
 const SEQ_WINDOW_S: f64 = 10.0;
 
+/// What each stashed packet is charged toward the stash cap on top of its
+/// payload (roughly a `Vec`'s heap header and the deque slot), so a flood
+/// of zero-length or tiny datagrams cannot grow the stash without bound.
+const STASH_PACKET_OVERHEAD: usize = 64;
+
 /// The most channels `open` remembers while choosing one (D7), so status
 /// packets with ever-new SSRCs from a host on the group cannot grow memory
 /// for the whole open wait.
@@ -512,8 +517,9 @@ impl Ka9qIqSource {
 /// the kernel's receive buffer cannot overflow while nothing reads it: on
 /// Linux's default grant it holds only ~0.17 s of 192 kS/s `f32` IQ, less
 /// than the 1.5 s no-SSRC settle window. It always drains the socket to
-/// empty. The stash keeps the newest `cap` bytes (plus the datagram that
-/// crosses it), dropping its own oldest packets past that, so a fast
+/// empty. The stash keeps the newest `cap` bytes (each packet charged its
+/// length plus `STASH_PACKET_OVERHEAD`, so empty datagrams count too),
+/// dropping its own oldest packets past that, so a fast
 /// channel never overflows the kernel and the replay in `open` runs
 /// straight into the socket's next packet with no gap. `open` replays the
 /// stash through `accept_rtp` once the channel is chosen.
@@ -528,10 +534,10 @@ fn stash_data(
         match sock.recv(buf) {
             Ok(n) => {
                 stash.push_back(buf[..n].to_vec());
-                *stashed += n;
+                *stashed += n + STASH_PACKET_OVERHEAD;
                 while *stashed > cap && stash.len() > 1 {
                     let old = stash.pop_front().expect("len > 1");
-                    *stashed -= old.len();
+                    *stashed -= old.len() + STASH_PACKET_OVERHEAD;
                 }
             }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
@@ -754,16 +760,37 @@ mod tests {
         let mut buf = vec![0u8; RECV_BUF_LEN];
         let mut stash = VecDeque::new();
         let mut stashed = 0;
-        stash_data(&rx, &mut buf, &mut stash, &mut stashed, 300).unwrap();
+        let cap = 3 * (100 + STASH_PACKET_OVERHEAD);
+        stash_data(&rx, &mut buf, &mut stash, &mut stashed, cap).unwrap();
         let kept: Vec<u8> = stash.iter().map(|p| p[0]).collect();
         assert_eq!(kept, vec![7, 8, 9]);
-        assert_eq!(stashed, 300);
+        assert_eq!(stashed, cap);
         let e = rx.recv(&mut buf).unwrap_err();
         assert_eq!(
             e.kind(),
             ErrorKind::WouldBlock,
             "the socket must be drained"
         );
+    }
+
+    /// Zero-length datagrams carry no bytes but still cost memory, so they
+    /// count toward the cap and cannot grow the stash without bound.
+    #[test]
+    fn zero_length_datagrams_count_toward_the_stash_cap() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for _ in 0..50 {
+            tx.send_to(&[], rx.local_addr().unwrap()).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let mut buf = vec![0u8; RECV_BUF_LEN];
+        let mut stash = VecDeque::new();
+        let mut stashed = 0;
+        let cap = 4 * STASH_PACKET_OVERHEAD;
+        stash_data(&rx, &mut buf, &mut stash, &mut stashed, cap).unwrap();
+        assert_eq!(stash.len(), 4);
+        assert!(stashed <= cap);
     }
 
     #[test]

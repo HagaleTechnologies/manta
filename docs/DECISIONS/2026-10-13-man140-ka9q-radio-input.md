@@ -126,8 +126,9 @@ guide tells operators to raise `net.core.rmem_max`, since Linux grants 416 KiB
 by default. One reused 64 KiB receive buffer, for HPSDR's `RECV_BUF_LEN`
 reason. While `open` waits for status it also drains the data socket —
 non-blocking, to empty, between status receives that wait at most 10 ms
-(`WAIT_POLL`) — into an app-side stash that keeps the newest 4 MiB, dropping
-its own oldest packets past that, and replays the stash through `accept_rtp`
+(`WAIT_POLL`) — into an app-side stash that keeps the newest 4 MiB (each
+packet charged its length plus 64 bytes, so a flood of empty datagrams is
+bounded too), dropping its own oldest packets past that, and replays the stash through `accept_rtp`
 once the channel is chosen. The drain never stops, so no `validate`-accepted
 rate can overflow the kernel during the wait (Linux's default grant holds
 ~70 ms of 768 kS/s `f32le`), and keeping the newest packets means the replay
