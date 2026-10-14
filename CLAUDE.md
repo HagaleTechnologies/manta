@@ -220,7 +220,6 @@ pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
 planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
-<<<<<<< HEAD
 MAN-174: within a `process_hops` batch a merge loser's `TrackClosed`
 precedes its survivor's, and a merge survivor that never emitted still
 gets its own `TrackClosed`, so a deferred Beacon migrated along a merge
@@ -229,14 +228,13 @@ chain resolves at the final survivor's close. `SuppressionCounts` adds
 are kept in `sample_ts` order, so the cap evicts the true oldest, and an
 equal-timestamp one goes through dedupe. SPEC §5/§6 and V22/V25 match. See
 docs/DECISIONS/2026-10-14-man174-deferred-beacon-merge-bookkeeping.md.
-=======
+
 MAN-95: `[spot].validation_level` defaults to `normal`: common, listed and
 unlisted callsign patterns need 2, 3 and 5 distinct-message repetitions.
 `minimal` keeps flat 2. The independent list derived from MASTER.SCP is
 replaced by `--patterns` / `[spot].pattern_path`; allowlist and beacon
 exemptions stay. Live decisions report `requiredReps` and `patternTier`.
 See docs/DECISIONS/2026-10-14-man95-pattern-rarity-repetition-tiers.md.
->>>>>>> 525edb731d8b6321aea2f286716992d30ef462b1
 
 ## Documents (read in this order)
 

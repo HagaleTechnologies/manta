@@ -24,18 +24,15 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
-<<<<<<< HEAD
 - MAN-174: a deferred Beacon candidate on a track that merged into another
   track which closed in the same batch now resolves at the final survivor's
   close instead of being lost; one whose timestamp equals an existing
   spot's goes through normal dedupe; a merge keeps the newest eight pending
   candidates by time.
-=======
 - MAN-95: default spot validation requires 2, 3 or 5 distinct-message
   repetitions by callsign-pattern rarity. `[spot].validation_level = "minimal"`
   restores flat 2; `--patterns` overrides the independent reference list.
 
->>>>>>> 525edb731d8b6321aea2f286716992d30ef462b1
 - A band-wide static crash (lightning) no longer starts tracks across the
   band, and running tracks no longer decode it as extra dits; new
   `[detector].crash_filter`, default `"full"` (MAN-312).
