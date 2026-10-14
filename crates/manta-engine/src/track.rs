@@ -1832,14 +1832,15 @@ impl TrackManager {
         // gate's smoothed power. Falling leakage skirts cannot start a
         // spawn decision. Preserve the same-hop adjacent-rise arbitration.
         // MAN-312: no track starts during a static crash ("starts-only"
-        // and "full").
+        // and "full"). MAN-197: the respawn cooldown gates a candidate's
+        // whole prospective ownership window, not just its birth channel.
         if past_warmup && !suppress {
             let n = self.n_channels();
             let mut k = 0;
             while k < n {
                 if rise[k]
                     && self.owner_of[k].is_none()
-                    && !self.channel_cooling_down(k)
+                    && !self.spawn_window_cooling_down(k)
                     && self.is_local_peak(k)
                     && !self.rtty_vetoes_spawn(k)
                 {
@@ -1847,7 +1848,7 @@ impl TrackManager {
                     if k + 1 < n
                         && rise[k + 1]
                         && self.owner_of[k + 1].is_none()
-                        && !self.channel_cooling_down(k + 1)
+                        && !self.spawn_window_cooling_down(k + 1)
                         && !self.rtty_vetoes_spawn(k + 1)
                     {
                         if hop.power[k + 1] > hop.power[winner] {
@@ -1916,6 +1917,19 @@ impl TrackManager {
     /// cooldown (`DetectorConfig::silent_respawn_cooldown_hops`)?
     fn channel_cooling_down(&self, k: usize) -> bool {
         self.channel_cooldown_until[k] > self.hop_counter
+    }
+
+    /// MAN-197: would a CANDIDATE born on `k` immediately come to own a
+    /// channel still serving a post-`Silent` cooldown? `Track::owned` is
+    /// the wrapping 3-channel window `{k-1, k, k+1}`, so gating only the
+    /// birth channel let a neighbour-born candidate absorb the cooling
+    /// channel via `select_channel`'s max-power rule and track it for a
+    /// full illegitimate promote/decode cycle inside the cooldown window.
+    fn spawn_window_cooling_down(&self, k: usize) -> bool {
+        let n = self.n_channels();
+        [(k + n - 1) % n, k, (k + 1) % n]
+            .into_iter()
+            .any(|ch| self.channel_cooling_down(ch))
     }
 
     /// Birth a new CANDIDATE track on `birth_channel`. Its `current_snr_db`
@@ -3758,6 +3772,100 @@ mod tests {
             repromoted,
             "a new signal on channel 10 was suppressed by a stale cooldown after the old \
              signal's rise genuinely dropped -- the cooldown must clear on a real RF gap"
+        );
+    }
+
+    /// Regression, MAN-197: a spawn candidate's prospective 3-channel
+    /// ownership window must not intersect any channel still serving a
+    /// post-`Silent` cooldown. Arming (`step_hop`'s Silent-close retain)
+    /// and living (`Track::owned`/`select_channel`) are window-granularity
+    /// operations, but the spawn gate checked only the birth channel -- so
+    /// after a birdie on channel 10 closed Silent (arming {9,10,11}) and the
+    /// round-4 per-channel clear released 9 and 11 (their own `rise` was
+    /// false), a candidate born on 9 passed the gate and absorbed still-
+    /// cooling channel 10 via `select_channel`'s max-power rule, tracking
+    /// the birdie for a full illegitimate promote/decode cycle inside the
+    /// cooldown window. Measured pre-fix: spawn at hop 15050 while channel
+    /// 10's cooldown was armed until 26282.
+    #[test]
+    fn neighbour_spawn_cannot_absorb_a_cooling_down_channel() {
+        let n = 64;
+        let mut tm = TrackManager::new(
+            n,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, n);
+        let mut power = quiet_power(n);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0); // birdie: +20 dB, never decodes
+
+        // One full promote -> gc_hops Silent-close cycle, driving step_hop
+        // directly so no character is ever decoded (same harness as the
+        // sibling MAN-171 tests).
+        let mut m = 250u64 * 15;
+        let mut promotions = 0u32;
+        for _ in 0..12_000 {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            promotions += promoted
+                .iter()
+                .filter(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
+                .count() as u32;
+            m += 1;
+            if promotions > 0 && tm.tracks.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            promotions, 1,
+            "expected exactly one promotion before the Silent close"
+        );
+        assert_eq!(tm.tracks.len(), 0, "the closed track must be gone");
+
+        // One more hop: 9/11 cooldowns clear (own rise false), 10 stays armed.
+        tm.step_hop(&hop(m, power.clone()), m);
+        m += 1;
+        assert!(
+            tm.channel_cooling_down(10),
+            "channel 10 must still be cooling down"
+        );
+        let until = tm.channel_cooldown_until[10];
+
+        // A strong new signal appears on channel 9 (strong enough to be a
+        // local peak against the birdie). Its prospective window {8,9,10}
+        // intersects the cooling channel, so no track may spawn before
+        // expiry. NOTE: `step_hop` increments hop_counter before the spawn
+        // scan, so the gate sees the cooldown expired on calls with
+        // m + 1 >= until -- stop one hop short.
+        let mut neighbour = power.clone();
+        neighbour[9] = 1e-9 * 10f32.powf(30.0 / 10.0);
+        while m + 1 < until {
+            tm.step_hop(&hop(m, neighbour.clone()), m);
+            m += 1;
+            assert!(
+                tm.tracks.is_empty(),
+                "MAN-197: a candidate spawned on channel 9 at hop {m} while channel 10's \
+                 cooldown (until {until}) was still armed"
+            );
+        }
+        // Rate limit, not denylist: once the cooldown expires the channel-9
+        // signal must be allowed to spawn and promote.
+        let mut repromoted = false;
+        for _ in 0..300 {
+            let (_, promoted, _) = tm.step_hop(&hop(m, neighbour.clone()), m);
+            m += 1;
+            if promoted
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
+            {
+                repromoted = true;
+                break;
+            }
+        }
+        assert!(
+            repromoted,
+            "channel 9 never promoted even after channel 10's cooldown expired"
         );
     }
 
