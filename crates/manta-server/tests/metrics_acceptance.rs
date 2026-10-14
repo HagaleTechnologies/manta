@@ -118,6 +118,11 @@ async fn operator_get_request_sees_spot_count_active_tracks_and_source_health() 
 
     assert!(body.contains("manta_spots_total 3"), "body: {body}");
     assert!(body.contains("manta_active_tracks 7"), "body: {body}");
+    // MAN-312: present from the first scrape, before any crash is injected.
+    assert!(
+        body.contains("\nmanta_static_crashes_total 0\n"),
+        "body: {body}"
+    );
     assert!(
         body.contains(r#"manta_source_health{source="soapy0"} 1"#),
         "body: {body}"

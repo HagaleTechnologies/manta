@@ -233,6 +233,8 @@ fn pileup_signals() -> Vec<SignalSpec> {
             let wpm = 18.0 + (i as f32 * 7.0) % 18.0; // 18..36 WPM spread
             let snr_2500_db = 4.0 + (i as f32 * 5.0) % 20.0; // 4..24 dB spread
             SignalSpec {
+                dit_units: 1.0,
+                element_gap_units: 1.0,
                 text: format!("CQ CQ DE {call} {call} K"),
                 loop_text: true,
                 wpm,
@@ -260,6 +262,8 @@ fn pileup_signals() -> Vec<SignalSpec> {
     // unit test (`soak_reports_no_panic_on_a_clean_short_signal`), which
     // is proven to decode "CQ CQ DE W1AW W1AW K" end to end.
     signals.push(SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: "CQ CQ DE N1CLR N1CLR K".to_string(),
         loop_text: true,
         wpm: 20.0,
@@ -307,6 +311,15 @@ impl IqSource for LoopingAudioIqSource {
 
     fn center_freq_hz(&self) -> f64 {
         0.0 // audio has no RF reference, matches AudioIqSource
+    }
+
+    // MAN-312: matches AudioIqSource, so `soak_with_metrics` judges static
+    // crashes over the same rig-audio passband `manta run` does.
+    fn rf_passband_hz(&self) -> (f64, f64) {
+        (
+            manta_input::AUDIO_PASSBAND_LO_HZ,
+            manta_input::AUDIO_PASSBAND_HI_HZ,
+        )
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
@@ -445,6 +458,7 @@ fn main() -> Result<()> {
                 "evicted": s.close_counts.evicted,
                 "rtty": s.close_counts.rtty,
             },
+            "static_crashes": s.static_crashes,
         });
         let text = match serde_json::to_string(&line) {
             Ok(t) => t,
@@ -569,6 +583,7 @@ fn main() -> Result<()> {
             "evicted": report.final_close_counts.evicted,
             "rtty": report.final_close_counts.rtty,
         },
+        "static_crashes": report.final_static_crashes,
         "man19_criteria": {
             "no_crash": no_crash,
             "no_input_overrun_by_construction": no_input_overrun,

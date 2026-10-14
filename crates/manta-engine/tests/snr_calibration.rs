@@ -16,6 +16,8 @@ const NOISE_SEED: u64 = 0x534B_494D_5631; // "SKIMV1", same seed V1 uses.
 /// itself a MAN-102 regression: see the calibration decision record.
 fn try_reported_snr_for(true_snr_2500_db: f32) -> Option<f32> {
     let sig = SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: "CQ CQ DE W1AW W1AW K".into(),
         loop_text: true,
         wpm: 20.0,

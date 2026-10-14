@@ -36,6 +36,8 @@ impl manta_input::IqSource for FixedFreqSource {
 #[test]
 fn listen_emits_a_spot_via_on_spot() {
     let sig = SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: "CQ CQ DE K5ARH K5ARH K".into(),
         loop_text: true,
         wpm: 20.0,

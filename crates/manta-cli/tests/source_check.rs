@@ -266,6 +266,8 @@ fn source_selectors_conflict_before_any_source_is_opened() {
             "--kiwi-freq-hz",
             "7030000",
         ],
+        vec!["missing.wav", "--ka9q-group", "239.1.2.3"],
+        vec!["--ka9q-group", "239.1.2.3", "--device", "dummy"],
     ] {
         let output = check(dir.path(), &args);
         status(&output, 2);

@@ -15,6 +15,8 @@ fn v1_lite_decodes_end_to_end() {
     // 20 s slice of the V1 scene: same parameters, faster test. The full
     // 120 s V1 gate lives in manta-cli/tests/golden_v1.rs.
     let sig = SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: "CQ CQ DE W1AW W1AW K".into(),
         loop_text: true,
         wpm: 20.0,
