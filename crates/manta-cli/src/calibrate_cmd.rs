@@ -349,6 +349,8 @@ fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<Str
         notch: _,
         cty: _,
         scp: _,
+        cty_sha256: _,
+        scp_sha256: _,
         patterns: _,
         // Exempt: RBN comparison grades spots after decoding, not the
         // input (calibrate has no --rbn-compare/--rbn-spotter flags).

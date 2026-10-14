@@ -1427,7 +1427,7 @@ freq_correction_ppm = 0.0
 # replay_epoch = 1700000000
 
 [spot]
-# allowlist, blocklist_path and notch_path are re-read on SIGHUP when the config has a [server] table (MAN-78); cty_path, scp_path, pattern_path and validation_level need a restart.
+# allowlist, blocklist_path and notch_path are re-read on SIGHUP when the config has a [server] table (MAN-78); every other [spot] key needs a restart.
 # Operator Watch List (§6, MAN-28): callsigns here bypass grammar/cty
 # validation and the repetition gate entirely in manta-spot's validator.
 # A non-empty --allowlist replaces this list.
@@ -1450,6 +1450,27 @@ allowlist = []
 # Download: https://www.supercheckpartial.com/MASTER.SCP
 # Same path rule. Unset: bundled. --scp overrides it.
 # scp_path = "MASTER.SCP"
+# Scheduled list refresh (MAN-316). Opt-in; only `run` from a live
+# receiver downloads. cty.dat is checked every 7 days and MASTER.SCP every
+# day (If-Modified-Since); a download replaces the table in use only after
+# it parses and passes the acceptance checks, and a failure keeps the
+# current table and retries in 1 hour. File replay never downloads and
+# never reads the cache's latest copy. Skipped for a list that a path or
+# a SHA-256 pin below sets.
+# refresh_lists = false
+# Accepted downloads, content-addressed (cty/<sha256>.dat,
+# scp/<sha256>.scp, state.json). Same path rule. Unset: memory only.
+# list_cache_dir = "/var/cache/manta"
+# http:// only (no TLS); https:// is refused at load.
+# cty_url = "http://www.country-files.com/cty/cty.dat"
+# scp_url = "http://www.supercheckpartial.com/MASTER.SCP"
+# Pin a list by the SHA-256 of its bytes (64 hex digits), for every
+# validating command: a set cty_path/scp_path must match it; otherwise it
+# is looked up in the bundled copy, then list_cache_dir. No match stops
+# before the source is read.
+# --cty-sha256 / --scp-sha256 override them.
+# cty_sha256 = "e9ff91a3c3ab28c5f7dbcffb4280944a84645ed53d41cb4c68a41f132ee13fd1"
+# scp_sha256 = "00692208fa86b1498dcd6fc0f88e14d2a1a0462ba5d481855da5de69be4e3cf0"
 # Pattern tier counts: normal = common 2 / listed 3 / unlisted 5; minimal = 2 for all.
 # Allowlisted calls and beacons stay exempt.
 validation_level = "normal"

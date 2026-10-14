@@ -68,7 +68,7 @@ in `RUNBOOKS/monitoring/`; see
 
 ## Metric families
 
-All 60 families, in the order `/metrics` renders them. Every family's
+All 63 families, in the order `/metrics` renders them. Every family's
 `# HELP` and `# TYPE` lines are always rendered, except two groups at the
 end of the table: the ten RBN comparison families (MAN-301), rendered only
 when `[rbn_compare]` is enabled, and the three live-state families
@@ -100,6 +100,9 @@ missing series as "no loss" or "no traffic".
 | `manta_input_dropped_packets_total` | counter | `source` | Input packets estimated lost in transit before reaching the decoder. | HPSDR, KiwiSDR and ka9q-radio sources only: from startup at 0, sampled every second, summed across reconnects. Other sources (file, audio, SoapySDR) show the `# TYPE` line but no samples: absent, not zero. |
 | `manta_input_gaps_detected_total` | counter | `source` | Distinct input-stream gap events detected. One gap may account for several dropped packets. | HPSDR, KiwiSDR and ka9q-radio sources only, as for `manta_input_dropped_packets_total`. Other sources: absent, not zero. |
 | `manta_input_malformed_packets_total` | counter | `source` | Input datagrams discarded as malformed: wrong length, or correct length but failed framing or sync validation (MAN-22). | HPSDR, KiwiSDR and ka9q-radio sources only, as for `manta_input_dropped_packets_total`. Other sources: absent, not zero. |
+| `manta_list_info` | gauge | `list`, `sha256`, `origin` | Always 1. Names the reference list each consumer uses now: `list` is `cty` or `scp`; `sha256` is the SHA-256 of its bytes; `origin` is `bundled`, `file`, `cache` or `download`. A swap replaces the series. | Always with `[server]`; one series per list. |
+| `manta_list_refresh_total` | counter | `list`, `outcome` | Download attempts by outcome: `updated` (a new version passed the checks and is in use), `unchanged` (304, or the same bytes), `failed` (network or HTTP error, or rejected by the checks). | With `refresh_lists` on, for each list the refresher manages; all three outcomes start at 0. No samples otherwise. |
+| `manta_list_last_success_timestamp_seconds` | gauge | `list` | Unix time manta last confirmed the list in use is current with its URL (an `updated` or `unchanged` attempt, or the cache's `checked_at` at startup). Alert on `time() - manta_list_last_success_timestamp_seconds{list="cty"} > 8*86400`. | With `refresh_lists` on, once the list has been confirmed at least once. Absent means never confirmed. |
 | `manta_uplink_sent_total` | counter | — | Spots forwarded to RBN uplink targets; the sum over every configured target. | Always, one series. Stays 0 with no `[[rbn_uplink]]` configured. |
 | `manta_uplink_suppressed_total` | counter | — | Spots not sent to an RBN uplink target because of `dry_run` or its `spot_types` setting; the sum over every configured target. | Always, one series. Stays 0 with no `[[rbn_uplink]]` configured. |
 | `manta_uplink_dropped_lagged_total` | counter | — | Spots the uplink fell behind on and lost before its next reconnect; the sum over every configured target. | Always, one series. Stays 0 with no `[[rbn_uplink]]` configured. |
@@ -297,6 +300,8 @@ For what each uplink state means and what to do about it, see
   source outage counters.
 - [MAN-132](DECISIONS/2026-10-08-man132-metrics-loopback-bind.md): the
   loopback default for `metrics_bind_addr`.
+- [MAN-316](DECISIONS/2026-10-12-man316-reference-list-refresh.md): the
+  reference-list families.
 - [MAN-301](DECISIONS/2026-10-11-man301-live-rbn-comparison.md): the
   RBN comparison families.
 - [MAN-324](DECISIONS/2026-10-12-man324-live-state-stream.md): the
