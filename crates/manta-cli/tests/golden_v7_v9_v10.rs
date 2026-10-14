@@ -248,6 +248,14 @@ fn v51_drift_with_refiner_enabled_passes_end_to_end() {
     // Non-vacuity: decode is deterministic on file input, so if the
     // config were silently ignored the two reports would be identical.
     // (Probe-measured 2026-10-14: events 362 vs 363, reports differ.)
+    // This differential proves the config reached the pipeline, not that
+    // the MAN-194 drain protocols ran: ordinary 30 Hz filtering already
+    // differs from the control, and a dropped `refiner_backlog` at a
+    // channel reset or at EOF is too small to leave V51's other bars
+    // (Codex review, PR #303). The drains are pinned on this same scene
+    // one layer down, where they are observable:
+    // `real_drift_scene_drains_refiner_backlog_at_resets_and_eof`
+    // (crates/manta-engine/src/track.rs).
     assert_ne!(
         control, refined,
         "refine_bw_hz = 30.0 must reach the pipeline; identical reports \

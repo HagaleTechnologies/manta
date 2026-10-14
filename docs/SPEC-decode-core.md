@@ -1211,6 +1211,23 @@ evidence any future change that turns the refiner on by default must keep
 green (found by MAN-194's final review: V4/V5/V8w never execute the
 refine-enabled branch, so their re-verification could not cover it).
 
+The drain protocols themselves cannot be pinned from the CLI report V51
+asserts on (Codex review, PR #303): measured on this scene, the
+end-of-stream backlog is trailing silence — the last keyed character
+closes ~0.24 s before EOF — and a backlog dropped at a reset or at EOF
+costs at most ~6 × `GROUP_DELAY_HOPS` hops of envelope, inside V51's CER
+bar. They are therefore asserted one layer down, on the same real scene:
+`real_drift_scene_drains_refiner_backlog_at_resets_and_eof`
+(`crates/manta-engine/src/track.rs`) drives `render_v9_drift`'s fixture
+through the real channelizer and `TrackManager` with the refiner on and
+asserts that the drift's channel crossing resets the refiner with a
+non-empty backlog, that delivery is exactly-once (decoder `hop_count` +
+`pending` + `refiner_backlog` equals the refine-off control's deliveries
+at every hop — a backlog dropped or duplicated at any reset diverges
+there), and that a non-empty backlog is still held when `finish()` runs
+(whose delivery wiring is pinned by
+`finish_drains_every_remaining_tracks_refiner_backlog_before_flushing`).
+
 M0 = V1 passing end-to-end from a WAV file. M1 = V1–V6. V7–V10 and V8w gate M2
 (multi-track engine). The RBN-parity corpus benchmark remains the M3 gate
 (ARCHITECTURE §9) and is not redefined here. V31 gates variable-width capture

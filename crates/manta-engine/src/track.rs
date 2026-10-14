@@ -3671,6 +3671,161 @@ mod tests {
         );
     }
 
+    /// MAN-210 (Codex review, PR #303): V51 -- the CLI-level golden gate in
+    /// `manta-cli`'s `golden_v7_v9_v10.rs` -- proves the refine-enabled path
+    /// runs end-to-end, but the JSON report it asserts on cannot pin the
+    /// MAN-194 drain protocols themselves: measured on this exact scene, the
+    /// end-of-stream backlog is trailing silence (the last keyed character
+    /// closes ~0.24 s before EOF), and a backlog dropped at a reset or at
+    /// EOF costs at most ~6 x `GROUP_DELAY_HOPS` hops of envelope, inside
+    /// V51's CER bar -- so a regression that drops `refiner_backlog` at a
+    /// channel reset or at EOF would leave V51 green. This test closes that
+    /// gap one layer down, where the drains are directly observable: the
+    /// real V9 drift scene (the exact `render_v9_drift` fixture V51
+    /// decodes) through the real channelizer and `TrackManager`, refiner
+    /// on, one hop per `process_hops` call:
+    ///
+    /// - the drift's channel crossing really resets the refiner mid-scene
+    ///   with hops still held at the moment of the reset (the reset-drain
+    ///   path runs with real work to do);
+    /// - delivery is exactly-once: after every hop, the refined run's
+    ///   delivered-plus-held hops (decoder `hop_count` + `pending` +
+    ///   `refiner_backlog`) equal the refine-off control run's -- a
+    ///   backlog dropped or duplicated at ANY reset diverges here and
+    ///   never recovers;
+    /// - a non-empty backlog is still held when the stream ends (the
+    ///   end-of-stream drain has real work; its delivery wiring into the
+    ///   decoder is pinned by
+    ///   `finish_drains_every_remaining_tracks_refiner_backlog_before_flushing`
+    ///   above).
+    #[test]
+    fn real_drift_scene_drains_refiner_backlog_at_resets_and_eof() {
+        // Per-hop drain state of the decoding track: (delivered decoder
+        // hop_count, queued pending, held refiner_backlog, refiner
+        // channel) -- `None` while no track is promoted.
+        type Snap = Option<(u64, usize, usize, Option<usize>)>;
+        let spec = manta_testkit::vectors::v9();
+        let rendered = manta_testkit::vectors::render_v9_drift(&spec).unwrap();
+
+        // Decode the scene once at `refine_bw_hz`, hop by hop, snapshotting
+        // after every `process_hops`.
+        let run = |refine_bw_hz: f32| -> Vec<Snap> {
+            let mut ch =
+                manta_dsp::channelizer::Channelizer::new(spec.fs, spec.center_freq_hz).unwrap();
+            let hop = ch.hop() as u64;
+            let pad_hops = (ch.filter_len() as u64).div_ceil(hop);
+            let mut padded = vec![num_complex::Complex32::new(0.0, 0.0); ch.filter_len()];
+            padded.extend_from_slice(&rendered.samples);
+            let decode = DecodeConfig {
+                refine_bw_hz,
+                ..DecodeConfig::default()
+            };
+            let mut tm = TrackManager::new(
+                ch.n_channels(),
+                spec.fs,
+                spec.center_freq_hz,
+                DetectorConfig::default(),
+                decode,
+            );
+            tm.skip_preroll_hops(pad_hops);
+            let mut snaps = Vec::new();
+            for chunk in padded.chunks(hop as usize) {
+                let hops = ch.process(chunk);
+                tm.process_hops(&hops, |m| m.saturating_sub(pad_hops) * hop);
+                let decoding = tm.tracks.values().filter(|t| t.decoder.is_some()).count();
+                assert!(
+                    decoding <= 1,
+                    "V9 is a single-signal scene: at most one decoding track"
+                );
+                snaps.push(tm.tracks.values().find_map(|t| {
+                    t.decoder.as_ref().map(|d| {
+                        (
+                            d.hop_count(),
+                            t.pending.len(),
+                            t.refiner_backlog.len(),
+                            t.refiner_channel,
+                        )
+                    })
+                }));
+            }
+            let backlog_at_eof = snaps
+                .last()
+                .and_then(|s| s.map(|(_, _, b, _)| b))
+                .unwrap_or(0);
+            if refine_bw_hz > 0.0 {
+                assert!(
+                    backlog_at_eof > 0,
+                    "sanity: at EOF the refiner must still hold hops for the EOF drain"
+                );
+            } else {
+                assert_eq!(
+                    backlog_at_eof, 0,
+                    "sanity: refine-off never holds a backlog"
+                );
+            }
+            tm.finish();
+            assert!(tm.tracks.is_empty(), "finish() must clear all tracks");
+            snaps
+        };
+
+        let refined = run(30.0);
+        let control = run(0.0);
+        assert_eq!(refined.len(), control.len());
+
+        // Promotion parity: both decodes promote their decoding track at
+        // the same hop, and it stays live to EOF in both (V9 never closes
+        // mid-scene), so the per-hop comparison below is like-for-like.
+        let promote_at = |v: &[Snap]| v.iter().position(Option::is_some).expect("no promotion");
+        assert_eq!(promote_at(&refined), promote_at(&control));
+        for (i, (r, c)) in refined.iter().zip(&control).enumerate() {
+            assert_eq!(
+                r.is_some(),
+                c.is_some(),
+                "hop {i}: track lifetime must not depend on refine_bw_hz"
+            );
+        }
+
+        // Reset drain: the refined run's refiner channel must change
+        // mid-scene with hops still held at the moment of the change --
+        // V9's +50 Hz/min drift crossing the channel grid, firing
+        // `decoder_input`'s reset-drain branch through the real
+        // channelizer with a real backlog to deliver.
+        let resets_with_backlog = refined
+            .windows(2)
+            .filter(|w| match (w[0], w[1]) {
+                (Some((_, _, held, prev_ch)), Some((_, _, _, ch))) => prev_ch != ch && held > 0,
+                _ => false,
+            })
+            .count();
+        assert!(
+            resets_with_backlog >= 1,
+            "the drift's channel crossing must reset the refiner with a \
+             non-empty backlog at least once mid-scene"
+        );
+        // The control never engages the refiner at all.
+        assert!(control.iter().all(|s| s
+            .map(|(_, _, backlog, ch)| backlog == 0 && ch.is_none())
+            .unwrap_or(true)));
+
+        // Exactly-once delivery: the refiner may delay hops
+        // (GROUP_DELAY_HOPS) and re-issue them at raw quality on a drain,
+        // but every hop the refine-off decode delivers must be delivered
+        // exactly once refine-on too -- nothing dropped at a reset drain,
+        // nothing duplicated by a double drain.
+        for (i, (r, c)) in refined.iter().zip(&control).enumerate() {
+            let (Some((rh, rp, rb, _)), Some((ch, cp, _, _))) = (r, c) else {
+                continue;
+            };
+            assert_eq!(
+                rh + *rp as u64 + *rb as u64,
+                ch + *cp as u64,
+                "hop {i}: delivered ({rh}) + pending ({rp}) + backlog ({rb}) \
+                 must equal the refine-off decode's deliveries ({ch} + {cp}): the \
+                 refiner must deliver every held hop exactly once"
+            );
+        }
+    }
+
     /// Regression, MAN-171: a channel that stays `rise`-true forever (a
     /// stationary, never-decoding interferer -- confirmed live as a real
     /// ~8kHz-spaced SDR/USB clock-harmonic comb on RSP1B hardware) must not
