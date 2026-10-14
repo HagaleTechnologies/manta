@@ -497,6 +497,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   naming the exact binary, and the part before `+` is the release the
   decoder-output rule in `CHANGELOG.md` governs. See
   `docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md`.
+  Every connection opens with a `hello`, and spots and grades share a per-session
+  `seq`; WebSocket clients resume with `?session=&since=` from their shared bounded
+  history. See [SPOT-SCHEMA Transport](docs/SPOT-SCHEMA.md#transport) and
+  [MAN-137](docs/DECISIONS/2026-10-14-man137-json-stream-resume.md).
 - **Spot grades on the JSON stream (MAN-301)**: with `[rbn_compare]` enabled,
   the :7301 stream (raw TCP and WebSocket) also carries one `spotGrade`
   record per spot, published after the spot's comparison window closes

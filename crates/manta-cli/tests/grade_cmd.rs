@@ -604,3 +604,29 @@ fn grade_refuses_a_tolerance_flag_past_its_config_key_maximum() {
         stderr(&out)
     );
 }
+
+#[test]
+fn grade_skips_hello_records_without_counting_them_as_grades() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("spots-hello.jsonl");
+    std::fs::write(&path, format!("{}\n{}{}\n", r#"{"kind":"hello","schema":"stream.v1","session":"1","seq":0,"historyFrom":1,"resumed":false}"#,
+        read_fixture("spots-2026-10-11.jsonl"), read_fixture("expected-all.jsonl").lines().next().unwrap())).unwrap();
+    let out = manta()
+        .args(["grade", "--spots"])
+        .arg(&path)
+        .arg("--rbn")
+        .arg(fixture("rbn-20261011.csv"))
+        .output()
+        .unwrap();
+    assert_success(&out);
+    assert!(stdout(&out).contains("1 grade record skipped"));
+    let out = manta()
+        .args(["grade", "--json", "--spots"])
+        .arg(&path)
+        .arg("--rbn")
+        .arg(fixture("rbn-20261011.csv"))
+        .output()
+        .unwrap();
+    assert_success(&out);
+    assert_lines_eq(&stdout(&out), &read_fixture("expected-all.jsonl"));
+}

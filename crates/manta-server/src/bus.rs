@@ -34,8 +34,10 @@ pub const DEFAULT_HISTORY_MINUTES: u32 = 30;
 /// Largest accepted `[server].history_minutes`: one day.
 pub const MAX_HISTORY_MINUTES: u32 = 1440;
 /// Keep at least this many newest publications, even on quiet bands.
+/// Also the minimum number of JSON resume records, including grades.
 pub const MIN_HISTORY_SPOTS: usize = 50;
 /// Bound history memory and the size of one telnet replay.
+/// Also bounds JSON resume history, counting spots and grades together.
 pub const MAX_HISTORY_SPOTS: usize = 10_000;
 
 /// Bounds how many distinct callsigns `occurrence_counts` tracks at once
@@ -72,8 +74,14 @@ pub struct BusSpot {
 /// serialised `spotGrade` line, written to clients verbatim.
 #[derive(Debug, Clone)]
 pub enum JsonItem {
-    Spot(BusSpot),
-    Grade(Arc<str>),
+    Spot {
+        seq: u64,
+        spot: BusSpot,
+    },
+    Grade {
+        seq: u64,
+        line: Arc<str>,
+    },
     /// MAN-324: one serialized live-state record, sent verbatim. Only ever
     /// on the live channel, never on the spot stream's.
     Live(Arc<str>),
@@ -131,21 +139,90 @@ impl OccurrenceTracker {
     }
 }
 
-struct History {
-    entries: VecDeque<BusSpot>,
+impl JsonItem {
+    /// Per-session stream position; live-state records have none.
+    pub fn seq(&self) -> Option<u64> {
+        match self {
+            Self::Spot { seq, .. } | Self::Grade { seq, .. } => Some(*seq),
+            Self::Live(_) => None,
+        }
+    }
+}
+
+trait Aged {
+    fn heard_ts(&self) -> u64;
+}
+impl Aged for BusSpot {
+    fn heard_ts(&self) -> u64 {
+        self.spot.sample_ts
+    }
+}
+struct StreamRecord {
+    heard_ts: u64,
+    item: JsonItem,
+}
+impl Aged for StreamRecord {
+    fn heard_ts(&self) -> u64 {
+        self.heard_ts
+    }
+}
+struct StreamHistory {
+    records: History<StreamRecord>,
+    last_seq: u64,
+}
+
+/// In-window ceiling evictions in the independent telnet and JSON histories.
+pub struct PublishOutcome {
+    pub history_truncated: usize,
+    pub stream_history_truncated: usize,
+}
+
+/// Whether a resume request can recover every missing record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeOutcome {
+    NoRequest,
+    Resumed,
+    Gap,
+    Reset,
+}
+
+/// Classify a cursor against the snapshot and the retained history (MAN-137).
+pub fn resume_outcome(
+    session_matches: bool,
+    since: Option<u64>,
+    upto: u64,
+    history_from: u64,
+) -> ResumeOutcome {
+    match since {
+        None => ResumeOutcome::NoRequest,
+        Some(n) if !session_matches || n > upto => ResumeOutcome::Reset,
+        Some(n) if n < history_from.saturating_sub(1) => ResumeOutcome::Gap,
+        Some(_) => ResumeOutcome::Resumed,
+    }
+}
+
+/// One atomic resume decision and its retained records, in send order.
+pub struct Resume {
+    pub outcome: ResumeOutcome,
+    pub history_from: u64,
+    pub records: Vec<JsonItem>,
+}
+
+struct History<T> {
+    entries: VecDeque<T>,
     /// Highest heard timestamp ever published; late entries cannot rewind it.
     newest_sample_ts: u64,
 }
 
-impl History {
-    fn push(&mut self, entry: BusSpot, window_samples: u64) -> usize {
-        self.newest_sample_ts = self.newest_sample_ts.max(entry.spot.sample_ts);
+impl<T: Aged> History<T> {
+    fn push(&mut self, entry: T, window_samples: u64) -> usize {
+        self.newest_sample_ts = self.newest_sample_ts.max(entry.heard_ts());
         self.entries.push_back(entry);
         let mut truncated = 0;
         while self.entries.len() > MIN_HISTORY_SPOTS {
             let front = self.entries.front().expect("history is nonempty");
             let in_window =
-                self.newest_sample_ts.saturating_sub(front.spot.sample_ts) <= window_samples;
+                self.newest_sample_ts.saturating_sub(front.heard_ts()) <= window_samples;
             let over_ceiling = self.entries.len() > MAX_HISTORY_SPOTS;
             // Zero restores the old count-only history even for equal timestamps.
             if window_samples != 0 && in_window && !over_ceiling {
@@ -168,7 +245,8 @@ pub struct SpotBus {
     epoch: SystemTime,
     session_nonce: u128,
     sample_rate_hz: f64,
-    recent: Mutex<History>,
+    recent: Mutex<History<BusSpot>>,
+    stream: Mutex<StreamHistory>,
     history_minutes: u32,
     window_samples: u64,
     occurrence_counts: Mutex<OccurrenceTracker>,
@@ -204,6 +282,13 @@ impl SpotBus {
                 entries: VecDeque::with_capacity(MIN_HISTORY_SPOTS),
                 newest_sample_ts: 0,
             }),
+            stream: Mutex::new(StreamHistory {
+                records: History {
+                    entries: VecDeque::with_capacity(MIN_HISTORY_SPOTS),
+                    newest_sample_ts: 0,
+                },
+                last_seq: 0,
+            }),
             history_minutes: DEFAULT_HISTORY_MINUTES,
             window_samples: 0,
             occurrence_counts: Mutex::new(OccurrenceTracker::new()),
@@ -229,7 +314,7 @@ impl SpotBus {
     /// with no connected clients is the common case, not a failure.
     /// Returns ceiling evictions still inside the window, for the caller to count.
     /// Ordinary window ageing and zero-minute count-only eviction are not loss.
-    pub fn publish(&self, spot: Spot) -> usize {
+    pub fn publish(&self, spot: Spot) -> PublishOutcome {
         // Increment and read back under one lock acquisition -- this *is*
         // the fix: the occurrence count a spot carries is fixed at the
         // instant of this publish, before any subscriber can observe it.
@@ -254,15 +339,103 @@ impl SpotBus {
             // uncounted (round-11 review finding).
             recent.push(bus_spot.clone(), self.window_samples)
         };
-        let _ = self.json_tx.send(JsonItem::Spot(bus_spot.clone()));
+        // Seq assignment, history push and nonblocking send share one lock.
+        // Subscribe snapshots under this same lock: replay ends exactly where
+        // the receiver starts. No other lock is acquired while this is held.
+        let stream_history_truncated = {
+            let mut stream = self.stream.lock().expect("stream lock poisoned");
+            stream.last_seq += 1;
+            let item = JsonItem::Spot {
+                seq: stream.last_seq,
+                spot: bus_spot.clone(),
+            };
+            let n = stream.records.push(
+                StreamRecord {
+                    heard_ts: bus_spot.spot.sample_ts,
+                    item: item.clone(),
+                },
+                self.window_samples,
+            );
+            let _ = self.json_tx.send(item);
+            n
+        };
         let _ = self.tx.send(bus_spot);
-        truncated
+        PublishOutcome {
+            history_truncated: truncated,
+            stream_history_truncated,
+        }
     }
 
     /// Publishes one serialised `spotGrade` line (MAN-301) to JSON-stream
     /// subscribers only. Telnet and the uplink never see it.
-    pub fn publish_grade(&self, line: Arc<str>) {
-        let _ = self.json_tx.send(JsonItem::Grade(line));
+    /// The renderer must not call back into this bus: it runs under the
+    /// stream lock, with seq assignment, history push and nonblocking send.
+    pub fn publish_grade(&self, render: impl FnOnce(u64) -> Arc<str>) -> usize {
+        let mut stream = self.stream.lock().expect("stream lock poisoned");
+        stream.last_seq += 1;
+        let seq = stream.last_seq;
+        let item = JsonItem::Grade {
+            seq,
+            line: render(seq),
+        };
+        let heard_ts = stream.records.newest_sample_ts;
+        let n = stream.records.push(
+            StreamRecord {
+                heard_ts,
+                item: item.clone(),
+            },
+            self.window_samples,
+        );
+        let _ = self.json_tx.send(item);
+        n
+    }
+
+    /// Subscribe and snapshot under the publication lock, so every live
+    /// record has seq greater than the snapshot. Broadcast send never blocks.
+    pub fn subscribe_json_with_seq(&self) -> (broadcast::Receiver<JsonItem>, u64) {
+        let stream = self.stream.lock().expect("stream lock poisoned");
+        (self.json_tx.subscribe(), stream.last_seq)
+    }
+
+    /// Decimal session identity shared with the spot IDs.
+    pub fn session_id(&self) -> String {
+        self.session_nonce.to_string()
+    }
+
+    /// Decide and copy a resume suffix under one lock; eviction cannot race
+    /// the decision. Never replay beyond the connection's subscription snapshot.
+    pub fn json_resume(&self, session: Option<&str>, since: Option<u64>, upto: u64) -> Resume {
+        let stream = self.stream.lock().expect("stream lock poisoned");
+        let history_from = stream
+            .records
+            .entries
+            .front()
+            .and_then(|r| r.item.seq())
+            .unwrap_or(stream.last_seq.saturating_add(1))
+            .min(upto.saturating_add(1));
+        let outcome = resume_outcome(
+            session == Some(self.session_id().as_str()),
+            since,
+            upto,
+            history_from,
+        );
+        let records = stream
+            .records
+            .entries
+            .iter()
+            .filter(|r| {
+                let seq = r.item.seq().expect("only spot stream records in history");
+                outcome != ResumeOutcome::NoRequest
+                    && seq <= upto
+                    && (outcome != ResumeOutcome::Resumed || seq > since.unwrap_or(0))
+            })
+            .map(|r| r.item.clone())
+            .collect();
+        Resume {
+            outcome,
+            history_from,
+            records,
+        }
     }
 
     /// Spots only: the telnet server, the RBN uplink and the comparator.
@@ -368,11 +541,147 @@ mod tests {
     }
 
     #[test]
+    fn json_records_carry_consecutive_seq_across_spots_and_grades() {
+        let bus = live_bus();
+        let mut rx = bus.subscribe_json();
+        bus.publish(sample_spot(0));
+        bus.publish_grade(|_| Arc::from("grade"));
+        bus.publish(sample_spot(1));
+        for seq in 1..=3 {
+            assert_eq!(rx.try_recv().unwrap().seq(), Some(seq));
+        }
+    }
+
+    #[test]
+    fn subscribe_json_with_seq_reports_the_newest_seq_before_subscribing() {
+        let bus = live_bus();
+        bus.publish(sample_spot(0));
+        bus.publish(sample_spot(1));
+        let (mut rx, s0) = bus.subscribe_json_with_seq();
+        assert_eq!(s0, 2);
+        bus.publish(sample_spot(2));
+        assert_eq!(rx.try_recv().unwrap().seq(), Some(3));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn json_resume_replays_retained_records_after_since_in_seq_order() {
+        let bus = live_bus();
+        bus.publish(sample_spot(0));
+        bus.publish_grade(|_| Arc::from("grade"));
+        bus.publish(sample_spot(1));
+        bus.publish(sample_spot(2));
+        let r = bus.json_resume(Some(&bus.session_id()), Some(1), 4);
+        assert_eq!(r.outcome, ResumeOutcome::Resumed);
+        assert_eq!(
+            r.records
+                .iter()
+                .filter_map(JsonItem::seq)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert!(matches!(&r.records[0], JsonItem::Grade { line, .. } if &**line == "grade"));
+    }
+
+    #[test]
+    fn resume_outcome_table() {
+        use ResumeOutcome::*;
+        for (matches, since, upto, first, expected) in [
+            (false, None, 0, 1, NoRequest),
+            (true, Some(0), 0, 1, Resumed),
+            (true, Some(4), 8, 5, Resumed),
+            (true, Some(8), 8, 5, Resumed),
+            (true, Some(3), 8, 5, Gap),
+            (false, Some(5), 8, 5, Reset),
+            (true, Some(9), 8, 5, Reset),
+        ] {
+            assert_eq!(resume_outcome(matches, since, upto, first), expected);
+        }
+    }
+
+    #[test]
+    fn json_history_holds_spots_and_grades_under_one_ten_thousand_record_ceiling() {
+        let bus = live_bus();
+        let mut truncated = 0;
+        for _ in 0..6000 {
+            truncated += bus.publish(sample_spot(0)).stream_history_truncated;
+            truncated += bus.publish_grade(|_| Arc::from("grade"));
+        }
+        let r = bus.json_resume(None, Some(0), 12000);
+        assert_eq!(r.history_from, 2001);
+        assert_eq!(r.records.len(), 10000);
+        assert_eq!(truncated, 2000);
+    }
+
+    #[test]
+    fn json_history_keeps_the_fifty_newest_records_outside_the_window() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0).with_history_minutes(1);
+        for ts in 0..60 {
+            bus.publish(sample_spot(ts * 3600));
+            bus.publish_grade(|_| Arc::from("grade"));
+        }
+        let r = bus.json_resume(Some("0"), Some(0), 120);
+        assert_eq!(r.records.len(), 50);
+        assert_eq!(r.history_from, 71);
+    }
+
+    #[test]
+    fn a_grade_ages_with_the_newest_heard_time_at_its_publish() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0).with_history_minutes(1);
+        bus.publish(sample_spot(0));
+        bus.publish_grade(|_| Arc::from("grade"));
+        assert_eq!(
+            bus.stream
+                .lock()
+                .unwrap()
+                .records
+                .entries
+                .back()
+                .unwrap()
+                .heard_ts,
+            0
+        );
+        for ts in 3600..3660 {
+            bus.publish(sample_spot(ts));
+        }
+        let r = bus.json_resume(None, Some(0), 62);
+        assert_eq!(r.history_from, 3);
+        assert!(r
+            .records
+            .iter()
+            .all(|item| matches!(item, JsonItem::Spot { .. })));
+    }
+
+    #[test]
+    fn sh_dx_history_never_holds_grades_and_keeps_fifty_spots() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0).with_history_minutes(1);
+        for ts in 0..100 {
+            bus.publish(sample_spot(ts * 3600));
+            bus.publish_grade(|_| Arc::from("grade"));
+        }
+        assert_eq!(
+            retained_times(&bus),
+            (50..100).map(|ts| ts * 3600).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn history_from_is_clamped_to_one_past_the_snapshot() {
+        let bus = live_bus().with_history_minutes(0);
+        for ts in 0..60 {
+            bus.publish(sample_spot(ts));
+        }
+        let r = bus.json_resume(None, None, 0);
+        assert_eq!(r.history_from, 1);
+        assert!(r.records.is_empty());
+    }
+
+    #[test]
     fn live_subscribers_receive_live_lines_only() {
         let bus = live_bus();
         let mut live = bus.subscribe_live();
         bus.publish(sample_spot(1));
-        bus.publish_grade(Arc::from("{\"kind\":\"spotGrade\"}"));
+        bus.publish_grade(|_| Arc::from("{\"kind\":\"spotGrade\"}"));
         bus.publish_live(Arc::from("{\"kind\":\"bandState\"}"));
         match live.try_recv() {
             Ok(JsonItem::Live(line)) => assert_eq!(&*line, "{\"kind\":\"bandState\"}"),
@@ -518,15 +827,15 @@ mod tests {
         let mut rx = bus.subscribe_json();
 
         bus.publish(sample_spot(0));
-        bus.publish_grade(Arc::from("{\"kind\":\"spotGrade\",\"n\":1}"));
+        bus.publish_grade(|_| Arc::from("{\"kind\":\"spotGrade\",\"n\":1}"));
         bus.publish(sample_spot(1));
-        bus.publish_grade(Arc::from("{\"kind\":\"spotGrade\",\"n\":2}"));
+        bus.publish_grade(|_| Arc::from("{\"kind\":\"spotGrade\",\"n\":2}"));
 
         let mut seen = Vec::new();
         for _ in 0..4 {
             seen.push(match rx.recv().await.unwrap() {
-                JsonItem::Spot(s) => format!("spot:{}", s.spot.sample_ts),
-                JsonItem::Grade(line) => format!("grade:{line}"),
+                JsonItem::Spot { spot: s, .. } => format!("spot:{}", s.spot.sample_ts),
+                JsonItem::Grade { line, .. } => format!("grade:{line}"),
                 JsonItem::Live(line) => format!("live:{line}"),
             });
         }
@@ -550,9 +859,9 @@ mod tests {
         let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
         let mut rx = bus.subscribe();
 
-        bus.publish_grade(Arc::from("{\"kind\":\"spotGrade\"}"));
+        bus.publish_grade(|_| Arc::from("{\"kind\":\"spotGrade\"}"));
         bus.publish(sample_spot(7));
-        bus.publish_grade(Arc::from("{\"kind\":\"spotGrade\"}"));
+        bus.publish_grade(|_| Arc::from("{\"kind\":\"spotGrade\"}"));
 
         assert_eq!(rx.recv().await.unwrap().spot.sample_ts, 7);
         assert!(matches!(
@@ -574,8 +883,10 @@ mod tests {
         for _ in 0..5 {
             let a = spots.recv().await.unwrap();
             let b = match json.recv().await.unwrap() {
-                JsonItem::Spot(s) => s,
-                JsonItem::Grade(line) | JsonItem::Live(line) => panic!("unexpected line {line}"),
+                JsonItem::Spot { spot: s, .. } => s,
+                JsonItem::Grade { line, .. } | JsonItem::Live(line) => {
+                    panic!("unexpected line {line}")
+                }
             };
             assert_eq!(a.spot, b.spot);
             assert_eq!(a.occurrence_count, b.occurrence_count);
@@ -795,7 +1106,7 @@ mod tests {
             for i in 0..60 {
                 let mut spot = sample_spot(i * spacing);
                 spot.track_id = i as u32;
-                assert_eq!(bus.publish(spot), 0);
+                assert_eq!(bus.publish(spot).history_truncated, 0);
             }
             assert_eq!(
                 bus.recent(usize::MAX)
@@ -814,7 +1125,7 @@ mod tests {
         for i in 0..MAX_HISTORY_SPOTS + 5 {
             let mut spot = sample_spot(1);
             spot.track_id = i as u32;
-            truncated += bus.publish(spot);
+            truncated += bus.publish(spot).history_truncated;
         }
         let entries = bus.recent(usize::MAX);
         assert_eq!(entries.len(), MAX_HISTORY_SPOTS);
@@ -826,7 +1137,7 @@ mod tests {
     fn ageing_out_of_the_window_is_not_reported_as_truncation() {
         let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0);
         for i in 0..100 {
-            assert_eq!(bus.publish(sample_spot(i * 600)), 0);
+            assert_eq!(bus.publish(sample_spot(i * 600)).history_truncated, 0);
         }
         assert_eq!(bus.recent(usize::MAX).len(), MIN_HISTORY_SPOTS);
     }

@@ -220,6 +220,14 @@ pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
 planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
+MAN-137: the JSON spot stream opens with `hello` and numbers spots and
+`spotGrade` records with one per-session `seq`. WebSocket
+`?session=&since=` resumes from the bounded shared history using
+`[server].history_minutes`; raw TCP receives live records only. Follows
+dispensa `contracts/spots/stream.v1.md` (ADR-0015, Q-0070); the live-state
+stream is unchanged. See
+`docs/DECISIONS/2026-10-14-man137-json-stream-resume.md`.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each

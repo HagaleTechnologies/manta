@@ -38,6 +38,13 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- JSON/WebSocket spot clients now receive a `hello` first, with schema and session
+  identity. Spots and grades carry `seq`; WebSocket `?session=&since=` resumes
+  from their shared history bounded by `history_minutes`. New
+  `manta_json_stream_resumes_total`, `manta_json_stream_replay_abandoned_total`
+  and `manta_json_stream_history_truncated_total` metrics report replay outcomes
+  and loss. Consumers must skip hello records (MAN-137).
+
 - MAN-315: a `TimingUpdate` event per track (each class's mean, variance
   and count, in dits), a top-level `timing` object in `decode --json`, and
   `manta decode --timing` for a `timing (dits, mean ± sd): …` stderr line.

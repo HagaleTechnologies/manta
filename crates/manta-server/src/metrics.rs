@@ -466,6 +466,34 @@ struct SourceHealthEntry {
     terminal: bool,
 }
 
+/// Bounded outcome labels for WebSocket spot-stream resume requests.
+#[derive(Debug, Clone, Copy)]
+pub enum ResumeMetricOutcome {
+    Resumed,
+    Gap,
+    Reset,
+    Refused,
+    Invalid,
+}
+impl ResumeMetricOutcome {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Resumed => "resumed",
+            Self::Gap => "gap",
+            Self::Reset => "reset",
+            Self::Refused => "refused",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+const RESUME_OUTCOMES: [ResumeMetricOutcome; 5] = [
+    ResumeMetricOutcome::Resumed,
+    ResumeMetricOutcome::Gap,
+    ResumeMetricOutcome::Reset,
+    ResumeMetricOutcome::Refused,
+    ResumeMetricOutcome::Invalid,
+];
+
 #[derive(Default)]
 pub struct Metrics {
     spots_total: AtomicU64,
@@ -503,6 +531,9 @@ pub struct Metrics {
     spots_replay_abandoned_total: AtomicU64,
     /// In-window spots evicted by the history ceiling (MAN-93).
     spots_history_truncated_total: AtomicU64,
+    json_stream_history_truncated_total: AtomicU64,
+    json_stream_resumes_total: [AtomicU64; 5],
+    json_stream_replay_abandoned_total: AtomicU64,
     /// MAN-136/MAN-45: a spot's dx or de callsign couldn't be resolved
     /// against `cty.dat` -- or resolved only through the base prefix of a
     /// `/MM`/`/AM` call, whose real position is unknowable from it -- so it
@@ -1094,6 +1125,31 @@ impl Metrics {
         self.spots_replay_abandoned_total.load(Ordering::Relaxed)
     }
 
+    pub fn record_json_stream_resume(&self, outcome: ResumeMetricOutcome) {
+        self.json_stream_resumes_total[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn json_stream_resumes_total(&self, outcome: ResumeMetricOutcome) -> u64 {
+        self.json_stream_resumes_total[outcome as usize].load(Ordering::Relaxed)
+    }
+    pub fn record_json_stream_replay_abandoned(&self, n: u64) {
+        self.json_stream_replay_abandoned_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn json_stream_replay_abandoned_total(&self) -> u64 {
+        self.json_stream_replay_abandoned_total
+            .load(Ordering::Relaxed)
+    }
+
+    /// In-window spot and grade evictions at the shared JSON history ceiling.
+    pub fn record_json_stream_history_truncated(&self, n: u64) {
+        self.json_stream_history_truncated_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn json_stream_history_truncated_total(&self) -> u64 {
+        self.json_stream_history_truncated_total
+            .load(Ordering::Relaxed)
+    }
+
     pub fn record_history_truncated(&self, n: u64) {
         self.spots_history_truncated_total
             .fetch_add(n, Ordering::Relaxed);
@@ -1593,6 +1649,27 @@ impl Metrics {
         out.push_str(&format!(
             "manta_spots_replay_abandoned_total {}\n",
             self.spots_replay_abandoned_total.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP manta_json_stream_resumes_total WebSocket resume requests (GET /?since=) on the JSON spot stream, by outcome: resumed (every record after since replayed), gap (since older than the retained history), reset (session absent or different, or since ahead of the session), refused (over the per-IP resume budget, HTTP 429), invalid (malformed since, HTTP 400).\n");
+        out.push_str("# TYPE manta_json_stream_resumes_total counter\n");
+        for outcome in RESUME_OUTCOMES {
+            out.push_str(&format!(
+                "manta_json_stream_resumes_total{{outcome=\"{}\"}} {}\n",
+                outcome.label(),
+                self.json_stream_resumes_total(outcome)
+            ));
+        }
+        out.push_str("# HELP manta_json_stream_replay_abandoned_total JSON stream resume records not replayed because a replay write failed or the daemon shut down mid-replay. Re-sends of records already published, so counted apart from live-delivery loss.\n");
+        out.push_str("# TYPE manta_json_stream_replay_abandoned_total counter\n");
+        out.push_str(&format!(
+            "manta_json_stream_replay_abandoned_total {}\n",
+            self.json_stream_replay_abandoned_total()
+        ));
+        out.push_str("# HELP manta_json_stream_history_truncated_total Spots and spotGrade records dropped from the JSON stream's resume history at its 10000-record ceiling while still inside [server].history_minutes. Non-zero means a resume reaches back less than the configured window.\n");
+        out.push_str("# TYPE manta_json_stream_history_truncated_total counter\n");
+        out.push_str(&format!(
+            "manta_json_stream_history_truncated_total {}\n",
+            self.json_stream_history_truncated_total()
         ));
         out.push_str("# HELP manta_spots_history_truncated_total Spots dropped from the sh/dx history at its 10000-spot ceiling while still inside [server].history_minutes. Non-zero means sh/dx reaches back less than the configured window.\n");
         out.push_str("# TYPE manta_spots_history_truncated_total counter\n");
@@ -3248,6 +3325,7 @@ mod tests {
     fn spot_grade(band: &'static str, grade: Grade, offset: Option<i64>) -> SpotGrade {
         SpotGrade {
             kind: "spotGrade",
+            seq: None,
             spot_id: "W3XYZ-1:1:1:1:W1AW".to_string(),
             call: "W1AW".to_string(),
             band,
@@ -3627,5 +3705,30 @@ mod tests {
         assert!(text.contains("# HELP manta_spots_history_truncated_total Spots dropped from the sh/dx history at its 10000-spot ceiling while still inside [server].history_minutes. Non-zero means sh/dx reaches back less than the configured window.\n"));
         assert!(text.contains("# TYPE manta_spots_history_truncated_total counter\n"));
         assert!(text.contains("manta_spots_history_truncated_total 5\n"));
+    }
+    #[test]
+    fn json_stream_history_truncated_is_counted_and_rendered() {
+        let m = Metrics::new();
+        m.record_json_stream_history_truncated(2);
+        m.record_json_stream_history_truncated(3);
+        assert_eq!(m.json_stream_history_truncated_total(), 5);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# HELP manta_json_stream_history_truncated_total"));
+        assert!(text.contains("# TYPE manta_json_stream_history_truncated_total counter"));
+        assert!(text.contains("manta_json_stream_history_truncated_total 5"));
+    }
+    #[test]
+    fn json_stream_resume_metrics_render_every_outcome_at_zero_and_count() {
+        let m = Metrics::new();
+        for name in ["resumed", "gap", "reset", "refused", "invalid"] {
+            assert!(m.render_prometheus_text().contains(&format!(
+                "manta_json_stream_resumes_total{{outcome=\"{name}\"}} 0\n"
+            )));
+        }
+        m.record_json_stream_resume(ResumeMetricOutcome::Gap);
+        m.record_json_stream_replay_abandoned(3);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("manta_json_stream_resumes_total{outcome=\"gap\"} 1\n"));
+        assert!(text.contains("manta_json_stream_replay_abandoned_total 3\n"));
     }
 }

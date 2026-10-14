@@ -1332,6 +1332,7 @@ fn rbn_grade(
     let same_band = matches!(grade, Grade::Match | Grade::Disagree);
     SpotGrade {
         kind: "spotGrade",
+        seq: None,
         spot_id: format!("W3XYZ-1:1:1:960000:W1AW-{grade:?}"),
         call: "W1AW".to_string(),
         band: "20m",
@@ -2476,4 +2477,18 @@ fn claude_md_decision_paths_start_a_word_and_resolve() {
             "CLAUDE.md:{line} cites {path}, which does not exist"
         );
     }
+}
+
+#[test]
+fn spot_schema_transport_points_at_the_stream_contract() {
+    let schema = include_str!("../../../docs/SPOT-SCHEMA.md").replace("\r\n", "\n");
+    let transport = schema
+        .split_once("\n## Transport\n")
+        .unwrap()
+        .1
+        .split("\n## ")
+        .next()
+        .unwrap();
+    assert!(transport.contains("contracts/spots/stream.v1.md"));
+    assert!(!transport.contains("no history"));
 }

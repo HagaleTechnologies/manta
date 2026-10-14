@@ -15,13 +15,34 @@ per graded spot (MAN-301); see [`spotGrade` records](#spotgrade-records).
   `\n`. It should send nothing. A client that sends nothing for 500 ms is
   classified as raw TCP. Any bytes it sends later close the connection.
 - A client whose first bytes are an HTTP `GET` WebSocket upgrade request gets
-  one WebSocket text frame per record (a spot, or a `spotGrade` record).
+  one WebSocket text frame per record (`hello`, a spot, or `spotGrade`).
   It must complete the handshake within
   10 s. After that it may send Ping and Close frames only. Text, Binary and
   Pong frames close the connection, as does any inbound frame over 16 KiB.
-- The server only pushes. There is no request, subscription or filter
-  message, and no history: a client receives the spots, and grades,
-  published after it connects.
+- The first record on every connection is a [`hello`](#hello-record).
+  Raw TCP receives it once the 500 ms classification ends, then live records only.
+- Every spot and `spotGrade` carries `seq`, starting at 1 and increasing by 1
+  per record in the session. A plain WebSocket connection also receives only live records.
+- WebSocket clients can resume with `GET /?session=<session>&since=<last seq processed>`.
+  The server sends the hello, then retained records after `since`, then live records.
+  A same-session cursor from `historyFrom - 1` through `hello.seq` resumes fully.
+  An older cursor gets the retained suffix with `resumed: false`. A missing or different
+  session, or a cursor ahead of `hello.seq`, gets all retained records with `resumed: false`.
+  In each false case the consumer has a gap. A session without `since` is a plain connection.
+  Empty, negative, nonnumeric, overflowing or repeated `since` values get HTTP 400;
+  repeated `session` also gets 400. Query values are not percent-decoded; unknown keys
+  and request paths are accepted. Use the session string exactly as received.
+- At most 30 resume requests per source IP per 10 s are allowed; excess requests
+  get HTTP 429. Behind a reverse proxy clients share this budget and must retry.
+- Replay retains `[server].history_minutes` of heard time (default 30 minutes),
+  at least the newest 50 records and at most 10,000, spots and grades together.
+  Grades age from the newest spot's heard time when published. A zero-minute window
+  keeps only the newest 50 records. Replay uses the original seq and record contents.
+- Apart from the resume query, the server only pushes. There is no subscription
+  or filter message. The live-state port is a separate protocol and does not resume.
+- Framing (`hello`, `seq`, resume) follows dispensa's
+  `contracts/spots/stream.v1.md` (ADR-0015, Q-0070). Manta's implementation decisions
+  are recorded in [MAN-137](DECISIONS/2026-10-14-man137-json-stream-resume.md).
 - Slow clients are disconnected, never back-pressured. A client is
   disconnected when a single write takes longer than 10 s, or when it falls
   more than 1024 records (spots and `spotGrade` records together) behind
@@ -41,6 +62,23 @@ per graded spot (MAN-301); see [`spotGrade` records](#spotgrade-records).
 The behaviour above is implemented in
 [`crates/manta-server/src/json_stream.rs`](../crates/manta-server/src/json_stream.rs).
 
+## `hello` record
+
+Every spot-stream connection opens with this record, before spots or grades:
+
+```json
+{"kind":"hello","schema":"stream.v1","session":"1791719990000000000","seq":41,"historyFrom":1,"resumed":false}
+```
+
+Every hello carries all 6 keys, in this order:
+
+- `kind` (string, never null): always `"hello"`.
+- `schema` (string, never null): `"stream.v1"`, the framing contract.
+- `session` (string, never null): opaque session identity, the decimal nonce used in spot IDs. A live server restart changes it. File replays reuse their content-derived identity for deterministic output.
+- `seq` (integer, never null): newest sequence published before this connection subscribed, or 0 on an empty session. Live records follow this position.
+- `historyFrom` (integer, never null): oldest retained position at the resume decision, clamped to `seq + 1`. If no records remain through this snapshot, it is `seq + 1`.
+- `resumed` (boolean, never null): true only for a same-session resume with `historyFrom - 1 <= since <= seq`. False for plain connections, an expired cursor, a missing or different session, or a cursor ahead of the snapshot. A resume returning false signals a gap. Separate replays of the same file reuse a session while numbering starts over; an ahead-of-session cursor resets. Consumers must check `resumed` as well as `session`.
+
 ## Example
 
 This line was captured from `manta run --config` replaying the output of
@@ -49,12 +87,12 @@ This line was captured from `manta run --config` replaying the output of
 `null`:
 
 ```json
-{"id":"W1AW:12534119743695398054:1:2006272:W1AW","source":"skimmer","timestamp":1700000020,"ingestedAt":1700000020,"frequency":14012362,"band":"20m","mode":"CW","dxCall":"W1AW","dxGrid":null,"dxLat":37.6,"dxLon":-91.87,"dxDxcc":291,"dxContinent":"NA","dxCqZone":5,"deCall":"W1AW","deGrid":null,"deLat":null,"deLon":null,"deDxcc":291,"deContinent":"NA","snr":21,"snrRefHz":2500,"wpm":20,"decodeConfidence":0.5541629,"decoderVersion":"manta-0.1.0+d3bfa7c0c47a","channelizerResolutionHz":null}
+{"id":"W1AW:12534119743695398054:1:2006272:W1AW","source":"skimmer","timestamp":1700000020,"ingestedAt":1700000020,"frequency":14012362,"band":"20m","mode":"CW","dxCall":"W1AW","dxGrid":null,"dxLat":37.6,"dxLon":-91.87,"dxDxcc":291,"dxContinent":"NA","dxCqZone":5,"deCall":"W1AW","deGrid":null,"deLat":null,"deLon":null,"deDxcc":291,"deContinent":"NA","snr":21,"snrRefHz":2500,"wpm":20,"decodeConfidence":0.5541629,"decoderVersion":"manta-0.1.0+d3bfa7c0c47a","channelizerResolutionHz":null,"seq":1}
 ```
 
 ## Fields
 
-Every spot object carries all 26 keys, in this order. Keys are never omitted; a
+Every spot object carries all 27 keys, in this order. Keys are never omitted; a
 missing value is JSON `null`. In the "Null?" column, "never" means the field
 cannot be `null`, "always" means manta sends `null` on every spot today, and
 "not today" means the field's type allows `null` but manta always fills it.
@@ -94,6 +132,7 @@ keys (MAN-138), never `cty.dat`.
 | `decodeConfidence` | number | not today | Callsign confidence from 0 to 1 (SPEC-decode-core §4.6): the geometric mean of the per-character confidences times a repetition factor `1 - 0.5^r`, multiplied by 1.15 and capped at 1 when the call is in `master.scp`. |
 | `decoderVersion` | string | not today | Build identity, `manta-<version>+<commit>`, for example `manta-0.1.0+d3bfa7c0c47a`. The part after `+` is the commit as 12 lowercase hex digits, `unknown` (no `.git`), or a build-time `MANTA_GIT_SHA` override: any SemVer build-metadata string (dot-separated `[0-9A-Za-z-]` identifiers, at most 64 characters) kept verbatim, except that a full 40- or 64-hex commit is shortened to 12 digits. So it can be, for example, `20261010123045` or `release.1`; don't validate it as a SHA. Compare the part before `+` across releases; the whole string names the exact binary. It is not decoder output (MAN-83). |
 | `channelizerResolutionHz` | null | always | Reserved by the contract; manta does not fill it. |
+| `seq` | integer | never | This record's position in the session named by `hello`: 1 for the first spot or `spotGrade`, +1 per record in send order. See [Transport](#transport). Optional in dispensa's `spots.v1`; manta always sends it. |
 
 There is no `deCqZone` field. The contract has none, and manta does not send
 one.
@@ -107,7 +146,7 @@ unresolved geography on either side, including `/MM` and `/AM`.
 ## `spotGrade` records
 
 Only a node with `[rbn_compare]` enabled sends these; without it the stream
-carries spots only, byte-identical to a node built before MAN-301. A
+carries the hello and spots only. A
 graded spot is followed, once its comparison window has closed
 (`window_secs` after the spot plus up to 5 s; up to 75 s while the RBN
 feed is silent), by one grade line on the same stream, raw TCP and
@@ -118,22 +157,24 @@ queue was full, or lost because it fell behind the spot bus, are counted in
 `manta_rbn_compare_ungraded_total`. Spots still pending when the daemon
 stops are never graded. Do not wait for a grade that may not come.
 
-Tell the two record shapes apart by the `kind` key. A spot has no `kind`
-key; a grade always has `"kind":"spotGrade"`. A consumer that wants spots
+Tell the record shapes apart by the `kind` key. A spot has no `kind`
+key; a grade always has `"kind":"spotGrade"`. The opening `hello` has
+`"kind":"hello"`. A consumer that wants spots
 only skips every object that has a `kind` key. A grade has no `dxCall`,
 `frequency` or `timestamp` key, so a consumer that requires those keys
 rejects it rather than mistaking it for a spot.
 
 ```json
-{"kind":"spotGrade","spotId":"W3XYZ-1:1791719990000000000:12:173760000:W1AW","call":"W1AW","band":"20m","spotTime":1791721800,"windowClose":1791721980,"windowS":180,"grade":"disagree","disagreements":["frequency","speed"],"mantaFreqHz":14026400,"mantaWpm":30,"rbnModalFreqHz":14025000,"rbnMedianWpm":20.0,"rbnSkimmers":2,"rbnReports":2,"freqOffsetHz":1400,"rbnBands":["20m"],"spotterFilter":[]}
+{"kind":"spotGrade","seq":2,"spotId":"W3XYZ-1:1791719990000000000:12:173760000:W1AW","call":"W1AW","band":"20m","spotTime":1791721800,"windowClose":1791721980,"windowS":180,"grade":"disagree","disagreements":["frequency","speed"],"mantaFreqHz":14026400,"mantaWpm":30,"rbnModalFreqHz":14025000,"rbnMedianWpm":20.0,"rbnSkimmers":2,"rbnReports":2,"freqOffsetHz":1400,"rbnBands":["20m"],"spotterFilter":[]}
 ```
 
-Every grade carries all 18 keys, in this order. Keys are never omitted; a
+Every grade on the stream carries all 19 keys, in this order. Keys are never omitted; a
 missing value is JSON `null`. The "same-band" values describe the RBN
 reports of the call on the spot's band within the window, and are `null`
 or `0` unless `grade` is `match` or `disagree`.
 
 - `kind` (string, never null): always `"spotGrade"`.
+- `seq` (integer, never null): this grade's own stream position, always larger than the graded spot's. Offline `manta grade` output omits it.
 - `spotId` (string, never null): the graded spot's `id`.
 - `call` (string, never null): the graded spot's `dxCall`.
 - `band` (string, never null): the band of `mantaFreqHz`, labelled as the
