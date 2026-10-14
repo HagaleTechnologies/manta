@@ -84,8 +84,10 @@ Tests in `crates/manta-decode/src/evidence.rs`:
   the original scan it failed with 3,262,950 reads for track 0 against a
   7,500 budget, about 870 per hop. With the deque it passes.
 
-`benches/evidence_300_tracks.rs` runs 300 tracks × 3,750 hops through the
-public `push`/`flush` and checks each case's emitted count outside the
+`benches/evidence_300_tracks.rs` runs 300 tracks × 3,750 hops of
+prebuilt deterministic keyed amplitudes (a per-track phase of one 104-hop
+dit/dah pattern at 40 dB depth with a slow ripple, noise 0.005) through the
+public `push`/`flush`. It checks each case's emitted count outside the
 timed loop. The same driver ran against the pre-change base
 `525edb731d8b6321aea2f286716992d30ef462b1` in a scratch worktree and
 against this change. Both ran on one AMD Ryzen 9 5950X cloud host with

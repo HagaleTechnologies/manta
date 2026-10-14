@@ -1482,6 +1482,10 @@ mod tests {
             }
             assert_eq!(emitted[t], hops, "track {t}");
             assert_linear_max_work(e, hops, emitted[t], &format!("track {t}"));
+            assert_eq!(
+                e.max_cache.ops.builds, 1,
+                "track {t}: a fixed window rebuilt"
+            );
         }
     }
 
