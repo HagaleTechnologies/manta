@@ -1,3 +1,19 @@
+---
+id: fleet-checkout-layout
+title: Where does the manta checkout live on a fleet machine, and what breaks if it moves?
+kind: gotcha
+status: current
+maintainer: agent
+sources:
+  - docs/DECISIONS/2026-09-04-man27-fleet-checkout-rename.md
+  - docs/RUNBOOKS/fleet-checkout-rename.md
+  - scripts/fleet-rename-checkout.sh
+  - .catalyst/config.json
+verified:
+  commit: d286147
+  date: 2026-10-13
+links: []
+---
 # Where does the manta checkout live on a fleet machine, and what breaks if it moves?
 
 Two independently-keyed path systems both care about the checkout's on-disk
@@ -6,9 +22,11 @@ location, and they respond to a directory rename differently.
 ## 1. The manual fleet clone — `~/code-repos/github/<org>/<repo>`
 
 Each fleet machine has a plain `git clone` under
-`~/code-repos/github/HagaleTechnologies/manta` (as of MAN-27; historically
-`.../skimmer` — see `docs/DECISIONS/2026-09-04-man27-fleet-checkout-rename.md`),
-with an optional `manta-worktrees/` sibling directory holding linked
+`~/code-repos/github/HagaleTechnologies/<repo>` — `manta` on a migrated host,
+historically `.../skimmer`. MAN-27 shipped the rename tooling and runbook
+(`docs/DECISIONS/2026-09-04-man27-fleet-checkout-rename.md`); the runbook's
+evidence table still records the migration as not run on any host. A
+clone may have an optional `manta-worktrees/` sibling directory holding linked
 worktrees created either by hand (`git worktree add`) or via
 `create-worktree.sh --worktree-dir <override>`. Naming here is literal and
 directory-name-driven: nothing renames these automatically when the repo is
@@ -31,6 +49,13 @@ A host whose config is missing `projectKey` (or carries a stale override)
 falls through to the `basename`-of-checkout fallback instead, and *is*
 affected — worktrees would keep minting under whatever the directory is
 named at the time.
+
+That chain is the one MAN-27 recorded. Catalyst v15's `create-worktree.sh`
+keys a checkout with a GitHub origin by `<owner>/<repo>` parsed from the
+origin URL (`~/catalyst/wt/HagaleTechnologies/manta/<ticket>`), falls back to
+`projectKey` then the basename only with no hosted origin, and reuses an
+existing tree under the older keys — so a directory rename moves nothing
+there either. Check which version a host runs before relying on either.
 
 ## What actually breaks on a rename, and why
 

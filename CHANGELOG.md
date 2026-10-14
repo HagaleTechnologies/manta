@@ -88,6 +88,12 @@ the git history and `docs/DECISIONS/`.
 - MAN-140: `--ka9q-group` / `[input] type = "ka9q"` reads one ka9q-radio
   (radiod) IQ channel over RTP multicast; see docs/GUIDES/ka9q-radio.md
 
+### Changed
+
+- The in-repo `wiki/` is the project's canonical wiki. GitHub's Wiki tab
+  is not used; disabling it remains an owner step. The wiki's stale
+  `verified` stamps and `manifest.json` are refreshed and CI-pinned (MAN-152).
+
 ## [0.1.0] - 2026-10-11
 
 Pre-stability alpha, expect breakage: manta has not cleared its own M2/M3

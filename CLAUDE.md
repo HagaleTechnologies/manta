@@ -175,6 +175,12 @@ same Rust engine. RBN's real login prompt and the live/offline agreement
 rate are unmeasured. See
 docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
 
+MAN-152: the in-repo `wiki/` is manta's canonical wiki. GitHub's Wiki tab
+is not used; disabling it remains an owner step. The wiki pages'
+`verified` stamps and `manifest.json` are refreshed and pinned by a
+`docs_consistency` test. See
+`docs/DECISIONS/2026-10-13-man152-one-wiki.md`.
+
 MAN-316: `[spot].refresh_lists` (default off) makes `run` from a live
 receiver download `cty.dat` every 7 days and `MASTER.SCP` daily over plain
 HTTP, swap a download that passes the acceptance checks into the
