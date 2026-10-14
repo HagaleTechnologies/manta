@@ -257,7 +257,19 @@ clamped to `[7.5, 56]` hops (60…8 WPM). `WGap`/`Silence` do not update
 
 At each anchor `t` (ascending), with `A(t)` the set of earlier anchors
 `s` with `t − s ≤ 1.5 · 7 · u_max_live` (and up to `80·u` for `Silence`,
-sampled every `round(u)` hops):
+sampled every `round(u)` hops — exactly: for origin anchor `s`, token
+`τ` with `d = t − s` and `d_prev` the same distance at the previous
+anchor step, evaluate `Silence` iff `d ≥ 10·u` and one of (a) `d ≤
+1.5·7·u_max_live` (inside the normal reach: not sampled); (b) `d_prev <
+10·u ≤ d` (the first crossing of the prior's lower bound is always
+evaluated); (c) a sample point `10·u + m·round(u)`, `m ≥ 1`, falls in
+`(d_prev, d]`; or (d) the `(s, index-of-τ)` pair's `Silence` successor
+survived merge and beam truncation at the previous productive anchor
+step ("hot carry", bounded by `beam` — the ranking of `Silence`
+candidates is invariant in `t` since `C[t]` cancels between origins, so
+per-step re-derivation only serves to keep the winning still-silent
+hypothesis in the beam; see
+`docs/DECISIONS/2026-10-14-man191-silence-cadence.md`)):
 
 1. For each `s ∈ A(t)` ascending, for each token `τ` alive at `s` in
    ascending stored order, for each segment type valid for `τ.phase`,
@@ -455,4 +467,8 @@ worst case for 300 simultaneously keying tracks**, typically a third of
 that (most tracks are idle or slow). §1–§2 add < 40 op per hop per track
 (≈ 4.5 MFLOP/s for 300 tracks). Criterion bench `hsmm_300_tracks` gates
 this; `beam` and `fallback_hops` are the knobs if the Pi 4 leg needs
-them.
+them. §4.6's `Silence` cadence (MAN-191) measured −78 %/−63 % Silence
+evaluations on V3/V8 and −38 % gap-phase evaluations on the synthetic
+long-gap scene, on top of keeping every non-`V5`/`V8`/`V8w`/`VR8` golden
+decode byte-identical; the `hsmm/300_tracks_10s_gappy` scene covers the
+long-silence path.

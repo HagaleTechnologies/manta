@@ -74,6 +74,43 @@ fn min_hist_ts(tokens: &[Token]) -> Option<u64> {
         .min()
 }
 
+/// MAN-191: whether a `Silence` successor from an origin anchor `d`
+/// hops behind the current anchor step should be evaluated at THIS step,
+/// given the previous anchor step sat at `d_prev` hops behind the same
+/// origin (0 when there was no previous step, or the origin is newer
+/// than it). SPEC v2 §4.6 samples the extended `80·u` Silence range
+/// "every `round(u)` hops"; this predicate is the exact rule (hot carry
+/// aside -- see `HsmmDecoder::push`):
+///
+/// - (a) `d ≤ reach_norm`: inside the normal candidate-origin set
+///   `A(t)`, every anchor is an origin for every segment type -- the
+///   §4.6 cadence qualifies only the *extension* beyond it;
+/// - (b) `d_prev < 10·u ≤ d`: the first crossing of the Silence
+///   prior's lower bound is always evaluated, so the initial
+///   "this gap just became Silence" decision keeps main's latency;
+/// - (c) otherwise, evaluate only when a sample point `10u + m·round(u)`
+///   (`m ≥ 1`) falls in the half-open interval `(d_prev, d]` -- i.e.
+///   `(d − 10u)/round(u) ≠ (d_prev − 10u)/round(u)`.
+///
+/// Sample points sit on a grid in `d` and each is taken at the first
+/// anchor step at or after it, so a strict `d % round(u) == 0` (which
+/// aliases against the 8-hop fallback anchor grid and delays the first
+/// evaluation by up to `round(u)` hops) is deliberately NOT used.
+fn silence_sampled(d: u64, d_prev: u64, u: f32, reach_norm: u64) -> bool {
+    if d <= reach_norm {
+        return true; // (a)
+    }
+    let d_lo = (10.0 * u) as u64;
+    if d < d_lo {
+        return false;
+    }
+    if d_prev < d_lo {
+        return true; // (b)
+    }
+    let r = (u.round() as u64).max(1);
+    (d - d_lo) / r != (d_prev - d_lo) / r // (c)
+}
+
 /// Token-passing HSMM decoder: consumes per-hop evidence, maintains a beam
 /// of speed/position hypotheses anchored at edge candidates, and commits
 /// glyphs/word-boundaries via partial traceback. SPEC v2 §4.
@@ -93,6 +130,27 @@ pub struct HsmmDecoder {
     /// KIND rather than its exact value, and why it's threaded through
     /// every call.
     sealed: Vec<(u64, bool)>,
+    /// MAN-191: hop of the most recent anchor step that ran candidate
+    /// generation (i.e. passed the anchor gate with a non-empty anchor
+    /// set), or `None` before the first. Updated every such step --
+    /// including steps whose candidate list ends up empty -- so
+    /// `silence_sampled`'s `d_prev` always reflects the previous anchor
+    /// step, not the previous *productive* one.
+    prev_step: Option<u64>,
+    /// MAN-191: the `(origin anchor hop, token index)` pairs whose
+    /// `Silence` successor survived merge + beam truncation at the
+    /// previous anchor step ("hot carry"). Bounded by `beam`, so it
+    /// adds at most `beam` Silence evaluations per step against the
+    /// ~1,300 per step the cadence removes. See `push`'s MAN-191
+    /// comment for why re-deriving these every step is load-bearing.
+    hot_silence: Vec<(u64, usize)>,
+    /// MAN-191 test instrumentation: every `Silence` evaluation beyond
+    /// `reach_norm`, as `(origin anchor hop, token index, d, hot, u)` --
+    /// the plan's 4-field shape plus the evaluating token's `u`, which
+    /// the cadence assertions need to reconstruct `d_lo = 10u` and
+    /// `round(u)` per pair.
+    #[cfg(test)]
+    silence_trace: Vec<(u64, usize, u64, bool, f32)>,
 }
 
 impl HsmmDecoder {
@@ -106,6 +164,10 @@ impl HsmmDecoder {
             last_prefix: 0.0,
             last_ts: 0,
             sealed: Vec::new(),
+            prev_step: None,
+            hot_silence: Vec::new(),
+            #[cfg(test)]
+            silence_trace: Vec::new(),
         }
     }
 
@@ -233,18 +295,63 @@ impl HsmmDecoder {
                 break;
             }
         }
-        let mut cands: Vec<Token> = Vec::new();
+        // MAN-191 (SPEC v2 §4.6): sample the extended Silence range at
+        // the round(u) cadence instead of evaluating it from every
+        // retained anchor on every anchor step. Rules, for origin
+        // anchor `s`, token `tau`, current anchor step `t` and previous
+        // anchor step `t_prev` (d = t - s, d_prev = t_prev - s):
+        //
+        // (a) d <= reach_norm: inside the normal A(t); not sampled.
+        // (b) d_prev < 10u <= d: the first crossing of 10u is always
+        //     evaluated, keeping the initial Silence decision's commit
+        //     latency exactly as before.
+        // (c) beyond that, evaluate only when a sample point
+        //     10u + m*round(u) (m >= 1) falls in (d_prev, d].
+        // (d) hot carry: any (s, token index) pair whose Silence
+        //     successor survived merge + beam truncation at the previous
+        //     productive step is re-evaluated every step.
+        //
+        // Why (d) exists: a Silence candidate's score is
+        // `tau.score + ev + 0 + lp_type` where `ev = -(C[t] - C[s])`.
+        // Its C[s] and tau.score terms are frozen in the origin anchor,
+        // so relative to another Silence candidate from a different
+        // origin the score differs by `tau.score + C[s] + lp_type` --
+        // none of which depends on t (C[t] cancels between the two).
+        // The ranking of Silence candidates is therefore t-invariant,
+        // and the ONLY thing per-step re-derivation adds is keeping the
+        // winning "still silent" hypothesis in the beam. Without (d),
+        // unsampled steps fill the beam with mark candidates that ran
+        // through negative evidence, which measurably shifts commits
+        // (the mode-3 prototype regressed V10's CER 0.493 -> 0.579 and
+        // moved commit timestamps). Hot carry is bounded by `beam` (<=
+        // 12 pairs per step), so it adds at most 12 evaluations per step
+        // against the ~1,300 the cadence removes. See
+        // docs/DECISIONS/2026-10-14-man191-silence-cadence.md and
+        // `silence_sampled` for the exact predicate.
+        let prev_step = self.prev_step.replace(ev.hop);
+        let mut cands: Vec<(Token, Option<(u64, usize)>)> = Vec::new();
+        #[cfg(test)]
+        let mut trace: Vec<(u64, usize, u64, bool, f32)> = Vec::new();
         for a in self.anchors.iter() {
             let d = ev.hop - a.hop;
             if d == 0 || d > reach_sil {
                 continue;
             }
             let evidence = (ev.prefix - a.prefix) as f32;
-            for tok in &a.tokens {
+            let d_prev = prev_step.map_or(0, |p| p.saturating_sub(a.hop));
+            for (ti, tok) in a.tokens.iter().enumerate() {
                 for seg in SegType::ALL {
                     if seg == SegType::Silence {
                         if d < (10.0 * tok.u) as u64 {
                             continue;
+                        }
+                        let hot = self.hot_silence.contains(&(a.hop, ti));
+                        if !silence_sampled(d, d_prev, tok.u, reach_norm) && !hot {
+                            continue;
+                        }
+                        #[cfg(test)]
+                        if d > reach_norm {
+                            trace.push((a.hop, ti, d, hot, tok.u));
                         }
                     } else if d > reach_norm {
                         continue;
@@ -258,26 +365,38 @@ impl HsmmDecoder {
                         ev.hop,
                         a.sample_ts,
                     ) {
-                        cands.push(s);
+                        let tag = (seg == SegType::Silence).then_some((a.hop, ti));
+                        cands.push((s, tag));
                     }
                 }
             }
         }
+        #[cfg(test)]
+        self.silence_trace.extend(trace);
         if cands.is_empty() {
+            // `hot_silence` is left unchanged here: the beam is
+            // unchanged too (no merge/truncate ran), so the pairs that
+            // were hot at the previous step are still the ones whose
+            // successors would be in the beam.
             return out;
         }
         // Merge by (node, phase, round(2u)): keep the best by token_order.
-        cands.sort_by(token_order);
-        let mut merged: Vec<Token> = Vec::with_capacity(cands.len());
+        // Sorting on the token alone (same `token_order` comparator as
+        // before, stable) keeps the candidate order identical to the
+        // untagged loop; the Silence origin tag rides along untouched.
+        cands.sort_by(|x, y| token_order(&x.0, &y.0));
+        let mut merged: Vec<(Token, Option<(u64, usize)>)> = Vec::with_capacity(cands.len());
         'outer: for c in cands {
             for m in &merged {
-                if merge_key(m) == merge_key(&c) {
+                if merge_key(&m.0) == merge_key(&c.0) {
                     continue 'outer;
                 }
             }
             merged.push(c);
         }
         merged.truncate(self.cfg.beam);
+        self.hot_silence = merged.iter().filter_map(|&(_, tag)| tag).collect();
+        let mut merged: Vec<Token> = merged.into_iter().map(|(t, _)| t).collect();
         // Commit consensus / forced entries.
         out.extend(commit::commit(
             &mut merged,
@@ -420,6 +539,310 @@ mod tests {
             mark_level: 1.0,
             noise_level: 0.1,
         }
+    }
+
+    /// MAN-191 scene driver: SPEC §1.7-conformant synthetic evidence with a
+    /// running f64 prefix, ±10 llr, `sample_ts = hop * 512` and anchors on
+    /// sign edges, every 8th hop and `present` changes. `marks` is the list
+    /// of (start, len) keying-down runs; everything between them is gate
+    /// low.
+    fn drive_scene(
+        dec: &mut HsmmDecoder,
+        marks: &[(u64, u64)],
+        total_hops: u64,
+    ) -> Vec<(Option<Glyph>, u64, u32)> {
+        let mut out = Vec::new();
+        let mut prefix = 0.0f64;
+        let mut prev_present = false;
+        let mut prev_llr = 0.0f32;
+        for hop in 0..total_hops {
+            let present = marks.iter().any(|&(s, l)| hop >= s && hop < s + l);
+            let llr = if present { 10.0 } else { -10.0 };
+            prefix += llr as f64;
+            let anchor = llr != prev_llr || hop.is_multiple_of(8) || present != prev_present;
+            let ev = HopEvidence {
+                hop,
+                sample_ts: hop * 512,
+                llr,
+                present,
+                anchor,
+                prefix,
+                amp: if present { 1.0 } else { 0.01 },
+                mark_level: 1.0,
+                noise_level: 0.1,
+            };
+            out.extend(
+                dec.push(&ev)
+                    .into_iter()
+                    .map(|c| (c.glyph, c.sample_ts / 512, (c.confidence * 1000.0) as u32)),
+            );
+            prev_present = present;
+            prev_llr = llr;
+        }
+        out.extend(
+            dec.finish()
+                .into_iter()
+                .map(|c| (c.glyph, c.sample_ts / 512, (c.confidence * 1000.0) as u32)),
+        );
+        out
+    }
+
+    /// `N N N`, a 1,875-hop gate-low gap, then `N N`, all at u=13 (each N
+    /// is dah 39 on / 13 off / dit 13 on; 91 off between Ns). The scene
+    /// starts with a 40-hop gate-low lead-in and ends with a 400-hop
+    /// gate-low tail. Returns `(marks, total_hops)`.
+    fn n_scene() -> (Vec<(u64, u64)>, u64) {
+        const U: u64 = 13;
+        const DAH: u64 = 3 * U; // 39
+        const IGAP: u64 = U; // 13
+        const DIT: u64 = U; // 13
+        const WGAP: u64 = 7 * U; // 91
+        const LEAD_IN: u64 = 40;
+        const LONG_GAP: u64 = 1875;
+        const TAIL: u64 = 400;
+        let mut t = LEAD_IN;
+        let mut marks = Vec::new();
+        for i in 0..5u64 {
+            marks.push((t, DAH));
+            t += DAH + IGAP;
+            marks.push((t, DIT));
+            t += DIT + WGAP;
+            if i == 2 {
+                t += LONG_GAP;
+            }
+        }
+        (marks, t + TAIL)
+    }
+
+    /// MAN-191 characterization: the commit stream across a long
+    /// inter-transmission gap, driven directly through `HsmmDecoder` on
+    /// the synthetic `N N N <1875-hop gap> N N` scene, asserting the
+    /// full stream (glyph, sample_ts/512, confidence*1000). This is the
+    /// post-cadence pin; main's pre-cadence stream (same test, same
+    /// scene) differed ONLY in the gap's junk-`E` artifact entries
+    /// (`E@1208/1248/1320/1360/1432 982, E@1440 882` ->
+    /// `E@1192/1232/1296/1336/1400/1440 982` -- the winning junk-Dit
+    /// ORIGIN anchor changes under sampling, and each `E` commits at
+    /// its own origin's timestamp) and two post-gap confidences
+    /// (`N@2448 906 -> 982`, `N@2604 999 -> 982`). Every keying glyph
+    /// and every keying commit timestamp is identical; the plan's own
+    /// golden comparison accepts exactly this timestamps/confidence
+    /// class (V8/VR8) and declares the junk-`E` flood out of scope --
+    /// see docs/DECISIONS/2026-10-14-man191-silence-cadence.md.
+    #[test]
+    fn silence_cadence_preserves_commit_stream_across_a_long_gap() {
+        let (marks, total) = n_scene();
+        let mut dec = HsmmDecoder::new(HsmmConfig::default());
+        let stream = drive_scene(&mut dec, &marks, total);
+        let render = |g: &Option<Glyph>| match g {
+            Some(Glyph::Char(c)) => c.to_string(),
+            Some(_) => "?".to_string(),
+            None => "␠".to_string(),
+        };
+        let got: Vec<String> = stream
+            .iter()
+            .map(|(g, ts, cf)| format!("{}@{} {}", render(g), ts, cf))
+            .collect();
+        let expected: Vec<String> = [
+            "N@104 978",
+            "␠@104 982",
+            "N@261 975",
+            "␠@261 982",
+            "N@416 859",
+            "␠@416 982",
+            "E@1192 982",
+            "␠@1192 982",
+            "E@1232 982",
+            "E@1296 982",
+            "␠@1296 982",
+            "E@1336 982",
+            "E@1400 982",
+            "␠@1400 982",
+            "E@1440 982",
+            "␠@1440 882",
+            "N@2448 982",
+            "␠@2448 982",
+            "N@2604 982",
+            "␠@2604 982",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(got, expected, "commit stream changed");
+    }
+
+    #[test]
+    fn silence_sampled_true_inside_normal_reach() {
+        // (a): within A(t)'s normal reach, Silence is not sampled.
+        assert!(silence_sampled(136, 128, 13.0, 137));
+        assert!(silence_sampled(137, 129, 13.0, 137));
+    }
+
+    #[test]
+    fn silence_sampled_true_at_first_crossing_of_ten_u() {
+        // (b): d_prev < 10u <= d always evaluates, whatever the stride.
+        assert!(silence_sampled(130, 128, 13.0, 137));
+        assert!(silence_sampled(131, 122, 13.0, 137));
+        // Below 10u entirely and beyond the normal reach: not
+        // Silence's range at all (the caller's range check would have
+        // skipped it; the predicate agrees).
+        assert!(!silence_sampled(129, 128, 13.0, 100));
+    }
+
+    #[test]
+    fn silence_sampled_once_per_round_u_bucket_at_u_13() {
+        // SPEC v2 §4.6 cadence: anchor steps arrive every 8 hops
+        // (fallback grid); at u=13 the sample points sit every
+        // r=13 hops in d, past d_lo=130. Walk the step sequence the
+        // decoder actually sees and require exactly one evaluation per
+        // 13-hop bucket of d.
+        let u = 13.0f32;
+        let reach_norm = 137u64;
+        let d_lo = (10.0 * u) as u64; // 130
+        let r = (u.round() as u64).max(1); // 13
+        let mut buckets: Vec<u64> = Vec::new();
+        let mut d_prev = d_lo - 8; // one 8-hop step before the crossing
+        let mut d = d_lo;
+        while d <= d_lo + 130 {
+            if silence_sampled(d, d_prev, u, reach_norm) {
+                buckets.push((d - d_lo) / r);
+            }
+            d_prev = d;
+            d += 8;
+        }
+        assert!(
+            buckets.windows(2).all(|w| w[0] < w[1]),
+            "bucket index must strictly increase across evaluated steps: {buckets:?}"
+        );
+        // ceil(130/13) = 10 sample points, +1 tolerance for the first
+        // crossing landing inside the first bucket.
+        assert!(
+            (9..=11).contains(&buckets.len()),
+            "expected ~10 sampled steps from d_lo to d_lo+130, got {} ({buckets:?})",
+            buckets.len()
+        );
+    }
+
+    #[test]
+    fn silence_sampled_stride_rounds_u_and_clamps_to_one() {
+        // u = 9.4 -> r = round(9.4) = 9: consecutive steps 8 apart land
+        // in different 9-hop buckets, but a 1-hop step within a bucket
+        // does not re-sample.
+        assert!(!silence_sampled(95, 94, 9.4, 50));
+        assert!(silence_sampled(103, 94, 9.4, 50));
+        // u < 0.5 -> round(u) = 0 clamps to 1: every hop is a sample
+        // point, so consecutive steps always re-sample.
+        let u = 0.4f32;
+        assert!(silence_sampled(5, 4, u, 2));
+        assert!(silence_sampled(6, 5, u, 2));
+        assert!(silence_sampled(7, 6, u, 2));
+    }
+
+    /// MAN-191: the cadence actually samples. Drives the Phase 1 scene
+    /// and reads `silence_trace` (every Silence evaluation beyond
+    /// `reach_norm`): cold (non-hot) evaluations of each (origin,
+    /// token) pair must advance to a new `round(u)` sample bucket each
+    /// time; hot carry is bounded by `beam` per step; and the total
+    /// gap-phase evaluations must come in well under the uncapped
+    /// every-anchor-step count reconstructed from the same trace.
+    #[test]
+    fn silence_cadence_samples_cold_origins_every_round_u() {
+        let cfg = HsmmConfig::default();
+        let (marks, total) = n_scene();
+        let mut dec = HsmmDecoder::new(cfg.clone());
+        let _ = drive_scene(&mut dec, &marks, total);
+        let trace = std::mem::take(&mut dec.silence_trace);
+        assert!(!trace.is_empty(), "scene must evaluate Silence");
+
+        // (1) Cold evaluations of each (origin, token) pair advance to a
+        // new round(u) sample bucket each time: (d - d_lo)/r strictly
+        // increases across consecutive cold entries. The pair key
+        // includes the token's u because `push` can freeze TWO anchors
+        // at the same hop (the reseed branch's seed anchor and the
+        // candidate step's merged anchor): same hop, different token 0.
+        use std::collections::BTreeMap;
+        let mut per_pair: BTreeMap<(u64, usize, u32), Vec<(u64, bool)>> = BTreeMap::new();
+        for &(origin, ti, d, hot, u) in &trace {
+            per_pair
+                .entry((origin, ti, u.to_bits()))
+                .or_default()
+                .push((d, hot));
+        }
+        for ((origin, ti, bits), entries) in &per_pair {
+            let u = f32::from_bits(*bits);
+            let d_lo = (10.0 * u) as u64;
+            let r = (u.round() as u64).max(1);
+            // `push` can freeze two anchors at one hop (reseed seeds +
+            // merged beam); both instances share the step grid, so
+            // dedupe identical (d, hot) evaluations before checking
+            // bucket monotonicity.
+            let mut deduped: Vec<(u64, bool)> = Vec::new();
+            for &e in entries {
+                if deduped.last() != Some(&e) {
+                    deduped.push(e);
+                }
+            }
+            let mut last_bucket: Option<u64> = None;
+            for &(d, hot) in &deduped {
+                if hot {
+                    continue;
+                }
+                let bucket = (d - d_lo) / r;
+                if let Some(lb) = last_bucket {
+                    assert!(
+                        bucket > lb,
+                        "cold Silence evaluations of pair ({origin}, {ti}, u={u}) re-sampled \
+                         bucket {bucket} after {lb} (d={d})"
+                    );
+                }
+                last_bucket = Some(bucket);
+            }
+        }
+
+        // (2) Hot carry is bounded by `beam` per anchor step.
+        let mut per_step: BTreeMap<u64, usize> = BTreeMap::new();
+        for &(origin, _ti, d, hot, _u) in &trace {
+            if hot {
+                *per_step.entry(origin + d).or_default() += 1;
+            }
+        }
+        for (step, n) in per_step {
+            assert!(
+                n <= cfg.beam,
+                "step {step} carried {n} hot Silence hypotheses, over the beam of {beam}",
+                beam = cfg.beam
+            );
+        }
+
+        // (3) The gap (hops 417..=2394 in this scene: after N3's dit,
+        // before N4's dah) evaluates far fewer Silences than the
+        // uncapped every-step rule would. Uncapped count reconstructed
+        // from the same trace's pairs: anchor steps arrive every 8
+        // hops through the gap, so every pair whose window spans
+        // [d_first, d_last] would be evaluated (d_last - d_first)/8 + 1
+        // times uncapped.
+        let gap = |step: u64| (417..=2394).contains(&step);
+        let mut actual = 0usize;
+        let mut uncapped = 0usize;
+        for ((origin, _ti, _u), entries) in &per_pair {
+            let gap_entries: Vec<(u64, bool)> = entries
+                .iter()
+                .filter(|&&(d, _)| gap(*origin + d))
+                .copied()
+                .collect();
+            if gap_entries.is_empty() {
+                continue;
+            }
+            actual += gap_entries.len();
+            let d_first = gap_entries.iter().map(|&(d, _)| d).min().unwrap();
+            let d_last = gap_entries.iter().map(|&(d, _)| d).max().unwrap();
+            uncapped += ((d_last - d_first) / 8 + 1) as usize;
+        }
+        assert!(
+            uncapped > 0 && actual * 10 <= uncapped * 7,
+            "gap-phase Silence evaluations {actual} are not >= 30% below the uncapped \
+             {uncapped}"
+        );
     }
 
     #[test]

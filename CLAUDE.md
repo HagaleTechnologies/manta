@@ -220,6 +220,18 @@ pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
 planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
+MAN-191: the HSMM decoder samples its long-`Silence` hypotheses at SPEC
+v2 §4.6's cadence instead of every anchor step (`silence_sampled`:
+normal reach, first `10u` crossing, then one sample per `round(u)` hops,
+plus a beam-bounded "hot carry" of surviving `Silence` successors;
+`HsmmDecoder::push`). Gap-phase `Silence` evaluations drop 38 % on the
+synthetic long-gap scene (plan: −78 % on V3) and 21/25 golden vectors
+decode byte-identically — only V5/V8/V8w/VR8 differ, in
+timestamps/confidences and gap-artifact glyphs (V8/VR8 text and
+V8/V8w spot lists unchanged). `hsmm_300_tracks` gains a
+`300_tracks_10s_gappy` scene covering the long-silence path. See
+docs/DECISIONS/2026-10-14-man191-silence-cadence.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each
