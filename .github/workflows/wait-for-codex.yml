@@ -41,8 +41,10 @@ on:
   pull_request_target:
     # Q-0068: main only. The environment check uses the PR's base as the ref, so a stacked PR
     # onto a non-main base would get a failing gate; only main's ruleset requires this gate.
+    # `edited` (base change only, see codex-review-request's `if:`) covers a stacked PR later
+    # retargeted onto main with no new commit, same as auto-merge-trigger.yml.
     branches: [main]
-    types: [opened, ready_for_review, synchronize, reopened]
+    types: [opened, ready_for_review, synchronize, reopened, edited]
   issue_comment:
     types: [created]
   # Fleet CI redesign, native merge-queue cutover: "Codex review clean (gate before expensive
@@ -91,7 +93,9 @@ jobs:
   # exact name instead of the separately-produced "Wait for Codex Review".
   codex-review-request:
     name: 'Codex review clean: request'
-    if: github.event_name == 'pull_request_target'
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      (github.event.action != 'edited' || github.event.changes.base != null)
     # Q-0068: the PAT and app key live in the main-only codex-review environment.
     environment:
       name: codex-review
@@ -99,7 +103,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     concurrency:
-      group: codex-review-request-${{ github.event.pull_request.number }}
+      # A non-base `edited` run (title/body edit) gets its own group so it can never cancel an
+      # in-flight request for the same PR.
+      group: codex-review-request-${{ github.event.pull_request.number }}${{ (github.event.action == 'edited' && github.event.changes.base == null) && format('-noop-{0}', github.run_id) || '' }}
       cancel-in-progress: ${{ github.run_attempt == 1 }}
     outputs:
       check_run_id: ${{ steps.create-check.outputs.check_run_id }}
