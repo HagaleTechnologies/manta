@@ -52,7 +52,8 @@ pending queue drained on its own.
 Reported frequencies move by up to the centroid's hop-to-hop jitter. V4's
 first report is 14,009,093.5 Hz after the fix, against 14,009,083.2 Hz
 (4096-sample chunks) and 14,009,088.3 Hz (2048) before. No golden vector
-pins a `TrackMeta` frequency; the workspace suite is unchanged.
+pins a `TrackMeta` frequency: the workspace suite passes without changing
+any expected value.
 
 ## Why the live writes were removed
 
