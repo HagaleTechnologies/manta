@@ -566,7 +566,10 @@ mod tests {
         let others = [
             "notes.txt".to_string(),
             format!("{}.scp", shas[1]),
-            format!("{}.dat", shas[1].to_uppercase()),
+            // Upper-case hex is not a version name. Not `shas[1]` upper-cased:
+            // on a case-insensitive filesystem (macOS APFS, Windows NTFS) that
+            // name is the same file as the version `shas[1].dat`.
+            format!("{}.dat", "AB".repeat(32)),
             format!(".{}.dat.tmp.1.2", shas[2]),
         ];
         for name in &others {
