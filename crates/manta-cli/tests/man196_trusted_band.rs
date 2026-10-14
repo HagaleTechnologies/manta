@@ -102,16 +102,17 @@ fn beyond_the_trusted_band_a_decimated_signal_spawns_no_tracks() {
     );
 }
 
-/// A steady complex tone at `offset_hz`, amp 0.1 (-20 dBFS), `seconds`
+/// A steady complex tone at `offset_hz`, `amp_dbfs` dBFS, `seconds`
 /// long at 96 kS/s -- the probe's carrier construction (no keying, no
 /// noise; digital silence everywhere else).
-fn tone_scene(offset_hz: f64, seconds: f64) -> Vec<Complex32> {
+fn tone_scene(offset_hz: f64, seconds: f64, amp_dbfs: f32) -> Vec<Complex32> {
     let fs = 96_000.0;
+    let amp = 10f32.powf(amp_dbfs / 20.0);
     let n = (seconds * fs).round() as usize;
     (0..n)
         .map(|i| {
             let phi = 2.0 * std::f64::consts::PI * offset_hz * i as f64 / fs;
-            Complex32::new(0.1 * phi.cos() as f32, 0.1 * phi.sin() as f32)
+            Complex32::new(amp * phi.cos() as f32, amp * phi.sin() as f32)
         })
         .collect()
 }
@@ -156,15 +157,53 @@ fn carrier_promotions(iq: &[Complex32], trusted: bool) -> usize {
 #[test]
 fn a_carrier_above_the_decimated_nyquist_promotes_nothing() {
     assert!(
-        carrier_promotions(&tone_scene(20_000.0, 20.0), true) >= 1,
+        carrier_promotions(&tone_scene(20_000.0, 20.0, -20.0), true) >= 1,
         "in-band control at +20 kHz: a carrier is a signal and must still \
          promote, trusted band or not"
     );
     assert_eq!(
-        carrier_promotions(&tone_scene(25_000.0, 20.0), true),
+        carrier_promotions(&tone_scene(25_000.0, 20.0, -20.0), true),
         0,
         "a carrier above the decimated Nyquist must promote nothing once \
          the trusted band is in force (its folded residue lands beyond \
          the boundary)"
+    );
+}
+
+/// The in-band foldover cell (round-1 review on PR #300): a carrier whose
+/// alias folds INSIDE the trusted band lands on trusted channels the
+/// spawn veto cannot see -- only the decimator's stopband (>= 80 dB by
+/// design, measured >= ~-86.5 dB over the whole fold-in region; see
+/// `halfband_stopband_covers_frequencies_folding_inside_the_trusted_band`)
+/// stands between it and a mirrored track. Measured boundary on this
+/// codebase: a -35 dBFS carrier at +26 343.75 Hz (folding to exactly
+/// 21 656.25 Hz -- trusted channel 231's centre, the deterministic worst
+/// case) still promotes in digital silence; at -40 dBFS its residue sits
+/// below the detector's floor and promotes nothing. The >= -35 dBFS
+/// window is the documented residual of the committed 80 dB stopband
+/// target: closing it needs a deeper stopband (KAISER_BETA/HALFBAND_TAPS
+/// redesign), which the plan's "no stopband work" scope excludes and this
+/// round raised as a decision ticket instead. This cell pins the boundary
+/// the committed design actually guarantees.
+#[test]
+fn an_in_band_foldover_residue_promotes_only_above_the_stopband_margin() {
+    // The residual, pinned so the boundary is executable: a strong carrier
+    // above Nyquist whose alias folds onto a trusted channel centre still
+    // promotes (>= 1, measured exactly 1) -- updating this pin to 0 is
+    // what landing a deeper stopband looks like.
+    assert!(
+        carrier_promotions(&tone_scene(26_343.75, 20.0, -20.0), true) >= 1,
+        "strong in-band-folded carriers are the documented residual of the 80 dB \
+         stopband target (decision ticket pending); if this stops promoting, the \
+         stopband deepened -- flip this pin and update the decision record"
+    );
+    // The guarantee: past the design's suppression margin the folded
+    // residue is below the digital-silence floor and promotes nothing.
+    assert_eq!(
+        carrier_promotions(&tone_scene(26_343.75, 20.0, -40.0), true),
+        0,
+        "a -40 dBFS carrier's folded residue (~-127 dBFS after >= ~86 dB of \
+         stopband) must stay below the detector's floor: this is the level the \
+         committed design honestly removes from detectability"
     );
 }

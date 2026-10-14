@@ -259,10 +259,15 @@ of fs_out, the <= 1 dB crossover): `DecimatingSource::rf_passband_hz`
 narrows `manta check`/SETT/bandState/crash live set to it, `run`/`soak`
 print one startup line, and the track manager's spawn scan vetoes
 channels beyond it (spawns only — MAN-314's lesson), via
-`IqSource::trusted_band_hz` threaded through `listen`. Rim channels
+`IqSource::trusted_band_hz` threaded through `listen` (every wrapper
+forwards it, doctor's `SampleBoundedSource` included). Rim channels
 232-255 per side at 48 kS/s are conceded by design; non-decimated sources
-are bit-identical to before. See
-docs/DECISIONS/2026-10-14-man196-decimator-trusted-band.md.
+are bit-identical to before. Aliases folding *inside* the trusted band
+(input frequencies >= fs_out - trusted) are stopband-only: held at
+>= 80 dB (measured >= ~-86.5 dB), so a carrier at <= -40 dBFS above
+Nyquist promotes nothing, but a stronger one can still mirror in digital
+silence — a pinned residual; deepening the stopband is a decision ticket.
+See docs/DECISIONS/2026-10-14-man196-decimator-trusted-band.md.
 
 ## Documents (read in this order)
 

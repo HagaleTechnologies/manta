@@ -21,7 +21,16 @@
 //! closing or de-weighting running tracks. See
 //! docs/DECISIONS/2026-10-14-man196-decimator-trusted-band.md. Without
 //! the margin, a signal just above the new Nyquist could alias into a
-//! false in-band track/spot at the mirrored RF frequency.
+//! false in-band track/spot at the mirrored RF frequency. Known residual
+//! (round-1 review on PR #300): frequencies at or above `fs_out -
+//! trusted` fold *inside* the trusted band, past anything the veto can
+//! see -- the halfband's stopband holds them at >= 80 dB (measured >=
+//! ~-86.5 dB; see
+//! `halfband_stopband_covers_frequencies_folding_inside_the_trusted_band`),
+//! which removes any carrier at/under ~-40 dBFS from detectability but
+//! leaves a stronger carrier above Nyquist able to promote a mirrored
+//! track in digital silence; deepening it is a filter-design decision
+//! recorded in the decision record, not a constant change here.
 
 use crate::proto::{bessel_i0, KAISER_BETA};
 use num_complex::Complex32;
@@ -405,6 +414,40 @@ mod tests {
         let h = design_halfband(HALFBAND_TAPS);
         let gain_db = response_db(&h, 40_000.0, fs);
         assert!(gain_db.abs() < 0.5, "passband gain {gain_db} dB");
+    }
+
+    #[test]
+    fn halfband_stopband_covers_frequencies_folding_inside_the_trusted_band() {
+        // MAN-196 round-1 review (PR #300): the trusted-band spawn veto
+        // only rejects folded aliases that land OUTSIDE the trusted band.
+        // Frequencies at or above fs_out - trusted_half fold INSIDE it,
+        // where no downstream veto can see them -- only this filter's
+        // stopband stands between the alias and a mirrored in-band track
+        // -- so the suppression over that whole region needs its own
+        // acceptance pin. The -80 dB figure is the design's own Kaiser
+        // stopband target (the module claims the decimator "isn't the
+        // weakest link in the alias-rejection chain"); measured worst case
+        // is ~-86.5 dB at the region's lower edge (26 275.2 Hz at
+        // fs_out = 48 kS/s). This pins the committed design; whether the
+        // target itself must deepen (a >= -35 dBFS carrier above Nyquist
+        // still promotes through ~-86 dB in digital silence) is raised as
+        // a decision ticket, not silently changed here.
+        let fs = 96_000.0; // one 96k -> 48k stage, the review's example
+        let fs_out = 48_000.0;
+        let fold_in_edge = fs_out - TRUSTED_HALF_BAND_FRACTION * fs_out;
+        let h = design_halfband(HALFBAND_TAPS);
+        let mut worst = -300.0f64;
+        let mut f = fold_in_edge;
+        while f <= fs / 2.0 {
+            worst = worst.max(response_db(&h, f, fs));
+            f += 5.0;
+        }
+        assert!(
+            worst <= -80.0,
+            "worst response over the fold-in region [{fold_in_edge:.1}, {:.1}] Hz is {worst} dB \
+             (design target -80 dB; raise the stopband target/KAISER_BETA if this fails)",
+            fs / 2.0
+        );
     }
 
     fn tone(freq: f64, n: usize, amp: f32, fs: f64) -> Vec<Complex32> {

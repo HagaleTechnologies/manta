@@ -162,6 +162,20 @@ bisection in the module's tests. Two rules consume it:
   MAN-314 key-up-gap lesson. `None` (every non-decimated source) vets
   nothing: behaviour-identical to before, bit for bit.
 
+**In-band foldover aliases** (round-1 review on PR #300): frequencies at
+or above `fs_out - trusted` fold *inside* the trusted band, where the
+spawn veto cannot see them — only the halfband's stopband stands between
+the alias and a mirrored in-band track. That region is pinned at the
+design's >= 80 dB Kaiser stopband target (measured >= ~-86.5 dB, worst at
+the region's lower edge 26 275.2 Hz at `fs_out` = 48 kS/s;
+`halfband_stopband_covers_frequencies_folding_inside_the_trusted_band`).
+A carrier above Nyquist stronger than the stopband margin can still
+promote a mirrored track in digital silence (measured boundary: -35 dBFS
+at +26 343.75 Hz promotes, -40 dBFS does not; e2e pin
+`an_in_band_foldover_residue_promotes_only_above_the_stopband_margin`).
+Deepening the stopband is a filter-design change excluded from MAN-196's
+scope and raised as a decision ticket (see the decision record).
+
 Channel granularity makes the effective edge the last channel centre
 inside the boundary (channel 231, 21 656.25 Hz, at 48 kS/s): channels
 232-255 per side (24 of 256) are conceded by design. See

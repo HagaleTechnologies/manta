@@ -88,11 +88,26 @@ dB) would concede usable channels; a looser one admits the measured
   a signal just inside the band (+21 kHz, −0.05 dB) decodes at the
   golden standard (CER < 0.02, freq error ≤ 25 Hz, one track — measured
   1.5 Hz / 0.0103) (`rim_inside_the_trusted_band_still_decodes_at_the_golden_standard`).
+- **In-band foldover aliases** (round-1 review on PR #300): a carrier at
+  or above `fs_out − trusted` (26 275.2 Hz at 48 kS/s) folds *inside*
+  the trusted band, where the spawn veto cannot see it — only the
+  halfband's stopband does. That region is held at ≥ 80 dB (measured
+  worst −86.5 dB at the region's lower edge;
+  `halfband_stopband_covers_frequencies_folding_inside_the_trusted_band`),
+  so the folded residue of a carrier at/under −40 dBFS stays below the
+  detector's digital-silence floor (e2e: −40 dBFS at +26 343.75 Hz,
+  folding to trusted channel 231's centre, promotes nothing), while a
+  carrier at −20 dBFS (residue ≈ −107 dBFS) still promotes one mirrored
+  track — measured boundary between −35 and −40 dBFS, pinned by
+  `an_in_band_foldover_residue_promotes_only_above_the_stopband_margin`.
 - Wrappers forward the band (`FixedCenterFreqSource`, `PacedSource`,
   `LoopingSource`, `ReconnectingSource` capture it beside
   `rf_passband_hz`); a factor-1 pass-through wrap reports `None` (no
   filter, no transition band). The CLI never builds the latter
-  (`maybe_decimate` skips an equal-rate target).
+  (`maybe_decimate` skips an equal-rate target). `doctor`'s
+  `SampleBoundedSource` forwards it too (round-1 review on PR #300),
+  so `doctor --capture-rate-hz` runs the same detector path as
+  `run`/`soak`.
 
 ## Not done here, and why
 
@@ -113,7 +128,17 @@ dB) would concede usable channels; a looser one admits the measured
 - **No stopband work.** The 39–50 dB near-Nyquist alias suppression
   margin belongs to the `CUTOFF_FRACTION`/`HALFBAND_TAPS` history; the
   veto removes its observable consequence (foldover promotions) without
-  redesigning the filter.
+  redesigning the filter. **Correction from the round-1 review on PR
+  #300:** that rationale holds only for aliases folding *outside* the
+  trusted band; aliases folding *inside* it (input frequencies ≥
+  `fs_out − trusted`) are suppressed by the stopband alone, which holds
+  ≥ 80 dB there but leaves a ≥ ~−35 dBFS carrier able to promote a
+  mirrored track in digital silence (see the residual above). Deepening
+  the stopband (~120 dB would close the −20 dBFS window) means a higher
+  Kaiser β and roughly double the taps against the missing Pi4
+  decimator CPU bench, and shifts the cutoff toward the 0.232–0.2325
+  golden cliff — a filter-design tradeoff this ticket's plan explicitly
+  excluded, so it is raised as a decision ticket rather than taken here.
 - **No `decode`-path change**: `decode` never decimates.
 
 ## What would relax this
