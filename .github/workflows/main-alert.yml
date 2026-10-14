@@ -6,7 +6,7 @@ name: Main Alert
 # deliberately not listed.
 #
 # INLINED COPY of HagaleTechnologies/credenza .github/workflows/main-alert.yml
-# @ 96f810e989c5939b61547c955354d3acce006024 -- this repo is public and cannot call a reusable workflow in a
+# @ ca2c4743a5c061f60ec8c6082296c750faa716db -- this repo is public and cannot call a reusable workflow in a
 # private repo. Logic and its tests live there (scripts/main-alert/); change it
 # there first, then re-copy. Inputs are fixed here: assignee thagale, label
 # main-red, events push/schedule/workflow_run, tags '^v[0-9]', recovery_jobs {}. Runs on
@@ -80,11 +80,14 @@ jobs:
           effective_success() {
             local path="repos/$REPO/actions/runs/$1/jobs?per_page=100"
             [ -z "${2:-}" ] || path="repos/$REPO/actions/runs/$1/attempts/$2/jobs?per_page=100"
-            gh api "$path" | jq -e --arg wf "$WORKFLOW_NAME" --argjson req "$RECOVERY_JOBS" '
+            local jobs
+            # An unreadable job list must abort, not read as "did nothing".
+            jobs=$(gh api "$path") || exit 1
+            jq -e --arg wf "$WORKFLOW_NAME" --argjson req "$RECOVERY_JOBS" '
               [.jobs[] | select(.conclusion != "skipped")] as $ran
               | ($ran | length) > 0
                 and (($req[$wf] // null) as $re
-                     | $re == null or any($ran[]; .conclusion == "success" and (.name | test($re))))' >/dev/null
+                     | $re == null or any($ran[]; .conclusion == "success" and (.name | test($re))))' <<<"$jobs" >/dev/null
           }
 
           if [ "$CONCLUSION" = success ] && ! effective_success "$RUN_ID" "$RUN_ATTEMPT"; then
@@ -143,8 +146,11 @@ jobs:
 
           if [ -n "$issue" ]; then
             # The opening report lives in the issue body, later ones in comments.
-            seen=$(gh api "repos/$REPO/issues/$issue" --jq '.body // ""'
-              gh api "repos/$REPO/issues/$issue/comments?per_page=100" --jq '.[].body')
+            # Fetched separately so either failing aborts the step (a missed
+            # marker would re-post).
+            body=$(gh api "repos/$REPO/issues/$issue" --jq '.body // ""')
+            comments=$(gh api --paginate "repos/$REPO/issues/$issue/comments?per_page=100" --jq '.[].body')
+            seen="$body"$'\n'"$comments"
             if grep -qF "$marker" <<<"$seen"; then
               echo "Issue #$issue already has this run -- duplicate delivery."
               exit 0
