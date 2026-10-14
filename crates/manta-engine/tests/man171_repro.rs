@@ -8,6 +8,8 @@ use manta_testkit::scene::SignalSpec;
 
 fn sig(offset_hz: f64, snr_2500_db: f32) -> SignalSpec {
     SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: "CQ CQ DE TEST TEST K".into(),
         loop_text: true,
         wpm: 25.0,

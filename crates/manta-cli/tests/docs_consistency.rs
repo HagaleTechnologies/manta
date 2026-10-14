@@ -130,6 +130,7 @@ fn readme_inputs_table_covers_every_shipped_input() {
         "--kiwi-host",
         "--soapy-driver",
         "--hpsdr-host",
+        "--ka9q-group",
     ] {
         assert!(
             inputs.contains(needle),
@@ -900,6 +901,9 @@ fn spec_documents_every_input_and_spot_key() {
                 "driver",
                 "rate_hz",
                 "gain_db",
+                "group",
+                "ssrc",
+                "interface",
                 "freq_correction_ppm",
                 "center_freq_hz",
                 "capture_rate_hz",

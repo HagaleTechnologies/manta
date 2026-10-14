@@ -50,7 +50,7 @@ allow).
 manta/
 ├── Cargo.toml                 # workspace
 ├── crates/
-│   ├── manta-input          # IQ sources: SoapySDR, HPSDR/Hermes, KiwiSDR client, file, audio
+│   ├── manta-input          # IQ sources: SoapySDR, HPSDR/Hermes, KiwiSDR client, ka9q-radio multicast, file, audio
 │   ├── manta-dsp            # PFB channelizer, noise-floor estimation, envelope
 │   ├── manta-decode         # CW keying state machine, timing, Morse decode
 │   ├── manta-spot           # callsign validation, CQ/DE parse, dedupe, scoring
@@ -101,7 +101,7 @@ versioned deps.
 
 ## 3. Input layer (`manta-input`)
 
-One trait, five implementations:
+One trait, six implementations:
 
 ```
 trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
@@ -116,6 +116,13 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
   no native-library dependency; the gate mirrors `soapy`. The wire facts are
   spike-pinned (`docs/DECISIONS/2026-09-02-hpsdr-hermes-protocol-spike.md`), not yet
   confirmed against live hardware.
+- **ka9q-radio (radiod) channel** (RTP over UDP multicast, no feature gate):
+  joins the multicast data group of one existing radiod IQ channel and reads
+  its sample rate, encoding, frequency and filter edges from the per-channel
+  status packets radiod sends to that group, so the operator sets none of
+  them. Pure std plus `socket2`, in every build. The wire facts are pinned
+  against ka9q-radio's documentation and headers, not yet a live radiod
+  ([docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md](docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md)).
 - **KiwiSDR client**: the kiwisdr websocket IQ protocol (12 kHz IQ per channel) —
   narrow, but gives instant worldwide receiver access for development and lets
   low-budget nodes contribute spots.

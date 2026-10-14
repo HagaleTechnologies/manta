@@ -137,6 +137,8 @@ pub fn series_signals(condition: Condition, wpm: f32, trial: u32, seed: u64) -> 
         .iter()
         .enumerate()
         .map(|(j, call)| SignalSpec {
+            dit_units: 1.0,
+            element_gap_units: 1.0,
             text: payload(call),
             loop_text: true,
             wpm,
