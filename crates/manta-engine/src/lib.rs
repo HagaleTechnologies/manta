@@ -137,6 +137,10 @@ pub struct PipelineConfig {
     pub cty: Option<Arc<manta_spot::cty::Table>>,
     /// Operator-supplied MASTER.SCP, parsed once. None uses the bundled set.
     pub scp: Option<Arc<manta_spot::scp::Set>>,
+    /// Operator-supplied callsign-pattern table. None uses the bundled list.
+    pub patterns: Option<Arc<manta_spot::pattern::Table>>,
+    /// Repetition thresholds by callsign-pattern rarity.
+    pub validation_level: manta_spot::ValidationLevel,
 }
 
 impl PipelineConfig {
@@ -152,6 +156,12 @@ impl PipelineConfig {
             .clone()
             .unwrap_or_else(|| Arc::new(manta_spot::scp::Set::bundled()))
     }
+    /// The resolved callsign-pattern table.
+    pub fn pattern_table(&self) -> Arc<manta_spot::pattern::Table> {
+        self.patterns
+            .clone()
+            .unwrap_or_else(|| Arc::new(manta_spot::pattern::Table::bundled()))
+    }
     /// Builds the validator used by every production decode path.
     pub fn validator(&self, fs: f64) -> Result<manta_spot::Validator> {
         // Keep the checked ppm constructor so callers cannot supply an
@@ -161,7 +171,9 @@ impl PipelineConfig {
                 .with_freq_correction_ppm(self.freq_correction_ppm)
                 .map_err(|e| anyhow::anyhow!(e))?
                 .with_blocklist(self.blocklist.clone())
-                .with_notch(self.notch.clone());
+                .with_notch(self.notch.clone())
+                .with_patterns(self.pattern_table())
+                .with_validation_level(self.validation_level);
         for call in &self.allowlist {
             validator.allowlist(call);
         }
@@ -180,6 +192,8 @@ impl Default for PipelineConfig {
             notch: NotchList::default(),
             cty: None,
             scp: None,
+            patterns: None,
+            validation_level: manta_spot::ValidationLevel::default(),
         }
     }
 }
@@ -445,6 +459,9 @@ mod tests {
         assert!(!calls(&PipelineConfig::default()).contains(&"QQ9ZZZ".to_string()));
         let cfg = PipelineConfig {
             cty: Some(cty_with_qq9()),
+            patterns: Some(Arc::new(
+                manta_spot::pattern::Table::parse("+QQ9@@@\n").unwrap(),
+            )),
             ..Default::default()
         };
         assert!(

@@ -24,6 +24,10 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-95: default spot validation requires 2, 3 or 5 distinct-message
+  repetitions by callsign-pattern rarity. `[spot].validation_level = "minimal"`
+  restores flat 2; `--patterns` overrides the independent reference list.
+
 - A band-wide static crash (lightning) no longer starts tracks across the
   band, and running tracks no longer decode it as extra dits; new
   `[detector].crash_filter`, default `"full"` (MAN-312).

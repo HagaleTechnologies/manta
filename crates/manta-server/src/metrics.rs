@@ -2009,7 +2009,7 @@ impl Metrics {
             push_histogram_samples(&mut out, "manta_track_rail_ratio", &q.rail_ratio);
         }
         out.push_str(
-            "# HELP manta_candidate_repetitions Message-distinct decodes of the same call near the same frequency within the trailing 90 s, for each callsign candidate the repetition gate scored. A candidate needs 2 to spot.\n",
+            "# HELP manta_candidate_repetitions Message-distinct decodes of the same call near the same frequency within the trailing 90 s, for each callsign candidate the repetition gate scored. A candidate needs 2, 3 or 5 to spot by its callsign-pattern tier (2 for every call at validation_level minimal).\n",
         );
         out.push_str("# TYPE manta_candidate_repetitions histogram\n");
         if let Some(q) = &quality {
@@ -2866,6 +2866,12 @@ mod tests {
                 sum: 899.0,
             },
         }
+    }
+
+    #[test]
+    fn repetition_help_describes_pattern_tiers_and_minimal_level() {
+        let text = Metrics::new().render_prometheus_text();
+        assert!(text.contains("A candidate needs 2, 3 or 5 to spot by its callsign-pattern tier (2 for every call at validation_level minimal)."));
     }
 
     #[test]
