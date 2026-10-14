@@ -332,8 +332,10 @@ is invalid.
   `manta run --config /etc/manta/manta.toml`. With
   `create_host_path: false`, a missing `./manta.toml` stops the container
   from starting instead of Docker creating an empty directory in its
-  place. Only that file is mounted: a blocklist, notch list or WAV file
-  the config names needs a mount of its own, at the path the config gives.
+  place. Besides it, only the `manta-lists` cache volume is mounted (see
+  [Keeping cty.dat and MASTER.SCP current](#keeping-ctydat-and-masterscp-current)):
+  a blocklist, notch list or WAV file the config names needs a mount of
+  its own, at the path the config gives.
 - **SELinux.** `selinux: Z` matters only on a host that enforces SELinux,
   such as Fedora or RHEL. There Docker relabels `./manta.toml` on the host
   with a private label for this container, so this container can read it
@@ -422,6 +424,63 @@ foreground, use `.\manta.exe config check --config manta.toml` and then
 `.\manta.exe run --config manta.toml` in a PowerShell window; Ctrl+C stops
 it.
 
+## Keeping cty.dat and MASTER.SCP current
+
+manta ships `cty.dat` (country prefixes: a call whose prefix it lacks is
+not spotted) and `MASTER.SCP` (known calls: a listed call is spotted with
+more confidence) built in, so a new prefix is rejected until the next
+release. To have `manta run` download current copies while it reads a live
+receiver, set this in `manta.toml`:
+
+```toml
+[spot]
+refresh_lists = true
+```
+
+and restart the service. `cty.dat` is then checked every 7 days and
+`MASTER.SCP` every day. A download replaces the list in use, without a
+restart, only after it parses and looks complete. A failed or rejected one
+is logged as a `warning: list refresh:` line, counted in
+`manta_list_refresh_total{outcome="failed"}` and retried an hour later; the
+copy already in use stays. Without network access manta runs on the
+built-in copies. File replay never downloads. Refresh is off by default.
+
+- **Firewall.** Downloads are plain HTTP: allow outbound TCP port 80 to
+  `www.country-files.com` and `www.supercheckpartial.com`. To keep the
+  node off the internet, or to share one download between nodes, serve
+  the two files from a local web server and set `cty_url` and `scp_url`
+  in `[spot]` to its `http://` URLs. manta has no TLS support and refuses
+  `https://`.
+- **Where downloads are kept.** Each accepted version is stored under
+  `[spot].list_cache_dir`, so a restart starts from the last good
+  download. The systemd unit sets it with
+  `Environment=MANTA_SPOT_LIST_CACHE_DIR=/var/cache/manta` and creates the
+  directory with `CacheDirectory=manta`; because of `DynamicUser=yes` its
+  files live in `/var/cache/private/manta`. Compose mounts the
+  `manta-lists` named volume at `/var/cache/manta` and sets the same
+  variable. LaunchDaemon users set `list_cache_dir` in their config; with
+  it unset, downloads are kept in memory only.
+- **Watching it.** At start, `run` logs a `lists:` line naming the SHA-256
+  of each list in use and where it came from, and `/metrics` carries
+  `manta_list_info`, `manta_list_refresh_total` and
+  `manta_list_last_success_timestamp_seconds` (`docs/METRICS.md` in the
+  source repository). Alert when
+  `time() - manta_list_last_success_timestamp_seconds{list="cty"}` passes
+  8 days.
+- **Replaying a recording with the list the daemon used.** Copy the hash
+  from the `lists:` line and pass it to `decode`, `run`, `soak` or
+  `doctor` as `--cty-sha256` or `--scp-sha256`, with a config whose
+  `list_cache_dir` holds that version (or `--cty`/`--scp` naming the
+  file). manta stops before reading the recording if no copy has that
+  hash.
+- **Choosing a list yourself.** A list that `cty_path`/`scp_path` or
+  `cty_sha256`/`scp_sha256` sets is never downloaded.
+
+Every `[spot]` key is described in `manta.example.toml` and in
+[SPEC-decode-core.md](../docs/SPEC-decode-core.md) §9; the design is in
+`docs/DECISIONS/2026-10-12-man316-reference-list-refresh.md` in the source
+repository.
+
 ## Network exposure
 
 By default telnet (7300) and JSON (7301) accept connections on every
@@ -487,8 +546,9 @@ sudo rm /etc/systemd/system/manta.service
 sudo systemctl daemon-reload
 ```
 
-This leaves `/etc/manta/manta.toml` and `/usr/local/bin/manta`. The unit's
-temporary user goes away with the service.
+This leaves `/etc/manta/manta.toml`, `/usr/local/bin/manta` and any
+downloaded lists in `/var/cache/private/manta`. The unit's temporary user
+goes away with the service.
 
 macOS:
 
@@ -504,4 +564,5 @@ This leaves `/usr/local/bin/manta`, `/usr/local/libexec/manta-rotate-log.sh`,
 remove the account.
 
 Docker Compose: `docker compose down` removes the container and leaves
-`manta.toml` and the image.
+`manta.toml`, the image and the `manta-lists` volume; `docker compose down
+--volumes` removes the volume too.

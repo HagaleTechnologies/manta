@@ -12,7 +12,7 @@ use crate::metrics::Metrics;
 use crate::rate_limit::IpRateLimiter;
 use crate::spot_message::SpotMessage;
 use crate::tasks::{ClientTasks, ConnectionLimiter, IpQuota};
-use manta_spot::cty::Table;
+use manta_spot::reference::ReferenceLists;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -127,7 +127,7 @@ impl From<anyhow::Error> for WsClientError {
 struct ClientCtx {
     bus: Arc<SpotBus>,
     metrics: Arc<Metrics>,
-    cty: Arc<Table>,
+    lists: Arc<ReferenceLists>,
     station_call: String,
     station_location: Option<crate::config::StationLocation>,
     decoder_version: String,
@@ -200,11 +200,14 @@ impl ClientCtx {
             JsonItem::Grade(line) | JsonItem::Live(line) => return line.to_string(),
         };
         let unix_ts = self.bus.unix_ts_for(bus_spot.spot.sample_ts);
+        // MAN-316: one snapshot per spot, so a refresh that swaps the table
+        // mid-render can never mix two tables' geography in one message.
+        let cty = self.lists.cty.load();
         let msg = SpotMessage::from_spot(
             &bus_spot.spot,
             &self.station_call,
             self.station_location.as_ref(),
-            &self.cty,
+            &cty,
             &self.decoder_version,
             unix_ts,
             self.bus.session_nonce(),
@@ -221,7 +224,10 @@ impl ClientCtx {
 pub struct JsonStreamConfig {
     pub bus: Arc<SpotBus>,
     pub metrics: Arc<Metrics>,
-    pub cty: Arc<Table>,
+    /// MAN-316: the run's reference lists; each client renders every spot
+    /// against the `cty.dat` in use at that moment, so a scheduled refresh
+    /// reaches connected clients without a reconnect.
+    pub lists: Arc<ReferenceLists>,
     pub station_call: String,
     /// This station's `deGrid`/`deLat`/`deLon` (MAN-138), resolved once at
     /// start-up by `ServerConfig::station_location`; `None` sends null
@@ -278,7 +284,7 @@ pub async fn serve(
     let ctx = ClientCtx {
         bus: config.bus,
         metrics: config.metrics,
-        cty: config.cty,
+        lists: config.lists,
         station_call: config.station_call,
         station_location: config.station_location,
         decoder_version: config.decoder_version,
@@ -1068,5 +1074,64 @@ mod tests {
         assert!(!is_ws_protocol_violation(&WsError::Protocol(
             ProtocolError::ResetWithoutClosingHandshake
         )));
+    }
+
+    /// MAN-316: a `cty.dat` refresh reaches a client that is already
+    /// connected. The same `ClientCtx` renders an unallocated `QQ9ZZZ` with
+    /// the unknown-geography sentinels, then, once the refresher stores a
+    /// table that allocates QQ9, with that entity's continent and CQ zone.
+    #[test]
+    fn render_uses_the_current_cty_table() {
+        use crate::spot_message::{UNKNOWN_CONTINENT, UNKNOWN_CQ_ZONE, UNKNOWN_DXCC};
+        use manta_spot::{cty, scp, Spot, SpotType};
+
+        const QQ9: &str = "Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n";
+        let lists = Arc::new(ReferenceLists::new(
+            Arc::new(cty::Table::bundled()),
+            Arc::new(scp::Set::bundled()),
+        ));
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let ctx = ClientCtx {
+            bus: Arc::new(SpotBus::new(48_000.0, std::time::SystemTime::UNIX_EPOCH, 1)),
+            metrics: Arc::new(Metrics::new()),
+            lists: lists.clone(),
+            station_call: "W3XYZ".to_string(),
+            station_location: None,
+            decoder_version: "manta-test".to_string(),
+            shutdown,
+            drain_deadline: Duration::from_secs(1),
+            stream: StreamKind::Spots,
+        };
+        let spot = JsonItem::Spot(crate::bus::BusSpot {
+            spot: Spot {
+                callsign: "QQ9ZZZ".to_string(),
+                freq_hz: 14_025_000.0,
+                snr_db: 20.0,
+                wpm: 25.0,
+                spot_type: SpotType::Cq,
+                confidence: 0.9,
+                track_id: 1,
+                sample_ts: 0,
+            },
+            occurrence_count: 1,
+        });
+        let render = |ctx: &ClientCtx| -> serde_json::Value {
+            serde_json::from_str(&ctx.render(&spot)).expect("render emits JSON")
+        };
+
+        let before = render(&ctx);
+        assert_eq!(before["dxDxcc"], UNKNOWN_DXCC);
+        assert_eq!(before["dxContinent"], UNKNOWN_CONTINENT);
+        assert_eq!(before["dxCqZone"], UNKNOWN_CQ_ZONE);
+        assert!(before["dxLat"].is_null(), "{before}");
+
+        lists.cty.store(Arc::new(cty::Table::parse(&format!(
+            "{}{QQ9}",
+            manta_spot::CTY_DAT
+        ))));
+        let after = render(&ctx);
+        assert_eq!(after["dxContinent"], "EU", "{after}");
+        assert_eq!(after["dxCqZone"], 14, "{after}");
+        assert!(!after["dxLat"].is_null(), "{after}");
     }
 }

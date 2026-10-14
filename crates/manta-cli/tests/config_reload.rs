@@ -21,7 +21,7 @@
 
 mod common;
 
-use common::{expect_line, fixture_wav, line_channel, wait_bounded};
+use common::{expect_line, fake_kiwi, fixture_wav, line_channel, wait_bounded, KillOnDrop};
 use std::io::Write as _;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -309,58 +309,6 @@ fn an_invalid_reload_is_logged_and_the_previous_lists_stay() {
     expect_line(&daemon.telnet_lines, &["DX de", "W1AW"], LINE_TIMEOUT);
 
     daemon.stop();
-}
-
-/// Kills and reaps the daemon on drop, so a failed assertion never leaves it
-/// reconnecting to a fake KiwiSDR that has gone away.
-struct KillOnDrop(Child);
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Plays a KiwiSDR just far enough for `KiwiIqSource::connect`
-/// (crates/manta-input/src/kiwi.rs) to return, then sends only pings, every
-/// 200 ms, until `done` or the client hangs up. No SND frame ever arrives, so
-/// the daemon's decode thread waits in the socket `recv`, and each ping
-/// resets the source's stall bound.
-fn fake_kiwi(listener: TcpListener, done: Arc<AtomicBool>) -> Result<(), String> {
-    use tungstenite::Message;
-
-    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-    let deadline = Instant::now() + LINE_TIMEOUT;
-    let stream = loop {
-        match listener.accept() {
-            Ok((stream, _)) => break stream,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if done.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                    return Err("manta never connected to the fake KiwiSDR".into());
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(e) => return Err(format!("accept: {e}")),
-        }
-    };
-    // BSD/macOS sockets inherit the listener's non-blocking mode.
-    stream.set_nonblocking(false).map_err(|e| e.to_string())?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|e| e.to_string())?;
-    let mut ws = tungstenite::accept(stream).map_err(|e| format!("WebSocket handshake: {e}"))?;
-    ws.read().map_err(|e| format!("reading SET auth: {e}"))?;
-    // 12000 Hz / 93.75 Hz per channel = 128 channels: a valid rate.
-    ws.send(Message::binary(b"MSG sample_rate=12000.000".to_vec()))
-        .map_err(|e| format!("sending sample_rate: {e}"))?;
-    while !done.load(Ordering::Relaxed) {
-        if ws.send(Message::Ping(Default::default())).is_err() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    Ok(())
 }
 
 /// Validate attempt 1's review finding: a reload must not cost a socket

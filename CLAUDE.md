@@ -181,6 +181,14 @@ is not used; disabling it remains an owner step. The wiki pages'
 `docs_consistency` test. See
 `docs/DECISIONS/2026-10-13-man152-one-wiki.md`.
 
+MAN-316: `[spot].refresh_lists` (default off) makes `run` from a live
+receiver download `cty.dat` every 7 days and `MASTER.SCP` daily over plain
+HTTP, swap a download that passes the acceptance checks into the
+validator, spot geography and JSON stream without a restart, and keep it
+under `[spot].list_cache_dir`; a failure keeps the list in use. File replay
+never downloads; `--cty-sha256`/`--scp-sha256` pin a version by hash. See
+docs/DECISIONS/2026-10-12-man316-reference-list-refresh.md.
+
 MAN-140: `--ka9q-group` (with `--ka9q-port`/`--ka9q-ssrc`/
 `--ka9q-interface`) or `[input] type = "ka9q"` reads one existing
 ka9q-radio (radiod) IQ channel over RTP multicast, in every build (no

@@ -613,6 +613,15 @@ impl Validator {
         self.notch = notch;
     }
 
+    /// MAN-316: replaces the country table and known-call set, for a
+    /// scheduled list refresh. Like `replace_operator_lists`, tracks, dedupe,
+    /// the repetition gate, the ledger and `suppression_counts` are
+    /// untouched; the new tables apply from the next decoder event.
+    pub fn replace_reference_tables(&mut self, cty: Arc<cty::Table>, scp: Option<Arc<scp::Set>>) {
+        self.cty = cty;
+        self.scp = scp;
+    }
+
     /// Per-reason counts of operator-suppressed spots so far (MAN-31,
     /// ARCHITECTURE §8).
     pub fn suppression_counts(&self) -> SuppressionCounts {
@@ -2412,6 +2421,62 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         });
         assert!(spots.is_empty(), "got {spots:?}");
         assert_eq!(v.suppression_counts().notch, 1);
+    }
+
+    /// MAN-316: QQ9ZZZ is unallocated in the bundled table, so the first
+    /// track's two messages never spot it; after a refresh adds QQ9, a
+    /// second track's do.
+    #[test]
+    fn replaced_cty_table_lets_a_new_prefix_spot() {
+        let scp = Arc::new(scp::Set::bundled());
+        // MAN-95: a common pattern, so two messages are enough to spot.
+        let mut v = Validator::from_tables(FS, Arc::new(cty::Table::bundled()), Some(scp.clone()))
+            .with_patterns(Arc::new(pattern::Table::parse("+QQ9@@@\n").unwrap()));
+        seed_meta(&mut v, 1);
+        seed_meta(&mut v, 2);
+        let words = ["CQ", "DE", "QQ9ZZZ", "QQ9ZZZ", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+        assert!(spots.is_empty(), "got {spots:?}");
+        let with_qq9 = cty::Table::parse(&format!("{}{QQ9_ENTITY}", crate::CTY_DAT));
+        v.replace_reference_tables(Arc::new(with_qq9), Some(scp));
+        let mut spots = run(&transmission_events(2, &words, 200_000), &mut v);
+        spots.extend(run(&transmission_events(2, &words, 300_000), &mut v));
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].callsign, "QQ9ZZZ");
+        assert_eq!(spots[0].track_id, 2);
+    }
+
+    #[test]
+    fn replaced_reference_tables_leave_operator_lists_and_counts_alone() {
+        let mut v =
+            Validator::new(FS, CTY_FIXTURE, None).with_blocklist(Blocklist::parse("K5ARH\n"));
+        v.allowlist("W1AW");
+        seed_meta(&mut v, 1);
+        seed_meta(&mut v, 2);
+        let words = ["DE", "K5ARH", "K"];
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(spots.is_empty(), "got {spots:?}");
+        let before = v.suppression_counts();
+        assert_eq!(before.blocklist, 1);
+        v.replace_reference_tables(
+            Arc::new(cty::Table::parse(&format!("{CTY_FIXTURE}{QQ9_ENTITY}"))),
+            Some(Arc::new(scp::Set::parse("K5ARH\n"))),
+        );
+        assert_eq!(v.suppression_counts(), before);
+        let spots = run(&transmission_events(1, &words, 100_000), &mut v);
+        assert!(
+            spots.is_empty(),
+            "the blocklist must still hold, got {spots:?}"
+        );
+        assert_eq!(v.suppression_counts().blocklist, before.blocklist + 1);
+        let spots = run(&transmission_events(2, &["W1AW"], 200_000), &mut v);
+        assert_eq!(
+            spots.len(),
+            1,
+            "the allowlist must still hold, got {spots:?}"
+        );
+        assert_eq!(spots[0].callsign, "W1AW");
     }
 
     #[test]
