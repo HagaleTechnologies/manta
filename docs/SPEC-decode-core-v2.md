@@ -50,6 +50,15 @@ sliding-window maximum (monotonic deque, O(1) amortized). Because the
 window is centered, the evidence stream is produced with a fixed delay of
 `h` hops behind the input; all timestamps refer to the input hop.
 
+Implementation note (MAN-193): the O(1) amortized bound holds while both
+window bounds move forward, which includes a fixed `h` and any `h` change
+of one hop between consecutive centers. A `u_ref` change that moves a
+bound backwards (growing or shrinking `h` by more than one hop between
+consecutive centers) rebuilds the deque from the retained samples of the
+new window, at O(2h + 1) for that hop. The §1.7 lookahead reads the next
+center's `M` from the same deque without advancing it. See
+`docs/DECISIONS/2026-10-14-man193-centered-maximum-deque.md`.
+
 Rationale (design §1.3, §5.1): a *symmetric* window tracks QSB in both
 directions with no rise/decay asymmetry to tune, and a maximum (not a
 mean) cannot be dragged by a long dah or a run of dits.

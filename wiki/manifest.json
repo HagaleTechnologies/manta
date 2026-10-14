@@ -1,6 +1,6 @@
 {
   "generated_at": "2026-10-14T11:53:58Z",
-  "head_commit": "525edb7",
+  "head_commit": "60c4339",
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -26,7 +26,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:cbabbc30c825788658a32ddc4712a35905df5bc744c4ab064b952fc9de5a2eb4",
+      "hash": "sha256:bbf8c98aa0726da4c8005e95e854722e4167dc453ff3e207349abf960d4712c2",
       "id": "decode-chain",
       "kind": "subsystem",
       "links": [
@@ -42,7 +42,7 @@
       ],
       "status": "current",
       "title": "How does the per-track CW decode chain work?",
-      "verified_commit": "525edb7",
+      "verified_commit": "60c4339",
       "verified_date": "2026-10-14",
       "visibility": "public"
     },
@@ -291,7 +291,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:f2fd55c129e057e1c7f614ffd0d5c07b4b1c63e5c799ab2a3c65a38629a7c16d",
+      "hash": "sha256:9a55eface9ef3ab23316ec6056dd89bda124fc2757e00b7a4cd3a0654122ec8d",
       "id": "spot-validation",
       "kind": "subsystem",
       "links": [
@@ -305,11 +305,13 @@
       "sources": [
         "ARCHITECTURE.md",
         "docs/SPEC-decode-core.md#46-per-callsign-confidence-consumed-by-manta-spot",
-        "docs/SPEC-decode-core.md#9-configuration-keys"
+        "docs/SPEC-decode-core.md#9-configuration-keys",
+        "docs/DECISIONS/2026-09-09-beacon-emission-deferred-to-track-close.md",
+        "docs/DECISIONS/2026-10-14-man174-deferred-beacon-merge-bookkeeping.md"
       ],
       "status": "current",
       "title": "How does manta decide a decoded call is trustworthy enough to spot?",
-      "verified_commit": "525edb7",
+      "verified_commit": "60c4339",
       "verified_date": "2026-10-14",
       "visibility": "public"
     },

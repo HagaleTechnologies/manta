@@ -1,4 +1,5 @@
 //! Partial-traceback commit and posterior margins. SPEC v2 §4.8–4.9.
+use super::segments::SegType;
 use super::token::{glyph_rank, token_order, Token};
 use super::{Committed, HsmmConfig};
 use crate::tree::Glyph;
@@ -131,13 +132,35 @@ pub fn margin(tokens: &[Token], j: usize, cfg: &HsmmConfig) -> (f32, Vec<(Glyph,
 /// once it becomes the front after some earlier removal in this same
 /// call). Re-checking every iteration catches that without needing a
 /// second, separately-maintained check.
+/// Internal commit result for `HsmmDecoder::push` (MAN-192): the public
+/// entries plus whether this call actually emitted a winning word-boundary
+/// head whose closing segment was `Silence` -- SPEC v2 §4.7's second
+/// reseeding trigger. Glyph consensus alone cannot establish a committed
+/// long gap (CGap, WGap and Silence interpretations can agree on the
+/// glyph), so only the boundary entry's own provenance, read from the
+/// head selected after the sort and duplicate stripping, sets the flag.
+pub(super) struct CommitOutcome {
+    pub entries: Vec<Committed>,
+    pub committed_silence: bool,
+}
+
 pub fn commit(
     tokens: &mut Vec<Token>,
     now_hop: u64,
     cfg: &HsmmConfig,
     sealed: &mut Vec<(u64, bool)>,
 ) -> Vec<Committed> {
+    commit_outcome(tokens, now_hop, cfg, sealed).entries
+}
+
+pub(super) fn commit_outcome(
+    tokens: &mut Vec<Token>,
+    now_hop: u64,
+    cfg: &HsmmConfig,
+    sealed: &mut Vec<(u64, bool)>,
+) -> CommitOutcome {
     let mut out = Vec::new();
+    let mut committed_silence = false;
     loop {
         for t in tokens.iter_mut() {
             while t
@@ -178,6 +201,9 @@ pub fn commit(
             break;
         }
         let (confidence, alternatives) = margin(tokens, 0, cfg);
+        if head.glyph.is_none() && head.closing_segment == Some(SegType::Silence) {
+            committed_silence = true;
+        }
         out.push(Committed {
             glyph: head.glyph,
             sample_ts: head.sample_ts,
@@ -190,13 +216,45 @@ pub fn commit(
         }
         sealed.push((head.sample_ts, head.glyph.is_some()));
     }
-    out
+    CommitOutcome {
+        entries: out,
+        committed_silence,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::token::Phase;
+    use super::super::segments::SegType;
+    use super::super::token::{HistEntry, Phase};
     use super::*;
+
+    /// MAN-192: compact fixture builder -- a synthetic history entry with
+    /// explicit closing-segment provenance (`None` = no closing segment,
+    /// the honest value for a hand-built fixture).
+    fn entry(
+        glyph: Option<Glyph>,
+        sample_ts: u64,
+        born_hop: u64,
+        seg: Option<SegType>,
+    ) -> HistEntry {
+        HistEntry {
+            glyph,
+            sample_ts,
+            born_hop,
+            closing_segment: seg,
+        }
+    }
+
+    fn token(hist: Vec<HistEntry>, score: f32) -> Token {
+        Token {
+            node: 0,
+            phase: Phase::AfterSpace,
+            u: 13.0,
+            score,
+            hist,
+            anchor_hop: 2,
+        }
+    }
 
     #[test]
     fn commit_resorts_after_stripping_sealed_prefixes_of_differing_length() {
@@ -215,16 +273,8 @@ mod tests {
             u: 13.0,
             score: 5.0,
             hist: vec![
-                super::super::token::HistEntry {
-                    glyph: Some(Glyph::Char('A')),
-                    sample_ts: 100,
-                    born_hop: 1,
-                },
-                super::super::token::HistEntry {
-                    glyph: Some(Glyph::Char('Z')),
-                    sample_ts: 200,
-                    born_hop: 2,
-                },
+                entry(Some(Glyph::Char('A')), 100, 1, None),
+                entry(Some(Glyph::Char('Z')), 200, 2, None),
             ],
             anchor_hop: 2,
         };
@@ -234,16 +284,8 @@ mod tests {
             u: 13.0,
             score: 5.0, // tied with token1
             hist: vec![
-                super::super::token::HistEntry {
-                    glyph: Some(Glyph::Char('B')),
-                    sample_ts: 100,
-                    born_hop: 1,
-                },
-                super::super::token::HistEntry {
-                    glyph: Some(Glyph::Char('A')),
-                    sample_ts: 250,
-                    born_hop: 2,
-                },
+                entry(Some(Glyph::Char('B')), 100, 1, None),
+                entry(Some(Glyph::Char('A')), 250, 2, None),
             ],
             anchor_hop: 2,
         };
@@ -259,5 +301,210 @@ mod tests {
             Some((Some(Glyph::Char('A')), 250)),
             "after stripping, token2's [A] must sort ahead of token1's [Z] -- got {out:?}"
         );
+    }
+
+    /// MAN-192: `commit_outcome` sets `committed_silence` only when it
+    /// actually emits a winning word-boundary head whose own provenance is
+    /// `Silence`. A WGap boundary, a CGap glyph (no boundary at all), and
+    /// a boundary with unknown (`None`) provenance must not set it.
+    #[test]
+    fn man192_commit_outcome_flags_only_a_silence_boundary_head() {
+        let cfg = HsmmConfig::default();
+        let cases: [(Option<SegType>, Option<SegType>, bool); 3] = [
+            // (glyph-entry provenance, boundary-entry provenance, signal)
+            (Some(SegType::Silence), Some(SegType::Silence), true),
+            (Some(SegType::WGap), Some(SegType::WGap), false),
+            (Some(SegType::CGap), None, false), // CGap: glyph only, no boundary
+        ];
+        for (i, (glyph_seg, boundary_seg, expect)) in cases.iter().enumerate() {
+            let mut hist = vec![entry(Some(Glyph::Char('T')), 512, 100, *glyph_seg)];
+            if let Some(bs) = boundary_seg {
+                hist.push(entry(None, 512, 100, Some(*bs)));
+            }
+            let hist_len = hist.len();
+            let mut tokens = vec![token(hist, 10.0)];
+            let mut sealed = Vec::new();
+            let out = commit_outcome(&mut tokens, 100, &cfg, &mut sealed);
+            assert_eq!(
+                out.entries.len(),
+                hist_len,
+                "case {i}: consensus of one token must emit every entry"
+            );
+            assert_eq!(
+                out.committed_silence, *expect,
+                "case {i}: signal must follow the boundary head's provenance"
+            );
+        }
+        // Unknown (`None`) boundary provenance -- a synthetic entry no real
+        // gap transition produced -- must not trigger reseeding either.
+        let mut tokens = vec![token(
+            vec![
+                entry(Some(Glyph::Char('T')), 512, 100, Some(SegType::CGap)),
+                entry(None, 512, 100, None),
+            ],
+            10.0,
+        )];
+        let mut sealed = Vec::new();
+        let out = commit_outcome(&mut tokens, 100, &cfg, &mut sealed);
+        assert_eq!(out.entries.len(), 2);
+        assert!(
+            !out.committed_silence,
+            "a None-provenance boundary must not flag"
+        );
+    }
+
+    /// MAN-192: the signal reads the WINNING head's provenance (the token
+    /// that sorts first), not any agreeing or losing candidate. Two tokens
+    /// carrying the same glyphs closed by different segment types agree on
+    /// everything the consensus check sees, so only the sort order -- and
+    /// with disagreeing tokens, the forced path -- decides.
+    #[test]
+    fn man192_winning_head_provenance_decides_the_signal() {
+        let cfg = HsmmConfig::default();
+        let hist = |seg: SegType| {
+            vec![
+                entry(Some(Glyph::Char('T')), 512, 100, Some(seg)),
+                entry(None, 512, 100, Some(seg)),
+            ]
+        };
+        // Consensus path: both tokens agree on the glyphs; the higher
+        // score sorts first and its provenance wins. A losing Silence
+        // hypothesis must NOT cause the signal.
+        let mut tokens = vec![
+            token(hist(SegType::WGap), 10.0),
+            token(hist(SegType::Silence), 9.0),
+        ];
+        let mut sealed = Vec::new();
+        let out = commit_outcome(&mut tokens, 100, &cfg, &mut sealed);
+        assert_eq!(
+            out.entries.len(),
+            2,
+            "consensus commits glyph then boundary"
+        );
+        assert!(!out.committed_silence, "the winning head closed via WGap");
+
+        let mut tokens = vec![
+            token(hist(SegType::WGap), 9.0),
+            token(hist(SegType::Silence), 10.0),
+        ];
+        let mut sealed = Vec::new();
+        let out = commit_outcome(&mut tokens, 100, &cfg, &mut sealed);
+        assert!(
+            out.committed_silence,
+            "the winning head closed via Silence -- even though the loser closed via WGap"
+        );
+
+        // Forced path: tokens disagree on the glyph; only the far-past
+        // born_hop forces emission, and the winner's provenance still
+        // decides.
+        let disagree: Vec<HistEntry> =
+            vec![entry(Some(Glyph::Char('E')), 300, 1, Some(SegType::WGap))];
+        let mut tokens = vec![token(hist(SegType::Silence), 10.0), token(disagree, 9.5)];
+        let mut sealed = Vec::new();
+        let out = commit_outcome(&mut tokens, 100_000, &cfg, &mut sealed);
+        assert_eq!(
+            out.entries.len(),
+            2,
+            "forced commit emits the winner's entries"
+        );
+        assert!(out.committed_silence, "forced winner closed via Silence");
+    }
+
+    /// MAN-192: a glyph and its boundary can commit in separate calls --
+    /// only the call that actually emits the Silence boundary reports it.
+    #[test]
+    fn man192_split_commit_reports_silence_only_on_the_boundary_call() {
+        let cfg = HsmmConfig::default();
+        // Best token: T closed by Silence (glyph + boundary). Runner-up:
+        // T closed by CGap (glyph only) -- it agrees on the glyph but has
+        // no boundary entry, so the boundary cannot reach consensus.
+        let silence_hist = vec![
+            entry(Some(Glyph::Char('T')), 512, 100, Some(SegType::Silence)),
+            entry(None, 512, 100, Some(SegType::Silence)),
+        ];
+        let cgap_hist = vec![entry(Some(Glyph::Char('T')), 512, 100, Some(SegType::CGap))];
+        let mut tokens = vec![token(silence_hist, 10.0), token(cgap_hist, 9.0)];
+        let mut sealed = Vec::new();
+        // First call, not forced: the glyph reaches consensus, the boundary
+        // does not (the CGap runner-up disagrees by having no entry).
+        let out = commit_outcome(&mut tokens, 100, &cfg, &mut sealed);
+        assert_eq!(
+            out.entries.iter().map(|c| c.glyph).collect::<Vec<_>>(),
+            vec![Some(Glyph::Char('T'))],
+            "only the glyph commits on the first call"
+        );
+        assert!(!out.committed_silence, "no boundary was emitted yet");
+        // Second call: the runner-up's glyph entry is now sealed (same
+        // sample_ts, is_char) and stripped; force the still-pending
+        // boundary with a far-future now_hop.
+        let out = commit_outcome(&mut tokens, 100_000, &cfg, &mut sealed);
+        assert_eq!(
+            out.entries.iter().map(|c| c.glyph).collect::<Vec<_>>(),
+            vec![None],
+            "the boundary commits on the second call"
+        );
+        assert!(
+            out.committed_silence,
+            "the boundary head closed via Silence"
+        );
+        // Third call: re-deriving the already-decided boundary yields no
+        // entries and no signal.
+        let mut stale = vec![token(
+            vec![
+                entry(Some(Glyph::Char('T')), 512, 100, Some(SegType::Silence)),
+                entry(None, 512, 100, Some(SegType::Silence)),
+            ],
+            10.0,
+        )];
+        let out = commit_outcome(&mut stale, 200_000, &cfg, &mut sealed);
+        assert!(
+            out.entries.is_empty(),
+            "an already-decided boundary re-emits nothing"
+        );
+        assert!(!out.committed_silence, "and reports no signal");
+    }
+
+    /// MAN-192 Phase 1 success criterion: the public `commit` wrapper and
+    /// the internal `commit_outcome` helper produce identical entries
+    /// (including confidence and alternatives) on cloned inputs.
+    #[test]
+    fn man192_public_wrapper_matches_internal_helper_entries() {
+        let cfg = HsmmConfig::default();
+        let make = || {
+            vec![
+                token(
+                    vec![
+                        entry(Some(Glyph::Char('T')), 512, 100, Some(SegType::Silence)),
+                        entry(None, 512, 100, Some(SegType::Silence)),
+                    ],
+                    10.0,
+                ),
+                token(
+                    vec![
+                        entry(Some(Glyph::Char('T')), 512, 100, Some(SegType::WGap)),
+                        entry(None, 512, 100, Some(SegType::WGap)),
+                    ],
+                    7.0,
+                ),
+            ]
+        };
+        let mut tokens_a = make();
+        let mut sealed_a = Vec::new();
+        let via_wrapper = commit(&mut tokens_a, 100, &cfg, &mut sealed_a);
+        let mut tokens_b = make();
+        let mut sealed_b = Vec::new();
+        let via_helper = commit_outcome(&mut tokens_b, 100, &cfg, &mut sealed_b);
+        assert_eq!(via_wrapper.len(), via_helper.entries.len());
+        for (w, h) in via_wrapper.iter().zip(via_helper.entries.iter()) {
+            assert_eq!(w.glyph, h.glyph);
+            assert_eq!(w.sample_ts, h.sample_ts);
+            assert_eq!(w.confidence.to_bits(), h.confidence.to_bits());
+            assert_eq!(w.alternatives.len(), h.alternatives.len());
+            for (wa, ha) in w.alternatives.iter().zip(h.alternatives.iter()) {
+                assert_eq!(wa.0, ha.0);
+                assert_eq!(wa.1.to_bits(), ha.1.to_bits());
+            }
+        }
+        assert_eq!(sealed_a, sealed_b, "both paths seal identically");
     }
 }

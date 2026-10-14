@@ -11,6 +11,9 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-14 | MAN-174 | [MAN-174: deferred beacons survive merge chains and every loss is counted](2026-10-14-man174-deferred-beacon-merge-bookkeeping.md) |
+| 2026-10-14 | MAN-192 | [MAN-192: the HSMM decoder reseeds after a committed Silence, not only on a gate re-onset](2026-10-14-man192-silence-reseed.md) |
+| 2026-10-14 | MAN-193 | [MAN-193: Evidence's centered maximum is a monotonic deque](2026-10-14-man193-centered-maximum-deque.md) |
 | 2026-10-14 | MAN-95 | [MAN-95: callsign-pattern rarity sets the repetition requirement](2026-10-14-man95-pattern-rarity-repetition-tiers.md) |
 | 2026-10-13 | MAN-140 | [MAN-140: a ka9q-radio (radiod) multicast IQ input](2026-10-13-man140-ka9q-radio-input.md) |
 | 2026-10-13 | MAN-152 | [MAN-152: the in-repo wiki is canonical; disabling GitHub's Wiki is pending](2026-10-13-man152-one-wiki.md) |

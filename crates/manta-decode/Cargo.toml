@@ -23,3 +23,7 @@ criterion = { workspace = true }
 [[bench]]
 name = "hsmm_300_tracks"
 harness = false
+
+[[bench]]
+name = "evidence_300_tracks"
+harness = false

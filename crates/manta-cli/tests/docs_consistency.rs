@@ -2801,3 +2801,20 @@ fn claude_md_decision_paths_start_a_word_and_resolve() {
         );
     }
 }
+
+/// SPEC §5 is the normative event schema, and `TrackClosed` carries a
+/// `closure` whose kind decides whether deferred evidence is judged,
+/// migrated or discarded (`manta_decode::events::ClosureKind`). PR #154
+/// added the field without updating §5, which kept showing
+/// `TrackClosed { track_id }` (MAN-174, finding 7).
+#[test]
+fn spec_section_5_track_closed_names_its_closure_kinds() {
+    let spec = doc("docs/SPEC-decode-core.md");
+    let s5 = section(&spec, "5. Decoder output");
+    for needle in ["closure", "SignalEnded", "Bookkeeping", "survivor_track_id"] {
+        assert!(
+            s5.contains(needle),
+            "SPEC §5's `TrackClosed` entry never names `{needle}`"
+        );
+    }
+}
