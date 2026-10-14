@@ -10,8 +10,8 @@ sources:
   - crates/manta-cli/src/reconnect.rs (InputHealthTotals)
   - crates/manta-input/src/lib.rs (IqSource::take_discontinuity)
 verified:
-  commit: e398d46
-  date: 2026-10-05
+  commit: d286147
+  date: 2026-10-13
 links:
   - determinism
 ---

@@ -5,24 +5,24 @@ kind: decision-digest
 status: current
 maintainer: agent
 sources:
-  - docs/SPEC-decode-core.md#7-golden-test-vectors-m0-m1-acceptance
+  - docs/SPEC-decode-core.md#7-golden-test-vectors-m0m1-acceptance
   - CLAUDE.md
 verified:
-  commit: e68b106
-  date: 2026-07-07
+  commit: d286147
+  date: 2026-10-13
 links:
   - watterson-dependency
   - coppa-reuse
 ---
-The V1–V10 golden vectors are the M0–M2 acceptance gates, and the fading ones (V4, V5, V8w) are generated through coppa's Watterson model — so their expected outputs are only reproducible if the exact coppa commit used to generate them is pinned in the fixture manifest. The decision: **freeze fading vectors against a named coppa commit, and do not regenerate them casually**, because the impairment model is an external dependency that has already changed under the spec once. The authoritative vector table and generation recipe are in SPEC §7 — this page is the rationale pointer.
+The V1–V10 golden vectors are the M0–M2 acceptance gates, and the fading ones (V4, V5, V8w) are generated through coppa's Watterson model — so their expected outputs are only reproducible if the exact coppa commit used to generate them is pinned — in the workspace `Cargo.toml`/`Cargo.lock` coppa rev and the M1 pins record, not in each vector's `.manifest.json`. The decision: **freeze fading vectors against a named coppa commit, and do not regenerate them casually**, because the impairment model is an external dependency that has already changed under the spec once. The authoritative vector table and generation recipe are in SPEC §7 — this page is the rationale pointer.
 
 ## Digest
 
 The freeze was *blocked* through most of design phase because coppa's Watterson had two bugs (see [[watterson-dependency]]); regenerating vectors against a buggy model would have baked wrong ground truth into CI. It was **unblocked on 2026-07-07** once the coppa fixes landed. The standing rules that fell out of this:
 
-- Fading vectors record the exact coppa commit they were generated against (fixture manifest), so a coppa change can never silently invalidate CI.
+- Fading vectors are pinned to the workspace coppa rev (`f8a4d16d`, `Cargo.toml`/`Cargo.lock`; `docs/DECISIONS/2026-07-17-m1-implementation-pins.md` pin 2), so a coppa change can never silently invalidate CI.
 - SNR is quoted in 2500 Hz for these vectors; the 2500 Hz vs benchmark-3 kHz reconciliation is still live and tracked in CLAUDE.md.
-- Watterson uses the streaming `WattersonChannel` API, not the deprecated one-shot helper (SPEC §7 note).
+- Watterson uses coppa's one-shot `watterson_preset()`: the streaming `WattersonChannel` SPEC §7 names was never shipped in coppa, and offline vector generation does not need it (`crates/manta-testkit/src/scene.rs`, `WattersonFade`).
 
 For the exact vectors, seeds, `fs`, and pass criteria (e.g. V8w: 0 bogus, 0 cross-channel ghost decodes), read SPEC §7 — never restated here.
 
