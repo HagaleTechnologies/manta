@@ -17,6 +17,8 @@ Then:
   systemd, launchd or Docker Compose.
 - [RUNBOOKS/monitoring.md](RUNBOOKS/monitoring.md): a ready Grafana dashboard
   and Prometheus alerts.
+- [GUIDES/ka9q-radio.md](GUIDES/ka9q-radio.md): feeding manta one
+  ka9q-radio (radiod) channel over multicast.
 - The [runbooks](#runbooks) below.
 - `manta <command> --help` for every flag, or `man manta` once the man
   pages are installed
@@ -38,6 +40,8 @@ Then:
   output may change.
 - [SPOT-SCHEMA.md](SPOT-SCHEMA.md): the JSON spot stream, if you are
   building a consumer.
+- [LIVE-STATE.md](LIVE-STATE.md): the live-state stream, if you are
+  building a dashboard.
 
 ## Researchers — the algorithms and how they're measured
 
@@ -64,6 +68,7 @@ Then:
 | [CONFIG.md](CONFIG.md) | What a config key does, its default, and whether it is wired to behaviour yet. |
 | [METRICS.md](METRICS.md) | What a `/metrics` family measures, its labels, and when it has samples. |
 | [SPOT-SCHEMA.md](SPOT-SCHEMA.md) | Every field of the `:7301` JSON Lines / WebSocket spot message. |
+| [LIVE-STATE.md](LIVE-STATE.md) | The opt-in live-state stream on `[server].live_port` for dashboards: band noise floor and activity, each track's text and candidates, and why each candidate was or was not spotted. |
 | [SPEC-decode-core.md §9](SPEC-decode-core.md#9-configuration-keys) | The normative decode-core defaults and the keys that are still compile-time constants. |
 
 ## Runbooks

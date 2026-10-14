@@ -430,7 +430,10 @@ Windows has no `SIGHUP`, so no reload. During shutdown the daemon logs
 servers bind `0.0.0.0`, every interface, as a public cluster node expects.
 The example above pins `127.0.0.1` on purpose. Metrics is the exception:
 it listens on `metrics_bind_addr`, `127.0.0.1` by default, because it has
-no password. Read
+no password. The optional live-state stream for dashboards is another
+exception: set `live_port` (for example `7303`) to start it, and it listens
+on `live_bind_addr`, also `127.0.0.1` by default, for the same reason
+([docs/LIVE-STATE.md](docs/LIVE-STATE.md)). Read
 [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 before you widen either.
 
@@ -526,6 +529,7 @@ JSON Lines) is unchanged.
 | KiwiSDR over the network | `listen --kiwi-host` — any receiver from the public directory at <https://kiwisdr.com/public/> | Working |
 | OpenHPSDR / Hermes (Hermes-Lite 2, Red Pitaya, QMTech) | `listen --hpsdr-host`, feature `hpsdr` — on in the install line above, no native dependency | Working; protocol verified against reference sources, not yet against hardware |
 | RTL-SDR, Airspy, SDRplay, HackRF, anything SoapySDR drives | `listen --soapy-driver`, feature `soapy` — **not** in the install line above; needs the SoapySDR system library, then `--features hpsdr,soapy` | Working, needs hardware soak |
+| ka9q-radio (radiod) multicast IQ channel: RX-888, Airspy, anything radiod drives | `listen --ka9q-group`; no build feature | Working; protocol checked against ka9q-radio's docs and headers, not yet against a live radiod |
 
 The source frequency and rate flags end in `-hz`: `--kiwi-freq-hz`,
 `--soapy-freq-hz`, `--soapy-rate-hz`, `--hpsdr-freq-hz` and
@@ -548,7 +552,9 @@ Audio selectors are names matched case-insensitively by substring, not numeric
 indexes. `devices` lists input-capable devices without opening a stream. With
 `--features soapy`, it also lists complete Soapy selector strings for
 `--soapy-driver`. HPSDR discovery is not supported; use `--hpsdr-host HOST`
-with an `hpsdr` build. KiwiSDR uses `--kiwi-host HOST`. `devices --json` reports
+with an `hpsdr` build. KiwiSDR uses `--kiwi-host HOST`. ka9q-radio uses
+`--ka9q-group GROUP`, the data group of a radiod IQ channel;
+`avahi-browse -rt _rtp._udp` lists them. `devices --json` reports
 empty, unavailable and failed enumeration separately; a backend error exits 1
 while retaining the other results.
 
@@ -566,6 +572,9 @@ The default window is three seconds of delivered samples; `--duration` accepts
 resampling and `--capture-rate-hz` decimation, center frequency, passband,
 received sample count, input power and a brief per-channel noise-floor estimate.
 KiwiSDR's stream rate is 96000 Hz after resampling, not its native receiver rate.
+With `--ka9q-group`, the rate and center frequency are the ones the radiod
+channel's status packets report, and the passband is its `low`/`high` filter
+edges ([ka9q-radio guide](docs/GUIDES/ka9q-radio.md#6-check-the-stream)).
 Power is relative dBFS, not calibrated RF power, dBm or spot SNR. The floor is
 the lower quartile in each eligible channel, summarized across the passband.
 See the [measurement definition](docs/DECISIONS/2026-10-10-man125-source-diagnostics.md).
@@ -594,10 +603,11 @@ enforced by criterion benches.
 
 ## Outputs
 
-All four ship today. `manta run --config <file>` starts the telnet
+All of these ship today. `manta run --config <file>` starts the telnet
 server, the JSON/WebSocket stream and the metrics endpoint together when
 the file has a `[server]` table; the outbound uplink starts alongside them
-only if that config also carries at least one `[[rbn_uplink]]` block.
+only if that config also carries at least one `[[rbn_uplink]]` block, and
+the live-state stream only if it sets `[server].live_port`.
 
 - **DX cluster telnet server** (`:7300`) — standard login prompt and
   RBN-format `DX de` lines, with enough command grammar (`sh/dx`,
@@ -611,6 +621,13 @@ only if that config also carries at least one `[[rbn_uplink]]` block.
 - **JSON Lines / WebSocket stream** (`:7301`) — one full-fidelity spot
   object per line; a raw TCP client and a WebSocket client share the
   port. This is the [cqdx](https://cqdx.app) ingest surface.
+- **Live-state stream** (optional, on `live_port`, for example `:7303`) —
+  for dashboards: each band's noise floor and activity every second, each
+  track's decoded text and candidate calls, and why each candidate was or
+  was not spotted. Off unless `[server].live_port` is set. It has no
+  password and carries every track's decoded text, so it listens on
+  `127.0.0.1` unless `live_bind_addr` says otherwise. Same raw TCP and
+  WebSocket rules as `:7301`; see [docs/LIVE-STATE.md](docs/LIVE-STATE.md).
 - **Live comparison with the RBN** — with `[rbn_compare]` enabled, manta
   reads RBN's public CW telnet feed and grades each spot `match`,
   `disagree`, `elsewhere`, `none` or `unknown` against what RBN's
@@ -699,7 +716,7 @@ configuration keys and output formats can change between releases before
 - **Shipped:** the full wideband pipeline — polyphase channelizer,
   noise-floor detector, track manager, decoder pool — with five input
   sources, callsign validation (cty.dat, SCP, CQ/DE parsing, dedupe), and
-  all four output surfaces above.
+  every output surface above.
 - **Not yet measured:** the RBN parity benchmark (recall vs. RBN on
   recorded contest IQ), the Raspberry Pi 4 CPU budget, and a 24-hour
   live-SDR soak. The first needs reference data; the other two need
@@ -763,7 +780,9 @@ researchers each start, and lists every runbook.
 **Running a node:** [docs/GUIDES/rbn-node.md](docs/GUIDES/rbn-node.md)
 (from install to a running node) · [docs/GUIDES/kiwisdr.md](docs/GUIDES/kiwisdr.md)
 (KiwiSDR etiquette) · [docs/GUIDES/raspberry-pi.md](docs/GUIDES/raspberry-pi.md)
-(Pi install and service) · [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
+(Pi install and service) · [docs/GUIDES/ka9q-radio.md](docs/GUIDES/ka9q-radio.md)
+(a ka9q-radio (radiod) channel over multicast) ·
+[docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 (exposing the servers safely) · the "Run it as a node" section above ·
 [docs/CONFIG.md](docs/CONFIG.md) (every config key, its default and what
 reads it) · [docs/METRICS.md](docs/METRICS.md) (every `/metrics` family,

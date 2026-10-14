@@ -130,6 +130,7 @@ fn readme_inputs_table_covers_every_shipped_input() {
         "--kiwi-host",
         "--soapy-driver",
         "--hpsdr-host",
+        "--ka9q-group",
     ] {
         assert!(
             inputs.contains(needle),
@@ -153,7 +154,7 @@ fn readme_outputs_describes_shipped_servers() {
         !outputs.contains("in progress"),
         "README Outputs still calls a shipped server \"in progress\""
     );
-    for needle in ["7300", "7301", "7302", "uplink", "--config"] {
+    for needle in ["7300", "7301", "7302", "7303", "uplink", "--config"] {
         assert!(
             outputs.contains(needle),
             "README Outputs never mentions `{needle}`"
@@ -900,6 +901,9 @@ fn spec_documents_every_input_and_spot_key() {
                 "driver",
                 "rate_hz",
                 "gain_db",
+                "group",
+                "ssrc",
+                "interface",
                 "freq_correction_ppm",
                 "center_freq_hz",
                 "capture_rate_hz",
@@ -2358,6 +2362,7 @@ fn reference_docs_relative_links_resolve() {
         CONFIG_REF,
         METRICS_REF,
         "docs/SPOT-SCHEMA.md",
+        "docs/LIVE-STATE.md",
         DOCS_INDEX,
         DECISIONS_INDEX,
     ] {

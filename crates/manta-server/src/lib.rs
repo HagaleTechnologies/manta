@@ -11,6 +11,7 @@ pub mod health;
 pub mod human;
 pub mod iac;
 pub mod json_stream;
+pub mod live_state;
 pub mod maidenhead;
 pub mod metrics;
 pub mod metrics_http;
