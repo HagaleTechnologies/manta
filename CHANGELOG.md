@@ -24,17 +24,56 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-95: default spot validation requires 2, 3 or 5 distinct-message
+  repetitions by callsign-pattern rarity. `[spot].validation_level = "minimal"`
+  restores flat 2; `--patterns` overrides the independent reference list.
+
+- A band-wide static crash (lightning) no longer starts tracks across the
+  band, and running tracks no longer decode it as extra dits; new
+  `[detector].crash_filter`, default `"full"` (MAN-312).
 - MAN-314: RTTY (two-tone FSK, 170/200/425/450/850 Hz shift) is recognised
   after 20 s and no CW track starts on it or its keying sidebands; open
   tracks on it close (`rtty` close count). `[detector] rtty_filter = false`
   restores the previous behaviour.
+- MAN-315: the `legacy` decoder learns each track's own dot, dash and gap
+  lengths. Gaps are measured against the sender's dit, and the word
+  boundary is the sender's own, so letter gaps up to about 4.5 dits no
+  longer split words. Dashes up to 6 dots long are accepted (was 4.5).
 
 ### Added
 
+- MAN-315: a `TimingUpdate` event per track (each class's mean, variance
+  and count, in dits), a top-level `timing` object in `decode --json`, and
+  `manta decode --timing` for a `timing (dits, mean ± sd): …` stderr line.
+
+- `manta completions <shell>` prints a tab-completion script for bash, zsh,
+  fish, PowerShell or elvish; `manta man-pages --out <dir>` writes `manta.1`
+  and one page per command, and every release archive carries them in
+  `man/man1` (MAN-133).
+- `manta_static_crashes_total` metric; `[detector].crash_filter`
+  (`full`/`starts-only`/`off`) (MAN-312).
 - `[detector] rtty_filter`/`rtty_dwell_ms`; `manta_rtty_signals{band}`
   gauge; `rtty` array in `decode --json` and, when RTTY was marked, an
   `rtty:` line in plain `decode`; `RTTY marked`/`RTTY cleared` log lines in
   `run` (MAN-314).
+- A live-state stream for dashboards, off unless `[server].live_port` is
+  set (`live_bind_addr` defaults to `127.0.0.1`): `bandState` (per-band
+  noise floor, occupancy and decoding tracks, every second), `trackState`
+  (each track's frequency, speed, SNR, decoded text and candidate calls),
+  `candidateDecision` (every validation decision with its reason, and the
+  spot's `id` when spotted) and `trackClosed` records, as JSON Lines or
+  WebSocket frames on their own port. `/metrics` gains
+  `manta_live_clients_connected`, `manta_live_records_total{kind}`,
+  `manta_live_records_dropped_total{reason}` and
+  `manta_listener_up{listener="live"}` when it is on. Spot output is
+  unchanged. See `docs/LIVE-STATE.md` (MAN-324).
+- A Grafana dashboard (spot rate, active tracks, source health, per-target
+  uplink status) and Prometheus alert rules (node down, node unhealthy, no
+  spots for 30 minutes, uplink target down or flapping) for a node's
+  `/metrics`, with promtool tests. See `docs/RUNBOOKS/monitoring.md`
+  (MAN-129).
+- MAN-140: `--ka9q-group` / `[input] type = "ka9q"` reads one ka9q-radio
+  (radiod) IQ channel over RTP multicast; see docs/GUIDES/ka9q-radio.md
 
 ## [0.1.0] - 2026-10-11
 

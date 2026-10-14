@@ -1584,3 +1584,202 @@ fn v45b_a_non_callsign_token_never_vetoes_a_real_call() {
         "the convention must never enter the support ledger as a rival"
     );
 }
+
+/// MAN-324: turning on the decision log never changes which spots are
+/// emitted. The v14, v15, v38, v38b, v38c and v42 event sequences run
+/// through two validators, recording off and on.
+#[test]
+fn recording_decisions_never_changes_spots() {
+    fn filler() -> Vec<String> {
+        (1..=16).map(|i| format!("QQQ{i}")).collect()
+    }
+    let v14 = |v: &mut Validator| {
+        seed_meta(v, 1);
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), v);
+        spots.extend(run(&transmission_events(1, &words, 100_000), v));
+        spots
+    };
+    let v15 = |v: &mut Validator| {
+        let meta = |snr| DecoderEvent::TrackMeta {
+            track_id: 1,
+            sample_ts: 0,
+            snr_2500_db: snr,
+            freq_hz: 14_000_000.0,
+        };
+        v.ingest(&meta(0.0));
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = Vec::new();
+        for ts in [0, 100_000, 200_000] {
+            spots.extend(run(&transmission_events(1, &words, ts), v));
+        }
+        v.ingest(&meta(6.0));
+        spots.extend(run(&transmission_events(1, &words, 300_000), v));
+        spots
+    };
+    let v38 = |v: &mut Validator| {
+        seed_meta(v, 1);
+        let mut spots = Vec::new();
+        for i in 0..2u64 {
+            spots.extend(run(
+                &transmission_events(1, &["CQ", "DE", "K5ARH", "K"], i * 300_000),
+                v,
+            ));
+        }
+        let f = filler();
+        let refs: Vec<&str> = f.iter().map(String::as_str).collect();
+        spots.extend(run(&transmission_events(1, &refs, 600_000), v));
+        for i in 0..2u64 {
+            spots.extend(run(
+                &transmission_events(1, &["CQ", "DE", "K5AR", "K"], 900_000 + i * 300_000),
+                v,
+            ));
+        }
+        spots
+    };
+    let v38b = |v: &mut Validator| {
+        seed_meta(v, 1);
+        seed_meta(v, 2);
+        let mut spots = Vec::new();
+        for i in 0..3u64 {
+            spots.extend(run(
+                &transmission_events(1, &["CQ", "DE", "K5ARH", "K"], i * 300_000),
+                v,
+            ));
+        }
+        for i in 0..2u64 {
+            spots.extend(run(
+                &transmission_events(2, &["CQ", "DE", "K5AR", "K"], i * 300_000),
+                v,
+            ));
+        }
+        spots
+    };
+    let v38c = |v: &mut Validator| {
+        seed_meta(v, 1);
+        let mut spots = run(&transmission_events(1, &["CQ", "DEN3NXI", "K"], 0), v);
+        for ts in [300_000, 600_000] {
+            spots.extend(run(
+                &transmission_events(1, &["CQ", "DE", "N3NXI", "K"], ts),
+                v,
+            ));
+        }
+        spots
+    };
+    let v42 = |v: &mut Validator| {
+        seed_meta(v, 1);
+        let mut spots = Vec::new();
+        for i in 0..2u64 {
+            spots.extend(run(
+                &transmission_events(1, &["V", "V", "V", "W6DPH", "K"], i * 300_000),
+                v,
+            ));
+        }
+        let f = filler();
+        let refs: Vec<&str> = f.iter().map(String::as_str).collect();
+        spots.extend(run(&transmission_events(1, &refs, 600_000), v));
+        spots.extend(run(
+            &transmission_events(1, &["V", "V", "V", "W6DPG", "K"], 900_000),
+            v,
+        ));
+        spots.extend(close_track(v, 1, ClosureKind::SignalEnded));
+        spots
+    };
+    const CTY_DE: &str = "\
+United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
+    K,W,N,AA,AB,AC,DE;
+";
+    type Scenario<'a> = (&'a str, &'a str, &'a dyn Fn(&mut Validator) -> Vec<Spot>);
+    let scenarios: [Scenario; 6] = [
+        ("v14", CTY_FIXTURE, &v14),
+        ("v15", CTY_FIXTURE, &v15),
+        ("v38", CTY_FIXTURE, &v38),
+        ("v38b", CTY_FIXTURE, &v38b),
+        ("v38c", CTY_DE, &v38c),
+        ("v42", CTY_FIXTURE, &v42),
+    ];
+    for (name, cty, scenario) in scenarios {
+        let mut off = Validator::new(FS, cty, None);
+        let mut on = Validator::new(FS, cty, None);
+        on.record_decisions(true);
+        let spots_off = scenario(&mut off);
+        let spots_on = scenario(&mut on);
+        assert!(!spots_off.is_empty(), "{name} must spot something");
+        assert_eq!(spots_off, spots_on, "{name}: recording changed the spots");
+        assert!(
+            !on.take_decisions().is_empty(),
+            "{name}: recording on must record decisions"
+        );
+    }
+}
+
+// MAN-95: a fixture table isolates rarity from future reference-list updates.
+fn rarity_validator() -> Validator {
+    Validator::new(FS, CTY_FIXTURE, None).with_patterns(std::sync::Arc::new(
+        manta_spot::pattern::Table::parse("+K5@@@\nK9@@@\n").unwrap(),
+    ))
+}
+
+fn assert_rarity_threshold(mut v: Validator, call: &str, required: u64) {
+    seed_meta(&mut v, 1);
+    for rep in 1..=required {
+        let spots = run(
+            &transmission_events(1, &["DE", call, "K"], (rep - 1) * 100_000),
+            &mut v,
+        );
+        if rep < required {
+            assert!(
+                spots.is_empty(),
+                "{call} spotted at {rep}, needs {required}"
+            );
+        } else {
+            assert_eq!(spots.len(), 1, "{call} must spot at {required}");
+            assert_eq!(spots[0].callsign, call);
+        }
+    }
+}
+
+#[test]
+fn v46_common_pattern_two_reps() {
+    assert_rarity_threshold(rarity_validator(), "K5ARH", 2);
+}
+
+#[test]
+fn v47_listed_pattern_three_reps() {
+    assert_rarity_threshold(rarity_validator(), "K9ABC", 3);
+}
+
+#[test]
+fn v48_unlisted_pattern_five_reps() {
+    assert_rarity_threshold(rarity_validator(), "W4KTNL", 5);
+}
+
+#[test]
+fn v49_minimal_level_is_flat_two() {
+    assert_rarity_threshold(
+        rarity_validator().with_validation_level(manta_spot::ValidationLevel::Minimal),
+        "W4KTNL",
+        2,
+    );
+}
+
+#[test]
+fn v50_exemptions_ignore_pattern_tier() {
+    let mut allowlisted = rarity_validator();
+    allowlisted.allowlist("W4KTNL");
+    seed_meta(&mut allowlisted, 1);
+    let spots = run(&transmission_events(1, &["W4KTNL"], 0), &mut allowlisted);
+    assert_eq!(spots.len(), 1);
+    assert_eq!(spots[0].callsign, "W4KTNL");
+    let mut beacon = rarity_validator();
+    seed_meta(&mut beacon, 1);
+    assert!(run(
+        &transmission_events(1, &["V", "V", "V", "W4KTNL"], 0),
+        &mut beacon
+    )
+    .is_empty());
+    let spots = close_track(&mut beacon, 1, ClosureKind::SignalEnded);
+    assert_eq!(spots.len(), 1);
+    assert_eq!(spots[0].callsign, "W4KTNL");
+    assert_eq!(spots[0].spot_type, SpotType::Beacon);
+}

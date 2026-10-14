@@ -7,10 +7,12 @@ pub mod blocklist;
 pub mod confidence;
 pub mod context;
 pub mod cty;
+pub mod decision;
 pub mod dedupe;
 pub mod gate;
 pub mod grammar;
 pub mod notch;
+pub mod pattern;
 pub mod reference;
 pub mod scp;
 pub mod support;
@@ -19,8 +21,11 @@ pub mod variant;
 
 pub use blocklist::Blocklist;
 pub use context::SpotType;
+pub use decision::{CandidateSupport, Decision, Reason, Rival, Verdict};
 pub use gate::{RepetitionCounts, REPETITION_BUCKETS};
 pub use notch::{FreqRange, NotchList};
+pub use pattern::{PatternTier, ValidationLevel};
+pub use support::Support;
 pub use validator::{
     calibration_factor_from_ppm, InvalidCalibration, Spot, SuppressionCounts, Validator,
 };
@@ -42,3 +47,6 @@ pub const MASTER_SCP: &str = include_str!("../data/master.scp");
 pub const DXCC_TSV: &str = include_str!("../data/dxcc.tsv");
 
 pub mod vintage;
+
+/// Callsign-pattern rarity list derived from `MASTER.SCP`; see `data/SOURCES.md`.
+pub const PATTERNS_LST: &str = include_str!("../data/patterns.lst");

@@ -25,6 +25,12 @@ fn default_metrics_bind_addr() -> String {
     "127.0.0.1".to_string()
 }
 
+/// MAN-324 D2: the live-state listener is loopback unless the operator
+/// widens it, like MAN-132's metrics listener.
+fn default_live_bind_addr() -> String {
+    "127.0.0.1".to_string()
+}
+
 /// MAN-159: dry-run is ON unless an operator explicitly turns it off.
 /// Enabling a `[[rbn_uplink]]` block is already a deliberate act, but it
 /// should not *also* silently mean "start transmitting to a real RBN
@@ -423,6 +429,18 @@ pub struct ServerConfig {
     pub json_port: u16,
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
+    /// MAN-324 D1: the live-state stream's port (band state, each track's
+    /// copy and candidates, every validation decision). `None` (the
+    /// default, field omitted) runs no live-state listener at all. See
+    /// `docs/LIVE-STATE.md`.
+    #[serde(default)]
+    pub live_port: Option<u16>,
+    /// MAN-324 D2: the live-state listener's address. It has no password
+    /// and carries every track's decoded text, so it defaults to
+    /// `127.0.0.1`; `"0.0.0.0"` lets a dashboard on another machine
+    /// connect. Read only when `live_port` is set.
+    #[serde(default = "default_live_bind_addr")]
+    pub live_bind_addr: String,
     /// Overrides the telnet listener's per-source-IP connection quota
     /// (MAN-61) -- `None` (default, field omitted) uses the built-in
     /// default (16). `0` means "no per-IP cap" (only
@@ -1080,6 +1098,23 @@ mod tests {
         assert_eq!(cfg.metrics_port, 7302);
         assert_eq!(cfg.bind_addr, "0.0.0.0");
         assert_eq!(cfg.metrics_bind_addr, "127.0.0.1");
+    }
+
+    #[test]
+    fn live_port_is_unset_and_live_bind_addr_is_loopback_by_default() {
+        let cfg: ServerConfig = toml::from_str("station_callsign = \"W3XYZ\"\n").unwrap();
+        assert_eq!(cfg.live_port, None);
+        assert_eq!(cfg.live_bind_addr, "127.0.0.1");
+    }
+
+    #[test]
+    fn live_port_and_live_bind_addr_parse() {
+        let cfg: ServerConfig = toml::from_str(
+            "station_callsign = \"W3XYZ\"\nlive_port = 7303\nlive_bind_addr = \"0.0.0.0\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.live_port, Some(7303));
+        assert_eq!(cfg.live_bind_addr, "0.0.0.0");
     }
 
     #[test]

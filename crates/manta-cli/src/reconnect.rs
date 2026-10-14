@@ -153,6 +153,11 @@ pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
     reported_healthy: bool,
     fs: f64,
     center_freq_hz: f64,
+    /// MAN-312: the first connection's `rf_passband_hz`, reported through
+    /// outages like `fs`/`center_freq_hz`, so `listen`'s static-crash
+    /// detector judges the real passband (a KiwiSDR's ±5 kHz, rig audio's
+    /// one-sided band) rather than the trait's full-Nyquist default.
+    rf_passband_hz: (f64, f64),
     backoff: Duration,
     /// Whether the current `inner` has returned at least one real sample
     /// since it was (re)opened -- decides `Disconnected` vs
@@ -205,6 +210,7 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
         on_health(initial_healthy);
         let fs = first.sample_rate();
         let center_freq_hz = first.center_freq_hz();
+        let rf_passband_hz = first.rf_passband_hz();
         let last_ok = env.now();
         let input_health = InputHealthTotals::for_source(first.as_ref());
         ReconnectingSource {
@@ -217,6 +223,7 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
             reported_healthy: initial_healthy,
             fs,
             center_freq_hz,
+            rf_passband_hz,
             backoff: INITIAL_BACKOFF,
             productive: false,
             reopened: false,
@@ -251,6 +258,10 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
         self.center_freq_hz
     }
 
+    fn rf_passband_hz(&self) -> (f64, f64) {
+        self.rf_passband_hz
+    }
+
     fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {
         loop {
             if self.inner.is_none() {
@@ -276,6 +287,18 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                                 self.name,
                                 manta_server::human::khz(src.center_freq_hz()),
                                 manta_server::human::khz(self.center_freq_hz)
+                            );
+                        }
+                        // MAN-140 (D14): the passband is reported from the first
+                        // connection, so a reopen onto a different filter would
+                        // leave it stale; end the run as a retune does.
+                        if src.rf_passband_hz() != self.rf_passband_hz {
+                            let (lo, hi) = src.rf_passband_hz();
+                            let (lo0, hi0) = self.rf_passband_hz;
+                            anyhow::bail!(
+                                "source {} reopened with a different passband \
+                                 ({lo} .. {hi} Hz, expected {lo0} .. {hi0} Hz)",
+                                self.name
                             );
                         }
                         if let Some(totals) = &self.input_health {
@@ -488,6 +511,40 @@ mod tests {
 
     fn buf(n: usize) -> Vec<Complex32> {
         vec![Complex32::new(0.0, 0.0); n]
+    }
+
+    /// MAN-312: the wrapper reports the wrapped source's passband, not the
+    /// trait's full-Nyquist default.
+    #[test]
+    fn reports_the_first_sources_rf_passband() {
+        struct Narrow(ScriptedSource);
+        impl IqSource for Narrow {
+            fn sample_rate(&self) -> f64 {
+                self.0.sample_rate()
+            }
+            fn center_freq_hz(&self) -> f64 {
+                self.0.center_freq_hz()
+            }
+            fn rf_passband_hz(&self) -> (f64, f64) {
+                (-5000.0, 5000.0)
+            }
+            fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {
+                self.0.read(buf)
+            }
+        }
+        let first = Narrow(scripted(FS, CENTER, vec![ok_chunk(8)]));
+        let (opener, _calls) = opener_from(VecDeque::new());
+        let (health, _log) = health_recorder();
+        let src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            FakeEnv::new(),
+        );
+        assert_eq!(src.rf_passband_hz(), (-5000.0, 5000.0));
     }
 
     #[test]
@@ -891,6 +948,56 @@ mod tests {
         assert!(
             err.to_string() == format!("source test reopened with a different center frequency ({:.1} kHz, expected {:.1} kHz)", (CENTER + 1000.0) / 1000.0, CENTER / 1000.0),
             "error must mention the center frequency mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn reopened_source_with_a_different_passband_is_a_fatal_error() {
+        struct Edges(ScriptedSource, (f64, f64));
+        impl IqSource for Edges {
+            fn sample_rate(&self) -> f64 {
+                self.0.sample_rate()
+            }
+            fn center_freq_hz(&self) -> f64 {
+                self.0.center_freq_hz()
+            }
+            fn rf_passband_hz(&self) -> (f64, f64) {
+                self.1
+            }
+            fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {
+                self.0.read(buf)
+            }
+        }
+        let first = Edges(
+            scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]),
+            (-5000.0, 5000.0),
+        );
+        let reopened: Box<dyn IqSource> = Box::new(Edges(
+            scripted(FS, CENTER, vec![ok_chunk(8)]),
+            (-3000.0, 3000.0),
+        ));
+        let mut next = Some(reopened);
+        let opener: Opener = Box::new(move || {
+            next.take()
+                .ok_or_else(|| anyhow::anyhow!("no more sources"))
+        });
+        let (health, _log) = health_recorder();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            FakeEnv::new(),
+        );
+
+        let mut b = buf(8);
+        src.read(&mut b).unwrap();
+        let err = src.read(&mut b).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "source test reopened with a different passband (-3000 .. 3000 Hz, expected -5000 .. 5000 Hz)"
         );
     }
 

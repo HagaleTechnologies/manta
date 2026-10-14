@@ -1,13 +1,13 @@
-//! Repetition gate: a callsign must decode >= 2 distinct times within a
-//! 90 s window on its track before first spot. SPEC §4.6 / ARCHITECTURE
+//! Repetition gate: count distinct messages within a 90 s window.
+//! The validator applies the pattern tier requirement (2, 3 or 5). SPEC §4.6 / ARCHITECTURE
 //! §6.4. `sample_ts`-based, never wall clock (SPEC-decode-core.md §6 rule
 //! 2). `BTreeMap`, never `HashMap` (rule 3) -- this state feeds directly
 //! into whether/when a `Spot` is emitted.
 //!
 //! MAN-100 Scenario 2: "distinct decodes" means distinct *messages*, not
 //! distinct decoded `Word`s. SPEC's own default payload template repeats
-//! a callsign back-to-back within one transmission ("CQ CQ DE <CALL>
-//! <CALL> K"), which the old word-count-only accounting let satisfy this
+//! a callsign back-to-back within one transmission (`CQ CQ DE <CALL>
+//! <CALL> K`), which the old word-count-only accounting let satisfy this
 //! gate on the strength of a single, possibly-corrupted message alone --
 //! see `MIN_MESSAGE_WORD_GAP`.
 
@@ -18,10 +18,10 @@ use std::collections::BTreeMap;
 /// different window than the one the repetition gate itself uses.
 pub(crate) const WINDOW_SECONDS: f64 = 90.0;
 
-/// MAN-100 Scenario 2. SPEC's payload template "CQ CQ DE <CALL> <CALL> K"
+/// MAN-100 Scenario 2. SPEC's payload template `CQ CQ DE <CALL> <CALL> K`
 /// puts one message's two utterances a single word apart; the closest two
-/// *separate* messages can put them is five ("<CALL> K CQ CQ DE
-/// <CALL>"). 3 sits between the two with margin. Measured (this ticket's
+/// *separate* messages can put them is five (`<CALL> K CQ CQ DE
+/// <CALL>`). 3 sits between the two with margin. Measured (this ticket's
 /// plan): gap = 2 and gap = 3 give identical outcomes on the reference
 /// pileup fixtures; 3 is the stricter reading of "a second, later message
 /// must independently support the candidate", so 3 is what ships.
@@ -30,12 +30,12 @@ pub const MIN_MESSAGE_WORD_GAP: u64 = 3;
 /// Width, in seconds of `sample_ts` (never real wall clock), beyond which
 /// two occurrences of the same text cannot plausibly belong to one
 /// transmission, regardless of their word_seq gap (MAN-100 remediation
-/// C2). A short ID -- e.g. "DE <CALL>", 2 words -- puts genuinely
+/// C2). A short ID -- e.g. `DE <CALL>`, 2 words -- puts genuinely
 /// separate messages below `MIN_MESSAGE_WORD_GAP`, and a pure word_seq
 /// rule then has no way to tell them apart from one corrupted message's
 /// double utterance (measured: "DE K5ARH" repeated 10x at 80s spacing,
 /// 13 minutes total, never spotted at all under a word_seq-only rule).
-/// 60s comfortably covers a full "CQ CQ DE <CALL> <CALL> K" transmission
+/// 60s comfortably covers a full `CQ CQ DE <CALL> <CALL> K` transmission
 /// even at 8 WPM (SPEC-decode-core.md's slowest supported speed, ~40s for
 /// that template) with margin, while staying well under the 80s spacing
 /// that must count as separate and under the 90s ledger/gate window
@@ -482,7 +482,7 @@ pub struct RepetitionGate {
 
 /// MAN-118: upper bounds of the `manta_candidate_repetitions` histogram's
 /// buckets, over the counts `RepetitionGate::record` returns. A candidate
-/// needs 2 to spot, so 1 and 2 get their own buckets.
+/// needs 2, 3 or 5 to spot by its pattern tier; each has its own bucket.
 pub const REPETITION_BUCKETS: [u32; 10] = [1, 2, 3, 4, 5, 6, 8, 10, 15, 20];
 
 /// MAN-118: cumulative distribution of `RepetitionGate::record`'s return
@@ -590,7 +590,7 @@ impl RepetitionGate {
     /// A non-finite `freq_hz` (NaN/±infinity -- should never happen from
     /// the real DSP pipeline, but a defensive guard, Codex review PR
     /// #152) is rejected outright: no entry is touched, and this returns
-    /// 0 (never `>= 2`, so it can never itself satisfy the repetition
+    /// 0 (below every tier requirement, so it can never itself satisfy the repetition
     /// gate). Silently mapping it to some fallback bucket instead would
     /// risk cross-contaminating repetition credit with whatever a real
     /// signal happens to already occupy there -- bucket 0 in particular

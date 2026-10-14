@@ -270,8 +270,9 @@ pub(crate) struct Listener {
     pub port: u16,
 }
 
-/// `[server]`'s three listeners, in the order `run` binds them.
-pub(crate) fn server_listeners(server: &ServerConfig) -> [Listener; 3] {
+/// `[server]`'s listeners, in the order `run` binds them: telnet, JSON,
+/// metrics, then (MAN-324) the live-state listener when `live_port` is set.
+pub(crate) fn server_listeners(server: &ServerConfig) -> Vec<Listener> {
     let listener = |name, port_key, addr_key, addr: &str, port| Listener {
         name,
         port_key,
@@ -279,7 +280,7 @@ pub(crate) fn server_listeners(server: &ServerConfig) -> [Listener; 3] {
         addr: addr.to_string(),
         port,
     };
-    [
+    let mut listeners = vec![
         listener(
             "telnet",
             "telnet_port",
@@ -301,7 +302,17 @@ pub(crate) fn server_listeners(server: &ServerConfig) -> [Listener; 3] {
             &server.metrics_bind_addr,
             server.metrics_port,
         ),
-    ]
+    ];
+    if let Some(live_port) = server.live_port {
+        listeners.push(listener(
+            "live",
+            "live_port",
+            "live_bind_addr",
+            &server.live_bind_addr,
+            live_port,
+        ));
+    }
+    listeners
 }
 
 /// D3: the earlier listener that `listeners[i]` can never bind beside --
@@ -410,6 +421,14 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
                 s.metrics_port,
                 line_format_name(s.line_format)
             );
+            // MAN-324: only when the live-state listener is on, so a
+            // config without `live_port` prints the same line as before.
+            if let Some(live_port) = s.live_port {
+                l.push_str(&format!(
+                    " live_port={live_port} live_bind_addr={}",
+                    s.live_bind_addr
+                ));
+            }
             let optional = [
                 ("status_interval_secs", s.status_interval_secs),
                 ("history_minutes", s.history_minutes.map(u64::from)),
@@ -544,6 +563,16 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
         }) => {
             format!("input: type=hpsdr host={host} port={port} freq_hz={freq_hz} rate_hz={rate_hz}")
         }
+        Some(SourceFromFile::Ka9q {
+            group,
+            port,
+            ssrc,
+            interface,
+        }) => format!(
+            "input: type=ka9q group={group} port={port} ssrc={} interface={}",
+            ssrc.map_or("any".to_string(), |s| s.to_string()),
+            interface.map_or("default".to_string(), |i| i.to_string())
+        ),
     };
     let shared = &loaded.input.shared;
     for (key, value) in [
@@ -574,7 +603,8 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
     let spot = &loaded.spot;
     lines.push(format!(
         "spot: allowlist={} blocklist_path={} notch_path={} cty_path={} scp_path={} \
-         cty_sha256={} scp_sha256={} refresh_lists={} list_cache_dir={} cty_url={} scp_url={}",
+         cty_sha256={} scp_sha256={} refresh_lists={} list_cache_dir={} cty_url={} scp_url={} \
+         validation_level={} pattern_path={}",
         if spot.allowlist.is_empty() {
             "none".to_string()
         } else {
@@ -594,6 +624,10 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
         path_or_none(&spot.list_cache_dir),
         spot.cty_url(),
         spot.scp_url(),
+        spot.validation_level.as_str(),
+        spot.pattern_path
+            .as_ref()
+            .map_or("bundled".to_string(), |p| p.display().to_string()),
     ));
 
     let detector = set_keys(loaded, "detector", &[]);
@@ -669,6 +703,22 @@ fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> V
             )
         },
     );
+    // MAN-324: the live-state stream carries every track's decoded text.
+    if server.live_port.is_some() {
+        bind_notes(
+            &mut notes,
+            "live_bind_addr",
+            &server.live_bind_addr,
+            |addr| {
+                format!(
+                    "note: the live-state stream listens on every network interface \
+                 (live_bind_addr = \"{addr}\") and has no password; it carries every track's \
+                 decoded text -- firewall live_port to the dashboards that read it, or set \
+                 live_bind_addr = \"127.0.0.1\""
+                )
+            },
+        );
+    }
     // MAN-90: before going live, operators run `config check` (the node guide
     // sends them here); say the uplink is experimental and what to use instead.
     if loaded.rbn_uplink.iter().any(|u| u.enabled) {
@@ -813,6 +863,84 @@ mod tests {
     }
 
     // ---- Phase 2: the summary and notes
+
+    #[test]
+    fn server_listeners_includes_live_only_when_live_port_is_set() {
+        let without = load_text("[server]\nstation_callsign = \"W1AW\"\n").unwrap();
+        let names: Vec<&str> = server_listeners(without.server.as_ref().unwrap())
+            .iter()
+            .map(|l| l.name)
+            .collect();
+        assert_eq!(names, ["telnet", "json", "metrics"]);
+        let with = load_text("[server]\nstation_callsign = \"W1AW\"\nlive_port = 7303\n").unwrap();
+        let listeners = server_listeners(with.server.as_ref().unwrap());
+        let live = listeners.last().unwrap();
+        assert_eq!(
+            (
+                live.name,
+                live.port_key,
+                live.addr_key,
+                live.addr.as_str(),
+                live.port
+            ),
+            ("live", "live_port", "live_bind_addr", "127.0.0.1", 7303)
+        );
+    }
+
+    #[test]
+    fn a_live_port_equal_to_json_port_is_refused() {
+        let err = load_text(
+            "[server]\nstation_callsign = \"W1AW\"\nlive_port = 7301\nlive_bind_addr = \"0.0.0.0\"\n",
+        )
+        .and_then(|loaded| reject_duplicate_ports(&loaded))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("live_port 7301 is the same as json_port"),
+            "{err}"
+        );
+        // A loopback live listener beside a specific-address JSON listener
+        // on another IP binds fine.
+        let ok = load_text(
+            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"192.0.2.1\"\nlive_port = 7301\n",
+        )
+        .unwrap();
+        assert!(reject_duplicate_ports(&ok).is_ok());
+    }
+
+    #[test]
+    fn summary_names_live_port_and_bind_addr_only_when_set() {
+        let without = lines_of("[server]\nstation_callsign = \"W1AW\"\n");
+        let server = without.iter().find(|l| l.starts_with("server:")).unwrap();
+        assert!(!server.contains("live_"), "{server}");
+        let with = lines_of(
+            "[server]\nstation_callsign = \"W1AW\"\nlive_port = 7303\nlive_bind_addr = \"0.0.0.0\"\n",
+        );
+        let server = with.iter().find(|l| l.starts_with("server:")).unwrap();
+        assert!(
+            server.ends_with("line_format=rbn live_port=7303 live_bind_addr=0.0.0.0"),
+            "{server}"
+        );
+    }
+
+    #[test]
+    fn note_live_bind_addr_on_every_interface() {
+        let note = "note: the live-state stream listens on every network interface \
+                    (live_bind_addr = \"0.0.0.0\") and has no password; it carries every \
+                    track's decoded text -- firewall live_port to the dashboards that read it, \
+                    or set live_bind_addr = \"127.0.0.1\"";
+        let wide = notes_of(
+            "[server]\nstation_callsign = \"W1AW\"\nlive_port = 7303\nlive_bind_addr = \"0.0.0.0\"\n",
+        );
+        assert!(wide.iter().any(|l| l == note), "{wide:#?}");
+        let local = notes_of("[server]\nstation_callsign = \"W1AW\"\nlive_port = 7303\n");
+        assert!(
+            !local.iter().any(|l| l.contains("live-state")),
+            "{local:#?}"
+        );
+        let off = notes_of("[server]\nstation_callsign = \"W1AW\"\nlive_bind_addr = \"0.0.0.0\"\n");
+        assert!(!off.iter().any(|l| l.contains("live-state")), "{off:#?}");
+    }
 
     #[test]
     fn summary_server_line_shows_configured_ports_and_defaults() {
@@ -997,6 +1125,25 @@ mod tests {
         );
     }
 
+    /// MAN-140: both forms of the ka9q line (Design §2): the defaults, and
+    /// an explicit ssrc and interface.
+    #[test]
+    fn summary_line_for_a_ka9q_input() {
+        let lines = lines_of("[input]\ntype = \"ka9q\"\ngroup = \"239.101.6.1\"\n");
+        assert_eq!(
+            line(&lines, "input:"),
+            "input: type=ka9q group=239.101.6.1 port=5004 ssrc=any interface=default"
+        );
+        let lines = lines_of(
+            "[input]\ntype = \"ka9q\"\ngroup = \"239.101.6.1\"\nssrc = 14100000\n\
+             interface = \"192.168.1.20\"\n",
+        );
+        assert_eq!(
+            line(&lines, "input:"),
+            "input: type=ka9q group=239.101.6.1 port=5004 ssrc=14100000 interface=192.168.1.20"
+        );
+    }
+
     #[test]
     fn summary_never_prints_the_kiwi_password() {
         let lines = lines_of(
@@ -1019,7 +1166,8 @@ mod tests {
             "spot: allowlist=none blocklist_path=none notch_path=none cty_path=bundled \
              scp_path=bundled cty_sha256=none scp_sha256=none refresh_lists=off \
              list_cache_dir=none cty_url=http://www.country-files.com/cty/cty.dat \
-             scp_url=http://www.supercheckpartial.com/MASTER.SCP"
+             scp_url=http://www.supercheckpartial.com/MASTER.SCP \
+             validation_level=normal pattern_path=bundled"
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manta.toml");
@@ -1032,7 +1180,7 @@ mod tests {
                 "[spot]\nallowlist = [\"W1AW\", \"K1ABC\"]\nblocklist_path = \"bad.txt\"\n\
                  notch_path = '{}'\ncty_path = 'cty.dat'\nscp_path = 'MASTER.SCP'\n\
                  cty_sha256 = '{}'\nrefresh_lists = true\nlist_cache_dir = 'cache'\n\
-                 scp_url = 'http://mirror.lan/MASTER.SCP'\n",
+                 scp_url = 'http://mirror.lan/MASTER.SCP'\npattern_path = 'patterns.lst'\n",
                 notch.display(),
                 PIN.to_ascii_uppercase()
             ),
@@ -1045,12 +1193,15 @@ mod tests {
                 "spot: allowlist=W1AW,K1ABC blocklist_path={} notch_path={} cty_path={} \
                  scp_path={} cty_sha256={PIN} scp_sha256=none refresh_lists=on \
                  list_cache_dir={} cty_url=http://www.country-files.com/cty/cty.dat \
-                 scp_url=http://mirror.lan/MASTER.SCP",
+                 scp_url=http://mirror.lan/MASTER.SCP \
+                 validation_level={} pattern_path={}",
                 dir.path().join("bad.txt").display(),
                 notch.display(),
                 dir.path().join("cty.dat").display(),
                 dir.path().join("MASTER.SCP").display(),
-                dir.path().join("cache").display()
+                dir.path().join("cache").display(),
+                "normal",
+                dir.path().join("patterns.lst").display()
             )
         );
     }
@@ -1560,6 +1711,7 @@ mod tests {
 
     /// Keys with no built-in default: the scaffold shows an example (D10).
     const NO_DEFAULT: &[(&str, &str)] = &[
+        ("server", "live_port"),
         ("server", "station_callsign"),
         ("server", "operator_name"),
         ("server", "operator_qth"),
@@ -1579,6 +1731,9 @@ mod tests {
         ("input", "driver"),
         ("input", "rate_hz"),
         ("input", "gain_db"),
+        ("input", "group"),
+        ("input", "ssrc"),
+        ("input", "interface"),
         ("input", "center_freq_hz"),
         ("input", "capture_rate_hz"),
         ("input", "replay_epoch"),
@@ -1589,6 +1744,7 @@ mod tests {
         ("spot", "list_cache_dir"),
         ("spot", "cty_sha256"),
         ("spot", "scp_sha256"),
+        ("spot", "pattern_path"),
     ];
 
     /// `Option` keys whose absence means a built-in value: setting them to
@@ -1843,6 +1999,7 @@ mod tests {
             InputKind::Kiwi,
             InputKind::Soapy,
             InputKind::Hpsdr,
+            InputKind::Ka9q,
         ] {
             let body = format!(
                 "[input]\ntype = \"{}\"\n{}",
@@ -1866,7 +2023,9 @@ mod tests {
         let body = format!("[spot]\n{}", uncommented("spot", |_| true));
         let l = loaded(&body);
         assert!(l.spot.blocklist_path.is_some() && l.spot.notch_path.is_some());
-        assert!(l.spot.cty_path.is_some() && l.spot.scp_path.is_some());
+        assert!(
+            l.spot.cty_path.is_some() && l.spot.scp_path.is_some() && l.spot.pattern_path.is_some()
+        );
     }
 
     #[test]

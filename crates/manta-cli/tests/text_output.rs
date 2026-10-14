@@ -25,6 +25,8 @@ fn write_three_station_wav(dir: &Path) -> PathBuf {
     let fs = 48_000.0;
     let duration_s = 60.0;
     let station = |call: &str, offset_hz: f64, wpm: f32| SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: format!("CQ CQ DE {call} {call} K"),
         loop_text: true,
         wpm,
