@@ -1003,6 +1003,37 @@ impl Track {
             .unwrap()
     }
 
+    /// MAN-197 (Codex review, PR #301): the live-track counterpart of the
+    /// spawn gate's `spawn_window_cooling_down`. A candidate born two bins
+    /// from a cooling channel passes the spawn gate legitimately, yet a
+    /// stronger neighbour can drag `center` across the rounding boundary
+    /// until `owned` includes that channel -- so a live track's max-power
+    /// selection must skip channels still serving a post-`Silent`
+    /// cooldown, or the track keeps decoding the silenced birdie for a
+    /// whole extra GC cycle inside the cooldown window. Identical to
+    /// `select_channel` unless the max-power owned channel is cooling
+    /// (only the absorbed-birdie case changes). Falls back to the plain
+    /// max-power channel when *every* owned channel is cooling (possible
+    /// only for a track that predates the close or drifted fully onto the
+    /// cooldown window; the spawn gate blocks fresh births there).
+    fn select_live_channel(
+        &self,
+        power: &[f32],
+        n_channels: usize,
+        channel_cooldown_until: &[u64],
+        hop_counter: u64,
+    ) -> usize {
+        let plain = self.select_channel(power, n_channels);
+        if channel_cooldown_until[plain] <= hop_counter {
+            return plain;
+        }
+        self.owned(n_channels)
+            .into_iter()
+            .filter(|&ch| channel_cooldown_until[ch] <= hop_counter)
+            .max_by(|&a, &b| power[a].partial_cmp(&power[b]).unwrap())
+            .unwrap_or(plain)
+    }
+
     /// Update `center` (live EMA), from this hop's selected channel's
     /// fine-frequency interpolation. SPEC §1.4/§2.5.
     fn update_centroid(&mut self, k: usize, power: &[f32], n_channels: usize) {
@@ -1622,7 +1653,15 @@ impl TrackManager {
         for id in ids {
             let n = self.n_channels();
             let track = self.tracks.get_mut(&id).unwrap();
-            let k = track.select_channel(&hop.power, n);
+            // MAN-197: selection skips channels still serving a post-Silent
+            // cooldown, so a track whose window drifted onto a silenced
+            // birdie cannot keep decoding it inside the cooldown window.
+            let k = track.select_live_channel(
+                &hop.power,
+                n,
+                &self.channel_cooldown_until,
+                self.hop_counter,
+            );
             // MAN-312: a crash's energy would drag the centroid toward
             // wherever the smear happens to peak this hop.
             if !suppress {
@@ -1835,14 +1874,15 @@ impl TrackManager {
         // gate's smoothed power. Falling leakage skirts cannot start a
         // spawn decision. Preserve the same-hop adjacent-rise arbitration.
         // MAN-312: no track starts during a static crash ("starts-only"
-        // and "full").
+        // and "full"). MAN-197: the respawn cooldown gates a candidate's
+        // whole prospective ownership window, not just its birth channel.
         if past_warmup && !suppress {
             let n = self.n_channels();
             let mut k = 0;
             while k < n {
                 if rise[k]
                     && self.owner_of[k].is_none()
-                    && !self.channel_cooling_down(k)
+                    && !self.spawn_window_cooling_down(k)
                     && self.is_local_peak(k)
                     && !self.rtty_vetoes_spawn(k)
                 {
@@ -1850,7 +1890,7 @@ impl TrackManager {
                     if k + 1 < n
                         && rise[k + 1]
                         && self.owner_of[k + 1].is_none()
-                        && !self.channel_cooling_down(k + 1)
+                        && !self.spawn_window_cooling_down(k + 1)
                         && !self.rtty_vetoes_spawn(k + 1)
                     {
                         if hop.power[k + 1] > hop.power[winner] {
@@ -1919,6 +1959,19 @@ impl TrackManager {
     /// cooldown (`DetectorConfig::silent_respawn_cooldown_hops`)?
     fn channel_cooling_down(&self, k: usize) -> bool {
         self.channel_cooldown_until[k] > self.hop_counter
+    }
+
+    /// MAN-197: would a CANDIDATE born on `k` immediately come to own a
+    /// channel still serving a post-`Silent` cooldown? `Track::owned` is
+    /// the wrapping 3-channel window `{k-1, k, k+1}`, so gating only the
+    /// birth channel let a neighbour-born candidate absorb the cooling
+    /// channel via `select_channel`'s max-power rule and track it for a
+    /// full illegitimate promote/decode cycle inside the cooldown window.
+    fn spawn_window_cooling_down(&self, k: usize) -> bool {
+        let n = self.n_channels();
+        [(k + n - 1) % n, k, (k + 1) % n]
+            .into_iter()
+            .any(|ch| self.channel_cooling_down(ch))
     }
 
     /// Birth a new CANDIDATE track on `birth_channel`. Its `current_snr_db`
@@ -3836,6 +3889,222 @@ mod tests {
             repromoted,
             "a new signal on channel 10 was suppressed by a stale cooldown after the old \
              signal's rise genuinely dropped -- the cooldown must clear on a real RF gap"
+        );
+    }
+
+    /// Regression, MAN-197: a spawn candidate's prospective 3-channel
+    /// ownership window must not intersect any channel still serving a
+    /// post-`Silent` cooldown. Arming (`step_hop`'s Silent-close retain)
+    /// and living (`Track::owned`/`select_channel`) are window-granularity
+    /// operations, but the spawn gate checked only the birth channel -- so
+    /// after a birdie on channel 10 closed Silent (arming {9,10,11}) and the
+    /// round-4 per-channel clear released 9 and 11 (their own `rise` was
+    /// false), a candidate born on 9 passed the gate and absorbed still-
+    /// cooling channel 10 via `select_channel`'s max-power rule, tracking
+    /// the birdie for a full illegitimate promote/decode cycle inside the
+    /// cooldown window. Measured pre-fix: spawn at hop 15050 while channel
+    /// 10's cooldown was armed until 26282.
+    #[test]
+    fn neighbour_spawn_cannot_absorb_a_cooling_down_channel() {
+        let n = 64;
+        let mut tm = TrackManager::new(
+            n,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, n);
+        let mut power = quiet_power(n);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0); // birdie: +20 dB, never decodes
+
+        // One full promote -> gc_hops Silent-close cycle, driving step_hop
+        // directly so no character is ever decoded (same harness as the
+        // sibling MAN-171 tests).
+        let mut m = 250u64 * 15;
+        let mut promotions = 0u32;
+        for _ in 0..12_000 {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            promotions += promoted
+                .iter()
+                .filter(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
+                .count() as u32;
+            m += 1;
+            if promotions > 0 && tm.tracks.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            promotions, 1,
+            "expected exactly one promotion before the Silent close"
+        );
+        assert_eq!(tm.tracks.len(), 0, "the closed track must be gone");
+
+        // One more hop: 9/11 cooldowns clear (own rise false), 10 stays armed.
+        tm.step_hop(&hop(m, power.clone()), m);
+        m += 1;
+        assert!(
+            tm.channel_cooling_down(10),
+            "channel 10 must still be cooling down"
+        );
+        let until = tm.channel_cooldown_until[10];
+
+        // A strong new signal appears on channel 9 (strong enough to be a
+        // local peak against the birdie). Its prospective window {8,9,10}
+        // intersects the cooling channel, so no track may spawn before
+        // expiry. NOTE: `step_hop` increments hop_counter before the spawn
+        // scan, so the gate sees the cooldown expired on calls with
+        // m + 1 >= until -- stop one hop short.
+        let mut neighbour = power.clone();
+        neighbour[9] = 1e-9 * 10f32.powf(30.0 / 10.0);
+        while m + 1 < until {
+            tm.step_hop(&hop(m, neighbour.clone()), m);
+            m += 1;
+            assert!(
+                tm.tracks.is_empty(),
+                "MAN-197: a candidate spawned on channel 9 at hop {m} while channel 10's \
+                 cooldown (until {until}) was still armed"
+            );
+        }
+        // Rate limit, not denylist: once the cooldown expires the channel-9
+        // signal must be allowed to spawn and promote.
+        let mut repromoted = false;
+        for _ in 0..300 {
+            let (_, promoted, _) = tm.step_hop(&hop(m, neighbour.clone()), m);
+            m += 1;
+            if promoted
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
+            {
+                repromoted = true;
+                break;
+            }
+        }
+        assert!(
+            repromoted,
+            "channel 9 never promoted even after channel 10's cooldown expired"
+        );
+    }
+
+    /// Regression, MAN-197 (Codex review, PR #301): the respawn cooldown
+    /// must also police a *live* track's input selection, not just the
+    /// birth-time window. A candidate born two bins away from the cooling
+    /// channel passes `spawn_window_cooling_down` legitimately (its
+    /// prospective window does not intersect the cooldown), but a stronger
+    /// signal on the intervening bin drags `center` across the rounding
+    /// boundary via `update_centroid` until `Track::owned` expands to
+    /// include the cooling birdie channel -- and once the intervening
+    /// signal ends, `select_channel`'s max-power rule feeds the decoder
+    /// from the birdie for a whole extra illegitimate GC cycle inside the
+    /// cooldown window, exactly the absorption the spawn gate closed.
+    #[test]
+    fn drifting_track_cannot_take_input_from_a_cooling_down_channel() {
+        let n = 64;
+        let mut tm = TrackManager::new(
+            n,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, n);
+        let mut power = quiet_power(n);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0); // birdie: +20 dB, never decodes
+
+        // Phase A: one promote -> gc_hops Silent-close cycle on the birdie,
+        // arming the {9,10,11} cooldown (same harness as the sibling test).
+        let mut m = 250u64 * 15;
+        let mut promotions = 0u32;
+        for _ in 0..12_000 {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            promotions += promoted
+                .iter()
+                .filter(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
+                .count() as u32;
+            m += 1;
+            if promotions > 0 && tm.tracks.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            promotions, 1,
+            "expected exactly one promotion before the Silent close"
+        );
+        assert_eq!(tm.tracks.len(), 0, "the closed track must be gone");
+        // One more hop: 9/11 cooldowns clear (own rise false), 10 stays armed.
+        tm.step_hop(&hop(m, power.clone()), m);
+        m += 1;
+        assert!(
+            tm.channel_cooling_down(10),
+            "channel 10 must still be cooling down"
+        );
+        let until = tm.channel_cooldown_until[10];
+
+        // Phase B: a new signal on channel 8 -- two bins from the birdie, so
+        // its prospective window {7,8,9} is legitimately clean and it must
+        // spawn and promote (the accepted neighbour trade-off, not a bypass).
+        let mut neighbour = power.clone();
+        neighbour[8] = 1e-9 * 10f32.powf(30.0 / 10.0);
+        let mut neighbour_promoted = false;
+        for _ in 0..600 {
+            let (_, promoted, _) = tm.step_hop(&hop(m, neighbour.clone()), m);
+            m += 1;
+            if promoted
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
+            {
+                neighbour_promoted = true;
+                break;
+            }
+        }
+        assert!(
+            neighbour_promoted,
+            "channel 8 never promoted (clean prospective window; it must spawn)"
+        );
+
+        // Phase C: a stronger signal on the intervening bin 9. Channel 9 is
+        // owned by the channel-8 track, so it is absorbed rather than
+        // spawned; `update_centroid` drags center from 8.0 toward ~8.8 until
+        // `center.round() == 9` and the owned window becomes {8,9,10}.
+        let mut dragging = neighbour.clone();
+        dragging[9] = 1e-9 * 10f32.powf(40.0 / 10.0);
+        for _ in 0..300 {
+            tm.step_hop(&hop(m, dragging.clone()), m);
+            m += 1;
+        }
+        assert_eq!(
+            tm.tracks.len(),
+            1,
+            "the channel-8 track must still be the only live track"
+        );
+        let track = tm.tracks.values().next().unwrap();
+        assert!(
+            track.owned(n).contains(&10),
+            "expected the dragged track's window to include cooling channel 10 (center {})",
+            track.center
+        );
+
+        // Phase D: the real signals end; only the still-cooling birdie on
+        // channel 10 remains. The track may NOT take its input from the
+        // cooling channel: without enforcement it stayed ACTIVE on the
+        // birdie for a whole extra gc_hops cycle; with it, the de-selected
+        // track must close (HangExpired) within hang_hops.
+        for _ in 0..2500 {
+            tm.step_hop(&hop(m, power.clone()), m);
+            m += 1;
+        }
+        assert!(
+            tm.tracks.is_empty(),
+            "MAN-197: a live track was still being driven by cooling channel 10 \
+             (expected a hang close within hang_hops = 1875 hops)"
+        );
+        assert_eq!(
+            tm.channel_cooldown_until[10], until,
+            "no Silent re-arm may extend the cooldown out of an illegitimate cycle"
+        );
+        assert!(
+            m < until,
+            "test must run inside the cooldown window, not past its expiry"
         );
     }
 
