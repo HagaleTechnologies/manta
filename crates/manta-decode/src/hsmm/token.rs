@@ -344,9 +344,9 @@ mod tests {
         // AfterMark, ready to be closed by each gap type.
         let t_node = |u: f32| root_token(u).successor(SegType::Dah, 39, 150.0, tree, &cfg, 39, 512);
         for (seg, d) in [
-            (SegType::CGap, 39u32),     // nominal 3u
-            (SegType::WGap, 91),        // nominal 7u
-            (SegType::Silence, 200),    // inside [10u, 80u] = [130, 1040]
+            (SegType::CGap, 39u32),  // nominal 3u
+            (SegType::WGap, 91),     // nominal 7u
+            (SegType::Silence, 200), // inside [10u, 80u] = [130, 1040]
         ] {
             let t = t_node(13.0).unwrap();
             let closed = t
@@ -357,7 +357,11 @@ mod tests {
             // Nominal CGap/WGap durations and any in-window Silence leave
             // u at 13 (CGap updates speed but at d = 3u the update is a
             // no-op; WGap/Silence never update it).
-            assert!((closed.u - 13.0).abs() < 1e-5, "{seg:?}: u drifted to {}", closed.u);
+            assert!(
+                (closed.u - 13.0).abs() < 1e-5,
+                "{seg:?}: u drifted to {}",
+                closed.u
+            );
             let glyph_entry = closed.hist[0];
             assert_eq!(glyph_entry.glyph, Some(Glyph::Char('T')), "{seg:?}");
             assert_eq!(glyph_entry.sample_ts, 512, "{seg:?}: pinned decision-11 ts");

@@ -231,7 +231,12 @@ mod tests {
     /// MAN-192: compact fixture builder -- a synthetic history entry with
     /// explicit closing-segment provenance (`None` = no closing segment,
     /// the honest value for a hand-built fixture).
-    fn entry(glyph: Option<Glyph>, sample_ts: u64, born_hop: u64, seg: Option<SegType>) -> HistEntry {
+    fn entry(
+        glyph: Option<Glyph>,
+        sample_ts: u64,
+        born_hop: u64,
+        seg: Option<SegType>,
+    ) -> HistEntry {
         HistEntry {
             glyph,
             sample_ts,
@@ -342,7 +347,10 @@ mod tests {
         let mut sealed = Vec::new();
         let out = commit_outcome(&mut tokens, 100, &cfg, &mut sealed);
         assert_eq!(out.entries.len(), 2);
-        assert!(!out.committed_silence, "a None-provenance boundary must not flag");
+        assert!(
+            !out.committed_silence,
+            "a None-provenance boundary must not flag"
+        );
     }
 
     /// MAN-192: the signal reads the WINNING head's provenance (the token
@@ -362,13 +370,23 @@ mod tests {
         // Consensus path: both tokens agree on the glyphs; the higher
         // score sorts first and its provenance wins. A losing Silence
         // hypothesis must NOT cause the signal.
-        let mut tokens = vec![token(hist(SegType::WGap), 10.0), token(hist(SegType::Silence), 9.0)];
+        let mut tokens = vec![
+            token(hist(SegType::WGap), 10.0),
+            token(hist(SegType::Silence), 9.0),
+        ];
         let mut sealed = Vec::new();
         let out = commit_outcome(&mut tokens, 100, &cfg, &mut sealed);
-        assert_eq!(out.entries.len(), 2, "consensus commits glyph then boundary");
+        assert_eq!(
+            out.entries.len(),
+            2,
+            "consensus commits glyph then boundary"
+        );
         assert!(!out.committed_silence, "the winning head closed via WGap");
 
-        let mut tokens = vec![token(hist(SegType::WGap), 9.0), token(hist(SegType::Silence), 10.0)];
+        let mut tokens = vec![
+            token(hist(SegType::WGap), 9.0),
+            token(hist(SegType::Silence), 10.0),
+        ];
         let mut sealed = Vec::new();
         let out = commit_outcome(&mut tokens, 100, &cfg, &mut sealed);
         assert!(
@@ -379,11 +397,16 @@ mod tests {
         // Forced path: tokens disagree on the glyph; only the far-past
         // born_hop forces emission, and the winner's provenance still
         // decides.
-        let disagree: Vec<HistEntry> = vec![entry(Some(Glyph::Char('E')), 300, 1, Some(SegType::WGap))];
+        let disagree: Vec<HistEntry> =
+            vec![entry(Some(Glyph::Char('E')), 300, 1, Some(SegType::WGap))];
         let mut tokens = vec![token(hist(SegType::Silence), 10.0), token(disagree, 9.5)];
         let mut sealed = Vec::new();
         let out = commit_outcome(&mut tokens, 100_000, &cfg, &mut sealed);
-        assert_eq!(out.entries.len(), 2, "forced commit emits the winner's entries");
+        assert_eq!(
+            out.entries.len(),
+            2,
+            "forced commit emits the winner's entries"
+        );
         assert!(out.committed_silence, "forced winner closed via Silence");
     }
 
@@ -420,7 +443,10 @@ mod tests {
             vec![None],
             "the boundary commits on the second call"
         );
-        assert!(out.committed_silence, "the boundary head closed via Silence");
+        assert!(
+            out.committed_silence,
+            "the boundary head closed via Silence"
+        );
         // Third call: re-deriving the already-decided boundary yields no
         // entries and no signal.
         let mut stale = vec![token(
@@ -431,7 +457,10 @@ mod tests {
             10.0,
         )];
         let out = commit_outcome(&mut stale, 200_000, &cfg, &mut sealed);
-        assert!(out.entries.is_empty(), "an already-decided boundary re-emits nothing");
+        assert!(
+            out.entries.is_empty(),
+            "an already-decided boundary re-emits nothing"
+        );
         assert!(!out.committed_silence, "and reports no signal");
     }
 
