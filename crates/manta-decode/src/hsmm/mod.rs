@@ -533,11 +533,13 @@ mod tests {
                     glyph: Some(Glyph::Char('A')),
                     sample_ts: 100,
                     born_hop: 5,
+                    closing_segment: None,
                 },
                 token::HistEntry {
                     glyph: Some(Glyph::Char('B')),
                     sample_ts: 200,
                     born_hop: 10,
+                    closing_segment: None,
                 },
             ],
             anchor_hop: 10,
@@ -566,11 +568,13 @@ mod tests {
                 glyph: Some(Glyph::Char('A')),
                 sample_ts: 100,
                 born_hop: 1,
+                closing_segment: None,
             },
             token::HistEntry {
                 glyph: Some(Glyph::Char('B')),
                 sample_ts: 200,
                 born_hop: 2,
+                closing_segment: None,
             },
         ];
         let best_token = |hist: Vec<token::HistEntry>| Token {
@@ -598,6 +602,7 @@ mod tests {
                     glyph: Some(Glyph::Char('C')), // disagrees at entry 0 only
                     sample_ts: 100,
                     born_hop: 1,
+                    closing_segment: None,
                 }],
                 anchor_hop: 1,
             },
