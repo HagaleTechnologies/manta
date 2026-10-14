@@ -204,12 +204,15 @@ def expand_paths(paths, dir_glob_suffixes, dir_prefix=""):
 
 
 def load_node_spots(paths):
-    """SpotMessage JSONL -> (spots, file_infos, malformed_count).
+    """SpotMessage JSONL -> (spots, file_infos, malformed_count,
+    grade_records_skipped).
 
     Only a file's final line with no newline (a write torn by a kill) may be
     malformed. Any other malformed record would silently leave the
-    uncorroborated share D-I reads, so it is an input error."""
-    spots, infos, malformed = [], [], 0
+    uncorroborated share D-I reads, so it is an input error. A MAN-301
+    `spotGrade` record (`kind` is "spotGrade") is not a spot: it is skipped
+    and counted, never compared."""
+    spots, infos, malformed, grade_records = [], [], 0, 0
     for path in expand_paths(paths, (".jsonl",), dir_prefix="spots-"):
         rows = 0
         try:
@@ -227,6 +230,9 @@ def load_node_spots(paths):
                 rows += 1
                 try:
                     d = json.loads(line)
+                    if isinstance(d, dict) and d.get("kind") == "spotGrade":
+                        grade_records += 1
+                        continue
                     ts = float(d["timestamp"])
                     freq = float(d["frequency"])
                     call = str(d["dxCall"]).upper()
@@ -252,7 +258,7 @@ def load_node_spots(paths):
                     "decoder_version": d.get("decoderVersion"),
                 })
         infos.append({"kind": "node", "path": path, "rows": rows, "sha256": sha256_of(path)})
-    return spots, infos, malformed
+    return spots, infos, malformed, grade_records
 
 
 def _open_rbn_texts(path):
@@ -551,7 +557,7 @@ def _iso(dt):
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def render_markdown(res, args, files, rbn_counts, node_malformed, show):
+def render_markdown(res, args, files, rbn_counts, node_malformed, show, node_grade_records=0):
     a = res["agreement"]
     out = []
     w = out.append
@@ -571,8 +577,10 @@ def render_markdown(res, args, files, rbn_counts, node_malformed, show):
     w("- decoderVersion values seen: %s"
       % (", ".join("%s (%d)" % kv for kv in dv.items()) or "none"))
     nf = res["node_filter"]
-    w("- Node spots: %d loaded, %d malformed lines skipped, %d out of passband, %d out of window, %d compared"
-      % (nf["loaded"], node_malformed, nf["out_of_passband"], nf["out_of_window"], nf["compared"]))
+    w("- Node spots: %d loaded, %d malformed lines skipped, %d grade records skipped, "
+      "%d out of passband, %d out of window, %d compared"
+      % (nf["loaded"], node_malformed, node_grade_records, nf["out_of_passband"],
+         nf["out_of_window"], nf["compared"]))
     w("- RBN rows: %d read, %d non-CW, %d malformed, %d out of passband, %d out of window, %d kept"
       % (rbn_counts["read"], rbn_counts["non_cw"], rbn_counts["malformed"],
          rbn_counts["out_of_passband"], rbn_counts["out_of_window"], rbn_counts["kept"]))
@@ -714,7 +722,7 @@ def run(argv, stdout=None, stderr=None):
         stderr.write("shadow-compare.py: error: --end must be after --start\n")
         return 2
     try:
-        node_all, node_files, node_malformed = load_node_spots(args.node_spots)
+        node_all, node_files, node_malformed, node_grades = load_node_spots(args.node_spots)
         rbn_rows, rbn_files, rbn_counts = load_rbn(args.rbn, args.passband_khz, args.start, args.end,
                                                    args.time_tol_s)
     except InputError as e:
@@ -723,7 +731,8 @@ def run(argv, stdout=None, stderr=None):
     res = compare(node_all, rbn_rows, args.primary, args.passband_khz, args.start, args.end,
                   args.freq_tol_hz, args.time_tol_s, args.exclude_spotter, args.missed_spots)
     files = node_files + rbn_files
-    stdout.write(render_markdown(res, args, files, rbn_counts, node_malformed, args.show))
+    stdout.write(render_markdown(res, args, files, rbn_counts, node_malformed, args.show,
+                                 node_grades))
     if args.json:
         summary = dict(res)
         summary["inputs"] = {
@@ -731,6 +740,7 @@ def run(argv, stdout=None, stderr=None):
             "passbands_khz": [list(pb) for pb in args.passband_khz],
             "freq_tol_hz": args.freq_tol_hz, "time_tol_s": args.time_tol_s,
             "files": files, "node_malformed_lines": node_malformed,
+            "grade_records_skipped": node_grades,
             "rbn_rows": {k: rbn_counts[k] for k in
                          ("read", "non_cw", "malformed", "out_of_passband", "out_of_window", "kept")},
         }

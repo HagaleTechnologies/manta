@@ -14,8 +14,8 @@ SoapySDR input; KiwiSDR input) — see docs/DECISIONS/2026-07-1[7-9]*.md and
 2026-07-2[4-5]*.md. V1/V3/V4/V7/V8/V9/V10 green; V2's WPM gate is green too
 (MAN-7/103's near-channel-edge WPM bug is fixed — keying-threshold placement
 and a symmetric mark/gap dit-period estimate, see
-docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md) — V2's separate
-CER gate stays open (SPEC §2.1 warmup-floor dilution, unrelated to WPM).
+docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md) — and V2's
+separate CER gate is green since MAN-115 removed its warmup-floor dilution.
 V6 now passes and V8w meets its 0-bogus criterion with a >= 20/50
 validated floor (MAN-213's fade-tracking keying rails, measured 28/50 — see
 docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md). **V5's
@@ -51,6 +51,17 @@ MAN-132: the metrics listener (`/metrics`, `/healthz`) binds
 `[server].metrics_bind_addr`, default `127.0.0.1`, while telnet/JSON keep
 `bind_addr` (`0.0.0.0`) — see
 docs/DECISIONS/2026-10-08-man132-metrics-loopback-bind.md.
+MAN-78: SIGHUP to a `[server]` daemon reloads `[spot]` lists and
+`[[rbn_uplink]]` `dry_run`; invalid reloads are logged and ignored.
+`cty_path`/`scp_path` and every other key need a restart. See
+docs/DECISIONS/2026-10-10-man78-live-reload.md.
+
+MAN-126: `manta doctor` runs named setup checks (config refusals, audio,
+server ports, clock via SNTP plus Linux `adjtimex`, RBN uplink TCP reach)
+before its signal check, prints PASS/WARN/FAIL/SKIP with a fix per problem,
+and exits 1 on any FAIL — see
+docs/DECISIONS/2026-10-10-man126-doctor-setup-checks.md and
+docs/RUNBOOKS/setup-checks.md.
 
 MAN-79: `--cty`/`--scp` and `[spot].cty_path`/`scp_path` override the
 vendored `cty.dat`/`master.scp` at run time. `run`/`listen`/`soak`/`doctor`/
@@ -64,6 +75,12 @@ MAN-116: `manta bench sensitivity` produces the recall/CER-vs-SNR (500 Hz)
 table over AWGN/Watterson good/poor × WPM, deterministic per build and
 flags — see docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md.
 
+MAN-298: v0.1.0 release prep. The GitHub Release shares
+`docker-publish-release`'s `ghcr-publish` approval but not its outcome, so a
+failed image push no longer skips it; release notes and README say
+"pre-stability alpha, expect breakage". Tony pushes the tag. See
+docs/DECISIONS/2026-10-11-man298-first-release.md.
+
 MAN-123: `run`'s plain-text mode prints decoded text on stderr grouped one
 line per track and `SPOT:` lines on stdout; with a `[server]` table decoded
 text is off unless `--decoded-text` — see
@@ -74,8 +91,164 @@ MAN-125: `manta devices` lists audio inputs and optional Soapy selectors;
 floor without decoding or services. See
 `docs/DECISIONS/2026-10-10-man125-source-diagnostics.md`.
 
+MAN-131: live audio reads wait for samples (5 s stall error naming the
+device, 48000 Hz and a macOS microphone-permission hint); digital-silence
+warning; `decode` warns without a sidecar and takes `--center-freq-hz` —
+see docs/DECISIONS/2026-10-11-man131-actionable-errors.md.
+
+MAN-138: JSON spots' `deGrid`/`deLat`/`deLon` are the operator's
+`[server].operator_grid` (its square's centre) or the new `operator_lat`/
+`operator_lon`, `null` when none is set, never a `cty.dat` country
+centroid; an inconsistent location fails config loading before I/O. See
+`docs/DECISIONS/2026-10-11-man138-station-location.md`.
+
+MAN-93: `[server].history_minutes` controls telnet replay retention
+(default 30 minutes, newest-50 floor, 10,000 ceiling). Bare `sh/dx` stays
+at 10 rows; loggers request `sh/dx 30m`. Changes need a restart. See
+`docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md`.
+
+MAN-149: `docs/CONFIG.md` (every key's default and what reads it),
+`docs/METRICS.md`, `docs/SPOT-SCHEMA.md`, `docs/README.md` (start here, by
+audience) and `docs/DECISIONS/README.md`. A new config key, metric family,
+wire field, runbook or decision record needs a row in its document; tests
+in `docs_consistency.rs` and `spot_message.rs` enforce it — see
+docs/DECISIONS/2026-10-11-man149-docs-reference-and-index.md.
+
+MAN-172: high-SNR track churn fixed in `TrackManager` (local-peak spawn
+rule, incumbent-wins merge ties); VR3/VR4 pass, VR1/VR2 pass CER but not
+WPM. See docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md.
+MAN-269: `run --realtime`/`--loop` (`input.realtime`/`input.loop`) pace and
+loop file replay so a hardware-free replay can feed telnet/JSON clients; IQ
+WAVs declaring more than 10 MS/s are rejected at open — see
+docs/DECISIONS/2026-10-10-man269-paced-looping-replay.md.
+
+MAN-90: the direct `[[rbn_uplink]]` is experimental (docs, a `config check`
+note, and the live-transmit WARN lines); the Aggregator path is the supported
+route into RBN. Claims C1–C7 stay open until a consenting Aggregator
+operator's capture — see
+docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md and
+docs/RUNBOOKS/aggregator-rbn-capture.md.
+
+MAN-115: `TrackManager` skips the channelizer's zero pre-roll, `FloorBank`
+seeds a young channel's effective floor from its block median for 1 s, and
+`[detector].warmup_ms` defaults to 25 (was 2000). V1 promotes at 0.07 s
+(was 2.06 s) and decodes its first character at 0.62 s (was 2.66 s).
+`TrackMeta` is still not emitted at promotion. See
+docs/DECISIONS/2026-10-11-man115-startup-latency.md.
+
+MAN-81: with no arguments the Docker image runs the daemon from a config
+mounted at `/etc/manta/manta.toml` (or `MANTA_CONFIG`), else prints
+`--help`; its `HEALTHCHECK` runs the new `manta health` (exit 0/1 from
+`/healthz`, metrics address read from the daemon's config); the image is
+also built for `linux/arm/v7`. See
+`docs/DECISIONS/2026-10-11-man81-docker-config-mount-and-healthcheck.md`.
+
+MAN-127: `manta calibrate` measures the receiver's ppm offset against a
+known carrier and saves `[input].freq_correction_ppm` after confirmation —
+see docs/DECISIONS/2026-10-11-man127-calibrate-command.md.
+
+MAN-312: `[detector].crash_filter` (`full` default / `starts-only` / `off`)
+stops band-wide static crashes (≥ 3 dB on three quarters of the passband's
+channels for ≥ 8 ms) from starting tracks or decoding inside them; counted
+as `manta_static_crashes_total`; VC1–VC3 vectors — see
+docs/DECISIONS/2026-10-13-man312-static-crash-filter.md.
+
+MAN-118: `/metrics` reports decode quality node-wide, with no `track_id`
+label: `manta_decode_chars_total`/`manta_decode_garbles_total`,
+`manta_track_rail_ratio` (each `legacy` track's keying-rail ratio once per
+second) and `manta_candidate_repetitions` (the repetition gate's count per
+candidate), via `manta_engine::DecodeQualityObserver` — see
+docs/DECISIONS/2026-10-12-man118-decode-quality-metrics.md.
+
+MAN-314: RTTY (two-tone FSK) is recognised after `[detector] rtty_dwell_ms`
+(20 s) and starts no CW track on its tones or keying sidebands
+(`manta-dsp::fsk`, SPEC §2.6); `decode --json` gains `rtty`, `run` logs
+marks/clears and `/metrics` gains `manta_rtty_signals{band}`. See
+docs/DECISIONS/2026-10-11-man314-rtty-recognition.md.
+
+MAN-301: `[rbn_compare]` (off by default, needs `[server]`) reads RBN's
+CW telnet feed read-only (login callsign only) and grades each spot
+`match`/`disagree`/`elsewhere`/`none`/`unknown` after a 180 s window, as a
+`spotGrade` record on :7301 and `manta_rbn_compare_*` metrics; `manta
+grade` and `score-against-rbn.py --node-log` replay offline through the
+same Rust engine. RBN's real login prompt and the live/offline agreement
+rate are unmeasured. See
+docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
+
+MAN-140: `--ka9q-group` (with `--ka9q-port`/`--ka9q-ssrc`/
+`--ka9q-interface`) or `[input] type = "ka9q"` reads one existing
+ka9q-radio (radiod) IQ channel over RTP multicast, in every build (no
+Cargo feature). Rate, encoding, frequency and filter edges come from the
+status radiod sends to the data group on port 5006; manta also joins on
+127.0.0.1 (radiod's default `ttl = 0`); a retune ends the run with exit 1.
+Written clean-room from ka9q-radio's docs and headers at `f44b3a3ee8dd`;
+six facts (D-HW) still need a live radiod. See docs/GUIDES/ka9q-radio.md
+and docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md.
+
+MAN-324: `[server].live_port` (unset = off; `live_bind_addr` default
+`127.0.0.1`) starts a live-state stream for dashboards: `bandState`,
+`trackState`, `candidateDecision` (the why-not-spotted record, from the
+validator's opt-in decision log) and `trackClosed` records on their own
+port and broadcast channel, served by `json_stream`'s fan-out code (4096
+lag, 32 clients), plus `manta_live_*` metrics. Spot output is unchanged.
+Fields: `docs/LIVE-STATE.md`; see
+docs/DECISIONS/2026-10-12-man324-live-state-stream.md. The dispensa
+`liveState.v1` fragment is not yet filed.
+
+MAN-133: `manta completions <shell>` (bash/zsh/fish/powershell/elvish) and
+`manta man-pages --out DIR` render from the clap tree `--help` uses; every
+release archive ships `man/man1/*.1` rendered natively by the release
+workflows' `validate-tag` job. clap_complete publishes hidden commands
+and flags, so nothing in the CLI may be hidden. See
+docs/DECISIONS/2026-10-13-man133-shell-completions-and-man-pages.md.
+
+MAN-156: CI denies rustdoc warnings (`RUSTDOCFLAGS=-D warnings cargo doc
+--no-deps --workspace --locked` in `test (ubuntu-latest)`; `manta-cli`'s
+clap help text is exempt). The "Supply Chain" check runs `cargo deny
+--locked check` against `deny.toml` (advisories, licenses, bans, sources;
+also daily on main). Trusted PRs get a non-required `test (windows-latest)`
+check-run. `release-publish.yml` refuses a tag whose CI push run failed any
+test leg. The `PR title` check requires a Conventional Commits title. See
+docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md.
+
+MAN-315: the legacy decoder learns per-track dot/dash/gap timing
+(`SenderTiming`, SPEC §4.1b; `TimingUpdate` event, `decode --json`
+`timing`, a `decode --timing` stderr line); gaps are measured in the
+symmetric dit (`dit_estimate_ms`), the word boundary is the sender's own,
+and the dash/dot ceiling is 6.0. VW1–VW5 (SPEC §7.3, `golden_vw.rs`)
+pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
+planned dash re-split was dropped after a bogus V8w spot). See
+docs/DECISIONS/2026-10-11-man315-sender-timing.md.
+
+MAN-174: within a `process_hops` batch a merge loser's `TrackClosed`
+precedes its survivor's, and a merge survivor that never emitted still
+gets its own `TrackClosed`, so a deferred Beacon migrated along a merge
+chain resolves at the final survivor's close. `SuppressionCounts` adds
+`pending_beacon_rejected_wpm` and `pending_beacon_stale`; pending beacons
+are kept in `sample_ts` order, so the cap evicts the true oldest, and an
+equal-timestamp one goes through dedupe. SPEC §5/§6 and V22/V25 match. See
+docs/DECISIONS/2026-10-14-man174-deferred-beacon-merge-bookkeeping.md.
+
+MAN-192: the HSMM decoder reseeds after a committed Silence segment, not
+only on a present re-onset (SPEC v2 §4.7's second trigger), carrying the
+closing segment in `HistEntry::closing_segment` and a scored-prefix
+count (`scored_live_len`) that replaces the zero-score seed heuristic in
+`best_u`/`finish`. No cooldown: every distinct committed Silence
+reseeds; snapshots stay within `beam + seed set`. The `hsmm` engine
+stays non-default with its stage-2 gate still failing. See
+docs/DECISIONS/2026-10-14-man192-silence-reseed.md.
+
+MAN-95: `[spot].validation_level` defaults to `normal`: common, listed and
+unlisted callsign patterns need 2, 3 and 5 distinct-message repetitions.
+`minimal` keeps flat 2. The independent list derived from MASTER.SCP is
+replaced by `--patterns` / `[spot].pattern_path`; allowlist and beacon
+exemptions stay. Live decisions report `requiredReps` and `patternTier`.
+See docs/DECISIONS/2026-10-14-man95-pattern-rarity-repetition-tiers.md.
+
 ## Documents (read in this order)
 
+- `docs/README.md` — where operators, contributors and researchers each
+  start; every runbook and reference doc
 - `README.md` — goals and non-goals
 - `ARCHITECTURE.md` — 9-crate workspace, data flow, channelizer/decoder/
   validation/output design
@@ -129,7 +302,8 @@ descriptive and always loses conflicts with code and docs/.
 - CPU budget: full 192 kS/s passband within one Raspberry Pi 4 core, enforced
   by criterion benches.
 - JSON spot schema is an ecosystem contract — belongs in the `dispensa` repo
-  (ADR pending), not solely here.
+  (ADR-0011 `spots.v1`), not solely here. dispensa is private, so
+  `docs/SPOT-SCHEMA.md` is the in-repo field reference.
 - No GUI: daemon + CLI. Outputs: RBN-format cluster telnet (:7300) and JSON
   Lines/WebSocket (:7301) for cqdx ingest.
 - M0 testkit generates its own ref-bandwidth AWGN (see
@@ -154,6 +328,9 @@ in other clones, branches, or worktrees.
 - **Flush at the end:** push (`--force-with-lease` only) and open/update your
   PR before finishing. Unpushed work is invisible work.
 - **Main moves only by PR merge.**
+- **PR titles are commit subjects:** squash merge uses the title, so it must
+  read `<type>(<scope>): <subject>`; the `PR title` check enforces it
+  (MAN-156).
 - **Auto-merge is on, repo-wide** (overrides the global "Tony merges"
   default for this repo specifically): every PR gets `gh pr merge --auto
   --squash` right after opening; GitHub merges it unattended once required

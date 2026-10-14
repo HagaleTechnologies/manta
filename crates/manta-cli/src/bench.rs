@@ -601,6 +601,7 @@ fn event_track_id(e: &DecoderEvent) -> u32 {
         | DecoderEvent::WordBoundary { track_id, .. }
         | DecoderEvent::SpeedUpdate { track_id, .. }
         | DecoderEvent::TrackMeta { track_id, .. }
+        | DecoderEvent::TimingUpdate { track_id, .. }
         | DecoderEvent::TrackPromoted { track_id, .. }
         | DecoderEvent::TrackClosed { track_id, .. } => *track_id,
     }
@@ -1190,6 +1191,9 @@ mod tests {
             text: String::new(),
             events,
             spots,
+            timing: None,
+            rtty: Vec::new(),
+            sample_rate_hz: 192_000.0,
         }
     }
 

@@ -78,10 +78,15 @@ jobs:
   # `gh api repos/HagaleTechnologies/manta/rulesets`) need to land on the PR's OWN head commit,
   # so this job creates them explicitly via the Checks API instead, matching the exact names
   # GitHub's own matrix-strategy check-run naming produces natively -- the same pattern
-  # cqdx/widdershins/vanity use for their own single "CI" fan-in check, adapted here for TWO
-  # independent required matrix legs instead of one aggregate. push/merge_group need none of
+  # cqdx/widdershins/vanity use for their own single "CI" fan-in check, adapted here for
+  # independent matrix legs instead of one aggregate. push/merge_group need none of
   # this: github.sha there already names the real commit under test, so this job is skipped
   # entirely and the native per-job check-run attribution is already correct.
+  #
+  # MAN-156: it creates THREE check-runs. "test (windows-latest)" is not required, but without it
+  # a trusted PR never shows its Windows result -- that is how MAN-301's Windows-only regression
+  # (dispatched run 38244914017) merged with green PR checks. The ruleset can require it later
+  # with no workflow change (docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md, step O5).
   #
   # HAG-106/HAG-108: the check-runs are written with a hagale-agent App token, not
   # github.token. A github.token POST lands in the OLDEST github-actions check suite on the SHA
@@ -98,6 +103,7 @@ jobs:
     outputs:
       ubuntu_check_id: ${{ steps.create.outputs.ubuntu_check_id }}
       macos_check_id: ${{ steps.create.outputs.macos_check_id }}
+      windows_check_id: ${{ steps.create.outputs.windows_check_id }}
     steps:
       - name: Mint a hagale-agent installation token for the test check-runs
         id: app-token
@@ -120,6 +126,14 @@ jobs:
             -f name="test (macos-latest)" -f head_sha="$HEAD_SHA" -f status="in_progress" --jq '.id')
           echo "ubuntu_check_id=$ubuntu_id" >> "$GITHUB_OUTPUT"
           echo "macos_check_id=$macos_id" >> "$GITHUB_OUTPUT"
+          # MAN-156: the Windows check-run is not required, so failing to create it must not cost
+          # the two required ones their relay; relay-check-runs warns and skips an empty id.
+          windows_id=$(gh api -X POST "repos/$REPO/check-runs" \
+            -f name="test (windows-latest)" -f head_sha="$HEAD_SHA" -f status="in_progress" --jq '.id') || {
+            echo "::warning::Could not create the test (windows-latest) check-run; this PR will not show its Windows result."
+            windows_id=""
+          }
+          echo "windows_check_id=$windows_id" >> "$GITHUB_OUTPUT"
 
   # No longer gated on codex-clean (HAG-46): this whole workflow only ever gets
   # workflow_dispatch'd once wait-for-codex.yml's codex-review-response job has already
@@ -196,6 +210,14 @@ jobs:
       # fixed by hand in #209). To fix a red run, build once locally without
       # --locked and commit the updated Cargo.lock. fmt never reads the lockfile.
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # MAN-156: a broken intra-doc link, an unclosed HTML tag or a bare URL in rustdoc fails the
+      # build instead of scrolling past (48 had accumulated unnoticed). Linux only: rustdoc's lints
+      # do not depend on the host, and this rides the already-required `test (ubuntu-latest)` check.
+      # manta-cli's clap help text is exempt in its own main.rs.
+      - if: runner.os == 'Linux'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --workspace --locked
       - run: cargo test --workspace --locked
       # MAN-65: the release pipeline's tag grammar and :latest recency
       # logic are testable without pushing a tag, and this rides the
@@ -224,6 +246,14 @@ jobs:
           py=python3
           if [ "${{ runner.os }}" = "Windows" ]; then py=python; fi
           "$py" -m unittest scripts.tests.test_package_release -v
+      # MAN-301: score-against-rbn.py --node-log's wrapper around `manta grade` (stub binary).
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_score_against_rbn_replay -v
+      # MAN-156: dependency, rustdoc, Windows-release and PR-title gates (workflow wiring and scripts).
+      # Linux only: these tests read workflow text and run pure functions, so the host adds nothing,
+      # and DenyPolicyTests needs tomllib (Python 3.11+), which ubuntu-latest's python3 has.
+      - if: runner.os == 'Linux'
+        run: python3 -m unittest scripts.tests.test_ci_gates -v
   # Same MAN-243 routing as `test` above (Dependabot plus every PR wait-for-codex.yml won't
   # dispatch) -- not itself a required check, but matches this job's own pre-migration behavior
   # (ran for a Dependabot PR too, gated only by codex-clean's tolerant skip) rather than silently
@@ -291,8 +321,8 @@ jobs:
   # Relays each matrix leg's OWN real conclusion onto the corresponding explicit check-run
   # create-ci-check made on head_sha -- a job-level `needs.test.result` alone is a single
   # aggregate across every matrix combination (success only if ALL legs succeeded), which
-  # cannot tell "ubuntu passed, macos failed" apart from "both failed"; the two required
-  # checks need their OWN independent, accurate conclusions. Looks up each leg's real
+  # cannot tell "ubuntu passed, macos failed" apart from "both failed"; each minted
+  # check-run needs its OWN independent, accurate conclusion. Looks up each leg's real
   # conclusion from the Jobs API by its exact display name instead.
   relay-check-runs:
     name: Relay test results onto the reviewed SHA's check-runs
@@ -319,6 +349,7 @@ jobs:
           REPO: ${{ github.repository }}
           UBUNTU_CHECK_ID: ${{ needs.create-ci-check.outputs.ubuntu_check_id }}
           MACOS_CHECK_ID: ${{ needs.create-ci-check.outputs.macos_check_id }}
+          WINDOWS_CHECK_ID: ${{ needs.create-ci-check.outputs.windows_check_id }}
         run: |
           jobs_json=$(gh api --paginate "repos/$REPO/actions/runs/${{ github.run_id }}/jobs")
           relay() {
@@ -337,3 +368,4 @@ jobs:
           }
           relay "test (ubuntu-latest)" "$UBUNTU_CHECK_ID"
           relay "test (macos-latest)" "$MACOS_CHECK_ID"
+          relay "test (windows-latest)" "$WINDOWS_CHECK_ID"

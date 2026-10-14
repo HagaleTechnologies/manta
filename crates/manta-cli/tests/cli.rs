@@ -101,17 +101,36 @@ fn assert_rejected_before_source_io(what: &str, out: &Output, needles: &[&str]) 
     for needle in needles {
         assert!(stderr.contains(needle), "{what}: no {needle:?} in {stderr}");
     }
+    // MAN-126: `doctor` reports a source that will not open as a check
+    // line on stdout, so stdout must be clean too.
+    let stdout = String::from_utf8_lossy(&out.stdout);
     for io in ["open WAV", "No such file", "os error 2"] {
         assert!(
             !stderr.contains(io),
             "{what}: the config must be rejected before any source I/O: {stderr}"
         );
+        assert!(
+            !stdout.contains(io),
+            "{what}: the config must be rejected before any source I/O: {stdout}"
+        );
     }
 }
 
-/// `run`, `decode`, `soak` and `doctor`, each given `--config cfg` and a
-/// nonexistent WAV, so a config error is the only way to fail before I/O.
-fn every_config_command(cfg: &Path) -> [(&'static str, Command); 4] {
+/// A UDP port nothing answers on: `doctor --ntp-server 127.0.0.1:<it>`
+/// keeps the clock check off the internet (MAN-126).
+fn closed_ntp_server() -> String {
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    format!("127.0.0.1:{port}")
+}
+
+/// `run`, `decode`, `soak`, `doctor` and `calibrate`, each given `--config
+/// cfg` and a nonexistent WAV, so a config error is the only way to fail
+/// before I/O.
+fn every_config_command(cfg: &Path) -> [(&'static str, Command); 5] {
     let mut run = manta();
     run.args([
         "run",
@@ -148,11 +167,22 @@ fn every_config_command(cfg: &Path) -> [(&'static str, Command); 4] {
             "--config",
         ])
         .arg(cfg);
+    let mut calibrate = manta();
+    calibrate
+        .args([
+            "calibrate",
+            "--source",
+            "/nonexistent.wav",
+            "--source-iq",
+            "--config",
+        ])
+        .arg(cfg);
     [
         ("run", run),
         ("decode", decode),
         ("soak", soak),
         ("doctor", doctor),
+        ("calibrate", calibrate),
     ]
 }
 
@@ -212,6 +242,65 @@ fn gen_then_decode_prints_text() {
     );
 }
 
+/// MAN-315 scenario 3: `manta decode --timing` prints the primary track's
+/// learned sender timing on stderr, after the summary line; stdout stays the
+/// decoded text alone, and without `--timing` stderr is the summary alone
+/// (MAN-270). With `--json`, the report's top-level `timing` carries it.
+#[test]
+fn decode_prints_timing_line_for_primary_track() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::VectorSpec {
+        duration_s: 15.0,
+        ..manta_testkit::vectors::v1()
+    };
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let wav = dir.path().join("v1.wav");
+
+    let out = manta().arg("decode").arg(&wav).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert!(!stderr.contains("timing"), "stderr: {stderr}");
+
+    let out = manta()
+        .args(["decode", "--timing"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "stdout: {stdout:?}");
+    assert!(!stdout.contains("timing"), "stdout: {stdout:?}");
+    let lines: Vec<&str> = stderr.lines().collect();
+    let summary = lines
+        .iter()
+        .position(|l| l.starts_with("frequency: "))
+        .expect("no summary line");
+    assert_eq!(lines.len(), summary + 2, "stderr: {stderr}");
+    assert!(
+        lines[summary + 1].starts_with("timing (dits, mean ± sd): dot "),
+        "stderr: {stderr}"
+    );
+    assert!(
+        lines[summary + 1].contains("  word gap "),
+        "stderr: {stderr}"
+    );
+
+    let out = manta()
+        .args(["decode", "--json"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(report["timing"]["dash"]["mean_dits"].as_f64().is_some());
+    assert!(report["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["event"] == "TimingUpdate"));
+}
+
 #[test]
 fn gen_subcommand_writes_fixture_set() {
     let dir = tempfile::tempdir().unwrap();
@@ -240,6 +329,11 @@ fn unknown_vector_errors() {
         .output()
         .unwrap();
     assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("vr7-vr8, vw1-vw5)"),
+        "the error lists MAN-315's VW vectors: {stderr}"
+    );
 }
 
 /// `Engine::Hsmm` is a fully implemented, reviewed engine since Task 8
@@ -778,7 +872,8 @@ fn doctor_accepts_and_applies_dial_freq_hz_for_an_audio_source() {
     let out = manta()
         .args(["doctor", "--duration", "3", "--json", "--source"])
         .arg(&wav)
-        .args(["--dial-freq-hz", "14030000"])
+        .args(["--dial-freq-hz", "14030000", "--ntp-server"])
+        .arg(closed_ntp_server())
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1200,6 +1295,119 @@ fn decode_json_includes_spots_field() {
     );
 }
 
+/// MAN-314: writes a 25 s, 96 kHz WAV holding one 30 dB, 170 Hz RTTY
+/// signal (mark 15 kHz above a 14.07 MHz centre) and returns its path.
+fn write_rtty_wav(dir: &Path) -> PathBuf {
+    let fs = 96_000.0;
+    let (mut iq, _) = manta_testkit::scene::render_scene(&[], fs, 25.0, Some(5)).unwrap();
+    manta_testkit::fsk::add_fsk(
+        &mut iq,
+        fs,
+        &manta_testkit::fsk::FskSpec {
+            mark_offset_hz: 15_000.0,
+            shift_hz: 170.0,
+            baud: 45.45,
+            snr_2500_db: 30.0,
+            text: "CQ TEST DE W1AW W1AW RYRYRY 599 001 ".into(),
+            start_s: 0.0,
+            watterson: None,
+            seed: 1,
+        },
+    );
+    manta_testkit::wav::write_fixture(dir, "rtty", &iq, fs, 14_070_000.0).unwrap()
+}
+
+#[test]
+fn decode_json_has_rtty_array() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = short_v1();
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let out = manta()
+        .args(["decode", "--json"])
+        .arg(dir.path().join(format!("{}.wav", spec.name)))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["rtty"], serde_json::json!([]));
+
+    let wav = write_rtty_wav(dir.path());
+    let out = manta()
+        .args(["decode", "--json"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rtty = report["rtty"].as_array().unwrap();
+    assert_eq!(rtty.len(), 1, "{report}");
+    assert_eq!(rtty[0]["shift_hz"], 170.0);
+    assert!(rtty[0]["cleared_sample_ts"].is_null());
+}
+
+#[test]
+fn decode_plain_prints_rtty_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = short_v1();
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let out = manta()
+        .arg("decode")
+        .arg(dir.path().join(format!("{}.wav", spec.name)))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    // No RTTY, no line: MAN-270 keeps a CW-only decode's summary one line.
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("rtty:"));
+
+    let wav = write_rtty_wav(dir.path());
+    let out = manta().arg("decode").arg(&wav).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("rtty: 1 ("), "{stderr}");
+    assert!(stderr.contains("shift 170 Hz"), "{stderr}");
+}
+
+/// Codex review on PR #272: `run`'s `RTTY cleared` line counts the
+/// recording's time, not the wall time a faster-than-real-time file replay
+/// took. The signal is marked about 21 s into the 25 s file and cleared at
+/// its end.
+#[test]
+fn run_logs_rtty_marked_for_in_stream_seconds() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = write_rtty_wav(dir.path());
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(&wav)
+        .arg("--source-iq")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("RTTY cleared:"))
+        .unwrap_or_else(|| panic!("no RTTY cleared line: {stderr}"));
+    let secs: u64 = line
+        .split("marked for ")
+        .nth(1)
+        .and_then(|rest| rest.strip_suffix(" s"))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("unparsable line: {line}"));
+    assert!((3..=5).contains(&secs), "{line}");
+}
+
 /// MAN-28 Watch List: an operator running `manta decode` on a real
 /// recording must be able to force-spot a callsign that fails automatic
 /// validation, via `--allowlist`. `decode` is the only subcommand
@@ -1482,6 +1690,98 @@ fn hpsdr_host_conflicts_with_kiwi_host() {
         stderr.contains("cannot be used with"),
         "expected a clap conflict error, got: {stderr}"
     );
+}
+
+/// MAN-140: `--ka9q-group` is a source selector like the others, so naming
+/// another source with it is clap's conflict error (exit 2), before any I/O.
+#[test]
+fn ka9q_group_conflicts_with_every_other_source_flag() {
+    #[allow(unused_mut)]
+    let mut others: Vec<Vec<&str>> = vec![
+        vec!["--kiwi-host", "x", "--kiwi-freq-hz", "7030000"],
+        vec!["--device", "USB Audio"],
+        vec!["--source", "v1.wav"],
+    ];
+    #[cfg(feature = "hpsdr")]
+    others.push(vec![
+        "--hpsdr-host",
+        "192.168.1.100",
+        "--hpsdr-freq-hz",
+        "14000000",
+        "--hpsdr-rate-hz",
+        "192000",
+    ]);
+    #[cfg(feature = "soapy")]
+    others.push(vec![
+        "--soapy-driver",
+        "driver=rtlsdr",
+        "--soapy-freq-hz",
+        "14000000",
+        "--soapy-rate-hz",
+        "192000",
+    ]);
+    for other in &others {
+        for order in [true, false] {
+            let mut args = vec!["run"];
+            if order {
+                args.extend(["--ka9q-group", "239.1.2.3"]);
+                args.extend(other.iter().copied());
+            } else {
+                args.extend(other.iter().copied());
+                args.extend(["--ka9q-group", "239.1.2.3"]);
+            }
+            let out = manta().args(&args).output().unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+            assert!(
+                stderr.contains("cannot be used with"),
+                "{args:?}: expected a clap conflict error, got: {stderr}"
+            );
+        }
+    }
+}
+
+/// MAN-140: `--ka9q-port`, `--ka9q-ssrc` and `--ka9q-interface` describe the
+/// group's channel, so each needs `--ka9q-group`.
+#[test]
+fn ka9q_port_ssrc_interface_require_the_group() {
+    for (flag, value) in [
+        ("--ka9q-port", "5004"),
+        ("--ka9q-ssrc", "14100000"),
+        ("--ka9q-interface", "192.168.1.20"),
+    ] {
+        let out = manta().args(["run", flag, value]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{flag}: {stderr}");
+        assert!(
+            stderr.contains("the following required arguments were not provided")
+                && stderr.contains("--ka9q-group"),
+            "{flag}: expected clap's missing --ka9q-group error, got: {stderr}"
+        );
+    }
+}
+
+/// MAN-140: every command that opens a live source takes the four
+/// `--ka9q-*` flags under their own help heading (`listen` is `run`'s alias).
+#[test]
+fn every_live_command_takes_the_ka9q_flags() {
+    for command in ["run", "listen", "soak", "doctor", "calibrate", "check"] {
+        let out = manta().args([command, "--help"]).output().unwrap();
+        assert!(out.status.success(), "{command} --help failed");
+        let help = String::from_utf8_lossy(&out.stdout);
+        for needle in [
+            "ka9q-radio source:",
+            "--ka9q-group <KA9Q_GROUP>",
+            "--ka9q-port <KA9Q_PORT>",
+            "--ka9q-ssrc <KA9Q_SSRC>",
+            "--ka9q-interface <KA9Q_INTERFACE>",
+        ] {
+            assert!(
+                help.contains(needle),
+                "`manta {command} --help` lacks {needle:?}:\n{help}"
+            );
+        }
+    }
 }
 
 /// MAN-135 renamed the Hz-valued flags to a consistent `-hz` suffix and
@@ -2078,7 +2378,8 @@ fn out_of_range_freq_correction_ppm_in_input_is_rejected_like_the_flag() {
     }
 }
 
-/// MAN-261 scenario 3 (table) on the two commands that gained `--config`.
+/// MAN-261 scenario 3 (table) on the commands that gained `--config`:
+/// soak, doctor and (MAN-127) calibrate.
 #[test]
 fn unknown_table_in_config_fails_for_soak_and_doctor() {
     let dir = tempfile::tempdir().unwrap();
@@ -2223,6 +2524,8 @@ fn doctor_reports_center_freq_hz_from_the_config_file() {
     let out = manta()
         .args(["doctor", "--duration", "3", "--json", "--config"])
         .arg(&cfg)
+        .arg("--ntp-server")
+        .arg(closed_ntp_server())
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -2255,34 +2558,67 @@ fn soak_runs_from_a_config_file_source() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stderr: {stderr}");
-    assert!(stderr.contains("SoakReport"), "stderr: {stderr}");
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("soak: passed\nevents: "));
 }
 
-/// MAN-261 D7: `soak` and `doctor` never start the spot servers; a
-/// `[server]` table in their config earns a note instead.
+/// MAN-261 D7: `soak` never starts the spot servers; a `[server]` table in
+/// its config earns a note instead. MAN-126 D10
+/// (docs/DECISIONS/2026-10-10-man126-doctor-setup-checks.md): `doctor` now
+/// checks `[server]`'s ports instead of ignoring the table, still starting
+/// no server; every port here is 0, so each port row is a SKIP.
 #[test]
-fn soak_and_doctor_note_an_ignored_server_table() {
+fn soak_notes_an_ignored_server_table_and_doctor_checks_its_ports() {
     let dir = tempfile::tempdir().unwrap();
     v1_fixture(dir.path());
     let cfg = write_cfg(
         dir.path(),
         "manta.toml",
-        &format!("{SERVER_TOML}[input]\ntype = \"file\"\npath = \"v1.wav\"\niq = true\n"),
+        &format!(
+            "{SERVER_TOML}[input]\ntype = \"file\"\npath = \"v1.wav\"\niq = true\n\
+             center_freq_hz = 7030000.0\n"
+        ),
     );
 
-    for args in [
-        ["soak", "--duration", "2", "--config"].as_slice(),
-        ["doctor", "--duration", "3", "--json", "--config"].as_slice(),
-    ] {
-        let out = manta().args(args).arg(&cfg).output().unwrap();
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(out.status.success(), "{}: stderr: {stderr}", args[0]);
-        assert!(
-            stderr.contains("does not start the spot servers"),
-            "{}: stderr: {stderr}",
-            args[0]
-        );
-        assert!(!stderr.contains("telnet="), "{}: {stderr}", args[0]);
+    let out = manta()
+        .args(["soak", "--duration", "2", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "soak: stderr: {stderr}");
+    assert!(
+        stderr.contains("does not start the spot servers"),
+        "soak: stderr: {stderr}"
+    );
+    assert!(!stderr.contains("telnet="), "soak: {stderr}");
+
+    let out = manta()
+        .args(["doctor", "--duration", "3", "--json", "--config"])
+        .arg(&cfg)
+        .arg("--ntp-server")
+        .arg(closed_ntp_server())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "doctor: stdout: {stdout} stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("does not start the spot servers"),
+        "doctor: stderr: {stderr}"
+    );
+    assert!(!stderr.contains("telnet="), "doctor: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let checks = report["checks"].as_array().unwrap();
+    for name in ["telnet port", "json port", "metrics port"] {
+        let row = checks
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("no {name} row in {report}"));
+        assert_eq!(row["status"], "skip", "{row}");
     }
 }
 
@@ -2516,7 +2852,7 @@ fn status_with_a_missing_server_config_fails_with_exit_code_two_not_one() {
             "`manta status {spelling}` stderr: {stderr}"
         );
         assert!(
-            stderr.contains("manta status:") && stderr.contains("/nonexistent/manta.toml"),
+            stderr.contains("error:") && stderr.contains("/nonexistent/manta.toml"),
             "`manta status {spelling}` must fail reading the config, not on clap usage: {stderr}"
         );
     }
@@ -2535,6 +2871,7 @@ fn qq9_fixture(dir: &Path) -> (PathBuf, PathBuf) {
             manta_spot::CTY_DAT
         ),
     );
+    write_cfg(dir, "patterns-new.lst", "+QQ9@@@\n");
     (wav, cty)
 }
 
@@ -2551,6 +2888,8 @@ fn decode_cty_flag_lets_a_newly_allocated_prefix_spot() {
     let after = manta()
         .args(["decode", "--json", "--cty"])
         .arg(cty)
+        .arg("--patterns")
+        .arg(dir.path().join("patterns-new.lst"))
         .arg(wav)
         .output()
         .unwrap();
@@ -2565,7 +2904,11 @@ fn decode_cty_path_in_a_config_file_lets_a_newly_allocated_prefix_spot() {
     let sub = dir.path().join("config");
     std::fs::create_dir(&sub).unwrap();
     let (wav, _) = qq9_fixture(&sub);
-    let config = write_cfg(&sub, "manta.toml", "[spot]\ncty_path = 'cty-new.dat'\n");
+    let config = write_cfg(
+        &sub,
+        "manta.toml",
+        "[spot]\ncty_path = 'cty-new.dat'\npattern_path = 'patterns-new.lst'\n",
+    );
     let out = manta()
         .current_dir(dir.path())
         .args(["decode", "--json", "--config"])
@@ -2586,6 +2929,10 @@ fn run_reads_cty_path_from_the_environment() {
         .args(["run", "--json", "--source-iq", "--source"])
         .arg(wav)
         .env("MANTA_SPOT_CTY_PATH", cty)
+        .env(
+            "MANTA_SPOT_PATTERN_PATH",
+            dir.path().join("patterns-new.lst"),
+        )
         .output()
         .unwrap();
     assert!(
@@ -2640,4 +2987,255 @@ fn decode_never_prints_the_cty_age_warning() {
         .unwrap();
     assert!(out.status.success());
     assert!(!String::from_utf8_lossy(&out.stderr).contains("built-in cty.dat"));
+}
+
+// ---- MAN-269: IQ WAV rate ceiling, and paced/looping file replay
+
+/// A float32 stereo WAV header declaring `rate` and four frames of silence:
+/// 108 bytes, written by hand because `hound::WavWriter` is not the thing
+/// under test and might refuse an absurd rate.
+fn header_only_iq_wav(path: &Path, rate: u32) {
+    let frames = 4u32;
+    let data_len = frames * 8;
+    let mut b = Vec::new();
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(36 + data_len).to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    b.extend_from_slice(&16u32.to_le_bytes());
+    b.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
+    b.extend_from_slice(&2u16.to_le_bytes()); // I, Q
+    b.extend_from_slice(&rate.to_le_bytes());
+    b.extend_from_slice(&rate.wrapping_mul(8).to_le_bytes());
+    b.extend_from_slice(&8u16.to_le_bytes());
+    b.extend_from_slice(&32u16.to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&data_len.to_le_bytes());
+    b.resize(b.len() + data_len as usize, 0);
+    std::fs::write(path, b).unwrap();
+}
+
+/// 393 216 000 Hz = 93.75 * 2^22 is shape-valid for the channelizer, so
+/// before MAN-269 it reached `FloorBank::new`'s 3.36 GB allocation and
+/// aborted (exit 134) or was SIGKILLed (137).
+fn assert_rate_bomb_is_refused(out: &Output) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("at most 10000000 Hz"), "stderr: {stderr}");
+    assert!(stderr.contains("393216000 Hz"), "stderr: {stderr}");
+    assert!(!stderr.contains("memory allocation"), "stderr: {stderr}");
+}
+
+#[test]
+fn run_rejects_an_iq_wav_whose_declared_rate_would_exhaust_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("bomb.wav");
+    header_only_iq_wav(&wav, 393_216_000);
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(&wav)
+        .arg("--source-iq")
+        .output()
+        .unwrap();
+    assert_rate_bomb_is_refused(&out);
+}
+
+/// MAN-269 review (P2): with `[server]` and no dial frequency, `run`'s dial
+/// guard used to report "--dial-freq-hz is required" for an over-rate IQ WAV
+/// (its open error was read as "no RF frequency"), hiding the rate error.
+#[test]
+fn daemon_run_reports_the_rate_error_not_the_dial_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("bomb.wav");
+    header_only_iq_wav(&wav, 393_216_000);
+    std::fs::write(
+        dir.path().join("bomb.json"),
+        "{\"center_freq_hz\": 14030000.0}",
+    )
+    .unwrap();
+    let cfg = write_cfg(dir.path(), "server.toml", SERVER_TOML);
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(&wav)
+        .arg("--source-iq")
+        .arg("--config")
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert_rate_bomb_is_refused(&out);
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("--dial-freq-hz is required"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn decode_rejects_an_iq_wav_whose_declared_rate_would_exhaust_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("bomb.wav");
+    header_only_iq_wav(&wav, 393_216_000);
+    let out = manta().arg("decode").arg(&wav).output().unwrap();
+    assert_rate_bomb_is_refused(&out);
+}
+
+/// `dir/v1.wav`: V1 rendered for `duration_s` seconds.
+fn v1_of(dir: &Path, duration_s: f64) -> PathBuf {
+    write_fixture(
+        dir,
+        &manta_testkit::vectors::VectorSpec {
+            duration_s,
+            ..manta_testkit::vectors::v1()
+        },
+    )
+}
+
+/// `run --source <wav> --source-iq --json <extra>`: its output and wall time.
+fn replay_json(wav: &Path, extra: &[&str]) -> (Output, std::time::Duration) {
+    let start = std::time::Instant::now();
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(wav)
+        .args(["--source-iq", "--json"])
+        .args(extra)
+        .output()
+        .unwrap();
+    let took = start.elapsed();
+    assert!(
+        out.status.success(),
+        "run {extra:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out, took)
+}
+
+#[test]
+fn realtime_replay_is_byte_identical_to_unpaced_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_of(dir.path(), 8.0);
+    let (unpaced, _) = replay_json(&wav, &[]);
+    let unpaced_stdout = String::from_utf8(unpaced.stdout).unwrap();
+    assert!(
+        unpaced_stdout.contains("\"CharDecoded\""),
+        "premise: an 8 s V1 decodes characters, so equality below means something:\n\
+         {unpaced_stdout}"
+    );
+    let (paced, took) = replay_json(&wav, &["--realtime"]);
+    assert_eq!(String::from_utf8(paced.stdout).unwrap(), unpaced_stdout);
+    // Lower bound only: an 8 s recording cannot finish sooner than 8 s.
+    assert!(
+        took >= std::time::Duration::from_secs_f64(7.5),
+        "an 8 s --realtime replay took only {took:?}"
+    );
+}
+
+#[test]
+fn realtime_paces_a_decimated_replay_at_the_decimated_rate() {
+    // Pacing against the 96 kS/s file rate instead of the 48 kS/s decimated
+    // rate would finish this 4 s recording in about 2 s.
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_of(dir.path(), 4.0);
+    let (unpaced, _) = replay_json(&wav, &["--capture-rate-hz", "48000"]);
+    let (paced, took) = replay_json(&wav, &["--capture-rate-hz", "48000", "--realtime"]);
+    assert_eq!(
+        String::from_utf8(paced.stdout).unwrap(),
+        String::from_utf8(unpaced.stdout).unwrap()
+    );
+    assert!(
+        took >= std::time::Duration::from_secs_f64(3.5),
+        "a 4 s decimated --realtime replay took only {took:?}"
+    );
+}
+
+#[test]
+fn realtime_with_a_live_source_fails_before_any_io() {
+    for (flag, message) in [
+        ("--realtime", "--realtime only applies to a file replay"),
+        ("--loop", "--loop only applies to a file replay"),
+    ] {
+        let out = manta()
+            .args(["run", "--device", "manta-test-no-such-device", flag])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{flag}: {stderr}");
+        assert!(stderr.contains(message), "{flag}: {stderr}");
+    }
+}
+
+#[test]
+fn soak_ignores_input_realtime_with_a_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_of(dir.path(), 4.0);
+    let cfg = write_cfg(
+        dir.path(),
+        "soak.toml",
+        &format!(
+            "[input]\ntype = \"file\"\npath = '{}'\niq = true\nrealtime = true\n",
+            wav.display()
+        ),
+    );
+    let out = manta()
+        .args(["soak", "--duration", "1", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "note: soak replays files as fast as it can; ignoring input.realtime/input.loop from"
+        ),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn decode_refuses_invalid_and_empty_pattern_files_before_source_io() {
+    let dir = tempfile::tempdir().unwrap();
+    for (contents, expected) in [
+        ("+K5@@@\nK5ARH;\n", "line 2"),
+        ("# empty\n", "contains no patterns"),
+    ] {
+        let path = write_cfg(dir.path(), "bad.lst", contents);
+        let out = manta()
+            .args(["decode", "--patterns"])
+            .arg(path)
+            .arg("does-not-exist.wav")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("bad.lst") && err.contains(expected), "{err}");
+    }
+}
+
+#[test]
+fn decode_minimal_config_spots_an_unlisted_pattern() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, _) = qq9_fixture(dir.path());
+    let normal = write_cfg(
+        dir.path(),
+        "normal.toml",
+        "[spot]\ncty_path = 'cty-new.dat'\n",
+    );
+    let minimal = write_cfg(
+        dir.path(),
+        "minimal.toml",
+        "[spot]\ncty_path = 'cty-new.dat'\nvalidation_level = 'minimal'\n",
+    );
+    let normal_out = manta()
+        .args(["decode", "--json", "--config"])
+        .arg(normal)
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(decode_spots(&normal_out).is_empty());
+    let minimal_out = manta()
+        .args(["decode", "--json", "--config"])
+        .arg(minimal)
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(decode_spots(&minimal_out)
+        .iter()
+        .any(|s| s["callsign"] == "QQ9ZZZ"));
 }

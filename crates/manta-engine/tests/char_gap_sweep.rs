@@ -112,6 +112,8 @@ fn run_case(rng: &mut Rng) -> Option<(String, f32, i32, f32, f64)> {
     let (probe_env, _) = key_text(&text, &KeyerSpec::new(wpm), fs).unwrap();
     let duration_s = (probe_env.len() as f64 / fs + 1.5).max(12.0);
     let sig = SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: text.clone(),
         loop_text: true,
         wpm,

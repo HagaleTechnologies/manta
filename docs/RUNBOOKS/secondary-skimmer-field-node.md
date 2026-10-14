@@ -30,10 +30,19 @@ The evidence files, all on the node:
 |---|---|---|
 | `/var/lib/manta-field/ledger.jsonl` | `manta-field-ledger.service` | one sample per minute (`/healthz`, `/metrics`), notes, watchdog recoveries |
 | `/var/lib/manta-field/spots/spots-YYYY-MM-DD.jsonl` | `manta-field-spots.service` | every spot from the JSON Lines port, verbatim, one file per UTC day |
+| `/var/lib/manta-field/spots/grades-YYYY-MM-DD.jsonl` | `manta-field-spots.service` | only with `[rbn_compare]` enabled (MAN-301): every `spotGrade` record from the JSON Lines port, verbatim, one file per UTC day of its `windowClose` |
 
 The tools are [`scripts/field-node.py`](../../scripts/field-node.py) and
 [`scripts/shadow-compare.py`](../../scripts/shadow-compare.py). For what `/healthz` and each
 `/metrics` family mean, see [node-health.md](node-health.md).
+
+With `[rbn_compare]` enabled, the JSON Lines port also carries one grade line per spot,
+marked `"kind":"spotGrade"`. `record-spots` writes those to the `grades-*.jsonl` files and
+counts them, never to `spots-*.jsonl`. `shadow-compare.py` skips a grade line found in a
+`spots-*.jsonl` file and reports how many it skipped on its "Node spots" input line, so
+grades never count as spots. The grades and what they mean are in
+[rbn-comparison.md](rbn-comparison.md); `manta grade` replays the `spots/` directory against
+an unzipped RBN archive with the same grading code.
 
 ## 2. Before you start
 
@@ -193,7 +202,10 @@ With `manta-field.service` stopped (only one process can open the SDR):
 sudo -u manta manta doctor --config /etc/manta/manta-field.toml --duration 120
 ```
 
-The verdict must be `DECODING`. A confirmed spot alone is not proof of a real signal. If the
+Every check line must be `PASS` or `SKIP` (doctor exits 0 only when no check fails; a `WARN`
+clock line still needs fixing before Stage 1, because spot times go to RBN), and the verdict must
+be `DECODING`. See [setup-checks](setup-checks.md) for each check and its fix. A confirmed spot
+alone is not proof of a real signal. If the
 verdict is anything else, or the spots look wrong, follow
 [live-hardware-field-testing](../../wiki/pages/live-hardware-field-testing.md) in order: the
 gain-is-attenuation sweep first, then the raw channelizer power check against a known carrier
@@ -280,8 +292,26 @@ by every `deCall` it saw) reported that call within the tolerances. Look at the
 `## Node-only, uncorroborated` list too: repeated fixed-frequency busts point at a decoder or RF
 problem, not at stations only this node heard.
 
-Frequency calibration: in `shadow-compare`'s `## Calibration` table, the `Freq delta (Hz)` row's
-`Median` column is the signed median Δf, node minus primary. If its magnitude is over 20 Hz, set
+Frequency calibration: when the node's receiver can hear a time signal (WWV, WWVH, BPM, RWM) or an
+NCDXF beacon, prefer `manta calibrate`. It measures the correction against that carrier and, after
+you answer `y`, saves it as `freq_correction_ppm` in `[input]`. The SDR serves one program at a
+time, so record a planned stop, stop the service while it measures, and start it again.
+`--tune-hz 9998500` borrows the receiver at 10 MHz for the measurement only; run it with `sudo`,
+because the config file belongs to root:
+
+```sh
+sudo -u manta python3 /opt/manta/scripts/field-node.py note \
+  --ledger /var/lib/manta-field/ledger.jsonl --kind planned --reason "stage 1 freq calibration"
+sudo systemctl stop manta-field.service
+sudo manta calibrate --config /etc/manta/manta-field.toml --tune-hz 9998500
+manta config check --config /etc/manta/manta-field.toml
+sudo systemctl start manta-field.service
+```
+
+If it finds no carrier, try another time of day, or `--duration 180` for a beacon.
+`shadow-compare` cross-checks the result against the primary, and is the fallback when no
+reference is audible: in its `## Calibration` table, the `Freq delta (Hz)` row's `Median` column
+is the signed median Δf, node minus primary. If its magnitude is over 20 Hz, set
 
 ```
 freq_correction_ppm = -(median Δf) / freq_hz × 1e6
@@ -498,3 +528,8 @@ On FAIL, the report records why. Fix the cause and restart from Stage 2 with a n
   [the MAN-86 record](../DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md)).
 - **`/healthz` says `unhealthy`.** The per-check lines say which source, listener or decode check
   failed; [node-health.md](node-health.md) explains each.
+- **`manta_rtty_signals` stays above 0.** That is normal while the passband covers an RTTY
+  segment: the detector has marked those signals and starts no CW track on them
+  ([the MAN-314 record](../DECISIONS/2026-10-11-man314-rtty-recognition.md)). It covers
+  two-tone FSK only: FT8 around 14074–14077 kHz is *not* recognised and still produces CW
+  tracks that decode garbage.

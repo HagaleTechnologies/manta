@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
 
 [dependencies]
 coppa-dsp = { workspace = true }
@@ -13,3 +17,8 @@ num-complex = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "fsk"
+harness = false

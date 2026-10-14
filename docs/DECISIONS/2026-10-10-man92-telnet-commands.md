@@ -66,8 +66,8 @@ show dx [N | Nm] [BAND band] [CW | RTTY]
 
 One request is evaluated in this order (`telnet::select_history_at`):
 
-1. Start from the bus's retained history: the last **fifty** published spots
-   (`RECENT_HISTORY_CAP`, `bus.rs`). No request can reach further back.
+1. Start from the bus's retained heard-time window, with its floor and ceiling
+   ([MAN-93](2026-10-11-man93-sh-dx-history-window.md)). No request can reach further back.
 2. Keep entries in the requested band and mode. For a minutes query, also keep only entries whose
    heard time (the Zulu time the row shows, `SpotBus::unix_ts_for`) falls within
    `max(0, now − N·60) ≤ heard ≤ now`. Both ends are inclusive, and an entry stamped in the future
@@ -106,7 +106,7 @@ Rows use the configured `[server].line_format` renderer, the same one live spots
 ## Out of scope
 
 This change adds no `help` catalogue, `set/skimmer`, `set/nocq`, Ctrl-D, new decode modes, new
-config keys, deeper history or richer version provenance (git SHA, features). `help` and
+config keys, deeper history (done in MAN-93) or richer version provenance (git SHA, features). `help` and
 `set/skimmer` are answered by the generic `Unknown command` reply. The greeting, `SETT`, `BYE`,
 IAC handling, the JSON and uplink contracts and the spot-line columns are unchanged. Whether a live
 Aggregator tolerates the new control replies has not been measured.

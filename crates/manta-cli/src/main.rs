@@ -1,8 +1,19 @@
 //! `manta` CLI: decode CW from a recorded file or a live receiver, and run
 //! the spotting daemon.
 
+// MAN-156: this binary's `///` comments are clap `--help` and man-page text,
+// printed verbatim, so they keep plain-text placeholders such as `<TABLE>`
+// and `[spot]` that rustdoc would parse as HTML tags and links. CI's
+// `RUSTDOCFLAGS=-D warnings` doc build still applies these lints to every
+// library crate.
+#![allow(
+    rustdoc::broken_intra_doc_links,
+    rustdoc::invalid_html_tags,
+    rustdoc::bare_urls
+)]
+
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use manta_decode::decoder::Engine;
 use manta_engine::{decode_wav, PipelineConfig};
 use manta_input::IqSource;
@@ -10,11 +21,21 @@ use std::path::{Path, PathBuf};
 
 mod bench;
 mod build_info;
+mod calibrate_cmd;
+mod cli_docs;
+mod clock_check;
 mod config;
 mod config_cmd;
+mod config_edit;
 mod devices;
+mod doctor_checks;
+mod fmt;
+mod grade_cmd;
+mod health_cmd;
+mod live_state;
 mod logging;
 mod reconnect;
+mod reload;
 mod source_check;
 mod text_lines;
 use reconnect::ReconnectingSource;
@@ -66,11 +87,22 @@ enum Command {
     /// deterministic: the same file always produces the same output.
     Decode {
         /// Stereo IQ WAV file. Its centre frequency is read from the
-        /// matching `<name>.json` sidecar next to it.
+        /// matching `<name>.json` sidecar next to it, unless
+        /// --center-freq-hz is given.
         path: PathBuf,
+        /// RF centre frequency of the recording, in Hz, overriding its sidecar.
+        ///
+        /// Without this flag or a sidecar, reported frequencies are baseband
+        /// offsets from the recording's centre, and manta prints a warning.
+        #[arg(long, value_name = "HZ", value_parser = parse_center_freq_hz)]
+        center_freq_hz: Option<f64>,
         /// Print the full decode report as one JSON object.
         #[arg(long, help_heading = "Output")]
         json: bool,
+        /// Also print the main signal's learned dot, dash and gap lengths
+        /// (in dits) on stderr. `--json` always includes them.
+        #[arg(long, help_heading = "Output")]
+        timing: bool,
         /// TOML config file; the whole file is validated.
         ///
         /// Its `[decode]` values are the baseline; an explicit --engine
@@ -156,7 +188,7 @@ enum Command {
     /// produces the same file.
     Gen {
         /// Which test recording to generate: v1 to v6, vr1 to vr5, vr6a,
-        /// vr6b, vr7 or vr8.
+        /// vr6b, vr7, vr8, or vw1 to vw5.
         vector: String,
         /// Directory to write `<name>.wav`, `<name>.json` and
         /// `<name>.manifest.json` into.
@@ -182,17 +214,18 @@ enum Command {
         device: Option<String>,
         /// Replay a WAV file instead of listening to a live device.
         ///
-        /// Decoded as fast as the machine manages, not in real time, so a
-        /// 60-second file usually finishes sooner than that. Useful for
-        /// demos and repeatable testing.
+        /// Decoded as fast as the machine manages, so a 60-second file usually
+        /// finishes sooner than that; add --realtime to replay it at its own
+        /// pace, or --loop to keep it playing. Useful for demos and repeatable
+        /// testing.
         #[arg(long, conflicts_with = "device", help_heading = "Audio input")]
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -225,8 +258,8 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -256,8 +289,8 @@ enum Command {
         /// builds made with the `hpsdr` feature.
         #[cfg(feature = "hpsdr")]
         #[arg(help_heading = "HPSDR source")]
-        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
         #[cfg(feature = "hpsdr")]
@@ -288,6 +321,40 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_rate_hz: Option<f64>,
+        /// Multicast data group of a ka9q-radio (radiod) IQ channel
+        ///
+        /// An IPv4 multicast address, or the name in the channel's `data =`
+        /// line (for example cw-20m.local) when this machine resolves mDNS
+        /// names. manta joins the group and reads the channel's sample rate,
+        /// encoding and frequency from radiod's status packets; it does not
+        /// create or retune channels.
+        #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        ka9q_group: Option<String>,
+        /// RTP data port of the group.
+        #[arg(
+            long,
+            default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            value_parser = clap::value_parser!(u16).range(1..),
+            requires = "ka9q_group",
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_port: u16,
+        /// SSRC of the channel to read, when the group carries more than one.
+        #[arg(long, requires = "ka9q_group", help_heading = "ka9q-radio source")]
+        ka9q_ssrc: Option<u32>,
+        /// IPv4 address of the local interface to join the group on. manta
+        /// also joins on 127.0.0.1, for a radiod on this machine.
+        #[arg(
+            long,
+            requires = "ka9q_group",
+            value_parser = clap::value_parser!(std::net::Ipv4Addr),
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_interface: Option<std::net::Ipv4Addr>,
         /// Decimate the source to this sample rate, in Hz, before decoding.
         ///
         /// Must divide the source's own rate by a power of two, and the
@@ -303,6 +370,29 @@ enum Command {
         /// told apart from the WAV header alone, so say which you have.
         #[arg(long)]
         source_iq: bool,
+        /// Replay the file at the recording's own pace instead of as fast as
+        /// possible.
+        ///
+        /// A 120-second file takes 120 seconds, so telnet and JSON clients have
+        /// time to connect and watch spots arrive. The decoded output is the same,
+        /// byte for byte, as an unpaced replay; only its timing changes. Only for
+        /// file replay: a live receiver already runs in real time. Also set by
+        /// input.realtime in the config file.
+        // No `requires = "source"`: the file source can come from the config
+        // file, so the check runs after `resolve` (MAN-269 D4).
+        #[arg(long)]
+        realtime: bool,
+        /// Start the file again from the beginning each time it ends, until
+        /// stopped.
+        ///
+        /// Implies --realtime. Keeps a short recording playing for a demo; stop it
+        /// with Ctrl-C or SIGTERM. The jump from the last sample back to the first
+        /// is not smoothed, and a station already spotted is not spotted again for
+        /// 10 minutes, so a looped recording yields a fresh spot about every 10
+        /// minutes (type sh/dx on the telnet port to list earlier ones). Only for
+        /// file replay. Also set by input.loop in the config file.
+        #[arg(long = "loop")]
+        loop_replay: bool,
         /// Print each decode as a JSON object, one per line, instead of
         /// plain text.
         #[arg(long, help_heading = "Output")]
@@ -321,6 +411,10 @@ enum Command {
         /// Needs a `[server]` table with the station callsign and ports.
         /// Starts the telnet cluster server, the JSON Lines / WebSocket
         /// stream, and the metrics endpoint alongside the decode loop.
+        ///
+        /// On Linux and macOS, SIGHUP makes the running daemon re-read this
+        /// file and apply its [spot] lists and each [[rbn_uplink]] dry_run
+        /// without a restart; other settings need a restart.
         // `--server-config` stays as a hidden alias for the flag's old
         // name; help advertises the canonical spelling only (D11/MAN-77).
         #[arg(long, alias = "server-config", help_heading = "Server")]
@@ -328,9 +422,10 @@ enum Command {
         /// Radio dial frequency, in Hz.
         ///
         /// For a sound card or an ordinary (real-audio) --source WAV this
-        /// becomes the source's centre frequency; for KiwiSDR, SoapySDR and
-        /// HPSDR inputs, and for a --source-iq recording whose sidecar already
-        /// carries a centre frequency, it overrides what the source reports.
+        /// becomes the source's centre frequency; for KiwiSDR, SoapySDR, HPSDR
+        /// and ka9q-radio inputs, and for a --source-iq recording whose
+        /// sidecar already carries a centre frequency, it overrides what the
+        /// source reports.
         /// Required with --config when the input is a sound card or a
         /// real-audio --source WAV, because neither knows what frequency the
         /// radio was on -- without it, spots would be published at the audio
@@ -372,6 +467,8 @@ enum Command {
         #[command(flatten)]
         filters: FilterOpts,
         #[command(flatten)]
+        rbn: RbnCompareOpts,
+        #[command(flatten)]
         logging: logging::LogOpts,
     },
     /// Run the live decoder for a fixed duration as a stability check.
@@ -397,10 +494,10 @@ enum Command {
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -433,8 +530,8 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -464,8 +561,8 @@ enum Command {
         /// builds made with the `hpsdr` feature.
         #[cfg(feature = "hpsdr")]
         #[arg(help_heading = "HPSDR source")]
-        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
         #[cfg(feature = "hpsdr")]
@@ -496,6 +593,40 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_rate_hz: Option<f64>,
+        /// Multicast data group of a ka9q-radio (radiod) IQ channel
+        ///
+        /// An IPv4 multicast address, or the name in the channel's `data =`
+        /// line (for example cw-20m.local) when this machine resolves mDNS
+        /// names. manta joins the group and reads the channel's sample rate,
+        /// encoding and frequency from radiod's status packets; it does not
+        /// create or retune channels.
+        #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        ka9q_group: Option<String>,
+        /// RTP data port of the group.
+        #[arg(
+            long,
+            default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            value_parser = clap::value_parser!(u16).range(1..),
+            requires = "ka9q_group",
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_port: u16,
+        /// SSRC of the channel to read, when the group carries more than one.
+        #[arg(long, requires = "ka9q_group", help_heading = "ka9q-radio source")]
+        ka9q_ssrc: Option<u32>,
+        /// IPv4 address of the local interface to join the group on. manta
+        /// also joins on 127.0.0.1, for a radiod on this machine.
+        #[arg(
+            long,
+            requires = "ka9q_group",
+            value_parser = clap::value_parser!(std::net::Ipv4Addr),
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_interface: Option<std::net::Ipv4Addr>,
         /// Decimate the source to this sample rate, in Hz, before decoding.
         ///
         /// Must divide the source's own rate by a power of two, and the
@@ -554,12 +685,37 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         timeout_secs: u64,
     },
-    /// Check whether a source is hearing anything, and say what it found.
+    /// Ask a running daemon whether it is healthy.
     ///
-    /// Runs the real decode pipeline for --duration seconds, then reports
-    /// track, SNR and spot counts plus a verdict. Tells "nothing is coming
-    /// in" apart from "signal is coming in but nothing decodes" and from
-    /// "working end to end" -- which a quiet `listen` run cannot.
+    /// Prints the daemon's health report, one check per line. Exits 0 when
+    /// the daemon reports healthy, and 1 when it reports unhealthy, cannot
+    /// be reached, or does not answer within --timeout-secs. These are the
+    /// exit codes a container health check expects.
+    // MAN-81: the image's HEALTHCHECK. Never exits 2 -- Docker reserves it.
+    Health {
+        /// Daemon config to read metrics_bind_addr/metrics_port from, with the
+        /// same MANTA_* overrides `run` applies (falls back to MANTA_CONFIG). A
+        /// wildcard address (0.0.0.0/::) is dialled on loopback.
+        #[arg(long, conflicts_with = "addr")]
+        config: Option<PathBuf>,
+        /// Explicit host:port of the daemon's metrics listener (default
+        /// 127.0.0.1:7302).
+        #[arg(long)]
+        addr: Option<String>,
+        /// Give up after this many seconds if the daemon doesn't answer.
+        #[arg(long, default_value_t = 3)]
+        timeout_secs: u64,
+    },
+    /// Check that this machine is ready to run manta, then whether the
+    /// receiver hears anything.
+    ///
+    /// First checks the config, the audio library, that the server ports
+    /// are free, the clock against an NTP server, and that each enabled RBN
+    /// uplink target accepts a connection. Then opens the receiver, runs the
+    /// real decode pipeline for --duration seconds and reports track, SNR
+    /// and spot counts plus a verdict. Each check prints PASS, WARN, FAIL or
+    /// SKIP, with a fix for every problem. Exits 1 when a check fails.
+    // MAN-126: the setup checks live in doctor_checks.rs and clock_check.rs.
     Doctor {
         /// How long to listen for, in seconds (3 to 3600).
         #[arg(long, default_value_t = 10)]
@@ -577,10 +733,10 @@ enum Command {
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -613,8 +769,8 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -644,8 +800,8 @@ enum Command {
         /// builds made with the `hpsdr` feature.
         #[cfg(feature = "hpsdr")]
         #[arg(help_heading = "HPSDR source")]
-        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
         #[cfg(feature = "hpsdr")]
@@ -676,6 +832,40 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_rate_hz: Option<f64>,
+        /// Multicast data group of a ka9q-radio (radiod) IQ channel
+        ///
+        /// An IPv4 multicast address, or the name in the channel's `data =`
+        /// line (for example cw-20m.local) when this machine resolves mDNS
+        /// names. manta joins the group and reads the channel's sample rate,
+        /// encoding and frequency from radiod's status packets; it does not
+        /// create or retune channels.
+        #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        ka9q_group: Option<String>,
+        /// RTP data port of the group.
+        #[arg(
+            long,
+            default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            value_parser = clap::value_parser!(u16).range(1..),
+            requires = "ka9q_group",
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_port: u16,
+        /// SSRC of the channel to read, when the group carries more than one.
+        #[arg(long, requires = "ka9q_group", help_heading = "ka9q-radio source")]
+        ka9q_ssrc: Option<u32>,
+        /// IPv4 address of the local interface to join the group on. manta
+        /// also joins on 127.0.0.1, for a radiod on this machine.
+        #[arg(
+            long,
+            requires = "ka9q_group",
+            value_parser = clap::value_parser!(std::net::Ipv4Addr),
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_interface: Option<std::net::Ipv4Addr>,
         /// Decimate the source to this sample rate, in Hz, before decoding.
         ///
         /// Must divide the source's own rate by a power of two, and the
@@ -701,9 +891,22 @@ enum Command {
         ///
         /// Falls back to $MANTA_CONFIG. Flags override the file, and
         /// MANTA_<TABLE>_<KEY> environment variables sit between the two.
-        /// `doctor` never starts the spot servers.
+        /// doctor checks [server]'s ports and each [[rbn_uplink]] target,
+        /// but never starts a server or logs in to a collector.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// NTP server the clock check asks for the time, as HOST or
+        /// HOST:PORT.
+        ///
+        /// doctor sends it one time request over UDP port 123. Name a server
+        /// on your own network when outbound NTP is blocked.
+        #[arg(
+            long,
+            default_value = clock_check::DEFAULT_NTP_SERVER,
+            value_parser = clock_check::parse_ntp_server,
+            help_heading = "Setup checks"
+        )]
+        ntp_server: clock_check::NtpServer,
         /// Print the full report as one JSON object instead of a readable
         /// summary.
         #[arg(long, help_heading = "Output")]
@@ -711,12 +914,264 @@ enum Command {
         #[command(flatten)]
         filters: FilterOpts,
     },
+    /// Measure the receiver's frequency error against a known signal.
+    ///
+    /// Listens for --duration seconds to a carrier whose frequency is known
+    /// exactly -- a time-signal station (WWV, WWVH, BPM, RWM) or an NCDXF
+    /// beacon -- and reports the freq_correction_ppm that corrects the
+    /// receiver. It picks a reference inside the receiver's passband by
+    /// itself; --tune-hz points the configured receiver at one, and
+    /// --reference-hz names any other carrier you know. Offers to save the
+    /// value to the config file.
+    // MAN-127: see calibrate_cmd.rs and
+    // docs/DECISIONS/2026-10-11-man127-calibrate-command.md. The source flag
+    // block is copied from `Doctor`, as run/soak/doctor each copy it.
+    Calibrate {
+        /// How long to measure, in seconds (10 to 3600). NCDXF beacons take
+        /// turns on each frequency, so give them 180.
+        #[arg(long, default_value_t = 60)]
+        duration: u64,
+        /// Measure against this carrier, in Hz, instead of the built-in list.
+        /// Use only a signal whose frequency you know to a fraction of a
+        /// hertz.
+        #[arg(long, value_parser = parse_reference_hz)]
+        reference_hz: Option<f64>,
+        /// How far from the reference to look, in parts per million (1 to
+        /// 1000). Widen it for a receiver without a temperature-compensated
+        /// oscillator.
+        #[arg(long, default_value_t = manta_engine::calibrate::DEFAULT_SEARCH_PPM, value_parser = parse_search_ppm)]
+        search_ppm: f64,
+        /// Retune the configured receiver to this centre frequency, in Hz,
+        /// for this measurement only. KiwiSDR, SoapySDR and HPSDR sources.
+        /// Keep the reference 1 to 2 kHz from the centre, e.g. 9998500 for
+        /// the 10 MHz time signal.
+        #[arg(long, value_parser = parse_tune_hz)]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(conflicts_with_all = ["kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(conflicts_with_all = ["kiwi_host", "hpsdr_host"]))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(conflicts_with_all = ["kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(
+            not(any(feature = "hpsdr", feature = "soapy")),
+            arg(conflicts_with = "kiwi_host")
+        )]
+        tune_hz: Option<f64>,
+        /// Sound-card input device; matched by substring. Defaults to the
+        /// system default input.
+        #[arg(long, conflicts_with = "source", help_heading = "Audio input")]
+        device: Option<String>,
+        /// Replay a WAV file instead of listening to a live device.
+        ///
+        /// Decoded as fast as the machine manages, not in real time, so a
+        /// 60-second file usually finishes sooner than that. Useful for
+        /// demos and repeatable testing.
+        #[arg(long, conflicts_with = "device", help_heading = "Audio input")]
+        source: Option<PathBuf>,
+        /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
+        #[arg(help_heading = "KiwiSDR source")]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
+        kiwi_host: Option<String>,
+        /// KiwiSDR receiver port.
+        #[arg(
+            long,
+            default_value = "8073",
+            requires = "kiwi_host",
+            help_heading = "KiwiSDR source"
+        )]
+        kiwi_port: u16,
+        /// Receiver centre frequency, in Hz. Required with --kiwi-host.
+        #[arg(
+            long = "kiwi-freq-hz",
+            alias = "kiwi-freq",
+            requires = "kiwi_host",
+            help_heading = "KiwiSDR source"
+        )]
+        kiwi_freq_hz: Option<f64>,
+        /// KiwiSDR password. Leave empty for public receivers that do not
+        /// ask for one.
+        #[arg(
+            long,
+            requires = "kiwi_host",
+            default_value = "",
+            help_heading = "KiwiSDR source"
+        )]
+        kiwi_password: String,
+        /// SoapySDR device arguments, e.g. "driver=rtlsdr".
+        ///
+        /// Requires --soapy-freq-hz and --soapy-rate-hz. Available only in
+        /// builds made with the `soapy` feature.
+        #[cfg(feature = "soapy")]
+        #[arg(help_heading = "SoapySDR source")]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
+        soapy_driver: Option<String>,
+        /// Receiver centre frequency, in Hz. Required with --soapy-driver.
+        #[cfg(feature = "soapy")]
+        #[arg(
+            long = "soapy-freq-hz",
+            alias = "soapy-freq",
+            requires = "soapy_driver",
+            help_heading = "SoapySDR source"
+        )]
+        soapy_freq_hz: Option<f64>,
+        /// Sample rate, in Hz. Required with --soapy-driver.
+        #[cfg(feature = "soapy")]
+        #[arg(
+            long = "soapy-rate-hz",
+            alias = "soapy-rate",
+            requires = "soapy_driver",
+            help_heading = "SoapySDR source"
+        )]
+        soapy_rate_hz: Option<f64>,
+        /// Receiver gain, in dB. Omit to let the device use AGC.
+        #[cfg(feature = "soapy")]
+        #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
+        soapy_gain: Option<f64>,
+        /// HPSDR/Hermes device hostname or IP address.
+        ///
+        /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Available only in
+        /// builds made with the `hpsdr` feature.
+        #[cfg(feature = "hpsdr")]
+        #[arg(help_heading = "HPSDR source")]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
+        hpsdr_host: Option<String>,
+        /// HPSDR/Hermes control port.
+        #[cfg(feature = "hpsdr")]
+        #[arg(
+            long,
+            default_value_t = manta_input::hpsdr::CONTROL_PORT,
+            requires = "hpsdr_host",
+            help_heading = "HPSDR source"
+        )]
+        hpsdr_port: u16,
+        /// Receiver centre frequency, in Hz. Required with --hpsdr-host.
+        #[cfg(feature = "hpsdr")]
+        #[arg(
+            long = "hpsdr-freq-hz",
+            alias = "hpsdr-freq",
+            requires = "hpsdr_host",
+            value_parser = parse_hpsdr_freq_hz,
+            help_heading = "HPSDR source"
+        )]
+        hpsdr_freq_hz: Option<f64>,
+        /// Sample rate, in Hz. Required with --hpsdr-host.
+        #[cfg(feature = "hpsdr")]
+        #[arg(
+            long = "hpsdr-rate-hz",
+            alias = "hpsdr-rate",
+            requires = "hpsdr_host",
+            value_parser = parse_hpsdr_rate_hz,
+            help_heading = "HPSDR source"
+        )]
+        hpsdr_rate_hz: Option<f64>,
+        /// Multicast data group of a ka9q-radio (radiod) IQ channel
+        ///
+        /// An IPv4 multicast address, or the name in the channel's `data =`
+        /// line (for example cw-20m.local) when this machine resolves mDNS
+        /// names. manta joins the group and reads the channel's sample rate,
+        /// encoding and frequency from radiod's status packets; it does not
+        /// create or retune channels.
+        #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        ka9q_group: Option<String>,
+        /// RTP data port of the group.
+        #[arg(
+            long,
+            default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            value_parser = clap::value_parser!(u16).range(1..),
+            requires = "ka9q_group",
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_port: u16,
+        /// SSRC of the channel to read, when the group carries more than one.
+        #[arg(long, requires = "ka9q_group", help_heading = "ka9q-radio source")]
+        ka9q_ssrc: Option<u32>,
+        /// IPv4 address of the local interface to join the group on. manta
+        /// also joins on 127.0.0.1, for a radiod on this machine.
+        #[arg(
+            long,
+            requires = "ka9q_group",
+            value_parser = clap::value_parser!(std::net::Ipv4Addr),
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_interface: Option<std::net::Ipv4Addr>,
+        /// Decimate the source to this sample rate, in Hz, before decoding.
+        ///
+        /// Must divide the source's own rate by a power of two, and the
+        /// result must itself be a rate the channelizer supports. Omit to
+        /// decode at the source's native rate.
+        #[arg(long, value_parser = parse_capture_rate_hz)]
+        capture_rate_hz: Option<f64>,
+        /// Read --source as a raw complex-IQ recording rather than ordinary
+        /// mono audio.
+        ///
+        /// Without this, --source is taken as mono real audio at 48000 Hz.
+        /// A stereo audio recording and a two-channel IQ capture cannot be
+        /// told apart from the WAV header alone, so say which you have.
+        #[arg(long)]
+        source_iq: bool,
+        /// Radio dial frequency, in Hz. See `run --dial-freq-hz`; without it
+        /// an audio source's reported frequencies, and the report's
+        /// `center_freq_hz`, are baseband offsets.
+        #[arg(long, value_parser = parse_dial_freq_hz, help_heading = "Audio input")]
+        dial_freq_hz: Option<f64>,
+        /// TOML config file whose [input] table names the receiver. The
+        /// measured value is saved to that table.
+        ///
+        /// Falls back to $MANTA_CONFIG. Flags override the file, and
+        /// MANTA_INPUT_<KEY> environment variables sit between the two.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Save the measured value to the config file without asking.
+        #[arg(long)]
+        write: bool,
+        /// Print the report as one JSON object. Never asks before saving.
+        #[arg(long, help_heading = "Output")]
+        json: bool,
+    },
     /// Check or create a config file, without starting anything.
     #[command(subcommand)]
     Config(ConfigCommand),
     /// Measure decode quality on synthetic signals, no radio needed.
     #[command(subcommand)]
     Bench(BenchCommand),
+    /// Grade a node's spot log against RBN reports, offline.
+    ///
+    /// Reads SpotMessage JSON Lines (the `field-node.py record-spots`
+    /// archive) and RBN daily-dump CSVs, and grades every spot the way
+    /// `[rbn_compare]` grades it live: match, disagree, elsewhere, none or
+    /// unknown. Prints a per-band summary, or the grade records with
+    /// --json. Never reads MANTA_* variables: the output depends only on
+    /// the inputs and flags.
+    Grade {
+        #[command(flatten)]
+        args: grade_cmd::Args,
+    },
+    /// Print a tab-completion script for your shell.
+    ///
+    /// Load it from your shell's startup file, for example by adding
+    /// `eval "$(manta completions bash)"` to ~/.bashrc. The script covers
+    /// this build's commands and flags, so load it again after an upgrade.
+    Completions {
+        /// Shell to print the script for.
+        shell: clap_complete::aot::Shell,
+    },
+    /// Write manta's man pages into a directory.
+    ///
+    /// Writes manta.1 and one page per command (manta-run.1,
+    /// manta-config-check.1, ...), replacing older copies. Release archives
+    /// already carry these pages in man/man1.
+    ManPages {
+        /// Directory to write the pages into, created if missing, for
+        /// example /usr/local/share/man/man1.
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+    },
 }
 
 // MAN-116: `manta bench sensitivity`; see bench.rs and
@@ -779,6 +1234,36 @@ enum ConfigCommand {
 //   - allowlist: the Operator Watch List of ARCHITECTURE §6 / MAN-28.
 //     Legacy precedent: CW Skimmer's Watch List (Aggregator manual App. A2).
 //   - blocklist / notch: MAN-31. cty / scp: MAN-79.
+/// MAN-301: `run`'s live RBN comparison flags, merged over
+/// `[rbn_compare]` in `resolve`.
+#[derive(clap::Args, Clone, Debug, Default)]
+#[command(next_help_heading = "RBN comparison")]
+struct RbnCompareOpts {
+    // `help`, not a doc comment: clap drops a one-paragraph doc comment's
+    // final period, and this text is the design's (MAN-301 §2).
+    #[arg(
+        long,
+        help = "Grade each spot against RBN's public telnet feed and publish the grades on the \
+                JSON stream and /metrics. Needs --config with a [server] table. Same as \
+                [rbn_compare].enabled = true."
+    )]
+    rbn_compare: bool,
+    #[arg(
+        long = "rbn-spotter",
+        value_name = "CALL",
+        value_parser = parse_rbn_spotter,
+        help = "Count only this RBN skimmer's reports when grading, for example a co-located \
+                skimmer on the same antenna. Repeatable. Replaces [rbn_compare].spotters."
+    )]
+    rbn_spotter: Vec<String>,
+}
+
+/// `--rbn-spotter`: the same callsign rule and uppercasing as an entry of
+/// `[rbn_compare].spotters`.
+fn parse_rbn_spotter(s: &str) -> std::result::Result<String, String> {
+    manta_server::config::normalize_rbn_spotter(s)
+}
+
 /// Flags that decide which decodes become spots. Shared by `decode`,
 /// `listen` and `soak`.
 #[derive(clap::Args, Clone, Debug)]
@@ -833,6 +1318,9 @@ struct FilterOpts {
     /// Defaults to the built-in copy, or to `spot.scp_path` from --config.
     #[arg(long)]
     scp: Option<PathBuf>,
+    /// Callsign-pattern list used in place of the built-in one ([spot] pattern_path).
+    #[arg(long, value_name = "PATH")]
+    patterns: Option<PathBuf>,
 }
 
 /// KiwiSDR connection flags, grouped to keep `open_source`'s arity down.
@@ -866,6 +1354,33 @@ struct HpsdrOpts {
     rate: Option<f64>,
 }
 
+/// ka9q-radio (radiod) multicast flags, grouped for the same reason. No
+/// build feature: the source is in every build (MAN-140 D2).
+#[derive(Clone)]
+struct Ka9qOpts {
+    group: Option<String>,
+    port: u16,
+    ssrc: Option<u32>,
+    interface: Option<std::net::Ipv4Addr>,
+    /// radiod's frequency at the first open, shared with the clone the
+    /// reconnect opener holds, so a reopen under `--dial-freq-hz` can still
+    /// see a retune (MAN-140 D13; see `LiveSourceSpec::open`).
+    first_center_hz: std::sync::Arc<std::sync::OnceLock<f64>>,
+}
+
+impl Ka9qOpts {
+    /// No `--ka9q-*` flag given: the defaults `CliOverrides::none` uses.
+    fn unset() -> Self {
+        Ka9qOpts {
+            group: None,
+            port: manta_input::ka9q::wire::DATA_PORT,
+            ssrc: None,
+            interface: None,
+            first_center_hz: Default::default(),
+        }
+    }
+}
+
 /// Everything needed to (re)open the configured live input. MAN-73: a
 /// reconnectable kind (every variant but `File`) is re-opened by
 /// `ReconnectingSource` after a loss; `File` (deterministic replay) never
@@ -878,6 +1393,7 @@ enum LiveSourceSpec {
     Soapy(SoapyOpts),
     #[cfg(feature = "hpsdr")]
     Hpsdr(HpsdrOpts),
+    Ka9q(Ka9qOpts),
     AudioDevice(Option<String>),
     /// `source_iq` selects `WavIqSource` over `AudioIqSource`; see
     /// `open_audio_source`.
@@ -895,12 +1411,13 @@ impl LiveSourceSpec {
             LiveSourceSpec::Soapy(_) => "soapy",
             #[cfg(feature = "hpsdr")]
             LiveSourceSpec::Hpsdr(_) => "hpsdr",
+            LiveSourceSpec::Ka9q(_) => "ka9q",
             LiveSourceSpec::AudioDevice(_) => "audio",
             LiveSourceSpec::File { .. } => "file",
         }
     }
 
-    /// Kiwi/Soapy/Hpsdr, or an IQ WAV whose sidecar reports a real (> 0)
+    /// Kiwi/Soapy/Hpsdr/Ka9q, or an IQ WAV whose sidecar reports a real (> 0)
     /// center frequency: a source that already knows its own tuned
     /// frequency, so `--dial-freq-hz` is an override and not a requirement.
     fn is_rf_aware(&self) -> bool {
@@ -933,6 +1450,9 @@ impl LiveSourceSpec {
         capture_rate_hz: Option<f64>,
         dial_freq_hz: Option<f64>,
     ) -> Result<Box<dyn IqSource>> {
+        // How far radiod has moved the channel since the first open; only
+        // ka9q sets it (MAN-140 D13).
+        let mut retune_hz = 0.0;
         let src: Box<dyn IqSource> = match self {
             LiveSourceSpec::Kiwi(kiwi) => {
                 let host = kiwi
@@ -987,18 +1507,44 @@ impl LiveSourceSpec {
                 let mut sources = manta_input::hpsdr::HpsdrDevice::open(cfg)?;
                 Box::new(sources.remove(0))
             }
-            LiveSourceSpec::AudioDevice(device) => {
-                Box::new(manta_input::AudioIqSource::from_device(device.as_deref())?)
+            LiveSourceSpec::Ka9q(ka9q) => {
+                let group = ka9q
+                    .group
+                    .clone()
+                    .expect("LiveSourceSpec::Ka9q always carries a group");
+                let mut cfg = manta_input::ka9q::Ka9qConfig::new(group);
+                cfg.port = ka9q.port;
+                cfg.ssrc = ka9q.ssrc;
+                cfg.interface = ka9q.interface;
+                let src = manta_input::ka9q::Ka9qIqSource::open(cfg)?;
+                // MAN-140 D18: printed on each (re)open, as the audio
+                // silence notice is; manta still starts.
+                if src.agc_on() {
+                    logging::warning(&ka9q_agc_warning(src.ssrc()));
+                }
+                let first_hz = *ka9q.first_center_hz.get_or_init(|| src.center_freq_hz());
+                retune_hz = src.center_freq_hz() - first_hz;
+                Box::new(src)
             }
+            // Each (re)open gets its own one-shot silence notice (MAN-131).
+            LiveSourceSpec::AudioDevice(device) => Box::new(
+                manta_input::AudioIqSource::from_device(device.as_deref())?.with_silence_notice(
+                    Box::new(|device| logging::warning(&audio_silence_warning(device))),
+                ),
+            ),
             LiveSourceSpec::File { path, source_iq } => {
                 open_audio_source(None, Some(path.clone()), *source_iq, None)?
             }
         };
         let src = maybe_decimate(src, capture_rate_hz)?;
         Ok(match dial_freq_hz {
+            // A radiod retune moves the override by the same amount, so
+            // `ReconnectingSource`'s reopen check still sees it and ends the
+            // run, as it does with no override, instead of publishing spots
+            // against the old frequency.
             Some(freq_hz) => Box::new(FixedCenterFreqSource {
                 inner: src,
-                freq_hz,
+                freq_hz: freq_hz + retune_hz,
             }),
             None => src,
         })
@@ -1160,6 +1706,52 @@ fn warn_if_audio_source_has_no_rf_reference(has_rf_aware_source: bool, dial_freq
     }
 }
 
+/// MAN-131: a live audio input delivering exact zeros is, on macOS, the
+/// usual sign of a denied microphone permission (cpal cannot see TCC; the
+/// stream opens and the callback hands over silence). A warning, not an
+/// error: a muted input is a legitimate state, and `doctor` still reports
+/// NO_SIGNAL on its own.
+fn audio_silence_warning(device: &str) -> String {
+    format!(
+        "warning: audio input {device} is delivering digital silence at {} Hz \
+         (every sample is exactly zero) -- {}",
+        manta_input::TARGET_RATE_HZ,
+        manta_input::audio::audio_input_hint()
+    )
+}
+
+/// MAN-140 D18: a radiod channel with AGC on rescales every signal in its
+/// passband whenever one strong signal comes and goes. A warning on each
+/// open, not an error: some operators run AGC on purpose.
+fn ka9q_agc_warning(ssrc: u32) -> String {
+    format!(
+        "warning: ka9q-radio channel ssrc {ssrc} has AGC on; set agc = off and a fixed gain \
+         in its radiod section, or one strong signal changes the gain for every signal in \
+         the passband"
+    )
+}
+
+/// MAN-131: `decode`'s analogue of `warn_if_audio_source_has_no_rf_reference`.
+/// `sidecar_center_hz` is `None` when `<stem>.json` does not exist. When this
+/// returns `Some`, the `Decode` handler decodes at a 0.0 centre, so a
+/// negative sidecar value cannot contradict the warning.
+fn recording_center_warning(wav: &Path, sidecar_center_hz: Option<f64>) -> Option<String> {
+    let sidecar = manta_input::sidecar_path(wav);
+    let why = match sidecar_center_hz {
+        Some(hz) if hz > 0.0 => return None,
+        Some(hz) => format!(
+            "sidecar {} gives center_freq_hz = {hz}, not an RF frequency",
+            sidecar.display()
+        ),
+        None => format!("no sidecar {} next to {}", sidecar.display(), wav.display()),
+    };
+    Some(format!(
+        "warning: {why} -- reported frequencies are baseband offsets from the \
+         recording's centre, not absolute RF frequencies. Pass the centre \
+         frequency, e.g. --center-freq-hz 14000000."
+    ))
+}
+
 /// Wrap `src` in a `DecimatingSource` targeting `capture_rate_hz`, unless
 /// it's `None` or already matches the source's native rate (a no-op in
 /// either case -- omitting `--capture-rate-hz` reproduces today's exact
@@ -1200,9 +1792,7 @@ const MIN_CAPTURE_RATE_HZ: f64 = 1_000.0;
 /// of obviously-bad input (e.g. a negative or degenerately tiny value that
 /// would otherwise reach `Channelizer::new` with `hop == 0` and hang).
 fn parse_capture_rate_hz(s: &str) -> std::result::Result<f64, String> {
-    let hz: f64 = s
-        .parse()
-        .map_err(|e| format!("invalid --capture-rate-hz {s:?}: {e}"))?;
+    let hz: f64 = s.parse().map_err(|e| format!("{e}"))?;
     check_capture_rate_hz("--capture-rate-hz", hz)
 }
 
@@ -1222,9 +1812,7 @@ fn check_capture_rate_hz(name: &str, hz: f64) -> std::result::Result<f64, String
 /// same validation `manta_spot::calibration_factor_from_ppm` applies
 /// (MAN-29 review).
 fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
-    let ppm: f64 = s
-        .parse()
-        .map_err(|e| format!("invalid --freq-correction-ppm {s:?}: {e}"))?;
+    let ppm: f64 = s.parse().map_err(|e| format!("{e}"))?;
     check_freq_correction_ppm(ppm)
 }
 
@@ -1382,7 +1970,7 @@ fn session_nonce_for_replay_path(path: &std::path::Path) -> Result<u128> {
 /// to the actual recording start (Codex review, PR #161).
 fn parse_capture_start(s: &str) -> std::result::Result<i64, String> {
     manta_testkit::oracle::parse_utc_timestamp(s)
-        .map_err(|e| format!("invalid --capture-start {s:?}: {e}"))
+        .map_err(|e| manta_server::status_doc::escape_for_terminal(&e.to_string()))
 }
 
 // Codex review, PR #161 round 2: a negative --window-s makes run_oracle's
@@ -1392,9 +1980,7 @@ fn parse_capture_start(s: &str) -> std::result::Result<i64, String> {
 // function's doc comment -- but a CLI-level rejection gives a clap usage
 // error instead of a bail! from inside the command's execution path).
 fn parse_window_s(s: &str) -> std::result::Result<f64, String> {
-    let window_s: f64 = s
-        .parse()
-        .map_err(|e| format!("invalid --window-s {s:?}: {e}"))?;
+    let window_s: f64 = s.parse().map_err(|e| format!("{e}"))?;
     if !window_s.is_finite() || window_s <= 0.0 {
         return Err(format!(
             "--window-s must be finite and positive, got {window_s}"
@@ -1404,14 +1990,50 @@ fn parse_window_s(s: &str) -> std::result::Result<f64, String> {
 }
 
 fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
-    let hz: f64 = s
-        .parse()
-        .map_err(|e| format!("invalid --dial-freq-hz {s:?}: {e}"))?;
+    let hz: f64 = s.parse().map_err(|e| format!("{e}"))?;
     check_dial_freq_hz("--dial-freq-hz", hz)
 }
 
+// MAN-127: `calibrate`'s frequency/ppm flags.
+fn parse_reference_hz(s: &str) -> std::result::Result<f64, String> {
+    let hz: f64 = s
+        .parse()
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+    check_dial_freq_hz("--reference-hz", hz)
+}
+
+fn parse_tune_hz(s: &str) -> std::result::Result<f64, String> {
+    let hz: f64 = s
+        .parse()
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+    check_dial_freq_hz("--tune-hz", hz)
+}
+
+fn parse_search_ppm(s: &str) -> std::result::Result<f64, String> {
+    use manta_engine::calibrate::{MAX_SEARCH_PPM, MIN_SEARCH_PPM};
+    let ppm: f64 = s
+        .parse()
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+    if !ppm.is_finite() || !(MIN_SEARCH_PPM..=MAX_SEARCH_PPM).contains(&ppm) {
+        return Err(format!(
+            "--search-ppm must be between {MIN_SEARCH_PPM} and {MAX_SEARCH_PPM}, got {s}"
+        ));
+    }
+    Ok(ppm)
+}
+
+/// `decode --center-freq-hz` (MAN-131). The parse error is just the
+/// `ParseFloatError` text: clap already prints the flag and the value.
+fn parse_center_freq_hz(s: &str) -> std::result::Result<f64, String> {
+    let hz: f64 = s
+        .parse()
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
+    check_dial_freq_hz("--center-freq-hz", hz)
+}
+
 /// `parse_dial_freq_hz`'s check, shared with `input.center_freq_hz`
-/// (MAN-261); `name` is the flag or config key the message cites.
+/// (MAN-261) and `decode --center-freq-hz` (MAN-131); `name` is the flag
+/// or config key the message cites.
 fn check_dial_freq_hz(name: &str, hz: f64) -> std::result::Result<f64, String> {
     if !hz.is_finite() || hz <= 0.0 {
         return Err(format!(
@@ -1453,9 +2075,7 @@ const _: () = assert!(HPSDR_CONTROL_PORT == manta_input::hpsdr::CONTROL_PORT);
 /// `parse_dial_freq_hz`'s pattern.
 #[cfg(feature = "hpsdr")]
 fn parse_hpsdr_rate_hz(s: &str) -> std::result::Result<f64, String> {
-    let hz: f64 = s
-        .parse()
-        .map_err(|e| format!("invalid --hpsdr-rate-hz {s:?}: {e}"))?;
+    let hz: f64 = s.parse().map_err(|e| format!("{e}"))?;
     check_hpsdr_rate_hz("--hpsdr-rate-hz", hz)
 }
 
@@ -1479,10 +2099,16 @@ fn check_hpsdr_rate_hz(name: &str, hz: f64) -> std::result::Result<f64, String> 
 /// every emitted spot's frequency field).
 #[cfg(feature = "hpsdr")]
 fn parse_hpsdr_freq_hz(s: &str) -> std::result::Result<f64, String> {
-    let hz: f64 = s
-        .parse()
-        .map_err(|e| format!("invalid --hpsdr-freq-hz {s:?}: {e}"))?;
+    let hz: f64 = s.parse().map_err(|e| format!("{e}"))?;
     check_hpsdr_freq_hz("--hpsdr-freq-hz", hz)
+}
+
+/// Clap value parser for `--ka9q-group`: the same check `input.group` gets
+/// at load (MAN-140 D16), an IPv4 multicast literal or a host name, never
+/// resolved here.
+fn parse_ka9q_group(s: &str) -> std::result::Result<String, String> {
+    manta_input::ka9q::check_group(s)?;
+    Ok(s.to_string())
 }
 
 /// `parse_hpsdr_freq_hz`'s check, un-gated like `check_hpsdr_rate_hz`.
@@ -1515,9 +2141,7 @@ const MAX_REPLAY_EPOCH_SECS: i64 = 4_102_444_800;
 /// recording tool's own metadata, `date +%s`) can produce Unix seconds
 /// directly.
 fn parse_replay_epoch(s: &str) -> std::result::Result<i64, String> {
-    let secs: i64 = s
-        .parse()
-        .map_err(|e| format!("invalid --replay-epoch {s:?}: {e}"))?;
+    let secs: i64 = s.parse().map_err(|e| format!("{e}"))?;
     check_replay_epoch("--replay-epoch", secs)
 }
 
@@ -1541,6 +2165,17 @@ fn strip_bom(text: &str) -> &str {
     text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 
+/// Loads a reference table once, with consistent path context and BOM handling.
+fn read_reference<T>(
+    path: &Path,
+    label: &str,
+    parse: impl FnOnce(&str) -> Result<T>,
+) -> Result<std::sync::Arc<T>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {label} {}", path.display()))?;
+    parse(strip_bom(&text)).map(std::sync::Arc::new)
+}
+
 /// Builds a `PipelineConfig` from the CLI's shared flags: the MAN-29
 /// frequency-calibration correction, the MAN-28 operator Watch List, and
 /// the MAN-31 operator suppression lists. Each is optional/repeatable; an
@@ -1555,6 +2190,7 @@ fn build_pipeline_config(
     let mut cfg = PipelineConfig {
         freq_correction_ppm,
         allowlist: spot.allowlist.clone(),
+        validation_level: spot.validation_level,
         detector,
         ..Default::default()
     };
@@ -1570,22 +2206,32 @@ fn build_pipeline_config(
         cfg.notch = manta_engine::NotchList::parse(strip_bom(&text));
     }
     if let Some(path) = &spot.cty {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading cty.dat file {}", path.display()))?;
-        let table = manta_spot::cty::Table::parse(strip_bom(&text));
-        if table.is_empty() {
-            bail!("cty.dat file {} lists no callsign prefixes; is it AD1C's cty.dat (not cty.csv or a saved web page)?", path.display());
-        }
-        cfg.cty = Some(std::sync::Arc::new(table));
+        cfg.cty = Some(read_reference(path, "cty.dat file", |text| {
+            let table = manta_spot::cty::Table::parse(text);
+            if table.is_empty() {
+                bail!("cty.dat file {} lists no callsign prefixes; is it AD1C's cty.dat (not cty.csv or a saved web page)?", path.display());
+            }
+            Ok(table)
+        })?);
     }
     if let Some(path) = &spot.scp {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading master.scp file {}", path.display()))?;
-        let set = manta_spot::scp::Set::parse(strip_bom(&text));
-        if set.is_empty() {
-            bail!("master.scp file {} lists no callsigns", path.display());
-        }
-        cfg.scp = Some(std::sync::Arc::new(set));
+        cfg.scp = Some(read_reference(path, "master.scp file", |text| {
+            let set = manta_spot::scp::Set::parse(text);
+            if set.is_empty() {
+                bail!("master.scp file {} lists no callsigns", path.display());
+            }
+            Ok(set)
+        })?);
+    }
+    if let Some(path) = &spot.patterns {
+        cfg.patterns = Some(read_reference(path, "the pattern list", |text| {
+            manta_spot::pattern::Table::parse(text).map_err(|error| match error {
+                manta_spot::pattern::ParseError::Empty => {
+                    anyhow!("the pattern list {} contains no patterns", path.display())
+                }
+                _ => anyhow!("reading the pattern list {}: {error}", path.display()),
+            })
+        })?);
     }
     Ok(cfg)
 }
@@ -2029,6 +2675,30 @@ fn merge_cli_engine(
     file_decode
 }
 
+/// MAN-78 (supersedes MAN-85's ctrlc `termination` feature on Unix):
+/// SIGTERM always drains; SIGHUP drains too unless this is a daemon
+/// (`[server]`), where it requests a reload instead -- the returned
+/// `Signals` buffers it for `reload::spawn`. Installed with ctrlc, before
+/// the `listening:` banner (MAN-122 round 6). ctrlc refuses to share a
+/// signal (`MultipleHandlers`), so it must no longer own SIGTERM/SIGHUP.
+#[cfg(unix)]
+fn install_unix_signal_handlers(
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    daemon: bool,
+) -> Result<Option<signal_hook::iterator::Signals>> {
+    use signal_hook::consts::{SIGHUP, SIGTERM};
+    signal_hook::flag::register(SIGTERM, stop.clone()).context("installing the SIGTERM handler")?;
+    if daemon {
+        let signals = signal_hook::iterator::Signals::new([SIGHUP])
+            .context("installing the SIGHUP handler")?;
+        Ok(Some(signals))
+    } else {
+        signal_hook::flag::register(SIGHUP, stop.clone())
+            .context("installing the SIGHUP handler")?;
+        Ok(None)
+    }
+}
+
 /// Handles what the `Run` on-spot closure needs to feed a running spot server.
 struct SpotServer {
     bus: std::sync::Arc<manta_server::bus::SpotBus>,
@@ -2072,11 +2742,44 @@ struct SpotServer {
     /// await. `Mutex<Option<..>>` because shutdown only ever holds
     /// `&SpotServer` and must `take()` the handle to join it.
     status_line: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// MAN-301: the live RBN comparator's task, `None` when `[rbn_compare]`
+    /// is off. Retained for the same reason as `status_line`: shutdown
+    /// joins it right after `shutdown_tx.send(true)`, so no `spotGrade`
+    /// lands in the middle of the client drain.
+    rbn_compare: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The metrics/status HTTP listener's real bound address (MAN-44),
     /// from `TcpListener::local_addr()`, so a port-0 bind is reachable by
     /// tests without guessing or binding a fixed port.
     #[cfg_attr(not(test), allow(dead_code))]
     metrics_addr: std::net::SocketAddr,
+    /// The JSON listener's real bound address, so a port-0 bind is reachable
+    /// by tests -- `metrics_addr`'s MAN-44 precedent.
+    #[cfg_attr(not(test), allow(dead_code))]
+    json_addr: std::net::SocketAddr,
+    /// MAN-324: the live-state listener's bound address; `None` when
+    /// `[server].live_port` is unset, in which case the decode loop runs
+    /// no live tap.
+    live_addr: Option<std::net::SocketAddr>,
+    /// MAN-324: `deCall` on every live record, and the station half of a
+    /// spotted decision's `spotId`.
+    station_callsign: String,
+    /// MAN-78: each `[[rbn_uplink]]` task's live `dry_run` flag, in config
+    /// order, for the SIGHUP reload thread (Unix only) to flip.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    uplink_dry_run: Vec<UplinkDryRun>,
+}
+
+/// MAN-78: one `[[rbn_uplink]]` target's live `dry_run` flag, read per
+/// spot by `uplink::serve_with_live_dry_run`, and the same `host:port`
+/// label `/metrics` uses (MAN-128 D7) for the reload's log line.
+#[derive(Clone)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct UplinkDryRun {
+    label: String,
+    /// The entry's `enabled`: a disabled target runs no task, so nothing
+    /// reads its flag.
+    enabled: bool,
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 // MAN-89 (PR #131 review, round 7): the "would `from_spot` emit the
@@ -2249,7 +2952,10 @@ const ACTIVE_TRACKS_POLL_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// the reconnecting `read()`, so it can't publish a count itself, and the
 /// poller above would keep exporting the pre-drop tracks -- MAN-45's ghost
 /// count. `listen()` publishes the real count again after its first
-/// post-reconnect chunk.
+/// post-reconnect chunk. MAN-314: `manta_rtty_signals` is zeroed here for
+/// the same reason; it is published only from the per-batch callback,
+/// which cannot run during the outage, and the reconnect's discontinuity
+/// restarts the RTTY set that callback publishes next.
 fn source_health_sink(
     name: &'static str,
     metrics: Option<std::sync::Arc<manta_server::metrics::Metrics>>,
@@ -2259,6 +2965,9 @@ fn source_health_sink(
         if !healthy {
             if let Some(gauge) = &active_tracks {
                 gauge.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(metrics) = &metrics {
+                metrics.set_rtty_signals(&[]);
             }
         }
         if let Some(metrics) = &metrics {
@@ -2376,6 +3085,30 @@ fn latency_histogram_of(
     }
 }
 
+/// MAN-118: as `latency_histogram_of`, attaching the engine's rail-ratio
+/// bounds and the repetition gate's bucket bounds to their snapshots.
+fn decode_quality_of(
+    s: &manta_engine::DecodeQualitySnapshot,
+) -> manta_server::metrics::DecodeQuality {
+    manta_server::metrics::DecodeQuality {
+        chars_total: s.chars_total,
+        garbles_total: s.garbles_total,
+        rail_ratio: manta_server::metrics::ValueHistogram {
+            bounds: manta_engine::RAIL_RATIO_BUCKETS.to_vec(),
+            bucket_counts: s.rail_ratio_bucket_counts.clone(),
+            sum: s.rail_ratio_sum,
+        },
+        repetitions: manta_server::metrics::ValueHistogram {
+            bounds: manta_spot::REPETITION_BUCKETS
+                .iter()
+                .map(|&b| f64::from(b))
+                .collect(),
+            bucket_counts: s.repetition_bucket_counts.clone(),
+            sum: s.repetition_sum as f64,
+        },
+    }
+}
+
 /// How often the daemon samples an input source's `InputHealthCounters`
 /// into `Metrics` (MAN-56). An order of magnitude below any realistic
 /// Prometheus scrape interval, so a scrape never sees more than ~1 s of
@@ -2425,6 +3158,7 @@ fn station_profile(
     center_freq_hz: f64,
     rf_passband_hz: (f64, f64),
     freq_calibration: f64,
+    validation_level: manta_spot::ValidationLevel,
 ) -> manta_server::telnet::StationProfile {
     manta_server::telnet::StationProfile {
         call: cfg.station_callsign.clone(),
@@ -2432,7 +3166,12 @@ fn station_profile(
         operator_qth: cfg.operator_qth.clone(),
         operator_grid: cfg.operator_grid.clone(),
         sett: manta_server::sett::SettSettings {
-            validation_level: manta_server::sett::ValidationLevel::Normal,
+            validation_level: match validation_level {
+                manta_spot::ValidationLevel::Minimal => {
+                    manta_server::sett::ValidationLevel::Minimal
+                }
+                manta_spot::ValidationLevel::Normal => manta_server::sett::ValidationLevel::Normal,
+            },
             cq_only: false,
             segments: manta_server::sett::segments_for_passband(
                 center_freq_hz,
@@ -2450,6 +3189,9 @@ fn station_profile(
 const LISTENER_TELNET: &str = "telnet";
 const LISTENER_JSON: &str = "json";
 const LISTENER_METRICS: &str = "metrics";
+/// MAN-324: the live-state listener, registered only when
+/// `[server].live_port` is set.
+const LISTENER_LIVE: &str = "live";
 
 /// Spawns `fut` as a tracked listener task: `metrics` reports `name` down
 /// the moment that task ends, whether by panic or by returning (the
@@ -2472,14 +3214,29 @@ fn spawn_tracked_listener(
     });
 }
 
+fn spot_bus_for(
+    cfg: &manta_server::config::ServerConfig,
+    sample_rate_hz: f64,
+    epoch: std::time::SystemTime,
+    session_nonce: u128,
+) -> manta_server::bus::SpotBus {
+    manta_server::bus::SpotBus::new(sample_rate_hz, epoch, session_nonce).with_history_minutes(
+        cfg.history_minutes
+            .unwrap_or(manta_server::bus::DEFAULT_HISTORY_MINUTES),
+    )
+}
+
 fn start_spot_server(
     cfg: manta_server::config::ServerConfig,
     rbn_uplink_cfgs: Vec<manta_server::config::RbnUplinkConfig>,
+    rbn_compare_cfg: Option<manta_server::config::RbnCompareConfig>,
     source: SourceInfo<'_>,
     epoch: std::time::SystemTime,
     session_nonce: u128,
-    cty: std::sync::Arc<manta_spot::cty::Table>,
+    pipeline: &PipelineConfig,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
+    let cty = pipeline.cty_table();
+    let validation_level = pipeline.validation_level;
     // MAN-59 connection/rejection events below are logged at `info`/
     // `warn`. `start_spot_server` no longer installs the subscriber:
     // `logging::init` does, at the top of `run` (MAN-124), and its module
@@ -2487,7 +3244,16 @@ fn start_spot_server(
 
     // MAN-261: `[server]`/`[[rbn_uplink]]` arrive already parsed and
     // validated by `config::load`, before any source was opened.
-    let bus = std::sync::Arc::new(manta_server::bus::SpotBus::new(
+    //
+    // MAN-138: `config::load` already rejected an inconsistent location
+    // before I/O; this re-resolution obtains the value every JSON spot
+    // carries, and still rejects one for a caller that built its
+    // `ServerConfig` directly.
+    let station_location = cfg
+        .station_location()
+        .map_err(|e| anyhow!("[server]: {e}"))?;
+    let bus = std::sync::Arc::new(spot_bus_for(
+        &cfg,
         source.sample_rate_hz,
         epoch,
         session_nonce,
@@ -2506,239 +3272,370 @@ fn start_spot_server(
     let tasks = manta_server::tasks::new_client_tasks();
 
     let rt = tokio::runtime::Runtime::new()?;
-    let (status_line, metrics_addr) = rt.block_on(async {
-        // MAN-132: metrics binds its own `metrics_bind_addr` (loopback by
-        // default), never `bind_addr`. With two configurable addresses
-        // "which listener failed?" is a real question, so each bind names
-        // its listener, address key and port.
-        let telnet_listener =
-            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.telnet_port))
-                .await
-                .with_context(|| {
-                    format!(
-                        "binding the telnet server (bind_addr = {:?}, telnet_port = {})",
-                        cfg.bind_addr, cfg.telnet_port
+    let (status_line, metrics_addr, json_addr, live_addr, uplink_dry_run, rbn_task) =
+        rt.block_on(async {
+            // MAN-132: metrics binds its own `metrics_bind_addr` (loopback by
+            // default), never `bind_addr`. With two configurable addresses
+            // "which listener failed?" is a real question, so each bind names
+            // its listener, address key and port.
+            let telnet_listener =
+                tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.telnet_port))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "binding the telnet server (bind_addr = {}, telnet_port = {})",
+                            fmt::quoted(&cfg.bind_addr),
+                            cfg.telnet_port
+                        )
+                    })?;
+            let json_listener =
+                tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.json_port))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "binding the JSON server (bind_addr = {}, json_port = {})",
+                            fmt::quoted(&cfg.bind_addr),
+                            cfg.json_port
+                        )
+                    })?;
+            let metrics_listener =
+                tokio::net::TcpListener::bind((cfg.metrics_bind_addr.as_str(), cfg.metrics_port))
+                    .await
+                    .with_context(|| {
+                        format!(
+                        "binding the metrics server (metrics_bind_addr = {}, metrics_port = {})",
+                        fmt::quoted(&cfg.metrics_bind_addr),
+                        cfg.metrics_port
                     )
-                })?;
-        let json_listener = tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.json_port))
-            .await
-            .with_context(|| {
-                format!(
-                    "binding the JSON server (bind_addr = {:?}, json_port = {})",
-                    cfg.bind_addr, cfg.json_port
-                )
-            })?;
-        let metrics_listener =
-            tokio::net::TcpListener::bind((cfg.metrics_bind_addr.as_str(), cfg.metrics_port))
-                .await
-                .with_context(|| {
-                    format!(
-                        "binding the metrics server (metrics_bind_addr = {:?}, metrics_port = {})",
-                        cfg.metrics_bind_addr, cfg.metrics_port
-                    )
-                })?;
-        let metrics_addr = metrics_listener.local_addr()?;
+                    })?;
+            let metrics_addr = metrics_listener.local_addr()?;
+            let json_addr = json_listener.local_addr()?;
+            // MAN-324: the live-state listener, only when `live_port` is set.
+            let live_listener = match cfg.live_port {
+                Some(live_port) => Some(
+                    tokio::net::TcpListener::bind((cfg.live_bind_addr.as_str(), live_port))
+                        .await
+                        .with_context(|| {
+                            format!(
+                            "binding the live-state server (live_bind_addr = {}, live_port = {})",
+                            fmt::quoted(&cfg.live_bind_addr),
+                            live_port
+                        )
+                        })?,
+                ),
+                None => None,
+            };
+            let live_addr = live_listener
+                .as_ref()
+                .map(tokio::net::TcpListener::local_addr)
+                .transpose()?;
 
-        // MAN-122 scenario 1. Emitted after every bind succeeds (so a bind
-        // failure never produces a banner at all) but BEFORE any listener task is
-        // spawned -- on a multi-thread runtime a spawned accept loop can admit a
-        // client immediately, and its per-connection line would otherwise be able
-        // to land ahead of the banner. `local_addr()`, not the configured port,
-        // so a `*_port = 0` (ephemeral) config still names the real address.
-        //
-        // Review round 2: this line says `listening:`, not `ready:`. Three
-        // bound sockets are not evidence that anything will ever be decoded --
-        // a replay shorter than `manta_engine`'s two-second calibration window,
-        // or a live source that fails its first reads, exits here with the
-        // pipeline never having started. The readiness event proper is emitted
-        // from the decode loop's first batch (see `format_pipeline_ready`'s
-        // call site).
-        tracing::info!(
-            "{}",
-            manta_server::status::format_startup_banner(&manta_server::status::StartupInfo {
-                version: env!("CARGO_PKG_VERSION"),
-                source: source.name,
-                sample_rate_hz: source.sample_rate_hz,
-                dial_freq_hz: source.dial_freq_hz,
-                station_callsign: &cfg.station_callsign,
-                telnet_addr: telnet_listener.local_addr()?,
-                json_addr: json_listener.local_addr()?,
-                metrics_addr: metrics_listener.local_addr()?,
-            })
-        );
+            // MAN-122 scenario 1. Emitted after every bind succeeds (so a bind
+            // failure never produces a banner at all) but BEFORE any listener task is
+            // spawned -- on a multi-thread runtime a spawned accept loop can admit a
+            // client immediately, and its per-connection line would otherwise be able
+            // to land ahead of the banner. `local_addr()`, not the configured port,
+            // so a `*_port = 0` (ephemeral) config still names the real address.
+            //
+            // Review round 2: this line says `listening:`, not `ready:`. Three
+            // bound sockets are not evidence that anything will ever be decoded --
+            // a replay shorter than `manta_engine`'s two-second calibration window,
+            // or a live source that fails its first reads, exits here with the
+            // pipeline never having started. The readiness event proper is emitted
+            // from the decode loop's first batch (see `format_pipeline_ready`'s
+            // call site).
+            tracing::info!(
+                "{}",
+                manta_server::status::format_startup_banner(&manta_server::status::StartupInfo {
+                    version: env!("CARGO_PKG_VERSION"),
+                    source: source.name,
+                    sample_rate_hz: source.sample_rate_hz,
+                    dial_freq_hz: source.dial_freq_hz,
+                    station_callsign: &cfg.station_callsign,
+                    telnet_addr: telnet_listener.local_addr()?,
+                    json_addr: json_listener.local_addr()?,
+                    metrics_addr: metrics_listener.local_addr()?,
+                    live_addr,
+                })
+            );
 
-        // MAN-128: all three binds above already succeeded (a failed bind
-        // returns via `?` before this point), so every listener starts
-        // "up" -- `spawn_tracked_listener` below flips each back to "down"
-        // the moment its own task actually ends.
-        metrics.set_listener_up(LISTENER_TELNET, true);
-        metrics.set_listener_up(LISTENER_JSON, true);
-        metrics.set_listener_up(LISTENER_METRICS, true);
+            // MAN-128: all three binds above already succeeded (a failed bind
+            // returns via `?` before this point), so every listener starts
+            // "up" -- `spawn_tracked_listener` below flips each back to "down"
+            // the moment its own task actually ends.
+            metrics.set_listener_up(LISTENER_TELNET, true);
+            metrics.set_listener_up(LISTENER_JSON, true);
+            metrics.set_listener_up(LISTENER_METRICS, true);
+            if live_listener.is_some() {
+                metrics.enable_live();
+                metrics.set_listener_up(LISTENER_LIVE, true);
+            }
 
-        let telnet_ip_command_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
-            manta_server::telnet::MAX_TELNET_COMMANDS,
-            manta_server::telnet::COMMAND_RATE_WINDOW,
-            cfg.telnet_max_commands_per_ip,
-        );
-        manta_server::rate_limit::spawn_stale_entry_reaper(telnet_ip_command_limiter.clone());
-        // MAN-86: Aggregator will not forward spots from a source that
-        // never answers SKIMMER/SETT (Aggregator manual v6.0 §9.2) --
-        // `profile` carries the operator identity for the greeting banner
-        // and the live-passband segments for the SETT reply.
-        if cfg.operator_grid.is_none() || cfg.operator_qth.is_none() {
-            tracing::warn!(
-                "telnet greeting will omit QTH/grid -- set [server].operator_qth and \
+            let telnet_ip_command_limiter =
+                manta_server::rate_limit::IpRateLimiter::new_with_override(
+                    manta_server::telnet::MAX_TELNET_COMMANDS,
+                    manta_server::telnet::COMMAND_RATE_WINDOW,
+                    cfg.telnet_max_commands_per_ip,
+                );
+            manta_server::rate_limit::spawn_stale_entry_reaper(telnet_ip_command_limiter.clone());
+            // MAN-86: Aggregator will not forward spots from a source that
+            // never answers SKIMMER/SETT (Aggregator manual v6.0 §9.2) --
+            // `profile` carries the operator identity for the greeting banner
+            // and the live-passband segments for the SETT reply.
+            if cfg.operator_grid.is_none() || cfg.operator_qth.is_none() {
+                tracing::warn!(
+                    "telnet greeting will omit QTH/grid -- set [server].operator_qth and \
                  operator_grid so RBN Aggregator can record this node's location \
                  (Aggregator manual v6.0 §9.2)"
-            );
-        }
-        let profile = std::sync::Arc::new(station_profile(
-            &cfg,
-            source.dial_freq_hz,
-            source.rf_passband_hz,
-            source.freq_calibration,
-        ));
-        spawn_tracked_listener(
-            LISTENER_TELNET,
-            metrics.clone(),
-            manta_server::telnet::serve(
-                telnet_listener,
-                bus.clone(),
-                metrics.clone(),
-                profile,
-                shutdown_rx.clone(),
-                tasks.clone(),
-                manta_server::tasks::new_connection_limiter(
-                    manta_server::telnet::MAX_TELNET_CONNECTIONS,
-                ),
-                manta_server::tasks::IpQuota::new_with_override(
-                    manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP,
-                    cfg.telnet_max_connections_per_ip,
-                ),
-                telnet_ip_command_limiter,
-                manta_server::tasks::CLIENT_DRAIN_DEADLINE,
-                cfg.line_format,
-            ),
-        );
-        let json_ip_ping_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
-            manta_server::json_stream::MAX_INBOUND_PINGS,
-            manta_server::json_stream::PING_RATE_WINDOW,
-            cfg.json_max_pings_per_ip,
-        );
-        manta_server::rate_limit::spawn_stale_entry_reaper(json_ip_ping_limiter.clone());
-        spawn_tracked_listener(
-            LISTENER_JSON,
-            metrics.clone(),
-            manta_server::json_stream::serve(
-                json_listener,
-                manta_server::json_stream::JsonStreamConfig {
-                    bus: bus.clone(),
-                    metrics: metrics.clone(),
-                    cty: cty.clone(),
-                    station_call: cfg.station_callsign.clone(),
-                    decoder_version,
-                    // .clone(): MAN-32/MAN-42's uplink::serve spawns below also
-                    // need shutdown_rx -- can't let this be the moving consumer
-                    // anymore now that there are more consumers.
-                    shutdown: shutdown_rx.clone(),
-                    drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
-                },
-                tasks.clone(),
-                manta_server::tasks::new_connection_limiter(
-                    manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS,
-                ),
-                manta_server::tasks::IpQuota::new_with_override(
-                    manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
-                    cfg.json_max_connections_per_ip,
-                ),
-                json_ip_ping_limiter,
-            ),
-        );
-        // Reaps completed per-client tasks continuously, independent of
-        // shutdown -- without this, `tasks` only ever shrinks at
-        // shutdown_runtime_after_drain's one-time `await_all`, so ordinary
-        // connect/disconnect churn grows it without bound for the life of
-        // the process (round-11 review finding).
-        manta_server::tasks::spawn_reaper(tasks.clone());
-        // MAN-44: the WHOLE uplink registry is published before the
-        // metrics/status endpoint is spawned below. On this multi-thread
-        // runtime that endpoint accepts on another worker the instant its
-        // task is spawned, so a probe racing a later registration loop
-        // could read a half-registered (or empty) registry and be told
-        // `disabled` -- `manta status` exit 0 -- for a daemon whose
-        // configured targets are in fact down. Registered-but-unconnected
-        // reads as down, the honest startup answer. `target_labels`
-        // assigns the Prometheus label (`host:port`, `#N`-suffixed only on
-        // an exact duplicate; MAN-128 D7).
-        let uplink_labels = manta_server::uplink::target_labels(&rbn_uplink_cfgs);
-        let enabled_uplinks = rbn_uplink_cfgs.iter().filter(|u| u.enabled).count();
-        let uplink_tasks: Vec<_> = rbn_uplink_cfgs
-            .into_iter()
-            .zip(uplink_labels)
-            .map(|(uplink_cfg, label)| {
-                let target = metrics.register_uplink_target(label, uplink_cfg.enabled);
-                (uplink_cfg, target)
-            })
-            .collect();
-        let metrics_ip_request_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
-            manta_server::metrics_http::MAX_METRICS_REQUESTS_PER_IP,
-            manta_server::metrics_http::METRICS_REQUEST_RATE_WINDOW,
-            cfg.metrics_max_requests_per_ip,
-        );
-        manta_server::rate_limit::spawn_stale_entry_reaper(metrics_ip_request_limiter.clone());
-        spawn_tracked_listener(
-            LISTENER_METRICS,
-            metrics.clone(),
-            manta_server::metrics_http::serve(
-                metrics_listener,
-                metrics.clone(),
-                manta_server::tasks::new_connection_limiter(
-                    manta_server::metrics_http::MAX_METRICS_CONNECTIONS,
-                ),
-                manta_server::tasks::IpQuota::new_with_override(
-                    manta_server::metrics_http::MAX_METRICS_CONNECTIONS_PER_IP,
-                    cfg.metrics_max_connections_per_ip,
-                ),
-                metrics_ip_request_limiter,
-            ),
-        );
-        // MAN-32/MAN-42: one independent uplink::serve task per configured
-        // [[rbn_uplink]] entry -- the common case for existing single-node
-        // operators is no [[rbn_uplink]] tables at all (empty Vec, loop
-        // body never runs), and uplink::serve itself also no-ops when
-        // `enabled = false` (belt-and-suspenders, not a duplicate check:
-        // this loop additionally avoids spawning a task at all when the
-        // Vec is empty). Each task owns its own SpotBus subscription and
-        // backoff state, so one target being down never affects another's
-        // delivery or retry timing.
-        // MAN-128 D6/D7: each target was registered above, before both its
-        // `serve` task and the metrics endpoint, so a scrape landing before
-        // the first connect attempt still sees it.
-        for (uplink_cfg, target) in uplink_tasks {
-            tokio::spawn(manta_server::uplink::serve(
-                uplink_cfg,
-                cfg.station_callsign.clone(),
-                bus.clone(),
-                target,
-                shutdown_rx.clone(),
+                );
+            }
+            // MAN-138: without a configured position every JSON spot's
+            // deGrid/deLat/deLon is null -- legal, but a map shows nothing.
+            if station_location.is_none() {
+                tracing::warn!(
+                    "JSON spots will carry no station position -- set [server].operator_grid, or \
+                 operator_lat and operator_lon, so deGrid/deLat/deLon name this node's location"
+                );
+            }
+            let profile = std::sync::Arc::new(station_profile(
+                &cfg,
+                source.dial_freq_hz,
+                source.rf_passband_hz,
+                source.freq_calibration,
+                validation_level,
             ));
-        }
+            spawn_tracked_listener(
+                LISTENER_TELNET,
+                metrics.clone(),
+                manta_server::telnet::serve(
+                    telnet_listener,
+                    bus.clone(),
+                    metrics.clone(),
+                    profile,
+                    shutdown_rx.clone(),
+                    tasks.clone(),
+                    manta_server::tasks::new_connection_limiter(
+                        manta_server::telnet::MAX_TELNET_CONNECTIONS,
+                    ),
+                    manta_server::tasks::IpQuota::new_with_override(
+                        manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP,
+                        cfg.telnet_max_connections_per_ip,
+                    ),
+                    telnet_ip_command_limiter,
+                    manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                    cfg.line_format,
+                ),
+            );
+            let json_ip_ping_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
+                manta_server::json_stream::MAX_INBOUND_PINGS,
+                manta_server::json_stream::PING_RATE_WINDOW,
+                cfg.json_max_pings_per_ip,
+            );
+            manta_server::rate_limit::spawn_stale_entry_reaper(json_ip_ping_limiter.clone());
+            // MAN-324: the live-state listener is the same fan-out code on the
+            // bus's live channel, with its own client cap, per-IP quota and
+            // ping budget (built from the same `json_*` keys).
+            if let Some(live_listener) = live_listener {
+                let live_ip_ping_limiter =
+                    manta_server::rate_limit::IpRateLimiter::new_with_override(
+                        manta_server::json_stream::MAX_INBOUND_PINGS,
+                        manta_server::json_stream::PING_RATE_WINDOW,
+                        cfg.json_max_pings_per_ip,
+                    );
+                manta_server::rate_limit::spawn_stale_entry_reaper(live_ip_ping_limiter.clone());
+                spawn_tracked_listener(
+                    LISTENER_LIVE,
+                    metrics.clone(),
+                    manta_server::json_stream::serve(
+                        live_listener,
+                        manta_server::json_stream::JsonStreamConfig {
+                            bus: bus.clone(),
+                            metrics: metrics.clone(),
+                            cty: cty.clone(),
+                            station_call: cfg.station_callsign.clone(),
+                            station_location: station_location.clone(),
+                            decoder_version: decoder_version.clone(),
+                            shutdown: shutdown_rx.clone(),
+                            drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                            stream: manta_server::json_stream::StreamKind::Live,
+                        },
+                        tasks.clone(),
+                        manta_server::tasks::new_connection_limiter(
+                            manta_server::json_stream::MAX_LIVE_STREAM_CONNECTIONS,
+                        ),
+                        manta_server::tasks::IpQuota::new_with_override(
+                            manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
+                            cfg.json_max_connections_per_ip,
+                        ),
+                        live_ip_ping_limiter,
+                    ),
+                );
+            }
+            spawn_tracked_listener(
+                LISTENER_JSON,
+                metrics.clone(),
+                manta_server::json_stream::serve(
+                    json_listener,
+                    manta_server::json_stream::JsonStreamConfig {
+                        bus: bus.clone(),
+                        metrics: metrics.clone(),
+                        cty: cty.clone(),
+                        station_call: cfg.station_callsign.clone(),
+                        station_location,
+                        decoder_version,
+                        // .clone(): MAN-32/MAN-42's uplink::serve spawns below also
+                        // need shutdown_rx -- can't let this be the moving consumer
+                        // anymore now that there are more consumers.
+                        shutdown: shutdown_rx.clone(),
+                        drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                        stream: manta_server::json_stream::StreamKind::Spots,
+                    },
+                    tasks.clone(),
+                    manta_server::tasks::new_connection_limiter(
+                        manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS,
+                    ),
+                    manta_server::tasks::IpQuota::new_with_override(
+                        manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
+                        cfg.json_max_connections_per_ip,
+                    ),
+                    json_ip_ping_limiter,
+                ),
+            );
+            // Reaps completed per-client tasks continuously, independent of
+            // shutdown -- without this, `tasks` only ever shrinks at
+            // shutdown_runtime_after_drain's one-time `await_all`, so ordinary
+            // connect/disconnect churn grows it without bound for the life of
+            // the process (round-11 review finding).
+            manta_server::tasks::spawn_reaper(tasks.clone());
+            // MAN-44: the WHOLE uplink registry is published before the
+            // metrics/status endpoint is spawned below. On this multi-thread
+            // runtime that endpoint accepts on another worker the instant its
+            // task is spawned, so a probe racing a later registration loop
+            // could read a half-registered (or empty) registry and be told
+            // `disabled` -- `manta status` exit 0 -- for a daemon whose
+            // configured targets are in fact down. Registered-but-unconnected
+            // reads as down, the honest startup answer. `target_labels`
+            // assigns the Prometheus label (`host:port`, `#N`-suffixed only on
+            // an exact duplicate; MAN-128 D7).
+            let uplink_labels = manta_server::uplink::target_labels(&rbn_uplink_cfgs);
+            let enabled_uplinks = rbn_uplink_cfgs.iter().filter(|u| u.enabled).count();
+            let uplink_tasks: Vec<_> = rbn_uplink_cfgs
+                .into_iter()
+                .zip(uplink_labels)
+                .map(|(uplink_cfg, label)| {
+                    let target = metrics.register_uplink_target(label.clone(), uplink_cfg.enabled);
+                    // MAN-78: one live flag per entry, seeded from the file.
+                    let dry_run = UplinkDryRun {
+                        label,
+                        enabled: uplink_cfg.enabled,
+                        flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                            uplink_cfg.dry_run,
+                        )),
+                    };
+                    (uplink_cfg, target, dry_run)
+                })
+                .collect();
+            let uplink_dry_run: Vec<UplinkDryRun> =
+                uplink_tasks.iter().map(|(_, _, d)| d.clone()).collect();
+            // MAN-301: enabled before the metrics endpoint spawns below, for
+            // MAN-44's reason: a scrape racing startup must already see the
+            // `manta_rbn_compare_*` families of a comparator that is starting.
+            let rbn_compare_cfg = rbn_compare_cfg.filter(|c| c.enabled);
+            if rbn_compare_cfg.is_some() {
+                metrics.enable_rbn_compare();
+            }
+            let metrics_ip_request_limiter =
+                manta_server::rate_limit::IpRateLimiter::new_with_override(
+                    manta_server::metrics_http::MAX_METRICS_REQUESTS_PER_IP,
+                    manta_server::metrics_http::METRICS_REQUEST_RATE_WINDOW,
+                    cfg.metrics_max_requests_per_ip,
+                );
+            manta_server::rate_limit::spawn_stale_entry_reaper(metrics_ip_request_limiter.clone());
+            spawn_tracked_listener(
+                LISTENER_METRICS,
+                metrics.clone(),
+                manta_server::metrics_http::serve(
+                    metrics_listener,
+                    metrics.clone(),
+                    manta_server::tasks::new_connection_limiter(
+                        manta_server::metrics_http::MAX_METRICS_CONNECTIONS,
+                    ),
+                    manta_server::tasks::IpQuota::new_with_override(
+                        manta_server::metrics_http::MAX_METRICS_CONNECTIONS_PER_IP,
+                        cfg.metrics_max_connections_per_ip,
+                    ),
+                    metrics_ip_request_limiter,
+                ),
+            );
+            // MAN-32/MAN-42: one independent uplink::serve task per configured
+            // [[rbn_uplink]] entry -- the common case for existing single-node
+            // operators is no [[rbn_uplink]] tables at all (empty Vec, loop
+            // body never runs), and uplink::serve itself also no-ops when
+            // `enabled = false` (belt-and-suspenders, not a duplicate check:
+            // this loop additionally avoids spawning a task at all when the
+            // Vec is empty). Each task owns its own SpotBus subscription and
+            // backoff state, so one target being down never affects another's
+            // delivery or retry timing.
+            // MAN-128 D6/D7: each target was registered above, before both its
+            // `serve` task and the metrics endpoint, so a scrape landing before
+            // the first connect attempt still sees it.
+            for (uplink_cfg, target, dry_run) in uplink_tasks {
+                tokio::spawn(manta_server::uplink::serve_with_live_dry_run(
+                    uplink_cfg,
+                    cfg.station_callsign.clone(),
+                    bus.clone(),
+                    target,
+                    dry_run.flag,
+                    shutdown_rx.clone(),
+                ));
+            }
+            // MAN-301: the live comparator reads the same bus the uplinks do
+            // and publishes grades back onto it. Its metric families were
+            // enabled above, before the metrics endpoint was spawned.
+            let rbn_compare = rbn_compare_cfg.map(|rc| {
+                let station_callsign = cfg.station_callsign.clone();
+                manta_server::rbn_compare::live::spawn(
+                    manta_server::rbn_compare::live::LiveConfig {
+                        feed: manta_server::rbn_compare::feed::FeedConfig {
+                            host: rc.feed_host.clone(),
+                            port: rc.feed_port,
+                            login_callsign: rc
+                                .effective_login_callsign(&station_callsign)
+                                .to_string(),
+                        },
+                        grade: rc.grade_config(&station_callsign),
+                        station_callsign,
+                        tick: manta_server::rbn_compare::live::TICK,
+                    },
+                    bus.clone(),
+                    metrics.clone(),
+                    manta_server::rbn_compare::system_clock(),
+                    shutdown_rx.clone(),
+                )
+            });
 
-        // MAN-122 scenario 2. The handle travels out of this block and
-        // into `SpotServer::status_line` so shutdown can join the task --
-        // see that field's doc comment.
-        let status_line = manta_server::status::spawn_status_line(
-            metrics.clone(),
-            cfg.status_interval_secs
-                .map_or(manta_server::status::DEFAULT_STATUS_INTERVAL, |secs| {
-                    std::time::Duration::from_secs(secs)
-                }),
-            enabled_uplinks,
-            shutdown_rx.clone(),
-        );
+            // MAN-122 scenario 2. The handle travels out of this block and
+            // into `SpotServer::status_line` so shutdown can join the task --
+            // see that field's doc comment.
+            let status_line = manta_server::status::spawn_status_line(
+                metrics.clone(),
+                cfg.status_interval_secs
+                    .map_or(manta_server::status::DEFAULT_STATUS_INTERVAL, |secs| {
+                        std::time::Duration::from_secs(secs)
+                    }),
+                enabled_uplinks,
+                shutdown_rx.clone(),
+            );
 
-        anyhow::Ok((status_line, metrics_addr))
-    })?;
+            anyhow::Ok((
+                status_line,
+                metrics_addr,
+                json_addr,
+                live_addr,
+                uplink_dry_run,
+                rbn_compare,
+            ))
+        })?;
 
     Ok((
         rt,
@@ -2755,22 +3652,33 @@ fn start_spot_server(
             station_geography_unresolved: station_geography_unresolved(&cty, &cfg.station_callsign),
             cty,
             status_line: std::sync::Mutex::new(status_line),
+            rbn_compare: std::sync::Mutex::new(rbn_task),
             metrics_addr,
+            json_addr,
+            live_addr,
+            station_callsign: cfg.station_callsign.clone(),
+            uplink_dry_run,
         },
     ))
 }
 
 /// The command line's say in source/input/spot selection, before it is
 /// merged over the config file and environment (`resolve`, MAN-261).
+/// `Clone` so a SIGHUP reload (MAN-78) re-resolves with the same flags.
+#[derive(Clone)]
 struct CliOverrides {
     device: Option<String>,
     source: Option<PathBuf>,
     source_iq: bool,
+    /// `run --realtime`/`--loop` (MAN-269); always false for soak/doctor.
+    realtime: bool,
+    loop_replay: bool,
     kiwi: KiwiOpts,
     #[cfg(feature = "soapy")]
     soapy: SoapyOpts,
     #[cfg(feature = "hpsdr")]
     hpsdr: HpsdrOpts,
+    ka9q: Ka9qOpts,
     freq_correction_ppm: Option<f64>,
     dial_freq_hz: Option<f64>,
     capture_rate_hz: Option<f64>,
@@ -2780,6 +3688,9 @@ struct CliOverrides {
     notch: Option<PathBuf>,
     cty: Option<PathBuf>,
     scp: Option<PathBuf>,
+    patterns: Option<PathBuf>,
+    /// MAN-301: `--rbn-compare`/`--rbn-spotter` (`run` only).
+    rbn: RbnCompareOpts,
 }
 
 impl CliOverrides {
@@ -2790,6 +3701,8 @@ impl CliOverrides {
             device: None,
             source: None,
             source_iq: false,
+            realtime: false,
+            loop_replay: false,
             kiwi: KiwiOpts {
                 host: None,
                 port: 8073,
@@ -2810,6 +3723,7 @@ impl CliOverrides {
                 freq: None,
                 rate: None,
             },
+            ka9q: Ka9qOpts::unset(),
             freq_correction_ppm: None,
             dial_freq_hz: None,
             capture_rate_hz: None,
@@ -2819,12 +3733,17 @@ impl CliOverrides {
             notch: None,
             cty: None,
             scp: None,
+            patterns: None,
+            rbn: RbnCompareOpts::default(),
         }
     }
 
     /// The flag that selects a source, if any: given one, the command line
     /// defines the whole source (D6).
     fn source_selector(&self) -> Option<&'static str> {
+        if self.ka9q.group.is_some() {
+            return Some("--ka9q-group");
+        }
         #[cfg(feature = "hpsdr")]
         if self.hpsdr.host.is_some() {
             return Some("--hpsdr-host");
@@ -2844,9 +3763,14 @@ impl CliOverrides {
         }
     }
 
-    /// The source the flags describe, in today's priority order: hpsdr,
-    /// then kiwi, then soapy, then a WAV file or audio device.
+    /// The source the flags describe, in today's priority order: ka9q,
+    /// then hpsdr, then kiwi, then soapy, then a WAV file or audio device.
+    /// clap lets at most one selector through, so the order only matters
+    /// for a hand-built `CliOverrides`.
     fn into_spec(self) -> LiveSourceSpec {
+        if self.ka9q.group.is_some() {
+            return LiveSourceSpec::Ka9q(self.ka9q);
+        }
         #[cfg(feature = "hpsdr")]
         if self.hpsdr.host.is_some() {
             return LiveSourceSpec::Hpsdr(self.hpsdr);
@@ -2871,11 +3795,13 @@ impl CliOverrides {
 /// `[spot]` after the CLI is merged over the file/env layer (D6).
 #[derive(Debug, PartialEq)]
 struct SpotResolved {
+    validation_level: manta_spot::ValidationLevel,
     allowlist: Vec<String>,
     blocklist: Option<PathBuf>,
     notch: Option<PathBuf>,
     cty: Option<PathBuf>,
     scp: Option<PathBuf>,
+    patterns: Option<PathBuf>,
 }
 
 /// A non-empty `--allowlist` replaces the file's list (never concatenated);
@@ -2886,6 +3812,7 @@ fn resolve_spot(
     cli_notch: Option<PathBuf>,
     cli_cty: Option<PathBuf>,
     cli_scp: Option<PathBuf>,
+    cli_patterns: Option<PathBuf>,
     spot: &config::SpotFile,
 ) -> SpotResolved {
     SpotResolved {
@@ -2898,30 +3825,78 @@ fn resolve_spot(
         notch: cli_notch.or_else(|| spot.notch_path.clone()),
         cty: cli_cty.or_else(|| spot.cty_path.clone()),
         scp: cli_scp.or_else(|| spot.scp_path.clone()),
+        patterns: cli_patterns.or_else(|| spot.pattern_path.clone()),
+        validation_level: spot.validation_level,
+    }
+}
+
+/// How a file replay is delivered (MAN-269): `paced` plays it at the
+/// recording's own clock, `looped` reopens it at each end. Only `run`
+/// applies it, and only to `LiveSourceSpec::File`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReplayMode {
+    paced: bool,
+    looped: bool,
+}
+
+impl ReplayMode {
+    /// `--loop` implies `--realtime` (D2): an unpaced loop would decode
+    /// endlessly and stamp spots ever further into the future.
+    fn from_flags(realtime: bool, looped: bool) -> Self {
+        ReplayMode {
+            paced: realtime || looped,
+            looped,
+        }
     }
 }
 
 /// Everything a live command needs after CLI > env > file > default.
 struct Resolved {
     spec: LiveSourceSpec,
+    replay: ReplayMode,
     freq_correction_ppm: f64,
     dial_freq_hz: Option<f64>,
     capture_rate_hz: Option<f64>,
     replay_epoch: Option<i64>,
     spot: SpotResolved,
+    /// MAN-301: `[rbn_compare]` with `--rbn-compare`/`--rbn-spotter`
+    /// merged over it; `None` when neither the file nor the flags set it.
+    rbn_compare: Option<manta_server::config::RbnCompareConfig>,
     /// Printed to stderr by the caller, never stdout.
     notes: Vec<String>,
+    /// The flag that replaced a typed `[input]` from the file, if one did:
+    /// that file's receiver is then not the one being opened (MAN-127).
+    replaced_file_source: Option<&'static str>,
+}
+
+/// MAN-301: the flag enables; a non-empty `--rbn-spotter` replaces
+/// `[rbn_compare].spotters` (never concatenated, like `--allowlist`).
+fn resolve_rbn_compare(
+    cli: &RbnCompareOpts,
+    file: Option<&manta_server::config::RbnCompareConfig>,
+) -> Option<manta_server::config::RbnCompareConfig> {
+    if !cli.rbn_compare && cli.rbn_spotter.is_empty() {
+        return file.cloned();
+    }
+    let mut cfg = file.cloned().unwrap_or_default();
+    cfg.enabled |= cli.rbn_compare;
+    if !cli.rbn_spotter.is_empty() {
+        cfg.spotters = cli.rbn_spotter.clone();
+    }
+    Some(cfg)
 }
 
 /// D6: merges the command line over the loaded file + environment layer.
 fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
-    let mut notes = Vec::new();
+    let mut notes = loaded.notes.clone();
+    let rbn_compare = resolve_rbn_compare(&cli.rbn, loaded.rbn_compare.as_ref());
     let spot = resolve_spot(
         cli.allowlist.clone(),
         cli.blocklist.clone(),
         cli.notch.clone(),
         cli.cty.clone(),
         cli.scp.clone(),
+        cli.patterns.clone(),
         &loaded.spot,
     );
     let mut shared = loaded.input.shared.clone();
@@ -2931,8 +3906,17 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
         cli.capture_rate_hz,
         cli.replay_epoch,
     );
+    let mut replaced_file_source = None;
+    let (cli_realtime, cli_loop) = (cli.realtime, cli.loop_replay);
+    // MAN-269 D3: a config `type = "file"` source contributes its own
+    // realtime/loop only when no CLI flag selects the source.
+    let file_replay = match (cli.source_selector(), &loaded.input.source) {
+        (None, Some(source)) => Some(source),
+        _ => None,
+    };
     let spec = match (cli.source_selector(), &loaded.input.source) {
         (Some(flag), Some(file_source)) => {
+            replaced_file_source = Some(flag);
             // A typed [input] describes one receiver: its ppm and dial
             // belong to it, not to whatever the command line names instead.
             notes.push(format!(
@@ -2947,8 +3931,10 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
         (Some(_), None) | (None, None) => cli.into_spec(),
         (None, Some(file_source)) => spec_from_file(file_source, cli.source_iq)?,
     };
+    let replay = resolve_replay_mode(cli_realtime, cli_loop, file_replay, &spec)?;
     Ok(Resolved {
         spec,
+        replay,
         freq_correction_ppm: freq_correction_ppm
             .or(shared.freq_correction_ppm)
             .unwrap_or(0.0),
@@ -2956,7 +3942,9 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
         capture_rate_hz: capture_rate_hz.or(shared.capture_rate_hz),
         replay_epoch: replay_epoch.or(shared.replay_epoch),
         spot,
+        rbn_compare,
         notes,
+        replaced_file_source,
     })
 }
 
@@ -2965,7 +3953,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
 fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Result<LiveSourceSpec> {
     Ok(match source {
         config::SourceFromFile::Audio { device } => LiveSourceSpec::AudioDevice(device.clone()),
-        config::SourceFromFile::File { path, iq } => LiveSourceSpec::File {
+        config::SourceFromFile::File { path, iq, .. } => LiveSourceSpec::File {
             path: path.clone(),
             source_iq: *iq || cli_source_iq,
         },
@@ -3012,7 +4000,147 @@ fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Resul
         config::SourceFromFile::Hpsdr { .. } => {
             bail!("input.type = \"hpsdr\" needs a manta built with --features hpsdr")
         }
+        config::SourceFromFile::Ka9q {
+            group,
+            port,
+            ssrc,
+            interface,
+        } => LiveSourceSpec::Ka9q(Ka9qOpts {
+            group: Some(group.clone()),
+            port: *port,
+            ssrc: *ssrc,
+            interface: *interface,
+            ..Ka9qOpts::unset()
+        }),
     })
+}
+
+/// MAN-269 D3/D4: the CLI's `--realtime`/`--loop` ORed with the config file
+/// source's `realtime`/`loop` (`file_source` is `Some` only when no CLI flag
+/// selected the source), then refused unless the resolved source is a file.
+/// Runs inside `prepare_live`, before any source I/O.
+fn resolve_replay_mode(
+    cli_realtime: bool,
+    cli_loop: bool,
+    file_source: Option<&config::SourceFromFile>,
+    spec: &LiveSourceSpec,
+) -> Result<ReplayMode> {
+    let (file_realtime, file_loop) = match file_source {
+        Some(config::SourceFromFile::File {
+            realtime, looped, ..
+        }) => (*realtime, *looped),
+        _ => (false, false),
+    };
+    let replay = ReplayMode::from_flags(cli_realtime || file_realtime, cli_loop || file_loop);
+    if replay != ReplayMode::default() && !matches!(spec, LiveSourceSpec::File { .. }) {
+        // `validate_input` already refuses realtime/loop on a non-file
+        // [input], so only a CLI flag can get here.
+        if cli_realtime {
+            bail!(
+                "--realtime only applies to a file replay (--source, or input.type = \"file\"); \
+                 a live source already runs in real time"
+            );
+        }
+        bail!(
+            "--loop only applies to a file replay (--source, or input.type = \"file\"); a live \
+             source never reaches an end to loop from"
+        );
+    }
+    Ok(replay)
+}
+
+/// `soak`/`doctor`'s note for config-file realtime/loop they do not apply
+/// (MAN-269 D5); `None` when neither is set.
+fn replay_mode_ignored_note(command: &str, replay: ReplayMode, origin: &str) -> Option<String> {
+    (replay != ReplayMode::default()).then(|| {
+        format!(
+            "note: {command} replays files as fast as it can; ignoring \
+             input.realtime/input.loop from {origin}"
+        )
+    })
+}
+
+/// Wraps an opened file replay for `mode` (MAN-269 D8): the loop sits inside
+/// the pacing, so one clock spans every pass. `reopen` opens each later pass.
+/// The default mode returns `first` unchanged.
+fn wrap_file_replay(
+    first: Box<dyn IqSource>,
+    mode: ReplayMode,
+    label: String,
+    reopen: manta_input::Reopen,
+) -> Result<Box<dyn IqSource>> {
+    let src: Box<dyn IqSource> = if mode.looped {
+        Box::new(manta_input::LoopingSource::new(label, first, reopen))
+    } else {
+        first
+    };
+    Ok(if mode.paced {
+        Box::new(manta_input::PacedSource::new(src)?)
+    } else {
+        src
+    })
+}
+
+/// `run`'s dial guard (MAN-34): with `[server]`, a receiver that reports no
+/// real RF frequency needs a dial frequency, or every spot is a baseband
+/// offset. Shared with `manta doctor`'s `config` check (MAN-126).
+fn needs_dial_freq(has_server: bool, rf_aware: bool, dial_freq_hz: Option<f64>) -> bool {
+    has_server && !rf_aware && dial_freq_hz.is_none()
+}
+
+/// How `manta doctor` names the configured receiver. Never includes the
+/// KiwiSDR password.
+fn receiver_desc(spec: &LiveSourceSpec) -> doctor_checks::ReceiverDesc {
+    use doctor_checks::{ReceiverDesc, ReceiverKind};
+    let (kind, description) = match spec {
+        LiveSourceSpec::Kiwi(kiwi) => (
+            ReceiverKind::Kiwi,
+            format!(
+                "KiwiSDR {}:{}",
+                kiwi.host.as_deref().unwrap_or_default(),
+                kiwi.port
+            ),
+        ),
+        #[cfg(feature = "soapy")]
+        LiveSourceSpec::Soapy(soapy) => (
+            ReceiverKind::Soapy,
+            format!(
+                "SoapySDR device \"{}\"",
+                soapy.driver.as_deref().unwrap_or_default()
+            ),
+        ),
+        #[cfg(feature = "hpsdr")]
+        LiveSourceSpec::Hpsdr(hpsdr) => (
+            ReceiverKind::Hpsdr,
+            format!(
+                "HPSDR radio {}:{}",
+                hpsdr.host.as_deref().unwrap_or_default(),
+                hpsdr.port
+            ),
+        ),
+        LiveSourceSpec::Ka9q(ka9q) => (
+            ReceiverKind::Ka9q,
+            format!(
+                "ka9q-radio group {}:{}{}",
+                ka9q.group.as_deref().unwrap_or_default(),
+                ka9q.port,
+                ka9q.ssrc.map(|s| format!(" ssrc {s}")).unwrap_or_default()
+            ),
+        ),
+        LiveSourceSpec::AudioDevice(None) => (
+            ReceiverKind::SoundCard,
+            "the system default sound-card input".to_string(),
+        ),
+        LiveSourceSpec::AudioDevice(Some(name)) => (
+            ReceiverKind::SoundCard,
+            format!("the sound-card input matching \"{name}\""),
+        ),
+        LiveSourceSpec::File { path, .. } => (
+            ReceiverKind::File,
+            format!("the WAV file {}", path.display()),
+        ),
+    };
+    ReceiverDesc { kind, description }
 }
 
 /// `run`/`soak`/`doctor`'s shared start: load the config (`--config`, else
@@ -3043,7 +4171,8 @@ fn bundled_cty_warning(cty_overridden: bool, now: std::time::SystemTime) -> Opti
     ))
 }
 
-/// Shared typed config and source resolution, with no pipeline assets or I/O.
+/// Shared typed config and source resolution, with no pipeline assets or I/O:
+/// the part of `prepare_live` that `check` and `calibrate` share.
 struct SourcePrepared {
     config_path: Option<PathBuf>,
     loaded: config::Loaded,
@@ -3070,11 +4199,35 @@ fn prepare_live(
     config_flag: Option<PathBuf>,
     cli_engine: Option<Engine>,
 ) -> Result<Prepared> {
-    let SourcePrepared {
-        config_path,
-        loaded,
-        resolved,
-    } = prepare_source(cli, config_flag)?;
+    let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+    let config_path = config_flag.or_else(|| config::config_path_from_env(&vars));
+    let prepared = prepare_config(cli, config_path, cli_engine, &vars)?;
+    for note in &prepared.resolved.notes {
+        logging::note(note);
+    }
+    if let Some(warning) = bundled_cty_warning(
+        prepared.pipeline.cty.is_some(),
+        std::time::SystemTime::now(),
+    ) {
+        logging::warning(&warning);
+    }
+    Ok(prepared)
+}
+
+/// `prepare_live`'s non-printing core, given the already-chosen config
+/// path and the environment: load + `MANTA_*` overlay, CLI merge, and the
+/// blocklist/notch file reads. A SIGHUP reload (MAN-78) re-runs exactly
+/// this, so `manta config check` passing means a reload passes too.
+fn prepare_config(
+    cli: CliOverrides,
+    config_path: Option<PathBuf>,
+    cli_engine: Option<Engine>,
+    vars: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<Prepared> {
+    let loaded = config::load(config_path.as_deref(), config::Env::Read(vars))?;
+    let rbn_opts = cli.rbn.clone();
+    let resolved = resolve(cli, &loaded)?;
+    check_rbn_compare(&rbn_opts, &loaded, &resolved)?;
     let decode = merge_cli_engine(cli_engine, loaded.decode.clone());
     let mut pipeline = build_pipeline_config(
         resolved.freq_correction_ppm,
@@ -3083,16 +4236,79 @@ fn prepare_live(
         decode.engine,
     )?;
     pipeline.decode = decode;
-    if let Some(warning) = bundled_cty_warning(pipeline.cty.is_some(), std::time::SystemTime::now())
-    {
-        logging::warning(&warning);
-    }
     Ok(Prepared {
         config_path,
         loaded,
         resolved,
         pipeline,
     })
+}
+
+/// MAN-301's refusals that need the merged command line: `--rbn-spotter`
+/// without comparison, comparison turned on by the flag without `[server]`
+/// (the loader refuses the file's own `enabled = true`), and `--rbn-spotter`
+/// naming this station. Run before any source or listener opens, and by
+/// `manta config check`. The replayed-recording refusal is
+/// [`refuse_rbn_compare_replay`], which only `run` (and its SIGHUP reload)
+/// and `config check` call: `soak` and `doctor` share this path but never
+/// start the comparator.
+fn check_rbn_compare(
+    cli: &RbnCompareOpts,
+    loaded: &config::Loaded,
+    resolved: &Resolved,
+) -> Result<()> {
+    let enabled = resolved.rbn_compare.as_ref().is_some_and(|c| c.enabled);
+    if !cli.rbn_spotter.is_empty() && !enabled {
+        bail!(
+            "--rbn-spotter needs RBN comparison: add --rbn-compare or set \
+             [rbn_compare].enabled = true"
+        );
+    }
+    let Some(rbn_compare) = resolved.rbn_compare.as_ref().filter(|c| c.enabled) else {
+        return Ok(());
+    };
+    let Some(server) = &loaded.server else {
+        bail!("{}", config::rbn_compare_needs_server(&loaded.origin));
+    };
+    if !cli.rbn_spotter.is_empty() {
+        if let Some(call) = rbn_compare.own_call_spotter(&server.station_callsign) {
+            bail!(
+                "--rbn-spotter {call} is this station's own callsign: its reports are always \
+                 excluded, so every spot would grade none"
+            );
+        }
+        if let Some(call) = rbn_compare.excluded_spotter() {
+            bail!(
+                "--rbn-spotter {call} is in [rbn_compare].exclude_spotters: its reports would \
+                 never count"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// MAN-301: RBN comparison enabled on a run that replays a recording is
+/// refused, since the live feed's reports would never line up with the
+/// recording's spot times. `run` calls this after `prepare_live`, before any
+/// source or listener opens; its SIGHUP reload and `manta config check` call
+/// it too. `soak` and `doctor` do not, because neither starts the comparator.
+/// `source_flag` is whether `--source` chose the file.
+fn refuse_rbn_compare_replay(resolved: &Resolved, source_flag: bool) -> Result<()> {
+    if !resolved.rbn_compare.as_ref().is_some_and(|c| c.enabled) {
+        return Ok(());
+    }
+    if let LiveSourceSpec::File { .. } = resolved.spec {
+        let how = if source_flag {
+            "--source"
+        } else {
+            "[input] type = \"file\""
+        };
+        bail!(
+            "RBN comparison grades spots against the live RBN feed, but this run replays a \
+             recording ({how}). Grade a recorded node's spot log with `manta grade` instead."
+        );
+    }
+    Ok(())
 }
 
 /// `decode`/`oracle`: one stderr note naming the tables present in the file
@@ -3157,10 +4373,10 @@ fn resolve_status_addr(
         use std::net::ToSocketAddrs;
         let addrs: Vec<_> = addr
             .to_socket_addrs()
-            .with_context(|| format!("invalid --addr {addr:?}"))?
+            .with_context(|| format!("invalid --addr {}", fmt::quoted(addr)))?
             .collect();
         if addrs.is_empty() {
-            bail!("--addr {addr:?} resolved to no addresses");
+            bail!("--addr {} resolved to no addresses", fmt::quoted(addr));
         }
         return Ok(addrs);
     }
@@ -3189,10 +4405,15 @@ fn resolve_status_addr(
                 use std::net::ToSocketAddrs;
                 let addrs: Vec<_> = (other, server.metrics_port)
                     .to_socket_addrs()
-                    .with_context(|| format!("resolving server.metrics_bind_addr {other:?}"))?
+                    .with_context(|| {
+                        format!("resolving server.metrics_bind_addr {}", fmt::quoted(other))
+                    })?
                     .collect();
                 if addrs.is_empty() {
-                    bail!("server.metrics_bind_addr {other:?} resolved to no addresses");
+                    bail!(
+                        "server.metrics_bind_addr {} resolved to no addresses",
+                        fmt::quoted(other)
+                    );
                 }
                 Ok(addrs)
             }
@@ -3225,7 +4446,7 @@ fn format_addrs(addrs: &[std::net::SocketAddr]) -> String {
 /// asked for.
 ///
 /// Resolution and the fetch share ONE end-to-end deadline rather than a
-/// timeout window each (see `deadline`/`remaining` in the body): giving
+/// timeout window each (see `deadline`/`remaining` in `query_daemon`): giving
 /// each leg its own full `timeout` would let `--timeout-secs 5` take
 /// nearly ten seconds, twice the give-up bound the flag advertises.
 fn run_status(
@@ -3233,22 +4454,63 @@ fn run_status(
     addr: Option<&str>,
     timeout_secs: u64,
 ) -> Result<manta_server::status_doc::StatusDoc> {
-    // MAN-261: the same loader and `MANTA_*` overlay `run` uses, so the
-    // port `status` dials is the port the daemon bound -- including a
-    // `MANTA_SERVER_METRICS_PORT` override and the `MANTA_CONFIG` fallback.
     // An explicit `--addr` needs no config at all.
     let server = if addr.is_some() {
         None
     } else {
-        let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
-        let config_path = server_config
-            .map(std::path::Path::to_path_buf)
-            .or_else(|| config::config_path_from_env(&vars));
-        match config_path {
-            Some(path) => config::load(Some(&path), config::Env::Read(&vars))?.server,
-            None => None,
-        }
+        daemon_server_config(server_config)?.1
     };
+    query_daemon(
+        addr,
+        server,
+        timeout_secs,
+        |targets, remaining| async move {
+            fetch_status(&targets, remaining)
+                .await
+                .with_context(|| format!("could not reach daemon at {}", format_addrs(&targets)))
+        },
+    )
+}
+
+/// The daemon's `[server]` table as `run` would load it: `--config`, else
+/// `MANTA_CONFIG`, with the `MANTA_*` overlay. `(None, None)` when neither
+/// names a file. Shared by `manta status` and `manta health` (MAN-81).
+fn daemon_server_config(
+    config: Option<&std::path::Path>,
+) -> Result<(
+    Option<std::path::PathBuf>,
+    Option<manta_server::config::ServerConfig>,
+)> {
+    // MAN-261: the same loader and `MANTA_*` overlay `run` uses, so the
+    // port a client dials is the port the daemon bound -- including a
+    // `MANTA_SERVER_METRICS_PORT` override and the `MANTA_CONFIG` fallback.
+    let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+    let config_path = config
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| config::config_path_from_env(&vars));
+    match config_path {
+        Some(path) => {
+            let server = config::load(Some(&path), config::Env::Read(&vars))?.server;
+            Ok((Some(path), server))
+        }
+        None => Ok((None, None)),
+    }
+}
+
+/// Resolves `addr`/`server` on the blocking pool and runs `fetch` against
+/// the resolved candidates within ONE end-to-end deadline, then detaches
+/// the runtime. The MAN-44 plumbing, moved here unchanged from
+/// `run_status` so `manta health` (MAN-81) shares the hardened copy.
+fn query_daemon<T, F, Fut>(
+    addr: Option<&str>,
+    server: Option<manta_server::config::ServerConfig>,
+    timeout_secs: u64,
+    fetch: F,
+) -> Result<T>
+where
+    F: FnOnce(Vec<std::net::SocketAddr>, std::time::Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
     let timeout = std::time::Duration::from_secs(timeout_secs);
     let addr_owned = addr.map(str::to_string);
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -3272,13 +4534,11 @@ fn run_status(
         .map_err(|_| anyhow!("resolving the daemon's address timed out"))?
         .context("resolving the daemon's address panicked")??;
         // Only what's LEFT of the deadline goes to the fetch. A zero
-        // remainder is not special-cased: `fetch_status` bounds itself with
-        // this duration and reports the same "timed out talking to ..."
-        // error it would for any other exhausted budget.
+        // remainder is not special-cased: `fetch` bounds itself with this
+        // duration and reports the same "timed out talking to ..." error
+        // it would for any other exhausted budget.
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        fetch_status(&targets, remaining)
-            .await
-            .with_context(|| format!("could not reach daemon at {}", format_addrs(&targets)))
+        fetch(targets, remaining).await
     });
     // MAN-44 review: the timeout above only DROPS the JoinHandle -- a
     // `spawn_blocking` task cannot be aborted once it is running, so a
@@ -3291,7 +4551,8 @@ fn run_status(
     // detaches the runtime instead of joining it, so the bound the
     // operator asked for is the bound they get; the orphaned lookup is
     // pure-read, owns no caller-visible state, and dies with the process
-    // (which `Command::Status` reaches immediately after this returns).
+    // (which `Command::Status` and `Command::Health` reach immediately
+    // after this returns).
     rt.shutdown_background();
     outcome
 }
@@ -3302,7 +4563,7 @@ fn run_status(
 /// third case -- `2`, "could not reach or parse the daemon's status at
 /// all" -- is returned directly by `Command::Status`'s handler, since it
 /// never gets as far as a `StatusDoc` to pass here.)
-fn status_exit_code(doc: &manta_server::status_doc::StatusDoc) -> i32 {
+fn status_exit_code(doc: &manta_server::status_doc::StatusDoc) -> u8 {
     use manta_server::metrics::OverallUplinkHealth;
     match doc.uplink.health {
         OverallUplinkHealth::Ok | OverallUplinkHealth::Disabled => 0,
@@ -3310,14 +4571,9 @@ fn status_exit_code(doc: &manta_server::status_doc::StatusDoc) -> i32 {
     }
 }
 
-/// What `Command::Status` prints to stderr before exiting 2. Not escaped
-/// here as a whole: local diagnostics such as a `--config` TOML error carry
-/// a multi-line source snippet that must stay readable. Peer-supplied text
-/// is escaped where it enters the error instead -- the status line in
-/// `fetch_status_inner`, serde_json's quoted values in `parse_status_doc`
-/// (Codex review, PR #95).
+/// Status uses the application error style while retaining exit code 2.
 fn status_failure_message(e: &anyhow::Error) -> String {
-    format!("manta status: {e:#}")
+    fmt::render_error(e)
 }
 
 /// Bounds a fetched status document's body size (MAN-44): a real status
@@ -3413,30 +4669,64 @@ async fn fetch_status_inner(
     addrs: &[std::net::SocketAddr],
     timeout: std::time::Duration,
 ) -> Result<manta_server::status_doc::StatusDoc> {
-    use manta_server::bounded_io::read_line_bounded;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-
-    let (mut stream, addr) = connect_any(addrs, timeout)
-        .await
-        .with_context(|| format!("connecting to {}", format_addrs(addrs)))?;
-    stream
-        .write_all(
-            format!("GET /status HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
-        )
-        .await
-        .context("writing the status request")?;
-
-    let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    read_line_bounded(&mut reader, &mut status_line)
-        .await
-        .context("reading the status line")?;
+    let (_, status_line, reader) = http_get(addrs, "/status", "status", timeout).await?;
     if !status_line.starts_with("HTTP/1.1 200") {
         bail!(
             "daemon returned {}",
             manta_server::status_doc::escape_for_terminal(status_line.trim_end())
         );
     }
+    let body = read_http_body(reader, MAX_STATUS_BODY_BYTES, "status").await?;
+    parse_status_doc(&body)
+}
+
+/// One hand-rolled `GET {path}` against the first of `addrs` that accepts
+/// a connection within `timeout`: writes the request and reads the HTTP
+/// status line (bounded). Returns the address dialled, the status line and
+/// the reader, positioned at the header block for `read_http_body`. `what`
+/// names the request in errors ("status", "health"). Shared by
+/// `manta status` and `manta health` (MAN-81).
+async fn http_get(
+    addrs: &[std::net::SocketAddr],
+    path: &str,
+    what: &str,
+    timeout: std::time::Duration,
+) -> Result<(
+    std::net::SocketAddr,
+    String,
+    tokio::io::BufReader<tokio::net::TcpStream>,
+)> {
+    use manta_server::bounded_io::read_line_bounded;
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    let (mut stream, addr) = connect_any(addrs, timeout)
+        .await
+        .with_context(|| format!("connecting to {}", format_addrs(addrs)))?;
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .with_context(|| format!("writing the {what} request"))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    read_line_bounded(&mut reader, &mut status_line)
+        .await
+        .context("reading the status line")?;
+    Ok((addr, status_line, reader))
+}
+
+/// Skips the header block `http_get` left unread (at most
+/// `MAX_STATUS_HEADER_LINES` lines) and reads the body, capped at
+/// `max_body` bytes, as UTF-8.
+async fn read_http_body(
+    mut reader: tokio::io::BufReader<tokio::net::TcpStream>,
+    max_body: u64,
+    what: &str,
+) -> Result<String> {
+    use manta_server::bounded_io::read_line_bounded;
+    use tokio::io::AsyncReadExt;
 
     for _ in 0..MAX_STATUS_HEADER_LINES {
         let mut line = String::new();
@@ -3450,12 +4740,11 @@ async fn fetch_status_inner(
 
     let mut body = Vec::new();
     reader
-        .take(MAX_STATUS_BODY_BYTES)
+        .take(max_body)
         .read_to_end(&mut body)
         .await
-        .context("reading the status body")?;
-    let body = String::from_utf8(body).context("status body was not valid UTF-8")?;
-    parse_status_doc(&body)
+        .with_context(|| format!("reading the {what} body"))?;
+    String::from_utf8(body).with_context(|| format!("{what} body was not valid UTF-8"))
 }
 
 /// Parses a `/status` body AND enforces its `schema_version` (Codex
@@ -3528,21 +4817,24 @@ fn invalid_status_doc(e: serde_json::Error) -> anyhow::Error {
     )
 }
 
-fn main() -> Result<()> {
-    let result = real_main();
-    if let Err(e) = &result {
-        // MAN-124: under --log-format json the error is a log record too,
-        // not Rust's plain `Error: …` line, whatever the level filter;
-        // exit status stays 1.
-        if logging::is_json() {
-            logging::fatal(format!("{e:#}").trim_end());
-            std::process::exit(1);
+fn main() -> std::process::ExitCode {
+    match run_command() {
+        Ok(code) => code,
+        Err(err) => {
+            // MAN-124: under --log-format json the error is a log record too,
+            // whatever the level filter; exit status stays 1. MAN-270: in
+            // text mode it is one escaped `error:` line.
+            if logging::is_json() {
+                logging::fatal(&fmt::cause_text(&err));
+            } else {
+                eprintln!("{}", fmt::render_error(&err));
+            }
+            std::process::ExitCode::FAILURE
         }
     }
-    result
 }
 
-fn real_main() -> Result<()> {
+fn run_command() -> Result<std::process::ExitCode> {
     warn_deprecations();
     match Cli::parse().command {
         Command::Devices { json } => std::process::exit(devices::run(json)?),
@@ -3550,7 +4842,7 @@ fn real_main() -> Result<()> {
             let code = match source_check::run(args) {
                 Ok(code) => code,
                 Err(error) => {
-                    eprintln!("error: {error:#}");
+                    eprintln!("{}", fmt::render_error(&error));
                     1
                 }
             };
@@ -3558,7 +4850,9 @@ fn real_main() -> Result<()> {
         }
         Command::Decode {
             path,
+            center_freq_hz,
             json,
+            timing,
             filters,
             config,
             engine,
@@ -3570,6 +4864,7 @@ fn real_main() -> Result<()> {
                 notch,
                 cty,
                 scp,
+                patterns,
             } = filters;
             // D7/D8: the whole file is validated, the environment is never
             // read; [decode], [detector], [spot] and input.freq_correction_ppm
@@ -3587,7 +4882,15 @@ fn real_main() -> Result<()> {
                     loaded.origin
                 );
             }
-            let spot = resolve_spot(allowlist, blocklist, notch, cty, scp, &loaded.spot);
+            let spot = resolve_spot(
+                allowlist,
+                blocklist,
+                notch,
+                cty,
+                scp,
+                patterns,
+                &loaded.spot,
+            );
             let decode_cfg = merge_cli_engine(engine, loaded.decode.clone());
             let mut cfg = build_pipeline_config(
                 freq_correction_ppm
@@ -3598,13 +4901,39 @@ fn real_main() -> Result<()> {
                 decode_cfg.engine,
             )?;
             cfg.decode = decode_cfg;
-            let report = decode_wav(&path, &cfg)?;
+            // MAN-131: say so before decoding when the reported frequencies
+            // will be baseband offsets. Only for an existing file, so a
+            // missing WAV still fails with just its `open WAV` error.
+            let mut center_freq_hz = center_freq_hz;
+            if center_freq_hz.is_none() && path.is_file() {
+                let sidecar = manta_input::read_sidecar(&path)?;
+                if let Some(warning) =
+                    recording_center_warning(&path, sidecar.map(|sc| sc.center_freq_hz))
+                {
+                    eprintln!("{warning}");
+                    // Keep the warning true: a negative sidecar centre
+                    // decodes at 0.0, not shifted by itself.
+                    center_freq_hz = Some(0.0);
+                }
+            }
+            let report = decode_wav(&path, center_freq_hz, &cfg)?;
             if json {
                 println!("{}", serde_json::to_string(&report)?);
             } else {
                 println!("{}", report.text);
-                eprintln!("freq_hz: {:.1}  wpm: {:?}", report.freq_hz, report.wpm);
-                eprintln!("spots: {}", report.spots.len());
+                eprintln!("{}", fmt::decode_summary(&report));
+                // MAN-314: only when RTTY was marked, so a CW-only decode
+                // keeps MAN-270's one-line summary.
+                if !report.rtty.is_empty() {
+                    eprintln!("{}", rtty_line(&report.rtty, report.sample_rate_hz));
+                }
+                // MAN-315: the primary track's learned sender timing, on
+                // request only, so the default stderr stays the summary.
+                if timing {
+                    if let Some(estimates) = &report.timing {
+                        eprintln!("timing (dits, mean ± sd): {}", estimates.display_line());
+                    }
+                }
             }
         }
         Command::Oracle {
@@ -3652,19 +4981,25 @@ fn real_main() -> Result<()> {
                 "vr6b" => manta_testkit::vectors::vr6b(),
                 "vr7" => manta_testkit::vectors::vr7(),
                 "vr8" => manta_testkit::vectors::vr8(),
+                "vw1" => manta_testkit::vectors::vw1(),
+                "vw2" => manta_testkit::vectors::vw2(),
+                "vw3" => manta_testkit::vectors::vw3(),
+                "vw4" => manta_testkit::vectors::vw4(),
+                "vw5" => manta_testkit::vectors::vw5(),
                 other => bail!(
-                    "unknown vector {other:?} (available: v1-v6, vr1-vr5, vr6a, vr6b, vr7-vr8)"
+                    "unknown vector '{}' (available: v1-v6, vr1-vr5, vr6a, vr6b, vr7-vr8, vw1-vw5)",
+                    manta_server::status_doc::escape_for_terminal(other).replace('\'', "\\'")
                 ),
             };
             std::fs::create_dir_all(&out)?;
             let manifest = manta_testkit::vectors::write_fixture_set(&spec, &out)?;
             eprintln!(
-                "wrote {}/{{{}.wav,{}.json,{}.manifest.json}} (expected freq {:.1} Hz)",
+                "wrote {}/{{{}.wav,{}.json,{}.manifest.json}} (expected frequency {})",
                 out.display(),
                 spec.name,
                 spec.name,
                 spec.name,
-                manifest.expected_freq_hz
+                manta_server::human::khz(manifest.expected_freq_hz)
             );
         }
         Command::Run {
@@ -3690,8 +5025,14 @@ fn real_main() -> Result<()> {
             hpsdr_freq_hz,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
             capture_rate_hz,
             source_iq,
+            realtime,
+            loop_replay,
             filters,
             json,
             decoded_text,
@@ -3699,6 +5040,7 @@ fn real_main() -> Result<()> {
             dial_freq_hz,
             replay_epoch,
             engine,
+            rbn,
             logging: log_opts,
         } => {
             // MAN-124: first, so every later stderr line of `run` (startup
@@ -3711,50 +5053,66 @@ fn real_main() -> Result<()> {
                 notch,
                 cty,
                 scp,
+                patterns,
             } = filters;
+            let cli = CliOverrides {
+                device,
+                source,
+                source_iq,
+                realtime,
+                loop_replay,
+                kiwi: KiwiOpts {
+                    host: kiwi_host,
+                    port: kiwi_port,
+                    freq: kiwi_freq_hz,
+                    password: kiwi_password,
+                },
+                #[cfg(feature = "soapy")]
+                soapy: SoapyOpts {
+                    driver: soapy_driver,
+                    freq: soapy_freq_hz,
+                    rate: soapy_rate_hz,
+                    gain: soapy_gain,
+                },
+                #[cfg(feature = "hpsdr")]
+                hpsdr: HpsdrOpts {
+                    host: hpsdr_host,
+                    port: hpsdr_port,
+                    freq: hpsdr_freq_hz,
+                    rate: hpsdr_rate_hz,
+                },
+                ka9q: Ka9qOpts {
+                    group: ka9q_group,
+                    port: ka9q_port,
+                    ssrc: ka9q_ssrc,
+                    interface: ka9q_interface,
+                    ..Ka9qOpts::unset()
+                },
+                freq_correction_ppm,
+                dial_freq_hz,
+                capture_rate_hz,
+                replay_epoch,
+                allowlist,
+                blocklist,
+                notch,
+                cty,
+                scp,
+                patterns,
+                rbn,
+            };
+            // MAN-78: a SIGHUP reload re-resolves with the same flags.
+            #[cfg(unix)]
+            let reload_cli = cli.clone();
+            #[cfg(unix)]
+            let vars: Vec<_> = std::env::vars_os().collect();
+            let source_flag = cli.source.is_some();
             let Prepared {
                 config_path,
                 loaded,
                 resolved,
                 pipeline: cfg,
-            } = prepare_live(
-                CliOverrides {
-                    device,
-                    source,
-                    source_iq,
-                    kiwi: KiwiOpts {
-                        host: kiwi_host,
-                        port: kiwi_port,
-                        freq: kiwi_freq_hz,
-                        password: kiwi_password,
-                    },
-                    #[cfg(feature = "soapy")]
-                    soapy: SoapyOpts {
-                        driver: soapy_driver,
-                        freq: soapy_freq_hz,
-                        rate: soapy_rate_hz,
-                        gain: soapy_gain,
-                    },
-                    #[cfg(feature = "hpsdr")]
-                    hpsdr: HpsdrOpts {
-                        host: hpsdr_host,
-                        port: hpsdr_port,
-                        freq: hpsdr_freq_hz,
-                        rate: hpsdr_rate_hz,
-                    },
-                    freq_correction_ppm,
-                    dial_freq_hz,
-                    capture_rate_hz,
-                    replay_epoch,
-                    allowlist,
-                    blocklist,
-                    notch,
-                    cty,
-                    scp,
-                },
-                config,
-                engine,
-            )?;
+            } = prepare_live(cli, config, engine)?;
+            refuse_rbn_compare_replay(&resolved, source_flag)?;
             // MAN-268: an unedited manta.example.toml must not start a
             // daemon that spots, or logs in to a collector, as N0CALL.
             // Checked first, on the identities after the MANTA_* overlay:
@@ -3765,6 +5123,10 @@ fn real_main() -> Result<()> {
             config_cmd::reject_example_callsigns(&loaded)?;
             let spec = &resolved.spec;
             let dial_freq_hz = resolved.dial_freq_hz;
+            // The resolved (CLI > env > file) capture rate, for the first open
+            // and every reopen below: binding the CLI's raw value here dropped a
+            // config/env capture rate on a MAN-73 reconnect.
+            let capture_rate_hz = resolved.capture_rate_hz;
             // Needed to derive a recording-specific replay epoch/nonce.
             let replay_path = match spec {
                 LiveSourceSpec::File { path, .. } => Some(path.clone()),
@@ -3775,7 +5137,22 @@ fn real_main() -> Result<()> {
 
             // Servers start iff the resolved config has a [server] table
             // (D7); the guard runs after the load and before any source I/O.
-            if loaded.server.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
+            if needs_dial_freq(loaded.server.is_some(), has_rf_aware_source, dial_freq_hz) {
+                // MAN-269 review (P2): `is_rf_aware()` reads an IQ WAV's
+                // sidecar by opening it and maps any open error to "no RF
+                // frequency". For a file that exists, that error (an
+                // unsupported sample rate, a malformed header) is the real
+                // problem, so report it rather than asking for a dial
+                // frequency that would not help.
+                if let LiveSourceSpec::File {
+                    path,
+                    source_iq: true,
+                } = spec
+                {
+                    if path.exists() {
+                        manta_input::WavIqSource::open(path)?;
+                    }
+                }
                 bail!(
                     "--dial-freq-hz is required with --config when using a plain \
                      audio device or --source WAV file -- neither reports a real RF \
@@ -3792,8 +5169,23 @@ fn real_main() -> Result<()> {
                 ));
             }
             warn_if_audio_source_has_no_rf_reference(has_rf_aware_source, dial_freq_hz);
-            let first = spec.open(resolved.capture_rate_hz, dial_freq_hz)?;
+            // MAN-78: a daemon's SIGHUP is a reload, so it must not land on
+            // this thread, the decode loop's: see `reload::mask_sighup`.
+            // Blocked before the source, the servers and the reload thread
+            // start, so each inherits the mask and only the reload thread
+            // unblocks it. SIGINT/SIGTERM still reach this thread; they end
+            // the run anyway.
+            #[cfg(unix)]
+            if loaded.server.is_some() {
+                reload::mask_sighup(libc::SIG_BLOCK)
+                    .context("blocking SIGHUP on the decode thread")?;
+            }
+            let first = spec.open(capture_rate_hz, dial_freq_hz)?;
             let replay_epoch = resolved.replay_epoch;
+            // MAN-312 (SPEC §2.7): read here, while `first` is in hand;
+            // logged just before decoding starts (below).
+            let crash_live =
+                manta_engine::crash_live_channels(first.sample_rate(), first.rf_passband_hz());
 
             // MAN-122 review round 6 (P2): installed HERE -- before
             // `start_spot_server` binds the sockets and logs the
@@ -3818,11 +5210,18 @@ fn real_main() -> Result<()> {
             // banner itself still precedes the listener
             // tasks (see `start_spot_server`), so its ordering against
             // per-connection lines is unchanged.
+            //
+            // MAN-78: ctrlc covers SIGINT, plus Ctrl-C/Ctrl-Break on
+            // Windows; on Unix, `install_unix_signal_handlers` adds SIGTERM
+            // and SIGHUP at the same point, so the same covered window
+            // holds for every signal.
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_handler = stop.clone();
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
+            #[cfg(unix)]
+            let reload_signals = install_unix_signal_handlers(&stop, loaded.server.is_some())?;
 
             // Kept alive for the process lifetime: dropping it would stop
             // the spawned server tasks. `None` when --config wasn't
@@ -3840,6 +5239,7 @@ fn real_main() -> Result<()> {
                 mut active_tracks_poller,
                 decode_latency,
                 mut decode_latency_poller,
+                decode_quality,
             ) = match loaded.server.clone() {
                 Some(server_cfg) => {
                     // `epoch` feeds SpotBus's wall-clock conversion (every
@@ -3889,6 +5289,7 @@ fn real_main() -> Result<()> {
                     let (rt, server) = start_spot_server(
                         server_cfg,
                         loaded.rbn_uplink.clone(),
+                        resolved.rbn_compare.clone(),
                         SourceInfo {
                             name: source_name,
                             sample_rate_hz: first.sample_rate(),
@@ -3898,7 +5299,7 @@ fn real_main() -> Result<()> {
                         },
                         epoch,
                         session_nonce,
-                        cfg.cty_table(),
+                        &cfg,
                     )?;
                     // MAN-45 (round-9 finding): the daemon's own copy of the
                     // gauge `manta_engine::listen_with_observers` updates as
@@ -3941,14 +5342,25 @@ fn real_main() -> Result<()> {
                     server
                         .metrics
                         .set_decode_latency(latency_histogram_of(&decode_latency.snapshot()));
+                    // MAN-118: the decode-quality observer rides the same
+                    // poller; its all-zero snapshot is published now so
+                    // the families carry samples from startup.
+                    let decode_quality =
+                        std::sync::Arc::new(manta_engine::DecodeQualityObserver::new());
+                    server
+                        .metrics
+                        .set_decode_quality(decode_quality_of(&decode_quality.snapshot()));
                     let decode_latency_poller = {
                         let obs = decode_latency.clone();
+                        let quality = decode_quality.clone();
                         let latency_metrics = server.metrics.clone();
                         rt.spawn(async move {
                             loop {
                                 tokio::time::sleep(DECODE_LATENCY_POLL_INTERVAL).await;
                                 latency_metrics
                                     .set_decode_latency(latency_histogram_of(&obs.snapshot()));
+                                latency_metrics
+                                    .set_decode_quality(decode_quality_of(&quality.snapshot()));
                             }
                         })
                     };
@@ -3980,10 +5392,42 @@ fn real_main() -> Result<()> {
                         Some(active_tracks_poller),
                         Some(decode_latency),
                         Some(decode_latency_poller),
+                        Some(decode_quality),
                     )
                 }
-                None => (None, None, None, None, None, None),
+                None => (None, None, None, None, None, None, None),
             };
+
+            // MAN-78: with a `[server]` table, SIGHUP reloads the `[spot]`
+            // lists and each `[[rbn_uplink]]` `dry_run` (D2). The thread
+            // starts after `start_spot_server`, so its log lines have a
+            // subscriber; a SIGHUP that arrived earlier is buffered by
+            // `Signals` and handled as soon as it starts.
+            let operator_lists = std::sync::Arc::new(manta_engine::OperatorListsUpdate::default());
+            let drain_gate = std::sync::Arc::new(reload::DrainGate::default());
+            #[cfg(unix)]
+            let reload_enabled = match (reload_signals, &spot_server) {
+                (Some(signals), Some(server)) => {
+                    reload::spawn(
+                        signals,
+                        reload::ReloadContext {
+                            config_path: config_path.clone(),
+                            cli: reload_cli,
+                            cli_engine: engine,
+                            vars,
+                            startup_raw: loaded.raw.clone(),
+                            lists: operator_lists.clone(),
+                            uplinks: server.uplink_dry_run.clone(),
+                            drain_gate: drain_gate.clone(),
+                            stop: stop.clone(),
+                        },
+                    )?;
+                    true
+                }
+                _ => false,
+            };
+            #[cfg(not(unix))]
+            let reload_enabled = false;
 
             // MAN-73: wrap every reconnectable source so a later read
             // error/EOF is retried with `manta-server::backoff`'s policy
@@ -4013,7 +5457,19 @@ fn real_main() -> Result<()> {
                 Box::new(wrapped)
             } else {
                 input_health = reconnect::InputHealthTotals::for_source(first.as_ref());
-                first
+                // MAN-269: `--realtime`/`--loop` pace and loop a file replay;
+                // every loop pass reopens through `spec.open`, so it gets a
+                // fresh decimator and the same dial override.
+                let reopen_spec = spec.clone();
+                let label = replay_path
+                    .as_ref()
+                    .map_or_else(String::new, |p| p.display().to_string());
+                wrap_file_replay(
+                    first,
+                    resolved.replay,
+                    label,
+                    Box::new(move || reopen_spec.open(capture_rate_hz, dial_freq_hz)),
+                )?
             };
 
             // MAN-56: a source's packet loss/malformed counters are
@@ -4060,8 +5516,32 @@ fn real_main() -> Result<()> {
             // default disposition. If the fuller startup banner (lens 1 #7)
             // ever replaces this line, `READY_MARKER` must be updated to
             // match. stdout stays pure JSON under `--json` (MAN-59
-            // round 6); this goes to stderr.
-            logging::note("manta: listening; send SIGINT or SIGTERM to stop");
+            // round 6); this goes to stderr. MAN-78: a daemon that reloads
+            // on SIGHUP says so; the `manta: listening;` prefix the tests
+            // wait for is the same either way.
+            //
+            // MAN-312 (SPEC §2.7): the static-crash filter fails open on a
+            // narrow source; say so once rather than leave an operator who
+            // set `crash_filter` believing it acts. Logged after the servers
+            // bound, so a failed start still prints exactly one `error:`
+            // line (MAN-270), and before the readiness marker, so a reader
+            // that stops at the marker never leaves it unread.
+            if cfg.detector.crash_filter != manta_engine::CrashFilter::Off
+                && crash_live < manta_engine::CRASH_MIN_LIVE_CHANNELS
+            {
+                tracing::info!(
+                    "static-crash filter inactive: the source passband holds {crash_live} channels, fewer than the {} it needs",
+                    manta_engine::CRASH_MIN_LIVE_CHANNELS
+                );
+            }
+            if reload_enabled {
+                logging::note(
+                    "manta: listening; send SIGINT or SIGTERM to stop, SIGHUP to reload \
+                     [spot] lists and dry_run",
+                );
+            } else {
+                logging::note("manta: listening; send SIGINT or SIGTERM to stop");
+            }
             // Captured before `src` is moved into the pipeline, for the
             // readiness event below.
             let source_sample_rate_hz = src.sample_rate();
@@ -4085,6 +5565,13 @@ fn real_main() -> Result<()> {
             // asked, so its journal holds spots and diagnostics only.
             let print_text = !json && (spot_server.is_none() || decoded_text);
             let mut text_lines = text_lines::TrackLines::default();
+            // MAN-312: `listen` stores its running crash count here before
+            // each `on_tracks` call, which copies it into `Metrics`.
+            let static_crashes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            // MAN-314: the engine's marked RTTY set, logged on change and
+            // copied into `manta_rtty_signals` from the per-batch callback.
+            let rtty_observer = std::sync::Arc::new(manta_engine::RttyObserver::default());
+            let mut rtty_log = RttyLogState::new(source_sample_rate_hz);
             let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
@@ -4092,6 +5579,22 @@ fn real_main() -> Result<()> {
                 manta_engine::ListenObservers {
                     active_tracks: active_tracks.clone(),
                     decode_latency: decode_latency.clone(),
+                    decode_quality: decode_quality.clone(),
+                    operator_lists: reload_enabled.then(|| operator_lists.clone()),
+                    static_crashes: Some(static_crashes.clone()),
+                    rtty: Some(rtty_observer.clone()),
+                    // MAN-324: only with a live-state listener.
+                    live_state: spot_server
+                        .as_ref()
+                        .filter(|server| server.live_addr.is_some())
+                        .map(|server| {
+                            std::sync::Arc::new(live_state::LiveSink::new(
+                                server.bus.clone(),
+                                server.metrics.clone(),
+                                &server.station_callsign,
+                            ))
+                                as std::sync::Arc<dyn manta_engine::LiveStateSink>
+                        }),
                 },
                 |ev| {
                     if json {
@@ -4117,7 +5620,10 @@ fn real_main() -> Result<()> {
                 // (MAN-123); decoded text and diagnostics go to stderr.
                 |spot| {
                     if let Some(server) = &spot_server {
-                        server.bus.publish(spot.clone());
+                        let truncated = server.bus.publish(spot.clone());
+                        if truncated > 0 {
+                            server.metrics.record_history_truncated(truncated as u64);
+                        }
                         server.metrics.record_spot(spot);
                         // MAN-136/MAN-45: counted ONCE per spot here, NOT
                         // inside `SpotMessage::from_spot` -- that runs once
@@ -4138,15 +5644,7 @@ fn real_main() -> Result<()> {
                         println!("{}", serde_json::json!({ "spot": spot }));
                         return;
                     }
-                    println!(
-                        "SPOT: {} ({:?}) {:.1} Hz {:.0} dB {:.0} wpm conf={:.2}",
-                        spot.callsign,
-                        spot.spot_type,
-                        spot.freq_hz,
-                        spot.snr_db,
-                        spot.wpm,
-                        spot.confidence
-                    );
+                    println!("{}", fmt::spot_line(spot));
                 },
                 // MAN-122 review round 1: the live track gauge comes from
                 // `TrackManager`'s own lifecycle -- how many tracks are
@@ -4165,8 +5663,16 @@ fn real_main() -> Result<()> {
                 // only thing that lets the status line say "stalled"
                 // instead of republishing a frozen `tracks=N` forever.
                 |n_tracks| {
+                    if let Some(marks_hz) = rtty_log.poll(&rtty_observer) {
+                        if let Some(server) = &spot_server {
+                            server.metrics.set_rtty_signals(&marks_hz);
+                        }
+                    }
                     if let Some(server) = &spot_server {
                         server.metrics.set_active_tracks(n_tracks as u64);
+                        server.metrics.set_static_crashes_total(
+                            static_crashes.load(std::sync::atomic::Ordering::Relaxed),
+                        );
                         server.metrics.record_pipeline_batch();
                         // The first batch is the earliest moment the daemon
                         // can honestly claim to be decoding: `listen`'s
@@ -4198,6 +5704,13 @@ fn real_main() -> Result<()> {
                     }
                 },
             );
+            // MAN-78 D7: the decode loop has returned, so the daemon is
+            // draining from here on. Closing the gate (under the lock a
+            // reload holds while it applies) and setting `stop` tell the
+            // reload thread to ignore SIGHUP instead of flipping `dry_run`
+            // mid-drain.
+            drain_gate.close();
+            stop_ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
             // A source read error returns from listen without closing its
             // tracks, so their partial lines are printed here, on both paths.
@@ -4237,6 +5750,11 @@ fn real_main() -> Result<()> {
                         .metrics
                         .set_decode_latency(latency_histogram_of(&obs.snapshot()));
                 }
+                if let Some(obs) = &decode_quality {
+                    server
+                        .metrics
+                        .set_decode_quality(decode_quality_of(&obs.snapshot()));
+                }
                 server.metrics.mark_decode_stopped();
                 if let Some(poller) = decode_latency_poller.take() {
                     poller.abort();
@@ -4270,6 +5788,7 @@ fn real_main() -> Result<()> {
                     }
                 }
                 server.metrics.set_active_tracks(0);
+                server.metrics.set_rtty_signals(&[]);
                 // Before `shutdown_tx.send(true)`, not after: ordering is
                 // what makes this observable at all (MAN-64) -- writing it
                 // after the drain would guarantee no scraper still
@@ -4303,6 +5822,20 @@ fn real_main() -> Result<()> {
                 {
                     if let Some(rt) = server_runtime.as_ref() {
                         let _ = rt.block_on(status_line);
+                    }
+                }
+                // MAN-301: the comparator watches the same shutdown signal;
+                // joined like the status line, bounded so a stuck feed
+                // connect can never hold the drain past its deadline.
+                if let Some(rbn_compare) = server
+                    .rbn_compare
+                    .lock()
+                    .expect("rbn_compare handle mutex poisoned")
+                    .take()
+                {
+                    if let Some(rt) = server_runtime.as_ref() {
+                        let _ =
+                            rt.block_on(tokio::time::timeout(SHUTDOWN_DRAIN_DEADLINE, rbn_compare));
                     }
                 }
             }
@@ -4339,6 +5872,10 @@ fn real_main() -> Result<()> {
             hpsdr_freq_hz,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
             capture_rate_hz,
             source_iq,
             filters,
@@ -4352,6 +5889,7 @@ fn real_main() -> Result<()> {
                 notch,
                 cty,
                 scp,
+                patterns,
             } = filters;
             let Prepared {
                 loaded,
@@ -4363,6 +5901,8 @@ fn real_main() -> Result<()> {
                     device,
                     source,
                     source_iq,
+                    realtime: false,
+                    loop_replay: false,
                     kiwi: KiwiOpts {
                         host: kiwi_host,
                         port: kiwi_port,
@@ -4383,6 +5923,13 @@ fn real_main() -> Result<()> {
                         freq: hpsdr_freq_hz,
                         rate: hpsdr_rate_hz,
                     },
+                    ka9q: Ka9qOpts {
+                        group: ka9q_group,
+                        port: ka9q_port,
+                        ssrc: ka9q_ssrc,
+                        interface: ka9q_interface,
+                        ..Ka9qOpts::unset()
+                    },
                     freq_correction_ppm,
                     dial_freq_hz,
                     capture_rate_hz,
@@ -4392,6 +5939,8 @@ fn real_main() -> Result<()> {
                     notch,
                     cty,
                     scp,
+                    patterns,
+                    rbn: RbnCompareOpts::default(),
                 },
                 config,
                 None,
@@ -4402,14 +5951,17 @@ fn real_main() -> Result<()> {
                     loaded.origin
                 );
             }
+            if let Some(note) = replay_mode_ignored_note("soak", resolved.replay, &loaded.origin) {
+                eprintln!("{note}");
+            }
             let spec = &resolved.spec;
             warn_if_audio_source_has_no_rf_reference(spec.is_rf_aware(), resolved.dial_freq_hz);
             let src: Box<dyn IqSource> =
                 spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz)?;
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
-            eprintln!("{report:?}");
+            print!("{}", fmt::soak_report(&report));
             if !manta_engine::soak_passed(&report) {
-                std::process::exit(1);
+                return Ok(std::process::ExitCode::FAILURE);
             }
         }
         Command::Status {
@@ -4432,7 +5984,7 @@ fn real_main() -> Result<()> {
                 Ok(doc) => doc,
                 Err(e) => {
                     eprintln!("{}", status_failure_message(&e));
-                    std::process::exit(2);
+                    return Ok(std::process::ExitCode::from(2));
                 }
             };
             if json {
@@ -4440,7 +5992,18 @@ fn real_main() -> Result<()> {
             } else {
                 print!("{}", manta_server::status_doc::render_human(&doc));
             }
-            std::process::exit(status_exit_code(&doc));
+            return Ok(std::process::ExitCode::from(status_exit_code(&doc)));
+        }
+        Command::Health {
+            config,
+            addr,
+            timeout_secs,
+        } => {
+            std::process::exit(health_cmd::run(
+                config.as_deref(),
+                addr.as_deref(),
+                timeout_secs,
+            ));
         }
         Command::Doctor {
             duration,
@@ -4467,10 +6030,15 @@ fn real_main() -> Result<()> {
             hpsdr_freq_hz,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
             capture_rate_hz,
             source_iq,
             dial_freq_hz,
             config,
+            ntp_server,
             json,
         } => {
             let FilterOpts {
@@ -4480,6 +6048,7 @@ fn real_main() -> Result<()> {
                 notch,
                 cty,
                 scp,
+                patterns,
             } = filters;
             // Checked before any source is opened -- otherwise an invalid
             // --duration only surfaces after a KiwiSDR/SoapySDR/HPSDR
@@ -4497,15 +6066,17 @@ fn real_main() -> Result<()> {
                 );
             }
             let Prepared {
+                config_path,
                 loaded,
                 resolved,
                 pipeline: cfg,
-                ..
             } = prepare_live(
                 CliOverrides {
                     device,
                     source,
                     source_iq,
+                    realtime: false,
+                    loop_replay: false,
                     kiwi: KiwiOpts {
                         host: kiwi_host,
                         port: kiwi_port,
@@ -4526,6 +6097,13 @@ fn real_main() -> Result<()> {
                         freq: hpsdr_freq_hz,
                         rate: hpsdr_rate_hz,
                     },
+                    ka9q: Ka9qOpts {
+                        group: ka9q_group,
+                        port: ka9q_port,
+                        ssrc: ka9q_ssrc,
+                        interface: ka9q_interface,
+                        ..Ka9qOpts::unset()
+                    },
                     freq_correction_ppm,
                     dial_freq_hz,
                     capture_rate_hz,
@@ -4535,44 +6113,193 @@ fn real_main() -> Result<()> {
                     notch,
                     cty,
                     scp,
+                    patterns,
+                    rbn: RbnCompareOpts::default(),
                 },
                 config,
                 None,
             )?;
-            if loaded.server.is_some() {
-                eprintln!(
-                    "note: doctor does not start the spot servers; ignoring [server] from {}",
-                    loaded.origin
-                );
+            if let Some(note) = replay_mode_ignored_note("doctor", resolved.replay, &loaded.origin)
+            {
+                eprintln!("{note}");
             }
+            // MAN-126: named setup checks first, each printed as it is
+            // known; the receiver and signal stages become check lines too,
+            // so a failure is named rather than ending in a generic error.
             let spec = &resolved.spec;
-            warn_if_audio_source_has_no_rf_reference(spec.is_rf_aware(), resolved.dial_freq_hz);
-            let src: Box<dyn IqSource> =
-                spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz)?;
-            let report = manta_engine::doctor(src, &cfg, std::time::Duration::from_secs(duration))?;
+            let rf_aware = spec.is_rf_aware();
+            let receiver = receiver_desc(spec);
+            let mut sink = doctor_checks::Sink::new(json);
+            doctor_checks::run_setup_checks(
+                &doctor_checks::SetupInputs {
+                    config_path: config_path.as_deref(),
+                    loaded: &loaded,
+                    needs_dial: needs_dial_freq(
+                        loaded.server.is_some(),
+                        rf_aware,
+                        resolved.dial_freq_hz,
+                    ),
+                    receiver: &receiver,
+                    ntp_server: &ntp_server,
+                },
+                &mut sink,
+            );
+            warn_if_audio_source_has_no_rf_reference(rf_aware, resolved.dial_freq_hz);
+            let report = match spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz) {
+                Err(e) => {
+                    sink.push(doctor_checks::receiver_check(&receiver, Err(&e)));
+                    None
+                }
+                Ok(src) => {
+                    sink.push(doctor_checks::receiver_check(
+                        &receiver,
+                        Ok(src.sample_rate()),
+                    ));
+                    match manta_engine::doctor(src, &cfg, std::time::Duration::from_secs(duration))
+                    {
+                        Ok(report) => {
+                            if !json {
+                                println!();
+                                print!("{}", fmt::doctor_report(&report));
+                            }
+                            Some(report)
+                        }
+                        Err(e) => {
+                            sink.push(doctor_checks::signal_check(&e));
+                            None
+                        }
+                    }
+                }
+            };
+            let checks = sink.checks;
             if json {
                 // `verdict()` is computed, not a stored field, so a plain
                 // `serde_json::to_string(&report)` omits the command's
                 // primary health classification entirely -- merge it in as
                 // an extra key rather than making JSON consumers duplicate
                 // the classification policy themselves.
-                let mut value = serde_json::to_value(&report)?;
-                if let serde_json::Value::Object(ref mut map) = value {
+                let mut map = serde_json::Map::new();
+                if let Some(report) = &report {
+                    if let serde_json::Value::Object(fields) = serde_json::to_value(report)? {
+                        map = fields;
+                    }
                     map.insert(
                         "verdict".to_string(),
                         serde_json::to_value(report.verdict())?,
                     );
                 }
-                println!("{}", serde_json::to_string(&value)?);
+                map.insert("checks".to_string(), serde_json::to_value(&checks)?);
+                map.insert(
+                    "checks_status".to_string(),
+                    serde_json::to_value(doctor_checks::worst(&checks))?,
+                );
+                println!("{}", serde_json::to_string(&map)?);
             } else {
-                print_doctor_report(&report);
+                println!();
+                println!("{}", doctor_checks::summary(&checks));
+            }
+            // As `manta status` does: the specific lines above are the
+            // whole story, so no generic `Error:` line follows them.
+            use std::io::Write as _;
+            std::io::stdout().flush()?;
+            if doctor_checks::worst(&checks) == doctor_checks::Status::Fail {
+                return Ok(std::process::ExitCode::FAILURE);
             }
         }
+        Command::Calibrate {
+            duration,
+            reference_hz,
+            search_ppm,
+            tune_hz,
+            device,
+            source,
+            kiwi_host,
+            kiwi_port,
+            kiwi_freq_hz,
+            kiwi_password,
+            #[cfg(feature = "soapy")]
+            soapy_driver,
+            #[cfg(feature = "soapy")]
+            soapy_freq_hz,
+            #[cfg(feature = "soapy")]
+            soapy_rate_hz,
+            #[cfg(feature = "soapy")]
+            soapy_gain,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_host,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_port,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_freq_hz,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_rate_hz,
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
+            capture_rate_hz,
+            source_iq,
+            dial_freq_hz,
+            config,
+            write,
+            json,
+        } => calibrate_cmd::run(calibrate_cmd::CalibrateArgs {
+            duration_secs: duration,
+            reference_hz,
+            search_ppm,
+            tune_hz,
+            write,
+            json,
+            config,
+            cli: CliOverrides {
+                device,
+                source,
+                source_iq,
+                kiwi: KiwiOpts {
+                    host: kiwi_host,
+                    port: kiwi_port,
+                    freq: kiwi_freq_hz,
+                    password: kiwi_password,
+                },
+                #[cfg(feature = "soapy")]
+                soapy: SoapyOpts {
+                    driver: soapy_driver,
+                    freq: soapy_freq_hz,
+                    rate: soapy_rate_hz,
+                    gain: soapy_gain,
+                },
+                #[cfg(feature = "hpsdr")]
+                hpsdr: HpsdrOpts {
+                    host: hpsdr_host,
+                    port: hpsdr_port,
+                    freq: hpsdr_freq_hz,
+                    rate: hpsdr_rate_hz,
+                },
+                ka9q: Ka9qOpts {
+                    group: ka9q_group,
+                    port: ka9q_port,
+                    ssrc: ka9q_ssrc,
+                    interface: ka9q_interface,
+                    ..Ka9qOpts::unset()
+                },
+                capture_rate_hz,
+                dial_freq_hz,
+                ..CliOverrides::none()
+            },
+        })?,
         Command::Config(ConfigCommand::Check { config }) => config_cmd::check(config)?,
         Command::Config(ConfigCommand::Init { out, force }) => config_cmd::init(&out, force)?,
         Command::Bench(BenchCommand::Sensitivity(args)) => bench::sensitivity(args)?,
+        Command::Grade { args } => grade_cmd::run(args)?,
+        Command::Completions { shell } => {
+            cli_docs::write_completions(shell, &mut Cli::command(), &mut std::io::stdout().lock())?
+        }
+        Command::ManPages { out } => {
+            let n = cli_docs::write_man_pages(Cli::command(), &out)?;
+            eprintln!("wrote {n} man pages to {}", out.display());
+        }
     }
-    Ok(())
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 /// Which replaced CLI spelling the operator typed, if any.
@@ -4638,49 +6365,230 @@ fn warn_deprecations() {
     }
 }
 
-/// Human-readable `manta doctor` summary. `--json` bypasses this entirely
-/// in favor of the raw `DoctorReport`.
-fn print_doctor_report(report: &manta_engine::DoctorReport) {
-    println!(
-        "source: {:.0} Hz sample rate, {:.1} Hz center, observed for {:.1}s",
-        report.sample_rate_hz,
-        report.center_freq_hz,
-        report.duration.as_secs_f64()
-    );
-    println!(
-        "tracks: {} promoted, {} TrackMeta updates, {} closed",
-        report.tracks_promoted, report.track_meta_count, report.tracks_closed
-    );
-    match (report.snr_db_min, report.snr_db_median, report.snr_db_max) {
-        (Some(min), Some(median), Some(max)) => {
-            println!("snr_2500_db: min={min:.1} median={median:.1} max={max:.1}");
-        }
-        // `tracks_promoted` is verdict()'s own authoritative signal for
-        // "did anything really happen" -- match its logic exactly rather
-        // than re-deriving it from a different combination of fields.
-        _ if report.tracks_promoted == 0 => {
-            println!("snr_2500_db: no TrackMeta events -- no track ever promoted")
-        }
-        _ => println!(
-            "snr_2500_db: a track was promoted but no TrackMeta ever landed for it before this \
-             run ended"
-        ),
+/// MAN-314: `decode`'s RTTY summary line, `rtty: 0` without RTTY;
+/// `decode` prints it only when RTTY was marked.
+fn rtty_line(signals: &[manta_engine::RttySignalReport], fs: f64) -> String {
+    if signals.is_empty() {
+        return "rtty: 0".into();
     }
-    println!(
-        "decode: {} chars ({} distinct), {} confirmed spots",
-        report.chars_decoded, report.distinct_chars, report.spots_confirmed
-    );
-    println!("verdict: {}", report.verdict().summary());
+    let parts: Vec<String> = signals
+        .iter()
+        .map(|s| {
+            format!(
+                "{:.3} kHz shift {} Hz from {:.1} s",
+                s.mark_hz / 1000.0,
+                s.shift_hz,
+                s.marked_sample_ts as f64 / fs
+            )
+        })
+        .collect();
+    format!("rtty: {} ({})", signals.len(), parts.join("; "))
+}
+
+/// MAN-314: `run`'s log line when the detector marks an RTTY signal.
+fn format_rtty_marked(s: &manta_engine::RttySignalReport) -> String {
+    format!(
+        "RTTY marked: {:.3} kHz shift {} Hz (measured {:.1} Hz); no CW tracks there while it lasts",
+        s.mark_hz / 1000.0,
+        s.shift_hz,
+        s.measured_shift_hz
+    )
+}
+
+/// MAN-314: `run`'s log line when a marked RTTY signal clears.
+fn format_rtty_cleared(s: &manta_engine::RttySignalReport, marked_for_secs: u64) -> String {
+    format!(
+        "RTTY cleared: {:.3} kHz shift {} Hz, marked for {marked_for_secs} s",
+        s.mark_hz / 1000.0,
+        s.shift_hz
+    )
+}
+
+/// MAN-314: whole seconds of stream time from `s`'s mark to
+/// `cleared_sample_ts`, at `fs` samples per second. Stream time, not wall
+/// time: a file replay without `--realtime` runs far faster than real time
+/// (Codex review on PR #272).
+fn rtty_marked_for_secs(
+    s: &manta_engine::RttySignalReport,
+    cleared_sample_ts: u64,
+    fs: f64,
+) -> u64 {
+    (cleared_sample_ts.saturating_sub(s.marked_sample_ts) as f64 / fs) as u64
+}
+
+/// MAN-314: what `run` last saw of the engine's marked RTTY set, so a
+/// change logs one line per newly marked or cleared signal.
+struct RttyLogState {
+    /// The source's sample rate, for the engine's sample timestamps.
+    sample_rate_hz: f64,
+    generation: u64,
+    current: std::collections::BTreeMap<u32, manta_engine::RttySignalReport>,
+}
+
+impl RttyLogState {
+    fn new(sample_rate_hz: f64) -> Self {
+        Self {
+            sample_rate_hz,
+            generation: 0,
+            current: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Logs the marks and clears since the last call. Returns the current
+    /// mark frequencies when the set changed, `None` otherwise.
+    fn poll(&mut self, obs: &manta_engine::RttyObserver) -> Option<Vec<f64>> {
+        let generation = obs.generation();
+        if generation == self.generation {
+            return None;
+        }
+        self.generation = generation;
+        let (snapshot, sample_ts) = obs.snapshot_with_sample_ts();
+        let ids: Vec<u32> = snapshot.iter().map(|s| s.id).collect();
+        let fs = self.sample_rate_hz;
+        self.current.retain(|id, s| {
+            let keep = ids.contains(id);
+            if !keep {
+                let secs = rtty_marked_for_secs(s, sample_ts, fs);
+                tracing::info!("{}", format_rtty_cleared(s, secs));
+            }
+            keep
+        });
+        for s in &snapshot {
+            match self.current.entry(s.id) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    tracing::info!("{}", format_rtty_marked(s));
+                    slot.insert(s.clone());
+                }
+                // Still marked: keep its clear line on the current
+                // frequency and shift.
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    *slot.get_mut() = s.clone();
+                }
+            }
+        }
+        Some(snapshot.iter().map(|s| s.mark_hz).collect())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn cli_definition_passes_clap_debug_assert() {
+        Cli::command().debug_assert();
+    }
+
+    /// MAN-133: clap_complete 4.6 writes hidden subcommands and flags into
+    /// every shell's script, so hiding one would still offer it on <TAB>.
+    /// Filter them in cli_docs before hiding anything.
+    #[test]
+    fn no_command_or_flag_is_hidden() {
+        fn walk(cmd: &clap::Command, path: &str, hidden: &mut Vec<String>) {
+            for arg in cmd.get_arguments().filter(|a| a.is_hide_set()) {
+                hidden.push(format!("{path} --{}", arg.get_id()));
+            }
+            for sub in cmd.get_subcommands() {
+                let p = format!("{path} {}", sub.get_name());
+                if sub.is_hide_set() {
+                    hidden.push(p.clone());
+                }
+                walk(sub, &p, hidden);
+            }
+        }
+        let mut hidden = Vec::new();
+        let mut cmd = Cli::command();
+        cmd.build();
+        walk(&cmd, "manta", &mut hidden);
+        assert!(hidden.is_empty(), "hidden: {hidden:?}");
+    }
+
+    fn rtty_sig() -> manta_engine::RttySignalReport {
+        manta_engine::RttySignalReport {
+            mark_hz: 14_080_002.4,
+            space_hz: 14_079_832.6,
+            shift_hz: 170.0,
+            measured_shift_hz: 169.8,
+            marked_sample_ts: 2_016_000,
+            cleared_sample_ts: None,
+            id: 1,
+        }
+    }
+
+    #[test]
+    fn rtty_log_lines_match_the_design() {
+        assert_eq!(
+            format_rtty_marked(&rtty_sig()),
+            "RTTY marked: 14080.002 kHz shift 170 Hz (measured 169.8 Hz); no CW tracks there while it lasts"
+        );
+        assert_eq!(
+            format_rtty_cleared(&rtty_sig(), 446),
+            "RTTY cleared: 14080.002 kHz shift 170 Hz, marked for 446 s"
+        );
+    }
+
+    /// Codex review on PR #272: the duration is the stream time between
+    /// the engine's mark and clear timestamps, whatever the replay pace.
+    #[test]
+    fn rtty_marked_for_counts_stream_seconds() {
+        // Marked at 21.0 s, cleared 446.9 s later at 96 kHz.
+        let cleared = 2_016_000 + 42_902_400;
+        assert_eq!(rtty_marked_for_secs(&rtty_sig(), cleared, 96_000.0), 446);
+        assert_eq!(rtty_marked_for_secs(&rtty_sig(), 2_016_000, 96_000.0), 0);
+        assert_eq!(rtty_marked_for_secs(&rtty_sig(), 0, 96_000.0), 0);
+    }
+
+    #[test]
+    fn rtty_decode_line_lists_each_signal() {
+        assert_eq!(rtty_line(&[], 96_000.0), "rtty: 0");
+        assert_eq!(
+            rtty_line(&[rtty_sig()], 96_000.0),
+            "rtty: 1 (14080.002 kHz shift 170 Hz from 21.0 s)"
+        );
+    }
     // Derived from manta_spot's constant, never hardcoded, so a cty.dat refresh
     // does not break these tests.
     fn at_day(d: u64) -> SystemTime {
         manta_spot::vintage::cty_dat_retrieved_at().unwrap() + Duration::from_secs(d * 86_400)
+    }
+
+    #[test]
+    fn audio_silence_warning_names_the_device_the_rate_and_the_hint() {
+        let w = audio_silence_warning("\"Test Mic\"");
+        assert!(
+            w.starts_with(
+                "warning: audio input \"Test Mic\" is delivering digital silence at 48000 Hz \
+                 (every sample is exactly zero) -- "
+            ),
+            "{w}"
+        );
+        assert!(w.ends_with(manta_input::audio::audio_input_hint()), "{w}");
+    }
+
+    #[test]
+    fn recording_center_warning_covers_a_missing_and_a_non_positive_sidecar() {
+        let wav = Path::new("/rec/x.wav");
+        let missing = recording_center_warning(wav, None).unwrap();
+        assert!(
+            missing.starts_with("warning: no sidecar /rec/x.json next to /rec/x.wav -- "),
+            "{missing}"
+        );
+        let zero = recording_center_warning(wav, Some(0.0)).unwrap();
+        for w in [&missing, &zero] {
+            assert!(
+                w.contains("baseband offsets") && w.contains("--center-freq-hz 14000000"),
+                "{w}"
+            );
+        }
+        assert!(
+            zero.starts_with(
+                "warning: sidecar /rec/x.json gives center_freq_hz = 0, not an RF frequency -- "
+            ),
+            "{zero}"
+        );
+        assert!(recording_center_warning(wav, Some(-5.0)).is_some());
+        assert!(recording_center_warning(wav, Some(14_000_000.0)).is_none());
     }
 
     #[test]
@@ -4731,13 +6639,41 @@ mod tests {
     const QQ9_ENTITY: &str = "Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n";
 
     #[test]
+    fn cli_patterns_override_file_and_preserve_validation_level() {
+        let spot = config::SpotFile {
+            pattern_path: Some("file.lst".into()),
+            validation_level: manta_spot::ValidationLevel::Minimal,
+            ..Default::default()
+        };
+        let r = resolve_spot(
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            Some("cli.lst".into()),
+            &spot,
+        );
+        assert_eq!(r.patterns, Some("cli.lst".into()));
+        assert_eq!(r.validation_level, manta_spot::ValidationLevel::Minimal);
+    }
+
+    #[test]
     fn cli_cty_beats_cty_path() {
         let spot = config::SpotFile {
             cty_path: Some("file.dat".into()),
             scp_path: Some("file.scp".into()),
             ..Default::default()
         };
-        let r = resolve_spot(vec![], None, None, Some("cli.dat".into()), None, &spot);
+        let r = resolve_spot(
+            vec![],
+            None,
+            None,
+            Some("cli.dat".into()),
+            None,
+            None,
+            &spot,
+        );
         assert_eq!(r.cty, Some("cli.dat".into()));
         assert_eq!(r.scp, Some("file.scp".into()));
     }
@@ -4748,18 +6684,42 @@ mod tests {
             scp_path: Some("file.scp".into()),
             ..Default::default()
         };
-        let r = resolve_spot(vec![], None, None, None, Some("cli.scp".into()), &spot);
+        let r = resolve_spot(
+            vec![],
+            None,
+            None,
+            None,
+            Some("cli.scp".into()),
+            None,
+            &spot,
+        );
         assert_eq!(r.cty, Some("file.dat".into()));
         assert_eq!(r.scp, Some("cli.scp".into()));
     }
     #[test]
     fn unset_cty_and_scp_stay_built_in() {
-        let r = resolve_spot(vec![], None, None, None, None, &config::SpotFile::default());
+        let r = resolve_spot(
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            &config::SpotFile::default(),
+        );
         let cfg = build_pipeline_config(0.0, &r, Default::default(), Engine::Legacy).unwrap();
         assert!(cfg.cty.is_none() && cfg.scp.is_none());
     }
     fn tables_config(cty: Option<PathBuf>, scp: Option<PathBuf>) -> Result<PipelineConfig> {
-        let spot = resolve_spot(vec![], None, None, cty, scp, &config::SpotFile::default());
+        let spot = resolve_spot(
+            vec![],
+            None,
+            None,
+            cty,
+            scp,
+            None,
+            &config::SpotFile::default(),
+        );
         build_pipeline_config(0.0, &spot, Default::default(), Engine::Legacy)
     }
     #[test]
@@ -4835,6 +6795,7 @@ mod tests {
         let (test_runtime, server) = start_spot_server(
             loaded.server.unwrap(),
             vec![],
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -4844,7 +6805,10 @@ mod tests {
             },
             std::time::UNIX_EPOCH,
             0,
-            table.clone(),
+            &PipelineConfig {
+                cty: Some(table.clone()),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert!(std::sync::Arc::ptr_eq(&server.cty, &table));
@@ -4857,6 +6821,29 @@ mod tests {
         let _ = server.shutdown_tx.send(true);
         test_runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     }
+    /// MAN-126: doctor's help names the clock check's server flag, the four
+    /// statuses, and the exit rule scripts rely on.
+    #[test]
+    fn doctor_help_lists_ntp_server_and_the_exit_rule() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let doctor = cli.find_subcommand_mut("doctor").unwrap();
+        let help = doctor.render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "--ntp-server",
+            "Setup checks",
+            "PASS, WARN, FAIL or SKIP",
+            "Exits 1 when a check fails",
+            "pool.ntp.org",
+        ] {
+            assert!(
+                flat.contains(needle),
+                "doctor --help lacks {needle:?}:\n{help}"
+            );
+        }
+    }
+
     #[test]
     fn help_lists_cty_and_scp_for_every_validating_command() {
         use clap::CommandFactory;
@@ -5133,6 +7120,7 @@ mod tests {
         let (rt, server) = start_spot_server(
             loaded.server.unwrap(),
             loaded.rbn_uplink,
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -5142,7 +7130,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -5964,6 +7952,7 @@ mod tests {
         let (rt, _server) = start_spot_server(
             loaded.server.unwrap(),
             loaded.rbn_uplink,
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -5973,7 +7962,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -6023,6 +8012,7 @@ mod tests {
         let (rt, _server) = start_spot_server(
             loaded.server.unwrap(),
             loaded.rbn_uplink,
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -6032,7 +8022,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -6080,6 +8070,7 @@ mod tests {
         let result = start_spot_server(
             loaded.server.unwrap(),
             loaded.rbn_uplink,
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -6089,13 +8080,151 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         );
         assert!(
             result.is_ok(),
             "a config with the operator-identity keys present must still start: {:?}",
             result.err()
         );
+    }
+
+    /// MAN-138: starts the daemon's servers from a real config file (through
+    /// `config::load` and `start_spot_server`, as `run` does), publishes one
+    /// spot and returns the line a raw TCP client reads from the JSON port.
+    fn json_spot_from_a_daemon(callsign: &str, location_keys: &str) -> serde_json::Value {
+        let cfg_file = write_temp_file(
+            format!(
+                "[server]\nstation_callsign = \"{callsign}\"\nbind_addr = '127.0.0.1'\n\
+                 telnet_port = 0\njson_port = 0\nmetrics_port = 0\n{location_keys}"
+            )
+            .as_bytes(),
+        );
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
+        let (rt, server) = start_spot_server(
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
+            None,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0),
+                freq_calibration: 1.0,
+            },
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+            &PipelineConfig::default(),
+        )
+        .unwrap();
+
+        let line = rt.block_on(async {
+            use tokio::io::AsyncBufReadExt;
+            let stream = tokio::net::TcpStream::connect(server.json_addr)
+                .await
+                .unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            // Let the listener accept and subscribe before the publish (the
+            // json_stream_acceptance precedent).
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            server.bus.publish(manta_spot::Spot {
+                callsign: "JA1ABC".to_string(),
+                freq_hz: 14_027_100.0,
+                snr_db: 23.0,
+                wpm: 28.0,
+                spot_type: manta_spot::SpotType::Cq,
+                confidence: 0.9,
+                track_id: 7,
+                sample_ts: 12_345,
+            });
+            let mut line = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                reader.read_line(&mut line),
+            )
+            .await
+            .expect("timed out waiting for a JSON spot")
+            .unwrap();
+            line
+        });
+
+        let _ = server.shutdown_tx.send(true);
+        shutdown_runtime_after_drain(rt, &server.tasks);
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("{line:?}: {e}"))
+    }
+
+    /// MAN-138's Gherkin scenario, end to end: an operator configures their
+    /// station's grid square, and every JSON spot names that location as
+    /// deGrid/deLat/deLon -- not the cty.dat centroid (37.6, -91.87) that
+    /// every US-based spotter used to share.
+    #[test]
+    fn a_configured_station_grid_reaches_json_spots_as_the_receiver_position() {
+        let mut positions = Vec::new();
+        for (call, grid) in [("W1AW", "FN31pr"), ("W5AU", "EM12kp")] {
+            let spot = json_spot_from_a_daemon(call, &format!("operator_grid = \"{grid}\"\n"));
+            let (lat, lon) = manta_server::maidenhead::square(grid).unwrap().center();
+            assert_eq!(spot["deCall"], call, "{spot}");
+            assert_eq!(spot["deGrid"], grid, "{spot}");
+            let de_lat = spot["deLat"].as_f64().expect("deLat is a number");
+            let de_lon = spot["deLon"].as_f64().expect("deLon is a number");
+            assert!(
+                (de_lat - lat).abs() < 1e-9,
+                "{call}: deLat {de_lat}, want {lat}"
+            );
+            assert!(
+                (de_lon - lon).abs() < 1e-9,
+                "{call}: deLon {de_lon}, want {lon}"
+            );
+            assert_ne!((de_lat, de_lon), (37.6, -91.87), "{call}: the US centroid");
+            // Entity-level fields still follow the callsign.
+            assert_eq!(spot["deDxcc"], 291, "{spot}");
+            positions.push((de_lat, de_lon));
+        }
+        assert_ne!(
+            positions[0], positions[1],
+            "two stations in one country must not share a position"
+        );
+    }
+
+    /// With no location configured, the daemon sends the contract-legal
+    /// "unknown" (`null`), never a country centroid in its place.
+    #[test]
+    fn a_station_without_a_configured_location_sends_null_position_not_a_country_centroid() {
+        let spot = json_spot_from_a_daemon("W1AW", "");
+        for key in ["deGrid", "deLat", "deLon"] {
+            assert!(spot[key].is_null(), "{key}: {spot}");
+        }
+        assert_eq!(spot["deDxcc"], 291, "{spot}");
+    }
+
+    /// The belt-and-braces path for a caller that skips `config::load`: a
+    /// hand-built config with half a lat/lon pair never starts a listener.
+    #[test]
+    fn start_spot_server_rejects_an_inconsistent_station_location() {
+        let cfg = manta_server::config::ServerConfig {
+            operator_lat: Some(41.7),
+            ..test_server_config("W1AW")
+        };
+        let Err(err) = start_spot_server(
+            cfg,
+            Vec::new(),
+            None,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0),
+                freq_calibration: 1.0,
+            },
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+            &PipelineConfig::default(),
+        ) else {
+            panic!("half a lat/lon pair must not start the servers");
+        };
+        let err = format!("{err:#}");
+        assert!(err.contains("operator_lon"), "{err}");
+        assert!(err.starts_with("[server]: "), "{err}");
     }
 
     #[test]
@@ -6136,6 +8265,7 @@ mod tests {
         let (rt, _server) = start_spot_server(
             loaded.server.unwrap(),
             loaded.rbn_uplink,
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -6145,7 +8275,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -6304,6 +8434,33 @@ mod tests {
             .contains(r#"manta_source_health{source="kiwi"} 0"#));
     }
 
+    /// MAN-314: `manta_rtty_signals` is published only from the per-batch
+    /// callback, which cannot run while `listen()` is blocked in the
+    /// reconnecting `read()`, so the unhealthy transition must zero it or
+    /// it exports the pre-outage RTTY counts for the whole outage.
+    #[test]
+    fn source_health_sink_zeroes_rtty_signals_when_the_source_goes_unhealthy() {
+        use std::sync::Arc;
+
+        let metrics = Arc::new(manta_server::metrics::Metrics::new());
+        metrics.set_rtty_signals(&[14_080_000.0, 14_086_000.0]);
+        let mut sink = source_health_sink("kiwi", Some(metrics.clone()), None);
+
+        sink(true);
+        assert!(
+            metrics
+                .render_prometheus_text()
+                .contains(r#"manta_rtty_signals{band="20m"} 2"#),
+            "a healthy report leaves the marked RTTY set alone"
+        );
+        sink(false);
+        let text = metrics.render_prometheus_text();
+        assert!(
+            text.contains(r#"manta_rtty_signals{band="20m"} 0"#),
+            "an unhealthy source has no marked RTTY signals: {text}"
+        );
+    }
+
     /// MAN-96: a reconnecting source's healthy -> unhealthy -> healthy
     /// round trip through the real sink is one `manta_source_outages_total`
     /// increment.
@@ -6428,6 +8585,31 @@ mod tests {
             manta_engine::DECODE_LATENCY_BUCKETS_SECONDS
         );
         assert_eq!(h.bucket_counts.iter().sum::<u64>(), 1);
+    }
+
+    #[test]
+    fn decode_quality_of_attaches_the_engines_bucket_bounds() {
+        let obs = manta_engine::DecodeQualityObserver::new();
+        obs.add_chars(4);
+        obs.add_garbles(1);
+        obs.observe_rail_ratio(3.5);
+        let q = decode_quality_of(&obs.snapshot());
+        assert_eq!(q.chars_total, 4);
+        assert_eq!(q.garbles_total, 1);
+        assert_eq!(q.rail_ratio.bounds, manta_engine::RAIL_RATIO_BUCKETS);
+        assert_eq!(
+            q.rail_ratio.bucket_counts.len(),
+            q.rail_ratio.bounds.len() + 1
+        );
+        assert_eq!(q.rail_ratio.bucket_counts.iter().sum::<u64>(), 1);
+        assert_eq!(
+            q.repetitions.bounds,
+            manta_spot::REPETITION_BUCKETS.map(f64::from)
+        );
+        assert_eq!(
+            q.repetitions.bucket_counts.len(),
+            q.repetitions.bounds.len() + 1
+        );
     }
 
     #[test]
@@ -6639,13 +8821,258 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(*source_iq);
     }
 
+    // ---- MAN-269: paced and looping file replay
+
+    const FILE_INPUT: &str = "[input]\ntype = \"file\"\npath = \"/x/v1.wav\"\niq = true\n";
+
+    #[test]
+    fn realtime_flag_paces_a_cli_file_source() {
+        let cli = CliOverrides {
+            source: Some(PathBuf::from("x.wav")),
+            realtime: true,
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded_from("")).unwrap();
+        assert_eq!(
+            r.replay,
+            ReplayMode {
+                paced: true,
+                looped: false
+            }
+        );
+    }
+
+    #[test]
+    fn loop_flag_implies_pacing() {
+        let cli = CliOverrides {
+            source: Some(PathBuf::from("x.wav")),
+            loop_replay: true,
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded_from("")).unwrap();
+        assert_eq!(
+            r.replay,
+            ReplayMode {
+                paced: true,
+                looped: true
+            }
+        );
+    }
+
+    #[test]
+    fn input_realtime_and_loop_keys_apply_to_a_config_file_source() {
+        let loaded = loaded_from(&format!("{FILE_INPUT}realtime = true\nloop = true\n"));
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        assert!(matches!(r.spec, LiveSourceSpec::File { .. }));
+        assert_eq!(
+            r.replay,
+            ReplayMode {
+                paced: true,
+                looped: true
+            }
+        );
+        let r = resolve(
+            cli_overrides(),
+            &loaded_from(&format!("{FILE_INPUT}realtime = true\n")),
+        )
+        .unwrap();
+        assert_eq!(
+            r.replay,
+            ReplayMode {
+                paced: true,
+                looped: false
+            }
+        );
+    }
+
+    #[test]
+    fn cli_realtime_adds_to_a_config_file_source() {
+        let cli = CliOverrides {
+            realtime: true,
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded_from(FILE_INPUT)).unwrap();
+        assert_eq!(
+            r.replay,
+            ReplayMode {
+                paced: true,
+                looped: false
+            }
+        );
+        let cli = CliOverrides {
+            loop_replay: true,
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded_from(&format!("{FILE_INPUT}realtime = true\n"))).unwrap();
+        assert_eq!(
+            r.replay,
+            ReplayMode {
+                paced: true,
+                looped: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_cli_source_selector_discards_the_files_realtime_and_loop() {
+        let loaded = loaded_from(&format!("{FILE_INPUT}realtime = true\nloop = true\n"));
+        let cli = CliOverrides {
+            source: Some(PathBuf::from("y.wav")),
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded).unwrap();
+        assert_eq!(r.replay, ReplayMode::default());
+        let LiveSourceSpec::File { path, .. } = &r.spec else {
+            panic!("expected the CLI file source");
+        };
+        assert_eq!(path, &PathBuf::from("y.wav"));
+    }
+
+    #[test]
+    fn realtime_with_a_live_source_is_an_error() {
+        let cli = CliOverrides {
+            kiwi: KiwiOpts {
+                host: Some("192.0.2.1".into()),
+                port: 8073,
+                freq: Some(7_030_000.0),
+                password: String::new(),
+            },
+            realtime: true,
+            loop_replay: true,
+            ..cli_overrides()
+        };
+        let err = resolve(cli, &loaded_from("")).err().unwrap().to_string();
+        assert_eq!(
+            err,
+            "--realtime only applies to a file replay (--source, or input.type = \"file\"); a \
+             live source already runs in real time"
+        );
+    }
+
+    #[test]
+    fn loop_with_the_default_audio_device_is_an_error() {
+        let cli = CliOverrides {
+            loop_replay: true,
+            ..cli_overrides()
+        };
+        let err = resolve(cli, &loaded_from("")).err().unwrap().to_string();
+        assert_eq!(
+            err,
+            "--loop only applies to a file replay (--source, or input.type = \"file\"); a live \
+             source never reaches an end to loop from"
+        );
+        // The same for a typed non-file [input] the CLI adds --loop to.
+        let cli = CliOverrides {
+            loop_replay: true,
+            ..cli_overrides()
+        };
+        let err = resolve(cli, &loaded_from(KIWI_INPUT))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.starts_with("--loop only applies to a file replay"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn replay_mode_note_names_the_ignored_keys() {
+        let mode = ReplayMode::from_flags(true, false);
+        assert_eq!(
+            replay_mode_ignored_note("soak", mode, "demo.toml").as_deref(),
+            Some(
+                "note: soak replays files as fast as it can; ignoring input.realtime/input.loop \
+                 from demo.toml"
+            )
+        );
+        assert_eq!(
+            replay_mode_ignored_note("doctor", ReplayMode::default(), "demo.toml"),
+            None
+        );
+    }
+
+    /// `n` samples of a ramp at `fs`, for the `wrap_file_replay` tests.
+    struct RampSource {
+        n: usize,
+        cursor: usize,
+        fs: f64,
+    }
+
+    impl IqSource for RampSource {
+        fn sample_rate(&self) -> f64 {
+            self.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            0.0
+        }
+        fn read(&mut self, buf: &mut [num_complex::Complex32]) -> Result<usize> {
+            let k = buf.len().min(self.n - self.cursor);
+            for (i, s) in buf[..k].iter_mut().enumerate() {
+                *s = num_complex::Complex32::new((self.cursor + i) as f32, 0.0);
+            }
+            self.cursor += k;
+            Ok(k)
+        }
+    }
+
+    fn ramp(n: usize, fs: f64) -> Box<dyn IqSource> {
+        Box::new(RampSource { n, cursor: 0, fs })
+    }
+
+    #[test]
+    fn wrap_file_replay_is_identity_for_the_default_mode() {
+        let first = ramp(10, 1000.0);
+        let before = &*first as *const dyn IqSource as *const ();
+        let wrapped = wrap_file_replay(
+            first,
+            ReplayMode::default(),
+            "x.wav".into(),
+            Box::new(|| bail!("the default mode never reopens")),
+        )
+        .unwrap();
+        assert_eq!(&*wrapped as *const dyn IqSource as *const (), before);
+    }
+
+    #[test]
+    fn wrap_file_replay_loops_inside_pacing() {
+        // 100 samples at 1 kS/s, read 300 times over: three passes of one
+        // paced clock take >= 300 ms. Lower bound only.
+        let mut src = wrap_file_replay(
+            ramp(100, 1000.0),
+            ReplayMode::from_flags(false, true),
+            "x.wav".into(),
+            Box::new(|| Ok(ramp(100, 1000.0))),
+        )
+        .unwrap();
+        let mut buf = vec![num_complex::Complex32::new(0.0, 0.0); 300];
+        let start = std::time::Instant::now();
+        let mut filled = 0;
+        while filled < buf.len() {
+            let n = src.read(&mut buf[filled..]).unwrap();
+            assert!(n > 0, "the loop ended after {filled} samples");
+            filled += n;
+        }
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(290),
+            "300 paced samples at 1 kS/s took only {:?}",
+            start.elapsed()
+        );
+        assert_eq!(buf[99].re, 99.0);
+        assert_eq!(
+            buf[100].re, 0.0,
+            "the second pass starts from the first sample"
+        );
+        assert_eq!(buf[299].re, 99.0);
+    }
+
     #[test]
     fn cli_allowlist_replaces_file_allowlist() {
         let spot = config::SpotFile {
             allowlist: vec!["W1AW".into()],
             ..Default::default()
         };
-        let r = resolve_spot(vec!["K1ABC".into()], None, None, None, None, &spot);
+        let r = resolve_spot(vec!["K1ABC".into()], None, None, None, None, None, &spot);
         assert_eq!(r.allowlist, vec!["K1ABC".to_string()]);
     }
 
@@ -6655,7 +9082,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             allowlist: vec!["W1AW".into()],
             ..Default::default()
         };
-        let r = resolve_spot(Vec::new(), None, None, None, None, &spot);
+        let r = resolve_spot(Vec::new(), None, None, None, None, None, &spot);
         assert_eq!(r.allowlist, vec!["W1AW".to_string()]);
     }
 
@@ -6669,6 +9096,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let r = resolve_spot(
             Vec::new(),
             Some(PathBuf::from("cli.txt")),
+            None,
             None,
             None,
             None,
@@ -6746,11 +9174,191 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
     }
 
+    // ---- MAN-140: the ka9q-radio source
+
+    #[test]
+    fn every_live_command_rejects_zero_ka9q_port() {
+        let mut accepted_invalid = Vec::new();
+        for command in ["run", "listen", "soak", "doctor", "calibrate", "check"] {
+            let mut args = vec!["manta", command, "--ka9q-group", "239.101.6.1"];
+            if command == "soak" {
+                args.extend(["--duration", "1"]);
+            }
+            assert!(
+                Cli::try_parse_from(&args).is_ok(),
+                "{command}: default port"
+            );
+            for port in ["1", "5004", "65535"] {
+                assert!(
+                    Cli::try_parse_from(args.iter().copied().chain(["--ka9q-port", port])).is_ok(),
+                    "{command}: valid port {port}"
+                );
+            }
+            for port in ["0", "65536"] {
+                match Cli::try_parse_from(args.iter().copied().chain(["--ka9q-port", port])) {
+                    Ok(_) => accepted_invalid.push(format!("{command}: {port}")),
+                    Err(error) => {
+                        assert_eq!(error.exit_code(), 2);
+                        assert!(error.to_string().contains("--ka9q-port"), "{error}");
+                    }
+                }
+            }
+        }
+        assert!(
+            accepted_invalid.is_empty(),
+            "accepted invalid ports: {accepted_invalid:?}"
+        );
+    }
+
+    fn ka9q_opts(ssrc: Option<u32>) -> Ka9qOpts {
+        Ka9qOpts {
+            group: Some("239.101.6.1".into()),
+            port: manta_input::ka9q::wire::DATA_PORT,
+            ssrc,
+            interface: None,
+            ..Ka9qOpts::unset()
+        }
+    }
+
+    #[test]
+    fn ka9q_flag_selects_the_source_and_replaces_a_typed_input() {
+        let cli = CliOverrides {
+            ka9q: Ka9qOpts {
+                interface: Some(std::net::Ipv4Addr::new(192, 168, 1, 20)),
+                ..ka9q_opts(Some(14_100_000))
+            },
+            ..cli_overrides()
+        };
+        assert_eq!(cli.source_selector(), Some("--ka9q-group"));
+        let LiveSourceSpec::Ka9q(k) = cli.clone().into_spec() else {
+            panic!("expected the ka9q source from --ka9q-group");
+        };
+        assert_eq!(k.group.as_deref(), Some("239.101.6.1"));
+        assert_eq!(k.port, 5004);
+        assert_eq!(k.ssrc, Some(14_100_000));
+        assert_eq!(k.interface, Some(std::net::Ipv4Addr::new(192, 168, 1, 20)));
+
+        // A typed [input] is replaced whole, its shared keys included.
+        let r = resolve(cli, &loaded_from(KIWI_INPUT)).unwrap();
+        assert!(matches!(r.spec, LiveSourceSpec::Ka9q(_)));
+        assert_eq!(r.replaced_file_source, Some("--ka9q-group"));
+        assert_eq!(r.freq_correction_ppm, 0.0);
+        assert_eq!(r.dial_freq_hz, None);
+        assert!(
+            r.notes[0]
+                .contains("--ka9q-group selects the source; ignoring [input] (type = \"kiwi\")"),
+            "{:?}",
+            r.notes
+        );
+
+        // The flags as clap parses them, defaults included.
+        let parsed = Cli::try_parse_from([
+            "manta",
+            "run",
+            "--ka9q-group",
+            "239.101.6.1",
+            "--ka9q-ssrc",
+            "14100000",
+            "--ka9q-interface",
+            "192.168.1.20",
+        ])
+        .unwrap();
+        let Command::Run {
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
+            ..
+        } = parsed.command
+        else {
+            unreachable!("parsed `run`");
+        };
+        assert_eq!(ka9q_group.as_deref(), Some("239.101.6.1"));
+        assert_eq!(ka9q_port, 5004);
+        assert_eq!(ka9q_ssrc, Some(14_100_000));
+        assert_eq!(
+            ka9q_interface,
+            Some(std::net::Ipv4Addr::new(192, 168, 1, 20))
+        );
+        // --ka9q-interface takes an address, not an interface name.
+        assert!(Cli::try_parse_from([
+            "manta",
+            "run",
+            "--ka9q-group",
+            "239.101.6.1",
+            "--ka9q-interface",
+            "eth0",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn spec_from_file_maps_a_ka9q_input() {
+        let loaded = loaded_from(
+            "[input]\ntype = \"ka9q\"\ngroup = \"239.101.6.1\"\nport = 5010\nssrc = 14100000\n\
+             interface = \"192.168.1.20\"\n",
+        );
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        let LiveSourceSpec::Ka9q(k) = &r.spec else {
+            panic!("expected the ka9q source from [input]");
+        };
+        assert_eq!(k.group.as_deref(), Some("239.101.6.1"));
+        assert_eq!(k.port, 5010);
+        assert_eq!(k.ssrc, Some(14_100_000));
+        assert_eq!(k.interface, Some(std::net::Ipv4Addr::new(192, 168, 1, 20)));
+        assert_eq!(r.replaced_file_source, None);
+
+        let loaded = loaded_from("[input]\ntype = \"ka9q\"\ngroup = \"cw-20m.local\"\n");
+        let LiveSourceSpec::Ka9q(k) = resolve(cli_overrides(), &loaded).unwrap().spec else {
+            panic!("expected the ka9q source from [input]");
+        };
+        assert_eq!(k.group.as_deref(), Some("cw-20m.local"));
+        assert_eq!(k.port, 5004);
+        assert_eq!(k.ssrc, None);
+        assert_eq!(k.interface, None);
+    }
+
+    #[test]
+    fn ka9q_spec_is_rf_aware_and_reconnectable_and_named_ka9q() {
+        let spec = LiveSourceSpec::Ka9q(ka9q_opts(None));
+        // radiod reports the channel's frequency, so --dial-freq-hz is an
+        // override, not a requirement.
+        assert!(spec.is_rf_aware());
+        assert!(!needs_dial_freq(true, spec.is_rf_aware(), None));
+        assert!(spec.is_reconnectable());
+        // The `source` label of manta_source_health and manta_input_*.
+        assert_eq!(spec.name(), "ka9q");
+    }
+
+    #[test]
+    fn receiver_desc_names_the_ka9q_group() {
+        let d = receiver_desc(&LiveSourceSpec::Ka9q(ka9q_opts(None)));
+        assert_eq!(d.kind, doctor_checks::ReceiverKind::Ka9q);
+        assert_eq!(d.description, "ka9q-radio group 239.101.6.1:5004");
+        let d = receiver_desc(&LiveSourceSpec::Ka9q(ka9q_opts(Some(14_100_000))));
+        assert_eq!(
+            d.description,
+            "ka9q-radio group 239.101.6.1:5004 ssrc 14100000"
+        );
+    }
+
+    #[test]
+    fn ka9q_agc_warning_is_design_section_3s_text() {
+        assert_eq!(
+            ka9q_agc_warning(14_100_000),
+            "warning: ka9q-radio channel ssrc 14100000 has AGC on; set agc = off and a fixed \
+             gain in its radiod section, or one strong signal changes the gain for every \
+             signal in the passband"
+        );
+    }
+
     /// D10: every config-backed flag maps to the key it overrides.
     const FLAG_KEYS: &[(&str, &str)] = &[
         ("device", "input.device"),
         ("source", "input.path"),
         ("source_iq", "input.iq"),
+        ("realtime", "input.realtime"),
+        ("loop_replay", "input.loop"),
         ("kiwi_host", "input.host"),
         ("kiwi_port", "input.port"),
         ("kiwi_freq_hz", "input.freq_hz"),
@@ -6763,6 +9371,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("hpsdr_port", "input.port"),
         ("hpsdr_freq_hz", "input.freq_hz"),
         ("hpsdr_rate_hz", "input.rate_hz"),
+        ("ka9q_group", "input.group"),
+        ("ka9q_port", "input.port"),
+        ("ka9q_ssrc", "input.ssrc"),
+        ("ka9q_interface", "input.interface"),
         ("freq_correction_ppm", "input.freq_correction_ppm"),
         ("dial_freq_hz", "input.center_freq_hz"),
         ("capture_rate_hz", "input.capture_rate_hz"),
@@ -6772,7 +9384,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("notch", "spot.notch_path"),
         ("cty", "spot.cty_path"),
         ("scp", "spot.scp_path"),
+        ("patterns", "spot.pattern_path"),
         ("engine", "decode.engine"),
+        ("rbn_compare", "rbn_compare.enabled"),
+        ("rbn_spotter", "rbn_compare.spotters"),
     ];
     /// Flags with no config key, by design.
     const CLI_ONLY: &[&str] = &[
@@ -6781,8 +9396,18 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         "duration",
         "config",
         "path",
+        // `decode --center-freq-hz` (MAN-131 D8): a recording's centre, not
+        // the live receiver's `input.center_freq_hz`.
+        "center_freq_hz",
+        // `decode --timing` (MAN-315): an output choice, like `json`.
+        "timing",
         "help",
         "version",
+        "reference_hz",
+        "search_ppm",
+        "tune_hz",
+        "write",
+        "ntp_server",
         "verbose",
         "quiet",
         "log_level",
@@ -6860,7 +9485,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn every_config_backed_flag_maps_to_a_key() {
         use clap::CommandFactory;
         let cli = Cli::command();
-        for name in ["run", "soak", "doctor", "decode", "check"] {
+        for name in ["run", "soak", "doctor", "decode", "check", "calibrate"] {
             let sub = cli.find_subcommand(name).unwrap();
             for arg in sub.get_arguments() {
                 let id = arg.get_id().as_str();
@@ -6877,7 +9502,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn every_flag_key_is_accepted_by_the_loader() {
         const TYPED: &[(&str, &str)] = &[
             ("audio", "type = \"audio\"\ndevice = \"d\"\n"),
-            ("file", "type = \"file\"\npath = \"x.wav\"\niq = true\n"),
+            (
+                "file",
+                "type = \"file\"\npath = \"x.wav\"\niq = true\nrealtime = true\nloop = true\n",
+            ),
             (
                 "kiwi",
                 "type = \"kiwi\"\nhost = \"h\"\nport = 8073\nfreq_hz = 7e6\npassword = \"\"\n",
@@ -6889,6 +9517,11 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             (
                 "hpsdr",
                 "type = \"hpsdr\"\nhost = \"h\"\nport = 1024\nfreq_hz = 7e6\nrate_hz = 48000.0\n",
+            ),
+            (
+                "ka9q",
+                "type = \"ka9q\"\ngroup = \"239.1.2.3\"\nport = 5004\nssrc = 1\n\
+                 interface = \"127.0.0.1\"\n",
             ),
         ];
         const SHARED: &[(&str, &str)] = &[
@@ -6910,7 +9543,20 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             ("spot.notch_path", "[spot]\nnotch_path = \"n.txt\"\n"),
             ("spot.cty_path", "[spot]\ncty_path = 'cty.dat'\n"),
             ("spot.scp_path", "[spot]\nscp_path = 'MASTER.SCP'\n"),
+            (
+                "spot.pattern_path",
+                "[spot]\npattern_path = 'patterns.lst'\n",
+            ),
             ("decode.engine", "[decode]\nengine = \"legacy\"\n"),
+            (
+                "rbn_compare.enabled",
+                "[server]\nstation_callsign = \"W1AW\"\n[rbn_compare]\nenabled = true\n",
+            ),
+            (
+                "rbn_compare.spotters",
+                "[server]\nstation_callsign = \"W1AW\"\n[rbn_compare]\n\
+                 spotters = [\"K5TR\"]\n",
+            ),
         ];
         for (_, key) in FLAG_KEYS {
             let body = match SHARED.iter().find(|(k, _)| k == key) {
@@ -6956,6 +9602,19 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     }
 
     #[test]
+    fn sett_advertises_the_configured_minimal_validation_level() {
+        let cfg = test_server_config("W3XYZ");
+        let profile = station_profile(
+            &cfg,
+            14_040_000.0,
+            (-5_000.0, 5_000.0),
+            1.0,
+            manta_spot::ValidationLevel::Minimal,
+        );
+        assert_eq!(profile.sett.to_string(), "SETT: vlMinimal 14035.0-14045.0");
+    }
+
+    #[test]
     fn sett_advertises_a_rig_audio_source_only_above_its_dial_frequency() {
         // `--source` WAV / an audio device with --dial-freq-hz: analytic
         // audio carries spectrum ONLY above the dial, over the rig's ~3 kHz
@@ -6969,6 +9628,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 manta_input::AUDIO_PASSBAND_HI_HZ,
             ),
             1.0,
+            manta_spot::ValidationLevel::Normal,
         );
         assert_eq!(
             profile.sett.to_string(),
@@ -6983,8 +9643,20 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         // bounds have to move with them.
         let cfg = test_server_config("W3XYZ");
         let factor = manta_spot::calibration_factor_from_ppm(1_000.0).unwrap();
-        let corrected = station_profile(&cfg, 14_040_000.0, (-5_000.0, 5_000.0), factor);
-        let raw = station_profile(&cfg, 14_040_000.0, (-5_000.0, 5_000.0), 1.0);
+        let corrected = station_profile(
+            &cfg,
+            14_040_000.0,
+            (-5_000.0, 5_000.0),
+            factor,
+            manta_spot::ValidationLevel::Normal,
+        );
+        let raw = station_profile(
+            &cfg,
+            14_040_000.0,
+            (-5_000.0, 5_000.0),
+            1.0,
+            manta_spot::ValidationLevel::Normal,
+        );
         assert_eq!(raw.sett.to_string(), "SETT: vlNormal 14035.0-14045.0");
         assert_eq!(corrected.sett.to_string(), "SETT: vlNormal 14049.0-14059.1");
     }
@@ -7060,6 +9732,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let (_rt, server) = start_spot_server(
             loaded.server.unwrap(),
             loaded.rbn_uplink,
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -7069,7 +9742,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -7107,6 +9780,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let (rt, server) = start_spot_server(
             loaded.server.unwrap(),
             loaded.rbn_uplink,
+            None,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -7116,7 +9790,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -7432,20 +10106,19 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(message.contains(r"\u{1b}[2J\npwned"), "{message:?}");
     }
 
-    /// The escaping above is applied where peer text enters the error, not
-    /// to the whole chain at the stderr sink: a local `--config` TOML
-    /// error's multi-line source snippet must still print as lines.
+    /// Local snippets keep their source and caret, with visible line breaks.
     #[test]
-    fn status_config_parse_errors_keep_their_multi_line_snippet() {
+    fn status_config_parse_errors_keep_their_escaped_snippet() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.toml");
         std::fs::write(&path, "[server]\nbind_addr = \n").unwrap();
         let err = run_status(Some(&path), None, 5).expect_err("a broken config must not parse");
         let message = status_failure_message(&err);
         assert!(message.contains("TOML parse error"), "{message:?}");
+        assert!(message.contains("bind_addr = ") && message.contains('^'));
         assert!(
-            message.contains('\n') && !message.contains(r"\n"),
-            "the TOML snippet must keep its real line breaks: {message:?}"
+            !message.chars().any(char::is_control) && message.contains(r"\n"),
+            "the TOML snippet must keep visible line breaks: {message:?}"
         );
     }
 
@@ -7592,5 +10265,205 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             started.elapsed() < std::time::Duration::from_secs(2),
             "must not have hung past the configured timeout"
         );
+    }
+
+    // ---- MAN-301: `run --rbn-compare` / `--rbn-spotter`
+
+    /// `run`'s parsed RBN comparison flags.
+    fn run_rbn_opts(extra: &[&str]) -> Result<RbnCompareOpts, clap::Error> {
+        let argv = ["manta", "run"].iter().chain(extra);
+        match Cli::try_parse_from(argv)?.command {
+            Command::Run { rbn, .. } => Ok(rbn),
+            _ => unreachable!("`manta run` parses as Command::Run"),
+        }
+    }
+
+    const RBN_SERVER: &str = "[server]\nstation_callsign = \"W3XYZ-1\"\n";
+
+    /// `prepare_config` over a config file `body` and the given flags, with
+    /// no environment (the same path `run` and `config check` take).
+    fn prepare_rbn(body: &str, rbn: RbnCompareOpts, source: Option<&str>) -> Result<Prepared> {
+        let f = write_temp_file(body.as_bytes());
+        let cli = CliOverrides {
+            source: source.map(PathBuf::from),
+            rbn,
+            ..CliOverrides::none()
+        };
+        prepare_config(cli, Some(f.path().to_path_buf()), None, &[])
+    }
+
+    /// `prepare_rbn` followed by `run`'s replay refusal.
+    fn run_rbn(body: &str, rbn: RbnCompareOpts, source: Option<&str>) -> Result<Prepared> {
+        let prepared = prepare_rbn(body, rbn, source)?;
+        refuse_rbn_compare_replay(&prepared.resolved, source.is_some())?;
+        Ok(prepared)
+    }
+
+    #[test]
+    fn rbn_compare_flag_enables_comparison() {
+        let rbn = run_rbn_opts(&["--rbn-compare"]).unwrap();
+        assert!(rbn.rbn_compare);
+        assert!(run_rbn_opts(&[]).unwrap().rbn_spotter.is_empty());
+        // `listen` is `run`'s alias and takes the same flags.
+        assert!(Cli::try_parse_from(["manta", "listen", "--rbn-compare"]).is_ok());
+        // The flag alone (no [rbn_compare] table) enables with defaults.
+        let p = prepare_rbn(RBN_SERVER, rbn.clone(), None).unwrap();
+        let rc = p.resolved.rbn_compare.expect("the flag creates the table");
+        assert!(rc.enabled);
+        assert_eq!(rc.window_secs, 180);
+        // Over a disabled table, the flag enables and keeps its keys.
+        let body = format!("{RBN_SERVER}[rbn_compare]\nenabled = false\nwindow_secs = 300\n");
+        let rc = prepare_rbn(&body, rbn.clone(), None)
+            .unwrap()
+            .resolved
+            .rbn_compare
+            .unwrap();
+        assert!(rc.enabled);
+        assert_eq!(rc.window_secs, 300);
+        // Without the flag, the file decides.
+        let rc = prepare_rbn(&body, RbnCompareOpts::default(), None)
+            .unwrap()
+            .resolved
+            .rbn_compare
+            .unwrap();
+        assert!(!rc.enabled);
+        assert!(prepare_rbn(RBN_SERVER, RbnCompareOpts::default(), None)
+            .unwrap()
+            .resolved
+            .rbn_compare
+            .is_none());
+        // The flag without [server] is the table's own needs-[server] refusal.
+        let err = format!(
+            "{:#}",
+            prepare_rbn("[decode]\nengine = \"legacy\"\n", rbn, None)
+                .err()
+                .unwrap()
+        );
+        assert!(
+            err.ends_with(
+                ": [rbn_compare] needs a [server] table (grades are published on the JSON \
+                 stream and /metrics, which only the daemon runs)"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rbn_spotter_flag_replaces_file_spotters() {
+        let rbn = run_rbn_opts(&["--rbn-spotter", "k5tr", "--rbn-spotter", "N0XYZ"]).unwrap();
+        assert_eq!(
+            rbn.rbn_spotter,
+            vec!["K5TR".to_string(), "N0XYZ".to_string()]
+        );
+        assert!(run_rbn_opts(&["--rbn-spotter", "K5TR-#"]).is_err());
+        assert!(run_rbn_opts(&["--rbn-spotter", "not a call"]).is_err());
+        let body = format!("{RBN_SERVER}[rbn_compare]\nenabled = true\nspotters = [\"W1AW\"]\n");
+        let rc = prepare_rbn(&body, rbn, None)
+            .unwrap()
+            .resolved
+            .rbn_compare
+            .unwrap();
+        assert_eq!(rc.spotters, vec!["K5TR".to_string(), "N0XYZ".to_string()]);
+        let rc = prepare_rbn(&body, RbnCompareOpts::default(), None)
+            .unwrap()
+            .resolved
+            .rbn_compare
+            .unwrap();
+        assert_eq!(rc.spotters, vec!["W1AW".to_string()]);
+        // --rbn-spotter naming this station is refused like the file's list.
+        let own = run_rbn_opts(&["--rbn-spotter", "w3xyz"]).unwrap();
+        let err = format!("{:#}", prepare_rbn(&body, own, None).err().unwrap());
+        assert_eq!(
+            err,
+            "--rbn-spotter W3XYZ is this station's own callsign: its reports are always \
+             excluded, so every spot would grade none"
+        );
+        // So is one the file's exclude_spotters names.
+        let body = format!("{body}exclude_spotters = [\"N0XYZ\"]\n");
+        let excluded = run_rbn_opts(&["--rbn-spotter", "K5TR", "--rbn-spotter", "n0xyz"]).unwrap();
+        let err = format!("{:#}", prepare_rbn(&body, excluded, None).err().unwrap());
+        assert_eq!(
+            err,
+            "--rbn-spotter N0XYZ is in [rbn_compare].exclude_spotters: its reports would never \
+             count"
+        );
+    }
+
+    #[test]
+    fn rbn_spotter_without_comparison_is_refused() {
+        let rbn = run_rbn_opts(&["--rbn-spotter", "K5TR"]).unwrap();
+        for body in [
+            RBN_SERVER.to_string(),
+            format!("{RBN_SERVER}[rbn_compare]\nenabled = false\n"),
+        ] {
+            let err = format!("{:#}", prepare_rbn(&body, rbn.clone(), None).err().unwrap());
+            assert_eq!(
+                err,
+                "--rbn-spotter needs RBN comparison: add --rbn-compare or set \
+                 [rbn_compare].enabled = true"
+            );
+        }
+        let with_flag = run_rbn_opts(&["--rbn-compare", "--rbn-spotter", "K5TR"]).unwrap();
+        assert!(prepare_rbn(RBN_SERVER, with_flag, None).is_ok());
+    }
+
+    #[test]
+    fn rbn_compare_with_file_replay_is_refused() {
+        let enabled = format!("{RBN_SERVER}[rbn_compare]\nenabled = true\n");
+        let err = format!(
+            "{:#}",
+            run_rbn(&enabled, RbnCompareOpts::default(), Some("x.wav"))
+                .err()
+                .unwrap()
+        );
+        assert_eq!(
+            err,
+            "RBN comparison grades spots against the live RBN feed, but this run replays a \
+             recording (--source). Grade a recorded node's spot log with `manta grade` instead."
+        );
+        let flag = run_rbn_opts(&["--rbn-compare"]).unwrap();
+        assert!(run_rbn(RBN_SERVER, flag, Some("x.wav")).is_err());
+        let file_input = format!("{enabled}[input]\ntype = \"file\"\npath = \"/x.wav\"\n");
+        let err = format!(
+            "{:#}",
+            run_rbn(&file_input, RbnCompareOpts::default(), None)
+                .err()
+                .unwrap()
+        );
+        assert!(
+            err.starts_with(
+                "RBN comparison grades spots against the live RBN feed, but this run replays a \
+                 recording ([input] type = \"file\")."
+            ),
+            "{err}"
+        );
+        // A replay with comparison off is unaffected.
+        assert!(run_rbn(RBN_SERVER, RbnCompareOpts::default(), Some("x.wav")).is_ok());
+    }
+
+    /// `soak` and `doctor` share `prepare_config` with `run` but never start
+    /// the comparator, so a node config with `[rbn_compare]` enabled still
+    /// prepares over a replayed recording; only `run` refuses it.
+    #[test]
+    fn soak_and_doctor_prepare_a_replay_with_rbn_compare_enabled() {
+        let enabled = format!("{RBN_SERVER}[rbn_compare]\nenabled = true\n");
+        let p = prepare_rbn(&enabled, RbnCompareOpts::default(), Some("x.wav")).unwrap();
+        assert!(p.resolved.rbn_compare.is_some_and(|c| c.enabled));
+        let file_input = format!("{enabled}[input]\ntype = \"file\"\npath = \"/x.wav\"\n");
+        assert!(prepare_rbn(&file_input, RbnCompareOpts::default(), None).is_ok());
+        assert!(run_rbn(&file_input, RbnCompareOpts::default(), None).is_err());
+    }
+
+    #[test]
+    fn spot_bus_for_uses_configured_history_or_the_default() {
+        let mut cfg = test_server_config("W1AW");
+        let bus = spot_bus_for(&cfg, 1.0, std::time::SystemTime::UNIX_EPOCH, 0);
+        assert_eq!(
+            bus.history_minutes(),
+            manta_server::bus::DEFAULT_HISTORY_MINUTES
+        );
+        cfg.history_minutes = Some(90);
+        let bus = spot_bus_for(&cfg, 1.0, std::time::SystemTime::UNIX_EPOCH, 0);
+        assert_eq!(bus.history_minutes(), 90);
     }
 }

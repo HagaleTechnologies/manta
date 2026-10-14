@@ -5,12 +5,14 @@ use crate::blocklist::Blocklist;
 use crate::confidence;
 use crate::context::{self, SpotType};
 use crate::cty;
+use crate::decision::{CandidateSupport, Decision, Reason, Rival};
 use crate::dedupe::Dedupe;
-use crate::gate::{RepetitionGate, WINDOW_SECONDS as GATE_WINDOW_SECONDS};
+use crate::gate::{RepetitionCounts, RepetitionGate, WINDOW_SECONDS as GATE_WINDOW_SECONDS};
 use crate::grammar;
 use crate::notch::NotchList;
 use crate::scp;
 use crate::support::SupportLedger;
+use crate::{pattern, ValidationLevel};
 use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_decode::tree::{Glyph, Prosign};
 use std::collections::{BTreeMap, VecDeque};
@@ -246,8 +248,9 @@ pub fn calibration_factor_from_ppm(ppm: f64) -> Result<f64, InvalidCalibration> 
     Ok(factor)
 }
 
-/// Per-reason counts of spots suppressed by an operator override (MAN-31).
-/// ARCHITECTURE §8: "Every dropped/evicted/suppressed item is counted. No
+/// Per-reason counts of spots suppressed by an operator override (MAN-31),
+/// and of captured deferred Beacon candidates (`PendingBeacon`) lost
+/// before they could spot (PR #154, MAN-174). ARCHITECTURE §8: "Every dropped/evicted/suppressed item is counted. No
 /// silent loss anywhere in the pipeline." Exposed via
 /// `Validator::suppression_counts` for the future M3 metrics endpoint to
 /// read, mirroring `manta_engine::track::CloseCounts` -- nothing wires it
@@ -267,6 +270,18 @@ pub struct SuppressionCounts {
     /// evidence the physical signal ended, but with no successor
     /// track_id to migrate the evidence to either (round 9).
     pub pending_beacon_lost_to_eviction: u64,
+    /// A captured `PendingBeacon` discarded at its track's `SignalEnded`
+    /// close because the track's final speed was implausible (above
+    /// `MAX_PLAUSIBLE_WPM`) or never measured (no `SpeedUpdate`): the WPM
+    /// gate (MAN-174, ARCHITECTURE §8). A candidate the operator lists
+    /// suppress at that moment is counted under `blocklist`/`notch`
+    /// instead, never both.
+    pub pending_beacon_rejected_wpm: u64,
+    /// A captured `PendingBeacon` discarded at resolution because a spot
+    /// for the same (callsign, frequency bucket) with a strictly newer
+    /// `sample_ts` was already emitted, so emitting it would rewind
+    /// `Dedupe`'s watermark (MAN-174).
+    pub pending_beacon_stale: u64,
     /// Power-step beacon occurrences (MAN-37 `<call> T`) discarded by the
     /// coarse whole-window CQ/DE framing guard -- see `context::parse`'s own
     /// docs for why that guard is deliberately coarse. Counted once per
@@ -302,6 +317,8 @@ pub struct SuppressionCounts {
 pub struct Validator {
     cty: Arc<cty::Table>,
     scp: Option<Arc<scp::Set>>,
+    patterns: Arc<pattern::Table>,
+    level: ValidationLevel,
     tracks: BTreeMap<u32, TrackState>,
     gate: RepetitionGate,
     dedupe: Dedupe,
@@ -374,6 +391,9 @@ pub struct Validator {
     /// already dropped any of the alias's occurrences regardless, so it
     /// can no longer affect message-distinctness either way.
     merged_into: BTreeMap<u32, (u32, u64)>,
+    /// MAN-324: the opt-in decision log (`record_decisions`). `None`, the
+    /// default, records nothing and allocates nothing.
+    decisions: Option<Vec<Decision>>,
 }
 
 /// How often (in seconds of `sample_ts`) the repetition gate is swept
@@ -399,6 +419,8 @@ impl Validator {
         Self {
             cty,
             scp,
+            patterns: Arc::new(pattern::Table::bundled()),
+            level: ValidationLevel::Normal,
             tracks: BTreeMap::new(),
             gate: RepetitionGate::new(fs),
             dedupe: Dedupe::new(fs),
@@ -413,6 +435,68 @@ impl Validator {
             sweep_interval_samples: (SWEEP_INTERVAL_SECONDS * fs) as u64,
             gate_window_samples: (GATE_WINDOW_SECONDS * fs) as u64,
             merged_into: BTreeMap::new(),
+            decisions: None,
+        }
+    }
+
+    /// Replace the independent callsign-pattern reference table.
+    pub fn with_patterns(mut self, patterns: Arc<pattern::Table>) -> Self {
+        self.patterns = patterns;
+        self
+    }
+
+    /// Select the rarity-tiered or flat repetition requirement.
+    pub fn with_validation_level(mut self, level: ValidationLevel) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// MAN-324: turn the decision log on or off. On, every validation
+    /// decision (spotted, withheld with its reason, or a deferred beacon)
+    /// is kept until `take_decisions`. Off discards anything unread.
+    /// Recording never changes which spots are emitted.
+    pub fn record_decisions(&mut self, on: bool) {
+        self.decisions = if on { Some(Vec::new()) } else { None };
+    }
+
+    /// Whether `record_decisions` is on.
+    pub fn records_decisions(&self) -> bool {
+        self.decisions.is_some()
+    }
+
+    /// The decisions recorded since the last call, oldest first. Empty
+    /// when recording is off.
+    pub fn take_decisions(&mut self) -> Vec<Decision> {
+        self.decisions
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// MAN-324: the grammar- and cty-plausible words decoded on
+    /// `track_id` within the support window, as the variant arbitration
+    /// weighs them, strongest first (ties by call ascending). Empty once
+    /// the track has closed.
+    pub fn candidates_for(&self, track_id: u32, now: u64) -> Vec<CandidateSupport> {
+        self.ledger
+            .candidates(track_id, now)
+            .into_iter()
+            .map(|(call, support)| CandidateSupport { call, support })
+            .collect()
+    }
+
+    /// Records one decision when the log is on; `build` runs only then.
+    fn decide(&mut self, build: impl FnOnce() -> Decision) {
+        if let Some(log) = self.decisions.as_mut() {
+            let mut decision = build();
+            // One boundary covers early refusals, reclassification and every
+            // deferred-beacon path, without doing pattern lookups when logging is off.
+            if decision.spot_type != SpotType::Beacon && !self.allowlist.contains(&decision.call) {
+                let tier = self.patterns.tier(&decision.call);
+                decision.required_reps = self.level.required_reps(tier);
+                decision.pattern_tier = Some(tier);
+            }
+            log.push(decision);
         }
     }
 
@@ -491,6 +575,14 @@ impl Validator {
         self.gate.records_total()
     }
 
+    /// MAN-118: the distribution of every `RepetitionGate::record` result
+    /// so far, cumulative for life, for the daemon's
+    /// `manta_candidate_repetitions` histogram. Read after `ingest`, as
+    /// `suppression_counts` is.
+    pub fn repetition_counts(&self) -> RepetitionCounts {
+        self.gate.repetition_counts()
+    }
+
     /// Sets the operator's bad-callsign blocklist (MAN-31). Empty by
     /// default -- no suppression until the operator supplies one.
     pub fn with_blocklist(mut self, blocklist: Blocklist) -> Self {
@@ -503,6 +595,22 @@ impl Validator {
     pub fn with_notch(mut self, notch: NotchList) -> Self {
         self.notch = notch;
         self
+    }
+
+    /// MAN-78: replaces the operator's three lists as one unit, for a live
+    /// config reload. Tracks, dedupe, the repetition gate, the ledger and
+    /// `suppression_counts` are untouched; a word already attempted under the
+    /// old lists is not re-evaluated, so the new lists apply from the next
+    /// decoder event.
+    pub fn replace_operator_lists(
+        &mut self,
+        allowlist: &[String],
+        blocklist: Blocklist,
+        notch: NotchList,
+    ) {
+        self.allowlist = allowlist.iter().map(|c| c.to_ascii_uppercase()).collect();
+        self.blocklist = blocklist;
+        self.notch = notch;
     }
 
     /// Per-reason counts of operator-suppressed spots so far (MAN-31,
@@ -625,6 +733,8 @@ impl Validator {
                 self.advance_clock(*sample_ts);
                 Vec::new()
             }
+            // Sender-timing diagnostics (MAN-315): nothing to validate.
+            DecoderEvent::TimingUpdate { .. } => Vec::new(),
             DecoderEvent::TrackClosed { track_id, closure } => {
                 // Round 7 redesign (PR #154): `SignalEnded` is the ONE point where
                 // every captured non-allowlisted Beacon candidate for
@@ -662,7 +772,17 @@ impl Validator {
                         self.resolve_pending_beacons(*track_id)
                     }
                     ClosureKind::Bookkeeping { survivor_track_id } => {
-                        self.migrate_or_discard_pending_beacons(*track_id, *survivor_track_id);
+                        // MAN-174: resolve the named survivor through
+                        // `merged_into` BEFORE migrating. manta-engine
+                        // orders a merge loser's close ahead of its
+                        // survivor's, so this is normally the survivor
+                        // itself; if closures ever arrive out of order
+                        // (the survivor already merged further), the
+                        // evidence lands on the live root instead of
+                        // recreating a dead track_id's state that no
+                        // close would ever free.
+                        let root = survivor_track_id.map(|s| self.resolve_survivor_root(s));
+                        self.migrate_or_discard_pending_beacons(*track_id, root);
                         // MAN-100 message-distinctness (Codex review, PR
                         // #133 rounds 3-5): a survivor exists, so this
                         // track_id's identity continues rather than
@@ -672,8 +792,7 @@ impl Validator {
                         // real close and let the survivor's next word
                         // manufacture a false second message from the
                         // SAME transmission.
-                        if let Some(survivor) = survivor_track_id {
-                            let root = self.resolve_survivor_root(*survivor);
+                        if let Some(root) = root {
                             // A chained merge (A already an alias into
                             // THIS track_id, which is now itself merging
                             // further into `root`): re-point A straight
@@ -958,10 +1077,12 @@ impl Validator {
     fn burn_suppressed_power_step_candidate(
         &mut self,
         track_id: u32,
+        call: &str,
         exact_seq: u64,
         involved_max_seq: u64,
+        sample_ts: u64,
     ) {
-        let first_suppression = {
+        let (first_suppression, freq_hz) = {
             let Some(track) = self.tracks.get_mut(&track_id) else {
                 return;
             };
@@ -977,10 +1098,20 @@ impl Validator {
             word.power_step_suppressed = true;
             word.attempted = true;
             word.classified_max_seq = word.classified_max_seq.max(involved_max_seq);
-            first_suppression
+            (first_suppression, track.freq_hz * self.freq_calibration)
         };
         if first_suppression {
             self.suppression_counts.power_step_guard += 1;
+            self.decide(|| {
+                Decision::withheld(
+                    track_id,
+                    sample_ts,
+                    call,
+                    freq_hz,
+                    SpotType::Beacon,
+                    Reason::PowerStepGuard,
+                )
+            });
         }
     }
 
@@ -988,6 +1119,7 @@ impl Validator {
         // No real TrackMeta yet -- freq_hz/snr_db still hold bogus 0.0
         // defaults. Bail without marking anything attempted, so pending
         // candidates are simply re-evaluated once metadata does arrive.
+        // Not a decision, so nothing is recorded (MAN-324).
         if !self.tracks.get(&track_id).is_some_and(|t| t.has_meta) {
             return Vec::new();
         }
@@ -1013,9 +1145,15 @@ impl Validator {
                 )
             })
             .collect();
-        for (_call, involved_max_seq, exact_seq) in suppressed {
+        for (call, involved_max_seq, exact_seq) in suppressed {
             // Identity resolved via exact_seq, not text -- see burn's own docs.
-            self.burn_suppressed_power_step_candidate(track_id, exact_seq, involved_max_seq);
+            self.burn_suppressed_power_step_candidate(
+                track_id,
+                &call,
+                exact_seq,
+                involved_max_seq,
+                sample_ts,
+            );
         }
         spots
     }
@@ -1098,6 +1236,9 @@ impl Validator {
                 // context types (round 12), both merely because an older
                 // framing word (DE, CQ) fell out of the 16-word window,
                 // not because anything new arrived.
+                //
+                // A re-attempt that changes nothing is not a decision, so
+                // it records nothing (MAN-324).
                 if word.last_spot_type == Some(spot_type)
                     || involved_max_seq <= word.classified_max_seq
                 {
@@ -1118,12 +1259,17 @@ impl Validator {
         // silently defeated by a broader allowlist entry. Each hit is
         // counted (ARCHITECTURE §8) so it reads as a deliberate
         // suppression, not silent coverage loss.
+        let withheld = |reason: Reason| {
+            Decision::withheld(track_id, sample_ts, &candidate, freq_hz, spot_type, reason)
+        };
         if self.blocklist.contains(&candidate) {
             self.suppression_counts.blocklist += 1;
+            self.decide(|| withheld(Reason::Blocklist));
             return None;
         }
         if self.notch.contains(freq_hz) {
             self.suppression_counts.notch += 1;
+            self.decide(|| withheld(Reason::Notch));
             return None;
         }
 
@@ -1133,9 +1279,11 @@ impl Validator {
 
         if !is_allowlisted {
             if !grammar::is_plausible(&candidate) {
+                self.decide(|| withheld(Reason::Grammar));
                 return None;
             }
             if !self.cty.is_allocated(&candidate) {
+                self.decide(|| withheld(Reason::Cty));
                 return None;
             }
         }
@@ -1190,7 +1338,11 @@ impl Validator {
         // here for an ALLOWLISTED Beacon candidate -- non-allowlisted
         // ones never reach this function body at all (see the early
         // dispatch above).
-        if !is_allowlisted && spot_type != SpotType::Beacon && reps < 2 {
+        if !is_allowlisted
+            && spot_type != SpotType::Beacon
+            && reps < self.level.required_reps(self.patterns.tier(&candidate))
+        {
+            self.decide(|| withheld(Reason::Repetition).with_reps(reps));
             return None;
         }
 
@@ -1218,15 +1370,22 @@ impl Validator {
         // check can only withhold a spot the rest of the pipeline would
         // have emitted, never create one.
         let scp_exempt = self.scp.as_ref().is_some_and(|s| s.contains(&candidate));
-        if !is_allowlisted
-            && !scp_exempt
-            && spot_type != SpotType::Beacon
-            && self
-                .ledger
+        let rival = if !is_allowlisted && !scp_exempt && spot_type != SpotType::Beacon {
+            self.ledger
                 .better_supported_rival(track_id, &candidate, sample_ts)
-                .is_some()
-        {
+        } else {
+            None
+        };
+        if let Some((rival_call, rival_support)) = rival {
             self.suppression_counts.variant += 1;
+            self.decide(|| {
+                let mut d = withheld(Reason::Variant).with_reps(reps);
+                d.rival = Some(Rival {
+                    call: rival_call,
+                    support: rival_support,
+                });
+                d
+            });
             return None;
         }
 
@@ -1234,10 +1393,11 @@ impl Validator {
             .dedupe
             .should_emit(&candidate, freq_hz, snr_db, spot_type, sample_ts)
         {
+            self.decide(|| withheld(Reason::Dedupe).with_reps(reps));
             return None;
         }
 
-        Some(Spot {
+        let spot = Spot {
             callsign: candidate,
             freq_hz,
             snr_db,
@@ -1246,7 +1406,9 @@ impl Validator {
             confidence,
             track_id,
             sample_ts,
-        })
+        };
+        self.decide(|| Decision::spotted(&spot, reps));
+        Some(spot)
     }
 
     /// Captures a non-allowlisted Beacon candidate once every permanent,
@@ -1298,40 +1460,59 @@ impl Validator {
 
         // Operator suppression overrides (MAN-31), same boundary as the
         // non-Beacon path (ARCHITECTURE §8).
-        if self.blocklist.contains(&candidate) {
+        let withheld = |reason: Reason| {
+            Decision::withheld(
+                track_id,
+                sample_ts,
+                &candidate,
+                freq_hz,
+                SpotType::Beacon,
+                reason,
+            )
+        };
+        let rejected = if self.blocklist.contains(&candidate) {
             self.suppression_counts.blocklist += 1;
-            return None;
-        }
-        if self.notch.contains(freq_hz) {
+            Some(Reason::Blocklist)
+        } else if self.notch.contains(freq_hz) {
             self.suppression_counts.notch += 1;
+            Some(Reason::Notch)
+        } else if !grammar::is_plausible(&candidate) {
+            Some(Reason::Grammar)
+        } else if !self.cty.is_allocated(&candidate) {
+            Some(Reason::Cty)
+        } else {
+            None
+        };
+        if let Some(reason) = rejected {
+            self.decide(|| withheld(reason));
             return None;
         }
-        if !grammar::is_plausible(&candidate) {
-            return None;
-        }
-        if !self.cty.is_allocated(&candidate) {
-            return None;
-        }
+        self.decide(|| withheld(Reason::BeaconPending));
 
         let pending = &mut self.tracks.get_mut(&track_id)?.pending_beacons;
-        if pending.len() >= MAX_PENDING_BEACONS {
-            // Drop the oldest to bound growth on a track that stays alive
-            // indefinitely (round 8) -- see MAX_PENDING_BEACONS's doc.
-            // Counted (ARCHITECTURE §8 -- round 9): this candidate's own
-            // source word was already marked attempted and won't be
-            // recaptured, so this is a real, permanent loss.
-            pending.remove(0);
+        // Past the cap, drop the oldest to bound growth on a track that
+        // stays alive indefinitely (round 8) -- see MAX_PENDING_BEACONS's
+        // doc. Counted (ARCHITECTURE §8 -- round 9): this candidate's own
+        // source word was already marked attempted and won't be
+        // recaptured, so this is a real, permanent loss.
+        let evicted = insert_by_age(
+            pending,
+            PendingBeacon {
+                candidate,
+                sample_ts,
+                freq_hz,
+                snr_db,
+                char_confidences,
+                origin_track_id: track_id,
+                word_seq,
+            },
+        );
+        if let Some(evicted) = evicted {
             self.suppression_counts.pending_beacon_overflow += 1;
+            if let Some(log) = self.decisions.as_mut() {
+                log.push(beacon_decision(track_id, &evicted, Reason::BeaconOverflow));
+            }
         }
-        pending.push(PendingBeacon {
-            candidate,
-            sample_ts,
-            freq_hz,
-            snr_db,
-            char_confidences,
-            origin_track_id: track_id,
-            word_seq,
-        });
         None
     }
 
@@ -1374,16 +1555,23 @@ impl Validator {
         match survivor_track_id {
             Some(survivor) => {
                 let survivor_track = self.tracks.entry(survivor).or_default();
+                // Merged by `sample_ts`, not appended (MAN-174): the cap
+                // must drop the true oldest across both queues, so an old
+                // loser candidate never displaces the survivor's newer ones.
                 for pb in pending {
-                    if survivor_track.pending_beacons.len() >= MAX_PENDING_BEACONS {
-                        survivor_track.pending_beacons.remove(0);
+                    if let Some(evicted) = insert_by_age(&mut survivor_track.pending_beacons, pb) {
                         self.suppression_counts.pending_beacon_overflow += 1;
+                        if let Some(log) = self.decisions.as_mut() {
+                            log.push(beacon_decision(survivor, &evicted, Reason::BeaconOverflow));
+                        }
                     }
-                    survivor_track.pending_beacons.push(pb);
                 }
             }
             None => {
                 self.suppression_counts.pending_beacon_lost_to_eviction += pending.len() as u64;
+                for pb in &pending {
+                    self.decide(|| beacon_decision(track_id, pb, Reason::BeaconDiscarded));
+                }
             }
         }
     }
@@ -1400,6 +1588,22 @@ impl Validator {
     /// fixed ~20-22 WPM, well under `MAX_PLAUSIBLE_WPM`. A single WPM
     /// value covers every pending candidate on this track -- it's a
     /// track-level property, not a per-candidate one.
+    /// MAN-78: the lists can be replaced between a beacon's capture and its
+    /// track's close. Counts and reports a pending beacon the current lists
+    /// suppress; a no-op when they were not replaced, since capture already
+    /// passed the same checks.
+    fn operator_suppressed(&mut self, pb: &PendingBeacon) -> Option<Reason> {
+        if self.blocklist.contains(&pb.candidate) {
+            self.suppression_counts.blocklist += 1;
+            return Some(Reason::Blocklist);
+        }
+        if self.notch.contains(pb.freq_hz) {
+            self.suppression_counts.notch += 1;
+            return Some(Reason::Notch);
+        }
+        None
+    }
+
     fn resolve_pending_beacons(&mut self, track_id: u32) -> Vec<Spot> {
         let (wpm, wpm_confirmed, pending) = {
             let Some(track) = self.tracks.get_mut(&track_id) else {
@@ -1415,12 +1619,37 @@ impl Validator {
         // a genuine slow speed -- refuse to resolve rather than let a
         // never-measured survivor pass the plausibility check on a
         // placeholder value (round 10).
-        if pending.is_empty() || !wpm_confirmed || wpm > MAX_PLAUSIBLE_WPM {
+        if pending.is_empty() {
+            return Vec::new();
+        }
+        if !wpm_confirmed || wpm > MAX_PLAUSIBLE_WPM {
+            // Operator suppression takes precedence over the automatic
+            // speed rejection (`blocklisted_beacon_above_max_wpm_still_counts_as_suppressed`),
+            // so lists reloaded since capture are still counted here (MAN-78).
+            // Every other candidate is counted as a WPM-gate rejection,
+            // unconfirmed and implausible speed alike (MAN-174,
+            // ARCHITECTURE §8) -- exactly one counter per candidate.
+            for pb in &pending {
+                let reason = match self.operator_suppressed(pb) {
+                    Some(reason) => reason,
+                    None => {
+                        self.suppression_counts.pending_beacon_rejected_wpm += 1;
+                        Reason::BeaconSpeed
+                    }
+                };
+                self.decide(|| beacon_decision(track_id, pb, reason));
+            }
             return Vec::new();
         }
         pending
             .into_iter()
             .filter_map(|pb| {
+                // Before `gate.record`, so a suppressed beacon never feeds
+                // the repetition gate.
+                if let Some(reason) = self.operator_suppressed(&pb) {
+                    self.decide(|| beacon_decision(track_id, &pb, reason));
+                    return None;
+                }
                 // pb.origin_track_id, not the resolving `track_id`
                 // (Codex review, PR #152, round 14): a migrated
                 // PendingBeacon must keep the identity that ACTUALLY
@@ -1454,10 +1683,19 @@ impl Validator {
                 // there would still record it, silently rewinding the
                 // watermark backward and letting a later real spot escape
                 // the suppression window early (Codex review on PR #154,
-                // round 8). Simplest safe rule: an already-superseded
-                // observation is not worth emitting at all.
+                // round 8). So a strictly older observation is dropped,
+                // and counted (MAN-174, ARCHITECTURE §8). An EQUAL
+                // timestamp cannot rewind the watermark -- e.g. two tracks
+                // completing a word on the same input hop -- so it goes
+                // through `should_emit` exactly like a non-deferred
+                // candidate: suppressed as a duplicate, or emitted on a
+                // spot-type change or SNR jump (MAN-174).
                 if let Some(last_ts) = self.dedupe.last_sample_ts(&pb.candidate, pb.freq_hz) {
-                    if pb.sample_ts <= last_ts {
+                    if pb.sample_ts < last_ts {
+                        self.suppression_counts.pending_beacon_stale += 1;
+                        self.decide(|| {
+                            beacon_decision(track_id, &pb, Reason::Dedupe).with_reps(reps)
+                        });
                         return None;
                     }
                 }
@@ -1468,9 +1706,10 @@ impl Validator {
                     SpotType::Beacon,
                     pb.sample_ts,
                 ) {
+                    self.decide(|| beacon_decision(track_id, &pb, Reason::Dedupe).with_reps(reps));
                     return None;
                 }
-                Some(Spot {
+                let spot = Spot {
                     callsign: pb.candidate,
                     freq_hz: pb.freq_hz,
                     snr_db: pb.snr_db,
@@ -1479,10 +1718,36 @@ impl Validator {
                     confidence,
                     track_id,
                     sample_ts: pb.sample_ts,
-                })
+                };
+                self.decide(|| Decision::spotted(&spot, reps));
+                Some(spot)
             })
             .collect()
     }
+}
+
+/// Inserts `pb` at its `sample_ts` position (after any equal ones, so
+/// capture order breaks ties) and, past `MAX_PENDING_BEACONS`, removes and
+/// returns the oldest entry, which may be `pb` itself. Keeps `pending`
+/// sorted by `sample_ts`, so the cap always drops the true oldest
+/// (MAN-174).
+fn insert_by_age(pending: &mut Vec<PendingBeacon>, pb: PendingBeacon) -> Option<PendingBeacon> {
+    let at = pending.partition_point(|p| p.sample_ts <= pb.sample_ts);
+    pending.insert(at, pb);
+    (pending.len() > MAX_PENDING_BEACONS).then(|| pending.remove(0))
+}
+
+/// A decision about a deferred beacon candidate, decided under
+/// `track_id` (the track it is resolved or discarded on).
+fn beacon_decision(track_id: u32, pb: &PendingBeacon, reason: Reason) -> Decision {
+    Decision::withheld(
+        track_id,
+        pb.sample_ts,
+        &pb.candidate,
+        pb.freq_hz,
+        SpotType::Beacon,
+        reason,
+    )
 }
 
 #[cfg(test)]
@@ -1495,7 +1760,8 @@ mod tests {
     fn from_tables_spots_a_call_only_the_supplied_table_allocates() {
         let words = ["DE", "QQ9ZZZ", "K"];
         let spots_with = |cty: &str| {
-            let mut v = Validator::from_tables(FS, Arc::new(cty::Table::parse(cty)), None);
+            let mut v = Validator::from_tables(FS, Arc::new(cty::Table::parse(cty)), None)
+                .with_patterns(Arc::new(pattern::Table::parse("+QQ9@@@\n").unwrap()));
             seed_meta(&mut v, 1);
             let mut spots = run(&transmission_events(1, &words, 0), &mut v);
             spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
@@ -1517,7 +1783,8 @@ mod tests {
         let cty = Arc::new(cty::Table::parse(&format!("{CTY_FIXTURE}{QQ9_ENTITY}")));
         let confidence_with = |scp: &str| {
             let mut v =
-                Validator::from_tables(FS, cty.clone(), Some(Arc::new(scp::Set::parse(scp))));
+                Validator::from_tables(FS, cty.clone(), Some(Arc::new(scp::Set::parse(scp))))
+                    .with_patterns(Arc::new(pattern::Table::parse("+QQ9@@@\n").unwrap()));
             seed_meta(&mut v, 1);
             let words = ["DE", "QQ9ZZZ", "K"];
             let mut spots = run(&transmission_events(1, &words, 0), &mut v);
@@ -1575,6 +1842,323 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             snr_2500_db: 20.0,
             freq_hz: 14_000_000.0,
         });
+    }
+
+    // ---- MAN-324: the decision record ----
+
+    use crate::decision::Verdict;
+
+    fn recording(cty: &str) -> Validator {
+        let mut v = Validator::new(FS, cty, None);
+        v.record_decisions(true);
+        seed_meta(&mut v, 1);
+        v
+    }
+
+    fn decisions_for<'a>(log: &'a [Decision], call: &str) -> Vec<&'a Decision> {
+        log.iter().filter(|d| d.call == call).collect()
+    }
+
+    #[test]
+    fn unlisted_decisions_and_reclassification_keep_the_five_rep_requirement() {
+        let mut v = recording(CTY_FIXTURE);
+        let events = transmission_events(1, &["DE", "W4KTNL", "CQ"], 0);
+        assert!(run(&events, &mut v).is_empty());
+        let log = v.take_decisions();
+        let decisions = decisions_for(&log, "W4KTNL");
+        assert_eq!(decisions.len(), 2, "DE then CQ reclassification: {log:?}");
+        for d in decisions {
+            assert_eq!(d.reason, Some(Reason::Repetition));
+            assert_eq!(d.required_reps, 5);
+            assert_eq!(d.pattern_tier, Some(crate::PatternTier::Unlisted));
+            assert_eq!(d.reps, Some(1), "reclassification must not record again");
+        }
+    }
+
+    #[test]
+    fn allowlisted_decision_reports_one_rep_and_no_pattern_tier() {
+        let mut v = recording(CTY_FIXTURE);
+        v.allowlist("W4KTNL");
+        assert_eq!(
+            run(&transmission_events(1, &["W4KTNL"], 0), &mut v).len(),
+            1
+        );
+        let log = v.take_decisions();
+        let d = decisions_for(&log, "W4KTNL")[0];
+        assert_eq!(d.required_reps, 1);
+        assert_eq!(d.pattern_tier, None);
+    }
+
+    #[test]
+    fn decision_log_is_empty_unless_enabled() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+        assert_eq!(spots.len(), 1);
+        assert!(v.take_decisions().is_empty());
+    }
+
+    #[test]
+    fn a_first_decode_is_withheld_for_repetition_then_spotted_on_the_second() {
+        let mut v = recording(CTY_FIXTURE);
+        let words = ["DE", "K5ARH", "K"];
+        assert!(run(&transmission_events(1, &words, 0), &mut v).is_empty());
+        let first = v.take_decisions();
+        let first = decisions_for(&first, "K5ARH");
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert_eq!(first[0].verdict, Verdict::Withheld);
+        assert_eq!(first[0].reason, Some(Reason::Repetition));
+        assert_eq!(first[0].reps, Some(1));
+        assert_eq!(first[0].spot_type, SpotType::De);
+        assert_eq!(first[0].freq_hz, 14_000_000.0);
+
+        let spots = run(&transmission_events(1, &words, 100_000), &mut v);
+        assert_eq!(spots.len(), 1);
+        let second = v.take_decisions();
+        let second = decisions_for(&second, "K5ARH");
+        assert_eq!(second.len(), 1, "{second:?}");
+        assert_eq!(second[0].verdict, Verdict::Spotted);
+        assert_eq!(second[0].reason, None);
+        assert_eq!(second[0].reps, Some(2));
+        assert_eq!(second[0].spot.as_ref(), Some(&spots[0]));
+        assert!(v.take_decisions().is_empty(), "take drains the log");
+    }
+
+    #[test]
+    fn variant_withhold_names_the_better_supported_rival() {
+        let mut v = recording(CTY_FIXTURE);
+        for i in 0..2u64 {
+            run(
+                &transmission_events(1, &["CQ", "DE", "K5ARH", "K"], i * 300_000),
+                &mut v,
+            );
+        }
+        let filler: Vec<String> = (1..=16).map(|i| format!("QQQ{i}")).collect();
+        let filler_refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+        run(&transmission_events(1, &filler_refs, 600_000), &mut v);
+        for i in 0..2u64 {
+            run(
+                &transmission_events(1, &["CQ", "DE", "K5AR", "K"], 900_000 + i * 300_000),
+                &mut v,
+            );
+        }
+        let log = v.take_decisions();
+        let variant: Vec<&Decision> = decisions_for(&log, "K5AR")
+            .into_iter()
+            .filter(|d| d.reason == Some(Reason::Variant))
+            .collect();
+        assert!(!variant.is_empty(), "{log:?}");
+        let rival = variant[0]
+            .rival
+            .as_ref()
+            .expect("a variant withhold names its rival");
+        assert_eq!(rival.call, "K5ARH");
+        assert_eq!(rival.support.reps, 2);
+        assert_eq!(variant[0].verdict, Verdict::Withheld);
+        assert!(variant[0].reps.unwrap() >= 2);
+    }
+
+    #[test]
+    fn blocklist_notch_grammar_and_cty_withholds_carry_their_reason() {
+        let reason_of = |mut v: Validator, words: &[&str], call: &str| {
+            v.record_decisions(true);
+            seed_meta(&mut v, 1);
+            run(&transmission_events(1, words, 0), &mut v);
+            let log = v.take_decisions();
+            let d = decisions_for(&log, call);
+            assert_eq!(d.len(), 1, "{log:?}");
+            assert_eq!(d[0].verdict, Verdict::Withheld);
+            assert_eq!(d[0].reps, None, "decided before the repetition gate");
+            d[0].reason
+        };
+        let base = || Validator::new(FS, CTY_FIXTURE, None);
+        assert_eq!(
+            reason_of(
+                base().with_blocklist(Blocklist::parse("K5ARH\n")),
+                &["DE", "K5ARH", "K"],
+                "K5ARH"
+            ),
+            Some(Reason::Blocklist)
+        );
+        assert_eq!(
+            reason_of(
+                base().with_notch(NotchList::parse("13999000-14001000\n")),
+                &["DE", "K5ARH", "K"],
+                "K5ARH"
+            ),
+            Some(Reason::Notch)
+        );
+        assert_eq!(
+            reason_of(base(), &["DE", "ABC", "K"], "ABC"),
+            Some(Reason::Grammar)
+        );
+        assert_eq!(
+            reason_of(base(), &["DE", "QQ9ZZZ", "K"], "QQ9ZZZ"),
+            Some(Reason::Cty)
+        );
+    }
+
+    #[test]
+    fn dedupe_withhold_is_recorded() {
+        let mut v = recording(CTY_FIXTURE);
+        let words = ["DE", "K5ARH", "K"];
+        run(&transmission_events(1, &words, 0), &mut v);
+        run(&transmission_events(1, &words, 100_000), &mut v);
+        v.take_decisions();
+        assert!(run(&transmission_events(1, &words, 200_000), &mut v).is_empty());
+        let log = v.take_decisions();
+        let d = decisions_for(&log, "K5ARH");
+        assert_eq!(d.len(), 1, "{log:?}");
+        assert_eq!(d[0].reason, Some(Reason::Dedupe));
+        assert!(d[0].reps.is_some());
+    }
+
+    #[test]
+    fn a_beacon_is_deferred_then_decided_when_its_track_ends() {
+        // Deferred, then spotted at a plausible final speed.
+        let mut v = recording(CTY_FIXTURE);
+        run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH", "K"], 0),
+            &mut v,
+        );
+        let log = v.take_decisions();
+        let d = decisions_for(&log, "K5ARH");
+        assert_eq!(d.len(), 1, "{log:?}");
+        assert_eq!(d[0].verdict, Verdict::Deferred);
+        assert_eq!(d[0].reason, Some(Reason::BeaconPending));
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert_eq!(spots.len(), 1);
+        let log = v.take_decisions();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0].verdict, Verdict::Spotted);
+        assert_eq!(log[0].spot.as_ref(), Some(&spots[0]));
+
+        // Rejected for speed.
+        let mut v = recording(CTY_FIXTURE);
+        run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH", "K"], 0),
+            &mut v,
+        );
+        v.take_decisions();
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 60.0,
+        });
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        let log = v.take_decisions();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0].reason, Some(Reason::BeaconSpeed));
+
+        // Discarded on a bookkeeping close with no survivor.
+        let mut v = recording(CTY_FIXTURE);
+        run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH", "K"], 0),
+            &mut v,
+        );
+        v.take_decisions();
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: None,
+            },
+        });
+        let log = v.take_decisions();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0].reason, Some(Reason::BeaconDiscarded));
+
+        // Overflow past MAX_PENDING_BEACONS.
+        let mut v = recording(CTY_FIXTURE);
+        let mut ts = 0u64;
+        for i in 0..(MAX_PENDING_BEACONS + 1) {
+            let call = format!("K5AA{}", (b'A' + i as u8) as char);
+            run(&transmission_events(1, &[call.as_str(), "T"], ts), &mut v);
+            ts += 1_000_000;
+        }
+        let log = v.take_decisions();
+        let overflow: Vec<&Decision> = log
+            .iter()
+            .filter(|d| d.reason == Some(Reason::BeaconOverflow))
+            .collect();
+        assert_eq!(overflow.len(), 1, "{log:?}");
+        assert_eq!(overflow[0].call, "K5AAA", "the oldest is evicted");
+    }
+
+    #[test]
+    fn a_power_step_guard_withhold_is_recorded() {
+        let mut v = recording(CTY_FIXTURE);
+        let words = ["CQ", "DX", "FILLER1", "FILLER2", "FILLER3", "K5ARH", "T"];
+        run(&transmission_events(1, &words, 0), &mut v);
+        assert_eq!(v.suppression_counts().power_step_guard, 1);
+        let log = v.take_decisions();
+        let d: Vec<&Decision> = log
+            .iter()
+            .filter(|d| d.reason == Some(Reason::PowerStepGuard))
+            .collect();
+        assert_eq!(d.len(), 1, "{log:?}");
+        assert_eq!(d[0].call, "K5ARH");
+        assert_eq!(d[0].spot_type, SpotType::Beacon);
+    }
+
+    #[test]
+    fn a_reclassification_reattempt_records_no_new_decision() {
+        let mut v = recording(CTY_FIXTURE);
+        let words = ["DE", "K5ARH", "K"];
+        run(&transmission_events(1, &words, 0), &mut v);
+        assert_eq!(decisions_for(&v.take_decisions(), "K5ARH").len(), 1);
+        // A later unrelated word re-scans the window; the same K5ARH word
+        // with the same type is not a new decision.
+        run(&transmission_events(1, &["QSL"], 50_000), &mut v);
+        assert!(decisions_for(&v.take_decisions(), "K5ARH").is_empty());
+    }
+
+    #[test]
+    fn no_decision_before_the_first_track_meta() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        v.record_decisions(true);
+        run(&transmission_events(1, &["DE", "K5ARH", "K"], 0), &mut v);
+        assert!(v.take_decisions().is_empty());
+        seed_meta(&mut v, 1);
+        let log = v.take_decisions();
+        assert_eq!(decisions_for(&log, "K5ARH").len(), 1, "{log:?}");
+    }
+
+    #[test]
+    fn candidates_for_lists_a_tracks_plausible_words_strongest_first() {
+        let mut v = recording(CTY_FIXTURE);
+        seed_meta(&mut v, 2);
+        run(&transmission_events(1, &["DE", "K5ARH", "K"], 0), &mut v);
+        run(
+            &transmission_events(1, &["DE", "K5ARX", "K"], 100_000),
+            &mut v,
+        );
+        run(
+            &transmission_events(1, &["DE", "K5ARH", "K"], 400_000),
+            &mut v,
+        );
+        run(&transmission_events(2, &["DE", "W1AW", "K"], 0), &mut v);
+        let got = v.candidates_for(1, 500_000);
+        let calls: Vec<&str> = got.iter().map(|c| c.call.as_str()).collect();
+        assert_eq!(calls, ["K5ARH", "K5ARX"], "{got:?}");
+        assert_eq!(got[0].support.reps, 2);
+        assert!(got[0].support.strictly_better_than(&got[1].support));
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(v.candidates_for(1, 500_000).is_empty());
+        assert_eq!(v.candidates_for(2, 500_000).len(), 1);
     }
 
     #[test]
@@ -1688,6 +2272,161 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert_eq!(spots[0].spot_type, SpotType::Beacon);
     }
 
+    /// MAN-78: a K5ARH transmission, then a reload that blocklists
+    /// K5ARH, then the same transmission again -- the second one would
+    /// spot (see `full_pipeline_spots_a_repeated_valid_callsign`) and must
+    /// not.
+    #[test]
+    fn replaced_blocklist_suppresses_the_next_occurrence() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        v.replace_operator_lists(&[], Blocklist::parse("K5ARH\n"), NotchList::default());
+        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().blocklist, 1);
+    }
+
+    #[test]
+    fn replaced_empty_blocklist_lets_later_words_spot() {
+        let mut v =
+            Validator::new(FS, CTY_FIXTURE, None).with_blocklist(Blocklist::parse("K5ARH\n"));
+        seed_meta(&mut v, 1);
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().blocklist, 1);
+        v.replace_operator_lists(&[], Blocklist::default(), NotchList::default());
+        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+        spots.extend(run(&transmission_events(1, &words, 200_000), &mut v));
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].callsign, "K5ARH");
+    }
+
+    #[test]
+    fn replaced_allowlist_is_uppercased_and_replaces_the_old_list() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        v.allowlist("k5arh");
+        v.replace_operator_lists(
+            &["w1aw".to_string()],
+            Blocklist::default(),
+            NotchList::default(),
+        );
+        seed_meta(&mut v, 1);
+        seed_meta(&mut v, 2);
+        let spots = run(&transmission_events(1, &["W1AW"], 0), &mut v);
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].callsign, "W1AW");
+        let spots = run(&transmission_events(2, &["K5ARH"], 0), &mut v);
+        assert!(
+            spots.is_empty(),
+            "the old allowlist must be gone, got {spots:?}"
+        );
+    }
+
+    /// A beacon captured before a reload, resolved at `TrackClosed` after
+    /// it: the new blocklist must still apply (control:
+    /// `only_the_true_final_wpm_at_track_close_decides` spots it).
+    #[test]
+    fn pending_beacon_captured_before_a_blocklist_reload_never_spots() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        v.replace_operator_lists(&[], Blocklist::parse("K5ARH\n"), NotchList::default());
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().blocklist, 1);
+    }
+
+    /// Codex review on PR #232: a beacon blocklisted by a reload and then
+    /// closed above `MAX_PLAUSIBLE_WPM` still counts as operator
+    /// suppression, matching `blocklisted_beacon_above_max_wpm_still_counts_as_suppressed`.
+    #[test]
+    fn pending_beacon_blocklisted_by_a_reload_then_too_fast_counts_as_suppressed() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        v.replace_operator_lists(&[], Blocklist::parse("K5ARH\n"), NotchList::default());
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 60.0,
+        });
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().blocklist, 1);
+    }
+
+    #[test]
+    fn pending_beacon_without_a_reload_still_spots() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].spot_type, SpotType::Beacon);
+    }
+
+    #[test]
+    fn pending_beacon_in_a_newly_notched_range_never_spots() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        v.replace_operator_lists(
+            &[],
+            Blocklist::default(),
+            NotchList::parse("13999900-14000100\n"),
+        );
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().notch, 1);
+    }
+
+    #[test]
+    fn replacing_lists_keeps_suppression_counts() {
+        let mut v =
+            Validator::new(FS, CTY_FIXTURE, None).with_blocklist(Blocklist::parse("K5ARH\n"));
+        seed_meta(&mut v, 1);
+        let spots = run(&transmission_events(1, &["DE", "K5ARH", "K"], 0), &mut v);
+        assert!(spots.is_empty());
+        let before = v.suppression_counts();
+        assert_eq!(before.blocklist, 1);
+        v.replace_operator_lists(&[], Blocklist::default(), NotchList::default());
+        assert_eq!(v.suppression_counts(), before);
+    }
+
     /// Codex review on PR #154, round 3: a blocklisted callsign that
     /// would ALSO fail the Beacon-WPM gate must still count as an
     /// explicit operator suppression (ARCHITECTURE §8), not be silently
@@ -1705,6 +2444,170 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(spots.is_empty());
         assert_eq!(v.suppression_counts().blocklist, 1);
+        // MAN-174: counted once, as an operator suppression, never also
+        // as a WPM-gate rejection.
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().blocklist, 1);
+        assert_eq!(v.suppression_counts().pending_beacon_rejected_wpm, 0);
+    }
+
+    /// MAN-174 finding 2: a captured Beacon dropped by the WPM gate at its
+    /// track's close is counted, not silently lost (ARCHITECTURE §8).
+    #[test]
+    fn a_beacon_rejected_for_implausible_wpm_is_counted() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 60.0,
+        });
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().pending_beacon_rejected_wpm, 1);
+    }
+
+    /// MAN-174 finding 2 (round-10 note): the unconfirmed-speed refusal is
+    /// the same gate and is counted the same way.
+    #[test]
+    fn a_beacon_rejected_for_unconfirmed_wpm_is_counted() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().pending_beacon_rejected_wpm, 1);
+    }
+
+    /// MAN-174 finding 1 backstop: closures arriving survivor-first (track
+    /// 1 merges into 3, then track 2 into 1) still land track 2's evidence
+    /// on the live root, track 3, and leave no state behind for track 1.
+    #[test]
+    fn a_chained_merge_out_of_order_still_resolves_at_the_final_survivor() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 2);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 2,
+            wpm: 22.0,
+        });
+        let spots = run(&transmission_events(2, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        for (track_id, survivor) in [(1, 3), (2, 1)] {
+            let spots = v.ingest(&DecoderEvent::TrackClosed {
+                track_id,
+                closure: ClosureKind::Bookkeeping {
+                    survivor_track_id: Some(survivor),
+                },
+            });
+            assert!(spots.is_empty(), "got {spots:?}");
+        }
+        seed_meta(&mut v, 3);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 3,
+            wpm: 25.0,
+        });
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 3,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].callsign, "K5ARH");
+        assert_eq!(spots[0].spot_type, SpotType::Beacon);
+        assert!(
+            !v.tracks.contains_key(&1),
+            "a dead survivor's track state must not be recreated"
+        );
+    }
+
+    /// MAN-174 finding 4: migration merges both queues by `sample_ts`, so
+    /// the cap evicts the true oldest. The loser's stale candidate goes,
+    /// not the survivor's oldest newer one.
+    #[test]
+    fn migration_keeps_the_newest_pending_beacons_by_sample_ts() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        seed_meta(&mut v, 2);
+        let spots = run(&transmission_events(1, &["K5AAZ", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        let mut expected = Vec::new();
+        for i in 0..MAX_PENDING_BEACONS {
+            let call = format!("K5AA{}", (b'A' + i as u8) as char);
+            let start = 10_000_000 + i as u64 * 1_000_000;
+            let spots = run(
+                &transmission_events(2, &[call.as_str(), "T"], start),
+                &mut v,
+            );
+            assert!(spots.is_empty());
+            expected.push(call);
+        }
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(2),
+            },
+        });
+        let pending = &v.tracks[&2].pending_beacons;
+        let calls: Vec<&str> = pending.iter().map(|pb| pb.candidate.as_str()).collect();
+        assert_eq!(calls, expected);
+        assert!(
+            pending.windows(2).all(|w| w[0].sample_ts <= w[1].sample_ts),
+            "pending_beacons must stay sorted by sample_ts"
+        );
+        assert_eq!(v.suppression_counts().pending_beacon_overflow, 1);
+    }
+
+    /// MAN-174 finding 5: a deferred Beacon with the SAME `sample_ts` as
+    /// an emitted spot cannot rewind the dedupe watermark. It goes through
+    /// `Dedupe::should_emit`, where a De -> Beacon type change emits it.
+    #[test]
+    fn an_equal_timestamp_deferred_beacon_goes_through_dedupe() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 2);
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = run(&transmission_events(2, &words, 5_000_000), &mut v);
+        spots.extend(run(&transmission_events(2, &words, 5_100_000), &mut v));
+        assert_eq!(spots.len(), 1, "the ordinary path must spot normally");
+        assert_eq!(spots[0].spot_type, SpotType::De);
+        let t = spots[0].sample_ts;
+
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        // The capture is stamped at "T"'s word boundary, 700 samples after
+        // "K5ARH"'s first character.
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], t - 700), &mut v);
+        assert!(spots.is_empty());
+        assert_eq!(
+            v.tracks[&1]
+                .pending_beacons
+                .iter()
+                .map(|pb| pb.sample_ts)
+                .collect::<Vec<_>>(),
+            vec![t],
+            "fixture: the Beacon must be captured at the spot's own timestamp"
+        );
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].spot_type, SpotType::Beacon);
+        assert_eq!(spots[0].sample_ts, t);
+        assert_eq!(v.suppression_counts().pending_beacon_stale, 0);
     }
 
     /// Codex review on PR #154, round 8: a regularly-transmitting carrier
@@ -1784,7 +2687,13 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
 
         // Track 1 finally closes -- its captured (OLDER) Beacon candidate
         // must not emit now, and must not roll dedupe's watermark back to
-        // its own stale timestamp.
+        // its own stale timestamp. A plausible, confirmed final speed
+        // (MAN-174), so the candidate reaches the stale check rather than
+        // the round-10 unconfirmed-WPM refusal.
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
         let spots3 = v.ingest(&DecoderEvent::TrackClosed {
             track_id: 1,
             closure: ClosureKind::SignalEnded,
@@ -1799,6 +2708,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             "resolving the stale deferred candidate must not roll the \
              dedupe watermark backward"
         );
+        // MAN-174 finding 6: the stale drop is counted.
+        assert_eq!(v.suppression_counts().pending_beacon_stale, 1);
     }
 
     /// Codex review on PR #154, round 9: a Merged closure is not evidence

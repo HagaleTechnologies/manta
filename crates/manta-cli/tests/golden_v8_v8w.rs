@@ -151,10 +151,69 @@ fn v8_pileup_validates_at_least_45_of_50_with_no_bogus_calls() {
 /// collapse. MAN-213 raised it to 20 to encode its acceptance criterion,
 /// "at least the pre-existing ~20 of 50": `main`'s pre-MAN-103 baseline
 /// is 21/50, and MAN-103 + MAN-213's fade-tracking rails measure 28/50
-/// (docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md). This
+/// (docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md).
+/// MAN-95 measures 27/50 at normal validation and 28/50 at minimal; the
+/// unlisted synthetic AB2KLK pattern accounts for the difference. This
 /// is NOT a SPEC criterion -- SPEC §7's V8w row states no recall bar -- it
 /// is a guard on this test's own meaning.
 const MIN_V8W_VALIDATED: usize = 20;
+
+/// The V8w-scene "no bogus callsigns" check shared by V8w and VC3: the
+/// distinct callsigns spotted that are not in the scene (sorted), the
+/// genuine calls validated, and the distinct calls spotted.
+fn bogus_and_validated(
+    report: &serde_json::Value,
+    manifest: &manta_testkit::vectors::Manifest,
+    name: &str,
+) -> (Vec<String>, usize, usize) {
+    let known_calls: HashSet<&str> = manifest
+        .keyed_texts
+        .iter()
+        .map(|t| call_from_keyed_text(t))
+        .collect();
+    assert_eq!(
+        known_calls.len(),
+        50,
+        "{name} fixture must have 50 unique callsigns"
+    );
+
+    let spots = spotted_calls(report);
+    let spotted: HashSet<&str> = spots.iter().map(|(c, _)| c.as_str()).collect();
+    let mut bogus: Vec<String> = spotted
+        .iter()
+        .filter(|c| !known_calls.contains(**c))
+        .map(|c| c.to_string())
+        .collect();
+    bogus.sort_unstable();
+    let validated = known_calls.iter().filter(|c| spotted.contains(**c)).count();
+    (bogus, validated, spotted.len())
+}
+
+/// The bogus/validated failures for a V8w-scene report, evaluated and
+/// reported together, deliberately: two sequential `assert!`s would make
+/// the second one unreachable whenever the first fails -- exactly the
+/// defect MAN-101 exists to fix one level up.
+fn v8w_scene_failures(
+    report: &serde_json::Value,
+    manifest: &manta_testkit::vectors::Manifest,
+    name: &str,
+) -> Vec<String> {
+    let (bogus, validated, n_spotted) = bogus_and_validated(report, manifest, name);
+    let mut failures: Vec<String> = Vec::new();
+    if !bogus.is_empty() {
+        failures.push(format!(
+            "SPEC §7 {name} requires 0 bogus callsigns; got {} of {n_spotted} distinct spotted: {bogus:?}",
+            bogus.len(),
+        ));
+    }
+    if validated < MIN_V8W_VALIDATED {
+        failures.push(format!(
+            "only {validated}/50 genuine callsigns validated (floor {MIN_V8W_VALIDATED}); \
+             0 bogus is vacuous if recall has collapsed"
+        ));
+    }
+    failures
+}
 
 /// SPEC §7's V8w row states three independent pass criteria; this is the
 /// second, "0 bogus callsigns". It is deliberately a test of its own, NOT
@@ -167,45 +226,60 @@ const MIN_V8W_VALIDATED: usize = 20;
 fn v8w_pileup_fading_spots_no_bogus_callsigns() {
     let spec = manta_testkit::vectors::v8w();
     let (report, manifest) = decode_report(&spec);
-    let known_calls: HashSet<&str> = manifest
-        .keyed_texts
-        .iter()
-        .map(|t| call_from_keyed_text(t))
-        .collect();
-    assert_eq!(
-        known_calls.len(),
-        50,
-        "V8w fixture must have 50 unique callsigns"
-    );
-
-    let spots = spotted_calls(&report);
-    let spotted: HashSet<&str> = spots.iter().map(|(c, _)| c.as_str()).collect();
-    let mut bogus: Vec<&str> = spotted
-        .iter()
-        .filter(|c| !known_calls.contains(**c))
-        .copied()
-        .collect();
-    bogus.sort_unstable();
-    let validated = known_calls.iter().filter(|c| spotted.contains(**c)).count();
-
-    // Both conditions are evaluated and reported together, deliberately: two
-    // sequential `assert!`s would make the second one unreachable whenever the
-    // first fails -- exactly the defect MAN-101 exists to fix one level up.
-    let mut failures: Vec<String> = Vec::new();
-    if !bogus.is_empty() {
-        failures.push(format!(
-            "SPEC §7 V8w requires 0 bogus callsigns; got {} of {} distinct spotted: {bogus:?}",
-            bogus.len(),
-            spotted.len()
-        ));
-    }
-    if validated < MIN_V8W_VALIDATED {
-        failures.push(format!(
-            "only {validated}/50 genuine callsigns validated (floor {MIN_V8W_VALIDATED}); \
-             0 bogus is vacuous if recall has collapsed"
-        ));
-    }
+    let failures = v8w_scene_failures(&report, &manifest, "V8w");
     assert!(failures.is_empty(), "V8w: {}", failures.join(" | "));
+}
+
+/// VC3 tracks promoted at most: the V8w scene promotes 52 without crashes,
+/// `"full"` measured 53 with them, and `"off"` 1694.
+const MAX_VC3_PROMOTED: usize = 60;
+
+/// MAN-312 (SPEC §7.2 VC3): the V8w scene plus a pinned crash train
+/// (`manta_testkit::crash::vc3`, train seed `0x3333`, 47 crashes of 1-10 ms
+/// at +20..+60 dB) under the default `crash_filter = "full"`: 0 bogus, at
+/// least `MIN_V8W_VALIDATED` validated, at most `MAX_VC3_PROMOTED`
+/// promoted (measured 0 bogus, 24 validated, 53 promoted).
+///
+/// The crash seed is pinned on purpose, and that is disclosed: on
+/// crash-augmented V8w the bogus count depends on the draw under every
+/// setting. Over five train seeds `"full"` spotted 0, 1, 4, 1 and 1 bogus
+/// calls, all garbles of Watterson-faded tracks (e.g. W6DPG decoded
+/// `W6DW G`), and `"off"` spots bogus calls too. The robust discriminators
+/// are promotions (53 against 1694 under `"off"`) and validated calls (24
+/// against 16), which `static_crash_tests::vc3_off_floods_and_loses_calls`
+/// measures. An oracle pre-channelizer blanker reached 0 bogus on all five
+/// seeds; a real one is follow-up (a) in
+/// docs/DECISIONS/2026-10-13-man312-static-crash-filter.md.
+#[test]
+fn vc3_pileup_fading_with_crashes_spots_no_bogus_callsigns() {
+    let (spec, crashes) = manta_testkit::crash::vc3();
+    let dir = tempfile::tempdir().unwrap();
+    let manifest =
+        manta_testkit::crash::write_crash_fixture_set(&spec, &crashes, dir.path()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_manta"))
+        .args(["decode", "--json"])
+        .arg(dir.path().join(format!("{}.wav", spec.name)))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut failures = v8w_scene_failures(&report, &manifest, "VC3");
+    let promoted = report["events"]
+        .as_array()
+        .expect("decode --json output must include an 'events' array")
+        .iter()
+        .filter(|e| e["event"] == "TrackPromoted")
+        .count();
+    if promoted > MAX_VC3_PROMOTED {
+        failures.push(format!(
+            "{promoted} tracks promoted (ceiling {MAX_VC3_PROMOTED}): crashes are starting tracks"
+        ));
+    }
+    assert!(failures.is_empty(), "VC3: {}", failures.join(" | "));
 }
 
 /// Ignored: measured 1/34 (2.9%) of the >= +6 dB strong signals at

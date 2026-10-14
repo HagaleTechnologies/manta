@@ -18,9 +18,11 @@ produced 94 hit-list items and raised 16 distinct strategic/logistics questions 
 judgment before those items could be filed as tickets; several of those 16 turned out to share one
 answer (e.g. the K5TR-hardware-arriving-in-~1-week status folded into D1's node-credibility framing
 and D5's data plan, rather than standing alone), so this doc records them as the **15 decisions
-below**, not a literal one-to-one list of 16. All 94 hit-list items are now filed as MAN-73 through
-MAN-158 (some folded into existing tickets instead of duplicating them — see each ticket's own
-comments for cross-references).
+below**, not a literal one-to-one list of 16. All 94 hit-list items are now
+dispositioned. Of these, 86 were filed as new tickets, MAN-73 through
+MAN-158; five were handled through comments on existing tickets; and three
+needed neither a new ticket nor a comment. See
+[Notes on ticket filing](#notes-on-ticket-filing) for the breakdown.
 
 ## Decisions
 
@@ -57,6 +59,12 @@ and was never written into README; README instead documents the safe
 default and how to opt out of it. The substantive part of D2 stands
 unchanged: nobody should point the uplink at a real RBN target until MAN-90
 confirms what that target accepts.
+
+**Update 2026-10-11 (MAN-90):** the uplink is now labelled experimental in
+docs and at run time, and the capture procedure and open claims are in
+`docs/RUNBOOKS/aggregator-rbn-capture.md` and
+`docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md`. The
+capture itself is still outstanding.
 
 ### D3 — Wire SNR convention: dual-referenced
 

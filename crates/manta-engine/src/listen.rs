@@ -4,14 +4,16 @@
 //! ring-thread split; see design doc §4.
 
 use crate::latency::DecodeLatencyObserver;
+use crate::live::{LiveStateSink, LiveTap};
+use crate::quality::DecodeQualityObserver;
 use crate::PipelineConfig;
 use anyhow::Result;
 use manta_decode::events::DecoderEvent;
 use manta_input::IqSource;
-use manta_spot::Validator;
+use manta_spot::{Blocklist, NotchList, Validator};
 use num_complex::Complex32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// One chunk read per loop iteration, in samples.
 const CHUNK_SAMPLES: usize = 2048;
@@ -48,6 +50,182 @@ pub struct ListenObservers {
     /// `None` (the default) skips both the `Instant::now()` calls and the
     /// observation entirely, so `listen()`'s existing callers pay nothing.
     pub decode_latency: Option<Arc<DecodeLatencyObserver>>,
+    /// MAN-118: decode-quality signals -- characters decoded, garbles, each
+    /// `legacy` track's keying-rail ratio once per second, and the
+    /// validator's repetition-gate results. Write-only from the decode
+    /// path, so output is unchanged. `None` (the default) skips every
+    /// count and sample, so `listen()`'s existing callers pay nothing.
+    pub decode_quality: Option<Arc<DecodeQualityObserver>>,
+    /// MAN-78: the one inbound field -- replacement operator lists from a
+    /// live config reload, taken before each decoder event reaches the
+    /// running `Validator`. `None` (the default) skips the check
+    /// entirely, so `listen()`'s existing callers pay nothing.
+    pub operator_lists: Option<Arc<OperatorListsUpdate>>,
+    /// MAN-312: static crashes detected so far this session
+    /// (`TrackManager::static_crash_count`, summed across the segments a
+    /// discontinuity starts), stored with `fetch_max` after each processed
+    /// chunk so the published value never goes backwards. A counter, so it
+    /// is never zeroed on exit. `None` (the default) skips the store.
+    pub static_crashes: Option<Arc<AtomicU64>>,
+    /// MAN-314: the currently marked RTTY signals (SPEC §2.6), stored
+    /// whenever the marked set or a marked signal's metadata changes (so a
+    /// store is not by itself a mark or clear), emptied on a segment
+    /// restart, a read error and every exit. `None` (the default) skips it
+    /// entirely.
+    pub rtty: Option<Arc<RttyObserver>>,
+    /// MAN-324: the live-state stream -- once per stream second each
+    /// channel's floor and occupancy, each track's running copy and
+    /// candidates when its text changes, every validation decision and
+    /// every track closure. Write-only from the decode path, so spots are
+    /// unchanged. `None` (the default) skips everything, so `listen()`'s
+    /// existing callers pay nothing.
+    pub live_state: Option<Arc<dyn LiveStateSink>>,
+}
+
+/// MAN-314: the decode loop's currently marked RTTY signals, calibrated.
+/// `generation` moves on every store, so a poller re-reads `snapshot` only
+/// when it changed.
+#[derive(Debug, Default)]
+pub struct RttyObserver {
+    generation: AtomicU64,
+    /// The marked signals and the stream sample timestamp they reflect.
+    signals: Mutex<(Vec<crate::RttySignalReport>, u64)>,
+}
+
+impl RttyObserver {
+    /// Bumped on every store.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// The currently marked signals.
+    pub fn snapshot(&self) -> Vec<crate::RttySignalReport> {
+        self.snapshot_with_sample_ts().0
+    }
+
+    /// The currently marked signals and the stream sample timestamp of the
+    /// store that published them: the hop whose block changed the marked
+    /// set, or the end of the segment when an outage restart, a read error
+    /// or the end of the stream emptied it. A signal missing here but
+    /// present in an earlier snapshot cleared at this timestamp if the
+    /// poller saw every store, and no later than it otherwise.
+    pub fn snapshot_with_sample_ts(&self) -> (Vec<crate::RttySignalReport>, u64) {
+        self.signals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn store(&self, signals: Vec<crate::RttySignalReport>, sample_ts: u64) {
+        *self.signals.lock().unwrap_or_else(|e| e.into_inner()) = (signals, sample_ts);
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// MAN-314: empties the RTTY observer on construction and on every exit
+/// path, like `ActiveTracksGuard`, and publishes the segment's marked set
+/// when the track manager reports a change.
+struct RttyPublisher {
+    observer: Option<Arc<RttyObserver>>,
+    seen_changes: u64,
+    calibration_factor: f64,
+    /// Stream sample timestamp of the latest store or restart, for the
+    /// clear on drop.
+    last_sample_ts: u64,
+}
+
+impl RttyPublisher {
+    fn new(observer: Option<Arc<RttyObserver>>, calibration_factor: f64) -> Self {
+        let p = Self {
+            observer,
+            seen_changes: 0,
+            calibration_factor,
+            last_sample_ts: 0,
+        };
+        p.clear();
+        p
+    }
+
+    fn clear(&self) {
+        if let Some(obs) = &self.observer {
+            if !obs.snapshot().is_empty() {
+                obs.store(Vec::new(), self.last_sample_ts);
+            }
+        }
+    }
+
+    /// A fresh segment's track manager starts with nothing marked.
+    /// `end_sample_ts` is the stream sample timestamp at which the ending
+    /// segment's marks clear.
+    fn restart(&mut self, end_sample_ts: u64) {
+        self.seen_changes = 0;
+        self.last_sample_ts = end_sample_ts;
+        self.clear();
+    }
+
+    fn update(&mut self, tm: &crate::track::TrackManager) {
+        let Some(obs) = &self.observer else {
+            return;
+        };
+        if tm.rtty_changes() == self.seen_changes {
+            return;
+        }
+        self.seen_changes = tm.rtty_changes();
+        self.last_sample_ts = tm.rtty_changed_sample_ts();
+        obs.store(
+            tm.rtty_signals()
+                .iter()
+                .filter(|e| e.cleared_sample_ts.is_none())
+                .map(|e| crate::RttySignalReport::from_entry(e, self.calibration_factor))
+                .collect(),
+            self.last_sample_ts,
+        );
+    }
+}
+
+impl Drop for RttyPublisher {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+/// MAN-78: the operator lists a live reload replaces, as one unit.
+#[derive(Debug, Clone, Default)]
+pub struct OperatorLists {
+    pub allowlist: Vec<String>,
+    pub blocklist: Blocklist,
+    pub notch: NotchList,
+}
+
+/// MAN-78: hands replacement lists from the reload thread to the decode
+/// loop. The newest offer wins; the validator's next decoder event uses it.
+#[derive(Default)]
+pub struct OperatorListsUpdate {
+    pending: AtomicBool,
+    next: Mutex<Option<OperatorLists>>,
+}
+
+impl OperatorListsUpdate {
+    /// Stores `lists` as the next update, replacing any not yet taken.
+    pub fn offer(&self, lists: OperatorLists) {
+        // Poison-tolerant: the slot holds plain data, so a panic in another
+        // holder cannot leave it half-written.
+        let mut next = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        *next = Some(lists);
+        self.pending.store(true, Ordering::Release);
+    }
+
+    /// The newest offer not yet taken, if any. A relaxed load is the whole
+    /// cost when nothing was offered.
+    pub fn take(&self) -> Option<OperatorLists> {
+        if !self.pending.load(Ordering::Relaxed) {
+            return None;
+        }
+        if !self.pending.swap(false, Ordering::Acquire) {
+            return None;
+        }
+        self.next.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
 }
 
 /// Zeroes the active-track observer on EVERY exit path out of
@@ -103,8 +281,11 @@ struct Segment {
 fn new_segment(
     fs: f64,
     center_freq_hz: f64,
+    rf_passband_hz: (f64, f64),
     cfg: &PipelineConfig,
     next_id: u32,
+    quality: Option<Arc<DecodeQualityObserver>>,
+    occupancy: bool,
 ) -> Result<Segment> {
     let ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -119,6 +300,16 @@ fn new_segment(
         cfg.decode.clone(),
     );
     tm.resume_track_ids_from(next_id);
+    tm.skip_preroll_hops(pad_hops);
+    // MAN-312 (SPEC §2.7): judge static crashes over the source's real
+    // passband, not channels that only carry the stream's residual noise.
+    tm.set_rf_passband_hz(rf_passband_hz.0, rf_passband_hz.1);
+    // MAN-118: a post-discontinuity segment keeps reporting.
+    tm.set_quality_observer(quality);
+    // MAN-324: a post-discontinuity segment keeps the live occupancy window.
+    if occupancy {
+        tm.enable_occupancy_window();
+    }
     Ok(Segment {
         ch,
         tm,
@@ -127,18 +318,68 @@ fn new_segment(
     })
 }
 
+/// What `emit` needs besides the events and callbacks, built once per
+/// `listen_with_observers` call.
+struct EmitCtx<'a> {
+    lists: Option<&'a OperatorListsUpdate>,
+    quality: Option<&'a DecodeQualityObserver>,
+    calibration_factor: f64,
+    /// MAN-324: `Some` only when `ListenObservers::live_state` is set.
+    live: Option<LiveTap>,
+}
+
 fn emit(
     events: Vec<DecoderEvent>,
     validator: &mut Validator,
-    calibration_factor: f64,
+    ctx: &mut EmitCtx<'_>,
     on_event: &mut impl FnMut(&DecoderEvent),
     on_spot: &mut impl FnMut(&crate::Spot),
 ) {
+    // MAN-324: record decisions only while the live stream has a
+    // subscriber, so an idle listener allocates nothing per decision.
+    if let Some(tap) = ctx.live.as_ref() {
+        let want = tap.wants_records();
+        if want != validator.records_decisions() {
+            validator.record_decisions(want);
+        }
+    }
+    let mut chars = 0u64;
     for ev in events {
-        on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
+        if matches!(ev, DecoderEvent::CharDecoded { .. }) {
+            chars += 1;
+        }
+        // MAN-78: the one place the validator is fed, so the one place a
+        // reload's lists are taken, for calibration, steady state, outage
+        // and end-of-stream batches alike.
+        if let Some(l) = ctx.lists.and_then(OperatorListsUpdate::take) {
+            validator.replace_operator_lists(&l.allowlist, l.blocklist, l.notch);
+        }
+        let calibrated = crate::calibrate_freq_events(&ev, ctx.calibration_factor);
+        on_event(&calibrated);
+        // MAN-324: state first (a closing track's last text is flushed
+        // while the validator still holds its candidates); decisions are
+        // queued and go out after the batch's states, or before a closure.
+        if let Some(tap) = ctx.live.as_mut() {
+            tap.observe(&calibrated, validator);
+        }
         for spot in validator.ingest(&ev) {
             on_spot(&spot);
         }
+        if let Some(tap) = ctx.live.as_mut() {
+            tap.decisions(validator.take_decisions());
+            if let DecoderEvent::TrackClosed { track_id, closure } = &ev {
+                tap.closed(*track_id, *closure, validator);
+            }
+        }
+    }
+    if let Some(tap) = ctx.live.as_mut() {
+        tap.end_batch(validator);
+    }
+    // MAN-118: once per batch. The validator's repetition counts are
+    // already cumulative, so they overwrite rather than add.
+    if let Some(q) = ctx.quality {
+        q.add_chars(chars);
+        q.store_repetitions(validator.repetition_counts());
     }
 }
 
@@ -234,10 +475,26 @@ pub fn listen_with_observers(
     let calibration_factor = manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
         .map_err(|e| anyhow::anyhow!(e))?;
 
+    let mut rtty = RttyPublisher::new(observers.rtty.clone(), calibration_factor);
+
     let fs = src.sample_rate();
     let center_freq_hz = src.center_freq_hz();
+    let rf_passband_hz = src.rf_passband_hz();
 
     let mut validator = cfg.validator(fs)?;
+    // MAN-324: the live tap turns the validator's decision log on per
+    // batch, only while someone is subscribed (`emit`).
+    let live = observers
+        .live_state
+        .clone()
+        .map(|sink| LiveTap::new(sink, fs, calibration_factor));
+    let occupancy = live.is_some();
+    let mut ctx = EmitCtx {
+        lists: observers.operator_lists.as_deref(),
+        quality: observers.decode_quality.as_deref(),
+        calibration_factor,
+        live,
+    };
 
     // One relaxed store over a count that is a single filtered pass across
     // the (cap-bounded) track map, once per processed chunk and skipped
@@ -259,7 +516,23 @@ pub fn listen_with_observers(
         }
     };
 
-    let mut seg = new_segment(fs, center_freq_hz, cfg, 1)?;
+    // MAN-312: crashes counted by segments a discontinuity already replaced.
+    let mut crash_base: u64 = 0;
+    let report_static_crashes = |n: u64| {
+        if let Some(counter) = &observers.static_crashes {
+            counter.fetch_max(n, Ordering::Relaxed);
+        }
+    };
+
+    let mut seg = new_segment(
+        fs,
+        center_freq_hz,
+        rf_passband_hz,
+        cfg,
+        1,
+        observers.decode_quality.clone(),
+        occupancy,
+    )?;
     let mut seg_base: u64 = 0;
 
     let padding = vec![Complex32::new(0.0, 0.0); seg.ch.filter_len()];
@@ -310,12 +583,14 @@ pub fn listen_with_observers(
     emit(
         events,
         &mut validator,
-        calibration_factor,
+        &mut ctx,
         &mut on_event,
         &mut on_spot,
     );
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
+    report_static_crashes(crash_base + seg.tm.static_crash_count());
+    rtty.update(&seg.tm);
     on_tracks(n_tracks);
     // `..filled`: the whole buffer unless a stop request cut the fill short.
     let events = seg.tm.process_hops(&seg.ch.process(&calib[..filled]), |m| {
@@ -324,14 +599,19 @@ pub fn listen_with_observers(
     emit(
         events,
         &mut validator,
-        calibration_factor,
+        &mut ctx,
         &mut on_event,
         &mut on_spot,
     );
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
+    report_static_crashes(crash_base + seg.tm.static_crash_count());
+    rtty.update(&seg.tm);
     on_tracks(n_tracks);
     let mut seg_consumed: u64 = filled as u64;
+    if let Some(tap) = ctx.live.as_mut() {
+        tap.maybe_tick(&mut seg.tm, seg_base + seg_consumed);
+    }
 
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
     loop {
@@ -351,6 +631,7 @@ pub fn listen_with_observers(
             Ok(n) => n,
             Err(e) => {
                 report_active_tracks(0);
+                rtty.restart(seg_base + seg_consumed);
                 on_tracks(0);
                 return Err(e);
             }
@@ -365,21 +646,32 @@ pub fn listen_with_observers(
             emit(
                 finish_events,
                 &mut validator,
-                calibration_factor,
+                &mut ctx,
                 &mut on_event,
                 &mut on_spot,
             );
             let next_id = seg.tm.next_track_id();
+            crash_base += seg.tm.static_crash_count();
+            // The old segment's marks clear where its samples end.
+            rtty.restart(seg_base + seg_consumed);
             seg_base += seg_consumed + gap;
             seg_consumed = 0;
-            seg = new_segment(fs, center_freq_hz, cfg, next_id)?;
+            seg = new_segment(
+                fs,
+                center_freq_hz,
+                rf_passband_hz,
+                cfg,
+                next_id,
+                observers.decode_quality.clone(),
+                occupancy,
+            )?;
             let events = seg.tm.process_hops(&seg.ch.process(&padding), |m| {
                 seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
             });
             emit(
                 events,
                 &mut validator,
-                calibration_factor,
+                &mut ctx,
                 &mut on_event,
                 &mut on_spot,
             );
@@ -398,31 +690,39 @@ pub fn listen_with_observers(
         emit(
             events,
             &mut validator,
-            calibration_factor,
+            &mut ctx,
             &mut on_event,
             &mut on_spot,
         );
         let n_tracks = seg.tm.decoding_track_count();
         report_active_tracks(n_tracks);
+        report_static_crashes(crash_base + seg.tm.static_crash_count());
+        rtty.update(&seg.tm);
         on_tracks(n_tracks);
         if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
             obs.observe(t0.elapsed());
         }
         seg_consumed += n as u64;
+        // MAN-324: once per stream second, after the chunk's batch.
+        if let Some(tap) = ctx.live.as_mut() {
+            tap.maybe_tick(&mut seg.tm, seg_base + seg_consumed);
+        }
     }
     let events = seg.tm.finish();
     emit(
         events,
         &mut validator,
-        calibration_factor,
+        &mut ctx,
         &mut on_event,
         &mut on_spot,
     );
+    report_static_crashes(crash_base + seg.tm.static_crash_count());
     // `finish()` flushes and drops every decoder and closes every remaining
     // track: nothing is being decoded once the stream has ended, so both
     // observers must settle back to 0 rather than be left holding the last
     // live value after a source disconnects or a replay hits EOF.
     report_active_tracks(0);
+    rtty.restart(seg_base + seg_consumed);
     on_tracks(0);
     Ok(())
 }
@@ -461,9 +761,186 @@ mod tests {
         ));
         let cfg = PipelineConfig {
             cty: Some(Arc::new(table)),
+            patterns: Some(Arc::new(
+                manta_spot::pattern::Table::parse("+QQ9@@@\n").unwrap(),
+            )),
             ..Default::default()
         };
         assert!(calls(&cfg).contains(&"QQ9ZZZ".into()));
+    }
+
+    // ---- MAN-324: the live tap over real vectors ----
+
+    use crate::live::tests::RecordingSink;
+    use crate::live::LiveRecord;
+
+    fn run_vector(
+        spec: &manta_testkit::vectors::VectorSpec,
+        cfg: &PipelineConfig,
+        live: Option<Arc<RecordingSink>>,
+        on_event: impl FnMut(&DecoderEvent),
+    ) -> Vec<crate::Spot> {
+        let rendered = manta_testkit::vectors::render(spec).unwrap();
+        let src = Box::new(FixedFreqSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let observers = ListenObservers {
+            live_state: live.map(|s| s as Arc<dyn LiveStateSink>),
+            ..Default::default()
+        };
+        let mut spots = Vec::new();
+        listen_with_observers(
+            src,
+            cfg,
+            Arc::new(AtomicBool::new(false)),
+            observers,
+            on_event,
+            |s| spots.push(s.clone()),
+            |_| {},
+        )
+        .unwrap();
+        spots
+    }
+
+    fn v1_30s() -> manta_testkit::vectors::VectorSpec {
+        let mut spec = manta_testkit::vectors::v1();
+        spec.duration_s = 30.0;
+        spec
+    }
+
+    #[test]
+    fn live_tap_sends_v1_band_state_every_stream_second() {
+        let sink = RecordingSink::wanting();
+        run_vector(
+            &v1_30s(),
+            &PipelineConfig::default(),
+            Some(sink.clone()),
+            |_| {},
+        );
+        let records = sink.take();
+        let bands: Vec<&crate::BandSample> = records
+            .iter()
+            .filter_map(|r| match r {
+                LiveRecord::Bands(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        assert!((29..=30).contains(&bands.len()), "{}", bands.len());
+        assert!(bands.iter().all(|b| b.channels.len() == 1024));
+        let with_track: Vec<&&crate::BandSample> = bands
+            .iter()
+            .filter(|b| !b.decoding_track_freqs_hz.is_empty())
+            .collect();
+        assert!(!with_track.is_empty());
+        for b in with_track {
+            assert_eq!(
+                b.decoding_track_freqs_hz.len(),
+                1,
+                "{:?}",
+                b.decoding_track_freqs_hz
+            );
+            let f = b.decoding_track_freqs_hz[0];
+            assert!((14_000_000.0..14_350_000.0).contains(&f), "{f}");
+        }
+    }
+
+    #[test]
+    fn live_tap_reports_w1aw_text_candidates_and_its_repetition_decision() {
+        let sink = RecordingSink::wanting();
+        let spots = run_vector(
+            &v1_30s(),
+            &PipelineConfig::default(),
+            Some(sink.clone()),
+            |_| {},
+        );
+        let w1aw = spots
+            .iter()
+            .find(|s| s.callsign == "W1AW")
+            .expect("V1 spots W1AW within 30 s");
+        let records = sink.take();
+        assert!(records.iter().any(|r| matches!(r,
+            LiveRecord::Track(t) if t.text.contains("W1AW")
+                && t.candidates.iter().any(|c| c.call == "W1AW"))));
+        let decisions: Vec<&manta_spot::Decision> = records
+            .iter()
+            .filter_map(|r| match r {
+                LiveRecord::Decision(d) if d.call == "W1AW" => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert!(decisions.len() >= 2, "{decisions:?}");
+        assert_eq!(decisions[0].verdict, manta_spot::Verdict::Withheld);
+        assert_eq!(decisions[0].reason, Some(manta_spot::Reason::Repetition));
+        assert_eq!(decisions[0].reps, Some(1));
+        let spotted = decisions
+            .iter()
+            .find(|d| d.verdict == manta_spot::Verdict::Spotted)
+            .expect("a spotted decision");
+        assert_eq!(spotted.spot.as_ref(), Some(w1aw));
+    }
+
+    #[test]
+    fn live_tap_never_changes_spots() {
+        let mut v7 = manta_testkit::vectors::v7();
+        v7.duration_s = 30.0;
+        for spec in [v1_30s(), v7] {
+            let cfg = PipelineConfig::default();
+            let without = run_vector(&spec, &cfg, None, |_| {});
+            let with = run_vector(&spec, &cfg, Some(RecordingSink::wanting()), |_| {});
+            assert!(!without.is_empty());
+            assert_eq!(without, with);
+        }
+    }
+
+    #[test]
+    fn live_tap_applies_the_frequency_calibration() {
+        let cfg = PipelineConfig {
+            freq_correction_ppm: 10.0,
+            ..Default::default()
+        };
+        let factor = manta_spot::calibration_factor_from_ppm(10.0).unwrap();
+        let sink = RecordingSink::wanting();
+        let mut seen_freqs = Vec::new();
+        run_vector(&v1_30s(), &cfg, Some(sink.clone()), |ev| match ev {
+            DecoderEvent::TrackMeta { freq_hz, .. }
+            | DecoderEvent::TrackPromoted { freq_hz, .. } => seen_freqs.push(*freq_hz),
+            _ => {}
+        });
+        let records = sink.take();
+        let mut saw_track = false;
+        for r in &records {
+            match r {
+                LiveRecord::Bands(b) => {
+                    let n = b.channels.len() as f64;
+                    for (i, c) in b.channels.iter().enumerate() {
+                        let raw = 14_000_000.0 + (i as f64 - n / 2.0) * 93.75;
+                        assert!(
+                            (c.freq_hz - raw * factor).abs() < 1e-3,
+                            "{} vs {}",
+                            c.freq_hz,
+                            raw * factor
+                        );
+                    }
+                    for f in &b.decoding_track_freqs_hz {
+                        assert!(seen_freqs.iter().any(|s| (s - f).abs() < 93.75), "{f}");
+                    }
+                }
+                LiveRecord::Track(t) => {
+                    if let Some(f) = t.freq_hz {
+                        saw_track = true;
+                        assert!(
+                            seen_freqs.contains(&f),
+                            "{f} is a calibrated event frequency"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_track);
     }
 
     /// A minimal in-memory IqSource for testing, reporting a fixed,
@@ -490,6 +967,92 @@ mod tests {
             self.cursor += n;
             Ok(n)
         }
+    }
+
+    /// MAN-312: a source whose RF passband is narrower than its stream,
+    /// like rig audio.
+    struct NarrowSource {
+        inner: FixedFreqSource,
+        rf_passband_hz: (f64, f64),
+    }
+
+    impl manta_input::IqSource for NarrowSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.sample_rate()
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz()
+        }
+        fn rf_passband_hz(&self) -> (f64, f64) {
+            self.rf_passband_hz
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    /// Runs `listen_with_observers` with a static-crash observer, returning
+    /// the value it held at every `on_tracks` call.
+    fn static_crash_readings(src: Box<dyn manta_input::IqSource>) -> Vec<u64> {
+        let counter = Arc::new(AtomicU64::new(0));
+        let mut readings = Vec::new();
+        listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                static_crashes: Some(counter.clone()),
+                ..Default::default()
+            },
+            |_| {},
+            |_| {},
+            |_| readings.push(counter.load(Ordering::Relaxed)),
+        )
+        .unwrap();
+        readings.push(counter.load(Ordering::Relaxed));
+        readings
+    }
+
+    /// MAN-312: the crash count reaches the observer, and a discontinuity's
+    /// fresh segment adds to it rather than restarting it at 0.
+    #[test]
+    fn listen_publishes_static_crashes_across_a_discontinuity() {
+        let fs = 96_000.0;
+        let mut iq = manta_testkit::crash::vc1_scene(fs);
+        manta_testkit::crash::add_crash(
+            &mut iq,
+            fs,
+            &manta_testkit::crash::vc1_crash(fs, 5.0, 40.0),
+        );
+        let readings = static_crash_readings(Box::new(GapSource::new(iq, fs, 0.0, 48_000)));
+        assert!(readings.windows(2).all(|w| w[0] <= w[1]), "{readings:?}");
+        assert!(readings.contains(&1), "{readings:?}");
+        assert_eq!(readings.last(), Some(&2), "{readings:?}");
+    }
+
+    /// MAN-312: a source whose passband holds fewer than
+    /// `CRASH_MIN_LIVE_CHANNELS` channels gets an inactive detector.
+    #[test]
+    fn a_narrow_passband_source_counts_no_static_crash() {
+        let fs = 48_000.0;
+        let mut iq = manta_testkit::crash::vc1_scene(fs);
+        manta_testkit::crash::add_crash(
+            &mut iq,
+            fs,
+            &manta_testkit::crash::vc1_crash(fs, 5.0, 40.0),
+        );
+        assert!(crate::crash_live_channels(fs, (300.0, 3000.0)) < crate::CRASH_MIN_LIVE_CHANNELS);
+        let src = NarrowSource {
+            inner: FixedFreqSource {
+                samples: iq,
+                cursor: 0,
+                fs,
+                center_freq_hz: 0.0,
+            },
+            rf_passband_hz: (300.0, 3000.0),
+        };
+        let readings = static_crash_readings(Box::new(src));
+        assert_eq!(readings.last(), Some(&0), "{readings:?}");
     }
 
     /// MAN-73 test double: serves `samples` on a loop. Once the cumulative
@@ -806,6 +1369,228 @@ mod tests {
         assert_eq!(run(), run(), "identical input must decode identically");
     }
 
+    #[test]
+    fn operator_lists_update_hands_over_only_the_newest_offer() {
+        assert!(OperatorListsUpdate::default().take().is_none());
+        let update = OperatorListsUpdate::default();
+        update.offer(OperatorLists {
+            allowlist: vec!["A".into()],
+            ..OperatorLists::default()
+        });
+        update.offer(OperatorLists {
+            allowlist: vec!["B".into()],
+            ..OperatorLists::default()
+        });
+        assert_eq!(update.take().unwrap().allowlist, vec!["B".to_string()]);
+        assert!(update.take().is_none());
+    }
+
+    /// Vector v7 through `listen_with_observers`, offering `lists` from
+    /// `on_spot` the first time N2BB spots (sample 1,407,232; N1AA follows
+    /// at 1,555,968, a later chunk). Returns every spotted callsign.
+    fn v7_with_lists_offered_at_n2bb(cfg: &PipelineConfig, lists: OperatorLists) -> Vec<String> {
+        let spec = manta_testkit::vectors::v7();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let update = Arc::new(OperatorListsUpdate::default());
+        let observers = ListenObservers {
+            operator_lists: Some(update.clone()),
+            ..ListenObservers::default()
+        };
+        let mut lists = Some(lists);
+        let mut spots = Vec::new();
+        listen_with_observers(
+            src,
+            cfg,
+            Arc::new(AtomicBool::new(false)),
+            observers,
+            |_ev| {},
+            |spot| {
+                if spot.callsign == "N2BB" {
+                    if let Some(l) = lists.take() {
+                        update.offer(l);
+                    }
+                }
+                spots.push(spot.callsign.clone());
+            },
+            |_n| {},
+        )
+        .unwrap();
+        spots
+    }
+
+    fn v7_spots(cfg: &PipelineConfig) -> Vec<String> {
+        let spec = manta_testkit::vectors::v7();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let mut spots = Vec::new();
+        listen(
+            src,
+            cfg,
+            Arc::new(AtomicBool::new(false)),
+            |_ev| {},
+            |spot| spots.push(spot.callsign.clone()),
+        )
+        .unwrap();
+        spots
+    }
+
+    /// Offers replacement lists from inside a read, including the EOF read.
+    struct OfferingSource {
+        inner: FixedFreqSource,
+        update: Arc<OperatorListsUpdate>,
+        offer_at: Option<u64>,
+        reads: Arc<AtomicU64>,
+    }
+
+    impl IqSource for OfferingSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.sample_rate()
+        }
+
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz()
+        }
+
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            let k = self.reads.fetch_add(1, Ordering::Relaxed) + 1;
+            if self.offer_at == Some(k) {
+                self.update.offer(OperatorLists {
+                    allowlist: vec!["W1AW".into()],
+                    blocklist: Blocklist::parse("W1AW\n"),
+                    ..Default::default()
+                });
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    fn fast_w1aw(
+        wpm: f32,
+        truncate: Option<usize>,
+        offer_at: Option<u64>,
+    ) -> (Vec<(String, u64)>, u64) {
+        let mut spec = manta_testkit::vectors::v1();
+        spec.duration_s = 3.0;
+        spec.signals[0].wpm = wpm;
+        spec.signals[0].text = "W1AW W1AW W1AW W1AW W1AW".into();
+        let mut samples = manta_testkit::vectors::render(&spec).unwrap().samples;
+        if let Some(n) = truncate {
+            samples.truncate(n);
+        }
+        let update = Arc::new(OperatorListsUpdate::default());
+        let reads = Arc::new(AtomicU64::new(0));
+        let src = OfferingSource {
+            inner: FixedFreqSource {
+                samples,
+                cursor: 0,
+                fs: spec.fs,
+                center_freq_hz: spec.center_freq_hz,
+            },
+            update: update.clone(),
+            offer_at,
+            reads: reads.clone(),
+        };
+        let mut cfg = PipelineConfig {
+            allowlist: vec!["W1AW".into()],
+            ..Default::default()
+        };
+        cfg.detector.warmup_hops = 0;
+        let mut spots = Vec::new();
+        listen_with_observers(
+            Box::new(src),
+            &cfg,
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                operator_lists: Some(update),
+                ..Default::default()
+            },
+            |_| {},
+            |s| spots.push((s.callsign.clone(), reads.load(Ordering::Relaxed))),
+            |_| {},
+        )
+        .unwrap();
+        // warmup_hops = 0 lets W1AW promote on the first real hop. Before
+        // MAN-115 this started on the uninitialised -140 dB floor and spawned
+        // hundreds of noise tracks; the pre-roll skip and block-median seed
+        // removed that, but any stray noise call still depends on the spawn
+        // layout, so only W1AW's spots are kept: these tests measure when
+        // lists apply to W1AW.
+        spots.retain(|(call, _)| call == "W1AW");
+        (spots, reads.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn lists_offered_during_calibration_apply_to_the_calibration_buffer() {
+        let (control, _) = fast_w1aw(72.0, None, None);
+        assert_eq!(control, vec![("W1AW".to_string(), 1)]);
+        let (spots, _) = fast_w1aw(72.0, None, Some(1));
+        assert!(spots.is_empty(), "got {spots:?}");
+    }
+
+    #[test]
+    fn lists_offered_during_a_read_apply_to_its_chunk() {
+        let (control, _) = fast_w1aw(60.0, None, None);
+        let k = control.first().expect("control spots W1AW").1;
+        assert!(
+            k > 1,
+            "spot must come from a steady-state chunk, got {control:?}"
+        );
+        let (spots, _) = fast_w1aw(60.0, None, Some(k));
+        assert!(spots.is_empty(), "got {spots:?}");
+    }
+
+    #[test]
+    fn lists_offered_during_the_eof_read_apply_to_the_final_flush() {
+        let (control, total) = fast_w1aw(60.0, Some(205_000), None);
+        assert_eq!(control, vec![("W1AW".to_string(), total)]);
+        let (spots, _) = fast_w1aw(60.0, Some(205_000), Some(total));
+        assert!(spots.is_empty(), "got {spots:?}");
+    }
+
+    /// MAN-78: lists offered mid-run reach the live validator before a
+    /// later call is evaluated.
+    #[test]
+    fn lists_offered_mid_run_block_a_later_call() {
+        let control = v7_spots(&PipelineConfig::default());
+        assert!(
+            control.iter().any(|c| c == "N1AA") && control.iter().any(|c| c == "N2BB"),
+            "control run must spot both N2BB and N1AA, got {control:?}"
+        );
+        let spots = v7_with_lists_offered_at_n2bb(
+            &PipelineConfig::default(),
+            OperatorLists {
+                blocklist: Blocklist::parse("N1AA\n"),
+                ..OperatorLists::default()
+            },
+        );
+        assert_eq!(spots, vec!["N2BB".to_string()]);
+    }
+
+    #[test]
+    fn lists_offered_mid_run_lift_a_block() {
+        let cfg = PipelineConfig {
+            blocklist: Blocklist::parse("N1AA\n"),
+            ..PipelineConfig::default()
+        };
+        assert!(
+            !v7_spots(&cfg).iter().any(|c| c == "N1AA"),
+            "control: the startup blocklist must hold N1AA back"
+        );
+        let spots = v7_with_lists_offered_at_n2bb(&cfg, OperatorLists::default());
+        assert!(spots.iter().any(|c| c == "N1AA"), "got {spots:?}");
+    }
+
     /// MAN-45 (PR #63 round-9 finding): `manta_active_tracks` reported a
     /// constant 0 on every production run because `listen()` exposed no
     /// live track count to its caller -- the manager's own count existed but
@@ -814,6 +1599,145 @@ mod tests {
     /// afterward (`TrackManager::finish()` closes every track). MAN-122: the
     /// number published here is `decoding_track_count()`, so an unconfirmed
     /// noise candidate can never lift it off 0.
+    /// MAN-314: a 25 s scene holding one 30 dB, 170 Hz RTTY signal.
+    fn rtty_scene() -> Vec<Complex32> {
+        let fs = 96_000.0;
+        let (mut iq, _) = manta_testkit::scene::render_scene(&[], fs, 25.0, Some(2)).unwrap();
+        manta_testkit::fsk::add_fsk(
+            &mut iq,
+            fs,
+            &manta_testkit::fsk::FskSpec {
+                mark_offset_hz: 15_000.0,
+                shift_hz: 170.0,
+                baud: 45.45,
+                snr_2500_db: 30.0,
+                text: "CQ TEST DE W1AW W1AW RYRYRY 599 001 ".into(),
+                start_s: 0.0,
+                watterson: None,
+                seed: 1,
+            },
+        );
+        iq
+    }
+
+    #[test]
+    fn rtty_observer_publishes_marks_and_clears_on_segment_restart() {
+        let src = GapSource::new(rtty_scene(), 96_000.0, 14_070_000.0, 96_000);
+        let gap_taken = src.gap_taken.clone();
+        let obs = Arc::new(RttyObserver::default());
+        let seen = obs.clone();
+        let mut marked_before_gap = false;
+        let mut first_after_gap: Option<(usize, u64)> = None;
+        listen_with_observers(
+            Box::new(src),
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                rtty: Some(obs.clone()),
+                ..Default::default()
+            },
+            |_ev| {},
+            |_spot| {},
+            |_n| {
+                let (snap, sample_ts) = seen.snapshot_with_sample_ts();
+                if gap_taken.load(Ordering::Relaxed) {
+                    first_after_gap.get_or_insert((snap.len(), sample_ts));
+                } else if snap.len() == 1 && snap[0].shift_hz == 170.0 {
+                    marked_before_gap = true;
+                }
+            },
+        )
+        .unwrap();
+        assert!(marked_before_gap, "the RTTY signal was never published");
+        // Emptied at the end of the pre-gap segment's 25 s of samples.
+        assert_eq!(
+            first_after_gap,
+            Some((0, 2_400_000)),
+            "the restart must empty the set, stamped where the segment ended"
+        );
+        assert!(obs.snapshot().is_empty());
+    }
+
+    /// Codex review on PR #272: `run` logs how long a signal was marked
+    /// from these timestamps, so both must be stream sample times -- a
+    /// file decodes far faster than real time.
+    #[test]
+    fn rtty_observer_stamps_marks_and_clears_in_stream_samples() {
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rtty_scene(),
+            cursor: 0,
+            fs: 96_000.0,
+            center_freq_hz: 14_070_000.0,
+        });
+        let obs = Arc::new(RttyObserver::default());
+        let seen = obs.clone();
+        let mut marked: Option<(u64, u64)> = None;
+        let mut cleared_at: Option<u64> = None;
+        listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                rtty: Some(obs.clone()),
+                ..Default::default()
+            },
+            |_ev| {},
+            |_spot| {},
+            |_n| {
+                let (snap, sample_ts) = seen.snapshot_with_sample_ts();
+                match (snap.first(), marked) {
+                    (Some(s), None) => marked = Some((s.marked_sample_ts, sample_ts)),
+                    (None, Some(_)) => {
+                        cleared_at.get_or_insert(sample_ts);
+                    }
+                    _ => {}
+                }
+            },
+        )
+        .unwrap();
+        let (marked_sample_ts, store_ts) = marked.expect("the RTTY signal was never published");
+        assert_eq!(
+            store_ts, marked_sample_ts,
+            "the marking store carries its hop"
+        );
+        assert!(
+            // 20 s dwell, less one 256-sample hop of slack.
+            (20.0 * 96_000.0 - 256.0..=22.0 * 96_000.0).contains(&(marked_sample_ts as f64)),
+            "{marked_sample_ts}"
+        );
+        // Still marked at the end of the 25 s file: cleared at its last sample.
+        assert_eq!(cleared_at, Some(2_400_000));
+    }
+
+    #[test]
+    fn rtty_observer_zeroed_on_drop() {
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rtty_scene(),
+            cursor: 0,
+            fs: 96_000.0,
+            center_freq_hz: 14_070_000.0,
+        });
+        let obs = Arc::new(RttyObserver::default());
+        let seen = obs.clone();
+        let mut peak = 0;
+        listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                rtty: Some(obs.clone()),
+                ..Default::default()
+            },
+            |_ev| {},
+            |_spot| {},
+            |_n| peak = peak.max(seen.snapshot().len()),
+        )
+        .unwrap();
+        assert_eq!(peak, 1);
+        assert!(obs.generation() >= 2, "marked, then cleared");
+        assert!(obs.snapshot().is_empty(), "cleared at exit");
+    }
+
     #[test]
     fn listen_with_observers_publishes_a_live_active_track_count() {
         use std::sync::atomic::AtomicU64;
@@ -1371,6 +2295,71 @@ mod tests {
         .unwrap();
 
         assert_eq!(obs.snapshot().count, 4);
+    }
+
+    /// MAN-118: V1 through `listen_with_observers` with only the
+    /// decode-quality observer set publishes every signal, and leaves the
+    /// spot output byte-for-byte what a run without it produces.
+    #[test]
+    fn listen_with_observers_publishes_decode_quality_without_changing_spots() {
+        use crate::quality::DecodeQualityObserver;
+
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let run = |observers: ListenObservers| {
+            let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+                samples: rendered.samples.clone(),
+                cursor: 0,
+                fs: spec.fs,
+                center_freq_hz: spec.center_freq_hz,
+            });
+            let mut chars_seen = 0u64;
+            let mut spots = Vec::new();
+            listen_with_observers(
+                src,
+                &PipelineConfig::default(),
+                Arc::new(AtomicBool::new(false)),
+                observers,
+                |ev| {
+                    if matches!(ev, DecoderEvent::CharDecoded { .. }) {
+                        chars_seen += 1;
+                    }
+                },
+                |spot| spots.push(spot.clone()),
+                |_n| {},
+            )
+            .unwrap();
+            (chars_seen, spots)
+        };
+
+        let obs = Arc::new(DecodeQualityObserver::new());
+        let (chars_seen, spots_observed) = run(ListenObservers {
+            decode_quality: Some(obs.clone()),
+            ..Default::default()
+        });
+        let snap = obs.snapshot();
+        assert!(chars_seen > 0, "V1 must decode characters");
+        assert_eq!(snap.chars_total, chars_seen);
+        assert!(
+            snap.rail_ratio_count >= 100,
+            "V1's ~119 track-seconds give one rail sample each, got {}",
+            snap.rail_ratio_count
+        );
+        assert_eq!(
+            snap.rail_ratio_bucket_counts[0], 0,
+            "V1's clean keying never sits at the collapse floor"
+        );
+        assert!(
+            snap.repetition_bucket_counts.iter().sum::<u64>() >= 1,
+            "V1's repeated call must reach the repetition gate"
+        );
+
+        let (_, spots_plain) = run(ListenObservers::default());
+        assert!(!spots_plain.is_empty(), "V1 must spot");
+        assert_eq!(
+            spots_observed, spots_plain,
+            "the observer must not change decode output"
+        );
     }
 
     /// The default path must stay exactly as cheap as before: no observer

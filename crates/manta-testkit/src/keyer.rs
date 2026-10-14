@@ -40,6 +40,12 @@ pub struct KeyerSpec {
     /// Inter-word gap, in dit units (of `gap_unit`). Standard Morse is 7.0;
     /// SPEC v2 §8.2 VR7 tightens this to 5.0.
     pub word_gap_units: f32,
+    /// Dot mark length, in dit units. Standard Morse is 1.0; MAN-315's
+    /// VW3/VW4 key bug-key (short) and heavy hand-key (long) dots.
+    pub dit_units: f32,
+    /// Gap between the elements of one character, in dit units. Standard
+    /// Morse is 1.0 (MAN-315 VW3/VW4).
+    pub element_gap_units: f32,
 }
 
 impl KeyerSpec {
@@ -54,6 +60,8 @@ impl KeyerSpec {
             weight: 3.0,
             char_gap_units: 3.0,
             word_gap_units: 7.0,
+            dit_units: 1.0,
+            element_gap_units: 1.0,
         }
     }
 }
@@ -119,38 +127,38 @@ fn normalize(text: &str) -> String {
 
 /// Append one word's segments. `unit` = dit ms (content/char speed).
 /// `gap_unit` = inter-character gap ms (spacing speed; equals `unit` unless
-/// Farnsworth is active). `weight` = dah:dit ratio (3.0 nominal). `char_gap_units`
-/// = inter-character gap, in `gap_unit`s (3.0 nominal). Returns Err on unknown
-/// chars.
+/// Farnsworth is active). From `spec`: `weight` = dah:dit ratio (3.0
+/// nominal), `dit_units` = dot length and `element_gap_units` = element gap,
+/// in `unit`s (1.0 nominal), `char_gap_units` = inter-character gap, in
+/// `gap_unit`s (3.0 nominal). Returns Err on unknown chars.
 fn push_word(
     b: &mut SegmentBuilder,
     word: &str,
     unit: f64,
     gap_unit: f64,
-    weight: f32,
-    char_gap_units: f32,
+    spec: &KeyerSpec,
 ) -> Result<()> {
     let chars: Vec<char> = word.chars().collect();
     for (ci, c) in chars.iter().enumerate() {
         let Some(pattern) = pattern_for(*c) else {
-            bail!("character {c:?} has no Morse encoding");
+            bail!("character '{}' has no Morse encoding", c.escape_debug());
         };
         let els: Vec<char> = pattern.chars().collect();
         for (ei, e) in els.iter().enumerate() {
             b.push(
                 true,
                 if *e == '.' {
-                    unit
+                    spec.dit_units as f64 * unit
                 } else {
-                    weight as f64 * unit
+                    spec.weight as f64 * unit
                 },
             );
             if ei < els.len() - 1 {
-                b.push(false, unit);
+                b.push(false, spec.element_gap_units as f64 * unit);
             }
         }
         if ci < chars.len() - 1 {
-            b.push(false, char_gap_units as f64 * gap_unit);
+            b.push(false, spec.char_gap_units as f64 * gap_unit);
         }
     }
     Ok(())
@@ -200,7 +208,7 @@ pub fn key_text(text: &str, spec: &KeyerSpec, fs: f64) -> Result<(Vec<f32>, Stri
     let mut b = SegmentBuilder::new(spec.jitter);
     let words: Vec<&str> = norm.split(' ').collect();
     for (wi, w) in words.iter().enumerate() {
-        push_word(&mut b, w, unit, gap_unit, spec.weight, spec.char_gap_units)?;
+        push_word(&mut b, w, unit, gap_unit, spec)?;
         if wi < words.len() - 1 {
             b.push(false, spec.word_gap_units as f64 * gap_unit);
         }
@@ -233,14 +241,7 @@ pub fn key_text_loop(
                     segs: Vec::new(),
                     rng: b.rng.take(),
                 };
-                push_word(
-                    &mut scratch,
-                    &c.to_string(),
-                    unit,
-                    gap_unit,
-                    spec.weight,
-                    spec.char_gap_units,
-                )?;
+                push_word(&mut scratch, &c.to_string(), unit, gap_unit, spec)?;
                 let char_ms: f64 = scratch.segs.iter().map(|s| s.dur_ms).sum();
                 b.rng = scratch.rng.take();
                 if elapsed + char_ms > budget_ms {
@@ -366,6 +367,8 @@ mod tests {
             weight: 3.0,
             char_gap_units: 3.0,
             word_gap_units: 7.0,
+            dit_units: 1.0,
+            element_gap_units: 1.0,
         };
         let (a, _) = key_text("PARIS", &spec, FS).unwrap();
         let (b, _) = key_text("PARIS", &spec, FS).unwrap();
@@ -405,6 +408,8 @@ mod tests {
             weight: 3.0,
             char_gap_units: 3.0,
             word_gap_units: 7.0,
+            dit_units: 1.0,
+            element_gap_units: 1.0,
         };
         let (env_fast, _) = key_text("E", &fast, FS).unwrap();
         let (env_fw, _) = key_text("E", &farnsworth, FS).unwrap();
@@ -462,5 +467,36 @@ mod tests {
         assert!((runs[0].1 - 120).abs() <= 2, "dit {runs:?}");
         assert!((runs[1].1 - 600).abs() <= 2, "word gap {runs:?}");
         assert!((runs[2].1 - 312).abs() <= 2, "dah {runs:?}");
+    }
+
+    /// MAN-315 D9: `dit_units` scales the dot only and `element_gap_units`
+    /// the gap inside a character; the dash stays `weight` units.
+    #[test]
+    fn dit_and_element_gap_units_change_segment_lengths() {
+        let mut spec = KeyerSpec::new(30.0);
+        spec.dit_units = 0.85;
+        spec.element_gap_units = 0.8;
+        spec.weight = 4.5;
+        spec.rise_ms = 0.0; // see weight_and_gap_units_change_segment_lengths
+        let (env, _) = key_text("A", &spec, 3000.0).unwrap();
+        // dit = 40 ms = 120 samples: dot 0.85 -> 102, gap 0.8 -> 96, dash 4.5 -> 540
+        let on: Vec<bool> = env.iter().map(|&v| v > 0.5).collect();
+        let mut runs = vec![];
+        let mut cur = on[0];
+        let mut n: i32 = 0;
+        for &v in &on {
+            if v == cur {
+                n += 1
+            } else {
+                runs.push((cur, n));
+                cur = v;
+                n = 1;
+            }
+        }
+        runs.push((cur, n));
+        assert_eq!(runs.len(), 3, "{runs:?}");
+        assert!((runs[0].1 - 102).abs() <= 2, "dot {runs:?}");
+        assert!((runs[1].1 - 96).abs() <= 2, "element gap {runs:?}");
+        assert!((runs[2].1 - 540).abs() <= 2, "dash {runs:?}");
     }
 }
