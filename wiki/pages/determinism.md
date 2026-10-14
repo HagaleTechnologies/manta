@@ -17,7 +17,7 @@ Running the daemon from an IQ file must produce **byte-identical** spot logs for
 
 ## Symptom
 
-The same fixture WAV yields different spot logs run-to-run, or different decoded text on Linux vs macOS, and SPEC §6's three-run identical-SHA-256 check (`json_output_is_valid_and_deterministic_across_three_runs` in `crates/manta-cli/tests/cli.rs`) fails. Timestamps in spots that follow wall-clock rather than sample count are the classic tell.
+The same fixture WAV yields different spot logs run-to-run, and SPEC §6's three-run identical-SHA-256 check (`json_output_is_valid_and_deterministic_across_three_runs` in `crates/manta-cli/tests/cli.rs`) fails; or the decoded text differs between Linux and macOS while staying stable on each, which that check cannot see (it compares three runs of one binary on one platform) — there the golden-vector runs on every CI platform (SPEC §7, `crates/manta-cli/tests/golden_*.rs`) are the gate that fails. Timestamps in spots that follow wall-clock rather than sample count are the classic tell.
 
 ## Cause and workaround
 
