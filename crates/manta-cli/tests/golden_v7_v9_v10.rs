@@ -187,6 +187,7 @@ fn v51_drift_with_refiner_enabled_passes_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = manta_testkit::vectors::write_v9_fixture_set(&spec, dir.path()).unwrap();
     let wav = dir.path().join("v9.wav");
+    let control_cfg = write_cfg(dir.path(), "refine0.toml", "[decode]\nrefine_bw_hz = 0.0\n");
     let cfg = write_cfg(
         dir.path(),
         "refine30.toml",
@@ -208,7 +209,12 @@ fn v51_drift_with_refiner_enabled_passes_end_to_end() {
         serde_json::from_slice(&out.stdout).unwrap()
     };
 
-    let control = run(&[]);
+    // Codex review, PR #303: the control is pinned to refinement off by an
+    // explicit `refine_bw_hz = 0.0`, not by the key's default -- a future
+    // default-on change would otherwise make both runs identical (the
+    // decode is deterministic) and fail the assert below for exactly the
+    // behavior it exists to green-light.
+    let control = run(&["--config", control_cfg.to_str().unwrap()]);
     let refined = run(&["--config", cfg.to_str().unwrap()]);
 
     // Non-vacuity: decode is deterministic on file input, so if the
