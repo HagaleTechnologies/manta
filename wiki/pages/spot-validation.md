@@ -9,8 +9,8 @@ sources:
   - docs/SPEC-decode-core.md#46-per-callsign-confidence-consumed-by-manta-spot
   - docs/SPEC-decode-core.md#9-configuration-keys
 verified:
-  commit: d286147
-  date: 2026-10-13
+  commit: 525edb7
+  date: 2026-10-14
 links:
   - decode-chain
   - spot-output-contract
