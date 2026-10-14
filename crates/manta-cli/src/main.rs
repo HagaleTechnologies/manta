@@ -32,13 +32,10 @@ mod doctor_checks;
 mod fmt;
 mod grade_cmd;
 mod health_cmd;
-<<<<<<< HEAD
 mod list_cache;
 mod list_http;
 mod list_refresh;
-=======
 mod live_state;
->>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
 mod logging;
 mod reconnect;
 mod reload;
@@ -2268,20 +2265,29 @@ fn resolve_list_bytes(
             )
         })
     };
+    // Where the pin was looked for before the built-in copy, for the miss
+    // error: empty with no path.
+    let mut path_miss = String::new();
     if let Some(path) = path {
         let bytes = std::fs::read(path)
             .with_context(|| format!("reading {label} file {}", path.display()))?;
         let sha = list_cache::sha256_hex(&bytes);
         let origin = match pin {
-            Some(pin) if pin != sha => bail!(
-                "{file_name} file {} has SHA-256 {sha}, not the pinned {pin} ({flag})",
-                path.display()
-            ),
-            Some(_) => list_refresh::Origin::Pinned(list_refresh::PinSource::File(path.into())),
-            None => list_refresh::Origin::File(path.into()),
+            // D3: the pin outranks the path, so a path holding other bytes
+            // is one place the pinned version is not; the search goes on.
+            Some(pin) if pin != sha => {
+                path_miss = format!("{file_name} file {} has SHA-256 {sha}, ", path.display());
+                None
+            }
+            Some(_) => Some(list_refresh::Origin::Pinned(list_refresh::PinSource::File(
+                path.into(),
+            ))),
+            None => Some(list_refresh::Origin::File(path.into())),
         };
-        let text = utf8(bytes, path)?;
-        return Ok(Some((text, list_refresh::InUse::new(kind, sha, origin))));
+        if let Some(origin) = origin {
+            let text = utf8(bytes, path)?;
+            return Ok(Some((text, list_refresh::InUse::new(kind, sha, origin))));
+        }
     }
     let Some(pin) = pin else {
         return Ok(None);
@@ -2301,18 +2307,18 @@ fn resolve_list_bytes(
     }
     let Some(cache) = cache else {
         bail!(
-            "{flag} {pin}: no {file_name} has that SHA-256: the built-in copy is {bundled} and \
-             spot.list_cache_dir is not set; pass the file itself with {path_flag}"
+            "{flag} {pin}: no {file_name} has that SHA-256: {path_miss}the built-in copy is \
+             {bundled} and spot.list_cache_dir is not set; pass the file itself with {path_flag}"
         );
     };
     let version_path = cache.version_path(kind, pin);
     match cache
         .load_version(kind, pin)
-        .map_err(|e| anyhow!("{flag} {pin}: {e}"))?
+        .map_err(|e| anyhow!("{flag} {pin}: {path_miss}{e}"))?
     {
         None => bail!(
-            "{flag} {pin}: no {file_name} has that SHA-256: the built-in copy is {bundled} and \
-             {} does not exist; pass the file itself with {path_flag}",
+            "{flag} {pin}: no {file_name} has that SHA-256: {path_miss}the built-in copy is \
+             {bundled} and {} does not exist; pass the file itself with {path_flag}",
             version_path.display()
         ),
         Some(bytes) => {
@@ -2824,6 +2830,8 @@ struct SpotServer {
     /// and not required to be cty-resolvable), whose de-side `UNKNOWN_*`
     /// sentinels are checked per spot against the current table: MAN-316's
     /// refresh can change the answer, at the cost of one more lookup.
+    /// MAN-324: also `deCall` on every live record, and the station half of
+    /// a spotted decision's `spotId`.
     station_callsign: String,
     /// MAN-122 review round 4 (P2): the periodic status task's `JoinHandle`
     /// is RETAINED, not discarded, so the shutdown sequence can AWAIT the
@@ -2858,9 +2866,6 @@ struct SpotServer {
     /// `[server].live_port` is unset, in which case the decode loop runs
     /// no live tap.
     live_addr: Option<std::net::SocketAddr>,
-    /// MAN-324: `deCall` on every live record, and the station half of a
-    /// spotted decision's `spotId`.
-    station_callsign: String,
     /// MAN-78: each `[[rbn_uplink]]` task's live `dry_run` flag, in config
     /// order, for the SIGHUP reload thread (Unix only) to flip.
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -3596,158 +3601,6 @@ fn start_spot_server(
                 tracing::warn!(
                     "JSON spots will carry no station position -- set [server].operator_grid, or \
                  operator_lat and operator_lon, so deGrid/deLat/deLon name this node's location"
-<<<<<<< HEAD
-            );
-        }
-        let profile = std::sync::Arc::new(station_profile(
-            &cfg,
-            source.dial_freq_hz,
-            source.rf_passband_hz,
-            source.freq_calibration,
-        ));
-        spawn_tracked_listener(
-            LISTENER_TELNET,
-            metrics.clone(),
-            manta_server::telnet::serve(
-                telnet_listener,
-                bus.clone(),
-                metrics.clone(),
-                profile,
-                shutdown_rx.clone(),
-                tasks.clone(),
-                manta_server::tasks::new_connection_limiter(
-                    manta_server::telnet::MAX_TELNET_CONNECTIONS,
-                ),
-                manta_server::tasks::IpQuota::new_with_override(
-                    manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP,
-                    cfg.telnet_max_connections_per_ip,
-                ),
-                telnet_ip_command_limiter,
-                manta_server::tasks::CLIENT_DRAIN_DEADLINE,
-                cfg.line_format,
-            ),
-        );
-        let json_ip_ping_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
-            manta_server::json_stream::MAX_INBOUND_PINGS,
-            manta_server::json_stream::PING_RATE_WINDOW,
-            cfg.json_max_pings_per_ip,
-        );
-        manta_server::rate_limit::spawn_stale_entry_reaper(json_ip_ping_limiter.clone());
-        spawn_tracked_listener(
-            LISTENER_JSON,
-            metrics.clone(),
-            manta_server::json_stream::serve(
-                json_listener,
-                manta_server::json_stream::JsonStreamConfig {
-                    bus: bus.clone(),
-                    metrics: metrics.clone(),
-                    lists: lists.clone(),
-                    station_call: cfg.station_callsign.clone(),
-                    station_location,
-                    decoder_version,
-                    // .clone(): MAN-32/MAN-42's uplink::serve spawns below also
-                    // need shutdown_rx -- can't let this be the moving consumer
-                    // anymore now that there are more consumers.
-                    shutdown: shutdown_rx.clone(),
-                    drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
-                },
-                tasks.clone(),
-                manta_server::tasks::new_connection_limiter(
-                    manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS,
-                ),
-                manta_server::tasks::IpQuota::new_with_override(
-                    manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
-                    cfg.json_max_connections_per_ip,
-                ),
-                json_ip_ping_limiter,
-            ),
-        );
-        // Reaps completed per-client tasks continuously, independent of
-        // shutdown -- without this, `tasks` only ever shrinks at
-        // shutdown_runtime_after_drain's one-time `await_all`, so ordinary
-        // connect/disconnect churn grows it without bound for the life of
-        // the process (round-11 review finding).
-        manta_server::tasks::spawn_reaper(tasks.clone());
-        // MAN-44: the WHOLE uplink registry is published before the
-        // metrics/status endpoint is spawned below. On this multi-thread
-        // runtime that endpoint accepts on another worker the instant its
-        // task is spawned, so a probe racing a later registration loop
-        // could read a half-registered (or empty) registry and be told
-        // `disabled` -- `manta status` exit 0 -- for a daemon whose
-        // configured targets are in fact down. Registered-but-unconnected
-        // reads as down, the honest startup answer. `target_labels`
-        // assigns the Prometheus label (`host:port`, `#N`-suffixed only on
-        // an exact duplicate; MAN-128 D7).
-        let uplink_labels = manta_server::uplink::target_labels(&rbn_uplink_cfgs);
-        let enabled_uplinks = rbn_uplink_cfgs.iter().filter(|u| u.enabled).count();
-        let uplink_tasks: Vec<_> = rbn_uplink_cfgs
-            .into_iter()
-            .zip(uplink_labels)
-            .map(|(uplink_cfg, label)| {
-                let target = metrics.register_uplink_target(label.clone(), uplink_cfg.enabled);
-                // MAN-78: one live flag per entry, seeded from the file.
-                let dry_run = UplinkDryRun {
-                    label,
-                    enabled: uplink_cfg.enabled,
-                    flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                        uplink_cfg.dry_run,
-                    )),
-                };
-                (uplink_cfg, target, dry_run)
-            })
-            .collect();
-        let uplink_dry_run: Vec<UplinkDryRun> =
-            uplink_tasks.iter().map(|(_, _, d)| d.clone()).collect();
-        // MAN-301: enabled before the metrics endpoint spawns below, for
-        // MAN-44's reason: a scrape racing startup must already see the
-        // `manta_rbn_compare_*` families of a comparator that is starting.
-        let rbn_compare_cfg = rbn_compare_cfg.filter(|c| c.enabled);
-        if rbn_compare_cfg.is_some() {
-            metrics.enable_rbn_compare();
-        }
-        let metrics_ip_request_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
-            manta_server::metrics_http::MAX_METRICS_REQUESTS_PER_IP,
-            manta_server::metrics_http::METRICS_REQUEST_RATE_WINDOW,
-            cfg.metrics_max_requests_per_ip,
-        );
-        manta_server::rate_limit::spawn_stale_entry_reaper(metrics_ip_request_limiter.clone());
-        spawn_tracked_listener(
-            LISTENER_METRICS,
-            metrics.clone(),
-            manta_server::metrics_http::serve(
-                metrics_listener,
-                metrics.clone(),
-                manta_server::tasks::new_connection_limiter(
-                    manta_server::metrics_http::MAX_METRICS_CONNECTIONS,
-                ),
-                manta_server::tasks::IpQuota::new_with_override(
-                    manta_server::metrics_http::MAX_METRICS_CONNECTIONS_PER_IP,
-                    cfg.metrics_max_connections_per_ip,
-                ),
-                metrics_ip_request_limiter,
-            ),
-        );
-        // MAN-32/MAN-42: one independent uplink::serve task per configured
-        // [[rbn_uplink]] entry -- the common case for existing single-node
-        // operators is no [[rbn_uplink]] tables at all (empty Vec, loop
-        // body never runs), and uplink::serve itself also no-ops when
-        // `enabled = false` (belt-and-suspenders, not a duplicate check:
-        // this loop additionally avoids spawning a task at all when the
-        // Vec is empty). Each task owns its own SpotBus subscription and
-        // backoff state, so one target being down never affects another's
-        // delivery or retry timing.
-        // MAN-128 D6/D7: each target was registered above, before both its
-        // `serve` task and the metrics endpoint, so a scrape landing before
-        // the first connect attempt still sees it.
-        for (uplink_cfg, target, dry_run) in uplink_tasks {
-            tokio::spawn(manta_server::uplink::serve_with_live_dry_run(
-                uplink_cfg,
-                cfg.station_callsign.clone(),
-                bus.clone(),
-                target,
-                dry_run.flag,
-                shutdown_rx.clone(),
-=======
                 );
             }
             let profile = std::sync::Arc::new(station_profile(
@@ -3755,7 +3608,6 @@ fn start_spot_server(
                 source.dial_freq_hz,
                 source.rf_passband_hz,
                 source.freq_calibration,
->>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
             ));
             spawn_tracked_listener(
                 LISTENER_TELNET,
@@ -3804,7 +3656,7 @@ fn start_spot_server(
                         manta_server::json_stream::JsonStreamConfig {
                             bus: bus.clone(),
                             metrics: metrics.clone(),
-                            cty: cty.clone(),
+                            lists: lists.clone(),
                             station_call: cfg.station_callsign.clone(),
                             station_location: station_location.clone(),
                             decoder_version: decoder_version.clone(),
@@ -3832,7 +3684,7 @@ fn start_spot_server(
                     manta_server::json_stream::JsonStreamConfig {
                         bus: bus.clone(),
                         metrics: metrics.clone(),
-                        cty: cty.clone(),
+                        lists: lists.clone(),
                         station_call: cfg.station_callsign.clone(),
                         station_location,
                         decoder_version,
@@ -3997,7 +3849,6 @@ fn start_spot_server(
             metrics,
             shutdown_tx,
             tasks,
-            station_callsign: cfg.station_callsign.clone(),
             lists,
             status_line: std::sync::Mutex::new(status_line),
             rbn_compare: std::sync::Mutex::new(rbn_task),
@@ -6034,11 +5885,8 @@ fn run_command() -> Result<std::process::ExitCode> {
                     decode_latency: decode_latency.clone(),
                     decode_quality: decode_quality.clone(),
                     operator_lists: reload_enabled.then(|| operator_lists.clone()),
-<<<<<<< HEAD
                     reference_lists,
-=======
                     static_crashes: Some(static_crashes.clone()),
->>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
                     rtty: Some(rtty_observer.clone()),
                     // MAN-324: only with a live-state listener.
                     live_state: spot_server
@@ -7257,15 +7105,70 @@ mod tests {
             in_use[0].origin,
             list_refresh::Origin::Pinned(list_refresh::PinSource::File(_))
         ));
-        let other = bundled_cty_sha256();
+        let other = "0".repeat(64);
+        let bundled = bundled_cty_sha256();
         let err = pinned(&pinned_spot(Some(f.path().into()), Some(&other), None))
             .unwrap_err()
             .to_string();
         assert_eq!(
             err,
             format!(
-                "cty.dat file {} has SHA-256 {sha}, not the pinned {other} (--cty-sha256)",
+                "--cty-sha256 {other}: no cty.dat has that SHA-256: cty.dat file {} has SHA-256 \
+                 {sha}, the built-in copy is {bundled} and spot.list_cache_dir is not set; pass \
+                 the file itself with --cty",
                 f.path().display()
+            )
+        );
+    }
+    /// D3: the pin outranks the path, so a `cty_path` naming a rolling
+    /// current file does not stop a pin of an older version: the built-in
+    /// copy and `list_cache_dir` are still searched.
+    #[test]
+    fn a_pin_the_path_does_not_match_is_still_looked_up() {
+        let current = format!("{}{QQ9_ENTITY}", manta_spot::CTY_DAT);
+        let f = write_temp_file(current.as_bytes());
+        let bundled = bundled_cty_sha256();
+        let (cfg, in_use) =
+            pinned(&pinned_spot(Some(f.path().into()), Some(&bundled), None)).unwrap();
+        assert!(!cfg.cty_table().is_allocated("QQ9ZZZ"));
+        assert!(matches!(
+            in_use[0].origin,
+            list_refresh::Origin::Pinned(list_refresh::PinSource::Bundled)
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let older = cache_cty_version(dir.path(), QQ9_ENTITY.as_bytes());
+        let (cfg, in_use) = pinned(&pinned_spot(
+            Some(f.path().into()),
+            Some(&older),
+            Some(dir.path().into()),
+        ))
+        .unwrap();
+        assert!(!cfg.cty_table().is_allocated("K1ABC"));
+        assert_eq!(in_use[0].sha256, older);
+        assert!(matches!(
+            in_use[0].origin,
+            list_refresh::Origin::Pinned(list_refresh::PinSource::Cache(_))
+        ));
+        // A cache file that fails its own check still says the path was tried.
+        let pin = list_cache::sha256_hex(b"some other cty.dat");
+        let cached = write_cty_version(dir.path(), &pin, QQ9_ENTITY.as_bytes());
+        let err = format!(
+            "{:#}",
+            pinned(&pinned_spot(
+                Some(f.path().into()),
+                Some(&pin),
+                Some(dir.path().into()),
+            ))
+            .unwrap_err()
+        );
+        assert_eq!(
+            err,
+            format!(
+                "--cty-sha256 {pin}: cty.dat file {} has SHA-256 {}, {} has SHA-256 {older}, \
+                 not {pin}",
+                f.path().display(),
+                list_cache::sha256_hex(current.as_bytes()),
+                cached.display()
             )
         );
     }

@@ -68,18 +68,11 @@ in `RUNBOOKS/monitoring/`; see
 
 ## Metric families
 
-<<<<<<< HEAD
-All 59 families, in the order `/metrics` renders them. Every family's
-`# HELP` and `# TYPE` lines are always rendered, except the ten
-RBN comparison families (MAN-301) at the end of the table, which are
-rendered only when `[rbn_compare]` is enabled. "Present when" says when
-=======
-All 60 families, in the order `/metrics` renders them. Every family's
+All 63 families, in the order `/metrics` renders them. Every family's
 `# HELP` and `# TYPE` lines are always rendered, except two groups at the
 end of the table: the ten RBN comparison families (MAN-301), rendered only
 when `[rbn_compare]` is enabled, and the three live-state families
 (MAN-324), rendered only when `[server].live_port` is set. "Present when" says when
->>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
 the family also carries samples. Where it says a family has no samples, the
 value is absent, not zero: the node does not measure it, so do not read the
 missing series as "no loss" or "no traffic".
@@ -104,18 +97,12 @@ missing series as "no loss" or "no traffic".
 | `manta_source_health` | gauge | `source` | Health of each input source: 1 healthy, 0 unhealthy. `source` is the input type: `file`, `audio`, `kiwi`, `soapy`, `hpsdr` or `ka9q`. | One series per registered source, from the first health report. A file replay reports 1 at startup. Reconnecting sources report on each connect and disconnect; HPSDR reads 0 until the radio is confirmed live, and ka9q-radio until the first RTP packet of its channel arrives. |
 | `manta_source_outages_total` | counter | `source` | Times each input source went from healthy to unhealthy (a lost connection or failed read). A source that starts unhealthy has not had an outage. | Same `source` set as `manta_source_health`; starts at 0. |
 | `manta_source_down_seconds_total` | counter | `source` | Seconds each input source spent in outages that have ended. An outage still in progress is added when it ends; until then it shows only as `manta_source_health` 0. | Same `source` set as `manta_source_health`; starts at 0. |
-<<<<<<< HEAD
-| `manta_input_dropped_packets_total` | counter | `source` | Input packets estimated lost in transit before reaching the decoder. | HPSDR and KiwiSDR sources only: from startup at 0, sampled every second, summed across reconnects. Other sources (file, audio, SoapySDR) show the `# TYPE` line but no samples: absent, not zero. |
-| `manta_input_gaps_detected_total` | counter | `source` | Distinct input-stream gap events detected. One gap may account for several dropped packets. | HPSDR and KiwiSDR sources only, as for `manta_input_dropped_packets_total`. Other sources: absent, not zero. |
-| `manta_input_malformed_packets_total` | counter | `source` | Input datagrams discarded as malformed: wrong length, or correct length but failed framing or sync validation (MAN-22). | HPSDR and KiwiSDR sources only, as for `manta_input_dropped_packets_total`. Other sources: absent, not zero. |
-| `manta_list_info` | gauge | `list`, `sha256`, `origin` | Always 1. Names the reference list each consumer uses now: `list` is `cty` or `scp`; `sha256` is the SHA-256 of its bytes; `origin` is `bundled`, `file`, `cache` or `download`. A swap replaces the series. | Always with `[server]`; one series per list. |
-| `manta_list_refresh_total` | counter | `list`, `outcome` | Download attempts by outcome: `updated` (a new version passed the checks and is in use), `unchanged` (304, or the same bytes), `failed` (network or HTTP error, or rejected by the checks). | With `refresh_lists` on, for each list the refresher manages; all three outcomes start at 0. No samples otherwise. |
-| `manta_list_last_success_timestamp_seconds` | gauge | `list` | Unix time manta last confirmed the list in use is current with its URL (an `updated` or `unchanged` attempt, or the cache's `checked_at` at startup). Alert on `time() - manta_list_last_success_timestamp_seconds{list="cty"} > 8*86400`. | With `refresh_lists` on, once the list has been confirmed at least once. Absent means never confirmed. |
-=======
 | `manta_input_dropped_packets_total` | counter | `source` | Input packets estimated lost in transit before reaching the decoder. | HPSDR, KiwiSDR and ka9q-radio sources only: from startup at 0, sampled every second, summed across reconnects. Other sources (file, audio, SoapySDR) show the `# TYPE` line but no samples: absent, not zero. |
 | `manta_input_gaps_detected_total` | counter | `source` | Distinct input-stream gap events detected. One gap may account for several dropped packets. | HPSDR, KiwiSDR and ka9q-radio sources only, as for `manta_input_dropped_packets_total`. Other sources: absent, not zero. |
 | `manta_input_malformed_packets_total` | counter | `source` | Input datagrams discarded as malformed: wrong length, or correct length but failed framing or sync validation (MAN-22). | HPSDR, KiwiSDR and ka9q-radio sources only, as for `manta_input_dropped_packets_total`. Other sources: absent, not zero. |
->>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
+| `manta_list_info` | gauge | `list`, `sha256`, `origin` | Always 1. Names the reference list each consumer uses now: `list` is `cty` or `scp`; `sha256` is the SHA-256 of its bytes; `origin` is `bundled`, `file`, `cache` or `download`. A swap replaces the series. | Always with `[server]`; one series per list. |
+| `manta_list_refresh_total` | counter | `list`, `outcome` | Download attempts by outcome: `updated` (a new version passed the checks and is in use), `unchanged` (304, or the same bytes), `failed` (network or HTTP error, or rejected by the checks). | With `refresh_lists` on, for each list the refresher manages; all three outcomes start at 0. No samples otherwise. |
+| `manta_list_last_success_timestamp_seconds` | gauge | `list` | Unix time manta last confirmed the list in use is current with its URL (an `updated` or `unchanged` attempt, or the cache's `checked_at` at startup). Alert on `time() - manta_list_last_success_timestamp_seconds{list="cty"} > 8*86400`. | With `refresh_lists` on, once the list has been confirmed at least once. Absent means never confirmed. |
 | `manta_uplink_sent_total` | counter | — | Spots forwarded to RBN uplink targets; the sum over every configured target. | Always, one series. Stays 0 with no `[[rbn_uplink]]` configured. |
 | `manta_uplink_suppressed_total` | counter | — | Spots not sent to an RBN uplink target because of `dry_run` or its `spot_types` setting; the sum over every configured target. | Always, one series. Stays 0 with no `[[rbn_uplink]]` configured. |
 | `manta_uplink_dropped_lagged_total` | counter | — | Spots the uplink fell behind on and lost before its next reconnect; the sum over every configured target. | Always, one series. Stays 0 with no `[[rbn_uplink]]` configured. |
