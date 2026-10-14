@@ -1204,6 +1204,7 @@ in the fixture manifest. Text payload (unless stated):
 | V9 | drift | 18 WPM, +12 dB, drift +50 Hz/min, EA8AAA | AWGN | 1 track (no split); char ≥ 90 %; final freq tracks within 15 Hz |
 | V10 | farnsworth | 15 WPM chars / 25 WPM char-speed (Farnsworth), +15 dB, G4XXX | AWGN | char ≥ 95 %; word boundaries 100 % correct |
 | V31 | decimated-clean-20 | Same scene as V1 (20 WPM, +20 dB, offset +12.34 kHz, W1AW), synthesized at 192 kHz then decimated to 48 kHz via `manta_dsp::decimate::Decimator` | AWGN only, no jitter | char ≥ 98%; 1 track; freq error ≤ 25 Hz |
+| V51 | drift-refine | Same scene as V9 (18 WPM, +12 dB, drift +50 Hz/min, EA8AAA), decoded with `decode.refine_bw_hz = 30` (the narrowband refiner, MAN-168/MAN-194) via a `--config` TOML | AWGN only, no jitter (as V9) | 1 track (no split); char ≥ 90 %; final freq within 15 Hz; the refine-on report differs from the refine-off control (the config reaches the pipeline) |
 
 V31's freq-error bound (25 Hz) differs from V1's (10 Hz) because the fine-
 frequency estimator's error is channel-table-size dependent, not a
@@ -1212,6 +1213,35 @@ table size vs. V1's N = 1024 (96 kHz) table. Confirmed by two no-decimator
 control renders of the same scene -- native 48 kHz and native 192 kHz both
 independently measure a similar ~15-17 Hz error with zero decimator
 involvement (see `crates/manta-cli/tests/golden_decimated_capture.rs`).
+
+V51 (MAN-210) gates the narrowband refiner's refine-enabled path
+(`Track::decoder_input`'s delay-compensated hold-back/drain, MAN-194)
+end-to-end: V9's drift crosses a channel boundary mid-scene, so the
+reset-drain branch fires through the real channelizer, and the decode ends
+in `TrackManager::finish`'s end-of-stream drain. Like V31 it is a standalone
+test in `crates/manta-cli/tests/golden_v7_v9_v10.rs`
+(`v51_drift_with_refiner_enabled_passes_end_to_end`), not part of the
+`manta-testkit::vectors` V1–V10 fixture table. This is the end-to-end
+evidence any future change that turns the refiner on by default must keep
+green (found by MAN-194's final review: V4/V5/V8w never execute the
+refine-enabled branch, so their re-verification could not cover it).
+
+The drain protocols themselves cannot be pinned from the CLI report V51
+asserts on (Codex review, PR #303): measured on this scene, the
+end-of-stream backlog is trailing silence — the last keyed character
+closes ~0.24 s before EOF — and a backlog dropped at a reset or at EOF
+costs at most ~6 × `GROUP_DELAY_HOPS` hops of envelope, inside V51's CER
+bar. They are therefore asserted one layer down, on the same real scene:
+`real_drift_scene_drains_refiner_backlog_at_resets_and_eof`
+(`crates/manta-engine/src/track.rs`) drives `render_v9_drift`'s fixture
+through the real channelizer and `TrackManager` with the refiner on and
+asserts that the drift's channel crossing resets the refiner with a
+non-empty backlog, that delivery is exactly-once (decoder `hop_count` +
+`pending` + `refiner_backlog` equals the refine-off control's deliveries
+at every hop — a backlog dropped or duplicated at any reset diverges
+there), and that a non-empty backlog is still held when `finish()` runs
+(whose delivery wiring is pinned by
+`finish_drains_every_remaining_tracks_refiner_backlog_before_flushing`).
 
 M0 = V1 passing end-to-end from a WAV file. M1 = V1–V6. V7–V10 and V8w gate M2
 (multi-track engine). The RBN-parity corpus benchmark remains the M3 gate
