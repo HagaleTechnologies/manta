@@ -2363,6 +2363,7 @@ fn reference_docs_relative_links_resolve() {
         METRICS_REF,
         "docs/SPOT-SCHEMA.md",
         "docs/LIVE-STATE.md",
+        "docs/COMPARISON.md",
         DOCS_INDEX,
         DECISIONS_INDEX,
     ] {
@@ -2476,4 +2477,55 @@ fn claude_md_decision_paths_start_a_word_and_resolve() {
             "CLAUDE.md:{line} cites {path}, which does not exist"
         );
     }
+}
+
+// ---- MAN-155: the comparison page, and the explained FT8/RTTY non-goal ----
+
+/// MAN-155: the comparison page covers each closest alternative, and a
+/// visitor reaches it from the README and the docs index.
+#[test]
+fn comparison_page_names_each_alternative_and_is_linked() {
+    let page = doc("docs/COMPARISON.md");
+    for project in [
+        "CW Skimmer Server",
+        "SparkSDR",
+        "sdroxide",
+        "OpenWebRX+",
+        "csdr-skimmer",
+        "sdrainer",
+    ] {
+        assert!(
+            page.contains(project),
+            "docs/COMPARISON.md never names {project}"
+        );
+    }
+    let readme = doc("README.md");
+    for heading in ["Why", "Related projects"] {
+        assert!(
+            link_targets(section(&readme, heading))
+                .iter()
+                .any(|t| t == "docs/COMPARISON.md"),
+            "README `## {heading}` does not link docs/COMPARISON.md"
+        );
+    }
+    assert!(
+        link_targets(&doc(DOCS_INDEX))
+            .iter()
+            .any(|t| t == "COMPARISON.md"),
+        "{DOCS_INDEX} does not link COMPARISON.md"
+    );
+}
+
+/// MAN-155: Non-goals says why FT8 is out, citing the RBN's own announcement.
+#[test]
+fn readme_non_goals_cites_the_rbn_ft8_announcement() {
+    let goals = squash_whitespace(section(&doc("README.md"), "Non-goals"));
+    assert!(
+        goals.contains("reversebeacon.net/pages/FT8"),
+        "Non-goals must link RBN's FT8 announcement"
+    );
+    assert!(
+        goals.contains("beta"),
+        "Non-goals must say RBN put FT8 on a beta basis"
+    );
 }
