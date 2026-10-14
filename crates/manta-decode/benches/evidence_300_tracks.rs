@@ -1,10 +1,11 @@
 //! MAN-193: `Evidence` alone, 300 tracks x 3,750 hops (10 s) each, pushed
 //! and fully flushed through the public methods. The fixed cases hold the
 //! hold window at h = 60 (the default `u_init`) and h = 224 (the default
-//! slow-speed limit) so width is the only changed factor; the stress case
-//! alternates h between 223 and 225 after every pushed hop, which retreats
-//! a window bound on every center and forces the cached maximum to rebuild
-//! each time (`docs/DECISIONS/2026-10-14-man193-centered-maximum-deque.md`).
+//! slow-speed limit) so width is the only changed factor. The stress case
+//! switches h between 223 and 225 every third pushed hop; each switch
+//! retreats one bound of the next emitted window, so the cached maximum
+//! rebuilds about once per three emitted hops instead of maintaining
+//! incrementally (`docs/DECISIONS/2026-10-14-man193-centered-maximum-deque.md`).
 //!
 //! Scope: the evidence front end only. It excludes channelization,
 //! detection and the HSMM search (`hsmm_300_tracks` measures the decoder).
@@ -15,6 +16,8 @@ use std::hint::black_box;
 
 const TRACKS: usize = 300;
 const HOPS: usize = 375 * 10;
+/// Pushed hops between width switches in the stress case.
+const SWING_DWELL: usize = 3;
 
 /// One deterministic amplitude stream per track: a keyed 35 WPM-like
 /// pattern at 40 dB depth with a per-track phase and slow ripple.
@@ -46,8 +49,10 @@ fn cfg(u_init_hops: f32) -> EvidenceConfig {
 }
 
 /// Runs every track and returns (emitted hops, checksum of every emitted
-/// hop's mark level and LLR). `swing` alternates `set_u_ref` after every
-/// pushed hop.
+/// hop's mark level and LLR). `swing` switches `set_u_ref` between its two
+/// values every [`SWING_DWELL`] pushed hops. (Switching after every hop
+/// would emit every center at the smaller width: a grown window waits for
+/// lookahead and emits nothing until it shrinks again.)
 fn run(inputs: &[Vec<f32>], u: f32, swing: Option<[f32; 2]>) -> (usize, f64) {
     let mut emitted = 0usize;
     let mut checksum = 0.0f64;
@@ -59,7 +64,7 @@ fn run(inputs: &[Vec<f32>], u: f32, swing: Option<[f32; 2]>) -> (usize, f64) {
                 checksum += (ev.mark_level + ev.llr) as f64;
             }
             if let Some(s) = swing {
-                e.set_u_ref(s[i % 2]);
+                e.set_u_ref(s[(i / SWING_DWELL) % 2]);
             }
         }
         for ev in e.flush() {

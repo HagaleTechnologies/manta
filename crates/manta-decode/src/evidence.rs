@@ -513,7 +513,7 @@ impl CenteredMax {
         {
             self.ops.admitted += 1;
         }
-        if !(v > 0.0) {
+        if v.is_nan() || v <= 0.0 {
             return;
         }
         while let Some(&(_, back)) = self.cand.back() {
@@ -825,8 +825,8 @@ mod centered_max_tests {
         // retreats, so the cache keeps maintaining incrementally.
         for c in 100..2800u64 {
             h = match c % 7 {
-                0 | 1 | 2 => h + 1,
-                3 | 4 | 5 => h - 1,
+                0..=2 => h + 1,
+                3..=5 => h - 1,
                 _ => h,
             };
             step(&mut cm, &values, c, h, 0, 2999);
@@ -1730,7 +1730,11 @@ mod tests {
         for &a in &amps[330..] {
             t.record(a, 0.01);
             t.drain_all();
-            t.set_u(if t.out.len() % 2 == 0 { 40.0 } else { 4.0 });
+            t.set_u(if t.out.len().is_multiple_of(2) {
+                40.0
+            } else {
+                4.0
+            });
         }
         t.flush_all();
         assert_eq!(t.out.len(), amps.len());
@@ -1850,5 +1854,38 @@ mod tests {
         );
         let a_s = t.fast.line.back().unwrap().1;
         assert_eq!(next.mark_level.to_bits(), a_s.to_bits());
+    }
+
+    #[test]
+    fn the_benchmark_resize_stress_schedule_rebuilds_about_every_third_hop() {
+        // `benches/evidence_300_tracks.rs`'s stress case: h switches between
+        // 223 and 225 every third pushed hop. Growth to 225 retreats the
+        // next window's left bound and the shrink to 223 its right bound,
+        // so each switch costs one rebuild of about 2h+1 samples.
+        let hops = 3_750u64;
+        let mut t = Twin::new(EvidenceConfig {
+            u_init_hops: 56.0,
+            ..EvidenceConfig::default()
+        });
+        for i in 0..hops {
+            t.record(0.5 + 0.4 * ((i as f32) * 0.07).sin(), 0.02);
+            t.drain_all();
+            t.set_u([55.75, 56.25][(i as usize / 3) % 2]);
+        }
+        t.flush_all();
+        assert_eq!(t.out.len() as u64, hops);
+        let ops = &t.fast.max_cache.ops;
+        // About one rebuild per three emitted hops (a few switches land
+        // while a grown window is still waiting for lookahead).
+        assert!(
+            ops.builds * 4 > hops,
+            "{} builds for {hops} hops: the stress case is not stressing",
+            ops.builds
+        );
+        assert!(ops.rebuilt_admissions >= (ops.builds - 1) * 400);
+        println!(
+            "stress schedule: {} builds, {} rebuilt admissions, {} admissions for {hops} hops",
+            ops.builds, ops.rebuilt_admissions, ops.admitted
+        );
     }
 }
