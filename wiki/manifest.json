@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-13T12:59:38Z",
-  "head_commit": "d286147",
+  "generated_at": "2026-10-14T01:33:18Z",
+  "head_commit": "9636fe0",
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -26,7 +26,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:0e91b33af6e0f25a784ffe4f9e542b188ad7ee870217bfca9deba496f84e1365",
+      "hash": "sha256:cbabbc30c825788658a32ddc4712a35905df5bc744c4ab064b952fc9de5a2eb4",
       "id": "decode-chain",
       "kind": "subsystem",
       "links": [
@@ -42,8 +42,8 @@
       ],
       "status": "current",
       "title": "How does the per-track CW decode chain work?",
-      "verified_commit": "d286147",
-      "verified_date": "2026-10-13",
+      "verified_commit": "9636fe0",
+      "verified_date": "2026-10-14",
       "visibility": "public"
     },
     {

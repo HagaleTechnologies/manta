@@ -175,13 +175,12 @@ same Rust engine. RBN's real login prompt and the live/offline agreement
 rate are unmeasured. See
 docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
 
-<<<<<<< HEAD
 MAN-152: the in-repo `wiki/` is manta's canonical wiki. GitHub's Wiki tab
 is not used; disabling it remains an owner step. The wiki pages'
 `verified` stamps and `manifest.json` are refreshed and pinned by a
 `docs_consistency` test. See
 `docs/DECISIONS/2026-10-13-man152-one-wiki.md`.
-=======
+
 MAN-140: `--ka9q-group` (with `--ka9q-port`/`--ka9q-ssrc`/
 `--ka9q-interface`) or `[input] type = "ka9q"` reads one existing
 ka9q-radio (radiod) IQ channel over RTP multicast, in every build (no
@@ -191,7 +190,6 @@ status radiod sends to the data group on port 5006; manta also joins on
 Written clean-room from ka9q-radio's docs and headers at `f44b3a3ee8dd`;
 six facts (D-HW) still need a live radiod. See docs/GUIDES/ka9q-radio.md
 and docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md.
->>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
 
 MAN-324: `[server].live_port` (unset = off; `live_bind_addr` default
 `127.0.0.1`) starts a live-state stream for dashboards: `bandState`,

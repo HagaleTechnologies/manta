@@ -862,6 +862,69 @@ fn wiki_manifest_lists_every_page_with_a_matching_hash() {
     }
 }
 
+/// `git` run in the repository root, or `None` when git is missing or the
+/// command fails.
+fn git_in_repo(args: &[&str]) -> Option<std::process::Output> {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo_root())
+        .output()
+        .ok()
+}
+
+/// `wiki/manifest.json`'s `head_commit` names the snapshot the index was
+/// generated from; each page was verified at its own `verified_commit`,
+/// which must therefore be in `head_commit`'s history. A merge kept main's own `de525d1` stamp on windows-build-setup
+/// while `head_commit` stayed at `d286147`, which does not contain it.
+/// Ordering commits needs git history: the test skips in a shallow clone
+/// (ci-full.yml's test checkout is one) and skips any commit this clone
+/// cannot resolve.
+#[test]
+fn wiki_manifest_head_commit_contains_every_page_stamp() {
+    let shallow = git_in_repo(&["rev-parse", "--is-shallow-repository"]);
+    match shallow {
+        Some(out) if out.status.success() && out.stdout.starts_with(b"false") => {}
+        _ => {
+            eprintln!("skipping: needs a full (non-shallow) git clone");
+            return;
+        }
+    }
+    let resolves = |commit: &str| {
+        git_in_repo(&["cat-file", "-e", &format!("{commit}^{{commit}}")])
+            .is_some_and(|out| out.status.success())
+    };
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&doc("wiki/manifest.json")).expect("parse wiki/manifest.json");
+    let head = manifest["head_commit"]
+        .as_str()
+        .expect("wiki/manifest.json has a string `head_commit`");
+    if !resolves(head) {
+        eprintln!("skipping: head_commit {head} is not in this clone");
+        return;
+    }
+    for entry in manifest["pages"]
+        .as_array()
+        .expect("wiki/manifest.json has a `pages` array")
+    {
+        let id = entry["id"].as_str().unwrap_or("?");
+        let stamp = entry["verified_commit"]
+            .as_str()
+            .unwrap_or_else(|| panic!("wiki/manifest.json entry `{id}` has no verified_commit"));
+        if !resolves(stamp) {
+            eprintln!("skipping `{id}`: verified_commit {stamp} is not in this clone");
+            continue;
+        }
+        let contained = git_in_repo(&["merge-base", "--is-ancestor", stamp, head])
+            .is_some_and(|out| out.status.success());
+        assert!(
+            contained,
+            "wiki/manifest.json's head_commit {head} does not contain verified_commit {stamp} \
+             of entry `{id}`: re-anchor head_commit on a commit that contains every page stamp"
+        );
+    }
+}
+
 /// MAN-152 re-stamped spot-output-contract.md as verified, but its opening
 /// still said manta "consumes no external spot contract". MAN-301's
 /// `[rbn_compare]` parses RBN's `DX de` feed, so the page names that parser.
