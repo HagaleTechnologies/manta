@@ -278,6 +278,13 @@ track back to ACTIVE.
 - A rising, unowned channel `k` may start a spawn decision only if its
   smoothed power `S[k]` is ≥ both `S[k−1]` and `S[k+1]` (a local maximum;
   neighbours wrap). (MAN-172, see docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md)
+- A spawn decision at `k` is additionally rejected while *any* channel of
+  the prospective ownership window `{k−1, k, k+1}` (neighbours wrap) is
+  still serving a post-`Silent` respawn cooldown (§9's
+  `detector.silent_respawn_cooldown_ms`). The same-hop pairing rule below
+  applies this to `k+1`'s own window. Gating the birth channel alone let a
+  neighbour-born candidate absorb the cooling channel via max-power
+  selection. (MAN-197, see docs/DECISIONS/2026-10-14-man197-respawn-cooldown-ownership-window.md)
 - Each hop, the track's demod input is taken from the **max-power channel
   among its owned set** (per ARCHITECTURE §4 "max-power selection"); the
   owned set follows `round(c)` as the centroid drifts, which is how drifting
