@@ -98,6 +98,7 @@ loopback-only by default, see `docs/RUNBOOKS/network-exposure.md`).
 | `0` | Every enabled target connected, or no uplink configured at all. |
 | `1` | Reached the daemon; the uplink is unhealthy (`DEGRADED`/`DOWN`). |
 | `2` | Could not reach or parse the daemon's status — check the daemon is running and the address/port. |
+| `141` | stdout closed before the status document was written. |
 
 Exit `2` also covers version skew: if the daemon serves a `schema_version`
 this `manta` build doesn't understand, `manta status` refuses to interpret

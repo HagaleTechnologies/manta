@@ -113,6 +113,7 @@ non-standard port.
 | 0 | No check failed. Warnings are allowed, and the signal verdict (including `NO_SIGNAL`) does not change the exit code: a quiet band is not a broken setup |
 | 1 | At least one check failed, or doctor could not start (a bad `--duration`, a config that does not load) |
 | 2 | Command-line usage error |
+| 141 | stdout closed before doctor finished its report (for example `manta doctor \| head -3`); checks after that point did not run |
 
 ## Network traffic doctor sends
 

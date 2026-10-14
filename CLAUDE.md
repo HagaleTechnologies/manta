@@ -264,6 +264,17 @@ MAN-210: golden vector V51 (V9's drift scene, `refine_bw_hz = 30` via
 end-to-end through `manta decode --json` — the evidence any future
 default-on change must keep green.
 
+MAN-232: `run`/`listen`, `decode`, `doctor`, `oracle`, `soak` and
+`status` never panic on a failed stdout/stderr write
+(`manta-cli::stdio`; a guard in `output_style_guard.rs` keeps panicking
+print macros out of the converted files). A closed stdout stops `run`
+through the normal drain (`manta: stdout closed; stopping`) and exits
+141; batch commands exit 141 silently; a closed stderr is ignored
+(including `tracing`, via `log_internal_errors(false)`). On Unix, SIGINT
+moved from ctrlc to signal-hook; a second SIGINT/SIGTERM (SIGHUP without
+`[server]`) exits at once with 128 + signal, skipping the drain. See
+docs/DECISIONS/2026-10-14-man232-closed-and-stalled-output.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each
