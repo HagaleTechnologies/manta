@@ -381,6 +381,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_forward(
     config: &RbnUplinkConfig,
     dry_run: &AtomicBool,
