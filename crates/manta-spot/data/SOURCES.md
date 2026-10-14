@@ -13,7 +13,10 @@
 - Refresh: download the source above and replace `data/cty.dat`. Update
   `CTY_DAT_RETRIEVED` in `src/vintage.rs` and this section's retrieval date
   together; a test enforces the match. Operators can use `--cty` or
-  `[spot] cty_path` to supply a newer file without a manta release.
+  `[spot] cty_path` to supply a newer file without a manta release, or
+  `[spot] refresh_lists` to have `manta run` download it every 7 days
+  (MAN-316; docs/DECISIONS/2026-10-12-man316-reference-list-refresh.md).
+  A download is used only when it is newer than this retrieval date.
 
 ## dxcc.tsv
 
@@ -48,9 +51,13 @@
 - License/redistribution: same convention as cty.dat -- bundled by contest
   logging software as a matter of course; no separate license published
   upstream. Same flag-not-block note applies.
-- Refresh: download the source above and replace `data/master.scp`.
-  Operators can use `--scp` or `[spot] scp_path` to supply a newer file
-  without a manta release.
+- Refresh: download the source above and replace `data/master.scp`. Update
+  `MASTER_SCP_RETRIEVED` in `src/vintage.rs` and this section's retrieval
+  date together; a test enforces the match. Operators can use `--scp` or
+  `[spot] scp_path` to supply a newer file without a manta release, or
+  `[spot] refresh_lists` to have `manta run` download it every day
+  (MAN-316). A download is used only when it is newer than this retrieval
+  date.
 
 ## patterns.lst
 
@@ -68,4 +75,5 @@
   atomically replaces `data/patterns.lst`. The
   `pattern::tests::vendored_list_is_derived_from_the_vendored_master_scp`
   consistency test fails if the two drift apart. Operators override this list
-  separately with `--patterns` or `[spot] pattern_path`; `--scp` does not change it.
+  separately with `--patterns` or `[spot] pattern_path`; neither `--scp` nor
+  a `refresh_lists` download (MAN-316) changes it.
