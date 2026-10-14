@@ -300,8 +300,8 @@ fn v21_allowlisted_word_found_despite_a_stale_attempted_context_match() {
     );
 }
 
-/// V22: a fast, first-decode-exempt spot (BEACON or allowlist) must not be
-/// emitted before the track's first `TrackMeta` event -- `TrackState`'s
+/// V22: a fast, first-decode-exempt allowlisted spot must not be emitted
+/// before the track's first `TrackMeta` event -- `TrackState`'s
 /// `freq_hz`/`snr_db` still hold their `0.0` defaults until then, and the
 /// old repetition gate only *incidentally* hid this by taking long enough
 /// that real telemetry always arrived first.
@@ -382,8 +382,8 @@ fn v24_reclassification_does_not_inflate_the_repetition_count() {
     );
 }
 
-/// V25: a pending first-decode-exempt candidate must be retried the
-/// moment `TrackMeta` arrives, not merely on the next `WordBoundary`. A
+/// V25: a pending first-decode-exempt allowlisted candidate must be retried
+/// the moment `TrackMeta` arrives, not merely on the next `WordBoundary`. A
 /// short transmission with no further words after the one that completed
 /// the exemption would otherwise lose it permanently -- `try_spot` is
 /// only ever invoked by a word boundary, so if none follows, a pending
