@@ -24,13 +24,11 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
-<<<<<<< HEAD
 - MAN-174: a deferred Beacon candidate on a track that merged into another
   track which closed in the same batch now resolves at the final survivor's
   close instead of being lost; one whose timestamp equals an existing
   spot's goes through normal dedupe; a merge keeps the newest eight pending
   candidates by time.
-=======
 - MAN-192: the opt-in `hsmm` engine now reseeds its speed hypotheses
   after a committed `Silence` segment even when the keying-present gate
   never re-opens (interference holding it high through the gap), as
@@ -39,7 +37,6 @@ the git history and `docs/DECISIONS/`.
   from the surviving speed alone. `decode.engine` remains `legacy` by
   default; output changes only for `hsmm` runs with such gate-stuck
   gaps.
->>>>>>> 957a49eee81585e6c9faa28160218dddb5ecac2c
 - MAN-95: default spot validation requires 2, 3 or 5 distinct-message
   repetitions by callsign-pattern rarity. `[spot].validation_level = "minimal"`
   restores flat 2; `--patterns` overrides the independent reference list.
