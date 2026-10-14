@@ -1712,3 +1712,74 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
     }
 }
+
+// MAN-95: a fixture table isolates rarity from future reference-list updates.
+fn rarity_validator() -> Validator {
+    Validator::new(FS, CTY_FIXTURE, None).with_patterns(std::sync::Arc::new(
+        manta_spot::pattern::Table::parse("+K5@@@\nK9@@@\n").unwrap(),
+    ))
+}
+
+fn assert_rarity_threshold(mut v: Validator, call: &str, required: u64) {
+    seed_meta(&mut v, 1);
+    for rep in 1..=required {
+        let spots = run(
+            &transmission_events(1, &["DE", call, "K"], (rep - 1) * 100_000),
+            &mut v,
+        );
+        if rep < required {
+            assert!(
+                spots.is_empty(),
+                "{call} spotted at {rep}, needs {required}"
+            );
+        } else {
+            assert_eq!(spots.len(), 1, "{call} must spot at {required}");
+            assert_eq!(spots[0].callsign, call);
+        }
+    }
+}
+
+#[test]
+fn v46_common_pattern_two_reps() {
+    assert_rarity_threshold(rarity_validator(), "K5ARH", 2);
+}
+
+#[test]
+fn v47_listed_pattern_three_reps() {
+    assert_rarity_threshold(rarity_validator(), "K9ABC", 3);
+}
+
+#[test]
+fn v48_unlisted_pattern_five_reps() {
+    assert_rarity_threshold(rarity_validator(), "W4KTNL", 5);
+}
+
+#[test]
+fn v49_minimal_level_is_flat_two() {
+    assert_rarity_threshold(
+        rarity_validator().with_validation_level(manta_spot::ValidationLevel::Minimal),
+        "W4KTNL",
+        2,
+    );
+}
+
+#[test]
+fn v50_exemptions_ignore_pattern_tier() {
+    let mut allowlisted = rarity_validator();
+    allowlisted.allowlist("W4KTNL");
+    seed_meta(&mut allowlisted, 1);
+    let spots = run(&transmission_events(1, &["W4KTNL"], 0), &mut allowlisted);
+    assert_eq!(spots.len(), 1);
+    assert_eq!(spots[0].callsign, "W4KTNL");
+    let mut beacon = rarity_validator();
+    seed_meta(&mut beacon, 1);
+    assert!(run(
+        &transmission_events(1, &["V", "V", "V", "W4KTNL"], 0),
+        &mut beacon
+    )
+    .is_empty());
+    let spots = close_track(&mut beacon, 1, ClosureKind::SignalEnded);
+    assert_eq!(spots.len(), 1);
+    assert_eq!(spots[0].callsign, "W4KTNL");
+    assert_eq!(spots[0].spot_type, SpotType::Beacon);
+}

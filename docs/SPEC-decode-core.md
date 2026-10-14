@@ -950,8 +950,10 @@ c_call = (Π cᵢ)^(1/n) · (1 − 0.5^r)
 Geometric mean (one garbled character tanks it, correctly) times a
 repetition factor: `r=1 → 0.5`, `r=2 → 0.75`, `r=3 → 0.875`. The validator's
 own adjustments (cty/SCP hits, per ARCHITECTURE §6) multiply on top of this
-and are specified in `manta-spot`, not here. The ≥ 2-repetition gate for
-first spot is unchanged for non-beacon, non-allowlisted spot types; a
+and are specified in `manta-spot`, not here. The first-spot gate requires
+the pattern tier's count (2 for a common
+pattern, 3 for a listed pattern, 5 for an unlisted pattern at the default
+`normal` level; `minimal` requires 2 for every pattern, MAN-95); a
 message already type-tagged `BEACON` by the context parse (ARCHITECTURE §6
 step 1), or a callsign the operator has explicitly allowlisted (ARCHITECTURE
 §6's Watch List), is exempt from this gate — never needs a second, distinct
@@ -987,8 +989,8 @@ at least `MIN_MESSAGE_TIME_GAP_SECONDS = 60` seconds of `sample_ts` separate
 them (MAN-100 remediation C2). SPEC's own default payload template repeats
 the callsign back-to-back within one transmission (`CQ CQ DE <CALL> <CALL>
 K`, §7's payload note) — without the word-gap half of this rule, that
-single, possibly fading-corrupted message alone could satisfy the ≥
-2-repetition gate. 3 words sits strictly between the one-word gap inside a
+single, possibly fading-corrupted message alone could satisfy the tier's requirement
+(2 for a common pattern). 3 words sits strictly between the one-word gap inside a
 single message and the minimum five-word gap between two separate ones
 (`<CALL> K CQ CQ DE <CALL>`). That word-gap reasoning assumes SPEC's own
 payload template, though, and does not hold for a real, shorter ID (e.g.
@@ -1016,7 +1018,7 @@ strict prefix of a rival that has been observed at all (≥ 1 message-distinct
 repetition — shape alone decides a prefix-containment pair once the rival
 exists, however little support it has). An earlier attempt (MAN-100
 remediation C5) also required the rival to independently clear the same
-≥ 2-repetition floor a spottable candidate must, on the reasoning that a
+tier's repetition floor a spottable candidate must, on the reasoning that a
 single stray, garbled decode that happens to be a textual prefix-extension
 of a well-supported candidate should not be enough on its own to veto it;
 reverted in remediation round 3 because it excluded the ticket's own
@@ -1207,7 +1209,7 @@ M0 = V1 passing end-to-end from a WAV file. M1 = V1–V6. V7–V10 and V8w gate 
 
 Unlike V1–V10 (testkit-synthesized IQ), these operate at the
 `DecoderEvent`-stream level -- hand-built event sequences feeding
-`Validator::ingest` directly, no IQ synthesis involved. V11-V15, V18-V45b
+`Validator::ingest` directly, no IQ synthesis involved. V11-V15, V18-V50
 are implemented in `crates/manta-spot/tests/golden_v11_v15.rs`; V16-V17
 (operator suppression, MAN-31 -- orthogonal to this pipeline, see
 ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
@@ -1217,7 +1219,7 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V11 | context-parse | Each of `CQ <call>`, `CQ TEST <call>`, `CQ <contest> <call>` (e.g. `CQ WPX`; filler set per `manta-spot::context`), `TEST <call>`, `DE <call>`, `<call> UP`, `V V V <call>`, `<call> T` | Correct `SpotType` assigned per pattern family |
 | V12 | bogus-prefix | Structurally-valid callsign with a prefix absent from cty.dat | 0 spots, even though grammar passes |
 | V13 | scp-boost | Same callsign/confidences with vs. without SCP membership | `c_call` strictly higher when a member; absence never rejects |
-| V14 | repetition-gate | 1 decode vs. 2 decodes of the same callsign within 90 s, non-beacon spot type | 1 rep never spots; 2 reps does |
+| V14 | repetition-gate | 1 decode vs. 2 decodes of a common-pattern callsign within 90 s, non-beacon spot type | 1 rep never spots; the tier's requirement (2 for a common pattern) spots |
 | V15 | dedupe | Repeat spot inside the 10 min window, then an SNR jump >= 6 dB | Suppressed inside the window; allowed after the SNR jump |
 | V16 | bad-call blocklist | Callsign present vs. absent from the operator's bad-call list | Present → 0 spots; absent → spots normally |
 | V17 | notched frequency | Track frequency inside vs. outside a notched range | Inside → 0 spots; outside → spots normally |
@@ -1235,7 +1237,7 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V29 | provenance-bound-to-occurrence | "CQ DE K5ARH K CQ DE K5ARH" repeats DE-K5ARH across two genuinely separate messages (MAN-100 Scenario 2 requires the gap); the newest K5ARH spots as `Cq` after 2 reps, then "CQ" and the first "DE" age out while the second "DE K5ARH" remains | No spot reclassifies to `De` -- provenance is bound to the exact word occurrence `evaluate_candidate` selects, not whichever occurrence the regex matched first |
 | V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37), track closed at a plausible speed | `BEACON`-tagged spot emits once the track closes, gate not applied regardless -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern; emission timing per V18's amendment note |
 | V38 | variant-arbitration | A track decodes both a callsign and a confusable, less-supported variant of it (truncation or shared-prefix near-miss) inside one 90 s window -- variants V38b (per-track scoping) and V38c (a well-supported real call is not suppressed by a 1-rep head-merge artifact) | Only the better-supported candidate spots; arbitration is per track, and never fires against a form that could not itself be spotted |
-| V39 | same-message-repetition | One `CQ CQ DE <CALL> <CALL> K` transmission, then a second, genuinely later one | The first message's doubled call alone never satisfies the ≥ 2-rep gate; the second message completes it |
+| V39 | same-message-repetition | One `CQ CQ DE <CALL> <CALL> K` transmission, then a second, genuinely later one | The first message's doubled call alone never satisfies the repetition gate (2 for its common pattern); the second message completes it |
 | V40 | truncation-arrives-first | A strict-prefix truncation clears the repetition gate on a track before the genuine, longer call has any support at all, which then appears | The genuine call still spots once observed -- the prefix-containment asymmetry fires regardless of arrival order (MAN-100 remediation C1) |
 | V41 | short-id-wide-time-gap | A 2-word ID ("DE `<CALL>`") repeated 80 s apart -- below `MIN_MESSAGE_WORD_GAP` but past `MIN_MESSAGE_TIME_GAP_SECONDS` | Still clears the repetition gate as two distinct messages (MAN-100 remediation C2) |
 | V42 | beacon-exempt-from-arbitration | A confusable rival of a `BEACON`-tagged candidate reaches more reps than the genuine, once-per-cycle beacon | The genuine beacon still spots -- `BEACON` candidates are exempt from step 4b arbitration (MAN-100 remediation C3) |
@@ -1243,6 +1245,11 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V44 | 1-rep-rival-still-wins-by-shape | The literal, measured V8w track-90 shape: a 3-rep truncation ("W6JQ") vs. its genuine, longer form ("W6JQA") observed only once on the track | The truncation is withheld -- shape decides a prefix-containment pair once the rival has been observed at all, regardless of how few reps it has (MAN-100 remediation round 3; a rival-side rep floor tried in remediation C5 excluded this exact case and was reverted) |
 | V45 | non-callsign-convention | Each listed CW convention (`5NN`, `3NN`, `599`, `TEST`, …) sent as a CQ/DE/beacon candidate, some of which match an allocated cty.dat prefix (`5N` Nigeria) | 0 spots — rejected by grammar regardless of cty.dat (MAN-105) |
 | V45b | convention-never-vetoes | A track that repeats `5NN` exchanges, then a real non-SCP call ending in `5NN` (`HA5NN`) | The real call spots — the convention never enters the MAN-100 support ledger (MAN-105) |
+| V46 | common-pattern-two-reps | `DE K5ARH K` with `+K5@@@` in the pattern table, on the same track | No spot at 1; spots at 2 message-distinct repetitions |
+| V47 | listed-pattern-three-reps | `DE K9ABC K` with `K9@@@` listed without `+`, on the same track | No spot at 2; spots at 3 message-distinct repetitions |
+| V48 | unlisted-pattern-five-reps | `DE W4KTNL K` with its pattern absent, on the same track | No spot through 4; spots at 5 message-distinct repetitions |
+| V49 | minimal-level-is-flat-two | V48's unlisted pattern at `validation_level = "minimal"` | No spot at 1; spots at 2 |
+| V50 | exemptions-ignore-pattern-tier | An unlisted-pattern allowlisted call, then a `V V V <call>` beacon | Allowlisted call spots at its first decode; beacon spots at track close with confirmed plausible speed |
 
 ### 7.2 Static-crash vectors (VC1–VC3, MAN-312)
 
@@ -1420,7 +1427,7 @@ freq_correction_ppm = 0.0
 # replay_epoch = 1700000000
 
 [spot]
-# allowlist, blocklist_path and notch_path are re-read on SIGHUP when the config has a [server] table (MAN-78); cty_path and scp_path need a restart.
+# allowlist, blocklist_path and notch_path are re-read on SIGHUP when the config has a [server] table (MAN-78); cty_path, scp_path, pattern_path and validation_level need a restart.
 # Operator Watch List (§6, MAN-28): callsigns here bypass grammar/cty
 # validation and the repetition gate entirely in manta-spot's validator.
 # A non-empty --allowlist replaces this list.
@@ -1443,6 +1450,13 @@ allowlist = []
 # Download: https://www.supercheckpartial.com/MASTER.SCP
 # Same path rule. Unset: bundled. --scp overrides it.
 # scp_path = "MASTER.SCP"
+# Pattern tier counts: normal = common 2 / listed 3 / unlisted 5; minimal = 2 for all.
+# Allowlisted calls and beacons stay exempt.
+validation_level = "normal"
+# Independent list derived from MASTER.SCP. One [+]PATTERN per line, e.g. +K5@@@.
+# Leading # comments; @ for later letters, # for later digits. Same path rule.
+# Unset: bundled. --patterns overrides it.
+# pattern_path = "patterns.lst"
 
 # [server] key line_format (MAN-88), set inside your real [server] table:
 # Which fixed-column wire layout the INBOUND telnet cluster server renders
@@ -1528,7 +1542,8 @@ always taken verbatim: `server.station_callsign`, `server.bind_addr`,
 `server.operator_name`, `server.operator_qth`, `server.operator_grid`,
 `input.type`, `input.device`, `input.path`, `input.host`,
 `input.password`, `input.driver`, `spot.blocklist_path`,
-`spot.notch_path`, `spot.cty_path`, `spot.scp_path`, `decode.engine`,
+`spot.notch_path`, `spot.cty_path`, `spot.scp_path`, `spot.pattern_path`,
+`spot.validation_level`, `decode.engine`,
 `detector.crash_filter`, `rbn_compare.feed_host` and
 `rbn_compare.login_callsign`. Relative
 paths from the file resolve against the file's directory; those from a flag or the

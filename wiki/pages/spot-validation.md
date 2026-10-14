@@ -22,6 +22,11 @@ Decoded CW text is noisy, so validation — not decoding — is what makes a spo
 
 ## How it works
 
+- MAN-95 changes the repetition threshold by callsign-pattern rarity. The
+  reference list is independent of an operator SCP override. See
+  [the decision record](../../docs/DECISIONS/2026-10-14-man95-pattern-rarity-repetition-tiers.md)
+  for thresholds, configuration and the message-distinct counting caveat.
+
 - Operators can supply cty/scp files and receive a startup warning for an old bundled country table. See [MAN-79's decisions](../../docs/DECISIONS/2026-10-10-man79-operator-cty-scp-override.md) for flags, precedence and the age threshold.
 
 - CQ/DE/beacon context parse sets spot type (carried in the RBN flag): ARCHITECTURE §6.1.
