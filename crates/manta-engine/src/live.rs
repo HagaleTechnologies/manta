@@ -602,6 +602,8 @@ pub(crate) mod tests {
             verdict: manta_spot::Verdict::Withheld,
             reason: Some(manta_spot::Reason::Repetition),
             reps: Some(1),
+            required_reps: 2,
+            pattern_tier: Some(manta_spot::PatternTier::Common),
             rival: None,
             spot: None,
         }

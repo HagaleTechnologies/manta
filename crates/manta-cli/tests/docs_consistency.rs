@@ -918,6 +918,8 @@ fn spec_documents_every_input_and_spot_key() {
                 "notch_path",
                 "cty_path",
                 "scp_path",
+                "pattern_path",
+                "validation_level",
             ],
         ),
     ];
@@ -2029,6 +2031,7 @@ fn config_reference_documents_path_resolution_by_source() {
         ("spot", "notch_path", "--notch"),
         ("spot", "cty_path", "--cty"),
         ("spot", "scp_path", "--scp"),
+        ("spot", "pattern_path", "--patterns"),
     ] {
         let rows = backticked_rows(config_ref_table_section(&md, table));
         let row = rows

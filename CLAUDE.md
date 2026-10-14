@@ -220,6 +220,13 @@ pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
 planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
+MAN-95: `[spot].validation_level` defaults to `normal`: common, listed and
+unlisted callsign patterns need 2, 3 and 5 distinct-message repetitions.
+`minimal` keeps flat 2. The independent list derived from MASTER.SCP is
+replaced by `--patterns` / `[spot].pattern_path`; allowlist and beacon
+exemptions stay. Live decisions report `requiredReps` and `patternTier`.
+See docs/DECISIONS/2026-10-14-man95-pattern-rarity-repetition-tiers.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each
