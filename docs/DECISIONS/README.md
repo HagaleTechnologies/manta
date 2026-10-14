@@ -11,6 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-14 | MAN-211 | [MAN-211: TrackMeta's frequency is captured per queued hop, like its SNR](2026-10-14-man211-trackmeta-freq-per-hop.md) |
 | 2026-10-14 | MAN-197 | [MAN-197: a live track's input selection also skips cooling-down channels](2026-10-14-man197-live-window-cooldown-enforcement.md) |
 | 2026-10-14 | MAN-197 | [MAN-197: the respawn cooldown gates a spawn candidate's whole ownership window](2026-10-14-man197-respawn-cooldown-ownership-window.md) |
 | 2026-10-14 | MAN-174 | [MAN-174: deferred beacons survive merge chains and every loss is counted](2026-10-14-man174-deferred-beacon-merge-bookkeeping.md) |
