@@ -24,6 +24,11 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-174: a deferred Beacon candidate on a track that merged into another
+  track which closed in the same batch now resolves at the final survivor's
+  close instead of being lost; one whose timestamp equals an existing
+  spot's goes through normal dedupe; a merge keeps the newest eight pending
+  candidates by time.
 - MAN-192: the opt-in `hsmm` engine now reseeds its speed hypotheses
   after a committed `Silence` segment even when the keying-present gate
   never re-opens (interference holding it high through the gap), as
