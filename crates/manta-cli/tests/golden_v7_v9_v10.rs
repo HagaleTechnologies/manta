@@ -2,7 +2,7 @@
 //! detector). V10 is added in Task 10; V51 (MAN-210) is V9's scene
 //! decoded with the narrowband refiner on.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
 fn decode_report(
@@ -52,6 +52,34 @@ fn per_track(report: &serde_json::Value) -> BTreeMap<u64, (String, Option<f64>)>
         .into_iter()
         .map(|(tid, t)| (tid, (t.trim().to_string(), freqs.get(&tid).copied())))
         .collect()
+}
+
+/// The distinct `track_id`s of `report["events"]`'s `TrackPromoted`
+/// events: every promoted track, including one merged or closed before it
+/// decoded a character, which `per_track` never sees.
+fn promoted_track_ids(report: &serde_json::Value) -> BTreeSet<u64> {
+    report["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|ev| ev["event"] == "TrackPromoted")
+        .map(|ev| ev["track_id"].as_u64().unwrap())
+        .collect()
+}
+
+// Codex review, PR #303: a track promoted and then merged or closed
+// before decoding a character is invisible to `per_track`, so V51's
+// no-split gate also counts `promoted_track_ids`.
+#[test]
+fn promoted_track_ids_counts_a_track_that_decoded_nothing() {
+    let report = serde_json::json!({ "events": [
+        { "event": "TrackPromoted", "track_id": 1 },
+        { "event": "TrackPromoted", "track_id": 2 },
+        { "event": "CharDecoded", "track_id": 1, "glyph": { "Char": "E" } },
+        { "event": "TrackClosed", "track_id": 2 },
+    ] });
+    assert_eq!(per_track(&report).len(), 1);
+    assert_eq!(promoted_track_ids(&report), BTreeSet::from([1, 2]));
 }
 
 #[test]
@@ -226,12 +254,14 @@ fn v51_drift_with_refiner_enabled_passes_end_to_end() {
          mean the config was dropped"
     );
 
-    let tracks = per_track(&refined);
+    let promoted = promoted_track_ids(&refined);
     assert_eq!(
-        tracks.len(),
+        promoted.len(),
         1,
-        "V51 must not split into multiple tracks under drift with the refiner on"
+        "V51 must not split into multiple tracks under drift with the refiner on: promoted {promoted:?}"
     );
+    let tracks = per_track(&refined);
+    assert_eq!(tracks.len(), 1, "V51's one promoted track must decode text");
     let (_, (decoded_text, freq)) = tracks.iter().next().unwrap();
     let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded_text);
     assert!(
