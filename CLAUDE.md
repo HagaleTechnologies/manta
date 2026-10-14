@@ -220,6 +220,16 @@ pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
 planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
+MAN-248: each `[[rbn_uplink]]` target enforces
+`max_spots_per_minute` (default `600`, `0` disables) on spots written to
+the wire, via the existing `RateLimiter` owned above the reconnect loop;
+over-budget spots are counted in
+`manta_uplink_ceiling_suppressed_total` /
+`manta_uplink_target_ceiling_suppressed_total{target}` and skipped with
+the connection left up (dry-run spots consume no budget; restart-only).
+The owner's measured-peak-rate gate on the default stays open — see
+docs/DECISIONS/2026-10-14-man248-uplink-forwarding-ceiling.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each

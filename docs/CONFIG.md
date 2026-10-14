@@ -169,6 +169,7 @@ nothing, and flags an example `login_callsign`.
 | `login_callsign` | none; example `"N0CALL"`; unset logs in as `station_callsign` | live: `run` with `[server]` | Callsign sent at login. `run` and `config check` reject `N0CALL`. |
 | `dry_run` | `true` | live: `run` with `[server]`; reloads on SIGHUP | `true` connects and logs in but sends no spots. See [RUNBOOKS/uplink-health.md](RUNBOOKS/uplink-health.md). |
 | `spot_types` | `"cq_beacon"` | live: `run` with `[server]` | `"cq_beacon"` sends CQ and beacon spots only, as RBN requires; `"all"` sends every spot. Telnet and JSON still carry every spot. |
+| `max_spots_per_minute` | `600` | live: `run` with `[server]` | Max spots written to this target per 60 s window (the window resets at the first spot after it elapses); further spots are counted in `manta_uplink_ceiling_suppressed_total` and skipped, and the connection stays up. `0` disables the ceiling. Needs a restart; SIGHUP reloads only `dry_run`. |
 
 ## [rbn_compare]
 

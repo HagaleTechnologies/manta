@@ -27,6 +27,15 @@ spot while `dry_run` is on, and otherwise each DE or untyped spot its
 `spot_types` setting holds back (MAN-91). It is therefore non-zero on a
 healthy live uplink too.)
 
+Spots skipped by the target's `max_spots_per_minute` ceiling (MAN-248) are
+NOT in `SUPPR`; they show only as `manta_uplink_ceiling_suppressed_total`
+(and its per-target form) on `/metrics`. That counter staying at 0 forever
+is the healthy state: a sustained rise means either a runaway input or a
+default set too low for contest conditions — tighten
+`max_spots_per_minute` (or set `0` to disable the ceiling as a rollback),
+then restart; SIGHUP does not reload it. See
+[DECISIONS/2026-10-14-man248-uplink-forwarding-ceiling.md](../DECISIONS/2026-10-14-man248-uplink-forwarding-ceiling.md).
+
 Or against an explicit address (e.g. from another host, or when you don't
 have the daemon's config file to hand):
 

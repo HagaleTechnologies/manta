@@ -496,13 +496,14 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
     for u in &loaded.rbn_uplink {
         lines.push(format!(
             "rbn_uplink: target_host={} target_port={} enabled={} dry_run={} spot_types={} \
-             login_callsign={}",
+             login_callsign={} max_spots_per_minute={}",
             u.target_host,
             u.target_port,
             u.enabled,
             u.dry_run,
             u.spot_types.as_str(),
-            u.effective_login_callsign(station)
+            u.effective_login_callsign(station),
+            u.max_spots_per_minute
         ));
     }
 
@@ -942,7 +943,9 @@ mod tests {
             "[server]\nstation_callsign = \"W1AW\"\n\
              [[rbn_uplink]]\nenabled = true\ntarget_host = \"a.example.org\"\ntarget_port = 7000\n\
              [[rbn_uplink]]\nenabled = false\ntarget_host = \"b.example.org\"\ntarget_port = 7001\n\
-             login_callsign = \"k1abc\"\ndry_run = false\nspot_types = \"all\"\n",
+             login_callsign = \"k1abc\"\ndry_run = false\nspot_types = \"all\"\n\
+             [[rbn_uplink]]\nenabled = true\ntarget_host = \"c.example.org\"\ntarget_port = 7002\n\
+             login_callsign = \"w1aw\"\nmax_spots_per_minute = 25\n",
         );
         let uplinks: Vec<&String> = lines
             .iter()
@@ -952,9 +955,11 @@ mod tests {
             uplinks,
             [
                 "rbn_uplink: target_host=a.example.org target_port=7000 enabled=true \
-                 dry_run=true spot_types=cq_beacon login_callsign=W1AW",
+                 dry_run=true spot_types=cq_beacon login_callsign=W1AW max_spots_per_minute=600",
                 "rbn_uplink: target_host=b.example.org target_port=7001 enabled=false \
-                 dry_run=false spot_types=all login_callsign=K1ABC",
+                 dry_run=false spot_types=all login_callsign=K1ABC max_spots_per_minute=600",
+                "rbn_uplink: target_host=c.example.org target_port=7002 enabled=true \
+                 dry_run=true spot_types=cq_beacon login_callsign=W1AW max_spots_per_minute=25",
             ]
         );
     }

@@ -11,6 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-14 | MAN-248 | [MAN-248: a per-minute ceiling on spots the RBN uplink forwards](2026-10-14-man248-uplink-forwarding-ceiling.md) |
 | 2026-10-13 | MAN-140 | [MAN-140: a ka9q-radio (radiod) multicast IQ input](2026-10-13-man140-ka9q-radio-input.md) |
 | 2026-10-13 | MAN-156 | [MAN-156: CI catches dependency, rustdoc, Windows-release and PR-title regressions](2026-10-13-man156-ci-regression-gates.md) |
 | 2026-10-13 | MAN-133 | [MAN-133: shell completions and a man page for the manta CLI](2026-10-13-man133-shell-completions-and-man-pages.md) |
