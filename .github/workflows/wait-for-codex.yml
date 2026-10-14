@@ -17,7 +17,7 @@ name: Wait for Codex
 # Replaces the OLD ~1100-line inline poll loop (every 20s, up to 70min per push) with two
 # seconds-long, event-triggered jobs: codex-review-request posts "@codex review" and creates a
 # pending check-run, then exits; codex-review-response reacts to Codex's own
-# pull_request_review/issue_comment event, evaluates once, and dispatches ci-full.yml (this
+# issue_comment (clean verdict) event, evaluates once, and dispatches ci-full.yml (this
 # repo's workflow_dispatch-only heavy tier, split out of the old ci.yml -- see that file's own
 # header) only once the revision is confirmed clean. credenza's own
 # codex-review-timeout-scan.yml (org-wide, 15min cron, `search/issues?q=org:HagaleTechnologies+
@@ -28,14 +28,23 @@ name: Wait for Codex
 # pull_request_target for the request half -- same reasoning as the pre-migration version of
 # this file (a same-repo PR editing this file could otherwise run its own modified copy with
 # CODEX_REVIEW_PAT still in scope -- pull_request_target always reads its workflow definition
-# from the BASE branch, closing that hole). pull_request_review/issue_comment for the response
-# half don't carry that same specific risk (no ref checkout tied to the event), but keep
-# write-scoped secrets out of a plain pull_request context regardless.
+# from the BASE branch, closing that hole). issue_comment for the response half doesn't carry
+# that same specific risk (no ref checkout tied to the event), but keep write-scoped secrets out
+# of a plain pull_request context regardless.
+#
+# dispensa Q-0068: CODEX_REVIEW_PAT and HAGALE_AGENT_APP_PRIVATE_KEY live in the codex-review
+# environment (deployment branches: main only); request and response declare it. pull_request_review
+# is dropped (it runs a PR-derived workflow, which the environment rejects): a Codex findings
+# review now leaves the gate pending (still blocks merge) instead of red; Catalyst remediates on
+# the non-clean review itself, and the clean verdict arrives on issue_comment.
 on:
   pull_request_target:
-    types: [opened, ready_for_review, synchronize, reopened]
-  pull_request_review:
-    types: [submitted]
+    # Q-0068: main only. The environment check uses the PR's base as the ref, so a stacked PR
+    # onto a non-main base would get a failing gate; only main's ruleset requires this gate.
+    # `edited` (base change only, see codex-review-request's `if:`) covers a stacked PR later
+    # retargeted onto main with no new commit, same as auto-merge-trigger.yml.
+    branches: [main]
+    types: [opened, ready_for_review, synchronize, reopened, edited]
   issue_comment:
     types: [created]
   # Fleet CI redesign, native merge-queue cutover: "Codex review clean (gate before expensive
@@ -76,7 +85,7 @@ jobs:
   # workflow, not just ones where the job is skipped: on a genuine pull_request_target run
   # (this job's `if:` true), that native check-run and the one create-check's own `-f name=`
   # step manages via the raw Checks API would BOTH exist under the identical name on the same
-  # head SHA; on every other trigger (pull_request_review/issue_comment/merge_group, `if:`
+  # head SHA; on every other trigger (issue_comment/merge_group, `if:`
   # false), it's the usual `skipped`-ghost collision. Either way, two check-run objects sharing
   # one name is exactly the ambiguous state GitHub's required-status rollup can resolve
   # non-deterministically. This bug predates HAG-74 (the job was already named this in the
@@ -84,11 +93,19 @@ jobs:
   # exact name instead of the separately-produced "Wait for Codex Review".
   codex-review-request:
     name: 'Codex review clean: request'
-    if: github.event_name == 'pull_request_target'
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      (github.event.action != 'edited' || github.event.changes.base != null)
+    # Q-0068: the PAT and app key live in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     concurrency:
-      group: codex-review-request-${{ github.event.pull_request.number }}
+      # A non-base `edited` run (title/body edit) gets its own group so it can never cancel an
+      # in-flight request for the same PR.
+      group: codex-review-request-${{ github.event.pull_request.number }}${{ (github.event.action == 'edited' && github.event.changes.base == null) && format('-noop-{0}', github.run_id) || '' }}
       cancel-in-progress: ${{ github.run_attempt == 1 }}
     outputs:
       check_run_id: ${{ steps.create-check.outputs.check_run_id }}
@@ -333,8 +350,11 @@ jobs:
   codex-review-response:
     name: Codex review response
     if: |
-      (github.event_name == 'pull_request_review' && (github.event.review.user.login == 'chatgpt-codex-connector' || github.event.review.user.login == 'chatgpt-codex-connector[bot]')) ||
-      (github.event_name == 'issue_comment' && (github.event.comment.user.login == 'chatgpt-codex-connector' || github.event.comment.user.login == 'chatgpt-codex-connector[bot]') && github.event.issue.pull_request != null)
+      github.event_name == 'issue_comment' && (github.event.comment.user.login == 'chatgpt-codex-connector' || github.event.comment.user.login == 'chatgpt-codex-connector[bot]') && github.event.issue.pull_request != null
+    # Q-0068: the PAT and app key live in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
@@ -942,7 +962,7 @@ jobs:
   # on every run where its `if:` is false, which is almost every run here (`if:
   # github.event_name == 'merge_group'`). A job named exactly the required-check string would
   # spray a ghost `skipped` check-run under that name on every
-  # pull_request_target/pull_request_review/issue_comment run, colliding with the one real
+  # pull_request_target/issue_comment run, colliding with the one real
   # check-run codex-review-request/codex-review-response manage via the raw Checks API --
   # confirmed live on cqdx PR #446/CQD-181.
   wait-for-codex-merge-group-passthrough:
