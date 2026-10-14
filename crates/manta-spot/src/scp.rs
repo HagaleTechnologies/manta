@@ -34,18 +34,22 @@ impl Set {
 
     /// Parses a `MASTER.SCP` file's full contents.
     pub fn parse(master_scp: &str) -> Self {
-        let calls = master_scp
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('!'))
-            .map(str::to_uppercase)
-            .collect();
+        let calls = calls(master_scp).collect();
         Self { calls }
     }
 
     pub fn contains(&self, callsign: &str) -> bool {
         self.calls.contains(&callsign.to_uppercase())
     }
+}
+
+/// Shared source-line filter for SCP membership and pattern-list generation.
+pub(crate) fn calls(master_scp: &str) -> impl Iterator<Item = String> + '_ {
+    master_scp
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('!'))
+        .map(str::to_uppercase)
 }
 
 #[cfg(test)]

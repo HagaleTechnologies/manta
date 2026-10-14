@@ -24,6 +24,7 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+<<<<<<< HEAD
 - MAN-192: the opt-in `hsmm` engine now reseeds its speed hypotheses
   after a committed `Silence` segment even when the keying-present gate
   never re-opens (interference holding it high through the gap), as
@@ -32,6 +33,12 @@ the git history and `docs/DECISIONS/`.
   from the surviving speed alone. `decode.engine` remains `legacy` by
   default; output changes only for `hsmm` runs with such gate-stuck
   gaps.
+=======
+- MAN-95: default spot validation requires 2, 3 or 5 distinct-message
+  repetitions by callsign-pattern rarity. `[spot].validation_level = "minimal"`
+  restores flat 2; `--patterns` overrides the independent reference list.
+
+>>>>>>> 525edb731d8b6321aea2f286716992d30ef462b1
 - A band-wide static crash (lightning) no longer starts tracks across the
   band, and running tracks no longer decode it as extra dits; new
   `[detector].crash_filter`, default `"full"` (MAN-312).

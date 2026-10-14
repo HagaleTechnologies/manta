@@ -236,6 +236,20 @@ station_callsign = "N0CALL"
 # directory. Unset: the built-in copy. --scp overrides it.
 #scp_path = "MASTER.SCP"
 
+# How many times a call must repeat before it is spotted, by how common its
+# callsign pattern is (the call's first 2-4 characters, then @ for each
+# letter and # for each digit, so K5ARH is K5@@@). "normal": 2 for a common
+# pattern, 3 for a rare one, 5 for one not in the pattern list. "minimal":
+# 2 for every call (manta before 0.2). Allowlisted calls and beacons are
+# exempt either way. Changes need a restart.
+#validation_level = "normal"
+
+# Callsign-pattern list used in place of the copy built into manta (derived
+# from MASTER.SCP). One pattern per line, a leading + marks a common one, `#`
+# starts a comment: "+K5@@@". Relative to this file's directory. Unset: the
+# built-in copy. --patterns overrides it. Changes need a restart.
+#pattern_path = "patterns.lst"
+
 
 # --- Signal detection --------------------------------------------------------
 # When a signal becomes a track that gets decoded, and when the track ends.
