@@ -119,6 +119,38 @@ fn a_redirected_daemon_log_has_no_escape_codes() {
     assert!(has_banner(&stderr), "no plain banner line: {stderr}");
 }
 
+/// MAN-196: a decimated capture states its usable passband once at
+/// startup -- one stderr info line, before the readiness marker, in the
+/// static-crash notice position. The fixture is v1 at its native 96 kS/s,
+/// so `--capture-rate-hz 48000` puts a real decimator in the path.
+#[test]
+fn a_decimated_capture_states_its_usable_passband_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let line = "decimated capture 48000 Hz: usable passband -21725 to 21725 Hz; \
+                channels beyond (decimator transition band) are not tracked";
+    let decimated = stderr_of(&daemon(
+        dir.path(),
+        &["--capture-rate-hz", "48000"],
+        &[("RUST_LOG", "info")],
+    ));
+    assert_eq!(
+        decimated.lines().filter(|l| l.contains(line)).count(),
+        1,
+        "the usable-passband line must appear exactly once: {decimated}"
+    );
+    let line_at = decimated.find(line).expect("line present");
+    let ready_at = decimated.find(READY).expect("readiness marker");
+    assert!(
+        line_at < ready_at,
+        "the usable-passband line must precede the readiness marker: {decimated}"
+    );
+
+    // Without --capture-rate-hz the line never appears: the
+    // non-decimated path is unchanged in every observable respect.
+    let plain = stderr_of(&daemon(dir.path(), &[], &[("RUST_LOG", "info")]));
+    assert!(!plain.contains("decimated capture"), "{plain}");
+}
+
 #[test]
 fn quiet_keeps_warnings_and_drops_info() {
     let dir = tempfile::tempdir().unwrap();

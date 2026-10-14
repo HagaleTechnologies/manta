@@ -131,6 +131,21 @@ pub trait IqSource {
         let half = self.sample_rate() / 2.0;
         (-half, half)
     }
+
+    /// MAN-196: the band inside which this source's own filtering keeps
+    /// channels within 1 dB of flat, as `(lo, hi)` Hz relative to the
+    /// centre. `None` (the default) means every channel is trusted --
+    /// today's behaviour for every non-decimated source, whose delivered
+    /// spectrum needs no additional boundary beyond `rf_passband_hz`.
+    /// `DecimatingSource` overrides this from its decimator's
+    /// `trusted_half_bandwidth_hz()`; consumers advertise it (the usable
+    /// passband) and may veto track spawns beyond it. A source whose
+    /// trusted band is narrower than its `rf_passband_hz` clips the
+    /// passband it reports to the trusted band, so the two never
+    /// disagree.
+    fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+        None
+    }
     /// Fill `buf`, returning the number of samples written; 0 = EOF.
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize>;
 

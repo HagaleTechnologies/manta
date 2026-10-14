@@ -278,10 +278,12 @@ struct Segment {
     pad_hops: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn new_segment(
     fs: f64,
     center_freq_hz: f64,
     rf_passband_hz: (f64, f64),
+    trusted_band_hz: Option<(f64, f64)>,
     cfg: &PipelineConfig,
     next_id: u32,
     quality: Option<Arc<DecodeQualityObserver>>,
@@ -304,6 +306,13 @@ fn new_segment(
     // MAN-312 (SPEC §2.7): judge static crashes over the source's real
     // passband, not channels that only carry the stream's residual noise.
     tm.set_rf_passband_hz(rf_passband_hz.0, rf_passband_hz.1);
+    // MAN-196: never spawn tracks outside the source's trusted band (the
+    // decimator's <= 1 dB boundary on a decimated capture; `None`, no
+    // decimator, leaves the manager exactly as it was). Spawns-only per
+    // segment, same threading as the RF passband above.
+    if let Some((lo, hi)) = trusted_band_hz {
+        tm.set_trusted_band_hz(lo, hi);
+    }
     // MAN-118: a post-discontinuity segment keeps reporting.
     tm.set_quality_observer(quality);
     // MAN-324: a post-discontinuity segment keeps the live occupancy window.
@@ -480,6 +489,11 @@ pub fn listen_with_observers(
     let fs = src.sample_rate();
     let center_freq_hz = src.center_freq_hz();
     let rf_passband_hz = src.rf_passband_hz();
+    // MAN-196: the source's trusted band, read once beside the RF
+    // passband and applied to every segment (including the
+    // discontinuity rebuild below) -- `None` for every non-decimated
+    // source leaves each segment's manager exactly as before.
+    let trusted_band_hz = src.trusted_band_hz();
 
     let mut validator = cfg.validator(fs)?;
     // MAN-324: the live tap turns the validator's decision log on per
@@ -528,6 +542,7 @@ pub fn listen_with_observers(
         fs,
         center_freq_hz,
         rf_passband_hz,
+        trusted_band_hz,
         cfg,
         1,
         observers.decode_quality.clone(),
@@ -660,6 +675,7 @@ pub fn listen_with_observers(
                 fs,
                 center_freq_hz,
                 rf_passband_hz,
+                trusted_band_hz,
                 cfg,
                 next_id,
                 observers.decode_quality.clone(),
@@ -991,6 +1007,29 @@ mod tests {
         }
     }
 
+    /// MAN-196: a source that reports a trusted band, as a decimated one
+    /// does (`DecimatingSource`). `None` mimics every non-decimated
+    /// source (the trait default).
+    struct TrustedBandSource {
+        inner: FixedFreqSource,
+        trusted_band_hz: Option<(f64, f64)>,
+    }
+
+    impl manta_input::IqSource for TrustedBandSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.sample_rate()
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz()
+        }
+        fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+            self.trusted_band_hz
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
     /// Runs `listen_with_observers` with a static-crash observer, returning
     /// the value it held at every `on_tracks` call.
     fn static_crash_readings(src: Box<dyn manta_input::IqSource>) -> Vec<u64> {
@@ -1055,6 +1094,86 @@ mod tests {
         assert_eq!(readings.last(), Some(&0), "{readings:?}");
     }
 
+    /// MAN-196: `listen` reads the source's trusted band once and
+    /// threads it into every segment's track manager -- including the
+    /// discontinuity rebuild's fresh segment -- so a real, detectable CW
+    /// signal beyond the band never spawns a track, while a source
+    /// without a band (`None`, every non-decimated source) spawns as
+    /// before.
+    #[test]
+    fn listen_vetoes_spawns_beyond_the_sources_trusted_band() {
+        // +23_500 Hz / SNR 10 dB on a 48 kS/s stream: beyond the
+        // 21_724.8 Hz trusted boundary, at the offset/SNR of the measured
+        // duplicate-track cell (research section 2). The native-48k
+        // control there spawned one track: the signal is real and
+        // detectable, so the control below asserting >= 1 promotion pins
+        // detectability, not the duplicate itself.
+        let mut spec = manta_testkit::vectors::v1();
+        spec.fs = 48_000.0;
+        spec.duration_s = 20.0;
+        spec.signals[0].offset_hz = 23_500.0;
+        spec.signals[0].snr_2500_db = 10.0;
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let trusted = manta_dsp::decimate::TRUSTED_HALF_BAND_FRACTION * 48_000.0;
+
+        let promotions = |src: Box<dyn manta_input::IqSource>| {
+            let mut n = 0usize;
+            listen(
+                src,
+                &PipelineConfig::default(),
+                Arc::new(AtomicBool::new(false)),
+                |ev| {
+                    if matches!(ev, DecoderEvent::TrackPromoted { .. }) {
+                        n += 1;
+                    }
+                },
+                |_| {},
+            )
+            .unwrap();
+            n
+        };
+        let fixed = || FixedFreqSource {
+            samples: rendered.samples.clone(),
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        };
+
+        // Control, no trusted band (the trait default): the signal spawns.
+        assert!(
+            promotions(Box::new(fixed())) >= 1,
+            "native control must detect the signal"
+        );
+
+        // With the trusted band: zero promotions over the whole render.
+        assert_eq!(
+            promotions(Box::new(TrustedBandSource {
+                inner: fixed(),
+                trusted_band_hz: Some((-trusted, trusted)),
+            })),
+            0,
+            "no track may spawn beyond the trusted band"
+        );
+
+        // ...and across a mid-stream discontinuity: the rebuild path
+        // applies the same band (read once, applied per segment).
+        let half = rendered.samples.len() / 2;
+        assert_eq!(
+            promotions(Box::new(
+                GapSource::new(
+                    rendered.samples.clone(),
+                    spec.fs,
+                    spec.center_freq_hz,
+                    48_000
+                )
+                .arm_after_samples(half)
+                .with_trusted_band(Some((-trusted, trusted)))
+            )),
+            0,
+            "the post-discontinuity segment must keep the trusted band"
+        );
+    }
+
     /// MAN-73 test double: serves `samples` on a loop. Once the cumulative
     /// number of samples served reaches `arm_at` (default: the full
     /// vector length, i.e. "after exhaustion"), the *next* `read()` call
@@ -1077,6 +1196,9 @@ mod tests {
         served: usize,
         armed: bool,
         pending_gap: Option<u64>,
+        /// MAN-196: the trusted band this double reports (`None` unless
+        /// `with_trusted_band` set one).
+        trusted_band: Option<(f64, f64)>,
         /// Set once `take_discontinuity()` has handed the gap to `listen()`,
         /// so a test can tell the events `listen()` emits after the
         /// discontinuity from those before it.
@@ -1097,6 +1219,7 @@ mod tests {
                 served: 0,
                 armed: false,
                 pending_gap: None,
+                trusted_band: None,
                 gap_taken: Arc::new(AtomicBool::new(false)),
             }
         }
@@ -1109,6 +1232,12 @@ mod tests {
             self.chunk_cap = (k / 4).max(64);
             self
         }
+
+        /// MAN-196: report a trusted band, as a decimated source would.
+        fn with_trusted_band(mut self, band: Option<(f64, f64)>) -> Self {
+            self.trusted_band = band;
+            self
+        }
     }
 
     impl manta_input::IqSource for GapSource {
@@ -1117,6 +1246,9 @@ mod tests {
         }
         fn center_freq_hz(&self) -> f64 {
             self.center_freq_hz
+        }
+        fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+            self.trusted_band
         }
         fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
             if !self.armed && self.served >= self.arm_at {

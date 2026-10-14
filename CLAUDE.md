@@ -236,6 +236,17 @@ replaced by `--patterns` / `[spot].pattern_path`; allowlist and beacon
 exemptions stay. Live decisions report `requiredReps` and `patternTier`.
 See docs/DECISIONS/2026-10-14-man95-pattern-rarity-repetition-tiers.md.
 
+MAN-196: a decimated capture advertises and enforces the decimator's
+trusted band (`manta-dsp::decimate::TRUSTED_HALF_BAND_FRACTION = 0.4526`
+of fs_out, the <= 1 dB crossover): `DecimatingSource::rf_passband_hz`
+narrows `manta check`/SETT/bandState/crash live set to it, `run`/`soak`
+print one startup line, and the track manager's spawn scan vetoes
+channels beyond it (spawns only — MAN-314's lesson), via
+`IqSource::trusted_band_hz` threaded through `listen`. Rim channels
+232-255 per side at 48 kS/s are conceded by design; non-decimated sources
+are bit-identical to before. See
+docs/DECISIONS/2026-10-14-man196-decimator-trusted-band.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each

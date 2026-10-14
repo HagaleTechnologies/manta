@@ -1668,6 +1668,14 @@ impl IqSource for FixedCenterFreqSource {
         self.inner.rf_passband_hz()
     }
 
+    /// MAN-196: same forwarding duty as `rf_passband_hz` above -- the
+    /// wrapped decimator's trusted band must reach the run/soak startup
+    /// notice and the track manager's spawn veto; the override relocates
+    /// the centre only, and the band is offsets from the centre.
+    fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+        self.inner.trusted_band_hz()
+    }
+
     fn read(&mut self, buf: &mut [num_complex::Complex32]) -> Result<usize> {
         self.inner.read(buf)
     }
@@ -5186,6 +5194,13 @@ fn run_command() -> Result<std::process::ExitCode> {
             // logged just before decoding starts (below).
             let crash_live =
                 manta_engine::crash_live_channels(first.sample_rate(), first.rf_passband_hz());
+            // MAN-196: the source's trusted band, read once here while
+            // `first` is in hand (before `wrap_file_replay` and `listen`
+            // take ownership); `Some` only when a decimator is in the
+            // path (`--capture-rate-hz`/`input.capture_rate_hz`). Logged
+            // beside the crash notice below, before the readiness marker.
+            let trusted_band = first.trusted_band_hz();
+            let trusted_band_fs_hz = first.sample_rate();
 
             // MAN-122 review round 6 (P2): installed HERE -- before
             // `start_spot_server` binds the sockets and logs the
@@ -5532,6 +5547,20 @@ fn run_command() -> Result<std::process::ExitCode> {
                 tracing::info!(
                     "static-crash filter inactive: the source passband holds {crash_live} channels, fewer than the {} it needs",
                     manta_engine::CRASH_MIN_LIVE_CHANNELS
+                );
+            }
+            // MAN-196: a decimated capture states its usable passband
+            // once, at the same point as the crash notice -- after the
+            // servers bound, before the readiness marker -- so an
+            // operator who chose `--capture-rate-hz` for its nominal
+            // Nyquist width learns the channels beyond the decimator's
+            // <= 1 dB trusted band are not tracked. No line at all
+            // without a decimator: the non-decimated path is unchanged
+            // in every observable respect.
+            if let Some((lo, hi)) = trusted_band {
+                tracing::info!(
+                    "decimated capture {trusted_band_fs_hz:.0} Hz: usable passband {lo:.0} to {hi:.0} Hz; \
+                     channels beyond (decimator transition band) are not tracked"
                 );
             }
             if reload_enabled {

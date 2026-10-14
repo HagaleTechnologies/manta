@@ -28,6 +28,15 @@ pub struct DecimatingSource {
     inner: Box<dyn IqSource>,
     decimator: Decimator,
     fs_out: f64,
+    /// MAN-196: the decimator's <= 1 dB half-bandwidth, captured at
+    /// construction (a constant multiply -- zero per-read cost) so both
+    /// `rf_passband_hz` and `trusted_band_hz` derive from one number.
+    /// `None` for a factor-1 wrap (zero cascade stages: a pure
+    /// pass-through with no filter, hence no transition band to exclude
+    /// -- every channel is trusted). The CLI never builds one
+    /// (`maybe_decimate` skips the wrap when the target equals the
+    /// native rate), but this wrapper's contract allows it.
+    trusted_half: Option<f64>,
     /// Decimated samples produced by a prior inner read that didn't fit
     /// in the caller's buffer -- carried over so no decimated sample is
     /// ever dropped just because the caller's buffer was smaller than one
@@ -58,10 +67,12 @@ impl DecimatingSource {
         }
         let decimator = Decimator::new(fs_in, factor).map_err(|e| anyhow::anyhow!(e))?;
         let fs_out = decimator.fs_out();
+        let trusted_half = (factor >= 2).then(|| decimator.trusted_half_bandwidth_hz());
         Ok(DecimatingSource {
             inner,
             decimator,
             fs_out,
+            trusted_half,
             pending: VecDeque::new(),
             raw: vec![Complex32::new(0.0, 0.0); RAW_CHUNK_SAMPLES * factor],
         })
@@ -78,15 +89,38 @@ impl IqSource for DecimatingSource {
     }
 
     /// MAN-86: the inner source's delivered passband, clipped to the
-    /// decimated Nyquist span -- the anti-alias low-pass removes anything
-    /// beyond `+/- fs_out / 2`. Without this override the trait default
-    /// would report the full output Nyquist span, re-introducing the
-    /// "advertise the processing rate" SETT bug for a decimated rig-audio
-    /// or KiwiSDR source (see `IqSource::rf_passband_hz`).
+    /// band the decimator actually delivers usefully. MAN-196 narrows
+    /// that clip from the raw output Nyquist (`+/- fs_out / 2`) to the
+    /// decimator's **trusted band** (`+/- trusted_half`, the <= 1 dB
+    /// crossover of the halfband design): everything beyond it is
+    /// transition band, 6-39 dB down by the Nyquist edge, so advertising
+    /// it as usable passband promises spectrum the filter has already
+    /// attenuated. A factor-1 wrap (no stages, `trusted_half == None`)
+    /// keeps the plain Nyquist clip -- a pass-through filters nothing.
+    /// Without this override the trait default would report the full
+    /// output Nyquist span, re-introducing the "advertise the processing
+    /// rate" SETT bug for a decimated rig-audio or KiwiSDR source (see
+    /// `IqSource::rf_passband_hz`). The inner clip stays as a defensive
+    /// intersection, subsumed by the trusted clip (the trusted
+    /// half-bandwidth is always below `fs_out / 2`).
     fn rf_passband_hz(&self) -> (f64, f64) {
         let half = self.fs_out / 2.0;
         let (lo, hi) = self.inner.rf_passband_hz();
-        (lo.max(-half), hi.min(half))
+        match self.trusted_half {
+            Some(t) => (lo.max(-half).max(-t), hi.min(half).min(t)),
+            None => (lo.max(-half), hi.min(half)),
+        }
+    }
+
+    /// MAN-196: the decimator's <= 1 dB trusted band, `(lo, hi)` Hz
+    /// relative to the centre. Consumers use it to veto track spawns
+    /// beyond the boundary (the transition band's frequency-estimate
+    /// corruption, duplicate tracks and foldover promotions all measured
+    /// beyond it); `rf_passband_hz` above already reports the same band,
+    /// so advertisement and veto can never disagree. `None` for a
+    /// factor-1 pass-through wrap (no filter, no transition band).
+    fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+        self.trusted_half.map(|t| (-t, t))
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
@@ -384,7 +418,8 @@ mod tests {
 
     /// MAN-86: a decimated source must report the inner source's delivered
     /// passband (so SETT never advertises the processing rate), clipped to
-    /// the post-decimation Nyquist span.
+    /// the band the decimator delivers usefully -- MAN-196: the trusted
+    /// band, not the raw output Nyquist.
     #[test]
     fn rf_passband_forwards_the_inner_passband_clipped_to_the_output_nyquist() {
         struct NarrowSource;
@@ -406,6 +441,9 @@ mod tests {
         assert_eq!(narrow.rf_passband_hz(), (300.0, 3_000.0));
 
         // Inner default = full 192 kS/s Nyquist span; output is 48 kS/s.
+        // MAN-196: the clip is the decimator's trusted band
+        // (TRUSTED_HALF_BAND_FRACTION * 48_000 = 21_724.8 Hz), no longer
+        // the 24_000 Hz output Nyquist.
         let wide: Box<dyn IqSource> = Box::new(InMemorySource {
             samples: Vec::new(),
             cursor: 0,
@@ -415,6 +453,84 @@ mod tests {
             counters: None,
         });
         let wide = DecimatingSource::new(wide, 48_000.0).unwrap();
-        assert_eq!(wide.rf_passband_hz(), (-24_000.0, 24_000.0));
+        assert_eq!(wide.rf_passband_hz(), (-21_724.8, 21_724.8));
+    }
+
+    /// MAN-196: the reported usable passband is the trusted band, not the
+    /// decimated Nyquist -- the transition band beyond the <= 1 dB
+    /// crossover is spectrum the filter has already attenuated.
+    #[test]
+    fn rf_passband_is_clipped_to_the_trusted_band_not_the_nyquist() {
+        let expected = manta_dsp::decimate::TRUSTED_HALF_BAND_FRACTION * 48_000.0;
+        assert!((expected - 21_724.8).abs() < 1e-9);
+        let wide: Box<dyn IqSource> = Box::new(InMemorySource {
+            samples: Vec::new(),
+            cursor: 0,
+            fs: 192_000.0,
+            center_freq_hz: 14_000_000.0,
+            live: None,
+            counters: None,
+        });
+        let wide = DecimatingSource::new(wide, 48_000.0).unwrap();
+        let (lo, hi) = wide.rf_passband_hz();
+        assert!((lo - -expected).abs() < 1e-9, "lo {lo}");
+        assert!((hi - expected).abs() < 1e-9, "hi {hi}");
+        // NOT the Nyquist: the boundary must sit strictly inside 24 kHz.
+        assert!(lo > -24_000.0 && hi < 24_000.0);
+    }
+
+    /// MAN-196: `trusted_band_hz` reports the decimator boundary for a
+    /// decimated source and `None` (the trait default) without one.
+    #[test]
+    fn trusted_band_hz_reports_the_decimator_boundary() {
+        let expected = manta_dsp::decimate::TRUSTED_HALF_BAND_FRACTION * 48_000.0;
+        let decimated = DecimatingSource::new(
+            Box::new(InMemorySource {
+                samples: Vec::new(),
+                cursor: 0,
+                fs: 192_000.0,
+                center_freq_hz: 14_000_000.0,
+                live: None,
+                counters: None,
+            }),
+            48_000.0,
+        )
+        .unwrap();
+        assert_eq!(decimated.trusted_band_hz(), Some((-expected, expected)));
+
+        // A bare source with no decimator: the trait default, no boundary.
+        let bare = InMemorySource {
+            samples: Vec::new(),
+            cursor: 0,
+            fs: 48_000.0,
+            center_freq_hz: 14_000_000.0,
+            live: None,
+            counters: None,
+        };
+        assert_eq!(bare.trusted_band_hz(), None);
+    }
+
+    /// MAN-196: a factor-1 wrap (target == native rate, zero cascade
+    /// stages) is a pure pass-through: no filter, no transition band, so
+    /// it must neither report a trusted band nor narrow the advertised
+    /// passband. The CLI never builds one (`maybe_decimate` skips the
+    /// wrap for an equal rate); this pins the wrapper's own honesty.
+    #[test]
+    fn a_factor_one_pass_through_has_no_trusted_band() {
+        let src = DecimatingSource::new(
+            Box::new(InMemorySource {
+                samples: Vec::new(),
+                cursor: 0,
+                fs: 48_000.0,
+                center_freq_hz: 14_000_000.0,
+                live: None,
+                counters: None,
+            }),
+            48_000.0,
+        )
+        .unwrap();
+        assert_eq!(src.sample_rate(), 48_000.0);
+        assert_eq!(src.trusted_band_hz(), None);
+        assert_eq!(src.rf_passband_hz(), (-24_000.0, 24_000.0));
     }
 }
