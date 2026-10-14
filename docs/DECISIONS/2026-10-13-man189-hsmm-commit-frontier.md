@@ -46,7 +46,10 @@ Consequences, each pinned by a unit test in `hsmm::commit::tests` or
 4. A conflicting segmentation that ends before the committed close is
    stripped (the out-of-order `T@1611 after B@1795` class).
 5. A word boundary at the same gap as an emitted character, from the WGap
-   lineage after the CGap lineage won, is still emitted once.
+   lineage after the CGap lineage won, is still emitted once when that
+   lineage began the character at the same anchor. Rule 9 strips it when
+   the lineage agrees on the glyph but began it at another anchor (see
+   below).
 6. A second word boundary for the same character is stripped.
 7. A late word boundary behind a later character is stripped.
 8. Output `sample_ts` never decreases within a track.
@@ -59,6 +62,19 @@ after self-review found the leak; the plan's rule had only the first two
 word-boundary conditions. Re-measured on the implement build, it removes
 5 spurious word boundaries from V5 (CER 1.1771 → 1.1406) and leaves the
 decoded text of the other 14 vectors unchanged.
+
+Rule 9 compares starts, not glyphs, so it also strips the word boundary
+of a lineage that agrees on the emitted glyph but placed its first mark
+at another anchor. Validation reproduced two such cases, where the space
+is lost and two words merge: `[G start40 @100]` and
+`[G start48 @100, Word]` committed together, and, after `G start40
+@100`, `[G start52 @104, Word, H start150 @200]`, which emits only `H`.
+Comparing glyphs instead keeps both spaces, but on V8/hsmm it emits a
+boundary every live lineage agrees on after `K2ST`'s T (sample 2168320),
+the text reads `DE K2ST T`, and the bogus spot `K2ST` returns, so
+`v8_pileup_validates_at_least_45_of_50_with_hsmm_engine` fails. Neither
+comparison is right in both cases. The start comparison stays until the
+trade-off is decided.
 
 ## Mechanism and evidence
 

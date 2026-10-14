@@ -69,8 +69,11 @@ pub fn margin(tokens: &[Token], j: usize, cfg: &HsmmConfig) -> (f32, Vec<(Glyph,
 /// segmentation that contradicts what was emitted. A word boundary is
 /// decided once one was emitted at or after its character's start, when
 /// its gap began before the latest emitted entry, or when its character
-/// is decided but is not the character last emitted (it follows a
-/// contradicting segmentation). Every check is O(1) and needs no pruning.
+/// is decided but began at another anchor than the character last
+/// emitted. That catches a boundary after a contradicting segmentation,
+/// but also drops one after a lineage that agrees on the glyph and placed
+/// its first mark elsewhere (see the MAN-189 decision record). Every
+/// check is O(1) and needs no pruning.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Frontier {
     /// `sample_ts` of the latest emitted entry of either kind.
