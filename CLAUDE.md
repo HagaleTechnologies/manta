@@ -220,7 +220,6 @@ pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
 planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
-<<<<<<< HEAD
 MAN-192: the HSMM decoder reseeds after a committed Silence segment, not
 only on a present re-onset (SPEC v2 §4.7's second trigger), carrying the
 closing segment in `HistEntry::closing_segment` and a scored-prefix
@@ -229,14 +228,13 @@ count (`scored_live_len`) that replaces the zero-score seed heuristic in
 reseeds; snapshots stay within `beam + seed set`. The `hsmm` engine
 stays non-default with its stage-2 gate still failing. See
 docs/DECISIONS/2026-10-14-man192-silence-reseed.md.
-=======
+
 MAN-95: `[spot].validation_level` defaults to `normal`: common, listed and
 unlisted callsign patterns need 2, 3 and 5 distinct-message repetitions.
 `minimal` keeps flat 2. The independent list derived from MASTER.SCP is
 replaced by `--patterns` / `[spot].pattern_path`; allowlist and beacon
 exemptions stay. Live decisions report `requiredReps` and `patternTier`.
 See docs/DECISIONS/2026-10-14-man95-pattern-rarity-repetition-tiers.md.
->>>>>>> 525edb731d8b6321aea2f286716992d30ef462b1
 
 ## Documents (read in this order)
 
