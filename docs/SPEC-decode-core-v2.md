@@ -209,6 +209,9 @@ then reports the FIR output. No hop is dropped and none is fed as
 `llr = 0`. Historical note: when this section was written the call site was
 deferred to MAN-168, and the text asked MAN-168 to re-derive the 16 ms
 rise-time budget against the real implementation before wiring it.
+End-to-end coverage: golden vector V51 (SPEC §7, MAN-210) decodes V9's
+drift scene with `refine_bw_hz = 30` through `manta decode --json
+--config`, asserting both drain protocols and decode quality.
 
 ---
 

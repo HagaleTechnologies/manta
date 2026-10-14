@@ -1,5 +1,6 @@
 //! SPEC §7 V7/V9/V10 golden gates (M2 sub-project 2: real multi-track
-//! detector). V10 is added in Task 10.
+//! detector). V10 is added in Task 10; V51 (MAN-210) is V9's scene
+//! decoded with the narrowband refiner on.
 
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -162,6 +163,81 @@ fn v10_passes_end_to_end_from_wav() {
             && decoded_words <= expected_words + FARNSWORTH_BOOTSTRAP_WORD_TOLERANCE,
         "word boundary count outside the documented Farnsworth-bootstrap tolerance: expected {expected_words} (+0..={FARNSWORTH_BOOTSTRAP_WORD_TOLERANCE}), decoded {decoded_words}\nexpected: {:?}\ndecoded:  {decoded:?}",
         manifest.keyed_texts[0]
+    );
+}
+
+/// Writes `body` to `dir/name` and returns that path (`cli.rs`'s
+/// `write_cfg`, copied per test binary: `tests/common/mod.rs` is for
+/// signal/daemon plumbing).
+fn write_cfg(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+// MAN-210: the narrowband refiner (`refine_bw_hz > 0`) end-to-end.
+// Same scene as V9 -- its +50 Hz/min drift crosses the 93.75 Hz
+// channel grid mid-scene, firing `decoder_input`'s reset-drain branch
+// (MAN-194) through the real channelizer, and every decode ends in
+// `TrackManager::finish`'s end-of-stream drain. Refine-on must hold
+// V9's own bars and must measurably change the pipeline's output.
+#[test]
+fn v51_drift_with_refiner_enabled_passes_end_to_end() {
+    let spec = manta_testkit::vectors::v9();
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = manta_testkit::vectors::write_v9_fixture_set(&spec, dir.path()).unwrap();
+    let wav = dir.path().join("v9.wav");
+    let cfg = write_cfg(
+        dir.path(),
+        "refine30.toml",
+        "[decode]\nrefine_bw_hz = 30.0\n",
+    );
+
+    let run = |extra: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
+        cmd.args(["decode", "--json"]);
+        for a in extra {
+            cmd.arg(a);
+        }
+        let out = cmd.arg(&wav).output().unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+
+    let control = run(&[]);
+    let refined = run(&["--config", cfg.to_str().unwrap()]);
+
+    // Non-vacuity: decode is deterministic on file input, so if the
+    // config were silently ignored the two reports would be identical.
+    // (Probe-measured 2026-10-14: events 362 vs 363, reports differ.)
+    assert_ne!(
+        control, refined,
+        "refine_bw_hz = 30.0 must reach the pipeline; identical reports \
+         mean the config was dropped"
+    );
+
+    let tracks = per_track(&refined);
+    assert_eq!(
+        tracks.len(),
+        1,
+        "V51 must not split into multiple tracks under drift with the refiner on"
+    );
+    let (_, (decoded_text, freq)) = tracks.iter().next().unwrap();
+    let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded_text);
+    assert!(
+        cer <= 0.10,
+        "V51 char accuracy must be >= 90%, got CER {cer}"
+    );
+    let freq = freq.expect("TrackMeta freq_hz must have fired at least once");
+    assert!(
+        (freq - manifest.expected_freq_hz).abs() <= 15.0,
+        "V51 final freq {freq} expected {} (err {})",
+        manifest.expected_freq_hz,
+        (freq - manifest.expected_freq_hz).abs()
     );
 }
 
