@@ -1161,4 +1161,122 @@ mod tests {
             "the second commit, 117 hops (< 10*u_max_live) after the first, must reseed too"
         );
     }
+
+    /// MAN-192 phase 3: repeated recovery over a long run. Twelve
+    /// mark(20)/gap(97) cycles -- each a distinct eligible Silence
+    /// boundary commit on a gate that never drops -- must each reseed;
+    /// a subsequent fallback-anchor tail carries the run past
+    /// `80 * cfg.u_max` (4480) hops with every snapshot inside the
+    /// `beam + seed set` bound, anchors expiring instead of
+    /// accumulating, and the whole commit stream byte-identical on
+    /// replay.
+    #[test]
+    fn man192_repeated_recovery_is_bounded_and_deterministic() {
+        let build_events = || {
+            let mut events = Vec::new();
+            events.push(man192_ev(100, true, true, 0.0));
+            for k in 0..12u64 {
+                let mark_hop = 120 + 117 * k;
+                let gap_hop = mark_hop + 97;
+                let prefix = 200.0 * (k as f64 + 1.0);
+                events.push(man192_ev(mark_hop, true, true, prefix));
+                events.push(man192_ev(gap_hop, true, true, prefix));
+            }
+            // Fallback-anchor tail (every 8 hops, evidence frozen, gate
+            // stuck high) past 80*cfg.u_max = 4480 hops from the start.
+            let last_gap = 217 + 117 * 11;
+            let mut hop = last_gap + 8;
+            while hop < 4700 {
+                events.push(man192_ev(hop, true, true, 2400.0));
+                hop += 8;
+            }
+            events
+        };
+        let run = |events: Vec<HopEvidence>| {
+            let mut dec = HsmmDecoder::new(man192_cfg(&[9.0, 13.0]));
+            let mut commits = Vec::new();
+            let mut reseed_snapshots = 0usize;
+            for ev in &events {
+                let out = dec.push(ev);
+                for c in &out {
+                    commits.push((
+                        c.glyph,
+                        c.sample_ts,
+                        c.confidence.to_bits(),
+                        c.alternatives
+                            .iter()
+                            .map(|(g, s)| (*g, s.to_bits()))
+                            .collect::<Vec<_>>(),
+                    ));
+                }
+                assert!(
+                    dec.live.len() <= dec.cfg.beam + dec.cfg.seed_units_hops.len(),
+                    "hop {}: snapshot bound beam + seed set exceeded: {}",
+                    ev.hop,
+                    dec.live.len()
+                );
+                assert!(
+                    dec.scored_live_len <= dec.cfg.beam,
+                    "hop {}: scored prefix exceeds the beam: {}",
+                    ev.hop,
+                    dec.scored_live_len
+                );
+                assert!(
+                    dec.anchors.len() < 600,
+                    "hop {}: anchors must expire, not accumulate: {}",
+                    ev.hop,
+                    dec.anchors.len()
+                );
+                if ev.hop == 217 + 117 * 11 + 8 {
+                    // The previous push (the last cycle's gap anchor)
+                    // reseeded, so live holds the u=13 seed and this push
+                    // pruned with reach_sil = 80*13 = 1040: every anchor
+                    // from the early cycles must be gone.
+                    assert!(
+                        dec.anchors.front().map(|a| a.hop) > Some(472),
+                        "old anchors must expire: front is {:?}",
+                        dec.anchors.front().map(|a| a.hop)
+                    );
+                }
+                let raw: Vec<f32> = dec.live[dec.scored_live_len..]
+                    .iter()
+                    .map(|t| t.u)
+                    .collect();
+                if raw == vec![9.0, 13.0] {
+                    reseed_snapshots += 1;
+                }
+            }
+            (commits, reseed_snapshots)
+        };
+        let events = build_events();
+        let span = events.last().unwrap().hop - events.first().unwrap().hop;
+        assert!(
+            span > (80.0 * 56.0) as u64,
+            "the run must exceed 80*cfg.u_max, span {span}"
+        );
+        let (commits, reseed_snapshots) = run(events.clone());
+        // Every one of the twelve cycles committed a Silence boundary and
+        // reseeded. (The tail may add more reseed snapshots through junk
+        // Silence commits, which the no-cooldown rule deliberately allows.)
+        assert!(
+            reseed_snapshots >= 12,
+            "every distinct committed Silence must reseed; saw {reseed_snapshots}"
+        );
+        let boundary_ts: Vec<u64> = commits
+            .iter()
+            .filter(|(g, _, _, _)| g.is_none())
+            .map(|(_, ts, _, _)| *ts)
+            .collect();
+        for k in 0..12u64 {
+            assert!(
+                boundary_ts.contains(&((120 + 117 * k) * 256)),
+                "cycle {k} must commit its boundary at the mark anchor's ts"
+            );
+        }
+        // Determinism: replaying the identical sequence reproduces the
+        // serialized commit stream exactly.
+        let (commits2, reseed_snapshots2) = run(events);
+        assert_eq!(commits, commits2, "replay must be byte-identical");
+        assert_eq!(reseed_snapshots, reseed_snapshots2);
+    }
 }

@@ -24,6 +24,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-192: the opt-in `hsmm` engine now reseeds its speed hypotheses
+  after a committed `Silence` segment even when the keying-present gate
+  never re-opens (interference holding it high through the gap), as
+  SPEC v2 §4.7 always required, so a transmission resuming at a
+  different speed competes with fresh hypotheses instead of decoding
+  from the surviving speed alone. `decode.engine` remains `legacy` by
+  default; output changes only for `hsmm` runs with such gate-stuck
+  gaps.
 - A band-wide static crash (lightning) no longer starts tracks across the
   band, and running tracks no longer decode it as extra dits; new
   `[detector].crash_filter`, default `"full"` (MAN-312).
