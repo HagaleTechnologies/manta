@@ -337,7 +337,10 @@ mod tests {
                 if path.is_dir() {
                     stack.push(path);
                 } else {
-                    out.push(path.strip_prefix(dir).unwrap().display().to_string());
+                    // `/`-joined on every platform, so expectations read the same on Windows.
+                    let rel = path.strip_prefix(dir).unwrap();
+                    let parts: Vec<_> = rel.iter().map(|c| c.to_string_lossy()).collect();
+                    out.push(parts.join("/"));
                 }
             }
         }
