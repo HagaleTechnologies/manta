@@ -1730,9 +1730,11 @@ fn warn_if_audio_source_has_no_rf_reference(has_rf_aware_source: bool, dial_freq
 }
 
 /// MAN-196: the one startup line a decimated capture prints, naming its
-/// usable passband (the decimator's <= 1 dB trusted band). `run` logs it
-/// through `tracing::info!`; `soak`, which installs no subscriber, writes
-/// it straight to stderr.
+/// usable passband. `lo_hz`/`hi_hz` are the source's *intersected* RF
+/// passband (`rf_passband_hz()` -- the inner passband clipped to the
+/// decimator's <= 1 dB trusted band), so the line never claims spectrum
+/// the source does not deliver. `run` logs it through `tracing::info!`;
+/// `soak`, which installs no subscriber, writes it straight to stderr.
 fn trusted_band_notice(fs_out_hz: f64, lo_hz: f64, hi_hz: f64) -> String {
     format!(
         "decimated capture {fs_out_hz:.0} Hz: usable passband {lo_hz:.0} to {hi_hz:.0} Hz; \
@@ -5536,7 +5538,14 @@ fn run_command() -> Result<std::process::ExitCode> {
             // take ownership); `Some` only when a decimator is in the
             // path (`--capture-rate-hz`/`input.capture_rate_hz`). Logged
             // beside the crash notice below, before the readiness marker.
-            let trusted_band = first.trusted_band_hz();
+            // Round-1 review (PR #300): the notice states the band the
+            // source actually delivers -- `rf_passband_hz()`, the inner
+            // passband intersected with the trusted band -- so a
+            // decimation wrapping an already narrower source (a KiwiSDR's
+            // +/-5 kHz filter, a one-sided rig-audio passband) never
+            // claims a wider usable passband than `manta check` and SETT
+            // advertise for the same source.
+            let trusted_band = first.trusted_band_hz().map(|_| first.rf_passband_hz());
             let trusted_band_fs_hz = first.sample_rate();
 
             // MAN-122 review round 6 (P2): installed HERE -- before
@@ -6366,7 +6375,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             // MAN-196: the same usable-passband line `run` logs, once,
             // before the soak starts; `Some` only with a decimator in the
             // path. Plain stderr: `soak` installs no tracing subscriber.
-            if let Some((lo, hi)) = src.trusted_band_hz() {
+            // The values are the intersected `rf_passband_hz()`, exactly
+            // as `run`'s notice above (round-1 review, PR #300).
+            if let Some((lo, hi)) = src.trusted_band_hz().map(|_| src.rf_passband_hz()) {
                 eprintln!("{}", trusted_band_notice(src.sample_rate(), lo, hi));
             }
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
