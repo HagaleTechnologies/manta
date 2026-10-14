@@ -21,6 +21,7 @@ pub use calibrate::{calibrate, CalibrateOptions, CalibrationReport};
 pub mod doctor;
 pub use doctor::{doctor, DoctorReport, Verdict, MAX_DURATION, MIN_DURATION};
 pub mod soak;
+pub use manta_spot::reference::ReferenceLists;
 pub use manta_spot::{Blocklist, NotchList, Spot, SpotType};
 pub use soak::{soak, soak_passed, SoakReport};
 pub mod soak_metrics;

@@ -15,6 +15,9 @@ Then:
   `/status`.
 - [packaging/README.md](../packaging/README.md): running unattended under
   systemd, launchd or Docker Compose.
+- [Keeping cty.dat and MASTER.SCP current](../packaging/README.md#keeping-ctydat-and-masterscp-current):
+  downloading newer country-prefix and known-call lists without a release
+  (MAN-316).
 - [RUNBOOKS/monitoring.md](RUNBOOKS/monitoring.md): a ready Grafana dashboard
   and Prometheus alerts.
 - [GUIDES/ka9q-radio.md](GUIDES/ka9q-radio.md): feeding manta one

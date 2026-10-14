@@ -918,6 +918,12 @@ fn spec_documents_every_input_and_spot_key() {
                 "notch_path",
                 "cty_path",
                 "scp_path",
+                "refresh_lists",
+                "list_cache_dir",
+                "cty_url",
+                "scp_url",
+                "cty_sha256",
+                "scp_sha256",
                 "pattern_path",
                 "validation_level",
             ],
@@ -2110,7 +2116,7 @@ fn spot_schema_documents_uppercased_station_identity() {
 /// `# comment`, which TOML ignores.
 fn scaffold_settings() -> Vec<(String, String, String)> {
     let header = regex::Regex::new(r"^#?\[\[?([a-z_]+)\]\]?\s*$").unwrap();
-    let setting = regex::Regex::new(r"^#([a-z_]+) = (.*)$").unwrap();
+    let setting = regex::Regex::new(r"^#([a-z][a-z0-9_]*) = (.*)$").unwrap();
     let mut table = None;
     let mut out = Vec::new();
     for line in doc("crates/manta-cli/src/config_init.toml").lines() {
@@ -2217,7 +2223,7 @@ fn config_reference_lists_every_scaffold_key_with_its_default() {
 fn config_reference_lists_every_constant_only_key() {
     let md = doc(CONFIG_REF);
     let not_settable = section(&md, "Not settable");
-    let key = regex::Regex::new(r"^#\s*([a-z_]+)\s*=").unwrap();
+    let key = regex::Regex::new(r"^#\s*([a-z][a-z0-9_]*)\s*=").unwrap();
     let constants: Vec<String> = spec_section_9_toml()
         .lines()
         .filter(|l| l.contains("not configurable yet"))
