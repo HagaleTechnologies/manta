@@ -8,9 +8,9 @@ use std::fmt;
 
 /// CW Skimmer's validation-level scale (RttySkimServ manual: 0=minimal,
 /// 1=normal, 2=aggressive, 3=paranoid; "the RBN recommends a value of 1").
-/// manta's own validator (`manta-spot`) has no equivalent scale, so only
-/// the RBN-recommended level is ever emitted today -- an enum rather than a
-/// literal so a real mapping stays a local change.
+/// manta's validator supports Minimal (two repetitions for every call) and
+/// Normal (two, three or five by callsign-pattern rarity). The configured
+/// level is advertised to the Aggregator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationLevel {
     Minimal,
@@ -151,6 +151,16 @@ mod tests {
     /// rig-audio bounds existed.
     fn symmetric(bandwidth_hz: f64) -> (f64, f64) {
         (-bandwidth_hz / 2.0, bandwidth_hz / 2.0)
+    }
+
+    #[test]
+    fn minimal_validation_level_renders_vl_minimal() {
+        let s = SettSettings {
+            validation_level: ValidationLevel::Minimal,
+            cq_only: false,
+            segments: vec![(14_000_000.0, 14_070_000.0)],
+        };
+        assert_eq!(s.to_string(), "SETT: vlMinimal 14000.0-14070.0");
     }
 
     #[test]

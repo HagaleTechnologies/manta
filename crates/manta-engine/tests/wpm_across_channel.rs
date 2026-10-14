@@ -27,6 +27,8 @@ fn decode_at(wpm: f32, residual_ch: f64, snr_db: f32, seed: u64) -> (f64, f64) {
     let fs = 96_000.0;
     let duration_s = 60.0;
     let sig = SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: "CQ CQ DE W1AW W1AW K".into(),
         loop_text: true,
         wpm,

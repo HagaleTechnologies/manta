@@ -562,6 +562,16 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
         }) => {
             format!("input: type=hpsdr host={host} port={port} freq_hz={freq_hz} rate_hz={rate_hz}")
         }
+        Some(SourceFromFile::Ka9q {
+            group,
+            port,
+            ssrc,
+            interface,
+        }) => format!(
+            "input: type=ka9q group={group} port={port} ssrc={} interface={}",
+            ssrc.map_or("any".to_string(), |s| s.to_string()),
+            interface.map_or("default".to_string(), |i| i.to_string())
+        ),
     };
     let shared = &loaded.input.shared;
     for (key, value) in [
@@ -590,7 +600,7 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             .map_or("none".to_string(), |p| p.display().to_string())
     };
     lines.push(format!(
-        "spot: allowlist={} blocklist_path={} notch_path={} cty_path={} scp_path={}",
+        "spot: allowlist={} blocklist_path={} notch_path={} cty_path={} scp_path={} validation_level={} pattern_path={}",
         if loaded.spot.allowlist.is_empty() {
             "none".to_string()
         } else {
@@ -607,7 +617,9 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             .spot
             .scp_path
             .as_ref()
-            .map_or("bundled".to_string(), |p| p.display().to_string())
+            .map_or("bundled".to_string(), |p| p.display().to_string()),
+        loaded.spot.validation_level.as_str(),
+        loaded.spot.pattern_path.as_ref().map_or("bundled".to_string(), |p| p.display().to_string())
     ));
 
     let detector = set_keys(loaded, "detector", &[]);
@@ -1022,6 +1034,25 @@ mod tests {
         );
     }
 
+    /// MAN-140: both forms of the ka9q line (Design §2): the defaults, and
+    /// an explicit ssrc and interface.
+    #[test]
+    fn summary_line_for_a_ka9q_input() {
+        let lines = lines_of("[input]\ntype = \"ka9q\"\ngroup = \"239.101.6.1\"\n");
+        assert_eq!(
+            line(&lines, "input:"),
+            "input: type=ka9q group=239.101.6.1 port=5004 ssrc=any interface=default"
+        );
+        let lines = lines_of(
+            "[input]\ntype = \"ka9q\"\ngroup = \"239.101.6.1\"\nssrc = 14100000\n\
+             interface = \"192.168.1.20\"\n",
+        );
+        assert_eq!(
+            line(&lines, "input:"),
+            "input: type=ka9q group=239.101.6.1 port=5004 ssrc=14100000 interface=192.168.1.20"
+        );
+    }
+
     #[test]
     fn summary_never_prints_the_kiwi_password() {
         let lines = lines_of(
@@ -1041,7 +1072,7 @@ mod tests {
         let lines = lines_of("");
         assert_eq!(
             line(&lines, "spot:"),
-            "spot: allowlist=none blocklist_path=none notch_path=none cty_path=bundled scp_path=bundled"
+            "spot: allowlist=none blocklist_path=none notch_path=none cty_path=bundled scp_path=bundled validation_level=normal pattern_path=bundled"
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manta.toml");
@@ -1052,7 +1083,7 @@ mod tests {
             &path,
             format!(
                 "[spot]\nallowlist = [\"W1AW\", \"K1ABC\"]\nblocklist_path = \"bad.txt\"\n\
-                 notch_path = '{}'\ncty_path = 'cty.dat'\nscp_path = 'MASTER.SCP'\n",
+                 notch_path = '{}'\ncty_path = 'cty.dat'\nscp_path = 'MASTER.SCP'\npattern_path = 'patterns.lst'\n",
                 notch.display()
             ),
         )
@@ -1061,11 +1092,13 @@ mod tests {
         assert_eq!(
             line(&summary("x", &l), "spot:"),
             format!(
-                "spot: allowlist=W1AW,K1ABC blocklist_path={} notch_path={} cty_path={} scp_path={}",
+                "spot: allowlist=W1AW,K1ABC blocklist_path={} notch_path={} cty_path={} scp_path={} validation_level={} pattern_path={}",
                 dir.path().join("bad.txt").display(),
                 notch.display(),
                 dir.path().join("cty.dat").display(),
-                dir.path().join("MASTER.SCP").display()
+                dir.path().join("MASTER.SCP").display(),
+                "normal",
+                dir.path().join("patterns.lst").display()
             )
         );
     }
@@ -1465,6 +1498,9 @@ mod tests {
         ("input", "driver"),
         ("input", "rate_hz"),
         ("input", "gain_db"),
+        ("input", "group"),
+        ("input", "ssrc"),
+        ("input", "interface"),
         ("input", "center_freq_hz"),
         ("input", "capture_rate_hz"),
         ("input", "replay_epoch"),
@@ -1472,6 +1508,7 @@ mod tests {
         ("spot", "notch_path"),
         ("spot", "cty_path"),
         ("spot", "scp_path"),
+        ("spot", "pattern_path"),
     ];
 
     /// `Option` keys whose absence means a built-in value: setting them to
@@ -1716,6 +1753,7 @@ mod tests {
             InputKind::Kiwi,
             InputKind::Soapy,
             InputKind::Hpsdr,
+            InputKind::Ka9q,
         ] {
             let body = format!(
                 "[input]\ntype = \"{}\"\n{}",
@@ -1739,7 +1777,9 @@ mod tests {
         let body = format!("[spot]\n{}", uncommented("spot", |_| true));
         let l = loaded(&body);
         assert!(l.spot.blocklist_path.is_some() && l.spot.notch_path.is_some());
-        assert!(l.spot.cty_path.is_some() && l.spot.scp_path.is_some());
+        assert!(
+            l.spot.cty_path.is_some() && l.spot.scp_path.is_some() && l.spot.pattern_path.is_some()
+        );
     }
 
     #[test]

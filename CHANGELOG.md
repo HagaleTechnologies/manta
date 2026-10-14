@@ -24,6 +24,10 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-95: default spot validation requires 2, 3 or 5 distinct-message
+  repetitions by callsign-pattern rarity. `[spot].validation_level = "minimal"`
+  restores flat 2; `--patterns` overrides the independent reference list.
+
 - A band-wide static crash (lightning) no longer starts tracks across the
   band, and running tracks no longer decode it as extra dits; new
   `[detector].crash_filter`, default `"full"` (MAN-312).
@@ -31,8 +35,16 @@ the git history and `docs/DECISIONS/`.
   after 20 s and no CW track starts on it or its keying sidebands; open
   tracks on it close (`rtty` close count). `[detector] rtty_filter = false`
   restores the previous behaviour.
+- MAN-315: the `legacy` decoder learns each track's own dot, dash and gap
+  lengths. Gaps are measured against the sender's dit, and the word
+  boundary is the sender's own, so letter gaps up to about 4.5 dits no
+  longer split words. Dashes up to 6 dots long are accepted (was 4.5).
 
 ### Added
+
+- MAN-315: a `TimingUpdate` event per track (each class's mean, variance
+  and count, in dits), a top-level `timing` object in `decode --json`, and
+  `manta decode --timing` for a `timing (dits, mean ± sd): …` stderr line.
 
 - `manta completions <shell>` prints a tab-completion script for bash, zsh,
   fish, PowerShell or elvish; `manta man-pages --out <dir>` writes `manta.1`
@@ -60,6 +72,8 @@ the git history and `docs/DECISIONS/`.
   spots for 30 minutes, uplink target down or flapping) for a node's
   `/metrics`, with promtool tests. See `docs/RUNBOOKS/monitoring.md`
   (MAN-129).
+- MAN-140: `--ka9q-group` / `[input] type = "ka9q"` reads one ka9q-radio
+  (radiod) IQ channel over RTP multicast; see docs/GUIDES/ka9q-radio.md
 
 ### Changed
 

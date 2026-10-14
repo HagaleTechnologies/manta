@@ -5,13 +5,14 @@ use crate::blocklist::Blocklist;
 use crate::confidence;
 use crate::context::{self, SpotType};
 use crate::cty;
-use crate::decision::{CandidateSupport, Decision, Reason, Rival, REQUIRED_REPS};
+use crate::decision::{CandidateSupport, Decision, Reason, Rival};
 use crate::dedupe::Dedupe;
 use crate::gate::{RepetitionCounts, RepetitionGate, WINDOW_SECONDS as GATE_WINDOW_SECONDS};
 use crate::grammar;
 use crate::notch::NotchList;
 use crate::scp;
 use crate::support::SupportLedger;
+use crate::{pattern, ValidationLevel};
 use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_decode::tree::{Glyph, Prosign};
 use std::collections::{BTreeMap, VecDeque};
@@ -303,6 +304,8 @@ pub struct SuppressionCounts {
 pub struct Validator {
     cty: Arc<cty::Table>,
     scp: Option<Arc<scp::Set>>,
+    patterns: Arc<pattern::Table>,
+    level: ValidationLevel,
     tracks: BTreeMap<u32, TrackState>,
     gate: RepetitionGate,
     dedupe: Dedupe,
@@ -403,6 +406,8 @@ impl Validator {
         Self {
             cty,
             scp,
+            patterns: Arc::new(pattern::Table::bundled()),
+            level: ValidationLevel::Normal,
             tracks: BTreeMap::new(),
             gate: RepetitionGate::new(fs),
             dedupe: Dedupe::new(fs),
@@ -419,6 +424,18 @@ impl Validator {
             merged_into: BTreeMap::new(),
             decisions: None,
         }
+    }
+
+    /// Replace the independent callsign-pattern reference table.
+    pub fn with_patterns(mut self, patterns: Arc<pattern::Table>) -> Self {
+        self.patterns = patterns;
+        self
+    }
+
+    /// Select the rarity-tiered or flat repetition requirement.
+    pub fn with_validation_level(mut self, level: ValidationLevel) -> Self {
+        self.level = level;
+        self
     }
 
     /// MAN-324: turn the decision log on or off. On, every validation
@@ -458,7 +475,15 @@ impl Validator {
     /// Records one decision when the log is on; `build` runs only then.
     fn decide(&mut self, build: impl FnOnce() -> Decision) {
         if let Some(log) = self.decisions.as_mut() {
-            log.push(build());
+            let mut decision = build();
+            // One boundary covers early refusals, reclassification and every
+            // deferred-beacon path, without doing pattern lookups when logging is off.
+            if decision.spot_type != SpotType::Beacon && !self.allowlist.contains(&decision.call) {
+                let tier = self.patterns.tier(&decision.call);
+                decision.required_reps = self.level.required_reps(tier);
+                decision.pattern_tier = Some(tier);
+            }
+            log.push(decision);
         }
     }
 
@@ -695,6 +720,8 @@ impl Validator {
                 self.advance_clock(*sample_ts);
                 Vec::new()
             }
+            // Sender-timing diagnostics (MAN-315): nothing to validate.
+            DecoderEvent::TimingUpdate { .. } => Vec::new(),
             DecoderEvent::TrackClosed { track_id, closure } => {
                 // Round 7 redesign (PR #154): `SignalEnded` is the ONE point where
                 // every captured non-allowlisted Beacon candidate for
@@ -1289,7 +1316,10 @@ impl Validator {
         // here for an ALLOWLISTED Beacon candidate -- non-allowlisted
         // ones never reach this function body at all (see the early
         // dispatch above).
-        if !is_allowlisted && spot_type != SpotType::Beacon && (reps as usize) < REQUIRED_REPS {
+        if !is_allowlisted
+            && spot_type != SpotType::Beacon
+            && reps < self.level.required_reps(self.patterns.tier(&candidate))
+        {
             self.decide(|| withheld(Reason::Repetition).with_reps(reps));
             return None;
         }
@@ -1679,7 +1709,8 @@ mod tests {
     fn from_tables_spots_a_call_only_the_supplied_table_allocates() {
         let words = ["DE", "QQ9ZZZ", "K"];
         let spots_with = |cty: &str| {
-            let mut v = Validator::from_tables(FS, Arc::new(cty::Table::parse(cty)), None);
+            let mut v = Validator::from_tables(FS, Arc::new(cty::Table::parse(cty)), None)
+                .with_patterns(Arc::new(pattern::Table::parse("+QQ9@@@\n").unwrap()));
             seed_meta(&mut v, 1);
             let mut spots = run(&transmission_events(1, &words, 0), &mut v);
             spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
@@ -1701,7 +1732,8 @@ mod tests {
         let cty = Arc::new(cty::Table::parse(&format!("{CTY_FIXTURE}{QQ9_ENTITY}")));
         let confidence_with = |scp: &str| {
             let mut v =
-                Validator::from_tables(FS, cty.clone(), Some(Arc::new(scp::Set::parse(scp))));
+                Validator::from_tables(FS, cty.clone(), Some(Arc::new(scp::Set::parse(scp))))
+                    .with_patterns(Arc::new(pattern::Table::parse("+QQ9@@@\n").unwrap()));
             seed_meta(&mut v, 1);
             let words = ["DE", "QQ9ZZZ", "K"];
             let mut spots = run(&transmission_events(1, &words, 0), &mut v);
@@ -1777,6 +1809,36 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     }
 
     #[test]
+    fn unlisted_decisions_and_reclassification_keep_the_five_rep_requirement() {
+        let mut v = recording(CTY_FIXTURE);
+        let events = transmission_events(1, &["DE", "W4KTNL", "CQ"], 0);
+        assert!(run(&events, &mut v).is_empty());
+        let log = v.take_decisions();
+        let decisions = decisions_for(&log, "W4KTNL");
+        assert_eq!(decisions.len(), 2, "DE then CQ reclassification: {log:?}");
+        for d in decisions {
+            assert_eq!(d.reason, Some(Reason::Repetition));
+            assert_eq!(d.required_reps, 5);
+            assert_eq!(d.pattern_tier, Some(crate::PatternTier::Unlisted));
+            assert_eq!(d.reps, Some(1), "reclassification must not record again");
+        }
+    }
+
+    #[test]
+    fn allowlisted_decision_reports_one_rep_and_no_pattern_tier() {
+        let mut v = recording(CTY_FIXTURE);
+        v.allowlist("W4KTNL");
+        assert_eq!(
+            run(&transmission_events(1, &["W4KTNL"], 0), &mut v).len(),
+            1
+        );
+        let log = v.take_decisions();
+        let d = decisions_for(&log, "W4KTNL")[0];
+        assert_eq!(d.required_reps, 1);
+        assert_eq!(d.pattern_tier, None);
+    }
+
+    #[test]
     fn decision_log_is_empty_unless_enabled() {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
         seed_meta(&mut v, 1);
@@ -1808,7 +1870,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert_eq!(second.len(), 1, "{second:?}");
         assert_eq!(second[0].verdict, Verdict::Spotted);
         assert_eq!(second[0].reason, None);
-        assert_eq!(second[0].reps, Some(REQUIRED_REPS as u32));
+        assert_eq!(second[0].reps, Some(2));
         assert_eq!(second[0].spot.as_ref(), Some(&spots[0]));
         assert!(v.take_decisions().is_empty(), "take drains the log");
     }

@@ -81,6 +81,8 @@ fn write_cw_fixture(path: &std::path::Path) {
     let fs = 48_000.0;
     let duration_s = 300.0;
     let sig = SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: "CQ CQ DE W1AW W1AW K".to_string(),
         loop_text: true,
         wpm: 20.0,

@@ -196,6 +196,9 @@ impl LiveTap {
                 // boundary even though the visible text does not yet.
                 self.dirty.insert(*track_id);
             }
+            // MAN-315: the live-state stream carries no sender timing; it
+            // stays on the event stream and `decode --json`.
+            DecoderEvent::TimingUpdate { .. } => {}
             DecoderEvent::TrackClosed { track_id, .. } => {
                 if self.dirty.remove(track_id) {
                     self.publish_track(*track_id, validator);
@@ -599,6 +602,8 @@ pub(crate) mod tests {
             verdict: manta_spot::Verdict::Withheld,
             reason: Some(manta_spot::Reason::Repetition),
             reps: Some(1),
+            required_reps: 2,
+            pattern_tier: Some(manta_spot::PatternTier::Common),
             rival: None,
             spot: None,
         }

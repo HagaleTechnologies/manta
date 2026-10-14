@@ -99,6 +99,10 @@ enum Command {
         /// Print the full decode report as one JSON object.
         #[arg(long, help_heading = "Output")]
         json: bool,
+        /// Also print the main signal's learned dot, dash and gap lengths
+        /// (in dits) on stderr. `--json` always includes them.
+        #[arg(long, help_heading = "Output")]
+        timing: bool,
         /// TOML config file; the whole file is validated.
         ///
         /// Its `[decode]` values are the baseline; an explicit --engine
@@ -184,7 +188,7 @@ enum Command {
     /// produces the same file.
     Gen {
         /// Which test recording to generate: v1 to v6, vr1 to vr5, vr6a,
-        /// vr6b, vr7 or vr8.
+        /// vr6b, vr7, vr8, or vw1 to vw5.
         vector: String,
         /// Directory to write `<name>.wav`, `<name>.json` and
         /// `<name>.manifest.json` into.
@@ -218,10 +222,10 @@ enum Command {
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -254,8 +258,8 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -285,8 +289,8 @@ enum Command {
         /// builds made with the `hpsdr` feature.
         #[cfg(feature = "hpsdr")]
         #[arg(help_heading = "HPSDR source")]
-        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
         #[cfg(feature = "hpsdr")]
@@ -317,6 +321,40 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_rate_hz: Option<f64>,
+        /// Multicast data group of a ka9q-radio (radiod) IQ channel
+        ///
+        /// An IPv4 multicast address, or the name in the channel's `data =`
+        /// line (for example cw-20m.local) when this machine resolves mDNS
+        /// names. manta joins the group and reads the channel's sample rate,
+        /// encoding and frequency from radiod's status packets; it does not
+        /// create or retune channels.
+        #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        ka9q_group: Option<String>,
+        /// RTP data port of the group.
+        #[arg(
+            long,
+            default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            value_parser = clap::value_parser!(u16).range(1..),
+            requires = "ka9q_group",
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_port: u16,
+        /// SSRC of the channel to read, when the group carries more than one.
+        #[arg(long, requires = "ka9q_group", help_heading = "ka9q-radio source")]
+        ka9q_ssrc: Option<u32>,
+        /// IPv4 address of the local interface to join the group on. manta
+        /// also joins on 127.0.0.1, for a radiod on this machine.
+        #[arg(
+            long,
+            requires = "ka9q_group",
+            value_parser = clap::value_parser!(std::net::Ipv4Addr),
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_interface: Option<std::net::Ipv4Addr>,
         /// Decimate the source to this sample rate, in Hz, before decoding.
         ///
         /// Must divide the source's own rate by a power of two, and the
@@ -384,9 +422,10 @@ enum Command {
         /// Radio dial frequency, in Hz.
         ///
         /// For a sound card or an ordinary (real-audio) --source WAV this
-        /// becomes the source's centre frequency; for KiwiSDR, SoapySDR and
-        /// HPSDR inputs, and for a --source-iq recording whose sidecar already
-        /// carries a centre frequency, it overrides what the source reports.
+        /// becomes the source's centre frequency; for KiwiSDR, SoapySDR, HPSDR
+        /// and ka9q-radio inputs, and for a --source-iq recording whose
+        /// sidecar already carries a centre frequency, it overrides what the
+        /// source reports.
         /// Required with --config when the input is a sound card or a
         /// real-audio --source WAV, because neither knows what frequency the
         /// radio was on -- without it, spots would be published at the audio
@@ -455,10 +494,10 @@ enum Command {
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -491,8 +530,8 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -522,8 +561,8 @@ enum Command {
         /// builds made with the `hpsdr` feature.
         #[cfg(feature = "hpsdr")]
         #[arg(help_heading = "HPSDR source")]
-        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
         #[cfg(feature = "hpsdr")]
@@ -554,6 +593,40 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_rate_hz: Option<f64>,
+        /// Multicast data group of a ka9q-radio (radiod) IQ channel
+        ///
+        /// An IPv4 multicast address, or the name in the channel's `data =`
+        /// line (for example cw-20m.local) when this machine resolves mDNS
+        /// names. manta joins the group and reads the channel's sample rate,
+        /// encoding and frequency from radiod's status packets; it does not
+        /// create or retune channels.
+        #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        ka9q_group: Option<String>,
+        /// RTP data port of the group.
+        #[arg(
+            long,
+            default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            value_parser = clap::value_parser!(u16).range(1..),
+            requires = "ka9q_group",
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_port: u16,
+        /// SSRC of the channel to read, when the group carries more than one.
+        #[arg(long, requires = "ka9q_group", help_heading = "ka9q-radio source")]
+        ka9q_ssrc: Option<u32>,
+        /// IPv4 address of the local interface to join the group on. manta
+        /// also joins on 127.0.0.1, for a radiod on this machine.
+        #[arg(
+            long,
+            requires = "ka9q_group",
+            value_parser = clap::value_parser!(std::net::Ipv4Addr),
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_interface: Option<std::net::Ipv4Addr>,
         /// Decimate the source to this sample rate, in Hz, before decoding.
         ///
         /// Must divide the source's own rate by a power of two, and the
@@ -660,10 +733,10 @@ enum Command {
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -696,8 +769,8 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -727,8 +800,8 @@ enum Command {
         /// builds made with the `hpsdr` feature.
         #[cfg(feature = "hpsdr")]
         #[arg(help_heading = "HPSDR source")]
-        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
         #[cfg(feature = "hpsdr")]
@@ -759,6 +832,40 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_rate_hz: Option<f64>,
+        /// Multicast data group of a ka9q-radio (radiod) IQ channel
+        ///
+        /// An IPv4 multicast address, or the name in the channel's `data =`
+        /// line (for example cw-20m.local) when this machine resolves mDNS
+        /// names. manta joins the group and reads the channel's sample rate,
+        /// encoding and frequency from radiod's status packets; it does not
+        /// create or retune channels.
+        #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        ka9q_group: Option<String>,
+        /// RTP data port of the group.
+        #[arg(
+            long,
+            default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            value_parser = clap::value_parser!(u16).range(1..),
+            requires = "ka9q_group",
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_port: u16,
+        /// SSRC of the channel to read, when the group carries more than one.
+        #[arg(long, requires = "ka9q_group", help_heading = "ka9q-radio source")]
+        ka9q_ssrc: Option<u32>,
+        /// IPv4 address of the local interface to join the group on. manta
+        /// also joins on 127.0.0.1, for a radiod on this machine.
+        #[arg(
+            long,
+            requires = "ka9q_group",
+            value_parser = clap::value_parser!(std::net::Ipv4Addr),
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_interface: Option<std::net::Ipv4Addr>,
         /// Decimate the source to this sample rate, in Hz, before decoding.
         ///
         /// Must divide the source's own rate by a power of two, and the
@@ -860,10 +967,10 @@ enum Command {
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -896,8 +1003,8 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -927,8 +1034,8 @@ enum Command {
         /// builds made with the `hpsdr` feature.
         #[cfg(feature = "hpsdr")]
         #[arg(help_heading = "HPSDR source")]
-        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
         #[cfg(feature = "hpsdr")]
@@ -959,6 +1066,40 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_rate_hz: Option<f64>,
+        /// Multicast data group of a ka9q-radio (radiod) IQ channel
+        ///
+        /// An IPv4 multicast address, or the name in the channel's `data =`
+        /// line (for example cw-20m.local) when this machine resolves mDNS
+        /// names. manta joins the group and reads the channel's sample rate,
+        /// encoding and frequency from radiod's status packets; it does not
+        /// create or retune channels.
+        #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        ka9q_group: Option<String>,
+        /// RTP data port of the group.
+        #[arg(
+            long,
+            default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            value_parser = clap::value_parser!(u16).range(1..),
+            requires = "ka9q_group",
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_port: u16,
+        /// SSRC of the channel to read, when the group carries more than one.
+        #[arg(long, requires = "ka9q_group", help_heading = "ka9q-radio source")]
+        ka9q_ssrc: Option<u32>,
+        /// IPv4 address of the local interface to join the group on. manta
+        /// also joins on 127.0.0.1, for a radiod on this machine.
+        #[arg(
+            long,
+            requires = "ka9q_group",
+            value_parser = clap::value_parser!(std::net::Ipv4Addr),
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_interface: Option<std::net::Ipv4Addr>,
         /// Decimate the source to this sample rate, in Hz, before decoding.
         ///
         /// Must divide the source's own rate by a power of two, and the
@@ -1177,6 +1318,9 @@ struct FilterOpts {
     /// Defaults to the built-in copy, or to `spot.scp_path` from --config.
     #[arg(long)]
     scp: Option<PathBuf>,
+    /// Callsign-pattern list used in place of the built-in one ([spot] pattern_path).
+    #[arg(long, value_name = "PATH")]
+    patterns: Option<PathBuf>,
 }
 
 /// KiwiSDR connection flags, grouped to keep `open_source`'s arity down.
@@ -1210,6 +1354,33 @@ struct HpsdrOpts {
     rate: Option<f64>,
 }
 
+/// ka9q-radio (radiod) multicast flags, grouped for the same reason. No
+/// build feature: the source is in every build (MAN-140 D2).
+#[derive(Clone)]
+struct Ka9qOpts {
+    group: Option<String>,
+    port: u16,
+    ssrc: Option<u32>,
+    interface: Option<std::net::Ipv4Addr>,
+    /// radiod's frequency at the first open, shared with the clone the
+    /// reconnect opener holds, so a reopen under `--dial-freq-hz` can still
+    /// see a retune (MAN-140 D13; see `LiveSourceSpec::open`).
+    first_center_hz: std::sync::Arc<std::sync::OnceLock<f64>>,
+}
+
+impl Ka9qOpts {
+    /// No `--ka9q-*` flag given: the defaults `CliOverrides::none` uses.
+    fn unset() -> Self {
+        Ka9qOpts {
+            group: None,
+            port: manta_input::ka9q::wire::DATA_PORT,
+            ssrc: None,
+            interface: None,
+            first_center_hz: Default::default(),
+        }
+    }
+}
+
 /// Everything needed to (re)open the configured live input. MAN-73: a
 /// reconnectable kind (every variant but `File`) is re-opened by
 /// `ReconnectingSource` after a loss; `File` (deterministic replay) never
@@ -1222,6 +1393,7 @@ enum LiveSourceSpec {
     Soapy(SoapyOpts),
     #[cfg(feature = "hpsdr")]
     Hpsdr(HpsdrOpts),
+    Ka9q(Ka9qOpts),
     AudioDevice(Option<String>),
     /// `source_iq` selects `WavIqSource` over `AudioIqSource`; see
     /// `open_audio_source`.
@@ -1239,12 +1411,13 @@ impl LiveSourceSpec {
             LiveSourceSpec::Soapy(_) => "soapy",
             #[cfg(feature = "hpsdr")]
             LiveSourceSpec::Hpsdr(_) => "hpsdr",
+            LiveSourceSpec::Ka9q(_) => "ka9q",
             LiveSourceSpec::AudioDevice(_) => "audio",
             LiveSourceSpec::File { .. } => "file",
         }
     }
 
-    /// Kiwi/Soapy/Hpsdr, or an IQ WAV whose sidecar reports a real (> 0)
+    /// Kiwi/Soapy/Hpsdr/Ka9q, or an IQ WAV whose sidecar reports a real (> 0)
     /// center frequency: a source that already knows its own tuned
     /// frequency, so `--dial-freq-hz` is an override and not a requirement.
     fn is_rf_aware(&self) -> bool {
@@ -1277,6 +1450,9 @@ impl LiveSourceSpec {
         capture_rate_hz: Option<f64>,
         dial_freq_hz: Option<f64>,
     ) -> Result<Box<dyn IqSource>> {
+        // How far radiod has moved the channel since the first open; only
+        // ka9q sets it (MAN-140 D13).
+        let mut retune_hz = 0.0;
         let src: Box<dyn IqSource> = match self {
             LiveSourceSpec::Kiwi(kiwi) => {
                 let host = kiwi
@@ -1331,6 +1507,25 @@ impl LiveSourceSpec {
                 let mut sources = manta_input::hpsdr::HpsdrDevice::open(cfg)?;
                 Box::new(sources.remove(0))
             }
+            LiveSourceSpec::Ka9q(ka9q) => {
+                let group = ka9q
+                    .group
+                    .clone()
+                    .expect("LiveSourceSpec::Ka9q always carries a group");
+                let mut cfg = manta_input::ka9q::Ka9qConfig::new(group);
+                cfg.port = ka9q.port;
+                cfg.ssrc = ka9q.ssrc;
+                cfg.interface = ka9q.interface;
+                let src = manta_input::ka9q::Ka9qIqSource::open(cfg)?;
+                // MAN-140 D18: printed on each (re)open, as the audio
+                // silence notice is; manta still starts.
+                if src.agc_on() {
+                    logging::warning(&ka9q_agc_warning(src.ssrc()));
+                }
+                let first_hz = *ka9q.first_center_hz.get_or_init(|| src.center_freq_hz());
+                retune_hz = src.center_freq_hz() - first_hz;
+                Box::new(src)
+            }
             // Each (re)open gets its own one-shot silence notice (MAN-131).
             LiveSourceSpec::AudioDevice(device) => Box::new(
                 manta_input::AudioIqSource::from_device(device.as_deref())?.with_silence_notice(
@@ -1343,9 +1538,13 @@ impl LiveSourceSpec {
         };
         let src = maybe_decimate(src, capture_rate_hz)?;
         Ok(match dial_freq_hz {
+            // A radiod retune moves the override by the same amount, so
+            // `ReconnectingSource`'s reopen check still sees it and ends the
+            // run, as it does with no override, instead of publishing spots
+            // against the old frequency.
             Some(freq_hz) => Box::new(FixedCenterFreqSource {
                 inner: src,
-                freq_hz,
+                freq_hz: freq_hz + retune_hz,
             }),
             None => src,
         })
@@ -1518,6 +1717,17 @@ fn audio_silence_warning(device: &str) -> String {
          (every sample is exactly zero) -- {}",
         manta_input::TARGET_RATE_HZ,
         manta_input::audio::audio_input_hint()
+    )
+}
+
+/// MAN-140 D18: a radiod channel with AGC on rescales every signal in its
+/// passband whenever one strong signal comes and goes. A warning on each
+/// open, not an error: some operators run AGC on purpose.
+fn ka9q_agc_warning(ssrc: u32) -> String {
+    format!(
+        "warning: ka9q-radio channel ssrc {ssrc} has AGC on; set agc = off and a fixed gain \
+         in its radiod section, or one strong signal changes the gain for every signal in \
+         the passband"
     )
 }
 
@@ -1893,6 +2103,14 @@ fn parse_hpsdr_freq_hz(s: &str) -> std::result::Result<f64, String> {
     check_hpsdr_freq_hz("--hpsdr-freq-hz", hz)
 }
 
+/// Clap value parser for `--ka9q-group`: the same check `input.group` gets
+/// at load (MAN-140 D16), an IPv4 multicast literal or a host name, never
+/// resolved here.
+fn parse_ka9q_group(s: &str) -> std::result::Result<String, String> {
+    manta_input::ka9q::check_group(s)?;
+    Ok(s.to_string())
+}
+
 /// `parse_hpsdr_freq_hz`'s check, un-gated like `check_hpsdr_rate_hz`.
 fn check_hpsdr_freq_hz(name: &str, hz: f64) -> std::result::Result<f64, String> {
     if !hz.is_finite() || hz <= 0.0 {
@@ -1947,6 +2165,17 @@ fn strip_bom(text: &str) -> &str {
     text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 
+/// Loads a reference table once, with consistent path context and BOM handling.
+fn read_reference<T>(
+    path: &Path,
+    label: &str,
+    parse: impl FnOnce(&str) -> Result<T>,
+) -> Result<std::sync::Arc<T>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {label} {}", path.display()))?;
+    parse(strip_bom(&text)).map(std::sync::Arc::new)
+}
+
 /// Builds a `PipelineConfig` from the CLI's shared flags: the MAN-29
 /// frequency-calibration correction, the MAN-28 operator Watch List, and
 /// the MAN-31 operator suppression lists. Each is optional/repeatable; an
@@ -1961,6 +2190,7 @@ fn build_pipeline_config(
     let mut cfg = PipelineConfig {
         freq_correction_ppm,
         allowlist: spot.allowlist.clone(),
+        validation_level: spot.validation_level,
         detector,
         ..Default::default()
     };
@@ -1976,22 +2206,32 @@ fn build_pipeline_config(
         cfg.notch = manta_engine::NotchList::parse(strip_bom(&text));
     }
     if let Some(path) = &spot.cty {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading cty.dat file {}", path.display()))?;
-        let table = manta_spot::cty::Table::parse(strip_bom(&text));
-        if table.is_empty() {
-            bail!("cty.dat file {} lists no callsign prefixes; is it AD1C's cty.dat (not cty.csv or a saved web page)?", path.display());
-        }
-        cfg.cty = Some(std::sync::Arc::new(table));
+        cfg.cty = Some(read_reference(path, "cty.dat file", |text| {
+            let table = manta_spot::cty::Table::parse(text);
+            if table.is_empty() {
+                bail!("cty.dat file {} lists no callsign prefixes; is it AD1C's cty.dat (not cty.csv or a saved web page)?", path.display());
+            }
+            Ok(table)
+        })?);
     }
     if let Some(path) = &spot.scp {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading master.scp file {}", path.display()))?;
-        let set = manta_spot::scp::Set::parse(strip_bom(&text));
-        if set.is_empty() {
-            bail!("master.scp file {} lists no callsigns", path.display());
-        }
-        cfg.scp = Some(std::sync::Arc::new(set));
+        cfg.scp = Some(read_reference(path, "master.scp file", |text| {
+            let set = manta_spot::scp::Set::parse(text);
+            if set.is_empty() {
+                bail!("master.scp file {} lists no callsigns", path.display());
+            }
+            Ok(set)
+        })?);
+    }
+    if let Some(path) = &spot.patterns {
+        cfg.patterns = Some(read_reference(path, "the pattern list", |text| {
+            manta_spot::pattern::Table::parse(text).map_err(|error| match error {
+                manta_spot::pattern::ParseError::Empty => {
+                    anyhow!("the pattern list {} contains no patterns", path.display())
+                }
+                _ => anyhow!("reading the pattern list {}: {error}", path.display()),
+            })
+        })?);
     }
     Ok(cfg)
 }
@@ -2918,6 +3158,7 @@ fn station_profile(
     center_freq_hz: f64,
     rf_passband_hz: (f64, f64),
     freq_calibration: f64,
+    validation_level: manta_spot::ValidationLevel,
 ) -> manta_server::telnet::StationProfile {
     manta_server::telnet::StationProfile {
         call: cfg.station_callsign.clone(),
@@ -2925,7 +3166,12 @@ fn station_profile(
         operator_qth: cfg.operator_qth.clone(),
         operator_grid: cfg.operator_grid.clone(),
         sett: manta_server::sett::SettSettings {
-            validation_level: manta_server::sett::ValidationLevel::Normal,
+            validation_level: match validation_level {
+                manta_spot::ValidationLevel::Minimal => {
+                    manta_server::sett::ValidationLevel::Minimal
+                }
+                manta_spot::ValidationLevel::Normal => manta_server::sett::ValidationLevel::Normal,
+            },
             cq_only: false,
             segments: manta_server::sett::segments_for_passband(
                 center_freq_hz,
@@ -2987,8 +3233,10 @@ fn start_spot_server(
     source: SourceInfo<'_>,
     epoch: std::time::SystemTime,
     session_nonce: u128,
-    cty: std::sync::Arc<manta_spot::cty::Table>,
+    pipeline: &PipelineConfig,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
+    let cty = pipeline.cty_table();
+    let validation_level = pipeline.validation_level;
     // MAN-59 connection/rejection events below are logged at `info`/
     // `warn`. `start_spot_server` no longer installs the subscriber:
     // `logging::init` does, at the top of `run` (MAN-124), and its module
@@ -3154,6 +3402,7 @@ fn start_spot_server(
                 source.dial_freq_hz,
                 source.rf_passband_hz,
                 source.freq_calibration,
+                validation_level,
             ));
             spawn_tracked_listener(
                 LISTENER_TELNET,
@@ -3429,6 +3678,7 @@ struct CliOverrides {
     soapy: SoapyOpts,
     #[cfg(feature = "hpsdr")]
     hpsdr: HpsdrOpts,
+    ka9q: Ka9qOpts,
     freq_correction_ppm: Option<f64>,
     dial_freq_hz: Option<f64>,
     capture_rate_hz: Option<f64>,
@@ -3438,6 +3688,7 @@ struct CliOverrides {
     notch: Option<PathBuf>,
     cty: Option<PathBuf>,
     scp: Option<PathBuf>,
+    patterns: Option<PathBuf>,
     /// MAN-301: `--rbn-compare`/`--rbn-spotter` (`run` only).
     rbn: RbnCompareOpts,
 }
@@ -3472,6 +3723,7 @@ impl CliOverrides {
                 freq: None,
                 rate: None,
             },
+            ka9q: Ka9qOpts::unset(),
             freq_correction_ppm: None,
             dial_freq_hz: None,
             capture_rate_hz: None,
@@ -3481,6 +3733,7 @@ impl CliOverrides {
             notch: None,
             cty: None,
             scp: None,
+            patterns: None,
             rbn: RbnCompareOpts::default(),
         }
     }
@@ -3488,6 +3741,9 @@ impl CliOverrides {
     /// The flag that selects a source, if any: given one, the command line
     /// defines the whole source (D6).
     fn source_selector(&self) -> Option<&'static str> {
+        if self.ka9q.group.is_some() {
+            return Some("--ka9q-group");
+        }
         #[cfg(feature = "hpsdr")]
         if self.hpsdr.host.is_some() {
             return Some("--hpsdr-host");
@@ -3507,9 +3763,14 @@ impl CliOverrides {
         }
     }
 
-    /// The source the flags describe, in today's priority order: hpsdr,
-    /// then kiwi, then soapy, then a WAV file or audio device.
+    /// The source the flags describe, in today's priority order: ka9q,
+    /// then hpsdr, then kiwi, then soapy, then a WAV file or audio device.
+    /// clap lets at most one selector through, so the order only matters
+    /// for a hand-built `CliOverrides`.
     fn into_spec(self) -> LiveSourceSpec {
+        if self.ka9q.group.is_some() {
+            return LiveSourceSpec::Ka9q(self.ka9q);
+        }
         #[cfg(feature = "hpsdr")]
         if self.hpsdr.host.is_some() {
             return LiveSourceSpec::Hpsdr(self.hpsdr);
@@ -3534,11 +3795,13 @@ impl CliOverrides {
 /// `[spot]` after the CLI is merged over the file/env layer (D6).
 #[derive(Debug, PartialEq)]
 struct SpotResolved {
+    validation_level: manta_spot::ValidationLevel,
     allowlist: Vec<String>,
     blocklist: Option<PathBuf>,
     notch: Option<PathBuf>,
     cty: Option<PathBuf>,
     scp: Option<PathBuf>,
+    patterns: Option<PathBuf>,
 }
 
 /// A non-empty `--allowlist` replaces the file's list (never concatenated);
@@ -3549,6 +3812,7 @@ fn resolve_spot(
     cli_notch: Option<PathBuf>,
     cli_cty: Option<PathBuf>,
     cli_scp: Option<PathBuf>,
+    cli_patterns: Option<PathBuf>,
     spot: &config::SpotFile,
 ) -> SpotResolved {
     SpotResolved {
@@ -3561,6 +3825,8 @@ fn resolve_spot(
         notch: cli_notch.or_else(|| spot.notch_path.clone()),
         cty: cli_cty.or_else(|| spot.cty_path.clone()),
         scp: cli_scp.or_else(|| spot.scp_path.clone()),
+        patterns: cli_patterns.or_else(|| spot.pattern_path.clone()),
+        validation_level: spot.validation_level,
     }
 }
 
@@ -3630,6 +3896,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
         cli.notch.clone(),
         cli.cty.clone(),
         cli.scp.clone(),
+        cli.patterns.clone(),
         &loaded.spot,
     );
     let mut shared = loaded.input.shared.clone();
@@ -3733,6 +4000,18 @@ fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Resul
         config::SourceFromFile::Hpsdr { .. } => {
             bail!("input.type = \"hpsdr\" needs a manta built with --features hpsdr")
         }
+        config::SourceFromFile::Ka9q {
+            group,
+            port,
+            ssrc,
+            interface,
+        } => LiveSourceSpec::Ka9q(Ka9qOpts {
+            group: Some(group.clone()),
+            port: *port,
+            ssrc: *ssrc,
+            interface: *interface,
+            ..Ka9qOpts::unset()
+        }),
     })
 }
 
@@ -3837,6 +4116,15 @@ fn receiver_desc(spec: &LiveSourceSpec) -> doctor_checks::ReceiverDesc {
                 "HPSDR radio {}:{}",
                 hpsdr.host.as_deref().unwrap_or_default(),
                 hpsdr.port
+            ),
+        ),
+        LiveSourceSpec::Ka9q(ka9q) => (
+            ReceiverKind::Ka9q,
+            format!(
+                "ka9q-radio group {}:{}{}",
+                ka9q.group.as_deref().unwrap_or_default(),
+                ka9q.port,
+                ka9q.ssrc.map(|s| format!(" ssrc {s}")).unwrap_or_default()
             ),
         ),
         LiveSourceSpec::AudioDevice(None) => (
@@ -4564,6 +4852,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             path,
             center_freq_hz,
             json,
+            timing,
             filters,
             config,
             engine,
@@ -4575,6 +4864,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 notch,
                 cty,
                 scp,
+                patterns,
             } = filters;
             // D7/D8: the whole file is validated, the environment is never
             // read; [decode], [detector], [spot] and input.freq_correction_ppm
@@ -4592,7 +4882,15 @@ fn run_command() -> Result<std::process::ExitCode> {
                     loaded.origin
                 );
             }
-            let spot = resolve_spot(allowlist, blocklist, notch, cty, scp, &loaded.spot);
+            let spot = resolve_spot(
+                allowlist,
+                blocklist,
+                notch,
+                cty,
+                scp,
+                patterns,
+                &loaded.spot,
+            );
             let decode_cfg = merge_cli_engine(engine, loaded.decode.clone());
             let mut cfg = build_pipeline_config(
                 freq_correction_ppm
@@ -4628,6 +4926,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                 // keeps MAN-270's one-line summary.
                 if !report.rtty.is_empty() {
                     eprintln!("{}", rtty_line(&report.rtty, report.sample_rate_hz));
+                }
+                // MAN-315: the primary track's learned sender timing, on
+                // request only, so the default stderr stays the summary.
+                if timing {
+                    if let Some(estimates) = &report.timing {
+                        eprintln!("timing (dits, mean ± sd): {}", estimates.display_line());
+                    }
                 }
             }
         }
@@ -4676,8 +4981,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                 "vr6b" => manta_testkit::vectors::vr6b(),
                 "vr7" => manta_testkit::vectors::vr7(),
                 "vr8" => manta_testkit::vectors::vr8(),
+                "vw1" => manta_testkit::vectors::vw1(),
+                "vw2" => manta_testkit::vectors::vw2(),
+                "vw3" => manta_testkit::vectors::vw3(),
+                "vw4" => manta_testkit::vectors::vw4(),
+                "vw5" => manta_testkit::vectors::vw5(),
                 other => bail!(
-                    "unknown vector '{}' (available: v1-v6, vr1-vr5, vr6a, vr6b, vr7-vr8)",
+                    "unknown vector '{}' (available: v1-v6, vr1-vr5, vr6a, vr6b, vr7-vr8, vw1-vw5)",
                     manta_server::status_doc::escape_for_terminal(other).replace('\'', "\\'")
                 ),
             };
@@ -4715,6 +5025,10 @@ fn run_command() -> Result<std::process::ExitCode> {
             hpsdr_freq_hz,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
             capture_rate_hz,
             source_iq,
             realtime,
@@ -4739,6 +5053,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 notch,
                 cty,
                 scp,
+                patterns,
             } = filters;
             let cli = CliOverrides {
                 device,
@@ -4766,6 +5081,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                     freq: hpsdr_freq_hz,
                     rate: hpsdr_rate_hz,
                 },
+                ka9q: Ka9qOpts {
+                    group: ka9q_group,
+                    port: ka9q_port,
+                    ssrc: ka9q_ssrc,
+                    interface: ka9q_interface,
+                    ..Ka9qOpts::unset()
+                },
                 freq_correction_ppm,
                 dial_freq_hz,
                 capture_rate_hz,
@@ -4775,6 +5097,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 notch,
                 cty,
                 scp,
+                patterns,
                 rbn,
             };
             // MAN-78: a SIGHUP reload re-resolves with the same flags.
@@ -4976,7 +5299,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                         },
                         epoch,
                         session_nonce,
-                        cfg.cty_table(),
+                        &cfg,
                     )?;
                     // MAN-45 (round-9 finding): the daemon's own copy of the
                     // gauge `manta_engine::listen_with_observers` updates as
@@ -5549,6 +5872,10 @@ fn run_command() -> Result<std::process::ExitCode> {
             hpsdr_freq_hz,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
             capture_rate_hz,
             source_iq,
             filters,
@@ -5562,6 +5889,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 notch,
                 cty,
                 scp,
+                patterns,
             } = filters;
             let Prepared {
                 loaded,
@@ -5595,6 +5923,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                         freq: hpsdr_freq_hz,
                         rate: hpsdr_rate_hz,
                     },
+                    ka9q: Ka9qOpts {
+                        group: ka9q_group,
+                        port: ka9q_port,
+                        ssrc: ka9q_ssrc,
+                        interface: ka9q_interface,
+                        ..Ka9qOpts::unset()
+                    },
                     freq_correction_ppm,
                     dial_freq_hz,
                     capture_rate_hz,
@@ -5604,6 +5939,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     notch,
                     cty,
                     scp,
+                    patterns,
                     rbn: RbnCompareOpts::default(),
                 },
                 config,
@@ -5694,6 +6030,10 @@ fn run_command() -> Result<std::process::ExitCode> {
             hpsdr_freq_hz,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
             capture_rate_hz,
             source_iq,
             dial_freq_hz,
@@ -5708,6 +6048,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 notch,
                 cty,
                 scp,
+                patterns,
             } = filters;
             // Checked before any source is opened -- otherwise an invalid
             // --duration only surfaces after a KiwiSDR/SoapySDR/HPSDR
@@ -5756,6 +6097,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                         freq: hpsdr_freq_hz,
                         rate: hpsdr_rate_hz,
                     },
+                    ka9q: Ka9qOpts {
+                        group: ka9q_group,
+                        port: ka9q_port,
+                        ssrc: ka9q_ssrc,
+                        interface: ka9q_interface,
+                        ..Ka9qOpts::unset()
+                    },
                     freq_correction_ppm,
                     dial_freq_hz,
                     capture_rate_hz,
@@ -5765,6 +6113,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     notch,
                     cty,
                     scp,
+                    patterns,
                     rbn: RbnCompareOpts::default(),
                 },
                 config,
@@ -5884,6 +6233,10 @@ fn run_command() -> Result<std::process::ExitCode> {
             hpsdr_freq_hz,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
             capture_rate_hz,
             source_iq,
             dial_freq_hz,
@@ -5921,6 +6274,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                     port: hpsdr_port,
                     freq: hpsdr_freq_hz,
                     rate: hpsdr_rate_hz,
+                },
+                ka9q: Ka9qOpts {
+                    group: ka9q_group,
+                    port: ka9q_port,
+                    ssrc: ka9q_ssrc,
+                    interface: ka9q_interface,
+                    ..Ka9qOpts::unset()
                 },
                 capture_rate_hz,
                 dial_freq_hz,
@@ -6279,13 +6639,41 @@ mod tests {
     const QQ9_ENTITY: &str = "Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n";
 
     #[test]
+    fn cli_patterns_override_file_and_preserve_validation_level() {
+        let spot = config::SpotFile {
+            pattern_path: Some("file.lst".into()),
+            validation_level: manta_spot::ValidationLevel::Minimal,
+            ..Default::default()
+        };
+        let r = resolve_spot(
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            Some("cli.lst".into()),
+            &spot,
+        );
+        assert_eq!(r.patterns, Some("cli.lst".into()));
+        assert_eq!(r.validation_level, manta_spot::ValidationLevel::Minimal);
+    }
+
+    #[test]
     fn cli_cty_beats_cty_path() {
         let spot = config::SpotFile {
             cty_path: Some("file.dat".into()),
             scp_path: Some("file.scp".into()),
             ..Default::default()
         };
-        let r = resolve_spot(vec![], None, None, Some("cli.dat".into()), None, &spot);
+        let r = resolve_spot(
+            vec![],
+            None,
+            None,
+            Some("cli.dat".into()),
+            None,
+            None,
+            &spot,
+        );
         assert_eq!(r.cty, Some("cli.dat".into()));
         assert_eq!(r.scp, Some("file.scp".into()));
     }
@@ -6296,18 +6684,42 @@ mod tests {
             scp_path: Some("file.scp".into()),
             ..Default::default()
         };
-        let r = resolve_spot(vec![], None, None, None, Some("cli.scp".into()), &spot);
+        let r = resolve_spot(
+            vec![],
+            None,
+            None,
+            None,
+            Some("cli.scp".into()),
+            None,
+            &spot,
+        );
         assert_eq!(r.cty, Some("file.dat".into()));
         assert_eq!(r.scp, Some("cli.scp".into()));
     }
     #[test]
     fn unset_cty_and_scp_stay_built_in() {
-        let r = resolve_spot(vec![], None, None, None, None, &config::SpotFile::default());
+        let r = resolve_spot(
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            &config::SpotFile::default(),
+        );
         let cfg = build_pipeline_config(0.0, &r, Default::default(), Engine::Legacy).unwrap();
         assert!(cfg.cty.is_none() && cfg.scp.is_none());
     }
     fn tables_config(cty: Option<PathBuf>, scp: Option<PathBuf>) -> Result<PipelineConfig> {
-        let spot = resolve_spot(vec![], None, None, cty, scp, &config::SpotFile::default());
+        let spot = resolve_spot(
+            vec![],
+            None,
+            None,
+            cty,
+            scp,
+            None,
+            &config::SpotFile::default(),
+        );
         build_pipeline_config(0.0, &spot, Default::default(), Engine::Legacy)
     }
     #[test]
@@ -6393,7 +6805,10 @@ mod tests {
             },
             std::time::UNIX_EPOCH,
             0,
-            table.clone(),
+            &PipelineConfig {
+                cty: Some(table.clone()),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert!(std::sync::Arc::ptr_eq(&server.cty, &table));
@@ -6715,7 +7130,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -7547,7 +7962,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -7607,7 +8022,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -7665,7 +8080,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         );
         assert!(
             result.is_ok(),
@@ -7699,7 +8114,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -7803,7 +8218,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         ) else {
             panic!("half a lat/lon pair must not start the servers");
         };
@@ -7860,7 +8275,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -8657,7 +9072,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             allowlist: vec!["W1AW".into()],
             ..Default::default()
         };
-        let r = resolve_spot(vec!["K1ABC".into()], None, None, None, None, &spot);
+        let r = resolve_spot(vec!["K1ABC".into()], None, None, None, None, None, &spot);
         assert_eq!(r.allowlist, vec!["K1ABC".to_string()]);
     }
 
@@ -8667,7 +9082,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             allowlist: vec!["W1AW".into()],
             ..Default::default()
         };
-        let r = resolve_spot(Vec::new(), None, None, None, None, &spot);
+        let r = resolve_spot(Vec::new(), None, None, None, None, None, &spot);
         assert_eq!(r.allowlist, vec!["W1AW".to_string()]);
     }
 
@@ -8681,6 +9096,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let r = resolve_spot(
             Vec::new(),
             Some(PathBuf::from("cli.txt")),
+            None,
             None,
             None,
             None,
@@ -8758,6 +9174,184 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
     }
 
+    // ---- MAN-140: the ka9q-radio source
+
+    #[test]
+    fn every_live_command_rejects_zero_ka9q_port() {
+        let mut accepted_invalid = Vec::new();
+        for command in ["run", "listen", "soak", "doctor", "calibrate", "check"] {
+            let mut args = vec!["manta", command, "--ka9q-group", "239.101.6.1"];
+            if command == "soak" {
+                args.extend(["--duration", "1"]);
+            }
+            assert!(
+                Cli::try_parse_from(&args).is_ok(),
+                "{command}: default port"
+            );
+            for port in ["1", "5004", "65535"] {
+                assert!(
+                    Cli::try_parse_from(args.iter().copied().chain(["--ka9q-port", port])).is_ok(),
+                    "{command}: valid port {port}"
+                );
+            }
+            for port in ["0", "65536"] {
+                match Cli::try_parse_from(args.iter().copied().chain(["--ka9q-port", port])) {
+                    Ok(_) => accepted_invalid.push(format!("{command}: {port}")),
+                    Err(error) => {
+                        assert_eq!(error.exit_code(), 2);
+                        assert!(error.to_string().contains("--ka9q-port"), "{error}");
+                    }
+                }
+            }
+        }
+        assert!(
+            accepted_invalid.is_empty(),
+            "accepted invalid ports: {accepted_invalid:?}"
+        );
+    }
+
+    fn ka9q_opts(ssrc: Option<u32>) -> Ka9qOpts {
+        Ka9qOpts {
+            group: Some("239.101.6.1".into()),
+            port: manta_input::ka9q::wire::DATA_PORT,
+            ssrc,
+            interface: None,
+            ..Ka9qOpts::unset()
+        }
+    }
+
+    #[test]
+    fn ka9q_flag_selects_the_source_and_replaces_a_typed_input() {
+        let cli = CliOverrides {
+            ka9q: Ka9qOpts {
+                interface: Some(std::net::Ipv4Addr::new(192, 168, 1, 20)),
+                ..ka9q_opts(Some(14_100_000))
+            },
+            ..cli_overrides()
+        };
+        assert_eq!(cli.source_selector(), Some("--ka9q-group"));
+        let LiveSourceSpec::Ka9q(k) = cli.clone().into_spec() else {
+            panic!("expected the ka9q source from --ka9q-group");
+        };
+        assert_eq!(k.group.as_deref(), Some("239.101.6.1"));
+        assert_eq!(k.port, 5004);
+        assert_eq!(k.ssrc, Some(14_100_000));
+        assert_eq!(k.interface, Some(std::net::Ipv4Addr::new(192, 168, 1, 20)));
+
+        // A typed [input] is replaced whole, its shared keys included.
+        let r = resolve(cli, &loaded_from(KIWI_INPUT)).unwrap();
+        assert!(matches!(r.spec, LiveSourceSpec::Ka9q(_)));
+        assert_eq!(r.replaced_file_source, Some("--ka9q-group"));
+        assert_eq!(r.freq_correction_ppm, 0.0);
+        assert_eq!(r.dial_freq_hz, None);
+        assert!(
+            r.notes[0]
+                .contains("--ka9q-group selects the source; ignoring [input] (type = \"kiwi\")"),
+            "{:?}",
+            r.notes
+        );
+
+        // The flags as clap parses them, defaults included.
+        let parsed = Cli::try_parse_from([
+            "manta",
+            "run",
+            "--ka9q-group",
+            "239.101.6.1",
+            "--ka9q-ssrc",
+            "14100000",
+            "--ka9q-interface",
+            "192.168.1.20",
+        ])
+        .unwrap();
+        let Command::Run {
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
+            ..
+        } = parsed.command
+        else {
+            unreachable!("parsed `run`");
+        };
+        assert_eq!(ka9q_group.as_deref(), Some("239.101.6.1"));
+        assert_eq!(ka9q_port, 5004);
+        assert_eq!(ka9q_ssrc, Some(14_100_000));
+        assert_eq!(
+            ka9q_interface,
+            Some(std::net::Ipv4Addr::new(192, 168, 1, 20))
+        );
+        // --ka9q-interface takes an address, not an interface name.
+        assert!(Cli::try_parse_from([
+            "manta",
+            "run",
+            "--ka9q-group",
+            "239.101.6.1",
+            "--ka9q-interface",
+            "eth0",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn spec_from_file_maps_a_ka9q_input() {
+        let loaded = loaded_from(
+            "[input]\ntype = \"ka9q\"\ngroup = \"239.101.6.1\"\nport = 5010\nssrc = 14100000\n\
+             interface = \"192.168.1.20\"\n",
+        );
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        let LiveSourceSpec::Ka9q(k) = &r.spec else {
+            panic!("expected the ka9q source from [input]");
+        };
+        assert_eq!(k.group.as_deref(), Some("239.101.6.1"));
+        assert_eq!(k.port, 5010);
+        assert_eq!(k.ssrc, Some(14_100_000));
+        assert_eq!(k.interface, Some(std::net::Ipv4Addr::new(192, 168, 1, 20)));
+        assert_eq!(r.replaced_file_source, None);
+
+        let loaded = loaded_from("[input]\ntype = \"ka9q\"\ngroup = \"cw-20m.local\"\n");
+        let LiveSourceSpec::Ka9q(k) = resolve(cli_overrides(), &loaded).unwrap().spec else {
+            panic!("expected the ka9q source from [input]");
+        };
+        assert_eq!(k.group.as_deref(), Some("cw-20m.local"));
+        assert_eq!(k.port, 5004);
+        assert_eq!(k.ssrc, None);
+        assert_eq!(k.interface, None);
+    }
+
+    #[test]
+    fn ka9q_spec_is_rf_aware_and_reconnectable_and_named_ka9q() {
+        let spec = LiveSourceSpec::Ka9q(ka9q_opts(None));
+        // radiod reports the channel's frequency, so --dial-freq-hz is an
+        // override, not a requirement.
+        assert!(spec.is_rf_aware());
+        assert!(!needs_dial_freq(true, spec.is_rf_aware(), None));
+        assert!(spec.is_reconnectable());
+        // The `source` label of manta_source_health and manta_input_*.
+        assert_eq!(spec.name(), "ka9q");
+    }
+
+    #[test]
+    fn receiver_desc_names_the_ka9q_group() {
+        let d = receiver_desc(&LiveSourceSpec::Ka9q(ka9q_opts(None)));
+        assert_eq!(d.kind, doctor_checks::ReceiverKind::Ka9q);
+        assert_eq!(d.description, "ka9q-radio group 239.101.6.1:5004");
+        let d = receiver_desc(&LiveSourceSpec::Ka9q(ka9q_opts(Some(14_100_000))));
+        assert_eq!(
+            d.description,
+            "ka9q-radio group 239.101.6.1:5004 ssrc 14100000"
+        );
+    }
+
+    #[test]
+    fn ka9q_agc_warning_is_design_section_3s_text() {
+        assert_eq!(
+            ka9q_agc_warning(14_100_000),
+            "warning: ka9q-radio channel ssrc 14100000 has AGC on; set agc = off and a fixed \
+             gain in its radiod section, or one strong signal changes the gain for every \
+             signal in the passband"
+        );
+    }
+
     /// D10: every config-backed flag maps to the key it overrides.
     const FLAG_KEYS: &[(&str, &str)] = &[
         ("device", "input.device"),
@@ -8777,6 +9371,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("hpsdr_port", "input.port"),
         ("hpsdr_freq_hz", "input.freq_hz"),
         ("hpsdr_rate_hz", "input.rate_hz"),
+        ("ka9q_group", "input.group"),
+        ("ka9q_port", "input.port"),
+        ("ka9q_ssrc", "input.ssrc"),
+        ("ka9q_interface", "input.interface"),
         ("freq_correction_ppm", "input.freq_correction_ppm"),
         ("dial_freq_hz", "input.center_freq_hz"),
         ("capture_rate_hz", "input.capture_rate_hz"),
@@ -8786,6 +9384,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("notch", "spot.notch_path"),
         ("cty", "spot.cty_path"),
         ("scp", "spot.scp_path"),
+        ("patterns", "spot.pattern_path"),
         ("engine", "decode.engine"),
         ("rbn_compare", "rbn_compare.enabled"),
         ("rbn_spotter", "rbn_compare.spotters"),
@@ -8800,6 +9399,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         // `decode --center-freq-hz` (MAN-131 D8): a recording's centre, not
         // the live receiver's `input.center_freq_hz`.
         "center_freq_hz",
+        // `decode --timing` (MAN-315): an output choice, like `json`.
+        "timing",
         "help",
         "version",
         "reference_hz",
@@ -8917,6 +9518,11 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 "hpsdr",
                 "type = \"hpsdr\"\nhost = \"h\"\nport = 1024\nfreq_hz = 7e6\nrate_hz = 48000.0\n",
             ),
+            (
+                "ka9q",
+                "type = \"ka9q\"\ngroup = \"239.1.2.3\"\nport = 5004\nssrc = 1\n\
+                 interface = \"127.0.0.1\"\n",
+            ),
         ];
         const SHARED: &[(&str, &str)] = &[
             (
@@ -8937,6 +9543,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             ("spot.notch_path", "[spot]\nnotch_path = \"n.txt\"\n"),
             ("spot.cty_path", "[spot]\ncty_path = 'cty.dat'\n"),
             ("spot.scp_path", "[spot]\nscp_path = 'MASTER.SCP'\n"),
+            (
+                "spot.pattern_path",
+                "[spot]\npattern_path = 'patterns.lst'\n",
+            ),
             ("decode.engine", "[decode]\nengine = \"legacy\"\n"),
             (
                 "rbn_compare.enabled",
@@ -8992,6 +9602,19 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     }
 
     #[test]
+    fn sett_advertises_the_configured_minimal_validation_level() {
+        let cfg = test_server_config("W3XYZ");
+        let profile = station_profile(
+            &cfg,
+            14_040_000.0,
+            (-5_000.0, 5_000.0),
+            1.0,
+            manta_spot::ValidationLevel::Minimal,
+        );
+        assert_eq!(profile.sett.to_string(), "SETT: vlMinimal 14035.0-14045.0");
+    }
+
+    #[test]
     fn sett_advertises_a_rig_audio_source_only_above_its_dial_frequency() {
         // `--source` WAV / an audio device with --dial-freq-hz: analytic
         // audio carries spectrum ONLY above the dial, over the rig's ~3 kHz
@@ -9005,6 +9628,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 manta_input::AUDIO_PASSBAND_HI_HZ,
             ),
             1.0,
+            manta_spot::ValidationLevel::Normal,
         );
         assert_eq!(
             profile.sett.to_string(),
@@ -9019,8 +9643,20 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         // bounds have to move with them.
         let cfg = test_server_config("W3XYZ");
         let factor = manta_spot::calibration_factor_from_ppm(1_000.0).unwrap();
-        let corrected = station_profile(&cfg, 14_040_000.0, (-5_000.0, 5_000.0), factor);
-        let raw = station_profile(&cfg, 14_040_000.0, (-5_000.0, 5_000.0), 1.0);
+        let corrected = station_profile(
+            &cfg,
+            14_040_000.0,
+            (-5_000.0, 5_000.0),
+            factor,
+            manta_spot::ValidationLevel::Normal,
+        );
+        let raw = station_profile(
+            &cfg,
+            14_040_000.0,
+            (-5_000.0, 5_000.0),
+            1.0,
+            manta_spot::ValidationLevel::Normal,
+        );
         assert_eq!(raw.sett.to_string(), "SETT: vlNormal 14035.0-14045.0");
         assert_eq!(corrected.sett.to_string(), "SETT: vlNormal 14049.0-14059.1");
     }
@@ -9106,7 +9742,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -9154,7 +9790,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
