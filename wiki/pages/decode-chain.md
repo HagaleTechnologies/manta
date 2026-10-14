@@ -29,7 +29,11 @@ Each active track runs a classical CW decode chain on its ~375 Hz complex channe
 
 - The keying-decision band must not gate the rail updates: a mark that fades into the band would then update neither rail, freezing `E_hi` at its pre-fade level and deleting the faded marks (MAN-103 D5 did this; V8w recall fell to 0/50 until MAN-213). See `docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md` and SPEC §3.2.
 
+- HSMM evidence's centered maximum is an incremental deque that stays O(1) amortized only while its window bounds move forward; a `set_u_ref` that moves a bound backwards rebuilds it from the retained samples (SPEC v2 §1.2 implementation note, MAN-193 decision `docs/DECISIONS/2026-10-14-man193-centered-maximum-deque.md`).
+
 - The gap unit is `dit_estimate_ms` (the symmetric mark/gap dit), not `mu_dit_ms`: the transmitter's rise time shortens marks and lengthens gaps by the same amount, so gaps in mark dits read long and 4.5-dit letter gaps split words (MAN-315 D3, SPEC §4.2). Beam likelihoods and the keying threshold still use `mu_dit_ms`.
+
+- In the HSMM engine, a history entry's closing-segment provenance (`HistEntry::closing_segment`) is what makes a committed long gap reseedable: a word boundary closed by `Silence` merges the configured seed set even when the keying gate never re-opens, and the uniform score normalization that accompanies reseeding means a zero score with empty history is no longer proof a token is a raw seed — the scored-prefix count (`scored_live_len`) is. See `docs/DECISIONS/2026-10-14-man192-silence-reseed.md` and SPEC v2 §4.7.
 
 ## Why it is shaped this way
 
