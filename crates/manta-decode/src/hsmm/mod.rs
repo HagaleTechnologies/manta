@@ -852,18 +852,10 @@ mod tests {
         dec.push(&man192_ev(100, true, true, 0.0));
         dec.push(&man192_ev(113, true, true, 130.0));
         // Snapshot the retained anchors (100, 113) before the commit hop.
-        let before: Vec<(u64, Vec<(f32, _, token::Phase, f32, usize)>)> = dec
+        let before: Vec<(u64, Vec<Token>)> = dec
             .anchors
             .iter()
-            .map(|a| {
-                (
-                    a.hop,
-                    a.tokens
-                        .iter()
-                        .map(|t| (t.score, t.node, t.phase, t.u, t.hist.len()))
-                        .collect(),
-                )
-            })
+            .map(|a| (a.hop, a.tokens.clone()))
             .collect();
         let out = dec.push(&man192_ev(250, true, true, 130.0));
         assert!(!out.is_empty());
@@ -877,12 +869,12 @@ mod tests {
                 .find(|a| &a.hop == hop)
                 .unwrap_or_else(|| panic!("anchor {hop} must be retained"));
             assert_eq!(a.tokens.len(), tokens_before.len(), "anchor {hop}");
-            for (t, (score, node, phase, u, hist_len)) in a.tokens.iter().zip(tokens_before) {
-                assert_eq!(t.node, *node, "identity fields must not change");
-                assert_eq!(t.phase, *phase);
-                assert!((t.u - u).abs() < 1e-6);
-                assert_eq!(t.hist.len(), *hist_len, "history must be untouched");
-                offsets.push(*score - t.score);
+            for (t, old) in a.tokens.iter().zip(tokens_before) {
+                assert_eq!(t.node, old.node, "identity fields must not change");
+                assert_eq!(t.phase, old.phase);
+                assert!((t.u - old.u).abs() < 1e-6);
+                assert_eq!(t.hist.len(), old.hist.len(), "history must be untouched");
+                offsets.push(old.score - t.score);
             }
         }
         let offset = offsets[0];
