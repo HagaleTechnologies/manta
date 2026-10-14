@@ -13,6 +13,7 @@ use manta_server::metrics::Metrics;
 use manta_spot::cty::Table;
 use manta_spot::{Spot, SpotType};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -213,44 +214,69 @@ async fn a_live_client_that_stops_reading_is_dropped_and_publishing_never_blocks
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let total = LIVE_CHANNEL_CAPACITY + 20_000;
-    let reader = tokio::spawn(async move {
-        let mut reader = BufReader::new(reader_stream);
-        let mut got = 0usize;
-        let mut line = String::new();
-        while got < total {
-            line.clear();
-            let n = tokio::time::timeout(Duration::from_secs(30), reader.read_line(&mut line))
-                .await
-                .expect("the reading client stalled")
-                .unwrap();
-            assert!(
-                n > 0,
-                "the reading client was disconnected after {got} lines"
-            );
-            let idx: usize = line[..line.find(' ').unwrap()].parse().unwrap();
-            assert_eq!(idx, got, "lines arrive in order");
-            got += 1;
+    // Lines the reading client has consumed, so the publisher can be paced
+    // by that client's real progress rather than by wall-clock guesses.
+    let consumed = Arc::new(AtomicUsize::new(0));
+    let reader = tokio::spawn({
+        let consumed = Arc::clone(&consumed);
+        async move {
+            let mut reader = BufReader::new(reader_stream);
+            let mut got = 0usize;
+            let mut line = String::new();
+            while got < total {
+                line.clear();
+                let n = tokio::time::timeout(Duration::from_secs(30), reader.read_line(&mut line))
+                    .await
+                    .expect("the reading client stalled")
+                    .unwrap();
+                assert!(
+                    n > 0,
+                    "the reading client was disconnected after {got} lines"
+                );
+                let idx: usize = line[..line.find(' ').unwrap()].parse().unwrap();
+                assert_eq!(idx, got, "lines arrive in order");
+                got += 1;
+                consumed.store(got, Ordering::Release);
+            }
+            got
         }
-        got
     });
 
+    // Pace the publisher like a decode loop handing over batches, keeping
+    // it at most half the live channel ahead of what the reading client
+    // has consumed. The server's handler for that client has received at
+    // least as much as the client has read, so its receiver can never lag
+    // -- however slow this host's loopback is -- while the stalled
+    // client's handler, blocked on a full socket, falls far behind. The
+    // wait happens here, outside `publish_live`, so it does not count as
+    // publishing time below.
     let pad = "x".repeat(1024);
-    let start = Instant::now();
+    let mut publishing = Duration::ZERO;
     for i in 0..total {
-        node.bus.publish_live(Arc::from(format!("{i} {pad}")));
-        // Pace the publisher like a decode loop handing over batches, so
-        // the reading client keeps up while the stalled one cannot.
-        if i % 256 == 255 {
-            tokio::task::yield_now().await;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while i - consumed.load(Ordering::Acquire) >= LIVE_CHANNEL_CAPACITY / 2 {
+            if reader.is_finished() {
+                // It ended early: surface its panic message.
+                reader.await.unwrap();
+                panic!("the reading client ended after fewer than {total} lines");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the reading client made no progress for 60 s"
+            );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+        let line: Arc<str> = Arc::from(format!("{i} {pad}"));
+        let start = Instant::now();
+        node.bus.publish_live(line);
+        publishing += start.elapsed();
     }
-    let publish_elapsed = start.elapsed();
-    // Publishing is a non-blocking broadcast send; even paced, it never
-    // waits on the stalled client.
+    // Publishing is a non-blocking broadcast send: all of the calls
+    // together take far less than the server's 10 s per-write timeout that
+    // a send waiting on the stalled client would have to sit through.
     assert!(
-        publish_elapsed < Duration::from_secs(5) + Duration::from_millis(total as u64 / 256 * 2),
-        "publishing took {publish_elapsed:?}"
+        publishing < Duration::from_secs(2),
+        "publishing took {publishing:?}"
     );
 
     assert_eq!(reader.await.unwrap(), total);
