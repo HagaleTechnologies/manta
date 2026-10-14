@@ -175,11 +175,23 @@ same Rust engine. RBN's real login prompt and the live/offline agreement
 rate are unmeasured. See
 docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
 
+<<<<<<< HEAD
 MAN-152: the in-repo `wiki/` is manta's canonical wiki. GitHub's Wiki tab
 is not used; disabling it remains an owner step. The wiki pages'
 `verified` stamps and `manifest.json` are refreshed and pinned by a
 `docs_consistency` test. See
 `docs/DECISIONS/2026-10-13-man152-one-wiki.md`.
+=======
+MAN-140: `--ka9q-group` (with `--ka9q-port`/`--ka9q-ssrc`/
+`--ka9q-interface`) or `[input] type = "ka9q"` reads one existing
+ka9q-radio (radiod) IQ channel over RTP multicast, in every build (no
+Cargo feature). Rate, encoding, frequency and filter edges come from the
+status radiod sends to the data group on port 5006; manta also joins on
+127.0.0.1 (radiod's default `ttl = 0`); a retune ends the run with exit 1.
+Written clean-room from ka9q-radio's docs and headers at `f44b3a3ee8dd`;
+six facts (D-HW) still need a live radiod. See docs/GUIDES/ka9q-radio.md
+and docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md.
+>>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
 
 MAN-324: `[server].live_port` (unset = off; `live_bind_addr` default
 `127.0.0.1`) starts a live-state stream for dashboards: `bandState`,
@@ -206,6 +218,15 @@ also daily on main). Trusted PRs get a non-required `test (windows-latest)`
 check-run. `release-publish.yml` refuses a tag whose CI push run failed any
 test leg. The `PR title` check requires a Conventional Commits title. See
 docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md.
+
+MAN-315: the legacy decoder learns per-track dot/dash/gap timing
+(`SenderTiming`, SPEC §4.1b; `TimingUpdate` event, `decode --json`
+`timing`, a `decode --timing` stderr line); gaps are measured in the
+symmetric dit (`dit_estimate_ms`), the word boundary is the sender's own,
+and the dash/dot ceiling is 6.0. VW1–VW5 (SPEC §7.3, `golden_vw.rs`)
+pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
+planned dash re-split was dropped after a bogus V8w spot). See
+docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
 ## Documents (read in this order)
 
