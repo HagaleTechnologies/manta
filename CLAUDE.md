@@ -259,6 +259,11 @@ replaced by `--patterns` / `[spot].pattern_path`; allowlist and beacon
 exemptions stay. Live decisions report `requiredReps` and `patternTier`.
 See docs/DECISIONS/2026-10-14-man95-pattern-rarity-repetition-tiers.md.
 
+MAN-210: golden vector V51 (V9's drift scene, `refine_bw_hz = 30` via
+`--config`) exercises the narrowband refiner's refine-enabled path
+end-to-end through `manta decode --json` — the evidence any future
+default-on change must keep green.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each
