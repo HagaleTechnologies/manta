@@ -7,6 +7,7 @@ pub mod blocklist;
 pub mod confidence;
 pub mod context;
 pub mod cty;
+pub mod decision;
 pub mod dedupe;
 pub mod gate;
 pub mod grammar;
@@ -19,8 +20,10 @@ pub mod variant;
 
 pub use blocklist::Blocklist;
 pub use context::SpotType;
+pub use decision::{CandidateSupport, Decision, Reason, Rival, Verdict, REQUIRED_REPS};
 pub use gate::{RepetitionCounts, REPETITION_BUCKETS};
 pub use notch::{FreqRange, NotchList};
+pub use support::Support;
 pub use validator::{
     calibration_factor_from_ppm, InvalidCalibration, Spot, SuppressionCounts, Validator,
 };

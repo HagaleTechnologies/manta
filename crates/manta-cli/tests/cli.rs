@@ -242,6 +242,65 @@ fn gen_then_decode_prints_text() {
     );
 }
 
+/// MAN-315 scenario 3: `manta decode --timing` prints the primary track's
+/// learned sender timing on stderr, after the summary line; stdout stays the
+/// decoded text alone, and without `--timing` stderr is the summary alone
+/// (MAN-270). With `--json`, the report's top-level `timing` carries it.
+#[test]
+fn decode_prints_timing_line_for_primary_track() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::VectorSpec {
+        duration_s: 15.0,
+        ..manta_testkit::vectors::v1()
+    };
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let wav = dir.path().join("v1.wav");
+
+    let out = manta().arg("decode").arg(&wav).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert!(!stderr.contains("timing"), "stderr: {stderr}");
+
+    let out = manta()
+        .args(["decode", "--timing"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "stdout: {stdout:?}");
+    assert!(!stdout.contains("timing"), "stdout: {stdout:?}");
+    let lines: Vec<&str> = stderr.lines().collect();
+    let summary = lines
+        .iter()
+        .position(|l| l.starts_with("frequency: "))
+        .expect("no summary line");
+    assert_eq!(lines.len(), summary + 2, "stderr: {stderr}");
+    assert!(
+        lines[summary + 1].starts_with("timing (dits, mean ± sd): dot "),
+        "stderr: {stderr}"
+    );
+    assert!(
+        lines[summary + 1].contains("  word gap "),
+        "stderr: {stderr}"
+    );
+
+    let out = manta()
+        .args(["decode", "--json"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(report["timing"]["dash"]["mean_dits"].as_f64().is_some());
+    assert!(report["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["event"] == "TimingUpdate"));
+}
+
 #[test]
 fn gen_subcommand_writes_fixture_set() {
     let dir = tempfile::tempdir().unwrap();
@@ -270,6 +329,11 @@ fn unknown_vector_errors() {
         .output()
         .unwrap();
     assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("vr7-vr8, vw1-vw5)"),
+        "the error lists MAN-315's VW vectors: {stderr}"
+    );
 }
 
 /// `Engine::Hsmm` is a fully implemented, reviewed engine since Task 8
@@ -1626,6 +1690,98 @@ fn hpsdr_host_conflicts_with_kiwi_host() {
         stderr.contains("cannot be used with"),
         "expected a clap conflict error, got: {stderr}"
     );
+}
+
+/// MAN-140: `--ka9q-group` is a source selector like the others, so naming
+/// another source with it is clap's conflict error (exit 2), before any I/O.
+#[test]
+fn ka9q_group_conflicts_with_every_other_source_flag() {
+    #[allow(unused_mut)]
+    let mut others: Vec<Vec<&str>> = vec![
+        vec!["--kiwi-host", "x", "--kiwi-freq-hz", "7030000"],
+        vec!["--device", "USB Audio"],
+        vec!["--source", "v1.wav"],
+    ];
+    #[cfg(feature = "hpsdr")]
+    others.push(vec![
+        "--hpsdr-host",
+        "192.168.1.100",
+        "--hpsdr-freq-hz",
+        "14000000",
+        "--hpsdr-rate-hz",
+        "192000",
+    ]);
+    #[cfg(feature = "soapy")]
+    others.push(vec![
+        "--soapy-driver",
+        "driver=rtlsdr",
+        "--soapy-freq-hz",
+        "14000000",
+        "--soapy-rate-hz",
+        "192000",
+    ]);
+    for other in &others {
+        for order in [true, false] {
+            let mut args = vec!["run"];
+            if order {
+                args.extend(["--ka9q-group", "239.1.2.3"]);
+                args.extend(other.iter().copied());
+            } else {
+                args.extend(other.iter().copied());
+                args.extend(["--ka9q-group", "239.1.2.3"]);
+            }
+            let out = manta().args(&args).output().unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+            assert!(
+                stderr.contains("cannot be used with"),
+                "{args:?}: expected a clap conflict error, got: {stderr}"
+            );
+        }
+    }
+}
+
+/// MAN-140: `--ka9q-port`, `--ka9q-ssrc` and `--ka9q-interface` describe the
+/// group's channel, so each needs `--ka9q-group`.
+#[test]
+fn ka9q_port_ssrc_interface_require_the_group() {
+    for (flag, value) in [
+        ("--ka9q-port", "5004"),
+        ("--ka9q-ssrc", "14100000"),
+        ("--ka9q-interface", "192.168.1.20"),
+    ] {
+        let out = manta().args(["run", flag, value]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{flag}: {stderr}");
+        assert!(
+            stderr.contains("the following required arguments were not provided")
+                && stderr.contains("--ka9q-group"),
+            "{flag}: expected clap's missing --ka9q-group error, got: {stderr}"
+        );
+    }
+}
+
+/// MAN-140: every command that opens a live source takes the four
+/// `--ka9q-*` flags under their own help heading (`listen` is `run`'s alias).
+#[test]
+fn every_live_command_takes_the_ka9q_flags() {
+    for command in ["run", "listen", "soak", "doctor", "calibrate", "check"] {
+        let out = manta().args([command, "--help"]).output().unwrap();
+        assert!(out.status.success(), "{command} --help failed");
+        let help = String::from_utf8_lossy(&out.stdout);
+        for needle in [
+            "ka9q-radio source:",
+            "--ka9q-group <KA9Q_GROUP>",
+            "--ka9q-port <KA9Q_PORT>",
+            "--ka9q-ssrc <KA9Q_SSRC>",
+            "--ka9q-interface <KA9Q_INTERFACE>",
+        ] {
+            assert!(
+                help.contains(needle),
+                "`manta {command} --help` lacks {needle:?}:\n{help}"
+            );
+        }
+    }
 }
 
 /// MAN-135 renamed the Hz-valued flags to a consistent `-hz` suffix and

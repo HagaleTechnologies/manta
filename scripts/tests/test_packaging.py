@@ -828,8 +828,14 @@ class InstallGuideTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             binary = os.path.join(tmp, "manta")
             write_bytes(binary, b"fake manta")
+            # MAN-133: the helper needs a man dir holding manta.1; one page is
+            # enough here (its archive contents are test_package_release's job).
+            man_dir = os.path.join(tmp, "man-pages")
+            os.makedirs(man_dir)
+            write_bytes(os.path.join(man_dir, "manta.1"), b".TH manta 1\n")
             subprocess.run([sys.executable, PACKAGE_RELEASE, "--binary", binary,
-                            "--artifact", "manta-test", "--format", "tar.gz", "--out-dir", tmp],
+                            "--artifact", "manta-test", "--format", "tar.gz",
+                            "--out-dir", tmp, "--man-dir", man_dir],
                            check=True, capture_output=True)
             with tarfile.open(os.path.join(tmp, "manta-test.tar.gz")) as tar:
                 if hasattr(tarfile, "data_filter"):

@@ -211,7 +211,12 @@ Per channel, smoothed power `S[k, m]`: EMA of `PdB[k, m]` with time constant
 **τ = 40 ms** (`α = 1 − e^{−2.667/40} = 0.0645`).
 
 - **Rise:** `S ≥ F + 6 dB` (`detector.on_snr_db = 6.0`) sustained for
-  **19 consecutive hops (≈ 50 ms)** — rejects impulse noise and clicks.
+  **19 consecutive hops (≈ 50 ms)** — rejects impulse noise and clicks on
+  one channel. It does not reject a band-wide impulse (a static crash): the
+  85.33 ms prototype filter (§1.2) and this 40 ms EMA smear a crash of a
+  few milliseconds across tens of hops of every channel at once, long
+  enough to pass the 19-hop test on hundreds of channels. §2.7 detects
+  such a crash across the band and holds the gate through it.
 - **Drop:** `S < F + 3 dB` (`detector.off_snr_db = 3.0`, i.e. 3 dB
   hysteresis) continuously for **hang = 5 000 ms** (1875 hops) — survives QSB
   troughs and inter-word gaps at slow speeds.
@@ -243,7 +248,7 @@ States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`.
 
 | Transition | Condition |
 |---|---|
-| IDLE → CANDIDATE | rise condition first met on channel `k`, `k` is not owned by an existing track (§2.5), and `k` is not RTTY-vetoed (§2.6) |
+| IDLE → CANDIDATE | rise condition first met on channel `k`, `k` is not owned by an existing track (§2.5), `k` is not RTTY-vetoed (§2.6), and no static crash is being suppressed this hop (§2.7) |
 | CANDIDATE → ACTIVE | rise sustained 19 hops → lease decoder from pool |
 | CANDIDATE → IDLE | rise condition lost before 19 hops |
 | ACTIVE → HANG | drop condition met (below off threshold) |
@@ -254,6 +259,14 @@ States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`.
 | ACTIVE/HANG/CANDIDATE → CLOSED | `round(c)` inside a marked RTTY signal's hard span (§2.6) → closed as bookkeeping (`CloseReason` `rtty`, counted) |
 
 All timers are hop-counted (integers), never wall-clock.
+
+On a hop where a static crash is suppressed (§2.7, `detector.crash_filter`
+`"full"` or `"starts-only"`), no IDLE → CANDIDATE transition happens, a
+CANDIDATE's lifecycle does not step (its confirm count neither advances
+nor resets), and ACTIVE/HANG tracks step on rise/drop recomputed from the
+gate's held `S[k]` (its value before the crash) against the current floor.
+The crash's energy therefore cannot confirm a candidate or turn a HANG
+track back to ACTIVE.
 
 ### 2.5 Adjacent-channel ownership (one signal ⇒ one track)
 
@@ -346,6 +359,178 @@ Effects on the track manager (§2.4/§2.5):
 Determinism: no RNG and no clock; pairs iterate in frequency order through
 a `BTreeMap`; sums run in index order with `f64` accumulators.
 `rtty_filter = false` builds no detector and leaves every output as before.
+
+### 2.7 Band-wide static-crash detection (MAN-312)
+
+MAN-312, `manta-dsp::crash::CrashDetector`, see
+docs/DECISIONS/2026-10-13-man312-static-crash-filter.md. A static crash
+(lightning or another atmospheric impulse) is a few milliseconds of
+broadband energy. The prototype filter is `L·N` taps, `8 / 93.75 Hz =
+85.33 ms` at every table rate (§1.2), and the gate EMA has τ = 40 ms
+(§2.3); together they spread one crash across tens of hops of every
+channel. Judged one channel at a time (§2.3), a +40 dB, 5 ms crash on an
+empty 96 kS/s band starts 177 tracks, and the same energy reaches every
+running track's decoder as extra key-down. A crash lifts nearly every
+channel together and CW never does, so the detector judges each hop
+across the band. The track manager runs it every hop, before the floor
+and gate updates, on the same `PdB[k]` they receive.
+
+**Live channels.** The statistic runs over the channels inside the
+source's RF passband, `(lo, hi)` Hz relative to the centre frequency
+(`IqSource::rf_passband_hz()`):
+
+- If `lo ≤ −fs/2` and `hi ≥ fs/2` (the default, which file, SoapySDR and
+  HPSDR sources report and a `DecimatingSource` clamps to), every channel
+  is live.
+- Otherwise channel `k` is live when `lo + Δ ≤ o(k)·Δ ≤ hi − Δ`, where
+  `o(k) = ((k + N/2) mod N) − N/2` is §1.3's signed channel offset: one
+  channel of margin inside each passband edge, where the source's own
+  filter roll-off sits. A KiwiSDR's ±5 kHz at 96 kS/s gives 105 live
+  channels; 48 kHz rig audio with a 300–3000 Hz passband gives 27.
+
+The paths that open a live source (`manta-engine::listen`, which `run`
+uses, and the soak harness) give the track manager the source's
+passband; `decode` (file input) uses the full band, which is what every
+IQ WAV source reports. With fewer than
+`CRASH_MIN_LIVE_CHANNELS` (96) live channels the detector is
+**inactive**: it never fires and counts nothing, and every
+`crash_filter` value behaves as `"off"`. `run` logs one INFO line when
+the filter is not `"off"` but inactive. The passband matters: over all
+1024 channels of a KiwiSDR-shaped 96 kS/s stream the out-of-band
+channels never lift, so crashes went undetected (22 and 60 tracks
+started under `"full"`); over the 105 passband channels none started.
+
+**Reference.** The detector keeps its own per-channel dB reference `R[k]`
+for every channel, live or not. On its first hop, `R[k] = PdB[k]`. On
+every later hop whose reference is not frozen (below), each channel
+updates:
+
+```text
+R[k] ← PdB[k]                         if R[k] < HIST_MIN_DB (−140 dBFS, §2.1)
+R[k] ← R[k] + α·(PdB[k] − R[k])       otherwise, α = 0.0645 (§2.3's gate α)
+```
+
+The first rule is for digital silence (a source still opening, or a gap
+of zeros). Input returning from silence lifts every channel, so it is
+held as a crash until `CRASH_MAX_HOPS` (below); when the reference then
+unfreezes, the rule moves it to the new level in one hop rather than over
+the EMA's tail, and the crash releases `CRASH_RELEASE_HOPS` later.
+
+**Lift.** On hop `m`, when the detector is **armed** (the segment's hop
+count has reached `detector.warmup_ms`'s hop count, §2.2; earlier hops
+only warm the reference) and active, with `n` live channels:
+
+```text
+lift[m] = Q25 over live k of (PdB[k, m] − R[k]) + CRASH_ONSET_Q25_OFFSET_DB
+```
+
+`Q25` is the element at index `⌊n/4⌋` of the `n` excesses in ascending
+`f64::total_cmp` order, a selection with no interpolation. `R` is the
+reference before this hop's update. On noise, `PdB − R` is the dB-domain
+spread of a chi-squared 2-DOF power about its smoothed level; its lower
+quartile measured −2.81 dB (theory −2.90), so the offset puts the lift
+of a quiet band near 0 dB. An unarmed or inactive hop has
+`lift = −∞`. A lift of 3 dB at the lower quartile means at least three
+quarters of the live channels rose about 3 dB together. The median was
+measured and rejected: it fired up to 9 times per 30 s on dense bands,
+where Q25 never fired.
+
+**State machine.** Per hop, after the lift:
+
+1. `above = lift ≥ CRASH_LIFT_DB`. `above_run` counts consecutive
+   `above` hops and resets to 0 on any other hop.
+2. If `above` and (`in_crash` or `above_run ≥ CRASH_MIN_HOPS`): set
+   `below_hops = 0`. If not already `in_crash`, the crash **begins**:
+   `in_crash = true`, `count += 1`, `run_hops = 0`.
+3. Otherwise, if `in_crash`: `below_hops += 1`; once
+   `below_hops ≥ CRASH_RELEASE_HOPS`, `in_crash = false`.
+4. If `in_crash`: `run_hops += 1`.
+5. The reference is **frozen** on this hop when
+   `(above or in_crash) and not (in_crash and run_hops > CRASH_MAX_HOPS)`;
+   otherwise it updates as above.
+
+The hop's outputs are `suppress = in_crash and run_hops ≤ CRASH_MAX_HOPS`
+and `hold_decoder = in_crash and run_hops ≤ CRASH_HOLD_MAX_HOPS`. A crash
+begins on its third lifted hop, so its first two lifted hops are neither
+suppressed nor held; the decoder hold below reaches back past them.
+A lift that outlasts `CRASH_MAX_HOPS` is a level change rather than a
+crash (a gain step, or input returning from silence): suppression ends,
+the reference unfreezes and tracks the new level, the lift falls back
+under the threshold, and `in_crash` releases `CRASH_RELEASE_HOPS` later.
+It counts as one crash.
+
+Constants (compile-time, `pub const` in `manta-dsp::crash`; the measured
+basis is in the decision record):
+
+| Constant | Value | Basis |
+|---|---|---|
+| `CRASH_LIFT_DB` | 3.0 dB | the ticket's "≥ 3 dB across most of the stream". Noise's largest 3-hop lift was 0.40–1.03 dB at ≥ 512 live channels and 2.69 dB at 97 |
+| `CRASH_ONSET_Q25_OFFSET_DB` | 2.8 dB | −Q25 of `PdB − R` on noise: measured 2.81, theory 2.90 |
+| `CRASH_MIN_HOPS` | 3 (8 ms) | dense bands reached single-hop lifts of 3.27–3.38 dB but at most 2.48 dB over 3 hops; a 1 ms +40 dB crash still flags 16 hops |
+| `CRASH_RELEASE_HOPS` | 4 (10.7 ms) | one prototype-filter sidelobe period; every measured crash counted exactly once |
+| `CRASH_HOLD_MAX_HOPS` | 75 (200 ms) | caps the decoder hold; measured short crashes flag at most 30 hops |
+| `CRASH_MAX_HOPS` | 375 (1 s) | past this the lift is a level change: suppression ends and the reference re-tracks |
+| `CRASH_MIN_LIVE_CHANNELS` | 96 | 64 live channels gave 7 false crashes per hour of noise; 97, 105 and 128 gave none |
+
+**Mode actions.** `detector.crash_filter` (§9) chooses what the track
+manager does on a hop with `suppress` set:
+
+| Action | `"off"` | `"starts-only"` | `"full"` (default) |
+|---|---|---|---|
+| detect; count each crash once, when it begins | yes | yes | yes |
+| no spawn decision (§2.4 IDLE → CANDIDATE, §2.5) | no | yes | yes |
+| CANDIDATE lifecycles do not step | no | yes | yes |
+| gate EMA `S[k]` held; rise/drop recomputed from the held `S[k]` against the current floor | no | yes | yes |
+| track centroids (§1.4, §2.5) not updated | no | yes | yes |
+| ACTIVE/HANG lifecycles step on the held rise/drop | no (live rise/drop) | yes | yes |
+| decoder input held at its pre-onset value (hops with `hold_decoder`) | no | no | yes |
+| spectral reference (`FloorBank`'s 40 ms linear-power EMA, SPEC-decode-core-v2 §2.2) held (hops with `hold_decoder`) | no | no | yes |
+| floor rings (§2.1) keep taking their decimated pushes | yes | yes | yes |
+| RTTY detector (§2.6, when `rtty_filter` is on) takes the hop's unheld `PdB[k]` and floor | yes | yes | yes |
+
+The floor rings are never frozen: a sustained band-wide rise has to reach
+the floor eventually, or a level step would never release. `"off"`
+counts crashes and changes nothing else; its event stream equals that of
+an inactive detector, which is the behaviour before MAN-312.
+`"starts-only"` lets a running track decode the crash as received.
+
+**Decoder hold (`"full"`).** Each decoder input entry (§3's `a[m]` with
+its raw power, spectral reference, sample timestamp and current SNR)
+carries the `hold_decoder` flag of the hop on which it was observed. The
+flag is captured at observation, so it stays with its entry through the
+refiner's `GROUP_DELAY_HOPS` delay (MAN-194, SPEC-decode-core-v2 §3),
+which emits a refined entry several hops after it was observed. Each
+track keeps the `(amplitude, raw power)` of its last `CRASH_MIN_HOPS`
+clean entries. When an entry is queued for the decoder:
+
+- a clean entry joins that history (the oldest pair leaves past
+  `CRASH_MIN_HOPS`) and passes unchanged;
+- a flagged entry has its `(amplitude, raw power)` replaced by the
+  history's oldest pair, the value from before the lift crossed the
+  threshold. With an empty history it passes unchanged. Its timestamp,
+  spectral reference and SNR are kept, and it does not join the history.
+
+The held value is the one from before the onset, not from just before the
+flag: the crash's first two lifted hops precede the flag and are already
+in the history. A hold, rather than zeroed input, leaves the keyer in
+the state it was in before the crash: zeros during a key-down would read
+as a key-up and split the element. On VC2 (§7.2) the hold added no dits,
+but it can substitute a character (`W1AW` → `A1AW` or `WAOAW`, `CQ` →
+`CGT` were measured), so the §7.2 vectors assert dits and spots, not
+text.
+
+**Counting.** `TrackManager::static_crash_count()` is one decode
+segment's count. The daemon sums segments across source reconnects and
+exports the total as `manta_static_crashes_total`, which never decreases
+(docs/METRICS.md); the soak report carries it as `static_crashes`.
+
+**Determinism.** The detector holds only per-hop state (the reference,
+the run counters and the count), allocates nothing per hop, uses no RNG
+and no clock, and takes its quartile by `f64::total_cmp` selection over
+the live channels in ascending index order. It consumes one channelizer
+hop at a time, so its state and every output are independent of how the
+input is chunked (§6); `crash_state_is_chunk_invariant` checks 256-,
+4096- and 65536-sample chunks.
 
 ---
 
@@ -500,9 +685,16 @@ down, and the clamp re-anchors `μ_dah`.
 space (i.e. `dit` iff `d < B`), then EMA the assigned centroid:
 `μ ← μ + 0.15·(d − μ)`.
 
-**Constraints** — after every update enforce `2.2 ≤ μ_dah/μ_dit ≤ 4.5`
+**Constraints** — after every update enforce `2.2 ≤ μ_dah/μ_dit ≤ 6.0`
 (weighted keying and Farnsworth stay inside this window); on violation,
-re-anchor `μ_dah = 3·μ_dit`. Clamp `μ_dit` to `[20 ms, 150 ms]`
+re-anchor `μ_dah = r·μ_dit`, where `r` is the sender's learned dash/dot
+ratio (§4.1b; both mark classes need ≥ 3 observations, clamped to the same
+window) and `3.0` before that. **[DEVIATION]** (MAN-315 D5,
+`docs/DECISIONS/2026-10-11-man315-sender-timing.md`): the ceiling was
+`4.5` and the target always `3.0`. Heavy-dash senders sit at or above `4.5`,
+so a dit cluster seeded by a noise fragment never healed: the re-anchor
+kept snapping `μ_dah` back to `3·μ_dit` (measured: dit stuck at 20 ms for
+weight 4 and 5). Clamp `μ_dit` to `[20 ms, 150 ms]`
 (60 WPM .. 8 WPM); the reported PARIS WPM is `1200 / dit_estimate`
 (§4.1a's symmetric correction of `μ_dit_ms`), EMA-smoothed with
 `α = 0.1`.
@@ -513,7 +705,8 @@ centroid by > 40 %, the operator has changed speed (QRQ/QRS): reinitialize
 from the last 5 marks. (Plain EMA tracking already follows ≤ ~20 % gradual
 drift; this rule catches step changes.) A regime-change reinit also resets
 the §4.1a gap centroid below (a stale correction from the old speed regime
-must not carry into the new one).
+must not carry into the new one), and the sender timing model (§4.1b,
+MAN-315 D7): its statistics were learned in the old scale's dits.
 
 #### 4.1a WPM reporting: symmetric mark/gap dit-period estimate
 
@@ -547,15 +740,42 @@ wpm_raw = 1200 / dit_estimate
 with `DIT_BIAS_CAP_FRAC = 0.35`, a two-sided cap (bounding a runaway if
 mark/gap pairing ever breaks down, e.g. element gaps swallowed by the 12 ms
 debounce at extreme WPM). `μ_dit` itself (and its boundary `B`) stays
-uncorrected: §4.2's `u = gap_ms/μ_dit`, §4.3's beam likelihoods, and §3.2's
-`τ_hi` all want a centroid consistent with the marks actually being
-classified — only the WPM *report* wants the absolute physical estimate.
-Before any element gap has been observed, `dit_estimate = μ_dit` (no
-correction).
+uncorrected: §4.3's beam likelihoods and §3.2's `τ_hi` want a centroid
+consistent with the marks actually being classified. Gaps sit on the other
+side of the same boundary, so §4.2 measures them in `dit_estimate` too
+(**[DEVIATION]**, MAN-315 D3): in `μ_dit` units the rise time made every gap
+read long. Before any element gap has been observed, `dit_estimate = μ_dit`
+(no correction). Element gaps buffered during tracker warm-up (the first 5
+marks) feed `μ_egap` when they are replayed (MAN-315 D3).
+
+#### 4.1b Sender timing model
+
+**[DEVIATION]** (MAN-315, `docs/DECISIONS/2026-10-11-man315-sender-timing.md`):
+each track learns its own sender's timing (`SenderTiming` in
+`crates/manta-decode/src/timing.rs`) instead of assuming 1 / 3 / 1 / 3 / 7.
+Five classes, each an EW mean and variance **in dits of `dit_estimate`**
+(§4.1a) at observation time, with an observation count:
+`d = x − mean; mean += α·d; var = (1−α)·(var + α·d²)`, `α = cluster_alpha`;
+the first sample sets `mean = x`, `var = 0`.
+
+| Class | Fed by |
+|---|---|
+| dot / dash | the marks of a character decoded as a plain `Char` whose pattern has as many elements as there were marks, labelled by that pattern; garbles, prosigns and length mismatches feed nothing |
+| element gap | gaps classified inter-element (§4.2), live and replayed |
+| char gap | closed gaps classified inter-character |
+| word gap | closed gaps classified inter-word, and flushed gaps at their closed length (flush length + the space that follows, or the flush length alone when the next mark absorbs a remainder shorter than the demod's debounce window); a gap ≥ `max(15, 4·char-gap mean)` dits is a pause and is not learned |
+
+Uses: §4.1's ratio re-anchor target and §4.2's sender word boundary.
+MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses) read the means
+and variances; this section uses only the means. A §4.1 drift re-init
+resets every class. Legacy and EdgeLegacy only; the HSMM engine (SPEC v2)
+keeps its own per-token speed and learns none of this.
 
 ### 4.2 Gap classification (spaces)
 
-Nominal thresholds in dits (`u = gap_ms / μ_dit`):
+Nominal thresholds in dits (`u = gap_ms / dit_estimate`, §4.1a; was
+`gap_ms / μ_dit` before MAN-315 D3 — the safety-net flush threshold below
+uses the same unit):
 
 - `u < 2.0` → **inter-element** (within a character)
 - `2.0 ≤ u < 5.0` → **inter-character**
@@ -587,6 +807,16 @@ and `μ_wgap / μ_cgap ≥ 1.8`, the word threshold becomes the geometric mean
 `sqrt(μ_cgap · μ_wgap)` instead of the fixed `5.0` dits; the character
 threshold stays at `2.0` dits (element/character confusion is speed-locked;
 character/word spacing is what Farnsworth stretches).
+
+**Sender word boundary** — **[DEVIATION]** (MAN-315 D4). When Farnsworth is
+not active, the character/word threshold is the sender's own, from §4.1b:
+`sqrt(char_gap · word_gap)` once both are learned, `char_gap · sqrt(7/3)`
+with only the char gap, clamped to `[3.0, 12.0]` dits; before any char gap,
+the nominal `5.0`. Precedence: an active Farnsworth pair, then the sender
+boundary, then `5.0`. The inter-element/inter-character threshold stays
+`2.0` (scoring it from the learned variances is MAN-111's). Measured
+(envelope level, 25 WPM, 5 ms rise): letter gaps of 4.5 dits and word gaps
+of 9 decoded `C Q T E S T W 1 A W` before; `CQ TEST W1AW` after.
 
 A trailing space reaching `7·μ_dit` without a new mark forces character +
 word flush immediately (don't wait for the next mark to close a word —
@@ -833,7 +1063,24 @@ TrackClosed    { track_id }  (added post-freeze, MAN-19 — a track has closed
                  and will never emit another event under this track_id; only
                  emitted for a track that produced at least one other event
                  first.)
+TimingUpdate   { track_id, sample_ts: u64, dit_ms: f32, dot, dash, element_gap,
+                 char_gap, word_gap }  (added post-freeze, MAN-315 — the
+                 track's §4.1b sender timing; each class is
+                 { mean_dits, var_dits2, n } or null before its first
+                 observation, in dits of dit_ms = dit_estimate. On the
+                 TrackMeta cadence when a class gained an observation since
+                 the last one, and once at track finish if anything changed.
+                 A drift re-init (§4.1b) that wipes timing an update already
+                 reported counts as a change: the next update goes out even
+                 with no new observation, wiped classes null, so a stale
+                 update never stands as the track's last. Legacy/EdgeLegacy
+                 only.)
 ```
+
+`manta decode --json` also reports the primary track's last `TimingUpdate`
+(without `track_id`/`sample_ts`) as the top-level `timing`, and
+`manta decode --timing` prints it on stderr, after the summary line, as
+`timing (dits, mean ± sd): dot … dash … element gap … char gap … word gap …`.
 
 `TrackMeta.snr_2500_db` is §2.3's floor-based `S − F` estimate (peak-held
 over the reporting interval, per §2.3), supplied by the detector layer that
@@ -976,6 +1223,49 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V45 | non-callsign-convention | Each listed CW convention (`5NN`, `3NN`, `599`, `TEST`, …) sent as a CQ/DE/beacon candidate, some of which match an allocated cty.dat prefix (`5N` Nigeria) | 0 spots — rejected by grammar regardless of cty.dat (MAN-105) |
 | V45b | convention-never-vetoes | A track that repeats `5NN` exchanges, then a real non-SCP call ending in `5NN` (`HA5NN`) | The real call spots — the convention never enters the MAN-100 support ledger (MAN-105) |
 
+### 7.2 Static-crash vectors (VC1–VC3, MAN-312)
+
+These gate §2.7. Each crash is complex white Gaussian noise `width` long,
+`level` dB above the scene's unit AWGN power, added to the rendered IQ by
+`manta-testkit::crash` (a separate adder, so no existing scene or golden
+vector changes) from ChaCha8 seeds pinned in that module; every MAN-312
+number depends on that generator and those seeds. The vectors are not
+part of `manta gen`.
+
+| # | Name | Signal(s) | Impairment | Pass criteria |
+|---|---|---|---|---|
+| VC1 | crash-only-band | none (10 s; 48/96/192 kHz; KiwiSDR-shaped ±5 kHz) | one crash at 5 s, 1–500 ms, +6…+60 dB | 0 tracks under `full`/`starts-only`; each crash ≥ +20 dB counted once |
+| VC2 | crash-mid-character | V1's W1AW at +15 dB, 60 s | 24 crashes, 5 ms, +20/+40/+60 dB | 1 track closed only at end of stream; dits ≤ crash-free; W1AW spotted (`full`, legacy and HSMM); `starts-only` decodes the crash |
+| VC3 | pileup-50-fading-crashes | the V8w scene | 47 crashes (train seed `0x3333`), 1–10 ms, +20…+60 dB | 0 bogus; ≥ 20/50 validated; ≤ 60 tracks promoted |
+
+VC1 and VC2 run in-crate, in `crates/manta-engine/src/static_crash_tests.rs`,
+alongside the dense-band, long-noise, level-step, silence lead-in,
+chunk-invariance and `off`-identity checks; VC3 runs end to end through
+`manta decode --json` as `vc3_pileup_fading_with_crashes_spots_no_bogus_callsigns`
+in `crates/manta-cli/tests/golden_v8_v8w.rs`; the generator and the
+vector definitions live in `crates/manta-testkit/src/crash.rs`. VC3's
+bogus count depends on the crash draw under every `crash_filter` value
+(five train seeds gave 0, 1, 4, 1 and 1 under `full`), so its seed is
+pinned; promotions and validated calls are the robust discriminators
+(see the decision record).
+
+### 7.3 Sender-weighting vectors VW1–VW5 (MAN-315)
+
+Senders who do not key ideal 1:3 / 3 / 7 timing, decoded on the default
+`legacy` engine (`crates/manta-cli/tests/golden_vw.rs`; `manta gen vw1` …
+`vw5`). All: 96 kHz, 14 MHz centre, offset +12.34 kHz unless stated, 5 ms
+rise, AWGN, looped text, 60 s unless stated. `dit_units`/`element_gap_units`
+set the dot and the element gap in dits (1.0 standard). Learned timing is
+read from the track's last `TimingUpdate` (§5).
+
+| # | Name | Signal(s) | Impairment | Pass criteria |
+|---|---|---|---|---|
+| VW1 | heavy-dash | 25 WPM, dash 4.0 dits, gaps 3/7, +10 dB, `CQ TEST K1ABC K1ABC TEST`, noise seed `0x3153` | AWGN, jitter 8 % (seed 3) | first exact `K1ABC` among the first 10 words, every word after it a keyed word; CER ≤ 0.25; learned dash 3.6–4.4 dits |
+| VW2 | long-gaps | 25 WPM, 3:1, char gap 4.5, word gap 9, +15 dB, `CQ TEST W1AW` | AWGN, jitter 8 % (seed 3) | CER ≤ 0.06; word boundaries ≥ 95 %; learned char gap 4.0–5.0, word gap 8.0–10.0 dits |
+| VW3 | bug-key | 22 WPM, dot 0.85, dash 4.5, element gap 1.0, gaps 3.5/8, +12 dB, `CQ DX DE W9BUG W9BUG K` | AWGN, jitter 10 % (seed 5) | CER ≤ 0.08; learned dash > 4.0 dits |
+| VW4 | heavy hand-key | 18 WPM, dot 1.2, element gap 0.8, dash 3.6, gaps 4/9, +15 dB, `CQ CQ DE G4HND G4HND K` | AWGN, jitter 12 % (seed 6) | CER ≤ 0.08 |
+| VW5 | keyboard + heavy, adjacent | A: 28 WPM ideal 3:1, 3/7, `CQ TEST N1AA N1AA TEST`; B: 22 WPM dash 4.0, gaps 4.5/9, offset +12.34 kHz + 3 × 93.75 Hz, `CQ TEST N2BB N2BB TEST`; both +20 dB; 90 s | AWGN; B jitter 5 % (seed 7) | exactly 2 decoded tracks, each within half a channel (46.875 Hz) of its signal; CER ≤ 0.06 each; A learned dash 2.6–3.4 and char gap 2.5–3.5, B dash 3.6–4.4 and char gap 4.0–5.0, on different `track_id`s |
+
 ---
 
 ## 8. Module map (where each section lands)
@@ -986,11 +1276,13 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | §1.4 interpolation | `manta-dsp::centroid` |
 | §2 floor + gate + state machine | `manta-dsp::floor`, `manta-engine::track` |
 | §2.6 RTTY recognition | `manta-dsp::fsk` |
+| §2.7 static-crash detection | `manta-dsp::crash`, `manta-engine::track` |
 | §3 demod | `manta-decode::envelope` |
 | §4.1–4.2 timing | `manta-decode::timing` |
 | §4.3–4.5 beam decode | `manta-decode::beam`, `manta-decode::tree` |
 | §5 events | `manta-decode::events` |
 | §7 vectors | `manta-testkit::vectors` |
+| §7.2 static-crash vectors | `manta-testkit::crash` |
 
 ## 9. Configuration keys
 
@@ -1021,6 +1313,7 @@ track_cap = 1200
 # MAN-171: a channel whose track closed Silent may not spawn a new
 # CANDIDATE for this long.
 silent_respawn_cooldown_ms = 30000  # 11250 hops
+crash_filter = "full"               # "full" | "starts-only" | "off"; §2.7 (MAN-312)
 # MAN-314: two-tone FSK (RTTY) recognition, §2.6. rtty_dwell_ms >= 1000.
 rtty_filter = true
 rtty_dwell_ms = 20000   # 7500 hops; whole 1 s blocks
@@ -1041,7 +1334,7 @@ hyst_frac = 0.15
 tau_lo_ms = 500
 tau_hi_bounds_ms = [100, 400]
 flush_gap_dits = 7.0
-# mu_ratio_bounds = [2.2, 4.5]  # not configurable yet: compile-time constant in manta-decode::timing
+# mu_ratio_bounds = [2.2, 6.0]  # not configurable yet: compile-time constant in manta-decode::timing (MAN-315: was 4.5)
 # char_gap_dits = 2.0           # not configurable yet: compile-time constant in manta-decode::timing (every engine, MAN-103)
 # word_gap_dits = 5.0           # not configurable yet: compile-time constant in manta-decode::timing
 # cluster_alpha = 0.15          # not configurable yet: compile-time constant in manta-decode::timing
@@ -1055,12 +1348,13 @@ flush_gap_dits = 7.0
 #   kiwi:  host*, freq_hz*, port, password
 #   soapy: driver*, freq_hz*, rate_hz*, gain_db   (build with --features soapy)
 #   hpsdr: host*, freq_hz*, rate_hz*, port        (build with --features hpsdr)
+#   ka9q:  group*, port, ssrc, interface
 # Any source flag on the command line (--device, --source, --kiwi-host,
-# --soapy-driver, --hpsdr-host) replaces a typed [input] table whole,
-# its shared keys below included. Example:
-# type = "kiwi"               # audio | file | kiwi | soapy | hpsdr
+# --soapy-driver, --hpsdr-host, --ka9q-group) replaces a typed [input]
+# table whole, its shared keys below included. Example:
+# type = "kiwi"               # audio | file | kiwi | soapy | hpsdr | ka9q
 # host = "<your-kiwi-host>"   # kiwi, hpsdr
-# port = 8073                 # kiwi (default 8073), hpsdr (default 1024)
+# port = 8073                 # kiwi (default 8073), hpsdr (default 1024), ka9q (default 5004)
 # freq_hz = 7030000.0         # kiwi, soapy, hpsdr: RF center frequency, Hz
 # password = ""               # kiwi (default "")
 # The other types' keys:
@@ -1072,6 +1366,9 @@ flush_gap_dits = 7.0
 # driver = "driver=rtlsdr"    # soapy: SoapySDR device args
 # rate_hz = 192000.0          # soapy, hpsdr: sample rate, Hz
 # gain_db = 30.0              # soapy: omit for the device's AGC
+# group = "239.101.6.1"       # ka9q: the radiod channel's multicast data group, IPv4 address or host name (--ka9q-group)
+# ssrc = 14100000             # ka9q: the channel's SSRC, 0 to 4294967295; omit when the group carries one channel (--ka9q-ssrc)
+# interface = "192.168.1.20"  # ka9q: local IPv4 address to join the group on; omit for the kernel's choice (127.0.0.1 is always joined too) (--ka9q-interface)
 
 # Shared keys, valid with any type or none:
 
@@ -1226,12 +1523,13 @@ names the file; without it they read `MANTA_CONFIG`. An environment value is par
 TOML value (`9300` is an integer, `["W1AW","K1ABC"]` an array), falling
 back to a bare string -- except for the string-typed keys, which are
 always taken verbatim: `server.station_callsign`, `server.bind_addr`,
-`server.metrics_bind_addr`, `server.operator_name`,
-`server.operator_qth`, `server.operator_grid`, `input.type`,
-`input.device`, `input.path`, `input.host`, `input.password`,
-`input.driver`, `spot.blocklist_path`, `spot.notch_path`,
-`spot.cty_path`, `spot.scp_path`, `decode.engine`,
-`rbn_compare.feed_host` and `rbn_compare.login_callsign`. Relative
+`server.metrics_bind_addr`, `server.live_bind_addr`,
+`server.operator_name`, `server.operator_qth`, `server.operator_grid`,
+`input.type`, `input.device`, `input.path`, `input.host`,
+`input.password`, `input.driver`, `spot.blocklist_path`,
+`spot.notch_path`, `spot.cty_path`, `spot.scp_path`, `decode.engine`,
+`detector.crash_filter`, `rbn_compare.feed_host` and
+`rbn_compare.login_callsign`. Relative
 paths from the file resolve against the file's directory; those from a flag or the
 environment resolve against the working directory. `[[rbn_uplink]]`
 cannot be set from the environment. `[rbn_compare]` (MAN-301) is, like

@@ -62,6 +62,15 @@
 #json_port = 7301                    # JSON Lines and WebSocket spot stream
 #metrics_port = 7302                 # Prometheus metrics, GET /metrics
 
+# Live-state stream for dashboards: band noise floor and activity,
+# each track's decoded text and candidates, and why each candidate was or
+# was not spotted. Off unless live_port is set. No password, and it carries
+# every track's decoded text, so the default address accepts connections
+# from this machine only; set "0.0.0.0" for a dashboard on another machine
+# and firewall live_port to it.
+#live_port = 7303                    # live-state stream (JSON Lines/WebSocket)
+#live_bind_addr = "127.0.0.1"        # live-state listener address
+
 # Telnet spot-line layout: "rbn" (the Reverse Beacon Network's layout,
 # which most loggers read) or "skimmer" (CW Skimmer's own layout, for
 # running behind an Aggregator).
@@ -141,7 +150,7 @@
 
 [input]
 
-# Receiver type: "audio", "file", "kiwi", "soapy" or "hpsdr". No default.
+# Receiver type: "audio", "file", "kiwi", "soapy", "hpsdr" or "ka9q". No default.
 # Each type reads only its own settings below; "required" ones must be set.
 #type = "kiwi"
 
@@ -157,7 +166,7 @@
 # type = "kiwi", a KiwiSDR web receiver, and type = "hpsdr", an
 # HPSDR/Hermes radio (hpsdr needs a manta built with hpsdr support):
 #host = "<your-receiver-host>"       # required for kiwi and hpsdr
-#port = 8073                         # default 8073 for kiwi, 1024 for hpsdr
+#port = 8073                         # default 8073 for kiwi, 1024 for hpsdr, 5004 for ka9q
 #password = ""                       # kiwi only; leave empty for public receivers
 
 # type = "soapy", a SoapySDR device (needs a manta built with soapy support):
@@ -167,6 +176,12 @@
 # Shared by kiwi, soapy and hpsdr:
 #freq_hz = 7030000.0                 # required: the receiver's centre frequency, Hz
 #rate_hz = 192000.0                  # required for soapy and hpsdr: sample rate, Hz
+
+# type = "ka9q", a ka9q-radio (radiod) IQ channel over multicast. It reads
+# the channel's rate and frequency from radiod; port above is its RTP data port:
+#group = "239.101.6.1"               # required: the channel's data group, an IPv4 multicast address or the name in radiod's `data =` line
+#ssrc = 14100000                     # no default: the channel to read, needed only when the group carries more than one
+#interface = "192.168.1.20"          # no default: local IPv4 address to join on (the kernel's choice, plus 127.0.0.1)
 
 # The settings below apply to any receiver type, or none.
 
@@ -263,6 +278,7 @@
 #warmup_ms = 25.0                    # start-up time spent measuring the noise; no tracks before it
 #track_cap = 1200                    # most open tracks, candidates included
 #silent_respawn_cooldown_ms = 30000.0  # wait before a channel whose track went silent starts another
+#crash_filter = "full"               # static crashes: "full" ignores them, "starts-only" only blocks new tracks, "off"
 #rtty_filter = true                  # recognise RTTY (FSK) signals and start no CW track on them
 #rtty_dwell_ms = 20000.0             # how long an FSK signal must last before it is marked as RTTY
 

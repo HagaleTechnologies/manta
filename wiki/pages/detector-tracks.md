@@ -50,3 +50,24 @@ Order statistics rather than a mean floor is the load-bearing choice: CW is burs
   frequency gates move with the promotion hop, so re-run them after any
   warm-up change; see the MAN-115
   [decision record](../../docs/DECISIONS/2026-10-11-man115-startup-latency.md).
+- Static crashes (MAN-312, SPEC §2.7): judge any band-wide event over the
+  source's passband, not every channel. A KiwiSDR's out-of-band channels
+  never lift, so an all-channel lower quartile missed its crashes; wherever
+  a live source exists, pass `rf_passband_hz()` to the `TrackManager`.
+- The crash decoder hold uses the value from before the onset: a crash is
+  flagged on its third lifted hop, so the entry just before the flag is
+  already lifted. The flag is captured on each decoder input entry when it
+  is observed, so it survives the MAN-194 refiner delay.
+- Floor rings keep taking their pushes during a crash. Freezing them would
+  leave a sustained band-wide rise (a gain step) unable to release.
+- Synthetic dense scenes start synchronized (every signal keys its first
+  element at t = 0), which a band-wide statistic reads as a crash. Render a
+  lead-in and drop it, as `manta-testkit::crash::dense_scene` does, before
+  testing one.
+- VC3's bogus count depends on the crash draw (five train seeds gave 0, 1,
+  4, 1 and 1 under `full`). After touching any crash constant, re-run the
+  five-seed sweep, not only the pinned `0x3333`.
+- Two worktrees that share one `CARGO_TARGET_DIR` can silently reuse each
+  other's path-dependency rlibs; use separate target directories when
+  comparing branches (for example `cpu_budget`). See the MAN-312
+  [decision record](../../docs/DECISIONS/2026-10-13-man312-static-crash-filter.md).

@@ -10,6 +10,8 @@ use manta_testkit::scene::{render_scene, SignalSpec};
 #[test]
 fn decode_samples_spots_a_repeated_valid_callsign() {
     let sig = SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: "CQ CQ DE K5ARH K5ARH K".into(),
         loop_text: true,
         wpm: 20.0,
@@ -44,6 +46,8 @@ fn decode_samples_applies_freq_correction_consistently_to_report_and_spots() {
     const PPM: f64 = 10.0;
 
     let sig = SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: "CQ CQ DE K5ARH K5ARH K".into(),
         loop_text: true,
         wpm: 20.0,
@@ -105,6 +109,8 @@ fn decode_samples_calibrates_track_meta_events_too() {
     const PPM: f64 = 10.0;
 
     let sig = SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: "CQ CQ DE K5ARH K5ARH K".into(),
         loop_text: true,
         wpm: 20.0,
@@ -190,6 +196,8 @@ fn decode_samples_calibrates_track_meta_events_too() {
 #[test]
 fn decode_samples_spots_an_allowlisted_call_despite_bogus_cty_prefix() {
     let sig = SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: "CQ CQ DE QQ9ZZZ QQ9ZZZ K".into(),
         loop_text: true,
         wpm: 20.0,
@@ -221,6 +229,8 @@ fn decode_samples_spots_an_allowlisted_call_despite_bogus_cty_prefix() {
 #[test]
 fn decode_samples_rejects_an_invalid_freq_correction_ppm() {
     let sig = SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: "CQ CQ DE K5ARH K5ARH K".into(),
         loop_text: true,
         wpm: 20.0,

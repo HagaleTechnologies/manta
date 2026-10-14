@@ -63,7 +63,7 @@ pub fn merge_key(t: &Token) -> (NodeId, Phase, i32) {
 
 impl Token {
     /// The token reached by ending segment `seg` of `d` hops with mark
-    /// evidence `evidence` (= C[t] − C[s]; negated internally for spaces).
+    /// evidence `evidence` (= `C[t] − C[s]`; negated internally for spaces).
     /// `seg_start_ts` is the input sample counter at the segment's first hop
     /// (the timestamp a glyph committed by this gap carries, pinned decision 11).
     #[allow(clippy::too_many_arguments)]

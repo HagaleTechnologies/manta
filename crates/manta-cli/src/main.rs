@@ -1,8 +1,19 @@
 //! `manta` CLI: decode CW from a recorded file or a live receiver, and run
 //! the spotting daemon.
 
+// MAN-156: this binary's `///` comments are clap `--help` and man-page text,
+// printed verbatim, so they keep plain-text placeholders such as `<TABLE>`
+// and `[spot]` that rustdoc would parse as HTML tags and links. CI's
+// `RUSTDOCFLAGS=-D warnings` doc build still applies these lints to every
+// library crate.
+#![allow(
+    rustdoc::broken_intra_doc_links,
+    rustdoc::invalid_html_tags,
+    rustdoc::bare_urls
+)]
+
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use manta_decode::decoder::Engine;
 use manta_engine::{decode_wav, PipelineConfig};
 use manta_input::IqSource;
@@ -11,6 +22,7 @@ use std::path::{Path, PathBuf};
 mod bench;
 mod build_info;
 mod calibrate_cmd;
+mod cli_docs;
 mod clock_check;
 mod config;
 mod config_cmd;
@@ -20,9 +32,13 @@ mod doctor_checks;
 mod fmt;
 mod grade_cmd;
 mod health_cmd;
+<<<<<<< HEAD
 mod list_cache;
 mod list_http;
 mod list_refresh;
+=======
+mod live_state;
+>>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
 mod logging;
 mod reconnect;
 mod reload;
@@ -90,6 +106,10 @@ enum Command {
         /// Print the full decode report as one JSON object.
         #[arg(long, help_heading = "Output")]
         json: bool,
+        /// Also print the main signal's learned dot, dash and gap lengths
+        /// (in dits) on stderr. `--json` always includes them.
+        #[arg(long, help_heading = "Output")]
+        timing: bool,
         /// TOML config file; the whole file is validated.
         ///
         /// Its `[decode]` values are the baseline; an explicit --engine
@@ -175,7 +195,7 @@ enum Command {
     /// produces the same file.
     Gen {
         /// Which test recording to generate: v1 to v6, vr1 to vr5, vr6a,
-        /// vr6b, vr7 or vr8.
+        /// vr6b, vr7, vr8, or vw1 to vw5.
         vector: String,
         /// Directory to write `<name>.wav`, `<name>.json` and
         /// `<name>.manifest.json` into.
@@ -209,10 +229,10 @@ enum Command {
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -245,8 +265,8 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -276,8 +296,8 @@ enum Command {
         /// builds made with the `hpsdr` feature.
         #[cfg(feature = "hpsdr")]
         #[arg(help_heading = "HPSDR source")]
-        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
         #[cfg(feature = "hpsdr")]
@@ -308,6 +328,40 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_rate_hz: Option<f64>,
+        /// Multicast data group of a ka9q-radio (radiod) IQ channel
+        ///
+        /// An IPv4 multicast address, or the name in the channel's `data =`
+        /// line (for example cw-20m.local) when this machine resolves mDNS
+        /// names. manta joins the group and reads the channel's sample rate,
+        /// encoding and frequency from radiod's status packets; it does not
+        /// create or retune channels.
+        #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        ka9q_group: Option<String>,
+        /// RTP data port of the group.
+        #[arg(
+            long,
+            default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            value_parser = clap::value_parser!(u16).range(1..),
+            requires = "ka9q_group",
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_port: u16,
+        /// SSRC of the channel to read, when the group carries more than one.
+        #[arg(long, requires = "ka9q_group", help_heading = "ka9q-radio source")]
+        ka9q_ssrc: Option<u32>,
+        /// IPv4 address of the local interface to join the group on. manta
+        /// also joins on 127.0.0.1, for a radiod on this machine.
+        #[arg(
+            long,
+            requires = "ka9q_group",
+            value_parser = clap::value_parser!(std::net::Ipv4Addr),
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_interface: Option<std::net::Ipv4Addr>,
         /// Decimate the source to this sample rate, in Hz, before decoding.
         ///
         /// Must divide the source's own rate by a power of two, and the
@@ -375,9 +429,10 @@ enum Command {
         /// Radio dial frequency, in Hz.
         ///
         /// For a sound card or an ordinary (real-audio) --source WAV this
-        /// becomes the source's centre frequency; for KiwiSDR, SoapySDR and
-        /// HPSDR inputs, and for a --source-iq recording whose sidecar already
-        /// carries a centre frequency, it overrides what the source reports.
+        /// becomes the source's centre frequency; for KiwiSDR, SoapySDR, HPSDR
+        /// and ka9q-radio inputs, and for a --source-iq recording whose
+        /// sidecar already carries a centre frequency, it overrides what the
+        /// source reports.
         /// Required with --config when the input is a sound card or a
         /// real-audio --source WAV, because neither knows what frequency the
         /// radio was on -- without it, spots would be published at the audio
@@ -446,10 +501,10 @@ enum Command {
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -482,8 +537,8 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -513,8 +568,8 @@ enum Command {
         /// builds made with the `hpsdr` feature.
         #[cfg(feature = "hpsdr")]
         #[arg(help_heading = "HPSDR source")]
-        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
         #[cfg(feature = "hpsdr")]
@@ -545,6 +600,40 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_rate_hz: Option<f64>,
+        /// Multicast data group of a ka9q-radio (radiod) IQ channel
+        ///
+        /// An IPv4 multicast address, or the name in the channel's `data =`
+        /// line (for example cw-20m.local) when this machine resolves mDNS
+        /// names. manta joins the group and reads the channel's sample rate,
+        /// encoding and frequency from radiod's status packets; it does not
+        /// create or retune channels.
+        #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        ka9q_group: Option<String>,
+        /// RTP data port of the group.
+        #[arg(
+            long,
+            default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            value_parser = clap::value_parser!(u16).range(1..),
+            requires = "ka9q_group",
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_port: u16,
+        /// SSRC of the channel to read, when the group carries more than one.
+        #[arg(long, requires = "ka9q_group", help_heading = "ka9q-radio source")]
+        ka9q_ssrc: Option<u32>,
+        /// IPv4 address of the local interface to join the group on. manta
+        /// also joins on 127.0.0.1, for a radiod on this machine.
+        #[arg(
+            long,
+            requires = "ka9q_group",
+            value_parser = clap::value_parser!(std::net::Ipv4Addr),
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_interface: Option<std::net::Ipv4Addr>,
         /// Decimate the source to this sample rate, in Hz, before decoding.
         ///
         /// Must divide the source's own rate by a power of two, and the
@@ -651,10 +740,10 @@ enum Command {
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -687,8 +776,8 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -718,8 +807,8 @@ enum Command {
         /// builds made with the `hpsdr` feature.
         #[cfg(feature = "hpsdr")]
         #[arg(help_heading = "HPSDR source")]
-        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
         #[cfg(feature = "hpsdr")]
@@ -750,6 +839,40 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_rate_hz: Option<f64>,
+        /// Multicast data group of a ka9q-radio (radiod) IQ channel
+        ///
+        /// An IPv4 multicast address, or the name in the channel's `data =`
+        /// line (for example cw-20m.local) when this machine resolves mDNS
+        /// names. manta joins the group and reads the channel's sample rate,
+        /// encoding and frequency from radiod's status packets; it does not
+        /// create or retune channels.
+        #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        ka9q_group: Option<String>,
+        /// RTP data port of the group.
+        #[arg(
+            long,
+            default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            value_parser = clap::value_parser!(u16).range(1..),
+            requires = "ka9q_group",
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_port: u16,
+        /// SSRC of the channel to read, when the group carries more than one.
+        #[arg(long, requires = "ka9q_group", help_heading = "ka9q-radio source")]
+        ka9q_ssrc: Option<u32>,
+        /// IPv4 address of the local interface to join the group on. manta
+        /// also joins on 127.0.0.1, for a radiod on this machine.
+        #[arg(
+            long,
+            requires = "ka9q_group",
+            value_parser = clap::value_parser!(std::net::Ipv4Addr),
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_interface: Option<std::net::Ipv4Addr>,
         /// Decimate the source to this sample rate, in Hz, before decoding.
         ///
         /// Must divide the source's own rate by a power of two, and the
@@ -851,10 +974,10 @@ enum Command {
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -887,8 +1010,8 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -918,8 +1041,8 @@ enum Command {
         /// builds made with the `hpsdr` feature.
         #[cfg(feature = "hpsdr")]
         #[arg(help_heading = "HPSDR source")]
-        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
         #[cfg(feature = "hpsdr")]
@@ -950,6 +1073,40 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_rate_hz: Option<f64>,
+        /// Multicast data group of a ka9q-radio (radiod) IQ channel
+        ///
+        /// An IPv4 multicast address, or the name in the channel's `data =`
+        /// line (for example cw-20m.local) when this machine resolves mDNS
+        /// names. manta joins the group and reads the channel's sample rate,
+        /// encoding and frequency from radiod's status packets; it does not
+        /// create or retune channels.
+        #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        ka9q_group: Option<String>,
+        /// RTP data port of the group.
+        #[arg(
+            long,
+            default_value_t = manta_input::ka9q::wire::DATA_PORT,
+            value_parser = clap::value_parser!(u16).range(1..),
+            requires = "ka9q_group",
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_port: u16,
+        /// SSRC of the channel to read, when the group carries more than one.
+        #[arg(long, requires = "ka9q_group", help_heading = "ka9q-radio source")]
+        ka9q_ssrc: Option<u32>,
+        /// IPv4 address of the local interface to join the group on. manta
+        /// also joins on 127.0.0.1, for a radiod on this machine.
+        #[arg(
+            long,
+            requires = "ka9q_group",
+            value_parser = clap::value_parser!(std::net::Ipv4Addr),
+            help_heading = "ka9q-radio source"
+        )]
+        ka9q_interface: Option<std::net::Ipv4Addr>,
         /// Decimate the source to this sample rate, in Hz, before decoding.
         ///
         /// Must divide the source's own rate by a power of two, and the
@@ -1001,6 +1158,26 @@ enum Command {
     Grade {
         #[command(flatten)]
         args: grade_cmd::Args,
+    },
+    /// Print a tab-completion script for your shell.
+    ///
+    /// Load it from your shell's startup file, for example by adding
+    /// `eval "$(manta completions bash)"` to ~/.bashrc. The script covers
+    /// this build's commands and flags, so load it again after an upgrade.
+    Completions {
+        /// Shell to print the script for.
+        shell: clap_complete::aot::Shell,
+    },
+    /// Write manta's man pages into a directory.
+    ///
+    /// Writes manta.1 and one page per command (manta-run.1,
+    /// manta-config-check.1, ...), replacing older copies. Release archives
+    /// already carry these pages in man/man1.
+    ManPages {
+        /// Directory to write the pages into, created if missing, for
+        /// example /usr/local/share/man/man1.
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
     },
 }
 
@@ -1190,6 +1367,33 @@ struct HpsdrOpts {
     rate: Option<f64>,
 }
 
+/// ka9q-radio (radiod) multicast flags, grouped for the same reason. No
+/// build feature: the source is in every build (MAN-140 D2).
+#[derive(Clone)]
+struct Ka9qOpts {
+    group: Option<String>,
+    port: u16,
+    ssrc: Option<u32>,
+    interface: Option<std::net::Ipv4Addr>,
+    /// radiod's frequency at the first open, shared with the clone the
+    /// reconnect opener holds, so a reopen under `--dial-freq-hz` can still
+    /// see a retune (MAN-140 D13; see `LiveSourceSpec::open`).
+    first_center_hz: std::sync::Arc<std::sync::OnceLock<f64>>,
+}
+
+impl Ka9qOpts {
+    /// No `--ka9q-*` flag given: the defaults `CliOverrides::none` uses.
+    fn unset() -> Self {
+        Ka9qOpts {
+            group: None,
+            port: manta_input::ka9q::wire::DATA_PORT,
+            ssrc: None,
+            interface: None,
+            first_center_hz: Default::default(),
+        }
+    }
+}
+
 /// Everything needed to (re)open the configured live input. MAN-73: a
 /// reconnectable kind (every variant but `File`) is re-opened by
 /// `ReconnectingSource` after a loss; `File` (deterministic replay) never
@@ -1202,6 +1406,7 @@ enum LiveSourceSpec {
     Soapy(SoapyOpts),
     #[cfg(feature = "hpsdr")]
     Hpsdr(HpsdrOpts),
+    Ka9q(Ka9qOpts),
     AudioDevice(Option<String>),
     /// `source_iq` selects `WavIqSource` over `AudioIqSource`; see
     /// `open_audio_source`.
@@ -1219,12 +1424,13 @@ impl LiveSourceSpec {
             LiveSourceSpec::Soapy(_) => "soapy",
             #[cfg(feature = "hpsdr")]
             LiveSourceSpec::Hpsdr(_) => "hpsdr",
+            LiveSourceSpec::Ka9q(_) => "ka9q",
             LiveSourceSpec::AudioDevice(_) => "audio",
             LiveSourceSpec::File { .. } => "file",
         }
     }
 
-    /// Kiwi/Soapy/Hpsdr, or an IQ WAV whose sidecar reports a real (> 0)
+    /// Kiwi/Soapy/Hpsdr/Ka9q, or an IQ WAV whose sidecar reports a real (> 0)
     /// center frequency: a source that already knows its own tuned
     /// frequency, so `--dial-freq-hz` is an override and not a requirement.
     fn is_rf_aware(&self) -> bool {
@@ -1257,6 +1463,9 @@ impl LiveSourceSpec {
         capture_rate_hz: Option<f64>,
         dial_freq_hz: Option<f64>,
     ) -> Result<Box<dyn IqSource>> {
+        // How far radiod has moved the channel since the first open; only
+        // ka9q sets it (MAN-140 D13).
+        let mut retune_hz = 0.0;
         let src: Box<dyn IqSource> = match self {
             LiveSourceSpec::Kiwi(kiwi) => {
                 let host = kiwi
@@ -1311,6 +1520,25 @@ impl LiveSourceSpec {
                 let mut sources = manta_input::hpsdr::HpsdrDevice::open(cfg)?;
                 Box::new(sources.remove(0))
             }
+            LiveSourceSpec::Ka9q(ka9q) => {
+                let group = ka9q
+                    .group
+                    .clone()
+                    .expect("LiveSourceSpec::Ka9q always carries a group");
+                let mut cfg = manta_input::ka9q::Ka9qConfig::new(group);
+                cfg.port = ka9q.port;
+                cfg.ssrc = ka9q.ssrc;
+                cfg.interface = ka9q.interface;
+                let src = manta_input::ka9q::Ka9qIqSource::open(cfg)?;
+                // MAN-140 D18: printed on each (re)open, as the audio
+                // silence notice is; manta still starts.
+                if src.agc_on() {
+                    logging::warning(&ka9q_agc_warning(src.ssrc()));
+                }
+                let first_hz = *ka9q.first_center_hz.get_or_init(|| src.center_freq_hz());
+                retune_hz = src.center_freq_hz() - first_hz;
+                Box::new(src)
+            }
             // Each (re)open gets its own one-shot silence notice (MAN-131).
             LiveSourceSpec::AudioDevice(device) => Box::new(
                 manta_input::AudioIqSource::from_device(device.as_deref())?.with_silence_notice(
@@ -1323,9 +1551,13 @@ impl LiveSourceSpec {
         };
         let src = maybe_decimate(src, capture_rate_hz)?;
         Ok(match dial_freq_hz {
+            // A radiod retune moves the override by the same amount, so
+            // `ReconnectingSource`'s reopen check still sees it and ends the
+            // run, as it does with no override, instead of publishing spots
+            // against the old frequency.
             Some(freq_hz) => Box::new(FixedCenterFreqSource {
                 inner: src,
-                freq_hz,
+                freq_hz: freq_hz + retune_hz,
             }),
             None => src,
         })
@@ -1498,6 +1730,17 @@ fn audio_silence_warning(device: &str) -> String {
          (every sample is exactly zero) -- {}",
         manta_input::TARGET_RATE_HZ,
         manta_input::audio::audio_input_hint()
+    )
+}
+
+/// MAN-140 D18: a radiod channel with AGC on rescales every signal in its
+/// passband whenever one strong signal comes and goes. A warning on each
+/// open, not an error: some operators run AGC on purpose.
+fn ka9q_agc_warning(ssrc: u32) -> String {
+    format!(
+        "warning: ka9q-radio channel ssrc {ssrc} has AGC on; set agc = off and a fixed gain \
+         in its radiod section, or one strong signal changes the gain for every signal in \
+         the passband"
     )
 }
 
@@ -1871,6 +2114,14 @@ fn check_hpsdr_rate_hz(name: &str, hz: f64) -> std::result::Result<f64, String> 
 fn parse_hpsdr_freq_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s.parse().map_err(|e| format!("{e}"))?;
     check_hpsdr_freq_hz("--hpsdr-freq-hz", hz)
+}
+
+/// Clap value parser for `--ka9q-group`: the same check `input.group` gets
+/// at load (MAN-140 D16), an IPv4 multicast literal or a host name, never
+/// resolved here.
+fn parse_ka9q_group(s: &str) -> std::result::Result<String, String> {
+    manta_input::ka9q::check_group(s)?;
+    Ok(s.to_string())
 }
 
 /// `parse_hpsdr_freq_hz`'s check, un-gated like `check_hpsdr_rate_hz`.
@@ -2603,6 +2854,13 @@ struct SpotServer {
     /// by tests -- `metrics_addr`'s MAN-44 precedent.
     #[cfg_attr(not(test), allow(dead_code))]
     json_addr: std::net::SocketAddr,
+    /// MAN-324: the live-state listener's bound address; `None` when
+    /// `[server].live_port` is unset, in which case the decode loop runs
+    /// no live tap.
+    live_addr: Option<std::net::SocketAddr>,
+    /// MAN-324: `deCall` on every live record, and the station half of a
+    /// spotted decision's `spotId`.
+    station_callsign: String,
     /// MAN-78: each `[[rbn_uplink]]` task's live `dry_run` flag, in config
     /// order, for the SIGHUP reload thread (Unix only) to flip.
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -3023,6 +3281,9 @@ fn station_profile(
 const LISTENER_TELNET: &str = "telnet";
 const LISTENER_JSON: &str = "json";
 const LISTENER_METRICS: &str = "metrics";
+/// MAN-324: the live-state listener, registered only when
+/// `[server].live_port` is set.
+const LISTENER_LIVE: &str = "live";
 
 /// Spawns `fut` as a tracked listener task: `metrics` reports `name` down
 /// the moment that task ends, whether by panic or by returning (the
@@ -3212,102 +3473,130 @@ fn start_spot_server(
     let tasks = manta_server::tasks::new_client_tasks();
 
     let rt = tokio::runtime::Runtime::new()?;
-    let (status_line, metrics_addr, json_addr, uplink_dry_run, rbn_task) = rt.block_on(async {
-        // MAN-132: metrics binds its own `metrics_bind_addr` (loopback by
-        // default), never `bind_addr`. With two configurable addresses
-        // "which listener failed?" is a real question, so each bind names
-        // its listener, address key and port.
-        let telnet_listener =
-            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.telnet_port))
-                .await
-                .with_context(|| {
-                    format!(
-                        "binding the telnet server (bind_addr = {}, telnet_port = {})",
-                        fmt::quoted(&cfg.bind_addr),
-                        cfg.telnet_port
-                    )
-                })?;
-        let json_listener = tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.json_port))
-            .await
-            .with_context(|| {
-                format!(
-                    "binding the JSON server (bind_addr = {}, json_port = {})",
-                    fmt::quoted(&cfg.bind_addr),
-                    cfg.json_port
-                )
-            })?;
-        let metrics_listener =
-            tokio::net::TcpListener::bind((cfg.metrics_bind_addr.as_str(), cfg.metrics_port))
-                .await
-                .with_context(|| {
-                    format!(
+    let (status_line, metrics_addr, json_addr, live_addr, uplink_dry_run, rbn_task) =
+        rt.block_on(async {
+            // MAN-132: metrics binds its own `metrics_bind_addr` (loopback by
+            // default), never `bind_addr`. With two configurable addresses
+            // "which listener failed?" is a real question, so each bind names
+            // its listener, address key and port.
+            let telnet_listener =
+                tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.telnet_port))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "binding the telnet server (bind_addr = {}, telnet_port = {})",
+                            fmt::quoted(&cfg.bind_addr),
+                            cfg.telnet_port
+                        )
+                    })?;
+            let json_listener =
+                tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.json_port))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "binding the JSON server (bind_addr = {}, json_port = {})",
+                            fmt::quoted(&cfg.bind_addr),
+                            cfg.json_port
+                        )
+                    })?;
+            let metrics_listener =
+                tokio::net::TcpListener::bind((cfg.metrics_bind_addr.as_str(), cfg.metrics_port))
+                    .await
+                    .with_context(|| {
+                        format!(
                         "binding the metrics server (metrics_bind_addr = {}, metrics_port = {})",
                         fmt::quoted(&cfg.metrics_bind_addr),
                         cfg.metrics_port
                     )
-                })?;
-        let metrics_addr = metrics_listener.local_addr()?;
-        let json_addr = json_listener.local_addr()?;
+                    })?;
+            let metrics_addr = metrics_listener.local_addr()?;
+            let json_addr = json_listener.local_addr()?;
+            // MAN-324: the live-state listener, only when `live_port` is set.
+            let live_listener = match cfg.live_port {
+                Some(live_port) => Some(
+                    tokio::net::TcpListener::bind((cfg.live_bind_addr.as_str(), live_port))
+                        .await
+                        .with_context(|| {
+                            format!(
+                            "binding the live-state server (live_bind_addr = {}, live_port = {})",
+                            fmt::quoted(&cfg.live_bind_addr),
+                            live_port
+                        )
+                        })?,
+                ),
+                None => None,
+            };
+            let live_addr = live_listener
+                .as_ref()
+                .map(tokio::net::TcpListener::local_addr)
+                .transpose()?;
 
-        // MAN-122 scenario 1. Emitted after every bind succeeds (so a bind
-        // failure never produces a banner at all) but BEFORE any listener task is
-        // spawned -- on a multi-thread runtime a spawned accept loop can admit a
-        // client immediately, and its per-connection line would otherwise be able
-        // to land ahead of the banner. `local_addr()`, not the configured port,
-        // so a `*_port = 0` (ephemeral) config still names the real address.
-        //
-        // Review round 2: this line says `listening:`, not `ready:`. Three
-        // bound sockets are not evidence that anything will ever be decoded --
-        // a replay shorter than `manta_engine`'s two-second calibration window,
-        // or a live source that fails its first reads, exits here with the
-        // pipeline never having started. The readiness event proper is emitted
-        // from the decode loop's first batch (see `format_pipeline_ready`'s
-        // call site).
-        tracing::info!(
-            "{}",
-            manta_server::status::format_startup_banner(&manta_server::status::StartupInfo {
-                version: env!("CARGO_PKG_VERSION"),
-                source: source.name,
-                sample_rate_hz: source.sample_rate_hz,
-                dial_freq_hz: source.dial_freq_hz,
-                station_callsign: &cfg.station_callsign,
-                telnet_addr: telnet_listener.local_addr()?,
-                json_addr: json_listener.local_addr()?,
-                metrics_addr: metrics_listener.local_addr()?,
-            })
-        );
+            // MAN-122 scenario 1. Emitted after every bind succeeds (so a bind
+            // failure never produces a banner at all) but BEFORE any listener task is
+            // spawned -- on a multi-thread runtime a spawned accept loop can admit a
+            // client immediately, and its per-connection line would otherwise be able
+            // to land ahead of the banner. `local_addr()`, not the configured port,
+            // so a `*_port = 0` (ephemeral) config still names the real address.
+            //
+            // Review round 2: this line says `listening:`, not `ready:`. Three
+            // bound sockets are not evidence that anything will ever be decoded --
+            // a replay shorter than `manta_engine`'s two-second calibration window,
+            // or a live source that fails its first reads, exits here with the
+            // pipeline never having started. The readiness event proper is emitted
+            // from the decode loop's first batch (see `format_pipeline_ready`'s
+            // call site).
+            tracing::info!(
+                "{}",
+                manta_server::status::format_startup_banner(&manta_server::status::StartupInfo {
+                    version: env!("CARGO_PKG_VERSION"),
+                    source: source.name,
+                    sample_rate_hz: source.sample_rate_hz,
+                    dial_freq_hz: source.dial_freq_hz,
+                    station_callsign: &cfg.station_callsign,
+                    telnet_addr: telnet_listener.local_addr()?,
+                    json_addr: json_listener.local_addr()?,
+                    metrics_addr: metrics_listener.local_addr()?,
+                    live_addr,
+                })
+            );
 
-        // MAN-128: all three binds above already succeeded (a failed bind
-        // returns via `?` before this point), so every listener starts
-        // "up" -- `spawn_tracked_listener` below flips each back to "down"
-        // the moment its own task actually ends.
-        metrics.set_listener_up(LISTENER_TELNET, true);
-        metrics.set_listener_up(LISTENER_JSON, true);
-        metrics.set_listener_up(LISTENER_METRICS, true);
+            // MAN-128: all three binds above already succeeded (a failed bind
+            // returns via `?` before this point), so every listener starts
+            // "up" -- `spawn_tracked_listener` below flips each back to "down"
+            // the moment its own task actually ends.
+            metrics.set_listener_up(LISTENER_TELNET, true);
+            metrics.set_listener_up(LISTENER_JSON, true);
+            metrics.set_listener_up(LISTENER_METRICS, true);
+            if live_listener.is_some() {
+                metrics.enable_live();
+                metrics.set_listener_up(LISTENER_LIVE, true);
+            }
 
-        let telnet_ip_command_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
-            manta_server::telnet::MAX_TELNET_COMMANDS,
-            manta_server::telnet::COMMAND_RATE_WINDOW,
-            cfg.telnet_max_commands_per_ip,
-        );
-        manta_server::rate_limit::spawn_stale_entry_reaper(telnet_ip_command_limiter.clone());
-        // MAN-86: Aggregator will not forward spots from a source that
-        // never answers SKIMMER/SETT (Aggregator manual v6.0 §9.2) --
-        // `profile` carries the operator identity for the greeting banner
-        // and the live-passband segments for the SETT reply.
-        if cfg.operator_grid.is_none() || cfg.operator_qth.is_none() {
-            tracing::warn!(
-                "telnet greeting will omit QTH/grid -- set [server].operator_qth and \
+            let telnet_ip_command_limiter =
+                manta_server::rate_limit::IpRateLimiter::new_with_override(
+                    manta_server::telnet::MAX_TELNET_COMMANDS,
+                    manta_server::telnet::COMMAND_RATE_WINDOW,
+                    cfg.telnet_max_commands_per_ip,
+                );
+            manta_server::rate_limit::spawn_stale_entry_reaper(telnet_ip_command_limiter.clone());
+            // MAN-86: Aggregator will not forward spots from a source that
+            // never answers SKIMMER/SETT (Aggregator manual v6.0 §9.2) --
+            // `profile` carries the operator identity for the greeting banner
+            // and the live-passband segments for the SETT reply.
+            if cfg.operator_grid.is_none() || cfg.operator_qth.is_none() {
+                tracing::warn!(
+                    "telnet greeting will omit QTH/grid -- set [server].operator_qth and \
                  operator_grid so RBN Aggregator can record this node's location \
                  (Aggregator manual v6.0 §9.2)"
-            );
-        }
-        // MAN-138: without a configured position every JSON spot's
-        // deGrid/deLat/deLon is null -- legal, but a map shows nothing.
-        if station_location.is_none() {
-            tracing::warn!(
-                "JSON spots will carry no station position -- set [server].operator_grid, or \
+                );
+            }
+            // MAN-138: without a configured position every JSON spot's
+            // deGrid/deLat/deLon is null -- legal, but a map shows nothing.
+            if station_location.is_none() {
+                tracing::warn!(
+                    "JSON spots will carry no station position -- set [server].operator_grid, or \
                  operator_lat and operator_lon, so deGrid/deLat/deLon name this node's location"
+<<<<<<< HEAD
             );
         }
         let profile = std::sync::Arc::new(station_profile(
@@ -3458,52 +3747,248 @@ fn start_spot_server(
                 target,
                 dry_run.flag,
                 shutdown_rx.clone(),
+=======
+                );
+            }
+            let profile = std::sync::Arc::new(station_profile(
+                &cfg,
+                source.dial_freq_hz,
+                source.rf_passband_hz,
+                source.freq_calibration,
+>>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
             ));
-        }
-        // MAN-301: the live comparator reads the same bus the uplinks do
-        // and publishes grades back onto it. Its metric families were
-        // enabled above, before the metrics endpoint was spawned.
-        let rbn_compare = rbn_compare_cfg.map(|rc| {
-            let station_callsign = cfg.station_callsign.clone();
-            manta_server::rbn_compare::live::spawn(
-                manta_server::rbn_compare::live::LiveConfig {
-                    feed: manta_server::rbn_compare::feed::FeedConfig {
-                        host: rc.feed_host.clone(),
-                        port: rc.feed_port,
-                        login_callsign: rc.effective_login_callsign(&station_callsign).to_string(),
-                    },
-                    grade: rc.grade_config(&station_callsign),
-                    station_callsign,
-                    tick: manta_server::rbn_compare::live::TICK,
-                },
-                bus.clone(),
+            spawn_tracked_listener(
+                LISTENER_TELNET,
                 metrics.clone(),
-                manta_server::rbn_compare::system_clock(),
+                manta_server::telnet::serve(
+                    telnet_listener,
+                    bus.clone(),
+                    metrics.clone(),
+                    profile,
+                    shutdown_rx.clone(),
+                    tasks.clone(),
+                    manta_server::tasks::new_connection_limiter(
+                        manta_server::telnet::MAX_TELNET_CONNECTIONS,
+                    ),
+                    manta_server::tasks::IpQuota::new_with_override(
+                        manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP,
+                        cfg.telnet_max_connections_per_ip,
+                    ),
+                    telnet_ip_command_limiter,
+                    manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                    cfg.line_format,
+                ),
+            );
+            let json_ip_ping_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
+                manta_server::json_stream::MAX_INBOUND_PINGS,
+                manta_server::json_stream::PING_RATE_WINDOW,
+                cfg.json_max_pings_per_ip,
+            );
+            manta_server::rate_limit::spawn_stale_entry_reaper(json_ip_ping_limiter.clone());
+            // MAN-324: the live-state listener is the same fan-out code on the
+            // bus's live channel, with its own client cap, per-IP quota and
+            // ping budget (built from the same `json_*` keys).
+            if let Some(live_listener) = live_listener {
+                let live_ip_ping_limiter =
+                    manta_server::rate_limit::IpRateLimiter::new_with_override(
+                        manta_server::json_stream::MAX_INBOUND_PINGS,
+                        manta_server::json_stream::PING_RATE_WINDOW,
+                        cfg.json_max_pings_per_ip,
+                    );
+                manta_server::rate_limit::spawn_stale_entry_reaper(live_ip_ping_limiter.clone());
+                spawn_tracked_listener(
+                    LISTENER_LIVE,
+                    metrics.clone(),
+                    manta_server::json_stream::serve(
+                        live_listener,
+                        manta_server::json_stream::JsonStreamConfig {
+                            bus: bus.clone(),
+                            metrics: metrics.clone(),
+                            cty: cty.clone(),
+                            station_call: cfg.station_callsign.clone(),
+                            station_location: station_location.clone(),
+                            decoder_version: decoder_version.clone(),
+                            shutdown: shutdown_rx.clone(),
+                            drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                            stream: manta_server::json_stream::StreamKind::Live,
+                        },
+                        tasks.clone(),
+                        manta_server::tasks::new_connection_limiter(
+                            manta_server::json_stream::MAX_LIVE_STREAM_CONNECTIONS,
+                        ),
+                        manta_server::tasks::IpQuota::new_with_override(
+                            manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
+                            cfg.json_max_connections_per_ip,
+                        ),
+                        live_ip_ping_limiter,
+                    ),
+                );
+            }
+            spawn_tracked_listener(
+                LISTENER_JSON,
+                metrics.clone(),
+                manta_server::json_stream::serve(
+                    json_listener,
+                    manta_server::json_stream::JsonStreamConfig {
+                        bus: bus.clone(),
+                        metrics: metrics.clone(),
+                        cty: cty.clone(),
+                        station_call: cfg.station_callsign.clone(),
+                        station_location,
+                        decoder_version,
+                        // .clone(): MAN-32/MAN-42's uplink::serve spawns below also
+                        // need shutdown_rx -- can't let this be the moving consumer
+                        // anymore now that there are more consumers.
+                        shutdown: shutdown_rx.clone(),
+                        drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                        stream: manta_server::json_stream::StreamKind::Spots,
+                    },
+                    tasks.clone(),
+                    manta_server::tasks::new_connection_limiter(
+                        manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS,
+                    ),
+                    manta_server::tasks::IpQuota::new_with_override(
+                        manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
+                        cfg.json_max_connections_per_ip,
+                    ),
+                    json_ip_ping_limiter,
+                ),
+            );
+            // Reaps completed per-client tasks continuously, independent of
+            // shutdown -- without this, `tasks` only ever shrinks at
+            // shutdown_runtime_after_drain's one-time `await_all`, so ordinary
+            // connect/disconnect churn grows it without bound for the life of
+            // the process (round-11 review finding).
+            manta_server::tasks::spawn_reaper(tasks.clone());
+            // MAN-44: the WHOLE uplink registry is published before the
+            // metrics/status endpoint is spawned below. On this multi-thread
+            // runtime that endpoint accepts on another worker the instant its
+            // task is spawned, so a probe racing a later registration loop
+            // could read a half-registered (or empty) registry and be told
+            // `disabled` -- `manta status` exit 0 -- for a daemon whose
+            // configured targets are in fact down. Registered-but-unconnected
+            // reads as down, the honest startup answer. `target_labels`
+            // assigns the Prometheus label (`host:port`, `#N`-suffixed only on
+            // an exact duplicate; MAN-128 D7).
+            let uplink_labels = manta_server::uplink::target_labels(&rbn_uplink_cfgs);
+            let enabled_uplinks = rbn_uplink_cfgs.iter().filter(|u| u.enabled).count();
+            let uplink_tasks: Vec<_> = rbn_uplink_cfgs
+                .into_iter()
+                .zip(uplink_labels)
+                .map(|(uplink_cfg, label)| {
+                    let target = metrics.register_uplink_target(label.clone(), uplink_cfg.enabled);
+                    // MAN-78: one live flag per entry, seeded from the file.
+                    let dry_run = UplinkDryRun {
+                        label,
+                        enabled: uplink_cfg.enabled,
+                        flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                            uplink_cfg.dry_run,
+                        )),
+                    };
+                    (uplink_cfg, target, dry_run)
+                })
+                .collect();
+            let uplink_dry_run: Vec<UplinkDryRun> =
+                uplink_tasks.iter().map(|(_, _, d)| d.clone()).collect();
+            // MAN-301: enabled before the metrics endpoint spawns below, for
+            // MAN-44's reason: a scrape racing startup must already see the
+            // `manta_rbn_compare_*` families of a comparator that is starting.
+            let rbn_compare_cfg = rbn_compare_cfg.filter(|c| c.enabled);
+            if rbn_compare_cfg.is_some() {
+                metrics.enable_rbn_compare();
+            }
+            let metrics_ip_request_limiter =
+                manta_server::rate_limit::IpRateLimiter::new_with_override(
+                    manta_server::metrics_http::MAX_METRICS_REQUESTS_PER_IP,
+                    manta_server::metrics_http::METRICS_REQUEST_RATE_WINDOW,
+                    cfg.metrics_max_requests_per_ip,
+                );
+            manta_server::rate_limit::spawn_stale_entry_reaper(metrics_ip_request_limiter.clone());
+            spawn_tracked_listener(
+                LISTENER_METRICS,
+                metrics.clone(),
+                manta_server::metrics_http::serve(
+                    metrics_listener,
+                    metrics.clone(),
+                    manta_server::tasks::new_connection_limiter(
+                        manta_server::metrics_http::MAX_METRICS_CONNECTIONS,
+                    ),
+                    manta_server::tasks::IpQuota::new_with_override(
+                        manta_server::metrics_http::MAX_METRICS_CONNECTIONS_PER_IP,
+                        cfg.metrics_max_connections_per_ip,
+                    ),
+                    metrics_ip_request_limiter,
+                ),
+            );
+            // MAN-32/MAN-42: one independent uplink::serve task per configured
+            // [[rbn_uplink]] entry -- the common case for existing single-node
+            // operators is no [[rbn_uplink]] tables at all (empty Vec, loop
+            // body never runs), and uplink::serve itself also no-ops when
+            // `enabled = false` (belt-and-suspenders, not a duplicate check:
+            // this loop additionally avoids spawning a task at all when the
+            // Vec is empty). Each task owns its own SpotBus subscription and
+            // backoff state, so one target being down never affects another's
+            // delivery or retry timing.
+            // MAN-128 D6/D7: each target was registered above, before both its
+            // `serve` task and the metrics endpoint, so a scrape landing before
+            // the first connect attempt still sees it.
+            for (uplink_cfg, target, dry_run) in uplink_tasks {
+                tokio::spawn(manta_server::uplink::serve_with_live_dry_run(
+                    uplink_cfg,
+                    cfg.station_callsign.clone(),
+                    bus.clone(),
+                    target,
+                    dry_run.flag,
+                    shutdown_rx.clone(),
+                ));
+            }
+            // MAN-301: the live comparator reads the same bus the uplinks do
+            // and publishes grades back onto it. Its metric families were
+            // enabled above, before the metrics endpoint was spawned.
+            let rbn_compare = rbn_compare_cfg.map(|rc| {
+                let station_callsign = cfg.station_callsign.clone();
+                manta_server::rbn_compare::live::spawn(
+                    manta_server::rbn_compare::live::LiveConfig {
+                        feed: manta_server::rbn_compare::feed::FeedConfig {
+                            host: rc.feed_host.clone(),
+                            port: rc.feed_port,
+                            login_callsign: rc
+                                .effective_login_callsign(&station_callsign)
+                                .to_string(),
+                        },
+                        grade: rc.grade_config(&station_callsign),
+                        station_callsign,
+                        tick: manta_server::rbn_compare::live::TICK,
+                    },
+                    bus.clone(),
+                    metrics.clone(),
+                    manta_server::rbn_compare::system_clock(),
+                    shutdown_rx.clone(),
+                )
+            });
+
+            // MAN-122 scenario 2. The handle travels out of this block and
+            // into `SpotServer::status_line` so shutdown can join the task --
+            // see that field's doc comment.
+            let status_line = manta_server::status::spawn_status_line(
+                metrics.clone(),
+                cfg.status_interval_secs
+                    .map_or(manta_server::status::DEFAULT_STATUS_INTERVAL, |secs| {
+                        std::time::Duration::from_secs(secs)
+                    }),
+                enabled_uplinks,
                 shutdown_rx.clone(),
-            )
-        });
+            );
 
-        // MAN-122 scenario 2. The handle travels out of this block and
-        // into `SpotServer::status_line` so shutdown can join the task --
-        // see that field's doc comment.
-        let status_line = manta_server::status::spawn_status_line(
-            metrics.clone(),
-            cfg.status_interval_secs
-                .map_or(manta_server::status::DEFAULT_STATUS_INTERVAL, |secs| {
-                    std::time::Duration::from_secs(secs)
-                }),
-            enabled_uplinks,
-            shutdown_rx.clone(),
-        );
-
-        anyhow::Ok((
-            status_line,
-            metrics_addr,
-            json_addr,
-            uplink_dry_run,
-            rbn_compare,
-        ))
-    })?;
+            anyhow::Ok((
+                status_line,
+                metrics_addr,
+                json_addr,
+                live_addr,
+                uplink_dry_run,
+                rbn_compare,
+            ))
+        })?;
 
     Ok((
         rt,
@@ -3518,6 +4003,8 @@ fn start_spot_server(
             rbn_compare: std::sync::Mutex::new(rbn_task),
             metrics_addr,
             json_addr,
+            live_addr,
+            station_callsign: cfg.station_callsign.clone(),
             uplink_dry_run,
         },
     ))
@@ -3539,6 +4026,7 @@ struct CliOverrides {
     soapy: SoapyOpts,
     #[cfg(feature = "hpsdr")]
     hpsdr: HpsdrOpts,
+    ka9q: Ka9qOpts,
     freq_correction_ppm: Option<f64>,
     dial_freq_hz: Option<f64>,
     capture_rate_hz: Option<f64>,
@@ -3585,6 +4073,7 @@ impl CliOverrides {
                 freq: None,
                 rate: None,
             },
+            ka9q: Ka9qOpts::unset(),
             freq_correction_ppm: None,
             dial_freq_hz: None,
             capture_rate_hz: None,
@@ -3603,6 +4092,9 @@ impl CliOverrides {
     /// The flag that selects a source, if any: given one, the command line
     /// defines the whole source (D6).
     fn source_selector(&self) -> Option<&'static str> {
+        if self.ka9q.group.is_some() {
+            return Some("--ka9q-group");
+        }
         #[cfg(feature = "hpsdr")]
         if self.hpsdr.host.is_some() {
             return Some("--hpsdr-host");
@@ -3622,9 +4114,14 @@ impl CliOverrides {
         }
     }
 
-    /// The source the flags describe, in today's priority order: hpsdr,
-    /// then kiwi, then soapy, then a WAV file or audio device.
+    /// The source the flags describe, in today's priority order: ka9q,
+    /// then hpsdr, then kiwi, then soapy, then a WAV file or audio device.
+    /// clap lets at most one selector through, so the order only matters
+    /// for a hand-built `CliOverrides`.
     fn into_spec(self) -> LiveSourceSpec {
+        if self.ka9q.group.is_some() {
+            return LiveSourceSpec::Ka9q(self.ka9q);
+        }
         #[cfg(feature = "hpsdr")]
         if self.hpsdr.host.is_some() {
             return LiveSourceSpec::Hpsdr(self.hpsdr);
@@ -3897,6 +4394,18 @@ fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Resul
         config::SourceFromFile::Hpsdr { .. } => {
             bail!("input.type = \"hpsdr\" needs a manta built with --features hpsdr")
         }
+        config::SourceFromFile::Ka9q {
+            group,
+            port,
+            ssrc,
+            interface,
+        } => LiveSourceSpec::Ka9q(Ka9qOpts {
+            group: Some(group.clone()),
+            port: *port,
+            ssrc: *ssrc,
+            interface: *interface,
+            ..Ka9qOpts::unset()
+        }),
     })
 }
 
@@ -4001,6 +4510,15 @@ fn receiver_desc(spec: &LiveSourceSpec) -> doctor_checks::ReceiverDesc {
                 "HPSDR radio {}:{}",
                 hpsdr.host.as_deref().unwrap_or_default(),
                 hpsdr.port
+            ),
+        ),
+        LiveSourceSpec::Ka9q(ka9q) => (
+            ReceiverKind::Ka9q,
+            format!(
+                "ka9q-radio group {}:{}{}",
+                ka9q.group.as_deref().unwrap_or_default(),
+                ka9q.port,
+                ka9q.ssrc.map(|s| format!(" ssrc {s}")).unwrap_or_default()
             ),
         ),
         LiveSourceSpec::AudioDevice(None) => (
@@ -4744,6 +5262,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             path,
             center_freq_hz,
             json,
+            timing,
             filters,
             config,
             engine,
@@ -4823,6 +5342,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                 if !report.rtty.is_empty() {
                     eprintln!("{}", rtty_line(&report.rtty, report.sample_rate_hz));
                 }
+                // MAN-315: the primary track's learned sender timing, on
+                // request only, so the default stderr stays the summary.
+                if timing {
+                    if let Some(estimates) = &report.timing {
+                        eprintln!("timing (dits, mean ± sd): {}", estimates.display_line());
+                    }
+                }
             }
         }
         Command::Oracle {
@@ -4870,8 +5396,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                 "vr6b" => manta_testkit::vectors::vr6b(),
                 "vr7" => manta_testkit::vectors::vr7(),
                 "vr8" => manta_testkit::vectors::vr8(),
+                "vw1" => manta_testkit::vectors::vw1(),
+                "vw2" => manta_testkit::vectors::vw2(),
+                "vw3" => manta_testkit::vectors::vw3(),
+                "vw4" => manta_testkit::vectors::vw4(),
+                "vw5" => manta_testkit::vectors::vw5(),
                 other => bail!(
-                    "unknown vector '{}' (available: v1-v6, vr1-vr5, vr6a, vr6b, vr7-vr8)",
+                    "unknown vector '{}' (available: v1-v6, vr1-vr5, vr6a, vr6b, vr7-vr8, vw1-vw5)",
                     manta_server::status_doc::escape_for_terminal(other).replace('\'', "\\'")
                 ),
             };
@@ -4909,6 +5440,10 @@ fn run_command() -> Result<std::process::ExitCode> {
             hpsdr_freq_hz,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
             capture_rate_hz,
             source_iq,
             realtime,
@@ -4961,6 +5496,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                     port: hpsdr_port,
                     freq: hpsdr_freq_hz,
                     rate: hpsdr_rate_hz,
+                },
+                ka9q: Ka9qOpts {
+                    group: ka9q_group,
+                    port: ka9q_port,
+                    ssrc: ka9q_ssrc,
+                    interface: ka9q_interface,
+                    ..Ka9qOpts::unset()
                 },
                 freq_correction_ppm,
                 dial_freq_hz,
@@ -5070,6 +5612,10 @@ fn run_command() -> Result<std::process::ExitCode> {
             }
             let first = spec.open(capture_rate_hz, dial_freq_hz)?;
             let replay_epoch = resolved.replay_epoch;
+            // MAN-312 (SPEC §2.7): read here, while `first` is in hand;
+            // logged just before decoding starts (below).
+            let crash_live =
+                manta_engine::crash_live_channels(first.sample_rate(), first.rf_passband_hz());
 
             // MAN-122 review round 6 (P2): installed HERE -- before
             // `start_spot_server` binds the sockets and logs the
@@ -5426,6 +5972,21 @@ fn run_command() -> Result<std::process::ExitCode> {
             // round 6); this goes to stderr. MAN-78: a daemon that reloads
             // on SIGHUP says so; the `manta: listening;` prefix the tests
             // wait for is the same either way.
+            //
+            // MAN-312 (SPEC §2.7): the static-crash filter fails open on a
+            // narrow source; say so once rather than leave an operator who
+            // set `crash_filter` believing it acts. Logged after the servers
+            // bound, so a failed start still prints exactly one `error:`
+            // line (MAN-270), and before the readiness marker, so a reader
+            // that stops at the marker never leaves it unread.
+            if cfg.detector.crash_filter != manta_engine::CrashFilter::Off
+                && crash_live < manta_engine::CRASH_MIN_LIVE_CHANNELS
+            {
+                tracing::info!(
+                    "static-crash filter inactive: the source passband holds {crash_live} channels, fewer than the {} it needs",
+                    manta_engine::CRASH_MIN_LIVE_CHANNELS
+                );
+            }
             if reload_enabled {
                 logging::note(
                     "manta: listening; send SIGINT or SIGTERM to stop, SIGHUP to reload \
@@ -5457,6 +6018,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             // asked, so its journal holds spots and diagnostics only.
             let print_text = !json && (spot_server.is_none() || decoded_text);
             let mut text_lines = text_lines::TrackLines::default();
+            // MAN-312: `listen` stores its running crash count here before
+            // each `on_tracks` call, which copies it into `Metrics`.
+            let static_crashes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             // MAN-314: the engine's marked RTTY set, logged on change and
             // copied into `manta_rtty_signals` from the per-batch callback.
             let rtty_observer = std::sync::Arc::new(manta_engine::RttyObserver::default());
@@ -5470,8 +6034,24 @@ fn run_command() -> Result<std::process::ExitCode> {
                     decode_latency: decode_latency.clone(),
                     decode_quality: decode_quality.clone(),
                     operator_lists: reload_enabled.then(|| operator_lists.clone()),
+<<<<<<< HEAD
                     reference_lists,
+=======
+                    static_crashes: Some(static_crashes.clone()),
+>>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
                     rtty: Some(rtty_observer.clone()),
+                    // MAN-324: only with a live-state listener.
+                    live_state: spot_server
+                        .as_ref()
+                        .filter(|server| server.live_addr.is_some())
+                        .map(|server| {
+                            std::sync::Arc::new(live_state::LiveSink::new(
+                                server.bus.clone(),
+                                server.metrics.clone(),
+                                &server.station_callsign,
+                            ))
+                                as std::sync::Arc<dyn manta_engine::LiveStateSink>
+                        }),
                 },
                 |ev| {
                     if json {
@@ -5550,6 +6130,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                     }
                     if let Some(server) = &spot_server {
                         server.metrics.set_active_tracks(n_tracks as u64);
+                        server.metrics.set_static_crashes_total(
+                            static_crashes.load(std::sync::atomic::Ordering::Relaxed),
+                        );
                         server.metrics.record_pipeline_batch();
                         // The first batch is the earliest moment the daemon
                         // can honestly claim to be decoding: `listen`'s
@@ -5749,6 +6332,10 @@ fn run_command() -> Result<std::process::ExitCode> {
             hpsdr_freq_hz,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
             capture_rate_hz,
             source_iq,
             filters,
@@ -5797,6 +6384,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                         port: hpsdr_port,
                         freq: hpsdr_freq_hz,
                         rate: hpsdr_rate_hz,
+                    },
+                    ka9q: Ka9qOpts {
+                        group: ka9q_group,
+                        port: ka9q_port,
+                        ssrc: ka9q_ssrc,
+                        interface: ka9q_interface,
+                        ..Ka9qOpts::unset()
                     },
                     freq_correction_ppm,
                     dial_freq_hz,
@@ -5908,6 +6502,10 @@ fn run_command() -> Result<std::process::ExitCode> {
             hpsdr_freq_hz,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
             capture_rate_hz,
             source_iq,
             dial_freq_hz,
@@ -5972,6 +6570,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                         port: hpsdr_port,
                         freq: hpsdr_freq_hz,
                         rate: hpsdr_rate_hz,
+                    },
+                    ka9q: Ka9qOpts {
+                        group: ka9q_group,
+                        port: ka9q_port,
+                        ssrc: ka9q_ssrc,
+                        interface: ka9q_interface,
+                        ..Ka9qOpts::unset()
                     },
                     freq_correction_ppm,
                     dial_freq_hz,
@@ -6105,6 +6710,10 @@ fn run_command() -> Result<std::process::ExitCode> {
             hpsdr_freq_hz,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
             capture_rate_hz,
             source_iq,
             dial_freq_hz,
@@ -6143,6 +6752,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                     freq: hpsdr_freq_hz,
                     rate: hpsdr_rate_hz,
                 },
+                ka9q: Ka9qOpts {
+                    group: ka9q_group,
+                    port: ka9q_port,
+                    ssrc: ka9q_ssrc,
+                    interface: ka9q_interface,
+                    ..Ka9qOpts::unset()
+                },
                 capture_rate_hz,
                 dial_freq_hz,
                 ..CliOverrides::none()
@@ -6152,6 +6768,13 @@ fn run_command() -> Result<std::process::ExitCode> {
         Command::Config(ConfigCommand::Init { out, force }) => config_cmd::init(&out, force)?,
         Command::Bench(BenchCommand::Sensitivity(args)) => bench::sensitivity(args)?,
         Command::Grade { args } => grade_cmd::run(args)?,
+        Command::Completions { shell } => {
+            cli_docs::write_completions(shell, &mut Cli::command(), &mut std::io::stdout().lock())?
+        }
+        Command::ManPages { out } => {
+            let n = cli_docs::write_man_pages(Cli::command(), &out)?;
+            eprintln!("wrote {n} man pages to {}", out.display());
+        }
     }
     Ok(std::process::ExitCode::SUCCESS)
 }
@@ -6328,6 +6951,35 @@ impl RttyLogState {
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn cli_definition_passes_clap_debug_assert() {
+        Cli::command().debug_assert();
+    }
+
+    /// MAN-133: clap_complete 4.6 writes hidden subcommands and flags into
+    /// every shell's script, so hiding one would still offer it on <TAB>.
+    /// Filter them in cli_docs before hiding anything.
+    #[test]
+    fn no_command_or_flag_is_hidden() {
+        fn walk(cmd: &clap::Command, path: &str, hidden: &mut Vec<String>) {
+            for arg in cmd.get_arguments().filter(|a| a.is_hide_set()) {
+                hidden.push(format!("{path} --{}", arg.get_id()));
+            }
+            for sub in cmd.get_subcommands() {
+                let p = format!("{path} {}", sub.get_name());
+                if sub.is_hide_set() {
+                    hidden.push(p.clone());
+                }
+                walk(sub, &p, hidden);
+            }
+        }
+        let mut hidden = Vec::new();
+        let mut cmd = Cli::command();
+        cmd.build();
+        walk(&cmd, "manta", &mut hidden);
+        assert!(hidden.is_empty(), "hidden: {hidden:?}");
+    }
 
     fn rtty_sig() -> manta_engine::RttySignalReport {
         manta_engine::RttySignalReport {
@@ -9206,6 +9858,184 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
     }
 
+    // ---- MAN-140: the ka9q-radio source
+
+    #[test]
+    fn every_live_command_rejects_zero_ka9q_port() {
+        let mut accepted_invalid = Vec::new();
+        for command in ["run", "listen", "soak", "doctor", "calibrate", "check"] {
+            let mut args = vec!["manta", command, "--ka9q-group", "239.101.6.1"];
+            if command == "soak" {
+                args.extend(["--duration", "1"]);
+            }
+            assert!(
+                Cli::try_parse_from(&args).is_ok(),
+                "{command}: default port"
+            );
+            for port in ["1", "5004", "65535"] {
+                assert!(
+                    Cli::try_parse_from(args.iter().copied().chain(["--ka9q-port", port])).is_ok(),
+                    "{command}: valid port {port}"
+                );
+            }
+            for port in ["0", "65536"] {
+                match Cli::try_parse_from(args.iter().copied().chain(["--ka9q-port", port])) {
+                    Ok(_) => accepted_invalid.push(format!("{command}: {port}")),
+                    Err(error) => {
+                        assert_eq!(error.exit_code(), 2);
+                        assert!(error.to_string().contains("--ka9q-port"), "{error}");
+                    }
+                }
+            }
+        }
+        assert!(
+            accepted_invalid.is_empty(),
+            "accepted invalid ports: {accepted_invalid:?}"
+        );
+    }
+
+    fn ka9q_opts(ssrc: Option<u32>) -> Ka9qOpts {
+        Ka9qOpts {
+            group: Some("239.101.6.1".into()),
+            port: manta_input::ka9q::wire::DATA_PORT,
+            ssrc,
+            interface: None,
+            ..Ka9qOpts::unset()
+        }
+    }
+
+    #[test]
+    fn ka9q_flag_selects_the_source_and_replaces_a_typed_input() {
+        let cli = CliOverrides {
+            ka9q: Ka9qOpts {
+                interface: Some(std::net::Ipv4Addr::new(192, 168, 1, 20)),
+                ..ka9q_opts(Some(14_100_000))
+            },
+            ..cli_overrides()
+        };
+        assert_eq!(cli.source_selector(), Some("--ka9q-group"));
+        let LiveSourceSpec::Ka9q(k) = cli.clone().into_spec() else {
+            panic!("expected the ka9q source from --ka9q-group");
+        };
+        assert_eq!(k.group.as_deref(), Some("239.101.6.1"));
+        assert_eq!(k.port, 5004);
+        assert_eq!(k.ssrc, Some(14_100_000));
+        assert_eq!(k.interface, Some(std::net::Ipv4Addr::new(192, 168, 1, 20)));
+
+        // A typed [input] is replaced whole, its shared keys included.
+        let r = resolve(cli, &loaded_from(KIWI_INPUT)).unwrap();
+        assert!(matches!(r.spec, LiveSourceSpec::Ka9q(_)));
+        assert_eq!(r.replaced_file_source, Some("--ka9q-group"));
+        assert_eq!(r.freq_correction_ppm, 0.0);
+        assert_eq!(r.dial_freq_hz, None);
+        assert!(
+            r.notes[0]
+                .contains("--ka9q-group selects the source; ignoring [input] (type = \"kiwi\")"),
+            "{:?}",
+            r.notes
+        );
+
+        // The flags as clap parses them, defaults included.
+        let parsed = Cli::try_parse_from([
+            "manta",
+            "run",
+            "--ka9q-group",
+            "239.101.6.1",
+            "--ka9q-ssrc",
+            "14100000",
+            "--ka9q-interface",
+            "192.168.1.20",
+        ])
+        .unwrap();
+        let Command::Run {
+            ka9q_group,
+            ka9q_port,
+            ka9q_ssrc,
+            ka9q_interface,
+            ..
+        } = parsed.command
+        else {
+            unreachable!("parsed `run`");
+        };
+        assert_eq!(ka9q_group.as_deref(), Some("239.101.6.1"));
+        assert_eq!(ka9q_port, 5004);
+        assert_eq!(ka9q_ssrc, Some(14_100_000));
+        assert_eq!(
+            ka9q_interface,
+            Some(std::net::Ipv4Addr::new(192, 168, 1, 20))
+        );
+        // --ka9q-interface takes an address, not an interface name.
+        assert!(Cli::try_parse_from([
+            "manta",
+            "run",
+            "--ka9q-group",
+            "239.101.6.1",
+            "--ka9q-interface",
+            "eth0",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn spec_from_file_maps_a_ka9q_input() {
+        let loaded = loaded_from(
+            "[input]\ntype = \"ka9q\"\ngroup = \"239.101.6.1\"\nport = 5010\nssrc = 14100000\n\
+             interface = \"192.168.1.20\"\n",
+        );
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        let LiveSourceSpec::Ka9q(k) = &r.spec else {
+            panic!("expected the ka9q source from [input]");
+        };
+        assert_eq!(k.group.as_deref(), Some("239.101.6.1"));
+        assert_eq!(k.port, 5010);
+        assert_eq!(k.ssrc, Some(14_100_000));
+        assert_eq!(k.interface, Some(std::net::Ipv4Addr::new(192, 168, 1, 20)));
+        assert_eq!(r.replaced_file_source, None);
+
+        let loaded = loaded_from("[input]\ntype = \"ka9q\"\ngroup = \"cw-20m.local\"\n");
+        let LiveSourceSpec::Ka9q(k) = resolve(cli_overrides(), &loaded).unwrap().spec else {
+            panic!("expected the ka9q source from [input]");
+        };
+        assert_eq!(k.group.as_deref(), Some("cw-20m.local"));
+        assert_eq!(k.port, 5004);
+        assert_eq!(k.ssrc, None);
+        assert_eq!(k.interface, None);
+    }
+
+    #[test]
+    fn ka9q_spec_is_rf_aware_and_reconnectable_and_named_ka9q() {
+        let spec = LiveSourceSpec::Ka9q(ka9q_opts(None));
+        // radiod reports the channel's frequency, so --dial-freq-hz is an
+        // override, not a requirement.
+        assert!(spec.is_rf_aware());
+        assert!(!needs_dial_freq(true, spec.is_rf_aware(), None));
+        assert!(spec.is_reconnectable());
+        // The `source` label of manta_source_health and manta_input_*.
+        assert_eq!(spec.name(), "ka9q");
+    }
+
+    #[test]
+    fn receiver_desc_names_the_ka9q_group() {
+        let d = receiver_desc(&LiveSourceSpec::Ka9q(ka9q_opts(None)));
+        assert_eq!(d.kind, doctor_checks::ReceiverKind::Ka9q);
+        assert_eq!(d.description, "ka9q-radio group 239.101.6.1:5004");
+        let d = receiver_desc(&LiveSourceSpec::Ka9q(ka9q_opts(Some(14_100_000))));
+        assert_eq!(
+            d.description,
+            "ka9q-radio group 239.101.6.1:5004 ssrc 14100000"
+        );
+    }
+
+    #[test]
+    fn ka9q_agc_warning_is_design_section_3s_text() {
+        assert_eq!(
+            ka9q_agc_warning(14_100_000),
+            "warning: ka9q-radio channel ssrc 14100000 has AGC on; set agc = off and a fixed \
+             gain in its radiod section, or one strong signal changes the gain for every \
+             signal in the passband"
+        );
+    }
+
     /// D10: every config-backed flag maps to the key it overrides.
     const FLAG_KEYS: &[(&str, &str)] = &[
         ("device", "input.device"),
@@ -9225,6 +10055,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("hpsdr_port", "input.port"),
         ("hpsdr_freq_hz", "input.freq_hz"),
         ("hpsdr_rate_hz", "input.rate_hz"),
+        ("ka9q_group", "input.group"),
+        ("ka9q_port", "input.port"),
+        ("ka9q_ssrc", "input.ssrc"),
+        ("ka9q_interface", "input.interface"),
         ("freq_correction_ppm", "input.freq_correction_ppm"),
         ("dial_freq_hz", "input.center_freq_hz"),
         ("capture_rate_hz", "input.capture_rate_hz"),
@@ -9250,6 +10084,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         // `decode --center-freq-hz` (MAN-131 D8): a recording's centre, not
         // the live receiver's `input.center_freq_hz`.
         "center_freq_hz",
+        // `decode --timing` (MAN-315): an output choice, like `json`.
+        "timing",
         "help",
         "version",
         "reference_hz",
@@ -9366,6 +10202,11 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             (
                 "hpsdr",
                 "type = \"hpsdr\"\nhost = \"h\"\nport = 1024\nfreq_hz = 7e6\nrate_hz = 48000.0\n",
+            ),
+            (
+                "ka9q",
+                "type = \"ka9q\"\ngroup = \"239.1.2.3\"\nport = 5004\nssrc = 1\n\
+                 interface = \"127.0.0.1\"\n",
             ),
         ];
         const SHARED: &[(&str, &str)] = &[

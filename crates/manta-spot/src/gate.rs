@@ -6,8 +6,8 @@
 //!
 //! MAN-100 Scenario 2: "distinct decodes" means distinct *messages*, not
 //! distinct decoded `Word`s. SPEC's own default payload template repeats
-//! a callsign back-to-back within one transmission ("CQ CQ DE <CALL>
-//! <CALL> K"), which the old word-count-only accounting let satisfy this
+//! a callsign back-to-back within one transmission (`CQ CQ DE <CALL>
+//! <CALL> K`), which the old word-count-only accounting let satisfy this
 //! gate on the strength of a single, possibly-corrupted message alone --
 //! see `MIN_MESSAGE_WORD_GAP`.
 
@@ -18,10 +18,10 @@ use std::collections::BTreeMap;
 /// different window than the one the repetition gate itself uses.
 pub(crate) const WINDOW_SECONDS: f64 = 90.0;
 
-/// MAN-100 Scenario 2. SPEC's payload template "CQ CQ DE <CALL> <CALL> K"
+/// MAN-100 Scenario 2. SPEC's payload template `CQ CQ DE <CALL> <CALL> K`
 /// puts one message's two utterances a single word apart; the closest two
-/// *separate* messages can put them is five ("<CALL> K CQ CQ DE
-/// <CALL>"). 3 sits between the two with margin. Measured (this ticket's
+/// *separate* messages can put them is five (`<CALL> K CQ CQ DE
+/// <CALL>`). 3 sits between the two with margin. Measured (this ticket's
 /// plan): gap = 2 and gap = 3 give identical outcomes on the reference
 /// pileup fixtures; 3 is the stricter reading of "a second, later message
 /// must independently support the candidate", so 3 is what ships.
@@ -30,12 +30,12 @@ pub const MIN_MESSAGE_WORD_GAP: u64 = 3;
 /// Width, in seconds of `sample_ts` (never real wall clock), beyond which
 /// two occurrences of the same text cannot plausibly belong to one
 /// transmission, regardless of their word_seq gap (MAN-100 remediation
-/// C2). A short ID -- e.g. "DE <CALL>", 2 words -- puts genuinely
+/// C2). A short ID -- e.g. `DE <CALL>`, 2 words -- puts genuinely
 /// separate messages below `MIN_MESSAGE_WORD_GAP`, and a pure word_seq
 /// rule then has no way to tell them apart from one corrupted message's
 /// double utterance (measured: "DE K5ARH" repeated 10x at 80s spacing,
 /// 13 minutes total, never spotted at all under a word_seq-only rule).
-/// 60s comfortably covers a full "CQ CQ DE <CALL> <CALL> K" transmission
+/// 60s comfortably covers a full `CQ CQ DE <CALL> <CALL> K` transmission
 /// even at 8 WPM (SPEC-decode-core.md's slowest supported speed, ~40s for
 /// that template) with margin, while staying well under the 80s spacing
 /// that must count as separate and under the 90s ledger/gate window

@@ -65,8 +65,9 @@ listed here change what the command does.
 | `bench sensitivity` | `[decode]` `[detector]` | no |
 | `grade` | `[rbn_compare]` `window_secs`, the tolerances and the spotter lists, from the file `--config` names; its flags win | no |
 
-`run` starts the telnet, JSON and metrics servers, and any uplink, only when
-the resolved config has a `[server]` table. The table can come from the file
+`run` starts the telnet, JSON and metrics servers, the live-state stream
+when `live_port` is set, and any uplink, only when the resolved config has a
+`[server]` table. The table can come from the file
 or a `MANTA_SERVER_*` environment variable.
 
 ## Checking a file
@@ -119,7 +120,8 @@ logged and ignored. See
 
 ## [server]
 
-The telnet, JSON and metrics servers. Only `run` starts them. `doctor` reads
+The telnet, JSON and metrics servers, and the optional live-state stream
+(`live_port`). Only `run` starts them. `doctor` reads
 the table to check that each listener's address and port can bind right now
 and that `station_callsign` is not the example `N0CALL`. `status` reads
 `metrics_bind_addr` and `metrics_port` to find a running daemon, from the file
@@ -142,14 +144,16 @@ the config for both. The table needs `station_callsign`.
 | `telnet_port` | `7300` | live: `run` with `[server]` | DX-cluster telnet port. |
 | `json_port` | `7301` | live: `run` with `[server]` | JSON Lines and WebSocket spot stream; both share this port. |
 | `metrics_port` | `7302` | live: `run` with `[server]`, `status` and `health` | Prometheus metrics port; `manta status` and `manta health` dial it when given `--config` or `MANTA_CONFIG`. |
+| `live_port` | none; example `7303`; unset runs no live-state listener | live: `run` with `[server]`; restart required | Live-state stream port; see [LIVE-STATE.md](LIVE-STATE.md). |
+| `live_bind_addr` | `"127.0.0.1"` | live: `run` with `[server]` and `live_port`; restart required | Address of the live-state listener, which has no password. The stream carries every track's decoded text; set `"0.0.0.0"` only for a dashboard on another machine, and firewall `live_port`. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
 | `line_format` | `"rbn"` | live: `run` with `[server]` | Telnet spot-line layout, `"rbn"` or `"skimmer"`. The uplink always sends the `"rbn"` layout. |
 | `status_interval_secs` | `60` | live: `run` with `[server]` | Seconds between one-line status reports in the log; `0` turns them off. |
 | `history_minutes` | `30` | live: `run` with `[server]`; restart required | Telnet replay retention in whole minutes, 0–1440, measured from the newest published spot's sample timestamp. Keeps at least the newest 50 spots and at most 10,000; `0` keeps only the newest 50. Loggers request `sh/dx 30m`; bare `sh/dx` returns 10 rows. See [MAN-93](DECISIONS/2026-10-11-man93-sh-dx-history-window.md). |
 | `telnet_max_connections_per_ip` | `16` | live: `run` with `[server]` | Open telnet connections per client IP; `0` removes the limit. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
-| `json_max_connections_per_ip` | `16` | live: `run` with `[server]` | Open JSON and WebSocket connections per client IP; `0` removes the limit. |
+| `json_max_connections_per_ip` | `16` | live: `run` with `[server]` | Open JSON and WebSocket connections per client IP; `0` removes the limit. The live-state listener applies the same quota, counted separately. |
 | `metrics_max_connections_per_ip` | `8` | live: `run` with `[server]` | Open metrics connections per client IP; `0` removes the limit. |
 | `telnet_max_commands_per_ip` | `30` | live: `run` with `[server]` | Telnet commands per client IP per 10 seconds; `0` removes the limit. |
-| `json_max_pings_per_ip` | `10` | live: `run` with `[server]` | WebSocket pings per client IP per 60 seconds; `0` removes the limit. |
+| `json_max_pings_per_ip` | `10` | live: `run` with `[server]` | WebSocket pings per client IP per 60 seconds; `0` removes the limit. The live-state listener applies the same budget, counted separately. |
 | `metrics_max_requests_per_ip` | `60` | live: `run` with `[server]` | Metrics connections per client IP per 60 seconds; `0` removes the limit. |
 
 ## [[rbn_uplink]]
@@ -192,27 +196,30 @@ one TCP connection to `feed_host:feed_port`, sending nothing. See
 ## [input]
 
 The receiver. `decode` never reads the source keys, and a command-line source
-flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`)
-replaces a typed `[input]` whole, its shared keys included. So does a
+flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
+`--ka9q-group`) replaces a typed `[input]` whole, its shared keys included. So does a
 `MANTA_INPUT_TYPE` that differs from the file's `type` (see
 [Precedence](#precedence)): only the `MANTA_INPUT_*` variables then set
 `[input]`.
 
 | Key | Default | Wired | Notes |
 |---|---|---|---|
-| `type` | none; example `"kiwi"`; unset uses the default sound card, or the source the command line names | live: `run`, `soak`, `doctor`, `check` | `"audio"`, `"file"`, `"kiwi"`, `"soapy"` or `"hpsdr"`. Each type accepts only its own keys below. |
+| `type` | none; example `"kiwi"`; unset uses the default sound card, or the source the command line names | live: `run`, `soak`, `doctor`, `check` | `"audio"`, `"file"`, `"kiwi"`, `"soapy"`, `"hpsdr"` or `"ka9q"`. Each type accepts only its own keys below. |
 | `device` | none; example `"USB Audio"`; unset uses the system's default input | live: `type = "audio"` | Part of the device's name; `manta devices` lists them. `--device` overrides it. |
 | `path` | none; example `"capture.wav"`; required for `type = "file"` | live: `type = "file"` | WAV recording replayed as if live. A relative path set in the file is relative to the file's directory; from `--source`, which overrides it, or `MANTA_INPUT_PATH` it is relative to the working directory. |
 | `iq` | `false` | live: `type = "file"` | `true` for a two-channel IQ recording. `--source-iq` sets it. |
 | `realtime` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` paces the replay to the recording's own clock, so telnet/JSON clients can watch it. `--realtime` sets it; a live source refuses it. See [DECISIONS/2026-10-10-man269-paced-looping-replay.md](DECISIONS/2026-10-10-man269-paced-looping-replay.md). |
 | `loop` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` replays the file again from the start each time it ends, until stopped; implies `realtime`. `--loop` sets it; a live source refuses it. |
 | `host` | none; example `"<your-receiver-host>"`; required for kiwi and hpsdr | live: `type = "kiwi"` or `"hpsdr"` (hpsdr needs the build feature) | Receiver host name. `--kiwi-host` or `--hpsdr-host` overrides it. |
-| `port` | `8073`; `1024` for hpsdr | live: `type = "kiwi"` or `"hpsdr"` (hpsdr needs the build feature) | Receiver port, 1 to 65535. `--kiwi-port` or `--hpsdr-port` overrides it. |
+| `port` | `8073`; `1024` for hpsdr; `5004` for ka9q | live: `type = "kiwi"`, `"hpsdr"` (hpsdr needs the build feature) or `"ka9q"` | Receiver port, 1 to 65535; for ka9q, the group's RTP data port. `--kiwi-port`, `--hpsdr-port` or `--ka9q-port` overrides it. |
 | `password` | `""` | live: `type = "kiwi"` | KiwiSDR password; empty for a public receiver. `config check` prints only whether it is set. `--kiwi-password` overrides it. |
 | `driver` | none; example `"driver=rtlsdr"`; required for soapy | live: `type = "soapy"` (needs the build feature) | SoapySDR device arguments. `--soapy-driver` overrides it. |
 | `gain_db` | none; example `30.0`; unset uses the device's automatic gain | live: `type = "soapy"` (needs the build feature) | Receiver gain, dB. `--soapy-gain` overrides it. |
 | `freq_hz` | none; example `7030000.0`; required for kiwi, soapy and hpsdr | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"` | Receiver centre frequency, Hz. `--kiwi-freq-hz`, `--soapy-freq-hz` or `--hpsdr-freq-hz` overrides it. |
 | `rate_hz` | none; example `192000.0`; required for soapy and hpsdr | live: `type = "soapy"` or `"hpsdr"` | Sample rate, Hz. `--soapy-rate-hz` or `--hpsdr-rate-hz` overrides it. |
+| `group` | none; example `"239.101.6.1"`; required for ka9q | live: `type = "ka9q"` | Multicast data group of one ka9q-radio (radiod) IQ channel: an IPv4 multicast address, or the name in the channel's `data =` line, resolved by the system resolver when the source opens. Checked when the file loads; an IPv6 group is refused. manta reads the channel's sample rate, encoding and frequency from radiod's status packets. `--ka9q-group` overrides it. |
+| `ssrc` | none; example `14100000`; unset reads the group's only channel | live: `type = "ka9q"` | SSRC of the channel to read, 0 to 4294967295; needed only when the group carries more than one channel. `--ka9q-ssrc` overrides it. |
+| `interface` | none; example `"192.168.1.20"`; unset joins on the kernel's choice | live: `type = "ka9q"` | IPv4 address of the local interface to join the group on (an interface name is refused). manta also joins on `127.0.0.1`, for a radiod on the same machine. `--ka9q-interface` overrides it. |
 | `freq_correction_ppm` | `0.0` | live: `run`, `soak`, `doctor`, `decode`; dropped when a source flag replaces a typed `[input]` | Oscillator correction, ppm, -1000 to 1000. `--freq-correction-ppm` overrides it. |
 | `center_freq_hz` | none; example `14030000.0`; unset leaves frequencies as audio offsets, and `run` with `[server]` refuses a source that carries no frequency of its own | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Your radio's dial frequency, Hz, for a source that carries none. `--dial-freq-hz` overrides it. |
 | `capture_rate_hz` | none; example `48000.0`; unset decodes at the receiver's own rate | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Decimated sample rate, Hz. It must be at least 1000 (checked before the receiver opens), divide the receiver's rate by a power of two, and be 93.75 Hz (the channel spacing) times a power of two of at least 4, so in practice 1500, 3000, 6000, 12000, 24000, 48000, 96000 and so on. A rate that divides evenly but fails the last rule, such as 50000 from a 100 kS/s receiver, is rejected at startup. `--capture-rate-hz` overrides it. |
@@ -255,6 +262,7 @@ milliseconds, 0 to 3600000.
 | `warmup_ms` | `25.0` | live | Start-up time spent measuring the noise; no track opens before it ends. 0 to 3600000 (1 h); 0 means no warmup. |
 | `track_cap` | `1200` | live | Most tracks open at once, counting unconfirmed candidates that have no decoder yet; past it the lowest-SNR track is evicted. At least 1. |
 | `silent_respawn_cooldown_ms` | `30000.0` | live | Wait before a channel whose track went silent may start another. 0 to 3600000 (1 h); 0 means no cooldown. |
+| `crash_filter` | `"full"` | live | What a static crash (a band-wide lift of 3 dB or more on at least three quarters of the passband's channels for 8 ms or more) does. `"full"`: no track starts on it, and running tracks do not decode it. `"starts-only"`: no track starts on it, but running tracks decode it as received. `"off"`: no filtering. Crashes are counted in `manta_static_crashes_total` whatever the value. Inactive when the source passband holds fewer than 96 channels (rig audio; captures of 6 kHz or less). Needs a restart. See [SPEC §2.7](SPEC-decode-core.md#27-band-wide-static-crash-detection-man-312) and [MAN-312](DECISIONS/2026-10-13-man312-static-crash-filter.md). |
 | `rtty_filter` | `true` | live | Recognise RTTY (two-tone FSK) signals and start no CW track on them or their keying sidebands; `false` restores the previous behaviour. See [SPEC §2.6](SPEC-decode-core.md#26-two-tone-fsk-rtty-recognition) and [MAN-314](DECISIONS/2026-10-11-man314-rtty-recognition.md). |
 | `rtty_dwell_ms` | `20000.0` | live | How long an FSK signal must last before it is marked as RTTY; 1000 to 3600000 (1 h), counted in whole 1000 ms detector blocks. |
 

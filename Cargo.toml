@@ -60,6 +60,7 @@ rubato = "5.0"
 soapysdr = "0.5"
 regex = "1"
 tokio = "1"
+socket2 = { version = "0.6", features = ["all"] }
 tokio-tungstenite = "0.30"
 toml = "1.1"
 toml_edit = "0.25"
