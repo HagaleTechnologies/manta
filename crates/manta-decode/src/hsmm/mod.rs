@@ -293,11 +293,11 @@ impl HsmmDecoder {
         // anchor snapshot can't resurface an already-emitted entry here.
         // Decided entries form a prefix (see `commit::commit`), but this
         // check runs only once before reading the WHOLE history (Codex
-        // review, PR #161 round 7), so `retain` keeps it from depending
-        // on that proof.
+        // review, PR #161 round 7), so the prefix strip is kept from
+        // depending on that proof.
         let frontier = self.frontier;
         for t in self.live.iter_mut() {
-            t.hist.retain(|e| !frontier.is_decided(e));
+            frontier.strip_decided(&mut t.hist);
         }
         self.live.sort_by(token_order);
         let best = self.live[0].clone();

@@ -11,28 +11,36 @@ Each history entry (`token::HistEntry`) also records `char_start_ts`, the
 input sample counter at the anchor where its character's first mark
 began; a word boundary carries the character it follows. A
 `commit::Frontier` holds the latest emitted `sample_ts` (`last_ts`), the
-latest emitted word-boundary `sample_ts` (`last_word_ts`) and the latest
-emitted character's `char_start_ts` (`last_char_start`):
+latest emitted word-boundary `sample_ts` (`last_word_ts`), and the latest
+emitted character's glyph and `char_start_ts` (`last_glyph`,
+`last_char_start`):
 
 - **Character entry:** decided if `char_start_ts <= last_ts`.
 - **Word boundary entry:** decided if `char_start_ts <= last_word_ts`,
   meaning a boundary was already emitted at or after its character began,
   *or* if `sample_ts < last_ts`, meaning its gap began before something
-  already emitted, *or* if `char_start_ts <= last_ts` and
-  `char_start_ts != last_char_start`, meaning its character is decided
-  but is not the character last emitted, so the boundary follows a
-  contradicting segmentation.
+  already emitted.
 - **Emitting:** `last_ts = max(last_ts, sample_ts)`; for a word boundary,
   also `last_word_ts = max(last_word_ts, sample_ts)`; for a character,
-  `last_char_start = char_start_ts`.
+  `last_glyph` and `last_char_start`.
 
 `commit::commit()` strips decided entries from the front of every token
-at the top of each loop iteration. `finish()` removes them from every
-live token with `retain`, and emits its unclosed `AfterMark` tail glyph
-only when the frontier does not call that character decided. Character
-starts strictly increase along a token's `hist`, and a word boundary
-shares its character's start and closing time, so decided entries always
-form a prefix of a token's `hist`.
+at the top of each loop iteration (`Frontier::strip_decided`), and a word
+boundary is stripped together with its character when that character was
+rejected as a contradicting reading — a different glyph than `last_glyph`
+— that also began at a different anchor than the emitted character: a
+segmentation offset at both ends, whose gap timing is fabricated
+relative to the emission. A boundary whose character AGREED with the
+emission is the same character's own boundary and is kept, and so is one
+whose character only misread the glyph while agreeing on where it began
+(V8: such a straggler's gap timing still describes the real signal).
+`finish()` runs the same prefix strip on every live token, and emits its
+unclosed `AfterMark` tail glyph only when the frontier does not call that
+character decided. Character starts strictly increase along a token's
+`hist`, and a word boundary shares its character's start and closing
+time, so decided entries — with the boundary of a contradicting
+character, removed alongside it — always form a prefix of a token's
+`hist`.
 
 Consequences, each pinned by a unit test in `hsmm::commit::tests` or
 `hsmm::tests`:
@@ -46,19 +54,30 @@ Consequences, each pinned by a unit test in `hsmm::commit::tests` or
 4. A conflicting segmentation that ends before the committed close is
    stripped (the out-of-order `T@1611 after B@1795` class).
 5. A word boundary at the same gap as an emitted character, from the WGap
-   lineage after the CGap lineage won, is still emitted once.
+   lineage after the CGap lineage won, is still emitted once. So is the
+   boundary of a lineage that agreed on the glyph but placed the
+   character's first mark at another anchor: dropping it would lose a
+   real space and merge two words in the decoded text.
 6. A second word boundary for the same character is stripped.
 7. A late word boundary behind a later character is stripped.
 8. Output `sample_ts` never decreases within a track.
-9. A word boundary that follows a stripped, contradicting character is
+9. A word boundary that follows a stripped, contradicting character that
+   also began at a different anchor than the emitted character is
    stripped too. Otherwise it would emit a space and move `last_ts` past
    the real next character, which would then be dropped as decided.
 
-Rule 9's `last_char_start` condition was added in the implement phase
-after self-review found the leak; the plan's rule had only the first two
-word-boundary conditions. Re-measured on the implement build, it removes
-5 spurious word boundaries from V5 (CER 1.1771 → 1.1406) and leaves the
-decoded text of the other 14 vectors unchanged.
+The contradicting-character strip (rule 9) was added in the implement
+phase after self-review found the leak; the plan's rule had only the two
+word-boundary conditions above. The implement phase keyed it on
+`char_start_ts != last_char_start`, which also removed the boundaries of
+lineages that AGREED with the emitted glyph, losing real spaces between
+words (MAN-189 validation, 2026-10-14); it now compares glyphs and start
+anchors as described above. A boundary whose character misread the glyph
+but agreed on the start anchor is kept on purpose: on V8 such boundaries
+carry real spaces, and stripping them let the bogus `K2ST` spot (a split
+`K2STA`) through. The V5 CER with the over-stripping variant was
+measured at 1.1406 (5 fewer boundaries); the narrowed rule keeps those
+boundaries, so V5 sits at or below the plan's 1.1771 frontier number.
 
 ## Mechanism and evidence
 
@@ -108,7 +127,7 @@ the track nearest each expected frequency):
 | vector | CER main | CER frontier | chars main→frontier |
 |---|---|---|---|
 | V1, V2, V3, V4, V6, VR1, VR2, VR3, VR4, VR6b, VR7 | unchanged | unchanged (identical text) | unchanged |
-| V5 | 1.4062 | 1.1771 (1.1406 with rule 9) | 237→205 |
+| V5 | 1.4062 | 1.1771 | 237→205 |
 | VR5 (sig 0 / sig 1) | 0.1582 / 0.7228 | 0.1497 / 0.6966 | 308→300 |
 | VR6a | 0.0065 | 0.0032 | 248→247 |
 | VR8 | 0.6687 | 0.5604 | 316→289 |
