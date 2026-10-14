@@ -247,8 +247,9 @@ pub fn calibration_factor_from_ppm(ppm: f64) -> Result<f64, InvalidCalibration> 
     Ok(factor)
 }
 
-/// Per-reason counts of spots suppressed by an operator override (MAN-31).
-/// ARCHITECTURE §8: "Every dropped/evicted/suppressed item is counted. No
+/// Per-reason counts of spots suppressed by an operator override (MAN-31),
+/// and of captured deferred Beacon candidates (`PendingBeacon`) lost
+/// before they could spot (PR #154, MAN-174). ARCHITECTURE §8: "Every dropped/evicted/suppressed item is counted. No
 /// silent loss anywhere in the pipeline." Exposed via
 /// `Validator::suppression_counts` for the future M3 metrics endpoint to
 /// read, mirroring `manta_engine::track::CloseCounts` -- nothing wires it
@@ -268,6 +269,18 @@ pub struct SuppressionCounts {
     /// evidence the physical signal ended, but with no successor
     /// track_id to migrate the evidence to either (round 9).
     pub pending_beacon_lost_to_eviction: u64,
+    /// A captured `PendingBeacon` discarded at its track's `SignalEnded`
+    /// close because the track's final speed was implausible (above
+    /// `MAX_PLAUSIBLE_WPM`) or never measured (no `SpeedUpdate`): the WPM
+    /// gate (MAN-174, ARCHITECTURE §8). A candidate the operator lists
+    /// suppress at that moment is counted under `blocklist`/`notch`
+    /// instead, never both.
+    pub pending_beacon_rejected_wpm: u64,
+    /// A captured `PendingBeacon` discarded at resolution because a spot
+    /// for the same (callsign, frequency bucket) with a strictly newer
+    /// `sample_ts` was already emitted, so emitting it would rewind
+    /// `Dedupe`'s watermark (MAN-174).
+    pub pending_beacon_stale: u64,
     /// Power-step beacon occurrences (MAN-37 `<call> T`) discarded by the
     /// coarse whole-window CQ/DE framing guard -- see `context::parse`'s own
     /// docs for why that guard is deliberately coarse. Counted once per
@@ -734,7 +747,17 @@ impl Validator {
                         self.resolve_pending_beacons(*track_id)
                     }
                     ClosureKind::Bookkeeping { survivor_track_id } => {
-                        self.migrate_or_discard_pending_beacons(*track_id, *survivor_track_id);
+                        // MAN-174: resolve the named survivor through
+                        // `merged_into` BEFORE migrating. manta-engine
+                        // orders a merge loser's close ahead of its
+                        // survivor's, so this is normally the survivor
+                        // itself; if closures ever arrive out of order
+                        // (the survivor already merged further), the
+                        // evidence lands on the live root instead of
+                        // recreating a dead track_id's state that no
+                        // close would ever free.
+                        let root = survivor_track_id.map(|s| self.resolve_survivor_root(s));
+                        self.migrate_or_discard_pending_beacons(*track_id, root);
                         // MAN-100 message-distinctness (Codex review, PR
                         // #133 rounds 3-5): a survivor exists, so this
                         // track_id's identity continues rather than
@@ -744,8 +767,7 @@ impl Validator {
                         // real close and let the survivor's next word
                         // manufacture a false second message from the
                         // SAME transmission.
-                        if let Some(survivor) = survivor_track_id {
-                            let root = self.resolve_survivor_root(*survivor);
+                        if let Some(root) = root {
                             // A chained merge (A already an alias into
                             // THIS track_id, which is now itself merging
                             // further into `root`): re-point A straight
@@ -1440,27 +1462,29 @@ impl Validator {
         self.decide(|| withheld(Reason::BeaconPending));
 
         let pending = &mut self.tracks.get_mut(&track_id)?.pending_beacons;
-        if pending.len() >= MAX_PENDING_BEACONS {
-            // Drop the oldest to bound growth on a track that stays alive
-            // indefinitely (round 8) -- see MAX_PENDING_BEACONS's doc.
-            // Counted (ARCHITECTURE §8 -- round 9): this candidate's own
-            // source word was already marked attempted and won't be
-            // recaptured, so this is a real, permanent loss.
-            let evicted = pending.remove(0);
+        // Past the cap, drop the oldest to bound growth on a track that
+        // stays alive indefinitely (round 8) -- see MAX_PENDING_BEACONS's
+        // doc. Counted (ARCHITECTURE §8 -- round 9): this candidate's own
+        // source word was already marked attempted and won't be
+        // recaptured, so this is a real, permanent loss.
+        let evicted = insert_by_age(
+            pending,
+            PendingBeacon {
+                candidate,
+                sample_ts,
+                freq_hz,
+                snr_db,
+                char_confidences,
+                origin_track_id: track_id,
+                word_seq,
+            },
+        );
+        if let Some(evicted) = evicted {
             self.suppression_counts.pending_beacon_overflow += 1;
             if let Some(log) = self.decisions.as_mut() {
                 log.push(beacon_decision(track_id, &evicted, Reason::BeaconOverflow));
             }
         }
-        pending.push(PendingBeacon {
-            candidate,
-            sample_ts,
-            freq_hz,
-            snr_db,
-            char_confidences,
-            origin_track_id: track_id,
-            word_seq,
-        });
         None
     }
 
@@ -1503,15 +1527,16 @@ impl Validator {
         match survivor_track_id {
             Some(survivor) => {
                 let survivor_track = self.tracks.entry(survivor).or_default();
+                // Merged by `sample_ts`, not appended (MAN-174): the cap
+                // must drop the true oldest across both queues, so an old
+                // loser candidate never displaces the survivor's newer ones.
                 for pb in pending {
-                    if survivor_track.pending_beacons.len() >= MAX_PENDING_BEACONS {
-                        let evicted = survivor_track.pending_beacons.remove(0);
+                    if let Some(evicted) = insert_by_age(&mut survivor_track.pending_beacons, pb) {
                         self.suppression_counts.pending_beacon_overflow += 1;
                         if let Some(log) = self.decisions.as_mut() {
                             log.push(beacon_decision(survivor, &evicted, Reason::BeaconOverflow));
                         }
                     }
-                    survivor_track.pending_beacons.push(pb);
                 }
             }
             None => {
@@ -1573,8 +1598,17 @@ impl Validator {
             // Operator suppression takes precedence over the automatic
             // speed rejection (`blocklisted_beacon_above_max_wpm_still_counts_as_suppressed`),
             // so lists reloaded since capture are still counted here (MAN-78).
+            // Every other candidate is counted as a WPM-gate rejection,
+            // unconfirmed and implausible speed alike (MAN-174,
+            // ARCHITECTURE §8) -- exactly one counter per candidate.
             for pb in &pending {
-                let reason = self.operator_suppressed(pb).unwrap_or(Reason::BeaconSpeed);
+                let reason = match self.operator_suppressed(pb) {
+                    Some(reason) => reason,
+                    None => {
+                        self.suppression_counts.pending_beacon_rejected_wpm += 1;
+                        Reason::BeaconSpeed
+                    }
+                };
                 self.decide(|| beacon_decision(track_id, pb, reason));
             }
             return Vec::new();
@@ -1621,10 +1655,16 @@ impl Validator {
                 // there would still record it, silently rewinding the
                 // watermark backward and letting a later real spot escape
                 // the suppression window early (Codex review on PR #154,
-                // round 8). Simplest safe rule: an already-superseded
-                // observation is not worth emitting at all.
+                // round 8). So a strictly older observation is dropped,
+                // and counted (MAN-174, ARCHITECTURE §8). An EQUAL
+                // timestamp cannot rewind the watermark -- e.g. two tracks
+                // completing a word on the same input hop -- so it goes
+                // through `should_emit` exactly like a non-deferred
+                // candidate: suppressed as a duplicate, or emitted on a
+                // spot-type change or SNR jump (MAN-174).
                 if let Some(last_ts) = self.dedupe.last_sample_ts(&pb.candidate, pb.freq_hz) {
-                    if pb.sample_ts <= last_ts {
+                    if pb.sample_ts < last_ts {
+                        self.suppression_counts.pending_beacon_stale += 1;
                         self.decide(|| {
                             beacon_decision(track_id, &pb, Reason::Dedupe).with_reps(reps)
                         });
@@ -1656,6 +1696,17 @@ impl Validator {
             })
             .collect()
     }
+}
+
+/// Inserts `pb` at its `sample_ts` position (after any equal ones, so
+/// capture order breaks ties) and, past `MAX_PENDING_BEACONS`, removes and
+/// returns the oldest entry, which may be `pb` itself. Keeps `pending`
+/// sorted by `sample_ts`, so the cap always drops the true oldest
+/// (MAN-174).
+fn insert_by_age(pending: &mut Vec<PendingBeacon>, pb: PendingBeacon) -> Option<PendingBeacon> {
+    let at = pending.partition_point(|p| p.sample_ts <= pb.sample_ts);
+    pending.insert(at, pb);
+    (pending.len() > MAX_PENDING_BEACONS).then(|| pending.remove(0))
 }
 
 /// A decision about a deferred beacon candidate, decided under
@@ -2333,6 +2384,170 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(spots.is_empty());
         assert_eq!(v.suppression_counts().blocklist, 1);
+        // MAN-174: counted once, as an operator suppression, never also
+        // as a WPM-gate rejection.
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().blocklist, 1);
+        assert_eq!(v.suppression_counts().pending_beacon_rejected_wpm, 0);
+    }
+
+    /// MAN-174 finding 2: a captured Beacon dropped by the WPM gate at its
+    /// track's close is counted, not silently lost (ARCHITECTURE §8).
+    #[test]
+    fn a_beacon_rejected_for_implausible_wpm_is_counted() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 60.0,
+        });
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().pending_beacon_rejected_wpm, 1);
+    }
+
+    /// MAN-174 finding 2 (round-10 note): the unconfirmed-speed refusal is
+    /// the same gate and is counted the same way.
+    #[test]
+    fn a_beacon_rejected_for_unconfirmed_wpm_is_counted() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert_eq!(v.suppression_counts().pending_beacon_rejected_wpm, 1);
+    }
+
+    /// MAN-174 finding 1 backstop: closures arriving survivor-first (track
+    /// 1 merges into 3, then track 2 into 1) still land track 2's evidence
+    /// on the live root, track 3, and leave no state behind for track 1.
+    #[test]
+    fn a_chained_merge_out_of_order_still_resolves_at_the_final_survivor() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 2);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 2,
+            wpm: 22.0,
+        });
+        let spots = run(&transmission_events(2, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        for (track_id, survivor) in [(1, 3), (2, 1)] {
+            let spots = v.ingest(&DecoderEvent::TrackClosed {
+                track_id,
+                closure: ClosureKind::Bookkeeping {
+                    survivor_track_id: Some(survivor),
+                },
+            });
+            assert!(spots.is_empty(), "got {spots:?}");
+        }
+        seed_meta(&mut v, 3);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 3,
+            wpm: 25.0,
+        });
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 3,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].callsign, "K5ARH");
+        assert_eq!(spots[0].spot_type, SpotType::Beacon);
+        assert!(
+            !v.tracks.contains_key(&1),
+            "a dead survivor's track state must not be recreated"
+        );
+    }
+
+    /// MAN-174 finding 4: migration merges both queues by `sample_ts`, so
+    /// the cap evicts the true oldest. The loser's stale candidate goes,
+    /// not the survivor's oldest newer one.
+    #[test]
+    fn migration_keeps_the_newest_pending_beacons_by_sample_ts() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        seed_meta(&mut v, 2);
+        let spots = run(&transmission_events(1, &["K5AAZ", "T"], 0), &mut v);
+        assert!(spots.is_empty());
+        let mut expected = Vec::new();
+        for i in 0..MAX_PENDING_BEACONS {
+            let call = format!("K5AA{}", (b'A' + i as u8) as char);
+            let start = 10_000_000 + i as u64 * 1_000_000;
+            let spots = run(
+                &transmission_events(2, &[call.as_str(), "T"], start),
+                &mut v,
+            );
+            assert!(spots.is_empty());
+            expected.push(call);
+        }
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(2),
+            },
+        });
+        let pending = &v.tracks[&2].pending_beacons;
+        let calls: Vec<&str> = pending.iter().map(|pb| pb.candidate.as_str()).collect();
+        assert_eq!(calls, expected);
+        assert!(
+            pending.windows(2).all(|w| w[0].sample_ts <= w[1].sample_ts),
+            "pending_beacons must stay sorted by sample_ts"
+        );
+        assert_eq!(v.suppression_counts().pending_beacon_overflow, 1);
+    }
+
+    /// MAN-174 finding 5: a deferred Beacon with the SAME `sample_ts` as
+    /// an emitted spot cannot rewind the dedupe watermark. It goes through
+    /// `Dedupe::should_emit`, where a De -> Beacon type change emits it.
+    #[test]
+    fn an_equal_timestamp_deferred_beacon_goes_through_dedupe() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 2);
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = run(&transmission_events(2, &words, 5_000_000), &mut v);
+        spots.extend(run(&transmission_events(2, &words, 5_100_000), &mut v));
+        assert_eq!(spots.len(), 1, "the ordinary path must spot normally");
+        assert_eq!(spots[0].spot_type, SpotType::De);
+        let t = spots[0].sample_ts;
+
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        // The capture is stamped at "T"'s word boundary, 700 samples after
+        // "K5ARH"'s first character.
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], t - 700), &mut v);
+        assert!(spots.is_empty());
+        assert_eq!(
+            v.tracks[&1]
+                .pending_beacons
+                .iter()
+                .map(|pb| pb.sample_ts)
+                .collect::<Vec<_>>(),
+            vec![t],
+            "fixture: the Beacon must be captured at the spot's own timestamp"
+        );
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].spot_type, SpotType::Beacon);
+        assert_eq!(spots[0].sample_ts, t);
+        assert_eq!(v.suppression_counts().pending_beacon_stale, 0);
     }
 
     /// Codex review on PR #154, round 8: a regularly-transmitting carrier
@@ -2412,7 +2627,13 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
 
         // Track 1 finally closes -- its captured (OLDER) Beacon candidate
         // must not emit now, and must not roll dedupe's watermark back to
-        // its own stale timestamp.
+        // its own stale timestamp. A plausible, confirmed final speed
+        // (MAN-174), so the candidate reaches the stale check rather than
+        // the round-10 unconfirmed-WPM refusal.
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
         let spots3 = v.ingest(&DecoderEvent::TrackClosed {
             track_id: 1,
             closure: ClosureKind::SignalEnded,
@@ -2427,6 +2648,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             "resolving the stale deferred candidate must not roll the \
              dedupe watermark backward"
         );
+        // MAN-174 finding 6: the stale drop is counted.
+        assert_eq!(v.suppression_counts().pending_beacon_stale, 1);
     }
 
     /// Codex review on PR #154, round 9: a Merged closure is not evidence

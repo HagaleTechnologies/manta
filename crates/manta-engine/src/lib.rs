@@ -80,17 +80,6 @@ pub(crate) fn calibrate_freq_events(ev: &DecoderEvent, factor: f64) -> DecoderEv
     }
 }
 
-/// `decode_samples`'s single-track selection: the lowest track_id among
-/// events that represent real decoder output. `TrackPromoted` is a
-/// detector-internal diagnostic signal (added for `manta_engine::doctor()`'s
-/// NoSignal check, see docs/DECISIONS/2026-09-09-doctor-track-promoted-
-/// event.md) with no decoder output of its own -- excluded here so an
-/// early, low-track-id candidate that was promoted and then merged/
-/// evicted/reached EOF before producing any real decoder event never gets
-/// selected over a later track that actually decoded something (round-5
-/// review finding). `None` means every event in `events` was a
-/// `TrackPromoted` (or `events` was empty, already handled by the caller
-/// before this is reached).
 /// The last `TimingUpdate` in `track_events` (one track's events): the
 /// sender timing `DecodeReport::timing` reports (MAN-315).
 fn last_timing(track_events: &[DecoderEvent]) -> Option<TimingEstimates> {
@@ -100,10 +89,29 @@ fn last_timing(track_events: &[DecoderEvent]) -> Option<TimingEstimates> {
     })
 }
 
+/// `decode_samples`'s single-track selection: the lowest track_id among
+/// events that represent real decoder output. `TrackPromoted` is a
+/// detector-internal diagnostic signal (added for `manta_engine::doctor()`'s
+/// NoSignal check, see docs/DECISIONS/2026-09-09-doctor-track-promoted-
+/// event.md) with no decoder output of its own -- excluded here so an
+/// early, low-track-id candidate that was promoted and then merged/
+/// evicted/reached EOF before producing any real decoder event never gets
+/// selected over a later track that actually decoded something (round-5
+/// review finding). `TrackClosed` is bookkeeping, not decoder output,
+/// and is excluded too (MAN-174): a merge survivor that never decoded
+/// still gets its own `TrackClosed`, and must not become the reported
+/// track on that alone. `None` means every event in `events` was a
+/// `TrackPromoted` or `TrackClosed` (or `events` was empty, already
+/// handled by the caller before this is reached).
 fn primary_track_id(events: &[DecoderEvent]) -> Option<u32> {
     events
         .iter()
-        .filter(|e| !matches!(e, DecoderEvent::TrackPromoted { .. }))
+        .filter(|e| {
+            !matches!(
+                e,
+                DecoderEvent::TrackPromoted { .. } | DecoderEvent::TrackClosed { .. }
+            )
+        })
         .map(track::event_track_id)
         .min()
 }
@@ -515,6 +523,21 @@ mod tests {
             },
         ];
         assert_eq!(primary_track_id(&events), Some(2));
+    }
+
+    /// MAN-174: a merge survivor that never decoded still gets its own
+    /// `TrackClosed`. That bookkeeping event must not make it the
+    /// reported track over a higher-id track with real decoder output.
+    #[test]
+    fn primary_track_id_ignores_track_closed() {
+        let events = vec![
+            DecoderEvent::TrackClosed {
+                track_id: 2,
+                closure: manta_decode::events::ClosureKind::SignalEnded,
+            },
+            DecoderEvent::word_boundary(5, 10),
+        ];
+        assert_eq!(primary_track_id(&events), Some(5));
     }
 
     /// MAN-315: `DecodeReport::timing` is the primary track's last
