@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Build one native release archive (MAN-268).
 
-Copies the built binary, README.md, both licence files and the unattended-
-service kit into a fresh scratch staging tree, then writes
+Copies the built binary, README.md, both licence files, the unattended-
+service kit and the man pages `manta man-pages --out` generates (MAN-133,
+passed in via --man-dir) into a fresh scratch staging tree, then writes
 `<out-dir>/<artifact>.tar.gz` or `<out-dir>/<artifact>.zip` containing exactly
 one top-level `<artifact>/` directory. Both release workflows
 (.github/workflows/release.yml, release-publish.yml) call this from one
@@ -43,6 +44,20 @@ ASSETS = (
     "packaging/launchd/create-service-account.sh",
     "packaging/launchd/rotate-log.sh",
     "docs/RUNBOOKS/network-exposure.md",
+    # MAN-148: the service kit links the operator guides. Keep their direct
+    # relative-link targets available when reading an extracted release too.
+    "docs/GUIDES/rbn-node.md",
+    "docs/GUIDES/kiwisdr.md",
+    "docs/GUIDES/raspberry-pi.md",
+    "docs/RUNBOOKS/node-health.md",
+    "docs/RUNBOOKS/uplink-health.md",
+    "docs/RUNBOOKS/release.md",
+    "docs/RUNBOOKS/secondary-skimmer-field-node.md",
+    "docs/RUNBOOKS/m2-pi4-cpu-budget.md",
+    "docs/DECISIONS/2026-07-25-m2-kiwisdr-input-pins.md",
+    "docs/DECISIONS/2026-09-06-broad-review-decisions.md",
+    "docs/SPEC-decode-core.md",
+    "rust-toolchain.toml",
 )
 
 FORMATS = {"tar.gz": ".tar.gz", "zip": ".zip"}
@@ -55,6 +70,8 @@ def parse_args(argv):
                    help="top-level directory and archive basename, e.g. manta-linux-x86_64")
     p.add_argument("--format", required=True, choices=sorted(FORMATS))
     p.add_argument("--out-dir", required=True, help="directory the archive is written to")
+    p.add_argument("--man-dir", required=True,
+                   help="directory holding the generated man pages (`manta man-pages --out`)")
     p.add_argument("--root", default=ROOT, help="repository root holding the assets (default: this checkout)")
     args = p.parse_args(argv)
     name = args.artifact
@@ -63,13 +80,28 @@ def parse_args(argv):
     return args
 
 
-def missing_inputs(binary, root):
+# Where the man pages land inside the archive (MAN-133): `man/man1`, the
+# directory `man manta` reads once the operator copies it under a prefix.
+MAN_DEST = "man/man1"
+
+
+def man_pages(man_dir):
+    """Every regular `*.1` file directly in `man_dir`, sorted."""
+    if not os.path.isdir(man_dir):
+        return []
+    return sorted(n for n in os.listdir(man_dir)
+                  if n.endswith(".1") and os.path.isfile(os.path.join(man_dir, n)))
+
+
+def missing_inputs(binary, root, man_dir):
     paths = [binary] + [os.path.join(root, *rel.split("/")) for rel in ASSETS]
+    paths.append(os.path.join(man_dir, "manta.1"))
     return [path for path in paths if not os.path.isfile(path)]
 
 
-def stage(binary, root, staging):
-    """Copy the binary and every asset under `staging`; return {relative path: mode}."""
+def stage(binary, root, man_dir, staging):
+    """Copy the binary, every asset and the man pages under `staging`;
+    return {relative path: mode}."""
     os.makedirs(staging)
     bin_name = os.path.basename(binary)
     shutil.copyfile(binary, os.path.join(staging, bin_name))
@@ -79,6 +111,11 @@ def stage(binary, root, staging):
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         shutil.copyfile(os.path.join(root, *rel.split("/")), dest)
         modes[rel] = 0o755 if rel.endswith(".sh") else 0o644
+    os.makedirs(os.path.join(staging, *MAN_DEST.split("/")), exist_ok=True)
+    for name in man_pages(man_dir):
+        rel = f"{MAN_DEST}/{name}"
+        shutil.copyfile(os.path.join(man_dir, name), os.path.join(staging, *rel.split("/")))
+        modes[rel] = 0o644
     return modes
 
 
@@ -135,7 +172,7 @@ def write_zip(path, items, mtime):
 
 def main(argv=None):
     args = parse_args(argv)
-    missing = missing_inputs(args.binary, args.root)
+    missing = missing_inputs(args.binary, args.root, args.man_dir)
     if missing:
         for path in missing:
             print(f"package-release: missing required input: {path}", file=sys.stderr)
@@ -147,7 +184,7 @@ def main(argv=None):
     mtime = int(time.time())
     with tempfile.TemporaryDirectory(prefix="manta-package-") as scratch:
         staging = os.path.join(scratch, args.artifact)
-        modes = stage(args.binary, args.root, staging)
+        modes = stage(args.binary, args.root, args.man_dir, staging)
         items = entries(staging, args.artifact, modes)
         # Build beside the destination, then rename: a failure never leaves a
         # partial archive under the final name.

@@ -1,9 +1,12 @@
-//! Outbound RBN telnet uplink -- MAN-32. Connects to RBN's own
-//! spot-collection endpoint as a client and forwards manta's own
-//! validated spots (`SpotBus`) in the same `DX de` wire format the
-//! inbound telnet server (`telnet.rs`) emits, per ARCHITECTURE §7's wire
-//! format and this repo's own reference implementation of that protocol
-//! from the server side.
+//! Outbound RBN uplink -- MAN-32. Experimental (MAN-90): connects to a
+//! configured spot collector as a client and forwards manta's own validated
+//! spots (`SpotBus`) as RBN-layout `DX de` lines. The handshake (read one
+//! line, send the login callsign) and the layout are manta's assumption,
+//! borrowed from the inbound telnet server (`telnet.rs`), whose AK1A layout
+//! was measured on RBN's *outbound* relay. RBN publishes nothing about what
+//! its ingest accepts, and this module has only run against in-process mock
+//! collectors. Open claims C1-C7:
+//! docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md.
 
 use crate::backoff::{next_backoff, AttemptOutcome as ConnectAttemptError, INITIAL_BACKOFF};
 use crate::bounded_io::{read_line_bounded, read_line_bounded_with_timeout};
@@ -12,6 +15,7 @@ use crate::config::{RbnUplinkConfig, UplinkSpotTypes};
 use crate::metrics::UplinkTarget;
 use crate::rate_limit::RateLimiter;
 use crate::rbn;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -24,7 +28,7 @@ use tokio::sync::{broadcast, watch, Semaphore};
 /// (commonly minutes), blocking shutdown the whole time -- this attempt
 /// is additionally raced against `shutdown.changed()` below, but the
 /// timeout still bounds worst-case time when shutdown never fires.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounds the WHOLE multi-address attempt in `connect_first_reachable`
 /// (MAN-67, PR #80 review round 9): each candidate address already gets
 /// its own `CONNECT_TIMEOUT`, but with no cap on the loop as a whole, a
@@ -39,7 +43,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// succeeded can still be cut off if earlier ones ate the whole window,
 /// but the alternative (no cap) is worse -- shutdown remains the only
 /// hard bound otherwise.
-const OVERALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const OVERALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Every outbound write to the uplink target gets this long before being
 /// treated as stalled (MAN-58 comment finding 2) -- matches `telnet.rs`'s
 /// identical `WRITE_TIMEOUT` for the same class of risk on the inbound
@@ -48,8 +52,8 @@ const OVERALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// task indefinitely.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Response-line rate budget for the target's post-login discard read
-/// (MAN-58 comment finding 3): RBN's collection server isn't expected to
-/// send anything meaningful back after login, but with no budget at all
+/// (MAN-58 comment finding 3): manta assumes the collector sends nothing
+/// meaningful back after login (unverified, MAN-90 C6), but with no budget at all
 /// a misbehaving, compromised, or MITM'd target sending an endless stream
 /// of short, valid, newline-terminated lines would keep this task hot
 /// indefinitely with no CPU/bandwidth bound -- mirrors `telnet.rs`'s
@@ -60,6 +64,13 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// time.
 const MAX_TARGET_RESPONSE_LINES: u32 = 30;
 const TARGET_RESPONSE_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// MAN-90: appended to every operator-facing "now transmitting" log line --
+/// here at startup and in manta-cli's SIGHUP reload -- because nothing has
+/// yet confirmed what RBN's real ingest accepts. See
+/// docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md.
+pub const EXPERIMENTAL_NOTICE: &str =
+    "The uplink is experimental: its login and spot format are unverified against RBN's real ingest.";
 
 /// MAN-128 D7: the Prometheus label for each configured `[[rbn_uplink]]`
 /// target is `host:port`; the 2nd and later exact duplicate of the same
@@ -89,11 +100,30 @@ pub fn target_labels(configs: &[RbnUplinkConfig]) -> Vec<String> {
 /// a dropped connection must not permanently silence the uplink, since
 /// that would defeat MAN-32's purpose of manta staying a live RBN
 /// contributor.
+///
+/// `dry_run` is fixed at `config.dry_run` for the task's life; see
+/// `serve_with_live_dry_run` for a flag a live reload can change.
 pub async fn serve(
     config: RbnUplinkConfig,
     station_callsign: String,
     bus: Arc<SpotBus>,
     target: Arc<UplinkTarget>,
+    shutdown: watch::Receiver<bool>,
+) {
+    let dry_run = Arc::new(AtomicBool::new(config.dry_run));
+    serve_with_live_dry_run(config, station_callsign, bus, target, dry_run, shutdown).await;
+}
+
+/// `serve`, reading `dry_run` from a shared flag on every forwarded spot
+/// instead of `config.dry_run` (MAN-78): a live config reload flips it
+/// without reconnecting or logging in again. Once running, only the flag
+/// is read, never `config.dry_run`.
+pub async fn serve_with_live_dry_run(
+    config: RbnUplinkConfig,
+    station_callsign: String,
+    bus: Arc<SpotBus>,
+    target: Arc<UplinkTarget>,
+    dry_run: Arc<AtomicBool>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     if !config.enabled {
@@ -108,7 +138,7 @@ pub async fn serve(
     // field and `start_spot_server` spawns one `serve` task per entry.
     // Goes through `tracing` (stderr, see `main.rs`'s subscriber setup)
     // so it can never interleave with `--json` spot output on stdout.
-    if config.dry_run {
+    if dry_run.load(Ordering::Relaxed) {
         tracing::info!(
             target_host = %config.target_host,
             target_port = config.target_port,
@@ -122,7 +152,8 @@ pub async fn serve(
             target_host = %config.target_host,
             target_port = config.target_port,
             spot_types = %config.spot_types.as_str(),
-            "uplink: dry_run = false -- transmitting real spots to this target."
+            "uplink: dry_run = false -- transmitting real spots to this target. {}",
+            EXPERIMENTAL_NOTICE
         );
     }
     let login_callsign = config
@@ -149,6 +180,7 @@ pub async fn serve(
 
         match connect_and_forward(
             &config,
+            &dry_run,
             &login_callsign,
             &bus,
             &target,
@@ -290,7 +322,7 @@ async fn connect_first_reachable(addrs: Vec<std::net::SocketAddr>) -> std::io::R
 /// that block (or a gateway that rejects it) gets an immediate
 /// `NetworkUnreachable` instead of a hang, silently turning the deadline
 /// test into a no-op everywhere that's true.
-async fn connect_first_reachable_bounded<T, F, Fut>(
+pub(crate) async fn connect_first_reachable_bounded<T, F, Fut>(
     addrs: Vec<std::net::SocketAddr>,
     per_addr_timeout: Duration,
     overall_timeout: Duration,
@@ -329,6 +361,7 @@ where
 
 async fn connect_and_forward(
     config: &RbnUplinkConfig,
+    dry_run: &AtomicBool,
     login_callsign: &str,
     bus: &Arc<SpotBus>,
     target: &Arc<UplinkTarget>,
@@ -417,7 +450,7 @@ async fn connect_and_forward(
         &mut reader,
         &mut wr,
         &mut rx,
-        config,
+        dry_run,
         config.spot_types,
         login_callsign,
         bus,
@@ -429,8 +462,8 @@ async fn connect_and_forward(
     result.map_err(|_| ConnectAttemptError::Disconnected)
 }
 
-/// RBN's collection server isn't expected to send anything meaningful
-/// back after login, but this task must still poll the read half --
+/// manta assumes the collector sends nothing meaningful back after login
+/// (unverified, MAN-90 C6), but this task must still poll the read half --
 /// otherwise a remote-side close (FIN) is invisible until the next
 /// spot happens to be published and the resulting write fails. A node
 /// that only notices it's disconnected whenever the next spot arrives
@@ -525,7 +558,7 @@ async fn forward_loop(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
     wr: &mut tokio::net::tcp::OwnedWriteHalf,
     rx: &mut broadcast::Receiver<crate::bus::BusSpot>,
-    config: &RbnUplinkConfig,
+    dry_run: &AtomicBool,
     spot_types: UplinkSpotTypes,
     spotter_call: &str,
     bus: &Arc<SpotBus>,
@@ -550,7 +583,7 @@ async fn forward_loop(
                             target.record_suppressed();
                             continue;
                         }
-                        if config.dry_run {
+                        if dry_run.load(Ordering::Relaxed) {
                             target.record_suppressed();
                             continue;
                         }

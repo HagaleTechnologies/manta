@@ -33,6 +33,8 @@ impl TrackLines {
             // No state: a bare promotion never gets a TrackClosed (MAN-19's
             // has_emitted filter), so an entry made here would never be freed.
             DecoderEvent::TrackPromoted { .. } => None,
+            // Sender-timing diagnostics (MAN-315) stay out of text mode.
+            DecoderEvent::TimingUpdate { .. } => None,
             DecoderEvent::TrackClosed { track_id, .. } => {
                 let line = self.tracks.remove(track_id)?;
                 render(*track_id, &line)
@@ -104,11 +106,14 @@ fn render(track_id: u32, line: &PendingLine) -> Option<String> {
         return None;
     }
     let mut label = format!("track {track_id}");
+    // MAN-270: the shared human formatters (half-away-from-zero WPM).
     if let Some(hz) = line.freq_hz {
-        label.push_str(&format!(" {:.1} kHz", hz / 1000.0));
+        label.push(' ');
+        label.push_str(&manta_server::human::khz(hz));
     }
     if let Some(wpm) = line.wpm {
-        label.push_str(&format!(" {wpm:.0} WPM"));
+        label.push(' ');
+        label.push_str(&manta_server::human::wpm(wpm));
     }
     Some(format!("[{label}] {text}"))
 }

@@ -27,3 +27,47 @@ The detector estimates a per-channel noise floor by order statistics (a quantile
 ## Why it is shaped this way
 
 Order statistics rather than a mean floor is the load-bearing choice: CW is bursty, and a mean would let a strong keyed signal raise the threshold above weaker neighbors. The hysteresis + hang timing exists to survive QSB and inter-word gaps without dropping a track mid-QSO. Active tracks feed the [[decode-chain]].
+
+## Gotchas
+
+- High-SNR PFB skirt leakage can cross the detector threshold outside an
+  incumbent's owned channels. MAN-172 adds local-peak spawn eligibility
+  and incumbent-wins merge ties; see the
+  [decision record](../../docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md).
+- A splatter rule must never close existing tracks: key-up gaps put real
+  CW below any relative-level threshold. MAN-314's RTTY shadow therefore
+  vetoes spawns only, and closes use the RTTY hard span alone; see the
+  [decision record](../../docs/DECISIONS/2026-10-11-man314-rtty-recognition.md)
+  and SPEC-decode-core.md §2.6.
+- Start-up: a padded decode path's zero pre-roll hops must stay out of the
+  floor (`TrackManager::skip_preroll_hops`); a young ring's lower quartile
+  is its minimum, so they would pin the floor near -140 dB. The 25 ms
+  default warm-up is safe only together with `FloorBank`'s 1 s
+  block-median seed (SPEC §2.2 "Startup"). Never extend the seed on a
+  ring's bottom-bin count: one later entry revives a stale seed for 10 s;
+  leading silence is left out of the effective floor's quartile instead.
+  V8w's 0-bogus and V1's 10 Hz
+  frequency gates move with the promotion hop, so re-run them after any
+  warm-up change; see the MAN-115
+  [decision record](../../docs/DECISIONS/2026-10-11-man115-startup-latency.md).
+- Static crashes (MAN-312, SPEC §2.7): judge any band-wide event over the
+  source's passband, not every channel. A KiwiSDR's out-of-band channels
+  never lift, so an all-channel lower quartile missed its crashes; wherever
+  a live source exists, pass `rf_passband_hz()` to the `TrackManager`.
+- The crash decoder hold uses the value from before the onset: a crash is
+  flagged on its third lifted hop, so the entry just before the flag is
+  already lifted. The flag is captured on each decoder input entry when it
+  is observed, so it survives the MAN-194 refiner delay.
+- Floor rings keep taking their pushes during a crash. Freezing them would
+  leave a sustained band-wide rise (a gain step) unable to release.
+- Synthetic dense scenes start synchronized (every signal keys its first
+  element at t = 0), which a band-wide statistic reads as a crash. Render a
+  lead-in and drop it, as `manta-testkit::crash::dense_scene` does, before
+  testing one.
+- VC3's bogus count depends on the crash draw (five train seeds gave 0, 1,
+  4, 1 and 1 under `full`). After touching any crash constant, re-run the
+  five-seed sweep, not only the pinned `0x3333`.
+- Two worktrees that share one `CARGO_TARGET_DIR` can silently reuse each
+  other's path-dependency rlibs; use separate target directories when
+  comparing branches (for example `cpu_budget`). See the MAN-312
+  [decision record](../../docs/DECISIONS/2026-10-13-man312-static-crash-filter.md).

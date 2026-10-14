@@ -10,8 +10,14 @@ pub use audio::{AudioIqSource, AUDIO_PASSBAND_HI_HZ, AUDIO_PASSBAND_LO_HZ, TARGE
 pub mod kiwi;
 pub use kiwi::KiwiIqSource;
 
+pub mod ka9q;
+pub use ka9q::{Ka9qConfig, Ka9qIqSource};
+
 pub mod decimate;
 pub use decimate::DecimatingSource;
+
+pub mod replay;
+pub use replay::{LoopingSource, PacedSource, Reopen};
 
 #[cfg(feature = "soapy")]
 pub mod soapy;
@@ -25,7 +31,7 @@ pub use hpsdr::{HpsdrConfig, HpsdrDevice, HpsdrIqSource};
 
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Packet-level health counters for an input source that can lose or
 /// discard whole packets on the wire (MAN-56, following MAN-22's
@@ -185,6 +191,38 @@ pub struct Sidecar {
     pub center_freq_hz: f64,
 }
 
+/// Where `wav`'s sidecar lives: `<stem>.json` next to it. ARCHITECTURE §3.
+pub fn sidecar_path(wav: &Path) -> PathBuf {
+    wav.with_extension("json")
+}
+
+/// The `<stem>.json` sidecar of `wav`, if one exists (ARCHITECTURE §3).
+/// `None` when there is no such file; malformed JSON is an error naming it.
+pub fn read_sidecar(wav: &Path) -> Result<Option<Sidecar>> {
+    let sidecar_path = sidecar_path(wav);
+    if !sidecar_path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&sidecar_path)
+        .with_context(|| format!("read sidecar {}", sidecar_path.display()))?;
+    let sc: Sidecar = serde_json::from_str(&text)
+        .with_context(|| format!("parse sidecar {}", sidecar_path.display()))?;
+    Ok(Some(sc))
+}
+
+/// The highest sample rate an IQ WAV may declare, in Hz (MAN-269).
+///
+/// `WavIqSource::open` checks only the size here, not the shape: whether
+/// `fs / 93.75` is a power of two stays `Channelizer::new`'s job, with its
+/// own error message. The size check exists because a shape-valid but absurd
+/// rate (393 216 000 Hz = 93.75 * 2^22, in a 76-byte header) passes the
+/// channelizer and then asks `FloorBank::new` for 3.36 GB, before the
+/// calibration buffer is even sized. 10 MS/s matches `manta-cli`'s
+/// `MAX_HPSDR_RATE_HZ`; at the largest table rate it admits (6.144 MS/s) a
+/// replay peaked at 163 MiB RSS. See
+/// docs/DECISIONS/2026-10-10-man269-paced-looping-replay.md.
+pub const MAX_IQ_WAV_RATE_HZ: f64 = 10_000_000.0;
+
 /// Stereo WAV file (ch0=I, ch1=Q) as an IqSource, with an optional `<stem>.json` sidecar for center frequency. ARCHITECTURE §3.
 pub struct WavIqSource {
     samples: Vec<Complex32>,
@@ -195,12 +233,34 @@ pub struct WavIqSource {
 
 impl WavIqSource {
     /// Eager-loads the whole file (M0 pinned decision 15; files are <~100 MB). ARCHITECTURE §3.
+    /// The centre frequency comes from the `<stem>.json` sidecar, `0.0` without one.
     pub fn open(path: &Path) -> Result<Self> {
+        let mut src = Self::open_with_center_freq_hz(path, 0.0)?;
+        src.center_freq_hz = read_sidecar(path)?.map_or(0.0, |sc| sc.center_freq_hz);
+        Ok(src)
+    }
+
+    /// `open` with a caller-supplied centre frequency; the sidecar is not
+    /// read at all, so a malformed or foreign `<stem>.json` cannot fail it
+    /// (MAN-131, `decode --center-freq-hz`).
+    pub fn open_with_center_freq_hz(path: &Path, center_freq_hz: f64) -> Result<Self> {
         let mut reader =
             hound::WavReader::open(path).with_context(|| format!("open WAV {}", path.display()))?;
         let spec = reader.spec();
         if spec.channels != 2 {
             bail!("IQ WAV must have 2 channels (I, Q); got {}", spec.channels);
+        }
+        // Before any sample is read: every rate-sized allocation downstream
+        // trusts this number (MAN-269, MAX_IQ_WAV_RATE_HZ).
+        let fs = f64::from(spec.sample_rate);
+        if fs <= 0.0 || fs > MAX_IQ_WAV_RATE_HZ {
+            bail!(
+                "IQ WAV {} declares a sample rate of {} Hz; IQ replay needs a rate above 0 \
+                 and at most {} Hz",
+                path.display(),
+                spec.sample_rate,
+                MAX_IQ_WAV_RATE_HZ as u64
+            );
         }
         let interleaved: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
             (hound::SampleFormat::Float, 32) => {
@@ -210,7 +270,7 @@ impl WavIqSource {
                 .samples::<i16>()
                 .map(|s| s.map(|v| v as f32 / 32768.0))
                 .collect::<Result<_, _>>()?,
-            (f, b) => bail!("unsupported WAV format {f:?}/{b}-bit (need Float32 or Int16)"),
+            (f, b) => return Err(unsupported_wav(f, b)),
         };
         let samples = interleaved
             .as_chunks::<2>()
@@ -219,21 +279,10 @@ impl WavIqSource {
             .map(|&[re, im]| Complex32::new(re, im))
             .collect();
 
-        let sidecar_path = path.with_extension("json");
-        let center_freq_hz = if sidecar_path.exists() {
-            let text = std::fs::read_to_string(&sidecar_path)
-                .with_context(|| format!("read sidecar {}", sidecar_path.display()))?;
-            let sc: Sidecar = serde_json::from_str(&text)
-                .with_context(|| format!("parse sidecar {}", sidecar_path.display()))?;
-            sc.center_freq_hz
-        } else {
-            0.0
-        };
-
         Ok(WavIqSource {
             samples,
             cursor: 0,
-            fs: spec.sample_rate as f64,
+            fs,
             center_freq_hz,
         })
     }
@@ -269,8 +318,29 @@ pub fn read_all(src: &mut dyn IqSource) -> Result<Vec<Complex32>> {
     }
 }
 
+fn unsupported_wav(format: hound::SampleFormat, bits: u16) -> anyhow::Error {
+    let name = match format {
+        hound::SampleFormat::Float => "Float",
+        hound::SampleFormat::Int => "Int",
+    };
+    anyhow::anyhow!("unsupported WAV format {name}/{bits}-bit (need Float32 or Int16)")
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn unsupported_wav_text_names_sample_formats() {
+        assert_eq!(
+            unsupported_wav(hound::SampleFormat::Float, 64).to_string(),
+            "unsupported WAV format Float/64-bit (need Float32 or Int16)"
+        );
+        assert_eq!(
+            unsupported_wav(hound::SampleFormat::Int, 24).to_string(),
+            "unsupported WAV format Int/24-bit (need Float32 or Int16)"
+        );
+    }
+
     use super::*;
     use num_complex::Complex32;
     use std::io::Write;
@@ -321,6 +391,53 @@ mod tests {
     }
 
     #[test]
+    fn read_sidecar_is_none_without_a_json_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("fix.wav");
+        write_f32_wav(&wav, &samples(), 96_000);
+        assert!(read_sidecar(&wav).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_sidecar_returns_the_center_frequency() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("fix.wav");
+        std::fs::write(
+            dir.path().join("fix.json"),
+            br#"{"center_freq_hz": 7030000.0}"#,
+        )
+        .unwrap();
+        assert_eq!(sidecar_path(&wav), dir.path().join("fix.json"));
+        let sc = read_sidecar(&wav).unwrap().expect("sidecar present");
+        assert_eq!(sc.center_freq_hz, 7_030_000.0);
+    }
+
+    #[test]
+    fn read_sidecar_rejects_malformed_json_naming_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("fix.wav");
+        write_f32_wav(&wav, &samples(), 96_000);
+        let json = dir.path().join("fix.json");
+        std::fs::write(&json, b"{not json").unwrap();
+        let err = format!("{:#}", read_sidecar(&wav).unwrap_err());
+        let want = format!("parse sidecar {}", json.display());
+        assert!(err.contains(&want), "{err}");
+        // `WavIqSource::open` reports the same text.
+        let open_err = format!("{:#}", WavIqSource::open(&wav).err().expect("bad sidecar"));
+        assert!(open_err.contains(&want), "{open_err}");
+    }
+
+    #[test]
+    fn open_with_center_freq_hz_never_reads_the_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("fix.wav");
+        write_f32_wav(&wav, &samples(), 96_000);
+        std::fs::write(dir.path().join("fix.json"), b"{not json").unwrap();
+        let src = WavIqSource::open_with_center_freq_hz(&wav, 7_030_000.0).unwrap();
+        assert_eq!(src.center_freq_hz(), 7_030_000.0);
+    }
+
+    #[test]
     fn reads_i16_wav_normalized() {
         let dir = tempfile::tempdir().unwrap();
         let wav = dir.path().join("fix16.wav");
@@ -355,6 +472,75 @@ mod tests {
         w.write_sample(0.0f32).unwrap();
         w.finalize().unwrap();
         assert!(WavIqSource::open(&wav).is_err());
+    }
+
+    /// A float32 stereo WAV header declaring `rate` and `frames` frames of
+    /// silence, written byte by byte so the test never depends on
+    /// `hound::WavWriter` accepting an absurd rate.
+    fn header_only_iq_wav(path: &std::path::Path, rate: u32, frames: u32) {
+        let data_len = frames * 8;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data_len).to_le_bytes());
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
+        b.extend_from_slice(&2u16.to_le_bytes()); // I, Q
+        b.extend_from_slice(&rate.to_le_bytes());
+        b.extend_from_slice(&rate.wrapping_mul(8).to_le_bytes()); // byte rate
+        b.extend_from_slice(&8u16.to_le_bytes()); // block align
+        b.extend_from_slice(&32u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data_len.to_le_bytes());
+        b.resize(b.len() + data_len as usize, 0);
+        std::fs::write(path, b).unwrap();
+    }
+
+    fn open_at(rate: u32) -> Result<WavIqSource> {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("rate.wav");
+        header_only_iq_wav(&wav, rate, 4);
+        WavIqSource::open(&wav)
+    }
+
+    // MAN-269: the two PR #135 findings -- validate/cap the replay rate
+    // before anything is allocated from it.
+
+    #[test]
+    fn iq_wav_declaring_a_rate_above_the_replay_ceiling_is_rejected() {
+        // 393_216_000 = 93.75 * 2^22: shape-valid for the channelizer, so only
+        // a magnitude bound stops it (measured: FloorBank::new asked for
+        // 3.36 GB).
+        let err = open_at(393_216_000).err().unwrap().to_string();
+        assert!(err.contains("393216000 Hz"), "{err}");
+        assert!(
+            err.contains("IQ replay needs a rate above 0 and at most 10000000 Hz"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn iq_wav_rate_ceiling_is_inclusive() {
+        let src = open_at(10_000_000).unwrap();
+        assert_eq!(src.sample_rate(), 10_000_000.0);
+        let err = open_at(10_000_001).err().unwrap().to_string();
+        assert!(err.contains("10000001 Hz"), "{err}");
+    }
+
+    #[test]
+    fn iq_wav_at_the_largest_admitted_table_rate_opens() {
+        // 6_144_000 = 93.75 * 2^16, the largest channelizer table rate under
+        // the ceiling.
+        let mut src = open_at(6_144_000).unwrap();
+        assert_eq!(src.sample_rate(), 6_144_000.0);
+        assert_eq!(read_all(&mut src).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn iq_wav_declaring_zero_hz_is_rejected() {
+        let err = open_at(0).err().unwrap().to_string();
+        assert!(err.contains("a sample rate of 0 Hz"), "{err}");
     }
 
     // MAN-56: input-layer health counters.

@@ -5,6 +5,7 @@
 
 use crate::config::{Loaded, SourceFromFile};
 use anyhow::{bail, Context, Result};
+use manta_server::config::ServerConfig;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -16,7 +17,7 @@ pub(crate) const DEFAULT_PATH: &str = "manta.toml";
 pub(crate) const SCAFFOLD: &str = include_str!("config_init.toml");
 
 /// The callsign the scaffold shows where a real one belongs (D10).
-const EXAMPLE_CALLSIGN: &str = "N0CALL";
+pub(crate) const EXAMPLE_CALLSIGN: &str = "N0CALL";
 
 /// Where `check` found the file it checked (D2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +46,7 @@ pub(crate) fn check(config_flag: Option<PathBuf>) -> Result<()> {
     // Never `spec.open()`, never `is_rf_aware()` (it opens IQ WAVs), never
     // `start_spot_server`.
     let prepared = crate::prepare_live(crate::CliOverrides::none(), path.clone(), None)?;
+    crate::refuse_rbn_compare_replay(&prepared.resolved, false)?;
     reject_placeholders(&prepared.loaded)?;
     reject_duplicate_ports(&prepared.loaded)?;
 
@@ -105,7 +107,13 @@ pub(crate) fn init(out: &Path, force: bool) -> Result<()> {
 /// misconfiguration -- a `<...>` placeholder string anywhere, or the
 /// example callsign as the station or uplink login.
 fn reject_placeholders(loaded: &Loaded) -> Result<()> {
-    if let Some((key, value)) = find_placeholder(&loaded.raw, "") {
+    reject_placeholders_in(loaded, &loaded.raw)
+}
+
+/// `reject_placeholders`, scanning `raw` (`loaded.raw` or part of it) for
+/// `<...>` strings.
+fn reject_placeholders_in(loaded: &Loaded, raw: &toml::Table) -> Result<()> {
+    if let Some((key, value)) = find_placeholder(raw, "") {
         // Never echo a secret, even one shaped like a placeholder (D5).
         if key.ends_with("password") {
             bail!(
@@ -114,11 +122,29 @@ fn reject_placeholders(loaded: &Loaded) -> Result<()> {
             );
         }
         bail!(
-            "{}: {key} is still a placeholder ({value:?}) -- replace it",
-            loaded.origin
+            "{}: {key} is still a placeholder ({}) -- replace it",
+            loaded.origin,
+            crate::fmt::quoted(&value)
         );
     }
     reject_example_callsigns(loaded)
+}
+
+/// MAN-78: the checks `check` runs beyond `run`'s config stage
+/// (placeholders, example callsigns, duplicate ports), for a SIGHUP
+/// reload: a document they reject applies nothing. With `cli_source` (the
+/// daemon's command line names the source) `[input]` is not scanned for
+/// placeholders: that flag replaced it, so `run` never reads it (MAN-268
+/// D3).
+pub(crate) fn reject_on_reload(loaded: &Loaded, cli_source: bool) -> Result<()> {
+    if cli_source {
+        let mut raw = loaded.raw.clone();
+        raw.remove("input");
+        reject_placeholders_in(loaded, &raw)?;
+    } else {
+        reject_placeholders(loaded)?;
+    }
+    reject_duplicate_ports(loaded)
 }
 
 /// MAN-268: the callsign half of `reject_placeholders`, which `run` (and
@@ -130,24 +156,42 @@ fn reject_placeholders(loaded: &Loaded) -> Result<()> {
 /// source flag replaces `[input]` and its unused placeholders. See
 /// docs/DECISIONS/2026-10-10-man268-unattended-packaging.md.
 pub(crate) fn reject_example_callsigns(loaded: &Loaded) -> Result<()> {
+    match example_callsign_key(loaded) {
+        Some(key) => Err(example_callsign(loaded, key)),
+        None => Ok(()),
+    }
+}
+
+/// The first identity key still holding the example callsign, as `run`
+/// checks them. Shared with `manta doctor`'s `config` check (MAN-126), so
+/// the two cannot drift.
+pub(crate) fn example_callsign_key(loaded: &Loaded) -> Option<&'static str> {
     if let Some(server) = &loaded.server {
         if server
             .station_callsign
             .eq_ignore_ascii_case(EXAMPLE_CALLSIGN)
         {
-            return Err(example_callsign(loaded, "server.station_callsign"));
+            return Some("server.station_callsign");
         }
     }
-    for uplink in &loaded.rbn_uplink {
-        if uplink
-            .login_callsign
-            .as_deref()
-            .is_some_and(|c| c.eq_ignore_ascii_case(EXAMPLE_CALLSIGN))
-        {
-            return Err(example_callsign(loaded, "rbn_uplink.login_callsign"));
-        }
-    }
-    Ok(())
+    loaded
+        .rbn_uplink
+        .iter()
+        .any(|uplink| {
+            uplink
+                .login_callsign
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case(EXAMPLE_CALLSIGN))
+        })
+        .then_some("rbn_uplink.login_callsign")
+        .or_else(|| {
+            loaded
+                .rbn_compare
+                .as_ref()
+                .and_then(|rc| rc.login_callsign.as_deref())
+                .is_some_and(|c| c.eq_ignore_ascii_case(EXAMPLE_CALLSIGN))
+                .then_some("rbn_compare.login_callsign")
+        })
 }
 
 /// D10: `key` still holds the scaffold's example callsign.
@@ -189,48 +233,97 @@ fn reject_duplicate_ports(loaded: &Loaded) -> Result<()> {
     let Some(server) = &loaded.server else {
         return Ok(());
     };
-    let listeners = [
-        (
-            "telnet_port",
-            "bind_addr",
-            server.bind_addr.as_str(),
-            server.telnet_port,
-        ),
-        (
-            "json_port",
-            "bind_addr",
-            server.bind_addr.as_str(),
-            server.json_port,
-        ),
-        (
-            "metrics_port",
-            "metrics_bind_addr",
-            server.metrics_bind_addr.as_str(),
-            server.metrics_port,
-        ),
-    ];
-    for (i, (key, addr_key, addr, port)) in listeners.iter().enumerate() {
-        if *port == 0 {
-            continue;
-        }
-        let Some((first, first_addr_key, first_addr, _)) = listeners[..i]
-            .iter()
-            .find(|(_, _, a, p)| p == port && may_overlap(a, addr))
-        else {
+    let listeners = server_listeners(server);
+    for (i, l) in listeners.iter().enumerate() {
+        let Some(first) = duplicate_of(&listeners, i) else {
             continue;
         };
-        let overlap = if addr == first_addr {
+        let overlap = if l.addr == first.addr {
             String::new()
         } else {
-            format!(", and {addr_key} \"{addr}\" overlaps {first_addr_key} \"{first_addr}\"")
+            format!(
+                ", and {} \"{}\" overlaps {} \"{}\"",
+                l.addr_key, l.addr, first.addr_key, first.addr
+            )
         };
         bail!(
-            "{}: [server]: {key} {port} is the same as {first}{overlap}; each server needs its \
-             own port",
-            loaded.origin
+            "{}: [server]: {} {} is the same as {}{overlap}; each server needs its own port",
+            loaded.origin,
+            l.port_key,
+            l.port,
+            first.port_key
         );
     }
     Ok(())
+}
+
+/// One `[server]` listener: what `run` binds, and the keys that set it.
+/// MAN-132: telnet and JSON share `bind_addr`, metrics has its own
+/// `metrics_bind_addr`.
+pub(crate) struct Listener {
+    /// `telnet`, `json` or `metrics`.
+    pub name: &'static str,
+    pub port_key: &'static str,
+    pub addr_key: &'static str,
+    pub addr: String,
+    pub port: u16,
+}
+
+/// `[server]`'s listeners, in the order `run` binds them: telnet, JSON,
+/// metrics, then (MAN-324) the live-state listener when `live_port` is set.
+pub(crate) fn server_listeners(server: &ServerConfig) -> Vec<Listener> {
+    let listener = |name, port_key, addr_key, addr: &str, port| Listener {
+        name,
+        port_key,
+        addr_key,
+        addr: addr.to_string(),
+        port,
+    };
+    let mut listeners = vec![
+        listener(
+            "telnet",
+            "telnet_port",
+            "bind_addr",
+            &server.bind_addr,
+            server.telnet_port,
+        ),
+        listener(
+            "json",
+            "json_port",
+            "bind_addr",
+            &server.bind_addr,
+            server.json_port,
+        ),
+        listener(
+            "metrics",
+            "metrics_port",
+            "metrics_bind_addr",
+            &server.metrics_bind_addr,
+            server.metrics_port,
+        ),
+    ];
+    if let Some(live_port) = server.live_port {
+        listeners.push(listener(
+            "live",
+            "live_port",
+            "live_bind_addr",
+            &server.live_bind_addr,
+            live_port,
+        ));
+    }
+    listeners
+}
+
+/// D3: the earlier listener that `listeners[i]` can never bind beside --
+/// one non-zero port on overlapping addresses.
+pub(crate) fn duplicate_of(listeners: &[Listener], i: usize) -> Option<&Listener> {
+    let l = &listeners[i];
+    if l.port == 0 {
+        return None;
+    }
+    listeners[..i]
+        .iter()
+        .find(|first| first.port == l.port && may_overlap(&first.addr, &l.addr))
 }
 
 /// Whether two listeners on one port could fail to both bind. Only two
@@ -279,6 +372,32 @@ fn set_keys(loaded: &Loaded, table: &str, skip: &[&str]) -> Vec<String> {
 
 /// D6: one line per table, `key=value` tokens named as the config keys.
 /// Never prints a secret; deterministic (no timestamps, no bound ports).
+/// MAN-301: `config check`'s `[rbn_compare]` line. `f64`'s Display prints
+/// a whole tolerance without a fraction (`500`, not `500.0`).
+fn rbn_compare_summary(rc: &manta_server::config::RbnCompareConfig, station: &str) -> String {
+    let list = |calls: &[String], empty: &str| {
+        if calls.is_empty() {
+            empty.to_string()
+        } else {
+            calls.join(",")
+        }
+    };
+    format!(
+        "rbn_compare: enabled={} feed={}:{} login_callsign={} window_secs={} freq_tol_hz={} \
+         speed_tol={} WPM/{}% spotters={} exclude_spotters={}",
+        rc.enabled,
+        rc.feed_host,
+        rc.feed_port,
+        rc.effective_login_callsign(station),
+        rc.window_secs,
+        rc.freq_tol_hz,
+        rc.speed_tol_wpm,
+        rc.speed_tol_pct,
+        list(&rc.spotters, "all"),
+        list(&rc.exclude_spotters, "none"),
+    )
+}
+
 fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
     let mut lines = vec![origin_line.to_string()];
     lines.push(if loaded.env_vars.is_empty() {
@@ -301,8 +420,17 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
                 s.metrics_port,
                 line_format_name(s.line_format)
             );
+            // MAN-324: only when the live-state listener is on, so a
+            // config without `live_port` prints the same line as before.
+            if let Some(live_port) = s.live_port {
+                l.push_str(&format!(
+                    " live_port={live_port} live_bind_addr={}",
+                    s.live_bind_addr
+                ));
+            }
             let optional = [
                 ("status_interval_secs", s.status_interval_secs),
+                ("history_minutes", s.history_minutes.map(u64::from)),
                 (
                     "telnet_max_connections_per_ip",
                     s.telnet_max_connections_per_ip.map(|v| v as u64),
@@ -337,13 +465,21 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             // QTH with spaces stays one token; the grid is validated as a
             // bare locator.
             if let Some(v) = &s.operator_name {
-                l.push_str(&format!(" operator_name={v:?}"));
+                l.push_str(&format!(" operator_name={}", crate::fmt::quoted(v)));
             }
             if let Some(v) = &s.operator_qth {
-                l.push_str(&format!(" operator_qth={v:?}"));
+                l.push_str(&format!(" operator_qth={}", crate::fmt::quoted(v)));
             }
             if let Some(v) = &s.operator_grid {
                 l.push_str(&format!(" operator_grid={v}"));
+            }
+            // MAN-138: the station position. `f64`'s Display prints the
+            // value as written (`43.9375`, `-72` as `-72`).
+            if let Some(v) = s.operator_lat {
+                l.push_str(&format!(" operator_lat={v}"));
+            }
+            if let Some(v) = s.operator_lon {
+                l.push_str(&format!(" operator_lon={v}"));
             }
             l
         }
@@ -370,16 +506,34 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
         ));
     }
 
+    lines.push(match &loaded.rbn_compare {
+        None => "rbn_compare: none".to_string(),
+        Some(rc) => rbn_compare_summary(rc, station),
+    });
+
     let mut input = match &loaded.input.source {
         None => "input: type=unset (the default sound card, unless a command-line flag picks \
                  the source)"
             .to_string(),
         Some(SourceFromFile::Audio { device }) => match device {
-            Some(d) => format!("input: type=audio device={d:?}"),
+            Some(d) => format!("input: type=audio device={}", crate::fmt::quoted(d)),
             None => "input: type=audio device=default".to_string(),
         },
-        Some(SourceFromFile::File { path, iq }) => {
-            format!("input: type=file path={} iq={iq}", path.display())
+        Some(SourceFromFile::File {
+            path,
+            iq,
+            realtime,
+            looped,
+        }) => {
+            // MAN-269: shown only when set, so existing summaries are unchanged.
+            let mut line = format!("input: type=file path={} iq={iq}", path.display());
+            if *realtime {
+                line.push_str(" realtime=true");
+            }
+            if *looped {
+                line.push_str(" loop=true");
+            }
+            line
         }
         Some(SourceFromFile::Kiwi {
             host,
@@ -396,7 +550,8 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             rate_hz,
             gain_db,
         }) => format!(
-            "input: type=soapy driver={driver:?} freq_hz={freq_hz} rate_hz={rate_hz} gain_db={}",
+            "input: type=soapy driver={} freq_hz={freq_hz} rate_hz={rate_hz} gain_db={}",
+            crate::fmt::quoted(driver),
             gain_db.map_or("auto".to_string(), |g| g.to_string())
         ),
         Some(SourceFromFile::Hpsdr {
@@ -407,6 +562,16 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
         }) => {
             format!("input: type=hpsdr host={host} port={port} freq_hz={freq_hz} rate_hz={rate_hz}")
         }
+        Some(SourceFromFile::Ka9q {
+            group,
+            port,
+            ssrc,
+            interface,
+        }) => format!(
+            "input: type=ka9q group={group} port={port} ssrc={} interface={}",
+            ssrc.map_or("any".to_string(), |s| s.to_string()),
+            interface.map_or("default".to_string(), |i| i.to_string())
+        ),
     };
     let shared = &loaded.input.shared;
     for (key, value) in [
@@ -435,7 +600,7 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             .map_or("none".to_string(), |p| p.display().to_string())
     };
     lines.push(format!(
-        "spot: allowlist={} blocklist_path={} notch_path={} cty_path={} scp_path={}",
+        "spot: allowlist={} blocklist_path={} notch_path={} cty_path={} scp_path={} validation_level={} pattern_path={}",
         if loaded.spot.allowlist.is_empty() {
             "none".to_string()
         } else {
@@ -452,7 +617,9 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             .spot
             .scp_path
             .as_ref()
-            .map_or("bundled".to_string(), |p| p.display().to_string())
+            .map_or("bundled".to_string(), |p| p.display().to_string()),
+        loaded.spot.validation_level.as_str(),
+        loaded.spot.pattern_path.as_ref().map_or("bundled".to_string(), |p| p.display().to_string())
     ));
 
     let detector = set_keys(loaded, "detector", &[]);
@@ -469,7 +636,7 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
 
 /// D3/D4: stderr notes that never change the exit code. I/O-free: the dial
 /// note matches the source kind rather than calling `is_rf_aware()`, which
-/// opens IQ WAVs.
+/// opens IQ WAVs. MAN-90: an enabled uplink is experimental.
 fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> Vec<String> {
     let mut notes = Vec::new();
     match source {
@@ -499,6 +666,15 @@ fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> V
                 .to_string(),
         );
     }
+    // MAN-138. `load` already rejected an `Err` (an inconsistent location),
+    // so only a config with no location key at all gets the note.
+    if matches!(server.station_location(), Ok(None)) {
+        notes.push(
+            "note: JSON spots will carry no station position (deGrid, deLat and deLon are \
+             null) -- set [server].operator_grid, or operator_lat and operator_lon"
+                .to_string(),
+        );
+    }
     bind_notes(&mut notes, "bind_addr", &server.bind_addr, |addr| {
         format!(
             "note: the telnet and JSON servers listen on every network interface (bind_addr = \
@@ -518,6 +694,32 @@ fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> V
             )
         },
     );
+    // MAN-324: the live-state stream carries every track's decoded text.
+    if server.live_port.is_some() {
+        bind_notes(
+            &mut notes,
+            "live_bind_addr",
+            &server.live_bind_addr,
+            |addr| {
+                format!(
+                    "note: the live-state stream listens on every network interface \
+                 (live_bind_addr = \"{addr}\") and has no password; it carries every track's \
+                 decoded text -- firewall live_port to the dashboards that read it, or set \
+                 live_bind_addr = \"127.0.0.1\""
+                )
+            },
+        );
+    }
+    // MAN-90: before going live, operators run `config check` (the node guide
+    // sends them here); say the uplink is experimental and what to use instead.
+    if loaded.rbn_uplink.iter().any(|u| u.enabled) {
+        notes.push(
+            "note: [[rbn_uplink]] is experimental -- its login and spot format are unverified \
+             against RBN's real ingest; to reach RBN today, let an RBN Aggregator read this \
+             node's telnet server (docs/RUNBOOKS/secondary-skimmer-field-node.md)"
+                .to_string(),
+        );
+    }
     notes
 }
 
@@ -572,6 +774,84 @@ mod tests {
     // ---- Phase 2: the summary and notes
 
     #[test]
+    fn server_listeners_includes_live_only_when_live_port_is_set() {
+        let without = load_text("[server]\nstation_callsign = \"W1AW\"\n").unwrap();
+        let names: Vec<&str> = server_listeners(without.server.as_ref().unwrap())
+            .iter()
+            .map(|l| l.name)
+            .collect();
+        assert_eq!(names, ["telnet", "json", "metrics"]);
+        let with = load_text("[server]\nstation_callsign = \"W1AW\"\nlive_port = 7303\n").unwrap();
+        let listeners = server_listeners(with.server.as_ref().unwrap());
+        let live = listeners.last().unwrap();
+        assert_eq!(
+            (
+                live.name,
+                live.port_key,
+                live.addr_key,
+                live.addr.as_str(),
+                live.port
+            ),
+            ("live", "live_port", "live_bind_addr", "127.0.0.1", 7303)
+        );
+    }
+
+    #[test]
+    fn a_live_port_equal_to_json_port_is_refused() {
+        let err = load_text(
+            "[server]\nstation_callsign = \"W1AW\"\nlive_port = 7301\nlive_bind_addr = \"0.0.0.0\"\n",
+        )
+        .and_then(|loaded| reject_duplicate_ports(&loaded))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("live_port 7301 is the same as json_port"),
+            "{err}"
+        );
+        // A loopback live listener beside a specific-address JSON listener
+        // on another IP binds fine.
+        let ok = load_text(
+            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"192.0.2.1\"\nlive_port = 7301\n",
+        )
+        .unwrap();
+        assert!(reject_duplicate_ports(&ok).is_ok());
+    }
+
+    #[test]
+    fn summary_names_live_port_and_bind_addr_only_when_set() {
+        let without = lines_of("[server]\nstation_callsign = \"W1AW\"\n");
+        let server = without.iter().find(|l| l.starts_with("server:")).unwrap();
+        assert!(!server.contains("live_"), "{server}");
+        let with = lines_of(
+            "[server]\nstation_callsign = \"W1AW\"\nlive_port = 7303\nlive_bind_addr = \"0.0.0.0\"\n",
+        );
+        let server = with.iter().find(|l| l.starts_with("server:")).unwrap();
+        assert!(
+            server.ends_with("line_format=rbn live_port=7303 live_bind_addr=0.0.0.0"),
+            "{server}"
+        );
+    }
+
+    #[test]
+    fn note_live_bind_addr_on_every_interface() {
+        let note = "note: the live-state stream listens on every network interface \
+                    (live_bind_addr = \"0.0.0.0\") and has no password; it carries every \
+                    track's decoded text -- firewall live_port to the dashboards that read it, \
+                    or set live_bind_addr = \"127.0.0.1\"";
+        let wide = notes_of(
+            "[server]\nstation_callsign = \"W1AW\"\nlive_port = 7303\nlive_bind_addr = \"0.0.0.0\"\n",
+        );
+        assert!(wide.iter().any(|l| l == note), "{wide:#?}");
+        let local = notes_of("[server]\nstation_callsign = \"W1AW\"\nlive_port = 7303\n");
+        assert!(
+            !local.iter().any(|l| l.contains("live-state")),
+            "{local:#?}"
+        );
+        let off = notes_of("[server]\nstation_callsign = \"W1AW\"\nlive_bind_addr = \"0.0.0.0\"\n");
+        assert!(!off.iter().any(|l| l.contains("live-state")), "{off:#?}");
+    }
+
+    #[test]
     fn summary_server_line_shows_configured_ports_and_defaults() {
         let lines = lines_of("[server]\nstation_callsign = \"w1aw\"\n");
         assert_eq!(
@@ -611,6 +891,16 @@ mod tests {
             ),
             "{server}"
         );
+        // MAN-138: the position keys follow the grid, printed as written.
+        let lines = lines_of(
+            "[server]\nstation_callsign = \"HB9H\"\noperator_grid = \"FN03gw\"\n\
+             operator_lat = 43.9375\noperator_lon = -79.4583\n",
+        );
+        let server = line(&lines, "server:");
+        assert!(
+            server.ends_with(" operator_grid=FN03gw operator_lat=43.9375 operator_lon=-79.4583"),
+            "{server}"
+        );
     }
 
     #[test]
@@ -621,6 +911,31 @@ mod tests {
             "server: none (manta run starts no servers)"
         );
         assert_eq!(line(&lines, "rbn_uplink:"), "rbn_uplink: none");
+    }
+
+    #[test]
+    fn config_check_prints_rbn_compare_summary() {
+        let lines =
+            lines_of("[server]\nstation_callsign = \"W3XYZ-1\"\n[rbn_compare]\nenabled = true\n");
+        assert_eq!(
+            line(&lines, "rbn_compare:"),
+            "rbn_compare: enabled=true feed=telnet.reversebeacon.net:7000 \
+             login_callsign=W3XYZ-1 window_secs=180 freq_tol_hz=500 speed_tol=3 WPM/20% \
+             spotters=all exclude_spotters=none"
+        );
+        let lines = lines_of(
+            "[server]\nstation_callsign = \"W3XYZ-1\"\n[rbn_compare]\nenabled = true\n\
+             feed_port = 7001\nlogin_callsign = \"k1abc\"\nfreq_tol_hz = 250.5\n\
+             spotters = [\"K5TR\", \"n0xyz\"]\nexclude_spotters = [\"W1AW\"]\n",
+        );
+        assert_eq!(
+            line(&lines, "rbn_compare:"),
+            "rbn_compare: enabled=true feed=telnet.reversebeacon.net:7001 \
+             login_callsign=K1ABC window_secs=180 freq_tol_hz=250.5 speed_tol=3 WPM/20% \
+             spotters=K5TR,N0XYZ exclude_spotters=W1AW"
+        );
+        let lines = lines_of("[decode]\nengine = \"legacy\"\n");
+        assert_eq!(line(&lines, "rbn_compare:"), "rbn_compare: none");
     }
 
     #[test]
@@ -677,6 +992,19 @@ mod tests {
                 dir.path().join("rec.wav").display()
             )
         );
+        std::fs::write(
+            &path,
+            "[input]\ntype = \"file\"\npath = \"rec.wav\"\niq = true\nrealtime = true\nloop = true\n",
+        )
+        .unwrap();
+        let l = config::load(Some(&path), Env::Ignore).unwrap();
+        assert_eq!(
+            line(&summary("x", &l), "input:"),
+            format!(
+                "input: type=file path={} iq=true realtime=true loop=true",
+                dir.path().join("rec.wav").display()
+            )
+        );
 
         let lines =
             lines_of("[input]\ntype = \"kiwi\"\nhost = \"rx.example.org\"\nfreq_hz = 7030000.0\n");
@@ -706,6 +1034,25 @@ mod tests {
         );
     }
 
+    /// MAN-140: both forms of the ka9q line (Design §2): the defaults, and
+    /// an explicit ssrc and interface.
+    #[test]
+    fn summary_line_for_a_ka9q_input() {
+        let lines = lines_of("[input]\ntype = \"ka9q\"\ngroup = \"239.101.6.1\"\n");
+        assert_eq!(
+            line(&lines, "input:"),
+            "input: type=ka9q group=239.101.6.1 port=5004 ssrc=any interface=default"
+        );
+        let lines = lines_of(
+            "[input]\ntype = \"ka9q\"\ngroup = \"239.101.6.1\"\nssrc = 14100000\n\
+             interface = \"192.168.1.20\"\n",
+        );
+        assert_eq!(
+            line(&lines, "input:"),
+            "input: type=ka9q group=239.101.6.1 port=5004 ssrc=14100000 interface=192.168.1.20"
+        );
+    }
+
     #[test]
     fn summary_never_prints_the_kiwi_password() {
         let lines = lines_of(
@@ -725,7 +1072,7 @@ mod tests {
         let lines = lines_of("");
         assert_eq!(
             line(&lines, "spot:"),
-            "spot: allowlist=none blocklist_path=none notch_path=none cty_path=bundled scp_path=bundled"
+            "spot: allowlist=none blocklist_path=none notch_path=none cty_path=bundled scp_path=bundled validation_level=normal pattern_path=bundled"
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manta.toml");
@@ -736,7 +1083,7 @@ mod tests {
             &path,
             format!(
                 "[spot]\nallowlist = [\"W1AW\", \"K1ABC\"]\nblocklist_path = \"bad.txt\"\n\
-                 notch_path = '{}'\ncty_path = 'cty.dat'\nscp_path = 'MASTER.SCP'\n",
+                 notch_path = '{}'\ncty_path = 'cty.dat'\nscp_path = 'MASTER.SCP'\npattern_path = 'patterns.lst'\n",
                 notch.display()
             ),
         )
@@ -745,11 +1092,13 @@ mod tests {
         assert_eq!(
             line(&summary("x", &l), "spot:"),
             format!(
-                "spot: allowlist=W1AW,K1ABC blocklist_path={} notch_path={} cty_path={} scp_path={}",
+                "spot: allowlist=W1AW,K1ABC blocklist_path={} notch_path={} cty_path={} scp_path={} validation_level={} pattern_path={}",
                 dir.path().join("bad.txt").display(),
                 notch.display(),
                 dir.path().join("cty.dat").display(),
-                dir.path().join("MASTER.SCP").display()
+                dir.path().join("MASTER.SCP").display(),
+                "normal",
+                dir.path().join("patterns.lst").display()
             )
         );
     }
@@ -809,6 +1158,87 @@ mod tests {
 
     fn has(notes: &[String], prefix: &str) -> bool {
         notes.iter().any(|n| n.starts_with(prefix))
+    }
+
+    const POSITION_NOTE: &str = "note: JSON spots will carry no station position";
+    const UPLINK_NOTE: &str = "note: [[rbn_uplink]] is experimental";
+
+    /// MAN-90: any enabled uplink gets one note, whatever its dry_run says.
+    #[test]
+    fn note_uplink_is_experimental_only_when_an_uplink_is_enabled() {
+        let server = "[server]\nstation_callsign = \"W1AW\"\noperator_grid = \"FN31pr\"\n";
+        let uplink = |enabled: bool, host: &str| {
+            format!(
+                "[[rbn_uplink]]\nenabled = {enabled}\ntarget_host = \"{host}\"\ntarget_port = 7000\n"
+            )
+        };
+        let n = notes_of(&format!("{server}{}", uplink(true, "a.example.org")));
+        let hits: Vec<&String> = n.iter().filter(|x| x.starts_with(UPLINK_NOTE)).collect();
+        assert_eq!(
+            hits,
+            [
+                &"note: [[rbn_uplink]] is experimental -- its login and spot format are \
+               unverified against RBN's real ingest; to reach RBN today, let an RBN \
+               Aggregator read this node's telnet server \
+               (docs/RUNBOOKS/secondary-skimmer-field-node.md)"
+                    .to_string()
+            ]
+        );
+        let two = notes_of(&format!(
+            "{server}{}{}",
+            uplink(true, "a.example.org"),
+            uplink(true, "b.example.org")
+        ));
+        assert_eq!(two.iter().filter(|x| x.starts_with(UPLINK_NOTE)).count(), 1);
+        assert!(!has(
+            &notes_of(&format!("{server}{}", uplink(false, "a.example.org"))),
+            UPLINK_NOTE
+        ));
+        assert!(!has(&notes_of(server), UPLINK_NOTE));
+    }
+
+    /// MAN-90: the scaffold's uplink block says it is experimental and where
+    /// the supported route is documented.
+    #[test]
+    fn scaffold_marks_the_uplink_experimental() {
+        let start = SCAFFOLD.find("# --- Uplink").unwrap();
+        let end = SCAFFOLD.find("# --- Receiver").unwrap();
+        let block = &SCAFFOLD[start..end];
+        assert!(block.contains("\n# Experimental:"), "{block}");
+        assert!(block.contains("secondary-skimmer-field-node.md"), "{block}");
+    }
+
+    /// MAN-138: an unconfigured position is legal (every JSON spot then says
+    /// `null`), so it is a note, not an error -- and only for a config that
+    /// starts the servers.
+    #[test]
+    fn note_station_position_only_when_no_location_is_configured() {
+        let server = "[server]\nstation_callsign = \"W1AW\"\n";
+        let n = notes_of(server);
+        let note = n
+            .iter()
+            .find(|x| x.starts_with(POSITION_NOTE))
+            .unwrap_or_else(|| panic!("no position note in {n:?}"));
+        assert_eq!(
+            note,
+            "note: JSON spots will carry no station position (deGrid, deLat and deLon are \
+             null) -- set [server].operator_grid, or operator_lat and operator_lon"
+        );
+        assert!(!has(
+            &notes_of(&format!("{server}operator_grid = \"FN31pr\"\n")),
+            POSITION_NOTE
+        ));
+        assert!(!has(
+            &notes_of(&format!(
+                "{server}operator_lat = 41.714775\noperator_lon = -72.72726\n"
+            )),
+            POSITION_NOTE
+        ));
+        assert!(!has(
+            &notes_of("[decode]\nengine = \"legacy\"\n"),
+            POSITION_NOTE
+        ));
+        assert!(!has(&notes_of(""), POSITION_NOTE));
     }
 
     #[test]
@@ -1048,14 +1478,18 @@ mod tests {
 
     /// Keys with no built-in default: the scaffold shows an example (D10).
     const NO_DEFAULT: &[(&str, &str)] = &[
+        ("server", "live_port"),
         ("server", "station_callsign"),
         ("server", "operator_name"),
         ("server", "operator_qth"),
         ("server", "operator_grid"),
+        ("server", "operator_lat"),
+        ("server", "operator_lon"),
         ("rbn_uplink", "enabled"),
         ("rbn_uplink", "target_host"),
         ("rbn_uplink", "target_port"),
         ("rbn_uplink", "login_callsign"),
+        ("rbn_compare", "login_callsign"),
         ("input", "type"),
         ("input", "device"),
         ("input", "path"),
@@ -1064,6 +1498,9 @@ mod tests {
         ("input", "driver"),
         ("input", "rate_hz"),
         ("input", "gain_db"),
+        ("input", "group"),
+        ("input", "ssrc"),
+        ("input", "interface"),
         ("input", "center_freq_hz"),
         ("input", "capture_rate_hz"),
         ("input", "replay_epoch"),
@@ -1071,12 +1508,14 @@ mod tests {
         ("spot", "notch_path"),
         ("spot", "cty_path"),
         ("spot", "scp_path"),
+        ("spot", "pattern_path"),
     ];
 
     /// `Option` keys whose absence means a built-in value: setting them to
     /// that value changes the typed config (None -> Some) but not behaviour.
     const BUILTIN_EQUIVALENT: &[(&str, &str)] = &[
         ("server", "status_interval_secs"),
+        ("server", "history_minutes"),
         ("server", "telnet_max_connections_per_ip"),
         ("server", "json_max_connections_per_ip"),
         ("server", "metrics_max_connections_per_ip"),
@@ -1164,7 +1603,9 @@ mod tests {
                 "[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7030000.0\n".to_string()
             }
             // Absolute, so both loads resolve it the same from their temp dirs.
-            ("input", "iq") => "[input]\ntype = \"file\"\npath = \"/x.wav\"\n".to_string(),
+            ("input", "iq" | "realtime" | "loop") => {
+                "[input]\ntype = \"file\"\npath = \"/x.wav\"\n".to_string()
+            }
             _ => format!("[{table}]\n"),
         }
     }
@@ -1175,6 +1616,7 @@ mod tests {
         match table {
             "server" => a.server == b.server,
             "rbn_uplink" => a.rbn_uplink == b.rbn_uplink,
+            "rbn_compare" => a.rbn_compare == b.rbn_compare,
             "input" => a.input == b.input,
             "spot" => a.spot == b.spot,
             "detector" => a.detector == b.detector,
@@ -1253,6 +1695,10 @@ mod tests {
             int("status_interval_secs"),
             status::DEFAULT_STATUS_INTERVAL.as_secs()
         );
+        assert_eq!(
+            int("history_minutes"),
+            u64::from(manta_server::bus::DEFAULT_HISTORY_MINUTES)
+        );
         // `resolve` falls back to 0.0 when no ppm is set.
         let ppm = scaffold_number("input", "freq_correction_ppm");
         assert_eq!(ppm.as_float(), Some(0.0));
@@ -1307,6 +1753,7 @@ mod tests {
             InputKind::Kiwi,
             InputKind::Soapy,
             InputKind::Hpsdr,
+            InputKind::Ka9q,
         ] {
             let body = format!(
                 "[input]\ntype = \"{}\"\n{}",
@@ -1330,7 +1777,9 @@ mod tests {
         let body = format!("[spot]\n{}", uncommented("spot", |_| true));
         let l = loaded(&body);
         assert!(l.spot.blocklist_path.is_some() && l.spot.notch_path.is_some());
-        assert!(l.spot.cty_path.is_some() && l.spot.scp_path.is_some());
+        assert!(
+            l.spot.cty_path.is_some() && l.spot.scp_path.is_some() && l.spot.pattern_path.is_some()
+        );
     }
 
     #[test]
@@ -1510,5 +1959,13 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "sentinel");
         init(&path, true).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), SCAFFOLD);
+    }
+
+    #[test]
+    fn summary_server_line_shows_history_minutes_only_when_set() {
+        let lines = lines_of("[server]\nstation_callsign = \"W1AW\"\nhistory_minutes = 90\n");
+        assert!(line(&lines, "server:").ends_with(" history_minutes=90"));
+        let lines = lines_of("[server]\nstation_callsign = \"W1AW\"\n");
+        assert!(!line(&lines, "server:").contains("history_minutes"));
     }
 }

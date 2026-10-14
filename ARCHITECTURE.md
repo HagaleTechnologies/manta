@@ -50,7 +50,7 @@ allow).
 manta/
 ├── Cargo.toml                 # workspace
 ├── crates/
-│   ├── manta-input          # IQ sources: SoapySDR, HPSDR/Hermes, KiwiSDR client, file, audio
+│   ├── manta-input          # IQ sources: SoapySDR, HPSDR/Hermes, KiwiSDR client, ka9q-radio multicast, file, audio
 │   ├── manta-dsp            # PFB channelizer, noise-floor estimation, envelope
 │   ├── manta-decode         # CW keying state machine, timing, Morse decode
 │   ├── manta-spot           # callsign validation, CQ/DE parse, dedupe, scoring
@@ -101,7 +101,7 @@ versioned deps.
 
 ## 3. Input layer (`manta-input`)
 
-One trait, five implementations:
+One trait, six implementations:
 
 ```
 trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
@@ -116,6 +116,13 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
   no native-library dependency; the gate mirrors `soapy`. The wire facts are
   spike-pinned (`docs/DECISIONS/2026-09-02-hpsdr-hermes-protocol-spike.md`), not yet
   confirmed against live hardware.
+- **ka9q-radio (radiod) channel** (RTP over UDP multicast, no feature gate):
+  joins the multicast data group of one existing radiod IQ channel and reads
+  its sample rate, encoding, frequency and filter edges from the per-channel
+  status packets radiod sends to that group, so the operator sets none of
+  them. Pure std plus `socket2`, in every build. The wire facts are pinned
+  against ka9q-radio's documentation and headers, not yet a live radiod
+  ([docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md](docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md)).
 - **KiwiSDR client**: the kiwisdr websocket IQ protocol (12 kHz IQ per channel) —
   narrow, but gives instant worldwide receiver access for development and lets
   low-budget nodes contribute spots.
@@ -171,6 +178,25 @@ audio spliced across the gap and no zero-fill (see
 was rejected). File replay is exempt: its errors and EOF must reach
 `listen()` unchanged for byte-identical replay.
 
+**Paced and looping replay (MAN-269).** File replay normally runs as fast
+as the machine decodes. `run --realtime` (`input.realtime`) wraps the file
+source in `manta_input::PacedSource`, which sleeps after each read until the
+recording's own clock (cumulative samples / `sample_rate()`, started at the
+first read) has caught up, so a 120 s file keeps the servers up for 120 s
+and a spot reaches the wire when it would have live. `run --loop`
+(`input.loop`) adds `manta_input::LoopingSource`, which reopens the file
+through the same `LiveSourceSpec::open` at each end and fails if a later
+pass changes sample rate or centre frequency; `--loop` implies `--realtime`.
+The loop sits inside the pacing, so one clock spans every pass, and the wrap
+reports no discontinuity (that would restart `listen()`'s calibration fill
+forever on a file shorter than 2 s). Both decide only when samples arrive,
+never which, so paced output is byte-identical to unpaced output. Both
+flags are refused for a live source, and `soak`/`doctor` ignore the keys.
+Separately, `WavIqSource::open` rejects an IQ WAV declaring 0 Hz or more
+than 10 MS/s (`MAX_IQ_WAV_RATE_HZ`) before reading samples, so a shape-valid
+but absurd header rate cannot reach the rate-sized allocations downstream.
+See `docs/DECISIONS/2026-10-10-man269-paced-looping-replay.md`.
+
 ## 4. Channelizer (`manta-dsp`)
 
 **Implemented** as of M2 sub-project 1 (`manta-dsp::channelizer`) -- the
@@ -206,6 +232,15 @@ its ceiling for the entire duration of a real 15-minute recording,
 `docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`) with
 lowest-SNR eviction; evictions are counted and reported (no silent
 coverage loss).
+
+RTTY (MAN-314): a two-tone FSK detector (`manta-dsp::fsk`) reads the same
+per-hop power and floor. A tone pair with anti-correlated per-hop SNR, a
+constant envelope and a standard shift (170/200/425/450/850 Hz) that lasts
+`detector.rtty_dwell_ms` (20 s) is marked as RTTY. No CW track starts on
+its tones (± 1 channel) or on splatter-level candidates nearby, and open
+tracks on its tones close. The marked set is reported in `decode --json`,
+the `run` log and the `manta_rtty_signals{band}` gauge. SPEC-decode-core.md
+§2.6 is normative.
 
 **CPU budget** (the reason this whole design is viable):
 
@@ -308,9 +343,17 @@ transmission may never produce again).
    `master.scp` (contest super-check-partial list) *raises* confidence; absence
    only lowers it (new/rare calls must still spot, not just well-known ones).
    `--scp` / `[spot] scp_path` supplies a replacement known-callsign list.
-4. **Repetition requirement**: a callsign must decode ≥ 2 times within 90 s
-   before first spot (CW ops repeat their calls; single decodes are
-   overwhelmingly garble). **Deviates from "the same track" (MAN-166,
+4. **Repetition requirement** (MAN-95): within 90 s a call needs 2 distinct
+   messages for a common pattern, 3 for a listed pattern and 5 for an
+   unlisted pattern. `[spot].validation_level = "minimal"` restores flat 2;
+   the default is `"normal"`. Patterns keep the first 3 characters literal
+   (2 for letter-digit-letter, 4 for digit-letter-letter), then replace
+   later letters with `@` and digits with `#`. Portable suffixes are ignored.
+   The independent `data/patterns.lst` is derived from vendored MASTER.SCP:
+   `+` means at least two calls share that pattern; a plain entry means one.
+   `--patterns` / `[spot].pattern_path` replaces it. Changing `--scp` alone
+   does not change the pattern table. CW operators repeat their calls;
+   single decodes are overwhelmingly garble. **Deviates from "the same track" (MAN-166,
    `docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`)**: a
    real signal's `track_id` changes across a close+reopen, so repetition is
    tracked per frequency instead, with a minimum-gap check across
@@ -421,9 +464,13 @@ validation (MAN-28). Dedupe (step 5) still applies.
   trailer).
   `sh/dx` follows Aggregator's documented forms: `sh/dx N` is a count and
   `sh/dx Nm` a minutes window, never a band. Either can take a ` CW`/` RTTY`
-  suffix, and the manta extension `BAND <band>` selects a band. Every query
-  reaches back at most the fifty retained spots. See
-  `docs/DECISIONS/2026-10-10-man92-telnet-commands.md`.
+  suffix, and the manta extension `BAND <band>` selects a band. History
+  retains a heard-time window (`[server].history_minutes`, default 30),
+  with a floor of the newest 50 spots and a ceiling of 10,000. Bare `sh/dx`
+  returns ten rows; loggers can request `sh/dx 30m`. Window changes need a
+  restart. See [MAN-93](docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md)
+  for retention and `docs/DECISIONS/2026-10-10-man92-telnet-commands.md`
+  for query semantics.
   `SKIMMER/SETT` replies with validation level and the live decodable
   passband (`SETT: vlNormal 14000.0-14070.0`); Aggregator will not forward
   spots from a source that never answers it (Aggregator manual v6.0 §9.2).
@@ -446,6 +493,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `dxCqZone` (and their `de*` counterparts) carry named, out-of-domain
   `UNKNOWN_*` sentinels rather than `null` or a fabricated-looking value —
   see `docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md`.
+  `deGrid`/`deLat`/`deLon` are the operator's configured station position
+  (`[server].operator_grid`/`operator_lat`/`operator_lon`), `null` when none
+  is configured, never a `cty.dat` centroid (MAN-138; see
+  `docs/DECISIONS/2026-10-11-man138-station-location.md`).
   Its `snr` field keeps the native 2500 Hz measurement (no 500 Hz conversion)
   alongside an explicit `snrRefHz` field naming that bandwidth, so a consumer
   of either surface never has to guess which convention it's reading
@@ -454,7 +505,67 @@ validation (MAN-28). Dedupe (step 5) still applies.
   naming the exact binary, and the part before `+` is the release the
   decoder-output rule in `CHANGELOG.md` governs. See
   `docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md`.
-- Both servers are thin fan-out consumers of one broadcast channel; slow clients
+- **Spot grades on the JSON stream (MAN-301)**: with `[rbn_compare]` enabled,
+  the :7301 stream (raw TCP and WebSocket) also carries one `spotGrade`
+  record per spot, published after the spot's comparison window closes
+  (`window_secs`, default 180 s). It references the spot's `id` as `spotId`
+  and grades it `match`, `disagree`, `elsewhere`, `none` or `unknown`
+  against what RBN's skimmers reported. Spot lines are unchanged and have
+  no `kind` key; a grade line always has `"kind":"spotGrade"` and
+  deliberately no `dxCall`/`frequency`/`timestamp`, so a consumer that
+  wants spots only skips lines with a `kind` key, and MAN-96's field-node
+  scripts can never count a grade as a spot. Without the table the stream
+  is byte-identical to before. Telnet and the RBN uplink never see grades.
+  The grading engine (`manta_server::rbn_compare::grade`) is pure and
+  deterministic; `manta grade` runs it offline over a node's `spots-*.jsonl`
+  archive and RBN's daily CSV. See
+  `docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md` and
+  `docs/RUNBOOKS/rbn-comparison.md`.
+- **Live-state stream (MAN-324, opt-in)**: with `[server].live_port` set,
+  a fourth listener pushes what the node hears between spots, for
+  dashboards: `bandState` (per-band noise floor, occupancy and decoding
+  tracks, once per second of stream time), `trackState` (each track's
+  frequency, speed, SNR, newest 128 characters of text and up to 8
+  candidate calls with their support), `candidateDecision` (every
+  validation decision with its reason, e.g. `withheld`/`repetition`, and
+  for a spot the `:7301` `id` as `spotId`) and `trackClosed`. It has its
+  own port and its own broadcast channel on `SpotBus` (4096 records deep),
+  and runs the same `json_stream::serve` fan-out code as :7301 (raw TCP and
+  WebSocket, 10 s write timeout, lag-means-disconnect), capped at 32
+  clients. It binds `[server].live_bind_addr`, default `127.0.0.1`, because
+  it has no password and carries every track's decoded text. Unset, no
+  socket opens and the decode loop does no live work; set, records are
+  serialized on the decode thread only while a client is connected, never
+  block it, and never change spot output. The why-not-spotted record is the
+  validator's opt-in decision log (`manta_spot::Decision`). Field
+  reference: `docs/LIVE-STATE.md`; design and measured rates:
+  `docs/DECISIONS/2026-10-12-man324-live-state-stream.md`.
+- **Inbound RBN feed client (MAN-301)**: the comparator's
+  `rbn_compare::feed` connects out to `[rbn_compare].feed_host:feed_port`
+  (`telnet.reversebeacon.net:7000`), reconnecting on `backoff.rs`'s
+  ladder, and turns `DX de` CW lines into reports. It is **read-only toward
+  RBN (normative)**: it writes exactly one line, `login_callsign` plus CRLF,
+  and never a command, filter or spot (`sends_nothing_but_the_login`).
+  It sends that login when the server's text ends a line, ends in `:`, or
+  falls silent for 10 s, so a prompt without a trailing newline cannot
+  hang it (MAN-90 finding C7). Live reports are timed by arrival, because
+  the feed's `HHMMZ` field has no date.
+- **Outbound RBN uplink (experimental)** (`uplink.rs`): one client task per
+  enabled `[[rbn_uplink]]`. It connects to `target_host:target_port`, reads
+  one line and ignores it, and sends the login callsign plus CRLF. Each spot
+  `spot_types` lets through (CQ and beacon by default, MAN-91) is then written
+  as a `DX de` line, always in `LineFormat::Rbn` whatever `[server].line_format`
+  says, unless `dry_run` (default `true`, MAN-159) holds it back. Failed
+  connections are retried with 1 s→60 s backoff. That handshake and layout are
+  manta's assumption. RBN publishes nothing about what its ingest accepts. The
+  AK1A layout was measured on RBN's *outbound* relay
+  (`telnet.reversebeacon.net:7000`, MAN-88), not on any ingest. The uplink has
+  only run against in-process mock collectors. The supported route into RBN is
+  the telnet server above behind an RBN Aggregator (broad-review D1, MAN-86).
+  The open claims and the capture that would settle them are in
+  `docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md` and
+  `docs/RUNBOOKS/aggregator-rbn-capture.md`.
+- Both servers are thin fan-out consumers of the spot bus; slow clients
   are disconnected, never back-pressure the pipeline. At shutdown each
   client's queued backlog is drained on a best-effort basis bounded by a
   per-client deadline (`tasks::CLIENT_DRAIN_DEADLINE`) that starts once the
@@ -494,21 +605,24 @@ validation (MAN-28). Dedupe (step 5) still applies.
 ## 8. Configuration & observability
 
 - **Single TOML config** (MAN-261,
-  `docs/DECISIONS/2026-10-06-man261-config-surface.md`): one file with six
+  `docs/DECISIONS/2026-10-06-man261-config-surface.md`): one file with seven
   tables — `[server]` (station callsign, which may carry an RBN `-N`
   per-band SSID per
   `docs/DECISIONS/2026-09-07-man-89-station-callsign-ssid-grammar.md`;
   bind address; ports),
-  `[[rbn_uplink]]`, `[input]` (source type and its keys, dial frequency,
+  `[[rbn_uplink]]`, `[rbn_compare]` (MAN-301: live grading against RBN's
+  feed; needs `[server]`), `[input]` (source type and its keys, dial frequency,
   capture rate, ppm correction), `[spot]` (watch list, blocklist and notch
   files, and `cty.dat`/`master.scp` overrides), `[detector]` (thresholds, timers, track cap) and `[decode]` —
-  read by `run`, `soak`, `doctor` and `check` (`--config`, else
+  read by `run`, `soak`, `doctor`, `check` and `calibrate` (`--config`, else
   `MANTA_CONFIG`) and by `decode`/`oracle`, and by `bench sensitivity`
   (which reads only `[decode]`/`[detector]`, never the environment).
   Precedence is flag, then `MANTA_<TABLE>_<KEY>` environment variable, then
   file, then default; `decode` and `oracle` never read the environment.
   Unknown tables, keys and `MANTA_*` variables
-  are errors. `docs/SPEC-decode-core.md` §9 is the key table. Not yet
+  are errors. `docs/CONFIG.md` is the per-key reference (default, and
+  which commands and engines each key affects); `docs/SPEC-decode-core.md`
+  §9 stays normative for the decode-core defaults. Not yet
   configurable: a band plan (CW segment limits) and the
   compile-time constants SPEC §9 marks `not configurable yet`.
   `manta config check` runs `run`'s config pipeline up to its first source
@@ -518,6 +632,17 @@ validation (MAN-28). Dedupe (step 5) still applies.
   scaffold with every key commented out at its default, pinned to the code
   defaults and the loader's key list by tests (MAN-76,
   `docs/DECISIONS/2026-10-07-man76-config-check-init.md`).
+  With `[server]`, SIGHUP re-runs that same pipeline and swaps the `[spot]`
+  lists into the live validator and `dry_run` into each uplink task; other
+  keys need a restart, and an invalid reload is logged and changes nothing
+  (MAN-78, `docs/DECISIONS/2026-10-10-man78-live-reload.md`).
+  `manta calibrate` resolves `[input]` the way `doctor` does, measures the
+  receiver's frequency error against a known carrier
+  (`manta-dsp::carrier` estimates it, `manta-engine::calibrate` picks the
+  reference and gates the result), and after confirmation edits only
+  `input.freq_correction_ppm` in place in the file it read, keeping every
+  other byte, the file's mode and owner (MAN-127,
+  `docs/DECISIONS/2026-10-11-man127-calibrate-command.md`).
 - **Source diagnostics (MAN-125)**: `manta devices` enumerates audio inputs
   and, when compiled, SoapySDR selectors without opening capture streams.
   `manta check [SOURCE]` shares typed config/source resolution and source wrappers
@@ -579,7 +704,8 @@ validation (MAN-28). Dedupe (step 5) still applies.
   Unlike `/healthz`, which deliberately ignores the uplink (MAN-128 D10),
   `/status` is about the uplink. Inherits `/metrics`'s unauthenticated,
   `0.0.0.0`-by-default exposure posture
-  (`docs/RUNBOOKS/network-exposure.md`). Prometheus text
+  (`docs/RUNBOOKS/network-exposure.md`). `docs/METRICS.md` lists every
+  rendered family with its type, labels and when it has samples. Prometheus text
   endpoint (compiled in unconditionally, no feature flag — the "(feature
   `metrics`)" phrasing in older revisions of this doc was stale, no Cargo
   `metrics` feature has ever existed; the endpoint is served whenever
@@ -610,6 +736,9 @@ validation (MAN-28). Dedupe (step 5) still applies.
   replayed because the replay write failed or shutdown intervened — kept
   out of the write-failure counter because a replay entry was already
   counted once in `manta_spots_total`),
+  `manta_spots_history_truncated_total` (in-window history entries evicted
+  at the ceiling; normal ageing is not counted, see
+  [MAN-93](docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md)),
   `manta_spots_unresolved_geography_total` (MAN-136/MAN-45 — a spot that
   went out carrying an `UNKNOWN_*` sentinel on either side, i.e. its dx or
   de callsign didn't resolve against `cty.dat`, *or* it resolved but its
@@ -634,10 +763,16 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `manta_uplink_target_*{target="host:port"}` (per-target labels for every
   uplink counter, derived-sum aggregates preserved under their old
   unlabeled names); and `manta_healthy`/`manta_listener_up{listener}`
-  (the same verdict `/healthz`, below, reports). What's still genuinely
-  missing: per-stage queue depths, spots/min, spot-confidence histogram,
-  and **ring**-overrun counting for live audio (§3 — blocked on
-  a `coppa-audio` API addition, `manta-engine::soak`'s documented
+  (the same verdict `/healthz`, below, reports). **MAN-118 added**
+  decode-quality families with no `track_id` label:
+  `manta_decode_chars_total`/`manta_decode_garbles_total` (counters),
+  `manta_track_rail_ratio` (each `legacy` track's keying-rail ratio, once
+  per second) and `manta_candidate_repetitions` (the repetition gate's
+  count per candidate), fed by `manta_engine::DecodeQualityObserver` — see
+  [MAN-118](docs/DECISIONS/2026-10-12-man118-decode-quality-metrics.md).
+  What's still genuinely missing: per-stage queue depths, spots/min,
+  spot-confidence histogram, and **ring**-overrun counting for live audio
+  (§3 — blocked on a `coppa-audio` API addition, `manta-engine::soak`'s documented
   deviation, a different gap from MAN-56's wire-level packet counters).
   The three `manta_input_*` series are published only for sources that
   actually count wire-level packet loss (HPSDR and KiwiSDR — MAN-128
@@ -646,6 +781,32 @@ validation (MAN-28). Dedupe (step 5) still applies.
   every other source — "absent means not measured", so an operator never
   reads a placeholder as live data; the same distinction that motivated
   the `manta_active_tracks` caveat before it was populated.
+- **RBN comparison (MAN-301)**: `[rbn_compare]` is opt-in and disabled by
+  default; disabled, it opens no connection, adds no JSON line and renders
+  no metric family. Enabled (a `[server]` table is required, and a file
+  replay is refused), `rbn_compare::live` runs three tasks beside the
+  uplink tasks: one reads the spot bus with `subscribe()` and queues each
+  spot in a pure `Grader`, one runs the feed client (§7), and a 5 s tick
+  grades every spot whose window has closed and publishes the record with
+  `SpotBus::publish_grade`. The bus has a second broadcast channel for the
+  JSON stream only: `subscribe_json()` carries every spot plus grade lines
+  in publish order, and telnet and the uplink keep `subscribe()`, which
+  carries spots only. Every `[rbn_compare]` key needs a restart; a SIGHUP
+  reload names a changed one in its restart warning. The comparator runs
+  in the async server layer, not the decode loop, so decode determinism
+  and the CPU-budget benches are untouched. Metrics, rendered only when
+  enabled: `manta_rbn_compare_grades_total{band,grade}`,
+  `manta_rbn_compare_grades_last_hour{band,grade}`,
+  `manta_rbn_compare_disagreements_last_hour{band,kind}`,
+  `manta_rbn_compare_freq_offset_median_hz{band}` and `_samples{band}`
+  (the median is a receiver-calibration signal, MAN-127),
+  `manta_rbn_compare_feed_connected`, `_feed_reports_total`,
+  `_feed_reconnects_total`, `manta_rbn_compare_pending` and
+  `manta_rbn_compare_ungraded_total`. The trailing-hour gauges keep a
+  bounded ring per key, pruned at scrape, as
+  `manta_uplink_target_recent_reconnects` does. `manta doctor` adds an
+  `rbn compare feed` reachability row that sends nothing. See
+  `docs/RUNBOOKS/rbn-comparison.md`.
 - **Source-outage counters (MAN-96)**: `manta_source_outages_total{source}`
   (healthy → unhealthy edges) and `manta_source_down_seconds_total{source}`
   (seconds in outages that have ended), counted in

@@ -58,10 +58,53 @@ more than one implementation of it, on more than one operating system.
 
 ## Installation
 
-There is no tagged release yet, so there is no prebuilt binary or Docker
-image to pull — build from source. You need Rust 1.98+ and a `git`
-executable on `PATH`. Git is a build-time requirement, not just a way to
-clone this repo: manta depends on
+### Download a release
+
+Each tagged release on the
+[Releases page](https://github.com/HagaleTechnologies/manta/releases) has a
+prebuilt archive for every supported platform. You need neither Rust nor a
+clone of this repository.
+
+| Platform | Archive |
+|---|---|
+| Linux x86-64 | `manta-linux-x86_64.tar.gz` |
+| Linux arm64 (64-bit Raspberry Pi OS and other ARM boards) | `manta-linux-arm64.tar.gz` |
+| macOS, Intel | `manta-macos-x86_64.tar.gz` |
+| macOS, Apple silicon | `manta-macos-arm64.tar.gz` |
+| Windows x86-64 | `manta-windows-x86_64.zip` |
+
+On Linux or macOS, put your archive's name in place of
+`manta-linux-x86_64.tar.gz`:
+
+```sh
+curl -fLO https://github.com/HagaleTechnologies/manta/releases/latest/download/manta-linux-x86_64.tar.gz
+curl -fLO https://github.com/HagaleTechnologies/manta/releases/latest/download/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+tar xzf manta-linux-x86_64.tar.gz
+cd manta-linux-x86_64
+./manta --version
+```
+
+On macOS, check the download with `shasum -a 256 -c --ignore-missing
+SHA256SUMS` instead. On Windows, download the ZIP and `SHA256SUMS` from the
+Releases page, check them as
+[Verifying a downloaded release](docs/RUNBOOKS/release.md#verifying-a-downloaded-release)
+shows, unzip, and run `.\manta.exe --version` in the unpacked folder.
+
+Each archive holds the binary, this README, both licence files, an example
+config, the man pages (see [Tab completion and man pages](#tab-completion-and-man-pages))
+and the kit for running manta as a service
+([packaging/README.md](packaging/README.md)). Release binaries read
+KiwiSDR, HPSDR, audio and WAV input; SoapySDR needs a build from source.
+Linux binaries need the ALSA runtime library (`libasound2`, see the notes
+below). macOS binaries are not signed or notarized: if macOS refuses to run
+one you downloaded in a browser, clear the flag with
+`xattr -d com.apple.quarantine ./manta`.
+
+### Build from source
+
+You need Rust 1.98+ and a `git` executable on `PATH`. Git is a build-time
+requirement, not just a way to clone this repo: manta depends on
 [`coppa`](https://github.com/HagaleTechnologies/coppa) as a rev-pinned git
 dependency, and `.cargo/config.toml` sets `[net] git-fetch-with-cli = true`
 so cargo fetches it through the `git` binary rather than its built-in
@@ -83,15 +126,48 @@ the `--features hpsdr` across: drop it and the binary has no `--hpsdr-host`
 flag at all, so it no longer matches the install above or the HPSDR row in
 the Inputs table below.
 
-A binary and a Docker image publish automatically, for every platform,
-from the first tag:
+### Docker
+
+Each release also publishes a multi-arch image (`linux/amd64`,
+`linux/arm64`, `linux/arm/v7`) to GitHub Container Registry:
 
 ```sh
-# once a release exists:
 docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
 ```
 
-**Notes:**
+### Tab completion and man pages
+
+`manta completions <shell>` prints a tab-completion script for `bash`,
+`zsh`, `fish`, `powershell` or `elvish`. Load it from your shell's startup
+file:
+
+| Shell | Where | What to add or run |
+|---|---|---|
+| bash | `~/.bashrc` | `eval "$(manta completions bash)"` |
+| zsh | `~/.zshrc`, after `autoload -Uz compinit && compinit` | `eval "$(manta completions zsh)"` |
+| fish | run once | `manta completions fish > ~/.config/fish/completions/manta.fish` |
+| PowerShell | `$PROFILE` | `manta completions powershell \| Out-String \| Invoke-Expression` |
+| elvish | `~/.config/elvish/rc.elv` | `eval (manta completions elvish \| slurp)` |
+
+The script covers the commands and flags of the binary that printed it, so
+run the fish line again after an upgrade; the other shells reload it with
+every new shell.
+
+Each release archive carries man pages in `man/man1`: `manta.1` and one
+page per command (`manta-run.1`, `manta-config-check.1`, ...). On Linux or
+macOS, from the unpacked archive:
+
+```sh
+sudo install -d /usr/local/share/man/man1
+sudo install -m 0644 man/man1/*.1 /usr/local/share/man/man1/
+man manta
+```
+
+After a build from source, `manta man-pages --out <dir>` writes the same
+pages into `<dir>`.
+
+### Notes
+
 - Building on Linux compiles the ALSA bindings (audio input is an
   unconditional dependency, even if you only ever use file, KiwiSDR, or
   HPSDR input), so the build host needs the ALSA development headers and
@@ -129,6 +205,17 @@ docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
   `MANTA_SERVER_METRICS_BIND_ADDR=0.0.0.0` and publish it as
   `-p 127.0.0.1:7302:7302`, which keeps it on the host — see
   [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md).
+- With no arguments, the image runs the daemon from a config mounted at
+  `/etc/manta/manta.toml` (or the file `MANTA_CONFIG` names), and prints
+  `--help` when there is none. Any arguments run `manta <arguments>`
+  unchanged. The image reports its health to `docker ps` and orchestrators
+  by running `manta health`, which asks the daemon's own `/healthz` from
+  inside the container, so the metrics endpoint can stay on loopback. Setup,
+  timing and how to turn the check off are in
+  [packaging/README.md](packaging/README.md#docker-compose).
+- The image is built for `linux/amd64`, `linux/arm64` and `linux/arm/v7`.
+  `linux/arm/v7` is for 32-bit Raspberry Pi OS; its decode CPU budget is
+  unmeasured.
 - If the `docker run` above returns an authorization error, the GHCR
   package still needs its one-time "make public" step — see
   [docs/RUNBOOKS/release.md](docs/RUNBOOKS/release.md).
@@ -147,6 +234,11 @@ manta decode /tmp/v1/v1.wav
 # CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K CQ …
 ```
 
+`decode` reads the recording's RF centre frequency from the `<name>.json`
+sidecar next to it (`gen` writes `v1.json`). Without one it warns that
+reported frequencies are baseband offsets; `--center-freq-hz 14000000`
+supplies or overrides the centre.
+
 Then point it at a real signal — a public KiwiSDR needs no hardware of
 your own. `<your-kiwi-host>` is a placeholder: pick a receiver that covers
 the band you want from the public KiwiSDR directory at
@@ -161,6 +253,8 @@ flag entirely when yours is on 8073:
 manta listen --kiwi-host <your-kiwi-host> --kiwi-port <your-kiwi-port> --kiwi-freq-hz 7030000
 ```
 
+Someone else's KiwiSDR is shared: read [docs/GUIDES/kiwisdr.md](docs/GUIDES/kiwisdr.md) before you leave manta connected to one.
+
 File replay (`listen --source`) takes 48 kHz mono audio, or a raw complex-IQ
 WAV with `--source-iq`. IQ replay is not resampled: the channelizer runs
 only at its table rates — any rate whose `fs / 93.75` is a power of two,
@@ -169,17 +263,38 @@ which among the rates recorders commonly produce means 24, 48, 96, 192,
 interpreted, so a recording at an off-table rate (100 or 250 kS/s, say) is
 rejected with `unsupported sample rate …: fs/93.75 must be a power of two`.
 That list is examples, not the whole set: divide your own rate by 93.75,
-and it replays if the answer is a power of two of at least 4.
+and it replays if the answer is a power of two of at least 4 and the rate
+is at most 10 MS/s.
 `--capture-rate-hz` decimates by a power of two into a *lower* table rate
 (`--capture-rate-hz 48000` on a 192 kS/s capture, to spend less CPU on a
 narrower passband); it is not a general resampler and cannot rescue an
-off-table recording. Replay runs faster than realtime, so the hardware-free
-path above stops at `decode`; a paced replay that can drive the servers
-below is being worked on.
+off-table recording.
+
+Replay runs as fast as the machine manages unless you add `--realtime`,
+which plays the file at the recording's own pace, so a hardware-free replay
+can drive the servers described below:
+
+```sh
+cat > /tmp/v1/demo.toml <<'EOF'
+[server]
+station_callsign = "W5AU"   # your call; becomes `DX de W5AU-#:`
+bind_addr = "127.0.0.1"     # this machine only
+EOF
+manta run --source /tmp/v1/v1.wav --source-iq --realtime --config /tmp/v1/demo.toml
+```
+
+In a second terminal, within about 20 seconds, run `telnet localhost 7300`
+and enter any callsign at the prompt: W1AW's CQ arrives as a `DX de` line
+about 21 seconds into the replay, and the server stays up for the full 120
+seconds. Connected later than that? Type `sh/dx` to list the spots already
+sent. Add `--loop` to keep a recording playing until you press Ctrl-C (a
+station is spotted again at most every 10 minutes).
 
 `manta --help` lists every subcommand and flag.
 
 ## Run it as a node
+
+For a step-by-step walk from install to a firewalled node with the uplink in dry-run, follow [docs/GUIDES/rbn-node.md](docs/GUIDES/rbn-node.md).
 
 One TOML file describes a node: the station and servers in `[server]`, the
 receiver in `[input]`. With a `[server]` table, `run --config` starts the
@@ -213,6 +328,17 @@ and the problem when something is wrong:
 ```sh
 manta config init                         # writes ./manta.toml; never replaces one
 manta config check --config manta.toml
+```
+
+Then `manta doctor` checks the machine itself: the audio library, that the
+server ports are free, the clock against an NTP server, that each enabled
+RBN uplink target accepts a connection, and that the receiver opens and
+hears something. Each check prints `PASS`, `WARN`, `FAIL` or `SKIP` with a
+fix for every problem, and it exits 1 when a check fails. See
+[docs/RUNBOOKS/setup-checks.md](docs/RUNBOOKS/setup-checks.md).
+
+```sh
+manta doctor --config manta.toml
 ```
 
 Start the server in one terminal. It runs in the foreground until you stop it:
@@ -251,17 +377,89 @@ connection and reconnect state per target) instead of reading its logs:
 manta status --config server.toml
 ```
 
-Forwarding to an upstream RBN-style collector is a `[[rbn_uplink]]`
-block. `dry_run` defaults to `true`, so an uplink connects and logs in but
-transmits nothing until you set it to `false` deliberately.
+The supported route into the Reverse Beacon Network is an RBN Aggregator
+reading this node's telnet server (see the
+[secondary-skimmer field-node runbook](docs/RUNBOOKS/secondary-skimmer-field-node.md)).
+Forwarding straight to an upstream collector is an experimental
+`[[rbn_uplink]]` block. `dry_run` defaults to `true`, so an uplink connects
+and logs in but transmits nothing until you set it to `false` deliberately.
+
+To see, live, whether RBN heard what manta spots, add an `[rbn_compare]`
+table (MAN-301). manta then reads RBN's public CW feed, read-only, and
+publishes a grade for each spot on the JSON stream and `/metrics` about
+3 minutes after the spot. Allow outbound TCP to
+`telnet.reversebeacon.net:7000`:
+
+```toml
+[rbn_compare]
+enabled = true             # or pass --rbn-compare for a single run
+# spotters = ["K5TR"]     # grade against one co-located skimmer only
+```
+
+[docs/RUNBOOKS/rbn-comparison.md](docs/RUNBOOKS/rbn-comparison.md) explains
+each grade and metric, and `manta grade` for replaying a recorded node's
+spot log against RBN's daily archive.
+
+### Changing lists without a restart
+
+With a `[server]` table, `SIGHUP` makes a running daemon re-read its config
+file and apply the `[spot]` lists (`allowlist` and the `blocklist_path` and
+`notch_path` files) and each `[[rbn_uplink]]` block's `dry_run`. Connected
+clients, the `sh/dx` history and uplink connections stay up (MAN-78).
+
+```sh
+manta config check --config server.toml   # the same checks a reload runs
+kill -HUP "$(pidof manta)"               # systemd: systemctl reload manta
+# Docker: docker kill --signal=HUP <container>
+```
+
+The log reports `reload: applied` with the new list sizes, or
+`reload: rejected; still running the previous configuration` with the
+reason; a rejected reload changes nothing.
+Every other setting still needs a restart: a reload that finds one changed
+applies the lists anyway and names the setting in a warning.
+That includes `cty_path` and `scp_path`: a reload checks that those
+files still parse, but keeps the tables manta started with, so a new
+cty.dat or master.scp, even at the same path, needs a restart.
+Command-line `--allowlist`/`--blocklist`/`--notch` keep overriding the file. Without a
+`[server]` table, `SIGHUP` stops manta just as `SIGINT` and `SIGTERM` do.
+Windows has no `SIGHUP`, so no reload. During shutdown the daemon logs
+`SIGHUP ignored; the daemon is shutting down` at INFO and applies nothing.
 
 `bind_addr` has no loopback default — omit it and the telnet and JSON
 servers bind `0.0.0.0`, every interface, as a public cluster node expects.
 The example above pins `127.0.0.1` on purpose. Metrics is the exception:
 it listens on `metrics_bind_addr`, `127.0.0.1` by default, because it has
-no password. Read
+no password. The optional live-state stream for dashboards is another
+exception: set `live_port` (for example `7303`) to start it, and it listens
+on `live_bind_addr`, also `127.0.0.1` by default, for the same reason
+([docs/LIVE-STATE.md](docs/LIVE-STATE.md)). Read
 [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 before you widen either.
+
+### Calibrate the receiver's frequency
+
+Spot frequencies are only as accurate as the receiver's oscillator.
+`manta calibrate` listens to a carrier whose frequency is known exactly (the
+WWV, WWVH, BPM or RWM time signals, or an NCDXF beacon) and reports the
+`freq_correction_ppm` that corrects the receiver. Stop `manta run` first if
+your receiver serves only one program at a time.
+
+```sh
+manta calibrate --config manta.toml
+manta calibrate --config manta.toml --tune-hz 9998500
+```
+
+The first command measures a reference that already sits inside the
+configured receiver's passband. The second retunes a KiwiSDR, SoapySDR or
+HPSDR receiver to 9998500 Hz for this measurement only, which puts the
+10 MHz time signal 1.5 kHz above centre; the 40 m example above needs it.
+Either way, manta prints the measured frequency, the correction and the
+evidence for it, then asks before it saves `freq_correction_ppm` to
+`[input]` in your config file. Nothing else in the file changes. Restart
+`manta run` to apply the new value. In a script, `--write` saves without
+asking. A measurement takes 60 seconds; NCDXF beacons share each frequency
+in turns, so give them `--duration 180`.
 
 ## Running unattended
 
@@ -331,6 +529,7 @@ JSON Lines) is unchanged.
 | KiwiSDR over the network | `listen --kiwi-host` — any receiver from the public directory at <https://kiwisdr.com/public/> | Working |
 | OpenHPSDR / Hermes (Hermes-Lite 2, Red Pitaya, QMTech) | `listen --hpsdr-host`, feature `hpsdr` — on in the install line above, no native dependency | Working; protocol verified against reference sources, not yet against hardware |
 | RTL-SDR, Airspy, SDRplay, HackRF, anything SoapySDR drives | `listen --soapy-driver`, feature `soapy` — **not** in the install line above; needs the SoapySDR system library, then `--features hpsdr,soapy` | Working, needs hardware soak |
+| ka9q-radio (radiod) multicast IQ channel: RX-888, Airspy, anything radiod drives | `listen --ka9q-group`; no build feature | Working; protocol checked against ka9q-radio's docs and headers, not yet against a live radiod |
 
 The source frequency and rate flags end in `-hz`: `--kiwi-freq-hz`,
 `--soapy-freq-hz`, `--soapy-rate-hz`, `--hpsdr-freq-hz` and
@@ -353,7 +552,9 @@ Audio selectors are names matched case-insensitively by substring, not numeric
 indexes. `devices` lists input-capable devices without opening a stream. With
 `--features soapy`, it also lists complete Soapy selector strings for
 `--soapy-driver`. HPSDR discovery is not supported; use `--hpsdr-host HOST`
-with an `hpsdr` build. KiwiSDR uses `--kiwi-host HOST`. `devices --json` reports
+with an `hpsdr` build. KiwiSDR uses `--kiwi-host HOST`. ka9q-radio uses
+`--ka9q-group GROUP`, the data group of a radiod IQ channel;
+`avahi-browse -rt _rtp._udp` lists them. `devices --json` reports
 empty, unavailable and failed enumeration separately; a backend error exits 1
 while retaining the other results.
 
@@ -371,6 +572,9 @@ The default window is three seconds of delivered samples; `--duration` accepts
 resampling and `--capture-rate-hz` decimation, center frequency, passband,
 received sample count, input power and a brief per-channel noise-floor estimate.
 KiwiSDR's stream rate is 96000 Hz after resampling, not its native receiver rate.
+With `--ka9q-group`, the rate and center frequency are the ones the radiod
+channel's status packets report, and the passband is its `low`/`high` filter
+edges ([ka9q-radio guide](docs/GUIDES/ka9q-radio.md#6-check-the-stream)).
 Power is relative dBFS, not calibrated RF power, dBm or spot SNR. The floor is
 the lower quartile in each eligible channel, summarized across the passband.
 See the [measurement definition](docs/DECISIONS/2026-10-10-man125-source-diagnostics.md).
@@ -384,40 +588,79 @@ and retains any measurements. The deadline is duration plus five seconds after
 opening, checked between reads. Native open/read calls can exceed it, so
 `--duration` is not a hard wall-clock timeout. No reconnect loop runs.
 
+Audio input errors name the input (as `manta devices` spells it) and the
+48000 Hz requirement, and say what to check next. A sound card that delivers
+no samples for 5 seconds is an error; one that delivers only exact zeros for
+2 seconds gets a `warning: ... is delivering digital silence` line. On macOS
+either usually means the microphone permission is denied: allow the app
+running manta in System Settings > Privacy & Security > Microphone, quit and
+reopen that app, then confirm with `manta check`. See
+[MAN-131](docs/DECISIONS/2026-10-11-man131-actionable-errors.md).
+
 Targets Linux (x86-64 and ARM, Raspberry Pi 4 class), macOS, and Windows.
 The CPU budget is a full 192 kS/s passband inside one Raspberry Pi 4 core,
 enforced by criterion benches.
 
 ## Outputs
 
-All four ship today. `manta run --config <file>` starts the telnet
+All of these ship today. `manta run --config <file>` starts the telnet
 server, the JSON/WebSocket stream and the metrics endpoint together when
 the file has a `[server]` table; the outbound uplink starts alongside them
-only if that config also carries at least one `[[rbn_uplink]]` block.
+only if that config also carries at least one `[[rbn_uplink]]` block, and
+the live-state stream only if it sets `[server].live_port`.
 
 - **DX cluster telnet server** (`:7300`) — standard login prompt and
   RBN-format `DX de` lines, with enough command grammar (`sh/dx`,
   `set/dx/filter`) for stock clients. This is the RBN/aggregator
-  compatibility surface.
+  compatibility surface and the supported route into RBN: an RBN Aggregator
+  reads it as it reads CW Skimmer Server, following the published CW Skimmer
+  and Aggregator manuals. A logger can request the last 30 minutes with
+  `sh/dx 30m`; `[server].history_minutes` sets retained history depth
+  (default 30). A bare `sh/dx` shows the last 10. See
+  [history limits](docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md).
 - **JSON Lines / WebSocket stream** (`:7301`) — one full-fidelity spot
   object per line; a raw TCP client and a WebSocket client share the
   port. This is the [cqdx](https://cqdx.app) ingest surface.
-- **Outbound RBN uplink** — forwards validated spots to an upstream
-  collector in the same `DX de` wire format, with reconnect and multiple
-  simultaneous targets. Working against a collector; **not yet validated
-  against RBN's live ingest**.
+- **Live-state stream** (optional, on `live_port`, for example `:7303`) —
+  for dashboards: each band's noise floor and activity every second, each
+  track's decoded text and candidate calls, and why each candidate was or
+  was not spotted. Off unless `[server].live_port` is set. It has no
+  password and carries every track's decoded text, so it listens on
+  `127.0.0.1` unless `live_bind_addr` says otherwise. Same raw TCP and
+  WebSocket rules as `:7301`; see [docs/LIVE-STATE.md](docs/LIVE-STATE.md).
+- **Live comparison with the RBN** — with `[rbn_compare]` enabled, manta
+  reads RBN's public CW telnet feed and grades each spot `match`,
+  `disagree`, `elsewhere`, `none` or `unknown` against what RBN's
+  skimmers heard within 3 minutes of it. Each grade is a `spotGrade`
+  record on the `:7301` stream and a per-band count on `/metrics`;
+  `manta grade` replays a recorded spot log against RBN's daily archive.
+  manta only reads the feed: it sends its login callsign and nothing else.
+- **Outbound RBN uplink (experimental)** — forwards validated spots to an
+  upstream collector as `DX de` lines, with reconnect and multiple
+  simultaneous targets. Tested only against manta's own mock collector: RBN
+  publishes nothing about what its ingest accepts, so the login and line
+  format are manta's assumption, and the uplink ships in dry-run. To reach
+  RBN today, let an RBN Aggregator read the telnet server above.
 - **Prometheus metrics** (`:7302/metrics`) — spot, client, uplink and
   source-health counters. Some gauges are still placeholders;
   ARCHITECTURE §8 says which.
 
-`run` (alias `listen`) also prints a `SPOT:` line on stdout for each
-confirmed spot, and decoded text on stderr, one line per track labelled
-with its track number, frequency and speed. With a `[server]` table the
-decoded text is off unless you pass `--decoded-text`, so a service log
-holds spots and diagnostics only. `--json` prints every decoder event and
-spot as JSON Lines on stdout instead. `decode` prints its decoded text on
-stdout. This terminal output is a debugging aid, not a stable interface —
-the servers above are.
+`run` (alias `listen`) prints a `SPOT:` line on stdout for each confirmed
+spot, and decoded text on stderr, one line per track labelled with its track
+number, frequency and speed. With a `[server]` table the decoded text is off
+unless you pass `--decoded-text`, so a service log holds spots and diagnostics
+only. Startup messages, warnings and errors also go to stderr, so the two
+streams can be captured separately:
+
+```sh
+manta run --config manta.toml > spots.log 2> monitor.log
+```
+
+`decode` prints decoded text on stdout and a measurement summary on stderr.
+`run --json` and `decode --json` keep full-precision JSON on stdout. This
+terminal output is a debugging aid, not a stable interface — the servers above
+are. Human units, report streams and error conventions are defined in the
+[command output style decision](docs/DECISIONS/2026-10-10-man270-cli-output-style.md).
 
 The decode path is deterministic: the same file in produces byte-identical
 spot logs out. That is a hard requirement, and CI enforces it with golden
@@ -425,9 +668,15 @@ test vectors.
 
 ### Outbound RBN uplink
 
-manta can also log into an RBN spot-collection endpoint as a client and
-forward its own spots there. Add one `[[rbn_uplink]]` block per target to
-the daemon config:
+**Experimental.** manta can also log into a spot collector as a client and
+forward its own spots there. RBN has not published what its own ingest
+accepts, and this uplink has only been tested against a mock collector, so it
+may not work against RBN's servers. To get spots into RBN today, run manta's
+telnet server behind an RBN Aggregator; the
+[secondary-skimmer field-node runbook](docs/RUNBOOKS/secondary-skimmer-field-node.md)
+walks through it.
+
+Add one `[[rbn_uplink]]` block per target to the daemon config:
 
 ```toml
 [server]
@@ -449,18 +698,25 @@ target_port = 7000
 Spots an uplink holds back still appear on manta's own telnet and JSON
 output; `spot_types` only decides what goes to that target.
 
-The uplink has not yet been verified against a real RBN ingest (see
-[ROADMAP.md](ROADMAP.md)), which is why dry-run is the default. manta logs
-which mode each target is in at startup.
+What the uplink sends, and each part of that still unverified, is recorded
+in
+[docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md](docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md).
+The capture that would settle it is described in
+[docs/RUNBOOKS/aggregator-rbn-capture.md](docs/RUNBOOKS/aggregator-rbn-capture.md).
+That is also why dry-run is the default. manta logs which mode each target is
+in at startup.
 
 ## Status
 
-Pre-1.0, and pre-first-release. What is true today:
+**Pre-stability alpha, expect breakage.** manta has not cleared its own
+M2/M3 acceptance gates ([ROADMAP.md](ROADMAP.md)), and command-line flags,
+configuration keys and output formats can change between releases before
+1.0. What is true today:
 
 - **Shipped:** the full wideband pipeline — polyphase channelizer,
   noise-floor detector, track manager, decoder pool — with five input
   sources, callsign validation (cty.dat, SCP, CQ/DE parsing, dedupe), and
-  all four output surfaces above.
+  every output surface above.
 - **Not yet measured:** the RBN parity benchmark (recall vs. RBN on
   recorded contest IQ), the Raspberry Pi 4 CPU budget, and a 24-hour
   live-SDR soak. The first needs reference data; the other two need
@@ -471,8 +727,9 @@ Pre-1.0, and pre-first-release. What is true today:
   fading on several golden vectors, and at low SNR the validator still
   admits occasional bogus callsigns from noise. Closing the fading gap is
   classical-DSP work in flight, with ML fusion behind it at M4. The
-  outbound RBN uplink is unverified against a real RBN ingest and ships
-  dry-run by default until that verification lands.
+  outbound RBN uplink is experimental: its login and line format are
+  unverified against RBN's real ingest (MAN-90), and it ships dry-run by
+  default.
 - **Decode engine:** `decode.engine` defaults to `legacy`. A rewritten
   `hsmm` engine (decode-core-v2, `docs/SPEC-decode-core-v2.md`) is
   implemented and reachable via `--engine hsmm`, but its stage-2
@@ -485,8 +742,6 @@ Pre-1.0, and pre-first-release. What is true today:
   and character error rate against SNR (500 Hz) on synthetic AWGN and
   Watterson-faded signals; the curve at landing is in
   [docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md](docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md).
-- **No tagged release yet**, so the container image above is empty until
-  the first tag.
 
 [ROADMAP.md](ROADMAP.md) has the milestone breakdown with acceptance
 criteria.
@@ -497,6 +752,8 @@ criteria.
   waterfall.
 - Not a general digital-mode skimmer. FT8 and RTTY are out of scope for 1.0,
   though the channelizer architecture does not preclude them later.
+  Decoding RTTY stays a non-goal for now; recognising it so that its tones
+  never become CW tracks is in scope (MAN-314).
 - Not a cluster network. `manta` is a spot source, not an aggregator.
 - Not a logger. No QSO state.
 - Not a multi-process orchestrator. `manta` is a single Rust binary, not a
@@ -517,15 +774,29 @@ criteria.
 
 ## Documentation
 
-**Running a node:** [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
+[docs/README.md](docs/README.md) says where operators, contributors and
+researchers each start, and lists every runbook.
+
+**Running a node:** [docs/GUIDES/rbn-node.md](docs/GUIDES/rbn-node.md)
+(from install to a running node) · [docs/GUIDES/kiwisdr.md](docs/GUIDES/kiwisdr.md)
+(KiwiSDR etiquette) · [docs/GUIDES/raspberry-pi.md](docs/GUIDES/raspberry-pi.md)
+(Pi install and service) · [docs/GUIDES/ka9q-radio.md](docs/GUIDES/ka9q-radio.md)
+(a ka9q-radio (radiod) channel over multicast) ·
+[docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 (exposing the servers safely) · the "Run it as a node" section above ·
+[docs/CONFIG.md](docs/CONFIG.md) (every config key, its default and what
+reads it) · [docs/METRICS.md](docs/METRICS.md) (every `/metrics` family,
+`/healthz` and `/status`) · [docs/SPOT-SCHEMA.md](docs/SPOT-SCHEMA.md)
+(every field of the `:7301` JSON spot stream) ·
 [packaging/README.md](packaging/README.md) (running unattended under
 systemd, launchd or Docker Compose) ·
 [docs/RUNBOOKS/secondary-skimmer-field-node.md](docs/RUNBOOKS/secondary-skimmer-field-node.md)
 (a 30-day secondary-skimmer field node behind an RBN Aggregator, MAN-96) ·
 `manta <subcommand> --help` for every flag.
 
-**Contributing:** [ARCHITECTURE.md](ARCHITECTURE.md) — the nine-crate
+**Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) — setup, build and
+test commands, golden-vector rules and the pull request review process ·
+[ARCHITECTURE.md](ARCHITECTURE.md) — the nine-crate
 workspace, data flow, and the channelizer, decoder, validation and output
 design · [docs/DECISIONS/](docs/DECISIONS/) — dated design decisions and
 implementation pins · [wiki/INDEX.md](wiki/INDEX.md) — accumulated
@@ -551,6 +822,9 @@ recall/CER-vs-SNR curve on synthetic signals, regenerable from any build.
 
 ## Contributing
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, build and test commands,
+golden-vector rules, and the pull request review process.
+
 Open an issue or a pull request. Main moves only by PR, CI must be green, and
 the golden-vector determinism tests are the bar every decoder change has to
 clear. See [SECURITY.md](SECURITY.md) for vulnerability reporting.
@@ -566,6 +840,10 @@ output adds a `### Decoder output` entry to [CHANGELOG.md](CHANGELOG.md).
 MIT OR Apache-2.0, at your option. Unless you explicitly state otherwise, any
 contribution intentionally submitted for inclusion in this project shall be
 dual licensed as above, without any additional terms or conditions.
+
+Read the [MIT license](LICENSE-MIT) or the
+[Apache-2.0 license](LICENSE-APACHE). The
+[contributor guide](CONTRIBUTING.md#license) explains GitHub's license display.
 
 ## Keeping the prefix table current
 

@@ -6,10 +6,16 @@
 //! decode pipeline, and a subscriber that falls too far behind gets
 //! `RecvError::Lagged` instead of stalling the sender -- callers should
 //! treat `Lagged` as "disconnect this client," not "catch up."
+//!
+//! Two channels carry the same spots (MAN-301): telnet and the RBN uplink
+//! read [`SpotBus::subscribe`], spots only; the JSON stream reads
+//! [`SpotBus::subscribe_json`], which carries every spot plus, with
+//! `[rbn_compare]` enabled, each `spotGrade` record in publish order. With
+//! no grades published the JSON channel carries exactly the spots.
 
 use manta_spot::Spot;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::broadcast;
 
@@ -17,11 +23,20 @@ use tokio::sync::broadcast;
 /// it starts missing spots (and its next `recv()` returns `Lagged`).
 const CHANNEL_CAPACITY: usize = 1024;
 
-/// How many of the most recently published spots `recent()` can return --
-/// backs the telnet server's `sh/dx` command (MAN-12 scope, per the
-/// 2026-09-02 ticket clarification: real command grammar, not just
-/// "don't disconnect").
-const RECENT_HISTORY_CAP: usize = 50;
+/// MAN-324: the live-state channel's capacity -- how many records a live
+/// subscriber may fall behind before it is disconnected. Larger than the
+/// spot channels' because the live stream carries roughly 290 times the
+/// spot rate (docs/DECISIONS/2026-10-12-man324-live-state-stream.md).
+pub const LIVE_CHANNEL_CAPACITY: usize = 4096;
+
+/// Default `[server].history_minutes` (MAN-93).
+pub const DEFAULT_HISTORY_MINUTES: u32 = 30;
+/// Largest accepted `[server].history_minutes`: one day.
+pub const MAX_HISTORY_MINUTES: u32 = 1440;
+/// Keep at least this many newest publications, even on quiet bands.
+pub const MIN_HISTORY_SPOTS: usize = 50;
+/// Bound history memory and the size of one telnet replay.
+pub const MAX_HISTORY_SPOTS: usize = 10_000;
 
 /// Bounds how many distinct callsigns `occurrence_counts` tracks at once
 /// (MAN-62). `docs/DECISIONS/2026-09-02-man23-threat-model.md` finding 2
@@ -51,6 +66,17 @@ const MAX_OCCURRENCE_ENTRIES: usize = 20_000;
 pub struct BusSpot {
     pub spot: Spot,
     pub occurrence_count: u32,
+}
+
+/// One item on the JSON stream's channel (MAN-301): a spot, or one already
+/// serialised `spotGrade` line, written to clients verbatim.
+#[derive(Debug, Clone)]
+pub enum JsonItem {
+    Spot(BusSpot),
+    Grade(Arc<str>),
+    /// MAN-324: one serialized live-state record, sent verbatim. Only ever
+    /// on the live channel, never on the spot stream's.
+    Live(Arc<str>),
 }
 
 /// Bounded, LRU-on-touch tracker for `SpotBus::occurrence_counts` (MAN-62).
@@ -105,12 +131,46 @@ impl OccurrenceTracker {
     }
 }
 
+struct History {
+    entries: VecDeque<BusSpot>,
+    /// Highest heard timestamp ever published; late entries cannot rewind it.
+    newest_sample_ts: u64,
+}
+
+impl History {
+    fn push(&mut self, entry: BusSpot, window_samples: u64) -> usize {
+        self.newest_sample_ts = self.newest_sample_ts.max(entry.spot.sample_ts);
+        self.entries.push_back(entry);
+        let mut truncated = 0;
+        while self.entries.len() > MIN_HISTORY_SPOTS {
+            let front = self.entries.front().expect("history is nonempty");
+            let in_window =
+                self.newest_sample_ts.saturating_sub(front.spot.sample_ts) <= window_samples;
+            let over_ceiling = self.entries.len() > MAX_HISTORY_SPOTS;
+            // Zero restores the old count-only history even for equal timestamps.
+            if window_samples != 0 && in_window && !over_ceiling {
+                break;
+            }
+            if over_ceiling && in_window && window_samples != 0 {
+                truncated += 1;
+            }
+            self.entries.pop_front();
+        }
+        truncated
+    }
+}
+
 pub struct SpotBus {
     tx: broadcast::Sender<BusSpot>,
+    json_tx: broadcast::Sender<JsonItem>,
+    /// MAN-324: the live-state stream's own channel.
+    live_tx: broadcast::Sender<JsonItem>,
     epoch: SystemTime,
     session_nonce: u128,
     sample_rate_hz: f64,
-    recent: Mutex<VecDeque<BusSpot>>,
+    recent: Mutex<History>,
+    history_minutes: u32,
+    window_samples: u64,
     occurrence_counts: Mutex<OccurrenceTracker>,
 }
 
@@ -131,20 +191,45 @@ impl SpotBus {
     /// reconflate them.
     pub fn new(sample_rate_hz: f64, epoch: SystemTime, session_nonce: u128) -> Self {
         let (tx, _rx) = broadcast::channel(CHANNEL_CAPACITY);
+        let (json_tx, _json_rx) = broadcast::channel(CHANNEL_CAPACITY);
+        let (live_tx, _live_rx) = broadcast::channel(LIVE_CHANNEL_CAPACITY);
         Self {
             tx,
+            json_tx,
+            live_tx,
             epoch,
             session_nonce,
             sample_rate_hz,
-            recent: Mutex::new(VecDeque::with_capacity(RECENT_HISTORY_CAP)),
+            recent: Mutex::new(History {
+                entries: VecDeque::with_capacity(MIN_HISTORY_SPOTS),
+                newest_sample_ts: 0,
+            }),
+            history_minutes: DEFAULT_HISTORY_MINUTES,
+            window_samples: 0,
             occurrence_counts: Mutex::new(OccurrenceTracker::new()),
         }
+        .with_history_minutes(DEFAULT_HISTORY_MINUTES)
+    }
+
+    /// Retain the heard-time window plus the floor, up to the ceiling.
+    /// Config bounds minutes to 0..=MAX_HISTORY_MINUTES; larger values saturate.
+    pub fn with_history_minutes(mut self, minutes: u32) -> Self {
+        self.history_minutes = minutes;
+        self.window_samples =
+            (f64::from(self.history_minutes()) * 60.0 * self.sample_rate_hz).ceil() as u64;
+        self
+    }
+
+    pub fn history_minutes(&self) -> u32 {
+        self.history_minutes
     }
 
     /// Publishes one validated spot to every current subscriber. No-op
     /// (not an error) when there are zero subscribers -- a spot server
     /// with no connected clients is the common case, not a failure.
-    pub fn publish(&self, spot: Spot) {
+    /// Returns ceiling evictions still inside the window, for the caller to count.
+    /// Ordinary window ageing and zero-minute count-only eviction are not loss.
+    pub fn publish(&self, spot: Spot) -> usize {
         // Increment and read back under one lock acquisition -- this *is*
         // the fix: the occurrence count a spot carries is fixed at the
         // instant of this publish, before any subscriber can observe it.
@@ -159,24 +244,53 @@ impl SpotBus {
             spot,
             occurrence_count,
         };
-        {
+        let truncated = {
             let mut recent = self.recent.lock().expect("recent lock poisoned");
-            if recent.len() == RECENT_HISTORY_CAP {
-                recent.pop_front();
-            }
             // `recent` retains the SAME occurrence_count as the live
             // broadcast, not just the bare Spot -- otherwise a caller
             // replaying history (`sh/dx`) has no way to apply the same
             // occurrence-based filter the live stream already honors, and
             // a spot suppressed live could leak through history replay,
             // uncounted (round-11 review finding).
-            recent.push_back(bus_spot.clone());
-        }
+            recent.push(bus_spot.clone(), self.window_samples)
+        };
+        let _ = self.json_tx.send(JsonItem::Spot(bus_spot.clone()));
         let _ = self.tx.send(bus_spot);
+        truncated
+    }
+
+    /// Publishes one serialised `spotGrade` line (MAN-301) to JSON-stream
+    /// subscribers only. Telnet and the uplink never see it.
+    pub fn publish_grade(&self, line: Arc<str>) {
+        let _ = self.json_tx.send(JsonItem::Grade(line));
+    }
+
+    /// Spots only: the telnet server, the RBN uplink and the comparator.
+    /// MAN-324: publishes one serialized live-state record to the live
+    /// channel. Never blocks; with no subscriber the line is dropped and
+    /// this returns false.
+    pub fn publish_live(&self, line: Arc<str>) -> bool {
+        self.live_tx.send(JsonItem::Live(line)).is_ok()
+    }
+
+    /// MAN-324: a receiver on the live-state channel.
+    pub fn subscribe_live(&self) -> broadcast::Receiver<JsonItem> {
+        self.live_tx.subscribe()
+    }
+
+    /// MAN-324: live-state subscribers right now; the decode loop builds
+    /// records only when this is nonzero.
+    pub fn live_receiver_count(&self) -> usize {
+        self.live_tx.receiver_count()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<BusSpot> {
         self.tx.subscribe()
+    }
+
+    /// Spots and grades in publish order: the JSON/WebSocket stream.
+    pub fn subscribe_json(&self) -> broadcast::Receiver<JsonItem> {
+        self.json_tx.subscribe()
     }
 
     /// Opaque session identity -- combined (alongside `track_id`/
@@ -196,9 +310,28 @@ impl SpotBus {
     /// `publish`'s doc comment for why history must retain this, not just
     /// the bare `Spot`.
     pub fn recent(&self, n: usize) -> Vec<BusSpot> {
+        self.select_recent(|_| true, n)
+    }
+
+    /// Newest `limit` matching retained entries, in publication order (oldest first).
+    /// Filters under the history lock and clones only selected entries. `keep`
+    /// must not call a method that locks history; `unix_ts_for` is safe.
+    pub fn select_recent(
+        &self,
+        mut keep: impl FnMut(&BusSpot) -> bool,
+        limit: usize,
+    ) -> Vec<BusSpot> {
         let recent = self.recent.lock().expect("recent lock poisoned");
-        let skip = recent.len().saturating_sub(n);
-        recent.iter().skip(skip).cloned().collect()
+        let mut selected: Vec<_> = recent
+            .entries
+            .iter()
+            .rev()
+            .filter(|entry| keep(entry))
+            .take(limit)
+            .cloned()
+            .collect();
+        selected.reverse();
+        selected
     }
 
     /// Converts a spot's `sample_ts` (samples since session start) to a
@@ -212,7 +345,7 @@ impl SpotBus {
     }
 }
 
-/// Total spots a subscriber will never receive once disconnected right
+/// Total items (spots, or on the JSON channel spots and grades) a subscriber will never receive once disconnected right
 /// after a `Lagged(n)` error: `n` (already evicted from the channel) plus
 /// whatever's still retained in `rx`'s own buffer (`rx.len()`) that a
 /// caller choosing to disconnect (ARCHITECTURE §7: slow clients are
@@ -221,7 +354,7 @@ impl SpotBus {
 /// item counted, not just the evicted portion (round-9 review finding).
 /// Shared by the telnet, JSON/TCP, and WebSocket handlers so all three
 /// count loss the same way.
-pub fn total_lag_loss(n: u64, rx: &broadcast::Receiver<BusSpot>) -> u64 {
+pub fn total_lag_loss<T: Clone>(n: u64, rx: &broadcast::Receiver<T>) -> u64 {
     n + rx.len() as u64
 }
 
@@ -229,6 +362,66 @@ pub fn total_lag_loss(n: u64, rx: &broadcast::Receiver<BusSpot>) -> u64 {
 mod tests {
     use super::*;
     use manta_spot::SpotType;
+
+    fn live_bus() -> SpotBus {
+        SpotBus::new(96_000.0, SystemTime::UNIX_EPOCH, 1)
+    }
+
+    #[test]
+    fn live_subscribers_receive_live_lines_only() {
+        let bus = live_bus();
+        let mut live = bus.subscribe_live();
+        bus.publish(sample_spot(1));
+        bus.publish_grade(Arc::from("{\"kind\":\"spotGrade\"}"));
+        bus.publish_live(Arc::from("{\"kind\":\"bandState\"}"));
+        match live.try_recv() {
+            Ok(JsonItem::Live(line)) => assert_eq!(&*line, "{\"kind\":\"bandState\"}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(live.try_recv().is_err());
+    }
+
+    #[test]
+    fn spot_and_json_subscribers_never_receive_live_lines() {
+        let bus = live_bus();
+        let mut spots = bus.subscribe();
+        let mut json = bus.subscribe_json();
+        bus.publish_live(Arc::from("{}"));
+        assert!(spots.try_recv().is_err());
+        assert!(json.try_recv().is_err());
+    }
+
+    #[test]
+    fn live_receiver_count_follows_subscribers() {
+        let bus = live_bus();
+        assert_eq!(bus.live_receiver_count(), 0);
+        let a = bus.subscribe_live();
+        let b = bus.subscribe_live();
+        assert_eq!(bus.live_receiver_count(), 2);
+        drop(a);
+        assert_eq!(bus.live_receiver_count(), 1);
+        drop(b);
+        assert_eq!(bus.live_receiver_count(), 0);
+        let _json = bus.subscribe_json();
+        assert_eq!(bus.live_receiver_count(), 0);
+    }
+
+    #[test]
+    fn a_lagging_live_subscriber_is_told_to_disconnect_after_4096() {
+        let bus = live_bus();
+        let mut rx = bus.subscribe_live();
+        let published = LIVE_CHANNEL_CAPACITY + 10;
+        for i in 0..published {
+            bus.publish_live(Arc::from(format!("{i}")));
+        }
+        match rx.try_recv() {
+            Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                assert_eq!(n, 10);
+                assert_eq!(total_lag_loss(n, &rx), published as u64);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 
     fn sample_spot(sample_ts: u64) -> Spot {
         Spot {
@@ -317,6 +510,80 @@ mod tests {
             other => panic!("expected Lagged, got {other:?}"),
         };
         assert_eq!(total_lag_loss(n, &rx), total_published);
+    }
+
+    #[tokio::test]
+    async fn json_subscribers_receive_spots_and_grades_in_publish_order() {
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
+        let mut rx = bus.subscribe_json();
+
+        bus.publish(sample_spot(0));
+        bus.publish_grade(Arc::from("{\"kind\":\"spotGrade\",\"n\":1}"));
+        bus.publish(sample_spot(1));
+        bus.publish_grade(Arc::from("{\"kind\":\"spotGrade\",\"n\":2}"));
+
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(match rx.recv().await.unwrap() {
+                JsonItem::Spot(s) => format!("spot:{}", s.spot.sample_ts),
+                JsonItem::Grade(line) => format!("grade:{line}"),
+                JsonItem::Live(line) => format!("live:{line}"),
+            });
+        }
+        assert_eq!(
+            seen,
+            vec![
+                "spot:0".to_string(),
+                "grade:{\"kind\":\"spotGrade\",\"n\":1}".to_string(),
+                "spot:1".to_string(),
+                "grade:{\"kind\":\"spotGrade\",\"n\":2}".to_string(),
+            ]
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn spot_subscribers_never_receive_grades() {
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
+        let mut rx = bus.subscribe();
+
+        bus.publish_grade(Arc::from("{\"kind\":\"spotGrade\"}"));
+        bus.publish(sample_spot(7));
+        bus.publish_grade(Arc::from("{\"kind\":\"spotGrade\"}"));
+
+        assert_eq!(rx.recv().await.unwrap().spot.sample_ts, 7);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn with_no_grades_published_the_json_channel_carries_exactly_the_spots() {
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
+        let mut spots = bus.subscribe();
+        let mut json = bus.subscribe_json();
+
+        for i in 0..5u64 {
+            bus.publish(sample_spot(i));
+        }
+
+        for _ in 0..5 {
+            let a = spots.recv().await.unwrap();
+            let b = match json.recv().await.unwrap() {
+                JsonItem::Spot(s) => s,
+                JsonItem::Grade(line) | JsonItem::Live(line) => panic!("unexpected line {line}"),
+            };
+            assert_eq!(a.spot, b.spot);
+            assert_eq!(a.occurrence_count, b.occurrence_count);
+        }
+        assert!(matches!(
+            json.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
@@ -491,5 +758,131 @@ mod tests {
         let b = SpotBus::new(1000.0, epoch, 222);
         assert_ne!(a.session_nonce(), b.session_nonce());
         assert_eq!(a.unix_ts_for(0), b.unix_ts_for(0));
+    }
+
+    fn retained_times(bus: &SpotBus) -> Vec<u64> {
+        bus.recent(usize::MAX)
+            .iter()
+            .map(|e| e.spot.sample_ts)
+            .collect()
+    }
+
+    #[test]
+    fn history_keeps_every_spot_heard_within_the_window() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0);
+        for ts in 0..3600 {
+            bus.publish(sample_spot(ts));
+        }
+        assert_eq!(retained_times(&bus), (1799..3600).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn history_never_drops_below_the_fifty_newest_spots() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0).with_history_minutes(1);
+        for ts in 0..60 {
+            bus.publish(sample_spot(ts * 3600));
+        }
+        assert_eq!(
+            retained_times(&bus),
+            (10..60).map(|ts| ts * 3600).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn zero_minutes_keeps_exactly_the_fifty_newest_like_before_man93() {
+        for spacing in [0, 1] {
+            let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0).with_history_minutes(0);
+            for i in 0..60 {
+                let mut spot = sample_spot(i * spacing);
+                spot.track_id = i as u32;
+                assert_eq!(bus.publish(spot), 0);
+            }
+            assert_eq!(
+                bus.recent(usize::MAX)
+                    .iter()
+                    .map(|e| e.spot.track_id)
+                    .collect::<Vec<_>>(),
+                (10..60).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn history_is_capped_at_the_ceiling_and_publish_reports_in_window_evictions() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0);
+        let mut truncated = 0;
+        for i in 0..MAX_HISTORY_SPOTS + 5 {
+            let mut spot = sample_spot(1);
+            spot.track_id = i as u32;
+            truncated += bus.publish(spot);
+        }
+        let entries = bus.recent(usize::MAX);
+        assert_eq!(entries.len(), MAX_HISTORY_SPOTS);
+        assert_eq!(entries[0].spot.track_id, 5);
+        assert_eq!(truncated, 5);
+    }
+
+    #[test]
+    fn ageing_out_of_the_window_is_not_reported_as_truncation() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0);
+        for i in 0..100 {
+            assert_eq!(bus.publish(sample_spot(i * 600)), 0);
+        }
+        assert_eq!(bus.recent(usize::MAX).len(), MIN_HISTORY_SPOTS);
+    }
+
+    #[test]
+    fn an_out_of_order_publish_never_evicts_an_entry_inside_the_window() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0).with_history_minutes(1);
+        for ts in 100..200 {
+            bus.publish(sample_spot(ts));
+        }
+        bus.publish(sample_spot(0));
+        assert_eq!(
+            retained_times(&bus),
+            (139..200).chain([0]).collect::<Vec<_>>()
+        );
+        bus.publish(sample_spot(200));
+        assert_eq!(
+            retained_times(&bus),
+            (140..200).chain([0, 200]).collect::<Vec<_>>()
+        );
+        // The high-water mark cannot move backwards on a late publish.
+        assert_eq!(bus.recent.lock().unwrap().newest_sample_ts, 200);
+    }
+
+    #[test]
+    fn select_recent_returns_the_newest_matching_entries_oldest_first() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0);
+        for ts in 0..10 {
+            bus.publish(sample_spot(ts));
+        }
+        let even = |entry: &BusSpot| entry.spot.sample_ts.is_multiple_of(2);
+        let selected = bus.select_recent(even, 3);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|e| e.spot.sample_ts)
+                .collect::<Vec<_>>(),
+            [4, 6, 8]
+        );
+        assert!(bus.select_recent(even, 0).is_empty());
+        assert_eq!(
+            bus.select_recent(even, 100)
+                .iter()
+                .map(|e| e.spot.sample_ts)
+                .collect::<Vec<_>>(),
+            [0, 2, 4, 6, 8]
+        );
+    }
+
+    #[test]
+    fn new_defaults_to_thirty_minutes_and_huge_values_do_not_panic() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0);
+        assert_eq!(bus.history_minutes(), DEFAULT_HISTORY_MINUTES);
+        assert_eq!(DEFAULT_HISTORY_MINUTES, 30);
+        let bus = bus.with_history_minutes(u32::MAX);
+        bus.publish(sample_spot(u64::MAX));
+        assert_eq!(bus.recent(1).len(), 1);
     }
 }

@@ -5,7 +5,7 @@ use crate::proto::{design_prototype, TAPS_PER_BRANCH};
 use coppa_dsp::fft::FftProcessor;
 use num_complex::{Complex32, Complex64};
 
-const CHANNEL_SPACING_HZ: f64 = 93.75; // SPEC §1.1
+pub const CHANNEL_SPACING_HZ: f64 = 93.75; // SPEC §1.1
 /// SPEC §1.3/§1.4 power-to-dB epsilon.
 const POWER_DB_EPSILON: f64 = 1e-20;
 

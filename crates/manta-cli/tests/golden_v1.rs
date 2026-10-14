@@ -1,7 +1,8 @@
 //! SPEC §7 V1 golden gate: 120 s, 20 WPM, +20 dB, offset +12.34 kHz, W1AW.
-//! Pass criteria: char accuracy >= 98 % (SPEC's original 100% is
-//! structurally unreachable under SPEC §2.1's mandatory warmup floor --
-//! see the CER assertion below); 1 track; freq error <= 10 Hz (SPEC's
+//! Pass criteria: char accuracy >= 98 % (SPEC's original 100% was
+//! structurally unreachable under the old 2 s warmup floor, and the first
+//! character still decodes from mid-element -- see the CER assertion
+//! below); 1 track; freq error <= 10 Hz (SPEC's
 //! original value, re-measured and reverted in Task 11 Step 2 -- see the
 //! freq-error assertion below).
 
@@ -25,14 +26,15 @@ fn v1_passes_end_to_end_from_wav() {
     );
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
 
-    // char accuracy: SPEC §2.1's ~2.05 s mandatory warmup(750 hops)+
-    // confirm(19 hops) floor deterministically loses this 120 s scene's
-    // leading "CQ " before the real detector ever promotes a track -- not a
-    // bug, same structural cause (and same measured value) as
-    // `track.rs::active_track_decodes_real_text`'s `CER < 0.02` (both decode
-    // this exact V1 vector). Measured empirically (Task 11 Step 0): CER =
-    // 0.015463917525773196. See
-    // docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md.
+    // char accuracy: under the old ~2.05 s warmup(750 hops)+confirm(19
+    // hops) floor this 120 s scene lost its leading "CQ " before the
+    // detector promoted a track (Task 11 Step 0: CER 0.0155, see
+    // docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md).
+    // MAN-115 (25 ms warmup after the pre-roll, SPEC §2.2 "Startup")
+    // promotes at 0.072 s; only the first character, keyed before
+    // promotion, still decodes wrong ("FQ CQ DE ..."), so the measured CER
+    // is now ~0.005. The 0.02 bound is kept, not tightened. See
+    // docs/DECISIONS/2026-10-11-man115-startup-latency.md.
     let decoded = report["text"].as_str().unwrap();
     let cer_val = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
     assert!(
@@ -42,6 +44,11 @@ fn v1_passes_end_to_end_from_wav() {
         decoded
     );
 
+    // MAN-115: this reads the LAST `TrackMeta`'s centroid, a single draw
+    // whose phase moves with the promotion hop (9.89 Hz at 0, 10 and 25 ms
+    // warmup, 11.34 Hz at 40-75 ms). 25 ms was picked partly to keep it;
+    // see docs/DECISIONS/2026-10-11-man115-startup-latency.md F4.
+    //
     // freq error <= 10 Hz (SPEC's original value, fully reverted from M2
     // sub-project 1's 25 Hz widening). Task 9's EMA-based `Track::center`
     // freq estimate (replacing a lifetime power-weighted mean) closed the

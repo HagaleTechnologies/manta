@@ -88,6 +88,9 @@ async fn startup_log_announces_the_dry_run_default_and_how_to_disable_it() {
         "no instruction for how to disable it: {out}"
     );
     assert!(out.contains("INFO"), "expected info level: {out}");
+    // MAN-90: the dry-run INFO line, which the node guide quotes verbatim,
+    // stays unchanged.
+    assert!(!out.contains("experimental"), "{out}");
 }
 
 #[tokio::test]
@@ -97,6 +100,11 @@ async fn startup_log_warns_when_the_operator_has_opted_into_transmitting() {
     assert!(out.contains("transmitting real spots"), "{out}");
     // MAN-91: the line names which spot types this target is sent.
     assert!(out.contains("spot_types=cq_beacon"), "{out}");
+    // MAN-90: the live line also says the protocol is unverified.
+    assert!(
+        out.contains(manta_server::uplink::EXPERIMENTAL_NOTICE),
+        "{out}"
+    );
 }
 
 #[tokio::test]

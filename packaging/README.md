@@ -24,10 +24,13 @@ there.
   every build supports and which needs no device permissions. An HPSDR
   radio on the network works the same way. None of the recipes gives manta
   access to a local sound card or USB SDR. Release binaries include
-  KiwiSDR and HPSDR support, not SoapySDR.
+  KiwiSDR and HPSDR support, not SoapySDR. Before you run the service against a receiver you don't own, read [the KiwiSDR guide](../docs/GUIDES/kiwisdr.md).
 - **Linux:** the binary needs the ALSA runtime library even when it never
   opens a sound card: `sudo apt install libasound2` on Debian, Ubuntu and
-  Raspberry Pi OS (`libasound2t64` on Debian 13).
+  Raspberry Pi OS (`libasound2t64` on Debian 13). Without it, `./manta`
+  does not start at all and the system prints
+  `error while loading shared libraries: libasound.so.2: cannot open shared object file`;
+  see [setup-checks](https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/setup-checks.md#manta-will-not-start-at-all).
 - **macOS:** release binaries are not signed or notarized. If macOS
   refuses to run `./manta` because it was downloaded from the internet,
   clear the flag with `xattr -d com.apple.quarantine ./manta`.
@@ -49,7 +52,9 @@ Copy the example, replace N0CALL with your station callsign, and configure your 
 **Station.** Under `[server]`, edit the active `station_callsign = "N0CALL"`
 line, not the commented reference line above it. Your call is sent as the
 spotter of every spot; an RBN SSID such as `-1` is allowed. The
-`operator_*` lines are optional.
+`operator_*` lines are optional. Set `operator_grid` (or `operator_lat` and
+`operator_lon`) to put your station's position on JSON spots; without it
+they carry none.
 
 **Receiver.** For a KiwiSDR, find these lines in the `[input]` table that
 is already in the file, delete the `#` at the start of each, and edit the
@@ -83,15 +88,30 @@ the setting, including any `<...>` example value you uncommented but did
 not edit. It does not contact the receiver: a wrong host name or port
 shows up only when manta runs.
 
+Then check the machine and the receiver together:
+
+```sh
+./manta doctor --config manta.toml
+```
+
+It checks that the server ports are free, the clock against an NTP server,
+each enabled uplink target, and that the receiver opens and hears
+something, printing `PASS`, `WARN`, `FAIL` or `SKIP` with a fix for every
+problem, and exits 1 when a check fails. Run it before you install the
+service, not while it runs. See
+[setup-checks](https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/setup-checks.md).
+
 **Uplinks.** Leave the `[[rbn_uplink]]` block commented out. If you enable
 an uplink later, `dry_run` defaults to `true`: it connects and logs in but
-sends no spots until you set `dry_run = false`.
+sends no spots until you set `dry_run = false`. The uplink is experimental:
+its login and spot format are unverified against RBN's real ingest. To reach
+RBN, let an RBN Aggregator read the telnet server.
 
 **If `N0CALL` is left in place**, manta refuses to start:
 
 ```console
 $ ./manta run --config manta.toml
-Error: manta.toml: server.station_callsign is still the example "N0CALL" -- set your own callsign
+error: manta.toml: server.station_callsign is still the example "N0CALL" -- set your own callsign
 ```
 
 It exits with status 1 before it opens the receiver or any listener;
@@ -138,6 +158,15 @@ verify` must report no errors for the unit.
   made each time the service starts: after editing
   `/etc/manta/manta.toml`, run the `config check` line again, then
   `sudo systemctl restart manta`.
+- **Changing lists without a restart.** `sudo systemctl reload manta`
+  sends SIGHUP, which re-reads the `[spot]` lists and each
+  `[[rbn_uplink]]` `dry_run` while clients, the `sh/dx` history and
+  uplink connections stay up (MAN-78). It re-reads the start-time
+  credential copy of the config, so it picks up edits to the
+  `blocklist_path` and `notch_path` files, which the config names by
+  absolute path; an edit to `/etc/manta/manta.toml` itself still needs a
+  restart. `journalctl -u manta` shows `reload: applied` or
+  `reload: rejected` with the reason; a rejected reload changes nothing.
 - **Absolute paths.** manta resolves a relative path in the config against
   the config's directory, and at run time that is the credentials
   directory, not `/etc/manta`. Give `path` under `[input]`, and
@@ -234,8 +263,8 @@ each file.
   larger than 10 MiB, it keeps the final 1 MiB in place: it copies that
   tail to a temporary file in the same directory, overwrites the log with
   it, and removes the temporary file. The log keeps its inode because
-  manta never reopens its stdout and stderr, and SIGHUP shuts manta down
-  instead of reopening anything. A rename-based rotator such as newsyslog
+  manta never reopens its stdout and stderr, and SIGHUP reloads the
+  `[spot]` lists (MAN-78) instead of reopening anything. A rename-based rotator such as newsyslog
   would leave manta writing to the renamed file. Limits: the log can grow
   past 10 MiB between runs, or while the job cannot run, and lines manta
   writes during the copy can be lost. This is operational log retention,
@@ -331,8 +360,59 @@ is invalid.
   and keeps 3 files (`max-size: "10m"`, `max-file: "3"`), about 30 MB in
   all. `RUST_LOG=info` sets the log level. For JSON log lines, append
   `"--log-format", "json"` to `command:`.
+- **Health.** The image carries a `HEALTHCHECK` that runs
+  `manta health --config "${MANTA_CONFIG:-/etc/manta/manta.toml}"` inside
+  the container every 10 seconds. `manta health` reads the same config the
+  daemon runs, with the same `MANTA_SERVER_*` overrides, asks the daemon's
+  own `/healthz`, and exits 0 or 1. It re-reads `manta.toml` at every check,
+  and `metrics_port` and `metrics_bind_addr` take effect only after a
+  restart, so restart the container after editing them; until then the
+  check dials the new address, where the daemon may not be listening. An
+  edit after which `manta.toml` no longer loads, or has no `[server]`
+  table, also fails the check until it is fixed. `docker ps` shows
+  `(health: starting)` for up to 60 seconds after start (long enough for a
+  KiwiSDR to connect), then `(healthy)`, or `(unhealthy)` after three
+  failed checks in a row.
+  `docker inspect --format '{{json .State.Health.Log}}' <container>` shows
+  the daemon's own reasons, such as `decode: stalled 12s`. The check runs
+  inside the container, so `metrics_bind_addr` can stay `127.0.0.1`; it
+  costs 6 of the metrics listener's 60 requests a minute per address. The
+  RBN uplink is not part of the verdict: `manta status` reports it. A
+  container started for something other than the daemon (`decode`, or
+  `listen` without a config) has nothing to probe and shows `(unhealthy)`.
+  Turn the check off for those with `docker run --no-healthcheck`, or with
+  `healthcheck: disable: true` under the service in Compose.
 - **Not enabled.** No device passthrough, privileged mode or host
   networking: use a network receiver.
+
+### Without Compose
+
+With no arguments, the image runs the daemon from a config mounted at
+`/etc/manta/manta.toml`:
+
+```sh
+docker run -d --name manta --restart unless-stopped --stop-timeout 60 --mount type=bind,src="$PWD/manta.toml",dst=/etc/manta/manta.toml,readonly -p 7300:7300 -p 7301:7301 ghcr.io/hagaletechnologies/manta:latest
+docker logs -f manta
+docker ps    # STATUS shows (healthy) once the daemon answers
+```
+
+- Use `--mount`, not `-v`. When `manta.toml` is missing on the host,
+  `--mount` refuses to start the container. `-v` creates an empty
+  directory in its place instead, which manta then reports as
+  `Is a directory (os error 21)` and exits.
+- `--stop-timeout 60` gives manta's 50-second client drain time to finish
+  before Docker's SIGKILL, as `stop_grace_period` does in Compose.
+- To mount the config somewhere else, also set `MANTA_CONFIG` to that
+  path (`-e MANTA_CONFIG=/config/manta.toml`): the daemon and the health
+  check both read it. Passing `run --config <path>` as arguments works for
+  the daemon, but the health check still reads `/etc/manta/manta.toml`.
+- With no config mounted and no `MANTA_CONFIG`, the container prints
+  `manta --help` and exits 0. Any arguments run `manta <arguments>`
+  unchanged, for example
+  `docker run --rm ghcr.io/hagaletechnologies/manta:latest --version`.
+- The image is built for `linux/amd64`, `linux/arm64` and `linux/arm/v7`
+  (32-bit Raspberry Pi OS). The `linux/arm/v7` image's decode CPU budget
+  is unmeasured.
 
 ## Windows
 
@@ -352,6 +432,9 @@ accepts connections only from the same machine
 `curl -s http://127.0.0.1:7302/healthz` on that machine reports the node's
 health. Read [network-exposure.md](../docs/RUNBOOKS/network-exposure.md)
 before you change either address.
+
+For a Grafana dashboard and Prometheus alerts, see
+[monitoring](https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md).
 
 ## Upgrading or reinstalling
 

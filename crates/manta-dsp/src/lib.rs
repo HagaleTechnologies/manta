@@ -5,11 +5,16 @@
 //! FFT-peak frequency estimator. `channelizer` is the M2 full N-channel WOLA
 //! polyphase filterbank (SPEC §1.1-1.3) that supersedes `single`/`freqest`.
 //! `refine` is decode-core-v2 §3's optional per-track narrowband refiner.
+//! `carrier` is the narrowband carrier-frequency estimator behind frequency calibration.
+//! `crash` is MAN-312's band-wide static-crash detector (SPEC §2.7).
 
+pub mod carrier;
 pub mod channelizer;
+pub mod crash;
 pub mod decimate;
 pub mod floor;
 pub mod freqest;
+pub mod fsk;
 pub mod hilbert;
 pub mod proto;
 pub mod refine;

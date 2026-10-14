@@ -15,15 +15,17 @@ use manta_decode::config_file::DecodeConfigToml;
 use manta_decode::decoder::DecodeConfig;
 use manta_engine::config_file::DetectorConfigToml;
 use manta_engine::DetectorConfig;
-use manta_server::config::{RbnUplinkConfig, ServerConfig};
+use manta_server::config::{RbnCompareConfig, RbnUplinkConfig, ServerConfig};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 /// Every top-level table manta reads. Adding a table means adding it here.
 pub(crate) const KNOWN_TABLES: &[&str] = &[
     "server",
     "rbn_uplink",
+    "rbn_compare",
     "input",
     "spot",
     "detector",
@@ -48,6 +50,7 @@ const ENV_PREFIX: &str = "MANTA_";
 pub(crate) const ENV_CONFIG: &str = "MANTA_CONFIG";
 const ENV_TABLES: &[(&str, &str)] = &[
     ("SERVER_", "server"),
+    ("RBN_COMPARE_", "rbn_compare"),
     ("INPUT_", "input"),
     ("SPOT_", "spot"),
     ("DETECTOR_", "detector"),
@@ -63,20 +66,28 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("server", "station_callsign"),
     ("server", "bind_addr"),
     ("server", "metrics_bind_addr"),
+    ("server", "live_bind_addr"),
     ("server", "operator_name"),
     ("server", "operator_qth"),
     ("server", "operator_grid"),
+    ("rbn_compare", "feed_host"),
+    ("rbn_compare", "login_callsign"),
     ("input", "type"),
     ("input", "device"),
     ("input", "path"),
     ("input", "host"),
     ("input", "password"),
     ("input", "driver"),
+    ("input", "group"),
+    ("input", "interface"),
     ("spot", "blocklist_path"),
     ("spot", "notch_path"),
     ("spot", "cty_path"),
     ("spot", "scp_path"),
+    ("spot", "pattern_path"),
+    ("spot", "validation_level"),
     ("decode", "engine"),
+    ("detector", "crash_filter"),
 ];
 
 /// Whether `load` applies the `MANTA_*` overlay. `decode`/`oracle` pass
@@ -94,6 +105,11 @@ pub(crate) struct Loaded {
     pub origin: String,
     pub server: Option<ServerConfig>,
     pub rbn_uplink: Vec<RbnUplinkConfig>,
+    /// MAN-301: `[rbn_compare]` as written, validated (`None` when the
+    /// table is absent). Present even when `enabled = false`: `manta grade
+    /// --config` reads its tolerances. `run` merges `--rbn-compare`/
+    /// `--rbn-spotter` over it in `resolve`.
+    pub rbn_compare: Option<RbnCompareConfig>,
     pub decode: DecodeConfig,
     pub detector: DetectorConfig,
     pub spot: SpotFile,
@@ -106,6 +122,9 @@ pub(crate) struct Loaded {
     pub raw: toml::Table,
     /// The `MANTA_<TABLE>_<KEY>` variables the overlay applied, sorted.
     pub env_vars: Vec<String>,
+    /// Stderr notes about the file itself (an inert table), printed by the
+    /// caller with `resolve`'s merge notes.
+    pub notes: Vec<String>,
 }
 
 /// `[spot]`, with relative file paths already resolved (file values against
@@ -117,6 +136,8 @@ pub(crate) struct SpotFile {
     pub notch_path: Option<PathBuf>,
     pub cty_path: Option<PathBuf>,
     pub scp_path: Option<PathBuf>,
+    pub pattern_path: Option<PathBuf>,
+    pub validation_level: manta_spot::ValidationLevel,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -127,6 +148,23 @@ struct SpotToml {
     notch_path: Option<PathBuf>,
     cty_path: Option<PathBuf>,
     scp_path: Option<PathBuf>,
+    pattern_path: Option<PathBuf>,
+    #[serde(default, deserialize_with = "deserialize_validation_level")]
+    validation_level: manta_spot::ValidationLevel,
+}
+
+fn deserialize_validation_level<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<manta_spot::ValidationLevel, D::Error> {
+    let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+    match value.as_str() {
+        "minimal" => Ok(manta_spot::ValidationLevel::Minimal),
+        "normal" => Ok(manta_spot::ValidationLevel::Normal),
+        _ => Err(serde::de::Error::unknown_variant(
+            &value,
+            &["minimal", "normal"],
+        )),
+    }
 }
 
 /// `input.type` (D5).
@@ -138,6 +176,7 @@ pub(crate) enum InputKind {
     Kiwi,
     Soapy,
     Hpsdr,
+    Ka9q,
 }
 
 impl InputKind {
@@ -148,6 +187,7 @@ impl InputKind {
             InputKind::Kiwi => "kiwi",
             InputKind::Soapy => "soapy",
             InputKind::Hpsdr => "hpsdr",
+            InputKind::Ka9q => "ka9q",
         }
     }
 
@@ -155,10 +195,11 @@ impl InputKind {
     pub(crate) fn keys(self) -> &'static [&'static str] {
         match self {
             InputKind::Audio => &["device"],
-            InputKind::File => &["path", "iq"],
+            InputKind::File => &["path", "iq", "realtime", "loop"],
             InputKind::Kiwi => &["host", "port", "freq_hz", "password"],
             InputKind::Soapy => &["driver", "freq_hz", "rate_hz", "gain_db"],
             InputKind::Hpsdr => &["host", "port", "freq_hz", "rate_hz"],
+            InputKind::Ka9q => &["group", "port", "ssrc", "interface"],
         }
     }
 }
@@ -171,6 +212,9 @@ struct InputToml {
     device: Option<String>,
     path: Option<PathBuf>,
     iq: Option<bool>,
+    realtime: Option<bool>,
+    #[serde(rename = "loop")]
+    looped: Option<bool>,
     host: Option<String>,
     port: Option<u16>,
     freq_hz: Option<f64>,
@@ -178,6 +222,11 @@ struct InputToml {
     driver: Option<String>,
     rate_hz: Option<f64>,
     gain_db: Option<f64>,
+    group: Option<String>,
+    // i64, not u32, so a negative or too-large value gets the range message
+    // rather than serde's.
+    ssrc: Option<i64>,
+    interface: Option<String>,
     // Shared keys, valid with any (or no) type.
     freq_correction_ppm: Option<f64>,
     center_freq_hz: Option<f64>,
@@ -206,9 +255,13 @@ pub(crate) enum SourceFromFile {
     Audio {
         device: Option<String>,
     },
+    /// `realtime`/`looped` are MAN-269's paced and looping replay; `run`
+    /// applies them, `soak`/`doctor` ignore them with a note.
     File {
         path: PathBuf,
         iq: bool,
+        realtime: bool,
+        looped: bool,
     },
     Kiwi {
         host: String,
@@ -228,6 +281,14 @@ pub(crate) enum SourceFromFile {
         freq_hz: f64,
         rate_hz: f64,
     },
+    /// MAN-140: one ka9q-radio (radiod) IQ channel. `group` passed
+    /// `check_group` at load; a host name is resolved at open.
+    Ka9q {
+        group: String,
+        port: u16,
+        ssrc: Option<u32>,
+        interface: Option<Ipv4Addr>,
+    },
 }
 
 impl SourceFromFile {
@@ -238,6 +299,7 @@ impl SourceFromFile {
             SourceFromFile::Kiwi { .. } => InputKind::Kiwi,
             SourceFromFile::Soapy { .. } => InputKind::Soapy,
             SourceFromFile::Hpsdr { .. } => InputKind::Hpsdr,
+            SourceFromFile::Ka9q { .. } => InputKind::Ka9q,
         }
     }
 }
@@ -269,12 +331,31 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
     reject_constant_only_keys(&doc, &origin)?;
 
     let server = take_typed::<ServerConfig>(&doc, "server", &origin, &overlay)?;
+    // MAN-138: the location keys' cross-key rules, before any source or
+    // listener opens (the same point `[input]`'s `validate_input` runs).
+    if let Some(s) = &server {
+        s.station_location()
+            .map_err(|e| anyhow!("{origin}: [server]: {e}{}", overlay.suffix("server")))?;
+    }
     let rbn_uplink = take_uplinks(&doc, &origin)?;
     if !rbn_uplink.is_empty() && server.is_none() {
         bail!(
             "{origin}: [[rbn_uplink]] needs a [server] table (the uplink forwards the spots \
              the servers publish)"
         );
+    }
+    let mut notes = Vec::new();
+    let rbn_compare = take_typed::<RbnCompareConfig>(&doc, "rbn_compare", &origin, &overlay)?;
+    if let Some(rc) = &rbn_compare {
+        rc.validate()
+            .map_err(|e| anyhow!("{origin}: {e}{}", overlay.suffix("rbn_compare")))?;
+        match &server {
+            None if rc.enabled => bail!("{}", rbn_compare_needs_server(&origin)),
+            None => notes.push(RBN_COMPARE_INERT_NOTE.to_string()),
+            Some(s) => rc
+                .check_spotters_against_station(&s.station_callsign)
+                .map_err(|e| anyhow!("{origin}: {e}{}", overlay.suffix("rbn_compare")))?,
+        }
     }
     let decode_toml =
         take_typed::<DecodeConfigToml>(&doc, "decode", &origin, &overlay)?.unwrap_or_default();
@@ -306,6 +387,10 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         scp_path: spot_toml
             .scp_path
             .map(|p| resolve_path("spot", "scp_path", p)),
+        pattern_path: spot_toml
+            .pattern_path
+            .map(|p| resolve_path("spot", "pattern_path", p)),
+        validation_level: spot_toml.validation_level,
     };
     let input_toml = take_typed::<InputToml>(&doc, "input", &origin, &overlay)?.unwrap_or_default();
     let input = validate_input(input_toml, &|p| resolve_path("input", "path", p))
@@ -317,6 +402,7 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         origin,
         server,
         rbn_uplink,
+        rbn_compare,
         decode,
         detector,
         spot,
@@ -324,7 +410,34 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         present: doc.keys().cloned().collect(),
         raw: doc,
         env_vars,
+        notes,
     })
+}
+
+/// MAN-301: an enabled `[rbn_compare]` (from the file, the environment or
+/// `--rbn-compare`) without `[server]`.
+pub(crate) fn rbn_compare_needs_server(origin: &str) -> String {
+    format!(
+        "{origin}: [rbn_compare] needs a [server] table (grades are published on the JSON \
+         stream and /metrics, which only the daemon runs)"
+    )
+}
+
+/// MAN-301: a disabled `[rbn_compare]` without `[server]` is inert.
+pub(crate) const RBN_COMPARE_INERT_NOTE: &str = "note: [rbn_compare] is off and ignored";
+
+/// `check_top_level`'s list of the tables manta reads, built from
+/// `KNOWN_TABLES` so a new table cannot drift it. `rbn_uplink` is an array
+/// of tables, so it keeps its double brackets.
+fn known_tables_list() -> String {
+    KNOWN_TABLES
+        .iter()
+        .map(|t| match *t {
+            "rbn_uplink" => format!("[[{t}]]"),
+            _ => format!("[{t}]"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn read_doc(p: &Path) -> Result<toml::Table> {
@@ -357,8 +470,8 @@ fn check_top_level(doc: &toml::Table, origin: &str) -> Result<()> {
                 .map(|known| format!(" (did you mean [{known}]?)"))
                 .unwrap_or_default();
             bail!(
-                "unrecognized table [{key}] in {origin}{suggestion} -- manta reads [server], \
-                 [[rbn_uplink]], [input], [spot], [detector], [decode]"
+                "unrecognized table [{key}] in {origin}{suggestion} -- manta reads {}",
+                known_tables_list()
             );
         }
         match (key.as_str(), value) {
@@ -432,6 +545,31 @@ fn finite_positive(key: &str, v: f64) -> std::result::Result<f64, String> {
     Ok(v)
 }
 
+/// MAN-140 D16: `input.group` is an IPv4 multicast literal or a host name,
+/// checked without resolving it. `check_group`'s IPv6 message is a full
+/// clause of its own, so it follows a colon; the other reads on from the key.
+fn check_ka9q_group(group: String) -> std::result::Result<String, String> {
+    match manta_input::ka9q::check_group(&group) {
+        Ok(()) => Ok(group),
+        Err(msg) if msg.starts_with("IPv6") => Err(format!("input.group: {msg}")),
+        Err(msg) => Err(format!("input.group {msg}")),
+    }
+}
+
+/// `input.ssrc`: an RTP SSRC, 32 bits unsigned.
+fn check_ka9q_ssrc(ssrc: i64) -> std::result::Result<u32, String> {
+    u32::try_from(ssrc)
+        .map_err(|_| format!("input.ssrc must be between 0 and {}, got {ssrc}", u32::MAX))
+}
+
+/// `input.interface`: the local IPv4 address to join the group on; an
+/// interface name is not accepted.
+fn check_ka9q_interface(interface: &str) -> std::result::Result<Ipv4Addr, String> {
+    interface
+        .parse()
+        .map_err(|_| format!("input.interface must be an IPv4 address, got {interface}"))
+}
+
 /// D5: type/key consistency, required keys, and the same value checks the
 /// equivalent CLI flags apply.
 fn validate_input(
@@ -456,10 +594,12 @@ fn validate_input(
             .map(|v| crate::check_replay_epoch("input.replay_epoch", v))
             .transpose()?,
     };
-    let set: [(&str, bool); 10] = [
+    let set: [(&str, bool); 15] = [
         ("device", t.device.is_some()),
         ("path", t.path.is_some()),
         ("iq", t.iq.is_some()),
+        ("realtime", t.realtime.is_some()),
+        ("loop", t.looped.is_some()),
         ("host", t.host.is_some()),
         ("port", t.port.is_some()),
         ("freq_hz", t.freq_hz.is_some()),
@@ -467,11 +607,14 @@ fn validate_input(
         ("driver", t.driver.is_some()),
         ("rate_hz", t.rate_hz.is_some()),
         ("gain_db", t.gain_db.is_some()),
+        ("group", t.group.is_some()),
+        ("ssrc", t.ssrc.is_some()),
+        ("interface", t.interface.is_some()),
     ];
     let Some(kind) = t.kind else {
         if let Some((key, _)) = set.iter().find(|(_, is_set)| *is_set) {
             return Err(format!(
-                "input.{key} needs input.type (one of audio, file, kiwi, soapy, hpsdr)"
+                "input.{key} needs input.type (one of audio, file, kiwi, soapy, hpsdr, ka9q)"
             ));
         }
         return Ok(InputFile {
@@ -505,6 +648,8 @@ fn validate_input(
         InputKind::File => SourceFromFile::File {
             path: resolve_path(req(t.path.clone(), "path", name)?),
             iq: t.iq.unwrap_or(false),
+            realtime: t.realtime.unwrap_or(false),
+            looped: t.looped.unwrap_or(false),
         },
         InputKind::Kiwi => SourceFromFile::Kiwi {
             port: port(8073)?,
@@ -528,6 +673,16 @@ fn validate_input(
             host: req(t.host.clone(), "host", name)?,
             freq_hz: crate::check_hpsdr_freq_hz("input.freq_hz", req(t.freq_hz, "freq_hz", name)?)?,
             rate_hz: crate::check_hpsdr_rate_hz("input.rate_hz", req(t.rate_hz, "rate_hz", name)?)?,
+        },
+        InputKind::Ka9q => SourceFromFile::Ka9q {
+            port: port(manta_input::ka9q::wire::DATA_PORT)?,
+            group: check_ka9q_group(req(t.group.clone(), "group", name)?)?,
+            ssrc: t.ssrc.map(check_ka9q_ssrc).transpose()?,
+            interface: t
+                .interface
+                .as_deref()
+                .map(check_ka9q_interface)
+                .transpose()?,
         },
     };
     Ok(InputFile {
@@ -583,7 +738,7 @@ fn apply_env_overlay(doc: &mut toml::Table, vars: &[(OsString, OsString)]) -> Re
         }) else {
             bail!(
                 "unrecognized environment variable {name} (manta reads {ENV_CONFIG} and \
-                 MANTA_<SERVER|INPUT|SPOT|DETECTOR|DECODE>_<KEY>)"
+                 MANTA_<SERVER|RBN_COMPARE|INPUT|SPOT|DETECTOR|DECODE>_<KEY>)"
             );
         };
         let Some(value) = value.to_str() else {
@@ -665,6 +820,43 @@ fn levenshtein(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pattern_validation_level_accepts_minimal_and_rejects_unknown() {
+        let loaded = load_file("[spot]\nvalidation_level = 'minimal'\n").unwrap();
+        assert_eq!(
+            loaded.spot.validation_level,
+            manta_spot::ValidationLevel::Minimal
+        );
+        let err = err_of("[spot]\nvalidation_level = 'strict'\n");
+        assert!(err.contains("minimal") && err.contains("normal"), "{err}");
+    }
+
+    #[test]
+    fn pattern_settings_env_override_file_and_file_paths_are_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manta.toml");
+        std::fs::write(
+            &path,
+            "[spot]\nvalidation_level = 'normal'\npattern_path = 'patterns.lst'\n",
+        )
+        .unwrap();
+        let env = vars(&[
+            ("MANTA_SPOT_VALIDATION_LEVEL", "minimal"),
+            ("MANTA_SPOT_PATTERN_PATH", "2026"),
+        ]);
+        let loaded = load(Some(&path), Env::Read(&env)).unwrap();
+        assert_eq!(
+            loaded.spot.validation_level,
+            manta_spot::ValidationLevel::Minimal
+        );
+        assert_eq!(loaded.spot.pattern_path, Some(PathBuf::from("2026")));
+        let loaded = load(Some(&path), Env::Ignore).unwrap();
+        assert_eq!(
+            loaded.spot.pattern_path,
+            Some(dir.path().join("patterns.lst"))
+        );
+    }
 
     #[test]
     fn env_cty_and_scp_paths_are_string_typed_and_cwd_relative() {
@@ -792,6 +984,82 @@ mod tests {
         assert!(err.contains(&f.path().display().to_string()), "{err}");
     }
 
+    /// MAN-324: the live-state keys get `MANTA_SERVER_*` variables from
+    /// the generic overlay, and the environment beats the file.
+    #[test]
+    fn manta_server_live_port_overrides_the_file() {
+        let body = format!("{SERVER}live_port = 7303\nlive_bind_addr = \"127.0.0.1\"\n");
+        for raw in ["0.0.0.0", "0", "true"] {
+            let loaded = load_env(
+                Some(&body),
+                &[
+                    ("MANTA_SERVER_LIVE_PORT", "17303"),
+                    ("MANTA_SERVER_LIVE_BIND_ADDR", raw),
+                ],
+            )
+            .unwrap_or_else(|err| panic!("live_bind_addr={raw}: {err:#}"));
+            let server = loaded.server.unwrap();
+            assert_eq!(server.live_port, Some(17303));
+            assert_eq!(server.live_bind_addr, raw);
+        }
+    }
+
+    /// MAN-138: the numeric location keys load from the file and from
+    /// `MANTA_SERVER_*`, TOML-probed like every other number.
+    #[test]
+    fn server_location_keys_load_from_the_file_and_the_environment() {
+        let body = format!("{SERVER}operator_lat = 41.714775\n");
+        let loaded = load_env(Some(&body), &[("MANTA_SERVER_OPERATOR_LON", "-72.72726")]).unwrap();
+        let server = loaded.server.unwrap();
+        assert_eq!(server.operator_lat, Some(41.714775));
+        assert_eq!(server.operator_lon, Some(-72.72726));
+
+        let loaded = load_env(
+            Some(SERVER),
+            &[
+                ("MANTA_SERVER_OPERATOR_LAT", "41"),
+                ("MANTA_SERVER_OPERATOR_LON", "-72.72726"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(loaded.server.unwrap().operator_lat, Some(41.0));
+    }
+
+    #[test]
+    fn an_inconsistent_station_location_is_rejected_before_io() {
+        for (keys, message) in [
+            (
+                "operator_lat = 41.7\n",
+                "operator_lat is set but operator_lon is not",
+            ),
+            (
+                "operator_lon = -72.7\n",
+                "operator_lon is set but operator_lat is not",
+            ),
+            (
+                "operator_grid = \"FN31pr\"\noperator_lat = 40.0\noperator_lon = -74.0\n",
+                "is outside operator_grid \"FN31pr\"",
+            ),
+        ] {
+            let f = write_cfg(&format!("{SERVER}{keys}"));
+            let err = format!("{:#}", load(Some(f.path()), Env::Ignore).unwrap_err());
+            assert!(
+                err.starts_with(&format!("{}: [server]: ", f.path().display())),
+                "{err}"
+            );
+            assert!(err.contains(message), "{err}");
+        }
+        // A variable that supplied the value is named, as for typed errors.
+        let err = format!(
+            "{:#}",
+            load_env(Some(SERVER), &[("MANTA_SERVER_OPERATOR_LAT", "41.7")]).unwrap_err()
+        );
+        assert!(
+            err.contains("(environment: MANTA_SERVER_OPERATOR_LAT)"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn decode_validation_messages_are_unchanged() {
         let f = write_cfg("[decode]\nbeam_width = 0\n");
@@ -851,6 +1119,23 @@ mod tests {
     fn detector_table_reaches_loaded() {
         let loaded = load_file("[detector]\non_snr_db = 20.0\n").unwrap();
         assert_eq!(loaded.detector.on_snr_db, 20.0);
+    }
+
+    /// MAN-312: `crash_filter` is string-typed, so `MANTA_DETECTOR_CRASH_FILTER=off`
+    /// reaches the loader as the string `"off"` and beats the file.
+    #[test]
+    fn env_crash_filter_overrides_the_file() {
+        let loaded = load_file("[detector]\ncrash_filter = \"starts-only\"\n").unwrap();
+        assert_eq!(
+            loaded.detector.crash_filter,
+            manta_engine::CrashFilter::StartsOnly
+        );
+        let loaded = load_env(
+            Some("[detector]\ncrash_filter = \"starts-only\"\n"),
+            &[("MANTA_DETECTOR_CRASH_FILTER", "off")],
+        )
+        .unwrap();
+        assert_eq!(loaded.detector.crash_filter, manta_engine::CrashFilter::Off);
     }
 
     #[test]
@@ -1034,6 +1319,182 @@ mod tests {
         );
     }
 
+    // ---- MAN-140: type = "ka9q"
+
+    const KA9Q: &str = "[input]\ntype = \"ka9q\"\ngroup = \"239.101.6.1\"\n";
+
+    #[test]
+    fn ka9q_input_defaults_port_5004_and_no_ssrc_or_interface() {
+        let loaded = load_file(KA9Q).unwrap();
+        assert_eq!(
+            loaded.input.source,
+            Some(SourceFromFile::Ka9q {
+                group: "239.101.6.1".into(),
+                port: 5004,
+                ssrc: None,
+                interface: None,
+            })
+        );
+        let loaded = load_file(&format!(
+            "{KA9Q}port = 5010\nssrc = 14100000\ninterface = \"192.168.1.20\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            loaded.input.source,
+            Some(SourceFromFile::Ka9q {
+                group: "239.101.6.1".into(),
+                port: 5010,
+                ssrc: Some(14_100_000),
+                interface: Some(Ipv4Addr::new(192, 168, 1, 20)),
+            })
+        );
+    }
+
+    #[test]
+    fn ka9q_requires_group() {
+        let err = err_of("[input]\ntype = \"ka9q\"\n");
+        assert!(
+            err.ends_with("[input]: input.group is required when input.type = \"ka9q\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ka9q_group_is_checked_at_load() {
+        let group = |g: &str| format!("[input]\ntype = \"ka9q\"\ngroup = \"{g}\"\n");
+        let err = err_of(&group("192.168.1.5"));
+        assert!(
+            err.ends_with(
+                "[input]: input.group must be an IPv4 multicast address (224.0.0.0 to \
+                 239.255.255.255) or a host name, got 192.168.1.5"
+            ),
+            "{err}"
+        );
+        let err = err_of(&group("ff02::1"));
+        assert!(
+            err.ends_with(
+                "[input]: input.group: IPv6 groups are not supported yet; give radiod's IPv4 \
+                 data group, got ff02::1"
+            ),
+            "{err}"
+        );
+        // A guide placeholder left in place is refused, not resolved.
+        let err = err_of(&group("<your-radiod-data-group>"));
+        assert!(
+            err.contains("[input]: input.group must be an IPv4 multicast address"),
+            "{err}"
+        );
+        for ok in ["239.101.6.1", "cw-20m.local"] {
+            let loaded = load_file(&group(ok)).unwrap();
+            let Some(SourceFromFile::Ka9q { group, .. }) = loaded.input.source else {
+                panic!("expected a ka9q source for {ok}");
+            };
+            assert_eq!(group, ok);
+        }
+    }
+
+    #[test]
+    fn ka9q_interface_must_be_an_ipv4_address() {
+        let err = err_of(&format!("{KA9Q}interface = \"eth0\"\n"));
+        assert!(
+            err.ends_with("[input]: input.interface must be an IPv4 address, got eth0"),
+            "{err}"
+        );
+        let err = err_of(&format!("{KA9Q}interface = \"::1\"\n"));
+        assert!(
+            err.ends_with("[input]: input.interface must be an IPv4 address, got ::1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ka9q_ssrc_range_is_u32() {
+        let err = err_of(&format!("{KA9Q}ssrc = -1\n"));
+        assert!(
+            err.ends_with("[input]: input.ssrc must be between 0 and 4294967295, got -1"),
+            "{err}"
+        );
+        let err = err_of(&format!("{KA9Q}ssrc = 4294967296\n"));
+        assert!(
+            err.ends_with("[input]: input.ssrc must be between 0 and 4294967295, got 4294967296"),
+            "{err}"
+        );
+        for (ssrc, want) in [("0", 0), ("4294967295", u32::MAX)] {
+            let loaded = load_file(&format!("{KA9Q}ssrc = {ssrc}\n")).unwrap();
+            let Some(SourceFromFile::Ka9q { ssrc, .. }) = loaded.input.source else {
+                panic!("expected a ka9q source");
+            };
+            assert_eq!(ssrc, Some(want));
+        }
+    }
+
+    #[test]
+    fn ka9q_rejects_keys_of_other_types() {
+        let err = err_of(&format!("{KA9Q}freq_hz = 14100000.0\n"));
+        assert!(
+            err.ends_with(
+                "[input]: input.freq_hz does not apply to input.type = \"ka9q\" (ka9q takes \
+                 group, port, ssrc, interface)"
+            ),
+            "{err}"
+        );
+        // And the ka9q keys belong to ka9q only.
+        let err = err_of("[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7e6\nssrc = 1\n");
+        assert!(
+            err.contains("input.ssrc does not apply to input.type = \"kiwi\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn keys_without_a_type_name_ka9q_among_the_types() {
+        let err = err_of("[input]\ngroup = \"239.101.6.1\"\n");
+        assert!(
+            err.ends_with(
+                "[input]: input.group needs input.type (one of audio, file, kiwi, soapy, hpsdr, \
+                 ka9q)"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ka9q_group_and_interface_env_values_stay_strings() {
+        // `127.0.0.1` and `239.101.6.1` are not TOML values, and a group
+        // name could look like one; both keys are taken verbatim.
+        let loaded = load_env(
+            None,
+            &[
+                ("MANTA_INPUT_TYPE", "ka9q"),
+                ("MANTA_INPUT_GROUP", "239.101.6.1"),
+                ("MANTA_INPUT_INTERFACE", "127.0.0.1"),
+                ("MANTA_INPUT_SSRC", "14100000"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.input.source,
+            Some(SourceFromFile::Ka9q {
+                group: "239.101.6.1".into(),
+                port: 5004,
+                ssrc: Some(14_100_000),
+                interface: Some(Ipv4Addr::LOCALHOST),
+            })
+        );
+        assert!(STRING_TYPED_ENV_KEYS.contains(&("input", "group")));
+        assert!(STRING_TYPED_ENV_KEYS.contains(&("input", "interface")));
+        // A numeric-looking host name stays a string rather than a TOML
+        // integer the loader would reject as the wrong type.
+        let err = load_env(
+            None,
+            &[("MANTA_INPUT_TYPE", "ka9q"), ("MANTA_INPUT_GROUP", "1234")],
+        )
+        .err()
+        .map(|e| format!("{e:#}"))
+        .unwrap_or_default();
+        assert!(!err.contains("invalid type"), "{err}");
+    }
+
     #[test]
     fn file_path_resolves_against_the_config_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -1045,6 +1506,8 @@ mod tests {
             Some(SourceFromFile::File {
                 path: dir.path().join("v1.wav"),
                 iq: false,
+                realtime: false,
+                looped: false,
             })
         );
     }
@@ -1059,6 +1522,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(loaded.input.shared.freq_correction_ppm, Some(3.0));
+    }
+
+    /// MAN-314: `MANTA_DETECTOR_RTTY_FILTER=false` overrides the file.
+    #[test]
+    fn env_rtty_filter_overrides_the_file() {
+        let loaded = load_env(
+            Some("[detector]\nrtty_filter = true\nrtty_dwell_ms = 30000\n"),
+            &[("MANTA_DETECTOR_RTTY_FILTER", "false")],
+        )
+        .unwrap();
+        assert!(!loaded.detector.rtty_filter);
+        assert_eq!(loaded.detector.rtty_dwell_hops, 11250);
     }
 
     #[test]
@@ -1095,6 +1570,60 @@ mod tests {
             Some(SourceFromFile::File {
                 path: PathBuf::from("x.wav"),
                 iq: true,
+                realtime: false,
+                looped: false,
+            })
+        );
+    }
+
+    // ---- MAN-269: paced and looping file replay
+
+    #[test]
+    fn input_realtime_and_loop_are_file_keys() {
+        // Absolute on every OS (a bare "/x.wav" is relative on Windows).
+        let wav = std::env::temp_dir().join("x.wav");
+        let loaded = load_file(&format!(
+            "[input]\ntype = \"file\"\npath = '{}'\nrealtime = true\nloop = true\n",
+            wav.display()
+        ))
+        .unwrap();
+        assert_eq!(
+            loaded.input.source,
+            Some(SourceFromFile::File {
+                path: wav,
+                iq: false,
+                realtime: true,
+                looped: true,
+            })
+        );
+        let err = err_of("[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7e6\nloop = true\n");
+        assert!(
+            err.contains(
+                "input.loop does not apply to input.type = \"kiwi\" (kiwi takes host, port, \
+                 freq_hz, password)"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn manta_input_loop_env_sets_the_loop_key() {
+        let loaded = load_env(
+            None,
+            &[
+                ("MANTA_INPUT_TYPE", "file"),
+                ("MANTA_INPUT_PATH", "x.wav"),
+                ("MANTA_INPUT_LOOP", "true"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.input.source,
+            Some(SourceFromFile::File {
+                path: PathBuf::from("x.wav"),
+                iq: false,
+                realtime: false,
+                looped: true,
             })
         );
     }
@@ -1246,6 +1775,8 @@ mod tests {
             Some(SourceFromFile::File {
                 path: PathBuf::from("x.wav"),
                 iq: false,
+                realtime: false,
+                looped: false,
             })
         );
         assert_eq!(loaded.input.shared.freq_correction_ppm, None);
@@ -1335,5 +1866,145 @@ mod tests {
         for name in names {
             assert!(ENV_IGNORED.contains(&name), "{name} must be in ENV_IGNORED");
         }
+    }
+
+    // ---- MAN-301: [rbn_compare]
+
+    #[test]
+    fn rbn_compare_is_a_known_table() {
+        assert!(KNOWN_TABLES.contains(&"rbn_compare"));
+        let loaded = load_file(&format!(
+            "{SERVER}[rbn_compare]\nenabled = true\nwindow_secs = 240\nspotters = [\"k5tr\"]\n"
+        ))
+        .unwrap();
+        let rc = loaded.rbn_compare.expect("[rbn_compare] reaches Loaded");
+        assert!(rc.enabled);
+        assert_eq!(rc.window_secs, 240);
+        assert_eq!(rc.spotters, vec!["K5TR".to_string()]);
+        assert!(loaded.notes.is_empty(), "{:?}", loaded.notes);
+        assert!(load_file(SERVER).unwrap().rbn_compare.is_none());
+    }
+
+    #[test]
+    fn rbn_compare_enabled_without_server_is_rejected() {
+        let f = write_cfg("[rbn_compare]\nenabled = true\n");
+        let err = format!("{:#}", load(Some(f.path()), Env::Ignore).unwrap_err());
+        assert_eq!(
+            err,
+            format!(
+                "{}: [rbn_compare] needs a [server] table (grades are published on the JSON \
+                 stream and /metrics, which only the daemon runs)",
+                f.path().display()
+            )
+        );
+        // The rbn_uplink refusal still applies alongside.
+        let err = err_of("[[rbn_uplink]]\nenabled = false\ntarget_host = \"x\"\ntarget_port = 1\n");
+        assert!(
+            err.contains("[[rbn_uplink]] needs a [server] table"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rbn_compare_disabled_without_server_is_a_note() {
+        let loaded = load_file("[rbn_compare]\nenabled = false\n").unwrap();
+        assert_eq!(
+            loaded.notes,
+            vec!["note: [rbn_compare] is off and ignored".to_string()]
+        );
+        assert!(loaded.server.is_none());
+        assert!(loaded.rbn_compare.is_some_and(|rc| !rc.enabled));
+        // A bad value in an inert table is still an error.
+        let err = err_of("[rbn_compare]\nwindow_secs = 10\n");
+        assert!(
+            err.ends_with(": [rbn_compare].window_secs must be 30 to 3600, got 10"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rbn_compare_env_overlay() {
+        let body = format!("{SERVER}[rbn_compare]\nenabled = true\nwindow_secs = 120\n");
+        let loaded = load_env(Some(&body), &[("MANTA_RBN_COMPARE_WINDOW_SECS", "240")]).unwrap();
+        assert_eq!(loaded.rbn_compare.unwrap().window_secs, 240);
+        assert_eq!(
+            loaded.env_vars,
+            vec!["MANTA_RBN_COMPARE_WINDOW_SECS".to_string()]
+        );
+        let loaded =
+            load_env(Some(&body), &[("MANTA_RBN_COMPARE_FEED_HOST", "127.0.0.1")]).unwrap();
+        assert_eq!(loaded.rbn_compare.unwrap().feed_host, "127.0.0.1");
+        // String-typed: `12345` reaches the callsign check as a string, not
+        // an integer type error, and is then refused as a callsign.
+        let err = format!(
+            "{:#}",
+            load_env(
+                Some(&body),
+                &[("MANTA_RBN_COMPARE_LOGIN_CALLSIGN", "12345")]
+            )
+            .unwrap_err()
+        );
+        assert!(
+            err.contains("login_callsign \"12345\" is not a plausible callsign"),
+            "{err}"
+        );
+        assert!(err.contains("MANTA_RBN_COMPARE_LOGIN_CALLSIGN"), "{err}");
+        let err = format!(
+            "{:#}",
+            load_env(Some(&body), &[("MANTA_RBN_COMPARE_FOO", "1")]).unwrap_err()
+        );
+        assert!(err.contains("unknown field `foo`"), "{err}");
+        assert!(err.contains("MANTA_RBN_COMPARE_FOO"), "{err}");
+        // The environment alone can turn it on, and then needs [server].
+        let err = format!(
+            "{:#}",
+            load_env(None, &[("MANTA_RBN_COMPARE_ENABLED", "true")]).unwrap_err()
+        );
+        assert!(
+            err.starts_with("environment: [rbn_compare] needs a [server] table"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rbn_compare_spotters_must_not_be_own_call() {
+        let body = "[server]\nstation_callsign = \"W3XYZ-1\"\n[rbn_compare]\nenabled = true\n";
+        let f = write_cfg(&format!("{body}spotters = [\"K5TR\", \"w3xyz\"]\n"));
+        let err = format!("{:#}", load(Some(f.path()), Env::Ignore).unwrap_err());
+        assert_eq!(
+            err,
+            format!(
+                "{}: [rbn_compare].spotters lists W3XYZ, this station's own callsign: its \
+                 reports are always excluded, so every spot would grade none",
+                f.path().display()
+            )
+        );
+        let err = err_of(&format!("{body}spotters = [\"W3XYZ-1\"]\n"));
+        assert!(err.contains("spotters lists W3XYZ-1"), "{err}");
+        assert!(load_file(&format!("{body}spotters = [\"K5TR\"]\n")).is_ok());
+    }
+
+    #[test]
+    fn unknown_table_message_lists_rbn_compare() {
+        let err = err_of("[telemetry]\nx = 1\n");
+        assert!(
+            err.ends_with(
+                "-- manta reads [server], [[rbn_uplink]], [rbn_compare], [input], [spot], \
+                 [detector], [decode]"
+            ),
+            "{err}"
+        );
+        let err = err_of("[rbn_compar]\nenabled = true\n");
+        assert!(err.contains("did you mean [rbn_compare]?"), "{err}");
+    }
+
+    #[test]
+    fn env_overrides_server_history_minutes() {
+        let loaded = load_env(
+            Some("[server]\nstation_callsign = \"W1AW\"\nhistory_minutes = 30\n"),
+            &[("MANTA_SERVER_HISTORY_MINUTES", "45")],
+        )
+        .unwrap();
+        assert_eq!(loaded.server.unwrap().history_minutes, Some(45));
     }
 }

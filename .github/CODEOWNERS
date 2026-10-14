@@ -17,6 +17,10 @@
 Cargo.toml           @thagale
 /Cargo.lock          @thagale
 
+# deny.toml decides which advisories, licenses and dependency sources pass the "Supply Chain"
+# required check (MAN-156); an unowned edit could allowlist its way past it.
+/deny.toml           @thagale
+
 # Cross.toml controls the exact cross-compilation toolchain/image used to build release
 # artifacts -- an unowned edit here can substitute a different (unverified) build environment
 # for release builds without touching release.yml itself.
@@ -70,6 +74,10 @@ Cargo.toml           @thagale
 # here can change the published release image's contents with no corresponding review of
 # release-publish.yml or a version bump.
 /Dockerfile          @thagale
+
+# The image's entrypoint script (MAN-81) decides what a bare `docker run` of the published image
+# does -- it changes the image's behaviour as much as the Dockerfile does.
+/packaging/docker/   @thagale
 
 /SECURITY.md         @thagale
 

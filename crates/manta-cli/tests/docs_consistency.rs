@@ -130,6 +130,7 @@ fn readme_inputs_table_covers_every_shipped_input() {
         "--kiwi-host",
         "--soapy-driver",
         "--hpsdr-host",
+        "--ka9q-group",
     ] {
         assert!(
             inputs.contains(needle),
@@ -153,7 +154,7 @@ fn readme_outputs_describes_shipped_servers() {
         !outputs.contains("in progress"),
         "README Outputs still calls a shipped server \"in progress\""
     );
-    for needle in ["7300", "7301", "7302", "uplink", "--config"] {
+    for needle in ["7300", "7301", "7302", "7303", "uplink", "--config"] {
         assert!(
             outputs.contains(needle),
             "README Outputs never mentions `{needle}`"
@@ -182,6 +183,53 @@ fn readme_status_does_not_promise_shipped_work() {
         assert!(
             !status.contains(stale),
             "README Status still lists `{stale}` as future work"
+        );
+    }
+}
+
+/// MAN-298 / decision D7: until manta clears its M2/M3 acceptance gates, the
+/// Status block says how far to trust a release.
+#[test]
+fn readme_status_says_pre_stability_alpha() {
+    let status = squash_whitespace(section(&doc("README.md"), "Status")).to_lowercase();
+    assert!(
+        status.contains("pre-stability alpha, expect breakage"),
+        "README Status must say \"pre-stability alpha, expect breakage\" (decision D7)"
+    );
+}
+
+/// MAN-298: Installation offers a download of every archive the release
+/// workflow builds, so a platform added to the build matrix is documented too.
+#[test]
+fn readme_installation_offers_every_release_archive() {
+    let install = squash_whitespace(section(&doc("README.md"), "Installation"));
+    assert!(
+        !install.contains("There is no tagged release yet"),
+        "README Installation still says no release exists"
+    );
+    assert!(
+        install.contains("releases/latest/download/"),
+        "README Installation gives no download command"
+    );
+    let workflow = doc(".github/workflows/release-publish.yml");
+    let artifacts: Vec<&str> = workflow
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("artifact: "))
+        .collect();
+    assert!(
+        !artifacts.is_empty(),
+        "no `artifact:` entries in the release build matrix"
+    );
+    for artifact in artifacts {
+        let ext = if artifact.contains("windows") {
+            "zip"
+        } else {
+            "tar.gz"
+        };
+        let archive = format!("{artifact}.{ext}");
+        assert!(
+            install.contains(&archive),
+            "README Installation never names release archive `{archive}`"
         );
     }
 }
@@ -390,6 +438,39 @@ fn roadmap_m3_remaining_work_names_every_open_acceptance_gate() {
              `{gate}`"
         );
     }
+}
+
+/// MAN-269: ROADMAP M3 points at the README's paced-replay demo. "60-second
+/// demo" is that README section's title, not the replay's length -- the
+/// `gen v1` replay keeps the server up for 120 seconds -- so the pointer must
+/// link the section and state the real length rather than read as a
+/// 60-second run.
+#[test]
+fn roadmap_m3_replay_demo_pointer_states_the_real_length() {
+    let roadmap = doc("ROADMAP.md");
+    let m3 = squash_whitespace(section(&roadmap, "M3"));
+    let idx = m3
+        .find("Since MAN-269")
+        .expect("M3 MAN-269 replay sentence");
+    let sentence = &m3[idx..idx + m3[idx..].find(").").expect("sentence end") + 2];
+    assert!(
+        sentence.contains("(README.md#60-second-demo)"),
+        "ROADMAP M3's replay pointer does not link the README section: {sentence}"
+    );
+    assert!(
+        sentence.contains("120 seconds"),
+        "ROADMAP M3's replay pointer does not state the 120-second replay: {sentence}"
+    );
+    let readme = doc("README.md");
+    // `section()` prefix-matches; the anchor only resolves on this exact heading.
+    assert!(
+        readme.contains("\n## 60-second demo\n"),
+        "README's `## 60-second demo` heading changed; ROADMAP M3's #60-second-demo link is broken"
+    );
+    assert!(
+        squash_whitespace(section(&readme, "60-second demo")).contains("full 120 seconds"),
+        "README's demo no longer says the replay runs 120 seconds; update ROADMAP M3 too"
+    );
 }
 
 /// The input rates of the normative rate table in `docs/SPEC-decode-core.md`
@@ -742,6 +823,9 @@ fn spec_detector_values_equal_the_code_defaults() {
         "warmup_ms",
         "track_cap",
         "silent_respawn_cooldown_ms",
+        "crash_filter",
+        "rtty_filter",
+        "rtty_dwell_ms",
     ] {
         assert!(
             table.contains_key(key),
@@ -808,6 +892,8 @@ fn spec_documents_every_input_and_spot_key() {
                 "device",
                 "path",
                 "iq",
+                "realtime",
+                "loop",
                 "host",
                 "port",
                 "freq_hz",
@@ -815,6 +901,9 @@ fn spec_documents_every_input_and_spot_key() {
                 "driver",
                 "rate_hz",
                 "gain_db",
+                "group",
+                "ssrc",
+                "interface",
                 "freq_correction_ppm",
                 "center_freq_hz",
                 "capture_rate_hz",
@@ -829,6 +918,8 @@ fn spec_documents_every_input_and_spot_key() {
                 "notch_path",
                 "cty_path",
                 "scp_path",
+                "pattern_path",
+                "validation_level",
             ],
         ),
     ];
@@ -1113,6 +1204,36 @@ fn architecture_section_7_describes_decoder_version() {
     }
 }
 
+/// MAN-127: the README's node section tells an operator how to measure
+/// `freq_correction_ppm`, and ARCHITECTURE §8 says which command edits the
+/// config file in place.
+#[test]
+fn readme_and_architecture_mention_calibrate() {
+    let readme = doc("README.md");
+    let commands = fenced_commands(section(&readme, "Run it as a node"));
+    assert!(
+        commands
+            .iter()
+            .any(|c| c.trim_start().starts_with("manta calibrate")),
+        "README node section has no `manta calibrate` command: {commands:?}"
+    );
+    let arch = doc("ARCHITECTURE.md");
+    let s8 = squash_whitespace(section(&arch, "8. Configuration"));
+    for needle in [
+        "`manta calibrate`",
+        "input.freq_correction_ppm",
+        "docs/DECISIONS/2026-10-11-man127-calibrate-command.md",
+    ] {
+        assert!(s8.contains(needle), "ARCHITECTURE §8 never says {needle:?}");
+    }
+    assert!(
+        repo_root()
+            .join("docs/DECISIONS/2026-10-11-man127-calibrate-command.md")
+            .is_file(),
+        "ARCHITECTURE §8 links the MAN-127 decision doc, which does not exist"
+    );
+}
+
 // ---- MAN-124: the log's level and format controls, documented and real ----
 
 /// MAN-124: README's `## Logs` documents `RUST_LOG` as the underlying
@@ -1183,4 +1304,1196 @@ fn architecture_logging_bullet_is_current() {
         arch.contains("--log-format json"),
         "ARCHITECTURE.md never says --log-format json"
     );
+}
+
+// ---- MAN-301: live RBN comparison, documented ----
+
+/// Every `manta_rbn_compare_*` family the design names (MAN-301 plan §7).
+/// The runbook test below also checks the rendered families against this
+/// list, so a stubbed or partial renderer cannot pass it vacuously.
+const RBN_COMPARE_FAMILIES: [&str; 10] = [
+    "manta_rbn_compare_grades_total",
+    "manta_rbn_compare_grades_last_hour",
+    "manta_rbn_compare_disagreements_last_hour",
+    "manta_rbn_compare_freq_offset_median_hz",
+    "manta_rbn_compare_freq_offset_samples",
+    "manta_rbn_compare_feed_connected",
+    "manta_rbn_compare_feed_reports_total",
+    "manta_rbn_compare_feed_reconnects_total",
+    "manta_rbn_compare_pending",
+    "manta_rbn_compare_ungraded_total",
+];
+
+/// One grade of `grade` for `call` on 20m, with same-band statistics when
+/// the grade has them.
+fn rbn_grade(
+    grade: manta_server::rbn_compare::grade::Grade,
+    disagreements: Vec<manta_server::rbn_compare::grade::Disagreement>,
+) -> manta_server::rbn_compare::grade::SpotGrade {
+    use manta_server::rbn_compare::grade::{Grade, SpotGrade};
+    let same_band = matches!(grade, Grade::Match | Grade::Disagree);
+    SpotGrade {
+        kind: "spotGrade",
+        spot_id: format!("W3XYZ-1:1:1:960000:W1AW-{grade:?}"),
+        call: "W1AW".to_string(),
+        band: "20m",
+        spot_time: 1_791_720_000,
+        window_close: 1_791_720_180,
+        window_s: 180,
+        grade,
+        disagreements,
+        manta_freq_hz: 14_025_100,
+        manta_wpm: Some(25),
+        rbn_modal_freq_hz: same_band.then_some(14_025_000),
+        rbn_median_wpm: same_band.then_some(24.0),
+        rbn_skimmers: if same_band { 3 } else { 0 },
+        rbn_reports: if same_band { 3 } else { 0 },
+        freq_offset_hz: same_band.then_some(100),
+        rbn_bands: match grade {
+            Grade::Match | Grade::Disagree => vec!["20m"],
+            Grade::Elsewhere => vec!["40m"],
+            Grade::None | Grade::Unknown => vec![],
+        },
+        spotter_filter: vec![],
+    }
+}
+
+/// MAN-301: `docs/RUNBOOKS/rbn-comparison.md` explains every
+/// `manta_rbn_compare_*` family `/metrics` renders once comparison is on.
+/// The family list comes from the real renderer, fed one grade of each
+/// kind plus the feed and pending setters, so a family added later without
+/// a runbook entry fails here.
+#[test]
+fn rbn_comparison_runbook_names_every_rbn_compare_metric() {
+    use manta_server::rbn_compare::grade::{Disagreement, Grade};
+    let metrics = manta_server::metrics::Metrics::new();
+    metrics.enable_rbn_compare();
+    for (grade, disagreements) in [
+        (Grade::Match, vec![]),
+        (
+            Grade::Disagree,
+            vec![Disagreement::Frequency, Disagreement::Speed],
+        ),
+        (Grade::Elsewhere, vec![]),
+        (Grade::None, vec![]),
+        (Grade::Unknown, vec![]),
+    ] {
+        metrics.record_rbn_grade(&rbn_grade(grade, disagreements));
+    }
+    metrics.set_rbn_feed_connected(true);
+    metrics.inc_rbn_feed_reports();
+    metrics.inc_rbn_feed_reconnects();
+    metrics.set_rbn_pending(1);
+    metrics.add_rbn_ungraded(1);
+    let text = metrics.render_prometheus_text();
+
+    let mut rendered: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("# TYPE "))
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|name| name.starts_with("manta_rbn_compare_"))
+        .collect();
+    rendered.dedup();
+    assert!(
+        !rendered.is_empty(),
+        "an enabled Metrics renders no manta_rbn_compare_* family"
+    );
+    for family in RBN_COMPARE_FAMILIES {
+        assert!(
+            rendered.contains(&family),
+            "an enabled Metrics with one grade of each kind does not render {family}"
+        );
+    }
+
+    let runbook = doc("docs/RUNBOOKS/rbn-comparison.md");
+    for family in &rendered {
+        assert!(
+            runbook.contains(family),
+            "docs/RUNBOOKS/rbn-comparison.md never names {family}"
+        );
+    }
+}
+
+/// MAN-301: README documents the `[rbn_compare]` table, and ARCHITECTURE §7
+/// says the JSON stream can carry `spotGrade` records.
+#[test]
+fn readme_and_architecture_mention_rbn_compare() {
+    let readme = doc("README.md");
+    assert!(
+        readme.contains("[rbn_compare]"),
+        "README.md never mentions the [rbn_compare] table"
+    );
+    let arch = doc("ARCHITECTURE.md");
+    let s7 = section(&arch, "7. Output layer");
+    assert!(
+        s7.contains("spotGrade"),
+        "ARCHITECTURE §7 never mentions spotGrade records"
+    );
+}
+
+/// MAN-301: SPEC §9's precedence paragraph lists the `RBN_COMPARE`
+/// environment prefix and `[rbn_compare]`'s two string-typed keys.
+#[test]
+fn spec_precedence_paragraph_lists_rbn_compare_env_prefix() {
+    let spec = doc("docs/SPEC-decode-core.md");
+    let start = spec
+        .find("**Precedence and the environment.**")
+        .expect("SPEC §9 has no precedence paragraph");
+    let rest = &spec[start..];
+    let paragraph = squash_whitespace(&rest[..rest.find("\n\n").unwrap_or(rest.len())]);
+    for needle in [
+        "RBN_COMPARE",
+        "rbn_compare.feed_host",
+        "rbn_compare.login_callsign",
+    ] {
+        assert!(
+            paragraph.contains(needle),
+            "SPEC §9's precedence paragraph never says {needle:?}"
+        );
+    }
+}
+
+// ---- MAN-90 ----
+
+const MAN90_DECISION: &str = "docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md";
+const MAN90_RUNBOOK: &str = "docs/RUNBOOKS/aggregator-rbn-capture.md";
+/// Same literal as uplink_acceptance.rs's MAN90_REFERENCE_SPOT (minus CRLF):
+/// the decision record must quote the bytes the uplink really writes.
+const MAN90_REFERENCE_SPOT: &str =
+    "DX de W3XYZ-#:  14027.10  JA1ABC         CW    30 dB  28 WPM  CQ      2213Z";
+
+/// MAN-90: the decision record lists every open claim, quotes the uplink's
+/// real bytes, and it and the capture runbook link each other.
+#[test]
+fn man90_records_list_every_open_claim_and_link_each_other() {
+    let decision = doc(MAN90_DECISION);
+    let runbook = doc(MAN90_RUNBOOK);
+    for id in ["C1", "C2", "C3", "C4", "C5", "C6", "C7"] {
+        assert!(
+            decision.contains(&format!("| {id} |")),
+            "decision record has no {id} row"
+        );
+        assert!(runbook.contains(id), "capture runbook never mentions {id}");
+    }
+    assert!(
+        decision.contains(MAN90_REFERENCE_SPOT),
+        "decision record misquotes the uplink's bytes"
+    );
+    assert!(decision.contains("aggregator-rbn-capture.md"));
+    assert!(runbook.contains("2026-10-11-man90-uplink-protocol-verification.md"));
+    assert!(
+        runbook.contains("\n## Captures"),
+        "runbook has no Captures log"
+    );
+}
+
+/// MAN-90: every relative link in the two records resolves.
+#[test]
+fn man90_records_relative_links_resolve() {
+    // Same link grammar as operator_guides.rs::guide_relative_links_resolve.
+    let link = regex::Regex::new(r#"\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)"#).unwrap();
+    for rel in [MAN90_DECISION, MAN90_RUNBOOK] {
+        let base = repo_root().join(rel).parent().unwrap().to_path_buf();
+        let mut checked = 0;
+        for cap in link.captures_iter(&doc(rel)) {
+            let target = &cap[1];
+            if target.starts_with("http")
+                || target.starts_with('#')
+                || target.starts_with("mailto:")
+            {
+                continue;
+            }
+            let path = target.split('#').next().unwrap();
+            assert!(base.join(path).exists(), "{rel}: broken link {target}");
+            checked += 1;
+        }
+        assert!(checked > 0, "{rel}: no relative links checked");
+    }
+}
+
+/// MAN-90: the capture starts before Aggregator restarts, so the runbook's
+/// Developer steps must list stream indices from SYN packets and check and
+/// follow a chosen stream across the whole file. They must not cap packets
+/// (`-c` counts every packet read) or follow stream 0, which can be the old
+/// connection. Checks text in that section, not shell semantics.
+#[test]
+fn man90_runbook_checks_the_restarted_connection() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let steps = section(&runbook, "Developer steps");
+    for needle in [
+        "-Y 'tcp.flags.syn == 1 && tcp.flags.ack == 0'",
+        "-e tcp.stream",
+        "-Y \"tcp.stream == $N && (tls || tcp.payload[0:2] == 16:03)\"",
+        "-z follow,tcp,ascii,$N",
+        "-e udp.stream",
+    ] {
+        assert!(
+            steps.contains(needle),
+            "Developer steps never run `{needle}`"
+        );
+    }
+    for stale in [" -c ", "follow,tcp,ascii,0"] {
+        assert!(
+            !steps.contains(stale),
+            "Developer steps still run `{stale}`"
+        );
+    }
+}
+
+/// MAN-90: after its restart Aggregator may reach RBN at a different address,
+/// a second endpoint or over UDP. A `host <address from step 1>` capture
+/// filter drops all of that, yet the file settles C1 and C2. The operator
+/// steps must capture without that filter, list Aggregator's addresses again
+/// after the restart, and send only Aggregator's packets. The developer
+/// steps must use every listed address. Checks text, not Wireshark behaviour.
+#[test]
+fn man90_runbook_keeps_every_endpoint_aggregator_uses() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let operator = squash_whitespace(section(&runbook, "Operator steps"));
+    for stale in ["host <address from step 1>", "capture filter `"] {
+        assert!(
+            !operator.contains(stale),
+            "Operator steps still set a capture filter (`{stale}`)"
+        );
+    }
+    for needle in [
+        "no capture filter",
+        "after the restart",
+        "Export Specified Packets",
+    ] {
+        assert!(
+            operator.contains(needle),
+            "Operator steps never say `{needle}`"
+        );
+    }
+    let steps = squash_whitespace(section(&runbook, "Developer steps"));
+    assert!(
+        steps.contains("every address the operator noted"),
+        "Developer steps never use every address the operator noted"
+    );
+}
+
+/// MAN-90: `ip.addr == <address>` keeps every packet to or from that address,
+/// whichever program sent it, so a browser open on an RBN page that shares the
+/// address would pass step 5 and could be read as Aggregator's connection.
+/// Steps 1 and 3 must note each connection's ports, and step 5 must pair every
+/// `ip.addr`/`ipv6.addr` term with ports, then check the Conversations list.
+/// Checks text, not Wireshark behaviour.
+#[test]
+fn man90_runbook_exports_only_aggregators_connections() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let operator = squash_whitespace(section(&runbook, "Operator steps"));
+    let step = |start: &str, end: &str| -> String {
+        let from = operator
+            .find(start)
+            .unwrap_or_else(|| panic!("Operator steps have no `{start}` step"));
+        let to = operator[from..]
+            .find(end)
+            .map_or(operator.len(), |i| from + i);
+        operator[from..to].to_string()
+    };
+    let find = step("1. **Find", "2. **");
+    let restart = step("3. **Restart", "4. **");
+    // Step 5 is the last step, so it runs to the end of the section.
+    let export = step("5. **Stop", "6. **");
+    for (name, text, needles) in [
+        (
+            "Step 1",
+            &find,
+            &[
+                "LocalPort, RemoteAddress and RemotePort",
+                "Get-NetUDPEndpoint -OwningProcess $p.Id",
+            ][..],
+        ),
+        (
+            "Step 3",
+            &restart,
+            &["LocalPort, RemoteAddress and RemotePort", "TCP Connections"][..],
+        ),
+        (
+            "Step 5",
+            &export,
+            &[
+                "(ip.addr == <RemoteAddress> && tcp.port == <LocalPort> && tcp.port == <RemotePort>)",
+                "`udp.port == <LocalPort>`",
+                "Statistics → Conversations",
+            ][..],
+        ),
+    ] {
+        for needle in needles {
+            assert!(text.contains(needle), "{name} never says `{needle}`");
+        }
+    }
+    for field in ["ip.addr == <", "ipv6.addr == <"] {
+        for (i, _) in export.match_indices(field) {
+            let rest = &export[i + field.len()..];
+            let close = rest.find('>').expect("placeholder closes");
+            assert!(
+                rest[close + 1..].starts_with(" && "),
+                "Step 5 exports by address alone: {}",
+                &export[i..]
+            );
+        }
+    }
+}
+
+/// MAN-90: `Get-NetUDPEndpoint` lists Aggregator's UDP LocalPorts, but its UDP
+/// peers come only from Resource Monitor's live view, which can miss one. Step
+/// 5 must keep UDP by the restarted Aggregator's ports alone, not by a noted
+/// address and port, and the developer steps must follow every UDP flow in
+/// the file, not only flows to noted addresses. A port-only term would keep a
+/// step 1 port another program takes after the restart, so step 5 must use
+/// step 3's ports only and check the saved file. Checks text, not Wireshark
+/// behaviour.
+#[test]
+fn man90_runbook_keeps_udp_to_unnoted_addresses() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let operator = squash_whitespace(section(&runbook, "Operator steps"));
+    // Step 5 is the last step, so it runs to the end of the section.
+    let export = &operator[operator
+        .find("5. **Stop")
+        .expect("Operator steps have no `5. **Stop` step")..];
+    for needle in [
+        "one per UDP LocalPort from step 3, `udp.port == <LocalPort>`",
+        "Open the saved file and check",
+    ] {
+        assert!(export.contains(needle), "Step 5 never says `{needle}`");
+    }
+    assert!(
+        !export.contains("&& udp.port =="),
+        "Step 5 keeps UDP only to an address the operator noted"
+    );
+    let steps = squash_whitespace(section(&runbook, "Developer steps"));
+    assert!(
+        steps.contains("including one to an address the operator did not note"),
+        "Developer steps never follow UDP flows to addresses the operator did not note"
+    );
+}
+
+/// MAN-90: steps 1 and 3 note only the connections the operator sees in
+/// PowerShell or Resource Monitor, so a TCP connection Aggregator opens and
+/// closes between two looks would be left out of step 5's export. Step 2 must
+/// turn on Windows' per-program connection log (Security event 5156), step 5
+/// must take TCP connections from it as well and restore the audit settings,
+/// and the developer steps must check every logged connection is in the file.
+/// Checks text, not Windows behaviour.
+#[test]
+fn man90_runbook_takes_aggregators_connections_from_the_windows_log() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let operator = squash_whitespace(section(&runbook, "Operator steps"));
+    let start = operator
+        .find("2. **Start")
+        .expect("Operator steps have no `2. **Start` step");
+    let record = &operator[start..start + operator[start..].find("3. **").unwrap()];
+    for needle in [
+        "auditpol /backup /file:",
+        "auditpol /set /subcategory:'{0CCE9226-69AE-11D9-BED3-505054503030}' /success:enable",
+    ] {
+        assert!(record.contains(needle), "Step 2 never runs `{needle}`");
+    }
+    // Step 5 is the last step, so it runs to the end of the section.
+    let export = &operator[operator
+        .find("5. **Stop")
+        .expect("Operator steps have no `5. **Stop` step")..];
+    for needle in [
+        "Id=5156",
+        "auditpol /restore /file:",
+        "one term per TCP connection from step 1, step 3 or the saved list",
+    ] {
+        assert!(export.contains(needle), "Step 5 never says `{needle}`");
+    }
+    let steps = squash_whitespace(section(&runbook, "Developer steps"));
+    assert!(
+        steps.contains(
+            "a row of `aggregator-connections.csv`, with no conversation in the file was not recorded"
+        ),
+        "Developer steps never check the file against the connection log"
+    );
+}
+
+/// MAN-90: event 5156 logs inbound connections as well as outbound ones, and
+/// Microsoft's page for it disagrees with itself on which end of an inbound
+/// row is the Source. Step 5 reads SourcePort as Aggregator's LocalPort and
+/// DestAddress as the remote peer, which holds only for a connection
+/// Aggregator opened, so its query must keep outbound rows (`%%14593`) only
+/// (Codex P2 on PR #259). Checks text, not Windows behaviour.
+#[test]
+fn man90_runbook_takes_only_outbound_connections_from_the_windows_log() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let filter = section(&runbook, "Operator steps")
+        .lines()
+        .find(|line| line.contains("Split-Path $_.Application"))
+        .expect("Step 5 never filters the log by Aggregator's executable");
+    assert!(
+        filter.contains("$_.Direction -eq '%%14593'"),
+        "Step 5 keeps inbound 5156 rows: `{}`",
+        filter.trim()
+    );
+}
+
+/// MAN-90: a TLS session leaves only ciphertext, so the developer steps must
+/// say what a TLS result records for C2–C7 and hand the rest to D-5's rework
+/// ticket rather than just "stop" (Codex P2 on PR #259). Checks text only.
+#[test]
+fn man90_runbook_says_what_a_tls_session_records() {
+    let steps = squash_whitespace(section(&doc(MAN90_RUNBOOK), "Developer steps"));
+    for needle in [
+        "`differs: TLS`",
+        "`not observable: TLS`",
+        "D-5",
+        "session keys",
+    ] {
+        assert!(
+            steps.contains(needle),
+            "the runbook's developer steps never say {needle:?} for a TLS session"
+        );
+    }
+    assert!(
+        !steps.contains("stop at C2"),
+        "the runbook still says only \"stop at C2\" for a TLS session"
+    );
+}
+
+/// MAN-90: C3, C4 and C7 compare exact bytes. tshark's `ascii` follow mode
+/// turns non-printable bytes into dots, so the developer steps must also write
+/// a `raw` (hex) transcript of each TCP stream and UDP flow.
+#[test]
+fn man90_runbook_writes_exact_byte_transcripts() {
+    let runbook = doc(MAN90_RUNBOOK);
+    let steps = section(&runbook, "Developer steps");
+    for needle in ["-z follow,tcp,raw,$N", "-z follow,udp,raw,$N"] {
+        assert!(
+            steps.contains(needle),
+            "Developer steps never run `{needle}`"
+        );
+    }
+}
+
+/// MAN-90: step 5 exports every Aggregator connection outside the LAN and the
+/// Skimmers, not only RBN's, so the consent text must say so (Codex P2 on
+/// PR #259).
+#[test]
+fn man90_runbook_consent_covers_every_connection_aggregator_has_open() {
+    let runbook = doc(MAN90_RUNBOOK);
+    // The request is a blockquote; drop the `>` markers before matching.
+    let consent = squash_whitespace(&section(&runbook, "Asking for consent").replace("\n>", "\n"));
+    assert!(
+        !consent.contains("traffic with RBN's servers")
+            && !consent.contains("traffic with the RBN server"),
+        "consent text still promises only RBN traffic"
+    );
+    for needle in [
+        "every internet connection Aggregator has open while you record",
+        "not only its connection to RBN",
+    ] {
+        assert!(
+            consent.contains(needle),
+            "consent text never says `{needle}`"
+        );
+    }
+}
+
+/// MAN-90: README calls the uplink experimental everywhere it offers it, and
+/// "Run it as a node" names the Aggregator route before the uplink block.
+#[test]
+fn readme_marks_the_uplink_experimental_and_leads_with_the_aggregator_route() {
+    let readme = doc("README.md");
+    let outputs = squash_whitespace(section(&readme, "Outputs"));
+    for needle in [
+        "**Outbound RBN uplink (experimental)**",
+        "**Experimental.**",
+        "supported route into RBN",
+        MAN90_DECISION,
+        MAN90_RUNBOOK,
+    ] {
+        assert!(
+            outputs.contains(needle),
+            "README Outputs never says `{needle}`"
+        );
+    }
+    let node = squash_whitespace(section(&readme, "Run it as a node"));
+    let aggregator = node
+        .find("RBN Aggregator")
+        .expect("Run it as a node never names the Aggregator route");
+    let uplink = node
+        .find("`[[rbn_uplink]]`")
+        .expect("Run it as a node never names the uplink block");
+    assert!(
+        aggregator < uplink,
+        "Run it as a node offers the uplink before the Aggregator route"
+    );
+    assert!(
+        node.contains("experimental"),
+        "Run it as a node never calls the uplink experimental"
+    );
+    let status = squash_whitespace(section(&readme, "Status"));
+    assert!(
+        status.contains("outbound RBN uplink is experimental"),
+        "README Status"
+    );
+}
+
+/// MAN-90: ARCHITECTURE §7 enumerates the uplink as an output surface.
+#[test]
+fn architecture_output_layer_describes_the_experimental_uplink() {
+    let s7 = squash_whitespace(section(&doc("ARCHITECTURE.md"), "7. Output layer"));
+    for needle in [
+        "**Outbound RBN uplink (experimental)**",
+        "`uplink.rs`",
+        "Aggregator",
+        MAN90_DECISION,
+    ] {
+        assert!(s7.contains(needle), "ARCHITECTURE §7 never says `{needle}`");
+    }
+}
+
+/// MAN-90: no uplink example names an RBN server as its target.
+#[test]
+fn uplink_health_runbook_example_is_not_an_rbn_server() {
+    assert!(!doc("docs/RUNBOOKS/uplink-health.md").contains("reversebeacon.net"));
+}
+
+/// MAN-81: an operator reading the Docker docs learns that a bare
+/// `docker run` runs a mounted config, that the image reports health through
+/// `manta health`, and how to turn the check off.
+#[test]
+fn docker_docs_describe_the_bare_run_and_the_health_check() {
+    let norm = |s: &str| squash_whitespace(s).to_lowercase();
+    let guide = doc("packaging/README.md");
+    let docker = norm(section(&guide, "Docker Compose"));
+    for needle in [
+        "/etc/manta/manta.toml",
+        "manta health",
+        "--no-healthcheck",
+        "--mount",
+    ] {
+        assert!(
+            docker.contains(needle),
+            "packaging/README.md's Docker section never says {needle:?}"
+        );
+    }
+    let runbook = norm(&doc("docs/RUNBOOKS/node-health.md"));
+    for needle in ["manta health", "healthcheck"] {
+        assert!(
+            runbook.contains(needle),
+            "docs/RUNBOOKS/node-health.md never says {needle:?}"
+        );
+    }
+    assert!(
+        norm(&doc("README.md")).contains("manta health"),
+        "README.md never says manta health"
+    );
+}
+
+/// MAN-81: no command line in packaging/README.md's ```sh blocks ends in a
+/// `\` continuation. scripts/tests/test_packaging.py's `sh_blocks` runs
+/// `shlex.split` on each of those lines on its own, which fails on an
+/// unescaped trailing `\` (`No escaped character`), and that test only runs
+/// in CI, not in `cargo test`. Fences, blank lines and comment lines are
+/// read the way `sh_blocks` reads them.
+#[test]
+fn packaging_readme_sh_blocks_have_no_line_continuations() {
+    let guide = doc("packaging/README.md");
+    let mut inside = false;
+    let mut checked = 0;
+    for line in guide.lines() {
+        if inside && line == "```" {
+            inside = false;
+        } else if !inside && line == "```sh" {
+            inside = true;
+        } else if inside {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let trailing = line.len() - line.trim_end_matches('\\').len();
+            assert!(
+                trailing.is_multiple_of(2),
+                "packaging/README.md: a ```sh line continues onto the next: {line}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no ```sh commands in packaging/README.md");
+}
+
+// ---- MAN-149: the reference docs and indexes cover everything they list ----
+
+const CONFIG_REF: &str = "docs/CONFIG.md";
+const METRICS_REF: &str = "docs/METRICS.md";
+const DOCS_INDEX: &str = "docs/README.md";
+const DECISIONS_INDEX: &str = "docs/DECISIONS/README.md";
+
+/// MAN-149 M1: config::load creates [server] from MANTA_SERVER_* too.
+#[test]
+fn config_reference_documents_environment_server_activation() {
+    let md = doc(CONFIG_REF);
+    let commands = squash_whitespace(section(&md, "Which commands read which tables"));
+    assert!(
+        commands.contains("only when the resolved config has a `[server]` table"),
+        "{CONFIG_REF} must tie server startup to the resolved config"
+    );
+    assert!(
+        commands.contains("`MANTA_SERVER_*`"),
+        "{CONFIG_REF} must say the environment can supply [server]"
+    );
+    assert!(
+        !commands.contains("only when the file has"),
+        "{CONFIG_REF} still restricts server startup to a table in the file"
+    );
+}
+
+/// MAN-149 PR #251 review: run_status loads [server] from --config or
+/// MANTA_CONFIG and dials metrics_bind_addr:metrics_port, so `run` is not
+/// the table's only reader. With no config path it skips the MANTA_*
+/// overlay and resolve_status_addr dials 127.0.0.1:7302.
+#[test]
+fn config_reference_names_status_as_a_server_reader() {
+    let md = doc(CONFIG_REF);
+    let server = section(&md, "[server]");
+    let intro = squash_whitespace(&server[..server.find("\n|").unwrap_or(server.len())]);
+    assert!(
+        !intro.contains("Only `run` reads this table"),
+        "{CONFIG_REF} [server] still says only `run` reads the table"
+    );
+    assert!(
+        intro.contains("`status` reads `metrics_bind_addr` and `metrics_port`"),
+        "{CONFIG_REF} [server] must say `status` reads metrics_bind_addr and metrics_port"
+    );
+    assert!(
+        intro.contains("with neither it dials `127.0.0.1:7302`"),
+        "{CONFIG_REF} [server] must say `status` without a config file dials the default"
+    );
+}
+
+/// MAN-81 PR #257 review: health_cmd::probe loads [server] through the same
+/// daemon_server_config as `status`, so the reference must name `health`
+/// wherever it names `status` as a reader of the metrics keys -- and say
+/// that a resolved config with no [server] table is an error for it.
+#[test]
+fn config_reference_names_health_as_a_server_reader() {
+    let md = doc(CONFIG_REF);
+    let precedence = squash_whitespace(section(&md, "Precedence"));
+    assert!(
+        precedence
+            .contains("`status`, `health` and `config check` read the path from `MANTA_CONFIG`"),
+        "{CONFIG_REF} Precedence must list `health` among the MANTA_CONFIG readers"
+    );
+    let matrix = backticked_rows(section(&md, "Which commands read which tables"));
+    let row = matrix
+        .iter()
+        .find(|r| r[0] == "`health`")
+        .unwrap_or_else(|| panic!("{CONFIG_REF} command matrix has no `health` row"));
+    assert!(
+        row[1].contains("`metrics_bind_addr` and `metrics_port`"),
+        "{CONFIG_REF} `health` row must name metrics_bind_addr and metrics_port"
+    );
+    assert!(
+        row[1].contains("resolves to no `[server]` table is an error"),
+        "{CONFIG_REF} `health` row must say a config with no [server] table is an error"
+    );
+    assert!(
+        row[2].contains("`MANTA_SERVER_*` only alongside a config file"),
+        "{CONFIG_REF} `health` row must say MANTA_SERVER_* needs a config file"
+    );
+    let server = section(&md, "[server]");
+    let intro = squash_whitespace(&server[..server.find("\n|").unwrap_or(server.len())]);
+    assert!(
+        intro.contains("`health` reads the same two keys"),
+        "{CONFIG_REF} [server] must say `health` reads metrics_bind_addr and metrics_port"
+    );
+    assert!(
+        intro.contains("exits 1 when the named file plus overrides resolve to no `[server]` table"),
+        "{CONFIG_REF} [server] must say `health` rejects a config with no [server] table"
+    );
+    let rows = backticked_rows(server);
+    for key in ["metrics_bind_addr", "metrics_port"] {
+        let row = rows
+            .iter()
+            .find(|r| r[0] == format!("`{key}`"))
+            .unwrap_or_else(|| panic!("{CONFIG_REF} [server] has no `{key}` row"));
+        assert!(
+            row[2].contains("`health`"),
+            "{CONFIG_REF} [server] `{key}`'s Wired cell must name `health`"
+        );
+    }
+}
+
+/// MAN-149 PR #251 review: config::load joins a relative path to the
+/// config file's directory only when the file set it; a `MANTA_*` value
+/// or a flag stays relative to the working directory.
+#[test]
+fn config_reference_documents_path_resolution_by_source() {
+    let md = doc(CONFIG_REF);
+    for (table, key, flag) in [
+        ("input", "path", "--source"),
+        ("spot", "blocklist_path", "--blocklist"),
+        ("spot", "notch_path", "--notch"),
+        ("spot", "cty_path", "--cty"),
+        ("spot", "scp_path", "--scp"),
+        ("spot", "pattern_path", "--patterns"),
+    ] {
+        let rows = backticked_rows(config_ref_table_section(&md, table));
+        let row = rows
+            .iter()
+            .find(|r| r[0] == format!("`{key}`"))
+            .unwrap_or_else(|| panic!("{CONFIG_REF} has no [{table}] `{key}` row"));
+        let notes = squash_whitespace(row.last().unwrap());
+        let var = format!("`MANTA_{}_{}`", table.to_uppercase(), key.to_uppercase());
+        for wanted in [
+            "the file's directory",
+            "the working directory",
+            &var,
+            &format!("`{flag}`"),
+        ] {
+            assert!(
+                notes.contains(wanted),
+                "{CONFIG_REF} [{table}] `{key}` must say how a relative path resolves \
+                 from the file versus {flag}/{var}; its Notes cell lacks {wanted}"
+            );
+        }
+    }
+}
+
+/// MAN-149 PR #251 review: metrics_http::handle_request charges EOF,
+/// header-timeout and header-read-error connections against
+/// metrics_max_requests_per_ip, but answers only the request path with 429.
+#[test]
+fn metrics_reference_documents_non_request_budget_charges() {
+    let md = doc(METRICS_REF);
+    let scraping = squash_whitespace(section(&md, "Scraping"));
+    assert!(
+        !scraping.contains("caps completed requests"),
+        "{METRICS_REF} still describes metrics_max_requests_per_ip as a completed-request cap"
+    );
+    for charged in [
+        "closes without sending a byte",
+        "times out reading its headers",
+        "hits a read error",
+    ] {
+        assert!(
+            scraping.contains(charged),
+            "{METRICS_REF} must say a connection that {charged} is charged"
+        );
+    }
+    assert!(
+        scraping.contains("is charged but never refused"),
+        "{METRICS_REF} must say those connections are never answered with 429"
+    );
+}
+
+/// MAN-149 M2: config deserialization uppercases the station identity;
+/// SpotMessage uses that identity for both deCall and the id prefix.
+#[test]
+fn spot_schema_documents_uppercased_station_identity() {
+    let md = doc("docs/SPOT-SCHEMA.md");
+    let rows = backticked_rows(section(&md, "Fields"));
+    for field in ["deCall", "id"] {
+        let row = rows
+            .iter()
+            .find(|r| r[0] == format!("`{field}`"))
+            .unwrap_or_else(|| panic!("SPOT-SCHEMA.md is missing {field}"));
+        assert!(
+            row.last().unwrap().contains("uppercased"),
+            "SPOT-SCHEMA.md {field} must describe the uppercased station callsign"
+        );
+        assert!(
+            !row.last().unwrap().contains("exactly as configured"),
+            "SPOT-SCHEMA.md {field} still promises to preserve config casing"
+        );
+    }
+}
+
+/// Every `#key = value` line of the `manta config init` scaffold, as
+/// `(table, key, value_src)` -- the same two patterns `config_cmd.rs`'s
+/// scaffold drift tests parse it with. `value_src` keeps any trailing
+/// `# comment`, which TOML ignores.
+fn scaffold_settings() -> Vec<(String, String, String)> {
+    let header = regex::Regex::new(r"^#?\[\[?([a-z_]+)\]\]?\s*$").unwrap();
+    let setting = regex::Regex::new(r"^#([a-z_]+) = (.*)$").unwrap();
+    let mut table = None;
+    let mut out = Vec::new();
+    for line in doc("crates/manta-cli/src/config_init.toml").lines() {
+        if let Some(c) = header.captures(line) {
+            table = Some(c[1].to_string());
+        } else if let Some(c) = setting.captures(line) {
+            let t = table
+                .clone()
+                .unwrap_or_else(|| panic!("scaffold setting `{line}` before any table"));
+            out.push((t, c[1].to_string(), c[2].to_string()));
+        }
+    }
+    assert!(!out.is_empty(), "no settings parsed from the scaffold");
+    out
+}
+
+/// `src` as the TOML value of `v = <src>`.
+fn toml_value(src: &str) -> toml::Value {
+    let mut t: toml::Table = toml::from_str(&format!("v = {src}"))
+        .unwrap_or_else(|e| panic!("`{src}` is not a TOML value: {e}"));
+    t.remove("v").expect("v")
+}
+
+/// The cells of every `` | `name` | … `` table row in `md`, trimmed, with
+/// the leading and trailing empty cells dropped.
+fn backticked_rows(md: &str) -> Vec<Vec<String>> {
+    md.lines()
+        .filter(|l| l.starts_with("| `"))
+        .map(|l| {
+            let cells: Vec<String> = l.split('|').map(|c| c.trim().to_string()).collect();
+            cells[1..cells.len() - 1].to_vec()
+        })
+        .collect()
+}
+
+/// The first `` `code span` `` in `cell`.
+fn first_code_span(cell: &str) -> Option<&str> {
+    let start = cell.find('`')? + 1;
+    let len = cell[start..].find('`')?;
+    Some(&cell[start..start + len])
+}
+
+/// `docs/CONFIG.md`'s section for a TOML table: `## [[t]]` when it has one,
+/// else `## [t]`.
+fn config_ref_table_section<'a>(md: &'a str, table: &str) -> &'a str {
+    if md.contains(&format!("\n## [[{table}]]")) {
+        section(md, &format!("[[{table}]]"))
+    } else {
+        section(md, &format!("[{table}]"))
+    }
+}
+
+/// Scenario 1: an operator looking a key up finds its default and whether
+/// it is wired to behaviour. The Default column is pinned to the scaffold,
+/// which `config_cmd.rs` pins to the code, and a row for a key the loader
+/// no longer accepts fails too.
+#[test]
+fn config_reference_lists_every_scaffold_key_with_its_default() {
+    let md = doc(CONFIG_REF);
+    let settings = scaffold_settings();
+    let mut tables: Vec<&str> = settings.iter().map(|(t, _, _)| t.as_str()).collect();
+    tables.dedup();
+    for table in tables {
+        let rows = backticked_rows(config_ref_table_section(&md, table));
+        for (_, key, value) in settings.iter().filter(|(t, _, _)| t == table) {
+            let wanted = format!("`{key}`");
+            let row = rows.iter().find(|r| r[0] == wanted).unwrap_or_else(|| {
+                panic!("{CONFIG_REF} has no `| `{key}` |` row under its [{table}] heading")
+            });
+            assert!(
+                row.len() >= 3,
+                "{CONFIG_REF} [{table}] `{key}` row needs Key, Default and Wired cells"
+            );
+            let span = first_code_span(&row[1]).unwrap_or_else(|| {
+                panic!("{CONFIG_REF} [{table}] `{key}`: the Default cell has no `code span`")
+            });
+            assert_eq!(
+                toml_value(span),
+                toml_value(value),
+                "{CONFIG_REF} [{table}] `{key}`: the Default cell's first code span `{span}` \
+                 is not the scaffold's value `{value}` (crates/manta-cli/src/config_init.toml)"
+            );
+            assert!(
+                !row[2].is_empty(),
+                "{CONFIG_REF} [{table}] `{key}`: the Wired cell is empty"
+            );
+        }
+        for row in &rows {
+            assert!(
+                settings
+                    .iter()
+                    .any(|(t, k, _)| t == table && row[0] == format!("`{k}`")),
+                "{CONFIG_REF} [{table}] documents {}, which the scaffold (and so the loader) \
+                 does not list",
+                row[0]
+            );
+        }
+    }
+}
+
+/// SPEC §9's `not configurable yet` keys are names an operator may try;
+/// CONFIG.md must say the loader rejects them.
+#[test]
+fn config_reference_lists_every_constant_only_key() {
+    let md = doc(CONFIG_REF);
+    let not_settable = section(&md, "Not settable");
+    let key = regex::Regex::new(r"^#\s*([a-z_]+)\s*=").unwrap();
+    let constants: Vec<String> = spec_section_9_toml()
+        .lines()
+        .filter(|l| l.contains("not configurable yet"))
+        .filter_map(|l| key.captures(l.trim_start()).map(|c| c[1].to_string()))
+        .collect();
+    assert!(
+        !constants.is_empty(),
+        "SPEC §9 has no `not configurable yet` keys"
+    );
+    for k in constants {
+        assert!(
+            not_settable.contains(&format!("| `{k}` |")),
+            "{CONFIG_REF}'s \"Not settable\" section has no `| `{k}` |` row"
+        );
+    }
+}
+
+/// Every family `metrics.rs` renders has a row with its Prometheus type,
+/// and the page names no family that does not exist.
+#[test]
+fn metrics_reference_lists_every_rendered_family() {
+    let md = doc(METRICS_REF);
+    let src = doc("crates/manta-server/src/metrics.rs");
+    let type_line = regex::Regex::new(r"# TYPE (manta_[a-z0-9_]+) ([a-z]+)").unwrap();
+    let mut families: Vec<(String, String)> = type_line
+        .captures_iter(&src)
+        .map(|c| (c[1].to_string(), c[2].to_string()))
+        .collect();
+    families.sort();
+    families.dedup();
+    assert!(
+        !families.is_empty(),
+        "no `# TYPE` lines found in metrics.rs"
+    );
+    for (name, kind) in &families {
+        assert!(
+            md.contains(&format!("| `{name}` | {kind} |")),
+            "{METRICS_REF} has no `| `{name}` | {kind} |` row"
+        );
+    }
+    let token = regex::Regex::new(r"\bmanta_[a-z0-9_]+").unwrap();
+    let mut unknown: Vec<&str> = token
+        .find_iter(&md)
+        .map(|m| m.as_str())
+        .filter(|raw| {
+            let name = ["_bucket", "_sum", "_count"]
+                .iter()
+                .find_map(|s| raw.strip_suffix(s))
+                .unwrap_or(raw);
+            !families.iter().any(|(f, _)| f == name)
+        })
+        .collect();
+    unknown.sort();
+    unknown.dedup();
+    assert!(
+        unknown.is_empty(),
+        "{METRICS_REF} names metrics crates/manta-server/src/metrics.rs does not render: \
+         {unknown:?}"
+    );
+}
+
+/// The `[text](target)` link targets in `md`.
+fn link_targets(md: &str) -> Vec<String> {
+    let link = regex::Regex::new(r#"\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)"#).unwrap();
+    link.captures_iter(md).map(|c| c[1].to_string()).collect()
+}
+
+/// Whether a relative link target in `from` (a repo-relative path) names
+/// a file or directory that exists; `#anchors` are ignored.
+fn relative_link_resolves(from: &str, target: &str) -> bool {
+    let path = target.split('#').next().unwrap_or(target);
+    let base = repo_root().join(from);
+    base.parent().expect("a directory").join(path).exists()
+}
+
+/// Scenario 3: each audience has one entry point, and it opens.
+#[test]
+fn docs_index_names_a_start_here_per_audience() {
+    let md = doc(DOCS_INDEX);
+    for audience in ["Operators", "Contributors", "Researchers"] {
+        let body = section(&md, audience);
+        let line = body
+            .lines()
+            .find(|l| l.starts_with("Start here:"))
+            .unwrap_or_else(|| panic!("{DOCS_INDEX} `## {audience}` has no `Start here:` line"));
+        let targets = link_targets(line);
+        let target = targets.first().unwrap_or_else(|| {
+            panic!("{DOCS_INDEX} `## {audience}`'s `Start here:` line has no link")
+        });
+        assert!(
+            relative_link_resolves(DOCS_INDEX, target),
+            "{DOCS_INDEX} `## {audience}`'s `Start here:` link `{target}` does not resolve"
+        );
+    }
+}
+
+/// The `.md` file names directly inside a repo-relative directory.
+fn md_files_in(dir: &str) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(repo_root().join(dir))
+        .unwrap_or_else(|e| panic!("reading {dir}: {e}"))
+        .map(|e| {
+            e.expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|n| n.ends_with(".md") && n != "README.md")
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn docs_index_links_every_runbook() {
+    let targets = link_targets(&doc(DOCS_INDEX));
+    let runbooks = md_files_in("docs/RUNBOOKS");
+    assert!(!runbooks.is_empty(), "docs/RUNBOOKS has no runbooks");
+    for name in runbooks {
+        let want = format!("RUNBOOKS/{name}");
+        assert!(
+            targets
+                .iter()
+                .any(|t| t.split('#').next() == Some(want.as_str())),
+            "{DOCS_INDEX} does not link docs/{want}: add a row to its Runbooks table"
+        );
+    }
+}
+
+#[test]
+fn decisions_index_links_every_record() {
+    let targets = link_targets(&doc(DECISIONS_INDEX));
+    let records = md_files_in("docs/DECISIONS");
+    assert!(!records.is_empty(), "docs/DECISIONS has no records");
+    for name in records {
+        assert!(
+            targets.iter().any(|t| t.split('#').next() == Some(name.as_str())),
+            "{DECISIONS_INDEX} does not link {name}: add a `| date | ticket | [title]({name}) |` row"
+        );
+    }
+}
+
+#[test]
+fn reference_docs_relative_links_resolve() {
+    for file in [
+        CONFIG_REF,
+        METRICS_REF,
+        "docs/SPOT-SCHEMA.md",
+        "docs/LIVE-STATE.md",
+        DOCS_INDEX,
+        DECISIONS_INDEX,
+    ] {
+        let broken: Vec<String> = link_targets(&doc(file))
+            .into_iter()
+            .filter(|t| {
+                !(t.starts_with("http://")
+                    || t.starts_with("https://")
+                    || t.starts_with("mailto:")
+                    || t.starts_with('#'))
+            })
+            .filter(|t| !relative_link_resolves(file, t))
+            .collect();
+        assert!(
+            broken.is_empty(),
+            "{file} has relative links that do not resolve: {broken:?}"
+        );
+    }
+}
+
+// ---- MAN-133: completions and man pages, documented and real ----
+
+/// MAN-133: README's Installation documents how to load the completion
+/// script for every shell the binary supports and how to read `man manta`,
+/// and never suggests `source <(…)` (a silent no-op on macOS's bash 3.2;
+/// decision D11).
+#[test]
+fn readme_installation_documents_completions_and_man_pages() {
+    let install = squash_whitespace(section(&doc("README.md"), "Installation"));
+    assert!(
+        install.contains("### Tab completion and man pages"),
+        "README Installation has no `### Tab completion and man pages` subsection"
+    );
+    let completions_help = manta().args(["completions", "--help"]).output().unwrap();
+    assert!(completions_help.status.success());
+    let help = String::from_utf8(completions_help.stdout).unwrap();
+    let values = help
+        .lines()
+        .find(|l| l.contains("[possible values: "))
+        .expect("`manta completions --help` lists no possible values");
+    for shell in values
+        .split("[possible values: ")
+        .nth(1)
+        .unwrap()
+        .trim_end_matches(']')
+        .split(", ")
+    {
+        assert!(
+            install.contains(&format!("manta completions {shell}")),
+            "README Installation never shows `manta completions {shell}`"
+        );
+    }
+    for needle in ["man/man1", "manta man-pages --out", "man manta"] {
+        assert!(
+            install.contains(needle),
+            "README Installation never says {needle:?}"
+        );
+    }
+    assert!(
+        install.contains("eval \"$(manta completions bash)\""),
+        "README's bash row must use eval \"$(…)\", not source <(…)"
+    );
+    assert!(
+        !install.contains("source <(manta completions"),
+        "README still suggests `source <(manta completions …)`, a silent no-op on \
+         macOS's bash 3.2 (MAN-133 D11)"
+    );
+}
+
+/// MAN-133: the release runbook names the steps that render the pages and
+/// where they land in each archive.
+#[test]
+fn release_runbook_lists_the_man_pages() {
+    let runbook = squash_whitespace(&doc("docs/RUNBOOKS/release.md"));
+    for needle in ["man/man1", "the `validate-tag` job's man-page steps"] {
+        assert!(
+            runbook.contains(needle),
+            "docs/RUNBOOKS/release.md never says {needle:?}"
+        );
+    }
+}
+
+/// No `docs/DECISIONS/` path CLAUDE.md cites is glued to the word before it,
+/// and each one that is not a glob names a `.md` file that exists. MAN-133's
+/// reflow once joined `See` onto the MAN-314 record's path
+/// (`Seedocs/DECISIONS/…`).
+#[test]
+fn claude_md_decision_paths_start_a_word_and_resolve() {
+    let claude = doc("CLAUDE.md");
+    for (at, _) in claude.match_indices("docs/DECISIONS/") {
+        let line = claude[..at].matches('\n').count() + 1;
+        assert!(
+            !claude[..at]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric),
+            "CLAUDE.md:{line}: a `docs/DECISIONS/` path is glued to the word before it"
+        );
+        let token = claude[at..].split(char::is_whitespace).next().unwrap();
+        let path = token
+            .find(".md")
+            .map(|end| &token[..end + 3])
+            .unwrap_or_else(|| {
+                panic!("CLAUDE.md:{line}: `{token}` is not a whole .md path (split across lines?)")
+            });
+        if path.contains(['[', '*']) {
+            continue;
+        }
+        assert!(
+            repo_root().join(path).is_file(),
+            "CLAUDE.md:{line} cites {path}, which does not exist"
+        );
+    }
+}
+
+/// SPEC §5 is the normative event schema, and `TrackClosed` carries a
+/// `closure` whose kind decides whether deferred evidence is judged,
+/// migrated or discarded (`manta_decode::events::ClosureKind`). PR #154
+/// added the field without updating §5, which kept showing
+/// `TrackClosed { track_id }` (MAN-174, finding 7).
+#[test]
+fn spec_section_5_track_closed_names_its_closure_kinds() {
+    let spec = doc("docs/SPEC-decode-core.md");
+    let s5 = section(&spec, "5. Decoder output");
+    for needle in ["closure", "SignalEnded", "Bookkeeping", "survivor_track_id"] {
+        assert!(
+            s5.contains(needle),
+            "SPEC §5's `TrackClosed` entry never names `{needle}`"
+        );
+    }
 }
