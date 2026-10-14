@@ -228,6 +228,15 @@ pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
 planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
+MAN-174: within a `process_hops` batch a merge loser's `TrackClosed`
+precedes its survivor's, and a merge survivor that never emitted still
+gets its own `TrackClosed`, so a deferred Beacon migrated along a merge
+chain resolves at the final survivor's close. `SuppressionCounts` adds
+`pending_beacon_rejected_wpm` and `pending_beacon_stale`; pending beacons
+are kept in `sample_ts` order, so the cap evicts the true oldest, and an
+equal-timestamp one goes through dedupe. SPEC §5/§6 and V22/V25 match. See
+docs/DECISIONS/2026-10-14-man174-deferred-beacon-merge-bookkeeping.md.
+
 MAN-192: the HSMM decoder reseeds after a committed Silence segment, not
 only on a present re-onset (SPEC v2 §4.7's second trigger), carrying the
 closing segment in `HistEntry::closing_segment` and a scored-prefix
