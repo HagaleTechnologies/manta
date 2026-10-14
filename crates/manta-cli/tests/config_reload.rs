@@ -209,7 +209,10 @@ fn sighup_applies_a_new_blocklist_without_dropping_clients_or_history() {
         &config,
         server_toml(
             "operator_qth = \"Testville\"",
-            &format!("cty_path = \"{}\"\n", cty.display()),
+            &format!(
+                "cty_path = \"{}\"\nvalidation_level = \"minimal\"\n",
+                cty.display()
+            ),
         ),
     )
     .unwrap();
@@ -217,7 +220,13 @@ fn sighup_applies_a_new_blocklist_without_dropping_clients_or_history() {
     expect_line(&daemon.stderr, &["reload: applied"], LINE_TIMEOUT);
     expect_line(
         &daemon.stderr,
-        &["WARN", "restart", "server.operator_qth", "spot.cty_path"],
+        &[
+            "WARN",
+            "restart",
+            "server.operator_qth",
+            "spot.cty_path",
+            "spot.validation_level",
+        ],
         LINE_TIMEOUT,
     );
 

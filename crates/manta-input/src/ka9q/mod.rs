@@ -852,6 +852,11 @@ mod tests {
     #[test]
     fn stash_takes_at_most_one_batch_per_call() {
         let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // Match the production socket: small default receive buffers can drop
+        // the queued datagrams before stash_data gets a chance to drain them.
+        socket2::SockRef::from(&rx)
+            .set_recv_buffer_size(RCVBUF_BYTES)
+            .unwrap();
         rx.set_nonblocking(true).unwrap();
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
         for _ in 0..DRAIN_BATCH + 20 {

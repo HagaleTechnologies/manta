@@ -177,7 +177,7 @@ then the call in ascending order.
 | Field | JSON type | Null? | Meaning |
 |---|---|---|---|
 | `call` | string | never | The candidate callsign. |
-| `reps` | integer | never | Message-distinct repetitions of this word on this track within the last 90 s. A spot needs 2 (see `requiredReps` on `candidateDecision`), but this count is per track, while the spot decision's count can include nearby tracks. |
+| `reps` | integer | never | Message-distinct repetitions of this word on this track within the last 90 s. A spot needs its pattern tier's requirement (see `requiredReps` on `candidateDecision`), but this count is per track, while the spot decision's count can include nearby tracks. |
 | `confSum` | number | never | The sum, over those repetitions, of each repetition's mean character confidence (geometric mean, 0 to 1). Breaks ties between candidates with equal `reps`. |
 
 ## `candidateDecision` records
@@ -191,7 +191,7 @@ the same batch's `trackState` records, so the state naming its candidate
 always arrives first.
 
 ```json
-{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000044,"trackId":9,"call":"W4KTNL","frequency":14031200,"band":"20m","spotType":"de","decision":"withheld","reason":"variant","reps":2,"requiredReps":2,"rival":{"call":"W4KCL","reps":2,"confSum":1.016},"spotId":null}
+{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000044,"trackId":9,"call":"W4KTNL","frequency":14031200,"band":"20m","spotType":"de","decision":"withheld","reason":"repetition","reps":2,"requiredReps":5,"patternTier":"unlisted","rival":null,"spotId":null}
 ```
 
 | Field | JSON type | Null? | Meaning |
@@ -207,7 +207,8 @@ always arrives first.
 | `decision` | string | never | `spotted`, `withheld` or `deferred`. |
 | `reason` | string or null | when spotted | Why the candidate was withheld or deferred; `null` when `decision` is `spotted`. One of the twelve strings below. |
 | `reps` | integer or null | when the gate did not run | The repetition gate's count for this decode: message-distinct decodes of the call near this frequency within the last 90 s, this one included, which can span nearby tracks. `null` when the decision came before the gate ran: reasons `blocklist`, `notch`, `grammar`, `cty`, `powerStepGuard`, `beaconPending`, `beaconSpeed`, `beaconOverflow` and `beaconDiscarded`. |
-| `requiredReps` | integer | never | Repetitions a candidate needs to spot. Always `2`. |
+| `requiredReps` | integer | never | Repetitions this candidate needs to spot: 1 for an allowlisted call or beacon; otherwise 2, 3 or 5 by pattern tier at `normal`, or 2 at `minimal`. |
+| `patternTier` | string or null | for an allowlisted call or beacon | `"common"`, `"listed"` or `"unlisted"`: the candidate's callsign-pattern tier. |
 | `rival` | object or null | unless variant | When `reason` is `variant`, the better-supported variant that wins on this track, as `{"call", "reps", "confSum"}`: its callsign, its message-distinct repetitions on this track within the last 90 s, and its `confSum`. `null` for every other reason. |
 | `spotId` | string or null | unless spotted | When `decision` is `spotted`, the `id` of the spot published on the `:7301` stream, so a dashboard can join the two streams. `null` otherwise. |
 | `confSum` | number | never | Only inside `rival`: the rival's sum of per-repetition mean character confidence, as a `trackState` candidate's `confSum`. Variant arbitration compares `reps` first and `confSum` on a tie. |
@@ -282,9 +283,9 @@ timestamps, `occupancy` and `confSum` are illustrative.
 $ nc 127.0.0.1 7303
 {"kind":"bandState","deCall":"W1AW","timestamp":1700000005,"bands":[{"band":"20m","loHz":14000000,"hiHz":14047906,"channels":512,"noiseFloorDb":-62.2,"occupancy":0.0059,"activeTracks":1},{"band":"unknown","loHz":13952000,"hiHz":13999906,"channels":512,"noiseFloorDb":-62.2,"occupancy":0.0,"activeTracks":0}]}
 {"kind":"trackState","deCall":"W1AW","timestamp":1700000013,"trackId":1,"frequency":14012362,"band":"20m","wpm":20,"snr":21,"snrRefHz":2500,"text":"CQ CQ DE W1AW","candidates":[{"call":"W1AW","reps":1,"confSum":0.55}]}
-{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000013,"trackId":1,"call":"W1AW","frequency":14012362,"band":"20m","spotType":"cq","decision":"withheld","reason":"repetition","reps":1,"requiredReps":2,"rival":null,"spotId":null}
+{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000013,"trackId":1,"call":"W1AW","frequency":14012362,"band":"20m","spotType":"cq","decision":"withheld","reason":"repetition","reps":1,"requiredReps":2,"patternTier":"common","rival":null,"spotId":null}
 {"kind":"trackState","deCall":"W1AW","timestamp":1700000020,"trackId":1,"frequency":14012362,"band":"20m","wpm":20,"snr":21,"snrRefHz":2500,"text":"CQ CQ DE W1AW W1AW","candidates":[{"call":"W1AW","reps":2,"confSum":1.1}]}
-{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000020,"trackId":1,"call":"W1AW","frequency":14012362,"band":"20m","spotType":"cq","decision":"spotted","reason":null,"reps":2,"requiredReps":2,"rival":null,"spotId":"W1AW:12534119743695398054:1:2006272:W1AW"}
+{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000020,"trackId":1,"call":"W1AW","frequency":14012362,"band":"20m","spotType":"cq","decision":"spotted","reason":null,"reps":2,"requiredReps":2,"patternTier":"common","rival":null,"spotId":"W1AW:12534119743695398054:1:2006272:W1AW"}
 {"kind":"trackClosed","deCall":"W1AW","timestamp":1700000120,"trackId":1,"closure":"signalEnded","survivorTrackId":null}
 ```
 
@@ -318,7 +319,9 @@ the live listener up. See [METRICS.md](METRICS.md).
 ## Where the values come from
 
 - [`crates/manta-spot/src/decision.rs`](../crates/manta-spot/src/decision.rs):
-  the decision, its verdict and reason, and `REQUIRED_REPS`.
+  the decision, its verdict and reason, and the candidate's `required_reps`
+  and `pattern_tier`. Thresholds come from
+  [`crates/manta-spot/src/pattern.rs`](../crates/manta-spot/src/pattern.rs).
 - [`crates/manta-spot/src/support.rs`](../crates/manta-spot/src/support.rs):
   candidate support (`reps`, `confSum`) and variant arbitration.
 - [`crates/manta-engine/src/live.rs`](../crates/manta-engine/src/live.rs):

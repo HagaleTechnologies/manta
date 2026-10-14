@@ -761,6 +761,9 @@ mod tests {
         ));
         let cfg = PipelineConfig {
             cty: Some(Arc::new(table)),
+            patterns: Some(Arc::new(
+                manta_spot::pattern::Table::parse("+QQ9@@@\n").unwrap(),
+            )),
             ..Default::default()
         };
         assert!(calls(&cfg).contains(&"QQ9ZZZ".into()));
