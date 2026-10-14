@@ -288,7 +288,15 @@ track back to ACTIVE.
 - Each hop, the track's demod input is taken from the **max-power channel
   among its owned set** (per ARCHITECTURE §4 "max-power selection"); the
   owned set follows `round(c)` as the centroid drifts, which is how drifting
-  signals (§7 test 9) are followed without retuning.
+  signals (§7 test 9) are followed without retuning. A live track's
+  selection additionally **skips channels still serving a post-`Silent`
+  respawn cooldown**, falling back to the plain max-power channel only when
+  every owned channel is cooling: a candidate born two bins from a cooling
+  channel passes the spawn gate legitimately, yet a stronger neighbour can
+  drag `round(c)` onto the cooling channel, whose continuous power would
+  otherwise keep the track decoding the silenced birdie for a whole extra
+  GC cycle inside the cooldown window. (MAN-197, see
+  docs/DECISIONS/2026-10-14-man197-live-window-cooldown-enforcement.md)
 - If two channels `k` and `k+1` meet the rise condition on the *same hop* and
   neither is owned, a spawn decision at `k` creates one CANDIDATE at the
   higher instantaneous-power channel. This existing pairing rule can select
