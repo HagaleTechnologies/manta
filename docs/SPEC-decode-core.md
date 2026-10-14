@@ -1068,10 +1068,28 @@ TrackPromoted  { track_id, sample_ts: u64, freq_hz: f64 }  (detector-internal;
                  promoted from CANDIDATE to ACTIVE, independent of whether the
                  decoder subsequently produces anything. See
                  docs/DECISIONS/2026-09-09-doctor-track-promoted-event.md.)
-TrackClosed    { track_id }  (added post-freeze, MAN-19 — a track has closed
-                 and will never emit another event under this track_id; only
-                 emitted for a track that produced at least one other event
-                 first.)
+TrackClosed    { track_id, closure: SignalEnded
+                                     | Bookkeeping { survivor_track_id: Option<u32> } }
+                 (added post-freeze, MAN-19; `closure` PR #154 round 9,
+                 MAN-174 — a track has closed and will never emit another
+                 event under this track_id. Emitted only for a track that
+                 produced at least one other event first, or that a
+                 merged-away track named as its `survivor_track_id`. The
+                 `closure` kind says what a consumer holding deferred
+                 per-track evidence, such as manta-spot's pending Beacon
+                 candidates (§4 amendment), does with it:
+                   SignalEnded — `HangExpired`, or end of stream
+                     (`finish()`): the signal is gone; deferred evidence
+                     is judged now.
+                   Bookkeeping { survivor_track_id: Some(s) } — `Merged`:
+                     the identity may continue on track `s`; deferred
+                     evidence moves to `s` and is judged at `s`'s own
+                     close.
+                   Bookkeeping { survivor_track_id: None } — `Evicted`,
+                     `Silent`, `Rtty`, or a source discontinuity (MAN-73):
+                     tracking stopped with no successor; deferred evidence
+                     is discarded and counted.
+                 Missing in JSON, `closure` defaults to `SignalEnded`.)
 TimingUpdate   { track_id, sample_ts: u64, dit_ms: f32, dot, dash, element_gap,
                  char_gap, word_gap }  (added post-freeze, MAN-315 — the
                  track's §4.1b sender timing; each class is
@@ -1142,7 +1160,10 @@ rules:
 6. **Pool scheduling must not affect output:** decoder workers may run in any
    order, but each track's decoder is a pure function of its own input queue;
    emitted events are sequenced by `(sample_ts, track_id)` before the
-   validator sees them.
+   validator sees them. `TrackClosed` events sort after every other event of
+   their batch; a merge loser's `TrackClosed` precedes its survivor's own
+   `TrackClosed` in the same batch; other closures stay in `track_id` order
+   (MAN-174).
 
 CI enforces: same binary + same IQ file, 3 runs → identical SHA-256 of the
 JSON spot log; and the §7 vectors on all platforms.
@@ -1213,10 +1234,10 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V19 | allowlist-bypass | A single decode of a callsign with an unallocated cty prefix, explicitly allowlisted | Spots despite failing grammar/cty and despite only 1 decode (MAN-28 Watch List) |
 | V20 | allowlist-no-context | An allowlisted callsign decoded with no CQ/DE/UP/beacon framing at all | Spots, tagged `SpotType::Unknown` (MAN-28 Watch List, the primary NCDXF-beacon case) |
 | V21 | allowlist-independent-of-context | A stale, already-attempted context match (e.g. `CQ K5ARH`, decoded once, never spotted) sits in the window when a different, freshly-allowlisted word arrives | The allowlisted word still spots -- context-match and allowlist candidates are evaluated independently, not one-or-the-other by priority (MAN-28 Watch List) |
-| V22 | exempt-spot-waits-for-metadata | A first-decode-exempt callsign (BEACON or allowlist) decoded before the track's first `TrackMeta` event | No spot until real telemetry arrives; the pending candidate spots once metadata does arrive, on the next word boundary |
+| V22 | exempt-spot-waits-for-metadata | An allowlisted callsign decoded before the track's first `TrackMeta` event | No spot until real telemetry arrives; the pending candidate spots once metadata does arrive, on the next word boundary. A non-allowlisted BEACON candidate decoded before `TrackMeta` is captured once metadata arrives and spots only at `TrackClosed` (V18/V30; `power_step_beacon_retains_every_unattempted_occurrence_across_the_metadata_gate`) |
 | V23 | allowlist-reclassification | An allowlisted call spots immediately with no context (type `Unknown`), then a trailing word completes a real context pattern (e.g. `<call> UP` -> `De`) | A second, corrected spot is emitted with the new type -- an already-attempted word is not permanently locked to its first type |
 | V24 | reclassification-reps-reuse | "DE K5ARH" decodes once (reps=1, held back by the repetition gate), then a trailing `CQ` token reclassifies the same word from `De` to `Cq` | Still 0 spots -- the reclassification reuses the word's existing rep count rather than recording a second decode |
-| V25 | metadata-retries-pending-candidate | A `TrackMeta` event arrives for a track with a pending exempt candidate (held back by V22) and no further word ever completes | The candidate is retried and spots as part of the `TrackMeta` ingest itself, not left waiting on a `WordBoundary` that may never come |
+| V25 | metadata-retries-pending-candidate | A `TrackMeta` event arrives for a track with a pending allowlisted candidate (held back by V22) and no further word ever completes | The candidate is retried and spots as part of the `TrackMeta` ingest itself, not left waiting on a `WordBoundary` that may never come. A pending non-allowlisted BEACON candidate is captured at that `TrackMeta`, not spotted; it spots only at `TrackClosed` (V18/V30) |
 | V26 | reclassification-never-downgrades | "DE K5ARH" spots as `De`; 15 more words push "DE" out of the 16-word window while "K5ARH" remains | No spot reverts to `Unknown` -- reclassification only ever promotes a word's type, never downgrades one that already earned a contextual type |
 | V27 | reclassification-never-downgrades-between-types | "CQ DE K5ARH" spots as `Cq`; 15 more words push both "CQ" and "DE" out of the window while "K5ARH" remains | No spot reclassifies to `De` -- the same aging-out bug shape as V26, for a pair of two contextual types instead of type-vs-`Unknown` |
 | V28 | reclassification-still-accepted | "DE K5ARH" spots as `De`; a `CQ` token then arrives as a genuinely new trailing word (not via aging) | A second spot promotes it to `Cq` -- V26/V27's fix rejects aging-driven changes specifically, not reclassification in general |

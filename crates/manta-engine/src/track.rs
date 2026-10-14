@@ -506,7 +506,9 @@ pub(crate) struct Track {
     /// removed (that only runs once, after every hop in the batch), so it
     /// can have an allocated decoder yet have emitted nothing at all
     /// (MAN-19 review round 1). `TrackClosed` emission checks this, not
-    /// decoder presence.
+    /// decoder presence. Also set when an emitting merge loser names this
+    /// track as its survivor (MAN-174): consumers may hold state for it
+    /// from that moment, so it owes its own `TrackClosed`.
     has_emitted: bool,
     /// MAN-168 (SPEC v2 §3): this track's narrowband amplitude refiner,
     /// lazily constructed the first time `decoder_input` runs with
@@ -1739,7 +1741,8 @@ impl TrackManager {
             }
         }
         // MAN-19: only report a close as `TrackClosed`-worthy if the track
-        // actually emitted a real event (`has_emitted`), not merely
+        // actually emitted a real event (`has_emitted`, or was named as a
+        // merge survivor -- MAN-174, see `merge_converged`), not merely
         // whether it was ever promoted (`decoder.is_some()`) -- a track
         // promoted and then merged/evicted within this *same*
         // `process_hops` batch never gets a `drain_pool` pass before it's
@@ -2000,6 +2003,16 @@ impl TrackManager {
                 if !track.has_emitted {
                     return None;
                 }
+                // MAN-174: the loser's TrackClosed names `survivor` to every
+                // consumer, which may create per-track_id state for it
+                // (manta-spot migrates pending beacons there). The survivor
+                // therefore owes its own TrackClosed even if it has emitted
+                // nothing yet. A survivor here can only be a loser in a
+                // later `to_close` entry (pairs with a loser are skipped
+                // above), so it is still in `self.tracks`.
+                if let Some(s) = self.tracks.get_mut(&survivor) {
+                    s.has_emitted = true;
+                }
                 // MAN-194: same reasoning as step_hop's closure handling --
                 // a merge-loser's refiner also stops receiving input here.
                 track.drain_refiner_into_pending();
@@ -2147,20 +2160,11 @@ impl TrackManager {
         // 6; `event_sample_ts` gives these no ordering claim of their own
         // (synthetic `u64::MAX`, same treatment as `SpeedUpdate`'s
         // synthetic `0` -- see that function's doc; `TrackMeta` now
-        // carries a real timestamp, MAN-102 review round 2).
-        events.extend(
-            closed_ids
-                .into_iter()
-                .map(|(track_id, closure)| DecoderEvent::TrackClosed { track_id, closure }),
-        );
-        events.sort_by_key(|e| {
-            (
-                effective_sort_ts(e, &promoted_ts_by_track),
-                event_track_id(e),
-                event_kind_tier(e),
-            )
-        });
-        events
+        // carries a real timestamp, MAN-102 review round 2). Among
+        // themselves, a merge loser's `TrackClosed` sorts before its
+        // survivor's own same-batch `TrackClosed` (MAN-174) -- see
+        // `sequence_batch`.
+        sequence_batch(events, closed_ids, &promoted_ts_by_track)
     }
 
     /// Flush every track's decoder (SPEC §5 end-of-stream). Call once,
@@ -2416,6 +2420,80 @@ fn effective_sort_ts(
         }
         other => event_sample_ts(other),
     }
+}
+
+/// SPEC §6 rule 6 resequencing for one `process_hops` batch, plus
+/// MAN-174: a merge loser's `TrackClosed` sorts before its survivor's own
+/// same-batch `TrackClosed`, so a consumer migrating the loser's deferred
+/// evidence (manta-spot's pending beacons) finds the survivor still open.
+/// Every other event keeps `(sample_ts, track_id, tier)` order: the
+/// second key is non-zero only for a `TrackClosed`, and every
+/// `TrackClosed` already sorts after every other event of the batch (its
+/// synthetic `u64::MAX` timestamp, see `event_sample_ts`), so it reorders
+/// closures among themselves and nothing else. Independent closures stay
+/// in `track_id` order.
+fn sequence_batch(
+    mut events: Vec<DecoderEvent>,
+    closed_ids: Vec<(u32, ClosureKind)>,
+    promoted_ts_by_track: &std::collections::HashMap<u32, u64>,
+) -> Vec<DecoderEvent> {
+    let depth = closure_depths(&closed_ids);
+    events.extend(
+        closed_ids
+            .into_iter()
+            .map(|(track_id, closure)| DecoderEvent::TrackClosed { track_id, closure }),
+    );
+    events.sort_by_key(|e| {
+        let closure_depth = match e {
+            DecoderEvent::TrackClosed { track_id, .. } => depth.get(track_id).copied().unwrap_or(0),
+            _ => 0,
+        };
+        (
+            effective_sort_ts(e, promoted_ts_by_track),
+            std::cmp::Reverse(closure_depth),
+            event_track_id(e),
+            event_kind_tier(e),
+        )
+    });
+    events
+}
+
+/// For each track closed this batch: how many same-batch merge hops lead
+/// from it, survivor to survivor, before reaching a track that is not
+/// itself closed this batch (or that closed with no survivor). 0 for a
+/// non-merge closure, or a merge whose survivor stays open. A loser's
+/// depth is always its survivor's plus one, so sorting closures by
+/// descending depth puts every loser ahead of its survivor (MAN-174).
+/// The walk is bounded by the number of closures, so a malformed cycle
+/// cannot hang it; only `BTreeMap`s are used (SPEC §6 rule 3).
+fn closure_depths(closed: &[(u32, ClosureKind)]) -> BTreeMap<u32, usize> {
+    let survivor_of: BTreeMap<u32, Option<u32>> = closed
+        .iter()
+        .map(|&(track_id, closure)| {
+            let survivor = match closure {
+                ClosureKind::Bookkeeping { survivor_track_id } => survivor_track_id,
+                ClosureKind::SignalEnded => None,
+            };
+            (track_id, survivor)
+        })
+        .collect();
+    survivor_of
+        .keys()
+        .map(|&track_id| {
+            let mut depth = 0;
+            let mut current = track_id;
+            while depth < closed.len() {
+                match survivor_of.get(&current).copied().flatten() {
+                    Some(survivor) if survivor_of.contains_key(&survivor) => {
+                        depth += 1;
+                        current = survivor;
+                    }
+                    _ => break,
+                }
+            }
+            (track_id, depth)
+        })
+        .collect()
 }
 
 /// Tertiary sort key, after `(effective_sort_ts, track_id)`: `TrackPromoted`
@@ -4256,6 +4334,182 @@ mod tests {
                 2,
                 ClosureKind::Bookkeeping {
                     survivor_track_id: Some(1)
+                }
+            )]
+        );
+    }
+
+    /// MAN-174 fixture: a `TrackManager` holding tracks 1..=n, each with
+    /// a hand-set `(center, current_snr_db, has_emitted)`.
+    fn man174_tracks(track_cap: usize, setup: &[(f64, f32, bool)]) -> TrackManager {
+        let det_cfg = DetectorConfig {
+            track_cap,
+            ..DetectorConfig::default()
+        };
+        let mut tm =
+            TrackManager::new(64, 96_000.0, 14_000_000.0, det_cfg, DecodeConfig::default());
+        for (i, &(center, snr, emitted)) in setup.iter().enumerate() {
+            tm.spawn(10 + 20 * i);
+            let track = tm.tracks.get_mut(&(i as u32 + 1)).unwrap();
+            track.center = center;
+            track.current_snr_db = snr;
+            track.has_emitted = emitted;
+        }
+        tm
+    }
+
+    fn closed_order(events: &[DecoderEvent]) -> Vec<u32> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::TrackClosed { track_id, .. } => Some(*track_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn merged_into(survivor: u32) -> ClosureKind {
+        ClosureKind::Bookkeeping {
+            survivor_track_id: Some(survivor),
+        }
+    }
+
+    /// MAN-174 finding 1: three tracks converge in one hop. Track 2 merges
+    /// into track 1, then track 1 into track 3. Track 2's closure must
+    /// reach consumers first, or its migrated evidence lands on track 1
+    /// after track 1 has already closed.
+    #[test]
+    fn chained_merge_closures_are_sequenced_loser_before_survivor() {
+        let mut tm = man174_tracks(
+            8,
+            &[(20.4, 12.0, true), (20.9, 8.0, true), (21.3, 18.0, true)],
+        );
+        let (closed, _) = tm.merge_converged();
+        assert_eq!(closed, vec![(2, merged_into(1)), (1, merged_into(3))]);
+        let events = sequence_batch(Vec::new(), closed, &std::collections::HashMap::new());
+        assert_eq!(closed_order(&events), vec![2, 1]);
+    }
+
+    /// MAN-174: a survivor that also closes this batch (here
+    /// `SignalEnded`) sorts after its loser; independent closures keep
+    /// `track_id` order.
+    #[test]
+    fn a_merge_losers_closure_precedes_its_survivors_same_batch_close() {
+        let closed = vec![
+            (5, ClosureKind::SignalEnded),
+            (2, merged_into(1)),
+            (
+                4,
+                ClosureKind::Bookkeeping {
+                    survivor_track_id: None,
+                },
+            ),
+            (1, ClosureKind::SignalEnded),
+        ];
+        let events = vec![
+            DecoderEvent::word_boundary(5, 100),
+            DecoderEvent::word_boundary(1, 50),
+        ];
+        let events = sequence_batch(events, closed, &std::collections::HashMap::new());
+        assert_eq!(closed_order(&events), vec![2, 1, 4, 5]);
+        assert!(
+            matches!(events[0], DecoderEvent::WordBoundary { track_id: 1, .. })
+                && matches!(events[1], DecoderEvent::WordBoundary { track_id: 5, .. }),
+            "non-closure events keep (sample_ts, track_id) order ahead of every closure: {events:?}"
+        );
+    }
+
+    /// MAN-174 finding 1, end to end: real `merge_converged` output,
+    /// sequenced, into a real `Validator`. Track 2's deferred Beacon must
+    /// resolve at the final survivor's (track 3's) close.
+    #[test]
+    fn chained_merge_resolves_the_deferred_beacon_at_the_final_survivor() {
+        let mut tm = man174_tracks(
+            8,
+            &[(20.4, 12.0, true), (20.9, 8.0, true), (21.3, 18.0, true)],
+        );
+        let (closed, _) = tm.merge_converged();
+        let closures = sequence_batch(Vec::new(), closed, &std::collections::HashMap::new());
+
+        let mut v = manta_spot::Validator::bundled(96_000.0);
+        let meta = |track_id| DecoderEvent::TrackMeta {
+            track_id,
+            sample_ts: 0,
+            snr_2500_db: 20.0,
+            freq_hz: 14_000_000.0,
+        };
+        let mut events = vec![
+            meta(2),
+            DecoderEvent::SpeedUpdate {
+                track_id: 2,
+                wpm: 22.0,
+            },
+        ];
+        let mut ts = 1_000;
+        for word in ["K5ARH", "T"] {
+            for c in word.chars() {
+                events.push(DecoderEvent::char_decoded(
+                    2,
+                    ts,
+                    manta_decode::tree::Glyph::Char(c),
+                    0.95,
+                ));
+                ts += 100;
+            }
+            events.push(DecoderEvent::word_boundary(2, ts));
+            ts += 100;
+        }
+        events.extend(closures);
+        events.extend([
+            meta(3),
+            DecoderEvent::SpeedUpdate {
+                track_id: 3,
+                wpm: 25.0,
+            },
+            DecoderEvent::TrackClosed {
+                track_id: 3,
+                closure: ClosureKind::SignalEnded,
+            },
+        ]);
+        let spots: Vec<_> = events.iter().flat_map(|e| v.ingest(e)).collect();
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].callsign, "K5ARH");
+        assert_eq!(spots[0].spot_type, manta_spot::SpotType::Beacon);
+    }
+
+    /// MAN-174 finding 1b: track 1 merges into track 2, which has emitted
+    /// nothing. Track 2 is now named to consumers, so when it later merges
+    /// into track 3 it must get its own `TrackClosed`.
+    #[test]
+    fn a_never_emitted_merge_survivor_gets_its_own_closure_when_it_merges() {
+        let mut tm = man174_tracks(
+            8,
+            &[(20.4, 8.0, true), (20.9, 12.0, false), (40.0, 18.0, false)],
+        );
+        let (closed, _) = tm.merge_converged();
+        assert_eq!(closed, vec![(1, merged_into(2))]);
+        tm.tracks.get_mut(&3).unwrap().center = 21.3;
+        let (closed, _) = tm.merge_converged();
+        assert_eq!(closed, vec![(2, merged_into(3))]);
+    }
+
+    /// MAN-174 finding 1b, eviction path: the never-emitted survivor of a
+    /// merge is evicted, and still owes its `TrackClosed`.
+    #[test]
+    fn a_never_emitted_merge_survivor_gets_its_own_closure_when_evicted() {
+        let mut tm = man174_tracks(
+            1,
+            &[(20.4, 8.0, true), (20.9, 12.0, false), (40.0, 18.0, false)],
+        );
+        let (closed, _) = tm.merge_converged();
+        assert_eq!(closed, vec![(1, merged_into(2))]);
+        let (evicted, _) = tm.evict_over_cap();
+        assert_eq!(
+            evicted,
+            vec![(
+                2,
+                ClosureKind::Bookkeeping {
+                    survivor_track_id: None
                 }
             )]
         );
