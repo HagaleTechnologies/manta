@@ -25,6 +25,9 @@ pub struct StartupInfo<'a> {
     pub telnet_addr: SocketAddr,
     pub json_addr: SocketAddr,
     pub metrics_addr: SocketAddr,
+    /// MAN-324: the live-state listener's bound address, when
+    /// `[server].live_port` is set.
+    pub live_addr: Option<SocketAddr>,
 }
 
 /// Scenario 1's one-line banner. The verb is `listening:`, not `ready:`
@@ -36,7 +39,7 @@ pub struct StartupInfo<'a> {
 /// Readiness to decode is a separate, later event; see
 /// `format_pipeline_ready`.
 pub fn format_startup_banner(info: &StartupInfo<'_>) -> String {
-    format!(
+    let mut line = format!(
         "manta {} listening: source={} sample_rate_hz={:.0} dial_frequency={} station={} \
          telnet={} json={} metrics={}",
         info.version,
@@ -47,7 +50,13 @@ pub fn format_startup_banner(info: &StartupInfo<'_>) -> String {
         info.telnet_addr,
         info.json_addr,
         info.metrics_addr,
-    )
+    );
+    // MAN-324: appended only when the live-state listener runs, so the
+    // banner is unchanged without `live_port`.
+    if let Some(live) = info.live_addr {
+        line.push_str(&format!(" live={live}"));
+    }
+    line
 }
 
 /// The readiness event proper: emitted once, by the daemon wiring layer,
@@ -310,6 +319,7 @@ mod tests {
             telnet_addr: "127.0.0.1:7300".parse().unwrap(),
             json_addr: "127.0.0.1:7301".parse().unwrap(),
             metrics_addr: "127.0.0.1:7302".parse().unwrap(),
+            live_addr: None,
         });
         for needle in [
             "0.1.0",
@@ -322,6 +332,26 @@ mod tests {
         ] {
             assert!(line.contains(needle), "{needle:?} missing from {line:?}");
         }
+    }
+
+    #[test]
+    fn banner_appends_live_addr_only_when_enabled() {
+        let info = |live_addr| StartupInfo {
+            version: "0.1.0",
+            source: "file",
+            sample_rate_hz: 96_000.0,
+            dial_freq_hz: 14_000_000.0,
+            station_callsign: "W1AW",
+            telnet_addr: "127.0.0.1:7300".parse().unwrap(),
+            json_addr: "127.0.0.1:7301".parse().unwrap(),
+            metrics_addr: "127.0.0.1:7302".parse().unwrap(),
+            live_addr,
+        };
+        let off = format_startup_banner(&info(None));
+        assert!(off.ends_with("metrics=127.0.0.1:7302"), "{off}");
+        assert!(!off.contains("live="));
+        let on = format_startup_banner(&info(Some("127.0.0.1:7303".parse().unwrap())));
+        assert_eq!(on, format!("{off} live=127.0.0.1:7303"));
     }
 
     #[test]
@@ -436,6 +466,7 @@ mod tests {
             telnet_addr: "127.0.0.1:7300".parse().unwrap(),
             json_addr: "127.0.0.1:7301".parse().unwrap(),
             metrics_addr: "127.0.0.1:7302".parse().unwrap(),
+            live_addr: None,
         });
         assert!(banner.contains("listening:"), "{banner:?}");
         assert!(!banner.contains("ready:"), "{banner:?}");
