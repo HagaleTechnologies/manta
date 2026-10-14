@@ -337,7 +337,14 @@ mod tests {
                 if path.is_dir() {
                     stack.push(path);
                 } else {
-                    out.push(path.strip_prefix(dir).unwrap().display().to_string());
+                    // `/`-joined so expectations hold on Windows too, where
+                    // `display()` would render `cty\<sha>.dat`.
+                    let rel = path.strip_prefix(dir).unwrap();
+                    let parts: Vec<_> = rel
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect();
+                    out.push(parts.join("/"));
                 }
             }
         }
