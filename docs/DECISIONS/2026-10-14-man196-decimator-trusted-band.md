@@ -13,9 +13,10 @@ crossover of the halfband design — serves both halves of the ticket:
   clips to it, so `manta check` (JSON `passband_offsets_hz` narrows from
   `[-24000, 24000]` to `[-21724.8, 21724.8]` at 48 kS/s), SETT/Aggregator
   segments, live-state `bandState` rows and the MAN-312 static-crash
-  live set all advertise/judge the honest band in one edit. `run`/`soak`
-  print one startup info line stating the usable passband in the
-  crash-filter-notice position. The field names, schemas and metrics
+  live set all advertise/judge the honest band in one edit. `run` logs
+  one startup info line stating the usable passband in the
+  crash-filter-notice position; `soak` prints the same line on stderr
+  before it starts. The field names, schemas and metrics
   families do not change.
 - **Veto** (option a): `IqSource::trusted_band_hz()` (default `None`)
   reports the band; `listen` reads it once per source and threads it

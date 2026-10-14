@@ -151,6 +151,44 @@ fn a_decimated_capture_states_its_usable_passband_once() {
     assert!(!plain.contains("decimated capture"), "{plain}");
 }
 
+/// MAN-196: `soak` states a decimated capture's usable passband with the
+/// same line `run` logs, exactly once on stderr, and not at all without a
+/// decimator in the path.
+#[test]
+fn a_decimated_soak_states_its_usable_passband_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = write_fixture(dir.path(), &short_v1());
+    let line = "decimated capture 48000 Hz: usable passband -21725 to 21725 Hz; \
+                channels beyond (decimator transition band) are not tracked";
+    let soak = |extra_args: &[&str]| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_manta"));
+        cmd.args([
+            "soak",
+            "--duration",
+            "1",
+            "--cty",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../manta-spot/data/cty.dat"),
+            "--source",
+            wav.to_str().unwrap(),
+            "--source-iq",
+            "--dial-freq-hz",
+            "14000000",
+        ])
+        .args(extra_args)
+        .env_remove("NO_COLOR")
+        .env_remove("RUST_LOG");
+        stderr_of(&cmd.output().unwrap())
+    };
+    let decimated = soak(&["--capture-rate-hz", "48000"]);
+    assert_eq!(
+        decimated.lines().filter(|l| l.contains(line)).count(),
+        1,
+        "the usable-passband line must appear exactly once: {decimated}"
+    );
+    let plain = soak(&[]);
+    assert!(!plain.contains("decimated capture"), "{plain}");
+}
+
 #[test]
 fn quiet_keeps_warnings_and_drops_info() {
     let dir = tempfile::tempdir().unwrap();

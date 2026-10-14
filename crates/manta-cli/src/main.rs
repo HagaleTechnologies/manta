@@ -1714,6 +1714,17 @@ fn warn_if_audio_source_has_no_rf_reference(has_rf_aware_source: bool, dial_freq
     }
 }
 
+/// MAN-196: the one startup line a decimated capture prints, naming its
+/// usable passband (the decimator's <= 1 dB trusted band). `run` logs it
+/// through `tracing::info!`; `soak`, which installs no subscriber, writes
+/// it straight to stderr.
+fn trusted_band_notice(fs_out_hz: f64, lo_hz: f64, hi_hz: f64) -> String {
+    format!(
+        "decimated capture {fs_out_hz:.0} Hz: usable passband {lo_hz:.0} to {hi_hz:.0} Hz; \
+         channels beyond (decimator transition band) are not tracked"
+    )
+}
+
 /// MAN-131: a live audio input delivering exact zeros is, on macOS, the
 /// usual sign of a denied microphone permission (cpal cannot see TCC; the
 /// stream opens and the callback hands over silence). A warning, not an
@@ -5558,10 +5569,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             // without a decimator: the non-decimated path is unchanged
             // in every observable respect.
             if let Some((lo, hi)) = trusted_band {
-                tracing::info!(
-                    "decimated capture {trusted_band_fs_hz:.0} Hz: usable passband {lo:.0} to {hi:.0} Hz; \
-                     channels beyond (decimator transition band) are not tracked"
-                );
+                tracing::info!("{}", trusted_band_notice(trusted_band_fs_hz, lo, hi));
             }
             if reload_enabled {
                 logging::note(
@@ -5987,6 +5995,12 @@ fn run_command() -> Result<std::process::ExitCode> {
             warn_if_audio_source_has_no_rf_reference(spec.is_rf_aware(), resolved.dial_freq_hz);
             let src: Box<dyn IqSource> =
                 spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz)?;
+            // MAN-196: the same usable-passband line `run` logs, once,
+            // before the soak starts; `Some` only with a decimator in the
+            // path. Plain stderr: `soak` installs no tracing subscriber.
+            if let Some((lo, hi)) = src.trusted_band_hz() {
+                eprintln!("{}", trusted_band_notice(src.sample_rate(), lo, hi));
+            }
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
             print!("{}", fmt::soak_report(&report));
             if !manta_engine::soak_passed(&report) {
