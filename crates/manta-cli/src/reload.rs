@@ -729,6 +729,16 @@ blocklist_path = \"bl.txt\"
     }
 
     #[test]
+    fn pattern_settings_need_a_restart() {
+        let old = table("[spot]\nvalidation_level = 'normal'\npattern_path = 'old.lst'\n");
+        let new = table("[spot]\nvalidation_level = 'minimal'\npattern_path = 'new.lst'\n");
+        assert_eq!(
+            restart_only_changes(&old, &new),
+            vec!["spot.pattern_path", "spot.validation_level"]
+        );
+    }
+
+    #[test]
     fn restart_only_changes_reports_cty_and_scp_paths() {
         let old = table("[spot]\ncty_path = \"/a/cty.dat\"\nblocklist_path = \"bl.txt\"\n");
         let new = table("[spot]\ncty_path = \"/b/cty.dat\"\nscp_path = \"/b/master.scp\"\nblocklist_path = \"other.txt\"\n");

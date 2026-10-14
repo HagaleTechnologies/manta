@@ -1318,6 +1318,9 @@ struct FilterOpts {
     /// Defaults to the built-in copy, or to `spot.scp_path` from --config.
     #[arg(long)]
     scp: Option<PathBuf>,
+    /// Callsign-pattern list used in place of the built-in one ([spot] pattern_path).
+    #[arg(long, value_name = "PATH")]
+    patterns: Option<PathBuf>,
 }
 
 /// KiwiSDR connection flags, grouped to keep `open_source`'s arity down.
@@ -2162,6 +2165,17 @@ fn strip_bom(text: &str) -> &str {
     text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 
+/// Loads a reference table once, with consistent path context and BOM handling.
+fn read_reference<T>(
+    path: &Path,
+    label: &str,
+    parse: impl FnOnce(&str) -> Result<T>,
+) -> Result<std::sync::Arc<T>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {label} {}", path.display()))?;
+    parse(strip_bom(&text)).map(std::sync::Arc::new)
+}
+
 /// Builds a `PipelineConfig` from the CLI's shared flags: the MAN-29
 /// frequency-calibration correction, the MAN-28 operator Watch List, and
 /// the MAN-31 operator suppression lists. Each is optional/repeatable; an
@@ -2176,6 +2190,7 @@ fn build_pipeline_config(
     let mut cfg = PipelineConfig {
         freq_correction_ppm,
         allowlist: spot.allowlist.clone(),
+        validation_level: spot.validation_level,
         detector,
         ..Default::default()
     };
@@ -2191,22 +2206,32 @@ fn build_pipeline_config(
         cfg.notch = manta_engine::NotchList::parse(strip_bom(&text));
     }
     if let Some(path) = &spot.cty {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading cty.dat file {}", path.display()))?;
-        let table = manta_spot::cty::Table::parse(strip_bom(&text));
-        if table.is_empty() {
-            bail!("cty.dat file {} lists no callsign prefixes; is it AD1C's cty.dat (not cty.csv or a saved web page)?", path.display());
-        }
-        cfg.cty = Some(std::sync::Arc::new(table));
+        cfg.cty = Some(read_reference(path, "cty.dat file", |text| {
+            let table = manta_spot::cty::Table::parse(text);
+            if table.is_empty() {
+                bail!("cty.dat file {} lists no callsign prefixes; is it AD1C's cty.dat (not cty.csv or a saved web page)?", path.display());
+            }
+            Ok(table)
+        })?);
     }
     if let Some(path) = &spot.scp {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading master.scp file {}", path.display()))?;
-        let set = manta_spot::scp::Set::parse(strip_bom(&text));
-        if set.is_empty() {
-            bail!("master.scp file {} lists no callsigns", path.display());
-        }
-        cfg.scp = Some(std::sync::Arc::new(set));
+        cfg.scp = Some(read_reference(path, "master.scp file", |text| {
+            let set = manta_spot::scp::Set::parse(text);
+            if set.is_empty() {
+                bail!("master.scp file {} lists no callsigns", path.display());
+            }
+            Ok(set)
+        })?);
+    }
+    if let Some(path) = &spot.patterns {
+        cfg.patterns = Some(read_reference(path, "the pattern list", |text| {
+            manta_spot::pattern::Table::parse(text).map_err(|error| match error {
+                manta_spot::pattern::ParseError::Empty => {
+                    anyhow!("the pattern list {} contains no patterns", path.display())
+                }
+                _ => anyhow!("reading the pattern list {}: {error}", path.display()),
+            })
+        })?);
     }
     Ok(cfg)
 }
@@ -3133,6 +3158,7 @@ fn station_profile(
     center_freq_hz: f64,
     rf_passband_hz: (f64, f64),
     freq_calibration: f64,
+    validation_level: manta_spot::ValidationLevel,
 ) -> manta_server::telnet::StationProfile {
     manta_server::telnet::StationProfile {
         call: cfg.station_callsign.clone(),
@@ -3140,7 +3166,12 @@ fn station_profile(
         operator_qth: cfg.operator_qth.clone(),
         operator_grid: cfg.operator_grid.clone(),
         sett: manta_server::sett::SettSettings {
-            validation_level: manta_server::sett::ValidationLevel::Normal,
+            validation_level: match validation_level {
+                manta_spot::ValidationLevel::Minimal => {
+                    manta_server::sett::ValidationLevel::Minimal
+                }
+                manta_spot::ValidationLevel::Normal => manta_server::sett::ValidationLevel::Normal,
+            },
             cq_only: false,
             segments: manta_server::sett::segments_for_passband(
                 center_freq_hz,
@@ -3202,8 +3233,10 @@ fn start_spot_server(
     source: SourceInfo<'_>,
     epoch: std::time::SystemTime,
     session_nonce: u128,
-    cty: std::sync::Arc<manta_spot::cty::Table>,
+    pipeline: &PipelineConfig,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
+    let cty = pipeline.cty_table();
+    let validation_level = pipeline.validation_level;
     // MAN-59 connection/rejection events below are logged at `info`/
     // `warn`. `start_spot_server` no longer installs the subscriber:
     // `logging::init` does, at the top of `run` (MAN-124), and its module
@@ -3369,6 +3402,7 @@ fn start_spot_server(
                 source.dial_freq_hz,
                 source.rf_passband_hz,
                 source.freq_calibration,
+                validation_level,
             ));
             spawn_tracked_listener(
                 LISTENER_TELNET,
@@ -3654,6 +3688,7 @@ struct CliOverrides {
     notch: Option<PathBuf>,
     cty: Option<PathBuf>,
     scp: Option<PathBuf>,
+    patterns: Option<PathBuf>,
     /// MAN-301: `--rbn-compare`/`--rbn-spotter` (`run` only).
     rbn: RbnCompareOpts,
 }
@@ -3698,6 +3733,7 @@ impl CliOverrides {
             notch: None,
             cty: None,
             scp: None,
+            patterns: None,
             rbn: RbnCompareOpts::default(),
         }
     }
@@ -3759,11 +3795,13 @@ impl CliOverrides {
 /// `[spot]` after the CLI is merged over the file/env layer (D6).
 #[derive(Debug, PartialEq)]
 struct SpotResolved {
+    validation_level: manta_spot::ValidationLevel,
     allowlist: Vec<String>,
     blocklist: Option<PathBuf>,
     notch: Option<PathBuf>,
     cty: Option<PathBuf>,
     scp: Option<PathBuf>,
+    patterns: Option<PathBuf>,
 }
 
 /// A non-empty `--allowlist` replaces the file's list (never concatenated);
@@ -3774,6 +3812,7 @@ fn resolve_spot(
     cli_notch: Option<PathBuf>,
     cli_cty: Option<PathBuf>,
     cli_scp: Option<PathBuf>,
+    cli_patterns: Option<PathBuf>,
     spot: &config::SpotFile,
 ) -> SpotResolved {
     SpotResolved {
@@ -3786,6 +3825,8 @@ fn resolve_spot(
         notch: cli_notch.or_else(|| spot.notch_path.clone()),
         cty: cli_cty.or_else(|| spot.cty_path.clone()),
         scp: cli_scp.or_else(|| spot.scp_path.clone()),
+        patterns: cli_patterns.or_else(|| spot.pattern_path.clone()),
+        validation_level: spot.validation_level,
     }
 }
 
@@ -3855,6 +3896,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
         cli.notch.clone(),
         cli.cty.clone(),
         cli.scp.clone(),
+        cli.patterns.clone(),
         &loaded.spot,
     );
     let mut shared = loaded.input.shared.clone();
@@ -4822,6 +4864,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 notch,
                 cty,
                 scp,
+                patterns,
             } = filters;
             // D7/D8: the whole file is validated, the environment is never
             // read; [decode], [detector], [spot] and input.freq_correction_ppm
@@ -4839,7 +4882,15 @@ fn run_command() -> Result<std::process::ExitCode> {
                     loaded.origin
                 );
             }
-            let spot = resolve_spot(allowlist, blocklist, notch, cty, scp, &loaded.spot);
+            let spot = resolve_spot(
+                allowlist,
+                blocklist,
+                notch,
+                cty,
+                scp,
+                patterns,
+                &loaded.spot,
+            );
             let decode_cfg = merge_cli_engine(engine, loaded.decode.clone());
             let mut cfg = build_pipeline_config(
                 freq_correction_ppm
@@ -5002,6 +5053,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 notch,
                 cty,
                 scp,
+                patterns,
             } = filters;
             let cli = CliOverrides {
                 device,
@@ -5045,6 +5097,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 notch,
                 cty,
                 scp,
+                patterns,
                 rbn,
             };
             // MAN-78: a SIGHUP reload re-resolves with the same flags.
@@ -5246,7 +5299,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                         },
                         epoch,
                         session_nonce,
-                        cfg.cty_table(),
+                        &cfg,
                     )?;
                     // MAN-45 (round-9 finding): the daemon's own copy of the
                     // gauge `manta_engine::listen_with_observers` updates as
@@ -5836,6 +5889,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 notch,
                 cty,
                 scp,
+                patterns,
             } = filters;
             let Prepared {
                 loaded,
@@ -5885,6 +5939,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     notch,
                     cty,
                     scp,
+                    patterns,
                     rbn: RbnCompareOpts::default(),
                 },
                 config,
@@ -5993,6 +6048,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 notch,
                 cty,
                 scp,
+                patterns,
             } = filters;
             // Checked before any source is opened -- otherwise an invalid
             // --duration only surfaces after a KiwiSDR/SoapySDR/HPSDR
@@ -6057,6 +6113,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     notch,
                     cty,
                     scp,
+                    patterns,
                     rbn: RbnCompareOpts::default(),
                 },
                 config,
@@ -6582,13 +6639,41 @@ mod tests {
     const QQ9_ENTITY: &str = "Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n";
 
     #[test]
+    fn cli_patterns_override_file_and_preserve_validation_level() {
+        let spot = config::SpotFile {
+            pattern_path: Some("file.lst".into()),
+            validation_level: manta_spot::ValidationLevel::Minimal,
+            ..Default::default()
+        };
+        let r = resolve_spot(
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            Some("cli.lst".into()),
+            &spot,
+        );
+        assert_eq!(r.patterns, Some("cli.lst".into()));
+        assert_eq!(r.validation_level, manta_spot::ValidationLevel::Minimal);
+    }
+
+    #[test]
     fn cli_cty_beats_cty_path() {
         let spot = config::SpotFile {
             cty_path: Some("file.dat".into()),
             scp_path: Some("file.scp".into()),
             ..Default::default()
         };
-        let r = resolve_spot(vec![], None, None, Some("cli.dat".into()), None, &spot);
+        let r = resolve_spot(
+            vec![],
+            None,
+            None,
+            Some("cli.dat".into()),
+            None,
+            None,
+            &spot,
+        );
         assert_eq!(r.cty, Some("cli.dat".into()));
         assert_eq!(r.scp, Some("file.scp".into()));
     }
@@ -6599,18 +6684,42 @@ mod tests {
             scp_path: Some("file.scp".into()),
             ..Default::default()
         };
-        let r = resolve_spot(vec![], None, None, None, Some("cli.scp".into()), &spot);
+        let r = resolve_spot(
+            vec![],
+            None,
+            None,
+            None,
+            Some("cli.scp".into()),
+            None,
+            &spot,
+        );
         assert_eq!(r.cty, Some("file.dat".into()));
         assert_eq!(r.scp, Some("cli.scp".into()));
     }
     #[test]
     fn unset_cty_and_scp_stay_built_in() {
-        let r = resolve_spot(vec![], None, None, None, None, &config::SpotFile::default());
+        let r = resolve_spot(
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            &config::SpotFile::default(),
+        );
         let cfg = build_pipeline_config(0.0, &r, Default::default(), Engine::Legacy).unwrap();
         assert!(cfg.cty.is_none() && cfg.scp.is_none());
     }
     fn tables_config(cty: Option<PathBuf>, scp: Option<PathBuf>) -> Result<PipelineConfig> {
-        let spot = resolve_spot(vec![], None, None, cty, scp, &config::SpotFile::default());
+        let spot = resolve_spot(
+            vec![],
+            None,
+            None,
+            cty,
+            scp,
+            None,
+            &config::SpotFile::default(),
+        );
         build_pipeline_config(0.0, &spot, Default::default(), Engine::Legacy)
     }
     #[test]
@@ -6696,7 +6805,10 @@ mod tests {
             },
             std::time::UNIX_EPOCH,
             0,
-            table.clone(),
+            &PipelineConfig {
+                cty: Some(table.clone()),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert!(std::sync::Arc::ptr_eq(&server.cty, &table));
@@ -7018,7 +7130,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -7850,7 +7962,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -7910,7 +8022,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -7968,7 +8080,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         );
         assert!(
             result.is_ok(),
@@ -8002,7 +8114,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -8106,7 +8218,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         ) else {
             panic!("half a lat/lon pair must not start the servers");
         };
@@ -8163,7 +8275,7 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -8960,7 +9072,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             allowlist: vec!["W1AW".into()],
             ..Default::default()
         };
-        let r = resolve_spot(vec!["K1ABC".into()], None, None, None, None, &spot);
+        let r = resolve_spot(vec!["K1ABC".into()], None, None, None, None, None, &spot);
         assert_eq!(r.allowlist, vec!["K1ABC".to_string()]);
     }
 
@@ -8970,7 +9082,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             allowlist: vec!["W1AW".into()],
             ..Default::default()
         };
-        let r = resolve_spot(Vec::new(), None, None, None, None, &spot);
+        let r = resolve_spot(Vec::new(), None, None, None, None, None, &spot);
         assert_eq!(r.allowlist, vec!["W1AW".to_string()]);
     }
 
@@ -8984,6 +9096,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let r = resolve_spot(
             Vec::new(),
             Some(PathBuf::from("cli.txt")),
+            None,
             None,
             None,
             None,
@@ -9271,6 +9384,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("notch", "spot.notch_path"),
         ("cty", "spot.cty_path"),
         ("scp", "spot.scp_path"),
+        ("patterns", "spot.pattern_path"),
         ("engine", "decode.engine"),
         ("rbn_compare", "rbn_compare.enabled"),
         ("rbn_spotter", "rbn_compare.spotters"),
@@ -9429,6 +9543,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             ("spot.notch_path", "[spot]\nnotch_path = \"n.txt\"\n"),
             ("spot.cty_path", "[spot]\ncty_path = 'cty.dat'\n"),
             ("spot.scp_path", "[spot]\nscp_path = 'MASTER.SCP'\n"),
+            (
+                "spot.pattern_path",
+                "[spot]\npattern_path = 'patterns.lst'\n",
+            ),
             ("decode.engine", "[decode]\nengine = \"legacy\"\n"),
             (
                 "rbn_compare.enabled",
@@ -9484,6 +9602,19 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     }
 
     #[test]
+    fn sett_advertises_the_configured_minimal_validation_level() {
+        let cfg = test_server_config("W3XYZ");
+        let profile = station_profile(
+            &cfg,
+            14_040_000.0,
+            (-5_000.0, 5_000.0),
+            1.0,
+            manta_spot::ValidationLevel::Minimal,
+        );
+        assert_eq!(profile.sett.to_string(), "SETT: vlMinimal 14035.0-14045.0");
+    }
+
+    #[test]
     fn sett_advertises_a_rig_audio_source_only_above_its_dial_frequency() {
         // `--source` WAV / an audio device with --dial-freq-hz: analytic
         // audio carries spectrum ONLY above the dial, over the rig's ~3 kHz
@@ -9497,6 +9628,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 manta_input::AUDIO_PASSBAND_HI_HZ,
             ),
             1.0,
+            manta_spot::ValidationLevel::Normal,
         );
         assert_eq!(
             profile.sett.to_string(),
@@ -9511,8 +9643,20 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         // bounds have to move with them.
         let cfg = test_server_config("W3XYZ");
         let factor = manta_spot::calibration_factor_from_ppm(1_000.0).unwrap();
-        let corrected = station_profile(&cfg, 14_040_000.0, (-5_000.0, 5_000.0), factor);
-        let raw = station_profile(&cfg, 14_040_000.0, (-5_000.0, 5_000.0), 1.0);
+        let corrected = station_profile(
+            &cfg,
+            14_040_000.0,
+            (-5_000.0, 5_000.0),
+            factor,
+            manta_spot::ValidationLevel::Normal,
+        );
+        let raw = station_profile(
+            &cfg,
+            14_040_000.0,
+            (-5_000.0, 5_000.0),
+            1.0,
+            manta_spot::ValidationLevel::Normal,
+        );
         assert_eq!(raw.sett.to_string(), "SETT: vlNormal 14035.0-14045.0");
         assert_eq!(corrected.sett.to_string(), "SETT: vlNormal 14049.0-14059.1");
     }
@@ -9598,7 +9742,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -9646,7 +9790,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            &PipelineConfig::default(),
         )
         .unwrap();
 

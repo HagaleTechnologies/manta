@@ -84,6 +84,8 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("spot", "notch_path"),
     ("spot", "cty_path"),
     ("spot", "scp_path"),
+    ("spot", "pattern_path"),
+    ("spot", "validation_level"),
     ("decode", "engine"),
     ("detector", "crash_filter"),
 ];
@@ -134,6 +136,8 @@ pub(crate) struct SpotFile {
     pub notch_path: Option<PathBuf>,
     pub cty_path: Option<PathBuf>,
     pub scp_path: Option<PathBuf>,
+    pub pattern_path: Option<PathBuf>,
+    pub validation_level: manta_spot::ValidationLevel,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -144,6 +148,23 @@ struct SpotToml {
     notch_path: Option<PathBuf>,
     cty_path: Option<PathBuf>,
     scp_path: Option<PathBuf>,
+    pattern_path: Option<PathBuf>,
+    #[serde(default, deserialize_with = "deserialize_validation_level")]
+    validation_level: manta_spot::ValidationLevel,
+}
+
+fn deserialize_validation_level<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<manta_spot::ValidationLevel, D::Error> {
+    let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+    match value.as_str() {
+        "minimal" => Ok(manta_spot::ValidationLevel::Minimal),
+        "normal" => Ok(manta_spot::ValidationLevel::Normal),
+        _ => Err(serde::de::Error::unknown_variant(
+            &value,
+            &["minimal", "normal"],
+        )),
+    }
 }
 
 /// `input.type` (D5).
@@ -366,6 +387,10 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         scp_path: spot_toml
             .scp_path
             .map(|p| resolve_path("spot", "scp_path", p)),
+        pattern_path: spot_toml
+            .pattern_path
+            .map(|p| resolve_path("spot", "pattern_path", p)),
+        validation_level: spot_toml.validation_level,
     };
     let input_toml = take_typed::<InputToml>(&doc, "input", &origin, &overlay)?.unwrap_or_default();
     let input = validate_input(input_toml, &|p| resolve_path("input", "path", p))
@@ -795,6 +820,43 @@ fn levenshtein(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pattern_validation_level_accepts_minimal_and_rejects_unknown() {
+        let loaded = load_file("[spot]\nvalidation_level = 'minimal'\n").unwrap();
+        assert_eq!(
+            loaded.spot.validation_level,
+            manta_spot::ValidationLevel::Minimal
+        );
+        let err = err_of("[spot]\nvalidation_level = 'strict'\n");
+        assert!(err.contains("minimal") && err.contains("normal"), "{err}");
+    }
+
+    #[test]
+    fn pattern_settings_env_override_file_and_file_paths_are_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manta.toml");
+        std::fs::write(
+            &path,
+            "[spot]\nvalidation_level = 'normal'\npattern_path = 'patterns.lst'\n",
+        )
+        .unwrap();
+        let env = vars(&[
+            ("MANTA_SPOT_VALIDATION_LEVEL", "minimal"),
+            ("MANTA_SPOT_PATTERN_PATH", "2026"),
+        ]);
+        let loaded = load(Some(&path), Env::Read(&env)).unwrap();
+        assert_eq!(
+            loaded.spot.validation_level,
+            manta_spot::ValidationLevel::Minimal
+        );
+        assert_eq!(loaded.spot.pattern_path, Some(PathBuf::from("2026")));
+        let loaded = load(Some(&path), Env::Ignore).unwrap();
+        assert_eq!(
+            loaded.spot.pattern_path,
+            Some(dir.path().join("patterns.lst"))
+        );
+    }
 
     #[test]
     fn env_cty_and_scp_paths_are_string_typed_and_cwd_relative() {

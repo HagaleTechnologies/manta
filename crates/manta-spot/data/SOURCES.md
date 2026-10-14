@@ -51,3 +51,21 @@
 - Refresh: download the source above and replace `data/master.scp`.
   Operators can use `--scp` or `[spot] scp_path` to supply a newer file
   without a manta release.
+
+## patterns.lst
+
+- Source: mechanically derived from the vendored `master.scp`; independent of
+  Skimmer Server's licensed `Patt3Ch.lst`, with no entries copied from it.
+- Retrieved: generated 2026-10-14; the SCP release appears in the file header.
+- Format: one `[+]PATTERN` per line. `+` means at least two distinct plausible
+  SCP calls share the pattern; an unprefixed pattern has one. Blank lines and
+  `#` comments are ignored. Patterns preserve the first 3 call characters
+  (2 for letter-digit-letter, 4 for digit-letter-letter), then replace letters
+  with `@` and digits with `#`; portable suffixes are removed.
+- License/redistribution: same as `master.scp`, from which this list is derived.
+- Refresh: run `cargo run -p manta-spot --example gen_pattern_list` whenever
+  `master.scp` is refreshed (optional argument: an SCP input path). The generator
+  atomically replaces `data/patterns.lst`. The
+  `pattern::tests::vendored_list_is_derived_from_the_vendored_master_scp`
+  consistency test fails if the two drift apart. Operators override this list
+  separately with `--patterns` or `[spot] pattern_path`; `--scp` does not change it.
