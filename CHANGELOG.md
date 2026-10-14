@@ -24,6 +24,11 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-174: a deferred Beacon candidate on a track that merged into another
+  track which closed in the same batch now resolves at the final survivor's
+  close instead of being lost; one whose timestamp equals an existing
+  spot's goes through normal dedupe; a merge keeps the newest eight pending
+  candidates by time.
 - A band-wide static crash (lightning) no longer starts tracks across the
   band, and running tracks no longer decode it as extra dits; new
   `[detector].crash_filter`, default `"full"` (MAN-312).
