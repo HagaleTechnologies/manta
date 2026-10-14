@@ -19,6 +19,7 @@ on:
       - CI
       - Release
       - Release Publish
+      - Supply Chain
     types: [completed]
     branches: [main, 'v[0-9]*']
 
