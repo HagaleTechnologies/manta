@@ -125,6 +125,12 @@ station_callsign = "N0CALL"
 # a call (DE) and spots with no recognised context.
 #spot_types = "cq_beacon"
 
+# Per-minute ceiling on spots actually written to this target. Over the
+# ceiling, spots are counted in manta_uplink_ceiling_suppressed_total and
+# skipped -- the connection stays up. 0 disables the ceiling. Restart-only
+# (SIGHUP reloads only dry_run).
+#max_spots_per_minute = 600
+
 
 # --- Comparison with the Reverse Beacon Network -------------------------------
 # Grades each spot against what RBN's public telnet feed heard within
