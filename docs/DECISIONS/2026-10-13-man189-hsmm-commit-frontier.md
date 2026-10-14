@@ -12,23 +12,23 @@ input sample counter at the anchor where its character's first mark
 began; a word boundary carries the character it follows. A
 `commit::Frontier` holds the latest emitted `sample_ts` (`last_ts`), the
 latest emitted word-boundary `sample_ts` (`last_word_ts`) and the latest
-emitted character's `char_start_ts` (`last_char_start`):
+emitted glyph (`last_char`) and its first-mark anchor (`last_char_start`):
 
 - **Character entry:** decided if `char_start_ts <= last_ts`.
 - **Word boundary entry:** decided if `char_start_ts <= last_word_ts`,
   meaning a boundary was already emitted at or after its character began,
   *or* if `sample_ts < last_ts`, meaning its gap began before something
-  already emitted, *or* if `char_start_ts <= last_ts` and
-  `char_start_ts != last_char_start`, meaning its character is decided
-  but is not the character last emitted, so the boundary follows a
-  contradicting segmentation.
+  already emitted. The history filter also removes a boundary paired
+  with a stripped character whose glyph differs from `last_char` and
+  whose start differs from `last_char_start`. The pair shares both `char_start_ts` and `sample_ts`; a different
+  first-mark anchor alone does not establish disagreement.
 - **Emitting:** `last_ts = max(last_ts, sample_ts)`; for a word boundary,
   also `last_word_ts = max(last_word_ts, sample_ts)`; for a character,
-  `last_char_start = char_start_ts`.
+  `last_char = glyph` and `last_char_start = char_start_ts`.
 
-`commit::commit()` strips decided entries from the front of every token
-at the top of each loop iteration. `finish()` removes them from every
-live token with `retain`, and emits its unclosed `AfterMark` tail glyph
+`commit::commit()` filters every token history at the top of each loop
+iteration. `finish()` uses the same `strip_decided` filter, which uses
+`retain`, and emits its unclosed `AfterMark` tail glyph
 only when the frontier does not call that character decided. Character
 starts strictly increase along a token's `hist`, and a word boundary
 shares its character's start and closing time, so decided entries always
@@ -46,19 +46,33 @@ Consequences, each pinned by a unit test in `hsmm::commit::tests` or
 4. A conflicting segmentation that ends before the committed close is
    stripped (the out-of-order `T@1611 after B@1795` class).
 5. A word boundary at the same gap as an emitted character, from the WGap
-   lineage after the CGap lineage won, is still emitted once.
+   lineage after the CGap lineage won, is still emitted once, including
+   when the agreeing lineage placed its first mark at another anchor.
+   An agreeing variant closed later may also emit its boundary, provided
+   no boundary or later character has already decided that time.
 6. A second word boundary for the same character is stripped.
 7. A late word boundary behind a later character is stripped.
 8. Output `sample_ts` never decreases within a track.
-9. A word boundary that follows a stripped, contradicting character is
-   stripped too. Otherwise it would emit a space and move `last_ts` past
-   the real next character, which would then be dropped as decided.
+9. A word boundary paired with a stripped character whose glyph and
+   first-mark anchor both differ from the latest emitted character's
+   is stripped too. Otherwise it would emit
+   a space and move `last_ts` past the real next character, which would
+   then be dropped as decided.
 
-Rule 9's `last_char_start` condition was added in the implement phase
-after self-review found the leak; the plan's rule had only the first two
-word-boundary conditions. Re-measured on the implement build, it removes
-5 spurious word boundaries from V5 (CER 1.1771 → 1.1406) and leaves the
-decoded text of the other 14 vectors unchanged.
+The implement phase initially inferred rule 9's disagreement from unequal
+character starts. Validate attempt 1 reproduced two lost spaces after
+agreeing glyphs with different first-mark anchors. Remediation replaces
+that comparison with the paired predecessor's glyph comparison in the
+shared history filter. Unit regressions cover both consensus and a later
+re-derived variant, including the end-of-stream path.
+
+The filter retains the original handling of same-start alternatives.
+Extending suppression to a different glyph with the same start failed
+V8's zero-bogus gate with `K2ST`. The pre-repair control and the narrower
+filter each validated 45/50 calls with zero bogus spots on the same V8
+WAV. The narrower filter restores the agreeing boundary without that
+extra suppression. This does not claim to suppress every boundary from
+every contradictory segmentation.
 
 ## Mechanism and evidence
 
@@ -71,8 +85,8 @@ and was committed a second time. A lineage that split already-committed
 marks differently was committed out of time order for the same reason.
 
 The measurements below were taken during planning on `30e6f41` (main
-before this change) with a prototype that is byte-identical in output to
-the committed code on all 15 generated vectors.
+before this change) with the plan's two-condition prototype. These are
+historical measurements, not measurements of the remediated filter.
 
 VR6a, `manta decode --json --engine hsmm`:
 
@@ -108,7 +122,7 @@ the track nearest each expected frequency):
 | vector | CER main | CER frontier | chars main→frontier |
 |---|---|---|---|
 | V1, V2, V3, V4, V6, VR1, VR2, VR3, VR4, VR6b, VR7 | unchanged | unchanged (identical text) | unchanged |
-| V5 | 1.4062 | 1.1771 (1.1406 with rule 9) | 237→205 |
+| V5 | 1.4062 | 1.1771 | 237→205 |
 | VR5 (sig 0 / sig 1) | 0.1582 / 0.7228 | 0.1497 / 0.6966 | 308→300 |
 | VR6a | 0.0065 | 0.0032 | 248→247 |
 | VR8 | 0.6687 | 0.5604 | 316→289 |
@@ -138,8 +152,8 @@ O(|sealed|), and the per-anchor-step `min_hist_ts` scan is gone.
   Frontier plus `sealed` was measured byte-identical to the frontier
   alone on 15 vectors, so `sealed` is removed rather than kept alongside.
 - **`Anchor::min_hist_ts` and the `sealed` prune block** (rounds 3 and
-  4): they existed only to bound `sealed`'s growth. The frontier is two
-  integers and needs no pruning.
+  4): they existed only to bound `sealed`'s growth. The frontier is fixed-size
+  state and needs no pruning.
 - **The round-7 test's second assertion.**
   `finish_does_not_reemit_an_entry_sealed_by_a_different_lineage`
   injected `sealed = [(200, true)]` and asserted that a live `A@100` was

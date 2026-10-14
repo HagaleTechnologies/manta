@@ -68,16 +68,21 @@ pub fn margin(tokens: &[Token], j: usize, cfg: &HsmmConfig) -> (f32, Vec<(Glyph,
 /// same character again under a different closing anchor, or a
 /// segmentation that contradicts what was emitted. A word boundary is
 /// decided once one was emitted at or after its character's start, when
-/// its gap began before the latest emitted entry, or when its character
-/// is decided but is not the character last emitted (it follows a
-/// contradicting segmentation). Every check is O(1) and needs no pruning.
+/// its gap began before the latest emitted entry, or when it follows a
+/// stripped character with both a different glyph and first-mark anchor
+/// from the last emitted one.
+/// Different first-mark anchors alone do not imply glyph disagreement.
+/// Every entry check is O(1) and needs no pruning.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Frontier {
     /// `sample_ts` of the latest emitted entry of either kind.
     last_ts: Option<u64>,
     /// `sample_ts` of the latest emitted word boundary.
     last_word_ts: Option<u64>,
-    /// `char_start_ts` of the latest emitted character.
+    /// Glyph of the latest emitted character, for rejecting its alternatives.
+    last_char: Option<Glyph>,
+    /// First-mark anchor of that character. Same-start alternatives retain
+    /// the plan's original boundary handling.
     last_char_start: Option<u64>,
 }
 
@@ -88,13 +93,31 @@ impl Frontier {
             Some(_) => self.last_ts.is_some_and(|t| e.char_start_ts <= t),
             None => {
                 self.last_word_ts.is_some_and(|w| e.char_start_ts <= w)
-                    || self.last_ts.is_some_and(|t| {
-                        e.sample_ts < t
-                            || (e.char_start_ts <= t
-                                && self.last_char_start != Some(e.char_start_ts))
-                    })
+                    || self.last_ts.is_some_and(|t| e.sample_ts < t)
             }
         }
+    }
+
+    /// Strip decided entries, including the boundary paired with a rejected
+    /// character with a different glyph and start. Both entries of a WGap
+    /// share their start and close; an agreeing character may use different
+    /// anchors from the emitted one and must still be allowed its boundary.
+    pub fn strip_decided(&self, hist: &mut Vec<HistEntry>) {
+        let mut rejected_boundary = None;
+        hist.retain(|e| {
+            let decided = self.is_decided(e);
+            let anchors = (e.char_start_ts, e.sample_ts);
+            if e.glyph.is_some() {
+                rejected_boundary = (decided
+                    && e.glyph != self.last_char
+                    && Some(e.char_start_ts) != self.last_char_start)
+                    .then_some(anchors);
+                !decided
+            } else {
+                let rejected = rejected_boundary.take() == Some(anchors);
+                !decided && !rejected
+            }
+        });
     }
 
     /// Record that `e` was emitted.
@@ -103,6 +126,7 @@ impl Frontier {
         if e.glyph.is_none() {
             self.last_word_ts = self.last_word_ts.max(Some(e.sample_ts));
         } else {
+            self.last_char = e.glyph;
             self.last_char_start = Some(e.char_start_ts);
         }
     }
@@ -123,7 +147,8 @@ impl Frontier {
 /// before the consensus/forced check sees it. Character starts strictly
 /// increase along a token's `hist` (a word boundary shares its
 /// character's start and closing `sample_ts`), so decided entries always
-/// form a prefix and the front-only strip is complete.
+/// form a prefix. The history filter also removes a boundary paired with
+/// a stripped character with a different glyph and first-mark anchor.
 pub fn commit(
     tokens: &mut Vec<Token>,
     now_hop: u64,
@@ -133,9 +158,7 @@ pub fn commit(
     let mut out = Vec::new();
     loop {
         for t in tokens.iter_mut() {
-            while t.hist.first().is_some_and(|e| frontier.is_decided(e)) {
-                t.hist.remove(0);
-            }
+            frontier.strip_decided(&mut t.hist);
         }
         // Codex review, PR #161 round 15: stripping decided entries
         // removes a DIFFERENT number of leading entries per token
@@ -287,6 +310,49 @@ mod tests {
         let mut tokens = vec![token(5.0, 13.0, vec![entry(None, 40, 100)])];
         let out = commit(&mut tokens, FORCE, &cfg, &mut frontier);
         assert_eq!(emitted(&out), vec![(None, 100)]);
+    }
+
+    #[test]
+    fn commit_keeps_the_word_boundary_of_an_agreeing_lineage_with_another_start() {
+        let cfg = HsmmConfig::default();
+        let mut frontier = Frontier::default();
+        let mut tokens = vec![
+            token(5.0, 13.0, vec![entry(Some('G'), 40, 100)]),
+            token(
+                4.0,
+                13.0,
+                vec![entry(Some('G'), 48, 100), entry(None, 48, 100)],
+            ),
+        ];
+        assert_eq!(
+            emitted(&commit(&mut tokens, 2, &cfg, &mut frontier)),
+            vec![(Some(Glyph::Char('G')), 100)]
+        );
+        // The CGap lineage dies, leaving the agreeing WGap lineage.
+        tokens.remove(0);
+        assert_eq!(
+            emitted(&commit(&mut tokens, FORCE, &cfg, &mut frontier)),
+            vec![(None, 100)]
+        );
+    }
+
+    #[test]
+    fn commit_keeps_the_word_boundary_of_a_later_first_mark_variant() {
+        let cfg = HsmmConfig::default();
+        let mut frontier = after(&[entry(Some('G'), 40, 100)]);
+        let mut tokens = vec![token(
+            5.0,
+            13.0,
+            vec![
+                entry(Some('G'), 52, 104),
+                entry(None, 52, 104),
+                entry(Some('H'), 150, 200),
+            ],
+        )];
+        assert_eq!(
+            emitted(&commit(&mut tokens, FORCE, &cfg, &mut frontier)),
+            vec![(None, 104), (Some(Glyph::Char('H')), 200)]
+        );
     }
 
     #[test]

@@ -24,6 +24,9 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-189: the HSMM decoder suppresses re-derived committed characters
+  while preserving word boundaries from agreeing timing variants.
+
 - A band-wide static crash (lightning) no longer starts tracks across the
   band, and running tracks no longer decode it as extra dits; new
   `[detector].crash_filter`, default `"full"` (MAN-312).

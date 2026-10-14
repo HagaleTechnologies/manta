@@ -27,6 +27,8 @@ Each active track runs a classical CW decode chain on its ~375 Hz complex channe
 
 ## Gotchas
 
+- HSMM word-boundary agreement depends on the glyph, not equality of the first-mark anchors. The shared commit and finish filter is specified in `docs/DECISIONS/2026-10-13-man189-hsmm-commit-frontier.md`.
+
 - The keying-decision band must not gate the rail updates: a mark that fades into the band would then update neither rail, freezing `E_hi` at its pre-fade level and deleting the faded marks (MAN-103 D5 did this; V8w recall fell to 0/50 until MAN-213). See `docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md` and SPEC §3.2.
 
 - The gap unit is `dit_estimate_ms` (the symmetric mark/gap dit), not `mu_dit_ms`: the transmitter's rise time shortens marks and lengthens gaps by the same amount, so gaps in mark dits read long and 4.5-dit letter gaps split words (MAN-315 D3, SPEC §4.2). Beam likelihoods and the keying threshold still use `mu_dit_ms`.

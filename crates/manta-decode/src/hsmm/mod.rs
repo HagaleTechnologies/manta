@@ -297,7 +297,7 @@ impl HsmmDecoder {
         // on that proof.
         let frontier = self.frontier;
         for t in self.live.iter_mut() {
-            t.hist.retain(|e| !frontier.is_decided(e));
+            frontier.strip_decided(&mut t.hist);
         }
         self.live.sort_by(token_order);
         let best = self.live[0].clone();
@@ -508,6 +508,27 @@ mod tests {
         let out = dec.finish();
         let got: Vec<_> = out.iter().map(|c| (c.glyph, c.sample_ts)).collect();
         assert_eq!(got, vec![(Some(Glyph::Char('C')), 300)], "{out:?}");
+    }
+
+    #[test]
+    fn finish_keeps_the_word_boundary_of_an_agreeing_later_start() {
+        let mut dec = HsmmDecoder::new(HsmmConfig::default());
+        dec.frontier = frontier_after(&[char_entry('G', 40, 100)]);
+        let variant = char_entry('G', 52, 104);
+        dec.live = vec![live_token(vec![
+            variant,
+            token::HistEntry {
+                glyph: None,
+                ..variant
+            },
+            char_entry('H', 150, 200),
+        ])];
+        let got: Vec<_> = dec
+            .finish()
+            .iter()
+            .map(|c| (c.glyph, c.sample_ts))
+            .collect();
+        assert_eq!(got, vec![(None, 104), (Some(Glyph::Char('H')), 200)]);
     }
 
     #[test]

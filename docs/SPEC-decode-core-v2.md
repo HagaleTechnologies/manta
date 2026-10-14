@@ -301,10 +301,12 @@ After pruning at anchor `t`:
   emission when its character began at or before the latest emitted
   entry's `sample_ts`, or, for a `Word` entry, when a `Word` was already
   emitted at or after its character's start, its gap began before the
-  latest emitted entry, or its character began at or before the latest
-  emitted entry's `sample_ts` at a different start from the latest
-  emitted character's. This is checked before the consensus and forced
-  rules and again after every emission, and by `finish()` (§4.10).
+  latest emitted entry, or it is paired with a stripped character whose
+  glyph and first-mark anchor both differ from the latest emitted
+  character's. The pair shares its character start and closing timestamp.
+  An agreeing variant's different first-mark anchor alone does not suppress
+  its boundary. This is checked before the consensus and forced rules and
+  again after every emission, and by `finish()` (§4.10).
   Emitted `sample_ts` therefore never decreases within a track.
 - A `Glyph` entry emits `CharDecoded { sample_ts = start of the closing
   space segment, glyph, confidence, alternatives }`; a `Word` entry emits
