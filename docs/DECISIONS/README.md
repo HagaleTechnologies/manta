@@ -11,7 +11,11 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+<<<<<<< HEAD
 | 2026-10-14 | MAN-193 | [MAN-193: Evidence's centered maximum is a monotonic deque](2026-10-14-man193-centered-maximum-deque.md) |
+=======
+| 2026-10-14 | MAN-192 | [MAN-192: the HSMM decoder reseeds after a committed Silence, not only on a gate re-onset](2026-10-14-man192-silence-reseed.md) |
+>>>>>>> 957a49eee81585e6c9faa28160218dddb5ecac2c
 | 2026-10-14 | MAN-95 | [MAN-95: callsign-pattern rarity sets the repetition requirement](2026-10-14-man95-pattern-rarity-repetition-tiers.md) |
 | 2026-10-13 | MAN-140 | [MAN-140: a ka9q-radio (radiod) multicast IQ input](2026-10-13-man140-ka9q-radio-input.md) |
 | 2026-10-13 | MAN-156 | [MAN-156: CI catches dependency, rustdoc, Windows-release and PR-title regressions](2026-10-13-man156-ci-regression-gates.md) |
