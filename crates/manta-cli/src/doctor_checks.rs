@@ -750,6 +750,7 @@ pub(crate) enum ReceiverKind {
     Soapy,
     #[cfg(feature = "hpsdr")]
     Hpsdr,
+    Ka9q,
 }
 
 impl ReceiverKind {
@@ -763,6 +764,7 @@ impl ReceiverKind {
             ReceiverKind::Soapy => "SoapySDR",
             #[cfg(feature = "hpsdr")]
             ReceiverKind::Hpsdr => "HPSDR",
+            ReceiverKind::Ka9q => "ka9q-radio",
         }
     }
 
@@ -788,6 +790,11 @@ impl ReceiverKind {
             ReceiverKind::Hpsdr => {
                 "check --hpsdr-host/input.host, and that the radio is powered on and on this \
                  network"
+            }
+            ReceiverKind::Ka9q => {
+                "check --ka9q-group/input.group and --ka9q-ssrc/input.ssrc against the radiod \
+                 channel section, that radiod is running, and that its ttl is at least 1 when \
+                 it runs on another machine"
             }
         }
     }
@@ -1651,6 +1658,52 @@ mod tests {
                 assert!(fix.contains(needle), "{needle} not in {fix}");
             }
         }
+    }
+
+    /// MAN-140: doctor names a radiod channel by its group (and SSRC when
+    /// one is set), labels it ka9q-radio, and gives Design §4's fix.
+    #[test]
+    fn ka9q_receiver_label_and_fix() {
+        let ka9q = |ssrc| {
+            crate::LiveSourceSpec::Ka9q(crate::Ka9qOpts {
+                group: Some("239.101.6.1".into()),
+                port: 5004,
+                ssrc,
+                interface: None,
+                ..crate::Ka9qOpts::unset()
+            })
+        };
+        let d = desc(ka9q(None));
+        assert_eq!(d.kind, ReceiverKind::Ka9q);
+        assert_eq!(d.kind.label(), "ka9q-radio");
+        let err = anyhow::anyhow!("no status");
+        let check = receiver_check(&d, Err(&err));
+        assert_eq!(check.status, Status::Fail);
+        assert_eq!(
+            check.detail,
+            "could not open ka9q-radio group 239.101.6.1:5004: no status"
+        );
+        assert_eq!(
+            check.fix.as_deref(),
+            Some(
+                "check --ka9q-group/input.group and --ka9q-ssrc/input.ssrc against the radiod \
+                 channel section, that radiod is running, and that its ttl is at least 1 when \
+                 it runs on another machine"
+            )
+        );
+        assert_eq!(
+            desc(ka9q(Some(14_100_000))).description,
+            "ka9q-radio group 239.101.6.1:5004 ssrc 14100000"
+        );
+        // The audio check names it rather than enumerating sound cards.
+        let audio = audio_check(d.kind.label(), false, || panic!("must not enumerate"));
+        assert_eq!(
+            audio.detail,
+            format!(
+                "{}this ka9q-radio receiver does not use a sound card",
+                lib()
+            )
+        );
     }
 
     #[test]

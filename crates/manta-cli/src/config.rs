@@ -18,6 +18,7 @@ use manta_engine::DetectorConfig;
 use manta_server::config::{RbnCompareConfig, RbnUplinkConfig, ServerConfig};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 /// Every top-level table manta reads. Adding a table means adding it here.
@@ -77,6 +78,8 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("input", "host"),
     ("input", "password"),
     ("input", "driver"),
+    ("input", "group"),
+    ("input", "interface"),
     ("spot", "blocklist_path"),
     ("spot", "notch_path"),
     ("spot", "cty_path"),
@@ -152,6 +155,7 @@ pub(crate) enum InputKind {
     Kiwi,
     Soapy,
     Hpsdr,
+    Ka9q,
 }
 
 impl InputKind {
@@ -162,6 +166,7 @@ impl InputKind {
             InputKind::Kiwi => "kiwi",
             InputKind::Soapy => "soapy",
             InputKind::Hpsdr => "hpsdr",
+            InputKind::Ka9q => "ka9q",
         }
     }
 
@@ -173,6 +178,7 @@ impl InputKind {
             InputKind::Kiwi => &["host", "port", "freq_hz", "password"],
             InputKind::Soapy => &["driver", "freq_hz", "rate_hz", "gain_db"],
             InputKind::Hpsdr => &["host", "port", "freq_hz", "rate_hz"],
+            InputKind::Ka9q => &["group", "port", "ssrc", "interface"],
         }
     }
 }
@@ -195,6 +201,11 @@ struct InputToml {
     driver: Option<String>,
     rate_hz: Option<f64>,
     gain_db: Option<f64>,
+    group: Option<String>,
+    // i64, not u32, so a negative or too-large value gets the range message
+    // rather than serde's.
+    ssrc: Option<i64>,
+    interface: Option<String>,
     // Shared keys, valid with any (or no) type.
     freq_correction_ppm: Option<f64>,
     center_freq_hz: Option<f64>,
@@ -249,6 +260,14 @@ pub(crate) enum SourceFromFile {
         freq_hz: f64,
         rate_hz: f64,
     },
+    /// MAN-140: one ka9q-radio (radiod) IQ channel. `group` passed
+    /// `check_group` at load; a host name is resolved at open.
+    Ka9q {
+        group: String,
+        port: u16,
+        ssrc: Option<u32>,
+        interface: Option<Ipv4Addr>,
+    },
 }
 
 impl SourceFromFile {
@@ -259,6 +278,7 @@ impl SourceFromFile {
             SourceFromFile::Kiwi { .. } => InputKind::Kiwi,
             SourceFromFile::Soapy { .. } => InputKind::Soapy,
             SourceFromFile::Hpsdr { .. } => InputKind::Hpsdr,
+            SourceFromFile::Ka9q { .. } => InputKind::Ka9q,
         }
     }
 }
@@ -500,6 +520,31 @@ fn finite_positive(key: &str, v: f64) -> std::result::Result<f64, String> {
     Ok(v)
 }
 
+/// MAN-140 D16: `input.group` is an IPv4 multicast literal or a host name,
+/// checked without resolving it. `check_group`'s IPv6 message is a full
+/// clause of its own, so it follows a colon; the other reads on from the key.
+fn check_ka9q_group(group: String) -> std::result::Result<String, String> {
+    match manta_input::ka9q::check_group(&group) {
+        Ok(()) => Ok(group),
+        Err(msg) if msg.starts_with("IPv6") => Err(format!("input.group: {msg}")),
+        Err(msg) => Err(format!("input.group {msg}")),
+    }
+}
+
+/// `input.ssrc`: an RTP SSRC, 32 bits unsigned.
+fn check_ka9q_ssrc(ssrc: i64) -> std::result::Result<u32, String> {
+    u32::try_from(ssrc)
+        .map_err(|_| format!("input.ssrc must be between 0 and {}, got {ssrc}", u32::MAX))
+}
+
+/// `input.interface`: the local IPv4 address to join the group on; an
+/// interface name is not accepted.
+fn check_ka9q_interface(interface: &str) -> std::result::Result<Ipv4Addr, String> {
+    interface
+        .parse()
+        .map_err(|_| format!("input.interface must be an IPv4 address, got {interface}"))
+}
+
 /// D5: type/key consistency, required keys, and the same value checks the
 /// equivalent CLI flags apply.
 fn validate_input(
@@ -524,7 +569,7 @@ fn validate_input(
             .map(|v| crate::check_replay_epoch("input.replay_epoch", v))
             .transpose()?,
     };
-    let set: [(&str, bool); 12] = [
+    let set: [(&str, bool); 15] = [
         ("device", t.device.is_some()),
         ("path", t.path.is_some()),
         ("iq", t.iq.is_some()),
@@ -537,11 +582,14 @@ fn validate_input(
         ("driver", t.driver.is_some()),
         ("rate_hz", t.rate_hz.is_some()),
         ("gain_db", t.gain_db.is_some()),
+        ("group", t.group.is_some()),
+        ("ssrc", t.ssrc.is_some()),
+        ("interface", t.interface.is_some()),
     ];
     let Some(kind) = t.kind else {
         if let Some((key, _)) = set.iter().find(|(_, is_set)| *is_set) {
             return Err(format!(
-                "input.{key} needs input.type (one of audio, file, kiwi, soapy, hpsdr)"
+                "input.{key} needs input.type (one of audio, file, kiwi, soapy, hpsdr, ka9q)"
             ));
         }
         return Ok(InputFile {
@@ -600,6 +648,16 @@ fn validate_input(
             host: req(t.host.clone(), "host", name)?,
             freq_hz: crate::check_hpsdr_freq_hz("input.freq_hz", req(t.freq_hz, "freq_hz", name)?)?,
             rate_hz: crate::check_hpsdr_rate_hz("input.rate_hz", req(t.rate_hz, "rate_hz", name)?)?,
+        },
+        InputKind::Ka9q => SourceFromFile::Ka9q {
+            port: port(manta_input::ka9q::wire::DATA_PORT)?,
+            group: check_ka9q_group(req(t.group.clone(), "group", name)?)?,
+            ssrc: t.ssrc.map(check_ka9q_ssrc).transpose()?,
+            interface: t
+                .interface
+                .as_deref()
+                .map(check_ka9q_interface)
+                .transpose()?,
         },
     };
     Ok(InputFile {
@@ -1197,6 +1255,182 @@ mod tests {
                 password: String::new(),
             })
         );
+    }
+
+    // ---- MAN-140: type = "ka9q"
+
+    const KA9Q: &str = "[input]\ntype = \"ka9q\"\ngroup = \"239.101.6.1\"\n";
+
+    #[test]
+    fn ka9q_input_defaults_port_5004_and_no_ssrc_or_interface() {
+        let loaded = load_file(KA9Q).unwrap();
+        assert_eq!(
+            loaded.input.source,
+            Some(SourceFromFile::Ka9q {
+                group: "239.101.6.1".into(),
+                port: 5004,
+                ssrc: None,
+                interface: None,
+            })
+        );
+        let loaded = load_file(&format!(
+            "{KA9Q}port = 5010\nssrc = 14100000\ninterface = \"192.168.1.20\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            loaded.input.source,
+            Some(SourceFromFile::Ka9q {
+                group: "239.101.6.1".into(),
+                port: 5010,
+                ssrc: Some(14_100_000),
+                interface: Some(Ipv4Addr::new(192, 168, 1, 20)),
+            })
+        );
+    }
+
+    #[test]
+    fn ka9q_requires_group() {
+        let err = err_of("[input]\ntype = \"ka9q\"\n");
+        assert!(
+            err.ends_with("[input]: input.group is required when input.type = \"ka9q\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ka9q_group_is_checked_at_load() {
+        let group = |g: &str| format!("[input]\ntype = \"ka9q\"\ngroup = \"{g}\"\n");
+        let err = err_of(&group("192.168.1.5"));
+        assert!(
+            err.ends_with(
+                "[input]: input.group must be an IPv4 multicast address (224.0.0.0 to \
+                 239.255.255.255) or a host name, got 192.168.1.5"
+            ),
+            "{err}"
+        );
+        let err = err_of(&group("ff02::1"));
+        assert!(
+            err.ends_with(
+                "[input]: input.group: IPv6 groups are not supported yet; give radiod's IPv4 \
+                 data group, got ff02::1"
+            ),
+            "{err}"
+        );
+        // A guide placeholder left in place is refused, not resolved.
+        let err = err_of(&group("<your-radiod-data-group>"));
+        assert!(
+            err.contains("[input]: input.group must be an IPv4 multicast address"),
+            "{err}"
+        );
+        for ok in ["239.101.6.1", "cw-20m.local"] {
+            let loaded = load_file(&group(ok)).unwrap();
+            let Some(SourceFromFile::Ka9q { group, .. }) = loaded.input.source else {
+                panic!("expected a ka9q source for {ok}");
+            };
+            assert_eq!(group, ok);
+        }
+    }
+
+    #[test]
+    fn ka9q_interface_must_be_an_ipv4_address() {
+        let err = err_of(&format!("{KA9Q}interface = \"eth0\"\n"));
+        assert!(
+            err.ends_with("[input]: input.interface must be an IPv4 address, got eth0"),
+            "{err}"
+        );
+        let err = err_of(&format!("{KA9Q}interface = \"::1\"\n"));
+        assert!(
+            err.ends_with("[input]: input.interface must be an IPv4 address, got ::1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ka9q_ssrc_range_is_u32() {
+        let err = err_of(&format!("{KA9Q}ssrc = -1\n"));
+        assert!(
+            err.ends_with("[input]: input.ssrc must be between 0 and 4294967295, got -1"),
+            "{err}"
+        );
+        let err = err_of(&format!("{KA9Q}ssrc = 4294967296\n"));
+        assert!(
+            err.ends_with("[input]: input.ssrc must be between 0 and 4294967295, got 4294967296"),
+            "{err}"
+        );
+        for (ssrc, want) in [("0", 0), ("4294967295", u32::MAX)] {
+            let loaded = load_file(&format!("{KA9Q}ssrc = {ssrc}\n")).unwrap();
+            let Some(SourceFromFile::Ka9q { ssrc, .. }) = loaded.input.source else {
+                panic!("expected a ka9q source");
+            };
+            assert_eq!(ssrc, Some(want));
+        }
+    }
+
+    #[test]
+    fn ka9q_rejects_keys_of_other_types() {
+        let err = err_of(&format!("{KA9Q}freq_hz = 14100000.0\n"));
+        assert!(
+            err.ends_with(
+                "[input]: input.freq_hz does not apply to input.type = \"ka9q\" (ka9q takes \
+                 group, port, ssrc, interface)"
+            ),
+            "{err}"
+        );
+        // And the ka9q keys belong to ka9q only.
+        let err = err_of("[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7e6\nssrc = 1\n");
+        assert!(
+            err.contains("input.ssrc does not apply to input.type = \"kiwi\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn keys_without_a_type_name_ka9q_among_the_types() {
+        let err = err_of("[input]\ngroup = \"239.101.6.1\"\n");
+        assert!(
+            err.ends_with(
+                "[input]: input.group needs input.type (one of audio, file, kiwi, soapy, hpsdr, \
+                 ka9q)"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ka9q_group_and_interface_env_values_stay_strings() {
+        // `127.0.0.1` and `239.101.6.1` are not TOML values, and a group
+        // name could look like one; both keys are taken verbatim.
+        let loaded = load_env(
+            None,
+            &[
+                ("MANTA_INPUT_TYPE", "ka9q"),
+                ("MANTA_INPUT_GROUP", "239.101.6.1"),
+                ("MANTA_INPUT_INTERFACE", "127.0.0.1"),
+                ("MANTA_INPUT_SSRC", "14100000"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.input.source,
+            Some(SourceFromFile::Ka9q {
+                group: "239.101.6.1".into(),
+                port: 5004,
+                ssrc: Some(14_100_000),
+                interface: Some(Ipv4Addr::LOCALHOST),
+            })
+        );
+        assert!(STRING_TYPED_ENV_KEYS.contains(&("input", "group")));
+        assert!(STRING_TYPED_ENV_KEYS.contains(&("input", "interface")));
+        // A numeric-looking host name stays a string rather than a TOML
+        // integer the loader would reject as the wrong type.
+        let err = load_env(
+            None,
+            &[("MANTA_INPUT_TYPE", "ka9q"), ("MANTA_INPUT_GROUP", "1234")],
+        )
+        .err()
+        .map(|e| format!("{e:#}"))
+        .unwrap_or_default();
+        assert!(!err.contains("invalid type"), "{err}");
     }
 
     #[test]
