@@ -127,8 +127,9 @@ cd manta-linux-x86_64-soapy
 ./manta devices
 ```
 
-The checksum command prints `manta-linux-x86_64-soapy.tar.gz: OK` when
-only this archive is present. `./manta --version` shows the release's
+`apt-get` and `curl` print their usual, host-dependent output. The
+checksum command prints `manta-linux-x86_64-soapy.tar.gz: OK` when only
+this archive is present. `./manta --version` shows the release's
 version and build ID, and both features:
 
 ```text
@@ -154,7 +155,8 @@ relying on it.
 it to `--soapy-driver`. Choose a frequency and a sample rate your receiver
 supports: the rate rules and the remaining flags are in [Inputs](#inputs).
 With no receiver attached, or no module for it, `./manta devices` prints
-`SoapySDR devices: none found.` and exits 0.
+`SoapySDR devices: none found.`; it exits 0 unless enumerating a backend
+failed (then 1, with that backend's error on stderr).
 
 If the SoapySDR runtime library is missing, the binary cannot start at
 all, not even for `--version`. The system's loader prints this and exits
