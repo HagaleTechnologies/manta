@@ -1849,7 +1849,7 @@ impl Metrics {
         ));
 
         // MAN-128: per-target uplink families -- one read guard for all
-        // eight, so a concurrent `register_uplink_target` can't interleave
+        // nine, so a concurrent `register_uplink_target` can't interleave
         // a partial view across them.
         let targets = self.uplink_targets_snapshot();
 
