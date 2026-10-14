@@ -220,6 +220,18 @@ pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
 planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
+MAN-119: `WavIqSource` streams (header-only `open`) and reads Float32 and
+16/24/32-bit integer IQ WAVs; `manta decode` streams through
+`manta_engine::decode_source`, so its memory no longer grows with the file.
+The real-audio corpus is pinned in
+`crates/manta-testkit/audio-corpus/manifest.json`; `scripts/corpus.py
+fetch|score`, a `MANTA_CORPUS_DIR`-gated test and a nightly `corpus.yml`
+(skipped until `MANTA_CORPUS_BASE_URL` is set, after redistribution rights
+are confirmed) make it a CI fixture; `scripts/score-transcript.py` scores a
+run against a hand transcript, and the VP8GEO transcript itself is
+outstanding. See
+docs/DECISIONS/2026-10-14-man119-streaming-wav-and-real-audio-corpus.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each

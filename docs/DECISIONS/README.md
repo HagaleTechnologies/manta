@@ -11,6 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-14 | MAN-119 | [MAN-119: streaming IQ WAVs, 24/32-bit PCM, and the real-audio corpus as a CI fixture](2026-10-14-man119-streaming-wav-and-real-audio-corpus.md) |
 | 2026-10-13 | MAN-140 | [MAN-140: a ka9q-radio (radiod) multicast IQ input](2026-10-13-man140-ka9q-radio-input.md) |
 | 2026-10-13 | MAN-156 | [MAN-156: CI catches dependency, rustdoc, Windows-release and PR-title regressions](2026-10-13-man156-ci-regression-gates.md) |
 | 2026-10-13 | MAN-133 | [MAN-133: shell completions and a man page for the manta CLI](2026-10-13-man133-shell-completions-and-man-pages.md) |
