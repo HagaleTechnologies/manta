@@ -74,14 +74,22 @@ def _is_valid_base(base):
     return has_digit and has_letter and base[-1].isalpha()
 
 
+# grammar.rs's NON_CALLSIGN_TOKENS (MAN-105): CW conventions that are never a
+# callsign, matched exactly against the base call. score-transcript.py
+# (MAN-119) needs this: `5NN` is callsign-shaped and in nearly every exchange.
+_NON_CALLSIGN_TOKENS = ("5NN", "4NN", "3NN", "599", "TEST", "TU", "QRZ", "AGN", "K", "KN")
+
+
 def _is_plausible_callsign(call):
     """Port of crates/manta-spot/src/grammar.rs::is_plausible."""
     if "/" in call:
         base, portable = call.split("/", 1)
-        if not _is_valid_portable(portable):
-            return False
     else:
-        base = call
+        base, portable = call, None
+    if base.upper() in _NON_CALLSIGN_TOKENS:
+        return False
+    if portable is not None and not _is_valid_portable(portable):
+        return False
     return _is_valid_base(base)
 
 
@@ -177,6 +185,46 @@ def match(manta_spots, truth_by_key, freq_tol_hz, time_tol_s):
             fp.append(m)
     fn_keys = set(truth_by_key.keys()) - matched_truth_keys
     return tp, fp, fn_keys
+
+
+def score_report(decode_report, rbn_truth_csv, capture_start, sample_rate_hz,
+                 spotters=None, min_spotters=1, freq_tol_hz=500.0, time_tol_s=90.0):
+    """Scores one `manta decode --json` report against an RBN truth CSV.
+
+    Returns a dict: `n_manta` (manta spots), `n_truth` (unique call+kHz truth
+    bins), `excluded` (truth rows manta's grammar can never accept), `tp`/`fp`
+    (manta spot dicts), `fn_keys` (unmatched truth bins), `precision` and
+    `recall` (0.0 when their denominator is 0). `main` prints these;
+    `scripts/corpus.py score` (MAN-119) imports this function rather than
+    re-implementing it.
+    """
+    manta_spots = load_manta_spots(decode_report, capture_start, sample_rate_hz)
+    truth, excluded = load_rbn_truth(rbn_truth_csv, capture_start,
+                                      spotters=spotters, min_spotters=min_spotters)
+    truth_by_key = dedup_truth(truth)
+
+    tp, fp, fn_keys = match(manta_spots, truth_by_key, freq_tol_hz, time_tol_s)
+
+    n_manta = len(manta_spots)
+    n_truth = len(truth_by_key)
+    precision = len(tp) / n_manta if n_manta else 0.0
+    # Codex review, PR #161: `len(tp)` counts manta SPOTS, not unique matched
+    # truth bins -- a re-spot of the same call+kHz (e.g. after the 10-minute
+    # dedupe window) appends a second entry to `tp` for the same truth item,
+    # which would double-count that one truth item and can inflate recall
+    # past 100%. `n_truth - len(fn_keys)` is the count of truth bins that
+    # matched at least one manta spot, which is what recall means.
+    recall = (n_truth - len(fn_keys)) / n_truth if n_truth else 0.0
+    return {
+        "n_manta": n_manta,
+        "n_truth": n_truth,
+        "excluded": excluded,
+        "tp": tp,
+        "fp": fp,
+        "fn_keys": fn_keys,
+        "precision": precision,
+        "recall": recall,
+    }
 
 
 def parse_iso(s):
@@ -375,24 +423,13 @@ def main(argv=None):
     if args.min_spotters is None:
         args.min_spotters = 1
 
-    manta_spots = load_manta_spots(args.decode_report, args.capture_start, args.sample_rate_hz)
     spotters = {s.upper() for s in args.spotter} if args.spotter else None
-    truth, excluded = load_rbn_truth(args.rbn_truth_csv, args.capture_start,
-                                      spotters=spotters, min_spotters=args.min_spotters)
-    truth_by_key = dedup_truth(truth)
-
-    tp, fp, fn_keys = match(manta_spots, truth_by_key, args.freq_tol_hz, args.time_tol_s)
-
-    n_manta = len(manta_spots)
-    n_truth = len(truth_by_key)
-    precision = len(tp) / n_manta if n_manta else 0.0
-    # Codex review, PR #161: `len(tp)` counts manta SPOTS, not unique matched
-    # truth bins -- a re-spot of the same call+kHz (e.g. after the 10-minute
-    # dedupe window) appends a second entry to `tp` for the same truth item,
-    # which would double-count that one truth item and can inflate recall
-    # past 100%. `n_truth - len(fn_keys)` is the count of truth bins that
-    # matched at least one manta spot, which is what recall means.
-    recall = (n_truth - len(fn_keys)) / n_truth if n_truth else 0.0
+    r = score_report(args.decode_report, args.rbn_truth_csv, args.capture_start,
+                     args.sample_rate_hz, spotters=spotters, min_spotters=args.min_spotters,
+                     freq_tol_hz=args.freq_tol_hz, time_tol_s=args.time_tol_s)
+    n_manta, n_truth, excluded = r["n_manta"], r["n_truth"], r["excluded"]
+    tp, fp, fn_keys = r["tp"], r["fp"], r["fn_keys"]
+    precision, recall = r["precision"], r["recall"]
 
     # Codex review, PR #161 round 19: the implementation plan
     # (docs/superpowers/plans/2026-09-09-decode-core-v2.md lines 135-147)

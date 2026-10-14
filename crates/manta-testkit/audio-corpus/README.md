@@ -10,19 +10,46 @@ real receiver and band artifacts (SSB-bandwidth capture, pileup QRM,
 wideband noise, real IQ) that a synthetic scene generator doesn't model.
 
 **None of the audio files themselves are committed** — see `.gitignore`.
-Reasons differ per file (below); this directory only tracks documentation
-and conversion tooling notes, not the bytes.
+Reasons differ per file (below). This directory tracks the documentation,
+`manifest.json` and the ground truth, not the audio.
+
+## Using the corpus (MAN-119)
+
+- `manifest.json` lists each recording: file name, `kind` (`iq` or
+  `audio`), sample rate, bit depth, centre frequency when known, ground
+  truth, score floors, and a SHA-256 pin. Only pinned entries are ever
+  downloaded.
+- `scripts/corpus.py fetch --dest DIR` downloads every pinned recording
+  from `<base-url>/<file>` and checks its SHA-256. The base URL comes from
+  `--base-url` or `MANTA_CORPUS_BASE_URL`.
+- `scripts/corpus.py score --corpus-dir DIR` decodes every manifest
+  recording present in DIR, scores it against its ground truth, and exits
+  non-zero on a failed decode or a missed floor.
+- `MANTA_CORPUS_DIR=DIR cargo test -p manta-testkit --test
+  real_audio_corpus -- --nocapture` streams every IQ recording present in
+  DIR end to end through `WavIqSource` and checks its header against the
+  manifest. With `MANTA_CORPUS_DIR` unset it only parses the manifest.
+- `.github/workflows/corpus.yml` runs fetch, the test and score nightly. It
+  is skipped until a maintainer sets the `MANTA_CORPUS_BASE_URL` repository
+  variable, which waits on redistribution rights (see *Provenance and
+  licensing*).
+
+Steps for each of these, including hosting and transcribing:
+[docs/RUNBOOKS/real-audio-corpus.md](../../../docs/RUNBOOKS/real-audio-corpus.md).
+Decisions:
+[docs/DECISIONS/2026-10-14-man119-streaming-wav-and-real-audio-corpus.md](../../../docs/DECISIONS/2026-10-14-man119-streaming-wav-and-real-audio-corpus.md).
 
 ## Files (all local-only)
 
-- `vp8geo_cw_48khz.wav` (30 MB) — mono PCM16 @ 48 kHz, converted from
-  `vp8geo_cw.mp3` via:
+- `vp8geo_cw_48khz.wav` (30 MB) — mono PCM16 @ 48 kHz, 323 s, converted
+  from `vp8geo_cw.mp3` via:
   `ffmpeg -i vp8geo_cw.mp3 -ac 1 -ar 48000 -c:a pcm_s16le vp8geo_cw_48khz.wav`.
-  Loadable **only** via `manta listen --source` (`AudioIqSource`, which
-  hard-requires exactly 48 kHz mono real audio and does not resample — the
-  original MP3 is 11,025 Hz and can't be loaded directly). **Not**
-  loadable via `manta decode` (`WavIqSource` requires 2-channel I/Q; a
-  mono file is rejected outright).
+  Loadable only as real audio, via `manta run --source` or `manta listen
+  --source` (`AudioIqSource`, which requires exactly 48 kHz mono and does
+  not resample; the original MP3 is 11,025 Hz and can't be loaded
+  directly). Not loadable via `manta decode`: `WavIqSource` requires
+  2-channel I/Q and rejects a mono file. Not pinned in `manifest.json`
+  yet.
 - `vp8geo_cw.mp3` (1.2 MB) — the original capture. ~5 min CW pileup on
   VP8GEO, listener tuning around within an SSB-bandwidth (~2.4-3 kHz)
   capture, with wideband noise present. Source: George, 2026-09-02.
@@ -33,48 +60,44 @@ and conversion tooling notes, not the bytes.
   channels = I/Q), per George: "different stuff." Original filename
   `WPXCWLast10min96KHz.wav`, dated 2008-06-08. Source: George,
   2026-09-02. Not committed: too large for this repo's git history
-  without LFS. If it's a genuine I/Q WAV, the loading path is `manta
-  decode` (`WavIqSource`), not `listen --source` — `WavIqSource` preserves
-  the file's native sample rate (96 kHz is fine as-is, no resample
-  needed) but only reads Float32 or Int16 samples, so this 24-bit file
-  needs a bit-depth conversion first; `WavIqSource` also eager-loads the
-  whole file into memory (`crates/manta-input/src/lib.rs`'s own doc
-  comment assumes files "<~100 MB"), so at 389 MB this is oversized for
-  that path's documented design assumption regardless of bit depth.
-- `B2_20251129_000000_7080kHz.wav` (1.0 GB) — first 15 minutes of CQ WW CW
-  2025, 40 meters. Genuine stereo I/Q (2-channel PCM24 @ 192 kHz,
-  00:14:59), captured by CWSL (`HrochL/CWSL`, per the file's own `encoder`
-  RIFF chunk) — embedded metadata gives capture start `2025-11-29 00:00:00
-  UTC` and center frequency 7,080,000 Hz. Source: George K5TR, received
-  2026-09-06. Loading path is `manta decode` (`WavIqSource`, native 192
-  kHz needs no resample), but like `wpx_cw_iq_96khz.wav` the 24-bit
-  samples need a bit-depth conversion first (`WavIqSource` only reads
-  Float32/Int16), and at 1.0 GB it's ~2.6x further past the "<~100 MB"
-  eager-load design assumption than that file already was.
-  `WavIqSource` also ignores the WAV's own embedded center-frequency
-  metadata — it only reads a same-stem `<name>.json` sidecar
-  (`crates/manta-input/src/lib.rs`) and silently defaults to 0.0 Hz when
-  absent — so decoding the converted file needs a
-  `B2_20251129_000000_7080kHz.json` sidecar with
-  `{"center_freq_hz": 7080000}` alongside it, or spots/events will carry
-  baseband-relative rather than correct RF frequencies. **Exact
-  conversion command** (Codex review, PR #144 -- without a pinned command
-  and checksums, "this recording, unmodified pipeline" doesn't actually
-  identify the benchmark input; bit-depth/normalization choices in the
-  conversion can shift weak-signal samples and so the reported spot
-  count):
+  without LFS. `manta decode` reads it as received: `WavIqSource` reads
+  24-bit PCM and streams the file, so no conversion is needed and memory
+  does not grow with its size. It has no capture metadata, so there is no
+  centre frequency: `decode` warns and reports baseband-relative
+  frequencies. Not pinned in `manifest.json` yet; pin it before uploading
+  it (runbook §2).
+- `B2_20251129_000000_7080kHz.source.wav` (1.0 GB) — first 15 minutes of
+  CQ WW CW 2025, 40 meters, as received. Genuine stereo I/Q (2-channel
+  PCM24 @ 192 kHz, 00:14:59), captured by CWSL (`HrochL/CWSL`, per the
+  file's own `encoder` RIFF chunk). Its embedded metadata gives capture
+  start `2025-11-29 00:00:00 UTC` and center frequency 7,080,000 Hz.
+  Source: George K5TR, received 2026-09-06. SHA-256
+  `74eba71e00fede9cab8067f9ff5a043396066015bbf8c23232788279b9f1c5f2`,
+  pinned in `manifest.json`. This file is the benchmark input: `manta
+  decode` reads it natively (24-bit, streamed, native 192 kHz), and
+  `scripts/corpus.py score` passes `--center-freq-hz 7080000` from the
+  manifest. `WavIqSource` ignores the WAV's embedded center-frequency
+  metadata; it only reads a same-stem `<name>.json` sidecar or
+  `--center-freq-hz`, and without either it reports baseband-relative
+  frequencies. Decoding it by hand therefore needs
+  `--center-freq-hz 7080000` or a `B2_20251129_000000_7080kHz.source.json`
+  sidecar with `{"center_freq_hz": 7080000}`.
+- `B2_20251129_000000_7080kHz.wav` — the PCM16 conversion the 2026-09-08
+  and 2026-09-09 baselines below were measured on, from before
+  `WavIqSource` read 24-bit samples. It is no longer needed. It was made
+  with (Codex review, PR #144, which asked for a pinned command and
+  checksums so "this recording, unmodified pipeline" identifies one input):
   `ffmpeg -i B2_20251129_000000_7080kHz.source.wav -c:a pcm_s16le B2_20251129_000000_7080kHz.wav`
-  (distinct input/output paths -- ffmpeg refuses to edit a file in place;
-  rename the as-received source to the `.source.wav` stem above, or point
-  `-i` at wherever it actually lives, before running this)
-  (source, as received from George K5TR, unmodified: SHA-256
-  `74eba71e00fede9cab8067f9ff5a043396066015bbf8c23232788279b9f1c5f2`;
-  converted, this repo's benchmark input: SHA-256
-  `d2ea524744fd9d551bd4e5f09103a1771588eb11d37054c4334078edd4d4a621`).
+  (converted SHA-256
+  `d2ea524744fd9d551bd4e5f09103a1771588eb11d37054c4334078edd4d4a621`),
+  with a `B2_20251129_000000_7080kHz.json` sidecar holding
+  `{"center_freq_hz": 7080000}`. Scores from the native 24-bit file and
+  from this conversion can differ slightly, because the conversion
+  rounds weak-signal samples.
 
 ## Ground truth
 
-`B2_20251129_000000_7080kHz.wav` has real ground truth: `ground-truth/
+B2 has real ground truth: `ground-truth/
 B2_20251129_000000_7080kHz.rbn.csv` is the Reverse Beacon Network's own raw
 spot dump (`data.reversebeacon.net/rbn_history/20251129.zip`, RBN's public
 daily archive) pre-filtered to this recording's exact window --
@@ -93,7 +116,13 @@ don't appear on multiple independent systems. This is the ARCHITECTURE.md
 as reference labels -> recall/precision) for real M3-grade validation, not
 just synthetic fixtures.
 
-First baseline run (2026-09-08, this recording, unmodified pipeline):
+The baselines below were measured on the PCM16 conversion with the legacy
+engine, and decoding has changed since (MAN-172, MAN-115, MAN-213,
+MAN-315, MAN-312, MAN-314). The `manifest.json` floors are set well below
+them as catastrophe floors until the first hosted nightly run re-measures
+B2 on the native file.
+
+First baseline run (2026-09-08, the PCM16 conversion, unmodified pipeline):
 **197 manta spots vs. 1,441 scoreable RBN truth bins -> 29.9% precision,
 4.1% recall** (revised after a Codex review on PR #144 caught two real
 scorer bugs -- unbounded-time matching, and RBN truth rows manta's own
@@ -148,6 +177,38 @@ useful as real-audio robustness/regression baselines (crash/hang/throughput,
 "still decodes something plausible"), just not scoreable for
 recall/precision until a transcript or capture metadata turns up.
 
+### Transcript ground truth
+
+A recording with no RBN reference, such as VP8GEO, is scored against a hand
+transcript: `ground-truth/<recording-stem>.transcript.csv`. The file is
+UTF-8 CSV with a header row; lines starting with `#` are comments.
+
+| column | meaning |
+|---|---|
+| `start_s` | seconds from the recording's first sample when the transmission starts (float ≥ 0) |
+| `end_s` | when it ends (≥ `start_s`) |
+| `pitch_hz` | approximate audio tone in Hz, read from a spectrogram; empty when unknown |
+| `text` | what was sent, uppercase `A–Z 0–9 / ? . , =`, single spaces between words. Write only copy you are sure of; leave unreadable characters and words out (no placeholders) |
+
+Example:
+
+```
+start_s,end_s,pitch_hz,text
+12.4,15.9,640,VP8GEO UP
+16.2,17.5,710,K5TR
+18.0,20.1,640,K5TR 5NN
+```
+
+`scripts/score-transcript.py` scores a `manta run --source <file> --json`
+capture against it: spot precision, call recall and word recall, within 10 s
+and 100 Hz by default. Spot precision is a lower bound, because a transcriber
+can miss weak callers that manta copied. Once the manifest entry has
+`"truth": {"kind": "transcript", ...}`, `scripts/corpus.py score` runs it.
+The `ground-truth/` directory is tracked in git, so a new transcript there is
+not ignored. How to transcribe VP8GEO and record its first numbers:
+[docs/RUNBOOKS/real-audio-corpus.md §5](../../../docs/RUNBOOKS/real-audio-corpus.md#5-transcribing-vp8geo).
+No transcript exists yet.
+
 ## Provenance and licensing
 
 `vp8geo_cw.mp3` and `wpx_cw_iq_96khz.wav` were received from George on
@@ -162,4 +223,6 @@ license. Unlike the vendored data documented in
 basis for redistributing the recordings — so the audio stays off git
 entirely (not just out of this PR) until that's confirmed. If rights get
 confirmed later, update this section with the license/permission
-statement before re-adding a file to git.
+statement before re-adding a file to git. That statement (George K5TR's
+redistribution permission) must be recorded here before any recording is
+uploaded to a public host or `MANTA_CORPUS_BASE_URL` is set.
