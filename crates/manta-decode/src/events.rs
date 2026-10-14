@@ -54,6 +54,7 @@ pub enum DecoderEvent {
         #[serde(default)]
         sample_ts: u64,
         snr_2500_db: f32,
+        /// The track's centroid at the hop `sample_ts` names (MAN-211).
         freq_hz: f64,
     },
     /// The track's learned sender timing (MAN-315 D8): dot, dash,

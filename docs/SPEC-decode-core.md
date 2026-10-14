@@ -510,7 +510,8 @@ an inactive detector, which is the behaviour before MAN-312.
 `"starts-only"` lets a running track decode the crash as received.
 
 **Decoder hold (`"full"`).** Each decoder input entry (§3's `a[m]` with
-its raw power, spectral reference, sample timestamp and current SNR)
+its raw power, spectral reference, sample timestamp, current SNR and
+centroid frequency)
 carries the `hold_decoder` flag of the hop on which it was observed. The
 flag is captured at observation, so it stays with its entry through the
 refiner's `GROUP_DELAY_HOPS` delay (MAN-194, SPEC-decode-core-v2 §3),
@@ -1129,6 +1130,12 @@ position -- not a synthetic tie value -- among the same batch's
 tying it to a synthetic `0` let a just-reported SNR retroactively attach to
 characters decoded earlier in the same batch, with the effect's magnitude
 depending on the caller's chunk size).
+
+`TrackMeta.freq_centroid` (`freq_hz` in code) is the track's centroid at the
+hop its `sample_ts` names. The detector captures it when it observes that
+hop and carries it with the queued hop through the refiner's
+`GROUP_DELAY_HOPS` delay (SPEC-decode-core-v2 §3), so, like `snr_2500_db`,
+it does not depend on the caller's chunk size (MAN-211).
 
 `sample_ts` is the input-stream sample counter (u64, monotonic from stream
 start). Wall-clock time exists only at the spot-emission boundary
