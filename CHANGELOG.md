@@ -38,6 +38,12 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- `manta-linux-x86_64-soapy.tar.gz`, a release archive whose binary has
+  SoapySDR input (`--soapy-driver`, for RTL-SDR, Airspy, SDRplay and
+  HackRF) for Ubuntu 24.04 x86_64, so those receivers no longer need a
+  build from source. It needs `libsoapysdr0.8` and the receiver's SoapySDR
+  module installed; see README's "SoapySDR on Linux x86_64". `manta
+  devices` on a binary without Soapy now names this archive (MAN-82).
 - MAN-315: a `TimingUpdate` event per track (each class's mean, variance
   and count, in dits), a top-level `timing` object in `decode --json`, and
   `manta decode --timing` for a `timing (dits, mean ± sd): …` stderr line.

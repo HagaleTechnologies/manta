@@ -220,6 +220,12 @@ pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
 planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
+MAN-82: releases add `manta-linux-x86_64-soapy.tar.gz` (`build-soapy`,
+`hpsdr,soapy`, Ubuntu 24.04 x86_64, libSoapySDR linked dynamically, own
+man pages, checked by `scripts/check-soapy-release.py` before upload); the
+Release needs it, the image does not. See
+docs/DECISIONS/2026-10-14-man82-soapy-release-archive.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each

@@ -237,6 +237,9 @@ jobs:
       # commands (GNU sha256sum on ubuntu, macOS shasum on macos), ride the required `test` check.
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_release_checksums -v
+      # MAN-82: the Soapy archive's verifier (fake POSIX-shell binaries) and its release-job wiring.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_soapy_release -v
       # MAN-268: the service kit's shell and account-helper tests are Unix-only; the release-archive
       # tests run on all three legs so Windows keeps its zip coverage (`python` in Git Bash there).
       - if: runner.os != 'Windows'

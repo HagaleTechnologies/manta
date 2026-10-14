@@ -135,8 +135,9 @@ jobs:
           RELEASE_COMMIT: ${{ github.sha }}
         run: python3 scripts/check-release-ci.py "$GITHUB_REPOSITORY" "$RELEASE_COMMIT"
 
-      # MAN-133: the man pages every archive ships, rendered once from a native
-      # build. Their text depends only on Cargo features -- the same as every
+      # MAN-133: the man pages every `build` archive ships, rendered once from a
+      # native build (MAN-82: `build-soapy` renders its own, for its features).
+      # Their text depends only on Cargo features -- the same as every
       # build leg's, pinned by scripts/tests/test_package_release.py -- never on
       # the target, and the aarch64 leg's cross-built binary cannot run on its
       # runner. Here, after the tag checks, so a bad tag still fails before any
@@ -307,6 +308,91 @@ jobs:
             ${{ matrix.artifact }}.tar.gz
             ${{ matrix.artifact }}.zip
           if-no-files-found: ignore
+          retention-days: 14
+
+  # MAN-82: one extra Linux x86_64 archive with the `soapy` input, for RTL-SDR, Airspy,
+  # SDRplay and HackRF operators who should not need Rust to use them. The five `build` legs
+  # above keep `hpsdr` only, so their users never need libSoapySDR. This binary links
+  # libSoapySDR.so.0.8 dynamically, so it is built natively on the Ubuntu release it supports
+  # (pinned, not ubuntu-latest) and run there by operators who install the library and their
+  # device's module (README, "SoapySDR on Linux x86_64"). It renders its own man pages: the
+  # validate-tag pages describe the hpsdr-only binary and would omit the Soapy flags.
+  # release-publish.yml's `release` needs this job, so a failed or skipped build publishes
+  # nothing. See docs/DECISIONS/2026-10-14-man82-soapy-release-archive.md.
+  build-soapy:
+    needs: validate-tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Link-time dependencies only. Device modules are runtime choices for operators and are
+      # not needed to build.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev libsoapysdr-dev
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      # MAN-243: no build cache here either, for the same reasons as `build`.
+      - name: Build (soapy)
+        run: cargo build --release --locked -p manta-cli --features hpsdr,soapy --target x86_64-unknown-linux-gnu
+
+      # The real library's null-device open, activate and read-error paths, with the release
+      # features combined.
+      - name: Test the Soapy input against the real library
+        run: cargo test --release --locked -p manta-input --features hpsdr,soapy --lib soapy::tests
+
+      - name: Write man pages
+        run: target/x86_64-unknown-linux-gnu/release/manta man-pages --out man-pages-soapy
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/package-release.py \
+            --binary "target/x86_64-unknown-linux-gnu/release/${BIN_NAME}" \
+            --artifact manta-linux-x86_64-soapy \
+            --format tar.gz \
+            --man-dir man-pages-soapy \
+            --out-dir .
+
+      # Runs the extracted archive, never target/ (scripts/tests/test_soapy_release.py).
+      - name: Verify the archive on the build runner
+        run: python3 scripts/check-soapy-release.py manta-linux-x86_64-soapy.tar.gz
+
+      # The operator's machine: a fresh Ubuntu 24.04 with no Rust, compiler or -dev package, and
+      # nothing from this runner but the archive and the verifier, both read-only. First the
+      # binary must fail to start for want of libSoapySDR alone, then pass every check once the
+      # runtime library and three distro device modules are installed.
+      - name: Verify the archive in a clean Ubuntu 24.04 runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/manta-linux-x86_64-soapy.tar.gz:/release/manta-linux-x86_64-soapy.tar.gz:ro" \
+            -v "$PWD/scripts/check-soapy-release.py:/release/check-soapy-release.py:ro" \
+            ubuntu:24.04 bash -euo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends python3 libasound2t64
+              python3 /release/check-soapy-release.py --expect-missing-soapy-library /release/manta-linux-x86_64-soapy.tar.gz
+              apt-get install -y --no-install-recommends libsoapysdr0.8 soapysdr0.8-module-rtlsdr soapysdr0.8-module-airspy soapysdr0.8-module-hackrf
+              if command -v cargo || command -v rustc || command -v cc; then
+                echo "the runtime container has a Rust toolchain or C compiler" >&2
+                exit 1
+              fi
+              if dpkg-query -W -f "\${Package}\n" | grep -E -- "-dev(:|$)"; then
+                echo "the runtime container has development packages" >&2
+                exit 1
+              fi
+              python3 /release/check-soapy-release.py /release/manta-linux-x86_64-soapy.tar.gz
+            '
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: manta-linux-x86_64-soapy
+          path: manta-linux-x86_64-soapy.tar.gz
+          if-no-files-found: error
           retention-days: 14
 
   # Separate environments preserve production's tag-only policy while allowing
@@ -591,7 +677,8 @@ jobs:
         run: docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE:$VERSION"
 
   # MAN-80: every Release carries a SHA256SUMS asset and a SLSA build-provenance
-  # attestation over the same five archives, so an operator can check a download
+  # attestation over the same archives (MAN-82: build's five and build-soapy's one,
+  # so it needs both jobs), so an operator can check a download
   # with `sha256sum -c` and `gh attestation verify` (docs/RUNBOOKS/release.md,
   # "Verifying a downloaded release"). Signing happens HERE, not in `build`: the
   # build legs run dependency build scripts and `cross` containers, and keeping
@@ -603,7 +690,7 @@ jobs:
   # neither skips nor repeats it. A rejected approval still publishes nothing.
   # See docs/DECISIONS/2026-10-11-man298-first-release.md.
   release:
-    needs: [validate-tag, build]
+    needs: [validate-tag, build, build-soapy]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: ghcr-publish
@@ -615,7 +702,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      # Only the build legs' `manta-*` artifacts: docker/build-push-action also uploads a
+      # Only the build legs' and build-soapy's `manta-*` artifacts: docker/build-push-action also uploads a
       # `*.dockerbuild` build record to this run, which must not be checksummed, attested or
       # published as a release asset.
       - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
@@ -691,3 +778,7 @@ jobs:
             before running anything:
             [Verifying a downloaded release](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/RUNBOOKS/release.md#verifying-a-downloaded-release).
             Linux binaries need the ALSA runtime library (`libasound2`).
+
+            SoapySDR users on Ubuntu 24.04 x86_64: choose `manta-linux-x86_64-soapy.tar.gz`.
+            Install `libsoapysdr0.8` and your receiver's SoapySDR module before running it.
+            See the archive's README for setup and SDRplay prerequisites.

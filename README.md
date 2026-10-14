@@ -72,6 +72,7 @@ clone of this repository.
 | macOS, Intel | `manta-macos-x86_64.tar.gz` |
 | macOS, Apple silicon | `manta-macos-arm64.tar.gz` |
 | Windows x86-64 | `manta-windows-x86_64.zip` |
+| Linux x86-64 with SoapySDR, Ubuntu 24.04 | `manta-linux-x86_64-soapy.tar.gz` |
 
 On Linux or macOS, put your archive's name in place of
 `manta-linux-x86_64.tar.gz`:
@@ -94,12 +95,92 @@ shows, unzip, and run `.\manta.exe --version` in the unpacked folder.
 Each archive holds the binary, this README, both licence files, an example
 config, the man pages (see [Tab completion and man pages](#tab-completion-and-man-pages))
 and the kit for running manta as a service
-([packaging/README.md](packaging/README.md)). Release binaries read
-KiwiSDR, HPSDR, audio and WAV input; SoapySDR needs a build from source.
+([packaging/README.md](packaging/README.md)). The standard release
+archives support KiwiSDR, HPSDR, audio and WAV input. For SoapySDR on
+Ubuntu 24.04 x86_64, download `manta-linux-x86_64-soapy.tar.gz`. It
+includes the SoapySDR input support and requires the system libraries and
+device module below. You do not need Rust or a manta source checkout.
 Linux binaries need the ALSA runtime library (`libasound2`, see the notes
 below). macOS binaries are not signed or notarized: if macOS refuses to run
 one you downloaded in a browser, clear the flag with
 `xattr -d com.apple.quarantine ./manta`.
+
+### SoapySDR on Linux x86_64
+
+`manta-linux-x86_64-soapy.tar.gz` is the Linux x86-64 binary with SoapySDR
+input (RTL-SDR, Airspy, SDRplay, HackRF), built and tested on Ubuntu
+24.04. It loads the SoapySDR library installed on your system, so install
+that library and your receiver's SoapySDR module first. The archive
+bundles neither the vendor API nor driver modules. On other Linux systems,
+use `manta-linux-x86_64.tar.gz`, or [build from source](#build-from-source)
+with `--features hpsdr,soapy`.
+
+```sh
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends libasound2t64 libsoapysdr0.8 soapysdr0.8-module-rtlsdr
+curl -fLO https://github.com/HagaleTechnologies/manta/releases/latest/download/manta-linux-x86_64-soapy.tar.gz
+curl -fLO https://github.com/HagaleTechnologies/manta/releases/latest/download/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+tar xzf manta-linux-x86_64-soapy.tar.gz
+cd manta-linux-x86_64-soapy
+./manta --version
+./manta devices
+```
+
+The checksum command prints `manta-linux-x86_64-soapy.tar.gz: OK` when
+only this archive is present. `./manta --version` shows the release's
+version and build ID, and both features:
+
+```text
+manta 0.1.0 (git <build-id>; features: hpsdr,soapy)
+```
+
+The example installs the RTL-SDR module. Install your receiver's module
+instead, in addition to the core runtime:
+
+| Receiver | Install in addition to the core runtime |
+|---|---|
+| RTL-SDR | `soapysdr0.8-module-rtlsdr` |
+| Airspy | `soapysdr0.8-module-airspy` |
+| HackRF | `soapysdr0.8-module-hackrf` |
+| SDRplay | The vendor's SDRplay API and a compatible SoapySDRPlay3 module, following [SoapySDRPlay3 installation requirements](https://github.com/pothosware/SoapySDRPlay3/blob/master/README.md). |
+
+Getting the SDRplay module can mean installing SDRplay's API and compiling
+SoapySDRPlay3's C++ module yourself; running this manta binary still needs
+no Rust toolchain. Check that the Airspy module supports your model before
+relying on it.
+
+`./manta devices` lists a selector string for each receiver it finds; pass
+it to `--soapy-driver`. Choose a frequency and a sample rate your receiver
+supports: the rate rules and the remaining flags are in [Inputs](#inputs).
+With no receiver attached, or no module for it, `./manta devices` prints
+`SoapySDR devices: none found.` and exits 0.
+
+If the SoapySDR runtime library is missing, the binary cannot start at
+all, not even for `--version`. The system's loader prints this and exits
+127:
+
+```text
+./manta: error while loading shared libraries: libSoapySDR.so.0.8: cannot open shared object file: No such file or directory
+```
+
+Install the SoapySDR runtime with `sudo apt-get install libsoapysdr0.8`,
+then install your receiver's module from the table above. If you do not
+need SoapySDR, use `manta-linux-x86_64.tar.gz` instead. An `unexpected
+argument '--soapy-driver'` error means you are running a binary without
+SoapySDR support; check `./manta --version` and the archive name.
+
+When the library is present but no installed module matches the selector,
+manta exits 1:
+
+```console
+$ ./manta check --soapy-driver driver=man82_nonexistent --soapy-freq-hz 14025000 --soapy-rate-hz 96000
+error: cannot open source: Other: SoapySDR::Device::make() no match
+```
+
+That can mean the receiver's module is not installed, the receiver is
+unplugged, or your user lacks permission to open the device. The module's
+own messages can add more lines on stderr.
 
 ### Build from source
 
@@ -190,8 +271,11 @@ pages into `<dir>`.
   `error: unexpected argument` on a build without them. `hpsdr`
   (OpenHPSDR/Hermes) has no native dependency, which is why the install
   line above turns it on. `soapy` (RTL-SDR, Airspy, SDRplay, HackRF via
-  SoapySDR) needs the native SoapySDR system library installed first;
-  once you have it, add it: `--features hpsdr,soapy`.
+  SoapySDR) is in the `manta-linux-x86_64-soapy.tar.gz` release archive
+  for Ubuntu 24.04 x86_64 (see [SoapySDR on Linux
+  x86_64](#soapysdr-on-linux-x86_64)). To build it yourself, install the
+  native SoapySDR development library first, then add it:
+  `--features hpsdr,soapy`.
 - Windows binaries from the release workflow link the MSVC runtime
   statically, so they need no Visual C++ Redistributable. A Windows build
   from source links it dynamically unless you set
@@ -528,7 +612,7 @@ JSON Lines) is unchanged.
 | Sound card (rig audio passband) | `listen --device`, `--dial-freq-hz` for absolute frequencies | Working, 48 kHz input only |
 | KiwiSDR over the network | `listen --kiwi-host` — any receiver from the public directory at <https://kiwisdr.com/public/> | Working |
 | OpenHPSDR / Hermes (Hermes-Lite 2, Red Pitaya, QMTech) | `listen --hpsdr-host`, feature `hpsdr` — on in the install line above, no native dependency | Working; protocol verified against reference sources, not yet against hardware |
-| RTL-SDR, Airspy, SDRplay, HackRF, anything SoapySDR drives | `listen --soapy-driver`, feature `soapy` — **not** in the install line above; needs the SoapySDR system library, then `--features hpsdr,soapy` | Working, needs hardware soak |
+| RTL-SDR, Airspy, SDRplay, HackRF, anything SoapySDR drives | `listen --soapy-driver`, feature `soapy` — in the `manta-linux-x86_64-soapy.tar.gz` release archive ([SoapySDR on Linux x86_64](#soapysdr-on-linux-x86_64)), **not** in the other archives or the install line above; from source, needs the SoapySDR system library, then `--features hpsdr,soapy` | Working, needs hardware soak |
 | ka9q-radio (radiod) multicast IQ channel: RX-888, Airspy, anything radiod drives | `listen --ka9q-group`; no build feature | Working; protocol checked against ka9q-radio's docs and headers, not yet against a live radiod |
 
 The source frequency and rate flags end in `-hz`: `--kiwi-freq-hz`,
@@ -549,9 +633,10 @@ manta doctor --config manta.toml --duration 10
 ```
 
 Audio selectors are names matched case-insensitively by substring, not numeric
-indexes. `devices` lists input-capable devices without opening a stream. With
-`--features soapy`, it also lists complete Soapy selector strings for
-`--soapy-driver`. HPSDR discovery is not supported; use `--hpsdr-host HOST`
+indexes. `devices` lists input-capable devices without opening a stream. From
+the `manta-linux-x86_64-soapy.tar.gz` archive or a `--features soapy` build,
+it also lists complete Soapy selector strings for `--soapy-driver`; any other
+binary says where to get one. HPSDR discovery is not supported; use `--hpsdr-host HOST`
 with an `hpsdr` build. KiwiSDR uses `--kiwi-host HOST`. ka9q-radio uses
 `--ka9q-group GROUP`, the data group of a radiod IQ channel;
 `avahi-browse -rt _rtp._udp` lists them. `devices --json` reports
