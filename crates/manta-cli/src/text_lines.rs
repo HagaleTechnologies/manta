@@ -33,6 +33,8 @@ impl TrackLines {
             // No state: a bare promotion never gets a TrackClosed (MAN-19's
             // has_emitted filter), so an entry made here would never be freed.
             DecoderEvent::TrackPromoted { .. } => None,
+            // Sender-timing diagnostics (MAN-315) stay out of text mode.
+            DecoderEvent::TimingUpdate { .. } => None,
             DecoderEvent::TrackClosed { track_id, .. } => {
                 let line = self.tracks.remove(track_id)?;
                 render(*track_id, &line)

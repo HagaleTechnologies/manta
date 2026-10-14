@@ -562,6 +562,16 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
         }) => {
             format!("input: type=hpsdr host={host} port={port} freq_hz={freq_hz} rate_hz={rate_hz}")
         }
+        Some(SourceFromFile::Ka9q {
+            group,
+            port,
+            ssrc,
+            interface,
+        }) => format!(
+            "input: type=ka9q group={group} port={port} ssrc={} interface={}",
+            ssrc.map_or("any".to_string(), |s| s.to_string()),
+            interface.map_or("default".to_string(), |i| i.to_string())
+        ),
     };
     let shared = &loaded.input.shared;
     for (key, value) in [
@@ -1022,6 +1032,25 @@ mod tests {
         );
     }
 
+    /// MAN-140: both forms of the ka9q line (Design §2): the defaults, and
+    /// an explicit ssrc and interface.
+    #[test]
+    fn summary_line_for_a_ka9q_input() {
+        let lines = lines_of("[input]\ntype = \"ka9q\"\ngroup = \"239.101.6.1\"\n");
+        assert_eq!(
+            line(&lines, "input:"),
+            "input: type=ka9q group=239.101.6.1 port=5004 ssrc=any interface=default"
+        );
+        let lines = lines_of(
+            "[input]\ntype = \"ka9q\"\ngroup = \"239.101.6.1\"\nssrc = 14100000\n\
+             interface = \"192.168.1.20\"\n",
+        );
+        assert_eq!(
+            line(&lines, "input:"),
+            "input: type=ka9q group=239.101.6.1 port=5004 ssrc=14100000 interface=192.168.1.20"
+        );
+    }
+
     #[test]
     fn summary_never_prints_the_kiwi_password() {
         let lines = lines_of(
@@ -1465,6 +1494,9 @@ mod tests {
         ("input", "driver"),
         ("input", "rate_hz"),
         ("input", "gain_db"),
+        ("input", "group"),
+        ("input", "ssrc"),
+        ("input", "interface"),
         ("input", "center_freq_hz"),
         ("input", "capture_rate_hz"),
         ("input", "replay_epoch"),
@@ -1716,6 +1748,7 @@ mod tests {
             InputKind::Kiwi,
             InputKind::Soapy,
             InputKind::Hpsdr,
+            InputKind::Ka9q,
         ] {
             let body = format!(
                 "[input]\ntype = \"{}\"\n{}",

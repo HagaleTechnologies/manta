@@ -21,6 +21,7 @@ Each active track runs a classical CW decode chain on its ~375 Hz complex channe
 - Envelope + per-track fixed reference scale (coppa's block AGC is deliberately *not* used — SPEC §3.1, §10.2): `manta-decode::envelope`.
 - Dual-EMA threshold + hysteresis/debounce key decisions: SPEC §3.2–3.4.
 - Online 2-means speed tracking of dit/dah durations, Farnsworth-tolerant gap classification: SPEC §4.1–4.2 (`manta-decode::timing`).
+- Per-track sender timing (dot, dash, element/char/word gap, mean and variance in dits; `SenderTiming`, `TimingUpdate`): SPEC §4.1b, MAN-315 decision `docs/DECISIONS/2026-10-11-man315-sender-timing.md`.
 - Beam search over the Morse tree keeps marginal dit/dah hypotheses alive to the character boundary: SPEC §4.3–4.5 (`manta-decode::beam`, `::tree`). Beam is **character-local** — greedy across characters; word context belongs to the validator (SPEC §10.3).
 - Per-character and per-callsign confidence feed [[spot-validation]]: SPEC §4.5–4.6.
 
@@ -28,6 +29,8 @@ Each active track runs a classical CW decode chain on its ~375 Hz complex channe
 
 - The keying-decision band must not gate the rail updates: a mark that fades into the band would then update neither rail, freezing `E_hi` at its pre-fade level and deleting the faded marks (MAN-103 D5 did this; V8w recall fell to 0/50 until MAN-213). See `docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md` and SPEC §3.2.
 - In the v2 evidence front end (`edge-legacy`/`hsmm`), anchor decisions are confirmed from two *actual* adjacent hops, never predicted: each computed hop is held one hop pending until its successor exists, so the per-hop `set_u_ref` speed feedback can only ever affect hops not yet computed (feedback after returned hop t first applies to hop t+2). Predicting the successor's sign with the current window was tried and kept going stale across window changes — MAN-190. See `docs/DECISIONS/2026-10-13-man190-confirmed-evidence-anchors.md`.
+
+- The gap unit is `dit_estimate_ms` (the symmetric mark/gap dit), not `mu_dit_ms`: the transmitter's rise time shortens marks and lengthens gaps by the same amount, so gaps in mark dits read long and 4.5-dit letter gaps split words (MAN-315 D3, SPEC §4.2). Beam likelihoods and the keying threshold still use `mu_dit_ms`.
 
 ## Why it is shaped this way
 

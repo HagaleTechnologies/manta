@@ -685,9 +685,16 @@ down, and the clamp re-anchors `μ_dah`.
 space (i.e. `dit` iff `d < B`), then EMA the assigned centroid:
 `μ ← μ + 0.15·(d − μ)`.
 
-**Constraints** — after every update enforce `2.2 ≤ μ_dah/μ_dit ≤ 4.5`
+**Constraints** — after every update enforce `2.2 ≤ μ_dah/μ_dit ≤ 6.0`
 (weighted keying and Farnsworth stay inside this window); on violation,
-re-anchor `μ_dah = 3·μ_dit`. Clamp `μ_dit` to `[20 ms, 150 ms]`
+re-anchor `μ_dah = r·μ_dit`, where `r` is the sender's learned dash/dot
+ratio (§4.1b; both mark classes need ≥ 3 observations, clamped to the same
+window) and `3.0` before that. **[DEVIATION]** (MAN-315 D5,
+`docs/DECISIONS/2026-10-11-man315-sender-timing.md`): the ceiling was
+`4.5` and the target always `3.0`. Heavy-dash senders sit at or above `4.5`,
+so a dit cluster seeded by a noise fragment never healed: the re-anchor
+kept snapping `μ_dah` back to `3·μ_dit` (measured: dit stuck at 20 ms for
+weight 4 and 5). Clamp `μ_dit` to `[20 ms, 150 ms]`
 (60 WPM .. 8 WPM); the reported PARIS WPM is `1200 / dit_estimate`
 (§4.1a's symmetric correction of `μ_dit_ms`), EMA-smoothed with
 `α = 0.1`.
@@ -698,7 +705,8 @@ centroid by > 40 %, the operator has changed speed (QRQ/QRS): reinitialize
 from the last 5 marks. (Plain EMA tracking already follows ≤ ~20 % gradual
 drift; this rule catches step changes.) A regime-change reinit also resets
 the §4.1a gap centroid below (a stale correction from the old speed regime
-must not carry into the new one).
+must not carry into the new one), and the sender timing model (§4.1b,
+MAN-315 D7): its statistics were learned in the old scale's dits.
 
 #### 4.1a WPM reporting: symmetric mark/gap dit-period estimate
 
@@ -732,15 +740,42 @@ wpm_raw = 1200 / dit_estimate
 with `DIT_BIAS_CAP_FRAC = 0.35`, a two-sided cap (bounding a runaway if
 mark/gap pairing ever breaks down, e.g. element gaps swallowed by the 12 ms
 debounce at extreme WPM). `μ_dit` itself (and its boundary `B`) stays
-uncorrected: §4.2's `u = gap_ms/μ_dit`, §4.3's beam likelihoods, and §3.2's
-`τ_hi` all want a centroid consistent with the marks actually being
-classified — only the WPM *report* wants the absolute physical estimate.
-Before any element gap has been observed, `dit_estimate = μ_dit` (no
-correction).
+uncorrected: §4.3's beam likelihoods and §3.2's `τ_hi` want a centroid
+consistent with the marks actually being classified. Gaps sit on the other
+side of the same boundary, so §4.2 measures them in `dit_estimate` too
+(**[DEVIATION]**, MAN-315 D3): in `μ_dit` units the rise time made every gap
+read long. Before any element gap has been observed, `dit_estimate = μ_dit`
+(no correction). Element gaps buffered during tracker warm-up (the first 5
+marks) feed `μ_egap` when they are replayed (MAN-315 D3).
+
+#### 4.1b Sender timing model
+
+**[DEVIATION]** (MAN-315, `docs/DECISIONS/2026-10-11-man315-sender-timing.md`):
+each track learns its own sender's timing (`SenderTiming` in
+`crates/manta-decode/src/timing.rs`) instead of assuming 1 / 3 / 1 / 3 / 7.
+Five classes, each an EW mean and variance **in dits of `dit_estimate`**
+(§4.1a) at observation time, with an observation count:
+`d = x − mean; mean += α·d; var = (1−α)·(var + α·d²)`, `α = cluster_alpha`;
+the first sample sets `mean = x`, `var = 0`.
+
+| Class | Fed by |
+|---|---|
+| dot / dash | the marks of a character decoded as a plain `Char` whose pattern has as many elements as there were marks, labelled by that pattern; garbles, prosigns and length mismatches feed nothing |
+| element gap | gaps classified inter-element (§4.2), live and replayed |
+| char gap | closed gaps classified inter-character |
+| word gap | closed gaps classified inter-word, and flushed gaps at their closed length (flush length + the space that follows, or the flush length alone when the next mark absorbs a remainder shorter than the demod's debounce window); a gap ≥ `max(15, 4·char-gap mean)` dits is a pause and is not learned |
+
+Uses: §4.1's ratio re-anchor target and §4.2's sender word boundary.
+MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses) read the means
+and variances; this section uses only the means. A §4.1 drift re-init
+resets every class. Legacy and EdgeLegacy only; the HSMM engine (SPEC v2)
+keeps its own per-token speed and learns none of this.
 
 ### 4.2 Gap classification (spaces)
 
-Nominal thresholds in dits (`u = gap_ms / μ_dit`):
+Nominal thresholds in dits (`u = gap_ms / dit_estimate`, §4.1a; was
+`gap_ms / μ_dit` before MAN-315 D3 — the safety-net flush threshold below
+uses the same unit):
 
 - `u < 2.0` → **inter-element** (within a character)
 - `2.0 ≤ u < 5.0` → **inter-character**
@@ -772,6 +807,16 @@ and `μ_wgap / μ_cgap ≥ 1.8`, the word threshold becomes the geometric mean
 `sqrt(μ_cgap · μ_wgap)` instead of the fixed `5.0` dits; the character
 threshold stays at `2.0` dits (element/character confusion is speed-locked;
 character/word spacing is what Farnsworth stretches).
+
+**Sender word boundary** — **[DEVIATION]** (MAN-315 D4). When Farnsworth is
+not active, the character/word threshold is the sender's own, from §4.1b:
+`sqrt(char_gap · word_gap)` once both are learned, `char_gap · sqrt(7/3)`
+with only the char gap, clamped to `[3.0, 12.0]` dits; before any char gap,
+the nominal `5.0`. Precedence: an active Farnsworth pair, then the sender
+boundary, then `5.0`. The inter-element/inter-character threshold stays
+`2.0` (scoring it from the learned variances is MAN-111's). Measured
+(envelope level, 25 WPM, 5 ms rise): letter gaps of 4.5 dits and word gaps
+of 9 decoded `C Q T E S T W 1 A W` before; `CQ TEST W1AW` after.
 
 A trailing space reaching `7·μ_dit` without a new mark forces character +
 word flush immediately (don't wait for the next mark to close a word —
@@ -1018,7 +1063,24 @@ TrackClosed    { track_id }  (added post-freeze, MAN-19 — a track has closed
                  and will never emit another event under this track_id; only
                  emitted for a track that produced at least one other event
                  first.)
+TimingUpdate   { track_id, sample_ts: u64, dit_ms: f32, dot, dash, element_gap,
+                 char_gap, word_gap }  (added post-freeze, MAN-315 — the
+                 track's §4.1b sender timing; each class is
+                 { mean_dits, var_dits2, n } or null before its first
+                 observation, in dits of dit_ms = dit_estimate. On the
+                 TrackMeta cadence when a class gained an observation since
+                 the last one, and once at track finish if anything changed.
+                 A drift re-init (§4.1b) that wipes timing an update already
+                 reported counts as a change: the next update goes out even
+                 with no new observation, wiped classes null, so a stale
+                 update never stands as the track's last. Legacy/EdgeLegacy
+                 only.)
 ```
+
+`manta decode --json` also reports the primary track's last `TimingUpdate`
+(without `track_id`/`sample_ts`) as the top-level `timing`, and
+`manta decode --timing` prints it on stderr, after the summary line, as
+`timing (dits, mean ± sd): dot … dash … element gap … char gap … word gap …`.
 
 `TrackMeta.snr_2500_db` is §2.3's floor-based `S − F` estimate (peak-held
 over the reporting interval, per §2.3), supplied by the detector layer that
@@ -1187,6 +1249,23 @@ bogus count depends on the crash draw under every `crash_filter` value
 pinned; promotions and validated calls are the robust discriminators
 (see the decision record).
 
+### 7.3 Sender-weighting vectors VW1–VW5 (MAN-315)
+
+Senders who do not key ideal 1:3 / 3 / 7 timing, decoded on the default
+`legacy` engine (`crates/manta-cli/tests/golden_vw.rs`; `manta gen vw1` …
+`vw5`). All: 96 kHz, 14 MHz centre, offset +12.34 kHz unless stated, 5 ms
+rise, AWGN, looped text, 60 s unless stated. `dit_units`/`element_gap_units`
+set the dot and the element gap in dits (1.0 standard). Learned timing is
+read from the track's last `TimingUpdate` (§5).
+
+| # | Name | Signal(s) | Impairment | Pass criteria |
+|---|---|---|---|---|
+| VW1 | heavy-dash | 25 WPM, dash 4.0 dits, gaps 3/7, +10 dB, `CQ TEST K1ABC K1ABC TEST`, noise seed `0x3153` | AWGN, jitter 8 % (seed 3) | first exact `K1ABC` among the first 10 words, every word after it a keyed word; CER ≤ 0.25; learned dash 3.6–4.4 dits |
+| VW2 | long-gaps | 25 WPM, 3:1, char gap 4.5, word gap 9, +15 dB, `CQ TEST W1AW` | AWGN, jitter 8 % (seed 3) | CER ≤ 0.06; word boundaries ≥ 95 %; learned char gap 4.0–5.0, word gap 8.0–10.0 dits |
+| VW3 | bug-key | 22 WPM, dot 0.85, dash 4.5, element gap 1.0, gaps 3.5/8, +12 dB, `CQ DX DE W9BUG W9BUG K` | AWGN, jitter 10 % (seed 5) | CER ≤ 0.08; learned dash > 4.0 dits |
+| VW4 | heavy hand-key | 18 WPM, dot 1.2, element gap 0.8, dash 3.6, gaps 4/9, +15 dB, `CQ CQ DE G4HND G4HND K` | AWGN, jitter 12 % (seed 6) | CER ≤ 0.08 |
+| VW5 | keyboard + heavy, adjacent | A: 28 WPM ideal 3:1, 3/7, `CQ TEST N1AA N1AA TEST`; B: 22 WPM dash 4.0, gaps 4.5/9, offset +12.34 kHz + 3 × 93.75 Hz, `CQ TEST N2BB N2BB TEST`; both +20 dB; 90 s | AWGN; B jitter 5 % (seed 7) | exactly 2 decoded tracks, each within half a channel (46.875 Hz) of its signal; CER ≤ 0.06 each; A learned dash 2.6–3.4 and char gap 2.5–3.5, B dash 3.6–4.4 and char gap 4.0–5.0, on different `track_id`s |
+
 ---
 
 ## 8. Module map (where each section lands)
@@ -1255,7 +1334,7 @@ hyst_frac = 0.15
 tau_lo_ms = 500
 tau_hi_bounds_ms = [100, 400]
 flush_gap_dits = 7.0
-# mu_ratio_bounds = [2.2, 4.5]  # not configurable yet: compile-time constant in manta-decode::timing
+# mu_ratio_bounds = [2.2, 6.0]  # not configurable yet: compile-time constant in manta-decode::timing (MAN-315: was 4.5)
 # char_gap_dits = 2.0           # not configurable yet: compile-time constant in manta-decode::timing (every engine, MAN-103)
 # word_gap_dits = 5.0           # not configurable yet: compile-time constant in manta-decode::timing
 # cluster_alpha = 0.15          # not configurable yet: compile-time constant in manta-decode::timing
@@ -1269,12 +1348,13 @@ flush_gap_dits = 7.0
 #   kiwi:  host*, freq_hz*, port, password
 #   soapy: driver*, freq_hz*, rate_hz*, gain_db   (build with --features soapy)
 #   hpsdr: host*, freq_hz*, rate_hz*, port        (build with --features hpsdr)
+#   ka9q:  group*, port, ssrc, interface
 # Any source flag on the command line (--device, --source, --kiwi-host,
-# --soapy-driver, --hpsdr-host) replaces a typed [input] table whole,
-# its shared keys below included. Example:
-# type = "kiwi"               # audio | file | kiwi | soapy | hpsdr
+# --soapy-driver, --hpsdr-host, --ka9q-group) replaces a typed [input]
+# table whole, its shared keys below included. Example:
+# type = "kiwi"               # audio | file | kiwi | soapy | hpsdr | ka9q
 # host = "<your-kiwi-host>"   # kiwi, hpsdr
-# port = 8073                 # kiwi (default 8073), hpsdr (default 1024)
+# port = 8073                 # kiwi (default 8073), hpsdr (default 1024), ka9q (default 5004)
 # freq_hz = 7030000.0         # kiwi, soapy, hpsdr: RF center frequency, Hz
 # password = ""               # kiwi (default "")
 # The other types' keys:
@@ -1286,6 +1366,9 @@ flush_gap_dits = 7.0
 # driver = "driver=rtlsdr"    # soapy: SoapySDR device args
 # rate_hz = 192000.0          # soapy, hpsdr: sample rate, Hz
 # gain_db = 30.0              # soapy: omit for the device's AGC
+# group = "239.101.6.1"       # ka9q: the radiod channel's multicast data group, IPv4 address or host name (--ka9q-group)
+# ssrc = 14100000             # ka9q: the channel's SSRC, 0 to 4294967295; omit when the group carries one channel (--ka9q-ssrc)
+# interface = "192.168.1.20"  # ka9q: local IPv4 address to join the group on; omit for the kernel's choice (127.0.0.1 is always joined too) (--ka9q-interface)
 
 # Shared keys, valid with any type or none:
 
