@@ -15,16 +15,13 @@ Then:
   `/status`.
 - [packaging/README.md](../packaging/README.md): running unattended under
   systemd, launchd or Docker Compose.
-<<<<<<< HEAD
 - [Keeping cty.dat and MASTER.SCP current](../packaging/README.md#keeping-ctydat-and-masterscp-current):
   downloading newer country-prefix and known-call lists without a release
   (MAN-316).
-=======
 - [RUNBOOKS/monitoring.md](RUNBOOKS/monitoring.md): a ready Grafana dashboard
   and Prometheus alerts.
 - [GUIDES/ka9q-radio.md](GUIDES/ka9q-radio.md): feeding manta one
   ka9q-radio (radiod) channel over multicast.
->>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
 - The [runbooks](#runbooks) below.
 - `manta <command> --help` for every flag, or `man manta` once the man
   pages are installed

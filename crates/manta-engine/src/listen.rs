@@ -62,7 +62,6 @@ pub struct ListenObservers {
     /// running `Validator`. `None` (the default) skips the check
     /// entirely, so `listen()`'s existing callers pay nothing.
     pub operator_lists: Option<Arc<OperatorListsUpdate>>,
-<<<<<<< HEAD
     /// MAN-316: the country table and known-call set a scheduled list
     /// refresh replaces. The running `Validator` takes their current tables
     /// at the start (so the caller builds this from the same
@@ -71,14 +70,12 @@ pub struct ListenObservers {
     /// `store`. `None` (the default) skips the check entirely, so `listen()`'s
     /// existing callers pay nothing.
     pub reference_lists: Option<Arc<ReferenceLists>>,
-=======
     /// MAN-312: static crashes detected so far this session
     /// (`TrackManager::static_crash_count`, summed across the segments a
     /// discontinuity starts), stored with `fetch_max` after each processed
     /// chunk so the published value never goes backwards. A counter, so it
     /// is never zeroed on exit. `None` (the default) skips the store.
     pub static_crashes: Option<Arc<AtomicU64>>,
->>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
     /// MAN-314: the currently marked RTTY signals (SPEC §2.6), stored
     /// whenever the marked set or a marked signal's metadata changes (so a
     /// store is not by itself a mark or clear), emptied on a segment
@@ -374,20 +371,11 @@ fn new_segment(
     })
 }
 
-<<<<<<< HEAD
-#[allow(clippy::too_many_arguments)]
-fn emit(
-    events: Vec<DecoderEvent>,
-    validator: &mut Validator,
-    lists: Option<&OperatorListsUpdate>,
-    mut references: Option<&mut ReferenceWatch>,
-    quality: Option<&DecodeQualityObserver>,
-    calibration_factor: f64,
-=======
 /// What `emit` needs besides the events and callbacks, built once per
 /// `listen_with_observers` call.
 struct EmitCtx<'a> {
     lists: Option<&'a OperatorListsUpdate>,
+    references: Option<ReferenceWatch>,
     quality: Option<&'a DecodeQualityObserver>,
     calibration_factor: f64,
     /// MAN-324: `Some` only when `ListenObservers::live_state` is set.
@@ -398,7 +386,6 @@ fn emit(
     events: Vec<DecoderEvent>,
     validator: &mut Validator,
     ctx: &mut EmitCtx<'_>,
->>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
     on_event: &mut impl FnMut(&DecoderEvent),
     on_spot: &mut impl FnMut(&crate::Spot),
 ) {
@@ -421,13 +408,10 @@ fn emit(
         if let Some(l) = ctx.lists.and_then(OperatorListsUpdate::take) {
             validator.replace_operator_lists(&l.allowlist, l.blocklist, l.notch);
         }
-<<<<<<< HEAD
         // MAN-316: likewise for a list refresh's new cty/scp tables.
-        if let Some(watch) = references.as_deref_mut() {
+        if let Some(watch) = ctx.references.as_mut() {
             watch.sync(validator);
         }
-        on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
-=======
         let calibrated = crate::calibrate_freq_events(&ev, ctx.calibration_factor);
         on_event(&calibrated);
         // MAN-324: state first (a closing track's last text is flushed
@@ -436,7 +420,6 @@ fn emit(
         if let Some(tap) = ctx.live.as_mut() {
             tap.observe(&calibrated, validator);
         }
->>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
         for spot in validator.ingest(&ev) {
             on_spot(&spot);
         }
@@ -557,12 +540,10 @@ pub fn listen_with_observers(
     let rf_passband_hz = src.rf_passband_hz();
 
     let mut validator = cfg.validator(fs)?;
-<<<<<<< HEAD
-    let mut references = observers
+    let references = observers
         .reference_lists
         .clone()
         .map(|lists| ReferenceWatch::new(lists, &mut validator));
-=======
     // MAN-324: the live tap turns the validator's decision log on per
     // batch, only while someone is subscribed (`emit`).
     let live = observers
@@ -573,10 +554,10 @@ pub fn listen_with_observers(
     let mut ctx = EmitCtx {
         lists: observers.operator_lists.as_deref(),
         quality: observers.decode_quality.as_deref(),
+        references,
         calibration_factor,
         live,
     };
->>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
 
     // One relaxed store over a count that is a single filtered pass across
     // the (cap-bounded) track map, once per processed chunk and skipped
@@ -665,14 +646,7 @@ pub fn listen_with_observers(
     emit(
         events,
         &mut validator,
-<<<<<<< HEAD
-        observers.operator_lists.as_deref(),
-        references.as_mut(),
-        observers.decode_quality.as_deref(),
-        calibration_factor,
-=======
         &mut ctx,
->>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
         &mut on_event,
         &mut on_spot,
     );
@@ -688,14 +662,7 @@ pub fn listen_with_observers(
     emit(
         events,
         &mut validator,
-<<<<<<< HEAD
-        observers.operator_lists.as_deref(),
-        references.as_mut(),
-        observers.decode_quality.as_deref(),
-        calibration_factor,
-=======
         &mut ctx,
->>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
         &mut on_event,
         &mut on_spot,
     );
@@ -742,14 +709,7 @@ pub fn listen_with_observers(
             emit(
                 finish_events,
                 &mut validator,
-<<<<<<< HEAD
-                observers.operator_lists.as_deref(),
-                references.as_mut(),
-                observers.decode_quality.as_deref(),
-                calibration_factor,
-=======
                 &mut ctx,
->>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
                 &mut on_event,
                 &mut on_spot,
             );
@@ -774,14 +734,7 @@ pub fn listen_with_observers(
             emit(
                 events,
                 &mut validator,
-<<<<<<< HEAD
-                observers.operator_lists.as_deref(),
-                references.as_mut(),
-                observers.decode_quality.as_deref(),
-                calibration_factor,
-=======
                 &mut ctx,
->>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
                 &mut on_event,
                 &mut on_spot,
             );
@@ -800,14 +753,7 @@ pub fn listen_with_observers(
         emit(
             events,
             &mut validator,
-<<<<<<< HEAD
-            observers.operator_lists.as_deref(),
-            references.as_mut(),
-            observers.decode_quality.as_deref(),
-            calibration_factor,
-=======
             &mut ctx,
->>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
             &mut on_event,
             &mut on_spot,
         );
@@ -829,14 +775,7 @@ pub fn listen_with_observers(
     emit(
         events,
         &mut validator,
-<<<<<<< HEAD
-        observers.operator_lists.as_deref(),
-        references.as_mut(),
-        observers.decode_quality.as_deref(),
-        calibration_factor,
-=======
         &mut ctx,
->>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
         &mut on_event,
         &mut on_spot,
     );

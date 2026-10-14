@@ -1100,6 +1100,7 @@ mod tests {
             decoder_version: "manta-test".to_string(),
             shutdown,
             drain_deadline: Duration::from_secs(1),
+            stream: StreamKind::Spots,
         };
         let spot = JsonItem::Spot(crate::bus::BusSpot {
             spot: Spot {

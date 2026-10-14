@@ -180,7 +180,6 @@ pub(crate) fn escape_label_value(v: &str) -> String {
         .replace('\n', "\\n")
 }
 
-<<<<<<< HEAD
 /// MAN-316: where the reference list in use came from -- the `origin`
 /// label of `manta_list_info`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,10 +257,7 @@ struct ListMetrics {
     last_success: Option<SystemTime>,
 }
 
-fn spot_type_metric_label(t: SpotType) -> &'static str {
-=======
 pub(crate) fn spot_type_metric_label(t: SpotType) -> &'static str {
->>>>>>> 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
     match t {
         SpotType::Cq => "cq",
         SpotType::De => "de",
