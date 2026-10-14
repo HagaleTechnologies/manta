@@ -97,6 +97,10 @@ jobs:
   create-ci-check:
     name: Create required test check-runs on the reviewed SHA
     if: github.event_name == 'workflow_dispatch'
+    # Q-0068: the app key lives in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
@@ -328,6 +332,10 @@ jobs:
     name: Relay test results onto the reviewed SHA's check-runs
     needs: [create-ci-check, test]
     if: always() && github.event_name == 'workflow_dispatch'
+    # Q-0068: the app key lives in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     permissions:
       actions: read
