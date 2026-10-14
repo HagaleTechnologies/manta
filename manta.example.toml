@@ -258,15 +258,15 @@ station_callsign = "N0CALL"
 #scp_url = "http://www.supercheckpartial.com/MASTER.SCP"
 
 # Use exactly this version of cty.dat, by the SHA-256 of its bytes (64 hex
-# digits, as printed in manta's `lists:` log line). manta looks in
-# cty_path, then the built-in copy, then list_cache_dir, and refuses to
-# start if none matches. A pinned list is never refreshed. --cty-sha256
-# overrides it.
+# digits, as printed in manta's `lists:` log line). If cty_path is set,
+# that file must match and nothing else is tried; otherwise manta looks in
+# the built-in copy, then list_cache_dir. It refuses to start if no copy
+# matches. A pinned list is never refreshed. --cty-sha256 overrides it.
 #cty_sha256 = "e9ff91a3c3ab28c5f7dbcffb4280944a84645ed53d41cb4c68a41f132ee13fd1"
 
-# Use exactly this version of MASTER.SCP, looked up like cty_sha256 (in
-# scp_path, the built-in copy, then list_cache_dir). --scp-sha256
-# overrides it.
+# Use exactly this version of MASTER.SCP, looked up like cty_sha256 (a set
+# scp_path must match; otherwise the built-in copy, then list_cache_dir).
+# --scp-sha256 overrides it.
 #scp_sha256 = "00692208fa86b1498dcd6fc0f88e14d2a1a0462ba5d481855da5de69be4e3cf0"
 
 # How many times a call must repeat before it is spotted, by how common its

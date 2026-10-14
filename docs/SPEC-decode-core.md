@@ -1444,8 +1444,9 @@ allowlist = []
 # cty_url = "http://www.country-files.com/cty/cty.dat"
 # scp_url = "http://www.supercheckpartial.com/MASTER.SCP"
 # Pin a list by the SHA-256 of its bytes (64 hex digits), for every
-# validating command: looked up in cty_path/scp_path, then the bundled
-# copy, then list_cache_dir; no match stops before the source is read.
+# validating command: a set cty_path/scp_path must match it; otherwise it
+# is looked up in the bundled copy, then list_cache_dir. No match stops
+# before the source is read.
 # --cty-sha256 / --scp-sha256 override them.
 # cty_sha256 = "e9ff91a3c3ab28c5f7dbcffb4280944a84645ed53d41cb4c68a41f132ee13fd1"
 # scp_sha256 = "00692208fa86b1498dcd6fc0f88e14d2a1a0462ba5d481855da5de69be4e3cf0"

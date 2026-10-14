@@ -1323,8 +1323,10 @@ struct FilterOpts {
     #[arg(long)]
     scp: Option<PathBuf>,
     /// Use exactly the cty.dat whose SHA-256 is HEX (64 hex digits, as in manta's `lists:` log
-    /// line). manta looks in --cty, then the built-in copy, then spot.list_cache_dir, and stops
-    /// before reading the source if none matches. Defaults to `spot.cty_sha256` from --config.
+    /// line). With --cty (or spot.cty_path) set, that file must have this SHA-256 and nothing
+    /// else is tried; without one, manta looks in the built-in copy, then spot.list_cache_dir.
+    /// manta stops before reading the source if no copy matches. Defaults to `spot.cty_sha256`
+    /// from --config.
     #[arg(long, value_name = "HEX", value_parser = config::parse_sha256)]
     cty_sha256: Option<String>,
     /// Use exactly the MASTER.SCP whose SHA-256 is HEX. Looked up like --cty-sha256. Defaults to
@@ -2268,10 +2270,12 @@ fn build_pipeline_config(
 }
 
 /// MAN-316 D3 steps 1 and 2 for one list: the text an explicit path or a
-/// hash pin chooses, or `None` for the built-in copy (no path, no pin, or a
-/// pin matching the built-in copy, which is reported as pinned but needs no
-/// parse of its own). A pin is looked up in the path, then the built-in
-/// copy, then `list_cache_dir`; a miss is an error naming where it looked.
+/// hash pin chooses, or `None` for the built-in copy (no path and no pin).
+/// A pin matching the built-in copy returns the built-in text, reported as
+/// pinned. A set path is the only place a pin is checked: a
+/// path whose SHA-256 differs from the pin is an error. Without a path, a
+/// pin is looked up in the built-in copy, then `list_cache_dir`; a miss is
+/// an error naming where it looked.
 fn resolve_list_bytes(
     kind: ListKind,
     path: Option<&std::path::Path>,
@@ -7212,6 +7216,23 @@ mod tests {
             format!(
                 "cty.dat file {} has SHA-256 {sha}, not the pinned {other} (--cty-sha256)",
                 f.path().display()
+            )
+        );
+    }
+    #[test]
+    fn a_pin_with_a_mismatched_path_is_not_looked_up_in_the_cache() {
+        let f = write_temp_file(manta_spot::CTY_DAT.as_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let cached = format!("{}{QQ9_ENTITY}", manta_spot::CTY_DAT);
+        let pin = cache_cty_version(dir.path(), cached.as_bytes());
+        let spot = pinned_spot(Some(f.path().into()), Some(&pin), Some(dir.path().into()));
+        let err = pinned(&spot).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "cty.dat file {} has SHA-256 {}, not the pinned {pin} (--cty-sha256)",
+                f.path().display(),
+                bundled_cty_sha256()
             )
         );
     }
