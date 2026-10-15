@@ -116,11 +116,15 @@ impl IqSource for DecimatingSource {
     /// relative to the centre. Consumers use it to veto track spawns
     /// beyond the boundary (the transition band's frequency-estimate
     /// corruption, duplicate tracks and foldover promotions all measured
-    /// beyond it); `rf_passband_hz` above already reports the same band,
-    /// so advertisement and veto can never disagree. `None` for a
-    /// factor-1 pass-through wrap (no filter, no transition band).
+    /// beyond it). Reported as `rf_passband_hz` itself -- the trusted
+    /// band intersected with the inner source's passband -- so a
+    /// decimation wrapping an already narrower source (one-sided rig
+    /// audio, a KiwiSDR filter) vetoes exactly what it advertises, and
+    /// advertisement and veto can never disagree (round-2 review on PR
+    /// #300). `None` for a factor-1 pass-through wrap (no filter, no
+    /// transition band).
     fn trusted_band_hz(&self) -> Option<(f64, f64)> {
-        self.trusted_half.map(|t| (-t, t))
+        self.trusted_half.map(|_| self.rf_passband_hz())
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
@@ -532,5 +536,52 @@ mod tests {
         assert_eq!(src.sample_rate(), 48_000.0);
         assert_eq!(src.trusted_band_hz(), None);
         assert_eq!(src.rf_passband_hz(), (-24_000.0, 24_000.0));
+    }
+
+    /// An `InMemorySource` reporting a narrower RF passband than its
+    /// Nyquist span, as a one-sided rig-audio source does.
+    struct NarrowSource {
+        inner: InMemorySource,
+        passband: (f64, f64),
+    }
+
+    impl IqSource for NarrowSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.sample_rate()
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz()
+        }
+        fn rf_passband_hz(&self) -> (f64, f64) {
+            self.passband
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    /// MAN-196 (round-2 review on PR #300): when the wrapped source is
+    /// narrower than the decimator's trusted band, the spawn veto is the
+    /// same intersected band `rf_passband_hz` (and the startup notice)
+    /// advertises -- advertisement and enforcement never disagree.
+    #[test]
+    fn trusted_band_hz_matches_the_advertised_passband_for_a_narrow_source() {
+        let src = DecimatingSource::new(
+            Box::new(NarrowSource {
+                inner: InMemorySource {
+                    samples: Vec::new(),
+                    cursor: 0,
+                    fs: 48_000.0,
+                    center_freq_hz: 14_000_000.0,
+                    live: None,
+                    counters: None,
+                },
+                passband: (300.0, 3_000.0),
+            }),
+            24_000.0,
+        )
+        .unwrap();
+        assert_eq!(src.rf_passband_hz(), (300.0, 3_000.0));
+        assert_eq!(src.trusted_band_hz(), Some((300.0, 3_000.0)));
     }
 }

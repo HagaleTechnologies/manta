@@ -19,7 +19,10 @@ crossover of the halfband design — serves both halves of the ticket:
   before it starts. The field names, schemas and metrics
   families do not change.
 - **Veto** (option a): `IqSource::trusted_band_hz()` (default `None`)
-  reports the band; `listen` reads it once per source and threads it
+  reports the band (for `DecimatingSource`, the same band intersected
+  with the inner passband that `rf_passband_hz` advertises, so a
+  narrower wrapped source vetoes what it advertises -- round-2 review
+  on PR #300); `listen` reads it once per source and threads it
   into every segment's `TrackManager` (the discontinuity rebuild
   included) via `set_trusted_band_hz`, which builds a per-channel mask —
   true iff the channel centre lies in `[lo, hi]`, no margin channel. The

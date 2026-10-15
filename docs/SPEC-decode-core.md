@@ -153,7 +153,8 @@ bisection in the module's tests. Two rules consume it:
   static-crash live set all advertise/judge the honest band. The JSON
   `passband_offsets_hz` value narrows; its name and schema do not change.
 - **Spawn veto**: `IqSource::trusted_band_hz()` (default `None`) reports
-  the band; `listen` reads it once per source and every segment's
+  the band — for `DecimatingSource`, the same intersected band
+  `rf_passband_hz` advertises, so the two never disagree; `listen` reads it once per source and every segment's
   `TrackManager::set_trusted_band_hz(lo, hi)` builds a per-channel mask
   (true iff the channel centre `f(k)` lies in `[lo, hi]`; no margin
   channel). A channel whose centre lies outside the band may not START a
