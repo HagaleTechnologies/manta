@@ -312,10 +312,23 @@ impl ClientCtx {
     /// record, already serialised, passed through verbatim. Both shapes,
     /// and the `kind` key that tells them apart, are in `docs/SPOT-SCHEMA.md`.
     fn render(&self, item: &JsonItem) -> String {
-        let (seq, bus_spot) = match item {
-            JsonItem::Spot { seq, spot } => (seq, spot),
+        let (seq, bus_spot, rendered) = match item {
+            JsonItem::Spot {
+                seq,
+                spot,
+                rendered,
+            } => (seq, spot, rendered),
             JsonItem::Grade { line, .. } | JsonItem::Live(line) => return line.to_string(),
         };
+        // MAN-137: replay must repeat a record's contents, so the first
+        // rendering is kept with the item and every later delivery (live or
+        // resumed) reuses it.
+        rendered
+            .get_or_init(|| self.render_spot(*seq, bus_spot).into())
+            .to_string()
+    }
+
+    fn render_spot(&self, seq: u64, bus_spot: &crate::bus::BusSpot) -> String {
         let unix_ts = self.bus.unix_ts_for(bus_spot.spot.sample_ts);
         // MAN-316: one snapshot per spot, so a refresh that swaps the table
         // mid-render can never mix two tables' geography in one message.
@@ -328,7 +341,7 @@ impl ClientCtx {
             &self.decoder_version,
             unix_ts,
             self.bus.session_nonce(),
-            *seq,
+            seq,
         );
         serde_json::to_string(&msg).expect("SpotMessage always serializes")
     }
@@ -1362,7 +1375,8 @@ mod tests {
     /// MAN-316: a `cty.dat` refresh reaches a client that is already
     /// connected. The same `ClientCtx` renders an unallocated `QQ9ZZZ` with
     /// the unknown-geography sentinels, then, once the refresher stores a
-    /// table that allocates QQ9, with that entity's continent and CQ zone.
+    /// table that allocates QQ9, with that entity's continent and CQ zone
+    /// for the next publication. A spot already delivered replays unchanged.
     #[test]
     fn render_uses_the_current_cty_table() {
         use crate::spot_message::{UNKNOWN_CONTINENT, UNKNOWN_CQ_ZONE, UNKNOWN_DXCC};
@@ -1387,8 +1401,8 @@ mod tests {
             start_seq: None,
             resume_limiter: IpRateLimiter::new(MAX_RESUMES_PER_IP, RESUME_RATE_WINDOW),
         };
-        let spot = JsonItem::Spot {
-            seq: 1,
+        let publication = |seq: u64| JsonItem::Spot {
+            seq,
             spot: crate::bus::BusSpot {
                 spot: Spot {
                     callsign: "QQ9ZZZ".to_string(),
@@ -1402,12 +1416,17 @@ mod tests {
                 },
                 occurrence_count: 1,
             },
+            rendered: Arc::default(),
         };
-        let render = |ctx: &ClientCtx| -> serde_json::Value {
-            serde_json::from_str(&ctx.render(&spot)).expect("render emits JSON")
+        let parse = |line: &str| -> serde_json::Value {
+            serde_json::from_str(line).expect("render emits JSON")
         };
 
-        let before = render(&ctx);
+        let delivered = publication(1);
+        // The history keeps a clone of the item the broadcast carried.
+        let replayed = delivered.clone();
+        let first_line = ctx.render(&delivered);
+        let before = parse(&first_line);
         assert_eq!(before["dxDxcc"], UNKNOWN_DXCC);
         assert_eq!(before["dxContinent"], UNKNOWN_CONTINENT);
         assert_eq!(before["dxCqZone"], UNKNOWN_CQ_ZONE);
@@ -1417,9 +1436,13 @@ mod tests {
             "{}{QQ9}",
             manta_spot::CTY_DAT
         ))));
-        let after = render(&ctx);
+        let after = parse(&ctx.render(&publication(2)));
         assert_eq!(after["dxContinent"], "EU", "{after}");
         assert_eq!(after["dxCqZone"], 14, "{after}");
         assert!(!after["dxLat"].is_null(), "{after}");
+
+        // MAN-137: a resumed client gets the record it would have got live,
+        // byte for byte, not a re-rendering against the swapped table.
+        assert_eq!(ctx.render(&replayed), first_line);
     }
 }

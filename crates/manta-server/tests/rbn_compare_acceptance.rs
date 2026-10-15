@@ -458,7 +458,7 @@ impl Harness {
                     .records
                     .iter()
                     .find_map(|r| match r {
-                        manta_server::bus::JsonItem::Spot { seq, spot }
+                        manta_server::bus::JsonItem::Spot { seq, spot, .. }
                             if manta_server::spot_message::spot_id(
                                 STATION_CALL,
                                 NONCE,

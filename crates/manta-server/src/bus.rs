@@ -15,7 +15,7 @@
 
 use manta_spot::Spot;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::sync::broadcast;
 
@@ -77,6 +77,11 @@ pub enum JsonItem {
     Spot {
         seq: u64,
         spot: BusSpot,
+        /// The line this spot was first rendered as, shared by the live
+        /// broadcast and the resume history (MAN-137): a replay resends it
+        /// byte for byte, even after a `cty.dat` swap (MAN-316) changed
+        /// what a fresh rendering would say.
+        rendered: Arc<OnceLock<Arc<str>>>,
     },
     Grade {
         seq: u64,
@@ -348,6 +353,7 @@ impl SpotBus {
             let item = JsonItem::Spot {
                 seq: stream.last_seq,
                 spot: bus_spot.clone(),
+                rendered: Arc::default(),
             };
             let n = stream.records.push(
                 StreamRecord {
