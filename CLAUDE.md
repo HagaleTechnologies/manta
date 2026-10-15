@@ -289,6 +289,14 @@ by a 20-run merge-queue watch with rollback triggers;
 `test-hpsdr (windows-latest)` stays advisory. See
 docs/DECISIONS/2026-10-15-man371-windows-required-check.md.
 
+MAN-233: a SoapySDR driver stream overflow counts one
+`manta_input_gaps_detected_total{source="soapy"}` gap event (present at 0
+from the first scrape; `dropped_packets`/`malformed_packets` stay 0) and
+warns rate-limited (fixed 60 s, `with_overflow_notice`); `Timeout` counts
+nothing and the retry bounds are unchanged. The `soapy`-gated lines
+compile and test only in CI's `test-soapy` leg. See
+docs/DECISIONS/2026-10-15-man233-soapy-overflow-visibility.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each

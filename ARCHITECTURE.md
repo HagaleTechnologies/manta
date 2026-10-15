@@ -775,10 +775,12 @@ validation (MAN-28). Dedupe (step 5) still applies.
   (§3 — blocked on a `coppa-audio` API addition, `manta-engine::soak`'s documented
   deviation, a different gap from MAN-56's wire-level packet counters).
   The three `manta_input_*` series are published only for sources that
-  actually count wire-level packet loss (HPSDR and KiwiSDR — MAN-128
-  generalized MAN-56's gap-stat wiring to KiwiSDR's SND `seq` field;
-  soapy/audio report none) and are **absent**, not a frozen zero, for
-  every other source — "absent means not measured", so an operator never
+  actually count wire-level packet loss or driver overflow (HPSDR, KiwiSDR
+  (MAN-128's SND `seq` tracking), ka9q-radio (MAN-140) and SoapySDR, whose
+  driver stream overflows each count one gap event — MAN-233; its
+  `dropped_packets` stays 0 because an overflow carries no lost-sample
+  count) and are **absent**, not a frozen zero, for every other source
+  (audio) — "absent means not measured", so an operator never
   reads a placeholder as live data; the same distinction that motivated
   the `manta_active_tracks` caveat before it was populated.
 - **RBN comparison (MAN-301)**: `[rbn_compare]` is opt-in and disabled by

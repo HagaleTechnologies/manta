@@ -1496,9 +1496,16 @@ impl LiveSourceSpec {
                 let rate = soapy
                     .rate
                     .ok_or_else(|| anyhow!("--soapy-rate-hz is required with --soapy-driver"))?;
-                Box::new(manta_input::soapy::SoapySdrIqSource::open(
-                    driver, rate, freq, soapy.gain,
-                )?)
+                // Each (re)open gets a fresh rate-limit state, mirroring
+                // the audio silence notice (MAN-233; the reconnect itself
+                // already logs per-attempt).
+                let warn_driver = driver.to_string();
+                Box::new(
+                    manta_input::soapy::SoapySdrIqSource::open(driver, rate, freq, soapy.gain)?
+                        .with_overflow_notice(Box::new(move || {
+                            logging::warning(&soapy_overflow_warning(&warn_driver))
+                        })),
+                )
             }
             #[cfg(feature = "hpsdr")]
             LiveSourceSpec::Hpsdr(hpsdr) => {
@@ -1750,9 +1757,22 @@ fn trusted_band_notice(fs_out_hz: f64, lo_hz: f64, hi_hz: f64) -> String {
 fn audio_silence_warning(device: &str) -> String {
     format!(
         "warning: audio input {device} is delivering digital silence at {} Hz \
-         (every sample is exactly zero) -- {}",
+          (every sample is exactly zero) -- {}",
         manta_input::TARGET_RATE_HZ,
         manta_input::audio::audio_input_hint()
+    )
+}
+
+/// MAN-233: a SoapySDR stream overflow means this chunk was dropped by a
+/// full driver ring buffer -- the host is not keeping up. Counted, and
+/// rate-limited so a sustained overflow burst logs one line per 60 s.
+#[cfg(feature = "soapy")]
+fn soapy_overflow_warning(driver: &str) -> String {
+    format!(
+        "warning: SoapySDR input ({driver}) dropped samples: the driver reported a \
+         stream overflow -- the host is not keeping up; every overflow is counted in \
+         manta_input_gaps_detected_total{{source=\"soapy\"}} (this warning is \
+         rate-limited to once per 60 s)"
     )
 }
 
@@ -6993,6 +7013,21 @@ mod tests {
             "{w}"
         );
         assert!(w.ends_with(manta_input::audio::audio_input_hint()), "{w}");
+    }
+
+    /// MAN-233: pins the design section's exact wording, so a future edit
+    /// cannot quietly change what the operator is told to watch
+    /// (`ka9q_agc_warning_is_design_section_3s_text` precedent).
+    #[cfg(feature = "soapy")]
+    #[test]
+    fn soapy_overflow_warning_names_the_driver_the_counter_and_the_interval() {
+        assert_eq!(
+            soapy_overflow_warning("driver=rtlsdr"),
+            "warning: SoapySDR input (driver=rtlsdr) dropped samples: the driver reported a \
+             stream overflow -- the host is not keeping up; every overflow is counted in \
+             manta_input_gaps_detected_total{source=\"soapy\"} (this warning is \
+             rate-limited to once per 60 s)"
+        );
     }
 
     #[test]
