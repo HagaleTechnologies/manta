@@ -5992,6 +5992,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                             ))
                                 as std::sync::Arc<dyn manta_engine::LiveStateSink>
                         }),
+                    detector_confirmations: None,
                 },
                 |ev| {
                     if json {
