@@ -244,13 +244,6 @@ pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
 planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
-<<<<<<< HEAD
-MAN-82: releases add `manta-linux-x86_64-soapy.tar.gz` (`build-soapy`,
-`hpsdr,soapy`, Ubuntu 24.04 x86_64, libSoapySDR linked dynamically, own
-man pages, checked by `scripts/check-soapy-release.py` before upload); the
-Release needs it, the image does not. See
-docs/DECISIONS/2026-10-14-man82-soapy-release-archive.md.
-=======
 MAN-248: each `[[rbn_uplink]]` target enforces
 `max_spots_per_minute` (default `600`, `0` disables) on spots written to
 the wire, via the existing `RateLimiter` owned above the reconnect loop;
@@ -337,7 +330,12 @@ with `0+0j` and counted in `Channelizer::process` (SPEC §1.3 step 0;
 report line and `manta_input_bad_samples_total{source}`; `manta check`
 still errors on non-finite input. See
 docs/DECISIONS/2026-10-15-man234-bad-input-samples.md.
->>>>>>> f1a9c55a522da040abf616a0aa9208a900424f9f
+
+MAN-82: releases add `manta-linux-x86_64-soapy.tar.gz` (`build-soapy`,
+`hpsdr,soapy`, Ubuntu 24.04 x86_64, libSoapySDR linked dynamically, own
+man pages, checked by `scripts/check-soapy-release.py` before upload); the
+Release needs it, the image does not. See
+docs/DECISIONS/2026-10-14-man82-soapy-release-archive.md.
 
 ## Documents (read in this order)
 
