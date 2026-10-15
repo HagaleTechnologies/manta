@@ -22,9 +22,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+// MAN-236: shared with soak_metrics.rs, including the peak-RSS helper below.
 /// Growth in peak RSS beyond this, after the warm-up window, fails the soak.
-const RSS_GROWTH_LIMIT_BYTES: u64 = 200 * 1024 * 1024; // 200 MiB
-const WARMUP: Duration = Duration::from_secs(10);
+pub(crate) const RSS_GROWTH_LIMIT_BYTES: u64 = 200 * 1024 * 1024; // 200 MiB
+pub(crate) const WARMUP: Duration = Duration::from_secs(10);
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
@@ -40,7 +41,7 @@ pub struct SoakReport {
 // Windows has no libc::rusage/getrusage (POSIX-only) -- see this crate's
 // Cargo.toml for why windows-sys is target-gated in as the equivalent.
 #[cfg(unix)]
-fn peak_rss_bytes() -> u64 {
+pub(crate) fn peak_rss_bytes() -> u64 {
     unsafe {
         let mut usage: libc::rusage = std::mem::zeroed();
         libc::getrusage(libc::RUSAGE_SELF, &mut usage);
@@ -54,7 +55,7 @@ fn peak_rss_bytes() -> u64 {
 }
 
 #[cfg(windows)]
-fn peak_rss_bytes() -> u64 {
+pub(crate) fn peak_rss_bytes() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{
         GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
