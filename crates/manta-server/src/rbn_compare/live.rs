@@ -229,10 +229,16 @@ async fn run_ticks(
 /// and the grade to the metrics.
 fn emit(grades: &[SpotGrade], bus: &SpotBus, metrics: &Metrics) {
     for grade in grades {
-        let line: Arc<str> = serde_json::to_string(grade)
-            .expect("SpotGrade always serializes")
-            .into();
-        bus.publish_grade(line);
+        let truncated = bus.publish_grade(|seq| {
+            let grade = SpotGrade {
+                seq: Some(seq),
+                ..grade.clone()
+            };
+            serde_json::to_string(&grade)
+                .expect("SpotGrade always serializes")
+                .into()
+        });
+        metrics.record_json_stream_history_truncated(truncated as u64);
         metrics.record_rbn_grade(grade);
     }
 }

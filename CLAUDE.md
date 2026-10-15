@@ -166,6 +166,15 @@ MAN-314: RTTY (two-tone FSK) is recognised after `[detector] rtty_dwell_ms`
 marks/clears and `/metrics` gains `manta_rtty_signals{band}`. See
 docs/DECISIONS/2026-10-11-man314-rtty-recognition.md.
 
+MAN-313: with `[detector] non_cw_filter` (default on) a promoted track
+leases a decoder and emits `TrackPromoted` only once it qualifies as keyed
+CW, so noise-like data and swept carriers start no CW track and SSB
+voice starts far fewer (`manta-dsp::comod`, SPEC §2.8; a residual of 7
+in-band tracks at +30 dB with the testkit voice, none spotted, is
+MAN-372); a track key-down for `unkeyed_close_ms`
+(10 s) with no callsign read closes `Unkeyed`; doctor gains `NOT_CW`. See
+docs/DECISIONS/2026-10-13-man313-non-cw-rejection.md.
+
 MAN-301: `[rbn_compare]` (off by default, needs `[server]`) reads RBN's
 CW telnet feed read-only (login callsign only) and grades each spot
 `match`/`disagree`/`elsewhere`/`none`/`unknown` after a 180 s window, as a
@@ -174,6 +183,20 @@ grade` and `score-against-rbn.py --node-log` replay offline through the
 same Rust engine. RBN's real login prompt and the live/offline agreement
 rate are unmeasured. See
 docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
+
+MAN-152: the in-repo `wiki/` is manta's canonical wiki. GitHub's Wiki tab
+is not used; disabling it remains an owner step. The wiki pages'
+`verified` stamps and `manifest.json` are refreshed and pinned by a
+`docs_consistency` test. See
+`docs/DECISIONS/2026-10-13-man152-one-wiki.md`.
+
+MAN-316: `[spot].refresh_lists` (default off) makes `run` from a live
+receiver download `cty.dat` every 7 days and `MASTER.SCP` daily over plain
+HTTP, swap a download that passes the acceptance checks into the
+validator, spot geography and JSON stream without a restart, and keep it
+under `[spot].list_cache_dir`; a failure keeps the list in use. File replay
+never downloads; `--cty-sha256`/`--scp-sha256` pin a version by hash. See
+docs/DECISIONS/2026-10-12-man316-reference-list-refresh.md.
 
 MAN-140: `--ka9q-group` (with `--ka9q-port`/`--ka9q-ssrc`/
 `--ka9q-interface`) or `[input] type = "ka9q"` reads one existing
@@ -206,9 +229,10 @@ MAN-156: CI denies rustdoc warnings (`RUSTDOCFLAGS=-D warnings cargo doc
 --no-deps --workspace --locked` in `test (ubuntu-latest)`; `manta-cli`'s
 clap help text is exempt). The "Supply Chain" check runs `cargo deny
 --locked check` against `deny.toml` (advisories, licenses, bans, sources;
-also daily on main). Trusted PRs get a non-required `test (windows-latest)`
-check-run. `release-publish.yml` refuses a tag whose CI push run failed any
-test leg. The `PR title` check requires a Conventional Commits title. See
+also daily on main). Trusted PRs get a `test (windows-latest)` check-run
+(required once MAN-371's owner step O1 is applied). `release-publish.yml`
+refuses a tag whose CI push run failed any test leg. The `PR title` check
+requires a Conventional Commits title. See
 docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md.
 
 MAN-315: the legacy decoder learns per-track dot/dash/gap timing
@@ -220,6 +244,7 @@ pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
 planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
+<<<<<<< HEAD
 MAN-191: the HSMM decoder samples its long-`Silence` hypotheses at SPEC
 v2 §4.6's cadence instead of every anchor step (`silence_sampled`:
 normal reach, first `10u` crossing, then one sample per `round(u)` hops,
@@ -231,6 +256,102 @@ timestamps/confidences and gap-artifact glyphs (V8/VR8 text and
 V8/V8w spot lists unchanged). `hsmm_300_tracks` gains a
 `300_tracks_10s_gappy` scene covering the long-silence path. See
 docs/DECISIONS/2026-10-14-man191-silence-cadence.md.
+=======
+MAN-137: the JSON spot stream opens with `hello` and numbers spots and
+`spotGrade` records with one per-session `seq`. WebSocket
+`?session=&since=` resumes from the bounded shared history using
+`[server].history_minutes`; raw TCP receives live records only. Follows
+dispensa `contracts/spots/stream.v1.md` (ADR-0015, Q-0070); the live-state
+stream is unchanged. See
+`docs/DECISIONS/2026-10-14-man137-json-stream-resume.md`.
+
+MAN-248: each `[[rbn_uplink]]` target enforces
+`max_spots_per_minute` (default `600`, `0` disables) on spots written to
+the wire, via the existing `RateLimiter` owned above the reconnect loop;
+over-budget spots are counted in
+`manta_uplink_ceiling_suppressed_total` /
+`manta_uplink_target_ceiling_suppressed_total{target}` and skipped with
+the connection left up (dry-run spots consume no budget; restart-only).
+The owner's measured-peak-rate gate on the default stays open — see
+docs/DECISIONS/2026-10-14-man248-uplink-forwarding-ceiling.md.
+
+MAN-174: within a `process_hops` batch a merge loser's `TrackClosed`
+precedes its survivor's, and a merge survivor that never emitted still
+gets its own `TrackClosed`, so a deferred Beacon migrated along a merge
+chain resolves at the final survivor's close. `SuppressionCounts` adds
+`pending_beacon_rejected_wpm` and `pending_beacon_stale`; pending beacons
+are kept in `sample_ts` order, so the cap evicts the true oldest, and an
+equal-timestamp one goes through dedupe. SPEC §5/§6 and V22/V25 match. See
+docs/DECISIONS/2026-10-14-man174-deferred-beacon-merge-bookkeeping.md.
+
+MAN-192: the HSMM decoder reseeds after a committed Silence segment, not
+only on a present re-onset (SPEC v2 §4.7's second trigger), carrying the
+closing segment in `HistEntry::closing_segment` and a scored-prefix
+count (`scored_live_len`) that replaces the zero-score seed heuristic in
+`best_u`/`finish`. No cooldown: every distinct committed Silence
+reseeds; snapshots stay within `beam + seed set`. The `hsmm` engine
+stays non-default with its stage-2 gate still failing. See
+docs/DECISIONS/2026-10-14-man192-silence-reseed.md.
+
+MAN-95: `[spot].validation_level` defaults to `normal`: common, listed and
+unlisted callsign patterns need 2, 3 and 5 distinct-message repetitions.
+`minimal` keeps flat 2. The independent list derived from MASTER.SCP is
+replaced by `--patterns` / `[spot].pattern_path`; allowlist and beacon
+exemptions stay. Live decisions report `requiredReps` and `patternTier`.
+See docs/DECISIONS/2026-10-14-man95-pattern-rarity-repetition-tiers.md.
+
+MAN-196: a decimated capture advertises and enforces the decimator's
+trusted band (`manta-dsp::decimate::TRUSTED_HALF_BAND_FRACTION = 0.4526`
+of fs_out, the <= 1 dB crossover): `DecimatingSource::rf_passband_hz`
+narrows `manta check`/SETT/bandState/crash live set to it, `run`/`soak`
+print one startup line, and the track manager's spawn scan vetoes
+channels beyond it (spawns only — MAN-314's lesson), via
+`IqSource::trusted_band_hz` threaded through `listen` and
+`soak_with_metrics` (every wrapper
+forwards it, doctor's `SampleBoundedSource` included). Rim channels
+232-255 per side at 48 kS/s are conceded by design; non-decimated sources
+are bit-identical to before. Aliases folding *inside* the trusted band
+(input frequencies >= fs_out - trusted) are stopband-only: held at
+>= 80 dB (measured >= ~-86.5 dB), so a carrier at <= -40 dBFS above
+Nyquist promotes nothing, but a stronger one can still mirror in digital
+silence — a pinned residual; deepening the stopband is a decision ticket.
+See docs/DECISIONS/2026-10-14-man196-decimator-trusted-band.md.
+MAN-210: golden vector V51 (V9's drift scene, `refine_bw_hz = 30` via
+`--config`) exercises the narrowband refiner's refine-enabled path
+end-to-end through `manta decode --json` — the evidence any future
+default-on change must keep green.
+
+MAN-189: the HSMM decoder no longer re-emits a committed character under
+a different closing anchor. `commit::Frontier` (each entry's character
+start against the latest emitted timestamp) replaces `sealed`. V7/hsmm
+and V8/hsmm now pass, and V5/VR5/VR6a/VR8 CER improve. See
+docs/DECISIONS/2026-10-13-man189-hsmm-commit-frontier.md.
+
+MAN-371: `ci-full.yml` creates all three `test (...)` check-runs on a
+trusted PR's head fail-closed, and tests that need several free ports
+hold every listener until all are read (`free_ports::<N>()`). Adding
+`test (windows-latest)` to `main-protection` is owner step O1, followed
+by a 20-run merge-queue watch with rollback triggers;
+`test-hpsdr (windows-latest)` stays advisory. See
+docs/DECISIONS/2026-10-15-man371-windows-required-check.md.
+
+MAN-235: `manta doctor` keeps its 10 s default; a `WEAK_NO_DECODE` run
+asked for under 60 s adds a stdout `hint:` line to rerun with
+`--duration 60` (`manta gen v1` first spots at 20-21 s). `--strict` exits 0
+for `DECODING`, 3 for every other verdict and 1 for a failed check; without
+it every verdict still exits 0. See
+docs/DECISIONS/2026-10-15-man235-doctor-rerun-hint-and-strict-exit.md.
+
+MAN-234: an input sample with a NaN, infinite or larger-than-1e17
+component (`manta-dsp::sample_guard::MAX_SAMPLE_MAGNITUDE`) is replaced
+with `0+0j` and counted in `Channelizer::process` (SPEC §1.3 step 0;
+`calibrate` guards its own buffer), so it no longer panics or deafens
+`decode`/`run`/`doctor`. Reported as `bad_samples` in `decode`/`doctor`/
+`calibrate --json` (omitted when 0), stderr warnings, a `doctor`/`soak`
+report line and `manta_input_bad_samples_total{source}`; `manta check`
+still errors on non-finite input. See
+docs/DECISIONS/2026-10-15-man234-bad-input-samples.md.
+>>>>>>> e2c9681eba9619ab59cff2f283034edaf5192cc1
 
 ## Documents (read in this order)
 

@@ -50,6 +50,15 @@ sliding-window maximum (monotonic deque, O(1) amortized). Because the
 window is centered, the evidence stream is produced with a fixed delay of
 `h` hops behind the input; all timestamps refer to the input hop.
 
+Implementation note (MAN-193): the O(1) amortized bound holds while both
+window bounds move forward, which includes a fixed `h` and any `h` change
+of one hop between consecutive centers. A `u_ref` change that moves a
+bound backwards (growing or shrinking `h` by more than one hop between
+consecutive centers) rebuilds the deque from the retained samples of the
+new window, at O(2h + 1) for that hop. The §1.7 lookahead reads the next
+center's `M` from the same deque without advancing it. See
+`docs/DECISIONS/2026-10-14-man193-centered-maximum-deque.md`.
+
 Rationale (design §1.3, §5.1): a *symmetric* window tracks QSB in both
 directions with no rise/decay asymmetry to tune, and a maximum (not a
 mean) cannot be dragged by a long dah or a run of dits.
@@ -200,6 +209,13 @@ then reports the FIR output. No hop is dropped and none is fed as
 `llr = 0`. Historical note: when this section was written the call site was
 deferred to MAN-168, and the text asked MAN-168 to re-derive the 16 ms
 rise-time budget against the real implementation before wiring it.
+End-to-end coverage: golden vector V51 (SPEC §7, MAN-210) decodes V9's
+drift scene with `refine_bw_hz = 30` through `manta decode --json
+--config`, asserting decode quality and that the config reaches the
+pipeline; the drain protocols themselves (a dropped backlog at a channel
+reset or at EOF stays inside V51's CER bar) are asserted on the same real
+scene by `real_drift_scene_drains_refiner_backlog_at_resets_and_eof`
+(`crates/manta-engine/src/track.rs`, MAN-210).
 
 ---
 
@@ -244,9 +260,14 @@ explained as `E`).
 
 ```
 Token { node: NodeId, phase: AfterMark | AfterSpace, u: f32,
-        score: f32, hist: RingBuf<Entry, 8>, anchor: u64 }
-Entry = Glyph(Glyph) | Word
+        score: f32, hist: RingBuf<Entry, 8>, anchor: u64,
+        char_start: u64 }
+Entry = (Glyph(Glyph) | Word, sample_ts, char_start)
 ```
+
+`char_start` is the input sample counter at the anchor where the
+character's first mark began (MAN-189); a `Word` entry carries the
+character it follows.
 
 `u` is updated after every `Dit`/`Dah`/`EGap`/`CGap` of observed `d`:
 `u ← u + α_u · (d/k − u)`, `α_u` = `speed_alpha`, default 0.2, then
@@ -303,6 +324,20 @@ After pruning at anchor `t`:
 - **Forced**: if the best token's oldest `hist` entry was appended more
   than `lookahead_dits · u_best` hops ago (default 25), emit it, remove
   it from tokens that agree, and drop tokens that disagree.
+- **Committed time is final** (MAN-189): each token entry records the
+  start of its character's first mark. An entry is removed without
+  emission when its character began at or before the latest emitted
+  entry's `sample_ts`, or, for a `Word` entry, when a `Word` was already
+  emitted at or after its character's start, or its gap began before the
+  latest emitted entry. A `Word` entry is also removed together with its
+  own character when that character was removed as contradicting the
+  emitted glyph (a different glyph over already-decided time, beginning
+  at another start than the emitted character's own); a `Word` whose
+  character agreed with the emitted glyph is never removed that way,
+  whatever anchor its first mark sat at. This is checked before the
+  consensus and forced rules and again after every emission, and by
+  `finish()` (§4.10). Emitted `sample_ts` therefore never decreases
+  within a track.
 - A `Glyph` entry emits `CharDecoded { sample_ts = start of the closing
   space segment, glyph, confidence, alternatives }`; a `Word` entry emits
   `WordBoundary { sample_ts = start of the word gap, confidence }` (v1
@@ -327,7 +362,8 @@ the best token whose entry `j` is not `Word`.
 `finish()` performs a forced commit of the best token's whole `hist`
 and, if its phase is `AfterMark` at a glyph-bearing node, emits that
 glyph with confidence `σ(0)·q` (the last character is not closed by a
-gap).
+gap). Entries §4.8's "committed time is final" rule calls decided,
+including that unclosed glyph, are not emitted.
 
 ---
 

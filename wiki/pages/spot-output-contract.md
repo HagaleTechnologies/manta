@@ -13,16 +13,18 @@ sources:
   - docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md
   - docs/RUNBOOKS/rbn-comparison.md
   - docs/SPOT-SCHEMA.md
+  - docs/DECISIONS/2026-10-14-man137-json-stream-resume.md
 verified:
-  commit: 01d1ea1
-  date: 2026-09-07
+  commit: 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
+  date: 2026-10-14
 links:
   - spot-validation
 ---
-manta produces spots on two surfaces: a **telnet DX cluster server** (default :7300) emitting standard RBN-format `DX de` lines — the drop-in compatibility surface existing aggregators consume with zero changes — and a **JSON Lines stream** (TCP + WebSocket, default :7301) carrying full-fidelity spot objects for modern consumers like cqdx. This repo *produces* both; it consumes no external spot contract. Both are thin fan-out consumers of one broadcast channel — slow clients are dropped, never back-pressured, and at shutdown each client's queued backlog is drained best-effort under its own bounded deadline (ARCHITECTURE §7/§8). The formats and ports are described in ARCHITECTURE §7.
+manta produces spots on two surfaces: a **telnet DX cluster server** (default :7300) emitting standard RBN-format `DX de` lines — the drop-in compatibility surface existing aggregators consume with zero changes — and a **JSON Lines stream** (TCP + WebSocket, default :7301) carrying full-fidelity spot objects for modern consumers like cqdx. This repo *produces* both. Both are thin fan-out consumers of the spot bus (telnet on `SpotBus::subscribe()`, JSON on `subscribe_json()`, which also carries MAN-301 grade records) — slow clients are dropped, never back-pressured, and at shutdown each client's queued backlog is drained best-effort under its own bounded deadline (ARCHITECTURE §7/§8). The formats and ports are described in ARCHITECTURE §7. manta also reads RBN's spots, to grade its own (MAN-301, below): with `[rbn_compare]` enabled, a `[server]` daemon parses RBN's public CW telnet feed (AK1A `DX de` lines, `crates/manta-server/src/rbn_compare/ak1a.rs`), and `manta grade` reads RBN's daily CSV offline.
 
 ## Pointers
 
+- `:7301` opens with a `hello` and numbers records with `seq`; WebSocket clients resume with `?session=&since=`. Normative: [SPOT-SCHEMA Transport](../../docs/SPOT-SCHEMA.md#transport) and the [MAN-137 decision record](../../docs/DECISIONS/2026-10-14-man137-json-stream-resume.md).
 - RBN telnet format and the command grammar manta supports (`sh/dx`, filters, `SKIMMER/SETT`, `BYE`, `sh/version`): ARCHITECTURE §7. Ports and station-callsign spotter ID are TOML config keys (ARCHITECTURE §8).
 - **Aggregator compatibility is a gate, not a nicety** (MAN-86): RBN's Aggregator will not forward spots from a source that never answers `SKIMMER/SETT`, so the greeting banner, the `SETT` reply and the `BYE` close are an RBN *admission requirement* on this surface, not a convenience — that is the one thing worth knowing before you touch it. Every wire detail (what the banner lines contain, the `SETT` reply grammar, the close text) is normative in `docs/DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md`, together with the four primary sources it was reconstructed from, and summarized in ARCHITECTURE §7 — read it there; this page deliberately does not restate it. The operator identity the banner reports comes from the `[server]` `operator_name`/`operator_qth`/`operator_grid` keys in the canonical config-key table (docs/SPEC-decode-core.md §9).
 - Gotcha (MAN-92): in `sh/dx`, `20m` means the last twenty **minutes**, not the 20 m band. This follows Aggregator manual §10.5, and `sh/dx 20` is a count. Band selection is manta's own `BAND` keyword (`sh/dx BAND 20m`). Unknown or malformed commands now get `Unknown command` instead of silence. The grammar and selection order are normative in `docs/DECISIONS/2026-10-10-man92-telnet-commands.md`. Retention now follows [MAN-93](../../docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md). Bare `sh/dx` is 10 rows; loggers should send `sh/dx 30m`.
@@ -32,7 +34,7 @@ manta produces spots on two surfaces: a **telnet DX cluster server** (default :7
 - JSON spot schema: **the schema is an ecosystem contract that lives in the `dispensa` repo** (`contracts/spots/spots.v1.schema.json`, ADR-0011 — noted in CLAUDE.md and ARCHITECTURE §7), not solely in this repo. dispensa is private, so the in-repo field reference is `docs/SPOT-SCHEMA.md` (MAN-149), pinned to `SpotMessage` by a unit test; it names the one divergence from the contract (`snrRefHz`). Do not restate fields here.
 - **Unresolvable geography for an allowlisted call**: MAN-28's Watch List allowlist can make the validator emit a spot for a callsign `cty.lookup` can't resolve. `dxContinent`/`dxCqZone` emit out-of-domain sentinels rather than the contract-forbidden `null` (those two fields are required/non-nullable on the wire); `dxLat`/`dxLon` are already nullable and are the contract-legal "unknown" signal. See `docs/DECISIONS/2026-09-04-man45-unresolved-geography-sentinels.md` for the full rationale and the cross-repo question proposed to dispensa.
 - `decoderVersion` is build identity, not decoder output: `manta-<crate version>+<commit>` (MAN-83), the commit as SemVer build metadata. A consumer comparing decoder behaviour across releases compares the part before `+`; the whole string names the exact binary. When decoder output may change between versions is normative in `docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md` (summarised in `CHANGELOG.md`).
-- cqdx is the intended first-class JSON ingest consumer (README "Relationship to sibling projects"); the boundary is referenced across repos, not linked from this wiki.
+- cqdx is the intended first-class JSON ingest consumer (README "Related projects"); the boundary is referenced across repos, not linked from this wiki.
 
 ## Status caveat
 
@@ -48,7 +50,7 @@ manta can also act as a telnet *client*, logging into an RBN spot-collection end
 
 ## Spot grades: a second record kind on the JSON stream (MAN-301)
 
-With `[rbn_compare]` enabled, :7301 also carries a `spotGrade` record per spot, after the spot's comparison window closes, grading it against RBN's live CW feed (`match`/`disagree`/`elsewhere`/`none`/`unknown`). Telnet and the uplink never see grades; without the table the stream is byte-identical to before. The gotcha for any consumer or script reading :7301: **split the stream on the `kind` key** (spot lines have none). Grades deliberately carry no `dxCall`/`frequency`/`timestamp`, so old `field-node.py`/`shadow-compare.py` copies reject rather than double-count them. The record shape, field rules and the proposed dispensa `spotGrade` schema fragment are normative in `docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md`; the operator view is `docs/RUNBOOKS/rbn-comparison.md`. The feed client is a new outbound connection and is read-only toward RBN: it writes only its login callsign.
+With `[rbn_compare]` enabled, :7301 also carries a `spotGrade` record per spot, after the spot's comparison window closes, grading it against RBN's live CW feed (`match`/`disagree`/`elsewhere`/`none`/`unknown`). Telnet and the uplink never see grades; without the table the stream carries only the hello and spots. The gotcha for any consumer or script reading :7301: **split the stream on the `kind` key** (spot lines have none). Grades deliberately carry no `dxCall`/`frequency`/`timestamp`, so old `field-node.py`/`shadow-compare.py` copies reject rather than double-count them. The record shape, field rules and the proposed dispensa `spotGrade` schema fragment are normative in `docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md`; the operator view is `docs/RUNBOOKS/rbn-comparison.md`. The feed client is a new outbound connection and is read-only toward RBN: it writes only its login callsign.
 
 ## Audio-sourced spot frequencies (MAN-34)
 

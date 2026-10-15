@@ -343,9 +343,17 @@ transmission may never produce again).
    `master.scp` (contest super-check-partial list) *raises* confidence; absence
    only lowers it (new/rare calls must still spot, not just well-known ones).
    `--scp` / `[spot] scp_path` supplies a replacement known-callsign list.
-4. **Repetition requirement**: a callsign must decode ≥ 2 times within 90 s
-   before first spot (CW ops repeat their calls; single decodes are
-   overwhelmingly garble). **Deviates from "the same track" (MAN-166,
+4. **Repetition requirement** (MAN-95): within 90 s a call needs 2 distinct
+   messages for a common pattern, 3 for a listed pattern and 5 for an
+   unlisted pattern. `[spot].validation_level = "minimal"` restores flat 2;
+   the default is `"normal"`. Patterns keep the first 3 characters literal
+   (2 for letter-digit-letter, 4 for digit-letter-letter), then replace
+   later letters with `@` and digits with `#`. Portable suffixes are ignored.
+   The independent `data/patterns.lst` is derived from vendored MASTER.SCP:
+   `+` means at least two calls share that pattern; a plain entry means one.
+   `--patterns` / `[spot].pattern_path` replaces it. Changing `--scp` alone
+   does not change the pattern table. CW operators repeat their calls;
+   single decodes are overwhelmingly garble. **Deviates from "the same track" (MAN-166,
    `docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`)**: a
    real signal's `track_id` changes across a close+reopen, so repetition is
    tracked per frequency instead, with a minimum-gap check across
@@ -497,6 +505,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   naming the exact binary, and the part before `+` is the release the
   decoder-output rule in `CHANGELOG.md` governs. See
   `docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md`.
+  Every connection opens with a `hello`, and spots and grades share a per-session
+  `seq`; WebSocket clients resume with `?session=&since=` from their shared bounded
+  history. See [SPOT-SCHEMA Transport](docs/SPOT-SCHEMA.md#transport) and
+  [MAN-137](docs/DECISIONS/2026-10-14-man137-json-stream-resume.md).
 - **Spot grades on the JSON stream (MAN-301)**: with `[rbn_compare]` enabled,
   the :7301 stream (raw TCP and WebSocket) also carries one `spotGrade`
   record per spot, published after the spot's comparison window closes

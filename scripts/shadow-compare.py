@@ -211,7 +211,8 @@ def load_node_spots(paths):
     malformed. Any other malformed record would silently leave the
     uncorroborated share D-I reads, so it is an input error. A MAN-301
     `spotGrade` record (`kind` is "spotGrade") is not a spot: it is skipped
-    and counted, never compared."""
+    and counted, never compared. Other records with a `kind` key, including
+    hello, are skipped without counting them as grades."""
     spots, infos, malformed, grade_records = [], [], 0, 0
     for path in expand_paths(paths, (".jsonl",), dir_prefix="spots-"):
         rows = 0
@@ -230,8 +231,9 @@ def load_node_spots(paths):
                 rows += 1
                 try:
                     d = json.loads(line)
-                    if isinstance(d, dict) and d.get("kind") == "spotGrade":
-                        grade_records += 1
+                    if isinstance(d, dict) and "kind" in d:
+                        if d["kind"] == "spotGrade":
+                            grade_records += 1
                         continue
                     ts = float(d["timestamp"])
                     freq = float(d["frequency"])

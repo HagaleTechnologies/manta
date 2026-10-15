@@ -80,6 +80,12 @@ impl IqSource for PacedSource {
         self.inner.rf_passband_hz()
     }
 
+    /// MAN-196: forwarded with `rf_passband_hz` -- pacing changes when
+    /// samples arrive, not which band the wrapped source delivers.
+    fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+        self.inner.trusted_band_hz()
+    }
+
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
         // The clock starts before the inner read: the time the inner source
         // spends producing this buffer is part of the recording's interval.
@@ -153,6 +159,13 @@ impl IqSource for LoopingSource {
 
     fn rf_passband_hz(&self) -> (f64, f64) {
         self.inner.rf_passband_hz()
+    }
+
+    /// MAN-196: forwarded with `rf_passband_hz` -- every loop pass
+    /// reopens through the same spec, so the decimator (and its trusted
+    /// band) is the same on every pass.
+    fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+        self.inner.trusted_band_hz()
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {

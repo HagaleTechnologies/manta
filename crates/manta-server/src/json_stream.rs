@@ -7,18 +7,133 @@
 //! server push), so a peek timeout with no bytes is itself the "not a
 //! WebSocket handshake" signal, not an error.
 
-use crate::bus::{JsonItem, SpotBus};
-use crate::metrics::Metrics;
+use crate::bus::{JsonItem, ResumeOutcome, SpotBus};
+use crate::metrics::{Metrics, ResumeMetricOutcome};
 use crate::rate_limit::IpRateLimiter;
 use crate::spot_message::SpotMessage;
 use crate::tasks::{ClientTasks, ConnectionLimiter, IpQuota};
-use manta_spot::cty::Table;
+use manta_spot::reference::ReferenceLists;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, watch};
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::http::StatusCode;
+
+/// The opening record on every spot-stream connection.
+pub const HELLO_KIND: &str = "hello";
+/// dispensa's `contracts/spots/stream.v1.md` framing contract.
+pub const STREAM_SCHEMA: &str = "stream.v1";
+
+/// Connection snapshot, sent before any replay or live record.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Hello {
+    pub kind: &'static str,
+    pub schema: &'static str,
+    pub session: String,
+    pub seq: u64,
+    pub history_from: u64,
+    pub resumed: bool,
+}
+impl Hello {
+    pub fn new(session: String, seq: u64, history_from: u64, resumed: bool) -> Self {
+        Self {
+            kind: HELLO_KIND,
+            schema: STREAM_SCHEMA,
+            session,
+            seq,
+            history_from,
+            resumed,
+        }
+    }
+}
+
+/// Same budget as telnet commands: a full resume can render 10,000 records.
+pub const MAX_RESUMES_PER_IP: u32 = 30;
+/// Resume budget window, matching telnet's command budget.
+pub const RESUME_RATE_WINDOW: Duration = Duration::from_secs(10);
+
+#[derive(Debug, PartialEq)]
+struct ResumeRequest {
+    session: Option<String>,
+    since: u64,
+}
+
+fn parse_resume_query(query: Option<&str>) -> Result<Option<ResumeRequest>, &'static str> {
+    let mut session = None;
+    let mut since = None;
+    for part in query.unwrap_or("").split('&') {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        match key {
+            "since" => {
+                if since.is_some() || value.is_empty() || !value.bytes().all(|c| c.is_ascii_digit())
+                {
+                    return Err("since must be a whole number");
+                }
+                since = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| "since must be a whole number")?,
+                );
+            }
+            "session" => {
+                if session.is_some() {
+                    return Err("session given more than once");
+                }
+                session = Some(value.to_string());
+            }
+            _ => {}
+        }
+    }
+    Ok(since.map(|since| ResumeRequest { session, since }))
+}
+
+// Implement the dependency's callback trait directly: its required ErrorResponse
+// is larger than Clippy permits for a free-standing closure's Result.
+struct ResumeHandshake<'a> {
+    stream: StreamKind,
+    metrics: &'a Metrics,
+    resume_limiter: &'a IpRateLimiter,
+    peer_ip: IpAddr,
+    request: &'a mut Option<ResumeRequest>,
+}
+
+impl tokio_tungstenite::tungstenite::handshake::server::Callback for ResumeHandshake<'_> {
+    fn on_request(self, req: &Request, response: Response) -> Result<Response, ErrorResponse> {
+        if self.stream == StreamKind::Live {
+            return Ok(response);
+        }
+        let error = match parse_resume_query(req.uri().query()) {
+            Err(msg) => {
+                self.metrics
+                    .record_json_stream_resume(ResumeMetricOutcome::Invalid);
+                Some((StatusCode::BAD_REQUEST, msg))
+            }
+            Ok(Some(_)) if !self.resume_limiter.allow(self.peer_ip) => {
+                self.metrics
+                    .record_json_stream_resume(ResumeMetricOutcome::Refused);
+                Some((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many resume requests from this address; retry later",
+                ))
+            }
+            Ok(parsed) => {
+                *self.request = parsed;
+                None
+            }
+        };
+        match error {
+            Some((status, message)) => Err(Response::builder()
+                .status(status)
+                .body(Some(message.to_string()))
+                .expect("valid HTTP error")),
+            None => Ok(response),
+        }
+    }
+}
 
 /// How long a slow client is given to accept one write before it's treated
 /// as stalled and disconnected -- otherwise a write blocked forever would
@@ -127,13 +242,15 @@ impl From<anyhow::Error> for WsClientError {
 struct ClientCtx {
     bus: Arc<SpotBus>,
     metrics: Arc<Metrics>,
-    cty: Arc<Table>,
+    lists: Arc<ReferenceLists>,
     station_call: String,
     station_location: Option<crate::config::StationLocation>,
     decoder_version: String,
     shutdown: watch::Receiver<bool>,
     drain_deadline: Duration,
     stream: StreamKind,
+    start_seq: Option<u64>,
+    resume_limiter: IpRateLimiter,
 }
 
 impl ClientCtx {
@@ -195,19 +312,36 @@ impl ClientCtx {
     /// record, already serialised, passed through verbatim. Both shapes,
     /// and the `kind` key that tells them apart, are in `docs/SPOT-SCHEMA.md`.
     fn render(&self, item: &JsonItem) -> String {
-        let bus_spot = match item {
-            JsonItem::Spot(bus_spot) => bus_spot,
-            JsonItem::Grade(line) | JsonItem::Live(line) => return line.to_string(),
+        let (seq, bus_spot, rendered) = match item {
+            JsonItem::Spot {
+                seq,
+                spot,
+                rendered,
+            } => (seq, spot, rendered),
+            JsonItem::Grade { line, .. } | JsonItem::Live(line) => return line.to_string(),
         };
+        // MAN-137: replay must repeat a record's contents, so the first
+        // rendering is kept with the item and every later delivery (live or
+        // resumed) reuses it.
+        rendered
+            .get_or_init(|| self.render_spot(*seq, bus_spot).into())
+            .to_string()
+    }
+
+    fn render_spot(&self, seq: u64, bus_spot: &crate::bus::BusSpot) -> String {
         let unix_ts = self.bus.unix_ts_for(bus_spot.spot.sample_ts);
+        // MAN-316: one snapshot per spot, so a refresh that swaps the table
+        // mid-render can never mix two tables' geography in one message.
+        let cty = self.lists.cty.load();
         let msg = SpotMessage::from_spot(
             &bus_spot.spot,
             &self.station_call,
             self.station_location.as_ref(),
-            &self.cty,
+            &cty,
             &self.decoder_version,
             unix_ts,
             self.bus.session_nonce(),
+            seq,
         );
         serde_json::to_string(&msg).expect("SpotMessage always serializes")
     }
@@ -221,7 +355,10 @@ impl ClientCtx {
 pub struct JsonStreamConfig {
     pub bus: Arc<SpotBus>,
     pub metrics: Arc<Metrics>,
-    pub cty: Arc<Table>,
+    /// MAN-316: the run's reference lists; each client renders every spot
+    /// against the `cty.dat` in use at that moment, so a scheduled refresh
+    /// reaches connected clients without a reconnect.
+    pub lists: Arc<ReferenceLists>,
     pub station_call: String,
     /// This station's `deGrid`/`deLat`/`deLon` (MAN-138), resolved once at
     /// start-up by `ServerConfig::station_location`; `None` sends null
@@ -278,14 +415,17 @@ pub async fn serve(
     let ctx = ClientCtx {
         bus: config.bus,
         metrics: config.metrics,
-        cty: config.cty,
+        lists: config.lists,
         station_call: config.station_call,
         station_location: config.station_location,
         decoder_version: config.decoder_version,
         shutdown: config.shutdown,
         drain_deadline: config.drain_deadline,
         stream: config.stream,
+        start_seq: None,
+        resume_limiter: IpRateLimiter::new(MAX_RESUMES_PER_IP, RESUME_RATE_WINDOW),
     };
+    crate::rate_limit::spawn_stale_entry_reaper(ctx.resume_limiter.clone());
     let quota_reject_log_limiter =
         IpRateLimiter::new(QUOTA_REJECT_LOG_MAX_PER_WINDOW, QUOTA_REJECT_LOG_WINDOW);
     crate::rate_limit::spawn_stale_entry_reaper(quota_reject_log_limiter.clone());
@@ -331,11 +471,15 @@ pub async fn serve(
         // broadcast channel's no-history-for-late-subscribers semantics on
         // a busy runtime or a high-rate stream (round-7 review finding;
         // same fix applied to the telnet accept path below).
-        let rx = match ctx.stream {
-            StreamKind::Spots => ctx.bus.subscribe_json(),
-            StreamKind::Live => ctx.bus.subscribe_live(),
+        let (rx, start_seq) = match ctx.stream {
+            StreamKind::Spots => {
+                let (rx, seq) = ctx.bus.subscribe_json_with_seq();
+                (rx, Some(seq))
+            }
+            StreamKind::Live => (ctx.bus.subscribe_live(), None),
         };
-        let ctx = ctx.clone();
+        let mut ctx = ctx.clone();
+        ctx.start_seq = start_seq;
         let peer_ip = peer.ip();
         let ip_ping_limiter = ip_ping_limiter.clone();
         let rejection_log_limiter = rejection_log_limiter.clone();
@@ -507,6 +651,22 @@ async fn handle_tcp_client(
 ) -> std::io::Result<()> {
     if log_enabled {
         tracing::info!("json_stream: raw TCP client connected");
+    }
+    if let Some(seq) = ctx.start_seq {
+        let resume = ctx.bus.json_resume(None, None, seq);
+        let hello = Hello::new(ctx.bus.session_id(), seq, resume.history_from, false);
+        let line = serde_json::to_string(&hello).expect("Hello always serializes") + "\n";
+        let written = tokio::select! {
+            result = tokio::time::timeout(WRITE_TIMEOUT, socket.write_all(line.as_bytes())) => matches!(result, Ok(Ok(()))),
+            _ = ctx.shutdown.changed() => {
+                ctx.record_dropped_shutdown(crate::metrics::abandoned_spot_count(false, rx.len()));
+                return Ok(());
+            }
+        };
+        if !written {
+            ctx.record_write_failed(crate::metrics::abandoned_spot_count(false, rx.len()));
+            return Ok(());
+        }
     }
     // This protocol is pure server push -- the client never needs to send
     // anything -- so this scratch buffer only exists to notice EOF/close;
@@ -745,10 +905,18 @@ async fn handle_ws_client(
     // nothing left for the loop to double-observe; one that DOESN'T fire
     // here leaves the receiver exactly as unseen as before, so the loop's
     // branch still fires normally afterward.
+    let mut request = None;
+    let callback = ResumeHandshake {
+        stream: ctx.stream,
+        metrics: &ctx.metrics,
+        resume_limiter: &ctx.resume_limiter,
+        peer_ip,
+        request: &mut request,
+    };
     let ws_result = tokio::select! {
         result = tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
-            tokio_tungstenite::accept_async_with_config(socket, Some(ws_config)),
+            tokio_tungstenite::accept_hdr_async_with_config(socket, callback, Some(ws_config)),
         ) => result,
         _ = ctx.shutdown.changed() => {
             if log_enabled {
@@ -777,6 +945,68 @@ async fn handle_ws_client(
     };
     if log_enabled {
         tracing::info!("json_stream: WS client connected");
+    }
+    if let Some(seq) = ctx.start_seq {
+        let since = request.as_ref().map(|r| r.since);
+        let resume = ctx.bus.json_resume(
+            request.as_ref().and_then(|r| r.session.as_deref()),
+            since,
+            seq,
+        );
+        let metric = match resume.outcome {
+            ResumeOutcome::NoRequest => None,
+            ResumeOutcome::Resumed => Some(ResumeMetricOutcome::Resumed),
+            ResumeOutcome::Gap => Some(ResumeMetricOutcome::Gap),
+            ResumeOutcome::Reset => Some(ResumeMetricOutcome::Reset),
+        };
+        if let Some(outcome) = metric {
+            ctx.metrics.record_json_stream_resume(outcome);
+            if log_enabled {
+                tracing::info!(
+                    outcome = outcome.label(),
+                    since,
+                    replayed = resume.records.len(),
+                    "json_stream: resume"
+                );
+            }
+        }
+        let hello = Hello::new(
+            ctx.bus.session_id(),
+            seq,
+            resume.history_from,
+            resume.outcome == ResumeOutcome::Resumed,
+        );
+        let text = serde_json::to_string(&hello).expect("Hello always serializes");
+        let written = tokio::select! {
+            result = tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Text(text.into()))) => matches!(result, Ok(Ok(()))),
+            _ = ctx.shutdown.changed() => {
+                ctx.metrics.record_json_stream_replay_abandoned(resume.records.len() as u64);
+                ctx.record_dropped_shutdown(crate::metrics::abandoned_spot_count(false, rx.len()));
+                return Ok(());
+            }
+        };
+        if !written {
+            ctx.metrics
+                .record_json_stream_replay_abandoned(resume.records.len() as u64);
+            ctx.record_write_failed(crate::metrics::abandoned_spot_count(false, rx.len()));
+            return Ok(());
+        }
+        for (index, item) in resume.records.iter().enumerate() {
+            let remaining = (resume.records.len() - index) as u64;
+            if ctx.shutdown.has_changed().unwrap_or(true) {
+                ctx.metrics.record_json_stream_replay_abandoned(remaining);
+                break; // Leave the watch change unseen so the live backlog drains below.
+            }
+            let text = ctx.render(item);
+            if !matches!(
+                tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Text(text.into()))).await,
+                Ok(Ok(()))
+            ) {
+                ctx.metrics.record_json_stream_replay_abandoned(remaining);
+                ctx.record_write_failed(crate::metrics::abandoned_spot_count(false, rx.len()));
+                return Ok(());
+            }
+        }
     }
     let mut ping_limiter = crate::rate_limit::RateLimiter::new(MAX_INBOUND_PINGS, PING_RATE_WINDOW);
     loop {
@@ -1026,6 +1256,78 @@ mod tests {
         Error as WsError,
     };
 
+    #[test]
+    fn parse_resume_query_table() {
+        for q in [None, Some(""), Some("foo=1"), Some("session=12")] {
+            assert_eq!(parse_resume_query(q), Ok(None));
+        }
+        for (q, session, since) in [
+            ("since=0", None, 0),
+            ("session=12&since=007", Some("12"), 7),
+            ("since=12&session=9&x=y", Some("9"), 12),
+        ] {
+            assert_eq!(
+                parse_resume_query(Some(q)),
+                Ok(Some(ResumeRequest {
+                    session: session.map(String::from),
+                    since
+                }))
+            );
+        }
+        for q in [
+            "since=abc",
+            "since=",
+            "since",
+            "since=-1",
+            "since=+1",
+            "since=18446744073709551616",
+            "since=1&since=2",
+        ] {
+            assert_eq!(
+                parse_resume_query(Some(q)),
+                Err("since must be a whole number")
+            );
+        }
+        assert_eq!(
+            parse_resume_query(Some("session=1&session=2&since=1")),
+            Err("session given more than once")
+        );
+    }
+
+    #[test]
+    fn hello_serialises_in_contract_order() {
+        let h = Hello::new("1791719990000000000".into(), 41, 1, false);
+        assert_eq!(
+            serde_json::to_string(&h).unwrap(),
+            r#"{"kind":"hello","schema":"stream.v1","session":"1791719990000000000","seq":41,"historyFrom":1,"resumed":false}"#
+        );
+    }
+
+    #[test]
+    fn every_hello_field_is_documented_in_spot_schema() {
+        let h = Hello::new("0".into(), 0, 1, false);
+        let line = serde_json::to_string(&h).unwrap();
+        let v = serde_json::to_value(&h).unwrap();
+        let mut keys: Vec<_> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_by_key(|k| line.find(&format!("\"{k}\":")).unwrap());
+        let schema = include_str!("../../../docs/SPOT-SCHEMA.md").replace("\r\n", "\n");
+        let section = schema
+            .split_once("\n## `hello` record\n")
+            .unwrap()
+            .1
+            .split("\n## ")
+            .next()
+            .unwrap();
+        let rows: Vec<_> = section
+            .lines()
+            .filter_map(|l| l.strip_prefix("- `"))
+            .filter_map(|l| l.split_once("` ("))
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(rows, keys);
+        assert!(section.contains("all 6 keys"));
+    }
+
     /// MAN-68, PR #85 review round 8: a genuine protocol-shaped error
     /// must be classified as a rejection worth its own audit budget.
     #[test]
@@ -1068,5 +1370,79 @@ mod tests {
         assert!(!is_ws_protocol_violation(&WsError::Protocol(
             ProtocolError::ResetWithoutClosingHandshake
         )));
+    }
+
+    /// MAN-316: a `cty.dat` refresh reaches a client that is already
+    /// connected. The same `ClientCtx` renders an unallocated `QQ9ZZZ` with
+    /// the unknown-geography sentinels, then, once the refresher stores a
+    /// table that allocates QQ9, with that entity's continent and CQ zone
+    /// for the next publication. A spot already delivered replays unchanged.
+    #[test]
+    fn render_uses_the_current_cty_table() {
+        use crate::spot_message::{UNKNOWN_CONTINENT, UNKNOWN_CQ_ZONE, UNKNOWN_DXCC};
+        use manta_spot::{cty, scp, Spot, SpotType};
+
+        const QQ9: &str = "Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n";
+        let lists = Arc::new(ReferenceLists::new(
+            Arc::new(cty::Table::bundled()),
+            Arc::new(scp::Set::bundled()),
+        ));
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let ctx = ClientCtx {
+            bus: Arc::new(SpotBus::new(48_000.0, std::time::SystemTime::UNIX_EPOCH, 1)),
+            metrics: Arc::new(Metrics::new()),
+            lists: lists.clone(),
+            station_call: "W3XYZ".to_string(),
+            station_location: None,
+            decoder_version: "manta-test".to_string(),
+            shutdown,
+            drain_deadline: Duration::from_secs(1),
+            stream: StreamKind::Spots,
+            start_seq: None,
+            resume_limiter: IpRateLimiter::new(MAX_RESUMES_PER_IP, RESUME_RATE_WINDOW),
+        };
+        let publication = |seq: u64| JsonItem::Spot {
+            seq,
+            spot: crate::bus::BusSpot {
+                spot: Spot {
+                    callsign: "QQ9ZZZ".to_string(),
+                    freq_hz: 14_025_000.0,
+                    snr_db: 20.0,
+                    wpm: 25.0,
+                    spot_type: SpotType::Cq,
+                    confidence: 0.9,
+                    track_id: 1,
+                    sample_ts: 0,
+                },
+                occurrence_count: 1,
+            },
+            rendered: Arc::default(),
+        };
+        let parse = |line: &str| -> serde_json::Value {
+            serde_json::from_str(line).expect("render emits JSON")
+        };
+
+        let delivered = publication(1);
+        // The history keeps a clone of the item the broadcast carried.
+        let replayed = delivered.clone();
+        let first_line = ctx.render(&delivered);
+        let before = parse(&first_line);
+        assert_eq!(before["dxDxcc"], UNKNOWN_DXCC);
+        assert_eq!(before["dxContinent"], UNKNOWN_CONTINENT);
+        assert_eq!(before["dxCqZone"], UNKNOWN_CQ_ZONE);
+        assert!(before["dxLat"].is_null(), "{before}");
+
+        lists.cty.store(Arc::new(cty::Table::parse(&format!(
+            "{}{QQ9}",
+            manta_spot::CTY_DAT
+        ))));
+        let after = parse(&ctx.render(&publication(2)));
+        assert_eq!(after["dxContinent"], "EU", "{after}");
+        assert_eq!(after["dxCqZone"], 14, "{after}");
+        assert!(!after["dxLat"].is_null(), "{after}");
+
+        // MAN-137: a resumed client gets the record it would have got live,
+        // byte for byte, not a re-rendering against the swapped table.
+        assert_eq!(ctx.render(&replayed), first_line);
     }
 }

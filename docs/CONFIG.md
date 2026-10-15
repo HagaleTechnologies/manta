@@ -80,7 +80,7 @@ environment: none
 server: none (manta run starts no servers)
 rbn_uplink: none
 input: type=unset (the default sound card, unless a command-line flag picks the source)
-spot: allowlist=none blocklist_path=none notch_path=none cty_path=bundled scp_path=bundled
+spot: allowlist=none blocklist_path=none notch_path=none cty_path=bundled scp_path=bundled cty_sha256=none scp_sha256=none refresh_lists=off list_cache_dir=none cty_url=http://www.country-files.com/cty/cty.dat scp_url=http://www.supercheckpartial.com/MASTER.SCP
 detector: defaults
 decode: engine=legacy (other keys default)
 ```
@@ -100,8 +100,10 @@ and two servers on one port. Without `--config` or `MANTA_CONFIG` it checks
 **Reloading without a restart.** On Unix, `SIGHUP` to a `run` daemon (a config
 with a `[server]` table) re-reads the file and applies `[spot]` `allowlist`,
 `blocklist_path` and `notch_path`, and each `[[rbn_uplink]]` block's `dry_run`.
-Every other key, `cty_path` and `scp_path` included, needs a restart; a reload
-logs the changed keys it did not apply. A file that fails the checks above is
+Every other key, `cty_path`, `scp_path` and the list-refresh keys included,
+needs a restart; a reload logs the changed keys it did not apply. A
+`refresh_lists` download replaces `cty.dat` or `MASTER.SCP` on its own
+schedule, not on `SIGHUP`. A file that fails the checks above is
 logged and ignored. See
 [DECISIONS/2026-10-10-man78-live-reload.md](DECISIONS/2026-10-10-man78-live-reload.md).
 
@@ -146,7 +148,7 @@ the config for both. The table needs `station_callsign`.
 | `live_bind_addr` | `"127.0.0.1"` | live: `run` with `[server]` and `live_port`; restart required | Address of the live-state listener, which has no password. The stream carries every track's decoded text; set `"0.0.0.0"` only for a dashboard on another machine, and firewall `live_port`. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
 | `line_format` | `"rbn"` | live: `run` with `[server]` | Telnet spot-line layout, `"rbn"` or `"skimmer"`. The uplink always sends the `"rbn"` layout. |
 | `status_interval_secs` | `60` | live: `run` with `[server]` | Seconds between one-line status reports in the log; `0` turns them off. |
-| `history_minutes` | `30` | live: `run` with `[server]`; restart required | Telnet replay retention in whole minutes, 0–1440, measured from the newest published spot's sample timestamp. Keeps at least the newest 50 spots and at most 10,000; `0` keeps only the newest 50. Loggers request `sh/dx 30m`; bare `sh/dx` returns 10 rows. See [MAN-93](DECISIONS/2026-10-11-man93-sh-dx-history-window.md). |
+| `history_minutes` | `30` | live: `run` with `[server]`; restart required | Telnet replay retention in whole minutes, 0–1440, measured from the newest published spot's sample timestamp. Keeps at least the newest 50 spots and at most 10,000; `0` keeps only the newest 50. Loggers request `sh/dx 30m`; bare `sh/dx` returns 10 rows. See [MAN-93](DECISIONS/2026-10-11-man93-sh-dx-history-window.md). Also bounds the separate JSON resume history, with spots and grades together under the same floor and ceiling, counted in records; see [MAN-137](DECISIONS/2026-10-14-man137-json-stream-resume.md). |
 | `telnet_max_connections_per_ip` | `16` | live: `run` with `[server]` | Open telnet connections per client IP; `0` removes the limit. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
 | `json_max_connections_per_ip` | `16` | live: `run` with `[server]` | Open JSON and WebSocket connections per client IP; `0` removes the limit. The live-state listener applies the same quota, counted separately. |
 | `metrics_max_connections_per_ip` | `8` | live: `run` with `[server]` | Open metrics connections per client IP; `0` removes the limit. |
@@ -169,6 +171,7 @@ nothing, and flags an example `login_callsign`.
 | `login_callsign` | none; example `"N0CALL"`; unset logs in as `station_callsign` | live: `run` with `[server]` | Callsign sent at login. `run` and `config check` reject `N0CALL`. |
 | `dry_run` | `true` | live: `run` with `[server]`; reloads on SIGHUP | `true` connects and logs in but sends no spots. See [RUNBOOKS/uplink-health.md](RUNBOOKS/uplink-health.md). |
 | `spot_types` | `"cq_beacon"` | live: `run` with `[server]` | `"cq_beacon"` sends CQ and beacon spots only, as RBN requires; `"all"` sends every spot. Telnet and JSON still carry every spot. |
+| `max_spots_per_minute` | `600` | live: `run` with `[server]` | Max spots written to this target per 60 s window (the window resets at the first spot after it elapses); further spots are counted in `manta_uplink_ceiling_suppressed_total` and skipped, and the connection stays up. `0` disables the ceiling. Needs a restart; SIGHUP reloads only `dry_run`. |
 
 ## [rbn_compare]
 
@@ -220,13 +223,16 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `interface` | none; example `"192.168.1.20"`; unset joins on the kernel's choice | live: `type = "ka9q"` | IPv4 address of the local interface to join the group on (an interface name is refused). manta also joins on `127.0.0.1`, for a radiod on the same machine. `--ka9q-interface` overrides it. |
 | `freq_correction_ppm` | `0.0` | live: `run`, `soak`, `doctor`, `decode`; dropped when a source flag replaces a typed `[input]` | Oscillator correction, ppm, -1000 to 1000. `--freq-correction-ppm` overrides it. |
 | `center_freq_hz` | none; example `14030000.0`; unset leaves frequencies as audio offsets, and `run` with `[server]` refuses a source that carries no frequency of its own | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Your radio's dial frequency, Hz, for a source that carries none. `--dial-freq-hz` overrides it. |
-| `capture_rate_hz` | none; example `48000.0`; unset decodes at the receiver's own rate | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Decimated sample rate, Hz. It must be at least 1000 (checked before the receiver opens), divide the receiver's rate by a power of two, and be 93.75 Hz (the channel spacing) times a power of two of at least 4, so in practice 1500, 3000, 6000, 12000, 24000, 48000, 96000 and so on. A rate that divides evenly but fails the last rule, such as 50000 from a 100 kS/s receiver, is rejected at startup. `--capture-rate-hz` overrides it. |
+| `capture_rate_hz` | none; example `48000.0`; unset decodes at the receiver's own rate | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Decimated sample rate, Hz. It must be at least 1000 (checked before the receiver opens), divide the receiver's rate by a power of two, and be 93.75 Hz (the channel spacing) times a power of two of at least 4, so in practice 1500, 3000, 6000, 12000, 24000, 48000, 96000 and so on. A rate that divides evenly but fails the last rule, such as 50000 from a 100 kS/s receiver, is rejected at startup. The decimator's transition band (the outer ~9.4% of each side, 24 of 256 channels at 48 kS/s — beyond the <= 1 dB point at 0.4526 x the rate) is not usable: the reported passband, `manta check`, SETT segments and tracked channels stop at the trusted band, and `run`/`soak` say so in one startup line naming the source's intersected passband. `--capture-rate-hz` overrides it. |
 | `replay_epoch` | none; example `1700000000`; unset uses the file's modification time | live: `run` with `[server]` and a file source; ignored elsewhere | Unix seconds that the recording's first sample stands for. `--replay-epoch` overrides it. |
 
 ## [spot]
 
 Which decodes become spots. `allowlist`, `blocklist_path` and `notch_path`
-reload on SIGHUP; `cty_path` and `scp_path` need a restart.
+reload on SIGHUP; every other key needs a restart. With `refresh_lists` on,
+`run` from a live receiver also replaces `cty.dat` and `MASTER.SCP` on its
+own schedule. See
+[DECISIONS/2026-10-12-man316-reference-list-refresh.md](DECISIONS/2026-10-12-man316-reference-list-refresh.md).
 
 | Key | Default | Wired | Notes |
 |---|---|---|---|
@@ -235,6 +241,14 @@ reload on SIGHUP; `cty_path` and `scp_path` need a restart.
 | `notch_path` | none; example `"notches.txt"`; unset notches no frequency | live: `run`, `soak`, `doctor`, `decode`; reloads on SIGHUP | File of `low_hz-high_hz` ranges never spotted, one per line. A relative path set in the file is relative to the file's directory; from `--notch`, which overrides it, or `MANTA_SPOT_NOTCH_PATH` it is relative to the working directory. |
 | `cty_path` | none; example `"cty.dat"`; unset uses the built-in `cty.dat` | live: `run`, `soak`, `doctor`, `decode` | AD1C's country-prefix file. A relative path set in the file is relative to the file's directory; from `--cty`, which overrides it, or `MANTA_SPOT_CTY_PATH` it is relative to the working directory. See [DECISIONS/2026-10-10-man79-operator-cty-scp-override.md](DECISIONS/2026-10-10-man79-operator-cty-scp-override.md). |
 | `scp_path` | none; example `"MASTER.SCP"`; unset uses the built-in `master.scp` | live: `run`, `soak`, `doctor`, `decode` | Known-callsign list that raises confidence. A relative path set in the file is relative to the file's directory; from `--scp`, which overrides it, or `MANTA_SPOT_SCP_PATH` it is relative to the working directory. |
+| `refresh_lists` | `false` | live: `run` with a live source; file replay ignores it | Downloads `cty.dat` every 7 days and `MASTER.SCP` every day from `cty_url` and `scp_url`, with `If-Modified-Since`. A download replaces the list in use only after it parses and passes the completeness checks; a failed or rejected one is logged as a `warning: list refresh:` line, counted in `manta_list_refresh_total{outcome="failed"}` and retried an hour later, and the list in use stays. Skipped for a list that `cty_path`/`scp_path` or `cty_sha256`/`scp_sha256` sets. `soak`, `decode` and file replay never download. Needs outbound TCP port 80. |
+| `list_cache_dir` | none; example `"/var/cache/manta"`; unset keeps downloads in memory only | live: `run` with a live source; file replay ignores it | Where accepted downloads are kept (`cty/<sha256>.dat`, `scp/<sha256>.scp`, each list's `state.json`; the 30 newest versions per list), so a restart starts from the last good download. `cty_sha256`/`scp_sha256` pins also look here, for every validating command, when `cty_path`/`scp_path` is not set. A relative path set in the file is relative to the file's directory; from `MANTA_SPOT_LIST_CACHE_DIR` it is relative to the working directory. The systemd unit and Compose file set it to `/var/cache/manta`. |
+| `cty_url` | `"http://www.country-files.com/cty/cty.dat"` | live: `run` with a live source; file replay ignores it | Where `refresh_lists` downloads `cty.dat`. Only `http://` URLs: `https://` is refused at load, because manta has no TLS support. Redirects and chunked responses count as failures. Point it at a local mirror to share one download. |
+| `scp_url` | `"http://www.supercheckpartial.com/MASTER.SCP"` | live: `run` with a live source; file replay ignores it | Where `refresh_lists` downloads `MASTER.SCP`. Same rules as `cty_url`. |
+| `cty_sha256` | none; example `"e9ff91a3c3ab28c5f7dbcffb4280944a84645ed53d41cb4c68a41f132ee13fd1"`; unset uses `cty_path`, the cache or the built-in copy | live: `run`, `soak`, `doctor`, `decode` | Use exactly the `cty.dat` whose SHA-256 is this (64 hex digits, as in the `lists:` log line). If `cty_path` is set, that file must match and nothing else is tried; otherwise manta looks in the built-in copy, then `list_cache_dir`. manta stops before reading the source if no copy matches. A pinned list is never refreshed. `--cty-sha256` overrides it; `MANTA_SPOT_CTY_SHA256` sets it. |
+| `scp_sha256` | none; example `"00692208fa86b1498dcd6fc0f88e14d2a1a0462ba5d481855da5de69be4e3cf0"`; unset uses `scp_path`, the cache or the built-in copy | live: `run`, `soak`, `doctor`, `decode` | Use exactly the `MASTER.SCP` whose SHA-256 is this, looked up like `cty_sha256`. `--scp-sha256` overrides it; `MANTA_SPOT_SCP_SHA256` sets it. |
+| `validation_level` | `"normal"` | live: `run`, `soak`, `doctor`, `decode` | `"normal"`: 2 repetitions for a common pattern, 3 for a listed pattern, 5 for an unlisted pattern. `"minimal"`: 2 for every call. Allowlisted calls and beacons are exempt. Advertised to the Aggregator as `vlNormal` or `vlMinimal`. `MANTA_SPOT_VALIDATION_LEVEL` overrides the file for live commands. |
+| `pattern_path` | none; example `"patterns.lst"`; unset uses the built-in list | live: `run`, `soak`, `doctor`, `decode` | Callsign-pattern list, independent of `scp_path`. One pattern per line; `+K5@@@` marks a common pattern, `K5@@@` a listed one. Leading `#` starts a comment; `@` represents a letter, `#` a digit after the literal prefix. A relative path set in the file is relative to the file's directory; `--patterns` or `MANTA_SPOT_PATTERN_PATH` overrides it relative to the working directory. |
 
 ## [detector]
 
@@ -254,6 +268,8 @@ milliseconds, 0 to 3600000.
 | `crash_filter` | `"full"` | live | What a static crash (a band-wide lift of 3 dB or more on at least three quarters of the passband's channels for 8 ms or more) does. `"full"`: no track starts on it, and running tracks do not decode it. `"starts-only"`: no track starts on it, but running tracks decode it as received. `"off"`: no filtering. Crashes are counted in `manta_static_crashes_total` whatever the value. Inactive when the source passband holds fewer than 96 channels (rig audio; captures of 6 kHz or less). Needs a restart. See [SPEC §2.7](SPEC-decode-core.md#27-band-wide-static-crash-detection-man-312) and [MAN-312](DECISIONS/2026-10-13-man312-static-crash-filter.md). |
 | `rtty_filter` | `true` | live | Recognise RTTY (two-tone FSK) signals and start no CW track on them or their keying sidebands; `false` restores the previous behaviour. See [SPEC §2.6](SPEC-decode-core.md#26-two-tone-fsk-rtty-recognition) and [MAN-314](DECISIONS/2026-10-11-man314-rtty-recognition.md). |
 | `rtty_dwell_ms` | `20000.0` | live | How long an FSK signal must last before it is marked as RTTY; 1000 to 3600000 (1 h), counted in whole 1000 ms detector blocks. |
+| `non_cw_filter` | `true` | live | A new track is decoded only once it shows CW keying. Noise-like wideband data and swept carriers start no CW track and strong SSB voice starts far fewer (7 against 81 at +30 dB with the testkit voice, none spotted; zero is MAN-372), and a track whose signal stops keying closes after `unkeyed_close_ms`. `false` restores the pre-MAN-313 behaviour. See [SPEC §2.8](SPEC-decode-core.md#28-non-cw-rejection-man-313) and [MAN-313](DECISIONS/2026-10-13-man313-non-cw-rejection.md). Restart required (every `[detector]` key is). |
+| `unkeyed_close_ms` | `10000.0` | live | With `non_cw_filter` on, two limits: how long a qualified track may stay key-down with no keying, no decoded character and no callsign read before it closes; and how long a new track may take to show CW keying. Range 1000 to 3600000 (1 h). |
 
 ## [decode]
 

@@ -322,7 +322,10 @@ impl Harness {
                 manta_server::json_stream::JsonStreamConfig {
                     bus: bus2,
                     metrics: metrics2,
-                    cty: Arc::new(Table::parse(CTY_FIXTURE)),
+                    lists: Arc::new(manta_spot::reference::ReferenceLists::new(
+                        Arc::new(Table::parse(CTY_FIXTURE)),
+                        Arc::new(manta_spot::scp::Set::bundled()),
+                    )),
                     station_call: STATION_CALL.to_string(),
                     station_location: None,
                     decoder_version: "manta-test".to_string(),
@@ -446,7 +449,32 @@ impl Harness {
             .unwrap()
             .iter()
             .filter(|l| l.contains("\"kind\":\"spotGrade\""))
-            .map(|l| l.trim_end_matches('\n').to_string())
+            .map(|l| {
+                let grade: serde_json::Value = serde_json::from_str(l).unwrap();
+                let seq = grade["seq"].as_u64().expect("streamed grade has seq");
+                let spot_seq = self
+                    .bus
+                    .json_resume(None, Some(0), seq)
+                    .records
+                    .iter()
+                    .find_map(|r| match r {
+                        manta_server::bus::JsonItem::Spot { seq, spot, .. }
+                            if manta_server::spot_message::spot_id(
+                                STATION_CALL,
+                                NONCE,
+                                &spot.spot,
+                            ) == grade["spotId"].as_str().unwrap() =>
+                        {
+                            Some(*seq)
+                        }
+                        _ => None,
+                    })
+                    .expect("graded spot retained");
+                assert!(seq > spot_seq);
+                // Remove only seq, preserving the offline fixture's exact key order.
+                l.trim_end_matches('\n')
+                    .replacen(&format!("\"seq\":{seq},"), "", 1)
+            })
             .collect()
     }
 
@@ -529,8 +557,7 @@ async fn run_scenario(spot_index: usize, reports: Vec<Report>, expected: &str) {
     // Window still open: the client has the spot line only (raw TCP
     // starts streaming after json_stream's 500 ms WebSocket peek), and
     // three more ticks pass without a grade.
-    let json_lines = h.json_lines.clone();
-    wait_until("the spot line", || !json_lines.lock().unwrap().is_empty()).await;
+    wait_until("the spot line", || h.spot_lines() > 0).await;
     tokio::time::sleep(Duration::from_millis(350)).await;
     assert_eq!(h.spot_lines(), 1);
     assert!(h.grade_lines().is_empty(), "{:?}", h.grade_lines());
@@ -540,7 +567,13 @@ async fn run_scenario(spot_index: usize, reports: Vec<Report>, expected: &str) {
     assert_eq!(grades, vec![expected.to_string()]);
     // The spot line came first.
     let all = h.json_lines.lock().unwrap().clone();
-    assert!(!all[0].contains("\"kind\""), "{all:?}");
+    assert!(
+        !all.iter()
+            .find(|l| !l.contains("\"kind\":\"hello\""))
+            .unwrap()
+            .contains("\"kind\""),
+        "{all:?}"
+    );
 
     let v: serde_json::Value = serde_json::from_str(expected).unwrap();
     let series = format!(

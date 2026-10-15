@@ -180,6 +180,83 @@ pub(crate) fn escape_label_value(v: &str) -> String {
         .replace('\n', "\\n")
 }
 
+/// MAN-316: where the reference list in use came from -- the `origin`
+/// label of `manta_list_info`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListOrigin {
+    /// The copy compiled into manta.
+    Bundled,
+    /// `cty_path`/`scp_path` (or `--cty`/`--scp`).
+    File,
+    /// `[spot].list_cache_dir`'s last good download, read at startup.
+    Cache,
+    /// Downloaded by this run's refresher.
+    Download,
+}
+
+impl ListOrigin {
+    pub fn label(self) -> &'static str {
+        match self {
+            ListOrigin::Bundled => "bundled",
+            ListOrigin::File => "file",
+            ListOrigin::Cache => "cache",
+            ListOrigin::Download => "download",
+        }
+    }
+}
+
+/// MAN-316: one reference-list download attempt's result -- the `outcome`
+/// label of `manta_list_refresh_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListRefreshOutcome {
+    /// A new version passed the checks and is in use.
+    Updated,
+    /// 304 Not Modified, or the same bytes as the copy in use.
+    Unchanged,
+    /// A network or HTTP error, or a download the checks rejected.
+    Failed,
+}
+
+impl ListRefreshOutcome {
+    /// Render order of `manta_list_refresh_total`'s outcomes.
+    const ALL: [ListRefreshOutcome; 3] = [
+        ListRefreshOutcome::Updated,
+        ListRefreshOutcome::Unchanged,
+        ListRefreshOutcome::Failed,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ListRefreshOutcome::Updated => "updated",
+            ListRefreshOutcome::Unchanged => "unchanged",
+            ListRefreshOutcome::Failed => "failed",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            ListRefreshOutcome::Updated => 0,
+            ListRefreshOutcome::Unchanged => 1,
+            ListRefreshOutcome::Failed => 2,
+        }
+    }
+}
+
+/// MAN-316: one reference list's series across the three `manta_list_*`
+/// families. Each field is `None` until its setter first runs, so a list
+/// the refresher does not manage publishes no refresh series rather than
+/// a permanently-zero one.
+#[derive(Debug, Default)]
+struct ListMetrics {
+    /// `(sha256, origin)` of the copy in use, for `manta_list_info`.
+    in_use: Option<(String, ListOrigin)>,
+    /// `manta_list_refresh_total`, indexed by `ListRefreshOutcome::index`;
+    /// `Some` once `enable_list_refresh` (or a first attempt) ran.
+    refresh_totals: Option<[u64; 3]>,
+    /// `manta_list_last_success_timestamp_seconds`.
+    last_success: Option<SystemTime>,
+}
+
 pub(crate) fn spot_type_metric_label(t: SpotType) -> &'static str {
     match t {
         SpotType::Cq => "cq",
@@ -286,6 +363,7 @@ pub struct UplinkTarget {
     connected: AtomicBool,
     sent: AtomicU64,
     suppressed: AtomicU64,
+    ceiling_suppressed: AtomicU64,
     lagged: AtomicU64,
     write_failed: AtomicU64,
     disconnected: AtomicU64,
@@ -303,6 +381,7 @@ impl UplinkTarget {
             connected: AtomicBool::new(false),
             sent: AtomicU64::new(0),
             suppressed: AtomicU64::new(0),
+            ceiling_suppressed: AtomicU64::new(0),
             lagged: AtomicU64::new(0),
             write_failed: AtomicU64::new(0),
             disconnected: AtomicU64::new(0),
@@ -328,6 +407,17 @@ impl UplinkTarget {
     /// (MAN-91).
     pub fn record_suppressed(&self) {
         self.suppressed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A spot this target would otherwise have written, skipped because
+    /// the target's `max_spots_per_minute` ceiling was reached (MAN-248).
+    /// Deliberately separate from `record_suppressed`: that counter's
+    /// HELP text and METRICS.md meaning promise "dry-run or spot_types",
+    /// and the ticket requires a distinguishable suppressed-by-ceiling
+    /// counter so an operator can tell a runaway input or a too-low
+    /// default from ordinary filtering.
+    pub fn record_ceiling_suppressed(&self) {
+        self.ceiling_suppressed.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_lagged(&self, n: u64) {
@@ -420,6 +510,10 @@ impl UplinkTarget {
         self.suppressed.load(Ordering::Relaxed)
     }
 
+    pub fn ceiling_suppressed_total(&self) -> u64 {
+        self.ceiling_suppressed.load(Ordering::Relaxed)
+    }
+
     pub fn lagged_total(&self) -> u64 {
         self.lagged.load(Ordering::Relaxed)
     }
@@ -466,6 +560,34 @@ struct SourceHealthEntry {
     terminal: bool,
 }
 
+/// Bounded outcome labels for WebSocket spot-stream resume requests.
+#[derive(Debug, Clone, Copy)]
+pub enum ResumeMetricOutcome {
+    Resumed,
+    Gap,
+    Reset,
+    Refused,
+    Invalid,
+}
+impl ResumeMetricOutcome {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Resumed => "resumed",
+            Self::Gap => "gap",
+            Self::Reset => "reset",
+            Self::Refused => "refused",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+const RESUME_OUTCOMES: [ResumeMetricOutcome; 5] = [
+    ResumeMetricOutcome::Resumed,
+    ResumeMetricOutcome::Gap,
+    ResumeMetricOutcome::Reset,
+    ResumeMetricOutcome::Refused,
+    ResumeMetricOutcome::Invalid,
+];
+
 #[derive(Default)]
 pub struct Metrics {
     spots_total: AtomicU64,
@@ -503,6 +625,9 @@ pub struct Metrics {
     spots_replay_abandoned_total: AtomicU64,
     /// In-window spots evicted by the history ceiling (MAN-93).
     spots_history_truncated_total: AtomicU64,
+    json_stream_history_truncated_total: AtomicU64,
+    json_stream_resumes_total: [AtomicU64; 5],
+    json_stream_replay_abandoned_total: AtomicU64,
     /// MAN-136/MAN-45: a spot's dx or de callsign couldn't be resolved
     /// against `cty.dat` -- or resolved only through the base prefix of a
     /// `/MM`/`/AM` call, whose real position is unknowable from it -- so it
@@ -553,6 +678,14 @@ pub struct Metrics {
     /// Sources with no wire-packet loss model never call `set_input_health`,
     /// so they publish no series rather than a permanently-zero one.
     input_health: RwLock<BTreeMap<String, InputHealth>>,
+    /// MAN-234: per-source count of input samples the channelizer replaced
+    /// with silence (NaN, infinite, or beyond `MAX_SAMPLE_MAGNITUDE`).
+    /// Unlike `input_health`, every source publishes it, at 0 from startup.
+    input_bad_samples: RwLock<BTreeMap<String, u64>>,
+    /// MAN-316: per reference list (`cty`, `scp`), fed by `manta-cli`'s
+    /// startup resolution and list refresher. Ordered so `/metrics`
+    /// renders the lists in a stable order.
+    lists: Mutex<BTreeMap<&'static str, ListMetrics>>,
     /// MAN-128: one handle per configured `[[rbn_uplink]]` target,
     /// registered in config order before `uplink::serve` is spawned for it
     /// (so a never-connected or disabled target still renders). The seven
@@ -1094,6 +1227,31 @@ impl Metrics {
         self.spots_replay_abandoned_total.load(Ordering::Relaxed)
     }
 
+    pub fn record_json_stream_resume(&self, outcome: ResumeMetricOutcome) {
+        self.json_stream_resumes_total[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn json_stream_resumes_total(&self, outcome: ResumeMetricOutcome) -> u64 {
+        self.json_stream_resumes_total[outcome as usize].load(Ordering::Relaxed)
+    }
+    pub fn record_json_stream_replay_abandoned(&self, n: u64) {
+        self.json_stream_replay_abandoned_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn json_stream_replay_abandoned_total(&self) -> u64 {
+        self.json_stream_replay_abandoned_total
+            .load(Ordering::Relaxed)
+    }
+
+    /// In-window spot and grade evictions at the shared JSON history ceiling.
+    pub fn record_json_stream_history_truncated(&self, n: u64) {
+        self.json_stream_history_truncated_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn json_stream_history_truncated_total(&self) -> u64 {
+        self.json_stream_history_truncated_total
+            .load(Ordering::Relaxed)
+    }
+
     pub fn record_history_truncated(&self, n: u64) {
         self.spots_history_truncated_total
             .fetch_add(n, Ordering::Relaxed);
@@ -1273,6 +1431,66 @@ impl Metrics {
             .insert(source.to_string(), health);
     }
 
+    /// MAN-234: the engine's running count of replaced input samples for
+    /// `source`. Keeps the maximum, so a stale or out-of-order injection
+    /// can never make the counter go backwards.
+    pub fn set_input_bad_samples(&self, source: &str, count: u64) {
+        let mut map = self
+            .input_bad_samples
+            .write()
+            .expect("input_bad_samples lock poisoned");
+        let entry = map.entry(source.to_string()).or_insert(0);
+        *entry = (*entry).max(count);
+    }
+
+    /// MAN-316: the reference lists' entries, tolerating a poisoned lock --
+    /// a panic elsewhere must not take `/metrics` down with it.
+    fn list_metrics(&self) -> std::sync::MutexGuard<'_, BTreeMap<&'static str, ListMetrics>> {
+        self.lists
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// MAN-316: names the copy of `list` (`"cty"` or `"scp"`) every consumer
+    /// uses now. Replaces the list's previous `manta_list_info` series, so a
+    /// scrape never shows two versions of one list in use.
+    pub fn set_list_in_use(&self, list: &'static str, sha256: &str, origin: ListOrigin) {
+        self.list_metrics().entry(list).or_default().in_use = Some((sha256.to_string(), origin));
+    }
+
+    /// MAN-316: `list` is refreshed by this run, so `manta_list_refresh_total`
+    /// publishes all three outcomes for it, starting at 0. Idempotent.
+    pub fn enable_list_refresh(&self, list: &'static str) {
+        self.list_metrics()
+            .entry(list)
+            .or_default()
+            .refresh_totals
+            .get_or_insert([0; 3]);
+    }
+
+    /// MAN-316: counts one download attempt for `list`. `Updated` and
+    /// `Unchanged` both confirm the list in use is current, so they also
+    /// move its last-success time to `at`.
+    pub fn record_list_refresh(
+        &self,
+        list: &'static str,
+        outcome: ListRefreshOutcome,
+        at: SystemTime,
+    ) {
+        let mut lists = self.list_metrics();
+        let entry = lists.entry(list).or_default();
+        entry.refresh_totals.get_or_insert([0; 3])[outcome.index()] += 1;
+        if outcome != ListRefreshOutcome::Failed {
+            entry.last_success = Some(at);
+        }
+    }
+
+    /// MAN-316: `list` was last confirmed current at `at` without an
+    /// attempt in this run -- the cache's `checked_at`, read at startup.
+    pub fn set_list_confirmed_at(&self, list: &'static str, at: SystemTime) {
+        self.list_metrics().entry(list).or_default().last_success = Some(at);
+    }
+
     // MAN-32/MAN-128: RBN uplink counters. ARCHITECTURE §8's "every
     // dropped/evicted/suppressed item is counted" invariant applies here
     // too -- a dry-run-suppressed or lag-dropped spot must be visible,
@@ -1310,6 +1528,17 @@ impl Metrics {
         self.uplink_targets_snapshot()
             .iter()
             .map(|t| t.suppressed_total())
+            .sum()
+    }
+
+    /// MAN-248: spots skipped because a target's forwarding ceiling was
+    /// reached, summed over every configured target. Separate from
+    /// `uplink_suppressed_total` for the same reason the per-target
+    /// counter is (see `UplinkTarget::record_ceiling_suppressed`).
+    pub fn uplink_ceiling_suppressed_total(&self) -> u64 {
+        self.uplink_targets_snapshot()
+            .iter()
+            .map(|t| t.ceiling_suppressed_total())
             .sum()
     }
 
@@ -1594,6 +1823,27 @@ impl Metrics {
             "manta_spots_replay_abandoned_total {}\n",
             self.spots_replay_abandoned_total.load(Ordering::Relaxed)
         ));
+        out.push_str("# HELP manta_json_stream_resumes_total WebSocket resume requests (GET /?since=) on the JSON spot stream, by outcome: resumed (every record after since replayed), gap (since older than the retained history), reset (session absent or different, or since ahead of the session), refused (over the per-IP resume budget, HTTP 429), invalid (malformed since, HTTP 400).\n");
+        out.push_str("# TYPE manta_json_stream_resumes_total counter\n");
+        for outcome in RESUME_OUTCOMES {
+            out.push_str(&format!(
+                "manta_json_stream_resumes_total{{outcome=\"{}\"}} {}\n",
+                outcome.label(),
+                self.json_stream_resumes_total(outcome)
+            ));
+        }
+        out.push_str("# HELP manta_json_stream_replay_abandoned_total JSON stream resume records not replayed because a replay write failed or the daemon shut down mid-replay. Re-sends of records already published, so counted apart from live-delivery loss.\n");
+        out.push_str("# TYPE manta_json_stream_replay_abandoned_total counter\n");
+        out.push_str(&format!(
+            "manta_json_stream_replay_abandoned_total {}\n",
+            self.json_stream_replay_abandoned_total()
+        ));
+        out.push_str("# HELP manta_json_stream_history_truncated_total Spots and spotGrade records dropped from the JSON stream's resume history at its 10000-record ceiling while still inside [server].history_minutes. Non-zero means a resume reaches back less than the configured window.\n");
+        out.push_str("# TYPE manta_json_stream_history_truncated_total counter\n");
+        out.push_str(&format!(
+            "manta_json_stream_history_truncated_total {}\n",
+            self.json_stream_history_truncated_total()
+        ));
         out.push_str("# HELP manta_spots_history_truncated_total Spots dropped from the sh/dx history at its 10000-spot ceiling while still inside [server].history_minutes. Non-zero means sh/dx reaches back less than the configured window.\n");
         out.push_str("# TYPE manta_spots_history_truncated_total counter\n");
         out.push_str(&format!(
@@ -1634,7 +1884,9 @@ impl Metrics {
             self.ws_clients.load(Ordering::Relaxed)
         ));
 
-        out.push_str("# HELP manta_active_tracks Currently active decoder tracks.\n");
+        out.push_str(
+            "# HELP manta_active_tracks Currently decoding CW tracks (keyed CW only, MAN-313).\n",
+        );
         out.push_str("# TYPE manta_active_tracks gauge\n");
         out.push_str(&format!(
             "manta_active_tracks {}\n",
@@ -1752,6 +2004,72 @@ impl Metrics {
 
         drop(input_health);
 
+        // MAN-234: replaced input samples, every source, 0 from startup.
+        out.push_str(
+            "# HELP manta_input_bad_samples_total Input samples replaced with silence because a component was NaN, infinite, or larger than 1e17 in magnitude, per source.\n",
+        );
+        out.push_str("# TYPE manta_input_bad_samples_total counter\n");
+        for (source, n) in self
+            .input_bad_samples
+            .read()
+            .expect("input_bad_samples lock poisoned")
+            .iter()
+        {
+            out.push_str(&format!(
+                "manta_input_bad_samples_total{{source=\"{source}\"}} {n}\n"
+            ));
+        }
+
+        // MAN-316: the reference lists in use and their refresh history.
+        // HELP/TYPE always render; each family has samples only for the
+        // lists whose setter has run (see `ListMetrics`).
+        let lists = self.list_metrics();
+        out.push_str(
+            "# HELP manta_list_info The reference list in use: list (cty or scp), the SHA-256 of its bytes, and its origin (bundled, file, cache or download). Always 1.\n",
+        );
+        out.push_str("# TYPE manta_list_info gauge\n");
+        for (list, m) in lists.iter() {
+            if let Some((sha256, origin)) = &m.in_use {
+                out.push_str(&format!(
+                    "manta_list_info{{list=\"{list}\",sha256=\"{}\",origin=\"{}\"}} 1\n",
+                    escape_label_value(sha256),
+                    origin.label()
+                ));
+            }
+        }
+
+        out.push_str(
+            "# HELP manta_list_refresh_total Reference-list download attempts by outcome: updated, unchanged or failed.\n",
+        );
+        out.push_str("# TYPE manta_list_refresh_total counter\n");
+        for (list, m) in lists.iter() {
+            if let Some(totals) = &m.refresh_totals {
+                for outcome in ListRefreshOutcome::ALL {
+                    out.push_str(&format!(
+                        "manta_list_refresh_total{{list=\"{list}\",outcome=\"{}\"}} {}\n",
+                        outcome.label(),
+                        totals[outcome.index()]
+                    ));
+                }
+            }
+        }
+
+        out.push_str(
+            "# HELP manta_list_last_success_timestamp_seconds Unix time the reference list in use was last confirmed current with its download URL.\n",
+        );
+        out.push_str("# TYPE manta_list_last_success_timestamp_seconds gauge\n");
+        for (list, m) in lists.iter() {
+            if let Some(at) = m.last_success {
+                let secs = at
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                out.push_str(&format!(
+                    "manta_list_last_success_timestamp_seconds{{list=\"{list}\"}} {secs}\n"
+                ));
+            }
+        }
+        drop(lists);
+
         out.push_str("# HELP manta_uplink_sent_total Spots forwarded to the RBN uplink target.\n");
         out.push_str("# TYPE manta_uplink_sent_total counter\n");
         out.push_str(&format!(
@@ -1766,6 +2084,15 @@ impl Metrics {
         out.push_str(&format!(
             "manta_uplink_suppressed_total {}\n",
             self.uplink_suppressed_total()
+        ));
+
+        out.push_str(
+            "# HELP manta_uplink_ceiling_suppressed_total Spots not sent to the RBN uplink target because its per-minute forwarding ceiling (max_spots_per_minute) was reached.\n",
+        );
+        out.push_str("# TYPE manta_uplink_ceiling_suppressed_total counter\n");
+        out.push_str(&format!(
+            "manta_uplink_ceiling_suppressed_total {}\n",
+            self.uplink_ceiling_suppressed_total()
         ));
 
         out.push_str(
@@ -1812,7 +2139,7 @@ impl Metrics {
         ));
 
         // MAN-128: per-target uplink families -- one read guard for all
-        // eight, so a concurrent `register_uplink_target` can't interleave
+        // nine, so a concurrent `register_uplink_target` can't interleave
         // a partial view across them.
         let targets = self.uplink_targets_snapshot();
 
@@ -1855,6 +2182,16 @@ impl Metrics {
                 "manta_uplink_target_suppressed_total{{target=\"{}\"}} {}\n",
                 escape_label_value(t.label()),
                 t.suppressed_total()
+            ));
+        }
+
+        out.push_str("# HELP manta_uplink_target_ceiling_suppressed_total Spots not sent to this RBN uplink target because its per-minute forwarding ceiling (max_spots_per_minute) was reached.\n");
+        out.push_str("# TYPE manta_uplink_target_ceiling_suppressed_total counter\n");
+        for t in targets.iter() {
+            out.push_str(&format!(
+                "manta_uplink_target_ceiling_suppressed_total{{target=\"{}\"}} {}\n",
+                escape_label_value(t.label()),
+                t.ceiling_suppressed_total()
             ));
         }
 
@@ -2009,7 +2346,7 @@ impl Metrics {
             push_histogram_samples(&mut out, "manta_track_rail_ratio", &q.rail_ratio);
         }
         out.push_str(
-            "# HELP manta_candidate_repetitions Message-distinct decodes of the same call near the same frequency within the trailing 90 s, for each callsign candidate the repetition gate scored. A candidate needs 2 to spot.\n",
+            "# HELP manta_candidate_repetitions Message-distinct decodes of the same call near the same frequency within the trailing 90 s, for each callsign candidate the repetition gate scored. A candidate needs 2, 3 or 5 to spot by its callsign-pattern tier (2 for every call at validation_level minimal).\n",
         );
         out.push_str("# TYPE manta_candidate_repetitions histogram\n");
         if let Some(q) = &quality {
@@ -2266,6 +2603,25 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains("# TYPE manta_static_crashes_total counter\n"));
         assert!(text.contains("\nmanta_static_crashes_total 3\n"), "{text}");
+    }
+
+    #[test]
+    fn input_bad_samples_total_is_labelled_and_never_goes_backwards() {
+        let m = Metrics::new();
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_input_bad_samples_total counter\n"));
+        assert!(!text.contains("manta_input_bad_samples_total{"), "{text}");
+        m.set_input_bad_samples("file", 0);
+        assert!(m
+            .render_prometheus_text()
+            .contains("\nmanta_input_bad_samples_total{source=\"file\"} 0\n"));
+        m.set_input_bad_samples("file", 3);
+        m.set_input_bad_samples("file", 2);
+        let text = m.render_prometheus_text();
+        assert!(
+            text.contains("\nmanta_input_bad_samples_total{source=\"file\"} 3\n"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -2593,6 +2949,61 @@ mod tests {
         assert!(text.contains("manta_uplink_connected 1"));
     }
 
+    /// MAN-248: ceiling suppression is its own counter -- rendered as an
+    /// aggregate family and a per-target family -- and never leaks into
+    /// the combined `suppressed` counters, whose HELP text promises
+    /// "dry-run or spot_types" only.
+    #[test]
+    fn ceiling_suppression_renders_and_stays_out_of_the_combined_suppressed_counter() {
+        let m = Metrics::new();
+        let a = m.register_uplink_target("a.example:7000".to_string(), true);
+        let b = m.register_uplink_target("b.example:7000".to_string(), true);
+
+        a.record_ceiling_suppressed();
+        a.record_ceiling_suppressed();
+        a.record_ceiling_suppressed();
+        b.record_ceiling_suppressed();
+        b.record_ceiling_suppressed();
+        // Ordinary suppression (dry-run / spot_types) on `a` must not move
+        // its ceiling counter, and vice versa.
+        a.record_suppressed();
+
+        assert_eq!(m.uplink_ceiling_suppressed_total(), 5);
+        assert_eq!(a.ceiling_suppressed_total(), 3);
+        assert_eq!(b.ceiling_suppressed_total(), 2);
+        assert_eq!(
+            a.suppressed_total(),
+            1,
+            "ordinary suppression must not move the ceiling counter"
+        );
+
+        let text = m.render_prometheus_text();
+        assert!(text.contains("manta_uplink_ceiling_suppressed_total 5\n"));
+        assert!(text.contains(
+            r#"manta_uplink_target_ceiling_suppressed_total{target="a.example:7000"} 3"#
+        ));
+        assert!(text.contains(
+            r#"manta_uplink_target_ceiling_suppressed_total{target="b.example:7000"} 2"#
+        ));
+        // The combined counters are unchanged by ceiling records: the
+        // aggregate is 1 (only `a`'s ordinary record), never 6.
+        assert!(text.contains("manta_uplink_suppressed_total 1\n"));
+        assert!(text.contains(r#"manta_uplink_target_suppressed_total{target="a.example:7000"} 1"#));
+
+        // A target that only ever records ordinary suppression renders 0
+        // in the ceiling families rather than inheriting `suppressed`.
+        let only_ordinary = Metrics::new();
+        let t = only_ordinary.register_uplink_target("c.example:7000".to_string(), true);
+        t.record_suppressed();
+        t.record_suppressed();
+        let text = only_ordinary.render_prometheus_text();
+        assert!(text.contains("manta_uplink_ceiling_suppressed_total 0\n"));
+        assert!(text.contains(
+            r#"manta_uplink_target_ceiling_suppressed_total{target="c.example:7000"} 0"#
+        ));
+        assert_eq!(t.ceiling_suppressed_total(), 0);
+    }
+
     #[test]
     fn renders_per_target_uplink_families_with_labels() {
         let m = Metrics::new();
@@ -2866,6 +3277,12 @@ mod tests {
                 sum: 899.0,
             },
         }
+    }
+
+    #[test]
+    fn repetition_help_describes_pattern_tiers_and_minimal_level() {
+        let text = Metrics::new().render_prometheus_text();
+        assert!(text.contains("A candidate needs 2, 3 or 5 to spot by its callsign-pattern tier (2 for every call at validation_level minimal)."));
     }
 
     #[test]
@@ -3248,6 +3665,7 @@ mod tests {
     fn spot_grade(band: &'static str, grade: Grade, offset: Option<i64>) -> SpotGrade {
         SpotGrade {
             kind: "spotGrade",
+            seq: None,
             spot_id: "W3XYZ-1:1:1:1:W1AW".to_string(),
             call: "W1AW".to_string(),
             band,
@@ -3627,5 +4045,181 @@ mod tests {
         assert!(text.contains("# HELP manta_spots_history_truncated_total Spots dropped from the sh/dx history at its 10000-spot ceiling while still inside [server].history_minutes. Non-zero means sh/dx reaches back less than the configured window.\n"));
         assert!(text.contains("# TYPE manta_spots_history_truncated_total counter\n"));
         assert!(text.contains("manta_spots_history_truncated_total 5\n"));
+    }
+    #[test]
+    fn json_stream_history_truncated_is_counted_and_rendered() {
+        let m = Metrics::new();
+        m.record_json_stream_history_truncated(2);
+        m.record_json_stream_history_truncated(3);
+        assert_eq!(m.json_stream_history_truncated_total(), 5);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# HELP manta_json_stream_history_truncated_total"));
+        assert!(text.contains("# TYPE manta_json_stream_history_truncated_total counter"));
+        assert!(text.contains("manta_json_stream_history_truncated_total 5"));
+    }
+    #[test]
+    fn json_stream_resume_metrics_render_every_outcome_at_zero_and_count() {
+        let m = Metrics::new();
+        for name in ["resumed", "gap", "reset", "refused", "invalid"] {
+            assert!(m.render_prometheus_text().contains(&format!(
+                "manta_json_stream_resumes_total{{outcome=\"{name}\"}} 0\n"
+            )));
+        }
+        m.record_json_stream_resume(ResumeMetricOutcome::Gap);
+        m.record_json_stream_replay_abandoned(3);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("manta_json_stream_resumes_total{outcome=\"gap\"} 1\n"));
+        assert!(text.contains("manta_json_stream_replay_abandoned_total 3\n"));
+    }
+
+    // MAN-316: reference-list families.
+
+    const SHA_A: &str = "e9ff91a3c3ab28c5f7dbcffb4280944a84645ed53d41cb4c68a41f132ee13fd1";
+    const SHA_B: &str = "75aaca91f62bd010b32d3e98193e9abe2330a640d9edf9a0a58b4d628ef1aa6c";
+
+    /// The sample lines of one family, in render order.
+    fn samples<'a>(text: &'a str, family: &str) -> Vec<&'a str> {
+        text.lines()
+            .filter(|l| l.starts_with(&format!("{family}{{")))
+            .collect()
+    }
+
+    #[test]
+    fn renders_list_info_per_list() {
+        let m = Metrics::new();
+        m.set_list_in_use("scp", SHA_B, ListOrigin::Bundled);
+        m.set_list_in_use("cty", SHA_A, ListOrigin::Cache);
+        let text = m.render_prometheus_text();
+        assert_eq!(
+            samples(&text, "manta_list_info"),
+            [
+                format!(r#"manta_list_info{{list="cty",sha256="{SHA_A}",origin="cache"}} 1"#),
+                format!(r#"manta_list_info{{list="scp",sha256="{SHA_B}",origin="bundled"}} 1"#),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_info_replaces_the_series_on_swap() {
+        let m = Metrics::new();
+        m.set_list_in_use("cty", SHA_A, ListOrigin::Bundled);
+        m.set_list_in_use("cty", SHA_B, ListOrigin::Download);
+        let text = m.render_prometheus_text();
+        assert_eq!(
+            samples(&text, "manta_list_info"),
+            [format!(
+                r#"manta_list_info{{list="cty",sha256="{SHA_B}",origin="download"}} 1"#
+            )]
+        );
+        assert!(!text.contains(SHA_A), "{text}");
+    }
+
+    #[test]
+    fn renders_list_refresh_outcomes_from_zero_once_enabled() {
+        let m = Metrics::new();
+        m.enable_list_refresh("scp");
+        assert_eq!(
+            samples(&m.render_prometheus_text(), "manta_list_refresh_total"),
+            [
+                r#"manta_list_refresh_total{list="scp",outcome="updated"} 0"#,
+                r#"manta_list_refresh_total{list="scp",outcome="unchanged"} 0"#,
+                r#"manta_list_refresh_total{list="scp",outcome="failed"} 0"#,
+            ]
+        );
+
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_791_795_600);
+        m.record_list_refresh("scp", ListRefreshOutcome::Failed, at);
+        m.record_list_refresh("scp", ListRefreshOutcome::Failed, at);
+        m.record_list_refresh("scp", ListRefreshOutcome::Unchanged, at);
+        m.enable_list_refresh("scp"); // idempotent: keeps the counts
+        m.enable_list_refresh("cty");
+        m.record_list_refresh("cty", ListRefreshOutcome::Updated, at);
+        assert_eq!(
+            samples(&m.render_prometheus_text(), "manta_list_refresh_total"),
+            [
+                r#"manta_list_refresh_total{list="cty",outcome="updated"} 1"#,
+                r#"manta_list_refresh_total{list="cty",outcome="unchanged"} 0"#,
+                r#"manta_list_refresh_total{list="cty",outcome="failed"} 0"#,
+                r#"manta_list_refresh_total{list="scp",outcome="updated"} 0"#,
+                r#"manta_list_refresh_total{list="scp",outcome="unchanged"} 1"#,
+                r#"manta_list_refresh_total{list="scp",outcome="failed"} 2"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn list_refresh_families_render_help_and_type_without_samples_when_unused() {
+        let m = Metrics::new();
+        // A list in use but not refreshed (refresh_lists off) has an info
+        // series and nothing else.
+        m.set_list_in_use("cty", SHA_A, ListOrigin::Bundled);
+        let text = m.render_prometheus_text();
+        for (family, kind, help) in [
+            (
+                "manta_list_info",
+                "gauge",
+                "The reference list in use: list (cty or scp), the SHA-256 of its bytes, and its origin (bundled, file, cache or download). Always 1.",
+            ),
+            (
+                "manta_list_refresh_total",
+                "counter",
+                "Reference-list download attempts by outcome: updated, unchanged or failed.",
+            ),
+            (
+                "manta_list_last_success_timestamp_seconds",
+                "gauge",
+                "Unix time the reference list in use was last confirmed current with its download URL.",
+            ),
+        ] {
+            assert!(text.contains(&format!("# HELP {family} {help}\n")), "{family}");
+            assert!(text.contains(&format!("# TYPE {family} {kind}\n")), "{family}");
+        }
+        assert!(samples(&text, "manta_list_refresh_total").is_empty());
+        assert!(samples(&text, "manta_list_last_success_timestamp_seconds").is_empty());
+
+        let empty = Metrics::new().render_prometheus_text();
+        assert!(empty.contains("# TYPE manta_list_info gauge\n"));
+        assert!(samples(&empty, "manta_list_info").is_empty());
+    }
+
+    #[test]
+    fn renders_last_success_timestamp_only_after_a_success() {
+        let m = Metrics::new();
+        m.enable_list_refresh("cty");
+        m.enable_list_refresh("scp");
+        let failed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_791_700_000);
+        m.record_list_refresh("cty", ListRefreshOutcome::Failed, failed_at);
+        let text = m.render_prometheus_text();
+        assert!(
+            samples(&text, "manta_list_last_success_timestamp_seconds").is_empty(),
+            "{text}"
+        );
+
+        // Rendered in whole seconds: the sub-second part is truncated.
+        let ok_at = SystemTime::UNIX_EPOCH + Duration::from_millis(1_791_795_600_750);
+        m.record_list_refresh("cty", ListRefreshOutcome::Updated, ok_at);
+        // The cache's checked_at at startup counts as a confirmation too.
+        let checked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_791_600_000);
+        m.set_list_confirmed_at("scp", checked_at);
+        assert_eq!(
+            samples(
+                &m.render_prometheus_text(),
+                "manta_list_last_success_timestamp_seconds"
+            ),
+            [
+                r#"manta_list_last_success_timestamp_seconds{list="cty"} 1791795600"#,
+                r#"manta_list_last_success_timestamp_seconds{list="scp"} 1791600000"#,
+            ]
+        );
+
+        // A later failure leaves the last success alone.
+        m.record_list_refresh(
+            "cty",
+            ListRefreshOutcome::Failed,
+            ok_at + Duration::from_secs(60),
+        );
+        assert!(m
+            .render_prometheus_text()
+            .contains(r#"manta_list_last_success_timestamp_seconds{list="cty"} 1791795600"#));
     }
 }
