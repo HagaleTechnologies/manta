@@ -853,6 +853,10 @@ mod tests {
     fn stash_takes_at_most_one_batch_per_call() {
         let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
         rx.set_nonblocking(true).unwrap();
+        // The receive buffer the real socket asks for: the kernel default
+        // can be too small to queue DRAIN_BATCH + 20 datagrams (measured:
+        // only 222 fit by default in a Linux 6.8 container).
+        let _ = socket2::SockRef::from(&rx).set_recv_buffer_size(RCVBUF_BYTES);
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
         for _ in 0..DRAIN_BATCH + 20 {
             tx.send_to(&[1; 8], rx.local_addr().unwrap()).unwrap();
