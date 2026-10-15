@@ -314,16 +314,6 @@ by a 20-run merge-queue watch with rollback triggers;
 `test-hpsdr (windows-latest)` stays advisory. See
 docs/DECISIONS/2026-10-15-man371-windows-required-check.md.
 
-<<<<<<< HEAD
-MAN-236: `soak_with_metrics` (the `man19-soak` harness and
-`examples/close_counts.rs`) wraps `listen_with_observers`, the loop
-`manta run` executes, instead of a copy. `ListenObservers::track_lifecycle`
-(`TrackLifecycleObserver`, relaxed atomics) publishes the all-entry track
-count and peak, per-reason closes, repetition-gate record total and
-steady-state chunk count. Bounded fixed-seed runs reported identical
-counts before and after. See
-docs/DECISIONS/2026-10-15-man236-soak-metrics-wraps-listen.md.
-=======
 MAN-234: an input sample with a NaN, infinite or larger-than-1e17
 component (`manta-dsp::sample_guard::MAX_SAMPLE_MAGNITUDE`) is replaced
 with `0+0j` and counted in `Channelizer::process` (SPEC §1.3 step 0;
@@ -333,7 +323,15 @@ with `0+0j` and counted in `Channelizer::process` (SPEC §1.3 step 0;
 report line and `manta_input_bad_samples_total{source}`; `manta check`
 still errors on non-finite input. See
 docs/DECISIONS/2026-10-15-man234-bad-input-samples.md.
->>>>>>> 53dfb5de03a0974591033da8a83bc0c07e21dc5c
+
+MAN-236: `soak_with_metrics` (the `man19-soak` harness and
+`examples/close_counts.rs`) wraps `listen_with_observers`, the loop
+`manta run` executes, instead of a copy. `ListenObservers::track_lifecycle`
+(`TrackLifecycleObserver`, relaxed atomics) publishes the all-entry track
+count and peak, per-reason closes, repetition-gate record total and
+steady-state chunk count. Bounded fixed-seed runs reported identical
+counts before and after. See
+docs/DECISIONS/2026-10-15-man236-soak-metrics-wraps-listen.md.
 
 ## Documents (read in this order)
 
