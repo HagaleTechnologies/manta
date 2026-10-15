@@ -16,13 +16,11 @@ pub struct HistEntry {
     pub glyph: Option<Glyph>,
     pub sample_ts: u64,
     pub born_hop: u64,
-<<<<<<< HEAD
     /// MAN-189: input sample counter at the first hop of this entry's
     /// character -- the anchor its first mark began at. A word boundary
     /// carries the character it follows. `commit::Frontier` compares it
     /// with what has already been emitted.
     pub char_start_ts: u64,
-=======
     /// Segment that closed this history entry. `Some(CGap)` on a
     /// glyph-carrying entry, `Some(WGap)`/`Some(Silence)` on both entries
     /// those transitions append, `None` for an entry with no closing
@@ -32,7 +30,6 @@ pub struct HistEntry {
     /// §4.7 -- a committed word boundary whose closing segment was
     /// `Silence` is the decoder's second reseeding trigger.
     pub closing_segment: Option<SegType>,
->>>>>>> 3805f78bcb1b166f1eba98448d62db98addb201c
 }
 
 #[derive(Clone, Debug)]
@@ -131,22 +128,16 @@ impl Token {
                     glyph: Some(g),
                     sample_ts: seg_start_ts,
                     born_hop: end_hop,
-<<<<<<< HEAD
                     char_start_ts,
-=======
                     closing_segment: Some(seg),
->>>>>>> 3805f78bcb1b166f1eba98448d62db98addb201c
                 });
                 if seg != SegType::CGap {
                     hist.push(HistEntry {
                         glyph: None,
                         sample_ts: seg_start_ts,
                         born_hop: end_hop,
-<<<<<<< HEAD
                         char_start_ts,
-=======
                         closing_segment: Some(seg),
->>>>>>> 3805f78bcb1b166f1eba98448d62db98addb201c
                     });
                 }
                 (MorseTree::ROOT, Phase::AfterSpace)

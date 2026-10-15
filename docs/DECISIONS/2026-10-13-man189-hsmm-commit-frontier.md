@@ -11,20 +11,24 @@ Each history entry (`token::HistEntry`) also records `char_start_ts`, the
 input sample counter at the anchor where its character's first mark
 began; a word boundary carries the character it follows. A
 `commit::Frontier` holds the latest emitted `sample_ts` (`last_ts`), the
-latest emitted word-boundary `sample_ts` (`last_word_ts`) and the latest
-emitted character's `char_start_ts` (`last_char_start`):
+latest emitted word-boundary `sample_ts` (`last_word_ts`) and the glyph
+of the latest emitted character (`last_glyph`):
 
 - **Character entry:** decided if `char_start_ts <= last_ts`.
 - **Word boundary entry:** decided if `char_start_ts <= last_word_ts`,
   meaning a boundary was already emitted at or after its character began,
   *or* if `sample_ts < last_ts`, meaning its gap began before something
-  already emitted, *or* if `char_start_ts <= last_ts` and
-  `char_start_ts != last_char_start`, meaning its character is decided
-  but is not the character last emitted, so the boundary follows a
-  contradicting segmentation.
+  already emitted. A boundary whose character was stripped as
+  *contradicting* the emitted glyph is stripped together with that
+  character (`Frontier::strip_decided`): when a decided character entry
+  carries a different glyph than `last_glyph` and began at another start
+  than the latest emitted character's own, the word boundary immediately
+  following it in the same `hist` is removed with it. A boundary whose
+  character *agreed* with the emitted glyph is never removed this way,
+  whatever anchor its first mark sat at.
 - **Emitting:** `last_ts = max(last_ts, sample_ts)`; for a word boundary,
   also `last_word_ts = max(last_word_ts, sample_ts)`; for a character,
-  `last_char_start = char_start_ts`.
+  `last_glyph = glyph`.
 
 `commit::commit()` strips decided entries from the front of every token
 at the top of each loop iteration. `finish()` removes them from every
@@ -50,15 +54,32 @@ Consequences, each pinned by a unit test in `hsmm::commit::tests` or
 6. A second word boundary for the same character is stripped.
 7. A late word boundary behind a later character is stripped.
 8. Output `sample_ts` never decreases within a track.
-9. A word boundary that follows a stripped, contradicting character is
-   stripped too. Otherwise it would emit a space and move `last_ts` past
+9. A word boundary that follows a stripped, *contradicting* character (a
+   different glyph over already-decided time, beginning at another start
+   than the emitted character's own) is stripped together with that
+   character. Otherwise it would emit a space and move `last_ts` past
    the real next character, which would then be dropped as decided.
+   A boundary whose character *agreed* with the emitted glyph keeps its
+   chance to emit, whatever anchor its first mark sat at (consequence 5).
 
-Rule 9's `last_char_start` condition was added in the implement phase
-after self-review found the leak; the plan's rule had only the first two
-word-boundary conditions. Re-measured on the implement build, it removes
-5 spurious word boundaries from V5 (CER 1.1771 → 1.1406) and leaves the
-decoded text of the other 14 vectors unchanged.
+The contradicting-character strip was added in the implement phase after
+self-review found the leak; the plan's rule had only the first two
+word-boundary conditions. Its first cut compared `char_start_ts` values
+(`char_start_ts != last_char_start`), which also stripped the boundary of
+a lineage that *agreed* on the emitted glyph but placed its first mark at
+another anchor -- two words then merged in the decoded text. The validate
+round reproduced exactly that (two failing scenarios, kept as the tests
+`commit_keeps_an_agreeing_lineages_word_boundary_at_another_start` and
+`commit_keeps_a_later_first_mark_variants_word_boundary`), and the rule
+now also compares glyphs: a boundary is stripped with its character only
+when that character's glyph differs from the latest emitted
+character's. The start comparison is kept alongside the glyph test
+because a glyph-only cut re-broke the V8 pileup (the bogus `K2ST` spot
+returned: same-start contradicting stragglers' boundaries, which the
+start comparison alone used to leak, are load-bearing there). On the
+implement build the start-comparison form removed 5 word boundaries
+from V5 (CER 1.1771 → 1.1406) and left the decoded text of the other 14
+vectors unchanged.
 
 ## Mechanism and evidence
 
@@ -108,7 +129,7 @@ the track nearest each expected frequency):
 | vector | CER main | CER frontier | chars main→frontier |
 |---|---|---|---|
 | V1, V2, V3, V4, V6, VR1, VR2, VR3, VR4, VR6b, VR7 | unchanged | unchanged (identical text) | unchanged |
-| V5 | 1.4062 | 1.1771 (1.1406 with rule 9) | 237→205 |
+| V5 | 1.4062 | 1.1771 (1.1406 with the start-comparison form of rule 9) | 237→205 |
 | VR5 (sig 0 / sig 1) | 0.1582 / 0.7228 | 0.1497 / 0.6966 | 308→300 |
 | VR6a | 0.0065 | 0.0032 | 248→247 |
 | VR8 | 0.6687 | 0.5604 | 316→289 |
