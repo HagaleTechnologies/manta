@@ -421,13 +421,14 @@ use std::sync::Arc;
 use crate::quality::DecodeQualityObserver;
 
 /// `(amplitude, raw_power, spectral_ref_power, sample_ts, current_snr_db,
-/// crash)` -- one `decoder_input`/refiner-backlog entry (MAN-194;
+/// freq_hz, crash)` -- one `decoder_input`/refiner-backlog entry (MAN-194;
 /// `current_snr_db` added for MAN-102 compatibility -- see `decoder_input`'s
-/// doc comment; `crash` is MAN-312's hold flag, captured per entry the same
-/// way, see `Track::queue_input`). Named to keep
+/// doc comment; `freq_hz` is MAN-211's centroid of the hop at `sample_ts`,
+/// captured per entry the same way; `crash` is MAN-312's hold flag, also
+/// captured per entry, see `Track::queue_input`). Named to keep
 /// `SmallVec<[DecoderInputEntry; 1]>` under clippy's `type_complexity`
 /// threshold, which a bare tuple-in-a-SmallVec this wide trips.
-type DecoderInputEntry = (f32, f32, Option<f32>, u64, f32, bool);
+type DecoderInputEntry = (f32, f32, Option<f32>, u64, f32, f64, bool);
 
 /// One tracked signal. Owns channels `{round(center)-1, round(center),
 /// round(center)+1}` per SPEC §2.5; `center` is a live, per-hop EMA of the
@@ -469,7 +470,7 @@ pub(crate) struct Track {
     /// promotion (SPEC §2.4/§5); `None` before promotion.
     decoder: Option<TrackDecoder>,
     /// `(amplitude, raw_power, spectral_ref_power, sample_ts,
-    /// current_snr_db_at_that_hop)` queued this hop-batch by `step_hop`,
+    /// current_snr_db_at_that_hop, freq_hz)` queued this hop-batch by `step_hop`,
     /// drained once per `process_hops` call by `drain_pool` (ARCHITECTURE
     /// §10's decoder pool). `raw_power` is kept separate from `amplitude`
     /// (rather than derived as `amplitude * amplitude`) so the noise
@@ -498,7 +499,10 @@ pub(crate) struct Track {
     /// resetting only when `TrackMeta` actually emits left the window
     /// unbounded while `!Demod::running()`, so the reset now keys off the
     /// boundary itself, which fires every interval regardless.)
-    pending: Vec<(f32, f32, Option<f32>, u64, f32)>,
+    /// `freq_hz` is the track's centroid at the hop the entry describes,
+    /// set on the decoder before that entry's `push_hop` so `TrackMeta`
+    /// pairs it with the same hop's `sample_ts` (MAN-211).
+    pending: Vec<(f32, f32, Option<f32>, u64, f32, f64)>,
     /// Set by `process_hops` once `drain_pool` has actually produced a
     /// `DecoderEvent` for this track. Distinct from `decoder.is_some()`:
     /// a track promoted and then merged/evicted within the *same*
@@ -534,7 +538,8 @@ pub(crate) struct Track {
     /// Reset to 0 alongside `refiner.reset()`.
     refiner_hops_since_reset: u64,
     /// MAN-194: buffered-but-not-yet-reported `(raw_amp, raw_power,
-    /// spectral_ref_power, sample_ts)` entries, oldest first, one pushed per
+    /// spectral_ref_power, sample_ts, current_snr_db, freq_hz, crash)`
+    /// entries, oldest first, one pushed per
     /// hop fed to `refiner`. Holds at most `GROUP_DELAY_HOPS` entries at any
     /// instant once steady state is reached (one is popped the same hop one
     /// is pushed, from `refiner_hops_since_reset > GROUP_DELAY_HOPS` on).
@@ -731,7 +736,9 @@ impl Track {
     /// not just on a reset: near a 375-hop `TrackMeta` reporting boundary,
     /// a handful of hops' true SNR could be attributed to the wrong side of
     /// the window. Capturing `snr_db` at push time (like `spectral_ref_power`
-    /// above) closes this exactly the same way.
+    /// above) closes this exactly the same way. `freq_hz` (MAN-211) is
+    /// captured the same way, so a delayed or reset-drained entry reports
+    /// its own hop's centroid in `TrackMeta`, not the caller's current one.
     // MAN-312: `crash` is captured per entry, like `spectral_ref_power`
     // and `snr_db` above, so it cannot be applied after the fact.
     #[allow(clippy::too_many_arguments)]
@@ -743,6 +750,7 @@ impl Track {
         refine_bw_hz: f32,
         spectral_ref_power: Option<f32>,
         snr_db: f32,
+        freq_hz: f64,
         crash: bool,
     ) -> SmallVec<[DecoderInputEntry; 1]> {
         let raw_power = hop.power[k];
@@ -753,6 +761,7 @@ impl Track {
                 spectral_ref_power,
                 sample_ts,
                 snr_db,
+                freq_hz,
                 crash
             )];
         }
@@ -794,6 +803,7 @@ impl Track {
             spectral_ref_power,
             sample_ts,
             snr_db,
+            freq_hz,
             crash,
         ));
         debug_assert!(
@@ -804,11 +814,18 @@ impl Track {
 
         let d = GROUP_DELAY_HOPS as u64;
         if n > d {
-            let (due_raw_amp, due_raw_power, due_spectral_ref_power, due_ts, due_snr_db, due_crash) =
-                self.refiner_backlog.pop_front().expect(
-                    "backlog must hold an entry once n > GROUP_DELAY_HOPS: exactly one is \
+            let (
+                due_raw_amp,
+                due_raw_power,
+                due_spectral_ref_power,
+                due_ts,
+                due_snr_db,
+                due_freq_hz,
+                due_crash,
+            ) = self.refiner_backlog.pop_front().expect(
+                "backlog must hold an entry once n > GROUP_DELAY_HOPS: exactly one is \
                      pushed per call and none are popped until this threshold",
-                );
+            );
             let full_history_hops = 2 * d + 1; // == TAPS
             let amp = if n >= full_history_hops {
                 refined_amp
@@ -821,6 +838,7 @@ impl Track {
                 due_spectral_ref_power,
                 due_ts,
                 due_snr_db,
+                due_freq_hz,
                 due_crash,
             ));
         }
@@ -828,7 +846,8 @@ impl Track {
     }
 
     /// MAN-194: pop every buffered-but-undelivered `(raw_amp, raw_power,
-    /// spectral_ref_power, sample_ts)` entry, in order, at raw quality --
+    /// spectral_ref_power, sample_ts, current_snr_db, freq_hz, crash)`
+    /// entry, in order, at raw quality --
     /// used both when `decoder_input` detects a channel reset (folded
     /// transparently into its own returned `SmallVec`, above) and by
     /// `TrackManager` at every other point this track's refiner stops
@@ -843,8 +862,9 @@ impl Track {
     /// MAN-194: `TrackManager`-facing wrapper around `drain_refiner_backlog`
     /// that appends every drained entry straight into `pending`. Takes no
     /// parameters: each backlog entry already carries its OWN
-    /// `spectral_ref_power` AND `current_snr_db`, both captured by
-    /// `decoder_input` at the instant that hop was actually observed (Codex
+    /// `spectral_ref_power`, `current_snr_db` and `freq_hz` (MAN-211), all
+    /// captured by `decoder_input` at the instant that hop was actually
+    /// observed (Codex
     /// review, PR #183: an earlier version of this fix applied `snr_db`
     /// uniformly at drain/dequeue time instead of capturing it per-entry --
     /// exactly the bug already fixed for `spectral_ref_power`, just not yet
@@ -872,7 +892,7 @@ impl Track {
     /// would otherwise read that energy as a mark. The pre-onset value,
     /// not zero, so a crash inside a mark does not split it into two.
     fn queue_input(&mut self, e: DecoderInputEntry) {
-        let (mut amp, mut raw_power, spectral_ref_power, sample_ts, snr_db, crash) = e;
+        let (mut amp, mut raw_power, spectral_ref_power, sample_ts, snr_db, freq_hz, crash) = e;
         if crash {
             if let Some(&(a, p)) = self.clean_hist.front() {
                 amp = a;
@@ -884,8 +904,14 @@ impl Track {
                 self.clean_hist.pop_front();
             }
         }
-        self.pending
-            .push((amp, raw_power, spectral_ref_power, sample_ts, snr_db));
+        self.pending.push((
+            amp,
+            raw_power,
+            spectral_ref_power,
+            sample_ts,
+            snr_db,
+            freq_hz,
+        ));
     }
 
     /// Drain this track's queued `pending` samples through its decoder,
@@ -913,9 +939,10 @@ impl Track {
         // (review round 2, finding 2: keyed to `hop_count() %
         // META_INTERVAL_HOPS == 0`, not to `TrackMeta` actually emitting).
         let mut events: Vec<DecoderEvent> = Vec::new();
-        for (amp, raw_power, spectral_ref_power, ts, snr_db) in pending {
+        for (amp, raw_power, spectral_ref_power, ts, snr_db, freq_hz) in pending {
             self.snr_peak_db = self.snr_peak_db.max(snr_db);
             decoder.set_snr_2500_db(self.snr_peak_db - manta_decode::SNR_BW_CORR_DB);
+            decoder.set_freq_hz(freq_hz);
             let hop_events = decoder.push_hop(amp, raw_power, spectral_ref_power, ts);
             if decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0 {
                 self.snr_peak_db = f32::NEG_INFINITY;
@@ -955,9 +982,10 @@ impl Track {
         // (review round 2, finding 2: keyed to `hop_count() %
         // META_INTERVAL_HOPS == 0`, not to `TrackMeta` actually emitting).
         let mut events: Vec<DecoderEvent> = Vec::new();
-        for (amp, raw_power, spectral_ref_power, ts, snr_db) in pending {
+        for (amp, raw_power, spectral_ref_power, ts, snr_db, freq_hz) in pending {
             self.snr_peak_db = self.snr_peak_db.max(snr_db);
             decoder.set_snr_2500_db(self.snr_peak_db - manta_decode::SNR_BW_CORR_DB);
+            decoder.set_freq_hz(freq_hz);
             let hop_events = decoder.push_hop(amp, raw_power, spectral_ref_power, ts);
             if decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0 {
                 self.snr_peak_db = f32::NEG_INFINITY;
@@ -1692,20 +1720,21 @@ impl TrackManager {
                     // CANDIDATE-period update_centroid calls above), not the
                     // pipeline's raw center_freq_hz -- every track otherwise
                     // reports the same wrong frequency regardless of which
-                    // channel it actually lives on.
-                    // Computed before `track.decoder` is touched: `freq_hz`
-                    // borrows all of `track`, which would conflict with a
-                    // simultaneous `track.decoder.as_mut()` borrow.
+                    // channel it actually lives on. MAN-211: captured into
+                    // this hop's queued entry (`decoder_input` below), not
+                    // written to the decoder here: the drain sets it before
+                    // this entry's own `push_hop`, so a `TrackMeta` pairs it
+                    // with this hop's `sample_ts`.
                     let freq_hz = track.freq_hz(self.center_freq_hz, self.channel_spacing_hz, n);
                     track.decoder = Some(TrackDecoder::new(id, self.decode_cfg.clone()));
-                    track.decoder.as_mut().unwrap().set_freq_hz(freq_hz);
                     let spectral_ref_power = compute_spectral_ref_power
                         .then(|| Self::spectral_ref_power(&self.floor, track.center))
                         .flatten();
                     // MAN-102: `current_snr_db` is passed INTO decoder_input
                     // and captured per-entry in the backlog (Codex review,
                     // PR #183 -- see decoder_input's doc comment), not
-                    // re-applied uniformly here after the fact.
+                    // re-applied uniformly here after the fact. MAN-211:
+                    // `freq_hz` likewise.
                     let burst = track.decoder_input(
                         k,
                         hop,
@@ -1713,6 +1742,7 @@ impl TrackManager {
                         refine_bw_hz,
                         spectral_ref_power,
                         track.current_snr_db,
+                        freq_hz,
                         hold,
                     );
                     for e in burst {
@@ -1746,23 +1776,21 @@ impl TrackManager {
                     // so the continuous feed keeps the decoder's timeline
                     // hole-free. SPEC §3.3/§4.1 timing depends on this.
                     if track.decoder.is_some() {
-                        // Keep TrackMeta.freq_hz live (SPEC §5's 1 Hz
-                        // cadence reports the *current* centroid, not a
-                        // frozen promotion-time snapshot) -- cheap, a plain
-                        // field write, no per-hop allocation. Computed
-                        // before the mutable `decoder` borrow, same reason
-                        // as the `Promoted` arm above.
+                        // TrackMeta.freq_hz tracks the centroid (SPEC §5's
+                        // 1 Hz cadence reports the *current* centroid, not a
+                        // frozen promotion-time snapshot). MAN-211: this
+                        // hop's centroid is captured into this hop's queued
+                        // entry, so the report pairs it with this hop's
+                        // `sample_ts` however long the entry waits in
+                        // `pending` or the refiner backlog.
                         let freq_hz =
                             track.freq_hz(self.center_freq_hz, self.channel_spacing_hz, n);
-                        if let Some(decoder) = track.decoder.as_mut() {
-                            decoder.set_freq_hz(freq_hz);
-                        }
                         let spectral_ref_power = compute_spectral_ref_power
                             .then(|| Self::spectral_ref_power(&self.floor, track.center))
                             .flatten();
                         // MAN-102 (see the Promoted arm above for the full
-                        // rationale): current_snr_db passed INTO
-                        // decoder_input, captured per-entry.
+                        // rationale): current_snr_db and (MAN-211) freq_hz
+                        // passed INTO decoder_input, captured per-entry.
                         let burst = track.decoder_input(
                             k,
                             hop,
@@ -1770,6 +1798,7 @@ impl TrackManager {
                             refine_bw_hz,
                             spectral_ref_power,
                             track.current_snr_db,
+                            freq_hz,
                             hold,
                         );
                         for e in burst {
@@ -2344,7 +2373,7 @@ impl TrackManager {
             .par_bridge()
             .flat_map_iter(|(decoder, peak, garbles_published, pending)| {
                 let mut out = Vec::new();
-                for (amp, raw_power, spectral_ref_power, ts, snr_db) in pending {
+                for (amp, raw_power, spectral_ref_power, ts, snr_db, freq_hz) in pending {
                     // MAN-102: SPEC §2.3's floor-based estimate, in the
                     // 2500 Hz reference bandwidth, held at its peak since
                     // this track's last SPEC §5 reporting boundary (see
@@ -2366,6 +2395,10 @@ impl TrackManager {
                     // harmless but inert for those two engines.
                     *peak = peak.max(snr_db);
                     decoder.set_snr_2500_db(*peak - manta_decode::SNR_BW_CORR_DB);
+                    // MAN-211: this entry's own hop's centroid, so a
+                    // `TrackMeta` this push emits pairs it with the same
+                    // hop's `sample_ts`.
+                    decoder.set_freq_hz(freq_hz);
                     let hop_events = decoder.push_hop(amp, raw_power, spectral_ref_power, ts);
                     if decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0 {
                         *peak = f32::NEG_INFINITY;
@@ -2688,11 +2721,11 @@ mod tests {
             .chain([1.0f32; 15])
             .collect();
         assert_eq!(keyed.len() as u64, manta_decode::META_INTERVAL_HOPS);
-        let queue = || -> Vec<(f32, f32, Option<f32>, u64, f32)> {
+        let queue = || -> Vec<(f32, f32, Option<f32>, u64, f32, f64)> {
             keyed
                 .iter()
                 .enumerate()
-                .map(|(i, &a)| (a, a * a, None, i as u64 * 256, 20.0))
+                .map(|(i, &a)| (a, a * a, None, i as u64 * 256, 20.0, 0.0))
                 .collect()
         };
         let rail_samples = |path: &str| {
@@ -2720,6 +2753,61 @@ mod tests {
         }
     }
 
+    /// MAN-211: each drain path sets the decoder's frequency from the
+    /// entry it is about to push, so the `TrackMeta` a reporting boundary
+    /// emits carries the centroid of the same hop as its `sample_ts`, not
+    /// whatever `step_hop` last saw. Same keyed interval as the rail-ratio
+    /// test above; entry `i` carries `14_000_000 + i` Hz, so the one report
+    /// at the interval's last hop must read `14_000_374` Hz.
+    #[test]
+    fn every_pending_drain_sets_track_meta_freq_from_its_own_entry() {
+        let keyed: Vec<f32> = (0..12)
+            .flat_map(|_| [1.0f32; 15].into_iter().chain([0.01f32; 15]))
+            .chain([1.0f32; 15])
+            .collect();
+        let last = manta_decode::META_INTERVAL_HOPS - 1;
+        assert_eq!(keyed.len() as u64, last + 1);
+        let queue = || -> Vec<(f32, f32, Option<f32>, u64, f32, f64)> {
+            keyed
+                .iter()
+                .enumerate()
+                .map(|(i, &a)| {
+                    let freq_hz = 14_000_000.0 + i as f64;
+                    (a, a * a, None, i as u64 * 256, 20.0, freq_hz)
+                })
+                .collect()
+        };
+        let metas = |path: &str| -> Vec<(u64, f64)> {
+            let mut tm =
+                TrackManager::new(64, 96_000.0, 14_000_000.0, cfg(), DecodeConfig::default());
+            tm.spawn(10);
+            let track = tm.tracks.values_mut().next().unwrap();
+            track.decoder = Some(TrackDecoder::new(track.id, DecodeConfig::default()));
+            track.pending = queue();
+            let events = match path {
+                "drain_pool" => tm.drain_pool(),
+                "finish_decoder" => track.finish_decoder(None),
+                _ => track.finish_decoder_speed_only(None),
+            };
+            events
+                .into_iter()
+                .filter_map(|e| match e {
+                    DecoderEvent::TrackMeta {
+                        sample_ts, freq_hz, ..
+                    } => Some((sample_ts, freq_hz)),
+                    _ => None,
+                })
+                .collect()
+        };
+        for path in ["drain_pool", "finish_decoder", "finish_decoder_speed_only"] {
+            assert_eq!(
+                metas(path),
+                vec![(last * 256, 14_000_000.0 + last as f64)],
+                "{path} must report the frequency of the entry whose sample_ts it reports"
+            );
+        }
+    }
+
     #[test]
     fn decoder_input_bypasses_the_refiner_when_disabled() {
         // MAN-168: refine_bw_hz <= 0.0 (the default) must fall back to the
@@ -2727,9 +2815,9 @@ mod tests {
         // construct a Refiner at all.
         let mut track = Track::new(1, 5, &cfg());
         let h = hop_with_x(0, vec![num_complex::Complex32::new(3.0, 4.0); 8]); // |z|=5
-        let out = track.decoder_input(5, &h, 1000, 0.0, None, 0.0, false);
+        let out = track.decoder_input(5, &h, 1000, 0.0, None, 0.0, 0.0, false);
         let expected: SmallVec<[DecoderInputEntry; 1]> =
-            smallvec![(5.0, 25.0, None, 1000, 0.0, false)];
+            smallvec![(5.0, 25.0, None, 1000, 0.0, 0.0, false)];
         assert_eq!(out, expected);
         assert!(track.refiner.is_none());
     }
@@ -2742,14 +2830,14 @@ mod tests {
         // fractional drift would retrigger the FIR ramp-in transient.
         let mut track = Track::new(1, 5, &cfg());
         let h = hop_with_x(0, vec![num_complex::Complex32::new(1.0, 0.0); 8]);
-        track.decoder_input(5, &h, 0, 30.0, None, 0.0, false);
+        track.decoder_input(5, &h, 0, 30.0, None, 0.0, 0.0, false);
         assert_eq!(track.refiner_hops_since_reset, 1);
         // Drift center within the same integer channel k=5 across several
         // more hops -- the counter must keep GROWING (never cleared by a
         // spurious reset) since `refiner_channel` stays `Some(5)`.
         for i in 1..4u64 {
             track.center += 0.1;
-            track.decoder_input(5, &h, i * 512, 30.0, None, 0.0, false);
+            track.decoder_input(5, &h, i * 512, 30.0, None, 0.0, 0.0, false);
         }
         assert_eq!(
             track.refiner_hops_since_reset, 4,
@@ -2767,11 +2855,11 @@ mod tests {
         // so only `center` crossing a rounding boundary can trigger this.
         let mut track = Track::new(1, 5, &cfg());
         let h = hop_with_x(0, vec![num_complex::Complex32::new(1.0, 0.0); 8]);
-        track.decoder_input(5, &h, 0, 30.0, None, 0.0, false);
-        track.decoder_input(5, &h, 512, 30.0, None, 0.0, false);
+        track.decoder_input(5, &h, 0, 30.0, None, 0.0, 0.0, false);
+        track.decoder_input(5, &h, 512, 30.0, None, 0.0, 0.0, false);
         assert_eq!(track.refiner_hops_since_reset, 2);
         track.center = 6.0; // centroid crosses the rounding boundary 5 -> 6
-        track.decoder_input(5, &h, 1024, 30.0, None, 0.0, false);
+        track.decoder_input(5, &h, 1024, 30.0, None, 0.0, 0.0, false);
         assert_eq!(
             track.refiner_hops_since_reset, 1,
             "a real centroid-channel change must reset the hop counter, not just increment it"
@@ -2791,8 +2879,8 @@ mod tests {
         let mut reported_ts: Vec<u64> = Vec::new();
         for i in 0..(d + 3) {
             let sample_ts = 1000 + i * 512;
-            let out = track.decoder_input(5, &h, sample_ts, 30.0, None, 0.0, false);
-            reported_ts.extend(out.into_iter().map(|(_, _, _, ts, _, _)| ts));
+            let out = track.decoder_input(5, &h, sample_ts, 30.0, None, 0.0, 0.0, false);
+            reported_ts.extend(out.into_iter().map(|(_, _, _, ts, _, _, _)| ts));
         }
         // Hops 0..D-1 report nothing (no valid delayed observation yet);
         // hop D reports hop 0's ts, hop D+1 reports hop 1's ts, hop D+2
@@ -2815,7 +2903,7 @@ mod tests {
         let raw = num_complex::Complex32::new(3.0, 4.0); // |raw| = 5
         let h = hop_with_x(0, vec![raw; 8]);
         for i in 0..GROUP_DELAY_HOPS as u64 {
-            let out = track.decoder_input(5, &h, i * 512, 30.0, None, 0.0, false);
+            let out = track.decoder_input(5, &h, i * 512, 30.0, None, 0.0, 0.0, false);
             assert!(
                 out.is_empty(),
                 "warm-up hop {i} must report nothing, not a same-hop raw substitute"
@@ -2837,10 +2925,10 @@ mod tests {
         let d = GROUP_DELAY_HOPS as u64;
         let full_history_hops = 2 * d + 1;
         for i in 0..full_history_hops {
-            let out = track.decoder_input(5, &h, i * 512, 30.0, None, 0.0, false);
+            let out = track.decoder_input(5, &h, i * 512, 30.0, None, 0.0, 0.0, false);
             if i >= d {
                 let expected: SmallVec<[DecoderInputEntry; 1]> =
-                    smallvec![(5.0, 25.0, None, (i - d) * 512, 0.0, false)];
+                    smallvec![(5.0, 25.0, None, (i - d) * 512, 0.0, 0.0, false)];
                 assert_eq!(
                     out, expected,
                     "hop {i} (before full convergence at {full_history_hops}) must report the \
@@ -2864,22 +2952,23 @@ mod tests {
         let h_quiet = hop_with_x(0, vec![quiet; 8]);
         let d = GROUP_DELAY_HOPS as u64;
 
-        track.decoder_input(5, &h_loud, 0, 30.0, None, 0.0, false); // hop 0: loud
+        track.decoder_input(5, &h_loud, 0, 30.0, None, 0.0, 0.0, false); // hop 0: loud
         for i in 1..d {
-            track.decoder_input(5, &h_quiet, i * 512, 30.0, None, 0.0, false); // hops 1..D-1: quiet
+            track.decoder_input(5, &h_quiet, i * 512, 30.0, None, 0.0, 0.0, false);
+            // hops 1..D-1: quiet
         }
         // Hop D: due observation is hop 0's (loud).
-        let out_d = track.decoder_input(5, &h_quiet, d * 512, 30.0, None, 0.0, false);
+        let out_d = track.decoder_input(5, &h_quiet, d * 512, 30.0, None, 0.0, 0.0, false);
         let expected_d: SmallVec<[DecoderInputEntry; 1]> =
-            smallvec![(5.0, 25.0, None, 0, 0.0, false)];
+            smallvec![(5.0, 25.0, None, 0, 0.0, 0.0, false)];
         assert_eq!(
             out_d, expected_d,
             "hop D must report hop 0's loud observation"
         );
         // Hop D+1: due observation is hop 1's (quiet), not hop 0's replayed.
-        let out_d1 = track.decoder_input(5, &h_quiet, (d + 1) * 512, 30.0, None, 0.0, false);
+        let out_d1 = track.decoder_input(5, &h_quiet, (d + 1) * 512, 30.0, None, 0.0, 0.0, false);
         let expected_d1: SmallVec<[DecoderInputEntry; 1]> =
-            smallvec![(0.05, 0.0025, None, 512, 0.0, false)];
+            smallvec![(0.05, 0.0025, None, 512, 0.0, 0.0, false)];
         assert_eq!(
             out_d1, expected_d1,
             "hop D+1 must report hop 1's OWN quiet observation, not hop 0's loud one replayed"
@@ -2898,11 +2987,11 @@ mod tests {
         let d = GROUP_DELAY_HOPS as u64;
         let full_history_hops = 2 * d + 1;
         for _ in 0..(full_history_hops - 1) {
-            track.decoder_input(5, &h, 0, 30.0, None, 0.0, false);
+            track.decoder_input(5, &h, 0, 30.0, None, 0.0, 0.0, false);
         }
-        let out = track.decoder_input(5, &h, 0, 30.0, None, 0.0, false);
+        let out = track.decoder_input(5, &h, 0, 30.0, None, 0.0, 0.0, false);
         assert_eq!(out.len(), 1);
-        let (amp, _, _, _, _, _) = out[0];
+        let (amp, _, _, _, _, _, _) = out[0];
         assert!(
             amp.is_finite() && amp > 0.0,
             "post-convergence amplitude must be a real, finite, positive refined value"
@@ -2920,7 +3009,7 @@ mod tests {
                                                                                // Feed 3 hops on channel 5 (n=1..3, all < D=5, all buffered, none
                                                                                // popped yet).
         for i in 0..3u64 {
-            let out = track.decoder_input(5, &h, i * 512, 30.0, None, 0.0, false);
+            let out = track.decoder_input(5, &h, i * 512, 30.0, None, 0.0, 0.0, false);
             assert!(out.is_empty());
         }
         // Reassign to channel 6: the reset must drain exactly those 3
@@ -2928,11 +3017,11 @@ mod tests {
         // even though the new channel's own contribution this hop is
         // itself not yet due.
         track.center = 6.0;
-        let out = track.decoder_input(6, &h, 3 * 512, 30.0, None, 0.0, false);
+        let out = track.decoder_input(6, &h, 3 * 512, 30.0, None, 0.0, 0.0, false);
         let expected: SmallVec<[DecoderInputEntry; 1]> = smallvec![
-            (5.0, 25.0, None, 0, 0.0, false),
-            (5.0, 25.0, None, 512, 0.0, false),
-            (5.0, 25.0, None, 1024, 0.0, false)
+            (5.0, 25.0, None, 0, 0.0, 0.0, false),
+            (5.0, 25.0, None, 512, 0.0, 0.0, false),
+            (5.0, 25.0, None, 1024, 0.0, 0.0, false)
         ];
         assert_eq!(
             out, expected,
@@ -2954,9 +3043,10 @@ mod tests {
         let d = GROUP_DELAY_HOPS as u64;
         let mut last_out: SmallVec<[DecoderInputEntry; 1]> = SmallVec::new();
         for i in 0..=d {
-            last_out = track.decoder_input(6, &h, i * 512, 30.0, None, 0.0, false);
+            last_out = track.decoder_input(6, &h, i * 512, 30.0, None, 0.0, 0.0, false);
         }
-        let expected: SmallVec<[DecoderInputEntry; 1]> = smallvec![(5.0, 1.0, None, 0, 0.0, false)];
+        let expected: SmallVec<[DecoderInputEntry; 1]> =
+            smallvec![(5.0, 1.0, None, 0, 0.0, 0.0, false)];
         assert_eq!(
             last_out, expected,
             "raw_power must come from k=6 (power 1), not c=5 (power 25) or any refined value"
@@ -2978,9 +3068,9 @@ mod tests {
             for m in 0..200u64 {
                 let artifacted = raw * odd_channel_sign_correction(m, channel);
                 let h = hop_with_x(m, vec![artifacted; 8]);
-                let out = track.decoder_input(channel, &h, m * 512, 30.0, None, 0.0, false);
+                let out = track.decoder_input(channel, &h, m * 512, 30.0, None, 0.0, 0.0, false);
                 if m > 50 {
-                    for (amp, _, _, _, _, _) in out {
+                    for (amp, _, _, _, _, _, _) in out {
                         sum += amp;
                         count += 1;
                     }
@@ -3011,7 +3101,7 @@ mod tests {
         let d = GROUP_DELAY_HOPS as u64;
         // Steady state: backlog holds exactly d entries once n > d.
         for i in 0..(d + 3) {
-            track.decoder_input(5, &h, i * 512, 30.0, None, 0.0, false);
+            track.decoder_input(5, &h, i * 512, 30.0, None, 0.0, 0.0, false);
         }
         assert_eq!(track.refiner_backlog.len(), d as usize);
         track.drain_refiner_into_pending();
@@ -3576,9 +3666,15 @@ mod tests {
             // exactly the shape Track::decoder_input leaves behind
             // mid-burst (Task 1).
             for (j, &a) in env[split..].iter().enumerate() {
-                track
-                    .refiner_backlog
-                    .push_back((a, a * a, None, (split + j) as u64, 0.0, false));
+                track.refiner_backlog.push_back((
+                    a,
+                    a * a,
+                    None,
+                    (split + j) as u64,
+                    0.0,
+                    0.0,
+                    false,
+                ));
             }
             track.has_emitted = true;
             // Decoder deliberately NOT attached yet -- keeps the
@@ -3691,9 +3787,15 @@ mod tests {
             // `decoder_input` itself (already covered by Task 1's own
             // exhaustive unit tests).
             for (j, &a) in env[split..].iter().enumerate() {
-                track
-                    .refiner_backlog
-                    .push_back((a, a * a, None, (split + j) as u64, 0.0, false));
+                track.refiner_backlog.push_back((
+                    a,
+                    a * a,
+                    None,
+                    (split + j) as u64,
+                    0.0,
+                    0.0,
+                    false,
+                ));
             }
             track.has_emitted = true;
         }
@@ -4300,7 +4402,7 @@ mod tests {
         }
         let id = promoted_id.expect("must promote a track within the loop");
         let track = tm.tracks.get(&id).unwrap();
-        let (_, _, spectral_ref_power, _, _) = *track
+        let (_, _, spectral_ref_power, _, _, _) = *track
             .pending
             .last()
             .expect("the promotion hop itself must have queued a pending entry");
@@ -4372,7 +4474,7 @@ mod tests {
         tm.step_hop(&hop(m2, divergent_power), m2);
 
         let track = tm.tracks.get(&id).unwrap();
-        let (_, _, spectral_ref_power, _, _) = *track
+        let (_, _, spectral_ref_power, _, _, _) = *track
             .pending
             .last()
             .expect("this hop must have queued a pending entry");
@@ -4416,7 +4518,7 @@ mod tests {
         }
         let id = promoted_id.expect("must promote a track within the loop");
         let track = tm.tracks.get(&id).unwrap();
-        let (_, _, spectral_ref_power, _, _) = *track
+        let (_, _, spectral_ref_power, _, _, _) = *track
             .pending
             .last()
             .expect("the promotion hop itself must have queued a pending entry");
@@ -4592,7 +4694,7 @@ mod tests {
             weak.refiner_backlog = rect_envelope_hops("PARIS", 18)
                 .into_iter()
                 .enumerate()
-                .map(|(i, a)| (a, a * a, None, i as u64, 0.0, false))
+                .map(|(i, a)| (a, a * a, None, i as u64, 0.0, 0.0, false))
                 .collect();
             weak.has_emitted = true;
         }
@@ -5121,13 +5223,13 @@ mod tests {
             weak.current_snr_db = 8.0;
             weak.decoder = Some(TrackDecoder::new(weak_id, DecodeConfig::default()));
             // Queued exactly as `step_hop` would (amplitude, raw_power,
-            // spectral_ref_power, sample_ts, current_snr_db) tuples in
-            // `pending` -- NOT fed through push_hop yet.
+            // spectral_ref_power, sample_ts, current_snr_db, freq_hz)
+            // tuples in `pending` -- NOT fed through push_hop yet.
             let snr = weak.current_snr_db;
             weak.pending = rect_envelope_hops("PARIS", 18)
                 .into_iter()
                 .enumerate()
-                .map(|(i, a)| (a, a * a, None, i as u64, snr))
+                .map(|(i, a)| (a, a * a, None, i as u64, snr, 0.0))
                 .collect();
             weak.has_emitted = true;
         }
@@ -5202,7 +5304,7 @@ mod tests {
             weak.refiner_backlog = rect_envelope_hops("PARIS", 18)
                 .into_iter()
                 .enumerate()
-                .map(|(i, a)| (a, a * a, None, i as u64, 0.0, false))
+                .map(|(i, a)| (a, a * a, None, i as u64, 0.0, 0.0, false))
                 .collect();
             weak.has_emitted = true;
         }
@@ -5597,6 +5699,97 @@ mod tests {
             at_4096, at_2048,
             "TrackMeta.snr_2500_db must not depend on the caller's process_hops chunk size"
         );
+    }
+
+    /// MAN-211 (regression): `TrackMeta.freq_hz` must not depend on the
+    /// caller's `process_hops` chunk size either. Before the fix `step_hop`
+    /// wrote each hop's centroid to the decoder live, so a report drained
+    /// from an older queued entry carried the batch's last centroid while
+    /// its `sample_ts` named its own hop: 60 of V1's and V4's 119
+    /// `TrackMeta`s differed between 4096 and 2048 (up to 8.1 Hz), and 59
+    /// of V9's with the refiner on (up to 5.0 Hz). V9 with the refiner also
+    /// covers the MAN-194 `refiner_backlog` delay and a drifting centroid.
+    #[test]
+    fn track_meta_freq_hz_is_invariant_to_process_hops_chunk_size() {
+        use manta_dsp::channelizer::Channelizer;
+        use manta_testkit::vectors::{self, RenderedVector, VectorSpec};
+
+        fn metas_at_chunk_size(
+            spec: &VectorSpec,
+            rendered: &RenderedVector,
+            decode_cfg: &DecodeConfig,
+            chunk_samples: usize,
+        ) -> Vec<(u32, u64, f64)> {
+            let mut ch = Channelizer::new(spec.fs, spec.center_freq_hz).unwrap();
+            let hop_samples = ch.hop() as u64;
+            let mut tm = TrackManager::new(
+                ch.n_channels(),
+                spec.fs,
+                spec.center_freq_hz,
+                DetectorConfig::default(),
+                decode_cfg.clone(),
+            );
+            let mut all_events = Vec::new();
+            for chunk in rendered.samples.chunks(chunk_samples) {
+                let hops = ch.process(chunk);
+                all_events.extend(tm.process_hops(&hops, |m| m * hop_samples));
+            }
+            all_events.extend(tm.finish());
+            all_events
+                .into_iter()
+                .filter_map(|e| match e {
+                    DecoderEvent::TrackMeta {
+                        track_id,
+                        sample_ts,
+                        freq_hz,
+                        ..
+                    } => Some((track_id, sample_ts, freq_hz)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let refined = DecodeConfig {
+            refine_bw_hz: 30.0,
+            ..DecodeConfig::default()
+        };
+        let v1 = vectors::v1();
+        let v4 = vectors::v4();
+        let v9 = vectors::v9();
+        let cases = [
+            (
+                "V1",
+                vectors::render(&v1).unwrap(),
+                &v1,
+                DecodeConfig::default(),
+            ),
+            (
+                "V4",
+                vectors::render(&v4).unwrap(),
+                &v4,
+                DecodeConfig::default(),
+            ),
+            (
+                "V9 refined",
+                vectors::render_v9_drift(&v9).unwrap(),
+                &v9,
+                refined,
+            ),
+        ];
+        for (name, rendered, spec, decode_cfg) in &cases {
+            // 4096 mirrors decode_samples's CHUNK_SAMPLES; 2048 mirrors
+            // listen/soak_metrics's own chunk size.
+            let at_4096 = metas_at_chunk_size(spec, rendered, decode_cfg, 4096);
+            let at_2048 = metas_at_chunk_size(spec, rendered, decode_cfg, 2048);
+            assert!(
+                !at_4096.is_empty(),
+                "{name} should produce at least one TrackMeta"
+            );
+            assert_eq!(
+                at_4096, at_2048,
+                "{name}: TrackMeta.freq_hz must not depend on the caller's process_hops chunk size"
+            );
+        }
     }
 
     /// MAN-19 round 4: `finish()`'s own `TrackClosed` must be ordered
