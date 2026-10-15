@@ -488,8 +488,10 @@ fn load_node_spots(paths: &[PathBuf]) -> Result<(Vec<(String, GradeInput)>, Spot
                 }
                 Err(e) => return Err(malformed(e.to_string())),
             };
-            if value.get("kind").is_some() {
-                stats.grade_records += 1;
+            if let Some(kind) = value.get("kind") {
+                if kind == "spotGrade" {
+                    stats.grade_records += 1;
+                }
                 continue;
             }
             let spot = match parse_spot_message_line(line) {
