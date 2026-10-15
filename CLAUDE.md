@@ -175,6 +175,12 @@ same Rust engine. RBN's real login prompt and the live/offline agreement
 rate are unmeasured. See
 docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
 
+MAN-152: the in-repo `wiki/` is manta's canonical wiki. GitHub's Wiki tab
+is not used; disabling it remains an owner step. The wiki pages'
+`verified` stamps and `manifest.json` are refreshed and pinned by a
+`docs_consistency` test. See
+`docs/DECISIONS/2026-10-13-man152-one-wiki.md`.
+
 MAN-316: `[spot].refresh_lists` (default off) makes `run` from a live
 receiver download `cty.dat` every 7 days and `MASTER.SCP` daily over plain
 HTTP, swap a download that passes the acceptance checks into the
@@ -268,6 +274,10 @@ are bit-identical to before. Aliases folding *inside* the trusted band
 Nyquist promotes nothing, but a stronger one can still mirror in digital
 silence — a pinned residual; deepening the stopband is a decision ticket.
 See docs/DECISIONS/2026-10-14-man196-decimator-trusted-band.md.
+MAN-210: golden vector V51 (V9's drift scene, `refine_bw_hz = 30` via
+`--config`) exercises the narrowband refiner's refine-enabled path
+end-to-end through `manta decode --json` — the evidence any future
+default-on change must keep green.
 
 ## Documents (read in this order)
 

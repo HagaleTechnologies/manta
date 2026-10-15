@@ -1,3 +1,6 @@
 # Byte-exact test fixtures: Windows checkouts must not rewrite them to CRLF
 # (manta grade writes LF; grade_cmd.rs compares byte for byte).
 crates/manta-cli/tests/fixtures/rbn_grade/** text eol=lf
+# Generated file a unit test compares byte for byte against derive_list()'s
+# LF output; a CRLF checkout on Windows would fail that test.
+crates/manta-spot/data/patterns.lst text eol=lf
