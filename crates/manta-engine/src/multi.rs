@@ -248,8 +248,12 @@ impl Drop for OpenedInputs {
 }
 
 /// Opens every input in parallel, each on its own thread named
-/// `manta-input-<name>`, and fails fast if any open fails: the error names
-/// the input, and every other input's thread is joined before returning.
+/// `manta-input-<name>`, and fails fast if any open fails: the first
+/// failure to arrive is returned naming the input, without waiting for
+/// any still-running opener. Every other input's thread is released
+/// before returning -- one that has finished opening is joined; one still
+/// inside its open is detached, because an opener blocked in a connect
+/// cannot be cancelled from outside and must not hold the error hostage.
 pub fn open_inputs(specs: Vec<InputSpec>, stop: Arc<AtomicBool>) -> Result<OpenedInputs> {
     if specs.is_empty() {
         bail!("no input to open");
@@ -260,47 +264,74 @@ pub fn open_inputs(specs: Vec<InputSpec>, stop: Arc<AtomicBool>) -> Result<Opene
             specs.len()
         );
     }
-    let mut pending = Vec::with_capacity(specs.len());
-    let mut ppm = Vec::with_capacity(specs.len());
-    let mut observers = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let (opened_tx, opened_rx) = mpsc::sync_channel::<Result<OpenedInput>>(1);
+    let n = specs.len();
+    let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
+    let mut pending = Vec::with_capacity(n);
+    let mut ppm = Vec::with_capacity(n);
+    let mut observers = Vec::with_capacity(n);
+    // One shared completion channel, so the first failure is observed the
+    // moment it arrives instead of after every earlier opener has returned
+    // (a per-input `recv()` in config order would hide it behind a hung
+    // opener indefinitely).
+    let (done_tx, done_rx) = mpsc::channel::<(usize, Result<OpenedInput>)>();
+    for (index, spec) in specs.into_iter().enumerate() {
         let (go_tx, go_rx) = mpsc::sync_channel::<Go>(1);
+        let done_tx = done_tx.clone();
         let name = spec.name.clone();
         let open = spec.open;
         let stop = stop.clone();
         let handle = std::thread::Builder::new()
             .name(format!("manta-input-{name}"))
-            .spawn(move || input_thread(name, open, opened_tx, go_rx, stop))
+            .spawn(move || input_thread(name, open, index, done_tx, go_rx, stop))
             .map_err(|e| anyhow!("input \"{}\": cannot start its thread: {e}", spec.name))?;
         ppm.push(spec.freq_correction_ppm);
         observers.push(spec.observers);
-        pending.push((spec.name, opened_rx, Parked { go: go_tx, handle }));
+        pending.push(Parked { go: go_tx, handle });
     }
     let mut opened = OpenedInputs {
         inputs: Vec::new(),
         ppm,
         observers,
-        parked: Vec::new(),
+        parked: pending,
         common_rate_hz: 0.0,
     };
+    let mut slots: Vec<Option<OpenedInput>> = (0..n).map(|_| None).collect();
+    let mut reported = vec![false; n];
     let mut first_error = None;
-    for (name, rx, parked) in pending {
-        opened.parked.push(parked);
-        let result = rx
-            .recv()
-            .unwrap_or_else(|_| Err(anyhow!("its thread ended while opening")));
-        match result {
-            Ok(input) => opened.inputs.push(input),
-            Err(e) if first_error.is_none() => {
-                first_error = Some(anyhow!("input \"{name}\" failed to open: {e:#}"));
+    for _ in 0..n {
+        let (index, result) = match done_rx.recv() {
+            Ok(done) => done,
+            Err(_) => {
+                first_error = Some(anyhow!("an input thread ended while opening"));
+                break;
             }
-            Err(_) => {}
+        };
+        reported[index] = true;
+        match result {
+            Ok(input) => slots[index] = Some(input),
+            Err(e) => {
+                first_error = Some(anyhow!("input \"{}\" failed to open: {e:#}", names[index]));
+                break;
+            }
         }
     }
     if let Some(e) = first_error {
-        return Err(e); // `opened`'s drop joins every thread
+        // Release every thread: dropping its go-sender makes one that
+        // finished opening drop its source and exit, so it can be joined.
+        // One still inside `open` is detached -- joining it would wait on
+        // the very opener the first failure must not sit behind.
+        for (reported, p) in reported.into_iter().zip(opened.parked.drain(..)) {
+            drop(p.go);
+            if reported {
+                let _ = p.handle.join();
+            }
+        }
+        return Err(e);
     }
+    opened.inputs = slots
+        .into_iter()
+        .map(|s| s.expect("every input reported its open"))
+        .collect();
     let rates: Vec<f64> = opened.inputs.iter().map(|i| i.sample_rate_hz).collect();
     opened.common_rate_hz = common_rate_hz(&rates)?;
     Ok(opened)
@@ -309,7 +340,8 @@ pub fn open_inputs(specs: Vec<InputSpec>, stop: Arc<AtomicBool>) -> Result<Opene
 fn input_thread(
     name: String,
     open: InputOpener,
-    opened_tx: SyncSender<Result<OpenedInput>>,
+    index: usize,
+    done: mpsc::Sender<(usize, Result<OpenedInput>)>,
     go_rx: Receiver<Go>,
     stop: Arc<AtomicBool>,
 ) {
@@ -318,7 +350,7 @@ fn input_thread(
     let mut src = match opened {
         Ok(src) => src,
         Err(e) => {
-            let _ = opened_tx.send(Err(e));
+            let _ = done.send((index, Err(e)));
             return;
         }
     };
@@ -328,7 +360,7 @@ fn input_thread(
         center_freq_hz: src.center_freq_hz(),
         rf_passband_hz: src.rf_passband_hz(),
     };
-    if opened_tx.send(Ok(info)).is_err() {
+    if done.send((index, Ok(info))).is_err() {
         return;
     }
     let Ok(go) = go_rx.recv() else {

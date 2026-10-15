@@ -986,11 +986,13 @@ pub(crate) fn run_input_front(
     let fs = src.sample_rate();
     let center_freq_hz = src.center_freq_hz();
     let rf_passband_hz = src.rf_passband_hz();
+    let trusted_band_hz = src.trusted_band_hz();
     let mut crash_base: u64 = 0;
     let mut seg = new_segment(
         fs,
         center_freq_hz,
         rf_passband_hz,
+        trusted_band_hz,
         cfg,
         ids,
         ids.first,
@@ -1086,6 +1088,7 @@ pub(crate) fn run_input_front(
                 fs,
                 center_freq_hz,
                 rf_passband_hz,
+                trusted_band_hz,
                 cfg,
                 ids,
                 next_id,

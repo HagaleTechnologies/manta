@@ -513,6 +513,48 @@ fn open_inputs_fails_fast_naming_the_input() {
 }
 
 #[test]
+fn open_inputs_does_not_wait_for_a_hung_opener_after_a_failure() {
+    // Input "a" (first in config order) stays inside its open until the
+    // test releases it; input "b" fails at once. open_inputs must return
+    // b's error without waiting for "a": collecting the results in config
+    // order would hide the failure behind the hung opener indefinitely.
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let specs = vec![
+        InputSpec {
+            name: "a".into(),
+            open: Box::new(move || {
+                // Stands in for an opener blocked in a connect: it returns
+                // only once the test lets it.
+                let _ = release_rx.recv();
+                anyhow::bail!("a was never opened")
+            }),
+            freq_correction_ppm: 0.0,
+            observers: Default::default(),
+        },
+        InputSpec {
+            name: "b".into(),
+            open: Box::new(|| anyhow::bail!("boom")),
+            freq_correction_ppm: 0.0,
+            observers: Default::default(),
+        },
+    ];
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = result_tx.send(open_inputs(specs, Arc::new(AtomicBool::new(false))));
+    });
+    // A bound, so the pre-fix behaviour fails the test instead of
+    // hanging it.
+    let err = match result_rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(Ok(_)) => panic!("an input failed to open, so startup must fail"),
+        Ok(Err(e)) => format!("{e:#}"),
+        Err(_) => panic!("open_inputs still waits for the hung opener \"a\" after \"b\" failed"),
+    };
+    assert_eq!(err, "input \"b\" failed to open: boom");
+    // Let the detached "a" thread finish and exit.
+    drop(release_tx);
+}
+
+#[test]
 fn stop_ends_every_input() {
     let stop = Arc::new(AtomicBool::new(false));
     let opened = open_inputs(
