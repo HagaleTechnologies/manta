@@ -265,7 +265,8 @@ of fs_out, the <= 1 dB crossover): `DecimatingSource::rf_passband_hz`
 narrows `manta check`/SETT/bandState/crash live set to it, `run`/`soak`
 print one startup line, and the track manager's spawn scan vetoes
 channels beyond it (spawns only — MAN-314's lesson), via
-`IqSource::trusted_band_hz` threaded through `listen` (every wrapper
+`IqSource::trusted_band_hz` threaded through `listen` and
+`soak_with_metrics` (every wrapper
 forwards it, doctor's `SampleBoundedSource` included). Rim channels
 232-255 per side at 48 kS/s are conceded by design; non-decimated sources
 are bit-identical to before. Aliases folding *inside* the trusted band

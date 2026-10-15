@@ -24,7 +24,10 @@ crossover of the halfband design — serves both halves of the ticket:
   included) via `set_trusted_band_hz`, which builds a per-channel mask —
   true iff the channel centre lies in `[lo, hi]`, no margin channel. The
   §2.5 spawn conjunction gains `!trusted_vetoes_spawn(k)` in both the
-  `k` and `k+1` slots. **Spawns only**: never a close path, never a
+  `k` and `k+1` slots. `soak_with_metrics` (the crate's other public
+  detector driver, used by `manta-soak-harness`) applies the same band
+  to its manager (round-2 review on PR #300,
+  `soak_with_metrics_applies_the_trusted_band`). **Spawns only**: never a close path, never a
   decode hold — the MAN-314 measured lesson that applying a veto to
   running tracks kills real CW in key-up gaps. A track that already
   exists on a rim channel keeps decoding.
