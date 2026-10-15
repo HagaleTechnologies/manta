@@ -323,6 +323,7 @@ mod tests {
             "v",
             bus.unix_ts_for(s.sample_ts),
             bus.session_nonce(),
+            0,
         );
         assert_eq!(value["spotId"], serde_json::Value::String(msg.id.clone()));
         assert_eq!(value["decision"], "spotted");

@@ -174,7 +174,7 @@ a `DX de` line proves a spot reached the client. Exit telnet with Ctrl+] then
 nc localhost 7301
 ```
 
-It prints one JSON object per new spot. Ctrl+C closes the client.
+It prints a `hello` line, then one JSON object per new spot. Ctrl+C closes the client.
 
 ### No spots yet?
 

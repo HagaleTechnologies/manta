@@ -6332,9 +6332,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                 |spot| {
                     if let Some(server) = &spot_server {
                         let truncated = server.bus.publish(spot.clone());
-                        if truncated > 0 {
-                            server.metrics.record_history_truncated(truncated as u64);
-                        }
+                        server
+                            .metrics
+                            .record_history_truncated(truncated.history_truncated as u64);
+                        server.metrics.record_json_stream_history_truncated(
+                            truncated.stream_history_truncated as u64,
+                        );
                         server.metrics.record_spot(spot);
                         // MAN-136/MAN-45: counted ONCE per spot here, NOT
                         // inside `SpotMessage::from_spot` -- that runs once
@@ -9279,15 +9282,18 @@ mod tests {
                 track_id: 7,
                 sample_ts: 12_345,
             });
-            let mut line = String::new();
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                reader.read_line(&mut line),
-            )
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                    let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    if value.get("kind").is_none() {
+                        break line;
+                    }
+                }
+            })
             .await
             .expect("timed out waiting for a JSON spot")
-            .unwrap();
-            line
         });
 
         let _ = server.shutdown_tx.send(true);

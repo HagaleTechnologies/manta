@@ -107,6 +107,8 @@ pub enum Disagreement {
 #[serde(rename_all = "camelCase")]
 pub struct SpotGrade {
     pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
     pub spot_id: String,
     pub call: String,
     pub band: &'static str,
@@ -392,6 +394,7 @@ fn grade_with(
 
     let mut record = SpotGrade {
         kind: SPOT_GRADE_KIND,
+        seq: None,
         spot_id: spot.spot_id.clone(),
         call: spot.call.clone(),
         band,
@@ -1170,7 +1173,8 @@ mod tests {
     /// `spotGrade` section must list exactly the keys this record sends.
     #[test]
     fn every_grade_field_is_documented_in_spot_schema() {
-        let g = graded(scenario3(), true, &cfg());
+        let mut g = graded(scenario3(), true, &cfg());
+        g.seq = Some(1);
         let line = serde_json::to_string(&g).unwrap();
         let v = serde_json::to_value(&g).unwrap();
         let mut keys: Vec<&str> = v
@@ -1438,5 +1442,13 @@ mod tests {
                 ("matched".to_string(), Grade::Match)
             ]
         );
+    }
+    #[test]
+    fn a_streamed_grade_carries_seq_right_after_kind() {
+        let mut g = graded(scenario3(), true, &cfg());
+        g.seq = Some(9);
+        assert!(serde_json::to_string(&g)
+            .unwrap()
+            .starts_with(r#"{"kind":"spotGrade","seq":9,"spotId":"#));
     }
 }

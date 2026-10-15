@@ -89,6 +89,8 @@ station_callsign = "N0CALL"
 # keeps the 50 newest spots and never more than 10000, so a very busy band
 # can keep less than this. 0 keeps only the 50 newest. 0 to 1440; the
 # history starts empty whenever manta starts.
+# Also bounds WebSocket resume history: spots and grades together,
+# at least the newest 50 records and at most 10,000. Raw TCP never replays.
 #history_minutes = 30
 
 # Limits per client IP address; 0 removes a limit. Raise them when clients
