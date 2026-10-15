@@ -68,10 +68,8 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
-<<<<<<< HEAD
 - MAN-235: `manta doctor --strict` exits 3 when no check failed but the
   verdict is not `DECODING`; without it every verdict still exits 0.
-=======
 - MAN-234: a `bad_samples` field in `decode --json`, `doctor --json` and
   `calibrate --json` (omitted when 0); a `warning: … bad sample(s) …`
   stderr line from `decode`, `calibrate` and `run`/`listen` (at the first
@@ -79,7 +77,6 @@ the git history and `docs/DECISIONS/`.
   sample(s) … replaced with silence` line in the `doctor` and `soak`
   reports; and the `manta_input_bad_samples_total{source}` counter, at 0
   from startup with a `[server]` table.
->>>>>>> 53dfb5de03a0974591033da8a83bc0c07e21dc5c
 - MAN-315: a `TimingUpdate` event per track (each class's mean, variance
   and count, in dits), a top-level `timing` object in `decode --json`, and
   `manta decode --timing` for a `timing (dits, mean ± sd): …` stderr line.

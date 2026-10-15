@@ -283,7 +283,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn doctor_rerun_hint_only_for_a_short_weak_run() {
         use manta_engine::Verdict;
         use std::time::Duration;
@@ -302,6 +301,7 @@ mod tests {
             chars_decoded: 12,
             distinct_chars: 9,
             spots_confirmed: 0,
+            bad_samples: 0,
         };
         assert_eq!(r.verdict(), Verdict::WeakNoDecode);
         let hint = doctor_rerun_hint(&r, ten).expect("a 10 s WEAK_NO_DECODE run hints");
@@ -335,7 +335,9 @@ mod tests {
         };
         assert_eq!(r.verdict(), Verdict::NoSignal);
         assert_eq!(doctor_rerun_hint(&r, ten), None);
-=======
+    }
+
+    #[test]
     fn bad_samples_warning_names_the_input_the_count_and_the_limit() {
         assert_eq!(
             bad_samples_warning("nan30.wav", 1),
@@ -402,7 +404,6 @@ mod tests {
             "panicked: no\ninput: 3 bad samples (NaN, infinite, or larger than 1e17 in \
              magnitude) replaced with silence\n"
         ));
->>>>>>> 53dfb5de03a0974591033da8a83bc0c07e21dc5c
     }
 
     /// MAN-313: a run with confirmed signals but no keyed CW prints its
