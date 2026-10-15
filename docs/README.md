@@ -85,6 +85,7 @@ Then:
 | [m1-w1aw-live-copy.md](RUNBOOKS/m1-w1aw-live-copy.md) | Contributors | Running the M1 manual acceptance: a live W1AW copy. |
 | [m2-pi4-cpu-budget.md](RUNBOOKS/m2-pi4-cpu-budget.md) | Contributors | Running the M2 Raspberry Pi 4 CPU-budget gate. |
 | [aggregator-rbn-capture.md](RUNBOOKS/aggregator-rbn-capture.md) | Contributors | Checking the experimental RBN uplink against a consenting Aggregator operator's recorded RBN traffic (MAN-90). |
+| [real-audio-corpus.md](RUNBOOKS/real-audio-corpus.md) | Contributors | Using, pinning, hosting and scoring the real-audio corpus, and transcribing VP8GEO (MAN-119). |
 | [release.md](RUNBOOKS/release.md) | Maintainers | Cutting a release. |
 | [ci-trust-boundary.md](RUNBOOKS/ci-trust-boundary.md) | Maintainers | Changing CI or the repository's one-time trust settings. |
 | [fleet-checkout-rename.md](RUNBOOKS/fleet-checkout-rename.md) | Maintainers | Moving an old `skimmer` checkout to `manta` (MAN-27). |
