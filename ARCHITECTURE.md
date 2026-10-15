@@ -343,9 +343,17 @@ transmission may never produce again).
    `master.scp` (contest super-check-partial list) *raises* confidence; absence
    only lowers it (new/rare calls must still spot, not just well-known ones).
    `--scp` / `[spot] scp_path` supplies a replacement known-callsign list.
-4. **Repetition requirement**: a callsign must decode ≥ 2 times within 90 s
-   before first spot (CW ops repeat their calls; single decodes are
-   overwhelmingly garble). **Deviates from "the same track" (MAN-166,
+4. **Repetition requirement** (MAN-95): within 90 s a call needs 2 distinct
+   messages for a common pattern, 3 for a listed pattern and 5 for an
+   unlisted pattern. `[spot].validation_level = "minimal"` restores flat 2;
+   the default is `"normal"`. Patterns keep the first 3 characters literal
+   (2 for letter-digit-letter, 4 for digit-letter-letter), then replace
+   later letters with `@` and digits with `#`. Portable suffixes are ignored.
+   The independent `data/patterns.lst` is derived from vendored MASTER.SCP:
+   `+` means at least two calls share that pattern; a plain entry means one.
+   `--patterns` / `[spot].pattern_path` replaces it. Changing `--scp` alone
+   does not change the pattern table. CW operators repeat their calls;
+   single decodes are overwhelmingly garble. **Deviates from "the same track" (MAN-166,
    `docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`)**: a
    real signal's `track_id` changes across a close+reopen, so repetition is
    tracked per frequency instead, with a minimum-gap check across

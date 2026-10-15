@@ -32,12 +32,16 @@ mod doctor_checks;
 mod fmt;
 mod grade_cmd;
 mod health_cmd;
+mod list_cache;
+mod list_http;
+mod list_refresh;
 mod live_state;
 mod logging;
 mod reconnect;
 mod reload;
 mod source_check;
 mod text_lines;
+use list_cache::ListKind;
 use reconnect::ReconnectingSource;
 
 #[derive(Parser)]
@@ -1318,6 +1322,20 @@ struct FilterOpts {
     /// Defaults to the built-in copy, or to `spot.scp_path` from --config.
     #[arg(long)]
     scp: Option<PathBuf>,
+    /// Use exactly the cty.dat whose SHA-256 is HEX (64 hex digits, as in manta's `lists:` log
+    /// line). With --cty (or spot.cty_path) set, that file must have this SHA-256 and nothing
+    /// else is tried; without one, manta looks in the built-in copy, then spot.list_cache_dir.
+    /// manta stops before reading the source if no copy matches. Defaults to `spot.cty_sha256`
+    /// from --config.
+    #[arg(long, value_name = "HEX", value_parser = config::parse_sha256)]
+    cty_sha256: Option<String>,
+    /// Use exactly the MASTER.SCP whose SHA-256 is HEX. Looked up like --cty-sha256. Defaults to
+    /// `spot.scp_sha256` from --config.
+    #[arg(long, value_name = "HEX", value_parser = config::parse_sha256)]
+    scp_sha256: Option<String>,
+    /// Callsign-pattern list used in place of the built-in one ([spot] pattern_path).
+    #[arg(long, value_name = "PATH")]
+    patterns: Option<PathBuf>,
 }
 
 /// KiwiSDR connection flags, grouped to keep `open_source`'s arity down.
@@ -1411,6 +1429,15 @@ impl LiveSourceSpec {
             LiveSourceSpec::Ka9q(_) => "ka9q",
             LiveSourceSpec::AudioDevice(_) => "audio",
             LiveSourceSpec::File { .. } => "file",
+        }
+    }
+
+    /// MAN-234: how the bad-sample warnings name this input -- the file's
+    /// path, or `the <kind> input` for a live source.
+    fn input_label(&self) -> String {
+        match self {
+            LiveSourceSpec::File { path, .. } => path.display().to_string(),
+            _ => format!("the {} input", self.name()),
         }
     }
 
@@ -1665,6 +1692,14 @@ impl IqSource for FixedCenterFreqSource {
         self.inner.rf_passband_hz()
     }
 
+    /// MAN-196: same forwarding duty as `rf_passband_hz` above -- the
+    /// wrapped decimator's trusted band must reach the run/soak startup
+    /// notice and the track manager's spawn veto; the override relocates
+    /// the centre only, and the band is offsets from the centre.
+    fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+        self.inner.trusted_band_hz()
+    }
+
     fn read(&mut self, buf: &mut [num_complex::Complex32]) -> Result<usize> {
         self.inner.read(buf)
     }
@@ -1701,6 +1736,19 @@ fn warn_if_audio_source_has_no_rf_reference(has_rf_aware_source: bool, dial_freq
              rig's dial frequency, e.g. --dial-freq-hz 14030000.",
         );
     }
+}
+
+/// MAN-196: the one startup line a decimated capture prints, naming its
+/// usable passband. `lo_hz`/`hi_hz` are the source's *intersected* RF
+/// passband (`rf_passband_hz()` -- the inner passband clipped to the
+/// decimator's <= 1 dB trusted band), so the line never claims spectrum
+/// the source does not deliver. `run` logs it through `tracing::info!`;
+/// `soak`, which installs no subscriber, writes it straight to stderr.
+fn trusted_band_notice(fs_out_hz: f64, lo_hz: f64, hi_hz: f64) -> String {
+    format!(
+        "decimated capture {fs_out_hz:.0} Hz: usable passband {lo_hz:.0} to {hi_hz:.0} Hz; \
+         channels beyond (decimator transition band) are not tracked"
+    )
 }
 
 /// MAN-131: a live audio input delivering exact zeros is, on macOS, the
@@ -2162,20 +2210,33 @@ fn strip_bom(text: &str) -> &str {
     text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 
+/// Loads a reference table once, with consistent path context and BOM handling.
+fn read_reference<T>(
+    path: &Path,
+    label: &str,
+    parse: impl FnOnce(&str) -> Result<T>,
+) -> Result<std::sync::Arc<T>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {label} {}", path.display()))?;
+    parse(strip_bom(&text)).map(std::sync::Arc::new)
+}
+
 /// Builds a `PipelineConfig` from the CLI's shared flags: the MAN-29
 /// frequency-calibration correction, the MAN-28 operator Watch List, and
 /// the MAN-31 operator suppression lists. Each is optional/repeatable; an
 /// absent one leaves that list empty, matching `PipelineConfig`'s own
-/// defaults.
+/// defaults. MAN-316: also resolves the cty.dat/MASTER.SCP hash pins, before
+/// any source opens, and returns the version of each list it chose.
 fn build_pipeline_config(
     freq_correction_ppm: f64,
     spot: &SpotResolved,
     detector: manta_engine::DetectorConfig,
     engine: Engine,
-) -> Result<PipelineConfig> {
+) -> Result<(PipelineConfig, [list_refresh::InUse; 2])> {
     let mut cfg = PipelineConfig {
         freq_correction_ppm,
         allowlist: spot.allowlist.clone(),
+        validation_level: spot.validation_level,
         detector,
         ..Default::default()
     };
@@ -2190,25 +2251,144 @@ fn build_pipeline_config(
             .with_context(|| format!("reading notch file {}", path.display()))?;
         cfg.notch = manta_engine::NotchList::parse(strip_bom(&text));
     }
-    if let Some(path) = &spot.cty {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading cty.dat file {}", path.display()))?;
-        let table = manta_spot::cty::Table::parse(strip_bom(&text));
-        if table.is_empty() {
-            bail!("cty.dat file {} lists no callsign prefixes; is it AD1C's cty.dat (not cty.csv or a saved web page)?", path.display());
+    let cache = spot.list_cache_dir.clone().map(list_cache::Cache::new);
+    let cty_in_use = match resolve_list_bytes(
+        ListKind::Cty,
+        spot.cty.as_deref(),
+        spot.cty_sha256.as_deref(),
+        cache.as_ref(),
+    )? {
+        None => list_refresh::InUse::bundled(ListKind::Cty),
+        Some((text, in_use)) => {
+            let table = manta_spot::cty::Table::parse(strip_bom(&text));
+            // MAN-79's rule for an explicit file; a pin is the operator's
+            // exact choice of bytes, so it skips every check (D5).
+            if let (list_refresh::Origin::File(path), true) = (&in_use.origin, table.is_empty()) {
+                bail!("cty.dat file {} lists no callsign prefixes; is it AD1C's cty.dat (not cty.csv or a saved web page)?", path.display());
+            }
+            cfg.cty = Some(std::sync::Arc::new(table));
+            in_use
         }
-        cfg.cty = Some(std::sync::Arc::new(table));
-    }
-    if let Some(path) = &spot.scp {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading master.scp file {}", path.display()))?;
-        let set = manta_spot::scp::Set::parse(strip_bom(&text));
-        if set.is_empty() {
-            bail!("master.scp file {} lists no callsigns", path.display());
+    };
+    let scp_in_use = match resolve_list_bytes(
+        ListKind::Scp,
+        spot.scp.as_deref(),
+        spot.scp_sha256.as_deref(),
+        cache.as_ref(),
+    )? {
+        None => list_refresh::InUse::bundled(ListKind::Scp),
+        Some((text, in_use)) => {
+            let set = manta_spot::scp::Set::parse(strip_bom(&text));
+            if let (list_refresh::Origin::File(path), true) = (&in_use.origin, set.is_empty()) {
+                bail!("master.scp file {} lists no callsigns", path.display());
+            }
+            cfg.scp = Some(std::sync::Arc::new(set));
+            in_use
         }
-        cfg.scp = Some(std::sync::Arc::new(set));
+    };
+    if let Some(path) = &spot.patterns {
+        cfg.patterns = Some(read_reference(path, "the pattern list", |text| {
+            manta_spot::pattern::Table::parse(text).map_err(|error| match error {
+                manta_spot::pattern::ParseError::Empty => {
+                    anyhow!("the pattern list {} contains no patterns", path.display())
+                }
+                _ => anyhow!("reading the pattern list {}: {error}", path.display()),
+            })
+        })?);
     }
-    Ok(cfg)
+    Ok((cfg, [cty_in_use, scp_in_use]))
+}
+
+/// MAN-316 D3 steps 1 and 2 for one list: the text an explicit path or a
+/// hash pin chooses, or `None` for the built-in copy (no path and no pin).
+/// A pin matching the built-in copy returns the built-in text, reported as
+/// pinned. A set path is the only place a pin is checked: a
+/// path whose SHA-256 differs from the pin is an error. Without a path, a
+/// pin is looked up in the built-in copy, then `list_cache_dir`; a miss is
+/// an error naming where it looked.
+fn resolve_list_bytes(
+    kind: ListKind,
+    path: Option<&std::path::Path>,
+    pin: Option<&str>,
+    cache: Option<&list_cache::Cache>,
+) -> Result<Option<(String, list_refresh::InUse)>> {
+    let (file_name, flag, path_flag, label) = match kind {
+        ListKind::Cty => ("cty.dat", "--cty-sha256", "--cty", "cty.dat"),
+        ListKind::Scp => ("MASTER.SCP", "--scp-sha256", "--scp", "master.scp"),
+    };
+    let utf8 = |bytes: Vec<u8>, what: &std::path::Path| -> Result<String> {
+        String::from_utf8(bytes).map_err(|_| {
+            anyhow!(
+                "reading {label} file {}: stream did not contain valid UTF-8",
+                what.display()
+            )
+        })
+    };
+    if let Some(path) = path {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("reading {label} file {}", path.display()))?;
+        let sha = list_cache::sha256_hex(&bytes);
+        let origin = match pin {
+            Some(pin) if pin != sha => bail!(
+                "{file_name} file {} has SHA-256 {sha}, not the pinned {pin} ({flag})",
+                path.display()
+            ),
+            Some(_) => list_refresh::Origin::Pinned(list_refresh::PinSource::File(path.into())),
+            None => list_refresh::Origin::File(path.into()),
+        };
+        let text = utf8(bytes, path)?;
+        return Ok(Some((text, list_refresh::InUse::new(kind, sha, origin))));
+    }
+    let Some(pin) = pin else {
+        return Ok(None);
+    };
+    let bundled = list_refresh::bundled_sha256(kind);
+    if pin == bundled {
+        let in_use = list_refresh::InUse::new(
+            kind,
+            bundled,
+            list_refresh::Origin::Pinned(list_refresh::PinSource::Bundled),
+        );
+        let text = match kind {
+            ListKind::Cty => manta_spot::CTY_DAT,
+            ListKind::Scp => manta_spot::MASTER_SCP,
+        };
+        return Ok(Some((text.to_string(), in_use)));
+    }
+    let Some(cache) = cache else {
+        bail!(
+            "{flag} {pin}: no {file_name} has that SHA-256: the built-in copy is {bundled} and \
+             spot.list_cache_dir is not set; pass the file itself with {path_flag}"
+        );
+    };
+    let version_path = cache.version_path(kind, pin);
+    match cache
+        .load_version(kind, pin)
+        .map_err(|e| anyhow!("{flag} {pin}: {e}"))?
+    {
+        None => bail!(
+            "{flag} {pin}: no {file_name} has that SHA-256: the built-in copy is {bundled} and \
+             {} does not exist; pass the file itself with {path_flag}",
+            version_path.display()
+        ),
+        Some(bytes) => {
+            let text = utf8(bytes, &version_path)?;
+            let in_use = list_refresh::InUse::new(
+                kind,
+                pin.to_string(),
+                list_refresh::Origin::Pinned(list_refresh::PinSource::Cache(version_path)),
+            );
+            Ok(Some((text, in_use)))
+        }
+    }
+}
+
+/// MAN-316 Design §5: every validating command names the lists it uses on
+/// stderr when a pin is set (`run` with refresh on prints its own line).
+fn note_pinned_lists(spot: &SpotResolved, in_use: &[list_refresh::InUse; 2]) {
+    if spot.cty_sha256.is_some() || spot.scp_sha256.is_some() {
+        logging::note(&list_refresh::lists_line(&in_use[0], &in_use[1]));
+    }
 }
 
 /// Range-checks a `[decode]` table (SPEC v2 §7) loaded by `config::load`
@@ -2689,19 +2869,20 @@ struct SpotServer {
     /// `SHUTDOWN_DRAIN_DEADLINE`) instead of guessing a fixed sleep
     /// duration -- see `shutdown_runtime_after_drain`.
     tasks: manta_server::tasks::ClientTasks,
-    /// The run's resolved table, shared with the validator and `JsonStreamConfig`,
-    /// kept here too so the publish callback can check resolvability once
-    /// per spot for `manta_spots_unresolved_geography_total` -- checking
-    /// inside `SpotMessage::from_spot` would scale with connected client
-    /// count instead of spot count.
-    cty: std::sync::Arc<manta_spot::cty::Table>,
-    /// Whether the operator's OWN station callsign (config, not decoder
-    /// output -- and not required to be cty-resolvable) already forces the
-    /// de-side `UNKNOWN_*` sentinels. Resolved ONCE at `start_spot_server`
-    /// time rather than per spot: `station_callsign` cannot change for the
-    /// life of the process, so re-running the same binary search on every
-    /// spot only re-derives a constant.
-    station_geography_unresolved: bool,
+    /// The run's reference lists, shared with the validator and
+    /// `JsonStreamConfig`, kept here too so the publish callback can check
+    /// resolvability once per spot for `manta_spots_unresolved_geography_total`
+    /// -- checking inside `SpotMessage::from_spot` would scale with connected
+    /// client count instead of spot count. MAN-316: a list refresh may swap
+    /// the cty table, so the callback loads it once per spot.
+    lists: std::sync::Arc<manta_engine::ReferenceLists>,
+    /// The operator's OWN station callsign (config, not decoder output --
+    /// and not required to be cty-resolvable), whose de-side `UNKNOWN_*`
+    /// sentinels are checked per spot against the current table: MAN-316's
+    /// refresh can change the answer, at the cost of one more lookup.
+    /// MAN-324: also `deCall` on every live record, and the station half of
+    /// a spotted decision's `spotId`.
+    station_callsign: String,
     /// MAN-122 review round 4 (P2): the periodic status task's `JoinHandle`
     /// is RETAINED, not discarded, so the shutdown sequence can AWAIT the
     /// task's actual exit right after `shutdown_tx.send(true)` and before
@@ -2735,9 +2916,6 @@ struct SpotServer {
     /// `[server].live_port` is unset, in which case the decode loop runs
     /// no live tap.
     live_addr: Option<std::net::SocketAddr>,
-    /// MAN-324: `deCall` on every live record, and the station half of a
-    /// spotted decision's `spotId`.
-    station_callsign: String,
     /// MAN-78: each `[[rbn_uplink]]` task's live `dry_run` flag, in config
     /// order, for the SIGHUP reload thread (Unix only) to flip.
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -3133,6 +3311,7 @@ fn station_profile(
     center_freq_hz: f64,
     rf_passband_hz: (f64, f64),
     freq_calibration: f64,
+    validation_level: manta_spot::ValidationLevel,
 ) -> manta_server::telnet::StationProfile {
     manta_server::telnet::StationProfile {
         call: cfg.station_callsign.clone(),
@@ -3140,7 +3319,12 @@ fn station_profile(
         operator_qth: cfg.operator_qth.clone(),
         operator_grid: cfg.operator_grid.clone(),
         sett: manta_server::sett::SettSettings {
-            validation_level: manta_server::sett::ValidationLevel::Normal,
+            validation_level: match validation_level {
+                manta_spot::ValidationLevel::Minimal => {
+                    manta_server::sett::ValidationLevel::Minimal
+                }
+                manta_spot::ValidationLevel::Normal => manta_server::sett::ValidationLevel::Normal,
+            },
             cq_only: false,
             segments: manta_server::sett::segments_for_passband(
                 center_freq_hz,
@@ -3195,6 +3379,118 @@ fn spot_bus_for(
     )
 }
 
+/// MAN-316: the reference lists a `run` shares between its validator and
+/// spot servers, and the refresher to start once the servers are up.
+struct RunLists {
+    lists: std::sync::Arc<manta_engine::ReferenceLists>,
+    /// cty first, then scp.
+    in_use: [list_refresh::InUse; 2],
+    /// `Some` only for a live source with `refresh_lists` on (D2).
+    refresh: Option<list_refresh::RefreshSetup>,
+}
+
+/// Builds `run`'s shared lists from `cfg`'s tables. With a live source and
+/// `refresh_lists` on, a list no pin or path chose may start from the cache
+/// (D3) and is handed to the refresher, and the stale built-in cty.dat
+/// warning is printed here, judged on the copy chosen; otherwise the tables
+/// are `cfg`'s, and file replay never reads the cache (D4).
+fn prepare_run_lists(
+    live: bool,
+    spot: &SpotResolved,
+    in_use: [list_refresh::InUse; 2],
+    cfg: &PipelineConfig,
+) -> Result<RunLists> {
+    if !(live && spot.refresh_lists) {
+        return Ok(RunLists {
+            lists: std::sync::Arc::new(manta_engine::ReferenceLists::new(
+                cfg.cty_table(),
+                cfg.scp_set(),
+            )),
+            in_use,
+            refresh: None,
+        });
+    }
+    let cache = spot.list_cache_dir.clone().map(list_cache::Cache::new);
+    let [cty_in_use, scp_in_use] = in_use;
+    let (lists, in_use) = list_refresh::resolve_startup(
+        cfg.cty_table(),
+        cty_in_use,
+        cfg.scp_set(),
+        scp_in_use,
+        true,
+        cache.as_ref(),
+    );
+    if let Some(warning) = stale_cty_warning(&in_use[0], std::time::SystemTime::now()) {
+        logging::warning(&warning);
+    }
+    let mut managed = Vec::new();
+    for (list, url) in in_use.iter().zip([&spot.cty_url, &spot.scp_url]) {
+        if !list.is_operator_choice() {
+            managed.push(list_refresh::ListSetting {
+                url: list_http::HttpUrl::parse(url).map_err(|e| anyhow!("[spot]: {e}"))?,
+                in_use: list.clone(),
+            });
+        }
+    }
+    Ok(RunLists {
+        lists: std::sync::Arc::new(lists),
+        in_use,
+        refresh: Some(list_refresh::RefreshSetup {
+            lists: managed,
+            cache,
+            limits: list_http::FetchLimits::default(),
+        }),
+    })
+}
+
+/// MAN-316: publishes the lists in use to `manta_list_info` (every daemon),
+/// prints the startup lines, and starts the `manta-lists` thread when a
+/// live source has refresh on and a list to manage. Returns the handle the
+/// decode loop watches, `None` when nothing can change the lists.
+fn start_list_refresh(
+    run_lists: RunLists,
+    live: bool,
+    spot: &SpotResolved,
+    metrics: Option<std::sync::Arc<manta_server::metrics::Metrics>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<Option<std::sync::Arc<manta_engine::ReferenceLists>>> {
+    let RunLists {
+        lists,
+        in_use,
+        refresh,
+    } = run_lists;
+    let managed: Vec<ListKind> = refresh.as_ref().map_or_else(Vec::new, |setup| {
+        setup.lists.iter().map(|list| list.in_use.kind).collect()
+    });
+    if let Some(metrics) = &metrics {
+        list_refresh::publish(metrics, &in_use, &managed);
+    }
+    let Some(setup) = refresh else {
+        if spot.refresh_lists && !live {
+            logging::note(&list_refresh::file_replay_note(&in_use[0], &in_use[1]));
+        } else {
+            note_pinned_lists(spot, &in_use);
+        }
+        return Ok(None);
+    };
+    logging::note(&list_refresh::lists_line(&in_use[0], &in_use[1]));
+    if !setup.lists.is_empty() {
+        logging::note(&setup.startup_line());
+    }
+    for list in &in_use {
+        if let Some(note) = list_refresh::left_alone_note(list) {
+            logging::note(&note);
+        }
+    }
+    if setup.lists.is_empty() {
+        return Ok(None);
+    }
+    list_refresh::spawn(setup, lists.clone(), metrics, stop)
+        .context("starting the manta-lists thread")?;
+    Ok(Some(lists))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn start_spot_server(
     cfg: manta_server::config::ServerConfig,
     rbn_uplink_cfgs: Vec<manta_server::config::RbnUplinkConfig>,
@@ -3202,8 +3498,10 @@ fn start_spot_server(
     source: SourceInfo<'_>,
     epoch: std::time::SystemTime,
     session_nonce: u128,
-    cty: std::sync::Arc<manta_spot::cty::Table>,
+    lists: std::sync::Arc<manta_engine::ReferenceLists>,
+    pipeline: &PipelineConfig,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
+    let validation_level = pipeline.validation_level;
     // MAN-59 connection/rejection events below are logged at `info`/
     // `warn`. `start_spot_server` no longer installs the subscriber:
     // `logging::init` does, at the top of `run` (MAN-124), and its module
@@ -3369,6 +3667,7 @@ fn start_spot_server(
                 source.dial_freq_hz,
                 source.rf_passband_hz,
                 source.freq_calibration,
+                validation_level,
             ));
             spawn_tracked_listener(
                 LISTENER_TELNET,
@@ -3417,7 +3716,7 @@ fn start_spot_server(
                         manta_server::json_stream::JsonStreamConfig {
                             bus: bus.clone(),
                             metrics: metrics.clone(),
-                            cty: cty.clone(),
+                            lists: lists.clone(),
                             station_call: cfg.station_callsign.clone(),
                             station_location: station_location.clone(),
                             decoder_version: decoder_version.clone(),
@@ -3445,7 +3744,7 @@ fn start_spot_server(
                     manta_server::json_stream::JsonStreamConfig {
                         bus: bus.clone(),
                         metrics: metrics.clone(),
-                        cty: cty.clone(),
+                        lists: lists.clone(),
                         station_call: cfg.station_callsign.clone(),
                         station_location,
                         decoder_version,
@@ -3610,19 +3909,13 @@ fn start_spot_server(
             metrics,
             shutdown_tx,
             tasks,
-            // MAN-89: `station_geography_unresolved` strips the RBN `-N`
-            // per-band SSID itself, so this flag is classified through the
-            // SAME string `SpotMessage::from_spot` resolves the de side
-            // through -- see its doc comment for what an unstripped
-            // classification costs.
-            station_geography_unresolved: station_geography_unresolved(&cty, &cfg.station_callsign),
-            cty,
+            station_callsign: cfg.station_callsign.clone(),
+            lists,
             status_line: std::sync::Mutex::new(status_line),
             rbn_compare: std::sync::Mutex::new(rbn_task),
             metrics_addr,
             json_addr,
             live_addr,
-            station_callsign: cfg.station_callsign.clone(),
             uplink_dry_run,
         },
     ))
@@ -3654,6 +3947,10 @@ struct CliOverrides {
     notch: Option<PathBuf>,
     cty: Option<PathBuf>,
     scp: Option<PathBuf>,
+    /// MAN-316: `--cty-sha256`/`--scp-sha256`.
+    cty_sha256: Option<String>,
+    scp_sha256: Option<String>,
+    patterns: Option<PathBuf>,
     /// MAN-301: `--rbn-compare`/`--rbn-spotter` (`run` only).
     rbn: RbnCompareOpts,
 }
@@ -3698,6 +3995,9 @@ impl CliOverrides {
             notch: None,
             cty: None,
             scp: None,
+            cty_sha256: None,
+            scp_sha256: None,
+            patterns: None,
             rbn: RbnCompareOpts::default(),
         }
     }
@@ -3759,21 +4059,66 @@ impl CliOverrides {
 /// `[spot]` after the CLI is merged over the file/env layer (D6).
 #[derive(Debug, PartialEq)]
 struct SpotResolved {
+    validation_level: manta_spot::ValidationLevel,
     allowlist: Vec<String>,
     blocklist: Option<PathBuf>,
     notch: Option<PathBuf>,
     cty: Option<PathBuf>,
     scp: Option<PathBuf>,
+    /// MAN-316: hash pins, CLI > `MANTA_SPOT_*_SHA256` > file.
+    cty_sha256: Option<String>,
+    scp_sha256: Option<String>,
+    /// MAN-316: the refresh settings; no flags, so straight from `[spot]`.
+    refresh_lists: bool,
+    list_cache_dir: Option<PathBuf>,
+    cty_url: String,
+    scp_url: String,
+    patterns: Option<PathBuf>,
+}
+
+/// MAN-316: `--cty-sha256`/`--scp-sha256`, the only list flags beyond
+/// `resolve_spot`'s paths.
+#[derive(Debug, Default, Clone)]
+struct CliPins {
+    cty_sha256: Option<String>,
+    scp_sha256: Option<String>,
 }
 
 /// A non-empty `--allowlist` replaces the file's list (never concatenated);
-/// `--blocklist`/`--notch` beat `blocklist_path`/`notch_path`.
+/// `--blocklist`/`--notch` beat `blocklist_path`/`notch_path`; a pin flag
+/// beats `cty_sha256`/`scp_sha256` (MAN-316).
+#[cfg(test)]
 fn resolve_spot(
     cli_allowlist: Vec<String>,
     cli_blocklist: Option<PathBuf>,
     cli_notch: Option<PathBuf>,
     cli_cty: Option<PathBuf>,
     cli_scp: Option<PathBuf>,
+    cli_patterns: Option<PathBuf>,
+    spot: &config::SpotFile,
+) -> SpotResolved {
+    resolve_spot_pinned(
+        cli_allowlist,
+        cli_blocklist,
+        cli_notch,
+        cli_cty,
+        cli_scp,
+        CliPins::default(),
+        cli_patterns,
+        spot,
+    )
+}
+
+/// [`resolve_spot`] with the MAN-316 pin flags.
+#[allow(clippy::too_many_arguments)]
+fn resolve_spot_pinned(
+    cli_allowlist: Vec<String>,
+    cli_blocklist: Option<PathBuf>,
+    cli_notch: Option<PathBuf>,
+    cli_cty: Option<PathBuf>,
+    cli_scp: Option<PathBuf>,
+    pins: CliPins,
+    cli_patterns: Option<PathBuf>,
     spot: &config::SpotFile,
 ) -> SpotResolved {
     SpotResolved {
@@ -3786,6 +4131,14 @@ fn resolve_spot(
         notch: cli_notch.or_else(|| spot.notch_path.clone()),
         cty: cli_cty.or_else(|| spot.cty_path.clone()),
         scp: cli_scp.or_else(|| spot.scp_path.clone()),
+        cty_sha256: pins.cty_sha256.or_else(|| spot.cty_sha256.clone()),
+        scp_sha256: pins.scp_sha256.or_else(|| spot.scp_sha256.clone()),
+        refresh_lists: spot.refresh_lists,
+        list_cache_dir: spot.list_cache_dir.clone(),
+        cty_url: spot.cty_url().to_string(),
+        scp_url: spot.scp_url().to_string(),
+        patterns: cli_patterns.or_else(|| spot.pattern_path.clone()),
+        validation_level: spot.validation_level,
     }
 }
 
@@ -3849,12 +4202,17 @@ fn resolve_rbn_compare(
 fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
     let mut notes = loaded.notes.clone();
     let rbn_compare = resolve_rbn_compare(&cli.rbn, loaded.rbn_compare.as_ref());
-    let spot = resolve_spot(
+    let spot = resolve_spot_pinned(
         cli.allowlist.clone(),
         cli.blocklist.clone(),
         cli.notch.clone(),
         cli.cty.clone(),
         cli.scp.clone(),
+        CliPins {
+            cty_sha256: cli.cty_sha256.clone(),
+            scp_sha256: cli.scp_sha256.clone(),
+        },
+        cli.patterns.clone(),
         &loaded.spot,
     );
     let mut shared = loaded.input.shared.clone();
@@ -4111,6 +4469,8 @@ struct Prepared {
     loaded: config::Loaded,
     resolved: Resolved,
     pipeline: PipelineConfig,
+    /// MAN-316: the version of cty.dat and MASTER.SCP `pipeline` holds.
+    lists_in_use: [list_refresh::InUse; 2],
 }
 
 /// MAN-79 scenario 2: one stderr line when the built-in cty.dat is in use
@@ -4127,6 +4487,15 @@ fn bundled_cty_warning(cty_overridden: bool, now: std::time::SystemTime) -> Opti
          https://www.country-files.com/cty/cty.dat and pass it with --cty or set spot.cty_path.",
         manta_spot::vintage::CTY_DAT_RETRIEVED
     ))
+}
+
+/// [`bundled_cty_warning`] for `cty`, the cty.dat a command decodes with:
+/// silent unless it is the built-in copy because nothing chose another (a
+/// path, a pin, even of the built-in bytes, or the cache). A live `run`
+/// with refresh on may start from the cache's copy (MAN-316), so
+/// `prepare_run_lists` asks once it has chosen.
+fn stale_cty_warning(cty: &list_refresh::InUse, now: std::time::SystemTime) -> Option<String> {
+    bundled_cty_warning(cty.origin != list_refresh::Origin::Bundled, now)
 }
 
 /// Shared typed config and source resolution, with no pipeline assets or I/O:
@@ -4152,10 +4521,13 @@ fn prepare_source(cli: CliOverrides, config_flag: Option<PathBuf>) -> Result<Sou
     })
 }
 
+/// `warn_stale_cty`: print [`stale_cty_warning`] here. `run` passes false
+/// and prints it itself once it knows which cty.dat it starts with.
 fn prepare_live(
     cli: CliOverrides,
     config_flag: Option<PathBuf>,
     cli_engine: Option<Engine>,
+    warn_stale_cty: bool,
 ) -> Result<Prepared> {
     let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
     let config_path = config_flag.or_else(|| config::config_path_from_env(&vars));
@@ -4163,11 +4535,12 @@ fn prepare_live(
     for note in &prepared.resolved.notes {
         logging::note(note);
     }
-    if let Some(warning) = bundled_cty_warning(
-        prepared.pipeline.cty.is_some(),
-        std::time::SystemTime::now(),
-    ) {
-        logging::warning(&warning);
+    if warn_stale_cty {
+        if let Some(warning) =
+            stale_cty_warning(&prepared.lists_in_use[0], std::time::SystemTime::now())
+        {
+            logging::warning(&warning);
+        }
     }
     Ok(prepared)
 }
@@ -4187,7 +4560,7 @@ fn prepare_config(
     let resolved = resolve(cli, &loaded)?;
     check_rbn_compare(&rbn_opts, &loaded, &resolved)?;
     let decode = merge_cli_engine(cli_engine, loaded.decode.clone());
-    let mut pipeline = build_pipeline_config(
+    let (mut pipeline, lists_in_use) = build_pipeline_config(
         resolved.freq_correction_ppm,
         &resolved.spot,
         loaded.detector,
@@ -4199,6 +4572,7 @@ fn prepare_config(
         loaded,
         resolved,
         pipeline,
+        lists_in_use,
     })
 }
 
@@ -4822,6 +5196,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                 notch,
                 cty,
                 scp,
+                cty_sha256,
+                scp_sha256,
+                patterns,
             } = filters;
             // D7/D8: the whole file is validated, the environment is never
             // read; [decode], [detector], [spot] and input.freq_correction_ppm
@@ -4839,9 +5216,21 @@ fn run_command() -> Result<std::process::ExitCode> {
                     loaded.origin
                 );
             }
-            let spot = resolve_spot(allowlist, blocklist, notch, cty, scp, &loaded.spot);
+            let spot = resolve_spot_pinned(
+                allowlist,
+                blocklist,
+                notch,
+                cty,
+                scp,
+                CliPins {
+                    cty_sha256,
+                    scp_sha256,
+                },
+                patterns,
+                &loaded.spot,
+            );
             let decode_cfg = merge_cli_engine(engine, loaded.decode.clone());
-            let mut cfg = build_pipeline_config(
+            let (mut cfg, lists_in_use) = build_pipeline_config(
                 freq_correction_ppm
                     .or(loaded.input.shared.freq_correction_ppm)
                     .unwrap_or(0.0),
@@ -4849,6 +5238,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 loaded.detector,
                 decode_cfg.engine,
             )?;
+            note_pinned_lists(&spot, &lists_in_use);
             cfg.decode = decode_cfg;
             // MAN-131: say so before decoding when the reported frequencies
             // will be baseband offsets. Only for an existing file, so a
@@ -4883,6 +5273,14 @@ fn run_command() -> Result<std::process::ExitCode> {
                         eprintln!("timing (dits, mean ± sd): {}", estimates.display_line());
                     }
                 }
+            }
+            // MAN-234: after the output, in both modes, so the decoded text
+            // stays first and `--json` stdout stays one record.
+            if report.bad_samples > 0 {
+                logging::warning(&fmt::bad_samples_warning(
+                    &path.display().to_string(),
+                    report.bad_samples,
+                ));
             }
         }
         Command::Oracle {
@@ -5002,6 +5400,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                 notch,
                 cty,
                 scp,
+                cty_sha256,
+                scp_sha256,
+                patterns,
             } = filters;
             let cli = CliOverrides {
                 device,
@@ -5045,6 +5446,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                 notch,
                 cty,
                 scp,
+                cty_sha256,
+                scp_sha256,
+                patterns,
                 rbn,
             };
             // MAN-78: a SIGHUP reload re-resolves with the same flags.
@@ -5058,7 +5462,20 @@ fn run_command() -> Result<std::process::ExitCode> {
                 loaded,
                 resolved,
                 pipeline: cfg,
-            } = prepare_live(cli, config, engine)?;
+                lists_in_use,
+            } = prepare_live(cli, config, engine, false)?;
+            // MAN-79's stale built-in cty.dat warning, before any I/O,
+            // unless the cache may replace that copy: `prepare_run_lists`
+            // warns then, once it has chosen (MAN-316).
+            let cache_may_choose_cty =
+                resolved.spec.is_reconnectable() && resolved.spot.refresh_lists;
+            if !cache_may_choose_cty {
+                if let Some(warning) =
+                    stale_cty_warning(&lists_in_use[0], std::time::SystemTime::now())
+                {
+                    logging::warning(&warning);
+                }
+            }
             refuse_rbn_compare_replay(&resolved, source_flag)?;
             // MAN-268: an unedited manta.example.toml must not start a
             // daemon that spots, or logs in to a collector, as N0CALL.
@@ -5081,6 +5498,8 @@ fn run_command() -> Result<std::process::ExitCode> {
             };
             let has_rf_aware_source = spec.is_rf_aware();
             let source_name = spec.name();
+            // MAN-234: how the bad-sample warnings name this input.
+            let input_label = spec.input_label();
 
             // Servers start iff the resolved config has a [server] table
             // (D7); the guard runs after the load and before any source I/O.
@@ -5133,6 +5552,20 @@ fn run_command() -> Result<std::process::ExitCode> {
             // logged just before decoding starts (below).
             let crash_live =
                 manta_engine::crash_live_channels(first.sample_rate(), first.rf_passband_hz());
+            // MAN-196: the source's trusted band, read once here while
+            // `first` is in hand (before `wrap_file_replay` and `listen`
+            // take ownership); `Some` only when a decimator is in the
+            // path (`--capture-rate-hz`/`input.capture_rate_hz`). Logged
+            // beside the crash notice below, before the readiness marker.
+            // Round-1 review (PR #300): the notice states the band the
+            // source actually delivers -- `rf_passband_hz()`, the inner
+            // passband intersected with the trusted band -- so a
+            // decimation wrapping an already narrower source (a KiwiSDR's
+            // +/-5 kHz filter, a one-sided rig-audio passband) never
+            // claims a wider usable passband than `manta check` and SETT
+            // advertise for the same source.
+            let trusted_band = first.trusted_band_hz().map(|_| first.rf_passband_hz());
+            let trusted_band_fs_hz = first.sample_rate();
 
             // MAN-122 review round 6 (P2): installed HERE -- before
             // `start_spot_server` binds the sockets and logs the
@@ -5169,6 +5602,18 @@ fn run_command() -> Result<std::process::ExitCode> {
             })?;
             #[cfg(unix)]
             let reload_signals = install_unix_signal_handlers(&stop, loaded.server.is_some())?;
+            // MAN-316: the cty.dat/MASTER.SCP every consumer shares (D3);
+            // with refresh on and a live source, the cache's last good
+            // download replaces the built-in copy here, before the
+            // validator and servers are built.
+            let run_lists =
+                prepare_run_lists(spec.is_reconnectable(), &resolved.spot, lists_in_use, &cfg)?;
+            let mut cfg = cfg;
+            if run_lists.refresh.is_some() {
+                cfg.cty = Some(run_lists.lists.cty.load());
+                cfg.scp = Some(run_lists.lists.scp.load());
+            }
+            let lists = run_lists.lists.clone();
 
             // Kept alive for the process lifetime: dropping it would stop
             // the spawned server tasks. `None` when --config wasn't
@@ -5246,7 +5691,8 @@ fn run_command() -> Result<std::process::ExitCode> {
                         },
                         epoch,
                         session_nonce,
-                        cfg.cty_table(),
+                        lists.clone(),
+                        &cfg,
                     )?;
                     // MAN-45 (round-9 finding): the daemon's own copy of the
                     // gauge `manta_engine::listen_with_observers` updates as
@@ -5344,6 +5790,17 @@ fn run_command() -> Result<std::process::ExitCode> {
                 }
                 None => (None, None, None, None, None, None, None),
             };
+            // MAN-316: after the `listening:` banner, before `manta:
+            // listening;`: the `lists:` lines, `manta_list_info`, and the
+            // `manta-lists` thread. `None` (file replay, refresh off) keeps
+            // the decode loop's check off entirely.
+            let reference_lists = start_list_refresh(
+                run_lists,
+                spec.is_reconnectable(),
+                &resolved.spot,
+                spot_server.as_ref().map(|server| server.metrics.clone()),
+                stop.clone(),
+            )?;
 
             // MAN-78: with a `[server]` table, SIGHUP reloads the `[spot]`
             // lists and each `[[rbn_uplink]]` `dry_run` (D2). The thread
@@ -5481,6 +5938,17 @@ fn run_command() -> Result<std::process::ExitCode> {
                     manta_engine::CRASH_MIN_LIVE_CHANNELS
                 );
             }
+            // MAN-196: a decimated capture states its usable passband
+            // once, at the same point as the crash notice -- after the
+            // servers bound, before the readiness marker -- so an
+            // operator who chose `--capture-rate-hz` for its nominal
+            // Nyquist width learns the channels beyond the decimator's
+            // <= 1 dB trusted band are not tracked. No line at all
+            // without a decimator: the non-decimated path is unchanged
+            // in every observable respect.
+            if let Some((lo, hi)) = trusted_band {
+                tracing::info!("{}", trusted_band_notice(trusted_band_fs_hz, lo, hi));
+            }
             if reload_enabled {
                 logging::note(
                     "manta: listening; send SIGINT or SIGTERM to stop, SIGHUP to reload \
@@ -5515,6 +5983,15 @@ fn run_command() -> Result<std::process::ExitCode> {
             // MAN-312: `listen` stores its running crash count here before
             // each `on_tracks` call, which copies it into `Metrics`.
             let static_crashes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            // MAN-234: `listen` stores its running count of replaced input
+            // samples here before each `on_tracks` call, which warns once
+            // at the first one and copies the count into `Metrics`, where
+            // it is published at 0 from startup.
+            let bad_samples = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let mut bad_samples_warned: u64 = 0;
+            if let Some(server) = &spot_server {
+                server.metrics.set_input_bad_samples(source_name, 0);
+            }
             // MAN-314: the engine's marked RTTY set, logged on change and
             // copied into `manta_rtty_signals` from the per-batch callback.
             let rtty_observer = std::sync::Arc::new(manta_engine::RttyObserver::default());
@@ -5528,7 +6005,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                     decode_latency: decode_latency.clone(),
                     decode_quality: decode_quality.clone(),
                     operator_lists: reload_enabled.then(|| operator_lists.clone()),
+                    reference_lists,
                     static_crashes: Some(static_crashes.clone()),
+                    bad_samples: Some(bad_samples.clone()),
                     rtty: Some(rtty_observer.clone()),
                     // MAN-324: only with a live-state listener.
                     live_state: spot_server
@@ -5542,6 +6021,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                             ))
                                 as std::sync::Arc<dyn manta_engine::LiveStateSink>
                         }),
+                    detector_confirmations: None,
                 },
                 |ev| {
                     if json {
@@ -5582,10 +6062,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                         // instead of spot count. Checks BOTH sides: the
                         // operator's own station_callsign is config, not
                         // decoder output, and isn't required to resolve --
-                        // but it also never changes, so its side is
-                        // resolved once at start_spot_server time.
-                        if geography_is_unresolved(&server.cty, &spot.callsign)
-                            || server.station_geography_unresolved
+                        // MAN-316: both sides use the table in use now,
+                        // loaded once, since a list refresh can swap it.
+                        // MAN-89: `station_geography_unresolved` strips the
+                        // RBN `-N` per-band SSID itself, as `from_spot` does.
+                        let cty = server.lists.cty.load();
+                        if geography_is_unresolved(&cty, &spot.callsign)
+                            || station_geography_unresolved(&cty, &server.station_callsign)
                         {
                             server.metrics.record_unresolved_geography();
                         }
@@ -5613,6 +6096,18 @@ fn run_command() -> Result<std::process::ExitCode> {
                 // only thing that lets the status line say "stalled"
                 // instead of republishing a frozen `tracks=N` forever.
                 |n_tracks| {
+                    let n_bad = bad_samples.load(std::sync::atomic::Ordering::Relaxed);
+                    if n_bad > 0 && bad_samples_warned == 0 {
+                        logging::warning(&fmt::bad_samples_live_warning(
+                            &input_label,
+                            n_bad,
+                            spot_server.is_some(),
+                        ));
+                        bad_samples_warned = n_bad;
+                    }
+                    if let Some(server) = &spot_server {
+                        server.metrics.set_input_bad_samples(source_name, n_bad);
+                    }
                     if let Some(marks_hz) = rtty_log.poll(&rtty_observer) {
                         if let Some(server) = &spot_server {
                             server.metrics.set_rtty_signals(&marks_hz);
@@ -5661,6 +6156,12 @@ fn run_command() -> Result<std::process::ExitCode> {
             // mid-drain.
             drain_gate.close();
             stop_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+            // MAN-234: the run's total, only when it grew past the count
+            // the first-sample line reported (success and error alike).
+            let bad_total = bad_samples.load(std::sync::atomic::Ordering::Relaxed);
+            if bad_total > bad_samples_warned {
+                logging::warning(&fmt::bad_samples_warning(&input_label, bad_total));
+            }
 
             // A source read error returns from listen without closing its
             // tracks, so their partial lines are printed here, on both paths.
@@ -5839,11 +6340,15 @@ fn run_command() -> Result<std::process::ExitCode> {
                 notch,
                 cty,
                 scp,
+                cty_sha256,
+                scp_sha256,
+                patterns,
             } = filters;
             let Prepared {
                 loaded,
                 resolved,
                 pipeline: cfg,
+                lists_in_use,
                 ..
             } = prepare_live(
                 CliOverrides {
@@ -5888,10 +6393,14 @@ fn run_command() -> Result<std::process::ExitCode> {
                     notch,
                     cty,
                     scp,
+                    cty_sha256,
+                    scp_sha256,
+                    patterns,
                     rbn: RbnCompareOpts::default(),
                 },
                 config,
                 None,
+                true,
             )?;
             if loaded.server.is_some() {
                 eprintln!(
@@ -5902,10 +6411,26 @@ fn run_command() -> Result<std::process::ExitCode> {
             if let Some(note) = replay_mode_ignored_note("soak", resolved.replay, &loaded.origin) {
                 eprintln!("{note}");
             }
+            note_pinned_lists(&resolved.spot, &lists_in_use);
+            // MAN-316: soak never refreshes; for a file it says so, as `run` does.
+            if resolved.spot.refresh_lists && !resolved.spec.is_reconnectable() {
+                logging::note(&list_refresh::file_replay_note(
+                    &lists_in_use[0],
+                    &lists_in_use[1],
+                ));
+            }
             let spec = &resolved.spec;
             warn_if_audio_source_has_no_rf_reference(spec.is_rf_aware(), resolved.dial_freq_hz);
             let src: Box<dyn IqSource> =
                 spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz)?;
+            // MAN-196: the same usable-passband line `run` logs, once,
+            // before the soak starts; `Some` only with a decimator in the
+            // path. Plain stderr: `soak` installs no tracing subscriber.
+            // The values are the intersected `rf_passband_hz()`, exactly
+            // as `run`'s notice above (round-1 review, PR #300).
+            if let Some((lo, hi)) = src.trusted_band_hz().map(|_| src.rf_passband_hz()) {
+                eprintln!("{}", trusted_band_notice(src.sample_rate(), lo, hi));
+            }
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
             print!("{}", fmt::soak_report(&report));
             if !manta_engine::soak_passed(&report) {
@@ -5996,6 +6521,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                 notch,
                 cty,
                 scp,
+                cty_sha256,
+                scp_sha256,
+                patterns,
             } = filters;
             // Checked before any source is opened -- otherwise an invalid
             // --duration only surfaces after a KiwiSDR/SoapySDR/HPSDR
@@ -6017,6 +6545,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 loaded,
                 resolved,
                 pipeline: cfg,
+                lists_in_use,
             } = prepare_live(
                 CliOverrides {
                     device,
@@ -6060,11 +6589,16 @@ fn run_command() -> Result<std::process::ExitCode> {
                     notch,
                     cty,
                     scp,
+                    cty_sha256,
+                    scp_sha256,
+                    patterns,
                     rbn: RbnCompareOpts::default(),
                 },
                 config,
                 None,
+                true,
             )?;
+            note_pinned_lists(&resolved.spot, &lists_in_use);
             if let Some(note) = replay_mode_ignored_note("doctor", resolved.replay, &loaded.origin)
             {
                 eprintln!("{note}");
@@ -6582,7 +7116,49 @@ mod tests {
         assert_eq!(bundled_cty_warning(false, UNIX_EPOCH), None);
     }
 
+    #[test]
+    fn the_stale_cty_warning_is_judged_on_the_cty_in_use() {
+        // MAN-316: a live `run` with refresh on may start from the cache's
+        // copy; the built-in copy's age alone must not warn then.
+        let built_in = list_refresh::InUse::bundled(ListKind::Cty);
+        assert!(stale_cty_warning(&built_in, at_day(200)).is_some());
+        let cached = list_refresh::InUse::new(
+            ListKind::Cty,
+            built_in.sha256.clone(),
+            list_refresh::Origin::Cache {
+                downloaded_at: at_day(190),
+            },
+        );
+        assert_eq!(stale_cty_warning(&cached, at_day(200)), None);
+        let pinned = list_refresh::InUse::new(
+            ListKind::Cty,
+            built_in.sha256.clone(),
+            list_refresh::Origin::Pinned(list_refresh::PinSource::Bundled),
+        );
+        assert_eq!(stale_cty_warning(&pinned, at_day(200)), None);
+    }
+
     const QQ9_ENTITY: &str = "Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n";
+
+    #[test]
+    fn cli_patterns_override_file_and_preserve_validation_level() {
+        let spot = config::SpotFile {
+            pattern_path: Some("file.lst".into()),
+            validation_level: manta_spot::ValidationLevel::Minimal,
+            ..Default::default()
+        };
+        let r = resolve_spot(
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            Some("cli.lst".into()),
+            &spot,
+        );
+        assert_eq!(r.patterns, Some("cli.lst".into()));
+        assert_eq!(r.validation_level, manta_spot::ValidationLevel::Minimal);
+    }
 
     #[test]
     fn cli_cty_beats_cty_path() {
@@ -6591,7 +7167,15 @@ mod tests {
             scp_path: Some("file.scp".into()),
             ..Default::default()
         };
-        let r = resolve_spot(vec![], None, None, Some("cli.dat".into()), None, &spot);
+        let r = resolve_spot(
+            vec![],
+            None,
+            None,
+            Some("cli.dat".into()),
+            None,
+            None,
+            &spot,
+        );
         assert_eq!(r.cty, Some("cli.dat".into()));
         assert_eq!(r.scp, Some("file.scp".into()));
     }
@@ -6602,19 +7186,43 @@ mod tests {
             scp_path: Some("file.scp".into()),
             ..Default::default()
         };
-        let r = resolve_spot(vec![], None, None, None, Some("cli.scp".into()), &spot);
+        let r = resolve_spot(
+            vec![],
+            None,
+            None,
+            None,
+            Some("cli.scp".into()),
+            None,
+            &spot,
+        );
         assert_eq!(r.cty, Some("file.dat".into()));
         assert_eq!(r.scp, Some("cli.scp".into()));
     }
     #[test]
     fn unset_cty_and_scp_stay_built_in() {
-        let r = resolve_spot(vec![], None, None, None, None, &config::SpotFile::default());
-        let cfg = build_pipeline_config(0.0, &r, Default::default(), Engine::Legacy).unwrap();
+        let r = resolve_spot(
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            &config::SpotFile::default(),
+        );
+        let (cfg, _) = build_pipeline_config(0.0, &r, Default::default(), Engine::Legacy).unwrap();
         assert!(cfg.cty.is_none() && cfg.scp.is_none());
     }
     fn tables_config(cty: Option<PathBuf>, scp: Option<PathBuf>) -> Result<PipelineConfig> {
-        let spot = resolve_spot(vec![], None, None, cty, scp, &config::SpotFile::default());
-        build_pipeline_config(0.0, &spot, Default::default(), Engine::Legacy)
+        let spot = resolve_spot(
+            vec![],
+            None,
+            None,
+            cty,
+            scp,
+            None,
+            &config::SpotFile::default(),
+        );
+        build_pipeline_config(0.0, &spot, Default::default(), Engine::Legacy).map(|(cfg, _)| cfg)
     }
     #[test]
     fn build_pipeline_config_loads_an_override_cty_and_scp() {
@@ -6624,6 +7232,210 @@ mod tests {
         assert!(cfg.cty_table().is_allocated("QQ9ZZZ"));
         assert!(cfg.scp_set().contains("QQ9ZZZ"));
         assert_eq!(cfg.scp_set().len(), 2);
+    }
+    // ---- MAN-316: hash pins (Design §5)
+
+    /// A `[spot]` with `list_cache_dir`, plus `--cty`/`--cty-sha256`.
+    fn pinned_spot(
+        cty: Option<PathBuf>,
+        cty_sha256: Option<&str>,
+        list_cache_dir: Option<PathBuf>,
+    ) -> SpotResolved {
+        let spot = config::SpotFile {
+            list_cache_dir,
+            ..Default::default()
+        };
+        let pins = CliPins {
+            cty_sha256: cty_sha256.map(str::to_string),
+            scp_sha256: None,
+        };
+        resolve_spot_pinned(vec![], None, None, cty, None, pins, None, &spot)
+    }
+    fn pinned(spot: &SpotResolved) -> Result<(PipelineConfig, [list_refresh::InUse; 2])> {
+        build_pipeline_config(0.0, spot, Default::default(), Engine::Legacy)
+    }
+    /// Writes `bytes` as `dir`'s cty version file; returns its SHA-256.
+    fn cache_cty_version(dir: &std::path::Path, bytes: &[u8]) -> String {
+        let sha = list_cache::sha256_hex(bytes);
+        write_cty_version(dir, &sha, bytes);
+        sha
+    }
+    /// Writes `bytes` under the cty version file name for `sha`, whatever
+    /// their own hash.
+    fn write_cty_version(dir: &std::path::Path, sha: &str, bytes: &[u8]) -> PathBuf {
+        let path = list_cache::Cache::new(dir.to_path_buf()).version_path(ListKind::Cty, sha);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+    fn bundled_cty_sha256() -> String {
+        list_cache::sha256_hex(manta_spot::CTY_DAT.as_bytes())
+    }
+    #[test]
+    fn a_pin_matching_the_bundled_copy_uses_it() {
+        let sha = bundled_cty_sha256();
+        let (cfg, in_use) = pinned(&pinned_spot(None, Some(&sha), None)).unwrap();
+        assert!(cfg.cty_table().is_allocated("K1ABC"));
+        assert!(!cfg.cty_table().is_allocated("QQ9ZZZ"));
+        assert_eq!(in_use[0].sha256, sha);
+        assert!(matches!(
+            in_use[0].origin,
+            list_refresh::Origin::Pinned(list_refresh::PinSource::Bundled)
+        ));
+        assert_eq!(in_use[1], list_refresh::InUse::bundled(ListKind::Scp));
+    }
+    #[test]
+    fn a_pin_resolves_from_the_cache_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = format!("{}{QQ9_ENTITY}", manta_spot::CTY_DAT);
+        let sha = cache_cty_version(dir.path(), bytes.as_bytes());
+        let (cfg, in_use) =
+            pinned(&pinned_spot(None, Some(&sha), Some(dir.path().into()))).unwrap();
+        assert!(cfg.cty_table().is_allocated("QQ9ZZZ"));
+        assert_eq!(in_use[0].sha256, sha);
+        let expected = list_cache::Cache::new(dir.path().into()).version_path(ListKind::Cty, &sha);
+        match &in_use[0].origin {
+            list_refresh::Origin::Pinned(list_refresh::PinSource::Cache(path)) => {
+                assert_eq!(path, &expected)
+            }
+            other => panic!("expected a cache pin, got {other:?}"),
+        }
+    }
+    #[test]
+    fn a_pin_with_a_path_checks_the_files_hash() {
+        let bytes = format!("{}{QQ9_ENTITY}", manta_spot::CTY_DAT);
+        let f = write_temp_file(bytes.as_bytes());
+        let sha = list_cache::sha256_hex(bytes.as_bytes());
+        let (cfg, in_use) = pinned(&pinned_spot(Some(f.path().into()), Some(&sha), None)).unwrap();
+        assert!(cfg.cty_table().is_allocated("QQ9ZZZ"));
+        assert!(matches!(
+            in_use[0].origin,
+            list_refresh::Origin::Pinned(list_refresh::PinSource::File(_))
+        ));
+        let other = bundled_cty_sha256();
+        let err = pinned(&pinned_spot(Some(f.path().into()), Some(&other), None))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "cty.dat file {} has SHA-256 {sha}, not the pinned {other} (--cty-sha256)",
+                f.path().display()
+            )
+        );
+    }
+    #[test]
+    fn a_pin_with_a_mismatched_path_is_not_looked_up_in_the_cache() {
+        let f = write_temp_file(manta_spot::CTY_DAT.as_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let cached = format!("{}{QQ9_ENTITY}", manta_spot::CTY_DAT);
+        let pin = cache_cty_version(dir.path(), cached.as_bytes());
+        let spot = pinned_spot(Some(f.path().into()), Some(&pin), Some(dir.path().into()));
+        let err = pinned(&spot).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "cty.dat file {} has SHA-256 {}, not the pinned {pin} (--cty-sha256)",
+                f.path().display(),
+                bundled_cty_sha256()
+            )
+        );
+    }
+    #[test]
+    fn an_unmatched_pin_fails_before_io_and_says_where_it_looked() {
+        let pin = "0".repeat(64);
+        let bundled = bundled_cty_sha256();
+        let err = format!(
+            "{:#}",
+            pinned(&pinned_spot(None, Some(&pin), None)).unwrap_err()
+        );
+        assert_eq!(
+            err,
+            format!(
+                "--cty-sha256 {pin}: no cty.dat has that SHA-256: the built-in copy is {bundled} \
+                 and spot.list_cache_dir is not set; pass the file itself with --cty"
+            )
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let missing = list_cache::Cache::new(dir.path().into()).version_path(ListKind::Cty, &pin);
+        let err = format!(
+            "{:#}",
+            pinned(&pinned_spot(None, Some(&pin), Some(dir.path().into()))).unwrap_err()
+        );
+        assert_eq!(
+            err,
+            format!(
+                "--cty-sha256 {pin}: no cty.dat has that SHA-256: the built-in copy is {bundled} \
+                 and {} does not exist; pass the file itself with --cty",
+                missing.display()
+            )
+        );
+    }
+    #[test]
+    fn a_pinned_cache_file_whose_bytes_do_not_match_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let pin = list_cache::sha256_hex(b"some other cty.dat");
+        let path = write_cty_version(dir.path(), &pin, manta_spot::CTY_DAT.as_bytes());
+        let err = format!(
+            "{:#}",
+            pinned(&pinned_spot(None, Some(&pin), Some(dir.path().into()))).unwrap_err()
+        );
+        assert_eq!(
+            err,
+            format!(
+                "--cty-sha256 {pin}: {} has SHA-256 {}, not {pin}",
+                path.display(),
+                bundled_cty_sha256()
+            )
+        );
+    }
+    /// The pin is the operator's explicit choice of bytes, so a copy the
+    /// download checks would reject (one entity: no canaries, nowhere near
+    /// 90% of the prefixes) is still used.
+    #[test]
+    fn pins_bypass_download_acceptance() {
+        let bundled = manta_spot::cty::Table::bundled();
+        assert!(manta_spot::reference::accept_cty(QQ9_ENTITY, &bundled).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let sha = cache_cty_version(dir.path(), QQ9_ENTITY.as_bytes());
+        let (cfg, _) = pinned(&pinned_spot(None, Some(&sha), Some(dir.path().into()))).unwrap();
+        assert!(cfg.cty_table().is_allocated("QQ9ZZZ"));
+        assert!(!cfg.cty_table().is_allocated("K1ABC"));
+    }
+    /// `--cty-sha256` > `MANTA_SPOT_CTY_SHA256` > `[spot].cty_sha256`. An
+    /// all-digit hash from the environment stays a string.
+    #[test]
+    fn cli_pin_beats_env_beats_file() {
+        use std::ffi::OsString;
+        let (file, env, cli) = ("a".repeat(64), "1".repeat(64), "c".repeat(64));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manta.toml");
+        std::fs::write(&path, format!("[spot]\ncty_sha256 = '{file}'\n")).unwrap();
+        let loaded = config::load(Some(&path), config::Env::Read(&[])).unwrap();
+        assert_eq!(loaded.spot.cty_sha256.as_deref(), Some(file.as_str()));
+        let vars = [(
+            OsString::from("MANTA_SPOT_CTY_SHA256"),
+            OsString::from(&env),
+        )];
+        let loaded = config::load(Some(&path), config::Env::Read(&vars)).unwrap();
+        assert_eq!(loaded.spot.cty_sha256.as_deref(), Some(env.as_str()));
+        let none = resolve_spot_pinned(
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            CliPins::default(),
+            None,
+            &loaded.spot,
+        );
+        assert_eq!(none.cty_sha256.as_deref(), Some(env.as_str()));
+        let pins = CliPins {
+            cty_sha256: Some(cli.clone()),
+            scp_sha256: None,
+        };
+        let r = resolve_spot_pinned(vec![], None, None, None, None, pins, None, &loaded.spot);
+        assert_eq!(r.cty_sha256.as_deref(), Some(cli.as_str()));
     }
     #[test]
     fn build_pipeline_config_rejects_a_cty_file_with_no_prefixes() {
@@ -6699,16 +7511,76 @@ mod tests {
             },
             std::time::UNIX_EPOCH,
             0,
-            table.clone(),
+            std::sync::Arc::new(manta_spot::reference::ReferenceLists::new(
+                table.clone(),
+                std::sync::Arc::new(manta_spot::scp::Set::bundled()),
+            )),
+            &PipelineConfig {
+                cty: Some(table.clone()),
+                ..Default::default()
+            },
         )
         .unwrap();
-        assert!(std::sync::Arc::ptr_eq(&server.cty, &table));
-        assert!(!geography_is_unresolved(&server.cty, "QQ9ZZZ"));
-        let entry = server.cty.lookup("QQ9ZZZ").unwrap();
+        let cty = server.lists.cty.load();
+        assert!(std::sync::Arc::ptr_eq(&cty, &table));
+        assert!(!geography_is_unresolved(&cty, "QQ9ZZZ"));
+        let entry = cty.lookup("QQ9ZZZ").unwrap();
         assert_eq!(
             (&*entry.continent, entry.cq_zone, entry.lat, entry.lon),
             ("NA", 5, 40.0, -75.0)
         );
+        let _ = server.shutdown_tx.send(true);
+        test_runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    }
+    /// The built-in cty.dat and MASTER.SCP as the shared lists a test's
+    /// `start_spot_server` needs.
+    fn bundled_reference_lists() -> std::sync::Arc<manta_spot::reference::ReferenceLists> {
+        std::sync::Arc::new(manta_spot::reference::ReferenceLists::new(
+            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            std::sync::Arc::new(manta_spot::scp::Set::bundled()),
+        ))
+    }
+    // MAN-316: the daemon's per-spot geography check reads the table in use
+    // now, so a refreshed cty.dat changes it without a restart, and the
+    // station side is checked against the same (current) table.
+    #[test]
+    fn published_spot_geography_follows_a_swapped_cty_table() {
+        let lists = bundled_reference_lists();
+        let loaded = loaded_from("[server]\nstation_callsign = 'QQ9ZZZ'\nbind_addr = '127.0.0.1'\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n");
+        let (test_runtime, server) = start_spot_server(
+            loaded.server.unwrap(),
+            vec![],
+            None,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0),
+                freq_calibration: 1.0,
+            },
+            std::time::UNIX_EPOCH,
+            0,
+            lists.clone(),
+            &PipelineConfig::default(),
+        )
+        .unwrap();
+        let cty = server.lists.cty.load();
+        assert!(geography_is_unresolved(&cty, "QQ9ZZZ"));
+        assert!(station_geography_unresolved(&cty, &server.station_callsign));
+        // The vendored dxcc.tsv has no QQ9 row, so the test entity gets one
+        // here: resolved geography needs an ADIF number as well as an entry.
+        lists.cty.store(std::sync::Arc::new(
+            manta_spot::cty::Table::parse_with_dxcc(
+                &format!("{}{QQ9_ENTITY}", manta_spot::CTY_DAT),
+                &format!("{}QQ9\t999\tTest DXpedition\n", manta_spot::DXCC_TSV),
+            ),
+        ));
+        let cty = server.lists.cty.load();
+        assert!(!geography_is_unresolved(&cty, "QQ9ZZZ"));
+        assert!(!station_geography_unresolved(
+            &cty,
+            &server.station_callsign
+        ));
         let _ = server.shutdown_tx.send(true);
         test_runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     }
@@ -6741,7 +7613,7 @@ mod tests {
         let cli = Cli::command();
         for name in ["decode", "run", "listen", "soak", "doctor"] {
             let command = cli.find_subcommand(name).unwrap();
-            for flag in ["cty", "scp"] {
+            for flag in ["cty", "scp", "cty-sha256", "scp-sha256"] {
                 assert!(
                     command
                         .get_arguments()
@@ -7021,7 +7893,8 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            bundled_reference_lists(),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -7853,7 +8726,8 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            bundled_reference_lists(),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -7913,7 +8787,8 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            bundled_reference_lists(),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -7971,7 +8846,8 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            bundled_reference_lists(),
+            &PipelineConfig::default(),
         );
         assert!(
             result.is_ok(),
@@ -8005,7 +8881,8 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            bundled_reference_lists(),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -8112,7 +8989,8 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            bundled_reference_lists(),
+            &PipelineConfig::default(),
         ) else {
             panic!("half a lat/lon pair must not start the servers");
         };
@@ -8169,7 +9047,8 @@ mod tests {
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            bundled_reference_lists(),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -8966,7 +9845,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             allowlist: vec!["W1AW".into()],
             ..Default::default()
         };
-        let r = resolve_spot(vec!["K1ABC".into()], None, None, None, None, &spot);
+        let r = resolve_spot(vec!["K1ABC".into()], None, None, None, None, None, &spot);
         assert_eq!(r.allowlist, vec!["K1ABC".to_string()]);
     }
 
@@ -8976,7 +9855,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             allowlist: vec!["W1AW".into()],
             ..Default::default()
         };
-        let r = resolve_spot(Vec::new(), None, None, None, None, &spot);
+        let r = resolve_spot(Vec::new(), None, None, None, None, None, &spot);
         assert_eq!(r.allowlist, vec!["W1AW".to_string()]);
     }
 
@@ -8990,6 +9869,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let r = resolve_spot(
             Vec::new(),
             Some(PathBuf::from("cli.txt")),
+            None,
             None,
             None,
             None,
@@ -9277,6 +10157,9 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("notch", "spot.notch_path"),
         ("cty", "spot.cty_path"),
         ("scp", "spot.scp_path"),
+        ("cty_sha256", "spot.cty_sha256"),
+        ("scp_sha256", "spot.scp_sha256"),
+        ("patterns", "spot.pattern_path"),
         ("engine", "decode.engine"),
         ("rbn_compare", "rbn_compare.enabled"),
         ("rbn_spotter", "rbn_compare.spotters"),
@@ -9435,6 +10318,19 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             ("spot.notch_path", "[spot]\nnotch_path = \"n.txt\"\n"),
             ("spot.cty_path", "[spot]\ncty_path = 'cty.dat'\n"),
             ("spot.scp_path", "[spot]\nscp_path = 'MASTER.SCP'\n"),
+            (
+                "spot.cty_sha256",
+                "[spot]\ncty_sha256 = 'e9ff91a3c3ab28c5f7dbcffb4280944a84645ed53d41cb4c68a41f132ee13fd1'\n",
+            ),
+            (
+                "spot.scp_sha256",
+                "[spot]\nscp_sha256 = '00692208fa86b1498dcd6fc0f88e14d2a1a0462ba5d481855da5de69be4e3cf0'\n",
+
+            ),
+            (
+                "spot.pattern_path",
+                "[spot]\npattern_path = 'patterns.lst'\n",
+            ),
             ("decode.engine", "[decode]\nengine = \"legacy\"\n"),
             (
                 "rbn_compare.enabled",
@@ -9490,6 +10386,19 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     }
 
     #[test]
+    fn sett_advertises_the_configured_minimal_validation_level() {
+        let cfg = test_server_config("W3XYZ");
+        let profile = station_profile(
+            &cfg,
+            14_040_000.0,
+            (-5_000.0, 5_000.0),
+            1.0,
+            manta_spot::ValidationLevel::Minimal,
+        );
+        assert_eq!(profile.sett.to_string(), "SETT: vlMinimal 14035.0-14045.0");
+    }
+
+    #[test]
     fn sett_advertises_a_rig_audio_source_only_above_its_dial_frequency() {
         // `--source` WAV / an audio device with --dial-freq-hz: analytic
         // audio carries spectrum ONLY above the dial, over the rig's ~3 kHz
@@ -9503,6 +10412,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 manta_input::AUDIO_PASSBAND_HI_HZ,
             ),
             1.0,
+            manta_spot::ValidationLevel::Normal,
         );
         assert_eq!(
             profile.sett.to_string(),
@@ -9517,8 +10427,20 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         // bounds have to move with them.
         let cfg = test_server_config("W3XYZ");
         let factor = manta_spot::calibration_factor_from_ppm(1_000.0).unwrap();
-        let corrected = station_profile(&cfg, 14_040_000.0, (-5_000.0, 5_000.0), factor);
-        let raw = station_profile(&cfg, 14_040_000.0, (-5_000.0, 5_000.0), 1.0);
+        let corrected = station_profile(
+            &cfg,
+            14_040_000.0,
+            (-5_000.0, 5_000.0),
+            factor,
+            manta_spot::ValidationLevel::Normal,
+        );
+        let raw = station_profile(
+            &cfg,
+            14_040_000.0,
+            (-5_000.0, 5_000.0),
+            1.0,
+            manta_spot::ValidationLevel::Normal,
+        );
         assert_eq!(raw.sett.to_string(), "SETT: vlNormal 14035.0-14045.0");
         assert_eq!(corrected.sett.to_string(), "SETT: vlNormal 14049.0-14059.1");
     }
@@ -9604,7 +10526,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            bundled_reference_lists(),
+            &PipelineConfig::default(),
         )
         .unwrap();
 
@@ -9652,7 +10575,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
-            std::sync::Arc::new(manta_spot::cty::Table::bundled()),
+            bundled_reference_lists(),
+            &PipelineConfig::default(),
         )
         .unwrap();
 

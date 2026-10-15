@@ -6,7 +6,7 @@
 //! two in step.
 
 use crate::band::{allocations, band_for_freq_hz};
-use manta_spot::{Decision, Reason, Support, Verdict, REQUIRED_REPS};
+use manta_spot::{Decision, Reason, Support, Verdict};
 use serde::Serialize;
 
 /// Every `kind` the live stream carries, in `/metrics` label order.
@@ -222,6 +222,7 @@ pub struct CandidateDecisionRecord {
     pub reason: Option<&'static str>,
     pub reps: Option<u32>,
     pub required_reps: u32,
+    pub pattern_tier: Option<&'static str>,
     pub rival: Option<CandidateRow>,
     pub spot_id: Option<String>,
 }
@@ -242,7 +243,8 @@ impl CandidateDecisionRecord {
             decision: decision_label(d.verdict),
             reason: d.reason.map(reason_label),
             reps: d.reps,
-            required_reps: REQUIRED_REPS as u32,
+            required_reps: d.required_reps,
+            pattern_tier: d.pattern_tier.map(|tier| tier.as_str()),
             rival: d
                 .rival
                 .as_ref()
@@ -320,7 +322,7 @@ pub fn reason_label(r: Reason) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use manta_spot::{Rival, Spot, SpotType};
+    use manta_spot::{PatternTier, Rival, Spot, SpotType};
 
     fn ch(freq_hz: f64, floor_db: f32, occupied: bool) -> ChannelLevel {
         ChannelLevel {
@@ -442,6 +444,8 @@ mod tests {
             verdict,
             reason,
             reps: Some(2),
+            required_reps: 5,
+            pattern_tier: Some(PatternTier::Unlisted),
             rival: None,
             spot: None,
         }
@@ -480,6 +484,33 @@ mod tests {
     }
 
     #[test]
+    fn unlisted_pattern_decision_reports_five_required_repetitions() {
+        let d = decision(Verdict::Withheld, Some(Reason::Repetition));
+        let line =
+            serde_json::to_string(&CandidateDecisionRecord::new("W1AW", 1, &d, None)).unwrap();
+        assert!(
+            line.contains(
+                r#""reason":"repetition","reps":2,"requiredReps":5,"patternTier":"unlisted""#
+            ),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn allowlisted_decision_reports_one_required_repetition_and_no_pattern_tier() {
+        let mut d = decision(Verdict::Spotted, None);
+        d.reps = Some(1);
+        d.required_reps = 1;
+        d.pattern_tier = None;
+        let line =
+            serde_json::to_string(&CandidateDecisionRecord::new("W1AW", 1, &d, None)).unwrap();
+        assert!(
+            line.contains(r#""reps":1,"requiredReps":1,"patternTier":null"#),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn candidate_decision_line_for_each_reason() {
         let mut d = decision(Verdict::Withheld, Some(Reason::Variant));
         d.rival = Some(Rival {
@@ -497,7 +528,7 @@ mod tests {
                 None
             ))
             .unwrap(),
-            r#"{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000044,"trackId":9,"call":"W4KTNL","frequency":14031200,"band":"20m","spotType":"de","decision":"withheld","reason":"variant","reps":2,"requiredReps":2,"rival":{"call":"W4KCL","reps":2,"confSum":1.016},"spotId":null}"#
+            r#"{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000044,"trackId":9,"call":"W4KTNL","frequency":14031200,"band":"20m","spotType":"de","decision":"withheld","reason":"variant","reps":2,"requiredReps":5,"patternTier":"unlisted","rival":{"call":"W4KCL","reps":2,"confSum":1.016},"spotId":null}"#
         );
         let spot = Spot {
             callsign: "W4KTNL".into(),
@@ -511,6 +542,7 @@ mod tests {
         };
         let mut spotted = decision(Verdict::Spotted, None);
         spotted.spot = Some(spot);
+        spotted.reps = Some(5);
         assert_eq!(
             serde_json::to_string(&CandidateDecisionRecord::new(
                 "W1AW",
@@ -519,7 +551,7 @@ mod tests {
                 Some("W1AW:1:9:0:W4KTNL".into())
             ))
             .unwrap(),
-            r#"{"kind":"candidateDecision","deCall":"W1AW","timestamp":1,"trackId":9,"call":"W4KTNL","frequency":14031200,"band":"20m","spotType":"de","decision":"spotted","reason":null,"reps":2,"requiredReps":2,"rival":null,"spotId":"W1AW:1:9:0:W4KTNL"}"#
+            r#"{"kind":"candidateDecision","deCall":"W1AW","timestamp":1,"trackId":9,"call":"W4KTNL","frequency":14031200,"band":"20m","spotType":"de","decision":"spotted","reason":null,"reps":5,"requiredReps":5,"patternTier":"unlisted","rival":null,"spotId":"W1AW:1:9:0:W4KTNL"}"#
         );
         let cases = [
             (

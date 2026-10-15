@@ -356,7 +356,7 @@
       "type": "stat",
       "id": 6,
       "title": "Active tracks",
-      "description": "manta_active_tracks: signals the decoder is following now.",
+      "description": "manta_active_tracks: keyed CW tracks being decoded (excludes speech, data and swept carriers since MAN-313).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -580,7 +580,7 @@
       "type": "timeseries",
       "id": 12,
       "title": "Active tracks",
-      "description": "manta_active_tracks: signals the decoder is following. Reads 0 while the source is in an outage.",
+      "description": "manta_active_tracks: keyed CW tracks being decoded (excludes speech, data and swept carriers since MAN-313).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

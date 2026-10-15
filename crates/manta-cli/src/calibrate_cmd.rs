@@ -349,6 +349,9 @@ fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<Str
         notch: _,
         cty: _,
         scp: _,
+        cty_sha256: _,
+        scp_sha256: _,
+        patterns: _,
         // Exempt: RBN comparison grades spots after decoding, not the
         // input (calibrate has no --rbn-compare/--rbn-spotter flags).
         rbn: _,
@@ -470,6 +473,12 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
     )?;
     eprintln!("{}", measuring_line(&planned, duration));
     let report = manta_engine::calibrate(src, &planned, &opts)?;
+    if report.bad_samples > 0 {
+        eprintln!(
+            "{}",
+            crate::fmt::bad_samples_warning(&spec.input_label(), report.bad_samples)
+        );
+    }
 
     // The file's own value, read from its text: the loaded config already
     // carries the environment overlay.
@@ -702,6 +711,7 @@ mod tests {
             duration_s: 60.0,
             search_ppm: 50.0,
             references,
+            bad_samples: 0,
         }
     }
 
@@ -831,7 +841,15 @@ mod tests {
             dial_freq_hz: Some(7_000_000.0),
             capture_rate_hz: None,
             replay_epoch: None,
-            spot: crate::resolve_spot(Vec::new(), None, None, None, None, &Default::default()),
+            spot: crate::resolve_spot(
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                &Default::default(),
+            ),
             rbn_compare: None,
             notes: Vec::new(),
             replaced_file_source: None,

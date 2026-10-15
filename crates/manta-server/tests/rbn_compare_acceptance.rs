@@ -322,7 +322,10 @@ impl Harness {
                 manta_server::json_stream::JsonStreamConfig {
                     bus: bus2,
                     metrics: metrics2,
-                    cty: Arc::new(Table::parse(CTY_FIXTURE)),
+                    lists: Arc::new(manta_spot::reference::ReferenceLists::new(
+                        Arc::new(Table::parse(CTY_FIXTURE)),
+                        Arc::new(manta_spot::scp::Set::bundled()),
+                    )),
                     station_call: STATION_CALL.to_string(),
                     station_location: None,
                     decoder_version: "manta-test".to_string(),

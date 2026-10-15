@@ -1193,6 +1193,7 @@ mod tests {
             spots,
             timing: None,
             rtty: Vec::new(),
+            bad_samples: 0,
             sample_rate_hz: 192_000.0,
         }
     }

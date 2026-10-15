@@ -86,3 +86,68 @@ fn clean_signal_decodes_correctly_after_192khz_to_48khz_decimation() {
         assert_eq!(ev["track_id"].as_u64(), Some(1));
     }
 }
+
+/// MAN-196: a signal just inside the trusted band still decodes at the
+/// golden standard. +21 kHz on a 96k->48k decimation sits at the -0.05 dB
+/// point of the final halfband stage -- well inside the 21 724.8 Hz
+/// trusted boundary (0.4526 x 48 000) -- so the rim-inside channel must
+/// be unaffected by the trusted band's advertisement and spawn veto.
+/// Research-measured at this cell: freq error 1.5 Hz, CER 0.0103, one
+/// track. The 25 Hz / CER < 0.02 bounds reuse this file's existing
+/// golden gate.
+#[test]
+fn rim_inside_the_trusted_band_still_decodes_at_the_golden_standard() {
+    let mut spec = manta_testkit::vectors::v1();
+    spec.fs = 96_000.0;
+    spec.signals[0].offset_hz = 21_000.0;
+    let rendered = manta_testkit::vectors::render(&spec).unwrap();
+
+    let mut decimator = Decimator::new(96_000.0, 2).unwrap();
+    let decimated: Vec<Complex32> = decimator.process(&rendered.samples);
+    assert_eq!(decimator.fs_out(), 48_000.0);
+
+    let dir = tempfile::tempdir().unwrap();
+    manta_testkit::wav::write_fixture(
+        dir.path(),
+        "decimated_v1_rim_inside",
+        &decimated,
+        48_000.0,
+        spec.center_freq_hz,
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_manta"))
+        .args(["decode", "--json"])
+        .arg(dir.path().join("decimated_v1_rim_inside.wav"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    let decoded = report["text"].as_str().unwrap();
+    let cer_val = manta_testkit::cer::cer(&rendered.keyed_texts[0], decoded);
+    assert!(
+        cer_val < 0.02,
+        "rim-inside char accuracy must be >= 98% (CER < 0.02), got CER {cer_val:.4}\n\
+         expected: {}\ndecoded:  {}",
+        rendered.keyed_texts[0],
+        decoded
+    );
+
+    let freq = report["freq_hz"].as_f64().unwrap();
+    assert!(
+        (freq - rendered.expected_freq_hz).abs() <= 25.0,
+        "freq {} expected {} (err {})",
+        freq,
+        rendered.expected_freq_hz,
+        (freq - rendered.expected_freq_hz).abs()
+    );
+
+    for ev in report["events"].as_array().unwrap() {
+        assert_eq!(ev["track_id"].as_u64(), Some(1));
+    }
+}

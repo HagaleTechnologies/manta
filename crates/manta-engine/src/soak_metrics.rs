@@ -210,6 +210,11 @@ pub fn soak_with_metrics(
         // real passband, as `listen` does.
         let (lo, hi) = src.rf_passband_hz();
         tm.set_rf_passband_hz(lo, hi);
+        // MAN-196: veto spawns outside the source's trusted band, as
+        // `listen` does (`None`, no decimator, leaves the manager as is).
+        if let Some((lo, hi)) = src.trusted_band_hz() {
+            tm.set_trusted_band_hz(lo, hi);
+        }
         let mut validator = cfg.validator(fs)?;
 
         let pad_samples = ch.filter_len();
@@ -351,6 +356,9 @@ mod tests {
         samples: Vec<Complex32>,
         cursor: usize,
         fs: f64,
+        /// MAN-196: `None` mimics every non-decimated source (the trait
+        /// default); `Some` mimics a `DecimatingSource`.
+        trusted_band_hz: Option<(f64, f64)>,
     }
 
     impl IqSource for VecSource {
@@ -359,6 +367,9 @@ mod tests {
         }
         fn center_freq_hz(&self) -> f64 {
             0.0
+        }
+        fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+            self.trusted_band_hz
         }
         fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
             let n = buf.len().min(self.samples.len() - self.cursor);
@@ -382,6 +393,7 @@ mod tests {
             samples,
             cursor: 0,
             fs,
+            trusted_band_hz: None,
         });
         let report = soak_with_metrics(
             src,
@@ -392,5 +404,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.final_static_crashes, 1);
+    }
+
+    /// MAN-196: `soak_with_metrics` applies the source's trusted band to
+    /// its track manager exactly as `listen` does, so a decimated source
+    /// spawns no track in the decimator's transition band on this path
+    /// either. Same scene as listen's
+    /// `trusted_band_vetoes_spawns_beyond_the_decimator_band`.
+    #[test]
+    fn soak_with_metrics_applies_the_trusted_band() {
+        let mut spec = manta_testkit::vectors::v1();
+        spec.fs = 48_000.0;
+        spec.duration_s = 20.0;
+        spec.signals[0].offset_hz = 23_500.0;
+        spec.signals[0].snr_2500_db = 10.0;
+        spec.center_freq_hz = 0.0;
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let trusted = manta_dsp::decimate::TRUSTED_HALF_BAND_FRACTION * spec.fs;
+
+        let peak_tracks = |trusted_band_hz: Option<(f64, f64)>| {
+            let src = Box::new(VecSource {
+                samples: rendered.samples.clone(),
+                cursor: 0,
+                fs: spec.fs,
+                trusted_band_hz,
+            });
+            soak_with_metrics(
+                src,
+                &PipelineConfig::default(),
+                Duration::from_secs(600),
+                Duration::from_secs(600),
+                |_| {},
+            )
+            .unwrap()
+            .peak_active_tracks
+        };
+
+        assert!(
+            peak_tracks(None) >= 1,
+            "control without a trusted band must detect the signal"
+        );
+        assert_eq!(
+            peak_tracks(Some((-trusted, trusted))),
+            0,
+            "no track may spawn beyond the trusted band in soak_with_metrics"
+        );
     }
 }

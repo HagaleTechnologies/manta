@@ -119,6 +119,168 @@ fn a_redirected_daemon_log_has_no_escape_codes() {
     assert!(has_banner(&stderr), "no plain banner line: {stderr}");
 }
 
+/// MAN-196: a decimated capture states its usable passband once at
+/// startup -- one stderr info line, before the readiness marker, in the
+/// static-crash notice position. The fixture is v1 at its native 96 kS/s,
+/// so `--capture-rate-hz 48000` puts a real decimator in the path.
+#[test]
+fn a_decimated_capture_states_its_usable_passband_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let line = "decimated capture 48000 Hz: usable passband -21725 to 21725 Hz; \
+                channels beyond (decimator transition band) are not tracked";
+    let decimated = stderr_of(&daemon(
+        dir.path(),
+        &["--capture-rate-hz", "48000"],
+        &[("RUST_LOG", "info")],
+    ));
+    assert_eq!(
+        decimated.lines().filter(|l| l.contains(line)).count(),
+        1,
+        "the usable-passband line must appear exactly once: {decimated}"
+    );
+    let line_at = decimated.find(line).expect("line present");
+    let ready_at = decimated.find(READY).expect("readiness marker");
+    assert!(
+        line_at < ready_at,
+        "the usable-passband line must precede the readiness marker: {decimated}"
+    );
+
+    // Without --capture-rate-hz the line never appears: the
+    // non-decimated path is unchanged in every observable respect.
+    let plain = stderr_of(&daemon(dir.path(), &[], &[("RUST_LOG", "info")]));
+    assert!(!plain.contains("decimated capture"), "{plain}");
+}
+
+/// Writes a mono 48 kS/s rig-audio WAV (constant nonzero samples -- real
+/// content, not digital silence) for the narrow-passband notice test.
+fn mono_audio_wav(dir: &Path) -> PathBuf {
+    let path = dir.join("rig.wav");
+    let mut writer = hound::WavWriter::create(
+        &path,
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        },
+    )
+    .unwrap();
+    for _ in 0..48_000 {
+        writer.write_sample(0.25_f32).unwrap();
+    }
+    writer.finalize().unwrap();
+    path
+}
+
+/// MAN-196 (round-1 review, PR #300): when decimation wraps an already
+/// narrower source, the notice must state the source's *intersected* RF
+/// passband, not the decimator's symmetric +/-trusted span. A rig-audio
+/// passband is one-sided (300..3000 Hz), and `--capture-rate-hz 24000`
+/// puts a real decimator (factor 2) around it with a +/-10 862.4 Hz
+/// trusted band -- the old notice claimed "usable passband -10862 to
+/// 10862 Hz", spectrum the rig never delivers and far wider than
+/// `manta check`/SETT advertise for the same source. Both `run` and
+/// `soak` print the same line; both must state the intersection.
+#[test]
+fn a_decimated_narrow_source_states_its_intersected_passband() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = mono_audio_wav(dir.path());
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
+        .current_dir(dir.path())
+        .args([
+            "run",
+            "--cty",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../manta-spot/data/cty.dat"),
+            "--source",
+            wav.to_str().unwrap(),
+            "--capture-rate-hz",
+            "24000",
+            "--dial-freq-hz",
+            "14000000",
+        ])
+        .env_remove("NO_COLOR")
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+    let run_err = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(
+        run_err
+            .lines()
+            .filter(|l| l.contains("decimated capture 24000 Hz: usable passband 300 to 3000 Hz"))
+            .count(),
+        1,
+        "run's usable-passband line must state the intersected rig passband \
+         (300 to 3000 Hz, not the symmetric trusted span) exactly once: {run_err}"
+    );
+    let soak = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
+        .current_dir(dir.path())
+        .args([
+            "soak",
+            "--duration",
+            "1",
+            "--cty",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../manta-spot/data/cty.dat"),
+            "--source",
+            wav.to_str().unwrap(),
+            "--capture-rate-hz",
+            "24000",
+            "--dial-freq-hz",
+            "14000000",
+        ])
+        .env_remove("NO_COLOR")
+        .env_remove("RUST_LOG")
+        .output()
+        .unwrap();
+    let soak_err = String::from_utf8_lossy(&soak.stderr);
+    assert_eq!(
+        soak_err
+            .lines()
+            .filter(|l| l.contains("decimated capture 24000 Hz: usable passband 300 to 3000 Hz"))
+            .count(),
+        1,
+        "soak's usable-passband line must state the intersected rig passband \
+         (300 to 3000 Hz, not the symmetric trusted span) exactly once: {soak_err}"
+    );
+}
+
+/// MAN-196: `soak` states a decimated capture's usable passband with the
+/// same line `run` logs, exactly once on stderr, and not at all without a
+/// decimator in the path.
+#[test]
+fn a_decimated_soak_states_its_usable_passband_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = write_fixture(dir.path(), &short_v1());
+    let line = "decimated capture 48000 Hz: usable passband -21725 to 21725 Hz; \
+                channels beyond (decimator transition band) are not tracked";
+    let soak = |extra_args: &[&str]| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_manta"));
+        cmd.args([
+            "soak",
+            "--duration",
+            "1",
+            "--cty",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../manta-spot/data/cty.dat"),
+            "--source",
+            wav.to_str().unwrap(),
+            "--source-iq",
+            "--dial-freq-hz",
+            "14000000",
+        ])
+        .args(extra_args)
+        .env_remove("NO_COLOR")
+        .env_remove("RUST_LOG");
+        stderr_of(&cmd.output().unwrap())
+    };
+    let decimated = soak(&["--capture-rate-hz", "48000"]);
+    assert_eq!(
+        decimated.lines().filter(|l| l.contains(line)).count(),
+        1,
+        "the usable-passband line must appear exactly once: {decimated}"
+    );
+    let plain = soak(&[]);
+    assert!(!plain.contains("decimated capture"), "{plain}");
+}
+
 #[test]
 fn quiet_keeps_warnings_and_drops_info() {
     let dir = tempfile::tempdir().unwrap();

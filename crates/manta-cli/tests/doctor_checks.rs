@@ -41,11 +41,17 @@ fn silent_48k_wav(dir: &Path, seconds: u32) -> PathBuf {
 
 /// A port nothing listens on right now (bound, read, released).
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    let [port] = free_ports();
+    port
+}
+
+/// `N` distinct ports nothing listens on right now. All `N` listeners are
+/// held until every port is read: releasing each before binding the next
+/// lets the OS hand the same port out twice (Windows does, and then the
+/// config is rejected as "two servers cannot share a port").
+fn free_ports<const N: usize>() -> [u16; N] {
+    let held: [TcpListener; N] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
+    held.map(|l| l.local_addr().unwrap().port())
 }
 
 /// A UDP port nothing answers on, for an NTP server that refuses.
@@ -133,7 +139,7 @@ impl Setup {
         let wav = silent_48k_wav(dir.path(), 4);
         Self {
             dir,
-            ports: [free_port(), free_port(), free_port()],
+            ports: free_ports(),
             uplink: TcpListener::bind("127.0.0.1:0").unwrap(),
             wav,
             station: "W1AW",
@@ -386,10 +392,12 @@ fn the_example_callsign_fails_the_config_check() {
     );
 }
 
-/// The keys `manta doctor --json` printed before MAN-126.
+/// The keys `manta doctor --json` printed before MAN-126, plus MAN-313's
+/// `detector_confirmations`.
 const REPORT_KEYS: &[&str] = &[
     "center_freq_hz",
     "chars_decoded",
+    "detector_confirmations",
     "distinct_chars",
     "duration",
     "sample_rate_hz",
