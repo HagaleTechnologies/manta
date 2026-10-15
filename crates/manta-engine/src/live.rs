@@ -273,6 +273,15 @@ impl LiveTap {
         }));
     }
 
+    /// MAN-13: after one input's batch in a multi-input session, forgets
+    /// that input's tracks its manager no longer holds (`live` is sorted).
+    /// Input `input` of `n_inputs` owns ids `≡ input + 1 (mod n_inputs)`.
+    pub(crate) fn retain_input_tracks(&mut self, input: usize, n_inputs: usize, live: &[u32]) {
+        let n = n_inputs.max(1);
+        self.tracks
+            .retain(|id, _| (*id as usize).saturating_sub(1) % n != input || live.binary_search(id).is_ok());
+    }
+
     /// After each batch, forgets tracks the manager has removed. Once per
     /// second of stream time, publishes a band sample. Reads and resets
     /// the occupancy window either way, so each sample covers about one
