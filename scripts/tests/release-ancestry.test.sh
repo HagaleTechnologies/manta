@@ -130,6 +130,8 @@ for wf in release-publish.yml release.yml; do
   gate="$(job_block "$path" validate-tag)"
   build="$(job_block "$path" build)"
   require "$build" '    needs: validate-tag' "$wf: platform builds bypass validation"
+  # MAN-82: the Soapy archive is a release build too.
+  require "$(job_block "$path" build-soapy)" '    needs: validate-tag' "$wf: Soapy build bypasses validation"
   if grep -Eq '^    (if|environment):|continue-on-error:|\|\| true' <<< "$gate"; then
     fail "$wf: validation is skipped, environment-gated or ignores errors"
   fi
@@ -171,7 +173,8 @@ for job in docker-publish-release publish-latest release; do
     docker-publish-release) dependency='    needs: [validate-tag, build]' ;;
     publish-latest) dependency='    needs: [validate-tag, docker-publish-release]' ;;
     # MAN-298: the GitHub Release waits for the owner's approval, not for the image.
-    release) dependency='    needs: [validate-tag, build]' ;;
+    # MAN-82: and for both archive producers, so the Soapy archive is never left out.
+    release) dependency='    needs: [validate-tag, build, build-soapy]' ;;
   esac
   require "$block" "$dependency" "$job: dependency chain changed"
   require "$block" '    environment: ghcr-publish' "$job: missing production approval environment"

@@ -194,6 +194,13 @@ for wf in release.yml release-publish.yml; do
   if ! grep -Eq '^    needs: \[?validate-tag\]?$' <<< "$build_job"; then
     fail "$wf: the build job does not declare needs: validate-tag"
   fi
+  # MAN-82: the Soapy archive's build is gated by the same tag check.
+  soapy_job="$(job_block "$path" build-soapy)"
+  if [ -z "$soapy_job" ]; then
+    fail "$wf: no '  build-soapy:' job header found, so nothing was checked"
+  elif ! grep -Eq '^    needs: \[?validate-tag\]?$' <<< "$soapy_job"; then
+    fail "$wf: the build-soapy job does not declare needs: validate-tag"
+  fi
   if grep -Eq '^    if:' <<< "$gate_job"; then
     fail "$wf: validate-tag has a job-level if:, which skips build when false"
   fi

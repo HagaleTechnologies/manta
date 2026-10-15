@@ -31,15 +31,21 @@ RUNBOOK = "docs/RUNBOOKS/release.md"
 RUNBOOK_HEADING = "## Verifying a downloaded release"
 RUNBOOK_LINK = RUNBOOK + "#verifying-a-downloaded-release"
 RETRY_HEADING = "## If the image publish fails"
-# The release's five archives, as the build matrix names them; sorted under any collation.
+# The release's six archives: the build matrix's five and build-soapy's one (MAN-82); sorted under
+# any collation.
 ARCHIVES = (
     "manta-linux-arm64.tar.gz",
+    "manta-linux-x86_64-soapy.tar.gz",
     "manta-linux-x86_64.tar.gz",
     "manta-macos-arm64.tar.gz",
     "manta-macos-x86_64.tar.gz",
     "manta-windows-x86_64.zip",
 )
 DOWNLOADED = "manta-linux-x86_64.tar.gz"
+# MAN-82: the jobs whose `manta-*` uploads the release job publishes, and the jobs it must not wait for.
+ARCHIVE_PRODUCERS = ("build", "build-soapy")
+IMAGE_JOBS = ("docker-publish-release", "docker-build-dispatch", "publish-latest")
+SOAPY_ARCHIVE = "manta-linux-x86_64-soapy.tar.gz"
 # The commands the runbook gives operators; the executed tests below run exactly these.
 LINUX_CHECK = "sha256sum -c --ignore-missing SHA256SUMS"
 MACOS_CHECK = "shasum -a 256 -c --ignore-missing SHA256SUMS"
@@ -177,14 +183,39 @@ class ReleaseJobTests(unittest.TestCase):
         self.assertLess(attest, publish, "fail closed: attest before the Release exists")
 
     def test_download_pattern_keeps_every_build_archive(self):
-        build = wf.job_block(wf.read(WORKFLOW), "build")
+        text = wf.read(WORKFLOW)
+        build = wf.job_block(text, "build")
         names = re.findall(r"^\s*(?:- )?artifact:\s*(\S+)\s*$", "\n".join(wf.code_lines(build)), re.M)
-        self.assertEqual(sorted(n + (".zip" if "windows" in n else ".tar.gz") for n in names), list(ARCHIVES))
-        for name in names:
-            self.assertTrue(fnmatch.fnmatchcase(name, "manta-*"), f"pattern manta-* drops {name}")
         uploads = [s for s in wf.steps(build) if uses(s).startswith("actions/upload-artifact@")]
         self.assertEqual(len(uploads), 1)
         self.assertEqual(with_field(uploads[0], "name"), "${{ matrix.artifact }}")
+        # MAN-82: build-soapy uploads one archive under a literal name.
+        soapy = [s for s in wf.steps(wf.job_block(text, "build-soapy"))
+                 if uses(s).startswith("actions/upload-artifact@")]
+        self.assertEqual(len(soapy), 1)
+        names.append(with_field(soapy[0], "name"))
+        self.assertEqual(with_field(soapy[0], "path"), SOAPY_ARCHIVE)
+        self.assertEqual(sorted(n + (".zip" if "windows" in n else ".tar.gz") for n in names), list(ARCHIVES))
+        for name in names:
+            self.assertTrue(fnmatch.fnmatchcase(name, "manta-*"), f"pattern manta-* drops {name}")
+
+    def test_release_waits_for_every_archive_producer_and_not_the_image(self):
+        # A `manta-*` upload from a job the release does not wait for can be missing when the
+        # download runs; MAN-298 keeps the image's outcome out of the release.
+        text = wf.read(WORKFLOW)
+        needs = wf.field(wf.job_block(text, "release"), "needs")
+        self.assertEqual(needs, "[validate-tag, build, build-soapy]")
+        listed = {n.strip() for n in needs.strip("[]").split(",")}
+        producers = set()
+        for job in wf.job_ids(text):
+            for step in wf.steps(wf.job_block(text, job)):
+                name = with_field(step, "name") or ""
+                if uses(step).startswith("actions/upload-artifact@") and (
+                        fnmatch.fnmatchcase(name, "manta-*") or "matrix.artifact" in name):
+                    producers.add(job)
+        self.assertEqual(producers, set(ARCHIVE_PRODUCERS))
+        self.assertLessEqual(producers, listed, "the release must wait for every archive it publishes")
+        self.assertFalse(listed & set(IMAGE_JOBS), "the release must not wait for the image")
 
     def test_checksum_step_runs_bash_inside_dist(self):
         step = checksum_step()
@@ -211,6 +242,15 @@ class ReleaseJobTests(unittest.TestCase):
                       "the Release body must carry decision D7's label")
         self.assertEqual(with_field(step, "generate_release_notes"), "true",
                          "the body is prepended to the generated notes")
+
+    def test_release_notes_point_soapy_users_at_their_archive(self):
+        # MAN-82: the notes keep the alpha label, the verification link and the ALSA note, and
+        # say which archive SoapySDR users take and what to install first.
+        body = " ".join((with_field(publish_step(), "body") or "").split())
+        for needle in (D7_PHRASE, "#verifying-a-downloaded-release", "libasound2", SOAPY_ARCHIVE,
+                       "Ubuntu 24.04 x86_64", "libsoapysdr0.8", "SoapySDR module", "SDRplay"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle.lower(), body.lower())
 
     def test_semver_prereleases_are_github_prereleases(self):
         self.assertEqual(with_field(publish_step(), "prerelease"), "${{ contains(github.ref_name, '-') }}",
