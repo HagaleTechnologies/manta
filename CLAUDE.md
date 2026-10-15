@@ -314,6 +314,7 @@ by a 20-run merge-queue watch with rollback triggers;
 `test-hpsdr (windows-latest)` stays advisory. See
 docs/DECISIONS/2026-10-15-man371-windows-required-check.md.
 
+<<<<<<< HEAD
 MAN-13: `[[input]]` (one entry per receiver, each named) makes one `run`
 decode several SDRs or receiver channels into one spot output: each input
 has its own thread, channelizer and track manager (`manta-engine::multi`),
@@ -326,6 +327,14 @@ into that entry; SIGHUP reload, list refresh, RTTY marks, `manta_input_*`
 counters and the live-state stream (one `bandState` per input, named in
 `source`) work with several inputs. HPSDR multi-DDC is MAN-307. Guide: docs/GUIDES/multiple-receivers.md. See
 docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md.
+=======
+MAN-235: `manta doctor` keeps its 10 s default; a `WEAK_NO_DECODE` run
+asked for under 60 s adds a stdout `hint:` line to rerun with
+`--duration 60` (`manta gen v1` first spots at 20-21 s). `--strict` exits 0
+for `DECODING`, 3 for every other verdict and 1 for a failed check; without
+it every verdict still exits 0. See
+docs/DECISIONS/2026-10-15-man235-doctor-rerun-hint-and-strict-exit.md.
+>>>>>>> cd9ec8f2897a18cd7243c989ba0ef26d307ca48d
 
 MAN-234: an input sample with a NaN, infinite or larger-than-1e17
 component (`manta-dsp::sample_guard::MAX_SAMPLE_MAGNITUDE`) is replaced

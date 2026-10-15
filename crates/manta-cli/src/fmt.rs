@@ -136,6 +136,31 @@ decode: {} chars ({} distinct), {} confirmed spots\n\
     )
 }
 
+/// The `--duration` a short WEAK_NO_DECODE run is told to retry with.
+/// `manta gen v1`'s first confirmed spot lands between 20 s and 21 s.
+pub const DOCTOR_RERUN_SECS: u64 = 60;
+
+/// MAN-235: the line printed after `verdict:` when a run asked for less
+/// than `DOCTOR_RERUN_SECS` reads WEAK_NO_DECODE, so a short default run
+/// does not leave a healthy chain blaming mode, WPM or the grammar gate.
+/// Kept out of `Verdict::summary()`, whose wording MAN-270 pins.
+pub fn doctor_rerun_hint(
+    report: &manta_engine::DoctorReport,
+    requested: std::time::Duration,
+) -> Option<String> {
+    if report.verdict() != manta_engine::Verdict::WeakNoDecode
+        || requested >= std::time::Duration::from_secs(DOCTOR_RERUN_SECS)
+    {
+        return None;
+    }
+    Some(format!(
+        "hint: a {:.1} s run can end before a working signal is confirmed as a spot; \
+a clean signal can need 20 s or more. Rerun with --duration {DOCTOR_RERUN_SECS} before \
+looking for another cause.\n",
+        report.duration.as_secs_f64()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -255,6 +280,61 @@ mod tests {
         r.tracks_promoted = 0;
         assert!(doctor_report(&r)
             .contains("SNR (2500 Hz reference): no TrackMeta events -- no track ever promoted\n"));
+    }
+
+    #[test]
+    fn doctor_rerun_hint_only_for_a_short_weak_run() {
+        use manta_engine::Verdict;
+        use std::time::Duration;
+        let ten = Duration::from_secs(10);
+        let mut r = manta_engine::DoctorReport {
+            sample_rate_hz: 96000.0,
+            center_freq_hz: 14_000_000.0,
+            duration: ten,
+            tracks_promoted: 1,
+            detector_confirmations: 1,
+            track_meta_count: 9,
+            tracks_closed: 1,
+            snr_db_min: Some(21.0),
+            snr_db_median: Some(21.0),
+            snr_db_max: Some(23.0),
+            chars_decoded: 12,
+            distinct_chars: 9,
+            spots_confirmed: 0,
+            bad_samples: 0,
+        };
+        assert_eq!(r.verdict(), Verdict::WeakNoDecode);
+        let hint = doctor_rerun_hint(&r, ten).expect("a 10 s WEAK_NO_DECODE run hints");
+        assert_eq!(
+            hint,
+            "hint: a 10.0 s run can end before a working signal is confirmed as a spot; a \
+             clean signal can need 20 s or more. Rerun with --duration 60 before looking for \
+             another cause.\n"
+        );
+        assert!(hint.contains("Rerun with --duration 60"));
+        assert!(doctor_rerun_hint(&r, Duration::from_secs(59)).is_some());
+        assert_eq!(
+            doctor_rerun_hint(&r, Duration::from_secs(DOCTOR_RERUN_SECS)),
+            None
+        );
+        r.spots_confirmed = 1;
+        assert_eq!(r.verdict(), Verdict::Decoding);
+        assert_eq!(doctor_rerun_hint(&r, ten), None);
+        r = manta_engine::DoctorReport {
+            tracks_promoted: 0,
+            detector_confirmations: 0,
+            track_meta_count: 0,
+            tracks_closed: 0,
+            snr_db_min: None,
+            snr_db_median: None,
+            snr_db_max: None,
+            chars_decoded: 0,
+            distinct_chars: 0,
+            spots_confirmed: 0,
+            ..r
+        };
+        assert_eq!(r.verdict(), Verdict::NoSignal);
+        assert_eq!(doctor_rerun_hint(&r, ten), None);
     }
 
     #[test]

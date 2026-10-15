@@ -68,6 +68,7 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+<<<<<<< HEAD
 - MAN-13: one `manta run` decodes several receivers into one spot output.
   Write `[[input]]` once per receiver (each with a `name`); every input
   decodes on its own thread into one shared validator, so a station two
@@ -76,6 +77,10 @@ the git history and `docs/DECISIONS/`.
   entries' corrections differ. With several inputs `/healthz` stays `ok`
   while one input is healthy. Single-input runs are unchanged.
 
+=======
+- MAN-235: `manta doctor --strict` exits 3 when no check failed but the
+  verdict is not `DECODING`; without it every verdict still exits 0.
+>>>>>>> cd9ec8f2897a18cd7243c989ba0ef26d307ca48d
 - MAN-234: a `bad_samples` field in `decode --json`, `doctor --json` and
   `calibrate --json` (omitted when 0); a `warning: … bad sample(s) …`
   stderr line from `decode`, `calibrate` and `run`/`listen` (at the first
@@ -123,6 +128,8 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-235: a `manta doctor` run shorter than 60 s that reads
+  `WEAK_NO_DECODE` adds a `hint:` line suggesting `--duration 60`.
 - The in-repo `wiki/` is the project's canonical wiki. GitHub's Wiki tab
   is not used; disabling it remains an owner step. The wiki's stale
   `verified` stamps and `manifest.json` are refreshed and CI-pinned (MAN-152).
