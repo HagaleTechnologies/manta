@@ -457,6 +457,21 @@ class RecordSpotsTests(unittest.TestCase):
         # The report's spot counter never reads a grade file.
         self.assertEqual(fn.load_recorded_spots(self.out), {"2026-10-11": 2})
 
+    def test_record_spots_skips_hello(self):
+        hello = b'{"kind":"hello","schema":"stream.v1","session":"1","seq":0,"historyFrom":1,"resumed":false}'
+        spot = spot_line("W1AW", 1791720000)
+        grade = b'{"kind":"spotGrade","windowClose":1791720180}'
+        srv = LineServer([hello + b"\n" + spot + b"\n" + grade + b"\n"])
+        logs = []
+        stats = self.run_until(srv, 1, logs=logs)
+        self.assertEqual((stats["written"], stats["grades"], stats["invalid"]), (1, 1, 0))
+        self.assertFalse([m for m in logs if m.startswith("invalid line")])
+        self.assertTrue(all(hello not in self.read(name) for name in self.files()))
+
+    def test_classify_line_hello(self):
+        hello = b'{"kind":"hello","schema":"stream.v1","session":"1","seq":0,"historyFrom":1,"resumed":false}'
+        self.assertEqual(fn.classify_line(hello), ("hello", json.loads(hello)))
+
     def test_classify_line_needs_a_numeric_window_close(self):
         kind, obj = fn.classify_line(b'{"kind":"spotGrade","windowClose":1791720180}')
         self.assertEqual(kind, "grade")

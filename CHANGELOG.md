@@ -43,6 +43,12 @@ the git history and `docs/DECISIONS/`.
 - MAN-95: default spot validation requires 2, 3 or 5 distinct-message
   repetitions by callsign-pattern rarity. `[spot].validation_level = "minimal"`
   restores flat 2; `--patterns` overrides the independent reference list.
+- MAN-190: the opt-in `hsmm` engine's evidence front end now confirms
+  mark/space anchors from two actually computed hops instead of a
+  forward-looking prediction, closing a missed-anchor race with the
+  per-hop speed feedback. Evidence hops are released one hop later
+  (`h+1` at constant speed, shared with `edge-legacy`); adaptive input
+  can decode differently. The default `legacy` engine is unchanged.
 
 - A band-wide static crash (lightning) no longer starts tracks across the
   band, and running tracks no longer decode it as extra dits; new
@@ -68,12 +74,22 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+<<<<<<< HEAD
 - `manta-linux-x86_64-soapy.tar.gz`, a release archive whose binary has
   SoapySDR input (`--soapy-driver`, for RTL-SDR, Airspy, SDRplay and
   HackRF) for Ubuntu 24.04 x86_64, so those receivers no longer need a
   build from source. It needs `libsoapysdr0.8` and the receiver's SoapySDR
   module installed; see README's "SoapySDR on Linux x86_64". `manta
   devices` on a binary without Soapy now names this archive (MAN-82).
+=======
+- JSON/WebSocket spot clients now receive a `hello` first, with schema and session
+  identity. Spots and grades carry `seq`; WebSocket `?session=&since=` resumes
+  from their shared history bounded by `history_minutes`. New
+  `manta_json_stream_resumes_total`, `manta_json_stream_replay_abandoned_total`
+  and `manta_json_stream_history_truncated_total` metrics report replay outcomes
+  and loss. Consumers must skip hello records (MAN-137).
+
+>>>>>>> 4e7eeac3730f39a2bc576c84b6898f8439f240e5
 - MAN-235: `manta doctor --strict` exits 3 when no check failed but the
   verdict is not `DECODING`; without it every verdict still exits 0.
 - MAN-234: a `bad_samples` field in `decode --json`, `doctor --json` and

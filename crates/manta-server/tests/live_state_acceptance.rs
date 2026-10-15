@@ -174,6 +174,15 @@ async fn the_spot_stream_never_carries_live_records_and_the_live_stream_never_ca
     let node = spawn_node(16).await;
     let mut live = BufReader::new(TcpStream::connect(node.live).await.unwrap());
     let mut spots = BufReader::new(TcpStream::connect(node.spots).await.unwrap());
+    let mut hello = String::new();
+    tokio::time::timeout(Duration::from_secs(5), spots.read_line(&mut hello))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&hello).unwrap()["kind"],
+        "hello"
+    );
     wait_for_live_subscribers(&node.bus, 1).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     node.bus.publish_live(Arc::from(r#"{"kind":"bandState"}"#));
@@ -379,4 +388,19 @@ async fn records_queued_for_a_failed_websocket_handshake_are_counted_as_dropped(
         .metrics
         .render_prometheus_text()
         .contains("manta_live_records_dropped_total{reason=\"write_failed\"} 3\n"));
+}
+
+#[tokio::test]
+async fn live_state_stream_sends_no_hello() {
+    let node = spawn_node(16).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/?since=abc", node.live))
+        .await
+        .unwrap();
+    node.bus.publish_live(Arc::from(r#"{"kind":"bandState"}"#));
+    let first = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.into_text().unwrap(), r#"{"kind":"bandState"}"#);
 }

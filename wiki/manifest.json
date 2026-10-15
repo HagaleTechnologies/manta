@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-10-15T00:51:02Z",
+  "generated_at": "2026-10-15T01:55:00Z",
   "head_commit": "3805f78",
   "pages": [
     {
@@ -26,7 +26,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:bbf8c98aa0726da4c8005e95e854722e4167dc453ff3e207349abf960d4712c2",
+      "hash": "sha256:d0ba644a071d67a25133644fe1d0361172e71696d71195b1f997c38f25bb5202",
       "id": "decode-chain",
       "kind": "subsystem",
       "links": [
@@ -42,8 +42,8 @@
       ],
       "status": "current",
       "title": "How does the per-track CW decode chain work?",
-      "verified_commit": "60c4339",
-      "verified_date": "2026-10-14",
+      "verified_commit": "3805f78",
+      "verified_date": "2026-10-15",
       "visibility": "public"
     },
     {
@@ -265,7 +265,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:b663b99ab4116f0a03db6186dc9102a21eef07e3dee3cb2a6c7d993d0861a950",
+      "hash": "sha256:eb40916133f50002e9dc5e628cbe0c77e70446b1b950c79c7418423a0d1cba7f",
       "id": "spot-output-contract",
       "kind": "interface",
       "links": [
@@ -282,12 +282,13 @@
         "docs/DECISIONS/2026-10-10-man92-telnet-commands.md",
         "docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md",
         "docs/RUNBOOKS/rbn-comparison.md",
-        "docs/SPOT-SCHEMA.md"
+        "docs/SPOT-SCHEMA.md",
+        "docs/DECISIONS/2026-10-14-man137-json-stream-resume.md"
       ],
       "status": "current",
       "title": "What spot-output contracts does manta expose (telnet RBN + JSON)?",
-      "verified_commit": "d286147",
-      "verified_date": "2026-10-13",
+      "verified_commit": "9636fe0494b4bce7973c3e0c5ad854f9ebc16f73",
+      "verified_date": "2026-10-14",
       "visibility": "public"
     },
     {

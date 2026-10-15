@@ -363,6 +363,13 @@ class ShadowCompareTest(unittest.TestCase):
         self.assertEqual(s["agreement"]["node_spots"], 1)
         self.assertEqual(s["inputs"]["node_malformed_lines"], 1)
 
+    def test_load_node_spots_skips_hello_records(self):
+        npath = os.path.join(self.d, "spots-hello.jsonl")
+        write_lines(npath, ['{"kind":"hello"}', NODE_DAY1[0], '{"kind":"spotGrade"}'])
+        spots, _, malformed, grades = sc.load_node_spots([npath])
+        self.assertEqual([sp["callsign"] for sp in spots], ["W1AW"])
+        self.assertEqual((malformed, grades), (0, 1))
+
     def test_load_node_spots_skips_grade_records(self):
         npath = os.path.join(self.d, "spots-2026-09-09.jsonl")
         grade = json.dumps({

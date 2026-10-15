@@ -1719,6 +1719,7 @@ fn rbn_grade(
     let same_band = matches!(grade, Grade::Match | Grade::Disagree);
     SpotGrade {
         kind: "spotGrade",
+        seq: None,
         spot_id: format!("W3XYZ-1:1:1:960000:W1AW-{grade:?}"),
         call: "W1AW".to_string(),
         band: "20m",
@@ -2866,6 +2867,20 @@ fn claude_md_decision_paths_start_a_word_and_resolve() {
     }
 }
 
+#[test]
+fn spot_schema_transport_points_at_the_stream_contract() {
+    let schema = include_str!("../../../docs/SPOT-SCHEMA.md").replace("\r\n", "\n");
+    let transport = schema
+        .split_once("\n## Transport\n")
+        .unwrap()
+        .1
+        .split("\n## ")
+        .next()
+        .unwrap();
+    assert!(transport.contains("contracts/spots/stream.v1.md"));
+    assert!(!transport.contains("no history"));
+}
+
 /// SPEC §5 is the normative event schema, and `TrackClosed` carries a
 /// `closure` whose kind decides whether deferred evidence is judged,
 /// migrated or discarded (`manta_decode::events::ClosureKind`). PR #154
@@ -2879,6 +2894,51 @@ fn spec_section_5_track_closed_names_its_closure_kinds() {
         assert!(
             s5.contains(needle),
             "SPEC §5's `TrackClosed` entry never names `{needle}`"
+        );
+    }
+}
+
+// ---- MAN-190 (PR #290 review): the docs follow the pending-hop redesign ----
+
+/// MAN-190 added a gotcha to `wiki/pages/decode-chain.md` (v2 evidence
+/// anchors are confirmed from two actual adjacent hops) but left the page
+/// stamped `60c4339 / 2026-10-14`: MAN-152's re-verification, made before
+/// main carried that claim. Same rule as the overview stamp test above.
+#[test]
+fn wiki_decode_chain_verified_stamp_is_not_the_pre_man190_one() {
+    let rel = "wiki/pages/decode-chain.md";
+    let claim = "anchor decisions are confirmed from two *actual* adjacent hops";
+    assert!(
+        doc(rel).contains(claim),
+        "{rel} no longer says `{claim}`; this test pins the stamp to that MAN-190 \
+         gotcha and needs updating with it"
+    );
+    let (commit, date) = wiki_verified_stamp(rel);
+    assert!(
+        commit != "60c4339" && date.as_str() > "2026-10-14",
+        "{rel} still stamps `verified: {commit} / {date}`, MAN-152's re-verification \
+         from before the MAN-190 gotcha: refresh `verified.commit`/`verified.date` (and \
+         the manifest entry) whenever the body is substantively changed"
+    );
+}
+
+/// MAN-190 computes every Evidence center for real before using its
+/// maximum, so `CenteredMax::peek_next` became test-only. SPEC v2 §1.2's
+/// MAN-193 implementation note still said the §1.7 lookahead reads the next
+/// center's `M` from the deque without advancing it. This pins that one
+/// sentence's removal; a design that peeks ahead again updates it with the
+/// spec.
+#[test]
+fn spec_v2_drops_the_man193_lookahead_sentence() {
+    let spec = squash_whitespace(&doc("docs/SPEC-decode-core-v2.md"));
+    for stale in [
+        "lookahead reads the next center's `M`",
+        "from the same deque without advancing it",
+    ] {
+        assert!(
+            !spec.contains(stale),
+            "SPEC-decode-core-v2.md still says `{stale}`, but `CenteredMax::peek_next` is \
+             test-only since MAN-190: each center's `M` comes from the query that computes it"
         );
     }
 }
