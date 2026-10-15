@@ -436,3 +436,113 @@ fn decode_refuses_several_inputs_without_a_correction() {
         "{stderr}"
     );
 }
+
+/// MAN-124 (Codex, PR 313): with several inputs `--log-format json` keeps
+/// every stderr line a JSON record — the grouped decoded text rides a
+/// `manta::text` event rather than a bare stderr line a collector would
+/// reject.
+#[test]
+fn json_log_format_keeps_decoded_text_a_json_record() {
+    let out = manta()
+        .args(["run", "--config"])
+        .arg(overlap_config())
+        .args(["--log-format", "json"])
+        .env("RUST_LOG", "info")
+        .env_remove("NO_COLOR")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let mut saw_text = false;
+    for line in stderr.lines() {
+        let record: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("stderr line is not one JSON object ({e}): {line:?}"));
+        saw_text |= record["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("CQ CQ DE W1AW"));
+    }
+    assert!(
+        saw_text,
+        "no decoded-text record on the manta::text target: {stderr}"
+    );
+}
+
+/// MAN-196 (Codex, PR 313): a decimated `[[input]]` states its usable
+/// passband once at startup, as the one-input path does, while the
+/// undecimated input beside it says nothing.
+#[test]
+fn a_decimated_input_states_its_usable_passband() {
+    let (dir, a, b) = fixtures();
+    let config = write_config(
+        dir.path(),
+        "decimated.toml",
+        &format!(
+            "[[input]]\nname = \"a\"\ntype = \"file\"\npath = \"{}\"\niq = true\n\n\
+             [[input]]\nname = \"b\"\ntype = \"file\"\npath = \"{}\"\niq = true\n\
+             capture_rate_hz = 48000.0\n",
+            toml_path(a),
+            toml_path(b)
+        ),
+    );
+    let out = run_config(&config);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|l| l.contains("decimated capture 48000 Hz: usable passband"))
+            .count(),
+        1,
+        "exactly one usable-passband line, for input b only: {stderr}"
+    );
+}
+
+/// MAN-234 (Codex, PR 313): one poisoned `[[input]]` warns naming it and
+/// keeps decoding — its samples are replaced with silence — while the
+/// clean input beside it warns nothing.
+#[test]
+fn bad_samples_in_one_input_warn_naming_it() {
+    let (dir, a, _) = fixtures();
+    let (samples, _) = render_scene(
+        &[station("CQ CQ DE ZL2XYZ ZL2XYZ K", 25_000.0)],
+        192_000.0,
+        30.0,
+        Some(22),
+    )
+    .unwrap();
+    let mut poisoned = samples;
+    poisoned[1_000_000].re = f32::NAN;
+    poisoned[3_000_000].im = f32::INFINITY;
+    let b = manta_testkit::wav::write_fixture(
+        dir.path(),
+        "poison_b",
+        &poisoned,
+        192_000.0,
+        14_060_000.0,
+    )
+    .unwrap();
+    let config = write_config(
+        dir.path(),
+        "poisoned.toml",
+        &format!(
+            "[[input]]\nname = \"a\"\ntype = \"file\"\npath = \"{}\"\niq = true\n\n\
+             [[input]]\nname = \"b\"\ntype = \"file\"\npath = \"{}\"\niq = true\n",
+            toml_path(a),
+            toml_path(&b)
+        ),
+    );
+    let out = run_config(&config);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("warning: b delivered ")
+            && stderr.contains("replaced with silence, decoding continues"),
+        "no first-sample warning naming input b: {stderr}"
+    );
+    assert!(
+        !stderr.contains("warning: a delivered "),
+        "the clean input warned: {stderr}"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(spot_calls(&stdout).get("ZL2XYZ"), Some(&1), "{stdout}");
+}

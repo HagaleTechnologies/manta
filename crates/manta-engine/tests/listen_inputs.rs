@@ -16,7 +16,7 @@ use manta_engine::{
 use manta_testkit::scene::{render_scene, SignalSpec};
 use num_complex::Complex32;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -728,4 +728,61 @@ fn a_failing_input_closes_every_track_it_reported() {
             reported.difference(&tapped).collect::<Vec<_>>()
         );
     }
+}
+
+/// MAN-234 (Codex, PR 313): each input's front end counts the samples its
+/// own channelizer replaced, so a multi-input run can warn and publish per
+/// source as the one-input path does: a poisoned input raises only its own
+/// counter, a clean input beside it stays at 0.
+#[test]
+fn an_inputs_replaced_samples_reach_only_its_own_counter() {
+    let scene = forty_metre_scene();
+    let mut poisoned: Vec<Complex32> = scene.samples.as_ref().clone();
+    poisoned[1_000_000].re = f32::NAN;
+    poisoned[2_000_000].im = f32::INFINITY;
+    let bad: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let mk = |name: &str, samples: Arc<Vec<Complex32>>, counter: Arc<AtomicU64>| {
+        let (fs, center) = (scene.fs, scene.center_freq_hz);
+        InputSpec {
+            name: name.into(),
+            open: Box::new(move || {
+                Ok(Box::new(SceneSource {
+                    samples,
+                    cursor: 0,
+                    fs,
+                    center_freq_hz: center,
+                    fail_at: usize::MAX,
+                    fault: Fault::None,
+                }) as Box<dyn manta_input::IqSource>)
+            }),
+            freq_correction_ppm: 0.0,
+            observers: manta_engine::InputObservers {
+                bad_samples: Some(counter),
+                ..Default::default()
+            },
+        }
+    };
+    let specs = vec![
+        mk("a", scene.samples.clone(), bad[0].clone()),
+        mk("b", Arc::new(poisoned), bad[1].clone()),
+    ];
+    let stop = Arc::new(AtomicBool::new(false));
+    let opened = open_inputs(specs, stop).unwrap();
+    listen_inputs(
+        opened,
+        &PipelineConfig::default(),
+        SessionClock::Replay,
+        SharedObservers::default(),
+        |_e| {},
+        |_s| {},
+        |_input, _n| {},
+        |_end| {},
+    )
+    .unwrap();
+    assert_eq!(bad[0].load(Ordering::Relaxed), 0);
+    assert!(
+        bad[1].load(Ordering::Relaxed) >= 2,
+        "poisoned input counted {} bad samples",
+        bad[1].load(Ordering::Relaxed)
+    );
 }

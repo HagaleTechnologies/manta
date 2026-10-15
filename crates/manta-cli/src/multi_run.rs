@@ -251,6 +251,11 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     // Set once the server is up; the health sinks run on input threads.
     let metrics_slot: Arc<OnceLock<Arc<Metrics>>> = Arc::new(OnceLock::new());
     let crashes: Vec<Arc<AtomicU64>> = (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    // MAN-234: each input's replaced-sample count, read on the back end's
+    // thread after each of its batches, as the one-input path reads one
+    // counter; `bad_warned` holds what the one-time warning already named.
+    let bad: Vec<Arc<AtomicU64>> = (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let bad_warned: Vec<std::cell::Cell<u64>> = (0..n).map(|_| std::cell::Cell::new(0)).collect();
     // Each input's active-track count; `manta_active_tracks` is their sum
     // (D9). A lost input's health sink zeroes only its own count.
     let tracks: Vec<Arc<AtomicU64>> = (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
@@ -281,11 +286,13 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 metrics: metrics_slot.clone(),
             };
             let input_counters = input_counters.clone();
+            let bad = bad[index].clone();
             InputSpec {
                 name: input.name.clone(),
                 freq_correction_ppm: input.freq_correction_ppm,
                 observers: manta_engine::InputObservers {
                     static_crashes: Some(crashes[index].clone()),
+                    bad_samples: Some(bad),
                     rtty: Some(rtty_observers[index].clone()),
                     ..Default::default()
                 },
@@ -343,6 +350,15 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 input.center_freq_hz
             )
         );
+        // MAN-196: as the one-input path, a decimated input says so -- its
+        // rim channels outside the decimator's trusted band are not
+        // tracked, and the nominal Nyquist coverage is not coming.
+        if let Some((lo, hi)) = input.trusted_band_hz.map(|_| input.rf_passband_hz) {
+            tracing::info!(
+                "{}",
+                crate::trusted_band_notice(input.sample_rate_hz, lo, hi)
+            );
+        }
     }
     let clock = if live {
         let at = opened_at.lock().map(|a| a.clone()).unwrap_or_default();
@@ -478,6 +494,9 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 server
                     .metrics
                     .set_source_health(name, up.load(Ordering::Relaxed));
+                // MAN-234: every input's bad-sample series exists from the
+                // first scrape, as the one-input path publishes it.
+                server.metrics.set_input_bad_samples(name, 0);
             }
             Some((rt, server))
         }
@@ -554,7 +573,14 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 println!("{}", serde_json::to_string(ev).unwrap_or_default());
             } else if print_text {
                 if let Some(line) = text.ingest(ev) {
-                    eprintln!("{line}");
+                    // As the one-input path: `--log-format json` makes
+                    // every stderr line a JSON record (MAN-124), so the
+                    // grouped text rides a `manta::text` event there.
+                    if logging::is_json() {
+                        tracing::info!(target: "manta::text", "{line}");
+                    } else {
+                        eprintln!("{line}");
+                    }
                 }
             }
         },
@@ -592,6 +618,21 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                     }
                 }
             }
+            // MAN-234: warn once at this input's first replaced sample and
+            // keep its metric current, as the one-input path does per
+            // `on_tracks`.
+            let n_bad = bad[input].load(Ordering::Relaxed);
+            if n_bad > 0 && bad_warned[input].get() == 0 {
+                logging::warning(&fmt::bad_samples_live_warning(
+                    &names[input],
+                    n_bad,
+                    server.is_some(),
+                ));
+                bad_warned[input].set(n_bad);
+            }
+            if let Some((_, server)) = &server {
+                server.metrics.set_input_bad_samples(&names[input], n_bad);
+            }
             if let Some((_, server)) = &server {
                 server.metrics.set_active_tracks(sum(&tracks));
                 server.metrics.set_static_crashes_total(sum(&crashes));
@@ -615,6 +656,13 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 let stopping = stop_end.load(Ordering::Relaxed);
                 publish_input_end(&server.metrics, &end.name, &end.result, stopping);
             }
+            // MAN-234: the input's total, only when it grew past the count
+            // its first-sample line named (a clean and an error end alike).
+            let bad_total = bad[end.index].load(Ordering::Relaxed);
+            if bad_total > bad_warned[end.index].get() {
+                logging::warning(&fmt::bad_samples_warning(&end.name, bad_total));
+                bad_warned[end.index].set(bad_total);
+            }
             if let Some(flag) = healthy.get(end.index) {
                 flag.store(false, Ordering::Relaxed);
             }
@@ -632,7 +680,11 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     stop_ready.store(true, Ordering::Relaxed);
     if print_text {
         for line in text.finish() {
-            eprintln!("{line}");
+            if logging::is_json() {
+                tracing::info!(target: "manta::text", "{line}");
+            } else {
+                eprintln!("{line}");
+            }
         }
     }
     if let Some((rt, server)) = server {

@@ -1011,6 +1011,7 @@ impl<'a> Back<'a> {
 pub(crate) struct FrontObservers {
     pub(crate) active_tracks: Option<Arc<AtomicU64>>,
     pub(crate) static_crashes: Option<Arc<AtomicU64>>,
+    pub(crate) bad_samples: Option<Arc<AtomicU64>>,
     pub(crate) rtty: Option<Arc<RttyObserver>>,
     pub(crate) decode_latency: Option<Arc<DecodeLatencyObserver>>,
     pub(crate) decode_quality: Option<Arc<DecodeQualityObserver>>,
@@ -1072,6 +1073,14 @@ pub(crate) fn run_input_front(
     };
     let report_static_crashes = |n: u64| {
         if let Some(counter) = &observers.static_crashes {
+            counter.fetch_max(n, Ordering::Relaxed);
+        }
+    };
+    // MAN-234: samples replaced by segments a discontinuity already
+    // replaced, as `listen_with_observers` counts them.
+    let mut bad_base: u64 = 0;
+    let report_bad_samples = |n: u64| {
+        if let Some(counter) = &observers.bad_samples {
             counter.fetch_max(n, Ordering::Relaxed);
         }
     };
@@ -1144,6 +1153,7 @@ pub(crate) fn run_input_front(
         }
         report_active_tracks(b.n_tracks);
         report_static_crashes(crash_base + seg.tm.static_crash_count());
+        report_bad_samples(bad_base + seg.ch.bad_samples());
         rtty.update(&seg.tm);
         if !send(b) {
             return Ok(());
@@ -1173,6 +1183,7 @@ pub(crate) fn run_input_front(
             pending.push(batch(finish_events, seg_base + seg_consumed, &seg.tm));
             let next_id = seg.tm.next_track_id();
             crash_base += seg.tm.static_crash_count();
+            bad_base += seg.ch.bad_samples();
             rtty.restart(seg_base + seg_consumed);
             seg_base += seg_consumed + gap;
             seg_consumed = 0;
@@ -1205,6 +1216,7 @@ pub(crate) fn run_input_front(
         pending.push(b);
         report_active_tracks(seg.tm.decoding_track_count());
         report_static_crashes(crash_base + seg.tm.static_crash_count());
+        report_bad_samples(bad_base + seg.ch.bad_samples());
         rtty.update(&seg.tm);
         if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
             obs.observe(t0.elapsed());
@@ -1219,6 +1231,7 @@ pub(crate) fn run_input_front(
     let mut last = batch(events, seg_base + seg_consumed, &seg.tm);
     last.n_tracks = 0;
     report_static_crashes(crash_base + seg.tm.static_crash_count());
+    report_bad_samples(bad_base + seg.ch.bad_samples());
     report_active_tracks(0);
     rtty.restart(seg_base + seg_consumed);
     send(last);

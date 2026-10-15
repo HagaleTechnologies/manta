@@ -123,6 +123,8 @@ pub struct InputObservers {
     pub active_tracks: Option<Arc<AtomicU64>>,
     /// Static crashes on this input so far (the caller sums inputs).
     pub static_crashes: Option<Arc<AtomicU64>>,
+    /// Input samples replaced as unusable on this input (MAN-234).
+    pub bad_samples: Option<Arc<AtomicU64>>,
     /// This input's marked RTTY signals.
     pub rtty: Option<Arc<RttyObserver>>,
 }
@@ -148,6 +150,11 @@ pub struct OpenedInput {
     pub sample_rate_hz: f64,
     pub center_freq_hz: f64,
     pub rf_passband_hz: (f64, f64),
+    /// The source's trusted band, `None` when it is not decimated: an
+    /// input whose `[[input]]` sets `capture_rate_hz` delivers a narrower
+    /// usable passband than its rate suggests (MAN-196), and `run` says
+    /// so per input.
+    pub trusted_band_hz: Option<(f64, f64)>,
 }
 
 /// How a session's inputs share one clock.
@@ -359,6 +366,7 @@ fn input_thread(
         sample_rate_hz: src.sample_rate(),
         center_freq_hz: src.center_freq_hz(),
         rf_passband_hz: src.rf_passband_hz(),
+        trusted_band_hz: src.trusted_band_hz(),
     };
     if done.send((index, Ok(info))).is_err() {
         return;
@@ -455,6 +463,7 @@ pub fn listen_inputs(
             observers: FrontObservers {
                 active_tracks: opened.observers[index].active_tracks.clone(),
                 static_crashes: opened.observers[index].static_crashes.clone(),
+                bad_samples: opened.observers[index].bad_samples.clone(),
                 rtty: opened.observers[index].rtty.clone(),
                 decode_latency: shared.decode_latency.clone(),
                 decode_quality: shared.decode_quality.clone(),
