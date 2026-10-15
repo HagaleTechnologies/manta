@@ -80,9 +80,10 @@ pub fn strip_ansi(line: &str) -> String {
 }
 
 /// Forwards every line `reader` yields, ANSI-stripped, over a channel from
-/// a background thread, and keeps draining to EOF so the child never hits
-/// `EPIPE` on a later write (`eprintln!` panics on a failed write). The
-/// channel disconnects at EOF -- the child closed its end, i.e. exited.
+/// a background thread, and keeps draining to EOF so the child never blocks
+/// on a write to a full pipe (MAN-232 kept blocking writes; a closed pipe
+/// no longer panics it). The channel disconnects at EOF -- the child closed
+/// its end, i.e. exited.
 pub fn line_channel(reader: impl Read + Send + 'static) -> Receiver<String> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {

@@ -254,3 +254,16 @@ by mistake shows as `blocklist_calls=0`. `dry_run` levels follow MAN-159:
 
 5. Country/SCP table hot reload across validation and geography consumers.
 6. Uplink `spot_types` hot reload.
+
+## Superseded in part by MAN-232 (2026-10-14)
+
+MAN-232 moved SIGINT from ctrlc to `signal-hook` on Unix, so D3's "ctrlc
+keeps SIGINT" no longer holds there: every stop signal — SIGINT, SIGTERM,
+and SIGHUP without a `[server]` table — gets one signal-hook
+`low_level::register` action that stores `stop` and atomically swaps a
+dedicated `signalled` flag, calling `_exit(128 + signal)` when the swap
+finds it already set, so a second stop signal ends the process at once
+instead of leaving it blocked in a stdout write. ctrlc is now Windows-only, for console events. Everything
+else this record decides — SIGHUP's reload-vs-drain split, the reload
+gate, the install point — is unchanged. See
+`docs/DECISIONS/2026-10-14-man232-closed-and-stalled-output.md`.
