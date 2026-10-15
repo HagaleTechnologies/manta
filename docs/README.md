@@ -15,6 +15,9 @@ Then:
   `/status`.
 - [packaging/README.md](../packaging/README.md): running unattended under
   systemd, launchd or Docker Compose.
+- [Keeping cty.dat and MASTER.SCP current](../packaging/README.md#keeping-ctydat-and-masterscp-current):
+  downloading newer country-prefix and known-call lists without a release
+  (MAN-316).
 - [RUNBOOKS/monitoring.md](RUNBOOKS/monitoring.md): a ready Grafana dashboard
   and Prometheus alerts.
 - [GUIDES/ka9q-radio.md](GUIDES/ka9q-radio.md): feeding manta one
@@ -34,7 +37,9 @@ Then:
   review-convergence policy.
 - [DECISIONS/README.md](DECISIONS/README.md): every dated decision record,
   newest first.
-- [wiki/INDEX.md](../wiki/INDEX.md): accumulated gotchas. The wiki points at
+- [wiki/INDEX.md](../wiki/INDEX.md): accumulated gotchas, manta's canonical wiki.
+  GitHub's Wiki tab is not used; disabling it remains an owner step
+  ([MAN-152](DECISIONS/2026-10-13-man152-one-wiki.md)). The wiki points at
   the code and these docs; it loses any conflict with them.
 - [CHANGELOG.md](../CHANGELOG.md): changes, and the rule for when decoder
   output may change.

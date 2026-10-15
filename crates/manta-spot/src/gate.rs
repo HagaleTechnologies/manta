@@ -1,5 +1,5 @@
-//! Repetition gate: a callsign must decode >= 2 distinct times within a
-//! 90 s window on its track before first spot. SPEC §4.6 / ARCHITECTURE
+//! Repetition gate: count distinct messages within a 90 s window.
+//! The validator applies the pattern tier requirement (2, 3 or 5). SPEC §4.6 / ARCHITECTURE
 //! §6.4. `sample_ts`-based, never wall clock (SPEC-decode-core.md §6 rule
 //! 2). `BTreeMap`, never `HashMap` (rule 3) -- this state feeds directly
 //! into whether/when a `Spot` is emitted.
@@ -482,7 +482,7 @@ pub struct RepetitionGate {
 
 /// MAN-118: upper bounds of the `manta_candidate_repetitions` histogram's
 /// buckets, over the counts `RepetitionGate::record` returns. A candidate
-/// needs 2 to spot, so 1 and 2 get their own buckets.
+/// needs 2, 3 or 5 to spot by its pattern tier; each has its own bucket.
 pub const REPETITION_BUCKETS: [u32; 10] = [1, 2, 3, 4, 5, 6, 8, 10, 15, 20];
 
 /// MAN-118: cumulative distribution of `RepetitionGate::record`'s return
@@ -590,7 +590,7 @@ impl RepetitionGate {
     /// A non-finite `freq_hz` (NaN/±infinity -- should never happen from
     /// the real DSP pipeline, but a defensive guard, Codex review PR
     /// #152) is rejected outright: no entry is touched, and this returns
-    /// 0 (never `>= 2`, so it can never itself satisfy the repetition
+    /// 0 (below every tier requirement, so it can never itself satisfy the repetition
     /// gate). Silently mapping it to some fallback bucket instead would
     /// risk cross-contaminating repetition credit with whatever a real
     /// signal happens to already occupy there -- bucket 0 in particular

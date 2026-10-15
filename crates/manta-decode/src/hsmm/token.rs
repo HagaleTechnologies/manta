@@ -16,6 +16,20 @@ pub struct HistEntry {
     pub glyph: Option<Glyph>,
     pub sample_ts: u64,
     pub born_hop: u64,
+    /// MAN-189: input sample counter at the first hop of this entry's
+    /// character -- the anchor its first mark began at. A word boundary
+    /// carries the character it follows. `commit::Frontier` compares it
+    /// with what has already been emitted.
+    pub char_start_ts: u64,
+    /// Segment that closed this history entry. `Some(CGap)` on a
+    /// glyph-carrying entry, `Some(WGap)`/`Some(Silence)` on both entries
+    /// those transitions append, `None` for an entry with no closing
+    /// segment (a synthetic unclosed entry, or a test fixture). Metadata
+    /// only: it never feeds `token_order`, `merge_key`, confidence,
+    /// consensus, or committed-history deduplication. MAN-192, SPEC v2
+    /// §4.7 -- a committed word boundary whose closing segment was
+    /// `Silence` is the decoder's second reseeding trigger.
+    pub closing_segment: Option<SegType>,
 }
 
 #[derive(Clone, Debug)]
@@ -26,6 +40,10 @@ pub struct Token {
     pub score: f32,
     pub hist: Vec<HistEntry>,
     pub anchor_hop: u64,
+    /// MAN-189: where the character this token is building began (the
+    /// `seg_start_ts` of its first mark). Stale while the token is at
+    /// `ROOT` between characters.
+    pub char_start_ts: u64,
 }
 
 pub fn glyph_rank(g: Option<Glyph>) -> u32 {
@@ -89,6 +107,11 @@ impl Token {
             u = u.clamp(cfg.u_min, cfg.u_max);
         }
         let mut hist = self.hist.clone();
+        let char_start_ts = if seg.is_mark() && self.node == MorseTree::ROOT {
+            seg_start_ts
+        } else {
+            self.char_start_ts
+        };
         let (node, phase) = match seg {
             SegType::Dit | SegType::Dah => {
                 let e = if seg == SegType::Dit {
@@ -105,12 +128,16 @@ impl Token {
                     glyph: Some(g),
                     sample_ts: seg_start_ts,
                     born_hop: end_hop,
+                    char_start_ts,
+                    closing_segment: Some(seg),
                 });
                 if seg != SegType::CGap {
                     hist.push(HistEntry {
                         glyph: None,
                         sample_ts: seg_start_ts,
                         born_hop: end_hop,
+                        char_start_ts,
+                        closing_segment: Some(seg),
                     });
                 }
                 (MorseTree::ROOT, Phase::AfterSpace)
@@ -123,6 +150,7 @@ impl Token {
             score,
             hist,
             anchor_hop: end_hop,
+            char_start_ts,
         })
     }
 }
@@ -140,6 +168,7 @@ mod tests {
             score: 0.0,
             hist: Vec::new(),
             anchor_hop: 0,
+            char_start_ts: 0,
         }
     }
 
@@ -167,6 +196,36 @@ mod tests {
         assert_eq!(t.hist[0].glyph, Some(Glyph::Char('A')));
         assert_eq!(t.hist[0].sample_ts, 65 * 512);
         assert!((t.u - 13.0).abs() < 1e-4, "u drifted to {}", t.u);
+    }
+
+    #[test]
+    fn hist_entry_carries_its_characters_first_mark_start() {
+        // MAN-189: both entries a WGap closes (the glyph and the word
+        // boundary) record where the character's first mark began, not
+        // where its closing gap began; the next character's first mark
+        // starts a fresh value.
+        let tree = MorseTree::shared();
+        let cfg = HsmmConfig::default();
+        let t = root_token(13.0)
+            .successor(SegType::Dit, 13, 50.0, tree, &cfg, 13, 1000)
+            .unwrap();
+        let t = t
+            .successor(SegType::EGap, 13, 50.0, tree, &cfg, 26, 2000)
+            .unwrap();
+        let t = t
+            .successor(SegType::Dah, 39, 150.0, tree, &cfg, 65, 3000)
+            .unwrap();
+        let t = t
+            .successor(SegType::WGap, 91, 300.0, tree, &cfg, 156, 4000)
+            .unwrap();
+        assert_eq!(t.hist.len(), 2);
+        for e in &t.hist {
+            assert_eq!((e.sample_ts, e.char_start_ts), (4000, 1000), "{e:?}");
+        }
+        let t = t
+            .successor(SegType::Dah, 39, 150.0, tree, &cfg, 195, 5000)
+            .unwrap();
+        assert_eq!(t.char_start_ts, 5000);
     }
 
     #[test]
@@ -319,5 +378,61 @@ mod tests {
         c.score = 1.0;
         assert_eq!(token_order(&c, &a), std::cmp::Ordering::Less); // equal score: smaller u first
         assert_eq!(merge_key(&a), (MorseTree::ROOT, Phase::AfterSpace, 26));
+    }
+
+    /// MAN-192: every real gap transition stamps the closing segment on
+    /// every `HistEntry` it creates, so `commit` can tell a word boundary
+    /// closed by a long `Silence` (the §4.7 reseed trigger) from one closed
+    /// by an ordinary `WGap`.
+    #[test]
+    fn man192_gap_transitions_stamp_closing_segment() {
+        let tree = MorseTree::shared();
+        let cfg = HsmmConfig::default();
+        // A single nominal Dah at u=13 lands on node T (glyph 'T') in
+        // AfterMark, ready to be closed by each gap type.
+        let t_node = |u: f32| root_token(u).successor(SegType::Dah, 39, 150.0, tree, &cfg, 39, 512);
+        for (seg, d) in [
+            (SegType::CGap, 39u32),  // nominal 3u
+            (SegType::WGap, 91),     // nominal 7u
+            (SegType::Silence, 200), // inside [10u, 80u] = [130, 1040]
+        ] {
+            let t = t_node(13.0).unwrap();
+            let closed = t
+                .successor(seg, d, 0.0, tree, &cfg, 39 + d as u64, 512)
+                .unwrap_or_else(|| panic!("{seg:?} close of node T must be valid"));
+            assert_eq!(closed.node, MorseTree::ROOT);
+            assert_eq!(closed.phase, Phase::AfterSpace);
+            // Nominal CGap/WGap durations and any in-window Silence leave
+            // u at 13 (CGap updates speed but at d = 3u the update is a
+            // no-op; WGap/Silence never update it).
+            assert!(
+                (closed.u - 13.0).abs() < 1e-5,
+                "{seg:?}: u drifted to {}",
+                closed.u
+            );
+            let glyph_entry = closed.hist[0];
+            assert_eq!(glyph_entry.glyph, Some(Glyph::Char('T')), "{seg:?}");
+            assert_eq!(glyph_entry.sample_ts, 512, "{seg:?}: pinned decision-11 ts");
+            assert_eq!(glyph_entry.born_hop, 39 + d as u64, "{seg:?}");
+            assert_eq!(glyph_entry.closing_segment, Some(seg), "{seg:?}");
+            if seg == SegType::CGap {
+                assert_eq!(closed.hist.len(), 1, "CGap appends no boundary");
+            } else {
+                assert_eq!(closed.hist.len(), 2, "{seg:?} appends glyph + boundary");
+                let boundary = closed.hist[1];
+                assert_eq!(boundary.glyph, None, "{seg:?}");
+                assert_eq!(boundary.sample_ts, 512, "{seg:?}");
+                assert_eq!(boundary.closing_segment, Some(seg), "{seg:?}");
+            }
+            // Inherited metadata survives further successors: a mark taken
+            // after the close keeps the closed entries byte-identical.
+            let resumed = closed
+                .successor(SegType::Dit, 13, 50.0, tree, &cfg, 39 + d as u64 + 13, 600)
+                .unwrap();
+            assert_eq!(resumed.hist.len(), closed.hist.len(), "{seg:?}");
+            for (old, new) in closed.hist.iter().zip(resumed.hist.iter()) {
+                assert_eq!(old, new, "{seg:?}: inherited entry changed");
+            }
+        }
     }
 }

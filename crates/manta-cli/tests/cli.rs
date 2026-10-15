@@ -2871,6 +2871,7 @@ fn qq9_fixture(dir: &Path) -> (PathBuf, PathBuf) {
             manta_spot::CTY_DAT
         ),
     );
+    write_cfg(dir, "patterns-new.lst", "+QQ9@@@\n");
     (wav, cty)
 }
 
@@ -2887,6 +2888,8 @@ fn decode_cty_flag_lets_a_newly_allocated_prefix_spot() {
     let after = manta()
         .args(["decode", "--json", "--cty"])
         .arg(cty)
+        .arg("--patterns")
+        .arg(dir.path().join("patterns-new.lst"))
         .arg(wav)
         .output()
         .unwrap();
@@ -2901,7 +2904,11 @@ fn decode_cty_path_in_a_config_file_lets_a_newly_allocated_prefix_spot() {
     let sub = dir.path().join("config");
     std::fs::create_dir(&sub).unwrap();
     let (wav, _) = qq9_fixture(&sub);
-    let config = write_cfg(&sub, "manta.toml", "[spot]\ncty_path = 'cty-new.dat'\n");
+    let config = write_cfg(
+        &sub,
+        "manta.toml",
+        "[spot]\ncty_path = 'cty-new.dat'\npattern_path = 'patterns-new.lst'\n",
+    );
     let out = manta()
         .current_dir(dir.path())
         .args(["decode", "--json", "--config"])
@@ -2922,6 +2929,10 @@ fn run_reads_cty_path_from_the_environment() {
         .args(["run", "--json", "--source-iq", "--source"])
         .arg(wav)
         .env("MANTA_SPOT_CTY_PATH", cty)
+        .env(
+            "MANTA_SPOT_PATTERN_PATH",
+            dir.path().join("patterns-new.lst"),
+        )
         .output()
         .unwrap();
     assert!(
@@ -3175,4 +3186,56 @@ fn soak_ignores_input_realtime_with_a_note() {
         ),
         "stderr: {stderr}"
     );
+}
+
+#[test]
+fn decode_refuses_invalid_and_empty_pattern_files_before_source_io() {
+    let dir = tempfile::tempdir().unwrap();
+    for (contents, expected) in [
+        ("+K5@@@\nK5ARH;\n", "line 2"),
+        ("# empty\n", "contains no patterns"),
+    ] {
+        let path = write_cfg(dir.path(), "bad.lst", contents);
+        let out = manta()
+            .args(["decode", "--patterns"])
+            .arg(path)
+            .arg("does-not-exist.wav")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("bad.lst") && err.contains(expected), "{err}");
+    }
+}
+
+#[test]
+fn decode_minimal_config_spots_an_unlisted_pattern() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, _) = qq9_fixture(dir.path());
+    let normal = write_cfg(
+        dir.path(),
+        "normal.toml",
+        "[spot]\ncty_path = 'cty-new.dat'\n",
+    );
+    let minimal = write_cfg(
+        dir.path(),
+        "minimal.toml",
+        "[spot]\ncty_path = 'cty-new.dat'\nvalidation_level = 'minimal'\n",
+    );
+    let normal_out = manta()
+        .args(["decode", "--json", "--config"])
+        .arg(normal)
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(decode_spots(&normal_out).is_empty());
+    let minimal_out = manta()
+        .args(["decode", "--json", "--config"])
+        .arg(minimal)
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(decode_spots(&minimal_out)
+        .iter()
+        .any(|s| s["callsign"] == "QQ9ZZZ"));
 }

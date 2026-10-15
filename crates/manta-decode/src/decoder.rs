@@ -150,6 +150,8 @@ pub struct TrackDecoder {
     /// is a truncation, not the sender's gap, so `observe_gap` skips it.
     learn_gaps: bool,
     last_reported_wpm: Option<f32>,
+    /// The centroid of the hop being pushed; `manta-engine` sets it before
+    /// each `push_hop` (MAN-211).
     freq_hz: f64,
     hop_count: u64,
     last_ts: u64,
@@ -228,6 +230,9 @@ impl TrackDecoder {
     }
 
     /// Set the track's absolute RF frequency, reported in TrackMeta events. SPEC §5.
+    /// `manta-engine` calls it before each `push_hop` with that hop's
+    /// centroid, so a `TrackMeta` pairs the frequency with the same hop's
+    /// `sample_ts` (MAN-211).
     pub fn set_freq_hz(&mut self, hz: f64) {
         self.freq_hz = hz;
     }
@@ -1703,8 +1708,8 @@ mod tests {
         // of silence: long enough for the anchor that stamped K's hist
         // entry to age out of `reach_sil` while a newer, still-live
         // anchor's frozen token carries the inherited entry -- the exact
-        // window round 3's `min_hist_ts`-only prune bound could
-        // (non-structurally) fail to cover.
+        // window round 3's anchor-history-only prune bound (removed by
+        // MAN-189) could (non-structurally) fail to cover.
         let lo = 10f32.powf(-40.0 / 20.0);
         let mut env = vec![lo; 4];
         env.extend(rect_envelope_depth("K", 13, 40.0));

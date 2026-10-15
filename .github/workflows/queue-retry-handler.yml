@@ -77,6 +77,10 @@ jobs:
         github.event.workflow_run.conclusion == 'timed_out' ||
         github.event.workflow_run.conclusion == 'startup_failure'
       )
+    # Q-0068: the PAT lives in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Serialize per merge-group attempt (recovered from the branch name

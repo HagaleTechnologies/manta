@@ -479,7 +479,13 @@ impl Ka9qIqSource {
     }
 
     fn drain_status(&mut self) -> Result<()> {
-        for _ in 0..DRAIN_BATCH {
+        self.drain_status_up_to(DRAIN_BATCH)
+    }
+
+    /// `drain_status` with the per-call datagram limit as a parameter, so
+    /// tests can exercise the limit without queueing `DRAIN_BATCH` datagrams.
+    fn drain_status_up_to(&mut self, limit: usize) -> Result<()> {
+        for _ in 0..limit {
             match self.status_sock.recv(&mut self.recv_buf) {
                 Ok(n) => match wire::parse_status_packet(&self.recv_buf[..n]) {
                     Ok(Some(s)) if s.ssrc == Some(self.ssrc) => self.check_status(&s)?,
@@ -499,6 +505,11 @@ impl Ka9qIqSource {
     /// blocking, up to the replay plus `QUEUE_CAP_S` seconds of samples and
     /// at most `DRAIN_BATCH` datagrams per call.
     fn drain_ready_rtp(&mut self) -> Result<()> {
+        self.drain_ready_rtp_up_to(DRAIN_BATCH)
+    }
+
+    /// `drain_ready_rtp` with the per-call datagram limit as a parameter.
+    fn drain_ready_rtp_up_to(&mut self, limit: usize) -> Result<()> {
         let cap = STASH_MAX_SAMPLES + (self.fs * QUEUE_CAP_S) as usize;
         if self.queue.len() >= cap {
             return Ok(());
@@ -507,7 +518,7 @@ impl Ka9qIqSource {
             .set_nonblocking(true)
             .context("ka9q-radio: set data socket non-blocking")?;
         let mut res = Ok(());
-        for _ in 0..DRAIN_BATCH {
+        for _ in 0..limit {
             match self.data.recv(&mut self.recv_buf) {
                 Ok(n) => {
                     self.accept_rtp(n);
@@ -587,7 +598,21 @@ fn stash_data(
     stashed: &mut usize,
     cap: usize,
 ) -> Result<()> {
-    for _ in 0..DRAIN_BATCH {
+    stash_data_up_to(sock, buf, stash, stashed, cap, DRAIN_BATCH)
+}
+
+/// `stash_data` with the per-call datagram limit as a parameter, so tests
+/// can exercise the limit without queueing `DRAIN_BATCH` datagrams, which a
+/// host's `rmem_max` may not allow.
+fn stash_data_up_to(
+    sock: &UdpSocket,
+    buf: &mut [u8],
+    stash: &mut VecDeque<Vec<u8>>,
+    stashed: &mut usize,
+    cap: usize,
+    limit: usize,
+) -> Result<()> {
+    for _ in 0..limit {
         match sock.recv(buf) {
             Ok(n) => {
                 stash.push_back(buf[..n].to_vec());
@@ -847,14 +872,61 @@ mod tests {
         );
     }
 
-    /// One call takes at most `DRAIN_BATCH` datagrams, so a flood that keeps
+    /// Batch-limit tests use a small limit instead of `DRAIN_BATCH`: a
+    /// host's `rmem_max` can clamp the receive buffer below `DRAIN_BATCH`
+    /// datagrams (a CI container held ~222), so the excess never queues.
+    const TEST_LIMIT: usize = 16;
+    const TEST_FLOOD: usize = TEST_LIMIT + 4;
+
+    /// One call takes at most one batch of datagrams, so a flood that keeps
     /// the socket readable cannot keep `wait_for_status` from its deadline.
     #[test]
     fn stash_takes_at_most_one_batch_per_call() {
         let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
         rx.set_nonblocking(true).unwrap();
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-        for _ in 0..DRAIN_BATCH + 20 {
+        for _ in 0..TEST_FLOOD {
+            tx.send_to(&[1; 8], rx.local_addr().unwrap()).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let mut buf = vec![0u8; RECV_BUF_LEN];
+        let mut stash = VecDeque::new();
+        let mut stashed = 0;
+        stash_data_up_to(
+            &rx,
+            &mut buf,
+            &mut stash,
+            &mut stashed,
+            RCVBUF_BYTES,
+            TEST_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(stash.len(), TEST_LIMIT);
+        stash_data_up_to(
+            &rx,
+            &mut buf,
+            &mut stash,
+            &mut stashed,
+            RCVBUF_BYTES,
+            TEST_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(
+            stash.len(),
+            TEST_FLOOD,
+            "the rest is left for the next pass"
+        );
+    }
+
+    /// `stash_data` drains with the production `DRAIN_BATCH` limit, not a
+    /// smaller one: a backlog below a batch is taken in a single call.
+    #[test]
+    fn stash_data_uses_the_drain_batch_limit() {
+        const _: () = assert!(TEST_FLOOD < DRAIN_BATCH);
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for _ in 0..TEST_FLOOD {
             tx.send_to(&[1; 8], rx.local_addr().unwrap()).unwrap();
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -862,11 +934,7 @@ mod tests {
         let mut stash = VecDeque::new();
         let mut stashed = 0;
         stash_data(&rx, &mut buf, &mut stash, &mut stashed, RCVBUF_BYTES).unwrap();
-        assert_eq!(stash.len(), DRAIN_BATCH);
-        assert!(
-            rx.recv(&mut buf).is_ok(),
-            "the rest is left for the next pass"
-        );
+        assert_eq!(stash.len(), TEST_FLOOD);
     }
 
     /// Zero-length datagrams carry no bytes but still cost memory, so they
@@ -1438,19 +1506,19 @@ mod tests {
         }
 
         /// A status flood (here another channel's statuses) is drained one
-        /// `DRAIN_BATCH` per `read` pass, so it cannot starve RTP and the
-        /// stall deadline.
+        /// batch per `read` pass, so it cannot starve RTP and the stall
+        /// deadline. Uses `TEST_LIMIT`; see its note on `rmem_max`.
         #[test]
         fn status_draining_takes_at_most_one_batch_per_pass() {
             let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
             let mut src = Ka9qIqSource::open(f.config(Some(SSRC))).unwrap();
             let other = wire::encode_status_packet(&channel(SSRC + 1, 7e6));
-            for _ in 0..DRAIN_BATCH + 20 {
+            for _ in 0..TEST_FLOOD {
                 f.tx.send_to(&other, SocketAddrV4::new(f.group, f.status_port))
                     .unwrap();
             }
             std::thread::sleep(Duration::from_millis(100));
-            src.drain_status().unwrap();
+            src.drain_status_up_to(TEST_LIMIT).unwrap();
             let mut buf = vec![0u8; RECV_BUF_LEN];
             assert!(
                 src.status_sock.recv(&mut buf).is_ok(),
@@ -1459,7 +1527,8 @@ mod tests {
         }
 
         /// Foreign-SSRC packets never fill the queue toward its cap, so the
-        /// drain while queued samples remain is bounded by `DRAIN_BATCH`.
+        /// drain while queued samples remain is bounded by one batch. Uses
+        /// `TEST_LIMIT`; see its note on `rmem_max`.
         #[test]
         fn rtp_draining_while_samples_are_queued_takes_at_most_one_batch() {
             let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
@@ -1467,11 +1536,11 @@ mod tests {
             let mut one = [Complex32::new(0.0, 0.0); 1];
             f.send_rtp(SSRC, 1, Encoding::F32Le, &ramp(64, 0));
             assert_eq!(src.read(&mut one).unwrap(), 1);
-            for k in 0..DRAIN_BATCH + 20 {
+            for k in 0..TEST_FLOOD {
                 f.send_rtp(SSRC + 1, k as u16, Encoding::F32Le, &ramp(8, k));
             }
             std::thread::sleep(Duration::from_millis(100));
-            src.drain_ready_rtp().unwrap();
+            src.drain_ready_rtp_up_to(TEST_LIMIT).unwrap();
             assert_eq!(src.queue.len(), 63);
             src.data.set_nonblocking(true).unwrap();
             let mut buf = vec![0u8; RECV_BUF_LEN];

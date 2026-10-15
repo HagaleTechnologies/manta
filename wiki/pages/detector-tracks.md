@@ -5,11 +5,11 @@ kind: subsystem
 status: current
 maintainer: agent
 sources:
-  - docs/SPEC-decode-core.md#2-noise-floor-signal-presence-detection
+  - docs/SPEC-decode-core.md#2-noise-floor--signal-presence-detection
   - ARCHITECTURE.md
 verified:
-  commit: 9802ca5
-  date: 2026-07-24
+  commit: d286147
+  date: 2026-10-13
 links:
   - pfb-channelizer
   - decode-chain
@@ -22,7 +22,7 @@ The detector estimates a per-channel noise floor by order statistics (a quantile
 - Track lifecycle state machine (IDLE → CANDIDATE → ACTIVE → HANG → CLOSED): SPEC §2.4 (`manta-engine::track`, now implemented — see `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md`).
 - Adjacent-channel ownership so one signal yields exactly one track (no cross-channel ghost decodes): SPEC §2.5. This invariant is a V7/V8w pass criterion — see [[golden-vector-freeze]].
 - Track cap with lowest-SNR eviction; merges (SPEC §2.5) and evictions (ARCHITECTURE §4) are counted in-process via `TrackManager::close_counts` (issue #26) — **no silent coverage loss**, though external exposition as Prometheus metrics is explicit M3 scope (ARCHITECTURE §8), not yet wired.
-- Every close that ever emitted a real `DecoderEvent` also produces a `DecoderEvent::TrackClosed { track_id }` (`process_hops`/`finish()`, gated on `Track::has_emitted`) — the teardown signal [[spot-validation]]'s per-track_id state depends on. Normative contract: `docs/DECISIONS/2026-09-02-man19-track-closed-teardown-invariant.md`.
+- Every close that ever emitted a real `DecoderEvent` also produces a `DecoderEvent::TrackClosed { track_id, closure }` (`closure` is `SignalEnded`, or `Bookkeeping` for a merge, eviction, silent-track GC, RTTY suppression or source discontinuity, none of which means the signal ended; see SPEC §5 and `ClosureKind` in `manta-decode::events`; `process_hops`/`finish()`, gated on `Track::has_emitted`) — the teardown signal [[spot-validation]]'s per-track_id state depends on. Normative contract: `docs/DECISIONS/2026-09-02-man19-track-closed-teardown-invariant.md`.
 
 ## Why it is shaped this way
 
@@ -38,7 +38,11 @@ Order statistics rather than a mean floor is the load-bearing choice: CW is burs
   CW below any relative-level threshold. MAN-314's RTTY shadow therefore
   vetoes spawns only, and closes use the RTTY hard span alone; see the
   [decision record](../../docs/DECISIONS/2026-10-11-man314-rtty-recognition.md)
-  and SPEC-decode-core.md §2.6.
+  and SPEC-decode-core.md §2.6. The spawns-only rule's second instance:
+  MAN-196's trusted-band veto (decimated captures) blocks spawns on
+  channels whose centre lies beyond the decimator's <= 1 dB boundary and
+  touches nothing already running; see the
+  [decision record](../../docs/DECISIONS/2026-10-14-man196-decimator-trusted-band.md).
 - Start-up: a padded decode path's zero pre-roll hops must stay out of the
   floor (`TrackManager::skip_preroll_hops`); a young ring's lower quartile
   is its minimum, so they would pin the floor near -140 dB. The 25 ms
@@ -71,3 +75,18 @@ Order statistics rather than a mean floor is the load-bearing choice: CW is burs
   other's path-dependency rlibs; use separate target directories when
   comparing branches (for example `cpu_budget`). See the MAN-312
   [decision record](../../docs/DECISIONS/2026-10-13-man312-static-crash-filter.md).
+- MAN-313 lazy lease: with `[detector] non_cw_filter` on, a promoted
+  track has no decoder and emits no `TrackPromoted` until it qualifies as
+  keyed CW; the event then carries the promotion `sample_ts`/`freq_hz`.
+  Tests that expect a decoder or `TrackPromoted` at the promotion hop
+  need the filter off. `drain_pool` must skip queued tracks that hold no
+  decoder, or it panics on the unwrap.
+- MAN-313 flatness: the per-track neighbourhood test must tolerate a
+  louder neighbour. Requiring `PdB[k]` to beat its ±2/±3 channels kept
+  weak CW 300 Hz from a loud RTTY mark from ever qualifying; only a
+  neighbourhood within 6 dB counts as flat.
+- MAN-313 co-modulation: lags start at 3 so a tone's own key clicks never
+  count, and the span's strong test uses window peaks, not means, or a
+  loud keyed tone's click skirt forms a span over the tone itself. See
+  SPEC-decode-core.md §2.8 and the
+  [decision record](../../docs/DECISIONS/2026-10-13-man313-non-cw-rejection.md).

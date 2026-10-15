@@ -55,6 +55,11 @@ COPY --from=builder /build/target/release/manta /usr/local/bin/manta
 # No `--chmod` (BuildKit-only): git's 100755 mode carries the execute bit.
 COPY packaging/docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
+# MAN-316: [spot].list_cache_dir for docker-compose.yml's manta-lists
+# volume. Owned by manta here so a named volume mounted on it inherits that
+# owner on first mount and the daemon can store downloaded lists.
+RUN mkdir -p /var/cache/manta && chown manta:manta /var/cache/manta
+
 USER manta
 WORKDIR /home/manta
 

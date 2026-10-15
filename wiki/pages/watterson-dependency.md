@@ -8,8 +8,8 @@ sources:
   - CLAUDE.md
   - ARCHITECTURE.md
 verified:
-  commit: e68b106
-  date: 2026-07-07
+  commit: d286147
+  date: 2026-10-13
 links:
   - golden-vector-freeze
   - coppa-reuse
