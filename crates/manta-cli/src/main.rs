@@ -1432,6 +1432,15 @@ impl LiveSourceSpec {
         }
     }
 
+    /// MAN-234: how the bad-sample warnings name this input -- the file's
+    /// path, or `the <kind> input` for a live source.
+    fn input_label(&self) -> String {
+        match self {
+            LiveSourceSpec::File { path, .. } => path.display().to_string(),
+            _ => format!("the {} input", self.name()),
+        }
+    }
+
     /// Kiwi/Soapy/Hpsdr/Ka9q, or an IQ WAV whose sidecar reports a real (> 0)
     /// center frequency: a source that already knows its own tuned
     /// frequency, so `--dial-freq-hz` is an override and not a requirement.
@@ -5265,6 +5274,14 @@ fn run_command() -> Result<std::process::ExitCode> {
                     }
                 }
             }
+            // MAN-234: after the output, in both modes, so the decoded text
+            // stays first and `--json` stdout stays one record.
+            if report.bad_samples > 0 {
+                logging::warning(&fmt::bad_samples_warning(
+                    &path.display().to_string(),
+                    report.bad_samples,
+                ));
+            }
         }
         Command::Oracle {
             path,
@@ -5481,6 +5498,8 @@ fn run_command() -> Result<std::process::ExitCode> {
             };
             let has_rf_aware_source = spec.is_rf_aware();
             let source_name = spec.name();
+            // MAN-234: how the bad-sample warnings name this input.
+            let input_label = spec.input_label();
 
             // Servers start iff the resolved config has a [server] table
             // (D7); the guard runs after the load and before any source I/O.
@@ -5964,6 +5983,15 @@ fn run_command() -> Result<std::process::ExitCode> {
             // MAN-312: `listen` stores its running crash count here before
             // each `on_tracks` call, which copies it into `Metrics`.
             let static_crashes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            // MAN-234: `listen` stores its running count of replaced input
+            // samples here before each `on_tracks` call, which warns once
+            // at the first one and copies the count into `Metrics`, where
+            // it is published at 0 from startup.
+            let bad_samples = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let mut bad_samples_warned: u64 = 0;
+            if let Some(server) = &spot_server {
+                server.metrics.set_input_bad_samples(source_name, 0);
+            }
             // MAN-314: the engine's marked RTTY set, logged on change and
             // copied into `manta_rtty_signals` from the per-batch callback.
             let rtty_observer = std::sync::Arc::new(manta_engine::RttyObserver::default());
@@ -5979,6 +6007,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     operator_lists: reload_enabled.then(|| operator_lists.clone()),
                     reference_lists,
                     static_crashes: Some(static_crashes.clone()),
+                    bad_samples: Some(bad_samples.clone()),
                     rtty: Some(rtty_observer.clone()),
                     // MAN-324: only with a live-state listener.
                     live_state: spot_server
@@ -6064,6 +6093,18 @@ fn run_command() -> Result<std::process::ExitCode> {
                 // only thing that lets the status line say "stalled"
                 // instead of republishing a frozen `tracks=N` forever.
                 |n_tracks| {
+                    let n_bad = bad_samples.load(std::sync::atomic::Ordering::Relaxed);
+                    if n_bad > 0 && bad_samples_warned == 0 {
+                        logging::warning(&fmt::bad_samples_live_warning(
+                            &input_label,
+                            n_bad,
+                            spot_server.is_some(),
+                        ));
+                        bad_samples_warned = n_bad;
+                    }
+                    if let Some(server) = &spot_server {
+                        server.metrics.set_input_bad_samples(source_name, n_bad);
+                    }
                     if let Some(marks_hz) = rtty_log.poll(&rtty_observer) {
                         if let Some(server) = &spot_server {
                             server.metrics.set_rtty_signals(&marks_hz);
@@ -6112,6 +6153,12 @@ fn run_command() -> Result<std::process::ExitCode> {
             // mid-drain.
             drain_gate.close();
             stop_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+            // MAN-234: the run's total, only when it grew past the count
+            // the first-sample line reported (success and error alike).
+            let bad_total = bad_samples.load(std::sync::atomic::Ordering::Relaxed);
+            if bad_total > bad_samples_warned {
+                logging::warning(&fmt::bad_samples_warning(&input_label, bad_total));
+            }
 
             // A source read error returns from listen without closing its
             // tracks, so their partial lines are printed here, on both paths.

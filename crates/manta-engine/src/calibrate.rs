@@ -421,6 +421,11 @@ pub struct CalibrationReport {
     pub duration_s: f64,
     pub search_ppm: f64,
     pub references: Vec<ReferenceResult>,
+    /// MAN-234: samples replaced with silence before measurement because a
+    /// component was NaN, infinite or beyond `MAX_SAMPLE_MAGNITUDE` (SPEC
+    /// §1.3 step 0). Omitted from `calibrate --json` when 0.
+    #[serde(skip_serializing_if = "crate::is_zero")]
+    pub bad_samples: u64,
 }
 
 impl CalibrationReport {
@@ -481,6 +486,7 @@ fn calibrate_with_clock(
     let deadline = opts.duration + STALL_GRACE;
     let mut buf = vec![Complex32::new(0.0, 0.0); READ_CHUNK];
     let mut consumed: u64 = 0;
+    let mut bad_samples: u64 = 0;
     while consumed < max_samples {
         // Saturate rather than truncate, as doctor's SampleBoundedSource does.
         let remaining = usize::try_from(max_samples - consumed).unwrap_or(usize::MAX);
@@ -489,6 +495,10 @@ fn calibrate_with_clock(
         if n == 0 {
             break;
         }
+        // MAN-234: calibrate is the one raw-IQ consumer that bypasses the
+        // channelizer's guard, and `CarrierEstimator` sums segment powers
+        // for the whole run, so one NaN would poison every result.
+        bad_samples += manta_dsp::sample_guard::replace_unusable(&mut buf[..n]);
         if src.take_discontinuity().is_some() {
             for e in &mut estimators {
                 e.discontinuity();
@@ -513,6 +523,7 @@ fn calibrate_with_clock(
         duration_s: consumed as f64 / fs,
         search_ppm: opts.search_ppm,
         references,
+        bad_samples,
     })
 }
 
@@ -900,6 +911,34 @@ mod tests {
         let ppm = r.freq_correction_ppm.unwrap();
         assert!((ppm - 2.5).abs() < 0.02, "{ppm}");
         assert_eq!(report.result(), Some(r));
+    }
+
+    /// MAN-234: one NaN no longer poisons the estimator's accumulated
+    /// power; it is replaced with silence and counted, so the result is
+    /// exactly that of the same input with the sample zeroed, and matches
+    /// the clean input's.
+    #[test]
+    fn a_bad_sample_does_not_change_the_measured_ppm() {
+        let clean = with_noise(carrier(PPM_2_5_HZ, CENTRE, 12.0, |_| 1.0), 1);
+        let planned = plan_references(CENTRE, (-FS / 2.0, FS / 2.0), false, &opts(12)).unwrap();
+        let ppm = |s: Vec<Complex32>| {
+            let report = calibrate(source(s, CENTRE), &planned, &opts(12)).unwrap();
+            (
+                report.references[0].freq_correction_ppm.unwrap(),
+                report.bad_samples,
+            )
+        };
+        let (want, clean_bad) = ppm(clean.clone());
+        assert_eq!(clean_bad, 0);
+        let mut zeroed = clean.clone();
+        zeroed[100] = Complex32::new(0.0, 0.0);
+        let (zeroed_ppm, _) = ppm(zeroed);
+        let mut corrupt = clean;
+        corrupt[100].re = f32::NAN;
+        let (got, bad) = ppm(corrupt);
+        assert_eq!(bad, 1);
+        assert_eq!(got.to_bits(), zeroed_ppm.to_bits());
+        assert_eq!(got.to_bits(), want.to_bits(), "got {got}, clean {want}");
     }
 
     #[test]
