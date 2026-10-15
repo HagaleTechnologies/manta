@@ -812,6 +812,9 @@ pub(crate) struct Batch {
     /// The ids the input's `TrackManager` still holds, for the live tap's
     /// bookkeeping; `None` when no live-state sink is attached.
     pub(crate) live_ids: Option<Vec<u32>>,
+    /// The input's band sample when this batch crossed one of its stream
+    /// seconds, on the common clock; only with a live-state sink.
+    pub(crate) band: Option<crate::live::BandSample>,
 }
 
 /// MAN-13 (D1): the shared back end of a multi-input session: the one
@@ -869,6 +872,10 @@ impl<'a> Back<'a> {
         if let (Some(tap), Some(ids)) = (self.ctx.live.as_mut(), batch.live_ids.as_deref()) {
             tap.retain_input_tracks(input, n_inputs, ids);
         }
+        // MAN-324 per input: after the batch it closes, as `maybe_tick`.
+        if let (Some(tap), Some(band)) = (self.ctx.live.as_ref(), batch.band) {
+            tap.publish_band(band);
+        }
     }
 }
 
@@ -880,6 +887,8 @@ pub(crate) struct FrontObservers {
     pub(crate) decode_latency: Option<Arc<DecodeLatencyObserver>>,
     pub(crate) decode_quality: Option<Arc<DecodeQualityObserver>>,
     pub(crate) live_ids: bool,
+    /// The input's index, for its band samples.
+    pub(crate) input: usize,
 }
 
 /// Maps a batch's local timestamps onto the common clock and calibrates
@@ -950,7 +959,7 @@ pub(crate) fn run_input_front(
         ids,
         ids.first,
         observers.decode_quality.clone(),
-        false,
+        observers.live_ids,
     )?;
     let mut seg_base: u64 = 0;
     let mut seg_consumed: u64 = 0;
@@ -961,7 +970,20 @@ pub(crate) fn run_input_front(
             end_ts: clock.to_common(end_local),
             n_tracks: tm.decoding_track_count(),
             live_ids: observers.live_ids.then(|| tm.track_ids()),
+            band: None,
         };
+    let mut band_ticker = observers
+        .live_ids
+        .then(|| crate::live::BandTicker::new(observers.input, fs, calibration_factor));
+    // Once per stream second, on the batch that crossed it (MAN-324).
+    let mut tick = |b: &mut Batch, tm: &mut crate::track::TrackManager, local_ts: u64| {
+        if let Some(ticker) = band_ticker.as_mut() {
+            b.band = ticker.tick(tm, local_ts).map(|mut sample| {
+                sample.sample_ts = clock.to_common(sample.sample_ts);
+                sample
+            });
+        }
+    };
 
     let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
     let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];
@@ -982,11 +1004,14 @@ pub(crate) fn run_input_front(
         }
         filled += n;
     }
-    for block in [&padding[..], &calib[..filled]] {
+    for (i, block) in [&padding[..], &calib[..filled]].into_iter().enumerate() {
         let events = seg.tm.process_hops(&seg.ch.process(block), |m| {
             seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
         });
-        let b = batch(events, seg_base + filled as u64, &seg.tm);
+        let mut b = batch(events, seg_base + filled as u64, &seg.tm);
+        if i == 1 {
+            tick(&mut b, &mut seg.tm, seg_base + filled as u64);
+        }
         report_active_tracks(b.n_tracks);
         report_static_crashes(crash_base + seg.tm.static_crash_count());
         rtty.update(&seg.tm);
@@ -1029,7 +1054,7 @@ pub(crate) fn run_input_front(
                 ids,
                 next_id,
                 observers.decode_quality.clone(),
-                false,
+                observers.live_ids,
             )?;
             let events = seg.tm.process_hops(&seg.ch.process(&padding), |m| {
                 seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
@@ -1044,7 +1069,9 @@ pub(crate) fn run_input_front(
             seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
         });
         seg_consumed += n as u64;
-        pending.push(batch(events, seg_base + seg_consumed, &seg.tm));
+        let mut b = batch(events, seg_base + seg_consumed, &seg.tm);
+        tick(&mut b, &mut seg.tm, seg_base + seg_consumed);
+        pending.push(b);
         report_active_tracks(seg.tm.decoding_track_count());
         report_static_crashes(crash_base + seg.tm.static_crash_count());
         rtty.update(&seg.tm);

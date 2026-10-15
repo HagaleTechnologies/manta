@@ -20,6 +20,9 @@ pub(crate) struct LiveSink {
     bus: Arc<SpotBus>,
     metrics: Arc<Metrics>,
     station_callsign: String,
+    /// MAN-13: with several inputs, their names in config order; each
+    /// `bandState` then names its input (`BandSample::input`).
+    sources: Option<Vec<String>>,
 }
 
 impl LiveSink {
@@ -28,6 +31,21 @@ impl LiveSink {
             bus,
             metrics,
             station_callsign: station_callsign.to_string(),
+            sources: None,
+        }
+    }
+
+    /// MAN-13: a sink for several inputs, named in config order.
+    pub(crate) fn with_sources(mut self, names: &[String]) -> Self {
+        self.sources = Some(names.to_vec());
+        self
+    }
+
+    /// The input name a `bandState` carries: only with several inputs.
+    fn source_of(&self, record: &LiveRecord) -> Option<&str> {
+        match (record, &self.sources) {
+            (LiveRecord::Bands(b), Some(names)) => names.get(b.input).map(String::as_str),
+            _ => None,
         }
     }
 }
@@ -41,7 +59,8 @@ impl LiveStateSink for LiveSink {
     /// A non-blocking broadcast send; a slow subscriber lags and is
     /// disconnected by its own handler, never waited on here.
     fn publish(&self, record: LiveRecord) {
-        let (kind, line) = render(&record, &self.station_callsign, &self.bus);
+        let source = self.source_of(&record);
+        let (kind, line) = render_from(&record, &self.station_callsign, source, &self.bus);
         if self.bus.publish_live(Arc::from(line)) {
             self.metrics.record_live_published(kind);
         }
@@ -49,7 +68,19 @@ impl LiveStateSink for LiveSink {
 }
 
 /// One engine live record as its `kind` and serialised wire line.
+#[cfg(test)]
 pub(crate) fn render(record: &LiveRecord, de_call: &str, bus: &SpotBus) -> (&'static str, String) {
+    render_from(record, de_call, None, bus)
+}
+
+/// [`render`], naming the input a `bandState` describes when `source` is
+/// set (MAN-13).
+pub(crate) fn render_from(
+    record: &LiveRecord,
+    de_call: &str,
+    source: Option<&str>,
+    bus: &SpotBus,
+) -> (&'static str, String) {
     match record {
         LiveRecord::Bands(b) => {
             let channels: Vec<ChannelLevel> = b
@@ -65,7 +96,10 @@ pub(crate) fn render(record: &LiveRecord, de_call: &str, bus: &SpotBus) -> (&'st
                 channels: &channels,
                 decoding_track_freqs_hz: &b.decoding_track_freqs_hz,
             });
-            let rec = BandStateRecord::new(de_call, bus.unix_ts_for(b.sample_ts), bands);
+            let mut rec = BandStateRecord::new(de_call, bus.unix_ts_for(b.sample_ts), bands);
+            if let Some(source) = source {
+                rec = rec.with_source(source);
+            }
             (BAND_STATE_KIND, to_line(&rec))
         }
         LiveRecord::Track(t) => {
@@ -152,9 +186,33 @@ mod tests {
     }
 
     #[test]
+    fn band_state_names_its_input_with_several_inputs() {
+        let sample = |input| {
+            LiveRecord::Bands(BandSample {
+                input,
+                sample_ts: 5 * FS as u64,
+                channels: vec![],
+                decoding_track_freqs_hz: vec![],
+            })
+        };
+        let metrics = Arc::new(Metrics::new());
+        let one = LiveSink::new(bus(), metrics.clone(), "W1AW");
+        assert_eq!(one.source_of(&sample(0)), None);
+        let names = ["20m".to_string(), "40m".to_string()];
+        let several = LiveSink::new(bus(), metrics, "W1AW").with_sources(&names);
+        assert_eq!(several.source_of(&sample(1)), Some("40m"));
+        let (_, line) = render_from(&sample(1), "W1AW", Some("40m"), &bus());
+        assert_eq!(
+            line,
+            r#"{"kind":"bandState","deCall":"W1AW","source":"40m","timestamp":1700000005,"bands":[]}"#
+        );
+    }
+
+    #[test]
     fn each_live_record_maps_to_its_documented_line() {
         let bus = bus();
         let bands = LiveRecord::Bands(BandSample {
+            input: 0,
             sample_ts: 5 * FS as u64,
             channels: vec![
                 EngineChannel {

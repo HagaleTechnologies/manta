@@ -538,3 +538,81 @@ fn more_than_max_inputs_is_refused() {
     };
     assert_eq!(err, "at most 16 inputs are supported, found 17");
 }
+
+/// Records every live-state record.
+#[derive(Default)]
+struct Recorder(std::sync::Mutex<Vec<manta_engine::LiveRecord>>);
+
+impl manta_engine::LiveStateSink for Recorder {
+    fn wants_records(&self) -> bool {
+        true
+    }
+    fn publish(&self, record: manta_engine::LiveRecord) {
+        self.0.lock().unwrap().push(record);
+    }
+}
+
+#[test]
+fn each_input_publishes_its_own_band_sample_once_per_stream_second() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let opened = open_inputs(
+        vec![
+            plain("20m", short_scene()),
+            plain("40m", forty_metre_scene()),
+        ],
+        stop,
+    )
+    .unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut spots = Vec::new();
+    listen_inputs(
+        opened,
+        &PipelineConfig::default(),
+        SessionClock::Replay,
+        SharedObservers {
+            live_state: Some(recorder.clone()),
+            ..Default::default()
+        },
+        |_| {},
+        |s| spots.push(s.clone()),
+        |_input, _n| {},
+        |_end| {},
+    )
+    .unwrap();
+    let records = recorder.0.lock().unwrap();
+    let bands: Vec<&manta_engine::BandSample> = records
+        .iter()
+        .filter_map(|r| match r {
+            manta_engine::LiveRecord::Bands(b) => Some(b),
+            _ => None,
+        })
+        .collect();
+    for (input, center) in [(0, 14_000_000.0), (1, 7_020_000.0)] {
+        let mine: Vec<_> = bands.iter().filter(|b| b.input == input).collect();
+        // 30 s of stream: one sample per second after the calibration fill.
+        assert!(
+            (28..=30).contains(&mine.len()),
+            "input {input}: {} band samples",
+            mine.len()
+        );
+        assert!(mine.windows(2).all(|w| w[0].sample_ts < w[1].sample_ts));
+        // Each input's keyed station occupies its channel (MAN-324's window).
+        assert!(mine.iter().flat_map(|b| &b.channels).any(|c| c.occupied));
+        assert!(mine
+            .iter()
+            .flat_map(|b| &b.channels)
+            .all(|c| (c.freq_hz - center).abs() <= 48_000.0));
+    }
+    assert_eq!(bands.len(), bands.iter().filter(|b| b.input < 2).count());
+    // The tap changes no spot.
+    assert_eq!(
+        call_counts(&spots),
+        call_counts(
+            &run(vec![
+                plain("20m", short_scene()),
+                plain("40m", forty_metre_scene())
+            ])
+            .spots
+        )
+    );
+}

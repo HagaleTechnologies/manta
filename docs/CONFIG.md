@@ -253,9 +253,11 @@ per receiver. Each entry takes the keys above, plus `name`. A one-entry
 - A station two receivers both hear is spotted once (the shared validator's
   cross-input dedupe), on stdout and, with `[server]`, on the one telnet,
   JSON and metrics server. `/healthz` stays `ok` while at least one input
-  is healthy. SIGHUP stops a several-input run instead of reloading, and
-  the live-state stream, scheduled list refresh and per-input
-  `manta_input_*` counters are not wired for several inputs yet. See
+  is healthy. SIGHUP reloads `[spot]` lists and `dry_run`, `refresh_lists`
+  refreshes `cty.dat` and `MASTER.SCP` for every input, `manta_rtty_signals`
+  counts every input's RTTY marks, each input keeps its own
+  `manta_input_*{source}` counters, and with `live_port` set each input
+  sends its own `bandState` record, named in its `source` field. See
   [DECISIONS/2026-10-15-man13-multi-input-daemon.md](DECISIONS/2026-10-15-man13-multi-input-daemon.md).
 
 ## [spot]

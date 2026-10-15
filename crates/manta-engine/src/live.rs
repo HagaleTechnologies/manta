@@ -48,6 +48,9 @@ pub enum LiveRecord {
 /// decoder, at one stream instant. Calibrated Hz.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BandSample {
+    /// MAN-13: the input this sample describes, in config order; 0 with
+    /// one input.
+    pub input: usize,
     pub sample_ts: u64,
     pub channels: Vec<ChannelLevel>,
     pub decoding_track_freqs_hz: Vec<f64>,
@@ -273,6 +276,14 @@ impl LiveTap {
         }));
     }
 
+    /// MAN-13: publishes one input's band sample, taken on that input's
+    /// front end by its [`BandTicker`].
+    pub(crate) fn publish_band(&self, sample: BandSample) {
+        if self.sink.wants_records() {
+            self.sink.publish(LiveRecord::Bands(sample));
+        }
+    }
+
     /// MAN-13: after one input's batch in a multi-input session, forgets
     /// that input's tracks its manager no longer holds (`live` is sorted).
     /// Input `input` of `n_inputs` owns ids `≡ input + 1 (mod n_inputs)`.
@@ -312,10 +323,60 @@ impl LiveTap {
             .map(|f| f * self.factor)
             .collect();
         self.sink.publish(LiveRecord::Bands(BandSample {
+            input: 0,
             sample_ts: stream_ts,
             channels,
             decoding_track_freqs_hz,
         }));
+    }
+}
+
+/// MAN-13: one input's band tick in a multi-input session, on the input's
+/// own thread (its `TrackManager` lives there): once per second of the
+/// input's stream time, as [`LiveTap::maybe_tick`] ticks with one input.
+pub(crate) struct BandTicker {
+    input: usize,
+    next_tick: u64,
+    tick_samples: u64,
+    factor: f64,
+}
+
+impl BandTicker {
+    /// `fs` is the input's own rate; `factor` its calibration.
+    pub(crate) fn new(input: usize, fs: f64, factor: f64) -> Self {
+        let tick_samples = (fs.round() as u64).max(1);
+        Self {
+            input,
+            next_tick: tick_samples,
+            tick_samples,
+            factor,
+        }
+    }
+
+    /// The input's band sample when `local_ts` crosses a stream second,
+    /// stamped with `local_ts` (the caller maps it to the common clock).
+    pub(crate) fn tick(&mut self, tm: &mut TrackManager, local_ts: u64) -> Option<BandSample> {
+        if local_ts < self.next_tick {
+            return None;
+        }
+        while self.next_tick <= local_ts {
+            self.next_tick += self.tick_samples;
+        }
+        let mut channels = tm.take_channel_levels();
+        for c in &mut channels {
+            c.freq_hz *= self.factor;
+        }
+        let decoding_track_freqs_hz = tm
+            .decoding_track_freqs_hz()
+            .into_iter()
+            .map(|f| f * self.factor)
+            .collect();
+        Some(BandSample {
+            input: self.input,
+            sample_ts: local_ts,
+            channels,
+            decoding_track_freqs_hz,
+        })
     }
 }
 

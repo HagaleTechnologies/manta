@@ -108,16 +108,21 @@ existed.
   (SSRCs on one radiod) and KiwiSDR (channels of one receiver), whose
   transports are independent. HPSDR multi-DDC is MAN-307.
 
+## Services with several inputs
+
+The live-state stream, SIGHUP reload, the scheduled list refresh, RTTY
+marks and per-input `manta_input_*` counters work with several inputs as
+with one. Each input's front end takes its own `bandState` sample, named
+in `source`. `manta_rtty_signals` counts the union of every input's marks
+(two inputs' marks within 50 Hz count once), and a lost input clears only
+its own. An input that ends while the daemon runs on reads
+`manta_source_health{source} 0` from then on; a clean end at shutdown is
+not counted as an outage.
+
 ## Not yet
 
 These parts of the plan are not in this change and stay open:
 
-- The live-state stream (`[server].live_port`) with several inputs:
-  `bandState.source` and one record per input. A multi-input daemon logs
-  a warning and leaves the stream off.
-- SIGHUP reload of `[spot]` lists, the scheduled `cty.dat`/`MASTER.SCP`
-  refresh, the RTTY observer and per-input `manta_input_*` counters are not
-  wired for several inputs; one input keeps all of them.
 - Single-input runs keep `listen_with_observers` unchanged rather than a
   front/back split of it; the multi-input path has its own front end
   (`listen::run_input_front`) and back end (`listen::Back`).

@@ -5628,22 +5628,16 @@ fn run_command() -> Result<std::process::ExitCode> {
             // MAN-13: several [[input]] entries decode on their own threads
             // into one validator and one spot output.
             if !resolved.inputs.is_empty() {
-                // MAN-316's refresh is not wired for several inputs: the
-                // lists loaded at startup stay in use, so the stale-copy
-                // warning skipped above for the refresh is due here.
+                // MAN-316: as with one input; mixing file and live inputs
+                // is refused, so the first input's kind is every input's,
+                // and `prepare_run_lists` warns of a stale copy once the
+                // cache has had its say.
                 let live = resolved.inputs.iter().any(|i| i.spec.is_reconnectable());
-                if live && resolved.spot.refresh_lists {
-                    if cache_may_choose_cty {
-                        if let Some(warning) =
-                            stale_cty_warning(&lists_in_use[0], std::time::SystemTime::now())
-                        {
-                            logging::warning(&warning);
-                        }
-                    }
-                    logging::warning(
-                        "[spot].refresh_lists is not applied with several [[input]] entries yet; \
-                         the cty.dat and MASTER.SCP loaded at startup stay in use",
-                    );
+                let run_lists = prepare_run_lists(live, &resolved.spot, lists_in_use, &cfg)?;
+                let mut cfg = cfg;
+                if run_lists.refresh.is_some() {
+                    cfg.cty = Some(run_lists.lists.cty.load());
+                    cfg.scp = Some(run_lists.lists.scp.load());
                 }
                 let server = match loaded.server.clone() {
                     None => None,
@@ -5651,13 +5645,19 @@ fn run_command() -> Result<std::process::ExitCode> {
                         cfg: server_cfg,
                         rbn_uplink: loaded.rbn_uplink.clone(),
                         rbn_compare: resolved.rbn_compare.clone(),
-                        lists: std::sync::Arc::new(manta_engine::ReferenceLists::new(
-                            cfg.cty_table(),
-                            cfg.scp_set(),
-                        )),
                         replay_epoch: resolved.replay_epoch,
                     }),
                 };
+                #[cfg(unix)]
+                let reload = Some(multi_run::ReloadSetup {
+                    config_path: config_path.clone(),
+                    cli: reload_cli,
+                    cli_engine: engine,
+                    vars,
+                    startup_raw: loaded.raw.clone(),
+                });
+                #[cfg(not(unix))]
+                let reload = None;
                 return multi_run::run(multi_run::MultiRun {
                     inputs: &resolved.inputs,
                     replay: resolved.replay,
@@ -5665,6 +5665,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                     json,
                     decoded_text,
                     server,
+                    run_lists,
+                    spot: &resolved.spot,
+                    reload,
                 });
             }
             let spec = &resolved.spec;

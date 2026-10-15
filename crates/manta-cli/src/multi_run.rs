@@ -4,17 +4,22 @@
 //! by two inputs is spotted once on the one spot output. A live input that
 //! drops out reconnects on its own thread (`ReconnectingSource`) and logs
 //! its health edges; an input that ends in error stops only itself.
+//! A daemon's SIGHUP reload (MAN-78), the scheduled list refresh (MAN-316),
+//! RTTY marks (MAN-314), each input's `manta_input_*` counters (MAN-56) and
+//! the live-state stream (MAN-324, one `bandState` per input) work as with
+//! one input.
 
-use crate::reconnect::{HealthSink, ReconnectingSource};
+use crate::reconnect::{HealthSink, InputHealthTotals, ReconnectingSource};
 use crate::{
     fmt, logging, text_lines, wrap_file_replay, LiveSourceSpec, ReplayMode, ResolvedInput,
+    RunLists, SpotResolved,
 };
 use anyhow::{bail, Result};
-use manta_engine::{InputSpec, PipelineConfig, SessionClock, SharedObservers};
+use manta_engine::{InputSpec, PipelineConfig, RttyObserver, SessionClock, SharedObservers};
 use manta_server::metrics::Metrics;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// What `run` hands the multi-input path.
 pub(crate) struct MultiRun<'a> {
@@ -28,6 +33,23 @@ pub(crate) struct MultiRun<'a> {
     /// `Some` with a `[server]` table: one telnet/JSON/metrics server for
     /// every input.
     pub server: Option<ServerSetup>,
+    /// MAN-316: the lists every input's spots are checked against, and the
+    /// refresher to start once the servers are up.
+    pub run_lists: RunLists,
+    pub spot: &'a SpotResolved,
+    /// MAN-78: what a SIGHUP reload re-resolves with; `Some` on Unix.
+    pub reload: Option<ReloadSetup>,
+}
+
+/// MAN-78: startup's view of the config, for `reload::ReloadContext`.
+/// Built on Unix only: elsewhere there is no SIGHUP.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct ReloadSetup {
+    pub config_path: Option<std::path::PathBuf>,
+    pub cli: crate::CliOverrides,
+    pub cli_engine: Option<manta_decode::decoder::Engine>,
+    pub vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    pub startup_raw: toml::Table,
 }
 
 /// The `[server]` side of a multi-input daemon.
@@ -35,7 +57,6 @@ pub(crate) struct ServerSetup {
     pub cfg: manta_server::config::ServerConfig,
     pub rbn_uplink: Vec<manta_server::config::RbnUplinkConfig>,
     pub rbn_compare: Option<manta_server::config::RbnCompareConfig>,
-    pub lists: Arc<manta_engine::ReferenceLists>,
     pub replay_epoch: Option<i64>,
 }
 
@@ -74,10 +95,114 @@ fn sum(counters: &[Arc<AtomicU64>]) -> u64 {
     counters.iter().map(|c| c.load(Ordering::Relaxed)).sum()
 }
 
+/// Each input's open-completion time after the earliest one (the session
+/// epoch), in input order; an input with no time reads zero.
+fn live_offsets(opened_at: &[Option<Instant>]) -> Vec<Duration> {
+    let epoch = opened_at.iter().flatten().min().copied();
+    opened_at
+        .iter()
+        .map(|t| match (t, epoch) {
+            (Some(t), Some(e)) => t.saturating_duration_since(e),
+            _ => Duration::ZERO,
+        })
+        .collect()
+}
+
+/// Two inputs' marks closer than this are one RTTY signal heard twice (a
+/// station in two receivers' overlap): well under the narrowest standard
+/// shift, 170 Hz.
+const SAME_RTTY_MARK_HZ: f64 = 50.0;
+
+/// MAN-314: every input's marked RTTY frequencies, in input order;
+/// `manta_rtty_signals` counts their union.
+#[derive(Default)]
+struct RttyMarks(Mutex<Vec<Vec<f64>>>);
+
+impl RttyMarks {
+    fn new(n: usize) -> Self {
+        Self(Mutex::new(vec![Vec::new(); n]))
+    }
+
+    /// Replaces input `index`'s marks; returns the union to publish,
+    /// ascending, a mark another input also reports counted once.
+    fn set(&self, index: usize, marks_hz: Vec<f64>) -> Vec<f64> {
+        let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = all.get_mut(index) {
+            *slot = marks_hz;
+        }
+        let mut marks: Vec<f64> = all.iter().flatten().copied().collect();
+        marks.sort_by(f64::total_cmp);
+        marks.dedup_by(|b, a| *b - *a < SAME_RTTY_MARK_HZ);
+        marks
+    }
+}
+
+/// What one input's health sink updates besides its own flag.
+struct InputHealthState {
+    healthy: Arc<Vec<AtomicBool>>,
+    tracks: Vec<Arc<AtomicU64>>,
+    rtty: Arc<RttyMarks>,
+    metrics: Arc<OnceLock<Arc<Metrics>>>,
+}
+
+/// MAN-73 per input: the `ReconnectingSource` health sink of input
+/// `index`. A down edge zeroes only this input's track count and RTTY
+/// marks (its thread is blocked reconnecting, so it cannot publish them
+/// itself, MAN-45) and republishes the sums; every edge after the first
+/// report logs the `k of n inputs decoding` line.
+fn input_health_sink(index: usize, name: String, state: InputHealthState) -> HealthSink {
+    let InputHealthState {
+        healthy,
+        tracks,
+        rtty,
+        metrics,
+    } = state;
+    // The first healthy report of a source that started unconfirmed is
+    // its start, not a recovery.
+    let mut ever_up = false;
+    // The report at construction is the initial state.
+    let mut constructed = false;
+    Box::new(move |up| {
+        let initial = !std::mem::replace(&mut constructed, true);
+        let union = (!up).then(|| {
+            tracks[index].store(0, Ordering::Relaxed);
+            rtty.set(index, Vec::new())
+        });
+        let was = healthy[index].swap(up, Ordering::Relaxed);
+        if let Some(metrics) = metrics.get() {
+            if let Some(union) = &union {
+                metrics.set_active_tracks(sum(&tracks));
+                metrics.set_rtty_signals(union);
+            }
+            metrics.set_source_health(&name, up);
+        }
+        let recovered = !initial && up && !was && ever_up;
+        let lost = !initial && !up && was;
+        ever_up |= up;
+        if recovered {
+            tracing::info!("input {name}: back; {}", decoding_line(&healthy));
+        } else if lost {
+            tracing::warn!("input {name}: lost; retrying, {}", decoding_line(&healthy));
+        }
+    })
+}
+
 /// `{decoding} of {configured} inputs decoding`.
 fn decoding_line(healthy: &[AtomicBool]) -> String {
     let decoding = healthy.iter().filter(|h| h.load(Ordering::Relaxed)).count();
     format!("{decoding} of {} inputs decoding", healthy.len())
+}
+
+/// An input that has ended while others may still run delivers no more
+/// samples: `manta_source_health` reads 0 for it from here on, and the
+/// inputs still running keep their own state. A clean end after a stop
+/// request is the daemon's shutdown, not a failure, so it is left alone as
+/// the one-input path's `record_terminal_source_health` leaves it (no
+/// outage counted).
+fn publish_input_end(metrics: &Metrics, name: &str, result: &Result<()>, stopping: bool) {
+    if result.is_err() || !stopping {
+        metrics.set_source_health_terminal(name, false);
+    }
 }
 
 /// Runs every input until each has ended. Exit 0 when every input ended
@@ -87,27 +212,20 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     let n = m.inputs.len();
     let names: Vec<String> = m.inputs.iter().map(|i| i.name.clone()).collect();
     let live = m.inputs.iter().any(|i| i.spec.is_reconnectable());
+    // MAN-78: a daemon's SIGHUP is a reload, handled on the reload thread
+    // alone: blocked here, before the input threads and the servers start,
+    // so each inherits the mask (`reload::mask_sighup`).
+    #[cfg(unix)]
+    if m.server.is_some() {
+        use anyhow::Context as _;
+        crate::reload::mask_sighup(libc::SIG_BLOCK)
+            .context("blocking SIGHUP on the decode threads")?;
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let stop_handler = stop.clone();
     ctrlc::set_handler(move || stop_handler.store(true, Ordering::Relaxed))?;
     #[cfg(unix)]
-    {
-        if let Some(mut signals) = crate::install_unix_signal_handlers(&stop, m.server.is_some())? {
-            // A daemon's SIGHUP reloads `[spot]` lists and `dry_run` with one
-            // input (MAN-78); with several it is not wired yet, so it must not
-            // stop the daemon either: say so and keep running.
-            std::thread::Builder::new()
-                .name("manta-sighup".into())
-                .spawn(move || {
-                    for _ in signals.forever() {
-                        logging::warning(
-                            "SIGHUP: reloading [spot] lists and dry_run is not supported with \
-                             several [[input]] entries yet; restart manta to apply config changes",
-                        );
-                    }
-                })?;
-        }
-    }
+    let reload_signals = crate::install_unix_signal_handlers(&stop, m.server.is_some())?;
     // Each input's last reported health; "k of n inputs decoding" counts
     // the healthy ones. A `ReconnectingSource` reports its initial state at
     // construction, so only a change of state is an edge worth a log line.
@@ -119,6 +237,13 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     // Each input's active-track count; `manta_active_tracks` is their sum
     // (D9). A lost input's health sink zeroes only its own count.
     let tracks: Vec<Arc<AtomicU64>> = (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    // MAN-314: each input's marked RTTY set; the metric is their union.
+    let rtty_observers: Vec<Arc<RttyObserver>> =
+        (0..n).map(|_| Arc::new(RttyObserver::default())).collect();
+    let rtty_marks = Arc::new(RttyMarks::new(n));
+    // MAN-56: each input's packet counters, taken on its own thread at open.
+    let input_counters: Arc<Mutex<Vec<Option<Arc<InputHealthTotals>>>>> =
+        Arc::new(Mutex::new(vec![None; n]));
 
     let specs = m
         .inputs
@@ -132,13 +257,19 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             let stop = stop.clone();
             let healthy = healthy.clone();
             let opened_at = opened_at.clone();
-            let metrics_slot = metrics_slot.clone();
-            let tracks = tracks.clone();
+            let health = InputHealthState {
+                healthy: healthy.clone(),
+                tracks: tracks.clone(),
+                rtty: rtty_marks.clone(),
+                metrics: metrics_slot.clone(),
+            };
+            let input_counters = input_counters.clone();
             InputSpec {
                 name: input.name.clone(),
                 freq_correction_ppm: input.freq_correction_ppm,
                 observers: manta_engine::InputObservers {
                     static_crashes: Some(crashes[index].clone()),
+                    rtty: Some(rtty_observers[index].clone()),
                     ..Default::default()
                 },
                 open: Box::new(move || {
@@ -148,50 +279,26 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                     }
                     let reopen = spec.clone();
                     if spec.is_reconnectable() {
-                        let source_name = name.clone();
                         // As the one-input path: a source that confirms it
                         // is live (Kiwi, ka9q) is healthy once it has.
                         let initial_healthy = first.confirmed_live_handle().is_none();
-                        // The first healthy report of a source that started
-                        // unconfirmed is its start, not a recovery.
-                        let mut ever_up = false;
-                        // The report at construction is the initial state.
-                        let mut constructed = false;
-                        let on_health: HealthSink = Box::new(move |up| {
-                            let initial = !std::mem::replace(&mut constructed, true);
-                            if !up {
-                                // The input's thread is blocked reconnecting,
-                                // so it cannot publish its own count (MAN-45).
-                                tracks[index].store(0, Ordering::Relaxed);
-                            }
-                            let was = healthy[index].swap(up, Ordering::Relaxed);
-                            if let Some(metrics) = metrics_slot.get() {
-                                if !up {
-                                    metrics.set_active_tracks(sum(&tracks));
-                                }
-                                metrics.set_source_health(&name, up);
-                            }
-                            let recovered = !initial && up && !was && ever_up;
-                            let lost = !initial && !up && was;
-                            ever_up |= up;
-                            if recovered {
-                                tracing::info!("input {name}: back; {}", decoding_line(&healthy));
-                            } else if lost {
-                                tracing::warn!(
-                                    "input {name}: lost; retrying, {}",
-                                    decoding_line(&healthy)
-                                );
-                            }
-                        });
-                        Ok(Box::new(ReconnectingSource::new(
-                            source_name,
+                        let on_health = input_health_sink(index, name.clone(), health);
+                        let wrapped = ReconnectingSource::new(
+                            name,
                             first,
                             Box::new(move || reopen.open(capture, dial)),
                             stop,
                             initial_healthy,
                             on_health,
-                        )) as Box<dyn manta_input::IqSource>)
+                        );
+                        if let Ok(mut slot) = input_counters.lock() {
+                            slot[index] = wrapped.input_health();
+                        }
+                        Ok(Box::new(wrapped) as Box<dyn manta_input::IqSource>)
                     } else {
+                        if let Ok(mut slot) = input_counters.lock() {
+                            slot[index] = InputHealthTotals::for_source(first.as_ref());
+                        }
                         let label = match &spec {
                             LiveSourceSpec::File { path, .. } => path.display().to_string(),
                             _ => String::new(),
@@ -222,15 +329,8 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     }
     let clock = if live {
         let at = opened_at.lock().map(|a| a.clone()).unwrap_or_default();
-        let epoch = at.iter().flatten().min().copied();
         SessionClock::Live {
-            offsets: at
-                .iter()
-                .map(|t| match (t, epoch) {
-                    (Some(t), Some(e)) => t.saturating_duration_since(e),
-                    _ => std::time::Duration::ZERO,
-                })
-                .collect(),
+            offsets: live_offsets(&at),
         }
     } else {
         SessionClock::Replay
@@ -239,17 +339,10 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     // `opened` below.
     let rates: Vec<f64> = opened.inputs().iter().map(|i| i.sample_rate_hz).collect();
     let mut shared = SharedObservers::default();
+    let lists = m.run_lists.lists.clone();
     let server = match m.server {
         None => None,
-        Some(mut setup) => {
-            // Not wired for several inputs yet (bandState.source): the
-            // live-state listener is neither bound nor served.
-            if setup.cfg.live_port.take().is_some() {
-                logging::warning(
-                    "[server].live_port is not served with several [[input]] entries yet; the \
-                     live-state stream stays off",
-                );
-            }
+        Some(setup) => {
             let first = &opened.inputs()[0];
             let files: Vec<&std::path::Path> = m
                 .inputs
@@ -307,9 +400,37 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 },
                 epoch,
                 nonce,
-                setup.lists,
+                lists.clone(),
                 m.cfg,
             )?;
+            // MAN-324: one `bandState` per input per stream second, each
+            // naming its input; track and decision records as with one.
+            if server.live_addr.is_some() {
+                shared.live_state = Some(Arc::new(
+                    crate::live_state::LiveSink::new(
+                        server.bus.clone(),
+                        server.metrics.clone(),
+                        &server.station_callsign,
+                    )
+                    .with_sources(&names),
+                ) as Arc<dyn manta_engine::LiveStateSink>);
+            }
+            // MAN-56: each input's packet counters, keyed by its name;
+            // published once now so every series exists from the first
+            // scrape. Inputs without a wire-loss model publish none.
+            let counters = input_counters.lock().map(|c| c.clone()).unwrap_or_default();
+            for (name, counters) in names.iter().zip(counters) {
+                let Some(counters) = counters else { continue };
+                let metrics = server.metrics.clone();
+                let name = name.clone();
+                metrics.set_input_health(&name, counters.snapshot());
+                rt.spawn(async move {
+                    loop {
+                        tokio::time::sleep(crate::INPUT_HEALTH_POLL_INTERVAL).await;
+                        metrics.set_input_health(&name, counters.snapshot());
+                    }
+                });
+            }
             // MAN-128: the decode watchdog progresses while any input's
             // front end processes chunks (D9); the poller copies the shared
             // observers into `Metrics`, as the one-input path does.
@@ -344,9 +465,55 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             Some((rt, server))
         }
     };
+    // MAN-316: after the `listening:` banner, as with one input.
+    shared.reference_lists = crate::start_list_refresh(
+        m.run_lists,
+        live,
+        m.spot,
+        server.as_ref().map(|(_, server)| server.metrics.clone()),
+        stop.clone(),
+    )?;
+    // MAN-78: with a `[server]` table, SIGHUP reloads the `[spot]` lists
+    // every input's spots are checked against and each `dry_run`.
+    let operator_lists = Arc::new(manta_engine::OperatorListsUpdate::default());
+    let drain_gate = Arc::new(crate::reload::DrainGate::default());
+    #[cfg(unix)]
+    let reload_enabled = match (reload_signals, &server, m.reload) {
+        (Some(signals), Some((_, server)), Some(setup)) => {
+            crate::reload::spawn(
+                signals,
+                crate::reload::ReloadContext {
+                    config_path: setup.config_path,
+                    cli: setup.cli,
+                    cli_engine: setup.cli_engine,
+                    vars: setup.vars,
+                    startup_raw: setup.startup_raw,
+                    lists: operator_lists.clone(),
+                    uplinks: server.uplink_dry_run.clone(),
+                    drain_gate: drain_gate.clone(),
+                    stop: stop.clone(),
+                },
+            )?;
+            true
+        }
+        _ => false,
+    };
+    #[cfg(not(unix))]
+    let reload_enabled = {
+        let _ = m.reload;
+        false
+    };
+    if reload_enabled {
+        shared.operator_lists = Some(operator_lists);
+    }
     logging::note(&format!(
-        "manta: listening on {n} inputs ({}); send SIGINT or SIGTERM to stop",
-        names.join(", ")
+        "manta: listening on {n} inputs ({}); send SIGINT or SIGTERM to stop{}",
+        names.join(", "),
+        if reload_enabled {
+            ", SIGHUP to reload [spot] lists and dry_run"
+        } else {
+            ""
+        }
     ));
 
     let json = m.json;
@@ -354,7 +521,12 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     let print_text = !json && (server.is_none() || m.decoded_text);
     let mut text = text_lines::TrackLines::default();
     let mut ready = vec![false; n];
+    let mut rtty_logs: Vec<crate::RttyLogState> = rates
+        .iter()
+        .map(|&fs| crate::RttyLogState::new(fs))
+        .collect();
     let stop_ready = stop.clone();
+    let stop_end = stop.clone();
     let ends = manta_engine::listen_inputs(
         opened,
         m.cfg,
@@ -390,7 +562,19 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             }
         },
         |input, n_tracks| {
-            tracks[input].store(n_tracks as u64, Ordering::Relaxed);
+            // A batch queued before an outage, handled after the input's
+            // health sink zeroed its count and marks, must not bring them
+            // back for the whole outage (MAN-45); the first batch after
+            // the reconnect publishes them again.
+            if healthy[input].load(Ordering::Relaxed) {
+                tracks[input].store(n_tracks as u64, Ordering::Relaxed);
+                if let Some(marks_hz) = rtty_logs[input].poll(&rtty_observers[input]) {
+                    let union = rtty_marks.set(input, marks_hz);
+                    if let Some((_, server)) = &server {
+                        server.metrics.set_rtty_signals(&union);
+                    }
+                }
+            }
             if let Some((_, server)) = &server {
                 server.metrics.set_active_tracks(sum(&tracks));
                 server.metrics.set_static_crashes_total(sum(&crashes));
@@ -410,7 +594,8 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         },
         |end| {
             if let Some((_, server)) = &server {
-                crate::record_terminal_source_health(&server.metrics, &end.name, &end.result);
+                let stopping = stop_end.load(Ordering::Relaxed);
+                publish_input_end(&server.metrics, &end.name, &end.result, stopping);
             }
             if let Some(flag) = healthy.get(end.index) {
                 flag.store(false, Ordering::Relaxed);
@@ -424,6 +609,9 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             }
         },
     )?;
+    // MAN-78 D7: draining from here on; a later SIGHUP is ignored.
+    drain_gate.close();
+    stop_ready.store(true, Ordering::Relaxed);
     if print_text {
         for line in text.finish() {
             eprintln!("{line}");
@@ -432,6 +620,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     if let Some((rt, server)) = server {
         server.metrics.mark_decode_stopped();
         server.metrics.set_active_tracks(0);
+        server.metrics.set_rtty_signals(&[]);
         let _ = server.shutdown_tx.send(true);
         let status_line = server
             .status_line
@@ -468,6 +657,112 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_nonce_for_one_file_is_todays_and_for_several_hashes_them_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.wav");
+        let b = dir.path().join("b.wav");
+        std::fs::write(&a, b"first recording").unwrap();
+        std::fs::write(&b, b"second recording").unwrap();
+        let one = crate::session_nonce_for_replay_path(&a).unwrap();
+        assert_eq!(replay_nonce(&[&a]).unwrap(), one);
+        let ab = replay_nonce(&[&a, &b]).unwrap();
+        assert_eq!(ab, replay_nonce(&[&a, &b]).unwrap());
+        assert_ne!(ab, one);
+        assert_ne!(ab, replay_nonce(&[&b, &a]).unwrap());
+    }
+
+    #[test]
+    fn live_offsets_are_measured_from_the_earliest_open() {
+        let t0 = Instant::now();
+        let at = [
+            Some(t0 + Duration::from_millis(250)),
+            Some(t0),
+            None,
+            Some(t0 + Duration::from_secs(2)),
+        ];
+        assert_eq!(
+            live_offsets(&at),
+            [
+                Duration::from_millis(250),
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::from_secs(2)
+            ]
+        );
+        assert_eq!(live_offsets(&[None, None]), [Duration::ZERO; 2]);
+    }
+
+    fn health_state(n: usize, metrics: &Arc<Metrics>) -> InputHealthState {
+        let slot = Arc::new(OnceLock::new());
+        let _ = slot.set(metrics.clone());
+        InputHealthState {
+            healthy: Arc::new((0..n).map(|_| AtomicBool::new(true)).collect()),
+            tracks: (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect(),
+            rtty: Arc::new(RttyMarks::new(n)),
+            metrics: slot,
+        }
+    }
+
+    #[test]
+    fn source_health_sink_zeroes_only_its_own_inputs_tracks() {
+        let metrics = Arc::new(Metrics::new());
+        let state = health_state(3, &metrics);
+        for (i, count) in [4, 5, 6].into_iter().enumerate() {
+            state.tracks[i].store(count, Ordering::Relaxed);
+        }
+        state.rtty.set(0, vec![14_080_000.0]);
+        state.rtty.set(1, vec![7_040_000.0]);
+        let (tracks, healthy) = (state.tracks.clone(), state.healthy.clone());
+        let mut sink = input_health_sink(1, "b".into(), state);
+        sink(true); // the report at construction
+        assert_eq!(tracks[1].load(Ordering::Relaxed), 5);
+        sink(false);
+        let counts: Vec<u64> = tracks.iter().map(|t| t.load(Ordering::Relaxed)).collect();
+        assert_eq!(counts, [4, 0, 6]);
+        assert_eq!(metrics.active_tracks(), 10);
+        assert_eq!(metrics.source_health_counts(), (0, 1));
+        assert_eq!(decoding_line(&healthy), "2 of 3 inputs decoding");
+        sink(true);
+        assert_eq!(metrics.source_health_counts(), (1, 1));
+    }
+
+    #[test]
+    fn rtty_marks_publish_the_union_and_a_lost_input_clears_only_its_own() {
+        let marks = RttyMarks::new(2);
+        assert_eq!(marks.set(0, vec![14_080_000.0]), [14_080_000.0]);
+        assert_eq!(
+            marks.set(1, vec![7_040_000.0, 7_045_000.0]),
+            [7_040_000.0, 7_045_000.0, 14_080_000.0]
+        );
+        // One signal both receivers mark counts once.
+        assert_eq!(marks.set(1, vec![14_080_012.0]), [14_080_000.0]);
+        assert_eq!(marks.set(1, Vec::new()), [14_080_000.0]);
+    }
+
+    #[test]
+    fn an_input_that_ended_cleanly_reads_down_and_the_others_keep_their_state() {
+        let metrics = Metrics::new();
+        metrics.set_source_health("a", true);
+        metrics.set_source_health("b", true);
+        publish_input_end(&metrics, "a", &Ok(()), false);
+        assert_eq!(metrics.source_health_counts(), (1, 2));
+        // Terminal: a late regular write cannot bring it back.
+        metrics.set_source_health("a", true);
+        assert_eq!(metrics.source_health_counts(), (1, 2));
+    }
+
+    #[test]
+    fn a_clean_end_at_shutdown_is_not_an_outage_but_an_error_is() {
+        let metrics = Metrics::new();
+        metrics.set_source_health("a", true);
+        metrics.set_source_health("b", true);
+        publish_input_end(&metrics, "a", &Ok(()), true);
+        assert_eq!(metrics.source_health_counts(), (2, 2));
+        publish_input_end(&metrics, "b", &Err(anyhow::anyhow!("boom")), true);
+        assert_eq!(metrics.source_health_counts(), (1, 2));
+    }
 
     #[test]
     fn decoding_line_counts_healthy_inputs() {

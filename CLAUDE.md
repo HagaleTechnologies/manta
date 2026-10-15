@@ -281,8 +281,9 @@ dedupe treats a different input's report of a stored spot as a duplicate.
 `--input NAME` picks one input for `calibrate`/`doctor`/`soak`/`check`;
 `/healthz` stays `ok` while one of several inputs is healthy and the new
 `MantaInputDown` alert reports a dead one; `calibrate --input NAME` saves
-into that entry; the live-state stream is not served with several inputs
-yet. HPSDR multi-DDC is MAN-307. Guide: docs/GUIDES/multiple-receivers.md. See
+into that entry; SIGHUP reload, list refresh, RTTY marks, `manta_input_*`
+counters and the live-state stream (one `bandState` per input, named in
+`source`) work with several inputs. HPSDR multi-DDC is MAN-307. Guide: docs/GUIDES/multiple-receivers.md. See
 docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md.
 
 ## Documents (read in this order)

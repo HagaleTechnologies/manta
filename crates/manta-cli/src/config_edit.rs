@@ -283,7 +283,16 @@ fn save_with_env(
                 target.display()
             )
         })?;
-    let got = loaded.input.shared.freq_correction_ppm;
+    // MAN-13: the entry just edited, not the first one.
+    let edited = match input {
+        Some(name) => loaded
+            .inputs
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| &entry.input),
+        None => Some(&loaded.input),
+    };
+    let got = edited.and_then(|entry| entry.shared.freq_correction_ppm);
     ensure!(
         got == Some(ppm),
         "{} left unchanged: the edited file reads {KEY} = {}, expected {}",
@@ -710,6 +719,21 @@ mod tests {
         assert_eq!(previous, Some(0.5));
         let loaded = load(Some(&p), Env::Ignore).unwrap();
         assert_eq!(loaded.input.shared.freq_correction_ppm, Some(-1.42));
+    }
+
+    #[test]
+    fn save_into_a_named_entry_validates_that_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "manta.toml", TWO_INPUTS);
+        let previous = save_freq_correction_ppm(&p, -2.0, None, Some("b")).unwrap();
+        assert_eq!(previous, Some(0.5));
+        let loaded = load(Some(&p), Env::Ignore).unwrap();
+        assert_eq!(loaded.inputs[0].input.shared.freq_correction_ppm, None);
+        assert_eq!(
+            loaded.inputs[1].input.shared.freq_correction_ppm,
+            Some(-2.0)
+        );
+        assert_eq!(entries(dir.path()), ["manta.toml"]);
     }
 
     #[test]

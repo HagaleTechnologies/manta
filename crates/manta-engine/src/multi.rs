@@ -427,6 +427,7 @@ pub fn listen_inputs(
                 decode_latency: shared.decode_latency.clone(),
                 decode_quality: shared.decode_quality.clone(),
                 live_ids: shared.live_state.is_some(),
+                input: index,
             },
             outbox,
         };

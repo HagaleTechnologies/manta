@@ -106,7 +106,8 @@ station twice.
   ended if any ended in error.
 - `/healthz` stays `ok` while at least one receiver delivers samples; each
   receiver has its own `source <name>:` line. `manta_source_health{source}`
-  drops to 0 for the dead one, the status line ends in `inputs=2/3`, and the
+  drops to 0 for the dead one (and stays 0 for a receiver that has ended
+  while the others run), the status line ends in `inputs=2/3`, and the
   shipped `MantaInputDown` alert fires after 2 minutes
   ([monitoring.md](../RUNBOOKS/monitoring.md#mantainputdown)).
 

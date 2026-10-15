@@ -117,7 +117,9 @@ client limit and a larger lag allowance:
 
 ## `bandState` records
 
-Once per second of stream time, one record covering the whole passband:
+Once per second of stream time, one record covering the whole passband.
+With several `[[input]]` entries (MAN-13), one record per input per stream
+second, each covering that input's passband and naming it in `source`:
 
 ```json
 {"kind":"bandState","deCall":"W1AW","timestamp":1700000005,"bands":[{"band":"20m","loHz":14000000,"hiHz":14047906,"channels":512,"noiseFloorDb":-62.2,"occupancy":0.0059,"activeTracks":1},{"band":"unknown","loHz":13952000,"hiHz":13999906,"channels":512,"noiseFloorDb":-62.2,"occupancy":0.0,"activeTracks":0}]}
@@ -127,6 +129,7 @@ Once per second of stream time, one record covering the whole passband:
 |---|---|---|---|
 | `kind` | string | never | Always `"bandState"`. |
 | `deCall` | string | never | `[server].station_callsign`, uppercased, as in a spot's `deCall`. |
+| `source` | string | absent with one input | The `[[input]]` `name` whose passband the record covers. Present only with several inputs. |
 | `timestamp` | integer | never | The stream second this record describes. |
 | `bands` | array | never | One entry per band the passband covers, in band-table order (lowest band first), with the `unknown` entry last. Bands the passband does not reach are absent. Empty only if the passband has no channels. |
 
