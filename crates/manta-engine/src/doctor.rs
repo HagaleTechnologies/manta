@@ -160,6 +160,12 @@ pub struct DoctorReport {
     pub distinct_chars: usize,
     /// Confirmed, fully-validated spots -- the strictest signal.
     pub spots_confirmed: usize,
+    /// MAN-234: input samples replaced with silence because a component
+    /// was NaN, infinite or beyond `MAX_SAMPLE_MAGNITUDE` (SPEC §1.3 step
+    /// 0). Omitted from `doctor --json` when 0. Not an input to `verdict()`:
+    /// the replaced samples are silence, so the verdict judges what remains.
+    #[serde(skip_serializing_if = "crate::is_zero")]
+    pub bad_samples: u64,
 }
 
 impl DoctorReport {
@@ -395,12 +401,14 @@ pub fn doctor(
     let mut spots_confirmed = 0usize;
     let confirmations = Arc::new(AtomicU64::new(0));
 
+    let bad_samples = Arc::new(AtomicU64::new(0));
     let result = listen_with_observers(
         src,
         cfg,
         stop.clone(),
         ListenObservers {
             detector_confirmations: Some(confirmations.clone()),
+            bad_samples: Some(bad_samples.clone()),
             ..ListenObservers::default()
         },
         |ev| match ev {
@@ -458,6 +466,7 @@ pub fn doctor(
         chars_decoded,
         distinct_chars: distinct_chars.len(),
         spots_confirmed,
+        bad_samples: bad_samples.load(Ordering::Relaxed),
     })
 }
 
@@ -605,6 +614,29 @@ mod tests {
         assert!(report.tracks_promoted > 0);
     }
 
+    /// MAN-234 scenario 3: one finite `f32::MAX` sample at 1 ms latched
+    /// the floor/gate averages at NaN, so no track ever spawned and the
+    /// verdict read `NO_SIGNAL`. The guard replaces it with silence.
+    #[test]
+    fn doctor_on_a_finite_overflow_sample_is_not_no_signal() {
+        let spec = manta_testkit::vectors::VectorSpec {
+            duration_s: 20.0,
+            ..manta_testkit::vectors::v1()
+        };
+        let mut samples = manta_testkit::vectors::render(&spec).unwrap().samples;
+        samples[96].re = f32::MAX;
+        let src: Box<dyn IqSource> = Box::new(RawIqSource {
+            samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let report = doctor(src, &PipelineConfig::default(), Duration::from_secs(60)).unwrap();
+        assert_ne!(report.verdict(), Verdict::NoSignal, "{report:?}");
+        assert_eq!(report.bad_samples, 1);
+        assert!(report.tracks_promoted >= 1, "{report:?}");
+    }
+
     #[test]
     fn doctor_reports_no_signal_on_digital_silence() {
         let fs = manta_input::TARGET_RATE_HZ;
@@ -653,6 +685,7 @@ mod tests {
             chars_decoded: 50,
             distinct_chars: 2,
             spots_confirmed: 0,
+            bad_samples: 0,
         };
         assert_eq!(report.verdict(), Verdict::NoisyNoDecode);
     }
@@ -673,6 +706,7 @@ mod tests {
             chars_decoded: 200,
             distinct_chars: 20,
             spots_confirmed: 0,
+            bad_samples: 0,
         };
         assert_eq!(report.verdict(), Verdict::WeakNoDecode);
     }
@@ -697,6 +731,7 @@ mod tests {
             chars_decoded: 300,
             distinct_chars: 3,
             spots_confirmed: 0,
+            bad_samples: 0,
         };
         assert_eq!(report.verdict(), Verdict::WeakNoDecode);
     }
@@ -721,6 +756,7 @@ mod tests {
             chars_decoded: 4,
             distinct_chars: 3,
             spots_confirmed: 0,
+            bad_samples: 0,
         };
         assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
     }
@@ -745,6 +781,7 @@ mod tests {
             chars_decoded: 0,
             distinct_chars: 0,
             spots_confirmed: 0,
+            bad_samples: 0,
         };
         assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
     }
@@ -773,6 +810,7 @@ mod tests {
             chars_decoded: 0,
             distinct_chars: 0,
             spots_confirmed: 0,
+            bad_samples: 0,
         };
         assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
     }
@@ -792,6 +830,7 @@ mod tests {
             chars_decoded: 0,
             distinct_chars: 0,
             spots_confirmed: 0,
+            bad_samples: 0,
         }
     }
 

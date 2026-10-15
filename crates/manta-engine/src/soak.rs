@@ -14,11 +14,11 @@
 //! endpoint -- lost/rejected datagrams before demux, not ring
 //! backpressure after it.
 
-use crate::{listen, PipelineConfig};
+use crate::{listen_with_observers, ListenObservers, PipelineConfig};
 use anyhow::Result;
 use manta_input::IqSource;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,9 @@ pub struct SoakReport {
     pub events_emitted: usize,
     pub rss_growth_bytes: u64,
     pub panicked: bool,
+    /// MAN-234: input samples replaced with silence because a component
+    /// was NaN, infinite or beyond `MAX_SAMPLE_MAGNITUDE` (SPEC §1.3 step 0).
+    pub bad_samples: u64,
 }
 
 // Windows has no libc::rusage/getrusage (POSIX-only) -- see this crate's
@@ -105,11 +108,16 @@ pub fn soak(
         stop_watchdog.store(true, Ordering::Relaxed);
     });
 
+    let bad_samples = Arc::new(AtomicU64::new(0));
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        listen(
+        listen_with_observers(
             src,
             cfg,
             stop.clone(),
+            ListenObservers {
+                bad_samples: Some(bad_samples.clone()),
+                ..Default::default()
+            },
             |_ev| {
                 event_count += 1;
                 if start.elapsed() >= WARMUP {
@@ -118,6 +126,7 @@ pub fn soak(
                 }
             },
             |_spot| {},
+            |_| {},
         )
     }));
     let _ = watchdog.join();
@@ -132,6 +141,7 @@ pub fn soak(
         events_emitted: event_count,
         rss_growth_bytes: worst_growth,
         panicked,
+        bad_samples: bad_samples.load(Ordering::Relaxed),
     })
 }
 
