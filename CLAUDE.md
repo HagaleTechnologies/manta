@@ -244,6 +244,14 @@ pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
 planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
+MAN-137: the JSON spot stream opens with `hello` and numbers spots and
+`spotGrade` records with one per-session `seq`. WebSocket
+`?session=&since=` resumes from the bounded shared history using
+`[server].history_minutes`; raw TCP receives live records only. Follows
+dispensa `contracts/spots/stream.v1.md` (ADR-0015, Q-0070); the live-state
+stream is unchanged. See
+`docs/DECISIONS/2026-10-14-man137-json-stream-resume.md`.
+
 MAN-248: each `[[rbn_uplink]]` target enforces
 `max_spots_per_minute` (default `600`, `0` disables) on spots written to
 the wire, via the existing `RateLimiter` owned above the reconnect loop;
@@ -331,6 +339,7 @@ report line and `manta_input_bad_samples_total{source}`; `manta check`
 still errors on non-finite input. See
 docs/DECISIONS/2026-10-15-man234-bad-input-samples.md.
 
+<<<<<<< HEAD
 MAN-233: a SoapySDR driver stream overflow returned as a read error
 counts one `manta_input_gaps_detected_total{source="soapy"}` gap event
 (present at 0 from the first scrape; `dropped_packets`/`malformed_packets`
@@ -340,6 +349,16 @@ overflow flagged `SOAPY_SDR_END_ABRUPT` on a successful read is not seen
 bounds are unchanged. The `soapy`-gated lines
 compile and test only in CI's `test-soapy` leg. See
 docs/DECISIONS/2026-10-15-man233-soapy-overflow-visibility.md.
+=======
+MAN-236: `soak_with_metrics` (the `man19-soak` harness and
+`examples/close_counts.rs`) wraps `listen_with_observers`, the loop
+`manta run` executes, instead of a copy. `ListenObservers::track_lifecycle`
+(`TrackLifecycleObserver`, relaxed atomics) publishes the all-entry track
+count and peak, per-reason closes, repetition-gate record total and
+steady-state chunk count. Bounded fixed-seed runs reported identical
+counts before and after. See
+docs/DECISIONS/2026-10-15-man236-soak-metrics-wraps-listen.md.
+>>>>>>> 8c92062aa574efa8ffb8dc7827b67d99178bd961
 
 ## Documents (read in this order)
 

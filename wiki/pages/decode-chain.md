@@ -8,8 +8,8 @@ sources:
   - docs/SPEC-decode-core.md#3-per-track-demodulation
   - ARCHITECTURE.md
 verified:
-  commit: 60c4339
-  date: 2026-10-14
+  commit: 3805f78
+  date: 2026-10-15
 links:
   - detector-tracks
   - spot-validation
@@ -28,6 +28,7 @@ Each active track runs a classical CW decode chain on its ~375 Hz complex channe
 ## Gotchas
 
 - The keying-decision band must not gate the rail updates: a mark that fades into the band would then update neither rail, freezing `E_hi` at its pre-fade level and deleting the faded marks (MAN-103 D5 did this; V8w recall fell to 0/50 until MAN-213). See `docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md` and SPEC §3.2.
+- In the v2 evidence front end (`edge-legacy`/`hsmm`), anchor decisions are confirmed from two *actual* adjacent hops, never predicted: each computed hop is held one hop pending until its successor exists, so the per-hop `set_u_ref` speed feedback can only ever affect hops not yet computed (feedback after returned hop t first applies to hop t+2). Predicting the successor's sign with the current window was tried and kept going stale across window changes — MAN-190. See `docs/DECISIONS/2026-10-13-man190-confirmed-evidence-anchors.md`.
 
 - HSMM evidence's centered maximum is an incremental deque that stays O(1) amortized only while its window bounds move forward; a `set_u_ref` that moves a bound backwards rebuilds it from the retained samples (SPEC v2 §1.2 implementation note, MAN-193 decision `docs/DECISIONS/2026-10-14-man193-centered-maximum-deque.md`).
 

@@ -317,7 +317,7 @@ impl Drop for ChildGuard {
 const SERVER_TOML: &str = "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n";
 
 /// Scenario 2, end to end: a real `manta run` over a synthetic recording,
-/// read off the JSON stream's wire. The stream keeps no history for late
+/// read off the JSON stream's wire. Raw TCP does not replay for late
 /// subscribers and dedupe suppresses re-spots for 600 s of sample time, so
 /// the client connects as soon as the `listening:` banner names the bound
 /// port -- about 2 ms after it, against ~0.9 s to the first spot.
@@ -377,16 +377,22 @@ fn json_spots_carry_the_builds_decoder_version() {
     stream
         .set_read_timeout(Some(Duration::from_secs(60)))
         .unwrap();
+    let mut reader = BufReader::new(stream);
     let mut first = String::new();
-    let n = BufReader::new(stream)
-        .read_line(&mut first)
-        .expect("no JSON spot within 60 s");
-    assert!(
-        n > 0,
-        "the JSON stream closed before any spot: the client connected too late \
-         (the stream keeps no history), or the replay produced no spot"
-    );
-    let spot: serde_json::Value = serde_json::from_str(&first).unwrap();
+    let spot: serde_json::Value = loop {
+        first.clear();
+        let n = reader
+            .read_line(&mut first)
+            .expect("no JSON spot within 60 s");
+        assert!(
+            n > 0,
+            "stream closed before a spot: raw TCP does not replay, or the file produced no spot"
+        );
+        let value: serde_json::Value = serde_json::from_str(&first).unwrap();
+        if value.get("kind").is_none() {
+            break value;
+        }
+    };
     let want = format!(
         "manta-{}+{}",
         env!("CARGO_PKG_VERSION"),
