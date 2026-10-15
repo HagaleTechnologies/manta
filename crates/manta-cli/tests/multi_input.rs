@@ -372,3 +372,67 @@ fn check_with_input_reports_that_inputs_rate() {
         "{stderr}"
     );
 }
+
+/// Codex on PR 313: a recording came from one receiver, and `decode`
+/// cannot tell which of several `[[input]]` entries it was, so entries that
+/// disagree on the correction are refused rather than the first one's
+/// applied; `--freq-correction-ppm` gives the right one.
+#[test]
+fn decode_refuses_several_inputs_without_a_correction() {
+    let (dir, a, b) = fixtures();
+    let two_ppm = |name: &str, ppm_a: f64, ppm_b: f64| {
+        write_config(
+            dir.path(),
+            name,
+            &format!(
+                "[[input]]\nname = \"a\"\ntype = \"file\"\npath = \"{}\"\niq = true\n\
+                 freq_correction_ppm = {ppm_a:?}\n\n\
+                 [[input]]\nname = \"b\"\ntype = \"file\"\npath = \"{}\"\niq = true\n\
+                 freq_correction_ppm = {ppm_b:?}\n",
+                toml_path(a),
+                toml_path(b)
+            ),
+        )
+    };
+    let config = two_ppm("decode-two-ppm.toml", 2.0, -1.5);
+    let missing = dir.path().join("no-such-recording.wav");
+    let out = manta()
+        .args(["decode", "--config"])
+        .arg(&config)
+        .arg(&missing)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "manta decode cannot tell which of {}'s 2 inputs (a, b) recorded {}: pass \
+             --freq-correction-ppm with that receiver's correction (0 for none)",
+            config.display(),
+            missing.display()
+        )),
+        "{stderr}"
+    );
+    let named = manta()
+        .args(["decode", "--freq-correction-ppm", "-1.5", "--config"])
+        .arg(&config)
+        .arg(&missing)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&named.stderr);
+    assert!(!stderr.contains("cannot tell which"), "{stderr}");
+    assert!(stderr.contains("no-such-recording.wav"), "{stderr}");
+    // Entries that agree leave nothing to choose.
+    let agreed = manta()
+        .args(["decode", "--config"])
+        .arg(two_ppm("decode-same-ppm.toml", 1.0, 1.0))
+        .arg(&missing)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&agreed.stderr);
+    assert!(!stderr.contains("cannot tell which"), "{stderr}");
+    assert!(
+        stderr.contains("note: decode applies only freq_correction_ppm from the 2 [[input]]"),
+        "{stderr}"
+    );
+}

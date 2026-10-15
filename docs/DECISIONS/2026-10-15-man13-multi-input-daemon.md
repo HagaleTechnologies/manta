@@ -66,7 +66,11 @@ existed.
   owns (MAN-53's open questions).
 - **D7 Failure isolation.** An input whose read errors or panics ends only
   its own thread; the back end logs `input NAME: stopped (...)` and the
-  other inputs keep spotting. A live input reconnects on its own thread
+  other inputs keep spotting. Such an input sends no closing batch, so the
+  back end closes every track it reported as an outage does
+  (`ClosureKind::Bookkeeping`, no survivor), freeing their validator and
+  live-state rows, and its track count and RTTY marks leave
+  `manta_active_tracks` and `manta_rtty_signals`. A live input reconnects on its own thread
   (`ReconnectingSource`) and logs `input NAME: lost; retrying, k of n
   inputs decoding` / `back`. Startup opens every input in parallel and
   fails fast naming the input (`input "b" failed to open: ...`); the
@@ -89,6 +93,9 @@ existed.
   take `--input NAME`, required with several inputs. `calibrate --input
   NAME` saves `freq_correction_ppm` into that `[[input]]` entry
   (`config_edit::set_freq_correction_ppm`), keeping every other byte.
+  `decode` cannot tell which receiver made a recording, so several
+  entries that disagree on `freq_correction_ppm` need
+  `--freq-correction-ppm` rather than the first entry's.
 - **D12 Wire output unchanged.** One station identity, the same telnet,
   JSON and uplink formats.
 
@@ -126,7 +133,6 @@ These parts of the plan are not in this change and stay open:
 - Single-input runs keep `listen_with_observers` unchanged rather than a
   front/back split of it; the multi-input path has its own front end
   (`listen::run_input_front`) and back end (`listen::Back`).
-- The wiki pages (determinism, source reconnect, spot validation).
 
 ## Live clock drift
 

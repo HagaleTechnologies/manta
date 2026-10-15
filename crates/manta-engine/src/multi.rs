@@ -472,19 +472,24 @@ pub fn listen_inputs(
 
     let names: Vec<String> = opened.inputs.iter().map(|i| i.name.clone()).collect();
     let mut ends: Vec<Option<InputEnd>> = (0..n).map(|_| None).collect();
-    let mut finish = |index: usize, result: Result<()>, ends: &mut Vec<Option<InputEnd>>| {
-        let end = InputEnd {
-            index,
-            name: names[index].clone(),
-            result,
-        };
-        on_input_end(&end);
-        ends[index] = Some(end);
-    };
-    let mut ingest = |index: usize, batch: Batch| {
-        let n_tracks = batch.n_tracks;
-        back.ingest(index, n, batch, &mut on_event, &mut on_spot);
-        on_batch(index, n_tracks);
+    let mut handle = |index: usize, msg: Msg, ends: &mut Vec<Option<InputEnd>>| match msg {
+        Msg::Batch(batch) => {
+            let n_tracks = batch.n_tracks;
+            back.ingest(index, n, batch, &mut on_event, &mut on_spot);
+            on_batch(index, n_tracks);
+        }
+        Msg::End(result) => {
+            // An input that errored or panicked sent no closing batch: its
+            // tracks are retired before its end is reported.
+            back.close_input(index, n, &mut on_event, &mut on_spot);
+            let end = InputEnd {
+                index,
+                name: names[index].clone(),
+                result,
+            };
+            on_input_end(&end);
+            ends[index] = Some(end);
+        }
     };
     let panicked = |index: usize| Err(anyhow!("input {}: pipeline panicked", names[index]));
 
@@ -492,15 +497,17 @@ pub fn listen_inputs(
         let mut open = n;
         while open > 0 {
             match live_rx.recv() {
-                Ok((index, Msg::Batch(b))) => ingest(index, b),
-                Ok((index, Msg::End(result))) => {
-                    finish(index, result, &mut ends);
-                    open -= 1;
+                Ok((index, msg)) => {
+                    let ended = matches!(msg, Msg::End(_));
+                    handle(index, msg, &mut ends);
+                    if ended {
+                        open -= 1;
+                    }
                 }
                 Err(RecvError) => {
                     for index in 0..n {
                         if ends[index].is_none() {
-                            finish(index, panicked(index), &mut ends);
+                            handle(index, Msg::End(panicked(index)), &mut ends);
                         }
                     }
                     open = 0;
@@ -515,8 +522,8 @@ pub fn listen_inputs(
             Err(RecvError) => Pulled::End(panicked(index)),
         }) {
             match step {
-                Step::Batch(index, b) => ingest(index, b),
-                Step::End(index, result) => finish(index, result, &mut ends),
+                Step::Batch(index, b) => handle(index, Msg::Batch(b), &mut ends),
+                Step::End(index, result) => handle(index, Msg::End(result), &mut ends),
             }
         }
     }

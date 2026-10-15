@@ -205,6 +205,23 @@ fn publish_input_end(metrics: &Metrics, name: &str, result: &Result<()>, stoppin
     }
 }
 
+/// An ended input decodes nothing more, whether it ended cleanly or not:
+/// its track count and RTTY marks leave `manta_active_tracks` and
+/// `manta_rtty_signals`, which the other inputs' batches keep publishing as
+/// sums. A clean end's last batch already zeroed them; an error or a panic
+/// sent none.
+fn retire_input_gauges(
+    metrics: &Metrics,
+    index: usize,
+    tracks: &[Arc<AtomicU64>],
+    rtty: &RttyMarks,
+) {
+    tracks[index].store(0, Ordering::Relaxed);
+    let union = rtty.set(index, Vec::new());
+    metrics.set_active_tracks(sum(tracks));
+    metrics.set_rtty_signals(&union);
+}
+
 /// Runs every input until each has ended. Exit 0 when every input ended
 /// cleanly; an input that ended in error makes the run fail, naming it.
 pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
@@ -594,6 +611,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         },
         |end| {
             if let Some((_, server)) = &server {
+                retire_input_gauges(&server.metrics, end.index, &tracks, &rtty_marks);
                 let stopping = stop_end.load(Ordering::Relaxed);
                 publish_input_end(&server.metrics, &end.name, &end.result, stopping);
             }
@@ -762,6 +780,27 @@ mod tests {
         assert_eq!(metrics.source_health_counts(), (2, 2));
         publish_input_end(&metrics, "b", &Err(anyhow::anyhow!("boom")), true);
         assert_eq!(metrics.source_health_counts(), (1, 2));
+    }
+
+    #[test]
+    fn an_ended_input_leaves_the_summed_track_and_rtty_gauges() {
+        let metrics = Metrics::new();
+        let tracks: Vec<Arc<AtomicU64>> = [4, 5].map(|c| Arc::new(AtomicU64::new(c))).into();
+        let marks = RttyMarks::new(2);
+        marks.set(0, vec![7_040_000.0]);
+        metrics.set_rtty_signals(&marks.set(1, vec![14_080_000.0]));
+        metrics.set_active_tracks(sum(&tracks));
+        retire_input_gauges(&metrics, 1, &tracks, &marks);
+        assert_eq!(metrics.active_tracks(), 4);
+        let text = metrics.render_prometheus_text();
+        assert!(
+            text.contains(r#"manta_rtty_signals{band="20m"} 0"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"manta_rtty_signals{band="40m"} 1"#),
+            "{text}"
+        );
     }
 
     #[test]

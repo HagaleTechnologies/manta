@@ -15,13 +15,13 @@ use manta_engine::{
 };
 use manta_testkit::scene::{render_scene, SignalSpec};
 use num_complex::Complex32;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// How a test source behaves once `fail_at` samples have been read.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Fault {
     None,
     Error,
@@ -657,4 +657,75 @@ fn each_input_publishes_its_own_band_sample_once_per_stream_second() {
             .spots
         )
     );
+}
+
+/// An input that errors or panics mid-transmission still closes every track
+/// it reported (Codex, PR 313): the shared validator frees their state and
+/// the live tap publishes their closure, while the other inputs run on.
+#[test]
+fn a_failing_input_closes_every_track_it_reported() {
+    for fault in [Fault::Error, Fault::Panic] {
+        let stop = Arc::new(AtomicBool::new(false));
+        let opened = open_inputs(
+            vec![
+                plain("a", forty_metre_scene()),
+                spec("b", short_scene(), 0.0, 20 * 96_000, fault),
+            ],
+            stop,
+        )
+        .unwrap();
+        let recorder = Arc::new(Recorder::default());
+        let mut events = Vec::new();
+        listen_inputs(
+            opened,
+            &PipelineConfig::default(),
+            SessionClock::Replay,
+            SharedObservers {
+                live_state: Some(recorder.clone()),
+                ..Default::default()
+            },
+            |e| events.push(e.clone()),
+            |_| {},
+            |_input, _n| {},
+            |_end| {},
+        )
+        .unwrap();
+        // Input b, the second of two, numbers its tracks 2, 4, 6, ...
+        let reported: BTreeSet<u32> = events
+            .iter()
+            .filter(|e| {
+                !matches!(
+                    e,
+                    DecoderEvent::TrackPromoted { .. } | DecoderEvent::TrackClosed { .. }
+                )
+            })
+            .map(event_track)
+            .filter(|id| id % 2 == 0)
+            .collect();
+        assert!(!reported.is_empty(), "{fault:?}: input b reported nothing");
+        let closed: BTreeSet<u32> = events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::TrackClosed { track_id, .. } => Some(*track_id),
+                _ => None,
+            })
+            .collect();
+        let open: Vec<&u32> = reported.difference(&closed).collect();
+        assert!(open.is_empty(), "{fault:?}: tracks {open:?} never closed");
+        let tapped: BTreeSet<u32> = recorder
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|r| match r {
+                manta_engine::LiveRecord::TrackClosed { track_id, .. } => Some(*track_id),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            reported.is_subset(&tapped),
+            "{fault:?}: the live tap kept {:?}",
+            reported.difference(&tapped).collect::<Vec<_>>()
+        );
+    }
 }

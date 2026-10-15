@@ -5383,8 +5383,37 @@ fn run_command() -> Result<std::process::ExitCode> {
             // apply, with the CLI over the file.
             let loaded = config::load(config.as_deref(), config::Env::Ignore)?;
             note_ignored_tables(&loaded, "decode", &["decode", "detector", "spot", "input"]);
+            // MAN-13: a recording came from one receiver, and decode cannot
+            // tell which entry that was: entries that disagree on the
+            // correction need --freq-correction-ppm, never the first one's.
+            let several = loaded.inputs.len() >= 2;
+            let ppm_of = |n: &config::NamedInput| n.input.shared.freq_correction_ppm.unwrap_or(0.0);
+            if several
+                && freq_correction_ppm.is_none()
+                && loaded
+                    .inputs
+                    .iter()
+                    .any(|n| ppm_of(n) != ppm_of(&loaded.inputs[0]))
+            {
+                let names: Vec<&str> = loaded.inputs.iter().map(|n| n.name.as_str()).collect();
+                bail!(
+                    "manta decode cannot tell which of {}'s {} inputs ({}) recorded {}: pass \
+                     --freq-correction-ppm with that receiver's correction (0 for none)",
+                    loaded.origin,
+                    names.len(),
+                    names.join(", "),
+                    path.display()
+                );
+            }
             let shared = &loaded.input.shared;
-            if loaded.input.source.is_some()
+            if several {
+                eprintln!(
+                    "note: decode applies only freq_correction_ppm from the {} [[input]] entries \
+                     in {}",
+                    loaded.inputs.len(),
+                    loaded.origin
+                );
+            } else if loaded.input.source.is_some()
                 || shared.center_freq_hz.is_some()
                 || shared.capture_rate_hz.is_some()
                 || shared.replay_epoch.is_some()

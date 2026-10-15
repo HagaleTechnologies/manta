@@ -8,11 +8,12 @@ use crate::live::{LiveStateSink, LiveTap};
 use crate::quality::DecodeQualityObserver;
 use crate::PipelineConfig;
 use anyhow::Result;
-use manta_decode::events::DecoderEvent;
+use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_input::IqSource;
 use manta_spot::reference::ReferenceLists;
 use manta_spot::{Blocklist, NotchList, Validator};
 use num_complex::Complex32;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -875,6 +876,10 @@ pub(crate) struct Batch {
 pub(crate) struct Back<'a> {
     validator: Validator,
     ctx: EmitCtx<'a>,
+    /// Every track that has reported and not yet closed, across inputs:
+    /// what an input that ends without its `finish()` batch still owes a
+    /// `TrackClosed` (`close_input`).
+    open: BTreeSet<u32>,
 }
 
 impl<'a> Back<'a> {
@@ -902,6 +907,7 @@ impl<'a> Back<'a> {
                 live,
                 references,
             },
+            open: BTreeSet::new(),
         }
     }
 
@@ -915,6 +921,29 @@ impl<'a> Back<'a> {
         on_event: &mut impl FnMut(&DecoderEvent),
         on_spot: &mut impl FnMut(&crate::Spot),
     ) {
+        // The tracks that earn a `TrackClosed` (MAN-19): any event but a
+        // bare promotion, or being named a merge survivor (MAN-174).
+        for ev in &batch.events {
+            match ev {
+                DecoderEvent::TrackPromoted { .. } => {}
+                DecoderEvent::TrackClosed { track_id, closure } => {
+                    self.open.remove(track_id);
+                    if let ClosureKind::Bookkeeping {
+                        survivor_track_id: Some(survivor),
+                    } = closure
+                    {
+                        self.open.insert(*survivor);
+                    }
+                }
+                DecoderEvent::CharDecoded { track_id, .. }
+                | DecoderEvent::WordBoundary { track_id, .. }
+                | DecoderEvent::SpeedUpdate { track_id, .. }
+                | DecoderEvent::TrackMeta { track_id, .. }
+                | DecoderEvent::TimingUpdate { track_id, .. } => {
+                    self.open.insert(*track_id);
+                }
+            }
+        }
         emit(
             batch.events,
             &mut self.validator,
@@ -928,6 +957,52 @@ impl<'a> Back<'a> {
         // MAN-324 per input: after the batch it closes, as `maybe_tick`.
         if let (Some(tap), Some(band)) = (self.ctx.live.as_ref(), batch.band) {
             tap.publish_band(band);
+        }
+    }
+
+    /// An input has ended. One that errored or panicked sent no `finish()`
+    /// batch, so its tracks still open here are closed now, in id order, as
+    /// `finish_for_discontinuity` closes them at an outage
+    /// (`Bookkeeping`, no survivor: a dead receiver is not evidence the
+    /// signal ended). The validator frees their state and the live tap
+    /// publishes their closure and forgets the input's tracks. After a
+    /// clean end nothing is left open and this changes nothing.
+    pub(crate) fn close_input(
+        &mut self,
+        input: usize,
+        n_inputs: usize,
+        on_event: &mut impl FnMut(&DecoderEvent),
+        on_spot: &mut impl FnMut(&crate::Spot),
+    ) {
+        let owned: Vec<u32> = self
+            .open
+            .iter()
+            .copied()
+            .filter(|id| self.validator.input_of(*id) as usize == input)
+            .collect();
+        if !owned.is_empty() {
+            for id in &owned {
+                self.open.remove(id);
+            }
+            let events = owned
+                .into_iter()
+                .map(|track_id| DecoderEvent::TrackClosed {
+                    track_id,
+                    closure: ClosureKind::Bookkeeping {
+                        survivor_track_id: None,
+                    },
+                })
+                .collect();
+            emit(
+                events,
+                &mut self.validator,
+                &mut self.ctx,
+                on_event,
+                on_spot,
+            );
+        }
+        if let Some(tap) = self.ctx.live.as_mut() {
+            tap.retain_input_tracks(input, n_inputs, &[]);
         }
     }
 }
