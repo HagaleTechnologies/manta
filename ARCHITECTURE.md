@@ -777,9 +777,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   The three `manta_input_*` series are published only for sources that
   actually count wire-level packet loss or driver overflow (HPSDR, KiwiSDR
   (MAN-128's SND `seq` tracking), ka9q-radio (MAN-140) and SoapySDR, whose
-  driver stream overflows each count one gap event — MAN-233; its
-  `dropped_packets` stays 0 because an overflow carries no lost-sample
-  count) and are **absent**, not a frozen zero, for every other source
+  driver overflow read errors each count one gap event — MAN-233; an
+  overflow flagged `SOAPY_SDR_END_ABRUPT` on a successful read is not
+  seen, and SoapySDR's `dropped_packets` stays 0 because an overflow
+  carries no lost-sample count) and are **absent**, not a frozen zero, for every other source
   (audio) — "absent means not measured", so an operator never
   reads a placeholder as live data; the same distinction that motivated
   the `manta_active_tracks` caveat before it was populated.

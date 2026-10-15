@@ -11,11 +11,8 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
-<<<<<<< HEAD
 | 2026-10-15 | MAN-233 | [MAN-233: SoapySDR overflows are counted and warned, not silent](2026-10-15-man233-soapy-overflow-visibility.md) |
-=======
 | 2026-10-15 | MAN-235 | [MAN-235: doctor hints a longer run, and --strict puts the verdict in the exit code](2026-10-15-man235-doctor-rerun-hint-and-strict-exit.md) |
->>>>>>> f1a9c55a522da040abf616a0aa9208a900424f9f
 | 2026-10-15 | MAN-234 | [MAN-234: one bad input sample is replaced and counted, not fatal](2026-10-15-man234-bad-input-samples.md) |
 | 2026-10-15 | MAN-371 | [MAN-371: `test (windows-latest)` becomes a required check](2026-10-15-man371-windows-required-check.md) |
 | 2026-10-14 | MAN-248 | [MAN-248: a per-minute ceiling on spots the RBN uplink forwards](2026-10-14-man248-uplink-forwarding-ceiling.md) |

@@ -1787,14 +1787,16 @@ fn audio_silence_warning(device: &str) -> String {
     )
 }
 
-/// MAN-233: a SoapySDR stream overflow means this chunk was dropped by a
-/// full driver ring buffer -- the host is not keeping up. Counted, and
-/// rate-limited so a sustained overflow burst logs one line per 60 s.
+/// MAN-233: a SoapySDR stream overflow error means this chunk was dropped
+/// by a full driver ring buffer -- the host is not keeping up. Counted, and
+/// rate-limited so a sustained overflow burst logs one line per 60 s. An
+/// overflow flagged `SOAPY_SDR_END_ABRUPT` on a successful read never
+/// reaches here (see `SoapySdrIqSource::read`), hence "overflow error".
 #[cfg(feature = "soapy")]
 fn soapy_overflow_warning(driver: &str) -> String {
     format!(
         "warning: SoapySDR input ({driver}) dropped samples: the driver reported a \
-         stream overflow -- the host is not keeping up; every overflow is counted in \
+         stream overflow -- the host is not keeping up; every overflow error is counted in \
          manta_input_gaps_detected_total{{source=\"soapy\"}} (this warning is \
          rate-limited to once per 60 s)"
     )
@@ -7114,7 +7116,7 @@ mod tests {
         assert_eq!(
             soapy_overflow_warning("driver=rtlsdr"),
             "warning: SoapySDR input (driver=rtlsdr) dropped samples: the driver reported a \
-             stream overflow -- the host is not keeping up; every overflow is counted in \
+             stream overflow -- the host is not keeping up; every overflow error is counted in \
              manta_input_gaps_detected_total{source=\"soapy\"} (this warning is \
              rate-limited to once per 60 s)"
         );

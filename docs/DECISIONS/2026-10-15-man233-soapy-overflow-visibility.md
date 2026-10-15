@@ -87,6 +87,21 @@ scrape) and then every 1 s, and `ReconnectingSource::InputHealthTotals`
    publication machinery and the `"soapy"` label already existed; sources
    that count nothing (file, audio) keep publishing nothing ("absent
    means not measured").
+8. **Only the error form of an overflow is counted.** SoapySDR reports an
+   overflow either as the `SOAPY_SDR_OVERFLOW` read error or as the
+   `SOAPY_SDR_END_ABRUPT` flag ("the flag version of an overflow error
+   that indicates an overflow with the end samples", `Constants.h`) on a
+   read that still returns samples. The pinned `soapysdr` crate (0.5.1,
+   the newest release) writes `read`'s flags into a private
+   `RxStream` field with no accessor, so a driver that uses the flag form
+   produces neither a counter increment nor a warning. Seeing it needs a
+   `soapysdr` API that does not exist yet, a patched copy of the crate, or
+   a hand-written FFI read path replacing the wrapper; each is a
+   dependency change beyond this ticket and is left for a follow-up
+   (raised in PR #312's review). The drivers the field tests use return
+   the error form: on 2026-10-15, SoapySDRPlay3's and SoapyRTLSDR's
+   `Streaming.cpp` (master) both `return SOAPY_SDR_OVERFLOW` and neither
+   sets `SOAPY_SDR_END_ABRUPT`. Other drivers were not checked.
 
 ## Verification
 

@@ -3,10 +3,13 @@
 //! build without this feature (ROADMAP.md: "CI green on Linux + macOS (no
 //! SoapySDR dependency in default features)").
 //!
-//! Driver stream overflows are counted, not silent: each one records a gap
-//! event on the shared `InputHealthCounters` (`health_counters`, MAN-233)
-//! and fires a rate-limited operator notice (`with_overflow_notice`), so a
-//! dropping host is never mistaken for a quiet band.
+//! Driver stream overflows reported as a read error are counted, not
+//! silent: each `ErrorCode::Overflow` records a gap event on the shared
+//! `InputHealthCounters` (`health_counters`, MAN-233) and fires a
+//! rate-limited operator notice (`with_overflow_notice`), so a dropping
+//! host is not mistaken for a quiet band. An overflow a driver reports
+//! only as the `SOAPY_SDR_END_ABRUPT` flag on a successful read is not
+//! counted: soapysdr 0.5.1's `RxStream::read` keeps the read flags private.
 
 use crate::InputHealthCounters;
 use crate::IqSource;
@@ -207,7 +210,12 @@ impl IqSource for SoapySdrIqSource {
     /// `OVERFLOW_WARN_INTERVAL`, fires the operator notice injected with
     /// `with_overflow_notice`. A `Timeout` counts nothing -- that is how a
     /// quiet band presents, and counting it would recreate the
-    /// dropped-input/quiet-band confusion MAN-233 removes.
+    /// dropped-input/quiet-band confusion MAN-233 removes. Only the error
+    /// form is seen: SoapySDR also defines `SOAPY_SDR_END_ABRUPT`, the flag
+    /// form of an overflow returned with the final samples of a successful
+    /// read, but soapysdr 0.5.1 (the pinned version; the newest release on
+    /// 2026-10-15) stores `read`'s flags in a private field with no
+    /// accessor, so such an overflow is neither counted nor warned.
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
         let mut timeout_retries = 0;
         let mut overflow_retries = 0;
