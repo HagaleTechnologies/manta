@@ -15,14 +15,23 @@ evaluated iff `d ≥ 10·u` and one of:
   Silence" decision keeps its commit latency;
 - (c) a sample point `10u + m·round(u)` (`m ≥ 1`) falls in `(d_prev, d]`
   — the cadence itself;
-- (d) "hot carry": the `(s, index-of-τ)` pair's `Silence` successor
-  survived merge + beam truncation at the previous productive anchor
-  step, and is re-derived every step while it keeps winning.
+- (d) "hot carry": the `(s, index-of-τ)` pair produced the best
+  `Silence` candidate of its merge key (`round(2·u)`; a `Silence`
+  successor is always `ROOT`/`AfterSpace`) at the previous productive
+  anchor step, whether or not that candidate won its key or survived
+  the beam. At most one pair per key;
+- (e) expiry: when a key's carried pair produces no candidate at `t`
+  (it passed `80·u`, or its anchor aged out of `reach_sil`), every pair
+  of that key is evaluated at `t`.
 
 The predicate is the pure function `silence_sampled`
 (`crates/manta-decode/src/hsmm/mod.rs`), implementing (a)–(c); (d) is
-the `hot_silence` set carried in `HsmmDecoder`. No config key: `round(u)`
-stays hardcoded per the spec. `decode.engine` stays `legacy`.
+the `hot_silence` set carried in `HsmmDecoder`, and (e) evaluates the
+step's skipped pairs of an expired key after the main loop. Candidates
+sort on `token_order`, then enumeration position, which is the order
+the stable sort over the old loop gave, so (e)'s late evaluations break
+ties the same way. No config key: `round(u)` stays hardcoded per the
+spec. `decode.engine` stays `legacy`.
 
 ## Problem
 
@@ -45,75 +54,125 @@ including during continuous keying — so this cost also sat inside the
 
 ## Evidence
 
-All numbers from this implementation run at `9636fe0` in this container,
-via the unit-test `silence_trace` recorder (every `Silence` evaluation
-beyond `reach_norm`) and the SHA-256 byte comparison of
-`manta decode --json --engine hsmm` over all 25 golden fixtures
-(V1–V10, V8w, VR1–VR8 with VR6a/b, VW1–VW5).
+Measured on 2026-10-15 in this container against `e2c9681`, the main
+commit this branch merges, which already carries MAN-189's
+`commit::Frontier` and MAN-192's Silence reseed. The tools: the
+unit-test `silence_trace` recorder (every `Silence` evaluation beyond
+`reach_norm`), a scratch instrumented release build that counts
+successor calls (never committed), and a SHA-256 byte comparison of
+`manta decode --json --engine hsmm` over all 25 golden fixtures (V1–V10,
+V8w, VR1–VR8 with VR6a/b, VW1–VW5).
 
 ### Evaluation counts
 
-Synthetic `N N N <1,875-hop gap> N N` scene at u=13
-(`silence_cadence_samples_cold_origins_every_round_u`): gap-phase
-beyond-`reach_norm` `Silence` evaluations 345,496 uncapped → 214,111
-with the cadence (−38%). The plan's instrumented runs measured the same
-scene at 343,075 → 223,082 (−35%) and, over whole vectors,
-V3 25.76 M → 5.77 M (−78%) and V8 860 M → 318 M (−63%) `Silence`
-evaluations, with total successor calls falling 24–43%.
+| input | `Silence` evaluations, every step → cadence | all successor calls |
+|---|---|---|
+| synthetic `N N N <1,875-hop gap> N N`, u=13, gap phase beyond `reach_norm` | 342,881 → 218,100 (−36%) | — |
+| V3 | 25.76 M → 5.89 M (−77%) | 46.7 M → 26.8 M (−43%) |
+| V8 | 944 M → 321 M (−66%) | 1.69 G → 1.07 G (−37%) |
+
+"Every step" is the same build with the cadence switched off, which
+decodes V3 and V8 byte-identically to `e2c9681`. Across the whole
+synthetic scene, beyond `reach_norm`, evaluations go 497,022 → 310,743;
+7,533 of those are hot carry and 3,939 come from the expiry rule. The
+gap outlasts `80·u`, so carried origins do expire there.
 
 ### Golden-vector output
 
-21/25 vectors decode byte-identically to `9636fe0`, including every
-currently passing HSMM gate vector: V3, V4, V6, V9, VR1–VR4, VR6a,
-VR6b, VR7 (also V1, V2, V7, V10, VR5, VW1–VW5). Exactly the four
-vectors the plan predicted may differ do: V5, V8, V8w, VR8.
+25/25 vectors decode byte-identically to `e2c9681`, V8w and V8
+included. `silence_cadence_commits_what_every_step_evaluation_commits`
+checks the same property on the synthetic scene: identical glyphs,
+timestamps and confidences with and without the cadence.
 
-- V8, VR8: JSON bytes differ, assembled text identical to main's.
-- V8, V8w: JSON bytes differ, spot callsign lists identical to main's;
-  V8w text is also identical.
-- V5: +2 characters in 363 (garble-level text on a vector whose CER
-  gate is `#[ignore]`d for the HSMM engine anyway — the plan measured
-  +1 char, CER 1.406 → 1.417).
+### The first cut, and why it was not enough
 
-The deltas are timestamps/confidences and gap-artifact glyphs — the same
-class the plan's mode-6 measurement accepted. The direct-drive
-characterization test
-(`silence_cadence_preserves_commit_stream_across_a_long_gap`) pins the
-post-cadence commit stream; main's pre-cadence stream on the same scene
-differed only in the gap's junk-`E` artifact entries (origin
-timestamps; the winning junk-Dit origin changes under sampling) and two
-post-gap confidences. Every keying glyph and keying commit timestamp is
-identical.
+The first implementation carried only beam survivors as hot (rule (d)
+was "this pair's `Silence` successor survived merge + beam truncation")
+and had no rule (e). At `9636fe0`, before MAN-189 and MAN-192, it
+decoded 21/25 vectors byte-identically: V5 +2 characters, V8/VR8
+timestamps and confidences, V8w −6 glyphs, spot lists unchanged. After
+the main merge, validation found V8w spotting a bogus `U1IRL` (a misread
+of the keyed `K1IRL`) that main does not; V5, V8, V8w and VR8 still
+differed. The cause is a gap in the hot-carry argument below: the
+`Silence` ranking among origins is fixed, but a key's best `Silence`
+candidate can enter the beam at an unsampled step once the mark
+candidates around it decay. Carrying only last step's survivors left it
+out until its next sample point, and a worse candidate took its slot.
+Carrying each key's best candidate, plus rule (e) for when that origin
+expires, closes the gap.
 
 ### Bench (this container, not a Pi 4; `--sample-size 10`)
 
-| scene | main `9636fe0` | with cadence |
+Measured 2026-10-15. Main `e2c9681` (with this branch's bench file
+copied in) and this branch ran at the same time, while other decodes
+and builds also ran, so the absolute times are inflated and noisy. The
+branch build predates the review fixes to rule (b)'s bound and to
+clearing the hot set on an empty step; neither changes the evaluation
+counts by more than 0.01%.
+
+| scene | main `e2c9681` | with cadence |
 |---|---|---|
-| `hsmm/300_tracks_10s` | 23.952 s [23.093, 24.922] | 24.407 s [23.342, 25.547] |
-| `hsmm/300_tracks_10s_gappy` | 15.050 s [13.596, 16.597] | 13.819 s [13.611, 14.037] |
+| `hsmm/300_tracks_10s` | 41.753 s [34.163, 49.996] | 42.678 s [35.180, 50.779] |
+| `hsmm/300_tracks_10s_gappy` | 18.010 s [17.302, 18.762] | 22.671 s [21.947, 23.440] |
 
-The new `hsmm/300_tracks_10s_gappy` scene (3 s keying, 5 s gate-low,
-2 s keying) is the first bench coverage of the long-silence path — the
+The continuous scene is within noise. The gappy scene came out ~26 %
+**slower** with the cadence. Its intervals do not overlap, so this is
+probably real and not noise. The likely cost is hot carry: one
+successful, `hist`-cloning evaluation per `Silence` merge key per step,
+where the first cut carried at most `beam`. Rule (e) also runs when the
+5 s gap outlasts a key's `80·u`. The bench drives 300 tracks of
+identical keying through the same gap.
+
+On the golden vectors, single decodes on an otherwise idle container
+(wall time, `--engine hsmm`), main → first cut → this change:
+
+| vector | main | first cut | this change |
+|---|---|---|---|
+| V3 | 15.3 s | 12.3 s | 12.4 s |
+| VW3 | 5.6 s | 4.6 s | 4.8 s |
+| VR1 | 8.4 s | 8.6 s | 8.8 s |
+
+The previous record's numbers (`9636fe0`, first cut) were 23.952 s →
+24.407 s continuous and 15.050 s → 13.819 s gappy. The new
+`hsmm/300_tracks_10s_gappy` scene (3 s keying, 5 s gate-low, 2 s
+keying) is the first bench coverage of the long-silence path; the
 existing continuous scene's longest quiet stretch (39 hops) never
-reaches `10·u`. Both scenes' confidence intervals overlap heavily on
-this container: the gappy mean improves ~8 % while the continuous mean
-is within timer noise, so the wall-time claim is weak here and the
-evaluation-count reductions above are the measurable effect. For
-context, the stage-2 record measured `300_tracks_10s` at 10.625 s mean
-on an M-series core; this container runs the same scene ~2.3× slower.
-The 4.25× MAN-171 overage is unchanged by this ticket.
+reaches `10·u`. For context, the stage-2 record measured
+`300_tracks_10s` at 10.625 s mean on an M-series core. The 4.25×
+MAN-171 overage is unchanged by this ticket, and the gappy-scene cost
+is a MAN-171 input.
 
-## Why hot carry (d) exists
+## Why hot carry (d) and expiry (e) exist
 
 A `Silence` candidate's score is `τ.score + ev + 0 + lp_type` with
-`ev = −(C[t] − C[s])`. Between two `Silence` candidates the `C[t]` term
-cancels, so their ranking does not depend on `t`: per-step re-derivation
-adds only one thing — keeping the winning "still silent" hypothesis in
-the beam. Without (d), unsampled steps fill the beam with mark
-candidates that ran through negative evidence; the plan's mode-3
-prototype (cadence without hot carry) shifted commits and regressed
-V10's CER 0.493 → 0.579. Hot carry is bounded by `beam` (≤ 12 pairs per
-step) against the ~1,300 evaluations per step the cadence removes.
+`ev = −(C[t] − C[s])` (the duration prior is flat on `[10u, 80u]`).
+Between two `Silence` candidates the `C[t]` term cancels, so their
+`token_order` ranking does not depend on `t`. A pair can only start
+producing by crossing `10·u` (rule (b)) or inside `reach_norm` (rule
+(a)), and both are always evaluated. So if each key's best `Silence`
+candidate is evaluated at one step, it is still the best at the next
+step unless it expired (rule (e) then evaluates the whole key) or a
+newly crossing pair beats it (rule (b) evaluated that pair). Merge keeps
+only the best candidate per key, so the merged beam is the one
+evaluating every origin at every step would give. That holds in exact
+arithmetic. Scores are `f32` and the evidence term `C[t] − C[s]` is
+rounded at each step, so two same-key candidates within about one
+rounding step can swap order between steps; the cadence then keeps the
+one it carried. The 25-vector comparison above found no such case.
+
+Rule (b)'s bound is `ceil(10·u)` in whole hops, the first `d` the
+`Silence` prior accepts (`d as f32 >= 10·u`). The first cut truncated
+it, which spends (b) on a step the prior still rejects when `10·u` is
+fractional and skips the pair's first productive step. A step that
+produces no candidate at all clears the hot set: every carried pair
+expired there and rule (e) found no other producible pair of its key.
+
+Without any carry, unsampled steps fill the beam with mark candidates
+that ran through negative evidence; the plan's mode-3 prototype shifted
+commits and regressed V10's CER 0.493 → 0.579. Hot carry costs one
+evaluation per `Silence` merge key per step. Rule (e) costs a full
+pass over one key, and only on a step where that key's carried origin
+expires.
 
 Rejected alternatives (measured in the plan): a strict
 `d % round(u) == 0` grid (aliases against the 8-hop fallback grid,
@@ -140,12 +199,13 @@ The plan's full variant comparison, retained verbatim (25 vectors,
 - MAN-171: the overall HSMM CPU budget (4.25× bench overage) remains
   open; lazy `Silence` materialisation is still the candidate lever.
 - The junk-`E` flood in gaps longer than `80·u` exists on main and is
-  unchanged by the cadence (same glyph count in the synthetic scene,
-  shifted origin timestamps): each retained origin's `Silence`
+  unchanged by the cadence (the synthetic scene's commit stream is
+  identical with and without it): each retained origin's `Silence`
   successor commits its node glyph at its own origin `sample_ts`, and
-  the `sealed` dedupe keys on `sample_ts`, so distinct origins all
+  MAN-189's `commit::Frontier` only drops a glyph whose character
+  started at or before the last emitted entry, so later origins still
   emit. A candidate for its own ticket, not MAN-191 scope.
-- MAN-192 (reseed after a committed `Silence`, SPEC §4.7) will change
-  the beam composition during gaps; rerun the byte comparison when it
-  lands. Hot carry still applies — hot entries are (anchor hop, token
-  index) pairs and anchors stay frozen apart from reseed score shifts.
+- MAN-192 (reseed after a committed `Silence`, SPEC §4.7) landed before
+  this merged; the byte comparison above was rerun against it. Reseed
+  score shifts are uniform across anchors, so they leave the `Silence`
+  ranking that hot carry relies on unchanged.

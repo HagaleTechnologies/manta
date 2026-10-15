@@ -246,14 +246,17 @@ docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
 MAN-191: the HSMM decoder samples its long-`Silence` hypotheses at SPEC
 v2 §4.6's cadence instead of every anchor step (`silence_sampled`:
-normal reach, first `10u` crossing, then one sample per `round(u)` hops,
-plus a beam-bounded "hot carry" of surviving `Silence` successors;
-`HsmmDecoder::push`). Gap-phase `Silence` evaluations drop 38 % on the
-synthetic long-gap scene (plan: −78 % on V3) and 21/25 golden vectors
-decode byte-identically — only V5/V8/V8w/VR8 differ, in
-timestamps/confidences and gap-artifact glyphs (V8/VR8 text and
-V8/V8w spot lists unchanged). `hsmm_300_tracks` gains a
-`300_tracks_10s_gappy` scene covering the long-silence path. See
+normal reach, first `10u` crossing, then one sample per `round(u)` hops;
+plus a "hot carry" of each merge key's best `Silence` origin, and a
+full pass over a key whose carried origin expires; `HsmmDecoder::push`).
+`Silence` evaluations drop 77 % on V3, 66 % on V8 and 36 % in the
+synthetic long-gap scene's gap, and all 25 golden vectors decode
+byte-identically to main under `--engine hsmm` (a first cut that carried
+only beam survivors spotted a bogus `U1IRL` on V8w once MAN-192 landed).
+Wall time falls on V3/VW3, but the `300_tracks_10s_gappy` bench scene
+measured ~26 % slower than main (an input for MAN-171).
+`hsmm_300_tracks` gains a `300_tracks_10s_gappy` scene covering the
+long-silence path. See
 docs/DECISIONS/2026-10-14-man191-silence-cadence.md.
 
 MAN-137: the JSON spot stream opens with `hello` and numbers spots and
