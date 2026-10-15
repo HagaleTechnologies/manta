@@ -24,6 +24,23 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-174: a deferred Beacon candidate on a track that merged into another
+  track which closed in the same batch now resolves at the final survivor's
+  close instead of being lost; one whose timestamp equals an existing
+  spot's goes through normal dedupe; a merge keeps the newest eight pending
+  candidates by time.
+- MAN-192: the opt-in `hsmm` engine now reseeds its speed hypotheses
+  after a committed `Silence` segment even when the keying-present gate
+  never re-opens (interference holding it high through the gap), as
+  SPEC v2 §4.7 always required, so a transmission resuming at a
+  different speed competes with fresh hypotheses instead of decoding
+  from the surviving speed alone. `decode.engine` remains `legacy` by
+  default; output changes only for `hsmm` runs with such gate-stuck
+  gaps.
+- MAN-95: default spot validation requires 2, 3 or 5 distinct-message
+  repetitions by callsign-pattern rarity. `[spot].validation_level = "minimal"`
+  restores flat 2; `--patterns` overrides the independent reference list.
+
 - A band-wide static crash (lightning) no longer starts tracks across the
   band, and running tracks no longer decode it as extra dits; new
   `[detector].crash_filter`, default `"full"` (MAN-312).
@@ -70,6 +87,12 @@ the git history and `docs/DECISIONS/`.
   (MAN-129).
 - MAN-140: `--ka9q-group` / `[input] type = "ka9q"` reads one ka9q-radio
   (radiod) IQ channel over RTP multicast; see docs/GUIDES/ka9q-radio.md
+
+### Changed
+
+- The in-repo `wiki/` is the project's canonical wiki. GitHub's Wiki tab
+  is not used; disabling it remains an owner step. The wiki's stale
+  `verified` stamps and `manifest.json` are refreshed and CI-pinned (MAN-152).
 
 ## [0.1.0] - 2026-10-11
 

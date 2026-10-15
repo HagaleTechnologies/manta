@@ -84,9 +84,35 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("spot", "notch_path"),
     ("spot", "cty_path"),
     ("spot", "scp_path"),
+    // MAN-316: paths and URLs verbatim, and an all-digit SHA-256 must stay
+    // a string rather than TOML-probe as a number.
+    ("spot", "list_cache_dir"),
+    ("spot", "cty_url"),
+    ("spot", "scp_url"),
+    ("spot", "cty_sha256"),
+    ("spot", "scp_sha256"),
+    ("spot", "pattern_path"),
+    ("spot", "validation_level"),
     ("decode", "engine"),
     ("detector", "crash_filter"),
 ];
+
+/// MAN-316: where `refresh_lists` downloads each list when `cty_url` /
+/// `scp_url` is unset. Plain HTTP: manta has no TLS support.
+pub(crate) const DEFAULT_CTY_URL: &str = "http://www.country-files.com/cty/cty.dat";
+pub(crate) const DEFAULT_SCP_URL: &str = "http://www.supercheckpartial.com/MASTER.SCP";
+
+/// MAN-316: a list pin (`--cty-sha256`/`--scp-sha256`, `[spot].cty_sha256`/
+/// `scp_sha256`): exactly 64 hexadecimal digits, returned lowercased so it
+/// compares equal to `list_cache::sha256_hex`. Also the flags' clap
+/// `value_parser`.
+pub(crate) fn parse_sha256(s: &str) -> std::result::Result<String, String> {
+    if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(s.to_ascii_lowercase())
+    } else {
+        Err("expected 64 hexadecimal digits (a SHA-256)".to_string())
+    }
+}
 
 /// Whether `load` applies the `MANTA_*` overlay. `decode`/`oracle` pass
 /// `Ignore`: they are the deterministic golden-vector and measurement tools,
@@ -134,6 +160,32 @@ pub(crate) struct SpotFile {
     pub notch_path: Option<PathBuf>,
     pub cty_path: Option<PathBuf>,
     pub scp_path: Option<PathBuf>,
+    /// MAN-316: download current lists while `run` reads a live receiver.
+    pub refresh_lists: bool,
+    /// MAN-316: where downloaded lists persist; resolved like `cty_path`.
+    pub list_cache_dir: Option<PathBuf>,
+    /// MAN-316: `None` is [`DEFAULT_CTY_URL`]; a value parsed as an
+    /// `http://` URL at load. See [`SpotFile::cty_url`].
+    pub cty_url: Option<String>,
+    pub scp_url: Option<String>,
+    /// MAN-316: a pinned list version, validated and lowercased by
+    /// [`parse_sha256`] at load.
+    pub cty_sha256: Option<String>,
+    pub scp_sha256: Option<String>,
+    pub pattern_path: Option<PathBuf>,
+    pub validation_level: manta_spot::ValidationLevel,
+}
+
+impl SpotFile {
+    /// MAN-316: the URL `refresh_lists` downloads cty.dat from.
+    pub(crate) fn cty_url(&self) -> &str {
+        self.cty_url.as_deref().unwrap_or(DEFAULT_CTY_URL)
+    }
+
+    /// MAN-316: the URL `refresh_lists` downloads MASTER.SCP from.
+    pub(crate) fn scp_url(&self) -> &str {
+        self.scp_url.as_deref().unwrap_or(DEFAULT_SCP_URL)
+    }
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -144,6 +196,62 @@ struct SpotToml {
     notch_path: Option<PathBuf>,
     cty_path: Option<PathBuf>,
     scp_path: Option<PathBuf>,
+    refresh_lists: Option<bool>,
+    list_cache_dir: Option<PathBuf>,
+    cty_url: Option<String>,
+    scp_url: Option<String>,
+    cty_sha256: Option<String>,
+    scp_sha256: Option<String>,
+    pattern_path: Option<PathBuf>,
+    #[serde(default, deserialize_with = "deserialize_validation_level")]
+    validation_level: manta_spot::ValidationLevel,
+}
+
+fn deserialize_validation_level<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<manta_spot::ValidationLevel, D::Error> {
+    let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+    match value.as_str() {
+        "minimal" => Ok(manta_spot::ValidationLevel::Minimal),
+        "normal" => Ok(manta_spot::ValidationLevel::Normal),
+        _ => Err(serde::de::Error::unknown_variant(
+            &value,
+            &["minimal", "normal"],
+        )),
+    }
+}
+
+/// MAN-316: a `[spot]` list URL must be one `list_http` can fetch. Checked at
+/// load, so a bad URL fails `config check`/`run` before any source opens
+/// rather than at the first refresh days later.
+fn check_list_url(key: &str, url: Option<String>) -> std::result::Result<Option<String>, String> {
+    let Some(url) = url else {
+        return Ok(None);
+    };
+    match crate::list_http::HttpUrl::parse(&url) {
+        Ok(_) => Ok(Some(url)),
+        Err(reason) => {
+            let mut e =
+                format!("{key} must be an http:// URL (manta has no TLS support), got \"{url}\"");
+            // An `http://` value that still fails says why.
+            if url
+                .get(..7)
+                .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+            {
+                e.push_str(&format!(": {reason}"));
+            }
+            Err(e)
+        }
+    }
+}
+
+/// MAN-316: a `[spot]` pin key, through the flags' parser.
+fn check_pin(key: &str, pin: Option<String>) -> std::result::Result<Option<String>, String> {
+    pin.map(|p| {
+        parse_sha256(&p)
+            .map_err(|_| format!("{key} must be 64 hexadecimal digits (a SHA-256), got \"{p}\""))
+    })
+    .transpose()
 }
 
 /// `input.type` (D5).
@@ -352,6 +460,7 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         }
     };
     let spot_toml = take_typed::<SpotToml>(&doc, "spot", &origin, &overlay)?.unwrap_or_default();
+    let spot_err = |e: String| anyhow!("{origin}: [spot]: {e}{}", overlay.suffix("spot"));
     let spot = SpotFile {
         allowlist: spot_toml.allowlist.unwrap_or_default(),
         blocklist_path: spot_toml
@@ -366,6 +475,18 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         scp_path: spot_toml
             .scp_path
             .map(|p| resolve_path("spot", "scp_path", p)),
+        refresh_lists: spot_toml.refresh_lists.unwrap_or(false),
+        list_cache_dir: spot_toml
+            .list_cache_dir
+            .map(|p| resolve_path("spot", "list_cache_dir", p)),
+        cty_url: check_list_url("cty_url", spot_toml.cty_url).map_err(&spot_err)?,
+        scp_url: check_list_url("scp_url", spot_toml.scp_url).map_err(&spot_err)?,
+        cty_sha256: check_pin("cty_sha256", spot_toml.cty_sha256).map_err(&spot_err)?,
+        scp_sha256: check_pin("scp_sha256", spot_toml.scp_sha256).map_err(&spot_err)?,
+        pattern_path: spot_toml
+            .pattern_path
+            .map(|p| resolve_path("spot", "pattern_path", p)),
+        validation_level: spot_toml.validation_level,
     };
     let input_toml = take_typed::<InputToml>(&doc, "input", &origin, &overlay)?.unwrap_or_default();
     let input = validate_input(input_toml, &|p| resolve_path("input", "path", p))
@@ -797,6 +918,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pattern_validation_level_accepts_minimal_and_rejects_unknown() {
+        let loaded = load_file("[spot]\nvalidation_level = 'minimal'\n").unwrap();
+        assert_eq!(
+            loaded.spot.validation_level,
+            manta_spot::ValidationLevel::Minimal
+        );
+        let err = err_of("[spot]\nvalidation_level = 'strict'\n");
+        assert!(err.contains("minimal") && err.contains("normal"), "{err}");
+    }
+
+    #[test]
+    fn pattern_settings_env_override_file_and_file_paths_are_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manta.toml");
+        std::fs::write(
+            &path,
+            "[spot]\nvalidation_level = 'normal'\npattern_path = 'patterns.lst'\n",
+        )
+        .unwrap();
+        let env = vars(&[
+            ("MANTA_SPOT_VALIDATION_LEVEL", "minimal"),
+            ("MANTA_SPOT_PATTERN_PATH", "2026"),
+        ]);
+        let loaded = load(Some(&path), Env::Read(&env)).unwrap();
+        assert_eq!(
+            loaded.spot.validation_level,
+            manta_spot::ValidationLevel::Minimal
+        );
+        assert_eq!(loaded.spot.pattern_path, Some(PathBuf::from("2026")));
+        let loaded = load(Some(&path), Env::Ignore).unwrap();
+        assert_eq!(
+            loaded.spot.pattern_path,
+            Some(dir.path().join("patterns.lst"))
+        );
+    }
+
+    #[test]
     fn env_cty_and_scp_paths_are_string_typed_and_cwd_relative() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manta.toml");
@@ -1119,6 +1277,161 @@ mod tests {
         assert!(
             err.contains("cty_path") && err.contains("scp_path"),
             "{err}"
+        );
+    }
+
+    // ---- MAN-316: list refresh and pins
+
+    const PIN: &str = "e9ff91a3c3ab28c5f7dbcffb4280944a84645ed53d41cb4c68a41f132ee13fd1";
+
+    #[test]
+    fn spot_refresh_keys_parse_with_defaults() {
+        let spot = load_file("[spot]\n").unwrap().spot;
+        assert!(!spot.refresh_lists);
+        assert_eq!(spot.list_cache_dir, None);
+        assert_eq!(
+            (spot.cty_url.as_deref(), spot.scp_url.as_deref()),
+            (None, None)
+        );
+        assert_eq!(spot.cty_url(), DEFAULT_CTY_URL);
+        assert_eq!(spot.scp_url(), DEFAULT_SCP_URL);
+        assert_eq!(DEFAULT_CTY_URL, "http://www.country-files.com/cty/cty.dat");
+        assert_eq!(
+            DEFAULT_SCP_URL,
+            "http://www.supercheckpartial.com/MASTER.SCP"
+        );
+        assert_eq!((spot.cty_sha256, spot.scp_sha256), (None, None));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manta.toml");
+        std::fs::write(
+            &path,
+            "[spot]\nrefresh_lists = true\nlist_cache_dir = \"cache\"\n\
+             cty_url = \"http://mirror.lan:8080/cty.dat\"\n\
+             scp_url = \"http://mirror.lan/MASTER.SCP\"\n",
+        )
+        .unwrap();
+        let spot = load(Some(&path), Env::Ignore).unwrap().spot;
+        assert!(spot.refresh_lists);
+        assert_eq!(spot.list_cache_dir, Some(dir.path().join("cache")));
+        assert_eq!(spot.cty_url(), "http://mirror.lan:8080/cty.dat");
+        assert_eq!(spot.scp_url(), "http://mirror.lan/MASTER.SCP");
+    }
+
+    /// Mirrors `env_cty_and_scp_paths_are_string_typed_and_cwd_relative`.
+    #[test]
+    fn env_refresh_keys_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manta.toml");
+        std::fs::write(&path, "[spot]\nlist_cache_dir = 'from-file'\n").unwrap();
+        let loaded = load(Some(&path), Env::Ignore).unwrap();
+        assert_eq!(
+            loaded.spot.list_cache_dir,
+            Some(dir.path().join("from-file"))
+        );
+
+        let v = vars(&[
+            ("MANTA_SPOT_REFRESH_LISTS", "true"),
+            ("MANTA_SPOT_LIST_CACHE_DIR", "2026"),
+            ("MANTA_SPOT_CTY_URL", "http://10.0.0.1/cty.dat"),
+            ("MANTA_SPOT_SCP_URL", "http://10.0.0.1:8080/MASTER.SCP"),
+        ]);
+        let loaded = load(Some(&path), Env::Read(&v)).unwrap();
+        assert!(loaded.spot.refresh_lists, "TOML-probed to a bool");
+        // Verbatim and CWD-relative, not joined onto the config's directory.
+        assert_eq!(loaded.spot.list_cache_dir, Some(PathBuf::from("2026")));
+        assert_eq!(loaded.spot.cty_url(), "http://10.0.0.1/cty.dat");
+        assert_eq!(loaded.spot.scp_url(), "http://10.0.0.1:8080/MASTER.SCP");
+        assert_eq!(
+            loaded.raw["spot"]["list_cache_dir"],
+            toml::Value::String("2026".into())
+        );
+    }
+
+    #[test]
+    fn an_https_or_malformed_list_url_is_refused_before_io() {
+        let f = write_cfg("[spot]\ncty_url = \"https://www.country-files.com/cty/cty.dat\"\n");
+        let err = format!("{:#}", load(Some(f.path()), Env::Ignore).unwrap_err());
+        assert_eq!(
+            err,
+            format!(
+                "{}: [spot]: cty_url must be an http:// URL (manta has no TLS support), got \
+                 \"https://www.country-files.com/cty/cty.dat\"",
+                f.path().display()
+            )
+        );
+        for bad in [
+            "ftp://mirror.lan/MASTER.SCP",
+            "www.supercheckpartial.com/MASTER.SCP",
+            "",
+        ] {
+            let err = err_of(&format!("[spot]\nscp_url = \"{bad}\"\n"));
+            assert!(
+                err.contains(&format!(
+                    "[spot]: scp_url must be an http:// URL (manta has no TLS support), got \
+                     \"{bad}\""
+                )),
+                "{err}"
+            );
+        }
+        // An http:// URL with no host still fails, with the parser's reason.
+        let err = err_of("[spot]\ncty_url = \"http://\"\n");
+        assert!(
+            err.contains("[spot]: cty_url must be an http:// URL (manta has no TLS support), got \"http://\": "),
+            "{err}"
+        );
+        // From the environment, the variable is named.
+        let err = format!(
+            "{:#}",
+            load_env(None, &[("MANTA_SPOT_SCP_URL", "https://x/MASTER.SCP")]).unwrap_err()
+        );
+        assert!(
+            err.starts_with("environment: [spot]: scp_url must be"),
+            "{err}"
+        );
+        assert!(err.ends_with("(environment: MANTA_SPOT_SCP_URL)"), "{err}");
+    }
+
+    #[test]
+    fn spot_pins_are_validated_lowercased_and_string_typed_from_env() {
+        let upper = PIN.to_ascii_uppercase();
+        let spot = load_file(&format!("[spot]\ncty_sha256 = \"{upper}\"\n"))
+            .unwrap()
+            .spot;
+        assert_eq!(spot.cty_sha256.as_deref(), Some(PIN));
+        assert_eq!(spot.scp_sha256, None);
+
+        // An all-digit hash stays a string (it would TOML-probe as a number).
+        let digits = "1".repeat(64);
+        let loaded = load_env(
+            None,
+            &[
+                ("MANTA_SPOT_CTY_SHA256", digits.as_str()),
+                ("MANTA_SPOT_SCP_SHA256", PIN),
+            ],
+        )
+        .unwrap();
+        assert_eq!(loaded.spot.cty_sha256, Some(digits));
+        assert_eq!(loaded.spot.scp_sha256.as_deref(), Some(PIN));
+
+        let bad_pins = [
+            "0069220".to_string(),
+            format!("{PIN}0"),
+            format!("{}g", &PIN[..63]),
+        ];
+        for bad in &bad_pins {
+            let err = err_of(&format!("[spot]\nscp_sha256 = \"{bad}\"\n"));
+            assert!(
+                err.contains(&format!(
+                    "[spot]: scp_sha256 must be 64 hexadecimal digits (a SHA-256), got \"{bad}\""
+                )),
+                "{err}"
+            );
+        }
+        assert_eq!(parse_sha256(&upper), Ok(PIN.to_string()));
+        assert_eq!(
+            parse_sha256("abc"),
+            Err("expected 64 hexadecimal digits (a SHA-256)".to_string())
         );
     }
 

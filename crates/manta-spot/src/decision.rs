@@ -8,12 +8,6 @@ use crate::context::SpotType;
 use crate::support::Support;
 use crate::validator::Spot;
 
-/// The repetition gate's requirement: a non-allowlisted, non-beacon
-/// candidate spots only once this many message-distinct repetitions have
-/// been seen (ARCHITECTURE §6). Named so the decision record can quote
-/// it as `requiredReps`.
-pub const REQUIRED_REPS: usize = 2;
-
 /// What validation decided about one candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -37,7 +31,7 @@ pub enum Reason {
     Grammar,
     /// No `cty.dat` prefix allocates it.
     Cty,
-    /// Fewer than `REQUIRED_REPS` repetitions so far. Not final: a later
+    /// Fewer than the candidate pattern tier requires. Not final: a later
     /// repetition produces a new decision.
     Repetition,
     /// A better-supported variant on the same track wins (MAN-100).
@@ -80,6 +74,10 @@ pub struct Decision {
     /// The repetition gate's count for this decode; `None` when the
     /// decision came before the gate ran.
     pub reps: Option<u32>,
+    /// Admission requirement at the configured validation level.
+    pub required_reps: u32,
+    /// None for an allowlisted call or a beacon.
+    pub pattern_tier: Option<crate::PatternTier>,
     pub rival: Option<Rival>,
     /// The emitted spot, `Verdict::Spotted` only.
     pub spot: Option<Spot>,
@@ -110,6 +108,9 @@ impl Decision {
             verdict,
             reason: Some(reason),
             reps: None,
+            // Validator::decide fills the per-candidate admission metadata.
+            required_reps: 1,
+            pattern_tier: None,
             rival: None,
             spot: None,
         }
@@ -126,6 +127,9 @@ impl Decision {
             verdict: Verdict::Spotted,
             reason: None,
             reps: Some(reps),
+            // Validator::decide fills the per-candidate admission metadata.
+            required_reps: 1,
+            pattern_tier: None,
             rival: None,
             spot: Some(spot.clone()),
         }

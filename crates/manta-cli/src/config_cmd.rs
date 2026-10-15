@@ -6,6 +6,7 @@
 use crate::config::{Loaded, SourceFromFile};
 use anyhow::{bail, Context, Result};
 use manta_server::config::ServerConfig;
+use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -45,7 +46,7 @@ pub(crate) fn check(config_flag: Option<PathBuf>) -> Result<()> {
     // rejects source types this build cannot open), blocklist/notch reads.
     // Never `spec.open()`, never `is_rf_aware()` (it opens IQ WAVs), never
     // `start_spot_server`.
-    let prepared = crate::prepare_live(crate::CliOverrides::none(), path.clone(), None)?;
+    let prepared = crate::prepare_live(crate::CliOverrides::none(), path.clone(), None, true)?;
     crate::refuse_rbn_compare_replay(&prepared.resolved, false)?;
     reject_placeholders(&prepared.loaded)?;
     reject_duplicate_ports(&prepared.loaded)?;
@@ -600,25 +601,34 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
         p.as_ref()
             .map_or("none".to_string(), |p| p.display().to_string())
     };
+    let spot = &loaded.spot;
     lines.push(format!(
-        "spot: allowlist={} blocklist_path={} notch_path={} cty_path={} scp_path={}",
-        if loaded.spot.allowlist.is_empty() {
+        "spot: allowlist={} blocklist_path={} notch_path={} cty_path={} scp_path={} \
+         cty_sha256={} scp_sha256={} refresh_lists={} list_cache_dir={} cty_url={} scp_url={} \
+         validation_level={} pattern_path={}",
+        if spot.allowlist.is_empty() {
             "none".to_string()
         } else {
-            loaded.spot.allowlist.join(",")
+            spot.allowlist.join(",")
         },
-        path_or_none(&loaded.spot.blocklist_path),
-        path_or_none(&loaded.spot.notch_path),
-        loaded
-            .spot
-            .cty_path
+        path_or_none(&spot.blocklist_path),
+        path_or_none(&spot.notch_path),
+        spot.cty_path
             .as_ref()
             .map_or("bundled".to_string(), |p| p.display().to_string()),
-        loaded
-            .spot
-            .scp_path
+        spot.scp_path
             .as_ref()
-            .map_or("bundled".to_string(), |p| p.display().to_string())
+            .map_or("bundled".to_string(), |p| p.display().to_string()),
+        spot.cty_sha256.as_deref().unwrap_or("none"),
+        spot.scp_sha256.as_deref().unwrap_or("none"),
+        if spot.refresh_lists { "on" } else { "off" },
+        path_or_none(&spot.list_cache_dir),
+        spot.cty_url(),
+        spot.scp_url(),
+        spot.validation_level.as_str(),
+        spot.pattern_path
+            .as_ref()
+            .map_or("bundled".to_string(), |p| p.display().to_string()),
     ));
 
     let detector = set_keys(loaded, "detector", &[]);
@@ -650,6 +660,7 @@ fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> V
         ConfigSource::Flag | ConfigSource::Env => {}
     }
     let Some(server) = &loaded.server else {
+        notes.extend(list_refresh_notes(&loaded.spot));
         return notes;
     };
     if resolved.dial_freq_hz.is_none()
@@ -719,7 +730,89 @@ fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> V
                 .to_string(),
         );
     }
+    notes.extend(list_refresh_notes(&loaded.spot));
     notes
+}
+
+/// MAN-316: with `refresh_lists` on, where `run` will download from, whether
+/// the downloads survive a restart, and which lists a path or pin keeps out
+/// of the refresh. Nothing when refresh is off.
+fn list_refresh_notes(spot: &crate::config::SpotFile) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !spot.refresh_lists {
+        return notes;
+    }
+    let lists = [
+        (
+            "cty",
+            "cty.dat",
+            &spot.cty_path,
+            &spot.cty_sha256,
+            spot.cty_url(),
+        ),
+        (
+            "scp",
+            "MASTER.SCP",
+            &spot.scp_path,
+            &spot.scp_sha256,
+            spot.scp_url(),
+        ),
+    ];
+    // `load` already parsed every URL, so a failure here cannot happen.
+    let refreshed: Vec<crate::list_http::HttpUrl> = lists
+        .iter()
+        .filter(|(_, _, path, pin, _)| path.is_none() && pin.is_none())
+        .filter_map(|(_, _, _, _, url)| crate::list_http::HttpUrl::parse(url).ok())
+        .collect();
+    if !refreshed.is_empty() {
+        notes.push(format!(
+            "note: list refresh downloads over plain HTTP from {} while `run` reads a live \
+             receiver; file replay never downloads",
+            download_endpoints(&refreshed)
+        ));
+        if spot.list_cache_dir.is_none() {
+            notes.push(
+                "note: [spot].refresh_lists is on but list_cache_dir is unset, so downloaded \
+                 lists are kept in memory only and each restart starts from the built-in copies"
+                    .to_string(),
+            );
+        }
+    }
+    for (name, file, path, pin, _) in lists {
+        if path.is_some() {
+            notes.push(format!(
+                "note: {name}_path is set, so list refresh leaves {file} alone"
+            ));
+        }
+        if pin.is_some() {
+            notes.push(format!(
+                "note: {name}_sha256 is set, so list refresh leaves {file} alone"
+            ));
+        }
+    }
+    notes
+}
+
+/// `www.country-files.com and www.supercheckpartial.com (TCP port 80)`: each
+/// distinct host once, then the port; `host:port` forms when the ports differ.
+fn download_endpoints(urls: &[crate::list_http::HttpUrl]) -> String {
+    let ports: BTreeSet<u16> = urls.iter().map(|u| u.port).collect();
+    let mut names: Vec<String> = Vec::new();
+    for u in urls {
+        let name = match ports.len() {
+            1 if u.host.contains(':') => format!("[{}]", u.host),
+            1 => u.host.clone(),
+            _ => u.host_port(),
+        };
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let names = names.join(" and ");
+    match ports.iter().next() {
+        Some(port) if ports.len() == 1 => format!("{names} (TCP port {port})"),
+        _ => names,
+    }
 }
 
 /// D3 (MAN-76), split per listener by MAN-132: `bind_addr` serves
@@ -1075,7 +1168,11 @@ mod tests {
         let lines = lines_of("");
         assert_eq!(
             line(&lines, "spot:"),
-            "spot: allowlist=none blocklist_path=none notch_path=none cty_path=bundled scp_path=bundled"
+            "spot: allowlist=none blocklist_path=none notch_path=none cty_path=bundled \
+             scp_path=bundled cty_sha256=none scp_sha256=none refresh_lists=off \
+             list_cache_dir=none cty_url=http://www.country-files.com/cty/cty.dat \
+             scp_url=http://www.supercheckpartial.com/MASTER.SCP \
+             validation_level=normal pattern_path=bundled"
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manta.toml");
@@ -1086,8 +1183,11 @@ mod tests {
             &path,
             format!(
                 "[spot]\nallowlist = [\"W1AW\", \"K1ABC\"]\nblocklist_path = \"bad.txt\"\n\
-                 notch_path = '{}'\ncty_path = 'cty.dat'\nscp_path = 'MASTER.SCP'\n",
-                notch.display()
+                 notch_path = '{}'\ncty_path = 'cty.dat'\nscp_path = 'MASTER.SCP'\n\
+                 cty_sha256 = '{}'\nrefresh_lists = true\nlist_cache_dir = 'cache'\n\
+                 scp_url = 'http://mirror.lan/MASTER.SCP'\npattern_path = 'patterns.lst'\n",
+                notch.display(),
+                PIN.to_ascii_uppercase()
             ),
         )
         .unwrap();
@@ -1095,11 +1195,18 @@ mod tests {
         assert_eq!(
             line(&summary("x", &l), "spot:"),
             format!(
-                "spot: allowlist=W1AW,K1ABC blocklist_path={} notch_path={} cty_path={} scp_path={}",
+                "spot: allowlist=W1AW,K1ABC blocklist_path={} notch_path={} cty_path={} \
+                 scp_path={} cty_sha256={PIN} scp_sha256=none refresh_lists=on \
+                 list_cache_dir={} cty_url=http://www.country-files.com/cty/cty.dat \
+                 scp_url=http://mirror.lan/MASTER.SCP \
+                 validation_level={} pattern_path={}",
                 dir.path().join("bad.txt").display(),
                 notch.display(),
                 dir.path().join("cty.dat").display(),
-                dir.path().join("MASTER.SCP").display()
+                dir.path().join("MASTER.SCP").display(),
+                dir.path().join("cache").display(),
+                "normal",
+                dir.path().join("patterns.lst").display()
             )
         );
     }
@@ -1367,6 +1474,136 @@ mod tests {
         );
     }
 
+    // ---- MAN-316: list refresh and pins
+
+    const PIN: &str = "e9ff91a3c3ab28c5f7dbcffb4280944a84645ed53d41cb4c68a41f132ee13fd1";
+    const HTTP_NOTE: &str = "note: list refresh downloads over plain HTTP";
+    const MEMORY_NOTE: &str = "note: [spot].refresh_lists is on but list_cache_dir is unset";
+
+    #[test]
+    fn refresh_on_without_a_cache_dir_notes_memory_only() {
+        let server = "[server]\nstation_callsign = \"W1AW\"\noperator_grid = \"FN31pr\"\n\
+                      bind_addr = \"127.0.0.1\"\n";
+        // Off (the default): no list note, with or without [server].
+        for body in [
+            "",
+            server,
+            "[spot]\nlist_cache_dir = \"/var/cache/manta\"\n",
+        ] {
+            let n = notes_of(body);
+            assert!(!n.iter().any(|n| n.contains("list refresh")), "{n:?}");
+        }
+        let on = format!("{server}[spot]\nrefresh_lists = true\n");
+        // Only the list notes: this config also draws the dial-frequency one.
+        let list_notes: Vec<String> = notes_of(&on)
+            .into_iter()
+            .filter(|n| n.starts_with(HTTP_NOTE) || n.starts_with(MEMORY_NOTE))
+            .collect();
+        assert_eq!(
+            list_notes,
+            vec![
+                "note: list refresh downloads over plain HTTP from www.country-files.com and \
+                 www.supercheckpartial.com (TCP port 80) while `run` reads a live receiver; \
+                 file replay never downloads",
+                "note: [spot].refresh_lists is on but list_cache_dir is unset, so downloaded \
+                 lists are kept in memory only and each restart starts from the built-in copies",
+            ]
+        );
+        // No [server] table: the notes still print.
+        let n = notes_of("[spot]\nrefresh_lists = true\n");
+        assert!(has(&n, HTTP_NOTE) && has(&n, MEMORY_NOTE), "{n:?}");
+        // A cache directory drops the memory-only note.
+        let n = notes_of("[spot]\nrefresh_lists = true\nlist_cache_dir = \"/var/cache/manta\"\n");
+        assert!(has(&n, HTTP_NOTE) && !has(&n, MEMORY_NOTE), "{n:?}");
+        // One mirror for both lists is named once; a non-80 port is shown.
+        let n = notes_of(
+            "[spot]\nrefresh_lists = true\ncty_url = \"http://mirror.lan:8080/cty.dat\"\n\
+             scp_url = \"http://mirror.lan:8080/MASTER.SCP\"\n",
+        );
+        assert!(
+            has(&n, "note: list refresh downloads over plain HTTP from mirror.lan (TCP port 8080) while"),
+            "{n:?}"
+        );
+        let n = notes_of(
+            "[spot]\nrefresh_lists = true\ncty_url = \"http://mirror.lan:8080/cty.dat\"\n",
+        );
+        assert!(
+            has(
+                &n,
+                "note: list refresh downloads over plain HTTP from mirror.lan:8080 and \
+                 www.supercheckpartial.com:80 while"
+            ),
+            "{n:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_on_with_cty_path_notes_cty_is_left_alone() {
+        let n = notes_of("[spot]\nrefresh_lists = true\ncty_path = \"/etc/manta/cty.dat\"\n");
+        assert!(
+            has(
+                &n,
+                "note: cty_path is set, so list refresh leaves cty.dat alone"
+            ),
+            "{n:?}"
+        );
+        // Only MASTER.SCP is downloaded, so only its host is named.
+        assert!(
+            has(
+                &n,
+                "note: list refresh downloads over plain HTTP from www.supercheckpartial.com \
+                 (TCP port 80) while"
+            ),
+            "{n:?}"
+        );
+        assert!(!n.iter().any(|n| n.contains("MASTER.SCP alone")), "{n:?}");
+
+        let n = notes_of(&format!(
+            "[spot]\nrefresh_lists = true\nscp_path = \"/etc/manta/MASTER.SCP\"\n\
+             cty_sha256 = \"{PIN}\"\nscp_sha256 = \"{PIN}\"\n"
+        ));
+        let alone: Vec<&String> = n.iter().filter(|n| n.ends_with(" alone")).collect();
+        assert_eq!(
+            alone,
+            vec![
+                "note: cty_sha256 is set, so list refresh leaves cty.dat alone",
+                "note: scp_path is set, so list refresh leaves MASTER.SCP alone",
+                "note: scp_sha256 is set, so list refresh leaves MASTER.SCP alone",
+            ]
+        );
+        // Nothing is downloaded, so neither the HTTP nor the memory note.
+        assert!(!has(&n, HTTP_NOTE) && !has(&n, MEMORY_NOTE), "{n:?}");
+        // With refresh off, a path or pin is no note at all.
+        let n = notes_of("[spot]\ncty_path = \"/etc/manta/cty.dat\"\n");
+        assert!(!n.iter().any(|n| n.ends_with(" alone")), "{n:?}");
+    }
+
+    #[test]
+    fn a_malformed_pin_is_refused() {
+        let err = format!(
+            "{:#}",
+            load_text("[spot]\nscp_sha256 = \"0069220\"\n").unwrap_err()
+        );
+        assert!(
+            err.ends_with(
+                ": [spot]: scp_sha256 must be 64 hexadecimal digits (a SHA-256), got \"0069220\""
+            ),
+            "{err}"
+        );
+        let err = format!(
+            "{:#}",
+            load_text("[spot]\ncty_url = \"https://www.country-files.com/cty/cty.dat\"\n")
+                .unwrap_err()
+        );
+        assert!(
+            err.ends_with(
+                ": [spot]: cty_url must be an http:// URL (manta has no TLS support), got \
+                 \"https://www.country-files.com/cty/cty.dat\""
+            ),
+            "{err}"
+        );
+    }
+
     #[test]
     fn duplicate_non_zero_server_ports_are_rejected() {
         let l = loaded(
@@ -1434,7 +1671,7 @@ mod tests {
     fn sections() -> Vec<(String, Vec<Setting>)> {
         let mut out: Vec<(String, Vec<Setting>)> = Vec::new();
         let header = regex::Regex::new(r"^#?\[\[?([a-z_]+)\]\]?\s*$").unwrap();
-        let setting = regex::Regex::new(r"^#([a-z_]+) = (.*)$").unwrap();
+        let setting = regex::Regex::new(r"^#([a-z][a-z0-9_]*) = (.*)$").unwrap();
         for (n, l) in SCAFFOLD.lines().enumerate() {
             if let Some(c) = header.captures(l) {
                 out.push((c[1].to_string(), Vec::new()));
@@ -1509,6 +1746,10 @@ mod tests {
         ("spot", "notch_path"),
         ("spot", "cty_path"),
         ("spot", "scp_path"),
+        ("spot", "list_cache_dir"),
+        ("spot", "cty_sha256"),
+        ("spot", "scp_sha256"),
+        ("spot", "pattern_path"),
     ];
 
     /// `Option` keys whose absence means a built-in value: setting them to
@@ -1523,6 +1764,8 @@ mod tests {
         ("server", "json_max_pings_per_ip"),
         ("server", "metrics_max_requests_per_ip"),
         ("input", "freq_correction_ppm"),
+        ("spot", "cty_url"),
+        ("spot", "scp_url"),
     ];
 
     #[test]
@@ -1558,7 +1801,7 @@ mod tests {
             .split_once("expected one of")
             .unwrap_or_else(|| panic!("[{table}]: no key list in {err:?}"))
             .1;
-        let keys: BTreeSet<String> = regex::Regex::new(r"`([a-z_]+)`")
+        let keys: BTreeSet<String> = regex::Regex::new(r"`([a-z][a-z0-9_]*)`")
             .unwrap()
             .captures_iter(list)
             .map(|c| c[1].to_string())
@@ -1704,6 +1947,14 @@ mod tests {
         assert_eq!(ppm.as_float(), Some(0.0));
         let l = loaded("");
         assert_eq!(resolved(&l).freq_correction_ppm, 0.0);
+        // MAN-316: an unset URL is `SpotFile::cty_url()`'s default.
+        let url = |key: &str| scaffold_number("spot", key).as_str().unwrap().to_string();
+        assert_eq!(url("cty_url"), config::DEFAULT_CTY_URL);
+        assert_eq!(url("scp_url"), config::DEFAULT_SCP_URL);
+        assert_eq!(
+            (l.spot.cty_url(), l.spot.scp_url()),
+            (config::DEFAULT_CTY_URL, config::DEFAULT_SCP_URL)
+        );
         // The rate windows the comments quote.
         assert!(
             scaffold_setting("server", "telnet_max_commands_per_ip").contains(&format!(
@@ -1777,7 +2028,9 @@ mod tests {
         let body = format!("[spot]\n{}", uncommented("spot", |_| true));
         let l = loaded(&body);
         assert!(l.spot.blocklist_path.is_some() && l.spot.notch_path.is_some());
-        assert!(l.spot.cty_path.is_some() && l.spot.scp_path.is_some());
+        assert!(
+            l.spot.cty_path.is_some() && l.spot.scp_path.is_some() && l.spot.pattern_path.is_some()
+        );
     }
 
     #[test]

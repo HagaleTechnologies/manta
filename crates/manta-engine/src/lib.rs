@@ -21,6 +21,7 @@ pub use calibrate::{calibrate, CalibrateOptions, CalibrationReport};
 pub mod doctor;
 pub use doctor::{doctor, DoctorReport, Verdict, MAX_DURATION, MIN_DURATION};
 pub mod soak;
+pub use manta_spot::reference::ReferenceLists;
 pub use manta_spot::{Blocklist, NotchList, Spot, SpotType};
 pub use soak::{soak, soak_passed, SoakReport};
 pub mod soak_metrics;
@@ -80,17 +81,6 @@ pub(crate) fn calibrate_freq_events(ev: &DecoderEvent, factor: f64) -> DecoderEv
     }
 }
 
-/// `decode_samples`'s single-track selection: the lowest track_id among
-/// events that represent real decoder output. `TrackPromoted` is a
-/// detector-internal diagnostic signal (added for `manta_engine::doctor()`'s
-/// NoSignal check, see docs/DECISIONS/2026-09-09-doctor-track-promoted-
-/// event.md) with no decoder output of its own -- excluded here so an
-/// early, low-track-id candidate that was promoted and then merged/
-/// evicted/reached EOF before producing any real decoder event never gets
-/// selected over a later track that actually decoded something (round-5
-/// review finding). `None` means every event in `events` was a
-/// `TrackPromoted` (or `events` was empty, already handled by the caller
-/// before this is reached).
 /// The last `TimingUpdate` in `track_events` (one track's events): the
 /// sender timing `DecodeReport::timing` reports (MAN-315).
 fn last_timing(track_events: &[DecoderEvent]) -> Option<TimingEstimates> {
@@ -100,10 +90,29 @@ fn last_timing(track_events: &[DecoderEvent]) -> Option<TimingEstimates> {
     })
 }
 
+/// `decode_samples`'s single-track selection: the lowest track_id among
+/// events that represent real decoder output. `TrackPromoted` is a
+/// detector-internal diagnostic signal (added for `manta_engine::doctor()`'s
+/// NoSignal check, see docs/DECISIONS/2026-09-09-doctor-track-promoted-
+/// event.md) with no decoder output of its own -- excluded here so an
+/// early, low-track-id candidate that was promoted and then merged/
+/// evicted/reached EOF before producing any real decoder event never gets
+/// selected over a later track that actually decoded something (round-5
+/// review finding). `TrackClosed` is bookkeeping, not decoder output,
+/// and is excluded too (MAN-174): a merge survivor that never decoded
+/// still gets its own `TrackClosed`, and must not become the reported
+/// track on that alone. `None` means every event in `events` was a
+/// `TrackPromoted` or `TrackClosed` (or `events` was empty, already
+/// handled by the caller before this is reached).
 fn primary_track_id(events: &[DecoderEvent]) -> Option<u32> {
     events
         .iter()
-        .filter(|e| !matches!(e, DecoderEvent::TrackPromoted { .. }))
+        .filter(|e| {
+            !matches!(
+                e,
+                DecoderEvent::TrackPromoted { .. } | DecoderEvent::TrackClosed { .. }
+            )
+        })
         .map(track::event_track_id)
         .min()
 }
@@ -137,6 +146,10 @@ pub struct PipelineConfig {
     pub cty: Option<Arc<manta_spot::cty::Table>>,
     /// Operator-supplied MASTER.SCP, parsed once. None uses the bundled set.
     pub scp: Option<Arc<manta_spot::scp::Set>>,
+    /// Operator-supplied callsign-pattern table. None uses the bundled list.
+    pub patterns: Option<Arc<manta_spot::pattern::Table>>,
+    /// Repetition thresholds by callsign-pattern rarity.
+    pub validation_level: manta_spot::ValidationLevel,
 }
 
 impl PipelineConfig {
@@ -152,6 +165,12 @@ impl PipelineConfig {
             .clone()
             .unwrap_or_else(|| Arc::new(manta_spot::scp::Set::bundled()))
     }
+    /// The resolved callsign-pattern table.
+    pub fn pattern_table(&self) -> Arc<manta_spot::pattern::Table> {
+        self.patterns
+            .clone()
+            .unwrap_or_else(|| Arc::new(manta_spot::pattern::Table::bundled()))
+    }
     /// Builds the validator used by every production decode path.
     pub fn validator(&self, fs: f64) -> Result<manta_spot::Validator> {
         // Keep the checked ppm constructor so callers cannot supply an
@@ -161,7 +180,9 @@ impl PipelineConfig {
                 .with_freq_correction_ppm(self.freq_correction_ppm)
                 .map_err(|e| anyhow::anyhow!(e))?
                 .with_blocklist(self.blocklist.clone())
-                .with_notch(self.notch.clone());
+                .with_notch(self.notch.clone())
+                .with_patterns(self.pattern_table())
+                .with_validation_level(self.validation_level);
         for call in &self.allowlist {
             validator.allowlist(call);
         }
@@ -180,6 +201,8 @@ impl Default for PipelineConfig {
             notch: NotchList::default(),
             cty: None,
             scp: None,
+            patterns: None,
+            validation_level: manta_spot::ValidationLevel::default(),
         }
     }
 }
@@ -445,6 +468,9 @@ mod tests {
         assert!(!calls(&PipelineConfig::default()).contains(&"QQ9ZZZ".to_string()));
         let cfg = PipelineConfig {
             cty: Some(cty_with_qq9()),
+            patterns: Some(Arc::new(
+                manta_spot::pattern::Table::parse("+QQ9@@@\n").unwrap(),
+            )),
             ..Default::default()
         };
         assert!(
@@ -515,6 +541,21 @@ mod tests {
             },
         ];
         assert_eq!(primary_track_id(&events), Some(2));
+    }
+
+    /// MAN-174: a merge survivor that never decoded still gets its own
+    /// `TrackClosed`. That bookkeeping event must not make it the
+    /// reported track over a higher-id track with real decoder output.
+    #[test]
+    fn primary_track_id_ignores_track_closed() {
+        let events = vec![
+            DecoderEvent::TrackClosed {
+                track_id: 2,
+                closure: manta_decode::events::ClosureKind::SignalEnded,
+            },
+            DecoderEvent::word_boundary(5, 10),
+        ];
+        assert_eq!(primary_track_id(&events), Some(5));
     }
 
     /// MAN-315: `DecodeReport::timing` is the primary track's last

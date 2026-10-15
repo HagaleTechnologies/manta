@@ -54,6 +54,7 @@ pub enum DecoderEvent {
         #[serde(default)]
         sample_ts: u64,
         snr_2500_db: f32,
+        /// The track's centroid at the hop `sample_ts` names (MAN-211).
         freq_hz: f64,
     },
     /// The track's learned sender timing (MAN-315 D8): dot, dash,
@@ -86,8 +87,11 @@ pub enum DecoderEvent {
         freq_hz: f64,
     },
     /// A track has closed (any `CloseReason`: Unconfirmed/HangExpired/
-    /// Silent/Merged/Evicted) and will never emit another event under
-    /// this `track_id` -- `TrackManager::next_id` never reuses one.
+    /// Silent/Merged/Evicted/Rtty) and will never emit another event under
+    /// this `track_id` -- `TrackManager::next_id` never reuses one. The
+    /// normative schema, including both `closure` kinds and when this is
+    /// emitted at all, is SPEC-decode-core.md §5; §6 rule 6 orders a merge
+    /// loser's `TrackClosed` before its survivor's (MAN-174).
     /// MAN-19: added so per-track_id state downstream (`manta-spot`'s
     /// `Validator::tracks`, `RepetitionGate::seen`) has a signal to free
     /// it; without this neither had one, so both grew unboundedly for the
@@ -120,17 +124,18 @@ pub enum DecoderEvent {
 /// positive risk the deferred-judgment design exists to close.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ClosureKind {
-    /// A genuine, observed end of signal: overall stream EOF, a
-    /// sustained observed power drop (`HangExpired`), or no character
-    /// decoded for the GC timeout (`Silent` -- not itself proof the RF
-    /// signal is gone, but by the time `TrackManager::finish` or
-    /// `step_hop`'s closure path fires this reason, no further evidence
-    /// for this exact `track_id` will ever arrive either way).
+    /// A genuine, observed end of signal: overall stream EOF
+    /// (`TrackManager::finish`) or a sustained observed power drop
+    /// (`HangExpired`). Deferred evidence is judged now.
     SignalEnded,
     /// Pure track-bookkeeping, not evidence the signal itself ended. If
     /// `survivor_track_id` is `Some`, this track's identity may continue
-    /// there (`Merged`); if `None`, it simply stopped being tracked with
-    /// no successor (`Evicted`).
+    /// there (`Merged`) and deferred evidence moves to it; if `None`, it
+    /// simply stopped being tracked with no successor (`Evicted`,
+    /// `Silent` -- no character decoded for the GC timeout, which a
+    /// continuous carrier also satisfies, round 10 -- `Rtty`, or a source
+    /// discontinuity, MAN-73) and deferred evidence is discarded and
+    /// counted. See SPEC-decode-core.md §5.
     Bookkeeping { survivor_track_id: Option<u32> },
 }
 

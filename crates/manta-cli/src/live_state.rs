@@ -208,6 +208,8 @@ mod tests {
             verdict: Verdict::Withheld,
             reason: Some(Reason::Repetition),
             reps: Some(1),
+            required_reps: 2,
+            pattern_tier: Some(manta_spot::PatternTier::Common),
             rival: None,
             spot: None,
         });
@@ -215,7 +217,7 @@ mod tests {
             render(&withheld, "W1AW", &bus),
             (
                 "candidateDecision",
-                r#"{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000013,"trackId":1,"call":"W1AW","frequency":14012362,"band":"20m","spotType":"cq","decision":"withheld","reason":"repetition","reps":1,"requiredReps":2,"rival":null,"spotId":null}"#.to_string()
+                r#"{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000013,"trackId":1,"call":"W1AW","frequency":14012362,"band":"20m","spotType":"cq","decision":"withheld","reason":"repetition","reps":1,"requiredReps":2,"patternTier":"common","rival":null,"spotId":null}"#.to_string()
             )
         );
         let closed = LiveRecord::TrackClosed {
@@ -247,6 +249,8 @@ mod tests {
             verdict: Verdict::Spotted,
             reason: None,
             reps: Some(2),
+            required_reps: 2,
+            pattern_tier: Some(manta_spot::PatternTier::Common),
             rival: None,
             spot: Some(s.clone()),
         });

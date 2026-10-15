@@ -68,7 +68,7 @@ in `RUNBOOKS/monitoring/`; see
 
 ## Metric families
 
-All 60 families, in the order `/metrics` renders them. Every family's
+All 63 families, in the order `/metrics` renders them. Every family's
 `# HELP` and `# TYPE` lines are always rendered, except two groups at the
 end of the table: the ten RBN comparison families (MAN-301), rendered only
 when `[rbn_compare]` is enabled, and the three live-state families
@@ -100,6 +100,9 @@ missing series as "no loss" or "no traffic".
 | `manta_input_dropped_packets_total` | counter | `source` | Input packets estimated lost in transit before reaching the decoder. | HPSDR, KiwiSDR and ka9q-radio sources only: from startup at 0, sampled every second, summed across reconnects. Other sources (file, audio, SoapySDR) show the `# TYPE` line but no samples: absent, not zero. |
 | `manta_input_gaps_detected_total` | counter | `source` | Distinct input-stream gap events detected. One gap may account for several dropped packets. | HPSDR, KiwiSDR and ka9q-radio sources only, as for `manta_input_dropped_packets_total`. Other sources: absent, not zero. |
 | `manta_input_malformed_packets_total` | counter | `source` | Input datagrams discarded as malformed: wrong length, or correct length but failed framing or sync validation (MAN-22). | HPSDR, KiwiSDR and ka9q-radio sources only, as for `manta_input_dropped_packets_total`. Other sources: absent, not zero. |
+| `manta_list_info` | gauge | `list`, `sha256`, `origin` | Always 1. Names the reference list each consumer uses now: `list` is `cty` or `scp`; `sha256` is the SHA-256 of its bytes; `origin` is `bundled`, `file`, `cache` or `download`. A swap replaces the series. | Always with `[server]`; one series per list. |
+| `manta_list_refresh_total` | counter | `list`, `outcome` | Download attempts by outcome: `updated` (a new version passed the checks and is in use), `unchanged` (304, or the same bytes), `failed` (network or HTTP error, or rejected by the checks). | With `refresh_lists` on, for each list the refresher manages; all three outcomes start at 0. No samples otherwise. |
+| `manta_list_last_success_timestamp_seconds` | gauge | `list` | Unix time manta last confirmed the list in use is current with its URL (an `updated` or `unchanged` attempt, or the cache's `checked_at` at startup). Alert on `time() - manta_list_last_success_timestamp_seconds{list="cty"} > 8*86400`. | With `refresh_lists` on, once the list has been confirmed at least once. Absent means never confirmed. |
 | `manta_uplink_sent_total` | counter | — | Spots forwarded to RBN uplink targets; the sum over every configured target. | Always, one series. Stays 0 with no `[[rbn_uplink]]` configured. |
 | `manta_uplink_suppressed_total` | counter | — | Spots not sent to an RBN uplink target because of `dry_run` or its `spot_types` setting; the sum over every configured target. | Always, one series. Stays 0 with no `[[rbn_uplink]]` configured. |
 | `manta_uplink_ceiling_suppressed_total` | counter | — | Spots not sent to an RBN uplink target because its `max_spots_per_minute` ceiling was reached; the sum over every configured target. | Always, one series. Stays 0 with no `[[rbn_uplink]]` configured. |
@@ -125,7 +128,7 @@ missing series as "no loss" or "no traffic".
 | `manta_decode_chars_total` | counter | — | Characters decoded across every track (`CharDecoded` events). The denominator for the garble rate below. | From startup at 0: the daemon publishes it just before the decode loop starts, then refreshes it every 250 ms with `manta_decode_latency_seconds`. |
 | `manta_decode_garbles_total` | counter | — | Characters the decoder could not match to any Morse character (every beam branch rejected the marks), across every track. Engines `legacy` and `edge-legacy` produce garbles; `hsmm` never does. Rare on a healthy node: the beam usually commits a wrong character instead (V8w: 3 garbles in 9,690 characters), so read a sudden rise as a fault. See [MAN-118](DECISIONS/2026-10-12-man118-decode-quality-metrics.md). | As `manta_decode_chars_total`. |
 | `manta_track_rail_ratio` | histogram | `le` | Keying-rail ratio (mark rail / space rail amplitude) of each decoding track, sampled once per second per track at the same hop `TrackMeta` reports on. Deep, clean keying reads high (V1: median 22); fading or QRM eating the keying depth pulls it toward 2, the floor the rails collapse to (V5's CCIR-poor fading: median 3.3). `le="2"` counts samples at that floor. Buckets: 2, 2.5, 3, 4, 6, 10, 16, 25, 40, 63 and `+Inf`, plus `_sum` and `_count`. `legacy` engine only. No `track_id` label: each observation is one track's value. | As `manta_decode_chars_total`. Buckets stay at 0 until a track's rails initialise, and always under `[decode] engine = "edge-legacy"` or `"hsmm"`, which have no keying rails. |
-| `manta_candidate_repetitions` | histogram | `le` | One observation per callsign candidate the repetition gate scored: how many message-distinct decodes of that call near that frequency it had seen within the trailing 90 s, this one included. A candidate needs 2 to spot, so the `le="1"` share is the share of candidates nobody repeated (a busted-call proxy). Buckets: 1, 2, 3, 4, 5, 6, 8, 10, 15, 20 and `+Inf`, plus `_sum` and `_count`. | As `manta_decode_chars_total`. |
+| `manta_candidate_repetitions` | histogram | `le` | One observation per callsign candidate the repetition gate scored: how many message-distinct decodes of that call near that frequency it had seen within the trailing 90 s, this one included. A candidate needs 2, 3 or 5 to spot by its callsign-pattern tier (2 for every call at validation_level minimal), so the `le="1"` share is the share of candidates nobody repeated (a busted-call proxy). Buckets: 1, 2, 3, 4, 5, 6, 8, 10, 15, 20 and `+Inf`, plus `_sum` and `_count`. | As `manta_decode_chars_total`. |
 | `manta_healthy` | gauge | — | Whether `/healthz` currently reports this node healthy (1) or not (0). Same evaluation as `/healthz`. | Always. |
 | `manta_listener_up` | gauge | `listener` | Whether each listener is currently up (1) or down (0). `listener` is `telnet`, `json`, `metrics`, or `live` for the live-state stream. | One series per listener once the listeners have started; a listener whose task ends reads 0. The `live` series is registered only when `[server].live_port` is set. |
 | `manta_rbn_compare_grades_total` | counter | `band`, `grade` | Spots graded against the RBN feed since start, by the spot's band and grade (`match`, `disagree`, `elsewhere`, `none`, `unknown`). | Only with `[rbn_compare]` enabled: the family's `# HELP`/`# TYPE` lines are absent otherwise. One series per (band, grade) pair after its first grade. |
@@ -299,6 +302,8 @@ For what each uplink state means and what to do about it, see
   source outage counters.
 - [MAN-132](DECISIONS/2026-10-08-man132-metrics-loopback-bind.md): the
   loopback default for `metrics_bind_addr`.
+- [MAN-316](DECISIONS/2026-10-12-man316-reference-list-refresh.md): the
+  reference-list families.
 - [MAN-301](DECISIONS/2026-10-11-man301-live-rbn-comparison.md): the
   RBN comparison families.
 - [MAN-324](DECISIONS/2026-10-12-man324-live-state-stream.md): the

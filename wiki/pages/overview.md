@@ -10,8 +10,8 @@ sources:
   - ROADMAP.md
   - CLAUDE.md
 verified:
-  commit: 23b0dd0
-  date: 2026-10-02
+  commit: d286147
+  date: 2026-10-13
 links:
   - pfb-channelizer
   - decode-chain

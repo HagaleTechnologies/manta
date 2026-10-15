@@ -349,6 +349,9 @@ fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<Str
         notch: _,
         cty: _,
         scp: _,
+        cty_sha256: _,
+        scp_sha256: _,
+        patterns: _,
         // Exempt: RBN comparison grades spots after decoding, not the
         // input (calibrate has no --rbn-compare/--rbn-spotter flags).
         rbn: _,
@@ -831,7 +834,15 @@ mod tests {
             dial_freq_hz: Some(7_000_000.0),
             capture_rate_hz: None,
             replay_epoch: None,
-            spot: crate::resolve_spot(Vec::new(), None, None, None, None, &Default::default()),
+            spot: crate::resolve_spot(
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                &Default::default(),
+            ),
             rbn_compare: None,
             notes: Vec::new(),
             replaced_file_source: None,
