@@ -24,6 +24,9 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-234: an input sample that is NaN, infinite or larger than 1e17 in
+  magnitude is replaced with silence and counted instead of ending the run
+  (exit 101) or silencing it; clean input decodes byte-identically.
 - MAN-174: a deferred Beacon candidate on a track that merged into another
   track which closed in the same batch now resolves at the final survivor's
   close instead of being lost; one whose timestamp equals an existing
@@ -52,9 +55,26 @@ the git history and `docs/DECISIONS/`.
   lengths. Gaps are measured against the sender's dit, and the word
   boundary is the sender's own, so letter gaps up to about 4.5 dits no
   longer split words. Dashes up to 6 dots long are accepted (was 4.5).
+- MAN-313: noise-like wideband data and swept carriers start no CW track,
+  SSB voice starts far fewer (7 in band against 81 at +30 dB with the
+  testkit voice, none spotted), and a track that stops keying closes 10 s after its last
+  key-down edge unless a callsign was read. A new track is decoded only
+  once it shows CW keying, so its `TrackPromoted` arrives 0.5–1.5 s of
+  stream later, with the same `sample_ts`; decoded text and spots are
+  unchanged on the golden vectors. `manta decode` on a non-empty input with
+  no keyed CW now fails with `no signal found (no keyed CW signal in the
+  input)`. `manta_active_tracks` counts only keyed CW tracks.
+  `[detector] non_cw_filter = false` restores the previous behaviour.
 
 ### Added
 
+- MAN-234: a `bad_samples` field in `decode --json`, `doctor --json` and
+  `calibrate --json` (omitted when 0); a `warning: … bad sample(s) …`
+  stderr line from `decode`, `calibrate` and `run`/`listen` (at the first
+  bad sample, plus a total at the end if more followed); an `input: N bad
+  sample(s) … replaced with silence` line in the `doctor` and `soak`
+  reports; and the `manta_input_bad_samples_total{source}` counter, at 0
+  from startup with a `[server]` table.
 - MAN-315: a `TimingUpdate` event per track (each class's mean, variance
   and count, in dits), a top-level `timing` object in `decode --json`, and
   `manta decode --timing` for a `timing (dits, mean ± sd): …` stderr line.
@@ -80,6 +100,11 @@ the git history and `docs/DECISIONS/`.
   `manta_live_records_dropped_total{reason}` and
   `manta_listener_up{listener="live"}` when it is on. Spot output is
   unchanged. See `docs/LIVE-STATE.md` (MAN-324).
+- `[detector] non_cw_filter` (default `true`) and `unkeyed_close_ms`
+  (default 10000, at least 1000), also as `MANTA_DETECTOR_NON_CW_FILTER`/
+  `MANTA_DETECTOR_UNKEYED_CLOSE_MS`; a `NOT_CW` verdict and a
+  `detector_confirmations` count in `manta doctor` for a band with signals
+  but no keyed CW (MAN-313).
 - A Grafana dashboard (spot rate, active tracks, source health, per-target
   uplink status) and Prometheus alert rules (node down, node unhealthy, no
   spots for 30 minutes, uplink target down or flapping) for a node's

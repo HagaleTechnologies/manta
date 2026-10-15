@@ -166,6 +166,15 @@ MAN-314: RTTY (two-tone FSK) is recognised after `[detector] rtty_dwell_ms`
 marks/clears and `/metrics` gains `manta_rtty_signals{band}`. See
 docs/DECISIONS/2026-10-11-man314-rtty-recognition.md.
 
+MAN-313: with `[detector] non_cw_filter` (default on) a promoted track
+leases a decoder and emits `TrackPromoted` only once it qualifies as keyed
+CW, so noise-like data and swept carriers start no CW track and SSB
+voice starts far fewer (`manta-dsp::comod`, SPEC §2.8; a residual of 7
+in-band tracks at +30 dB with the testkit voice, none spotted, is
+MAN-372); a track key-down for `unkeyed_close_ms`
+(10 s) with no callsign read closes `Unkeyed`; doctor gains `NOT_CW`. See
+docs/DECISIONS/2026-10-13-man313-non-cw-rejection.md.
+
 MAN-301: `[rbn_compare]` (off by default, needs `[server]`) reads RBN's
 CW telnet feed read-only (login callsign only) and grades each spot
 `match`/`disagree`/`elsewhere`/`none`/`unknown` after a 180 s window, as a
@@ -220,9 +229,10 @@ MAN-156: CI denies rustdoc warnings (`RUSTDOCFLAGS=-D warnings cargo doc
 --no-deps --workspace --locked` in `test (ubuntu-latest)`; `manta-cli`'s
 clap help text is exempt). The "Supply Chain" check runs `cargo deny
 --locked check` against `deny.toml` (advisories, licenses, bans, sources;
-also daily on main). Trusted PRs get a non-required `test (windows-latest)`
-check-run. `release-publish.yml` refuses a tag whose CI push run failed any
-test leg. The `PR title` check requires a Conventional Commits title. See
+also daily on main). Trusted PRs get a `test (windows-latest)` check-run
+(required once MAN-371's owner step O1 is applied). `release-publish.yml`
+refuses a tag whose CI push run failed any test leg. The `PR title` check
+requires a Conventional Commits title. See
 docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md.
 
 MAN-315: the legacy decoder learns per-track dot/dash/gap timing
@@ -233,6 +243,16 @@ and the dash/dot ceiling is 6.0. VW1–VW5 (SPEC §7.3, `golden_vw.rs`)
 pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
 planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.
+
+MAN-248: each `[[rbn_uplink]]` target enforces
+`max_spots_per_minute` (default `600`, `0` disables) on spots written to
+the wire, via the existing `RateLimiter` owned above the reconnect loop;
+over-budget spots are counted in
+`manta_uplink_ceiling_suppressed_total` /
+`manta_uplink_target_ceiling_suppressed_total{target}` and skipped with
+the connection left up (dry-run spots consume no budget; restart-only).
+The owner's measured-peak-rate gate on the default stays open — see
+docs/DECISIONS/2026-10-14-man248-uplink-forwarding-ceiling.md.
 
 MAN-174: within a `process_hops` batch a merge loser's `TrackClosed`
 precedes its survivor's, and a merge survivor that never emitted still
@@ -259,10 +279,50 @@ replaced by `--patterns` / `[spot].pattern_path`; allowlist and beacon
 exemptions stay. Live decisions report `requiredReps` and `patternTier`.
 See docs/DECISIONS/2026-10-14-man95-pattern-rarity-repetition-tiers.md.
 
+MAN-196: a decimated capture advertises and enforces the decimator's
+trusted band (`manta-dsp::decimate::TRUSTED_HALF_BAND_FRACTION = 0.4526`
+of fs_out, the <= 1 dB crossover): `DecimatingSource::rf_passband_hz`
+narrows `manta check`/SETT/bandState/crash live set to it, `run`/`soak`
+print one startup line, and the track manager's spawn scan vetoes
+channels beyond it (spawns only — MAN-314's lesson), via
+`IqSource::trusted_band_hz` threaded through `listen` and
+`soak_with_metrics` (every wrapper
+forwards it, doctor's `SampleBoundedSource` included). Rim channels
+232-255 per side at 48 kS/s are conceded by design; non-decimated sources
+are bit-identical to before. Aliases folding *inside* the trusted band
+(input frequencies >= fs_out - trusted) are stopband-only: held at
+>= 80 dB (measured >= ~-86.5 dB), so a carrier at <= -40 dBFS above
+Nyquist promotes nothing, but a stronger one can still mirror in digital
+silence — a pinned residual; deepening the stopband is a decision ticket.
+See docs/DECISIONS/2026-10-14-man196-decimator-trusted-band.md.
 MAN-210: golden vector V51 (V9's drift scene, `refine_bw_hz = 30` via
 `--config`) exercises the narrowband refiner's refine-enabled path
 end-to-end through `manta decode --json` — the evidence any future
 default-on change must keep green.
+
+MAN-189: the HSMM decoder no longer re-emits a committed character under
+a different closing anchor. `commit::Frontier` (each entry's character
+start against the latest emitted timestamp) replaces `sealed`. V7/hsmm
+and V8/hsmm now pass, and V5/VR5/VR6a/VR8 CER improve. See
+docs/DECISIONS/2026-10-13-man189-hsmm-commit-frontier.md.
+
+MAN-371: `ci-full.yml` creates all three `test (...)` check-runs on a
+trusted PR's head fail-closed, and tests that need several free ports
+hold every listener until all are read (`free_ports::<N>()`). Adding
+`test (windows-latest)` to `main-protection` is owner step O1, followed
+by a 20-run merge-queue watch with rollback triggers;
+`test-hpsdr (windows-latest)` stays advisory. See
+docs/DECISIONS/2026-10-15-man371-windows-required-check.md.
+
+MAN-234: an input sample with a NaN, infinite or larger-than-1e17
+component (`manta-dsp::sample_guard::MAX_SAMPLE_MAGNITUDE`) is replaced
+with `0+0j` and counted in `Channelizer::process` (SPEC §1.3 step 0;
+`calibrate` guards its own buffer), so it no longer panics or deafens
+`decode`/`run`/`doctor`. Reported as `bad_samples` in `decode`/`doctor`/
+`calibrate --json` (omitted when 0), stderr warnings, a `doctor`/`soak`
+report line and `manta_input_bad_samples_total{source}`; `manta check`
+still errors on non-finite input. See
+docs/DECISIONS/2026-10-15-man234-bad-input-samples.md.
 
 MAN-232: `run`/`listen`, `decode`, `doctor`, `oracle`, `soak` and
 `status` never panic on a failed stdout/stderr write
