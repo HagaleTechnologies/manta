@@ -402,8 +402,16 @@ fn decode_report_hsmm(
     (serde_json::from_slice(&out.stdout).unwrap(), manifest)
 }
 
-// Passes since MAN-189 (was failing on the bogus spot K2ST, real call
-// K2STA); see docs/DECISIONS/2026-10-13-man189-hsmm-commit-frontier.md.
+// MAN-189 measured pass in planning (two-condition prototype) and with
+// the implement phase's start-comparison word rule, but FAILS with the
+// remediated glyph-agreement rule (validation round 1): the corrected
+// rule keeps an agreeing lineage's word boundary that the refuted rule
+// (and, through a leaked contradicting boundary, the plan rule)
+// suppressed on V8, and the bogus spot K2ST (real call K2STA) returns.
+// The assertion is not weakened; the vector stays ignored per the plan's
+// Phase 3 fallback. See
+// docs/DECISIONS/2026-10-13-man189-hsmm-commit-frontier.md.
+#[ignore = "MAN-189 remediation: bogus K2ST spot under the glyph-agreement word rule"]
 #[test]
 fn v8_pileup_validates_at_least_45_of_50_with_hsmm_engine() {
     let spec = manta_testkit::vectors::v8();

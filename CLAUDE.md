@@ -225,13 +225,6 @@ check-run. `release-publish.yml` refuses a tag whose CI push run failed any
 test leg. The `PR title` check requires a Conventional Commits title. See
 docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md.
 
-<<<<<<< HEAD
-MAN-189: the HSMM decoder no longer re-emits a committed character under
-a different closing anchor. `commit::Frontier` (each entry's character
-start against the latest emitted timestamp) replaces `sealed`. V7/hsmm
-and V8/hsmm now pass, and V5/VR5/VR6a/VR8 CER improve. See
-docs/DECISIONS/2026-10-13-man189-hsmm-commit-frontier.md.
-=======
 MAN-315: the legacy decoder learns per-track dot/dash/gap timing
 (`SenderTiming`, SPEC §4.1b; `TimingUpdate` event, `decode --json`
 `timing`, a `decode --timing` stderr line); gaps are measured in the
@@ -270,7 +263,16 @@ MAN-210: golden vector V51 (V9's drift scene, `refine_bw_hz = 30` via
 `--config`) exercises the narrowband refiner's refine-enabled path
 end-to-end through `manta decode --json` — the evidence any future
 default-on change must keep green.
->>>>>>> 3805f78bcb1b166f1eba98448d62db98addb201c
+
+MAN-189: the HSMM decoder no longer re-emits a committed character under
+a different closing anchor. `commit::Frontier` (each entry's character
+start against the latest emitted timestamp) replaces `sealed`, and a
+word boundary is only ever retired together with a stripped
+contradicting character, never for a lineage that agrees on the glyph.
+V7/hsmm now passes, and V5/VR5/VR6a/VR8 CER improve; V8/hsmm is back to
+ignored under the corrected word rule (bogus `K2ST` spot), per the plan's
+Phase 3 fallback. See
+docs/DECISIONS/2026-10-13-man189-hsmm-commit-frontier.md.
 
 ## Documents (read in this order)
 

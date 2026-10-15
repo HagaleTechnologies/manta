@@ -316,12 +316,15 @@ After pruning at anchor `t`:
   start of its character's first mark. An entry is removed without
   emission when its character began at or before the latest emitted
   entry's `sample_ts`, or, for a `Word` entry, when a `Word` was already
-  emitted at or after its character's start, its gap began before the
-  latest emitted entry, or its character began at or before the latest
-  emitted entry's `sample_ts` at a different start from the latest
-  emitted character's. This is checked before the consensus and forced
-  rules and again after every emission, and by `finish()` (§4.10).
-  Emitted `sample_ts` therefore never decreases within a track.
+  emitted at or after its character's start, or its gap began before the
+  latest emitted entry. A character removed this way that carries a
+  different glyph from the latest emitted character is a rejected
+  contradiction, and the `Word` entry its own closing transition appended
+  is removed with it; a lineage that agrees on the glyph keeps its
+  boundary wherever it placed the character's start and close. This is
+  checked before the consensus and forced rules and again after every
+  emission, and by `finish()` (§4.10). Emitted `sample_ts` therefore
+  never decreases within a track.
 - A `Glyph` entry emits `CharDecoded { sample_ts = start of the closing
   space segment, glyph, confidence, alternatives }`; a `Word` entry emits
   `WordBoundary { sample_ts = start of the word gap, confidence }` (v1

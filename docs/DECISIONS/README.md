@@ -11,9 +11,6 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
-<<<<<<< HEAD
-| 2026-10-13 | MAN-189 | [MAN-189: the HSMM decoder commits each stretch of time once](2026-10-13-man189-hsmm-commit-frontier.md) |
-=======
 | 2026-10-14 | MAN-211 | [MAN-211: TrackMeta's frequency is captured per queued hop, like its SNR](2026-10-14-man211-trackmeta-freq-per-hop.md) |
 | 2026-10-14 | MAN-197 | [MAN-197: a live track's input selection also skips cooling-down channels](2026-10-14-man197-live-window-cooldown-enforcement.md) |
 | 2026-10-14 | MAN-197 | [MAN-197: the respawn cooldown gates a spawn candidate's whole ownership window](2026-10-14-man197-respawn-cooldown-ownership-window.md) |
@@ -23,7 +20,7 @@ Add a row here in the same change that adds a record:
 | 2026-10-14 | MAN-95 | [MAN-95: callsign-pattern rarity sets the repetition requirement](2026-10-14-man95-pattern-rarity-repetition-tiers.md) |
 | 2026-10-13 | MAN-140 | [MAN-140: a ka9q-radio (radiod) multicast IQ input](2026-10-13-man140-ka9q-radio-input.md) |
 | 2026-10-13 | MAN-152 | [MAN-152: the in-repo wiki is canonical; disabling GitHub's Wiki is pending](2026-10-13-man152-one-wiki.md) |
->>>>>>> 3805f78bcb1b166f1eba98448d62db98addb201c
+| 2026-10-13 | MAN-189 | [MAN-189: the HSMM decoder commits each stretch of time once](2026-10-13-man189-hsmm-commit-frontier.md) |
 | 2026-10-13 | MAN-156 | [MAN-156: CI catches dependency, rustdoc, Windows-release and PR-title regressions](2026-10-13-man156-ci-regression-gates.md) |
 | 2026-10-13 | MAN-133 | [MAN-133: shell completions and a man page for the manta CLI](2026-10-13-man133-shell-completions-and-man-pages.md) |
 | 2026-10-13 | MAN-312 | [MAN-312: band-wide static crashes start no tracks and are not decoded](2026-10-13-man312-static-crash-filter.md) |

@@ -277,20 +277,11 @@ impl HsmmDecoder {
             merged.push(c);
         }
         merged.truncate(self.cfg.beam);
-<<<<<<< HEAD
-        // Commit consensus / forced entries.
-        out.extend(commit::commit(
-            &mut merged,
-            ev.hop,
-            &self.cfg,
-            &mut self.frontier,
-        ));
-=======
         // Commit consensus / forced entries. MAN-192: the internal helper
         // also reports whether this step emitted a winning word-boundary
         // head closed by `Silence` -- SPEC v2 §4.7's second seeding
         // trigger, beside the gate rise above.
-        let outcome = commit::commit_outcome(&mut merged, ev.hop, &self.cfg, &mut self.sealed);
+        let outcome = commit::commit_outcome(&mut merged, ev.hop, &self.cfg, &mut self.frontier);
         out.extend(outcome.entries);
         self.scored_live_len = merged.len();
         if outcome.committed_silence && ev.present {
@@ -321,7 +312,6 @@ impl HsmmDecoder {
             }
             merged.extend(self.seed(ev.hop));
         }
->>>>>>> 3805f78bcb1b166f1eba98448d62db98addb201c
         self.live = merged.clone();
         // The just-pushed anchor is always age 0 relative to `ev.hop`, so
         // it can never itself need pruning here -- the age-based prune
@@ -357,11 +347,13 @@ impl HsmmDecoder {
         // anchor snapshot can't resurface an already-emitted entry here.
         // Decided entries form a prefix (see `commit::commit`), but this
         // check runs only once before reading the WHOLE history (Codex
-        // review, PR #161 round 7), so `retain` keeps it from depending
-        // on that proof.
+        // review, PR #161 round 7), so `retain_undecided` -- the
+        // whole-history strip that also retires a contradicting
+        // character's own boundary -- keeps it from depending on that
+        // proof.
         let frontier = self.frontier;
         for t in self.live.iter_mut() {
-            t.hist.retain(|e| !frontier.is_decided(e));
+            frontier.retain_undecided(&mut t.hist);
         }
         self.live.sort_by(token_order);
         let best = self.live[0].clone();
@@ -400,6 +392,7 @@ impl HsmmDecoder {
                     sample_ts: self.last_ts,
                     born_hop: self.hop,
                     char_start_ts: best.char_start_ts,
+                    closing_segment: None,
                 };
                 if !self.frontier.is_decided(&tail) {
                     self.frontier.advance(&tail);
@@ -533,7 +526,6 @@ mod tests {
             phase: Phase::AfterSpace,
             u: 13.0,
             score: 1.0,
-<<<<<<< HEAD
             hist,
             anchor_hop: 10,
             char_start_ts: 0,
@@ -546,6 +538,7 @@ mod tests {
             sample_ts,
             born_hop: 10,
             char_start_ts,
+            closing_segment: None,
         }
     }
 
@@ -571,25 +564,7 @@ mod tests {
             char_entry('B', 160, 205),
             char_entry('C', 240, 300),
         ])];
-=======
-            hist: vec![
-                token::HistEntry {
-                    glyph: Some(Glyph::Char('A')),
-                    sample_ts: 100,
-                    born_hop: 5,
-                    closing_segment: None,
-                },
-                token::HistEntry {
-                    glyph: Some(Glyph::Char('B')),
-                    sample_ts: 200,
-                    born_hop: 10,
-                    closing_segment: None,
-                },
-            ],
-            anchor_hop: 10,
-        }];
         dec.scored_live_len = dec.live.len(); // MAN-192: the fixture's live is all scored
->>>>>>> 3805f78bcb1b166f1eba98448d62db98addb201c
         let out = dec.finish();
         let got: Vec<_> = out.iter().map(|c| (c.glyph, c.sample_ts)).collect();
         assert_eq!(got, vec![(Some(Glyph::Char('C')), 300)], "{out:?}");
@@ -612,6 +587,7 @@ mod tests {
                 char_start_ts,
                 ..live_token(Vec::new())
             }];
+            dec.scored_live_len = dec.live.len(); // MAN-192: fixture live is scored
             dec.finish()
         };
         let out = run(180);
@@ -633,21 +609,15 @@ mod tests {
                 glyph: Some(Glyph::Char('A')),
                 sample_ts: 100,
                 born_hop: 1,
-<<<<<<< HEAD
                 char_start_ts: 0,
-=======
                 closing_segment: None,
->>>>>>> 3805f78bcb1b166f1eba98448d62db98addb201c
             },
             token::HistEntry {
                 glyph: Some(Glyph::Char('B')),
                 sample_ts: 200,
                 born_hop: 2,
-<<<<<<< HEAD
                 char_start_ts: 150,
-=======
                 closing_segment: None,
->>>>>>> 3805f78bcb1b166f1eba98448d62db98addb201c
             },
         ];
         let best_token = |hist: Vec<token::HistEntry>| Token {
@@ -677,11 +647,8 @@ mod tests {
                     glyph: Some(Glyph::Char('C')), // disagrees at entry 0 only
                     sample_ts: 100,
                     born_hop: 1,
-<<<<<<< HEAD
                     char_start_ts: 0,
-=======
                     closing_segment: None,
->>>>>>> 3805f78bcb1b166f1eba98448d62db98addb201c
                 }],
                 anchor_hop: 1,
                 char_start_ts: 0,
@@ -939,6 +906,7 @@ mod tests {
                 score: 0.0,
                 hist: Vec::new(),
                 anchor_hop: 250,
+                char_start_ts: 0,
             },
             Token {
                 node: MorseTree::ROOT,
@@ -949,9 +917,11 @@ mod tests {
                     glyph: Some(Glyph::Char('E')),
                     sample_ts: 28_928,
                     born_hop: 250,
+                    char_start_ts: 0,
                     closing_segment: Some(SegType::Silence),
                 }],
                 anchor_hop: 250,
+                char_start_ts: 0,
             },
         ];
         dec.scored_live_len = 2;
@@ -982,9 +952,11 @@ mod tests {
                 glyph: Some(Glyph::Char('E')),
                 sample_ts: 100,
                 born_hop: 5,
+                char_start_ts: 0,
                 closing_segment: Some(SegType::CGap),
             }],
             anchor_hop: 5,
+            char_start_ts: 0,
         };
         // Scored-only control.
         let mut control = HsmmDecoder::new(HsmmConfig::default());

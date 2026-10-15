@@ -11,28 +11,33 @@ Each history entry (`token::HistEntry`) also records `char_start_ts`, the
 input sample counter at the anchor where its character's first mark
 began; a word boundary carries the character it follows. A
 `commit::Frontier` holds the latest emitted `sample_ts` (`last_ts`), the
-latest emitted word-boundary `sample_ts` (`last_word_ts`) and the latest
-emitted character's `char_start_ts` (`last_char_start`):
+latest emitted word-boundary `sample_ts` (`last_word_ts`) and the glyph
+of the latest emitted character (`last_glyph`):
 
 - **Character entry:** decided if `char_start_ts <= last_ts`.
 - **Word boundary entry:** decided if `char_start_ts <= last_word_ts`,
   meaning a boundary was already emitted at or after its character began,
   *or* if `sample_ts < last_ts`, meaning its gap began before something
-  already emitted, *or* if `char_start_ts <= last_ts` and
-  `char_start_ts != last_char_start`, meaning its character is decided
-  but is not the character last emitted, so the boundary follows a
-  contradicting segmentation.
+  already emitted.
+- **A contradicting character's boundary:** a character entry that is
+  decided *and* carries a different glyph from `last_glyph` is a
+  reading the decoder already rejected; the word boundary its own
+  closing transition appended is removed together with it, so a rejected
+  segmentation cannot leave a bogus space behind. A lineage that agrees
+  on the glyph never loses its boundary, whatever start or close it
+  placed the character at.
 - **Emitting:** `last_ts = max(last_ts, sample_ts)`; for a word boundary,
   also `last_word_ts = max(last_word_ts, sample_ts)`; for a character,
-  `last_char_start = char_start_ts`.
+  `last_glyph = its glyph`.
 
-`commit::commit()` strips decided entries from the front of every token
-at the top of each loop iteration. `finish()` removes them from every
-live token with `retain`, and emits its unclosed `AfterMark` tail glyph
-only when the frontier does not call that character decided. Character
-starts strictly increase along a token's `hist`, and a word boundary
-shares its character's start and closing time, so decided entries always
-form a prefix of a token's `hist`.
+`commit::commit()` strips the decided prefix of every token at the top
+of each loop iteration (`Frontier::strip_decided_prefix`). `finish()`
+removes every decided entry from every live token
+(`Frontier::retain_undecided`, the same pairing), and emits its unclosed
+`AfterMark` tail glyph only when the frontier does not call that
+character decided. Character starts strictly increase along a token's
+`hist`, and a word boundary shares its character's start and closing
+time, so decided entries always form a prefix of a token's `hist`.
 
 Consequences, each pinned by a unit test in `hsmm::commit::tests` or
 `hsmm::tests`:
@@ -46,19 +51,28 @@ Consequences, each pinned by a unit test in `hsmm::commit::tests` or
 4. A conflicting segmentation that ends before the committed close is
    stripped (the out-of-order `T@1611 after B@1795` class).
 5. A word boundary at the same gap as an emitted character, from the WGap
-   lineage after the CGap lineage won, is still emitted once.
+   lineage after the CGap lineage won, is still emitted once -- including
+   when that agreeing lineage placed the character's first mark at a
+   different anchor than the winner did.
 6. A second word boundary for the same character is stripped.
 7. A late word boundary behind a later character is stripped.
 8. Output `sample_ts` never decreases within a track.
 9. A word boundary that follows a stripped, contradicting character is
-   stripped too. Otherwise it would emit a space and move `last_ts` past
+   stripped with it. Otherwise it would emit a space and move `last_ts` past
    the real next character, which would then be dropped as decided.
 
-Rule 9's `last_char_start` condition was added in the implement phase
-after self-review found the leak; the plan's rule had only the first two
-word-boundary conditions. Re-measured on the implement build, it removes
-5 spurious word boundaries from V5 (CER 1.1771 → 1.1406) and leaves the
-decoded text of the other 14 vectors unchanged.
+The implement phase first added rule 9 as a third word-boundary condition
+in `Frontier::is_decided` that compared starts: decided when
+`char_start_ts != last_char_start`. Validation (round 1) refuted that
+form: a lineage that *agrees* on the emitted glyph but started its first
+mark at another anchor also has a differing start, so the rule swallowed
+its boundary too and two words merged in the decoded text (consequence 5
+broken). The rule now reads glyph agreement instead: the contradicting
+*character* is recognized by its different glyph over emitted time and
+removed together with its own boundary, while an agreeing lineage keeps
+its boundary under the two word conditions above. This also catches a
+contradiction that happens to share the emitted character's start, which
+the start-comparison form missed.
 
 ## Mechanism and evidence
 
@@ -114,11 +128,23 @@ the track nearest each expected frequency):
 | VR8 | 0.6687 | 0.5604 | 316→289 |
 
 No vector got worse. `v7_passes_end_to_end_with_hsmm_engine` (was CER
-0.0540, `N2BBB`; the stage-2 record's "0.004 near-miss") and
-`v8_pileup_validates_at_least_45_of_50_with_hsmm_engine` (was failing on
-the bogus spot `K2ST`, real call `K2STA`) now pass and are no longer
-ignored. `crates/manta-cli/tests/hsmm_commit_order.rs` checks the
-observable invariant on VR6a and V7.
+0.0540, `N2BBB`; the stage-2 record's "0.004 near-miss") now passes and
+is no longer ignored. `crates/manta-cli/tests/hsmm_commit_order.rs`
+checks the observable invariant on VR6a and V7.
+
+`v8_pileup_validates_at_least_45_of_50_with_hsmm_engine` was un-ignored
+by the implement phase (which measured it passing with the
+start-comparison rule) and is back to `#[ignore]` under the remediated
+glyph-agreement rule: the corrected rule keeps an agreeing lineage's word
+boundary that the refuted rule -- and, through a leaked contradicting
+boundary's frontier advance, the plan's two-condition rule -- suppressed
+on V8, so the bogus spot `K2ST` (real call `K2STA`) returns. The plan's
+Phase 3 fallback prescribes exactly this: keep the vector ignored, do
+not weaken the assertion. The same paragraph measures the V5 golden at
+CER 1.4844 (plan two-condition rule), 1.4219 (glyph-agreement rule) and
+1.3073 (refuted start-comparison rule) on the post-MAN-192 tree -- the
+glyph-agreement rule does not regress word spacing against the plan's
+rule, which was validation round 1's acceptance question.
 
 HSMM JSON bytes change even where the text is identical, because
 stripping a decided entry from a non-best token can let consensus fire
