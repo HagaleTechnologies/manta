@@ -394,14 +394,10 @@ pub fn decode_samples(
     // were produced, so the input was long enough; with `non_cw_filter` on
     // an input of only speech, data or swept carriers lands here.
     if events.is_empty() && rtty.is_empty() {
-<<<<<<< HEAD
         bail!(
-            "no signal found (input shorter than one filter length or empty){}",
+            "no signal found (no keyed CW signal in the input){}",
             bad_samples_suffix(bad_samples)
         );
-=======
-        bail!("no signal found (no keyed CW signal in the input)");
->>>>>>> 5499511bc122183cbc504a4fcadb6a4741c37fde
     }
     let min_track_id = primary_track_id(&events);
     if min_track_id.is_none() && rtty.is_empty() {

@@ -401,22 +401,15 @@ pub fn doctor(
     let mut spots_confirmed = 0usize;
     let confirmations = Arc::new(AtomicU64::new(0));
 
-<<<<<<< HEAD
     let bad_samples = Arc::new(AtomicU64::new(0));
-=======
->>>>>>> 5499511bc122183cbc504a4fcadb6a4741c37fde
     let result = listen_with_observers(
         src,
         cfg,
         stop.clone(),
         ListenObservers {
-<<<<<<< HEAD
-            bad_samples: Some(bad_samples.clone()),
-            ..Default::default()
-=======
             detector_confirmations: Some(confirmations.clone()),
+            bad_samples: Some(bad_samples.clone()),
             ..ListenObservers::default()
->>>>>>> 5499511bc122183cbc504a4fcadb6a4741c37fde
         },
         |ev| match ev {
             DecoderEvent::TrackPromoted { .. } => tracks_promoted += 1,
@@ -434,11 +427,7 @@ pub fn doctor(
             _ => {}
         },
         |_spot| spots_confirmed += 1,
-<<<<<<< HEAD
-        |_| {},
-=======
         |_n| {},
->>>>>>> 5499511bc122183cbc504a4fcadb6a4741c37fde
     );
     listen_done.store(true, Ordering::Relaxed);
     let _ = watchdog.join();
@@ -841,6 +830,7 @@ mod tests {
             chars_decoded: 0,
             distinct_chars: 0,
             spots_confirmed: 0,
+            bad_samples: 0,
         }
     }
 

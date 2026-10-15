@@ -257,7 +257,6 @@ mod tests {
             .contains("SNR (2500 Hz reference): no TrackMeta events -- no track ever promoted\n"));
     }
 
-<<<<<<< HEAD
     #[test]
     fn bad_samples_warning_names_the_input_the_count_and_the_limit() {
         assert_eq!(
@@ -291,6 +290,7 @@ mod tests {
             center_freq_hz: 14_000_000.0,
             duration: std::time::Duration::from_secs(20),
             tracks_promoted: 1,
+            detector_confirmations: 0,
             track_meta_count: 19,
             tracks_closed: 1,
             snr_db_min: Some(16.0),
@@ -324,7 +324,8 @@ mod tests {
             "panicked: no\ninput: 3 bad samples (NaN, infinite, or larger than 1e17 in \
              magnitude) replaced with silence\n"
         ));
-=======
+    }
+
     /// MAN-313: a run with confirmed signals but no keyed CW prints its
     /// confirmation count and the `NOT_CW` verdict.
     #[test]
@@ -343,6 +344,7 @@ mod tests {
             chars_decoded: 0,
             distinct_chars: 0,
             spots_confirmed: 0,
+            bad_samples: 0,
         };
         let out = doctor_report(&r);
         assert!(
@@ -352,6 +354,5 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("\nverdict: NOT_CW -- "), "{out}");
->>>>>>> 5499511bc122183cbc504a4fcadb6a4741c37fde
     }
 }
