@@ -55,6 +55,17 @@ pub struct DetectorConfig {
     /// RTTY, in hops. The detector works in whole 375-hop blocks
     /// (`rtty_dwell_hops / manta_dsp::fsk::BLOCK_HOPS`).
     pub rtty_dwell_hops: u64,
+    /// MAN-313 (SPEC §2.8): a newly promoted track leases a decoder and
+    /// emits `TrackPromoted` only once it shows CW keying; speech, noise-like
+    /// wideband data and swept carriers never qualify, and a qualified track
+    /// that stops keying closes `Unkeyed`. `false` restores the pre-MAN-313
+    /// behaviour exactly.
+    pub non_cw_filter: bool,
+    /// MAN-313: with `non_cw_filter` on, both how long a promoted track may
+    /// take to qualify as keyed CW (else it closes `NotCw`) and how long a
+    /// qualified track may stay key-down with no keying, no decoded
+    /// character and no callsign read (else it closes `Unkeyed`), in hops.
+    pub unkeyed_close_hops: u64,
     /// MAN-312 (SPEC §2.7): what a band-wide static crash does to track
     /// starts and to running tracks' decoder input. Not in SPEC §9's
     /// original table; `[detector].crash_filter`.
@@ -220,6 +231,9 @@ impl Default for DetectorConfig {
             // MAN-314: on; 7500 hops = 20 s = 20 detector blocks.
             rtty_filter: true,
             rtty_dwell_hops: 7500,
+            // MAN-313: on; 3750 hops = 10 s.
+            non_cw_filter: true,
+            unkeyed_close_hops: 3750,
         }
     }
 }
@@ -253,6 +267,13 @@ pub(crate) enum CloseReason {
     /// MAN-314 (SPEC §2.6): the track sits on a marked RTTY signal's hard
     /// span.
     Rtty,
+    /// MAN-313 (SPEC §2.8): the track never qualified as keyed CW within
+    /// `unkeyed_close_hops` of promotion. It never held a decoder.
+    NotCw,
+    /// MAN-313 (SPEC §2.8): a qualified track stayed key-down for
+    /// `unkeyed_close_hops` with no re-rise, no decoded character and no
+    /// callsign read.
+    Unkeyed,
 }
 
 /// Per-`CloseReason` close counters (issue #26: SPEC §2.5 / ARCHITECTURE §4,
@@ -269,6 +290,10 @@ pub struct CloseCounts {
     pub evicted: u64,
     /// MAN-314: closed because the track sat on a marked RTTY signal.
     pub rtty: u64,
+    /// MAN-313: closed because the track never qualified as keyed CW.
+    pub not_cw: u64,
+    /// MAN-313: closed because a qualified track stopped keying.
+    pub unkeyed: u64,
 }
 
 impl CloseCounts {
@@ -280,6 +305,8 @@ impl CloseCounts {
             CloseReason::Merged => self.merged += 1,
             CloseReason::Evicted => self.evicted += 1,
             CloseReason::Rtty => self.rtty += 1,
+            CloseReason::NotCw => self.not_cw += 1,
+            CloseReason::Unkeyed => self.unkeyed += 1,
         }
     }
 }
@@ -410,6 +437,7 @@ use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_dsp::channelizer::{
     interpolate_offset, odd_channel_sign_correction, power_db, HopOutput,
 };
+use manta_dsp::comod::CoModDetector;
 use manta_dsp::crash::{CrashDetector, CRASH_MIN_HOPS};
 use manta_dsp::floor::{FloorBank, Gate};
 use manta_dsp::fsk::{FskDetector, BLOCK_HOPS as FSK_BLOCK_HOPS};
@@ -565,6 +593,13 @@ pub(crate) struct Track {
     /// already been added to the decode-quality observer, so each drain
     /// publishes only the new garbles. See `publish_garbles`.
     garbles_published: u32,
+    /// MAN-313 (SPEC §2.8): keying evidence, created at promotion when
+    /// `DetectorConfig::non_cw_filter` is on; `None` otherwise (and for a
+    /// CANDIDATE).
+    keying: Option<KeyingEvidence>,
+    /// MAN-313: this promoted track qualified as keyed CW and holds a
+    /// decoder. Set at promotion when the filter is off.
+    qualified: bool,
 }
 
 /// MAN-118: adds `decoder`'s garbles since the last call to `quality`, and
@@ -608,6 +643,218 @@ fn wrapped_channel_offset(k: usize, n_channels: usize) -> f64 {
     let half = n_channels as i64 / 2;
     let signed = ((k as i64 + half).rem_euclid(n_channels as i64)) - half;
     signed as f64
+}
+
+/// MAN-313 (SPEC §2.8): a keying cycle is an ACTIVE run of at most this
+/// many hops (3 s at 375 hops/s), then HANG, then a re-rise.
+pub const MAX_MARK_HOPS: u64 = 1125;
+/// MAN-313: ACTIVE hops a track needs since the previous classifier
+/// evaluation to qualify at this one.
+pub const QUALIFY_MIN_ACTIVE_HOPS: u64 = 8;
+/// MAN-313: key-down hops the frequency-slope fit needs.
+pub const SLOPE_MIN_SAMPLES: u64 = 20;
+/// MAN-313: the largest |frequency slope| over key-down hops a qualifying
+/// track may show, in Hz/s. Rejects swept carriers.
+pub const MAX_SWEEP_HZ_PER_S: f64 = 75.0;
+/// MAN-313: the key-down hops must span at least this many hops.
+pub const KEYDOWN_SPAN_MIN_HOPS: u64 = 150;
+/// MAN-313: a key-down hop is non-flat when the strongest of the channels
+/// two and three away differs from the track's channel by at least this
+/// many dB (either way: a much louder neighbour is a different signal).
+pub const ISO_DB: f64 = 6.0;
+/// MAN-313: the fraction of key-down hops that must be non-flat.
+pub const ISO_MIN_FRACTION: f64 = 0.5;
+/// MAN-313: the most queued decoder inputs a track awaiting qualification
+/// keeps (20 s of hops, twice the default `unkeyed_close_hops`, so the
+/// default never reaches it). Only a raised `unkeyed_close_ms` can: the
+/// oldest entries are then dropped, and a track that qualifies that late
+/// is decoded from at most 20 s back.
+pub const MAX_UNQUALIFIED_BACKLOG: usize = 7500;
+
+/// MAN-313 (SPEC §2.8): one promoted track's evidence that it is keyed CW,
+/// plus the state its unkeyed close reads. Every field is integer-hop
+/// driven and summed in a fixed order, so the decision is deterministic.
+#[derive(Debug, Clone)]
+struct KeyingEvidence {
+    /// `sample_ts` of the promotion hop, carried by the lazy
+    /// `TrackPromoted`.
+    promo_ts: u64,
+    /// Centroid frequency at promotion, carried by the lazy
+    /// `TrackPromoted`.
+    promo_freq_hz: f64,
+    /// `hop_counter` at promotion; the `NotCw` timeout counts from here.
+    promo_hop: u64,
+    /// HANG -> ACTIVE transitions whose preceding ACTIVE run was at most
+    /// `MAX_MARK_HOPS`.
+    cycles: u64,
+    /// Length of the current (or, during HANG, the last) ACTIVE run.
+    active_run: u64,
+    /// ACTIVE hops since the last classifier evaluation.
+    active_hops_since_eval: u64,
+    /// Hop of the first key-down sample; `t` in the slope fit is relative
+    /// to it.
+    first_keydown_hop: Option<u64>,
+    /// Least-squares running sums over key-down hops: n, Σt, Σf, Σt², Σtf.
+    n: u64,
+    sum_t: f64,
+    sum_f: f64,
+    sum_tt: f64,
+    sum_tf: f64,
+    /// Span of the key-down samples, in hops (last t).
+    t_last: u64,
+    /// Key-down hops whose neighbourhood was not flat (Discovery 7).
+    non_flat: u64,
+    /// Hop of the promotion or the latest HANG -> ACTIVE re-rise.
+    last_rise_hop: u64,
+    /// `hop_counter` at the end of the latest batch that decoded a
+    /// character (batch-granular).
+    last_char_hop: u64,
+    /// The word being decoded.
+    word: String,
+    /// A decoded word passed `manta_spot::grammar::is_plausible`.
+    callsign_read: bool,
+}
+
+impl KeyingEvidence {
+    fn new(promo_ts: u64, promo_freq_hz: f64, promo_hop: u64) -> Self {
+        KeyingEvidence {
+            promo_ts,
+            promo_freq_hz,
+            promo_hop,
+            cycles: 0,
+            active_run: 0,
+            active_hops_since_eval: 0,
+            first_keydown_hop: None,
+            n: 0,
+            sum_t: 0.0,
+            sum_f: 0.0,
+            sum_tt: 0.0,
+            sum_tf: 0.0,
+            t_last: 0,
+            non_flat: 0,
+            last_rise_hop: promo_hop,
+            last_char_hop: 0,
+            word: String::new(),
+            callsign_read: false,
+        }
+    }
+
+    /// One hop of a promoted track. `prev`/`now` are its lifecycle state
+    /// before and after this hop's `on_hop`; `k` its selected channel;
+    /// `keydown` whether `power_db[k]` cleared the floor by `on_snr_db`.
+    /// Cycle and re-rise bookkeeping always run; the slope and flatness
+    /// sums only until the track qualifies.
+    #[allow(clippy::too_many_arguments)]
+    fn on_hop(
+        &mut self,
+        hop: u64,
+        prev: LifecycleState,
+        now: LifecycleState,
+        qualified: bool,
+        k: usize,
+        birth_channel: usize,
+        keydown: bool,
+        power: &[f32],
+        power_db: &[f64],
+    ) {
+        if prev == LifecycleState::Hang && now == LifecycleState::Active {
+            if self.active_run <= MAX_MARK_HOPS {
+                self.cycles += 1;
+            }
+            self.active_run = 0;
+            self.last_rise_hop = hop;
+        }
+        if now == LifecycleState::Active {
+            self.active_run += 1;
+            self.active_hops_since_eval += 1;
+        }
+        if qualified || !keydown {
+            return;
+        }
+        let n_ch = power.len();
+        let first = *self.first_keydown_hop.get_or_insert(hop);
+        let t = (hop - first) as f64;
+        let offset = wrapped_channel_offset((k + n_ch - birth_channel % n_ch) % n_ch, n_ch);
+        let fine = interpolate_offset(
+            power[(k + n_ch - 1) % n_ch],
+            power[k],
+            power[(k + 1) % n_ch],
+        )
+        .unwrap_or(0.0);
+        let f = offset + fine;
+        self.n += 1;
+        self.sum_t += t;
+        self.sum_f += f;
+        self.sum_tt += t * t;
+        self.sum_tf += t * f;
+        self.t_last = hop - first;
+        let side = [2, 3]
+            .iter()
+            .flat_map(|&d| [power_db[(k + d) % n_ch], power_db[(k + n_ch - d) % n_ch]])
+            .fold(f64::NEG_INFINITY, f64::max);
+        if (power_db[k] - side).abs() >= ISO_DB {
+            self.non_flat += 1;
+        }
+    }
+
+    /// Least-squares frequency slope over the key-down hops, in Hz/s.
+    /// The channelizer is 4x oversampled (hop = N/4), so hops/s is
+    /// `4 * spacing` (375 at 96 kHz / 1024 channels). `0.0` with fewer
+    /// than two distinct times.
+    fn slope_hz_s(&self, spacing_hz: f64) -> f64 {
+        let n = self.n as f64;
+        let denom = n * self.sum_tt - self.sum_t * self.sum_t;
+        if self.n < 2 || denom <= 0.0 {
+            return 0.0;
+        }
+        let ch_per_hop = (n * self.sum_tf - self.sum_t * self.sum_f) / denom;
+        ch_per_hop * spacing_hz * (4.0 * spacing_hz)
+    }
+
+    /// Fraction of key-down hops whose neighbourhood was not flat.
+    fn non_flat_fraction(&self) -> f64 {
+        if self.n == 0 {
+            return 0.0;
+        }
+        self.non_flat as f64 / self.n as f64
+    }
+
+    /// SPEC §2.8's qualification rule, checked at a classifier evaluation
+    /// for a track whose centre channel is `k`.
+    fn qualifies(&self, comod: &CoModDetector, k: usize, spacing_hz: f64) -> bool {
+        self.cycles >= 1
+            && self.active_hops_since_eval >= QUALIFY_MIN_ACTIVE_HOPS
+            && !comod.in_span(k)
+            && !comod.comodulated_with_span(k)
+            && self.n >= SLOPE_MIN_SAMPLES
+            && self.slope_hz_s(spacing_hz).abs() <= MAX_SWEEP_HZ_PER_S
+            && self.t_last >= KEYDOWN_SPAN_MIN_HOPS
+            && self.non_flat_fraction() >= ISO_MIN_FRACTION
+    }
+
+    /// A decoded character (`None` for a prosign) at batch-end hop `hop`.
+    /// A space ends the current word.
+    fn note_char(&mut self, hop: u64, c: Option<char>) {
+        self.last_char_hop = hop;
+        match c {
+            Some(' ') => self.end_word(),
+            Some(c) => {
+                self.word.push(c);
+                if !self.callsign_read && manta_spot::grammar::is_plausible(&self.word) {
+                    self.callsign_read = true;
+                }
+            }
+            None => self.end_word(),
+        }
+    }
+
+    /// A word boundary (or a space): the current word is complete.
+    fn end_word(&mut self) {
+        if !self.callsign_read && manta_spot::grammar::is_plausible(&self.word) {
+            self.callsign_read = true;
+        }
+        self.word.clear();
+    }
 }
 
 /// SPEC §2.5: a live centroid EMA responsive enough to follow realistic
@@ -655,6 +902,8 @@ impl Track {
             refiner_backlog: VecDeque::new(),
             clean_hist: VecDeque::new(),
             garbles_published: 0,
+            keying: None,
+            qualified: false,
         }
     }
 
@@ -1150,6 +1399,14 @@ pub struct TrackManager {
     /// MAN-314: sample timestamp of the hop whose block made the latest
     /// `rtty_changes` bump; 0 before the first.
     rtty_changed_sample_ts: u64,
+    /// MAN-313 (SPEC §2.8): the band co-modulation classifier, `None` when
+    /// `DetectorConfig::non_cw_filter` is off.
+    comod: Option<CoModDetector>,
+    /// MAN-313: per-hop gate-smoothed SNR handed to `comod`, reused.
+    comod_snr_buf: Vec<f64>,
+    /// MAN-313: every CANDIDATE -> ACTIVE confirmation so far, qualified as
+    /// keyed CW or not. Never reset. See `confirmations`.
+    confirmations: u64,
     /// MAN-324: per channel, whether the rise test passed on any hop since
     /// the last `take_channel_levels`. `None` (the default) skips it; no
     /// decode logic reads it.
@@ -1289,7 +1546,20 @@ impl TrackManager {
             rf_channels: None,
             trusted_channels: None,
             crash: CrashDetector::new(n_channels),
+            comod: detector_cfg
+                .non_cw_filter
+                .then(|| CoModDetector::new(n_channels)),
+            comod_snr_buf: Vec::with_capacity(n_channels),
+            confirmations: 0,
         }
+    }
+
+    /// MAN-313: how many tracks the detector has confirmed (CANDIDATE ->
+    /// ACTIVE) so far, whether or not they went on to qualify as keyed CW
+    /// and emit `TrackPromoted`. Doctor reads it to tell "signals, but none
+    /// keyed CW" (`NotCw`) apart from "no signal at all".
+    pub fn confirmations(&self) -> u64 {
+        self.confirmations
     }
 
     /// MAN-324: start recording, per channel, whether the rise test passed
@@ -1477,6 +1747,12 @@ impl TrackManager {
         self.rtty_changed_sample_ts = sample_ts;
     }
 
+    /// MAN-313 (SPEC §2.8): may no CW candidate spawn on channel `k`? True
+    /// inside a marked co-modulated (speech) span.
+    fn comod_vetoes_spawn(&self, k: usize) -> bool {
+        self.comod.as_ref().is_some_and(|c| c.in_span(k))
+    }
+
     /// MAN-314 (SPEC §2.6): may no CW candidate spawn on channel `k`? True
     /// inside a marked RTTY signal's hard span, or inside its shadow below
     /// the shadow depth.
@@ -1581,7 +1857,9 @@ impl TrackManager {
     /// Count of tracks the manager has actually *promoted* -- every track
     /// holding a leased decoder, i.e. in `LifecycleState::Active` or
     /// `Hang` (the decoder is leased on CANDIDATE -> ACTIVE and kept
-    /// across HANG, `step_hop`). This is the daemon's live
+    /// across HANG, `step_hop`; with `DetectorConfig::non_cw_filter` on,
+    /// MAN-313 defers the lease until the track qualifies as keyed CW, so
+    /// a promoted track still awaiting qualification is not counted). This is the daemon's live
     /// `manta_active_tracks` gauge (MAN-122), and it is deliberately a
     /// *lifecycle* count rather than one derived from the decoder event
     /// stream: a promoted track whose demodulator has not latched yet
@@ -1676,6 +1954,18 @@ impl TrackManager {
                 self.update_rtty_log(sample_ts);
             }
         }
+        // MAN-313 (SPEC §2.8): feed the co-modulation classifier every
+        // channel's gate-smoothed SNR; `true` when it evaluated this hop.
+        let comod_evaluated = if let Some(comod) = self.comod.as_mut() {
+            self.comod_snr_buf.clear();
+            self.comod_snr_buf.extend(
+                (0..self.owner_of.len())
+                    .map(|k| self.gate.smoothed_db(k) - self.floor.effective_floor_db(k)),
+            );
+            comod.push_hop(&self.comod_snr_buf)
+        } else {
+            false
+        };
         // MAN-171 (Codex review, PR #174 round 4, correct): clear a
         // channel's respawn cooldown the moment its own `rise` genuinely
         // drops. `CloseReason::Silent` does NOT prove the RF signal ended
@@ -1746,15 +2036,55 @@ impl TrackManager {
             let f = self.floor.effective_floor_db(k);
             track.current_snr_db = (self.gate.smoothed_db(k) - f) as f32;
             let char_emitted = false; // GC timer input; refined below once a decoder exists.
-
+            let prev_state = track.lifecycle.state();
+            // MAN-313 (SPEC §2.8 A): a track awaiting qualification has no
+            // decoder, so "no character decoded" says nothing about it yet;
+            // hold its garbage-collect timer at zero. `NotCw` bounds its
+            // life instead, and the timer starts at qualification.
+            if track.keying.is_some() && !track.qualified {
+                track.lifecycle.note_char_decoded();
+            }
             // MAN-312: a CANDIDATE's confirm window is frozen through a
             // crash rather than counted for or against it; ACTIVE/HANG
             // tracks step on the held rise/drop so their hang timers run.
-            let event = if suppress && track.lifecycle.state() == LifecycleState::Candidate {
+            let mut event = if suppress && prev_state == LifecycleState::Candidate {
                 LifecycleEvent::None
             } else {
                 track.lifecycle.on_hop(rise[k], drop[k], char_emitted)
             };
+            // MAN-313 (SPEC §2.8): keying evidence for a promoted track, then
+            // the two filter-only closes. `keying` is `None` with the filter
+            // off, so none of this runs there.
+            let hop_now = self.hop_counter;
+            let qualified = track.qualified;
+            if let Some(ev) = track.keying.as_mut() {
+                let keydown = power_db_vals[k] - self.floor.effective_floor_db(k)
+                    >= f64::from(self.cfg.on_snr_db);
+                ev.on_hop(
+                    hop_now,
+                    prev_state,
+                    track.lifecycle.state(),
+                    qualified,
+                    k,
+                    track.birth_channel,
+                    keydown,
+                    &hop.power,
+                    &power_db_vals,
+                );
+                if event == LifecycleEvent::None {
+                    if !qualified {
+                        if hop_now - ev.promo_hop >= self.cfg.unkeyed_close_hops {
+                            event = LifecycleEvent::Closed(CloseReason::NotCw);
+                        }
+                    } else if track.lifecycle.state() == LifecycleState::Active
+                        && !ev.callsign_read
+                        && hop_now - ev.last_rise_hop.max(ev.last_char_hop)
+                            >= self.cfg.unkeyed_close_hops
+                    {
+                        event = LifecycleEvent::Closed(CloseReason::Unkeyed);
+                    }
+                }
+            }
             match event {
                 LifecycleEvent::Closed(reason) => {
                     self.close_counts.record(reason);
@@ -1762,6 +2092,8 @@ impl TrackManager {
                     closed.push(id);
                 }
                 LifecycleEvent::Promoted => {
+                    // MAN-313: every detector confirmation, qualified or not.
+                    self.confirmations += 1;
                     // SPEC §1.1/§5 (freq_hz's doc comment covers the §1.4
                     // deviation): seed TrackMeta.freq_hz from this track's
                     // own centroid EMA (already warm from its
@@ -1774,7 +2106,17 @@ impl TrackManager {
                     // this entry's own `push_hop`, so a `TrackMeta` pairs it
                     // with this hop's `sample_ts`.
                     let freq_hz = track.freq_hz(self.center_freq_hz, self.channel_spacing_hz, n);
-                    track.decoder = Some(TrackDecoder::new(id, self.decode_cfg.clone()));
+                    // MAN-313 (SPEC §2.8): with the filter on, the decoder is
+                    // leased (and `TrackPromoted` emitted) only once the track
+                    // qualifies as keyed CW; until then its input queues in
+                    // `pending`. With the filter off, both happen here.
+                    if self.cfg.non_cw_filter {
+                        track.keying =
+                            Some(KeyingEvidence::new(sample_ts, freq_hz, self.hop_counter));
+                    } else {
+                        track.qualified = true;
+                        track.decoder = Some(TrackDecoder::new(id, self.decode_cfg.clone()));
+                    }
                     let spectral_ref_power = compute_spectral_ref_power
                         .then(|| Self::spectral_ref_power(&self.floor, track.center))
                         .flatten();
@@ -1796,8 +2138,10 @@ impl TrackManager {
                     for e in burst {
                         track.queue_input(e);
                     }
-                    // Emitted unconditionally here, at the exact hop the
-                    // detector made this decision -- NOT gated by
+                    // With the filter on, deferred to qualification (MAN-313,
+                    // see above), carrying this hop's `sample_ts`/`freq_hz`.
+                    // With it off, emitted unconditionally here, at the
+                    // exact hop the detector made this decision -- NOT gated by
                     // `has_emitted`/TrackClosed's same-batch-merge filter
                     // (MAN-19) further down. A track promoted and merged
                     // away within this same `process_hops` call still
@@ -1805,11 +2149,13 @@ impl TrackManager {
                     // `doctor()`'s NoSignal check needs and the other event
                     // kinds can't reliably provide (see events.rs's doc
                     // comment on this variant).
-                    promoted_events.push(DecoderEvent::TrackPromoted {
-                        track_id: id,
-                        sample_ts,
-                        freq_hz,
-                    });
+                    if !self.cfg.non_cw_filter {
+                        promoted_events.push(DecoderEvent::TrackPromoted {
+                            track_id: id,
+                            sample_ts,
+                            freq_hz,
+                        });
+                    }
                 }
                 LifecycleEvent::None => {
                     // Feed the decoder every hop once it exists (ACTIVE *or*
@@ -1823,7 +2169,11 @@ impl TrackManager {
                     // magnitude, which the demod correctly reads as a space --
                     // so the continuous feed keeps the decoder's timeline
                     // hole-free. SPEC §3.3/§4.1 timing depends on this.
-                    if track.decoder.is_some() {
+                    // MAN-313: a promoted track awaiting qualification queues
+                    // too, so the decoder leased at qualification replays the
+                    // whole track from its promotion hop.
+                    let awaiting = track.keying.is_some() && !track.qualified;
+                    if track.decoder.is_some() || awaiting {
                         // TrackMeta.freq_hz tracks the centroid (SPEC §5's
                         // 1 Hz cadence reports the *current* centroid, not a
                         // frozen promotion-time snapshot). MAN-211: this
@@ -1851,6 +2201,15 @@ impl TrackManager {
                         );
                         for e in burst {
                             track.queue_input(e);
+                        }
+                        // MAN-313: bound the unqualified backlog, trimming
+                        // in quarter-cap steps so the copy is amortised.
+                        if awaiting
+                            && track.pending.len()
+                                > MAX_UNQUALIFIED_BACKLOG + MAX_UNQUALIFIED_BACKLOG / 4
+                        {
+                            let excess = track.pending.len() - MAX_UNQUALIFIED_BACKLOG;
+                            track.pending.drain(..excess);
                         }
                     }
                 }
@@ -1885,6 +2244,41 @@ impl TrackManager {
         // samples still queued in `pending` THIS batch first -- without
         // that, `finish()` alone would reflect only whatever the decoder
         // processed as of the end of the PREVIOUS `process_hops` batch.
+        // MAN-313 (SPEC §2.8): at each classifier evaluation, qualify every
+        // promoted, unqualified track that shows keyed-CW evidence: lease
+        // its decoder (the next `drain_pool` replays its queued input) and
+        // emit its deferred `TrackPromoted`. Every unqualified track's
+        // per-evaluation ACTIVE count restarts.
+        if comod_evaluated {
+            if let Some(comod) = self.comod.as_ref() {
+                let n = self.n_channels();
+                let spacing = self.channel_spacing_hz;
+                for (&id, track) in self.tracks.iter_mut() {
+                    if track.qualified || close_reasons.contains_key(&id) {
+                        continue;
+                    }
+                    let Some(ev) = track.keying.as_mut() else {
+                        continue;
+                    };
+                    let k = (track.center.round() as i64).rem_euclid(n as i64) as usize;
+                    let qualifies = ev.qualifies(comod, k, spacing);
+                    ev.active_hops_since_eval = 0;
+                    if qualifies {
+                        let (promo_ts, promo_freq_hz) = (ev.promo_ts, ev.promo_freq_hz);
+                        let freq_hz = track.freq_hz(self.center_freq_hz, spacing, n);
+                        track.qualified = true;
+                        let mut decoder = TrackDecoder::new(id, self.decode_cfg.clone());
+                        decoder.set_freq_hz(freq_hz);
+                        track.decoder = Some(decoder);
+                        promoted_events.push(DecoderEvent::TrackPromoted {
+                            track_id: id,
+                            sample_ts: promo_ts,
+                            freq_hz: promo_freq_hz,
+                        });
+                    }
+                }
+            }
+        }
         // MAN-314 (SPEC §2.4/§2.6): close every open track whose centre
         // channel sits on a marked RTTY signal's hard span. Hard span only:
         // the splatter shadow must never close an existing track, since a
@@ -1916,7 +2310,12 @@ impl TrackManager {
             // surfacing downstream, not about whether this channel just
             // proved itself not real CW -- unrelated questions. Computed
             // from `track.owned` before `track` drops.
-            if close_reasons.get(id) == Some(&CloseReason::Silent) {
+            // MAN-313: `Unkeyed` and `NotCw` likewise mark a channel holding
+            // energy that is not keyed CW.
+            if matches!(
+                close_reasons.get(id),
+                Some(CloseReason::Silent | CloseReason::Unkeyed | CloseReason::NotCw)
+            ) {
                 let until = self.hop_counter + self.cfg.silent_respawn_cooldown_hops;
                 let n = self.channel_cooldown_until.len();
                 for ch in track.owned(n) {
@@ -1965,6 +2364,7 @@ impl TrackManager {
                     && !self.spawn_window_cooling_down(k)
                     && self.is_local_peak(k)
                     && !self.rtty_vetoes_spawn(k)
+                    && !self.comod_vetoes_spawn(k)
                     && !self.trusted_vetoes_spawn(k)
                 {
                     let mut winner = k;
@@ -1973,6 +2373,7 @@ impl TrackManager {
                         && self.owner_of[k + 1].is_none()
                         && !self.spawn_window_cooling_down(k + 1)
                         && !self.rtty_vetoes_spawn(k + 1)
+                        && !self.comod_vetoes_spawn(k + 1)
                         && !self.trusted_vetoes_spawn(k + 1)
                     {
                         if hop.power[k + 1] > hop.power[winner] {
@@ -2101,12 +2502,20 @@ impl TrackManager {
                     // MAN-172: ids are ascending, so `a` is the incumbent.
                     // Converged tracks often select the same channel and tie
                     // exactly. Keep its established decoder on that tie.
-                    let (loser, survivor) =
-                        if self.tracks[&a].current_snr_db < self.tracks[&b].current_snr_db {
-                            (a, b)
-                        } else {
+                    // MAN-313 (SPEC §2.8): with the filter on, a qualified
+                    // track beats an unqualified one regardless of SNR.
+                    let (qa, qb) = (self.tracks[&a].qualified, self.tracks[&b].qualified);
+                    let (loser, survivor) = if self.cfg.non_cw_filter && qa != qb {
+                        if qa {
                             (b, a)
-                        };
+                        } else {
+                            (a, b)
+                        }
+                    } else if self.tracks[&a].current_snr_db < self.tracks[&b].current_snr_db {
+                        (a, b)
+                    } else {
+                        (b, a)
+                    };
                     to_close.push((loser, survivor));
                 }
             }
@@ -2246,10 +2655,29 @@ impl TrackManager {
             if let Some(t) = self.tracks.get_mut(&event_track_id(e)) {
                 t.has_emitted = true;
             }
-            if let DecoderEvent::CharDecoded { track_id, .. } = e {
-                if let Some(t) = self.tracks.get_mut(track_id) {
-                    t.lifecycle.note_char_decoded();
+            match e {
+                DecoderEvent::CharDecoded {
+                    track_id, glyph, ..
+                } => {
+                    if let Some(t) = self.tracks.get_mut(track_id) {
+                        t.lifecycle.note_char_decoded();
+                        // MAN-313: the unkeyed close's character timer and
+                        // callsign read.
+                        if let Some(ev) = t.keying.as_mut() {
+                            ev.note_char(self.hop_counter, glyph.text_char());
+                        }
+                    }
                 }
+                DecoderEvent::WordBoundary { track_id, .. } => {
+                    if let Some(ev) = self
+                        .tracks
+                        .get_mut(track_id)
+                        .and_then(|t| t.keying.as_mut())
+                    {
+                        ev.end_word();
+                    }
+                }
+                _ => {}
             }
         }
         // Per-track promotion timestamp, for `effective_sort_ts` below --
@@ -2411,12 +2839,15 @@ impl TrackManager {
             .tracks
             .values_mut()
             .filter_map(|t| {
+                // MAN-313: a track awaiting qualification keeps its queue
+                // until a decoder is leased.
+                let decoder = t.decoder.as_mut()?;
                 if t.pending.is_empty() {
                     None
                 } else {
                     let pending = std::mem::take(&mut t.pending);
                     Some((
-                        t.decoder.as_mut().unwrap(),
+                        decoder,
                         &mut t.snr_peak_db,
                         &mut t.garbles_published,
                         pending,
@@ -2758,6 +3189,16 @@ mod tests {
             confirm_hops: 5,
             hang_hops: 10,
             gc_hops: 20,
+            ..DetectorConfig::default()
+        }
+    }
+
+    /// `DetectorConfig::default()` with the MAN-313 non-CW filter off:
+    /// promotion leases a decoder and emits `TrackPromoted` at once, as
+    /// before MAN-313.
+    fn default_filter_off() -> DetectorConfig {
+        DetectorConfig {
+            non_cw_filter: false,
             ..DetectorConfig::default()
         }
     }
@@ -3323,12 +3764,14 @@ mod tests {
 
     /// 512 channels at 48 kS/s: the channel grid the decimated path
     /// actually uses, with channel centres at `k' * 93.75` Hz.
+    /// Filter off: these cells drive steady unkeyed carriers, which the
+    /// MAN-313 non-CW filter (rightly) never qualifies.
     fn trusted_band_manager(n: usize) -> TrackManager {
         TrackManager::new(
             n,
             (n as f64) * 93.75,
             14_000_000.0,
-            DetectorConfig::default(),
+            default_filter_off(),
             DecodeConfig::default(),
         )
     }
@@ -3476,7 +3919,7 @@ mod tests {
             64,
             96_000.0,
             14_000_000.0,
-            DetectorConfig::default(),
+            default_filter_off(),
             DecodeConfig::default(),
         );
         feed_warmup(&mut tm, 64);
@@ -3675,7 +4118,7 @@ mod tests {
             64,
             96_000.0,
             14_000_000.0,
-            DetectorConfig::default(),
+            default_filter_off(),
             DecodeConfig::default(),
         );
         feed_warmup(&mut tm, 64);
@@ -3707,7 +4150,7 @@ mod tests {
             64,
             96_000.0,
             14_000_000.0,
-            DetectorConfig::default(),
+            default_filter_off(),
             DecodeConfig::default(),
         );
         feed_warmup(&mut tm, 64);
@@ -4194,7 +4637,7 @@ mod tests {
             n,
             96_000.0,
             14_000_000.0,
-            DetectorConfig::default(),
+            default_filter_off(),
             DecodeConfig::default(),
         );
         feed_warmup(&mut tm, n);
@@ -4287,7 +4730,7 @@ mod tests {
             n,
             96_000.0,
             14_000_000.0,
-            DetectorConfig::default(),
+            default_filter_off(),
             DecodeConfig::default(),
         );
         feed_warmup(&mut tm, n);
@@ -4364,7 +4807,7 @@ mod tests {
             n,
             96_000.0,
             14_000_000.0,
-            DetectorConfig::default(),
+            default_filter_off(),
             DecodeConfig::default(),
         );
         feed_warmup(&mut tm, n);
@@ -4457,7 +4900,7 @@ mod tests {
             n,
             96_000.0,
             14_000_000.0,
-            DetectorConfig::default(),
+            default_filter_off(),
             DecodeConfig::default(),
         );
         feed_warmup(&mut tm, n);
@@ -4576,7 +5019,7 @@ mod tests {
             64,
             96_000.0,
             14_000_000.0,
-            DetectorConfig::default(),
+            default_filter_off(),
             DecodeConfig {
                 engine: Engine::Hsmm,
                 ..DecodeConfig::default()
@@ -4629,7 +5072,7 @@ mod tests {
             64,
             96_000.0,
             14_000_000.0,
-            DetectorConfig::default(),
+            default_filter_off(),
             DecodeConfig {
                 engine: Engine::Hsmm,
                 ..DecodeConfig::default()
@@ -4695,7 +5138,7 @@ mod tests {
             64,
             96_000.0,
             14_000_000.0,
-            DetectorConfig::default(),
+            default_filter_off(),
             DecodeConfig::default(),
         );
         feed_warmup(&mut tm, 64);
@@ -4730,7 +5173,7 @@ mod tests {
             64,
             96_000.0,
             14_000_000.0,
-            DetectorConfig::default(),
+            default_filter_off(),
             DecodeConfig::default(),
         );
         feed_warmup(&mut tm, 64);
@@ -4760,7 +5203,7 @@ mod tests {
             64,
             96_000.0,
             14_000_000.0,
-            DetectorConfig::default(),
+            default_filter_off(),
             DecodeConfig::default(),
         );
         feed_warmup(&mut tm, 64);
@@ -6035,6 +6478,510 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- MAN-313 (SPEC §2.8): non-CW filter ----
+
+    const NC_N: usize = 64;
+    /// Channel 10's absolute Hz at 96 kHz / 64 channels (1500 Hz spacing).
+    const NC_CH10_HZ: f64 = 14_015_000.0;
+
+    fn nc_db(db: f32) -> f32 {
+        1e-9 * 10f32.powf(db / 10.0)
+    }
+
+    fn nc_mgr(cfg: DetectorConfig) -> TrackManager {
+        let mut tm = TrackManager::new(NC_N, 96_000.0, 14_000_000.0, cfg, DecodeConfig::default());
+        feed_warmup(&mut tm, NC_N);
+        tm
+    }
+
+    fn nc_cfg(unkeyed_close_hops: u64) -> DetectorConfig {
+        DetectorConfig {
+            unkeyed_close_hops,
+            ..DetectorConfig::default()
+        }
+    }
+
+    /// 40 hops key-down, 40 key-up.
+    fn nc_keyed(i: u64) -> bool {
+        (i / 40).is_multiple_of(2)
+    }
+
+    /// Steps `hops` hops after warm-up (`m` continues from it); `power(i)`
+    /// is hop `i`'s power, `each(tm, i)` runs after each step. Returns
+    /// every `TrackPromoted`.
+    fn nc_drive(
+        tm: &mut TrackManager,
+        start: u64,
+        hops: u64,
+        mut power: impl FnMut(u64) -> Vec<f32>,
+        mut each: impl FnMut(&mut TrackManager, u64),
+    ) -> Vec<DecoderEvent> {
+        let mut promoted = Vec::new();
+        for i in 0..hops {
+            let m = 250 * 15 + start + i;
+            let (_, p, _) = tm.step_hop(&hop(m, power(i)), m);
+            promoted.extend(p);
+            each(tm, i);
+        }
+        promoted
+    }
+
+    fn nc_tone(ch: usize, on: bool, db: f32) -> Vec<f32> {
+        let mut p = quiet_power(NC_N);
+        if on {
+            p[ch] = nc_db(db);
+        }
+        p
+    }
+
+    /// Keyed on channel 10 until it qualifies (at most 1500 hops); returns
+    /// the hops used.
+    fn nc_qualify(tm: &mut TrackManager) -> u64 {
+        let mut used = 0;
+        let mut done = false;
+        for i in 0..1500 {
+            if done {
+                break;
+            }
+            let p = nc_drive(tm, i, 1, |_| nc_tone(10, nc_keyed(i), 30.0), |_, _| {});
+            done = !p.is_empty();
+            used = i + 1;
+        }
+        assert!(done, "the keyed tone never qualified");
+        // Finish on a key-down hop so the steady carrier continues it.
+        while !nc_keyed(used) {
+            nc_drive(tm, used, 1, |_| nc_tone(10, false, 30.0), |_, _| {});
+            used += 1;
+        }
+        used
+    }
+
+    #[test]
+    fn keyed_tone_qualifies_and_emits_track_promoted_with_its_promotion_ts() {
+        let mut tm = nc_mgr(DetectorConfig::default());
+        let mut promo: Option<(u64, f64)> = None;
+        let mut qualified_at = None;
+        let promoted = nc_drive(
+            &mut tm,
+            0,
+            1500,
+            |i| nc_tone(10, nc_keyed(i), 30.0),
+            |tm, i| {
+                for t in tm.tracks.values() {
+                    if let Some(ev) = t.keying.as_ref() {
+                        promo.get_or_insert((ev.promo_ts, ev.promo_freq_hz));
+                        if t.qualified && qualified_at.is_none() {
+                            qualified_at = Some(i);
+                        }
+                    }
+                }
+            },
+        );
+        let (promo_ts, promo_freq) = promo.expect("the keyed tone was promoted");
+        assert_eq!(promoted.len(), 1, "{promoted:?}");
+        match &promoted[0] {
+            DecoderEvent::TrackPromoted {
+                sample_ts, freq_hz, ..
+            } => {
+                assert_eq!(*sample_ts, promo_ts);
+                assert_eq!(*freq_hz, promo_freq);
+                assert!((freq_hz - NC_CH10_HZ).abs() < 1500.0, "{freq_hz}");
+            }
+            e => panic!("{e:?}"),
+        }
+        let q = qualified_at.unwrap();
+        assert!(250 * 15 + q > promo_ts, "qualified after promotion");
+        assert_eq!(tm.decoding_track_count(), 1);
+    }
+
+    #[test]
+    fn short_gc_does_not_close_a_track_awaiting_qualification() {
+        // gc_hops (60) far below the time a keyed tone takes to qualify:
+        // the silent GC must not close it before it can.
+        let mut tm = nc_mgr(DetectorConfig {
+            gc_hops: 60,
+            ..DetectorConfig::default()
+        });
+        let promoted = nc_drive(
+            &mut tm,
+            0,
+            1500,
+            |i| nc_tone(10, nc_keyed(i), 30.0),
+            |_, _| {},
+        );
+        // The first track qualifies. (Once qualified it has a decoder, so
+        // the 60-hop GC applies to it as before: this step-only harness
+        // decodes nothing, so it then closes `Silent` and respawns.)
+        assert!(
+            matches!(
+                promoted.first(),
+                Some(DecoderEvent::TrackPromoted { track_id: 1, .. })
+            ),
+            "{promoted:?}"
+        );
+    }
+
+    #[test]
+    fn steady_tone_never_emits_track_promoted_and_closes_not_cw_at_timeout() {
+        let mut tm = nc_mgr(nc_cfg(1000));
+        let mut promo_hop = None;
+        let mut closed_at = None;
+        let promoted = nc_drive(
+            &mut tm,
+            0,
+            1300,
+            |_| nc_tone(10, true, 30.0),
+            |tm, _| {
+                if let Some(ev) = tm.tracks.values().find_map(|t| t.keying.as_ref()) {
+                    promo_hop.get_or_insert(ev.promo_hop);
+                }
+                if tm.close_counts().not_cw == 1 && closed_at.is_none() {
+                    closed_at = Some(tm.hop_counter);
+                }
+            },
+        );
+        assert!(promoted.is_empty(), "{promoted:?}");
+        assert_eq!(tm.close_counts().not_cw, 1);
+        assert_eq!(closed_at.unwrap() - promo_hop.unwrap(), 1000);
+        assert!(tm.confirmations() >= 1);
+    }
+
+    #[test]
+    fn unqualified_track_is_not_a_decoding_track() {
+        let mut tm = nc_mgr(DetectorConfig::default());
+        nc_drive(&mut tm, 0, 300, |_| nc_tone(10, true, 30.0), |_, _| {});
+        assert!(tm
+            .tracks
+            .values()
+            .any(|t| t.state() == LifecycleState::Active && t.keying.is_some()));
+        assert_eq!(tm.decoding_track_count(), 0);
+        assert!(tm.tracks.values().all(|t| t.decoder.is_none()));
+    }
+
+    #[test]
+    fn moving_peak_does_not_qualify() {
+        // A keyed carrier stepping one channel every 40 hops.
+        let mut tm = nc_mgr(DetectorConfig::default());
+        let promoted = nc_drive(
+            &mut tm,
+            0,
+            1600,
+            |i| nc_tone(5 + (i / 40) as usize % 50, nc_keyed(i / 2), 30.0),
+            |_, _| {},
+        );
+        assert!(promoted.is_empty(), "{promoted:?}");
+        // The slope itself: 0.025 channel/hop at 1500 Hz spacing is far
+        // past MAX_SWEEP_HZ_PER_S.
+        let mut ev = KeyingEvidence::new(0, 0.0, 0);
+        for t in 0..200u64 {
+            ev.n += 1;
+            let (tt, f) = (t as f64, t as f64 * 0.025);
+            ev.sum_t += tt;
+            ev.sum_f += f;
+            ev.sum_tt += tt * tt;
+            ev.sum_tf += tt * f;
+        }
+        assert!((ev.slope_hz_s(93.75) - 0.025 * 93.75 * 375.0).abs() < 1e-6);
+        assert!(ev.slope_hz_s(93.75).abs() > MAX_SWEEP_HZ_PER_S);
+    }
+
+    #[test]
+    fn flat_wideband_block_does_not_qualify() {
+        let mut tm = nc_mgr(DetectorConfig::default());
+        let promoted = nc_drive(
+            &mut tm,
+            0,
+            1500,
+            |i| {
+                let mut p = quiet_power(NC_N);
+                if nc_keyed(i) {
+                    p[10..=30].iter_mut().for_each(|x| *x = nc_db(30.0));
+                }
+                p
+            },
+            |_, _| {},
+        );
+        assert!(promoted.is_empty(), "{promoted:?}");
+    }
+
+    #[test]
+    fn louder_neighbour_three_channels_away_does_not_block_qualification() {
+        let mut tm = nc_mgr(DetectorConfig::default());
+        let promoted = nc_drive(
+            &mut tm,
+            0,
+            1500,
+            |i| {
+                let mut p = nc_tone(10, nc_keyed(i), 20.0);
+                p[13] = nc_db(40.0);
+                p
+            },
+            |_, _| {},
+        );
+        assert!(
+            promoted.iter().any(|e| matches!(e,
+                DecoderEvent::TrackPromoted { freq_hz, .. } if (freq_hz - NC_CH10_HZ).abs() < 1500.0)),
+            "{promoted:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_is_vetoed_inside_a_comod_span() {
+        let mut tm = nc_mgr(DetectorConfig::default());
+        nc_drive(
+            &mut tm,
+            0,
+            600,
+            |i| {
+                let mut p = quiet_power(NC_N);
+                if nc_keyed(i) {
+                    p[10..=30].iter_mut().for_each(|x| *x = nc_db(30.0));
+                }
+                p
+            },
+            |_, _| {},
+        );
+        assert!(tm.comod.as_ref().unwrap().in_span(20));
+        assert!(tm.comod_vetoes_spawn(20));
+        assert!(!tm.comod_vetoes_spawn(50));
+        let off = nc_mgr(default_filter_off());
+        assert!(!off.comod_vetoes_spawn(20));
+    }
+
+    #[test]
+    fn merge_keeps_the_qualified_track() {
+        for (filter, expect_survivor) in [(true, 1u32), (false, 2u32)] {
+            let mut tm = nc_mgr(DetectorConfig {
+                non_cw_filter: filter,
+                ..DetectorConfig::default()
+            });
+            let cfg = tm.cfg;
+            let mut a = Track::new(1, 10, &cfg);
+            a.current_snr_db = 10.0;
+            a.qualified = true;
+            let mut b = Track::new(2, 10, &cfg);
+            b.center = 10.4;
+            b.current_snr_db = 20.0;
+            b.keying = Some(KeyingEvidence::new(0, 0.0, 0));
+            tm.tracks.insert(1, a);
+            tm.tracks.insert(2, b);
+            tm.merge_converged();
+            let left: Vec<u32> = tm.tracks.keys().copied().collect();
+            assert_eq!(left, vec![expect_survivor], "filter {filter}");
+        }
+    }
+
+    #[test]
+    fn drain_pool_skips_queued_tracks_without_a_decoder() {
+        let mut tm = nc_mgr(DetectorConfig::default());
+        let cfg = tm.cfg;
+        let mut t = Track::new(1, 10, &cfg);
+        t.keying = Some(KeyingEvidence::new(0, 0.0, 0));
+        t.pending.push((1.0, 1.0, None, 0, 10.0, 0.0));
+        tm.tracks.insert(1, t);
+        assert!(tm.drain_pool().is_empty());
+        assert_eq!(tm.tracks[&1].pending.len(), 1);
+    }
+
+    #[test]
+    fn unqualified_backlog_is_bounded() {
+        let mut tm = nc_mgr(nc_cfg(20_000));
+        let mut most = 0;
+        nc_drive(
+            &mut tm,
+            0,
+            12_000,
+            |_| nc_tone(10, true, 30.0),
+            |tm, _| {
+                for t in tm.tracks.values() {
+                    most = most.max(t.pending.len());
+                }
+            },
+        );
+        assert_eq!(tm.close_counts().not_cw, 0);
+        assert!(most > MAX_UNQUALIFIED_BACKLOG, "{most}");
+        assert!(
+            most <= MAX_UNQUALIFIED_BACKLOG + MAX_UNQUALIFIED_BACKLOG / 4,
+            "{most}"
+        );
+    }
+
+    #[test]
+    fn unqualified_track_at_finish_emits_nothing() {
+        let mut tm = nc_mgr(DetectorConfig::default());
+        let mut events = Vec::new();
+        for i in 0..400u64 {
+            let m = 250 * 15 + i;
+            events.extend(tm.process_hops(&[hop(m, nc_tone(10, true, 30.0))], |m| m));
+        }
+        assert!(tm
+            .tracks
+            .values()
+            .any(|t| t.keying.is_some() && !t.pending.is_empty()));
+        events.extend(tm.finish());
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn confirmations_count_every_promotion_qualified_or_not() {
+        for filter in [true, false] {
+            let mut tm = nc_mgr(DetectorConfig {
+                non_cw_filter: filter,
+                ..DetectorConfig::default()
+            });
+            let promoted = nc_drive(
+                &mut tm,
+                0,
+                1500,
+                |i| {
+                    let mut p = nc_tone(10, nc_keyed(i), 30.0);
+                    p[40] = nc_db(30.0);
+                    p
+                },
+                |_, _| {},
+            );
+            assert_eq!(tm.confirmations(), 2, "filter {filter}");
+            assert_eq!(
+                promoted.len(),
+                if filter { 1 } else { 2 },
+                "filter {filter}"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_on_is_deterministic() {
+        let run = || {
+            let mut tm = nc_mgr(nc_cfg(1000));
+            let promoted = nc_drive(
+                &mut tm,
+                0,
+                2000,
+                |i| {
+                    let mut p = nc_tone(10, nc_keyed(i), 30.0);
+                    p[40] = nc_db(30.0);
+                    if nc_keyed(i / 3) {
+                        p[20..=30].iter_mut().for_each(|x| *x = nc_db(25.0));
+                    }
+                    p
+                },
+                |_, _| {},
+            );
+            format!(
+                "{promoted:?} {:?} {}",
+                tm.close_counts(),
+                tm.confirmations()
+            )
+        };
+        assert_eq!(run(), run());
+    }
+
+    /// Qualify a keyed tone, then key down for good; returns the hop
+    /// counter when `unkeyed` first counted and the last re-rise hop.
+    fn nc_unkeyed_run(
+        cfg: DetectorConfig,
+        steady_hops: u64,
+        mut at: impl FnMut(&mut TrackManager, u64),
+    ) -> (TrackManager, Option<(u64, u64)>) {
+        let mut tm = nc_mgr(cfg);
+        let used = nc_qualify(&mut tm);
+        let mut last_rise = 0;
+        let mut closed = None;
+        nc_drive(
+            &mut tm,
+            used,
+            steady_hops,
+            |_| nc_tone(10, true, 30.0),
+            |tm, i| {
+                at(tm, i);
+                if let Some(ev) = tm.tracks.values().find_map(|t| t.keying.as_ref()) {
+                    last_rise = ev.last_rise_hop.max(ev.last_char_hop);
+                }
+                if tm.close_counts().unkeyed == 1 && closed.is_none() {
+                    closed = Some((tm.hop_counter, last_rise));
+                    // MAN-171 cooldown on the closed track's channel.
+                    assert!(tm.channel_cooldown_until[10] > tm.hop_counter);
+                }
+            },
+        );
+        (tm, closed)
+    }
+
+    #[test]
+    fn unkeyed_active_track_closes_after_unkeyed_close_hops() {
+        let (tm, closed) = nc_unkeyed_run(nc_cfg(500), 800, |_, _| {});
+        let (at, last_rise) = closed.expect("closed Unkeyed");
+        assert_eq!(at - last_rise, 500);
+        assert_eq!(tm.close_counts().unkeyed, 1);
+    }
+
+    #[test]
+    fn callsign_read_suppresses_the_unkeyed_close() {
+        let (tm, closed) = nc_unkeyed_run(nc_cfg(500), 1200, |tm, i| {
+            if i == 0 {
+                let ev = tm
+                    .tracks
+                    .values_mut()
+                    .find_map(|t| t.keying.as_mut())
+                    .unwrap();
+                for c in "K5ARH".chars() {
+                    ev.note_char(0, Some(c));
+                }
+                ev.end_word();
+                assert!(ev.callsign_read);
+            }
+        });
+        assert!(closed.is_none());
+        assert_eq!(tm.close_counts().unkeyed, 0);
+    }
+
+    #[test]
+    fn decoded_characters_restart_the_unkeyed_timer() {
+        let mut char_hop = 0;
+        let (_, closed) = nc_unkeyed_run(nc_cfg(500), 1200, |tm, i| {
+            if i == 300 {
+                char_hop = tm.hop_counter;
+                let ev = tm
+                    .tracks
+                    .values_mut()
+                    .find_map(|t| t.keying.as_mut())
+                    .unwrap();
+                ev.note_char(char_hop, Some('E'));
+            }
+        });
+        let (at, _) = closed.expect("closed Unkeyed");
+        assert_eq!(at, char_hop + 500);
+    }
+
+    #[test]
+    fn unkeyed_close_starts_the_respawn_cooldown() {
+        // `nc_unkeyed_run` asserts the cooldown at the close hop.
+        let (tm, closed) = nc_unkeyed_run(nc_cfg(500), 800, |_, _| {});
+        assert!(closed.is_some());
+        assert!(tm.channel_cooldown_until[10] > 0);
+        assert!(tm.tracks.values().all(|t| t.birth_channel.abs_diff(10) > 1));
+    }
+
+    #[test]
+    fn filter_off_never_closes_unkeyed() {
+        let mut tm = nc_mgr(DetectorConfig {
+            non_cw_filter: false,
+            unkeyed_close_hops: 500,
+            ..DetectorConfig::default()
+        });
+        nc_drive(
+            &mut tm,
+            0,
+            600,
+            |i| nc_tone(10, nc_keyed(i), 30.0),
+            |_, _| {},
+        );
+        nc_drive(&mut tm, 600, 1500, |_| nc_tone(10, true, 30.0), |_, _| {});
+        let c = tm.close_counts();
+        assert_eq!((c.unkeyed, c.not_cw), (0, 0));
+        assert!(tm.tracks.values().all(|t| t.keying.is_none()));
     }
 
     /// MAN-312 (SPEC §2.7): the live-channel rule. Rig audio is too narrow

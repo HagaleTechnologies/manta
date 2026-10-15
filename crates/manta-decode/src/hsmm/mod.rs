@@ -54,24 +54,6 @@ struct Anchor {
     sample_ts: u64,
     prefix: f64,
     tokens: Vec<Token>,
-    /// [Task 8 fix, review round 3] The minimum `HistEntry::sample_ts`
-    /// across every token's `hist` in this anchor, computed once at
-    /// creation. See `HsmmDecoder::push`'s `sealed`-pruning comment: this
-    /// is *not* the same as this anchor's own `sample_ts` -- `successor`
-    /// clones an ancestor's whole `hist` and only stamps the *new* entry
-    /// with the current anchor's timestamp, so an inherited older entry
-    /// (originally stamped by a since-evicted ancestor anchor) can still
-    /// be sitting in a still-live anchor's frozen tokens. `None` if no
-    /// token in this anchor has any hist entry yet.
-    min_hist_ts: Option<u64>,
-}
-
-fn min_hist_ts(tokens: &[Token]) -> Option<u64> {
-    tokens
-        .iter()
-        .flat_map(|t| t.hist.iter())
-        .map(|e| e.sample_ts)
-        .min()
 }
 
 /// Token-passing HSMM decoder: consumes per-hop evidence, maintains a beam
@@ -98,13 +80,11 @@ pub struct HsmmDecoder {
     hop: u64,
     last_prefix: f64,
     last_ts: u64,
-    /// [Task 8 fix; round 6 changed the value to `is_char` rather than the
-    /// specific `Glyph`] `(sample_ts, is_char)` pairs ever actually
-    /// committed; see `commit::commit`'s doc comment for why this must be
-    /// keyed on `sample_ts` (not `born_hop`), why the value is the entry
-    /// KIND rather than its exact value, and why it's threaded through
-    /// every call.
-    sealed: Vec<(u64, bool)>,
+    /// MAN-189: how far emitted output reaches in time; see
+    /// `commit::Frontier`. Replaces PR #161's `sealed` list of exact
+    /// `(sample_ts, is_char)` pairs, which missed a committed glyph
+    /// re-derived under a different closing anchor.
+    frontier: commit::Frontier,
 }
 
 impl HsmmDecoder {
@@ -118,7 +98,7 @@ impl HsmmDecoder {
             hop: 0,
             last_prefix: 0.0,
             last_ts: 0,
-            sealed: Vec::new(),
+            frontier: commit::Frontier::default(),
         }
     }
 
@@ -153,6 +133,7 @@ impl HsmmDecoder {
                 score: 0.0,
                 hist: Vec::new(),
                 anchor_hop: hop,
+                char_start_ts: 0,
             })
             .collect()
     }
@@ -217,7 +198,6 @@ impl HsmmDecoder {
                 hop: ev.hop,
                 sample_ts: ev.sample_ts,
                 prefix: ev.prefix,
-                min_hist_ts: min_hist_ts(&seeds),
                 tokens: seeds.clone(),
             });
             self.live = seeds;
@@ -301,7 +281,7 @@ impl HsmmDecoder {
         // also reports whether this step emitted a winning word-boundary
         // head closed by `Silence` -- SPEC v2 §4.7's second seeding
         // trigger, beside the gate rise above.
-        let outcome = commit::commit_outcome(&mut merged, ev.hop, &self.cfg, &mut self.sealed);
+        let outcome = commit::commit_outcome(&mut merged, ev.hop, &self.cfg, &mut self.frontier);
         out.extend(outcome.entries);
         self.scored_live_len = merged.len();
         if outcome.committed_silence && ev.present {
@@ -342,35 +322,8 @@ impl HsmmDecoder {
             hop: ev.hop,
             sample_ts: ev.sample_ts,
             prefix: ev.prefix,
-            min_hist_ts: min_hist_ts(&merged),
             tokens: merged,
         });
-        // [Task 8 fix, review round 4] Bound `sealed`'s growth: the safe
-        // prune bound is the minimum `sample_ts` over BOTH (a) every hist
-        // entry of every token in every currently-live anchor (round 3's
-        // `min_hist_ts`, needed because `Token::successor` clones an
-        // ancestor's whole `hist` and only stamps the *new* entry with the
-        // current anchor's own timestamp, so an inherited older entry can
-        // outlive the ancestor anchor that originally produced it) AND (b)
-        // every live anchor's own `sample_ts` (round 3 missed this half:
-        // `successor` can also stamp a *brand new* hist entry at a live
-        // anchor's own `sample_ts` via `seg_start_ts = a.sample_ts` --  a
-        // value that isn't in anyone's `hist` yet, so no `min_hist_ts`
-        // reflects it; worse, an anchor whose tokens' hist was just fully
-        // drained by a commit reports `min_hist_ts == None`, and round 3's
-        // `None -> clear()` fallback would discard every real seal once
-        // every live anchor was in that state). `anchors` is FIFO by hop
-        // and `sample_ts` is monotone in hop, so `front.sample_ts` is
-        // exactly the min over every live anchor's own timestamp -- no
-        // need to scan all anchors for that half.
-        let hist_bound = self.anchors.iter().filter_map(|a| a.min_hist_ts).min();
-        let front_ts = self.anchors.front().map(|a| a.sample_ts);
-        match (hist_bound, front_ts) {
-            (Some(h), Some(f)) => self.sealed.retain(|&(ts, _)| ts >= h.min(f)),
-            (Some(h), None) => self.sealed.retain(|&(ts, _)| ts >= h),
-            (None, Some(f)) => self.sealed.retain(|&(ts, _)| ts >= f),
-            (None, None) => self.sealed.clear(),
-        }
         out
     }
 
@@ -389,33 +342,18 @@ impl HsmmDecoder {
             return out;
         }
         // [Task 8 fix] Same stale-anchor concern as `commit::commit`: strip
-        // anything this decoder already committed before reading off the
+        // anything the frontier already decided before reading off the
         // tail, so a straggler token cloned from an older, un-trimmed
         // anchor snapshot can't resurface an already-emitted entry here.
-        //
-        // Codex review, PR #161 round 7: the old `while ... hist.first()
-        // ...` loop only ever stripped a leading, CONTIGUOUS run of sealed
-        // entries -- correct for `commit::commit`'s own use (that
-        // function re-checks the front on every outer-loop pass, so a
-        // newly-revealed sealed front is caught next iteration -- and it
-        // never reads past the front in a single pass anyway), but wrong
-        // here, where this check runs only once before reading the WHOLE
-        // history. A stale-anchor token can hold [an uncommitted entry,
-        // ..., an entry some OTHER lineage already committed and sealed]
-        // -- sealing is keyed globally on `(sample_ts, is_char)`, not per
-        // token, so a token whose own earlier entry never matched
-        // consensus (and so was never stripped) can still carry a LATER
-        // entry that happens to match what a different, already-committed
-        // lineage sealed. The old front-only check left that buried
-        // sealed entry in place, and the loop below would then re-emit it
-        // as a duplicate `CharDecoded`/`WordBoundary`, corrupting the
-        // final decoded text. `retain` removes every sealed entry
-        // anywhere in the history, not just a leading run.
-        let sealed = &self.sealed;
+        // Decided entries form a prefix (see `commit::commit`), but this
+        // check runs only once before reading the WHOLE history (Codex
+        // review, PR #161 round 7), so `strip_decided`'s full pass keeps
+        // it from depending on that proof.
+        let mut frontier = self.frontier;
         for t in self.live.iter_mut() {
-            t.hist
-                .retain(|e| !sealed.contains(&(e.sample_ts, e.glyph.is_some())));
+            frontier.strip_decided(&mut t.hist);
         }
+        self.frontier = frontier;
         self.live.sort_by(token_order);
         let best = self.live[0].clone();
         let hist = best.hist.clone();
@@ -435,6 +373,7 @@ impl HsmmDecoder {
         let mut live = self.live.clone();
         for (j, e) in hist.iter().enumerate() {
             let (confidence, alternatives) = commit::margin(&live, j, &self.cfg);
+            self.frontier.advance(e);
             out.push(Committed {
                 glyph: e.glyph,
                 sample_ts: e.sample_ts,
@@ -445,12 +384,24 @@ impl HsmmDecoder {
         }
         if best.phase == Phase::AfterMark {
             if let Some(g) = MorseTree::shared().glyph(best.node) {
-                out.push(Committed {
+                // MAN-189: the unclosed tail can be a character the
+                // frontier already emitted under a closed gap.
+                let tail = token::HistEntry {
                     glyph: Some(g),
                     sample_ts: self.last_ts,
-                    confidence: 0.5,
-                    alternatives: Vec::new(),
-                });
+                    born_hop: self.hop,
+                    char_start_ts: best.char_start_ts,
+                    closing_segment: None,
+                };
+                if !self.frontier.is_decided(&tail) {
+                    self.frontier.advance(&tail);
+                    out.push(Committed {
+                        glyph: Some(g),
+                        sample_ts: self.last_ts,
+                        confidence: 0.5,
+                        alternatives: Vec::new(),
+                    });
+                }
             }
         }
         self.live.clear();
@@ -568,48 +519,81 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finish_does_not_reemit_an_entry_sealed_by_a_different_lineage() {
-        // Codex review, PR #161 round 7: sealing is keyed globally on
-        // (sample_ts, is_char), not per token, so a stale-anchor token can
-        // hold an uncommitted entry followed by a LATER entry some other
-        // lineage already committed and sealed. The old front-only strip
-        // in `finish()` missed this buried sealed entry and would re-emit
-        // it as a duplicate CharDecoded.
-        let mut dec = HsmmDecoder::new(HsmmConfig::default());
-        dec.sealed.push((200, true)); // a different lineage already committed a char at ts=200
-        dec.live = vec![Token {
+    fn live_token(hist: Vec<token::HistEntry>) -> Token {
+        Token {
             node: MorseTree::ROOT,
             phase: Phase::AfterSpace,
             u: 13.0,
             score: 1.0,
-            hist: vec![
-                token::HistEntry {
-                    glyph: Some(Glyph::Char('A')),
-                    sample_ts: 100,
-                    born_hop: 5,
-                    closing_segment: None,
-                },
-                token::HistEntry {
-                    glyph: Some(Glyph::Char('B')),
-                    sample_ts: 200,
-                    born_hop: 10,
-                    closing_segment: None,
-                },
-            ],
+            hist,
             anchor_hop: 10,
-        }];
+            char_start_ts: 0,
+        }
+    }
+
+    fn char_entry(c: char, char_start_ts: u64, sample_ts: u64) -> token::HistEntry {
+        token::HistEntry {
+            glyph: Some(Glyph::Char(c)),
+            sample_ts,
+            born_hop: 10,
+            char_start_ts,
+            closing_segment: None,
+        }
+    }
+
+    /// The frontier after emitting `entries` in order.
+    fn frontier_after(entries: &[token::HistEntry]) -> commit::Frontier {
+        let mut f = commit::Frontier::default();
+        for e in entries {
+            f.advance(e);
+        }
+        f
+    }
+
+    #[test]
+    fn finish_does_not_reemit_an_entry_decided_by_a_different_lineage() {
+        // Codex review, PR #161 round 7, restated for MAN-189's frontier:
+        // a straggler token from a stale anchor can still hold a
+        // character a different lineage already committed, here at a
+        // later closing anchor (B@205 vs the emitted B@200), ahead of a
+        // genuinely new one. `finish()` must emit only the new C.
+        let mut dec = HsmmDecoder::new(HsmmConfig::default());
+        dec.frontier = frontier_after(&[char_entry('B', 160, 200)]);
+        dec.live = vec![live_token(vec![
+            char_entry('B', 160, 205),
+            char_entry('C', 240, 300),
+        ])];
         dec.scored_live_len = dec.live.len(); // MAN-192: the fixture's live is all scored
         let out = dec.finish();
-        assert!(
-            !out.iter().any(|c| c.sample_ts == 200),
-            "must not re-emit the entry at sample_ts=200, already sealed by a different \
-             lineage: {out:?}"
-        );
-        assert!(
-            out.iter().any(|c| c.sample_ts == 100),
-            "the genuinely uncommitted entry at sample_ts=100 must still be emitted: {out:?}"
-        );
+        let got: Vec<_> = out.iter().map(|c| (c.glyph, c.sample_ts)).collect();
+        assert_eq!(got, vec![(Some(Glyph::Char('C')), 300)], "{out:?}");
+    }
+
+    #[test]
+    fn finish_does_not_reemit_an_emitted_glyph_as_the_unclosed_tail() {
+        // MAN-189: the best token can still be AfterMark on the E node of
+        // a character that was already emitted under a closed gap.
+        let e_node = MorseTree::shared()
+            .child(MorseTree::ROOT, crate::tree::Element::Dit)
+            .unwrap();
+        let run = |char_start_ts: u64| {
+            let mut dec = HsmmDecoder::new(HsmmConfig::default());
+            dec.frontier = frontier_after(&[char_entry('E', 180, 200)]);
+            dec.last_ts = 320;
+            dec.live = vec![Token {
+                node: e_node,
+                phase: Phase::AfterMark,
+                char_start_ts,
+                ..live_token(Vec::new())
+            }];
+            dec.scored_live_len = dec.live.len(); // MAN-192: the fixture's live is all scored
+            dec.finish()
+        };
+        let out = run(180);
+        assert!(out.is_empty(), "re-emitted the committed E: {out:?}");
+        let out = run(260);
+        let got: Vec<_> = out.iter().map(|c| c.glyph).collect();
+        assert_eq!(got, vec![Some(Glyph::Char('E'))], "{out:?}");
     }
 
     #[test]
@@ -624,12 +608,14 @@ mod tests {
                 glyph: Some(Glyph::Char('A')),
                 sample_ts: 100,
                 born_hop: 1,
+                char_start_ts: 0,
                 closing_segment: None,
             },
             token::HistEntry {
                 glyph: Some(Glyph::Char('B')),
                 sample_ts: 200,
                 born_hop: 2,
+                char_start_ts: 150,
                 closing_segment: None,
             },
         ];
@@ -640,6 +626,7 @@ mod tests {
             score: 10.0,
             hist,
             anchor_hop: 2,
+            char_start_ts: 0,
         };
 
         let mut dec_baseline = HsmmDecoder::new(cfg.clone());
@@ -659,9 +646,11 @@ mod tests {
                     glyph: Some(Glyph::Char('C')), // disagrees at entry 0 only
                     sample_ts: 100,
                     born_hop: 1,
+                    char_start_ts: 0,
                     closing_segment: None,
                 }],
                 anchor_hop: 1,
+                char_start_ts: 0,
             },
         ];
         dec_with_rejected.scored_live_len = dec_with_rejected.live.len(); // MAN-192
@@ -916,6 +905,7 @@ mod tests {
                 score: 0.0,
                 hist: Vec::new(),
                 anchor_hop: 250,
+                char_start_ts: 0,
             },
             Token {
                 node: MorseTree::ROOT,
@@ -926,9 +916,11 @@ mod tests {
                     glyph: Some(Glyph::Char('E')),
                     sample_ts: 28_928,
                     born_hop: 250,
+                    char_start_ts: 0,
                     closing_segment: Some(SegType::Silence),
                 }],
                 anchor_hop: 250,
+                char_start_ts: 0,
             },
         ];
         dec.scored_live_len = 2;
@@ -959,9 +951,11 @@ mod tests {
                 glyph: Some(Glyph::Char('E')),
                 sample_ts: 100,
                 born_hop: 5,
+                char_start_ts: 0,
                 closing_segment: Some(SegType::CGap),
             }],
             anchor_hop: 5,
+            char_start_ts: 0,
         };
         // Scored-only control.
         let mut control = HsmmDecoder::new(HsmmConfig::default());

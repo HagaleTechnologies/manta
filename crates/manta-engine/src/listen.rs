@@ -76,12 +76,23 @@ pub struct ListenObservers {
     /// chunk so the published value never goes backwards. A counter, so it
     /// is never zeroed on exit. `None` (the default) skips the store.
     pub static_crashes: Option<Arc<AtomicU64>>,
+    /// MAN-234: input samples the channelizer replaced with silence
+    /// (`Channelizer::bad_samples`, summed across the segments a
+    /// discontinuity starts), stored with `fetch_max` after each processed
+    /// chunk so it never goes backwards. `None` (the default) skips it.
+    pub bad_samples: Option<Arc<AtomicU64>>,
     /// MAN-314: the currently marked RTTY signals (SPEC §2.6), stored
     /// whenever the marked set or a marked signal's metadata changes (so a
     /// store is not by itself a mark or clear), emptied on a segment
     /// restart, a read error and every exit. `None` (the default) skips it
     /// entirely.
     pub rtty: Option<Arc<RttyObserver>>,
+    /// MAN-313: every CANDIDATE -> ACTIVE confirmation the detector has
+    /// made since `listen()` started (`TrackManager::confirmations`),
+    /// whether or not the track went on to qualify as keyed CW. Summed
+    /// across outage segments, so it only ever grows. Stored wherever the
+    /// active-track count is. `None` (the default) skips it entirely.
+    pub detector_confirmations: Option<Arc<AtomicU64>>,
     /// MAN-324: the live-state stream -- once per stream second each
     /// channel's floor and occupancy, each track's running copy and
     /// candidates when its text changes, every validation decision and
@@ -594,10 +605,27 @@ pub fn listen_with_observers(
         }
     };
 
+    // MAN-313: each segment has its own `TrackManager`, so its
+    // confirmation count restarts at 0; `confirmations_base` holds the
+    // closed segments' totals so the published count never goes back.
+    let mut confirmations_base: u64 = 0;
+    let report_confirmations = |n: u64| {
+        if let Some(counter) = &observers.detector_confirmations {
+            counter.store(n, Ordering::Relaxed);
+        }
+    };
+
     // MAN-312: crashes counted by segments a discontinuity already replaced.
     let mut crash_base: u64 = 0;
     let report_static_crashes = |n: u64| {
         if let Some(counter) = &observers.static_crashes {
+            counter.fetch_max(n, Ordering::Relaxed);
+        }
+    };
+    // MAN-234: samples replaced by segments a discontinuity already replaced.
+    let mut bad_base: u64 = 0;
+    let report_bad_samples = |n: u64| {
+        if let Some(counter) = &observers.bad_samples {
             counter.fetch_max(n, Ordering::Relaxed);
         }
     };
@@ -668,7 +696,9 @@ pub fn listen_with_observers(
     );
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
+    report_confirmations(confirmations_base + seg.tm.confirmations());
     report_static_crashes(crash_base + seg.tm.static_crash_count());
+    report_bad_samples(bad_base + seg.ch.bad_samples());
     rtty.update(&seg.tm);
     on_tracks(n_tracks);
     // `..filled`: the whole buffer unless a stop request cut the fill short.
@@ -684,7 +714,9 @@ pub fn listen_with_observers(
     );
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
+    report_confirmations(confirmations_base + seg.tm.confirmations());
     report_static_crashes(crash_base + seg.tm.static_crash_count());
+    report_bad_samples(bad_base + seg.ch.bad_samples());
     rtty.update(&seg.tm);
     on_tracks(n_tracks);
     let mut seg_consumed: u64 = filled as u64;
@@ -730,7 +762,9 @@ pub fn listen_with_observers(
                 &mut on_spot,
             );
             let next_id = seg.tm.next_track_id();
+            confirmations_base += seg.tm.confirmations();
             crash_base += seg.tm.static_crash_count();
+            bad_base += seg.ch.bad_samples();
             // The old segment's marks clear where its samples end.
             rtty.restart(seg_base + seg_consumed);
             seg_base += seg_consumed + gap;
@@ -776,7 +810,9 @@ pub fn listen_with_observers(
         );
         let n_tracks = seg.tm.decoding_track_count();
         report_active_tracks(n_tracks);
+        report_confirmations(confirmations_base + seg.tm.confirmations());
         report_static_crashes(crash_base + seg.tm.static_crash_count());
+        report_bad_samples(bad_base + seg.ch.bad_samples());
         rtty.update(&seg.tm);
         on_tracks(n_tracks);
         if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
@@ -797,11 +833,13 @@ pub fn listen_with_observers(
         &mut on_spot,
     );
     report_static_crashes(crash_base + seg.tm.static_crash_count());
+    report_bad_samples(bad_base + seg.ch.bad_samples());
     // `finish()` flushes and drops every decoder and closes every remaining
     // track: nothing is being decoded once the stream has ended, so both
     // observers must settle back to 0 rather than be left holding the last
     // live value after a source disconnects or a replay hits EOF.
     report_active_tracks(0);
+    report_confirmations(confirmations_base + seg.tm.confirmations());
     rtty.restart(seg_base + seg_consumed);
     on_tracks(0);
     Ok(())
@@ -1131,6 +1169,100 @@ mod tests {
         assert!(readings.windows(2).all(|w| w[0] <= w[1]), "{readings:?}");
         assert!(readings.contains(&1), "{readings:?}");
         assert_eq!(readings.last(), Some(&2), "{readings:?}");
+    }
+
+    /// Runs `listen_with_observers` with a bad-sample observer, returning
+    /// the value it held at every `on_tracks` call and once more at the end.
+    fn bad_sample_readings(src: Box<dyn manta_input::IqSource>) -> Vec<u64> {
+        let counter = Arc::new(AtomicU64::new(0));
+        let mut readings = Vec::new();
+        listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                bad_samples: Some(counter.clone()),
+                ..Default::default()
+            },
+            |_| {},
+            |_| {},
+            |_| readings.push(counter.load(Ordering::Relaxed)),
+        )
+        .unwrap();
+        readings.push(counter.load(Ordering::Relaxed));
+        readings
+    }
+
+    fn v1_6s() -> (manta_testkit::vectors::VectorSpec, Vec<Complex32>) {
+        let spec = manta_testkit::vectors::VectorSpec {
+            duration_s: 6.0,
+            ..manta_testkit::vectors::v1()
+        };
+        let samples = manta_testkit::vectors::render(&spec).unwrap().samples;
+        (spec, samples)
+    }
+
+    /// MAN-234: the bad-sample count reaches the observer, and a
+    /// discontinuity's fresh segment (a fresh channelizer, counting from 0)
+    /// adds to it rather than restarting it. `GapSource` serves its buffer
+    /// once, reports the gap, then serves it again: a NaN in the first pass
+    /// and an `+Inf` at another index in the second are one bad sample per
+    /// segment, two in all.
+    #[test]
+    fn bad_samples_observer_counts_across_a_reconnect_segment() {
+        let (spec, mut iq) = v1_6s();
+        iq[300_000].re = f32::NAN;
+        let src = GapSource::new(iq, spec.fs, spec.center_freq_hz, 48_000);
+        // The replay after the gap carries an `+Inf` at another index
+        // instead of the NaN, so each segment has exactly one bad sample.
+        let mut second = src.samples.clone();
+        second[300_000].re = 0.25;
+        second[400_000].im = f32::INFINITY;
+        let readings = bad_sample_readings(Box::new(SwapOnGapSource {
+            inner: src,
+            second: Some(second),
+        }));
+        assert!(readings.windows(2).all(|w| w[0] <= w[1]), "{readings:?}");
+        assert!(readings.contains(&1), "{readings:?}");
+        assert_eq!(readings.last(), Some(&2), "{readings:?}");
+    }
+
+    /// `GapSource`, but the buffer it replays after the gap is `second`.
+    struct SwapOnGapSource {
+        inner: GapSource,
+        second: Option<Vec<Complex32>>,
+    }
+
+    impl manta_input::IqSource for SwapOnGapSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            if !self.inner.armed && self.inner.served >= self.inner.arm_at {
+                if let Some(second) = self.second.take() {
+                    self.inner.samples = second;
+                }
+            }
+            self.inner.read(buf)
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            manta_input::IqSource::take_discontinuity(&mut self.inner)
+        }
+    }
+
+    #[test]
+    fn bad_samples_observer_stays_zero_on_clean_input() {
+        let (spec, iq) = v1_6s();
+        let readings = bad_sample_readings(Box::new(GapSource::new(
+            iq,
+            spec.fs,
+            spec.center_freq_hz,
+            48_000,
+        )));
+        assert!(readings.iter().all(|&n| n == 0), "{readings:?}");
     }
 
     /// MAN-312: a source whose passband holds fewer than
@@ -2117,6 +2249,63 @@ mod tests {
         assert_eq!(peak, 1);
         assert!(obs.generation() >= 2, "marked, then cleared");
         assert!(obs.snapshot().is_empty(), "cleared at exit");
+    }
+
+    /// MAN-313 test scene: noise plus a steady unkeyed carrier 10 kHz above
+    /// centre at +20 dB in 2500 Hz -- confirmed by the detector within
+    /// ~50 ms, never keyed CW.
+    fn steady_carrier_scene(duration_s: f64) -> Vec<Complex32> {
+        let fs = 96_000.0;
+        let (mut iq, _) = manta_testkit::scene::render_scene(&[], fs, duration_s, Some(5)).unwrap();
+        let noise_pow = iq.iter().map(|z| z.norm_sqr() as f64).sum::<f64>() / iq.len() as f64;
+        let amp = (100.0 * noise_pow * 2500.0 / fs).sqrt() as f32;
+        let w = 2.0 * std::f64::consts::PI * 10_000.0 / fs;
+        for (n, z) in iq.iter_mut().enumerate() {
+            let ph = w * n as f64;
+            *z += Complex32::new(amp * ph.cos() as f32, amp * ph.sin() as f32);
+        }
+        iq
+    }
+
+    /// MAN-313: the detector-confirmation counter is published while the
+    /// stream runs, summed across an outage restart (each segment's
+    /// `TrackManager` counts from 0), and never goes back.
+    #[test]
+    fn listen_publishes_detector_confirmations() {
+        let samples = steady_carrier_scene(6.0);
+        let src = GapSource::new(samples, 96_000.0, 14_000_000.0, 96_000);
+        let gap_taken = src.gap_taken.clone();
+        let counter = Arc::new(AtomicU64::new(0));
+        let seen = counter.clone();
+        let mut last = 0u64;
+        let mut before_gap = 0u64;
+        listen_with_observers(
+            Box::new(src),
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                detector_confirmations: Some(counter.clone()),
+                ..Default::default()
+            },
+            |_ev| {},
+            |_spot| {},
+            |_n| {
+                let now = seen.load(Ordering::Relaxed);
+                assert!(now >= last, "the count went back from {last} to {now}");
+                last = now;
+                if !gap_taken.load(Ordering::Relaxed) {
+                    before_gap = now;
+                }
+            },
+        )
+        .unwrap();
+        let total = counter.load(Ordering::Relaxed);
+        assert!(before_gap >= 1, "the carrier is confirmed before the gap");
+        assert!(
+            total > before_gap,
+            "the post-gap segment's confirmation adds to the pre-gap count \
+             ({before_gap} before the gap, {total} at the end)"
+        );
     }
 
     #[test]
