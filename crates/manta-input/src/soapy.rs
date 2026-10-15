@@ -336,9 +336,13 @@ mod tests {
     fn account_overflow_notice_is_rate_limited_to_the_interval() {
         let counters = InputHealthCounters::new();
         let mut last_warn = None;
-        let fired = std::sync::atomic::AtomicUsize::new(0);
-        let notice: Option<Box<dyn Fn() + Send + Sync>> = Some(Box::new(|| {
-            fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // `Box<dyn Fn() + Send + Sync>` defaults to `'static`, so the
+        // closure owns an `Arc` clone of the count rather than borrowing a
+        // local (E0597).
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fired_in_notice = Arc::clone(&fired);
+        let notice: Option<Box<dyn Fn() + Send + Sync>> = Some(Box::new(move || {
+            fired_in_notice.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }));
 
         let t0 = Instant::now();
