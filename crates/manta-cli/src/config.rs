@@ -719,7 +719,10 @@ fn check_ka9q_interface(interface: &str) -> std::result::Result<Ipv4Addr, String
 fn check_input_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.chars().count() <= MAX_INPUT_NAME_CHARS
-        && name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
@@ -1220,7 +1223,8 @@ mod tests {
 
     // ---- MAN-13: [[input]] ----
 
-    const KA9Q_40: &str = "[[input]]\nname = \"40m\"\ntype = \"ka9q\"\ngroup = \"239.1.2.3\"\nssrc = 7030000\n";
+    const KA9Q_40: &str =
+        "[[input]]\nname = \"40m\"\ntype = \"ka9q\"\ngroup = \"239.1.2.3\"\nssrc = 7030000\n";
     const KA9Q_20: &str = "[[input]]\nname = \"20m\"\ntype = \"ka9q\"\ngroup = \"239.1.2.3\"\nssrc = 14030000\nfreq_correction_ppm = 0.8\n";
 
     fn file_entry(name: &str, extra: &str) -> String {
@@ -1252,7 +1256,9 @@ mod tests {
 
     #[test]
     fn input_names_are_required_with_two_or_more_entries() {
-        let err = err_of(&format!("{KA9Q_40}[[input]]\ntype = \"kiwi\"\nhost = \"k\"\nfreq_hz = 14030000.0\n"));
+        let err = err_of(&format!(
+            "{KA9Q_40}[[input]]\ntype = \"kiwi\"\nhost = \"k\"\nfreq_hz = 14030000.0\n"
+        ));
         assert!(
             err.ends_with(
                 ": [[input]] entry 2 has no name -- with more than one [[input]], give each one a \
@@ -1265,7 +1271,10 @@ mod tests {
     #[test]
     fn input_names_must_be_unique() {
         let err = err_of(&format!("{KA9Q_20}{KA9Q_20}"));
-        assert!(err.ends_with(": [[input]] name \"20m\" is used twice"), "{err}");
+        assert!(
+            err.ends_with(": [[input]] name \"20m\" is used twice"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1274,7 +1283,10 @@ mod tests {
                     and be at most 32 characters";
         for bad in ["a b", "-x", "", &"x".repeat(33)] {
             let err = err_of(&format!("{KA9Q_40}{}", file_entry(bad, "")));
-            assert!(err.contains(&format!("[[input]] name {bad:?} {want}")), "{err}");
+            assert!(
+                err.contains(&format!("[[input]] name {bad:?} {want}")),
+                "{err}"
+            );
         }
         let err = err_of("[input]\nname = \"a b\"\ntype = \"audio\"\n");
         assert!(err.contains(want), "{err}");
@@ -1362,7 +1374,11 @@ mod tests {
                  14030000.0\n"
             )
         };
-        let err = err_of(&format!("{}{}", hpsdr("a", "192.168.1.40"), hpsdr("b", "192.168.1.40")));
+        let err = err_of(&format!(
+            "{}{}",
+            hpsdr("a", "192.168.1.40"),
+            hpsdr("b", "192.168.1.40")
+        ));
         assert!(
             err.contains(
                 ": [[input]] \"b\": the HPSDR radio at 192.168.1.40:1024 is already input \"a\"; \
@@ -1370,12 +1386,19 @@ mod tests {
             ),
             "{err}"
         );
-        assert!(load_file(&format!("{}{}", hpsdr("a", "192.168.1.40"), hpsdr("b", "192.168.1.41"))).is_ok());
+        assert!(load_file(&format!(
+            "{}{}",
+            hpsdr("a", "192.168.1.40"),
+            hpsdr("b", "192.168.1.41")
+        ))
+        .is_ok());
     }
 
     #[test]
     fn audio_input_needs_center_freq_hz_with_two_or_more() {
-        let err = err_of(&format!("{KA9Q_40}[[input]]\nname = \"b\"\ntype = \"audio\"\n"));
+        let err = err_of(&format!(
+            "{KA9Q_40}[[input]]\nname = \"b\"\ntype = \"audio\"\n"
+        ));
         assert!(
             err.ends_with(
                 ": [[input]] \"b\": type = \"audio\" needs center_freq_hz when there is more than \
@@ -1391,7 +1414,10 @@ mod tests {
 
     #[test]
     fn manta_input_env_is_refused_with_two_or_more_inputs() {
-        let f = write_cfg(&format!("{KA9Q_40}{KA9Q_20}{}", KA9Q_20.replace("20m", "15m")));
+        let f = write_cfg(&format!(
+            "{KA9Q_40}{KA9Q_20}{}",
+            KA9Q_20.replace("20m", "15m")
+        ));
         let v = vars(&[("MANTA_INPUT_FREQ_CORRECTION_PPM", "1.5")]);
         let err = format!("{:#}", load(Some(f.path()), Env::Read(&v)).unwrap_err());
         assert_eq!(
@@ -1408,8 +1434,9 @@ mod tests {
         assert_eq!(l.inputs[0].name, "rsp");
         let untyped = load_file("[input]\nfreq_correction_ppm = 1.0\n").unwrap();
         assert_eq!(untyped.inputs[0].name, "audio");
-        let typed = load_file(&file_entry("x", "").replace("[[input]]\nname = \"x\"\n", "[input]\n"))
-            .unwrap();
+        let typed =
+            load_file(&file_entry("x", "").replace("[[input]]\nname = \"x\"\n", "[input]\n"))
+                .unwrap();
         assert_eq!(typed.inputs[0].name, "file");
     }
 

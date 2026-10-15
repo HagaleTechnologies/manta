@@ -278,8 +278,9 @@ impl LiveTap {
     /// Input `input` of `n_inputs` owns ids `≡ input + 1 (mod n_inputs)`.
     pub(crate) fn retain_input_tracks(&mut self, input: usize, n_inputs: usize, live: &[u32]) {
         let n = n_inputs.max(1);
-        self.tracks
-            .retain(|id, _| (*id as usize).saturating_sub(1) % n != input || live.binary_search(id).is_ok());
+        self.tracks.retain(|id, _| {
+            (*id as usize).saturating_sub(1) % n != input || live.binary_search(id).is_ok()
+        });
     }
 
     /// After each batch, forgets tracks the manager has removed. Once per

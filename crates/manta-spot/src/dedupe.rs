@@ -177,7 +177,8 @@ mod tests {
             14_027_000.0,
             20.0,
             SpotType::Cq,
-            window_samples + 1, 0
+            window_samples + 1,
+            0
         ));
     }
 
@@ -233,14 +234,7 @@ mod tests {
         let mut d = Dedupe::new(FS);
         let window_samples = (SUPPRESSION_SECONDS * FS) as u64;
         assert!(d.should_emit("W1AW", 14_012_340.0, 20.0, SpotType::Cq, 0, 0));
-        assert!(d.should_emit(
-            "W1AW",
-            14_012_340.0,
-            20.0,
-            SpotType::Cq,
-            window_samples,
-            1
-        ));
+        assert!(d.should_emit("W1AW", 14_012_340.0, 20.0, SpotType::Cq, window_samples, 1));
     }
 
     #[test]

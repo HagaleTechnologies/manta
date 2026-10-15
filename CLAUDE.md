@@ -273,6 +273,16 @@ by a 20-run merge-queue watch with rollback triggers;
 `test-hpsdr (windows-latest)` stays advisory. See
 docs/DECISIONS/2026-10-15-man371-windows-required-check.md.
 
+MAN-13: `[[input]]` (one entry per receiver, each named) makes one `run`
+decode several SDRs or receiver channels into one spot output: each input
+has its own thread, channelizer and track manager (`manta-engine::multi`),
+all feed one validator at a common clock with interleaved track ids, and
+dedupe treats a different input's report of a stored spot as a duplicate.
+`--input NAME` picks one input for `calibrate`/`doctor`/`soak`/`check`;
+`/healthz` stays `ok` while one of several inputs is healthy. HPSDR
+multi-DDC is MAN-307. See
+docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each

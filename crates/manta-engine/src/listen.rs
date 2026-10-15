@@ -331,6 +331,7 @@ struct Segment {
     pad_hops: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn new_segment(
     fs: f64,
     center_freq_hz: f64,
@@ -954,14 +955,13 @@ pub(crate) fn run_input_front(
     let mut seg_base: u64 = 0;
     let mut seg_consumed: u64 = 0;
     let padding = vec![Complex32::new(0.0, 0.0); seg.ch.filter_len()];
-    let batch = |events: Vec<DecoderEvent>, end_local: u64, tm: &crate::track::TrackManager| {
-        Batch {
+    let batch =
+        |events: Vec<DecoderEvent>, end_local: u64, tm: &crate::track::TrackManager| Batch {
             events: to_common(events, clock, calibration_factor),
             end_ts: clock.to_common(end_local),
             n_tracks: tm.decoding_track_count(),
             live_ids: observers.live_ids.then(|| tm.track_ids()),
-        }
-    };
+        };
 
     let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
     let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];

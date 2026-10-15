@@ -8,11 +8,11 @@
 //! `seg_b` 192 kS/s at 14.060 MHz (W1AW again, ZL2XYZ at 14_085_000 Hz);
 //! 120 s, 20 dB, 20 WPM.
 
+use manta_decode::events::DecoderEvent;
 use manta_engine::{
     listen_inputs, listen_with_observers, open_inputs, InputEnd, InputSpec, ListenObservers,
     OpenedInputs, PipelineConfig, SessionClock, SharedObservers, Spot, MAX_INPUTS,
 };
-use manta_decode::events::DecoderEvent;
 use manta_testkit::scene::{render_scene, SignalSpec};
 use num_complex::Complex32;
 use std::collections::BTreeMap;

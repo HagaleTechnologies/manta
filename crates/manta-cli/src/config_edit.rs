@@ -44,6 +44,12 @@ pub(crate) fn set_freq_correction_ppm(text: &str, ppm: f64) -> Result<(String, O
                 None
             }
         },
+        // MAN-13: saving into one `[[input]]` entry is not supported yet.
+        Some(Item::ArrayOfTables(_)) => bail!(
+            "the config has several [[input]] entries, and saving {KEY} into one of them is \
+             not supported yet; set {KEY} = {} in that entry by hand",
+            literal(ppm)
+        ),
         _ => bail!("[input] is not a table, so {KEY} cannot be set in it"),
     };
     let mut out = doc.to_string();

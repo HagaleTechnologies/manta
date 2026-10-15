@@ -382,10 +382,7 @@ pub fn listen_inputs(
         SessionClock::Replay => vec![0; n],
         SessionClock::Live { offsets } => {
             if offsets.len() != n {
-                bail!(
-                    "{} live clock offsets for {n} inputs",
-                    offsets.len()
-                );
+                bail!("{} live clock offsets for {n} inputs", offsets.len());
             }
             offsets
                 .iter()
@@ -490,7 +487,6 @@ pub fn listen_inputs(
             }
         }
     }
-    drop(ingest);
     for h in handles {
         let _ = h.join();
     }
@@ -501,7 +497,10 @@ pub fn listen_inputs(
             e.unwrap_or_else(|| InputEnd {
                 index,
                 name: opened.inputs[index].name.clone(),
-                result: Err(anyhow!("input {}: ended without a result", opened.inputs[index].name)),
+                result: Err(anyhow!(
+                    "input {}: ended without a result",
+                    opened.inputs[index].name
+                )),
             })
         })
         .collect())
@@ -564,7 +563,11 @@ impl PipelineConfig {
     /// MAN-13: the one validator several inputs share: built at the common
     /// rate, with calibration factor 1.0 (each input calibrates its own
     /// frequencies, D4) and the input count its track ids interleave by.
-    pub fn shared_validator(&self, rate_hz: f64, input_count: u32) -> Result<manta_spot::Validator> {
+    pub fn shared_validator(
+        &self,
+        rate_hz: f64,
+        input_count: u32,
+    ) -> Result<manta_spot::Validator> {
         let uncalibrated = PipelineConfig {
             freq_correction_ppm: 0.0,
             ..self.clone()
@@ -605,9 +608,13 @@ mod tests {
 
     #[test]
     fn common_rate_rejects_a_rate_that_is_not_a_power_of_two_multiple() {
-        let err = common_rate_hz(&[96_000.0, 100_000.0]).unwrap_err().to_string();
+        let err = common_rate_hz(&[96_000.0, 100_000.0])
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("96000"), "{err}");
-        let err = common_rate_hz(&[48_000.0, 144_000.0]).unwrap_err().to_string();
+        let err = common_rate_hz(&[48_000.0, 144_000.0])
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("48000"), "{err}");
     }
 
@@ -655,7 +662,11 @@ mod tests {
     fn replay_merge_drops_an_ended_input_from_the_minimum() {
         let mut merge = ReplayMerge::new(3);
         let mut queues = vec![
-            vec![Pulled::Batch(5, "a1"), Pulled::Batch(30, "a2"), Pulled::End(Ok(()))],
+            vec![
+                Pulled::Batch(5, "a1"),
+                Pulled::Batch(30, "a2"),
+                Pulled::End(Ok(())),
+            ],
             vec![Pulled::End(Err(anyhow!("boom")))],
             vec![Pulled::Batch(10, "c1"), Pulled::End(Ok(()))],
         ];

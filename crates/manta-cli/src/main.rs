@@ -484,7 +484,7 @@ enum Command {
     /// day-to-day operating.
     Soak {
         /// With several [[input]] entries in the config, the one to examine,
-        /// by its name (MAN-13). Optional with one input.
+        /// by its name. Optional with one input.
         #[arg(long, value_name = "NAME")]
         input: Option<String>,
         /// How long to run, in seconds.
@@ -727,7 +727,7 @@ enum Command {
     // MAN-126: the setup checks live in doctor_checks.rs and clock_check.rs.
     Doctor {
         /// With several [[input]] entries in the config, the one to examine,
-        /// by its name (MAN-13). Optional with one input.
+        /// by its name. Optional with one input.
         #[arg(long, value_name = "NAME")]
         input: Option<String>,
         /// How long to listen for, in seconds (3 to 3600).
@@ -941,7 +941,7 @@ enum Command {
     // block is copied from `Doctor`, as run/soak/doctor each copy it.
     Calibrate {
         /// With several [[input]] entries in the config, the one to examine,
-        /// by its name (MAN-13). Optional with one input.
+        /// by its name. Optional with one input.
         #[arg(long, value_name = "NAME")]
         input: Option<String>,
         /// How long to measure, in seconds (10 to 3600). NCDXF beacons take
@@ -9722,7 +9722,9 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn select_input_requires_a_name_with_two_or_more_inputs() {
         let mut loaded = loaded_from(THREE_KA9Q);
-        let err = select_input(&mut loaded, None, "doctor").unwrap_err().to_string();
+        let err = select_input(&mut loaded, None, "doctor")
+            .unwrap_err()
+            .to_string();
         assert_eq!(
             err,
             format!(

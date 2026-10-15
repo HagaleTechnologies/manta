@@ -137,8 +137,16 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
 **Sample-rate assumptions.** Design center: 96–192 kS/s complex (covers any HF CW
 band segment; CW allocations are ≤ 100 kHz wide). Supported ceiling: 768 kS/s
 (Airspy HF+ full span). The channelizer parameterizes N to hold channel spacing
-near 100 Hz regardless of input rate (§4). Multi-band via multiple daemon
-instances, not one instance retuning — simpler, and SDRs are cheap.
+near 100 Hz regardless of input rate (§4). Several bands, or several segments
+of one band, run as several inputs of one daemon (MAN-13): each `[[input]]`
+entry -- an SDR, a ka9q-radio channel, a KiwiSDR channel -- gets its own
+thread with its own channelizer, track manager and decoder pool, and every
+input feeds one shared validator, so the repetition gate and the 10-minute
+dedupe see every input's reports and a station two inputs hear is spotted
+once. Inputs share one clock at the highest input rate and interleave their
+track ids; see `manta-engine::multi` and
+`docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md`. Several receivers
+on one HPSDR radio wait on MAN-307.
 
 **Variable-width capture** (issue #169): an optional decimation stage
 (`manta-dsp::decimate::Decimator`, wrapped as

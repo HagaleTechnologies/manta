@@ -251,9 +251,11 @@ per receiver. Each entry takes the keys above, plus `name`. A one-entry
 - `calibrate`, `doctor`, `soak` and `check` examine one receiver: pass
   `--input NAME`.
 - A station two receivers both hear is spotted once (the shared validator's
-  cross-input dedupe). Today `run` decodes several inputs without a
-  `[server]` table (spots on stdout); `[server]` with several inputs is
-  refused until the daemon wiring lands. See
+  cross-input dedupe), on stdout and, with `[server]`, on the one telnet,
+  JSON and metrics server. `/healthz` stays `ok` while at least one input
+  is healthy. SIGHUP stops a several-input run instead of reloading, and
+  the live-state stream, scheduled list refresh and per-input
+  `manta_input_*` counters are not wired for several inputs yet. See
   [DECISIONS/2026-10-15-man13-multi-input-daemon.md](DECISIONS/2026-10-15-man13-multi-input-daemon.md).
 
 ## [spot]

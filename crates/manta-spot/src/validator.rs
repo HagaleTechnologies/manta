@@ -1418,17 +1418,14 @@ impl Validator {
             return None;
         }
 
-        if !self
-            .dedupe
-            .should_emit(
-                &candidate,
-                freq_hz,
-                snr_db,
-                spot_type,
-                sample_ts,
-                self.input_of(track_id),
-            )
-        {
+        if !self.dedupe.should_emit(
+            &candidate,
+            freq_hz,
+            snr_db,
+            spot_type,
+            sample_ts,
+            self.input_of(track_id),
+        ) {
             self.decide(|| withheld(Reason::Dedupe).with_reps(reps));
             return None;
         }
@@ -2268,7 +2265,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             let words = ["DE", "K5ARH", "K"];
             let mut spots = run(&transmission_events(1, &words, 0), v);
             spots.extend(run(&transmission_events(1, &words, 100_000), v));
-            spots.extend(run(&transmission_events(1, &["DE", "K5ARH", "K"], 900_000), v));
+            spots.extend(run(
+                &transmission_events(1, &["DE", "K5ARH", "K"], 900_000),
+                v,
+            ));
             format!("{spots:?}")
         };
         let mut default = Validator::new(FS, CTY_FIXTURE, None);

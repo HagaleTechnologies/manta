@@ -12,7 +12,7 @@ pub(crate) struct Args {
     #[arg(long, default_value = "3", value_parser = parse_duration)]
     duration: f64,
     /// With several [[input]] entries in the config, the one to check, by
-    /// its name (MAN-13). Optional with one input.
+    /// its name. Optional with one input.
     #[arg(long, value_name = "NAME")]
     input: Option<String>,
     /// Sound-card input device; matched by substring. Defaults to the

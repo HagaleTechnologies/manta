@@ -46,7 +46,8 @@ pub(crate) fn check(config_flag: Option<PathBuf>) -> Result<()> {
     // rejects source types this build cannot open), blocklist/notch reads.
     // Never `spec.open()`, never `is_rf_aware()` (it opens IQ WAVs), never
     // `start_spot_server`.
-    let prepared = crate::prepare_live(crate::CliOverrides::none(), path.clone(), None, true, None)?;
+    let prepared =
+        crate::prepare_live(crate::CliOverrides::none(), path.clone(), None, true, None)?;
     crate::refuse_rbn_compare_replay(&prepared.resolved, false)?;
     reject_placeholders(&prepared.loaded)?;
     reject_duplicate_ports(&prepared.loaded)?;

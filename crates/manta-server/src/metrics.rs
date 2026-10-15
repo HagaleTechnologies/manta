@@ -3228,7 +3228,10 @@ mod tests {
         assert!(!m.health_at(now).healthy);
         let (m, now) = ready_metrics(&[("40m", true), ("20m", true)]);
         m.set_listener_up("json", false);
-        assert!(!m.health_at(now).healthy, "a down listener still fails the node");
+        assert!(
+            !m.health_at(now).healthy,
+            "a down listener still fails the node"
+        );
     }
 
     #[test]

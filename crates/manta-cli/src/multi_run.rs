@@ -6,7 +6,9 @@
 //! its health edges; an input that ends in error stops only itself.
 
 use crate::reconnect::{HealthSink, ReconnectingSource};
-use crate::{fmt, logging, text_lines, wrap_file_replay, LiveSourceSpec, ReplayMode, ResolvedInput};
+use crate::{
+    fmt, logging, text_lines, wrap_file_replay, LiveSourceSpec, ReplayMode, ResolvedInput,
+};
 use anyhow::{bail, Result};
 use manta_engine::{InputSpec, PipelineConfig, SessionClock, SharedObservers};
 use manta_server::metrics::Metrics;
@@ -292,7 +294,9 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         |input, n_tracks| {
             tracks[input] = n_tracks;
             if let Some((_, server)) = &server {
-                server.metrics.set_active_tracks(tracks.iter().sum::<usize>() as u64);
+                server
+                    .metrics
+                    .set_active_tracks(tracks.iter().sum::<usize>() as u64);
                 server.metrics.set_static_crashes_total(
                     crashes.iter().map(|c| c.load(Ordering::Relaxed)).sum(),
                 );
@@ -312,9 +316,8 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 crate::record_terminal_source_health(&server.metrics, &end.name, &end.result);
             }
             if let Err(e) = &end.result {
-                let _ = healthy.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |h| {
-                    h.checked_sub(1)
-                });
+                let _ = healthy
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |h| h.checked_sub(1));
                 tracing::error!(
                     "input {}: stopped ({e:#}); {}",
                     end.name,
@@ -355,7 +358,11 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     }
     if let Some(failed) = ends.iter().find(|e| e.result.is_err()) {
         let e = failed.result.as_ref().err().map(|e| format!("{e:#}"));
-        bail!("input {:?} ended in error: {}", failed.name, e.unwrap_or_default());
+        bail!(
+            "input {:?} ended in error: {}",
+            failed.name,
+            e.unwrap_or_default()
+        );
     }
     Ok(std::process::ExitCode::SUCCESS)
 }

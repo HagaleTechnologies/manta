@@ -91,10 +91,10 @@ missing series as "no loss" or "no traffic".
 | `manta_telnet_clients_connected` | gauge | — | Currently connected telnet clients. | Always. |
 | `manta_json_clients_connected` | gauge | — | Currently connected JSON Lines clients. | Always. |
 | `manta_ws_clients_connected` | gauge | — | Currently connected WebSocket clients. | Always. |
-| `manta_active_tracks` | gauge | — | Currently active decoder tracks. Copied from the decode loop every 250 ms; set to 0 while the source is in an outage. | Always. |
-| `manta_static_crashes_total` | counter | — | Static crashes detected: times at least three quarters of the passband's channels rose 3 dB or more together for 8 ms or more, counted once per crash. A sudden band-wide level step (a gain change, or the input returning from digital silence) also counts once. Counted with any `[detector].crash_filter` value, including `"off"`. Stays 0 when the passband holds fewer than 96 channels. See [SPEC §2.7](SPEC-decode-core.md#27-band-wide-static-crash-detection-man-312) and [MAN-312](DECISIONS/2026-10-13-man312-static-crash-filter.md). | Always; starts at 0. Summed across source reconnects. |
+| `manta_active_tracks` | gauge | — | Currently active decoder tracks. Copied from the decode loop every 250 ms; set to 0 while the source is in an outage. With several inputs, the sum over inputs after each batch (MAN-13). | Always. |
+| `manta_static_crashes_total` | counter | — | Static crashes detected: times at least three quarters of the passband's channels rose 3 dB or more together for 8 ms or more, counted once per crash. A sudden band-wide level step (a gain change, or the input returning from digital silence) also counts once. Counted with any `[detector].crash_filter` value, including `"off"`. Stays 0 when the passband holds fewer than 96 channels. With several inputs, the sum over inputs (MAN-13). See [SPEC §2.7](SPEC-decode-core.md#27-band-wide-static-crash-detection-man-312) and [MAN-312](DECISIONS/2026-10-13-man312-static-crash-filter.md). | Always; starts at 0. Summed across source reconnects. |
 | `manta_rtty_signals` | gauge | `band` | RTTY (two-tone FSK) signals the detector currently marks, by amateur band. CW tracks are not started on a marked signal ([MAN-314](DECISIONS/2026-10-11-man314-rtty-recognition.md)). `band` is a band name such as `20m`, or `unknown` outside every band. Copied from the decode loop on every change; set to 0 while the source is in an outage and at shutdown. | One series per band after the first RTTY mark in that band; the series stays (at 0) after its signals clear. No samples before the first mark. |
-| `manta_source_health` | gauge | `source` | Health of each input source: 1 healthy, 0 unhealthy. `source` is the input type: `file`, `audio`, `kiwi`, `soapy`, `hpsdr` or `ka9q`. | One series per registered source, from the first health report. A file replay reports 1 at startup. Reconnecting sources report on each connect and disconnect; HPSDR reads 0 until the radio is confirmed live, and ka9q-radio until the first RTP packet of its channel arrives. |
+| `manta_source_health` | gauge | `source` | Health of each input source: 1 healthy, 0 unhealthy. `source` is the input type: `file`, `audio`, `kiwi`, `soapy`, `hpsdr` or `ka9q`; with several `[[input]]` entries it is each entry's `name` (MAN-13). | One series per registered source, from the first health report. A file replay reports 1 at startup. Reconnecting sources report on each connect and disconnect; HPSDR reads 0 until the radio is confirmed live, and ka9q-radio until the first RTP packet of its channel arrives. |
 | `manta_source_outages_total` | counter | `source` | Times each input source went from healthy to unhealthy (a lost connection or failed read). A source that starts unhealthy has not had an outage. | Same `source` set as `manta_source_health`; starts at 0. |
 | `manta_source_down_seconds_total` | counter | `source` | Seconds each input source spent in outages that have ended. An outage still in progress is added when it ends; until then it shows only as `manta_source_health` 0. | Same `source` set as `manta_source_health`; starts at 0. |
 | `manta_input_dropped_packets_total` | counter | `source` | Input packets estimated lost in transit before reaching the decoder. | HPSDR, KiwiSDR and ka9q-radio sources only: from startup at 0, sampled every second, summed across reconnects. Other sources (file, audio, SoapySDR) show the `# TYPE` line but no samples: absent, not zero. |
@@ -199,7 +199,11 @@ One line per check follows, in this order:
    - `decode: not monitored`: the watchdog was never armed. The daemon
      always arms it, so a running node does not show this line.
 
-The node is healthy only when every line passes. RBN uplink state is not
+The node is healthy only when every line passes, with one exception
+(MAN-13): with two or more inputs, the source lines need only one input
+healthy, so one dead receiver does not make a health check restart the
+daemon and interrupt the inputs still spotting. Each input keeps its own
+line and its own `manta_source_health` series. RBN uplink state is not
 part of the verdict; use the uplink families or `/status` for that.
 `manta_healthy` and `manta_listener_up` come from the same evaluation.
 
