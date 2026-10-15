@@ -9,12 +9,12 @@
 //! `listen --json` output) against a real SDRplay RSP1B -- see
 //! docs/DECISIONS/2026-09-08-first-live-rsp1b-run.md.
 
-use crate::{listen, PipelineConfig};
+use crate::{listen_with_observers, ListenObservers, PipelineConfig};
 use anyhow::Result;
 use manta_decode::events::DecoderEvent;
 use manta_input::IqSource;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,12 @@ pub enum Verdict {
     /// track. Check the antenna, the gain, and that the tuned passband
     /// actually overlaps where you expect signal.
     NoSignal,
+    /// MAN-313: the detector confirmed at least one signal
+    /// (`detector_confirmations` is nonzero) but none qualified as keyed
+    /// CW, so no track was promoted -- speech, wideband data, or a swept or
+    /// steady carrier. The receiver chain works; there is just no CW where
+    /// it is tuned.
+    NotCw,
     /// Decoder evidence exists (a closed track, or decoded characters),
     /// but not one `TrackMeta` landed before the last such track closed --
     /// no SNR was ever measured. Distinct from `NoisyNoDecode`: this is
@@ -65,6 +71,11 @@ impl Verdict {
                 "NO_SIGNAL -- no decoder evidence at all (no track, no decoded character, no \
                  spot). Check antenna, gain, and that the tuned passband overlaps where you \
                  expect signal."
+            }
+            Verdict::NotCw => {
+                "NOT_CW -- the detector saw signals but none was keyed CW (speech, data, or a \
+                 swept or steady carrier). The receiver chain works; tune to where CW activity \
+                 is, or set [detector] non_cw_filter = false to decode everything."
             }
             Verdict::ActivityNoSnr => {
                 "ACTIVITY_NO_SNR -- the detector promoted a candidate (possibly closing, possibly \
@@ -105,12 +116,23 @@ pub struct DoctorReport {
     /// paced to real time, so the two coincide there.
     pub duration: Duration,
     /// Number of `TrackPromoted` events seen -- the detector's own ground
-    /// truth for "found a candidate signal," independent of whether the
+    /// truth for "found a keyed CW signal," independent of whether the
     /// decoder ever got far enough to produce a `TrackMeta`/`CharDecoded`/
-    /// `TrackClosed` afterward. This, not any decode-timing proxy, is what
-    /// `verdict()`'s `NoSignal` check keys off (see
+    /// `TrackClosed` afterward. Since MAN-313 (with `[detector]
+    /// non_cw_filter` on, the default) a track is promoted only once it
+    /// shows CW keying, so speech, data and swept or steady carriers are
+    /// not counted here; `detector_confirmations` counts them. This, not
+    /// any decode-timing proxy, is what `verdict()`'s `NoSignal`/`NotCw`
+    /// checks key off (see
     /// docs/DECISIONS/2026-09-09-doctor-track-promoted-event.md).
     pub tracks_promoted: usize,
+    /// MAN-313: every CANDIDATE -> ACTIVE confirmation the detector made
+    /// during the run, whether or not the track qualified as keyed CW
+    /// (`TrackManager::confirmations`, read through
+    /// `ListenObservers::detector_confirmations`). Nonzero with
+    /// `tracks_promoted == 0` means signals were present but none was
+    /// keyed CW (`Verdict::NotCw`).
+    pub detector_confirmations: usize,
     /// Number of `TrackMeta` events seen (one per track, per hop it's
     /// updated -- a proxy for how much decoder activity there was, not a
     /// distinct-track count).
@@ -138,6 +160,12 @@ pub struct DoctorReport {
     pub distinct_chars: usize,
     /// Confirmed, fully-validated spots -- the strictest signal.
     pub spots_confirmed: usize,
+    /// MAN-234: input samples replaced with silence because a component
+    /// was NaN, infinite or beyond `MAX_SAMPLE_MAGNITUDE` (SPEC §1.3 step
+    /// 0). Omitted from `doctor --json` when 0. Not an input to `verdict()`:
+    /// the replaced samples are silence, so the verdict judges what remains.
+    #[serde(skip_serializing_if = "crate::is_zero")]
+    pub bad_samples: u64,
 }
 
 impl DoctorReport {
@@ -154,6 +182,12 @@ impl DoctorReport {
         // run can end before reaching at all). Promotion alone
         // is what "the detector found a candidate" means.
         if self.tracks_promoted == 0 {
+            // MAN-313: no keyed CW track, but the detector did confirm
+            // signals -- the receiver chain works, the band just holds no
+            // CW (speech, data, a swept or steady carrier).
+            if self.detector_confirmations > 0 {
+                return Verdict::NotCw;
+            }
             return Verdict::NoSignal;
         }
         // Based on the STRONGEST track seen (max), not the median: a
@@ -270,6 +304,22 @@ impl IqSource for SampleBoundedSource {
     fn confirmed_live_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
         self.inner.confirmed_live_handle()
     }
+
+    // MAN-196 (round-1 review on PR #300): forward the inner source's
+    // bands, like every other wrapper does. With the trait defaults,
+    // `doctor --capture-rate-hz` ran `listen()` on a `DecimatingSource`
+    // with the trusted-band spawn veto silently disabled (`None`) and with
+    // the static-crash live set / reported channel levels judged over the
+    // un-narrowed +/-fs_out/2 band -- a different detector path from
+    // `run`/`soak`, able to count transition-band or folded tracks those
+    // commands reject.
+    fn rf_passband_hz(&self) -> (f64, f64) {
+        self.inner.rf_passband_hz()
+    }
+
+    fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+        self.inner.trusted_band_hz()
+    }
 }
 
 /// Run `listen()` against `src` for `duration`, tabulating its event/spot
@@ -349,11 +399,18 @@ pub fn doctor(
     let mut chars_decoded = 0usize;
     let mut distinct_chars: HashSet<char> = HashSet::new();
     let mut spots_confirmed = 0usize;
+    let confirmations = Arc::new(AtomicU64::new(0));
 
-    let result = listen(
+    let bad_samples = Arc::new(AtomicU64::new(0));
+    let result = listen_with_observers(
         src,
         cfg,
         stop.clone(),
+        ListenObservers {
+            detector_confirmations: Some(confirmations.clone()),
+            bad_samples: Some(bad_samples.clone()),
+            ..ListenObservers::default()
+        },
         |ev| match ev {
             DecoderEvent::TrackPromoted { .. } => tracks_promoted += 1,
             DecoderEvent::TrackMeta { snr_2500_db, .. } => {
@@ -370,6 +427,7 @@ pub fn doctor(
             _ => {}
         },
         |_spot| spots_confirmed += 1,
+        |_n| {},
     );
     listen_done.store(true, Ordering::Relaxed);
     let _ = watchdog.join();
@@ -398,6 +456,8 @@ pub fn doctor(
         center_freq_hz,
         duration: observed_duration,
         tracks_promoted,
+        detector_confirmations: usize::try_from(confirmations.load(Ordering::Relaxed))
+            .unwrap_or(usize::MAX),
         track_meta_count,
         tracks_closed,
         snr_db_min,
@@ -406,6 +466,7 @@ pub fn doctor(
         chars_decoded,
         distinct_chars: distinct_chars.len(),
         spots_confirmed,
+        bad_samples: bad_samples.load(Ordering::Relaxed),
     })
 }
 
@@ -488,6 +549,50 @@ mod tests {
         );
     }
 
+    /// Regression (MAN-196 round-1 review on PR #300): `SampleBoundedSource`
+    /// must forward the inner source's `trusted_band_hz`/`rf_passband_hz`.
+    /// The trait defaults (`None` / +/-sample_rate/2) are wrong for a
+    /// wrapped `DecimatingSource`, whose veto band and narrowed passband
+    /// would otherwise be silently dropped, running `listen()` on a
+    /// different detector path from `run`/`soak`.
+    #[test]
+    fn sample_bounded_source_forwards_the_inner_bands() {
+        struct BandedSource;
+        impl IqSource for BandedSource {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                0.0
+            }
+            fn rf_passband_hz(&self) -> (f64, f64) {
+                (-21_724.8, 21_724.8)
+            }
+            fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+                Some((-21_724.8, 21_724.8))
+            }
+            fn read(&mut self, _buf: &mut [Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+        }
+        let src = SampleBoundedSource {
+            inner: Box::new(BandedSource),
+            max_samples: 10,
+            samples_read: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        assert_eq!(
+            src.trusted_band_hz(),
+            Some((-21_724.8, 21_724.8)),
+            "the wrapped source's trusted band must reach listen()'s spawn veto"
+        );
+        assert_eq!(
+            src.rf_passband_hz(),
+            (-21_724.8, 21_724.8),
+            "the wrapped source's narrowed passband must reach the crash live set and reported \
+             channel levels, not the default +/-fs_out/2"
+        );
+    }
+
     #[test]
     fn doctor_reports_decoding_on_a_clean_golden_signal() {
         // 60s, not 5s: V1's looped "CQ CQ DE W1AW W1AW K" at 20 WPM needs
@@ -507,6 +612,29 @@ mod tests {
         assert!(report.spots_confirmed > 0);
         assert!(report.track_meta_count > 0);
         assert!(report.tracks_promoted > 0);
+    }
+
+    /// MAN-234 scenario 3: one finite `f32::MAX` sample at 1 ms latched
+    /// the floor/gate averages at NaN, so no track ever spawned and the
+    /// verdict read `NO_SIGNAL`. The guard replaces it with silence.
+    #[test]
+    fn doctor_on_a_finite_overflow_sample_is_not_no_signal() {
+        let spec = manta_testkit::vectors::VectorSpec {
+            duration_s: 20.0,
+            ..manta_testkit::vectors::v1()
+        };
+        let mut samples = manta_testkit::vectors::render(&spec).unwrap().samples;
+        samples[96].re = f32::MAX;
+        let src: Box<dyn IqSource> = Box::new(RawIqSource {
+            samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let report = doctor(src, &PipelineConfig::default(), Duration::from_secs(60)).unwrap();
+        assert_ne!(report.verdict(), Verdict::NoSignal, "{report:?}");
+        assert_eq!(report.bad_samples, 1);
+        assert!(report.tracks_promoted >= 1, "{report:?}");
     }
 
     #[test]
@@ -548,6 +676,7 @@ mod tests {
             center_freq_hz: 14_025_000.0,
             duration: Duration::from_secs(10),
             tracks_promoted: 3,
+            detector_confirmations: 0,
             track_meta_count: 5,
             tracks_closed: 3,
             snr_db_min: Some(-8.0),
@@ -556,6 +685,7 @@ mod tests {
             chars_decoded: 50,
             distinct_chars: 2,
             spots_confirmed: 0,
+            bad_samples: 0,
         };
         assert_eq!(report.verdict(), Verdict::NoisyNoDecode);
     }
@@ -567,6 +697,7 @@ mod tests {
             center_freq_hz: 14_025_000.0,
             duration: Duration::from_secs(10),
             tracks_promoted: 1,
+            detector_confirmations: 0,
             track_meta_count: 5,
             tracks_closed: 1,
             snr_db_min: Some(5.0),
@@ -575,6 +706,7 @@ mod tests {
             chars_decoded: 200,
             distinct_chars: 20,
             spots_confirmed: 0,
+            bad_samples: 0,
         };
         assert_eq!(report.verdict(), Verdict::WeakNoDecode);
     }
@@ -590,6 +722,7 @@ mod tests {
             center_freq_hz: 14_025_000.0,
             duration: Duration::from_secs(10),
             tracks_promoted: 16,
+            detector_confirmations: 0,
             track_meta_count: 20,
             tracks_closed: 15,
             snr_db_min: Some(-8.0),
@@ -598,6 +731,7 @@ mod tests {
             chars_decoded: 300,
             distinct_chars: 3,
             spots_confirmed: 0,
+            bad_samples: 0,
         };
         assert_eq!(report.verdict(), Verdict::WeakNoDecode);
     }
@@ -613,6 +747,7 @@ mod tests {
             center_freq_hz: 0.0,
             duration: Duration::from_secs(3),
             tracks_promoted: 1,
+            detector_confirmations: 0,
             track_meta_count: 0,
             tracks_closed: 0,
             snr_db_min: None,
@@ -621,6 +756,7 @@ mod tests {
             chars_decoded: 4,
             distinct_chars: 3,
             spots_confirmed: 0,
+            bad_samples: 0,
         };
         assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
     }
@@ -636,6 +772,7 @@ mod tests {
             center_freq_hz: 0.0,
             duration: Duration::from_secs(3),
             tracks_promoted: 1,
+            detector_confirmations: 0,
             track_meta_count: 0,
             tracks_closed: 1,
             snr_db_min: None,
@@ -644,6 +781,7 @@ mod tests {
             chars_decoded: 0,
             distinct_chars: 0,
             spots_confirmed: 0,
+            bad_samples: 0,
         };
         assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
     }
@@ -663,6 +801,7 @@ mod tests {
             center_freq_hz: 0.0,
             duration: Duration::from_secs(3),
             tracks_promoted: 1,
+            detector_confirmations: 0,
             track_meta_count: 0,
             tracks_closed: 0,
             snr_db_min: None,
@@ -671,6 +810,62 @@ mod tests {
             chars_decoded: 0,
             distinct_chars: 0,
             spots_confirmed: 0,
+            bad_samples: 0,
+        };
+        assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
+    }
+
+    fn no_promotion_report(detector_confirmations: usize) -> DoctorReport {
+        DoctorReport {
+            sample_rate_hz: 96_000.0,
+            center_freq_hz: 14_000_000.0,
+            duration: Duration::from_secs(10),
+            tracks_promoted: 0,
+            detector_confirmations,
+            track_meta_count: 0,
+            tracks_closed: 0,
+            snr_db_min: None,
+            snr_db_max: None,
+            snr_db_median: None,
+            chars_decoded: 0,
+            distinct_chars: 0,
+            spots_confirmed: 0,
+            bad_samples: 0,
+        }
+    }
+
+    /// MAN-313: signals confirmed but none keyed CW (speech, data, a swept
+    /// or steady carrier) is not "no signal" -- the receiver chain works.
+    #[test]
+    fn verdict_is_not_cw_when_confirmations_but_no_promotions() {
+        let report = no_promotion_report(14);
+        assert_eq!(report.verdict(), Verdict::NotCw);
+        assert!(
+            report.verdict().summary().starts_with(
+                "NOT_CW -- the detector saw signals but none was keyed CW (speech, data, or a \
+                 swept or steady carrier). The receiver chain works; tune to where CW activity \
+                 is, or set [detector] non_cw_filter = false to decode everything."
+            ),
+            "{}",
+            report.verdict().summary()
+        );
+    }
+
+    #[test]
+    fn verdict_stays_no_signal_with_zero_confirmations() {
+        assert_eq!(no_promotion_report(0).verdict(), Verdict::NoSignal);
+    }
+
+    #[test]
+    fn verdict_prefers_decoding_over_not_cw() {
+        let report = DoctorReport {
+            spots_confirmed: 1,
+            ..no_promotion_report(5)
+        };
+        assert_eq!(report.verdict(), Verdict::Decoding);
+        let report = DoctorReport {
+            tracks_promoted: 1,
+            ..no_promotion_report(5)
         };
         assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
     }

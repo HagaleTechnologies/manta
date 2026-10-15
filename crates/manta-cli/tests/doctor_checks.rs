@@ -392,10 +392,12 @@ fn the_example_callsign_fails_the_config_check() {
     );
 }
 
-/// The keys `manta doctor --json` printed before MAN-126.
+/// The keys `manta doctor --json` printed before MAN-126, plus MAN-313's
+/// `detector_confirmations`.
 const REPORT_KEYS: &[&str] = &[
     "center_freq_hz",
     "chars_decoded",
+    "detector_confirmations",
     "distinct_chars",
     "duration",
     "sample_rate_hz",

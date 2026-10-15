@@ -66,7 +66,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:2099390e6fbb5961adb8215116cdcb94fccbdc2924352d263a4b2f53eafb19be",
+      "hash": "sha256:34a3f77ef10a671d063c8acbeaa30032f612d0e0721f1e8b47d8e4c4a39a05d9",
       "id": "detector-tracks",
       "kind": "subsystem",
       "links": [
@@ -358,7 +358,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:afd7c0b5a6c37114fc3be8b64cde36fd8be4366aa0a182b02b0bf59e2d1f6e01",
+      "hash": "sha256:a9ea021f5b989a216ee38a3fbbeb7dcd0ba26c64a315133d7caa66ea9ae7cd17",
       "id": "windows-build-setup",
       "kind": "howto",
       "links": [
@@ -372,12 +372,13 @@
         ".github/workflows/release.yml",
         ".github/workflows/release-publish.yml",
         "docs/superpowers/specs/2026-09-11-man212-windows-platform-support-design.md",
-        "docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md"
+        "docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md",
+        "docs/DECISIONS/2026-10-15-man371-windows-required-check.md"
       ],
       "status": "current",
       "title": "How do I build and test manta on Windows?",
-      "verified_commit": "de525d1",
-      "verified_date": "2026-10-13",
+      "verified_commit": "3805f78",
+      "verified_date": "2026-10-15",
       "visibility": "public"
     }
   ],

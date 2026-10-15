@@ -11,13 +11,19 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-15 | MAN-234 | [MAN-234: one bad input sample is replaced and counted, not fatal](2026-10-15-man234-bad-input-samples.md) |
+| 2026-10-15 | MAN-371 | [MAN-371: `test (windows-latest)` becomes a required check](2026-10-15-man371-windows-required-check.md) |
+| 2026-10-14 | MAN-248 | [MAN-248: a per-minute ceiling on spots the RBN uplink forwards](2026-10-14-man248-uplink-forwarding-ceiling.md) |
 | 2026-10-14 | MAN-211 | [MAN-211: TrackMeta's frequency is captured per queued hop, like its SNR](2026-10-14-man211-trackmeta-freq-per-hop.md) |
 | 2026-10-14 | MAN-197 | [MAN-197: a live track's input selection also skips cooling-down channels](2026-10-14-man197-live-window-cooldown-enforcement.md) |
 | 2026-10-14 | MAN-197 | [MAN-197: the respawn cooldown gates a spawn candidate's whole ownership window](2026-10-14-man197-respawn-cooldown-ownership-window.md) |
+| 2026-10-14 | MAN-196 | [MAN-196: the decimator's trusted band — advertised and spawn-vetoed](2026-10-14-man196-decimator-trusted-band.md) |
 | 2026-10-14 | MAN-174 | [MAN-174: deferred beacons survive merge chains and every loss is counted](2026-10-14-man174-deferred-beacon-merge-bookkeeping.md) |
 | 2026-10-14 | MAN-192 | [MAN-192: the HSMM decoder reseeds after a committed Silence, not only on a gate re-onset](2026-10-14-man192-silence-reseed.md) |
 | 2026-10-14 | MAN-193 | [MAN-193: Evidence's centered maximum is a monotonic deque](2026-10-14-man193-centered-maximum-deque.md) |
 | 2026-10-14 | MAN-95 | [MAN-95: callsign-pattern rarity sets the repetition requirement](2026-10-14-man95-pattern-rarity-repetition-tiers.md) |
+| 2026-10-13 | MAN-313 | [Non-CW rejection: no CW track on speech, data or a swept carrier](2026-10-13-man313-non-cw-rejection.md) |
+| 2026-10-13 | MAN-189 | [MAN-189: the HSMM decoder commits each stretch of time once](2026-10-13-man189-hsmm-commit-frontier.md) |
 | 2026-10-13 | MAN-190 | [MAN-190: evidence anchors confirmed from actual adjacent hops, not predicted](2026-10-13-man190-confirmed-evidence-anchors.md) |
 | 2026-10-13 | MAN-140 | [MAN-140: a ka9q-radio (radiod) multicast IQ input](2026-10-13-man140-ka9q-radio-input.md) |
 | 2026-10-13 | MAN-152 | [MAN-152: the in-repo wiki is canonical; disabling GitHub's Wiki is pending](2026-10-13-man152-one-wiki.md) |

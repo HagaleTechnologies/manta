@@ -90,6 +90,7 @@ fn uplink_config(target_port: u16, dry_run: bool) -> RbnUplinkConfig {
         login_callsign: None,
         dry_run,
         spot_types: UplinkSpotTypes::default(),
+        max_spots_per_minute: 600,
     }
 }
 
@@ -875,6 +876,197 @@ async fn spot_types_all_forwards_every_type() {
     assert!(received[1].contains("JA1UNK"));
 
     assert_eq!(harness.metrics.uplink_sent_total(), 4);
+    assert_eq!(harness.metrics.uplink_suppressed_total(), 0);
+    // MAN-248: below the default ceiling the new counter stays at zero
+    // (ticket scenario 3: "the counter stays at zero").
+    assert_eq!(harness.metrics.uplink_ceiling_suppressed_total(), 0);
+
+    let _ = harness.shutdown_tx.send(true);
+}
+
+// MAN-248 acceptance scenarios:
+//   Scenario: Forwarding stops at the ceiling
+//     Given the uplink is live and a per-minute ceiling is configured
+//     When more spots than the ceiling arrive within one minute
+//     Then no more than the ceiling are forwarded in that minute
+//     And the uplink connection stays up
+//
+//   Scenario: Suppressed spots are visible
+//     Given the ceiling has been reached
+//     When further spots are suppressed
+//     Then a suppressed-by-ceiling counter in the metrics output rises by
+//       the number suppressed
+#[tokio::test]
+async fn forwarding_stops_at_the_ceiling_and_the_connection_stays_up() {
+    use manta_server::metrics::UplinkHealth;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut cfg = uplink_config(addr.port(), false);
+    cfg.spot_types = UplinkSpotTypes::All;
+    cfg.max_spots_per_minute = 3;
+    let harness = spawn_uplinks(vec![cfg]);
+
+    let (_login_line, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+
+    let spots: Vec<Spot> = (0..5)
+        .map(|i| Spot {
+            callsign: format!("JA1CEIL{i}"),
+            ..sample_spot()
+        })
+        .collect();
+    let expected: Vec<String> = spots
+        .iter()
+        .map(|s| {
+            rbn::format_line(
+                s,
+                STATION_CALL,
+                harness.bus.unix_ts_for(s.sample_ts),
+                rbn::LineFormat::Rbn,
+            )
+        })
+        .collect();
+    for spot in spots {
+        harness.bus.publish(spot);
+    }
+
+    // Exactly the ceiling's worth of lines, in order.
+    let mut received = Vec::new();
+    for _ in 0..3 {
+        received.push(read_forwarded_line(&mut reader).await);
+    }
+    assert_eq!(received, expected[..3]);
+
+    // The two over-budget spots land in the ceiling counter (poll: the
+    // reads above can win the race with the last suppression).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while harness.metrics.uplink_ceiling_suppressed_total() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the over-budget spots were never counted as ceiling-suppressed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(harness.metrics.uplink_sent_total(), 3);
+    // The combined suppressed counter must not absorb ceiling drops.
+    assert_eq!(harness.metrics.uplink_suppressed_total(), 0);
+    // Suppressed, not disconnected: no reconnect, health still connected.
+    assert_eq!(harness.metrics.uplink_reconnects_total(), 0);
+    assert_eq!(
+        harness.metrics.uplink_snapshot()[0].health,
+        UplinkHealth::Connected
+    );
+
+    // One more spot within the same window: still suppressed, and the
+    // connection is STILL up -- no disconnect, no queue.
+    harness.bus.publish(Spot {
+        callsign: "JA1CEIL9".to_string(),
+        ..sample_spot()
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while harness.metrics.uplink_ceiling_suppressed_total() < 3 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the follow-up spot was never counted as ceiling-suppressed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut line = String::new();
+    let result =
+        tokio::time::timeout(Duration::from_millis(500), reader.read_line(&mut line)).await;
+    assert!(
+        result.is_err(),
+        "an over-budget spot must not be written, got: {line:?}"
+    );
+    assert_eq!(
+        harness.metrics.uplink_reconnects_total(),
+        0,
+        "ceiling suppression must not disconnect the uplink"
+    );
+    assert_eq!(harness.metrics.uplink_sent_total(), 3);
+    assert_eq!(
+        harness.metrics.uplink_snapshot()[0].health,
+        UplinkHealth::Connected
+    );
+
+    let _ = harness.shutdown_tx.send(true);
+}
+
+/// MAN-248: dry-run spots are suppressed before the budget check, so a
+/// dry-run period consumes no forwarding budget and never moves the
+/// ceiling counter.
+#[tokio::test]
+async fn dry_run_spots_consume_no_forwarding_budget() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut cfg = uplink_config(addr.port(), true);
+    cfg.spot_types = UplinkSpotTypes::All;
+    cfg.max_spots_per_minute = 2;
+    let harness = spawn_uplinks(vec![cfg]);
+
+    let (_login_line, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+
+    for i in 0..5 {
+        harness.bus.publish(Spot {
+            callsign: format!("JA1DRY{i}"),
+            ..sample_spot()
+        });
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while harness.metrics.uplink_suppressed_total() < 5 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the dry-run spots were never counted as suppressed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(harness.metrics.uplink_sent_total(), 0);
+    assert_eq!(
+        harness.metrics.uplink_ceiling_suppressed_total(),
+        0,
+        "dry-run suppression must not be ceiling suppression"
+    );
+    let mut line = String::new();
+    let result =
+        tokio::time::timeout(Duration::from_millis(500), reader.read_line(&mut line)).await;
+    assert!(
+        result.is_err(),
+        "dry-run must transmit nothing, got: {line:?}"
+    );
+
+    let _ = harness.shutdown_tx.send(true);
+}
+
+/// MAN-248: `max_spots_per_minute = 0` disables the ceiling entirely.
+#[tokio::test]
+async fn zero_max_spots_per_minute_disables_the_ceiling() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut cfg = uplink_config(addr.port(), false);
+    cfg.spot_types = UplinkSpotTypes::All;
+    cfg.max_spots_per_minute = 0;
+    let harness = spawn_uplinks(vec![cfg]);
+
+    let (_login_line, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+
+    let spots: Vec<Spot> = (0..6)
+        .map(|i| Spot {
+            callsign: format!("JA1UNL{i}"),
+            ..sample_spot()
+        })
+        .collect();
+    for spot in spots {
+        harness.bus.publish(spot);
+    }
+
+    let mut received = Vec::new();
+    for _ in 0..6 {
+        received.push(read_forwarded_line(&mut reader).await);
+    }
+    assert_eq!(received.len(), 6);
+    assert_eq!(harness.metrics.uplink_sent_total(), 6);
+    assert_eq!(harness.metrics.uplink_ceiling_suppressed_total(), 0);
     assert_eq!(harness.metrics.uplink_suppressed_total(), 0);
 
     let _ = harness.shutdown_tx.send(true);

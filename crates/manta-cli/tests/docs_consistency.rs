@@ -1147,6 +1147,8 @@ fn spec_detector_values_equal_the_code_defaults() {
         "crash_filter",
         "rtty_filter",
         "rtty_dwell_ms",
+        "non_cw_filter",
+        "unkeyed_close_ms",
     ] {
         assert!(
             table.contains_key(key),
