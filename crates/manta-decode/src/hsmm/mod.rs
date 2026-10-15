@@ -117,14 +117,6 @@ pub struct HsmmDecoder {
     hop: u64,
     last_prefix: f64,
     last_ts: u64,
-<<<<<<< HEAD
-    /// [Task 8 fix; round 6 changed the value to `is_char` rather than the
-    /// specific `Glyph`] `(sample_ts, is_char)` pairs ever actually
-    /// committed; see `commit::commit`'s doc comment for why this must be
-    /// keyed on `sample_ts` (not `born_hop`), why the value is the entry
-    /// KIND rather than its exact value, and why it's threaded through
-    /// every call.
-    sealed: Vec<(u64, bool)>,
     /// MAN-191: hop of the most recent anchor step that ran candidate
     /// generation (i.e. passed the anchor gate with a non-empty anchor
     /// set), or `None` before the first. Updated every such step --
@@ -146,13 +138,11 @@ pub struct HsmmDecoder {
     /// `round(u)` per pair.
     #[cfg(test)]
     silence_trace: Vec<(u64, usize, u64, bool, f32)>,
-=======
     /// MAN-189: how far emitted output reaches in time; see
     /// `commit::Frontier`. Replaces PR #161's `sealed` list of exact
     /// `(sample_ts, is_char)` pairs, which missed a committed glyph
     /// re-derived under a different closing anchor.
     frontier: commit::Frontier,
->>>>>>> e2c9681eba9619ab59cff2f283034edaf5192cc1
 }
 
 impl HsmmDecoder {
@@ -166,15 +156,11 @@ impl HsmmDecoder {
             hop: 0,
             last_prefix: 0.0,
             last_ts: 0,
-<<<<<<< HEAD
-            sealed: Vec::new(),
             prev_step: None,
             hot_silence: Vec::new(),
             #[cfg(test)]
             silence_trace: Vec::new(),
-=======
             frontier: commit::Frontier::default(),
->>>>>>> e2c9681eba9619ab59cff2f283034edaf5192cc1
         }
     }
 
@@ -408,17 +394,8 @@ impl HsmmDecoder {
             merged.push(c);
         }
         merged.truncate(self.cfg.beam);
-<<<<<<< HEAD
         self.hot_silence = merged.iter().filter_map(|&(_, tag)| tag).collect();
         let mut merged: Vec<Token> = merged.into_iter().map(|(t, _)| t).collect();
-        // Commit consensus / forced entries.
-        out.extend(commit::commit(
-            &mut merged,
-            ev.hop,
-            &self.cfg,
-            &mut self.sealed,
-        ));
-=======
         // Commit consensus / forced entries. MAN-192: the internal helper
         // also reports whether this step emitted a winning word-boundary
         // head closed by `Silence` -- SPEC v2 §4.7's second seeding
@@ -454,7 +431,6 @@ impl HsmmDecoder {
             }
             merged.extend(self.seed(ev.hop));
         }
->>>>>>> e2c9681eba9619ab59cff2f283034edaf5192cc1
         self.live = merged.clone();
         // The just-pushed anchor is always age 0 relative to `ev.hop`, so
         // it can never itself need pruning here -- the age-based prune
@@ -659,6 +635,15 @@ mod tests {
     /// golden comparison accepts exactly this timestamps/confidence
     /// class (V8/VR8) and declares the junk-`E` flood out of scope --
     /// see docs/DECISIONS/2026-10-14-man191-silence-cadence.md.
+    ///
+    /// Re-pinned at the main merge: MAN-189's `commit::Frontier`
+    /// (replacing PR #161's `sealed` ts-match list) additionally
+    /// suppresses gap-artifact `E`s and word boundaries re-derived from
+    /// an origin whose character start overlaps already-emitted time, so
+    /// the flood thins further (`E@1296+␠, E@1336, E@1400+␠` ->
+    /// `E@1304, E@1376`) and the final word boundary's confidence moves
+    /// 982 -> 998 (MAN-192's scored-prefix margin). Keying glyphs and
+    /// keying commit timestamps are still identical to both parents.
     #[test]
     fn silence_cadence_preserves_commit_stream_across_a_long_gap() {
         let (marks, total) = n_scene();
@@ -683,17 +668,14 @@ mod tests {
             "E@1192 982",
             "␠@1192 982",
             "E@1232 982",
-            "E@1296 982",
-            "␠@1296 982",
-            "E@1336 982",
-            "E@1400 982",
-            "␠@1400 982",
+            "E@1304 982",
+            "E@1376 982",
             "E@1440 982",
             "␠@1440 882",
             "N@2448 982",
             "␠@2448 982",
             "N@2604 982",
-            "␠@2604 982",
+            "␠@2604 998",
         ]
         .into_iter()
         .map(String::from)

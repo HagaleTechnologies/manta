@@ -244,7 +244,6 @@ pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
 planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
-<<<<<<< HEAD
 MAN-191: the HSMM decoder samples its long-`Silence` hypotheses at SPEC
 v2 §4.6's cadence instead of every anchor step (`silence_sampled`:
 normal reach, first `10u` crossing, then one sample per `round(u)` hops,
@@ -256,7 +255,7 @@ timestamps/confidences and gap-artifact glyphs (V8/VR8 text and
 V8/V8w spot lists unchanged). `hsmm_300_tracks` gains a
 `300_tracks_10s_gappy` scene covering the long-silence path. See
 docs/DECISIONS/2026-10-14-man191-silence-cadence.md.
-=======
+
 MAN-137: the JSON spot stream opens with `hello` and numbers spots and
 `spotGrade` records with one per-session `seq`. WebSocket
 `?session=&since=` resumes from the bounded shared history using
@@ -351,7 +350,6 @@ with `0+0j` and counted in `Channelizer::process` (SPEC §1.3 step 0;
 report line and `manta_input_bad_samples_total{source}`; `manta check`
 still errors on non-finite input. See
 docs/DECISIONS/2026-10-15-man234-bad-input-samples.md.
->>>>>>> e2c9681eba9619ab59cff2f283034edaf5192cc1
 
 ## Documents (read in this order)
 
