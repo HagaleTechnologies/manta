@@ -68,7 +68,6 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
-<<<<<<< HEAD
 - MAN-13: one `manta run` decodes several receivers into one spot output.
   Write `[[input]]` once per receiver (each with a `name`); every input
   decodes on its own thread into one shared validator, so a station two
@@ -76,7 +75,6 @@ the git history and `docs/DECISIONS/`.
   take `--input NAME`; `decode` needs `--freq-correction-ppm` when the
   entries' corrections differ. With several inputs `/healthz` stays `ok`
   while one input is healthy. Single-input runs are unchanged.
-=======
 - JSON/WebSocket spot clients now receive a `hello` first, with schema and session
   identity. Spots and grades carry `seq`; WebSocket `?session=&since=` resumes
   from their shared history bounded by `history_minutes`. New
@@ -84,7 +82,6 @@ the git history and `docs/DECISIONS/`.
   and `manta_json_stream_history_truncated_total` metrics report replay outcomes
   and loss. Consumers must skip hello records (MAN-137).
 
->>>>>>> e2c9681eba9619ab59cff2f283034edaf5192cc1
 - MAN-235: `manta doctor --strict` exits 3 when no check failed but the
   verdict is not `DECODING`; without it every verdict still exits 0.
 - MAN-234: a `bad_samples` field in `decode --json`, `doctor --json` and

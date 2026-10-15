@@ -587,9 +587,12 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         |spot| {
             if let Some((_, server)) = &server {
                 let truncated = server.bus.publish(spot.clone());
-                if truncated > 0 {
-                    server.metrics.record_history_truncated(truncated as u64);
-                }
+                server
+                    .metrics
+                    .record_history_truncated(truncated.history_truncated as u64);
+                server.metrics.record_json_stream_history_truncated(
+                    truncated.stream_history_truncated as u64,
+                );
                 server.metrics.record_spot(spot);
                 let cty = server.lists.cty.load();
                 if crate::geography_is_unresolved(&cty, &spot.callsign)

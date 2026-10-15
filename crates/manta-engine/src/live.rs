@@ -119,6 +119,10 @@ pub(crate) struct LiveTap {
     factor: f64,
     /// The newest event sample timestamp seen.
     now_ts: u64,
+    /// Multi-input closures use the closing input's batch end, rather
+    /// than the newest event across all inputs. The standalone listen
+    /// path keeps its event-clock behaviour.
+    closure_ts: Option<u64>,
 }
 
 impl LiveTap {
@@ -136,7 +140,13 @@ impl LiveTap {
             tick_samples,
             factor,
             now_ts: 0,
+            closure_ts: None,
         }
+    }
+
+    /// Sets the common-clock batch time for closures from one input.
+    pub(crate) fn set_closure_time(&mut self, sample_ts: u64) {
+        self.closure_ts = Some(sample_ts);
     }
 
     /// Whether anyone is subscribed: the decode loop records validation
@@ -230,7 +240,7 @@ impl LiveTap {
         if self.sink.wants_records() {
             self.sink.publish(LiveRecord::TrackClosed {
                 track_id,
-                sample_ts: self.now_ts,
+                sample_ts: self.closure_ts.unwrap_or(self.now_ts),
                 closure,
             });
         }

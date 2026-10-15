@@ -880,6 +880,9 @@ pub(crate) struct Back<'a> {
     /// what an input that ends without its `finish()` batch still owes a
     /// `TrackClosed` (`close_input`).
     open: BTreeSet<u32>,
+    /// Last received batch per input, for synthetic closures after a
+    /// failure. Only populated when the live tap needs closure times.
+    input_end_ts: Vec<u64>,
 }
 
 impl<'a> Back<'a> {
@@ -908,6 +911,7 @@ impl<'a> Back<'a> {
                 references,
             },
             open: BTreeSet::new(),
+            input_end_ts: Vec::new(),
         }
     }
 
@@ -921,6 +925,11 @@ impl<'a> Back<'a> {
         on_event: &mut impl FnMut(&DecoderEvent),
         on_spot: &mut impl FnMut(&crate::Spot),
     ) {
+        if let Some(tap) = self.ctx.live.as_mut() {
+            self.input_end_ts.resize(n_inputs, 0);
+            self.input_end_ts[input] = batch.end_ts;
+            tap.set_closure_time(batch.end_ts);
+        }
         // The tracks that earn a `TrackClosed` (MAN-19): any event but a
         // bare promotion, or being named a merge survivor (MAN-174).
         for ev in &batch.events {
@@ -981,6 +990,9 @@ impl<'a> Back<'a> {
             .filter(|id| self.validator.input_of(*id) as usize == input)
             .collect();
         if !owned.is_empty() {
+            if let Some(tap) = self.ctx.live.as_mut() {
+                tap.set_closure_time(self.input_end_ts[input]);
+            }
             for id in &owned {
                 self.open.remove(id);
             }
@@ -1241,6 +1253,94 @@ pub(crate) fn run_input_front(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_closures_use_the_closing_inputs_batch_time() {
+        for synthetic in [false, true] {
+            let sink = crate::live::tests::RecordingSink::wanting();
+            let shared = crate::multi::SharedObservers {
+                live_state: Some(sink.clone()),
+                ..Default::default()
+            };
+            let cfg = PipelineConfig::default();
+            let mut back = Back::new(
+                &shared,
+                cfg.shared_validator(48_000.0, 2).unwrap(),
+                48_000.0,
+            );
+            let batch = |end_ts, events| Batch {
+                events,
+                end_ts,
+                n_tracks: 1,
+                live_ids: None,
+                band: None,
+            };
+            let meta = |track_id, sample_ts| DecoderEvent::TrackMeta {
+                track_id,
+                sample_ts,
+                snr_2500_db: 20.0,
+                freq_hz: 14_030_000.0,
+            };
+            // Live batches arrive in input order, not common-clock order.
+            back.ingest(
+                0,
+                2,
+                batch(1_000, vec![meta(1, 900)]),
+                &mut |_| {},
+                &mut |_| {},
+            );
+            back.ingest(
+                1,
+                2,
+                batch(400, vec![meta(2, 300)]),
+                &mut |_| {},
+                &mut |_| {},
+            );
+            let closure = ClosureKind::Bookkeeping {
+                survivor_track_id: None,
+            };
+            let events = if synthetic {
+                Vec::new()
+            } else {
+                vec![DecoderEvent::TrackClosed {
+                    track_id: 2,
+                    closure,
+                }]
+            };
+            // Even an eventless batch advances this input's last known time.
+            back.ingest(1, 2, batch(500, events), &mut |_| {}, &mut |_| {});
+            if synthetic {
+                // Another input advances before the failed input is retired.
+                back.ingest(
+                    0,
+                    2,
+                    batch(2_000, vec![meta(1, 1_900)]),
+                    &mut |_| {},
+                    &mut |_| {},
+                );
+                back.close_input(1, 2, &mut |_| {}, &mut |_| {});
+            }
+            back.close_input(0, 2, &mut |_| {}, &mut |_| {});
+            let closures: Vec<_> = sink
+                .take()
+                .into_iter()
+                .filter_map(|r| match r {
+                    crate::live::LiveRecord::TrackClosed {
+                        track_id,
+                        sample_ts,
+                        ..
+                    } => Some((track_id, sample_ts)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                closures,
+                vec![(2, 500), (1, if synthetic { 2_000 } else { 1_000 })],
+                "synthetic={synthetic}"
+            );
+        }
+    }
+
     #[test]
     fn listen_spots_a_call_only_an_override_cty_allocates() {
         let mut spec = manta_testkit::vectors::v1();
