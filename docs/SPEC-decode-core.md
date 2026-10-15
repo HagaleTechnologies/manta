@@ -137,13 +137,50 @@ against the repo's Pi4 CPU budget. Moving the cutoff off exactly `fs_in/4`
 (above) also gives up this exact-zero-tap property, so issue #176's skip
 opportunity no longer applies to this stage regardless.
 
-**Known limitation** (issue #179): the `CUTOFF_FRACTION` margin means
-channels near the decimated Nyquist edge see real, non-negligible
-attenuation (roughly -6 dB to -22 dB in the last ~1.5 kHz below the edge,
-for a 96k->48k stage) while still being exposed to the channelizer as
-ordinary trackable channels -- a real CW signal landing there can lose
-enough SNR to go undetected. The channelizer has no concept of decimation
-and does not yet exclude or de-weight these transition-band channels.
+**Trusted band** (MAN-196): the `CUTOFF_FRACTION` margin means channels
+near the decimated Nyquist edge see real, non-negligible attenuation
+(roughly -6 dB to -22 dB in the last ~1.5 kHz below the edge, for a
+96k->48k stage). The decimator therefore publishes a **trusted
+half-bandwidth** — `TRUSTED_HALF_BAND_FRACTION = 0.4526` of `fs_out`, the
+<= 1 dB crossover of the halfband design (21 728.5 Hz measured at
+48 kS/s; the constant sits at 21 724.8 Hz, at-or-inside it), exposed as
+`Decimator::trusted_half_bandwidth_hz()` and DTFT-self-verified by
+bisection in the module's tests. Two rules consume it:
+
+- **Advertisement**: `DecimatingSource::rf_passband_hz` clips to
+  `+/- trusted` (intersected with the inner source's passband), so
+  `manta check`, SETT segments, live-state `bandState` and the
+  static-crash live set all advertise/judge the honest band. The JSON
+  `passband_offsets_hz` value narrows; its name and schema do not change.
+- **Spawn veto**: `IqSource::trusted_band_hz()` (default `None`) reports
+  the band — for `DecimatingSource`, the same intersected band
+  `rf_passband_hz` advertises, so the two never disagree; `listen` reads it once per source and every segment's
+  `TrackManager::set_trusted_band_hz(lo, hi)` builds a per-channel mask
+  (true iff the channel centre `f(k)` lies in `[lo, hi]`; no margin
+  channel). A channel whose centre lies outside the band may not START a
+  candidate (the §2.4 conjunction gains `!trusted_vetoes_spawn(k)`) —
+  spawns only, never closing or de-weighting a running track, per the
+  MAN-314 key-up-gap lesson. `None` (every non-decimated source) vets
+  nothing: behaviour-identical to before, bit for bit.
+
+**In-band foldover aliases** (round-1 review on PR #300): frequencies at
+or above `fs_out - trusted` fold *inside* the trusted band, where the
+spawn veto cannot see them — only the halfband's stopband stands between
+the alias and a mirrored in-band track. That region is pinned at the
+design's >= 80 dB Kaiser stopband target (measured >= ~-86.5 dB, worst at
+the region's lower edge 26 275.2 Hz at `fs_out` = 48 kS/s;
+`halfband_stopband_covers_frequencies_folding_inside_the_trusted_band`).
+A carrier above Nyquist stronger than the stopband margin can still
+promote a mirrored track in digital silence (measured boundary: -35 dBFS
+at +26 343.75 Hz promotes, -40 dBFS does not; e2e pin
+`an_in_band_foldover_residue_promotes_only_above_the_stopband_margin`).
+Deepening the stopband is a filter-design change excluded from MAN-196's
+scope and raised as a decision ticket (see the decision record).
+
+Channel granularity makes the effective edge the last channel centre
+inside the boundary (channel 231, 21 656.25 Hz, at 48 kS/s): channels
+232-255 per side (24 of 256) are conceded by design. See
+docs/DECISIONS/2026-10-14-man196-decimator-trusted-band.md.
 
 ---
 
@@ -248,7 +285,7 @@ States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`.
 
 | Transition | Condition |
 |---|---|
-| IDLE → CANDIDATE | rise condition first met on channel `k`, `k` is not owned by an existing track (§2.5), `k` is not RTTY-vetoed (§2.6), and no static crash is being suppressed this hop (§2.7) |
+| IDLE → CANDIDATE | rise condition first met on channel `k`, `k` is not owned by an existing track (§2.5), `k` is not RTTY-vetoed (§2.6), no static crash is being suppressed this hop (§2.7), and `k`'s centre is not outside the source's trusted band when one was supplied (§1.5, MAN-196) |
 | CANDIDATE → ACTIVE | rise sustained 19 hops → lease decoder from pool |
 | CANDIDATE → IDLE | rise condition lost before 19 hops |
 | ACTIVE → HANG | drop condition met (below off threshold) |
@@ -278,6 +315,12 @@ track back to ACTIVE.
 - A rising, unowned channel `k` may start a spawn decision only if its
   smoothed power `S[k]` is ≥ both `S[k−1]` and `S[k+1]` (a local maximum;
   neighbours wrap). (MAN-172, see docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md)
+- A channel whose centre lies outside the source's trusted band, when one
+  was supplied, may not start a spawn decision — in both the `k` and
+  `k+1` slots of the same-hop pairing rule below, so the arbitration
+  cannot route around the veto. Spawns only: a track that already exists
+  on an untrusted channel is never closed or de-weighted by it (MAN-196,
+  the MAN-314 spawns-only lesson).
 - A spawn decision at `k` is additionally rejected while *any* channel of
   the prospective ownership window `{k−1, k, k+1}` (neighbours wrap) is
   still serving a post-`Silent` respawn cooldown (§9's

@@ -7,18 +7,30 @@
 //! Each stage's design cutoff is deliberately a bit below the theoretical
 //! quarter-band point (see `CUTOFF_FRACTION`), reserving a transition-band
 //! margin so full stopband attenuation is actually reached by the new
-//! Nyquist rather than only somewhere past it. KNOWN LIMITATION (issue
-//! #179): this margin means channels near the decimated Nyquist edge see
-//! real, non-negligible attenuation (roughly -6 dB to -22 dB in the last
-//! ~1.5 kHz below the edge) while still being exposed to the channelizer
-//! as ordinary trackable channels -- a real CW signal landing there can
-//! lose enough SNR to go undetected, or a partially-attenuated edge
-//! channel can still show some spurious activity. The channelizer has no
-//! concept of decimation and does not yet exclude or de-weight these
-//! transition-band channels; see issue #179 for the follow-up. Without
-//! the margin, a
-//! signal just above the new Nyquist could alias into a false in-band
-//! track/spot at the mirrored RF frequency.
+//! Nyquist rather than only somewhere past it. This margin means channels
+//! near the decimated Nyquist edge see real, non-negligible attenuation
+//! (roughly -6 dB to -22 dB in the last ~1.5 kHz below the edge) while
+//! still being exposed to the channelizer as ordinary trackable channels.
+//! MITIGATION (MAN-196, issue #179): the decimator now publishes its own
+//! <= 1 dB **trusted band** (`TRUSTED_HALF_BAND_FRACTION`,
+//! `Decimator::trusted_half_bandwidth_hz`); `manta-input`'s
+//! `DecimatingSource` advertises it as its `rf_passband_hz` (so `manta
+//! check`, SETT segments, live-state bandState and the static-crash live
+//! set all narrow to the honest band) and `manta-engine`'s `TrackManager`
+//! vetoes *spawns* on channels whose centre lies outside it -- never
+//! closing or de-weighting running tracks. See
+//! docs/DECISIONS/2026-10-14-man196-decimator-trusted-band.md. Without
+//! the margin, a signal just above the new Nyquist could alias into a
+//! false in-band track/spot at the mirrored RF frequency. Known residual
+//! (round-1 review on PR #300): frequencies at or above `fs_out -
+//! trusted` fold *inside* the trusted band, past anything the veto can
+//! see -- the halfband's stopband holds them at >= 80 dB (measured >=
+//! ~-86.5 dB; see
+//! `halfband_stopband_covers_frequencies_folding_inside_the_trusted_band`),
+//! which removes any carrier at/under ~-40 dBFS from detectability but
+//! leaves a stronger carrier above Nyquist able to promote a mirrored
+//! track in digital silence; deepening it is a filter-design decision
+//! recorded in the decision record, not a constant change here.
 
 use crate::proto::{bessel_i0, KAISER_BETA};
 use num_complex::Complex32;
@@ -85,6 +97,50 @@ pub const HALFBAND_TAPS: usize = 127;
 /// the old `0.25` design (see `halfband_stopband_near_true_nyquist_db` and
 /// `false_track_scenario_tone_near_new_nyquist_is_suppressed`).
 pub const CUTOFF_FRACTION: f64 = 0.235;
+
+/// The trusted half-bandwidth, as a fraction of `fs_out` (MAN-196). The
+/// <= 1 dB crossover of the halfband design: at `fs_out = 48_000`, the
+/// measured crossover sits at 21 728.5 Hz and `0.4526 * 48_000 =
+/// 21 724.8 Hz`, a hair inside it (conservative: the constant never
+/// advertises attenuated spectrum). Channels beyond this boundary are the
+/// decimator's transition band.
+///
+/// Measured response of the real `design_halfband(HALFBAND_TAPS)` taps
+/// (exact DTFT, evaluated at the 93.75 Hz channel centres of a 48 kS/s
+/// output, final 96k->48k stage; the full 192k->48k cascade matches to
+/// within 0.05 dB because the final stage dominates, so one
+/// `fs_out`-normalized constant serves every factor):
+///
+/// ```text
+/// | offset Hz  | channel (from DC) | gain dB  |
+/// |------------|-------------------|----------|
+/// | 21 000.00  | 224               | -0.05    |
+/// | 21 562.50  | 230               | -0.60    |
+/// | 22 031.25  | 235               | -2.16    |
+/// | 22 500.00  | 240               | -5.44    |
+/// | 23 062.50  | 246               | -12.70   |
+/// | 23 531.25  | 251               | -22.76   |
+/// | 23 906.25  | 255               | -35.03   |
+/// | 24 000.00  | 256 (Nyquist)     | -39.05   |
+/// ```
+///
+/// Crossovers: -1 dB @ 21 728.5 Hz, -3 dB @ 22 183.3, -6 dB @ 22 557.9,
+/// -10 dB @ 22 889.5, -20 dB @ 23 422.4. The boundary sits at the -1 dB
+/// point because every measured artifact of the transition band lies
+/// beyond it: the frequency-estimate error breaches the project's 25 Hz
+/// golden bound from 23.0 kHz (-11.5 dB) outward, a duplicate second
+/// track spawned at 23.5 kHz (-22.8 dB), and above-Nyquist foldover
+/// residue promoted tracks -- while the golden rim-inside cell (+21 kHz,
+/// -0.05 dB) sits comfortably inside. Channel granularity makes the
+/// effective edge the last channel centre inside the boundary: channel
+/// 231 (21 656.25 Hz) at 48 kS/s, so channels 232-255 per side (24 of
+/// 256, the outer ~9.4% of each side) are conceded.
+///
+/// `trusted_half_band_matches_measured_1db_crossover` re-derives the
+/// crossover from the taps by bisection, so a change to `CUTOFF_FRACTION`
+/// or `HALFBAND_TAPS` that moves the -1 dB point fails the test instead
+/// of silently invalidating this constant.
+pub const TRUSTED_HALF_BAND_FRACTION: f64 = 0.4526;
 
 /// Design one halfband lowpass stage: ideal cutoff at `CUTOFF_FRACTION *
 /// fs_in` (deliberately below the theoretical quarter-band point of
@@ -219,6 +275,17 @@ impl Decimator {
         self.fs_out
     }
 
+    /// The trusted half-bandwidth, Hz: `TRUSTED_HALF_BAND_FRACTION *
+    /// fs_out()`. The band `+/- this value` around the centre is where
+    /// the cascade keeps channels within 1 dB of flat; beyond it lies the
+    /// transition band, which downstream surfaces advertise as unusable
+    /// and where the track manager vetoes spawns (MAN-196). Computed from
+    /// a constant at call time -- zero per-sample, per-hop or per-channel
+    /// cost, so MAN-186's decimator bench is undisturbed.
+    pub fn trusted_half_bandwidth_hz(&self) -> f64 {
+        TRUSTED_HALF_BAND_FRACTION * self.fs_out
+    }
+
     /// Feed input IQ at fs_in; returns however many decimated samples
     /// became available (possibly 0, if too few input samples have
     /// accumulated through every cascade stage so far).
@@ -232,12 +299,13 @@ impl Decimator {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
+pub(crate) mod dtft {
     /// |H(f)| in dB at frequency f (Hz), direct DTFT -- same helper shape
     /// as proto.rs's `response_db` (test-only, exact not FFT-approximated).
-    fn response_db(h: &[f32], f_hz: f64, fs: f64) -> f64 {
+    /// Promoted to module scope (MAN-196) so every test in this file --
+    /// the stopband sweeps, the passband checks and the trusted-band
+    /// crossover bisection -- shares one exact evaluator.
+    pub(crate) fn response_db(h: &[f32], f_hz: f64, fs: f64) -> f64 {
         let (mut re, mut im) = (0.0f64, 0.0f64);
         for (i, &tap) in h.iter().enumerate() {
             let phi = -2.0 * std::f64::consts::PI * f_hz * i as f64 / fs;
@@ -246,6 +314,12 @@ mod tests {
         }
         10.0 * (re * re + im * im).log10()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dtft::response_db;
+    use super::*;
 
     #[test]
     fn halfband_is_symmetric_and_unity_dc() {
@@ -340,6 +414,40 @@ mod tests {
         let h = design_halfband(HALFBAND_TAPS);
         let gain_db = response_db(&h, 40_000.0, fs);
         assert!(gain_db.abs() < 0.5, "passband gain {gain_db} dB");
+    }
+
+    #[test]
+    fn halfband_stopband_covers_frequencies_folding_inside_the_trusted_band() {
+        // MAN-196 round-1 review (PR #300): the trusted-band spawn veto
+        // only rejects folded aliases that land OUTSIDE the trusted band.
+        // Frequencies at or above fs_out - trusted_half fold INSIDE it,
+        // where no downstream veto can see them -- only this filter's
+        // stopband stands between the alias and a mirrored in-band track
+        // -- so the suppression over that whole region needs its own
+        // acceptance pin. The -80 dB figure is the design's own Kaiser
+        // stopband target (the module claims the decimator "isn't the
+        // weakest link in the alias-rejection chain"); measured worst case
+        // is ~-86.5 dB at the region's lower edge (26 275.2 Hz at
+        // fs_out = 48 kS/s). This pins the committed design; whether the
+        // target itself must deepen (a >= -35 dBFS carrier above Nyquist
+        // still promotes through ~-86 dB in digital silence) is raised as
+        // a decision ticket, not silently changed here.
+        let fs = 96_000.0; // one 96k -> 48k stage, the review's example
+        let fs_out = 48_000.0;
+        let fold_in_edge = fs_out - TRUSTED_HALF_BAND_FRACTION * fs_out;
+        let h = design_halfband(HALFBAND_TAPS);
+        let mut worst = -300.0f64;
+        let mut f = fold_in_edge;
+        while f <= fs / 2.0 {
+            worst = worst.max(response_db(&h, f, fs));
+            f += 5.0;
+        }
+        assert!(
+            worst <= -80.0,
+            "worst response over the fold-in region [{fold_in_edge:.1}, {:.1}] Hz is {worst} dB \
+             (design target -80 dB; raise the stopband target/KAISER_BETA if this fails)",
+            fs / 2.0
+        );
     }
 
     fn tone(freq: f64, n: usize, amp: f32, fs: f64) -> Vec<Complex32> {
@@ -478,5 +586,79 @@ mod tests {
             assert_eq!(a.re.to_bits(), b.re.to_bits());
             assert_eq!(a.im.to_bits(), b.im.to_bits());
         }
+    }
+
+    #[test]
+    fn trusted_half_band_matches_measured_1db_crossover() {
+        // Bisect |H(f)|^2 down to the -1 dB crossover of
+        // design_halfband(HALFBAND_TAPS), evaluated on the final stage's
+        // input grid (fs = 2 * fs_out = 96_000 for a 48 kS/s output).
+        // `trusted_half_band_matches_measured_1db_crossover` re-derives
+        // the boundary from the taps so a CUTOFF_FRACTION or
+        // HALFBAND_TAPS change that moves the -1 dB point fails here
+        // instead of silently invalidating TRUSTED_HALF_BAND_FRACTION.
+        let fs = 96_000.0;
+        let h = design_halfband(HALFBAND_TAPS);
+        let target = -1.0f64;
+        let response_at = |f: f64| dtft::response_db(&h, f, fs);
+        // The response is monotone non-increasing from DC through the
+        // transition band on [0, fs/4] (windowed lowpass), so bisection
+        // over that interval finds the unique -1 dB point.
+        let (mut lo, mut hi) = (0.0f64, fs / 4.0);
+        assert!(response_at(lo) > target, "DC gain must be above -1 dB");
+        assert!(response_at(hi) < target, "Nyquist must be below -1 dB");
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            if response_at(mid) > target {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let crossover = 0.5 * (lo + hi);
+        let constant_hz = TRUSTED_HALF_BAND_FRACTION * 48_000.0;
+        // Measured crossover: 21_728.5 Hz (research section 1). Pin the
+        // constant to it within half a channel spacing (93.75 / 2), and
+        // require it to sit AT-OR-INSIDE the crossover -- conservative,
+        // so the trusted band never advertises attenuated spectrum.
+        assert!(
+            (constant_hz - crossover).abs() <= CHANNEL_SPACING_HZ / 2.0,
+            "constant {constant_hz} Hz vs measured -1 dB crossover {crossover} Hz"
+        );
+        assert!(
+            constant_hz <= crossover,
+            "constant {constant_hz} Hz must sit at or inside the -1 dB crossover {crossover} Hz"
+        );
+        // The measured figure itself, so a filter redesign that keeps the
+        // constant but moves the response by more than a channel is
+        // caught by the two bounds above failing, not silently passing.
+        assert!(
+            (crossover - 21_728.5).abs() <= 1.0,
+            "crossover {crossover} Hz drifted from the measured 21_728.5 Hz"
+        );
+    }
+
+    #[test]
+    fn decimator_exposes_the_trusted_half_bandwidth_scaled_by_fs_out() {
+        // Every cascade factor shares one normalized design, and the
+        // final stage dominates (the cascade-vs-final-stage delta is
+        // <= 0.6 dB at the rim, research section 1), so one
+        // fs_out-normalized constant serves every factor.
+        for (fs_in, factor) in [(96_000.0, 2usize), (192_000.0, 4), (384_000.0, 8)] {
+            let d = Decimator::new(fs_in, factor).unwrap();
+            assert_eq!(d.fs_out(), 48_000.0);
+            let want = TRUSTED_HALF_BAND_FRACTION * 48_000.0;
+            assert!(
+                (d.trusted_half_bandwidth_hz() - want).abs() < 1e-9,
+                "fs_in {fs_in} factor {factor}: {} != {want}",
+                d.trusted_half_bandwidth_hz()
+            );
+        }
+        // A different output rate scales linearly.
+        let d = Decimator::new(192_000.0, 2).unwrap();
+        assert_eq!(d.fs_out(), 96_000.0);
+        assert!(
+            (d.trusted_half_bandwidth_hz() - TRUSTED_HALF_BAND_FRACTION * 96_000.0).abs() < 1e-9
+        );
     }
 }

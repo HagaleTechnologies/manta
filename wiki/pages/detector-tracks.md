@@ -38,7 +38,11 @@ Order statistics rather than a mean floor is the load-bearing choice: CW is burs
   CW below any relative-level threshold. MAN-314's RTTY shadow therefore
   vetoes spawns only, and closes use the RTTY hard span alone; see the
   [decision record](../../docs/DECISIONS/2026-10-11-man314-rtty-recognition.md)
-  and SPEC-decode-core.md §2.6.
+  and SPEC-decode-core.md §2.6. The spawns-only rule's second instance:
+  MAN-196's trusted-band veto (decimated captures) blocks spawns on
+  channels whose centre lies beyond the decimator's <= 1 dB boundary and
+  touches nothing already running; see the
+  [decision record](../../docs/DECISIONS/2026-10-14-man196-decimator-trusted-band.md).
 - Start-up: a padded decode path's zero pre-roll hops must stay out of the
   floor (`TrackManager::skip_preroll_hops`); a young ring's lower quartile
   is its minimum, so they would pin the floor near -140 dB. The 25 ms

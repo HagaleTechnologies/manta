@@ -195,6 +195,9 @@
 
 # Decimate to this sample rate, Hz, before decoding. No default: decode at
 # the receiver's own rate. It must divide that rate by a power of two.
+# Decimation narrows the usable passband to the decimator's <= 1 dB trusted
+# band (0.4526 x this rate per side): the outer channels are transition
+# band, not tracked, and `run`/`soak` say so at startup.
 #capture_rate_hz = 48000.0
 
 # WAV replay only: the time, in Unix seconds, that the recording's first

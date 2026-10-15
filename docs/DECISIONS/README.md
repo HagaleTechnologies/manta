@@ -15,6 +15,7 @@ Add a row here in the same change that adds a record:
 | 2026-10-14 | MAN-211 | [MAN-211: TrackMeta's frequency is captured per queued hop, like its SNR](2026-10-14-man211-trackmeta-freq-per-hop.md) |
 | 2026-10-14 | MAN-197 | [MAN-197: a live track's input selection also skips cooling-down channels](2026-10-14-man197-live-window-cooldown-enforcement.md) |
 | 2026-10-14 | MAN-197 | [MAN-197: the respawn cooldown gates a spawn candidate's whole ownership window](2026-10-14-man197-respawn-cooldown-ownership-window.md) |
+| 2026-10-14 | MAN-196 | [MAN-196: the decimator's trusted band — advertised and spawn-vetoed](2026-10-14-man196-decimator-trusted-band.md) |
 | 2026-10-14 | MAN-174 | [MAN-174: deferred beacons survive merge chains and every loss is counted](2026-10-14-man174-deferred-beacon-merge-bookkeeping.md) |
 | 2026-10-14 | MAN-192 | [MAN-192: the HSMM decoder reseeds after a committed Silence, not only on a gate re-onset](2026-10-14-man192-silence-reseed.md) |
 | 2026-10-14 | MAN-193 | [MAN-193: Evidence's centered maximum is a monotonic deque](2026-10-14-man193-centered-maximum-deque.md) |
