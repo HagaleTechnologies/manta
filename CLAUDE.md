@@ -220,9 +220,9 @@ MAN-156: CI denies rustdoc warnings (`RUSTDOCFLAGS=-D warnings cargo doc
 --no-deps --workspace --locked` in `test (ubuntu-latest)`; `manta-cli`'s
 clap help text is exempt). The "Supply Chain" check runs `cargo deny
 --locked check` against `deny.toml` (advisories, licenses, bans, sources;
-also daily on main). Trusted PRs get a non-required `test (windows-latest)`
-check-run. `release-publish.yml` refuses a tag whose CI push run failed any
-test leg. The `PR title` check requires a Conventional Commits title. See
+also daily on main). Trusted PRs get a `test (windows-latest)` check-run
+(required once MAN-371's owner step O1 is applied). `release-publish.yml`
+refuses a tag whose CI push run failed any test leg. The `PR title` check requires a Conventional Commits title. See
 docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md.
 
 MAN-315: the legacy decoder learns per-track dot/dash/gap timing
@@ -263,6 +263,14 @@ MAN-210: golden vector V51 (V9's drift scene, `refine_bw_hz = 30` via
 `--config`) exercises the narrowband refiner's refine-enabled path
 end-to-end through `manta decode --json` — the evidence any future
 default-on change must keep green.
+
+MAN-371: `ci-full.yml` creates all three `test (...)` check-runs on a
+trusted PR's head fail-closed, and tests that need several free ports
+hold every listener until all are read (`free_ports::<N>()`). Adding
+`test (windows-latest)` to `main-protection` is owner step O1, followed
+by a 20-run merge-queue watch with rollback triggers;
+`test-hpsdr (windows-latest)` stays advisory. See
+docs/DECISIONS/2026-10-15-man371-windows-required-check.md.
 
 ## Documents (read in this order)
 
