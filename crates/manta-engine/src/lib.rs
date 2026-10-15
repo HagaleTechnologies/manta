@@ -21,6 +21,7 @@ pub use calibrate::{calibrate, CalibrateOptions, CalibrationReport};
 pub mod doctor;
 pub use doctor::{doctor, DoctorReport, Verdict, MAX_DURATION, MIN_DURATION};
 pub mod soak;
+pub use manta_spot::reference::ReferenceLists;
 pub use manta_spot::{Blocklist, NotchList, Spot, SpotType};
 pub use soak::{soak, soak_passed, SoakReport};
 pub mod soak_metrics;
@@ -32,6 +33,9 @@ pub use soak_metrics::{
 mod static_crash_tests;
 mod track;
 pub use manta_dsp::crash::CRASH_MIN_LIVE_CHANNELS;
+/// MAN-234: the input sample guard's limit (SPEC §1.3 step 0), for the
+/// CLI's wording.
+pub use manta_dsp::sample_guard::MAX_SAMPLE_MAGNITUDE;
 pub use track::{crash_live_channels, ChannelLevel, CrashFilter, DetectorConfig};
 
 use anyhow::{bail, Context, Result};
@@ -80,17 +84,6 @@ pub(crate) fn calibrate_freq_events(ev: &DecoderEvent, factor: f64) -> DecoderEv
     }
 }
 
-/// `decode_samples`'s single-track selection: the lowest track_id among
-/// events that represent real decoder output. `TrackPromoted` is a
-/// detector-internal diagnostic signal (added for `manta_engine::doctor()`'s
-/// NoSignal check, see docs/DECISIONS/2026-09-09-doctor-track-promoted-
-/// event.md) with no decoder output of its own -- excluded here so an
-/// early, low-track-id candidate that was promoted and then merged/
-/// evicted/reached EOF before producing any real decoder event never gets
-/// selected over a later track that actually decoded something (round-5
-/// review finding). `None` means every event in `events` was a
-/// `TrackPromoted` (or `events` was empty, already handled by the caller
-/// before this is reached).
 /// The last `TimingUpdate` in `track_events` (one track's events): the
 /// sender timing `DecodeReport::timing` reports (MAN-315).
 fn last_timing(track_events: &[DecoderEvent]) -> Option<TimingEstimates> {
@@ -100,10 +93,29 @@ fn last_timing(track_events: &[DecoderEvent]) -> Option<TimingEstimates> {
     })
 }
 
+/// `decode_samples`'s single-track selection: the lowest track_id among
+/// events that represent real decoder output. `TrackPromoted` is a
+/// detector-internal diagnostic signal (added for `manta_engine::doctor()`'s
+/// NoSignal check, see docs/DECISIONS/2026-09-09-doctor-track-promoted-
+/// event.md) with no decoder output of its own -- excluded here so an
+/// early, low-track-id candidate that was promoted and then merged/
+/// evicted/reached EOF before producing any real decoder event never gets
+/// selected over a later track that actually decoded something (round-5
+/// review finding). `TrackClosed` is bookkeeping, not decoder output,
+/// and is excluded too (MAN-174): a merge survivor that never decoded
+/// still gets its own `TrackClosed`, and must not become the reported
+/// track on that alone. `None` means every event in `events` was a
+/// `TrackPromoted` or `TrackClosed` (or `events` was empty, already
+/// handled by the caller before this is reached).
 fn primary_track_id(events: &[DecoderEvent]) -> Option<u32> {
     events
         .iter()
-        .filter(|e| !matches!(e, DecoderEvent::TrackPromoted { .. }))
+        .filter(|e| {
+            !matches!(
+                e,
+                DecoderEvent::TrackPromoted { .. } | DecoderEvent::TrackClosed { .. }
+            )
+        })
         .map(track::event_track_id)
         .min()
 }
@@ -137,6 +149,10 @@ pub struct PipelineConfig {
     pub cty: Option<Arc<manta_spot::cty::Table>>,
     /// Operator-supplied MASTER.SCP, parsed once. None uses the bundled set.
     pub scp: Option<Arc<manta_spot::scp::Set>>,
+    /// Operator-supplied callsign-pattern table. None uses the bundled list.
+    pub patterns: Option<Arc<manta_spot::pattern::Table>>,
+    /// Repetition thresholds by callsign-pattern rarity.
+    pub validation_level: manta_spot::ValidationLevel,
 }
 
 impl PipelineConfig {
@@ -152,6 +168,12 @@ impl PipelineConfig {
             .clone()
             .unwrap_or_else(|| Arc::new(manta_spot::scp::Set::bundled()))
     }
+    /// The resolved callsign-pattern table.
+    pub fn pattern_table(&self) -> Arc<manta_spot::pattern::Table> {
+        self.patterns
+            .clone()
+            .unwrap_or_else(|| Arc::new(manta_spot::pattern::Table::bundled()))
+    }
     /// Builds the validator used by every production decode path.
     pub fn validator(&self, fs: f64) -> Result<manta_spot::Validator> {
         // Keep the checked ppm constructor so callers cannot supply an
@@ -161,7 +183,9 @@ impl PipelineConfig {
                 .with_freq_correction_ppm(self.freq_correction_ppm)
                 .map_err(|e| anyhow::anyhow!(e))?
                 .with_blocklist(self.blocklist.clone())
-                .with_notch(self.notch.clone());
+                .with_notch(self.notch.clone())
+                .with_patterns(self.pattern_table())
+                .with_validation_level(self.validation_level);
         for call in &self.allowlist {
             validator.allowlist(call);
         }
@@ -180,6 +204,8 @@ impl Default for PipelineConfig {
             notch: NotchList::default(),
             cty: None,
             scp: None,
+            patterns: None,
+            validation_level: manta_spot::ValidationLevel::default(),
         }
     }
 }
@@ -205,10 +231,39 @@ pub struct DecodeReport {
     /// MAN-314: every RTTY signal the detector marked (SPEC §2.6); empty
     /// for input without RTTY or with `rtty_filter` off.
     pub rtty: Vec<RttySignalReport>,
+    /// MAN-234: input samples replaced with silence (SPEC §1.3 step 0).
+    /// Omitted from JSON when 0, so a clean decode's `--json` is unchanged.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub bad_samples: u64,
     /// Input sample rate, for turning `rtty` sample timestamps into
     /// seconds; not serialized.
     #[serde(skip)]
     pub sample_rate_hz: f64,
+}
+
+/// `skip_serializing_if` predicate for the MAN-234 `bad_samples` report
+/// fields: a clean run's JSON keeps its pre-MAN-234 shape.
+pub(crate) fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// MAN-234: the suffix `decode_samples` adds to its "no signal found"
+/// errors when the channelizer replaced any input samples, so an input
+/// that was all bad samples says so instead of only "no signal".
+fn bad_samples_suffix(n: u64) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    let (noun, verb) = if n == 1 {
+        ("sample", "was")
+    } else {
+        ("samples", "were")
+    };
+    format!(
+        "; {n} bad input {noun} (NaN, infinite, or larger than {:e} in magnitude) {verb} \
+         replaced with silence",
+        MAX_SAMPLE_MAGNITUDE
+    )
 }
 
 /// MAN-314: one marked RTTY signal (SPEC §2.6), frequencies calibrated
@@ -319,8 +374,12 @@ pub fn decode_samples(
         any_hops |= !hops.is_empty();
         events.extend(tm.process_hops(&hops, |m| (m.saturating_sub(pad_hops)) * hop));
     }
+    let bad_samples = ch.bad_samples();
     if !any_hops {
-        bail!("no signal found (input shorter than one filter length or empty)");
+        bail!(
+            "no signal found (input shorter than one filter length or empty){}",
+            bad_samples_suffix(bad_samples)
+        );
     }
     let rtty: Vec<RttySignalReport> = tm
         .rtty_signals()
@@ -331,13 +390,21 @@ pub fn decode_samples(
 
     // MAN-314: a marked RTTY signal is a finding on its own, so input with
     // RTTY but no CW decoder output still returns a report (empty CW
-    // fields, `rtty` filled) instead of "no signal found".
+    // fields, `rtty` filled) instead of "no signal found". MAN-313: hops
+    // were produced, so the input was long enough; with `non_cw_filter` on
+    // an input of only speech, data or swept carriers lands here.
     if events.is_empty() && rtty.is_empty() {
-        bail!("no signal found (input shorter than one filter length or empty)");
+        bail!(
+            "no signal found (no keyed CW signal in the input){}",
+            bad_samples_suffix(bad_samples)
+        );
     }
     let min_track_id = primary_track_id(&events);
     if min_track_id.is_none() && rtty.is_empty() {
-        bail!("no signal found (only detector promotion events, no decoder output)");
+        bail!(
+            "no signal found (only detector promotion events, no decoder output){}",
+            bad_samples_suffix(bad_samples)
+        );
     }
     let this_track: Vec<DecoderEvent> = events
         .iter()
@@ -388,6 +455,7 @@ pub fn decode_samples(
         spots,
         timing,
         rtty,
+        bad_samples,
         sample_rate_hz: fs,
     })
 }
@@ -445,6 +513,9 @@ mod tests {
         assert!(!calls(&PipelineConfig::default()).contains(&"QQ9ZZZ".to_string()));
         let cfg = PipelineConfig {
             cty: Some(cty_with_qq9()),
+            patterns: Some(Arc::new(
+                manta_spot::pattern::Table::parse("+QQ9@@@\n").unwrap(),
+            )),
             ..Default::default()
         };
         assert!(
@@ -515,6 +586,21 @@ mod tests {
             },
         ];
         assert_eq!(primary_track_id(&events), Some(2));
+    }
+
+    /// MAN-174: a merge survivor that never decoded still gets its own
+    /// `TrackClosed`. That bookkeeping event must not make it the
+    /// reported track over a higher-id track with real decoder output.
+    #[test]
+    fn primary_track_id_ignores_track_closed() {
+        let events = vec![
+            DecoderEvent::TrackClosed {
+                track_id: 2,
+                closure: manta_decode::events::ClosureKind::SignalEnded,
+            },
+            DecoderEvent::word_boundary(5, 10),
+        ];
+        assert_eq!(primary_track_id(&events), Some(5));
     }
 
     /// MAN-315: `DecodeReport::timing` is the primary track's last
@@ -592,6 +678,90 @@ mod tests {
             "blocklisted callsign must never be spotted, got {:?}",
             report.spots
         );
+    }
+
+    /// MAN-234: V1 cut to 12 s, rendered once per test.
+    fn v1_12s() -> (manta_testkit::vectors::VectorSpec, Vec<Complex32>) {
+        let spec = manta_testkit::vectors::VectorSpec {
+            duration_s: 12.0,
+            ..manta_testkit::vectors::v1()
+        };
+        let samples = manta_testkit::vectors::render(&spec).unwrap().samples;
+        (spec, samples)
+    }
+
+    #[test]
+    fn decode_samples_survives_a_bad_sample_mid_track() {
+        // MAN-234 scenario 1: before the channelizer guard this panicked
+        // at `track.rs`'s `select_channel` `partial_cmp(..).unwrap()`.
+        let (spec, clean) = v1_12s();
+        let cfg = PipelineConfig::default();
+        let want = decode_samples(&clean, spec.fs, spec.center_freq_hz, &cfg).unwrap();
+        assert_eq!(want.bad_samples, 0);
+        let mut corrupt = clean.clone();
+        corrupt[576_000].re = f32::NAN; // t = 6 s
+        let got = decode_samples(&corrupt, spec.fs, spec.center_freq_hz, &cfg).unwrap();
+        assert_eq!(got.bad_samples, 1);
+        assert_eq!(got.text, want.text);
+    }
+
+    #[test]
+    fn decode_samples_survives_a_finite_overflow_sample_at_start() {
+        // MAN-234 D2: a finite `f32::MAX` latched the floor/gate EMAs at
+        // NaN and the decode failed "no signal found".
+        let (spec, clean) = v1_12s();
+        let cfg = PipelineConfig::default();
+        let want = decode_samples(&clean, spec.fs, spec.center_freq_hz, &cfg).unwrap();
+        let mut corrupt = clean.clone();
+        corrupt[96].re = f32::MAX; // t = 1 ms
+        let got = decode_samples(&corrupt, spec.fs, spec.center_freq_hz, &cfg).unwrap();
+        assert_eq!(got.bad_samples, 1);
+        assert_eq!(got.text, want.text);
+    }
+
+    #[test]
+    fn clean_decode_report_json_has_no_bad_samples_key() {
+        let (spec, clean) = v1_12s();
+        let mut report = decode_samples(
+            &clean,
+            spec.fs,
+            spec.center_freq_hz,
+            &PipelineConfig::default(),
+        )
+        .unwrap();
+        let v = serde_json::to_value(&report).unwrap();
+        assert!(v.get("bad_samples").is_none(), "clean JSON: {v}");
+        report.bad_samples = 3;
+        let s = serde_json::to_string(&report).unwrap();
+        assert!(s.contains("\"bad_samples\":3"), "{s}");
+    }
+
+    #[test]
+    fn no_signal_error_names_replaced_samples() {
+        let cfg = PipelineConfig::default();
+        let all_nan = vec![Complex32::new(f32::NAN, f32::NAN); 96_000];
+        let err = decode_samples(&all_nan, 96_000.0, 14_000_000.0, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("no signal found"), "{err}");
+        assert!(
+            err.contains(
+                "96000 bad input samples (NaN, infinite, or larger than 1e17 in magnitude) \
+                 were replaced with silence"
+            ),
+            "{err}"
+        );
+        let silence = vec![Complex32::new(0.0, 0.0); 96_000];
+        let err = decode_samples(&silence, 96_000.0, 14_000_000.0, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "input is digital silence");
+        assert_eq!(
+            bad_samples_suffix(1),
+            "; 1 bad input sample (NaN, infinite, or larger than 1e17 in magnitude) was \
+             replaced with silence"
+        );
+        assert_eq!(bad_samples_suffix(0), "");
     }
 
     #[test]

@@ -212,7 +212,10 @@ fn decimation_and_dial_override_reach_the_report() {
     );
     assert_eq!(measured["sample_rate_hz"], 48000.0);
     assert_eq!(measured["center_freq_hz"], 14060000.0);
-    assert_eq!(measured["passband_offsets_hz"], json!([-24000.0, 24000.0]));
+    // MAN-196: the reported passband is the decimator's <= 1 dB trusted
+    // band (0.4526 * 48_000 = 21_724.8 Hz), not the raw 24 kHz output
+    // Nyquist -- the transition band beyond it is not usable spectrum.
+    assert_eq!(measured["passband_offsets_hz"], json!([-21724.8, 21724.8]));
     assert!(measured["samples_received"].as_u64().unwrap() <= 48000);
     assert_eq!(
         measured["observed_duration_seconds"].as_f64().unwrap(),

@@ -64,6 +64,10 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// time.
 const MAX_TARGET_RESPONSE_LINES: u32 = 30;
 const TARGET_RESPONSE_RATE_WINDOW: Duration = Duration::from_secs(60);
+/// MAN-248: the window `max_spots_per_minute` is measured over -- the
+/// same fixed-window semantics `RateLimiter` already pins (resets at the
+/// first event after the window elapses).
+const FORWARD_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// MAN-90: appended to every operator-facing "now transmitting" log line --
 /// here at startup and in manta-cli's SIGHUP reload -- because nothing has
@@ -143,6 +147,7 @@ pub async fn serve_with_live_dry_run(
             target_host = %config.target_host,
             target_port = config.target_port,
             spot_types = %config.spot_types.as_str(),
+            max_spots_per_minute = config.max_spots_per_minute,
             "uplink: dry_run is ON (the default) -- connecting and logging in, \
              but NOT transmitting spots. Set `dry_run = false` in this \
              [[rbn_uplink]] block to transmit for real."
@@ -152,6 +157,7 @@ pub async fn serve_with_live_dry_run(
             target_host = %config.target_host,
             target_port = config.target_port,
             spot_types = %config.spot_types.as_str(),
+            max_spots_per_minute = config.max_spots_per_minute,
             "uplink: dry_run = false -- transmitting real spots to this target. {}",
             EXPERIMENTAL_NOTICE
         );
@@ -173,6 +179,21 @@ pub async fn serve_with_live_dry_run(
     // way a detached `tokio::spawn` task requires.
     let resolver_slot = Arc::new(Semaphore::new(1));
 
+    // MAN-248: this target's forwarding ceiling, budgeted with the
+    // existing `RateLimiter`. Owned HERE, above the reconnect loop, and
+    // passed `&mut` down -- a per-connection budget (like
+    // `response_limiter` below) would reset the flood bound on every
+    // reconnect, exactly when a flappy target is most able to multiply
+    // volume. `0` disables the ceiling (the `*_per_ip` keys' documented
+    // convention): mapped to `u32::MAX` so the hot path stays one compare
+    // and one increment, branch-free on the disabled spelling.
+    let effective_max_per_window = if config.max_spots_per_minute == 0 {
+        u32::MAX
+    } else {
+        config.max_spots_per_minute
+    };
+    let mut forward_budget = RateLimiter::new(effective_max_per_window, FORWARD_RATE_WINDOW);
+
     loop {
         if *shutdown.borrow() {
             return;
@@ -184,6 +205,7 @@ pub async fn serve_with_live_dry_run(
             &login_callsign,
             &bus,
             &target,
+            &mut forward_budget,
             &mut shutdown,
             &resolver_slot,
         )
@@ -359,12 +381,14 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_forward(
     config: &RbnUplinkConfig,
     dry_run: &AtomicBool,
     login_callsign: &str,
     bus: &Arc<SpotBus>,
     target: &Arc<UplinkTarget>,
+    forward_budget: &mut RateLimiter,
     shutdown: &mut watch::Receiver<bool>,
     resolver_slot: &Arc<Semaphore>,
 ) -> Result<(), ConnectAttemptError> {
@@ -455,6 +479,7 @@ async fn connect_and_forward(
         login_callsign,
         bus,
         target,
+        forward_budget,
         shutdown,
     )
     .await;
@@ -563,6 +588,7 @@ async fn forward_loop(
     spotter_call: &str,
     bus: &Arc<SpotBus>,
     target: &Arc<UplinkTarget>,
+    forward_budget: &mut RateLimiter,
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let mut discard = String::new();
@@ -585,6 +611,19 @@ async fn forward_loop(
                         }
                         if dry_run.load(Ordering::Relaxed) {
                             target.record_suppressed();
+                            continue;
+                        }
+                        // MAN-248: the forwarding ceiling, checked where
+                        // the spot is about to be written. Deliberately
+                        // AFTER the dry-run check: a dry-run spot is never
+                        // "about to be written", and `dry_run` flips live
+                        // via SIGHUP (MAN-78) -- dry-run periods must not
+                        // consume forwarding budget. Over budget: count
+                        // and skip. No disconnect, no queue, no error --
+                        // the connection stays up by design, the opposite
+                        // of `response_limiter`'s overrun handling below.
+                        if !forward_budget.allow() {
+                            target.record_ceiling_suppressed();
                             continue;
                         }
                         let unix_ts = bus.unix_ts_for(bus_spot.spot.sample_ts);
@@ -854,6 +893,7 @@ mod tests {
             login_callsign: None,
             dry_run: false,
             spot_types: crate::config::UplinkSpotTypes::default(),
+            max_spots_per_minute: 600,
         };
         assert_eq!(cfg.effective_login_callsign("W3XYZ"), "W3XYZ");
     }
@@ -995,6 +1035,7 @@ mod tests {
             login_callsign: None,
             dry_run: false,
             spot_types: crate::config::UplinkSpotTypes::default(),
+            max_spots_per_minute: 600,
         }
     }
 

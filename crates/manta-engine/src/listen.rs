@@ -10,6 +10,7 @@ use crate::PipelineConfig;
 use anyhow::Result;
 use manta_decode::events::DecoderEvent;
 use manta_input::IqSource;
+use manta_spot::reference::ReferenceLists;
 use manta_spot::{Blocklist, NotchList, Validator};
 use num_complex::Complex32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -61,18 +62,37 @@ pub struct ListenObservers {
     /// running `Validator`. `None` (the default) skips the check
     /// entirely, so `listen()`'s existing callers pay nothing.
     pub operator_lists: Option<Arc<OperatorListsUpdate>>,
+    /// MAN-316: the country table and known-call set a scheduled list
+    /// refresh replaces. The running `Validator` takes their current tables
+    /// at the start (so the caller builds this from the same
+    /// `PipelineConfig`, `ReferenceLists::new(cfg.cty_table(),
+    /// cfg.scp_set())`) and again before the next decoder event after a
+    /// `store`. `None` (the default) skips the check entirely, so `listen()`'s
+    /// existing callers pay nothing.
+    pub reference_lists: Option<Arc<ReferenceLists>>,
     /// MAN-312: static crashes detected so far this session
     /// (`TrackManager::static_crash_count`, summed across the segments a
     /// discontinuity starts), stored with `fetch_max` after each processed
     /// chunk so the published value never goes backwards. A counter, so it
     /// is never zeroed on exit. `None` (the default) skips the store.
     pub static_crashes: Option<Arc<AtomicU64>>,
+    /// MAN-234: input samples the channelizer replaced with silence
+    /// (`Channelizer::bad_samples`, summed across the segments a
+    /// discontinuity starts), stored with `fetch_max` after each processed
+    /// chunk so it never goes backwards. `None` (the default) skips it.
+    pub bad_samples: Option<Arc<AtomicU64>>,
     /// MAN-314: the currently marked RTTY signals (SPEC §2.6), stored
     /// whenever the marked set or a marked signal's metadata changes (so a
     /// store is not by itself a mark or clear), emptied on a segment
     /// restart, a read error and every exit. `None` (the default) skips it
     /// entirely.
     pub rtty: Option<Arc<RttyObserver>>,
+    /// MAN-313: every CANDIDATE -> ACTIVE confirmation the detector has
+    /// made since `listen()` started (`TrackManager::confirmations`),
+    /// whether or not the track went on to qualify as keyed CW. Summed
+    /// across outage segments, so it only ever grows. Stored wherever the
+    /// active-track count is. `None` (the default) skips it entirely.
+    pub detector_confirmations: Option<Arc<AtomicU64>>,
     /// MAN-324: the live-state stream -- once per stream second each
     /// channel's floor and occupancy, each track's running copy and
     /// candidates when its text changes, every validation decision and
@@ -228,6 +248,50 @@ impl OperatorListsUpdate {
     }
 }
 
+/// MAN-316: the decode loop's view of `ListenObservers::reference_lists`:
+/// the generation of each list its validator already holds, so a `store`
+/// costs one table swap and an unchanged list costs two atomic loads per
+/// event.
+struct ReferenceWatch {
+    lists: Arc<ReferenceLists>,
+    seen_cty: u64,
+    seen_scp: u64,
+}
+
+impl ReferenceWatch {
+    /// Starts in step with `lists`: `validator` takes their current tables,
+    /// so a `store` made before `listen()` began is not missed.
+    fn new(lists: Arc<ReferenceLists>, validator: &mut Validator) -> Self {
+        let mut watch = Self {
+            lists,
+            seen_cty: 0,
+            seen_scp: 0,
+        };
+        watch.apply(validator);
+        watch
+    }
+
+    /// Hands `validator` the current tables if either list moved since the
+    /// last call.
+    fn sync(&mut self, validator: &mut Validator) {
+        if self.lists.cty.generation() != self.seen_cty
+            || self.lists.scp.generation() != self.seen_scp
+        {
+            self.apply(validator);
+        }
+    }
+
+    fn apply(&mut self, validator: &mut Validator) {
+        // Generations before values: a `store` landing in between leaves a
+        // generation behind its value, so the next `sync` swaps again rather
+        // than recording the new generation against the old table.
+        let (cty_gen, scp_gen) = (self.lists.cty.generation(), self.lists.scp.generation());
+        validator.replace_reference_tables(self.lists.cty.load(), Some(self.lists.scp.load()));
+        self.seen_cty = cty_gen;
+        self.seen_scp = scp_gen;
+    }
+}
+
 /// Zeroes the active-track observer on EVERY exit path out of
 /// `listen_with_observers`, not just the happy one.
 ///
@@ -278,10 +342,12 @@ struct Segment {
     pad_hops: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn new_segment(
     fs: f64,
     center_freq_hz: f64,
     rf_passband_hz: (f64, f64),
+    trusted_band_hz: Option<(f64, f64)>,
     cfg: &PipelineConfig,
     next_id: u32,
     quality: Option<Arc<DecodeQualityObserver>>,
@@ -304,6 +370,13 @@ fn new_segment(
     // MAN-312 (SPEC §2.7): judge static crashes over the source's real
     // passband, not channels that only carry the stream's residual noise.
     tm.set_rf_passband_hz(rf_passband_hz.0, rf_passband_hz.1);
+    // MAN-196: never spawn tracks outside the source's trusted band (the
+    // decimator's <= 1 dB boundary on a decimated capture; `None`, no
+    // decimator, leaves the manager exactly as it was). Spawns-only per
+    // segment, same threading as the RF passband above.
+    if let Some((lo, hi)) = trusted_band_hz {
+        tm.set_trusted_band_hz(lo, hi);
+    }
     // MAN-118: a post-discontinuity segment keeps reporting.
     tm.set_quality_observer(quality);
     // MAN-324: a post-discontinuity segment keeps the live occupancy window.
@@ -326,6 +399,8 @@ struct EmitCtx<'a> {
     calibration_factor: f64,
     /// MAN-324: `Some` only when `ListenObservers::live_state` is set.
     live: Option<LiveTap>,
+    /// MAN-316: `Some` only when `ListenObservers::reference_lists` is set.
+    references: Option<ReferenceWatch>,
 }
 
 fn emit(
@@ -353,6 +428,10 @@ fn emit(
         // and end-of-stream batches alike.
         if let Some(l) = ctx.lists.and_then(OperatorListsUpdate::take) {
             validator.replace_operator_lists(&l.allowlist, l.blocklist, l.notch);
+        }
+        // MAN-316: likewise for a list refresh's new cty/scp tables.
+        if let Some(watch) = ctx.references.as_mut() {
+            watch.sync(validator);
         }
         let calibrated = crate::calibrate_freq_events(&ev, ctx.calibration_factor);
         on_event(&calibrated);
@@ -480,8 +559,17 @@ pub fn listen_with_observers(
     let fs = src.sample_rate();
     let center_freq_hz = src.center_freq_hz();
     let rf_passband_hz = src.rf_passband_hz();
+    // MAN-196: the source's trusted band, read once beside the RF
+    // passband and applied to every segment (including the
+    // discontinuity rebuild below) -- `None` for every non-decimated
+    // source leaves each segment's manager exactly as before.
+    let trusted_band_hz = src.trusted_band_hz();
 
     let mut validator = cfg.validator(fs)?;
+    let references = observers
+        .reference_lists
+        .clone()
+        .map(|lists| ReferenceWatch::new(lists, &mut validator));
     // MAN-324: the live tap turns the validator's decision log on per
     // batch, only while someone is subscribed (`emit`).
     let live = observers
@@ -494,6 +582,7 @@ pub fn listen_with_observers(
         quality: observers.decode_quality.as_deref(),
         calibration_factor,
         live,
+        references,
     };
 
     // One relaxed store over a count that is a single filtered pass across
@@ -516,10 +605,27 @@ pub fn listen_with_observers(
         }
     };
 
+    // MAN-313: each segment has its own `TrackManager`, so its
+    // confirmation count restarts at 0; `confirmations_base` holds the
+    // closed segments' totals so the published count never goes back.
+    let mut confirmations_base: u64 = 0;
+    let report_confirmations = |n: u64| {
+        if let Some(counter) = &observers.detector_confirmations {
+            counter.store(n, Ordering::Relaxed);
+        }
+    };
+
     // MAN-312: crashes counted by segments a discontinuity already replaced.
     let mut crash_base: u64 = 0;
     let report_static_crashes = |n: u64| {
         if let Some(counter) = &observers.static_crashes {
+            counter.fetch_max(n, Ordering::Relaxed);
+        }
+    };
+    // MAN-234: samples replaced by segments a discontinuity already replaced.
+    let mut bad_base: u64 = 0;
+    let report_bad_samples = |n: u64| {
+        if let Some(counter) = &observers.bad_samples {
             counter.fetch_max(n, Ordering::Relaxed);
         }
     };
@@ -528,6 +634,7 @@ pub fn listen_with_observers(
         fs,
         center_freq_hz,
         rf_passband_hz,
+        trusted_band_hz,
         cfg,
         1,
         observers.decode_quality.clone(),
@@ -589,7 +696,9 @@ pub fn listen_with_observers(
     );
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
+    report_confirmations(confirmations_base + seg.tm.confirmations());
     report_static_crashes(crash_base + seg.tm.static_crash_count());
+    report_bad_samples(bad_base + seg.ch.bad_samples());
     rtty.update(&seg.tm);
     on_tracks(n_tracks);
     // `..filled`: the whole buffer unless a stop request cut the fill short.
@@ -605,7 +714,9 @@ pub fn listen_with_observers(
     );
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
+    report_confirmations(confirmations_base + seg.tm.confirmations());
     report_static_crashes(crash_base + seg.tm.static_crash_count());
+    report_bad_samples(bad_base + seg.ch.bad_samples());
     rtty.update(&seg.tm);
     on_tracks(n_tracks);
     let mut seg_consumed: u64 = filled as u64;
@@ -651,7 +762,9 @@ pub fn listen_with_observers(
                 &mut on_spot,
             );
             let next_id = seg.tm.next_track_id();
+            confirmations_base += seg.tm.confirmations();
             crash_base += seg.tm.static_crash_count();
+            bad_base += seg.ch.bad_samples();
             // The old segment's marks clear where its samples end.
             rtty.restart(seg_base + seg_consumed);
             seg_base += seg_consumed + gap;
@@ -660,6 +773,7 @@ pub fn listen_with_observers(
                 fs,
                 center_freq_hz,
                 rf_passband_hz,
+                trusted_band_hz,
                 cfg,
                 next_id,
                 observers.decode_quality.clone(),
@@ -696,7 +810,9 @@ pub fn listen_with_observers(
         );
         let n_tracks = seg.tm.decoding_track_count();
         report_active_tracks(n_tracks);
+        report_confirmations(confirmations_base + seg.tm.confirmations());
         report_static_crashes(crash_base + seg.tm.static_crash_count());
+        report_bad_samples(bad_base + seg.ch.bad_samples());
         rtty.update(&seg.tm);
         on_tracks(n_tracks);
         if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
@@ -717,11 +833,13 @@ pub fn listen_with_observers(
         &mut on_spot,
     );
     report_static_crashes(crash_base + seg.tm.static_crash_count());
+    report_bad_samples(bad_base + seg.ch.bad_samples());
     // `finish()` flushes and drops every decoder and closes every remaining
     // track: nothing is being decoded once the stream has ended, so both
     // observers must settle back to 0 rather than be left holding the last
     // live value after a source disconnects or a replay hits EOF.
     report_active_tracks(0);
+    report_confirmations(confirmations_base + seg.tm.confirmations());
     rtty.restart(seg_base + seg_consumed);
     on_tracks(0);
     Ok(())
@@ -761,6 +879,9 @@ mod tests {
         ));
         let cfg = PipelineConfig {
             cty: Some(Arc::new(table)),
+            patterns: Some(Arc::new(
+                manta_spot::pattern::Table::parse("+QQ9@@@\n").unwrap(),
+            )),
             ..Default::default()
         };
         assert!(calls(&cfg).contains(&"QQ9ZZZ".into()));
@@ -988,6 +1109,29 @@ mod tests {
         }
     }
 
+    /// MAN-196: a source that reports a trusted band, as a decimated one
+    /// does (`DecimatingSource`). `None` mimics every non-decimated
+    /// source (the trait default).
+    struct TrustedBandSource {
+        inner: FixedFreqSource,
+        trusted_band_hz: Option<(f64, f64)>,
+    }
+
+    impl manta_input::IqSource for TrustedBandSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.sample_rate()
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz()
+        }
+        fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+            self.trusted_band_hz
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
     /// Runs `listen_with_observers` with a static-crash observer, returning
     /// the value it held at every `on_tracks` call.
     fn static_crash_readings(src: Box<dyn manta_input::IqSource>) -> Vec<u64> {
@@ -1027,6 +1171,100 @@ mod tests {
         assert_eq!(readings.last(), Some(&2), "{readings:?}");
     }
 
+    /// Runs `listen_with_observers` with a bad-sample observer, returning
+    /// the value it held at every `on_tracks` call and once more at the end.
+    fn bad_sample_readings(src: Box<dyn manta_input::IqSource>) -> Vec<u64> {
+        let counter = Arc::new(AtomicU64::new(0));
+        let mut readings = Vec::new();
+        listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                bad_samples: Some(counter.clone()),
+                ..Default::default()
+            },
+            |_| {},
+            |_| {},
+            |_| readings.push(counter.load(Ordering::Relaxed)),
+        )
+        .unwrap();
+        readings.push(counter.load(Ordering::Relaxed));
+        readings
+    }
+
+    fn v1_6s() -> (manta_testkit::vectors::VectorSpec, Vec<Complex32>) {
+        let spec = manta_testkit::vectors::VectorSpec {
+            duration_s: 6.0,
+            ..manta_testkit::vectors::v1()
+        };
+        let samples = manta_testkit::vectors::render(&spec).unwrap().samples;
+        (spec, samples)
+    }
+
+    /// MAN-234: the bad-sample count reaches the observer, and a
+    /// discontinuity's fresh segment (a fresh channelizer, counting from 0)
+    /// adds to it rather than restarting it. `GapSource` serves its buffer
+    /// once, reports the gap, then serves it again: a NaN in the first pass
+    /// and an `+Inf` at another index in the second are one bad sample per
+    /// segment, two in all.
+    #[test]
+    fn bad_samples_observer_counts_across_a_reconnect_segment() {
+        let (spec, mut iq) = v1_6s();
+        iq[300_000].re = f32::NAN;
+        let src = GapSource::new(iq, spec.fs, spec.center_freq_hz, 48_000);
+        // The replay after the gap carries an `+Inf` at another index
+        // instead of the NaN, so each segment has exactly one bad sample.
+        let mut second = src.samples.clone();
+        second[300_000].re = 0.25;
+        second[400_000].im = f32::INFINITY;
+        let readings = bad_sample_readings(Box::new(SwapOnGapSource {
+            inner: src,
+            second: Some(second),
+        }));
+        assert!(readings.windows(2).all(|w| w[0] <= w[1]), "{readings:?}");
+        assert!(readings.contains(&1), "{readings:?}");
+        assert_eq!(readings.last(), Some(&2), "{readings:?}");
+    }
+
+    /// `GapSource`, but the buffer it replays after the gap is `second`.
+    struct SwapOnGapSource {
+        inner: GapSource,
+        second: Option<Vec<Complex32>>,
+    }
+
+    impl manta_input::IqSource for SwapOnGapSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            if !self.inner.armed && self.inner.served >= self.inner.arm_at {
+                if let Some(second) = self.second.take() {
+                    self.inner.samples = second;
+                }
+            }
+            self.inner.read(buf)
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            manta_input::IqSource::take_discontinuity(&mut self.inner)
+        }
+    }
+
+    #[test]
+    fn bad_samples_observer_stays_zero_on_clean_input() {
+        let (spec, iq) = v1_6s();
+        let readings = bad_sample_readings(Box::new(GapSource::new(
+            iq,
+            spec.fs,
+            spec.center_freq_hz,
+            48_000,
+        )));
+        assert!(readings.iter().all(|&n| n == 0), "{readings:?}");
+    }
+
     /// MAN-312: a source whose passband holds fewer than
     /// `CRASH_MIN_LIVE_CHANNELS` channels gets an inactive detector.
     #[test]
@@ -1052,6 +1290,86 @@ mod tests {
         assert_eq!(readings.last(), Some(&0), "{readings:?}");
     }
 
+    /// MAN-196: `listen` reads the source's trusted band once and
+    /// threads it into every segment's track manager -- including the
+    /// discontinuity rebuild's fresh segment -- so a real, detectable CW
+    /// signal beyond the band never spawns a track, while a source
+    /// without a band (`None`, every non-decimated source) spawns as
+    /// before.
+    #[test]
+    fn listen_vetoes_spawns_beyond_the_sources_trusted_band() {
+        // +23_500 Hz / SNR 10 dB on a 48 kS/s stream: beyond the
+        // 21_724.8 Hz trusted boundary, at the offset/SNR of the measured
+        // duplicate-track cell (research section 2). The native-48k
+        // control there spawned one track: the signal is real and
+        // detectable, so the control below asserting >= 1 promotion pins
+        // detectability, not the duplicate itself.
+        let mut spec = manta_testkit::vectors::v1();
+        spec.fs = 48_000.0;
+        spec.duration_s = 20.0;
+        spec.signals[0].offset_hz = 23_500.0;
+        spec.signals[0].snr_2500_db = 10.0;
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let trusted = manta_dsp::decimate::TRUSTED_HALF_BAND_FRACTION * 48_000.0;
+
+        let promotions = |src: Box<dyn manta_input::IqSource>| {
+            let mut n = 0usize;
+            listen(
+                src,
+                &PipelineConfig::default(),
+                Arc::new(AtomicBool::new(false)),
+                |ev| {
+                    if matches!(ev, DecoderEvent::TrackPromoted { .. }) {
+                        n += 1;
+                    }
+                },
+                |_| {},
+            )
+            .unwrap();
+            n
+        };
+        let fixed = || FixedFreqSource {
+            samples: rendered.samples.clone(),
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        };
+
+        // Control, no trusted band (the trait default): the signal spawns.
+        assert!(
+            promotions(Box::new(fixed())) >= 1,
+            "native control must detect the signal"
+        );
+
+        // With the trusted band: zero promotions over the whole render.
+        assert_eq!(
+            promotions(Box::new(TrustedBandSource {
+                inner: fixed(),
+                trusted_band_hz: Some((-trusted, trusted)),
+            })),
+            0,
+            "no track may spawn beyond the trusted band"
+        );
+
+        // ...and across a mid-stream discontinuity: the rebuild path
+        // applies the same band (read once, applied per segment).
+        let half = rendered.samples.len() / 2;
+        assert_eq!(
+            promotions(Box::new(
+                GapSource::new(
+                    rendered.samples.clone(),
+                    spec.fs,
+                    spec.center_freq_hz,
+                    48_000
+                )
+                .arm_after_samples(half)
+                .with_trusted_band(Some((-trusted, trusted)))
+            )),
+            0,
+            "the post-discontinuity segment must keep the trusted band"
+        );
+    }
+
     /// MAN-73 test double: serves `samples` on a loop. Once the cumulative
     /// number of samples served reaches `arm_at` (default: the full
     /// vector length, i.e. "after exhaustion"), the *next* `read()` call
@@ -1074,6 +1392,9 @@ mod tests {
         served: usize,
         armed: bool,
         pending_gap: Option<u64>,
+        /// MAN-196: the trusted band this double reports (`None` unless
+        /// `with_trusted_band` set one).
+        trusted_band: Option<(f64, f64)>,
         /// Set once `take_discontinuity()` has handed the gap to `listen()`,
         /// so a test can tell the events `listen()` emits after the
         /// discontinuity from those before it.
@@ -1094,6 +1415,7 @@ mod tests {
                 served: 0,
                 armed: false,
                 pending_gap: None,
+                trusted_band: None,
                 gap_taken: Arc::new(AtomicBool::new(false)),
             }
         }
@@ -1106,6 +1428,12 @@ mod tests {
             self.chunk_cap = (k / 4).max(64);
             self
         }
+
+        /// MAN-196: report a trusted band, as a decimated source would.
+        fn with_trusted_band(mut self, band: Option<(f64, f64)>) -> Self {
+            self.trusted_band = band;
+            self
+        }
     }
 
     impl manta_input::IqSource for GapSource {
@@ -1114,6 +1442,9 @@ mod tests {
         }
         fn center_freq_hz(&self) -> f64 {
             self.center_freq_hz
+        }
+        fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+            self.trusted_band
         }
         fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
             if !self.armed && self.served >= self.arm_at {
@@ -1555,6 +1886,191 @@ mod tests {
         assert!(spots.is_empty(), "got {spots:?}");
     }
 
+    /// MAN-316: the bundled country table plus an entity for QQ9, which no
+    /// real `cty.dat` allocates.
+    fn cty_with_qq9() -> Arc<manta_spot::cty::Table> {
+        Arc::new(manta_spot::cty::Table::parse(&format!(
+            "{}Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n",
+            manta_spot::CTY_DAT
+        )))
+    }
+
+    fn bundled_reference_lists() -> Arc<ReferenceLists> {
+        Arc::new(ReferenceLists::new(
+            Arc::new(manta_spot::cty::Table::bundled()),
+            Arc::new(manta_spot::scp::Set::bundled()),
+        ))
+    }
+
+    /// Stores `cty_with_qq9()` from inside a read, including the EOF read:
+    /// `OfferingSource` for a list refresh.
+    struct StoringSource {
+        inner: FixedFreqSource,
+        lists: Arc<ReferenceLists>,
+        store_at: Option<u64>,
+        reads: Arc<AtomicU64>,
+    }
+
+    impl IqSource for StoringSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.sample_rate()
+        }
+
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz()
+        }
+
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            let k = self.reads.fetch_add(1, Ordering::Relaxed) + 1;
+            if self.store_at == Some(k) {
+                self.lists.cty.store(cty_with_qq9());
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    /// A V1-style scene sending `text` once at `wpm` for `seconds` (looped
+    /// when `loop_text`), through `listen_with_observers` with a
+    /// `ReferenceLists` observer that `StoringSource` stores `cty_with_qq9()`
+    /// into at read `store_at`. Returns the spots of calls under QQ9 (which
+    /// only `cty_with_qq9()` allocates), each with the reads made when it
+    /// came out, and the total reads. With `reference_lists` set, the
+    /// validator starts from the observer's tables.
+    fn qq9_spots(
+        seconds: f64,
+        wpm: f32,
+        text: &str,
+        loop_text: bool,
+        store_at: Option<u64>,
+    ) -> (Vec<(String, u64)>, u64) {
+        let mut spec = manta_testkit::vectors::v1();
+        spec.duration_s = seconds;
+        spec.signals[0].wpm = wpm;
+        spec.signals[0].text = text.into();
+        spec.signals[0].loop_text = loop_text;
+        let samples = manta_testkit::vectors::render(&spec).unwrap().samples;
+        let lists = bundled_reference_lists();
+        let reads = Arc::new(AtomicU64::new(0));
+        let src = StoringSource {
+            inner: FixedFreqSource {
+                samples,
+                cursor: 0,
+                fs: spec.fs,
+                center_freq_hz: spec.center_freq_hz,
+            },
+            lists: lists.clone(),
+            store_at,
+            reads: reads.clone(),
+        };
+        let mut cfg = PipelineConfig::default();
+        cfg.detector.warmup_hops = 0;
+        // MAN-95: QQ9 calls' patterns are common, so the repetition gate
+        // needs two messages, as these scenes were timed for.
+        cfg.patterns = Some(Arc::new(
+            manta_spot::pattern::Table::parse("+QQ9@@@\n+QQ9@\n").unwrap(),
+        ));
+        let mut spots = Vec::new();
+        listen_with_observers(
+            Box::new(src),
+            &cfg,
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                reference_lists: Some(lists),
+                ..Default::default()
+            },
+            |_| {},
+            |s| spots.push((s.callsign.clone(), reads.load(Ordering::Relaxed))),
+            |_| {},
+        )
+        .unwrap();
+        spots.retain(|(call, _)| call.starts_with("QQ9"));
+        (spots, reads.load(Ordering::Relaxed))
+    }
+
+    /// "CQ CQ DE QQ9ZZZ QQ9ZZZ K" looped for 10 s at 60 WPM: two
+    /// transmissions, so the repetition gate's second message (word 9) is
+    /// decoded in the steady-state loop, about read 360 of 377.
+    fn looped_qq9(store_at: Option<u64>) -> (Vec<(String, u64)>, u64) {
+        qq9_spots(10.0, 60.0, "CQ CQ DE QQ9ZZZ QQ9ZZZ K", true, store_at)
+    }
+
+    #[test]
+    fn reference_lists_swapped_mid_stream_apply_to_the_next_event() {
+        let (control, _) = looped_qq9(None);
+        assert!(
+            control.is_empty(),
+            "QQ9 is unallocated in the bundled table: {control:?}"
+        );
+        for k in [2, 40] {
+            let (spots, _) = looped_qq9(Some(k));
+            assert!(
+                spots.iter().any(|(call, _)| call == "QQ9ZZZ"),
+                "a store at read {k} must let QQ9ZZZ spot, got {spots:?}"
+            );
+            assert!(
+                spots.iter().all(|(_, read)| *read >= k),
+                "no spot may come out before the store at read {k}: {spots:?}"
+            );
+        }
+    }
+
+    /// MAN-78 remediate-9 timing, for a list refresh: "V DE QQ9E K DE QQ9E
+    /// K" sent once at 72 WPM puts the first QQ9E in the two-second
+    /// calibration buffer (read 1) and the confirming one in the steady
+    /// state. A store during the calibration read reaches the calibration
+    /// buffer's events, so the first QQ9E counts and the second spots; a
+    /// store one read later misses it, leaving one occurrence and no spot.
+    #[test]
+    fn reference_lists_stored_during_calibration_apply_to_the_calibration_buffer() {
+        let scene = |store_at| qq9_spots(4.0, 72.0, "V DE QQ9E K DE QQ9E K", false, store_at);
+        let (control, _) = scene(None);
+        assert!(control.is_empty(), "got {control:?}");
+        let (spots, _) = scene(Some(1));
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].0, "QQ9E");
+        let (late, _) = scene(Some(2));
+        assert!(
+            late.is_empty(),
+            "a store after the calibration buffer was evaluated must miss its QQ9E, got {late:?}"
+        );
+    }
+
+    /// V7 through `listen_with_observers`, with `observers`; every spot's
+    /// `Debug` rendering, so any field that moved shows.
+    fn v7_spot_records(observers: ListenObservers) -> Vec<String> {
+        let spec = manta_testkit::vectors::v7();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let mut spots = Vec::new();
+        listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            observers,
+            |_| {},
+            |spot| spots.push(format!("{spot:?}")),
+            |_| {},
+        )
+        .unwrap();
+        spots
+    }
+
+    #[test]
+    fn no_reference_lists_observer_is_byte_identical() {
+        let without = v7_spot_records(ListenObservers::default());
+        assert!(!without.is_empty(), "V7 must spot something");
+        let with = v7_spot_records(ListenObservers {
+            reference_lists: Some(bundled_reference_lists()),
+            ..Default::default()
+        });
+        assert_eq!(with, without);
+    }
+
     /// MAN-78: lists offered mid-run reach the live validator before a
     /// later call is evaluated.
     #[test]
@@ -1733,6 +2249,63 @@ mod tests {
         assert_eq!(peak, 1);
         assert!(obs.generation() >= 2, "marked, then cleared");
         assert!(obs.snapshot().is_empty(), "cleared at exit");
+    }
+
+    /// MAN-313 test scene: noise plus a steady unkeyed carrier 10 kHz above
+    /// centre at +20 dB in 2500 Hz -- confirmed by the detector within
+    /// ~50 ms, never keyed CW.
+    fn steady_carrier_scene(duration_s: f64) -> Vec<Complex32> {
+        let fs = 96_000.0;
+        let (mut iq, _) = manta_testkit::scene::render_scene(&[], fs, duration_s, Some(5)).unwrap();
+        let noise_pow = iq.iter().map(|z| z.norm_sqr() as f64).sum::<f64>() / iq.len() as f64;
+        let amp = (100.0 * noise_pow * 2500.0 / fs).sqrt() as f32;
+        let w = 2.0 * std::f64::consts::PI * 10_000.0 / fs;
+        for (n, z) in iq.iter_mut().enumerate() {
+            let ph = w * n as f64;
+            *z += Complex32::new(amp * ph.cos() as f32, amp * ph.sin() as f32);
+        }
+        iq
+    }
+
+    /// MAN-313: the detector-confirmation counter is published while the
+    /// stream runs, summed across an outage restart (each segment's
+    /// `TrackManager` counts from 0), and never goes back.
+    #[test]
+    fn listen_publishes_detector_confirmations() {
+        let samples = steady_carrier_scene(6.0);
+        let src = GapSource::new(samples, 96_000.0, 14_000_000.0, 96_000);
+        let gap_taken = src.gap_taken.clone();
+        let counter = Arc::new(AtomicU64::new(0));
+        let seen = counter.clone();
+        let mut last = 0u64;
+        let mut before_gap = 0u64;
+        listen_with_observers(
+            Box::new(src),
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                detector_confirmations: Some(counter.clone()),
+                ..Default::default()
+            },
+            |_ev| {},
+            |_spot| {},
+            |_n| {
+                let now = seen.load(Ordering::Relaxed);
+                assert!(now >= last, "the count went back from {last} to {now}");
+                last = now;
+                if !gap_taken.load(Ordering::Relaxed) {
+                    before_gap = now;
+                }
+            },
+        )
+        .unwrap();
+        let total = counter.load(Ordering::Relaxed);
+        assert!(before_gap >= 1, "the carrier is confirmed before the gap");
+        assert!(
+            total > before_gap,
+            "the post-gap segment's confirmation adds to the pre-gap count \
+             ({before_gap} before the gap, {total} at the end)"
+        );
     }
 
     #[test]

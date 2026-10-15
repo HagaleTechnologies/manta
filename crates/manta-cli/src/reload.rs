@@ -729,6 +729,16 @@ blocklist_path = \"bl.txt\"
     }
 
     #[test]
+    fn pattern_settings_need_a_restart() {
+        let old = table("[spot]\nvalidation_level = 'normal'\npattern_path = 'old.lst'\n");
+        let new = table("[spot]\nvalidation_level = 'minimal'\npattern_path = 'new.lst'\n");
+        assert_eq!(
+            restart_only_changes(&old, &new),
+            vec!["spot.pattern_path", "spot.validation_level"]
+        );
+    }
+
+    #[test]
     fn restart_only_changes_reports_cty_and_scp_paths() {
         let old = table("[spot]\ncty_path = \"/a/cty.dat\"\nblocklist_path = \"bl.txt\"\n");
         let new = table("[spot]\ncty_path = \"/b/cty.dat\"\nscp_path = \"/b/master.scp\"\nblocklist_path = \"other.txt\"\n");
@@ -736,6 +746,42 @@ blocklist_path = \"bl.txt\"
             restart_only_changes(&old, &new),
             vec!["spot.cty_path", "spot.scp_path"]
         );
+    }
+
+    /// MAN-316: the refresher starts once, at `run`'s startup, so its keys
+    /// and the pins need a restart; the operator lists still reload.
+    #[test]
+    fn restart_only_changes_reports_refresh_keys() {
+        let pin = "e9ff91a3c3ab28c5f7dbcffb4280944a84645ed53d41cb4c68a41f132ee13fd1";
+        let old = table("[spot]\nrefresh_lists = false\nallowlist = [\"A\"]\n");
+        let new = table(&format!(
+            "[spot]\nrefresh_lists = true\nallowlist = [\"B\"]\n\
+             list_cache_dir = \"/var/cache/manta\"\ncty_url = \"http://mirror.lan/cty.dat\"\n\
+             scp_url = \"http://mirror.lan/MASTER.SCP\"\ncty_sha256 = \"{pin}\"\n\
+             scp_sha256 = \"{pin}\"\n"
+        ));
+        assert_eq!(
+            restart_only_changes(&old, &new),
+            vec![
+                "spot.cty_sha256",
+                "spot.cty_url",
+                "spot.list_cache_dir",
+                "spot.refresh_lists",
+                "spot.scp_sha256",
+                "spot.scp_url",
+            ]
+        );
+        for key in [
+            "refresh_lists",
+            "list_cache_dir",
+            "cty_url",
+            "scp_url",
+            "cty_sha256",
+            "scp_sha256",
+        ] {
+            assert!(!is_reloadable(&format!("spot.{key}")), "{key}");
+        }
+        assert!(is_reloadable("spot.allowlist"));
     }
 
     #[test]

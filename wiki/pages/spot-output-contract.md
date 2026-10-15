@@ -14,12 +14,12 @@ sources:
   - docs/RUNBOOKS/rbn-comparison.md
   - docs/SPOT-SCHEMA.md
 verified:
-  commit: 01d1ea1
-  date: 2026-09-07
+  commit: d286147
+  date: 2026-10-13
 links:
   - spot-validation
 ---
-manta produces spots on two surfaces: a **telnet DX cluster server** (default :7300) emitting standard RBN-format `DX de` lines — the drop-in compatibility surface existing aggregators consume with zero changes — and a **JSON Lines stream** (TCP + WebSocket, default :7301) carrying full-fidelity spot objects for modern consumers like cqdx. This repo *produces* both; it consumes no external spot contract. Both are thin fan-out consumers of one broadcast channel — slow clients are dropped, never back-pressured, and at shutdown each client's queued backlog is drained best-effort under its own bounded deadline (ARCHITECTURE §7/§8). The formats and ports are described in ARCHITECTURE §7.
+manta produces spots on two surfaces: a **telnet DX cluster server** (default :7300) emitting standard RBN-format `DX de` lines — the drop-in compatibility surface existing aggregators consume with zero changes — and a **JSON Lines stream** (TCP + WebSocket, default :7301) carrying full-fidelity spot objects for modern consumers like cqdx. This repo *produces* both. Both are thin fan-out consumers of the spot bus (telnet on `SpotBus::subscribe()`, JSON on `subscribe_json()`, which also carries MAN-301 grade records) — slow clients are dropped, never back-pressured, and at shutdown each client's queued backlog is drained best-effort under its own bounded deadline (ARCHITECTURE §7/§8). The formats and ports are described in ARCHITECTURE §7. manta also reads RBN's spots, to grade its own (MAN-301, below): with `[rbn_compare]` enabled, a `[server]` daemon parses RBN's public CW telnet feed (AK1A `DX de` lines, `crates/manta-server/src/rbn_compare/ak1a.rs`), and `manta grade` reads RBN's daily CSV offline.
 
 ## Pointers
 
@@ -32,7 +32,7 @@ manta produces spots on two surfaces: a **telnet DX cluster server** (default :7
 - JSON spot schema: **the schema is an ecosystem contract that lives in the `dispensa` repo** (`contracts/spots/spots.v1.schema.json`, ADR-0011 — noted in CLAUDE.md and ARCHITECTURE §7), not solely in this repo. dispensa is private, so the in-repo field reference is `docs/SPOT-SCHEMA.md` (MAN-149), pinned to `SpotMessage` by a unit test; it names the one divergence from the contract (`snrRefHz`). Do not restate fields here.
 - **Unresolvable geography for an allowlisted call**: MAN-28's Watch List allowlist can make the validator emit a spot for a callsign `cty.lookup` can't resolve. `dxContinent`/`dxCqZone` emit out-of-domain sentinels rather than the contract-forbidden `null` (those two fields are required/non-nullable on the wire); `dxLat`/`dxLon` are already nullable and are the contract-legal "unknown" signal. See `docs/DECISIONS/2026-09-04-man45-unresolved-geography-sentinels.md` for the full rationale and the cross-repo question proposed to dispensa.
 - `decoderVersion` is build identity, not decoder output: `manta-<crate version>+<commit>` (MAN-83), the commit as SemVer build metadata. A consumer comparing decoder behaviour across releases compares the part before `+`; the whole string names the exact binary. When decoder output may change between versions is normative in `docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md` (summarised in `CHANGELOG.md`).
-- cqdx is the intended first-class JSON ingest consumer (README "Relationship to sibling projects"); the boundary is referenced across repos, not linked from this wiki.
+- cqdx is the intended first-class JSON ingest consumer (README "Related projects"); the boundary is referenced across repos, not linked from this wiki.
 
 ## Status caveat
 

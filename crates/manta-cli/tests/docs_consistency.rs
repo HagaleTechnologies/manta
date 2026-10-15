@@ -682,6 +682,327 @@ fn wiki_overview_verified_stamp_is_not_the_pre_rewrite_one() {
     );
 }
 
+// ---- MAN-152: wiki/manifest.json is a true index of wiki/pages ----
+
+/// The `verified: {commit, date}` stamp in a wiki page's frontmatter, as
+/// written (not YAML-typed, so an all-digit or `1e5`-shaped short hash stays
+/// text).
+fn wiki_verified_stamp(rel: &str) -> (String, String) {
+    let page = doc(rel);
+    let front = page
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---").map(|(f, _)| f))
+        .unwrap_or_else(|| panic!("{rel} has no `---` frontmatter block"));
+    let verified: Vec<&str> = front
+        .lines()
+        .skip_while(|l| *l != "verified:")
+        .skip(1)
+        .take_while(|l| l.starts_with(' '))
+        .collect();
+    let field = |key: &str| -> String {
+        verified
+            .iter()
+            .find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().to_string()))
+            .unwrap_or_else(|| panic!("{rel} frontmatter has no `verified.{key}` field"))
+    };
+    (field("commit:"), field("date:"))
+}
+
+fn wiki_page_body(page: &str) -> &str {
+    page.strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n"))
+        .map(|(_, body)| body)
+        .expect("wiki page has a complete frontmatter block")
+}
+
+/// The frontmatter fields a `wiki/manifest.json` entry copies from its page,
+/// in the manifest's shape: `locked` is `false` unless the page says
+/// otherwise, and `links: []` is an empty list.
+fn wiki_mirrored_frontmatter(rel: &str, page: &str) -> serde_json::Value {
+    let front = page
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n"))
+        .map(|(front, _)| front)
+        .unwrap_or_else(|| panic!("{rel} has no complete `---` frontmatter block"));
+    let lines: Vec<&str> = front.lines().collect();
+    let scalar = |key: &str| -> Option<&str> {
+        lines
+            .iter()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix(':').map(str::trim))
+    };
+    let required = |key: &str| -> &str {
+        scalar(key).unwrap_or_else(|| panic!("{rel} frontmatter has no `{key}` field"))
+    };
+    let list = |key: &str| -> Vec<&str> {
+        match required(key) {
+            "[]" => Vec::new(),
+            "" => lines
+                .iter()
+                .skip_while(|l| {
+                    l.strip_prefix(key)
+                        .and_then(|r| r.strip_prefix(':'))
+                        .is_none()
+                })
+                .skip(1)
+                .map_while(|l| l.strip_prefix("  - "))
+                .map(str::trim)
+                .collect(),
+            other => panic!("{rel} frontmatter `{key}: {other}` is not a list"),
+        }
+    };
+    let locked = match scalar("locked") {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => panic!("{rel} frontmatter `locked: {other}` is not a boolean"),
+    };
+    serde_json::json!({
+        "id": required("id"),
+        "title": required("title"),
+        "kind": required("kind"),
+        "status": required("status"),
+        "maintainer": required("maintainer"),
+        "locked": locked,
+        "sources": list("sources"),
+        "links": list("links"),
+    })
+}
+
+fn wiki_page_stems(names: Vec<String>) -> Vec<String> {
+    let mut stems: Vec<String> = names
+        .into_iter()
+        .map(|n| n.trim_end_matches(".md").to_string())
+        .collect();
+    stems.sort();
+    stems
+}
+
+#[test]
+fn wiki_manifest_hash_input_excludes_frontmatter() {
+    for page in [
+        "---\nid: example\n---\nBody.\n",
+        "---\nid: renamed\n---\nBody.\n",
+    ] {
+        assert_eq!(wiki_page_body(page), "Body.\n");
+    }
+}
+
+#[test]
+fn wiki_manifest_mirrors_every_copied_frontmatter_field() {
+    let page = "---\nid: example\ntitle: What is this?\nkind: gotcha\nstatus: current\n\
+                maintainer: agent\nsources:\n  - README.md\n  - docs/X.md#anchor\n\
+                verified:\n  commit: abc1234\n  date: 2026-10-13\nlinks: []\n---\nBody.\n";
+    assert_eq!(
+        wiki_mirrored_frontmatter("example.md", page),
+        serde_json::json!({
+            "id": "example",
+            "title": "What is this?",
+            "kind": "gotcha",
+            "status": "current",
+            "maintainer": "agent",
+            "locked": false,
+            "sources": ["README.md", "docs/X.md#anchor"],
+            "links": [],
+        })
+    );
+    let locked = page.replace("links: []\n", "locked: true\nlinks: \n  - overview\n");
+    let fields = wiki_mirrored_frontmatter("example.md", &locked);
+    assert_eq!(fields["locked"], true);
+    assert_eq!(fields["links"], serde_json::json!(["overview"]));
+}
+
+#[test]
+fn wiki_manifest_orders_prefix_ids_by_stem() {
+    // md_files_in sorts these filenames in this order, before removing .md.
+    let names = vec!["determinism-ci.md".into(), "determinism.md".into()];
+    assert_eq!(wiki_page_stems(names), ["determinism", "determinism-ci"]);
+}
+
+/// `wiki/manifest.json` is the wiki's index, and each page's `verified`
+/// stamp is what a reader uses to judge how stale it is. The 2026-09-05
+/// broad review found both three months old: all ten manifest hashes
+/// stale, seven pages missing from it, two pages with no frontmatter, and
+/// stamps older than the decision records their own pages cite. A page
+/// edit now has to carry the manifest with it. A hash is the SHA-256 of
+/// the body after the closing frontmatter delimiter, matching wiki-manifest/v1.
+/// The hash does not cover the frontmatter, so each entry's `id`, `title`,
+/// `kind`, `status`, `maintainer`, `locked`, `sources`, `links` and
+/// `verified_*` are compared with the page's frontmatter separately.
+/// `doc()` normalises CRLF to LF, so a Windows checkout hashes the same.
+#[test]
+fn wiki_manifest_lists_every_page_with_a_matching_hash() {
+    use sha2::{Digest, Sha256};
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&doc("wiki/manifest.json")).expect("parse wiki/manifest.json");
+    assert_eq!(manifest["schema"], "wiki-manifest/v1");
+    assert_eq!(manifest["repo"], "manta");
+    assert_eq!(manifest["visibility"], "public");
+    let entries = manifest["pages"]
+        .as_array()
+        .expect("wiki/manifest.json has a `pages` array");
+    let str_field = |entry: &serde_json::Value, key: &str| -> String {
+        entry[key]
+            .as_str()
+            .unwrap_or_else(|| panic!("wiki/manifest.json entry has no string `{key}`: {entry}"))
+            .to_string()
+    };
+
+    let mut ids: Vec<String> = entries.iter().map(|e| str_field(e, "id")).collect();
+    ids.sort();
+    let stems = wiki_page_stems(md_files_in("wiki/pages"));
+    for stem in &stems {
+        assert!(
+            ids.contains(stem),
+            "wiki/pages/{stem}.md has no wiki/manifest.json entry: add one"
+        );
+    }
+    assert_eq!(
+        ids, stems,
+        "wiki/manifest.json ids must be exactly the wiki/pages/*.md file stems, once each"
+    );
+
+    for entry in entries {
+        let id = str_field(entry, "id");
+        let path = str_field(entry, "path");
+        assert_eq!(
+            path,
+            format!("pages/{id}.md"),
+            "wiki/manifest.json entry `{id}` names the wrong path"
+        );
+        let rel = format!("wiki/{path}");
+        assert!(
+            repo_root().join(&rel).is_file(),
+            "wiki/manifest.json entry `{id}` names {rel}, which does not exist"
+        );
+
+        let page = doc(&rel);
+        let want = format!(
+            "sha256:{}",
+            Sha256::digest(wiki_page_body(&page).as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        assert_eq!(
+            str_field(entry, "hash"),
+            want,
+            "wiki/manifest.json's hash for `{id}` does not match {rel}: the page changed \
+             without the manifest; regenerate its entry"
+        );
+
+        let mirrored = wiki_mirrored_frontmatter(&rel, &page);
+        for (key, want) in mirrored.as_object().expect("mirrored fields are an object") {
+            assert_eq!(
+                &entry[key.as_str()],
+                want,
+                "wiki/manifest.json's `{key}` for `{id}` disagrees with {rel}'s frontmatter: \
+                 the page changed without the manifest; regenerate its entry"
+            );
+        }
+        // A public repository's pages are all public, whatever a page asks for.
+        assert_eq!(
+            entry["visibility"], manifest["visibility"],
+            "wiki/manifest.json entry `{id}` must carry the repository's visibility"
+        );
+
+        let (commit, date) = wiki_verified_stamp(&rel);
+        assert_eq!(
+            (
+                str_field(entry, "verified_commit"),
+                str_field(entry, "verified_date")
+            ),
+            (commit, date),
+            "wiki/manifest.json's verified_commit/verified_date for `{id}` disagree with \
+             {rel}'s `verified` frontmatter"
+        );
+    }
+}
+
+/// `git` run in the repository root, or `None` when git is missing or the
+/// command fails.
+fn git_in_repo(args: &[&str]) -> Option<std::process::Output> {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo_root())
+        .output()
+        .ok()
+}
+
+/// `wiki/manifest.json`'s `head_commit` names the snapshot the index was
+/// generated from; each page was verified at its own `verified_commit`,
+/// which must therefore be in `head_commit`'s history. A merge kept main's own `de525d1` stamp on windows-build-setup
+/// while `head_commit` stayed at `d286147`, which does not contain it.
+/// Ordering commits needs git history: the test skips in a shallow clone
+/// (ci-full.yml's test checkout is one) and skips any commit this clone
+/// cannot resolve.
+#[test]
+fn wiki_manifest_head_commit_contains_every_page_stamp() {
+    let shallow = git_in_repo(&["rev-parse", "--is-shallow-repository"]);
+    match shallow {
+        Some(out) if out.status.success() && out.stdout.starts_with(b"false") => {}
+        _ => {
+            eprintln!("skipping: needs a full (non-shallow) git clone");
+            return;
+        }
+    }
+    let resolves = |commit: &str| {
+        git_in_repo(&["cat-file", "-e", &format!("{commit}^{{commit}}")])
+            .is_some_and(|out| out.status.success())
+    };
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&doc("wiki/manifest.json")).expect("parse wiki/manifest.json");
+    let head = manifest["head_commit"]
+        .as_str()
+        .expect("wiki/manifest.json has a string `head_commit`");
+    if !resolves(head) {
+        eprintln!("skipping: head_commit {head} is not in this clone");
+        return;
+    }
+    for entry in manifest["pages"]
+        .as_array()
+        .expect("wiki/manifest.json has a `pages` array")
+    {
+        let id = entry["id"].as_str().unwrap_or("?");
+        let stamp = entry["verified_commit"]
+            .as_str()
+            .unwrap_or_else(|| panic!("wiki/manifest.json entry `{id}` has no verified_commit"));
+        if !resolves(stamp) {
+            eprintln!("skipping `{id}`: verified_commit {stamp} is not in this clone");
+            continue;
+        }
+        let contained = git_in_repo(&["merge-base", "--is-ancestor", stamp, head])
+            .is_some_and(|out| out.status.success());
+        assert!(
+            contained,
+            "wiki/manifest.json's head_commit {head} does not contain verified_commit {stamp} \
+             of entry `{id}`: re-anchor head_commit on a commit that contains every page stamp"
+        );
+    }
+}
+
+/// MAN-152 re-stamped spot-output-contract.md as verified, but its opening
+/// still said manta "consumes no external spot contract". MAN-301's
+/// `[rbn_compare]` parses RBN's `DX de` feed, so the page names that parser.
+#[test]
+fn spot_output_contract_names_the_rbn_feed_manta_reads() {
+    let page = squash_whitespace(&doc("wiki/pages/spot-output-contract.md"));
+    assert!(
+        !page.contains("consumes no external spot contract"),
+        "wiki/pages/spot-output-contract.md says manta consumes no external spot \
+         contract, but `[rbn_compare]` parses RBN's `DX de` feed (MAN-301)"
+    );
+    let parser = "crates/manta-server/src/rbn_compare/ak1a.rs";
+    assert!(
+        repo_root().join(parser).is_file(),
+        "{parser} is gone: point wiki/pages/spot-output-contract.md at the RBN feed parser"
+    );
+    assert!(
+        page.contains(parser),
+        "wiki/pages/spot-output-contract.md must name {parser}, the RBN feed parser"
+    );
+}
+
 // ---- MAN-261: SPEC §9 is the loadable key table; README's node is one file ----
 
 fn manta() -> std::process::Command {
@@ -882,6 +1203,8 @@ fn spec_detector_values_equal_the_code_defaults() {
         "crash_filter",
         "rtty_filter",
         "rtty_dwell_ms",
+        "non_cw_filter",
+        "unkeyed_close_ms",
     ] {
         assert!(
             table.contains_key(key),
@@ -974,6 +1297,14 @@ fn spec_documents_every_input_and_spot_key() {
                 "notch_path",
                 "cty_path",
                 "scp_path",
+                "refresh_lists",
+                "list_cache_dir",
+                "cty_url",
+                "scp_url",
+                "cty_sha256",
+                "scp_sha256",
+                "pattern_path",
+                "validation_level",
             ],
         ),
     ];
@@ -2085,6 +2416,7 @@ fn config_reference_documents_path_resolution_by_source() {
         ("spot", "notch_path", "--notch"),
         ("spot", "cty_path", "--cty"),
         ("spot", "scp_path", "--scp"),
+        ("spot", "pattern_path", "--patterns"),
     ] {
         let rows = backticked_rows(config_ref_table_section(&md, table));
         let row = rows
@@ -2163,7 +2495,7 @@ fn spot_schema_documents_uppercased_station_identity() {
 /// `# comment`, which TOML ignores.
 fn scaffold_settings() -> Vec<(String, String, String)> {
     let header = regex::Regex::new(r"^#?\[\[?([a-z_]+)\]\]?\s*$").unwrap();
-    let setting = regex::Regex::new(r"^#([a-z_]+) = (.*)$").unwrap();
+    let setting = regex::Regex::new(r"^#([a-z][a-z0-9_]*) = (.*)$").unwrap();
     let mut table = None;
     let mut out = Vec::new();
     for line in doc("crates/manta-cli/src/config_init.toml").lines() {
@@ -2270,7 +2602,7 @@ fn config_reference_lists_every_scaffold_key_with_its_default() {
 fn config_reference_lists_every_constant_only_key() {
     let md = doc(CONFIG_REF);
     let not_settable = section(&md, "Not settable");
-    let key = regex::Regex::new(r"^#\s*([a-z_]+)\s*=").unwrap();
+    let key = regex::Regex::new(r"^#\s*([a-z][a-z0-9_]*)\s*=").unwrap();
     let constants: Vec<String> = spec_section_9_toml()
         .lines()
         .filter(|l| l.contains("not configurable yet"))
@@ -2530,6 +2862,23 @@ fn claude_md_decision_paths_start_a_word_and_resolve() {
         assert!(
             repo_root().join(path).is_file(),
             "CLAUDE.md:{line} cites {path}, which does not exist"
+        );
+    }
+}
+
+/// SPEC §5 is the normative event schema, and `TrackClosed` carries a
+/// `closure` whose kind decides whether deferred evidence is judged,
+/// migrated or discarded (`manta_decode::events::ClosureKind`). PR #154
+/// added the field without updating §5, which kept showing
+/// `TrackClosed { track_id }` (MAN-174, finding 7).
+#[test]
+fn spec_section_5_track_closed_names_its_closure_kinds() {
+    let spec = doc("docs/SPEC-decode-core.md");
+    let s5 = section(&spec, "5. Decoder output");
+    for needle in ["closure", "SignalEnded", "Bookkeeping", "survivor_track_id"] {
+        assert!(
+            s5.contains(needle),
+            "SPEC §5's `TrackClosed` entry never names `{needle}`"
         );
     }
 }

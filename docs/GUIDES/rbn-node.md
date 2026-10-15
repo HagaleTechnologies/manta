@@ -125,7 +125,7 @@ environment: none
 server: station_callsign=W5AU bind_addr=0.0.0.0 metrics_bind_addr=127.0.0.1 telnet_port=7300 json_port=7301 metrics_port=7302 line_format=rbn
 rbn_uplink: target_host=collector.example.net target_port=7000 enabled=true dry_run=true spot_types=cq_beacon login_callsign=W5AU
 input: type=kiwi host=kiwi.example.net port=8073 freq_hz=7030000 password=none
-spot: allowlist=none blocklist_path=none notch_path=none cty_path=bundled scp_path=bundled
+spot: allowlist=none blocklist_path=none notch_path=none cty_path=bundled scp_path=bundled cty_sha256=none scp_sha256=none refresh_lists=off list_cache_dir=none cty_url=http://www.country-files.com/cty/cty.dat scp_url=http://www.supercheckpartial.com/MASTER.SCP
 detector: defaults
 decode: engine=legacy (other keys default)
 note: JSON spots will carry no station position (deGrid, deLat and deLon are null) -- set [server].operator_grid, or operator_lat and operator_lon

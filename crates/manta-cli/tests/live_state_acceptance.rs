@@ -300,3 +300,45 @@ fn no_live_listener_without_live_port() {
     assert!(!metrics.contains("manta_live_"), "{metrics}");
     assert!(!metrics.contains("listener=\"live\""), "{metrics}");
 }
+
+/// MAN-95: a dashboard sees every repetition tier decision on the real live socket.
+#[test]
+fn an_unlisted_pattern_is_withheld_until_its_fifth_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture(dir.path(), 100.0);
+    let cfg = server_toml(dir.path(), true);
+    std::fs::write(dir.path().join("patterns.lst"), "+K5@@@\n").unwrap();
+    let mut config = std::fs::OpenOptions::new().append(true).open(&cfg).unwrap();
+    writeln!(config, "[spot]\npattern_path = 'patterns.lst'").unwrap();
+    let spawned = Instant::now();
+    let (_daemon, rx) = spawn_daemon(&[
+        "run".as_ref(),
+        "--source".as_ref(),
+        wav.as_os_str(),
+        "--source-iq".as_ref(),
+        "--realtime".as_ref(),
+        "--loop".as_ref(),
+        "--config".as_ref(),
+        cfg.as_os_str(),
+    ]);
+    let line = banner(&rx, spawned + Duration::from_secs(30));
+    let mut live = connect(port_in(&line, "live").unwrap());
+    let deadline = spawned + Duration::from_secs(150);
+    for reps in 1..=5 {
+        let decision = read_json_until(&mut live, deadline, "the next W1AW repetition", |v| {
+            v["kind"] == "candidateDecision"
+                && v["call"] == "W1AW"
+                && v["reps"].as_u64() >= Some(reps)
+        });
+        assert_eq!(decision["reps"], reps, "{decision}");
+        assert_eq!(decision["requiredReps"], 5, "{decision}");
+        assert_eq!(decision["patternTier"], "unlisted", "{decision}");
+        if reps < 5 {
+            assert_eq!(decision["decision"], "withheld", "{decision}");
+            assert_eq!(decision["reason"], "repetition", "{decision}");
+        } else {
+            assert_eq!(decision["decision"], "spotted", "{decision}");
+            assert_eq!(decision["reason"], serde_json::Value::Null, "{decision}");
+        }
+    }
+}

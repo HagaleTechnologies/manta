@@ -1,9 +1,9 @@
 {
-  "generated_at": "2026-07-07T18:04:32Z",
-  "head_commit": "e68b106",
+  "generated_at": "2026-10-15T00:51:02Z",
+  "head_commit": "3805f78",
   "pages": [
     {
-      "hash": "sha256:849820d9d2912c471414d406acf6c37eab9c75510017a306e1ff7cfcb3d30729",
+      "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
       "id": "coppa-reuse",
       "kind": "interface",
       "links": [
@@ -16,17 +16,17 @@
       "path": "pages/coppa-reuse.md",
       "sources": [
         "ARCHITECTURE.md",
-        "docs/SPEC-decode-core.md#10-deviations-from-architecture-md",
+        "docs/SPEC-decode-core.md#10-deviations-from-architecturemd",
         "CLAUDE.md"
       ],
       "status": "current",
       "title": "What does manta reuse from coppa, and what is deliberately new code?",
-      "verified_commit": "e68b106",
-      "verified_date": "2026-07-07",
-      "visibility": "private"
+      "verified_commit": "d286147",
+      "verified_date": "2026-10-13",
+      "visibility": "public"
     },
     {
-      "hash": "sha256:090f03938bcb57207294c76ae7dffe6ea5854c4170d6b2e1ba9efdd11331f962",
+      "hash": "sha256:bbf8c98aa0726da4c8005e95e854722e4167dc453ff3e207349abf960d4712c2",
       "id": "decode-chain",
       "kind": "subsystem",
       "links": [
@@ -42,12 +42,31 @@
       ],
       "status": "current",
       "title": "How does the per-track CW decode chain work?",
-      "verified_commit": "e68b106",
-      "verified_date": "2026-07-07",
-      "visibility": "private"
+      "verified_commit": "60c4339",
+      "verified_date": "2026-10-14",
+      "visibility": "public"
     },
     {
-      "hash": "sha256:b6e5833fa0f410304f8cb4f57d99a5e3dcc587c2d33142855b2b81cdd9119787",
+      "hash": "sha256:e93d08f09bc48c925e63c8d03f32c831ddbfc4df7b3a1646d42474a3150c9786",
+      "id": "dependabot-cargo-unlock",
+      "kind": "gotcha",
+      "links": [],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/dependabot-cargo-unlock.md",
+      "sources": [
+        "docs/DECISIONS/2026-08-05-dependabot-cargo-single-package-unlock.md",
+        "scripts/check-dependabot-cargo-unlock.sh",
+        ".github/dependabot.yml"
+      ],
+      "status": "current",
+      "title": "Why is the weekly Cargo Dependabot run red with `unknown_error` / `null`?",
+      "verified_commit": "d286147",
+      "verified_date": "2026-10-13",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:34a3f77ef10a671d063c8acbeaa30032f612d0e0721f1e8b47d8e4c4a39a05d9",
       "id": "detector-tracks",
       "kind": "subsystem",
       "links": [
@@ -58,17 +77,17 @@
       "maintainer": "agent",
       "path": "pages/detector-tracks.md",
       "sources": [
-        "docs/SPEC-decode-core.md#2-noise-floor-signal-presence-detection",
+        "docs/SPEC-decode-core.md#2-noise-floor--signal-presence-detection",
         "ARCHITECTURE.md"
       ],
       "status": "current",
       "title": "How does the detector and track manager decide what to decode?",
-      "verified_commit": "e68b106",
-      "verified_date": "2026-07-07",
-      "visibility": "private"
+      "verified_commit": "d286147",
+      "verified_date": "2026-10-13",
+      "visibility": "public"
     },
     {
-      "hash": "sha256:552750b6d36fd4da58a1c02a6ebb3a80221657c88f98ca187cdf172d0a4db051",
+      "hash": "sha256:d6642b2d8281515140b20a7eb05facde2e4514f7be9119449d8a4f6c9a52522b",
       "id": "determinism",
       "kind": "gotcha",
       "links": [
@@ -83,12 +102,32 @@
       ],
       "status": "current",
       "title": "What will bite you about the byte-identical decode requirement?",
-      "verified_commit": "e68b106",
-      "verified_date": "2026-07-07",
-      "visibility": "private"
+      "verified_commit": "d286147",
+      "verified_date": "2026-10-13",
+      "visibility": "public"
     },
     {
-      "hash": "sha256:77f6164d209809f6d4b8f8a92ff11e2be3feb333f656989d7dc3221a61c01100",
+      "hash": "sha256:9587c83d6f3b97fe1fa52f44824d875dad9cf6d2fdfa8f7f1f307dfd024397db",
+      "id": "fleet-checkout-layout",
+      "kind": "gotcha",
+      "links": [],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/fleet-checkout-layout.md",
+      "sources": [
+        "docs/DECISIONS/2026-09-04-man27-fleet-checkout-rename.md",
+        "docs/RUNBOOKS/fleet-checkout-rename.md",
+        "scripts/fleet-rename-checkout.sh",
+        ".catalyst/config.json"
+      ],
+      "status": "current",
+      "title": "Where does the manta checkout live on a fleet machine, and what breaks if it moves?",
+      "verified_commit": "d286147",
+      "verified_date": "2026-10-13",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:0cccb4a7a1a77e625b66ea796b5ccbd69dae288834d83d599e273484a1dae56b",
       "id": "golden-vector-freeze",
       "kind": "decision-digest",
       "links": [
@@ -99,17 +138,46 @@
       "maintainer": "agent",
       "path": "pages/golden-vector-freeze.md",
       "sources": [
-        "docs/SPEC-decode-core.md#7-golden-test-vectors-m0-m1-acceptance",
+        "docs/SPEC-decode-core.md#7-golden-test-vectors-m0m1-acceptance",
         "CLAUDE.md"
       ],
       "status": "current",
       "title": "Why must the golden test vectors pin an exact coppa commit?",
-      "verified_commit": "e68b106",
-      "verified_date": "2026-07-07",
-      "visibility": "private"
+      "verified_commit": "d286147",
+      "verified_date": "2026-10-13",
+      "visibility": "public"
     },
     {
-      "hash": "sha256:b5bf4324ed409cb39507a97d7483960d64edf3b581f1c21a9b0b3ba7681f1f14",
+      "hash": "sha256:bf44087476bbcc5b0804e515aa41f1e24f96e9118bdeeffeee4ee76ed0def60a",
+      "id": "live-hardware-field-testing",
+      "kind": "howto",
+      "links": [
+        "spot-validation",
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/live-hardware-field-testing.md",
+      "sources": [
+        "docs/DECISIONS/2026-09-08-first-live-rsp1b-run.md",
+        "docs/DECISIONS/2026-09-09-overnight-40m-soapy-field-test.md",
+        "docs/DECISIONS/2026-09-09-post-pr154-20m-daytime-validation.md",
+        "docs/DECISIONS/2026-09-10-synchronized-rbn-capture-proves-detection-gap-is-manta-side.md",
+        "docs/DECISIONS/2026-09-10-man171-dead-zone-is-rf-path-not-manta-code.md",
+        "docs/DECISIONS/2026-09-09-20m-dial-shift-edge-artifact-confirmed.md",
+        "docs/DECISIONS/2026-09-09-soapy-gain-is-inverted-attenuation-scale.md",
+        "docs/DECISIONS/2026-09-10-antenna-path-fix-resolves-detection-gap.md",
+        "docs/DECISIONS/2026-09-10-post-antenna-fix-90min-soak-and-service-reliability.md",
+        "docs/DECISIONS/2026-10-11-man131-actionable-errors.md"
+      ],
+      "status": "current",
+      "title": "How do I run manta against real RF and trust what it tells me?",
+      "verified_commit": "d286147",
+      "verified_date": "2026-10-13",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:14e5baea5e7b27c990f35fe2b9596c69653452d659a23fe98aa0132e2b8ecbc3",
       "id": "overview",
       "kind": "overview",
       "links": [
@@ -127,13 +195,13 @@
         "CLAUDE.md"
       ],
       "status": "current",
-      "title": "manta \u2014 what is this and where do things live?",
-      "verified_commit": "e68b106",
-      "verified_date": "2026-07-07",
-      "visibility": "private"
+      "title": "manta — what is this and where do things live?",
+      "verified_commit": "d286147",
+      "verified_date": "2026-10-13",
+      "visibility": "public"
     },
     {
-      "hash": "sha256:599b5753405ba1ab775a19fe93e46ca651408b8b65269d860da73c34387dad35",
+      "hash": "sha256:a73e645854380e782f0d916f378ac5ce759f47c2c894ba2bb2fdf373548f1d8f",
       "id": "pfb-channelizer",
       "kind": "subsystem",
       "links": [
@@ -145,17 +213,59 @@
       "maintainer": "agent",
       "path": "pages/pfb-channelizer.md",
       "sources": [
-        "docs/SPEC-decode-core.md#1-channelizer",
+        "docs/SPEC-decode-core.md#1-channelizer-4-oversampled-polyphase-filterbank",
         "ARCHITECTURE.md"
       ],
       "status": "current",
       "title": "How does the PFB channelizer work and why is it shaped this way?",
-      "verified_commit": "e68b106",
-      "verified_date": "2026-07-07",
-      "visibility": "private"
+      "verified_commit": "d286147",
+      "verified_date": "2026-10-13",
+      "visibility": "public"
     },
     {
-      "hash": "sha256:d5ae10feb45c67f7b0ac942cff7953606a6de90166ec2aea5a7786378dbc8ef9",
+      "hash": "sha256:3b3bcc1ad0594f3cd4441ae8a1202798f61b1e3e3705c845e22d47081add9db8",
+      "id": "replay-spots-harness",
+      "kind": "gotcha",
+      "links": [
+        "spot-validation"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/replay-spots-harness.md",
+      "sources": [
+        "crates/manta-cli/examples/replay_spots.rs",
+        "docs/DECISIONS/2026-09-07-man100-variant-arbitration.md"
+      ],
+      "status": "current",
+      "title": "How do you iterate on manta-spot rules without a 6-minute IQ decode?",
+      "verified_commit": "d286147",
+      "verified_date": "2026-10-13",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:a3a5ddee297926a3692ac3116f60c4fce8e53dcdd830a0947f8406186d69e2c1",
+      "id": "source-reconnect",
+      "kind": "gotcha",
+      "links": [
+        "determinism"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/source-reconnect.md",
+      "sources": [
+        "docs/DECISIONS/2026-10-05-man73-source-reconnect.md",
+        "crates/manta-cli/src/reconnect.rs",
+        "crates/manta-cli/src/reconnect.rs (InputHealthTotals)",
+        "crates/manta-input/src/lib.rs (IqSource::take_discontinuity)"
+      ],
+      "status": "current",
+      "title": "What's the gotcha with a live source disconnecting?",
+      "verified_commit": "d286147",
+      "verified_date": "2026-10-13",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:b663b99ab4116f0a03db6186dc9102a21eef07e3dee3cb2a6c7d993d0861a950",
       "id": "spot-output-contract",
       "kind": "interface",
       "links": [
@@ -167,36 +277,67 @@
       "sources": [
         "ARCHITECTURE.md",
         "README.md",
-        "CLAUDE.md"
+        "CLAUDE.md",
+        "docs/DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md",
+        "docs/DECISIONS/2026-10-10-man92-telnet-commands.md",
+        "docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md",
+        "docs/RUNBOOKS/rbn-comparison.md",
+        "docs/SPOT-SCHEMA.md"
       ],
       "status": "current",
       "title": "What spot-output contracts does manta expose (telnet RBN + JSON)?",
-      "verified_commit": "e68b106",
-      "verified_date": "2026-07-07",
-      "visibility": "private"
+      "verified_commit": "d286147",
+      "verified_date": "2026-10-13",
+      "visibility": "public"
     },
     {
-      "hash": "sha256:904bea8fc41a12b8c531387108e55cd56a6c737b1c138ae2c9aaf5f8e2473762",
+      "hash": "sha256:9a55eface9ef3ab23316ec6056dd89bda124fc2757e00b7a4cd3a0654122ec8d",
       "id": "spot-validation",
       "kind": "subsystem",
       "links": [
         "decode-chain",
-        "spot-output-contract"
+        "spot-output-contract",
+        "live-hardware-field-testing"
       ],
       "locked": false,
       "maintainer": "agent",
       "path": "pages/spot-validation.md",
       "sources": [
-        "ARCHITECTURE.md"
+        "ARCHITECTURE.md",
+        "docs/SPEC-decode-core.md#46-per-callsign-confidence-consumed-by-manta-spot",
+        "docs/SPEC-decode-core.md#9-configuration-keys",
+        "docs/DECISIONS/2026-09-09-beacon-emission-deferred-to-track-close.md",
+        "docs/DECISIONS/2026-10-14-man174-deferred-beacon-merge-bookkeeping.md"
       ],
       "status": "current",
       "title": "How does manta decide a decoded call is trustworthy enough to spot?",
-      "verified_commit": "e68b106",
-      "verified_date": "2026-07-07",
-      "visibility": "private"
+      "verified_commit": "60c4339",
+      "verified_date": "2026-10-14",
+      "visibility": "public"
     },
     {
-      "hash": "sha256:a72de6ac72b61069b2c309cb6fc4f665b611c8aa3e70644526d095183e0c5b66",
+      "hash": "sha256:7ff72f447f8b2dd8d04c8ce0ea03c30ea4176fb5c436a0ed101aee68b4adf217",
+      "id": "uplink-health-observability",
+      "kind": "interface",
+      "links": [
+        "spot-output-contract"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/uplink-health-observability.md",
+      "sources": [
+        "ARCHITECTURE.md",
+        "docs/DECISIONS/2026-09-04-man44-uplink-status-surface.md",
+        "docs/RUNBOOKS/uplink-health.md"
+      ],
+      "status": "current",
+      "title": "How does an operator check RBN uplink health without reading logs?",
+      "verified_commit": "d286147",
+      "verified_date": "2026-10-13",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:a1b0cb72a041d380c3acfb6f371e1f03f5ca33fda0cacefee0bdf1ac1385ec6c",
       "id": "watterson-dependency",
       "kind": "gotcha",
       "links": [
@@ -212,12 +353,36 @@
       ],
       "status": "current",
       "title": "What will bite you about depending on coppa's Watterson HF fading model?",
-      "verified_commit": "e68b106",
-      "verified_date": "2026-07-07",
-      "visibility": "private"
+      "verified_commit": "d286147",
+      "verified_date": "2026-10-13",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:a9ea021f5b989a216ee38a3fbbeb7dcd0ba26c64a315133d7caa66ea9ae7cd17",
+      "id": "windows-build-setup",
+      "kind": "howto",
+      "links": [
+        "live-hardware-field-testing"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/windows-build-setup.md",
+      "sources": [
+        ".github/workflows/ci-full.yml",
+        ".github/workflows/release.yml",
+        ".github/workflows/release-publish.yml",
+        "docs/superpowers/specs/2026-09-11-man212-windows-platform-support-design.md",
+        "docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md",
+        "docs/DECISIONS/2026-10-15-man371-windows-required-check.md"
+      ],
+      "status": "current",
+      "title": "How do I build and test manta on Windows?",
+      "verified_commit": "3805f78",
+      "verified_date": "2026-10-15",
+      "visibility": "public"
     }
   ],
   "repo": "manta",
   "schema": "wiki-manifest/v1",
-  "visibility": "private"
+  "visibility": "public"
 }
