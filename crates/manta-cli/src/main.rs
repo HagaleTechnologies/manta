@@ -2806,8 +2806,16 @@ fn merge_cli_engine(
 /// SIGINT and SIGTERM always drain; SIGHUP drains too unless this is a daemon
 /// (`[server]`), where it requests a reload instead -- the returned `Signals`
 /// buffers it for `reload::spawn`. Each stop signal is registered three
-/// times, in this order: an `_exit(128 + signal)` armed by `signalled`, the
-/// store that arms it, and the `stop` store the drain watches. So the first
+/// times, in this order: the `stop` store the drain watches, an
+/// `_exit(128 + signal)` armed by `signalled`, and the store that arms it.
+/// `stop` first because the three registrations are separate
+/// kernel-visible moments: a signal delivered between them runs only a
+/// prefix of the actions, and registering `stop` first makes every such
+/// prefix still request the drain -- the signal is never swallowed, and
+/// never merely arms a forced exit the next signal would take without any
+/// drain. The `_exit` still registers before the arming store (signal-hook
+/// runs a signal's actions in registration order), which is what keeps
+/// the first signal from exiting at once. So the first
 /// stop signal only requests the drain, and any second one ends the process
 /// from inside the handler -- the one place that still runs while the decode
 /// thread is blocked in a stdout write (SA_RESTART restarts that write, and
@@ -2828,9 +2836,13 @@ fn install_unix_signal_handlers(
     }
     for (signal, name) in stop_signals {
         let install = || -> std::io::Result<()> {
+            // `stop` first, so a stop signal delivered between these
+            // separate registrations still requests the drain (see the doc
+            // comment); the `_exit` before the arming store keeps the first
+            // signal from exiting at once.
+            flag::register(signal, stop.clone())?;
             flag::register_conditional_shutdown(signal, 128 + signal, signalled.clone())?;
             flag::register(signal, signalled.clone())?;
-            flag::register(signal, stop.clone())?;
             Ok(())
         };
         install().with_context(|| format!("installing the {name} handler"))?;

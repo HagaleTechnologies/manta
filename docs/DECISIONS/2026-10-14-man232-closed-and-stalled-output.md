@@ -70,10 +70,16 @@ panic: exit 101, with no drain. Reproduced on `f33bf1c` (2026-10-14):
    the ticket asks; unit tests for `stdio` live in `stdio.rs`; the
    panicking-print ban is a guard in `output_style_guard.rs`.
 
-Registration order per stop signal (D4): the conditional `_exit` action
-first, then the arming store, then the `stop` store — signal-hook runs
+Registration order per stop signal (D4): the `stop` store first, then the
+conditional `_exit` action, then the arming store — signal-hook runs
 actions in registration order, so the first signal only arms, and the
-second exits with `_exit(128 + signal)` (async-signal-safe). Only these
+second exits with `_exit(128 + signal)` (async-signal-safe). `stop` is
+registered first because the three registrations are separate
+kernel-visible moments: a stop signal delivered between them (a supervisor
+terminating manta during startup) runs only a prefix of the actions, and
+with `stop` first every such prefix still requests the drain — the signal
+is never swallowed, and never merely arms a forced exit the next signal
+would take without any drain. Only these
 handlers set `signalled`: a closed stdout and the post-loop
 `stop_ready.store(true)` set `stop` without arming the forced exit, so
 the first signal after a closed-pipe stop still drains normally.

@@ -260,8 +260,8 @@ by mistake shows as `blocklist_calls=0`. `dry_run` levels follow MAN-159:
 MAN-232 moved SIGINT from ctrlc to `signal-hook` on Unix, so D3's "ctrlc
 keeps SIGINT" no longer holds there: every stop signal — SIGINT, SIGTERM,
 and SIGHUP without a `[server]` table — is registered three times through
-signal-hook (a conditional `_exit(128 + signal)` armed by a dedicated
-`signalled` flag, the arming store, then the `stop` store), so a second
+signal-hook (the `stop` store, then a conditional `_exit(128 + signal)`
+armed by a dedicated `signalled` flag, then the arming store), so a second
 stop signal ends the process at once instead of leaving it blocked in a
 stdout write. ctrlc is now Windows-only, for console events. Everything
 else this record decides — SIGHUP's reload-vs-drain split, the reload
