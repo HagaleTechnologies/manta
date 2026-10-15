@@ -2805,19 +2805,17 @@ fn merge_cli_engine(
 /// MAN-78 (supersedes MAN-85's ctrlc `termination` feature on Unix), MAN-232:
 /// SIGINT and SIGTERM always drain; SIGHUP drains too unless this is a daemon
 /// (`[server]`), where it requests a reload instead -- the returned `Signals`
-/// buffers it for `reload::spawn`. Each stop signal is registered three
-/// times, in this order: the `stop` store the drain watches, an
-/// `_exit(128 + signal)` armed by `signalled`, and the store that arms it.
-/// `stop` first because the three registrations are separate
-/// kernel-visible moments: a signal delivered between them runs only a
-/// prefix of the actions, and registering `stop` first makes every such
-/// prefix still request the drain -- the signal is never swallowed, and
-/// never merely arms a forced exit the next signal would take without any
-/// drain. The `_exit` still registers before the arming store (signal-hook
-/// runs a signal's actions in registration order), which is what keeps
-/// the first signal from exiting at once. So the first
-/// stop signal only requests the drain, and any second one ends the process
-/// from inside the handler -- the one place that still runs while the decode
+/// buffers it for `reload::spawn`. Each stop signal gets ONE handler action:
+/// store `stop` (the drain watches it), then atomically `swap` `signalled`
+/// to `true` and `_exit(128 + signal)` if it was already set. One action,
+/// not separate store/check/arm registrations, because (a) a signal
+/// delivered between separate registrations would run only some of them,
+/// and (b) handlers for *different* signals nest (signal-hook installs with
+/// an empty `sa_mask`), so a load-then-store pair lets two concurrent stop
+/// signals both see "not yet signalled" and neither exit. The swap makes
+/// "first or second?" a single atomic decision. So the first stop signal
+/// only requests the drain, and any second one ends the process from
+/// inside the handler -- the one place that still runs while the decode
 /// thread is blocked in a stdout write (SA_RESTART restarts that write, and
 /// std retries EINTR anyway). Only these handlers set `signalled`: a closed
 /// stdout and the post-loop `stop_ready` store set `stop` without arming it.
@@ -2828,24 +2826,30 @@ fn install_unix_signal_handlers(
     daemon: bool,
 ) -> Result<Option<signal_hook::iterator::Signals>> {
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
-    use signal_hook::flag;
+    use std::sync::atomic::Ordering;
     let signalled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut stop_signals = vec![(SIGINT, "SIGINT"), (SIGTERM, "SIGTERM")];
     if !daemon {
         stop_signals.push((SIGHUP, "SIGHUP"));
     }
     for (signal, name) in stop_signals {
-        let install = || -> std::io::Result<()> {
-            // `stop` first, so a stop signal delivered between these
-            // separate registrations still requests the drain (see the doc
-            // comment); the `_exit` before the arming store keeps the first
-            // signal from exiting at once.
-            flag::register(signal, stop.clone())?;
-            flag::register_conditional_shutdown(signal, 128 + signal, signalled.clone())?;
-            flag::register(signal, signalled.clone())?;
-            Ok(())
-        };
-        install().with_context(|| format!("installing the {name} handler"))?;
+        let stop = stop.clone();
+        let signalled = signalled.clone();
+        // SAFETY: the action runs in signal context, so it may only do
+        // async-signal-safe work. It does: two lock-free atomic operations
+        // on `AtomicBool`s it owns (via `Arc` clones, never freed while
+        // registered) and `low_level::exit`, which is `_exit(2)` --
+        // async-signal-safe and skipping at-exit hooks. No allocation, no
+        // locks, no I/O.
+        unsafe {
+            signal_hook::low_level::register(signal, move || {
+                stop.store(true, Ordering::SeqCst);
+                if signalled.swap(true, Ordering::SeqCst) {
+                    signal_hook::low_level::exit(128 + signal);
+                }
+            })
+        }
+        .with_context(|| format!("installing the {name} handler"))?;
     }
     if daemon {
         let signals = signal_hook::iterator::Signals::new([SIGHUP])
@@ -6594,6 +6598,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                         &receiver,
                         Ok(src.sample_rate()),
                     ));
+                    // MAN-232: a failed receiver-line write stops doctor
+                    // before the signal check runs for its full duration
+                    // for a reader that already left.
+                    sink.written()?;
                     match manta_engine::doctor(src, &cfg, std::time::Duration::from_secs(duration))
                     {
                         Ok(report) => {
