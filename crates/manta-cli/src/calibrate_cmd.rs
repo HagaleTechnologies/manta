@@ -483,6 +483,12 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
     )?;
     eprintln!("{}", measuring_line(&planned, duration));
     let report = manta_engine::calibrate(src, &planned, &opts)?;
+    if report.bad_samples > 0 {
+        eprintln!(
+            "{}",
+            crate::fmt::bad_samples_warning(&spec.input_label(), report.bad_samples)
+        );
+    }
 
     // The file's own value, read from its text: the loaded config already
     // carries the environment overlay.
@@ -736,6 +742,7 @@ mod tests {
             duration_s: 60.0,
             search_ppm: 50.0,
             references,
+            bad_samples: 0,
         }
     }
 

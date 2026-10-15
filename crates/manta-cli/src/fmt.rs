@@ -43,9 +43,55 @@ pub fn render_error(err: &anyhow::Error) -> String {
 
 pub use manta_server::human::quoted;
 
+/// MAN-234: `1 bad sample (NaN, …)` / `N bad samples (NaN, …)`, the one
+/// place the replaced-sample wording and its limit (built from
+/// `MAX_SAMPLE_MAGNITUDE`, so text and constant cannot drift) live.
+fn bad_samples_phrase(n: u64) -> String {
+    format!(
+        "{n} bad sample{} (NaN, infinite, or larger than {:e} in magnitude)",
+        if n == 1 { "" } else { "s" },
+        manta_engine::MAX_SAMPLE_MAGNITUDE
+    )
+}
+
+/// MAN-234: the end-of-run warning `decode`, `calibrate` and a live run's
+/// final total print when `input` had `n` > 0 samples replaced.
+pub fn bad_samples_warning(input: &str, n: u64) -> String {
+    format!(
+        "warning: {input} contained {}; each was replaced with silence and decoding \
+         continued -- check the source's sample format or driver",
+        bad_samples_phrase(n)
+    )
+}
+
+/// MAN-234: the one line `run`/`listen` prints at the first replaced
+/// sample; `daemon` (a `[server]` table) names the metric that keeps
+/// counting.
+pub fn bad_samples_live_warning(input: &str, n: u64, daemon: bool) -> String {
+    format!(
+        "warning: {input} delivered {}; replaced with silence, decoding continues. Later ones \
+         are counted{} and totalled when the run ends",
+        bad_samples_phrase(n),
+        if daemon {
+            " in manta_input_bad_samples_total"
+        } else {
+            ""
+        }
+    )
+}
+
+/// MAN-234: the `doctor`/`soak` report line, empty when nothing was replaced.
+fn bad_samples_report_line(n: u64) -> String {
+    if n == 0 {
+        String::new()
+    } else {
+        format!("input: {} replaced with silence\n", bad_samples_phrase(n))
+    }
+}
+
 pub fn soak_report(report: &manta_engine::SoakReport) -> String {
     format!(
-        "soak: {}\nevents: {}\nRSS growth: {:.1} MiB\npanicked: {}\n",
+        "soak: {}\nevents: {}\nRSS growth: {:.1} MiB\npanicked: {}\n{}",
         if manta_engine::soak_passed(report) {
             "passed"
         } else {
@@ -53,7 +99,8 @@ pub fn soak_report(report: &manta_engine::SoakReport) -> String {
         },
         report.events_emitted,
         report.rss_growth_bytes as f64 / (1024.0 * 1024.0),
-        if report.panicked { "yes" } else { "no" }
+        if report.panicked { "yes" } else { "no" },
+        bad_samples_report_line(report.bad_samples)
     )
 }
 
@@ -72,7 +119,7 @@ pub fn doctor_report(report: &manta_engine::DoctorReport) -> String {
 tracks: {} promoted, {} TrackMeta updates, {} closed, {} detector confirmations\n\
 SNR (2500 Hz reference): {}\n\
 decode: {} chars ({} distinct), {} confirmed spots\n\
-verdict: {}\n",
+{}verdict: {}\n",
         report.sample_rate_hz,
         khz(report.center_freq_hz),
         report.duration.as_secs_f64(),
@@ -84,6 +131,7 @@ verdict: {}\n",
         report.chars_decoded,
         report.distinct_chars,
         report.spots_confirmed,
+        bad_samples_report_line(report.bad_samples),
         report.verdict().summary()
     )
 }
@@ -100,6 +148,7 @@ mod tests {
             spots: Vec::new(),
             timing: None,
             rtty: Vec::new(),
+            bad_samples: 0,
             sample_rate_hz: 48_000.0,
         };
         assert_eq!(
@@ -163,6 +212,7 @@ mod tests {
             events_emitted: 0,
             rss_growth_bytes: 0,
             panicked: false,
+            bad_samples: 0,
         };
         assert_eq!(
             soak_report(&r),
@@ -195,6 +245,7 @@ mod tests {
             chars_decoded: 42,
             distinct_chars: 15,
             spots_confirmed: 0,
+            bad_samples: 0,
         };
         assert_eq!(doctor_report(&r), format!("source: 48000 Hz sample rate, 14000.0 kHz center, observed for 10.0s\ntracks: 61 promoted, 64 TrackMeta updates, 36 closed, 70 detector confirmations\nSNR (2500 Hz reference): min=20 dB median=59 dB max=68 dB\ndecode: 42 chars (15 distinct), 0 confirmed spots\nverdict: {}\n", r.verdict().summary()));
         r.snr_db_min = None;
@@ -204,6 +255,75 @@ mod tests {
         r.tracks_promoted = 0;
         assert!(doctor_report(&r)
             .contains("SNR (2500 Hz reference): no TrackMeta events -- no track ever promoted\n"));
+    }
+
+    #[test]
+    fn bad_samples_warning_names_the_input_the_count_and_the_limit() {
+        assert_eq!(
+            bad_samples_warning("nan30.wav", 1),
+            "warning: nan30.wav contained 1 bad sample (NaN, infinite, or larger than 1e17 in \
+             magnitude); each was replaced with silence and decoding continued -- check the \
+             source's sample format or driver"
+        );
+        assert!(bad_samples_warning("the soapy input", 2)
+            .starts_with("warning: the soapy input contained 2 bad samples (NaN"));
+    }
+
+    #[test]
+    fn bad_samples_live_warning_mentions_the_metric_only_with_a_server() {
+        assert_eq!(
+            bad_samples_live_warning("nan30.wav", 1, false),
+            "warning: nan30.wav delivered 1 bad sample (NaN, infinite, or larger than 1e17 in \
+             magnitude); replaced with silence, decoding continues. Later ones are counted and \
+             totalled when the run ends"
+        );
+        assert!(bad_samples_live_warning("nan30.wav", 1, true).ends_with(
+            "Later ones are counted in manta_input_bad_samples_total and totalled when the run \
+             ends"
+        ));
+    }
+
+    #[test]
+    fn doctor_report_adds_the_input_line_only_when_samples_were_replaced() {
+        let mut r = manta_engine::DoctorReport {
+            sample_rate_hz: 96000.0,
+            center_freq_hz: 14_000_000.0,
+            duration: std::time::Duration::from_secs(20),
+            tracks_promoted: 1,
+            detector_confirmations: 0,
+            track_meta_count: 19,
+            tracks_closed: 1,
+            snr_db_min: Some(16.0),
+            snr_db_median: Some(21.0),
+            snr_db_max: Some(23.0),
+            chars_decoded: 20,
+            distinct_chars: 9,
+            spots_confirmed: 0,
+            bad_samples: 0,
+        };
+        assert!(!doctor_report(&r).contains("input:"));
+        r.bad_samples = 1;
+        assert!(doctor_report(&r).contains(&format!(
+            "confirmed spots\ninput: 1 bad sample (NaN, infinite, or larger than 1e17 in \
+             magnitude) replaced with silence\nverdict: {}\n",
+            r.verdict().summary()
+        )));
+    }
+
+    #[test]
+    fn soak_report_adds_the_input_line_only_when_samples_were_replaced() {
+        let mut r = manta_engine::SoakReport {
+            events_emitted: 0,
+            rss_growth_bytes: 0,
+            panicked: false,
+            bad_samples: 0,
+        };
+        assert!(soak_report(&r).ends_with("panicked: no\n"));
+        r.bad_samples = 3;
+        assert!(soak_report(&r).ends_with(
+            "panicked: no\ninput: 3 bad samples (NaN, infinite, or larger than 1e17 in \
+             magnitude) replaced with silence\n"
+        ));
     }
 
     /// MAN-313: a run with confirmed signals but no keyed CW prints its
@@ -224,6 +344,7 @@ mod tests {
             chars_decoded: 0,
             distinct_chars: 0,
             spots_confirmed: 0,
+            bad_samples: 0,
         };
         let out = doctor_report(&r);
         assert!(

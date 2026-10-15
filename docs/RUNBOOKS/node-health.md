@@ -206,6 +206,41 @@ why they are node-wide, with no `track_id` label.
   A high share at `le="1"` means candidates are not confirming: busted
   calls, or signals too short-lived to repeat.
 
+## Bad input samples (MAN-234)
+
+`manta_input_bad_samples_total{source}` counts input samples manta
+replaced with silence because a component was NaN, infinite, or larger
+than 1e17 in magnitude. Sources deliver full scale at 1.0, so any count
+above 0 means the source or its driver is delivering corrupt or
+mis-scaled floats. The series is 0 from startup and should stay there.
+
+```promql
+increase(manta_input_bad_samples_total[1h]) > 0
+```
+
+Decoding continues: each bad sample becomes `0+0j`, so the node does not
+crash or go deaf, but a burst of them is a gap in what it hears. One bad
+sample from a sound card or a `--capture-rate-hz` capture can count as
+several, because the filters ahead of the channelizer spread it (see
+[METRICS.md](../METRICS.md)).
+
+On stderr, `run` prints one line at the first bad sample and a total
+when the run ends if more followed:
+
+```text
+warning: the soapy input delivered 1 bad sample (NaN, infinite, or larger than 1e17 in magnitude); replaced with silence, decoding continues. Later ones are counted in manta_input_bad_samples_total and totalled when the run ends
+warning: the soapy input contained 12 bad samples (NaN, infinite, or larger than 1e17 in magnitude); each was replaced with silence and decoding continued -- check the source's sample format or driver
+```
+
+`manta decode` and `manta calibrate` print the second form, and the
+`doctor` and `soak` reports add an `input: N bad samples (…) replaced
+with silence` line. `manta check` on the same source does not replace
+anything: it fails with `source check failed: nonfinite input sample`
+when its window covers a NaN or infinite sample. Check the source's
+sample format (for example a float WAV written with the wrong scale) and
+the driver version, then watch the counter stay flat. See
+[MAN-234](../DECISIONS/2026-10-15-man234-bad-input-samples.md).
+
 ## Known gaps
 
 - Signal-to-spot (track onset → first spot) latency is not yet a metric —
