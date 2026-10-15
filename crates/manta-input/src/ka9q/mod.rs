@@ -849,28 +849,60 @@ mod tests {
 
     /// One call takes at most `DRAIN_BATCH` datagrams, so a flood that keeps
     /// the socket readable cannot keep `wait_for_status` from its deadline.
+    /// A sender thread keeps the socket readable for the whole call instead
+    /// of queueing more than a batch up front: a host's `rmem_max` can clamp
+    /// the receive buffer below `DRAIN_BATCH` datagrams (a container held
+    /// only ~222), and then a full batch never queues at once.
     #[test]
     fn stash_takes_at_most_one_batch_per_call() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
         let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
-        // Match the production socket: small default receive buffers can drop
-        // the queued datagrams before stash_data gets a chance to drain them.
         socket2::SockRef::from(&rx)
             .set_recv_buffer_size(RCVBUF_BYTES)
             .unwrap();
         rx.set_nonblocking(true).unwrap();
-        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-        for _ in 0..DRAIN_BATCH + 20 {
-            tx.send_to(&[1; 8], rx.local_addr().unwrap()).unwrap();
-        }
-        std::thread::sleep(Duration::from_millis(50));
+        let to = rx.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flood = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+                while !stop.load(Ordering::Relaxed) {
+                    // A full receive buffer drops the datagram; keep going.
+                    let _ = tx.send_to(&[1; 8], to);
+                }
+            })
+        };
         let mut buf = vec![0u8; RECV_BUF_LEN];
-        let mut stash = VecDeque::new();
-        let mut stashed = 0;
-        stash_data(&rx, &mut buf, &mut stash, &mut stashed, RCVBUF_BYTES).unwrap();
-        assert_eq!(stash.len(), DRAIN_BATCH);
+        let mut sizes = Vec::new();
+        let mut failed = None;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(10));
+            let mut stash = VecDeque::new();
+            let mut stashed = 0;
+            if let Err(e) = stash_data(&rx, &mut buf, &mut stash, &mut stashed, RCVBUF_BYTES) {
+                failed = Some(e);
+                break;
+            }
+            sizes.push(stash.len());
+            if stash.len() >= DRAIN_BATCH {
+                break;
+            }
+        }
+        // Stop the flood before any assertion can panic past it.
+        stop.store(true, Ordering::Relaxed);
+        flood.join().unwrap();
+        assert!(failed.is_none(), "stash_data failed: {failed:?}");
         assert!(
-            rx.recv(&mut buf).is_ok(),
-            "the rest is left for the next pass"
+            sizes.iter().all(|&n| n <= DRAIN_BATCH),
+            "a call took more than one batch: {sizes:?}"
+        );
+        assert_eq!(
+            sizes.last(),
+            Some(&DRAIN_BATCH),
+            "the flood never kept a full batch readable: {sizes:?}"
         );
     }
 
