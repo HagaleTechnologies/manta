@@ -282,12 +282,13 @@
         "docs/DECISIONS/2026-10-10-man92-telnet-commands.md",
         "docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md",
         "docs/RUNBOOKS/rbn-comparison.md",
-        "docs/SPOT-SCHEMA.md"
+        "docs/SPOT-SCHEMA.md",
+        "docs/DECISIONS/2026-10-14-man137-json-stream-resume.md"
       ],
       "status": "current",
       "title": "What spot-output contracts does manta expose (telnet RBN + JSON)?",
-      "verified_commit": "d286147",
-      "verified_date": "2026-10-13",
+      "verified_commit": "9636fe0494b4bce7973c3e0c5ad854f9ebc16f73",
+      "verified_date": "2026-10-14",
       "visibility": "public"
     },
     {
