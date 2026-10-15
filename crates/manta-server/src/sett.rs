@@ -141,9 +141,48 @@ pub fn segments_for_passband(
     }
 }
 
+/// MAN-13 (D15): the segments of several inputs, each built with
+/// `segments_for_passband` from its own `(centre, passband, calibration)`,
+/// sorted, with overlapping or touching segments merged.
+pub fn segments_for_inputs(inputs: &[(f64, (f64, f64), f64)]) -> Vec<(f64, f64)> {
+    let mut all: Vec<(f64, f64)> = inputs
+        .iter()
+        .flat_map(|&(centre, passband, calibration)| {
+            segments_for_passband(centre, passband, calibration)
+        })
+        .collect();
+    all.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    let mut merged: Vec<(f64, f64)> = Vec::with_capacity(all.len());
+    for (lo, hi) in all {
+        match merged.last_mut() {
+            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segments_for_inputs_union_and_merge_overlaps() {
+        // Two overlapping 20 m segments and one 40 m segment.
+        let segments = segments_for_inputs(&[
+            (14_060_000.0, (-96_000.0, 96_000.0), 1.0),
+            (7_030_000.0, (-24_000.0, 24_000.0), 1.0),
+            (14_000_000.0, (-48_000.0, 48_000.0), 1.0),
+        ]);
+        assert_eq!(
+            segments,
+            vec![(7_006_000.0, 7_054_000.0), (14_000_000.0, 14_156_000.0)]
+        );
+        // Each input's own calibration moves its own segment.
+        let calibrated = segments_for_inputs(&[(7_030_000.0, (-24_000.0, 24_000.0), 1.0 + 1e-6)]);
+        assert!(calibrated[0].0 > 7_006_000.0, "{calibrated:?}");
+        assert!(segments_for_inputs(&[]).is_empty());
+    }
 
     /// A symmetric `centre +/- bandwidth/2` passband -- what every
     /// non-resampling source (file, SoapySDR, HPSDR) reports, and the

@@ -165,12 +165,19 @@ pub struct StatusSnapshot {
     pub ws_clients: i64,
     pub uplink: UplinkState,
     pub pipeline: PipelineState,
+    /// MAN-13: `(decoding, configured)` inputs, set only with two or more,
+    /// so a one-input line is unchanged.
+    pub inputs: Option<(usize, usize)>,
 }
 
 pub fn format_status_line(s: &StatusSnapshot) -> String {
+    let inputs = match s.inputs {
+        Some((decoding, configured)) => format!(" inputs={decoding}/{configured}"),
+        None => String::new(),
+    };
     format!(
         "manta status: uptime_s={} pipeline={} tracks={} spots_per_min={:.1} spots_total={} \
-         clients={} (telnet={} json={} ws={}) uplink={}",
+         clients={} (telnet={} json={} ws={}) uplink={}{inputs}",
         s.uptime_s,
         s.pipeline.as_str(),
         s.active_tracks,
@@ -295,6 +302,10 @@ pub fn spawn_status_line(
                     UplinkState::Disconnected
                 },
                 pipeline: PipelineState::from_progress(last_batches, batches, since_start),
+                inputs: match metrics.source_health_counts() {
+                    (decoding, configured) if configured >= 2 => Some((decoding, configured)),
+                    _ => None,
+                },
             };
             last_sample = now;
             last_spots = spots_total;
@@ -366,6 +377,7 @@ mod tests {
             ws_clients: 0,
             uplink: UplinkState::Connected,
             pipeline: PipelineState::Decoding,
+            inputs: None,
         });
         for needle in [
             "pipeline=decoding",
@@ -376,6 +388,29 @@ mod tests {
         ] {
             assert!(line.contains(needle), "{needle:?} missing from {line:?}");
         }
+    }
+
+    #[test]
+    fn status_line_appends_inputs_only_with_two_or_more() {
+        let mut snapshot = StatusSnapshot {
+            uptime_s: 600,
+            active_tracks: 7,
+            spots_per_min: 3.2,
+            spots_total: 31,
+            telnet_clients: 1,
+            json_clients: 1,
+            ws_clients: 0,
+            uplink: UplinkState::Connected,
+            pipeline: PipelineState::Decoding,
+            inputs: None,
+        };
+        assert!(format_status_line(&snapshot).ends_with(" uplink=connected"));
+        snapshot.inputs = Some((2, 3));
+        assert_eq!(
+            format_status_line(&snapshot),
+            "manta status: uptime_s=600 pipeline=decoding tracks=7 spots_per_min=3.2 \
+             spots_total=31 clients=2 (telnet=1 json=1 ws=0) uplink=connected inputs=2/3"
+        );
     }
 
     #[test]

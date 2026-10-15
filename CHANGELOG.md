@@ -55,6 +55,13 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-13: one `manta run` decodes several receivers into one spot output.
+  Write `[[input]]` once per receiver (each with a `name`); every input
+  decodes on its own thread into one shared validator, so a station two
+  receivers hear is spotted once. `calibrate`, `doctor`, `soak` and `check`
+  take `--input NAME`. With several inputs `/healthz` stays `ok` while one
+  input is healthy. Single-input runs are unchanged.
+
 - MAN-315: a `TimingUpdate` event per track (each class's mean, variance
   and count, in dits), a top-level `timing` object in `decode --json`, and
   `manta decode --timing` for a `timing (dits, mean ± sd): …` stderr line.

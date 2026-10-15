@@ -205,6 +205,7 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | Key | Default | Wired | Notes |
 |---|---|---|---|
 | `type` | none; example `"kiwi"`; unset uses the default sound card, or the source the command line names | live: `run`, `soak`, `doctor`, `check` | `"audio"`, `"file"`, `"kiwi"`, `"soapy"`, `"hpsdr"` or `"ka9q"`. Each type accepts only its own keys below. |
+| `name` | none; example `"20m"`; unset uses the input's `type` (`audio` when untyped) | live: `run`, `soak`, `doctor`, `calibrate`, `check` | The input's name in log lines and in `--input NAME`. Letters, digits, `.`, `_` and `-`, starting with a letter or digit, at most 32 characters. Required on every entry when there are several `[[input]]` entries (MAN-13). |
 | `device` | none; example `"USB Audio"`; unset uses the system's default input | live: `type = "audio"` | Part of the device's name; `manta devices` lists them. `--device` overrides it. |
 | `path` | none; example `"capture.wav"`; required for `type = "file"` | live: `type = "file"` | WAV recording replayed as if live. A relative path set in the file is relative to the file's directory; from `--source`, which overrides it, or `MANTA_INPUT_PATH` it is relative to the working directory. |
 | `iq` | `false` | live: `type = "file"` | `true` for a two-channel IQ recording. `--source-iq` sets it. |
@@ -224,6 +225,38 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `center_freq_hz` | none; example `14030000.0`; unset leaves frequencies as audio offsets, and `run` with `[server]` refuses a source that carries no frequency of its own | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Your radio's dial frequency, Hz, for a source that carries none. `--dial-freq-hz` overrides it. |
 | `capture_rate_hz` | none; example `48000.0`; unset decodes at the receiver's own rate | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Decimated sample rate, Hz. It must be at least 1000 (checked before the receiver opens), divide the receiver's rate by a power of two, and be 93.75 Hz (the channel spacing) times a power of two of at least 4, so in practice 1500, 3000, 6000, 12000, 24000, 48000, 96000 and so on. A rate that divides evenly but fails the last rule, such as 50000 from a 100 kS/s receiver, is rejected at startup. `--capture-rate-hz` overrides it. |
 | `replay_epoch` | none; example `1700000000`; unset uses the file's modification time | live: `run` with `[server]` and a file source; ignored elsewhere | Unix seconds that the recording's first sample stands for. `--replay-epoch` overrides it. |
+
+### Several receivers: [[input]]
+
+MAN-13: one `run` can decode several receivers -- several SDRs, or several
+receiver channels of one SDR (ka9q-radio SSRCs on one radiod, channels of one
+KiwiSDR) -- into one spot output. Write the input table as `[[input]]` once
+per receiver. Each entry takes the keys above, plus `name`. A one-entry
+`[[input]]` is the same as `[input]`.
+
+- With two or more entries, every entry needs a `name` and a `type`. Names
+  are unique; at most 16 entries.
+- `freq_correction_ppm`, `center_freq_hz` and `capture_rate_hz` belong to
+  their entry. An `audio` entry needs `center_freq_hz`, and a file entry
+  needs a sidecar or `center_freq_hz`, so every input's frequencies can be
+  compared.
+- File replay and live receivers do not mix in one run. `replay_epoch` goes
+  on the first entry only, and every file entry has the same `realtime` and
+  `loop`.
+- Two entries on one HPSDR radio are refused until MAN-307.
+- `MANTA_INPUT_*` and the per-receiver flags `--freq-correction-ppm`,
+  `--dial-freq-hz` and `--capture-rate-hz` cannot say which entry they set,
+  so they are refused; a source flag (`--source`, `--kiwi-host`, ...) still
+  replaces every entry with the one receiver it names.
+- `calibrate`, `doctor`, `soak` and `check` examine one receiver: pass
+  `--input NAME`.
+- A station two receivers both hear is spotted once (the shared validator's
+  cross-input dedupe), on stdout and, with `[server]`, on the one telnet,
+  JSON and metrics server. `/healthz` stays `ok` while at least one input
+  is healthy. SIGHUP stops a several-input run instead of reloading, and
+  the live-state stream, scheduled list refresh and per-input
+  `manta_input_*` counters are not wired for several inputs yet. See
+  [DECISIONS/2026-10-15-man13-multi-input-daemon.md](DECISIONS/2026-10-15-man13-multi-input-daemon.md).
 
 ## [spot]
 

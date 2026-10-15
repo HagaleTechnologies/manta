@@ -144,7 +144,9 @@ impl InputHealthTotals {
 /// `read()` just returns real samples a little later than usual, after an
 /// outage reported once via `take_discontinuity()`.
 pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
-    name: &'static str,
+    /// The source's name in log lines: its type, or with several inputs
+    /// (MAN-13) the input's name.
+    name: String,
     inner: Option<Box<dyn IqSource>>,
     opener: Opener,
     stop: Arc<AtomicBool>,
@@ -178,7 +180,7 @@ pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
 
 impl ReconnectingSource<RealEnv> {
     pub(crate) fn new(
-        name: &'static str,
+        name: impl Into<String>,
         first: Box<dyn IqSource>,
         opener: Opener,
         stop: Arc<AtomicBool>,
@@ -199,7 +201,7 @@ impl ReconnectingSource<RealEnv> {
 
 impl<E: ReconnectEnv> ReconnectingSource<E> {
     pub(crate) fn with_env(
-        name: &'static str,
+        name: impl Into<String>,
         first: Box<dyn IqSource>,
         opener: Opener,
         stop: Arc<AtomicBool>,
@@ -214,7 +216,7 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
         let last_ok = env.now();
         let input_health = InputHealthTotals::for_source(first.as_ref());
         ReconnectingSource {
-            name,
+            name: name.into(),
             inner: Some(first),
             opener,
             stop,

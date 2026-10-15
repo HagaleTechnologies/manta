@@ -137,7 +137,11 @@ pub(crate) struct Loaded {
     pub decode: DecodeConfig,
     pub detector: DetectorConfig,
     pub spot: SpotFile,
+    /// The first (or only) input: what every one-receiver command opens.
     pub input: InputFile,
+    /// MAN-13: every input, named, in config order; `inputs[0].input ==
+    /// input`. One entry for a single `[input]` table (or none at all).
+    pub inputs: Vec<NamedInput>,
     /// Top-level tables present after the overlay (for "ignored" notes).
     pub present: BTreeSet<String>,
     /// The whole document after the `MANTA_*` overlay, untyped: which keys
@@ -294,6 +298,8 @@ impl InputKind {
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InputToml {
+    /// MAN-13: the input's name (required with two or more `[[input]]`).
+    name: Option<String>,
     #[serde(rename = "type")]
     kind: Option<InputKind>,
     device: Option<String>,
@@ -320,6 +326,17 @@ struct InputToml {
     capture_rate_hz: Option<f64>,
     replay_epoch: Option<i64>,
 }
+
+/// MAN-13: one `[[input]]` entry (or the single `[input]` table) and its
+/// name. The single form's name defaults to its type (`audio` untyped).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NamedInput {
+    pub name: String,
+    pub input: InputFile,
+}
+
+/// MAN-13: the longest input name.
+const MAX_INPUT_NAME_CHARS: usize = 32;
 
 /// `[input]`: the source it describes (`None` when untyped) plus the shared
 /// keys.
@@ -411,6 +428,13 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         _ => PathBuf::from("."),
     });
     check_top_level(&doc, &origin)?;
+    // MAN-13: a one-entry `[[input]]` is the single form.
+    if let Some(toml::Value::Array(entries)) = doc.get("input") {
+        if entries.len() == 1 && entries[0].is_table() {
+            let only = entries[0].clone();
+            doc.insert("input".into(), only);
+        }
+    }
     let overlay = match env {
         Env::Ignore => EnvOverlay::default(),
         Env::Read(vars) => apply_env_overlay(&mut doc, vars)?,
@@ -488,9 +512,31 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
             .map(|p| resolve_path("spot", "pattern_path", p)),
         validation_level: spot_toml.validation_level,
     };
-    let input_toml = take_typed::<InputToml>(&doc, "input", &origin, &overlay)?.unwrap_or_default();
-    let input = validate_input(input_toml, &|p| resolve_path("input", "path", p))
-        .map_err(|e| anyhow!("{origin}: [input]: {e}{}", overlay.suffix("input")))?;
+    let inputs = match doc.get("input") {
+        Some(toml::Value::Array(entries)) if !entries.is_empty() => {
+            take_input_array(entries, &origin, &|p| resolve_path("input", "path", p))?
+        }
+        _ => {
+            let input_toml =
+                take_typed::<InputToml>(&doc, "input", &origin, &overlay)?.unwrap_or_default();
+            let name = input_toml.name.clone();
+            let input = validate_input(input_toml, &|p| resolve_path("input", "path", p))
+                .map_err(|e| anyhow!("{origin}: [input]: {e}{}", overlay.suffix("input")))?;
+            let name = match name {
+                Some(name) => {
+                    check_input_name(&name).map_err(|e| anyhow!("{origin}: {e}"))?;
+                    name
+                }
+                None => input
+                    .source
+                    .as_ref()
+                    .map_or("audio", |s| s.kind().name())
+                    .to_string(),
+            };
+            vec![NamedInput { name, input }]
+        }
+    };
+    let input = inputs[0].input.clone();
 
     let mut env_vars: Vec<String> = overlay.vars_by_table.into_values().flatten().collect();
     env_vars.sort();
@@ -503,6 +549,7 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         detector,
         spot,
         input,
+        inputs,
         present: doc.keys().cloned().collect(),
         raw: doc,
         env_vars,
@@ -575,10 +622,8 @@ fn check_top_level(doc: &toml::Table, origin: &str) -> Result<()> {
             ("rbn_uplink", _) => {
                 bail!("{origin}: rbn_uplink must be written [[rbn_uplink]] (an array of tables)")
             }
-            ("input", toml::Value::Array(_)) => bail!(
-                "{origin}: [[input]] (multiple sources) is not supported yet -- use a single \
-                 [input] table"
-            ),
+            // MAN-13: several receivers, one entry each.
+            ("input", toml::Value::Array(_)) => {}
             (_, toml::Value::Table(_)) => {}
             (_, toml::Value::Array(_)) => {
                 bail!("{origin}: [[{key}]] is not supported -- use a single [{key}] table")
@@ -668,6 +713,136 @@ fn check_ka9q_interface(interface: &str) -> std::result::Result<Ipv4Addr, String
 
 /// D5: type/key consistency, required keys, and the same value checks the
 /// equivalent CLI flags apply.
+/// MAN-13: an input name is a metric label and a log word: letters,
+/// digits, '.', '_' and '-', starting with a letter or digit, at most 32
+/// characters.
+fn check_input_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.chars().count() <= MAX_INPUT_NAME_CHARS
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !ok {
+        let name = crate::fmt::quoted(name);
+        bail!(
+            "[[input]] name {name} may use only letters, digits, '.', '_' and '-', start with \
+             a letter or digit, and be at most {MAX_INPUT_NAME_CHARS} characters"
+        );
+    }
+    Ok(())
+}
+
+/// MAN-13: `[[input]]` with two or more entries: each typed, named and
+/// validated like `[input]`, then the cross-entry rules.
+fn take_input_array(
+    entries: &[toml::Value],
+    origin: &str,
+    resolve_path: &dyn Fn(PathBuf) -> PathBuf,
+) -> Result<Vec<NamedInput>> {
+    if entries.len() > manta_engine::MAX_INPUTS {
+        bail!(
+            "{origin}: at most {} [[input]] entries are supported, found {}",
+            manta_engine::MAX_INPUTS,
+            entries.len()
+        );
+    }
+    let mut inputs: Vec<NamedInput> = Vec::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        let t = entry
+            .clone()
+            .try_into::<InputToml>()
+            .map_err(|e| anyhow!("{origin}: [[input]] entry {}: {e}", i + 1))?;
+        let Some(name) = t.name.clone() else {
+            bail!(
+                "{origin}: [[input]] entry {} has no name -- with more than one [[input]], give \
+                 each one a name, for example name = \"20m\"",
+                i + 1
+            );
+        };
+        check_input_name(&name).map_err(|e| anyhow!("{origin}: {e}"))?;
+        let quoted = crate::fmt::quoted(&name);
+        if inputs.iter().any(|n| n.name == name) {
+            bail!("{origin}: [[input]] name {quoted} is used twice");
+        }
+        if t.kind.is_none() {
+            bail!(
+                "{origin}: [[input]] {quoted} has no type -- with more than one [[input]], each \
+                 one names its receiver type"
+            );
+        }
+        let input = validate_input(t, resolve_path)
+            .map_err(|e| anyhow!("{origin}: [[input]] {quoted}: {e}"))?;
+        inputs.push(NamedInput { name, input });
+    }
+    check_input_entries(&inputs, origin)?;
+    Ok(inputs)
+}
+
+/// MAN-13: the rules that relate several `[[input]]` entries.
+fn check_input_entries(inputs: &[NamedInput], origin: &str) -> Result<()> {
+    let is_file = |n: &NamedInput| matches!(n.input.source, Some(SourceFromFile::File { .. }));
+    if let (Some(file), Some(live)) = (
+        inputs.iter().find(|n| is_file(n)),
+        inputs.iter().find(|n| !is_file(n)),
+    ) {
+        bail!(
+            "{origin}: [[input]] mixes file replay ({}) with a live receiver ({}); one \
+             daemon runs either recordings or receivers",
+            crate::fmt::quoted(&file.name),
+            crate::fmt::quoted(&live.name)
+        );
+    }
+    let mut first_file: Option<(bool, bool)> = None;
+    for (i, n) in inputs.iter().enumerate() {
+        let name = crate::fmt::quoted(&n.name);
+        if i > 0 && n.input.shared.replay_epoch.is_some() {
+            bail!(
+                "{origin}: [[input]] {name}: replay_epoch belongs on the first [[input]] \
+                 entry; every replayed input starts at that instant"
+            );
+        }
+        match &n.input.source {
+            Some(SourceFromFile::File {
+                realtime, looped, ..
+            }) => match first_file {
+                None => first_file = Some((*realtime, *looped)),
+                Some(first) if first != (*realtime, *looped) => bail!(
+                    "{origin}: [[input]] {name}: realtime and loop must match the first file \
+                     input's"
+                ),
+                Some(_) => {}
+            },
+            Some(SourceFromFile::Hpsdr { host, port, .. }) => {
+                let earlier = inputs[..i].iter().find(|o| {
+                    matches!(&o.input.source, Some(SourceFromFile::Hpsdr { host: h, port: p, .. })
+                        if h.eq_ignore_ascii_case(host) && p == port)
+                });
+                if let Some(earlier) = earlier {
+                    bail!(
+                        "{origin}: [[input]] {name}: the HPSDR radio at {host}:{port} is \
+                         already input {}; several receivers on one HPSDR radio are not \
+                         supported yet",
+                        crate::fmt::quoted(&earlier.name)
+                    );
+                }
+            }
+            Some(SourceFromFile::Audio { .. }) if n.input.shared.center_freq_hz.is_none() => {
+                bail!(
+                    "{origin}: [[input]] {name}: type = \"audio\" needs center_freq_hz when \
+                     there is more than one input, so its frequencies can be compared with the \
+                     other inputs'"
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn validate_input(
     t: InputToml,
     resolve_path: &dyn Fn(PathBuf) -> PathBuf,
@@ -862,6 +1037,16 @@ fn apply_env_overlay(doc: &mut toml::Table, vars: &[(OsString, OsString)]) -> Re
         }
     }
 
+    // MAN-13: one variable cannot say which of several receivers it sets.
+    if let Some(toml::Value::Array(inputs)) = doc.get("input") {
+        if let Some((name, _, key, _)) = entries.iter().find(|(_, table, _, _)| *table == "input") {
+            bail!(
+                "{name} cannot say which of the {} [[input]] entries it sets; set {key} in \
+                 that entry instead",
+                inputs.len()
+            );
+        }
+    }
     let mut overlay = EnvOverlay::default();
     for (name, table, key, raw) in entries {
         let string_typed = STRING_TYPED_ENV_KEYS.contains(&(table, key.as_str()));
@@ -1038,13 +1223,232 @@ mod tests {
         );
     }
 
+    // ---- MAN-13: [[input]] ----
+
+    const KA9Q_40: &str =
+        "[[input]]\nname = \"40m\"\ntype = \"ka9q\"\ngroup = \"239.1.2.3\"\nssrc = 7030000\n";
+    const KA9Q_20: &str = "[[input]]\nname = \"20m\"\ntype = \"ka9q\"\ngroup = \"239.1.2.3\"\nssrc = 14030000\nfreq_correction_ppm = 0.8\n";
+
+    fn file_entry(name: &str, extra: &str) -> String {
+        format!("[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = \"/x/{name}.wav\"\n{extra}")
+    }
+
     #[test]
-    fn array_of_input_tables_is_rejected() {
-        let err = err_of("[[input]]\ntype = \"audio\"\n");
+    fn array_of_input_tables_loads_each_entry_in_order() {
+        let l = load_file(&format!("{KA9Q_40}{KA9Q_20}")).unwrap();
+        let names: Vec<&str> = l.inputs.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["40m", "20m"]);
+        assert_eq!(l.input, l.inputs[0].input);
+        let Some(SourceFromFile::Ka9q { ssrc, .. }) = &l.inputs[1].input.source else {
+            panic!("{:?}", l.inputs[1]);
+        };
+        assert_eq!(*ssrc, Some(14_030_000));
+        assert_eq!(l.inputs[1].input.shared.freq_correction_ppm, Some(0.8));
+        assert_eq!(l.inputs[0].input.shared.freq_correction_ppm, None);
+    }
+
+    #[test]
+    fn one_entry_input_array_is_the_single_form() {
+        let array = load_file("[[input]]\ntype = \"audio\"\n").unwrap();
+        let table = load_file("[input]\ntype = \"audio\"\n").unwrap();
+        assert_eq!(array.input, table.input);
+        assert_eq!(array.inputs, table.inputs);
+        assert_eq!(array.inputs[0].name, "audio");
+    }
+
+    #[test]
+    fn input_names_are_required_with_two_or_more_entries() {
+        let err = err_of(&format!(
+            "{KA9Q_40}[[input]]\ntype = \"kiwi\"\nhost = \"k\"\nfreq_hz = 14030000.0\n"
+        ));
         assert!(
-            err.contains("[[input]] (multiple sources) is not supported yet"),
+            err.ends_with(
+                ": [[input]] entry 2 has no name -- with more than one [[input]], give each one a \
+                 name, for example name = \"20m\""
+            ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn input_names_must_be_unique() {
+        let err = err_of(&format!("{KA9Q_20}{KA9Q_20}"));
+        assert!(
+            err.ends_with(": [[input]] name \"20m\" is used twice"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn input_name_charset_and_length() {
+        let want = "may use only letters, digits, '.', '_' and '-', start with a letter or digit, \
+                    and be at most 32 characters";
+        for bad in ["a b", "-x", "", &"x".repeat(33)] {
+            let err = err_of(&format!("{KA9Q_40}{}", file_entry(bad, "")));
+            assert!(
+                err.contains(&format!("[[input]] name {bad:?} {want}")),
+                "{err}"
+            );
+        }
+        let err = err_of("[input]\nname = \"a b\"\ntype = \"audio\"\n");
+        assert!(err.contains(want), "{err}");
+        for good in ["20m", "rsp.1", "kiwi_a-2", &"x".repeat(32)] {
+            assert!(load_file(&format!("{}{}", file_entry("a", ""), file_entry(good, ""))).is_ok());
+        }
+    }
+
+    #[test]
+    fn more_than_sixteen_inputs_are_refused() {
+        let body: String = (0..17).map(|i| file_entry(&format!("in{i}"), "")).collect();
+        let err = err_of(&body);
+        assert!(
+            err.ends_with(": at most 16 [[input]] entries are supported, found 17"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn every_entry_needs_a_type_with_two_or_more() {
+        let err = err_of(&format!("{KA9Q_40}[[input]]\nname = \"20m\"\n"));
+        assert!(
+            err.ends_with(
+                ": [[input]] \"20m\" has no type -- with more than one [[input]], each one names \
+                 its receiver type"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn file_and_live_inputs_cannot_mix() {
+        let err = err_of(&format!("{}{KA9Q_20}", file_entry("a", "")));
+        assert!(
+            err.ends_with(
+                ": [[input]] mixes file replay (\"a\") with a live receiver (\"20m\"); one daemon \
+                 runs either recordings or receivers"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn replay_epoch_belongs_on_the_first_entry() {
+        let first = file_entry("a", "replay_epoch = 1700000000\n");
+        assert!(load_file(&format!("{first}{}", file_entry("b", ""))).is_ok());
+        let err = err_of(&format!(
+            "{}{}",
+            file_entry("a", ""),
+            file_entry("b", "replay_epoch = 1700000000\n")
+        ));
+        assert!(
+            err.ends_with(
+                ": [[input]] \"b\": replay_epoch belongs on the first [[input]] entry; every \
+                 replayed input starts at that instant"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn file_inputs_must_agree_on_realtime_and_loop() {
+        let err = err_of(&format!(
+            "{}{}",
+            file_entry("a", "realtime = true\n"),
+            file_entry("b", "")
+        ));
+        assert!(
+            err.ends_with(": [[input]] \"b\": realtime and loop must match the first file input's"),
+            "{err}"
+        );
+        assert!(load_file(&format!(
+            "{}{}",
+            file_entry("a", "loop = true\n"),
+            file_entry("b", "loop = true\n")
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn one_hpsdr_radio_is_at_most_one_input() {
+        let hpsdr = |name: &str, host: &str| {
+            format!(
+                "[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nhost = \"{host}\"\nrate_hz = 192000.0\nfreq_hz = \
+                 14030000.0\n"
+            )
+        };
+        let err = err_of(&format!(
+            "{}{}",
+            hpsdr("a", "192.168.1.40"),
+            hpsdr("b", "192.168.1.40")
+        ));
+        assert!(
+            err.contains(
+                ": [[input]] \"b\": the HPSDR radio at 192.168.1.40:1024 is already input \"a\"; \
+                 several receivers on one HPSDR radio are not supported yet"
+            ),
+            "{err}"
+        );
+        assert!(load_file(&format!(
+            "{}{}",
+            hpsdr("a", "192.168.1.40"),
+            hpsdr("b", "192.168.1.41")
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn audio_input_needs_center_freq_hz_with_two_or_more() {
+        let err = err_of(&format!(
+            "{KA9Q_40}[[input]]\nname = \"b\"\ntype = \"audio\"\n"
+        ));
+        assert!(
+            err.ends_with(
+                ": [[input]] \"b\": type = \"audio\" needs center_freq_hz when there is more than \
+                 one input, so its frequencies can be compared with the other inputs'"
+            ),
+            "{err}"
+        );
+        assert!(load_file(&format!(
+            "{KA9Q_40}[[input]]\nname = \"b\"\ntype = \"audio\"\ncenter_freq_hz = 7030000.0\n"
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn manta_input_env_is_refused_with_two_or_more_inputs() {
+        let f = write_cfg(&format!(
+            "{KA9Q_40}{KA9Q_20}{}",
+            KA9Q_20.replace("20m", "15m")
+        ));
+        let v = vars(&[("MANTA_INPUT_FREQ_CORRECTION_PPM", "1.5")]);
+        let err = format!("{:#}", load(Some(f.path()), Env::Read(&v)).unwrap_err());
+        assert_eq!(
+            err,
+            "MANTA_INPUT_FREQ_CORRECTION_PPM cannot say which of the 3 [[input]] entries it \
+             sets; set freq_correction_ppm in that entry instead"
+        );
+    }
+
+    #[test]
+    fn name_is_accepted_on_a_single_input_table() {
+        let l = load_file("[input]\nname = \"rsp\"\ntype = \"audio\"\n").unwrap();
+        assert_eq!(l.inputs.len(), 1);
+        assert_eq!(l.inputs[0].name, "rsp");
+        let untyped = load_file("[input]\nfreq_correction_ppm = 1.0\n").unwrap();
+        assert_eq!(untyped.inputs[0].name, "audio");
+        let typed =
+            load_file(&file_entry("x", "").replace("[[input]]\nname = \"x\"\n", "[input]\n"))
+                .unwrap();
+        assert_eq!(typed.inputs[0].name, "file");
+    }
+
+    #[test]
+    fn per_entry_keys_are_validated_with_the_entrys_name_in_the_error() {
+        let err = err_of(&format!(
+            "{KA9Q_40}[[input]]\nname = \"b\"\ntype = \"kiwi\"\nhost = \"k\"\nfreq_hz = \
+             14030000.0\nssrc = 5\n"
+        ));
+        assert!(err.contains(": [[input]] \"b\": input.ssrc"), "{err}");
     }
 
     #[test]
