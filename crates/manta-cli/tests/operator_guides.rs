@@ -10,6 +10,7 @@ const GUIDES: &[&str] = &[
     "docs/GUIDES/rbn-node.md",
     "docs/GUIDES/kiwisdr.md",
     "docs/GUIDES/raspberry-pi.md",
+    "docs/GUIDES/ka9q-radio.md",
 ];
 
 fn repo_root() -> PathBuf {
@@ -111,6 +112,7 @@ fn replace_placeholders(value: &mut toml::Value) -> usize {
                 "<collector-host>" => "collector.example.net",
                 "<receiver-password>" => "secret",
                 "<your-hpsdr-host>" => "192.0.2.10",
+                "<your-radiod-data-group>" => "239.192.0.1",
                 other => panic!("add a fixed test value for {other}"),
             }
             .into();
@@ -375,6 +377,21 @@ fn pi_guide_stays_within_d6() {
             text.contains(&format!("/{target}")),
             "Pi guide must link {target}"
         );
+    }
+}
+
+/// MAN-140: the ka9q-radio guide gives radiod's TTL and AGC settings, the
+/// Linux receive-buffer limit and Docker's host networking.
+#[test]
+fn ka9q_guide_states_ttl_rmem_and_host_networking() {
+    let text = doc(GUIDES[3]);
+    for phrase in [
+        "ttl = 1",
+        "net.core.rmem_max",
+        "network_mode: host",
+        "agc = off",
+    ] {
+        assert!(text.contains(phrase), "ka9q-radio guide omits {phrase}");
     }
 }
 

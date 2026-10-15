@@ -9,7 +9,11 @@ pub use listen::{
     RttyObserver,
 };
 pub mod latency;
+pub mod live;
 pub use latency::{DecodeLatencyObserver, DecodeLatencySnapshot, DECODE_LATENCY_BUCKETS_SECONDS};
+pub use live::{
+    BandSample, LiveRecord, LiveStateSink, TrackSnapshot, LIVE_MAX_CANDIDATES, LIVE_TEXT_CHARS,
+};
 pub mod quality;
 pub use quality::{DecodeQualityObserver, DecodeQualitySnapshot, RAIL_RATIO_BUCKETS};
 pub mod calibrate;
@@ -17,6 +21,7 @@ pub use calibrate::{calibrate, CalibrateOptions, CalibrationReport};
 pub mod doctor;
 pub use doctor::{doctor, DoctorReport, Verdict, MAX_DURATION, MIN_DURATION};
 pub mod soak;
+pub use manta_spot::reference::ReferenceLists;
 pub use manta_spot::{Blocklist, NotchList, Spot, SpotType};
 pub use soak::{soak, soak_passed, SoakReport};
 pub mod soak_metrics;
@@ -28,11 +33,12 @@ pub use soak_metrics::{
 mod static_crash_tests;
 mod track;
 pub use manta_dsp::crash::CRASH_MIN_LIVE_CHANNELS;
-pub use track::{crash_live_channels, CrashFilter, DetectorConfig};
+pub use track::{crash_live_channels, ChannelLevel, CrashFilter, DetectorConfig};
 
 use anyhow::{bail, Context, Result};
 use manta_decode::decoder::{events_to_text, DecodeConfig};
 use manta_decode::events::DecoderEvent;
+use manta_decode::timing::TimingEstimates;
 use manta_input::{read_all, IqSource, WavIqSource};
 use num_complex::Complex32;
 use std::path::Path;
@@ -75,6 +81,15 @@ pub(crate) fn calibrate_freq_events(ev: &DecoderEvent, factor: f64) -> DecoderEv
     }
 }
 
+/// The last `TimingUpdate` in `track_events` (one track's events): the
+/// sender timing `DecodeReport::timing` reports (MAN-315).
+fn last_timing(track_events: &[DecoderEvent]) -> Option<TimingEstimates> {
+    track_events.iter().rev().find_map(|e| match e {
+        DecoderEvent::TimingUpdate { timing, .. } => Some(timing.clone()),
+        _ => None,
+    })
+}
+
 /// `decode_samples`'s single-track selection: the lowest track_id among
 /// events that represent real decoder output. `TrackPromoted` is a
 /// detector-internal diagnostic signal (added for `manta_engine::doctor()`'s
@@ -83,13 +98,21 @@ pub(crate) fn calibrate_freq_events(ev: &DecoderEvent, factor: f64) -> DecoderEv
 /// early, low-track-id candidate that was promoted and then merged/
 /// evicted/reached EOF before producing any real decoder event never gets
 /// selected over a later track that actually decoded something (round-5
-/// review finding). `None` means every event in `events` was a
-/// `TrackPromoted` (or `events` was empty, already handled by the caller
-/// before this is reached).
+/// review finding). `TrackClosed` is bookkeeping, not decoder output,
+/// and is excluded too (MAN-174): a merge survivor that never decoded
+/// still gets its own `TrackClosed`, and must not become the reported
+/// track on that alone. `None` means every event in `events` was a
+/// `TrackPromoted` or `TrackClosed` (or `events` was empty, already
+/// handled by the caller before this is reached).
 fn primary_track_id(events: &[DecoderEvent]) -> Option<u32> {
     events
         .iter()
-        .filter(|e| !matches!(e, DecoderEvent::TrackPromoted { .. }))
+        .filter(|e| {
+            !matches!(
+                e,
+                DecoderEvent::TrackPromoted { .. } | DecoderEvent::TrackClosed { .. }
+            )
+        })
         .map(track::event_track_id)
         .min()
 }
@@ -123,6 +146,10 @@ pub struct PipelineConfig {
     pub cty: Option<Arc<manta_spot::cty::Table>>,
     /// Operator-supplied MASTER.SCP, parsed once. None uses the bundled set.
     pub scp: Option<Arc<manta_spot::scp::Set>>,
+    /// Operator-supplied callsign-pattern table. None uses the bundled list.
+    pub patterns: Option<Arc<manta_spot::pattern::Table>>,
+    /// Repetition thresholds by callsign-pattern rarity.
+    pub validation_level: manta_spot::ValidationLevel,
 }
 
 impl PipelineConfig {
@@ -138,6 +165,12 @@ impl PipelineConfig {
             .clone()
             .unwrap_or_else(|| Arc::new(manta_spot::scp::Set::bundled()))
     }
+    /// The resolved callsign-pattern table.
+    pub fn pattern_table(&self) -> Arc<manta_spot::pattern::Table> {
+        self.patterns
+            .clone()
+            .unwrap_or_else(|| Arc::new(manta_spot::pattern::Table::bundled()))
+    }
     /// Builds the validator used by every production decode path.
     pub fn validator(&self, fs: f64) -> Result<manta_spot::Validator> {
         // Keep the checked ppm constructor so callers cannot supply an
@@ -147,7 +180,9 @@ impl PipelineConfig {
                 .with_freq_correction_ppm(self.freq_correction_ppm)
                 .map_err(|e| anyhow::anyhow!(e))?
                 .with_blocklist(self.blocklist.clone())
-                .with_notch(self.notch.clone());
+                .with_notch(self.notch.clone())
+                .with_patterns(self.pattern_table())
+                .with_validation_level(self.validation_level);
         for call in &self.allowlist {
             validator.allowlist(call);
         }
@@ -166,6 +201,8 @@ impl Default for PipelineConfig {
             notch: NotchList::default(),
             cty: None,
             scp: None,
+            patterns: None,
+            validation_level: manta_spot::ValidationLevel::default(),
         }
     }
 }
@@ -185,6 +222,9 @@ pub struct DecodeReport {
     /// Validated spots (`manta-spot::Validator`, ARCHITECTURE §6), run
     /// over the full multi-track event stream above.
     pub spots: Vec<Spot>,
+    /// The primary track's last `TimingUpdate` (its learned dot, dash and
+    /// gap timing), or `None` when it emitted none (MAN-315).
+    pub timing: Option<TimingEstimates>,
     /// MAN-314: every RTTY signal the detector marked (SPEC §2.6); empty
     /// for input without RTTY or with `rtty_filter` off.
     pub rtty: Vec<RttySignalReport>,
@@ -341,6 +381,7 @@ pub fn decode_samples(
         _ => None,
     });
     let text = events_to_text(&this_track);
+    let timing = last_timing(&this_track);
     let mut validator = cfg.validator(fs)?;
     let mut spots = Vec::new();
     for ev in &events {
@@ -368,6 +409,7 @@ pub fn decode_samples(
         text,
         events,
         spots,
+        timing,
         rtty,
         sample_rate_hz: fs,
     })
@@ -426,6 +468,9 @@ mod tests {
         assert!(!calls(&PipelineConfig::default()).contains(&"QQ9ZZZ".to_string()));
         let cfg = PipelineConfig {
             cty: Some(cty_with_qq9()),
+            patterns: Some(Arc::new(
+                manta_spot::pattern::Table::parse("+QQ9@@@\n").unwrap(),
+            )),
             ..Default::default()
         };
         assert!(
@@ -496,6 +541,60 @@ mod tests {
             },
         ];
         assert_eq!(primary_track_id(&events), Some(2));
+    }
+
+    /// MAN-174: a merge survivor that never decoded still gets its own
+    /// `TrackClosed`. That bookkeeping event must not make it the
+    /// reported track over a higher-id track with real decoder output.
+    #[test]
+    fn primary_track_id_ignores_track_closed() {
+        let events = vec![
+            DecoderEvent::TrackClosed {
+                track_id: 2,
+                closure: manta_decode::events::ClosureKind::SignalEnded,
+            },
+            DecoderEvent::word_boundary(5, 10),
+        ];
+        assert_eq!(primary_track_id(&events), Some(5));
+    }
+
+    /// MAN-315: `DecodeReport::timing` is the primary track's last
+    /// `TimingUpdate`, never another track's.
+    #[test]
+    fn decode_report_timing_is_primary_tracks_last() {
+        use manta_decode::timing::ClassEstimate;
+        let update = |track_id, sample_ts, dash: f32| DecoderEvent::TimingUpdate {
+            track_id,
+            sample_ts,
+            timing: TimingEstimates {
+                dit_ms: 48.0,
+                dot: None,
+                dash: Some(ClassEstimate {
+                    mean_dits: dash,
+                    var_dits2: 0.0,
+                    n: 1,
+                }),
+                element_gap: None,
+                char_gap: None,
+                word_gap: None,
+            },
+        };
+        let events = vec![
+            update(2, 10, 3.0),
+            update(3, 11, 2.6),
+            update(2, 20, 4.0),
+            update(3, 21, 2.7),
+        ];
+        let primary = primary_track_id(&events).unwrap();
+        assert_eq!(primary, 2);
+        let this_track: Vec<DecoderEvent> = events
+            .iter()
+            .filter(|e| track::event_track_id(e) == primary)
+            .cloned()
+            .collect();
+        let t = last_timing(&this_track).unwrap();
+        assert_eq!(t.dash.unwrap().mean_dits, 4.0);
+        assert_eq!(last_timing(&[]), None);
     }
 
     #[test]

@@ -62,6 +62,15 @@
 #json_port = 7301                    # JSON Lines and WebSocket spot stream
 #metrics_port = 7302                 # Prometheus metrics, GET /metrics
 
+# Live-state stream for dashboards: band noise floor and activity,
+# each track's decoded text and candidates, and why each candidate was or
+# was not spotted. Off unless live_port is set. No password, and it carries
+# every track's decoded text, so the default address accepts connections
+# from this machine only; set "0.0.0.0" for a dashboard on another machine
+# and firewall live_port to it.
+#live_port = 7303                    # live-state stream (JSON Lines/WebSocket)
+#live_bind_addr = "127.0.0.1"        # live-state listener address
+
 # Telnet spot-line layout: "rbn" (the Reverse Beacon Network's layout,
 # which most loggers read) or "skimmer" (CW Skimmer's own layout, for
 # running behind an Aggregator).
@@ -141,7 +150,7 @@
 
 [input]
 
-# Receiver type: "audio", "file", "kiwi", "soapy" or "hpsdr". No default.
+# Receiver type: "audio", "file", "kiwi", "soapy", "hpsdr" or "ka9q". No default.
 # Each type reads only its own settings below; "required" ones must be set.
 #type = "kiwi"
 
@@ -157,7 +166,7 @@
 # type = "kiwi", a KiwiSDR web receiver, and type = "hpsdr", an
 # HPSDR/Hermes radio (hpsdr needs a manta built with hpsdr support):
 #host = "<your-receiver-host>"       # required for kiwi and hpsdr
-#port = 8073                         # default 8073 for kiwi, 1024 for hpsdr
+#port = 8073                         # default 8073 for kiwi, 1024 for hpsdr, 5004 for ka9q
 #password = ""                       # kiwi only; leave empty for public receivers
 
 # type = "soapy", a SoapySDR device (needs a manta built with soapy support):
@@ -167,6 +176,12 @@
 # Shared by kiwi, soapy and hpsdr:
 #freq_hz = 7030000.0                 # required: the receiver's centre frequency, Hz
 #rate_hz = 192000.0                  # required for soapy and hpsdr: sample rate, Hz
+
+# type = "ka9q", a ka9q-radio (radiod) IQ channel over multicast. It reads
+# the channel's rate and frequency from radiod; port above is its RTP data port:
+#group = "239.101.6.1"               # required: the channel's data group, an IPv4 multicast address or the name in radiod's `data =` line
+#ssrc = 14100000                     # no default: the channel to read, needed only when the group carries more than one
+#interface = "192.168.1.20"          # no default: local IPv4 address to join on (the kernel's choice, plus 127.0.0.1)
 
 # The settings below apply to any receiver type, or none.
 
@@ -215,6 +230,53 @@
 # https://www.supercheckpartial.com/MASTER.SCP. Relative to this file's
 # directory. Unset: the built-in copy. --scp overrides it.
 #scp_path = "MASTER.SCP"
+
+# Download current copies of cty.dat and MASTER.SCP while `manta run`
+# runs from a live receiver: cty.dat every 7 days, MASTER.SCP every day.
+# A download is used only if it parses and looks complete; a failed one is
+# logged, counted in manta_list_refresh_total and retried in an hour, and
+# the copy already in use stays. File replay never downloads. Downloads are
+# plain HTTP (port 80) from the two URLs below. Not used for a list that
+# cty_path/scp_path or cty_sha256/scp_sha256 sets.
+#refresh_lists = false
+
+# Directory for downloaded lists, so a restart starts from the last good
+# download instead of the built-in copy. Relative to this file's
+# directory. Unset: downloads are kept in memory only.
+#list_cache_dir = "/var/cache/manta"
+
+# Where to download cty.dat. Only http:// URLs: manta has no TLS
+# support. Point it at a local mirror to share one download.
+#cty_url = "http://www.country-files.com/cty/cty.dat"
+
+# Where to download MASTER.SCP, under the same rules as cty_url.
+#scp_url = "http://www.supercheckpartial.com/MASTER.SCP"
+
+# Use exactly this version of cty.dat, by the SHA-256 of its bytes (64 hex
+# digits, as printed in manta's `lists:` log line). If cty_path is set,
+# that file must match and nothing else is tried; otherwise manta looks in
+# the built-in copy, then list_cache_dir. It refuses to start if no copy
+# matches. A pinned list is never refreshed. --cty-sha256 overrides it.
+#cty_sha256 = "e9ff91a3c3ab28c5f7dbcffb4280944a84645ed53d41cb4c68a41f132ee13fd1"
+
+# Use exactly this version of MASTER.SCP, looked up like cty_sha256 (a set
+# scp_path must match; otherwise the built-in copy, then list_cache_dir).
+# --scp-sha256 overrides it.
+#scp_sha256 = "00692208fa86b1498dcd6fc0f88e14d2a1a0462ba5d481855da5de69be4e3cf0"
+
+# How many times a call must repeat before it is spotted, by how common its
+# callsign pattern is (the call's first 2-4 characters, then @ for each
+# letter and # for each digit, so K5ARH is K5@@@). "normal": 2 for a common
+# pattern, 3 for a rare one, 5 for one not in the pattern list. "minimal":
+# 2 for every call (manta before 0.2). Allowlisted calls and beacons are
+# exempt either way. Changes need a restart.
+#validation_level = "normal"
+
+# Callsign-pattern list used in place of the copy built into manta (derived
+# from MASTER.SCP). One pattern per line, a leading + marks a common one, `#`
+# starts a comment: "+K5@@@". Relative to this file's directory. Unset: the
+# built-in copy. --patterns overrides it. Changes need a restart.
+#pattern_path = "patterns.lst"
 
 
 # --- Signal detection --------------------------------------------------------

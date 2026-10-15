@@ -1,13 +1,17 @@
 //! Helpers shared by the tests that drive a real `manta` process and its
-//! signals (`signal_shutdown.rs`, MAN-85; `config_reload.rs`, MAN-78).
+//! signals (`signal_shutdown.rs`, MAN-85; `config_reload.rs`, MAN-78), and
+//! a fake KiwiSDR for live-source daemons (`config_reload.rs`;
+//! `list_refresh.rs`, MAN-316).
 // Each test binary compiles this module separately and uses only part of it.
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader, Read};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Replay seconds in the fixture. Only has to outlast the test window --
@@ -119,4 +123,108 @@ pub fn expect_line(rx: &Receiver<String>, needles: &[&str], timeout: Duration) -
             ),
         }
     }
+}
+
+/// How long the fake KiwiSDR waits for manta to connect.
+const KIWI_ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Kills and reaps the daemon on drop, so a failed assertion never leaves it
+/// reconnecting to a fake KiwiSDR that has gone away.
+pub struct KillOnDrop(pub Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Plays a KiwiSDR just far enough for `KiwiIqSource::connect`
+/// (crates/manta-input/src/kiwi.rs) to return, then sends only pings, every
+/// 200 ms, until `done` or the client hangs up. No SND frame ever arrives, so
+/// the daemon's decode thread waits in the socket `recv`, and each ping
+/// resets the source's stall bound.
+pub fn fake_kiwi(listener: TcpListener, done: Arc<AtomicBool>) -> Result<(), String> {
+    serve_fake_kiwi(listener, done, false)
+}
+
+/// MAN-316: [`fake_kiwi`], but streaming real-time `SND` frames of quiet
+/// noise instead of pings, so the daemon finishes its startup calibration,
+/// logs `ready: decoding` and keeps its decode loop (and `/healthz`) live.
+pub fn fake_kiwi_streaming(listener: TcpListener, done: Arc<AtomicBool>) -> Result<(), String> {
+    serve_fake_kiwi(listener, done, true)
+}
+
+fn serve_fake_kiwi(
+    listener: TcpListener,
+    done: Arc<AtomicBool>,
+    stream_iq: bool,
+) -> Result<(), String> {
+    use tungstenite::Message;
+
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + KIWI_ACCEPT_TIMEOUT;
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if done.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                    return Err("manta never connected to the fake KiwiSDR".into());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(format!("accept: {e}")),
+        }
+    };
+    // BSD/macOS sockets inherit the listener's non-blocking mode.
+    stream.set_nonblocking(false).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
+    let mut ws = tungstenite::accept(stream).map_err(|e| format!("WebSocket handshake: {e}"))?;
+    ws.read().map_err(|e| format!("reading SET auth: {e}"))?;
+    // 12000 Hz / 93.75 Hz per channel = 128 channels: a valid rate.
+    ws.send(Message::binary(b"MSG sample_rate=12000.000".to_vec()))
+        .map_err(|e| format!("sending sample_rate: {e}"))?;
+    if !stream_iq {
+        while !done.load(Ordering::Relaxed) {
+            if ws.send(Message::Ping(Default::default())).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        return Ok(());
+    }
+    // KiwiSDR's native frame: 512 complex pairs, i.e. 1/23.4375 s at
+    // 12000 Hz. Layout per kiwi.rs's module docs: flags (big-endian
+    // samples), little-endian seq, S-meter, 10-byte GPS block, then I,Q.
+    const PAIRS: usize = 512;
+    let frame_period = Duration::from_secs_f64(PAIRS as f64 / 12_000.0);
+    let mut rng: u32 = 0x1234_5678;
+    let mut seq: u32 = 0;
+    let start = Instant::now();
+    while !done.load(Ordering::Relaxed) {
+        let mut frame = Vec::with_capacity(3 + 17 + PAIRS * 4);
+        frame.extend_from_slice(b"SND");
+        frame.push(0x08);
+        frame.extend_from_slice(&seq.to_le_bytes());
+        frame.extend_from_slice(&[0u8; 2 + 10]);
+        for _ in 0..PAIRS * 2 {
+            // A deterministic LCG: low-level noise, never digital silence.
+            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let sample = ((rng >> 16) as i16) / 64;
+            frame.extend_from_slice(&sample.to_be_bytes());
+        }
+        if ws.send(Message::binary(frame)).is_err() {
+            break;
+        }
+        seq = seq.wrapping_add(1);
+        // Real-time pacing against the start, so sleep jitter never
+        // accumulates into a stall.
+        let due = start + frame_period * seq;
+        if let Some(wait) = due.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+    }
+    Ok(())
 }

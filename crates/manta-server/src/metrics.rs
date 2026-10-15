@@ -180,7 +180,84 @@ pub(crate) fn escape_label_value(v: &str) -> String {
         .replace('\n', "\\n")
 }
 
-fn spot_type_metric_label(t: SpotType) -> &'static str {
+/// MAN-316: where the reference list in use came from -- the `origin`
+/// label of `manta_list_info`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListOrigin {
+    /// The copy compiled into manta.
+    Bundled,
+    /// `cty_path`/`scp_path` (or `--cty`/`--scp`).
+    File,
+    /// `[spot].list_cache_dir`'s last good download, read at startup.
+    Cache,
+    /// Downloaded by this run's refresher.
+    Download,
+}
+
+impl ListOrigin {
+    pub fn label(self) -> &'static str {
+        match self {
+            ListOrigin::Bundled => "bundled",
+            ListOrigin::File => "file",
+            ListOrigin::Cache => "cache",
+            ListOrigin::Download => "download",
+        }
+    }
+}
+
+/// MAN-316: one reference-list download attempt's result -- the `outcome`
+/// label of `manta_list_refresh_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListRefreshOutcome {
+    /// A new version passed the checks and is in use.
+    Updated,
+    /// 304 Not Modified, or the same bytes as the copy in use.
+    Unchanged,
+    /// A network or HTTP error, or a download the checks rejected.
+    Failed,
+}
+
+impl ListRefreshOutcome {
+    /// Render order of `manta_list_refresh_total`'s outcomes.
+    const ALL: [ListRefreshOutcome; 3] = [
+        ListRefreshOutcome::Updated,
+        ListRefreshOutcome::Unchanged,
+        ListRefreshOutcome::Failed,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ListRefreshOutcome::Updated => "updated",
+            ListRefreshOutcome::Unchanged => "unchanged",
+            ListRefreshOutcome::Failed => "failed",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            ListRefreshOutcome::Updated => 0,
+            ListRefreshOutcome::Unchanged => 1,
+            ListRefreshOutcome::Failed => 2,
+        }
+    }
+}
+
+/// MAN-316: one reference list's series across the three `manta_list_*`
+/// families. Each field is `None` until its setter first runs, so a list
+/// the refresher does not manage publishes no refresh series rather than
+/// a permanently-zero one.
+#[derive(Debug, Default)]
+struct ListMetrics {
+    /// `(sha256, origin)` of the copy in use, for `manta_list_info`.
+    in_use: Option<(String, ListOrigin)>,
+    /// `manta_list_refresh_total`, indexed by `ListRefreshOutcome::index`;
+    /// `Some` once `enable_list_refresh` (or a first attempt) ran.
+    refresh_totals: Option<[u64; 3]>,
+    /// `manta_list_last_success_timestamp_seconds`.
+    last_success: Option<SystemTime>,
+}
+
+pub(crate) fn spot_type_metric_label(t: SpotType) -> &'static str {
     match t {
         SpotType::Cq => "cq",
         SpotType::De => "de",
@@ -553,6 +630,10 @@ pub struct Metrics {
     /// Sources with no wire-packet loss model never call `set_input_health`,
     /// so they publish no series rather than a permanently-zero one.
     input_health: RwLock<BTreeMap<String, InputHealth>>,
+    /// MAN-316: per reference list (`cty`, `scp`), fed by `manta-cli`'s
+    /// startup resolution and list refresher. Ordered so `/metrics`
+    /// renders the lists in a stable order.
+    lists: Mutex<BTreeMap<&'static str, ListMetrics>>,
     /// MAN-128: one handle per configured `[[rbn_uplink]]` target,
     /// registered in config order before `uplink::serve` is spawned for it
     /// (so a never-connected or disabled target still renders). The seven
@@ -578,6 +659,132 @@ pub struct Metrics {
     /// MAN-301: set once by `enable_rbn_compare`; `None` renders no
     /// `manta_rbn_compare_*` family at all.
     rbn_compare: OnceLock<RbnCompareMetrics>,
+    /// MAN-324: set once by `enable_live`; `None` renders no
+    /// `manta_live_*` family at all.
+    live: OnceLock<LiveMetrics>,
+}
+
+/// MAN-324: the live-state stream's families, kept apart from the spot
+/// families so `manta_spots_dropped_*` still counts only spots.
+#[derive(Default)]
+struct LiveMetrics {
+    clients: AtomicI64,
+    /// Per `crate::live_state::LIVE_RECORD_KINDS` entry.
+    records: [AtomicU64; 4],
+    dropped_lagged: AtomicU64,
+    dropped_write_failed: AtomicU64,
+    dropped_shutdown: AtomicU64,
+}
+
+/// MAN-324: the live-state stream's metrics. Every method is a no-op until
+/// `enable_live` has been called.
+impl Metrics {
+    pub fn enable_live(&self) {
+        let _ = self.live.set(LiveMetrics::default());
+    }
+
+    /// One record of `kind` published to at least one subscriber.
+    pub fn record_live_published(&self, kind: &str) {
+        let Some(live) = self.live.get() else {
+            return;
+        };
+        if let Some(i) = crate::live_state::LIVE_RECORD_KINDS
+            .iter()
+            .position(|k| *k == kind)
+        {
+            live.records[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A live client fell `n` records behind and was disconnected.
+    pub fn record_live_lagged(&self, n: u64) {
+        if let Some(live) = self.live.get() {
+            live.dropped_lagged.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// A live client's write failed or timed out with `n` records unsent.
+    pub fn record_live_write_failed(&self, n: u64) {
+        if let Some(live) = self.live.get() {
+            live.dropped_write_failed.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// `n` records were still unsent to a live client at shutdown.
+    pub fn record_live_dropped_shutdown(&self, n: u64) {
+        if let Some(live) = self.live.get() {
+            live.dropped_shutdown.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    pub fn inc_live_clients(&self) {
+        if let Some(live) = self.live.get() {
+            live.clients.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn dec_live_clients(&self) {
+        if let Some(live) = self.live.get() {
+            live.clients.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Live clients connected now; 0 when the live stream is off.
+    pub fn live_clients(&self) -> i64 {
+        self.live
+            .get()
+            .map_or(0, |l| l.clients.load(Ordering::Relaxed))
+    }
+
+    /// Live records lost to disconnected clients, all reasons.
+    pub fn live_records_dropped(&self) -> u64 {
+        self.live.get().map_or(0, |l| {
+            l.dropped_lagged.load(Ordering::Relaxed)
+                + l.dropped_write_failed.load(Ordering::Relaxed)
+                + l.dropped_shutdown.load(Ordering::Relaxed)
+        })
+    }
+
+    fn render_live(&self, out: &mut String) {
+        let Some(live) = self.live.get() else {
+            return;
+        };
+        out.push_str(
+            "# HELP manta_live_clients_connected Live-state stream clients connected now, raw TCP and WebSocket together.\n",
+        );
+        out.push_str("# TYPE manta_live_clients_connected gauge\n");
+        out.push_str(&format!(
+            "manta_live_clients_connected {}\n",
+            live.clients.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP manta_live_records_total Live-state records published to at least one subscriber, by kind.\n",
+        );
+        out.push_str("# TYPE manta_live_records_total counter\n");
+        for (kind, count) in crate::live_state::LIVE_RECORD_KINDS
+            .iter()
+            .zip(&live.records)
+        {
+            out.push_str(&format!(
+                "manta_live_records_total{{kind=\"{kind}\"}} {}\n",
+                count.load(Ordering::Relaxed)
+            ));
+        }
+        out.push_str(
+            "# HELP manta_live_records_dropped_total Live-state records a disconnected client never received, by reason.\n",
+        );
+        out.push_str("# TYPE manta_live_records_dropped_total counter\n");
+        for (reason, count) in [
+            ("lagged", &live.dropped_lagged),
+            ("write_failed", &live.dropped_write_failed),
+            ("shutdown", &live.dropped_shutdown),
+        ] {
+            out.push_str(&format!(
+                "manta_live_records_dropped_total{{reason=\"{reason}\"}} {}\n",
+                count.load(Ordering::Relaxed)
+            ));
+        }
+    }
 }
 
 /// MAN-301: the trailing window `manta_rbn_compare_*_last_hour` gauges and
@@ -1147,6 +1354,54 @@ impl Metrics {
             .insert(source.to_string(), health);
     }
 
+    /// MAN-316: the reference lists' entries, tolerating a poisoned lock --
+    /// a panic elsewhere must not take `/metrics` down with it.
+    fn list_metrics(&self) -> std::sync::MutexGuard<'_, BTreeMap<&'static str, ListMetrics>> {
+        self.lists
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// MAN-316: names the copy of `list` (`"cty"` or `"scp"`) every consumer
+    /// uses now. Replaces the list's previous `manta_list_info` series, so a
+    /// scrape never shows two versions of one list in use.
+    pub fn set_list_in_use(&self, list: &'static str, sha256: &str, origin: ListOrigin) {
+        self.list_metrics().entry(list).or_default().in_use = Some((sha256.to_string(), origin));
+    }
+
+    /// MAN-316: `list` is refreshed by this run, so `manta_list_refresh_total`
+    /// publishes all three outcomes for it, starting at 0. Idempotent.
+    pub fn enable_list_refresh(&self, list: &'static str) {
+        self.list_metrics()
+            .entry(list)
+            .or_default()
+            .refresh_totals
+            .get_or_insert([0; 3]);
+    }
+
+    /// MAN-316: counts one download attempt for `list`. `Updated` and
+    /// `Unchanged` both confirm the list in use is current, so they also
+    /// move its last-success time to `at`.
+    pub fn record_list_refresh(
+        &self,
+        list: &'static str,
+        outcome: ListRefreshOutcome,
+        at: SystemTime,
+    ) {
+        let mut lists = self.list_metrics();
+        let entry = lists.entry(list).or_default();
+        entry.refresh_totals.get_or_insert([0; 3])[outcome.index()] += 1;
+        if outcome != ListRefreshOutcome::Failed {
+            entry.last_success = Some(at);
+        }
+    }
+
+    /// MAN-316: `list` was last confirmed current at `at` without an
+    /// attempt in this run -- the cache's `checked_at`, read at startup.
+    pub fn set_list_confirmed_at(&self, list: &'static str, at: SystemTime) {
+        self.list_metrics().entry(list).or_default().last_success = Some(at);
+    }
+
     // MAN-32/MAN-128: RBN uplink counters. ARCHITECTURE §8's "every
     // dropped/evicted/suppressed item is counted" invariant applies here
     // too -- a dry-run-suppressed or lag-dropped spot must be visible,
@@ -1626,6 +1881,56 @@ impl Metrics {
 
         drop(input_health);
 
+        // MAN-316: the reference lists in use and their refresh history.
+        // HELP/TYPE always render; each family has samples only for the
+        // lists whose setter has run (see `ListMetrics`).
+        let lists = self.list_metrics();
+        out.push_str(
+            "# HELP manta_list_info The reference list in use: list (cty or scp), the SHA-256 of its bytes, and its origin (bundled, file, cache or download). Always 1.\n",
+        );
+        out.push_str("# TYPE manta_list_info gauge\n");
+        for (list, m) in lists.iter() {
+            if let Some((sha256, origin)) = &m.in_use {
+                out.push_str(&format!(
+                    "manta_list_info{{list=\"{list}\",sha256=\"{}\",origin=\"{}\"}} 1\n",
+                    escape_label_value(sha256),
+                    origin.label()
+                ));
+            }
+        }
+
+        out.push_str(
+            "# HELP manta_list_refresh_total Reference-list download attempts by outcome: updated, unchanged or failed.\n",
+        );
+        out.push_str("# TYPE manta_list_refresh_total counter\n");
+        for (list, m) in lists.iter() {
+            if let Some(totals) = &m.refresh_totals {
+                for outcome in ListRefreshOutcome::ALL {
+                    out.push_str(&format!(
+                        "manta_list_refresh_total{{list=\"{list}\",outcome=\"{}\"}} {}\n",
+                        outcome.label(),
+                        totals[outcome.index()]
+                    ));
+                }
+            }
+        }
+
+        out.push_str(
+            "# HELP manta_list_last_success_timestamp_seconds Unix time the reference list in use was last confirmed current with its download URL.\n",
+        );
+        out.push_str("# TYPE manta_list_last_success_timestamp_seconds gauge\n");
+        for (list, m) in lists.iter() {
+            if let Some(at) = m.last_success {
+                let secs = at
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                out.push_str(&format!(
+                    "manta_list_last_success_timestamp_seconds{{list=\"{list}\"}} {secs}\n"
+                ));
+            }
+        }
+        drop(lists);
+
         out.push_str("# HELP manta_uplink_sent_total Spots forwarded to the RBN uplink target.\n");
         out.push_str("# TYPE manta_uplink_sent_total counter\n");
         out.push_str(&format!(
@@ -1883,7 +2188,7 @@ impl Metrics {
             push_histogram_samples(&mut out, "manta_track_rail_ratio", &q.rail_ratio);
         }
         out.push_str(
-            "# HELP manta_candidate_repetitions Message-distinct decodes of the same call near the same frequency within the trailing 90 s, for each callsign candidate the repetition gate scored. A candidate needs 2 to spot.\n",
+            "# HELP manta_candidate_repetitions Message-distinct decodes of the same call near the same frequency within the trailing 90 s, for each callsign candidate the repetition gate scored. A candidate needs 2, 3 or 5 to spot by its callsign-pattern tier (2 for every call at validation_level minimal).\n",
         );
         out.push_str("# TYPE manta_candidate_repetitions histogram\n");
         if let Some(q) = &quality {
@@ -1921,6 +2226,7 @@ impl Metrics {
         }
 
         self.render_rbn_compare_at(&mut out, Instant::now());
+        self.render_live(&mut out);
 
         out
     }
@@ -2080,6 +2386,30 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains("# TYPE manta_spots_dropped_lagged_total counter"));
         assert!(text.contains("manta_spots_dropped_lagged_total 7"));
+    }
+
+    #[test]
+    fn live_families_render_only_once_enabled_and_never_touch_spot_loss() {
+        let m = Metrics::new();
+        m.record_live_lagged(5);
+        m.inc_live_clients();
+        assert!(!m.render_prometheus_text().contains("manta_live_"));
+        m.enable_live();
+        m.inc_live_clients();
+        m.record_live_published("trackState");
+        m.record_live_published("trackState");
+        m.record_live_lagged(7);
+        m.record_live_write_failed(2);
+        m.record_live_dropped_shutdown(1);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("manta_live_clients_connected 1\n"), "{text}");
+        assert!(text.contains("manta_live_records_total{kind=\"trackState\"} 2\n"));
+        assert!(text.contains("manta_live_records_total{kind=\"bandState\"} 0\n"));
+        assert!(text.contains("manta_live_records_dropped_total{reason=\"lagged\"} 7\n"));
+        assert!(text.contains("manta_live_records_dropped_total{reason=\"write_failed\"} 2\n"));
+        assert!(text.contains("manta_live_records_dropped_total{reason=\"shutdown\"} 1\n"));
+        assert!(text.contains("manta_spots_dropped_lagged_total 0\n"));
+        assert_eq!(m.live_records_dropped(), 10);
     }
 
     #[test]
@@ -2715,6 +3045,12 @@ mod tests {
                 sum: 899.0,
             },
         }
+    }
+
+    #[test]
+    fn repetition_help_describes_pattern_tiers_and_minimal_level() {
+        let text = Metrics::new().render_prometheus_text();
+        assert!(text.contains("A candidate needs 2, 3 or 5 to spot by its callsign-pattern tier (2 for every call at validation_level minimal)."));
     }
 
     #[test]
@@ -3476,5 +3812,156 @@ mod tests {
         assert!(text.contains("# HELP manta_spots_history_truncated_total Spots dropped from the sh/dx history at its 10000-spot ceiling while still inside [server].history_minutes. Non-zero means sh/dx reaches back less than the configured window.\n"));
         assert!(text.contains("# TYPE manta_spots_history_truncated_total counter\n"));
         assert!(text.contains("manta_spots_history_truncated_total 5\n"));
+    }
+
+    // MAN-316: reference-list families.
+
+    const SHA_A: &str = "e9ff91a3c3ab28c5f7dbcffb4280944a84645ed53d41cb4c68a41f132ee13fd1";
+    const SHA_B: &str = "75aaca91f62bd010b32d3e98193e9abe2330a640d9edf9a0a58b4d628ef1aa6c";
+
+    /// The sample lines of one family, in render order.
+    fn samples<'a>(text: &'a str, family: &str) -> Vec<&'a str> {
+        text.lines()
+            .filter(|l| l.starts_with(&format!("{family}{{")))
+            .collect()
+    }
+
+    #[test]
+    fn renders_list_info_per_list() {
+        let m = Metrics::new();
+        m.set_list_in_use("scp", SHA_B, ListOrigin::Bundled);
+        m.set_list_in_use("cty", SHA_A, ListOrigin::Cache);
+        let text = m.render_prometheus_text();
+        assert_eq!(
+            samples(&text, "manta_list_info"),
+            [
+                format!(r#"manta_list_info{{list="cty",sha256="{SHA_A}",origin="cache"}} 1"#),
+                format!(r#"manta_list_info{{list="scp",sha256="{SHA_B}",origin="bundled"}} 1"#),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_info_replaces_the_series_on_swap() {
+        let m = Metrics::new();
+        m.set_list_in_use("cty", SHA_A, ListOrigin::Bundled);
+        m.set_list_in_use("cty", SHA_B, ListOrigin::Download);
+        let text = m.render_prometheus_text();
+        assert_eq!(
+            samples(&text, "manta_list_info"),
+            [format!(
+                r#"manta_list_info{{list="cty",sha256="{SHA_B}",origin="download"}} 1"#
+            )]
+        );
+        assert!(!text.contains(SHA_A), "{text}");
+    }
+
+    #[test]
+    fn renders_list_refresh_outcomes_from_zero_once_enabled() {
+        let m = Metrics::new();
+        m.enable_list_refresh("scp");
+        assert_eq!(
+            samples(&m.render_prometheus_text(), "manta_list_refresh_total"),
+            [
+                r#"manta_list_refresh_total{list="scp",outcome="updated"} 0"#,
+                r#"manta_list_refresh_total{list="scp",outcome="unchanged"} 0"#,
+                r#"manta_list_refresh_total{list="scp",outcome="failed"} 0"#,
+            ]
+        );
+
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_791_795_600);
+        m.record_list_refresh("scp", ListRefreshOutcome::Failed, at);
+        m.record_list_refresh("scp", ListRefreshOutcome::Failed, at);
+        m.record_list_refresh("scp", ListRefreshOutcome::Unchanged, at);
+        m.enable_list_refresh("scp"); // idempotent: keeps the counts
+        m.enable_list_refresh("cty");
+        m.record_list_refresh("cty", ListRefreshOutcome::Updated, at);
+        assert_eq!(
+            samples(&m.render_prometheus_text(), "manta_list_refresh_total"),
+            [
+                r#"manta_list_refresh_total{list="cty",outcome="updated"} 1"#,
+                r#"manta_list_refresh_total{list="cty",outcome="unchanged"} 0"#,
+                r#"manta_list_refresh_total{list="cty",outcome="failed"} 0"#,
+                r#"manta_list_refresh_total{list="scp",outcome="updated"} 0"#,
+                r#"manta_list_refresh_total{list="scp",outcome="unchanged"} 1"#,
+                r#"manta_list_refresh_total{list="scp",outcome="failed"} 2"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn list_refresh_families_render_help_and_type_without_samples_when_unused() {
+        let m = Metrics::new();
+        // A list in use but not refreshed (refresh_lists off) has an info
+        // series and nothing else.
+        m.set_list_in_use("cty", SHA_A, ListOrigin::Bundled);
+        let text = m.render_prometheus_text();
+        for (family, kind, help) in [
+            (
+                "manta_list_info",
+                "gauge",
+                "The reference list in use: list (cty or scp), the SHA-256 of its bytes, and its origin (bundled, file, cache or download). Always 1.",
+            ),
+            (
+                "manta_list_refresh_total",
+                "counter",
+                "Reference-list download attempts by outcome: updated, unchanged or failed.",
+            ),
+            (
+                "manta_list_last_success_timestamp_seconds",
+                "gauge",
+                "Unix time the reference list in use was last confirmed current with its download URL.",
+            ),
+        ] {
+            assert!(text.contains(&format!("# HELP {family} {help}\n")), "{family}");
+            assert!(text.contains(&format!("# TYPE {family} {kind}\n")), "{family}");
+        }
+        assert!(samples(&text, "manta_list_refresh_total").is_empty());
+        assert!(samples(&text, "manta_list_last_success_timestamp_seconds").is_empty());
+
+        let empty = Metrics::new().render_prometheus_text();
+        assert!(empty.contains("# TYPE manta_list_info gauge\n"));
+        assert!(samples(&empty, "manta_list_info").is_empty());
+    }
+
+    #[test]
+    fn renders_last_success_timestamp_only_after_a_success() {
+        let m = Metrics::new();
+        m.enable_list_refresh("cty");
+        m.enable_list_refresh("scp");
+        let failed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_791_700_000);
+        m.record_list_refresh("cty", ListRefreshOutcome::Failed, failed_at);
+        let text = m.render_prometheus_text();
+        assert!(
+            samples(&text, "manta_list_last_success_timestamp_seconds").is_empty(),
+            "{text}"
+        );
+
+        // Rendered in whole seconds: the sub-second part is truncated.
+        let ok_at = SystemTime::UNIX_EPOCH + Duration::from_millis(1_791_795_600_750);
+        m.record_list_refresh("cty", ListRefreshOutcome::Updated, ok_at);
+        // The cache's checked_at at startup counts as a confirmation too.
+        let checked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_791_600_000);
+        m.set_list_confirmed_at("scp", checked_at);
+        assert_eq!(
+            samples(
+                &m.render_prometheus_text(),
+                "manta_list_last_success_timestamp_seconds"
+            ),
+            [
+                r#"manta_list_last_success_timestamp_seconds{list="cty"} 1791795600"#,
+                r#"manta_list_last_success_timestamp_seconds{list="scp"} 1791600000"#,
+            ]
+        );
+
+        // A later failure leaves the last success alone.
+        m.record_list_refresh(
+            "cty",
+            ListRefreshOutcome::Failed,
+            ok_at + Duration::from_secs(60),
+        );
+        assert!(m
+            .render_prometheus_text()
+            .contains(r#"manta_list_last_success_timestamp_seconds{list="cty"} 1791795600"#));
     }
 }

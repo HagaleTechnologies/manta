@@ -78,6 +78,10 @@ jobs:
         github.event.pull_request.user.login == 'thagale' ||
         github.event.pull_request.user.login == 'catalyst-cloud-connector[bot]'
       )
+    # Q-0068: the PAT lives in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     concurrency:
       group: auto-merge-${{ github.event.pull_request.number }}

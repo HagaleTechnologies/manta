@@ -289,6 +289,18 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                                 manta_server::human::khz(self.center_freq_hz)
                             );
                         }
+                        // MAN-140 (D14): the passband is reported from the first
+                        // connection, so a reopen onto a different filter would
+                        // leave it stale; end the run as a retune does.
+                        if src.rf_passband_hz() != self.rf_passband_hz {
+                            let (lo, hi) = src.rf_passband_hz();
+                            let (lo0, hi0) = self.rf_passband_hz;
+                            anyhow::bail!(
+                                "source {} reopened with a different passband \
+                                 ({lo} .. {hi} Hz, expected {lo0} .. {hi0} Hz)",
+                                self.name
+                            );
+                        }
                         if let Some(totals) = &self.input_health {
                             totals.attach(src.health_counters());
                         }
@@ -936,6 +948,56 @@ mod tests {
         assert!(
             err.to_string() == format!("source test reopened with a different center frequency ({:.1} kHz, expected {:.1} kHz)", (CENTER + 1000.0) / 1000.0, CENTER / 1000.0),
             "error must mention the center frequency mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn reopened_source_with_a_different_passband_is_a_fatal_error() {
+        struct Edges(ScriptedSource, (f64, f64));
+        impl IqSource for Edges {
+            fn sample_rate(&self) -> f64 {
+                self.0.sample_rate()
+            }
+            fn center_freq_hz(&self) -> f64 {
+                self.0.center_freq_hz()
+            }
+            fn rf_passband_hz(&self) -> (f64, f64) {
+                self.1
+            }
+            fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {
+                self.0.read(buf)
+            }
+        }
+        let first = Edges(
+            scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]),
+            (-5000.0, 5000.0),
+        );
+        let reopened: Box<dyn IqSource> = Box::new(Edges(
+            scripted(FS, CENTER, vec![ok_chunk(8)]),
+            (-3000.0, 3000.0),
+        ));
+        let mut next = Some(reopened);
+        let opener: Opener = Box::new(move || {
+            next.take()
+                .ok_or_else(|| anyhow::anyhow!("no more sources"))
+        });
+        let (health, _log) = health_recorder();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            FakeEnv::new(),
+        );
+
+        let mut b = buf(8);
+        src.read(&mut b).unwrap();
+        let err = src.read(&mut b).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "source test reopened with a different passband (-3000 .. 3000 Hz, expected -5000 .. 5000 Hz)"
         );
     }
 

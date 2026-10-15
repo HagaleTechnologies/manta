@@ -12,7 +12,7 @@ use crate::metrics::Metrics;
 use crate::rate_limit::IpRateLimiter;
 use crate::spot_message::SpotMessage;
 use crate::tasks::{ClientTasks, ConnectionLimiter, IpQuota};
-use manta_spot::cty::Table;
+use manta_spot::reference::ReferenceLists;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,6 +77,19 @@ pub const MAX_JSON_STREAM_CONNECTIONS: usize = 512;
 /// admission to every other client. Same reasoning and value as
 /// `telnet::MAX_TELNET_CONNECTIONS_PER_IP`.
 pub const MAX_JSON_STREAM_CONNECTIONS_PER_IP: usize = 16;
+/// MAN-324: the live-state listener's total client cap. Each live client
+/// is served at roughly 290 times the spot rate, so the cap is far below
+/// the spot stream's.
+pub const MAX_LIVE_STREAM_CONNECTIONS: usize = 32;
+
+/// MAN-324: which broadcast channel a `serve` listener fans out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    /// The JSON spot stream (`:7301`): spots plus `spotGrade` records.
+    Spots,
+    /// The live-state stream (`[server].live_port`).
+    Live,
+}
 
 /// MAN-68 (PR #85 review round 6): `handle_ws_client`'s WS handshake
 /// rejection/timeout branches already log a specific warning before
@@ -114,29 +127,87 @@ impl From<anyhow::Error> for WsClientError {
 struct ClientCtx {
     bus: Arc<SpotBus>,
     metrics: Arc<Metrics>,
-    cty: Arc<Table>,
+    lists: Arc<ReferenceLists>,
     station_call: String,
     station_location: Option<crate::config::StationLocation>,
     decoder_version: String,
     shutdown: watch::Receiver<bool>,
     drain_deadline: Duration,
+    stream: StreamKind,
 }
 
 impl ClientCtx {
+    // MAN-324: client gauges and loss counters go to the spot families
+    // for `:7301` and to the live families for the live-state listener,
+    // so `manta_spots_dropped_*` still counts only spots.
+    fn record_lagged(&self, n: u64) {
+        match self.stream {
+            StreamKind::Spots => self.metrics.record_lagged(n),
+            StreamKind::Live => self.metrics.record_live_lagged(n),
+        }
+    }
+
+    fn record_write_failed(&self, n: u64) {
+        match self.stream {
+            StreamKind::Spots => self.metrics.record_write_failed(n),
+            StreamKind::Live => self.metrics.record_live_write_failed(n),
+        }
+    }
+
+    fn record_dropped_shutdown(&self, n: u64) {
+        match self.stream {
+            StreamKind::Spots => self.metrics.record_dropped_shutdown(n),
+            StreamKind::Live => self.metrics.record_live_dropped_shutdown(n),
+        }
+    }
+
+    /// MAN-324: the live stream subscribes on accept, so records are built
+    /// and queued for a peer whose WebSocket handshake then fails or times
+    /// out; charge them to `write_failed` so the live loss counter stays
+    /// complete. The spot stream's counters keep their existing meaning.
+    fn record_failed_handshake(&self, still_queued: usize) {
+        if self.stream == StreamKind::Live {
+            self.metrics
+                .record_live_write_failed(crate::metrics::abandoned_spot_count(
+                    false,
+                    still_queued,
+                ));
+        }
+    }
+
+    fn inc_clients(&self, ws: bool) {
+        match (self.stream, ws) {
+            (StreamKind::Spots, true) => self.metrics.inc_ws_clients(),
+            (StreamKind::Spots, false) => self.metrics.inc_json_clients(),
+            (StreamKind::Live, _) => self.metrics.inc_live_clients(),
+        }
+    }
+
+    fn dec_clients(&self, ws: bool) {
+        match (self.stream, ws) {
+            (StreamKind::Spots, true) => self.metrics.dec_ws_clients(),
+            (StreamKind::Spots, false) => self.metrics.dec_json_clients(),
+            (StreamKind::Live, _) => self.metrics.dec_live_clients(),
+        }
+    }
+
     /// One stream line: a spot rendered as today, or a MAN-301 `spotGrade`
     /// record, already serialised, passed through verbatim. Both shapes,
     /// and the `kind` key that tells them apart, are in `docs/SPOT-SCHEMA.md`.
     fn render(&self, item: &JsonItem) -> String {
         let bus_spot = match item {
             JsonItem::Spot(bus_spot) => bus_spot,
-            JsonItem::Grade(line) => return line.to_string(),
+            JsonItem::Grade(line) | JsonItem::Live(line) => return line.to_string(),
         };
         let unix_ts = self.bus.unix_ts_for(bus_spot.spot.sample_ts);
+        // MAN-316: one snapshot per spot, so a refresh that swaps the table
+        // mid-render can never mix two tables' geography in one message.
+        let cty = self.lists.cty.load();
         let msg = SpotMessage::from_spot(
             &bus_spot.spot,
             &self.station_call,
             self.station_location.as_ref(),
-            &self.cty,
+            &cty,
             &self.decoder_version,
             unix_ts,
             self.bus.session_nonce(),
@@ -153,7 +224,10 @@ impl ClientCtx {
 pub struct JsonStreamConfig {
     pub bus: Arc<SpotBus>,
     pub metrics: Arc<Metrics>,
-    pub cty: Arc<Table>,
+    /// MAN-316: the run's reference lists; each client renders every spot
+    /// against the `cty.dat` in use at that moment, so a scheduled refresh
+    /// reaches connected clients without a reconnect.
+    pub lists: Arc<ReferenceLists>,
     pub station_call: String,
     /// This station's `deGrid`/`deLat`/`deLon` (MAN-138), resolved once at
     /// start-up by `ServerConfig::station_location`; `None` sends null
@@ -166,6 +240,8 @@ pub struct JsonStreamConfig {
     /// live on each handler's own loop rather than only the outer
     /// registry-wide `await_all` deadline.
     pub drain_deadline: Duration,
+    /// MAN-324: the spot stream or the live-state stream.
+    pub stream: StreamKind,
 }
 
 /// MAN-59 review round 2: same rationale as `telnet::QUOTA_REJECT_LOG_MAX_PER_WINDOW`
@@ -208,12 +284,13 @@ pub async fn serve(
     let ctx = ClientCtx {
         bus: config.bus,
         metrics: config.metrics,
-        cty: config.cty,
+        lists: config.lists,
         station_call: config.station_call,
         station_location: config.station_location,
         decoder_version: config.decoder_version,
         shutdown: config.shutdown,
         drain_deadline: config.drain_deadline,
+        stream: config.stream,
     };
     let quota_reject_log_limiter =
         IpRateLimiter::new(QUOTA_REJECT_LOG_MAX_PER_WINDOW, QUOTA_REJECT_LOG_WINDOW);
@@ -260,7 +337,10 @@ pub async fn serve(
         // broadcast channel's no-history-for-late-subscribers semantics on
         // a busy runtime or a high-rate stream (round-7 review finding;
         // same fix applied to the telnet accept path below).
-        let rx = ctx.bus.subscribe_json();
+        let rx = match ctx.stream {
+            StreamKind::Spots => ctx.bus.subscribe_json(),
+            StreamKind::Live => ctx.bus.subscribe_live(),
+        };
         let ctx = ctx.clone();
         let peer_ip = peer.ip();
         let ip_ping_limiter = ip_ping_limiter.clone();
@@ -306,14 +386,13 @@ pub async fn serve(
                             "json_stream: shutdown signalled during handshake classification, disconnecting"
                         );
                     }
-                    ctx.metrics
-                        .record_dropped_shutdown(crate::metrics::abandoned_spot_count(
+                    ctx.record_dropped_shutdown(crate::metrics::abandoned_spot_count(
                             false,
                             rx.len(),
                         ));
                 }
                 Some(true) => {
-                    ctx.metrics.inc_ws_clients();
+                    ctx.inc_clients(true);
                     let result = handle_ws_client(
                         socket,
                         rx,
@@ -333,10 +412,10 @@ pub async fn serve(
                             tracing::warn!(peer = %peer, error = %e, "json_stream: WS client task ended with an error");
                         }
                     }
-                    ctx.metrics.dec_ws_clients();
+                    ctx.dec_clients(true);
                 }
                 Some(false) => {
-                    ctx.metrics.inc_json_clients();
+                    ctx.inc_clients(false);
                     let result =
                         handle_tcp_client(socket, rx, ctx.clone(), peer, log_enabled).await;
                     if log_enabled {
@@ -344,7 +423,7 @@ pub async fn serve(
                             tracing::warn!(peer = %peer, error = %e, "json_stream: raw TCP client task ended with an error");
                         }
                     }
-                    ctx.metrics.dec_json_clients();
+                    ctx.dec_clients(false);
                 }
             }
         });
@@ -469,7 +548,7 @@ async fn handle_tcp_client(
                             if log_enabled {
                                 tracing::warn!("json_stream: spot write failed, disconnecting");
                             }
-                            ctx.metrics.record_write_failed(
+                            ctx.record_write_failed(
                                 crate::metrics::abandoned_spot_count(true, rx.len()),
                             );
                             return Ok(());
@@ -485,7 +564,7 @@ async fn handle_tcp_client(
                         if log_enabled {
                             tracing::warn!(lost, "json_stream: client lagged behind broadcast, disconnecting");
                         }
-                        ctx.metrics.record_lagged(lost);
+                        ctx.record_lagged(lost);
                         return Ok(());
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -582,14 +661,14 @@ async fn handle_tcp_client(
                                         "json_stream: shutdown-drain write failed or ran out of budget, disconnecting"
                                     );
                                 }
-                                ctx.metrics.record_write_failed(
+                                ctx.record_write_failed(
                                     crate::metrics::abandoned_spot_count(true, rx.len()),
                                 );
                                 return Ok(());
                             }
                         }
                         Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                            ctx.metrics.record_lagged(n);
+                            ctx.record_lagged(n);
                         }
                         Err(_) => break, // Empty or Closed: nothing left to drain
                     }
@@ -681,8 +760,7 @@ async fn handle_ws_client(
             if log_enabled {
                 tracing::info!("json_stream: shutdown signalled during WS handshake, disconnecting");
             }
-            ctx.metrics
-                .record_dropped_shutdown(crate::metrics::abandoned_spot_count(false, rx.len()));
+            ctx.record_dropped_shutdown(crate::metrics::abandoned_spot_count(false, rx.len()));
             return Ok(());
         }
     };
@@ -692,12 +770,14 @@ async fn handle_ws_client(
             if log_enabled {
                 tracing::warn!(error = %e, "json_stream: WS handshake rejected");
             }
+            ctx.record_failed_handshake(rx.len());
             return Err(WsClientError::Logged);
         }
         Err(_) => {
             if log_enabled {
                 tracing::warn!("json_stream: WS handshake timed out");
             }
+            ctx.record_failed_handshake(rx.len());
             return Err(WsClientError::Logged);
         }
     };
@@ -729,7 +809,7 @@ async fn handle_ws_client(
                             if log_enabled {
                                 tracing::warn!("json_stream: WS spot write failed, disconnecting");
                             }
-                            ctx.metrics.record_write_failed(
+                            ctx.record_write_failed(
                                 crate::metrics::abandoned_spot_count(true, rx.len()),
                             );
                             return Ok(());
@@ -742,7 +822,7 @@ async fn handle_ws_client(
                         if log_enabled {
                             tracing::warn!(lost, "json_stream: WS client lagged behind broadcast, disconnecting");
                         }
-                        ctx.metrics.record_lagged(lost);
+                        ctx.record_lagged(lost);
                         return Ok(());
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -815,7 +895,7 @@ async fn handle_ws_client(
                             if log_enabled {
                                 tracing::warn!("json_stream: WS Pong write failed, disconnecting");
                             }
-                            ctx.metrics.record_write_failed(
+                            ctx.record_write_failed(
                                 crate::metrics::abandoned_spot_count(false, rx.len()),
                             );
                             return Ok(());
@@ -926,14 +1006,14 @@ async fn handle_ws_client(
                                         "json_stream: WS shutdown-drain write failed or ran out of budget, disconnecting"
                                     );
                                 }
-                                ctx.metrics.record_write_failed(
+                                ctx.record_write_failed(
                                     crate::metrics::abandoned_spot_count(true, rx.len()),
                                 );
                                 return Ok(());
                             }
                         }
                         Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                            ctx.metrics.record_lagged(n);
+                            ctx.record_lagged(n);
                         }
                         Err(_) => break,
                     }
@@ -994,5 +1074,64 @@ mod tests {
         assert!(!is_ws_protocol_violation(&WsError::Protocol(
             ProtocolError::ResetWithoutClosingHandshake
         )));
+    }
+
+    /// MAN-316: a `cty.dat` refresh reaches a client that is already
+    /// connected. The same `ClientCtx` renders an unallocated `QQ9ZZZ` with
+    /// the unknown-geography sentinels, then, once the refresher stores a
+    /// table that allocates QQ9, with that entity's continent and CQ zone.
+    #[test]
+    fn render_uses_the_current_cty_table() {
+        use crate::spot_message::{UNKNOWN_CONTINENT, UNKNOWN_CQ_ZONE, UNKNOWN_DXCC};
+        use manta_spot::{cty, scp, Spot, SpotType};
+
+        const QQ9: &str = "Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n";
+        let lists = Arc::new(ReferenceLists::new(
+            Arc::new(cty::Table::bundled()),
+            Arc::new(scp::Set::bundled()),
+        ));
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let ctx = ClientCtx {
+            bus: Arc::new(SpotBus::new(48_000.0, std::time::SystemTime::UNIX_EPOCH, 1)),
+            metrics: Arc::new(Metrics::new()),
+            lists: lists.clone(),
+            station_call: "W3XYZ".to_string(),
+            station_location: None,
+            decoder_version: "manta-test".to_string(),
+            shutdown,
+            drain_deadline: Duration::from_secs(1),
+            stream: StreamKind::Spots,
+        };
+        let spot = JsonItem::Spot(crate::bus::BusSpot {
+            spot: Spot {
+                callsign: "QQ9ZZZ".to_string(),
+                freq_hz: 14_025_000.0,
+                snr_db: 20.0,
+                wpm: 25.0,
+                spot_type: SpotType::Cq,
+                confidence: 0.9,
+                track_id: 1,
+                sample_ts: 0,
+            },
+            occurrence_count: 1,
+        });
+        let render = |ctx: &ClientCtx| -> serde_json::Value {
+            serde_json::from_str(&ctx.render(&spot)).expect("render emits JSON")
+        };
+
+        let before = render(&ctx);
+        assert_eq!(before["dxDxcc"], UNKNOWN_DXCC);
+        assert_eq!(before["dxContinent"], UNKNOWN_CONTINENT);
+        assert_eq!(before["dxCqZone"], UNKNOWN_CQ_ZONE);
+        assert!(before["dxLat"].is_null(), "{before}");
+
+        lists.cty.store(Arc::new(cty::Table::parse(&format!(
+            "{}{QQ9}",
+            manta_spot::CTY_DAT
+        ))));
+        let after = render(&ctx);
+        assert_eq!(after["dxContinent"], "EU", "{after}");
+        assert_eq!(after["dxCqZone"], 14, "{after}");
+        assert!(!after["dxLat"].is_null(), "{after}");
     }
 }

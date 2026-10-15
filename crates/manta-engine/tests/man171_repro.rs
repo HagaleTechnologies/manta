@@ -8,6 +8,8 @@ use manta_testkit::scene::SignalSpec;
 
 fn sig(offset_hz: f64, snr_2500_db: f32) -> SignalSpec {
     SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: "CQ CQ DE TEST TEST K".into(),
         loop_text: true,
         wpm: 25.0,
@@ -46,9 +48,15 @@ fn two_signals_near_dc_both_promote() {
     eprintln!("TrackPromoted freqs: {promoted:?}");
     eprintln!("all events: {:#?}", report.events);
 
+    let near_jn1thl = promoted.iter().any(|&f| (f - 14_031_150.0).abs() < 200.0);
+    let near_vk2gr = promoted.iter().any(|&f| (f - 14_037_800.0).abs() < 200.0);
     assert!(
-        !promoted.is_empty(),
-        "expected at least one TrackPromoted event, got none"
+        near_jn1thl,
+        "JN1THL-equivalent target never promoted (expected a TrackPromoted within 200 Hz of 14031150)"
+    );
+    assert!(
+        near_vk2gr,
+        "VK2GR-equivalent target never promoted (expected a TrackPromoted within 200 Hz of 14037800)"
     );
 }
 

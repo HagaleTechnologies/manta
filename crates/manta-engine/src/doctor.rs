@@ -117,7 +117,8 @@ pub struct DoctorReport {
     pub track_meta_count: usize,
     /// Number of `TrackClosed` events seen. `TrackManager` only emits
     /// `TrackClosed` for a track that produced at least one other event
-    /// before closing (`has_emitted`, MAN-19, `track.rs`) -- an unpromoted
+    /// before closing (`has_emitted`, MAN-19, `track.rs`), or that a
+    /// merged-away track named as its survivor (MAN-174) -- an unpromoted
     /// CANDIDATE, or a promoted track merged/evicted before its first
     /// `process_hops` pass, closes with no event at all. So this counts
     /// *eventful* tracks that closed, not every detector candidate opened

@@ -5,11 +5,11 @@ kind: subsystem
 status: current
 maintainer: agent
 sources:
-  - docs/SPEC-decode-core.md#1-channelizer
+  - docs/SPEC-decode-core.md#1-channelizer-4-oversampled-polyphase-filterbank
   - ARCHITECTURE.md
 verified:
-  commit: e68b106
-  date: 2026-07-07
+  commit: d286147
+  date: 2026-10-13
 links:
   - overview
   - detector-tracks
@@ -22,9 +22,9 @@ The channelizer is a 4×-oversampled polyphase filterbank (PFB) that splits the 
 - Polyphase FIR commutator + one N-point FFT per hop, via `coppa-dsp::fft::FftProcessor` (reused — see [[coppa-reuse]]).
 - N scales with input rate to hold channel spacing near 100 Hz; the exact N table and hop are in SPEC §1.1.
 - Prototype lowpass is a Kaiser-designed FIR — **new code** in `manta-dsp::proto`, not from coppa (SPEC §1.2, §10.1).
-- Fine frequency estimate (for ±10 Hz spot accuracy) lands in `manta-dsp::centroid`, per SPEC §1.4.
-- Module map: SPEC §8 pins each spec section to its crate::module.
+- Fine frequency estimate (for ±10 Hz spot accuracy, SPEC §1.4): quadratic interpolation in `manta-dsp::channelizer::interpolate_offset`; a track's centroid is a live EMA in `manta-engine::track` (`Track::update_centroid`/`freq_hz`), deliberately not §1.4's lifetime mean (`docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md` item 5).
+- Module map: SPEC §8 pins each spec section to its crate::module (its `manta-dsp::pfb`/`::centroid` rows predate the build; the channelizer is `manta-dsp::channelizer`).
 
 ## Why it is shaped this way
 
-The whole design is viable only because it is cheap: the full-band pipeline stays well under one core, enforced by criterion benches as an M2 acceptance gate. The CPU budget table is in ARCHITECTURE §4; the 4× (not 2×) oversample choice was made to give enough envelope samples per dit for QSB'd fast CW. Stopband was tightened to 80 dB because pileup scenes need the dynamic range (SPEC §10.4). Detection and track handoff are covered in [[detector-tracks]].
+The whole design is viable only because it is cheap: the full-band pipeline is budgeted to stay well under one core, measured by the criterion bench `crates/manta-engine/benches/cpu_budget.rs`; the Pi 4 leg of that M2 acceptance gate is still open. The CPU budget table is in ARCHITECTURE §4; the 4× (not 2×) oversample choice was made to give enough envelope samples per dit for QSB'd fast CW. Stopband was tightened to 80 dB because pileup scenes need the dynamic range (SPEC §10.4). Detection and track handoff are covered in [[detector-tracks]].
