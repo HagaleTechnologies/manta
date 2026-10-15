@@ -36,9 +36,10 @@ overrun disconnects).
   re-spotting at most every ~10 s ≈ 300/min). Generous first, tightened
   on counter evidence, per the ticket's rollout note. **The owner's
   human gate from the ticket — decide the production default from
-  measured peak rates — stays open**;
-  `manta_uplink_ceiling_suppressed_total` is exactly the evidence that
-  decision needs.
+  measured peak rates — stays open**. The peak rate below the ceiling
+  comes from `increase(manta_uplink_target_sent_total[1m])`;
+  `manta_uplink_ceiling_suppressed_total` shows only when the ceiling
+  is exceeded.
 - **D3 — reuse `RateLimiter`, owned by `serve_with_live_dry_run`,
   above the reconnect loop.** A per-connection budget would reset the
   flood bound on every reconnect — precisely when a flappy target can
@@ -98,6 +99,10 @@ documented dry-run/spot_types meaning).
 ## Rollout / rollback
 
 Behaviour changes only above 600 forwarded spots/min/target. Rollback:
-set `max_spots_per_minute = 0` (restart), or revert. Operators watch
-`manta_uplink_ceiling_suppressed_total` and tighten before disabling;
+set `max_spots_per_minute = 0` (restart), or revert. A sustained rise in
+`manta_uplink_ceiling_suppressed_total` during genuine traffic means the
+ceiling is too low: raise it or set `0` (restart). A rise from a runaway
+input means fixing the input or setting `dry_run = true` (SIGHUP, on
+Unix, when it is the edit's only `[[rbn_uplink]]` change). Lowering the ceiling
+is only for a node whose forwarded rate stays well below it;
 `docs/RUNBOOKS/uplink-health.md` says how.
