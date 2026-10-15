@@ -37,6 +37,7 @@ mod list_http;
 mod list_refresh;
 mod live_state;
 mod logging;
+mod multi_run;
 mod reconnect;
 mod reload;
 mod source_check;
@@ -482,6 +483,10 @@ enum Command {
     /// use keeps growing. Intended for unattended stability runs, not for
     /// day-to-day operating.
     Soak {
+        /// With several [[input]] entries in the config, the one to examine,
+        /// by its name (MAN-13). Optional with one input.
+        #[arg(long, value_name = "NAME")]
+        input: Option<String>,
         /// How long to run, in seconds.
         #[arg(long)]
         duration: u64,
@@ -721,6 +726,10 @@ enum Command {
     /// SKIP, with a fix for every problem. Exits 1 when a check fails.
     // MAN-126: the setup checks live in doctor_checks.rs and clock_check.rs.
     Doctor {
+        /// With several [[input]] entries in the config, the one to examine,
+        /// by its name (MAN-13). Optional with one input.
+        #[arg(long, value_name = "NAME")]
+        input: Option<String>,
         /// How long to listen for, in seconds (3 to 3600).
         #[arg(long, default_value_t = 10)]
         duration: u64,
@@ -931,6 +940,10 @@ enum Command {
     // docs/DECISIONS/2026-10-11-man127-calibrate-command.md. The source flag
     // block is copied from `Doctor`, as run/soak/doctor each copy it.
     Calibrate {
+        /// With several [[input]] entries in the config, the one to examine,
+        /// by its name (MAN-13). Optional with one input.
+        #[arg(long, value_name = "NAME")]
+        input: Option<String>,
         /// How long to measure, in seconds (10 to 3600). NCDXF beacons take
         /// turns on each frequency, so give them 180.
         #[arg(long, default_value_t = 60)]
@@ -4149,6 +4162,62 @@ struct Resolved {
     /// The flag that replaced a typed `[input]` from the file, if one did:
     /// that file's receiver is then not the one being opened (MAN-127).
     replaced_file_source: Option<&'static str>,
+    /// MAN-13: every `[[input]]` entry, resolved, when the config names two
+    /// or more and no source flag replaced them; empty otherwise (the
+    /// fields above then describe the one receiver). `spec`,
+    /// `freq_correction_ppm`, `dial_freq_hz` and `capture_rate_hz` above
+    /// are the first entry's.
+    inputs: Vec<ResolvedInput>,
+}
+
+/// MAN-13: one `[[input]]` entry, resolved: its own source, receiver
+/// correction, dial and capture rate.
+#[derive(Clone)]
+struct ResolvedInput {
+    name: String,
+    spec: LiveSourceSpec,
+    freq_correction_ppm: f64,
+    dial_freq_hz: Option<f64>,
+    capture_rate_hz: Option<f64>,
+}
+
+/// MAN-13: a one-receiver command (`calibrate`, `doctor`, `soak`, `check`)
+/// against a config with several inputs must say which one it examines.
+/// Narrows `loaded` to the named input; with one input, `name` may name
+/// it or be omitted.
+fn select_input(loaded: &mut config::Loaded, name: Option<&str>, command: &str) -> Result<()> {
+    let origin = loaded.origin.clone();
+    let names: Vec<&str> = loaded.inputs.iter().map(|n| n.name.as_str()).collect();
+    let index = match name {
+        None if names.len() < 2 => return Ok(()),
+        None => {
+            let options = match names.split_last() {
+                Some((last, rest)) => format!(
+                    "{} or --input {last}",
+                    rest.iter()
+                        .map(|n| format!("--input {n}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                None => String::new(),
+            };
+            bail!(
+                "manta {command} checks one receiver at a time and {origin} has {} inputs: pass \
+                 {options}",
+                names.len()
+            );
+        }
+        Some(name) => names.iter().position(|n| *n == name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--input {name:?} is not one of {origin}'s inputs ({})",
+                names.join(", ")
+            )
+        })?,
+    };
+    let chosen = loaded.inputs[index].clone();
+    loaded.input = chosen.input.clone();
+    loaded.inputs = vec![chosen];
+    Ok(())
 }
 
 /// MAN-301: the flag enables; a non-empty `--rbn-spotter` replaces
@@ -4194,6 +4263,72 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
     );
     let mut replaced_file_source = None;
     let (cli_realtime, cli_loop) = (cli.realtime, cli.loop_replay);
+    // MAN-13: several `[[input]]` entries, unless a source flag picks one
+    // receiver instead.
+    let several = loaded.inputs.len() >= 2;
+    if several {
+        if let Some(flag) = cli.source_selector() {
+            notes.push(format!(
+                "note: {flag} selects the source; ignoring the {} [[input]] entries from {}",
+                loaded.inputs.len(),
+                loaded.origin
+            ));
+            let spec = cli.into_spec();
+            let replay = resolve_replay_mode(cli_realtime, cli_loop, None, &spec)?;
+            return Ok(Resolved {
+                spec,
+                replay,
+                freq_correction_ppm: freq_correction_ppm.unwrap_or(0.0),
+                dial_freq_hz,
+                capture_rate_hz,
+                replay_epoch,
+                spot,
+                rbn_compare,
+                notes,
+                replaced_file_source: Some(flag),
+                inputs: Vec::new(),
+            });
+        }
+        for (flag, set) in [
+            ("--freq-correction-ppm", freq_correction_ppm.is_some()),
+            ("--dial-freq-hz", dial_freq_hz.is_some()),
+            ("--capture-rate-hz", capture_rate_hz.is_some()),
+        ] {
+            if set {
+                let key = match flag {
+                    "--freq-correction-ppm" => "freq_correction_ppm",
+                    "--dial-freq-hz" => "center_freq_hz",
+                    _ => "capture_rate_hz",
+                };
+                bail!(
+                    "{flag} applies to one receiver and {} has {} [[input]] entries; set {key} \
+                     in the entry, or name one receiver with a source flag",
+                    loaded.origin,
+                    loaded.inputs.len()
+                );
+            }
+        }
+    }
+    let inputs = if several {
+        loaded
+            .inputs
+            .iter()
+            .map(|n| {
+                let Some(source) = &n.input.source else {
+                    bail!("[[input]] {:?} has no type", n.name);
+                };
+                Ok(ResolvedInput {
+                    name: n.name.clone(),
+                    spec: spec_from_file(source, cli.source_iq)?,
+                    freq_correction_ppm: n.input.shared.freq_correction_ppm.unwrap_or(0.0),
+                    dial_freq_hz: n.input.shared.center_freq_hz,
+                    capture_rate_hz: n.input.shared.capture_rate_hz,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
     // MAN-269 D3: a config `type = "file"` source contributes its own
     // realtime/loop only when no CLI flag selects the source.
     let file_replay = match (cli.source_selector(), &loaded.input.source) {
@@ -4231,6 +4366,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
         rbn_compare,
         notes,
         replaced_file_source,
+        inputs,
     })
 }
 
@@ -4476,10 +4612,23 @@ struct SourcePrepared {
     resolved: Resolved,
 }
 
-fn prepare_source(cli: CliOverrides, config_flag: Option<PathBuf>) -> Result<SourcePrepared> {
+/// MAN-13: a command that examines one receiver, and the `--input` it was
+/// given (see `select_input`).
+#[derive(Debug, Clone, Copy)]
+struct OneInput<'a> {
+    command: &'a str,
+    name: Option<&'a str>,
+}
+
+fn prepare_source(
+    cli: CliOverrides,
+    config_flag: Option<PathBuf>,
+    one: OneInput<'_>,
+) -> Result<SourcePrepared> {
     let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
     let config_path = config_flag.or_else(|| config::config_path_from_env(&vars));
-    let loaded = config::load(config_path.as_deref(), config::Env::Read(&vars))?;
+    let mut loaded = config::load(config_path.as_deref(), config::Env::Read(&vars))?;
+    select_input(&mut loaded, one.name, one.command)?;
     let resolved = resolve(cli, &loaded)?;
     for note in &resolved.notes {
         logging::note(note);
@@ -4498,10 +4647,11 @@ fn prepare_live(
     config_flag: Option<PathBuf>,
     cli_engine: Option<Engine>,
     warn_stale_cty: bool,
+    one: Option<OneInput<'_>>,
 ) -> Result<Prepared> {
     let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
     let config_path = config_flag.or_else(|| config::config_path_from_env(&vars));
-    let prepared = prepare_config(cli, config_path, cli_engine, &vars)?;
+    let prepared = prepare_config_for(cli, config_path, cli_engine, &vars, one)?;
     for note in &prepared.resolved.notes {
         logging::note(note);
     }
@@ -4525,7 +4675,22 @@ fn prepare_config(
     cli_engine: Option<Engine>,
     vars: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> Result<Prepared> {
-    let loaded = config::load(config_path.as_deref(), config::Env::Read(vars))?;
+    prepare_config_for(cli, config_path, cli_engine, vars, None)
+}
+
+/// `prepare_config`, narrowed to one input for a one-receiver command
+/// (MAN-13).
+fn prepare_config_for(
+    cli: CliOverrides,
+    config_path: Option<PathBuf>,
+    cli_engine: Option<Engine>,
+    vars: &[(std::ffi::OsString, std::ffi::OsString)],
+    one: Option<OneInput<'_>>,
+) -> Result<Prepared> {
+    let mut loaded = config::load(config_path.as_deref(), config::Env::Read(vars))?;
+    if let Some(one) = one {
+        select_input(&mut loaded, one.name, one.command)?;
+    }
     let rbn_opts = cli.rbn.clone();
     let resolved = resolve(cli, &loaded)?;
     check_rbn_compare(&rbn_opts, &loaded, &resolved)?;
@@ -5425,7 +5590,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 resolved,
                 pipeline: cfg,
                 lists_in_use,
-            } = prepare_live(cli, config, engine, false)?;
+            } = prepare_live(cli, config, engine, false, None)?;
             // MAN-79's stale built-in cty.dat warning, before any I/O,
             // unless the cache may replace that copy: `prepare_run_lists`
             // warns then, once it has chosen (MAN-316).
@@ -5447,6 +5612,24 @@ fn run_command() -> Result<std::process::ExitCode> {
             // only; `config check` keeps the broad placeholder scan. See
             // docs/DECISIONS/2026-10-10-man268-unattended-packaging.md.
             config_cmd::reject_example_callsigns(&loaded)?;
+            // MAN-13: several [[input]] entries decode on their own threads
+            // into one validator and one spot output.
+            if !resolved.inputs.is_empty() {
+                if loaded.server.is_some() {
+                    bail!(
+                        "{}: [server] with several [[input]] entries is not supported yet -- \
+                         run them without [server] (spots on stdout), or give each receiver \
+                         its own daemon until the multi-input daemon lands",
+                        loaded.origin
+                    );
+                }
+                return multi_run::run(multi_run::MultiRun {
+                    inputs: &resolved.inputs,
+                    replay: resolved.replay,
+                    cfg: &cfg,
+                    json,
+                });
+            }
             let spec = &resolved.spec;
             let dial_freq_hz = resolved.dial_freq_hz;
             // The resolved (CLI > env > file) capture rate, for the first open
@@ -6203,6 +6386,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             listen_result?;
         }
         Command::Soak {
+            input,
             duration,
             device,
             source,
@@ -6304,6 +6488,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                 config,
                 None,
                 true,
+                Some(OneInput {
+                    command: "soak",
+                    name: input.as_deref(),
+                }),
             )?;
             if loaded.server.is_some() {
                 eprintln!(
@@ -6374,6 +6562,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             ));
         }
         Command::Doctor {
+            input,
             duration,
             device,
             source,
@@ -6492,6 +6681,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                 config,
                 None,
                 true,
+                Some(OneInput {
+                    command: "doctor",
+                    name: input.as_deref(),
+                }),
             )?;
             note_pinned_lists(&resolved.spot, &lists_in_use);
             if let Some(note) = replay_mode_ignored_note("doctor", resolved.replay, &loaded.origin)
@@ -6582,6 +6775,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             }
         }
         Command::Calibrate {
+            input,
             duration,
             reference_hz,
             search_ppm,
@@ -6619,6 +6813,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             write,
             json,
         } => calibrate_cmd::run(calibrate_cmd::CalibrateArgs {
+            input,
             duration_secs: duration,
             reference_hz,
             search_ppm,

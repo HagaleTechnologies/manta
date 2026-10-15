@@ -34,6 +34,8 @@ pub(crate) struct CalibrateArgs {
     pub json: bool,
     pub config: Option<PathBuf>,
     pub cli: CliOverrides,
+    /// MAN-13: `--input NAME`, the `[[input]]` entry to measure.
+    pub input: Option<String>,
 }
 
 /// What happens to a measured value.
@@ -431,7 +433,14 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
         config_path,
         loaded,
         mut resolved,
-    } = prepare_source(args.cli, args.config)?;
+    } = prepare_source(
+        args.cli,
+        args.config,
+        crate::OneInput {
+            command: "calibrate",
+            name: args.input.as_deref(),
+        },
+    )?;
     let opts = CalibrateOptions {
         duration,
         search_ppm: args.search_ppm,
@@ -847,6 +856,7 @@ mod tests {
             notes: Vec::new(),
             replaced_file_source: None,
             replay: crate::ReplayMode::default(),
+            inputs: Vec::new(),
         }
     }
 
