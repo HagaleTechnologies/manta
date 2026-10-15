@@ -233,6 +233,8 @@ fn pileup_signals() -> Vec<SignalSpec> {
             let wpm = 18.0 + (i as f32 * 7.0) % 18.0; // 18..36 WPM spread
             let snr_2500_db = 4.0 + (i as f32 * 5.0) % 20.0; // 4..24 dB spread
             SignalSpec {
+                dit_units: 1.0,
+                element_gap_units: 1.0,
                 text: format!("CQ CQ DE {call} {call} K"),
                 loop_text: true,
                 wpm,
@@ -260,6 +262,8 @@ fn pileup_signals() -> Vec<SignalSpec> {
     // unit test (`soak_reports_no_panic_on_a_clean_short_signal`), which
     // is proven to decode "CQ CQ DE W1AW W1AW K" end to end.
     signals.push(SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: "CQ CQ DE N1CLR N1CLR K".to_string(),
         loop_text: true,
         wpm: 20.0,

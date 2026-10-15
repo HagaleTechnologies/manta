@@ -50,7 +50,7 @@ allow).
 manta/
 ├── Cargo.toml                 # workspace
 ├── crates/
-│   ├── manta-input          # IQ sources: SoapySDR, HPSDR/Hermes, KiwiSDR client, file, audio
+│   ├── manta-input          # IQ sources: SoapySDR, HPSDR/Hermes, KiwiSDR client, ka9q-radio multicast, file, audio
 │   ├── manta-dsp            # PFB channelizer, noise-floor estimation, envelope
 │   ├── manta-decode         # CW keying state machine, timing, Morse decode
 │   ├── manta-spot           # callsign validation, CQ/DE parse, dedupe, scoring
@@ -101,7 +101,7 @@ versioned deps.
 
 ## 3. Input layer (`manta-input`)
 
-One trait, five implementations:
+One trait, six implementations:
 
 ```
 trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
@@ -116,6 +116,13 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
   no native-library dependency; the gate mirrors `soapy`. The wire facts are
   spike-pinned (`docs/DECISIONS/2026-09-02-hpsdr-hermes-protocol-spike.md`), not yet
   confirmed against live hardware.
+- **ka9q-radio (radiod) channel** (RTP over UDP multicast, no feature gate):
+  joins the multicast data group of one existing radiod IQ channel and reads
+  its sample rate, encoding, frequency and filter edges from the per-channel
+  status packets radiod sends to that group, so the operator sets none of
+  them. Pure std plus `socket2`, in every build. The wire facts are pinned
+  against ka9q-radio's documentation and headers, not yet a live radiod
+  ([docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md](docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md)).
 - **KiwiSDR client**: the kiwisdr websocket IQ protocol (12 kHz IQ per channel) —
   narrow, but gives instant worldwide receiver access for development and lets
   low-budget nodes contribute spots.
@@ -336,9 +343,17 @@ transmission may never produce again).
    `master.scp` (contest super-check-partial list) *raises* confidence; absence
    only lowers it (new/rare calls must still spot, not just well-known ones).
    `--scp` / `[spot] scp_path` supplies a replacement known-callsign list.
-4. **Repetition requirement**: a callsign must decode ≥ 2 times within 90 s
-   before first spot (CW ops repeat their calls; single decodes are
-   overwhelmingly garble). **Deviates from "the same track" (MAN-166,
+4. **Repetition requirement** (MAN-95): within 90 s a call needs 2 distinct
+   messages for a common pattern, 3 for a listed pattern and 5 for an
+   unlisted pattern. `[spot].validation_level = "minimal"` restores flat 2;
+   the default is `"normal"`. Patterns keep the first 3 characters literal
+   (2 for letter-digit-letter, 4 for digit-letter-letter), then replace
+   later letters with `@` and digits with `#`. Portable suffixes are ignored.
+   The independent `data/patterns.lst` is derived from vendored MASTER.SCP:
+   `+` means at least two calls share that pattern; a plain entry means one.
+   `--patterns` / `[spot].pattern_path` replaces it. Changing `--scp` alone
+   does not change the pattern table. CW operators repeat their calls;
+   single decodes are overwhelmingly garble. **Deviates from "the same track" (MAN-166,
    `docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`)**: a
    real signal's `track_id` changes across a close+reopen, so repetition is
    tracked per frequency instead, with a minimum-gap check across
@@ -506,6 +521,25 @@ validation (MAN-28). Dedupe (step 5) still applies.
   archive and RBN's daily CSV. See
   `docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md` and
   `docs/RUNBOOKS/rbn-comparison.md`.
+- **Live-state stream (MAN-324, opt-in)**: with `[server].live_port` set,
+  a fourth listener pushes what the node hears between spots, for
+  dashboards: `bandState` (per-band noise floor, occupancy and decoding
+  tracks, once per second of stream time), `trackState` (each track's
+  frequency, speed, SNR, newest 128 characters of text and up to 8
+  candidate calls with their support), `candidateDecision` (every
+  validation decision with its reason, e.g. `withheld`/`repetition`, and
+  for a spot the `:7301` `id` as `spotId`) and `trackClosed`. It has its
+  own port and its own broadcast channel on `SpotBus` (4096 records deep),
+  and runs the same `json_stream::serve` fan-out code as :7301 (raw TCP and
+  WebSocket, 10 s write timeout, lag-means-disconnect), capped at 32
+  clients. It binds `[server].live_bind_addr`, default `127.0.0.1`, because
+  it has no password and carries every track's decoded text. Unset, no
+  socket opens and the decode loop does no live work; set, records are
+  serialized on the decode thread only while a client is connected, never
+  block it, and never change spot output. The why-not-spotted record is the
+  validator's opt-in decision log (`manta_spot::Decision`). Field
+  reference: `docs/LIVE-STATE.md`; design and measured rates:
+  `docs/DECISIONS/2026-10-12-man324-live-state-stream.md`.
 - **Inbound RBN feed client (MAN-301)**: the comparator's
   `rbn_compare::feed` connects out to `[rbn_compare].feed_host:feed_port`
   (`telnet.reversebeacon.net:7000`), reconnecting on `backoff.rs`'s

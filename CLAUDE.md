@@ -175,6 +175,40 @@ same Rust engine. RBN's real login prompt and the live/offline agreement
 rate are unmeasured. See
 docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md.
 
+MAN-152: the in-repo `wiki/` is manta's canonical wiki. GitHub's Wiki tab
+is not used; disabling it remains an owner step. The wiki pages'
+`verified` stamps and `manifest.json` are refreshed and pinned by a
+`docs_consistency` test. See
+`docs/DECISIONS/2026-10-13-man152-one-wiki.md`.
+
+MAN-316: `[spot].refresh_lists` (default off) makes `run` from a live
+receiver download `cty.dat` every 7 days and `MASTER.SCP` daily over plain
+HTTP, swap a download that passes the acceptance checks into the
+validator, spot geography and JSON stream without a restart, and keep it
+under `[spot].list_cache_dir`; a failure keeps the list in use. File replay
+never downloads; `--cty-sha256`/`--scp-sha256` pin a version by hash. See
+docs/DECISIONS/2026-10-12-man316-reference-list-refresh.md.
+
+MAN-140: `--ka9q-group` (with `--ka9q-port`/`--ka9q-ssrc`/
+`--ka9q-interface`) or `[input] type = "ka9q"` reads one existing
+ka9q-radio (radiod) IQ channel over RTP multicast, in every build (no
+Cargo feature). Rate, encoding, frequency and filter edges come from the
+status radiod sends to the data group on port 5006; manta also joins on
+127.0.0.1 (radiod's default `ttl = 0`); a retune ends the run with exit 1.
+Written clean-room from ka9q-radio's docs and headers at `f44b3a3ee8dd`;
+six facts (D-HW) still need a live radiod. See docs/GUIDES/ka9q-radio.md
+and docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md.
+
+MAN-324: `[server].live_port` (unset = off; `live_bind_addr` default
+`127.0.0.1`) starts a live-state stream for dashboards: `bandState`,
+`trackState`, `candidateDecision` (the why-not-spotted record, from the
+validator's opt-in decision log) and `trackClosed` records on their own
+port and broadcast channel, served by `json_stream`'s fan-out code (4096
+lag, 32 clients), plus `manta_live_*` metrics. Spot output is unchanged.
+Fields: `docs/LIVE-STATE.md`; see
+docs/DECISIONS/2026-10-12-man324-live-state-stream.md. The dispensa
+`liveState.v1` fragment is not yet filed.
+
 MAN-133: `manta completions <shell>` (bash/zsh/fish/powershell/elvish) and
 `manta man-pages --out DIR` render from the clap tree `--help` uses; every
 release archive ships `man/man1/*.1` rendered natively by the release
@@ -191,11 +225,52 @@ check-run. `release-publish.yml` refuses a tag whose CI push run failed any
 test leg. The `PR title` check requires a Conventional Commits title. See
 docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md.
 
+<<<<<<< HEAD
 MAN-189: the HSMM decoder no longer re-emits a committed character under
 a different closing anchor. `commit::Frontier` (each entry's character
 start against the latest emitted timestamp) replaces `sealed`. V7/hsmm
 and V8/hsmm now pass, and V5/VR5/VR6a/VR8 CER improve. See
 docs/DECISIONS/2026-10-13-man189-hsmm-commit-frontier.md.
+=======
+MAN-315: the legacy decoder learns per-track dot/dash/gap timing
+(`SenderTiming`, SPEC §4.1b; `TimingUpdate` event, `decode --json`
+`timing`, a `decode --timing` stderr line); gaps are measured in the
+symmetric dit (`dit_estimate_ms`), the word boundary is the sender's own,
+and the dash/dot ceiling is 6.0. VW1–VW5 (SPEC §7.3, `golden_vw.rs`)
+pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
+planned dash re-split was dropped after a bogus V8w spot). See
+docs/DECISIONS/2026-10-11-man315-sender-timing.md.
+
+MAN-174: within a `process_hops` batch a merge loser's `TrackClosed`
+precedes its survivor's, and a merge survivor that never emitted still
+gets its own `TrackClosed`, so a deferred Beacon migrated along a merge
+chain resolves at the final survivor's close. `SuppressionCounts` adds
+`pending_beacon_rejected_wpm` and `pending_beacon_stale`; pending beacons
+are kept in `sample_ts` order, so the cap evicts the true oldest, and an
+equal-timestamp one goes through dedupe. SPEC §5/§6 and V22/V25 match. See
+docs/DECISIONS/2026-10-14-man174-deferred-beacon-merge-bookkeeping.md.
+
+MAN-192: the HSMM decoder reseeds after a committed Silence segment, not
+only on a present re-onset (SPEC v2 §4.7's second trigger), carrying the
+closing segment in `HistEntry::closing_segment` and a scored-prefix
+count (`scored_live_len`) that replaces the zero-score seed heuristic in
+`best_u`/`finish`. No cooldown: every distinct committed Silence
+reseeds; snapshots stay within `beam + seed set`. The `hsmm` engine
+stays non-default with its stage-2 gate still failing. See
+docs/DECISIONS/2026-10-14-man192-silence-reseed.md.
+
+MAN-95: `[spot].validation_level` defaults to `normal`: common, listed and
+unlisted callsign patterns need 2, 3 and 5 distinct-message repetitions.
+`minimal` keeps flat 2. The independent list derived from MASTER.SCP is
+replaced by `--patterns` / `[spot].pattern_path`; allowlist and beacon
+exemptions stay. Live decisions report `requiredReps` and `patternTier`.
+See docs/DECISIONS/2026-10-14-man95-pattern-rarity-repetition-tiers.md.
+
+MAN-210: golden vector V51 (V9's drift scene, `refine_bw_hz = 30` via
+`--config`) exercises the narrowband refiner's refine-enabled path
+end-to-end through `manta decode --json` — the evidence any future
+default-on change must keep green.
+>>>>>>> 3805f78bcb1b166f1eba98448d62db98addb201c
 
 ## Documents (read in this order)
 

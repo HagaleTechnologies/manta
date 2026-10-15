@@ -16,8 +16,8 @@ sources:
   - docs/DECISIONS/2026-09-10-post-antenna-fix-90min-soak-and-service-reliability.md
   - docs/DECISIONS/2026-10-11-man131-actionable-errors.md
 verified:
-  commit: 9644a7f
-  date: 2026-10-11
+  commit: d286147
+  date: 2026-10-13
 links:
   - spot-validation
   - overview

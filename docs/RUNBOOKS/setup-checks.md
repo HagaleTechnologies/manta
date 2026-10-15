@@ -103,7 +103,7 @@ non-standard port.
 | `rbn compare feed ...: could not look up <host>` | Check `[rbn_compare].feed_host`, and this machine's DNS (`nslookup <host>`) |
 | `rbn compare feed ...: refused the connection` | Check `[rbn_compare].feed_port`; otherwise the feed is down or not accepting connections |
 | `rbn compare feed ...: did not answer within 10 s` | A firewall may be dropping outbound TCP to that port. The daemon needs it open to grade spots |
-| `receiver: could not open ...` | Sound card: connect it, or choose one with `--device`/`input.device`. WAV file: check `--source`/`input.path`. KiwiSDR: check `--kiwi-host`/`--kiwi-port` and that it has a free channel. SoapySDR: check `--soapy-driver` and `SoapySDRUtil --find`. HPSDR: check `--hpsdr-host` and that the radio is on this network |
+| `receiver: could not open ...` | Sound card: connect it, or choose one with `--device`/`input.device`. WAV file: check `--source`/`input.path`. KiwiSDR: check `--kiwi-host`/`--kiwi-port` and that it has a free channel. SoapySDR: check `--soapy-driver` and `SoapySDRUtil --find`. HPSDR: check `--hpsdr-host` and that the radio is on this network. ka9q-radio: check `--ka9q-group`/`input.group` and `--ka9q-ssrc`/`input.ssrc` against the radiod channel section, that radiod is running, and that its ttl is at least 1 when it runs on another machine ([ka9q-radio guide](../GUIDES/ka9q-radio.md#4-same-machine-or-another-machine)) |
 | `signal: the receiver opened, but the signal check stopped` | A WAV file must hold at least 3 seconds of audio; a live receiver must keep delivering samples |
 
 ## Exit codes

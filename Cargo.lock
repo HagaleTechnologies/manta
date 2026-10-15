@@ -873,6 +873,7 @@ dependencies = [
  "serde_yaml_ng",
  "sha2",
  "signal-hook",
+ "socket2",
  "syn 2.0.119",
  "tempfile",
  "tokio",
@@ -942,6 +943,7 @@ dependencies = [
  "serde",
  "serde_json",
  "soapysdr",
+ "socket2",
  "tempfile",
  "tungstenite",
 ]

@@ -43,6 +43,13 @@ pub struct SignalSpec {
     /// there is currently no way to give two signals in the same
     /// `VectorSpec`-based vector different edge shapes.
     pub rise_ms: f64,
+    /// Dot mark length in dit units, threaded into `KeyerSpec::dit_units`.
+    /// 1.0 (standard) for every vector before MAN-315's VW3/VW4.
+    pub dit_units: f32,
+    /// Element gap in dit units, threaded into
+    /// `KeyerSpec::element_gap_units`. 1.0 (standard) for every vector
+    /// before MAN-315's VW3/VW4.
+    pub element_gap_units: f32,
 }
 
 /// Sinusoidal QSB envelope multiplier applied on top of the keyed envelope.
@@ -87,6 +94,8 @@ pub fn render_scene(
             weight: sig.weight,
             char_gap_units: sig.char_gap_units,
             word_gap_units: sig.word_gap_units,
+            dit_units: sig.dit_units,
+            element_gap_units: sig.element_gap_units,
         };
         let (env, text) = if sig.loop_text {
             key_text_loop(&sig.text, &spec, fs, duration_s)?
@@ -184,6 +193,8 @@ mod tests {
         // convention; must be within 0.3 dB of the request (pinned decision 3).
         let fs = 96_000.0;
         let sig = SignalSpec {
+            dit_units: 1.0,
+            element_gap_units: 1.0,
             text: "CQ CQ DE W1AW W1AW K".into(),
             loop_text: true,
             wpm: 20.0,
@@ -221,6 +232,8 @@ mod tests {
     #[test]
     fn scene_is_deterministic() {
         let sig = SignalSpec {
+            dit_units: 1.0,
+            element_gap_units: 1.0,
             text: "TEST".into(),
             loop_text: false,
             wpm: 25.0,
@@ -248,6 +261,8 @@ mod tests {
     fn qsb_sine_modulates_envelope_amplitude() {
         let fs = 96_000.0;
         let sig = SignalSpec {
+            dit_units: 1.0,
+            element_gap_units: 1.0,
             // Ten E's as a single word: only 3-unit (180 ms) intra-word gaps
             // apply between characters, giving a 240 ms dit+gap cadence --
             // well under the 300 ms bin width below. (A single-character "E"

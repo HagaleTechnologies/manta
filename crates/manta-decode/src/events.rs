@@ -1,5 +1,6 @@
 //! Decoder output event stream. SPEC §5.
 
+use crate::timing::TimingEstimates;
 use crate::tree::Glyph;
 
 fn one() -> f32 {
@@ -53,7 +54,22 @@ pub enum DecoderEvent {
         #[serde(default)]
         sample_ts: u64,
         snr_2500_db: f32,
+        /// The track's centroid at the hop `sample_ts` names (MAN-211).
         freq_hz: f64,
+    },
+    /// The track's learned sender timing (MAN-315 D8): dot, dash,
+    /// element-gap, char-gap and word-gap durations, mean and variance in
+    /// dits of `dit_ms`, `null` for a class with no observations. Emitted
+    /// on the `TrackMeta` cadence when a class gained an observation since
+    /// the last one or a drift re-init wiped timing already reported (the
+    /// wiped classes then read `null`), and at track finish. Legacy and
+    /// EdgeLegacy only. The
+    /// estimates are flattened into the event object. SPEC §5.
+    TimingUpdate {
+        track_id: u32,
+        sample_ts: u64,
+        #[serde(flatten)]
+        timing: TimingEstimates,
     },
     /// A track has been promoted from CANDIDATE to ACTIVE (SPEC §2.1) --
     /// the detector decided this looks like a real signal worth
@@ -71,8 +87,11 @@ pub enum DecoderEvent {
         freq_hz: f64,
     },
     /// A track has closed (any `CloseReason`: Unconfirmed/HangExpired/
-    /// Silent/Merged/Evicted) and will never emit another event under
-    /// this `track_id` -- `TrackManager::next_id` never reuses one.
+    /// Silent/Merged/Evicted/Rtty) and will never emit another event under
+    /// this `track_id` -- `TrackManager::next_id` never reuses one. The
+    /// normative schema, including both `closure` kinds and when this is
+    /// emitted at all, is SPEC-decode-core.md §5; §6 rule 6 orders a merge
+    /// loser's `TrackClosed` before its survivor's (MAN-174).
     /// MAN-19: added so per-track_id state downstream (`manta-spot`'s
     /// `Validator::tracks`, `RepetitionGate::seen`) has a signal to free
     /// it; without this neither had one, so both grew unboundedly for the
@@ -105,17 +124,18 @@ pub enum DecoderEvent {
 /// positive risk the deferred-judgment design exists to close.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ClosureKind {
-    /// A genuine, observed end of signal: overall stream EOF, a
-    /// sustained observed power drop (`HangExpired`), or no character
-    /// decoded for the GC timeout (`Silent` -- not itself proof the RF
-    /// signal is gone, but by the time `TrackManager::finish` or
-    /// `step_hop`'s closure path fires this reason, no further evidence
-    /// for this exact `track_id` will ever arrive either way).
+    /// A genuine, observed end of signal: overall stream EOF
+    /// (`TrackManager::finish`) or a sustained observed power drop
+    /// (`HangExpired`). Deferred evidence is judged now.
     SignalEnded,
     /// Pure track-bookkeeping, not evidence the signal itself ended. If
     /// `survivor_track_id` is `Some`, this track's identity may continue
-    /// there (`Merged`); if `None`, it simply stopped being tracked with
-    /// no successor (`Evicted`).
+    /// there (`Merged`) and deferred evidence moves to it; if `None`, it
+    /// simply stopped being tracked with no successor (`Evicted`,
+    /// `Silent` -- no character decoded for the GC timeout, which a
+    /// continuous carrier also satisfies, round 10 -- `Rtty`, or a source
+    /// discontinuity, MAN-73) and deferred evidence is discarded and
+    /// counted. See SPEC-decode-core.md §5.
     Bookkeeping { survivor_track_id: Option<u32> },
 }
 
@@ -174,6 +194,46 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    fn timing_update() -> DecoderEvent {
+        use crate::timing::ClassEstimate;
+        let c = |mean_dits, var_dits2, n| {
+            Some(ClassEstimate {
+                mean_dits,
+                var_dits2,
+                n,
+            })
+        };
+        DecoderEvent::TimingUpdate {
+            track_id: 2,
+            sample_ts: 4_128_768,
+            timing: TimingEstimates {
+                dit_ms: 54.5,
+                dot: c(0.875, 0.0625, 118),
+                dash: c(4.0, 0.25, 131),
+                element_gap: c(1.125, 0.03125, 176),
+                char_gap: c(4.5, 0.5, 61),
+                word_gap: None,
+            },
+        }
+    }
+
+    /// MAN-315 D8: the estimates are flattened into the event object.
+    #[test]
+    fn timing_update_json_shape() {
+        assert_eq!(
+            serde_json::to_string(&timing_update()).unwrap(),
+            r#"{"event":"TimingUpdate","track_id":2,"sample_ts":4128768,"dit_ms":54.5,"dot":{"mean_dits":0.875,"var_dits2":0.0625,"n":118},"dash":{"mean_dits":4.0,"var_dits2":0.25,"n":131},"element_gap":{"mean_dits":1.125,"var_dits2":0.03125,"n":176},"char_gap":{"mean_dits":4.5,"var_dits2":0.5,"n":61},"word_gap":null}"#
+        );
+    }
+
+    #[test]
+    fn timing_update_roundtrips() {
+        let e = timing_update();
+        let json = serde_json::to_string(&e).unwrap();
+        let back: DecoderEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
     }
 
     #[test]

@@ -50,6 +50,15 @@ sliding-window maximum (monotonic deque, O(1) amortized). Because the
 window is centered, the evidence stream is produced with a fixed delay of
 `h` hops behind the input; all timestamps refer to the input hop.
 
+Implementation note (MAN-193): the O(1) amortized bound holds while both
+window bounds move forward, which includes a fixed `h` and any `h` change
+of one hop between consecutive centers. A `u_ref` change that moves a
+bound backwards (growing or shrinking `h` by more than one hop between
+consecutive centers) rebuilds the deque from the retained samples of the
+new window, at O(2h + 1) for that hop. The §1.7 lookahead reads the next
+center's `M` from the same deque without advancing it. See
+`docs/DECISIONS/2026-10-14-man193-centered-maximum-deque.md`.
+
 Rationale (design §1.3, §5.1): a *symmetric* window tracks QSB in both
 directions with no rise/decay asymmetry to tune, and a maximum (not a
 mean) cannot be dragged by a long dah or a run of dits.
@@ -200,6 +209,13 @@ then reports the FIR output. No hop is dropped and none is fed as
 `llr = 0`. Historical note: when this section was written the call site was
 deferred to MAN-168, and the text asked MAN-168 to re-derive the 16 ms
 rise-time budget against the real implementation before wiring it.
+End-to-end coverage: golden vector V51 (SPEC §7, MAN-210) decodes V9's
+drift scene with `refine_bw_hz = 30` through `manta decode --json
+--config`, asserting decode quality and that the config reaches the
+pipeline; the drain protocols themselves (a dropped backlog at a channel
+reset or at EOF stays inside V51's CER bar) are asserted on the same real
+scene by `real_drift_scene_drains_refiner_backlog_at_resets_and_eof`
+(`crates/manta-engine/src/track.rs`, MAN-210).
 
 ---
 
