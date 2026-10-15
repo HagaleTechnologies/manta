@@ -1807,7 +1807,9 @@ impl Metrics {
             self.ws_clients.load(Ordering::Relaxed)
         ));
 
-        out.push_str("# HELP manta_active_tracks Currently active decoder tracks.\n");
+        out.push_str(
+            "# HELP manta_active_tracks Currently decoding CW tracks (keyed CW only, MAN-313).\n",
+        );
         out.push_str("# TYPE manta_active_tracks gauge\n");
         out.push_str(&format!(
             "manta_active_tracks {}\n",

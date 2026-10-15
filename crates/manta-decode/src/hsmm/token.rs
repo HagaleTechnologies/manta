@@ -16,6 +16,11 @@ pub struct HistEntry {
     pub glyph: Option<Glyph>,
     pub sample_ts: u64,
     pub born_hop: u64,
+    /// MAN-189: input sample counter at the first hop of this entry's
+    /// character -- the anchor its first mark began at. A word boundary
+    /// carries the character it follows. `commit::Frontier` compares it
+    /// with what has already been emitted.
+    pub char_start_ts: u64,
     /// Segment that closed this history entry. `Some(CGap)` on a
     /// glyph-carrying entry, `Some(WGap)`/`Some(Silence)` on both entries
     /// those transitions append, `None` for an entry with no closing
@@ -35,6 +40,10 @@ pub struct Token {
     pub score: f32,
     pub hist: Vec<HistEntry>,
     pub anchor_hop: u64,
+    /// MAN-189: where the character this token is building began (the
+    /// `seg_start_ts` of its first mark). Stale while the token is at
+    /// `ROOT` between characters.
+    pub char_start_ts: u64,
 }
 
 pub fn glyph_rank(g: Option<Glyph>) -> u32 {
@@ -98,6 +107,11 @@ impl Token {
             u = u.clamp(cfg.u_min, cfg.u_max);
         }
         let mut hist = self.hist.clone();
+        let char_start_ts = if seg.is_mark() && self.node == MorseTree::ROOT {
+            seg_start_ts
+        } else {
+            self.char_start_ts
+        };
         let (node, phase) = match seg {
             SegType::Dit | SegType::Dah => {
                 let e = if seg == SegType::Dit {
@@ -114,6 +128,7 @@ impl Token {
                     glyph: Some(g),
                     sample_ts: seg_start_ts,
                     born_hop: end_hop,
+                    char_start_ts,
                     closing_segment: Some(seg),
                 });
                 if seg != SegType::CGap {
@@ -121,6 +136,7 @@ impl Token {
                         glyph: None,
                         sample_ts: seg_start_ts,
                         born_hop: end_hop,
+                        char_start_ts,
                         closing_segment: Some(seg),
                     });
                 }
@@ -134,6 +150,7 @@ impl Token {
             score,
             hist,
             anchor_hop: end_hop,
+            char_start_ts,
         })
     }
 }
@@ -151,6 +168,7 @@ mod tests {
             score: 0.0,
             hist: Vec::new(),
             anchor_hop: 0,
+            char_start_ts: 0,
         }
     }
 
@@ -178,6 +196,36 @@ mod tests {
         assert_eq!(t.hist[0].glyph, Some(Glyph::Char('A')));
         assert_eq!(t.hist[0].sample_ts, 65 * 512);
         assert!((t.u - 13.0).abs() < 1e-4, "u drifted to {}", t.u);
+    }
+
+    #[test]
+    fn hist_entry_carries_its_characters_first_mark_start() {
+        // MAN-189: both entries a WGap closes (the glyph and the word
+        // boundary) record where the character's first mark began, not
+        // where its closing gap began; the next character's first mark
+        // starts a fresh value.
+        let tree = MorseTree::shared();
+        let cfg = HsmmConfig::default();
+        let t = root_token(13.0)
+            .successor(SegType::Dit, 13, 50.0, tree, &cfg, 13, 1000)
+            .unwrap();
+        let t = t
+            .successor(SegType::EGap, 13, 50.0, tree, &cfg, 26, 2000)
+            .unwrap();
+        let t = t
+            .successor(SegType::Dah, 39, 150.0, tree, &cfg, 65, 3000)
+            .unwrap();
+        let t = t
+            .successor(SegType::WGap, 91, 300.0, tree, &cfg, 156, 4000)
+            .unwrap();
+        assert_eq!(t.hist.len(), 2);
+        for e in &t.hist {
+            assert_eq!((e.sample_ts, e.char_start_ts), (4000, 1000), "{e:?}");
+        }
+        let t = t
+            .successor(SegType::Dah, 39, 150.0, tree, &cfg, 195, 5000)
+            .unwrap();
+        assert_eq!(t.char_start_ts, 5000);
     }
 
     #[test]

@@ -91,7 +91,7 @@ missing series as "no loss" or "no traffic".
 | `manta_telnet_clients_connected` | gauge | — | Currently connected telnet clients. | Always. |
 | `manta_json_clients_connected` | gauge | — | Currently connected JSON Lines clients. | Always. |
 | `manta_ws_clients_connected` | gauge | — | Currently connected WebSocket clients. | Always. |
-| `manta_active_tracks` | gauge | — | Currently active decoder tracks. Copied from the decode loop every 250 ms; set to 0 while the source is in an outage. | Always. |
+| `manta_active_tracks` | gauge | — | Currently decoding CW tracks: open tracks that have shown CW keying and hold a decoder ([MAN-313](DECISIONS/2026-10-13-man313-non-cw-rejection.md); with `[detector] non_cw_filter = true` a newly confirmed signal is not counted until it qualifies, typically 0.5–1.5 s, and speech, data or swept carriers are never counted). Copied from the decode loop every 250 ms; set to 0 while the source is in an outage. | Always. |
 | `manta_static_crashes_total` | counter | — | Static crashes detected: times at least three quarters of the passband's channels rose 3 dB or more together for 8 ms or more, counted once per crash. A sudden band-wide level step (a gain change, or the input returning from digital silence) also counts once. Counted with any `[detector].crash_filter` value, including `"off"`. Stays 0 when the passband holds fewer than 96 channels. See [SPEC §2.7](SPEC-decode-core.md#27-band-wide-static-crash-detection-man-312) and [MAN-312](DECISIONS/2026-10-13-man312-static-crash-filter.md). | Always; starts at 0. Summed across source reconnects. |
 | `manta_rtty_signals` | gauge | `band` | RTTY (two-tone FSK) signals the detector currently marks, by amateur band. CW tracks are not started on a marked signal ([MAN-314](DECISIONS/2026-10-11-man314-rtty-recognition.md)). `band` is a band name such as `20m`, or `unknown` outside every band. Copied from the decode loop on every change; set to 0 while the source is in an outage and at shutdown. | One series per band after the first RTTY mark in that band; the series stays (at 0) after its signals clear. No samples before the first mark. |
 | `manta_source_health` | gauge | `source` | Health of each input source: 1 healthy, 0 unhealthy. `source` is the input type: `file`, `audio`, `kiwi`, `soapy`, `hpsdr` or `ka9q`. | One series per registered source, from the first health report. A file replay reports 1 at startup. Reconnecting sources report on each connect and disconnect; HPSDR reads 0 until the radio is confirmed live, and ka9q-radio until the first RTP packet of its channel arrives. |
@@ -238,7 +238,7 @@ document.
 | `uptime_seconds` | Whole seconds since the spot server and metrics endpoint started. |
 | `spots_total` | Same value as `manta_spots_total`. |
 | `telnet_clients`, `json_clients`, `ws_clients` | Same values as the three `*_clients_connected` gauges. |
-| `active_tracks` | Same value as `manta_active_tracks`. |
+| `active_tracks` | Same value as `manta_active_tracks`: keyed CW tracks being decoded, not every detected signal (MAN-313). |
 | `uplink.health` | `ok` when every enabled target is `connected`, `degraded` when some are, `down` when none are, `disabled` when no target is enabled (including no `[[rbn_uplink]]` at all). |
 | `uplink.connected_targets` | Targets whose `health` is `connected`. A flapping target is not counted. |
 | `uplink.enabled_targets` | Enabled targets. |

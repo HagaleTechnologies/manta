@@ -309,6 +309,8 @@ station_callsign = "N0CALL"
 #crash_filter = "full"               # static crashes: "full" ignores them, "starts-only" only blocks new tracks, "off"
 #rtty_filter = true                  # recognise RTTY (FSK) signals and start no CW track on them
 #rtty_dwell_ms = 20000.0             # how long an FSK signal must last before it is marked as RTTY
+#non_cw_filter = true                # decode a track only once it shows CW keying (rejects speech, data, sweeps)
+#unkeyed_close_ms = 10000.0          # close a track that stops keying (and read no callsign) after this long
 
 
 # --- Decoder -----------------------------------------------------------------

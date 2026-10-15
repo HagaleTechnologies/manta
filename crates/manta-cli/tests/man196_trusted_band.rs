@@ -132,10 +132,14 @@ fn carrier_promotions(iq: &[Complex32], trusted: bool) -> usize {
         cursor: 0,
         trusted_band_hz: trusted_band,
     };
+    // The scenes are steady unkeyed carriers, which the MAN-313 non-CW
+    // filter (rightly) never qualifies; count promotions with it off.
+    let mut cfg = PipelineConfig::default();
+    cfg.detector.non_cw_filter = false;
     let mut promoted = 0usize;
     listen(
         Box::new(src),
-        &PipelineConfig::default(),
+        &cfg,
         Arc::new(AtomicBool::new(false)),
         |ev| {
             if matches!(ev, DecoderEvent::TrackPromoted { .. }) {
