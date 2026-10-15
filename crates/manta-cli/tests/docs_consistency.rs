@@ -200,6 +200,9 @@ fn readme_status_says_pre_stability_alpha() {
 
 /// MAN-298: Installation offers a download of every archive the release
 /// workflow builds, so a platform added to the build matrix is documented too.
+/// MAN-82: that includes a standalone job's literal upload name
+/// (`build-soapy`'s `name: manta-linux-x86_64-soapy`), not only matrix
+/// `artifact:` entries.
 #[test]
 fn readme_installation_offers_every_release_archive() {
     let install = squash_whitespace(section(&doc("README.md"), "Installation"));
@@ -212,7 +215,7 @@ fn readme_installation_offers_every_release_archive() {
         "README Installation gives no download command"
     );
     let workflow = doc(".github/workflows/release-publish.yml");
-    let artifacts: Vec<&str> = workflow
+    let mut artifacts: Vec<&str> = workflow
         .lines()
         .filter_map(|l| l.trim().strip_prefix("artifact: "))
         .collect();
@@ -220,6 +223,16 @@ fn readme_installation_offers_every_release_archive() {
         !artifacts.is_empty(),
         "no `artifact:` entries in the release build matrix"
     );
+    let uploads: Vec<&str> = workflow
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("name: "))
+        .filter(|name| name.starts_with("manta-") && !name.contains("${{"))
+        .collect();
+    assert!(
+        uploads.contains(&"manta-linux-x86_64-soapy"),
+        "release-publish.yml no longer uploads `manta-linux-x86_64-soapy` by name"
+    );
+    artifacts.extend(uploads);
     for artifact in artifacts {
         let ext = if artifact.contains("windows") {
             "zip"
@@ -236,7 +249,7 @@ fn readme_installation_offers_every_release_archive() {
 
 /// Every command in the Quickstart must run on a build the reader was told
 /// to make. `--soapy-driver` needs `--features soapy`, which is in neither
-/// the default build nor any release binary.
+/// the default build nor any default release binary.
 #[test]
 fn readme_quickstart_only_uses_default_build_flags() {
     let readme = doc("README.md");
@@ -245,9 +258,76 @@ fn readme_quickstart_only_uses_default_build_flags() {
         assert!(
             !quickstart.contains(gated),
             "60-second demo uses feature-gated flag `{gated}`; it fails with \
-             `error: unexpected argument` on a default or release build"
+             `error: unexpected argument` on a default build or default release binary"
         );
     }
+}
+
+/// MAN-82: a SoapySDR operator can pick the Soapy archive from Installation
+/// and install what it needs to start, without a Rust toolchain.
+#[test]
+fn readme_installation_documents_the_soapy_archive() {
+    let install = squash_whitespace(section(&doc("README.md"), "Installation"));
+    assert!(
+        install.contains(
+            "| Linux x86-64 with SoapySDR, Ubuntu 24.04 | `manta-linux-x86_64-soapy.tar.gz` |"
+        ),
+        "README Installation has no archive-table row for the Soapy archive"
+    );
+    assert!(
+        !install.contains("SoapySDR needs a build from source"),
+        "README Installation still says SoapySDR needs a build from source"
+    );
+    for needle in [
+        "### SoapySDR on Linux x86_64",
+        "Ubuntu 24.04",
+        "libsoapysdr0.8",
+        "libasound2t64",
+        "soapysdr0.8-module-rtlsdr",
+        "soapysdr0.8-module-airspy",
+        "soapysdr0.8-module-hackrf",
+        "releases/latest/download/manta-linux-x86_64-soapy.tar.gz",
+        "features: hpsdr,soapy",
+        "libSoapySDR.so.0.8: cannot open shared object file",
+        "SoapySDR::Device::make() no match",
+        "unexpected argument '--soapy-driver'",
+        "https://github.com/pothosware/SoapySDRPlay3/blob/master/README.md",
+        "You do not need Rust",
+    ] {
+        assert!(
+            install.contains(needle),
+            "README Installation's Soapy setup never says `{needle}`"
+        );
+    }
+    let notes = install.to_lowercase();
+    assert!(
+        notes.contains("bundles neither the vendor api nor driver modules"),
+        "README must say the Soapy archive bundles no SDRplay API or device modules"
+    );
+}
+
+/// MAN-82: `soapysdr0.8-module-airspy` drives the Airspy R2/Mini only. The
+/// Airspy HF+ (manta's reference device) needs SoapyAirspyHF, which Ubuntu
+/// 24.04 does not package, so the module table must not send HF+ users to
+/// the wrong package.
+#[test]
+fn readme_soapy_setup_separates_airspy_hf_plus() {
+    let install = squash_whitespace(section(&doc("README.md"), "Installation"));
+    for needle in [
+        "| Airspy R2 or Airspy Mini | `soapysdr0.8-module-airspy` |",
+        "| Airspy HF+ |",
+        "libairspyhf-dev",
+        "https://github.com/pothosware/SoapyAirspyHF",
+    ] {
+        assert!(
+            install.contains(needle),
+            "README Installation's Soapy module table never says `{needle}`"
+        );
+    }
+    assert!(
+        !install.contains("| Airspy | `soapysdr0.8-module-airspy` |"),
+        "README Installation still offers `soapysdr0.8-module-airspy` for every Airspy"
+    );
 }
 
 // ---- Scenario 4: ROADMAP's RBN-admission item ----

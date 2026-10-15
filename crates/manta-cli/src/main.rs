@@ -40,9 +40,11 @@ mod logging;
 mod reconnect;
 mod reload;
 mod source_check;
+mod stdio;
 mod text_lines;
 use list_cache::ListKind;
 use reconnect::ReconnectingSource;
+use stdio::{errln, out, outln};
 
 #[derive(Parser)]
 #[command(
@@ -2867,26 +2869,60 @@ fn merge_cli_engine(
     file_decode
 }
 
-/// MAN-78 (supersedes MAN-85's ctrlc `termination` feature on Unix):
-/// SIGTERM always drains; SIGHUP drains too unless this is a daemon
-/// (`[server]`), where it requests a reload instead -- the returned
-/// `Signals` buffers it for `reload::spawn`. Installed with ctrlc, before
-/// the `listening:` banner (MAN-122 round 6). ctrlc refuses to share a
-/// signal (`MultipleHandlers`), so it must no longer own SIGTERM/SIGHUP.
+/// MAN-78 (supersedes MAN-85's ctrlc `termination` feature on Unix), MAN-232:
+/// SIGINT and SIGTERM always drain; SIGHUP drains too unless this is a daemon
+/// (`[server]`), where it requests a reload instead -- the returned `Signals`
+/// buffers it for `reload::spawn`. Each stop signal gets ONE handler action:
+/// store `stop` (the drain watches it), then atomically `swap` `signalled`
+/// to `true` and `_exit(128 + signal)` if it was already set. One action,
+/// not separate store/check/arm registrations, because (a) a signal
+/// delivered between separate registrations would run only some of them,
+/// and (b) handlers for *different* signals nest (signal-hook installs with
+/// an empty `sa_mask`), so a load-then-store pair lets two concurrent stop
+/// signals both see "not yet signalled" and neither exit. The swap makes
+/// "first or second?" a single atomic decision. So the first stop signal
+/// only requests the drain, and any second one ends the process from
+/// inside the handler -- the one place that still runs while the decode
+/// thread is blocked in a stdout write (SA_RESTART restarts that write, and
+/// std retries EINTR anyway). Only these handlers set `signalled`: a closed
+/// stdout and the post-loop `stop_ready` store set `stop` without arming it.
+/// Installed before the `listening:` banner (MAN-122 round 6).
 #[cfg(unix)]
 fn install_unix_signal_handlers(
     stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     daemon: bool,
 ) -> Result<Option<signal_hook::iterator::Signals>> {
-    use signal_hook::consts::{SIGHUP, SIGTERM};
-    signal_hook::flag::register(SIGTERM, stop.clone()).context("installing the SIGTERM handler")?;
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    use std::sync::atomic::Ordering;
+    let signalled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut stop_signals = vec![(SIGINT, "SIGINT"), (SIGTERM, "SIGTERM")];
+    if !daemon {
+        stop_signals.push((SIGHUP, "SIGHUP"));
+    }
+    for (signal, name) in stop_signals {
+        let stop = stop.clone();
+        let signalled = signalled.clone();
+        // SAFETY: the action runs in signal context, so it may only do
+        // async-signal-safe work. It does: two lock-free atomic operations
+        // on `AtomicBool`s it owns (via `Arc` clones, never freed while
+        // registered) and `low_level::exit`, which is `_exit(2)` --
+        // async-signal-safe and skipping at-exit hooks. No allocation, no
+        // locks, no I/O.
+        unsafe {
+            signal_hook::low_level::register(signal, move || {
+                stop.store(true, Ordering::SeqCst);
+                if signalled.swap(true, Ordering::SeqCst) {
+                    signal_hook::low_level::exit(128 + signal);
+                }
+            })
+        }
+        .with_context(|| format!("installing the {name} handler"))?;
+    }
     if daemon {
         let signals = signal_hook::iterator::Signals::new([SIGHUP])
             .context("installing the SIGHUP handler")?;
         Ok(Some(signals))
     } else {
-        signal_hook::flag::register(SIGHUP, stop.clone())
-            .context("installing the SIGHUP handler")?;
         Ok(None)
     }
 }
@@ -4684,7 +4720,7 @@ fn refuse_rbn_compare_replay(resolved: &Resolved, source_flag: bool) -> Result<(
 /// that the command does not apply (D7).
 fn note_ignored_tables(loaded: &config::Loaded, command: &str, applied: &[&str]) {
     if let Some(note) = ignored_tables_note(loaded, command, applied) {
-        eprintln!("{note}");
+        errln!("{note}");
     }
 }
 
@@ -5204,6 +5240,13 @@ fn invalid_status_doc(e: serde_json::Error) -> anyhow::Error {
 fn main() -> std::process::ExitCode {
     match run_command() {
         Ok(code) => code,
+        // MAN-232: stdout's reader went away; the failing command already
+        // said what it needed to (run's drain logs `stdout closed; stopping`),
+        // so exit 141 silently -- what a shell reports for a SIGPIPE'd
+        // producer.
+        Err(err) if err.downcast_ref::<stdio::StdoutClosed>().is_some() => {
+            std::process::ExitCode::from(stdio::EXIT_STDOUT_CLOSED)
+        }
         Err(err) => {
             // MAN-124: under --log-format json the error is a log record too,
             // whatever the level filter; exit status stays 1. MAN-270: in
@@ -5211,7 +5254,7 @@ fn main() -> std::process::ExitCode {
             if logging::is_json() {
                 logging::fatal(&fmt::cause_text(&err));
             } else {
-                eprintln!("{}", fmt::render_error(&err));
+                errln!("{}", fmt::render_error(&err));
             }
             std::process::ExitCode::FAILURE
         }
@@ -5226,7 +5269,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             let code = match source_check::run(args) {
                 Ok(code) => code,
                 Err(error) => {
-                    eprintln!("{}", fmt::render_error(&error));
+                    errln!("{}", fmt::render_error(&error));
                     1
                 }
             };
@@ -5263,7 +5306,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 || shared.capture_rate_hz.is_some()
                 || shared.replay_epoch.is_some()
             {
-                eprintln!(
+                errln!(
                     "note: decode applies only input.freq_correction_ppm from [input] in {}",
                     loaded.origin
                 );
@@ -5301,7 +5344,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 if let Some(warning) =
                     recording_center_warning(&path, sidecar.map(|sc| sc.center_freq_hz))
                 {
-                    eprintln!("{warning}");
+                    errln!("{warning}");
                     // Keep the warning true: a negative sidecar centre
                     // decodes at 0.0, not shifted by itself.
                     center_freq_hz = Some(0.0);
@@ -5309,20 +5352,20 @@ fn run_command() -> Result<std::process::ExitCode> {
             }
             let report = decode_wav(&path, center_freq_hz, &cfg)?;
             if json {
-                println!("{}", serde_json::to_string(&report)?);
+                outln!("{}", serde_json::to_string(&report)?)?;
             } else {
-                println!("{}", report.text);
-                eprintln!("{}", fmt::decode_summary(&report));
+                outln!("{}", report.text)?;
+                errln!("{}", fmt::decode_summary(&report));
                 // MAN-314: only when RTTY was marked, so a CW-only decode
                 // keeps MAN-270's one-line summary.
                 if !report.rtty.is_empty() {
-                    eprintln!("{}", rtty_line(&report.rtty, report.sample_rate_hz));
+                    errln!("{}", rtty_line(&report.rtty, report.sample_rate_hz));
                 }
                 // MAN-315: the primary track's learned sender timing, on
                 // request only, so the default stderr stays the summary.
                 if timing {
                     if let Some(estimates) = &report.timing {
-                        eprintln!("timing (dits, mean ± sd): {}", estimates.display_line());
+                        errln!("timing (dits, mean ± sd): {}", estimates.display_line());
                     }
                 }
             }
@@ -5361,7 +5404,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     writeln!(w, "{}", serde_json::to_string(r)?)?;
                 }
             }
-            println!("{}", serde_json::to_string_pretty(&summary)?);
+            outln!("{}", serde_json::to_string_pretty(&summary)?)?;
         }
         Command::Gen { vector, out } => {
             let spec = match vector.as_str() {
@@ -5392,7 +5435,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             };
             std::fs::create_dir_all(&out)?;
             let manifest = manta_testkit::vectors::write_fixture_set(&spec, &out)?;
-            eprintln!(
+            errln!(
                 "wrote {}/{{{}.wav,{}.json,{}.manifest.json}} (expected frequency {})",
                 out.display(),
                 spec.name,
@@ -5643,17 +5686,28 @@ fn run_command() -> Result<std::process::ExitCode> {
             // tasks (see `start_spot_server`), so its ordering against
             // per-connection lines is unchanged.
             //
-            // MAN-78: ctrlc covers SIGINT, plus Ctrl-C/Ctrl-Break on
-            // Windows; on Unix, `install_unix_signal_handlers` adds SIGTERM
-            // and SIGHUP at the same point, so the same covered window
-            // holds for every signal.
+            // MAN-78/MAN-232: on Unix, `install_unix_signal_handlers` owns
+            // every stop signal (SIGINT, SIGTERM, and SIGHUP without a
+            // `[server]` table) through signal-hook, at the same point, so
+            // the same covered window holds for every signal; ctrlc is
+            // Windows-only below, for console events.
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let stop_handler = stop.clone();
-            ctrlc::set_handler(move || {
-                stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
-            })?;
             #[cfg(unix)]
             let reload_signals = install_unix_signal_handlers(&stop, loaded.server.is_some())?;
+            // MAN-232: Windows' Ctrl-C/Ctrl-Break; on Unix every stop signal
+            // is signal-hook's (`install_unix_signal_handlers` above). A
+            // second event exits at once, as a second SIGINT does on Unix.
+            #[cfg(windows)]
+            {
+                let stop_handler = stop.clone();
+                let signalled = std::sync::atomic::AtomicBool::new(false);
+                ctrlc::set_handler(move || {
+                    if signalled.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        std::process::exit(130);
+                    }
+                    stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
+                })?;
+            }
             // MAN-316: the cty.dat/MASTER.SCP every consumer shares (D3);
             // with refresh on and a live source, the cache's last good
             // download replaces the built-in copy here, before the
@@ -5963,7 +6017,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             // json` it is a leveled INFO record (MAN-124). Two jobs: `listen` otherwise prints
             // nothing at startup (2026-09-05 review, lens 1 #4/#7), and it
             // is the readiness handshake `tests/signal_shutdown.rs` waits
-            // for. It remains AFTER `ctrlc::set_handler`, which as of
+            // for. It remains AFTER the signal handlers are installed, which as of
             // review round 6 runs further above (before `start_spot_server`
             // and its `listening:` banner), so every startup line this
             // daemon emits -- this marker and the banner alike -- is now
@@ -6026,6 +6080,11 @@ fn run_command() -> Result<std::process::ExitCode> {
             // `ready: decoding` for a run that shuts down without ever
             // decoding a chunk.
             let stop_ready = stop.clone();
+            // MAN-232: run's stdout lines go through `StopOnClose`: the
+            // first failed write sets `stop` -- starting the same drain a
+            // signal starts, so connected clients still drain -- and the
+            // stored error becomes exit 141 at `finish()`, after the drain.
+            let stdout_lines = stdio::StopOnClose::stdout(stop.clone());
             // MAN-123: decoded text is grouped per track (text_lines.rs) and
             // goes to stderr; stdout carries spots. A daemon -- servers
             // started from a [server] table -- logs no decoded text unless
@@ -6078,7 +6137,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 },
                 |ev| {
                     if json {
-                        println!("{}", serde_json::to_string(ev).unwrap());
+                        stdout_lines.line(format_args!("{}", serde_json::to_string(ev).unwrap()));
                         return;
                     }
                     if !print_text {
@@ -6088,7 +6147,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                         if logging::is_json() {
                             tracing::info!(target: "manta::text", "{line}");
                         } else {
-                            eprintln!("{line}");
+                            errln!("{line}");
                         }
                     }
                 },
@@ -6127,10 +6186,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                         }
                     }
                     if json {
-                        println!("{}", serde_json::json!({ "spot": spot }));
+                        stdout_lines.line(format_args!("{}", serde_json::json!({ "spot": spot })));
                         return;
                     }
-                    println!("{}", fmt::spot_line(spot));
+                    stdout_lines.line(format_args!("{}", fmt::spot_line(spot)));
                 },
                 // MAN-122 review round 1: the live track gauge comes from
                 // `TrackManager`'s own lifecycle -- how many tracks are
@@ -6223,7 +6282,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     if logging::is_json() {
                         tracing::info!(target: "manta::text", "{line}");
                     } else {
-                        eprintln!("{line}");
+                        errln!("{line}");
                     }
                 }
             }
@@ -6351,6 +6410,11 @@ fn run_command() -> Result<std::process::ExitCode> {
                 shutdown_runtime_after_drain(rt, &server.tasks);
             }
             listen_result?;
+            // MAN-232: a closed (or otherwise failed) stdout reader stopped
+            // the loop above through `stop`; only now, with the drain done,
+            // does it become the run's exit status (141 / 1). A source
+            // failure still wins, because it is reported first.
+            stdout_lines.finish()?;
         }
         Command::Soak {
             duration,
@@ -6456,13 +6520,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                 true,
             )?;
             if loaded.server.is_some() {
-                eprintln!(
+                errln!(
                     "note: soak does not start the spot servers; ignoring [server] from {}",
                     loaded.origin
                 );
             }
             if let Some(note) = replay_mode_ignored_note("soak", resolved.replay, &loaded.origin) {
-                eprintln!("{note}");
+                errln!("{note}");
             }
             note_pinned_lists(&resolved.spot, &lists_in_use);
             // MAN-316: soak never refreshes; for a file it says so, as `run` does.
@@ -6482,10 +6546,10 @@ fn run_command() -> Result<std::process::ExitCode> {
             // The values are the intersected `rf_passband_hz()`, exactly
             // as `run`'s notice above (round-1 review, PR #300).
             if let Some((lo, hi)) = src.trusted_band_hz().map(|_| src.rf_passband_hz()) {
-                eprintln!("{}", trusted_band_notice(src.sample_rate(), lo, hi));
+                errln!("{}", trusted_band_notice(src.sample_rate(), lo, hi));
             }
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
-            print!("{}", fmt::soak_report(&report));
+            out!("{}", fmt::soak_report(&report))?;
             if !manta_engine::soak_passed(&report) {
                 return Ok(std::process::ExitCode::FAILURE);
             }
@@ -6509,14 +6573,14 @@ fn run_command() -> Result<std::process::ExitCode> {
             let doc = match run_status(config.as_deref(), addr.as_deref(), timeout_secs) {
                 Ok(doc) => doc,
                 Err(e) => {
-                    eprintln!("{}", status_failure_message(&e));
+                    errln!("{}", status_failure_message(&e));
                     return Ok(std::process::ExitCode::from(2));
                 }
             };
             if json {
-                print!("{}", doc.to_json());
+                out!("{}", doc.to_json())?;
             } else {
-                print!("{}", manta_server::status_doc::render_human(&doc));
+                out!("{}", manta_server::status_doc::render_human(&doc))?;
             }
             return Ok(std::process::ExitCode::from(status_exit_code(&doc)));
         }
@@ -6655,7 +6719,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             note_pinned_lists(&resolved.spot, &lists_in_use);
             if let Some(note) = replay_mode_ignored_note("doctor", resolved.replay, &loaded.origin)
             {
-                eprintln!("{note}");
+                errln!("{note}");
             }
             // MAN-126: named setup checks first, each printed as it is
             // known; the receiver and signal stages become check lines too,
@@ -6678,6 +6742,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                 },
                 &mut sink,
             );
+            // MAN-232: a failed setup-check write stops doctor here, so
+            // `doctor | true` does not open the receiver and run the signal
+            // check for a reader that left.
+            sink.written()?;
             warn_if_audio_source_has_no_rf_reference(rf_aware, resolved.dial_freq_hz);
             let report = match spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz) {
                 Err(e) => {
@@ -6689,15 +6757,19 @@ fn run_command() -> Result<std::process::ExitCode> {
                         &receiver,
                         Ok(src.sample_rate()),
                     ));
+                    // MAN-232: a failed receiver-line write stops doctor
+                    // before the signal check runs for its full duration
+                    // for a reader that already left.
+                    sink.written()?;
                     match manta_engine::doctor(src, &cfg, std::time::Duration::from_secs(duration))
                     {
                         Ok(report) => {
                             if !json {
-                                println!();
-                                print!("{}", fmt::doctor_report(&report));
+                                outln!()?;
+                                out!("{}", fmt::doctor_report(&report))?;
                                 let requested = std::time::Duration::from_secs(duration);
                                 if let Some(hint) = fmt::doctor_rerun_hint(&report, requested) {
-                                    print!("{hint}");
+                                    out!("{hint}")?;
                                 }
                             }
                             Some(report)
@@ -6709,6 +6781,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                     }
                 }
             };
+            // MAN-232: again after the receiver/signal stage, for the same
+            // reason as the first `written()` call.
+            sink.written()?;
             let checks = sink.checks;
             if json {
                 // `verdict()` is computed, not a stored field, so a plain
@@ -6731,15 +6806,14 @@ fn run_command() -> Result<std::process::ExitCode> {
                     "checks_status".to_string(),
                     serde_json::to_value(doctor_checks::worst(&checks))?,
                 );
-                println!("{}", serde_json::to_string(&map)?);
+                outln!("{}", serde_json::to_string(&map)?)?;
             } else {
-                println!();
-                println!("{}", doctor_checks::summary(&checks));
+                outln!()?;
+                outln!("{}", doctor_checks::summary(&checks))?;
             }
             // As `manta status` does: the specific lines above are the
-            // whole story, so no generic `Error:` line follows them.
-            use std::io::Write as _;
-            std::io::stdout().flush()?;
+            // whole story, so no generic `Error:` line follows them (every
+            // write above flushed, so no trailing flush is needed either).
             if doctor_checks::worst(&checks) == doctor_checks::Status::Fail {
                 return Ok(std::process::ExitCode::FAILURE);
             }
@@ -6841,7 +6915,7 @@ fn run_command() -> Result<std::process::ExitCode> {
         }
         Command::ManPages { out } => {
             let n = cli_docs::write_man_pages(Cli::command(), &out)?;
-            eprintln!("wrote {n} man pages to {}", out.display());
+            errln!("wrote {n} man pages to {}", out.display());
         }
     }
     Ok(std::process::ExitCode::SUCCESS)
@@ -6898,11 +6972,11 @@ fn warn_deprecations() {
     let argv = std::env::args_os().map(|a| a.to_string_lossy().into_owned());
     for d in deprecations(argv) {
         match d {
-            Deprecation::ListenVerb => eprintln!(
+            Deprecation::ListenVerb => errln!(
                 "warning: starting the daemon with `manta listen` is deprecated and will be \
                  removed in a future release; use `manta run --config` instead."
             ),
-            Deprecation::ServerConfigFlag => eprintln!(
+            Deprecation::ServerConfigFlag => errln!(
                 "warning: `--server-config` is deprecated and will be removed in a future \
                  release; use `--config` instead."
             ),

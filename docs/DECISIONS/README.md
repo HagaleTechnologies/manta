@@ -16,7 +16,9 @@ Add a row here in the same change that adds a record:
 | 2026-10-15 | MAN-235 | [MAN-235: doctor hints a longer run, and --strict puts the verdict in the exit code](2026-10-15-man235-doctor-rerun-hint-and-strict-exit.md) |
 | 2026-10-15 | MAN-234 | [MAN-234: one bad input sample is replaced and counted, not fatal](2026-10-15-man234-bad-input-samples.md) |
 | 2026-10-15 | MAN-371 | [MAN-371: `test (windows-latest)` becomes a required check](2026-10-15-man371-windows-required-check.md) |
+| 2026-10-14 | MAN-82 | [MAN-82: a SoapySDR release archive for Linux x86_64](2026-10-14-man82-soapy-release-archive.md) |
 | 2026-10-14 | MAN-137 | [MAN-137: resumable JSON spot stream (hello, seq, WebSocket replay)](2026-10-14-man137-json-stream-resume.md) |
+| 2026-10-14 | MAN-232 | [MAN-232: a closed stdout stops manta through the drain; a second stop signal exits at once](2026-10-14-man232-closed-and-stalled-output.md) |
 | 2026-10-14 | MAN-248 | [MAN-248: a per-minute ceiling on spots the RBN uplink forwards](2026-10-14-man248-uplink-forwarding-ceiling.md) |
 | 2026-10-14 | MAN-211 | [MAN-211: TrackMeta's frequency is captured per queued hop, like its SNR](2026-10-14-man211-trackmeta-freq-per-hop.md) |
 | 2026-10-14 | MAN-197 | [MAN-197: a live track's input selection also skips cooling-down channels](2026-10-14-man197-live-window-cooldown-enforcement.md) |

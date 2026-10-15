@@ -2,6 +2,7 @@
 //! formatting cannot hide an operator-facing Debug rendering.
 use proc_macro2::{TokenStream, TokenTree};
 use std::path::{Path, PathBuf};
+use syn::spanned::Spanned as _;
 use syn::visit::{self, Visit};
 
 fn test_only(attrs: &[syn::Attribute]) -> bool {
@@ -37,6 +38,14 @@ fn debug_spec(text: &str) -> bool {
 struct Guard<'a> {
     path: &'a str,
     hits: Vec<String>,
+    /// MAN-232: also report every use of a panicking print macro
+    /// (`print`/`println`/`eprint`/`eprintln`) in non-test code.
+    ban_prints: bool,
+}
+
+/// The print macros whose write failure is a panic (MAN-232's guard).
+fn panicking_print(name: &str) -> bool {
+    matches!(name, "print" | "println" | "eprint" | "eprintln")
 }
 
 impl Guard<'_> {
@@ -56,6 +65,16 @@ impl Guard<'_> {
         ) {
             return;
         }
+        if self.ban_prints && panicking_print(name) {
+            let at = tokens.span().start();
+            self.hits.push(format!(
+                "{}:{}:{}: panicking print macro {name}!",
+                self.path,
+                at.line,
+                at.column + 1
+            ));
+            return;
+        }
         let formats = matches!(
             name,
             "format"
@@ -64,6 +83,9 @@ impl Guard<'_> {
                 | "println"
                 | "eprint"
                 | "eprintln"
+                | "out"
+                | "outln"
+                | "errln"
                 | "write"
                 | "writeln"
                 | "anyhow"
@@ -196,6 +218,19 @@ fn check(path: &str, source: &str) -> Vec<String> {
     let mut guard = Guard {
         path,
         hits: Vec::new(),
+        ban_prints: false,
+    };
+    guard.visit_file(&parsed);
+    guard.hits
+}
+
+/// MAN-232's ban on panicking print macros over `manta-cli/src`.
+fn check_ban_prints(path: &str, source: &str) -> Vec<String> {
+    let parsed = syn::parse_file(source).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let mut guard = Guard {
+        path,
+        hits: Vec::new(),
+        ban_prints: true,
     };
     guard.visit_file(&parsed);
     guard.hits
@@ -217,6 +252,7 @@ fn guard_detects_nested_captured_hex_and_raw_debug_formats() {
     let location = regex::Regex::new(r"^snippet\.rs:[1-9][0-9]*:[1-9][0-9]*:").unwrap();
     for source in [
         r#"fn f() { println!("{:?}", x); }"#,
+        r#"fn f() { outln!("{:?}", x)?; }"#,
         r#"fn f() { operation().with_context(|| format!("bad {x:?}")); }"#,
         r#"fn f() { return Err(format!("bad {x:#?}")); }"#,
         r#"fn f() { x.parse().map_err(|e| format!("bad {e:?}")); }"#,
@@ -247,6 +283,65 @@ fn guard_ignores_comments_literal_braces_and_real_test_items() {
     ] {
         assert!(check("negative.rs", source).is_empty(), "{source}");
     }
+}
+
+/// MAN-232: a print macro panics when its write fails (a reader that exits
+/// made `decode | true` exit 101), so `manta-cli/src`'s commands use the
+/// error-returning `out!`/`outln!` and the error-ignoring `errln!` instead.
+#[test]
+fn ban_prints_detects_each_macro_and_skips_test_only_items() {
+    let location = regex::Regex::new(r"^snippet\.rs:[1-9][0-9]*:[1-9][0-9]*:").unwrap();
+    for source in [
+        r#"fn f() { println!("x"); }"#,
+        r#"fn f() { print!("x"); }"#,
+        r#"fn f() { eprint!("x"); }"#,
+        r#"fn f() { std::eprintln!("x"); }"#,
+    ] {
+        let hits = check_ban_prints("snippet.rs", source);
+        assert_eq!(hits.len(), 1, "{source}: {hits:?}");
+        assert!(location.is_match(&hits[0]), "{hits:?}");
+    }
+    for source in [
+        r#"#[cfg(test)] mod tests { fn f() { println!("x"); } }"#,
+        r#"fn f() { outln!("x")?; }"#,
+        r#"fn f() { errln!("y"); }"#,
+        r#"fn f() { out!("{}", x)?; }"#,
+    ] {
+        assert!(
+            check_ban_prints("negative.rs", source).is_empty(),
+            "{source}"
+        );
+    }
+}
+
+/// MAN-232: every command file in `manta-cli/src` stays free of panicking
+/// print macros in non-test code.
+#[test]
+fn cli_commands_never_use_panicking_print_macros() {
+    // MAN-232: commands outside its scope; remove a file here when it is
+    // converted (follow-up ticket: the remaining commands should survive a
+    // closed stdout).
+    const NOT_YET: &[&str] = &[
+        "bench.rs",
+        "calibrate_cmd.rs",
+        "config_cmd.rs",
+        "grade_cmd.rs",
+        "health_cmd.rs",
+        "source_check.rs",
+    ];
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut hits = Vec::new();
+    for entry in std::fs::read_dir(&src).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "rs") && !NOT_YET.iter().any(|n| path.ends_with(n))
+        {
+            hits.extend(check_ban_prints(
+                &path.display().to_string(),
+                &std::fs::read_to_string(&path).unwrap(),
+            ));
+        }
+    }
+    assert!(hits.is_empty(), "{}", hits.join("\n"));
 }
 
 #[test]

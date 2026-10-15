@@ -456,7 +456,9 @@ mod startup {
                     let Ok(line) = line else { break };
                     if tx.send(line).is_err() {
                         // Receiver gone: keep draining so the child never
-                        // hits EPIPE on a later `eprintln!`.
+                        // blocks on a later write to a full pipe (MAN-232
+                        // kept blocking writes; a closed one no longer
+                        // panics it).
                         continue;
                     }
                 }

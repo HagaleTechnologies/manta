@@ -144,25 +144,31 @@ this change. See [the MAN-244 decision](../DECISIONS/2026-10-10-man244-release-g
    delete a release tag.
  3. Pushing the tag triggers both workflows:
     - **`release.yml`** builds and packages all five targets (macOS
-      x86_64/arm64, Windows x86_64, Linux x86_64/arm64) and validates the
+      x86_64/arm64, Windows x86_64, Linux x86_64/arm64), plus the sixth
+      archive, `manta-linux-x86_64-soapy.tar.gz`, from its `build-soapy`
+      job (MAN-82, see "The SoapySDR archive" below), and validates the
       multi-arch Docker build (`push: false`) — this run never publishes
       anything; it is a build-only check of the tagged commit (it no longer
       runs on pull requests at all, since HAG-47). The `validate-tag` job's
-      man-page steps render the man pages every archive ships (see "What
-      each artifact contains") from one native Linux build, after the tag
-      checks and before the matrix starts.
+      man-page steps render the man pages every `build` archive ships (see
+      "What each artifact contains") from one native Linux build, after the
+      tag checks and before the matrix starts; `build-soapy` renders its
+      own from the binary it packages.
     - **`release-publish.yml`** does the real work: `validate-tag` (checks
       tag grammar and default-branch ancestry before any platform build
       starts, and that the tagged commit's `ci-full.yml` push run passed
       every `test` and `test-hpsdr` leg, Windows included (MAN-156), then
       renders the man pages once from a native Linux build
       with the same `--features` as every build leg) → `build` (rebuilds
-      the same five targets and needs only `validate-tag`) → two jobs
-      side by side, both in the `ghcr-publish` environment:
+      the same five targets and needs only `validate-tag`) and, beside it,
+      `build-soapy` (the sixth archive, also needing only `validate-tag`)
+      → two jobs side by side, both in the `ghcr-publish` environment:
       `docker-publish-release` (pushes the multi-arch image to GHCR as
       `ghcr.io/hagaletechnologies/manta:X.Y.Z`, then `publish-latest` runs
-      after it; see below) and `release` (writes `SHA256SUMS` over the five
-      build artifacts, attests their build provenance, then creates the
+      after it; see below) and `release` (needs both `build` and
+      `build-soapy`, so a failed or skipped Soapy build publishes no
+      Release; writes `SHA256SUMS` over the six archives, attests their
+      build provenance, then creates the
       GitHub Release from the archives and `SHA256SUMS`; MAN-80, see
       "Verifying a downloaded release" below). The Release notes open with
       the pre-stability label above GitHub's generated list of merged pull
@@ -170,7 +176,7 @@ this change. See [the MAN-244 decision](../DECISIONS/2026-10-10-man244-release-g
       publish fails" below. The build-only workflow has the same ancestry
       guard before its platform builds.
 
-   Both workflows build all five targets cold: no build cache is restored
+   Both workflows build all five targets and the Soapy archive cold: no build cache is restored
    (MAN-243, `docs/DECISIONS/2026-10-10-man243-ci-trust-boundary.md`).
    Platform builds therefore take longer than a warm CI run. On 2026-10-05 a
    cold dispatch took 1m47s–6m11s per target, while the Docker job took
@@ -204,7 +210,7 @@ The GitHub Release does not wait for the Docker image (MAN-298). Once the
 owner approves `ghcr-publish`, `docker-publish-release` and `release` run
 side by side, so a failed image push leaves the Release in place. The run
 then shows `docker-publish-release` failed, `publish-latest` skipped and
-`release` succeeded: the Release has its five archives and `SHA256SUMS`,
+`release` succeeded: the Release has its six archives and `SHA256SUMS`,
 and GHCR has no `:X.Y.Z` image.
 
 Do not delete or re-push the tag. The binaries are published and attested,
@@ -301,7 +307,7 @@ in Docker/OCI's tag grammar (`[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`) — pushing
 such a tag used to reach Buildx 30 minutes into the build, get rejected
 there, and silently skip the GitHub Release along with it (MAN-65 finding
 1). Today, `validate-tag` rejects it within seconds of the push, before any
-of the five platform builds start, and the job's own log names the
+of the platform builds start, and the job's own log names the
 accepted grammar. If this happens, the owner deletes the bad tag
 (`git push origin :refs/tags/v1.2.3+linux`) and re-tags the reviewed commit
 without the suffix. Non-owners must not attempt to bypass the tag rule.
@@ -447,6 +453,55 @@ docker buildx imagetools inspect ghcr.io/hagaletechnologies/manta:X.Y.Z
 
 Both should report the same digest.
 
+## The SoapySDR archive
+
+`build-soapy` (MAN-82, both release workflows) builds
+`manta-linux-x86_64-soapy.tar.gz` natively on `ubuntu-24.04` with
+`--features hpsdr,soapy`, against the distro's `libsoapysdr-dev`. Before
+uploading the archive it:
+
+1. runs the three real-library Soapy input tests (`cargo test --release
+   --locked -p manta-input --features hpsdr,soapy --lib soapy::tests`);
+2. renders the man pages from the binary it packages, then packages it
+   with `scripts/package-release.py`;
+3. runs `scripts/check-soapy-release.py` on the archive, which extracts it
+   to a temporary directory and runs only the extracted `manta`:
+   `--version` lists `hpsdr,soapy`, `run`/`listen`/`check --help` offer the
+   four Soapy flags, the archive's `manta-run.1` and `manta-check.1`
+   document them, a nonexistent driver fails with SoapySDR's own `no match`
+   error (exit 1, not clap's exit 2), and `devices --json` enumerates Soapy
+   without error;
+4. repeats that in a fresh `ubuntu:24.04` container that sees only the
+   archive and the verifier, read-only: first, with only Python and the
+   ALSA runtime installed, `--version` must fail with the loader's
+   `libSoapySDR.so.0.8: cannot open shared object file`; then, after
+   installing `libsoapysdr0.8` and the RTL-SDR, Airspy and HackRF modules
+   (and checking that no Rust toolchain, compiler or `-dev` package is
+   present), every check above must pass.
+
+A failure in any of these stops the upload, and `release` publishes
+nothing. Fix the cause and re-run the failed jobs; keep the tag.
+
+To run the verifier on a local build (Linux, with `libsoapysdr-dev`
+installed):
+
+```sh
+cargo build --release --locked -p manta-cli --features hpsdr,soapy
+target/release/manta man-pages --out man-pages-soapy
+python3 scripts/package-release.py --binary target/release/manta --artifact manta-linux-x86_64-soapy --format tar.gz --man-dir man-pages-soapy --out-dir .
+python3 scripts/check-soapy-release.py manta-linux-x86_64-soapy.tar.gz
+```
+
+After publishing, repeat the check on the downloaded archive once it
+passes `sha256sum -c` (see "Verifying a downloaded release"). An operator
+whose binary will not start with `error while loading shared libraries:
+libSoapySDR.so.0.8` needs `sudo apt-get install libsoapysdr0.8` and their
+receiver's module; the install steps, the module table, SDRplay's external
+prerequisites and the other failure messages are in README's
+[SoapySDR on Linux x86_64](../../README.md#soapysdr-on-linux-x86_64).
+None of these checks attach a receiver: a hardware run with a real
+receiver is still a separate, manual check.
+
 ## What each artifact contains
 
 - **Windows** (`manta-windows-x86_64.zip`): `manta.exe`, `README.md`,
@@ -467,9 +522,17 @@ Both should report the same digest.
   `packaging/launchd/` (both plists, `create-service-account.sh`,
   `rotate-log.sh`) and `docs/RUNBOOKS/network-exposure.md`. See
   [docs/DECISIONS/2026-10-10-man268-unattended-packaging.md](../DECISIONS/2026-10-10-man268-unattended-packaging.md).
+- **SoapySDR Linux** (`manta-linux-x86_64-soapy.tar.gz`, MAN-82): the
+  same files as the Linux x86_64 archive, but the binary is built with
+  `--features hpsdr,soapy` on Ubuntu 24.04 and links
+  `libSoapySDR.so.0.8` dynamically. It needs `libsoapysdr0.8` and the
+  receiver's SoapySDR module installed as well as `libasound2t64`; it
+  bundles no SoapySDR library, device module or SDRplay API. See "The
+  SoapySDR archive" below.
 - **Man pages** (MAN-133, every archive): `man/man1/manta.1` and one page
   per command, rendered by the `validate-tag` job's man-page steps running
-  `manta man-pages`; `scripts/package-release.py --man-dir` refuses to
+  `manta man-pages` (the Soapy archive's by `build-soapy` from its own
+  binary, so they document the Soapy flags); `scripts/package-release.py --man-dir` refuses to
   build an archive without them.
 - **`SHA256SUMS`** (MAN-80, every Release): one `<sha256>  <archive>` line
   per archive above, bare file names, in `sha256sum` format. The same
@@ -485,7 +548,7 @@ Both should report the same digest.
 
 ## Verifying a downloaded release
 
-Every GitHub Release carries a `SHA256SUMS` file next to its five
+Every GitHub Release carries a `SHA256SUMS` file next to its six
 archives, and a GitHub build-provenance attestation covers each archive
 (MAN-80). Run both checks before you run a downloaded binary:
 
