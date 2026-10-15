@@ -11,7 +11,11 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+<<<<<<< HEAD
 | 2026-10-15 | MAN-236 | [MAN-236: the soak harness measures the loop manta run executes](2026-10-15-man236-soak-metrics-wraps-listen.md) |
+=======
+| 2026-10-15 | MAN-235 | [MAN-235: doctor hints a longer run, and --strict puts the verdict in the exit code](2026-10-15-man235-doctor-rerun-hint-and-strict-exit.md) |
+>>>>>>> cd9ec8f2897a18cd7243c989ba0ef26d307ca48d
 | 2026-10-15 | MAN-234 | [MAN-234: one bad input sample is replaced and counted, not fatal](2026-10-15-man234-bad-input-samples.md) |
 | 2026-10-15 | MAN-371 | [MAN-371: `test (windows-latest)` becomes a required check](2026-10-15-man371-windows-required-check.md) |
 | 2026-10-14 | MAN-248 | [MAN-248: a per-minute ceiling on spots the RBN uplink forwards](2026-10-14-man248-uplink-forwarding-ceiling.md) |
