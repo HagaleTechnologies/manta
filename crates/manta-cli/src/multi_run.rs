@@ -9,9 +9,10 @@ use crate::reconnect::{HealthSink, ReconnectingSource};
 use crate::{fmt, logging, text_lines, wrap_file_replay, LiveSourceSpec, ReplayMode, ResolvedInput};
 use anyhow::{bail, Result};
 use manta_engine::{InputSpec, PipelineConfig, SessionClock, SharedObservers};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use manta_server::metrics::Metrics;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Instant, SystemTime};
 
 /// What `run` hands the multi-input path.
 pub(crate) struct MultiRun<'a> {
@@ -19,6 +20,28 @@ pub(crate) struct MultiRun<'a> {
     pub replay: ReplayMode,
     pub cfg: &'a PipelineConfig,
     pub json: bool,
+    /// `Some` with a `[server]` table: one telnet/JSON/metrics server for
+    /// every input.
+    pub server: Option<ServerSetup>,
+}
+
+/// The `[server]` side of a multi-input daemon.
+pub(crate) struct ServerSetup {
+    pub cfg: manta_server::config::ServerConfig,
+    pub rbn_uplink: Vec<manta_server::config::RbnUplinkConfig>,
+    pub rbn_compare: Option<manta_server::config::RbnCompareConfig>,
+    pub lists: Arc<manta_engine::ReferenceLists>,
+    pub replay_epoch: Option<i64>,
+}
+
+/// The session nonce for several replayed files: each file's own nonce,
+/// folded in config order, so the same files give the same spot ids.
+fn replay_nonce(paths: &[&std::path::Path]) -> Result<u128> {
+    let mut nonce: u128 = 0;
+    for path in paths {
+        nonce = nonce.rotate_left(1) ^ crate::session_nonce_for_replay_path(path)?;
+    }
+    Ok(nonce)
 }
 
 /// `input "b" (b.wav) carries no frequency of its own`: with several
@@ -59,8 +82,13 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_handler = stop.clone();
     ctrlc::set_handler(move || stop_handler.store(true, Ordering::Relaxed))?;
+    #[cfg(unix)]
+    crate::install_unix_signal_handlers(&stop, false)?;
     let healthy = Arc::new(AtomicUsize::new(n));
     let opened_at: Arc<Mutex<Vec<Option<Instant>>>> = Arc::new(Mutex::new(vec![None; n]));
+    // Set once the server is up; the health sinks run on input threads.
+    let metrics_slot: Arc<OnceLock<Arc<Metrics>>> = Arc::new(OnceLock::new());
+    let crashes: Vec<Arc<AtomicU64>> = (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
 
     let specs = m
         .inputs
@@ -74,10 +102,14 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             let stop = stop.clone();
             let healthy = healthy.clone();
             let opened_at = opened_at.clone();
+            let metrics_slot = metrics_slot.clone();
             InputSpec {
                 name: input.name.clone(),
                 freq_correction_ppm: input.freq_correction_ppm,
-                observers: Default::default(),
+                observers: manta_engine::InputObservers {
+                    static_crashes: Some(crashes[index].clone()),
+                    ..Default::default()
+                },
                 open: Box::new(move || {
                     let first = spec.open(capture, dial)?;
                     if let Ok(mut at) = opened_at.lock() {
@@ -86,6 +118,9 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                     let reopen = spec.clone();
                     if spec.is_reconnectable() {
                         let on_health: HealthSink = Box::new(move |up| {
+                            if let Some(metrics) = metrics_slot.get() {
+                                metrics.set_source_health(&name, up);
+                            }
                             if up {
                                 healthy.fetch_add(1, Ordering::Relaxed);
                                 tracing::info!(
@@ -154,10 +189,69 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     } else {
         SessionClock::Replay
     };
+    let server = match m.server {
+        None => None,
+        Some(setup) => {
+            let first = &opened.inputs()[0];
+            let files: Vec<&std::path::Path> = m
+                .inputs
+                .iter()
+                .filter_map(|i| match &i.spec {
+                    LiveSourceSpec::File { path, .. } => Some(path.as_path()),
+                    _ => None,
+                })
+                .collect();
+            let (epoch, nonce) = if live {
+                let earliest = opened_at
+                    .lock()
+                    .ok()
+                    .and_then(|a| a.iter().flatten().min().copied());
+                let since = earliest.map_or(std::time::Duration::ZERO, |e| e.elapsed());
+                let epoch = SystemTime::now()
+                    .checked_sub(since)
+                    .unwrap_or_else(SystemTime::now);
+                let nonce = epoch
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos());
+                (epoch, nonce)
+            } else {
+                (
+                    crate::resolve_epoch(files.first().copied(), setup.replay_epoch)?,
+                    replay_nonce(&files)?,
+                )
+            };
+            let label = names.join(",");
+            let factor = manta_spot::calibration_factor_from_ppm(m.inputs[0].freq_correction_ppm)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let (rt, server) = crate::start_spot_server(
+                setup.cfg,
+                setup.rbn_uplink,
+                setup.rbn_compare,
+                crate::SourceInfo {
+                    name: &label,
+                    sample_rate_hz: opened.common_rate_hz(),
+                    dial_freq_hz: first.center_freq_hz,
+                    rf_passband_hz: first.rf_passband_hz,
+                    freq_calibration: factor,
+                },
+                epoch,
+                nonce,
+                setup.lists,
+                m.cfg,
+            )?;
+            server.metrics.arm_decode_watchdog();
+            for name in &names {
+                server.metrics.set_source_health(name, true);
+            }
+            let _ = metrics_slot.set(server.metrics.clone());
+            Some((rt, server))
+        }
+    };
     logging::note(&format!(
         "manta: listening on {n} inputs ({}); send SIGINT or SIGTERM to stop",
         names.join(", ")
     ));
+    let mut tracks = vec![0usize; n];
 
     let json = m.json;
     let mut text = text_lines::TrackLines::default();
@@ -176,13 +270,34 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             }
         },
         |spot| {
+            if let Some((_, server)) = &server {
+                let truncated = server.bus.publish(spot.clone());
+                if truncated > 0 {
+                    server.metrics.record_history_truncated(truncated as u64);
+                }
+                server.metrics.record_spot(spot);
+                let cty = server.lists.cty.load();
+                if crate::geography_is_unresolved(&cty, &spot.callsign)
+                    || crate::station_geography_unresolved(&cty, &server.station_callsign)
+                {
+                    server.metrics.record_unresolved_geography();
+                }
+            }
             if json {
                 println!("{}", serde_json::json!({ "spot": spot }));
             } else {
                 println!("{}", fmt::spot_line(spot));
             }
         },
-        |input, _n_tracks| {
+        |input, n_tracks| {
+            tracks[input] = n_tracks;
+            if let Some((_, server)) = &server {
+                server.metrics.set_active_tracks(tracks.iter().sum::<usize>() as u64);
+                server.metrics.set_static_crashes_total(
+                    crashes.iter().map(|c| c.load(Ordering::Relaxed)).sum(),
+                );
+                server.metrics.record_pipeline_batch();
+            }
             if !ready[input] && !stop_ready.load(Ordering::Relaxed) {
                 ready[input] = true;
                 tracing::info!(
@@ -193,6 +308,9 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             }
         },
         |end| {
+            if let Some((_, server)) = &server {
+                crate::record_terminal_source_health(&server.metrics, &end.name, &end.result);
+            }
             if let Err(e) = &end.result {
                 let _ = healthy.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |h| {
                     h.checked_sub(1)
@@ -209,6 +327,31 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         for line in text.finish() {
             eprintln!("{line}");
         }
+    }
+    if let Some((rt, server)) = server {
+        server.metrics.mark_decode_stopped();
+        server.metrics.set_active_tracks(0);
+        let _ = server.shutdown_tx.send(true);
+        let status_line = server
+            .status_line
+            .lock()
+            .ok()
+            .and_then(|mut handle| handle.take());
+        if let Some(status_line) = status_line {
+            let _ = rt.block_on(status_line);
+        }
+        let rbn_compare = server
+            .rbn_compare
+            .lock()
+            .ok()
+            .and_then(|mut handle| handle.take());
+        if let Some(rbn_compare) = rbn_compare {
+            let _ = rt.block_on(tokio::time::timeout(
+                crate::SHUTDOWN_DRAIN_DEADLINE,
+                rbn_compare,
+            ));
+        }
+        crate::shutdown_runtime_after_drain(rt, &server.tasks);
     }
     if let Some(failed) = ends.iter().find(|e| e.result.is_err()) {
         let e = failed.result.as_ref().err().map(|e| format!("{e:#}"));

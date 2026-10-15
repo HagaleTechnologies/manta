@@ -5615,19 +5615,25 @@ fn run_command() -> Result<std::process::ExitCode> {
             // MAN-13: several [[input]] entries decode on their own threads
             // into one validator and one spot output.
             if !resolved.inputs.is_empty() {
-                if loaded.server.is_some() {
-                    bail!(
-                        "{}: [server] with several [[input]] entries is not supported yet -- \
-                         run them without [server] (spots on stdout), or give each receiver \
-                         its own daemon until the multi-input daemon lands",
-                        loaded.origin
-                    );
-                }
+                let server = match loaded.server.clone() {
+                    None => None,
+                    Some(server_cfg) => Some(multi_run::ServerSetup {
+                        cfg: server_cfg,
+                        rbn_uplink: loaded.rbn_uplink.clone(),
+                        rbn_compare: resolved.rbn_compare.clone(),
+                        lists: std::sync::Arc::new(manta_engine::ReferenceLists::new(
+                            cfg.cty_table(),
+                            cfg.scp_set(),
+                        )),
+                        replay_epoch: resolved.replay_epoch,
+                    }),
+                };
                 return multi_run::run(multi_run::MultiRun {
                     inputs: &resolved.inputs,
                     replay: resolved.replay,
                     cfg: &cfg,
                     json,
+                    server,
                 });
             }
             let spec = &resolved.spec;

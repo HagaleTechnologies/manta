@@ -142,6 +142,35 @@ fn two_overlapping_file_inputs_spot_the_shared_station_once() {
 }
 
 #[test]
+fn multi_input_daemon_serves_one_stream() {
+    let (dir, a, b) = fixtures();
+    let config = write_config(
+        dir.path(),
+        "daemon.toml",
+        &format!(
+            "[server]\nstation_callsign = \"K5TR\"\nbind_addr = \"127.0.0.1\"\n\
+             metrics_bind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\n\
+             metrics_port = 0\n\n\
+             [[input]]\nname = \"a\"\ntype = \"file\"\npath = \"{}\"\niq = true\n\n\
+             [[input]]\nname = \"b\"\ntype = \"file\"\npath = \"{}\"\niq = true\n",
+            toml_path(a),
+            toml_path(b)
+        ),
+    );
+    let out = run_config(&config);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let want: BTreeMap<String, usize> = [("JA1ABC", 1), ("W1AW", 1), ("ZL2XYZ", 1)]
+        .iter()
+        .map(|(c, n)| (c.to_string(), *n))
+        .collect();
+    assert_eq!(spot_calls(&stdout), want, "{stdout}\n{stderr}");
+    assert!(stderr.contains("listening: source=a,b"), "{stderr}");
+    assert!(stderr.contains("station=K5TR"), "{stderr}");
+}
+
+#[test]
 fn multi_input_replay_stdout_is_byte_identical_across_three_runs() {
     let config = overlap_config();
     let first = run_config(&config);
