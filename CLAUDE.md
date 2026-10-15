@@ -339,7 +339,6 @@ report line and `manta_input_bad_samples_total{source}`; `manta check`
 still errors on non-finite input. See
 docs/DECISIONS/2026-10-15-man234-bad-input-samples.md.
 
-<<<<<<< HEAD
 MAN-233: a SoapySDR driver stream overflow returned as a read error
 counts one `manta_input_gaps_detected_total{source="soapy"}` gap event
 (present at 0 from the first scrape; `dropped_packets`/`malformed_packets`
@@ -349,7 +348,7 @@ overflow flagged `SOAPY_SDR_END_ABRUPT` on a successful read is not seen
 bounds are unchanged. The `soapy`-gated lines
 compile and test only in CI's `test-soapy` leg. See
 docs/DECISIONS/2026-10-15-man233-soapy-overflow-visibility.md.
-=======
+
 MAN-236: `soak_with_metrics` (the `man19-soak` harness and
 `examples/close_counts.rs`) wraps `listen_with_observers`, the loop
 `manta run` executes, instead of a copy. `ListenObservers::track_lifecycle`
@@ -358,7 +357,6 @@ count and peak, per-reason closes, repetition-gate record total and
 steady-state chunk count. Bounded fixed-seed runs reported identical
 counts before and after. See
 docs/DECISIONS/2026-10-15-man236-soak-metrics-wraps-listen.md.
->>>>>>> 8c92062aa574efa8ffb8dc7827b67d99178bd961
 
 ## Documents (read in this order)
 
