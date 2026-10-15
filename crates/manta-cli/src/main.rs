@@ -9596,6 +9596,167 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         "[input]\ntype = \"kiwi\"\nhost = \"127.0.0.1\"\nfreq_hz = 14025000.0\n\
                               freq_correction_ppm = 2.5\ncenter_freq_hz = 14000000.0\n";
 
+    // ---- MAN-13: several [[input]] entries ----
+
+    const THREE_KA9Q: &str = "[[input]]\nname = \"40m\"\ntype = \"ka9q\"\ngroup = \"239.1.2.3\"\n\
+        ssrc = 7030000\n\n[[input]]\nname = \"20m\"\ntype = \"ka9q\"\ngroup = \"239.1.2.3\"\n\
+        ssrc = 14030000\nfreq_correction_ppm = -1.5\ncapture_rate_hz = 48000.0\n\n\
+        [[input]]\nname = \"15m\"\ntype = \"kiwi\"\nhost = \"127.0.0.1\"\n\
+        freq_hz = 21030000.0\ncenter_freq_hz = 21000000.0\nfreq_correction_ppm = 0.8\n";
+
+    #[test]
+    fn resolve_returns_one_resolved_input_per_entry_with_its_own_ppm_dial_and_capture_rate() {
+        let loaded = loaded_from(THREE_KA9Q);
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        let names: Vec<&str> = r.inputs.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["40m", "20m", "15m"]);
+        assert!(matches!(r.inputs[0].spec, LiveSourceSpec::Ka9q(_)));
+        assert!(matches!(r.inputs[2].spec, LiveSourceSpec::Kiwi(_)));
+        assert_eq!(r.inputs[0].freq_correction_ppm, 0.0);
+        assert_eq!(r.inputs[1].freq_correction_ppm, -1.5);
+        assert_eq!(r.inputs[1].capture_rate_hz, Some(48_000.0));
+        assert_eq!(r.inputs[2].freq_correction_ppm, 0.8);
+        assert_eq!(r.inputs[2].dial_freq_hz, Some(21_000_000.0));
+        assert_eq!(r.inputs[0].dial_freq_hz, None);
+    }
+
+    #[test]
+    fn a_cli_source_flag_replaces_the_input_list_with_a_note() {
+        let loaded = loaded_from(THREE_KA9Q);
+        let cli = CliOverrides {
+            kiwi: KiwiOpts {
+                host: Some("kiwi.example.net".into()),
+                port: 8073,
+                freq: Some(14_030_000.0),
+                password: String::new(),
+            },
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded).unwrap();
+        assert!(r.inputs.is_empty());
+        assert!(matches!(r.spec, LiveSourceSpec::Kiwi(_)));
+        assert_eq!(r.freq_correction_ppm, 0.0);
+        assert_eq!(
+            r.notes,
+            vec![format!(
+                "note: --kiwi-host selects the source; ignoring the 3 [[input]] entries from {}",
+                loaded.origin
+            )]
+        );
+    }
+
+    #[test]
+    fn per_receiver_cli_flags_are_refused_with_two_or_more_inputs() {
+        let loaded = loaded_from(THREE_KA9Q);
+        for (cli, flag, key) in [
+            (
+                CliOverrides {
+                    freq_correction_ppm: Some(1.0),
+                    ..cli_overrides()
+                },
+                "--freq-correction-ppm",
+                "freq_correction_ppm",
+            ),
+            (
+                CliOverrides {
+                    dial_freq_hz: Some(7_000_000.0),
+                    ..cli_overrides()
+                },
+                "--dial-freq-hz",
+                "center_freq_hz",
+            ),
+            (
+                CliOverrides {
+                    capture_rate_hz: Some(48_000.0),
+                    ..cli_overrides()
+                },
+                "--capture-rate-hz",
+                "capture_rate_hz",
+            ),
+        ] {
+            let err = resolve(cli, &loaded).err().unwrap().to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "{flag} applies to one receiver and {} has 3 [[input]] entries; set {key} in \
+                     the entry, or name one receiver with a source flag",
+                    loaded.origin
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn realtime_loop_and_replay_epoch_flags_apply_to_every_file_input() {
+        let loaded = loaded_from(
+            "[[input]]\nname = \"a\"\ntype = \"file\"\npath = \"/x/a.wav\"\n\n\
+             [[input]]\nname = \"b\"\ntype = \"file\"\npath = \"/x/b.wav\"\n",
+        );
+        let cli = CliOverrides {
+            realtime: true,
+            replay_epoch: Some(1_700_000_000),
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded).unwrap();
+        assert_eq!(r.inputs.len(), 2);
+        assert!(r.replay.paced);
+        assert_eq!(r.replay_epoch, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn single_input_resolution_is_unchanged() {
+        let loaded = loaded_from(KIWI_INPUT);
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        assert!(r.inputs.is_empty());
+        assert!(matches!(r.spec, LiveSourceSpec::Kiwi(_)));
+        assert_eq!(r.freq_correction_ppm, 2.5);
+        assert_eq!(r.dial_freq_hz, Some(14_000_000.0));
+    }
+
+    #[test]
+    fn select_input_requires_a_name_with_two_or_more_inputs() {
+        let mut loaded = loaded_from(THREE_KA9Q);
+        let err = select_input(&mut loaded, None, "doctor").unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "manta doctor checks one receiver at a time and {} has 3 inputs: pass --input \
+                 40m, --input 20m or --input 15m",
+                loaded.origin
+            )
+        );
+    }
+
+    #[test]
+    fn select_input_refuses_an_unknown_name() {
+        let mut loaded = loaded_from(THREE_KA9Q);
+        let err = select_input(&mut loaded, Some("nope"), "check")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "--input \"nope\" is not one of {}'s inputs (40m, 20m, 15m)",
+                loaded.origin
+            )
+        );
+        select_input(&mut loaded, Some("20m"), "check").unwrap();
+        assert_eq!(loaded.inputs.len(), 1);
+        assert_eq!(loaded.input.shared.freq_correction_ppm, Some(-1.5));
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        assert!(r.inputs.is_empty());
+        assert_eq!(r.freq_correction_ppm, -1.5);
+        assert_eq!(r.capture_rate_hz, Some(48_000.0));
+    }
+
+    #[test]
+    fn select_input_accepts_the_single_inputs_name_or_none() {
+        let mut loaded = loaded_from(KIWI_INPUT);
+        select_input(&mut loaded, None, "soak").unwrap();
+        select_input(&mut loaded, Some("kiwi"), "soak").unwrap();
+        assert!(select_input(&mut loaded, Some("other"), "soak").is_err());
+    }
+
     #[test]
     fn cli_source_flag_discards_a_typed_input_layer_with_a_note() {
         let loaded = loaded_from(KIWI_INPUT);

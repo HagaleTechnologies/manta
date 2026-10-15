@@ -1218,13 +1218,208 @@ mod tests {
         );
     }
 
+    // ---- MAN-13: [[input]] ----
+
+    const KA9Q_40: &str = "[[input]]\nname = \"40m\"\ntype = \"ka9q\"\ngroup = \"239.1.2.3\"\nssrc = 7030000\n";
+    const KA9Q_20: &str = "[[input]]\nname = \"20m\"\ntype = \"ka9q\"\ngroup = \"239.1.2.3\"\nssrc = 14030000\nfreq_correction_ppm = 0.8\n";
+
+    fn file_entry(name: &str, extra: &str) -> String {
+        format!("[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = \"/x/{name}.wav\"\n{extra}")
+    }
+
     #[test]
-    fn array_of_input_tables_is_rejected() {
-        let err = err_of("[[input]]\ntype = \"audio\"\n");
+    fn array_of_input_tables_loads_each_entry_in_order() {
+        let l = load_file(&format!("{KA9Q_40}{KA9Q_20}")).unwrap();
+        let names: Vec<&str> = l.inputs.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["40m", "20m"]);
+        assert_eq!(l.input, l.inputs[0].input);
+        let Some(SourceFromFile::Ka9q { ssrc, .. }) = &l.inputs[1].input.source else {
+            panic!("{:?}", l.inputs[1]);
+        };
+        assert_eq!(*ssrc, Some(14_030_000));
+        assert_eq!(l.inputs[1].input.shared.freq_correction_ppm, Some(0.8));
+        assert_eq!(l.inputs[0].input.shared.freq_correction_ppm, None);
+    }
+
+    #[test]
+    fn one_entry_input_array_is_the_single_form() {
+        let array = load_file("[[input]]\ntype = \"audio\"\n").unwrap();
+        let table = load_file("[input]\ntype = \"audio\"\n").unwrap();
+        assert_eq!(array.input, table.input);
+        assert_eq!(array.inputs, table.inputs);
+        assert_eq!(array.inputs[0].name, "audio");
+    }
+
+    #[test]
+    fn input_names_are_required_with_two_or_more_entries() {
+        let err = err_of(&format!("{KA9Q_40}[[input]]\ntype = \"kiwi\"\nhost = \"k\"\nfreq_hz = 14030000.0\n"));
         assert!(
-            err.contains("[[input]] (multiple sources) is not supported yet"),
+            err.ends_with(
+                ": [[input]] entry 2 has no name -- with more than one [[input]], give each one a \
+                 name, for example name = \"20m\""
+            ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn input_names_must_be_unique() {
+        let err = err_of(&format!("{KA9Q_20}{KA9Q_20}"));
+        assert!(err.ends_with(": [[input]] name \"20m\" is used twice"), "{err}");
+    }
+
+    #[test]
+    fn input_name_charset_and_length() {
+        let want = "may use only letters, digits, '.', '_' and '-', start with a letter or digit, \
+                    and be at most 32 characters";
+        for bad in ["a b", "-x", "", &"x".repeat(33)] {
+            let err = err_of(&format!("{KA9Q_40}{}", file_entry(bad, "")));
+            assert!(err.contains(&format!("[[input]] name {bad:?} {want}")), "{err}");
+        }
+        let err = err_of("[input]\nname = \"a b\"\ntype = \"audio\"\n");
+        assert!(err.contains(want), "{err}");
+        for good in ["20m", "rsp.1", "kiwi_a-2", &"x".repeat(32)] {
+            assert!(load_file(&format!("{}{}", file_entry("a", ""), file_entry(good, ""))).is_ok());
+        }
+    }
+
+    #[test]
+    fn more_than_sixteen_inputs_are_refused() {
+        let body: String = (0..17).map(|i| file_entry(&format!("in{i}"), "")).collect();
+        let err = err_of(&body);
+        assert!(
+            err.ends_with(": at most 16 [[input]] entries are supported, found 17"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn every_entry_needs_a_type_with_two_or_more() {
+        let err = err_of(&format!("{KA9Q_40}[[input]]\nname = \"20m\"\n"));
+        assert!(
+            err.ends_with(
+                ": [[input]] \"20m\" has no type -- with more than one [[input]], each one names \
+                 its receiver type"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn file_and_live_inputs_cannot_mix() {
+        let err = err_of(&format!("{}{KA9Q_20}", file_entry("a", "")));
+        assert!(
+            err.ends_with(
+                ": [[input]] mixes file replay (\"a\") with a live receiver (\"20m\"); one daemon \
+                 runs either recordings or receivers"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn replay_epoch_belongs_on_the_first_entry() {
+        let first = file_entry("a", "replay_epoch = 1700000000\n");
+        assert!(load_file(&format!("{first}{}", file_entry("b", ""))).is_ok());
+        let err = err_of(&format!(
+            "{}{}",
+            file_entry("a", ""),
+            file_entry("b", "replay_epoch = 1700000000\n")
+        ));
+        assert!(
+            err.ends_with(
+                ": [[input]] \"b\": replay_epoch belongs on the first [[input]] entry; every \
+                 replayed input starts at that instant"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn file_inputs_must_agree_on_realtime_and_loop() {
+        let err = err_of(&format!(
+            "{}{}",
+            file_entry("a", "realtime = true\n"),
+            file_entry("b", "")
+        ));
+        assert!(
+            err.ends_with(": [[input]] \"b\": realtime and loop must match the first file input's"),
+            "{err}"
+        );
+        assert!(load_file(&format!(
+            "{}{}",
+            file_entry("a", "loop = true\n"),
+            file_entry("b", "loop = true\n")
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn one_hpsdr_radio_is_at_most_one_input() {
+        let hpsdr = |name: &str, host: &str| {
+            format!(
+                "[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nhost = \"{host}\"\nrate_hz = 192000.0\nfreq_hz = \
+                 14030000.0\n"
+            )
+        };
+        let err = err_of(&format!("{}{}", hpsdr("a", "192.168.1.40"), hpsdr("b", "192.168.1.40")));
+        assert!(
+            err.contains(
+                ": [[input]] \"b\": the HPSDR radio at 192.168.1.40:1024 is already input \"a\"; \
+                 several receivers on one HPSDR radio are not supported yet"
+            ),
+            "{err}"
+        );
+        assert!(load_file(&format!("{}{}", hpsdr("a", "192.168.1.40"), hpsdr("b", "192.168.1.41"))).is_ok());
+    }
+
+    #[test]
+    fn audio_input_needs_center_freq_hz_with_two_or_more() {
+        let err = err_of(&format!("{KA9Q_40}[[input]]\nname = \"b\"\ntype = \"audio\"\n"));
+        assert!(
+            err.ends_with(
+                ": [[input]] \"b\": type = \"audio\" needs center_freq_hz when there is more than \
+                 one input, so its frequencies can be compared with the other inputs'"
+            ),
+            "{err}"
+        );
+        assert!(load_file(&format!(
+            "{KA9Q_40}[[input]]\nname = \"b\"\ntype = \"audio\"\ncenter_freq_hz = 7030000.0\n"
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn manta_input_env_is_refused_with_two_or_more_inputs() {
+        let f = write_cfg(&format!("{KA9Q_40}{KA9Q_20}{}", KA9Q_20.replace("20m", "15m")));
+        let v = vars(&[("MANTA_INPUT_FREQ_CORRECTION_PPM", "1.5")]);
+        let err = format!("{:#}", load(Some(f.path()), Env::Read(&v)).unwrap_err());
+        assert_eq!(
+            err,
+            "MANTA_INPUT_FREQ_CORRECTION_PPM cannot say which of the 3 [[input]] entries it \
+             sets; set freq_correction_ppm in that entry instead"
+        );
+    }
+
+    #[test]
+    fn name_is_accepted_on_a_single_input_table() {
+        let l = load_file("[input]\nname = \"rsp\"\ntype = \"audio\"\n").unwrap();
+        assert_eq!(l.inputs.len(), 1);
+        assert_eq!(l.inputs[0].name, "rsp");
+        let untyped = load_file("[input]\nfreq_correction_ppm = 1.0\n").unwrap();
+        assert_eq!(untyped.inputs[0].name, "audio");
+        let typed = load_file(&file_entry("x", "").replace("[[input]]\nname = \"x\"\n", "[input]\n"))
+            .unwrap();
+        assert_eq!(typed.inputs[0].name, "file");
+    }
+
+    #[test]
+    fn per_entry_keys_are_validated_with_the_entrys_name_in_the_error() {
+        let err = err_of(&format!(
+            "{KA9Q_40}[[input]]\nname = \"b\"\ntype = \"kiwi\"\nhost = \"k\"\nfreq_hz = \
+             14030000.0\nssrc = 5\n"
+        ));
+        assert!(err.contains(": [[input]] \"b\": input.ssrc"), "{err}");
     }
 
     #[test]
