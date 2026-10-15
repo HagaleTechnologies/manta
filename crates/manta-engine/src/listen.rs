@@ -76,6 +76,11 @@ pub struct ListenObservers {
     /// chunk so the published value never goes backwards. A counter, so it
     /// is never zeroed on exit. `None` (the default) skips the store.
     pub static_crashes: Option<Arc<AtomicU64>>,
+    /// MAN-234: input samples the channelizer replaced with silence
+    /// (`Channelizer::bad_samples`, summed across the segments a
+    /// discontinuity starts), stored with `fetch_max` after each processed
+    /// chunk so it never goes backwards. `None` (the default) skips it.
+    pub bad_samples: Option<Arc<AtomicU64>>,
     /// MAN-314: the currently marked RTTY signals (SPEC §2.6), stored
     /// whenever the marked set or a marked signal's metadata changes (so a
     /// store is not by itself a mark or clear), emptied on a segment
@@ -601,6 +606,13 @@ pub fn listen_with_observers(
             counter.fetch_max(n, Ordering::Relaxed);
         }
     };
+    // MAN-234: samples replaced by segments a discontinuity already replaced.
+    let mut bad_base: u64 = 0;
+    let report_bad_samples = |n: u64| {
+        if let Some(counter) = &observers.bad_samples {
+            counter.fetch_max(n, Ordering::Relaxed);
+        }
+    };
 
     let mut seg = new_segment(
         fs,
@@ -669,6 +681,7 @@ pub fn listen_with_observers(
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
     report_static_crashes(crash_base + seg.tm.static_crash_count());
+    report_bad_samples(bad_base + seg.ch.bad_samples());
     rtty.update(&seg.tm);
     on_tracks(n_tracks);
     // `..filled`: the whole buffer unless a stop request cut the fill short.
@@ -685,6 +698,7 @@ pub fn listen_with_observers(
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
     report_static_crashes(crash_base + seg.tm.static_crash_count());
+    report_bad_samples(bad_base + seg.ch.bad_samples());
     rtty.update(&seg.tm);
     on_tracks(n_tracks);
     let mut seg_consumed: u64 = filled as u64;
@@ -731,6 +745,7 @@ pub fn listen_with_observers(
             );
             let next_id = seg.tm.next_track_id();
             crash_base += seg.tm.static_crash_count();
+            bad_base += seg.ch.bad_samples();
             // The old segment's marks clear where its samples end.
             rtty.restart(seg_base + seg_consumed);
             seg_base += seg_consumed + gap;
@@ -777,6 +792,7 @@ pub fn listen_with_observers(
         let n_tracks = seg.tm.decoding_track_count();
         report_active_tracks(n_tracks);
         report_static_crashes(crash_base + seg.tm.static_crash_count());
+        report_bad_samples(bad_base + seg.ch.bad_samples());
         rtty.update(&seg.tm);
         on_tracks(n_tracks);
         if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
@@ -797,6 +813,7 @@ pub fn listen_with_observers(
         &mut on_spot,
     );
     report_static_crashes(crash_base + seg.tm.static_crash_count());
+    report_bad_samples(bad_base + seg.ch.bad_samples());
     // `finish()` flushes and drops every decoder and closes every remaining
     // track: nothing is being decoded once the stream has ended, so both
     // observers must settle back to 0 rather than be left holding the last
@@ -1131,6 +1148,100 @@ mod tests {
         assert!(readings.windows(2).all(|w| w[0] <= w[1]), "{readings:?}");
         assert!(readings.contains(&1), "{readings:?}");
         assert_eq!(readings.last(), Some(&2), "{readings:?}");
+    }
+
+    /// Runs `listen_with_observers` with a bad-sample observer, returning
+    /// the value it held at every `on_tracks` call and once more at the end.
+    fn bad_sample_readings(src: Box<dyn manta_input::IqSource>) -> Vec<u64> {
+        let counter = Arc::new(AtomicU64::new(0));
+        let mut readings = Vec::new();
+        listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                bad_samples: Some(counter.clone()),
+                ..Default::default()
+            },
+            |_| {},
+            |_| {},
+            |_| readings.push(counter.load(Ordering::Relaxed)),
+        )
+        .unwrap();
+        readings.push(counter.load(Ordering::Relaxed));
+        readings
+    }
+
+    fn v1_6s() -> (manta_testkit::vectors::VectorSpec, Vec<Complex32>) {
+        let spec = manta_testkit::vectors::VectorSpec {
+            duration_s: 6.0,
+            ..manta_testkit::vectors::v1()
+        };
+        let samples = manta_testkit::vectors::render(&spec).unwrap().samples;
+        (spec, samples)
+    }
+
+    /// MAN-234: the bad-sample count reaches the observer, and a
+    /// discontinuity's fresh segment (a fresh channelizer, counting from 0)
+    /// adds to it rather than restarting it. `GapSource` serves its buffer
+    /// once, reports the gap, then serves it again: a NaN in the first pass
+    /// and an `+Inf` at another index in the second are one bad sample per
+    /// segment, two in all.
+    #[test]
+    fn bad_samples_observer_counts_across_a_reconnect_segment() {
+        let (spec, mut iq) = v1_6s();
+        iq[300_000].re = f32::NAN;
+        let src = GapSource::new(iq, spec.fs, spec.center_freq_hz, 48_000);
+        // The replay after the gap carries an `+Inf` at another index
+        // instead of the NaN, so each segment has exactly one bad sample.
+        let mut second = src.samples.clone();
+        second[300_000].re = 0.25;
+        second[400_000].im = f32::INFINITY;
+        let readings = bad_sample_readings(Box::new(SwapOnGapSource {
+            inner: src,
+            second: Some(second),
+        }));
+        assert!(readings.windows(2).all(|w| w[0] <= w[1]), "{readings:?}");
+        assert!(readings.contains(&1), "{readings:?}");
+        assert_eq!(readings.last(), Some(&2), "{readings:?}");
+    }
+
+    /// `GapSource`, but the buffer it replays after the gap is `second`.
+    struct SwapOnGapSource {
+        inner: GapSource,
+        second: Option<Vec<Complex32>>,
+    }
+
+    impl manta_input::IqSource for SwapOnGapSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            if !self.inner.armed && self.inner.served >= self.inner.arm_at {
+                if let Some(second) = self.second.take() {
+                    self.inner.samples = second;
+                }
+            }
+            self.inner.read(buf)
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            manta_input::IqSource::take_discontinuity(&mut self.inner)
+        }
+    }
+
+    #[test]
+    fn bad_samples_observer_stays_zero_on_clean_input() {
+        let (spec, iq) = v1_6s();
+        let readings = bad_sample_readings(Box::new(GapSource::new(
+            iq,
+            spec.fs,
+            spec.center_freq_hz,
+            48_000,
+        )));
+        assert!(readings.iter().all(|&n| n == 0), "{readings:?}");
     }
 
     /// MAN-312: a source whose passband holds fewer than

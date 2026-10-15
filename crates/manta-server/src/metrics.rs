@@ -647,6 +647,10 @@ pub struct Metrics {
     /// Sources with no wire-packet loss model never call `set_input_health`,
     /// so they publish no series rather than a permanently-zero one.
     input_health: RwLock<BTreeMap<String, InputHealth>>,
+    /// MAN-234: per-source count of input samples the channelizer replaced
+    /// with silence (NaN, infinite, or beyond `MAX_SAMPLE_MAGNITUDE`).
+    /// Unlike `input_health`, every source publishes it, at 0 from startup.
+    input_bad_samples: RwLock<BTreeMap<String, u64>>,
     /// MAN-316: per reference list (`cty`, `scp`), fed by `manta-cli`'s
     /// startup resolution and list refresher. Ordered so `/metrics`
     /// renders the lists in a stable order.
@@ -1371,6 +1375,18 @@ impl Metrics {
             .insert(source.to_string(), health);
     }
 
+    /// MAN-234: the engine's running count of replaced input samples for
+    /// `source`. Keeps the maximum, so a stale or out-of-order injection
+    /// can never make the counter go backwards.
+    pub fn set_input_bad_samples(&self, source: &str, count: u64) {
+        let mut map = self
+            .input_bad_samples
+            .write()
+            .expect("input_bad_samples lock poisoned");
+        let entry = map.entry(source.to_string()).or_insert(0);
+        *entry = (*entry).max(count);
+    }
+
     /// MAN-316: the reference lists' entries, tolerating a poisoned lock --
     /// a panic elsewhere must not take `/metrics` down with it.
     fn list_metrics(&self) -> std::sync::MutexGuard<'_, BTreeMap<&'static str, ListMetrics>> {
@@ -1908,6 +1924,22 @@ impl Metrics {
         }
 
         drop(input_health);
+
+        // MAN-234: replaced input samples, every source, 0 from startup.
+        out.push_str(
+            "# HELP manta_input_bad_samples_total Input samples replaced with silence because a component was NaN, infinite, or larger than 1e17 in magnitude, per source.\n",
+        );
+        out.push_str("# TYPE manta_input_bad_samples_total counter\n");
+        for (source, n) in self
+            .input_bad_samples
+            .read()
+            .expect("input_bad_samples lock poisoned")
+            .iter()
+        {
+            out.push_str(&format!(
+                "manta_input_bad_samples_total{{source=\"{source}\"}} {n}\n"
+            ));
+        }
 
         // MAN-316: the reference lists in use and their refresh history.
         // HELP/TYPE always render; each family has samples only for the
@@ -2492,6 +2524,25 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains("# TYPE manta_static_crashes_total counter\n"));
         assert!(text.contains("\nmanta_static_crashes_total 3\n"), "{text}");
+    }
+
+    #[test]
+    fn input_bad_samples_total_is_labelled_and_never_goes_backwards() {
+        let m = Metrics::new();
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_input_bad_samples_total counter\n"));
+        assert!(!text.contains("manta_input_bad_samples_total{"), "{text}");
+        m.set_input_bad_samples("file", 0);
+        assert!(m
+            .render_prometheus_text()
+            .contains("\nmanta_input_bad_samples_total{source=\"file\"} 0\n"));
+        m.set_input_bad_samples("file", 3);
+        m.set_input_bad_samples("file", 2);
+        let text = m.render_prometheus_text();
+        assert!(
+            text.contains("\nmanta_input_bad_samples_total{source=\"file\"} 3\n"),
+            "{text}"
+        );
     }
 
     #[test]

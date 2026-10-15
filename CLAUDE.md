@@ -299,6 +299,16 @@ by a 20-run merge-queue watch with rollback triggers;
 `test-hpsdr (windows-latest)` stays advisory. See
 docs/DECISIONS/2026-10-15-man371-windows-required-check.md.
 
+MAN-234: an input sample with a NaN, infinite or larger-than-1e17
+component (`manta-dsp::sample_guard::MAX_SAMPLE_MAGNITUDE`) is replaced
+with `0+0j` and counted in `Channelizer::process` (SPEC §1.3 step 0;
+`calibrate` guards its own buffer), so it no longer panics or deafens
+`decode`/`run`/`doctor`. Reported as `bad_samples` in `decode`/`doctor`/
+`calibrate --json` (omitted when 0), stderr warnings, a `doctor`/`soak`
+report line and `manta_input_bad_samples_total{source}`; `manta check`
+still errors on non-finite input. See
+docs/DECISIONS/2026-10-15-man234-bad-input-samples.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each

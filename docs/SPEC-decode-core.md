@@ -69,6 +69,20 @@ Prototype lowpass, length `L·N` with **L = 8 taps per branch**:
 Maintain a sliding input window `x[0..LN)` (newest sample at the end). Every
 `hop` new samples:
 
+0. **Replace unusable samples (MAN-234):** as new samples are appended to
+   the window, before any hop is computed from them, every sample whose
+   `|re|` or `|im|` is not `≤ MAX_SAMPLE_MAGNITUDE = 1e17` (NaN and ±Inf
+   included, since NaN compares false) is replaced with `0+0j` and counted
+   once (`Channelizer::bad_samples`, monotonic per channelizer). The bound: the prototype filter's absolute tap sum is
+   `Σ|h| < 1.34` for every supported N (1.33746–1.33821 for N = 64…4096),
+   so with every component within `B = 1e17`, `|X[k]| ≤ √2·Σ|h|·B` and
+   `P[k] < 3.6e34`, four decades below `f32::MAX` (3.4e38). No NaN or Inf
+   ever reaches channel power, and so none reaches floor or gate state
+   (§2). Sources deliver full scale at 1.0, so the bound only catches
+   corrupt or mis-scaled input. A usable sample is read and never written,
+   so output on clean input is bit-identical to an unguarded channelizer
+   (§6). `manta calibrate`, which does not use the channelizer, applies
+   the same replacement to its read buffer.
 1. **Window & fold:** `u[n] = x[n] · h[LN−1−n]` for `n = 0..LN`, then fold to
    `N` points: `v[j] = Σ_{p=0..L-1} u[j + pN]`, `j = 0..N`.
 2. **Phase correction for hop < N:** circularly rotate `v` left by
@@ -1213,6 +1227,7 @@ rules:
    bit-equality is NOT assumed — the byte-identical requirement applies to
    like-for-like builds, and cross-platform equality is asserted at the
    *decoded-text* level (test vectors, §7), not the sample level.
+   Replacement (§1.3 step 0) is a deterministic function of the input.
 5. **Beam tie-break:** equal scores order by (element-sequence lexical order,
    dit < dah). Softmax computed with the max-subtraction trick, fixed order.
 6. **Pool scheduling must not affect output:** decoder workers may run in any
