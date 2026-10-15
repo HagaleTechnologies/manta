@@ -314,6 +314,15 @@ by a 20-run merge-queue watch with rollback triggers;
 `test-hpsdr (windows-latest)` stays advisory. See
 docs/DECISIONS/2026-10-15-man371-windows-required-check.md.
 
+MAN-236: `soak_with_metrics` (the `man19-soak` harness and
+`examples/close_counts.rs`) wraps `listen_with_observers`, the loop
+`manta run` executes, instead of a copy. `ListenObservers::track_lifecycle`
+(`TrackLifecycleObserver`, relaxed atomics) publishes the all-entry track
+count and peak, per-reason closes, repetition-gate record total and
+steady-state chunk count. Bounded fixed-seed runs reported identical
+counts before and after. See
+docs/DECISIONS/2026-10-15-man236-soak-metrics-wraps-listen.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each

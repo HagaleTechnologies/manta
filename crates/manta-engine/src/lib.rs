@@ -14,6 +14,8 @@ pub use latency::{DecodeLatencyObserver, DecodeLatencySnapshot, DECODE_LATENCY_B
 pub use live::{
     BandSample, LiveRecord, LiveStateSink, TrackSnapshot, LIVE_MAX_CANDIDATES, LIVE_TEXT_CHARS,
 };
+pub mod lifecycle;
+pub use lifecycle::{TrackLifecycleObserver, TrackLifecycleSnapshot};
 pub mod quality;
 pub use quality::{DecodeQualityObserver, DecodeQualitySnapshot, RAIL_RATIO_BUCKETS};
 pub mod calibrate;
