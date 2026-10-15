@@ -69,7 +69,7 @@ pub fn doctor_report(report: &manta_engine::DoctorReport) -> String {
     };
     format!(
         "source: {:.0} Hz sample rate, {} center, observed for {:.1}s\n\
-tracks: {} promoted, {} TrackMeta updates, {} closed\n\
+tracks: {} promoted, {} TrackMeta updates, {} closed, {} detector confirmations\n\
 SNR (2500 Hz reference): {}\n\
 decode: {} chars ({} distinct), {} confirmed spots\n\
 verdict: {}\n",
@@ -79,6 +79,7 @@ verdict: {}\n",
         report.tracks_promoted,
         report.track_meta_count,
         report.tracks_closed,
+        report.detector_confirmations,
         snr,
         report.chars_decoded,
         report.distinct_chars,
@@ -210,6 +211,7 @@ mod tests {
             center_freq_hz: 14_000_000.0,
             duration: std::time::Duration::from_secs(10),
             tracks_promoted: 61,
+            detector_confirmations: 70,
             track_meta_count: 64,
             tracks_closed: 36,
             snr_db_min: Some(20.4),
@@ -219,7 +221,7 @@ mod tests {
             distinct_chars: 15,
             spots_confirmed: 0,
         };
-        assert_eq!(doctor_report(&r), format!("source: 48000 Hz sample rate, 14000.0 kHz center, observed for 10.0s\ntracks: 61 promoted, 64 TrackMeta updates, 36 closed\nSNR (2500 Hz reference): min=20 dB median=59 dB max=68 dB\ndecode: 42 chars (15 distinct), 0 confirmed spots\nverdict: {}\n", r.verdict().summary()));
+        assert_eq!(doctor_report(&r), format!("source: 48000 Hz sample rate, 14000.0 kHz center, observed for 10.0s\ntracks: 61 promoted, 64 TrackMeta updates, 36 closed, 70 detector confirmations\nSNR (2500 Hz reference): min=20 dB median=59 dB max=68 dB\ndecode: 42 chars (15 distinct), 0 confirmed spots\nverdict: {}\n", r.verdict().summary()));
         r.snr_db_min = None;
         r.snr_db_median = None;
         r.snr_db_max = None;
@@ -229,6 +231,7 @@ mod tests {
             .contains("SNR (2500 Hz reference): no TrackMeta events -- no track ever promoted\n"));
     }
 
+<<<<<<< HEAD
     #[test]
     fn doctor_rerun_hint_only_for_a_short_weak_run() {
         use manta_engine::Verdict;
@@ -267,6 +270,18 @@ mod tests {
         assert_eq!(doctor_rerun_hint(&r, ten), None);
         r = manta_engine::DoctorReport {
             tracks_promoted: 0,
+=======
+    /// MAN-313: a run with confirmed signals but no keyed CW prints its
+    /// confirmation count and the `NOT_CW` verdict.
+    #[test]
+    fn doctor_report_prints_detector_confirmations_and_not_cw() {
+        let r = manta_engine::DoctorReport {
+            sample_rate_hz: 96000.0,
+            center_freq_hz: 14_000_000.0,
+            duration: std::time::Duration::from_secs(10),
+            tracks_promoted: 0,
+            detector_confirmations: 14,
+>>>>>>> 5499511bc122183cbc504a4fcadb6a4741c37fde
             track_meta_count: 0,
             tracks_closed: 0,
             snr_db_min: None,
@@ -275,9 +290,21 @@ mod tests {
             chars_decoded: 0,
             distinct_chars: 0,
             spots_confirmed: 0,
+<<<<<<< HEAD
             ..r
         };
         assert_eq!(r.verdict(), Verdict::NoSignal);
         assert_eq!(doctor_rerun_hint(&r, ten), None);
+=======
+        };
+        let out = doctor_report(&r);
+        assert!(
+            out.contains(
+                "tracks: 0 promoted, 0 TrackMeta updates, 0 closed, 14 detector confirmations\n"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("\nverdict: NOT_CW -- "), "{out}");
+>>>>>>> 5499511bc122183cbc504a4fcadb6a4741c37fde
     }
 }
