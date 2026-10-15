@@ -3913,7 +3913,7 @@ mod tests {
             64,
             96_000.0,
             14_000_000.0,
-            DetectorConfig::default(),
+            default_filter_off(),
             DecodeConfig::default(),
         );
         feed_warmup(&mut tm, 64);
@@ -4602,7 +4602,7 @@ mod tests {
             n,
             96_000.0,
             14_000_000.0,
-            DetectorConfig::default(),
+            default_filter_off(),
             DecodeConfig::default(),
         );
         feed_warmup(&mut tm, n);
@@ -4695,7 +4695,7 @@ mod tests {
             n,
             96_000.0,
             14_000_000.0,
-            DetectorConfig::default(),
+            default_filter_off(),
             DecodeConfig::default(),
         );
         feed_warmup(&mut tm, n);
