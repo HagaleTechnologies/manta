@@ -222,7 +222,8 @@ clap help text is exempt). The "Supply Chain" check runs `cargo deny
 --locked check` against `deny.toml` (advisories, licenses, bans, sources;
 also daily on main). Trusted PRs get a `test (windows-latest)` check-run
 (required once MAN-371's owner step O1 is applied). `release-publish.yml`
-refuses a tag whose CI push run failed any test leg. The `PR title` check requires a Conventional Commits title. See
+refuses a tag whose CI push run failed any test leg. The `PR title` check
+requires a Conventional Commits title. See
 docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md.
 
 MAN-315: the legacy decoder learns per-track dot/dash/gap timing
