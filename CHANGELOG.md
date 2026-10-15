@@ -55,6 +55,8 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-235: `manta doctor --strict` exits 3 when no check failed but the
+  verdict is not `DECODING`; without it every verdict still exits 0.
 - MAN-315: a `TimingUpdate` event per track (each class's mean, variance
   and count, in dits), a top-level `timing` object in `decode --json`, and
   `manta decode --timing` for a `timing (dits, mean ± sd): …` stderr line.
@@ -90,6 +92,8 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-235: a `manta doctor` run shorter than 60 s that reads
+  `WEAK_NO_DECODE` adds a `hint:` line suggesting `--duration 60`.
 - The in-repo `wiki/` is the project's canonical wiki. GitHub's Wiki tab
   is not used; disabling it remains an owner step. The wiki's stale
   `verified` stamps and `manifest.json` are refreshed and CI-pinned (MAN-152).

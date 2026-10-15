@@ -519,3 +519,138 @@ fn no_server_and_no_uplink_are_single_skip_rows() {
     );
     assert!(!stdout.contains("telnet port"), "{stdout}");
 }
+
+/// MAN-235: `manta doctor` on `silent_48k_wav` (4 s, `--duration 3`) with
+/// a fake SNTP server at offset 0, plus `extra`.
+fn doctor_on_silence(extra: &[&str]) -> Output {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = silent_48k_wav(dir.path(), 4);
+    let (ntp, _h) = fake_sntp(0.0);
+    manta()
+        .args(["doctor", "--duration", "3", "--source"])
+        .arg(&wav)
+        .arg("--ntp-server")
+        .arg(format!("127.0.0.1:{ntp}"))
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+/// MAN-235 scenario 1: the README's demo signal, at the default
+/// `--duration`, reads DECODING, or WEAK_NO_DECODE followed by a line that
+/// says to rerun longer; the suggested rerun reads DECODING.
+#[test]
+fn the_demo_signal_reads_decoding_or_hints_a_longer_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let gen = manta()
+        .args(["gen", "v1", "--out"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(gen.status.success(), "{:?}", text(&gen));
+    let wav = dir.path().join("v1.wav");
+    let (ntp, _h) = fake_sntp(0.0);
+    let doctor = |extra: &[&str]| {
+        manta()
+            .args(["doctor", "--source-iq", "--source"])
+            .arg(&wav)
+            .arg("--ntp-server")
+            .arg(format!("127.0.0.1:{ntp}"))
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+
+    let out = doctor(&[]);
+    let (stdout, stderr) = text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+    if !stdout.contains("verdict: DECODING") {
+        let weak = "verdict: WEAK_NO_DECODE";
+        assert!(stdout.contains(weak), "{stdout}");
+        let hint = line_after(&stdout, weak);
+        assert!(
+            hint.starts_with("hint: ") && hint.contains("--duration 60"),
+            "{stdout}"
+        );
+    }
+
+    let out = doctor(&["--duration", "60", "--strict"]);
+    let (stdout, stderr) = text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(stdout.contains("verdict: DECODING"), "{stdout}");
+    assert!(!stdout.lines().any(|l| l.starts_with("hint:")), "{stdout}");
+}
+
+/// MAN-235 scenario 2: without `--strict`, an all-zero file is NO_SIGNAL
+/// and still exits 0.
+#[test]
+fn silence_is_no_signal_and_exits_0_without_strict() {
+    let out = doctor_on_silence(&[]);
+    let (stdout, stderr) = text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(stdout.contains("verdict: NO_SIGNAL"), "{stdout}");
+    assert!(!stdout.lines().any(|l| l.starts_with("hint:")), "{stdout}");
+}
+
+/// MAN-235 scenario 3: `--strict` turns the same NO_SIGNAL run into exit 3
+/// and changes nothing else it prints, in text or JSON.
+#[test]
+fn strict_exits_3_on_silence_and_changes_nothing_else() {
+    let out = doctor_on_silence(&["--strict"]);
+    let (stdout, stderr) = text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(stdout.contains("verdict: NO_SIGNAL"), "{stdout}");
+    if host_synced() != Some(false) {
+        assert!(stdout.contains("doctor: all checks passed"), "{stdout}");
+    }
+    assert!(!stdout.contains("failed:"), "{stdout}");
+    assert!(
+        !stderr.lines().any(|l| l.starts_with("error:")) && !stderr.contains("Error:"),
+        "{stderr}"
+    );
+
+    let out = doctor_on_silence(&["--strict", "--json"]);
+    let (stdout, stderr) = text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+    let map = json_object(&stdout);
+    assert_eq!(map["verdict"], "NoSignal", "{stdout}");
+    assert_ne!(map["checks_status"], "fail", "{stdout}");
+}
+
+/// MAN-235: a failed check exits 1 with `--strict` too, whatever the
+/// verdict.
+#[test]
+fn strict_keeps_exit_1_for_a_failed_check() {
+    let setup = Setup::new();
+    let cfg = setup.config(setup.uplink_port());
+    let (ntp, _h) = fake_sntp(120.0);
+    let out = setup.doctor(&cfg, ntp, &["--strict"]);
+    let (stdout, stderr) = text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(stdout.contains("FAIL  clock: "), "{stdout}");
+    assert!(stdout.contains("verdict: NO_SIGNAL"), "{stdout}");
+}
