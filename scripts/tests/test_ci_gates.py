@@ -8,6 +8,8 @@ import importlib.util
 import io
 import os
 import re
+import subprocess
+import tempfile
 import tomllib
 import unittest
 
@@ -132,8 +134,8 @@ class DenyPolicyTests(unittest.TestCase):
 
 
 SHA = "cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d"
-LEGS = ("test (ubuntu-latest)", "test (macos-latest)", "test (windows-latest)",
-        "test-hpsdr (ubuntu-latest)", "test-hpsdr (macos-latest)", "test-hpsdr (windows-latest)")
+CHECKS = ("test (ubuntu-latest)", "test (macos-latest)", "test (windows-latest)")
+LEGS = CHECKS + ("test-hpsdr (ubuntu-latest)", "test-hpsdr (macos-latest)", "test-hpsdr (windows-latest)")
 
 
 def run(number=1, status="completed", conclusion="success"):
@@ -163,6 +165,36 @@ class WindowsVisibilityTests(unittest.TestCase):
         self.assertIn('windows_check_id=$windows_id', body)
         self.assertEqual(wf.field(wf.sub(job, "outputs"), "windows_check_id"),
                          "${{ steps.create.outputs.windows_check_id }}")
+
+    def test_create_ci_check_fails_closed_for_every_leg(self):
+        # MAN-371: all three check-runs are required, so a failed POST must fail the step; a
+        # warning and an empty id would leave the PR on "Expected" behind a green job.
+        body = wf.run_body(wf.step_by_id(wf.job_block(self.text, "create-ci-check"), "create"))
+        for failing in ("", *CHECKS):
+            with self.subTest(failing=failing or "none"), tempfile.TemporaryDirectory() as tmp:
+                gh = os.path.join(tmp, "gh")
+                with open(gh, "w", encoding="utf-8") as f:
+                    f.write('#!/bin/sh\ncase "$*" in *"name=$FAIL_NAME"*) exit 1;; esac\n'
+                            'case "$*" in *ubuntu*) echo 11;; *macos*) echo 12;; *windows*) echo 13;; esac\n')
+                os.chmod(gh, 0o755)
+                script, out = os.path.join(tmp, "create.sh"), os.path.join(tmp, "out")
+                with open(script, "w", encoding="utf-8") as f:
+                    f.write(body)
+                open(out, "w").close()
+                env = {"PATH": f"{tmp}:{os.environ.get('PATH', '/usr/bin:/bin')}", "GITHUB_OUTPUT": out,
+                       "REPO": "o/r", "HEAD_SHA": "0" * 40, "FAIL_NAME": failing or "-"}
+                # The step sets no `shell:`, so the runner runs it as `bash -e {0}`.
+                proc = subprocess.run(["bash", "-e", script], env=env, capture_output=True, text=True)
+                with open(out, encoding="utf-8") as f:
+                    written = f.read().split()
+                if not failing:
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(written, ["ubuntu_check_id=11", "macos_check_id=12",
+                                               "windows_check_id=13"])
+                else:
+                    self.assertNotEqual(proc.returncode, 0, f"a failed {failing} POST must fail the step")
+                    self.assertNotIn("::warning::", proc.stdout)
+                    self.assertEqual([w for w in written if w.endswith("=")], [], "no empty check-run id")
 
     def test_relay_reports_the_windows_leg(self):
         relay = wf.job_block(self.text, "relay-check-runs")

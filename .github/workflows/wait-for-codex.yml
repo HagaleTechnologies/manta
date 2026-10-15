@@ -319,7 +319,8 @@ jobs:
         # file's header) runs test/test-soapy/test-hpsdr natively for this case instead, with
         # no dispatch or PAT needed at all -- the check-run this job already created above
         # (conclusion=success) is a compatibility artifact only; the REAL required checks
-        # ("test (ubuntu-latest)"/"test (macos-latest)") come from that native run.
+        # ("test (ubuntu-latest)"/"test (macos-latest)"/"test (windows-latest)") come from
+        # that native run.
         # MAN-243: also gated on the trust step above -- a draft, a fork head or an untrusted
         # author never reaches this dispatch.
         if: steps.create-check.outputs.check_run_id != '' && steps.create-check.outputs.conclusion == 'success' && steps.create-check.outputs.is_dependabot != 'true' && steps.trust.outputs.dispatch == 'true'

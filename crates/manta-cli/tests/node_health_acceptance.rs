@@ -19,12 +19,13 @@ use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// `N` distinct ports nothing listens on right now. All `N` listeners are
+/// held until every port is read: releasing each before binding the next
+/// lets the OS hand the same port out twice (Windows does, and then the
+/// config is rejected as "two servers cannot share a port").
+fn free_ports<const N: usize>() -> [u16; N] {
+    let held: [TcpListener; N] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
+    held.map(|l| l.local_addr().unwrap().port())
 }
 
 /// Kills and reaps the daemon child process on drop, including on a
@@ -120,11 +121,7 @@ fn node_health_is_observable_from_metrics_and_healthz_alone() {
     let wav_path = tmp.path().join("cw48k.wav");
     write_cw_fixture(&wav_path);
 
-    let telnet_port = free_port();
-    let json_port = free_port();
-    let metrics_port = free_port();
-    let uplink1_port = free_port();
-    let uplink2_port = free_port();
+    let [telnet_port, json_port, metrics_port, uplink1_port, uplink2_port] = free_ports();
 
     let mut cfg_file = tempfile::NamedTempFile::new().unwrap();
     write!(
