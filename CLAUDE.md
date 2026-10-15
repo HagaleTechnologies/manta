@@ -291,6 +291,12 @@ MAN-210: golden vector V51 (V9's drift scene, `refine_bw_hz = 30` via
 end-to-end through `manta decode --json` — the evidence any future
 default-on change must keep green.
 
+MAN-189: the HSMM decoder no longer re-emits a committed character under
+a different closing anchor. `commit::Frontier` (each entry's character
+start against the latest emitted timestamp) replaces `sealed`. V7/hsmm
+and V8/hsmm now pass, and V5/VR5/VR6a/VR8 CER improve. See
+docs/DECISIONS/2026-10-13-man189-hsmm-commit-frontier.md.
+
 MAN-371: `ci-full.yml` creates all three `test (...)` check-runs on a
 trusted PR's head fail-closed, and tests that need several free ports
 hold every listener until all are read (`free_ports::<N>()`). Adding
