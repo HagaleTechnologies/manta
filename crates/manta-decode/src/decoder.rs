@@ -337,30 +337,53 @@ impl TrackDecoder {
     ) -> Vec<DecoderEvent> {
         let n = self.noise.push(power, spectral_ref_power).max(1e-18).sqrt();
         let mut events = Vec::new();
-        // Codex review, PR #161 round 11: round 9's fix (letting `push`
-        // return multiple eligible centers per input sample) eagerly
-        // materialized the whole newly-eligible batch using a single,
-        // START-of-call `h` -- so even though this loop calls
-        // `set_u_ref` after every returned hop, a speed change mid-batch
-        // never actually affected any LATER hop already in that same
-        // batch, only hops from the NEXT input sample onward. Using
+        // Codex review, PR #161 round 11 (amended by MAN-190): round 9's
+        // fix (letting `push` return multiple eligible centers per input
+        // sample) eagerly materialized the whole newly-eligible batch
+        // using a single, START-of-call `h` -- so even though this loop
+        // calls `set_u_ref` after every returned hop, a speed change
+        // mid-batch never actually affected any LATER hop already in that
+        // same batch, only hops from the NEXT input sample onward. Using
         // `record` + `drain_one` instead re-checks the live `h` on every
-        // single drained hop, so feedback takes effect before the next
-        // one is even computed -- exactly like `finish()`'s incremental
-        // flush loop (`flush_one`) already does.
+        // single computed hop. Since MAN-190 each returned hop t was
+        // computed together with its still-pending successor t+1 (whose
+        // actual sign finalized t's anchor), the feedback applied here
+        // first affects the computation of hop t+2 -- before the next
+        // UNCOMPUTED hop, never rewriting the pending one.
         self.evidence.record(amp, n, sample_ts);
         while let Some(ev) = self.evidence.drain_one() {
-            self.snr_from_evidence(&ev);
-            for c in self.hsmm.push(&ev) {
-                self.emit_committed(c, &mut events);
-            }
-            if let Some(u) = self.hsmm.best_u() {
-                self.evidence.set_u_ref(u);
-                self.report_wpm(450.0 / u, &mut events);
-            }
+            self.feed_hsmm_hop(ev, &mut events);
         }
         self.tick_meta(&mut events);
         events
+    }
+
+    /// Process one finalized evidence hop through the `Hsmm` engine and
+    /// apply the per-hop speed feedback (MAN-190 factored this sequence
+    /// out of `push_hop_hsmm` and `finish`'s `Engine::Hsmm` branch so the
+    /// live and EOF paths cannot drift): record SNR history keyed by the
+    /// hop's own timestamp, push it into the token decoder and emit any
+    /// committed entries, then feed the best live speed hypothesis back
+    /// into the evidence window -- which, per `set_u_ref`'s contract,
+    /// first affects the next hop Evidence has not computed yet. Never
+    /// move the `set_u_ref` call outside the drain loops that call this.
+    ///
+    /// Codex review, PR #161 round 6: the `report_wpm` half matters as
+    /// much in the EOF loop as live -- `hsmm.finish()` clears the live
+    /// token set (so nothing downstream can recover the speed from it)
+    /// and `flush_final_speed` only ever reads the Legacy-only
+    /// `SpeedTracker`, so a short recording's first usable Hsmm speed
+    /// estimate (or a late change) would emit no `SpeedUpdate` at all
+    /// without it.
+    fn feed_hsmm_hop(&mut self, ev: HopEvidence, events: &mut Vec<DecoderEvent>) {
+        self.snr_from_evidence(&ev);
+        for c in self.hsmm.push(&ev) {
+            self.emit_committed(c, events);
+        }
+        if let Some(u) = self.hsmm.best_u() {
+            self.evidence.set_u_ref(u);
+            self.report_wpm(450.0 / u, events);
+        }
     }
 
     /// Translate one `hsmm::Committed` entry into a `DecoderEvent`, applying
@@ -610,35 +633,20 @@ impl TrackDecoder {
                 self.finish_runs(runs, &mut events);
             }
             Engine::Hsmm => {
-                // Codex review, PR #161 round 4: drain one hop at a time
-                // (`flush_one`, not the eager `flush()`) and re-apply
-                // `best_u()` -> `set_u_ref()` after each, exactly matching
-                // `push_hop_hsmm`'s live-path feedback loop -- see
+                // Codex review, PR #161 round 4 (amended by MAN-190): drain
+                // one hop at a time (`flush_one`, not the eager `flush()`)
+                // and apply `best_u()` -> `set_u_ref()` after each, exactly
+                // matching `push_hop_hsmm`'s live-path feedback loop (now
+                // via the shared `feed_hsmm_hop`) -- see
                 // `Evidence::flush_one`'s doc comment for why the eager
                 // batch drain let the tail run against a stale hold
                 // window instead of adapting to a genuine late speed
-                // change.
+                // change. `flush_one` also releases the terminal pending
+                // hop through this same sequence (base anchor only, no
+                // synthetic successor), so every real hop reaches HSMM
+                // before `hsmm.finish()` forces the final commitment.
                 while let Some(ev) = self.evidence.flush_one() {
-                    self.snr_from_evidence(&ev);
-                    for c in self.hsmm.push(&ev) {
-                        self.emit_committed(c, &mut events);
-                    }
-                    // Codex review, PR #161 round 6: this branch updated
-                    // the evidence window's speed feedback but never
-                    // called `report_wpm`, unlike `push_hop_hsmm`'s live
-                    // path -- `hsmm.finish()` below clears `self.live`
-                    // (so nothing downstream can recover the speed from
-                    // it) and `flush_final_speed` only ever reads the
-                    // Legacy-only `SpeedTracker`, so a short recording's
-                    // first usable Hsmm speed estimate (or a late change)
-                    // could emit no `SpeedUpdate` at all -- oracle's
-                    // `wpm_ratio` and any downstream WPM gate would then
-                    // see missing or stale data. Apply the exact same
-                    // reporting step `push_hop_hsmm` does.
-                    if let Some(u) = self.hsmm.best_u() {
-                        self.evidence.set_u_ref(u);
-                        self.report_wpm(450.0 / u, &mut events);
-                    }
+                    self.feed_hsmm_hop(ev, &mut events);
                 }
                 for c in self.hsmm.finish() {
                     self.emit_committed(c, &mut events);
@@ -1663,6 +1671,136 @@ mod tests {
             })
             .unwrap();
         assert!((wpm - 34.6).abs() < 2.0, "wpm {wpm}");
+    }
+
+    /// MAN-190 integration: the whole live chain through a mid-stream
+    /// speed change and a short final word that only `finish()` completes.
+    /// Protects the wiring and feedback order of the new one-hop-later
+    /// evidence schedule (each finalized hop is processed -- SNR history,
+    /// `hsmm.push`, committed events, `best_u` -> `set_u_ref` + WPM
+    /// report -- before the next finalized hop is requested, and the
+    /// terminal pending hop reaches HSMM before `hsmm.finish()` forces
+    /// the final commitment). This is a wiring/feedback-order regression
+    /// test, not a claim of an independently reproduced production miss.
+    #[test]
+    fn hsmm_streams_a_speed_change_and_finishes_the_final_word() {
+        let lo = 10f32.powf(-40.0 / 20.0);
+        let lead_in = 4usize;
+        let word1 = rect_envelope_depth("CQ DE", 13, 40.0); // ~35 WPM
+        let word2 = rect_envelope_depth("W5AU", 18, 40.0); // ~25 WPM
+        let w2_start = lead_in + word1.len();
+        let w2_end = w2_start + word2.len();
+        let mut env = vec![lo; lead_in];
+        env.extend(word1);
+        env.extend(word2);
+
+        let run = || {
+            let cfg = DecodeConfig {
+                engine: Engine::Hsmm,
+                ..Default::default()
+            };
+            let mut dec = TrackDecoder::new(1, cfg);
+            let mut events = Vec::new();
+            for (i, &a) in env.iter().enumerate() {
+                events.extend(dec.push_envelope(a, i as u64 * 256));
+            }
+            events.extend(dec.finish());
+            (events, dec)
+        };
+        let (events, mut dec) = run();
+
+        // Expected text across the speed change.
+        assert_eq!(events_to_text(&events), "CQ DE W5AU", "{events:?}");
+
+        // Final speed within the existing convergence tolerance
+        // (`hsmm_speed_converges_from_seeds` uses +/-2 WPM): the last
+        // reported speed must track the second word's 450/18 = 25 WPM.
+        let wpm = events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                DecoderEvent::SpeedUpdate { wpm, .. } => Some(*wpm),
+                _ => None,
+            })
+            .unwrap();
+        assert!((wpm - 25.0).abs() < 2.0, "final wpm {wpm}");
+
+        // Sample-based timestamps: the final word's characters are keyed
+        // inside the second envelope's own index range, at real marks.
+        let final_word_chars: Vec<&DecoderEvent> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    DecoderEvent::CharDecoded {
+                        sample_ts,
+                        glyph: crate::tree::Glyph::Char('W')
+                            | crate::tree::Glyph::Char('5')
+                            | crate::tree::Glyph::Char('A')
+                            | crate::tree::Glyph::Char('U'),
+                        ..
+                    } if *sample_ts >= (w2_start as u64) * 256
+                )
+            })
+            .collect();
+        assert!(
+            !final_word_chars.is_empty(),
+            "no characters keyed inside the final word's range"
+        );
+        for e in final_word_chars {
+            if let DecoderEvent::CharDecoded { sample_ts, .. } = e {
+                let idx = (*sample_ts / 256) as usize;
+                assert!(
+                    idx >= w2_start && idx < w2_end,
+                    "final-word char at ts {sample_ts} (idx {idx}) keyed outside word 2 \
+                     [{w2_start}, {w2_end})"
+                );
+                assert!(
+                    env[idx] > 0.5,
+                    "final-word char keyed at a space hop (idx {idx}, amp {})",
+                    env[idx]
+                );
+            }
+        }
+
+        // A second finish() must not repeat any character or word event.
+        let again = dec.finish();
+        assert!(
+            !again.iter().any(|e| matches!(
+                e,
+                DecoderEvent::CharDecoded { .. } | DecoderEvent::WordBoundary { .. }
+            )),
+            "second finish() repeated decode events: {again:?}"
+        );
+
+        // The streaming run must equal a reference run of the SAME
+        // incremental Evidence/HSMM schedule (two fresh decoders, events
+        // serialized): guards that the shared per-hop sequence stays
+        // deterministic under the h+1 release latency.
+        let (events_ref, _) = run();
+        assert_eq!(
+            serde_json::to_string(&events).unwrap(),
+            serde_json::to_string(&events_ref).unwrap()
+        );
+        assert_eq!(events_to_text(&events_ref), "CQ DE W5AU");
+    }
+
+    /// MAN-190: `EdgeLegacy` shares the Evidence front end, so it shares
+    /// the one-hop-later release too. A scene ending shortly after its
+    /// final mark -- whose final evidence hops are only released by
+    /// `finish()`'s terminal pending path -- must still decode fully.
+    #[test]
+    fn edge_legacy_tolerates_the_one_hop_evidence_release_delay() {
+        let lo = 10f32.powf(-40.0 / 20.0);
+        let mut env = vec![lo; 4];
+        let mut keyed = rect_envelope_depth("PARIS", 13, 40.0);
+        // Keep only ~4 dits of the auto-appended tail (still enough gap
+        // for EdgeDemod to close the final element): the last real
+        // evidence hops are released only by the terminal pending path.
+        let keep = keyed.len() - 50;
+        keyed.truncate(keep);
+        env.extend(keyed);
+        assert_eq!(decode_with(Engine::EdgeLegacy, &env), "PARIS");
     }
 
     #[test]

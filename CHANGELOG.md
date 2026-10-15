@@ -40,6 +40,12 @@ the git history and `docs/DECISIONS/`.
 - MAN-95: default spot validation requires 2, 3 or 5 distinct-message
   repetitions by callsign-pattern rarity. `[spot].validation_level = "minimal"`
   restores flat 2; `--patterns` overrides the independent reference list.
+- MAN-190: the opt-in `hsmm` engine's evidence front end now confirms
+  mark/space anchors from two actually computed hops instead of a
+  forward-looking prediction, closing a missed-anchor race with the
+  per-hop speed feedback. Evidence hops are released one hop later
+  (`h+1` at constant speed, shared with `edge-legacy`); adaptive input
+  can decode differently. The default `legacy` engine is unchanged.
 
 - A band-wide static crash (lightning) no longer starts tracks across the
   band, and running tracks no longer decode it as extra dits; new
