@@ -735,6 +735,20 @@ pub struct RbnUplinkConfig {
     /// Applies only to this uplink: telnet/JSON still carry every spot.
     #[serde(default)]
     pub spot_types: UplinkSpotTypes,
+    /// Max spots written to this target per 60 s window (MAN-248); 0
+    /// disables the ceiling. Over it, spots are counted in the target's
+    /// `ceiling_suppressed` counter and skipped -- the connection stays
+    /// up. Restart-only: SIGHUP reloads only `dry_run`.
+    #[serde(default = "default_max_spots_per_minute")]
+    pub max_spots_per_minute: u32,
+}
+
+/// MAN-248: 600/min = 10 spots/s, roughly twice a dense-contest
+/// single-passband estimate -- generous first, tightened on
+/// `manta_uplink_ceiling_suppressed_total` evidence. The owner's
+/// measured-peak-rate gate from the ticket stays open.
+fn default_max_spots_per_minute() -> u32 {
+    600
 }
 
 /// Which validated spots an `[[rbn_uplink]]` target is sent -- MAN-91.
@@ -1887,6 +1901,59 @@ mod tests {
         assert_eq!(uplink.login_callsign, None);
         // MAN-91: an omitted `spot_types` key means RBN's own rule.
         assert_eq!(uplink.spot_types, UplinkSpotTypes::CqBeacon);
+        // MAN-248: an omitted ceiling key means the generous default.
+        assert_eq!(uplink.max_spots_per_minute, 600);
+    }
+
+    fn parse_uplink_extra(body: &str) -> Result<DaemonConfigFile, toml::de::Error> {
+        toml::from_str(&format!(
+            r#"
+            [server]
+            station_callsign = "W3XYZ"
+            [[rbn_uplink]]
+            enabled = true
+            target_host = "example.invalid"
+            target_port = 7300
+            {body}
+            "#
+        ))
+    }
+
+    /// MAN-248: the ceiling round-trips, `0` (disabled) is accepted, and
+    /// non-u32 values or a typo'd key fail loudly at parse time rather
+    /// than silently forwarding without a limit.
+    #[test]
+    fn uplink_max_spots_per_minute_roundtrips_and_rejects_bad_values() {
+        assert_eq!(
+            parse_uplink_extra("max_spots_per_minute = 5")
+                .unwrap()
+                .rbn_uplink[0]
+                .max_spots_per_minute,
+            5
+        );
+        // 0 = disabled, a valid spelling (same convention as the
+        // `*_per_ip` budget keys).
+        assert_eq!(
+            parse_uplink_extra("max_spots_per_minute = 0")
+                .unwrap()
+                .rbn_uplink[0]
+                .max_spots_per_minute,
+            0
+        );
+        for bad in ["max_spots_per_minute = -1", "max_spots_per_minute = 1.5"] {
+            assert!(
+                parse_uplink_extra(bad).is_err(),
+                "`{bad}` must fail: the ceiling is a u32"
+            );
+        }
+        assert!(
+            parse_uplink_extra("max_spots_per_minute = plenty").is_err(),
+            "a non-integer ceiling must fail"
+        );
+        assert!(
+            parse_uplink_extra("max_spots_per_minut = 600").is_err(),
+            "a typo'd key must fail via deny_unknown_fields, not silently use the default"
+        );
     }
 
     fn parse_spot_types(value: &str) -> Result<DaemonConfigFile, toml::de::Error> {
@@ -2062,6 +2129,7 @@ mod tests {
             login_callsign: None,
             dry_run: false,
             spot_types: UplinkSpotTypes::default(),
+            max_spots_per_minute: 600,
         };
         assert_eq!(uplink.effective_login_callsign("W3XYZ"), "W3XYZ");
 
