@@ -244,6 +244,16 @@ pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
 planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
+MAN-248: each `[[rbn_uplink]]` target enforces
+`max_spots_per_minute` (default `600`, `0` disables) on spots written to
+the wire, via the existing `RateLimiter` owned above the reconnect loop;
+over-budget spots are counted in
+`manta_uplink_ceiling_suppressed_total` /
+`manta_uplink_target_ceiling_suppressed_total{target}` and skipped with
+the connection left up (dry-run spots consume no budget; restart-only).
+The owner's measured-peak-rate gate on the default stays open — see
+docs/DECISIONS/2026-10-14-man248-uplink-forwarding-ceiling.md.
+
 MAN-174: within a `process_hops` batch a merge loser's `TrackClosed`
 precedes its survivor's, and a merge survivor that never emitted still
 gets its own `TrackClosed`, so a deferred Beacon migrated along a merge
@@ -289,6 +299,12 @@ MAN-210: golden vector V51 (V9's drift scene, `refine_bw_hz = 30` via
 `--config`) exercises the narrowband refiner's refine-enabled path
 end-to-end through `manta decode --json` — the evidence any future
 default-on change must keep green.
+
+MAN-189: the HSMM decoder no longer re-emits a committed character under
+a different closing anchor. `commit::Frontier` (each entry's character
+start against the latest emitted timestamp) replaces `sealed`. V7/hsmm
+and V8/hsmm now pass, and V5/VR5/VR6a/VR8 CER improve. See
+docs/DECISIONS/2026-10-13-man189-hsmm-commit-frontier.md.
 
 MAN-371: `ci-full.yml` creates all three `test (...)` check-runs on a
 trusted PR's head fail-closed, and tests that need several free ports
