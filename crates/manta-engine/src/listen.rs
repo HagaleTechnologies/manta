@@ -331,11 +331,13 @@ struct Segment {
     pad_hops: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn new_segment(
     fs: f64,
     center_freq_hz: f64,
     rf_passband_hz: (f64, f64),
     cfg: &PipelineConfig,
+    ids: crate::multi::TrackIdSpace,
     next_id: u32,
     quality: Option<Arc<DecodeQualityObserver>>,
     occupancy: bool,
@@ -352,6 +354,8 @@ fn new_segment(
         cfg.detector,
         cfg.decode.clone(),
     );
+    // MAN-13 (D3): each input numbers its tracks in its own residue class.
+    tm.set_track_id_space(ids);
     tm.resume_track_ids_from(next_id);
     tm.skip_preroll_hops(pad_hops);
     // MAN-312 (SPEC §2.7): judge static crashes over the source's real
@@ -593,6 +597,7 @@ pub fn listen_with_observers(
         center_freq_hz,
         rf_passband_hz,
         cfg,
+        crate::multi::TrackIdSpace::SINGLE,
         1,
         observers.decode_quality.clone(),
         occupancy,
@@ -725,6 +730,7 @@ pub fn listen_with_observers(
                 center_freq_hz,
                 rf_passband_hz,
                 cfg,
+                crate::multi::TrackIdSpace::SINGLE,
                 next_id,
                 observers.decode_quality.clone(),
                 occupancy,
@@ -788,6 +794,276 @@ pub fn listen_with_observers(
     report_active_tracks(0);
     rtty.restart(seg_base + seg_consumed);
     on_tracks(0);
+    Ok(())
+}
+
+/// MAN-13: one input's decode batch, handed from its front end (source
+/// read, channelizer, `TrackManager`) to the shared back end (the one
+/// `Validator`). Every `sample_ts` is already on the session's common clock
+/// and every `TrackMeta`/`TrackPromoted` frequency is already calibrated
+/// with the input's own factor (D4).
+pub(crate) struct Batch {
+    pub(crate) events: Vec<DecoderEvent>,
+    /// Common-clock timestamp of the last sample this batch covers: the
+    /// replay merge's ordering key (D5).
+    pub(crate) end_ts: u64,
+    /// `TrackManager::decoding_track_count()` after the batch.
+    pub(crate) n_tracks: usize,
+    /// The ids the input's `TrackManager` still holds, for the live tap's
+    /// bookkeeping; `None` when no live-state sink is attached.
+    pub(crate) live_ids: Option<Vec<u32>>,
+}
+
+/// MAN-13 (D1): the shared back end of a multi-input session: the one
+/// `Validator` and everything `emit` feeds, on the caller's thread.
+pub(crate) struct Back<'a> {
+    validator: Validator,
+    ctx: EmitCtx<'a>,
+}
+
+impl<'a> Back<'a> {
+    /// `validator` is the session's shared one (factor 1.0: every batch
+    /// arrives calibrated).
+    pub(crate) fn new(
+        shared: &'a crate::multi::SharedObservers,
+        mut validator: Validator,
+        rate_hz: f64,
+    ) -> Self {
+        let references = shared
+            .reference_lists
+            .clone()
+            .map(|lists| ReferenceWatch::new(lists, &mut validator));
+        let live = shared
+            .live_state
+            .clone()
+            .map(|sink| LiveTap::new(sink, rate_hz, 1.0));
+        Self {
+            validator,
+            ctx: EmitCtx {
+                lists: shared.operator_lists.as_deref(),
+                quality: shared.decode_quality.as_deref(),
+                calibration_factor: 1.0,
+                live,
+                references,
+            },
+        }
+    }
+
+    /// Feeds one input's batch through the validator, exactly as
+    /// `listen_with_observers` feeds its own.
+    pub(crate) fn ingest(
+        &mut self,
+        input: usize,
+        n_inputs: usize,
+        batch: Batch,
+        on_event: &mut impl FnMut(&DecoderEvent),
+        on_spot: &mut impl FnMut(&crate::Spot),
+    ) {
+        emit(
+            batch.events,
+            &mut self.validator,
+            &mut self.ctx,
+            on_event,
+            on_spot,
+        );
+        if let (Some(tap), Some(ids)) = (self.ctx.live.as_mut(), batch.live_ids.as_deref()) {
+            tap.retain_input_tracks(input, n_inputs, ids);
+        }
+    }
+}
+
+/// MAN-13: what one input's front end publishes on its own thread.
+pub(crate) struct FrontObservers {
+    pub(crate) active_tracks: Option<Arc<AtomicU64>>,
+    pub(crate) static_crashes: Option<Arc<AtomicU64>>,
+    pub(crate) rtty: Option<Arc<RttyObserver>>,
+    pub(crate) decode_latency: Option<Arc<DecodeLatencyObserver>>,
+    pub(crate) decode_quality: Option<Arc<DecodeQualityObserver>>,
+    pub(crate) live_ids: bool,
+}
+
+/// Maps a batch's local timestamps onto the common clock and calibrates
+/// its frequencies.
+fn to_common(
+    events: Vec<DecoderEvent>,
+    clock: crate::multi::SourceClock,
+    factor: f64,
+) -> Vec<DecoderEvent> {
+    events
+        .into_iter()
+        .map(|ev| {
+            let mut ev = crate::calibrate_freq_events(&ev, factor);
+            match &mut ev {
+                DecoderEvent::CharDecoded { sample_ts, .. }
+                | DecoderEvent::WordBoundary { sample_ts, .. }
+                | DecoderEvent::TrackMeta { sample_ts, .. }
+                | DecoderEvent::TimingUpdate { sample_ts, .. }
+                | DecoderEvent::TrackPromoted { sample_ts, .. } => {
+                    *sample_ts = clock.to_common(*sample_ts);
+                }
+                DecoderEvent::SpeedUpdate { .. } | DecoderEvent::TrackClosed { .. } => {}
+            }
+            ev
+        })
+        .collect()
+}
+
+/// MAN-13 (D1): one input's front end -- the part of
+/// `listen_with_observers` before the validator, run on the input's own
+/// thread. Reads `src` until EOF, `stop`, a read error or `send` returning
+/// false (the back end has gone), and hands every batch to `send` in the
+/// order `listen_with_observers` would emit it. Segment restarts on a
+/// discontinuity, the startup calibration fill and the per-chunk observers
+/// behave exactly as there.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_input_front(
+    src: &mut dyn IqSource,
+    cfg: &PipelineConfig,
+    stop: &AtomicBool,
+    clock: crate::multi::SourceClock,
+    ids: crate::multi::TrackIdSpace,
+    calibration_factor: f64,
+    observers: &FrontObservers,
+    send: &mut dyn FnMut(Batch) -> bool,
+) -> Result<()> {
+    let _active_tracks_guard = ActiveTracksGuard::new(observers.active_tracks.clone());
+    let mut rtty = RttyPublisher::new(observers.rtty.clone(), calibration_factor);
+    let report_active_tracks = |n_tracks: usize| {
+        if let Some(gauge) = &observers.active_tracks {
+            gauge.store(n_tracks as u64, Ordering::Relaxed);
+        }
+    };
+    let report_static_crashes = |n: u64| {
+        if let Some(counter) = &observers.static_crashes {
+            counter.fetch_max(n, Ordering::Relaxed);
+        }
+    };
+    let fs = src.sample_rate();
+    let center_freq_hz = src.center_freq_hz();
+    let rf_passband_hz = src.rf_passband_hz();
+    let mut crash_base: u64 = 0;
+    let mut seg = new_segment(
+        fs,
+        center_freq_hz,
+        rf_passband_hz,
+        cfg,
+        ids,
+        ids.first,
+        observers.decode_quality.clone(),
+        false,
+    )?;
+    let mut seg_base: u64 = 0;
+    let mut seg_consumed: u64 = 0;
+    let padding = vec![Complex32::new(0.0, 0.0); seg.ch.filter_len()];
+    let batch =
+        |events: Vec<DecoderEvent>, end_local: u64, tm: &crate::track::TrackManager| Batch {
+            events: to_common(events, clock, calibration_factor),
+            end_ts: clock.to_common(end_local),
+            n_tracks: tm.decoding_track_count(),
+            live_ids: observers.live_ids.then(|| tm.track_ids()),
+        };
+
+    let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
+    let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];
+    let mut filled = 0;
+    while filled < calib_n {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let n = src.read(&mut calib[filled..])?;
+        if n == 0 {
+            anyhow::bail!("audio source ended during startup calibration");
+        }
+        if let Some(gap) = src.take_discontinuity() {
+            calib.copy_within(filled..filled + n, 0);
+            seg_base += filled as u64 + gap;
+            filled = n;
+            continue;
+        }
+        filled += n;
+    }
+    for block in [&padding[..], &calib[..filled]] {
+        let events = seg.tm.process_hops(&seg.ch.process(block), |m| {
+            seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
+        });
+        let b = batch(events, seg_base + filled as u64, &seg.tm);
+        report_active_tracks(b.n_tracks);
+        report_static_crashes(crash_base + seg.tm.static_crash_count());
+        rtty.update(&seg.tm);
+        if !send(b) {
+            return Ok(());
+        }
+    }
+    seg_consumed += filled as u64;
+
+    let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let n = match src.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) => {
+                report_active_tracks(0);
+                rtty.restart(seg_base + seg_consumed);
+                return Err(e);
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        let mut pending = Vec::new();
+        if let Some(gap) = src.take_discontinuity() {
+            let finish_events = seg.tm.finish_for_discontinuity();
+            pending.push(batch(finish_events, seg_base + seg_consumed, &seg.tm));
+            let next_id = seg.tm.next_track_id();
+            crash_base += seg.tm.static_crash_count();
+            rtty.restart(seg_base + seg_consumed);
+            seg_base += seg_consumed + gap;
+            seg_consumed = 0;
+            seg = new_segment(
+                fs,
+                center_freq_hz,
+                rf_passband_hz,
+                cfg,
+                ids,
+                next_id,
+                observers.decode_quality.clone(),
+                false,
+            )?;
+            let events = seg.tm.process_hops(&seg.ch.process(&padding), |m| {
+                seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
+            });
+            pending.push(batch(events, seg_base, &seg.tm));
+        }
+        let t0 = observers
+            .decode_latency
+            .as_ref()
+            .map(|_| std::time::Instant::now());
+        let events = seg.tm.process_hops(&seg.ch.process(&chunk[..n]), |m| {
+            seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
+        });
+        seg_consumed += n as u64;
+        pending.push(batch(events, seg_base + seg_consumed, &seg.tm));
+        report_active_tracks(seg.tm.decoding_track_count());
+        report_static_crashes(crash_base + seg.tm.static_crash_count());
+        rtty.update(&seg.tm);
+        if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
+            obs.observe(t0.elapsed());
+        }
+        for b in pending {
+            if !send(b) {
+                return Ok(());
+            }
+        }
+    }
+    let events = seg.tm.finish();
+    let mut last = batch(events, seg_base + seg_consumed, &seg.tm);
+    last.n_tracks = 0;
+    report_static_crashes(crash_base + seg.tm.static_crash_count());
+    report_active_tracks(0);
+    rtty.restart(seg_base + seg_consumed);
+    send(last);
     Ok(())
 }
 

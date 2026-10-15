@@ -22,6 +22,9 @@ Then:
   and Prometheus alerts.
 - [GUIDES/ka9q-radio.md](GUIDES/ka9q-radio.md): feeding manta one
   ka9q-radio (radiod) channel over multicast.
+- [GUIDES/multiple-receivers.md](GUIDES/multiple-receivers.md): one daemon
+  reading several SDRs, or several channels of one SDR, into one spot
+  output (MAN-13).
 - The [runbooks](#runbooks) below.
 - `manta <command> --help` for every flag, or `man manta` once the man
   pages are installed

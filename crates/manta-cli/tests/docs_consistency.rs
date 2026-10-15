@@ -2824,3 +2824,33 @@ fn spec_section_5_track_closed_names_its_closure_kinds() {
         );
     }
 }
+
+/// MAN-13: one daemon reads several receivers, so ARCHITECTURE no longer
+/// prescribes one daemon per band, and ROADMAP's post-1.0 list no longer
+/// offers multi-SDR orchestration as future work.
+#[test]
+fn architecture_no_longer_says_one_daemon_per_band() {
+    let architecture = doc("ARCHITECTURE.md");
+    assert!(
+        !architecture.contains("Multi-band via multiple daemon instances"),
+        "ARCHITECTURE.md still prescribes one daemon per band"
+    );
+    assert!(
+        architecture.contains("[[input]]"),
+        "ARCHITECTURE.md must describe the [[input]] model"
+    );
+    let roadmap = doc("ROADMAP.md");
+    for line in roadmap
+        .lines()
+        .filter(|l| l.contains("Multi-SDR single-daemon orchestration"))
+    {
+        assert!(
+            line.contains("~~Multi-SDR single-daemon orchestration.~~"),
+            "ROADMAP.md still offers multi-SDR orchestration: {line}"
+        );
+    }
+    assert!(
+        roadmap.contains("delivered by\n  MAN-13"),
+        "ROADMAP.md must record MAN-13 as delivering it"
+    );
+}

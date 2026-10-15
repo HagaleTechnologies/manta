@@ -11,6 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-15 | MAN-13 | [MAN-13: one daemon decodes several receivers into one spot output](2026-10-15-man13-multi-input-daemon.md) |
 | 2026-10-15 | MAN-371 | [MAN-371: `test (windows-latest)` becomes a required check](2026-10-15-man371-windows-required-check.md) |
 | 2026-10-14 | MAN-211 | [MAN-211: TrackMeta's frequency is captured per queued hop, like its SNR](2026-10-14-man211-trackmeta-freq-per-hop.md) |
 | 2026-10-14 | MAN-197 | [MAN-197: a live track's input selection also skips cooling-down channels](2026-10-14-man197-live-window-cooldown-enforcement.md) |

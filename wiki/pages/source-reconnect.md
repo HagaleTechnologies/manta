@@ -9,9 +9,10 @@ sources:
   - crates/manta-cli/src/reconnect.rs
   - crates/manta-cli/src/reconnect.rs (InputHealthTotals)
   - crates/manta-input/src/lib.rs (IqSource::take_discontinuity)
+  - docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md
 verified:
-  commit: d286147
-  date: 2026-10-13
+  commit: 6596e3a
+  date: 2026-10-15
 links:
   - determinism
 ---
@@ -42,3 +43,13 @@ tracks it live (ARCHITECTURE §8).
 `manta_source_outages_total`/`manta_source_down_seconds_total` (MAN-96) count each drop and its
 completed down time, so a reconnect between two scrapes still shows; the 30-day field-node
 procedure reads them (`docs/RUNBOOKS/secondary-skimmer-field-node.md`).
+
+## Several inputs
+
+With several `[[input]]` entries (MAN-13) every input owns its own `ReconnectingSource` on its own
+thread: one input dropping changes only its own `manta_source_health{source}` series and logs
+`input NAME: lost; retrying, k of n inputs decoding` — the others keep decoding, `/healthz` stays
+`ok` while at least one input is healthy, and the `MantaInputDown` alert (not `MantaNodeUnhealthy`)
+reports the dead one. Track ids are interleaved per input, so an input's per-track validator state
+never collides with another's. See
+[the decision record](../../docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md).

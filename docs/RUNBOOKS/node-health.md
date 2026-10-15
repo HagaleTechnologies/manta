@@ -20,7 +20,11 @@ with its type, labels and when it has samples.
 - `200 OK`, body `ok\n` followed by one `<check>: <status>` line per check,
   while every registered source is healthy, every registered listener
   (telnet/JSON/metrics) is up, and the decode loop has made progress within
-  the last 10 seconds.
+  the last 10 seconds. With several `[[input]]` entries (MAN-13) one healthy
+  input is enough: the node stays `ok` while at least one input delivers
+  samples, each input keeps its own `source <name>:` line, and the
+  `MantaInputDown` alert ([monitoring.md](monitoring.md#mantainputdown))
+  reports a dead one.
 - `503 Service Unavailable`, body `unhealthy\n` plus the same per-check
   lines, otherwise — e.g. `source file: unhealthy`, `listener json: down`,
   `decode: stalled 12s`, or `decode: stopped` (the daemon has exited the

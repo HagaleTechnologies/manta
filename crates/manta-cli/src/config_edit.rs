@@ -1,6 +1,7 @@
 //! MAN-127: sets `[input].freq_correction_ppm` in an existing config file
 //! while keeping every other byte, then validates the result with the real
-//! loader and atomically replaces the file.
+//! loader and atomically replaces the file. MAN-13: with `[[input]]`
+//! entries, the value goes into the entry `calibrate --input NAME` names.
 
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -14,7 +15,13 @@ const KEY: &str = "freq_correction_ppm";
 const BOM: char = '\u{feff}';
 
 /// Pure: returns the new text and the previous value (None when unset).
-pub(crate) fn set_freq_correction_ppm(text: &str, ppm: f64) -> Result<(String, Option<f64>)> {
+/// `input` names the `[[input]]` entry to set; `None` is the single
+/// `[input]` table, or a one-entry `[[input]]`.
+pub(crate) fn set_freq_correction_ppm(
+    text: &str,
+    ppm: f64,
+    input: Option<&str>,
+) -> Result<(String, Option<f64>)> {
     ensure!(ppm.is_finite(), "{KEY} must be a finite number, got {ppm}");
     // -0.0 would print as `-0.0`.
     let ppm = if ppm == 0.0 { 0.0 } else { ppm };
@@ -44,6 +51,35 @@ pub(crate) fn set_freq_correction_ppm(text: &str, ppm: f64) -> Result<(String, O
                 None
             }
         },
+        // MAN-13: the `[[input]]` entry `--input NAME` picked.
+        Some(Item::ArrayOfTables(entries)) => {
+            let count = entries.len();
+            let entry = match input {
+                Some(name) => {
+                    let named = entries
+                        .iter()
+                        .position(|entry| entry.get("name").and_then(Item::as_str) == Some(name));
+                    // A one-entry array's input is named by its type when
+                    // the entry has no `name` (config::NamedInput).
+                    let index = match named {
+                        Some(index) => index,
+                        None if count == 1 => 0,
+                        None => bail!("[[input]] has no entry named {}", crate::fmt::quoted(name)),
+                    };
+                    entries.get_mut(index).ok_or_else(|| {
+                        anyhow!("[[input]] has no entry named {}", crate::fmt::quoted(name))
+                    })?
+                }
+                None if count == 1 => entries
+                    .get_mut(0)
+                    .ok_or_else(|| anyhow!("[[input]] has no entries"))?,
+                None => bail!(
+                    "the config has {count} [[input]] entries; name the one to set {KEY} in \
+                     with --input"
+                ),
+            };
+            set_in_table(entry, ppm)?
+        }
         _ => bail!("[input] is not a table, so {KEY} cannot be set in it"),
     };
     let mut out = doc.to_string();
@@ -51,6 +87,19 @@ pub(crate) fn set_freq_correction_ppm(text: &str, ppm: f64) -> Result<(String, O
         out.insert(0, BOM);
     }
     Ok((out, previous))
+}
+
+/// Where `set_freq_correction_ppm` writes, for calibrate's prompt and
+/// result lines: `[input]`, or `the [[input]] entry "20m"`.
+pub(crate) fn input_section(text: &str, input: Option<&str>) -> String {
+    let body = text.strip_prefix(BOM).unwrap_or(text);
+    let array = body
+        .parse::<DocumentMut>()
+        .is_ok_and(|doc| matches!(doc.get("input"), Some(Item::ArrayOfTables(a)) if a.len() > 1));
+    match input {
+        Some(name) if array => format!("the [[input]] entry {}", crate::fmt::quoted(name)),
+        _ => "[input]".to_string(),
+    }
 }
 
 fn set_in_table(table: &mut Table, ppm: f64) -> Result<Option<f64>> {
@@ -129,9 +178,10 @@ pub(crate) fn save_freq_correction_ppm(
     path: &Path,
     ppm: f64,
     expected: Option<&ReadBefore>,
+    input: Option<&str>,
 ) -> Result<Option<f64>> {
     let vars: Vec<(OsString, OsString)> = std::env::vars_os().collect();
-    save_with_env(path, ppm, expected, &vars)
+    save_with_env(path, ppm, expected, input, &vars)
 }
 
 const PPM_ENV_VAR: &str = "MANTA_INPUT_FREQ_CORRECTION_PPM";
@@ -140,6 +190,7 @@ fn save_with_env(
     path: &Path,
     ppm: f64,
     expected: Option<&ReadBefore>,
+    input: Option<&str>,
     vars: &[(OsString, OsString)],
 ) -> Result<Option<f64>> {
     let target = fs::canonicalize(path)
@@ -165,7 +216,7 @@ fn save_with_env(
         );
     }
     let (new_text, previous) =
-        set_freq_correction_ppm(&text, ppm).with_context(|| target.display().to_string())?;
+        set_freq_correction_ppm(&text, ppm, input).with_context(|| target.display().to_string())?;
     let ppm = if ppm == 0.0 { 0.0 } else { ppm };
     let meta = fs::metadata(&target)
         .with_context(|| format!("reading the metadata of {}", target.display()))?;
@@ -482,7 +533,7 @@ mod tests {
     use crate::config::{load, Env};
 
     fn set(text: &str, ppm: f64) -> (String, Option<f64>) {
-        set_freq_correction_ppm(text, ppm).unwrap()
+        set_freq_correction_ppm(text, ppm, None).unwrap()
     }
 
     #[test]
@@ -577,10 +628,59 @@ mod tests {
 
     #[test]
     fn rejects_a_non_table_input() {
-        let err = set_freq_correction_ppm("input = 5\n", -1.42).unwrap_err();
+        let err = set_freq_correction_ppm("input = 5\n", -1.42, None).unwrap_err();
         assert!(format!("{err:#}").contains("[input]"), "{err:#}");
-        let err = set_freq_correction_ppm("[[input]]\n", -1.42).unwrap_err();
+        let err = set_freq_correction_ppm("input = [1, 2]\n", -1.42, None).unwrap_err();
         assert!(format!("{err:#}").contains("[input]"), "{err:#}");
+    }
+
+    const TWO_INPUTS: &str = "# receivers\n[[input]]\nname = \"a\"\ntype = \"file\"\npath = \"a.wav\"\n\n[[input]]\nname = \"b\" # the kiwi\ntype = \"file\"\npath = \"b.wav\"\nfreq_correction_ppm = 0.5 # old\n";
+
+    #[test]
+    fn sets_ppm_in_the_named_array_entry_and_keeps_every_other_byte() {
+        let (out, previous) = set_freq_correction_ppm(TWO_INPUTS, -1.42, Some("b")).unwrap();
+        assert_eq!(previous, Some(0.5));
+        assert_eq!(
+            out,
+            TWO_INPUTS.replace(
+                "freq_correction_ppm = 0.5 # old",
+                "freq_correction_ppm = -1.42 # old"
+            )
+        );
+        let (out, previous) = set_freq_correction_ppm(TWO_INPUTS, 2.0, Some("a")).unwrap();
+        assert_eq!(previous, None);
+        assert!(
+            out.starts_with("# receivers\n[[input]]\nname = \"a\"\ntype = \"file\"\npath = \"a.wav\"\nfreq_correction_ppm = 2.0\n"),
+            "{out}"
+        );
+        assert_eq!(
+            input_section(TWO_INPUTS, Some("b")),
+            "the [[input]] entry \"b\""
+        );
+        assert_eq!(input_section("[input]\n", Some("kiwi")), "[input]");
+    }
+
+    #[test]
+    fn refuses_an_input_name_that_is_not_in_the_file() {
+        let err = set_freq_correction_ppm(TWO_INPUTS, -1.42, Some("nope")).unwrap_err();
+        assert_eq!(err.to_string(), "[[input]] has no entry named \"nope\"");
+        let err = set_freq_correction_ppm(TWO_INPUTS, -1.42, None).unwrap_err();
+        assert!(err.to_string().contains("name the one"), "{err}");
+    }
+
+    #[test]
+    fn single_table_behaviour_is_unchanged() {
+        let text = "[input]\nfreq_correction_ppm = 0.5\n";
+        assert_eq!(
+            set_freq_correction_ppm(text, -1.42, None).unwrap(),
+            set_freq_correction_ppm(text, -1.42, Some("file")).unwrap()
+        );
+        let (out, _) =
+            set_freq_correction_ppm("[[input]]\ntype = \"kiwi\"\n", 1.0, Some("kiwi")).unwrap();
+        assert_eq!(
+            out,
+            "[[input]]\ntype = \"kiwi\"\nfreq_correction_ppm = 1.0\n"
+        );
     }
 
     fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
@@ -606,7 +706,7 @@ mod tests {
             "manta.toml",
             "[input]\nfreq_correction_ppm = 0.5\n",
         );
-        let previous = save_freq_correction_ppm(&p, -1.42, None).unwrap();
+        let previous = save_freq_correction_ppm(&p, -1.42, None, None).unwrap();
         assert_eq!(previous, Some(0.5));
         let loaded = load(Some(&p), Env::Ignore).unwrap();
         assert_eq!(loaded.input.shared.freq_correction_ppm, Some(-1.42));
@@ -616,12 +716,12 @@ mod tests {
     fn save_leaves_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "manta.toml", "[input]\n");
-        assert_eq!(save_freq_correction_ppm(&p, 2.5, None).unwrap(), None);
+        assert_eq!(save_freq_correction_ppm(&p, 2.5, None, None).unwrap(), None);
         assert_eq!(entries(dir.path()), ["manta.toml"]);
 
         let bad_body = "[input]\nfreq_correction_ppm = 0.5\n\n[bogus]\nx = 1\n";
         let bad = write(dir.path(), "bad.toml", bad_body);
-        let err = save_freq_correction_ppm(&bad, -1.42, None).unwrap_err();
+        let err = save_freq_correction_ppm(&bad, -1.42, None, None).unwrap_err();
         assert!(format!("{err:#}").contains("left unchanged"), "{err:#}");
         assert_eq!(fs::read_to_string(&bad).unwrap(), bad_body);
         assert_eq!(entries(dir.path()), ["bad.toml", "manta.toml"]);
@@ -633,13 +733,13 @@ mod tests {
         // Valid only with the environment's station callsign.
         let p = write(dir.path(), "manta.toml", "[input]\n\n[server]\n");
         let var = |k: &str, v: &str| (OsString::from(k), OsString::from(v));
-        assert!(save_with_env(&p, -1.42, None, &[]).is_err());
+        assert!(save_with_env(&p, -1.42, None, None, &[]).is_err());
         let vars = [
             var("MANTA_SERVER_STATION_CALLSIGN", "W1AW"),
             // Ignored: it would mask the value just written.
             var(PPM_ENV_VAR, "3.0"),
         ];
-        assert_eq!(save_with_env(&p, -1.42, None, &vars).unwrap(), None);
+        assert_eq!(save_with_env(&p, -1.42, None, None, &vars).unwrap(), None);
         assert_eq!(
             fs::read_to_string(&p).unwrap(),
             "[input]\nfreq_correction_ppm = -1.42\n\n[server]\n"
@@ -654,7 +754,7 @@ mod tests {
         let before = ReadBefore::read(&p).unwrap();
         let changed = "[input]\ndevice = \"other\"\n";
         fs::write(&p, changed).unwrap();
-        let err = save_freq_correction_ppm(&p, -1.42, Some(&before)).unwrap_err();
+        let err = save_freq_correction_ppm(&p, -1.42, Some(&before), None).unwrap_err();
         assert!(
             format!("{err:#}").contains("changed after calibrate read it"),
             "{err:#}"
@@ -663,7 +763,7 @@ mod tests {
         assert_eq!(entries(dir.path()), ["manta.toml"]);
         fs::write(&p, body).unwrap();
         assert_eq!(
-            save_freq_correction_ppm(&p, -1.42, Some(&before)).unwrap(),
+            save_freq_correction_ppm(&p, -1.42, Some(&before), None).unwrap(),
             Some(0.5)
         );
     }
@@ -681,7 +781,7 @@ mod tests {
         fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&b, &link).unwrap();
         // Byte-identical, but another file.
-        let err = save_freq_correction_ppm(&link, -1.42, Some(&before)).unwrap_err();
+        let err = save_freq_correction_ppm(&link, -1.42, Some(&before), None).unwrap_err();
         assert!(format!("{err:#}").contains("now resolves to"), "{err:#}");
         assert_eq!(fs::read_to_string(&a).unwrap(), body);
         assert_eq!(fs::read_to_string(&b).unwrap(), body);
@@ -694,7 +794,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "manta.toml", "[input]\n");
         fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
-        save_freq_correction_ppm(&p, -1.42, None).unwrap();
+        save_freq_correction_ppm(&p, -1.42, None, None).unwrap();
         let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o600);
     }
@@ -713,7 +813,7 @@ mod tests {
         let link = dir.path().join("link.toml");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert_eq!(
-            save_freq_correction_ppm(&link, -1.42, None).unwrap(),
+            save_freq_correction_ppm(&link, -1.42, None, None).unwrap(),
             Some(1.0)
         );
         assert!(fs::symlink_metadata(&link)
@@ -809,7 +909,7 @@ mod tests {
             return;
         }
         assert_eq!(access_acl(&p), None);
-        save_freq_correction_ppm(&p, -1.42, None).unwrap();
+        save_freq_correction_ppm(&p, -1.42, None, None).unwrap();
         assert_eq!(
             access_acl(&p),
             None,
@@ -823,7 +923,7 @@ mod tests {
         assert!(set_acl(&q, c"system.posix_acl_access"));
         let acl = access_acl(&q);
         assert!(acl.is_some());
-        save_freq_correction_ppm(&q, -1.42, None).unwrap();
+        save_freq_correction_ppm(&q, -1.42, None, None).unwrap();
         assert_eq!(access_acl(&q), acl, "the saved config lost its ACL");
         assert_eq!(mode(&q), 0o640);
     }
@@ -868,7 +968,7 @@ mod tests {
             return;
         }
         assert!(extended_acl(&p).is_empty());
-        save_freq_correction_ppm(&p, -1.42, None).unwrap();
+        save_freq_correction_ppm(&p, -1.42, None, None).unwrap();
         assert_eq!(
             extended_acl(&p),
             Vec::<String>::new(),
@@ -881,7 +981,7 @@ mod tests {
         assert!(chmod_acl(&q, "user:nobody allow read"));
         let acl = extended_acl(&q);
         assert_eq!(acl.len(), 1, "{acl:?}");
-        save_freq_correction_ppm(&q, -1.42, None).unwrap();
+        save_freq_correction_ppm(&q, -1.42, None, None).unwrap();
         assert_eq!(extended_acl(&q), acl, "the saved config lost its ACL");
     }
 
@@ -957,7 +1057,7 @@ mod tests {
         let p = write(dir.path(), "manta.toml", "[input]\n");
         dacl_protected(&p, true);
         assert!(dacl_protected(&p, false));
-        save_freq_correction_ppm(&p, -1.42, None).unwrap();
+        save_freq_correction_ppm(&p, -1.42, None, None).unwrap();
         assert!(
             dacl_protected(&p, false),
             "the saved config took the directory's inherited ACL"
@@ -965,7 +1065,7 @@ mod tests {
         // An inheriting DACL stays inheriting.
         let q = write(dir.path(), "other.toml", "[input]\n");
         assert!(!dacl_protected(&q, false));
-        save_freq_correction_ppm(&q, -1.42, None).unwrap();
+        save_freq_correction_ppm(&q, -1.42, None, None).unwrap();
         assert!(!dacl_protected(&q, false));
     }
 }
