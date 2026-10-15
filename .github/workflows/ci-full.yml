@@ -73,20 +73,22 @@ permissions:
 
 jobs:
   # A workflow_dispatch run's own native check-runs always attach to the DISPATCHED REF's tip
-  # (the default branch), never to an arbitrary head_sha input passed alongside it. The two
-  # required checks ("test (ubuntu-latest)", "test (macos-latest)" -- confirmed via
-  # `gh api repos/HagaleTechnologies/manta/rulesets`) need to land on the PR's OWN head commit,
-  # so this job creates them explicitly via the Checks API instead, matching the exact names
-  # GitHub's own matrix-strategy check-run naming produces natively -- the same pattern
-  # cqdx/widdershins/vanity use for their own single "CI" fan-in check, adapted here for
+  # (the default branch), never to an arbitrary head_sha input passed alongside it. The required
+  # test checks ("test (ubuntu-latest)", "test (macos-latest)", and "test (windows-latest)" once
+  # MAN-371's owner step O1 is applied -- see
+  # `gh api repos/HagaleTechnologies/manta/rules/branches/main`) need to land on the PR's OWN
+  # head commit, so this job creates them explicitly via the Checks API instead, matching the
+  # exact names GitHub's own matrix-strategy check-run naming produces natively -- the same
+  # pattern cqdx/widdershins/vanity use for their own single "CI" fan-in check, adapted here for
   # independent matrix legs instead of one aggregate. push/merge_group need none of
   # this: github.sha there already names the real commit under test, so this job is skipped
   # entirely and the native per-job check-run attribution is already correct.
   #
-  # MAN-156: it creates THREE check-runs. "test (windows-latest)" is not required, but without it
-  # a trusted PR never shows its Windows result -- that is how MAN-301's Windows-only regression
-  # (dispatched run 38244914017) merged with green PR checks. The ruleset can require it later
-  # with no workflow change (docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md, step O5).
+  # MAN-156 added the third, "test (windows-latest)": without it a trusted PR never showed its
+  # Windows result -- that is how MAN-301's Windows-only regression (dispatched run 38244914017)
+  # merged with green PR checks. MAN-371 makes it required (owner step O1 of
+  # docs/DECISIONS/2026-10-15-man371-windows-required-check.md), so all three are created
+  # fail-closed: a failed POST fails this job instead of leaving a PR on "Expected".
   #
   # HAG-106/HAG-108: the check-runs are written with a hagale-agent App token, not
   # github.token. A github.token POST lands in the OLDEST github-actions check suite on the SHA
@@ -130,13 +132,9 @@ jobs:
             -f name="test (macos-latest)" -f head_sha="$HEAD_SHA" -f status="in_progress" --jq '.id')
           echo "ubuntu_check_id=$ubuntu_id" >> "$GITHUB_OUTPUT"
           echo "macos_check_id=$macos_id" >> "$GITHUB_OUTPUT"
-          # MAN-156: the Windows check-run is not required, so failing to create it must not cost
-          # the two required ones their relay; relay-check-runs warns and skips an empty id.
+          # MAN-371: required like the two above, so no `||` fallback: a failed POST fails the step.
           windows_id=$(gh api -X POST "repos/$REPO/check-runs" \
-            -f name="test (windows-latest)" -f head_sha="$HEAD_SHA" -f status="in_progress" --jq '.id') || {
-            echo "::warning::Could not create the test (windows-latest) check-run; this PR will not show its Windows result."
-            windows_id=""
-          }
+            -f name="test (windows-latest)" -f head_sha="$HEAD_SHA" -f status="in_progress" --jq '.id')
           echo "windows_check_id=$windows_id" >> "$GITHUB_OUTPUT"
 
   # No longer gated on codex-clean (HAG-46): this whole workflow only ever gets
