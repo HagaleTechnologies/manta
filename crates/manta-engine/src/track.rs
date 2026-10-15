@@ -296,6 +296,23 @@ pub struct CloseCounts {
     pub unkeyed: u64,
 }
 
+impl std::ops::Add for CloseCounts {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            unconfirmed: self.unconfirmed + rhs.unconfirmed,
+            hang_expired: self.hang_expired + rhs.hang_expired,
+            silent: self.silent + rhs.silent,
+            merged: self.merged + rhs.merged,
+            evicted: self.evicted + rhs.evicted,
+            rtty: self.rtty + rhs.rtty,
+            not_cw: self.not_cw + rhs.not_cw,
+            unkeyed: self.unkeyed + rhs.unkeyed,
+        }
+    }
+}
+
 impl CloseCounts {
     fn record(&mut self, reason: CloseReason) {
         match reason {
@@ -1840,8 +1857,8 @@ impl TrackManager {
     /// (`Unconfirmed`/`HangExpired`/`Silent` from `Lifecycle`'s state
     /// machine, `Merged`/`Evicted` from `merge_converged`/`evict_over_cap`).
     /// SPEC §2.5 and ARCHITECTURE §4/§8 both describe these closes as
-    /// "counted" -- this is the count. Wired into `soak_metrics::soak_with_metrics`
-    /// (MAN-19) ahead of the real M3 Prometheus endpoint.
+    /// "counted" -- this is the count. Published by `TrackLifecycleObserver`
+    /// for `soak_metrics::soak_with_metrics` (MAN-236).
     pub fn close_counts(&self) -> CloseCounts {
         self.close_counts
     }
@@ -3082,6 +3099,43 @@ pub(crate) fn event_track_id(e: &DecoderEvent) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_counts_adds_every_reason() {
+        let a = CloseCounts {
+            unconfirmed: 1,
+            hang_expired: 2,
+            silent: 3,
+            merged: 4,
+            evicted: 5,
+            rtty: 6,
+            not_cw: 7,
+            unkeyed: 8,
+        };
+        let b = CloseCounts {
+            unconfirmed: 10,
+            hang_expired: 20,
+            silent: 30,
+            merged: 40,
+            evicted: 50,
+            rtty: 60,
+            not_cw: 70,
+            unkeyed: 80,
+        };
+        assert_eq!(
+            a + b,
+            CloseCounts {
+                unconfirmed: 11,
+                hang_expired: 22,
+                silent: 33,
+                merged: 44,
+                evicted: 55,
+                rtty: 66,
+                not_cw: 77,
+                unkeyed: 88
+            }
+        );
+    }
 
     #[test]
     fn default_detector_config_has_rtty_on_and_7500_dwell_hops() {
