@@ -6490,7 +6490,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             // The values are the intersected `rf_passband_hz()`, exactly
             // as `run`'s notice above (round-1 review, PR #300).
             if let Some((lo, hi)) = src.trusted_band_hz().map(|_| src.rf_passband_hz()) {
-                eprintln!("{}", trusted_band_notice(src.sample_rate(), lo, hi));
+                errln!("{}", trusted_band_notice(src.sample_rate(), lo, hi));
             }
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
             out!("{}", fmt::soak_report(&report))?;
