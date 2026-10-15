@@ -98,6 +98,7 @@ mod tests {
             text: String::new(),
             events: Vec::new(),
             spots: Vec::new(),
+            timing: None,
             rtty: Vec::new(),
             sample_rate_hz: 48_000.0,
         };

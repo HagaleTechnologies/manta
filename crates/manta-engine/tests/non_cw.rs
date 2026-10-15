@@ -22,6 +22,8 @@ const CQ: &str = "CQ CQ DE K5ARH K5ARH K";
 
 fn cw(offset_hz: f64, snr: f32, wpm: f32, rise_ms: f64) -> SignalSpec {
     SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: CQ.into(),
         loop_text: true,
         wpm,
@@ -127,12 +129,12 @@ fn add_carrier(iq: &mut [Complex32], offset_hz: f64, snr: f32) {
 }
 
 /// Scenario 1, strict: zero in-band tracks at +30 and +45 dB. Ignored:
-/// with this testkit voice model the co-modulation span (SPEC §2.7) forms
+/// with this testkit voice model the co-modulation span (SPEC §2.8) forms
 /// late and covers only the strong lower harmonics, so a residual of
 /// tracks qualifies (measured 7 in band at +30 dB against 81 with the
 /// filter off). See the MAN-313 decision record's known limits.
 #[test]
-#[ignore = "MAN-313 residual: 7 in-band tracks at +30 dB with this voice model (decision record)"]
+#[ignore = "MAN-372: 7 in-band tracks at +30 dB with this voice model; zero is MAN-372's goal"]
 fn ssb_voice_at_14040_starts_no_cw_track() {
     let (lo, hi) = (CENTER + 40_200.0, CENTER + 42_900.0);
     for snr in [30.0, 45.0] {

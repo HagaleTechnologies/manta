@@ -3,7 +3,7 @@
 ## Decision
 
 A newly promoted track is decoded only once it qualifies as keyed CW
-(SPEC-decode-core.md §2.7). Before this change the detector promoted a CW
+(SPEC-decode-core.md §2.8). Before this change the detector promoted a CW
 track on anything 12 dB above the floor for 19 hops (about 50 ms), leased a
 decoder at once and emitted `TrackPromoted`. SSB voice produced 56–166
 garbage tracks in 40 s, and a swept carrier up to 213.
@@ -167,14 +167,14 @@ band noise at +30/+45/+60 dB starts no track in its band, and weak CW
   late (no span at the first evaluations, because partner counts sit at
   2–3, short of `COMOD_COUNT` over an 8-channel run) and covered only the
   strong lower harmonics (k 429–442 of 429–458). Adding the
-  `comodulated_with_span` qualification check (SPEC §2.7 D) cut it to 7:
+  `comodulated_with_span` qualification check (SPEC §2.8 D) cut it to 7:
   4 tracks promoted in the first 0.1 s that qualified before any span
   existed, and 3 later tracks next to the span that did not correlate
   with it. None is spotted. `non_cw.rs` keeps the strict zero-track test
   as `#[ignore]` and gates the delivered property instead (at least 80 %
   fewer in-band tracks, no spot). The plan's prototype measured 0 at
   +25 dB and above with its own voice; closing this gap needs the span
-  constants re-measured against this voice model. Recommended follow-up.
+  constants re-measured against this voice model. Filed as MAN-372.
   Diagnosis at +30 dB (implement phase, 2026-10-13): 6 of the 7 tracks
   that qualify have key-down frequency slopes of 38–70 Hz/s (the voice's
   F0 declination and vibrato on a harmonic), inside `MAX_SWEEP_HZ_PER_S`
@@ -202,6 +202,16 @@ band noise at +30/+45/+60 dB starts no track in its band, and weak CW
 - **Pi4 CPU budget not run** (above).
 - A qualified track is never closed because speech or wideband energy
   appears on it later; only the existing closes and `Unkeyed` apply.
+
+## Rescope (2026-10-14)
+
+Scenario 1 of MAN-313 asked that SSB voice at 14040 kHz start no CW track.
+The shipped filter does not meet that (7 in-band tracks at +30 dB above, none
+spotted), so Tony approved landing it as a partial: MAN-313's scenario 1
+now reads "no spots and at least 80 % fewer `TrackPromoted` events than with
+the filter off", which `non_cw.rs` gates in CI. The zero-track goal moved to
+MAN-372; its acceptance is the strict
+`ssb_voice_at_14040_starts_no_cw_track` passing with its `#[ignore]` removed.
 
 ## Follow-up
 

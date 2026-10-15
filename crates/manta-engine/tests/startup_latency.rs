@@ -20,6 +20,8 @@ const CENTER_HZ: f64 = 14_000_000.0;
 #[test]
 fn signal_keyed_at_segment_start_promotes_and_decodes_within_one_second() {
     let sig = SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: "CQ CQ DE W1AW W1AW K".into(),
         loop_text: true,
         wpm: 20.0,

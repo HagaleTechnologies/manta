@@ -1,4 +1,4 @@
-//! Band co-modulation classifier, SPEC §2.7 (MAN-313).
+//! Band co-modulation classifier, SPEC §2.8 (MAN-313).
 //!
 //! Speech (SSB voice) raises many adjacent channels' power together: every
 //! harmonic of the voice follows the same syllable envelope. Independent CW

@@ -17,6 +17,8 @@ fn score_text_matches_the_scorer_definitions() {
 #[test]
 fn oracle_recovers_a_synthetic_station_at_its_rbn_khz() {
     let sig = SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: "CQ TEST W5AU W5AU TEST".into(),
         loop_text: true,
         wpm: 30.0,

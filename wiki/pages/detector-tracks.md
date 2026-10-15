@@ -5,11 +5,11 @@ kind: subsystem
 status: current
 maintainer: agent
 sources:
-  - docs/SPEC-decode-core.md#2-noise-floor-signal-presence-detection
+  - docs/SPEC-decode-core.md#2-noise-floor--signal-presence-detection
   - ARCHITECTURE.md
 verified:
-  commit: 9802ca5
-  date: 2026-07-24
+  commit: d286147
+  date: 2026-10-13
 links:
   - pfb-channelizer
   - decode-chain
@@ -22,7 +22,7 @@ The detector estimates a per-channel noise floor by order statistics (a quantile
 - Track lifecycle state machine (IDLE → CANDIDATE → ACTIVE → HANG → CLOSED): SPEC §2.4 (`manta-engine::track`, now implemented — see `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md`).
 - Adjacent-channel ownership so one signal yields exactly one track (no cross-channel ghost decodes): SPEC §2.5. This invariant is a V7/V8w pass criterion — see [[golden-vector-freeze]].
 - Track cap with lowest-SNR eviction; merges (SPEC §2.5) and evictions (ARCHITECTURE §4) are counted in-process via `TrackManager::close_counts` (issue #26) — **no silent coverage loss**, though external exposition as Prometheus metrics is explicit M3 scope (ARCHITECTURE §8), not yet wired.
-- Every close that ever emitted a real `DecoderEvent` also produces a `DecoderEvent::TrackClosed { track_id }` (`process_hops`/`finish()`, gated on `Track::has_emitted`) — the teardown signal [[spot-validation]]'s per-track_id state depends on. Normative contract: `docs/DECISIONS/2026-09-02-man19-track-closed-teardown-invariant.md`.
+- Every close that ever emitted a real `DecoderEvent` also produces a `DecoderEvent::TrackClosed { track_id, closure }` (`closure` is `SignalEnded`, or `Bookkeeping` for a merge, eviction, silent-track GC, RTTY suppression or source discontinuity, none of which means the signal ended; see SPEC §5 and `ClosureKind` in `manta-decode::events`; `process_hops`/`finish()`, gated on `Track::has_emitted`) — the teardown signal [[spot-validation]]'s per-track_id state depends on. Normative contract: `docs/DECISIONS/2026-09-02-man19-track-closed-teardown-invariant.md`.
 
 ## Why it is shaped this way
 
@@ -50,6 +50,27 @@ Order statistics rather than a mean floor is the load-bearing choice: CW is burs
   frequency gates move with the promotion hop, so re-run them after any
   warm-up change; see the MAN-115
   [decision record](../../docs/DECISIONS/2026-10-11-man115-startup-latency.md).
+- Static crashes (MAN-312, SPEC §2.7): judge any band-wide event over the
+  source's passband, not every channel. A KiwiSDR's out-of-band channels
+  never lift, so an all-channel lower quartile missed its crashes; wherever
+  a live source exists, pass `rf_passband_hz()` to the `TrackManager`.
+- The crash decoder hold uses the value from before the onset: a crash is
+  flagged on its third lifted hop, so the entry just before the flag is
+  already lifted. The flag is captured on each decoder input entry when it
+  is observed, so it survives the MAN-194 refiner delay.
+- Floor rings keep taking their pushes during a crash. Freezing them would
+  leave a sustained band-wide rise (a gain step) unable to release.
+- Synthetic dense scenes start synchronized (every signal keys its first
+  element at t = 0), which a band-wide statistic reads as a crash. Render a
+  lead-in and drop it, as `manta-testkit::crash::dense_scene` does, before
+  testing one.
+- VC3's bogus count depends on the crash draw (five train seeds gave 0, 1,
+  4, 1 and 1 under `full`). After touching any crash constant, re-run the
+  five-seed sweep, not only the pinned `0x3333`.
+- Two worktrees that share one `CARGO_TARGET_DIR` can silently reuse each
+  other's path-dependency rlibs; use separate target directories when
+  comparing branches (for example `cpu_budget`). See the MAN-312
+  [decision record](../../docs/DECISIONS/2026-10-13-man312-static-crash-filter.md).
 - MAN-313 lazy lease: with `[detector] non_cw_filter` on, a promoted
   track has no decoder and emits no `TrackPromoted` until it qualifies as
   keyed CW; the event then carries the promotion `sample_ts`/`freq_hz`.
@@ -63,5 +84,5 @@ Order statistics rather than a mean floor is the load-bearing choice: CW is burs
 - MAN-313 co-modulation: lags start at 3 so a tone's own key clicks never
   count, and the span's strong test uses window peaks, not means, or a
   loud keyed tone's click skirt forms a span over the tone itself. See
-  SPEC-decode-core.md §2.7 and the
+  SPEC-decode-core.md §2.8 and the
   [decision record](../../docs/DECISIONS/2026-10-13-man313-non-cw-rejection.md).

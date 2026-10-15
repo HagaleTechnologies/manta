@@ -18,9 +18,16 @@ const PILEUP_CALLS_SEED: u64 = 0x534B_494D_5638; // "SKIMV8"
 /// hand-rolled ChaCha8 conversion every other generator in this crate uses
 /// (pinned decision 2) -- no local reimplementation.
 pub(crate) fn pileup_calls() -> Vec<String> {
-    let mut rng = ChaCha8Rng::seed_from_u64(PILEUP_CALLS_SEED);
+    unique_calls(PILEUP_CALLS_SEED, 50)
+}
+
+/// `n` unique, deterministic fixture callsigns from `seed`, in sorted
+/// order. `pileup_calls` is `unique_calls(PILEUP_CALLS_SEED, 50)`; MAN-312's
+/// `crash::dense_scene` draws its larger sets here too.
+pub(crate) fn unique_calls(seed: u64, n: usize) -> Vec<String> {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let mut calls = BTreeSet::new();
-    while calls.len() < 50 {
+    while calls.len() < n {
         let prefix = PREFIXES[(crate::u01(&mut rng) * PREFIXES.len() as f64) as usize];
         let suffix: String = (0..3)
             .map(|_| {

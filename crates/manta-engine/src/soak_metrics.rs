@@ -40,6 +40,8 @@ pub struct SoakMetricsSample {
     pub spots_emitted: usize,
     pub active_tracks: usize,
     pub close_counts: CloseCounts,
+    /// MAN-312: `TrackManager::static_crash_count` at this sample.
+    pub static_crashes: u64,
 }
 
 #[derive(Debug)]
@@ -69,6 +71,8 @@ pub struct SoakMetricsReport {
     /// close -- satisfying `track_closed_events > 0` while
     /// `RepetitionGate::record` was never called (round 3 review).
     pub gate_records_total: u64,
+    /// MAN-312: static crashes detected over the whole run.
+    pub final_static_crashes: u64,
 }
 
 // Windows has no libc::rusage/getrusage (POSIX-only) -- see this crate's
@@ -150,6 +154,7 @@ pub fn soak_with_metrics(
     let mut peak_active_tracks = 0usize;
     let mut final_close_counts = CloseCounts::default();
     let mut gate_records_total = 0u64;
+    let mut final_static_crashes = 0u64;
     let mut last_sample = Instant::now();
 
     let watchdog = std::thread::spawn(move || {
@@ -201,6 +206,10 @@ pub fn soak_with_metrics(
             cfg.detector,
             cfg.decode.clone(),
         );
+        // MAN-312 (SPEC §2.7): judge static crashes over the source's
+        // real passband, as `listen` does.
+        let (lo, hi) = src.rf_passband_hz();
+        tm.set_rf_passband_hz(lo, hi);
         let mut validator = cfg.validator(fs)?;
 
         let pad_samples = ch.filter_len();
@@ -263,6 +272,7 @@ pub fn soak_with_metrics(
                     spots_emitted: spot_count,
                     active_tracks: active,
                     close_counts: final_close_counts,
+                    static_crashes: tm.static_crash_count(),
                 });
             }
         }
@@ -281,6 +291,7 @@ pub fn soak_with_metrics(
             spot_count += validator.ingest(&ev).len();
         }
         final_close_counts = tm.close_counts();
+        final_static_crashes = tm.static_crash_count();
         gate_records_total = validator.gate_records_total();
         // MAN-19 review round 1: `worst_growth` was otherwise only ever
         // updated inside the periodic `sample_interval` branch above -- any
@@ -321,6 +332,7 @@ pub fn soak_with_metrics(
         final_close_counts,
         track_closed_events: track_closed_count,
         gate_records_total,
+        final_static_crashes,
     })
 }
 
@@ -329,4 +341,56 @@ pub fn soak_with_metrics(
 /// `SoakMetricsSample` emitted during the run, not a separate gate here.
 pub fn soak_metrics_passed(report: &SoakMetricsReport) -> bool {
     !report.panicked && report.rss_growth_bytes < RSS_GROWTH_LIMIT_BYTES
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct VecSource {
+        samples: Vec<Complex32>,
+        cursor: usize,
+        fs: f64,
+    }
+
+    impl IqSource for VecSource {
+        fn sample_rate(&self) -> f64 {
+            self.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            0.0
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            let n = buf.len().min(self.samples.len() - self.cursor);
+            buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
+            self.cursor += n;
+            Ok(n)
+        }
+    }
+
+    /// MAN-312: the soak report carries the run's static-crash count.
+    #[test]
+    fn soak_report_counts_static_crashes() {
+        let fs = 96_000.0;
+        let mut samples = manta_testkit::crash::vc1_scene(fs);
+        manta_testkit::crash::add_crash(
+            &mut samples,
+            fs,
+            &manta_testkit::crash::vc1_crash(fs, 5.0, 40.0),
+        );
+        let src = Box::new(VecSource {
+            samples,
+            cursor: 0,
+            fs,
+        });
+        let report = soak_with_metrics(
+            src,
+            &PipelineConfig::default(),
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.final_static_crashes, 1);
+    }
 }

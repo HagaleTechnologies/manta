@@ -183,8 +183,12 @@ MINOR version.
 
 ## Not this schema
 
-`manta decode --json` and `manta run --json` print a debugging format.
-That format is not stable and is not described here.
+- `manta decode --json` and `manta run --json` print a debugging format.
+  That format is not stable and is not described here.
+- The live-state stream on `[server].live_port` (band noise floor, each
+  track's text and candidates, and every validation decision) is a
+  separate listener with its own record kinds; this stream never carries
+  them. See [LIVE-STATE.md](LIVE-STATE.md).
 
 ## Where the values come from
 
