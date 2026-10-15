@@ -11,7 +11,11 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+<<<<<<< HEAD
 | 2026-10-14 | MAN-248 | [MAN-248: a per-minute ceiling on spots the RBN uplink forwards](2026-10-14-man248-uplink-forwarding-ceiling.md) |
+=======
+| 2026-10-15 | MAN-371 | [MAN-371: `test (windows-latest)` becomes a required check](2026-10-15-man371-windows-required-check.md) |
+>>>>>>> 6596e3a3e9c3400e6111f2cd02294f74ecd0f383
 | 2026-10-14 | MAN-211 | [MAN-211: TrackMeta's frequency is captured per queued hop, like its SNR](2026-10-14-man211-trackmeta-freq-per-hop.md) |
 | 2026-10-14 | MAN-197 | [MAN-197: a live track's input selection also skips cooling-down channels](2026-10-14-man197-live-window-cooldown-enforcement.md) |
 | 2026-10-14 | MAN-197 | [MAN-197: the respawn cooldown gates a spawn candidate's whole ownership window](2026-10-14-man197-respawn-cooldown-ownership-window.md) |

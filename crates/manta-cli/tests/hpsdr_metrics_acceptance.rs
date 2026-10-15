@@ -32,12 +32,13 @@ use std::time::{Duration, Instant};
 /// check at that length is equally "malformed" to the framing validator.
 const FAKE_METIS_PACKET_LEN: usize = 1032;
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// `N` distinct ports nothing listens on right now. All `N` listeners are
+/// held until every port is read: releasing each before binding the next
+/// lets the OS hand the same port out twice (Windows does, and then the
+/// config is rejected as "two servers cannot share a port").
+fn free_ports<const N: usize>() -> [u16; N] {
+    let held: [TcpListener; N] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
+    held.map(|l| l.local_addr().unwrap().port())
 }
 
 /// Kills and reaps the daemon child process on drop, including on a
@@ -135,11 +136,9 @@ fn malformed_hpsdr_datagrams_are_visible_on_the_metrics_endpoint() {
         handle: Some(handle),
     };
 
-    // 2. Config: three free ports picked by TcpListener::bind + drop (no
-    //    fixed ports -- CLAUDE.md multi-agent hygiene).
-    let telnet_port = free_port();
-    let json_port = free_port();
-    let metrics_port = free_port();
+    // 2. Config: three distinct free ports, all held until read (no fixed
+    //    ports -- CLAUDE.md multi-agent hygiene).
+    let [telnet_port, json_port, metrics_port] = free_ports();
     let mut cfg_file = tempfile::NamedTempFile::new().unwrap();
     write!(
         cfg_file,
