@@ -49,12 +49,13 @@ fn unique_group() -> Ipv4Addr {
     )
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// `N` distinct ports nothing listens on right now. All `N` listeners are
+/// held until every port is read: releasing each before binding the next
+/// lets the OS hand the same port out twice (Windows does, and then the
+/// config is rejected as "two servers cannot share a port").
+fn free_ports<const N: usize>() -> [u16; N] {
+    let held: [TcpListener; N] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
+    held.map(|l| l.local_addr().unwrap().port())
 }
 
 fn free_udp_port() -> u16 {
@@ -280,14 +281,12 @@ fn ka9q_stream_spots_w1aw_like_the_file_replay() {
     let data_port = free_udp_port();
     let mut fake = FakeRadiod::status_only(group, channel_status(group, data_port, false));
 
-    let metrics_port = free_port();
+    let [telnet_port, json_port, metrics_port] = free_ports();
     let cfg = dir.path().join("manta.toml");
     std::fs::write(
         &cfg,
         format!(
-            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {}\njson_port = {}\nmetrics_port = {metrics_port}\n",
-            free_port(),
-            free_port()
+            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {telnet_port}\njson_port = {json_port}\nmetrics_port = {metrics_port}\n"
         ),
     )
     .unwrap();

@@ -10,9 +10,10 @@ sources:
   - .github/workflows/release-publish.yml
   - docs/superpowers/specs/2026-09-11-man212-windows-platform-support-design.md
   - docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md
+  - docs/DECISIONS/2026-10-15-man371-windows-required-check.md
 verified:
-  commit: de525d1
-  date: 2026-10-13
+  commit: 3805f78
+  date: 2026-10-15
 links:
   - live-hardware-field-testing
 ---
@@ -125,15 +126,23 @@ reliability comparison against the macOS baseline in issues #166/#167/
   straight after the write lets Windows reset the connection before the
   client reads the reply (os error 10054, "forcibly closed"), which made
   `health_command` flake on about 1 in 8 Windows merge-queue runs (MAN-156).
+- A test that needs several free ports must hold every listener until it
+  has read them all (`free_ports::<N>()` in `doctor_checks.rs`,
+  `node_health_acceptance.rs`, `hpsdr_metrics_acceptance.rs` and
+  `ka9q_input.rs`). Windows hands a just-released port straight back out,
+  so picking ports one at a time can pick the same port twice and the
+  config is rejected (#302, MAN-371). Delete the single-port helper once
+  nothing calls it, or `clippy -D warnings` fails on dead code.
 
 ## Known gaps
 
-- Windows legs are not required for merge. Since MAN-156,
-  `test (windows-latest)` posts on every PR head (a trusted PR's dispatched
-  run included), and `release-publish.yml` refuses to publish a commit whose
-  `ci-full.yml` push run failed a Windows leg. Promotion to required waits on
-  step O5 of
-  [the MAN-156 decision](../../docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md).
+- `test (windows-latest)` is required for merge once MAN-371's owner step
+  O1 is applied. `gh api repos/HagaleTechnologies/manta/rules/branches/main`
+  shows whether it is. Its check-run on a trusted PR's head is created
+  fail-closed. `test-hpsdr (windows-latest)` stays advisory, like its
+  ubuntu and macOS siblings. `release-publish.yml` refuses to publish a
+  commit whose `ci-full.yml` push run failed a Windows leg (MAN-156). See
+  [the MAN-371 decision](../../docs/DECISIONS/2026-10-15-man371-windows-required-check.md).
 - `--features soapy` is not covered by Windows CI. `test-soapy` runs only
   `ubuntu-latest` and `macos-latest`; the `windows-latest` leg was
   attempted (see the vcpkg subsection above) and dropped after hitting a
