@@ -306,6 +306,30 @@ fn readme_installation_documents_the_soapy_archive() {
     );
 }
 
+/// MAN-82: `soapysdr0.8-module-airspy` drives the Airspy R2/Mini only. The
+/// Airspy HF+ (manta's reference device) needs SoapyAirspyHF, which Ubuntu
+/// 24.04 does not package, so the module table must not send HF+ users to
+/// the wrong package.
+#[test]
+fn readme_soapy_setup_separates_airspy_hf_plus() {
+    let install = squash_whitespace(section(&doc("README.md"), "Installation"));
+    for needle in [
+        "| Airspy R2 or Airspy Mini | `soapysdr0.8-module-airspy` |",
+        "| Airspy HF+ |",
+        "libairspyhf-dev",
+        "https://github.com/pothosware/SoapyAirspyHF",
+    ] {
+        assert!(
+            install.contains(needle),
+            "README Installation's Soapy module table never says `{needle}`"
+        );
+    }
+    assert!(
+        !install.contains("| Airspy | `soapysdr0.8-module-airspy` |"),
+        "README Installation still offers `soapysdr0.8-module-airspy` for every Airspy"
+    );
+}
+
 // ---- Scenario 4: ROADMAP's RBN-admission item ----
 
 /// RBN admission is active P0 work (MAN-40; decision D1, 2026-09-06), not a

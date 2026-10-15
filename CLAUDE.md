@@ -339,13 +339,12 @@ report line and `manta_input_bad_samples_total{source}`; `manta check`
 still errors on non-finite input. See
 docs/DECISIONS/2026-10-15-man234-bad-input-samples.md.
 
-<<<<<<< HEAD
 MAN-82: releases add `manta-linux-x86_64-soapy.tar.gz` (`build-soapy`,
 `hpsdr,soapy`, Ubuntu 24.04 x86_64, libSoapySDR linked dynamically, own
 man pages, checked by `scripts/check-soapy-release.py` before upload); the
 Release needs it, the image does not. See
 docs/DECISIONS/2026-10-14-man82-soapy-release-archive.md.
-=======
+
 MAN-236: `soak_with_metrics` (the `man19-soak` harness and
 `examples/close_counts.rs`) wraps `listen_with_observers`, the loop
 `manta run` executes, instead of a copy. `ListenObservers::track_lifecycle`
@@ -354,7 +353,6 @@ count and peak, per-reason closes, repetition-gate record total and
 steady-state chunk count. Bounded fixed-seed runs reported identical
 counts before and after. See
 docs/DECISIONS/2026-10-15-man236-soak-metrics-wraps-listen.md.
->>>>>>> 8c92062aa574efa8ffb8dc7827b67d99178bd961
 
 ## Documents (read in this order)
 

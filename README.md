@@ -142,14 +142,16 @@ instead, in addition to the core runtime:
 | Receiver | Install in addition to the core runtime |
 |---|---|
 | RTL-SDR | `soapysdr0.8-module-rtlsdr` |
-| Airspy | `soapysdr0.8-module-airspy` |
+| Airspy R2 or Airspy Mini | `soapysdr0.8-module-airspy` |
+| Airspy HF+ | The SoapyAirspyHF module, which Ubuntu 24.04 does not package: build it from [SoapyAirspyHF](https://github.com/pothosware/SoapyAirspyHF) with `libairspyhf-dev`, `libsoapysdr-dev`, `cmake` and `g++` installed. |
 | HackRF | `soapysdr0.8-module-hackrf` |
 | SDRplay | The vendor's SDRplay API and a compatible SoapySDRPlay3 module, following [SoapySDRPlay3 installation requirements](https://github.com/pothosware/SoapySDRPlay3/blob/master/README.md). |
 
-Getting the SDRplay module can mean installing SDRplay's API and compiling
-SoapySDRPlay3's C++ module yourself; running this manta binary still needs
-no Rust toolchain. Check that the Airspy module supports your model before
-relying on it.
+`soapysdr0.8-module-airspy` drives the Airspy R2 and Mini, not the HF+.
+On Ubuntu 24.04, getting the Airspy HF+ module means compiling a C++
+SoapySDR module yourself, and getting the SDRplay one can too
+(SoapySDRPlay3 also needs SDRplay's API); running this manta binary still
+needs no Rust toolchain.
 
 `./manta devices` lists a selector string for each receiver it finds; pass
 it to `--soapy-driver`. Choose a frequency and a sample rate your receiver
