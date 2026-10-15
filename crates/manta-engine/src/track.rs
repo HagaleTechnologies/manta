@@ -1989,6 +1989,13 @@ impl TrackManager {
             track.current_snr_db = (self.gate.smoothed_db(k) - f) as f32;
             let char_emitted = false; // GC timer input; refined below once a decoder exists.
             let prev_state = track.lifecycle.state();
+            // MAN-313 (SPEC §2.8 A): a track awaiting qualification has no
+            // decoder, so "no character decoded" says nothing about it yet;
+            // hold its garbage-collect timer at zero. `NotCw` bounds its
+            // life instead, and the timer starts at qualification.
+            if track.keying.is_some() && !track.qualified {
+                track.lifecycle.note_char_decoded();
+            }
             // MAN-312: a CANDIDATE's confirm window is frozen through a
             // crash rather than counted for or against it; ACTIVE/HANG
             // tracks step on the held rise/drop so their hang timers run.
@@ -6389,6 +6396,33 @@ mod tests {
         let q = qualified_at.unwrap();
         assert!(250 * 15 + q > promo_ts, "qualified after promotion");
         assert_eq!(tm.decoding_track_count(), 1);
+    }
+
+    #[test]
+    fn short_gc_does_not_close_a_track_awaiting_qualification() {
+        // gc_hops (60) far below the time a keyed tone takes to qualify:
+        // the silent GC must not close it before it can.
+        let mut tm = nc_mgr(DetectorConfig {
+            gc_hops: 60,
+            ..DetectorConfig::default()
+        });
+        let promoted = nc_drive(
+            &mut tm,
+            0,
+            1500,
+            |i| nc_tone(10, nc_keyed(i), 30.0),
+            |_, _| {},
+        );
+        // The first track qualifies. (Once qualified it has a decoder, so
+        // the 60-hop GC applies to it as before: this step-only harness
+        // decodes nothing, so it then closes `Silent` and respawns.)
+        assert!(
+            matches!(
+                promoted.first(),
+                Some(DecoderEvent::TrackPromoted { track_id: 1, .. })
+            ),
+            "{promoted:?}"
+        );
     }
 
     #[test]

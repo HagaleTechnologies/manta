@@ -615,7 +615,9 @@ the next drain. Once an unqualified track's queue exceeds
 entries are dropped down to `MAX_UNQUALIFIED_BACKLOG`; the default
 `unkeyed_close_hops` (3750) never reaches that, so only a raised
 `unkeyed_close_ms` changes what a late-qualifying track replays. At end of
-input an unqualified track is dropped with no events.
+input an unqualified track is dropped with no events. Until it qualifies, the track's
+garbage-collect timer (§2.4) is held at zero, since with no decoder it
+cannot decode a character; `NotCw` (D) bounds its life instead.
 
 **B. Keying evidence.** Every hop, for each promoted, unqualified track:
 
