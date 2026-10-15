@@ -62,8 +62,9 @@ window bounds move forward, which includes a fixed `h` and any `h` change
 of one hop between consecutive centers. A `u_ref` change that moves a
 bound backwards (growing or shrinking `h` by more than one hop between
 consecutive centers) rebuilds the deque from the retained samples of the
-new window, at O(2h + 1) for that hop. The §1.7 lookahead reads the next
-center's `M` from the same deque without advancing it. See
+new window, at O(2h + 1) for that hop. Since MAN-190 each center's `M`
+is read once, by the query that computes that center; §1.7 compares two
+computed hops' LLRs and reads nothing ahead of the next query. See
 `docs/DECISIONS/2026-10-14-man193-centered-maximum-deque.md`.
 
 Rationale (design §1.3, §5.1): a *symmetric* window tracks QSB in both

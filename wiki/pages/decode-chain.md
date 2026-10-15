@@ -8,8 +8,8 @@ sources:
   - docs/SPEC-decode-core.md#3-per-track-demodulation
   - ARCHITECTURE.md
 verified:
-  commit: 60c4339
-  date: 2026-10-14
+  commit: 3805f78
+  date: 2026-10-15
 links:
   - detector-tracks
   - spot-validation
