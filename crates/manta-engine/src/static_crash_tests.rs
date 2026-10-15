@@ -131,8 +131,39 @@ fn run(
     passband: Option<(f64, f64)>,
     chunk: usize,
 ) -> Run {
+    run_cfg(iq, fs, center_freq_hz, mode, engine, passband, chunk, true)
+}
+
+/// `"off"` with MAN-313's non-CW filter also off: the pre-MAN-312 flood
+/// these tests compare against. With the non-CW filter on, crash noise
+/// never qualifies as keyed CW, so it emits no `TrackPromoted` to count.
+fn run_flood_baseline(iq: &[Complex32], fs: f64, passband: Option<(f64, f64)>) -> Run {
+    run_cfg(
+        iq,
+        fs,
+        0.0,
+        CrashFilter::Off,
+        Engine::Legacy,
+        passband,
+        4096,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_cfg(
+    iq: &[Complex32],
+    fs: f64,
+    center_freq_hz: f64,
+    mode: CrashFilter,
+    engine: Engine,
+    passband: Option<(f64, f64)>,
+    chunk: usize,
+    non_cw_filter: bool,
+) -> Run {
     let mut cfg = PipelineConfig::default();
     cfg.detector.crash_filter = mode;
+    cfg.detector.non_cw_filter = non_cw_filter;
     cfg.decode.engine = engine;
     let mut ch = Channelizer::new(fs, center_freq_hz).unwrap();
     let hop = ch.hop() as u64;
@@ -207,7 +238,11 @@ fn vc1_crashes_start_no_tracks() {
     for (width_ms, level_db) in vc1_cases() {
         let iq = with_crash(&base, fs, &vc1_crash(fs, width_ms, level_db));
         for mode in [CrashFilter::Full, CrashFilter::StartsOnly, CrashFilter::Off] {
-            let r = run_default(&iq, fs, mode);
+            let r = if mode == CrashFilter::Off {
+                run_flood_baseline(&iq, fs, None)
+            } else {
+                run_default(&iq, fs, mode)
+            };
             let case = format!("{width_ms} ms +{level_db} dB {mode:?}");
             assert_eq!(r.crashes, 1, "{case}: crash count");
             if mode != CrashFilter::Off {
@@ -230,7 +265,7 @@ fn vc1_other_rates() {
         let full = run_default(&iq, fs, CrashFilter::Full);
         assert_eq!(full.promoted(), 0, "{fs} Hz full");
         assert_eq!(full.crashes, 1, "{fs} Hz full");
-        let off = run_default(&iq, fs, CrashFilter::Off);
+        let off = run_flood_baseline(&iq, fs, None);
         assert!(off.promoted() > 0, "{fs} Hz off");
     }
 }
@@ -252,11 +287,22 @@ fn vc1_kiwi_passband() {
         assert_eq!(full.promoted(), 0, "{case}: full");
         if level_db >= 20.0 {
             assert_eq!(full.crashes, 1, "{case}: full count");
-            let off = run(&iq, fs, 0.0, CrashFilter::Off, Engine::Legacy, kiwi, 4096);
+            let off = run_flood_baseline(&iq, fs, kiwi);
             assert!(off.promoted() > 0, "{case}: off should flood");
         }
         if width_ms == 5.0 && level_db == 40.0 {
-            let all = run(&iq, fs, 0.0, CrashFilter::Full, Engine::Legacy, None, 4096);
+            // Non-CW filter off (MAN-313), as for the flood baseline: the
+            // missed crash's tracks are noise and would never qualify.
+            let all = run_cfg(
+                &iq,
+                fs,
+                0.0,
+                CrashFilter::Full,
+                Engine::Legacy,
+                None,
+                4096,
+                false,
+            );
             assert_eq!(all.crashes, 0, "{case}: all-channel statistic");
             assert!(all.promoted() > 0, "{case}: all-channel statistic");
         }
@@ -477,7 +523,7 @@ fn silence_lead_in_is_one_crash() {
     let full = run_default(&iq, spec.fs, CrashFilter::Full);
     assert_eq!(full.promoted(), 1);
     assert_eq!(full.crashes, 1);
-    let off = run_default(&iq, spec.fs, CrashFilter::Off);
+    let off = run_flood_baseline(&iq, spec.fs, None);
     assert!(off.promoted() > 1, "off promoted {}", off.promoted());
 }
 
@@ -491,7 +537,7 @@ fn silence_lead_in_is_one_crash() {
 fn vc3_off_floods_and_loses_calls() {
     let (spec, crashes) = manta_testkit::crash::vc3();
     let rendered = render_with_crashes(&spec, &crashes).unwrap();
-    let off = run_default(&rendered.samples, spec.fs, CrashFilter::Off);
+    let off = run_flood_baseline(&rendered.samples, spec.fs, None);
     let truth: std::collections::BTreeSet<String> = rendered
         .keyed_texts
         .iter()

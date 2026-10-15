@@ -2192,6 +2192,28 @@ mod tests {
     }
 
     #[test]
+    fn env_non_cw_filter_overrides_the_file() {
+        let loaded = load_env(
+            Some("[detector]\nnon_cw_filter = true\nunkeyed_close_ms = 20000\n"),
+            &[("MANTA_DETECTOR_NON_CW_FILTER", "false")],
+        )
+        .unwrap();
+        assert!(!loaded.detector.non_cw_filter);
+        assert_eq!(loaded.detector.unkeyed_close_hops, 7500);
+    }
+
+    #[test]
+    fn env_unkeyed_close_ms_overrides_the_file() {
+        let loaded = load_env(
+            Some("[detector]\nunkeyed_close_ms = 20000\n"),
+            &[("MANTA_DETECTOR_UNKEYED_CLOSE_MS", "15000")],
+        )
+        .unwrap();
+        assert!(loaded.detector.non_cw_filter);
+        assert_eq!(loaded.detector.unkeyed_close_hops, 5625);
+    }
+
+    #[test]
     fn env_values_are_typed_by_toml_probe() {
         let loaded = load_env(
             None,

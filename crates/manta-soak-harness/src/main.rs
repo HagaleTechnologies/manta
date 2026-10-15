@@ -457,6 +457,8 @@ fn main() -> Result<()> {
                 "merged": s.close_counts.merged,
                 "evicted": s.close_counts.evicted,
                 "rtty": s.close_counts.rtty,
+                "not_cw": s.close_counts.not_cw,
+                "unkeyed": s.close_counts.unkeyed,
             },
             "static_crashes": s.static_crashes,
         });
@@ -582,6 +584,8 @@ fn main() -> Result<()> {
             "merged": report.final_close_counts.merged,
             "evicted": report.final_close_counts.evicted,
             "rtty": report.final_close_counts.rtty,
+            "not_cw": report.final_close_counts.not_cw,
+            "unkeyed": report.final_close_counts.unkeyed,
         },
         "static_crashes": report.final_static_crashes,
         "man19_criteria": {

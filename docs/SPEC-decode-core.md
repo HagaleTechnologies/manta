@@ -137,13 +137,50 @@ against the repo's Pi4 CPU budget. Moving the cutoff off exactly `fs_in/4`
 (above) also gives up this exact-zero-tap property, so issue #176's skip
 opportunity no longer applies to this stage regardless.
 
-**Known limitation** (issue #179): the `CUTOFF_FRACTION` margin means
-channels near the decimated Nyquist edge see real, non-negligible
-attenuation (roughly -6 dB to -22 dB in the last ~1.5 kHz below the edge,
-for a 96k->48k stage) while still being exposed to the channelizer as
-ordinary trackable channels -- a real CW signal landing there can lose
-enough SNR to go undetected. The channelizer has no concept of decimation
-and does not yet exclude or de-weight these transition-band channels.
+**Trusted band** (MAN-196): the `CUTOFF_FRACTION` margin means channels
+near the decimated Nyquist edge see real, non-negligible attenuation
+(roughly -6 dB to -22 dB in the last ~1.5 kHz below the edge, for a
+96k->48k stage). The decimator therefore publishes a **trusted
+half-bandwidth** — `TRUSTED_HALF_BAND_FRACTION = 0.4526` of `fs_out`, the
+<= 1 dB crossover of the halfband design (21 728.5 Hz measured at
+48 kS/s; the constant sits at 21 724.8 Hz, at-or-inside it), exposed as
+`Decimator::trusted_half_bandwidth_hz()` and DTFT-self-verified by
+bisection in the module's tests. Two rules consume it:
+
+- **Advertisement**: `DecimatingSource::rf_passband_hz` clips to
+  `+/- trusted` (intersected with the inner source's passband), so
+  `manta check`, SETT segments, live-state `bandState` and the
+  static-crash live set all advertise/judge the honest band. The JSON
+  `passband_offsets_hz` value narrows; its name and schema do not change.
+- **Spawn veto**: `IqSource::trusted_band_hz()` (default `None`) reports
+  the band — for `DecimatingSource`, the same intersected band
+  `rf_passband_hz` advertises, so the two never disagree; `listen` reads it once per source and every segment's
+  `TrackManager::set_trusted_band_hz(lo, hi)` builds a per-channel mask
+  (true iff the channel centre `f(k)` lies in `[lo, hi]`; no margin
+  channel). A channel whose centre lies outside the band may not START a
+  candidate (the §2.4 conjunction gains `!trusted_vetoes_spawn(k)`) —
+  spawns only, never closing or de-weighting a running track, per the
+  MAN-314 key-up-gap lesson. `None` (every non-decimated source) vets
+  nothing: behaviour-identical to before, bit for bit.
+
+**In-band foldover aliases** (round-1 review on PR #300): frequencies at
+or above `fs_out - trusted` fold *inside* the trusted band, where the
+spawn veto cannot see them — only the halfband's stopband stands between
+the alias and a mirrored in-band track. That region is pinned at the
+design's >= 80 dB Kaiser stopband target (measured >= ~-86.5 dB, worst at
+the region's lower edge 26 275.2 Hz at `fs_out` = 48 kS/s;
+`halfband_stopband_covers_frequencies_folding_inside_the_trusted_band`).
+A carrier above Nyquist stronger than the stopband margin can still
+promote a mirrored track in digital silence (measured boundary: -35 dBFS
+at +26 343.75 Hz promotes, -40 dBFS does not; e2e pin
+`an_in_band_foldover_residue_promotes_only_above_the_stopband_margin`).
+Deepening the stopband is a filter-design change excluded from MAN-196's
+scope and raised as a decision ticket (see the decision record).
+
+Channel granularity makes the effective edge the last channel centre
+inside the boundary (channel 231, 21 656.25 Hz, at 48 kS/s): channels
+232-255 per side (24 of 256) are conceded by design. See
+docs/DECISIONS/2026-10-14-man196-decimator-trusted-band.md.
 
 ---
 
@@ -248,8 +285,8 @@ States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`.
 
 | Transition | Condition |
 |---|---|
-| IDLE → CANDIDATE | rise condition first met on channel `k`, `k` is not owned by an existing track (§2.5), `k` is not RTTY-vetoed (§2.6), and no static crash is being suppressed this hop (§2.7) |
-| CANDIDATE → ACTIVE | rise sustained 19 hops → lease decoder from pool |
+| IDLE → CANDIDATE | rise condition first met on channel `k`, `k` is not owned by an existing track (§2.5), `k` is not RTTY-vetoed (§2.6), no static crash is being suppressed this hop (§2.7), `k` is not inside a co-modulation span (§2.8), and `k`'s centre is not outside the source's trusted band when one was supplied (§1.5, MAN-196) |
+| CANDIDATE → ACTIVE | rise sustained 19 hops → lease decoder from pool; with `non_cw_filter` on, the lease waits for qualification (below, §2.8) |
 | CANDIDATE → IDLE | rise condition lost before 19 hops |
 | ACTIVE → HANG | drop condition met (below off threshold) |
 | HANG → ACTIVE | `S ≥ F + on_snr_db` again (hang timer reset) |
@@ -257,9 +294,22 @@ States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`.
 | ACTIVE/HANG → CLOSED | **garbage collect:** no character emitted for 30 000 ms (`detector.gc_ms`) — carrier or non-CW signal; the channel is marked *suppressed* for 60 s (re-detection allowed but logged) |
 | any → CLOSED | eviction: track cap reached and this is the lowest-SNR track (counted in metrics, per ARCHITECTURE §4) |
 | ACTIVE/HANG/CANDIDATE → CLOSED | `round(c)` inside a marked RTTY signal's hard span (§2.6) → closed as bookkeeping (`CloseReason` `rtty`, counted) |
+| ACTIVE/HANG → CLOSED | promoted but not qualified as keyed CW within `unkeyed_close_hops` of promotion (§2.8) → closed as bookkeeping (`CloseReason` `not_cw`, counted); no events, because no decoder was leased |
+| ACTIVE → CLOSED | qualified track key-down for `unkeyed_close_hops` with no re-rise, no decoded character and no callsign read (§2.8) → closed as bookkeeping (`CloseReason` `unkeyed`, counted), flushed like the garbage-collect close |
 
 All timers are hop-counted (integers), never wall-clock.
 
+**Lazy lease (MAN-313).** With `detector.non_cw_filter = true` (the
+default) the lifecycle above is unchanged, but CANDIDATE → ACTIVE does not
+lease a decoder. The promoted track queues its demod input from the
+promotion hop and emits nothing. When it qualifies as keyed CW (§2.8) it
+leases a decoder, the queue is replayed into it, and `TrackPromoted` is
+emitted carrying the promotion hop's `sample_ts` and `freq_hz`. Decoded
+output is the same as an immediate lease; only the batch that carries it
+is later (0.5–1.5 s of stream on the golden vectors). A track that never
+qualifies emits nothing, including at end of input. `NotCw`, `Unkeyed` and
+the garbage-collect close each start the MAN-171 respawn cooldown on their
+channels. `non_cw_filter = false` leases at promotion, as before.
 On a hop where a static crash is suppressed (§2.7, `detector.crash_filter`
 `"full"` or `"starts-only"`), no IDLE → CANDIDATE transition happens, a
 CANDIDATE's lifecycle does not step (its confirm count neither advances
@@ -278,6 +328,12 @@ track back to ACTIVE.
 - A rising, unowned channel `k` may start a spawn decision only if its
   smoothed power `S[k]` is ≥ both `S[k−1]` and `S[k+1]` (a local maximum;
   neighbours wrap). (MAN-172, see docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md)
+- A channel whose centre lies outside the source's trusted band, when one
+  was supplied, may not start a spawn decision — in both the `k` and
+  `k+1` slots of the same-hop pairing rule below, so the arbitration
+  cannot route around the veto. Spawns only: a track that already exists
+  on an untrusted channel is never closed or de-weighted by it (MAN-196,
+  the MAN-314 spawns-only lesson).
 - A spawn decision at `k` is additionally rejected while *any* channel of
   the prospective ownership window `{k−1, k, k+1}` (neighbours wrap) is
   still serving a post-`Silent` respawn cooldown (§9's
@@ -306,6 +362,8 @@ track back to ACTIVE.
   `merged` (counted); its decoder state is discarded (text already emitted
   stands). On equal SNR the older track (lower `track_id`) survives.
   (MAN-172, see docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md)
+  With `non_cw_filter` on, a qualified track beats an unqualified one
+  first (§2.8 F).
 
 ### 2.6 Two-tone FSK (RTTY) recognition
 
@@ -547,6 +605,162 @@ the live channels in ascending index order. It consumes one channelizer
 hop at a time, so its state and every output are independent of how the
 input is chunked (§6); `crash_state_is_chunk_invariant` checks 256-,
 4096- and 65536-sample chunks.
+### 2.8 Non-CW rejection (MAN-313)
+
+MAN-313, `manta-dsp::comod::CoModDetector` plus per-track keying evidence
+in `manta-engine::track`, see
+docs/DECISIONS/2026-10-13-man313-non-cw-rejection.md. Every rule here
+applies only with `detector.non_cw_filter = true` (the default).
+Noise-like wideband data and swept carriers start no CW track, speech
+(SSB) starts far fewer (a measured residual, not zero: see the decision
+record's known limits and MAN-372), and a track that stops keying closes. `non_cw_filter = false` builds no
+classifier and runs none of the rules below: decoder and `TrackPromoted`
+at promotion, no qualification, veto, timeout or unkeyed close.
+
+`unkeyed_close_hops = ms_to_hops(detector.unkeyed_close_ms)`, default
+3750 (10 s). The loader rejects a value below 1000 ms.
+
+Constants (compile-time; `COMOD_*` in `manta-dsp::comod`, the rest in
+`manta-engine::track`):
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `COMOD_WINDOW_HOPS` | 375 | ring length per channel, 1.000 s |
+| `COMOD_EVAL_HOPS` | 75 | evaluation cadence, 0.2 s |
+| `COMOD_MIN_FILL_HOPS` | 188 | first evaluation once this many hops are stored |
+| `COMOD_HOT_DB` | 6.0 | a channel is hot when its window-mean SNR reaches this |
+| `COMOD_LAG_MIN`, `COMOD_LAG_MAX` | 3, 16 | pair distances in channels, inclusive |
+| `COMOD_RHO` | 0.5 | Pearson ρ of a hot pair's per-hop SNR must be ≥ this |
+| `COMOD_COUNT` | 4 | a channel with ≥ 4 co-modulated partners joins a span |
+| `COMOD_SPAN_MIN_WIDTH` | 8 | span width, first to last channel inclusive |
+| `COMOD_SPAN_STRONG` | 4 | channels in `[first − 2, last + 2]` whose window peak … |
+| `COMOD_SPAN_STRONG_DB` | 10.0 | … is within 10 dB of that range's strongest window peak |
+| `COMOD_SPAN_GUARD` | 1 | marked span = `[first − 1, last + 1]` |
+| `COMOD_HOLD_HOPS` | 1875 | a span stays marked 5 s after the evaluation that found it |
+| `MAX_MARK_HOPS` | 1125 | longest ACTIVE run (3 s) that still counts as a keying cycle |
+| `QUALIFY_MIN_ACTIVE_HOPS` | 8 | ACTIVE hops needed since the previous evaluation |
+| `SLOPE_MIN_SAMPLES` | 20 | key-down hops needed for the slope |
+| `MAX_SWEEP_HZ_PER_S` | 75.0 | largest qualifying \|slope\| |
+| `KEYDOWN_SPAN_MIN_HOPS` | 150 | key-down hops must span at least 0.4 s |
+| `ISO_DB` | 6.0 | flat-neighbourhood threshold |
+| `ISO_MIN_FRACTION` | 0.5 | smallest qualifying non-flat fraction |
+| `MAX_UNQUALIFIED_BACKLOG` | 7500 | most queued demod inputs an unqualified track keeps (20 s) |
+
+**A. Lazy lease.** At CANDIDATE → ACTIVE the track records its promotion
+hop, `sample_ts` and `freq_hz`, queues the promotion burst, and from then
+on queues its demod input (§3) every hop. It leases no decoder and emits
+no `TrackPromoted`. The pool drains only tracks that hold a decoder. At
+qualification (D) it leases a decoder, sets the decoder frequency to the
+current centroid, and emits `TrackPromoted { sample_ts, freq_hz }` with
+the recorded promotion values; the queue is replayed into the decoder at
+the next drain. Once an unqualified track's queue exceeds
+`MAX_UNQUALIFIED_BACKLOG` + `MAX_UNQUALIFIED_BACKLOG`/4 entries, its oldest
+entries are dropped down to `MAX_UNQUALIFIED_BACKLOG`; the default
+`unkeyed_close_hops` (3750) never reaches that, so only a raised
+`unkeyed_close_ms` changes what a late-qualifying track replays. At end of
+input an unqualified track is dropped with no events. Until it qualifies, the track's
+garbage-collect timer (§2.4) is held at zero, since with no decoder it
+cannot decode a character; `NotCw` (D) bounds its life instead.
+
+**B. Keying evidence.** Every hop, for each promoted, unqualified track:
+
+- `cycles += 1` on each HANG → ACTIVE whose preceding ACTIVE run lasted
+  ≤ `MAX_MARK_HOPS`.
+- `active_hops` += 1 on each ACTIVE hop; reset to 0 at each evaluation.
+- A **key-down hop** is one with `PdB[k] − F_eff[k] ≥ on_snr_db`, `k` the
+  track's selected channel (§2.5). On it, until the track qualifies:
+  - **Slope:** accumulate `n, Σt, Σf, Σt², Σtf` in `f64`, with
+    `t = hop − first key-down hop` and `f = wrap(k − k₀) + δ` in
+    channels, where `k₀` is the birth channel, `wrap` maps to
+    `[−N/2, N/2)`, and `δ` is §1.4's interpolated offset from the linear
+    powers at `k − 1, k, k + 1` (0 when undefined). `t_last` is the last
+    key-down hop's `t`. The slope in Hz/s is the least-squares `df/dt`
+    (channels per hop) × channel spacing × hops per second
+    (4 × spacing; 375 at 93.75 Hz).
+  - **Flatness:** let `side = max(PdB[k±2], PdB[k±3])` (indices mod N).
+    The hop is **non-flat** when `|PdB[k] − side| ≥ ISO_DB`: a neighbour
+    at least 6 dB louder is a different signal, so only a neighbourhood
+    within 6 dB of `PdB[k]` counts as flat. The non-flat fraction is
+    non-flat hops ÷ key-down hops.
+
+**C. Co-modulation classifier.** Every hop the track manager pushes each
+channel's gate-smoothed SNR `S[k] − F_eff[k]` (§2.2, §2.3), stored in
+frequency order `j = (k + N/2) mod N` in an `N × COMOD_WINDOW_HOPS` `f32`
+ring. Once `COMOD_MIN_FILL_HOPS` hops are stored, it evaluates every
+`COMOD_EVAL_HOPS` hops over the stored hops (at most the last 375):
+
+1. Per channel: window mean and window peak. A channel is hot when its
+   mean ≥ `COMOD_HOT_DB`.
+2. Counts start at 0. For each hot pair `(j, j + d)`, `d` in
+   `COMOD_LAG_MIN..=COMOD_LAG_MAX`, `j + d < N` (no wrap across Nyquist),
+   with Pearson ρ ≥ `COMOD_RHO`: both channels' count += 1.
+3. A **span** is a run of channels with count ≥ `COMOD_COUNT`, bridging
+   single-channel gaps, at least `COMOD_SPAN_MIN_WIDTH` wide, that holds
+   at least `COMOD_SPAN_STRONG` channels in `[first − 2, last + 2]` whose
+   window peak is within `COMOD_SPAN_STRONG_DB` of the strongest window
+   peak in that range. The peak, not the mean, keeps a loud keyed tone's
+   click skirt (30–60 dB down) from forming a span.
+4. Each span marks `[first − COMOD_SPAN_GUARD, last + COMOD_SPAN_GUARD]`
+   until `hop + COMOD_HOLD_HOPS`. `in_span(k)` is true while `k` is
+   marked.
+
+Lags start at 3 so a tone's own ±1/±2 key-click splatter never counts.
+There is no per-track taint: a high count at a track's channel never
+closes it.
+
+**D. Qualification.** At each evaluation, each promoted, unqualified
+track (`k = round(c)`) qualifies when all hold:
+
+- `cycles ≥ 1`;
+- `active_hops ≥ QUALIFY_MIN_ACTIVE_HOPS`;
+- `!in_span(k)`;
+- `!comodulated_with_span(k)`: channel `k`'s window does not correlate
+  (Pearson ρ ≥ `COMOD_RHO`) with any marked span channel at least
+  `COMOD_LAG_MIN` channels away. A voice's weaker harmonics outside the
+  span its strong harmonics mark follow the same syllable envelope; an
+  independently keyed CW signal does not;
+- key-down hops `n ≥ SLOPE_MIN_SAMPLES`;
+- `|slope| ≤ MAX_SWEEP_HZ_PER_S`;
+- `t_last ≥ KEYDOWN_SPAN_MIN_HOPS`;
+- non-flat fraction ≥ `ISO_MIN_FRACTION`.
+
+A track not qualified `unkeyed_close_hops` after its promotion closes
+`CloseReason::NotCw` (`ClosureKind::Bookkeeping`, `CloseCounts::not_cw`).
+It has no decoder, so it emits nothing. Its channels get the MAN-171
+respawn cooldown.
+
+**E. Spawn veto.** A spawn decision at `k`, and the same-hop `k+1`
+pairing (§2.5), is vetoed while `in_span(k)`, next to the RTTY veto
+(§2.6).
+
+**F. Merge preference.** When two converging tracks merge (§2.5) and
+exactly one is qualified, the qualified one survives. Otherwise §2.5's
+rule applies.
+
+**G. Unkeyed close.** A qualified track in ACTIVE closes
+`CloseReason::Unkeyed` (`ClosureKind::Bookkeeping`,
+`CloseCounts::unkeyed`) when `hop − max(last_rise_hop, last_char_hop) ≥
+unkeyed_close_hops` and no callsign was read.
+
+- `last_rise_hop` is the promotion hop, then each HANG → ACTIVE.
+- `last_char_hop` is set from each batch's `CharDecoded` events (batch
+  granularity, like the garbage-collect timer's reset).
+- A callsign is read when the current word passes
+  `manta_spot::grammar::is_plausible`. The word is built from
+  `CharDecoded` glyph text and ends at a space, a prosign or a
+  `WordBoundary`.
+
+The close flushes like the garbage-collect close: refiner drained,
+speed-only decoder finish, `TrackClosed` if the track emitted, and the
+MAN-171 respawn cooldown. A callsign read leaves the track to the 30 s
+garbage-collect rule.
+
+Determinism: no RNG and no clock. Every rule is hop-counted and runs
+sequentially in the track step; tracks iterate in id order, channel pairs
+in frequency order, and sums in index order with `f64` accumulators.
+Memory: the ring is `N × 375` `f32` (3 MB at N = 2048); an unqualified
+track's queue is bounded by `unkeyed_close_hops` and by
+`MAX_UNQUALIFIED_BACKLOG` (A).
 
 ---
 
@@ -1371,6 +1585,7 @@ read from the track's last `TimingUpdate` (§5).
 | §2 floor + gate + state machine | `manta-dsp::floor`, `manta-engine::track` |
 | §2.6 RTTY recognition | `manta-dsp::fsk` |
 | §2.7 static-crash detection | `manta-dsp::crash`, `manta-engine::track` |
+| §2.8 non-CW rejection | `manta-dsp::comod`, `manta-engine::track` |
 | §3 demod | `manta-decode::envelope` |
 | §4.1–4.2 timing | `manta-decode::timing` |
 | §4.3–4.5 beam decode | `manta-decode::beam`, `manta-decode::tree` |
@@ -1411,6 +1626,9 @@ crash_filter = "full"               # "full" | "starts-only" | "off"; §2.7 (MAN
 # MAN-314: two-tone FSK (RTTY) recognition, §2.6. rtty_dwell_ms >= 1000.
 rtty_filter = true
 rtty_dwell_ms = 20000   # 7500 hops; whole 1 s blocks
+# MAN-313: non-CW rejection, §2.8. unkeyed_close_ms >= 1000.
+non_cw_filter = true
+unkeyed_close_ms = 10000.0   # 3750 hops; qualification timeout and unkeyed close
 # floor_quantile = 0.25       # not configurable yet: compile-time constant in manta-dsp::floor
 # floor_window_ms = 10000     # not configurable yet: compile-time constant in manta-dsp::floor
 # block_channels = 32         # not configurable yet: compile-time constant in manta-dsp::floor

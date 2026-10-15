@@ -363,6 +363,7 @@ pub struct UplinkTarget {
     connected: AtomicBool,
     sent: AtomicU64,
     suppressed: AtomicU64,
+    ceiling_suppressed: AtomicU64,
     lagged: AtomicU64,
     write_failed: AtomicU64,
     disconnected: AtomicU64,
@@ -380,6 +381,7 @@ impl UplinkTarget {
             connected: AtomicBool::new(false),
             sent: AtomicU64::new(0),
             suppressed: AtomicU64::new(0),
+            ceiling_suppressed: AtomicU64::new(0),
             lagged: AtomicU64::new(0),
             write_failed: AtomicU64::new(0),
             disconnected: AtomicU64::new(0),
@@ -405,6 +407,17 @@ impl UplinkTarget {
     /// (MAN-91).
     pub fn record_suppressed(&self) {
         self.suppressed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A spot this target would otherwise have written, skipped because
+    /// the target's `max_spots_per_minute` ceiling was reached (MAN-248).
+    /// Deliberately separate from `record_suppressed`: that counter's
+    /// HELP text and METRICS.md meaning promise "dry-run or spot_types",
+    /// and the ticket requires a distinguishable suppressed-by-ceiling
+    /// counter so an operator can tell a runaway input or a too-low
+    /// default from ordinary filtering.
+    pub fn record_ceiling_suppressed(&self) {
+        self.ceiling_suppressed.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_lagged(&self, n: u64) {
@@ -495,6 +508,10 @@ impl UplinkTarget {
 
     pub fn suppressed_total(&self) -> u64 {
         self.suppressed.load(Ordering::Relaxed)
+    }
+
+    pub fn ceiling_suppressed_total(&self) -> u64 {
+        self.ceiling_suppressed.load(Ordering::Relaxed)
     }
 
     pub fn lagged_total(&self) -> u64 {
@@ -1452,6 +1469,17 @@ impl Metrics {
             .sum()
     }
 
+    /// MAN-248: spots skipped because a target's forwarding ceiling was
+    /// reached, summed over every configured target. Separate from
+    /// `uplink_suppressed_total` for the same reason the per-target
+    /// counter is (see `UplinkTarget::record_ceiling_suppressed`).
+    pub fn uplink_ceiling_suppressed_total(&self) -> u64 {
+        self.uplink_targets_snapshot()
+            .iter()
+            .map(|t| t.ceiling_suppressed_total())
+            .sum()
+    }
+
     pub fn uplink_lagged_total(&self) -> u64 {
         self.uplink_targets_snapshot()
             .iter()
@@ -1783,7 +1811,9 @@ impl Metrics {
             self.ws_clients.load(Ordering::Relaxed)
         ));
 
-        out.push_str("# HELP manta_active_tracks Currently active decoder tracks.\n");
+        out.push_str(
+            "# HELP manta_active_tracks Currently decoding CW tracks (keyed CW only, MAN-313).\n",
+        );
         out.push_str("# TYPE manta_active_tracks gauge\n");
         out.push_str(&format!(
             "manta_active_tracks {}\n",
@@ -1968,6 +1998,15 @@ impl Metrics {
         ));
 
         out.push_str(
+            "# HELP manta_uplink_ceiling_suppressed_total Spots not sent to the RBN uplink target because its per-minute forwarding ceiling (max_spots_per_minute) was reached.\n",
+        );
+        out.push_str("# TYPE manta_uplink_ceiling_suppressed_total counter\n");
+        out.push_str(&format!(
+            "manta_uplink_ceiling_suppressed_total {}\n",
+            self.uplink_ceiling_suppressed_total()
+        ));
+
+        out.push_str(
             "# HELP manta_uplink_dropped_lagged_total Spots the uplink fell behind on and lost before its next reconnect.\n",
         );
         out.push_str("# TYPE manta_uplink_dropped_lagged_total counter\n");
@@ -2011,7 +2050,7 @@ impl Metrics {
         ));
 
         // MAN-128: per-target uplink families -- one read guard for all
-        // eight, so a concurrent `register_uplink_target` can't interleave
+        // nine, so a concurrent `register_uplink_target` can't interleave
         // a partial view across them.
         let targets = self.uplink_targets_snapshot();
 
@@ -2054,6 +2093,16 @@ impl Metrics {
                 "manta_uplink_target_suppressed_total{{target=\"{}\"}} {}\n",
                 escape_label_value(t.label()),
                 t.suppressed_total()
+            ));
+        }
+
+        out.push_str("# HELP manta_uplink_target_ceiling_suppressed_total Spots not sent to this RBN uplink target because its per-minute forwarding ceiling (max_spots_per_minute) was reached.\n");
+        out.push_str("# TYPE manta_uplink_target_ceiling_suppressed_total counter\n");
+        for t in targets.iter() {
+            out.push_str(&format!(
+                "manta_uplink_target_ceiling_suppressed_total{{target=\"{}\"}} {}\n",
+                escape_label_value(t.label()),
+                t.ceiling_suppressed_total()
             ));
         }
 
@@ -2790,6 +2839,61 @@ mod tests {
         assert!(text.contains("manta_uplink_sent_total 3"));
         assert!(text.contains("manta_uplink_reconnects_total 3"));
         assert!(text.contains("manta_uplink_connected 1"));
+    }
+
+    /// MAN-248: ceiling suppression is its own counter -- rendered as an
+    /// aggregate family and a per-target family -- and never leaks into
+    /// the combined `suppressed` counters, whose HELP text promises
+    /// "dry-run or spot_types" only.
+    #[test]
+    fn ceiling_suppression_renders_and_stays_out_of_the_combined_suppressed_counter() {
+        let m = Metrics::new();
+        let a = m.register_uplink_target("a.example:7000".to_string(), true);
+        let b = m.register_uplink_target("b.example:7000".to_string(), true);
+
+        a.record_ceiling_suppressed();
+        a.record_ceiling_suppressed();
+        a.record_ceiling_suppressed();
+        b.record_ceiling_suppressed();
+        b.record_ceiling_suppressed();
+        // Ordinary suppression (dry-run / spot_types) on `a` must not move
+        // its ceiling counter, and vice versa.
+        a.record_suppressed();
+
+        assert_eq!(m.uplink_ceiling_suppressed_total(), 5);
+        assert_eq!(a.ceiling_suppressed_total(), 3);
+        assert_eq!(b.ceiling_suppressed_total(), 2);
+        assert_eq!(
+            a.suppressed_total(),
+            1,
+            "ordinary suppression must not move the ceiling counter"
+        );
+
+        let text = m.render_prometheus_text();
+        assert!(text.contains("manta_uplink_ceiling_suppressed_total 5\n"));
+        assert!(text.contains(
+            r#"manta_uplink_target_ceiling_suppressed_total{target="a.example:7000"} 3"#
+        ));
+        assert!(text.contains(
+            r#"manta_uplink_target_ceiling_suppressed_total{target="b.example:7000"} 2"#
+        ));
+        // The combined counters are unchanged by ceiling records: the
+        // aggregate is 1 (only `a`'s ordinary record), never 6.
+        assert!(text.contains("manta_uplink_suppressed_total 1\n"));
+        assert!(text.contains(r#"manta_uplink_target_suppressed_total{target="a.example:7000"} 1"#));
+
+        // A target that only ever records ordinary suppression renders 0
+        // in the ceiling families rather than inheriting `suppressed`.
+        let only_ordinary = Metrics::new();
+        let t = only_ordinary.register_uplink_target("c.example:7000".to_string(), true);
+        t.record_suppressed();
+        t.record_suppressed();
+        let text = only_ordinary.render_prometheus_text();
+        assert!(text.contains("manta_uplink_ceiling_suppressed_total 0\n"));
+        assert!(text.contains(
+            r#"manta_uplink_target_ceiling_suppressed_total{target="c.example:7000"} 0"#
+        ));
+        assert_eq!(t.ceiling_suppressed_total(), 0);
     }
 
     #[test]

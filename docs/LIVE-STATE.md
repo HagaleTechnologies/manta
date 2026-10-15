@@ -145,6 +145,11 @@ Each `bands[]` entry:
 | `occupancy` | number | never | Share, 0 to 1, of the entry's channels where the detector's rise test (smoothed power at least `[detector].on_snr_db` above the effective floor) passed on at least one hop during the last second. Rounded to 4 decimals. CW keying flickers, so an instantaneous reading would understate a busy band. |
 | `activeTracks` | integer | never | Tracks holding a decoder whose calibrated frequency is in this band: the count `manta_active_tracks` reports, split by band. |
 
+Rows cover the source's trusted band on a decimated capture (`capture_rate_hz`):
+the decimator's transition band beyond its <= 1 dB boundary is not usable, so
+those channels are neither reported nor tracked. The record shape does not
+change — `channels` and `loHz`/`hiHz` simply narrow (MAN-196).
+
 ## `trackState` records
 
 One per track per decode batch in which the track decoded a character or a

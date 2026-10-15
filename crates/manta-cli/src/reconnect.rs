@@ -160,6 +160,11 @@ pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
     /// detector judges the real passband (a KiwiSDR's ±5 kHz, rig audio's
     /// one-sided band) rather than the trait's full-Nyquist default.
     rf_passband_hz: (f64, f64),
+    /// MAN-196: the first connection's `trusted_band_hz`, reported through
+    /// outages with `rf_passband_hz` (every reopen rebuilds the same
+    /// decimator, so the band is stable across reconnects; `None` for a
+    /// non-decimated source stays `None`).
+    trusted_band_hz: Option<(f64, f64)>,
     backoff: Duration,
     /// Whether the current `inner` has returned at least one real sample
     /// since it was (re)opened -- decides `Disconnected` vs
@@ -213,6 +218,7 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
         let fs = first.sample_rate();
         let center_freq_hz = first.center_freq_hz();
         let rf_passband_hz = first.rf_passband_hz();
+        let trusted_band_hz = first.trusted_band_hz();
         let last_ok = env.now();
         let input_health = InputHealthTotals::for_source(first.as_ref());
         ReconnectingSource {
@@ -226,6 +232,7 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
             fs,
             center_freq_hz,
             rf_passband_hz,
+            trusted_band_hz,
             backoff: INITIAL_BACKOFF,
             productive: false,
             reopened: false,
@@ -262,6 +269,13 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
 
     fn rf_passband_hz(&self) -> (f64, f64) {
         self.rf_passband_hz
+    }
+
+    /// MAN-196: the first connection's trusted band, forwarded like
+    /// `rf_passband_hz` above so a decimated reconnecting source's spawn
+    /// veto survives outages.
+    fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+        self.trusted_band_hz
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {

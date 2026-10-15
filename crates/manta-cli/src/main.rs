@@ -1696,6 +1696,14 @@ impl IqSource for FixedCenterFreqSource {
         self.inner.rf_passband_hz()
     }
 
+    /// MAN-196: same forwarding duty as `rf_passband_hz` above -- the
+    /// wrapped decimator's trusted band must reach the run/soak startup
+    /// notice and the track manager's spawn veto; the override relocates
+    /// the centre only, and the band is offsets from the centre.
+    fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+        self.inner.trusted_band_hz()
+    }
+
     fn read(&mut self, buf: &mut [num_complex::Complex32]) -> Result<usize> {
         self.inner.read(buf)
     }
@@ -1732,6 +1740,19 @@ fn warn_if_audio_source_has_no_rf_reference(has_rf_aware_source: bool, dial_freq
              rig's dial frequency, e.g. --dial-freq-hz 14030000.",
         );
     }
+}
+
+/// MAN-196: the one startup line a decimated capture prints, naming its
+/// usable passband. `lo_hz`/`hi_hz` are the source's *intersected* RF
+/// passband (`rf_passband_hz()` -- the inner passband clipped to the
+/// decimator's <= 1 dB trusted band), so the line never claims spectrum
+/// the source does not deliver. `run` logs it through `tracing::info!`;
+/// `soak`, which installs no subscriber, writes it straight to stderr.
+fn trusted_band_notice(fs_out_hz: f64, lo_hz: f64, hi_hz: f64) -> String {
+    format!(
+        "decimated capture {fs_out_hz:.0} Hz: usable passband {lo_hz:.0} to {hi_hz:.0} Hz; \
+         channels beyond (decimator transition band) are not tracked"
+    )
 }
 
 /// MAN-131: a live audio input delivering exact zeros is, on macOS, the
@@ -5735,6 +5756,20 @@ fn run_command() -> Result<std::process::ExitCode> {
             // logged just before decoding starts (below).
             let crash_live =
                 manta_engine::crash_live_channels(first.sample_rate(), first.rf_passband_hz());
+            // MAN-196: the source's trusted band, read once here while
+            // `first` is in hand (before `wrap_file_replay` and `listen`
+            // take ownership); `Some` only when a decimator is in the
+            // path (`--capture-rate-hz`/`input.capture_rate_hz`). Logged
+            // beside the crash notice below, before the readiness marker.
+            // Round-1 review (PR #300): the notice states the band the
+            // source actually delivers -- `rf_passband_hz()`, the inner
+            // passband intersected with the trusted band -- so a
+            // decimation wrapping an already narrower source (a KiwiSDR's
+            // +/-5 kHz filter, a one-sided rig-audio passband) never
+            // claims a wider usable passband than `manta check` and SETT
+            // advertise for the same source.
+            let trusted_band = first.trusted_band_hz().map(|_| first.rf_passband_hz());
+            let trusted_band_fs_hz = first.sample_rate();
 
             // MAN-122 review round 6 (P2): installed HERE -- before
             // `start_spot_server` binds the sockets and logs the
@@ -6109,6 +6144,17 @@ fn run_command() -> Result<std::process::ExitCode> {
                     manta_engine::CRASH_MIN_LIVE_CHANNELS
                 );
             }
+            // MAN-196: a decimated capture states its usable passband
+            // once, at the same point as the crash notice -- after the
+            // servers bound, before the readiness marker -- so an
+            // operator who chose `--capture-rate-hz` for its nominal
+            // Nyquist width learns the channels beyond the decimator's
+            // <= 1 dB trusted band are not tracked. No line at all
+            // without a decimator: the non-decimated path is unchanged
+            // in every observable respect.
+            if let Some((lo, hi)) = trusted_band {
+                tracing::info!("{}", trusted_band_notice(trusted_band_fs_hz, lo, hi));
+            }
             if reload_enabled {
                 logging::note(
                     "manta: listening; send SIGINT or SIGTERM to stop, SIGHUP to reload \
@@ -6171,6 +6217,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                             ))
                                 as std::sync::Arc<dyn manta_engine::LiveStateSink>
                         }),
+                    detector_confirmations: None,
                 },
                 |ev| {
                     if json {
@@ -6556,6 +6603,14 @@ fn run_command() -> Result<std::process::ExitCode> {
             warn_if_audio_source_has_no_rf_reference(spec.is_rf_aware(), resolved.dial_freq_hz);
             let src: Box<dyn IqSource> =
                 spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz)?;
+            // MAN-196: the same usable-passband line `run` logs, once,
+            // before the soak starts; `Some` only with a decimator in the
+            // path. Plain stderr: `soak` installs no tracing subscriber.
+            // The values are the intersected `rf_passband_hz()`, exactly
+            // as `run`'s notice above (round-1 review, PR #300).
+            if let Some((lo, hi)) = src.trusted_band_hz().map(|_| src.rf_passband_hz()) {
+                eprintln!("{}", trusted_band_notice(src.sample_rate(), lo, hi));
+            }
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
             print!("{}", fmt::soak_report(&report));
             if !manta_engine::soak_passed(&report) {

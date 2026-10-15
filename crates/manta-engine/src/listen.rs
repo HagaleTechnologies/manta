@@ -82,6 +82,12 @@ pub struct ListenObservers {
     /// restart, a read error and every exit. `None` (the default) skips it
     /// entirely.
     pub rtty: Option<Arc<RttyObserver>>,
+    /// MAN-313: every CANDIDATE -> ACTIVE confirmation the detector has
+    /// made since `listen()` started (`TrackManager::confirmations`),
+    /// whether or not the track went on to qualify as keyed CW. Summed
+    /// across outage segments, so it only ever grows. Stored wherever the
+    /// active-track count is. `None` (the default) skips it entirely.
+    pub detector_confirmations: Option<Arc<AtomicU64>>,
     /// MAN-324: the live-state stream -- once per stream second each
     /// channel's floor and occupancy, each track's running copy and
     /// candidates when its text changes, every validation decision and
@@ -336,6 +342,7 @@ fn new_segment(
     fs: f64,
     center_freq_hz: f64,
     rf_passband_hz: (f64, f64),
+    trusted_band_hz: Option<(f64, f64)>,
     cfg: &PipelineConfig,
     ids: crate::multi::TrackIdSpace,
     next_id: u32,
@@ -361,6 +368,13 @@ fn new_segment(
     // MAN-312 (SPEC §2.7): judge static crashes over the source's real
     // passband, not channels that only carry the stream's residual noise.
     tm.set_rf_passband_hz(rf_passband_hz.0, rf_passband_hz.1);
+    // MAN-196: never spawn tracks outside the source's trusted band (the
+    // decimator's <= 1 dB boundary on a decimated capture; `None`, no
+    // decimator, leaves the manager exactly as it was). Spawns-only per
+    // segment, same threading as the RF passband above.
+    if let Some((lo, hi)) = trusted_band_hz {
+        tm.set_trusted_band_hz(lo, hi);
+    }
     // MAN-118: a post-discontinuity segment keeps reporting.
     tm.set_quality_observer(quality);
     // MAN-324: a post-discontinuity segment keeps the live occupancy window.
@@ -543,6 +557,11 @@ pub fn listen_with_observers(
     let fs = src.sample_rate();
     let center_freq_hz = src.center_freq_hz();
     let rf_passband_hz = src.rf_passband_hz();
+    // MAN-196: the source's trusted band, read once beside the RF
+    // passband and applied to every segment (including the
+    // discontinuity rebuild below) -- `None` for every non-decimated
+    // source leaves each segment's manager exactly as before.
+    let trusted_band_hz = src.trusted_band_hz();
 
     let mut validator = cfg.validator(fs)?;
     let references = observers
@@ -584,6 +603,16 @@ pub fn listen_with_observers(
         }
     };
 
+    // MAN-313: each segment has its own `TrackManager`, so its
+    // confirmation count restarts at 0; `confirmations_base` holds the
+    // closed segments' totals so the published count never goes back.
+    let mut confirmations_base: u64 = 0;
+    let report_confirmations = |n: u64| {
+        if let Some(counter) = &observers.detector_confirmations {
+            counter.store(n, Ordering::Relaxed);
+        }
+    };
+
     // MAN-312: crashes counted by segments a discontinuity already replaced.
     let mut crash_base: u64 = 0;
     let report_static_crashes = |n: u64| {
@@ -596,6 +625,7 @@ pub fn listen_with_observers(
         fs,
         center_freq_hz,
         rf_passband_hz,
+        trusted_band_hz,
         cfg,
         crate::multi::TrackIdSpace::SINGLE,
         1,
@@ -658,6 +688,7 @@ pub fn listen_with_observers(
     );
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
+    report_confirmations(confirmations_base + seg.tm.confirmations());
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     rtty.update(&seg.tm);
     on_tracks(n_tracks);
@@ -674,6 +705,7 @@ pub fn listen_with_observers(
     );
     let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
+    report_confirmations(confirmations_base + seg.tm.confirmations());
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     rtty.update(&seg.tm);
     on_tracks(n_tracks);
@@ -720,6 +752,7 @@ pub fn listen_with_observers(
                 &mut on_spot,
             );
             let next_id = seg.tm.next_track_id();
+            confirmations_base += seg.tm.confirmations();
             crash_base += seg.tm.static_crash_count();
             // The old segment's marks clear where its samples end.
             rtty.restart(seg_base + seg_consumed);
@@ -729,6 +762,7 @@ pub fn listen_with_observers(
                 fs,
                 center_freq_hz,
                 rf_passband_hz,
+                trusted_band_hz,
                 cfg,
                 crate::multi::TrackIdSpace::SINGLE,
                 next_id,
@@ -766,6 +800,7 @@ pub fn listen_with_observers(
         );
         let n_tracks = seg.tm.decoding_track_count();
         report_active_tracks(n_tracks);
+        report_confirmations(confirmations_base + seg.tm.confirmations());
         report_static_crashes(crash_base + seg.tm.static_crash_count());
         rtty.update(&seg.tm);
         on_tracks(n_tracks);
@@ -792,6 +827,7 @@ pub fn listen_with_observers(
     // observers must settle back to 0 rather than be left holding the last
     // live value after a source disconnects or a replay hits EOF.
     report_active_tracks(0);
+    report_confirmations(confirmations_base + seg.tm.confirmations());
     rtty.restart(seg_base + seg_consumed);
     on_tracks(0);
     Ok(())
@@ -1358,6 +1394,29 @@ mod tests {
         }
     }
 
+    /// MAN-196: a source that reports a trusted band, as a decimated one
+    /// does (`DecimatingSource`). `None` mimics every non-decimated
+    /// source (the trait default).
+    struct TrustedBandSource {
+        inner: FixedFreqSource,
+        trusted_band_hz: Option<(f64, f64)>,
+    }
+
+    impl manta_input::IqSource for TrustedBandSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.sample_rate()
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz()
+        }
+        fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+            self.trusted_band_hz
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
     /// Runs `listen_with_observers` with a static-crash observer, returning
     /// the value it held at every `on_tracks` call.
     fn static_crash_readings(src: Box<dyn manta_input::IqSource>) -> Vec<u64> {
@@ -1422,6 +1481,86 @@ mod tests {
         assert_eq!(readings.last(), Some(&0), "{readings:?}");
     }
 
+    /// MAN-196: `listen` reads the source's trusted band once and
+    /// threads it into every segment's track manager -- including the
+    /// discontinuity rebuild's fresh segment -- so a real, detectable CW
+    /// signal beyond the band never spawns a track, while a source
+    /// without a band (`None`, every non-decimated source) spawns as
+    /// before.
+    #[test]
+    fn listen_vetoes_spawns_beyond_the_sources_trusted_band() {
+        // +23_500 Hz / SNR 10 dB on a 48 kS/s stream: beyond the
+        // 21_724.8 Hz trusted boundary, at the offset/SNR of the measured
+        // duplicate-track cell (research section 2). The native-48k
+        // control there spawned one track: the signal is real and
+        // detectable, so the control below asserting >= 1 promotion pins
+        // detectability, not the duplicate itself.
+        let mut spec = manta_testkit::vectors::v1();
+        spec.fs = 48_000.0;
+        spec.duration_s = 20.0;
+        spec.signals[0].offset_hz = 23_500.0;
+        spec.signals[0].snr_2500_db = 10.0;
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let trusted = manta_dsp::decimate::TRUSTED_HALF_BAND_FRACTION * 48_000.0;
+
+        let promotions = |src: Box<dyn manta_input::IqSource>| {
+            let mut n = 0usize;
+            listen(
+                src,
+                &PipelineConfig::default(),
+                Arc::new(AtomicBool::new(false)),
+                |ev| {
+                    if matches!(ev, DecoderEvent::TrackPromoted { .. }) {
+                        n += 1;
+                    }
+                },
+                |_| {},
+            )
+            .unwrap();
+            n
+        };
+        let fixed = || FixedFreqSource {
+            samples: rendered.samples.clone(),
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        };
+
+        // Control, no trusted band (the trait default): the signal spawns.
+        assert!(
+            promotions(Box::new(fixed())) >= 1,
+            "native control must detect the signal"
+        );
+
+        // With the trusted band: zero promotions over the whole render.
+        assert_eq!(
+            promotions(Box::new(TrustedBandSource {
+                inner: fixed(),
+                trusted_band_hz: Some((-trusted, trusted)),
+            })),
+            0,
+            "no track may spawn beyond the trusted band"
+        );
+
+        // ...and across a mid-stream discontinuity: the rebuild path
+        // applies the same band (read once, applied per segment).
+        let half = rendered.samples.len() / 2;
+        assert_eq!(
+            promotions(Box::new(
+                GapSource::new(
+                    rendered.samples.clone(),
+                    spec.fs,
+                    spec.center_freq_hz,
+                    48_000
+                )
+                .arm_after_samples(half)
+                .with_trusted_band(Some((-trusted, trusted)))
+            )),
+            0,
+            "the post-discontinuity segment must keep the trusted band"
+        );
+    }
+
     /// MAN-73 test double: serves `samples` on a loop. Once the cumulative
     /// number of samples served reaches `arm_at` (default: the full
     /// vector length, i.e. "after exhaustion"), the *next* `read()` call
@@ -1444,6 +1583,9 @@ mod tests {
         served: usize,
         armed: bool,
         pending_gap: Option<u64>,
+        /// MAN-196: the trusted band this double reports (`None` unless
+        /// `with_trusted_band` set one).
+        trusted_band: Option<(f64, f64)>,
         /// Set once `take_discontinuity()` has handed the gap to `listen()`,
         /// so a test can tell the events `listen()` emits after the
         /// discontinuity from those before it.
@@ -1464,6 +1606,7 @@ mod tests {
                 served: 0,
                 armed: false,
                 pending_gap: None,
+                trusted_band: None,
                 gap_taken: Arc::new(AtomicBool::new(false)),
             }
         }
@@ -1476,6 +1619,12 @@ mod tests {
             self.chunk_cap = (k / 4).max(64);
             self
         }
+
+        /// MAN-196: report a trusted band, as a decimated source would.
+        fn with_trusted_band(mut self, band: Option<(f64, f64)>) -> Self {
+            self.trusted_band = band;
+            self
+        }
     }
 
     impl manta_input::IqSource for GapSource {
@@ -1484,6 +1633,9 @@ mod tests {
         }
         fn center_freq_hz(&self) -> f64 {
             self.center_freq_hz
+        }
+        fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+            self.trusted_band
         }
         fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
             if !self.armed && self.served >= self.arm_at {
@@ -2288,6 +2440,63 @@ mod tests {
         assert_eq!(peak, 1);
         assert!(obs.generation() >= 2, "marked, then cleared");
         assert!(obs.snapshot().is_empty(), "cleared at exit");
+    }
+
+    /// MAN-313 test scene: noise plus a steady unkeyed carrier 10 kHz above
+    /// centre at +20 dB in 2500 Hz -- confirmed by the detector within
+    /// ~50 ms, never keyed CW.
+    fn steady_carrier_scene(duration_s: f64) -> Vec<Complex32> {
+        let fs = 96_000.0;
+        let (mut iq, _) = manta_testkit::scene::render_scene(&[], fs, duration_s, Some(5)).unwrap();
+        let noise_pow = iq.iter().map(|z| z.norm_sqr() as f64).sum::<f64>() / iq.len() as f64;
+        let amp = (100.0 * noise_pow * 2500.0 / fs).sqrt() as f32;
+        let w = 2.0 * std::f64::consts::PI * 10_000.0 / fs;
+        for (n, z) in iq.iter_mut().enumerate() {
+            let ph = w * n as f64;
+            *z += Complex32::new(amp * ph.cos() as f32, amp * ph.sin() as f32);
+        }
+        iq
+    }
+
+    /// MAN-313: the detector-confirmation counter is published while the
+    /// stream runs, summed across an outage restart (each segment's
+    /// `TrackManager` counts from 0), and never goes back.
+    #[test]
+    fn listen_publishes_detector_confirmations() {
+        let samples = steady_carrier_scene(6.0);
+        let src = GapSource::new(samples, 96_000.0, 14_000_000.0, 96_000);
+        let gap_taken = src.gap_taken.clone();
+        let counter = Arc::new(AtomicU64::new(0));
+        let seen = counter.clone();
+        let mut last = 0u64;
+        let mut before_gap = 0u64;
+        listen_with_observers(
+            Box::new(src),
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                detector_confirmations: Some(counter.clone()),
+                ..Default::default()
+            },
+            |_ev| {},
+            |_spot| {},
+            |_n| {
+                let now = seen.load(Ordering::Relaxed);
+                assert!(now >= last, "the count went back from {last} to {now}");
+                last = now;
+                if !gap_taken.load(Ordering::Relaxed) {
+                    before_gap = now;
+                }
+            },
+        )
+        .unwrap();
+        let total = counter.load(Ordering::Relaxed);
+        assert!(before_gap >= 1, "the carrier is confirmed before the gap");
+        assert!(
+            total > before_gap,
+            "the post-gap segment's confirmation adds to the pre-gap count \
+             ({before_gap} before the gap, {total} at the end)"
+        );
     }
 
     #[test]
