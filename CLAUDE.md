@@ -322,6 +322,13 @@ by a 20-run merge-queue watch with rollback triggers;
 `test-hpsdr (windows-latest)` stays advisory. See
 docs/DECISIONS/2026-10-15-man371-windows-required-check.md.
 
+MAN-235: `manta doctor` keeps its 10 s default; a `WEAK_NO_DECODE` run
+asked for under 60 s adds a stdout `hint:` line to rerun with
+`--duration 60` (`manta gen v1` first spots at 20-21 s). `--strict` exits 0
+for `DECODING`, 3 for every other verdict and 1 for a failed check; without
+it every verdict still exits 0. See
+docs/DECISIONS/2026-10-15-man235-doctor-rerun-hint-and-strict-exit.md.
+
 MAN-234: an input sample with a NaN, infinite or larger-than-1e17
 component (`manta-dsp::sample_guard::MAX_SAMPLE_MAGNITUDE`) is replaced
 with `0+0j` and counted in `Channelizer::process` (SPEC §1.3 step 0;
