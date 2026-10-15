@@ -1415,6 +1415,16 @@ pub struct TrackManager {
     /// RF passband, for `take_channel_levels`. `None` (full Nyquist band,
     /// the default) reports every channel.
     rf_channels: Option<Vec<bool>>,
+    /// MAN-196: per channel, whether its centre lies inside the source's
+    /// trusted band -- the band inside which the source's own filtering
+    /// keeps channels within 1 dB of flat (a decimator's transition band
+    /// beyond it corrupts frequency estimates, spawns duplicate tracks
+    /// and folds above-Nyquist carriers into promotions). `None` (the
+    /// default, no boundary supplied) vetoes nothing, so every
+    /// non-decimated source is behaviour-identical to before. Read by the
+    /// spawn scan ONLY (`trusted_vetoes_spawn`): never a close path,
+    /// never a decode hold -- the MAN-314 key-up-gap lesson.
+    trusted_channels: Option<Vec<bool>>,
     /// MAN-312 (SPEC §2.7): the band-wide static-crash detector. Every
     /// channel is live until `set_rf_passband_hz` narrows it to the
     /// source's real passband.
@@ -1482,6 +1492,22 @@ pub struct RttyLogEntry {
     pub cleared_sample_ts: Option<u64>,
 }
 
+/// MAN-196: per-channel mask, true iff the channel's centre
+/// (`wrapped_channel_offset(k, n) * spacing`, SPEC §1.1 f(k)) lies inside
+/// `[lo, hi]`. The shared body of `set_rf_passband_hz`'s reporting mask
+/// and `set_trusted_band_hz`'s veto mask (the crash set keeps its own
+/// margin-channel variant in `crash_live_set`: a band-wide quartile
+/// judgment wants one channel of margin, a per-channel centre test does
+/// not).
+fn channels_within(channel_spacing_hz: f64, lo: f64, hi: f64, n: usize) -> Vec<bool> {
+    (0..n)
+        .map(|k| {
+            let f = wrapped_channel_offset(k, n) * channel_spacing_hz;
+            f >= lo && f <= hi
+        })
+        .collect()
+}
+
 impl TrackManager {
     /// A fresh manager over `n_channels` channels, configured per
     /// `DetectorConfig`, with a decoder pool configured per `DecodeConfig`.
@@ -1518,6 +1544,7 @@ impl TrackManager {
             rtty_changed_sample_ts: 0,
             rise_seen: None,
             rf_channels: None,
+            trusted_channels: None,
             crash: CrashDetector::new(n_channels),
             comod: detector_cfg
                 .non_cw_filter
@@ -1594,16 +1621,37 @@ impl TrackManager {
         self.rf_channels = if lo <= -fs / 2.0 && hi >= fs / 2.0 {
             None
         } else {
-            let spacing = self.channel_spacing_hz;
-            Some(
-                (0..n)
-                    .map(|k| {
-                        let f = wrapped_channel_offset(k, n) * spacing;
-                        f >= lo && f <= hi
-                    })
-                    .collect(),
-            )
+            Some(channels_within(self.channel_spacing_hz, lo, hi, n))
         };
+    }
+
+    /// MAN-196: never spawn a candidate on a channel whose centre lies
+    /// outside `[lo, hi]` (Hz relative to the centre) -- the source's
+    /// trusted band, the band inside which its own filtering keeps
+    /// channels within 1 dB of flat. `listen` supplies it from
+    /// `IqSource::trusted_band_hz`, exactly as it supplies the RF
+    /// passband above. **Spawns only**: no close path, no decode hold --
+    /// a track that already exists on an untrusted channel keeps
+    /// decoding (the MAN-314 splatter-shadow lesson: applying a veto to
+    /// running tracks killed real CW in key-up gaps). A band covering
+    /// the full Nyquist clears the mask, making the call a no-op --
+    /// pinning that no-op is `unset_trusted_band_is_bit_identical_to_today`.
+    pub fn set_trusted_band_hz(&mut self, lo: f64, hi: f64) {
+        let n = self.n_channels();
+        let fs = self.channel_spacing_hz * n as f64;
+        self.trusted_channels = if lo <= -fs / 2.0 && hi >= fs / 2.0 {
+            None
+        } else {
+            Some(channels_within(self.channel_spacing_hz, lo, hi, n))
+        };
+    }
+
+    /// MAN-196: may no candidate spawn on channel `k`? True when a
+    /// trusted band was supplied and `k`'s centre lies outside it. The
+    /// RTTY-veto slot's shape (`rtty_vetoes_spawn`); consulted by the
+    /// spawn scan only.
+    fn trusted_vetoes_spawn(&self, k: usize) -> bool {
+        self.trusted_channels.as_ref().is_some_and(|t| !t[k])
     }
 
     /// MAN-312: static crashes detected by this manager so far, in every
@@ -2304,6 +2352,9 @@ impl TrackManager {
         // MAN-312: no track starts during a static crash ("starts-only"
         // and "full"). MAN-197: the respawn cooldown gates a candidate's
         // whole prospective ownership window, not just its birth channel.
+        // MAN-196: no track starts on a channel outside the source's
+        // trusted band, in both the k and k+1 slots -- the same-hop
+        // adjacent-rise arbitration must not route around the veto.
         if past_warmup && !suppress {
             let n = self.n_channels();
             let mut k = 0;
@@ -2314,6 +2365,7 @@ impl TrackManager {
                     && self.is_local_peak(k)
                     && !self.rtty_vetoes_spawn(k)
                     && !self.comod_vetoes_spawn(k)
+                    && !self.trusted_vetoes_spawn(k)
                 {
                     let mut winner = k;
                     if k + 1 < n
@@ -2322,6 +2374,7 @@ impl TrackManager {
                         && !self.spawn_window_cooling_down(k + 1)
                         && !self.rtty_vetoes_spawn(k + 1)
                         && !self.comod_vetoes_spawn(k + 1)
+                        && !self.trusted_vetoes_spawn(k + 1)
                     {
                         if hop.power[k + 1] > hop.power[winner] {
                             winner = k + 1;
@@ -3705,6 +3758,151 @@ mod tests {
             "a strong channel should spawn and promote a track"
         );
         assert_eq!(tm.tracks.len(), 1);
+    }
+
+    // ---- MAN-196: trusted-band spawn veto ----
+
+    /// 512 channels at 48 kS/s: the channel grid the decimated path
+    /// actually uses, with channel centres at `k' * 93.75` Hz.
+    /// Filter off: these cells drive steady unkeyed carriers, which the
+    /// MAN-313 non-CW filter (rightly) never qualifies.
+    fn trusted_band_manager(n: usize) -> TrackManager {
+        TrackManager::new(
+            n,
+            (n as f64) * 93.75,
+            14_000_000.0,
+            default_filter_off(),
+            DecodeConfig::default(),
+        )
+    }
+
+    fn strong_on(n: usize, k: usize) -> Vec<f32> {
+        let mut power = quiet_power(n);
+        power[k] = 1e-9 * 10f32.powf(20.0 / 10.0); // +20 dB above the floor
+        power
+    }
+
+    /// MAN-196: a rising local peak outside the trusted band never
+    /// spawns. Channel 251 of a 512-channel 48 kS/s grid has its centre
+    /// at 251 * 93.75 = 23 531.25 Hz -- the -22.8 dB point of the
+    /// decimator's transition band and where the duplicate-track
+    /// regression was measured.
+    #[test]
+    fn spawn_beyond_the_trusted_band_is_vetoed() {
+        let trusted = manta_dsp::decimate::TRUSTED_HALF_BAND_FRACTION * 48_000.0;
+        let start = 250u64 * 15;
+        for k in [251usize] {
+            // Control (no trusted band supplied): a track spawns.
+            let mut control = trusted_band_manager(512);
+            feed_warmup(&mut control, 512);
+            for m in start..start + 60 {
+                control.step_hop(&hop(m, strong_on(512, k)), m);
+            }
+            assert!(
+                !control.tracks.is_empty(),
+                "control (no trusted band) must spawn on channel {k}"
+            );
+
+            // With the trusted band: zero tracks, ever.
+            let mut vetoed = trusted_band_manager(512);
+            feed_warmup(&mut vetoed, 512);
+            vetoed.set_trusted_band_hz(-trusted, trusted);
+            for m in start..start + 60 {
+                vetoed.step_hop(&hop(m, strong_on(512, k)), m);
+            }
+            assert!(
+                vetoed.tracks.is_empty(),
+                "channel {k} (centre {} Hz) lies beyond the trusted band {trusted} Hz",
+                k as f64 * 93.75
+            );
+        }
+    }
+
+    /// MAN-196: the veto is spawns-only -- narrowing the trusted band
+    /// under a running track neither closes it nor holds its decode. The
+    /// MAN-314 key-up-gap lesson, pinned: a rule applied to running
+    /// tracks kills real CW in its key-up gaps.
+    #[test]
+    fn trusted_band_veto_never_closes_an_existing_track() {
+        let mut tm = trusted_band_manager(512);
+        feed_warmup(&mut tm, 512);
+        let start = 250u64 * 15;
+        // Spawn + promote well inside the band first.
+        for m in start..start + 60 {
+            tm.step_hop(&hop(m, strong_on(512, 10)), m);
+        }
+        assert!(tm
+            .tracks
+            .values()
+            .any(|t| t.state() == LifecycleState::Active));
+
+        // Narrow the trusted band to exclude channel 10 mid-run, as if it
+        // had always been outside, and keep feeding the same carrier.
+        tm.set_trusted_band_hz(-100.0, 100.0);
+        let hops: Vec<HopOutput> = (start + 60..start + 160)
+            .map(|m| hop(m, strong_on(512, 10)))
+            .collect();
+        let events = tm.process_hops(&hops, |m| m);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackClosed { .. })),
+            "narrowing the trusted band must not close the running track: {events:?}"
+        );
+        assert!(
+            tm.decoding_track_count() >= 1,
+            "the track outside the (re)narrowed band keeps its decoder"
+        );
+    }
+
+    /// MAN-196: unset (or full-Nyquist) trusted band is bit-identical to
+    /// today -- the no-decimator path is a no-op by construction.
+    #[test]
+    fn unset_trusted_band_is_bit_identical_to_today() {
+        let n = 512;
+        let start = 250u64 * 15;
+        let hops: Vec<HopOutput> = {
+            let mut hs: Vec<HopOutput> = (0..start).map(|m| hop(m, quiet_power(n))).collect();
+            hs.extend((start..start + 200).map(|m| hop(m, strong_on(n, 200))));
+            hs
+        };
+        let run = |full_band: bool| -> Vec<DecoderEvent> {
+            let mut tm = trusted_band_manager(n);
+            if full_band {
+                // Covers the full Nyquist: the setter's documented no-op
+                // arm, and exactly what a boundary-holding source whose
+                // band happens to span everything would report.
+                tm.set_trusted_band_hz(-24_000.0, 24_000.0);
+            }
+            tm.process_hops(&hops, |m| m)
+        };
+        assert_eq!(run(true), run(false));
+    }
+
+    /// MAN-196: boundary granularity is the channel centre, with no
+    /// margin channel either side (the crash live set's +1-channel margin
+    /// exists for quartile judgment, a different purpose). Channel 231's
+    /// centre (231 * 93.75 = 21 656.25 Hz) is the last inside the
+    /// 21 724.8 Hz boundary; channel 232's (21 750.0 Hz) is the first
+    /// outside. Channels 232-255 per side (24 of 256) are conceded.
+    #[test]
+    fn boundary_granularity_is_the_channel_centre() {
+        let trusted = manta_dsp::decimate::TRUSTED_HALF_BAND_FRACTION * 48_000.0;
+        let start = 250u64 * 15;
+        for (k, inside) in [(230usize, true), (231usize, true), (232usize, false)] {
+            let mut tm = trusted_band_manager(512);
+            feed_warmup(&mut tm, 512);
+            tm.set_trusted_band_hz(-trusted, trusted);
+            for m in start..start + 60 {
+                tm.step_hop(&hop(m, strong_on(512, k)), m);
+            }
+            assert_eq!(
+                tm.tracks.is_empty(),
+                !inside,
+                "channel {k} (centre {} Hz) vs boundary {trusted} Hz",
+                k as f64 * 93.75
+            );
+        }
     }
 
     /// MAN-122 review round 1, the exact failure the reviewer described: a

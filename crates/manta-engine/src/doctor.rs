@@ -298,6 +298,22 @@ impl IqSource for SampleBoundedSource {
     fn confirmed_live_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
         self.inner.confirmed_live_handle()
     }
+
+    // MAN-196 (round-1 review on PR #300): forward the inner source's
+    // bands, like every other wrapper does. With the trait defaults,
+    // `doctor --capture-rate-hz` ran `listen()` on a `DecimatingSource`
+    // with the trusted-band spawn veto silently disabled (`None`) and with
+    // the static-crash live set / reported channel levels judged over the
+    // un-narrowed +/-fs_out/2 band -- a different detector path from
+    // `run`/`soak`, able to count transition-band or folded tracks those
+    // commands reject.
+    fn rf_passband_hz(&self) -> (f64, f64) {
+        self.inner.rf_passband_hz()
+    }
+
+    fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+        self.inner.trusted_band_hz()
+    }
 }
 
 /// Run `listen()` against `src` for `duration`, tabulating its event/spot
@@ -521,6 +537,50 @@ mod tests {
             100,
             "the shared counter doctor() reads after listen() returns must reflect exactly what \
              was delivered"
+        );
+    }
+
+    /// Regression (MAN-196 round-1 review on PR #300): `SampleBoundedSource`
+    /// must forward the inner source's `trusted_band_hz`/`rf_passband_hz`.
+    /// The trait defaults (`None` / +/-sample_rate/2) are wrong for a
+    /// wrapped `DecimatingSource`, whose veto band and narrowed passband
+    /// would otherwise be silently dropped, running `listen()` on a
+    /// different detector path from `run`/`soak`.
+    #[test]
+    fn sample_bounded_source_forwards_the_inner_bands() {
+        struct BandedSource;
+        impl IqSource for BandedSource {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                0.0
+            }
+            fn rf_passband_hz(&self) -> (f64, f64) {
+                (-21_724.8, 21_724.8)
+            }
+            fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+                Some((-21_724.8, 21_724.8))
+            }
+            fn read(&mut self, _buf: &mut [Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+        }
+        let src = SampleBoundedSource {
+            inner: Box::new(BandedSource),
+            max_samples: 10,
+            samples_read: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        assert_eq!(
+            src.trusted_band_hz(),
+            Some((-21_724.8, 21_724.8)),
+            "the wrapped source's trusted band must reach listen()'s spawn veto"
+        );
+        assert_eq!(
+            src.rf_passband_hz(),
+            (-21_724.8, 21_724.8),
+            "the wrapped source's narrowed passband must reach the crash live set and reported \
+             channel levels, not the default +/-fs_out/2"
         );
     }
 
