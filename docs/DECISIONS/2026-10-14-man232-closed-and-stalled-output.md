@@ -43,9 +43,10 @@ panic: exit 101, with no drain. Reproduced on `f33bf1c` (2026-10-14):
    `warning`, `tracing` with `log_internal_errors(false)`). Diagnostics
    must not end a daemon or change an exit status.
 4. **D4 — the second stop signal exits from inside the handler** via
-   `signal_hook::flag::register_conditional_shutdown(sig, 128 + sig,
-   signalled)`, armed by a dedicated `signalled` flag that only the
-   stop-signal handlers set. Any combination counts (SIGINT then
+   one `signal_hook::low_level::register` action per stop signal that
+   stores `stop` and then swaps a dedicated `signalled` flag, calling
+   `_exit(128 + sig)` if the swap finds it already set. Only the
+   stop-signal handlers set `signalled`. Any combination counts (SIGINT then
    SIGTERM). This holds at any time after installation, including during
    a healthy client drain: a second signal comes from an operator who
    wants out.
@@ -70,17 +71,19 @@ panic: exit 101, with no drain. Reproduced on `f33bf1c` (2026-10-14):
    the ticket asks; unit tests for `stdio` live in `stdio.rs`; the
    panicking-print ban is a guard in `output_style_guard.rs`.
 
-Registration order per stop signal (D4): the `stop` store first, then the
-conditional `_exit` action, then the arming store — signal-hook runs
-actions in registration order, so the first signal only arms, and the
-second exits with `_exit(128 + signal)` (async-signal-safe). `stop` is
-registered first because the three registrations are separate
-kernel-visible moments: a stop signal delivered between them (a supervisor
-terminating manta during startup) runs only a prefix of the actions, and
-with `stop` first every such prefix still requests the drain — the signal
-is never swallowed, and never merely arms a forced exit the next signal
-would take without any drain. Only these
-handlers set `signalled`: a closed stdout and the post-loop
+One action per stop signal (D4): `stop.store(true)`, then
+`if signalled.swap(true) { _exit(128 + signal) }` — two lock-free atomics
+and an async-signal-safe `_exit`, nothing else. It is one registration,
+not separate store / conditional-exit / arm registrations (the first
+revision of this PR), for two reasons: a signal delivered between
+separate registrations runs only some of them, and handlers for
+*different* signals nest (signal-hook installs with an empty `sa_mask`),
+so a load-then-store pair lets two concurrent stop signals both see "not
+yet signalled" and neither exit. The swap makes "first or second?" a
+single atomic decision, so the first stop signal only requests the drain
+and any second one ends the process. Do not split it back into
+`signal_hook::flag::register` / `register_conditional_shutdown` calls.
+Only these handlers set `signalled`: a closed stdout and the post-loop
 `stop_ready.store(true)` set `stop` without arming the forced exit, so
 the first signal after a closed-pipe stop still drains normally.
 
