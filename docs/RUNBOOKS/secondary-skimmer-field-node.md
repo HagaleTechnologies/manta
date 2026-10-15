@@ -406,8 +406,8 @@ What to do with what it shows:
   section 11). A listener-task panic is logged but does not exit the process.
 - **Source outages.** `## Source outages` counts them from `manta_source_outages_total` and
   `manta_source_down_seconds_total`, so drops shorter than the 60 s sample interval still show.
-- **Recorder coverage below 99%** (spots recorded vs spots emitted). The JSON port has no history
-  for late subscribers, so spots emitted while the recorder is disconnected are lost to it. Check
+- **Recorder coverage below 99%** (spots recorded vs spots emitted). The recorder reads raw TCP,
+  which never replays (resume is WebSocket-only), so spots emitted while the recorder is disconnected are lost to it. Check
   `systemctl status manta-field-spots` and `journalctl -u manta-field-spots`, and the
   `manta_spots_dropped_lagged_total` counter.
 

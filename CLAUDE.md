@@ -244,6 +244,14 @@ pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
 planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
+MAN-137: the JSON spot stream opens with `hello` and numbers spots and
+`spotGrade` records with one per-session `seq`. WebSocket
+`?session=&since=` resumes from the bounded shared history using
+`[server].history_minutes`; raw TCP receives live records only. Follows
+dispensa `contracts/spots/stream.v1.md` (ADR-0015, Q-0070); the live-state
+stream is unchanged. See
+`docs/DECISIONS/2026-10-14-man137-json-stream-resume.md`.
+
 MAN-248: each `[[rbn_uplink]]` target enforces
 `max_spots_per_minute` (default `600`, `0` disables) on spots written to
 the wire, via the existing `RateLimiter` owned above the reconnect loop;
@@ -313,6 +321,13 @@ hold every listener until all are read (`free_ports::<N>()`). Adding
 by a 20-run merge-queue watch with rollback triggers;
 `test-hpsdr (windows-latest)` stays advisory. See
 docs/DECISIONS/2026-10-15-man371-windows-required-check.md.
+
+MAN-235: `manta doctor` keeps its 10 s default; a `WEAK_NO_DECODE` run
+asked for under 60 s adds a stdout `hint:` line to rerun with
+`--duration 60` (`manta gen v1` first spots at 20-21 s). `--strict` exits 0
+for `DECODING`, 3 for every other verdict and 1 for a failed check; without
+it every verdict still exits 0. See
+docs/DECISIONS/2026-10-15-man235-doctor-rerun-hint-and-strict-exit.md.
 
 MAN-234: an input sample with a NaN, infinite or larger-than-1e17
 component (`manta-dsp::sample_guard::MAX_SAMPLE_MAGNITUDE`) is replaced

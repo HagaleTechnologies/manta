@@ -721,7 +721,13 @@ enum Command {
     /// real decode pipeline for --duration seconds and reports track, SNR
     /// and spot counts plus a verdict. Each check prints PASS, WARN, FAIL or
     /// SKIP, with a fix for every problem. Exits 1 when a check fails.
+    ///
+    /// Exit codes: 0 when no check fails, whatever the verdict; 1 when a
+    /// check fails or doctor cannot start; 2 for a command-line usage error.
+    /// With --strict, a run whose checks pass exits 3 unless the verdict is
+    /// DECODING.
     // MAN-126: the setup checks live in doctor_checks.rs and clock_check.rs.
+    // MAN-235: `strict_exit_code` maps a verdict to its --strict code.
     Doctor {
         /// How long to listen for, in seconds (3 to 3600).
         #[arg(long, default_value_t = 10)]
@@ -917,6 +923,15 @@ enum Command {
         /// summary.
         #[arg(long, help_heading = "Output")]
         json: bool,
+        /// Exit 3 unless the verdict is DECODING, so a script can act on it.
+        ///
+        /// Without --strict every verdict exits 0: a quiet band is not a
+        /// broken setup. With --strict, DECODING exits 0, and NO_SIGNAL,
+        /// NOT_CW, ACTIVITY_NO_SNR, NOISY_NO_DECODE and WEAK_NO_DECODE exit
+        /// 3. A failed check still exits 1, whatever the verdict.
+        // MAN-235: the codes come from `strict_exit_code`.
+        #[arg(long, help_heading = "Output")]
+        strict: bool,
         #[command(flatten)]
         filters: FilterOpts,
     },
@@ -4939,6 +4954,21 @@ fn status_exit_code(doc: &manta_server::status_doc::StatusDoc) -> u8 {
     }
 }
 
+/// `manta doctor --strict`'s exit code for a run whose checks all passed:
+/// `0` for DECODING, `3` for every other verdict. No wildcard arm, so a new
+/// verdict has to choose its code here (and in the `--strict` help).
+fn strict_exit_code(verdict: manta_engine::Verdict) -> u8 {
+    use manta_engine::Verdict;
+    match verdict {
+        Verdict::Decoding => 0,
+        Verdict::NoSignal
+        | Verdict::NotCw
+        | Verdict::ActivityNoSnr
+        | Verdict::NoisyNoDecode
+        | Verdict::WeakNoDecode => 3,
+    }
+}
+
 /// Status uses the application error style while retaining exit code 2.
 fn status_failure_message(e: &anyhow::Error) -> String {
     fmt::render_error(e)
@@ -6107,9 +6137,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                 |spot| {
                     if let Some(server) = &spot_server {
                         let truncated = server.bus.publish(spot.clone());
-                        if truncated > 0 {
-                            server.metrics.record_history_truncated(truncated as u64);
-                        }
+                        server
+                            .metrics
+                            .record_history_truncated(truncated.history_truncated as u64);
+                        server.metrics.record_json_stream_history_truncated(
+                            truncated.stream_history_truncated as u64,
+                        );
                         server.metrics.record_spot(spot);
                         // MAN-136/MAN-45: counted ONCE per spot here, NOT
                         // inside `SpotMessage::from_spot` -- that runs once
@@ -6574,6 +6607,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             config,
             ntp_server,
             json,
+            strict,
         } => {
             let FilterOpts {
                 freq_correction_ppm,
@@ -6710,6 +6744,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                             if !json {
                                 outln!()?;
                                 out!("{}", fmt::doctor_report(&report))?;
+                                let requested = std::time::Duration::from_secs(duration);
+                                if let Some(hint) = fmt::doctor_rerun_hint(&report, requested) {
+                                    out!("{hint}")?;
+                                }
                             }
                             Some(report)
                         }
@@ -6755,6 +6793,13 @@ fn run_command() -> Result<std::process::ExitCode> {
             // write above flushed, so no trailing flush is needed either).
             if doctor_checks::worst(&checks) == doctor_checks::Status::Fail {
                 return Ok(std::process::ExitCode::FAILURE);
+            }
+            // A run with no report always pushed a FAIL row, so it has
+            // already returned 1 above.
+            if let (true, Some(report)) = (strict, &report) {
+                return Ok(std::process::ExitCode::from(strict_exit_code(
+                    report.verdict(),
+                )));
             }
         }
         Command::Calibrate {
@@ -7674,6 +7719,61 @@ mod tests {
             assert!(
                 flat.contains(needle),
                 "doctor --help lacks {needle:?}:\n{help}"
+            );
+        }
+    }
+
+    /// MAN-235: `doctor --help` names every verdict with its `--strict`
+    /// code, and the code it names is the one `strict_exit_code` returns.
+    #[test]
+    fn doctor_help_lists_the_strict_code_for_every_verdict() {
+        use clap::CommandFactory;
+        use manta_engine::Verdict;
+        let mut cli = Cli::command();
+        let doctor = cli.find_subcommand_mut("doctor").unwrap();
+        let strict_help = doctor
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("strict"))
+            .and_then(|arg| arg.get_long_help())
+            .expect("doctor has a --strict flag with long help")
+            .to_string();
+        let strict_flat = strict_help.split_whitespace().collect::<Vec<_>>().join(" ");
+        let help = doctor.render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in ["--strict", "exits 3", "A failed check still exits 1"] {
+            assert!(
+                flat.contains(needle),
+                "doctor --help lacks {needle:?}:\n{help}"
+            );
+        }
+        // "DECODING exits 0, and NO_SIGNAL, ... and WEAK_NO_DECODE exit 3."
+        let exits_3 = strict_flat
+            .split("DECODING exits 0, and ")
+            .nth(1)
+            .and_then(|rest| rest.split(" exit 3").next())
+            .unwrap_or_else(|| panic!("--strict help lists no exit-3 verdicts:\n{strict_help}"));
+        for (verdict, code) in [
+            (Verdict::NoSignal, 3),
+            (Verdict::NotCw, 3),
+            (Verdict::ActivityNoSnr, 3),
+            (Verdict::NoisyNoDecode, 3),
+            (Verdict::WeakNoDecode, 3),
+            (Verdict::Decoding, 0),
+        ] {
+            assert_eq!(strict_exit_code(verdict), code, "{verdict:?}");
+            let label = verdict.summary().split(" -- ").next().unwrap();
+            assert!(
+                flat.contains(label) && strict_flat.contains(label),
+                "doctor --help does not name {label}:\n{help}"
+            );
+            let listed = if code == 0 {
+                strict_flat.contains(&format!("{label} exits 0"))
+            } else {
+                exits_3.contains(label)
+            };
+            assert!(
+                listed,
+                "--strict help does not give {label} code {code}:\n{strict_help}"
             );
         }
     }
@@ -8976,15 +9076,18 @@ mod tests {
                 track_id: 7,
                 sample_ts: 12_345,
             });
-            let mut line = String::new();
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                reader.read_line(&mut line),
-            )
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                    let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    if value.get("kind").is_none() {
+                        break line;
+                    }
+                }
+            })
             .await
             .expect("timed out waiting for a JSON spot")
-            .unwrap();
-            line
         });
 
         let _ = server.shutdown_tx.send(true);
@@ -10251,6 +10354,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         "tune_hz",
         "write",
         "ntp_server",
+        // doctor --strict (MAN-235): an exit-code choice, like json.
+        "strict",
         "verbose",
         "quiet",
         "log_level",

@@ -1775,6 +1775,8 @@ mod tests {
             "--ntp-server",
             "| 0 |",
             "| 1 |",
+            "| 3 |",
+            "--strict",
         ] {
             assert!(runbook.contains(needle), "setup-checks.md lacks {needle}");
         }
