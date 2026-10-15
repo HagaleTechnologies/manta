@@ -47,7 +47,7 @@ and `MIN_DURATION`/`MAX_DURATION` are unchanged.
   | 0 | No check failed, whatever the verdict | No check failed and the verdict is `DECODING` |
   | 1 | A check failed, or doctor could not start | Same, whatever the verdict: a failed check takes precedence |
   | 2 | Command-line usage error | Same |
-  | 3 | — | No check failed; the verdict is `NO_SIGNAL`, `ACTIVITY_NO_SNR`, `NOISY_NO_DECODE` or `WEAK_NO_DECODE` |
+  | 3 | — | No check failed; the verdict is `NO_SIGNAL`, `NOT_CW`, `ACTIVITY_NO_SNR`, `NOISY_NO_DECODE` or `WEAK_NO_DECODE` |
 
   Code 3, not 1, so a strict script can tell a broken setup (1) from a quiet
   band (3) without parsing JSON; 2 belongs to clap. One code for every
@@ -57,10 +57,10 @@ and `MIN_DURATION`/`MAX_DURATION` are unchanged.
   so MAN-131's "digital silence is a warning and doctor reports
   `NO_SIGNAL`" contract holds.
 - **D4 — Every verdict names its code.** `strict_exit_code` matches every
-  `Verdict` variant with no wildcard arm, so a new verdict (MAN-313 plans
-  `NotCw`) does not compile until it chooses a code, and
+  `Verdict` variant with no wildcard arm, so a new verdict does not
+  compile until it chooses a code, and
   `doctor_help_lists_the_strict_code_for_every_verdict` fails until the
-  `--strict` help names it.
+  `--strict` help names it. MAN-313's `NotCw` took code 3 that way.
 - **D5 — CLI only.** `--strict` has no config key and no `MANTA_*`
   variable, like `--json` and `--duration`: it is a choice about how one run
   reports, not about the node.

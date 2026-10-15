@@ -119,7 +119,7 @@ non-standard port.
 | 0 | Without `--strict`: no check failed. Warnings are allowed, and the signal verdict (including `NO_SIGNAL`) does not change the exit code: a quiet band is not a broken setup. With `--strict`: no check failed and the verdict is `DECODING` |
 | 1 | At least one check failed, or doctor could not start (a bad `--duration`, a config that does not load) |
 | 2 | Command-line usage error |
-| 3 | With `--strict` only: no check failed, but the verdict is `NO_SIGNAL`, `ACTIVITY_NO_SNR`, `NOISY_NO_DECODE` or `WEAK_NO_DECODE` |
+| 3 | With `--strict` only: no check failed, but the verdict is `NO_SIGNAL`, `NOT_CW`, `ACTIVITY_NO_SNR`, `NOISY_NO_DECODE` or `WEAK_NO_DECODE` |
 
 A failed check exits 1 with or without `--strict`, whatever the verdict.
 

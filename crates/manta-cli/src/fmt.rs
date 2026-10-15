@@ -231,7 +231,6 @@ mod tests {
             .contains("SNR (2500 Hz reference): no TrackMeta events -- no track ever promoted\n"));
     }
 
-<<<<<<< HEAD
     #[test]
     fn doctor_rerun_hint_only_for_a_short_weak_run() {
         use manta_engine::Verdict;
@@ -242,6 +241,7 @@ mod tests {
             center_freq_hz: 14_000_000.0,
             duration: ten,
             tracks_promoted: 1,
+            detector_confirmations: 1,
             track_meta_count: 9,
             tracks_closed: 1,
             snr_db_min: Some(21.0),
@@ -270,7 +270,21 @@ mod tests {
         assert_eq!(doctor_rerun_hint(&r, ten), None);
         r = manta_engine::DoctorReport {
             tracks_promoted: 0,
-=======
+            detector_confirmations: 0,
+            track_meta_count: 0,
+            tracks_closed: 0,
+            snr_db_min: None,
+            snr_db_median: None,
+            snr_db_max: None,
+            chars_decoded: 0,
+            distinct_chars: 0,
+            spots_confirmed: 0,
+            ..r
+        };
+        assert_eq!(r.verdict(), Verdict::NoSignal);
+        assert_eq!(doctor_rerun_hint(&r, ten), None);
+    }
+
     /// MAN-313: a run with confirmed signals but no keyed CW prints its
     /// confirmation count and the `NOT_CW` verdict.
     #[test]
@@ -281,7 +295,6 @@ mod tests {
             duration: std::time::Duration::from_secs(10),
             tracks_promoted: 0,
             detector_confirmations: 14,
->>>>>>> 5499511bc122183cbc504a4fcadb6a4741c37fde
             track_meta_count: 0,
             tracks_closed: 0,
             snr_db_min: None,
@@ -290,12 +303,6 @@ mod tests {
             chars_decoded: 0,
             distinct_chars: 0,
             spots_confirmed: 0,
-<<<<<<< HEAD
-            ..r
-        };
-        assert_eq!(r.verdict(), Verdict::NoSignal);
-        assert_eq!(doctor_rerun_hint(&r, ten), None);
-=======
         };
         let out = doctor_report(&r);
         assert!(
@@ -305,6 +312,5 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("\nverdict: NOT_CW -- "), "{out}");
->>>>>>> 5499511bc122183cbc504a4fcadb6a4741c37fde
     }
 }

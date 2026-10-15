@@ -925,8 +925,8 @@ enum Command {
         ///
         /// Without --strict every verdict exits 0: a quiet band is not a
         /// broken setup. With --strict, DECODING exits 0, and NO_SIGNAL,
-        /// ACTIVITY_NO_SNR, NOISY_NO_DECODE and WEAK_NO_DECODE exit 3. A
-        /// failed check still exits 1, whatever the verdict.
+        /// NOT_CW, ACTIVITY_NO_SNR, NOISY_NO_DECODE and WEAK_NO_DECODE exit
+        /// 3. A failed check still exits 1, whatever the verdict.
         // MAN-235: the codes come from `strict_exit_code`.
         #[arg(long, help_heading = "Output")]
         strict: bool,
@@ -4917,6 +4917,7 @@ fn strict_exit_code(verdict: manta_engine::Verdict) -> u8 {
     match verdict {
         Verdict::Decoding => 0,
         Verdict::NoSignal
+        | Verdict::NotCw
         | Verdict::ActivityNoSnr
         | Verdict::NoisyNoDecode
         | Verdict::WeakNoDecode => 3,
@@ -7629,6 +7630,7 @@ mod tests {
             .unwrap_or_else(|| panic!("--strict help lists no exit-3 verdicts:\n{strict_help}"));
         for (verdict, code) in [
             (Verdict::NoSignal, 3),
+            (Verdict::NotCw, 3),
             (Verdict::ActivityNoSnr, 3),
             (Verdict::NoisyNoDecode, 3),
             (Verdict::WeakNoDecode, 3),
