@@ -68,6 +68,8 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-235: `manta doctor --strict` exits 3 when no check failed but the
+  verdict is not `DECODING`; without it every verdict still exits 0.
 - MAN-234: a `bad_samples` field in `decode --json`, `doctor --json` and
   `calibrate --json` (omitted when 0); a `warning: … bad sample(s) …`
   stderr line from `decode`, `calibrate` and `run`/`listen` (at the first
@@ -115,6 +117,8 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-235: a `manta doctor` run shorter than 60 s that reads
+  `WEAK_NO_DECODE` adds a `hint:` line suggesting `--duration 60`.
 - The in-repo `wiki/` is the project's canonical wiki. GitHub's Wiki tab
   is not used; disabling it remains an owner step. The wiki's stale
   `verified` stamps and `manifest.json` are refreshed and CI-pinned (MAN-152).
