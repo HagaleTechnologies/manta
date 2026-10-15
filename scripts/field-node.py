@@ -543,13 +543,16 @@ def validate_spot_line(line):
 def classify_line(body):
     """Return ("grade", obj) for a MAN-301 `spotGrade` record (`kind` is
     "spotGrade" and `windowClose` is numeric) or ("spot", obj) for a
-    SpotMessage `validate_spot_line` accepts; else raise ValueError. A grade
+    SpotMessage `validate_spot_line` accepts, or ("hello", obj) for the opening
+    hello record; else raise ValueError. A grade
     deliberately carries no dxCall/frequency/timestamp, so it is never
     mistaken for a spot."""
     try:
         obj = json.loads(body.decode("utf-8"))
     except (ValueError, RecursionError):  # bad UTF-8/JSON, or nested too deep
         obj = None
+    if isinstance(obj, dict) and obj.get("kind") == "hello":
+        return "hello", obj
     if isinstance(obj, dict) and obj.get("kind") == "spotGrade":
         wc = obj.get("windowClose")
         if not isinstance(wc, bool) and isinstance(wc, (int, float)):
@@ -647,6 +650,8 @@ def record_spots(host, port, out_dir, sleep=time.sleep, should_stop=lambda: Fals
                             except ValueError as e:
                                 stats["invalid"] += 1
                                 log("invalid line skipped (%s): %r" % (e, line[:200]))
+                                continue
+                            if kind == "hello":
                                 continue
                             if kind == "grade":
                                 grade_writer.write(_utc_day(float(obj["windowClose"])),

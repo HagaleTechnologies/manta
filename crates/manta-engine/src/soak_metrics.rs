@@ -1,35 +1,23 @@
-//! Soak variant that also samples `TrackManager` stats (active track
-//! count, per-`CloseReason` close counts) at a fixed interval, alongside
-//! `soak.rs`'s existing panic/RSS-growth tracking -- MAN-19's 24h soak
-//! needs "track count and evictions visible in metrics" throughout the
-//! run, not just a single pass/fail verdict at the end.
+//! Soak wrapper that samples RSS and track lifecycle counters at a fixed
+//! interval, alongside panic and RSS-growth tracking for MAN-19's 24h soak.
 //!
-//! This duplicates `soak.rs`/`listen.rs`'s loop body rather than adding a
-//! sampling hook to either: `TrackManager` isn't part of either function's
-//! public surface, and `listen()` is a widely-used, already-reviewed
-//! entry point (`manta listen`, `manta decode`, `soak()` itself) --
-//! threading a new callback through it for one caller isn't worth the
-//! risk. This file is net new; nothing in `soak.rs`/`listen.rs` changed.
+//! Since MAN-236 this calls `listen_with_observers`, the loop `manta run`
+//! executes. `TrackLifecycleObserver` and the static-crash observer provide
+//! the counters; no DSP or validator loop is maintained here.
 
-use crate::track::{CloseCounts, TrackManager};
-use crate::PipelineConfig;
+use crate::soak::{peak_rss_bytes, RSS_GROWTH_LIMIT_BYTES, WARMUP};
+use crate::track::CloseCounts;
+use crate::{PipelineConfig, TrackLifecycleObserver};
 use anyhow::Result;
 use manta_decode::events::DecoderEvent;
 use manta_input::IqSource;
-use num_complex::Complex32;
+use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub use crate::track::CloseCounts as SoakCloseCounts;
-
-const CHUNK_SAMPLES: usize = 2048;
-const CALIBRATION_SECONDS: f64 = 2.0;
-/// Matches `soak.rs::RSS_GROWTH_LIMIT_BYTES` -- same M1/M2/M3 soak-accept
-/// threshold, reused here rather than re-litigated.
-const RSS_GROWTH_LIMIT_BYTES: u64 = 200 * 1024 * 1024;
-const WARMUP: Duration = Duration::from_secs(10);
 
 /// One periodic observation, suitable for JSONL logging over a long run.
 #[derive(Debug, Clone, Copy)]
@@ -75,55 +63,12 @@ pub struct SoakMetricsReport {
     pub final_static_crashes: u64,
 }
 
-// Windows has no libc::rusage/getrusage (POSIX-only) -- see this crate's
-// Cargo.toml for why windows-sys is target-gated in as the equivalent.
-// Duplicated from soak.rs's own peak_rss_bytes() (pre-existing
-// duplication, not introduced by this fix) rather than extracted into a
-// shared module -- out of scope for a build-bug fix.
-#[cfg(unix)]
-fn peak_rss_bytes() -> u64 {
-    unsafe {
-        let mut usage: libc::rusage = std::mem::zeroed();
-        libc::getrusage(libc::RUSAGE_SELF, &mut usage);
-        let raw = usage.ru_maxrss as u64;
-        if cfg!(target_os = "macos") {
-            raw // macOS reports ru_maxrss in bytes
-        } else {
-            raw * 1024 // Linux (and most others) report it in KB
-        }
-    }
-}
-
-#[cfg(windows)]
-fn peak_rss_bytes() -> u64 {
-    use windows_sys::Win32::System::ProcessStatus::{
-        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
-    };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
-    unsafe {
-        let mut counters: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
-        let ok = GetProcessMemoryInfo(
-            GetCurrentProcess(),
-            &mut counters,
-            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        );
-        if ok != 0 {
-            counters.PeakWorkingSetSize as u64
-        } else {
-            0
-        }
-    }
-}
-
 /// Run the streaming pipeline against `src` for `duration` wall-clock time
 /// (or until EOF), sampling RSS + `TrackManager` stats every
-/// `sample_interval` and feeding each sample to `on_sample`. Mirrors
-/// `soak()`'s panic/RSS-growth tracking (`soak.rs`) and `listen()`'s loop
-/// body (`listen.rs`) -- see module doc for why they're duplicated rather
-/// than reused directly.
+/// `sample_interval` and feeding each sample to `on_sample`. Uses the shipped
+/// streaming loop and shares `soak()`'s panic/RSS-growth acceptance bar.
 pub fn soak_with_metrics(
-    mut src: Box<dyn IqSource>,
+    src: Box<dyn IqSource>,
     cfg: &PipelineConfig,
     duration: Duration,
     sample_interval: Duration,
@@ -148,13 +93,12 @@ pub fn soak_with_metrics(
     let start = Instant::now();
     let baseline_rss = peak_rss_bytes();
     let mut worst_growth = 0u64;
-    let mut event_count = 0usize;
-    let mut spot_count = 0usize;
+    let lifecycle = Arc::new(TrackLifecycleObserver::default());
+    let static_crashes = Arc::new(AtomicU64::new(0));
+    let event_count = Cell::new(0usize);
+    let spot_count = Cell::new(0usize);
     let mut track_closed_count = 0usize;
-    let mut peak_active_tracks = 0usize;
-    let mut final_close_counts = CloseCounts::default();
-    let mut gate_records_total = 0u64;
-    let mut final_static_crashes = 0u64;
+    let mut seen_chunks = 0u64;
     let mut last_sample = Instant::now();
 
     let watchdog = std::thread::spawn(move || {
@@ -169,135 +113,53 @@ pub fn soak_with_metrics(
     });
 
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<()> {
-        // MAN-19 review round 1: unlike `listen()`'s `on_event` callback
-        // (which the CLI's `--json` output needs calibrated), this
-        // function never surfaces raw events to a caller -- only
-        // `validator.ingest` sees them, and `Validator` already applies
-        // `cfg.freq_correction_ppm` internally (`with_freq_correction_ppm`
-        // below). Calibrating here too, as an earlier version of this
-        // file did, double-applies the correction to every spot's
-        // frequency (and to notch/dedupe bucketing) whenever
-        // `freq_correction_ppm != 0.0` -- matching `lib.rs`'s
-        // `calibrate_freq_events` doc, which explicitly warns against
-        // feeding its output to `Validator::ingest`. Validated up front
-        // only so a NaN/out-of-range ppm fails fast, same as soak.rs.
-        manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let fs = src.sample_rate();
-        let center_freq_hz = src.center_freq_hz();
-
-        let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
-        let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];
-        let mut filled = 0;
-        while filled < calib_n {
-            let n = src.read(&mut calib[filled..])?;
-            if n == 0 {
-                anyhow::bail!("audio source ended during startup calibration");
-            }
-            filled += n;
-        }
-        let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let hop = ch.hop() as u64;
-        let mut tm = TrackManager::new(
-            ch.n_channels(),
-            fs,
-            center_freq_hz,
-            cfg.detector,
-            cfg.decode.clone(),
-        );
-        // MAN-312 (SPEC §2.7): judge static crashes over the source's
-        // real passband, as `listen` does.
-        let (lo, hi) = src.rf_passband_hz();
-        tm.set_rf_passband_hz(lo, hi);
-        // MAN-196: veto spawns outside the source's trusted band, as
-        // `listen` does (`None`, no decimator, leaves the manager as is).
-        if let Some((lo, hi)) = src.trusted_band_hz() {
-            tm.set_trusted_band_hz(lo, hi);
-        }
-        let mut validator = cfg.validator(fs)?;
-
-        let pad_samples = ch.filter_len();
-        let pad_hops = (pad_samples as u64).div_ceil(hop);
-        tm.skip_preroll_hops(pad_hops);
-        let padding = vec![Complex32::new(0.0, 0.0); pad_samples];
-        for ev in tm.process_hops(&ch.process(&padding), |m| m.saturating_sub(pad_hops) * hop) {
-            event_count += 1;
-            if matches!(ev, DecoderEvent::TrackClosed { .. }) {
-                track_closed_count += 1;
-            }
-            spot_count += validator.ingest(&ev).len();
-        }
-        for ev in tm.process_hops(&ch.process(&calib), |m| m.saturating_sub(pad_hops) * hop) {
-            event_count += 1;
-            if matches!(ev, DecoderEvent::TrackClosed { .. }) {
-                track_closed_count += 1;
-            }
-            spot_count += validator.ingest(&ev).len();
-        }
-
-        let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
-        loop {
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            let n = src.read(&mut chunk)?;
-            if n == 0 {
-                break;
-            }
-            for ev in tm.process_hops(&ch.process(&chunk[..n]), |m| {
-                m.saturating_sub(pad_hops) * hop
-            }) {
-                event_count += 1;
+        // MAN-19 review round 1: only the event type is counted here.
+        // `listen_with_observers` sends its calibrated copy to `on_event`
+        // and the original to the validator, which applies ppm internally.
+        // Never feed the calibrated copy back into validation: that would
+        // double-correct frequencies and notch/dedupe bucketing.
+        crate::listen_with_observers(
+            src,
+            cfg,
+            stop.clone(),
+            crate::ListenObservers {
+                track_lifecycle: Some(lifecycle.clone()),
+                static_crashes: Some(static_crashes.clone()),
+                ..Default::default()
+            },
+            |ev| {
+                event_count.set(event_count.get() + 1);
                 if matches!(ev, DecoderEvent::TrackClosed { .. }) {
                     track_closed_count += 1;
                 }
-                spot_count += validator.ingest(&ev).len();
-            }
-            // MAN-19 round 7: updated after every processed chunk, not
-            // just at sample_interval ticks -- a track that opens AND
-            // closes entirely between two ticks (plausible for a busy
-            // pileup with a coarse interval) previously left no trace in
-            // peak_active_tracks at all. Cheap: active_track_count() is
-            // just self.tracks.len().
-            let active = tm.active_track_count();
-            peak_active_tracks = peak_active_tracks.max(active);
-
-            if last_sample.elapsed() >= sample_interval {
-                last_sample = Instant::now();
-                final_close_counts = tm.close_counts();
-                let rss = peak_rss_bytes();
-                if start.elapsed() >= WARMUP {
-                    worst_growth = worst_growth.max(rss.saturating_sub(baseline_rss));
+            },
+            |_spot| spot_count.set(spot_count.get() + 1),
+            |_decoding| {
+                let snap = lifecycle.snapshot();
+                // `on_tracks` also fires for padding, calibration and finish.
+                // MAN-19 samples only after steady-state chunks.
+                if snap.chunks == seen_chunks {
+                    return;
                 }
-                on_sample(&SoakMetricsSample {
-                    elapsed_s: start.elapsed().as_secs_f64(),
-                    rss_bytes: rss,
-                    events_emitted: event_count,
-                    spots_emitted: spot_count,
-                    active_tracks: active,
-                    close_counts: final_close_counts,
-                    static_crashes: tm.static_crash_count(),
-                });
-            }
-        }
-        // MAN-19 round 7: captured BEFORE finish(), which clears
-        // self.tracks internally (round 4) -- calling
-        // tm.active_track_count() after finish() always reads 0 against
-        // an already-emptied map, silently contributing nothing to the
-        // peak regardless of how many tracks were actually open right up
-        // to end-of-stream.
-        peak_active_tracks = peak_active_tracks.max(tm.active_track_count());
-        for ev in tm.finish() {
-            event_count += 1;
-            if matches!(ev, DecoderEvent::TrackClosed { .. }) {
-                track_closed_count += 1;
-            }
-            spot_count += validator.ingest(&ev).len();
-        }
-        final_close_counts = tm.close_counts();
-        final_static_crashes = tm.static_crash_count();
-        gate_records_total = validator.gate_records_total();
+                seen_chunks = snap.chunks;
+                if last_sample.elapsed() >= sample_interval {
+                    last_sample = Instant::now();
+                    let rss = peak_rss_bytes();
+                    if start.elapsed() >= WARMUP {
+                        worst_growth = worst_growth.max(rss.saturating_sub(baseline_rss));
+                    }
+                    on_sample(&SoakMetricsSample {
+                        elapsed_s: start.elapsed().as_secs_f64(),
+                        rss_bytes: rss,
+                        events_emitted: event_count.get(),
+                        spots_emitted: spot_count.get(),
+                        active_tracks: snap.active_tracks as usize,
+                        close_counts: snap.close_counts,
+                        static_crashes: static_crashes.load(Ordering::Relaxed),
+                    });
+                }
+            },
+        )?;
         // MAN-19 review round 1: `worst_growth` was otherwise only ever
         // updated inside the periodic `sample_interval` branch above -- any
         // growth after the last tick (or the whole run, if
@@ -327,17 +189,18 @@ pub fn soak_with_metrics(
         Err(_) => true,
     };
 
+    let snap = lifecycle.snapshot();
     Ok(SoakMetricsReport {
         duration_actual: processing_end.duration_since(start),
-        events_emitted: event_count,
-        spots_emitted: spot_count,
+        events_emitted: event_count.get(),
+        spots_emitted: spot_count.get(),
         rss_growth_bytes: worst_growth,
         panicked,
-        peak_active_tracks,
-        final_close_counts,
+        peak_active_tracks: snap.peak_active_tracks as usize,
+        final_close_counts: snap.close_counts,
         track_closed_events: track_closed_count,
-        gate_records_total,
-        final_static_crashes,
+        gate_records_total: snap.gate_records_total,
+        final_static_crashes: static_crashes.load(Ordering::Relaxed),
     })
 }
 
@@ -351,6 +214,7 @@ pub fn soak_metrics_passed(report: &SoakMetricsReport) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use num_complex::Complex32;
 
     struct VecSource {
         samples: Vec<Complex32>,
@@ -377,6 +241,120 @@ mod tests {
             self.cursor += n;
             Ok(n)
         }
+    }
+
+    fn source(samples: Vec<Complex32>) -> Box<dyn IqSource> {
+        Box::new(VecSource {
+            samples,
+            cursor: 0,
+            fs: 48_000.0,
+            trusted_band_hz: None,
+        })
+    }
+
+    fn v1_samples() -> Vec<Complex32> {
+        let mut spec = manta_testkit::vectors::v1();
+        spec.fs = 48_000.0;
+        spec.duration_s = 20.0;
+        spec.center_freq_hz = 0.0;
+        manta_testkit::vectors::render(&spec).unwrap().samples
+    }
+
+    fn close_fields(c: CloseCounts) -> [u64; 8] {
+        [
+            c.unconfirmed,
+            c.hang_expired,
+            c.silent,
+            c.merged,
+            c.evicted,
+            c.rtty,
+            c.not_cw,
+            c.unkeyed,
+        ]
+    }
+
+    #[test]
+    fn soak_with_metrics_samples_once_per_steady_state_chunk() {
+        let mut samples_seen = 0;
+        soak_with_metrics(
+            source(vec![Complex32::new(0.0, 0.0); 96_000 + 3 * 2048 + 100]),
+            &PipelineConfig::default(),
+            Duration::from_secs(600),
+            Duration::ZERO,
+            |_| samples_seen += 1,
+        )
+        .unwrap();
+        assert_eq!(samples_seen, 4);
+    }
+
+    #[test]
+    fn soak_with_metrics_samples_never_exceed_the_report() {
+        let mut samples = Vec::new();
+        let report = soak_with_metrics(
+            source(v1_samples()),
+            &PipelineConfig::default(),
+            Duration::from_secs(600),
+            Duration::ZERO,
+            |s| samples.push(*s),
+        )
+        .unwrap();
+        assert!(!samples.is_empty());
+        assert!(report.events_emitted > 0 && report.peak_active_tracks > 0);
+        for pair in samples.windows(2) {
+            assert!(pair[0].events_emitted <= pair[1].events_emitted);
+            assert!(pair[0].spots_emitted <= pair[1].spots_emitted);
+            assert!(pair[0].static_crashes <= pair[1].static_crashes);
+            for (before, after) in close_fields(pair[0].close_counts)
+                .into_iter()
+                .zip(close_fields(pair[1].close_counts))
+            {
+                assert!(before <= after);
+            }
+        }
+        for sample in &samples {
+            assert!(sample.active_tracks <= report.peak_active_tracks);
+            assert!(sample.events_emitted <= report.events_emitted);
+            assert!(sample.spots_emitted <= report.spots_emitted);
+            assert!(sample.static_crashes <= report.final_static_crashes);
+        }
+        for (last, total) in close_fields(samples.last().unwrap().close_counts)
+            .into_iter()
+            .zip(close_fields(report.final_close_counts))
+        {
+            assert!(last <= total);
+        }
+    }
+
+    #[test]
+    fn soak_with_metrics_counts_the_stream_listen_produces() {
+        let samples = v1_samples();
+        let mut events = Vec::new();
+        let mut spots = Vec::new();
+        crate::listen(
+            source(samples.clone()),
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            |ev| events.push(ev.clone()),
+            |spot| spots.push(spot.clone()),
+        )
+        .unwrap();
+        let report = soak_with_metrics(
+            source(samples),
+            &PipelineConfig::default(),
+            Duration::from_secs(600),
+            Duration::ZERO,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.events_emitted, events.len());
+        assert_eq!(report.spots_emitted, spots.len());
+        assert_eq!(
+            report.track_closed_events,
+            events
+                .iter()
+                .filter(|ev| matches!(ev, DecoderEvent::TrackClosed { .. }))
+                .count()
+        );
     }
 
     /// MAN-312: the soak report carries the run's static-crash count.

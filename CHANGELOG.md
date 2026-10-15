@@ -43,6 +43,12 @@ the git history and `docs/DECISIONS/`.
 - MAN-95: default spot validation requires 2, 3 or 5 distinct-message
   repetitions by callsign-pattern rarity. `[spot].validation_level = "minimal"`
   restores flat 2; `--patterns` overrides the independent reference list.
+- MAN-190: the opt-in `hsmm` engine's evidence front end now confirms
+  mark/space anchors from two actually computed hops instead of a
+  forward-looking prediction, closing a missed-anchor race with the
+  per-hop speed feedback. Evidence hops are released one hop later
+  (`h+1` at constant speed, shared with `edge-legacy`); adaptive input
+  can decode differently. The default `legacy` engine is unchanged.
 
 - A band-wide static crash (lightning) no longer starts tracks across the
   band, and running tracks no longer decode it as extra dits; new
@@ -67,6 +73,13 @@ the git history and `docs/DECISIONS/`.
   `[detector] non_cw_filter = false` restores the previous behaviour.
 
 ### Added
+
+- JSON/WebSocket spot clients now receive a `hello` first, with schema and session
+  identity. Spots and grades carry `seq`; WebSocket `?session=&since=` resumes
+  from their shared history bounded by `history_minutes`. New
+  `manta_json_stream_resumes_total`, `manta_json_stream_replay_abandoned_total`
+  and `manta_json_stream_history_truncated_total` metrics report replay outcomes
+  and loss. Consumers must skip hello records (MAN-137).
 
 - MAN-235: `manta doctor --strict` exits 3 when no check failed but the
   verdict is not `DECODING`; without it every verdict still exits 0.

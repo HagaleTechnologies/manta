@@ -46,17 +46,25 @@ and the track-local noise power `N[t]` from §2.
 `M[t] = max(a_s[t−h … t+h])`, `h = round(hold_dits · u_ref)` hops, where
 `u_ref` is the best live token's `u` (§4.5) or `u_init = 15` hops
 (40 ms) before any token exists. Default `hold_dits = 4`. Implemented as a
-sliding-window maximum (monotonic deque, O(1) amortized). Because the
-window is centered, the evidence stream is produced with a fixed delay of
-`h` hops behind the input; all timestamps refer to the input hop.
+sliding-window maximum (monotonic deque, O(1) amortized). Each hop is
+computed under the window in effect at the moment of its own computation
+(`u_ref` is live per §4.5's feedback schedule, MAN-190: feedback after
+returned hop t first affects the computation of hop t+2). One computed hop
+is retained pending until its successor is computed (§1.7), so with a
+constant window the evidence stream is produced with a fixed delay of
+`h+1` hops behind the input; when feedback changes `h`, the release
+latency varies by the same rule and no fixed delay is claimed. All
+timestamps refer to the input hop; a released hop's fields are frozen at
+computation time and never recomputed.
 
 Implementation note (MAN-193): the O(1) amortized bound holds while both
 window bounds move forward, which includes a fixed `h` and any `h` change
 of one hop between consecutive centers. A `u_ref` change that moves a
 bound backwards (growing or shrinking `h` by more than one hop between
 consecutive centers) rebuilds the deque from the retained samples of the
-new window, at O(2h + 1) for that hop. The §1.7 lookahead reads the next
-center's `M` from the same deque without advancing it. See
+new window, at O(2h + 1) for that hop. Since MAN-190 each center's `M`
+is read once, by the query that computes that center; §1.7 compares two
+computed hops' LLRs and reads nothing ahead of the next query. See
 `docs/DECISIONS/2026-10-14-man193-centered-maximum-deque.md`.
 
 Rationale (design §1.3, §5.1): a *symmetric* window tracks QSB in both
@@ -93,12 +101,29 @@ matched filter for a rectangular mark of that length.
 
 ### 1.7 Anchors (edge triggers)
 
-Hop `t` is an **anchor** iff `sign(llr[t]) ≠ sign(llr[t−1])` (a
-half-amplitude crossing) or `t mod fallback_hops = 0` (default 8), or
-`present` changed at `t`. The decoder (§4) evaluates segment ends only at
-anchors and segment starts only at earlier anchors; segment durations are
-therefore exact anchor-to-anchor distances, and no duration grid is
-needed.
+With `sign(x) = -1` when `x < 0`, `0` when `x = 0`, `+1` when `x > 0`
+(three-way rule; an exact-zero LLR differs from both signs), and
+`base_anchor[t] = (t mod fallback_hops = 0)` (default 8) or
+`present` changed at `t` (initial `present[-1] = false`):
+
+```text
+anchor[t] = base_anchor[t] OR (sign(llr[t]) != sign(llr[t+1]))
+anchor[last] = base_anchor[last]
+```
+
+The sign comparison uses the two hops' **actual** LLRs, decided when both
+are computed (MAN-190): each hop is held pending until its successor is
+computed under the currently effective hold window, which is what lets the
+*earlier* hop of a crossing be flagged without predicting the successor —
+tagging the later hop instead would push every measured edge one hop past
+the true keying edge systematically. The terminal hop has no synthetic
+successor and keeps only its base anchor. A sign crossing is also
+detected across a gate transition: the earlier hop gets the sign anchor
+and the later hop its gate-change anchor. A continuously gated-off span
+generates no sign anchors (all its LLRs equal `−L`). The decoder (§4)
+evaluates segment ends only at anchors and segment starts only at earlier
+anchors; segment durations are therefore exact anchor-to-anchor
+distances, and no duration grid is needed.
 
 ### 1.8 Prefix sums
 
