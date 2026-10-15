@@ -2841,3 +2841,48 @@ fn spec_section_5_track_closed_names_its_closure_kinds() {
         );
     }
 }
+
+// ---- MAN-190 (PR #290 review): the docs follow the pending-hop redesign ----
+
+/// MAN-190 added a gotcha to `wiki/pages/decode-chain.md` (v2 evidence
+/// anchors are confirmed from two actual adjacent hops) but left the page
+/// stamped `60c4339 / 2026-10-14`: MAN-152's re-verification, made before
+/// main carried that claim. Same rule as the overview stamp test above.
+#[test]
+fn wiki_decode_chain_verified_stamp_is_not_the_pre_man190_one() {
+    let rel = "wiki/pages/decode-chain.md";
+    let claim = "anchor decisions are confirmed from two *actual* adjacent hops";
+    assert!(
+        doc(rel).contains(claim),
+        "{rel} no longer says `{claim}`; this test pins the stamp to that MAN-190 \
+         gotcha and needs updating with it"
+    );
+    let (commit, date) = wiki_verified_stamp(rel);
+    assert!(
+        commit != "60c4339" && date.as_str() > "2026-10-14",
+        "{rel} still stamps `verified: {commit} / {date}`, MAN-152's re-verification \
+         from before the MAN-190 gotcha: refresh `verified.commit`/`verified.date` (and \
+         the manifest entry) whenever the body is substantively changed"
+    );
+}
+
+/// MAN-190 computes every Evidence center for real before using its
+/// maximum, so `CenteredMax::peek_next` became test-only. SPEC v2 §1.2's
+/// MAN-193 implementation note still said the §1.7 lookahead reads the next
+/// center's `M` from the deque without advancing it. This pins that one
+/// sentence's removal; a design that peeks ahead again updates it with the
+/// spec.
+#[test]
+fn spec_v2_drops_the_man193_lookahead_sentence() {
+    let spec = squash_whitespace(&doc("docs/SPEC-decode-core-v2.md"));
+    for stale in [
+        "lookahead reads the next center's `M`",
+        "from the same deque without advancing it",
+    ] {
+        assert!(
+            !spec.contains(stale),
+            "SPEC-decode-core-v2.md still says `{stale}`, but `CenteredMax::peek_next` is \
+             test-only since MAN-190: each center's `M` comes from the query that computes it"
+        );
+    }
+}
