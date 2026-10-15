@@ -2843,16 +2843,17 @@ fn spec_section_5_track_closed_names_its_closure_kinds() {
     }
 }
 
-<<<<<<< HEAD
-// ---- MAN-155: the comparison page, and the explained FT8/RTTY non-goal ----
+// ---- MAN-155 (scoped by the MAN-360 decision, option B): a neutral
+// related-projects page, links only ----
 
-/// MAN-155: the comparison page covers each closest alternative, and a
-/// visitor reaches it from the README and the docs index.
+/// MAN-155, as narrowed by MAN-360 (B): a neutral related-projects page
+/// links each closest alternative's own documentation with no capability
+/// claims about any of them, and a visitor reaches it from the README and
+/// the docs index.
 #[test]
-fn comparison_page_names_each_alternative_and_is_linked() {
+fn related_projects_page_links_each_alternative_without_capability_claims() {
     let page = doc("docs/COMPARISON.md");
     for project in [
-        "CW Skimmer Server",
         "SparkSDR",
         "sdroxide",
         "OpenWebRX+",
@@ -2864,6 +2865,29 @@ fn comparison_page_names_each_alternative_and_is_linked() {
             "docs/COMPARISON.md never names {project}"
         );
     }
+    let targets = link_targets(&page);
+    for home in [
+        "https://www.sparksdr.com/",
+        "https://github.com/dividebysandwich/sdroxide",
+        "https://github.com/0xAF/openwebrxplus",
+        "https://github.com/luarvique/csdr-skimmer",
+        "https://github.com/ftl/sdrainer",
+    ] {
+        assert!(
+            targets.iter().any(|t| t == home),
+            "docs/COMPARISON.md does not link {home}"
+        );
+    }
+    assert!(
+        page.contains("no capability claims"),
+        "docs/COMPARISON.md must state its neutrality: links only, no \
+         capability claims about any listed project (MAN-360 decision B)"
+    );
+    assert!(
+        !page.lines().any(|l| l.trim_start().starts_with('|')),
+        "docs/COMPARISON.md has a table row; MAN-360 (B) scoped the page to \
+         a neutral links-only list with no capability claims"
+    );
     let readme = doc("README.md");
     for heading in ["Why", "Related projects"] {
         assert!(
@@ -2881,19 +2905,6 @@ fn comparison_page_names_each_alternative_and_is_linked() {
     );
 }
 
-/// MAN-155: Non-goals says why FT8 is out, citing the RBN's own announcement.
-#[test]
-fn readme_non_goals_cites_the_rbn_ft8_announcement() {
-    let goals = squash_whitespace(section(&doc("README.md"), "Non-goals"));
-    assert!(
-        goals.contains("reversebeacon.net/pages/FT8"),
-        "Non-goals must link RBN's FT8 announcement"
-    );
-    assert!(
-        goals.contains("beta"),
-        "Non-goals must say RBN put FT8 on a beta basis"
-    );
-=======
 // ---- MAN-190 (PR #290 review): the docs follow the pending-hop redesign ----
 
 /// MAN-190 added a gotcha to `wiki/pages/decode-chain.md` (v2 evidence
@@ -2937,5 +2948,4 @@ fn spec_v2_drops_the_man193_lookahead_sentence() {
              test-only since MAN-190: each center's `M` comes from the query that computes it"
         );
     }
->>>>>>> 8c92062aa574efa8ffb8dc7827b67d99178bd961
 }

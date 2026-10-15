@@ -56,8 +56,9 @@ daemon, open source, with documented algorithms and golden-vector regression
 tests anyone can read, run, and check. Shared infrastructure is healthier with
 more than one implementation of it, on more than one operating system.
 
-[docs/COMPARISON.md](docs/COMPARISON.md) says how manta differs from the
-other projects that decode CW from an SDR.
+[docs/COMPARISON.md](docs/COMPARISON.md) links SparkSDR, sdroxide,
+OpenWebRX+/csdr-skimmer and sdrainer, with no capability claims about
+any of them.
 
 ## Installation
 
@@ -754,21 +755,10 @@ criteria.
 
 - Not an interactive receiver or panadapter. Use SDR++ or similar for a
   waterfall.
-- Not a general digital-mode skimmer. Decoding FT8 or RTTY is out of scope
-  for 1.0; the channelizer does not rule either out later.
-  - FT8: in 2018 the RBN found that FT8 made up 86–87% of one test node's
-    spots, and that 20–30 nodes spotting it could double the network's
-    load. It moved FT8 to its own port (7001) on a beta-test basis, kept
-    port 7000 for CW and RTTY, and reserved the right to shut FT8 off on
-    major CW and RTTY contest weekends or stop spotting it altogether
-    ([RBN's FT8 announcement](https://reversebeacon.net/pages/FT8%2BAnnouncement%2B40)).
-    RBN nodes that spot FT8 already do it with CWSL_DIGI or Aggregator
-    ([RBN's FT4/8 guide](https://www.reversebeacon.net/pages/Spotting%2BFT4%2F8%2B41)).
-  - RTTY: the RBN carries RTTY with CW, so that is not the reason. The
-    CW decoder isn't finished: it still loses copy under heavy fading
-    (see Status), and that comes first.
-  - Recognising RTTY so that its tones never become CW tracks is in scope
-    (MAN-314).
+- Not a general digital-mode skimmer. FT8 and RTTY are out of scope for 1.0,
+  though the channelizer architecture does not preclude them later.
+  Decoding RTTY stays a non-goal for now; recognising it so that its tones
+  never become CW tracks is in scope (MAN-314).
 - Not a cluster network. `manta` is a spot source, not an aggregator.
 - Not a logger. No QSO state.
 - Not a multi-process orchestrator. `manta` is a single Rust binary, not a
@@ -827,9 +817,9 @@ recall/CER-vs-SNR curve on synthetic signals, regenerable from any build.
 
 ## Related projects
 
-- [docs/COMPARISON.md](docs/COMPARISON.md): what CW Skimmer Server,
-  SparkSDR, sdroxide, OpenWebRX+/csdr-skimmer and sdrainer each do and
-  don't do, beside manta.
+- [docs/COMPARISON.md](docs/COMPARISON.md): neutral links to SparkSDR,
+  sdroxide, OpenWebRX+/csdr-skimmer and sdrainer — no capability claims
+  about any of them (MAN-360).
 - [coppa](https://github.com/HagaleTechnologies/coppa): `manta` reuses its
   FFT and its AWGN / Watterson HF channel models for the DSP core and test
   harness.

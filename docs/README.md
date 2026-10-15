@@ -75,7 +75,7 @@ Then:
 | [SPOT-SCHEMA.md](SPOT-SCHEMA.md) | Every field of the `:7301` JSON Lines / WebSocket spot message. |
 | [LIVE-STATE.md](LIVE-STATE.md) | The opt-in live-state stream on `[server].live_port` for dashboards: band noise floor and activity, each track's text and candidates, and why each candidate was or was not spotted. |
 | [SPEC-decode-core.md §9](SPEC-decode-core.md#9-configuration-keys) | The normative decode-core defaults and the keys that are still compile-time constants. |
-| [COMPARISON.md](COMPARISON.md) | How manta differs from CW Skimmer Server, SparkSDR, sdroxide, OpenWebRX+/csdr-skimmer and sdrainer, from each project's own documentation. |
+| [COMPARISON.md](COMPARISON.md) | Neutral links to SparkSDR, sdroxide, OpenWebRX+/csdr-skimmer and sdrainer — manta makes no capability claims about them (MAN-360). |
 
 ## Runbooks
 
