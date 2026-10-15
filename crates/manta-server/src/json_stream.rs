@@ -1384,20 +1384,25 @@ mod tests {
             shutdown,
             drain_deadline: Duration::from_secs(1),
             stream: StreamKind::Spots,
+            start_seq: None,
+            resume_limiter: IpRateLimiter::new(MAX_RESUMES_PER_IP, RESUME_RATE_WINDOW),
         };
-        let spot = JsonItem::Spot(crate::bus::BusSpot {
-            spot: Spot {
-                callsign: "QQ9ZZZ".to_string(),
-                freq_hz: 14_025_000.0,
-                snr_db: 20.0,
-                wpm: 25.0,
-                spot_type: SpotType::Cq,
-                confidence: 0.9,
-                track_id: 1,
-                sample_ts: 0,
+        let spot = JsonItem::Spot {
+            seq: 1,
+            spot: crate::bus::BusSpot {
+                spot: Spot {
+                    callsign: "QQ9ZZZ".to_string(),
+                    freq_hz: 14_025_000.0,
+                    snr_db: 20.0,
+                    wpm: 25.0,
+                    spot_type: SpotType::Cq,
+                    confidence: 0.9,
+                    track_id: 1,
+                    sample_ts: 0,
+                },
+                occurrence_count: 1,
             },
-            occurrence_count: 1,
-        });
+        };
         let render = |ctx: &ClientCtx| -> serde_json::Value {
             serde_json::from_str(&ctx.render(&spot)).expect("render emits JSON")
         };
