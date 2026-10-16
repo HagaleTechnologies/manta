@@ -1323,7 +1323,8 @@ TrackClosed    { track_id, closure: SignalEnded
                      evidence moves to `s` and is judged at `s`'s own
                      close.
                    Bookkeeping { survivor_track_id: None } — `Evicted`,
-                     `Silent`, `Rtty`, or a source discontinuity (MAN-73):
+                     `Silent`, `Rtty`, or a source discontinuity (MAN-73),
+                     including a stop while the source is down (MAN-258):
                      tracking stopped with no successor; deferred evidence
                      is discarded and counted.
                  Missing in JSON, `closure` defaults to `SignalEnded`.)
@@ -1373,7 +1374,9 @@ inside the decode path. A live source's disconnect/reconnect (MAN-73) reports
 the missed span, in samples, via `IqSource::take_discontinuity()`; `listen()`
 advances the sample clock by that count and starts a fresh track segment, so
 `sample_ts` stays monotonic and wall-clock-true across the gap with no audio
-spliced in. File replay never reports a discontinuity.
+spliced in. File replay never reports a discontinuity. An end of stream
+reported with a discontinuity pending (MAN-258: a stop while the source is
+down) closes the segment the same way and starts none.
 
 ---
 

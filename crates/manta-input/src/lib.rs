@@ -171,6 +171,9 @@ pub trait IqSource {
     /// zero-filled outage past ~2.5s pins `manta-dsp::floor`'s 25th-
     /// percentile noise floor at -140 dBFS and floods false tracks on
     /// resume (measured; see docs/DECISIONS/2026-10-05-man73-source-reconnect.md).
+    /// A `read()` that returns 0 may leave a gap pending too (MAN-258): the
+    /// stream ended during an outage, and `listen` then closes its tracks
+    /// with `finish_for_discontinuity` rather than as an end of signal.
     fn take_discontinuity(&mut self) -> Option<u64> {
         None
     }
