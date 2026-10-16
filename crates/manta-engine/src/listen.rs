@@ -1208,6 +1208,11 @@ pub(crate) fn run_input_front(
         }
         let n = src.read(&mut calib[filled..])?;
         if n == 0 {
+            // MAN-252, as `listen_with_observers`: an EOF returned because
+            // `stop` was set mid-outage is the stop, not a failed input.
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             anyhow::bail!("audio source ended during startup calibration");
         }
         if let Some(gap) = src.take_discontinuity() {
@@ -3649,6 +3654,69 @@ mod tests {
     #[test]
     fn listen_still_fails_when_a_source_ends_during_calibration_unasked() {
         let (result, _counts) = run_ending_during_calibration(false);
+        let err = result.expect_err("an unasked EOF during calibration is an error");
+        assert!(
+            err.to_string()
+                .contains("audio source ended during startup calibration"),
+            "got: {err}"
+        );
+    }
+
+    /// MAN-13: one input's front end against `EndsDuringCalibrationSource`,
+    /// returning its result and every batch's track count.
+    fn run_front_ending_during_calibration(stops_at_eof: bool) -> (Result<()>, Vec<usize>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut src = EndsDuringCalibrationSource {
+            stop: stop.clone(),
+            stops_at_eof,
+            reads: 0,
+        };
+        let observers = FrontObservers {
+            active_tracks: None,
+            static_crashes: None,
+            bad_samples: None,
+            rtty: None,
+            decode_latency: None,
+            decode_quality: None,
+            live_ids: false,
+            input: 0,
+        };
+        let mut counts = Vec::new();
+        let result = run_input_front(
+            &mut src,
+            &PipelineConfig::default(),
+            &stop,
+            crate::multi::SourceClock::IDENTITY,
+            crate::multi::TrackIdSpace::SINGLE,
+            1.0,
+            &observers,
+            &mut |b| {
+                counts.push(b.n_tracks);
+                true
+            },
+        );
+        (result, counts)
+    }
+
+    /// MAN-13, as MAN-252 on the one-input path: an input's front end that
+    /// reads the stop-mid-outage EOF during calibration returns `Ok`, the
+    /// result `listen_inputs` reports as that input's end, after sending
+    /// its closing batch.
+    #[test]
+    fn input_front_treats_eof_after_a_stop_request_during_calibration_as_a_clean_end() {
+        let (result, counts) = run_front_ending_during_calibration(true);
+        result.expect("an EOF that follows a stop request is a clean shutdown, not an error");
+        assert_eq!(
+            counts.last().copied(),
+            Some(0),
+            "the stopped input must still send its closing batch, got {counts:?}"
+        );
+    }
+
+    /// The control: an unasked EOF during calibration still fails the input.
+    #[test]
+    fn input_front_still_fails_when_a_source_ends_during_calibration_unasked() {
+        let (result, _counts) = run_front_ending_during_calibration(false);
         let err = result.expect_err("an unasked EOF during calibration is an error");
         assert!(
             err.to_string()
