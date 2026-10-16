@@ -45,7 +45,7 @@ LOADER = ("./manta: error while loading shared libraries: libSoapySDR.so.0.8: "
           "cannot open shared object file: No such file or directory")
 
 
-def fake_manta(version="manta 0.1.0 (git 0123456789ab; features: hpsdr,soapy)", help_text=HELP,
+def fake_manta(version="manta 0.1.0 (git 0123456789ab; features: soapy)", help_text=HELP,
                driver=(NO_MATCH, 1), devices=(json.dumps(OK_DEVICES), 0), version_sleep=0,
                loader=None):
     """A POSIX sh stand-in for the release binary. `loader` makes every call fail as the
@@ -125,7 +125,7 @@ class VerifierTests(unittest.TestCase):
     def test_a_complete_archive_passes_every_check(self):
         proc = verify(build_archive(self.tmp, fake_manta()))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("OK: manta 0.1.0 (git 0123456789ab; features: hpsdr,soapy)", proc.stdout)
+        self.assertIn("OK: manta 0.1.0 (git 0123456789ab; features: soapy)", proc.stdout)
         self.assertIn("OK: nonexistent driver: exit 1, SoapySDR::Device::make() no match", proc.stdout)
         self.assertIn("OK: devices --json: Soapy enumeration ok, 0 device(s)", proc.stdout)
 
@@ -148,7 +148,7 @@ class VerifierTests(unittest.TestCase):
                                   f"man/man1/{page}")
 
     def test_default_build_man_pages_fail(self):
-        # validate-tag's hpsdr-only pages: right names, no Soapy flags.
+        # validate-tag's default-build pages: right names, no Soapy flags.
         pages = dict(PAGES, **{"manta-check.1": ".TH manta-check 1\n\\fB\\-\\-hpsdr\\-host\\fR\n"})
         self.assert_fails(verify(build_archive(self.tmp, fake_manta(), pages=pages)),
                           "man/man1/manta-check.1 does not document --soapy-driver")
@@ -358,7 +358,7 @@ class WorkflowWiringTests(unittest.TestCase):
         for name in RELEASE_WORKFLOWS:
             with self.subTest(workflow=name):
                 bodies = [executable(wf.run_body(s)) for s in build_soapy_steps(name)]
-                self.assertIn("cargo test --release --locked -p manta-input --features hpsdr,soapy "
+                self.assertIn("cargo test --release --locked -p manta-input --features soapy "
                               "--lib soapy::tests", [b.strip() for b in bodies])
 
     def test_verifier_runs_the_extracted_archive_not_the_build_tree(self):

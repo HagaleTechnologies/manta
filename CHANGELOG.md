@@ -136,6 +136,9 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- HPSDR network-radio input and its hardware-free tests are included in
+  every build. The `hpsdr` Cargo feature remains an accepted no-op for
+  compatibility; SoapySDR still needs `--features soapy` (MAN-239).
 - MAN-235: a `manta doctor` run shorter than 60 s that reads
   `WEAK_NO_DECODE` adds a `hint:` line suggesting `--duration 60`.
 - The in-repo `wiki/` is the project's canonical wiki. GitHub's Wiki tab

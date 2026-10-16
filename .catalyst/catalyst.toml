@@ -5,7 +5,7 @@ linear_team = "MAN"
 
 # Mirrors .github/workflows/ci-full.yml and rust-toolchain.toml. CI builds and
 # tests with no environment variables, so none are declared. The soapy feature
-# leg (extra SDR system packages) is not part of verify; hpsdr needs none.
+# leg (extra SDR system packages) is not part of verify; HPSDR runs in the default gate.
 
 [[environment.toolchains]]
 name = "rust"
@@ -35,16 +35,6 @@ timeout_seconds = 300
 [[environment.verify]]
 name = "clippy"
 run = ["cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"]
-timeout_seconds = 3000
-
-[[environment.verify]]
-name = "clippy-hpsdr"
-run = ["cargo", "clippy", "-p", "manta-input", "-p", "manta-cli", "--all-targets", "--features", "hpsdr", "--locked", "--", "-D", "warnings"]
-timeout_seconds = 3000
-
-[[environment.verify]]
-name = "test-hpsdr"
-run = ["cargo", "test", "-p", "manta-input", "-p", "manta-cli", "--features", "hpsdr", "--locked"]
 timeout_seconds = 3000
 
 [[environment.verify]]

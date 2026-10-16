@@ -316,7 +316,7 @@ jobs:
         # rejected outright for the workflow_dispatch endpoint regardless -- there is no
         # credential available to make this call for a Dependabot PR. ci-full.yml's own
         # `pull_request` trigger (scoped to `github.actor == 'dependabot[bot]'`, see that
-        # file's header) runs test/test-soapy/test-hpsdr natively for this case instead, with
+        # file's header) runs test/test-soapy natively for this case instead, with
         # no dispatch or PAT needed at all -- the check-run this job already created above
         # (conclusion=success) is a compatibility artifact only; the REAL required checks
         # ("test (ubuntu-latest)"/"test (macos-latest)"/"test (windows-latest)") come from

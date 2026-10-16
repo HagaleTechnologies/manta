@@ -14,7 +14,6 @@
 //! malformed datagram is not a timeout, so a drip of one garbage datagram
 //! every 100 ms keeps the daemon alive for tens of minutes -- orders of
 //! magnitude more headroom than this test needs.
-#![cfg(feature = "hpsdr")]
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};

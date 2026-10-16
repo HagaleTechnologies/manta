@@ -111,9 +111,9 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
   8-bit), Airspy HF+ (768 kS/s, the reference device), SDRplay. Runtime device
   selection by driver string. Feature-gating keeps the core buildable without the
   native SoapySDR library (CI, contributors without hardware).
-- **OpenHPSDR/Hermes** (Protocol 1 "Metis" over UDP, feature-gated `hpsdr`):
+- **OpenHPSDR/Hermes** (Protocol 1 "Metis" over UDP, in every build):
   Hermes-Lite 2 and Pavel Demin's Red Pitaya and QMTech images. Pure UDP/std with
-  no native-library dependency; the gate mirrors `soapy`. The wire facts are
+  no native-library dependency. The wire facts are
   spike-pinned (`docs/DECISIONS/2026-09-02-hpsdr-hermes-protocol-spike.md`), not yet
   confirmed against live hardware.
 - **ka9q-radio (radiod) channel** (RTP over UDP multicast, no feature gate):

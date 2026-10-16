@@ -135,7 +135,6 @@ class DenyPolicyTests(unittest.TestCase):
 
 SHA = "cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d"
 CHECKS = ("test (ubuntu-latest)", "test (macos-latest)", "test (windows-latest)")
-LEGS = CHECKS + ("test-hpsdr (ubuntu-latest)", "test-hpsdr (macos-latest)", "test-hpsdr (windows-latest)")
 
 
 def run(number=1, status="completed", conclusion="success"):
@@ -144,9 +143,9 @@ def run(number=1, status="completed", conclusion="success"):
 
 
 def jobs(**overrides):
-    out = [{"name": n, "conclusion": overrides.get(n, "success")} for n in LEGS]
-    out += [{"name": "test-soapy (ubuntu-latest)", "conclusion": "success"},
-            {"name": "Create required test check-runs on the reviewed SHA", "conclusion": "skipped"}]
+    out = [{"name": n, "conclusion": overrides.get(n, "success")}
+           for n in CHECKS + ("test-soapy (ubuntu-latest)",)]
+    out += [{"name": "Create required test check-runs on the reviewed SHA", "conclusion": "skipped"}]
     return [j for j in out if j["conclusion"] != "absent"]
 
 
@@ -205,7 +204,7 @@ class WindowsVisibilityTests(unittest.TestCase):
 
 
 class ReleaseCiVerdictTests(unittest.TestCase):
-    def test_green_run_passes(self):
+    def test_green_default_jobs_pass_without_hpsdr_jobs(self):
         ok, msg = release_ci.verdict(SHA, [run()], jobs())
         self.assertTrue(ok, msg)
         self.assertTrue(msg.startswith("OK: "))
@@ -216,11 +215,11 @@ class ReleaseCiVerdictTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("test (windows-latest)=failure", msg)
 
-    def test_hpsdr_windows_failure_is_refused(self):  # the cb4fff9 shape
+    def test_surviving_soapy_job_failure_is_refused(self):
         ok, msg = release_ci.verdict(SHA, [run(conclusion="failure")],
-                                     jobs(**{"test-hpsdr (windows-latest)": "failure"}))
+                                     jobs(**{"test-soapy (ubuntu-latest)": "failure"}))
         self.assertFalse(ok)
-        self.assertIn("test-hpsdr (windows-latest)=failure", msg)
+        self.assertIn("test-soapy (ubuntu-latest)=failure", msg)
 
     def test_unfinished_run_is_refused(self):
         ok, msg = release_ci.verdict(SHA, [run(status="in_progress", conclusion=None)], [])

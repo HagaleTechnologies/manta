@@ -118,8 +118,7 @@ fn every_doc_states_the_real_crate_count() {
 // ---- Scenario 2: the Inputs table lists every shipped input ----
 
 /// Every input the CLI can be built with needs a row. HPSDR/Hermes shipped
-/// (crates/manta-input/src/hpsdr.rs, feature `hpsdr`, which the README's
-/// install line turns on) and had no row at all.
+/// (crates/manta-input/src/hpsdr.rs) and had no row at all.
 #[test]
 fn readme_inputs_table_covers_every_shipped_input() {
     let readme = doc("README.md");
@@ -287,7 +286,7 @@ fn readme_installation_documents_the_soapy_archive() {
         "soapysdr0.8-module-airspy",
         "soapysdr0.8-module-hackrf",
         "releases/latest/download/manta-linux-x86_64-soapy.tar.gz",
-        "features: hpsdr,soapy",
+        "features: soapy",
         "libSoapySDR.so.0.8: cannot open shared object file",
         "SoapySDR::Device::make() no match",
         "unexpected argument '--soapy-driver'",
@@ -437,29 +436,6 @@ fn fenced_commands(md: &str) -> Vec<String> {
         out.push(pending);
     }
     out
-}
-
-/// Every documented way of building the CLI must produce the same binary the
-/// rest of the README describes. `manta-cli` declares no default features and
-/// gates `--hpsdr-host` behind `hpsdr`, so a build command without
-/// `--features hpsdr` yields a binary that rejects the input flag the
-/// Installation notes and the Inputs table both advertise.
-#[test]
-fn readme_build_commands_keep_the_hpsdr_feature() {
-    let readme = doc("README.md");
-    for line in readme.lines() {
-        if !line.contains("manta-cli") {
-            continue;
-        }
-        if !(line.contains("cargo build") || line.contains("cargo install")) {
-            continue;
-        }
-        assert!(
-            line.contains("--features hpsdr"),
-            "README builds manta-cli without `--features hpsdr`, so the binary has no \
-             `--hpsdr-host` flag: {line}"
-        );
-    }
 }
 
 /// The Kiwi prose tells the reader to substitute the receiver's hostname

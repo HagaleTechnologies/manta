@@ -501,9 +501,12 @@ class ManPagesJobTests(unittest.TestCase):
     checks; `build` needs only validate-tag (scripts/tests/release-version.test.sh)."""
 
     def features_of(self, body):
-        m = re.search(r"--features (\S+)", body)
-        self.assertIsNotNone(m, f"no --features in:\n{body}")
-        return m.group(1)
+        if not re.search(r"(?<!\S)--features(?:[=\s]|$)", body):
+            return frozenset()
+        m = re.search(r"(?<!\S)--features(?:=|\s+)"
+                      r"([A-Za-z0-9_][A-Za-z0-9_-]*(?:,[A-Za-z0-9_][A-Za-z0-9_-]*)*)(?=\s|$)", body)
+        self.assertIsNotNone(m, f"invalid --features in:\n{body}")
+        return frozenset(m.group(1).split(","))
 
     def test_man_pages_job_renders_once_natively(self):
         for name in RELEASE_WORKFLOWS:
@@ -522,7 +525,7 @@ class ManPagesJobTests(unittest.TestCase):
                 build = [i for i, s in enumerate(steps)
                          if "cargo build --release -p manta-cli" in executable(wf.run_body(s))]
                 self.assertEqual(len(build), 1, "expected exactly one host build step")
-                self.assertRegex(executable(wf.run_body(steps[build[0]])), r"--features \S+")
+                self.assertEqual(self.features_of(executable(wf.run_body(steps[build[0]]))), frozenset())
                 checks = [i for i, s in enumerate(steps)
                           if re.search(r"release-version\.sh|check-release-ancestry\.sh",
                                        executable(wf.run_body(s)))]
@@ -550,6 +553,7 @@ class ManPagesJobTests(unittest.TestCase):
                         if "cargo build --release -p manta-cli" in b}
                 self.assertEqual(len(want), 1, f"validate-tag builds with several feature sets: {want}")
                 want = next(iter(want))
+                self.assertEqual(want, frozenset())
                 build = wf.job_block(wf.read(name), "build")
                 checked = 0
                 for step in wf.steps(build):
@@ -578,7 +582,7 @@ class ManPagesJobTests(unittest.TestCase):
                 self.assertIn("--man-dir man-pages", executable(wf.run_body(steps[pkg[0]])))
 
     def test_build_soapy_renders_man_pages_from_the_binary_it_packages(self):
-        # MAN-82: validate-tag's pages describe the hpsdr-only binary; the Soapy archive's
+        # MAN-82: validate-tag's pages describe the default binary; the Soapy archive's
         # pages must come from its own executable, after its build and before Package.
         for name in RELEASE_WORKFLOWS:
             with self.subTest(workflow=name):
@@ -591,7 +595,7 @@ class ManPagesJobTests(unittest.TestCase):
                 self.assertEqual((len(build), len(man), len(pkg)), (1, 1, 1))
                 self.assertLess(build[0], man[0])
                 self.assertLess(man[0], pkg[0])
-                self.assertEqual(self.features_of(bodies[build[0]]), "hpsdr,soapy")
+                self.assertEqual(self.features_of(bodies[build[0]]), frozenset({"soapy"}))
                 self.assertIn(f"--target {SOAPY_ENTRY['target']}", bodies[build[0]])
                 self.assertIn(f"--man-dir {SOAPY_MAN_DIR}", bodies[pkg[0]])
                 self.assertIn(f'--binary "target/{SOAPY_ENTRY["target"]}/release/${{BIN_NAME}}"',
@@ -630,12 +634,12 @@ class BuildSoapyJobTests(unittest.TestCase):
                 for key in ("if", "environment", "permissions", "continue-on-error", "strategy"):
                     self.assertIsNone(wf.field(job, key), f"{SOAPY_JOB} must not set {key}:")
 
-    def test_job_builds_with_both_features_from_the_lockfile(self):
+    def test_job_builds_with_soapy_from_the_lockfile(self):
         for name in RELEASE_WORKFLOWS:
             with self.subTest(workflow=name):
                 bodies = [executable(wf.run_body(s)).strip() for s in wf.steps(self.job(name))]
                 builds = [b for b in bodies if "cargo build" in b or "cross build" in b]
-                self.assertEqual(builds, ["cargo build --release --locked -p manta-cli --features hpsdr,soapy "
+                self.assertEqual(builds, ["cargo build --release --locked -p manta-cli --features soapy "
                                           f"--target {SOAPY_ENTRY['target']}"])
 
     def test_job_installs_link_dependencies_without_recommends(self):
@@ -666,7 +670,7 @@ class BuildSoapyJobTests(unittest.TestCase):
                 self.assertEqual({e["artifact"] for e in matrix_include(text)}, DEFAULT_ARTIFACTS)
                 for step in wf.steps(wf.job_block(text, "build")):
                     if wf.field(step, "name") in ("Build (native)", "Build (cross)"):
-                        self.assertRegex(executable(wf.run_body(step)), r"--features hpsdr(\s|$)")
+                        self.assertNotIn("--features", executable(wf.run_body(step)))
 
 
 class CiFullTests(unittest.TestCase):

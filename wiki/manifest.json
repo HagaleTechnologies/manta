@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-15T01:55:00Z",
-  "head_commit": "3805f78",
+  "generated_at": "2026-10-16T03:08:15Z",
+  "head_commit": "a7ae6c29391e96c8b5e84972001b420c41cd1eac",
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -359,7 +359,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:a9ea021f5b989a216ee38a3fbbeb7dcd0ba26c64a315133d7caa66ea9ae7cd17",
+      "hash": "sha256:2dbc4665305d99e10da73523944db00ec51d4cfd84997861522caef2e88e48cf",
       "id": "windows-build-setup",
       "kind": "howto",
       "links": [
@@ -372,14 +372,17 @@
         ".github/workflows/ci-full.yml",
         ".github/workflows/release.yml",
         ".github/workflows/release-publish.yml",
+        "CONTRIBUTING.md",
+        "scripts/check-release-ci.py",
+        "scripts/check-soapy-release.py",
         "docs/superpowers/specs/2026-09-11-man212-windows-platform-support-design.md",
         "docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md",
         "docs/DECISIONS/2026-10-15-man371-windows-required-check.md"
       ],
       "status": "current",
       "title": "How do I build and test manta on Windows?",
-      "verified_commit": "3805f78",
-      "verified_date": "2026-10-15",
+      "verified_commit": "a7ae6c29391e96c8b5e84972001b420c41cd1eac",
+      "verified_date": "2026-10-16",
       "visibility": "public"
     }
   ],

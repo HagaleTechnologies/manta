@@ -20,7 +20,7 @@ REPO = "HagaleTechnologies/manta"
 TRUSTED = {"thagale", "catalyst-cloud-connector[bot]"}
 DISPATCH_CALL = "actions/workflows/ci-full.yml/dispatches"
 BLOCK_SCALARS = {"|", "|-", "|+", ">", ">-", ">+"}
-CI_TEST_JOBS = ("test", "test-soapy", "test-hpsdr")
+CI_TEST_JOBS = ("test", "test-soapy")
 SAVE_IF = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
 NATIVE_IF = ("github.event_name != 'pull_request' || github.actor == 'dependabot[bot]' || "
              "github.event.pull_request.head.repo.full_name != github.repository || "
@@ -347,7 +347,7 @@ CACHE_MARKERS = ("actions/cache@", "cache-from:", "cache-to:", "sccache")
 class CiFullCacheTests(unittest.TestCase):
     def test_rust_cache_saves_only_on_push_to_main(self):
         found = rust_cache_steps(read("ci-full.yml"))
-        self.assertEqual(len(found), 3, "expected exactly three rust-cache steps in ci-full.yml")
+        self.assertEqual(len(found), 2, "expected exactly two rust-cache steps in ci-full.yml")
         for job, step in found:
             with self.subTest(job=job):
                 with_block = sub(step, "with")
@@ -370,6 +370,19 @@ class CiFullCacheTests(unittest.TestCase):
 class CiFullNativePathTests(unittest.TestCase):
     def setUp(self):
         self.text = read("ci-full.yml")
+
+    def test_hpsdr_coverage_moves_to_default_ci_and_catalyst_together(self):
+        self.assertEqual(tuple(j for j in job_ids(self.text) if j.startswith("test")), CI_TEST_JOBS)
+        # This suite also runs on macOS; do not require Python 3.11's tomllib.
+        with open(os.path.join(ROOT, ".catalyst", "catalyst.toml"), encoding="utf-8") as f:
+            config = f.read()
+        names = set(re.findall(r'^name = "([^"\n]+)"$', config, re.M))
+        self.assertFalse({"clippy-hpsdr", "test-hpsdr"} & names)
+        command = re.search(r'^name = "test-workspace"\nrun = (\[[^\n]*\])$', config, re.M)
+        self.assertIsNotNone(command, "Catalyst must retain the workspace test gate")
+        self.assertEqual(json.loads(command.group(1)), ["cargo", "test", "--workspace", "--locked"])
+        self.assertTrue(any((run_body(s) or "").strip() == "cargo test --workspace --locked"
+                            for s in steps(job_block(self.text, "test"))))
 
     def test_test_jobs_run_natively_for_non_dispatch_eligible_prs(self):
         for job in CI_TEST_JOBS:
