@@ -484,7 +484,9 @@ fn emit(
 /// onto post-outage audio or zero-filling the gap (zero-fill pins the
 /// noise floor and floods false tracks on resume -- see
 /// `IqSource::take_discontinuity`'s doc comment). File replay never
-/// reports a discontinuity, so this is a no-op there.
+/// reports a discontinuity, so this is a no-op there. An end of stream
+/// reported with a gap pending (MAN-258: a stop while the source was down)
+/// closes the segment the same way and starts no new one.
 ///
 /// Unchanged entry point: `listen_with_observers` with no observers. Kept so
 /// MAN-45's engine addition costs its four existing call sites nothing.
@@ -872,7 +874,13 @@ pub fn listen_with_observers(
     if let Some(obs) = lifecycle {
         obs.observe_peak(seg.tm.active_track_count());
     }
-    let events = seg.tm.finish();
+    // MAN-258: an end of stream with an outage pending (a stop while a live
+    // source was down) is not an end of signal either.
+    let events = if src.take_discontinuity().is_some() {
+        seg.tm.finish_for_discontinuity()
+    } else {
+        seg.tm.finish()
+    };
     emit(
         events,
         &mut validator,
@@ -1800,6 +1808,116 @@ mod tests {
                     survivor_track_id: None
                 }),
             "a discontinuity must close tracks as Bookkeeping, not SignalEnded: {closed_at_gap:?}"
+        );
+    }
+
+    /// Serves `samples`, then ends the stream (`Ok(0)`). With `gap_at_end`
+    /// set, that last read leaves a gap pending, as a `ReconnectingSource`
+    /// stopped mid-outage does (MAN-258); without it, a plain end of stream.
+    struct EndsWithGapSource {
+        samples: Vec<Complex32>,
+        cursor: usize,
+        fs: f64,
+        center_freq_hz: f64,
+        gap_at_end: Option<u64>,
+        pending_gap: Option<u64>,
+        /// Set by the read that returns 0, so a test can tell the
+        /// teardown's events from those before it.
+        ended: Arc<AtomicBool>,
+    }
+
+    impl manta_input::IqSource for EndsWithGapSource {
+        fn sample_rate(&self) -> f64 {
+            self.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.center_freq_hz
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            if self.cursor == self.samples.len() {
+                self.pending_gap = self.gap_at_end.take();
+                self.ended.store(true, Ordering::Relaxed);
+                return Ok(0);
+            }
+            let n = buf.len().min(self.samples.len() - self.cursor);
+            buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
+            self.cursor += n;
+            Ok(n)
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            self.pending_gap.take()
+        }
+    }
+
+    /// The closures `listen()` emits at the end of 12 s of V1's CQ, which
+    /// is mid-transmission there, ended with `gap_at_end` pending.
+    fn closures_at_end_of_stream(
+        gap_at_end: Option<u64>,
+    ) -> Vec<(u32, manta_decode::events::ClosureKind)> {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let ended = Arc::new(AtomicBool::new(false));
+        let src = EndsWithGapSource {
+            samples: rendered.samples[..(spec.fs * 12.0) as usize].to_vec(),
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+            gap_at_end,
+            pending_gap: None,
+            ended: ended.clone(),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut spots = Vec::new();
+        let mut closed: Vec<(u32, manta_decode::events::ClosureKind)> = Vec::new();
+        manta_engine_listen_with_discontinuity_probe(Box::new(src), &stop, &mut spots, |ev| {
+            if let DecoderEvent::TrackClosed { track_id, closure } = ev {
+                if ended.load(Ordering::Relaxed) {
+                    closed.push((*track_id, *closure));
+                }
+            }
+        })
+        .unwrap();
+        closed
+    }
+
+    /// MAN-258: an end of stream reported with a gap pending -- a live
+    /// source stopped while it was down -- closes the open tracks with the
+    /// outage teardown, as a mid-stream discontinuity does, not as
+    /// `SignalEnded`.
+    #[test]
+    fn an_eof_with_a_pending_gap_closes_tracks_as_bookkeeping() {
+        use manta_decode::events::ClosureKind;
+
+        let closed = closures_at_end_of_stream(Some(48_000));
+        assert!(
+            !closed.is_empty(),
+            "test setup: a track must still be open at the end of stream"
+        );
+        assert!(
+            closed.iter().all(|(_, closure)| *closure
+                == ClosureKind::Bookkeeping {
+                    survivor_track_id: None
+                }),
+            "an end of stream with a gap pending must close tracks as Bookkeeping: {closed:?}"
+        );
+    }
+
+    /// The control for the test above: with no gap pending, an end of
+    /// stream is still an end of signal.
+    #[test]
+    fn a_plain_eof_still_closes_tracks_as_signal_ended() {
+        use manta_decode::events::ClosureKind;
+
+        let closed = closures_at_end_of_stream(None);
+        assert!(
+            !closed.is_empty(),
+            "test setup: a track must still be open at the end of stream"
+        );
+        assert!(
+            closed
+                .iter()
+                .all(|(_, closure)| *closure == ClosureKind::SignalEnded),
+            "a plain end of stream must close tracks as SignalEnded: {closed:?}"
         );
     }
 
