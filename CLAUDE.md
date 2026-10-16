@@ -339,6 +339,16 @@ report line and `manta_input_bad_samples_total{source}`; `manta check`
 still errors on non-finite input. See
 docs/DECISIONS/2026-10-15-man234-bad-input-samples.md.
 
+MAN-233: a SoapySDR driver stream overflow returned as a read error
+counts one `manta_input_gaps_detected_total{source="soapy"}` gap event
+(present at 0 from the first scrape; `dropped_packets`/`malformed_packets`
+stay 0) and warns rate-limited (fixed 60 s, `with_overflow_notice`); an
+overflow flagged `SOAPY_SDR_END_ABRUPT` on a successful read is not seen
+(soapysdr 0.5.1 hides read flags); `Timeout` counts nothing and the retry
+bounds are unchanged. The `soapy`-gated lines
+compile and test only in CI's `test-soapy` leg. See
+docs/DECISIONS/2026-10-15-man233-soapy-overflow-visibility.md.
+
 MAN-82: releases add `manta-linux-x86_64-soapy.tar.gz` (`build-soapy`,
 `hpsdr,soapy`, Ubuntu 24.04 x86_64, libSoapySDR linked dynamically, own
 man pages, checked by `scripts/check-soapy-release.py` before upload); the

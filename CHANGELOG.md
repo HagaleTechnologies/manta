@@ -142,11 +142,21 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-254: `manta soak --help` says the run lasts the full `--duration`
+  even when a `--source` recording ends sooner, instead of repeating
+  `run`'s promise that a replay finishes early. Soak's behaviour is unchanged.
 - MAN-235: a `manta doctor` run shorter than 60 s that reads
   `WEAK_NO_DECODE` adds a `hint:` line suggesting `--duration 60`.
 - The in-repo `wiki/` is the project's canonical wiki. GitHub's Wiki tab
   is not used; disabling it remains an owner step. The wiki's stale
   `verified` stamps and `manifest.json` are refreshed and CI-pinned (MAN-152).
+
+### Fixed
+
+- `manta run` stopped while waiting to reconnect to a lost receiver no
+  longer force-decodes the open tracks' last element or judges their
+  pending beacons as if the signal had ended; they close as an outage
+  (MAN-258).
 
 ## [0.1.0] - 2026-10-11
 
