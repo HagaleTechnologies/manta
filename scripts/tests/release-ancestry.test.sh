@@ -123,28 +123,27 @@ job_block() {
 require() { # text, fixed expected line, label
   if ! grep -Fxq -- "$2" <<< "$1"; then fail "$3"; fi
 }
-for wf in release-publish.yml; do
-  path="$REPO_ROOT/.github/workflows/$wf"
-  gate="$(job_block "$path" validate-tag)"
-  build="$(job_block "$path" build)"
-  require "$build" '    needs: validate-tag' "$wf: platform builds bypass validation"
-  # MAN-82: the Soapy archive is a release build too.
-  require "$(job_block "$path" build-soapy)" '    needs: validate-tag' "$wf: Soapy build bypasses validation"
-  if grep -Eq '^    (if|environment):|continue-on-error:|\|\| true' <<< "$gate"; then
-    fail "$wf: validation is skipped, environment-gated or ignores errors"
-  fi
-  require "$gate" '          fetch-depth: 0' "$wf: validation needs full history"
-  step="$(awk '
-    /      - name: Require release commit on the default branch/ { found = 1; print; next }
-    found && /^      - / { exit }
-    found { print }
-  ' <<< "$gate")"
-  require "$step" "        if: github.event_name == 'push'" "$wf: ancestry is not push-only"
-  require "$step" '        shell: bash' "$wf: ancestry needs bash"
-  require "$step" "          RELEASE_COMMIT: \${{ github.sha }}" "$wf: missing immutable event SHA"
-  require "$step" "          DEFAULT_BRANCH: \${{ github.event.repository.default_branch }}" "$wf: missing event default branch"
-  require "$step" "        run: scripts/check-release-ancestry.sh \"\$RELEASE_COMMIT\" \"\$DEFAULT_BRANCH\"" "$wf: helper not invoked"
-done
+wf=release-publish.yml
+path="$REPO_ROOT/.github/workflows/$wf"
+gate="$(job_block "$path" validate-tag)"
+build="$(job_block "$path" build)"
+require "$build" '    needs: validate-tag' "$wf: platform builds bypass validation"
+# MAN-82: the Soapy archive is a release build too.
+require "$(job_block "$path" build-soapy)" '    needs: validate-tag' "$wf: Soapy build bypasses validation"
+if grep -Eq '^    (if|environment):|continue-on-error:|\|\| true' <<< "$gate"; then
+  fail "$wf: validation is skipped, environment-gated or ignores errors"
+fi
+require "$gate" '          fetch-depth: 0' "$wf: validation needs full history"
+step="$(awk '
+  /      - name: Require release commit on the default branch/ { found = 1; print; next }
+  found && /^      - / { exit }
+  found { print }
+' <<< "$gate")"
+require "$step" "        if: github.event_name == 'push'" "$wf: ancestry is not push-only"
+require "$step" '        shell: bash' "$wf: ancestry needs bash"
+require "$step" "          RELEASE_COMMIT: \${{ github.sha }}" "$wf: missing immutable event SHA"
+require "$step" "          DEFAULT_BRANCH: \${{ github.event.repository.default_branch }}" "$wf: missing event default branch"
+require "$step" "        run: scripts/check-release-ancestry.sh \"\$RELEASE_COMMIT\" \"\$DEFAULT_BRANCH\"" "$wf: helper not invoked"
 
 publish_path="$REPO_ROOT/.github/workflows/release-publish.yml"
 dispatch="$(job_block "$publish_path" docker-build-dispatch)"
