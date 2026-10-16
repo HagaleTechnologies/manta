@@ -1,12 +1,13 @@
 //! Helpers shared by the tests that drive a real `manta` process and its
 //! signals (`signal_shutdown.rs`, MAN-85; `config_reload.rs`, MAN-78), and
 //! a fake KiwiSDR for live-source daemons (`config_reload.rs`;
-//! `list_refresh.rs`, MAN-316).
+//! `list_refresh.rs`, MAN-316; `signal_shutdown.rs`'s reconnect stall,
+//! MAN-252).
 // Each test binary compiles this module separately and uses only part of it.
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader, Read};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -163,6 +164,73 @@ fn serve_fake_kiwi(
 ) -> Result<(), String> {
     use tungstenite::Message;
 
+    let mut ws = accept_kiwi_session(&listener, &done)?;
+    if !stream_iq {
+        while !done.load(Ordering::Relaxed) {
+            if ws.send(Message::Ping(Default::default())).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        return Ok(());
+    }
+    send_snd_frames(&mut ws, || done.load(Ordering::Relaxed));
+    Ok(())
+}
+
+/// MAN-252: a loopback listener whose accept queue holds one connection
+/// (`listen(0)` via socket2). Once one unaccepted connection sits in it,
+/// Linux drops further SYNs, so a client's connect stalls for its whole
+/// connect timeout.
+pub fn backlog_zero_listener() -> TcpListener {
+    use socket2::{Domain, Socket, Type};
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+    socket.bind(&addr.into()).unwrap();
+    socket.listen(0).unwrap();
+    socket.into()
+}
+
+/// MAN-252: plays one KiwiSDR session -- handshake, `sample_rate`, real-time
+/// SND noise for `stream_for` -- then parks a connection in the (backlog-0)
+/// accept queue and hangs up, so the daemon's reopen stalls in TCP connect
+/// for kiwi.rs's CONNECT_TIMEOUT (10 s) on its detached connect thread: a
+/// stall SIGTERM's EINTR cannot cut short (unlike a stalled handshake read
+/// on the decode thread). Sends on `hung_up` after the hang-up; keeps the
+/// parked connection and the listener until `done`.
+pub fn fake_kiwi_then_stalled_reconnect(
+    listener: TcpListener,
+    stream_for: Duration,
+    hung_up: mpsc::Sender<()>,
+    done: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let mut ws = accept_kiwi_session(&listener, &done)?;
+    let until = Instant::now() + stream_for;
+    send_snd_frames(&mut ws, || {
+        done.load(Ordering::Relaxed) || Instant::now() >= until
+    });
+    let addr = listener.local_addr().map_err(|e| e.to_string())?;
+    let parked = TcpStream::connect(addr).map_err(|e| format!("parking a connection: {e}"))?;
+    // Unread client data in the receive buffer makes the close a reset,
+    // which the daemon reads as a lost connection at once.
+    drop(ws);
+    let _ = hung_up.send(());
+    while !done.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(parked);
+    Ok(())
+}
+
+/// Accepts manta's KiwiSDR connection and plays the handshake just far
+/// enough for `KiwiIqSource::connect` (crates/manta-input/src/kiwi.rs) to
+/// return.
+fn accept_kiwi_session(
+    listener: &TcpListener,
+    done: &AtomicBool,
+) -> Result<tungstenite::WebSocket<TcpStream>, String> {
+    use tungstenite::Message;
+
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let deadline = Instant::now() + KIWI_ACCEPT_TIMEOUT;
     let stream = loop {
@@ -187,15 +255,14 @@ fn serve_fake_kiwi(
     // 12000 Hz / 93.75 Hz per channel = 128 channels: a valid rate.
     ws.send(Message::binary(b"MSG sample_rate=12000.000".to_vec()))
         .map_err(|e| format!("sending sample_rate: {e}"))?;
-    if !stream_iq {
-        while !done.load(Ordering::Relaxed) {
-            if ws.send(Message::Ping(Default::default())).is_err() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        return Ok(());
-    }
+    Ok(ws)
+}
+
+/// Streams real-time `SND` frames of quiet noise until `stop()` or the
+/// client hangs up.
+fn send_snd_frames(ws: &mut tungstenite::WebSocket<TcpStream>, stop: impl Fn() -> bool) {
+    use tungstenite::Message;
+
     // KiwiSDR's native frame: 512 complex pairs, i.e. 1/23.4375 s at
     // 12000 Hz. Layout per kiwi.rs's module docs: flags (big-endian
     // samples), little-endian seq, S-meter, 10-byte GPS block, then I,Q.
@@ -204,7 +271,7 @@ fn serve_fake_kiwi(
     let mut rng: u32 = 0x1234_5678;
     let mut seq: u32 = 0;
     let start = Instant::now();
-    while !done.load(Ordering::Relaxed) {
+    while !stop() {
         let mut frame = Vec::with_capacity(3 + 17 + PAIRS * 4);
         frame.extend_from_slice(b"SND");
         frame.push(0x08);
@@ -227,5 +294,4 @@ fn serve_fake_kiwi(
             std::thread::sleep(wait);
         }
     }
-    Ok(())
 }

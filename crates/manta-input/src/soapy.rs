@@ -64,9 +64,10 @@ impl SoapySdrIqSource {
     /// network-backed driver (or a USB device wedged in a bad enumeration
     /// state) can hang this call for however long the native driver takes.
     /// Since `manta-cli`'s `ReconnectingSource` now calls this repeatedly,
-    /// forever, on every reconnect, such a hang would also defeat that
-    /// loop's backoff/health-reporting/Ctrl-C responsiveness for the
-    /// duration. Left as-is because the `soapy` feature cannot be built or
+    /// forever, on every reconnect, such a hang also stalls that loop's
+    /// backoff and health reporting for the duration. Since MAN-252 it
+    /// delays reconnection only, not shutdown: the reopen runs on its own
+    /// thread, which a stop request abandons. Left as-is because the `soapy` feature cannot be built or
     /// tested in this environment (no native `libsoapysdr`) and the ticket
     /// scopes Soapy as "can follow the same pattern" later, not required
     /// now -- fixing this blind, with no way to compile or test the

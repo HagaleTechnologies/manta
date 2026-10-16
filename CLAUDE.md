@@ -365,6 +365,12 @@ moved from ctrlc to signal-hook; a second SIGINT/SIGTERM (SIGHUP without
 `[server]`) exits at once with 128 + signal, skipping the drain. See
 docs/DECISIONS/2026-10-14-man232-closed-and-stalled-output.md.
 
+MAN-252: `ReconnectingSource` runs each reopen on a `reopen-<kind>`
+thread and abandons it at a stop request, so SIGTERM during a stalled
+reconnect drains clients and exits 0 at once; an EOF after a stop during
+startup calibration is a clean end. See
+docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each

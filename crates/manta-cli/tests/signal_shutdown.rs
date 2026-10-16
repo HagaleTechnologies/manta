@@ -9,7 +9,9 @@
 //! only without a `[server]` table; `config_reload.rs` pins the daemon-mode
 //! reload. MAN-232 also pins the output hazards: a closed stdout stops a
 //! command without a panic (exit 141, `run` through the drain), and a second
-//! stop signal ends a run blocked on output at once.
+//! stop signal ends a run blocked on output at once. MAN-252 pins a SIGTERM
+//! during a stalled KiwiSDR reconnect: the client drain starts without
+//! waiting for the reopen, and the process exits 0.
 #![cfg(unix)]
 
 mod common;
@@ -705,4 +707,189 @@ fn one_signal_to_a_run_blocked_on_stdout_still_drains_once_the_reader_resumes() 
     let status = wait_bounded(&mut child, EXIT_BUDGET)
         .expect("the drained run did not exit within the budget");
     assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+// --- MAN-252: a stop request during a source reconnect -----------------
+
+/// MAN-252: how long a SIGTERM during a stalled reconnect may take to start
+/// the client drain, and again to end the process. The reopen it must not
+/// wait for stalls for kiwi.rs's 10 s connect timeout (on main: client EOF
+/// at 9.52 s, exit at 9.55 s); the fixed daemon takes ~40 ms.
+#[cfg(target_os = "linux")]
+const RECONNECT_STOP_BUDGET: Duration = Duration::from_secs(3);
+
+/// Runs `manta run` against a fake KiwiSDR that streams for `stream_for`,
+/// then hangs up so the daemon's reopen stalls in TCP connect
+/// (`common::fake_kiwi_then_stalled_reconnect`), with a raw JSON-stream
+/// client connected; sends SIGTERM half a second into that reopen and
+/// asserts the drain started (client EOF) and the process exited 0 within
+/// [`RECONNECT_STOP_BUDGET`], with the attempt abandoned rather than timed
+/// out.
+#[cfg(target_os = "linux")]
+fn sigterm_during_a_stalled_kiwisdr_reconnect(stream_for: Duration) {
+    use common::{
+        backlog_zero_listener, expect_line, fake_kiwi_then_stalled_reconnect, line_channel,
+        KillOnDrop,
+    };
+    use std::net::TcpStream;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+
+    const WAIT: Duration = Duration::from_secs(60);
+
+    let dir = tempfile::tempdir().unwrap();
+    let listener = backlog_zero_listener();
+    let kiwi_port = listener.local_addr().unwrap().port();
+    let (hung_up_tx, hung_up_rx) = mpsc::channel();
+    let done = Arc::new(AtomicBool::new(false));
+    let fake = std::thread::spawn({
+        let done = done.clone();
+        move || fake_kiwi_then_stalled_reconnect(listener, stream_for, hung_up_tx, done)
+    });
+    let cfg = dir.path().join("manta.toml");
+    // Port 0 everywhere, read back from the banner (MAN-371's port race).
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"
+[server]
+station_callsign = "W3XYZ"
+bind_addr = "127.0.0.1"
+metrics_bind_addr = "127.0.0.1"
+telnet_port = 0
+json_port = 0
+metrics_port = 0
+status_interval_secs = 0
+
+[input]
+type = "kiwi"
+host = "127.0.0.1"
+port = {kiwi_port}
+freq_hz = 14025000.0
+"#
+        ),
+    )
+    .unwrap();
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_manta"))
+            .args(["run", "--config"])
+            .arg(&cfg)
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = line_channel(child.0.stderr.take().expect("stderr piped"));
+
+    let banner = expect_line(&stderr, &["listening:", "json=127.0.0.1:"], WAIT);
+    let json_port: u16 = banner
+        .split("json=127.0.0.1:")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("no JSON port in {banner:?}"));
+    let mut json = TcpStream::connect(("127.0.0.1", json_port)).unwrap();
+    let (eof_tx, eof_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut json, &mut std::io::sink());
+        let _ = eof_tx.send(Instant::now());
+    });
+
+    hung_up_rx
+        .recv_timeout(WAIT)
+        .expect("the fake KiwiSDR never hung up");
+    let lost = expect_line(&stderr, &["source kiwi lost", "reconnecting in "], WAIT);
+    let backoff_secs: u64 = lost
+        .split("reconnecting in ")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no backoff in {lost:?}"));
+    // Past the backoff, so the reopen's TCP connect is in flight (it stalls
+    // for 10 s).
+    std::thread::sleep(Duration::from_secs(backoff_secs) + Duration::from_millis(500));
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "manta exited before it was signalled"
+    );
+    assert!(
+        eof_rx.try_recv().is_err(),
+        "the JSON client was disconnected before the signal"
+    );
+
+    let sent = Instant::now();
+    assert_eq!(
+        unsafe { libc::kill(child.0.id() as i32, libc::SIGTERM) },
+        0,
+        "kill(SIGTERM) failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let eof_at = eof_rx
+        .recv_timeout(RECONNECT_STOP_BUDGET)
+        .unwrap_or_else(|_| {
+            panic!(
+                "the client drain did not start within {RECONNECT_STOP_BUDGET:?} of SIGTERM: \
+                 the stop waited for the stalled reopen"
+            )
+        });
+    let status = wait_bounded(&mut child.0, RECONNECT_STOP_BUDGET).unwrap_or_else(|| {
+        panic!("SIGTERM during a reconnect did not stop manta within {RECONNECT_STOP_BUDGET:?}")
+    });
+    let exited_after = sent.elapsed();
+    // The channel disconnects at stderr's EOF, i.e. once manta has exited.
+    let after_signal: Vec<String> = stderr.iter().collect();
+    done.store(true, Ordering::Relaxed);
+    fake.join()
+        .expect("the fake KiwiSDR panicked")
+        .expect("the fake KiwiSDR failed");
+
+    eprintln!(
+        "MAN-252: JSON client EOF {:?} and exit {:?} after SIGTERM",
+        eof_at.saturating_duration_since(sent),
+        exited_after
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "SIGTERM during a reconnect must exit 0 through the drain, got {status:?}; \
+         stderr after the signal:\n{}",
+        after_signal.join("\n")
+    );
+    assert!(
+        !after_signal
+            .iter()
+            .any(|l| l.contains("reconnect attempt failed")),
+        "the stalled attempt must be abandoned at the stop, not waited out; stderr after the \
+         signal:\n{}",
+        after_signal.join("\n")
+    );
+    assert!(
+        !after_signal
+            .iter()
+            .any(|l| l.contains("ended during startup calibration")),
+        "a stop mid-reconnect is a clean end, not a source that ended; stderr after the \
+         signal:\n{}",
+        after_signal.join("\n")
+    );
+}
+
+/// MAN-252, the ticket's scenario: SIGTERM while manta is reopening a lost
+/// KiwiSDR connection, with a client connected. The client drain must start
+/// without waiting for the reopen (on main it waited out the 10 s connect
+/// timeout: client EOF at 9.52 s, exit at 9.55 s), and the process must
+/// exit 0.
+#[cfg(target_os = "linux")]
+#[test]
+fn sigterm_during_a_stalled_kiwisdr_reconnect_drains_and_exits_promptly() {
+    sigterm_during_a_stalled_kiwisdr_reconnect(Duration::from_secs(5));
+}
+
+/// MAN-252: a source that drops before startup calibration completes and is
+/// then stopped mid-reconnect still exits 0 through the drain (on main:
+/// exit 1, `error: audio source ended during startup calibration`).
+#[cfg(target_os = "linux")]
+#[test]
+fn sigterm_during_a_kiwisdr_reconnect_before_calibration_completes_exits_zero() {
+    sigterm_during_a_stalled_kiwisdr_reconnect(Duration::from_millis(500));
 }
