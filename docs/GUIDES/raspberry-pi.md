@@ -48,13 +48,14 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 . "$HOME/.cargo/env"
 git clone https://github.com/HagaleTechnologies/manta
 cd manta
-cargo build --release -p manta-cli --features hpsdr
+cargo build --release -p manta-cli
 sudo install -m 0755 target/release/manta /usr/local/bin/manta
 manta --version
 ```
 
-The version line includes `features: hpsdr`. Keep this source checkout for the
-config and service files used below; all subsequent relative paths start here.
+The version line includes `features: none`; HPSDR is included. Keep this source
+checkout for the config and service files used below; all subsequent relative
+paths start here.
 
 Once a release exists, its `manta-linux-arm64` archive replaces the build.
 Follow [release verification](../RUNBOOKS/release.md#verifying-a-downloaded-release),
@@ -192,7 +193,7 @@ build from your updated checkout:
 
 ```sh
 sudo systemctl stop manta
-cargo build --release -p manta-cli --features hpsdr
+cargo build --release -p manta-cli
 sudo install -m 0755 target/release/manta /usr/local/bin/manta
 sudo install -m 0644 packaging/systemd/manta.service /etc/systemd/system/manta.service
 sudo systemctl daemon-reload

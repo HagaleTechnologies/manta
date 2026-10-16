@@ -22,7 +22,7 @@ name: CI
 # dispatched run executes the PR's code in main's context and Actions cache scope, so
 # wait-for-codex.yml now dispatches only a ready, in-repository PR opened by a trusted author.
 # Every other PR -- a fork head, or an author off the trusted list (Dependabot included) -- runs
-# `test`/`test-soapy`/`test-hpsdr` through this native trigger instead (MAN-245: by authorship
+# `test`/`test-soapy` through this native trigger instead (MAN-245: by authorship
 # alone; a Dependabot-authored PR runs here because its author is not on the trusted list, and a
 # Dependabot-triggered event on a trusted author's PR does not): GitHub's isolated path
 # (refs/pull/N/merge cache scope; for a fork, a read-only token, no secrets, and the
@@ -309,34 +309,6 @@ jobs:
       # --locked: see the MAN-219 note in the test job above.
       - run: cargo clippy -p manta-input -p manta-cli --all-targets --features soapy --locked -- -D warnings
       - run: cargo test -p manta-input -p manta-cli --features soapy --locked
-  # Same MAN-243 routing as `test` above -- see that job's own comment.
-  test-hpsdr:
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name != github.repository ||
-      !contains(fromJSON('["thagale","catalyst-cloud-connector[bot]"]'), github.event.pull_request.user.login)
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
-          persist-credentials: false
-      - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          components: rustfmt, clippy
-      # MAN-243: same restore-only rule as `test`'s cache step.
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.1
-        with:
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      # --locked: see the MAN-219 note in the test job above.
-      - run: cargo clippy -p manta-input -p manta-cli --all-targets --features hpsdr --locked -- -D warnings
-      - run: cargo test -p manta-input -p manta-cli --features hpsdr --locked
 
   # Relays each matrix leg's OWN real conclusion onto the corresponding explicit check-run
   # create-ci-check made on head_sha -- a job-level `needs.test.result` alone is a single

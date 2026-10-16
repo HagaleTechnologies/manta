@@ -11,7 +11,7 @@ sources:
   - crates/manta-input/src/lib.rs (IqSource::take_discontinuity)
   - docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md
 verified:
-  commit: 9f35f1a
+  commit: 9a79a72
   date: 2026-10-16
 links:
   - determinism
@@ -24,7 +24,9 @@ with no synthetic samples at all — see the decision doc for the full design an
 whole `listen()` call (instead of restarting just the segment) would back-date timestamps against
 `SpotBus`'s fixed session epoch. Gotcha: the restart closes the old tracks with
 `TrackManager::finish_for_discontinuity` (`Bookkeeping`), never `finish()` (`SignalEnded`) — the
-decision doc says why. Gotcha: a per-connection handle taken before wrapping (`health_counters()`,
+decision doc says why; a stop during an outage takes the same teardown (MAN-258): the wrapper ends
+the stream with the outage still pending, and `listen` checks for a pending gap after its loop.
+Gotcha: a per-connection handle taken before wrapping (`health_counters()`,
 `confirmed_live_handle()`-style) goes stale at the first reconnect, because every reopen builds a
 new device with fresh counters, so poll `ReconnectingSource::input_health()` (MAN-228) instead; and
 syncing counts after `read()` returns is not enough, because HPSDR counts inside a `read()` that

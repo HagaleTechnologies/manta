@@ -177,7 +177,7 @@ station_callsign = "N0CALL"
 #loop = false                        # true to replay again from the start each time it ends; implies realtime (run only)
 
 # type = "kiwi", a KiwiSDR web receiver, and type = "hpsdr", an
-# HPSDR/Hermes radio (hpsdr needs a manta built with hpsdr support):
+# HPSDR/Hermes radio (both inputs are included in every build):
 #host = "<your-receiver-host>"       # required for kiwi and hpsdr
 #port = 8073                         # default 8073 for kiwi, 1024 for hpsdr, 5004 for ka9q
 #password = ""                       # kiwi only; leave empty for public receivers

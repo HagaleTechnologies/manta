@@ -199,23 +199,19 @@ pub fn spots_per_min(delta_spots: u64, elapsed: Duration) -> f64 {
 /// periodic-task idiom (`tasks::spawn_reaper`, `rate_limit::
 /// spawn_stale_entry_reaper`): a bare sleep loop, not `tokio::time::
 /// interval` (unused anywhere in this workspace), but additionally raced
-/// against the shutdown watch so the task cannot emit a status line into
-/// the middle of the shutdown drain.
+/// against the status task's own shutdown watch for prompt termination.
 ///
-/// **The returned `JoinHandle` is part of the contract, not a convenience:
-/// a caller that signals shutdown MUST await it before it starts draining
-/// clients** (MAN-122 review round 4, P2). The two in-task guards below
-/// order shutdown against this task's own `select!` poll points, but
-/// nothing orders it against the wall clock between the post-sleep
-/// `shutdown.borrow()` returning `false` and the `tracing::info!` that
-/// follows -- a shutdown landing inside that window still yields one
-/// status line printed into the middle of the drain, claiming a liveness
-/// the daemon no longer has. Joining the handle is what makes shutdown and
-/// emission mutually ordered from the outside, and it is cheap: the
-/// `shutdown.changed()` arm is `biased`-first, so the task returns within
-/// one scheduler poll of the signal rather than at the next `interval`
-/// tick. `manta-cli`'s `main` does exactly this, via
-/// `SpotServer::status_line`.
+/// The caller must signal this dedicated stop channel and await the returned
+/// `JoinHandle` before broadcasting client shutdown (MAN-256). A join after
+/// a shared broadcast is too late: that same send already wakes the clients
+/// to drain. The in-task guards cannot close the window between the last
+/// `shutdown.borrow()` and `tracing::info!`, so the join must finish before
+/// clients receive their signal. `manta-cli` enforces this ordering through
+/// `signal_spot_server_shutdown` and `SpotServer::status_line`.
+///
+/// The `shutdown.changed()` arm is `biased`-first, so a sleeping task exits
+/// on its next scheduler poll rather than waiting for the next `interval`
+/// tick. An in-flight status line finishes before the join returns.
 pub fn spawn_status_line(
     metrics: Arc<Metrics>,
     interval: Duration,
@@ -257,18 +253,11 @@ pub fn spawn_status_line(
             // within one poll, it does not order them against the wall
             // clock. Cheap (one `watch` borrow).
             //
-            // MAN-122 review round 4 (P2): this guard narrows the window,
-            // it does NOT close it -- a shutdown signalled after this
-            // borrow reads `false` but before the `tracing::info!` at the
-            // bottom of the loop still produces one line inside the drain,
-            // and no in-task check can close that (the check and the log
-            // cannot be made atomic against an external signal). The
-            // ordering is established from the OUTSIDE instead, by the
-            // caller joining this task's `JoinHandle` immediately after
-            // sending shutdown and before starting the client drain -- see
-            // this function's doc comment and `SpotServer::status_line` in
-            // `manta-cli`. Once that join returns, this task is gone and no
-            // further line is possible.
+            // This guard narrows the check-to-log window, but a stop signal
+            // after this borrow can still allow one final line. MAN-256:
+            // the caller signals this task's own channel and joins it BEFORE
+            // broadcasting client shutdown. Joining after a shared broadcast
+            // would already have let clients start draining.
             if *shutdown.borrow() {
                 return;
             }
