@@ -9,7 +9,7 @@
 # last, would leave :latest pointing at the older image. These cases pin the
 # grammar and the recency logic the pipeline now enforces.
 #
-# bash 3.2 compatible on purpose: this runs in ci.yml's `test` job, whose
+# bash 3.2 compatible on purpose: this runs in ci-full.yml's `test` job, whose
 # matrix includes macos-latest, where /bin/bash is 3.2 (no mapfile, no
 # associative arrays, no ${x,,}).
 set -uo pipefail

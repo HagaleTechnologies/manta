@@ -27,7 +27,7 @@
 # docs/DECISIONS/2026-09-04-man36-exact-rust-toolchain-pin.md.
 [toolchain]
 channel = "1.98.0"
-# Mirrors exactly what ci.yml's toolchain step installs (`components: rustfmt,
+# Mirrors exactly what ci-full.yml's toolchain step installs (`components: rustfmt,
 # clippy`), so a fresh clone can run the same fmt/clippy gate CI runs.
 # `minimal` keeps rust-docs (which no build step here reads) out of every
 # install this file drives; IDE users who want std sources run `rustup

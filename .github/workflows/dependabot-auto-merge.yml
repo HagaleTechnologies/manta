@@ -7,7 +7,7 @@ name: Dependabot Auto-Merge
 # access settings, because the calling repo's public build logs could otherwise leak the private
 # repo's workflow content. Every run since #191 landed (2026-09-13T01:30Z onward) has been a
 # zero-job startup failure: "error parsing called workflow ... workflow was not found". manta's
-# own ci.yml already documents this exact constraint for the SAME reason ("Self-contained (no
+# former ci.yml already documented this exact constraint for the SAME reason ("Self-contained (no
 # `uses:` call) since this repo is public") -- #191 contradicted it. Ten Dependabot PRs
 # (#115-#122, #196, #197) sat un-auto-merged as a result; fleet-wide audit 2026-09-14 found this.
 #

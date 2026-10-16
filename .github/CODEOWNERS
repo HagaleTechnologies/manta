@@ -33,7 +33,7 @@ Cargo.toml           @thagale
 /.cargo/             @thagale
 
 # rust-toolchain.toml is enforced by scripts/check-rust-toolchain-pin.sh, CI's own trust
-# mechanism (ci.yml's test job runs it before anything else, specifically so a toolchain
+# mechanism (ci-full.yml's test job runs it before anything else, specifically so a toolchain
 # mismatch reports as itself, not a confusing downstream diff) -- an unowned edit here changes
 # which toolchain CI/release actually compile with, silently invalidating what a green required
 # check proves.
