@@ -90,3 +90,14 @@ Order statistics rather than a mean floor is the load-bearing choice: CW is burs
   loud keyed tone's click skirt forms a span over the tone itself. See
   SPEC-decode-core.md §2.8 and the
   [decision record](../../docs/DECISIONS/2026-10-13-man313-non-cw-rejection.md).
+- MAN-271 short transmissions: a single 2-character burst can never show
+  rule D's `cycles >= 1` (the gate's 40 ms EMA bridges every gap — one
+  ACTIVE run) or 150-hop span, so SPEC §2.8 rule D′ qualifies it at the
+  first evaluation after the ACTIVE → HANG drop, gated on >= 3 keyed
+  marks counted from the queued input — the discriminator that keeps
+  single-channel sweep bumps out. A short burst's characters still arrive
+  only at its track's genuine `finish()` (the 5-mark speed-tracker quorum
+  bootstraps there from 2–4 marks). Don't test short bursts looped: MAN-3
+  taught that a looped test passes for an unrelated reason. See SPEC §2.8
+  D′/§4.1 and the
+  [decision record](../../docs/DECISIONS/2026-10-16-man271-short-transmission-decode.md).

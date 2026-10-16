@@ -610,6 +610,10 @@ impl TrackDecoder {
     /// closures) -- see `finish_speed_only` for closures that are pure
     /// track bookkeeping instead (Merged/Evicted), where forcing an
     /// in-progress mark sequence to resolve would fabricate content.
+    /// **MAN-271:** this is also the one place the speed tracker may
+    /// bootstrap its mark clusters below the 5-mark quorum -- a short
+    /// single transmission (2-4 decoder marks) replays its buffered runs
+    /// and decodes here instead of emitting nothing.
     /// **Engine caveat (MAN-166/MAN-169 merge, 2026-09-09):**
     /// `finish_speed_only` below was authored against `Legacy`'s
     /// `self.demod`/`self.tracker` only and does not yet branch per engine
@@ -652,6 +656,27 @@ impl TrackDecoder {
                     self.emit_committed(c, &mut events);
                 }
             }
+        }
+        // MAN-271 (SPEC §4.1 [DEVIATION]): a short single transmission can
+        // end with the tracker still under its 5-mark quorum and every run
+        // buffered in `pending` -- zero characters for a real, decodable
+        // signal (a 2-character text at 34-39 WPM loses its leading
+        // element(s) to promotion and arrives as 2-4 marks). At a genuine
+        // end-of-signal (this function; see its doc comment) bootstrap the
+        // clusters from the marks that did arrive and replay the buffer
+        // through the ordinary pipeline. The stream ends inside the
+        // trailing space, so that space teaches the sender timing nothing
+        // -- the same `finish_runs` rule (MAN-315).
+        // `finish_speed_only` never runs this.
+        if !self.tracker.ready() && self.tracker.bootstrap() {
+            let drained = std::mem::take(&mut self.pending);
+            let last = drained.len().saturating_sub(1);
+            for (i, r) in drained.into_iter().enumerate() {
+                // MAN-315: the space the stream ends inside is a truncation.
+                self.learn_gaps = !(i == last && !r.mark);
+                self.process_run(r, false, &mut events);
+            }
+            self.learn_gaps = true;
         }
         if !self.cur_marks.is_empty() && self.tracker.ready() {
             let ts = self.last_ts;
@@ -1452,6 +1477,79 @@ mod tests {
             )),
             "finish_speed_only must never fabricate a character/word from \
              an in-progress mark, got {speed_only_events:?}"
+        );
+    }
+
+    /// MAN-271: "AI" at ~35 WPM is 4 marks (dit-dah dit-dit); the live
+    /// 5-mark quorum never fills, so a genuine end-of-signal `finish()`
+    /// bootstraps the tracker from them and replays the buffer.
+    #[test]
+    fn finish_decodes_a_four_mark_text() {
+        // 13 hops/dit = 34.67 ms -> ~34.6 WPM.
+        let mut env = rect_envelope("AI", 13);
+        env.extend(std::iter::repeat_n(0.0, 750)); // >= 2 s of trailing silence
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::CharDecoded { .. })),
+            "zero CharDecoded: {events:?}"
+        );
+        assert_eq!(events_to_text(&events), "AI");
+    }
+
+    /// MAN-271: the bookkeeping close path must never bootstrap -- the
+    /// RF signal could still be mid-character at a Merged/Evicted close.
+    #[test]
+    fn finish_speed_only_does_not_bootstrap() {
+        let mut env = rect_envelope("AI", 13);
+        env.extend(std::iter::repeat_n(0.0, 750));
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish_speed_only());
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::CharDecoded { .. })),
+            "finish_speed_only fabricated: {events:?}"
+        );
+    }
+
+    /// MAN-271: the bootstrap replay extends `finish_runs`'s MAN-315 rule
+    /// -- the trailing space the stream ends inside is a truncation and
+    /// must not be learned as the sender's word gap.
+    #[test]
+    fn finish_bootstrap_does_not_learn_the_trailing_space() {
+        let mut env = rect_envelope("AI", 13);
+        // A trailing silence far past any word gap: ~200 dits.
+        env.extend(std::iter::repeat_n(0.0, 2600));
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        let word_gaps: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::TimingUpdate { timing, .. } => Some(timing.word_gap),
+                _ => None,
+            })
+            .collect();
+        // A TimingUpdate is emitted at finish (element/char gaps were
+        // observed); none of them may carry a word-gap observation, whose
+        // only candidate in this scene is the truncated trailing space.
+        assert!(
+            word_gaps.iter().all(Option::is_none),
+            "the truncated trailing space was learned: {word_gaps:?}"
         );
     }
 

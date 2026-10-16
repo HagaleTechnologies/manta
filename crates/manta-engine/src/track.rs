@@ -687,6 +687,77 @@ pub const ISO_MIN_FRACTION: f64 = 0.5;
 /// oldest entries are then dropped, and a track that qualifies that late
 /// is decoded from at most 20 s back.
 pub const MAX_UNQUALIFIED_BACKLOG: usize = 7500;
+/// MAN-271 (SPEC §2.8 D′): the few debounced key-down runs ("keyed
+/// marks") a short transmission must show inside its queued input to
+/// qualify through rule D′. Measured to reject every swept-carrier track
+/// while keeping all but two of 175 CW short evaluations -- see
+/// docs/DECISIONS/2026-10-16-man271-short-transmission-decode.md.
+pub const SHORT_MIN_MARKS: u64 = 3;
+/// MAN-271 (SPEC §2.8 D′): hops a key-down or key-up run must last before
+/// the keyed-marks counter counts it -- Demod's own run-debounce shape
+/// (SPEC §3.2/§3.3), so "a mark" means what the decoder will see.
+pub const SHORT_MARK_DEBOUNCE_HOPS: u32 = 4;
+/// MAN-271 (SPEC §2.8 D′): the keyed-marks hysteresis half-band, as a
+/// fraction of the Q10-Q90 rail gap.
+pub const SHORT_HYST_FRAC: f32 = 0.15;
+/// MAN-271 (SPEC §2.8 D′): the Q90/Q10 ratio the queued input must show
+/// before any mark is counted at all -- flat (unkeyed) input has no marks.
+pub const SHORT_MIN_KEYING_RATIO: f32 = 2.0;
+
+/// MAN-271 (SPEC §2.8 D′): count the debounced key-down runs ("keyed
+/// marks") in a track's queued decoder input, with Demod-style relative
+/// rails: nearest-rank Q90/Q10 quantiles over a copy (Q10 floored at
+/// 1e-12), no count at all when `Q90 < SHORT_MIN_KEYING_RATIO * Q10`, a
+/// midpoint threshold with ±`SHORT_HYST_FRAC` hysteresis, and
+/// `SHORT_MARK_DEBOUNCE_HOPS` of debounce on both the key-down run that
+/// starts a mark and the key-up run that must separate two marks. A pure
+/// function of data the track already holds (`pending` is never drained
+/// before qualification, so the count is chunk-size invariant), computed
+/// with `total_cmp` so it is deterministic. A swept carrier crossing one
+/// channel is one smooth bump and counts one; a real short CW message
+/// counts its dits and dahs.
+fn keyed_marks(amps: &[f32]) -> u64 {
+    let n = amps.len();
+    if n < 2 {
+        return 0;
+    }
+    let mut sorted = amps.to_vec();
+    let rank = |p: f32| ((p * n as f32).ceil() as usize).clamp(1, n) - 1;
+    let (lo_i, hi_i) = (rank(0.10), rank(0.90));
+    let _ = sorted.select_nth_unstable_by(lo_i, f32::total_cmp);
+    let lo = sorted[lo_i].max(1e-12);
+    let _ = sorted.select_nth_unstable_by(hi_i, f32::total_cmp);
+    let hi = sorted[hi_i];
+    if hi < SHORT_MIN_KEYING_RATIO * lo {
+        return 0;
+    }
+    let mid = 0.5 * (hi + lo);
+    let half = SHORT_HYST_FRAC * (hi - lo);
+    let (mut down, mut run, mut marks, mut counted) = (false, 0u32, 0u64, false);
+    for &a in amps {
+        let now_down = if down {
+            a >= mid - half
+        } else {
+            a > mid + half
+        };
+        if now_down == down {
+            run += 1;
+        } else {
+            // A key-up run shorter than the debounce is a dip inside a
+            // mark, not a gap between two marks.
+            if now_down && run >= SHORT_MARK_DEBOUNCE_HOPS {
+                counted = false;
+            }
+            down = now_down;
+            run = 1;
+        }
+        if down && !counted && run >= SHORT_MARK_DEBOUNCE_HOPS {
+            marks += 1;
+            counted = true;
+        }
+    }
+    marks
+}
 
 /// MAN-313 (SPEC §2.8): one promoted track's evidence that it is keyed CW,
 /// plus the state its unkeyed close reads. Every field is integer-hop
@@ -708,6 +779,12 @@ struct KeyingEvidence {
     active_run: u64,
     /// ACTIVE hops since the last classifier evaluation.
     active_hops_since_eval: u64,
+    /// MAN-271 (SPEC §2.8 D′): the track dropped ACTIVE → HANG since the
+    /// last classifier evaluation. Set in `on_hop`, cleared alongside
+    /// `active_hops_since_eval` at every evaluation, so the short rule
+    /// fires only at the first evaluation after a drop -- where the
+    /// co-modulation verdict is contemporaneous with the burst.
+    dropped_since_eval: bool,
     /// Hop of the first key-down sample; `t` in the slope fit is relative
     /// to it.
     first_keydown_hop: Option<u64>,
@@ -741,6 +818,7 @@ impl KeyingEvidence {
             cycles: 0,
             active_run: 0,
             active_hops_since_eval: 0,
+            dropped_since_eval: false,
             first_keydown_hop: None,
             n: 0,
             sum_t: 0.0,
@@ -780,6 +858,11 @@ impl KeyingEvidence {
             }
             self.active_run = 0;
             self.last_rise_hop = hop;
+        }
+        if prev == LifecycleState::Active && now == LifecycleState::Hang {
+            // MAN-271 (SPEC §2.8 D′): the first evaluation after this drop
+            // is where the short-transmission rule may fire.
+            self.dropped_since_eval = true;
         }
         if now == LifecycleState::Active {
             self.active_run += 1;
@@ -847,6 +930,51 @@ impl KeyingEvidence {
             && self.slope_hz_s(spacing_hz).abs() <= MAX_SWEEP_HZ_PER_S
             && self.t_last >= KEYDOWN_SPAN_MIN_HOPS
             && self.non_flat_fraction() >= ISO_MIN_FRACTION
+    }
+
+    /// MAN-271 (SPEC §2.8 D′): the slope tolerance for a short keyed
+    /// burst whose key-down span sits under `KEYDOWN_SPAN_MIN_HOPS`. A
+    /// least-squares slope's standard error over evenly keyed samples
+    /// grows as span^-1.5, so the tolerance scales up by the same factor,
+    /// keeping the 150-hop reference span's noise margin. Swept carriers
+    /// stay out through the keyed-marks count, not the slope.
+    fn short_slope_tolerance(&self) -> f64 {
+        if self.t_last >= KEYDOWN_SPAN_MIN_HOPS {
+            MAX_SWEEP_HZ_PER_S
+        } else {
+            MAX_SWEEP_HZ_PER_S
+                * (KEYDOWN_SPAN_MIN_HOPS as f64 / self.t_last.max(1) as f64).powf(1.5)
+        }
+    }
+
+    /// MAN-271 (SPEC §2.8 D′): the short-transmission qualification rule,
+    /// checked at the same classifier evaluations as `qualifies`. A
+    /// promoted track that has just dropped ACTIVE → HANG after one ACTIVE
+    /// run of at most `MAX_MARK_HOPS` qualifies without `cycles` or a
+    /// 150-hop key-down span: a single short burst can neither re-rise nor
+    /// span that long. Every spectral check stays, and `keyed_marks`
+    /// (counted from the track's queued input by the caller) must find at
+    /// least `SHORT_MIN_MARKS` debounced marks -- the measured
+    /// discriminator between a short CW message and a swept carrier
+    /// crossing one channel. The slope limit scales with the short span
+    /// (`short_slope_tolerance`).
+    fn qualifies_short(
+        &self,
+        comod: &CoModDetector,
+        k: usize,
+        spacing_hz: f64,
+        state: LifecycleState,
+        keyed_marks: u64,
+    ) -> bool {
+        state == LifecycleState::Hang
+            && self.dropped_since_eval
+            && self.active_run <= MAX_MARK_HOPS
+            && !comod.in_span(k)
+            && !comod.comodulated_with_span(k)
+            && self.n >= SLOPE_MIN_SAMPLES
+            && self.slope_hz_s(spacing_hz).abs() <= self.short_slope_tolerance()
+            && self.non_flat_fraction() >= ISO_MIN_FRACTION
+            && keyed_marks >= SHORT_MIN_MARKS
     }
 
     /// A decoded character (`None` for a prosign) at batch-end hop `hop`.
@@ -2274,12 +2402,28 @@ impl TrackManager {
                     if track.qualified || close_reasons.contains_key(&id) {
                         continue;
                     }
+                    // MAN-271 (SPEC §2.8 D′): `state` is read before the
+                    // `ev` borrow below (`track.state()` borrows the whole
+                    // track); `pending` and `keying` are field-disjoint.
+                    let state = track.state();
                     let Some(ev) = track.keying.as_mut() else {
                         continue;
                     };
                     let k = (track.center.round() as i64).rem_euclid(n as i64) as usize;
-                    let qualifies = ev.qualifies(comod, k, spacing);
+                    // MAN-271 (SPEC §2.8 D′): the keyed-marks count from
+                    // the queued input is needed only at the first
+                    // evaluation after an ACTIVE → HANG drop of an
+                    // unqualified track; everywhere else it stays 0, so
+                    // the quantile selection never runs.
+                    let marks = if state == LifecycleState::Hang && ev.dropped_since_eval {
+                        keyed_marks(&track.pending.iter().map(|p| p.0).collect::<Vec<f32>>())
+                    } else {
+                        0
+                    };
+                    let qualifies = ev.qualifies(comod, k, spacing)
+                        || ev.qualifies_short(comod, k, spacing, state, marks);
                     ev.active_hops_since_eval = 0;
+                    ev.dropped_since_eval = false;
                     if qualifies {
                         let (promo_ts, promo_freq_hz) = (ev.promo_ts, ev.promo_freq_hz);
                         let freq_hz = track.freq_hz(self.center_freq_hz, spacing, n);
@@ -6758,6 +6902,218 @@ mod tests {
             |_, _| {},
         );
         assert!(promoted.is_empty(), "{promoted:?}");
+    }
+
+    // ---- MAN-271 (SPEC §2.8 D′): short-transmission qualification ----
+
+    /// Four debounced plateaus separated by debounced gaps: four marks.
+    #[test]
+    fn keyed_marks_counts_on_off_keying() {
+        let mut amps = Vec::new();
+        for _ in 0..4 {
+            amps.extend(std::iter::repeat_n(10.0_f32, 12));
+            amps.extend(std::iter::repeat_n(1.0_f32, 12));
+        }
+        amps.extend(std::iter::repeat_n(1.0_f32, 200));
+        assert_eq!(keyed_marks(&amps), 4);
+    }
+
+    /// A smooth raised-cosine bump over a floor -- a swept carrier's shape
+    /// in one channel -- counts one mark, not several.
+    #[test]
+    fn keyed_marks_counts_a_single_bump_as_one() {
+        let mut amps = vec![1.0_f32; 50];
+        for i in 0..100 {
+            let t = i as f32 / 99.0;
+            amps.push(1.0 + 9.0 * (1.0 - (std::f32::consts::PI * t).cos()) / 2.0);
+        }
+        amps.extend(std::iter::repeat_n(1.0_f32, 50));
+        assert_eq!(keyed_marks(&amps), 1);
+    }
+
+    /// Flat input, or Q90 < 2*Q10, has no keying depth and no marks.
+    #[test]
+    fn keyed_marks_needs_keying_depth() {
+        assert_eq!(keyed_marks(&vec![5.0_f32; 300]), 0);
+        let mut amps = Vec::new();
+        for _ in 0..150 {
+            amps.push(1.0_f32);
+            amps.push(1.5_f32);
+        }
+        // Q10 = 1.0, Q90 = 1.5 < 2 * 1.0: not keyed.
+        assert_eq!(keyed_marks(&amps), 0);
+    }
+
+    /// Dips shorter than the debounce do not split a mark in two.
+    #[test]
+    fn keyed_marks_debounces_short_dips() {
+        let mut amps = Vec::new();
+        for _ in 0..10 {
+            amps.extend(std::iter::repeat_n(10.0_f32, 10));
+            amps.extend(std::iter::repeat_n(1.0_f32, 2));
+        }
+        assert_eq!(keyed_marks(&amps), 1);
+    }
+
+    /// A `KeyingEvidence` whose key-down samples (all non-flat, freshly
+    /// dropped, short ACTIVE run) follow `slope_ch_per_hop` channels per
+    /// hop over a key-down span of `t_last` hops.
+    fn short_evidence(t_last: u64, slope_ch_per_hop: f64) -> KeyingEvidence {
+        let mut ev = KeyingEvidence::new(0, 0.0, 0);
+        ev.dropped_since_eval = true;
+        ev.active_run = 40;
+        ev.t_last = t_last;
+        for t in 0..=t_last {
+            let (tt, f) = (t as f64, t as f64 * slope_ch_per_hop);
+            ev.n += 1;
+            ev.sum_t += tt;
+            ev.sum_f += f;
+            ev.sum_tt += tt * tt;
+            ev.sum_tf += tt * f;
+            ev.non_flat += 1;
+        }
+        ev
+    }
+
+    /// D′ fires only at the first evaluation after an ACTIVE → HANG drop,
+    /// only in HANG, and needs `SHORT_MIN_MARKS` keyed marks.
+    #[test]
+    fn short_rule_requires_a_fresh_drop() {
+        let comod = CoModDetector::new(NC_N);
+        let ev = short_evidence(120, 0.0);
+        assert!(ev.qualifies_short(&comod, 10, 1500.0, LifecycleState::Hang, 3));
+        let mut ev = ev;
+        ev.dropped_since_eval = false;
+        assert!(!ev.qualifies_short(&comod, 10, 1500.0, LifecycleState::Hang, 3));
+        let ev = short_evidence(120, 0.0);
+        assert!(!ev.qualifies_short(&comod, 10, 1500.0, LifecycleState::Active, 3));
+        assert!(!ev.qualifies_short(
+            &comod,
+            10,
+            1500.0,
+            LifecycleState::Hang,
+            SHORT_MIN_MARKS - 1
+        ));
+    }
+
+    /// One ACTIVE run longer than `MAX_MARK_HOPS` is not a mark any more:
+    /// that is an unkeyed carrier, not a short transmission.
+    #[test]
+    fn short_rule_rejects_long_marks() {
+        let comod = CoModDetector::new(NC_N);
+        let mut ev = short_evidence(120, 0.0);
+        ev.active_run = MAX_MARK_HOPS + 1;
+        assert!(!ev.qualifies_short(&comod, 10, 1500.0, LifecycleState::Hang, 3));
+    }
+
+    /// A co-modulated span (or being inside one) blocks D′ exactly as it
+    /// blocks rule D: the spectral checks are not waived for short bursts.
+    #[test]
+    fn short_rule_rejects_spans_and_comodulation() {
+        // Drive a wideband keyed block until the comod span covers ch 20
+        // (the same scene as `spawn_is_vetoed_inside_a_comod_span`).
+        let mut tm = nc_mgr(DetectorConfig::default());
+        nc_drive(
+            &mut tm,
+            0,
+            600,
+            |i| {
+                let mut p = quiet_power(NC_N);
+                if nc_keyed(i) {
+                    p[10..=30].iter_mut().for_each(|x| *x = nc_db(30.0));
+                }
+                p
+            },
+            |_, _| {},
+        );
+        let comod = tm.comod.as_ref().unwrap();
+        assert!(comod.in_span(20));
+        let ev = short_evidence(120, 0.0);
+        assert!(!ev.qualifies_short(comod, 20, 1500.0, LifecycleState::Hang, 3));
+    }
+
+    /// The D′ slope tolerance is `MAX_SWEEP_HZ_PER_S` at the reference
+    /// span and scales as (150/t_last)^1.5 below it.
+    #[test]
+    fn short_rule_slope_tolerance_scales_with_span() {
+        let ev = short_evidence(150, 0.0);
+        assert_eq!(ev.short_slope_tolerance(), MAX_SWEEP_HZ_PER_S);
+        let ev = short_evidence(150 + 1, 0.0);
+        assert_eq!(ev.short_slope_tolerance(), MAX_SWEEP_HZ_PER_S);
+        let ev = short_evidence(119, 0.0);
+        let expected = MAX_SWEEP_HZ_PER_S * (150.0_f64 / 119.0).powf(1.5);
+        assert!((ev.short_slope_tolerance() - expected).abs() < 1e-9);
+        // 75 * (150/119)^1.5 ~= 106 Hz/s.
+        assert!((ev.short_slope_tolerance() - 106.0).abs() < 1.0);
+        // A 90 Hz/s drift passes at t_last = 119 and fails at 150.
+        let comod = CoModDetector::new(NC_N);
+        let spacing = 93.75;
+        let ch = 90.0 / (spacing * 4.0 * spacing);
+        let ev = short_evidence(119, ch);
+        assert!(ev.qualifies_short(&comod, 10, spacing, LifecycleState::Hang, 3));
+        let ev = short_evidence(150, ch);
+        assert!(!ev.qualifies_short(&comod, 10, spacing, LifecycleState::Hang, 3));
+    }
+
+    /// The ticket's own case, end to end through `Channelizer` +
+    /// `TrackManager`: a single-shot "DA" @ 35 WPM qualifies through D′
+    /// (exactly one `TrackPromoted`) and decodes at least one character at
+    /// `finish()`. On main the track closed `HangExpired` with zero events.
+    #[test]
+    fn short_keyed_burst_qualifies_and_decodes() {
+        use manta_dsp::channelizer::Channelizer;
+        let sig = manta_testkit::scene::SignalSpec {
+            text: "DA".into(),
+            loop_text: false,
+            wpm: 35.0,
+            offset_hz: 14_000.0,
+            snr_2500_db: 28.3,
+            jitter: None,
+            qsb: None,
+            watterson: None,
+            char_wpm: None,
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
+            rise_ms: 5.0,
+            dit_units: 1.0,
+            element_gap_units: 1.0,
+        };
+        let (samples, _) = manta_testkit::scene::render_scene(
+            std::slice::from_ref(&sig),
+            96_000.0,
+            3.0,
+            Some(63032404875482),
+        )
+        .unwrap();
+        let mut ch = Channelizer::new(96_000.0, 0.0).unwrap();
+        let hop_samples = ch.hop() as u64;
+        let mut tm = TrackManager::new(
+            ch.n_channels(),
+            96_000.0,
+            0.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        let mut all_events = Vec::new();
+        for chunk in samples.chunks(4096) {
+            let hops = ch.process(chunk);
+            all_events.extend(tm.process_hops(&hops, |m| m * hop_samples));
+        }
+        all_events.extend(tm.finish());
+        let promoted = all_events
+            .iter()
+            .filter(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
+            .count();
+        let chars = all_events
+            .iter()
+            .filter(|e| matches!(e, DecoderEvent::CharDecoded { .. }))
+            .count();
+        assert_eq!(
+            promoted, 1,
+            "expected exactly one promotion: {all_events:?}"
+        );
+        assert!(chars >= 1, "zero CharDecoded: {all_events:?}");
     }
 
     #[test]

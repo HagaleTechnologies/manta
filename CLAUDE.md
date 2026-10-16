@@ -371,6 +371,21 @@ reconnect drains clients and exits 0 at once; an EOF after a stop during
 startup calibration is a clean end. See
 docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md.
 
+MAN-271 (replaces MAN-3): a short single-shot high-WPM CW transmission
+(2-character text, 34–39 WPM, > 20 dB) decodes to at least one character
+— measured 112 of 200 domain cases at zero output on main, 0 of 200
+after. Two fixes: a finish-time `SpeedTracker` bootstrap (SPEC §4.1
+[DEVIATION] — at a genuine end-of-signal `finish()`, 2–4 marks initialize
+the clusters and the buffered runs replay; `finish_speed_only` never
+does), and SPEC §2.8 rule D′ short-transmission qualification (first
+evaluation after an ACTIVE → HANG drop; every spectral check stays, plus
+`SHORT_MIN_MARKS = 3` keyed marks counted from the queued input, which is
+what rejects swept carriers; span-scaled slope tolerance). Out of scope,
+follow-ups recommended: the first-character corruption ("IA" for "DA";
+promotion consumes the leading element) and clips shorter than ~1.1 s
+after promotion (Demod's 375-hop init window). See
+docs/DECISIONS/2026-10-16-man271-short-transmission-decode.md.
+
 MAN-245: the Codex gate fails closed, titled `Review thread list
 incomplete`, when a PR has more than 100 review threads or an unresolved
 thread with more than 50 comments; Dependabot handling needs author,
