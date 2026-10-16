@@ -479,12 +479,14 @@ enum Command {
     },
     /// Run the live decoder for a fixed duration as a stability check.
     ///
-    /// Reads from the same sources `listen` does, decodes for --duration
+    /// Reads from the same sources `listen` does, runs for the full --duration
     /// seconds, and exits non-zero if the pipeline panics or its memory
-    /// use keeps growing. Intended for unattended stability runs, not for
-    /// day-to-day operating.
+    /// use keeps growing. A --source recording that ends sooner does not end
+    /// the run: soak waits out the rest of --duration before it reports.
+    /// Intended for unattended stability runs, not for day-to-day operating.
     Soak {
-        /// How long to run, in seconds.
+        /// How long to run, in seconds. The run lasts this long even when a
+        /// --source recording ends sooner.
         #[arg(long)]
         duration: u64,
         /// Sound-card input device; matched by substring. Defaults to the
@@ -493,9 +495,11 @@ enum Command {
         device: Option<String>,
         /// Replay a WAV file instead of listening to a live device.
         ///
-        /// Decoded as fast as the machine manages, not in real time, so a
-        /// 60-second file usually finishes sooner than that. Useful for
-        /// demos and repeatable testing.
+        /// Decoded as fast as the machine manages, not in real time, but the
+        /// run still lasts the full --duration: given a 60-second file and
+        /// --duration 3600, soak decodes the file, then waits, decoding nothing,
+        /// until the hour is up and prints its report. A live source keeps the
+        /// decoder busy for the whole run.
         #[arg(long, conflicts_with = "device", help_heading = "Audio input")]
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
@@ -7789,6 +7793,45 @@ mod tests {
                 "--strict help does not give {label} code {code}:\n{strict_help}"
             );
         }
+    }
+
+    /// MAN-254: `manta_engine::soak` waits out the whole --duration even
+    /// after a --source recording ends, so soak's help must say so and
+    /// must not borrow run's and doctor's "finishes sooner" promise.
+    #[test]
+    fn soak_help_says_a_short_recording_does_not_end_the_run() {
+        use clap::CommandFactory;
+        let flat = |help: clap::builder::StyledStr| {
+            help.to_string()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut cli = Cli::command();
+        let soak = cli.find_subcommand_mut("soak").unwrap();
+        let short = flat(soak.render_help());
+        let long = flat(soak.render_long_help());
+        let duration = "The run lasts this long even when a --source recording ends sooner";
+        assert!(
+            short.contains(duration),
+            "soak -h lacks {duration:?}:\n{short}"
+        );
+        for needle in [
+            duration,
+            "runs for the full --duration seconds",
+            "A --source recording that ends sooner does not end the run",
+            "the run still lasts the full --duration",
+            "decoding nothing, until the hour is up",
+        ] {
+            assert!(
+                long.contains(needle),
+                "soak --help lacks {needle:?}:\n{long}"
+            );
+        }
+        assert!(
+            !long.contains("finishes sooner"),
+            "soak --help promises an early finish:\n{long}"
+        );
     }
 
     #[test]
