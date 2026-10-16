@@ -11,8 +11,8 @@ sources:
   - docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md
   - docs/DECISIONS/2026-10-15-man371-windows-required-check.md
 verified:
-  commit: 3805f78
-  date: 2026-10-15
+  commit: e7243d1
+  date: 2026-10-16
 links:
   - live-hardware-field-testing
 ---

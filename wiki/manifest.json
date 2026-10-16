@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-15T01:55:00Z",
-  "head_commit": "3805f78",
+  "generated_at": "2026-10-16T07:53:11Z",
+  "head_commit": "8c7dba4",
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -377,8 +377,8 @@
       ],
       "status": "current",
       "title": "How do I build and test manta on Windows?",
-      "verified_commit": "3805f78",
-      "verified_date": "2026-10-15",
+      "verified_commit": "e7243d1",
+      "verified_date": "2026-10-16",
       "visibility": "public"
     }
   ],
