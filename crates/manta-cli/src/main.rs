@@ -9406,6 +9406,160 @@ mod tests {
         );
     }
 
+    /// MAN-251 (PR #207 review): a reconnecting read blocks the decode
+    /// loop throughout an outage. The real health sink must clear the
+    /// live count during backoff, and decoding must publish it again
+    /// after samples resume.
+    #[test]
+    fn reconnecting_outage_zeroes_active_tracks_until_samples_resume() {
+        use num_complex::Complex32;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Instant;
+
+        struct DropWhenExhaustedSource {
+            samples: Vec<Complex32>,
+            cursor: usize,
+            fs: f64,
+            center_freq_hz: f64,
+            stall_at_eof: bool,
+        }
+
+        impl IqSource for DropWhenExhaustedSource {
+            fn sample_rate(&self) -> f64 {
+                self.fs
+            }
+
+            fn center_freq_hz(&self) -> f64 {
+                self.center_freq_hz
+            }
+
+            fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+                let n = (self.samples.len() - self.cursor).min(buf.len());
+                if n == 0 && self.stall_at_eof {
+                    anyhow::bail!("simulated live source stall");
+                }
+                buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
+                self.cursor += n;
+                Ok(n)
+            }
+        }
+
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let first = DropWhenExhaustedSource {
+            samples: rendered.samples.clone(),
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+            stall_at_eof: true,
+        };
+        let opener: reconnect::Opener = Box::new(move || {
+            Ok(Box::new(DropWhenExhaustedSource {
+                samples: rendered.samples.clone(),
+                cursor: 0,
+                fs: spec.fs,
+                center_freq_hz: spec.center_freq_hz,
+                stall_at_eof: false,
+            }))
+        });
+        let gauge = Arc::new(AtomicU64::new(0));
+        let transitions = Arc::new(Mutex::new(Vec::new()));
+        let sink: reconnect::HealthSink = {
+            let transitions = transitions.clone();
+            let mut inner = source_health_sink("man251", None, Some(gauge.clone()));
+            Box::new(move |healthy| {
+                let mut transitions = transitions.lock().unwrap();
+                transitions.push((Instant::now(), healthy));
+                inner(healthy);
+            })
+        };
+        let src = reconnect::ReconnectingSource::new(
+            "man251",
+            Box::new(first),
+            opener,
+            Arc::new(AtomicBool::new(false)),
+            true,
+            sink,
+        );
+
+        // IqSource is not Send: keep decoding on this thread and move
+        // only the shared gauge to the polling thread.
+        let done = Arc::new(AtomicBool::new(false));
+        let poller = {
+            let done = done.clone();
+            let gauge = gauge.clone();
+            let transitions = transitions.clone();
+            std::thread::spawn(move || {
+                let mut polls = Vec::new();
+                while !done.load(Ordering::Relaxed) {
+                    {
+                        // Serialize timestamps with health callbacks so
+                        // a poll cannot straddle a transition and appear
+                        // to belong to the wrong side of the outage.
+                        let _transition = transitions.lock().unwrap();
+                        polls.push((Instant::now(), gauge.load(Ordering::Relaxed)));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                polls
+            })
+        };
+        let result = manta_engine::listen_with_observers(
+            Box::new(src),
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            manta_engine::ListenObservers {
+                active_tracks: Some(gauge),
+                ..Default::default()
+            },
+            |_ev| {},
+            |_spot| {},
+            |_n| {},
+        );
+        done.store(true, Ordering::Relaxed);
+        let polls = poller.join().expect("active-track poller must finish");
+        result.expect("the reconnected source must decode through clean EOF");
+
+        let transitions = transitions.lock().unwrap();
+        let false_at = transitions
+            .iter()
+            .find_map(|&(at, healthy)| (!healthy).then_some(at))
+            .expect("the live source must report its outage");
+        let true_at = transitions
+            .iter()
+            .find_map(|&(at, healthy)| (healthy && at > false_at).then_some(at))
+            .expect("the reconnected source must report resumed samples");
+        assert!(
+            polls.iter().any(|&(at, count)| at < false_at && count > 0),
+            "V1 must have active tracks before the source drops"
+        );
+        assert!(
+            true_at.duration_since(false_at) >= manta_server::backoff::INITIAL_BACKOFF,
+            "the unhealthy interval must include the real reconnect backoff"
+        );
+        assert!(
+            polls
+                .iter()
+                .filter(|&&(at, _)| at > false_at && at < true_at)
+                .all(|&(_, count)| count == 0),
+            "MAN-251: no poll during the outage may report ghost active tracks"
+        );
+        let first_zero = polls
+            .iter()
+            .find_map(|&(at, count)| (at >= false_at && count == 0).then_some(at))
+            .expect("active tracks must reach zero after the source drops");
+        assert!(
+            first_zero.duration_since(false_at) <= ACTIVE_TRACKS_POLL_INTERVAL,
+            "MAN-251: active tracks must reach zero within one polling interval; lag: {:?}",
+            first_zero.duration_since(false_at)
+        );
+        assert!(
+            polls.iter().any(|&(at, count)| at > true_at && count > 0),
+            "decoding must republish a real active-track count after samples resume"
+        );
+    }
+
     /// MAN-96: a reconnecting source's healthy -> unhealthy -> healthy
     /// round trip through the real sink is one `manta_source_outages_total`
     /// increment.
