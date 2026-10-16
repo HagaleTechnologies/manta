@@ -985,8 +985,10 @@ non-blocking send plus shared atomics and short locks between them.
   tokio.
 - **Bridge.** The decode thread never awaits. Spots and live-state records
   cross through `SpotBus` (§7): a short `std::sync::Mutex` section and a
-  `tokio::sync::broadcast` send, which does not block; a slow subscriber lags
-  and is disconnected rather than back-pressuring the loop. Counters and
+  `tokio::sync::broadcast` send, which does not block, so no subscriber
+  back-pressures the loop. A lagging telnet, JSON Lines or WebSocket client
+  is disconnected; the internal subscribers (the RBN uplink's forward loop
+  and `[rbn_compare]`) count the missed records and carry on. Counters and
   gauges are atomics, plus short `Mutex` sections for RTTY marks and
   per-band maps, that the decode thread writes: server tasks poll
   `ListenObservers` every `ACTIVE_TRACKS_POLL_INTERVAL` (MAN-118 D6), and
