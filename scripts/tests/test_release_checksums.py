@@ -22,7 +22,7 @@ wf = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(wf)
 
 WORKFLOW = "release-publish.yml"
-RELEASE_WORKFLOWS = ("release.yml", "release-publish.yml")
+RELEASE_WORKFLOWS = ("release-publish.yml",)
 RELEASE_PERMISSIONS = {"contents": "write", "id-token": "write", "attestations": "write"}
 SIGNING_SCOPE = re.compile(r"^\s*(id-token|attestations)\s*:|write-all")
 PINNED_ATTEST = re.compile(r"^actions/attest-build-provenance@[0-9a-f]{40} # v[0-9]+\.[0-9]+\.[0-9]+$")
