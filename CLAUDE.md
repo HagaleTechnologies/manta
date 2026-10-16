@@ -87,7 +87,8 @@ the commit subject, `<type>(<scope>): <subject>`). The queue merges when:
 
 `auto-merge-trigger.yml` arms auto-merge on ready PRs by `thagale` or
 `catalyst-cloud-connector[bot]` unless labelled `needs-human`, overriding the
-global "Tony merges" default. That author check is the only admission gate:
+global "Tony merges" default; `dependabot-auto-merge.yml` approves and arms
+verified Dependabot minor/patch bumps. These two are the only admission gates:
 run `gh pr merge --auto --squash` only on a PR you authored; never `--admin`.
 
 ## Code review convergence
