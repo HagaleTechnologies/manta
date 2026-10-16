@@ -156,6 +156,7 @@ jobs:
           target="codex-clean:${HEAD_SHA:0:12}"
           already_clean=false
           label_actor=""
+          earlier_verdict=false
           # MAN-245: paginated (a label past the first 100 was missed), and the label's latest applier
           # is recorded so create-check can tell the gate's own verdict label from an override.
           if names=$(gh api --paginate "repos/$REPO/issues/$PR/labels?per_page=100" --jq '.[].name' 2>/dev/null) \
@@ -163,9 +164,20 @@ jobs:
             already_clean=true
             label_actor=$(gh api --paginate --slurp "repos/$REPO/issues/$PR/timeline?per_page=100" 2>/dev/null \
               | jq -r --arg l "$target" '(add // []) | [.[] | select(.event == "labeled" and .label.name == $l)] | last | .actor.login // ""' 2>/dev/null) || label_actor=""
+            # Every GITHUB_TOKEN workflow labels as github-actions[bot], one defined on an unreviewed
+            # branch included. Only a "Codex review clean" check-run hagale-agent (4696353) completed on
+            # this head shows the verdict step ran: the app key is in the main-only environment.
+            if [ "$label_actor" = "github-actions[bot]" ]; then
+              earlier_verdict=$(gh api --paginate --slurp "repos/$REPO/commits/$HEAD_SHA/check-runs?filter=all&per_page=100" 2>/dev/null \
+                | jq -r '[.[].check_runs[] | select(.name == "Codex review clean (gate before expensive downstream jobs)" and .app.id == 4696353 and .conclusion == "success" and .output.title == "Codex review clean")] | length > 0' 2>/dev/null) || earlier_verdict=false
+              [ "$earlier_verdict" = "true" ] || earlier_verdict=false
+            fi
           fi
-          echo "already_clean=$already_clean" >> "$GITHUB_OUTPUT"
-          echo "label_actor=$label_actor" >> "$GITHUB_OUTPUT"
+          {
+            echo "already_clean=$already_clean"
+            echo "label_actor=$label_actor"
+            echo "earlier_verdict=$earlier_verdict"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create the codex-clean check-run
         id: create-check
@@ -182,9 +194,11 @@ jobs:
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           ALREADY_CLEAN: ${{ steps.existing-label.outputs.already_clean }}
-          # MAN-245: who last applied that label -- github-actions[bot] is this workflow's own
-          # verdict step; anyone else (or unknown) is an override, titled as one below.
+          # MAN-245: who last applied that label, and whether hagale-agent's clean verdict check-run
+          # is on this head. Both together are this workflow's own verdict; anything else (or
+          # unknown) is an override, titled as one below.
           LABEL_ACTOR: ${{ steps.existing-label.outputs.label_actor }}
+          EARLIER_VERDICT: ${{ steps.existing-label.outputs.earlier_verdict }}
           # MAN-245: a Dependabot update is opened by dependabot[bot] from a branch in this
           # repository AND this event was triggered by dependabot[bot]. A PR not authored by the bot
           # always takes the review path, whoever triggered the event; a human push to a bot PR
@@ -230,9 +244,9 @@ jobs:
             summary="Opened from a branch in this repository by dependabot[bot], and this event came from dependabot[bot]. dependabot-auto-merge.yml verifies and approves it; ci-full.yml tests it natively."
           elif [ "$ALREADY_CLEAN" = "true" ]; then
             conclusion="success"
-            if [ "$LABEL_ACTOR" = "github-actions[bot]" ]; then
+            if [ "$LABEL_ACTOR" = "github-actions[bot]" ] && [ "$EARLIER_VERDICT" = "true" ]; then
               title="Codex review clean (earlier verdict for this revision)"
-              summary="codex-clean:$sha12 was applied by this workflow's verdict step after a clean Codex round on this exact revision."
+              summary="codex-clean:$sha12 was applied by this workflow's verdict step after a clean Codex round on this exact revision, whose Codex review clean check-run is on this commit."
             elif [ -n "$LABEL_ACTOR" ]; then
               title="Codex review overridden by $LABEL_ACTOR (codex-clean label)"
               summary="No Codex round ran for this event. codex-clean:$sha12 was applied by $LABEL_ACTOR, not by this workflow's verdict step: an override, not a review."

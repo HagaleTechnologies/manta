@@ -567,6 +567,9 @@ LABEL_GH = """case "$*" in
   *"/timeline"*)
     if [ -n "$TIMELINE_FAIL" ]; then exit 1; fi
     cat "$TIMELINE" ;;
+  *"/check-runs"*)
+    if [ -n "$CHECKS_FAIL" ]; then exit 1; fi
+    cat "$CHECKS" ;;
   *) echo "unexpected gh call: $*" >&2; exit 1 ;;
 esac
 """
@@ -580,6 +583,13 @@ def labeled(actor, at, name=LABEL):
     return {"event": "labeled", "label": {"name": name}, "actor": {"login": actor}, "created_at": at}
 
 
+def check_run(app_id, title, conclusion="success", name=CHECK_NAME):
+    return {"name": name, "app": {"id": app_id}, "conclusion": conclusion, "output": {"title": title}}
+
+
+VERDICT_RUN = check_run(4696353, "Codex review clean")
+
+
 class CodexCheckRunProvenanceTests(unittest.TestCase):
     """MAN-245 (decision D3): a codex-clean label still passes the gate, and the check-run says
     whether the label was this workflow's own verdict or someone else's override."""
@@ -589,50 +599,67 @@ class CodexCheckRunProvenanceTests(unittest.TestCase):
         self.create_body = wf.run_body(gate_step("codex-review-request", sid="create-check"))
         self.update_body = wf.run_body(gate_step("codex-review-response", name="Update the check-run"))
 
-    def _lookup(self, labels, timeline=None, timeline_fail=False):
+    def _lookup(self, labels, timeline=None, timeline_fail=False, checks=(), checks_fail=False):
         with tempfile.TemporaryDirectory() as tmp:
-            lpath, tpath = os.path.join(tmp, "labels.txt"), os.path.join(tmp, "timeline.json")
+            lpath, tpath, cpath = (os.path.join(tmp, n) for n in ("labels.txt", "timeline.json", "checks.json"))
             with open(lpath, "w", encoding="utf-8") as f:
                 f.write("".join(n + "\n" for n in labels))
             with open(tpath, "w", encoding="utf-8") as f:
                 json.dump(timeline or [[]], f)
+            with open(cpath, "w", encoding="utf-8") as f:  # pages, as --paginate --slurp returns them
+                json.dump([{"total_count": len(checks), "check_runs": list(checks)}], f)
             env = {"GH_TOKEN": "x", "REPO": GATE_REPO, "PR": GATE_PR, "HEAD_SHA": HEAD_SHA,
-                   "LABELS": lpath, "TIMELINE": tpath, "TIMELINE_FAIL": "1" if timeline_fail else ""}
+                   "LABELS": lpath, "TIMELINE": tpath, "TIMELINE_FAIL": "1" if timeline_fail else "",
+                   "CHECKS": cpath, "CHECKS_FAIL": "1" if checks_fail else ""}
             return run_step(self.label_body, env, LABEL_GH, tmp=tmp)
 
     def test_label_lookup(self):
         gate = labeled("github-actions[bot]", "2026-10-16T10:00:00Z")
         human = labeled("thagale", "2026-10-16T11:00:00Z")
         other = labeled("thagale", "2026-10-16T12:00:00Z", name="codex-clean:" + "b" * 12)
-        cases = [  # (case, labels, timeline pages, timeline fails, already_clean, label_actor)
-            ("none", ["bug"], None, False, "false", ""),
-            ("gate verdict", [LABEL], [[gate]], False, "true", "github-actions[bot]"),
-            ("human override", [LABEL], [[gate], [human, other]], False, "true", "thagale"),
-            ("label on page 2", [f"other-{i}" for i in range(100)] + [LABEL], [[human]], False,
-             "true", "thagale"),
-            ("timeline unreadable", [LABEL], None, True, "true", ""),
+        # Any GITHUB_TOKEN workflow labels as github-actions[bot], one defined on an unreviewed
+        # branch included; only hagale-agent's completed "Codex review clean" shows a verdict ran.
+        forged = [check_run(15368, "Codex review clean"), check_run(4696353, "Codex raised new concerns", "failure"),
+                  check_run(4696353, "Codex review clean", name="other")]
+        cases = [  # (case, labels, timeline pages, timeline fails, check-runs, check-runs fail,
+                   #  already_clean, label_actor, earlier_verdict)
+            ("none", ["bug"], None, False, (), False, "false", "", "false"),
+            ("gate verdict", [LABEL], [[gate]], False, [VERDICT_RUN], False, "true", "github-actions[bot]", "true"),
+            ("workflow label, no verdict check-run", [LABEL], [[gate]], False, forged, False,
+             "true", "github-actions[bot]", "false"),
+            ("workflow label, check-runs unreadable", [LABEL], [[gate]], False, [VERDICT_RUN], True,
+             "true", "github-actions[bot]", "false"),
+            ("human override", [LABEL], [[gate], [human, other]], False, [VERDICT_RUN], False,
+             "true", "thagale", "false"),
+            ("label on page 2", [f"other-{i}" for i in range(100)] + [LABEL], [[human]], False, (), False,
+             "true", "thagale", "false"),
+            ("timeline unreadable", [LABEL], None, True, [VERDICT_RUN], False, "true", "", "false"),
         ]
-        for case, labels, timeline, fail, clean, actor in cases:
+        for case, labels, timeline, fail, checks, checks_fail, clean, actor, earlier in cases:
             with self.subTest(case=case):
-                proc, written, _ = self._lookup(labels, timeline, fail)
+                proc, written, _ = self._lookup(labels, timeline, fail, checks, checks_fail)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 lines = output_lines(written)
                 self.assertIn(f"already_clean={clean}", lines)
                 self.assertIn(f"label_actor={actor}", lines)
+                self.assertIn(f"earlier_verdict={earlier}", lines)
 
     def _create(self, **env):
         with tempfile.TemporaryDirectory() as tmp:
             base = {"GH_TOKEN": "x", "REPO": GATE_REPO, "HEAD_SHA": HEAD_SHA, "ALREADY_CLEAN": "false",
-                    "LABEL_ACTOR": "", "IS_EXCLUDED_DEPENDABOT": "false", "IS_DRAFT": "false",
-                    "PRODUCER_ACTION": "synchronize"}
+                    "LABEL_ACTOR": "", "EARLIER_VERDICT": "false", "IS_EXCLUDED_DEPENDABOT": "false",
+                    "IS_DRAFT": "false", "PRODUCER_ACTION": "synchronize"}
             return run_step(self.create_body, {**base, **env}, CREATE_GH, tmp=tmp)
 
     def test_pass_through_titles(self):
         cases = [  # (case, env, title, warning)
             ("draft", {"IS_DRAFT": "true"}, "Draft: not reviewed", False),
             ("dependabot update", {"IS_EXCLUDED_DEPENDABOT": "true"}, "Dependabot update: not sent to Codex", False),
-            ("gate verdict label", {"ALREADY_CLEAN": "true", "LABEL_ACTOR": "github-actions[bot]"},
+            ("gate verdict label", {"ALREADY_CLEAN": "true", "LABEL_ACTOR": "github-actions[bot]",
+                                    "EARLIER_VERDICT": "true"},
              "Codex review clean (earlier verdict for this revision)", False),
+            ("workflow label, no verdict check-run", {"ALREADY_CLEAN": "true", "LABEL_ACTOR": "github-actions[bot]"},
+             "Codex review overridden by github-actions[bot] (codex-clean label)", True),
             ("human override", {"ALREADY_CLEAN": "true", "LABEL_ACTOR": "thagale"},
              "Codex review overridden by thagale (codex-clean label)", True),
             ("applier unknown", {"ALREADY_CLEAN": "true", "LABEL_ACTOR": ""},

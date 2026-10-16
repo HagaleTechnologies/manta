@@ -159,9 +159,17 @@ failed at metadata in `dependabot-auto-merge.yml` rather than approving.
    every completed check-run carries a title:
    - `Codex review clean`: a real clean verdict;
    - `Codex review clean (earlier verdict for this revision)`: the label
-     was applied by `github-actions[bot]`, this workflow's verdict step;
+     was applied by `github-actions[bot]` **and** a `Codex review clean`
+     check-run that hagale-agent (4696353) completed as success is on the
+     head (`filter=all`). Every workflow that uses `GITHUB_TOKEN` labels
+     as `github-actions[bot]`, including one defined on a branch nobody
+     has reviewed and run on `push`, so the actor alone proves nothing.
+     hagale-agent's key is in the `main`-only codex-review environment,
+     and only the verdict step's PATCH titles its check-run `Codex review
+     clean`;
    - `Codex review overridden by <login> (codex-clean label)`: anyone
-     else, with a `::warning::` in the log;
+     else, or `github-actions[bot]` with no such check-run, with a
+     `::warning::` in the log;
    - `Codex review overridden (codex-clean label; applier unknown)`: the
      timeline could not be read, with the same warning;
    - `Draft: not reviewed` and `Dependabot update: not sent to Codex`
@@ -206,8 +214,9 @@ failed at metadata in `dependabot-auto-merge.yml` rather than approving.
     `pageInfo`, a baseline marked incomplete and a resolved 51-comment
     thread), the baseline's `incomplete` output and the failure title;
   - `CodexCheckRunProvenanceTests`: the label lookup (no label, the
-    gate's label, a later human label, a label on page 2, an unreadable
-    timeline) and every pass-through and clean title;
+    gate's label with and without hagale-agent's verdict check-run, an
+    unreadable check-run list, a later human label, a label on page 2, an
+    unreadable timeline) and every pass-through and clean title;
   - `RequiredCheckSourcesTests`: the script against the live ruleset as
     read, with `Supply Chain` pinned right and wrong, with `test
     (windows-latest)` and `PR title` added, an unknown context, a pinned
@@ -221,9 +230,12 @@ failed at metadata in `dependabot-auto-merge.yml` rather than approving.
 
 ## Residual risks
 
-- A `github-actions[bot]` label can also come from a workflow added on
-  the PR's own branch under `pull_request`. Such a change sits under
-  CODEOWNERS `/.github/`.
+- A `github-actions[bot]` label can also come from a workflow defined on
+  a branch, which runs on `push` or `pull_request` before anyone reviews
+  it (CODEOWNERS `/.github/` only blocks the merge). It still passes the
+  gate, as any `codex-clean` label does (decision 3), but without
+  hagale-agent's `Codex review clean` check-run on the head it is titled
+  an override.
 - The Codex and `test (*)` checks stay unpinned, so a commit status or
   another app's check-run with those names is not rejected by the
   ruleset.
