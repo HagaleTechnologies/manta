@@ -10,6 +10,7 @@
 //! one input.
 
 use crate::reconnect::{HealthSink, InputHealthTotals, ReconnectingSource};
+use crate::stdio::errln;
 use crate::{
     fmt, logging, text_lines, wrap_file_replay, LiveSourceSpec, ReplayMode, ResolvedInput,
     RunLists, SpotResolved,
@@ -569,6 +570,10 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     let json = m.json;
     // MAN-123: a daemon logs decoded text only with --decoded-text.
     let print_text = !json && (server.is_none() || m.decoded_text);
+    // MAN-232, as the one-input path: stdout lines go through
+    // `StopOnClose`, so a closed reader starts the drain through `stop`
+    // instead of panicking, and becomes the exit status after it.
+    let stdout_lines = crate::stdio::StopOnClose::stdout(stop.clone());
     let mut text = text_lines::TrackLines::default();
     let mut ready = vec![false; n];
     let mut rtty_logs: Vec<crate::RttyLogState> = rates
@@ -584,7 +589,10 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         shared,
         |ev| {
             if json {
-                println!("{}", serde_json::to_string(ev).unwrap_or_default());
+                stdout_lines.line(format_args!(
+                    "{}",
+                    serde_json::to_string(ev).unwrap_or_default()
+                ));
             } else if print_text {
                 if let Some(line) = text.ingest(ev) {
                     // As the one-input path: `--log-format json` makes
@@ -593,7 +601,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                     if logging::is_json() {
                         tracing::info!(target: "manta::text", "{line}");
                     } else {
-                        eprintln!("{line}");
+                        errln!("{line}");
                     }
                 }
             }
@@ -616,9 +624,9 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 }
             }
             if json {
-                println!("{}", serde_json::json!({ "spot": spot }));
+                stdout_lines.line(format_args!("{}", serde_json::json!({ "spot": spot })));
             } else {
-                println!("{}", fmt::spot_line(spot));
+                stdout_lines.line(format_args!("{}", fmt::spot_line(spot)));
             }
         },
         |input, n_tracks| {
@@ -700,7 +708,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             if logging::is_json() {
                 tracing::info!(target: "manta::text", "{line}");
             } else {
-                eprintln!("{line}");
+                errln!("{line}");
             }
         }
     }
@@ -708,26 +716,10 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         server.metrics.mark_decode_stopped();
         server.metrics.set_active_tracks(0);
         server.metrics.set_rtty_signals(&[]);
-        let _ = server.shutdown_tx.send(true);
-        let status_line = server
-            .status_line
-            .lock()
-            .ok()
-            .and_then(|mut handle| handle.take());
-        if let Some(status_line) = status_line {
-            let _ = rt.block_on(status_line);
-        }
-        let rbn_compare = server
-            .rbn_compare
-            .lock()
-            .ok()
-            .and_then(|mut handle| handle.take());
-        if let Some(rbn_compare) = rbn_compare {
-            let _ = rt.block_on(tokio::time::timeout(
-                crate::SHUTDOWN_DRAIN_DEADLINE,
-                rbn_compare,
-            ));
-        }
+        // MAN-256, as the one-input path: the status task is stopped and
+        // joined before client shutdown is broadcast; the comparator joins
+        // after, within its bound.
+        crate::signal_spot_server_shutdown(&rt, &server);
         crate::shutdown_runtime_after_drain(rt, &server.tasks);
     }
     if let Some(failed) = ends.iter().find(|e| e.result.is_err()) {
@@ -738,6 +730,10 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             e.unwrap_or_default()
         );
     }
+    // MAN-232: a closed stdout reader stopped the run through `stop`; only
+    // now, after the drain, does it become the exit status (141 / 1). An
+    // input failure still wins, because it is reported first.
+    stdout_lines.finish()?;
     Ok(std::process::ExitCode::SUCCESS)
 }
 

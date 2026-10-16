@@ -5540,7 +5540,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             }
             let shared = &loaded.input.shared;
             if several {
-                eprintln!(
+                errln!(
                     "note: decode applies only freq_correction_ppm from the {} [[input]] entries \
                      in {}",
                     loaded.inputs.len(),
