@@ -7,17 +7,20 @@ Linux/ARM/headless platforms it has no native build for.
 
 ## Build and test
 
-Needs Rust 1.98.0 (`rust-toolchain.toml`), `git`, and `libasound2-dev` on
-Linux. Before pushing, run what `ci-full.yml`'s `test`/`test-hpsdr` jobs run:
+Needs Rust 1.98.0 (`rust-toolchain.toml`), `git`, and on Linux `libasound2-dev`
+and `pkg-config`. Before pushing, run what `ci-full.yml`'s `test`/`test-hpsdr`
+jobs run (CI skips the script suites on Windows and runs `ci_gates` and
+`verify_dependabot_diff_safe` on Linux only):
 
 ```sh
-bash scripts/check-rust-toolchain-pin.sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+bash scripts/check-rust-toolchain-pin.sh && cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --locked
+bash scripts/tests/release-version.test.sh && bash scripts/tests/release-ancestry.test.sh
+python3 -m unittest -v scripts.tests.test_{ci_trust_boundary,release_checksums,soapy_release,\
+packaging,package_release,score_against_rbn_replay,ci_gates,verify_dependabot_diff_safe}
 cargo clippy -p manta-input -p manta-cli --all-targets --features hpsdr --locked -- -D warnings
 cargo test -p manta-input -p manta-cli --features hpsdr --locked
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --locked
 ```
 
 ## Status
@@ -62,8 +65,6 @@ and docs/DECISIONS/README.md row, not here. The log this section held until
   in-repo). No GUI; telnet :7300, JSON Lines/WebSocket :7301.
 
 ## Multi-agent hygiene
-
-Other agents work concurrently in other clones, branches and worktrees.
 
 - **Start fresh:** `git fetch` and rebase onto `origin/main` before reading
   code or making decisions; stale context produces wrong work.
