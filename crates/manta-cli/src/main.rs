@@ -1692,6 +1692,12 @@ impl IqSource for FixedCenterFreqSource {
         self.inner.take_discontinuity()
     }
 
+    /// MAN-259: `ReconnectingSource` reads this off the opener's result to
+    /// end an outage where acquisition began.
+    fn acquisition_start_offset(&self) -> std::time::Duration {
+        self.inner.acquisition_start_offset()
+    }
+
     fn health_counters(&self) -> Option<std::sync::Arc<manta_input::InputHealthCounters>> {
         self.inner.health_counters()
     }
@@ -9724,6 +9730,37 @@ mod tests {
         };
         assert_eq!(src.take_discontinuity(), Some(48_000));
         assert_eq!(src.take_discontinuity(), None);
+    }
+
+    /// MAN-259: the reconnect wrapper reads the acquisition-start offset
+    /// off the opener's result, which is this wrapper whenever
+    /// `--dial-freq-hz` or a fixed centre is in effect.
+    #[test]
+    fn fixed_center_freq_source_forwards_acquisition_start_offset() {
+        struct OffsetSource;
+        impl IqSource for OffsetSource {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                0.0
+            }
+            fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+            fn acquisition_start_offset(&self) -> std::time::Duration {
+                std::time::Duration::from_millis(250)
+            }
+        }
+
+        let src = FixedCenterFreqSource {
+            inner: Box::new(OffsetSource),
+            freq_hz: 14_000_000.0,
+        };
+        assert_eq!(
+            src.acquisition_start_offset(),
+            std::time::Duration::from_millis(250)
+        );
     }
 
     // MAN-56: input-layer health counters wiring.

@@ -189,15 +189,20 @@ the current track segment and starting a fresh one with the sample clock
 advanced by the gap, so spot timestamps stay wall-clock-true with no
 audio spliced across the gap and no zero-fill (see
 `docs/DECISIONS/2026-10-05-man73-source-reconnect.md` for why zero-fill
-was rejected). A stop while the source is down (MAN-258) ends the stream
-with the outage still pending, so the open tracks close with the same
-outage teardown and no new segment starts. File replay is exempt: its
-errors and EOF must reach `listen()` unchanged for byte-identical replay.
-Each reopen runs on its own short-lived `reopen-<kind>` thread, so a stop
-request during an outage abandons it and `read()` returns EOF within
-~100 ms; the client drain, which starts only after `listen()` returns,
-therefore no longer waits for a stalled DNS lookup, connect or driver open
-(MAN-252).
+was rejected). The gap ends where the reopened device started streaming,
+which each driver reports as `IqSource::acquisition_start_offset()`, not
+where its open call returned: samples it buffered while still opening are
+returned as data and must not also count as outage, or every later spot
+is stamped late by the reopen time (MAN-259,
+`docs/DECISIONS/2026-10-16-man259-acquisition-anchored-outage.md`). A stop
+while the source is down (MAN-258) ends the stream with the outage still
+pending, so the open tracks close with the same outage teardown and no new
+segment starts. File replay is exempt: its errors and EOF must reach
+`listen()` unchanged for byte-identical replay. Each reopen runs on its own
+short-lived `reopen-<kind>` thread, so a stop request during an outage
+abandons it and `read()` returns EOF within ~100 ms; the client drain,
+which starts only after `listen()` returns, therefore no longer waits for a
+stalled DNS lookup, connect or driver open (MAN-252).
 
 **Paced and looping replay (MAN-269).** File replay normally runs as fast
 as the machine decodes. `run --realtime` (`input.realtime`) wraps the file

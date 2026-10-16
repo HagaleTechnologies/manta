@@ -257,6 +257,9 @@ pub struct KiwiIqSource {
     /// `health_counters()`, same as HPSDR's `GapDetector` handle.
     health: Arc<InputHealthCounters>,
     seq: SndSeqTracker,
+    /// MAN-259: `connect`'s runtime up to the post-handshake `SET` loop
+    /// that turns streaming on; surfaced by `acquisition_start_offset()`.
+    acquisition_start_offset: Duration,
 }
 
 impl KiwiIqSource {
@@ -265,6 +268,7 @@ impl KiwiIqSource {
     /// to `TARGET_RATE_HZ`. `password` is `""` for anonymous/no-password
     /// receivers (most public ones).
     pub fn connect(host: &str, port: u16, center_freq_hz: f64, password: &str) -> Result<Self> {
+        let entered = Instant::now();
         let tcp = resolve_and_connect(host, port)?;
         tcp.set_read_timeout(Some(READ_TIMEOUT))
             .context("set TCP read timeout")?;
@@ -356,6 +360,11 @@ impl KiwiIqSource {
         // OK issue (see module docs) to maximize fidelity with a known-
         // working client while chasing that bug, and left in since removing
         // them was never verified safe against real nodes.
+        //
+        // MAN-259: `SET mod=iq` in this loop starts the SND stream, so the
+        // handshake above is outage and everything after it (the resampler
+        // build below) is already live acquisition.
+        let acquisition_start_offset = entered.elapsed();
         for cmd in [
             "SET ident_user=manta".to_string(),
             iq_mode_command(center_freq_hz),
@@ -395,6 +404,7 @@ impl KiwiIqSource {
             last_keepalive: Instant::now(),
             health: Arc::new(InputHealthCounters::new()),
             seq: SndSeqTracker::default(),
+            acquisition_start_offset,
         })
     }
 
@@ -612,6 +622,10 @@ impl IqSource for KiwiIqSource {
 
     fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
         Some(self.health.clone())
+    }
+
+    fn acquisition_start_offset(&self) -> Duration {
+        self.acquisition_start_offset
     }
 
     /// The receiver's own IQ passband (`IQ_LOW_CUT_HZ`..`IQ_HIGH_CUT_HZ`),

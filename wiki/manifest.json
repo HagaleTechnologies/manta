@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-10-16T22:46:15Z",
+  "generated_at": "2026-10-16T23:45:56Z",
   "head_commit": "b8b9367",
   "pages": [
     {
@@ -243,7 +243,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:70ce6a10a24c459e7985a8e31f224298041289617c982c8907375cb9fdf373f1",
+      "hash": "sha256:e34c18ec9eb25c17be08195b529891412a3bbdf06abb0893a8f53f1c256cd871",
       "id": "source-reconnect",
       "kind": "gotcha",
       "links": [
@@ -254,14 +254,16 @@
       "path": "pages/source-reconnect.md",
       "sources": [
         "docs/DECISIONS/2026-10-05-man73-source-reconnect.md",
+        "docs/DECISIONS/2026-10-16-man259-acquisition-anchored-outage.md",
         "crates/manta-cli/src/reconnect.rs",
         "crates/manta-cli/src/reconnect.rs (InputHealthTotals)",
         "crates/manta-input/src/lib.rs (IqSource::take_discontinuity)",
+        "crates/manta-input/src/lib.rs (IqSource::acquisition_start_offset)",
         "docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md"
       ],
       "status": "current",
       "title": "What's the gotcha with a live source disconnecting?",
-      "verified_commit": "9a79a72",
+      "verified_commit": "b8b9367",
       "verified_date": "2026-10-16",
       "visibility": "public"
     },
