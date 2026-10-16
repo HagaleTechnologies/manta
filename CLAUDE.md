@@ -365,6 +365,15 @@ moved from ctrlc to signal-hook; a second SIGINT/SIGTERM (SIGHUP without
 `[server]`) exits at once with 128 + signal, skipping the drain. See
 docs/DECISIONS/2026-10-14-man232-closed-and-stalled-output.md.
 
+MAN-245: the Codex gate fails closed, titled `Review thread list
+incomplete`, when a PR has more than 100 review threads or an unresolved
+thread with more than 50 comments; Dependabot handling needs author,
+same-repository head and actor; a `codex-clean` label the gate did not
+apply shows as `Codex review overridden by <login>`.
+`scripts/required-check-sources.py` lists the required checks against
+the decision record; pinning `Supply Chain` to GitHub Actions is owner
+step O2. See docs/DECISIONS/2026-10-16-man245-gate-verdict-integrity.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each
