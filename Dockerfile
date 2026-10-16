@@ -6,12 +6,12 @@
 #
 # HPSDR is included in every build (pure UDP/std, no native radio library).
 # This uses the default features, matching the native release binaries
-# (.github/workflows/release.yml).
+# (.github/workflows/release-publish.yml).
 # `soapy` is deliberately excluded -- see that workflow's comment for why.
 #
 # Built for linux/amd64, linux/arm64 and linux/arm/v7 (32-bit Raspberry Pi
 # OS) via `docker buildx build --platform
-# linux/amd64,linux/arm64,linux/arm/v7` (release.yml); a plain `docker build`
+# linux/amd64,linux/arm64,linux/arm/v7` (release-publish.yml); a plain `docker build`
 # on any of those architectures also works natively, cross-compiling nothing.
 #
 # MAN-81: the entrypoint is packaging/docker/docker-entrypoint.sh. With no

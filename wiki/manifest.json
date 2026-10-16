@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-16T03:08:15Z",
-  "head_commit": "a7ae6c29391e96c8b5e84972001b420c41cd1eac",
+  "generated_at": "2026-10-16T11:15:00Z",
+  "head_commit": "efe4223",
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -243,7 +243,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:a3a5ddee297926a3692ac3116f60c4fce8e53dcdd830a0947f8406186d69e2c1",
+      "hash": "sha256:ef955ed7d6e28d8a27ae7f522a2ea766c38766b321945d6817c4d5447b09f058",
       "id": "source-reconnect",
       "kind": "gotcha",
       "links": [
@@ -256,12 +256,13 @@
         "docs/DECISIONS/2026-10-05-man73-source-reconnect.md",
         "crates/manta-cli/src/reconnect.rs",
         "crates/manta-cli/src/reconnect.rs (InputHealthTotals)",
-        "crates/manta-input/src/lib.rs (IqSource::take_discontinuity)"
+        "crates/manta-input/src/lib.rs (IqSource::take_discontinuity)",
+        "docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md"
       ],
       "status": "current",
       "title": "What's the gotcha with a live source disconnecting?",
-      "verified_commit": "d286147",
-      "verified_date": "2026-10-13",
+      "verified_commit": "9f35f1a",
+      "verified_date": "2026-10-16",
       "visibility": "public"
     },
     {
@@ -359,7 +360,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:2dbc4665305d99e10da73523944db00ec51d4cfd84997861522caef2e88e48cf",
+      "hash": "sha256:9a2da65638fd93bd7dc66d89ef89b236fa4439ed1285102dec25872443b9ca0e",
       "id": "windows-build-setup",
       "kind": "howto",
       "links": [
@@ -370,7 +371,6 @@
       "path": "pages/windows-build-setup.md",
       "sources": [
         ".github/workflows/ci-full.yml",
-        ".github/workflows/release.yml",
         ".github/workflows/release-publish.yml",
         "CONTRIBUTING.md",
         "scripts/check-release-ci.py",
@@ -381,7 +381,7 @@
       ],
       "status": "current",
       "title": "How do I build and test manta on Windows?",
-      "verified_commit": "a7ae6c29391e96c8b5e84972001b420c41cd1eac",
+      "verified_commit": "799379d",
       "verified_date": "2026-10-16",
       "visibility": "public"
     }

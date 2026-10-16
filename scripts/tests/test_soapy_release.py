@@ -25,7 +25,7 @@ wf = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(wf)
 
 ARTIFACT = "manta-linux-x86_64-soapy"
-RELEASE_WORKFLOWS = ("release.yml", "release-publish.yml")
+RELEASE_WORKFLOWS = ("release-publish.yml",)
 VERIFY = f"python3 scripts/check-soapy-release.py {ARTIFACT}.tar.gz"
 FLAGS = ("--soapy-driver", "--soapy-freq-hz", "--soapy-rate-hz", "--soapy-gain")
 HELP = "Usage: manta run [OPTIONS]\n" + "".join(f"      {f} <X>\n" for f in FLAGS + ("--hpsdr-host",))
@@ -294,8 +294,7 @@ class WorkflowWiringTests(unittest.TestCase):
         i = index_of(steps, lambda s: "docker run" in executable(wf.run_body(s)), "clean-runtime")
         return i, executable(wf.run_body(steps[i]))
 
-    def test_both_workflows_verify_the_archive_before_upload(self):
-        bodies = {}
+    def test_the_workflow_verifies_the_archive_before_upload(self):
         for name in RELEASE_WORKFLOWS:
             with self.subTest(workflow=name):
                 steps = build_soapy_steps(name)
@@ -311,9 +310,6 @@ class WorkflowWiringTests(unittest.TestCase):
                 for step in (steps[host], steps[runtime], steps[upload]):
                     self.assertIsNone(wf.field(step, "if"), "no smoke step may be skipped")
                     self.assertIsNone(wf.field(step, "continue-on-error"))
-                bodies[name] = (executable(wf.run_body(steps[host])), body)
-        self.assertEqual(bodies["release.yml"], bodies["release-publish.yml"],
-                         "both workflows must run the same verifier the same way")
 
     def test_runtime_container_sees_only_the_archive_and_verifier_read_only(self):
         for name in RELEASE_WORKFLOWS:

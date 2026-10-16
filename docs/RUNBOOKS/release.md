@@ -1,7 +1,7 @@
 # Cutting a manta release
 
 This is the operational runbook for the release pipeline
-(`.github/workflows/release.yml`, `.github/workflows/release-publish.yml`).
+(`.github/workflows/release-publish.yml`).
 It exists so a maintainer who has never cut a manta release can do so from
 this document alone. See
 `docs/DECISIONS/2026-09-05-man65-release-pipeline-hardening.md` for the
@@ -142,41 +142,33 @@ this change. See [the MAN-244 decision](../DECISIONS/2026-10-10-man244-release-g
    grammar" below), then push: `git tag v1.2.3 <reviewed-commit-sha>` and
    `git push origin refs/tags/v1.2.3`. Only the owner may create, move or
    delete a release tag.
- 3. Pushing the tag triggers both workflows:
-    - **`release.yml`** builds and packages all five targets (macOS
-      x86_64/arm64, Windows x86_64, Linux x86_64/arm64), plus the sixth
-      archive, `manta-linux-x86_64-soapy.tar.gz`, from its `build-soapy`
-      job (MAN-82, see "The SoapySDR archive" below), and validates the
-      multi-arch Docker build (`push: false`) — this run never publishes
-      anything; it is a build-only check of the tagged commit (it no longer
-      runs on pull requests at all, since HAG-47). The `validate-tag` job's
-      man-page steps render the man pages every `build` archive ships (see
-      "What each artifact contains") from one native Linux build, after the
-      tag checks and before the matrix starts; `build-soapy` renders its
-      own from the binary it packages.
-    - **`release-publish.yml`** does the real work: `validate-tag` (checks
-      tag grammar and default-branch ancestry before any platform build
-      starts, and that the tagged commit's `ci-full.yml` push run passed
-      every default `test` leg, Windows included (MAN-156), then
-      renders the man pages once from a native Linux build
-      with the same default features as every standard build leg) → `build` (rebuilds
-      the same five targets and needs only `validate-tag`) and, beside it,
-      `build-soapy` (the sixth archive, also needing only `validate-tag`)
-      → two jobs side by side, both in the `ghcr-publish` environment:
-      `docker-publish-release` (pushes the multi-arch image to GHCR as
-      `ghcr.io/hagaletechnologies/manta:X.Y.Z`, then `publish-latest` runs
-      after it; see below) and `release` (needs both `build` and
-      `build-soapy`, so a failed or skipped Soapy build publishes no
-      Release; writes `SHA256SUMS` over the six archives, attests their
-      build provenance, then creates the
-      GitHub Release from the archives and `SHA256SUMS`; MAN-80, see
-      "Verifying a downloaded release" below). The Release notes open with
-      the pre-stability label above GitHub's generated list of merged pull
-      requests. `release` does not wait for the image; see "If the image
-      publish fails" below. The build-only workflow has the same ancestry
-      guard before its platform builds.
+  3. Pushing the tag triggers the release workflow,
+     **`release-publish.yml`**: `validate-tag` (checks tag grammar and
+     default-branch ancestry before any platform build starts, and that
+     the tagged commit's `ci-full.yml` push run passed every default
+     `test` leg, Windows included (MAN-156), then renders the man pages
+     every `build` archive ships (see "What each artifact contains") from
+     one native Linux build, with the same default features as every
+     standard build leg, after the tag checks and before the matrix starts) → `build` (builds and packages all five
+     targets — macOS x86_64/arm64, Windows x86_64, Linux x86_64/arm64 —
+     and needs only `validate-tag`) and, beside it, `build-soapy` (the
+     sixth archive, `manta-linux-x86_64-soapy.tar.gz`, MAN-82, see "The
+     SoapySDR archive" below; also needing only `validate-tag`; it
+     renders its own man pages from the binary it packages) → two jobs
+     side by side, both in the `ghcr-publish` environment:
+     `docker-publish-release` (pushes the multi-arch image to GHCR as
+     `ghcr.io/hagaletechnologies/manta:X.Y.Z`, then `publish-latest` runs
+     after it; see below) and `release` (needs both `build` and
+     `build-soapy`, so a failed or skipped Soapy build publishes no
+     Release; writes `SHA256SUMS` over the six archives, attests their
+     build provenance, then creates the
+     GitHub Release from the archives and `SHA256SUMS`; MAN-80, see
+     "Verifying a downloaded release" below). The Release notes open with
+     the pre-stability label above GitHub's generated list of merged pull
+     requests. `release` does not wait for the image; see "If the image
+     publish fails" below.
 
-   Both workflows build all five targets and the Soapy archive cold: no build cache is restored
+   The release workflow builds all five targets and the Soapy archive cold: no build cache is restored
    (MAN-243, `docs/DECISIONS/2026-10-10-man243-ci-trust-boundary.md`).
    Platform builds therefore take longer than a warm CI run. On 2026-10-05 a
    cold dispatch took 1m47s–6m11s per target, while the Docker job took
@@ -403,7 +395,7 @@ announcing it:
 
 If the check fails, edit the GitHub Release to warn Windows users before
 announcing it. Then look at the Windows entry's `rustflags` in the build
-matrix of both `release.yml` and `release-publish.yml`, and at any other
+matrix of `release-publish.yml`, and at any other
 place that sets rustflags for that build: Cargo takes rustflags from one
 source and does not merge them, so a flag set somewhere else can replace
 `+crt-static` without any error.
@@ -454,7 +446,7 @@ Both should report the same digest.
 
 ## The SoapySDR archive
 
-`build-soapy` (MAN-82, both release workflows) builds
+`build-soapy` (MAN-82, in the release workflow) builds
 `manta-linux-x86_64-soapy.tar.gz` natively on `ubuntu-24.04` with
 `--features soapy`, against the distro's `libsoapysdr-dev`. Before
 uploading the archive it:

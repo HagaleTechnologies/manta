@@ -122,6 +122,8 @@ jobs:
         # create-check's own GH_TOKEN falls back to github.token below when this step is
         # skipped, which is sufficient for a same-run POST (the only thing the dependabot
         # pass-through path needs).
+        # Actor, not author, on purpose: this skips a step whose secret GitHub withholds from
+        # Dependabot-actor runs; it does not classify the PR (MAN-245).
         if: github.actor != 'dependabot[bot]'
         # Checks API create/update endpoints only accept a GitHub App token -- github.token
         # (Actions' own installation token) can create a check-run within its own run but is
@@ -152,13 +154,36 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           target="codex-clean:${HEAD_SHA:0:12}"
-          if labels=$(gh api "repos/$REPO/issues/$PR/labels?per_page=100" --jq '[.[].name]' 2>/dev/null); then
-            if echo "$labels" | jq -e --arg l "$target" 'index($l) != null' >/dev/null 2>&1; then
-              echo "already_clean=true" >> "$GITHUB_OUTPUT"
-              exit 0
+          already_clean=false
+          label_actor=""
+          earlier_verdict=false
+          # MAN-245: paginated (a label past the first 100 was missed), and the label's latest applier
+          # is recorded so create-check can tell the gate's own verdict label from an override.
+          if names=$(gh api --paginate "repos/$REPO/issues/$PR/labels?per_page=100" --jq '.[].name' 2>/dev/null) \
+              && grep -qxF "$target" <<< "$names"; then
+            already_clean=true
+            label_record=$(gh api --paginate --slurp "repos/$REPO/issues/$PR/timeline?per_page=100" 2>/dev/null \
+              | jq -r --arg l "$target" '(add // []) | [.[] | select(.event == "labeled" and .label.name == $l)] | last | "\(.actor.login // "")\t\(.created_at // "")"' 2>/dev/null) || label_record=""
+            label_actor=${label_record%%$'\t'*}
+            label_at=${label_record#*$'\t'}
+            # Every GITHUB_TOKEN workflow labels as github-actions[bot], one defined on an unreviewed
+            # branch included. Only a "Codex review clean" check-run hagale-agent (4696353) completed on
+            # this head shows the verdict step ran: the app key is in the main-only environment.
+            # MAN-245: the verdict step applies the label BEFORE the response job PATCHes that
+            # check-run success, so the latest labeled event must sit at or before the completed
+            # check-run it claims. A github-actions[bot] label newer than every verdict check-run
+            # was reapplied by some other GITHUB_TOKEN workflow, and is titled an override below.
+            if [ "$label_actor" = "github-actions[bot]" ]; then
+              earlier_verdict=$(gh api --paginate --slurp "repos/$REPO/commits/$HEAD_SHA/check-runs?filter=all&per_page=100" 2>/dev/null \
+                | jq -r --arg at "$label_at" '[.[].check_runs[] | select(.name == "Codex review clean (gate before expensive downstream jobs)" and .app.id == 4696353 and .conclusion == "success" and .output.title == "Codex review clean" and $at != "" and (.completed_at // "") >= $at)] | length > 0' 2>/dev/null) || earlier_verdict=false
+              [ "$earlier_verdict" = "true" ] || earlier_verdict=false
             fi
           fi
-          echo "already_clean=false" >> "$GITHUB_OUTPUT"
+          {
+            echo "already_clean=$already_clean"
+            echo "label_actor=$label_actor"
+            echo "earlier_verdict=$earlier_verdict"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create the codex-clean check-run
         id: create-check
@@ -170,14 +195,27 @@ jobs:
           # skipped (dependabot[bot] actor, see that step's own comment) -- sufficient here
           # since the dependabot path only ever does a same-run POST, which github.token can do
           # fine; it's cross-run mutation that token can't do, and dependabot never reaches
-          # that path (no @codex review request is ever posted for it).
+          # that path (no @codex review request is ever posted for it). MAN-245: no other
+          # dependabot[bot]-triggered run reaches it either; APP_TOKEN_MINTED below fails it closed.
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           ALREADY_CLEAN: ${{ steps.existing-label.outputs.already_clean }}
-          # exclude_dependabot: true hardcoded (matches this file's own pre-migration
-          # `github.actor != 'dependabot[bot]'` job-level exclusion).
-          IS_EXCLUDED_DEPENDABOT: ${{ github.actor == 'dependabot[bot]' }}
+          # MAN-245: who last applied that label, and whether hagale-agent's clean verdict check-run
+          # is on this head. Both together are this workflow's own verdict; anything else (or
+          # unknown) is an override, titled as one below.
+          LABEL_ACTOR: ${{ steps.existing-label.outputs.label_actor }}
+          EARLIER_VERDICT: ${{ steps.existing-label.outputs.earlier_verdict }}
+          # MAN-245: a Dependabot update is opened by dependabot[bot] from a branch in this
+          # repository AND this event was triggered by dependabot[bot]. A PR not authored by the bot
+          # always takes the review path, whoever triggered the event; a human push to a bot PR
+          # gets a real round too. Same expression as dependabot-auto-merge.yml's three jobs.
+          IS_EXCLUDED_DEPENDABOT: ${{ github.actor == 'dependabot[bot]' && github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository }}
+          # MAN-245 (Codex P1, PR #327): "true" only when hagale-agent's token was minted. Without it
+          # (a dependabot[bot]-triggered event on a PR that is not a Dependabot update) neither the
+          # request PAT nor a token that can complete this check-run from another run is available,
+          # so the review path fails the gate instead of leaving a check-run nothing can complete.
+          APP_TOKEN_MINTED: ${{ steps.app-token.outcome == 'success' }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
           # Stamped onto the check-run's external_id below so codex-review-response can later
           # tell a genuine `synchronize` (a real new commit) apart from `reopened`/
@@ -203,12 +241,38 @@ jobs:
           # ever having looked. There is exactly one path to a real review: this workflow's own
           # explicit request below, for every non-draft/non-dependabot/not-already-labeled
           # revision, regardless of which action triggered it.
+          #
+          # MAN-245: every completed check-run says what produced it. A codex-clean label this
+          # workflow's verdict step did not apply still passes (fleet convergence tooling applies it
+          # for a round whose findings were ticketed), but it is titled as an override, not a review.
+          sha12="${HEAD_SHA:0:12}"
           if [ "$IS_DRAFT" = "true" ]; then
             conclusion="success"
+            title="Draft: not reviewed"
+            summary="Draft pull requests pass this gate without a Codex round; marking the PR ready for review requests one."
           elif [ "$IS_EXCLUDED_DEPENDABOT" = "true" ]; then
             conclusion="success"
+            title="Dependabot update: not sent to Codex"
+            summary="Opened from a branch in this repository by dependabot[bot], and this event came from dependabot[bot]. dependabot-auto-merge.yml verifies and approves it; ci-full.yml tests it natively."
           elif [ "$ALREADY_CLEAN" = "true" ]; then
             conclusion="success"
+            if [ "$LABEL_ACTOR" = "github-actions[bot]" ] && [ "$EARLIER_VERDICT" = "true" ]; then
+              title="Codex review clean (earlier verdict for this revision)"
+              summary="codex-clean:$sha12 was applied by this workflow's verdict step after a clean Codex round on this exact revision; its Codex review clean check-run is on this commit and completed at or after the label was applied."
+            elif [ -n "$LABEL_ACTOR" ]; then
+              title="Codex review overridden by $LABEL_ACTOR (codex-clean label)"
+              summary="No Codex round ran for this event. codex-clean:$sha12 was applied by $LABEL_ACTOR, not by this workflow's verdict step: an override, not a review."
+              echo "::warning::Codex gate passed by a codex-clean label that $LABEL_ACTOR applied -- an override, not a Codex verdict for $HEAD_SHA."
+            else
+              title="Codex review overridden (codex-clean label; applier unknown)"
+              summary="No Codex round ran for this event. codex-clean:$sha12 is on this pull request, but who applied it could not be read, so it is treated as an override, not a review."
+              echo "::warning::Codex gate passed by a codex-clean label whose applier could not be read -- an override, not a Codex verdict for $HEAD_SHA."
+            fi
+          elif [ "$APP_TOKEN_MINTED" != "true" ]; then
+            conclusion="failure"
+            title="Codex review not requested: event triggered by dependabot[bot]"
+            summary="This pull request is not a Dependabot update, so it needs a Codex round, but GitHub gives no secrets to a run dependabot[bot] triggers, so this run can neither request one nor leave a check-run the verdict job could complete. Push a new commit as anyone but dependabot[bot] to request a review on a fresh head."
+            echo "::warning::No Codex round requested for $HEAD_SHA: this event came from dependabot[bot] on a pull request that is not a Dependabot update, and its run has no credentials to request one. The gate fails until someone other than dependabot[bot] pushes a new commit."
           else
             conclusion=""
           fi
@@ -232,6 +296,8 @@ jobs:
               -f status="completed" \
               -f conclusion="$conclusion" \
               -f external_id="$PRODUCER_ACTION" \
+              -f "output[title]=$title" \
+              -f "output[summary]=$summary" \
               --jq '.id')
             echo "Created completed check-run ($conclusion) for $HEAD_SHA -- no wait needed."
           else
@@ -250,7 +316,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Request a review
-        if: steps.create-check.outputs.check_run_id != '' && steps.create-check.outputs.conclusion != 'success'
+        if: steps.create-check.outputs.check_run_id != '' && steps.create-check.outputs.conclusion == ''
         env:
           GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
           REPO: ${{ github.repository }}
@@ -315,10 +381,11 @@ jobs:
         # is empty here on exactly the revisions that would need it, and GITHUB_TOKEN is
         # rejected outright for the workflow_dispatch endpoint regardless -- there is no
         # credential available to make this call for a Dependabot PR. ci-full.yml's own
-        # `pull_request` trigger (scoped to `github.actor == 'dependabot[bot]'`, see that
-        # file's header) runs test/test-soapy natively for this case instead, with
-        # no dispatch or PAT needed at all -- the check-run this job already created above
-        # (conclusion=success) is a compatibility artifact only; the REAL required checks
+        # `pull_request` trigger (which runs for any PR whose author is off the trusted list,
+        # Dependabot included -- see that file's header) runs test/test-soapy
+        # natively for this case instead, with no dispatch or PAT needed at all -- the
+        # check-run this job already created above (conclusion=success) is a compatibility
+        # artifact only; the REAL required checks
         # ("test (ubuntu-latest)"/"test (macos-latest)"/"test (windows-latest)") come from
         # that native run.
         # MAN-243: also gated on the trust step above -- a draft, a fork head or an untrusted
@@ -504,10 +571,11 @@ jobs:
               repository(owner: $owner, name: $name) {
                 pullRequest(number: $pr) {
                   reviewThreads(first: 100) {
+                    pageInfo { hasNextPage }
                     nodes {
                       id
                       isResolved
-                      comments(first: 50) { nodes { author { login } createdAt } }
+                      comments(first: 50) { totalCount nodes { author { login } createdAt } }
                     }
                   }
                 }
@@ -531,6 +599,16 @@ jobs:
               | select(.comments.nodes[0].author.login | is_codex_bot)
               | select(.comments.nodes[0].createdAt < $since)
               | .id]' > /tmp/baseline-initiated.json
+          # MAN-245: one page of threads and of comments is all this reads, so record whether that
+          # was everything -- compute-verdict fails closed on an incomplete baseline. The def is
+          # repeated verbatim in compute-verdict (test_ci_gates.py enforces it).
+          incomplete=$(echo "$response" | jq '
+            def thread_list_incomplete: (.pageInfo.hasNextPage != false) or ([.nodes[] | select(.isResolved == false) | select((.comments.totalCount | type) != "number" or .comments.totalCount > (.comments.nodes | length))] | length > 0);
+            .data.repository.pullRequest.reviewThreads | thread_list_incomplete')
+          echo "incomplete=$incomplete" >> "$GITHUB_OUTPUT"
+          if [ "$incomplete" != "false" ]; then
+            echo "::warning::Baseline review-thread list for PR #$PR is incomplete (more than 100 threads, or an unresolved thread with more than 50 comments) -- the verdict step will fail closed."
+          fi
           {
             echo "baseline_pure<<BASELINE_EOF"
             cat /tmp/baseline-pure.json
@@ -661,6 +739,9 @@ jobs:
           HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
           RUN_STARTED: ${{ steps.request-comment.outputs.run_started }}
           IS_GENUINE_SYNC: ${{ steps.producer-action.outputs.is_genuine_sync }}
+          BASELINE: ${{ steps.baseline.outputs.baseline_pure }}
+          BASELINE_INITIATED: ${{ steps.baseline.outputs.baseline_initiated }}
+          BASELINE_INCOMPLETE: ${{ steps.baseline.outputs.incomplete }}
         run: |
           set -o pipefail
           # Re-check the PR's LIVE head immediately before mutating anything (Codex P1, manta
@@ -708,21 +789,20 @@ jobs:
 
           OWNER="${REPO%%/*}"
           NAME="${REPO##*/}"
-          baseline='${{ steps.baseline.outputs.baseline_pure }}'
-          baseline_initiated='${{ steps.baseline.outputs.baseline_initiated }}'
-          [ -z "$baseline" ] && baseline='[]'
-          [ -z "$baseline_initiated" ] && baseline_initiated='[]'
+          baseline="${BASELINE:-[]}"
+          baseline_initiated="${BASELINE_INITIATED:-[]}"
 
           result=$(gh api graphql -f query='
             query($owner: String!, $name: String!, $pr: Int!) {
               repository(owner: $owner, name: $name) {
                 pullRequest(number: $pr) {
                   reviewThreads(first: 100) {
+                    pageInfo { hasNextPage }
                     nodes {
                       id
                       isResolved
                       path
-                      comments(first: 50) { nodes { author { login } createdAt originalCommit { oid } } }
+                      comments(first: 50) { totalCount nodes { author { login } createdAt originalCommit { oid } } }
                     }
                   }
                 }
@@ -742,12 +822,16 @@ jobs:
               def codex_initiated: (.comments.nodes[0].author.login | is_codex_bot);
               def restated_by_codex:
                 [.comments.nodes[] | select((.author.login | is_codex_bot) and .createdAt >= $since)] | length > 0;
+              # MAN-245: true when GitHub has threads past this page, or an unresolved thread has
+              # comments past the 50 read -- identical to the baseline step copy.
+              def thread_list_incomplete: (.pageInfo.hasNextPage != false) or ([.nodes[] | select(.isResolved == false) | select((.comments.totalCount | type) != "number" or .comments.totalCount > (.comments.nodes | length))] | length > 0);
               .data.repository.pullRequest.reviewThreads.nodes as $nodes
               | ($nodes
                   | map(select(.isResolved == false)
                         | select(codex_initiated)
                         | .id)) as $codex_unresolved
               | {
+                  thread_list_incomplete: (.data.repository.pullRequest.reviewThreads | thread_list_incomplete),
                   new_count: (($codex_unresolved - $baselineInitiated) | length),
                   restated_count: ([$nodes[]
                     | select(.isResolved == false)
@@ -765,6 +849,13 @@ jobs:
                     | {id, path, findingSha: (.comments.nodes[0].originalCommit.oid // "")}
                   ]
                 }')
+
+          # MAN-245: a thread list the gate could not read in full never reports clean.
+          if [ "$BASELINE_INCOMPLETE" = "true" ] || [ "$(echo "$result" | jq '.thread_list_incomplete')" != "false" ]; then
+            echo "incomplete=true" >> "$GITHUB_OUTPUT"
+            echo "::error::Review thread list incomplete: PR #$PR has more review threads than the gate reads in one query (100), or an unresolved thread with more than 50 comments. The gate cannot see every finding, so it does not report $HEAD_SHA clean. Move the remaining work to a new pull request."
+            exit 1
+          fi
 
           new_count=$(echo "$result" | jq '.new_count')
           restated_count=$(echo "$result" | jq '.restated_count')
@@ -903,6 +994,8 @@ jobs:
           # MAN-243: the trust step's verdict; anything but "true" (including empty, if that step
           # never ran) completes the check-run without dispatching.
           DISPATCH: ${{ steps.trust.outputs.dispatch }}
+          # MAN-245: "true" when compute-verdict failed closed on an incomplete thread read.
+          INCOMPLETE: ${{ steps.compute-verdict.outputs.incomplete }}
         run: |
           # .status == "in_progress" (Codex P2, manta PR #200 review round 3): without this, a
           # SECOND qualifying Codex event for the same request (e.g. a review followed moments
@@ -921,7 +1014,9 @@ jobs:
             exit 0
           fi
           if [ "$OUTCOME" = "success" ]; then
-            gh api -X PATCH "repos/$REPO/check-runs/$check_id" -f status="completed" -f conclusion="success"
+            gh api -X PATCH "repos/$REPO/check-runs/$check_id" -f status="completed" -f conclusion="success" \
+              -f "output[title]=Codex review clean" \
+              -f "output[summary]=Codex reviewed $HEAD_SHA and raised no new or restated concerns."
             # MAN-243: only a trusted, in-repository, ready-for-review head is dispatched into
             # main's context -- see the trust step's log for why this one isn't.
             if [ "$DISPATCH" != "true" ]; then
@@ -939,10 +1034,17 @@ jobs:
             GH_TOKEN="$DISPATCH_TOKEN" gh api -X POST "repos/$REPO/actions/workflows/ci-full.yml/dispatches" \
               -f ref="$default_branch" -f "inputs[head_sha]=$HEAD_SHA"
           else
+            if [ "$INCOMPLETE" = "true" ]; then
+              title="Review thread list incomplete"
+              summary="This pull request has more review threads than the gate reads in one query (100), or an unresolved thread with more than 50 comments, so the gate cannot see every finding and does not report this revision clean. Move the remaining work to a new pull request."
+            else
+              title="Codex raised new concerns"
+              summary="See this job's log for details -- resolve or ticket them, then push a remediation commit to trigger a fresh re-review."
+            fi
             gh api -X PATCH "repos/$REPO/check-runs/$check_id" \
               -f status="completed" -f conclusion="failure" \
-              -f output[title]="Codex raised new concerns" \
-              -f output[summary]="See this job's log for details -- resolve or ticket them, then push a remediation commit to trigger a fresh re-review."
+              -f "output[title]=$title" \
+              -f "output[summary]=$summary"
           fi
 
   # Native pass-through for merge-group evaluation -- unchanged in spirit from the pre-migration
