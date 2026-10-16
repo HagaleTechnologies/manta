@@ -13,6 +13,7 @@ Add a row here in the same change that adds a record:
 |---|---|---|
 | 2026-10-16 | MAN-252 | [MAN-252: a stop request abandons a source reopen in flight](2026-10-16-man252-cancellable-source-reopen.md) |
 | 2026-10-16 | MAN-245 | [MAN-245: the Codex gate fails closed on an incomplete thread read, Dependabot is classified by author, and each required check names its source](2026-10-16-man245-gate-verdict-integrity.md) |
+| 2026-10-16 | MAN-238 | [MAN-238: CLAUDE.md is a short standing brief; its per-ticket log is archived here](2026-10-16-man238-standing-brief.md) |
 | 2026-10-15 | MAN-13 | [MAN-13: one daemon decodes several receivers into one spot output](2026-10-15-man13-multi-input-daemon.md) |
 | 2026-10-15 | MAN-233 | [MAN-233: SoapySDR overflows are counted and warned, not silent](2026-10-15-man233-soapy-overflow-visibility.md) |
 | 2026-10-15 | MAN-236 | [MAN-236: the soak harness measures the loop manta run executes](2026-10-15-man236-soak-metrics-wraps-listen.md) |

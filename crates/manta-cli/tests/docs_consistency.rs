@@ -2973,6 +2973,22 @@ fn spec_v2_drops_the_man193_lookahead_sentence() {
     }
 }
 
+/// MAN-217 names two admission gates for the native merge queue:
+/// `auto-merge-trigger.yml`'s trusted-author check and
+/// `dependabot-auto-merge.yml`'s verified-bump check. Each arms auto-merge on
+/// its own, so CLAUDE.md's "Merge rules" must name both; MAN-238's trim named
+/// only the first and called it the only gate.
+#[test]
+fn claude_merge_rules_name_both_admission_workflows() {
+    let rules = squash_whitespace(section(&doc("CLAUDE.md"), "Merge rules"));
+    for workflow in ["auto-merge-trigger.yml", "dependabot-auto-merge.yml"] {
+        assert!(
+            rules.contains(workflow),
+            "CLAUDE.md's Merge rules never name `{workflow}`, which arms auto-merge on its own"
+        );
+    }
+}
+
 // ---- MAN-241 (PR #325 review): a retargeted claim needs a stamp that ----
 // ---- vouches for a snapshot containing it                              ----
 
