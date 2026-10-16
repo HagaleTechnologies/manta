@@ -142,6 +142,13 @@ the git history and `docs/DECISIONS/`.
   is not used; disabling it remains an owner step. The wiki's stale
   `verified` stamps and `manifest.json` are refreshed and CI-pinned (MAN-152).
 
+### Fixed
+
+- `manta run` stopped while waiting to reconnect to a lost receiver no
+  longer force-decodes the open tracks' last element or judges their
+  pending beacons as if the signal had ended; they close as an outage
+  (MAN-258).
+
 ## [0.1.0] - 2026-10-11
 
 Pre-stability alpha, expect breakage: manta has not cleared its own M2/M3

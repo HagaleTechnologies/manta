@@ -175,8 +175,10 @@ the current track segment and starting a fresh one with the sample clock
 advanced by the gap, so spot timestamps stay wall-clock-true with no
 audio spliced across the gap and no zero-fill (see
 `docs/DECISIONS/2026-10-05-man73-source-reconnect.md` for why zero-fill
-was rejected). File replay is exempt: its errors and EOF must reach
-`listen()` unchanged for byte-identical replay.
+was rejected). A stop while the source is down (MAN-258) ends the stream
+with the outage still pending, so the open tracks close with the same
+outage teardown and no new segment starts. File replay is exempt: its
+errors and EOF must reach `listen()` unchanged for byte-identical replay.
 
 **Paced and looping replay (MAN-269).** File replay normally runs as fast
 as the machine decodes. `run --realtime` (`input.realtime`) wraps the file

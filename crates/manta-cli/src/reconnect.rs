@@ -142,7 +142,8 @@ impl InputHealthTotals {
 /// Wraps a live `IqSource`, reopening it with backoff whenever it errors.
 /// `listen()` never observes the intermediate error: from its perspective
 /// `read()` just returns real samples a little later than usual, after an
-/// outage reported once via `take_discontinuity()`.
+/// outage reported once via `take_discontinuity()`. A stop during an
+/// outage returns end of stream with that outage still pending (MAN-258).
 pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
     name: &'static str,
     inner: Option<Box<dyn IqSource>>,
@@ -254,6 +255,16 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
             self.reported_healthy = healthy;
         }
     }
+
+    /// MAN-258: a stop before the source came back ends the stream with
+    /// the outage still pending (its length so far, in samples), so
+    /// `listen()` closes the open tracks with the outage teardown rather
+    /// than as an end of signal. Returns the `0` the caller hands back.
+    fn end_during_outage(&mut self) -> usize {
+        let outage = self.env.now().duration_since(self.last_ok);
+        self.discontinuity = Some((outage.as_secs_f64() * self.fs).round() as u64);
+        0
+    }
 }
 
 impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
@@ -280,8 +291,9 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
         loop {
             if self.inner.is_none() {
                 if !self.env.sleep(self.backoff, &self.stop) {
-                    // Ctrl-C during the outage: a clean end, matching EOF.
-                    return Ok(0);
+                    // Ctrl-C during the outage: end of stream, with the
+                    // outage left pending.
+                    return Ok(self.end_during_outage());
                 }
                 match (self.opener)() {
                     Ok(src) => {
@@ -909,6 +921,159 @@ mod tests {
         );
     }
 
+    /// MAN-258: a stop during the backoff ends the stream with the outage
+    /// left pending, so `listen()` tears its tracks down as an outage
+    /// rather than as an end of signal.
+    #[test]
+    fn stop_during_backoff_leaves_the_outage_pending() {
+        let first = scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]);
+        let (opener, calls) = opener_from(VecDeque::new());
+        let (health, _log) = health_recorder();
+        let env = FakeEnv::new();
+        let env_handle = env.clone();
+        let stop = no_stop();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            stop.clone(),
+            true,
+            health,
+            env,
+        );
+
+        let mut b = buf(8);
+        src.read(&mut b).unwrap(); // last_ok set here
+        env_handle.advance(Duration::from_secs(10)); // the stall before the error surfaces
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(
+            src.read(&mut b).unwrap(),
+            0,
+            "errors, then stops in the backoff"
+        );
+        assert_eq!(
+            src.take_discontinuity(),
+            Some((10.0 * FS).round() as u64),
+            "the outage so far is left pending with the end of stream"
+        );
+        assert_eq!(src.take_discontinuity(), None, "reported only once");
+        assert_eq!(
+            calls.get(),
+            0,
+            "the opener must never be called once stop is set"
+        );
+    }
+
+    /// Serves `samples`, then fails the way a lost receiver does, with the
+    /// operator's Ctrl-C (`stop`) landing as the reconnect backoff starts.
+    struct LostThenStopped {
+        samples: Vec<Complex32>,
+        cursor: usize,
+        fs: f64,
+        center_freq_hz: f64,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl IqSource for LostThenStopped {
+        fn sample_rate(&self) -> f64 {
+            self.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.center_freq_hz
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {
+            if self.cursor == self.samples.len() {
+                self.stop.store(true, Ordering::Relaxed);
+                anyhow::bail!("receiver lost");
+            }
+            let n = buf.len().min(self.samples.len() - self.cursor);
+            buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
+            self.cursor += n;
+            Ok(n)
+        }
+    }
+
+    /// MAN-258's scenario through the real wrapper and the real engine:
+    /// V1's CQ is mid-transmission 12 s in when the receiver is lost and
+    /// the operator stops manta during the reconnect backoff. The open
+    /// tracks close with the outage teardown (`Bookkeeping`, no forced
+    /// decode of the trailing element), never as `SignalEnded`, and no
+    /// spot is published after the stop.
+    #[test]
+    fn stop_during_an_outage_closes_tracks_as_bookkeeping_not_signal_ended() {
+        use manta_decode::events::{ClosureKind, DecoderEvent};
+
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let stop = no_stop();
+        let first = LostThenStopped {
+            samples: rendered.samples[..(spec.fs * 12.0) as usize].to_vec(),
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+            stop: stop.clone(),
+        };
+        let (opener, calls) = opener_from(VecDeque::new());
+        let (health, _log) = health_recorder();
+        let env = FakeEnv::new();
+        let env_handle = env.clone();
+        let src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            stop.clone(),
+            true,
+            health,
+            env,
+        );
+
+        let mut closed_after_stop: Vec<(u32, ClosureKind)> = Vec::new();
+        let mut spots_after_stop: Vec<String> = Vec::new();
+        manta_engine::listen_with_observers(
+            Box::new(src),
+            &manta_engine::PipelineConfig::default(),
+            stop.clone(),
+            manta_engine::ListenObservers::default(),
+            |ev| {
+                if let DecoderEvent::TrackClosed { track_id, closure } = ev {
+                    if stop.load(Ordering::Relaxed) {
+                        closed_after_stop.push((*track_id, *closure));
+                    }
+                }
+            },
+            |spot| {
+                if stop.load(Ordering::Relaxed) {
+                    spots_after_stop.push(spot.callsign.clone());
+                }
+            },
+            |_n| {},
+        )
+        .unwrap();
+
+        assert_eq!(
+            env_handle.sleeps_secs(),
+            vec![1],
+            "test setup: the stop must land in the reconnect backoff"
+        );
+        assert_eq!(calls.get(), 0, "no reopen is attempted after the stop");
+        assert!(
+            !closed_after_stop.is_empty(),
+            "test setup: a track must still be open when the receiver is lost"
+        );
+        assert!(
+            closed_after_stop.iter().all(|(_, closure)| *closure
+                == ClosureKind::Bookkeeping {
+                    survivor_track_id: None
+                }),
+            "a stop during an outage must close tracks as Bookkeeping, not SignalEnded: \
+             {closed_after_stop:?}"
+        );
+        assert!(
+            spots_after_stop.is_empty(),
+            "no spot may be published after the stop: {spots_after_stop:?}"
+        );
+    }
+
     #[test]
     fn reopened_source_with_a_different_sample_rate_is_a_fatal_error() {
         let first = scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]);
@@ -1241,5 +1406,10 @@ mod tests {
         src.read(&mut b).unwrap();
         assert_eq!(src.read(&mut b).unwrap(), 0);
         assert_eq!(calls.get(), 0, "EOF must not trigger a reopen");
+        assert_eq!(
+            src.take_discontinuity(),
+            None,
+            "the inner source's own EOF is a plain end of stream, with no outage pending"
+        );
     }
 }
