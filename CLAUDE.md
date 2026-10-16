@@ -244,6 +244,14 @@ pass. Open: MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses; the
 planned dash re-split was dropped after a bogus V8w spot). See
 docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
+MAN-137: the JSON spot stream opens with `hello` and numbers spots and
+`spotGrade` records with one per-session `seq`. WebSocket
+`?session=&since=` resumes from the bounded shared history using
+`[server].history_minutes`; raw TCP receives live records only. Follows
+dispensa `contracts/spots/stream.v1.md` (ADR-0015, Q-0070); the live-state
+stream is unchanged. See
+`docs/DECISIONS/2026-10-14-man137-json-stream-resume.md`.
+
 MAN-248: each `[[rbn_uplink]]` target enforces
 `max_spots_per_minute` (default `600`, `0` disables) on spots written to
 the wire, via the existing `RateLimiter` owned above the reconnect loop;
@@ -314,6 +322,13 @@ by a 20-run merge-queue watch with rollback triggers;
 `test-hpsdr (windows-latest)` stays advisory. See
 docs/DECISIONS/2026-10-15-man371-windows-required-check.md.
 
+MAN-235: `manta doctor` keeps its 10 s default; a `WEAK_NO_DECODE` run
+asked for under 60 s adds a stdout `hint:` line to rerun with
+`--duration 60` (`manta gen v1` first spots at 20-21 s). `--strict` exits 0
+for `DECODING`, 3 for every other verdict and 1 for a failed check; without
+it every verdict still exits 0. See
+docs/DECISIONS/2026-10-15-man235-doctor-rerun-hint-and-strict-exit.md.
+
 MAN-234: an input sample with a NaN, infinite or larger-than-1e17
 component (`manta-dsp::sample_guard::MAX_SAMPLE_MAGNITUDE`) is replaced
 with `0+0j` and counted in `Channelizer::process` (SPEC §1.3 step 0;
@@ -323,6 +338,47 @@ with `0+0j` and counted in `Channelizer::process` (SPEC §1.3 step 0;
 report line and `manta_input_bad_samples_total{source}`; `manta check`
 still errors on non-finite input. See
 docs/DECISIONS/2026-10-15-man234-bad-input-samples.md.
+
+MAN-82: releases add `manta-linux-x86_64-soapy.tar.gz` (`build-soapy`,
+`hpsdr,soapy`, Ubuntu 24.04 x86_64, libSoapySDR linked dynamically, own
+man pages, checked by `scripts/check-soapy-release.py` before upload); the
+Release needs it, the image does not. See
+docs/DECISIONS/2026-10-14-man82-soapy-release-archive.md.
+
+MAN-236: `soak_with_metrics` (the `man19-soak` harness and
+`examples/close_counts.rs`) wraps `listen_with_observers`, the loop
+`manta run` executes, instead of a copy. `ListenObservers::track_lifecycle`
+(`TrackLifecycleObserver`, relaxed atomics) publishes the all-entry track
+count and peak, per-reason closes, repetition-gate record total and
+steady-state chunk count. Bounded fixed-seed runs reported identical
+counts before and after. See
+docs/DECISIONS/2026-10-15-man236-soak-metrics-wraps-listen.md.
+
+MAN-232: `run`/`listen`, `decode`, `doctor`, `oracle`, `soak` and
+`status` never panic on a failed stdout/stderr write
+(`manta-cli::stdio`; a guard in `output_style_guard.rs` keeps panicking
+print macros out of the converted files). A closed stdout stops `run`
+through the normal drain (`manta: stdout closed; stopping`) and exits
+141; batch commands exit 141 silently; a closed stderr is ignored
+(including `tracing`, via `log_internal_errors(false)`). On Unix, SIGINT
+moved from ctrlc to signal-hook; a second SIGINT/SIGTERM (SIGHUP without
+`[server]`) exits at once with 128 + signal, skipping the drain. See
+docs/DECISIONS/2026-10-14-man232-closed-and-stalled-output.md.
+
+MAN-252: `ReconnectingSource` runs each reopen on a `reopen-<kind>`
+thread and abandons it at a stop request, so SIGTERM during a stalled
+reconnect drains clients and exits 0 at once; an EOF after a stop during
+startup calibration is a clean end. See
+docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md.
+
+MAN-245: the Codex gate fails closed, titled `Review thread list
+incomplete`, when a PR has more than 100 review threads or an unresolved
+thread with more than 50 comments; Dependabot handling needs author,
+same-repository head and actor; a `codex-clean` label the gate did not
+apply shows as `Codex review overridden by <login>`.
+`scripts/required-check-sources.py` lists the required checks against
+the decision record; pinning `Supply Chain` to GitHub Actions is owner
+step O2. See docs/DECISIONS/2026-10-16-man245-gate-verdict-integrity.md.
 
 ## Documents (read in this order)
 

@@ -49,7 +49,7 @@ Stop other manta processes using that receiver before checking it.
 | --- | --- |
 | KiwiSDR | Prefer your own receiver, or read [KiwiSDR etiquette](kiwisdr.md) first. Get its hostname, port and any user password. Reserve one channel; obtain the owner's agreement before unattended use of a public receiver. |
 | OpenHPSDR / Hermes-Lite 2 | Use an `hpsdr` build and the radio's IP, centre frequency and sample rate. Protocol support has not yet been verified against hardware. |
-| SoapySDR | Install the native SoapySDR library and receiver driver, then build with `--features hpsdr,soapy`. Release binaries do not include SoapySDR. |
+| SoapySDR | On Ubuntu 24.04 x86_64, use the `manta-linux-x86_64-soapy.tar.gz` release archive and install `libsoapysdr0.8` and your receiver's SoapySDR module ([README](../../README.md#soapysdr-on-linux-x86_64)). The other release archives do not include SoapySDR; elsewhere, install the native SoapySDR library and receiver driver, then build with `--features hpsdr,soapy`. |
 | Sound card | Use a 48000 Hz input device and set `[input].center_freq_hz` to the actual radio dial frequency. The packaged service below needs a network receiver. |
 
 This tutorial uses KiwiSDR. The command assumes port 8073; add
@@ -174,7 +174,7 @@ a `DX de` line proves a spot reached the client. Exit telnet with Ctrl+] then
 nc localhost 7301
 ```
 
-It prints one JSON object per new spot. Ctrl+C closes the client.
+It prints a `hello` line, then one JSON object per new spot. Ctrl+C closes the client.
 
 ### No spots yet?
 

@@ -22,9 +22,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+// MAN-236: shared with soak_metrics.rs, including the peak-RSS helper below.
 /// Growth in peak RSS beyond this, after the warm-up window, fails the soak.
-const RSS_GROWTH_LIMIT_BYTES: u64 = 200 * 1024 * 1024; // 200 MiB
-const WARMUP: Duration = Duration::from_secs(10);
+pub(crate) const RSS_GROWTH_LIMIT_BYTES: u64 = 200 * 1024 * 1024; // 200 MiB
+pub(crate) const WARMUP: Duration = Duration::from_secs(10);
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
@@ -40,7 +41,7 @@ pub struct SoakReport {
 // Windows has no libc::rusage/getrusage (POSIX-only) -- see this crate's
 // Cargo.toml for why windows-sys is target-gated in as the equivalent.
 #[cfg(unix)]
-fn peak_rss_bytes() -> u64 {
+pub(crate) fn peak_rss_bytes() -> u64 {
     unsafe {
         let mut usage: libc::rusage = std::mem::zeroed();
         libc::getrusage(libc::RUSAGE_SELF, &mut usage);
@@ -54,7 +55,7 @@ fn peak_rss_bytes() -> u64 {
 }
 
 #[cfg(windows)]
-fn peak_rss_bytes() -> u64 {
+pub(crate) fn peak_rss_bytes() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{
         GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
@@ -174,6 +175,35 @@ mod tests {
         let report = soak(src, &PipelineConfig::default(), Duration::from_secs(1)).unwrap();
         assert!(!report.panicked);
         assert!(soak_passed(&report));
+    }
+
+    /// MAN-254: a source that ends before `duration` does not end the
+    /// soak -- the watchdog is joined before the result is read, so even
+    /// listen's immediate "ended during startup calibration" error waits
+    /// out `duration`. `manta soak --help` promises exactly this; change
+    /// this test and that help together.
+    #[test]
+    fn soak_waits_out_its_duration_after_the_source_ends() {
+        let fs = manta_input::TARGET_RATE_HZ;
+        let src: Box<dyn manta_input::IqSource> = Box::new(
+            AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(
+                vec![0.0f32; fs as usize / 2],
+                fs,
+            )))
+            .unwrap(),
+        );
+        let duration = Duration::from_secs(2);
+        let start = Instant::now();
+        let err = soak(src, &PipelineConfig::default(), duration).unwrap_err();
+        assert!(
+            err.to_string().contains("startup calibration"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            start.elapsed() >= duration,
+            "soak() returned after {:?}, before its {duration:?}",
+            start.elapsed()
+        );
     }
 
     /// MAN-29 review round 2: an invalid `freq_correction_ppm` must fail

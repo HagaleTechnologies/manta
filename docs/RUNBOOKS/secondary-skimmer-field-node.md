@@ -64,7 +64,7 @@ an unzipped RBN archive with the same grading code.
 - **The primary's RBN spotter callsign** (the call its spots carry on RBN) and the frequency
   range the primary covers.
 - **Build manta with the `soapy` feature.** Release binaries ship `hpsdr` but not `soapy`
-  (`.github/workflows/release.yml`), so build from source. This needs `libsoapysdr-dev`, the
+  (`.github/workflows/release-publish.yml`), so build from source. This needs `libsoapysdr-dev`, the
   SoapySDRPlay3 module and the SDRplay API service installed first. Clone the repo to
   `/opt/manta`; the companion units run the scripts from there.
 
@@ -406,8 +406,8 @@ What to do with what it shows:
   section 11). A listener-task panic is logged but does not exit the process.
 - **Source outages.** `## Source outages` counts them from `manta_source_outages_total` and
   `manta_source_down_seconds_total`, so drops shorter than the 60 s sample interval still show.
-- **Recorder coverage below 99%** (spots recorded vs spots emitted). The JSON port has no history
-  for late subscribers, so spots emitted while the recorder is disconnected are lost to it. Check
+- **Recorder coverage below 99%** (spots recorded vs spots emitted). The recorder reads raw TCP,
+  which never replays (resume is WebSocket-only), so spots emitted while the recorder is disconnected are lost to it. Check
   `systemctl status manta-field-spots` and `journalctl -u manta-field-spots`, and the
   `manta_spots_dropped_lagged_total` counter.
 

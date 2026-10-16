@@ -200,6 +200,9 @@ fn readme_status_says_pre_stability_alpha() {
 
 /// MAN-298: Installation offers a download of every archive the release
 /// workflow builds, so a platform added to the build matrix is documented too.
+/// MAN-82: that includes a standalone job's literal upload name
+/// (`build-soapy`'s `name: manta-linux-x86_64-soapy`), not only matrix
+/// `artifact:` entries.
 #[test]
 fn readme_installation_offers_every_release_archive() {
     let install = squash_whitespace(section(&doc("README.md"), "Installation"));
@@ -212,7 +215,7 @@ fn readme_installation_offers_every_release_archive() {
         "README Installation gives no download command"
     );
     let workflow = doc(".github/workflows/release-publish.yml");
-    let artifacts: Vec<&str> = workflow
+    let mut artifacts: Vec<&str> = workflow
         .lines()
         .filter_map(|l| l.trim().strip_prefix("artifact: "))
         .collect();
@@ -220,6 +223,16 @@ fn readme_installation_offers_every_release_archive() {
         !artifacts.is_empty(),
         "no `artifact:` entries in the release build matrix"
     );
+    let uploads: Vec<&str> = workflow
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("name: "))
+        .filter(|name| name.starts_with("manta-") && !name.contains("${{"))
+        .collect();
+    assert!(
+        uploads.contains(&"manta-linux-x86_64-soapy"),
+        "release-publish.yml no longer uploads `manta-linux-x86_64-soapy` by name"
+    );
+    artifacts.extend(uploads);
     for artifact in artifacts {
         let ext = if artifact.contains("windows") {
             "zip"
@@ -236,7 +249,7 @@ fn readme_installation_offers_every_release_archive() {
 
 /// Every command in the Quickstart must run on a build the reader was told
 /// to make. `--soapy-driver` needs `--features soapy`, which is in neither
-/// the default build nor any release binary.
+/// the default build nor any default release binary.
 #[test]
 fn readme_quickstart_only_uses_default_build_flags() {
     let readme = doc("README.md");
@@ -245,9 +258,76 @@ fn readme_quickstart_only_uses_default_build_flags() {
         assert!(
             !quickstart.contains(gated),
             "60-second demo uses feature-gated flag `{gated}`; it fails with \
-             `error: unexpected argument` on a default or release build"
+             `error: unexpected argument` on a default build or default release binary"
         );
     }
+}
+
+/// MAN-82: a SoapySDR operator can pick the Soapy archive from Installation
+/// and install what it needs to start, without a Rust toolchain.
+#[test]
+fn readme_installation_documents_the_soapy_archive() {
+    let install = squash_whitespace(section(&doc("README.md"), "Installation"));
+    assert!(
+        install.contains(
+            "| Linux x86-64 with SoapySDR, Ubuntu 24.04 | `manta-linux-x86_64-soapy.tar.gz` |"
+        ),
+        "README Installation has no archive-table row for the Soapy archive"
+    );
+    assert!(
+        !install.contains("SoapySDR needs a build from source"),
+        "README Installation still says SoapySDR needs a build from source"
+    );
+    for needle in [
+        "### SoapySDR on Linux x86_64",
+        "Ubuntu 24.04",
+        "libsoapysdr0.8",
+        "libasound2t64",
+        "soapysdr0.8-module-rtlsdr",
+        "soapysdr0.8-module-airspy",
+        "soapysdr0.8-module-hackrf",
+        "releases/latest/download/manta-linux-x86_64-soapy.tar.gz",
+        "features: hpsdr,soapy",
+        "libSoapySDR.so.0.8: cannot open shared object file",
+        "SoapySDR::Device::make() no match",
+        "unexpected argument '--soapy-driver'",
+        "https://github.com/pothosware/SoapySDRPlay3/blob/master/README.md",
+        "You do not need Rust",
+    ] {
+        assert!(
+            install.contains(needle),
+            "README Installation's Soapy setup never says `{needle}`"
+        );
+    }
+    let notes = install.to_lowercase();
+    assert!(
+        notes.contains("bundles neither the vendor api nor driver modules"),
+        "README must say the Soapy archive bundles no SDRplay API or device modules"
+    );
+}
+
+/// MAN-82: `soapysdr0.8-module-airspy` drives the Airspy R2/Mini only. The
+/// Airspy HF+ (manta's reference device) needs SoapyAirspyHF, which Ubuntu
+/// 24.04 does not package, so the module table must not send HF+ users to
+/// the wrong package.
+#[test]
+fn readme_soapy_setup_separates_airspy_hf_plus() {
+    let install = squash_whitespace(section(&doc("README.md"), "Installation"));
+    for needle in [
+        "| Airspy R2 or Airspy Mini | `soapysdr0.8-module-airspy` |",
+        "| Airspy HF+ |",
+        "libairspyhf-dev",
+        "https://github.com/pothosware/SoapyAirspyHF",
+    ] {
+        assert!(
+            install.contains(needle),
+            "README Installation's Soapy module table never says `{needle}`"
+        );
+    }
+    assert!(
+        !install.contains("| Airspy | `soapysdr0.8-module-airspy` |"),
+        "README Installation still offers `soapysdr0.8-module-airspy` for every Airspy"
+    );
 }
 
 // ---- Scenario 4: ROADMAP's RBN-admission item ----
@@ -1663,6 +1743,7 @@ fn rbn_grade(
     let same_band = matches!(grade, Grade::Match | Grade::Disagree);
     SpotGrade {
         kind: "spotGrade",
+        seq: None,
         spot_id: format!("W3XYZ-1:1:1:960000:W1AW-{grade:?}"),
         call: "W1AW".to_string(),
         band: "20m",
@@ -2810,6 +2891,20 @@ fn claude_md_decision_paths_start_a_word_and_resolve() {
     }
 }
 
+#[test]
+fn spot_schema_transport_points_at_the_stream_contract() {
+    let schema = include_str!("../../../docs/SPOT-SCHEMA.md").replace("\r\n", "\n");
+    let transport = schema
+        .split_once("\n## Transport\n")
+        .unwrap()
+        .1
+        .split("\n## ")
+        .next()
+        .unwrap();
+    assert!(transport.contains("contracts/spots/stream.v1.md"));
+    assert!(!transport.contains("no history"));
+}
+
 /// SPEC §5 is the normative event schema, and `TrackClosed` carries a
 /// `closure` whose kind decides whether deferred evidence is judged,
 /// migrated or discarded (`manta_decode::events::ClosureKind`). PR #154
@@ -2825,4 +2920,77 @@ fn spec_section_5_track_closed_names_its_closure_kinds() {
             "SPEC §5's `TrackClosed` entry never names `{needle}`"
         );
     }
+}
+
+// ---- MAN-190 (PR #290 review): the docs follow the pending-hop redesign ----
+
+/// MAN-190 added a gotcha to `wiki/pages/decode-chain.md` (v2 evidence
+/// anchors are confirmed from two actual adjacent hops) but left the page
+/// stamped `60c4339 / 2026-10-14`: MAN-152's re-verification, made before
+/// main carried that claim. Same rule as the overview stamp test above.
+#[test]
+fn wiki_decode_chain_verified_stamp_is_not_the_pre_man190_one() {
+    let rel = "wiki/pages/decode-chain.md";
+    let claim = "anchor decisions are confirmed from two *actual* adjacent hops";
+    assert!(
+        doc(rel).contains(claim),
+        "{rel} no longer says `{claim}`; this test pins the stamp to that MAN-190 \
+         gotcha and needs updating with it"
+    );
+    let (commit, date) = wiki_verified_stamp(rel);
+    assert!(
+        commit != "60c4339" && date.as_str() > "2026-10-14",
+        "{rel} still stamps `verified: {commit} / {date}`, MAN-152's re-verification \
+         from before the MAN-190 gotcha: refresh `verified.commit`/`verified.date` (and \
+         the manifest entry) whenever the body is substantively changed"
+    );
+}
+
+/// MAN-190 computes every Evidence center for real before using its
+/// maximum, so `CenteredMax::peek_next` became test-only. SPEC v2 §1.2's
+/// MAN-193 implementation note still said the §1.7 lookahead reads the next
+/// center's `M` from the deque without advancing it. This pins that one
+/// sentence's removal; a design that peeks ahead again updates it with the
+/// spec.
+#[test]
+fn spec_v2_drops_the_man193_lookahead_sentence() {
+    let spec = squash_whitespace(&doc("docs/SPEC-decode-core-v2.md"));
+    for stale in [
+        "lookahead reads the next center's `M`",
+        "from the same deque without advancing it",
+    ] {
+        assert!(
+            !spec.contains(stale),
+            "SPEC-decode-core-v2.md still says `{stale}`, but `CenteredMax::peek_next` is \
+             test-only since MAN-190: each center's `M` comes from the query that computes it"
+        );
+    }
+}
+
+// ---- MAN-241 (PR #325 review): a retargeted claim needs a stamp that ----
+// ---- vouches for a snapshot containing it                              ----
+
+/// MAN-241 deleted `release.yml` and retargeted
+/// `wiki/pages/windows-build-setup.md` at `release-publish.yml` as the
+/// prebuilt-release-binary source, but left the page stamped
+/// `3805f78 / 2026-10-15`: a main snapshot that still carried the deleted
+/// `release.yml`, so the verification metadata vouched for a tree that
+/// contradicted the claim. Same rule as the two stamp tests above.
+#[test]
+fn wiki_windows_build_setup_stamp_names_a_snapshot_without_release_yml() {
+    let rel = "wiki/pages/windows-build-setup.md";
+    let claim = "prebuilt release binaries (`.github/workflows/release-publish.yml`)";
+    assert!(
+        doc(rel).contains(claim),
+        "{rel} no longer says `{claim}`; this test pins the stamp to that MAN-241 \
+         retarget and needs updating with it"
+    );
+    let (commit, date) = wiki_verified_stamp(rel);
+    assert!(
+        commit != "3805f78" && date.as_str() > "2026-10-15",
+        "{rel} still stamps `verified: {commit} / {date}`, a snapshot where the \
+         deleted `.github/workflows/release.yml` still existed: refresh \
+         `verified.commit`/`verified.date` (and the manifest entry) whenever the \
+         body is substantively changed"
+    );
 }

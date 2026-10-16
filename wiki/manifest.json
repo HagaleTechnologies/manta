@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-15T00:51:02Z",
-  "head_commit": "3805f78",
+  "generated_at": "2026-10-16T11:15:00Z",
+  "head_commit": "efe4223",
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -26,7 +26,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:bbf8c98aa0726da4c8005e95e854722e4167dc453ff3e207349abf960d4712c2",
+      "hash": "sha256:d0ba644a071d67a25133644fe1d0361172e71696d71195b1f997c38f25bb5202",
       "id": "decode-chain",
       "kind": "subsystem",
       "links": [
@@ -42,8 +42,8 @@
       ],
       "status": "current",
       "title": "How does the per-track CW decode chain work?",
-      "verified_commit": "60c4339",
-      "verified_date": "2026-10-14",
+      "verified_commit": "3805f78",
+      "verified_date": "2026-10-15",
       "visibility": "public"
     },
     {
@@ -243,7 +243,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:a3a5ddee297926a3692ac3116f60c4fce8e53dcdd830a0947f8406186d69e2c1",
+      "hash": "sha256:ef955ed7d6e28d8a27ae7f522a2ea766c38766b321945d6817c4d5447b09f058",
       "id": "source-reconnect",
       "kind": "gotcha",
       "links": [
@@ -256,16 +256,17 @@
         "docs/DECISIONS/2026-10-05-man73-source-reconnect.md",
         "crates/manta-cli/src/reconnect.rs",
         "crates/manta-cli/src/reconnect.rs (InputHealthTotals)",
-        "crates/manta-input/src/lib.rs (IqSource::take_discontinuity)"
+        "crates/manta-input/src/lib.rs (IqSource::take_discontinuity)",
+        "docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md"
       ],
       "status": "current",
       "title": "What's the gotcha with a live source disconnecting?",
-      "verified_commit": "d286147",
-      "verified_date": "2026-10-13",
+      "verified_commit": "9f35f1a",
+      "verified_date": "2026-10-16",
       "visibility": "public"
     },
     {
-      "hash": "sha256:b663b99ab4116f0a03db6186dc9102a21eef07e3dee3cb2a6c7d993d0861a950",
+      "hash": "sha256:eb40916133f50002e9dc5e628cbe0c77e70446b1b950c79c7418423a0d1cba7f",
       "id": "spot-output-contract",
       "kind": "interface",
       "links": [
@@ -282,12 +283,13 @@
         "docs/DECISIONS/2026-10-10-man92-telnet-commands.md",
         "docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md",
         "docs/RUNBOOKS/rbn-comparison.md",
-        "docs/SPOT-SCHEMA.md"
+        "docs/SPOT-SCHEMA.md",
+        "docs/DECISIONS/2026-10-14-man137-json-stream-resume.md"
       ],
       "status": "current",
       "title": "What spot-output contracts does manta expose (telnet RBN + JSON)?",
-      "verified_commit": "d286147",
-      "verified_date": "2026-10-13",
+      "verified_commit": "9636fe0494b4bce7973c3e0c5ad854f9ebc16f73",
+      "verified_date": "2026-10-14",
       "visibility": "public"
     },
     {
@@ -358,7 +360,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:a9ea021f5b989a216ee38a3fbbeb7dcd0ba26c64a315133d7caa66ea9ae7cd17",
+      "hash": "sha256:4b7fed6fe439b6594d397e90be05c438ccb701d444a8007faebd118f5cffe503",
       "id": "windows-build-setup",
       "kind": "howto",
       "links": [
@@ -369,7 +371,6 @@
       "path": "pages/windows-build-setup.md",
       "sources": [
         ".github/workflows/ci-full.yml",
-        ".github/workflows/release.yml",
         ".github/workflows/release-publish.yml",
         "docs/superpowers/specs/2026-09-11-man212-windows-platform-support-design.md",
         "docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md",
@@ -377,8 +378,8 @@
       ],
       "status": "current",
       "title": "How do I build and test manta on Windows?",
-      "verified_commit": "3805f78",
-      "verified_date": "2026-10-15",
+      "verified_commit": "e7243d1",
+      "verified_date": "2026-10-16",
       "visibility": "public"
     }
   ],

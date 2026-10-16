@@ -6,6 +6,7 @@
 use crate::latency::DecodeLatencyObserver;
 use crate::live::{LiveStateSink, LiveTap};
 use crate::quality::DecodeQualityObserver;
+use crate::track::CloseCounts;
 use crate::PipelineConfig;
 use anyhow::Result;
 use manta_decode::events::DecoderEvent;
@@ -38,7 +39,7 @@ const CALIBRATION_SECONDS: f64 = 2.0;
 /// (MAN-55).
 #[derive(Clone, Default)]
 pub struct ListenObservers {
-    /// Updated after each processed chunk with `TrackManager::active_track_count()`.
+    /// Updated after each processed chunk with `TrackManager::decoding_track_count()`.
     /// `None` (the default) skips the store entirely, so `listen()`'s
     /// existing callers -- including `soak()` and the CPU-budget bench --
     /// pay nothing.
@@ -100,6 +101,11 @@ pub struct ListenObservers {
     /// unchanged. `None` (the default) skips everything, so `listen()`'s
     /// existing callers pay nothing.
     pub live_state: Option<Arc<dyn LiveStateSink>>,
+    /// MAN-236: every open track (including unconfirmed candidates) and its
+    /// peak, per-reason closes across outage segments, gate-record total,
+    /// and steady-state chunk count. Use a fresh observer for each run.
+    /// `None` skips all lifecycle reads and stores. Stores are relaxed atomics.
+    pub track_lifecycle: Option<Arc<crate::TrackLifecycleObserver>>,
 }
 
 /// MAN-314: the decode loop's currently marked RTTY signals, calibrated.
@@ -630,6 +636,9 @@ pub fn listen_with_observers(
         }
     };
 
+    let lifecycle = observers.track_lifecycle.as_deref();
+    let mut close_base = CloseCounts::default();
+
     let mut seg = new_segment(
         fs,
         center_freq_hz,
@@ -659,12 +668,20 @@ pub fn listen_with_observers(
         // `break`, not `return`: whatever was read is still processed below
         // and flushed by `finish()`, so a watchdog-bounded caller (`doctor`,
         // `soak`) still analyses every sample it read, and the decode loop's
-        // own `stop` check then ends the run without another read.
+        // own `stop` check then ends the run without another read. The same
+        // holds for an EOF returned because `stop` was set during the read
+        // (MAN-252: `manta-cli`'s reconnecting wrapper ends a backoff or
+        // reopen that way).
         if stop.load(Ordering::Relaxed) {
             break;
         }
         let n = src.read(&mut calib[filled..])?;
         if n == 0 {
+            // MAN-252: a live source's wrapper reports a stop request during
+            // an outage as EOF; that is the stop, not a source that ended.
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             anyhow::bail!("audio source ended during startup calibration");
         }
         if let Some(gap) = src.take_discontinuity() {
@@ -700,6 +717,12 @@ pub fn listen_with_observers(
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     report_bad_samples(bad_base + seg.ch.bad_samples());
     rtty.update(&seg.tm);
+    if let Some(obs) = lifecycle {
+        obs.publish_counts(
+            close_base + seg.tm.close_counts(),
+            validator.gate_records_total(),
+        );
+    }
     on_tracks(n_tracks);
     // `..filled`: the whole buffer unless a stop request cut the fill short.
     let events = seg.tm.process_hops(&seg.ch.process(&calib[..filled]), |m| {
@@ -718,6 +741,12 @@ pub fn listen_with_observers(
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     report_bad_samples(bad_base + seg.ch.bad_samples());
     rtty.update(&seg.tm);
+    if let Some(obs) = lifecycle {
+        obs.publish_counts(
+            close_base + seg.tm.close_counts(),
+            validator.gate_records_total(),
+        );
+    }
     on_tracks(n_tracks);
     let mut seg_consumed: u64 = filled as u64;
     if let Some(tap) = ctx.live.as_mut() {
@@ -742,6 +771,9 @@ pub fn listen_with_observers(
             Ok(n) => n,
             Err(e) => {
                 report_active_tracks(0);
+                if let Some(obs) = lifecycle {
+                    obs.clear_active();
+                }
                 rtty.restart(seg_base + seg_consumed);
                 on_tracks(0);
                 return Err(e);
@@ -753,6 +785,9 @@ pub fn listen_with_observers(
         if let Some(gap) = src.take_discontinuity() {
             // Not `finish()`: an outage is not an end of signal (see
             // `TrackManager::finish_for_discontinuity`).
+            if let Some(obs) = lifecycle {
+                obs.observe_peak(seg.tm.active_track_count());
+            }
             let finish_events = seg.tm.finish_for_discontinuity();
             emit(
                 finish_events,
@@ -762,6 +797,9 @@ pub fn listen_with_observers(
                 &mut on_spot,
             );
             let next_id = seg.tm.next_track_id();
+            if lifecycle.is_some() {
+                close_base = close_base + seg.tm.close_counts();
+            }
             confirmations_base += seg.tm.confirmations();
             crash_base += seg.tm.static_crash_count();
             bad_base += seg.ch.bad_samples();
@@ -814,6 +852,13 @@ pub fn listen_with_observers(
         report_static_crashes(crash_base + seg.tm.static_crash_count());
         report_bad_samples(bad_base + seg.ch.bad_samples());
         rtty.update(&seg.tm);
+        if let Some(obs) = lifecycle {
+            obs.publish_counts(
+                close_base + seg.tm.close_counts(),
+                validator.gate_records_total(),
+            );
+            obs.publish_chunk(seg.tm.active_track_count());
+        }
         on_tracks(n_tracks);
         if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
             obs.observe(t0.elapsed());
@@ -823,6 +868,9 @@ pub fn listen_with_observers(
         if let Some(tap) = ctx.live.as_mut() {
             tap.maybe_tick(&mut seg.tm, seg_base + seg_consumed);
         }
+    }
+    if let Some(obs) = lifecycle {
+        obs.observe_peak(seg.tm.active_track_count());
     }
     let events = seg.tm.finish();
     emit(
@@ -839,6 +887,13 @@ pub fn listen_with_observers(
     // observers must settle back to 0 rather than be left holding the last
     // live value after a source disconnects or a replay hits EOF.
     report_active_tracks(0);
+    if let Some(obs) = lifecycle {
+        obs.publish_counts(
+            close_base + seg.tm.close_counts(),
+            validator.gate_records_total(),
+        );
+        obs.clear_active();
+    }
     report_confirmations(confirmations_base + seg.tm.confirmations());
     rtty.restart(seg_base + seg_consumed);
     on_tracks(0);
@@ -848,6 +903,143 @@ pub fn listen_with_observers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn lifecycle_close_fields(c: crate::track::CloseCounts) -> [u64; 8] {
+        [
+            c.unconfirmed,
+            c.hang_expired,
+            c.silent,
+            c.merged,
+            c.evicted,
+            c.rtty,
+            c.not_cw,
+            c.unkeyed,
+        ]
+    }
+
+    #[test]
+    fn track_lifecycle_observer_leaves_events_and_spots_unchanged() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let run = |observers| {
+            let mut events = Vec::new();
+            let mut spots = Vec::new();
+            listen_with_observers(
+                Box::new(FixedFreqSource {
+                    samples: rendered.samples.clone(),
+                    cursor: 0,
+                    fs: spec.fs,
+                    center_freq_hz: spec.center_freq_hz,
+                }),
+                &PipelineConfig::default(),
+                Arc::new(AtomicBool::new(false)),
+                observers,
+                |ev| events.push(ev.clone()),
+                |spot| spots.push(spot.clone()),
+                |_| {},
+            )
+            .unwrap();
+            (events, spots)
+        };
+        let expected = run(ListenObservers::default());
+        let obs = Arc::new(crate::TrackLifecycleObserver::default());
+        assert_eq!(
+            expected,
+            run(ListenObservers {
+                track_lifecycle: Some(obs.clone()),
+                ..Default::default()
+            })
+        );
+        let snap = obs.snapshot();
+        assert!(snap.peak_active_tracks >= 1);
+        assert!(snap.gate_records_total >= 1);
+        assert!(
+            lifecycle_close_fields(snap.close_counts)
+                .iter()
+                .sum::<u64>()
+                >= 1
+        );
+        assert_eq!(snap.active_tracks, 0);
+        let calib_n = (spec.fs * CALIBRATION_SECONDS).round() as usize;
+        assert_eq!(
+            snap.chunks as usize,
+            (rendered.samples.len() - calib_n).div_ceil(CHUNK_SAMPLES)
+        );
+    }
+
+    #[test]
+    fn track_lifecycle_observer_counts_one_chunk_per_steady_state_read() {
+        let obs = Arc::new(crate::TrackLifecycleObserver::default());
+        listen_with_observers(
+            Box::new(FixedFreqSource {
+                samples: vec![Complex32::new(0.0, 0.0); 96_000 + 3 * CHUNK_SAMPLES + 100],
+                cursor: 0,
+                fs: 48_000.0,
+                center_freq_hz: 14_000_000.0,
+            }),
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                track_lifecycle: Some(obs.clone()),
+                ..Default::default()
+            },
+            |_| {},
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
+        let snap = obs.snapshot();
+        assert_eq!(snap.chunks, 4);
+        assert_eq!(snap.peak_active_tracks, 0);
+        assert_eq!(snap.close_counts, crate::track::CloseCounts::default());
+    }
+
+    #[test]
+    fn track_lifecycle_counts_never_go_back_across_a_discontinuity() {
+        let src = GapSource::new(steady_carrier_scene(6.0), 96_000.0, 14_000_000.0, 96_000);
+        let gap_taken = src.gap_taken.clone();
+        let obs = Arc::new(crate::TrackLifecycleObserver::default());
+        let mut previous = crate::TrackLifecycleSnapshot::default();
+        let mut before_gap = 0;
+        let mut largest_active = 0;
+        listen_with_observers(
+            Box::new(src),
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                track_lifecycle: Some(obs.clone()),
+                ..Default::default()
+            },
+            |_| {},
+            |_| {},
+            |_| {
+                let now = obs.snapshot();
+                for (old, new) in lifecycle_close_fields(previous.close_counts)
+                    .into_iter()
+                    .zip(lifecycle_close_fields(now.close_counts))
+                {
+                    assert!(new >= old, "close count went back: {previous:?} -> {now:?}");
+                }
+                assert!(now.gate_records_total >= previous.gate_records_total);
+                largest_active = largest_active.max(now.active_tracks);
+                assert!(now.peak_active_tracks >= largest_active);
+                if !gap_taken.load(Ordering::Relaxed) {
+                    before_gap = lifecycle_close_fields(now.close_counts).iter().sum::<u64>();
+                }
+                previous = now;
+            },
+        )
+        .unwrap();
+        assert!(before_gap >= 1, "must close a track before the gap");
+        let total = lifecycle_close_fields(obs.snapshot().close_counts)
+            .iter()
+            .sum::<u64>();
+        assert!(
+            total > before_gap,
+            "post-gap closes must add to {before_gap}, got {total}"
+        );
+        assert_eq!(obs.snapshot().active_tracks, 0);
+    }
+
     #[test]
     fn listen_spots_a_call_only_an_override_cty_allocates() {
         let mut spec = manta_testkit::vectors::v1();
@@ -2692,6 +2884,85 @@ mod tests {
             counts.last().copied(),
             Some(0),
             "the stopped run must still end through finish(), got {counts:?}"
+        );
+    }
+
+    /// A live-shaped source that returns one short read, then EOF on its
+    /// second -- setting `stop` first when `stops_at_eof`, as `manta-cli`'s
+    /// reconnecting wrapper does when a stop request lands mid-outage.
+    struct EndsDuringCalibrationSource {
+        stop: Arc<AtomicBool>,
+        stops_at_eof: bool,
+        reads: u64,
+    }
+
+    impl manta_input::IqSource for EndsDuringCalibrationSource {
+        fn sample_rate(&self) -> f64 {
+            48_000.0
+        }
+        fn center_freq_hz(&self) -> f64 {
+            14_000_000.0
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            self.reads += 1;
+            if self.reads == 1 {
+                let n = buf.len().min(64);
+                buf[..n].fill(Complex32::new(0.0, 0.0));
+                return Ok(n);
+            }
+            if self.stops_at_eof {
+                self.stop.store(true, Ordering::Relaxed);
+            }
+            Ok(0)
+        }
+    }
+
+    /// Runs `listen_with_observers` against `EndsDuringCalibrationSource`,
+    /// returning its result and every `on_tracks` value.
+    fn run_ending_during_calibration(stops_at_eof: bool) -> (Result<()>, Vec<usize>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let src: Box<dyn manta_input::IqSource> = Box::new(EndsDuringCalibrationSource {
+            stop: stop.clone(),
+            stops_at_eof,
+            reads: 0,
+        });
+        let mut counts = Vec::new();
+        let result = listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            stop,
+            ListenObservers::default(),
+            |_ev| {},
+            |_spot| {},
+            |n| counts.push(n),
+        );
+        (result, counts)
+    }
+
+    /// MAN-252: `ReconnectingSource` reports a stop request mid-outage as
+    /// EOF. During calibration that EOF is the stop, not a source that
+    /// ended: the run ends cleanly through `finish()`.
+    #[test]
+    fn listen_treats_eof_after_a_stop_request_during_calibration_as_a_clean_end() {
+        let (result, counts) = run_ending_during_calibration(true);
+        result.expect("an EOF that follows a stop request is a clean shutdown, not an error");
+        assert_eq!(
+            counts.last().copied(),
+            Some(0),
+            "the stopped run must still end through finish(), got {counts:?}"
+        );
+    }
+
+    /// The control: an EOF during calibration with no stop request is still
+    /// the `ended during startup calibration` error (a too-short file).
+    #[test]
+    fn listen_still_fails_when_a_source_ends_during_calibration_unasked() {
+        let (result, _counts) = run_ending_during_calibration(false);
+        let err = result.expect_err("an unasked EOF during calibration is an error");
+        assert!(
+            err.to_string()
+                .contains("audio source ended during startup calibration"),
+            "got: {err}"
         );
     }
 

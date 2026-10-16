@@ -9,7 +9,7 @@ use crate::config::Loaded;
 use crate::config_cmd::{self, Listener};
 use manta_server::config::{RbnCompareConfig, RbnUplinkConfig, ServerConfig};
 use manta_server::status_doc::escape_for_terminal;
-use std::io::{self, Write as _};
+use std::io;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::mpsc;
@@ -146,10 +146,13 @@ pub(crate) fn worst(checks: &[Check]) -> Status {
 }
 
 /// Where checks go: printed as each result is known (human mode), or only
-/// collected (`--json`).
+/// collected (`--json`). MAN-232: the first failed write is remembered, not
+/// panicked on, and later checks are collected without printing.
 pub(crate) struct Sink {
     json: bool,
     pub checks: Vec<Check>,
+    /// The first failed stdout write, if any.
+    failed: Option<anyhow::Error>,
 }
 
 impl Sink {
@@ -157,15 +160,24 @@ impl Sink {
         Self {
             json,
             checks: Vec::new(),
+            failed: None,
         }
     }
 
     pub fn push(&mut self, check: Check) {
-        if !self.json {
-            print!("{}", render(&check));
-            let _ = io::stdout().flush();
+        if !self.json && self.failed.is_none() {
+            if let Err(e) = crate::stdio::out!("{}", render(&check)) {
+                self.failed = Some(e);
+            }
         }
         self.checks.push(check);
+    }
+
+    /// The first failed write, so `doctor` stops instead of opening the
+    /// receiver and running the signal check for a reader that left
+    /// (MAN-232); `main` maps it to exit 141.
+    pub fn written(&mut self) -> anyhow::Result<()> {
+        self.failed.take().map_or(Ok(()), Err)
     }
 }
 
@@ -1763,6 +1775,8 @@ mod tests {
             "--ntp-server",
             "| 0 |",
             "| 1 |",
+            "| 3 |",
+            "--strict",
         ] {
             assert!(runbook.contains(needle), "setup-checks.md lacks {needle}");
         }

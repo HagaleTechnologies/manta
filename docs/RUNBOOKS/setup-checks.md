@@ -13,8 +13,9 @@ Run it with the service **stopped**. A running `manta run` holds its own
 ports and its receiver, so doctor would report the ports as in use and could
 not open a sound card or SDR that only one program may hold.
 
-Decision record:
-[2026-10-10-man126-doctor-setup-checks](../DECISIONS/2026-10-10-man126-doctor-setup-checks.md).
+Decision records:
+[2026-10-10-man126-doctor-setup-checks](../DECISIONS/2026-10-10-man126-doctor-setup-checks.md),
+[2026-10-15-man235-doctor-rerun-hint-and-strict-exit](../DECISIONS/2026-10-15-man235-doctor-rerun-hint-and-strict-exit.md).
 
 ## What it prints
 
@@ -43,6 +44,11 @@ verdict: DECODING -- at least one confirmed spot. End to end, working.
 
 doctor: 1 failed: telnet port (7 passed)
 ```
+
+When a run asked for less than 60 s (`--duration`, default 10) reads
+`WEAK_NO_DECODE`, a `hint:` line follows the verdict: a clean signal can need
+20 s or more to be confirmed as a spot, so rerun with `--duration 60` before
+looking for another cause. The line is not printed with `--json`.
 
 All check lines go to stdout. With `--json`, doctor prints one JSON object
 instead: the signal report's keys, plus `checks` (one object per line, with
@@ -110,9 +116,13 @@ non-standard port.
 
 | Code | Meaning |
 |---|---|
-| 0 | No check failed. Warnings are allowed, and the signal verdict (including `NO_SIGNAL`) does not change the exit code: a quiet band is not a broken setup |
+| 0 | Without `--strict`: no check failed. Warnings are allowed, and the signal verdict (including `NO_SIGNAL`) does not change the exit code: a quiet band is not a broken setup. With `--strict`: no check failed and the verdict is `DECODING` |
 | 1 | At least one check failed, or doctor could not start (a bad `--duration`, a config that does not load) |
 | 2 | Command-line usage error |
+| 3 | With `--strict` only: no check failed, but the verdict is `NO_SIGNAL`, `NOT_CW`, `ACTIVITY_NO_SNR`, `NOISY_NO_DECODE` or `WEAK_NO_DECODE` |
+| 141 | stdout closed before doctor finished its report (for example `manta doctor \| head -3`); checks after that point did not run |
+
+A failed check exits 1 with or without `--strict`, whatever the verdict.
 
 ## Network traffic doctor sends
 
