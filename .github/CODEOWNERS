@@ -23,7 +23,7 @@ Cargo.toml           @thagale
 
 # Cross.toml controls the exact cross-compilation toolchain/image used to build release
 # artifacts -- an unowned edit here can substitute a different (unverified) build environment
-# for release builds without touching release.yml itself.
+# for release builds without touching the release workflow itself.
 /Cross.toml          @thagale
 
 # .cargo/config.toml sets git-fetch-with-cli (this workspace's git dependencies otherwise

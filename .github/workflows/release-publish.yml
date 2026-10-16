@@ -3,10 +3,12 @@ name: Release Publish
 # MAN-21: the actual publish path -- pushes the multi-arch Docker image
 # to GHCR and creates the GitHub Release, from a tagged commit.
 #
-# Deliberately a SEPARATE FILE from release.yml, not a job within it, and
-# deliberately has NO `pull_request` trigger anywhere in its `on:` block
-# (PR #78 review round 6). Splitting into a second job within the same
-# file (the previous approach) is not sufficient on its own: for a
+# MAN-241: the single release workflow -- the duplicate build-only
+# workflow was deleted; no tag ever ran it. This file deliberately
+# has NO `pull_request` trigger anywhere in its `on:` block (PR #78
+# review round 6). Housing the write-capable jobs in a workflow that
+# also ran on PRs (the previous approach) is not sufficient on its
+# own: for a
 # `pull_request` event, GitHub evaluates the ENTIRE workflow file --
 # every job, every `if:`, every `permissions:` block -- from the PR's OWN
 # head ref, not the base branch (this is exactly why `pull_request_target`

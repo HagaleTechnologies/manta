@@ -359,7 +359,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:a9ea021f5b989a216ee38a3fbbeb7dcd0ba26c64a315133d7caa66ea9ae7cd17",
+      "hash": "sha256:4b7fed6fe439b6594d397e90be05c438ccb701d444a8007faebd118f5cffe503",
       "id": "windows-build-setup",
       "kind": "howto",
       "links": [
@@ -370,7 +370,6 @@
       "path": "pages/windows-build-setup.md",
       "sources": [
         ".github/workflows/ci-full.yml",
-        ".github/workflows/release.yml",
         ".github/workflows/release-publish.yml",
         "docs/superpowers/specs/2026-09-11-man212-windows-platform-support-design.md",
         "docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md",

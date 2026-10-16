@@ -54,7 +54,7 @@ KIT = (
 )
 EXECUTABLE_KIT = {"packaging/launchd/create-service-account.sh", "packaging/launchd/rotate-log.sh"}
 FAKE_BINARY = b"\x7fELF fake manta\x00\x01\x02"
-RELEASE_WORKFLOWS = ("release.yml", "release-publish.yml")
+RELEASE_WORKFLOWS = ("release-publish.yml",)
 OLD_PACKAGING = ("tar -C dist", "Compress-Archive")
 
 # What `manta man-pages --out` produces, faked: two distinct pages (the set

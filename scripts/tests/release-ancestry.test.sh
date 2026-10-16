@@ -123,10 +123,8 @@ job_block() {
 require() { # text, fixed expected line, label
   if ! grep -Fxq -- "$2" <<< "$1"; then fail "$3"; fi
 }
-for wf in release-publish.yml release.yml; do
+for wf in release-publish.yml; do
   path="$REPO_ROOT/.github/workflows/$wf"
-  # MAN-241 may remove the duplicate, read-only workflow.
-  if [ "$wf" = release.yml ] && [ ! -f "$path" ]; then continue; fi
   gate="$(job_block "$path" validate-tag)"
   build="$(job_block "$path" build)"
   require "$build" '    needs: validate-tag' "$wf: platform builds bypass validation"
@@ -146,9 +144,6 @@ for wf in release-publish.yml release.yml; do
   require "$step" "          RELEASE_COMMIT: \${{ github.sha }}" "$wf: missing immutable event SHA"
   require "$step" "          DEFAULT_BRANCH: \${{ github.event.repository.default_branch }}" "$wf: missing event default branch"
   require "$step" "        run: scripts/check-release-ancestry.sh \"\$RELEASE_COMMIT\" \"\$DEFAULT_BRANCH\"" "$wf: helper not invoked"
-  if [ "$wf" = release.yml ]; then
-    require "$(job_block "$path" docker-build)" '    needs: build' "$wf: Docker build bypasses platform validation"
-  fi
 done
 
 publish_path="$REPO_ROOT/.github/workflows/release-publish.yml"
