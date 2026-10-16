@@ -1485,16 +1485,17 @@ impl LiveSourceSpec {
     /// produces a fully-composed source and nothing above it (in particular
     /// `ReconnectingSource`) needs to know about either wrapper. A reopen
     /// therefore also starts a fresh decimator, with no filter state carried
-    /// across the outage.
+    /// across the outage. A reopen runs on `ReconnectingSource`'s reopen
+    /// thread (MAN-252), so everything this builds must be `Send`.
     fn open(
         &self,
         capture_rate_hz: Option<f64>,
         dial_freq_hz: Option<f64>,
-    ) -> Result<Box<dyn IqSource>> {
+    ) -> Result<reconnect::SendSource> {
         // How far radiod has moved the channel since the first open; only
         // ka9q sets it (MAN-140 D13).
         let mut retune_hz = 0.0;
-        let src: Box<dyn IqSource> = match self {
+        let src: reconnect::SendSource = match self {
             LiveSourceSpec::Kiwi(kiwi) => {
                 let host = kiwi
                     .host
@@ -1616,7 +1617,7 @@ fn open_audio_source(
     source: Option<PathBuf>,
     source_iq: bool,
     dial_freq_hz: Option<f64>,
-) -> Result<Box<dyn IqSource>> {
+) -> Result<reconnect::SendSource> {
     Ok(match source {
         // A raw-IQ WAV is a `WavIqSource`, not an `AudioIqSource`, so it
         // has no `with_center_freq_hz`: `--dial-freq-hz` is applied with
@@ -1624,7 +1625,7 @@ fn open_audio_source(
         // audio sources to a native dial frequency; this keeps the IQ
         // replay path honoring `--dial-freq-hz` exactly as before.)
         Some(path) if source_iq => {
-            let src: Box<dyn IqSource> = Box::new(manta_input::WavIqSource::open(&path)?);
+            let src: reconnect::SendSource = Box::new(manta_input::WavIqSource::open(&path)?);
             match dial_freq_hz {
                 Some(freq_hz) => Box::new(FixedCenterFreqSource {
                     inner: src,
@@ -1649,7 +1650,7 @@ fn open_audio_source(
 fn audio_with_dial(
     src: manta_input::AudioIqSource,
     dial_freq_hz: Option<f64>,
-) -> Result<Box<dyn IqSource>> {
+) -> Result<reconnect::SendSource> {
     Ok(Box::new(match dial_freq_hz {
         Some(hz) => src.with_center_freq_hz(hz)?,
         None => src,
@@ -1685,7 +1686,7 @@ fn source_iq_has_real_rf_center(path: &Path, source_iq: bool) -> bool {
 /// for raw-IQ WAV replay, which has no native dial setter. See
 /// `--dial-freq-hz`.
 struct FixedCenterFreqSource {
-    inner: Box<dyn IqSource>,
+    inner: reconnect::SendSource,
     freq_hz: f64,
 }
 
@@ -1821,9 +1822,9 @@ fn recording_center_warning(wav: &Path, sidecar_center_hz: Option<f64>) -> Optio
 /// hpsdr/audio/file replay), mirroring how `dial_freq_hz`'s
 /// `FixedCenterFreqSource` wrap is already applied uniformly below.
 fn maybe_decimate(
-    src: Box<dyn IqSource>,
+    src: reconnect::SendSource,
     capture_rate_hz: Option<f64>,
-) -> Result<Box<dyn IqSource>> {
+) -> Result<reconnect::SendSource> {
     match capture_rate_hz {
         Some(target) if (target - src.sample_rate()).abs() > 1e-6 => {
             Ok(Box::new(manta_input::DecimatingSource::new(src, target)?))
@@ -5662,11 +5663,13 @@ fn run_command() -> Result<std::process::ExitCode> {
             // calibration read (review round 7; before that round it was
             // observed only once the two-second calibration buffer had
             // filled); it processes only what it has already read and
-            // returns `Ok` without reading again. A read already in flight is not
-            // interrupted: it returns with whatever the source yields next,
-            // or fails after that source's own stall bound, and the shutdown
-            // sequence below runs on both the `Ok` and the error path,
-            // exactly as it does for a signal arriving mid-decode. The
+            // returns `Ok` without reading again. A reconnect's backoff or
+            // reopen in flight ends within ~100 ms (MAN-252: the reopen runs
+            // on its own thread, which a stop abandons). A read already in
+            // flight is not interrupted: it returns with whatever the source
+            // yields next, or fails after that source's own stall bound, and
+            // the shutdown sequence below runs on both the `Ok` and the error
+            // path, exactly as it does for a signal arriving mid-decode. The
             // banner itself still precedes the listener
             // tasks (see `start_spot_server`), so its ordering against
             // per-connection lines is unchanged.
@@ -5963,7 +5966,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                     first,
                     resolved.replay,
                     label,
-                    Box::new(move || reopen_spec.open(capture_rate_hz, dial_freq_hz)),
+                    Box::new(move || {
+                        Ok(reopen_spec.open(capture_rate_hz, dial_freq_hz)? as Box<dyn IqSource>)
+                    }),
                 )?
             };
 

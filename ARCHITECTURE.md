@@ -176,7 +176,11 @@ advanced by the gap, so spot timestamps stay wall-clock-true with no
 audio spliced across the gap and no zero-fill (see
 `docs/DECISIONS/2026-10-05-man73-source-reconnect.md` for why zero-fill
 was rejected). File replay is exempt: its errors and EOF must reach
-`listen()` unchanged for byte-identical replay.
+`listen()` unchanged for byte-identical replay. Each reopen runs on its own
+short-lived `reopen-<kind>` thread, so a stop request during an outage
+abandons it and `read()` returns EOF within ~100 ms; the client drain,
+which starts only after `listen()` returns, therefore no longer waits for a
+stalled DNS lookup, connect or driver open (MAN-252).
 
 **Paced and looping replay (MAN-269).** File replay normally runs as fast
 as the machine decodes. `run --realtime` (`input.realtime`) wraps the file
