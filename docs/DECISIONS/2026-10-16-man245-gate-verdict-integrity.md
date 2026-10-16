@@ -169,15 +169,19 @@ failed at metadata in `dependabot-auto-merge.yml` rather than approving.
    - `Codex review clean (earlier verdict for this revision)`: the label
      was applied by `github-actions[bot]` **and** a `Codex review clean`
      check-run that hagale-agent (4696353) completed as success is on the
-     head (`filter=all`). Every workflow that uses `GITHUB_TOKEN` labels
-     as `github-actions[bot]`, including one defined on a branch nobody
-     has reviewed and run on `push`, so the actor alone proves nothing.
-     hagale-agent's key is in the `main`-only codex-review environment,
-     and only the verdict step's PATCH titles its check-run `Codex review
-     clean`;
+     head (`filter=all`) **and completed at or after the latest `labeled`
+     event** — the verdict step applies the label before the response job
+     PATCHes the check-run, so a `github-actions[bot]` label newer than
+     every verdict check-run was reapplied by some other workflow and is
+     titled an override (F1, validate attempt 3). Every workflow that
+     uses `GITHUB_TOKEN` labels as `github-actions[bot]`, including one
+     defined on a branch nobody has reviewed and run on `push`, so the
+     actor alone proves nothing. hagale-agent's key is in the
+     `main`-only codex-review environment, and only the verdict step's
+     PATCH titles its check-run `Codex review clean`;
    - `Codex review overridden by <login> (codex-clean label)`: anyone
-     else, or `github-actions[bot]` with no such check-run, with a
-     `::warning::` in the log;
+     else, or `github-actions[bot]` with no such check-run at or after
+     the label event, with a `::warning::` in the log;
    - `Codex review overridden (codex-clean label; applier unknown)`: the
      timeline could not be read, with the same warning;
    - `Draft: not reviewed` and `Dependabot update: not sent to Codex`
@@ -224,10 +228,13 @@ failed at metadata in `dependabot-auto-merge.yml` rather than approving.
     `pageInfo`, a baseline marked incomplete and a resolved 51-comment
     thread), the baseline's `incomplete` output and the failure title;
   - `CodexCheckRunProvenanceTests`: the label lookup (no label, the
-    gate's label with and without hagale-agent's verdict check-run, an
-    unreadable check-run list, a later human label, a label on page 2, an
-    unreadable timeline), every pass-through and clean title, and the
-    failed check-run when no hagale-agent token was minted;
+    gate's label with and without hagale-agent's verdict check-run, a bot
+    label newer than every verdict check-run, a verdict check-run in the
+    same second as the label, an unreadable check-run list, a later human
+    label, a label on page 2, an unreadable timeline), every pass-through
+    and clean title, the lookup's outputs fed through create-check for the
+    later-bot-label override, and the failed check-run when no
+    hagale-agent token was minted;
   - `RequiredCheckSourcesTests`: the script against the live ruleset as
     read, with `Supply Chain` pinned right and wrong, with `test
     (windows-latest)` and `PR title` added, an unknown context, a pinned
@@ -244,9 +251,9 @@ failed at metadata in `dependabot-auto-merge.yml` rather than approving.
 - A `github-actions[bot]` label can also come from a workflow defined on
   a branch, which runs on `push` or `pull_request` before anyone reviews
   it (CODEOWNERS `/.github/` only blocks the merge). It still passes the
-  gate, as any `codex-clean` label does (decision 3), but without
-  hagale-agent's `Codex review clean` check-run on the head it is titled
-  an override.
+  gate, as any `codex-clean` label does (decision 3), but unless
+  hagale-agent's `Codex review clean` check-run on the head completed at
+  or after the label event it is titled an override.
 - The Codex and `test (*)` checks stay unpinned, so a commit status or
   another app's check-run with those names is not rejected by the
   ruleset.

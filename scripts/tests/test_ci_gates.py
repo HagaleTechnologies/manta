@@ -621,8 +621,11 @@ def labeled(actor, at, name=LABEL):
     return {"event": "labeled", "label": {"name": name}, "actor": {"login": actor}, "created_at": at}
 
 
-def check_run(app_id, title, conclusion="success", name=CHECK_NAME):
-    return {"name": name, "app": {"id": app_id}, "conclusion": conclusion, "output": {"title": title}}
+def check_run(app_id, title, conclusion="success", name=CHECK_NAME, completed="2026-10-16T10:00:05Z"):
+    # completed_at defaults to just after the gate-verdict label below (10:00:00Z): the verdict
+    # step applies the label, then the response job PATCHes the check-run (MAN-245 F1 binding).
+    return {"name": name, "app": {"id": app_id}, "conclusion": conclusion,
+            "completed_at": completed, "output": {"title": title}}
 
 
 VERDICT_RUN = check_run(4696353, "Codex review clean")
@@ -663,6 +666,16 @@ class CodexCheckRunProvenanceTests(unittest.TestCase):
                    #  already_clean, label_actor, earlier_verdict)
             ("none", ["bug"], None, False, (), False, "false", "", "false"),
             ("gate verdict", [LABEL], [[gate]], False, [VERDICT_RUN], False, "true", "github-actions[bot]", "true"),
+            # F1: the verdict check-run must be at or after the latest label event -- the verdict
+            # step labels before the response job PATCHes -- so a bot label newer than every
+            # verdict check-run was reapplied by another GITHUB_TOKEN workflow: an override.
+            ("later bot label, older verdict", [LABEL],
+             [[labeled("github-actions[bot]", "2026-10-16T11:00:00Z")]], False,
+             [check_run(4696353, "Codex review clean", completed="2026-10-16T09:05:00Z")], False,
+             "true", "github-actions[bot]", "false"),
+            ("label and verdict check same second", [LABEL], [[gate]], False,
+             [check_run(4696353, "Codex review clean", completed="2026-10-16T10:00:00Z")], False,
+             "true", "github-actions[bot]", "true"),
             ("workflow label, no verdict check-run", [LABEL], [[gate]], False, forged, False,
              "true", "github-actions[bot]", "false"),
             ("workflow label, check-runs unreadable", [LABEL], [[gate]], False, [VERDICT_RUN], True,
@@ -681,6 +694,36 @@ class CodexCheckRunProvenanceTests(unittest.TestCase):
                 self.assertIn(f"already_clean={clean}", lines)
                 self.assertIn(f"label_actor={actor}", lines)
                 self.assertIn(f"earlier_verdict={earlier}", lines)
+
+    def test_later_bot_label_is_titled_an_override(self):
+        # F1 (validate attempt 3, PR #327): a github-actions[bot] label applied AFTER an older
+        # clean verdict check-run must not read as this workflow's own verdict label. The
+        # lookup feeds create-check exactly as the request job does, so the pass-through the
+        # validator reproduced -- "Codex review clean (earlier verdict...)" with no warning --
+        # becomes override attribution.
+        later_label = [[labeled("github-actions[bot]", "2026-10-16T11:00:00Z")]]
+        older_verdict = [check_run(4696353, "Codex review clean", completed="2026-10-16T09:05:00Z")]
+        genuine_label = [[labeled("github-actions[bot]", "2026-10-16T10:00:00Z")]]
+        genuine_verdict = [check_run(4696353, "Codex review clean", completed="2026-10-16T10:00:05Z")]
+        for case, timeline, checks, wanted, warning in (
+            ("later bot label, older verdict", later_label, older_verdict,
+             "Codex review overridden by github-actions[bot] (codex-clean label)", True),
+            ("genuine order: label then verdict PATCH", genuine_label, genuine_verdict,
+             "Codex review clean (earlier verdict for this revision)", False),
+        ):
+            with self.subTest(case=case):
+                proc, written, _ = self._lookup([LABEL], timeline, checks=checks)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                outs = dict(l.split("=", 1) for l in output_lines(written))
+                self.assertEqual(outs["already_clean"], "true")
+                proc, written, calls = self._create(ALREADY_CLEAN=outs["already_clean"],
+                                                    LABEL_ACTOR=outs["label_actor"],
+                                                    EARLIER_VERDICT=outs["earlier_verdict"])
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                posts = [c for c in calls if f"repos/{GATE_REPO}/check-runs" in c]
+                self.assertEqual(len(posts), 1, calls)
+                self.assertEqual(arg_prefixed(posts[0], "output[title]="), [f"output[title]={wanted}"])
+                self.assertEqual("::warning::" in proc.stdout, warning, proc.stdout)
 
     def _create(self, **env):
         with tempfile.TemporaryDirectory() as tmp:

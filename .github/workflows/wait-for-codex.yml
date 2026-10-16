@@ -162,14 +162,20 @@ jobs:
           if names=$(gh api --paginate "repos/$REPO/issues/$PR/labels?per_page=100" --jq '.[].name' 2>/dev/null) \
               && grep -qxF "$target" <<< "$names"; then
             already_clean=true
-            label_actor=$(gh api --paginate --slurp "repos/$REPO/issues/$PR/timeline?per_page=100" 2>/dev/null \
-              | jq -r --arg l "$target" '(add // []) | [.[] | select(.event == "labeled" and .label.name == $l)] | last | .actor.login // ""' 2>/dev/null) || label_actor=""
+            label_record=$(gh api --paginate --slurp "repos/$REPO/issues/$PR/timeline?per_page=100" 2>/dev/null \
+              | jq -r --arg l "$target" '(add // []) | [.[] | select(.event == "labeled" and .label.name == $l)] | last | "\(.actor.login // "")\t\(.created_at // "")"' 2>/dev/null) || label_record=""
+            label_actor=${label_record%%$'\t'*}
+            label_at=${label_record#*$'\t'}
             # Every GITHUB_TOKEN workflow labels as github-actions[bot], one defined on an unreviewed
             # branch included. Only a "Codex review clean" check-run hagale-agent (4696353) completed on
             # this head shows the verdict step ran: the app key is in the main-only environment.
+            # MAN-245: the verdict step applies the label BEFORE the response job PATCHes that
+            # check-run success, so the latest labeled event must sit at or before the completed
+            # check-run it claims. A github-actions[bot] label newer than every verdict check-run
+            # was reapplied by some other GITHUB_TOKEN workflow, and is titled an override below.
             if [ "$label_actor" = "github-actions[bot]" ]; then
               earlier_verdict=$(gh api --paginate --slurp "repos/$REPO/commits/$HEAD_SHA/check-runs?filter=all&per_page=100" 2>/dev/null \
-                | jq -r '[.[].check_runs[] | select(.name == "Codex review clean (gate before expensive downstream jobs)" and .app.id == 4696353 and .conclusion == "success" and .output.title == "Codex review clean")] | length > 0' 2>/dev/null) || earlier_verdict=false
+                | jq -r --arg at "$label_at" '[.[].check_runs[] | select(.name == "Codex review clean (gate before expensive downstream jobs)" and .app.id == 4696353 and .conclusion == "success" and .output.title == "Codex review clean" and $at != "" and (.completed_at // "") >= $at)] | length > 0' 2>/dev/null) || earlier_verdict=false
               [ "$earlier_verdict" = "true" ] || earlier_verdict=false
             fi
           fi
@@ -252,7 +258,7 @@ jobs:
             conclusion="success"
             if [ "$LABEL_ACTOR" = "github-actions[bot]" ] && [ "$EARLIER_VERDICT" = "true" ]; then
               title="Codex review clean (earlier verdict for this revision)"
-              summary="codex-clean:$sha12 was applied by this workflow's verdict step after a clean Codex round on this exact revision, whose Codex review clean check-run is on this commit."
+              summary="codex-clean:$sha12 was applied by this workflow's verdict step after a clean Codex round on this exact revision; its Codex review clean check-run is on this commit and completed at or after the label was applied."
             elif [ -n "$LABEL_ACTOR" ]; then
               title="Codex review overridden by $LABEL_ACTOR (codex-clean label)"
               summary="No Codex round ran for this event. codex-clean:$sha12 was applied by $LABEL_ACTOR, not by this workflow's verdict step: an override, not a review."
