@@ -25,7 +25,9 @@ use std::sync::Arc;
 const RAW_CHUNK_SAMPLES: usize = 4096;
 
 pub struct DecimatingSource {
-    inner: Box<dyn IqSource>,
+    /// `Send`, so a source built on `manta-cli`'s reopen thread can move to
+    /// the decode thread (MAN-252).
+    inner: Box<dyn IqSource + Send>,
     decimator: Decimator,
     fs_out: f64,
     /// MAN-196: the decimator's <= 1 dB half-bandwidth, captured at
@@ -56,7 +58,7 @@ impl DecimatingSource {
     /// *does* divide evenly but still fails the channelizer's table
     /// constraint (or the minimum-channel-count floor) surfaces
     /// `Decimator::new`'s own error unchanged.
-    pub fn new(inner: Box<dyn IqSource>, target_rate_hz: f64) -> Result<Self> {
+    pub fn new(inner: Box<dyn IqSource + Send>, target_rate_hz: f64) -> Result<Self> {
         let fs_in = inner.sample_rate();
         let factor = (fs_in / target_rate_hz).round() as usize;
         if factor == 0 || (fs_in / factor as f64 - target_rate_hz).abs() > 1e-6 {
@@ -241,7 +243,7 @@ mod tests {
         // packet size -- the exact shape a large calibration read produces.
         let fs_in = 192_000.0;
         let n_in = 40_000;
-        let inner: Box<dyn IqSource> = Box::new(PacketizedSource {
+        let inner: Box<dyn IqSource + Send> = Box::new(PacketizedSource {
             samples: tone(2_000.0, n_in, fs_in),
             cursor: 0,
             fs: fs_in,
@@ -266,7 +268,7 @@ mod tests {
 
     #[test]
     fn sample_rate_reports_the_decimated_value() {
-        let inner: Box<dyn IqSource> = Box::new(InMemorySource {
+        let inner: Box<dyn IqSource + Send> = Box::new(InMemorySource {
             samples: tone(1_000.0, 1_000, 192_000.0),
             cursor: 0,
             fs: 192_000.0,
@@ -281,7 +283,7 @@ mod tests {
     #[test]
     fn center_freq_and_liveness_forward_to_the_inner_source() {
         let live = Arc::new(AtomicBool::new(true));
-        let inner: Box<dyn IqSource> = Box::new(InMemorySource {
+        let inner: Box<dyn IqSource + Send> = Box::new(InMemorySource {
             samples: tone(1_000.0, 1_000, 192_000.0),
             cursor: 0,
             fs: 192_000.0,
@@ -301,7 +303,7 @@ mod tests {
     fn read_yields_roughly_input_len_over_factor_samples_then_eof() {
         let fs_in = 192_000.0;
         let n_in = 40_000;
-        let inner: Box<dyn IqSource> = Box::new(InMemorySource {
+        let inner: Box<dyn IqSource + Send> = Box::new(InMemorySource {
             samples: tone(2_000.0, n_in, fs_in),
             cursor: 0,
             fs: fs_in,
@@ -342,7 +344,7 @@ mod tests {
         let n_in = 40_000;
         let samples = tone(2_000.0, n_in, fs_in);
 
-        let inner: Box<dyn IqSource> = Box::new(InMemorySource {
+        let inner: Box<dyn IqSource + Send> = Box::new(InMemorySource {
             samples: samples.clone(),
             cursor: 0,
             fs: fs_in,
@@ -373,7 +375,7 @@ mod tests {
 
     #[test]
     fn rejects_non_power_of_two_factor() {
-        let inner: Box<dyn IqSource> = Box::new(InMemorySource {
+        let inner: Box<dyn IqSource + Send> = Box::new(InMemorySource {
             samples: vec![],
             cursor: 0,
             fs: 192_000.0,
@@ -386,7 +388,7 @@ mod tests {
 
     #[test]
     fn rejects_target_rate_failing_channelizer_table_constraint() {
-        let inner: Box<dyn IqSource> = Box::new(InMemorySource {
+        let inner: Box<dyn IqSource + Send> = Box::new(InMemorySource {
             samples: vec![],
             cursor: 0,
             fs: 100_000.0,
@@ -400,7 +402,7 @@ mod tests {
     #[test]
     fn health_counters_forward_to_the_inner_source() {
         let counters = Arc::new(InputHealthCounters::new());
-        let inner: Box<dyn IqSource> = Box::new(InMemorySource {
+        let inner: Box<dyn IqSource + Send> = Box::new(InMemorySource {
             samples: tone(1_000.0, 1_000, 192_000.0),
             cursor: 0,
             fs: 192_000.0,
@@ -448,7 +450,7 @@ mod tests {
         // MAN-196: the clip is the decimator's trusted band
         // (TRUSTED_HALF_BAND_FRACTION * 48_000 = 21_724.8 Hz), no longer
         // the 24_000 Hz output Nyquist.
-        let wide: Box<dyn IqSource> = Box::new(InMemorySource {
+        let wide: Box<dyn IqSource + Send> = Box::new(InMemorySource {
             samples: Vec::new(),
             cursor: 0,
             fs: 192_000.0,
@@ -467,7 +469,7 @@ mod tests {
     fn rf_passband_is_clipped_to_the_trusted_band_not_the_nyquist() {
         let expected = manta_dsp::decimate::TRUSTED_HALF_BAND_FRACTION * 48_000.0;
         assert!((expected - 21_724.8).abs() < 1e-9);
-        let wide: Box<dyn IqSource> = Box::new(InMemorySource {
+        let wide: Box<dyn IqSource + Send> = Box::new(InMemorySource {
             samples: Vec::new(),
             cursor: 0,
             fs: 192_000.0,

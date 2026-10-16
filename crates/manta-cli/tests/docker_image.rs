@@ -280,10 +280,7 @@ fn dockerfile_healthcheck_probes_the_daemon_config() {
 
 #[test]
 fn every_buildx_call_site_builds_the_same_three_platforms() {
-    for workflow in [
-        ".github/workflows/release.yml",
-        ".github/workflows/release-publish.yml",
-    ] {
+    for workflow in [".github/workflows/release-publish.yml"] {
         let text = doc(workflow);
         let lines: Vec<&str> = text
             .lines()

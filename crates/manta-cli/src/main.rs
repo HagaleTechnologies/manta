@@ -479,12 +479,14 @@ enum Command {
     },
     /// Run the live decoder for a fixed duration as a stability check.
     ///
-    /// Reads from the same sources `listen` does, decodes for --duration
+    /// Reads from the same sources `listen` does, runs for the full --duration
     /// seconds, and exits non-zero if the pipeline panics or its memory
-    /// use keeps growing. Intended for unattended stability runs, not for
-    /// day-to-day operating.
+    /// use keeps growing. A --source recording that ends sooner does not end
+    /// the run: soak waits out the rest of --duration before it reports.
+    /// Intended for unattended stability runs, not for day-to-day operating.
     Soak {
-        /// How long to run, in seconds.
+        /// How long to run, in seconds. The run lasts this long even when a
+        /// --source recording ends sooner.
         #[arg(long)]
         duration: u64,
         /// Sound-card input device; matched by substring. Defaults to the
@@ -493,9 +495,11 @@ enum Command {
         device: Option<String>,
         /// Replay a WAV file instead of listening to a live device.
         ///
-        /// Decoded as fast as the machine manages, not in real time, so a
-        /// 60-second file usually finishes sooner than that. Useful for
-        /// demos and repeatable testing.
+        /// Decoded as fast as the machine manages, not in real time, but the
+        /// run still lasts the full --duration: given a 60-second file and
+        /// --duration 3600, soak decodes the file, then waits, decoding nothing,
+        /// until the hour is up and prints its report. A live source keeps the
+        /// decoder busy for the whole run.
         #[arg(long, conflicts_with = "device", help_heading = "Audio input")]
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
@@ -1485,16 +1489,17 @@ impl LiveSourceSpec {
     /// produces a fully-composed source and nothing above it (in particular
     /// `ReconnectingSource`) needs to know about either wrapper. A reopen
     /// therefore also starts a fresh decimator, with no filter state carried
-    /// across the outage.
+    /// across the outage. A reopen runs on `ReconnectingSource`'s reopen
+    /// thread (MAN-252), so everything this builds must be `Send`.
     fn open(
         &self,
         capture_rate_hz: Option<f64>,
         dial_freq_hz: Option<f64>,
-    ) -> Result<Box<dyn IqSource>> {
+    ) -> Result<reconnect::SendSource> {
         // How far radiod has moved the channel since the first open; only
         // ka9q sets it (MAN-140 D13).
         let mut retune_hz = 0.0;
-        let src: Box<dyn IqSource> = match self {
+        let src: reconnect::SendSource = match self {
             LiveSourceSpec::Kiwi(kiwi) => {
                 let host = kiwi
                     .host
@@ -1623,7 +1628,7 @@ fn open_audio_source(
     source: Option<PathBuf>,
     source_iq: bool,
     dial_freq_hz: Option<f64>,
-) -> Result<Box<dyn IqSource>> {
+) -> Result<reconnect::SendSource> {
     Ok(match source {
         // A raw-IQ WAV is a `WavIqSource`, not an `AudioIqSource`, so it
         // has no `with_center_freq_hz`: `--dial-freq-hz` is applied with
@@ -1631,7 +1636,7 @@ fn open_audio_source(
         // audio sources to a native dial frequency; this keeps the IQ
         // replay path honoring `--dial-freq-hz` exactly as before.)
         Some(path) if source_iq => {
-            let src: Box<dyn IqSource> = Box::new(manta_input::WavIqSource::open(&path)?);
+            let src: reconnect::SendSource = Box::new(manta_input::WavIqSource::open(&path)?);
             match dial_freq_hz {
                 Some(freq_hz) => Box::new(FixedCenterFreqSource {
                     inner: src,
@@ -1656,7 +1661,7 @@ fn open_audio_source(
 fn audio_with_dial(
     src: manta_input::AudioIqSource,
     dial_freq_hz: Option<f64>,
-) -> Result<Box<dyn IqSource>> {
+) -> Result<reconnect::SendSource> {
     Ok(Box::new(match dial_freq_hz {
         Some(hz) => src.with_center_freq_hz(hz)?,
         None => src,
@@ -1692,7 +1697,7 @@ fn source_iq_has_real_rf_center(path: &Path, source_iq: bool) -> bool {
 /// for raw-IQ WAV replay, which has no native dial setter. See
 /// `--dial-freq-hz`.
 struct FixedCenterFreqSource {
-    inner: Box<dyn IqSource>,
+    inner: reconnect::SendSource,
     freq_hz: f64,
 }
 
@@ -1843,9 +1848,9 @@ fn recording_center_warning(wav: &Path, sidecar_center_hz: Option<f64>) -> Optio
 /// hpsdr/audio/file replay), mirroring how `dial_freq_hz`'s
 /// `FixedCenterFreqSource` wrap is already applied uniformly below.
 fn maybe_decimate(
-    src: Box<dyn IqSource>,
+    src: reconnect::SendSource,
     capture_rate_hz: Option<f64>,
-) -> Result<Box<dyn IqSource>> {
+) -> Result<reconnect::SendSource> {
     match capture_rate_hz {
         Some(target) if (target - src.sample_rate()).abs() > 1e-6 => {
             Ok(Box::new(manta_input::DecimatingSource::new(src, target)?))
@@ -2934,8 +2939,8 @@ struct SpotServer {
     /// Signals the telnet/JSON/WS client tasks to drain their already-
     /// queued spots and exit, instead of being forcibly cut off by
     /// `Runtime::shutdown_timeout`'s raw deadline with no chance to finish
-    /// an in-flight write. Call `.send(true)` before shutting the runtime
-    /// down.
+    /// an in-flight write. `signal_spot_server_shutdown` first calls
+    /// `stop_status_line`, then sends here before shutting the runtime down.
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// Every spawned telnet/JSON/WS per-client connection task, tracked so
     /// shutdown can genuinely AWAIT their completion (bounded by
@@ -2956,25 +2961,20 @@ struct SpotServer {
     /// MAN-324: also `deCall` on every live record, and the station half of
     /// a spotted decision's `spotId`.
     station_callsign: String,
-    /// MAN-122 review round 4 (P2): the periodic status task's `JoinHandle`
-    /// is RETAINED, not discarded, so the shutdown sequence can AWAIT the
-    /// task's actual exit right after `shutdown_tx.send(true)` and before
-    /// the client drain begins. The task's own two shutdown guards (a
-    /// `biased` select and a re-borrow after the sleep) still leave a
-    /// check-to-log window: shutdown can be signalled between the second
-    /// borrow returning `false` and the `tracing::info!` that follows, so a
-    /// status line could still land in the middle of the drain. Awaiting
-    /// the handle here is what makes shutdown and emission mutually
-    /// ordered -- once the join returns, the task is gone and no further
-    /// line can be emitted. `None` when the status line is disabled
-    /// (`status_interval_secs = 0`), in which case there is nothing to
-    /// await. `Mutex<Option<..>>` because shutdown only ever holds
-    /// `&SpotServer` and must `take()` the handle to join it.
+    /// The periodic status task's retained handle. `stop_status_line` sends
+    /// its dedicated stop signal and joins it before `shutdown_tx` wakes
+    /// any client (MAN-256). The task's own guards leave a check-to-log
+    /// window, so joining after a shared broadcast would be too late.
+    /// `None` when `status_interval_secs = 0`. The mutex lets shutdown
+    /// take the handle while holding only `&SpotServer`.
     status_line: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The status task's own stop signal, sent and joined before
+    /// `shutdown_tx` wakes clients (MAN-256).
+    status_shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// MAN-301: the live RBN comparator's task, `None` when `[rbn_compare]`
-    /// is off. Retained for the same reason as `status_line`: shutdown
-    /// joins it right after `shutdown_tx.send(true)`, so no `spotGrade`
-    /// lands in the middle of the client drain.
+    /// is off. Joined after the client broadcast, bounded by
+    /// `SHUTDOWN_DRAIN_DEADLINE`; its exit is not ordered against the
+    /// start of the client drain.
     rbn_compare: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The metrics/status HTTP listener's real bound address (MAN-44),
     /// from `TcpListener::local_addr()`, so a port-0 bind is reachable by
@@ -3178,10 +3178,16 @@ const ACTIVE_TRACKS_POLL_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// the reconnecting `read()`, so it can't publish a count itself, and the
 /// poller above would keep exporting the pre-drop tracks -- MAN-45's ghost
 /// count. `listen()` publishes the real count again after its first
-/// post-reconnect chunk. MAN-314: `manta_rtty_signals` is zeroed here for
-/// the same reason; it is published only from the per-batch callback,
-/// which cannot run during the outage, and the reconnect's discontinuity
-/// restarts the RTTY set that callback publishes next.
+/// post-reconnect chunk. MAN-251 (PR #330 review): the EXPORTED
+/// `manta_active_tracks` is cleared here too, synchronously -- the poller
+/// loads the shared gauge and publishes it as two separate steps, so a
+/// tick that loaded the pre-drop count could republish it after the
+/// transition, and without this clear the zero would wait for the next
+/// full `ACTIVE_TRACKS_POLL_INTERVAL`. MAN-314: `manta_rtty_signals` is
+/// zeroed here for the same reason; it is published only from the
+/// per-batch callback, which cannot run during the outage, and the
+/// reconnect's discontinuity restarts the RTTY set that callback
+/// publishes next.
 fn source_health_sink(
     name: &'static str,
     metrics: Option<std::sync::Arc<manta_server::metrics::Metrics>>,
@@ -3193,6 +3199,7 @@ fn source_health_sink(
                 gauge.store(0, std::sync::atomic::Ordering::Relaxed);
             }
             if let Some(metrics) = &metrics {
+                metrics.set_active_tracks(0);
                 metrics.set_rtty_signals(&[]);
             }
         }
@@ -3205,6 +3212,35 @@ fn source_health_sink(
 /// `Metrics` (MAN-128). Same bridge shape and tuning rationale as
 /// `ACTIVE_TRACKS_POLL_INTERVAL`.
 const DECODE_LATENCY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Stops status emission completely before clients can begin draining.
+fn stop_status_line(rt: &tokio::runtime::Runtime, server: &SpotServer) {
+    let _ = server.status_shutdown_tx.send(true);
+    if let Some(status_line) = server
+        .status_line
+        .lock()
+        .expect("status-line handle mutex poisoned")
+        .take()
+    {
+        let _ = rt.block_on(status_line);
+    }
+}
+
+/// MAN-256: join the status task before broadcasting client shutdown.
+/// The comparator still joins after the broadcast, with its existing bound.
+fn signal_spot_server_shutdown(rt: &tokio::runtime::Runtime, server: &SpotServer) {
+    stop_status_line(rt, server);
+    let _ = server.shutdown_tx.send(true);
+    if let Some(rbn_compare) = server
+        .rbn_compare
+        .lock()
+        .expect("rbn_compare handle mutex poisoned")
+        .take()
+    {
+        let _ =
+            rt.block_on(async { tokio::time::timeout(SHUTDOWN_DRAIN_DEADLINE, rbn_compare).await });
+    }
+}
 
 /// Shuts down `rt`, first AWAITING (not just giving scheduler time to)
 /// every spawned client-connection task tracked in `tasks`, bounded by
@@ -3607,6 +3643,7 @@ fn start_spot_server(
     // docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md.
     let decoder_version = build_info::DECODER_VERSION.to_string();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (status_shutdown_tx, status_shutdown_rx) = tokio::sync::watch::channel(false);
     let tasks = manta_server::tasks::new_client_tasks();
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -3962,7 +3999,7 @@ fn start_spot_server(
                         std::time::Duration::from_secs(secs)
                     }),
                 enabled_uplinks,
-                shutdown_rx.clone(),
+                status_shutdown_rx,
             );
 
             anyhow::Ok((
@@ -3985,6 +4022,7 @@ fn start_spot_server(
             station_callsign: cfg.station_callsign.clone(),
             lists,
             status_line: std::sync::Mutex::new(status_line),
+            status_shutdown_tx,
             rbn_compare: std::sync::Mutex::new(rbn_task),
             metrics_addr,
             json_addr,
@@ -5677,11 +5715,13 @@ fn run_command() -> Result<std::process::ExitCode> {
             // calibration read (review round 7; before that round it was
             // observed only once the two-second calibration buffer had
             // filled); it processes only what it has already read and
-            // returns `Ok` without reading again. A read already in flight is not
-            // interrupted: it returns with whatever the source yields next,
-            // or fails after that source's own stall bound, and the shutdown
-            // sequence below runs on both the `Ok` and the error path,
-            // exactly as it does for a signal arriving mid-decode. The
+            // returns `Ok` without reading again. A reconnect's backoff or
+            // reopen in flight ends within ~100 ms (MAN-252: the reopen runs
+            // on its own thread, which a stop abandons). A read already in
+            // flight is not interrupted: it returns with whatever the source
+            // yields next, or fails after that source's own stall bound, and
+            // the shutdown sequence below runs on both the `Ok` and the error
+            // path, exactly as it does for a signal arriving mid-decode. The
             // banner itself still precedes the listener
             // tasks (see `start_spot_server`), so its ordering against
             // per-connection lines is unchanged.
@@ -5978,7 +6018,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                     first,
                     resolved.replay,
                     label,
-                    Box::new(move || reopen_spec.open(capture_rate_hz, dial_freq_hz)),
+                    Box::new(move || {
+                        Ok(reopen_spec.open(capture_rate_hz, dial_freq_hz)? as Box<dyn IqSource>)
+                    }),
                 )?
             };
 
@@ -6365,41 +6407,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                 // runtime tears down microseconds later and no scrape can
                 // land (see `record_terminal_source_health`'s doc comment).
                 record_terminal_source_health(&server.metrics, source_name, &listen_result);
-                let _ = server.shutdown_tx.send(true);
-                // MAN-122 review round 4 (P2): shutdown is signalled ABOVE
-                // and the periodic status task is joined HERE, before the
-                // client drain below starts -- the task's own guards order
-                // shutdown against its two `select!` poll points, but not
-                // against the wall clock between its last `shutdown.borrow()`
-                // and the `tracing::info!` that follows, so a line could
-                // otherwise still be emitted into the middle of the drain.
-                // Joining makes the two mutually ordered: `spawn_status_line`
-                // returns from its `shutdown.changed()` arm as soon as the
-                // send above is observed, so this wait is bounded by one
-                // scheduler poll, not by `status_interval_secs`.
-                if let Some(status_line) = server
-                    .status_line
-                    .lock()
-                    .expect("status-line handle mutex poisoned")
-                    .take()
-                {
-                    if let Some(rt) = server_runtime.as_ref() {
-                        let _ = rt.block_on(status_line);
-                    }
-                }
-                // MAN-301: the comparator watches the same shutdown signal;
-                // joined like the status line, bounded so a stuck feed
-                // connect can never hold the drain past its deadline.
-                if let Some(rbn_compare) = server
-                    .rbn_compare
-                    .lock()
-                    .expect("rbn_compare handle mutex poisoned")
-                    .take()
-                {
-                    if let Some(rt) = server_runtime.as_ref() {
-                        let _ =
-                            rt.block_on(tokio::time::timeout(SHUTDOWN_DRAIN_DEADLINE, rbn_compare));
-                    }
+                // Finish the status task before the broadcast wakes clients
+                // to drain, including any line already past its last guard.
+                if let Some(rt) = server_runtime.as_ref() {
+                    signal_spot_server_shutdown(rt, server);
                 }
             }
             // `server_runtime`/`spot_server` are always constructed as a
@@ -7816,6 +7827,45 @@ mod tests {
         }
     }
 
+    /// MAN-254: `manta_engine::soak` waits out the whole --duration even
+    /// after a --source recording ends, so soak's help must say so and
+    /// must not borrow run's and doctor's "finishes sooner" promise.
+    #[test]
+    fn soak_help_says_a_short_recording_does_not_end_the_run() {
+        use clap::CommandFactory;
+        let flat = |help: clap::builder::StyledStr| {
+            help.to_string()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut cli = Cli::command();
+        let soak = cli.find_subcommand_mut("soak").unwrap();
+        let short = flat(soak.render_help());
+        let long = flat(soak.render_long_help());
+        let duration = "The run lasts this long even when a --source recording ends sooner";
+        assert!(
+            short.contains(duration),
+            "soak -h lacks {duration:?}:\n{short}"
+        );
+        for needle in [
+            duration,
+            "runs for the full --duration seconds",
+            "A --source recording that ends sooner does not end the run",
+            "the run still lasts the full --duration",
+            "decoding nothing, until the hour is up",
+        ] {
+            assert!(
+                long.contains(needle),
+                "soak --help lacks {needle:?}:\n{long}"
+            );
+        }
+        assert!(
+            !long.contains("finishes sooner"),
+            "soak --help promises an early finish:\n{long}"
+        );
+    }
+
     #[test]
     fn help_lists_cty_and_scp_for_every_validating_command() {
         use clap::CommandFactory;
@@ -8064,16 +8114,9 @@ mod tests {
         );
     }
 
-    /// MAN-122 review round 4 (P2): `spawn_status_line`'s in-task guards
-    /// cannot close the window between its post-sleep `shutdown.borrow()`
-    /// and its `tracing::info!`, so the daemon must order the two from the
-    /// outside -- retain the task's `JoinHandle` and AWAIT it right after
-    /// signalling shutdown, before the client drain starts. This pins both
-    /// halves of that: the handle really is retained on `SpotServer` for a
-    /// config that enables the status line (a discarded handle is
-    /// unjoinable and the ordering is unenforceable), and joining it after
-    /// `shutdown_tx.send(true)` completes promptly rather than blocking for
-    /// a whole `status_interval_secs`.
+    /// The status task retains a joinable handle and exits promptly on its
+    /// own stop signal, even with an hour-long interval. The separate
+    /// broadcast-order test pins when that join happens relative to clients.
     #[test]
     fn the_status_line_task_is_retained_and_joins_promptly_on_shutdown() {
         let cfg_file = write_temp_file(
@@ -8112,7 +8155,7 @@ mod tests {
                 "a non-zero status_interval_secs must leave a joinable handle on SpotServer",
             );
 
-        let _ = server.shutdown_tx.send(true);
+        let _ = server.status_shutdown_tx.send(true);
         // One hour of configured interval against a one-second budget: this
         // can only pass because the task's `shutdown.changed()` arm is
         // `biased`-first and returns without waiting for the next tick.
@@ -8128,6 +8171,87 @@ mod tests {
             joined.unwrap().is_ok(),
             "the status task must exit cleanly, not panic"
         );
+    }
+
+    /// MAN-256: a held watch borrow blocks the client shutdown send. The
+    /// status task must finish while that borrow is held, proving that the
+    /// production helper joins it before any client can observe shutdown.
+    /// Checking only after a receiver wakes would race the status task.
+    #[test]
+    fn the_status_line_task_has_exited_before_client_shutdown_is_broadcast() {
+        let cfg_file = write_temp_file(
+            br#"
+                [server]
+                station_callsign = "W3XYZ"
+                bind_addr = "127.0.0.1"
+                telnet_port = 0
+                json_port = 0
+                metrics_port = 0
+                status_interval_secs = 3600
+                "#,
+        );
+
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
+        let (rt, server) = start_spot_server(
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
+            None,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
+                freq_calibration: 1.0,                 // --freq-correction-ppm 0
+            },
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+            bundled_reference_lists(),
+            &PipelineConfig::default(),
+        )
+        .unwrap();
+
+        let status_task = server
+            .status_line
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("status task enabled")
+            .abort_handle();
+        // Exercise the optional comparator join too. Its timer must be
+        // created inside the runtime, and its stop still follows the client
+        // broadcast. No external RBN connection is needed for this check.
+        let mut client_shutdown = server.shutdown_tx.subscribe();
+        let comparator = rt.spawn(async move {
+            client_shutdown
+                .wait_for(|stopping| *stopping)
+                .await
+                .unwrap();
+        });
+        let comparator_task = comparator.abort_handle();
+        *server.rbn_compare.lock().unwrap() = Some(comparator);
+        let held = server.shutdown_tx.borrow();
+        let finished = std::thread::scope(|scope| {
+            let shutdown = scope.spawn(|| signal_spot_server_shutdown(&rt, &server));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !status_task.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let finished = status_task.is_finished();
+            assert!(!*held, "clients must not have received shutdown yet");
+            if !finished {
+                // A miswired status receiver must fail rather than hang the join.
+                status_task.abort();
+            }
+            drop(held);
+            shutdown.join().unwrap();
+            finished
+        });
+        assert!(comparator_task.is_finished(), "comparator must be joined");
+        assert!(
+            finished,
+            "the status task must exit before client shutdown is broadcast"
+        );
+        shutdown_runtime_after_drain(rt, &server.tasks);
     }
 
     #[test]
@@ -9389,7 +9513,11 @@ mod tests {
     /// the reconnecting `read()` and can't republish the active-track
     /// count, so the unhealthy transition itself must zero the shared
     /// gauge, or `manta_active_tracks` exports the pre-drop tracks until
-    /// samples resume.
+    /// samples resume. MAN-251 (PR #330 review): the transition must clear
+    /// the EXPORTED gauge synchronously too -- the poller's atomic load and
+    /// its `set_active_tracks` publish are separate steps, so without this
+    /// clear a tick that loaded the pre-drop count can republish it after
+    /// the transition and the zero waits for the next full poll interval.
     #[test]
     fn source_health_sink_zeroes_active_tracks_when_the_source_goes_unhealthy() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -9398,6 +9526,9 @@ mod tests {
         let metrics = Arc::new(manta_server::metrics::Metrics::new());
         let gauge = Arc::new(AtomicU64::new(3));
         let mut sink = source_health_sink("kiwi", Some(metrics.clone()), Some(gauge.clone()));
+        // The poller's last pre-drop publish: the exported gauge holds the
+        // live count when the source drops.
+        metrics.set_active_tracks(3);
 
         sink(true);
         assert_eq!(
@@ -9410,6 +9541,11 @@ mod tests {
             gauge.load(Ordering::Relaxed),
             0,
             "an unhealthy source has no active tracks"
+        );
+        assert_eq!(
+            metrics.active_tracks(),
+            0,
+            "an unhealthy source exports no active tracks either, not only the shared handle"
         );
         assert!(metrics
             .render_prometheus_text()
@@ -9440,6 +9576,206 @@ mod tests {
         assert!(
             text.contains(r#"manta_rtty_signals{band="20m"} 0"#),
             "an unhealthy source has no marked RTTY signals: {text}"
+        );
+    }
+
+    /// MAN-251 (PR #207 review): a reconnecting read blocks the decode
+    /// loop throughout an outage. The real health sink must clear the
+    /// live count during backoff, and decoding must publish it again
+    /// after samples resume. PR #330 review: the poller here mirrors the
+    /// production bridge (atomic load, then `set_active_tracks` publish)
+    /// into a real `Metrics`, and the assertions check the EXPORTED
+    /// `manta_active_tracks` too -- synchronously zero at the unhealthy
+    /// transition, not only the shared handle.
+    #[test]
+    fn reconnecting_outage_zeroes_active_tracks_until_samples_resume() {
+        use num_complex::Complex32;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Instant;
+
+        struct DropWhenExhaustedSource {
+            samples: Vec<Complex32>,
+            cursor: usize,
+            fs: f64,
+            center_freq_hz: f64,
+            stall_at_eof: bool,
+        }
+
+        impl IqSource for DropWhenExhaustedSource {
+            fn sample_rate(&self) -> f64 {
+                self.fs
+            }
+
+            fn center_freq_hz(&self) -> f64 {
+                self.center_freq_hz
+            }
+
+            fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+                let n = (self.samples.len() - self.cursor).min(buf.len());
+                if n == 0 && self.stall_at_eof {
+                    anyhow::bail!("simulated live source stall");
+                }
+                buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
+                self.cursor += n;
+                Ok(n)
+            }
+        }
+
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let first = DropWhenExhaustedSource {
+            samples: rendered.samples.clone(),
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+            stall_at_eof: true,
+        };
+        let opener: reconnect::Opener = Box::new(move || {
+            Ok(Box::new(DropWhenExhaustedSource {
+                samples: rendered.samples.clone(),
+                cursor: 0,
+                fs: spec.fs,
+                center_freq_hz: spec.center_freq_hz,
+                stall_at_eof: false,
+            }))
+        });
+        let metrics = Arc::new(manta_server::metrics::Metrics::new());
+        let gauge = Arc::new(AtomicU64::new(0));
+        let transitions = Arc::new(Mutex::new(Vec::new()));
+        let sink: reconnect::HealthSink = {
+            let transitions = transitions.clone();
+            let metrics = metrics.clone();
+            let mut inner =
+                source_health_sink("man251", Some(metrics.clone()), Some(gauge.clone()));
+            Box::new(move |healthy| {
+                let mut transitions = transitions.lock().unwrap();
+                inner(healthy);
+                // Recorded after the production sink returns: this is the
+                // exported value a dashboard scrape would see at the
+                // transition instant (PR #330 review).
+                transitions.push((Instant::now(), healthy, metrics.active_tracks()));
+            })
+        };
+        let src = reconnect::ReconnectingSource::new(
+            "man251",
+            Box::new(first),
+            opener,
+            Arc::new(AtomicBool::new(false)),
+            true,
+            sink,
+        );
+
+        // IqSource is not Send: keep decoding on this thread and move
+        // only the shared gauge to the polling thread.
+        let done = Arc::new(AtomicBool::new(false));
+        let poller = {
+            let done = done.clone();
+            let gauge = gauge.clone();
+            let metrics = metrics.clone();
+            let transitions = transitions.clone();
+            std::thread::spawn(move || {
+                let mut polls = Vec::new();
+                while !done.load(Ordering::Relaxed) {
+                    {
+                        // Serialize with health callbacks so a poll cannot
+                        // straddle a transition and appear to belong to the
+                        // wrong side of the outage. Inside that
+                        // serialization this is the PRODUCTION poller's
+                        // pair (PR #330 review): load the shared gauge,
+                        // then publish it into the exported metric --
+                        // recorded as (when, count, exported) so the
+                        // bridge itself is what the assertions read.
+                        let _transition = transitions.lock().unwrap();
+                        let count = gauge.load(Ordering::Relaxed);
+                        metrics.set_active_tracks(count);
+                        polls.push((Instant::now(), count, metrics.active_tracks()));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                polls
+            })
+        };
+        let result = manta_engine::listen_with_observers(
+            Box::new(src),
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            manta_engine::ListenObservers {
+                active_tracks: Some(gauge),
+                ..Default::default()
+            },
+            |_ev| {},
+            |_spot| {},
+            |_n| {},
+        );
+        done.store(true, Ordering::Relaxed);
+        let polls = poller.join().expect("active-track poller must finish");
+        result.expect("the reconnected source must decode through clean EOF");
+
+        let transitions = transitions.lock().unwrap();
+        let (false_at, exported_at_drop) = transitions
+            .iter()
+            .find_map(|&(at, healthy, exported)| (!healthy).then_some((at, exported)))
+            .expect("the live source must report its outage");
+        let true_at = transitions
+            .iter()
+            .find_map(|&(at, healthy, _)| (healthy && at > false_at).then_some(at))
+            .expect("the reconnected source must report resumed samples");
+        assert!(
+            polls
+                .iter()
+                .any(|&(at, count, _)| at < false_at && count > 0),
+            "V1 must have active tracks before the source drops"
+        );
+        assert!(
+            polls
+                .iter()
+                .any(|&(at, _, exported)| at < false_at && exported > 0),
+            "the metrics bridge must export the live count before the source drops"
+        );
+        assert_eq!(
+            exported_at_drop, 0,
+            "MAN-251: the sink must clear the exported manta_active_tracks synchronously at \
+             the unhealthy transition, not only the shared handle"
+        );
+        assert!(
+            true_at.duration_since(false_at) >= manta_server::backoff::INITIAL_BACKOFF,
+            "the unhealthy interval must include the real reconnect backoff"
+        );
+        assert!(
+            polls
+                .iter()
+                .filter(|&&(at, _, _)| at > false_at && at < true_at)
+                .all(|&(_, count, _)| count == 0),
+            "MAN-251: no poll during the outage may report ghost active tracks"
+        );
+        assert!(
+            polls
+                .iter()
+                .filter(|&&(at, _, _)| at > false_at && at < true_at)
+                .all(|&(_, _, exported)| exported == 0),
+            "MAN-251: no poll during the outage may export ghost active tracks"
+        );
+        let first_zero = polls
+            .iter()
+            .find_map(|&(at, count, _)| (at >= false_at && count == 0).then_some(at))
+            .expect("active tracks must reach zero after the source drops");
+        assert!(
+            first_zero.duration_since(false_at) <= ACTIVE_TRACKS_POLL_INTERVAL,
+            "MAN-251: active tracks must reach zero within one polling interval; lag: {:?}",
+            first_zero.duration_since(false_at)
+        );
+        assert!(
+            polls
+                .iter()
+                .any(|&(at, count, _)| at > true_at && count > 0),
+            "decoding must republish a real active-track count after samples resume"
+        );
+        assert!(
+            polls
+                .iter()
+                .any(|&(at, _, exported)| at > true_at && exported > 0),
+            "the metrics bridge must export the resumed real count after samples resume"
         );
     }
 
