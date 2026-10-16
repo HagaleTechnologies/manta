@@ -958,7 +958,10 @@ non-blocking send plus shared atomics and short locks between them.
   the same pass at end of stream. `pending` is a per-track buffer on the
   decode thread, not a cross-thread queue: a decoding track's buffer is
   emptied every batch, and one still awaiting non-CW qualification (MAN-313)
-  keeps up to `MAX_UNQUALIFIED_BACKLOG` entries until a decoder is leased.
+  keeps a bounded backlog until a decoder is leased, with hysteresis — once
+  it exceeds `MAX_UNQUALIFIED_BACKLOG` + `MAX_UNQUALIFIED_BACKLOG`/4
+  entries, the oldest are dropped back down to `MAX_UNQUALIFIED_BACKLOG`
+  (SPEC §2.8; at the default cap of 7500, a 9375-entry high-water mark).
 - **tokio.** `start_spot_server` builds its own multi-thread runtime for
   telnet, JSON/WebSocket, metrics, the live-state stream, the RBN uplink and
   the `[rbn_compare]` feed. Only `manta-cli` and `manta-server` depend on
@@ -994,8 +997,14 @@ on dedicated threads and lock-free handoff, so a slow batch never blocks
 input and overruns are counted where they happen.
 
 **Trigger for building it:** a non-zero input-overflow count during a run at
-192 kS/s on a Raspberry Pi 4 (ROADMAP M2's CPU-budget target). For a
-SoapySDR receiver that is the counter MAN-233 adds,
-`manta_input_gaps_detected_total{source="soapy"}`. Until then the
-synchronous loop stays: it is deterministic by construction and has no
-thread boundary between pipeline stages to get wrong.
+192 kS/s on a Raspberry Pi 4 (ROADMAP M2's CPU-budget target). HPSDR,
+KiwiSDR and ka9q receivers publish that count today as
+`manta_input_gaps_detected_total` (docs/METRICS.md); for SoapySDR it is the
+series MAN-233 adds, `manta_input_gaps_detected_total{source="soapy"}`.
+Until that series exists a SoapySDR run's observable signal is coarser:
+each overflow is retried silently, and only the read error after 100
+consecutive overflows surfaces, as a lost connection
+(`manta_source_health{source="soapy"}` drops to 0, with a reconnect
+warning). Until the trigger fires the synchronous loop stays: it is
+deterministic by construction and has no thread boundary between pipeline
+stages to get wrong.
