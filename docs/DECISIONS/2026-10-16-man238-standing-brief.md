@@ -1,4 +1,4 @@
-# 2026-10-16 — MAN-238: CLAUDE.md is a short standing brief; its per-ticket log is archived here
+# MAN-238: CLAUDE.md is a short standing brief; its per-ticket log is archived here
 
 **Ticket:** MAN-238. Audit findings MAN-DX-009 and MAN-SIMP-010
 (repository audit 2026-10-05, manta @ `187192a8`).
