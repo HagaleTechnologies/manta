@@ -126,7 +126,11 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
 - **KiwiSDR client**: the kiwisdr websocket IQ protocol (12 kHz IQ per channel) —
   narrow, but gives instant worldwide receiver access for development and lets
   low-budget nodes contribute spots.
-- **File playback**: WAV (via `hound`, matching coppa) and raw interleaved
+- **File playback**: WAV (via `hound`, matching coppa): Float32 or
+  16/24/32-bit integer PCM, streamed from disk, so memory does not grow with
+  the recording
+  ([docs/DECISIONS/2026-10-14-man119-streaming-wav-and-real-audio-corpus.md](docs/DECISIONS/2026-10-14-man119-streaming-wav-and-real-audio-corpus.md)),
+  and raw interleaved
   `f32`/`i16` IQ with a small JSON sidecar for rate/center-freq. Drives the entire
   test strategy; the daemon must run identically from file and live SDR.
 - **Audio passband** (via `coppa-audio`): 48 kHz real audio from a rig's RX audio,

@@ -365,6 +365,18 @@ moved from ctrlc to signal-hook; a second SIGINT/SIGTERM (SIGHUP without
 `[server]`) exits at once with 128 + signal, skipping the drain. See
 docs/DECISIONS/2026-10-14-man232-closed-and-stalled-output.md.
 
+MAN-119: `WavIqSource` streams (header-only `open`) and reads Float32 and
+16/24/32-bit integer IQ WAVs; `manta decode` streams through
+`manta_engine::decode_source`, so its memory no longer grows with the file.
+The real-audio corpus is pinned in
+`crates/manta-testkit/audio-corpus/manifest.json`; `scripts/corpus.py
+fetch|score`, a `MANTA_CORPUS_DIR`-gated test and a nightly `corpus.yml`
+(skipped until `MANTA_CORPUS_BASE_URL` is set, after redistribution rights
+are confirmed) make it a CI fixture; `scripts/score-transcript.py` scores a
+run against a hand transcript, and the VP8GEO transcript itself is
+outstanding. See
+docs/DECISIONS/2026-10-14-man119-streaming-wav-and-real-audio-corpus.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each
