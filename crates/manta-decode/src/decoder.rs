@@ -755,12 +755,18 @@ impl TrackDecoder {
             }
             self.pending.push(run);
             if self.tracker.ready() {
-                // Retroactively assemble the buffered runs; their marks have
-                // already fed the tracker, so tracker updates are skipped.
+                // Retroactively assemble the buffered runs; their marks
+                // already fed the tracker, so mark updates are skipped,
+                // while their element gaps are learned here (MAN-315 D3).
                 let drained = std::mem::take(&mut self.pending);
                 for r in drained {
                     self.process_run(r, false, events);
                 }
+                // MAN-265: the readiness mark seeded wpm_ema before any
+                // element gap existed; replace that mark-only seed now
+                // that the replayed gaps are in, so a transmission that
+                // ends here reports the gap-corrected speed.
+                self.tracker.reseed_wpm_after_warmup();
                 self.demod.set_dit_ms(self.tracker.mu_dit_ms());
             }
             return;
@@ -1409,6 +1415,181 @@ mod tests {
             ),
             "finish() must flush the true final wpm even when it's within \
              WPM_REPORT_DELTA of the last reported value, got {finish_events:?}"
+        );
+    }
+
+    /// MAN-265: feed exactly five marks and four element gaps (the
+    /// `pending`-buffered shape of a transmission that ends at the
+    /// tracker's readiness boundary) through `on_run`, returning the
+    /// decoder mid-flight so each test can pick its own finalization.
+    /// No sixth mark or following element gap exists -- the whole point
+    /// is that nothing live ever follows warmup.
+    fn feed_five_marks_four_gaps(
+        mark_hops: u32,
+        gap_hops: u32,
+    ) -> (TrackDecoder, Vec<DecoderEvent>) {
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        let mut ts = 0u64;
+        for i in 0..5 {
+            dec.on_run(
+                Run {
+                    mark: true,
+                    start_ts: ts,
+                    hops: mark_hops,
+                },
+                &mut events,
+            );
+            ts += mark_hops as u64 * 256;
+            if i < 4 {
+                dec.on_run(
+                    Run {
+                        mark: false,
+                        start_ts: ts,
+                        hops: gap_hops,
+                    },
+                    &mut events,
+                );
+                ts += gap_hops as u64 * 256;
+            }
+        }
+        (dec, events)
+    }
+
+    /// MAN-265: the WPM seeded at the 5-mark readiness boundary is
+    /// mark-only -- the element gaps between those marks only reach
+    /// `mu_egap` (hence `dit_estimate_ms`) during the `pending` replay
+    /// that follows, and nothing recomputed `wpm_ema` after it. A short
+    /// transmission (a beacon ID, a single contest exchange) that ends
+    /// there reported the biased speed forever. `(15, 21)` hops =
+    /// 40 ms marks + 56 ms gaps (mark-only seed 30 WPM), `(21, 15)` the
+    /// mirror bias (21.43 WPM), `(18, 18)` the symmetric control; the
+    /// true dit is (40+56)/2 = 48 ms = 25 WPM in every case.
+    #[test]
+    fn short_warmup_transmission_reports_gap_corrected_wpm() {
+        for (mark_hops, gap_hops) in [(15u32, 21u32), (21, 15), (18, 18)] {
+            let (mut dec, feed_events) = feed_five_marks_four_gaps(mark_hops, gap_hops);
+            assert!(
+                !feed_events
+                    .iter()
+                    .any(|e| matches!(e, DecoderEvent::SpeedUpdate { .. })),
+                "warmup readiness alone must not emit a live speed event, got {feed_events:?}"
+            );
+            let finish_events = dec.finish();
+            assert_eq!(
+                events_to_text(&finish_events),
+                "5",
+                "{mark_hops}/{gap_hops} hops"
+            );
+            let final_wpm = finish_events.iter().rev().find_map(|e| match e {
+                DecoderEvent::SpeedUpdate { wpm, .. } => Some(*wpm),
+                _ => None,
+            });
+            let final_wpm = final_wpm
+                .unwrap_or_else(|| panic!("no final SpeedUpdate for {mark_hops}/{gap_hops}"));
+            assert!(
+                (final_wpm - 25.0).abs() < 0.01,
+                "finish() reported {final_wpm} WPM for {mark_hops}/{gap_hops} hops, \
+                 expected the gap-corrected 25"
+            );
+
+            // Same seed through the bookkeeping-only finalization
+            // (manta-spot's Beacon-WPM check reads this path).
+            let (mut dec, _) = feed_five_marks_four_gaps(mark_hops, gap_hops);
+            let speed_only_wpm = dec
+                .finish_speed_only()
+                .into_iter()
+                .find_map(|e| match e {
+                    DecoderEvent::SpeedUpdate { wpm, .. } => Some(wpm),
+                    _ => None,
+                })
+                .expect("finish_speed_only must report the corrected final speed");
+            assert!(
+                (speed_only_wpm - 25.0).abs() < 0.01,
+                "finish_speed_only() reported {speed_only_wpm} WPM for \
+                 {mark_hops}/{gap_hops} hops, expected the gap-corrected 25"
+            );
+        }
+    }
+
+    /// MAN-265: the reseed replaces the warmup seed, not the smoothing --
+    /// a later live mark still takes exactly one `WPM_ALPHA = 0.1` EMA
+    /// step from the corrected seed. After the `(15, 21)` warmup (seed
+    /// 25), one 24-hop (64 ms) element gap moves `mu_egap` to
+    /// 56 + 0.15*8 = 57.2 ms, so the next 15-hop (40 ms) mark's raw
+    /// estimate is 1200/48.6 = 24.6914 WPM and the live report must be
+    /// 25 + 0.1*(24.6914 - 25) = 24.9691 -- not the raw value, and not
+    /// an EMA step from the old mark-only 30 WPM seed (29.4691).
+    #[test]
+    fn live_marks_after_warmup_smooth_from_the_corrected_seed() {
+        let (mut dec, _) = feed_five_marks_four_gaps(15, 21);
+        let mut events = Vec::new();
+        dec.on_run(
+            Run {
+                mark: false,
+                start_ts: 159 * 256,
+                hops: 24,
+            },
+            &mut events,
+        );
+        dec.on_run(
+            Run {
+                mark: true,
+                start_ts: 183 * 256,
+                hops: 15,
+            },
+            &mut events,
+        );
+        let live_wpm = events.iter().find_map(|e| match e {
+            DecoderEvent::SpeedUpdate { wpm, .. } => Some(*wpm),
+            _ => None,
+        });
+        let live_wpm = live_wpm.expect("the first live mark must report its speed");
+        assert!(
+            (live_wpm - 24.9691).abs() < 0.01,
+            "live WPM after warmup must be the alpha-0.1 step from the \
+             corrected 25 WPM seed, got {live_wpm}"
+        );
+    }
+
+    /// MAN-265 end-to-end: a single "5" (five dots, 25 WPM, 40 dB keying
+    /// depth) whose transmission ends before any element gap follows its
+    /// fifth mark -- the last mark is force-closed by `finish()`, exactly
+    /// the on-air shape of a short transmission. The final `SpeedUpdate`
+    /// is the only speed a consumer ever sees, so it must carry the
+    /// gap-corrected estimate, agreeing with `dit_estimate_ms` (which
+    /// `TimingUpdate` reports) rather than the mark-only centroid.
+    #[test]
+    fn short_envelope_reports_gap_corrected_final_wpm() {
+        let lo = 10f32.powf(-40.0 / 20.0);
+        let mut env: Vec<f32> = vec![lo; 4];
+        env.extend(rect_envelope_depth("5", 18, 40.0));
+        while env.len() < 420 {
+            env.push(lo);
+        }
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        assert_eq!(events_to_text(&events), "5");
+        let final_wpm = events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                DecoderEvent::SpeedUpdate { wpm, .. } => Some(*wpm),
+                _ => None,
+            })
+            .expect("a short track must report its final speed");
+        let corrected = 1200.0 / dec.tracker.dit_estimate_ms();
+        assert!(
+            (final_wpm - corrected).abs() < 0.01,
+            "final {final_wpm} WPM must match the corrected estimate {corrected}"
+        );
+        assert!(
+            (final_wpm - 25.0).abs() < 1.0,
+            "final {final_wpm} WPM must be within 1 WPM of the 25 WPM input"
         );
     }
 

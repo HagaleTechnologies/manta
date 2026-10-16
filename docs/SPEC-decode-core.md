@@ -992,6 +992,15 @@ read long. Before any element gap has been observed, `dit_estimate = μ_dit`
 (no correction). Element gaps buffered during tracker warm-up (the first 5
 marks) feed `μ_egap` when they are replayed (MAN-315 D3).
 
+The mark that makes the tracker ready seeds the reporting EMA *before* that
+replay runs, so the seed itself is still mark-only. **[DEVIATION]** (MAN-265):
+immediately after the warm-up replay, the seed is replaced outright with
+`1200 / dit_estimate` — an assignment, not an EMA fold, because this is still
+the first sample (the replayed marks were already counted; only their gaps
+arrived late). A transmission that ends at the boundary — a beacon ID, a
+single exchange — reports the gap-corrected speed; every later live mark
+keeps the normal `α = 0.1` smoothing steps on top of the corrected seed.
+
 #### 4.1b Sender timing model
 
 **[DEVIATION]** (MAN-315, `docs/DECISIONS/2026-10-11-man315-sender-timing.md`):
