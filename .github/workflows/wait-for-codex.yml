@@ -229,7 +229,7 @@ jobs:
           # branches are: the label already exists, an excluded dependabot[bot] PR, or a draft
           # PR (never asked to wait on Codex at all). Every pass-through branch is also a
           # dispatch trigger below: under the OLD design, "success now" meant the expensive
-          # jobs, living in ci.yml's own pull_request-triggered run, just ran as part of the
+          # jobs, living in the old ci.yml's own pull_request-triggered run, just ran as part of the
           # same event -- under this split design that no longer happens on its own, so this
           # job must explicitly dispatch ci-full.yml itself whenever it passes a revision
           # through without a real Codex round to wait on.

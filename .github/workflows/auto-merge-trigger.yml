@@ -140,7 +140,7 @@ jobs:
             # --template") -- round 6's own fix silently failed on every call via the
             # `2>/dev/null` swallow, always returning empty and therefore always fail-closed
             # (permanently pausing, never actually detecting staleness) -- the exact same
-            # incompatibility this repo's own ci.yml already hit and documented (its codex-clean
+            # incompatibility this repo's former ci.yml already hit and documented (its codex-clean
             # gate, PR #56). Deliberately not a bare `cmd1 | cmd2` pipe either: this step's
             # default shell has no `pipefail`, so a pipe's exit status reflects only the last
             # command -- a genuine `gh api` failure could still slip through if `jq` happened to
