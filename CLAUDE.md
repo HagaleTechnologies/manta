@@ -365,11 +365,22 @@ moved from ctrlc to signal-hook; a second SIGINT/SIGTERM (SIGHUP without
 `[server]`) exits at once with 128 + signal, skipping the drain. See
 docs/DECISIONS/2026-10-14-man232-closed-and-stalled-output.md.
 
+<<<<<<< HEAD
 MAN-252: `ReconnectingSource` runs each reopen on a `reopen-<kind>`
 thread and abandons it at a stop request, so SIGTERM during a stalled
 reconnect drains clients and exits 0 at once; an EOF after a stop during
 startup calibration is a clean end. See
 docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md.
+=======
+MAN-245: the Codex gate fails closed, titled `Review thread list
+incomplete`, when a PR has more than 100 review threads or an unresolved
+thread with more than 50 comments; Dependabot handling needs author,
+same-repository head and actor; a `codex-clean` label the gate did not
+apply shows as `Codex review overridden by <login>`.
+`scripts/required-check-sources.py` lists the required checks against
+the decision record; pinning `Supply Chain` to GitHub Actions is owner
+step O2. See docs/DECISIONS/2026-10-16-man245-gate-verdict-integrity.md.
+>>>>>>> 353b1856a95c6d325aa17dd268aca67c6307beee
 
 ## Documents (read in this order)
 
