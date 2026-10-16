@@ -861,7 +861,11 @@ validation (MAN-28). Dedupe (step 5) still applies.
   or a fatal source error. A reconnectable source's disconnect never
   reaches `listen()` as a read failure (MAN-73, below): its unhealthy
   transition zeroes the shared handle instead, which the poller publishes
-  within one `ACTIVE_TRACKS_POLL_INTERVAL`. Note this is deliberately *not*
+  within one `ACTIVE_TRACKS_POLL_INTERVAL`, and since MAN-251 it also
+  clears the exported `manta_active_tracks` gauge synchronously — the
+  poller's gauge load and metric publish are separate steps, so a tick
+  that loaded the pre-drop count could otherwise republish it just after
+  the transition. Note this is deliberately *not*
   `TrackManager::active_track_count()` (what MAN-45 first published here),
   which also counts unconfirmed CANDIDATEs — noise-blip rise crossings
   that lease no decoder and would inflate an operator-facing "is it

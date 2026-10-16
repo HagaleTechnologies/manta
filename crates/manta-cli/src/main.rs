@@ -3156,10 +3156,16 @@ const ACTIVE_TRACKS_POLL_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// the reconnecting `read()`, so it can't publish a count itself, and the
 /// poller above would keep exporting the pre-drop tracks -- MAN-45's ghost
 /// count. `listen()` publishes the real count again after its first
-/// post-reconnect chunk. MAN-314: `manta_rtty_signals` is zeroed here for
-/// the same reason; it is published only from the per-batch callback,
-/// which cannot run during the outage, and the reconnect's discontinuity
-/// restarts the RTTY set that callback publishes next.
+/// post-reconnect chunk. MAN-251 (PR #330 review): the EXPORTED
+/// `manta_active_tracks` is cleared here too, synchronously -- the poller
+/// loads the shared gauge and publishes it as two separate steps, so a
+/// tick that loaded the pre-drop count could republish it after the
+/// transition, and without this clear the zero would wait for the next
+/// full `ACTIVE_TRACKS_POLL_INTERVAL`. MAN-314: `manta_rtty_signals` is
+/// zeroed here for the same reason; it is published only from the
+/// per-batch callback, which cannot run during the outage, and the
+/// reconnect's discontinuity restarts the RTTY set that callback
+/// publishes next.
 fn source_health_sink(
     name: &'static str,
     metrics: Option<std::sync::Arc<manta_server::metrics::Metrics>>,
@@ -3171,6 +3177,7 @@ fn source_health_sink(
                 gauge.store(0, std::sync::atomic::Ordering::Relaxed);
             }
             if let Some(metrics) = &metrics {
+                metrics.set_active_tracks(0);
                 metrics.set_rtty_signals(&[]);
             }
         }
@@ -9352,7 +9359,11 @@ mod tests {
     /// the reconnecting `read()` and can't republish the active-track
     /// count, so the unhealthy transition itself must zero the shared
     /// gauge, or `manta_active_tracks` exports the pre-drop tracks until
-    /// samples resume.
+    /// samples resume. MAN-251 (PR #330 review): the transition must clear
+    /// the EXPORTED gauge synchronously too -- the poller's atomic load and
+    /// its `set_active_tracks` publish are separate steps, so without this
+    /// clear a tick that loaded the pre-drop count can republish it after
+    /// the transition and the zero waits for the next full poll interval.
     #[test]
     fn source_health_sink_zeroes_active_tracks_when_the_source_goes_unhealthy() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -9361,6 +9372,9 @@ mod tests {
         let metrics = Arc::new(manta_server::metrics::Metrics::new());
         let gauge = Arc::new(AtomicU64::new(3));
         let mut sink = source_health_sink("kiwi", Some(metrics.clone()), Some(gauge.clone()));
+        // The poller's last pre-drop publish: the exported gauge holds the
+        // live count when the source drops.
+        metrics.set_active_tracks(3);
 
         sink(true);
         assert_eq!(
@@ -9373,6 +9387,11 @@ mod tests {
             gauge.load(Ordering::Relaxed),
             0,
             "an unhealthy source has no active tracks"
+        );
+        assert_eq!(
+            metrics.active_tracks(),
+            0,
+            "an unhealthy source exports no active tracks either, not only the shared handle"
         );
         assert!(metrics
             .render_prometheus_text()
@@ -9403,6 +9422,206 @@ mod tests {
         assert!(
             text.contains(r#"manta_rtty_signals{band="20m"} 0"#),
             "an unhealthy source has no marked RTTY signals: {text}"
+        );
+    }
+
+    /// MAN-251 (PR #207 review): a reconnecting read blocks the decode
+    /// loop throughout an outage. The real health sink must clear the
+    /// live count during backoff, and decoding must publish it again
+    /// after samples resume. PR #330 review: the poller here mirrors the
+    /// production bridge (atomic load, then `set_active_tracks` publish)
+    /// into a real `Metrics`, and the assertions check the EXPORTED
+    /// `manta_active_tracks` too -- synchronously zero at the unhealthy
+    /// transition, not only the shared handle.
+    #[test]
+    fn reconnecting_outage_zeroes_active_tracks_until_samples_resume() {
+        use num_complex::Complex32;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Instant;
+
+        struct DropWhenExhaustedSource {
+            samples: Vec<Complex32>,
+            cursor: usize,
+            fs: f64,
+            center_freq_hz: f64,
+            stall_at_eof: bool,
+        }
+
+        impl IqSource for DropWhenExhaustedSource {
+            fn sample_rate(&self) -> f64 {
+                self.fs
+            }
+
+            fn center_freq_hz(&self) -> f64 {
+                self.center_freq_hz
+            }
+
+            fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+                let n = (self.samples.len() - self.cursor).min(buf.len());
+                if n == 0 && self.stall_at_eof {
+                    anyhow::bail!("simulated live source stall");
+                }
+                buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
+                self.cursor += n;
+                Ok(n)
+            }
+        }
+
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let first = DropWhenExhaustedSource {
+            samples: rendered.samples.clone(),
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+            stall_at_eof: true,
+        };
+        let opener: reconnect::Opener = Box::new(move || {
+            Ok(Box::new(DropWhenExhaustedSource {
+                samples: rendered.samples.clone(),
+                cursor: 0,
+                fs: spec.fs,
+                center_freq_hz: spec.center_freq_hz,
+                stall_at_eof: false,
+            }))
+        });
+        let metrics = Arc::new(manta_server::metrics::Metrics::new());
+        let gauge = Arc::new(AtomicU64::new(0));
+        let transitions = Arc::new(Mutex::new(Vec::new()));
+        let sink: reconnect::HealthSink = {
+            let transitions = transitions.clone();
+            let metrics = metrics.clone();
+            let mut inner =
+                source_health_sink("man251", Some(metrics.clone()), Some(gauge.clone()));
+            Box::new(move |healthy| {
+                let mut transitions = transitions.lock().unwrap();
+                inner(healthy);
+                // Recorded after the production sink returns: this is the
+                // exported value a dashboard scrape would see at the
+                // transition instant (PR #330 review).
+                transitions.push((Instant::now(), healthy, metrics.active_tracks()));
+            })
+        };
+        let src = reconnect::ReconnectingSource::new(
+            "man251",
+            Box::new(first),
+            opener,
+            Arc::new(AtomicBool::new(false)),
+            true,
+            sink,
+        );
+
+        // IqSource is not Send: keep decoding on this thread and move
+        // only the shared gauge to the polling thread.
+        let done = Arc::new(AtomicBool::new(false));
+        let poller = {
+            let done = done.clone();
+            let gauge = gauge.clone();
+            let metrics = metrics.clone();
+            let transitions = transitions.clone();
+            std::thread::spawn(move || {
+                let mut polls = Vec::new();
+                while !done.load(Ordering::Relaxed) {
+                    {
+                        // Serialize with health callbacks so a poll cannot
+                        // straddle a transition and appear to belong to the
+                        // wrong side of the outage. Inside that
+                        // serialization this is the PRODUCTION poller's
+                        // pair (PR #330 review): load the shared gauge,
+                        // then publish it into the exported metric --
+                        // recorded as (when, count, exported) so the
+                        // bridge itself is what the assertions read.
+                        let _transition = transitions.lock().unwrap();
+                        let count = gauge.load(Ordering::Relaxed);
+                        metrics.set_active_tracks(count);
+                        polls.push((Instant::now(), count, metrics.active_tracks()));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                polls
+            })
+        };
+        let result = manta_engine::listen_with_observers(
+            Box::new(src),
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            manta_engine::ListenObservers {
+                active_tracks: Some(gauge),
+                ..Default::default()
+            },
+            |_ev| {},
+            |_spot| {},
+            |_n| {},
+        );
+        done.store(true, Ordering::Relaxed);
+        let polls = poller.join().expect("active-track poller must finish");
+        result.expect("the reconnected source must decode through clean EOF");
+
+        let transitions = transitions.lock().unwrap();
+        let (false_at, exported_at_drop) = transitions
+            .iter()
+            .find_map(|&(at, healthy, exported)| (!healthy).then_some((at, exported)))
+            .expect("the live source must report its outage");
+        let true_at = transitions
+            .iter()
+            .find_map(|&(at, healthy, _)| (healthy && at > false_at).then_some(at))
+            .expect("the reconnected source must report resumed samples");
+        assert!(
+            polls
+                .iter()
+                .any(|&(at, count, _)| at < false_at && count > 0),
+            "V1 must have active tracks before the source drops"
+        );
+        assert!(
+            polls
+                .iter()
+                .any(|&(at, _, exported)| at < false_at && exported > 0),
+            "the metrics bridge must export the live count before the source drops"
+        );
+        assert_eq!(
+            exported_at_drop, 0,
+            "MAN-251: the sink must clear the exported manta_active_tracks synchronously at \
+             the unhealthy transition, not only the shared handle"
+        );
+        assert!(
+            true_at.duration_since(false_at) >= manta_server::backoff::INITIAL_BACKOFF,
+            "the unhealthy interval must include the real reconnect backoff"
+        );
+        assert!(
+            polls
+                .iter()
+                .filter(|&&(at, _, _)| at > false_at && at < true_at)
+                .all(|&(_, count, _)| count == 0),
+            "MAN-251: no poll during the outage may report ghost active tracks"
+        );
+        assert!(
+            polls
+                .iter()
+                .filter(|&&(at, _, _)| at > false_at && at < true_at)
+                .all(|&(_, _, exported)| exported == 0),
+            "MAN-251: no poll during the outage may export ghost active tracks"
+        );
+        let first_zero = polls
+            .iter()
+            .find_map(|&(at, count, _)| (at >= false_at && count == 0).then_some(at))
+            .expect("active tracks must reach zero after the source drops");
+        assert!(
+            first_zero.duration_since(false_at) <= ACTIVE_TRACKS_POLL_INTERVAL,
+            "MAN-251: active tracks must reach zero within one polling interval; lag: {:?}",
+            first_zero.duration_since(false_at)
+        );
+        assert!(
+            polls
+                .iter()
+                .any(|&(at, count, _)| at > true_at && count > 0),
+            "decoding must republish a real active-track count after samples resume"
+        );
+        assert!(
+            polls
+                .iter()
+                .any(|&(at, _, exported)| at > true_at && exported > 0),
+            "the metrics bridge must export the resumed real count after samples resume"
         );
     }
 
