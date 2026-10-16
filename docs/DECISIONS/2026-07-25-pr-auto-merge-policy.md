@@ -3,8 +3,9 @@
 > **Superseded (MAN-238, 2026-10-16).** Neither the two-check rule nor the
 > Mergify queue below is current. `main` merges through GitHub's native merge
 > queue, admission is `auto-merge-trigger.yml`'s trusted-author check (see
-> [2026-09-12-man217-native-queue-admission-ignores-bypass-actors.md](2026-09-12-man217-native-queue-admission-ignores-bypass-actors.md)),
-> and `CLAUDE.md`'s "Merge rules" lists the four required checks and the
+> [2026-09-12-man217-native-queue-admission-ignores-bypass-actors.md](2026-09-12-man217-native-queue-admission-ignores-bypass-actors.md))
+> or, for verified Dependabot minor/patch bumps, `dependabot-auto-merge.yml`,
+> which approves the verified head and arms auto-merge; and `CLAUDE.md`'s "Merge rules" lists the four required checks and the
 > code-owner review. The text below is the record as written.
 
 ## AMENDMENT (2026-09-01)
