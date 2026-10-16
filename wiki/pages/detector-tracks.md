@@ -8,8 +8,8 @@ sources:
   - docs/SPEC-decode-core.md#2-noise-floor--signal-presence-detection
   - ARCHITECTURE.md
 verified:
-  commit: d286147
-  date: 2026-10-13
+  commit: d0fd24d
+  date: 2026-10-16
 links:
   - pfb-channelizer
   - decode-chain
