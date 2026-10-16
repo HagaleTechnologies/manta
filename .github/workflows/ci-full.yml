@@ -22,7 +22,9 @@ name: CI
 # dispatched run executes the PR's code in main's context and Actions cache scope, so
 # wait-for-codex.yml now dispatches only a ready, in-repository PR opened by a trusted author.
 # Every other PR -- a fork head, or an author off the trusted list (Dependabot included) -- runs
-# `test`/`test-soapy`/`test-hpsdr` through this native trigger instead: GitHub's isolated path
+# `test`/`test-soapy`/`test-hpsdr` through this native trigger instead (MAN-245: by authorship
+# alone; a Dependabot-authored PR runs here because its author is not on the trusted list, and a
+# Dependabot-triggered event on a trusted author's PR does not): GitHub's isolated path
 # (refs/pull/N/merge cache scope; for a fork, a read-only token, no secrets, and the
 # fork-approval setting). A trusted in-repository PR is skipped here, so it still goes
 # exclusively through the workflow_dispatch path (no double-run, and no PR ever gets `test (...)`
@@ -143,9 +145,10 @@ jobs:
   # review context at all), so there is no mid-review-loop skip state left to account for here.
   #
   # MAN-243: `pull_request` is the isolated path -- refs/pull/N/merge cache scope; for a fork, a
-  # read-only token, no secrets, and the repo's fork-approval setting. It runs for Dependabot (as
-  # before) and for every PR wait-for-codex.yml will not dispatch: a head outside this repository
-  # or an author off the trusted list. A trusted in-repository PR is skipped here and tested only
+  # read-only token, no secrets, and the repo's fork-approval setting. It runs for every PR
+  # wait-for-codex.yml will not dispatch: a head outside this repository or an author off the
+  # trusted list -- Dependabot-authored PRs included, because their author is not on the list
+  # (MAN-245: no separate actor test). A trusted in-repository PR is skipped here and tested only
   # through workflow_dispatch, so no PR ever gets both paths (two apps' `test (...)` check-runs on
   # one SHA). Trusted drafts get no CI until ready for review. Keep the list identical to
   # wait-for-codex.yml's trust steps and auto-merge-trigger.yml (test_ci_trust_boundary.py).
@@ -153,7 +156,6 @@ jobs:
   test:
     if: >-
       github.event_name != 'pull_request' ||
-      github.actor == 'dependabot[bot]' ||
       github.event.pull_request.head.repo.full_name != github.repository ||
       !contains(fromJSON('["thagale","catalyst-cloud-connector[bot]"]'), github.event.pull_request.user.login)
     strategy:
@@ -265,6 +267,15 @@ jobs:
       # and DenyPolicyTests needs tomllib (Python 3.11+), which ubuntu-latest's python3 has.
       - if: runner.os == 'Linux'
         run: python3 -m unittest scripts.tests.test_ci_gates -v
+      # MAN-240: the Dependabot diff verifier's own tests, under the Python dependabot-auto-merge.yml
+      # runs the verifier with (same setup-python pin). Last in the job so the pin does not change
+      # the python3 the steps above use.
+      - if: runner.os == 'Linux'
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13"
+      - if: runner.os == 'Linux'
+        run: python3 -m unittest scripts.tests.test_verify_dependabot_diff_safe -v
   # Same MAN-243 routing as `test` above (Dependabot plus every PR wait-for-codex.yml won't
   # dispatch) -- not itself a required check, but matches this job's own pre-migration behavior
   # (ran for a Dependabot PR too, gated only by codex-clean's tolerant skip) rather than silently
@@ -272,7 +283,6 @@ jobs:
   test-soapy:
     if: >-
       github.event_name != 'pull_request' ||
-      github.actor == 'dependabot[bot]' ||
       github.event.pull_request.head.repo.full_name != github.repository ||
       !contains(fromJSON('["thagale","catalyst-cloud-connector[bot]"]'), github.event.pull_request.user.login)
     strategy:
@@ -303,7 +313,6 @@ jobs:
   test-hpsdr:
     if: >-
       github.event_name != 'pull_request' ||
-      github.actor == 'dependabot[bot]' ||
       github.event.pull_request.head.repo.full_name != github.repository ||
       !contains(fromJSON('["thagale","catalyst-cloud-connector[bot]"]'), github.event.pull_request.user.login)
     strategy:

@@ -2966,3 +2966,31 @@ fn spec_v2_drops_the_man193_lookahead_sentence() {
         );
     }
 }
+
+// ---- MAN-241 (PR #325 review): a retargeted claim needs a stamp that ----
+// ---- vouches for a snapshot containing it                              ----
+
+/// MAN-241 deleted `release.yml` and retargeted
+/// `wiki/pages/windows-build-setup.md` at `release-publish.yml` as the
+/// prebuilt-release-binary source, but left the page stamped
+/// `3805f78 / 2026-10-15`: a main snapshot that still carried the deleted
+/// `release.yml`, so the verification metadata vouched for a tree that
+/// contradicted the claim. Same rule as the two stamp tests above.
+#[test]
+fn wiki_windows_build_setup_stamp_names_a_snapshot_without_release_yml() {
+    let rel = "wiki/pages/windows-build-setup.md";
+    let claim = "prebuilt release binaries (`.github/workflows/release-publish.yml`)";
+    assert!(
+        doc(rel).contains(claim),
+        "{rel} no longer says `{claim}`; this test pins the stamp to that MAN-241 \
+         retarget and needs updating with it"
+    );
+    let (commit, date) = wiki_verified_stamp(rel);
+    assert!(
+        commit != "3805f78" && date.as_str() > "2026-10-15",
+        "{rel} still stamps `verified: {commit} / {date}`, a snapshot where the \
+         deleted `.github/workflows/release.yml` still existed: refresh \
+         `verified.commit`/`verified.date` (and the manifest entry) whenever the \
+         body is substantively changed"
+    );
+}
