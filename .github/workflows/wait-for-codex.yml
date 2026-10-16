@@ -189,7 +189,8 @@ jobs:
           # skipped (dependabot[bot] actor, see that step's own comment) -- sufficient here
           # since the dependabot path only ever does a same-run POST, which github.token can do
           # fine; it's cross-run mutation that token can't do, and dependabot never reaches
-          # that path (no @codex review request is ever posted for it).
+          # that path (no @codex review request is ever posted for it). MAN-245: no other
+          # dependabot[bot]-triggered run reaches it either; APP_TOKEN_MINTED below fails it closed.
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -204,6 +205,11 @@ jobs:
           # always takes the review path, whoever triggered the event; a human push to a bot PR
           # gets a real round too. Same expression as dependabot-auto-merge.yml's three jobs.
           IS_EXCLUDED_DEPENDABOT: ${{ github.actor == 'dependabot[bot]' && github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository }}
+          # MAN-245 (Codex P1, PR #327): "true" only when hagale-agent's token was minted. Without it
+          # (a dependabot[bot]-triggered event on a PR that is not a Dependabot update) neither the
+          # request PAT nor a token that can complete this check-run from another run is available,
+          # so the review path fails the gate instead of leaving a check-run nothing can complete.
+          APP_TOKEN_MINTED: ${{ steps.app-token.outcome == 'success' }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
           # Stamped onto the check-run's external_id below so codex-review-response can later
           # tell a genuine `synchronize` (a real new commit) apart from `reopened`/
@@ -256,6 +262,11 @@ jobs:
               summary="No Codex round ran for this event. codex-clean:$sha12 is on this pull request, but who applied it could not be read, so it is treated as an override, not a review."
               echo "::warning::Codex gate passed by a codex-clean label whose applier could not be read -- an override, not a Codex verdict for $HEAD_SHA."
             fi
+          elif [ "$APP_TOKEN_MINTED" != "true" ]; then
+            conclusion="failure"
+            title="Codex review not requested: event triggered by dependabot[bot]"
+            summary="This pull request is not a Dependabot update, so it needs a Codex round, but GitHub gives no secrets to a run dependabot[bot] triggers, so this run can neither request one nor leave a check-run the verdict job could complete. Push a new commit as anyone but dependabot[bot] to request a review on a fresh head."
+            echo "::warning::No Codex round requested for $HEAD_SHA: this event came from dependabot[bot] on a pull request that is not a Dependabot update, and its run has no credentials to request one. The gate fails until someone other than dependabot[bot] pushes a new commit."
           else
             conclusion=""
           fi
@@ -299,7 +310,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Request a review
-        if: steps.create-check.outputs.check_run_id != '' && steps.create-check.outputs.conclusion != 'success'
+        if: steps.create-check.outputs.check_run_id != '' && steps.create-check.outputs.conclusion == ''
         env:
           GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
           REPO: ${{ github.repository }}

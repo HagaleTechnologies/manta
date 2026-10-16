@@ -1,11 +1,7 @@
-<<<<<<< HEAD
-"""MAN-156: CI gates for dependencies (cargo deny), rustdoc, Windows releases and PR titles.
-MAN-245: the Codex gate's verdict (a complete thread read, a check-run title naming what produced
-it) and the record of which source may report each required check.
-=======
 """MAN-156: CI gates for dependencies (cargo deny), rustdoc, Windows releases and PR titles;
 MAN-240: the Dependabot diff verifier's tests in the required `test` job.
->>>>>>> 9f35f1a3abb76bb623c5332a0d07666b39c501c5
+MAN-245: the Codex gate's verdict (a complete thread read, a check-run title naming what produced
+it) and the record of which source may report each required check.
 
 stdlib unittest only -- workflows are read as text with test_ci_trust_boundary.py's helpers.
 Run: python3 -m unittest scripts.tests.test_ci_gates -v
@@ -690,7 +686,7 @@ class CodexCheckRunProvenanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             base = {"GH_TOKEN": "x", "REPO": GATE_REPO, "HEAD_SHA": HEAD_SHA, "ALREADY_CLEAN": "false",
                     "LABEL_ACTOR": "", "EARLIER_VERDICT": "false", "IS_EXCLUDED_DEPENDABOT": "false",
-                    "IS_DRAFT": "false", "PRODUCER_ACTION": "synchronize"}
+                    "APP_TOKEN_MINTED": "true", "IS_DRAFT": "false", "PRODUCER_ACTION": "synchronize"}
             return run_step(self.create_body, {**base, **env}, CREATE_GH, tmp=tmp)
 
     def test_pass_through_titles(self):
@@ -729,6 +725,44 @@ class CodexCheckRunProvenanceTests(unittest.TestCase):
             self.assertEqual(arg_prefixed(posts[0], "output[title]="), [])
             self.assertEqual(arg_prefixed(posts[0], "conclusion="), [])
             self.assertIn("conclusion=", output_lines(written))
+
+    def test_no_app_token_fails_instead_of_waiting(self):
+        # Codex P1, PR #327: a dependabot[bot]-triggered event on a PR that is not a Dependabot
+        # update has no request PAT and no hagale-agent token, so an in_progress check-run made with
+        # github.token could never be completed. The review path fails the gate visibly instead.
+        request = gate_step("codex-review-request", sid="create-check")
+        self.assertEqual(wf.field(wf.sub(request, "env"), "APP_TOKEN_MINTED"),
+                         "${{ steps.app-token.outcome == 'success' }}")
+        self.assertEqual(wf.field(gate_step("codex-review-request", name="Request a review"), "if"),
+                         "steps.create-check.outputs.check_run_id != '' && steps.create-check.outputs.conclusion == ''")
+        for minted in ("false", ""):
+            with self.subTest(app_token_minted=minted):
+                proc, written, calls = self._create(APP_TOKEN_MINTED=minted)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                posts = [c for c in calls if f"repos/{GATE_REPO}/check-runs" in c]
+                self.assertEqual(len(posts), 1, calls)
+                self.assertIn("status=completed", posts[0])
+                self.assertIn("conclusion=failure", posts[0])
+                self.assertEqual(arg_prefixed(posts[0], "output[title]="),
+                                 ["output[title]=Codex review not requested: event triggered by dependabot[bot]"])
+                self.assertIn("::warning::", proc.stdout)
+                self.assertIn("conclusion=failure", output_lines(written))
+        # A genuine Dependabot update has no app token either, and still passes through as before;
+        # so do the other pass-throughs, which need no cross-run write.
+        passes = [
+            ("dependabot update", {"IS_EXCLUDED_DEPENDABOT": "true"}, "Dependabot update: not sent to Codex"),
+            ("draft", {"IS_DRAFT": "true"}, "Draft: not reviewed"),
+            ("label override", {"ALREADY_CLEAN": "true", "LABEL_ACTOR": "thagale"},
+             "Codex review overridden by thagale (codex-clean label)"),
+        ]
+        for case, env, wanted in passes:
+            with self.subTest(case=case):
+                proc, written, calls = self._create(APP_TOKEN_MINTED="false", **env)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                posts = [c for c in calls if f"repos/{GATE_REPO}/check-runs" in c]
+                self.assertEqual(len(posts), 1, calls)
+                self.assertIn("conclusion=success", posts[0])
+                self.assertEqual(arg_prefixed(posts[0], "output[title]="), [f"output[title]={wanted}"])
 
     def test_clean_verdict_title(self):
         with tempfile.TemporaryDirectory() as tmp:

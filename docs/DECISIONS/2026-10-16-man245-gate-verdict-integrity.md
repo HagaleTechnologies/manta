@@ -139,14 +139,22 @@ failed at metadata in `dependabot-auto-merge.yml` rather than approving.
    replaced: `!contains(trusted, author)` already routes Dependabot-authored
    PRs to the native run. The app-token mint keeps `github.actor !=
    'dependabot[bot]'`, because it is about which runs GitHub gives
-   secrets to, not about the PR.
+   secrets to, not about the PR. So a Dependabot-triggered event on a PR
+   that is not a Dependabot update cannot request a Codex round, and
+   cannot leave an `in_progress` check-run either: one made with
+   `github.token` can't be completed by the verdict job's hagale-agent
+   token. `create-check` reads `APP_TOKEN_MINTED` and fails the gate
+   instead, titled `Codex review not requested: event triggered by
+   dependabot[bot]`. A new commit pushed by anyone else requests the
+   round on a fresh head, where no stale check-run shares the name
+   (Codex P1 on PR #327).
 
    | Case | Actor | Author | Head | Dependabot update | `ci-full` native |
    |---|---|---|---|---|---|
    | Genuine update | dependabot[bot] | dependabot[bot] | this repo | yes, as before | runs |
    | Human pushes to a bot PR | thagale | dependabot[bot] | this repo | no, as before | runs |
    | Owner or agent PR | thagale / catalyst-cloud-connector[bot] | same | this repo | no | dispatched |
-   | Bot actor on a human PR | dependabot[bot] | thagale | this repo | **no** (was yes) | dispatched (was: also native) |
+   | Bot actor on a human PR | dependabot[bot] | thagale | this repo | **no** (was yes) | skipped; the Codex gate fails, and a later push is dispatched (was: also native) |
    | Bot login from a fork, or a deleted head | dependabot[bot] | dependabot[bot] | fork / none | no | runs |
 
 3. **The label shortcut stays, and an override says so (D3, the owner's
@@ -175,9 +183,11 @@ failed at metadata in `dependabot-auto-merge.yml` rather than approving.
    - `Draft: not reviewed` and `Dependabot update: not sent to Codex`
      for the other two pass-throughs;
    - `Review thread list incomplete` and `Codex raised new concerns` for
-     the two failures.
+     the two verdict failures, and `Codex review not requested: event
+     triggered by dependabot[bot]` when no round could be requested
+     (decision 2).
 
-   Pass/fail behaviour is unchanged. Thread resolution
+   The label shortcut's pass/fail behaviour is unchanged. Thread resolution
    (`manta-review-gate`) still blocks a merge past unresolved Codex
    threads. Removing the read later is owner step O5.
 4. **The label lookup paginates (D4).** `labels?per_page=100` without
@@ -216,7 +226,8 @@ failed at metadata in `dependabot-auto-merge.yml` rather than approving.
   - `CodexCheckRunProvenanceTests`: the label lookup (no label, the
     gate's label with and without hagale-agent's verdict check-run, an
     unreadable check-run list, a later human label, a label on page 2, an
-    unreadable timeline) and every pass-through and clean title;
+    unreadable timeline), every pass-through and clean title, and the
+    failed check-run when no hagale-agent token was minted;
   - `RequiredCheckSourcesTests`: the script against the live ruleset as
     read, with `Supply Chain` pinned right and wrong, with `test
     (windows-latest)` and `PR title` added, an unknown context, a pinned
