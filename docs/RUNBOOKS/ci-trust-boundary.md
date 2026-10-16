@@ -21,7 +21,7 @@ in `HagaleTechnologies/manta`, not a fork.
 | Dependabot | completed as success at once, as before | native `pull_request` run, as before | none (restore-only) | `dependabot-auto-merge.yml`, as before |
 
 Only a push to `main` (a merged commit) saves a build cache. Release
-builds (`release.yml`, `release-publish.yml`) restore none.
+builds (`release-publish.yml`) restore none.
 
 ## Getting an outside pull request tested and merged
 
@@ -117,11 +117,9 @@ overlapped; check that run's log if any appear.
 ### O7. A release build starts cold
 
 ```bash
-gh workflow run release.yml -R HagaleTechnologies/manta --ref main   # build-only; never publishes
+gh workflow run release-publish.yml -R HagaleTechnologies/manta --ref main   # publish defaults to false; build-only, never creates a Release
 gh run view <id> -R HagaleTechnologies/manta --log | grep -cE 'Restoring cache|Cache restored|Cache hit for|Restored from cache key'   # expect 0
 ```
-
-Optionally the same for `release-publish.yml` with `-f publish=false`.
 
 ### O8. The trusted path still runs unattended
 
