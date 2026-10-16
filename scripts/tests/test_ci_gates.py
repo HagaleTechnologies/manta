@@ -1,4 +1,5 @@
-"""MAN-156: CI gates for dependencies (cargo deny), rustdoc, Windows releases and PR titles.
+"""MAN-156: CI gates for dependencies (cargo deny), rustdoc, Windows releases and PR titles;
+MAN-240: the Dependabot diff verifier's tests in the required `test` job.
 
 stdlib unittest only -- workflows are read as text with test_ci_trust_boundary.py's helpers.
 Run: python3 -m unittest scripts.tests.test_ci_gates -v
@@ -55,6 +56,43 @@ class RustdocGateTests(unittest.TestCase):
         found = steps_running(self.test_job, "python3 -m unittest scripts.tests.test_ci_gates -v")
         self.assertEqual(len(found), 1)
         self.assertEqual(wf.field(found[0], "if"), "runner.os == 'Linux'")
+
+
+VERIFIER_TESTS = "python3 -m unittest scripts.tests.test_verify_dependabot_diff_safe -v"
+
+
+def setup_python_steps(job_lines):
+    return [s for s in wf.steps(job_lines)
+            if (wf.field(s, "uses") or "").startswith("actions/setup-python@")]
+
+
+class VerifierTestsGateTests(unittest.TestCase):
+    """MAN-240: the Dependabot diff verifier's tests ride the required `test` job, under the
+    Python dependabot-auto-merge.yml runs the verifier with."""
+
+    def setUp(self):
+        self.test_job = wf.job_block(wf.read("ci-full.yml"), "test")
+        self.verify_job = wf.job_block(wf.read("dependabot-auto-merge.yml"), "verify")
+
+    def test_verifier_tests_run_in_the_required_test_job_on_linux(self):
+        found = steps_running(self.test_job, VERIFIER_TESTS)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(wf.field(found[0], "if"), "runner.os == 'Linux'")
+
+    def test_verifier_tests_use_the_auto_merge_python(self):
+        ours, theirs = setup_python_steps(self.test_job), setup_python_steps(self.verify_job)
+        self.assertEqual(len(ours), 1)
+        self.assertEqual(len(theirs), 1)
+        self.assertEqual(wf.field(ours[0], "uses").split()[0], wf.field(theirs[0], "uses").split()[0])
+        version = wf.field(wf.sub(theirs[0], "with"), "python-version")
+        self.assertIsNotNone(version)
+        self.assertEqual(wf.field(wf.sub(ours[0], "with"), "python-version"), version)
+        self.assertEqual(wf.field(ours[0], "if"), "runner.os == 'Linux'")
+        all_steps = wf.steps(self.test_job)
+        setup = all_steps.index(ours[0])
+        tests = next(i for i, s in enumerate(all_steps)
+                     if (wf.run_body(s) or "").strip() == VERIFIER_TESTS)
+        self.assertLess(setup, tests)
 
 
 COPPA_GIT = "https://github.com/HagaleTechnologies/coppa.git"

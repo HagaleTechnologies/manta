@@ -259,6 +259,15 @@ jobs:
       # and DenyPolicyTests needs tomllib (Python 3.11+), which ubuntu-latest's python3 has.
       - if: runner.os == 'Linux'
         run: python3 -m unittest scripts.tests.test_ci_gates -v
+      # MAN-240: the Dependabot diff verifier's own tests, under the Python dependabot-auto-merge.yml
+      # runs the verifier with (same setup-python pin). Last in the job so the pin does not change
+      # the python3 the steps above use.
+      - if: runner.os == 'Linux'
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13"
+      - if: runner.os == 'Linux'
+        run: python3 -m unittest scripts.tests.test_verify_dependabot_diff_safe -v
   # Same MAN-243 routing as `test` above (Dependabot plus every PR wait-for-codex.yml won't
   # dispatch) -- not itself a required check, but matches this job's own pre-migration behavior
   # (ran for a Dependabot PR too, gated only by codex-clean's tolerant skip) rather than silently
