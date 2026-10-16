@@ -24,9 +24,7 @@ pub mod soapy;
 #[cfg(feature = "soapy")]
 pub use soapy::SoapySdrIqSource;
 
-#[cfg(feature = "hpsdr")]
 pub mod hpsdr;
-#[cfg(feature = "hpsdr")]
 pub use hpsdr::{HpsdrConfig, HpsdrDevice, HpsdrIqSource};
 
 use anyhow::{bail, Context, Result};
@@ -37,12 +35,8 @@ use std::path::{Path, PathBuf};
 /// discard whole packets on the wire (MAN-56, following MAN-22's
 /// malformed-packet counting).
 ///
-/// Defined at the crate root, deliberately NOT inside the
-/// `#[cfg(feature = "hpsdr")]` `hpsdr` module: `IqSource` itself is
-/// compiled unconditionally, so naming a feature-gated type in
-/// `health_counters`' signature would make the trait -- and every
-/// non-HPSDR build, including plain `cargo test --workspace` -- require
-/// `--features hpsdr`.
+/// Shared by packet-based sources, including HPSDR and KiwiSDR, through
+/// `IqSource::health_counters`.
 ///
 /// Atomic rather than mutex-guarded for the same reason
 /// `HpsdrIqSource::confirmed_live` is (MAN-55): a metrics reader must

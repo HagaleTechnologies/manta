@@ -151,7 +151,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       # MAN-243: no build cache here either; this binary is never shipped.
       - name: Build (host)
-        run: cargo build --release -p manta-cli --features hpsdr
+        run: cargo build --release -p manta-cli
       - name: Write man pages
         run: target/release/manta man-pages --out man-pages
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -236,11 +236,11 @@ jobs:
         if: "!matrix.use_cross"
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo build --release -p manta-cli --features hpsdr --target ${{ matrix.target }}
+        run: cargo build --release -p manta-cli --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --release -p manta-cli --features hpsdr --target ${{ matrix.target }}
+        run: cross build --release -p manta-cli --target ${{ matrix.target }}
 
       # MAN-65 finding 2 (PR #78 review): on a clean Windows install without
       # the VC++ 2015-2022 Redistributable, a dynamically-CRT-linked
@@ -314,11 +314,11 @@ jobs:
 
   # MAN-82: one extra Linux x86_64 archive with the `soapy` input, for RTL-SDR, Airspy,
   # SDRplay and HackRF operators who should not need Rust to use them. The five `build` legs
-  # above keep `hpsdr` only, so their users never need libSoapySDR. This binary links
+  # above use default features, so their users never need libSoapySDR. This binary links
   # libSoapySDR.so.0.8 dynamically, so it is built natively on the Ubuntu release it supports
   # (pinned, not ubuntu-latest) and run there by operators who install the library and their
   # device's module (README, "SoapySDR on Linux x86_64"). It renders its own man pages: the
-  # validate-tag pages describe the hpsdr-only binary and would omit the Soapy flags.
+  # validate-tag pages describe the default binary and would omit the Soapy flags.
   # release-publish.yml's `release` needs this job, so a failed or skipped build publishes
   # nothing. See docs/DECISIONS/2026-10-14-man82-soapy-release-archive.md.
   build-soapy:
@@ -337,12 +337,12 @@ jobs:
 
       # MAN-243: no build cache here either, for the same reasons as `build`.
       - name: Build (soapy)
-        run: cargo build --release --locked -p manta-cli --features hpsdr,soapy --target x86_64-unknown-linux-gnu
+        run: cargo build --release --locked -p manta-cli --features soapy --target x86_64-unknown-linux-gnu
 
-      # The real library's null-device open, activate and read-error paths, with the release
-      # features combined.
+      # The real library's null-device open, activate and read-error paths, with the
+      # same Soapy feature as the release binary.
       - name: Test the Soapy input against the real library
-        run: cargo test --release --locked -p manta-input --features hpsdr,soapy --lib soapy::tests
+        run: cargo test --release --locked -p manta-input --features soapy --lib soapy::tests
 
       - name: Write man pages
         run: target/x86_64-unknown-linux-gnu/release/manta man-pages --out man-pages-soapy

@@ -17,7 +17,8 @@ path = "src/main.rs"
 
 [features]
 soapy = ["manta-input/soapy"]
-hpsdr = ["manta-input/hpsdr"]
+# Compatibility name: HPSDR input is included in every build.
+hpsdr = []
 
 [dependencies]
 anyhow = { workspace = true }

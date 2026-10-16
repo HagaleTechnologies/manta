@@ -434,19 +434,18 @@ fn check_rejects_a_soapy_input_on_a_build_without_soapy() {
     );
 }
 
-#[cfg(not(feature = "hpsdr"))]
 #[test]
-fn check_rejects_an_hpsdr_input_on_a_build_without_hpsdr() {
+fn check_accepts_an_hpsdr_input_without_opening_the_receiver() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_cfg(
         dir.path(),
         "manta.toml",
-        "[input]\ntype = \"hpsdr\"\nhost = \"h\"\nfreq_hz = 7e6\nrate_hz = 48000.0\n",
+        "[input]\ntype = \"hpsdr\"\nhost = \"receiver.invalid\"\nfreq_hz = 7030000.0\nrate_hz = 48000.0\n",
     );
-    let err = fails(&check_file(&path));
-    assert!(
-        err.contains("input.type = \"hpsdr\" needs a manta built with --features hpsdr"),
-        "{err}"
+    let out = succeeds(&check_file(&path));
+    assert_eq!(
+        out.lines().find(|line| line.starts_with("input:")),
+        Some("input: type=hpsdr host=receiver.invalid port=1024 freq_hz=7030000 rate_hz=48000")
     );
 }
 

@@ -760,7 +760,6 @@ pub(crate) enum ReceiverKind {
     Kiwi,
     #[cfg(feature = "soapy")]
     Soapy,
-    #[cfg(feature = "hpsdr")]
     Hpsdr,
     Ka9q,
 }
@@ -774,7 +773,6 @@ impl ReceiverKind {
             ReceiverKind::Kiwi => "KiwiSDR",
             #[cfg(feature = "soapy")]
             ReceiverKind::Soapy => "SoapySDR",
-            #[cfg(feature = "hpsdr")]
             ReceiverKind::Hpsdr => "HPSDR",
             ReceiverKind::Ka9q => "ka9q-radio",
         }
@@ -798,7 +796,6 @@ impl ReceiverKind {
                 "check --soapy-driver/input.driver, and that SoapySDRUtil --find lists the \
                  radio; install its SoapySDR module if it does not"
             }
-            #[cfg(feature = "hpsdr")]
             ReceiverKind::Hpsdr => {
                 "check --hpsdr-host/input.host, and that the radio is powered on and on this \
                  network"
@@ -1613,7 +1610,6 @@ mod tests {
     #[test]
     fn receiver_fail_has_a_per_kind_fix() {
         let err = anyhow::anyhow!("inner").context("outer");
-        #[cfg_attr(not(any(feature = "soapy", feature = "hpsdr")), allow(unused_mut))]
         let mut cases: Vec<(crate::LiveSourceSpec, &str, &[&str])> = vec![
             (
                 crate::LiveSourceSpec::AudioDevice(None),
@@ -1650,7 +1646,6 @@ mod tests {
             "could not open SoapySDR device \"driver=rtlsdr\": outer: inner",
             &["--soapy-driver", "SoapySDRUtil --find"],
         ));
-        #[cfg(feature = "hpsdr")]
         cases.push((
             crate::LiveSourceSpec::Hpsdr(crate::HpsdrOpts {
                 host: Some("10.0.0.5".into()),

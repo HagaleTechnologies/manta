@@ -53,7 +53,7 @@ jobs:
     # run can't cancel this one structurally -- but an external cancel
     # (manual, a repo-wide event) still disarms auto-merge exactly the same
     # way a real test failure does, so it's handled identically here. Also
-    # includes `timed_out`: ci-full.yml's test/test-soapy/test-hpsdr jobs carry
+    # includes `timed_out`: ci-full.yml's test/test-soapy jobs carry
     # no explicit `timeout-minutes` of their own, so a genuinely hung run
     # (a wedged runner, a decoder stuck against real hardware) reaches
     # GitHub Actions' own platform-default job timeout rather than any
