@@ -278,7 +278,7 @@ jobs:
           Write-Host "OK: no dynamic MSVC CRT imports."
 
       # MAN-133: the pages validate-tag rendered; Package ships them in man/man1.
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: man-pages
           path: man-pages
@@ -707,7 +707,7 @@ jobs:
       # Only the build legs' and build-soapy's `manta-*` artifacts: docker/build-push-action also uploads a
       # `*.dockerbuild` build record to this run, which must not be checksummed, attested or
       # published as a release asset.
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: manta-*
           path: dist
