@@ -171,6 +171,24 @@ class DenyPolicyTests(unittest.TestCase):
             self.assertRegex(f.read(), r"(?m)^/deny\.toml\s+@thagale$")
 
 
+class CodeOwnersTests(unittest.TestCase):
+    """MAN-247: the pipeline's verify list, build scripts and checkout attributes need owner
+    review; build.rs and .gitattributes have no leading slash, so nested ones are covered."""
+
+    def setUp(self):
+        with open(os.path.join(ROOT, ".github", "CODEOWNERS"), encoding="utf-8") as f:
+            self.text = f.read()
+
+    def test_pipeline_definition_has_a_code_owner(self):
+        self.assertRegex(self.text, r"(?m)^/\.catalyst/\s+@thagale$")
+
+    def test_build_scripts_at_any_depth_have_a_code_owner(self):
+        self.assertRegex(self.text, r"(?m)^build\.rs\s+@thagale$")
+
+    def test_attributes_files_at_any_depth_have_a_code_owner(self):
+        self.assertRegex(self.text, r"(?m)^\.gitattributes\s+@thagale$")
+
+
 SHA = "cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d"
 CHECKS = ("test (ubuntu-latest)", "test (macos-latest)", "test (windows-latest)")
 LEGS = CHECKS + ("test-hpsdr (ubuntu-latest)", "test-hpsdr (macos-latest)", "test-hpsdr (windows-latest)")
