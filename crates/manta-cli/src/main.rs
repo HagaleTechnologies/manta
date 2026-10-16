@@ -4774,6 +4774,13 @@ struct OneInput<'a> {
     name: Option<&'a str>,
 }
 
+/// A source flag names a standalone receiver and `resolve` ignores the
+/// configured entries for it, so only an explicit `--input` still narrows
+/// them (Codex, PR 313).
+fn needs_input_selection(cli: &CliOverrides, one: OneInput<'_>) -> bool {
+    one.name.is_some() || cli.source_selector().is_none()
+}
+
 fn prepare_source(
     cli: CliOverrides,
     config_flag: Option<PathBuf>,
@@ -4782,7 +4789,9 @@ fn prepare_source(
     let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
     let config_path = config_flag.or_else(|| config::config_path_from_env(&vars));
     let mut loaded = config::load(config_path.as_deref(), config::Env::Read(&vars))?;
-    select_input(&mut loaded, one.name, one.command)?;
+    if needs_input_selection(&cli, one) {
+        select_input(&mut loaded, one.name, one.command)?;
+    }
     let resolved = resolve(cli, &loaded)?;
     for note in &resolved.notes {
         logging::note(note);
@@ -4842,7 +4851,7 @@ fn prepare_config_for(
     one: Option<OneInput<'_>>,
 ) -> Result<Prepared> {
     let mut loaded = config::load(config_path.as_deref(), config::Env::Read(vars))?;
-    if let Some(one) = one {
+    if let Some(one) = one.filter(|one| needs_input_selection(&cli, *one)) {
         select_input(&mut loaded, one.name, one.command)?;
     }
     let rbn_opts = cli.rbn.clone();

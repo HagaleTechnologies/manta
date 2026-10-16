@@ -95,7 +95,8 @@ existed.
   refused with several entries. Every input needs an RF reference
   (sidecar or `center_freq_hz`), checked before any input opens.
 - **D11 One-receiver commands.** `calibrate`, `doctor`, `soak` and `check`
-  take `--input NAME`, required with several inputs. `calibrate --input
+  take `--input NAME`, required with several inputs unless a source flag
+  names a standalone receiver (the entries are then ignored). `calibrate --input
   NAME` saves `freq_correction_ppm` into that `[[input]]` entry
   (`config_edit::set_freq_correction_ppm`), keeping every other byte.
   `decode` cannot tell which receiver made a recording, so several

@@ -373,6 +373,25 @@ fn check_with_input_reports_that_inputs_rate() {
     );
 }
 
+/// Codex on PR 313: a source flag names a standalone receiver and ignores
+/// the configured entries, so a one-receiver command given one needs no
+/// `--input` with several entries.
+#[test]
+fn a_source_flag_needs_no_input_with_several_entries() {
+    let (_, _, b) = fixtures();
+    let out = manta()
+        .args(["check", "--duration", "1", "--source-iq", "--source"])
+        .arg(b)
+        .arg("--config")
+        .arg(overlap_config())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.contains("192000"), "{stdout}");
+}
+
 /// Codex on PR 313: a recording came from one receiver, and `decode`
 /// cannot tell which of several `[[input]]` entries it was, so entries that
 /// disagree on the correction are refused rather than the first one's
