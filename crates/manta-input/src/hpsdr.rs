@@ -2,10 +2,9 @@
 //! Pavel Demin's `sdr_receiver_hpsdr`/`sdr_transceiver_hpsdr` Red Pitaya
 //! images, and his QMTech+`qmtech-adc` board. ARCHITECTURE §3.
 //!
-//! Feature-gated `hpsdr`, matching how `soapy` is feature-gated — this
-//! module has no native-library dependency (pure UDP/std), but the gate is
-//! kept for symmetry with the other network/hardware sources and so a build
-//! can opt it out.
+//! Included in every build. This module uses UDP/std and needs no native
+//! radio library. A receiver is opened only by an explicit call to
+//! [`HpsdrDevice::open`].
 //!
 //! Wire facts below are pinned by
 //! `docs/DECISIONS/2026-09-02-hpsdr-hermes-protocol-spike.md` (MAN-10),

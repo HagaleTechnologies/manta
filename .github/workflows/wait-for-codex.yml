@@ -382,7 +382,7 @@ jobs:
         # rejected outright for the workflow_dispatch endpoint regardless -- there is no
         # credential available to make this call for a Dependabot PR. ci-full.yml's own
         # `pull_request` trigger (which runs for any PR whose author is off the trusted list,
-        # Dependabot included -- see that file's header) runs test/test-soapy/test-hpsdr
+        # Dependabot included -- see that file's header) runs test/test-soapy
         # natively for this case instead, with no dispatch or PAT needed at all -- the
         # check-run this job already created above (conclusion=success) is a compatibility
         # artifact only; the REAL required checks

@@ -119,7 +119,6 @@ pub(crate) fn apply_tune_hz(resolved: &mut Resolved, tune_hz: f64) -> Result<()>
         LiveSourceSpec::Kiwi(kiwi) => kiwi.freq = Some(tune_hz),
         #[cfg(feature = "soapy")]
         LiveSourceSpec::Soapy(soapy) => soapy.freq = Some(tune_hz),
-        #[cfg(feature = "hpsdr")]
         LiveSourceSpec::Hpsdr(hpsdr) => {
             hpsdr.freq = Some(
                 crate::check_hpsdr_freq_hz("--tune-hz", tune_hz).map_err(|e| anyhow::anyhow!(e))?,
@@ -334,7 +333,6 @@ fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<Str
         kiwi,
         #[cfg(feature = "soapy")]
         soapy,
-        #[cfg(feature = "hpsdr")]
         hpsdr,
         ka9q,
         dial_freq_hz,
@@ -374,7 +372,6 @@ fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<Str
     // Likewise every other --soapy-* / --hpsdr-* flag requires these.
     #[cfg(feature = "soapy")]
     flag(soapy.driver.is_some(), "--soapy-driver");
-    #[cfg(feature = "hpsdr")]
     flag(hpsdr.host.is_some(), "--hpsdr-host");
     // --ka9q-port, --ka9q-ssrc and --ka9q-interface require --ka9q-group.
     flag(ka9q.group.is_some(), "--ka9q-group");
@@ -917,7 +914,6 @@ mod tests {
                 _ => unreachable!(),
             }
         }
-        #[cfg(feature = "hpsdr")]
         {
             let mut r = resolved_with(LiveSourceSpec::Hpsdr(crate::HpsdrOpts {
                 host: Some("h".into()),

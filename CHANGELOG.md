@@ -143,6 +143,9 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- HPSDR network-radio input and its hardware-free tests are included in
+  every build. The `hpsdr` Cargo feature remains an accepted no-op for
+  compatibility; SoapySDR still needs `--features soapy` (MAN-239).
 - MAN-254: `manta soak --help` says the run lasts the full `--duration`
   even when a `--source` recording ends sooner, instead of repeating
   `run`'s promise that a replay finishes early. Soak's behaviour is unchanged.
