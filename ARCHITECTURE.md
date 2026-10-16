@@ -180,7 +180,11 @@ advanced by the gap, so spot timestamps stay wall-clock-true with no
 audio spliced across the gap and no zero-fill (see
 `docs/DECISIONS/2026-10-05-man73-source-reconnect.md` for why zero-fill
 was rejected). File replay is exempt: its errors and EOF must reach
-`listen()` unchanged for byte-identical replay.
+`listen()` unchanged for byte-identical replay. Each reopen runs on its own
+short-lived `reopen-<kind>` thread, so a stop request during an outage
+abandons it and `read()` returns EOF within ~100 ms; the client drain,
+which starts only after `listen()` returns, therefore no longer waits for a
+stalled DNS lookup, connect or driver open (MAN-252).
 
 **Paced and looping replay (MAN-269).** File replay normally runs as fast
 as the machine decodes. `run --realtime` (`input.realtime`) wraps the file
@@ -865,7 +869,11 @@ validation (MAN-28). Dedupe (step 5) still applies.
   or a fatal source error. A reconnectable source's disconnect never
   reaches `listen()` as a read failure (MAN-73, below): its unhealthy
   transition zeroes the shared handle instead, which the poller publishes
-  within one `ACTIVE_TRACKS_POLL_INTERVAL`. Note this is deliberately *not*
+  within one `ACTIVE_TRACKS_POLL_INTERVAL`, and since MAN-251 it also
+  clears the exported `manta_active_tracks` gauge synchronously — the
+  poller's gauge load and metric publish are separate steps, so a tick
+  that loaded the pre-drop count could otherwise republish it just after
+  the transition. Note this is deliberately *not*
   `TrackManager::active_track_count()` (what MAN-45 first published here),
   which also counts unconfirmed CANDIDATEs — noise-blip rise crossings
   that lease no decoder and would inflate an operator-facing "is it

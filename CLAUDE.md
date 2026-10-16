@@ -365,6 +365,7 @@ moved from ctrlc to signal-hook; a second SIGINT/SIGTERM (SIGHUP without
 `[server]`) exits at once with 128 + signal, skipping the drain. See
 docs/DECISIONS/2026-10-14-man232-closed-and-stalled-output.md.
 
+<<<<<<< HEAD
 MAN-119: `WavIqSource` streams (header-only `open`) and reads Float32 and
 16/24/32-bit integer IQ WAVs; `manta decode` streams through
 `manta_engine::decode_source`, so its memory no longer grows with the file.
@@ -376,6 +377,13 @@ are confirmed) make it a CI fixture; `scripts/score-transcript.py` scores a
 run against a hand transcript, and the VP8GEO transcript itself is
 outstanding. See
 docs/DECISIONS/2026-10-14-man119-streaming-wav-and-real-audio-corpus.md.
+=======
+MAN-252: `ReconnectingSource` runs each reopen on a `reopen-<kind>`
+thread and abandons it at a stop request, so SIGTERM during a stalled
+reconnect drains clients and exits 0 at once; an EOF after a stop during
+startup calibration is a clean end. See
+docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md.
+>>>>>>> 9a79a729bec462d52cde4ab62bd6cf6a1529bf47
 
 MAN-245: the Codex gate fails closed, titled `Review thread list
 incomplete`, when a PR has more than 100 review threads or an unresolved
