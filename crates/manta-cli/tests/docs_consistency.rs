@@ -2891,6 +2891,44 @@ fn claude_md_decision_paths_start_a_word_and_resolve() {
     }
 }
 
+/// CLAUDE.md's "Merge rules" names every `.github/workflows/` file with a
+/// line that starts `gh pr merge` and passes `--auto`: each one admits PRs
+/// to the merge queue. MAN-238's brief named only `auto-merge-trigger.yml`
+/// and called it the only gate, leaving out `dependabot-auto-merge.yml`.
+#[test]
+fn claude_md_merge_rules_name_every_auto_merge_workflow() {
+    let dir = repo_root().join(".github/workflows");
+    let mut arming: Vec<String> = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+        .map(|e| {
+            e.expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|n| n.ends_with(".yml") || n.ends_with(".yaml"))
+        .filter(|n| {
+            doc(&format!(".github/workflows/{n}")).lines().any(|l| {
+                let l = l.trim_start();
+                l.starts_with("gh pr merge") && l.contains("--auto")
+            })
+        })
+        .collect();
+    arming.sort();
+    assert!(
+        !arming.is_empty(),
+        "no workflow runs `gh pr merge --auto`; update this test"
+    );
+    let claude = doc("CLAUDE.md");
+    let rules = section(&claude, "Merge rules");
+    for wf in &arming {
+        assert!(
+            rules.contains(&format!("`{wf}`")),
+            "CLAUDE.md's Merge rules never name `{wf}`, which runs `gh pr merge --auto`"
+        );
+    }
+}
+
 #[test]
 fn spot_schema_transport_points_at_the_stream_contract() {
     let schema = include_str!("../../../docs/SPOT-SCHEMA.md").replace("\r\n", "\n");
