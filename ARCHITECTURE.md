@@ -331,6 +331,14 @@ transmission may never produce again).
    occurrence already evaluated as a Beacon before the guard appeared is
    not a loss and is not counted). Context
    determines spot type (CQ / DE / BEACON) — RBN spots carry this flag.
+
+   **Spot annotations (MAN-272).** Each completed word is also scanned for
+   an RST (the cut number `N` read as `9`, so `5NN` is `599`) and for
+   `QRL?` (`manta_spot::message`). A spot carries its track's latest report
+   and a sticky QRL? flag, read from the emitting track when the spot is
+   built. **Neither gates any validation step, and neither crosses a track
+   merge**: a merge loser's annotations end with its state, like its words.
+   See `docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md`.
 2. **Callsign plausibility**: structural grammar (prefix-digit-suffix, portable
    designators `/P /QRP /3`), which also rejects, by exact match, a fixed
    list of non-callsign CW conventions (`5NN`, `599`, `TEST`, `TU`, `QRZ`,
@@ -491,7 +499,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
 - **JSON Lines stream** (TCP and WebSocket, :7301): full-fidelity spot objects
   (adds confidence, track id, decoder text context). This is the cqdx ingest
   surface; schema published in `dispensa` as a JSON Schema contract alongside the
-  existing ecosystem contracts. Every spot carries a non-null, real `dxDxcc`/
+  existing ecosystem contracts. Each spot also carries `rst` (its track's most
+  recent RST, or `null`) and `qrlQuery` (the track sent `QRL?`), MAN-272's §6
+  annotations, ahead of dispensa; the telnet line and the RBN uplink do not
+  carry them. Every spot carries a non-null, real `dxDxcc`/
   `deDxcc` (an ADIF DXCC entity number, MAN-136) whenever the callsign
   resolves against `cty.dat`; when it doesn't, `dxDxcc`/`dxContinent`/
   `dxCqZone` (and their `de*` counterparts) carry named, out-of-domain

@@ -380,6 +380,14 @@ apply shows as `Codex review overridden by <login>`.
 the decision record; pinning `Supply Chain` to GitHub Actions is owner
 step O2. See docs/DECISIONS/2026-10-16-man245-gate-verdict-integrity.md.
 
+MAN-272 (replaces MAN-33): each spot carries its track's latest RST (`5NN`
+read as `599`) and a sticky `QRL?` flag, scanned per completed word by
+`manta_spot::message`; neither gates validation. JSON spots gain `rst`/
+`qrlQuery` (ahead of dispensa) and the `SPOT:` line an optional ` rst=599`/
+` QRL?`; telnet and the RBN uplink are unchanged. A track merge does not
+carry the loser's annotations (D5). SPEC §7.1 V32/V33. See
+docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each

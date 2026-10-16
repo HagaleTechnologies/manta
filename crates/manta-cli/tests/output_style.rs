@@ -315,7 +315,7 @@ fn run_spots_are_stdout_only_repeatable_and_json_stays_raw() {
     let stdout = String::from_utf8(a.stdout).unwrap();
     let stderr = String::from_utf8(a.stderr).unwrap();
     assert!(stdout.contains("W1AW"));
-    let line = regex::Regex::new(r"^SPOT: [A-Z0-9/]+ \((CQ|DE|BEACON|unknown)\) -?\d+\.\d kHz -?\d+ dB \d+ WPM conf=\d+\.\d{2}$").unwrap();
+    let line = regex::Regex::new(r"^SPOT: [A-Z0-9/]+ \((CQ|DE|BEACON|unknown)\) -?\d+\.\d kHz -?\d+ dB \d+ WPM conf=\d+\.\d{2}( rst=[1-5][1-9]{2})?( QRL\?)?$").unwrap();
     assert!(stdout.lines().all(|s| line.is_match(s)), "{stdout}");
     assert!(stdout.ends_with('\n'));
     assert!(stderr.starts_with("manta: listening;"));

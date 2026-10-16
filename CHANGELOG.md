@@ -74,6 +74,12 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-272: each spot carries its track's latest RST (`5NN` read as `599`)
+  and whether it sent `QRL?`, as CW Skimmer's band map shows. JSON spots
+  gain `rst` (string or `null`) and `qrlQuery` (boolean), `run --json` and
+  `decode --json` spot objects gain `rst`/`qrl_query`, and the `SPOT:` line
+  ends with ` rst=599` and ` QRL?` when present. Telnet and the RBN uplink
+  are unchanged. A track merge does not carry the losing track's values.
 - `manta-linux-x86_64-soapy.tar.gz`, a release archive whose binary has
   SoapySDR input (`--soapy-driver`, for RTL-SDR, Airspy, SDRplay and
   HackRF) for Ubuntu 24.04 x86_64, so those receivers no longer need a

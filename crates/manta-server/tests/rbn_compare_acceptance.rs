@@ -156,6 +156,8 @@ fn fixture_spots() -> Vec<(i64, Spot)> {
                 confidence: 0.8,
                 track_id: parts[2].parse().unwrap(),
                 sample_ts: parts[3].parse().unwrap(),
+                rst: None,
+                qrl_query: false,
             };
             (v["timestamp"].as_i64().unwrap(), spot)
         })
