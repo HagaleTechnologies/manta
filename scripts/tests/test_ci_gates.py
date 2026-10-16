@@ -389,6 +389,7 @@ class PrTitleWorkflowTests(unittest.TestCase):
         self.assertNotIn("secrets.", "\n".join(wf.code_lines(self.text)))
 
 
+<<<<<<< HEAD
 # Every call is recorded as its arguments, each NUL-terminated, then a record separator, so a test
 # can match one argument exactly (a title that is a prefix of another must not match it).
 GH_STUB_HEADER = "#!/bin/bash\n{ printf '%s\\0' \"$@\"; printf '\\036'; } >> \"$GH_CALLS\"\n"
@@ -978,6 +979,28 @@ class PinnedCheckProducerTests(unittest.TestCase):
                 self.assertNotIn(context, posted)
         unpinned = {c for c, d in sources.DECISIONS.items() if d[0] == "unpinned"}
         self.assertEqual(posted, unpinned, "the Checks-API POST sites create exactly the unpinned checks")
+=======
+class MainAlertWatchTests(unittest.TestCase):
+    """MAN-241: main-alert.yml kept watching `Release` after release.yml was deleted. A
+    workflow_run filter entry naming no workflow never fires, so every watched name must exist."""
+
+    def test_every_watched_workflow_exists(self):
+        names = set()
+        for path in wf.workflow_files():
+            m = re.search(r"^name:\s*(.+?)\s*$", wf.read(os.path.basename(path)), re.M)
+            if m:
+                names.add(m.group(1).strip("'\""))
+        lines = wf.read("main-alert.yml").splitlines()
+        trigger = wf.sub(lines[lines.index("on:"):], "workflow_run")
+        self.assertIsNotNone(trigger, "main-alert.yml: no workflow_run trigger")
+        workflows = wf.sub(trigger, "workflows")
+        self.assertIsNotNone(workflows, "main-alert.yml: workflow_run has no workflows list")
+        # code_lines drops comment lines, so an entry after one is still checked.
+        watched = [line.strip()[2:].strip().strip("'\"")
+                   for line in wf.code_lines(workflows[1:]) if line.strip().startswith("- ")]
+        self.assertTrue(watched, "main-alert.yml: workflows is not a block list")
+        self.assertEqual([w for w in watched if w not in names], [])
+>>>>>>> efe422303b759cdb7b4cee786ef8d7089ed7b5ad
 
 
 if __name__ == "__main__":
