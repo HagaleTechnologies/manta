@@ -7,7 +7,6 @@
 # list an agent identity as an owner.
 
 /.github/            @thagale
-/.mergify.yml        @thagale
 
 # cargo build/test resolves exactly this dependency graph -- an unowned edit to any crate's OWN
 # Cargo.toml (not just the workspace root) can change a direct dependency's installed version
