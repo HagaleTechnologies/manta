@@ -177,6 +177,9 @@ pub trait IqSource {
     /// zero-filled outage past ~2.5s pins `manta-dsp::floor`'s 25th-
     /// percentile noise floor at -140 dBFS and floods false tracks on
     /// resume (measured; see docs/DECISIONS/2026-10-05-man73-source-reconnect.md).
+    /// A `read()` that returns 0 may leave a gap pending too (MAN-258): the
+    /// stream ended during an outage, and `listen` then closes its tracks
+    /// with `finish_for_discontinuity` rather than as an end of signal.
     fn take_discontinuity(&mut self) -> Option<u64> {
         None
     }
@@ -185,7 +188,8 @@ pub trait IqSource {
     /// discard whole packets on the wire (MAN-56). Returns `None` (the
     /// default) for sources with no such failure mode -- a file has no
     /// packets. KiwiSDR counts SND `seq` gaps and short frames (MAN-128);
-    /// SoapySDR/audio currently count nothing of the kind. A caller with
+    /// SoapySDR counts driver overflow read errors (MAN-233); audio
+    /// currently counts nothing of the kind. A caller with
     /// `Some(handle)` may keep polling it after the
     /// source itself has been moved into `manta_engine::listen`, which is
     /// the whole reason this is a shared handle rather than a `&self`

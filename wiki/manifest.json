@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-15T07:42:18Z",
-  "head_commit": "6596e3a",
+  "generated_at": "2026-10-16T15:47:53Z",
+  "head_commit": "9a79a72",
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -26,7 +26,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:bbf8c98aa0726da4c8005e95e854722e4167dc453ff3e207349abf960d4712c2",
+      "hash": "sha256:d0ba644a071d67a25133644fe1d0361172e71696d71195b1f997c38f25bb5202",
       "id": "decode-chain",
       "kind": "subsystem",
       "links": [
@@ -42,8 +42,8 @@
       ],
       "status": "current",
       "title": "How does the per-track CW decode chain work?",
-      "verified_commit": "60c4339",
-      "verified_date": "2026-10-14",
+      "verified_commit": "3805f78",
+      "verified_date": "2026-10-15",
       "visibility": "public"
     },
     {
@@ -244,7 +244,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:2933074e8296b64017cf692afb5b6ac4e5088dc89ee35595f453078d8d472d94",
+      "hash": "sha256:73012b6f4002a218f3503361244f408d314175ba450b5d27ef9b22899fd982b6",
       "id": "source-reconnect",
       "kind": "gotcha",
       "links": [
@@ -258,12 +258,13 @@
         "crates/manta-cli/src/reconnect.rs",
         "crates/manta-cli/src/reconnect.rs (InputHealthTotals)",
         "crates/manta-input/src/lib.rs (IqSource::take_discontinuity)",
-        "docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md"
+        "docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md",
+        "docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md"
       ],
       "status": "current",
       "title": "What's the gotcha with a live source disconnecting?",
-      "verified_commit": "6596e3a",
-      "verified_date": "2026-10-15",
+      "verified_commit": "9a79a72",
+      "verified_date": "2026-10-16",
       "visibility": "public"
     },
     {
@@ -362,7 +363,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:a9ea021f5b989a216ee38a3fbbeb7dcd0ba26c64a315133d7caa66ea9ae7cd17",
+      "hash": "sha256:4b7fed6fe439b6594d397e90be05c438ccb701d444a8007faebd118f5cffe503",
       "id": "windows-build-setup",
       "kind": "howto",
       "links": [
@@ -373,7 +374,6 @@
       "path": "pages/windows-build-setup.md",
       "sources": [
         ".github/workflows/ci-full.yml",
-        ".github/workflows/release.yml",
         ".github/workflows/release-publish.yml",
         "docs/superpowers/specs/2026-09-11-man212-windows-platform-support-design.md",
         "docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md",
@@ -381,8 +381,8 @@
       ],
       "status": "current",
       "title": "How do I build and test manta on Windows?",
-      "verified_commit": "3805f78",
-      "verified_date": "2026-10-15",
+      "verified_commit": "e7243d1",
+      "verified_date": "2026-10-16",
       "visibility": "public"
     }
   ],

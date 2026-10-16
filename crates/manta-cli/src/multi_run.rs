@@ -239,10 +239,22 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             .context("blocking SIGHUP on the decode threads")?;
     }
     let stop = Arc::new(AtomicBool::new(false));
-    let stop_handler = stop.clone();
-    ctrlc::set_handler(move || stop_handler.store(true, Ordering::Relaxed))?;
+    // MAN-232: on Unix every stop signal is signal-hook's
+    // (`install_unix_signal_handlers`); ctrlc is Windows-only, for console
+    // events, and a second event exits at once, as on the one-input path.
     #[cfg(unix)]
     let reload_signals = crate::install_unix_signal_handlers(&stop, m.server.is_some())?;
+    #[cfg(windows)]
+    {
+        let stop_handler = stop.clone();
+        let signalled = AtomicBool::new(false);
+        ctrlc::set_handler(move || {
+            if signalled.swap(true, Ordering::Relaxed) {
+                std::process::exit(130);
+            }
+            stop_handler.store(true, Ordering::Relaxed);
+        })?;
+    }
     // Each input's last reported health; "k of n inputs decoding" counts
     // the healthy ones. A `ReconnectingSource` reports its initial state at
     // construction, so only a change of state is an edge worth a log line.
@@ -331,7 +343,9 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                             first,
                             replay,
                             label,
-                            Box::new(move || reopen.open(capture, dial)),
+                            Box::new(move || {
+                                Ok(reopen.open(capture, dial)? as Box<dyn manta_input::IqSource>)
+                            }),
                         )
                     }
                 }),

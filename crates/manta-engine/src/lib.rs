@@ -15,6 +15,8 @@ pub use latency::{DecodeLatencyObserver, DecodeLatencySnapshot, DECODE_LATENCY_B
 pub use live::{
     BandSample, LiveRecord, LiveStateSink, TrackSnapshot, LIVE_MAX_CANDIDATES, LIVE_TEXT_CHARS,
 };
+pub mod lifecycle;
+pub use lifecycle::{TrackLifecycleObserver, TrackLifecycleSnapshot};
 pub use multi::{
     common_rate_hz, listen_inputs, open_inputs, InputEnd, InputObservers, InputOpener, InputSpec,
     OpenedInput, OpenedInputs, SessionClock, SharedObservers, SourceClock, TrackIdSpace,

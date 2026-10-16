@@ -243,7 +243,7 @@ dashboard can drop the track's row on this record.
 | `deCall` | string | never | As in `bandState`. |
 | `timestamp` | integer | never | Stream time of the newest decoder event when the track closed. |
 | `trackId` | integer | never | The track that closed. |
-| `closure` | string | never | `signalEnded`: the signal ended (a sustained power drop, no character for the silence timeout, or the end of the input). `bookkeeping`: the track stopped being tracked with no evidence the signal ended: it merged into another track, was evicted, or was closed by a source reconnect. |
+| `closure` | string | never | `signalEnded`: the signal ended (a sustained power drop, no character for the silence timeout, or the end of the input). `bookkeeping`: the track stopped being tracked with no evidence the signal ended: it merged into another track, was evicted, or was closed by a source outage (a reconnect, or a stop while the source was down). |
 | `survivorTrackId` | integer or null | unless merged | For a `bookkeeping` closure that merged into another track, that track's `trackId`; the signal continues there. `null` otherwise. |
 
 ## Decisions and reasons

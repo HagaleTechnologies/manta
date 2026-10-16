@@ -195,8 +195,15 @@ the current track segment and starting a fresh one with the sample clock
 advanced by the gap, so spot timestamps stay wall-clock-true with no
 audio spliced across the gap and no zero-fill (see
 `docs/DECISIONS/2026-10-05-man73-source-reconnect.md` for why zero-fill
-was rejected). File replay is exempt: its errors and EOF must reach
-`listen()` unchanged for byte-identical replay.
+was rejected). A stop while the source is down (MAN-258) ends the stream
+with the outage still pending, so the open tracks close with the same
+outage teardown and no new segment starts. File replay is exempt: its
+errors and EOF must reach `listen()` unchanged for byte-identical replay.
+Each reopen runs on its own short-lived `reopen-<kind>` thread, so a stop
+request during an outage abandons it and `read()` returns EOF within
+~100 ms; the client drain, which starts only after `listen()` returns,
+therefore no longer waits for a stalled DNS lookup, connect or driver open
+(MAN-252).
 
 **Paced and looping replay (MAN-269).** File replay normally runs as fast
 as the machine decodes. `run --realtime` (`input.realtime`) wraps the file
@@ -807,10 +814,13 @@ validation (MAN-28). Dedupe (step 5) still applies.
   (§3 — blocked on a `coppa-audio` API addition, `manta-engine::soak`'s documented
   deviation, a different gap from MAN-56's wire-level packet counters).
   The three `manta_input_*` series are published only for sources that
-  actually count wire-level packet loss (HPSDR and KiwiSDR — MAN-128
-  generalized MAN-56's gap-stat wiring to KiwiSDR's SND `seq` field;
-  soapy/audio report none) and are **absent**, not a frozen zero, for
-  every other source — "absent means not measured", so an operator never
+  actually count wire-level packet loss or driver overflow (HPSDR, KiwiSDR
+  (MAN-128's SND `seq` tracking), ka9q-radio (MAN-140) and SoapySDR, whose
+  driver overflow read errors each count one gap event — MAN-233; an
+  overflow flagged `SOAPY_SDR_END_ABRUPT` on a successful read is not
+  seen, and SoapySDR's `dropped_packets` stays 0 because an overflow
+  carries no lost-sample count) and are **absent**, not a frozen zero, for every other source
+  (audio) — "absent means not measured", so an operator never
   reads a placeholder as live data; the same distinction that motivated
   the `manta_active_tracks` caveat before it was populated.
 - **RBN comparison (MAN-301)**: `[rbn_compare]` is opt-in and disabled by
@@ -889,7 +899,11 @@ validation (MAN-28). Dedupe (step 5) still applies.
   or a fatal source error. A reconnectable source's disconnect never
   reaches `listen()` as a read failure (MAN-73, below): its unhealthy
   transition zeroes the shared handle instead, which the poller publishes
-  within one `ACTIVE_TRACKS_POLL_INTERVAL`. Note this is deliberately *not*
+  within one `ACTIVE_TRACKS_POLL_INTERVAL`, and since MAN-251 it also
+  clears the exported `manta_active_tracks` gauge synchronously — the
+  poller's gauge load and metric publish are separate steps, so a tick
+  that loaded the pre-drop count could otherwise republish it just after
+  the transition. Note this is deliberately *not*
   `TrackManager::active_track_count()` (what MAN-45 first published here),
   which also counts unconfirmed CANDIDATEs — noise-blip rise crossings
   that lease no decoder and would inflate an operator-facing "is it

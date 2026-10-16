@@ -6,22 +6,22 @@ status: current
 maintainer: agent
 sources:
   - .github/workflows/ci-full.yml
-  - .github/workflows/release.yml
   - .github/workflows/release-publish.yml
   - docs/superpowers/specs/2026-09-11-man212-windows-platform-support-design.md
   - docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md
   - docs/DECISIONS/2026-10-15-man371-windows-required-check.md
 verified:
-  commit: 3805f78
-  date: 2026-10-15
+  commit: e7243d1
+  date: 2026-10-16
 links:
   - live-hardware-field-testing
 ---
 # How do I build and test manta on Windows?
 
 manta targets `x86_64-pc-windows-msvc` (not MinGW) -- this matches the
-prebuilt release binaries (`.github/workflows/release.yml`) and is the only
-Windows target CI (`.github/workflows/ci-full.yml`) exercises.
+prebuilt release binaries (`.github/workflows/release-publish.yml`) and
+is the only Windows target CI (`.github/workflows/ci-full.yml`)
+exercises.
 
 ## Default build (no SoapySDR)
 

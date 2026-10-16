@@ -187,6 +187,9 @@ verify` must report no errors for the unit.
   manta stops decoding, gives connected clients up to 50 seconds to drain,
   and gives its runtime up to 2 more seconds to shut down.
   `TimeoutStopSec=60` leaves a margin before systemd sends SIGKILL.
+  A second SIGTERM while manta drains (for example a second
+  `systemctl kill manta`) ends it at once, without the rest of the drain,
+  with exit status 143.
 - **Logs.** stdout and stderr go to the journal under the identifier
   `manta`. Reading them with `journalctl -u manta` needs root or
   membership in the `systemd-journal` or `adm` group. journald keeps them
