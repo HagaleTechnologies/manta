@@ -670,12 +670,20 @@ pub fn listen_with_observers(
         // `break`, not `return`: whatever was read is still processed below
         // and flushed by `finish()`, so a watchdog-bounded caller (`doctor`,
         // `soak`) still analyses every sample it read, and the decode loop's
-        // own `stop` check then ends the run without another read.
+        // own `stop` check then ends the run without another read. The same
+        // holds for an EOF returned because `stop` was set during the read
+        // (MAN-252: `manta-cli`'s reconnecting wrapper ends a backoff or
+        // reopen that way).
         if stop.load(Ordering::Relaxed) {
             break;
         }
         let n = src.read(&mut calib[filled..])?;
         if n == 0 {
+            // MAN-252: a live source's wrapper reports a stop request during
+            // an outage as EOF; that is the stop, not a source that ended.
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             anyhow::bail!("audio source ended during startup calibration");
         }
         if let Some(gap) = src.take_discontinuity() {
@@ -2994,6 +3002,85 @@ mod tests {
             counts.last().copied(),
             Some(0),
             "the stopped run must still end through finish(), got {counts:?}"
+        );
+    }
+
+    /// A live-shaped source that returns one short read, then EOF on its
+    /// second -- setting `stop` first when `stops_at_eof`, as `manta-cli`'s
+    /// reconnecting wrapper does when a stop request lands mid-outage.
+    struct EndsDuringCalibrationSource {
+        stop: Arc<AtomicBool>,
+        stops_at_eof: bool,
+        reads: u64,
+    }
+
+    impl manta_input::IqSource for EndsDuringCalibrationSource {
+        fn sample_rate(&self) -> f64 {
+            48_000.0
+        }
+        fn center_freq_hz(&self) -> f64 {
+            14_000_000.0
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            self.reads += 1;
+            if self.reads == 1 {
+                let n = buf.len().min(64);
+                buf[..n].fill(Complex32::new(0.0, 0.0));
+                return Ok(n);
+            }
+            if self.stops_at_eof {
+                self.stop.store(true, Ordering::Relaxed);
+            }
+            Ok(0)
+        }
+    }
+
+    /// Runs `listen_with_observers` against `EndsDuringCalibrationSource`,
+    /// returning its result and every `on_tracks` value.
+    fn run_ending_during_calibration(stops_at_eof: bool) -> (Result<()>, Vec<usize>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let src: Box<dyn manta_input::IqSource> = Box::new(EndsDuringCalibrationSource {
+            stop: stop.clone(),
+            stops_at_eof,
+            reads: 0,
+        });
+        let mut counts = Vec::new();
+        let result = listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            stop,
+            ListenObservers::default(),
+            |_ev| {},
+            |_spot| {},
+            |n| counts.push(n),
+        );
+        (result, counts)
+    }
+
+    /// MAN-252: `ReconnectingSource` reports a stop request mid-outage as
+    /// EOF. During calibration that EOF is the stop, not a source that
+    /// ended: the run ends cleanly through `finish()`.
+    #[test]
+    fn listen_treats_eof_after_a_stop_request_during_calibration_as_a_clean_end() {
+        let (result, counts) = run_ending_during_calibration(true);
+        result.expect("an EOF that follows a stop request is a clean shutdown, not an error");
+        assert_eq!(
+            counts.last().copied(),
+            Some(0),
+            "the stopped run must still end through finish(), got {counts:?}"
+        );
+    }
+
+    /// The control: an EOF during calibration with no stop request is still
+    /// the `ended during startup calibration` error (a too-short file).
+    #[test]
+    fn listen_still_fails_when_a_source_ends_during_calibration_unasked() {
+        let (result, _counts) = run_ending_during_calibration(false);
+        let err = result.expect_err("an unasked EOF during calibration is an error");
+        assert!(
+            err.to_string()
+                .contains("audio source ended during startup calibration"),
+            "got: {err}"
         );
     }
 

@@ -9,8 +9,13 @@ sources:
   - crates/manta-cli/src/reconnect.rs
   - crates/manta-cli/src/reconnect.rs (InputHealthTotals)
   - crates/manta-input/src/lib.rs (IqSource::take_discontinuity)
+  - docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md
 verified:
+<<<<<<< HEAD
   commit: 353b185
+=======
+  commit: 9f35f1a
+>>>>>>> 9a79a729bec462d52cde4ab62bd6cf6a1529bf47
   date: 2026-10-16
 links:
   - determinism
@@ -29,7 +34,9 @@ Gotcha: a per-connection handle taken before wrapping (`health_counters()`,
 `confirmed_live_handle()`-style) goes stale at the first reconnect, because every reopen builds a
 new device with fresh counters, so poll `ReconnectingSource::input_health()` (MAN-228) instead; and
 syncing counts after `read()` returns is not enough, because HPSDR counts inside a `read()` that
-blocks until a valid packet arrives.
+blocks until a valid packet arrives. Gotcha (MAN-252): every reopen runs on its own `reopen-<kind>`
+thread, which a stop request abandons, so anything `LiveSourceSpec::open` builds must be `Send`; a
+source or wrapper holding `Rc` or raw pointers will not compile into the opener.
 
 ## Symptom
 

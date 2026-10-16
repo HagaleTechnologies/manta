@@ -1,6 +1,11 @@
 {
+<<<<<<< HEAD
   "generated_at": "2026-10-16T14:00:30Z",
   "head_commit": "353b185",
+=======
+  "generated_at": "2026-10-16T11:15:00Z",
+  "head_commit": "efe4223",
+>>>>>>> 9a79a729bec462d52cde4ab62bd6cf6a1529bf47
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -243,7 +248,11 @@
       "visibility": "public"
     },
     {
+<<<<<<< HEAD
       "hash": "sha256:f0176e73b5c4eb041d47f55ae088634c9b99103290d889244ba83c12c9b73fdd",
+=======
+      "hash": "sha256:ef955ed7d6e28d8a27ae7f522a2ea766c38766b321945d6817c4d5447b09f058",
+>>>>>>> 9a79a729bec462d52cde4ab62bd6cf6a1529bf47
       "id": "source-reconnect",
       "kind": "gotcha",
       "links": [
@@ -256,11 +265,16 @@
         "docs/DECISIONS/2026-10-05-man73-source-reconnect.md",
         "crates/manta-cli/src/reconnect.rs",
         "crates/manta-cli/src/reconnect.rs (InputHealthTotals)",
-        "crates/manta-input/src/lib.rs (IqSource::take_discontinuity)"
+        "crates/manta-input/src/lib.rs (IqSource::take_discontinuity)",
+        "docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md"
       ],
       "status": "current",
       "title": "What's the gotcha with a live source disconnecting?",
+<<<<<<< HEAD
       "verified_commit": "353b185",
+=======
+      "verified_commit": "9f35f1a",
+>>>>>>> 9a79a729bec462d52cde4ab62bd6cf6a1529bf47
       "verified_date": "2026-10-16",
       "visibility": "public"
     },
