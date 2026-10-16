@@ -403,6 +403,33 @@ class ScoreTests(ScriptTest):
         self.assertIn("min_recall 0.5: measured 0.3333", out.stderr)
         self.assertFalse(self.results()["passed"])
 
+    def test_invalid_floor_values_are_refused_before_decode(self):
+        self.present("iq.wav")
+        for key in ("min_spots", "min_precision", "min_recall"):
+            invalid = [-1, "0.5", None, True, False, [], {},
+                       float("nan"), float("inf"), float("-inf")]
+            invalid += [0.5, 1.0] if key == "min_spots" else [1.01, 10 ** 400]
+            for value in invalid:
+                with self.subTest(key=key, value=value):
+                    out = self.score([self.iq_entry(floors={key: value})])
+                    self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+                    self.assertIn(key, out.stderr)
+                    self.assertNotIn("Traceback", out.stderr)
+                    self.assertEqual(self.calls(), [])
+        for floors in ([], ["min_spots"], "min_spots", False, 0):
+            with self.subTest(floors=floors):
+                out = self.score([self.iq_entry(floors=floors)])
+                self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+                self.assertIn("floors must be an object", out.stderr)
+                self.assertEqual(self.calls(), [])
+
+    def test_valid_floor_boundaries_are_accepted(self):
+        for floors in ({}, {"min_spots": 0, "min_precision": 0, "min_recall": 0.0},
+                       {"min_spots": 10 ** 400, "min_precision": 1.0, "min_recall": 1}):
+            with self.subTest(floors=floors):
+                path = self.write_manifest([self.iq_entry(floors=floors)])
+                self.assertEqual(corpus.load_manifest(path)["recordings"][0]["floors"], floors)
+
     def test_failed_decode_fails_the_entry(self):
         self.present("iq.wav")
         out = self.score([self.iq_entry(floors={})], status=3)

@@ -114,9 +114,20 @@ def load_manifest(path=MANIFEST):
         if truth is not None and (not isinstance(truth, dict)
                                   or truth.get("kind") not in ("rbn", "transcript")):
             raise ManifestError("%s: %s: truth \"kind\" must be \"rbn\" or \"transcript\"" % (path, name))
-        for key in rec.get("floors") or {}:
+        floors = rec.get("floors")
+        if floors is None:
+            floors = {}
+        if not isinstance(floors, dict):
+            raise ManifestError("%s: %s: floors must be an object" % (path, name))
+        for key, value in floors.items():
             if key not in FLOOR_KEYS:
                 raise ManifestError("%s: %s: unknown floor %r" % (path, name, key))
+            if key == "min_spots":
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    raise ManifestError("%s: %s: %s must be a nonnegative integer" % (path, name, key))
+            elif (not isinstance(value, (int, float)) or isinstance(value, bool)
+                  or not 0 <= value <= 1):
+                raise ManifestError("%s: %s: %s must be a finite number in [0, 1]" % (path, name, key))
     return manifest
 
 

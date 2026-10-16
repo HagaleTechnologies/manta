@@ -365,7 +365,6 @@ moved from ctrlc to signal-hook; a second SIGINT/SIGTERM (SIGHUP without
 `[server]`) exits at once with 128 + signal, skipping the drain. See
 docs/DECISIONS/2026-10-14-man232-closed-and-stalled-output.md.
 
-<<<<<<< HEAD
 MAN-119: `WavIqSource` streams (header-only `open`) and reads Float32 and
 16/24/32-bit integer IQ WAVs; `manta decode` streams through
 `manta_engine::decode_source`, so its memory no longer grows with the file.
@@ -377,7 +376,7 @@ are confirmed) make it a CI fixture; `scripts/score-transcript.py` scores a
 run against a hand transcript, and the VP8GEO transcript itself is
 outstanding. See
 docs/DECISIONS/2026-10-14-man119-streaming-wav-and-real-audio-corpus.md.
-=======
+
 MAN-245: the Codex gate fails closed, titled `Review thread list
 incomplete`, when a PR has more than 100 review threads or an unresolved
 thread with more than 50 comments; Dependabot handling needs author,
@@ -386,7 +385,6 @@ apply shows as `Codex review overridden by <login>`.
 `scripts/required-check-sources.py` lists the required checks against
 the decision record; pinning `Supply Chain` to GitHub Actions is owner
 step O2. See docs/DECISIONS/2026-10-16-man245-gate-verdict-integrity.md.
->>>>>>> 353b1856a95c6d325aa17dd268aca67c6307beee
 
 ## Documents (read in this order)
 
