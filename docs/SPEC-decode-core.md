@@ -1932,3 +1932,11 @@ defaults.
    (§3.2/§3.3, MAN-103): ARCHITECTURE §5's "adaptive threshold at their
    geometric mean" text is superseded — see
    `docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md`.
+7. **No ring-and-thread split** (ARCHITECTURE §1, §3, §10): ARCHITECTURE's
+   design put an `rtrb` ring between an input thread and a channelizer
+   thread, per-track queues in front of a decoder pool, and a crossbeam
+   channel into tokio. The implementation reads, channelizes, detects,
+   decodes and validates synchronously on one thread; the decoder pool is a
+   rayon pass joined every batch, and §6 rule 6 keeps its output independent
+   of scheduling. ARCHITECTURE §10 describes this model and keeps the ring
+   design as a target with the measurement that would justify building it.
