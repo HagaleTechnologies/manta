@@ -126,7 +126,8 @@ impl DeviceReport {
             output.push_str("Select an audio input with --device NAME; names match case-insensitively by substring.\n");
         }
         if self.soapy.status == "disabled" {
-            output.push_str("SoapySDR: unavailable in this build; build with --features soapy.\n");
+            // MAN-82: the default release archives lack Soapy; point at the one that has it.
+            output.push_str("SoapySDR: unavailable in this build; on Ubuntu 24.04 x86_64, download manta-linux-x86_64-soapy.tar.gz, or build from source with --features soapy.\n");
         } else if self.soapy.error.is_some() {
             output.push_str("SoapySDR devices: enumeration failed.\n");
         } else if self.soapy.devices.is_empty() {
@@ -138,7 +139,7 @@ impl DeviceReport {
             }
             output.push_str("Select a SoapySDR device with --soapy-driver ARGS.\n");
         }
-        output.push_str("HPSDR: automatic discovery is not supported; use --hpsdr-host HOST with an hpsdr-enabled build.\nKiwiSDR: use --kiwi-host HOST.\n");
+        output.push_str("HPSDR: automatic discovery is not supported; use --hpsdr-host HOST (included in every build).\nKiwiSDR: use --kiwi-host HOST.\n");
         output.push_str("ka9q-radio: use --ka9q-group GROUP, the data group of a radiod IQ channel (avahi-browse -rt _rtp._udp lists them).\n");
         output
     }
@@ -172,7 +173,7 @@ mod tests {
         assert_eq!(report.exit_code(), 0);
         assert_eq!(
             report.text(),
-            "Audio inputs: none found.\nSoapySDR: unavailable in this build; build with --features soapy.\nHPSDR: automatic discovery is not supported; use --hpsdr-host HOST with an hpsdr-enabled build.\nKiwiSDR: use --kiwi-host HOST.\nka9q-radio: use --ka9q-group GROUP, the data group of a radiod IQ channel (avahi-browse -rt _rtp._udp lists them).\n"
+            "Audio inputs: none found.\nSoapySDR: unavailable in this build; on Ubuntu 24.04 x86_64, download manta-linux-x86_64-soapy.tar.gz, or build from source with --features soapy.\nHPSDR: automatic discovery is not supported; use --hpsdr-host HOST (included in every build).\nKiwiSDR: use --kiwi-host HOST.\nka9q-radio: use --ka9q-group GROUP, the data group of a radiod IQ channel (avahi-browse -rt _rtp._udp lists them).\n"
         );
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["audio"]["status"], "ok");

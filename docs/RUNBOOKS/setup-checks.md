@@ -120,6 +120,7 @@ non-standard port.
 | 1 | At least one check failed, or doctor could not start (a bad `--duration`, a config that does not load) |
 | 2 | Command-line usage error |
 | 3 | With `--strict` only: no check failed, but the verdict is `NO_SIGNAL`, `NOT_CW`, `ACTIVITY_NO_SNR`, `NOISY_NO_DECODE` or `WEAK_NO_DECODE` |
+| 141 | stdout closed before doctor finished its report (for example `manta doctor \| head -3`); checks after that point did not run |
 
 A failed check exits 1 with or without `--strict`, whatever the verdict.
 

@@ -5,7 +5,7 @@ linear_team = "MAN"
 
 # Mirrors .github/workflows/ci-full.yml and rust-toolchain.toml. CI builds and
 # tests with no environment variables, so none are declared. The soapy feature
-# leg (extra SDR system packages) is not part of verify; hpsdr needs none.
+# leg (extra SDR system packages) is not part of verify; HPSDR runs in the default gate.
 
 [[environment.toolchains]]
 name = "rust"
@@ -38,16 +38,13 @@ run = ["cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D"
 timeout_seconds = 3000
 
 [[environment.verify]]
-name = "clippy-hpsdr"
-run = ["cargo", "clippy", "-p", "manta-input", "-p", "manta-cli", "--all-targets", "--features", "hpsdr", "--locked", "--", "-D", "warnings"]
-timeout_seconds = 3000
-
-[[environment.verify]]
-name = "test-hpsdr"
-run = ["cargo", "test", "-p", "manta-input", "-p", "manta-cli", "--features", "hpsdr", "--locked"]
-timeout_seconds = 3000
-
-[[environment.verify]]
 name = "test-workspace"
 run = ["cargo", "test", "--workspace", "--locked"]
 timeout_seconds = 3300
+
+# MAN-240: the Dependabot diff verifier's tests, as in ci-full.yml's test job. The image's
+# python3 (3.12 when checked) is not pinned to auto-merge's 3.13; the verifier needs 3.11+.
+[[environment.verify]]
+name = "test-dependabot-verifier"
+run = ["python3", "-m", "unittest", "scripts.tests.test_verify_dependabot_diff_safe", "-v"]
+timeout_seconds = 300

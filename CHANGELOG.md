@@ -43,6 +43,12 @@ the git history and `docs/DECISIONS/`.
 - MAN-95: default spot validation requires 2, 3 or 5 distinct-message
   repetitions by callsign-pattern rarity. `[spot].validation_level = "minimal"`
   restores flat 2; `--patterns` overrides the independent reference list.
+- MAN-190: the opt-in `hsmm` engine's evidence front end now confirms
+  mark/space anchors from two actually computed hops instead of a
+  forward-looking prediction, closing a missed-anchor race with the
+  per-hop speed feedback. Evidence hops are released one hop later
+  (`h+1` at constant speed, shared with `edge-legacy`); adaptive input
+  can decode differently. The default `legacy` engine is unchanged.
 
 - A band-wide static crash (lightning) no longer starts tracks across the
   band, and running tracks no longer decode it as extra dits; new
@@ -68,6 +74,12 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- `manta-linux-x86_64-soapy.tar.gz`, a release archive whose binary has
+  SoapySDR input (`--soapy-driver`, for RTL-SDR, Airspy, SDRplay and
+  HackRF) for Ubuntu 24.04 x86_64, so those receivers no longer need a
+  build from source. It needs `libsoapysdr0.8` and the receiver's SoapySDR
+  module installed; see README's "SoapySDR on Linux x86_64". `manta
+  devices` on a binary without Soapy now names this archive (MAN-82).
 - JSON/WebSocket spot clients now receive a `hello` first, with schema and session
   identity. Spots and grades carry `seq`; WebSocket `?session=&since=` resumes
   from their shared history bounded by `history_minutes`. New
@@ -124,11 +136,24 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- HPSDR network-radio input and its hardware-free tests are included in
+  every build. The `hpsdr` Cargo feature remains an accepted no-op for
+  compatibility; SoapySDR still needs `--features soapy` (MAN-239).
+- MAN-254: `manta soak --help` says the run lasts the full `--duration`
+  even when a `--source` recording ends sooner, instead of repeating
+  `run`'s promise that a replay finishes early. Soak's behaviour is unchanged.
 - MAN-235: a `manta doctor` run shorter than 60 s that reads
   `WEAK_NO_DECODE` adds a `hint:` line suggesting `--duration 60`.
 - The in-repo `wiki/` is the project's canonical wiki. GitHub's Wiki tab
   is not used; disabling it remains an owner step. The wiki's stale
   `verified` stamps and `manifest.json` are refreshed and CI-pinned (MAN-152).
+
+### Fixed
+
+- `manta run` stopped while waiting to reconnect to a lost receiver no
+  longer force-decodes the open tracks' last element or judges their
+  pending beacons as if the signal had ended; they close as an outage
+  (MAN-258).
 
 ## [0.1.0] - 2026-10-11
 
