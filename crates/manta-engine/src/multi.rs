@@ -295,6 +295,10 @@ pub fn open_inputs(specs: Vec<InputSpec>, stop: Arc<AtomicBool>) -> Result<Opene
         observers.push(spec.observers);
         pending.push(Parked { go: go_tx, handle });
     }
+    // Only the input threads hold senders now, so a thread that ends
+    // without reporting disconnects the channel instead of leaving the
+    // `recv()` below waiting forever.
+    drop(done_tx);
     let mut opened = OpenedInputs {
         inputs: Vec::new(),
         ppm,
@@ -352,21 +356,27 @@ fn input_thread(
     go_rx: Receiver<Go>,
     stop: Arc<AtomicBool>,
 ) {
-    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(open))
-        .unwrap_or_else(|_| Err(anyhow!("the source panicked while opening")));
-    let mut src = match opened {
-        Ok(src) => src,
+    // The metadata reads are part of opening: a source that panics in one
+    // fails startup naming the input, like a panicking opener (Codex, PR
+    // 313), instead of ending this thread without a completion.
+    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let src = open()?;
+        let info = OpenedInput {
+            name: name.clone(),
+            sample_rate_hz: src.sample_rate(),
+            center_freq_hz: src.center_freq_hz(),
+            rf_passband_hz: src.rf_passband_hz(),
+            trusted_band_hz: src.trusted_band_hz(),
+        };
+        Ok((src, info))
+    }))
+    .unwrap_or_else(|_| Err(anyhow!("the source panicked while opening")));
+    let (mut src, info) = match opened {
+        Ok(opened) => opened,
         Err(e) => {
             let _ = done.send((index, Err(e)));
             return;
         }
-    };
-    let info = OpenedInput {
-        name: name.clone(),
-        sample_rate_hz: src.sample_rate(),
-        center_freq_hz: src.center_freq_hz(),
-        rf_passband_hz: src.rf_passband_hz(),
-        trusted_band_hz: src.trusted_band_hz(),
     };
     if done.send((index, Ok(info))).is_err() {
         return;
@@ -488,8 +498,9 @@ pub fn listen_inputs(
             on_batch(index, n_tracks);
         }
         Msg::End(result) => {
-            // An input that errored or panicked sent no closing batch: its
-            // tracks are retired before its end is reported.
+            // An input that panicked sent no closing batch: its tracks are
+            // retired before its end is reported (`on_input_end` retires
+            // its gauges). After a closing batch this changes nothing.
             back.close_input(index, n, &mut on_event, &mut on_spot);
             let end = InputEnd {
                 index,

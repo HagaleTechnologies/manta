@@ -66,11 +66,16 @@ existed.
   owns (MAN-53's open questions).
 - **D7 Failure isolation.** An input whose read errors or panics ends only
   its own thread; the back end logs `input NAME: stopped (...)` and the
-  other inputs keep spotting. Such an input sends no closing batch, so the
-  back end closes every track it reported as an outage does
-  (`ClosureKind::Bookkeeping`, no survivor), freeing their validator and
-  live-state rows, and its track count and RTTY marks leave
-  `manta_active_tracks` and `manta_rtty_signals`. A live input reconnects on its own thread
+  other inputs keep spotting. Every way an input ends finishes its
+  tracks: a read error, or an end of stream with an outage pending
+  (MAN-258), closes them on the input's own front end as an outage does
+  (`finish_for_discontinuity`: `ClosureKind::Bookkeeping`, no survivor)
+  in a closing batch; a panic can send none, so the back end closes every
+  track the input reported the same way. Either way their validator and
+  live-state rows are freed, and the input's track count and RTTY marks
+  leave `manta_active_tracks` and `manta_rtty_signals`. A source that
+  panics while its metadata is read at open fails startup like a
+  panicking opener. A live input reconnects on its own thread
   (`ReconnectingSource`) and logs `input NAME: lost; retrying, k of n
   inputs decoding` / `back`. Startup opens every input in parallel and
   fails fast naming the input (`input "b" failed to open: ...`); the

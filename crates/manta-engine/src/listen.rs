@@ -1237,6 +1237,7 @@ pub(crate) fn run_input_front(
     seg_consumed += filled as u64;
 
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
+    let mut read_error = None;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -1244,9 +1245,8 @@ pub(crate) fn run_input_front(
         let n = match src.read(&mut chunk) {
             Ok(n) => n,
             Err(e) => {
-                report_active_tracks(0);
-                rtty.restart(seg_base + seg_consumed);
-                return Err(e);
+                read_error = Some(e);
+                break;
             }
         };
         if n == 0 {
@@ -1302,7 +1302,18 @@ pub(crate) fn run_input_front(
             }
         }
     }
-    let events = seg.tm.finish();
+    // Every way out of the read loop finishes the input's tracks here, so
+    // the shared validator, the live tap and the track count never keep a
+    // dead input's tracks. A read error is not evidence the signal ended,
+    // nor is an end of stream with an outage pending (MAN-258: a stop
+    // while a live source was down): both take the outage teardown, as
+    // `listen_with_observers` does. Only a plain end of stream or a stop
+    // is `SignalEnded`.
+    let events = if read_error.is_some() || src.take_discontinuity().is_some() {
+        seg.tm.finish_for_discontinuity()
+    } else {
+        seg.tm.finish()
+    };
     let mut last = batch(events, seg_base + seg_consumed, &seg.tm);
     last.n_tracks = 0;
     report_static_crashes(crash_base + seg.tm.static_crash_count());
@@ -1310,7 +1321,10 @@ pub(crate) fn run_input_front(
     report_active_tracks(0);
     rtty.restart(seg_base + seg_consumed);
     send(last);
-    Ok(())
+    match read_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -2392,6 +2406,72 @@ mod tests {
                     survivor_track_id: None
                 }),
             "an end of stream with a gap pending must close tracks as Bookkeeping: {closed:?}"
+        );
+    }
+
+    /// MAN-13 x MAN-258: an input of a multi-input session takes the same
+    /// outage teardown at an end of stream reported with a gap pending; its
+    /// front end must not close those tracks as `SignalEnded`.
+    #[test]
+    fn a_multi_input_eof_with_a_pending_gap_closes_tracks_as_bookkeeping() {
+        use manta_decode::events::ClosureKind;
+
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let samples = rendered.samples[..(spec.fs * 12.0) as usize].to_vec();
+        let (fs, center_freq_hz) = (spec.fs, spec.center_freq_hz);
+        let ended = Arc::new(AtomicBool::new(false));
+        let ended_src = ended.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let opened = crate::multi::open_inputs(
+            vec![crate::multi::InputSpec {
+                name: "a".into(),
+                open: Box::new(move || {
+                    Ok(Box::new(EndsWithGapSource {
+                        samples,
+                        cursor: 0,
+                        fs,
+                        center_freq_hz,
+                        gap_at_end: Some(48_000),
+                        pending_gap: None,
+                        ended: ended_src,
+                    }) as Box<dyn IqSource>)
+                }),
+                freq_correction_ppm: 0.0,
+                observers: Default::default(),
+            }],
+            stop,
+        )
+        .unwrap();
+        let mut closed = Vec::new();
+        crate::multi::listen_inputs(
+            opened,
+            &PipelineConfig::default(),
+            crate::multi::SessionClock::Replay,
+            crate::multi::SharedObservers::default(),
+            |ev| {
+                if let DecoderEvent::TrackClosed { track_id, closure } = ev {
+                    if ended.load(Ordering::Relaxed) {
+                        closed.push((*track_id, *closure));
+                    }
+                }
+            },
+            |_| {},
+            |_, _| {},
+            |_| {},
+        )
+        .unwrap();
+        assert!(
+            !closed.is_empty(),
+            "test setup: a track must still be open at the end of stream"
+        );
+        assert!(
+            closed.iter().all(|(_, closure)| *closure
+                == ClosureKind::Bookkeeping {
+                    survivor_track_id: None
+                }),
+            "an input's end of stream with a gap pending must close tracks as \
+             Bookkeeping: {closed:?}"
         );
     }
 

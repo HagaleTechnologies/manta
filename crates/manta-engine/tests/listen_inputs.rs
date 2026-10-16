@@ -554,6 +554,54 @@ fn open_inputs_does_not_wait_for_a_hung_opener_after_a_failure() {
     drop(release_tx);
 }
 
+/// Opens fine, then panics when asked for its metadata.
+struct PanickingMetadataSource;
+
+impl manta_input::IqSource for PanickingMetadataSource {
+    fn sample_rate(&self) -> f64 {
+        panic!("driver bug reading the sample rate")
+    }
+    fn center_freq_hz(&self) -> f64 {
+        14_000_000.0
+    }
+    fn read(&mut self, _buf: &mut [Complex32]) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+}
+
+/// Codex (PR 313): an input whose opener succeeds but whose source panics
+/// while its metadata is read must fail startup naming the input, not
+/// leave `open_inputs` waiting forever for a completion that thread will
+/// never send.
+#[test]
+fn open_inputs_fails_when_a_source_panics_reading_its_metadata() {
+    let specs = vec![
+        plain("a", short_scene()),
+        InputSpec {
+            name: "b".into(),
+            open: Box::new(|| {
+                Ok(Box::new(PanickingMetadataSource) as Box<dyn manta_input::IqSource>)
+            }),
+            freq_correction_ppm: 0.0,
+            observers: Default::default(),
+        },
+    ];
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = result_tx.send(open_inputs(specs, Arc::new(AtomicBool::new(false))));
+    });
+    // A bound, so the pre-fix hang fails the test instead of hanging it.
+    let err = match result_rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(Ok(_)) => panic!("input b panicked while opening, so startup must fail"),
+        Ok(Err(e)) => format!("{e:#}"),
+        Err(_) => panic!("open_inputs hangs after input b's metadata read panicked"),
+    };
+    assert_eq!(
+        err,
+        "input \"b\" failed to open: the source panicked while opening"
+    );
+}
+
 #[test]
 fn stop_ends_every_input() {
     let stop = Arc::new(AtomicBool::new(false));
@@ -726,6 +774,48 @@ fn a_failing_input_closes_every_track_it_reported() {
             reported.is_subset(&tapped),
             "{fault:?}: the live tap kept {:?}",
             reported.difference(&tapped).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// Every way an input ends finishes its tracks (validation, PR 313): an
+/// input whose read errors mid-transmission finishes them on its own front
+/// end and sends a closing batch, so its track count settles to 0 in
+/// `on_batch`, as a clean end does. (A panic can send nothing; the back
+/// end retires its tracks and `on_input_end` its gauges.)
+#[test]
+fn an_input_whose_read_fails_settles_its_track_count_to_zero() {
+    {
+        let fault = Fault::Error;
+        let opened = open_inputs(
+            vec![
+                plain("a", forty_metre_scene()),
+                spec("b", short_scene(), 0.0, 20 * 96_000, fault),
+            ],
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut counts: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        listen_inputs(
+            opened,
+            &PipelineConfig::default(),
+            SessionClock::Replay,
+            SharedObservers::default(),
+            |_| {},
+            |_| {},
+            |input, n| counts.entry(input).or_default().push(n),
+            |_end| {},
+        )
+        .unwrap();
+        let b = &counts[&1];
+        assert!(
+            b.iter().any(|&n| n > 0),
+            "{fault:?}: test setup: input b must be decoding when it fails"
+        );
+        assert_eq!(
+            b.last(),
+            Some(&0),
+            "{fault:?}: input b's last track count must be 0"
         );
     }
 }
