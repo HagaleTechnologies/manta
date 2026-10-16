@@ -1520,9 +1520,25 @@ mod tests {
     /// estimate is 1200/48.6 = 24.6914 WPM and the live report must be
     /// 25 + 0.1*(24.6914 - 25) = 24.9691 -- not the raw value, and not
     /// an EMA step from the old mark-only 30 WPM seed (29.4691).
+    /// The replay also counts no mark twice: the warmed-up tracker equals
+    /// one fed each of the five marks once (replaying the marks through
+    /// `on_mark` would also fill the drift ring and fail the comparison).
     #[test]
     fn live_marks_after_warmup_smooth_from_the_corrected_seed() {
         let (mut dec, _) = feed_five_marks_four_gaps(15, 21);
+        let mut once = SpeedTracker::new();
+        for _ in 0..5 {
+            once.on_mark(15.0 * HOP_MS as f32);
+        }
+        for _ in 0..4 {
+            once.on_element_gap(21.0 * HOP_MS as f32);
+        }
+        once.reseed_wpm_after_warmup();
+        assert_eq!(
+            format!("{:?}", dec.tracker),
+            format!("{once:?}"),
+            "the warmup replay must not observe a mark twice"
+        );
         let mut events = Vec::new();
         dec.on_run(
             Run {
