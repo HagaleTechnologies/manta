@@ -35,9 +35,13 @@ frame count equals the header's, and that the samples are non-zero and
 within ±1.0. It prints one `<file>: <n> frames streamed` line per file:
 
 ```sh
-MANTA_CORPUS_DIR=crates/manta-testkit/audio-corpus \
+MANTA_CORPUS_DIR="$PWD/crates/manta-testkit/audio-corpus" \
   cargo test --release --locked -p manta-testkit --test real_audio_corpus -- --nocapture
 ```
+
+`MANTA_CORPUS_DIR` must be an absolute path. Cargo runs the test from
+`crates/manta-testkit`, so a relative path resolves there and finds none
+of the recordings.
 
 With `MANTA_CORPUS_DIR` unset the test only parses the manifest and prints
 `skipping: MANTA_CORPUS_DIR is not set`. Set to a directory holding none of
@@ -92,9 +96,11 @@ recording before uploading it. WPX and VP8GEO are not pinned yet.
 3. Run the manifest checks and the gated test on the file:
    ```sh
    python3 -m unittest scripts.tests.test_corpus -v
-   MANTA_CORPUS_DIR=<dir> cargo test --release --locked -p manta-testkit --test real_audio_corpus -- --nocapture
+   MANTA_CORPUS_DIR="$(cd <dir> >/dev/null && pwd)" cargo test --release --locked -p manta-testkit --test real_audio_corpus -- --nocapture
    ```
-   The gated test fails if the header disagrees with the manifest.
+   The gated test fails if the header disagrees with the manifest. The
+   `cd <dir> >/dev/null && pwd` makes the path absolute, which the test
+   needs; the redirect drops the path `cd` echoes when `CDPATH` is set.
 4. Commit the manifest change. A pin changes only with the file: uploading a
    re-encoded or trimmed copy needs a new hash.
 

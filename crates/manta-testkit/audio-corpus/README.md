@@ -28,7 +28,9 @@ Reasons differ per file (below). This directory tracks the documentation,
 - `MANTA_CORPUS_DIR=DIR cargo test -p manta-testkit --test
   real_audio_corpus -- --nocapture` streams every IQ recording present in
   DIR end to end through `WavIqSource` and checks its header against the
-  manifest. With `MANTA_CORPUS_DIR` unset it only parses the manifest.
+  manifest. DIR must be an absolute path, because cargo runs the test from
+  `crates/manta-testkit`. With `MANTA_CORPUS_DIR` unset it only parses the
+  manifest.
 - `.github/workflows/corpus.yml` runs fetch, the test and score nightly. It
   is skipped until a maintainer sets the `MANTA_CORPUS_BASE_URL` repository
   variable, which waits on redistribution rights (see *Provenance and

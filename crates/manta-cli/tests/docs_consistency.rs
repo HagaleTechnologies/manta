@@ -2994,3 +2994,39 @@ fn wiki_windows_build_setup_stamp_names_a_snapshot_without_release_yml() {
          body is substantively changed"
     );
 }
+
+// ---- MAN-119: the corpus runbook's test commands can be run as written ----
+
+/// Cargo runs an integration test from its package root
+/// (`crates/manta-testkit`), and `real_audio_corpus.rs` joins file names onto
+/// `MANTA_CORPUS_DIR` as given. The runbook told contributors to pass
+/// `MANTA_CORPUS_DIR=crates/manta-testkit/audio-corpus` from the workspace
+/// root, which resolved under `crates/manta-testkit/crates/...` and failed
+/// with "holds none of the manifest's recordings" while the files were there.
+/// Every copyable `MANTA_CORPUS_DIR=` value, quotes aside, must start with
+/// `/` or a `$` expansion; the test cannot check what an expansion yields.
+#[test]
+fn corpus_runbook_passes_an_absolute_corpus_dir() {
+    let rel = "docs/RUNBOOKS/real-audio-corpus.md";
+    let runbook = doc(rel);
+    let mut seen = 0;
+    for cmd in fenced_commands(&runbook) {
+        for tok in cmd.split_whitespace() {
+            let Some(value) = tok.strip_prefix("MANTA_CORPUS_DIR=") else {
+                continue;
+            };
+            seen += 1;
+            let unquoted = value.trim_start_matches('"');
+            assert!(
+                unquoted.starts_with('/') || unquoted.starts_with('$'),
+                "{rel} runs the corpus test with `MANTA_CORPUS_DIR={value}`; cargo runs \
+                 it from crates/manta-testkit, so the value must be an absolute path \
+                 (e.g. \"$PWD/...\"): {cmd}"
+            );
+        }
+    }
+    assert!(
+        seen > 0,
+        "{rel} no longer sets MANTA_CORPUS_DIR in a command; this test needs updating"
+    );
+}
