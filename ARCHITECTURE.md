@@ -36,7 +36,9 @@ marked **(research-dependent)** are the only intentionally open questions.
 ```
 
 Data flows one direction. As built, every stage from the source read to the
-validator runs synchronously on one decode thread. The decoder pool is a
+validator runs synchronously on one decode thread (live audio's capture
+callback fills coppa-audio's ring on cpal's own thread before that read;
+§10). The decoder pool is a
 rayon pass joined before the next batch, tokio serves sockets only, and the
 two meet through a non-blocking broadcast send and shared atomics or
 short-held locks, never an await, so IQ never touches the async runtime.
@@ -993,12 +995,22 @@ non-blocking send plus shared atomics and short locks between them.
   threads that hand the validator new lists: `manta-reload` (SIGHUP, through
   `OperatorListsUpdate`) and `manta-lists` (`[spot].refresh_lists`, through
   `ReferenceLists`). The decode thread picks those up before it feeds the
-  validator its next event; no other thread carries samples or decoder
-  events.
+  validator its next event.
+- **Live-audio capture callback.** The one exception to "only the decode
+  thread carries samples": live audio input (`AudioIqSource::from_device`)
+  wraps `coppa_audio::CpalSource`, whose capture callback runs on cpal's
+  audio thread and pushes samples into coppa-audio's internal `rtrb` SPSC
+  ring; the decode thread's `read()` pops them (§3). That is a real
+  producer/consumer boundary, and when the decode thread falls behind the
+  ring overruns where manta cannot count it (`CpalSource` does not expose
+  its `overflow_count()`). Every other source is read on the decode thread
+  itself, and no thread other than these two carries samples, and none but
+  the decode thread carries decoder events.
 
 A batch that takes longer than its own audio delays the next `read()`, and
-whatever the source cannot buffer meanwhile is lost before manta sees it.
-No per-stage queue exists to measure.
+whatever the source cannot buffer meanwhile is lost before manta sees it —
+for live audio, in coppa-audio's ring, uncounted. No manta per-stage queue
+exists to measure.
 
 **Target, not built:** `rtrb` SPSC rings and crossbeam channels between
 dedicated threads: SDR/input thread → ring → **channelizer thread** (owns
