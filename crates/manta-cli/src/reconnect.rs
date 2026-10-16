@@ -312,6 +312,10 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
     /// pending and is left to finish (or die with the process) on its own.
     /// An opener panic is re-raised here, on the reading thread, as it was
     /// when the opener ran on it.
+    ///
+    /// A result that arrives while the receive is waiting does not override
+    /// a stop observed in that same window: the late source is dropped here
+    /// rather than installed and read after the stop request (MAN-252).
     fn await_reopen(&mut self) -> Option<anyhow::Result<SendSource>> {
         loop {
             if self.stop.load(Ordering::Relaxed) {
@@ -320,7 +324,15 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
             let pending = self.reopen.as_ref().expect("a reopen is in flight");
             match pending.rx.recv_timeout(REAL_ENV_SLEEP_SLICE) {
                 Ok(result) => {
+                    // The worker has finished, so this is the intentional
+                    // detach after a result, not a leak: dropping
+                    // `PendingReopen` detaches its already-exited thread.
                     self.reopen = None;
+                    if self.stop.load(Ordering::Relaxed) {
+                        // `result` (a source, `Send` by construction) is
+                        // disposed of here, never read.
+                        return None;
+                    }
                     return Some(result);
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -444,6 +456,13 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
             // epoch uses, which is taken before the first read. Bound: time
             // that read spends waiting before any data arrives is excluded
             // from the gap too.
+            //
+            // MAN-252: a stop that landed while the result was being
+            // accepted and installed wins over that first read -- it has
+            // not started yet, so do not start it after a stop request.
+            if self.reopened && self.stop.load(Ordering::Relaxed) {
+                return Ok(0);
+            }
             let first_read_started = self.reopened.then(|| self.env.now());
             let inner = self.inner.as_mut().expect("checked Some above");
             match inner.read(buf) {
@@ -1093,6 +1112,94 @@ mod tests {
         // The abandoned attempt finishes on its own thread; dropping the
         // source neither hangs nor panics.
         release_tx.send(()).expect("the opener is still waiting");
+        drop(src);
+    }
+
+    /// MAN-252: a stop observed while the reopen result itself was in
+    /// flight wins over that result: `read()` ends with EOF, the late
+    /// source is disposed of unread, and no connected read starts after
+    /// the stop request. Before the fix the arriving result was accepted
+    /// and installed, and the new connection's first read -- here an
+    /// artificial 500 ms -- ran after the stop.
+    #[test]
+    fn a_result_arriving_during_the_stop_wait_does_not_override_it() {
+        let first = scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]);
+        struct LateSource {
+            reads: Arc<AtomicUsize>,
+        }
+        impl IqSource for LateSource {
+            fn sample_rate(&self) -> f64 {
+                FS
+            }
+            fn center_freq_hz(&self) -> f64 {
+                CENTER
+            }
+            fn read(&mut self, _buf: &mut [Complex32]) -> anyhow::Result<usize> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(500));
+                Ok(1)
+            }
+        }
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let late_reads = Arc::new(AtomicUsize::new(0));
+        let opener: Opener = {
+            let calls = calls.clone();
+            let late_reads = late_reads.clone();
+            Box::new(move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let _ = entered_tx.send(());
+                // The stop lands while the reading thread is inside
+                // `recv_timeout`; the result follows it by 30 ms.
+                std::thread::sleep(Duration::from_millis(30));
+                Ok(Box::new(LateSource {
+                    reads: late_reads.clone(),
+                }) as SendSource)
+            })
+        };
+        let (health, _log) = health_recorder();
+        let stop = no_stop();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            stop.clone(),
+            true,
+            health,
+            FakeEnv::new(),
+        );
+
+        let mut b = buf(8);
+        assert_eq!(src.read(&mut b).unwrap(), 8, "first chunk comes through");
+        let stopper = std::thread::spawn(move || {
+            entered_rx
+                .recv()
+                .expect("the opener must have been entered");
+            stop.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        assert_eq!(
+            src.read(&mut b).unwrap(),
+            0,
+            "a stop observed while the result was in flight is EOF, not a new connected read"
+        );
+        let elapsed = started.elapsed();
+        stopper.join().expect("the stopper thread ran");
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "read() must not wait out the late source's 500 ms first read: {elapsed:?}"
+        );
+        assert_eq!(
+            late_reads.load(Ordering::Relaxed),
+            0,
+            "the late source must be disposed of unread"
+        );
+        assert_eq!(src.read(&mut b).unwrap(), 0, "still stopped");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "no second attempt starts while one is pending or after a stop"
+        );
         drop(src);
     }
 
