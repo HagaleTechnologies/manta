@@ -17,7 +17,6 @@ import sys
 WORKFLOW = "ci-full.yml"
 REQUIRED_JOBS = (
     "test (ubuntu-latest)", "test (macos-latest)", "test (windows-latest)",
-    "test-hpsdr (ubuntu-latest)", "test-hpsdr (macos-latest)", "test-hpsdr (windows-latest)",
 )
 
 

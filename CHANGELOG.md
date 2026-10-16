@@ -24,6 +24,12 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-265: a transmission that ends at the speed tracker's warm-up
+  boundary (e.g. a beacon ID or a single exchange) now reports its
+  gap-corrected WPM. The readiness mark's seed was computed before the
+  buffered inter-element gaps were replayed, so short transmissions kept
+  the mark-only estimate; the seed is replaced after the replay, and
+  later live marks keep the same EMA smoothing.
 - MAN-234: an input sample that is NaN, infinite or larger than 1e17 in
   magnitude is replaced with silence and counted instead of ending the run
   (exit 101) or silencing it; clean input decodes byte-identically.
@@ -142,6 +148,9 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- HPSDR network-radio input and its hardware-free tests are included in
+  every build. The `hpsdr` Cargo feature remains an accepted no-op for
+  compatibility; SoapySDR still needs `--features soapy` (MAN-239).
 - MAN-254: `manta soak --help` says the run lasts the full `--duration`
   even when a `--source` recording ends sooner, instead of repeating
   `run`'s promise that a replay finishes early. Soak's behaviour is unchanged.
@@ -150,6 +159,13 @@ the git history and `docs/DECISIONS/`.
 - The in-repo `wiki/` is the project's canonical wiki. GitHub's Wiki tab
   is not used; disabling it remains an owner step. The wiki's stale
   `verified` stamps and `manifest.json` are refreshed and CI-pinned (MAN-152).
+
+### Fixed
+
+- `manta run` stopped while waiting to reconnect to a lost receiver no
+  longer force-decodes the open tracks' last element or judges their
+  pending beacons as if the signal had ended; they close as an outage
+  (MAN-258).
 
 ## [0.1.0] - 2026-10-11
 

@@ -27,8 +27,8 @@ manta-spot = { workspace = true }
 # in soak.rs (shared with soak_metrics.rs) needs a native equivalent there
 # (GetProcessMemoryInfo). Target-gated so it's a no-op dependency on
 # every other platform. Found via MAN-21's release pipeline: manta had
-# never actually been build-tested on Windows before (ci.yml only runs
-# ubuntu-latest/macos-latest), despite README claiming Windows support.
+# never actually been build-tested on Windows before (the then-current ci.yml
+# ran only ubuntu-latest/macos-latest), despite README claiming Windows support.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_System_ProcessStatus",

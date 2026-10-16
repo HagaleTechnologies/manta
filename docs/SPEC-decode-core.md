@@ -992,6 +992,15 @@ read long. Before any element gap has been observed, `dit_estimate = μ_dit`
 (no correction). Element gaps buffered during tracker warm-up (the first 5
 marks) feed `μ_egap` when they are replayed (MAN-315 D3).
 
+The mark that makes the tracker ready seeds the reporting EMA *before* that
+replay runs, so the seed itself is still mark-only. **[DEVIATION]** (MAN-265):
+immediately after the warm-up replay, the seed is replaced outright with
+`1200 / dit_estimate` — an assignment, not an EMA fold, because this is still
+the first sample (the replayed marks were already counted; only their gaps
+arrived late). A transmission that ends at the boundary — a beacon ID, a
+single exchange — reports the gap-corrected speed; every later live mark
+keeps the normal `α = 0.1` smoothing steps on top of the corrected seed.
+
 #### 4.1b Sender timing model
 
 **[DEVIATION]** (MAN-315, `docs/DECISIONS/2026-10-11-man315-sender-timing.md`):
@@ -1323,7 +1332,8 @@ TrackClosed    { track_id, closure: SignalEnded
                      evidence moves to `s` and is judged at `s`'s own
                      close.
                    Bookkeeping { survivor_track_id: None } — `Evicted`,
-                     `Silent`, `Rtty`, or a source discontinuity (MAN-73):
+                     `Silent`, `Rtty`, or a source discontinuity (MAN-73),
+                     including a stop while the source is down (MAN-258):
                      tracking stopped with no successor; deferred evidence
                      is discarded and counted.
                  Missing in JSON, `closure` defaults to `SignalEnded`.)
@@ -1373,7 +1383,9 @@ inside the decode path. A live source's disconnect/reconnect (MAN-73) reports
 the missed span, in samples, via `IqSource::take_discontinuity()`; `listen()`
 advances the sample clock by that count and starts a fresh track segment, so
 `sample_ts` stays monotonic and wall-clock-true across the gap with no audio
-spliced in. File replay never reports a discontinuity.
+spliced in. File replay never reports a discontinuity. An end of stream
+reported with a discontinuity pending (MAN-258: a stop while the source is
+down) closes the segment the same way and starts none.
 
 ---
 
@@ -1664,7 +1676,7 @@ flush_gap_dits = 7.0
 #   file:  path*, iq, realtime, loop
 #   kiwi:  host*, freq_hz*, port, password
 #   soapy: driver*, freq_hz*, rate_hz*, gain_db   (build with --features soapy)
-#   hpsdr: host*, freq_hz*, rate_hz*, port        (build with --features hpsdr)
+#   hpsdr: host*, freq_hz*, rate_hz*, port        (included in every build)
 #   ka9q:  group*, port, ssrc, interface
 # Any source flag on the command line (--device, --source, --kiwi-host,
 # --soapy-driver, --hpsdr-host, --ka9q-group) replaces a typed [input]
@@ -1919,3 +1931,11 @@ defaults.
    (§3.2/§3.3, MAN-103): ARCHITECTURE §5's "adaptive threshold at their
    geometric mean" text is superseded — see
    `docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md`.
+7. **No ring-and-thread split** (ARCHITECTURE §1, §3, §10): ARCHITECTURE's
+   design put an `rtrb` ring between an input thread and a channelizer
+   thread, per-track queues in front of a decoder pool, and a crossbeam
+   channel into tokio. The implementation reads, channelizes, detects,
+   decodes and validates synchronously on one thread; the decoder pool is a
+   rayon pass joined every batch, and §6 rule 6 keeps its output independent
+   of scheduling. ARCHITECTURE §10 describes this model and keeps the ring
+   design as a target with the measurement that would justify building it.

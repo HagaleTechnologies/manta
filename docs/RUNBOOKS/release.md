@@ -145,12 +145,11 @@ this change. See [the MAN-244 decision](../DECISIONS/2026-10-10-man244-release-g
   3. Pushing the tag triggers the release workflow,
      **`release-publish.yml`**: `validate-tag` (checks tag grammar and
      default-branch ancestry before any platform build starts, and that
-     the tagged commit's `ci-full.yml` push run passed every `test` and
-     `test-hpsdr` leg, Windows included (MAN-156), then renders the man
-     pages every `build` archive ships (see
-     "What each artifact contains") from one native Linux build, with
-     the same `--features` as every build leg, after the tag checks and
-     before the matrix starts) → `build` (builds and packages all five
+     the tagged commit's `ci-full.yml` push run passed every default
+     `test` leg, Windows included (MAN-156), then renders the man pages
+     every `build` archive ships (see "What each artifact contains") from
+     one native Linux build, with the same default features as every
+     standard build leg, after the tag checks and before the matrix starts) → `build` (builds and packages all five
      targets — macOS x86_64/arm64, Windows x86_64, Linux x86_64/arm64 —
      and needs only `validate-tag`) and, beside it, `build-soapy` (the
      sixth archive, `manta-linux-x86_64-soapy.tar.gz`, MAN-82, see "The
@@ -267,15 +266,14 @@ about the tag: fix the cause or re-run the job; keep the tag.
 
 ## If 'Require a green CI run on the release commit' fails
 
-Windows legs are not required for merge, so a commit on the default branch
-can carry a failed Windows test (MAN-156,
-`docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md`). `validate-tag`
-therefore runs `scripts/check-release-ci.py`, which reads the newest
+Windows becomes required for merge once MAN-371's owner step O1 is applied
+(see [the MAN-371 decision](../DECISIONS/2026-10-15-man371-windows-required-check.md)).
+Release verification checks Windows regardless of that protection setting. `validate-tag`
+runs `scripts/check-release-ci.py`, which reads the newest
 `ci-full.yml` push run for the tagged commit and requires it completed and
 successful, with `test (ubuntu-latest)`, `test (macos-latest)`,
-`test (windows-latest)` and their three `test-hpsdr` siblings present and
-green. Nothing is built or published until it passes. Its error names the
-run and each failed or missing leg:
+`test (windows-latest)` present and green. Nothing is built or published until
+it passes. Its error names the run and each failed or missing leg:
 
 - **A flaky leg.** Open the named run, choose **Re-run failed jobs**, and
   wait for it to finish green; the run's latest attempt is what counts.
@@ -450,18 +448,18 @@ Both should report the same digest.
 
 `build-soapy` (MAN-82, in the release workflow) builds
 `manta-linux-x86_64-soapy.tar.gz` natively on `ubuntu-24.04` with
-`--features hpsdr,soapy`, against the distro's `libsoapysdr-dev`. Before
+`--features soapy`, against the distro's `libsoapysdr-dev`. Before
 uploading the archive it:
 
 1. runs the three real-library Soapy input tests (`cargo test --release
-   --locked -p manta-input --features hpsdr,soapy --lib soapy::tests`);
+   --locked -p manta-input --features soapy --lib soapy::tests`);
 2. renders the man pages from the binary it packages, then packages it
    with `scripts/package-release.py`;
 3. runs `scripts/check-soapy-release.py` on the archive, which extracts it
    to a temporary directory and runs only the extracted `manta`:
-   `--version` lists `hpsdr,soapy`, `run`/`listen`/`check --help` offer the
-   four Soapy flags, the archive's `manta-run.1` and `manta-check.1`
-   document them, a nonexistent driver fails with SoapySDR's own `no match`
+   `--version` lists `soapy`, `run`/`listen`/`check --help` offer
+   `--hpsdr-host` and the four Soapy flags, the archive's `manta-run.1`
+   and `manta-check.1` document the Soapy flags, a nonexistent driver fails with SoapySDR's own `no match`
    error (exit 1, not clap's exit 2), and `devices --json` enumerates Soapy
    without error;
 4. repeats that in a fresh `ubuntu:24.04` container that sees only the
@@ -479,7 +477,7 @@ To run the verifier on a local build (Linux, with `libsoapysdr-dev`
 installed):
 
 ```sh
-cargo build --release --locked -p manta-cli --features hpsdr,soapy
+cargo build --release --locked -p manta-cli --features soapy
 target/release/manta man-pages --out man-pages-soapy
 python3 scripts/package-release.py --binary target/release/manta --artifact manta-linux-x86_64-soapy --format tar.gz --man-dir man-pages-soapy --out-dir .
 python3 scripts/check-soapy-release.py manta-linux-x86_64-soapy.tar.gz
@@ -517,7 +515,7 @@ receiver is still a separate, manual check.
   [docs/DECISIONS/2026-10-10-man268-unattended-packaging.md](../DECISIONS/2026-10-10-man268-unattended-packaging.md).
 - **SoapySDR Linux** (`manta-linux-x86_64-soapy.tar.gz`, MAN-82): the
   same files as the Linux x86_64 archive, but the binary is built with
-  `--features hpsdr,soapy` on Ubuntu 24.04 and links
+  `--features soapy` on Ubuntu 24.04 and links
   `libSoapySDR.so.0.8` dynamically. It needs `libsoapysdr0.8` and the
   receiver's SoapySDR module installed as well as `libasound2t64`; it
   bundles no SoapySDR library, device module or SDRplay API. See "The
