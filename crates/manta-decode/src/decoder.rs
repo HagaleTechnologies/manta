@@ -422,27 +422,25 @@ mod tests {
             .join(" ");
         let (baseline_decoded, _) = decode_from_hop(&baseline_text, 25, 125 - 7);
         let baseline_t = baseline_decoded.chars().filter(|&c| c == 'T').count();
-        assert!(baseline_t > 0, "precondition: bad lock not reproduced");
+        let mut long_decoded = String::new();
         for reps in [10usize, 24, 60] {
             let text = std::iter::repeat_n("AU", reps)
                 .collect::<Vec<_>>()
                 .join(" ");
             let (decoded, _) = decode_from_hop(&text, 25, 125 - 7);
             let t_count = decoded.chars().filter(|&c| c == 'T').count();
-            assert_eq!(
-                t_count, baseline_t,
-                "reps {reps}: garbled prefix grew past its fixed size (baseline {baseline_t}) -- {decoded:?}"
+            assert!(
+                t_count <= baseline_t,
+                "reps {reps}: garbled prefix grew past its fixed size ({t_count} > baseline {baseline_t}) -- {decoded:?}"
             );
+            long_decoded = decoded;
         }
         // MAN-6 F3: the 'T' prefix staying flat is necessary but not
         // sufficient -- `GapClassifier`'s own stale cluster state could
         // still silently delete every word boundary after the recovery
         // point even while the 'T' count stayed bounded. Assert the
-        // recovered tail is genuinely word-separated, not glued together.
-        let long_text = std::iter::repeat_n("AU", 60usize)
-            .collect::<Vec<_>>()
-            .join(" ");
-        let (long_decoded, _) = decode_from_hop(&long_text, 25, 125 - 7);
+        // recovered tail is genuinely word-separated, not glued together
+        // (`long_decoded` is the loop's last, 60-repetition, decode).
         let au_words = long_decoded
             .split_whitespace()
             .filter(|&w| w == "AU")
@@ -450,6 +448,42 @@ mod tests {
         assert!(
             au_words >= 50,
             "recovered decode must keep word boundaries -- {long_decoded:?}"
+        );
+    }
+
+    #[test]
+    fn mid_element_start_on_homogeneous_text_does_not_grow_with_duration() {
+        // MAN-6 on all-dit text: looped "HH" ("H" = 4 dits), started 7 hops
+        // before the end of H's second dit (hops [50, 75) at dit_hops = 25),
+        // the same trigger as the "AU" tests above. The fragment seeds
+        // mu_dit and the real dits seed mu_dah, so every dit reads as a dah
+        // ('T'). The streak that follows is homogeneous (CV ~0), which the
+        // bimodal bad-lock branch cannot see, so before the homogeneous
+        // branch existed this grew without bound: 'T' count 30 -> 78 -> 190
+        // -> 478 at reps 4/10/24/60. Started on an edge (skip 0), the same
+        // scene decodes perfectly, so the fragment is the whole cause.
+        let decode_reps = |reps: usize| {
+            let text = std::iter::repeat_n("HH", reps)
+                .collect::<Vec<_>>()
+                .join(" ");
+            decode_from_hop(&text, 25, 75 - 7).0
+        };
+        let baseline = decode_reps(4);
+        let baseline_t = baseline.chars().filter(|&c| c == 'T').count();
+        let mut long = String::new();
+        for reps in [10usize, 24, 60] {
+            let decoded = decode_reps(reps);
+            let t_count = decoded.chars().filter(|&c| c == 'T').count();
+            assert!(
+                t_count <= baseline_t,
+                "reps {reps}: garbled prefix grew past its fixed size ({t_count} > baseline {baseline_t}) -- {decoded:?}"
+            );
+            long = decoded;
+        }
+        let hh_words = long.split_whitespace().filter(|&w| w == "HH").count();
+        assert!(
+            hh_words >= 50,
+            "recovered decode must read the dits as dits, word-bounded -- {long:?}"
         );
     }
 

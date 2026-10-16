@@ -321,6 +321,15 @@ inter-character indefinitely, even after this reinitialization corrects
 `μ_dit`/`μ_dah`. See
 `docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md`.
 
+**[DEVIATION — added]** A third trigger covers the homogeneous case neither
+rule above can see: if 12 consecutive marks all assign to the dah cluster
+*and* their coefficient of variation is < 0.35 (and the regime-change rule
+did not fire) *and* the dit cluster still rests on the single bootstrap mark
+the 5-mark split isolated, with no later mark assigned to it, reinitialize
+from those 12 marks and reset the gap classifier as above. This is the same
+fabricated-fragment lock on all-dit text, whose streak has no spread for the
+bimodal trigger to detect.
+
 ### 4.2 Gap classification (spaces)
 
 Nominal thresholds in dits (`u = gap_ms / μ_dit`):

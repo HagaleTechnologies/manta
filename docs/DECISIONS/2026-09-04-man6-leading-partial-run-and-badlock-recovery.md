@@ -180,8 +180,10 @@ of ≈ 1.94 — below the 2.2 floor — so the guard correctly declines to fire.
 
 **Convergence bound:** worst case the tracker spends `DRIFT_LEN = 12` marks
 in the bad state before the ring fills, then recovers. At 18 WPM that is
-under 2 seconds. The ticket's criterion — error stabilizes rather than grows
-— holds by construction, independent of the specific repro tuple.
+under 2 seconds. The ticket's criterion (error stabilizes rather than
+grows) holds by construction for any text whose post-lock streak mixes dits
+and dahs, independent of the specific repro tuple. It does **not** cover
+homogeneous text, where the streak's CV is ~0; Decision 4 covers that case.
 
 See `docs/SPEC-decode-core.md` §4.1's amendment for the normative statement.
 
@@ -216,11 +218,57 @@ Decision 2's branch fires and cleared by `take_badlock_recovered()`.
 `TrackDecoder::process_run` checks it immediately after every live
 `on_mark()` call and, when set, replaces `self.gaps` with a fresh
 `GapClassifier::new()`. This is scoped to *only* the bimodal bad-lock
-branch, not the pre-existing QRQ/QRS regime-change branch immediately above
+branch (and, since Decision 4, the homogeneous one), not the pre-existing
+QRQ/QRS regime-change branch immediately above
 it in `check_drift` — a genuine operator speed change is not expected to
 have corrupted `GapClassifier` the same way (its own `μ_dit` was never a
 fabricated bootstrap value in that case), and changing that path's
 behavior is out of this ticket's scope.
+
+### Decision 4 — homogeneous bad-lock recovery (remediation, 2026-10-16)
+
+**Found by the validation round:** Decision 2 cannot fire on all-dit or
+all-dah text. Looped `"HH"` at `dit_hops = 25`, started 7 hops before the end
+of H's second dit (the same mid-element trigger as the `"AU"` tests), seeds
+the bootstrap with `[F, 84, 84, 84, 84]`: `μ_dit = F`, `μ_dah = 84`, and every
+real dit reads as a dah. The 12-mark streak then has CV ≈ 0, which keeps it
+out of Decision 2's `cv >= 0.35` branch. It also sits exactly on `μ_dah`, so
+the SPEC drift rule's off-centroid test sees nothing. Both paths were closed
+and the `'T'` count grew without bound: 30 → 78 → 190 → 478 at 4/10/24/60
+repetitions. Started on an edge, the same scene decodes perfectly.
+
+**Fix:** `ClusterPair` records how many bootstrap samples its bimodal split
+put in `lo` (`lo_n`). `SpeedTracker` sets `lo_uncorroborated` when that is
+exactly 1, and clears it on the first post-bootstrap mark assigned to the
+dit cluster or on any reinit. A third `check_drift` branch fires when 12
+consecutive marks are all dahs, their CV is < 0.35, the SPEC rule did not
+fire, and `lo_uncorroborated` is still set. It reinitializes from those 12
+marks and sets `badlock_recovered` (Decision 3's `GapClassifier` reset). A
+homogeneous 12-mark ring goes through `ClusterPair::initialize`'s unimodal
+branch, so the result is the decode the stream would have had without the
+fragment (pinned decision 20's prior). The looped `"HH"` scene now pins at
+its 4-repetition `'T'` count and decodes `"HH"` words after recovery
+(`decoder.rs`'s
+`mid_element_start_on_homogeneous_text_does_not_grow_with_duration`).
+
+**Cost, accepted:** an all-dah stream whose dit cluster is a lone bootstrap
+sample (a real opening dit, or a fragment, which before this branch happened
+to decode all-dah text correctly) and which then sends 16 or more
+consecutive dahs (the 4 remaining bootstrap marks plus 12) before any other
+dit is re-read as dits when its dah is shorter than the 150 ms dit ceiling,
+i.e. above ~24 WPM. That is the same ambiguity a dit-less opener already has
+under pinned decision 20. If dits follow, the bimodal branch recovers it at
+the first mixed streak; pure all-dah text stays misread, as it does when
+started on an edge. Telling the two cases apart would take gap evidence
+(inter-element gaps are about one dit long, so roughly equal to a dit mark
+but a third of a dah), which `SpeedTracker` does not see. A singleton dit that a later mark corroborates,
+and any lock bootstrapped from two or more dits, are never touched
+(`corroborated_singleton_dit_does_not_trigger_homogeneous_recovery`,
+`healthy_lock_survives_long_dah_run`).
+
+**Golden impact:** none. With a file-logging probe in both MAN-6 branches,
+neither fired on any golden vector (V1, V3, V4, V7, V8, V9, V10), while the
+probe logged the bimodal branch on the engine MAN-6 regression test.
 
 ## Alternatives considered and rejected
 
