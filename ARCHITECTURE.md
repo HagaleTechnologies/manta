@@ -995,7 +995,13 @@ non-blocking send plus shared atomics and short locks between them.
   threads that hand the validator new lists: `manta-reload` (SIGHUP, through
   `OperatorListsUpdate`) and `manta-lists` (`[spot].refresh_lists`, through
   `ReferenceLists`). The decode thread picks those up before it feeds the
-  validator its next event.
+  validator its next event. During a live source's outage,
+  `ReconnectingSource` opens the replacement source on a short-lived
+  `reopen-<kind>` thread (MAN-252) while `read()` waits for it in slices,
+  checking the stop flag; a stop request mid-reopen returns EOF at once and
+  abandons the attempt, which then finishes on its own detached thread or
+  dies with the process. The reopen thread only opens the source; the
+  decode thread reads it.
 - **Live-audio capture callback.** The one exception to "only the decode
   thread carries samples": live audio input (`AudioIqSource::from_device`)
   wraps `coppa_audio::CpalSource`, whose capture callback runs on cpal's
@@ -1020,11 +1026,16 @@ metrics, control). Rationale: coppa's audio/engine split, with real-time DSP
 on dedicated threads and lock-free handoff, so a slow batch never blocks
 input and overruns are counted where they happen.
 
-**Trigger for building it:** a non-zero input-overflow count during a run at
-192 kS/s on a Raspberry Pi 4 (ROADMAP M2's CPU-budget target). HPSDR,
-KiwiSDR and ka9q receivers publish that count today as
-`manta_input_gaps_detected_total` (docs/METRICS.md); for SoapySDR it is the
-series MAN-233 adds, `manta_input_gaps_detected_total{source="soapy"}`.
+**Trigger for building it:** input lost because the decode loop fell
+behind, during a run at 192 kS/s on a Raspberry Pi 4 (ROADMAP M2's
+CPU-budget target). For SoapySDR the direct measure is the series MAN-233
+adds, `manta_input_gaps_detected_total{source="soapy"}`, which counts driver
+stream overflows: samples the host did not read in time. For HPSDR, KiwiSDR
+and ka9q the same series (docs/METRICS.md) counts packet-sequence gaps, which
+network or receiver loss causes as readily as a slow loop, so a gap there is
+a candidate signal only: it counts toward the trigger when it is absent from
+a run on the same receiver and network with a lighter decode load, or when
+it coincides with batches that took longer than their own audio.
 Until that series exists a SoapySDR run's observable signal is coarser:
 each overflow is retried silently, and only the read error after 100
 consecutive overflows surfaces, as a lost connection
