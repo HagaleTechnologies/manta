@@ -4,7 +4,10 @@ This runbook is for the repository owner. It covers how each kind of pull
 request is tested since MAN-243, how to get an outside contribution tested
 and merged, and the one-time steps that need admin rights, a second
 account or hosted GitHub. The rationale is in
-`docs/DECISIONS/2026-10-10-man243-ci-trust-boundary.md`.
+`docs/DECISIONS/2026-10-10-man243-ci-trust-boundary.md`. How the Codex
+gate classifies Dependabot, titles an override and fails closed on an
+incomplete thread read, and which source may report each required check,
+are in `docs/DECISIONS/2026-10-16-man245-gate-verdict-integrity.md`.
 
 ## Routing
 
@@ -14,11 +17,12 @@ in `HagaleTechnologies/manta`, not a fork.
 
 | PR | Codex gate check | CI path | Cache writes | Auto-merge |
 |---|---|---|---|---|
-| Trusted, in-repository, ready | Codex request → verdict, as before | `ci-full.yml` dispatched on `main` after a clean verdict (or the existing `codex-clean:<sha12>` label) | none (restore-only) | arms |
+| Trusted, in-repository, ready | Codex request → verdict, as before; a `codex-clean:<sha12>` label the gate did not apply passes as `Codex review overridden by <login>` (MAN-245) | `ci-full.yml` dispatched on `main` after a clean verdict (or the existing `codex-clean:<sha12>` label) | none (restore-only) | arms |
 | Trusted, in-repository, draft | completed as success at once, as before | none until marked ready for review | none | does not arm (draft) |
 | Untrusted author, in-repository | Codex request → verdict, as before | `ci-full.yml` native `pull_request` run (`refs/pull/N/merge` scope) | none (restore-only) | never arms; owner merges |
 | Fork (any author) | Codex request → verdict, as before | native `pull_request` run; waits for approval under the fork-approval setting below | none (restore-only) | never arms; owner merges |
-| Dependabot | completed as success at once, as before | native `pull_request` run, as before | none (restore-only) | `dependabot-auto-merge.yml`, as before |
+| Dependabot update (opened by dependabot[bot] from this repository, event from dependabot[bot]) | completed as success at once, as before | native `pull_request` run, as before | none (restore-only) | `dependabot-auto-merge.yml`, as before |
+| Human event on a Dependabot PR | Codex request → verdict, as before | native `pull_request` run, as before | none (restore-only) | no auto-approve, as before |
 
 Only a push to `main` (a merged commit) saves a build cache. Release
 builds (`release.yml`, `release-publish.yml`) restore none.
