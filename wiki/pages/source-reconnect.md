@@ -11,11 +11,7 @@ sources:
   - crates/manta-input/src/lib.rs (IqSource::take_discontinuity)
   - docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md
 verified:
-<<<<<<< HEAD
-  commit: 353b185
-=======
-  commit: 9f35f1a
->>>>>>> 9a79a729bec462d52cde4ab62bd6cf6a1529bf47
+  commit: 9a79a72
   date: 2026-10-16
 links:
   - determinism

@@ -163,11 +163,8 @@ impl InputHealthTotals {
 /// Wraps a live `IqSource`, reopening it with backoff whenever it errors.
 /// `listen()` never observes the intermediate error: from its perspective
 /// `read()` just returns real samples a little later than usual, after an
-<<<<<<< HEAD
 /// outage reported once via `take_discontinuity()`. A stop during an
 /// outage returns end of stream with that outage still pending (MAN-258).
-=======
-/// outage reported once via `take_discontinuity()`.
 ///
 /// MAN-252: the opener runs on a `reopen-<kind>` thread, never on the
 /// reading thread, and `read()` returns EOF within one
@@ -177,7 +174,6 @@ impl InputHealthTotals {
 /// of seconds (Kiwi) or have no bound at all (an HPSDR or ka9q hostname
 /// lookup, a SoapySDR driver open). An abandoned attempt finishes on its
 /// own thread, or dies with the process.
->>>>>>> 9a79a729bec462d52cde4ab62bd6cf6a1529bf47
 pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
     name: &'static str,
     inner: Option<Box<dyn IqSource>>,
@@ -297,7 +293,6 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
         }
     }
 
-<<<<<<< HEAD
     /// MAN-258: a stop before the source came back ends the stream with
     /// the outage still pending (its length so far, in samples), so
     /// `listen()` closes the open tracks with the outage teardown rather
@@ -306,7 +301,8 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
         let outage = self.env.now().duration_since(self.last_ok);
         self.discontinuity = Some((outage.as_secs_f64() * self.fs).round() as u64);
         0
-=======
+    }
+
     /// Starts one reopen on its own `reopen-<kind>` thread (MAN-252).
     fn spawn_reopen(&self) -> std::io::Result<PendingReopen> {
         let (tx, rx) = mpsc::channel();
@@ -372,7 +368,6 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
             cause,
             self.backoff.as_secs()
         ));
->>>>>>> 9a79a729bec462d52cde4ab62bd6cf6a1529bf47
     }
 }
 
@@ -399,16 +394,11 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
     fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {
         loop {
             if self.inner.is_none() {
-<<<<<<< HEAD
-                if !self.env.sleep(self.backoff, &self.stop) {
-                    // Ctrl-C during the outage: end of stream, with the
-                    // outage left pending.
-                    return Ok(self.end_during_outage());
-=======
                 if self.reopen.is_none() {
                     if !self.env.sleep(self.backoff, &self.stop) {
-                        // Ctrl-C during the outage: a clean end, matching EOF.
-                        return Ok(0);
+                        // Ctrl-C during the outage: end of stream, with the
+                        // outage left pending (MAN-258).
+                        return Ok(self.end_during_outage());
                     }
                     match self.spawn_reopen() {
                         Ok(pending) => self.reopen = Some(pending),
@@ -417,12 +407,12 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                             continue;
                         }
                     }
->>>>>>> 9a79a729bec462d52cde4ab62bd6cf6a1529bf47
                 }
                 let Some(opened) = self.await_reopen() else {
-                    // Ctrl-C mid-reopen (MAN-252): a clean end, matching
-                    // EOF, without waiting for the attempt to return.
-                    return Ok(0);
+                    // Ctrl-C mid-reopen (MAN-252): end of stream without
+                    // waiting for the attempt to return, with the outage
+                    // left pending (MAN-258).
+                    return Ok(self.end_during_outage());
                 };
                 match opened {
                     Ok(src) => {
@@ -483,8 +473,10 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
             // MAN-252: a stop that landed while the result was being
             // accepted and installed wins over that first read -- it has
             // not started yet, so do not start it after a stop request.
+            // The source has returned nothing yet, so the outage is still
+            // open and stays pending (MAN-258).
             if self.reopened && self.stop.load(Ordering::Relaxed) {
-                return Ok(0);
+                return Ok(self.end_during_outage());
             }
             let first_read_started = self.reopened.then(|| self.env.now());
             let inner = self.inner.as_mut().expect("checked Some above");
@@ -1071,7 +1063,6 @@ mod tests {
         );
     }
 
-<<<<<<< HEAD
     /// MAN-258: a stop during the backoff ends the stream with the outage
     /// left pending, so `listen()` tears its tracks down as an outage
     /// rather than as an end of signal.
@@ -1082,29 +1073,6 @@ mod tests {
         let (health, _log) = health_recorder();
         let env = FakeEnv::new();
         let env_handle = env.clone();
-=======
-    /// MAN-252: a stop request that lands while a reopen is in flight ends
-    /// `read()` with EOF within one poll slice; it does not wait for the
-    /// opener -- a stalled DNS lookup, TCP connect or driver open -- to
-    /// return.
-    #[test]
-    fn stop_during_a_blocked_reopen_returns_eof_without_waiting_for_it() {
-        let first = scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let (entered_tx, entered_rx) = mpsc::channel::<()>();
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        let opener: Opener = {
-            let calls = calls.clone();
-            Box::new(move || {
-                calls.fetch_add(1, Ordering::Relaxed);
-                let _ = entered_tx.send(());
-                // Blocks like a stalled connect until the test's very end.
-                let _ = release_rx.recv();
-                Err(anyhow::anyhow!("released after the test"))
-            })
-        };
-        let (health, _log) = health_recorder();
->>>>>>> 9a79a729bec462d52cde4ab62bd6cf6a1529bf47
         let stop = no_stop();
         let mut src = ReconnectingSource::with_env(
             "test",
@@ -1113,7 +1081,6 @@ mod tests {
             stop.clone(),
             true,
             health,
-<<<<<<< HEAD
             env,
         );
 
@@ -1133,7 +1100,7 @@ mod tests {
         );
         assert_eq!(src.take_discontinuity(), None, "reported only once");
         assert_eq!(
-            calls.get(),
+            calls.load(Ordering::Relaxed),
             0,
             "the opener must never be called once stop is set"
         );
@@ -1193,7 +1160,95 @@ mod tests {
         let env = FakeEnv::new();
         let env_handle = env.clone();
         let src = ReconnectingSource::with_env(
-=======
+            "test",
+            Box::new(first),
+            opener,
+            stop.clone(),
+            true,
+            health,
+            env,
+        );
+
+        let mut closed_after_stop: Vec<(u32, ClosureKind)> = Vec::new();
+        let mut spots_after_stop: Vec<String> = Vec::new();
+        manta_engine::listen_with_observers(
+            Box::new(src),
+            &manta_engine::PipelineConfig::default(),
+            stop.clone(),
+            manta_engine::ListenObservers::default(),
+            |ev| {
+                if let DecoderEvent::TrackClosed { track_id, closure } = ev {
+                    if stop.load(Ordering::Relaxed) {
+                        closed_after_stop.push((*track_id, *closure));
+                    }
+                }
+            },
+            |spot| {
+                if stop.load(Ordering::Relaxed) {
+                    spots_after_stop.push(spot.callsign.clone());
+                }
+            },
+            |_n| {},
+        )
+        .unwrap();
+
+        assert_eq!(
+            env_handle.sleeps_secs(),
+            vec![1],
+            "test setup: the stop must land in the reconnect backoff"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "no reopen is attempted after the stop"
+        );
+        assert!(
+            !closed_after_stop.is_empty(),
+            "test setup: a track must still be open when the receiver is lost"
+        );
+        assert!(
+            closed_after_stop.iter().all(|(_, closure)| *closure
+                == ClosureKind::Bookkeeping {
+                    survivor_track_id: None
+                }),
+            "a stop during an outage must close tracks as Bookkeeping, not SignalEnded: \
+             {closed_after_stop:?}"
+        );
+        assert!(
+            spots_after_stop.is_empty(),
+            "no spot may be published after the stop: {spots_after_stop:?}"
+        );
+    }
+
+    /// MAN-252: a stop request that lands while a reopen is in flight ends
+    /// `read()` with EOF within one poll slice; it does not wait for the
+    /// opener -- a stalled DNS lookup, TCP connect or driver open -- to
+    /// return.
+    #[test]
+    fn stop_during_a_blocked_reopen_returns_eof_without_waiting_for_it() {
+        let first = scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let opener: Opener = {
+            let calls = calls.clone();
+            Box::new(move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let _ = entered_tx.send(());
+                // Blocks like a stalled connect until the test's very end.
+                let _ = release_rx.recv();
+                Err(anyhow::anyhow!("released after the test"))
+            })
+        };
+        let (health, _log) = health_recorder();
+        let stop = no_stop();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            stop.clone(),
+            true,
+            health,
             FakeEnv::new(),
         );
 
@@ -1218,6 +1273,13 @@ mod tests {
         assert!(
             latency < Duration::from_secs(1),
             "read() must return within a poll slice of the stop, not wait for the reopen: {latency:?}"
+        );
+        // MAN-258: the source never came back, so the outage (the 1 s
+        // backoff on the fake clock) is left pending with the end of stream.
+        assert_eq!(
+            src.take_discontinuity(),
+            Some(FS.round() as u64),
+            "a stop mid-reopen leaves the outage pending"
         );
         assert_eq!(src.read(&mut b).unwrap(), 0, "still stopped");
         assert_eq!(
@@ -1277,63 +1339,12 @@ mod tests {
         let (health, _log) = health_recorder();
         let stop = no_stop();
         let mut src = ReconnectingSource::with_env(
->>>>>>> 9a79a729bec462d52cde4ab62bd6cf6a1529bf47
             "test",
             Box::new(first),
             opener,
             stop.clone(),
             true,
             health,
-<<<<<<< HEAD
-            env,
-        );
-
-        let mut closed_after_stop: Vec<(u32, ClosureKind)> = Vec::new();
-        let mut spots_after_stop: Vec<String> = Vec::new();
-        manta_engine::listen_with_observers(
-            Box::new(src),
-            &manta_engine::PipelineConfig::default(),
-            stop.clone(),
-            manta_engine::ListenObservers::default(),
-            |ev| {
-                if let DecoderEvent::TrackClosed { track_id, closure } = ev {
-                    if stop.load(Ordering::Relaxed) {
-                        closed_after_stop.push((*track_id, *closure));
-                    }
-                }
-            },
-            |spot| {
-                if stop.load(Ordering::Relaxed) {
-                    spots_after_stop.push(spot.callsign.clone());
-                }
-            },
-            |_n| {},
-        )
-        .unwrap();
-
-        assert_eq!(
-            env_handle.sleeps_secs(),
-            vec![1],
-            "test setup: the stop must land in the reconnect backoff"
-        );
-        assert_eq!(calls.get(), 0, "no reopen is attempted after the stop");
-        assert!(
-            !closed_after_stop.is_empty(),
-            "test setup: a track must still be open when the receiver is lost"
-        );
-        assert!(
-            closed_after_stop.iter().all(|(_, closure)| *closure
-                == ClosureKind::Bookkeeping {
-                    survivor_track_id: None
-                }),
-            "a stop during an outage must close tracks as Bookkeeping, not SignalEnded: \
-             {closed_after_stop:?}"
-        );
-        assert!(
-            spots_after_stop.is_empty(),
-            "no spot may be published after the stop: {spots_after_stop:?}"
-        );
-=======
             FakeEnv::new(),
         );
 
@@ -1362,6 +1373,12 @@ mod tests {
             0,
             "the late source must be disposed of unread"
         );
+        assert_eq!(
+            src.take_discontinuity(),
+            Some(FS.round() as u64),
+            "the late source was never read, so the outage (the 1 s backoff on the fake clock) \
+             is left pending (MAN-258)"
+        );
         assert_eq!(src.read(&mut b).unwrap(), 0, "still stopped");
         assert_eq!(
             calls.load(Ordering::Relaxed),
@@ -1369,6 +1386,73 @@ mod tests {
             "no second attempt starts while one is pending or after a stop"
         );
         drop(src);
+    }
+
+    /// MAN-258: a stop that lands after a reopened source is installed but
+    /// before its first read (MAN-252's pre-read check) still ends inside
+    /// the outage, so it is left pending with the end of stream.
+    #[test]
+    fn stop_before_a_reopened_sources_first_read_leaves_the_outage_pending() {
+        /// Sets `stop` when `read()` inspects it, between the reopen
+        /// result arriving and its first read.
+        struct StopsWhenInspected {
+            stop: Arc<AtomicBool>,
+            reads: Arc<AtomicUsize>,
+        }
+        impl IqSource for StopsWhenInspected {
+            fn sample_rate(&self) -> f64 {
+                FS
+            }
+            fn center_freq_hz(&self) -> f64 {
+                self.stop.store(true, Ordering::Relaxed);
+                CENTER
+            }
+            fn read(&mut self, _buf: &mut [Complex32]) -> anyhow::Result<usize> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                Ok(1)
+            }
+        }
+        let first = scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]);
+        let stop = no_stop();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let opener: Opener = {
+            let stop = stop.clone();
+            let reads = reads.clone();
+            Box::new(move || {
+                Ok(Box::new(StopsWhenInspected {
+                    stop: stop.clone(),
+                    reads: reads.clone(),
+                }) as SendSource)
+            })
+        };
+        let (health, _log) = health_recorder();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            stop.clone(),
+            true,
+            health,
+            FakeEnv::new(),
+        );
+
+        let mut b = buf(8);
+        assert_eq!(src.read(&mut b).unwrap(), 8, "first chunk comes through");
+        assert_eq!(
+            src.read(&mut b).unwrap(),
+            0,
+            "the stop wins over the first read"
+        );
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            0,
+            "test setup: the reopened source must be installed but never read"
+        );
+        assert_eq!(
+            src.take_discontinuity(),
+            Some(FS.round() as u64),
+            "the outage (the 1 s backoff on the fake clock) is left pending"
+        );
     }
 
     /// MAN-252: an opener panic still ends the run, as it did when the
@@ -1392,7 +1476,6 @@ mod tests {
         let mut b = buf(8);
         src.read(&mut b).unwrap();
         let _ = src.read(&mut b);
->>>>>>> 9a79a729bec462d52cde4ab62bd6cf6a1529bf47
     }
 
     #[test]
@@ -1726,18 +1809,15 @@ mod tests {
         let mut b = buf(8);
         src.read(&mut b).unwrap();
         assert_eq!(src.read(&mut b).unwrap(), 0);
-<<<<<<< HEAD
-        assert_eq!(calls.get(), 0, "EOF must not trigger a reopen");
-        assert_eq!(
-            src.take_discontinuity(),
-            None,
-            "the inner source's own EOF is a plain end of stream, with no outage pending"
-=======
         assert_eq!(
             calls.load(Ordering::Relaxed),
             0,
             "EOF must not trigger a reopen"
->>>>>>> 9a79a729bec462d52cde4ab62bd6cf6a1529bf47
+        );
+        assert_eq!(
+            src.take_discontinuity(),
+            None,
+            "the inner source's own EOF is a plain end of stream, with no outage pending"
         );
     }
 }
