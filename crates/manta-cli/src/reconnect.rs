@@ -11,13 +11,22 @@
 //!
 //! Time and sleeping are behind the `ReconnectEnv` trait so the state
 //! machine's tests run instantly, with no real sleeping.
+//!
+//! MAN-252: each reopen runs on its own short-lived `reopen-<kind>` thread
+//! while `read()` waits for it in `REAL_ENV_SLEEP_SLICE` slices, checking
+//! `stop` between them. A stop request that lands mid-reopen -- a stalled
+//! DNS lookup, TCP connect, WebSocket handshake or driver open -- ends
+//! `read()` with EOF at once and abandons the attempt, because the daemon
+//! starts draining its clients only after `listen()` returns.
 
 use manta_input::{InputHealthCounters, IqSource};
 use manta_server::backoff::{next_backoff, AttemptOutcome, INITIAL_BACKOFF};
 use manta_server::metrics::InputHealth;
 use num_complex::Complex32;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Wall clock + interruptible sleep, injected so tests run instantly and
@@ -35,6 +44,9 @@ pub(crate) trait ReconnectEnv {
 /// length) rather than only after the full backoff duration elapses.
 pub(crate) struct RealEnv;
 
+/// How often a wait during an outage checks `stop`: `RealEnv::sleep`'s
+/// backoff slices and, in real time whatever the env, the wait for a reopen
+/// running on its own thread (MAN-252). Bounds the stop latency of both.
 const REAL_ENV_SLEEP_SLICE: Duration = Duration::from_millis(100);
 
 impl ReconnectEnv for RealEnv {
@@ -57,8 +69,17 @@ impl ReconnectEnv for RealEnv {
     }
 }
 
-pub(crate) type Opener = Box<dyn FnMut() -> anyhow::Result<Box<dyn IqSource>>>;
+/// A source as an opener builds it: `Send`, because MAN-252 runs every
+/// reopen on its own thread and hands the result to the decode thread.
+pub(crate) type SendSource = Box<dyn IqSource + Send>;
+pub(crate) type Opener = Box<dyn FnMut() -> anyhow::Result<SendSource> + Send>;
 pub(crate) type HealthSink = Box<dyn FnMut(bool)>;
+
+/// A reopen running on its own thread (MAN-252).
+struct PendingReopen {
+    rx: mpsc::Receiver<anyhow::Result<SendSource>>,
+    worker: JoinHandle<()>,
+}
 
 /// MAN-228: a source's MAN-56 input-health counters summed over every
 /// connection a `ReconnectingSource` makes. Each reopen builds a new device
@@ -143,10 +164,25 @@ impl InputHealthTotals {
 /// `listen()` never observes the intermediate error: from its perspective
 /// `read()` just returns real samples a little later than usual, after an
 /// outage reported once via `take_discontinuity()`.
+///
+/// MAN-252: the opener runs on a `reopen-<kind>` thread, never on the
+/// reading thread, and `read()` returns EOF within one
+/// `REAL_ENV_SLEEP_SLICE` of a stop request during the backoff or the
+/// reopen, without waiting for the reopen to return: the daemon's client
+/// drain starts only after `listen()` returns, and a reopen can take tens
+/// of seconds (Kiwi) or have no bound at all (an HPSDR or ka9q hostname
+/// lookup, a SoapySDR driver open). An abandoned attempt finishes on its
+/// own thread, or dies with the process.
 pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
     name: &'static str,
     inner: Option<Box<dyn IqSource>>,
-    opener: Opener,
+    /// Shared with the reopen thread, which locks it for the call; kept
+    /// here rather than moved into the thread so a failed spawn loses
+    /// nothing (MAN-252).
+    opener: Arc<Mutex<Opener>>,
+    /// The reopen in flight, if any. Never more than one: `read()` starts
+    /// an attempt only when none is pending.
+    reopen: Option<PendingReopen>,
     stop: Arc<AtomicBool>,
     env: E,
     on_health: HealthSink,
@@ -222,7 +258,8 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
         ReconnectingSource {
             name,
             inner: Some(first),
-            opener,
+            opener: Arc::new(Mutex::new(opener)),
+            reopen: None,
             stop,
             env,
             on_health,
@@ -254,6 +291,73 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
             self.reported_healthy = healthy;
         }
     }
+
+    /// Starts one reopen on its own `reopen-<kind>` thread (MAN-252).
+    fn spawn_reopen(&self) -> std::io::Result<PendingReopen> {
+        let (tx, rx) = mpsc::channel();
+        let opener = self.opener.clone();
+        let worker = std::thread::Builder::new()
+            .name(format!("reopen-{}", self.name))
+            .spawn(move || {
+                let result = (opener.lock().expect("reopen lock poisoned"))();
+                // The receiver is gone once a stop abandoned this attempt:
+                // the late source is then dropped here, on this thread.
+                let _ = tx.send(result);
+            })?;
+        Ok(PendingReopen { rx, worker })
+    }
+
+    /// Waits for the pending reopen, checking `stop` every
+    /// `REAL_ENV_SLEEP_SLICE`. `None` once `stop` is set: the attempt stays
+    /// pending and is left to finish (or die with the process) on its own.
+    /// An opener panic is re-raised here, on the reading thread, as it was
+    /// when the opener ran on it.
+    ///
+    /// A result that arrives while the receive is waiting does not override
+    /// a stop observed in that same window: the late source is dropped here
+    /// rather than installed and read after the stop request (MAN-252).
+    fn await_reopen(&mut self) -> Option<anyhow::Result<SendSource>> {
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            let pending = self.reopen.as_ref().expect("a reopen is in flight");
+            match pending.rx.recv_timeout(REAL_ENV_SLEEP_SLICE) {
+                Ok(result) => {
+                    // The worker has finished, so this is the intentional
+                    // detach after a result, not a leak: dropping
+                    // `PendingReopen` detaches its already-exited thread.
+                    self.reopen = None;
+                    if self.stop.load(Ordering::Relaxed) {
+                        // `result` (a source, `Send` by construction) is
+                        // disposed of here, never read.
+                        return None;
+                    }
+                    return Some(result);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    let pending = self.reopen.take().expect("checked above");
+                    match pending.worker.join() {
+                        Err(payload) => std::panic::resume_unwind(payload),
+                        Ok(()) => unreachable!("the reopen thread always sends its result"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A reopen attempt failed before producing a source: back off and say
+    /// when the next attempt runs.
+    fn attempt_failed(&mut self, cause: &str) {
+        self.backoff = next_backoff(self.backoff, &AttemptOutcome::NeverConnected);
+        crate::logging::warning(&format!(
+            "source {} reconnect attempt failed: {}; retrying in {}s",
+            self.name,
+            cause,
+            self.backoff.as_secs()
+        ));
+    }
 }
 
 impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
@@ -279,11 +383,25 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
     fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {
         loop {
             if self.inner.is_none() {
-                if !self.env.sleep(self.backoff, &self.stop) {
-                    // Ctrl-C during the outage: a clean end, matching EOF.
-                    return Ok(0);
+                if self.reopen.is_none() {
+                    if !self.env.sleep(self.backoff, &self.stop) {
+                        // Ctrl-C during the outage: a clean end, matching EOF.
+                        return Ok(0);
+                    }
+                    match self.spawn_reopen() {
+                        Ok(pending) => self.reopen = Some(pending),
+                        Err(e) => {
+                            self.attempt_failed(&format!("could not start the reopen thread: {e}"));
+                            continue;
+                        }
+                    }
                 }
-                match (self.opener)() {
+                let Some(opened) = self.await_reopen() else {
+                    // Ctrl-C mid-reopen (MAN-252): a clean end, matching
+                    // EOF, without waiting for the attempt to return.
+                    return Ok(0);
+                };
+                match opened {
                     Ok(src) => {
                         if src.sample_rate() != self.fs {
                             anyhow::bail!(
@@ -318,19 +436,13 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                         if let Some(totals) = &self.input_health {
                             totals.attach(src.health_counters());
                         }
-                        self.inner = Some(src);
+                        self.inner = Some(src as Box<dyn IqSource>);
                         self.productive = false;
                         self.reopened = true;
                         continue;
                     }
                     Err(e) => {
-                        self.backoff = next_backoff(self.backoff, &AttemptOutcome::NeverConnected);
-                        crate::logging::warning(&format!(
-                            "source {} reconnect attempt failed: {}; retrying in {}s",
-                            self.name,
-                            crate::fmt::cause_text(&e),
-                            self.backoff.as_secs()
-                        ));
+                        self.attempt_failed(&crate::fmt::cause_text(&e));
                         continue;
                     }
                 }
@@ -344,6 +456,13 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
             // epoch uses, which is taken before the first read. Bound: time
             // that read spends waiting before any data arrives is excluded
             // from the gap too.
+            //
+            // MAN-252: a stop that landed while the result was being
+            // accepted and installed wins over that first read -- it has
+            // not started yet, so do not start it after a stop request.
+            if self.reopened && self.stop.load(Ordering::Relaxed) {
+                return Ok(0);
+            }
             let first_read_started = self.reopened.then(|| self.env.now());
             let inner = self.inner.as_mut().expect("checked Some above");
             match inner.read(buf) {
@@ -399,9 +518,10 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
+    use std::sync::atomic::AtomicUsize;
 
     struct ScriptedSource {
         fs: f64,
@@ -455,36 +575,47 @@ mod tests {
         ScriptedSource::new(fs, center, script)
     }
 
+    /// `Arc`/`Mutex`, not `Rc`/`Cell`: a clone travels inside `SlowSource`
+    /// through an opener, which runs on the reopen thread (MAN-252).
     #[derive(Clone)]
     struct FakeEnv {
-        clock: Rc<Cell<Instant>>,
-        sleeps: Rc<RefCell<Vec<Duration>>>,
+        clock: Arc<Mutex<Instant>>,
+        sleeps: Arc<Mutex<Vec<Duration>>>,
     }
 
     impl FakeEnv {
         fn new() -> Self {
             FakeEnv {
-                clock: Rc::new(Cell::new(Instant::now())),
-                sleeps: Rc::new(RefCell::new(Vec::new())),
+                clock: Arc::new(Mutex::new(Instant::now())),
+                sleeps: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
+        fn clock_now(&self) -> Instant {
+            *self.clock.lock().unwrap()
+        }
+
         fn advance(&self, d: Duration) {
-            self.clock.set(self.clock.get() + d);
+            *self.clock.lock().unwrap() += d;
         }
 
         fn sleeps_secs(&self) -> Vec<u64> {
-            self.sleeps.borrow().iter().map(|d| d.as_secs()).collect()
+            self.sleeps
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|d| d.as_secs())
+                .collect()
         }
     }
 
     impl ReconnectEnv for FakeEnv {
         fn now(&mut self) -> Instant {
-            self.clock.get()
+            self.clock_now()
         }
 
         fn sleep(&mut self, d: Duration, stop: &AtomicBool) -> bool {
-            self.sleeps.borrow_mut().push(d);
+            self.sleeps.lock().unwrap().push(d);
             if stop.load(Ordering::Relaxed) {
                 return false;
             }
@@ -509,13 +640,13 @@ mod tests {
 
     fn opener_from(
         mut sources: VecDeque<anyhow::Result<ScriptedSource>>,
-    ) -> (Opener, Rc<Cell<usize>>) {
-        let calls = Rc::new(Cell::new(0));
+    ) -> (Opener, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_opener = calls.clone();
         let opener: Opener = Box::new(move || {
-            calls_for_opener.set(calls_for_opener.get() + 1);
+            calls_for_opener.fetch_add(1, Ordering::Relaxed);
             match sources.pop_front() {
-                Some(Ok(src)) => Ok(Box::new(src) as Box<dyn IqSource>),
+                Some(Ok(src)) => Ok(Box::new(src) as SendSource),
                 Some(Err(e)) => Err(e),
                 None => panic!("opener called more times than the test scripted"),
             }
@@ -584,7 +715,11 @@ mod tests {
         assert_eq!(src.read(&mut b).unwrap(), 8, "first chunk comes through");
         let n = src.read(&mut b).unwrap();
         assert_eq!(n, 8, "the error is retried transparently, not surfaced");
-        assert_eq!(calls.get(), 1, "the opener must be called exactly once");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the opener must be called exactly once"
+        );
     }
 
     #[test]
@@ -643,7 +778,7 @@ mod tests {
         src.read(&mut b).unwrap(); // productive
         let n = src.read(&mut b).unwrap(); // errors; 7 failed reopens; 8th succeeds
         assert_eq!(n, 8);
-        assert_eq!(calls.get(), 8);
+        assert_eq!(calls.load(Ordering::Relaxed), 8);
         assert_eq!(env_handle.sleeps_secs(), vec![1, 2, 4, 8, 16, 32, 60, 60]);
 
         // The recovered source drops again -- the ladder must have reset.
@@ -775,7 +910,11 @@ mod tests {
         let mut b = buf(8);
         src.read(&mut b).unwrap();
         assert_eq!(log.borrow().clone(), vec![false, true]);
-        assert_eq!(calls.get(), 0, "no reconnect was involved");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "no reconnect was involved"
+        );
     }
 
     #[test]
@@ -808,9 +947,9 @@ mod tests {
         );
 
         env_handle.advance(Duration::from_secs(10)); // simulated stall before the error surfaces
-        let t0 = env_handle.clock.get() - Duration::from_secs(10);
+        let t0 = env_handle.clock_now() - Duration::from_secs(10);
         src.read(&mut b).unwrap(); // errors, sleeps 1s (env advances), reopens, resumes
-        let t_now = env_handle.clock.get();
+        let t_now = env_handle.clock_now();
         let expected = ((t_now - t0).as_secs_f64() * FS).round() as u64;
 
         assert_eq!(src.take_discontinuity(), Some(expected));
@@ -853,7 +992,7 @@ mod tests {
             takes: Duration::from_millis(1500),
         });
         let opener: Opener = Box::new(move || {
-            Ok(Box::new(reopened.take().expect("reopened only once")) as Box<dyn IqSource>)
+            Ok(Box::new(reopened.take().expect("reopened only once")) as SendSource)
         });
         let (health, _log) = health_recorder();
         let mut src = ReconnectingSource::with_env(
@@ -868,10 +1007,10 @@ mod tests {
 
         let mut b = buf(8);
         src.read(&mut b).unwrap();
-        let t0 = env_handle.clock.get();
+        let t0 = env_handle.clock_now();
         src.read(&mut b).unwrap(); // errors, sleeps 1s, reopens, first read takes 1.5s
         assert_eq!(
-            env_handle.clock.get() - t0,
+            env_handle.clock_now() - t0,
             INITIAL_BACKOFF + Duration::from_millis(1500),
             "the reopened source's first read must have taken its 1.5s"
         );
@@ -903,10 +1042,188 @@ mod tests {
         let mut b = buf(8);
         assert_eq!(src.read(&mut b).unwrap(), 0);
         assert_eq!(
-            calls.get(),
+            calls.load(Ordering::Relaxed),
             0,
             "the opener must never be called once stop is set"
         );
+    }
+
+    /// MAN-252: a stop request that lands while a reopen is in flight ends
+    /// `read()` with EOF within one poll slice; it does not wait for the
+    /// opener -- a stalled DNS lookup, TCP connect or driver open -- to
+    /// return.
+    #[test]
+    fn stop_during_a_blocked_reopen_returns_eof_without_waiting_for_it() {
+        let first = scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let opener: Opener = {
+            let calls = calls.clone();
+            Box::new(move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let _ = entered_tx.send(());
+                // Blocks like a stalled connect until the test's very end.
+                let _ = release_rx.recv();
+                Err(anyhow::anyhow!("released after the test"))
+            })
+        };
+        let (health, _log) = health_recorder();
+        let stop = no_stop();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            stop.clone(),
+            true,
+            health,
+            FakeEnv::new(),
+        );
+
+        let mut b = buf(8);
+        assert_eq!(src.read(&mut b).unwrap(), 8, "first chunk comes through");
+        let stopper = std::thread::spawn(move || {
+            entered_rx
+                .recv()
+                .expect("the opener must have been entered");
+            stop.store(true, Ordering::Relaxed);
+            Instant::now()
+        });
+        assert_eq!(
+            src.read(&mut b).unwrap(),
+            0,
+            "a stop mid-reopen is a clean end, matching EOF"
+        );
+        let returned_at = Instant::now();
+        let stopped_at = stopper.join().expect("the stopper thread ran");
+        let latency = returned_at.duration_since(stopped_at);
+        eprintln!("read() returned {latency:?} after stop");
+        assert!(
+            latency < Duration::from_secs(1),
+            "read() must return within a poll slice of the stop, not wait for the reopen: {latency:?}"
+        );
+        assert_eq!(src.read(&mut b).unwrap(), 0, "still stopped");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "no second attempt starts while one is pending or after a stop"
+        );
+
+        // The abandoned attempt finishes on its own thread; dropping the
+        // source neither hangs nor panics.
+        release_tx.send(()).expect("the opener is still waiting");
+        drop(src);
+    }
+
+    /// MAN-252: a stop observed while the reopen result itself was in
+    /// flight wins over that result: `read()` ends with EOF, the late
+    /// source is disposed of unread, and no connected read starts after
+    /// the stop request. Before the fix the arriving result was accepted
+    /// and installed, and the new connection's first read -- here an
+    /// artificial 500 ms -- ran after the stop.
+    #[test]
+    fn a_result_arriving_during_the_stop_wait_does_not_override_it() {
+        let first = scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]);
+        struct LateSource {
+            reads: Arc<AtomicUsize>,
+        }
+        impl IqSource for LateSource {
+            fn sample_rate(&self) -> f64 {
+                FS
+            }
+            fn center_freq_hz(&self) -> f64 {
+                CENTER
+            }
+            fn read(&mut self, _buf: &mut [Complex32]) -> anyhow::Result<usize> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(500));
+                Ok(1)
+            }
+        }
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let late_reads = Arc::new(AtomicUsize::new(0));
+        let opener: Opener = {
+            let calls = calls.clone();
+            let late_reads = late_reads.clone();
+            Box::new(move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let _ = entered_tx.send(());
+                // The stop lands while the reading thread is inside
+                // `recv_timeout`; the result follows it by 30 ms.
+                std::thread::sleep(Duration::from_millis(30));
+                Ok(Box::new(LateSource {
+                    reads: late_reads.clone(),
+                }) as SendSource)
+            })
+        };
+        let (health, _log) = health_recorder();
+        let stop = no_stop();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            stop.clone(),
+            true,
+            health,
+            FakeEnv::new(),
+        );
+
+        let mut b = buf(8);
+        assert_eq!(src.read(&mut b).unwrap(), 8, "first chunk comes through");
+        let stopper = std::thread::spawn(move || {
+            entered_rx
+                .recv()
+                .expect("the opener must have been entered");
+            stop.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        assert_eq!(
+            src.read(&mut b).unwrap(),
+            0,
+            "a stop observed while the result was in flight is EOF, not a new connected read"
+        );
+        let elapsed = started.elapsed();
+        stopper.join().expect("the stopper thread ran");
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "read() must not wait out the late source's 500 ms first read: {elapsed:?}"
+        );
+        assert_eq!(
+            late_reads.load(Ordering::Relaxed),
+            0,
+            "the late source must be disposed of unread"
+        );
+        assert_eq!(src.read(&mut b).unwrap(), 0, "still stopped");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "no second attempt starts while one is pending or after a stop"
+        );
+        drop(src);
+    }
+
+    /// MAN-252: an opener panic still ends the run, as it did when the
+    /// opener ran on the reading thread.
+    #[test]
+    #[should_panic(expected = "opener blew up")]
+    fn a_panicking_opener_panics_the_reading_thread() {
+        let first = scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]);
+        let opener: Opener = Box::new(|| panic!("opener blew up"));
+        let (health, _log) = health_recorder();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            FakeEnv::new(),
+        );
+
+        let mut b = buf(8);
+        src.read(&mut b).unwrap();
+        let _ = src.read(&mut b);
     }
 
     #[test]
@@ -986,7 +1303,7 @@ mod tests {
             scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]),
             (-5000.0, 5000.0),
         );
-        let reopened: Box<dyn IqSource> = Box::new(Edges(
+        let reopened: SendSource = Box::new(Edges(
             scripted(FS, CENTER, vec![ok_chunk(8)]),
             (-3000.0, 3000.0),
         ));
@@ -1060,7 +1377,7 @@ mod tests {
                 sources
                     .pop_front()
                     .expect("opener called more times than the test scripted"),
-            ) as Box<dyn IqSource>)
+            ) as SendSource)
         })
     }
 
@@ -1151,8 +1468,8 @@ mod tests {
         // reconnect, or losing them during the outage, shows as a dip.
         let first = CountingSource::new(vec![ok_chunk(8), err_chunk("lost")], 10);
         let second = CountingSource::new(vec![ok_chunk(8)], 1);
-        let mid_outage: Rc<RefCell<Option<InputHealth>>> = Rc::new(RefCell::new(None));
-        let totals_slot: Rc<RefCell<Option<Arc<InputHealthTotals>>>> = Rc::new(RefCell::new(None));
+        let mid_outage: Arc<Mutex<Option<InputHealth>>> = Arc::new(Mutex::new(None));
+        let totals_slot: Arc<Mutex<Option<Arc<InputHealthTotals>>>> = Arc::new(Mutex::new(None));
         let opener: Opener = {
             let mut reopen = counting_opener(vec![second]);
             let mid_outage = mid_outage.clone();
@@ -1160,8 +1477,8 @@ mod tests {
             Box::new(move || {
                 // Runs mid-outage: the lost device is already retired and
                 // the replacement not yet attached.
-                let totals = totals_slot.borrow().clone().expect("slot set below");
-                *mid_outage.borrow_mut() = Some(totals.snapshot());
+                let totals = totals_slot.lock().unwrap().clone().expect("slot set below");
+                *mid_outage.lock().unwrap() = Some(totals.snapshot());
                 reopen()
             })
         };
@@ -1176,13 +1493,13 @@ mod tests {
             FakeEnv::new(),
         );
         let totals = src.input_health().unwrap();
-        *totals_slot.borrow_mut() = Some(totals.clone());
+        *totals_slot.lock().unwrap() = Some(totals.clone());
 
         let mut b = buf(8);
         src.read(&mut b).unwrap();
         let before = totals.snapshot();
         src.read(&mut b).unwrap(); // the losing read: retires, reopens, resumes
-        let during = mid_outage.borrow().expect("the opener ran");
+        let during = mid_outage.lock().unwrap().expect("the opener ran");
         let after = totals.snapshot();
 
         assert_no_field_dips(before, during);
@@ -1240,6 +1557,10 @@ mod tests {
         let mut b = buf(8);
         src.read(&mut b).unwrap();
         assert_eq!(src.read(&mut b).unwrap(), 0);
-        assert_eq!(calls.get(), 0, "EOF must not trigger a reopen");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "EOF must not trigger a reopen"
+        );
     }
 }

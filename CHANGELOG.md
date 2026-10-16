@@ -136,6 +136,9 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-254: `manta soak --help` says the run lasts the full `--duration`
+  even when a `--source` recording ends sooner, instead of repeating
+  `run`'s promise that a replay finishes early. Soak's behaviour is unchanged.
 - MAN-235: a `manta doctor` run shorter than 60 s that reads
   `WEAK_NO_DECODE` adds a `hint:` line suggesting `--duration 60`.
 - The in-repo `wiki/` is the project's canonical wiki. GitHub's Wiki tab

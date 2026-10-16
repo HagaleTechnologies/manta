@@ -33,8 +33,14 @@ jobs:
   # it against during development) or Node (would need a package.json+package-lock.json this repo
   # has never had, purely to reuse comparator logic that Cargo's own simpler, OR-free requirement
   # grammar doesn't actually need).
+  #
+  # MAN-245: every job here runs only for a Dependabot update -- the PR authored by
+  # dependabot[bot] from a branch in this repository, AND this event triggered by dependabot[bot]
+  # -- not merely a dependabot[bot]-triggered event, which can land on any PR. The same expression
+  # as wait-for-codex.yml's IS_EXCLUDED_DEPENDABOT. dependabot/fetch-metadata refusing a PR not
+  # created by Dependabot stays the inner check.
   verify:
-    if: github.actor == 'dependabot[bot]'
+    if: github.actor == 'dependabot[bot]' && github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -107,7 +113,7 @@ jobs:
   # (`needs: check-needs-human` on the auto-merge job below), so a stale label is already cleared
   # by the time the live check reads it.
   check-needs-human:
-    if: github.actor == 'dependabot[bot]'
+    if: github.actor == 'dependabot[bot]' && github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -188,7 +194,7 @@ jobs:
 
   auto-merge:
     needs: [verify, check-needs-human]
-    if: github.actor == 'dependabot[bot]'
+    if: github.actor == 'dependabot[bot]' && github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

@@ -64,7 +64,7 @@ an unzipped RBN archive with the same grading code.
 - **The primary's RBN spotter callsign** (the call its spots carry on RBN) and the frequency
   range the primary covers.
 - **Build manta with the `soapy` feature.** Release binaries ship `hpsdr` but not `soapy`
-  (`.github/workflows/release.yml`), so build from source. This needs `libsoapysdr-dev`, the
+  (`.github/workflows/release-publish.yml`), so build from source. This needs `libsoapysdr-dev`, the
   SoapySDRPlay3 module and the SDRplay API service installed first. Clone the repo to
   `/opt/manta`; the companion units run the scripts from there.
 
