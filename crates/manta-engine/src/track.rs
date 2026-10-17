@@ -1390,6 +1390,11 @@ pub struct TrackManager {
     /// channel -> owning track_id, recomputed each hop. SPEC §2.5.
     owner_of: Vec<Option<u32>>,
     next_id: u32,
+    /// MAN-13 (D3): the first id this manager's input owns and the step
+    /// between its ids (`crate::multi::TrackIdSpace`). `1`/`1` with one
+    /// input, today's numbering.
+    id_first: u32,
+    id_stride: u32,
     cfg: DetectorConfig,
     decode_cfg: DecodeConfig,
     hop_counter: u64,
@@ -1574,6 +1579,8 @@ impl TrackManager {
             tracks: BTreeMap::new(),
             owner_of: vec![None; n_channels],
             next_id: 1,
+            id_first: 1,
+            id_stride: 1,
             cfg: detector_cfg,
             decode_cfg,
             hop_counter: 0,
@@ -1927,6 +1934,17 @@ impl TrackManager {
         self.next_id = next;
     }
 
+    /// MAN-13 (D3): number this manager's tracks `space.first`,
+    /// `space.first + space.stride`, ... so several inputs feeding one
+    /// validator never share a track id. Restarts the sequence at
+    /// `space.first`; a segment restart then resumes from
+    /// `next_track_id()`, which keeps the input's residue.
+    pub(crate) fn set_track_id_space(&mut self, space: crate::multi::TrackIdSpace) {
+        self.id_first = space.first.max(1);
+        self.id_stride = space.stride.max(1);
+        self.next_id = self.id_first;
+    }
+
     /// Ignore every channelizer hop with `m < n`. MAN-115: callers that
     /// prepend `filter_len` zero samples (`decode_samples`, `listen`'s
     /// segments, `soak`) pass their `pad_hops`. Those hops' windows are
@@ -1993,6 +2011,12 @@ impl TrackManager {
     /// count and evictions visible in metrics").
     pub fn active_track_count(&self) -> usize {
         self.tracks.len()
+    }
+
+    /// MAN-13: the ids of every track this manager still holds, in id
+    /// order, for a multi-input live tap's bookkeeping.
+    pub(crate) fn track_ids(&self) -> Vec<u32> {
+        self.tracks.keys().copied().collect()
     }
 
     /// Count of tracks the manager has actually *promoted* -- every track
@@ -2613,7 +2637,12 @@ impl TrackManager {
     /// had `current_snr_db` populated yet.
     fn spawn(&mut self, birth_channel: usize) {
         let id = self.next_id;
-        self.next_id += 1;
+        // MAN-13 (D3): step by the input's stride; on overflow the input
+        // wraps to its own first id, never into another input's ids.
+        self.next_id = self
+            .next_id
+            .checked_add(self.id_stride)
+            .unwrap_or(self.id_first);
         let mut track = Track::new(id, birth_channel, &self.cfg);
         #[cfg(test)]
         {
@@ -3232,6 +3261,76 @@ pub(crate) fn event_track_id(e: &DecoderEvent) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    // MAN-13 (D3): interleaved track ids.
+
+    fn id_space_manager() -> TrackManager {
+        TrackManager::new(64, 96_000.0, 14_000_000.0, cfg(), DecodeConfig::default())
+    }
+
+    fn spawned_ids(tm: &mut TrackManager, n: usize) -> Vec<u32> {
+        (0..n)
+            .map(|k| {
+                let id = tm.next_track_id();
+                tm.spawn(5 + 8 * k);
+                id
+            })
+            .collect()
+    }
+
+    #[test]
+    fn track_ids_interleave_by_input() {
+        let mut tm = id_space_manager();
+        tm.set_track_id_space(crate::multi::TrackIdSpace {
+            first: 2,
+            stride: 3,
+        });
+        assert_eq!(spawned_ids(&mut tm, 3), vec![2, 5, 8]);
+        let mut ids: Vec<u32> = tm.tracks.keys().copied().collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![2, 5, 8]);
+    }
+
+    #[test]
+    fn one_input_track_ids_are_todays_numbering() {
+        let mut tm = id_space_manager();
+        tm.set_track_id_space(crate::multi::TrackIdSpace::SINGLE);
+        assert_eq!(spawned_ids(&mut tm, 3), vec![1, 2, 3]);
+        let mut fresh = id_space_manager();
+        assert_eq!(spawned_ids(&mut fresh, 3), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn resume_after_discontinuity_keeps_the_input_residue() {
+        let space = crate::multi::TrackIdSpace {
+            first: 3,
+            stride: 4,
+        };
+        let mut tm = id_space_manager();
+        tm.set_track_id_space(space);
+        spawned_ids(&mut tm, 2);
+        tm.finish_for_discontinuity();
+        let next = tm.next_track_id();
+        let mut seg = id_space_manager();
+        seg.set_track_id_space(space);
+        seg.resume_track_ids_from(next);
+        for id in spawned_ids(&mut seg, 3) {
+            assert_eq!(id % 4, 3, "id {id} left input 2's residue");
+            assert!(id >= next);
+        }
+    }
+
+    #[test]
+    fn track_id_overflow_wraps_to_the_inputs_first_id() {
+        let mut tm = id_space_manager();
+        tm.set_track_id_space(crate::multi::TrackIdSpace {
+            first: 2,
+            stride: 3,
+        });
+        tm.resume_track_ids_from(u32::MAX - 1);
+        tm.spawn(5);
+        assert_eq!(tm.next_track_id(), 2);
+    }
+
     use super::*;
 
     #[test]

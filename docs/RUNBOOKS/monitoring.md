@@ -153,12 +153,27 @@ container's state), that it is bound where Prometheus looks (the banner's
 **Fires when** `manta_healthy` has been 0 for 2 minutes. Severity `critical`.
 
 **Means** the node answers scrapes but `GET /healthz` fails: an input source is
-unhealthy, a listener is down, or the decode loop has made no progress for
-10 seconds. A dead RBN uplink does not count; see
+unhealthy (with several `[[input]]` entries: every input is), a listener is
+down, or the decode loop has made no progress for 10 seconds. A dead RBN uplink does not count; see
 [MantaUplinkDisconnected](#mantauplinkdisconnected).
 
 **Check** the per-check lines of `curl -s http://127.0.0.1:7302/healthz` on the
 node. [node-health.md](node-health.md) explains each line.
+
+### MantaInputDown
+
+**Fires when** one input's `manta_source_health{source="<name>"}` has been 0
+for 2 minutes. Severity `warning`.
+
+**Means** that input delivers no samples: its receiver is unreachable,
+unplugged or stopped, or (file replay) it reached its end. With several
+`[[input]]` entries (MAN-13) the node stays healthy while at least one input
+decodes, so [MantaNodeUnhealthy](#mantanodeunhealthy) does not fire for one
+dead input; the other inputs keep spotting.
+
+**Check** the node's log for `input <name>: lost` or `input <name>: stopped`
+lines, and `curl -s http://127.0.0.1:7302/healthz` for the `source <name>:`
+line. [node-health.md](node-health.md) explains each line.
 
 ### MantaNoSpots
 
