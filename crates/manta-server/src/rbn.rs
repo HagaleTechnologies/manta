@@ -284,6 +284,8 @@ mod tests {
             confidence: 0.9,
             track_id: 1,
             sample_ts: 0,
+            rst: None,
+            qrl_query: false,
         }
     }
 
@@ -296,6 +298,27 @@ mod tests {
     fn matches_the_live_rbn_capture_byte_for_byte() {
         let line = format_line(&capture_spot(), "S53A", 2 * 3600 + 36 * 60, LineFormat::Rbn);
         assert_eq!(line, LIVE_RBN_CAPTURE);
+    }
+
+    /// MAN-272 D7: a spot's RST/QRL? annotations reach the JSON stream and
+    /// the CLI line only. The telnet/RBN-uplink line has no column for them
+    /// and stays byte-identical to the unannotated spot's.
+    #[test]
+    fn rst_and_qrl_never_reach_the_rbn_line() {
+        let mut annotated = capture_spot();
+        annotated.rst = Some("599".to_string());
+        annotated.qrl_query = true;
+        for format in [LineFormat::Rbn, LineFormat::Skimmer] {
+            let ts = 2 * 3600 + 36 * 60;
+            assert_eq!(
+                format_line(&annotated, "S53A", ts, format),
+                format_line(&capture_spot(), "S53A", ts, format),
+            );
+        }
+        assert_eq!(
+            format_line(&annotated, "S53A", 2 * 3600 + 36 * 60, LineFormat::Rbn),
+            LIVE_RBN_CAPTURE
+        );
     }
 
     #[test]
