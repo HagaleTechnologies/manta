@@ -11,11 +11,8 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
-<<<<<<< HEAD
-| 2026-10-16 | MAN-271 | [MAN-271: a short single-shot high-WPM transmission decodes to at least one character (finish-time tracker bootstrap + SPEC §2.8 D′)](2026-10-16-man271-short-transmission-decode.md) |
-=======
 | 2026-10-16 | MAN-272 | [MAN-272: a spot carries its track's latest RST and a QRL? flag](2026-10-16-man272-rst-and-qrl-on-spots.md) |
->>>>>>> 3c14f9b83593c0a253bc1afd6e57623d767a417a
+| 2026-10-16 | MAN-271 | [MAN-271: a short single-shot high-WPM transmission decodes to at least one character (finish-time tracker bootstrap + SPEC §2.8 D′)](2026-10-16-man271-short-transmission-decode.md) |
 | 2026-10-16 | MAN-252 | [MAN-252: a stop request abandons a source reopen in flight](2026-10-16-man252-cancellable-source-reopen.md) |
 | 2026-10-16 | MAN-245 | [MAN-245: the Codex gate fails closed on an incomplete thread read, Dependabot is classified by author, and each required check names its source](2026-10-16-man245-gate-verdict-integrity.md) |
 | 2026-10-16 | MAN-238 | [MAN-238: CLAUDE.md is a short standing brief; its per-ticket log is archived here](2026-10-16-man238-standing-brief.md) |
