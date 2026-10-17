@@ -80,6 +80,13 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-13: one `manta run` decodes several receivers into one spot output.
+  Write `[[input]]` once per receiver (each with a `name`); every input
+  decodes on its own thread into one shared validator, so a station two
+  receivers hear is spotted once. `calibrate`, `doctor`, `soak` and `check`
+  take `--input NAME`; `decode` needs `--freq-correction-ppm` when the
+  entries' corrections differ. With several inputs `/healthz` stays `ok`
+  while one input is healthy. Single-input runs are unchanged.
 - MAN-272: each spot carries its track's latest RST (`5NN` read as `599`)
   and whether it sent `QRL?`, as CW Skimmer's band map shows. JSON spots
   gain `rst` (string or `null`) and `qrlQuery` (boolean), `run --json` and

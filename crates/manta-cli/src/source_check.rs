@@ -11,6 +11,10 @@ pub(crate) struct Args {
     /// Sample window in seconds, from 1 to 60.
     #[arg(long, default_value = "3", value_parser = parse_duration)]
     duration: f64,
+    /// With several [[input]] entries in the config, the one to check, by
+    /// its name. Optional with one input.
+    #[arg(long, value_name = "NAME")]
+    input: Option<String>,
     /// Sound-card input device; matched by substring. Defaults to the
     /// system default input.
     #[arg(long, conflicts_with = "source", help_heading = "Audio input")]
@@ -234,6 +238,10 @@ pub(crate) fn run(args: Args) -> Result<i32> {
             ..CliOverrides::none()
         },
         args.config,
+        crate::OneInput {
+            command: "check",
+            name: args.input.as_deref(),
+        },
     )?;
     let options = CheckOptions {
         duration_seconds: args.duration,

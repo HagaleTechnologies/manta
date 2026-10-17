@@ -18,9 +18,10 @@ const ALERTS: &str = "manta-alerts.yml";
 const ALERT_TESTS: &str = "manta-alerts.test.yml";
 const PROMETHEUS: &str = "prometheus.yml";
 const DASHBOARD: &str = "manta-dashboard.json";
-const ALERT_NAMES: [&str; 4] = [
+const ALERT_NAMES: [&str; 5] = [
     "MantaNodeDown",
     "MantaNodeUnhealthy",
+    "MantaInputDown",
     "MantaNoSpots",
     "MantaUplinkDisconnected",
 ];
@@ -175,7 +176,7 @@ fn rule_for(rule: &serde_yaml_ng::Value) -> Option<&str> {
 }
 
 #[test]
-fn alert_rules_define_the_four_alerts() {
+fn alert_rules_define_the_five_alerts() {
     let doc = yaml(ALERTS);
     let groups = doc["groups"].as_sequence().expect("groups list");
     assert_eq!(groups.len(), 1, "{ALERTS} must have exactly one group");
@@ -204,6 +205,22 @@ fn alert_rules_define_the_four_alerts() {
             "{name}'s runbook_url must land on its section of {RUNBOOK}"
         );
     }
+}
+
+/// MAN-13: with several inputs the node stays healthy while one decodes,
+/// so a dead input has its own alert, per `source`.
+#[test]
+fn input_down_alert_fires_per_source() {
+    let rules = alert_rules();
+    let r = rule(&rules, "MantaInputDown");
+    assert_eq!(expr(r).trim(), "manta_source_health == 0");
+    assert_eq!(rule_for(r), Some("2m"));
+    assert!(
+        r["annotations"]["summary"]
+            .as_str()
+            .is_some_and(|s| s.contains("{{ $labels.source }}")),
+        "MantaInputDown's summary names the input"
+    );
 }
 
 #[test]
