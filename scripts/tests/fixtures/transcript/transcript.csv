@@ -1,0 +1,6 @@
+# Fixture for scripts/tests/test_score_transcript.py and test_corpus.py (MAN-119):
+# two stations, one row per transmission, pitches as a spectrogram shows them.
+start_s,end_s,pitch_hz,text
+12.0,16.0,640,CQ DE VP8GEO K
+16.2,17.5,710,K5TR
+30.0,32.0,,5NN TU

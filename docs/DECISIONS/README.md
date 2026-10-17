@@ -34,6 +34,7 @@ Add a row here in the same change that adds a record:
 | 2026-10-14 | MAN-192 | [MAN-192: the HSMM decoder reseeds after a committed Silence, not only on a gate re-onset](2026-10-14-man192-silence-reseed.md) |
 | 2026-10-14 | MAN-193 | [MAN-193: Evidence's centered maximum is a monotonic deque](2026-10-14-man193-centered-maximum-deque.md) |
 | 2026-10-14 | MAN-95 | [MAN-95: callsign-pattern rarity sets the repetition requirement](2026-10-14-man95-pattern-rarity-repetition-tiers.md) |
+| 2026-10-14 | MAN-119 | [MAN-119: streaming IQ WAVs, 24/32-bit PCM, and the real-audio corpus as a CI fixture](2026-10-14-man119-streaming-wav-and-real-audio-corpus.md) |
 | 2026-10-13 | MAN-313 | [Non-CW rejection: no CW track on speech, data or a swept carrier](2026-10-13-man313-non-cw-rejection.md) |
 | 2026-10-13 | MAN-189 | [MAN-189: the HSMM decoder commits each stretch of time once](2026-10-13-man189-hsmm-commit-frontier.md) |
 | 2026-10-13 | MAN-190 | [MAN-190: evidence anchors confirmed from actual adjacent hops, not predicted](2026-10-13-man190-confirmed-evidence-anchors.md) |
