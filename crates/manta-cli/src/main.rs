@@ -9445,6 +9445,8 @@ mod tests {
                 confidence: 0.9,
                 track_id: 7,
                 sample_ts: 12_345,
+                rst: None,
+                qrl_query: false,
             });
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {

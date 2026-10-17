@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-16T15:47:53Z",
-  "head_commit": "4529021",
+  "generated_at": "2026-10-16T22:46:15Z",
+  "head_commit": "b8b9367",
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -268,7 +268,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:eb40916133f50002e9dc5e628cbe0c77e70446b1b950c79c7418423a0d1cba7f",
+      "hash": "sha256:07e3ff49bc362e6abe31f465492ef507ed13e471be9d6d82e5915658ca3426f6",
       "id": "spot-output-contract",
       "kind": "interface",
       "links": [
@@ -286,16 +286,17 @@
         "docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md",
         "docs/RUNBOOKS/rbn-comparison.md",
         "docs/SPOT-SCHEMA.md",
-        "docs/DECISIONS/2026-10-14-man137-json-stream-resume.md"
+        "docs/DECISIONS/2026-10-14-man137-json-stream-resume.md",
+        "docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md"
       ],
       "status": "current",
       "title": "What spot-output contracts does manta expose (telnet RBN + JSON)?",
-      "verified_commit": "9636fe0494b4bce7973c3e0c5ad854f9ebc16f73",
-      "verified_date": "2026-10-14",
+      "verified_commit": "799379d",
+      "verified_date": "2026-10-16",
       "visibility": "public"
     },
     {
-      "hash": "sha256:62b96cfd401d4050d7c3cfaa1770e274a244da2332874e05fad3111ffbc4c69a",
+      "hash": "sha256:70777e011e96d6b0797b03d61b2c1efa0babebe1a542a1d2b73043e72491b543",
       "id": "spot-validation",
       "kind": "subsystem",
       "links": [
@@ -312,12 +313,13 @@
         "docs/SPEC-decode-core.md#9-configuration-keys",
         "docs/DECISIONS/2026-09-09-beacon-emission-deferred-to-track-close.md",
         "docs/DECISIONS/2026-10-14-man174-deferred-beacon-merge-bookkeeping.md",
-        "docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md"
+        "docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md",
+        "docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md"
       ],
       "status": "current",
       "title": "How does manta decide a decoded call is trustworthy enough to spot?",
-      "verified_commit": "6596e3a",
-      "verified_date": "2026-10-15",
+      "verified_commit": "799379d",
+      "verified_date": "2026-10-16",
       "visibility": "public"
     },
     {

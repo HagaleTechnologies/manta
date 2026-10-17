@@ -24,6 +24,8 @@
 //! yet reflected in dispensa's frozen schema -- see
 //! `docs/DECISIONS/2026-09-07-man102-snr-reference-and-estimator.md` for
 //! the proposed schema fragment, ready to lift into that repo's ADR-0011.
+//! `rst`/`qrlQuery` (MAN-272) are likewise manta-originated; their fragment
+//! is in `docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md`.
 
 use manta_spot::cty;
 use manta_spot::Spot;
@@ -218,6 +220,10 @@ pub struct SpotMessage {
     /// The reference bandwidth `snr` is quoted in. MAN-102 / D3.
     pub snr_ref_hz: u32,
     pub wpm: Option<i32>,
+    /// The spot's track's most recent RST, three digits. MAN-272; manta-originated, not yet in dispensa.
+    pub rst: Option<String>,
+    /// The spot's track decoded `QRL?`. MAN-272; manta-originated, not yet in dispensa.
+    pub qrl_query: bool,
     pub decode_confidence: Option<f32>,
     pub decoder_version: Option<String>,
     pub channelizer_resolution_hz: Option<f64>,
@@ -350,6 +356,8 @@ impl SpotMessage {
             snr: Some(spot.snr_db.round() as i32),
             snr_ref_hz: SNR_REF_HZ,
             wpm: wire_wpm(spot),
+            rst: spot.rst.clone(),
+            qrl_query: spot.qrl_query,
             decode_confidence: Some(spot.confidence),
             decoder_version: Some(decoder_version.to_string()),
             channelizer_resolution_hz: None,
@@ -400,6 +408,8 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
             confidence: 0.9,
             track_id: 7,
             sample_ts: 12_345,
+            rst: None,
+            qrl_query: false,
         }
     }
 
@@ -1009,5 +1019,34 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         assert!(serde_json::to_string(&msg)
             .unwrap()
             .ends_with(r#","seq":7}"#));
+    }
+
+    /// MAN-272: a track's latest RST and its QRL? flag reach the JSON
+    /// stream as `rst`/`qrlQuery`, between `wpm` and `decodeConfidence`.
+    #[test]
+    fn rst_and_qrl_reach_the_wire_under_their_contract_names() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let mut spot = sample_spot();
+        spot.rst = Some("599".to_string());
+        spot.qrl_query = true;
+        let msg = SpotMessage::from_spot(&spot, "W1AW", None, &cty, "v", 0, 1, 0);
+        let line = serde_json::to_string(&msg).unwrap();
+        assert!(
+            line.contains(r#""wpm":28,"rst":"599","qrlQuery":true,"decodeConfidence""#),
+            "got {line}"
+        );
+    }
+
+    /// MAN-272: a spot whose track decoded neither annotation still sends
+    /// both keys -- SPOT-SCHEMA's keys-are-never-omitted invariant.
+    #[test]
+    fn a_spot_without_message_content_sends_null_rst_and_false_qrl() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let msg = SpotMessage::from_spot(&sample_spot(), "W1AW", None, &cty, "v", 0, 1, 0);
+        let line = serde_json::to_string(&msg).unwrap();
+        assert!(
+            line.contains(r#""rst":null,"qrlQuery":false"#),
+            "got {line}"
+        );
     }
 }

@@ -9,6 +9,7 @@ use crate::decision::{CandidateSupport, Decision, Reason, Rival};
 use crate::dedupe::Dedupe;
 use crate::gate::{RepetitionCounts, RepetitionGate, WINDOW_SECONDS as GATE_WINDOW_SECONDS};
 use crate::grammar;
+use crate::message;
 use crate::notch::NotchList;
 use crate::scp;
 use crate::support::SupportLedger;
@@ -59,6 +60,15 @@ pub struct Spot {
     pub confidence: f32,
     pub track_id: u32,
     pub sample_ts: u64,
+    /// The most recent RST signal report this spot's track decoded before
+    /// the spot was built, as three digits (`5NN` -> `"599"`), or `None`
+    /// (MAN-272 decision D4). Read from the emitting track only; a report a
+    /// merged-away track decoded is not carried (D5).
+    pub rst: Option<String>,
+    /// Set when this spot's track decoded `QRL?` before the spot was built.
+    /// Sticky for the track's life and never forwarded through a merge
+    /// (MAN-272 decisions D4/D5).
+    pub qrl_query: bool,
 }
 
 #[derive(Default)]
@@ -185,6 +195,13 @@ struct TrackState {
     /// Captured non-allowlisted Beacon candidates awaiting the track's
     /// true close -- see `PendingBeacon`'s doc comment.
     pending_beacons: Vec<PendingBeacon>,
+    /// The most recent RST any completed word on this track carried
+    /// (last value wins), scanned at word push so it outlives the word's
+    /// `WORD_WINDOW` slot (MAN-272 decision D4).
+    rst: Option<String>,
+    /// Set once any completed word on this track was `QRL?`; sticky until
+    /// this state is removed on `TrackClosed` (MAN-272 decision D4).
+    qrl_query: bool,
 }
 
 /// A `freq_correction_ppm` value that doesn't yield a finite, positive
@@ -687,6 +704,13 @@ impl Validator {
                 let mut newly_completed: Option<(String, u64, f32)> = None;
                 if !track.current.text.is_empty() {
                     let mut word = std::mem::take(&mut track.current);
+                    // MAN-272: scan the word that just completed, so "most
+                    // recent RST" is a per-track fact that survives
+                    // WORD_WINDOW aging (D4).
+                    if let Some(rst) = message::parse_rst(&word.text) {
+                        track.rst = Some(rst);
+                    }
+                    track.qrl_query |= message::is_qrl_query(&word.text);
                     word.seq = track.next_word_seq;
                     track.next_word_seq += 1;
                     newly_completed = Some((
@@ -811,6 +835,10 @@ impl Validator {
                         // recreating a dead track_id's state that no
                         // close would ever free.
                         let root = survivor_track_id.map(|s| self.resolve_survivor_root(s));
+                        // RST/QRL? annotations are deliberately NOT
+                        // migrated: they end with this track's `TrackState`
+                        // like its words do (MAN-272 D5, see
+                        // docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md).
                         self.migrate_or_discard_pending_beacons(*track_id, root);
                         // MAN-100 message-distinctness (Codex review, PR
                         // #133 rounds 3-5): a survivor exists, so this
@@ -1430,6 +1458,7 @@ impl Validator {
             return None;
         }
 
+        let (rst, qrl_query) = self.track_annotations(track_id);
         let spot = Spot {
             callsign: candidate,
             freq_hz,
@@ -1439,6 +1468,8 @@ impl Validator {
             confidence,
             track_id,
             sample_ts,
+            rst,
+            qrl_query,
         };
         self.decide(|| Decision::spotted(&spot, reps));
         Some(spot)
@@ -1568,6 +1599,14 @@ impl Validator {
         current
     }
 
+    /// MAN-272: the RST/QRL? annotations a spot emitted under `track_id`
+    /// carries, read when the spot is built (D6).
+    fn track_annotations(&self, track_id: u32) -> (Option<String>, bool) {
+        self.tracks
+            .get(&track_id)
+            .map_or((None, false), |t| (t.rst.clone(), t.qrl_query))
+    }
+
     /// A `ClosureKind::Bookkeeping` closure is not evidence this
     /// identity's signal ended (round 9) -- move its `PendingBeacon`s to
     /// the surviving track (a merge) so they're judged by ITS eventual
@@ -1648,6 +1687,7 @@ impl Validator {
                 std::mem::take(&mut track.pending_beacons),
             )
         };
+        let (rst, qrl_query) = self.track_annotations(track_id);
         // An unconfirmed `wpm` (still its `0.0` default) is not evidence of
         // a genuine slow speed -- refuse to resolve rather than let a
         // never-measured survivor pass the plausibility check on a
@@ -1753,6 +1793,8 @@ impl Validator {
                     confidence,
                     track_id,
                     sample_ts: pb.sample_ts,
+                    rst: rst.clone(),
+                    qrl_query,
                 };
                 self.decide(|| Decision::spotted(&spot, reps));
                 Some(spot)
@@ -2504,6 +2546,32 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         });
         assert_eq!(spots.len(), 1, "got {spots:?}");
         assert_eq!(spots[0].spot_type, SpotType::Beacon);
+    }
+
+    /// MAN-272 D6: the deferred-beacon `Spot` construction site reads its
+    /// track's annotations when the beacon resolves, so a report and a
+    /// `QRL?` decoded after capture but before the close are carried.
+    #[test]
+    fn a_deferred_beacon_spot_carries_its_tracks_annotations() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty(), "should be captured, not yet resolved");
+        let spots = run(&transmission_events(1, &["QRL?", "5NN"], 10_000), &mut v);
+        assert!(spots.is_empty(), "got {spots:?}");
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].callsign, "K5ARH");
+        assert_eq!(spots[0].spot_type, SpotType::Beacon);
+        assert_eq!(spots[0].rst.as_deref(), Some("599"));
+        assert!(spots[0].qrl_query);
     }
 
     #[test]

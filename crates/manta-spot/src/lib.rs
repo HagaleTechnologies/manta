@@ -11,6 +11,7 @@ pub mod decision;
 pub mod dedupe;
 pub mod gate;
 pub mod grammar;
+pub mod message;
 pub mod notch;
 pub mod pattern;
 pub mod reference;

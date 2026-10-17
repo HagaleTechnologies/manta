@@ -182,6 +182,8 @@ mod tests {
             confidence: 0.9,
             track_id: 1,
             sample_ts: 2_006_272,
+            rst: None,
+            qrl_query: false,
         }
     }
 

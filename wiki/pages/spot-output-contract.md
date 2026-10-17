@@ -14,9 +14,10 @@ sources:
   - docs/RUNBOOKS/rbn-comparison.md
   - docs/SPOT-SCHEMA.md
   - docs/DECISIONS/2026-10-14-man137-json-stream-resume.md
+  - docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md
 verified:
-  commit: 9636fe0494b4bce7973c3e0c5ad854f9ebc16f73
-  date: 2026-10-14
+  commit: 799379d
+  date: 2026-10-16
 links:
   - spot-validation
 ---
@@ -31,7 +32,8 @@ manta produces spots on two surfaces: a **telnet DX cluster server** (default :7
 - Gotcha (MAN-87): IAC (telnet option negotiation) is `0xFF`, never valid UTF-8 — a strictly-UTF-8 line reader on the telnet listener rejects any real client that negotiates on connect (Windows `telnet.exe`, PuTTY telnet mode). manta strips and refuses negotiation before UTF-8 validation runs; see `docs/DECISIONS/2026-09-07-man87-telnet-iac-policy.md` for the normative design.
 - What an operator may spell in `station_callsign`/`login_callsign` — including RBN's per-band `CALL-N` SSID, which the de-side identity on both surfaces carries verbatim while the `cty.dat` geography lookup behind `deDxcc`/`deContinent` sees it stripped: `docs/DECISIONS/2026-09-07-man-89-station-callsign-ssid-grammar.md`. That record, not this page, is authoritative for the grammar; the server still appends its own `-#`.
 - Where a JSON spot's `deGrid`/`deLat`/`deLon` come from (MAN-138): the operator's `[server]` location keys, never `cty.dat` — `docs/DECISIONS/2026-10-11-man138-station-location.md` is authoritative.
-- JSON spot schema: **the schema is an ecosystem contract that lives in the `dispensa` repo** (`contracts/spots/spots.v1.schema.json`, ADR-0011 — noted in CLAUDE.md and ARCHITECTURE §7), not solely in this repo. dispensa is private, so the in-repo field reference is `docs/SPOT-SCHEMA.md` (MAN-149), pinned to `SpotMessage` by a unit test; it names the one divergence from the contract (`snrRefHz`). Do not restate fields here.
+- JSON spot schema: **the schema is an ecosystem contract that lives in the `dispensa` repo** (`contracts/spots/spots.v1.schema.json`, ADR-0011 — noted in CLAUDE.md and ARCHITECTURE §7), not solely in this repo. dispensa is private, so the in-repo field reference is `docs/SPOT-SCHEMA.md` (MAN-149), pinned to `SpotMessage` by a unit test; it names the fields manta sends ahead of the contract (`snrRefHz`, `rst`, `qrlQuery`). Do not restate fields here.
+- `rst`/`qrlQuery` (MAN-272): a JSON spot carries its track's latest RST and a `QRL?` flag, ahead of dispensa; the `SPOT:` line shows them, telnet and the uplink never do, and a track merge does not carry them. Normative, with the proposed dispensa fragment: [the MAN-272 decision record](../../docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md).
 - **Unresolvable geography for an allowlisted call**: MAN-28's Watch List allowlist can make the validator emit a spot for a callsign `cty.lookup` can't resolve. `dxContinent`/`dxCqZone` emit out-of-domain sentinels rather than the contract-forbidden `null` (those two fields are required/non-nullable on the wire); `dxLat`/`dxLon` are already nullable and are the contract-legal "unknown" signal. See `docs/DECISIONS/2026-09-04-man45-unresolved-geography-sentinels.md` for the full rationale and the cross-repo question proposed to dispensa.
 - `decoderVersion` is build identity, not decoder output: `manta-<crate version>+<commit>` (MAN-83), the commit as SemVer build metadata. A consumer comparing decoder behaviour across releases compares the part before `+`; the whole string names the exact binary. When decoder output may change between versions is normative in `docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md` (summarised in `CHANGELOG.md`).
 - cqdx is the intended first-class JSON ingest consumer (README "Related projects"); the boundary is referenced across repos, not linked from this wiki.

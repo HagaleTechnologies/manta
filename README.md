@@ -736,7 +736,10 @@ the live-state stream only if it sets `[server].live_port`.
 
 `run` (alias `listen`) prints a `SPOT:` line on stdout for each confirmed
 spot, and decoded text on stderr, one line per track labelled with its track
-number, frequency and speed. With a `[server]` table the decoded text is off
+number, frequency and speed. A `SPOT:` line ends with ` rst=599` when its
+track decoded a signal report and ` QRL?` when the station asked whether the
+frequency is in use; the JSON stream carries both as `rst`/`qrlQuery` (see
+[docs/SPOT-SCHEMA.md](docs/SPOT-SCHEMA.md)). With a `[server]` table the decoded text is off
 unless you pass `--decoded-text`, so a service log holds spots and diagnostics
 only. Startup messages, warnings and errors also go to stderr, so the two
 streams can be captured separately:

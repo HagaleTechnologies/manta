@@ -24,6 +24,12 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-265: a transmission that ends at the speed tracker's warm-up
+  boundary (e.g. a beacon ID or a single exchange) now reports its
+  gap-corrected WPM. The readiness mark's seed was computed before the
+  buffered inter-element gaps were replayed, so short transmissions kept
+  the mark-only estimate; the seed is replaced after the replay, and
+  later live marks keep the same EMA smoothing.
 - MAN-234: an input sample that is NaN, infinite or larger than 1e17 in
   magnitude is replaced with silence and counted instead of ending the run
   (exit 101) or silencing it; clean input decodes byte-identically.
@@ -81,6 +87,12 @@ the git history and `docs/DECISIONS/`.
   take `--input NAME`; `decode` needs `--freq-correction-ppm` when the
   entries' corrections differ. With several inputs `/healthz` stays `ok`
   while one input is healthy. Single-input runs are unchanged.
+- MAN-272: each spot carries its track's latest RST (`5NN` read as `599`)
+  and whether it sent `QRL?`, as CW Skimmer's band map shows. JSON spots
+  gain `rst` (string or `null`) and `qrlQuery` (boolean), `run --json` and
+  `decode --json` spot objects gain `rst`/`qrl_query`, and the `SPOT:` line
+  ends with ` rst=599` and ` QRL?` when present. Telnet and the RBN uplink
+  are unchanged. A track merge does not carry the losing track's values.
 - `manta-linux-x86_64-soapy.tar.gz`, a release archive whose binary has
   SoapySDR input (`--soapy-driver`, for RTL-SDR, Airspy, SDRplay and
   HackRF) for Ubuntu 24.04 x86_64, so those receivers no longer need a
