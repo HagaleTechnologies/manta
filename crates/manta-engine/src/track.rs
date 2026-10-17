@@ -2156,6 +2156,10 @@ impl TrackManager {
                             Some(KeyingEvidence::new(sample_ts, freq_hz, self.hop_counter));
                     } else {
                         track.qualified = true;
+                        // MAN-5: the lease lands mid-signal (promotion sits
+                        // `confirm_hops` into a mark), so the decoder's first
+                        // run is a truncated tail that must not seed its
+                        // speed tracker (see `new_mid_signal`).
                         track.decoder = Some(TrackDecoder::new(id, self.decode_cfg.clone()));
                     }
                     let spectral_ref_power = compute_spectral_ref_power
@@ -2308,7 +2312,15 @@ impl TrackManager {
                         let (promo_ts, promo_freq_hz) = (ev.promo_ts, ev.promo_freq_hz);
                         let freq_hz = track.freq_hz(self.center_freq_hz, spacing, n);
                         track.qualified = true;
-                        let mut decoder = TrackDecoder::new(id, self.decode_cfg.clone());
+                        // MAN-5: the lease replays the input queued since
+                        // promotion, which sat `confirm_hops` into a mark, so
+                        // the decoder's first run is a truncated tail that must
+                        // not seed its speed tracker (see `new_mid_signal`).
+                        // MAN-5: the lease replays the input queued since
+                        // promotion, which sat `confirm_hops` into a mark, so
+                        // the decoder's first run is a truncated tail that must
+                        // not seed its speed tracker (see `new_mid_signal`).
+                        let mut decoder = TrackDecoder::new_mid_signal(id, self.decode_cfg.clone());
                         decoder.set_freq_hz(freq_hz);
                         track.decoder = Some(decoder);
                         promoted_events.push(DecoderEvent::TrackPromoted {

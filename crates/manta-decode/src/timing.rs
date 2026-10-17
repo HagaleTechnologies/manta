@@ -725,11 +725,15 @@ impl GapClassifier {
         } else {
             GapClass::InterWord
         };
+        self.observe(u);
+        class
+    }
+
+    fn observe(&mut self, u: f32) {
         if u >= FARNS_LONG_U {
             self.pair.observe(u);
             self.long_seen += 1;
         }
-        class
     }
 }
 
@@ -1467,7 +1471,6 @@ mod tests {
         assert_eq!(g.classify(3.0 * mu, mu), GapClass::InterChar);
         assert_eq!(g.flush_threshold_dits(3.5), 3.5);
     }
-
     #[test]
     fn unimodal_dah_init_assumes_dahs_not_dits() {
         // Pinned decision 20 fix: a lone ~180 ms cluster (all-dah opener, e.g.

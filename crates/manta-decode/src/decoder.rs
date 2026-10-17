@@ -171,6 +171,11 @@ pub struct TrackDecoder {
     snr_history: VecDeque<(u64, u64, f32)>,
     /// Decode-error counter (aborted garble characters). SPEC §4.4.
     pub garble_count: u32,
+    /// MAN-5: the next run `on_run` sees is left-censored -- it was already
+    /// in progress before this decoder's first sample, so its duration is a
+    /// truncated fragment, not a real element length. Set only by
+    /// `new_mid_signal`; cleared by the first run.
+    lead_run_censored: bool,
     /// SPEC §2.3's floor-based SNR for this track, supplied by the layer
     /// that owns the gate/floor state (`manta-engine`), exactly as
     /// `freq_hz` is. `None` when a `TrackDecoder` is driven standalone
@@ -225,7 +230,26 @@ impl TrackDecoder {
             last_snr: None,
             snr_history: VecDeque::new(),
             garble_count: 0,
+            lead_run_censored: false,
             snr_2500_db: None,
+        }
+    }
+
+    /// A decoder joining a signal already in progress (MAN-5). The engine
+    /// leases a decoder on CANDIDATE -> ACTIVE promotion, which by
+    /// construction lands `confirm_hops` into a mark (SPEC §2.3/§2.4), so
+    /// the demod's first run is the truncated tail of that mark. Fed to the
+    /// speed tracker as one of its 5 init marks, a short tail (e.g. 8 hops
+    /// of a 46-hop dit at 10.1 WPM) becomes the dit centroid: SPEC §4.1's
+    /// ratio constraint then pins mu_dah at 3x that, every real element
+    /// lands above the boundary as a dah, and the stream decodes as T/E
+    /// forever (drift reinit needs 12 same-cluster marks with CV < 0.35,
+    /// which a dit/dah mix never gives). This decoder still assembles that
+    /// first run into its character but keeps it out of speed tracking.
+    pub fn new_mid_signal(track_id: u32, cfg: DecodeConfig) -> Self {
+        TrackDecoder {
+            lead_run_censored: true,
+            ..TrackDecoder::new(track_id, cfg)
         }
     }
 
@@ -748,8 +772,9 @@ impl TrackDecoder {
     }
 
     fn on_run(&mut self, run: Run, events: &mut Vec<DecoderEvent>) {
+        let censored = std::mem::take(&mut self.lead_run_censored);
         if !self.tracker.ready() {
-            if run.mark {
+            if run.mark && !censored {
                 self.tracker.on_mark(run.hops as f32 * HOP_MS as f32);
                 self.sync_sender_regime();
             }
@@ -771,7 +796,7 @@ impl TrackDecoder {
             }
             return;
         }
-        self.process_run(run, true, events);
+        self.process_run(run, !censored, events);
     }
 
     fn process_run(&mut self, run: Run, live: bool, events: &mut Vec<DecoderEvent>) {
@@ -2595,6 +2620,117 @@ mod tests {
         }
         events.extend(dec.finish());
         events
+    }
+
+    fn decode_env(env: &[f32], mut dec: TrackDecoder) -> Vec<DecoderEvent> {
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        events
+    }
+
+    /// MAN-5's shape: a decoder joining mid-mark sees a truncated tail as
+    /// its first run, and the next 4 marks are all dahs ("MM", as in the
+    /// ticket's "GAMMAFOX" scene). 7 hops (just over the 5-hop debounce) of
+    /// a mark, then a word gap, then 25 WPM "MMAFOX GAMMAFOX" (18-hop dits).
+    fn mid_mark_join_envelope() -> Vec<f32> {
+        let mut env = vec![1.0; 7];
+        env.extend(std::iter::repeat_n(0.0, 7 * 18));
+        env.extend(rect_envelope("MMAFOX GAMMAFOX", 18));
+        env
+    }
+
+    #[test]
+    fn censored_lead_tail_poisons_a_from_start_decoder() {
+        // The pre-fix failure mode: as an init mark the 7-hop tail becomes
+        // the dit centroid, mu_dah is clamped to 3x it, and every real
+        // element classifies as a dah.
+        let events = decode_env(
+            &mid_mark_join_envelope(),
+            TrackDecoder::new(1, DecodeConfig::default()),
+        );
+        let text = events_to_text(&events);
+        assert!(!text.contains("GAMMAFOX"), "got {text:?}");
+    }
+
+    #[test]
+    fn mid_signal_decoder_keeps_censored_lead_tail_out_of_speed_tracking() {
+        let events = decode_env(
+            &mid_mark_join_envelope(),
+            TrackDecoder::new_mid_signal(1, DecodeConfig::default()),
+        );
+        // The tail itself still assembles (as the lone dit "E").
+        assert_eq!(events_to_text(&events), "E MMAFOX GAMMAFOX");
+        assert!(events.iter().any(
+            |e| matches!(e, DecoderEvent::SpeedUpdate { wpm, .. } if (*wpm - 25.0).abs() < 3.0)
+        ));
+    }
+
+    #[test]
+    fn early_long_pause_does_not_skew_word_gap_statistics() {
+        // A 2 s pause before the gap classifier's 5-sample bootstrap fills
+        // is caught by the safety-net flush. Fed into the bootstrap at full
+        // length (~42 dits) it would pin the word/char boundary far above
+        // real 7-dit word gaps and merge every later word.
+        let mut env = rect_envelope("CQ CQ", 18);
+        env.extend(std::iter::repeat_n(0.0, 750));
+        env.extend(rect_envelope("CQ DE W1AW W1AW K", 18));
+        let events = decode_env(&env, TrackDecoder::new(1, DecodeConfig::default()));
+        assert_eq!(events_to_text(&events), "CQ CQ CQ DE W1AW W1AW K");
+    }
+
+    #[test]
+    fn mid_signal_decoder_matches_new_when_the_first_run_is_a_space() {
+        // Joining during key-up: the censored first run is a space, which
+        // never feeds the speed tracker anyway, so nothing may change.
+        let mut env = vec![0.0; 30];
+        env.extend(rect_envelope("CQ CQ DE W1AW", 18));
+        let from_start = decode_env(&env, TrackDecoder::new(1, DecodeConfig::default()));
+        let mid_signal = decode_env(
+            &env,
+            TrackDecoder::new_mid_signal(1, DecodeConfig::default()),
+        );
+        assert_eq!(events_to_text(&mid_signal), "CQ CQ DE W1AW");
+        assert_eq!(mid_signal, from_start);
+    }
+
+    /// Codex review, PR #339: a mid-signal decoder on a Farnsworth signal
+    /// whose character gaps sit just over the 7-dit flush (V10's geometry)
+    /// was claimed to starve the gap pair of every high sample -- each
+    /// character gap's post-flush remainder is absorbed into the next mark
+    /// (only the threshold-crossing length is ever recorded) and each word
+    /// gap's remainder surfaces as its own run. Merged with main's
+    /// flush/censoring machinery that lock-in no longer occurs: a word gap
+    /// the safety net cannot take (`word_flushed`/`cur_marks` guard it)
+    /// still closes at full length and reaches `classify`, the pair splits,
+    /// `flush_threshold_dits` scales up, and words reassemble. This pins
+    /// that recovery for a join with no word boundary in the warmup window
+    /// (7 hops before the end of C's first dit): only the first repeat may
+    /// decode as separate characters.
+    #[test]
+    fn mid_signal_marginal_farnsworth_rebuilds_word_boundaries() {
+        // 25 WPM characters at 16.45 WPM effective: dit = 48 ms (18 hops),
+        // ARRL char gap 341 ms (128 hops = 7.1 dits, so the flush fires two
+        // hops early and the next mark absorbs the remainder), word gap
+        // 795 ms (298 hops, remainder surfaces).
+        let rep = "CQ CQ DE W1AW K";
+        let mut full = farnsworth_envelope(&[rep; 6].join(" "), 25.0, 16.45);
+        // Join 7 hops before the end of C's first dit: the warmup window
+        // (5 uncensored marks) spans only C and the start of Q -- no word
+        // boundary ever reaches `classify` during the pending replay.
+        let env: Vec<f32> = full.drain(18 - 7..).collect();
+        let events = decode_env(
+            &env,
+            TrackDecoder::new_mid_signal(1, DecodeConfig::default()),
+        );
+        let text = events_to_text(&events);
+        let settled = [rep; 2].join(" ");
+        assert!(
+            text.ends_with(&settled),
+            "marginal Farnsworth decode never reassembled words: {text:?}"
+        );
     }
 
     fn last_timing(events: &[DecoderEvent]) -> Option<&crate::timing::TimingEstimates> {
