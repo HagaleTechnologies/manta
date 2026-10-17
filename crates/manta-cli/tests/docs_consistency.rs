@@ -2925,7 +2925,7 @@ fn related_projects_page_links_each_alternative_without_capability_claims() {
     for home in [
         "https://www.sparksdr.com/",
         "https://github.com/dividebysandwich/sdroxide",
-        "https://github.com/0xAF/openwebrxplus",
+        "https://github.com/luarvique/openwebrx",
         "https://github.com/luarvique/csdr-skimmer",
         "https://github.com/ftl/sdrainer",
     ] {

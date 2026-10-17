@@ -12,6 +12,7 @@ and [Non-goals](../README.md#non-goals) sections.
   [manual](https://www.sparksdr.com/manual)
 - [sdroxide](https://github.com/dividebysandwich/sdroxide) —
   [user manual](https://github.com/dividebysandwich/sdroxide/blob/main/docs/USER_MANUAL.md)
-- [OpenWebRX+](https://github.com/0xAF/openwebrxplus) /
-  [csdr-skimmer](https://github.com/luarvique/csdr-skimmer)
+- [OpenWebRX+](https://github.com/luarvique/openwebrx) —
+  [documentation](https://fms.komkon.org/OWRX/)
+- [csdr-skimmer](https://github.com/luarvique/csdr-skimmer)
 - [sdrainer](https://github.com/ftl/sdrainer)
