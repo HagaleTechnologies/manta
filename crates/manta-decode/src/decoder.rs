@@ -488,6 +488,47 @@ mod tests {
     }
 
     #[test]
+    fn mid_element_start_on_sparse_dah_text_does_not_grow_with_duration() {
+        // MAN-6 on sparse-dah text: looped "HV" ("H" = 4 dits, "V" = 3
+        // dits + 1 dah -- one dah per 8 marks), started mid-dit: skip 13
+        // leaves a 12-hop = 32 ms fragment, above the 5-hop debounce floor
+        // and large enough to win the bootstrap's largest-ratio-gap split
+        // and isolate itself as the whole dit cluster. Every real mark
+        // then reads as a dah, and the post-lock streak is an ~11:1
+        // dit/dah mixture: CV ~0.47 kept it out of the homogeneous
+        // branch's original CV gate while 1-2 dahs per 12-mark window
+        // could not satisfy the bimodal branch's >= 3-per-side guard, so
+        // before that CV gate was dropped this text garbled forever --
+        // one of the validation round's measured gaps (48/650 attach
+        // phases for "HV" still grew on the shipped branch, identical to
+        // the base). Started on an edge (skip 0), the same scene decodes
+        // perfectly.
+        let decode_reps = |reps: usize| {
+            let text = std::iter::repeat_n("HV", reps)
+                .collect::<Vec<_>>()
+                .join(" ");
+            decode_from_hop(&text, 25, 13).0
+        };
+        let baseline = decode_reps(4);
+        let baseline_t = baseline.chars().filter(|&c| c == 'T').count();
+        let mut long = String::new();
+        for reps in [10usize, 24, 60] {
+            let decoded = decode_reps(reps);
+            let t_count = decoded.chars().filter(|&c| c == 'T').count();
+            assert!(
+                t_count <= baseline_t,
+                "reps {reps}: garbled prefix grew past its fixed size ({t_count} > baseline {baseline_t}) -- {decoded:?}"
+            );
+            long = decoded;
+        }
+        let hv_words = long.split_whitespace().filter(|&w| w == "HV").count();
+        assert!(
+            hv_words >= 50,
+            "recovered decode must read sparse-dah text, word-bounded -- {long:?}"
+        );
+    }
+
+    #[test]
     fn decodes_single_word() {
         let (text, _) = decode("PARIS");
         assert_eq!(text, "PARIS");

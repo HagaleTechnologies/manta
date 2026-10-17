@@ -429,19 +429,23 @@ impl SpeedTracker {
         // MAN-6, homogeneous-text case: the same fabricated leading fragment
         // on all-dit text (e.g. "HH") seeds `mu_dit` from that one sample
         // and `mu_dah` from the real dits, so every real dit classifies as a
-        // dah. The streak below is then homogeneous (CV ~0), which keeps it
-        // out of the bimodal branch underneath, and it sits exactly on
-        // `mu_dah`, which keeps it out of the SPEC rule above. Signature: 12
-        // consecutive dahs while the dit cluster still rests on the single
-        // bootstrap sample that isolated itself, with no mark assigned to it
-        // since. Reinitializing from the ring gives the decode the stream
-        // would have had without that sample (the unimodal init, pinned
-        // decision 20). Cost: an all-dah stream whose dit cluster is that
-        // lone sample (a real opening dit, or a fragment) and which then
-        // sends 16+ consecutive dahs is re-read as dits when its dah is
-        // under DIT_CLAMP_MS.1, the same ambiguity a dit-less opener
-        // already has.
-        if all_dah && cv < DRIFT_CV_MAX && self.lo_uncorroborated {
+        // dah. The streak below then sits exactly on `mu_dah`, which keeps
+        // it out of the SPEC rule above. Signature: 12 consecutive dahs
+        // while the dit cluster still rests on the single bootstrap sample
+        // that isolated itself, with no mark assigned to it since.
+        // Reinitializing from the ring gives the decode the stream would
+        // have had without that sample (the unimodal init, pinned decision
+        // 20). No CV gate, deliberately: on sparse-dah text ("HV"/"HU"/"SV",
+        // one dah per 7-8 marks) the all-dah streak is an ~11:1 dit/dah
+        // mixture with CV ~0.4-0.56 -- past DRIFT_CV_MAX, yet with too few
+        // dahs for the bimodal branch's >= 3-per-side guard below -- so a CV
+        // gate here would leave exactly that class of text locked forever.
+        // Cost: an all-dah stream whose dit cluster is that lone sample (a
+        // real opening dit, or a fragment) and which then sends 16+
+        // consecutive dahs is re-read as dits when its dah is under
+        // DIT_CLAMP_MS.1, the same ambiguity a dit-less opener already
+        // has.
+        if all_dah && self.lo_uncorroborated {
             let durs: Vec<f32> = self.ring.iter().map(|&(d, _, _, _)| d).collect();
             self.pair.reinit_from(&durs);
             self.apply_constraints();
@@ -781,6 +785,40 @@ mod tests {
             "real dits must classify as dits: boundary {}",
             t.boundary_ms()
         );
+    }
+
+    #[test]
+    fn sparse_dah_badlock_recovers() {
+        // MAN-6 on sparse-dah text ("HV"/"HU"/"SV": one dah per 7-8 marks):
+        // the fabricated 32 ms first sample isolates itself as the whole
+        // dit cluster, so every real mark -- dits and the lone dah alike --
+        // reads as a dah. The 12-mark streak is then an ~11:1 dit/dah
+        // mixture: CV ~0.47 puts it past DRIFT_CV_MAX, and 1-2 dahs per
+        // 12-mark window cannot satisfy the bimodal branch's >= 3-per-side
+        // guard, so before the homogeneous branch's CV gate was dropped
+        // neither recovery branch could fire and the lock was permanent.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[32.0, 67.0, 67.0, 67.0, 67.0]);
+        assert!(
+            t.boundary_ms() < 67.0,
+            "bad lock not formed (boundary {})",
+            t.boundary_ms()
+        );
+        // One dah per 8 marks, exactly like looped "HV".
+        for _ in 0..4 {
+            feed(&mut t, &[67.0, 67.0, 67.0, 67.0, 67.0, 67.0, 67.0, 200.0]);
+        }
+        assert!(
+            (t.mu_dit_ms() - 67.0).abs() < 6.0,
+            "mu_dit failed to recover: {}",
+            t.mu_dit_ms()
+        );
+        assert!(
+            67.0 < t.boundary_ms() && t.boundary_ms() < 200.0,
+            "boundary must separate dits from dahs: {}",
+            t.boundary_ms()
+        );
+        assert!(t.take_badlock_recovered());
     }
 
     #[test]

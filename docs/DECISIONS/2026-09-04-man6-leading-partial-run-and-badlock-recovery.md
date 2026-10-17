@@ -1,11 +1,13 @@
 # MAN-6: bimodal bad-lock recovery (leading-partial-run suppression tried and reverted)
 
-**Shipped scope, corrected 2026-09-05 (remediation round):** only Decision 2
-(bad-lock recovery in `SpeedTracker`) and Decision 3 (extending that
-recovery to `GapClassifier`) are in the code. Decision 1
+**Shipped scope, corrected 2026-09-05 (remediation round):** Decisions 2
+(bimodal bad-lock recovery in `SpeedTracker`), 3 (extending that
+recovery to `GapClassifier`) and 4 (lone-sample bad-lock recovery for
+all-dit and sparse-dah text) are in the code. Decision 1
 (leading-partial-run suppression in `Demod`) was implemented, found to
 regress golden V1/V10, and reverted before merge — see its section below,
-which this doc previously (incorrectly) described as shipped. `docs/SPEC-decode-core.md`
+which this doc previously (incorrectly) described as shipped.
+`docs/SPEC-decode-core.md`
 §3.4 and `crates/manta-engine/tests/roundtrip_iq.rs` were correct about the
 revert throughout; only this document had drifted from the code.
 
@@ -180,10 +182,13 @@ of ≈ 1.94 — below the 2.2 floor — so the guard correctly declines to fire.
 
 **Convergence bound:** worst case the tracker spends `DRIFT_LEN = 12` marks
 in the bad state before the ring fills, then recovers. At 18 WPM that is
-under 2 seconds. The ticket's criterion (error stabilizes rather than
-grows) holds by construction for any text whose post-lock streak mixes dits
-and dahs, independent of the specific repro tuple. It does **not** cover
-homogeneous text, where the streak's CV is ~0; Decision 4 covers that case.
+under 2 seconds. Within a 12-mark window this branch needs both populations
+to have ≥ 3 members, so it covers any text whose post-lock streak mixes
+dits and dahs densely enough for that (corrected 2026-10-17: the previous
+text claimed coverage of *any* mixed text "by construction", which the
+validation round measured to be false for sparse-dah text — one dah per
+7–8 marks, e.g. looped `"HV"`/`"HU"`/`"SV"`, whose 12-mark windows hold
+only 1–2 dahs). Sparser streaks are Decision 4's cases.
 
 See `docs/SPEC-decode-core.md` §4.1's amendment for the normative statement.
 
@@ -241,8 +246,9 @@ repetitions. Started on an edge, the same scene decodes perfectly.
 put in `lo` (`lo_n`). `SpeedTracker` sets `lo_uncorroborated` when that is
 exactly 1, and clears it on the first post-bootstrap mark assigned to the
 dit cluster or on any reinit. A third `check_drift` branch fires when 12
-consecutive marks are all dahs, their CV is < 0.35, the SPEC rule did not
-fire, and `lo_uncorroborated` is still set. It reinitializes from those 12
+consecutive marks are all dahs, the SPEC rule did not fire, and
+`lo_uncorroborated` is still set — with **no CV gate** (dropped 2026-10-17,
+see the correction below). It reinitializes from those 12
 marks and sets `badlock_recovered` (Decision 3's `GapClassifier` reset). A
 homogeneous 12-mark ring goes through `ClusterPair::initialize`'s unimodal
 branch, so the result is the decode the stream would have had without the
@@ -270,6 +276,42 @@ and any lock bootstrapped from two or more dits, are never touched
 neither fired on any golden vector (V1, V3, V4, V7, V8, V9, V10), while the
 probe logged the bimodal branch on the engine MAN-6 regression test.
 
+**CV gate dropped, 2026-10-17 (validate-attempt-19 remediation).** The
+validation round measured that this branch's original `cv < 0.35` gate left
+sparse-dah text locked forever: on looped `"HV"`/`"HU"`/`"SV"` (one dah per
+7–8 marks) the all-dah streak is an ~11:1 dit/dah mixture with CV ≈
+0.39–0.56 — past `DRIFT_CV_MAX`, yet with only 1–2 dahs per 12-mark window
+it cannot satisfy Decision 2's ≥ 3-per-side guard either. Hermetically
+(zero noise, attach hop swept over a full word period), 48/650 (`"HV"`),
+40/600 (`"HU"`) and 40/600 (`"SV"`) attach phases still produced a growing
+garble on the branch, identical to the base. Dropping the CV term — the
+branch now reads `all_dah && lo_uncorroborated` — takes all nine measured
+texts to **0** growing phases (re-verified after the edit: AU 0/550, HH
+0/600, 5 0/400, B 0/400, CQ 0/850, K7X 0/1150, HV 0/650, HU 0/600, SV
+0/600) and recovers through the full pipeline at the ticket's own
+18.117826 WPM / −20 kHz / 28.04 dB for HV seeds 1 and 8675309 and HU seed 1
+(bounded prefix, then word-bounded `"HV"`/`"HU"` output). Regression tests:
+`timing.rs`'s `sparse_dah_badlock_recovers` and `decoder.rs`'s
+`mid_element_start_on_sparse_dah_text_does_not_grow_with_duration` (looped
+`"HV"`, attach skip 13, red before the edit, green after).
+
+**Known residual (recorded for the follow-up, not fixed here): HV seed 7.**
+Through the full pipeline at the same tuple, `noise_seed = 7` still
+produces the persistent `"EIT TTTT TTTT …"` stream (bad tokens 43 → 99 from
+12 s to 24 s, zero clean words). Instrumented diagnosis: its bootstrap is
+*not* the lone-sample lock — the split isolated **three** crumb-sized
+samples (`lo_n = 3`, `lo ≈ 21 ms`; the ratio constraint then re-anchors
+`μ_dah = 3·μ_dit`, boundary ≈ 37 ms), so
+`lo_uncorroborated` is legitimately never set and this branch's signature
+does not apply. Widening the trigger to any never-corroborated `lo` would
+break the deliberate safety property that a lock bootstrapped from several
+real dits is never touched (`healthy_lock_survives_long_dah_run`,
+`corroborated_singleton_dit_does_not_trigger_homogeneous_recovery`): the
+seed-7 marks sit only ~4× above its crumb `lo` while healthy dahs sit at
+the nominal 3× above a real `lo`, so no ratio-style gate separates them
+without gap evidence or an absolute-duration prior that `SpeedTracker`
+does not have. Needs its own design; filed with this evidence.
+
 ## Alternatives considered and rejected
 
 1. **Lloyd's 2-means refinement** (seed at min/max, iterate) instead of the
@@ -277,11 +319,13 @@ probe logged the bimodal branch on the engine MAN-6 regression test.
    iterating does rescue the worked example (`μ_dit = 54.7`, `μ_dah = 200`,
    boundary 104.6, which classifies correctly). **Rejected** for this
    ticket because it changes the bootstrap split for *every* decode,
-   including all ten golden vectors, for a robustness gain Decisions 1 and
-   2 already deliver at far smaller blast radius. Recorded here as a
-   follow-up if the bad-lock recovery branch is ever observed to fire in
-   production telemetry (it should be rare: Decision 1 already removes the
-   one concrete trigger found).
+   including all ten golden vectors, for a robustness gain Decisions 2
+   and 4 already deliver at far smaller blast radius. Recorded here as a
+   follow-up if the bad-lock recovery branches are ever observed to leave
+   a residual lock in production telemetry (they do bound the one concrete
+   trigger found to a fixed-size prefix, but the crumb-cluster variant
+   above shows the bound is not total — Lloyd-style outlier resistance at
+   the bootstrap itself would close that class).
 2. **Raising the 5-mark bootstrap quorum to SPEC §9's nominal `min_count =
    8`.** Rejected: with 8 samples the corrupted seed
    `[F, 84, 217, 84, 84, 217, 84, 84]` still sorts to `[F, 84×5, 217×2]` and
@@ -324,9 +368,10 @@ probe logged the bimodal branch on the engine MAN-6 regression test.
   `jittery_single_cluster_does_not_trigger_badlock_recovery`.
 - `crates/manta-engine/tests/regression_man6_persistent_garble.rs` (new):
   the ticket's real tuple through the full channelizer + detector + track
-  pool + decoder, plus a 6-case deterministic sweep across MAN-6's
+  pool + decoder, plus a 3-case deterministic sweep across MAN-6's
   parameter region (excluding `offset_hz == 0` and the #22 WPM band by
-  construction).
+  construction; three further cases from the plan's original six were
+  removed per its pre-decided policy — see the sweep test's doc comment).
 - `crates/manta-engine/tests/roundtrip_iq.rs`: doc comment records #23/MAN-6
   as **mitigated** (bounded, non-growing garble; not eliminated — Decision 1
   was reverted), distinct from the still-open #12/#22.
@@ -349,15 +394,17 @@ threshold numbers it was used to justify in
 **Full workspace, real `cargo` invocations, this round:**
 
 - `cargo test --workspace --offline --no-fail-fast`: **all green**, zero
-  failures — `manta-decode` 47, `manta-dsp` 46 (+1 ignored),
+  failures — `manta-decode` (54 tests as of 2026-10-17; this section's
+  original run had 47, later rounds added the Decision 4 and sparse-dah
+  tests), `manta-dsp` 46 (+1 ignored),
   `manta-engine` 22 unit + goldens (V1 1, V2/V3 2, V7/V9/V10 3, V8 1) + the
   two MAN-6 regression tests + `chunking_determinism` +
   `channelizer_chunking_determinism` + `channelizer_multisignal` 3 +
   `roundtrip_envelope` 1 (`roundtrip_iq` correctly `#[ignore]`d), plus
   `manta-cli`, `manta-input`, `manta-server`, `manta-spot`, `manta-testkit`
   in full (including `golden_v11_v15`/`golden_v16_v17`). No golden vector
-  regressed — Decision 3 only executes on the bimodal bad-lock branch,
-  which none of the golden vectors trigger.
+  regressed — Decision 3 only executes on the bad-lock recovery branches
+  (bimodal or lone-sample), which none of the golden vectors trigger.
 - `cargo clippy --workspace --all-targets --offline -- -D warnings`: clean.
 - `cargo fmt --all --check`: clean (after this round fixed one pre-existing
   diff in `envelope.rs` and one introduced by this round's own test edits

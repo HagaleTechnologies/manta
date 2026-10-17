@@ -321,14 +321,21 @@ inter-character indefinitely, even after this reinitialization corrects
 `μ_dit`/`μ_dah`. See
 `docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md`.
 
-**[DEVIATION — added]** A third trigger covers the homogeneous case neither
-rule above can see: if 12 consecutive marks all assign to the dah cluster
-*and* their coefficient of variation is < 0.35 (and the regime-change rule
-did not fire) *and* the dit cluster still rests on the single bootstrap mark
-the 5-mark split isolated, with no later mark assigned to it, reinitialize
-from those 12 marks and reset the gap classifier as above. This is the same
-fabricated-fragment lock on all-dit text, whose streak has no spread for the
-bimodal trigger to detect.
+**[DEVIATION — added]** A third trigger covers the cases neither rule above
+can see: if 12 consecutive marks all assign to the dah cluster *and* the
+regime-change rule did not fire *and* the dit cluster still rests on the
+single bootstrap mark the 5-mark split isolated, with no later mark assigned
+to it, reinitialize from those 12 marks and reset the gap classifier as
+above. This is the same fabricated-fragment lock on all-dit text (whose
+streak has no spread for the bimodal trigger to detect) and on sparse-dah
+text — one dah per ~7–8 marks, whose streak's coefficient of variation
+lands past 0.35 while its 1–2 dahs cannot satisfy the second trigger's
+≥ 3-per-side guard — so it is deliberately **not** gated on the streak's
+coefficient of variation. Known residual, deliberately out of reach of this
+trigger: a bootstrap whose split isolates *several* crumb-sized marks (not
+the lone sample) forms the same bad lock without the lone-sample
+signature; see Decision 4 in
+`docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md`.
 
 ### 4.2 Gap classification (spaces)
 

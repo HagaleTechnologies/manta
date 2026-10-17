@@ -145,7 +145,8 @@ proptest! {
         // repetition(s) played during warmup+confirm are structurally lost.
         // This tolerance is aspirational pending issues #12/#22 above -- it
         // holds for the ordinary warmup-floor-only cases and for #23/MAN-6
-        // (fixed) but this test stays `#[ignore]`d because of the two
+        // (mitigated: bounded, non-growing garble, per the decisions doc)
+        // but this test stays `#[ignore]`d because of the two
         // remaining real-bug cases that violate it regardless of tolerance.
         prop_assert!(
             cer(&texts[0], &report.text) < 0.25,
