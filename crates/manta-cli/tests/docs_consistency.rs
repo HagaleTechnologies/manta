@@ -1524,6 +1524,27 @@ fn docs_describe_the_separate_metrics_bind_addr() {
     }
 }
 
+/// MAN-273: METRICS.md's Hilbert fan-out for `manta_input_bad_samples_total`
+/// is what the live-audio transformer does to one NaN source sample: a bad
+/// imaginary part on every nonzero tap, plus the delay-matched real part.
+#[test]
+fn metrics_states_the_live_hilbert_bad_sample_fan_out() {
+    let mut hilbert = manta_dsp::hilbert::HilbertTransformer::new();
+    let mut x = vec![0.0f32; 4 * manta_dsp::hilbert::HILBERT_TAPS];
+    x[0] = f32::NAN;
+    let fan_out = hilbert
+        .process(&x)
+        .iter()
+        .filter(|z| !z.re.is_finite() || !z.im.is_finite())
+        .count();
+    let metrics = squash_whitespace(&doc("docs/METRICS.md"));
+    let claim = format!("about {fan_out} through a sound card's Hilbert filter");
+    assert!(
+        metrics.contains(&claim),
+        "docs/METRICS.md must say {claim:?}"
+    );
+}
+
 /// MAN-116: the README and ARCHITECTURE name the sensitivity benchmark so a
 /// reader can find how a sensitivity claim was produced.
 #[test]
