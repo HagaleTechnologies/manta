@@ -217,7 +217,9 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `password` | `""` | live: `type = "kiwi"` | KiwiSDR password; empty for a public receiver. `config check` prints only whether it is set. `--kiwi-password` overrides it. |
 | `driver` | none; example `"driver=rtlsdr"`; required for soapy | live: `type = "soapy"` (needs the build feature) | SoapySDR device arguments. `--soapy-driver` overrides it. |
 | `gain_db` | none; example `30.0`; unset uses the device's automatic gain | live: `type = "soapy"` (needs the build feature) | Receiver gain, dB. `--soapy-gain` overrides it. |
-| `freq_hz` | none; example `7030000.0`; required for kiwi, soapy and hpsdr | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"` | Receiver centre frequency, Hz. `--kiwi-freq-hz`, `--soapy-freq-hz` or `--hpsdr-freq-hz` overrides it. |
+| `freq_hz` | none; example `7030000.0`; required for kiwi, soapy and hpsdr unless `bands` is set | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"` | Receiver centre frequency, Hz. `--kiwi-freq-hz`, `--soapy-freq-hz` or `--hpsdr-freq-hz` overrides it. |
+| `bands` | none; example `["40m"]`; set instead of `freq_hz` | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"`; restart required | `"all"`, band names such as `"40m"`, or centre frequencies in kHz such as `"7030"` (a string, a number or a list of them). manta plans one stream per slice of each band's CW segment and runs each as an input. See [Band plans: bands](#band-plans-bands) (MAN-310). |
+| `tuning_range_hz` | `[0.0, 30000000.0]`; only with `bands` | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"`; restart required | The receiver's tuning range, `[low, high]` in Hz. A band outside it is skipped and a band partly outside it is clipped, each with a note. See [Band plans: bands](#band-plans-bands). |
 | `rate_hz` | none; example `192000.0`; required for soapy and hpsdr | live: `type = "soapy"` or `"hpsdr"` | Sample rate, Hz. `--soapy-rate-hz` or `--hpsdr-rate-hz` overrides it. |
 | `group` | none; example `"239.101.6.1"`; required for ka9q | live: `type = "ka9q"` | Multicast data group of one ka9q-radio (radiod) IQ channel: an IPv4 multicast address, or the name in the channel's `data =` line, resolved by the system resolver when the source opens. Checked when the file loads; an IPv6 group is refused. manta reads the channel's sample rate, encoding and frequency from radiod's status packets. `--ka9q-group` overrides it. |
 | `ssrc` | none; example `14100000`; unset reads the group's only channel | live: `type = "ka9q"` | SSRC of the channel to read, 0 to 4294967295; needed only when the group carries more than one channel. `--ka9q-ssrc` overrides it. |
@@ -226,6 +228,89 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `center_freq_hz` | none; example `14030000.0`; unset leaves frequencies as audio offsets, and `run` with `[server]` refuses a source that carries no frequency of its own | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Your radio's dial frequency, Hz, for a source that carries none. `--dial-freq-hz` overrides it. |
 | `capture_rate_hz` | none; example `48000.0`; unset decodes at the receiver's own rate | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Decimated sample rate, Hz. It must be at least 1000 (checked before the receiver opens), divide the receiver's rate by a power of two, and be 93.75 Hz (the channel spacing) times a power of two of at least 4, so in practice 1500, 3000, 6000, 12000, 24000, 48000, 96000 and so on. A rate that divides evenly but fails the last rule, such as 50000 from a 100 kS/s receiver, is rejected at startup. The decimator's transition band (the outer ~9.4% of each side, 24 of 256 channels at 48 kS/s — beyond the <= 1 dB point at 0.4526 x the rate) is not usable: the reported passband, `manta check`, SETT segments and tracked channels stop at the trusted band, and `run`/`soak` say so in one startup line naming the source's intersected passband. `--capture-rate-hz` overrides it. |
 | `replay_epoch` | none; example `1700000000`; unset uses the file's modification time | live: `run` with `[server]` and a file source; ignored elsewhere | Unix seconds that the recording's first sample stands for. `--replay-epoch` overrides it. |
+
+### Band plans: bands
+
+`bands` names what a receiver skims instead of one centre (MAN-310). Write
+`"all"`, band names, or centre frequencies in kHz:
+
+```toml
+[input]
+type = "kiwi"
+host = "kiwi.example.net"
+bands = ["60m"]            # or "all", ["40m", "20m"], "7030", 7030
+#tuning_range_hz = [3000000.0, 30000000.0]
+```
+
+The band table below is the one manta uses (`manta_server::band_plan::CW_SEGMENTS`;
+a test holds the two equal). Each band's skimmed span runs from the bottom
+of its CW segment up to the higher of the segment's top and its NCDXF/IARU
+beacon. The segment limits are not configurable.
+
+| band | CW segment, kHz | NCDXF beacon, kHz | skimmed span, kHz |
+|---|---|---|---|
+| 160m | 1810–1840 | – | 1810–1840 |
+| 80m | 3500–3580 | – | 3500–3580 |
+| 60m | 5351.5–5366.5 | – | 5351.5–5366.5 |
+| 40m | 7000–7040 | – | 7000–7040 |
+| 30m | 10100–10130 | – | 10100–10130 |
+| 20m | 14000–14070 | 14100 | 14000–14100 |
+| 17m | 18068–18095 | 18110 | 18068–18110 |
+| 15m | 21000–21070 | 21150 | 21000–21150 |
+| 12m | 24890–24915 | 24930 | 24890–24930 |
+| 10m | 28000–28070 | 28200 | 28000–28200 |
+
+How a plan is made:
+
+- **Width.** One stream skims 2 × 0.4526 × its width: the decimator's
+  <= 1 dB band. The width is one KiwiSDR channel (10 kHz) for kiwi, and
+  `rate_hz` for soapy and hpsdr, capped by `capture_rate_hz` when set. A
+  96000 Hz stream skims 86.899 kHz.
+- **Split.** A span wider than that is cut into equal slices, one stream
+  each, centred on whole Hz. `"all"` on a 0 to 30 MHz receiver is 14
+  streams at 96 kS/s, 11 at 192 kS/s and 20 at 48 kS/s.
+- **Ownership.** Streams whose bands overlap split the overlap at the
+  midpoint of their centres: each starts new tracks only on its own side,
+  plus one channel (93.75 Hz). A signal in the overlap is decoded by the
+  nearer stream; within one channel of the split both may decode it, and
+  the cross-input dedupe spots it once. A running track is never stopped.
+- **Tuning range.** A band outside `tuning_range_hz` is skipped, a band
+  partly outside it is clipped, and a bare centre outside it is skipped,
+  each with a note. Nothing left to skim is an error.
+- **Repeats.** A band listed twice, a band `"all"` already includes, or a
+  bare centre inside a listed band is refused.
+
+**Names.** A plan of one stream keeps the entry's name (`[input]`'s is its
+type). Several streams are named `<entry>-<label>`: `kiwi-60m-1`,
+`kiwi-60m-2`, `kiwi-7030`. Each is an ordinary input: its own `/healthz`
+line, metric series and `--input` name. `calibrate --input kiwi-60m-1`
+saves into the entry the stream came from, so one measurement corrects
+every stream of that receiver.
+
+**Capacity.** A kiwi entry opens one KiwiSDR channel per stream, within the
+receiver's free channels. An hpsdr or soapy entry opens one stream; a plan
+that needs more is refused naming it (several receivers on one HPSDR radio
+is MAN-307). All inputs together stay within manta's 16. ka9q, file and
+audio inputs do not take `bands`.
+
+**CPU.** Each stream is one input thread with its own channelizer. At one
+Raspberry Pi 4 core per 192 kS/s stream, 14 streams at 96 kS/s need about
+seven cores.
+
+**Environment.** `MANTA_INPUT_BANDS=all`, `MANTA_INPUT_BANDS=7030` or
+`MANTA_INPUT_BANDS='["40m","20m"]'`.
+
+`config check` and `run` print the plan and every skipped or clipped band
+as notes before their output:
+
+```text
+note: [input]: bands = ["160m", "60m"] plans 2 streams: 60m (2)
+note: [input]: 160m skipped: 1810 to 1840 kHz is outside the receiver's tuning range, 3000 to 30000 kHz
+```
+
+`run` logs, for each stream of a split, where it starts new tracks:
+`input kiwi-60m-1: new tracks start only from 5350.25 to 5359.094 kHz; the
+rest of its passband is nearer another stream's centre`.
 
 ### Several receivers: [[input]]
 

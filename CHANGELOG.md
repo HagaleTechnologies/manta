@@ -80,6 +80,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-310: `[input].bands` (`"all"`, band names or centre frequencies in
+  kHz) plans a receiver's streams from the standard CW segments, 160
+  through 10 m with 60 m and the NCDXF beacons. `tuning_range_hz` drops
+  bands the receiver cannot tune, and a band wider than one stream is
+  split, each stream starting tracks only on its own side of the split.
+  Several KiwiSDR sessions to one receiver now open side by side. See
+  [docs/DECISIONS/2026-10-17-man310-band-plan.md](docs/DECISIONS/2026-10-17-man310-band-plan.md).
+
 - MAN-13: one `manta run` decodes several receivers into one spot output.
   Write `[[input]]` once per receiver (each with a `name`); every input
   decodes on its own thread into one shared validator, so a station two

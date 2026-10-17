@@ -678,8 +678,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   Unknown tables, keys and `MANTA_*` variables
   are errors. `docs/CONFIG.md` is the per-key reference (default, and
   which commands and engines each key affects); `docs/SPEC-decode-core.md`
-  §9 stays normative for the decode-core defaults. Not yet
-  configurable: a band plan (CW segment limits) and the
+  §9 stays normative for the decode-core defaults. A band plan:
+  `[input].bands` expands to streams over
+  `manta_server::band_plan::CW_SEGMENTS` (MAN-310); the segment limits
+  themselves are not configurable, nor are the
   compile-time constants SPEC §9 marks `not configurable yet`.
   `manta config check` runs `run`'s config pipeline up to its first source
   I/O (load, environment overlay, source resolution, blocklist/notch

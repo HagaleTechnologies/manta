@@ -299,7 +299,7 @@ States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`.
 
 | Transition | Condition |
 |---|---|
-| IDLE → CANDIDATE | rise condition first met on channel `k`, `k` is not owned by an existing track (§2.5), `k` is not RTTY-vetoed (§2.6), no static crash is being suppressed this hop (§2.7), `k` is not inside a co-modulation span (§2.8), and `k`'s centre is not outside the source's trusted band when one was supplied (§1.5, MAN-196) |
+| IDLE → CANDIDATE | rise condition first met on channel `k`, `k` is not owned by an existing track (§2.5), `k` is not RTTY-vetoed (§2.6), no static crash is being suppressed this hop (§2.7), `k` is not inside a co-modulation span (§2.8), and `k`'s centre is not outside the source's trusted band when one was supplied (§1.5, MAN-196), or outside the input's spawn band (MAN-310) |
 | CANDIDATE → ACTIVE | rise sustained 19 hops → lease decoder from pool; with `non_cw_filter` on, the lease waits for qualification (below, §2.8) |
 | CANDIDATE → IDLE | rise condition lost before 19 hops |
 | ACTIVE → HANG | drop condition met (below off threshold) |
@@ -348,6 +348,12 @@ track back to ACTIVE.
   cannot route around the veto. Spawns only: a track that already exists
   on an untrusted channel is never closed or de-weighted by it (MAN-196,
   the MAN-314 spawns-only lesson).
+- A channel whose centre lies outside the input's spawn band, when one was
+  supplied, may not start a spawn decision, in the same slots as the
+  trusted-band veto. Only the streams of one split band plan carry a spawn
+  band (MAN-310): from the midpoint with the lower sibling's centre minus
+  one channel spacing to the midpoint with the upper sibling's plus one,
+  intersected with the trusted band. Spawns only.
 - A spawn decision at `k` is additionally rejected while *any* channel of
   the prospective ownership window `{k−1, k, k+1}` (neighbours wrap) is
   still serving a post-`Silent` respawn cooldown (§9's
