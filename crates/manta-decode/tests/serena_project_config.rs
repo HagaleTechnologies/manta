@@ -7,7 +7,8 @@
 //! It checks that the config exists, names this repo, spells every field
 //! Serena would otherwise backfill (a backfill re-saves the file and drops its
 //! comments), runs no activation command, keeps the load-bearing ignores, hides
-//! no workspace `.rs` file from the index, and ships the `codebase_map` memory.
+//! no workspace `.rs` file from the index (rejecting ignore syntax its matcher
+//! cannot evaluate), and ships the `codebase_map` memory.
 //!
 //! CI runs `cargo test --workspace` on every PR with no paths filter, so this
 //! is regression insurance, not what makes CI run on a `.serena/`-only change.
@@ -214,7 +215,11 @@ fn workspace_members() -> Vec<String> {
 }
 
 /// Matches one gitignore pattern segment (`*` never crosses a `/`) against one
-/// path segment.
+/// path segment. `*` is the only wildcard evaluated: gitignore's `?`, `[...]`
+/// character classes, `\` escapes and `!` negation are treated as literal
+/// bytes here while Serena's matcher evaluates them, so
+/// `ignored_paths_use_only_glob_syntax_the_guard_evaluates` rejects any
+/// `ignored_paths` entry that uses them.
 fn segment_matches(pattern: &[u8], segment: &[u8]) -> bool {
     match (pattern.first(), segment.first()) {
         (None, None) => true,
@@ -387,6 +392,28 @@ fn no_ignored_path_hides_a_workspace_rust_file() {
                     "ignored_paths entry {pattern:?} hides workspace source file {source}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn ignored_paths_use_only_glob_syntax_the_guard_evaluates() {
+    // Serena matches `ignored_paths` with gitignore/pathspec semantics, but
+    // `segment_matches` above evaluates `*` (and `**`) only. An entry like
+    // "/crates/manta-?sp" hides all of crates/manta-dsp from Serena's index
+    // (verified with `git check-ignore`), yet the literal-byte matcher leaves
+    // `no_ignored_path_hides_a_workspace_rust_file` green. Reject such
+    // entries here so the guard fails loudly instead of silently approving
+    // a broken index.
+    let cfg = project_yml();
+    for pattern in cfg.list("ignored_paths") {
+        for unsupported in ['?', '[', '\\', '!'] {
+            assert!(
+                !pattern.contains(unsupported),
+                "ignored_paths entry {pattern:?} uses {unsupported:?}, gitignore syntax this \
+                 guard's matcher evaluates as a literal byte while Serena matches it as a \
+                 wildcard; extend segment_matches or reword the entry"
+            );
         }
     }
 }
