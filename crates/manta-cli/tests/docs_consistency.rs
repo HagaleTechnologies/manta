@@ -2899,7 +2899,6 @@ fn spec_section_5_track_closed_names_its_closure_kinds() {
     }
 }
 
-<<<<<<< HEAD
 // ---- MAN-155 (scoped by the MAN-360 decision, option B): a neutral
 // related-projects page, links only ----
 
@@ -2959,7 +2958,9 @@ fn related_projects_page_links_each_alternative_without_capability_claims() {
             .iter()
             .any(|t| t == "COMPARISON.md"),
         "{DOCS_INDEX} does not link COMPARISON.md"
-=======
+    );
+}
+
 /// MAN-13: one daemon reads several receivers, so ARCHITECTURE no longer
 /// prescribes one daemon per band, and ROADMAP's post-1.0 list no longer
 /// offers multi-SDR orchestration as future work.
@@ -2987,7 +2988,6 @@ fn architecture_no_longer_says_one_daemon_per_band() {
     assert!(
         roadmap.contains("delivered by\n  MAN-13"),
         "ROADMAP.md must record MAN-13 as delivering it"
->>>>>>> 3c14f9b83593c0a253bc1afd6e57623d767a417a
     );
 }
 
