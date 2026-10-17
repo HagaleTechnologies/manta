@@ -86,6 +86,18 @@ starts on (the MAN-166 note in `DetectorConfig`'s `Default` doc), so the
 wake rule matches a fresh candidate's 19-hop confirmation; with it every
 scene's text equals today's fragmented decode, under one `track_id`.
 Hops without a rise reset the wake count, as they end a candidate.
+Review round 1 (PR #344) added the candidate's crash rule too: on a hop
+where MAN-312 suppresses a static crash, the gate's EMA is held, so the
+`rise` such a hop reports is not evidence the signal returned. The wake
+confirmation freezes there (neither advancing nor resetting) while the
+`reacquire_ms` window itself keeps aging, exactly as a CANDIDATE's confirm
+window freezes while a HANG track's hang timer runs
+(`suppressed_crash_cannot_finish_dormant_wake_confirmation` and
+`suppressed_crash_still_ages_the_dormant_expiry`). Without the freeze, a
+crash that peaked on the dormant track's channel could complete the wake
+after the signal had already disappeared and hand the fresh decoder the
+crash itself (`go_dormant` clears `clean_hist`, so no pre-crash samples
+were left to substitute).
 
 ### D3. Default on, at 10 s
 

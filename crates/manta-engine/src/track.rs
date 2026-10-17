@@ -440,6 +440,22 @@ impl Lifecycle {
         self.silent_count = 0;
     }
 
+    /// MAN-312 + MAN-108 (SPEC §2.4/§2.7): one suppressed-crash hop for a
+    /// DORMANT track. The gate's EMA is held through a static crash, so
+    /// this hop's `rise` is not evidence the signal came back: the wake
+    /// confirmation holds, neither advancing nor resetting, exactly as a
+    /// CANDIDATE's confirm window freezes on the same hops. The expiry
+    /// timer keeps aging -- a HANG track's hang timer runs on held hops
+    /// too -- so a crash cannot stretch the re-acquisition window either.
+    pub(crate) fn age_dormant(&mut self) -> LifecycleEvent {
+        debug_assert_eq!(self.state, LifecycleState::Dormant);
+        self.dormant_count += 1;
+        if self.dormant_count >= self.reacquire_hops {
+            return LifecycleEvent::Closed(CloseReason::HangExpired);
+        }
+        LifecycleEvent::None
+    }
+
     /// Advance one hop. `rise`/`drop` are this hop's gate booleans for the
     /// channel currently feeding this track (its owned max-power channel,
     /// per SPEC §2.5). `char_emitted` marks whether a character was decoded
@@ -2229,8 +2245,16 @@ impl TrackManager {
                                       // MAN-312: a CANDIDATE's confirm window is frozen through a
                                       // crash rather than counted for or against it; ACTIVE/HANG
                                       // tracks step on the held rise/drop so their hang timers run.
-            let mut event = if suppress && prev_state == LifecycleState::Candidate {
-                LifecycleEvent::None
+                                      // MAN-108 (review round 1, PR #344): a DORMANT track's wake
+                                      // confirmation freezes the same way -- the held `rise` is not
+                                      // evidence the signal returned -- while its expiry timer keeps
+                                      // aging (`Lifecycle::age_dormant`), as a HANG track's does.
+            let mut event = if suppress {
+                match prev_state {
+                    LifecycleState::Candidate => LifecycleEvent::None,
+                    LifecycleState::Dormant => track.lifecycle.age_dormant(),
+                    _ => track.lifecycle.on_hop(rise[k], drop[k], char_emitted),
+                }
             } else {
                 track.lifecycle.on_hop(rise[k], drop[k], char_emitted)
             };
@@ -7854,5 +7878,133 @@ mod tests {
         );
         assert_eq!(crash_live_channels(96_000.0, (-5000.0, 5000.0)), 105);
         assert_eq!(crash_live_channels(96_000.0, (-48_000.0, 48_000.0)), 1024);
+    }
+
+    // ---- MAN-108 review round 1 (PR #344): DORMANT vs MAN-312's
+    // suppressed static crashes ----
+
+    /// The static-crash detector arms on `CRASH_MIN_LIVE_CHANNELS` (96)
+    /// live channels; the 64-channel `NC_N` harness cannot fire one, so
+    /// these tests run a 128-channel manager.
+    const SC_N: usize = 128;
+
+    /// A band-wide static crash: every channel lifted `db` over the
+    /// -90 dBFS quiet floor, peaking `peak_extra_db` higher on `peak_ch`
+    /// (a real crash's channelizer smear peaks somewhere; here it lands
+    /// on the tracked channel, so the dormant track's max-power
+    /// selection keeps reading it).
+    fn sc_crash(db: f32, peak_ch: usize, peak_extra_db: f32) -> Vec<f32> {
+        let mut p = vec![1e-9 * 10f32.powf(db / 10.0); SC_N];
+        p[peak_ch] *= 10f32.powf(peak_extra_db / 10.0);
+        p
+    }
+
+    /// The quiet floor with a +30 dB tone on channel 10.
+    fn sc_tone() -> Vec<f32> {
+        let mut p = quiet_power(SC_N);
+        p[10] = nc_db(30.0);
+        p
+    }
+
+    /// A promoted, qualified track on channel 10 (non-CW filter off, RTTY
+    /// filter off -- pure lifecycle), latched `reacquirable` by hand (this
+    /// step-only harness decodes nothing, like
+    /// `woken_track_is_not_closed_unkeyed_immediately`), then faded quiet
+    /// for `quiet_hops` hops so it sits DORMANT.
+    fn sc_dormant_track(cfg: &DetectorConfig, quiet_hops: u64) -> (TrackManager, u32) {
+        let mut tm = TrackManager::new(SC_N, 96_000.0, 14_000_000.0, *cfg, DecodeConfig::default());
+        feed_warmup(&mut tm, SC_N);
+        let mut id = None;
+        for i in 0..60 {
+            let m = 250 * 15 + i;
+            let (_, promoted, _) = tm.step_hop(&hop(m, sc_tone()), m);
+            if let Some(DecoderEvent::TrackPromoted { track_id, .. }) = promoted.first() {
+                id = Some(*track_id);
+            }
+        }
+        let id = id.expect("the tone never promoted");
+        tm.tracks.get_mut(&id).unwrap().lifecycle.set_reacquirable();
+        for i in 0..quiet_hops {
+            let m = 250 * 15 + 60 + i;
+            let p = quiet_power(SC_N);
+            tm.step_hop(&hop(m, p), m);
+        }
+        assert_eq!(
+            tm.tracks[&id].state(),
+            LifecycleState::Dormant,
+            "the fade must have reached DORMANT"
+        );
+        (tm, id)
+    }
+
+    /// A crash that starts before the wake's 19 confirm hops are done must
+    /// not finish them: the gate's EMA is held through a suppressed crash,
+    /// so its `rise` is not evidence the signal returned (MAN-312 freezes
+    /// a CANDIDATE's confirm window for exactly this reason). The signal
+    /// here is gone -- only the crash remains, peaking on the dormant
+    /// track's own channel.
+    #[test]
+    fn suppressed_crash_cannot_finish_dormant_wake_confirmation() {
+        let cfg = DetectorConfig {
+            hang_hops: 10,
+            non_cw_filter: false,
+            rtty_filter: false,
+            ..DetectorConfig::default()
+        };
+        // 70 quiet hops: the max-power tie moves selection to a flat
+        // floor-level channel, `drop` fires at once, `hang_hops` more
+        // hops reach DORMANT (~11), leaving ~59 of the window aged.
+        let (mut tm, id) = sc_dormant_track(&cfg, 70);
+        // The signal returns: the EMA needs ~14 hops to cross the rise
+        // threshold again, then 4 more confirm hops accrue (of 19)...
+        for _ in 0..17 {
+            let m = tm.hop_counter;
+            tm.step_hop(&hop(m, sc_tone()), m);
+        }
+        // ...then it disappears under a 20-hop band-wide crash.
+        for i in 0..20 {
+            let m = tm.hop_counter;
+            tm.step_hop(&hop(m, sc_crash(26.0, 10, 4.0)), m);
+            assert_eq!(
+                tm.tracks.get(&id).map(|t| t.state()),
+                Some(LifecycleState::Dormant),
+                "suppressed crash hop {i}: the crash must not wake the track"
+            );
+        }
+        assert_eq!(tm.static_crash_count(), 1);
+        assert_eq!(tm.reacquisition_count(), 0);
+        // After the crash the signal really returns: the wake still works.
+        for _ in 0..(cfg.confirm_hops + 10) {
+            let m = tm.hop_counter;
+            tm.step_hop(&hop(m, sc_tone()), m);
+        }
+        assert_eq!(tm.tracks[&id].state(), LifecycleState::Active);
+        assert_eq!(tm.reacquisition_count(), 1);
+    }
+
+    /// The freeze must not freeze the window itself: a suppressed crash
+    /// still ages `reacquire_hops`, so a crash longer than the remaining
+    /// window closes the track `HangExpired` mid-crash, as a HANG track's
+    /// hang timer runs on the same held hops.
+    #[test]
+    fn suppressed_crash_still_ages_the_dormant_expiry() {
+        let cfg = DetectorConfig {
+            hang_hops: 10,
+            non_cw_filter: false,
+            reacquire_hops: 15,
+            rtty_filter: false,
+            ..DetectorConfig::default()
+        };
+        // 18 quiet hops: DORMANT from ~hop 11, ~7 of the 15 window hops
+        // aged.
+        let (mut tm, id) = sc_dormant_track(&cfg, 18);
+        for _ in 0..20 {
+            let m = tm.hop_counter;
+            tm.step_hop(&hop(m, sc_crash(26.0, 10, 4.0)), m);
+        }
+        assert!(!tm.tracks.contains_key(&id), "the window must expire");
+        assert_eq!(tm.close_counts().hang_expired, 1);
+        assert_eq!(tm.static_crash_count(), 1);
+        assert_eq!(tm.reacquisition_count(), 0);
     }
 }

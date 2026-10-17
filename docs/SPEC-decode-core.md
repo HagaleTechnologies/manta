@@ -349,10 +349,12 @@ channels. `non_cw_filter = false` leases at promotion, as before.
 On a hop where a static crash is suppressed (§2.7, `detector.crash_filter`
 `"full"` or `"starts-only"`), no IDLE → CANDIDATE transition happens, a
 CANDIDATE's lifecycle does not step (its confirm count neither advances
-nor resets), and ACTIVE/HANG tracks step on rise/drop recomputed from the
+nor resets), a DORMANT track's wake confirmation likewise does not step
+(neither advancing nor resetting) while its `reacquire_ms` window keeps
+aging, and ACTIVE/HANG tracks step on rise/drop recomputed from the
 gate's held `S[k]` (its value before the crash) against the current floor.
-The crash's energy therefore cannot confirm a candidate or turn a HANG
-track back to ACTIVE.
+The crash's energy therefore cannot confirm a candidate, finish a
+DORMANT track's wake, or turn a HANG track back to ACTIVE.
 
 ### 2.5 Adjacent-channel ownership (one signal ⇒ one track)
 
