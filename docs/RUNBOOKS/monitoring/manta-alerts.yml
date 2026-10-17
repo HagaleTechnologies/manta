@@ -27,6 +27,19 @@ groups:
           description: "GET /healthz on {{ $labels.instance }} has failed for 2 minutes: a source is unhealthy, a listener is down or the decode loop has stalled."
           runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantanodeunhealthy"
 
+      # MAN-13: one input of a node has delivered no samples for 2 minutes. With
+      # several [[input]] entries /healthz stays ok while one input decodes, so
+      # MantaNodeUnhealthy does not fire for a single dead input; this does.
+      - alert: MantaInputDown
+        expr: manta_source_health == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "manta input {{ $labels.source }} on {{ $labels.instance }} is down"
+          description: "The input has delivered no samples for 2 minutes; the node's other inputs keep spotting. See docs/RUNBOOKS/node-health.md."
+          runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantainputdown"
+
       # The spot count is where it was 30 minutes ago and this process has run for
       # at least 30 minutes. `offset` finds no sample across a scrape gap, so the
       # alert stays quiet for 30 minutes after one; the uptime term keeps a restart

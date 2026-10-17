@@ -177,6 +177,35 @@ mod tests {
         assert!(soak_passed(&report));
     }
 
+    /// MAN-254: a source that ends before `duration` does not end the
+    /// soak -- the watchdog is joined before the result is read, so even
+    /// listen's immediate "ended during startup calibration" error waits
+    /// out `duration`. `manta soak --help` promises exactly this; change
+    /// this test and that help together.
+    #[test]
+    fn soak_waits_out_its_duration_after_the_source_ends() {
+        let fs = manta_input::TARGET_RATE_HZ;
+        let src: Box<dyn manta_input::IqSource> = Box::new(
+            AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(
+                vec![0.0f32; fs as usize / 2],
+                fs,
+            )))
+            .unwrap(),
+        );
+        let duration = Duration::from_secs(2);
+        let start = Instant::now();
+        let err = soak(src, &PipelineConfig::default(), duration).unwrap_err();
+        assert!(
+            err.to_string().contains("startup calibration"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            start.elapsed() >= duration,
+            "soak() returned after {:?}, before its {duration:?}",
+            start.elapsed()
+        );
+    }
+
     /// MAN-29 review round 2: an invalid `freq_correction_ppm` must fail
     /// `soak()` before it joins the watchdog thread -- otherwise the error
     /// doesn't surface until the full `duration` elapses (potentially 24h

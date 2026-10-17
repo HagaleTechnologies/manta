@@ -102,13 +102,11 @@ const RESAMPLER_CHUNK: usize = 16_384;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bounds DNS resolution plus every per-address connect attempt together
-/// (MAN-73). Unlike `uplink.rs`'s connect, this one runs on
-/// `ReconnectingSource`'s blocking read-loop thread, which cannot be
-/// interrupted by Ctrl-C mid-connect, so a stop signal landing mid-reopen
-/// waits up to this long, then the WebSocket handshake, before
-/// `manta-cli`'s up-to-50s shutdown drain even starts -- more, in that
-/// worst case, than the 60s `docker stop -t 60` grace the README
-/// recommends. 3x `CONNECT_TIMEOUT`, matching `uplink.rs`'s
+/// (MAN-73), and so how long one reconnect attempt can spend before the
+/// WebSocket handshake. It no longer bounds shutdown: `manta-cli`'s
+/// `ReconnectingSource` runs each reopen on its own thread and abandons an
+/// attempt in flight at a stop request (MAN-252), so the shutdown drain
+/// starts without waiting for it. 3x `CONNECT_TIMEOUT`, matching `uplink.rs`'s
 /// `OVERALL_CONNECT_TIMEOUT` and for the same reason (PR #80 review, round
 /// 2): a window equal to one address's `CONNECT_TIMEOUT` is used up by a
 /// black-holed first address (e.g. a dropped AAAA record), and since every

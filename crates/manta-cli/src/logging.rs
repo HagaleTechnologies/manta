@@ -92,7 +92,8 @@ pub struct LogOpts {
 }
 
 /// Set once `init` has installed the subscriber. Unset (every command but
-/// `run`) reads as text, so the helpers below fall back to `eprintln!`.
+/// `run`) reads as text, so the helpers below fall back to a plain stderr
+/// line.
 static FORMAT: OnceLock<LogFormat> = OnceLock::new();
 
 pub fn is_json() -> bool {
@@ -135,7 +136,12 @@ where
 {
     let builder = tracing_subscriber::fmt()
         .with_writer(writer)
-        .with_env_filter(filter);
+        .with_env_filter(filter)
+        // MAN-232: tracing-subscriber's fallback for a failed event write is
+        // an `eprintln!` (tracing-subscriber 0.3.23 `fmt_layer.rs:1053`),
+        // which panics on the same closed stderr. A lost log record is
+        // better than a dead daemon, so write nothing instead.
+        .log_internal_errors(false);
     match format {
         LogFormat::Text => Box::new(builder.with_ansi(ansi).finish()),
         LogFormat::Json => Box::new(
@@ -190,22 +196,22 @@ pub fn fatal(message: &str) {
 }
 
 /// A `note: ...`-style stderr line: unfiltered text, or a filtered INFO record under
-/// `--log-format json`.
+/// `--log-format json`. A failed write is dropped (MAN-232).
 pub fn note(line: &str) {
     if is_json() {
         tracing::info!(target: "manta", "{line}")
     } else {
-        eprintln!("{line}")
+        crate::stdio::errln!("{line}")
     }
 }
 
 /// A `warning: ...`-style stderr line: unfiltered text, or a filtered WARN record
-/// under `--log-format json`.
+/// under `--log-format json`. A failed write is dropped (MAN-232).
 pub fn warning(line: &str) {
     if is_json() {
         tracing::warn!(target: "manta", "{line}")
     } else {
-        eprintln!("{line}")
+        crate::stdio::errln!("{line}")
     }
 }
 

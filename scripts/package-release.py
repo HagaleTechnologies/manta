@@ -5,8 +5,8 @@ Copies the built binary, README.md, both licence files, the unattended-
 service kit and the man pages `manta man-pages --out` generates (MAN-133,
 passed in via --man-dir) into a fresh scratch staging tree, then writes
 `<out-dir>/<artifact>.tar.gz` or `<out-dir>/<artifact>.zip` containing exactly
-one top-level `<artifact>/` directory. Both release workflows
-(.github/workflows/release.yml, release-publish.yml) call this from one
+one top-level `<artifact>/` directory. The release workflow
+(.github/workflows/release-publish.yml) calls this from one
 `shell: bash` step on every runner, so tar.gz and zip get the same files.
 Tested by scripts/tests/test_package_release.py.
 

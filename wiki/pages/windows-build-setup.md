@@ -6,22 +6,25 @@ status: current
 maintainer: agent
 sources:
   - .github/workflows/ci-full.yml
-  - .github/workflows/release.yml
   - .github/workflows/release-publish.yml
+  - CONTRIBUTING.md
+  - scripts/check-release-ci.py
+  - scripts/check-soapy-release.py
   - docs/superpowers/specs/2026-09-11-man212-windows-platform-support-design.md
   - docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md
   - docs/DECISIONS/2026-10-15-man371-windows-required-check.md
 verified:
-  commit: 3805f78
-  date: 2026-10-15
+  commit: 799379d
+  date: 2026-10-16
 links:
   - live-hardware-field-testing
 ---
 # How do I build and test manta on Windows?
 
 manta targets `x86_64-pc-windows-msvc` (not MinGW) -- this matches the
-prebuilt release binaries (`.github/workflows/release.yml`) and is the only
-Windows target CI (`.github/workflows/ci-full.yml`) exercises.
+prebuilt release binaries (`.github/workflows/release-publish.yml`) and
+is the only Windows target CI (`.github/workflows/ci-full.yml`)
+exercises.
 
 ## Default build (no SoapySDR)
 
@@ -41,14 +44,22 @@ No extra system packages are needed for the default feature set --
 and the rest of the default dependency set are all pure-Rust or
 Windows-native, unlike Linux's `libasound2-dev` requirement.
 
-## `--features hpsdr`
+HPSDR is included in every build and its hardware-free tests run in the
+default workspace suite above. It needs no native radio library. Both crate
+manifests retain `hpsdr = []` so older commands using `--features hpsdr`
+still work. `--version` reports selected Cargo features, so `features: none`
+also includes HPSDR. See [the contributor build instructions](../../CONTRIBUTING.md#build-and-test).
 
-No extra setup -- `hpsdr` has zero optional dependencies
-(`crates/manta-input/Cargo.toml`'s `hpsdr = []`).
+MAN-239 removed the separate HPSDR CI job and Catalyst checks together.
+The [release CI validator](../../scripts/check-release-ci.py) now requires
+the three default OS test jobs; leaving retired job names there would
+block every release. The [Soapy archive validator](../../scripts/check-soapy-release.py)
+checks HPSDR through CLI help while requiring only `soapy` in build metadata.
+When removing feature gates around clap attributes, preserve each option's
+`long`, `requires` and conflict attributes, including the Soapy combinations.
 
-```powershell
-cargo test -p manta-input -p manta-cli --features hpsdr
-```
+The verification commit above identifies the inspected baseline; this page
+also records the MAN-239 build migration applied to that baseline.
 
 ## `--features soapy`
 
@@ -139,8 +150,8 @@ reliability comparison against the macOS baseline in issues #166/#167/
 - `test (windows-latest)` is required for merge once MAN-371's owner step
   O1 is applied. `gh api repos/HagaleTechnologies/manta/rules/branches/main`
   shows whether it is. Its check-run on a trusted PR's head is created
-  fail-closed. `test-hpsdr (windows-latest)` stays advisory, like its
-  ubuntu and macOS siblings. `release-publish.yml` refuses to publish a
+  fail-closed. HPSDR tests run in this default test job.
+  `release-publish.yml` refuses to publish a
   commit whose `ci-full.yml` push run failed a Windows leg (MAN-156). See
   [the MAN-371 decision](../../docs/DECISIONS/2026-10-15-man371-windows-required-check.md).
 - `--features soapy` is not covered by Windows CI. `test-soapy` runs only

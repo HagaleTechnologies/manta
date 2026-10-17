@@ -9,9 +9,11 @@ sources:
   - crates/manta-cli/src/reconnect.rs
   - crates/manta-cli/src/reconnect.rs (InputHealthTotals)
   - crates/manta-input/src/lib.rs (IqSource::take_discontinuity)
+  - docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md
+  - docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md
 verified:
-  commit: d286147
-  date: 2026-10-13
+  commit: 9a79a72
+  date: 2026-10-16
 links:
   - determinism
 ---
@@ -23,11 +25,15 @@ with no synthetic samples at all — see the decision doc for the full design an
 whole `listen()` call (instead of restarting just the segment) would back-date timestamps against
 `SpotBus`'s fixed session epoch. Gotcha: the restart closes the old tracks with
 `TrackManager::finish_for_discontinuity` (`Bookkeeping`), never `finish()` (`SignalEnded`) — the
-decision doc says why. Gotcha: a per-connection handle taken before wrapping (`health_counters()`,
+decision doc says why; a stop during an outage takes the same teardown (MAN-258): the wrapper ends
+the stream with the outage still pending, and `listen` checks for a pending gap after its loop.
+Gotcha: a per-connection handle taken before wrapping (`health_counters()`,
 `confirmed_live_handle()`-style) goes stale at the first reconnect, because every reopen builds a
 new device with fresh counters, so poll `ReconnectingSource::input_health()` (MAN-228) instead; and
 syncing counts after `read()` returns is not enough, because HPSDR counts inside a `read()` that
-blocks until a valid packet arrives.
+blocks until a valid packet arrives. Gotcha (MAN-252): every reopen runs on its own `reopen-<kind>`
+thread, which a stop request abandons, so anything `LiveSourceSpec::open` builds must be `Send`; a
+source or wrapper holding `Rc` or raw pointers will not compile into the opener.
 
 ## Symptom
 
@@ -42,3 +48,13 @@ tracks it live (ARCHITECTURE §8).
 `manta_source_outages_total`/`manta_source_down_seconds_total` (MAN-96) count each drop and its
 completed down time, so a reconnect between two scrapes still shows; the 30-day field-node
 procedure reads them (`docs/RUNBOOKS/secondary-skimmer-field-node.md`).
+
+## Several inputs
+
+With several `[[input]]` entries (MAN-13) every input owns its own `ReconnectingSource` on its own
+thread: one input dropping changes only its own `manta_source_health{source}` series and logs
+`input NAME: lost; retrying, k of n inputs decoding` — the others keep decoding, `/healthz` stays
+`ok` while at least one input is healthy, and the `MantaInputDown` alert (not `MantaNodeUnhealthy`)
+reports the dead one. Track ids are interleaved per input, so an input's per-track validator state
+never collides with another's. See
+[the decision record](../../docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md).
