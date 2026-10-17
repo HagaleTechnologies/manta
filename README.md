@@ -56,6 +56,10 @@ daemon, open source, with documented algorithms and golden-vector regression
 tests anyone can read, run, and check. Shared infrastructure is healthier with
 more than one implementation of it, on more than one operating system.
 
+[docs/COMPARISON.md](docs/COMPARISON.md) links SparkSDR, sdroxide,
+OpenWebRX+/csdr-skimmer and sdrainer, with no capability claims about
+any of them.
+
 ## Installation
 
 ### Download a release
@@ -917,6 +921,9 @@ recall/CER-vs-SNR curve on synthetic signals, regenerable from any build.
 
 ## Related projects
 
+- [docs/COMPARISON.md](docs/COMPARISON.md): neutral links to SparkSDR,
+  sdroxide, OpenWebRX+/csdr-skimmer and sdrainer — no capability claims
+  about any of them (MAN-360).
 - [coppa](https://github.com/HagaleTechnologies/coppa): `manta` reuses its
   FFT and its AWGN / Watterson HF channel models for the DSP core and test
   harness.
