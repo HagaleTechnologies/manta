@@ -47,7 +47,7 @@ docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md.
 - `docs/README.md` (start here, by audience); `README.md` (goals, install)
 - `ARCHITECTURE.md` — 9-crate workspace, data flow, component design
 - `docs/SPEC-decode-core.md` — the algorithm spec to implement from. §7 has
-  the golden vectors: V1–V10, V31 and V51 (decode), V11–V30 and V38–V50
+  the golden vectors: V1–V10, V31, V34 and V51 (decode), V11–V30 and V38–V50
   (validator), VC1–VC3, VW1–VW5; `docs/SPEC-decode-core-v2.md` §8.2 has
   VR1–VR8.
 - `ROADMAP.md` — milestones M0–M4 with acceptance criteria
