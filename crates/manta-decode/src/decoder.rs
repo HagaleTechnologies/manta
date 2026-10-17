@@ -53,8 +53,8 @@ pub struct TrackDecoder {
     /// `new_mid_signal`; cleared by the first run.
     lead_run_censored: bool,
     /// Open-space length, in hops, when `check_flush` last forced a flush,
-    /// held until the rest of that gap surfaces so its full length can
-    /// reach `GapClassifier::observe_flushed`.
+    /// held until the next run shows whether that gap ended within the
+    /// demod's debounce of the flush (see `process_run`).
     flushed_gap_hops: Option<u32>,
 }
 
@@ -171,8 +171,8 @@ impl TrackDecoder {
         if run.mark {
             if let Some(hops) = self.flushed_gap_hops.take() {
                 // The flushed gap's remainder fell under the debounce and
-                // was absorbed into this mark, so the flush-time length is
-                // all of it that is known.
+                // was absorbed into this mark: the gap ended within ~5 hops
+                // of the flush, so the flush-time length is its length.
                 self.gaps
                     .observe_flushed(hops as f32 * HOP_MS as f32, self.tracker.mu_dit_ms());
             }
@@ -199,10 +199,11 @@ impl TrackDecoder {
             if self.word_flushed {
                 // This gap was already handled by the 7-dit flush; `run` is
                 // only its remainder (the flush closed the demod's open run).
-                if let Some(hops) = self.flushed_gap_hops.take() {
-                    let gap_ms = (hops + run.hops) as f32 * HOP_MS as f32;
-                    self.gaps.observe_flushed(gap_ms, self.tracker.mu_dit_ms());
-                }
+                // A remainder long enough to surface as its own run means
+                // the gap outlasted the flush by more than the debounce --
+                // possibly a long pause -- so it stays out of the gap
+                // statistics.
+                self.flushed_gap_hops = None;
                 return;
             }
             match self.gaps.classify(dur_ms, self.tracker.mu_dit_ms()) {
@@ -521,6 +522,19 @@ mod tests {
         assert!(events.iter().any(
             |e| matches!(e, DecoderEvent::SpeedUpdate { wpm, .. } if (*wpm - 25.0).abs() < 3.0)
         ));
+    }
+
+    #[test]
+    fn early_long_pause_does_not_skew_word_gap_statistics() {
+        // A 2 s pause before the gap classifier's 5-sample bootstrap fills
+        // is caught by the safety-net flush. Fed into the bootstrap at full
+        // length (~42 dits) it would pin the word/char boundary far above
+        // real 7-dit word gaps and merge every later word.
+        let mut env = rect_envelope("CQ CQ", 18);
+        env.extend(std::iter::repeat_n(0.0, 750));
+        env.extend(rect_envelope("CQ DE W1AW W1AW K", 18));
+        let events = decode_env(&env, TrackDecoder::new(1, DecodeConfig::default()));
+        assert_eq!(events_to_text(&events), "CQ CQ CQ DE W1AW W1AW K");
     }
 
     #[test]

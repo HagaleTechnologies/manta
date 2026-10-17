@@ -442,7 +442,9 @@ impl GapClassifier {
     /// Feed a gap that decoder.rs's end-of-track safety-net flush already
     /// committed as a word boundary (so it never reaches `classify`) into
     /// the long-gap statistics, but only while the 2-means pair is still
-    /// collecting its 5 bootstrap samples.
+    /// collecting its 5 bootstrap samples. decoder.rs only passes gaps that
+    /// ended within the demod's debounce of the flush -- a gap class the
+    /// flush threshold barely undercuts -- never one that ran on past it.
     ///
     /// Closes the remaining half of `flush_threshold_dits`'s chicken-and-
     /// egg: that method can only scale the flush up once the pair is ready,
@@ -454,8 +456,9 @@ impl GapClassifier {
     /// several repeats of the text. Before MAN-5, V10 only escaped this by
     /// luck: the decoder's truncated first mark inflated the early mu_dit
     /// to ~66 ms, which pulled those first character gaps under the flush.
-    /// Limited to the bootstrap so later long pauses, which the flush also
-    /// catches, keep staying out of the live centroids.
+    /// Long pauses, which the flush also catches, never come through here:
+    /// one in the bootstrap would pin the word/char boundary far above real
+    /// word gaps for the life of the track.
     pub fn observe_flushed(&mut self, gap_ms: f32, mu_dit_ms: f32) {
         if !self.pair.ready() {
             self.observe(gap_ms / mu_dit_ms);
@@ -583,12 +586,14 @@ mod tests {
     #[test]
     fn flushed_gaps_bootstrap_farnsworth_but_stop_once_ready() {
         // V10's shape: 7.1-dit char gaps the safety-net flush catches before
-        // `classify` sees them, and 16.5-dit word gaps.
+        // `classify` sees them, and a 16.5-dit word gap that reaches it.
         let mu = 54.7;
         let mut g = GapClassifier::new();
-        for u in [7.1f32, 7.1, 16.5, 7.1, 7.1] {
-            g.observe_flushed(u * mu, mu);
-        }
+        g.observe_flushed(7.1 * mu, mu);
+        g.observe_flushed(7.1 * mu, mu);
+        g.classify(16.5 * mu, mu);
+        g.observe_flushed(7.1 * mu, mu);
+        g.observe_flushed(7.1 * mu, mu);
         assert!(g.pair.ready() && g.pair.confirmed());
         // The safety-net flush now scales clear of the character gaps.
         assert!(g.flush_threshold_dits(7.0) > 7.1);
