@@ -209,10 +209,22 @@ pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
     /// own "reached login" distinction.
     productive: bool,
     /// Whether the current `inner` came from `opener` (a reconnect) rather
-    /// than being the original source passed to `new`/`with_env` -- only a
-    /// reconnected source's first successful read produces a
-    /// discontinuity.
+    /// than being the original source passed to `new`/`with_env` -- gates
+    /// the pre-first-read stop check (MAN-252): a stop that lands before
+    /// the reopened source has returned data ends the stream with the
+    /// outage still pending (MAN-258).
     reopened: bool,
+    /// MAN-259: when the reopen in progress was started, after its backoff
+    /// sleep. `None` outside a reopen attempt.
+    reopen_started_at: Option<Instant>,
+    /// Where a reconnect's outage ends (MAN-259): the reopened source's
+    /// acquisition start, `reopen_started_at` plus its
+    /// `acquisition_start_offset()`. `Some` only while the current `inner`
+    /// came from `opener` (a reconnect) rather than being the original
+    /// source passed to `new`/`with_env` and has not yet returned data --
+    /// only a reconnected source's first successful read produces a
+    /// discontinuity, which takes it.
+    resumption_anchor: Option<Instant>,
     last_ok: Instant,
     discontinuity: Option<u64>,
     /// MAN-228: `None` when the first source counts nothing (MAN-56's
@@ -274,6 +286,8 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
             backoff: INITIAL_BACKOFF,
             productive: false,
             reopened: false,
+            reopen_started_at: None,
+            resumption_anchor: None,
             last_ok,
             discontinuity: None,
             input_health,
@@ -402,6 +416,10 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                         // outage left pending (MAN-258).
                         return Ok(self.end_during_outage());
                     }
+                    // MAN-259: the outage's end is measured from here, the
+                    // last instant that was certainly signal-silent before
+                    // the open call was started on the reopen thread.
+                    self.reopen_started_at = Some(self.env.now());
                     match self.spawn_reopen() {
                         Ok(pending) => self.reopen = Some(pending),
                         Err(e) => {
@@ -451,26 +469,41 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                         if let Some(totals) = &self.input_health {
                             totals.attach(src.health_counters());
                         }
+                        // MAN-259: the outage ends where the reopened
+                        // source began acquiring, which the open call
+                        // reports relative to its own start. Clamped to
+                        // now, so no driver can end it in the future.
+                        let now = self.env.now();
+                        self.resumption_anchor = self.reopen_started_at.take().map(|started| {
+                            started
+                                .checked_add(src.acquisition_start_offset())
+                                .map_or(now, |anchor| anchor.min(now))
+                        });
                         self.inner = Some(src as Box<dyn IqSource>);
                         self.productive = false;
                         self.reopened = true;
                         continue;
                     }
                     Err(e) => {
+                        self.reopen_started_at = None;
                         self.attempt_failed(&crate::fmt::cause_text(&e));
                         continue;
                     }
                 }
             }
 
-            // A reopened source's outage ends where its first read begins,
-            // not where it returns (PR #207 review): that read can block
-            // while capturing the samples it returns (a Kiwi fills its
-            // resampler first), and the engine counts those samples as it
-            // processes them. The same anchor the session's own `SpotBus`
-            // epoch uses, which is taken before the first read. Bound: time
-            // that read spends waiting before any data arrives is excluded
-            // from the gap too.
+            // A reopened source's outage ends where its acquisition began
+            // (MAN-259, `resumption_anchor`), not where its opener returned
+            // or its first read began: a driver starts streaming inside its
+            // open call (Kiwi's `SET mod=iq`, Soapy's activate, HPSDR's
+            // start command, cpal's start, ka9q's data join), the samples
+            // captured from then on come back from `read()`, and the engine
+            // counts them as it processes them. Counting that span as
+            // outage too shifted every later spot timestamp late. The anchor
+            // is never later than the first read's start, so PR #207's
+            // round-3 rule (the first read's capture time is not outage)
+            // still holds. Bound: any delay between the start trigger and
+            // the device's first captured sample is excluded from the gap.
             //
             // MAN-252: a stop that landed while the result was being
             // accepted and installed wins over that first read -- it has
@@ -480,7 +513,6 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
             if self.reopened && self.stop.load(Ordering::Relaxed) {
                 return Ok(self.end_during_outage());
             }
-            let first_read_started = self.reopened.then(|| self.env.now());
             let inner = self.inner.as_mut().expect("checked Some above");
             match inner.read(buf) {
                 Ok(0) => return Ok(0),
@@ -488,7 +520,7 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                     if !self.productive {
                         self.productive = true;
                         self.backoff = INITIAL_BACKOFF; // ladder resets on recovery
-                        if let Some(resumed_at) = first_read_started {
+                        if let Some(resumed_at) = self.resumption_anchor.take() {
                             let outage = resumed_at.duration_since(self.last_ok);
                             let gap = (outage.as_secs_f64() * self.fs).round() as u64;
                             self.discontinuity = Some(gap);
@@ -1036,6 +1068,97 @@ mod tests {
             src.take_discontinuity(),
             Some((INITIAL_BACKOFF.as_secs_f64() * FS).round() as u64),
             "the gap ends where the first read began, not where it returned"
+        );
+    }
+
+    /// A reopened source reporting how far into its open call acquisition
+    /// began (MAN-259), like a Kiwi whose handshake precedes `SET mod=iq`.
+    struct AcquiringSource {
+        inner: ScriptedSource,
+        acquisition_start_offset: Duration,
+    }
+
+    impl IqSource for AcquiringSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.sample_rate()
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz()
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {
+            self.inner.read(buf)
+        }
+        fn acquisition_start_offset(&self) -> Duration {
+            self.acquisition_start_offset
+        }
+    }
+
+    /// The gap reported after one reconnect whose open call takes
+    /// `open_takes` of virtual time and returns a source that reports
+    /// `acquisition_start_offset` and streams at once.
+    fn gap_after_a_slow_reopen(open_takes: Duration, acquisition_start_offset: Duration) -> u64 {
+        let first = scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]);
+        let env = FakeEnv::new();
+        let env_for_opener = env.clone();
+        let mut reopened = Some(AcquiringSource {
+            inner: scripted(FS, CENTER, vec![ok_chunk(8)]),
+            acquisition_start_offset,
+        });
+        let opener: Opener = Box::new(move || {
+            env_for_opener.advance(open_takes);
+            Ok(Box::new(reopened.take().expect("reopened only once")) as SendSource)
+        });
+        let (health, _log) = health_recorder();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            env,
+        );
+
+        let mut b = buf(8);
+        src.read(&mut b).unwrap();
+        src.read(&mut b).unwrap(); // errors, sleeps 1s, reopens (slowly), resumes
+        src.take_discontinuity()
+            .expect("a reconnect reports its gap")
+    }
+
+    fn samples(d: Duration) -> u64 {
+        (d.as_secs_f64() * FS).round() as u64
+    }
+
+    #[test]
+    fn discontinuity_ends_at_acquisition_start_not_opener_return() {
+        // MAN-259: the device streams from the start of a 2 s open call, so
+        // those 2 s come back as samples; counting them as outage too
+        // would shift every later spot timestamp 2 s late.
+        assert_eq!(
+            gap_after_a_slow_reopen(Duration::from_secs(2), Duration::ZERO),
+            samples(INITIAL_BACKOFF),
+            "the gap is the backoff alone, not backoff + open time"
+        );
+    }
+
+    #[test]
+    fn pre_acquisition_handshake_time_still_counts_as_outage() {
+        // A Kiwi-shaped open: 500 ms of handshake before streaming starts,
+        // then 1.5 s of open-time work during which samples already queue.
+        assert_eq!(
+            gap_after_a_slow_reopen(Duration::from_secs(2), Duration::from_millis(500)),
+            samples(INITIAL_BACKOFF + Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn an_offset_longer_than_the_open_call_clamps_to_the_install_instant() {
+        // A driver can never push the outage's end past the moment its
+        // connection was installed.
+        assert_eq!(
+            gap_after_a_slow_reopen(Duration::from_secs(2), Duration::from_secs(5)),
+            samples(INITIAL_BACKOFF + Duration::from_secs(2))
         );
     }
 

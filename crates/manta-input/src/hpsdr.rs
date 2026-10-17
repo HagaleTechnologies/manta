@@ -825,6 +825,7 @@ impl HpsdrDevice {
     /// they may be moved to independent threads, matching how
     /// `manta-engine` runs each source. ARCHITECTURE §3.
     pub fn open(cfg: HpsdrConfig) -> Result<Vec<HpsdrIqSource>> {
+        let entered = Instant::now();
         cfg.validate()?;
 
         let socket = UdpSocket::bind("0.0.0.0:0").context("bind HPSDR UDP socket")?;
@@ -900,18 +901,22 @@ impl HpsdrDevice {
         // flip true on pre-configuration data. `send_next_cc_frames`
         // advances by 2 frames per call, so `div_ceil(cc_frame_count, 2)`
         // calls cover every entry at least once per repeat.
-        {
+        // MAN-259: the device streams from the start command on; the
+        // C&C burst before it is still outage.
+        let acquisition_start_offset = {
             let mut guard = inner.lock().unwrap();
             for _ in 0..INITIAL_BURST_REPEATS * cc_frame_count.div_ceil(2) {
                 guard
                     .send_next_cc_frames()
                     .context("send initial HPSDR C&C tuning frames")?;
             }
+            let acquisition_start_offset = entered.elapsed();
             guard
                 .socket
                 .send(&build_start_command())
                 .context("send HPSDR start command")?;
-        }
+            acquisition_start_offset
+        };
 
         Ok((0..cfg.ddc_count)
             .map(|ddc_index| HpsdrIqSource {
@@ -921,6 +926,7 @@ impl HpsdrDevice {
                 center_freq_hz: cfg.center_freq_hz[ddc_index],
                 confirmed_live: confirmed_live.clone(),
                 health_counters: health_counters.clone(),
+                acquisition_start_offset,
             })
             .collect())
     }
@@ -942,6 +948,9 @@ pub struct HpsdrIqSource {
     /// MAN-56) -- kept here too so `health_counters()` and `gap_stats()`
     /// can read them without locking `inner`'s mutex.
     health_counters: Arc<InputHealthCounters>,
+    /// MAN-259: `HpsdrDevice::open`'s runtime up to the start command,
+    /// shared by every DDC of the connection.
+    acquisition_start_offset: Duration,
 }
 
 impl HpsdrIqSource {
@@ -986,6 +995,10 @@ impl IqSource for HpsdrIqSource {
 
     fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
         Some(self.health_counters.clone())
+    }
+
+    fn acquisition_start_offset(&self) -> Duration {
+        self.acquisition_start_offset
     }
 }
 
