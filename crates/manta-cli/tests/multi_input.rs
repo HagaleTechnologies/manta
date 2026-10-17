@@ -565,3 +565,134 @@ fn bad_samples_in_one_input_warn_naming_it() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert_eq!(spot_calls(&stdout).get("ZL2XYZ"), Some(&1), "{stdout}");
 }
+
+// MAN-310: a band plan opens one KiwiSDR session per planned stream.
+
+#[cfg(unix)]
+mod common;
+
+/// Runs `manta run` on a Kiwi `[input]` (`extra` adds its plan keys) against
+/// a fake KiwiSDR expecting `sessions` sessions, until `count` stderr lines
+/// contain `until`. Returns the sorted tune lines and stderr so far.
+#[cfg(unix)]
+fn run_kiwi_plan(
+    extra: &str,
+    sessions: usize,
+    until: &str,
+    count: usize,
+) -> (Vec<String>, Vec<String>) {
+    use std::net::TcpListener;
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let done = Arc::new(AtomicBool::new(false));
+    let (tx, tunes_rx) = mpsc::channel();
+    let fake = std::thread::spawn({
+        let done = done.clone();
+        move || common::fake_kiwi_sessions(listener, sessions, tx, done)
+    });
+    let cfg = dir.path().join("kiwi.toml");
+    std::fs::write(
+        &cfg,
+        format!("[input]\ntype = \"kiwi\"\nhost = \"127.0.0.1\"\nport = {port}\n{extra}"),
+    )
+    .unwrap();
+    let mut child = common::KillOnDrop(
+        manta()
+            .current_dir(dir.path())
+            .args(["run", "--config"])
+            .arg(&cfg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let lines_rx = common::line_channel(child.0.stderr.take().unwrap());
+    let mut lines = Vec::new();
+    let mut seen = 0;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while seen < count {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match lines_rx.recv_timeout(left) {
+            Ok(line) => {
+                let line = common::strip_ansi(&line);
+                if line.contains(until) {
+                    seen += 1;
+                }
+                lines.push(line);
+            }
+            Err(e) => panic!("{count} lines with {until:?} did not arrive ({e:?}): {lines:#?}"),
+        }
+    }
+    let mut tunes = Vec::new();
+    while tunes.len() < sessions {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match tunes_rx.recv_timeout(left) {
+            Ok(tune) => tunes.push(tune),
+            Err(e) => panic!("{sessions} sessions did not tune ({e:?}): {tunes:?}"),
+        }
+    }
+    drop(child);
+    done.store(true, Ordering::Relaxed);
+    fake.join().unwrap().unwrap();
+    tunes.sort();
+    (tunes, lines)
+}
+
+/// Scenarios 2 and 3, live: 160 m is skipped and 60 m opens two sessions,
+/// each starting tracks only on its own side of the split.
+#[cfg(unix)]
+#[test]
+fn bands_open_one_kiwi_session_per_planned_stream() {
+    let (tunes, lines) = run_kiwi_plan(
+        "bands = [\"160m\", \"60m\"]\ntuning_range_hz = [3000000.0, 30000000.0]\n",
+        2,
+        "ready: decoding",
+        2,
+    );
+    assert_eq!(
+        tunes,
+        [
+            "SET mod=iq low_cut=-5000 high_cut=5000 freq=5355.250",
+            "SET mod=iq low_cut=-5000 high_cut=5000 freq=5362.750",
+        ]
+    );
+    let plan = lines
+        .iter()
+        .position(|l| l == "note: [input]: bands = [\"160m\", \"60m\"] plans 2 streams: 60m (2)")
+        .unwrap_or_else(|| panic!("no plan note: {lines:#?}"));
+    assert_eq!(
+        lines[plan + 1],
+        "note: [input]: 160m skipped: 1810 to 1840 kHz is outside the receiver's tuning range, \
+         3000 to 30000 kHz"
+    );
+    for want in [
+        "input kiwi-60m-1: new tracks start only from 5350.25 to 5359.094 kHz",
+        "input kiwi-60m-2: new tracks start only from 5358.906 to 5367.75 kHz",
+    ] {
+        assert!(
+            lines.iter().any(|l| l.contains(want)),
+            "no {want:?}: {lines:#?}"
+        );
+    }
+}
+
+/// Scenario 4, live: a bare centre tunes one session to it.
+#[cfg(unix)]
+#[test]
+fn a_bare_centre_tunes_one_kiwi_session_to_it() {
+    let (tunes, lines) = run_kiwi_plan("bands = [\"7030\"]\n", 1, "manta: listening", 1);
+    assert_eq!(
+        tunes,
+        ["SET mod=iq low_cut=-5000 high_cut=5000 freq=7030.000"]
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("new tracks start only")),
+        "{lines:#?}"
+    );
+}
