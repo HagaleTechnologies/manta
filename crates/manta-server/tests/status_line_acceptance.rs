@@ -79,6 +79,8 @@ async fn the_periodic_status_line_reports_tracks_spot_rate_clients_and_uplink_st
         confidence: 0.9,
         track_id: 1,
         sample_ts: 0,
+        rst: None,
+        qrl_query: false,
     };
     for _ in 0..5 {
         metrics.record_spot(&spot);

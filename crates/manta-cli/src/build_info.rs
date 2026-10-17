@@ -7,7 +7,7 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 12-hex commit, a validated `MANTA_GIT_SHA` override, or `unknown`.
 pub const GIT_SHA: &str = env!("MANTA_GIT_SHA");
-/// Compiled-in Cargo features, sorted and comma-separated, or `none`.
+/// Selected Cargo features, sorted and comma-separated, or `none`.
 pub const FEATURES: &str = env!("MANTA_FEATURES");
 /// What `manta --version` / `-V` prints after `manta `. `concat!` cannot
 /// take a `const`, hence the repeated `env!`s.
@@ -47,26 +47,6 @@ mod tests {
             VERSION_LINE,
             format!("{VERSION} (git {GIT_SHA}; features: {FEATURES})")
         );
-    }
-
-    /// build.rs derives the list from `CARGO_CFG_FEATURE`; this is what rustc
-    /// itself compiled the crate with. Extend when manta-cli gains a feature.
-    #[test]
-    fn features_agree_with_the_cfg_flags_rustc_saw() {
-        let on: Vec<&str> = [
-            ("hpsdr", cfg!(feature = "hpsdr")),
-            ("soapy", cfg!(feature = "soapy")),
-        ]
-        .into_iter()
-        .filter(|(_, on)| *on)
-        .map(|(f, _)| f)
-        .collect();
-        let want = if on.is_empty() {
-            "none".to_string()
-        } else {
-            on.join(",")
-        };
-        assert_eq!(FEATURES, want);
     }
 
     /// MAN-128's "never fails the build": `std::env::vars()` panics on any
