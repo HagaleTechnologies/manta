@@ -452,6 +452,21 @@ impl SpeedTracker {
         });
     }
 
+    /// Replace the WPM seed after the decoder's warmup `pending` replay
+    /// (MAN-265). The mark that made the tracker ready seeded `wpm_ema`
+    /// inside `on_mark` before any element gap existed, so a transmission
+    /// ending at that boundary kept the mark-only estimate forever.
+    /// Assigns rather than EMA-folds: this is still the first sample (the
+    /// replayed marks were already counted, and its gaps only reached
+    /// `mu_egap` during the replay), so there is no smoothing history to
+    /// disturb -- later live marks keep the normal `WPM_ALPHA` steps.
+    /// No-op unless ready. SPEC §4.1a **\[DEVIATION\]** (MAN-265).
+    pub(crate) fn reseed_wpm_after_warmup(&mut self) {
+        if self.ready() {
+            self.wpm_ema = Some(1200.0 / self.dit_estimate_ms());
+        }
+    }
+
     fn apply_constraints(&mut self) {
         // SPEC §4.1: clamp mu_dit to [20, 150] ms; enforce 2.2 <= ratio <= 6.0
         // (MAN-315 D5: was 4.5), re-anchoring to the sender's learned ratio

@@ -142,4 +142,4 @@ test fails unless they all match:
   in both "Decide whether this revision may run CI in the default-branch
   context" steps (their bodies must stay byte-identical)
 - `.github/workflows/ci-full.yml`, the `fromJSON('[…]')` list in the
-  `test`, `test-soapy` and `test-hpsdr` job conditions
+  `test` and `test-soapy` job conditions
