@@ -47,6 +47,15 @@ pub struct TrackDecoder {
     last_ts: u64,
     /// Decode-error counter (aborted garble characters). SPEC §4.4.
     pub garble_count: u32,
+    /// MAN-5: the next run `on_run` sees is left-censored -- it was already
+    /// in progress before this decoder's first sample, so its duration is a
+    /// truncated fragment, not a real element length. Set only by
+    /// `new_mid_signal`; cleared by the first run.
+    lead_run_censored: bool,
+    /// Open-space length, in hops, when `check_flush` last forced a flush,
+    /// held until the rest of that gap surfaces so its full length can
+    /// reach `GapClassifier::observe_flushed`.
+    flushed_gap_hops: Option<u32>,
 }
 
 impl TrackDecoder {
@@ -67,6 +76,26 @@ impl TrackDecoder {
             hop_count: 0,
             last_ts: 0,
             garble_count: 0,
+            lead_run_censored: false,
+            flushed_gap_hops: None,
+        }
+    }
+
+    /// A decoder joining a signal already in progress (MAN-5). The engine
+    /// leases a decoder on CANDIDATE -> ACTIVE promotion, which by
+    /// construction lands `confirm_hops` into a mark (SPEC §2.3/§2.4), so
+    /// the demod's first run is the truncated tail of that mark. Fed to the
+    /// speed tracker as one of its 5 init marks, a short tail (e.g. 8 hops
+    /// of a 46-hop dit at 10.1 WPM) becomes the dit centroid: SPEC §4.1's
+    /// ratio constraint then pins mu_dah at 3x that, every real element
+    /// lands above the boundary as a dah, and the stream decodes as T/E
+    /// forever (drift reinit needs 12 same-cluster marks with CV < 0.35,
+    /// which a dit/dah mix never gives). This decoder still assembles that
+    /// first run into its character but keeps it out of speed tracking.
+    pub fn new_mid_signal(track_id: u32, cfg: DecodeConfig) -> Self {
+        TrackDecoder {
+            lead_run_censored: true,
+            ..TrackDecoder::new(track_id, cfg)
         }
     }
 
@@ -117,8 +146,9 @@ impl TrackDecoder {
     }
 
     fn on_run(&mut self, run: Run, events: &mut Vec<DecoderEvent>) {
+        let censored = std::mem::take(&mut self.lead_run_censored);
         if !self.tracker.ready() {
-            if run.mark {
+            if run.mark && !censored {
                 self.tracker.on_mark(run.hops as f32 * HOP_MS as f32);
             }
             self.pending.push(run);
@@ -133,12 +163,19 @@ impl TrackDecoder {
             }
             return;
         }
-        self.process_run(run, true, events);
+        self.process_run(run, !censored, events);
     }
 
     fn process_run(&mut self, run: Run, live: bool, events: &mut Vec<DecoderEvent>) {
         let dur_ms = run.hops as f32 * HOP_MS as f32;
         if run.mark {
+            if let Some(hops) = self.flushed_gap_hops.take() {
+                // The flushed gap's remainder fell under the debounce and
+                // was absorbed into this mark, so the flush-time length is
+                // all of it that is known.
+                self.gaps
+                    .observe_flushed(hops as f32 * HOP_MS as f32, self.tracker.mu_dit_ms());
+            }
             if live {
                 self.tracker.on_mark(dur_ms);
                 self.demod.set_dit_ms(self.tracker.mu_dit_ms());
@@ -160,7 +197,12 @@ impl TrackDecoder {
             self.word_flushed = false;
         } else {
             if self.word_flushed {
-                // This gap was already handled by the 7-dit flush.
+                // This gap was already handled by the 7-dit flush; `run` is
+                // only its remainder (the flush closed the demod's open run).
+                if let Some(hops) = self.flushed_gap_hops.take() {
+                    let gap_ms = (hops + run.hops) as f32 * HOP_MS as f32;
+                    self.gaps.observe_flushed(gap_ms, self.tracker.mu_dit_ms());
+                }
                 return;
             }
             match self.gaps.classify(dur_ms, self.tracker.mu_dit_ms()) {
@@ -216,6 +258,7 @@ impl TrackDecoder {
                     });
                 }
                 self.word_flushed = true;
+                self.flushed_gap_hops = Some(hops);
             }
         }
     }
@@ -432,5 +475,66 @@ mod tests {
         }
         events.extend(dec.finish());
         assert_eq!(events_to_text(&events), "TTTTT");
+    }
+
+    fn decode_env(env: &[f32], mut dec: TrackDecoder) -> Vec<DecoderEvent> {
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        events
+    }
+
+    /// MAN-5's shape: a decoder joining mid-mark sees a truncated tail as
+    /// its first run, and the next 4 marks are all dahs ("MM", as in the
+    /// ticket's "GAMMAFOX" scene). 7 hops (just over the 5-hop debounce) of
+    /// a mark, then a word gap, then 25 WPM "MMAFOX GAMMAFOX" (18-hop dits).
+    fn mid_mark_join_envelope() -> Vec<f32> {
+        let mut env = vec![1.0; 7];
+        env.extend(std::iter::repeat_n(0.0, 7 * 18));
+        env.extend(rect_envelope("MMAFOX GAMMAFOX", 18));
+        env
+    }
+
+    #[test]
+    fn censored_lead_tail_poisons_a_from_start_decoder() {
+        // The pre-fix failure mode: as an init mark the 7-hop tail becomes
+        // the dit centroid, mu_dah is clamped to 3x it, and every real
+        // element classifies as a dah.
+        let events = decode_env(
+            &mid_mark_join_envelope(),
+            TrackDecoder::new(1, DecodeConfig::default()),
+        );
+        let text = events_to_text(&events);
+        assert!(!text.contains("GAMMAFOX"), "got {text:?}");
+    }
+
+    #[test]
+    fn mid_signal_decoder_keeps_censored_lead_tail_out_of_speed_tracking() {
+        let events = decode_env(
+            &mid_mark_join_envelope(),
+            TrackDecoder::new_mid_signal(1, DecodeConfig::default()),
+        );
+        // The tail itself still assembles (as the lone dit "E").
+        assert_eq!(events_to_text(&events), "E MMAFOX GAMMAFOX");
+        assert!(events.iter().any(
+            |e| matches!(e, DecoderEvent::SpeedUpdate { wpm, .. } if (*wpm - 25.0).abs() < 3.0)
+        ));
+    }
+
+    #[test]
+    fn mid_signal_decoder_matches_new_when_the_first_run_is_a_space() {
+        // Joining during key-up: the censored first run is a space, which
+        // never feeds the speed tracker anyway, so nothing may change.
+        let mut env = vec![0.0; 30];
+        env.extend(rect_envelope("CQ CQ DE W1AW", 18));
+        let from_start = decode_env(&env, TrackDecoder::new(1, DecodeConfig::default()));
+        let mid_signal = decode_env(
+            &env,
+            TrackDecoder::new_mid_signal(1, DecodeConfig::default()),
+        );
+        assert_eq!(events_to_text(&mid_signal), "CQ CQ DE W1AW");
+        assert_eq!(mid_signal, from_start);
     }
 }

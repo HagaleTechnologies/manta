@@ -85,14 +85,19 @@ proptest! {
     // separate, pre-existing, out-of-scope real-detector bugs across this
     // proptest's WPM/offset/SNR/text space (Tasks 4-8, not a Task 11
     // tolerance issue -- same "don't force a real bug to pass" principle
-    // this plan applies to V2 in `golden_v2_v3.rs`):
+    // this plan applies to V2 in `golden_v2_v3.rs`). #2 is now fixed
+    // (MAN-5); #1 and #3 still keep this ignored:
     //   1. offset_hz == 0 (channel 0, dead DC center): total decode failure
     //      (zero CharDecoded events) at every WPM/SNR tried. Noted on
     //      <https://github.com/HagaleTechnologies/manta/issues/12>.
     //   2. WPM in roughly [10.0, 10.15]: a sharp decode-garbling cliff
-    //      (CER > 1) clearing completely by 10.2 WPM, independent of
-    //      text/offset/SNR. Filed as
-    //      <https://github.com/HagaleTechnologies/manta/issues/22>.
+    //      (CER > 1) clearing completely by 10.2 WPM. Filed as
+    //      <https://github.com/HagaleTechnologies/manta/issues/22>. FIXED
+    //      (MAN-5): the decoder leased at track promotion joins mid-mark,
+    //      and that truncated first mark seeded the speed tracker's dit
+    //      centroid; `TrackDecoder::new_mid_signal` keeps it out. Pinned by
+    //      `regression_man5_wpm_floor.rs`. The WPM range below stays at the
+    //      full 10.0 floor; do not narrow it to dodge this.
     //   3. Some other (text, wpm, offset, snr) combinations well outside
     //      both of the above (e.g. wpm=18.117826, offset=-20kHz, snr=28dB,
     //      text "AU") produce *persistent, non-converging* garbled decode
@@ -102,7 +107,7 @@ proptest! {
     // Given #3's breadth (not confined to a narrow, excludable parameter
     // band the way #1 and #2 are), narrowing the proptest strategy further
     // isn't a real fix, just whack-a-mole -- re-ignoring instead of forcing
-    // a pass, per this plan's escalation guidance. Un-ignore once #12/#22/#23
+    // a pass, per this plan's escalation guidance. Un-ignore once #12/#23
     // (or their eventual root cause, possibly shared) are resolved.
     #[test]
     #[ignore]
@@ -135,10 +140,10 @@ proptest! {
         // Loosened from the original exact `CER == 0`: like every other
         // continuously-keyed scenario in this task, the leading
         // repetition(s) played during warmup+confirm are structurally lost.
-        // This tolerance is aspirational pending issues #12/#22/#23 above --
+        // This tolerance is aspirational pending issues #12/#23 above --
         // it holds for the ordinary warmup-floor-only cases but this test
-        // stays `#[ignore]`d because of the three real-bug cases that
-        // violate it regardless of tolerance.
+        // stays `#[ignore]`d because of the two remaining real-bug cases
+        // that violate it regardless of tolerance.
         prop_assert!(
             cer(&texts[0], &report.text) < 0.25,
             "wpm {} snr {} offset {} kHz: keyed {:?} decoded {:?} (CER {:.4})",

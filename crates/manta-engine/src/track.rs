@@ -528,7 +528,10 @@ impl TrackManager {
                     // borrows all of `track`, which would conflict with a
                     // simultaneous `track.decoder.as_mut()` borrow.
                     let freq_hz = track.freq_hz(self.center_freq_hz, self.channel_spacing_hz, n);
-                    track.decoder = Some(TrackDecoder::new(id, self.decode_cfg.clone()));
+                    // MAN-5: promotion lands `confirm_hops` into a mark, so
+                    // the decoder's first run is a truncated tail that must
+                    // not seed its speed tracker (see `new_mid_signal`).
+                    track.decoder = Some(TrackDecoder::new_mid_signal(id, self.decode_cfg.clone()));
                     track.decoder.as_mut().unwrap().set_freq_hz(freq_hz);
                     track.pending.push((hop.power[k].sqrt(), sample_ts));
                 }
