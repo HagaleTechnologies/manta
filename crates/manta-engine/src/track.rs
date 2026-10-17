@@ -625,6 +625,12 @@ pub(crate) struct Track {
     /// `FINE_FREQ_MIN_SNR_DB`; feeds `freq_hz` only. Zero until the first
     /// such hop. A merge survivor keeps its own (D5).
     phase_z: Complex64,
+    /// MAN-114 (Codex review, PR #346): `phase_z` before each of the last
+    /// `CRASH_MIN_HOPS - 1` unsuppressed hops, oldest first. A crash is
+    /// only declared on its `CRASH_MIN_HOPS`-th lifted hop, so on that hop
+    /// the front entry is `phase_z` from before the lift began: the value
+    /// `rollback_phase` restores, as `clean_hist` does for the decoder.
+    phase_hist: VecDeque<Complex64>,
 }
 
 /// MAN-118: adds `decoder`'s garbles since the last call to `quality`, and
@@ -933,6 +939,7 @@ impl Track {
             keying: None,
             qualified: false,
             phase_z: Complex64::new(0.0, 0.0),
+            phase_hist: VecDeque::new(),
         }
     }
 
@@ -1357,6 +1364,27 @@ impl Track {
     /// key-down.
     fn update_phase(&mut self, z: Complex64) {
         self.phase_z += CENTER_EMA_ALPHA * (z - self.phase_z);
+    }
+
+    /// Record `phase_z` at the start of an unsuppressed hop, before that
+    /// hop's `update_phase` (MAN-114, Codex review PR #346).
+    fn note_phase(&mut self) {
+        self.phase_hist.push_back(self.phase_z);
+        if self.phase_hist.len() > CRASH_MIN_HOPS as usize - 1 {
+            self.phase_hist.pop_front();
+        }
+    }
+
+    /// On the hop a crash is declared, undo the phase products of its
+    /// `CRASH_MIN_HOPS - 1` lifted hops before it (MAN-114, Codex review
+    /// PR #346). They were not yet flagged, and `phase_z` is power-weighted:
+    /// a +100 dB crash's onset hops put a +6 dB signal's spot 19 Hz off
+    /// (`freq_across_channel.rs`).
+    fn rollback_phase(&mut self) {
+        if let Some(&z) = self.phase_hist.front() {
+            self.phase_z = z;
+        }
+        self.phase_hist.clear();
     }
 
     /// Absolute Hz for this track's current fine-frequency estimate,
@@ -2009,6 +2037,9 @@ impl TrackManager {
             .crash
             .update(&power_db_vals, self.hop_counter >= self.cfg.warmup_hops);
         let suppress = crash_hop.suppress() && self.cfg.crash_filter != CrashFilter::Off;
+        // MAN-114 (Codex review, PR #346): the hop this crash was declared
+        // on; each track's phase sum drops the lifted hops before it.
+        let crash_onset = suppress && crash_hop.run_hops == 1;
         let hold = crash_hop.hold_decoder() && self.cfg.crash_filter == CrashFilter::Full;
         self.floor.update_holding_reference(&power_db_vals, hold);
         let (rise, drop) = if suppress {
@@ -2106,8 +2137,11 @@ impl TrackManager {
             );
             // MAN-312: a crash's energy would drag the centroid toward
             // wherever the smear happens to peak this hop.
-            if !suppress {
+            if crash_onset {
+                track.rollback_phase();
+            } else if !suppress {
                 track.update_centroid(k, &hop.power, n);
+                track.note_phase();
                 // MAN-114 (SPEC §1.4): key-down hops at >= 6 dB feed the
                 // spot-frequency estimator.
                 if power_db_vals[k] - self.floor.effective_floor_db(k) >= FINE_FREQ_MIN_SNR_DB {

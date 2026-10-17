@@ -557,7 +557,8 @@ where Q25 never fired.
 The hop's outputs are `suppress = in_crash and run_hops ≤ CRASH_MAX_HOPS`
 and `hold_decoder = in_crash and run_hops ≤ CRASH_HOLD_MAX_HOPS`. A crash
 begins on its third lifted hop, so its first two lifted hops are neither
-suppressed nor held; the decoder hold below reaches back past them.
+suppressed nor held; the decoder hold and the phase-sum rollback below
+reach back past them.
 A lift that outlasts `CRASH_MAX_HOPS` is a level change rather than a
 crash (a gain step, or input returning from silence): suppression ends,
 the reference unfreezes and tracks the new level, the lift falls back
@@ -587,6 +588,7 @@ manager does on a hop with `suppress` set:
 | CANDIDATE lifecycles do not step | no | yes | yes |
 | gate EMA `S[k]` held; rise/drop recomputed from the held `S[k]` against the current floor | no | yes | yes |
 | track centroids (§1.4, §2.5) not updated | no | yes | yes |
+| spot-frequency phase sum `Z` (§1.4) not updated, and on the hop the crash begins reset to its value before the two lifted hops that preceded it | no | yes | yes |
 | ACTIVE/HANG lifecycles step on the held rise/drop | no (live rise/drop) | yes | yes |
 | decoder input held at its pre-onset value (hops with `hold_decoder`) | no | no | yes |
 | spectral reference (`FloorBank`'s 40 ms linear-power EMA, SPEC-decode-core-v2 §2.2) held (hops with `hold_decoder`) | no | no | yes |

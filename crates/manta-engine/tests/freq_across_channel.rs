@@ -111,3 +111,96 @@ fn characterize_freq_error_per_table() {
         }
     }
 }
+
+/// Codex review, PR #346: a static crash is only declared on its third
+/// lifted hop, so the two before it reach the phase estimator unless the
+/// track rolls them back. They sit near the 3 dB lift threshold (the crash
+/// is still in the prototype filter's tail), so they only outweigh the
+/// signal for a very strong crash: at +60 and +80 dB they moved the
+/// estimate by at most 1.2 Hz, at +100 dB by 22 Hz. A +100 dB, 5 ms crash
+/// at 10 s on a +6 dB signal half a channel off centre: every frequency
+/// the track reports from the first hop the crash reaches onward stays
+/// within ±10 Hz (+19 Hz before the rollback).
+#[test]
+fn freq_error_within_spec_after_a_static_crash() {
+    use manta_decode::events::DecoderEvent;
+    use manta_testkit::crash::{add_crash, Crash};
+    let fs = 96_000.0;
+    let offset_hz = (BASE_CHANNEL + 0.5) * CHANNEL_SPACING_HZ;
+    let sig = SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
+        text: "CQ CQ DE W1AW W1AW K".into(),
+        loop_text: true,
+        wpm: 20.0,
+        offset_hz,
+        snr_2500_db: 6.0,
+        jitter: None,
+        qsb: None,
+        watterson: None,
+        char_wpm: None,
+        weight: 3.0,
+        char_gap_units: 3.0,
+        word_gap_units: 7.0,
+        rise_ms: 5.0,
+    };
+    let (mut iq, _) = render_scene(std::slice::from_ref(&sig), fs, 20.0, Some(1)).unwrap();
+    let crash_s = 10.0;
+    add_crash(
+        &mut iq,
+        fs,
+        &Crash {
+            start_s: crash_s,
+            width_ms: 5.0,
+            level_db: 100.0,
+            seed: 77,
+        },
+    );
+    let report = decode_samples(&iq, fs, CENTER_FREQ_HZ, &PipelineConfig::default())
+        .expect("the signal decodes through the crash");
+    let primary = report
+        .events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            DecoderEvent::TrackMeta {
+                track_id, freq_hz, ..
+            } if *freq_hz == report.freq_hz => Some(*track_id),
+            _ => None,
+        })
+        .expect("the primary track reported a frequency");
+    let true_hz = CENTER_FREQ_HZ + offset_hz;
+    // A hop's `sample_ts` names its window's oldest sample, so the hops a
+    // crash reaches are labelled up to one prototype-filter length
+    // (85.33 ms, SPEC §1.2) before it starts.
+    const FILTER_S: f64 = 0.1;
+    let after: Vec<f64> = report
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            DecoderEvent::TrackMeta {
+                track_id,
+                sample_ts,
+                freq_hz,
+                ..
+            } if *track_id == primary && *sample_ts as f64 >= (crash_s - FILTER_S) * fs => {
+                Some(freq_hz - true_hz)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!after.is_empty(), "no frequency reported after the crash");
+    let worst = after
+        .iter()
+        .copied()
+        .fold(0.0f64, |w, e| if e.abs() > w.abs() { e } else { w });
+    println!(
+        "{} reports after the crash, worst error {worst:+.2} Hz",
+        after.len()
+    );
+    assert!(
+        worst.abs() <= FREQ_TOL_HZ,
+        "after a +100 dB static crash the reported frequency is off by {worst:+.2} Hz \
+         (SPEC §1.4 tolerance ±{FREQ_TOL_HZ} Hz)"
+    );
+}

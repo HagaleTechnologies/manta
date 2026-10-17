@@ -93,6 +93,17 @@ The choices, each with what it rules out:
    table: one cycle per hop spans 4 channels on every table.
 6. **Merges:** the survivor keeps its own `phase_z`; a loser's state is not
    carried (as MAN-272's D5 does for annotations).
+7. **Static crashes (Codex review, PR #346):** `phase_z` skips suppressed
+   hops (SPEC §2.7), as `center` does. A crash is declared on its third
+   lifted hop, so on that hop each track also restores `phase_z` from
+   before the two lifted hops that preceded it, as the decoder hold does
+   for its input. Without the rollback, a +100 dB, 5 ms crash put a +6 dB
+   signal half a channel off centre 19 Hz off after the crash; at +60 and
+   +80 dB the two hops moved the estimate by at most 1.2 Hz, because they
+   sit near the 3 dB lift threshold (`freq_across_channel.rs`). The
+   rollback does not reach values already reported on those two hops: a
+   `TrackMeta` (every 375 hops) or a promotion that lands on one of them
+   still carries it.
 
 ## Per-table characterisation (MAN-187)
 
