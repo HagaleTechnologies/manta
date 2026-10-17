@@ -87,7 +87,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:d6642b2d8281515140b20a7eb05facde2e4514f7be9119449d8a4f6c9a52522b",
+      "hash": "sha256:46dbe069431a9e5c1fe681d35277bca8a881b72097841924660d7f7240422758",
       "id": "determinism",
       "kind": "gotcha",
       "links": [
@@ -98,12 +98,13 @@
       "path": "pages/determinism.md",
       "sources": [
         "docs/SPEC-decode-core.md#6-determinism-requirements",
-        "ARCHITECTURE.md"
+        "ARCHITECTURE.md",
+        "docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md"
       ],
       "status": "current",
       "title": "What will bite you about the byte-identical decode requirement?",
-      "verified_commit": "d286147",
-      "verified_date": "2026-10-13",
+      "verified_commit": "6596e3a",
+      "verified_date": "2026-10-15",
       "visibility": "public"
     },
     {
@@ -218,7 +219,7 @@
         "CLAUDE.md"
       ],
       "status": "current",
-      "title": "manta — what is this and where do things live?",
+      "title": "manta \u2014 what is this and where do things live?",
       "verified_commit": "d286147",
       "verified_date": "2026-10-13",
       "visibility": "public"
@@ -266,7 +267,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:70ce6a10a24c459e7985a8e31f224298041289617c982c8907375cb9fdf373f1",
+      "hash": "sha256:73012b6f4002a218f3503361244f408d314175ba450b5d27ef9b22899fd982b6",
       "id": "source-reconnect",
       "kind": "gotcha",
       "links": [
@@ -280,6 +281,7 @@
         "crates/manta-cli/src/reconnect.rs",
         "crates/manta-cli/src/reconnect.rs (InputHealthTotals)",
         "crates/manta-input/src/lib.rs (IqSource::take_discontinuity)",
+        "docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md",
         "docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md"
       ],
       "status": "current",
@@ -317,7 +319,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:7b391ba7997d3069396aadb92d486b4997eeaa9f096d37fc52d62fb03d8d8e25",
+      "hash": "sha256:70777e011e96d6b0797b03d61b2c1efa0babebe1a542a1d2b73043e72491b543",
       "id": "spot-validation",
       "kind": "subsystem",
       "links": [
@@ -334,6 +336,7 @@
         "docs/SPEC-decode-core.md#9-configuration-keys",
         "docs/DECISIONS/2026-09-09-beacon-emission-deferred-to-track-close.md",
         "docs/DECISIONS/2026-10-14-man174-deferred-beacon-merge-bookkeeping.md",
+        "docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md",
         "docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md"
       ],
       "status": "current",

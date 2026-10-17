@@ -1362,6 +1362,16 @@ impl Metrics {
         self.set_source_health_at(source, healthy, Instant::now());
     }
 
+    /// MAN-13: `(healthy, registered)` sources, for the status line's
+    /// `inputs=` field.
+    pub fn source_health_counts(&self) -> (usize, usize) {
+        let map = self
+            .source_health
+            .read()
+            .expect("source_health lock poisoned");
+        (map.values().filter(|e| e.healthy).count(), map.len())
+    }
+
     /// MAN-96: `set_source_health` with an explicit observation time, so the
     /// outage counters are testable without sleeping. A healthy -> unhealthy
     /// edge counts one outage and starts its clock; the next unhealthy ->
@@ -1749,7 +1759,17 @@ impl Metrics {
                 .check(now),
         );
 
-        let healthy = checks.iter().all(|c| c.ok);
+        // MAN-13 (D8): with several inputs, the node stays healthy while at
+        // least one of them delivers samples; each input keeps its own
+        // check line, and `manta_source_health{source}` reports the rest.
+        // With one input (or none), every check must pass, as before.
+        let is_source = |c: &HealthCheck| c.name.starts_with("source:");
+        let healthy = if checks.iter().filter(|c| is_source(c)).count() >= 2 {
+            checks.iter().filter(|c| !is_source(c)).all(|c| c.ok)
+                && checks.iter().any(|c| is_source(c) && c.ok)
+        } else {
+            checks.iter().all(|c| c.ok)
+        };
         HealthReport { healthy, checks }
     }
 
@@ -3412,6 +3432,68 @@ mod tests {
         m.set_source_health("file", false);
         m.set_listener_up("telnet", true);
         assert!(!m.health_at(Instant::now()).healthy);
+    }
+
+    /// MAN-13 (D8): every listener up and the decode watchdog passing.
+    fn ready_metrics(sources: &[(&str, bool)]) -> (Metrics, Instant) {
+        let m = Metrics::new();
+        for (name, healthy) in sources {
+            m.set_source_health(name, *healthy);
+        }
+        for l in ["telnet", "json", "metrics"] {
+            m.set_listener_up(l, true);
+        }
+        let t0 = Instant::now();
+        m.arm_decode_watchdog_at(t0);
+        m.set_decode_latency_at(
+            LatencyHistogram {
+                bounds_seconds: vec![0.001],
+                bucket_counts: vec![5, 0],
+                sum_seconds: 0.001,
+            },
+            t0 + Duration::from_secs(1),
+        );
+        (m, t0 + Duration::from_secs(2))
+    }
+
+    #[test]
+    fn health_is_ok_while_one_of_several_inputs_is_healthy() {
+        let (m, now) = ready_metrics(&[("40m", true), ("20m", false), ("15m", true)]);
+        let report = m.health_at(now);
+        assert!(report.healthy);
+        let lines: Vec<&str> = report.checks.iter().map(|c| c.detail.as_str()).collect();
+        assert!(lines.contains(&"source 20m: unhealthy"), "{lines:?}");
+        assert!(lines.contains(&"source 40m: healthy"), "{lines:?}");
+    }
+
+    #[test]
+    fn health_is_unhealthy_when_every_input_is_down() {
+        let (m, now) = ready_metrics(&[("40m", false), ("20m", false)]);
+        assert!(!m.health_at(now).healthy);
+        let (m, now) = ready_metrics(&[("40m", true), ("20m", true)]);
+        m.set_listener_up("json", false);
+        assert!(
+            !m.health_at(now).healthy,
+            "a down listener still fails the node"
+        );
+    }
+
+    #[test]
+    fn source_health_counts_count_healthy_and_registered_sources() {
+        let m = Metrics::new();
+        assert_eq!(m.source_health_counts(), (0, 0));
+        m.set_source_health("40m", true);
+        m.set_source_health("20m", false);
+        m.set_source_health("15m", true);
+        assert_eq!(m.source_health_counts(), (2, 3));
+    }
+
+    #[test]
+    fn health_with_one_input_is_unchanged() {
+        let (m, now) = ready_metrics(&[("file", true)]);
+        assert!(m.health_at(now).healthy);
+        let (m, now) = ready_metrics(&[("file", false)]);
+        assert!(!m.health_at(now).healthy);
     }
 
     #[test]

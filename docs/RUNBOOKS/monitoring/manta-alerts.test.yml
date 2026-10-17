@@ -42,6 +42,29 @@ tests:
               description: "GET /healthz on node1:7302 has failed for 2 minutes: a source is unhealthy, a listener is down or the decode loop has stalled."
               runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantanodeunhealthy"
 
+  # MantaInputDown: input c of node1 stops delivering samples from minute 2;
+  # inputs a and b stay healthy.
+  - interval: 1m
+    input_series:
+      - series: 'manta_source_health{job="manta", instance="node1:7302", source="a"}'
+        values: '1x12'
+      - series: 'manta_source_health{job="manta", instance="node1:7302", source="b"}'
+        values: '1x12'
+      - series: 'manta_source_health{job="manta", instance="node1:7302", source="c"}'
+        values: '1 1 0x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: MantaInputDown
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: MantaInputDown
+        exp_alerts:
+          - exp_labels: {severity: warning, job: manta, instance: "node1:7302", source: c}
+            exp_annotations:
+              summary: "manta input c on node1:7302 is down"
+              description: "The input has delivered no samples for 2 minutes; the node's other inputs keep spotting. See docs/RUNBOOKS/node-health.md."
+              runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantainputdown"
+
   # MantaNoSpots
   #   node1: publishes until minute 10, then nothing: fires from minute 40.
   #   node2: publishes throughout: never fires.

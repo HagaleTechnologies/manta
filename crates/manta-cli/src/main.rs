@@ -37,6 +37,7 @@ mod list_http;
 mod list_refresh;
 mod live_state;
 mod logging;
+mod multi_run;
 mod reconnect;
 mod reload;
 mod source_check;
@@ -475,6 +476,10 @@ enum Command {
     /// the run: soak waits out the rest of --duration before it reports.
     /// Intended for unattended stability runs, not for day-to-day operating.
     Soak {
+        /// With several [[input]] entries in the config, the one to examine,
+        /// by its name. Optional with one input.
+        #[arg(long, value_name = "NAME")]
+        input: Option<String>,
         /// How long to run, in seconds. The run lasts this long even when a
         /// --source recording ends sooner.
         #[arg(long)]
@@ -713,6 +718,10 @@ enum Command {
     // MAN-126: the setup checks live in doctor_checks.rs and clock_check.rs.
     // MAN-235: `strict_exit_code` maps a verdict to its --strict code.
     Doctor {
+        /// With several [[input]] entries in the config, the one to examine,
+        /// by its name. Optional with one input.
+        #[arg(long, value_name = "NAME")]
+        input: Option<String>,
         /// How long to listen for, in seconds (3 to 3600).
         #[arg(long, default_value_t = 10)]
         duration: u64,
@@ -922,6 +931,10 @@ enum Command {
     // docs/DECISIONS/2026-10-11-man127-calibrate-command.md. The source flag
     // block is copied from `Doctor`, as run/soak/doctor each copy it.
     Calibrate {
+        /// With several [[input]] entries in the config, the one to examine,
+        /// by its name. Optional with one input.
+        #[arg(long, value_name = "NAME")]
+        input: Option<String>,
         /// How long to measure, in seconds (10 to 3600). NCDXF beacons take
         /// turns on each frequency, so give them 180.
         #[arg(long, default_value_t = 60)]
@@ -3283,6 +3296,13 @@ struct SourceInfo<'a> {
     /// the supported +/-1000 ppm limit manta advertises bounds that exclude
     /// frequencies from its own spot stream.
     freq_calibration: f64,
+    /// MAN-13 (D15): with several inputs, every input's `(centre,
+    /// passband, calibration)`; `SKIMMER/SETT` advertises their union.
+    /// Empty: the one source above.
+    coverage: &'a [(f64, (f64, f64), f64)],
+    /// MAN-13: the `[[input]]` names, set only with two or more inputs;
+    /// the startup banner then prints the `inputs=` form.
+    inputs: Option<&'a [String]>,
 }
 
 /// MAN-128: the engine's `DecodeLatencySnapshot` and `manta-server`'s
@@ -3683,6 +3703,7 @@ fn start_spot_server(
                     json_addr: json_listener.local_addr()?,
                     metrics_addr: metrics_listener.local_addr()?,
                     live_addr,
+                    inputs: source.inputs,
                 })
             );
 
@@ -3724,13 +3745,17 @@ fn start_spot_server(
                  operator_lat and operator_lon, so deGrid/deLat/deLon name this node's location"
                 );
             }
-            let profile = std::sync::Arc::new(station_profile(
+            let mut profile = station_profile(
                 &cfg,
                 source.dial_freq_hz,
                 source.rf_passband_hz,
                 source.freq_calibration,
                 validation_level,
-            ));
+            );
+            if !source.coverage.is_empty() {
+                profile.sett.segments = manta_server::sett::segments_for_inputs(source.coverage);
+            }
+            let profile = std::sync::Arc::new(profile);
             spawn_tracked_listener(
                 LISTENER_TELNET,
                 metrics.clone(),
@@ -4238,6 +4263,63 @@ struct Resolved {
     /// The flag that replaced a typed `[input]` from the file, if one did:
     /// that file's receiver is then not the one being opened (MAN-127).
     replaced_file_source: Option<&'static str>,
+    /// MAN-13: every `[[input]]` entry, resolved, when the config names two
+    /// or more and no source flag replaced them; empty otherwise (the
+    /// fields above then describe the one receiver). `spec`,
+    /// `freq_correction_ppm`, `dial_freq_hz` and `capture_rate_hz` above
+    /// are the first entry's.
+    inputs: Vec<ResolvedInput>,
+}
+
+/// MAN-13: one `[[input]]` entry, resolved: its own source, receiver
+/// correction, dial and capture rate.
+#[derive(Clone)]
+struct ResolvedInput {
+    name: String,
+    spec: LiveSourceSpec,
+    freq_correction_ppm: f64,
+    dial_freq_hz: Option<f64>,
+    capture_rate_hz: Option<f64>,
+}
+
+/// MAN-13: a one-receiver command (`calibrate`, `doctor`, `soak`, `check`)
+/// against a config with several inputs must say which one it examines.
+/// Narrows `loaded` to the named input; with one input, `name` may name
+/// it or be omitted.
+fn select_input(loaded: &mut config::Loaded, name: Option<&str>, command: &str) -> Result<()> {
+    let origin = loaded.origin.clone();
+    let names: Vec<&str> = loaded.inputs.iter().map(|n| n.name.as_str()).collect();
+    let index = match name {
+        None if names.len() < 2 => return Ok(()),
+        None => {
+            let options = match names.split_last() {
+                Some((last, rest)) => format!(
+                    "{} or --input {last}",
+                    rest.iter()
+                        .map(|n| format!("--input {n}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                None => String::new(),
+            };
+            bail!(
+                "manta {command} checks one receiver at a time and {origin} has {} inputs: pass \
+                 {options}",
+                names.len()
+            );
+        }
+        Some(name) => names.iter().position(|n| *n == name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--input {} is not one of {origin}'s inputs ({})",
+                fmt::quoted(name),
+                names.join(", ")
+            )
+        })?,
+    };
+    let chosen = loaded.inputs[index].clone();
+    loaded.input = chosen.input.clone();
+    loaded.inputs = vec![chosen];
+    Ok(())
 }
 
 /// MAN-301: the flag enables; a non-empty `--rbn-spotter` replaces
@@ -4283,6 +4365,72 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
     );
     let mut replaced_file_source = None;
     let (cli_realtime, cli_loop) = (cli.realtime, cli.loop_replay);
+    // MAN-13: several `[[input]]` entries, unless a source flag picks one
+    // receiver instead.
+    let several = loaded.inputs.len() >= 2;
+    if several {
+        if let Some(flag) = cli.source_selector() {
+            notes.push(format!(
+                "note: {flag} selects the source; ignoring the {} [[input]] entries from {}",
+                loaded.inputs.len(),
+                loaded.origin
+            ));
+            let spec = cli.into_spec();
+            let replay = resolve_replay_mode(cli_realtime, cli_loop, None, &spec)?;
+            return Ok(Resolved {
+                spec,
+                replay,
+                freq_correction_ppm: freq_correction_ppm.unwrap_or(0.0),
+                dial_freq_hz,
+                capture_rate_hz,
+                replay_epoch,
+                spot,
+                rbn_compare,
+                notes,
+                replaced_file_source: Some(flag),
+                inputs: Vec::new(),
+            });
+        }
+        for (flag, set) in [
+            ("--freq-correction-ppm", freq_correction_ppm.is_some()),
+            ("--dial-freq-hz", dial_freq_hz.is_some()),
+            ("--capture-rate-hz", capture_rate_hz.is_some()),
+        ] {
+            if set {
+                let key = match flag {
+                    "--freq-correction-ppm" => "freq_correction_ppm",
+                    "--dial-freq-hz" => "center_freq_hz",
+                    _ => "capture_rate_hz",
+                };
+                bail!(
+                    "{flag} applies to one receiver and {} has {} [[input]] entries; set {key} \
+                     in the entry, or name one receiver with a source flag",
+                    loaded.origin,
+                    loaded.inputs.len()
+                );
+            }
+        }
+    }
+    let inputs = if several {
+        loaded
+            .inputs
+            .iter()
+            .map(|n| {
+                let Some(source) = &n.input.source else {
+                    bail!("[[input]] {} has no type", fmt::quoted(&n.name));
+                };
+                Ok(ResolvedInput {
+                    name: n.name.clone(),
+                    spec: spec_from_file(source, cli.source_iq)?,
+                    freq_correction_ppm: n.input.shared.freq_correction_ppm.unwrap_or(0.0),
+                    dial_freq_hz: n.input.shared.center_freq_hz,
+                    capture_rate_hz: n.input.shared.capture_rate_hz,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
     // MAN-269 D3: a config `type = "file"` source contributes its own
     // realtime/loop only when no CLI flag selects the source.
     let file_replay = match (cli.source_selector(), &loaded.input.source) {
@@ -4320,6 +4468,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
         rbn_compare,
         notes,
         replaced_file_source,
+        inputs,
     })
 }
 
@@ -4559,10 +4708,32 @@ struct SourcePrepared {
     resolved: Resolved,
 }
 
-fn prepare_source(cli: CliOverrides, config_flag: Option<PathBuf>) -> Result<SourcePrepared> {
+/// MAN-13: a command that examines one receiver, and the `--input` it was
+/// given (see `select_input`).
+#[derive(Debug, Clone, Copy)]
+struct OneInput<'a> {
+    command: &'a str,
+    name: Option<&'a str>,
+}
+
+/// A source flag names a standalone receiver and `resolve` ignores the
+/// configured entries for it, so only an explicit `--input` still narrows
+/// them (Codex, PR 313).
+fn needs_input_selection(cli: &CliOverrides, one: OneInput<'_>) -> bool {
+    one.name.is_some() || cli.source_selector().is_none()
+}
+
+fn prepare_source(
+    cli: CliOverrides,
+    config_flag: Option<PathBuf>,
+    one: OneInput<'_>,
+) -> Result<SourcePrepared> {
     let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
     let config_path = config_flag.or_else(|| config::config_path_from_env(&vars));
-    let loaded = config::load(config_path.as_deref(), config::Env::Read(&vars))?;
+    let mut loaded = config::load(config_path.as_deref(), config::Env::Read(&vars))?;
+    if needs_input_selection(&cli, one) {
+        select_input(&mut loaded, one.name, one.command)?;
+    }
     let resolved = resolve(cli, &loaded)?;
     for note in &resolved.notes {
         logging::note(note);
@@ -4581,10 +4752,11 @@ fn prepare_live(
     config_flag: Option<PathBuf>,
     cli_engine: Option<Engine>,
     warn_stale_cty: bool,
+    one: Option<OneInput<'_>>,
 ) -> Result<Prepared> {
     let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
     let config_path = config_flag.or_else(|| config::config_path_from_env(&vars));
-    let prepared = prepare_config(cli, config_path, cli_engine, &vars)?;
+    let prepared = prepare_config_for(cli, config_path, cli_engine, &vars, one)?;
     for note in &prepared.resolved.notes {
         logging::note(note);
     }
@@ -4608,7 +4780,22 @@ fn prepare_config(
     cli_engine: Option<Engine>,
     vars: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> Result<Prepared> {
-    let loaded = config::load(config_path.as_deref(), config::Env::Read(vars))?;
+    prepare_config_for(cli, config_path, cli_engine, vars, None)
+}
+
+/// `prepare_config`, narrowed to one input for a one-receiver command
+/// (MAN-13).
+fn prepare_config_for(
+    cli: CliOverrides,
+    config_path: Option<PathBuf>,
+    cli_engine: Option<Engine>,
+    vars: &[(std::ffi::OsString, std::ffi::OsString)],
+    one: Option<OneInput<'_>>,
+) -> Result<Prepared> {
+    let mut loaded = config::load(config_path.as_deref(), config::Env::Read(vars))?;
+    if let Some(one) = one.filter(|one| needs_input_selection(&cli, *one)) {
+        select_input(&mut loaded, one.name, one.command)?;
+    }
     let rbn_opts = cli.rbn.clone();
     let resolved = resolve(cli, &loaded)?;
     check_rbn_compare(&rbn_opts, &loaded, &resolved)?;
@@ -5280,8 +5467,37 @@ fn run_command() -> Result<std::process::ExitCode> {
             // apply, with the CLI over the file.
             let loaded = config::load(config.as_deref(), config::Env::Ignore)?;
             note_ignored_tables(&loaded, "decode", &["decode", "detector", "spot", "input"]);
+            // MAN-13: a recording came from one receiver, and decode cannot
+            // tell which entry that was: entries that disagree on the
+            // correction need --freq-correction-ppm, never the first one's.
+            let several = loaded.inputs.len() >= 2;
+            let ppm_of = |n: &config::NamedInput| n.input.shared.freq_correction_ppm.unwrap_or(0.0);
+            if several
+                && freq_correction_ppm.is_none()
+                && loaded
+                    .inputs
+                    .iter()
+                    .any(|n| ppm_of(n) != ppm_of(&loaded.inputs[0]))
+            {
+                let names: Vec<&str> = loaded.inputs.iter().map(|n| n.name.as_str()).collect();
+                bail!(
+                    "manta decode cannot tell which of {}'s {} inputs ({}) recorded {}: pass \
+                     --freq-correction-ppm with that receiver's correction (0 for none)",
+                    loaded.origin,
+                    names.len(),
+                    names.join(", "),
+                    path.display()
+                );
+            }
             let shared = &loaded.input.shared;
-            if loaded.input.source.is_some()
+            if several {
+                errln!(
+                    "note: decode applies only freq_correction_ppm from the {} [[input]] entries \
+                     in {}",
+                    loaded.inputs.len(),
+                    loaded.origin
+                );
+            } else if loaded.input.source.is_some()
                 || shared.center_freq_hz.is_some()
                 || shared.capture_rate_hz.is_some()
                 || shared.replay_epoch.is_some()
@@ -5533,7 +5749,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 resolved,
                 pipeline: cfg,
                 lists_in_use,
-            } = prepare_live(cli, config, engine, false)?;
+            } = prepare_live(cli, config, engine, false, None)?;
             // MAN-79's stale built-in cty.dat warning, before any I/O,
             // unless the cache may replace that copy: `prepare_run_lists`
             // warns then, once it has chosen (MAN-316).
@@ -5555,6 +5771,51 @@ fn run_command() -> Result<std::process::ExitCode> {
             // only; `config check` keeps the broad placeholder scan. See
             // docs/DECISIONS/2026-10-10-man268-unattended-packaging.md.
             config_cmd::reject_example_callsigns(&loaded)?;
+            // MAN-13: several [[input]] entries decode on their own threads
+            // into one validator and one spot output.
+            if !resolved.inputs.is_empty() {
+                // MAN-316: as with one input; mixing file and live inputs
+                // is refused, so the first input's kind is every input's,
+                // and `prepare_run_lists` warns of a stale copy once the
+                // cache has had its say.
+                let live = resolved.inputs.iter().any(|i| i.spec.is_reconnectable());
+                let run_lists = prepare_run_lists(live, &resolved.spot, lists_in_use, &cfg)?;
+                let mut cfg = cfg;
+                if run_lists.refresh.is_some() {
+                    cfg.cty = Some(run_lists.lists.cty.load());
+                    cfg.scp = Some(run_lists.lists.scp.load());
+                }
+                let server = match loaded.server.clone() {
+                    None => None,
+                    Some(server_cfg) => Some(multi_run::ServerSetup {
+                        cfg: server_cfg,
+                        rbn_uplink: loaded.rbn_uplink.clone(),
+                        rbn_compare: resolved.rbn_compare.clone(),
+                        replay_epoch: resolved.replay_epoch,
+                    }),
+                };
+                #[cfg(unix)]
+                let reload = Some(multi_run::ReloadSetup {
+                    config_path: config_path.clone(),
+                    cli: reload_cli,
+                    cli_engine: engine,
+                    vars,
+                    startup_raw: loaded.raw.clone(),
+                });
+                #[cfg(not(unix))]
+                let reload = None;
+                return multi_run::run(multi_run::MultiRun {
+                    inputs: &resolved.inputs,
+                    replay: resolved.replay,
+                    cfg: &cfg,
+                    json,
+                    decoded_text,
+                    server,
+                    run_lists,
+                    spot: &resolved.spot,
+                    reload,
+                });
+            }
             let spec = &resolved.spec;
             let dial_freq_hz = resolved.dial_freq_hz;
             // The resolved (CLI > env > file) capture rate, for the first open
@@ -5771,6 +6032,8 @@ fn run_command() -> Result<std::process::ExitCode> {
                             dial_freq_hz: first.center_freq_hz(),
                             rf_passband_hz: first.rf_passband_hz(),
                             freq_calibration,
+                            coverage: &[],
+                            inputs: None,
                         },
                         epoch,
                         session_nonce,
@@ -6365,6 +6628,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             stdout_lines.finish()?;
         }
         Command::Soak {
+            input,
             duration,
             device,
             source,
@@ -6461,6 +6725,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                 config,
                 None,
                 true,
+                Some(OneInput {
+                    command: "soak",
+                    name: input.as_deref(),
+                }),
             )?;
             if loaded.server.is_some() {
                 errln!(
@@ -6539,6 +6807,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             ));
         }
         Command::Doctor {
+            input,
             duration,
             device,
             source,
@@ -6653,6 +6922,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                 config,
                 None,
                 true,
+                Some(OneInput {
+                    command: "doctor",
+                    name: input.as_deref(),
+                }),
             )?;
             note_pinned_lists(&resolved.spot, &lists_in_use);
             if let Some(note) = replay_mode_ignored_note("doctor", resolved.replay, &loaded.origin)
@@ -6764,6 +7037,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             }
         }
         Command::Calibrate {
+            input,
             duration,
             reference_hz,
             search_ppm,
@@ -6797,6 +7071,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             write,
             json,
         } => calibrate_cmd::run(calibrate_cmd::CalibrateArgs {
+            input,
             duration_secs: duration,
             reference_hz,
             search_ppm,
@@ -7595,6 +7870,8 @@ mod tests {
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0),
                 freq_calibration: 1.0,
+                coverage: &[],
+                inputs: None,
             },
             std::time::UNIX_EPOCH,
             0,
@@ -7644,6 +7921,8 @@ mod tests {
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0),
                 freq_calibration: 1.0,
+                coverage: &[],
+                inputs: None,
             },
             std::time::UNIX_EPOCH,
             0,
@@ -8064,6 +8343,8 @@ mod tests {
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
                 freq_calibration: 1.0,                 // --freq-correction-ppm 0
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -8124,6 +8405,8 @@ mod tests {
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
                 freq_calibration: 1.0,                 // --freq-correction-ppm 0
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -8978,6 +9261,8 @@ mod tests {
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
                 freq_calibration: 1.0,                 // --freq-correction-ppm 0
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -9039,6 +9324,8 @@ mod tests {
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
                 freq_calibration: 1.0,                 // --freq-correction-ppm 0
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -9098,6 +9385,8 @@ mod tests {
                 dial_freq_hz: 14_040_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
                 freq_calibration: 1.0,                 // --freq-correction-ppm 0
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -9133,6 +9422,8 @@ mod tests {
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0),
                 freq_calibration: 1.0,
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -9243,6 +9534,8 @@ mod tests {
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0),
                 freq_calibration: 1.0,
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -9301,6 +9594,8 @@ mod tests {
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
                 freq_calibration: 1.0,                 // --freq-correction-ppm 0
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -9974,6 +10269,169 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     const KIWI_INPUT: &str =
         "[input]\ntype = \"kiwi\"\nhost = \"127.0.0.1\"\nfreq_hz = 14025000.0\n\
                               freq_correction_ppm = 2.5\ncenter_freq_hz = 14000000.0\n";
+
+    // ---- MAN-13: several [[input]] entries ----
+
+    const THREE_KA9Q: &str = "[[input]]\nname = \"40m\"\ntype = \"ka9q\"\ngroup = \"239.1.2.3\"\n\
+        ssrc = 7030000\n\n[[input]]\nname = \"20m\"\ntype = \"ka9q\"\ngroup = \"239.1.2.3\"\n\
+        ssrc = 14030000\nfreq_correction_ppm = -1.5\ncapture_rate_hz = 48000.0\n\n\
+        [[input]]\nname = \"15m\"\ntype = \"kiwi\"\nhost = \"127.0.0.1\"\n\
+        freq_hz = 21030000.0\ncenter_freq_hz = 21000000.0\nfreq_correction_ppm = 0.8\n";
+
+    #[test]
+    fn resolve_returns_one_resolved_input_per_entry_with_its_own_ppm_dial_and_capture_rate() {
+        let loaded = loaded_from(THREE_KA9Q);
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        let names: Vec<&str> = r.inputs.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["40m", "20m", "15m"]);
+        assert!(matches!(r.inputs[0].spec, LiveSourceSpec::Ka9q(_)));
+        assert!(matches!(r.inputs[2].spec, LiveSourceSpec::Kiwi(_)));
+        assert_eq!(r.inputs[0].freq_correction_ppm, 0.0);
+        assert_eq!(r.inputs[1].freq_correction_ppm, -1.5);
+        assert_eq!(r.inputs[1].capture_rate_hz, Some(48_000.0));
+        assert_eq!(r.inputs[2].freq_correction_ppm, 0.8);
+        assert_eq!(r.inputs[2].dial_freq_hz, Some(21_000_000.0));
+        assert_eq!(r.inputs[0].dial_freq_hz, None);
+    }
+
+    #[test]
+    fn a_cli_source_flag_replaces_the_input_list_with_a_note() {
+        let loaded = loaded_from(THREE_KA9Q);
+        let cli = CliOverrides {
+            kiwi: KiwiOpts {
+                host: Some("kiwi.example.net".into()),
+                port: 8073,
+                freq: Some(14_030_000.0),
+                password: String::new(),
+            },
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded).unwrap();
+        assert!(r.inputs.is_empty());
+        assert!(matches!(r.spec, LiveSourceSpec::Kiwi(_)));
+        assert_eq!(r.freq_correction_ppm, 0.0);
+        assert_eq!(
+            r.notes,
+            vec![format!(
+                "note: --kiwi-host selects the source; ignoring the 3 [[input]] entries from {}",
+                loaded.origin
+            )]
+        );
+    }
+
+    #[test]
+    fn per_receiver_cli_flags_are_refused_with_two_or_more_inputs() {
+        let loaded = loaded_from(THREE_KA9Q);
+        for (cli, flag, key) in [
+            (
+                CliOverrides {
+                    freq_correction_ppm: Some(1.0),
+                    ..cli_overrides()
+                },
+                "--freq-correction-ppm",
+                "freq_correction_ppm",
+            ),
+            (
+                CliOverrides {
+                    dial_freq_hz: Some(7_000_000.0),
+                    ..cli_overrides()
+                },
+                "--dial-freq-hz",
+                "center_freq_hz",
+            ),
+            (
+                CliOverrides {
+                    capture_rate_hz: Some(48_000.0),
+                    ..cli_overrides()
+                },
+                "--capture-rate-hz",
+                "capture_rate_hz",
+            ),
+        ] {
+            let err = resolve(cli, &loaded).err().unwrap().to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "{flag} applies to one receiver and {} has 3 [[input]] entries; set {key} in \
+                     the entry, or name one receiver with a source flag",
+                    loaded.origin
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn realtime_loop_and_replay_epoch_flags_apply_to_every_file_input() {
+        let loaded = loaded_from(
+            "[[input]]\nname = \"a\"\ntype = \"file\"\npath = \"/x/a.wav\"\n\n\
+             [[input]]\nname = \"b\"\ntype = \"file\"\npath = \"/x/b.wav\"\n",
+        );
+        let cli = CliOverrides {
+            realtime: true,
+            replay_epoch: Some(1_700_000_000),
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded).unwrap();
+        assert_eq!(r.inputs.len(), 2);
+        assert!(r.replay.paced);
+        assert_eq!(r.replay_epoch, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn single_input_resolution_is_unchanged() {
+        let loaded = loaded_from(KIWI_INPUT);
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        assert!(r.inputs.is_empty());
+        assert!(matches!(r.spec, LiveSourceSpec::Kiwi(_)));
+        assert_eq!(r.freq_correction_ppm, 2.5);
+        assert_eq!(r.dial_freq_hz, Some(14_000_000.0));
+    }
+
+    #[test]
+    fn select_input_requires_a_name_with_two_or_more_inputs() {
+        let mut loaded = loaded_from(THREE_KA9Q);
+        let err = select_input(&mut loaded, None, "doctor")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "manta doctor checks one receiver at a time and {} has 3 inputs: pass --input \
+                 40m, --input 20m or --input 15m",
+                loaded.origin
+            )
+        );
+    }
+
+    #[test]
+    fn select_input_refuses_an_unknown_name() {
+        let mut loaded = loaded_from(THREE_KA9Q);
+        let err = select_input(&mut loaded, Some("nope"), "check")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "--input \"nope\" is not one of {}'s inputs (40m, 20m, 15m)",
+                loaded.origin
+            )
+        );
+        select_input(&mut loaded, Some("20m"), "check").unwrap();
+        assert_eq!(loaded.inputs.len(), 1);
+        assert_eq!(loaded.input.shared.freq_correction_ppm, Some(-1.5));
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        assert!(r.inputs.is_empty());
+        assert_eq!(r.freq_correction_ppm, -1.5);
+        assert_eq!(r.capture_rate_hz, Some(48_000.0));
+    }
+
+    #[test]
+    fn select_input_accepts_the_single_inputs_name_or_none() {
+        let mut loaded = loaded_from(KIWI_INPUT);
+        select_input(&mut loaded, None, "soak").unwrap();
+        select_input(&mut loaded, Some("kiwi"), "soak").unwrap();
+        assert!(select_input(&mut loaded, Some("other"), "soak").is_err());
+    }
 
     #[test]
     fn cli_source_flag_discards_a_typed_input_layer_with_a_note() {
@@ -10679,6 +11137,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         "quiet",
         "log_level",
         "log_format",
+        // `--input NAME` (MAN-13): picks one `[[input]]` entry by name.
+        "input",
     ];
 
     /// MAN-124: `run`'s `Logging` flags, parsed (or refused) by clap.
@@ -11015,6 +11475,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0),
                 freq_calibration: 1.0,
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -11064,6 +11526,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0),
                 freq_calibration: 1.0,
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,

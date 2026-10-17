@@ -162,6 +162,11 @@
 # Each type reads only its own settings below; "required" ones must be set.
 #type = "kiwi"
 
+# This receiver's name in logs, metrics and --input; unset uses its
+# type. Several receivers in one daemon: write this table as [[input]] once
+# per receiver, each with its own name and type (see docs/CONFIG.md).
+#name = "20m"
+
 # type = "audio", a sound card:
 #device = "USB Audio"                # no default (the system's default input); part of the device's name
 

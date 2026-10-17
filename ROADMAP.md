@@ -187,6 +187,7 @@ confidence weighting. ONNX/candle inference, feature-gated.
 ## Post-1.0 candidates (explicitly deferred)
 
 - RTTY/FT4-adjacent modes on the same channelizer.
-- Multi-SDR single-daemon orchestration.
+- ~~Multi-SDR single-daemon orchestration.~~ Pulled forward and delivered by
+  MAN-13 (`[[input]]`); several receivers on one HPSDR radio remain MAN-307.
 - Spot quality feedback loop: cqdx-side confirmation (same call spotted by other
   nodes) fed back to tune validation thresholds.
