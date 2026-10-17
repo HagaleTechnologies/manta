@@ -1226,6 +1226,26 @@ mod tests {
             assert_eq!(src.counters.malformed_packets(), 0);
         }
 
+        /// MAN-13 topology B: two receiver channels of one radiod, each its
+        /// own `[[input]]`, open at once on one group and port and each read
+        /// only its own channel.
+        #[test]
+        fn two_sources_with_different_ssrcs_on_one_group_each_read_their_own_channel() {
+            let (a, b) = (7_030_000, 14_030_000);
+            let f = FakeRadiod::start(vec![channel(a, 7_030_000.0), channel(b, 14_030_000.0)]);
+            let mut src_a = Ka9qIqSource::open(f.config(Some(a))).unwrap();
+            let mut src_b = Ka9qIqSource::open(f.config(Some(b))).unwrap();
+            assert_eq!(src_a.center_freq_hz(), 7_030_000.0);
+            assert_eq!(src_b.center_freq_hz(), 14_030_000.0);
+            let (want_a, want_b) = (ramp(180, 11), ramp(180, 99));
+            f.send_rtp(a, 1, Encoding::F32Le, &want_a);
+            f.send_rtp(b, 1, Encoding::F32Le, &want_b);
+            assert_eq!(read_n(&mut src_a, 180), want_a);
+            assert_eq!(read_n(&mut src_b, 180), want_b);
+            assert_eq!(src_a.counters.malformed_packets(), 0);
+            assert_eq!(src_b.counters.malformed_packets(), 0);
+        }
+
         /// Codex review round 3 (PR #284): with no `ssrc`, the 1.5 s settle
         /// window used to leave the data socket undrained, so a stream
         /// faster than the kernel's default receive grant (~416 KiB) was
