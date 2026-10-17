@@ -1208,6 +1208,12 @@ pub(crate) fn run_input_front(
         }
         let n = src.read(&mut calib[filled..])?;
         if n == 0 {
+            // MAN-252, as `listen_with_observers`: a live source's wrapper
+            // reports a stop request during an outage as EOF; that is the
+            // stop, not a source that ended.
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             anyhow::bail!("audio source ended during startup calibration");
         }
         if let Some(gap) = src.take_discontinuity() {
@@ -3642,6 +3648,61 @@ mod tests {
             Some(0),
             "the stopped run must still end through finish(), got {counts:?}"
         );
+    }
+
+    /// MAN-13 x MAN-252 (Codex, PR 313): an input of a multi-input session
+    /// whose EOF during calibration follows a stop request ends cleanly, as
+    /// the one-input path does, and an unasked EOF there is still an error.
+    #[test]
+    fn a_multi_input_eof_after_a_stop_request_during_calibration_is_a_clean_end() {
+        for stops_at_eof in [true, false] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let src_stop = stop.clone();
+            let opened = crate::multi::open_inputs(
+                vec![crate::multi::InputSpec {
+                    name: "a".into(),
+                    open: Box::new(move || {
+                        Ok(Box::new(EndsDuringCalibrationSource {
+                            stop: src_stop,
+                            stops_at_eof,
+                            reads: 0,
+                        }) as Box<dyn IqSource>)
+                    }),
+                    freq_correction_ppm: 0.0,
+                    observers: Default::default(),
+                }],
+                stop,
+            )
+            .unwrap();
+            let ends = crate::multi::listen_inputs(
+                opened,
+                &PipelineConfig::default(),
+                crate::multi::SessionClock::Replay,
+                crate::multi::SharedObservers::default(),
+                |_| {},
+                |_| {},
+                |_, _| {},
+                |_| {},
+            )
+            .unwrap();
+            if stops_at_eof {
+                assert!(
+                    ends[0].result.is_ok(),
+                    "an EOF that follows a stop request is a clean shutdown: {:?}",
+                    ends[0].result
+                );
+            } else {
+                let err = ends[0]
+                    .result
+                    .as_ref()
+                    .expect_err("an unasked EOF is an error");
+                assert!(
+                    err.to_string()
+                        .contains("audio source ended during startup calibration"),
+                    "got: {err}"
+                );
+            }
+        }
     }
 
     /// The control: an EOF during calibration with no stop request is still
