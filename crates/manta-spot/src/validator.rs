@@ -9,6 +9,7 @@ use crate::decision::{CandidateSupport, Decision, Reason, Rival};
 use crate::dedupe::Dedupe;
 use crate::gate::{RepetitionCounts, RepetitionGate, WINDOW_SECONDS as GATE_WINDOW_SECONDS};
 use crate::grammar;
+use crate::message;
 use crate::notch::NotchList;
 use crate::scp;
 use crate::support::SupportLedger;
@@ -59,6 +60,15 @@ pub struct Spot {
     pub confidence: f32,
     pub track_id: u32,
     pub sample_ts: u64,
+    /// The most recent RST signal report this spot's track decoded before
+    /// the spot was built, as three digits (`5NN` -> `"599"`), or `None`
+    /// (MAN-272 decision D4). Read from the emitting track only; a report a
+    /// merged-away track decoded is not carried (D5).
+    pub rst: Option<String>,
+    /// Set when this spot's track decoded `QRL?` before the spot was built.
+    /// Sticky for the track's life and never forwarded through a merge
+    /// (MAN-272 decisions D4/D5).
+    pub qrl_query: bool,
 }
 
 #[derive(Default)]
@@ -185,6 +195,13 @@ struct TrackState {
     /// Captured non-allowlisted Beacon candidates awaiting the track's
     /// true close -- see `PendingBeacon`'s doc comment.
     pending_beacons: Vec<PendingBeacon>,
+    /// The most recent RST any completed word on this track carried
+    /// (last value wins), scanned at word push so it outlives the word's
+    /// `WORD_WINDOW` slot (MAN-272 decision D4).
+    rst: Option<String>,
+    /// Set once any completed word on this track was `QRL?`; sticky until
+    /// this state is removed on `TrackClosed` (MAN-272 decision D4).
+    qrl_query: bool,
 }
 
 /// A `freq_correction_ppm` value that doesn't yield a finite, positive
@@ -394,6 +411,9 @@ pub struct Validator {
     /// MAN-324: the opt-in decision log (`record_decisions`). `None`, the
     /// default, records nothing and allocates nothing.
     decisions: Option<Vec<Decision>>,
+    /// MAN-13: inputs interleaving their track ids into this validator
+    /// (`with_input_count`).
+    input_count: u32,
 }
 
 /// How often (in seconds of `sample_ts`) the repetition gate is swept
@@ -436,7 +456,24 @@ impl Validator {
             gate_window_samples: (GATE_WINDOW_SECONDS * fs) as u64,
             merged_into: BTreeMap::new(),
             decisions: None,
+            input_count: 1,
         }
+    }
+
+    /// MAN-13: the number of inputs whose interleaved track ids feed this
+    /// validator. Input `i` of `n` numbers its tracks `1+i, 1+i+n, ...`
+    /// (`TrackIdSpace` in `manta-engine`), so a track's input is
+    /// `(track_id - 1) % n`, and dedupe treats a different input's report
+    /// of a stored spot as a duplicate for the whole window (D6). `1` (the
+    /// default) is the single-input validator, unchanged. `0` is taken as 1.
+    pub fn with_input_count(mut self, n: u32) -> Self {
+        self.input_count = n.max(1);
+        self
+    }
+
+    /// MAN-13: the input that spawned `track_id` (see `with_input_count`).
+    pub fn input_of(&self, track_id: u32) -> u32 {
+        track_id.saturating_sub(1) % self.input_count
     }
 
     /// Replace the independent callsign-pattern reference table.
@@ -667,6 +704,13 @@ impl Validator {
                 let mut newly_completed: Option<(String, u64, f32)> = None;
                 if !track.current.text.is_empty() {
                     let mut word = std::mem::take(&mut track.current);
+                    // MAN-272: scan the word that just completed, so "most
+                    // recent RST" is a per-track fact that survives
+                    // WORD_WINDOW aging (D4).
+                    if let Some(rst) = message::parse_rst(&word.text) {
+                        track.rst = Some(rst);
+                    }
+                    track.qrl_query |= message::is_qrl_query(&word.text);
                     word.seq = track.next_word_seq;
                     track.next_word_seq += 1;
                     newly_completed = Some((
@@ -791,6 +835,10 @@ impl Validator {
                         // recreating a dead track_id's state that no
                         // close would ever free.
                         let root = survivor_track_id.map(|s| self.resolve_survivor_root(s));
+                        // RST/QRL? annotations are deliberately NOT
+                        // migrated: they end with this track's `TrackState`
+                        // like its words do (MAN-272 D5, see
+                        // docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md).
                         self.migrate_or_discard_pending_beacons(*track_id, root);
                         // MAN-100 message-distinctness (Codex review, PR
                         // #133 rounds 3-5): a survivor exists, so this
@@ -1398,14 +1446,19 @@ impl Validator {
             return None;
         }
 
-        if !self
-            .dedupe
-            .should_emit(&candidate, freq_hz, snr_db, spot_type, sample_ts)
-        {
+        if !self.dedupe.should_emit(
+            &candidate,
+            freq_hz,
+            snr_db,
+            spot_type,
+            sample_ts,
+            self.input_of(track_id),
+        ) {
             self.decide(|| withheld(Reason::Dedupe).with_reps(reps));
             return None;
         }
 
+        let (rst, qrl_query) = self.track_annotations(track_id);
         let spot = Spot {
             callsign: candidate,
             freq_hz,
@@ -1415,6 +1468,8 @@ impl Validator {
             confidence,
             track_id,
             sample_ts,
+            rst,
+            qrl_query,
         };
         self.decide(|| Decision::spotted(&spot, reps));
         Some(spot)
@@ -1544,6 +1599,14 @@ impl Validator {
         current
     }
 
+    /// MAN-272: the RST/QRL? annotations a spot emitted under `track_id`
+    /// carries, read when the spot is built (D6).
+    fn track_annotations(&self, track_id: u32) -> (Option<String>, bool) {
+        self.tracks
+            .get(&track_id)
+            .map_or((None, false), |t| (t.rst.clone(), t.qrl_query))
+    }
+
     /// A `ClosureKind::Bookkeeping` closure is not evidence this
     /// identity's signal ended (round 9) -- move its `PendingBeacon`s to
     /// the surviving track (a merge) so they're judged by ITS eventual
@@ -1624,6 +1687,7 @@ impl Validator {
                 std::mem::take(&mut track.pending_beacons),
             )
         };
+        let (rst, qrl_query) = self.track_annotations(track_id);
         // An unconfirmed `wpm` (still its `0.0` default) is not evidence of
         // a genuine slow speed -- refuse to resolve rather than let a
         // never-measured survivor pass the plausibility check on a
@@ -1708,12 +1772,14 @@ impl Validator {
                         return None;
                     }
                 }
+                let input = self.input_of(pb.origin_track_id);
                 if !self.dedupe.should_emit(
                     &pb.candidate,
                     pb.freq_hz,
                     pb.snr_db,
                     SpotType::Beacon,
                     pb.sample_ts,
+                    input,
                 ) {
                     self.decide(|| beacon_decision(track_id, &pb, Reason::Dedupe).with_reps(reps));
                     return None;
@@ -1727,6 +1793,8 @@ impl Validator {
                     confidence,
                     track_id,
                     sample_ts: pb.sample_ts,
+                    rst: rst.clone(),
+                    qrl_query,
                 };
                 self.decide(|| Decision::spotted(&spot, reps));
                 Some(spot)
@@ -2170,6 +2238,86 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert_eq!(v.candidates_for(2, 500_000).len(), 1);
     }
 
+    // ---- MAN-13: several inputs, one validator ----
+
+    fn meta_at(v: &mut Validator, track_id: u32, freq_hz: f64) {
+        v.ingest(&DecoderEvent::TrackMeta {
+            track_id,
+            sample_ts: 0,
+            snr_2500_db: 20.0,
+            freq_hz,
+        });
+    }
+
+    /// Two tracks' transmissions, interleaved by `sample_ts` the way the
+    /// multi-input merge delivers them.
+    fn interleaved(a: (u32, &str), b: (u32, &str), start_ts: u64) -> Vec<DecoderEvent> {
+        let mut events = transmission_events(a.0, &["DE", a.1, "K"], start_ts);
+        events.extend(transmission_events(b.0, &["DE", b.1, "K"], start_ts + 50));
+        events.sort_by_key(|e| match e {
+            DecoderEvent::CharDecoded { sample_ts, .. }
+            | DecoderEvent::WordBoundary { sample_ts, .. } => *sample_ts,
+            _ => 0,
+        });
+        events
+    }
+
+    #[test]
+    fn input_count_maps_interleaved_track_ids_to_inputs() {
+        let v = Validator::new(FS, CTY_FIXTURE, None).with_input_count(3);
+        let inputs: Vec<u32> = [1, 4, 2, 5, 3].iter().map(|&id| v.input_of(id)).collect();
+        assert_eq!(inputs, vec![0, 0, 1, 1, 2]);
+        let single = Validator::new(FS, CTY_FIXTURE, None);
+        assert_eq!(single.input_of(7), 0);
+    }
+
+    #[test]
+    fn two_inputs_hearing_one_station_spot_it_once() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None).with_input_count(2);
+        // The measured 3 Hz disagreement, straddling the gate's 100 Hz
+        // bucket edge at 14_012_350 Hz.
+        meta_at(&mut v, 1, 14_012_349.9);
+        meta_at(&mut v, 2, 14_012_352.7);
+        let mut spots = Vec::new();
+        for start in [0, 100_000, 200_000] {
+            spots.extend(run(&interleaved((1, "K5ARH"), (2, "K5ARH"), start), &mut v));
+        }
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        assert_eq!(spots[0].callsign, "K5ARH");
+    }
+
+    #[test]
+    fn two_inputs_hearing_two_stations_spot_both() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None).with_input_count(2);
+        meta_at(&mut v, 1, 14_012_340.0);
+        meta_at(&mut v, 2, 14_085_000.0);
+        let mut spots = Vec::new();
+        for start in [0, 100_000] {
+            spots.extend(run(&interleaved((1, "K5ARH"), (2, "W1AW"), start), &mut v));
+        }
+        let mut calls: Vec<&str> = spots.iter().map(|s| s.callsign.as_str()).collect();
+        calls.sort_unstable();
+        assert_eq!(calls, vec!["K5ARH", "W1AW"]);
+    }
+
+    #[test]
+    fn one_input_validator_is_unchanged() {
+        let scene = |v: &mut Validator| {
+            seed_meta(v, 1);
+            let words = ["DE", "K5ARH", "K"];
+            let mut spots = run(&transmission_events(1, &words, 0), v);
+            spots.extend(run(&transmission_events(1, &words, 100_000), v));
+            spots.extend(run(
+                &transmission_events(1, &["DE", "K5ARH", "K"], 900_000),
+                v,
+            ));
+            format!("{spots:?}")
+        };
+        let mut default = Validator::new(FS, CTY_FIXTURE, None);
+        let mut one = Validator::new(FS, CTY_FIXTURE, None).with_input_count(1);
+        assert_eq!(scene(&mut default), scene(&mut one));
+    }
+
     #[test]
     fn full_pipeline_spots_a_repeated_valid_callsign() {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
@@ -2398,6 +2546,32 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         });
         assert_eq!(spots.len(), 1, "got {spots:?}");
         assert_eq!(spots[0].spot_type, SpotType::Beacon);
+    }
+
+    /// MAN-272 D6: the deferred-beacon `Spot` construction site reads its
+    /// track's annotations when the beacon resolves, so a report and a
+    /// `QRL?` decoded after capture but before the close are carried.
+    #[test]
+    fn a_deferred_beacon_spot_carries_its_tracks_annotations() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty(), "should be captured, not yet resolved");
+        let spots = run(&transmission_events(1, &["QRL?", "5NN"], 10_000), &mut v);
+        assert!(spots.is_empty(), "got {spots:?}");
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].callsign, "K5ARH");
+        assert_eq!(spots[0].spot_type, SpotType::Beacon);
+        assert_eq!(spots[0].rst.as_deref(), Some("599"));
+        assert!(spots[0].qrl_query);
     }
 
     #[test]

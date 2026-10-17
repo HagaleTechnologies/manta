@@ -209,12 +209,21 @@ signalled after that borrow reads `false` and before the loop's
 `tracing::info!` still produces one line, and no in-task check can be made
 atomic against an external signal.
 
-The ordering is therefore established from the outside. `spawn_status_line`
-already returned a `JoinHandle`; the daemon now RETAINS it
-(`SpotServer::status_line`) and awaits it immediately after
-`shutdown_tx.send(true)` and before the client drain starts. Once that join
-returns the task is gone, so no further line is possible. The wait is
-bounded by one scheduler poll rather than by `status_interval_secs`,
-because the task's `shutdown.changed()` arm is `biased`-first -- pinned by
-`main.rs`'s `the_status_line_task_is_retained_and_joins_promptly_on_shutdown`,
-which configures a one-hour interval and joins inside a one-second budget.
+The daemon retains the `JoinHandle` returned by `spawn_status_line` in
+`SpotServer::status_line`. The original round-4 implementation joined it
+after a shared `shutdown_tx.send(true)`. That send also woke the clients,
+so the join did not prevent a status line from landing during their drain.
+
+MAN-256 corrects the order: the status task has its own stop channel.
+`signal_spot_server_shutdown` signals it and joins the task through
+`stop_status_line` before broadcasting `shutdown_tx`. Any in-flight status
+line finishes before clients can begin draining. The regression test
+`the_status_line_task_has_exited_before_client_shutdown_is_broadcast`
+holds a borrow of the client watch to block its send, then checks that the
+status task has already exited.
+
+A sleeping status task exits on its next scheduler poll rather than waiting
+for `status_interval_secs`, because its `shutdown.changed()` arm is
+`biased`-first. This is pinned by `main.rs`'s
+`the_status_line_task_is_retained_and_joins_promptly_on_shutdown`, which
+configures a one-hour interval and joins inside a one-second budget.

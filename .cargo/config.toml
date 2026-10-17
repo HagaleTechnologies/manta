@@ -15,7 +15,7 @@
 #
 # Provisioned in every environment this repo builds source in:
 #   - CI / release runners: git ships on all GitHub-hosted images, and
-#     actions/checkout needs it (.github/workflows/ci.yml, release*.yml).
+#     actions/checkout needs it (.github/workflows/ci-full.yml, release*.yml).
 #   - Docker image build: installed explicitly in the builder stage, since
 #     `rust:1-slim-*` ships no git (see Dockerfile's comment).
 #   - `cross` release targets: installed by Cross.toml's pre-build hook,

@@ -7,9 +7,10 @@ maintainer: agent
 sources:
   - docs/SPEC-decode-core.md#6-determinism-requirements
   - ARCHITECTURE.md
+  - docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md
 verified:
-  commit: d286147
-  date: 2026-10-13
+  commit: 6596e3a
+  date: 2026-10-15
 links:
   - decode-chain
 ---
@@ -22,3 +23,5 @@ The same fixture WAV yields different spot logs run-to-run, and SPEC §6's three
 ## Cause and workaround
 
 No wall-clock anywhere in the decode path — time is derived from sample count. Watch for: HashMap iteration order (use ordered structures where output depends on it), non-deterministic thread scheduling affecting result ordering, and float summation order in the FFT/FIR reductions. Decoder-pool workers may run in any order: each track's decoder is a pure function of its own input, and events are sequenced by `(sample_ts, track_id)` before the validator sees them (SPEC §6 rule 6). When in doubt, the rule and the test vectors that enforce it are in SPEC §6–7.
+
+Multi-input sessions (MAN-13, several `[[input]]` entries) add one more rule (SPEC §6 rule 7): replay merges whole per-input batches in `(batch end time on the common clock, input index)` order, blocking only on inputs with nothing queued, so the merged stream is a pure function of the files even though the inputs run on separate threads; every replayed input's clock offset is 0. Live inputs merge in arrival order instead — holding one live input back for another would lose its samples, and live output is not deterministic anyway. Per-input events are still sorted per batch before the shared validator sees them. See [the decision record](../../docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md) for the common-clock mapping (highest input rate, exact power-of-two ratios).

@@ -63,9 +63,9 @@ an unzipped RBN archive with the same grading code.
   the firewall (section 3) and for Stage 2.
 - **The primary's RBN spotter callsign** (the call its spots carry on RBN) and the frequency
   range the primary covers.
-- **Build manta with the `soapy` feature.** Release binaries ship `hpsdr` but not `soapy`
-  (`.github/workflows/release-publish.yml`), so build from source. This needs `libsoapysdr-dev`, the
-  SoapySDRPlay3 module and the SDRplay API service installed first. Clone the repo to
+- **Build manta with the `soapy` feature.** The standard release archives include HPSDR;
+  SoapySDR has a separate Linux x86_64 archive. This recipe builds from source and needs
+  `libsoapysdr-dev`, the SoapySDRPlay3 module and the SDRplay API service installed first. Clone the repo to
   `/opt/manta`; the companion units run the scripts from there.
 
   ```sh
@@ -78,8 +78,8 @@ an unzipped RBN archive with the same grading code.
   git -C /opt/manta rev-parse HEAD   # record this SHA in the field report
   ```
 
-  For an OpenHPSDR receiver, build with `--features hpsdr` instead or use a release binary; a
-  KiwiSDR needs no feature. Once the node runs, `manta_build_info` on
+  OpenHPSDR and KiwiSDR receivers work with a default build or any release binary.
+  Once the node runs, `manta_build_info` on
   `/metrics` carries the same SHA in its `git_sha` label, and the ledger records it every minute.
 
 ## 3. Install

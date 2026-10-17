@@ -34,6 +34,8 @@ pub(crate) struct CalibrateArgs {
     pub json: bool,
     pub config: Option<PathBuf>,
     pub cli: CliOverrides,
+    /// MAN-13: `--input NAME`, the `[[input]]` entry to measure.
+    pub input: Option<String>,
 }
 
 /// What happens to a measured value.
@@ -117,7 +119,6 @@ pub(crate) fn apply_tune_hz(resolved: &mut Resolved, tune_hz: f64) -> Result<()>
         LiveSourceSpec::Kiwi(kiwi) => kiwi.freq = Some(tune_hz),
         #[cfg(feature = "soapy")]
         LiveSourceSpec::Soapy(soapy) => soapy.freq = Some(tune_hz),
-        #[cfg(feature = "hpsdr")]
         LiveSourceSpec::Hpsdr(hpsdr) => {
             hpsdr.freq = Some(
                 crate::check_hpsdr_freq_hz("--tune-hz", tune_hz).map_err(|e| anyhow::anyhow!(e))?,
@@ -332,7 +333,6 @@ fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<Str
         kiwi,
         #[cfg(feature = "soapy")]
         soapy,
-        #[cfg(feature = "hpsdr")]
         hpsdr,
         ka9q,
         dial_freq_hz,
@@ -372,7 +372,6 @@ fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<Str
     // Likewise every other --soapy-* / --hpsdr-* flag requires these.
     #[cfg(feature = "soapy")]
     flag(soapy.driver.is_some(), "--soapy-driver");
-    #[cfg(feature = "hpsdr")]
     flag(hpsdr.host.is_some(), "--hpsdr-host");
     // --ka9q-port, --ka9q-ssrc and --ka9q-interface require --ka9q-group.
     flag(ka9q.group.is_some(), "--ka9q-group");
@@ -427,11 +426,19 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
     // receiver `resolved` describes and the text the save is checked against
     // come from the same file and bytes.
     let snapshot_before = config_flag_or_env.map(|path| config_edit::ReadBefore::read(&path).ok());
+    let input_name = args.input.clone();
     let SourcePrepared {
         config_path,
         loaded,
         mut resolved,
-    } = prepare_source(args.cli, args.config)?;
+    } = prepare_source(
+        args.cli,
+        args.config,
+        crate::OneInput {
+            command: "calibrate",
+            name: args.input.as_deref(),
+        },
+    )?;
     let opts = CalibrateOptions {
         duration,
         search_ppm: args.search_ppm,
@@ -483,7 +490,7 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
     // The file's own value, read from its text: the loaded config already
     // carries the environment overlay.
     let file_value = match config_text {
-        Some(text) => config_edit::set_freq_correction_ppm(text, 0.0)?.1,
+        Some(text) => config_edit::set_freq_correction_ppm(text, 0.0, input_name.as_deref())?.1,
         None => None,
     };
     let origin = configured_origin(&resolved, &loaded, config_path.as_deref(), file_value);
@@ -528,17 +535,27 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
         // The TOML literal, as saved: `2.0`, never `2`.
         let value_lit = config_edit::literal(value);
         let run_hint = format!("pass --freq-correction-ppm {value_lit} to manta run");
+        // MAN-13: `[input]`, or the `[[input]]` entry `--input` named.
+        let entry = Entry {
+            name: input_name.as_deref(),
+            section: config_text.map_or_else(
+                || "[input]".to_string(),
+                |text| config_edit::input_section(text, input_name.as_deref()),
+            ),
+        };
         let outcome = match (decision, config_path.as_deref()) {
             (SaveDecision::Save, Some(path)) => Some(save(
                 path,
                 value,
                 read_before.as_ref(),
+                &entry,
                 &mut written,
                 &mut save_error,
             )),
             (SaveDecision::Ask, Some(path)) => {
                 let prompt = format!(
-                    "Save freq_correction_ppm = {value_lit} to [input] in {}?",
+                    "Save freq_correction_ppm = {value_lit} to {} in {}?",
+                    entry.section,
                     path.display()
                 );
                 if confirm(
@@ -550,6 +567,7 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
                         path,
                         value,
                         read_before.as_ref(),
+                        &entry,
                         &mut written,
                         &mut save_error,
                     ))
@@ -599,28 +617,38 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
     Ok(())
 }
 
+/// The table a save writes into: `--input`'s name and how the lines
+/// print it (`[input]` or `the [[input]] entry "20m"`).
+struct Entry<'a> {
+    name: Option<&'a str>,
+    section: String,
+}
+
 /// Save `value` to `path`, returning the line to print.
 fn save(
     path: &Path,
     value: f64,
     read_before: Option<&config_edit::ReadBefore>,
+    entry: &Entry<'_>,
     written: &mut bool,
     save_error: &mut Option<anyhow::Error>,
 ) -> String {
     let value_lit = config_edit::literal(value);
-    match config_edit::save_freq_correction_ppm(path, value, read_before) {
+    match config_edit::save_freq_correction_ppm(path, value, read_before, entry.name) {
         Ok(previous) => {
             *written = true;
             format!(
-                "saved: freq_correction_ppm = {value_lit} in [input] of {} (was {}); restart manta \
+                "saved: freq_correction_ppm = {value_lit} in {} of {} (was {}); restart manta \
                  to apply it",
+                entry.section,
                 path.display(),
                 previous.map_or_else(|| "not set".to_string(), config_edit::literal)
             )
         }
         Err(e) => {
             *save_error = Some(e.context(format!(
-                "could not save freq_correction_ppm = {value_lit}; set it in [input] of {} by hand",
+                "could not save freq_correction_ppm = {value_lit}; set it in {} of {} by hand",
+                entry.section,
                 path.display()
             )));
             "not saved: the config file could not be written".to_string()
@@ -854,6 +882,7 @@ mod tests {
             notes: Vec::new(),
             replaced_file_source: None,
             replay: crate::ReplayMode::default(),
+            inputs: Vec::new(),
         }
     }
 
@@ -885,7 +914,6 @@ mod tests {
                 _ => unreachable!(),
             }
         }
-        #[cfg(feature = "hpsdr")]
         {
             let mut r = resolved_with(LiveSourceSpec::Hpsdr(crate::HpsdrOpts {
                 host: Some("h".into()),
