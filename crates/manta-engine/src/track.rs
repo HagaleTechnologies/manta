@@ -70,6 +70,14 @@ pub struct DetectorConfig {
     /// starts and to running tracks' decoder input. Not in SPEC §9's
     /// original table; `[detector].crash_filter`.
     pub crash_filter: CrashFilter,
+    /// MAN-273: DC/Nyquist spawn guard in Hz, both rims: no track spawns on
+    /// a channel whose centre lies within this many Hz of DC or of
+    /// Nyquist. Not in SPEC §9's table and not operator-settable -- a
+    /// property of the source's analytic-signal construction, declared via
+    /// `IqSource::analytic_guard_hz` and raised (never lowered) to
+    /// `max(configured, source)` in `listen`. 0.0 restores the
+    /// pre-MAN-273 behaviour bit-identically.
+    pub guard_hz: f64,
 }
 
 /// MAN-312 (SPEC §2.7): `[detector].crash_filter`. A crash (at least three
@@ -234,6 +242,8 @@ impl Default for DetectorConfig {
             // MAN-313: on; 3750 hops = 10 s.
             non_cw_filter: true,
             unkeyed_close_hops: 3750,
+            // MAN-273: off; the live-audio source raises it.
+            guard_hz: 0.0,
         }
     }
 }
@@ -1447,6 +1457,23 @@ pub struct TrackManager {
     /// spawn scan ONLY (`trusted_vetoes_spawn`): never a close path,
     /// never a decode hold -- the MAN-314 key-up-gap lesson.
     trusted_channels: Option<Vec<bool>>,
+    /// MAN-273: per channel, whether its centre lies within the analytic
+    /// front end's DC/Nyquist guard (`set_guard_hz`). `None` (guard 0.0,
+    /// the default) vetoes nothing. Spawn scan only, like
+    /// `trusted_channels`.
+    guard_channels: Option<Vec<bool>>,
+    /// MAN-273 D3: whether the source is analytic (built from real input,
+    /// `IqSource::analytic_guard_hz() > 0.0`), so channel `k`'s mirror
+    /// `(n - k) % n` carries only the image of whatever sits on `k`.
+    /// Spawn scan only (`mirror_vetoes_spawn`). Off by default.
+    mirror_image_guard: bool,
+    /// MAN-273: spawns per birth channel since construction, and their
+    /// total -- the spawn census tests assert on (test builds only; not a
+    /// metric).
+    #[cfg(test)]
+    spawns_by_channel: Vec<u64>,
+    #[cfg(test)]
+    total_spawns: u64,
     /// MAN-312 (SPEC §2.7): the band-wide static-crash detector. Every
     /// channel is live until `set_rf_passband_hz` narrows it to the
     /// source's real passband.
@@ -1514,6 +1541,11 @@ pub struct RttyLogEntry {
     pub cleared_sample_ts: Option<u64>,
 }
 
+/// MAN-273 D3: how much stronger (raw `hop.power`, dB) a channel must be
+/// than every channel within one of its mirror before an analytic source
+/// may spawn on it.
+const MIRROR_POWER_MARGIN_DB: f32 = 3.0;
+
 /// MAN-196: per-channel mask, true iff the channel's centre
 /// (`wrapped_channel_offset(k, n) * spacing`, SPEC §1.1 f(k)) lies inside
 /// `[lo, hi]`. The shared body of `set_rf_passband_hz`'s reporting mask
@@ -1569,6 +1601,12 @@ impl TrackManager {
             rise_seen: None,
             rf_channels: None,
             trusted_channels: None,
+            guard_channels: None,
+            mirror_image_guard: false,
+            #[cfg(test)]
+            spawns_by_channel: vec![0; n_channels],
+            #[cfg(test)]
+            total_spawns: 0,
             crash: CrashDetector::new(n_channels),
             comod: detector_cfg
                 .non_cw_filter
@@ -1676,6 +1714,92 @@ impl TrackManager {
     /// spawn scan only.
     fn trusted_vetoes_spawn(&self, k: usize) -> bool {
         self.trusted_channels.as_ref().is_some_and(|t| !t[k])
+    }
+
+    /// MAN-273: never spawn a candidate on a channel whose whole band lies
+    /// within `guard_hz` of DC or of Nyquist -- where the source's
+    /// real-to-analytic front end (`manta-dsp::hilbert`) leaks a real
+    /// tone's negative-frequency image. `listen` supplies
+    /// `max(DetectorConfig::guard_hz, IqSource::analytic_guard_hz)`.
+    /// **Spawns only**, as `set_trusted_band_hz`: a running track on a
+    /// guarded channel keeps decoding. `guard_hz <= 0.0` clears the mask
+    /// (a no-op, pinned by `guard_zero_is_bit_identical_to_today`).
+    ///
+    /// The Nyquist rim yields to an installed trusted band (call
+    /// `set_trusted_band_hz` first, as `listen`'s `new_segment` does): the
+    /// leak it guards sat at the analytic front end's *input*-rate Nyquist,
+    /// which a decimating source's stopband has already removed, so at a
+    /// decimated rate the rim may not veto a channel the source's own
+    /// filtering vouches for. Without the yield, `--capture-rate-hz` at
+    /// 6000 Hz or below on rig audio masked the top of the advertised
+    /// band (at 1500 Hz, every channel). The DC rim is unconditional:
+    /// the near-DC leak survives decimation unchanged.
+    pub fn set_guard_hz(&mut self, guard_hz: f64) {
+        let n = self.n_channels();
+        let spacing = self.channel_spacing_hz;
+        let half = spacing * n as f64 / 2.0;
+        // A channel straddling the guard edge keeps spawning: a 600 Hz
+        // sidetone (channel 6 at 48 kHz, 515-609 Hz) must stay skimmable,
+        // and the FIR already clears its contract floor there.
+        self.guard_channels = (guard_hz > 0.0).then(|| {
+            (0..n)
+                .map(|k| {
+                    let f = (wrapped_channel_offset(k, n) * spacing).abs();
+                    f + spacing / 2.0 < guard_hz
+                        || (f - spacing / 2.0 > half - guard_hz
+                            && self.trusted_channels.as_ref().is_none_or(|t| !t[k]))
+                })
+                .collect()
+        });
+    }
+
+    /// MAN-273: may no candidate spawn on channel `k`? True when a guard
+    /// was set and `k`'s whole band lies inside it. Consulted by the spawn
+    /// scan only.
+    fn guard_vetoes_spawn(&self, k: usize) -> bool {
+        self.guard_channels.as_ref().is_some_and(|g| g[k])
+    }
+
+    /// MAN-273 D3: veto spawns on the mirror image of a stronger or owned
+    /// channel -- for an analytic source only (`analytic` true when the
+    /// source declares `IqSource::analytic_guard_hz() > 0.0`). Real audio
+    /// has no negative frequencies, so its analytic signal's channel
+    /// `(n - k) % n` holds only `k`'s leaked image; the Hilbert FIR also
+    /// strips the noise there, so the image can clear its own local floor.
+    /// Never enabled from `DetectorConfig::guard_hz`: a complex-IQ source
+    /// carries real signals on both sides of DC.
+    pub fn set_mirror_image_guard(&mut self, analytic: bool) {
+        self.mirror_image_guard = analytic;
+    }
+
+    /// MAN-273 D3: may no candidate spawn on channel `k` because it is the
+    /// image of its mirror? True when the mirror guard is on and a channel
+    /// within one of `k`'s mirror is owned by a track, or its raw power
+    /// this hop is within `MIRROR_POWER_MARGIN_DB` of `k`'s or above it
+    /// (an ambiguous comparison defers the spawn to a later hop).
+    fn mirror_vetoes_spawn(&self, k: usize, power: &[f32]) -> bool {
+        if !self.mirror_image_guard {
+            return false;
+        }
+        let n = self.n_channels();
+        let m = (n - k) % n;
+        let margin = 10f32.powf(MIRROR_POWER_MARGIN_DB / 10.0);
+        [n - 1, 0, 1].iter().any(|&d| {
+            let j = (m + d) % n;
+            self.owner_of[j].is_some() || power[j] * margin >= power[k]
+        })
+    }
+
+    /// MAN-273: spawns per birth channel since construction (the census).
+    #[cfg(test)]
+    pub(crate) fn spawns_by_channel(&self) -> &[u64] {
+        &self.spawns_by_channel
+    }
+
+    /// MAN-273: every spawn since construction, the census's sum.
+    #[cfg(test)]
+    pub(crate) fn total_spawns(&self) -> u64 {
+        self.total_spawns
     }
 
     /// MAN-312: static crashes detected by this manager so far, in every
@@ -2396,6 +2520,7 @@ impl TrackManager {
         // MAN-196: no track starts on a channel outside the source's
         // trusted band, in both the k and k+1 slots -- the same-hop
         // adjacent-rise arbitration must not route around the veto.
+        // MAN-273: likewise the analytic front end's DC/Nyquist guard.
         if past_warmup && !suppress {
             let n = self.n_channels();
             let mut k = 0;
@@ -2407,6 +2532,8 @@ impl TrackManager {
                     && !self.rtty_vetoes_spawn(k)
                     && !self.comod_vetoes_spawn(k)
                     && !self.trusted_vetoes_spawn(k)
+                    && !self.guard_vetoes_spawn(k)
+                    && !self.mirror_vetoes_spawn(k, &hop.power)
                 {
                     let mut winner = k;
                     if k + 1 < n
@@ -2416,6 +2543,8 @@ impl TrackManager {
                         && !self.rtty_vetoes_spawn(k + 1)
                         && !self.comod_vetoes_spawn(k + 1)
                         && !self.trusted_vetoes_spawn(k + 1)
+                        && !self.guard_vetoes_spawn(k + 1)
+                        && !self.mirror_vetoes_spawn(k + 1, &hop.power)
                     {
                         if hop.power[k + 1] > hop.power[winner] {
                             winner = k + 1;
@@ -2515,6 +2644,11 @@ impl TrackManager {
             .checked_add(self.id_stride)
             .unwrap_or(self.id_first);
         let mut track = Track::new(id, birth_channel, &self.cfg);
+        #[cfg(test)]
+        {
+            self.spawns_by_channel[birth_channel] += 1;
+            self.total_spawns += 1;
+        }
         let f = self.floor.effective_floor_db(birth_channel);
         track.current_snr_db = (self.gate.smoothed_db(birth_channel) - f) as f32;
         // `snr_peak_db` is left at `Track::new`'s `NEG_INFINITY`: it is only
@@ -3969,6 +4103,202 @@ mod tests {
                 k as f64 * 93.75
             );
         }
+    }
+
+    // ---- MAN-273: analytic DC/Nyquist guard, mirror veto, census ----
+
+    /// Run 60 hops of `power` through a warmed 512-channel manager after
+    /// `setup`, returning the birth channels of every track left open.
+    fn births_after(setup: impl Fn(&mut TrackManager), power: Vec<f32>) -> Vec<usize> {
+        let start = 250u64 * 15;
+        let mut tm = trusted_band_manager(512);
+        feed_warmup(&mut tm, 512);
+        setup(&mut tm);
+        for m in start..start + 60 {
+            tm.step_hop(&hop(m, power.clone()), m);
+        }
+        let mut births: Vec<usize> = tm.tracks.values().map(|t| t.birth_channel).collect();
+        births.sort_unstable();
+        births
+    }
+
+    fn strong_on_all(n: usize, ks: &[(usize, f32)]) -> Vec<f32> {
+        let mut power = quiet_power(n);
+        for &(k, db) in ks {
+            power[k] = 1e-9 * 10f32.powf(db / 10.0);
+        }
+        power
+    }
+
+    #[test]
+    fn guard_hz_masks_exactly_the_two_rims() {
+        let n = 512;
+        let mut tm = trusted_band_manager(n);
+        tm.set_guard_hz(600.0);
+        let mut guarded = 0;
+        for k in 0..n {
+            let f = (wrapped_channel_offset(k, n) * 93.75).abs();
+            let want = f + 46.875 < 600.0 || f - 46.875 > 24_000.0 - 600.0;
+            assert_eq!(tm.guard_vetoes_spawn(k), want, "channel {k} ({f} Hz)");
+            guarded += usize::from(want);
+        }
+        // 11 channels about DC (|k'| <= 5) and 11 about Nyquist (|k'| >= 251).
+        assert_eq!(guarded, 22);
+        // Channel 6 (562.5 Hz, the 600 Hz sidetone's channel) straddles the
+        // guard edge and still spawns.
+        assert!(!tm.guard_vetoes_spawn(6));
+        assert!(tm.guard_vetoes_spawn(5));
+        tm.set_guard_hz(0.0);
+        assert!((0..n).all(|k| !tm.guard_vetoes_spawn(k)));
+    }
+
+    /// MAN-273 remediate: a decimated capture's trusted band must win over
+    /// the analytic guard's Nyquist rim. `DecimatingSource` forwards the
+    /// 48 kHz Hilbert guard (600 Hz) unchanged, but the leak that rim
+    /// guards sat at the *input* rate's Nyquist, which the decimator's
+    /// stopband already removed -- applied at the decimated rate's own
+    /// Nyquist it masked the top of the advertised band (at 6000 Hz:
+    /// channels 27-28, 2484-2672 Hz, inside the trusted band that runs to
+    /// 2715.6 Hz; at 1500 Hz it covered every channel). The DC rim is
+    /// unconditional: the near-DC leak survives decimation unchanged.
+    #[test]
+    fn guard_nyquist_rim_yields_to_the_trusted_band() {
+        // The 6000 Hz decimated-audio shape: 64 channels of 93.75 Hz,
+        // trusted band as DecimatingSource(AudioIqSource) reports it
+        // (the audio passband 300..3000 Hz clipped to the decimator's
+        // 0.4526 * 6000 Hz trusted half-bandwidth).
+        let n = 64;
+        let mut tm = trusted_band_manager(n);
+        tm.set_trusted_band_hz(300.0, 2715.6);
+        tm.set_guard_hz(600.0);
+        for k in 0..n {
+            let signed = wrapped_channel_offset(k, n) * 93.75;
+            let f = signed.abs();
+            let dc_rim = f + 46.875 < 600.0;
+            // `channels_within` tests the signed centre against the
+            // one-sided band, exactly as the code under test does.
+            let trusted = (300.0..=2715.6).contains(&signed);
+            let want = dc_rim || (f - 46.875 > 3000.0 - 600.0 && !trusted);
+            assert_eq!(tm.guard_vetoes_spawn(k), want, "channel {k} ({signed} Hz)");
+        }
+        // The top of the advertised band is trusted and spawns; before
+        // the yield both of these were Nyquist-rim masked.
+        assert!(!tm.guard_vetoes_spawn(27)); // 2484-2578 Hz
+        assert!(!tm.guard_vetoes_spawn(28)); // 2578-2672 Hz
+                                             // The DC rim still bites inside the trusted band: the near-DC
+                                             // leak is real at any decimated rate.
+        assert!(tm.guard_vetoes_spawn(3)); // 234-375 Hz
+                                           // Without a trusted band the rim applies in full (48 kHz audio).
+        let mut plain = trusted_band_manager(512);
+        plain.set_guard_hz(600.0);
+        let f = (wrapped_channel_offset(252, 512) * 93.75).abs();
+        assert!(f - 46.875 > 24_000.0 - 600.0);
+        assert!(plain.guard_vetoes_spawn(252));
+    }
+
+    #[test]
+    fn guard_zero_is_bit_identical_to_today() {
+        let n = 512;
+        let start = 250u64 * 15;
+        let hops: Vec<HopOutput> = {
+            let mut hs: Vec<HopOutput> = (0..start).map(|m| hop(m, quiet_power(n))).collect();
+            hs.extend((start..start + 200).map(|m| hop(m, strong_on(n, 3))));
+            hs
+        };
+        let run = |set: bool| -> Vec<DecoderEvent> {
+            let mut tm = trusted_band_manager(n);
+            if set {
+                tm.set_guard_hz(0.0);
+                tm.set_mirror_image_guard(false);
+            }
+            tm.process_hops(&hops, |m| m)
+        };
+        let events = run(true);
+        assert_eq!(events, run(false));
+        assert!(!events.is_empty(), "channel 3 must spawn with no guard");
+    }
+
+    #[test]
+    fn guard_vetoes_both_spawn_scan_slots() {
+        // Adjacent rises on two guarded channels, at each rim: the k+1
+        // arbitration slot must not route around the veto.
+        for pair in [(4usize, 5usize), (252, 253), (259, 260)] {
+            let power = strong_on_all(512, &[(pair.0, 20.0), (pair.1, 23.0)]);
+            assert!(
+                !births_after(|_| {}, power.clone()).is_empty(),
+                "control must spawn on {pair:?}"
+            );
+            assert_eq!(
+                births_after(|tm| tm.set_guard_hz(600.0), power),
+                Vec::<usize>::new(),
+                "guarded pair {pair:?} spawned"
+            );
+        }
+        // The channel straddling the DC rim (k = 6, 562.5 Hz) still spawns.
+        let power = strong_on_all(512, &[(6, 20.0)]);
+        assert_eq!(births_after(|tm| tm.set_guard_hz(600.0), power), vec![6]);
+    }
+
+    #[test]
+    fn guard_wraps_at_the_channel_array_ends() {
+        for k in [0usize, 511] {
+            let power = strong_on(512, k);
+            assert!(
+                !births_after(|_| {}, power.clone()).is_empty(),
+                "control {k}"
+            );
+            assert!(
+                births_after(|tm| tm.set_guard_hz(600.0), power).is_empty(),
+                "channel {k} lies inside the DC guard"
+            );
+        }
+    }
+
+    #[test]
+    fn mirror_guard_vetoes_the_image_of_a_stronger_channel() {
+        // +750 Hz (k = 8) at +50 dB, its mirror (k = 504) at +20 dB: both
+        // local peaks above the floor. Without the mirror guard both spawn;
+        // with it only the real tone does.
+        let power = strong_on_all(512, &[(8, 50.0), (504, 20.0)]);
+        assert_eq!(births_after(|_| {}, power.clone()), vec![8, 504]);
+        assert_eq!(
+            births_after(|tm| tm.set_mirror_image_guard(true), power),
+            vec![8]
+        );
+    }
+
+    #[test]
+    fn mirror_guard_vetoes_the_image_of_an_owned_channel() {
+        // The real tone spawns first; its image rises later, one channel
+        // off the exact mirror -- the owned-window check still vetoes it.
+        let start = 250u64 * 15;
+        let mut tm = trusted_band_manager(512);
+        feed_warmup(&mut tm, 512);
+        tm.set_mirror_image_guard(true);
+        for m in start..start + 30 {
+            tm.step_hop(&hop(m, strong_on(512, 8)), m);
+        }
+        let late = strong_on_all(512, &[(8, 20.0), (505, 25.0)]);
+        for m in start + 30..start + 90 {
+            tm.step_hop(&hop(m, late.clone()), m);
+        }
+        let births: Vec<usize> = tm.tracks.values().map(|t| t.birth_channel).collect();
+        assert_eq!(births, vec![8]);
+    }
+
+    #[test]
+    fn census_counts_every_spawn_per_channel() {
+        let mut tm = trusted_band_manager(512);
+        tm.spawn(10);
+        tm.spawn(40);
+        tm.spawn(10);
+        assert_eq!(tm.spawns_by_channel()[10], 2);
+        assert_eq!(tm.spawns_by_channel()[40], 1);
+        assert_eq!(tm.total_spawns(), 3);
+        assert_eq!(
+            tm.spawns_by_channel().iter().sum::<u64>(),
+            tm.total_spawns()
+        );
     }
 
     /// MAN-196: the veto is spawns-only -- narrowing the trusted band

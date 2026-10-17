@@ -1693,6 +1693,11 @@ impl IqSource for FixedCenterFreqSource {
         self.inner.trusted_band_hz()
     }
 
+    /// MAN-273: forwarded with `trusted_band_hz`.
+    fn analytic_guard_hz(&self) -> f64 {
+        self.inner.analytic_guard_hz()
+    }
+
     fn read(&mut self, buf: &mut [num_complex::Complex32]) -> Result<usize> {
         self.inner.read(buf)
     }

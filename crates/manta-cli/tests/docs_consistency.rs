@@ -2468,6 +2468,43 @@ fn metrics_reference_documents_non_request_budget_charges() {
     );
 }
 
+/// MAN-273 PR #340 review: `manta_input_bad_samples_total`'s row states the
+/// worst-case fan-out one bad source sample suffers through the live-audio
+/// Hilbert filter, and the 511-tap sparse FIR changed it. `process()`
+/// evaluates only the nonzero taps, so one NaN real input poisons the
+/// imaginary part of every output whose window holds it at a nonzero tap
+/// plus the real part of the one output where it sits at the delay tap --
+/// and the row must state exactly that count, measured here through the
+/// shipped transformer and the metric's own usability rule.
+#[test]
+fn metrics_reference_states_the_hilbert_bad_sample_fan_out() {
+    let mut h = manta_dsp::hilbert::HilbertTransformer::new();
+    let mut input: Vec<f32> = (0..1024).map(|i| (i as f32 * 0.05).sin()).collect();
+    input[512] = f32::NAN;
+    let out = h.process(&input);
+    let fanout = out
+        .iter()
+        .filter(|s| !manta_dsp::sample_guard::is_usable(**s))
+        .count();
+    assert!(
+        fanout > 0,
+        "one NaN source sample poisoned no Hilbert output; the metric's fan-out \
+         contract has moved and this test needs re-deriving"
+    );
+    let md = doc(METRICS_REF);
+    let row = md
+        .lines()
+        .find(|l| l.starts_with("| `manta_input_bad_samples_total` |"))
+        .unwrap_or_else(|| panic!("{METRICS_REF} has no `manta_input_bad_samples_total` row"));
+    assert!(
+        row.contains(&format!("about {fanout} through")),
+        "{METRICS_REF}'s `manta_input_bad_samples_total` row states the wrong Hilbert \
+         fan-out: one bad source sample makes {fanout} outputs unusable through the \
+         {}-tap live filter",
+        manta_dsp::hilbert::HILBERT_TAPS,
+    );
+}
+
 /// MAN-149 M2: config deserialization uppercases the station identity;
 /// SpotMessage uses that identity for both deCall and the id prefix.
 #[test]
