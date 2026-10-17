@@ -4315,7 +4315,11 @@ fn select_input(loaded: &mut config::Loaded, name: Option<&str>, command: &str) 
                     .iter()
                     .filter(|n| match &n.entry {
                         Some(entry) => entry == name,
-                        None => n.input.source.as_ref().map(|s| s.kind().name()) == Some(name),
+                        // The `[input]` table's streams are `<its name>-<label>`.
+                        None => n
+                            .name
+                            .strip_prefix(name)
+                            .is_some_and(|rest| rest.starts_with('-')),
                     })
                     .map(|n| n.name.as_str())
                     .collect();
@@ -10488,6 +10492,21 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             "--input \"kiwi\" is one receiver with 2 streams (kiwi-60m-1, kiwi-60m-2); pass \
              --input kiwi-60m-1 or --input kiwi-60m-2"
         );
+        // A named `[input]`'s streams are found by its name, not its type.
+        let mut named = loaded_from(
+            "[input]\nname = \"mykiwi\"\ntype = \"kiwi\"\nhost = \"h\"\nbands = [\"60m\"]\n",
+        );
+        let err = select_input(&mut named, Some("mykiwi"), "doctor")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("--input \"mykiwi\" is one receiver with 2 streams"),
+            "{err}"
+        );
+        let err = select_input(&mut named, Some("kiwi"), "doctor")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not one of"), "{err}");
         let mut loaded = loaded_from(body);
         let cli = CliOverrides {
             source: Some(PathBuf::from("v1.wav")),
