@@ -57,25 +57,16 @@ fn clean_signal_decodes_correctly_after_192khz_to_48khz_decimation() {
         decoded
     );
 
-    // Freq error <= 25 Hz, not V1's 10 Hz. Measured (deterministic across 3
-    // runs): 17.396 Hz. Isolated the cause with two no-decimation control
-    // renders of the same v1() scene: native 48 kHz gives 16.605 Hz error
-    // and native 192 kHz gives 15.697 Hz error -- both close to this
-    // decimated-path's 17.396 Hz *with zero decimator involvement*. So the
-    // gap versus V1's 96 kHz-tuned 10 Hz bound is a channel-table-size-
-    // dependent property of the frequency estimator itself -- a different
-    // mechanism than the one documented in
-    // docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md pin 9 (AWGN
-    // corrupting the interpolator's weak neighbor bin at high-offset hops,
-    // a placeholder-detector-era limitation), not a decimator artifact and
-    // not a decode regression -- CER above is 0.0155, identical to V1's own
-    // measured floor. The 25 Hz *magnitude* reuses pin 9's precedent as a
-    // previously-accepted round number, not because pin 9 covers this same
-    // failure mode -- it doesn't -- with real margin over the measured
-    // 17.396 Hz.
+    // Freq error <= 10 Hz, V1's bound. The dB-parabola spot frequency
+    // measured 17.396 Hz here (and 16.605/15.697 Hz on native 48/192 kHz
+    // control renders), which forced a 25 Hz bound. MAN-114 found the cause
+    // was the scene's 0.627-channel fractional offset plus AWGN on the
+    // parabola's weak neighbour bin, at every table size, not the channel
+    // table or the decimator; the phase estimator measures 1.41 Hz. See
+    // docs/DECISIONS/2026-10-17-man114-phase-difference-spot-frequency.md.
     let freq = report["freq_hz"].as_f64().unwrap();
     assert!(
-        (freq - rendered.expected_freq_hz).abs() <= 25.0,
+        (freq - rendered.expected_freq_hz).abs() <= 10.0,
         "freq {} expected {} (err {})",
         freq,
         rendered.expected_freq_hz,
@@ -138,9 +129,10 @@ fn rim_inside_the_trusted_band_still_decodes_at_the_golden_standard() {
         decoded
     );
 
+    // V1's 10 Hz (MAN-114; measured 0.02 Hz, a bin-centred offset).
     let freq = report["freq_hz"].as_f64().unwrap();
     assert!(
-        (freq - rendered.expected_freq_hz).abs() <= 25.0,
+        (freq - rendered.expected_freq_hz).abs() <= 10.0,
         "freq {} expected {} (err {})",
         freq,
         rendered.expected_freq_hz,
