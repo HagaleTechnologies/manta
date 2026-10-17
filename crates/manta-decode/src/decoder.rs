@@ -171,17 +171,11 @@ pub struct TrackDecoder {
     snr_history: VecDeque<(u64, u64, f32)>,
     /// Decode-error counter (aborted garble characters). SPEC §4.4.
     pub garble_count: u32,
-<<<<<<< HEAD
     /// MAN-5: the next run `on_run` sees is left-censored -- it was already
     /// in progress before this decoder's first sample, so its duration is a
     /// truncated fragment, not a real element length. Set only by
     /// `new_mid_signal`; cleared by the first run.
     lead_run_censored: bool,
-    /// Open-space length, in hops, when `check_flush` last forced a flush,
-    /// held until the next run shows whether that gap ended within the
-    /// demod's debounce of the flush (see `process_run`).
-    flushed_gap_hops: Option<u32>,
-=======
     /// SPEC §2.3's floor-based SNR for this track, supplied by the layer
     /// that owns the gate/floor state (`manta-engine`), exactly as
     /// `freq_hz` is. `None` when a `TrackDecoder` is driven standalone
@@ -189,7 +183,6 @@ pub struct TrackDecoder {
     /// which case `TrackMeta` falls back to the M0 keying-rail estimate.
     /// MAN-102.
     snr_2500_db: Option<f32>,
->>>>>>> e539c9b2a807402c7d5a00206277a1bf90016296
 }
 
 impl TrackDecoder {
@@ -237,9 +230,8 @@ impl TrackDecoder {
             last_snr: None,
             snr_history: VecDeque::new(),
             garble_count: 0,
-<<<<<<< HEAD
             lead_run_censored: false,
-            flushed_gap_hops: None,
+            snr_2500_db: None,
         }
     }
 
@@ -258,9 +250,6 @@ impl TrackDecoder {
         TrackDecoder {
             lead_run_censored: true,
             ..TrackDecoder::new(track_id, cfg)
-=======
-            snr_2500_db: None,
->>>>>>> e539c9b2a807402c7d5a00206277a1bf90016296
         }
     }
 
@@ -813,21 +802,12 @@ impl TrackDecoder {
     fn process_run(&mut self, run: Run, live: bool, events: &mut Vec<DecoderEvent>) {
         let dur_ms = run.hops as f32 * HOP_MS as f32;
         if run.mark {
-<<<<<<< HEAD
-            if let Some(hops) = self.flushed_gap_hops.take() {
-                // The flushed gap's remainder fell under the debounce and
-                // was absorbed into this mark: the gap ended within ~5 hops
-                // of the flush, so the flush-time length is its length.
-                self.gaps
-                    .observe_flushed(hops as f32 * HOP_MS as f32, self.tracker.mu_dit_ms());
-=======
             // A flushed gap this mark closed without a separate remainder
             // run: the demod folded a remainder shorter than its debounce
             // window into this mark, so the length at the flush is the
             // closed length, short by less than that window (MAN-315 D2).
             if let Some(flushed_ms) = self.flushed_gap_ms.take() {
                 self.observe_gap(GapClass::InterWord, flushed_ms);
->>>>>>> e539c9b2a807402c7d5a00206277a1bf90016296
             }
             if live {
                 self.tracker.on_mark(dur_ms);
@@ -841,15 +821,6 @@ impl TrackDecoder {
             self.word_flushed = false;
         } else {
             if self.word_flushed {
-<<<<<<< HEAD
-                // This gap was already handled by the 7-dit flush; `run` is
-                // only its remainder (the flush closed the demod's open run).
-                // A remainder long enough to surface as its own run means
-                // the gap outlasted the flush by more than the debounce --
-                // possibly a long pause -- so it stays out of the gap
-                // statistics.
-                self.flushed_gap_hops = None;
-=======
                 // This gap was already handled by the 7-dit flush. Its
                 // closed length is the sender's word gap (MAN-315 D2).
                 if let Some(flushed_ms) = self.flushed_gap_ms.take() {
@@ -858,7 +829,6 @@ impl TrackDecoder {
                 if let Some(flushed_ms) = self.single_flush_ms.take() {
                     self.observe_single_flush(flushed_ms + dur_ms);
                 }
->>>>>>> e539c9b2a807402c7d5a00206277a1bf90016296
                 return;
             }
             let class = self.gaps.classify(dur_ms, self.gap_unit_ms());
@@ -1089,11 +1059,7 @@ impl TrackDecoder {
                 self.word_chars = 0;
                 self.word_decoded = 0;
                 self.word_flushed = true;
-<<<<<<< HEAD
-                self.flushed_gap_hops = Some(hops);
-=======
                 self.flushed_gap_ms = Some(gap_ms);
->>>>>>> e539c9b2a807402c7d5a00206277a1bf90016296
             }
         }
     }
@@ -2315,9 +2281,6 @@ mod tests {
         assert_eq!(events_to_text(&events), "TTTTT");
     }
 
-<<<<<<< HEAD
-    fn decode_env(env: &[f32], mut dec: TrackDecoder) -> Vec<DecoderEvent> {
-=======
     /// A 1.6 s pause inside the first five long gaps (a run station
     /// listening between calls) must not merge the words that follow.
     /// Guards against `check_flush` observing a flushed pause's closed
@@ -2651,7 +2614,6 @@ mod tests {
                 ..Default::default()
             },
         );
->>>>>>> e539c9b2a807402c7d5a00206277a1bf90016296
         let mut events = Vec::new();
         for (i, &a) in env.iter().enumerate() {
             events.extend(dec.push_envelope(a, i as u64 * 256));
@@ -2660,7 +2622,15 @@ mod tests {
         events
     }
 
-<<<<<<< HEAD
+    fn decode_env(env: &[f32], mut dec: TrackDecoder) -> Vec<DecoderEvent> {
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        events
+    }
+
     /// MAN-5's shape: a decoder joining mid-mark sees a truncated tail as
     /// its first run, and the next 4 marks are all dahs ("MM", as in the
     /// ticket's "GAMMAFOX" scene). 7 hops (just over the 5-hop debounce) of
@@ -2724,7 +2694,45 @@ mod tests {
         );
         assert_eq!(events_to_text(&mid_signal), "CQ CQ DE W1AW");
         assert_eq!(mid_signal, from_start);
-=======
+    }
+
+    /// Codex review, PR #339: a mid-signal decoder on a Farnsworth signal
+    /// whose character gaps sit just over the 7-dit flush (V10's geometry)
+    /// was claimed to starve the gap pair of every high sample -- each
+    /// character gap's post-flush remainder is absorbed into the next mark
+    /// (only the threshold-crossing length is ever recorded) and each word
+    /// gap's remainder surfaces as its own run. Merged with main's
+    /// flush/censoring machinery that lock-in no longer occurs: a word gap
+    /// the safety net cannot take (`word_flushed`/`cur_marks` guard it)
+    /// still closes at full length and reaches `classify`, the pair splits,
+    /// `flush_threshold_dits` scales up, and words reassemble. This pins
+    /// that recovery for a join with no word boundary in the warmup window
+    /// (7 hops before the end of C's first dit): only the first repeat may
+    /// decode as separate characters.
+    #[test]
+    fn mid_signal_marginal_farnsworth_rebuilds_word_boundaries() {
+        // 25 WPM characters at 16.45 WPM effective: dit = 48 ms (18 hops),
+        // ARRL char gap 341 ms (128 hops = 7.1 dits, so the flush fires two
+        // hops early and the next mark absorbs the remainder), word gap
+        // 795 ms (298 hops, remainder surfaces).
+        let rep = "CQ CQ DE W1AW K";
+        let mut full = farnsworth_envelope(&[rep; 6].join(" "), 25.0, 16.45);
+        // Join 7 hops before the end of C's first dit: the warmup window
+        // (5 uncensored marks) spans only C and the start of Q -- no word
+        // boundary ever reaches `classify` during the pending replay.
+        let env: Vec<f32> = full.drain(18 - 7..).collect();
+        let events = decode_env(
+            &env,
+            TrackDecoder::new_mid_signal(1, DecodeConfig::default()),
+        );
+        let text = events_to_text(&events);
+        let settled = [rep; 2].join(" ");
+        assert!(
+            text.ends_with(&settled),
+            "marginal Farnsworth decode never reassembled words: {text:?}"
+        );
+    }
+
     fn last_timing(events: &[DecoderEvent]) -> Option<&crate::timing::TimingEstimates> {
         events.iter().rev().find_map(|e| match e {
             DecoderEvent::TimingUpdate { timing, .. } => Some(timing),
@@ -2917,6 +2925,5 @@ mod tests {
         assert!(!events
             .iter()
             .any(|e| matches!(e, DecoderEvent::TimingUpdate { .. })));
->>>>>>> e539c9b2a807402c7d5a00206277a1bf90016296
     }
 }

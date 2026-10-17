@@ -47,6 +47,12 @@ fn assert_clean_decode(text: &str, wpm: f32, offset_hz: f64, snr_2500_db: f32) {
         qsb: None,
         watterson: None,
         char_wpm: None,
+        weight: 3.0,
+        char_gap_units: 3.0,
+        word_gap_units: 7.0,
+        rise_ms: 5.0,
+        dit_units: 1.0,
+        element_gap_units: 1.0,
     };
     let (iq, texts) =
         render_scene(std::slice::from_ref(&sig), FS, DURATION_S, Some(NOISE_SEED)).unwrap();
