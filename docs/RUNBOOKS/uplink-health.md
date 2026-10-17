@@ -66,9 +66,15 @@ the metrics listener's own address, `127.0.0.1` by default), not
 (`0.0.0.0`/`::`) means "the daemon listens everywhere," which isn't itself
 something `manta status` can dial, so it falls back to loopback. If the
 daemon runs on a different host than the one you're checking from, use
-`--addr <that host>:<metrics_port>` instead; that only works if the
-daemon's `metrics_bind_addr` is reachable from where you are (it is
-loopback-only by default, see `docs/RUNBOOKS/network-exposure.md`).
+`--addr <that host>:<metrics_port>` instead. That fails with exit `2`
+until the daemon's metrics listener is widened, because it is
+loopback-only by default: on the daemon, set `[server].metrics_bind_addr`
+to an address you can reach and restart it, then firewall
+`[server].metrics_port` to the hosts that check it, since the listener has
+no password. Prefer the management interface's IP to `0.0.0.0`; with a
+specific IP, `localhost` stops answering on the daemon's host too, but
+`manta status --config` there follows the new address.
+`docs/RUNBOOKS/network-exposure.md` has both steps.
 
 ## Reading the output
 
