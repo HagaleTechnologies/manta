@@ -60,6 +60,10 @@ const TARGET_RATE_HZ: usize = 96_000;
 const IQ_LOW_CUT_HZ: i32 = -5_000;
 const IQ_HIGH_CUT_HZ: i32 = 5_000;
 
+/// The same passband as Hz from the tuned centre: the width of one KiwiSDR
+/// stream, which MAN-310's band planner splits bands into.
+pub const IQ_PASSBAND_HZ: (f64, f64) = (IQ_LOW_CUT_HZ as f64, IQ_HIGH_CUT_HZ as f64);
+
 /// Resampler chunk size (in complex sample-pairs) fed to `rubato::Fft` per
 /// `process_into_buffer` call.
 ///
