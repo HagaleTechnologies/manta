@@ -86,6 +86,37 @@ backoff (96 000 samples).
    reference 192 kS/s the stash holds the whole window and the join and
    first-retained anchors coincide.
 
+## Review round 2 (PR #342, Codex)
+
+Four P2 refinements to where the anchor's timestamps are taken. None
+changes the design above; each closes a window the first implementation
+left out of the outage, so each stamped post-reconnect spots *early* by
+its span:
+
+1. **The anchor's base is sampled in the reopen worker, immediately
+   before it enters the opener** -- not where the reading thread spawned
+   the worker. The OS can delay scheduling the `reopen-<kind>` thread,
+   every driver measures its offset only from inside the opener, and no
+   samples are acquired during the delay, so `spawn + offset` omitted it.
+   `ReconnectEnv` gained a `clock()` handle so the worker reads the same
+   (possibly injected) clock as `now()`, and the worker returns its base
+   `Instant` with the opener's result.
+2. **KiwiSDR timestamps between `SET ident_user` and `SET mod=iq`.** On a
+   backpressured connection the fire-and-forget `ident_user` send can
+   block; acquisition starts only at the IQ-mode command, so that block
+   is outage. The offset used to be taken before the whole SET loop.
+3. **ka9q-radio's stash anchor requires a packet `read` can return:**
+   the first stashed packet of the channel that parses, carries the
+   channel's SSRC and RTP payload type, and decodes to at least one IQ
+   sample -- `accept_rtp`'s own checks. An empty or undecodable payload,
+   or a foreign payload type, is counted malformed and never yields
+   samples, so its arrival is still signal-silent.
+4. **ka9q-radio's fallback anchor is the data socket's first successful
+   group membership**, returned by `join_socket` from immediately before
+   that operation -- not an instant captured before the socket was even
+   created or bound, which dropped socket setup and interface-join
+   delays from the outage.
+
 ## Residual
 
 A delay between the start trigger and the device's first captured
@@ -98,13 +129,14 @@ too.
 For ka9q-radio that residual covers two cases decision 4 does not close.
 When the stash retained nothing of the chosen channel (the channel sent
 no RTP during the open wait, or a foreign channel's flood evicted all of
-it), the anchor falls back to the join and the delay from the join to
-the channel's first packet stays excluded. And the anchor is the first
-retained packet's *receive* time, which is late by at most one drain
-pass (~1 ms) after its true arrival. Neither approaches one second on a
-single-channel group; a shared group whose foreign traffic dominates the
-stash can stretch the first, and is a decision for the field-node ticket
-if it ever shows up.
+it), the anchor falls back to the data socket's first successful group
+membership and the delay from there to the channel's first packet stays
+excluded. And the anchor is the first sample-bearing retained packet's
+*receive* time, which is late by at most one drain pass (~1 ms) after
+its true arrival. Neither approaches one second on a single-channel
+group; a shared group whose foreign traffic dominates the stash can
+stretch the first, and is a decision for the field-node ticket if it
+ever shows up.
 
 The opener's own runtime is still unbounded for SoapySDR (MAN-73's
 documented gap); this record only re-anchors the outage around it.
@@ -134,3 +166,14 @@ documented gap); this record only re-anchors the outage around it.
   pattern; their test harnesses cannot reach a real start trigger, so
   only the build and their existing suites cover them. SoapySDR cannot be
   built here (no `libsoapysdr`); CI's soapy leg compiles and tests it.
+- Review round 2: `reconnect.rs`
+  `discontinuity_includes_the_delay_before_the_reopen_worker_enters_the_opener`
+  (a clock handle that jumps 500 ms on the worker's first read failed
+  against the spawn-side base with 96 000 vs 144 000 samples);
+  `ka9q::sockets`
+  `acquisition_start_offset_skips_packets_that_cannot_yield_samples`
+  (a 20-datagram empty-payload run anchored at 200 ms and failed the
+  450 ms bound). The KiwiSDR trigger move and the `join_socket`
+  membership instant are timing relocations with no harness that can
+  inject their windows; the build, their existing suites, and the tests
+  above cover them.
