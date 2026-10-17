@@ -88,6 +88,18 @@ const NOMINAL_WORD_CHAR_RATIO: f32 = 7.0 / 3.0;
 /// pause, not the sender's word spacing, and is not learned (MAN-315 D2).
 pub const PAUSE_MIN_DITS: f32 = 15.0;
 
+// MAN-6 bad-lock recovery. `check_drift`'s regime-change rule requires
+// CV < DRIFT_CV_MAX, which makes it structurally blind to a *self-consistent*
+// bad lock: when mu_dit is seeded far too low, every real mark -- dits and dahs
+// alike -- lands in the `hi` cluster, so there is no "off-centroid" anomaly to
+// detect, and the streak's CV is high (~0.47 for a 3-dit/2-dah mixture)
+// precisely because the streak is a mixture. That high-CV, single-cluster
+// region is unoccupied by the SPEC §4.1 rule, so it is claimed here as an
+// explicit recovery trigger, gated on the streak itself splitting into two
+// Morse-plausible clusters. See
+// docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md.
+const BADLOCK_MIN_CLUSTER: usize = 3; // of DRIFT_LEN = 12, per side
+
 fn mean(xs: &[f32]) -> f32 {
     let mut acc = 0.0f64;
     for &x in xs {
@@ -109,6 +121,32 @@ fn largest_ratio_split(s: &[f32]) -> usize {
         }
     }
     best_i
+}
+
+/// Whether `durs` splits into two clusters that are plausibly dits and
+/// dahs: a largest-ratio-gap split with at least `BADLOCK_MIN_CLUSTER`
+/// members on each side and a centroid ratio inside SPEC §4.1's
+/// `[2.2, 4.5]` window. Used only by the MAN-6 bad-lock check; deliberately
+/// stricter than `ClusterPair::initialize`'s own `>= 2.0` gate so that a
+/// merely jittery homogeneous run can never be mistaken for a bad lock.
+fn is_credible_bimodal(durs: &[f32]) -> bool {
+    if durs.len() < 2 * BADLOCK_MIN_CLUSTER {
+        return false;
+    }
+    let mut s = durs.to_vec();
+    s.sort_by(f32::total_cmp);
+    let best_i = largest_ratio_split(&s);
+    let lo_n = best_i + 1;
+    let hi_n = s.len() - lo_n;
+    if lo_n < BADLOCK_MIN_CLUSTER || hi_n < BADLOCK_MIN_CLUSTER {
+        return false;
+    }
+    let lo = mean(&s[..lo_n]);
+    let hi = mean(&s[lo_n..]);
+    if lo <= 0.0 {
+        return false;
+    }
+    (RATIO_MIN..=RATIO_MAX).contains(&(hi / lo))
 }
 
 /// Shared 2-means machinery: init-after-5 with largest-ratio-gap split,
@@ -136,6 +174,12 @@ struct ClusterPair {
     /// and can misfire on long real-audio silence gaps) preserves the original
     /// "always assume the low cluster is real" default.
     unimodal_ceiling: Option<f32>,
+    /// How many init samples the last `initialize()`'s bimodal split put in
+    /// `lo` (0 after a unimodal init, whose `lo` is either the whole
+    /// population or a placeholder). Read only by `SpeedTracker`'s MAN-6
+    /// homogeneous bad-lock check, which needs to know when `lo` rests on a
+    /// single bootstrap sample.
+    lo_n: usize,
 }
 
 impl ClusterPair {
@@ -148,6 +192,7 @@ impl ClusterPair {
             confirmed: false,
             placeholder_is_lo: false,
             unimodal_ceiling,
+            lo_n: 0,
         }
     }
 
@@ -235,6 +280,7 @@ impl ClusterPair {
             self.hi = mean(&s[best_i + 1..]);
             self.confirmed = true;
             self.placeholder_is_lo = false;
+            self.lo_n = best_i + 1;
         } else {
             let m = mean(&s);
             let assume_dah = self.unimodal_ceiling.is_some_and(|ceiling| m > ceiling);
@@ -248,6 +294,7 @@ impl ClusterPair {
                 self.placeholder_is_lo = false;
             }
             self.confirmed = false;
+            self.lo_n = 0;
         }
         self.ready = true;
         self.init.clear();
@@ -279,6 +326,25 @@ pub struct SpeedTracker {
     /// mark scale, so a caller holding statistics in the old scale's units
     /// knows to drop them (MAN-315 D7).
     regime: u32,
+    /// MAN-6: set for exactly one `on_mark()` call after either bad-lock
+    /// branch below (bimodal or homogeneous) reinitializes `pair`, then cleared by
+    /// `take_badlock_recovered()`. `GapClassifier` has its own `ClusterPair`
+    /// bootstrapped from `gap_ms / mu_dit_ms` ratios computed against
+    /// whatever `mu_dit_ms` was in effect at the time -- during a bad lock
+    /// that is the corrupted value, so its cluster boundary latches onto a
+    /// wrong scale and never self-corrects even after this tracker recovers
+    /// (`ClusterPair` has no drift/reinit machinery of its own; only
+    /// `SpeedTracker::check_drift` calls `reinit_from`). Without a signal to
+    /// reset it too, every inter-word gap keeps misclassifying as
+    /// inter-char forever, silently deleting every word boundary from the
+    /// recovery point on. See
+    /// docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md.
+    badlock_recovered: bool,
+    /// MAN-6, homogeneous-text case: true while `mu_dit` still rests on the
+    /// single bootstrap sample `ClusterPair::initialize`'s split isolated as
+    /// the whole dit cluster, with no later mark assigned to it. Cleared by
+    /// the first post-bootstrap dit and by any reinit.
+    lo_uncorroborated: bool,
 }
 
 impl SpeedTracker {
@@ -293,6 +359,8 @@ impl SpeedTracker {
             mu_egap_ms: None,
             ratio_hint: None,
             regime: 0,
+            badlock_recovered: false,
+            lo_uncorroborated: false,
         }
     }
 
@@ -383,6 +451,14 @@ impl SpeedTracker {
         (mu_dit - delta).clamp(DIT_CLAMP_MS.0, DIT_CLAMP_MS.1)
     }
 
+    /// True exactly once after either MAN-6 bad-lock branch has fired
+    /// since the last call; cleared on read. See `badlock_recovered`'s doc
+    /// comment for why callers (`TrackDecoder`) need this to also reset
+    /// `GapClassifier`.
+    pub fn take_badlock_recovered(&mut self) -> bool {
+        std::mem::take(&mut self.badlock_recovered)
+    }
+
     /// Feed one mark duration, updating the clusters, constraints, and drift check. SPEC §4.1.
     pub fn on_mark(&mut self, dur_ms: f32) {
         self.recent.push_back(dur_ms);
@@ -391,13 +467,20 @@ impl SpeedTracker {
         }
         let pre_lo = self.pair.lo;
         let pre_hi = self.pair.hi;
+        let was_ready = self.pair.ready();
         let was_init = self.pair.observe(dur_ms);
         if !self.pair.ready() {
             return;
         }
+        if !was_ready {
+            self.lo_uncorroborated = self.pair.lo_n == 1;
+        }
         self.apply_constraints();
         if !was_init {
             let is_dit = dur_ms < self.pair.boundary();
+            if is_dit {
+                self.lo_uncorroborated = false;
+            }
             self.ring.push_back((dur_ms, is_dit, pre_lo, pre_hi));
             if self.ring.len() > DRIFT_LEN {
                 self.ring.pop_front();
@@ -475,6 +558,53 @@ impl SpeedTracker {
             // into the new one's dit_estimate_ms correction (MAN-103 D6).
             self.mu_egap_ms = None;
             self.regime = self.regime.wrapping_add(1);
+            self.lo_uncorroborated = false;
+            return;
+        }
+        // MAN-6, homogeneous-text case: the same fabricated leading fragment
+        // on all-dit text (e.g. "HH") seeds `mu_dit` from that one sample
+        // and `mu_dah` from the real dits, so every real dit classifies as a
+        // dah. The streak below is then homogeneous (CV ~0), which keeps it
+        // out of the bimodal branch underneath, and it sits exactly on
+        // `mu_dah`, which keeps it out of the SPEC rule above. Signature: 12
+        // consecutive dahs while the dit cluster still rests on the single
+        // bootstrap sample that isolated itself, with no mark assigned to it
+        // since. Reinitializing from the ring gives the decode the stream
+        // would have had without that sample (the unimodal init, pinned
+        // decision 20). Cost: an all-dah stream whose dit cluster is that
+        // lone sample (a real opening dit, or a fragment) and which then
+        // sends 16+ consecutive dahs is re-read as dits when its dah is
+        // under DIT_CLAMP_MS.1, the same ambiguity a dit-less opener
+        // already has.
+        if all_dah && cv < DRIFT_CV_MAX && self.lo_uncorroborated {
+            let durs: Vec<f32> = self.ring.iter().map(|&(d, _, _, _)| d).collect();
+            self.pair.reinit_from(&durs);
+            self.apply_constraints();
+            self.ring.clear();
+            self.lo_uncorroborated = false;
+            self.mu_egap_ms = None;
+            self.regime = self.regime.wrapping_add(1);
+            self.badlock_recovered = true;
+            return;
+        }
+        // MAN-6: self-consistent bad lock. Twelve consecutive marks all
+        // assigned to one cluster, yet those twelve durations themselves split
+        // into two Morse-plausible clusters -- the boundary is on the wrong
+        // side of a bimodal population and no amount of EMA will move it,
+        // because the wrong centroid is what produced the assignments it is
+        // being compared against. Reinitialize from the full 12-mark ring (not
+        // `recent`'s 5) so the re-split has the most evidence available.
+        if cv >= DRIFT_CV_MAX {
+            let durs: Vec<f32> = self.ring.iter().map(|&(d, _, _, _)| d).collect();
+            if is_credible_bimodal(&durs) {
+                self.pair.reinit_from(&durs);
+                self.apply_constraints();
+                self.ring.clear();
+                self.lo_uncorroborated = false;
+                self.mu_egap_ms = None;
+                self.regime = self.regime.wrapping_add(1);
+                self.badlock_recovered = true;
+            }
         }
     }
 }
@@ -1303,6 +1433,163 @@ mod tests {
             t.mu_egap_ms()
         );
         assert_eq!(t.dit_estimate_ms(), t.mu_dit_ms());
+    }
+
+    #[test]
+    fn bimodal_badlock_recovers() {
+        // MAN-6: force the exact self-consistent bad lock -- a fabricated 30 ms
+        // first sample isolates itself as the whole dit cluster, so mu_dit = 30 and
+        // the boundary lands below every real element. check_drift's existing rule
+        // is blind to this (the 12-mark streak's CV is ~0.47, over DRIFT_CV_MAX),
+        // so the new bimodal-lock branch must catch it.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[30.0, 84.0, 217.0, 84.0, 84.0]);
+        assert!(
+            t.boundary_ms() < 84.0,
+            "precondition: bad lock not reproduced (boundary {})",
+            t.boundary_ms()
+        );
+        // Now a long stream of genuine, correctly-measured elements.
+        for _ in 0..6 {
+            feed(&mut t, &[84.0, 217.0, 84.0, 84.0, 217.0]);
+        }
+        assert!(
+            (t.mu_dit_ms() - 84.0).abs() < 12.0,
+            "mu_dit failed to recover: {}",
+            t.mu_dit_ms()
+        );
+        assert!(
+            84.0 < t.boundary_ms() && t.boundary_ms() < 217.0,
+            "boundary must separate dits from dahs: {}",
+            t.boundary_ms()
+        );
+    }
+
+    #[test]
+    fn healthy_stream_never_triggers_badlock_recovery() {
+        // A correctly-locked tracker sees marks in BOTH clusters, so the
+        // all-one-cluster precondition never holds. 20 WPM, 60 marks.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        for _ in 0..11 {
+            feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        }
+        assert!(
+            (t.mu_dit_ms() - 60.0).abs() < 3.0,
+            "mu_dit {}",
+            t.mu_dit_ms()
+        );
+        assert!(
+            (t.mu_dah_ms() - 180.0).abs() < 8.0,
+            "mu_dah {}",
+            t.mu_dah_ms()
+        );
+    }
+
+    #[test]
+    fn jittery_single_cluster_does_not_trigger_badlock_recovery() {
+        // A genuinely homogeneous but noisy run of dits must NOT be mistaken
+        // for a bad lock. This data's CV is ~0.39 -- deliberately pushed past
+        // DRIFT_CV_MAX (0.35) so check_drift's `cv >= DRIFT_CV_MAX` branch is
+        // actually reached (a prior version of this data had CV 0.34 and
+        // never reached that branch at all, passing vacuously) -- and its
+        // largest-ratio-gap split gives a centroid ratio of ~1.98, below
+        // RATIO_MIN (2.2), so the guard must reject it and leave the
+        // (correct) 60 ms dit centroid alone.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        let jittered = [
+            24.5, 32.6, 20.1, 26.6, 28.9, 29.4, 44.4, 43.9, 53.0, 41.4, 67.2, 70.6,
+        ];
+        feed(&mut t, &jittered);
+        assert!(
+            (t.mu_dit_ms() - 60.0).abs() < 20.0,
+            "mu_dit should stay near 60, got {}",
+            t.mu_dit_ms()
+        );
+    }
+
+    #[test]
+    fn single_long_mark_does_not_trigger_badlock_recovery() {
+        // BADLOCK_MIN_CLUSTER's per-side minimum: 11 dahs plus one overlong
+        // mark (CV ~0.47, so the bimodal branch is reached) split 11/1 at a
+        // ratio of 3.0, inside [RATIO_MIN, RATIO_MAX]. One sample is not a
+        // cluster, so the guard must reject it and leave the correct 60 ms
+        // dit centroid alone; re-splitting would make the dahs the dits.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        feed(
+            &mut t,
+            &[
+                180.0, 180.0, 180.0, 180.0, 180.0, 540.0, 180.0, 180.0, 180.0, 180.0, 180.0, 180.0,
+            ],
+        );
+        assert!(
+            (t.mu_dit_ms() - 60.0).abs() < 1.0,
+            "mu_dit should stay at 60, got {}",
+            t.mu_dit_ms()
+        );
+        assert!(!t.take_badlock_recovered());
+    }
+
+    #[test]
+    fn homogeneous_badlock_recovers() {
+        // MAN-6 on all-dit text ("HH"): the fabricated 30 ms first sample
+        // isolates itself as the whole dit cluster and the real 84 ms dits
+        // become mu_dah, so every dit reads as a dah. The 12-mark streak has
+        // CV ~0 (out of the bimodal branch's reach) and sits on mu_dah (out
+        // of the SPEC drift rule's reach); the homogeneous branch must
+        // catch it.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[30.0, 84.0, 84.0, 84.0, 84.0]);
+        assert!(
+            t.boundary_ms() < 84.0,
+            "bad lock not formed (boundary {})",
+            t.boundary_ms()
+        );
+        feed(&mut t, &[84.0; 60]);
+        assert!(
+            (t.mu_dit_ms() - 84.0).abs() < 1.0,
+            "mu_dit failed to recover: {}",
+            t.mu_dit_ms()
+        );
+        assert!(
+            t.boundary_ms() > 84.0,
+            "real dits must classify as dits: boundary {}",
+            t.boundary_ms()
+        );
+    }
+
+    #[test]
+    fn corroborated_singleton_dit_does_not_trigger_homogeneous_recovery() {
+        // A singleton dit cluster that a later mark lands in is a real dit,
+        // not a fabricated fragment: a following run of 12 dahs must not
+        // re-split it.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[66.0, 200.0, 200.0, 200.0, 200.0]);
+        t.on_mark(66.0);
+        feed(&mut t, &[200.0; 12]);
+        assert!(
+            (t.mu_dit_ms() - 66.0).abs() < 1.0,
+            "mu_dit should stay at 66, got {}",
+            t.mu_dit_ms()
+        );
+        assert!(!t.take_badlock_recovered());
+    }
+
+    #[test]
+    fn healthy_lock_survives_long_dah_run() {
+        // A lock bootstrapped from several dits ("0", "MOM", "OOOO" all send
+        // long dah runs) must not be touched by the homogeneous branch.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        feed(&mut t, &[180.0; 24]);
+        assert!(
+            (t.mu_dit_ms() - 60.0).abs() < 1.0,
+            "mu_dit should stay at 60, got {}",
+            t.mu_dit_ms()
+        );
+        assert!(!t.take_badlock_recovered());
     }
 
     #[test]

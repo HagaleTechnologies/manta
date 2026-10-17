@@ -109,6 +109,7 @@ Add a row here in the same change that adds a record:
 | 2026-09-06 | — | [Broad UI/UX/market review: architectural decisions](2026-09-06-broad-review-decisions.md) |
 | 2026-09-05 | MAN-65 | [MAN-65: release pipeline deferred review findings (PR #78)](2026-09-05-man65-release-pipeline-hardening.md) |
 | 2026-09-05 | MAN-34 | [`AudioIqSource` gains an operator-supplied RF reference (MAN-34)](2026-09-05-man-34-audio-rf-reference.md) |
+| 2026-09-04 | MAN-6 | [MAN-6: bimodal bad-lock recovery (leading-partial-run suppression tried and reverted)](2026-09-04-man6-leading-partial-run-and-badlock-recovery.md) |
 | 2026-09-04 | MAN-64 | [MAN-64: metrics request-rate budget and `manta_source_health`'s failure transition](2026-09-04-man64-metrics-request-rate-and-source-health.md) |
 | 2026-09-04 | MAN-56 | [MAN-56: input packet-loss/malformed counters on the Prometheus `/metrics` endpoint](2026-09-04-man56-input-health-metrics.md) |
 | 2026-09-04 | MAN-45 | [MAN-45: unresolved-allowlisted-geography sentinels (spot_message.rs)](2026-09-04-man45-unresolved-geography-sentinels.md) |

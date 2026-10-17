@@ -904,6 +904,15 @@ leading edge. A space is not emitted until the next mark begins (open-ended
 trailing space is flushed as a word boundary by the 7-dit timeout rule,
 §4.2).
 
+Note: the run open when this stage's rails first initialize has no observed
+leading edge — it starts at whatever arbitrary hop the rails happened to
+finish warming up on, not a genuine keying transition. Discarding it
+unconditionally was investigated (MAN-6) and rejected: this stage cannot
+distinguish that case from a window that happens to open exactly on a
+genuine mark/space transition, so the discard also drops real leading
+elements on ordinary decodes. See
+`docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md`.
+
 ---
 
 ## 4. Element classification & Morse decoding
@@ -1023,6 +1032,32 @@ MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses) read the means
 and variances; this section uses only the means. A §4.1 drift re-init
 resets every class. Legacy and EdgeLegacy only; the HSMM engine (SPEC v2)
 keeps its own per-token speed and learns none of this.
+
+**[DEVIATION — added]** A second reinitialization trigger covers the
+complementary case the rule above is structurally blind to: if 12 consecutive
+marks assign to a single cluster *and* their coefficient of variation is
+**≥ 0.35** *and* those 12 durations themselves split (largest ratio gap, ≥ 3
+members per side) into two clusters whose centroid ratio is inside
+`[2.2, 4.5]`, the boundary is on the wrong side of a genuinely bimodal
+population — reinitialize from those 12 marks. Without this, a `μ_dit` seeded
+too low is a stable fixed point: every real mark, dit and dah alike, is
+assigned to the dah cluster, so no "off that centroid" anomaly ever appears.
+When this trigger fires, the gap classifier (§4.2) is also reinitialized
+from scratch: its own 2-means state was bootstrapped from `gap_ms / μ_dit`
+ratios computed against the bad `μ_dit`, has no drift-detection of its own,
+and would otherwise keep misclassifying every inter-word gap as
+inter-character indefinitely, even after this reinitialization corrects
+`μ_dit`/`μ_dah`. See
+`docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md`.
+
+**[DEVIATION — added]** A third trigger covers the homogeneous case neither
+rule above can see: if 12 consecutive marks all assign to the dah cluster
+*and* their coefficient of variation is < 0.35 (and the regime-change rule
+did not fire) *and* the dit cluster still rests on the single bootstrap mark
+the 5-mark split isolated, with no later mark assigned to it, reinitialize
+from those 12 marks and reset the gap classifier as above. Both MAN-6 triggers are mark-scale re-inits like the regime-change rule: they also drop the inter-element gap centroid and bump the tracker's regime generation, so per-sender statistics learned in the old scale (MAN-315) are discarded. This is the same
+fabricated-fragment lock on all-dit text, whose streak has no spread for the
+bimodal trigger to detect.
 
 ### 4.2 Gap classification (spaces)
 
