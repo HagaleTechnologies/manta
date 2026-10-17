@@ -14,6 +14,12 @@
 //! absorbed into the next space, which is why the edge was so sharp. Fixed
 //! by `TrackDecoder::new_mid_signal`: the engine's decoder keeps that
 //! left-censored first run out of speed tracking.
+//!
+//! Measured when this branch merged main at 35deb42: these scenes also
+//! decode cleanly with that fix disabled, so they guard the end-to-end
+//! symptom only. decoder.rs's `censored_lead_tail_poisons_a_from_start_decoder`
+//! and `mid_signal_decoder_keeps_censored_lead_tail_out_of_speed_tracking`
+//! pin the mechanism.
 
 use manta_decode::events::DecoderEvent;
 use manta_engine::{decode_samples, PipelineConfig};
@@ -47,6 +53,12 @@ fn assert_clean_decode(text: &str, wpm: f32, offset_hz: f64, snr_2500_db: f32) {
         qsb: None,
         watterson: None,
         char_wpm: None,
+        weight: 3.0,
+        char_gap_units: 3.0,
+        word_gap_units: 7.0,
+        rise_ms: 5.0,
+        dit_units: 1.0,
+        element_gap_units: 1.0,
     };
     let (iq, texts) =
         render_scene(std::slice::from_ref(&sig), FS, DURATION_S, Some(NOISE_SEED)).unwrap();
