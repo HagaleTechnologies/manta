@@ -2123,14 +2123,6 @@ impl TrackManager {
                     // this entry's own `push_hop`, so a `TrackMeta` pairs it
                     // with this hop's `sample_ts`.
                     let freq_hz = track.freq_hz(self.center_freq_hz, self.channel_spacing_hz, n);
-<<<<<<< HEAD
-                    // MAN-5: promotion lands `confirm_hops` into a mark, so
-                    // the decoder's first run is a truncated tail that must
-                    // not seed its speed tracker (see `new_mid_signal`).
-                    track.decoder = Some(TrackDecoder::new_mid_signal(id, self.decode_cfg.clone()));
-                    track.decoder.as_mut().unwrap().set_freq_hz(freq_hz);
-                    track.pending.push((hop.power[k].sqrt(), sample_ts));
-=======
                     // MAN-313 (SPEC §2.8): with the filter on, the decoder is
                     // leased (and `TrackPromoted` emitted) only once the track
                     // qualifies as keyed CW; until then its input queues in
@@ -2140,7 +2132,12 @@ impl TrackManager {
                             Some(KeyingEvidence::new(sample_ts, freq_hz, self.hop_counter));
                     } else {
                         track.qualified = true;
-                        track.decoder = Some(TrackDecoder::new(id, self.decode_cfg.clone()));
+                        // MAN-5: promotion lands `confirm_hops` into a mark,
+                        // so the decoder's first run is a truncated tail that
+                        // must not seed its speed tracker (see
+                        // `new_mid_signal`).
+                        track.decoder =
+                            Some(TrackDecoder::new_mid_signal(id, self.decode_cfg.clone()));
                     }
                     let spectral_ref_power = compute_spectral_ref_power
                         .then(|| Self::spectral_ref_power(&self.floor, track.center))
@@ -2181,7 +2178,6 @@ impl TrackManager {
                             freq_hz,
                         });
                     }
->>>>>>> 35deb42de4260c19220c0fec9cd847f70bf93828
                 }
                 LifecycleEvent::None => {
                     // Feed the decoder every hop once it exists (ACTIVE *or*
@@ -2293,7 +2289,11 @@ impl TrackManager {
                         let (promo_ts, promo_freq_hz) = (ev.promo_ts, ev.promo_freq_hz);
                         let freq_hz = track.freq_hz(self.center_freq_hz, spacing, n);
                         track.qualified = true;
-                        let mut decoder = TrackDecoder::new(id, self.decode_cfg.clone());
+                        // MAN-5: the decoder replays this track's queued
+                        // input, which starts mid-mark at the promotion hop
+                        // (or mid-stream once the backlog was trimmed), so
+                        // its first run is likewise left-censored.
+                        let mut decoder = TrackDecoder::new_mid_signal(id, self.decode_cfg.clone());
                         decoder.set_freq_hz(freq_hz);
                         track.decoder = Some(decoder);
                         promoted_events.push(DecoderEvent::TrackPromoted {
