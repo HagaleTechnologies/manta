@@ -543,3 +543,25 @@ fn calibrate_help_names_every_flag() {
         assert!(help.contains(flag), "no {flag} in {help}");
     }
 }
+
+/// MAN-13: with several `[[input]]` entries, `--input NAME --write` saves
+/// into that entry, and the save's reload check reads that entry too.
+#[test]
+fn calibrate_write_saves_into_the_named_input_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path(), Some(CARRIER_2_5_PPM), CENTRE);
+    let original = "[[input]]\nname = \"a\"\ntype = \"file\"\npath = \"ref.wav\"\niq = true\n\
+                    freq_correction_ppm = 0.0\n\n[[input]]\nname = \"b\"\ntype = \"file\"\n\
+                    path = \"ref.wav\"\niq = true\nfreq_correction_ppm = 0.5 # old\n";
+    let cfg = write_cfg(dir.path(), original);
+    let out = calibrate(&cfg, &["--input", "b", "--write"]);
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));
+    assert_eq!(
+        std::fs::read_to_string(&cfg).unwrap(),
+        original.replace(
+            "freq_correction_ppm = 0.5 # old",
+            "freq_correction_ppm = 2.5 # old"
+        )
+    );
+}

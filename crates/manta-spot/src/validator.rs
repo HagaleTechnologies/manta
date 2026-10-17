@@ -411,6 +411,9 @@ pub struct Validator {
     /// MAN-324: the opt-in decision log (`record_decisions`). `None`, the
     /// default, records nothing and allocates nothing.
     decisions: Option<Vec<Decision>>,
+    /// MAN-13: inputs interleaving their track ids into this validator
+    /// (`with_input_count`).
+    input_count: u32,
 }
 
 /// How often (in seconds of `sample_ts`) the repetition gate is swept
@@ -453,7 +456,24 @@ impl Validator {
             gate_window_samples: (GATE_WINDOW_SECONDS * fs) as u64,
             merged_into: BTreeMap::new(),
             decisions: None,
+            input_count: 1,
         }
+    }
+
+    /// MAN-13: the number of inputs whose interleaved track ids feed this
+    /// validator. Input `i` of `n` numbers its tracks `1+i, 1+i+n, ...`
+    /// (`TrackIdSpace` in `manta-engine`), so a track's input is
+    /// `(track_id - 1) % n`, and dedupe treats a different input's report
+    /// of a stored spot as a duplicate for the whole window (D6). `1` (the
+    /// default) is the single-input validator, unchanged. `0` is taken as 1.
+    pub fn with_input_count(mut self, n: u32) -> Self {
+        self.input_count = n.max(1);
+        self
+    }
+
+    /// MAN-13: the input that spawned `track_id` (see `with_input_count`).
+    pub fn input_of(&self, track_id: u32) -> u32 {
+        track_id.saturating_sub(1) % self.input_count
     }
 
     /// Replace the independent callsign-pattern reference table.
@@ -1431,10 +1451,14 @@ impl Validator {
             return None;
         }
 
-        if !self
-            .dedupe
-            .should_emit(&candidate, freq_hz, snr_db, spot_type, sample_ts)
-        {
+        if !self.dedupe.should_emit(
+            &candidate,
+            freq_hz,
+            snr_db,
+            spot_type,
+            sample_ts,
+            self.input_of(track_id),
+        ) {
             self.decide(|| withheld(Reason::Dedupe).with_reps(reps));
             return None;
         }
@@ -1753,12 +1777,14 @@ impl Validator {
                         return None;
                     }
                 }
+                let input = self.input_of(pb.origin_track_id);
                 if !self.dedupe.should_emit(
                     &pb.candidate,
                     pb.freq_hz,
                     pb.snr_db,
                     SpotType::Beacon,
                     pb.sample_ts,
+                    input,
                 ) {
                     self.decide(|| beacon_decision(track_id, &pb, Reason::Dedupe).with_reps(reps));
                     return None;
@@ -2215,6 +2241,86 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         });
         assert!(v.candidates_for(1, 500_000).is_empty());
         assert_eq!(v.candidates_for(2, 500_000).len(), 1);
+    }
+
+    // ---- MAN-13: several inputs, one validator ----
+
+    fn meta_at(v: &mut Validator, track_id: u32, freq_hz: f64) {
+        v.ingest(&DecoderEvent::TrackMeta {
+            track_id,
+            sample_ts: 0,
+            snr_2500_db: 20.0,
+            freq_hz,
+        });
+    }
+
+    /// Two tracks' transmissions, interleaved by `sample_ts` the way the
+    /// multi-input merge delivers them.
+    fn interleaved(a: (u32, &str), b: (u32, &str), start_ts: u64) -> Vec<DecoderEvent> {
+        let mut events = transmission_events(a.0, &["DE", a.1, "K"], start_ts);
+        events.extend(transmission_events(b.0, &["DE", b.1, "K"], start_ts + 50));
+        events.sort_by_key(|e| match e {
+            DecoderEvent::CharDecoded { sample_ts, .. }
+            | DecoderEvent::WordBoundary { sample_ts, .. } => *sample_ts,
+            _ => 0,
+        });
+        events
+    }
+
+    #[test]
+    fn input_count_maps_interleaved_track_ids_to_inputs() {
+        let v = Validator::new(FS, CTY_FIXTURE, None).with_input_count(3);
+        let inputs: Vec<u32> = [1, 4, 2, 5, 3].iter().map(|&id| v.input_of(id)).collect();
+        assert_eq!(inputs, vec![0, 0, 1, 1, 2]);
+        let single = Validator::new(FS, CTY_FIXTURE, None);
+        assert_eq!(single.input_of(7), 0);
+    }
+
+    #[test]
+    fn two_inputs_hearing_one_station_spot_it_once() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None).with_input_count(2);
+        // The measured 3 Hz disagreement, straddling the gate's 100 Hz
+        // bucket edge at 14_012_350 Hz.
+        meta_at(&mut v, 1, 14_012_349.9);
+        meta_at(&mut v, 2, 14_012_352.7);
+        let mut spots = Vec::new();
+        for start in [0, 100_000, 200_000] {
+            spots.extend(run(&interleaved((1, "K5ARH"), (2, "K5ARH"), start), &mut v));
+        }
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        assert_eq!(spots[0].callsign, "K5ARH");
+    }
+
+    #[test]
+    fn two_inputs_hearing_two_stations_spot_both() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None).with_input_count(2);
+        meta_at(&mut v, 1, 14_012_340.0);
+        meta_at(&mut v, 2, 14_085_000.0);
+        let mut spots = Vec::new();
+        for start in [0, 100_000] {
+            spots.extend(run(&interleaved((1, "K5ARH"), (2, "W1AW"), start), &mut v));
+        }
+        let mut calls: Vec<&str> = spots.iter().map(|s| s.callsign.as_str()).collect();
+        calls.sort_unstable();
+        assert_eq!(calls, vec!["K5ARH", "W1AW"]);
+    }
+
+    #[test]
+    fn one_input_validator_is_unchanged() {
+        let scene = |v: &mut Validator| {
+            seed_meta(v, 1);
+            let words = ["DE", "K5ARH", "K"];
+            let mut spots = run(&transmission_events(1, &words, 0), v);
+            spots.extend(run(&transmission_events(1, &words, 100_000), v));
+            spots.extend(run(
+                &transmission_events(1, &["DE", "K5ARH", "K"], 900_000),
+                v,
+            ));
+            format!("{spots:?}")
+        };
+        let mut default = Validator::new(FS, CTY_FIXTURE, None);
+        let mut one = Validator::new(FS, CTY_FIXTURE, None).with_input_count(1);
+        assert_eq!(scene(&mut default), scene(&mut one));
     }
 
     #[test]

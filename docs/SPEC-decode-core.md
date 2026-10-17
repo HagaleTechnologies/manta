@@ -1452,6 +1452,20 @@ rules:
    their batch; a merge loser's `TrackClosed` precedes its survivor's own
    `TrackClosed` in the same batch; other closures stay in `track_id` order
    (MAN-174).
+7. **Several inputs (MAN-13):** each `[[input]]` runs rules 1–6 on its own
+   thread. Timestamps share one clock at the highest input rate F: input
+   *i*'s `sample_ts` maps to `offset_i + sample_ts × F / fs_i`, exact
+   because every channelizer rate is 93.75 Hz × 2^k. Replay offsets are 0;
+   live offsets are each input's open-completion time after the earliest.
+   Input *i* of N numbers its tracks `1+i, 1+i+N, …`, so ids stay unique
+   and `input = (track_id − 1) mod N`. Replay merges whole batches into the
+   one validator in `(batch end time, input index)` order, so the same
+   files give byte-identical output; live inputs merge in arrival order,
+   so no input waits on another. Dedupe treats another input's report of a
+   stored spot (same 300 Hz bucket, or within 93.75 Hz across a bucket edge,
+   inside the 600 s window) as a duplicate, with no SNR or spot-type
+   override; the stored time never moves backwards. See
+   docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md.
 
 CI enforces: same binary + same IQ file, 3 runs → identical SHA-256 of the
 JSON spot log; and the §7 vectors on all platforms.

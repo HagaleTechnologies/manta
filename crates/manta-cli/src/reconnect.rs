@@ -175,7 +175,9 @@ impl InputHealthTotals {
 /// lookup, a SoapySDR driver open). An abandoned attempt finishes on its
 /// own thread, or dies with the process.
 pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
-    name: &'static str,
+    /// The source's name in log lines: its type, or with several inputs
+    /// (MAN-13) the input's name.
+    name: String,
     inner: Option<Box<dyn IqSource>>,
     /// Shared with the reopen thread, which locks it for the call; kept
     /// here rather than moved into the thread so a failed spawn loses
@@ -220,7 +222,7 @@ pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
 
 impl ReconnectingSource<RealEnv> {
     pub(crate) fn new(
-        name: &'static str,
+        name: impl Into<String>,
         first: Box<dyn IqSource>,
         opener: Opener,
         stop: Arc<AtomicBool>,
@@ -241,7 +243,7 @@ impl ReconnectingSource<RealEnv> {
 
 impl<E: ReconnectEnv> ReconnectingSource<E> {
     pub(crate) fn with_env(
-        name: &'static str,
+        name: impl Into<String>,
         first: Box<dyn IqSource>,
         opener: Opener,
         stop: Arc<AtomicBool>,
@@ -257,7 +259,7 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
         let last_ok = env.now();
         let input_health = InputHealthTotals::for_source(first.as_ref());
         ReconnectingSource {
-            name,
+            name: name.into(),
             inner: Some(first),
             opener: Arc::new(Mutex::new(opener)),
             reopen: None,
