@@ -1,0 +1,56 @@
+# manta under Docker Compose (MAN-268). Before `docker compose up -d`, copy
+# manta.example.toml to manta.toml beside this file, set your station
+# callsign and configure your receiver. Then check the result with
+# `docker compose config`. Permissions, SELinux and port changes:
+# packaging/README.md.
+#
+# No released image is documented yet. From a source checkout, build one
+# with `docker build -t manta:local .` and change `image:` to manta:local.
+#
+# stop_grace_period covers manta's SIGTERM drain: up to 50 s for clients,
+# 2 s of runtime shutdown, and margin. Docker's own 10 s default would
+# SIGKILL a daemon that is still draining.
+#
+# Metrics listen on 0.0.0.0 inside the container so the published port can
+# reach them, and are published on the host's loopback only. If you change
+# a port in manta.toml, change its mapping here too.
+#
+# The manta-lists volume at /var/cache/manta is [spot].list_cache_dir
+# (MANTA_SPOT_LIST_CACHE_DIR): where [spot].refresh_lists keeps downloaded
+# cty.dat and MASTER.SCP copies across container restarts. Refresh stays
+# off until you set refresh_lists = true in manta.toml; it then needs
+# outbound TCP port 80. See packaging/README.md.
+
+services:
+  manta:
+    image: ghcr.io/hagaletechnologies/manta:latest
+    restart: unless-stopped
+    command: ["run", "--config", "/etc/manta/manta.toml"]
+    stop_grace_period: 60s
+    volumes:
+      - type: bind
+        source: ./manta.toml
+        target: /etc/manta/manta.toml
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: Z
+      - type: volume
+        source: manta-lists
+        target: /var/cache/manta
+    ports:
+      - "7300:7300"
+      - "7301:7301"
+      - "127.0.0.1:7302:7302"
+    environment:
+      RUST_LOG: info
+      MANTA_SERVER_METRICS_BIND_ADDR: "0.0.0.0"
+      MANTA_SPOT_LIST_CACHE_DIR: "/var/cache/manta"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  manta-lists:

@@ -15,6 +15,12 @@ use tokio::net::{TcpListener, TcpStream};
 const SAMPLE_RATE_HZ: f64 = 96_000.0;
 const STATION_CALL: &str = "W3XYZ";
 
+/// The session epoch every server in this file uses unless a test needs
+/// real wall-clock time (MAN-92's `sh/dx XXm` window).
+fn fixed_epoch() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+}
+
 async fn spawn_server() -> (
     std::net::SocketAddr,
     Arc<SpotBus>,
@@ -22,8 +28,85 @@ async fn spawn_server() -> (
     tokio::sync::watch::Sender<bool>,
     manta_server::tasks::ClientTasks,
 ) {
-    let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
+    spawn_server_with_drain_deadline(manta_server::tasks::CLIENT_DRAIN_DEADLINE).await
+}
+
+/// MAN-88: lets a test pick the wire layout (`rbn` vs `skimmer`) while
+/// keeping the production drain deadline.
+async fn spawn_server_with_format(
+    line_format: rbn::LineFormat,
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+    manta_server::tasks::ClientTasks,
+) {
+    spawn_server_with(
+        manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+        line_format,
+        fixed_epoch(),
+        None,
+    )
+    .await
+}
+
+/// MAN-92: a server whose session started at `epoch`, so a test can place
+/// spots inside and outside a real-time `sh/dx XXm` window.
+async fn spawn_server_with_epoch(
+    epoch: SystemTime,
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+    manta_server::tasks::ClientTasks,
+) {
+    spawn_server_with(
+        manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+        rbn::LineFormat::Rbn,
+        epoch,
+        None,
+    )
+    .await
+}
+
+/// MAN-45 (PR #63 round-16 finding): lets a test drive the per-client
+/// shutdown-drain deadline directly (e.g. `Duration::ZERO`, to make an
+/// expiry exact rather than timing-dependent) instead of always waiting on
+/// the production `CLIENT_DRAIN_DEADLINE`.
+async fn spawn_server_with_drain_deadline(
+    drain_deadline: Duration,
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+    manta_server::tasks::ClientTasks,
+) {
+    spawn_server_with(drain_deadline, rbn::LineFormat::Rbn, fixed_epoch(), None).await
+}
+
+/// The single spawn body the helpers above delegate to -- MAN-45's drain
+/// deadline, MAN-88's line format and MAN-92's session epoch are
+/// independent knobs on the same server.
+async fn spawn_server_with(
+    drain_deadline: Duration,
+    line_format: rbn::LineFormat,
+    epoch: SystemTime,
+    history_minutes: Option<u32>,
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+    manta_server::tasks::ClientTasks,
+) {
+    let mut bus = SpotBus::new(SAMPLE_RATE_HZ, epoch, 0);
+    if let Some(minutes) = history_minutes {
+        bus = bus.with_history_minutes(minutes);
+    }
+    let bus = Arc::new(bus);
     let metrics = Arc::new(Metrics::new());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -40,12 +123,31 @@ async fn spawn_server() -> (
     let tasks_handle = tasks.clone();
     let limiter =
         manta_server::tasks::new_connection_limiter(manta_server::telnet::MAX_TELNET_CONNECTIONS);
+    // MAN-86: 96 kS/s centred on 14.040 MHz -> a live passband of
+    // 13992.0-14088.0 kHz, clipped to the 20m allocation at its lower edge
+    // -> 14000.0-14088.0. Fixed so `skimmer_sett_gets_a_real_reply_in_the_documented_format`
+    // has a stable expected value.
+    let profile = std::sync::Arc::new(manta_server::telnet::StationProfile {
+        call: STATION_CALL.to_string(),
+        operator_name: None,
+        operator_qth: None,
+        operator_grid: None,
+        sett: manta_server::sett::SettSettings {
+            validation_level: manta_server::sett::ValidationLevel::Normal,
+            cq_only: false,
+            segments: manta_server::sett::segments_for_passband(
+                14_040_000.0,
+                (-SAMPLE_RATE_HZ / 2.0, SAMPLE_RATE_HZ / 2.0),
+                1.0,
+            ),
+        },
+    });
     tokio::spawn(async move {
         manta_server::telnet::serve(
             listener,
             bus2,
             metrics2,
-            STATION_CALL.to_string(),
+            profile,
             shutdown_rx,
             tasks,
             limiter,
@@ -54,6 +156,8 @@ async fn spawn_server() -> (
                 manta_server::telnet::MAX_TELNET_COMMANDS,
                 manta_server::telnet::COMMAND_RATE_WINDOW,
             ),
+            drain_deadline,
+            line_format,
         )
         .await;
     });
@@ -71,7 +175,44 @@ fn sample_spot() -> Spot {
         confidence: 0.9,
         track_id: 1,
         sample_ts: 0,
+        rst: None,
+        qrl_query: false,
     }
+}
+
+/// Read lines until `stop` matches one, returning every line read.
+///
+/// MAN-86 review: once the peer has closed, `read_line` returns `Ok(0)`
+/// forever, so a loop that only inspects the line's CONTENT spins until the
+/// harness kills it. `connect_and_login` below is shared by most tests in
+/// this file and has no surrounding timeout, so an early-close regression
+/// would hang the whole suite instead of naming the line it never saw.
+/// Zero bytes is EOF and fails immediately; the whole read is also bounded,
+/// so a server that stops writing without closing fails the same way.
+async fn read_lines_until(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    expecting: &str,
+    stop: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let collect = async {
+        let mut lines: Vec<String> = Vec::new();
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await.unwrap();
+            assert!(
+                n > 0,
+                "connection closed before {expecting}; lines seen: {lines:?}"
+            );
+            let done = stop(&line);
+            lines.push(line);
+            if done {
+                return lines;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), collect)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {expecting}"))
 }
 
 async fn connect_and_login(
@@ -84,24 +225,26 @@ async fn connect_and_login(
     let (rd, mut wr) = stream.into_split();
     let mut reader = BufReader::new(rd);
 
-    let mut prompt = String::new();
-    reader.read_line(&mut prompt).await.unwrap();
+    // MAN-86: the greeting is now a multi-line CW-Skimmer-shaped banner,
+    // not a single `login: ` line -- read until the callsign prompt rather
+    // than assuming the first line is it.
+    let banner = read_lines_until(&mut reader, "the callsign prompt", |line| {
+        line.to_lowercase().contains("enter your callsign")
+    })
+    .await;
     assert!(
-        prompt.to_lowercase().contains("login") || prompt.to_lowercase().contains("call"),
-        "expected a login prompt, got: {prompt:?}"
+        banner.iter().any(|line| line.contains("Welcome to")),
+        "expected a greeting banner before the callsign prompt, got: {banner:?}"
     );
 
     wr.write_all(b"N0CALL\r\n").await.unwrap();
 
     // Consume the post-login greeting line(s) up through the station's
     // own prompt (`de W3XYZ-# >`) before the spot stream starts.
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        if line.contains(STATION_CALL) {
-            break;
-        }
-    }
+    read_lines_until(&mut reader, "the post-login station prompt", |line| {
+        line.contains(STATION_CALL)
+    })
+    .await;
 
     (reader, wr)
 }
@@ -112,7 +255,12 @@ async fn standard_client_receives_spot_in_rbn_format_after_login() {
     let (mut reader, _wr) = connect_and_login(addr).await;
 
     let spot = sample_spot();
-    let expected = rbn::format_line(&spot, STATION_CALL, bus.unix_ts_for(spot.sample_ts));
+    let expected = rbn::format_line(
+        &spot,
+        STATION_CALL,
+        bus.unix_ts_for(spot.sample_ts),
+        rbn::LineFormat::Rbn,
+    );
     bus.publish(spot);
 
     let mut line = String::new();
@@ -154,9 +302,18 @@ async fn sh_dx_replays_recent_spot_history_in_rbn_format() {
     first.callsign = "K5ARH".to_string();
     let mut second = sample_spot();
     second.callsign = "N0CALL".to_string();
-    let expected_first = rbn::format_line(&first, STATION_CALL, bus.unix_ts_for(first.sample_ts));
-    let expected_second =
-        rbn::format_line(&second, STATION_CALL, bus.unix_ts_for(second.sample_ts));
+    let expected_first = rbn::format_line(
+        &first,
+        STATION_CALL,
+        bus.unix_ts_for(first.sample_ts),
+        rbn::LineFormat::Rbn,
+    );
+    let expected_second = rbn::format_line(
+        &second,
+        STATION_CALL,
+        bus.unix_ts_for(second.sample_ts),
+        rbn::LineFormat::Rbn,
+    );
     bus.publish(first);
     bus.publish(second);
 
@@ -379,6 +536,206 @@ async fn shutdown_drains_an_already_queued_spot_before_disconnecting() {
     assert_eq!(n, 0, "expected EOF after shutdown drain, got: {trailing:?}");
 }
 
+/// Validation round 17 (CR-1): before this fix, `handle_client`'s pre-loop
+/// login handshake (prompt write, login-line read, banner write) never
+/// observed `shutdown` at all -- a client that received the prompt and then
+/// simply stalled without sending a login line held its task inside
+/// `read_line_bounded_with_timeout` for up to `bounded_io::IDLE_READ_TIMEOUT`
+/// (30s), invisible to shutdown the whole time. The fix races every step of
+/// the handshake against `shutdown.changed()`. This is fully deterministic
+/// (no timing race): the "client" here never sends anything after reading
+/// the prompt, so the ONLY way the connection can close is via the new
+/// shutdown-aware branch -- without the fix this test would hang until the
+/// assertion's own timeout fires.
+///
+/// MAN-45 remediate (code-review round 18, finding 2): also asserts the
+/// abandoned backlog lands on `spots_dropped_shutdown_total`, NOT
+/// `spots_dropped_write_failed_total` -- no write ever failed on this path,
+/// the daemon shut down cleanly, and conflating the two would mislead an
+/// operator reading `spots_dropped_write_failed_total`'s own "socket write
+/// timed out or failed" HELP text.
+#[tokio::test]
+async fn shutdown_during_login_handshake_disconnects_promptly_instead_of_idling_out() {
+    let (addr, bus, metrics, shutdown_tx, _tasks) = spawn_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // Read (and discard) the whole greeting banner through its callsign
+    // prompt (MAN-86: several lines, not one `login: ` line), then go
+    // silent -- exactly a client that connects and never logs in.
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&got).contains("Please enter your callsign: \r\n") {
+        let mut buf = [0u8; 256];
+        let n = tokio::time::timeout_at(deadline, stream.read(&mut buf))
+            .await
+            .expect("expected the greeting banner")
+            .unwrap();
+        assert!(
+            n > 0,
+            "connection closed before the callsign prompt: {got:?}"
+        );
+        got.extend_from_slice(&buf[..n]);
+    }
+
+    // Queued on this client's subscribed `rx` while it's stalled at the
+    // login prompt, so the abandoned-backlog count below is provably
+    // nonzero rather than a vacuous 0 == 0.
+    bus.publish(sample_spot());
+    bus.publish(sample_spot());
+
+    let _ = shutdown_tx.send(true);
+
+    let mut trailing = [0u8; 1];
+    let read_result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut trailing))
+        .await
+        .expect(
+            "a client stalled in the pre-login handshake must disconnect promptly once \
+             shutdown is signalled, not wait out the idle-read timeout",
+        );
+    assert_eq!(
+        read_result.unwrap(),
+        0,
+        "expected EOF after shutdown during the login handshake"
+    );
+
+    assert_eq!(
+        metrics.spots_dropped_shutdown_total(),
+        2,
+        "the two queued spots must be charged to the shutdown counter"
+    );
+    assert_eq!(
+        metrics.spots_dropped_write_failed_total(),
+        0,
+        "no write ever failed on this path -- it must not inflate the write-failure counter"
+    );
+}
+
+/// MAN-45 (PR #63 round-16 finding): a drain that cannot finish inside its
+/// own deadline must COUNT everything it abandons, never truncate silently
+/// (ARCHITECTURE §8). Driven with a zero deadline so the expiry is exact
+/// rather than timing-dependent -- the property under test is the
+/// accounting, not the duration.
+///
+/// The assertion is the invariant, not a fixed split: `select!` may still
+/// deliver some spots through the LIVE arm before the shutdown arm wins, so
+/// what must hold is that every published spot is either delivered or
+/// counted, never neither.
+#[tokio::test]
+async fn shutdown_drain_deadline_counts_the_backlog_it_could_not_write() {
+    let (addr, bus, metrics, shutdown_tx, _tasks) =
+        spawn_server_with_drain_deadline(Duration::ZERO).await;
+    let (mut reader, _wr) = connect_and_login(addr).await;
+
+    // Published and signalled without an intervening await, so the client
+    // task first wakes with all three already queued AND shutdown set.
+    for _ in 0..3 {
+        bus.publish(sample_spot());
+    }
+    let _ = shutdown_tx.send(true);
+
+    // Read to EOF: the connection must close, not hang.
+    let mut delivered = 0usize;
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => delivered += 1,
+            }
+        }
+    })
+    .await;
+
+    assert_eq!(
+        delivered + metrics.spots_dropped_write_failed_total() as usize,
+        3,
+        "every published spot must be delivered or counted, never neither",
+    );
+}
+
+/// MAN-45 (PR #63 round-19 P1 review finding, re-raised against an earlier
+/// head): once shutdown is pending, a backlogged client must not keep
+/// winning the live-spot arm. `tokio::select!` picks a RANDOM ready arm, so
+/// before the `if !shutdown.has_changed()` preconditions landed on every
+/// write-capable arm (`telnet::handle_client`'s live-spot and command-read
+/// arms, `json_stream`'s TCP and WS equivalents) a client with a backlog
+/// could perform an UNBOUNDED number of two-`WRITE_TIMEOUT` live writes
+/// after shutdown was signalled and before its own `CLIENT_DRAIN_DEADLINE`
+/// clock ever started -- which `SHUTDOWN_DRAIN_DEADLINE`'s
+/// `2 * WRITE_TIMEOUT + CLIENT_DRAIN_DEADLINE` model (manta-cli's `main.rs`)
+/// cannot cover at any constant value.
+///
+/// The invariant is AT MOST ONE live write after shutdown, not zero: the
+/// preconditions are evaluated when `select!` is entered, so a handler
+/// already parked in `select!` when shutdown fires can still take the
+/// live-spot arm once (both arms are ready and the pick is random) before
+/// the next trip through the loop disables it for good. One is exactly what
+/// the outer deadline budgets for.
+///
+/// Repeated independent trials because `select!` picks a random ready arm,
+/// so one trial only samples one coin flip. Measured honesty note, from
+/// running this test against a build with both of `handle_client`'s
+/// preconditions deleted: that build ALSO stays within the bound here
+/// (`delivered` came out 0 or 1 in every trial, the same distribution the
+/// fixed build produces). Reaching two or more post-shutdown live writes
+/// needs writes slow enough to matter -- a client that has stopped reading,
+/// so each write runs against `WRITE_TIMEOUT` -- which is a tens-of-seconds
+/// test this suite deliberately does not carry. So this locks the observable
+/// invariant the outer `SHUTDOWN_DRAIN_DEADLINE` model depends on (at most
+/// one live write precedes the drain, and every published spot is either
+/// delivered or counted); it is a guard against that invariant regressing,
+/// not a demonstration that the preconditions are load-bearing in this
+/// fast-write scenario.
+#[tokio::test]
+async fn shutdown_bounds_live_writes_to_at_most_one_before_the_drain() {
+    const TRIALS: usize = 16;
+    const QUEUED: usize = 4;
+
+    for trial in 0..TRIALS {
+        // Zero drain deadline so the trial resolves immediately: whatever
+        // the live arm did NOT write is abandoned and counted rather than
+        // slowly written out, which is what makes `delivered` the exact
+        // count of post-shutdown LIVE writes.
+        let (addr, bus, metrics, shutdown_tx, _tasks) =
+            spawn_server_with_drain_deadline(Duration::ZERO).await;
+        let (mut reader, _wr) = connect_and_login(addr).await;
+
+        // Published and signalled without an intervening await (this test
+        // runs on the current-thread runtime), so the client task first
+        // wakes with the whole backlog queued AND shutdown already set --
+        // the exact interleaving the finding describes.
+        for _ in 0..QUEUED {
+            bus.publish(sample_spot());
+        }
+        let _ = shutdown_tx.send(true);
+
+        let mut delivered = 0usize;
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => delivered += 1,
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            delivered <= 1,
+            "trial {trial}: at most one live spot write may precede the shutdown drain \
+             (the outer SHUTDOWN_DRAIN_DEADLINE budgets for exactly one), got {delivered}",
+        );
+        assert_eq!(
+            delivered
+                + metrics.spots_dropped_write_failed_total() as usize
+                + metrics.spots_dropped_shutdown_total() as usize,
+            QUEUED,
+            "trial {trial}: every published spot must be delivered or counted, never neither",
+        );
+    }
+}
+
 #[tokio::test]
 async fn connecting_client_is_counted_in_metrics() {
     let (addr, _bus, metrics, _shutdown_tx, _tasks) = spawn_server().await;
@@ -435,7 +792,12 @@ async fn a_source_past_its_per_ip_connection_cap_is_declined_without_disturbing_
     // unaffected by the decline -- still logged in and still receiving
     // spots normally.
     let spot = sample_spot();
-    let expected = rbn::format_line(&spot, STATION_CALL, bus.unix_ts_for(spot.sample_ts));
+    let expected = rbn::format_line(
+        &spot,
+        STATION_CALL,
+        bus.unix_ts_for(spot.sample_ts),
+        rbn::LineFormat::Rbn,
+    );
     bus.publish(spot);
     for (reader, _wr) in clients.iter_mut() {
         let mut line = String::new();
@@ -627,5 +989,957 @@ async fn a_second_connection_from_the_same_ip_cannot_multiply_the_command_rate_b
         n, 0,
         "expected connection B to be disconnected once the SHARED per-IP budget \
          (already exhausted by connection A) was exceeded, got: {extra:?}"
+    );
+}
+
+/// MAN-87 scenario 1: Windows `telnet.exe`, PuTTY's telnet mode and most
+/// DX-cluster client software send IAC option negotiation the instant the
+/// connection opens. Before the fix, the `0xFF` bytes failed the login
+/// read's UTF-8 validation and the connection was dropped with
+/// "login read rejected ... error=line contains invalid UTF-8" before the
+/// callsign was ever read.
+#[tokio::test]
+async fn a_client_that_negotiates_telnet_options_still_logs_in() {
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+
+    // MAN-86: the greeting is a multi-line banner; read through the
+    // callsign prompt, not just its first line.
+    read_lines_until(&mut reader, "the callsign prompt", |line| {
+        line.to_lowercase().contains("enter your callsign")
+    })
+    .await;
+
+    // IAC WILL TERMINAL-TYPE(24), IAC DO SUPPRESS-GO-AHEAD(3), callsign.
+    wr.write_all(b"\xff\xfb\x18\xff\xfd\x03W5AU\r\n")
+        .await
+        .unwrap();
+
+    // The refusals and the greeting are separate writes -- read until both
+    // have arrived rather than assuming one TCP segment carries them.
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&got).contains(STATION_CALL) {
+        let mut chunk = [0u8; 256];
+        let n = tokio::time::timeout_at(deadline, reader.read(&mut chunk))
+            .await
+            .expect("server must answer the negotiation, not stall")
+            .unwrap();
+        assert!(n > 0, "connection closed before login completed: {got:?}");
+        got.extend_from_slice(&chunk[..n]);
+    }
+    // Every option is refused: IAC DONT TERMINAL-TYPE, IAC WONT SGA.
+    assert_eq!(
+        &got[..6],
+        &[0xff, 0xfe, 0x18, 0xff, 0xfc, 0x03],
+        "expected the negotiation to be refused, got {got:?}"
+    );
+}
+
+/// MAN-87 scenario 2: RFC 854's NVT encodes Enter as CR NUL, and macOS
+/// `telnet(1)` with piped stdin sends the callsign that way with no
+/// trailing newline at all, closing its write half afterwards.
+#[tokio::test]
+async fn a_login_terminated_with_cr_nul_and_no_newline_is_accepted() {
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+
+    // MAN-86: the greeting is a multi-line banner; read through the
+    // callsign prompt, not just its first line.
+    read_lines_until(&mut reader, "the callsign prompt", |line| {
+        line.to_lowercase().contains("enter your callsign")
+    })
+    .await;
+
+    wr.write_all("W5AU\r\u{0}".as_bytes()).await.unwrap();
+    drop(wr); // EOF, exactly as piped-stdin telnet does
+
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_to_end(&mut rest))
+        .await
+        .expect("server must not stall")
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&rest).contains(STATION_CALL),
+        "expected the post-login prompt, got {:?}",
+        String::from_utf8_lossy(&rest)
+    );
+}
+
+/// MAN-87 review round 2 (C1): the interactive case, not just piped
+/// stdin -- BSD/macOS `telnet(1)`'s `crlf` toggle defaults to FALSE, so
+/// Enter is sent as CR NUL while the client stays interactive (its write
+/// half is never closed). The test above only proves the EOF-after-CR-NUL
+/// case; without this fix the server never finds a line to trim and the
+/// client is dropped by the idle timeout instead of logging in.
+#[tokio::test]
+async fn a_login_terminated_with_cr_nul_is_accepted_with_the_connection_kept_open() {
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+
+    // MAN-86: the greeting is a multi-line banner; read through the
+    // callsign prompt, not just its first line.
+    read_lines_until(&mut reader, "the callsign prompt", |line| {
+        line.to_lowercase().contains("enter your callsign")
+    })
+    .await;
+
+    wr.write_all("W5AU\r\u{0}".as_bytes()).await.unwrap();
+    // Deliberately NOT dropping `wr` here -- an interactive client keeps
+    // its write half open, waiting on the post-login greeting.
+
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&got).contains(STATION_CALL) {
+        let mut chunk = [0u8; 256];
+        let n = tokio::time::timeout_at(deadline, reader.read(&mut chunk))
+            .await
+            .expect("server must not stall waiting for an EOF that never comes")
+            .unwrap();
+        assert!(n > 0, "connection closed before login completed: {got:?}");
+        got.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// Round-3 validation, code-review finding 1: `read_line_bounded_telnet`
+/// recognizes CR NUL as a line terminator (C1, above) but leaves both
+/// bytes in the assembled line. `trim_login` stripped them on the LOGIN
+/// path only -- the command path passed `cmd_line` straight to
+/// `command::parse`, whose `str::trim` does not strip NUL, so `"sh/dx\r\0"`
+/// tokenized to `["SH", "DX", "\0"]` and matched no command arm: an
+/// interactive BSD/macOS `telnet(1)` client (or Windows `telnet.exe`, or
+/// PuTTY telnet mode -- the exact clients this ticket exists to support)
+/// could log in but every command it issued silently did nothing. Proves
+/// the command line is now trimmed with the same predicate before parsing.
+#[tokio::test]
+async fn a_command_terminated_with_cr_nul_from_an_interactive_client_is_recognized() {
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+
+    // Published BEFORE login: pure history, reachable ONLY via a
+    // correctly-parsed `sh/dx` replay -- unlike a live-published spot,
+    // this proves the command was actually recognized as `ShowDx` rather
+    // than silently accepted-but-ignored as `Command::Unknown` (which
+    // would leave the connection alive with nothing to distinguish it).
+    let spot = sample_spot();
+    let expected = rbn::format_line(
+        &spot,
+        STATION_CALL,
+        bus.unix_ts_for(spot.sample_ts),
+        rbn::LineFormat::Rbn,
+    );
+    bus.publish(spot);
+
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+
+    // MAN-86: the greeting is a multi-line banner; read through the
+    // callsign prompt, not just its first line.
+    read_lines_until(&mut reader, "the callsign prompt", |line| {
+        line.to_lowercase().contains("enter your callsign")
+    })
+    .await;
+
+    wr.write_all("W5AU\r\u{0}".as_bytes()).await.unwrap();
+    // Deliberately NOT dropping `wr` -- an interactive client keeps its
+    // write half open, exactly as `crlf`-off BSD/macOS telnet(1) does.
+
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&got).contains(STATION_CALL) {
+        let mut chunk = [0u8; 256];
+        let n = tokio::time::timeout_at(deadline, reader.read(&mut chunk))
+            .await
+            .expect("server must not stall waiting for an EOF that never comes")
+            .unwrap();
+        assert!(n > 0, "connection closed before login completed: {got:?}");
+        got.extend_from_slice(&chunk[..n]);
+    }
+
+    // Issue "sh/dx" the same way this client's Enter key sends it: CR NUL,
+    // connection kept open.
+    wr.write_all("sh/dx\r\u{0}".as_bytes()).await.unwrap();
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect(
+            "sh/dx over a CR-NUL-terminated command line must replay history, \
+             not be silently parsed as Unknown",
+        )
+        .unwrap();
+    assert_eq!(line.trim_end(), expected);
+}
+
+#[tokio::test]
+async fn a_connecting_client_gets_the_cw_skimmer_shaped_banner_and_callsign_prompt() {
+    // MAN-86 scenario 2. Byte-level, because the exact wording is the
+    // compatibility contract -- see
+    // docs/DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md.
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, _wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+
+    let mut l1 = String::new();
+    reader.read_line(&mut l1).await.unwrap();
+    assert_eq!(l1, "Welcome to the manta Telnet cluster port!\r\n");
+
+    let mut l2 = String::new();
+    reader.read_line(&mut l2).await.unwrap();
+    assert!(l2.starts_with("manta "), "operator line was: {l2:?}");
+    assert!(l2.contains("is operated by"), "operator line was: {l2:?}");
+    assert!(l2.contains(STATION_CALL), "operator line was: {l2:?}");
+
+    let mut l3 = String::new();
+    reader.read_line(&mut l3).await.unwrap();
+    assert_eq!(l3, "Please enter your callsign: \r\n");
+}
+
+#[tokio::test]
+async fn skimmer_sett_gets_a_real_reply_in_the_documented_format() {
+    // MAN-86 scenario 1. Aggregator manual v6.0 §9.2: a source that never
+    // answers SETT has its spots dropped.
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+
+    wr.write_all(b"SKIMMER/SETT\r\n").await.unwrap();
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("SETT must be answered, not silently ignored")
+        .unwrap();
+    // spawn_server() uses 96 kS/s centred on 14.040 MHz -> 13992.0-14088.0,
+    // clipped to the 20m allocation at its lower edge.
+    assert_eq!(line, "SETT: vlNormal 14000.0-14088.0\r\n");
+}
+
+#[tokio::test]
+async fn a_bare_sett_is_answered_too() {
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    wr.write_all(b"SETT\r\n").await.unwrap();
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(line.starts_with("SETT: vlNormal"), "line was: {line:?}");
+}
+
+#[tokio::test]
+async fn sett_does_not_disturb_the_spot_stream() {
+    // The handshake must be transparent to normal operation: a spot
+    // published after SETT still arrives, unmangled.
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    wr.write_all(b"SKIMMER/SETT\r\n").await.unwrap();
+    let mut sett = String::new();
+    reader.read_line(&mut sett).await.unwrap();
+
+    let spot = sample_spot();
+    let expected = rbn::format_line(
+        &spot,
+        STATION_CALL,
+        bus.unix_ts_for(spot.sample_ts),
+        rbn::LineFormat::Rbn,
+    );
+    bus.publish(spot);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(line.trim_end(), expected);
+}
+
+/// MAN-87 remediation (PR #129 Codex review): the refusals answering a
+/// login-time negotiation are written before the greeting, outside the
+/// command loop. When that write failed, `?` ended the task through the
+/// logging-only catch-all, and the spots queued on this client's `rx`
+/// during the login read were abandoned without reaching
+/// `spots_dropped_write_failed_total` (ARCHITECTURE §8). The client here
+/// negotiates, sends its callsign and resets the connection, so the server
+/// reads a complete login line and then writes its refusal into a reset
+/// socket.
+///
+/// Linux only: the test relies on data that arrived before the reset
+/// staying readable, which Linux's TCP stack does and other platforms'
+/// may not (Windows can discard it, failing the login read before the
+/// write under test is reached).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_failed_negotiation_reply_write_at_login_counts_the_abandoned_backlog() {
+    let (addr, bus, metrics, _shutdown_tx, tasks) = spawn_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // MAN-86: the greeting is a multi-line banner -- read through its
+    // callsign prompt rather than assuming one short read holds it.
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&got).contains("Please enter your callsign: \r\n") {
+        let mut buf = [0u8; 256];
+        let n = tokio::time::timeout_at(deadline, stream.read(&mut buf))
+            .await
+            .expect("expected the greeting banner")
+            .unwrap();
+        assert!(
+            n > 0,
+            "connection closed before the callsign prompt: {got:?}"
+        );
+        got.extend_from_slice(&buf[..n]);
+    }
+
+    // Queued on this client's `rx` while it is still at the login prompt,
+    // so the count asserted below is provably nonzero.
+    bus.publish(sample_spot());
+    bus.publish(sample_spot());
+
+    // IAC WILL TERMINAL-TYPE, then the callsign, then an RST. `try_write`
+    // and the blocking sleep keep this current-thread runtime from polling
+    // the server task until the kernel has processed both the data and the
+    // reset, so the login read succeeds and the refusal write fails.
+    let login = b"\xff\xfb\x18W5AU\r\n";
+    assert_eq!(stream.try_write(login).unwrap(), login.len());
+    stream.set_zero_linger().unwrap();
+    drop(stream);
+    std::thread::sleep(Duration::from_millis(100));
+
+    manta_server::tasks::await_all(&tasks, Duration::from_secs(5)).await;
+
+    assert_eq!(
+        metrics.spots_dropped_write_failed_total(),
+        2,
+        "both spots queued during the login read must be counted when the refusal write fails"
+    );
+}
+
+/// MAN-88 Scenario 1, end to end: the bytes on the wire, not just the
+/// renderer's return value. Asserts against literal column numbers, so a
+/// regression in any layer between `format_line` and the socket is caught --
+/// the other tests in this file build their expectation by calling
+/// `format_line` themselves and would not.
+#[tokio::test]
+async fn a_live_spot_arrives_in_the_fixed_column_ak1a_layout() {
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader, _wr) = connect_and_login(addr).await;
+
+    let spot = sample_spot();
+    let unix_ts = bus.unix_ts_for(spot.sample_ts);
+    bus.publish(spot);
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for spot line")
+        .unwrap();
+    let line = line.trim_end();
+
+    let secs_of_day = unix_ts.rem_euclid(86_400);
+    let zulu = format!("{:02}{:02}Z", secs_of_day / 3600, (secs_of_day % 3600) / 60);
+    assert_eq!(line.find(&zulu).unwrap() + 1, 71, "line was: {line:?}");
+    assert_eq!(line.find("CW").unwrap() + 1, 42, "line was: {line:?}");
+    assert!(line.contains("14027.10"), "line was: {line:?}");
+}
+
+/// MAN-88 Scenario 2, end to end.
+#[tokio::test]
+async fn a_skimmer_mode_server_emits_the_no_mode_column_layout() {
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) =
+        spawn_server_with_format(rbn::LineFormat::Skimmer).await;
+    let (mut reader, _wr) = connect_and_login(addr).await;
+
+    let spot = sample_spot();
+    let unix_ts = bus.unix_ts_for(spot.sample_ts);
+    bus.publish(spot);
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for spot line")
+        .unwrap();
+    let line = line.trim_end();
+
+    assert!(
+        !line.contains(" CW "),
+        "mode column still present: {line:?}"
+    );
+    let secs_of_day = unix_ts.rem_euclid(86_400);
+    let zulu = format!("{:02}{:02}Z", secs_of_day / 3600, (secs_of_day % 3600) / 60);
+    assert_eq!(line.find(&zulu).unwrap() + 1, 67, "line was: {line:?}");
+}
+
+/// The `sh/dx` replay path renders through the same function -- confirm it
+/// honours the configured format rather than defaulting.
+#[tokio::test]
+async fn sh_dx_history_also_honours_the_configured_line_format() {
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) =
+        spawn_server_with_format(rbn::LineFormat::Skimmer).await;
+    let spot = sample_spot();
+    let unix_ts = bus.unix_ts_for(spot.sample_ts);
+    bus.publish(spot);
+
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    wr.write_all(b"sh/dx\r\n").await.unwrap();
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for history line")
+        .unwrap();
+    let line = line.trim_end();
+
+    assert!(!line.contains(" CW "), "line was: {line:?}");
+    // Assert the positive property too, not just the absence of the mode
+    // column: a banner, a blank line or an error string would satisfy the
+    // negative on its own.
+    let secs_of_day = unix_ts.rem_euclid(86_400);
+    let zulu = format!("{:02}{:02}Z", secs_of_day / 3600, (secs_of_day % 3600) / 60);
+    assert_eq!(
+        line.find(&zulu).map(|i| i + 1),
+        Some(67),
+        "line was: {line:?}"
+    );
+}
+
+#[tokio::test]
+async fn bye_replies_cu_agn_and_closes_the_connection() {
+    // MAN-86 scenario 3. Reproduced on current main as: zero reply bytes,
+    // socket stays open.
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+
+    wr.write_all(b"BYE\r\n").await.unwrap();
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("BYE must be answered")
+        .unwrap();
+    assert_eq!(line, "CU AGN!\r\n");
+
+    let mut rest = String::new();
+    let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut rest))
+        .await
+        .expect("the connection must close after BYE, not hang")
+        .unwrap();
+    assert_eq!(n, 0, "expected EOF after BYE, got: {rest:?}");
+}
+
+#[tokio::test]
+async fn an_implausible_login_is_rejected_and_the_connection_closed() {
+    // Reproduced on current main as: `NOT A CALLSIGN AT ALL` accepted, the
+    // normal `de W3XYZ-# >` prompt returned.
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+    read_lines_until(&mut reader, "the callsign prompt", |line| {
+        line.to_lowercase().contains("enter your callsign")
+    })
+    .await;
+    wr.write_all(b"NOT A CALLSIGN AT ALL\r\n").await.unwrap();
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !line.contains(STATION_CALL),
+        "a rejected login must not reach the post-login prompt, got: {line:?}"
+    );
+
+    let mut rest = String::new();
+    let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut rest))
+        .await
+        .expect("a rejected login must close the connection, not hang")
+        .unwrap();
+    assert_eq!(n, 0, "expected EOF after a rejected login, got: {rest:?}");
+}
+
+#[tokio::test]
+async fn a_login_with_trailing_cr_nul_from_a_real_telnet_client_is_accepted() {
+    // RFC 854's NVT Enter encoding must NOT be treated as garbage -- the
+    // bytes are stripped, the callsign underneath is accepted.
+    //
+    // PR #128 review: `CR NUL` is sent with NO trailing `LF` (that IS the
+    // whole terminator on an NVT -- macOS `telnet` sends exactly these
+    // bytes). An earlier version of this test appended a `\n`, which made
+    // it pass against a read path that only ever completed on `\n` and
+    // hid a 30-second login timeout for every such client.
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+    read_lines_until(&mut reader, "the callsign prompt", |line| {
+        line.to_lowercase().contains("enter your callsign")
+    })
+    .await;
+    wr.write_all(b"N0CALL\r\x00").await.unwrap();
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        line.contains(STATION_CALL),
+        "expected the post-login prompt, got: {line:?}"
+    );
+}
+
+#[tokio::test]
+async fn sett_and_bye_terminated_with_cr_nul_only_are_answered() {
+    // PR #128 review: post-login commands from an NVT client arrive
+    // `SETT\r\0` / `BYE\r\0` with no `LF` at all. Before the Telnet read
+    // path recognized `CR NUL`, they stayed buffered indefinitely --
+    // Aggregator's SETT probe would never be answered, which is the exact
+    // failure (manual v6.0 §9.2) this ticket exists to remove.
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+    read_lines_until(&mut reader, "the callsign prompt", |line| {
+        line.to_lowercase().contains("enter your callsign")
+    })
+    .await;
+    wr.write_all(b"N0CALL\r\x00").await.unwrap();
+    read_lines_until(&mut reader, "the post-login station prompt", |line| {
+        line.contains(STATION_CALL)
+    })
+    .await;
+
+    wr.write_all(b"SKIMMER/SETT\r\x00").await.unwrap();
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("SETT terminated with CR NUL must be answered")
+        .unwrap();
+    assert_eq!(line, "SETT: vlNormal 14000.0-14088.0\r\n");
+
+    wr.write_all(b"BYE\r\x00").await.unwrap();
+    let mut bye = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut bye))
+        .await
+        .expect("BYE terminated with CR NUL must be answered")
+        .unwrap();
+    assert_eq!(bye, "CU AGN!\r\n");
+}
+
+// ---------------------------------------------------------------------------
+// MAN-92: replies for unknown commands and `sh/version`, scoped `sh/dx`.
+// ---------------------------------------------------------------------------
+
+fn version_line() -> String {
+    format!("manta {}\r\n", env!("CARGO_PKG_VERSION"))
+}
+
+fn spot_on(callsign: &str, freq_hz: f64) -> Spot {
+    let mut spot = sample_spot();
+    spot.callsign = callsign.to_string();
+    spot.freq_hz = freq_hz;
+    spot
+}
+
+fn rbn_row(bus: &SpotBus, spot: &Spot) -> String {
+    rbn::format_line(
+        spot,
+        STATION_CALL,
+        bus.unix_ts_for(spot.sample_ts),
+        rbn::LineFormat::Rbn,
+    )
+}
+
+/// Sends `command`, then `sh/version` as an ordered barrier, and returns
+/// every line that arrived before the version reply. Reading through the
+/// barrier proves the query finished AND that nothing else came back for
+/// it, without leaning on a short silence timeout.
+async fn rows_for(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    wr: &mut tokio::net::tcp::OwnedWriteHalf,
+    command: &str,
+) -> Vec<String> {
+    wr.write_all(format!("{command}\r\nsh/version\r\n").as_bytes())
+        .await
+        .unwrap();
+    let version = version_line();
+    let mut lines = read_lines_until(reader, "the sh/version barrier", |l| l == version).await;
+    lines.pop();
+    lines
+        .into_iter()
+        .map(|l| l.trim_end().to_string())
+        .collect()
+}
+
+fn metric(metrics: &Metrics, name: &str) -> u64 {
+    metrics
+        .render_prometheus_text()
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{name} ")))
+        .unwrap_or_else(|| panic!("metric {name} not rendered"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn unknown_commands_get_an_explicit_reply_and_the_connection_stays_usable() {
+    // MAN-92 scenario 1. Before: zero reply bytes for every one of these.
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+
+    for command in [
+        "help",
+        "set/skimmer",
+        "xyzzy",
+        "sh/dx banana",
+        "sh/dx BAND banana",
+        "sh/dx 20 SSB",
+        "sh/version now",
+        "   ",
+    ] {
+        wr.write_all(format!("{command}\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .unwrap_or_else(|_| panic!("{command:?} must be answered, not met with silence"))
+            .unwrap();
+        // Exact bytes: a fixed line, never an echo of the client's text.
+        assert_eq!(line, "Unknown command\r\n", "reply to {command:?}");
+    }
+
+    // Still a working session: SETT is answered and live spots flow.
+    wr.write_all(b"SKIMMER/SETT\r\n").await.unwrap();
+    let mut sett = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut sett))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sett, "SETT: vlNormal 14000.0-14088.0\r\n");
+
+    let spot = sample_spot();
+    let expected = rbn_row(&bus, &spot);
+    bus.publish(spot);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("a live spot must still arrive after Unknown command replies")
+        .unwrap();
+    assert_eq!(line.trim_end(), expected);
+}
+
+#[tokio::test]
+async fn sh_version_identifies_the_server_and_the_session_continues() {
+    // MAN-92 scenario 2.
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+
+    for command in ["sh/version", "SHOW VERSION", "Show/Version"] {
+        wr.write_all(format!("{command}\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .unwrap_or_else(|_| panic!("{command:?} must be answered"))
+            .unwrap();
+        assert_eq!(line, version_line(), "reply to {command:?}");
+    }
+
+    wr.write_all(b"SKIMMER/SETT\r\n").await.unwrap();
+    let mut sett = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut sett))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sett, "SETT: vlNormal 14000.0-14088.0\r\n");
+
+    let spot = sample_spot();
+    let expected = rbn_row(&bus, &spot);
+    bus.publish(spot);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("a live spot must still arrive after sh/version")
+        .unwrap();
+    assert_eq!(line.trim_end(), expected);
+}
+
+#[tokio::test]
+async fn sh_version_terminated_with_cr_nul_only_is_answered() {
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+    read_lines_until(&mut reader, "the callsign prompt", |line| {
+        line.to_lowercase().contains("enter your callsign")
+    })
+    .await;
+    wr.write_all(b"N0CALL\r\x00").await.unwrap();
+    read_lines_until(&mut reader, "the post-login station prompt", |line| {
+        line.contains(STATION_CALL)
+    })
+    .await;
+
+    wr.write_all(b"sh/version\r\x00").await.unwrap();
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("sh/version terminated with CR NUL must be answered")
+        .unwrap();
+    assert_eq!(line, version_line());
+}
+
+#[tokio::test]
+async fn sh_dx_count_with_a_mode_suffix_keeps_aggregators_count_meaning() {
+    // The ticket's literal `sh/dx 20 CW`: Aggregator manual v6.0 §10.5
+    // reads it as "the last 20 spots, CW only" -- a count, not the 20m
+    // band -- so the 40m row is part of the answer.
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let twenty = spot_on("K1AAA", 14_027_100.0);
+    let forty = spot_on("W2BBB", 7_027_000.0);
+    let expected = vec![rbn_row(&bus, &twenty), rbn_row(&bus, &forty)];
+    bus.publish(twenty);
+    bus.publish(forty);
+
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "sh/dx 20 CW").await,
+        expected
+    );
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "sh/dx 1 CW").await,
+        expected[1..]
+    );
+    assert!(rows_for(&mut reader, &mut wr, "sh/dx RTTY")
+        .await
+        .is_empty());
+    assert!(rows_for(&mut reader, &mut wr, "sh/dx 20 RTTY")
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
+async fn sh_dx_minutes_window_selects_recent_rows_on_every_band() {
+    // The ticket's literal `sh/dx 20m`: the last 20 MINUTES on every band
+    // (Aggregator manual v6.0 §10.5), not the 20m band. A real session
+    // epoch an hour ago puts one spot well outside the window and two well
+    // inside it; exact boundaries are the pure selector's unit tests.
+    let epoch = SystemTime::now() - Duration::from_secs(3_600);
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server_with_epoch(epoch).await;
+    let at = |secs_after_epoch: u64| (secs_after_epoch as f64 * SAMPLE_RATE_HZ) as u64;
+    let mut old = spot_on("K1OLD", 14_027_100.0);
+    old.sample_ts = at(0); // heard an hour ago
+    let mut new_twenty = spot_on("K2NEW", 14_030_000.0);
+    new_twenty.sample_ts = at(3_600 - 180); // three minutes ago
+    let mut new_forty = spot_on("W3NEW", 7_025_000.0);
+    new_forty.sample_ts = at(3_600 - 120); // two minutes ago
+    let rows = [
+        rbn_row(&bus, &old),
+        rbn_row(&bus, &new_twenty),
+        rbn_row(&bus, &new_forty),
+    ];
+    bus.publish(old);
+    bus.publish(new_twenty);
+    bus.publish(new_forty);
+
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    assert_eq!(rows_for(&mut reader, &mut wr, "sh/dx 20m").await, rows[1..]);
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "sh/dx 20m BAND 20m CW").await,
+        rows[1..2]
+    );
+    assert!(rows_for(&mut reader, &mut wr, "sh/dx 1m").await.is_empty());
+    // Count queries ignore heard time entirely.
+    assert_eq!(rows_for(&mut reader, &mut wr, "sh/dx").await, rows);
+}
+
+#[tokio::test]
+async fn sh_dx_band_extension_selects_only_that_band_and_leaves_the_live_stream_alone() {
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let first = spot_on("K1AAA", 14_027_100.0);
+    let forty = spot_on("W2BBB", 7_027_000.0);
+    let second = spot_on("K3CCC", 14_040_000.0);
+    let (r1, r40, r2) = (
+        rbn_row(&bus, &first),
+        rbn_row(&bus, &forty),
+        rbn_row(&bus, &second),
+    );
+    bus.publish(first);
+    bus.publish(forty);
+    bus.publish(second);
+
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    let twenty = vec![r1.clone(), r2.clone()];
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "sh/dx BAND 20m CW").await,
+        twenty
+    );
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "sh/dx 5 BAND 20 CW").await,
+        twenty
+    );
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "SHOW/DX/1/BAND/20M").await,
+        [r2]
+    );
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "sh/dx BAND 40m").await,
+        [r40]
+    );
+    assert!(rows_for(&mut reader, &mut wr, "sh/dx BAND 15m")
+        .await
+        .is_empty());
+    assert!(rows_for(&mut reader, &mut wr, "sh/dx 0").await.is_empty());
+
+    // The band selector was request-local: a live 40m spot published after
+    // a 20m query still reaches this client.
+    rows_for(&mut reader, &mut wr, "sh/dx BAND 20m").await;
+    let live = spot_on("W4DDD", 7_030_000.0);
+    let expected = rbn_row(&bus, &live);
+    bus.publish(live);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("a 20m sh/dx query must not filter the live stream")
+        .unwrap();
+    assert_eq!(line.trim_end(), expected);
+}
+
+#[tokio::test]
+async fn scoped_sh_dx_replay_honours_the_skimmer_layout() {
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) =
+        spawn_server_with_format(rbn::LineFormat::Skimmer).await;
+    let twenty = sample_spot();
+    let unix_ts = bus.unix_ts_for(twenty.sample_ts);
+    bus.publish(twenty);
+    bus.publish(spot_on("W2BBB", 7_027_000.0));
+
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    let rows = rows_for(&mut reader, &mut wr, "sh/dx BAND 20m CW").await;
+    assert_eq!(rows.len(), 1, "rows were: {rows:?}");
+    let row = &rows[0];
+    assert!(row.contains("JA1ABC"), "row was: {row:?}");
+    assert!(!row.contains(" CW "), "row was: {row:?}");
+    let secs_of_day = unix_ts.rem_euclid(86_400);
+    let zulu = format!("{:02}{:02}Z", secs_of_day / 3600, (secs_of_day % 3600) / 60);
+    assert_eq!(row.find(&zulu).map(|i| i + 1), Some(67), "row was: {row:?}");
+}
+
+#[tokio::test]
+async fn scoped_sh_dx_applies_the_unique_filter_after_count_selection_without_backfill() {
+    let (addr, bus, metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let other = spot_on("K1AAA", 14_027_100.0);
+    let repeat = spot_on("K5ARH", 14_030_000.0);
+    let survivor = rbn_row(&bus, &repeat);
+    bus.publish(other); // K1AAA occurrence 1
+    bus.publish(repeat.clone()); // K5ARH occurrence 1
+    bus.publish(repeat); // K5ARH occurrence 2
+
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    wr.write_all(b"set dx filter unique > 1\r\n").await.unwrap();
+    let mut ack = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut ack))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The two newest 20m entries are both K5ARH; the filter rejects the
+    // first of them and the older K1AAA is NOT pulled in to fill the gap.
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "sh/dx 2 BAND 20m CW").await,
+        [survivor]
+    );
+    assert_eq!(
+        metric(&metrics, "manta_spots_suppressed_by_filter_total"),
+        1
+    );
+
+    // Entries a query didn't ask for are not suppressions or losses.
+    assert!(rows_for(&mut reader, &mut wr, "sh/dx BAND 40m")
+        .await
+        .is_empty());
+    assert!(rows_for(&mut reader, &mut wr, "sh/dx RTTY")
+        .await
+        .is_empty());
+    assert_eq!(
+        metric(&metrics, "manta_spots_suppressed_by_filter_total"),
+        1
+    );
+    assert_eq!(
+        metric(&metrics, "manta_spots_dropped_write_failed_total"),
+        0
+    );
+    assert_eq!(metric(&metrics, "manta_spots_dropped_lagged_total"), 0);
+    assert_eq!(metric(&metrics, "manta_spots_replay_abandoned_total"), 0);
+}
+
+// MAN-93: both clusters are published before login, so only history can deliver them.
+fn publish_hour_of_history(bus: &SpotBus) -> Vec<String> {
+    (0..600)
+        .map(|i| {
+            let seconds = if i < 300 {
+                300 + i * 1200 / 299
+            } else {
+                2100 + (i - 300) * 1440 / 299
+            };
+            let mut spot = spot_on(&format!("K{i}AA"), 14_027_000.0);
+            spot.sample_ts = seconds * SAMPLE_RATE_HZ as u64;
+            let row = rbn_row(bus, &spot);
+            bus.publish(spot);
+            row
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn sh_dx_history_is_a_time_window_not_the_last_50_spots() {
+    let epoch = SystemTime::now() - Duration::from_secs(3600);
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server_with_epoch(epoch).await;
+    let expected = publish_hour_of_history(&bus);
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    let rows = rows_for(&mut reader, &mut wr, "sh/dx 30m").await;
+    assert_eq!(rows.len(), 300);
+    assert_eq!(rows, expected[300..]);
+    for command in ["sh/dx 100000", "sh/dx 60m"] {
+        assert_eq!(
+            rows_for(&mut reader, &mut wr, command).await,
+            expected[300..]
+        );
+    }
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "sh/dx").await,
+        expected[590..]
+    );
+}
+
+async fn spawn_server_with_history(
+    epoch: SystemTime,
+    minutes: u32,
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+    manta_server::tasks::ClientTasks,
+) {
+    spawn_server_with(
+        manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+        rbn::LineFormat::Rbn,
+        epoch,
+        Some(minutes),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn sh_dx_history_window_is_configurable() {
+    let epoch = SystemTime::now() - Duration::from_secs(3600);
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server_with_history(epoch, 90).await;
+    let expected = publish_hour_of_history(&bus);
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    assert_eq!(rows_for(&mut reader, &mut wr, "sh/dx 60m").await, expected);
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "sh/dx 30m").await,
+        expected[300..]
     );
 }

@@ -1,0 +1,122 @@
+# HELP manta_spots_total Total spots published to the broadcast bus.
+# TYPE manta_spots_total counter
+manta_spots_total 1
+# HELP manta_spots_by_band_total Spots published to the broadcast bus, by amateur band and spot type (sums to manta_spots_total).
+# TYPE manta_spots_by_band_total counter
+manta_spots_by_band_total{band="20m",type="cq"} 1
+# HELP manta_spots_dropped_lagged_total Spots dropped because a slow client fell behind and was disconnected.
+# TYPE manta_spots_dropped_lagged_total counter
+manta_spots_dropped_lagged_total 0
+# HELP manta_spots_suppressed_by_filter_total Spots suppressed by a client's own filter (e.g. set dx filter unique), not a lag disconnect.
+# TYPE manta_spots_suppressed_by_filter_total counter
+manta_spots_suppressed_by_filter_total 0
+# HELP manta_spots_dropped_write_failed_total Spots dropped because a client's socket write timed out or failed before a lag/close error was observed.
+# TYPE manta_spots_dropped_write_failed_total counter
+manta_spots_dropped_write_failed_total 0
+# HELP manta_spots_dropped_shutdown_total Spots abandoned because the daemon shut down while a client was still in its pre-login/handshake phase, before any socket write timed out or failed.
+# TYPE manta_spots_dropped_shutdown_total counter
+manta_spots_dropped_shutdown_total 0
+# HELP manta_spots_replay_abandoned_total `sh/dx` history entries abandoned without being replayed, because the replay write failed or the daemon shut down mid-replay. Counted separately from live-delivery loss: these are re-sends of spots already counted in manta_spots_total.
+# TYPE manta_spots_replay_abandoned_total counter
+manta_spots_replay_abandoned_total 0
+# HELP manta_spots_unresolved_geography_total Spots emitted with an UNKNOWN_DXCC/UNKNOWN_CONTINENT/UNKNOWN_CQ_ZONE sentinel on the dx or de side, because the callsign did not resolve against cty.dat, OR its entity carries no row in the vendored dxcc.tsv, OR it carries a /MM or /AM designator that places it outside any DXCC entity.
+# TYPE manta_spots_unresolved_geography_total counter
+manta_spots_unresolved_geography_total 0
+# HELP manta_telnet_clients_connected Currently connected telnet clients.
+# TYPE manta_telnet_clients_connected gauge
+manta_telnet_clients_connected 0
+# HELP manta_json_clients_connected Currently connected JSON Lines clients.
+# TYPE manta_json_clients_connected gauge
+manta_json_clients_connected 0
+# HELP manta_ws_clients_connected Currently connected WebSocket clients.
+# TYPE manta_ws_clients_connected gauge
+manta_ws_clients_connected 0
+# HELP manta_active_tracks Currently active decoder tracks.
+# TYPE manta_active_tracks gauge
+manta_active_tracks 1
+# HELP manta_source_health Per-input-source health (1 = healthy, 0 = unhealthy).
+# TYPE manta_source_health gauge
+manta_source_health{source="file"} 1
+# HELP manta_source_outages_total Times each input source went from healthy to unhealthy (a lost connection or failed read).
+# TYPE manta_source_outages_total counter
+manta_source_outages_total{source="file"} 0
+# HELP manta_source_down_seconds_total Seconds each input source spent in outages that have ended; an outage still in progress is added when it ends.
+# TYPE manta_source_down_seconds_total counter
+manta_source_down_seconds_total{source="file"} 0.000
+# HELP manta_input_dropped_packets_total Input packets estimated lost in transit before reaching the decoder, per source.
+# TYPE manta_input_dropped_packets_total counter
+# HELP manta_input_gaps_detected_total Distinct input-stream gap events detected, per source (one gap may account for several dropped packets).
+# TYPE manta_input_gaps_detected_total counter
+# HELP manta_input_malformed_packets_total Input datagrams discarded as malformed -- wrong length, or correct length but failed framing/sync validation (MAN-22), per source.
+# TYPE manta_input_malformed_packets_total counter
+# HELP manta_uplink_sent_total Spots forwarded to the RBN uplink target.
+# TYPE manta_uplink_sent_total counter
+manta_uplink_sent_total 0
+# HELP manta_uplink_suppressed_total Spots suppressed by dry-run instead of sent to the RBN uplink target.
+# TYPE manta_uplink_suppressed_total counter
+manta_uplink_suppressed_total 0
+# HELP manta_uplink_dropped_lagged_total Spots the uplink fell behind on and lost before its next reconnect.
+# TYPE manta_uplink_dropped_lagged_total counter
+manta_uplink_dropped_lagged_total 0
+# HELP manta_uplink_dropped_write_failed_total Spots dropped because a write to the RBN uplink target's socket timed out or failed.
+# TYPE manta_uplink_dropped_write_failed_total counter
+manta_uplink_dropped_write_failed_total 0
+# HELP manta_uplink_dropped_disconnected_total Spots dropped when the RBN uplink connection was torn down for a reason other than a failed write (rate limit, protocol violation, stalled login, shutdown).
+# TYPE manta_uplink_dropped_disconnected_total counter
+manta_uplink_dropped_disconnected_total 0
+# HELP manta_uplink_reconnects_total Times the RBN uplink connection was reestablished after dropping.
+# TYPE manta_uplink_reconnects_total counter
+manta_uplink_reconnects_total 0
+# HELP manta_uplink_connected Count of configured RBN uplink targets currently connected.
+# TYPE manta_uplink_connected gauge
+manta_uplink_connected 0
+# HELP manta_uplink_target_enabled Whether this configured RBN uplink target is enabled (1) or configured but disabled (0).
+# TYPE manta_uplink_target_enabled gauge
+# HELP manta_uplink_target_connected Whether this RBN uplink target is currently connected.
+# TYPE manta_uplink_target_connected gauge
+# HELP manta_uplink_target_sent_total Spots forwarded to this RBN uplink target.
+# TYPE manta_uplink_target_sent_total counter
+# HELP manta_uplink_target_suppressed_total Spots suppressed by dry-run instead of sent to this RBN uplink target.
+# TYPE manta_uplink_target_suppressed_total counter
+# HELP manta_uplink_target_dropped_lagged_total Spots this target fell behind on and lost before its next reconnect.
+# TYPE manta_uplink_target_dropped_lagged_total counter
+# HELP manta_uplink_target_dropped_write_failed_total Spots dropped because a write to this target's socket timed out or failed.
+# TYPE manta_uplink_target_dropped_write_failed_total counter
+# HELP manta_uplink_target_dropped_disconnected_total Spots dropped when this target's connection was torn down for a reason other than a failed write.
+# TYPE manta_uplink_target_dropped_disconnected_total counter
+# HELP manta_uplink_target_reconnects_total Times this RBN uplink target's connection was reestablished after dropping.
+# TYPE manta_uplink_target_reconnects_total counter
+# HELP manta_start_time_seconds Unix time at which this daemon's spot server and metrics endpoint started.
+# TYPE manta_start_time_seconds gauge
+manta_start_time_seconds 1791416078.578
+# HELP manta_uptime_seconds Seconds since this daemon's spot server and metrics endpoint started (monotonic).
+# TYPE manta_uptime_seconds gauge
+manta_uptime_seconds 0.592
+# HELP manta_build_info Build metadata (value is always 1): crate version, git commit, and compiled-in optional features.
+# TYPE manta_build_info gauge
+manta_build_info{version="0.1.0",git_sha="ee0d183d116b",features="none"} 1
+# HELP manta_decode_latency_seconds Wall-clock time the decode thread spent processing one input chunk (channelize, track, decode, validate), excluding the wait for source data. Keeping up with real time requires this to stay below the chunk duration (2048 samples / sample rate).
+# TYPE manta_decode_latency_seconds histogram
+manta_decode_latency_seconds_bucket{le="0.0005"} 396
+manta_decode_latency_seconds_bucket{le="0.001"} 856
+manta_decode_latency_seconds_bucket{le="0.0025"} 857
+manta_decode_latency_seconds_bucket{le="0.005"} 857
+manta_decode_latency_seconds_bucket{le="0.01"} 857
+manta_decode_latency_seconds_bucket{le="0.025"} 857
+manta_decode_latency_seconds_bucket{le="0.05"} 857
+manta_decode_latency_seconds_bucket{le="0.1"} 857
+manta_decode_latency_seconds_bucket{le="0.25"} 857
+manta_decode_latency_seconds_bucket{le="0.5"} 857
+manta_decode_latency_seconds_bucket{le="1"} 857
+manta_decode_latency_seconds_bucket{le="2.5"} 857
+manta_decode_latency_seconds_bucket{le="+Inf"} 857
+manta_decode_latency_seconds_sum 0.440826798
+manta_decode_latency_seconds_count 857
+# HELP manta_healthy Whether /healthz currently reports this node healthy.
+# TYPE manta_healthy gauge
+manta_healthy 1
+# HELP manta_listener_up Whether this listener (telnet/json/metrics) is currently up.
+# TYPE manta_listener_up gauge
+manta_listener_up{listener="json"} 1
+manta_listener_up{listener="metrics"} 1
+manta_listener_up{listener="telnet"} 1

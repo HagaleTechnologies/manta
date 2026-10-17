@@ -1,0 +1,266 @@
+# promtool unit tests for manta-alerts.yml: `promtool test rules manta-alerts.test.yml`.
+# Each test feeds synthetic series at a 1-minute step and states which alerts fire when.
+rule_files:
+  - manta-alerts.yml
+evaluation_interval: 1m
+tests:
+  # MantaNodeDown: node1's scrapes fail from minute 2; node2 stays up.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="manta", instance="node1:7302"}'
+        values: '1 1 0x10'
+      - series: 'up{job="manta", instance="node2:7302"}'
+        values: '1x12'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: MantaNodeDown
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: MantaNodeDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: manta, instance: "node1:7302"}
+            exp_annotations:
+              summary: "manta node node1:7302 is down"
+              description: "Prometheus has failed to scrape node1:7302 for 2 minutes: the daemon is not running, or its metrics port is unreachable from Prometheus."
+              runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantanodedown"
+
+  # MantaNodeUnhealthy: node1's /healthz fails from minute 2.
+  - interval: 1m
+    input_series:
+      - series: 'manta_healthy{job="manta", instance="node1:7302"}'
+        values: '1 1 0x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: MantaNodeUnhealthy
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: MantaNodeUnhealthy
+        exp_alerts:
+          - exp_labels: {severity: critical, job: manta, instance: "node1:7302"}
+            exp_annotations:
+              summary: "manta node node1:7302 reports itself unhealthy"
+              description: "GET /healthz on node1:7302 has failed for 2 minutes: a source is unhealthy, a listener is down or the decode loop has stalled."
+              runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantanodeunhealthy"
+
+  # MantaInputDown: input c of node1 stops delivering samples from minute 2;
+  # inputs a and b stay healthy.
+  - interval: 1m
+    input_series:
+      - series: 'manta_source_health{job="manta", instance="node1:7302", source="a"}'
+        values: '1x12'
+      - series: 'manta_source_health{job="manta", instance="node1:7302", source="b"}'
+        values: '1x12'
+      - series: 'manta_source_health{job="manta", instance="node1:7302", source="c"}'
+        values: '1 1 0x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: MantaInputDown
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: MantaInputDown
+        exp_alerts:
+          - exp_labels: {severity: warning, job: manta, instance: "node1:7302", source: c}
+            exp_annotations:
+              summary: "manta input c on node1:7302 is down"
+              description: "The input has delivered no samples for 2 minutes; the node's other inputs keep spotting. See docs/RUNBOOKS/node-health.md."
+              runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantainputdown"
+
+  # MantaNoSpots
+  #   node1: publishes until minute 10, then nothing: fires from minute 40.
+  #   node2: publishes throughout: never fires.
+  #   node3: down from minute 21 to 49, restarted at minute 50 with no spots: quiet at 55.
+  #   node4: restarted at minute 30 with no scrape gap; by minute 39 the new process has
+  #          the same count (3) the old one had 30 minutes earlier: the uptime term keeps it quiet.
+  - interval: 1m
+    input_series:
+      - series: 'manta_spots_total{job="manta", instance="node1:7302"}'
+        values: '0+5x10 50x60'
+      - series: 'manta_uptime_seconds{job="manta", instance="node1:7302"}'
+        values: '3600+60x70'
+      - series: 'manta_spots_total{job="manta", instance="node2:7302"}'
+        values: '0+5x70'
+      - series: 'manta_uptime_seconds{job="manta", instance="node2:7302"}'
+        values: '3600+60x70'
+      - series: 'manta_spots_total{job="manta", instance="node3:7302"}'
+        values: '0+5x20 _x29 0x20'
+      - series: 'manta_uptime_seconds{job="manta", instance="node3:7302"}'
+        values: '3600+60x20 _x29 0+60x20'
+      - series: 'manta_spots_total{job="manta", instance="node4:7302"}'
+        values: '0 1 2 3x27 0 1 2 3x40'
+      - series: 'manta_uptime_seconds{job="manta", instance="node4:7302"}'
+        values: '3600+60x29 0+60x40'
+    alert_rule_test:
+      - eval_time: 39m
+        alertname: MantaNoSpots
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: MantaNoSpots
+        exp_alerts:
+          - exp_labels: {severity: warning, job: manta, instance: "node1:7302"}
+            exp_annotations:
+              summary: "manta node node1:7302 has published no spots for 30 minutes"
+              description: "manta_spots_total on node1:7302 has not increased in 30 minutes of uptime."
+              runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantanospots"
+      - eval_time: 55m
+        alertname: MantaNoSpots
+        exp_alerts:
+          - exp_labels: {severity: warning, job: manta, instance: "node1:7302"}
+            exp_annotations:
+              summary: "manta node node1:7302 has published no spots for 30 minutes"
+              description: "manta_spots_total on node1:7302 has not increased in 30 minutes of uptime."
+              runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantanospots"
+
+  # MantaNoSpots: a 40-minute scrape gap ends at minute 50. increase() over 30m would
+  # fire at minute 55 on the few post-gap samples; offset 30m finds no sample, so no alert.
+  - interval: 1m
+    input_series:
+      - series: 'manta_spots_total{job="manta", instance="node1:7302"}'
+        values: '0+1x10 _x40 100x10'
+      - series: 'manta_uptime_seconds{job="manta", instance="node1:7302"}'
+        values: '3600+60x10 _x40 6600+60x10'
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: MantaNoSpots
+        exp_alerts: []
+
+  # MantaUplinkDisconnected, one node with five targets:
+  #   a: unreachable from minute 1 (connected 0, recent attempts climb past 3): fires at 11m.
+  #   b: connected at every scrape but dropped every minute (recent >= 3 from minute 3): fires at 13m.
+  #   c: one dropped connection at minute 5: never fires.
+  #   d: collector restart: 4 quick attempts at minute 5, connected again, recent stays 4 for 5 minutes: never fires.
+  #   e: enabled = false: never fires.
+  - interval: 1m
+    input_series:
+      - series: 'manta_uplink_target_enabled{job="manta", instance="n:7302", target="a:7000"}'
+        values: '1x30'
+      - series: 'manta_uplink_target_connected{job="manta", instance="n:7302", target="a:7000"}'
+        values: '1 0x29'
+      - series: 'manta_uplink_target_recent_reconnects{job="manta", instance="n:7302", target="a:7000"}'
+        values: '0 4 5x28'
+      - series: 'manta_uplink_target_enabled{job="manta", instance="n:7302", target="b:7000"}'
+        values: '1x30'
+      - series: 'manta_uplink_target_connected{job="manta", instance="n:7302", target="b:7000"}'
+        values: '1x30'
+      - series: 'manta_uplink_target_recent_reconnects{job="manta", instance="n:7302", target="b:7000"}'
+        values: '0 1 2 3 4 5x25'
+      - series: 'manta_uplink_target_enabled{job="manta", instance="n:7302", target="c:7000"}'
+        values: '1x30'
+      - series: 'manta_uplink_target_connected{job="manta", instance="n:7302", target="c:7000"}'
+        values: '1x4 0 1x25'
+      - series: 'manta_uplink_target_recent_reconnects{job="manta", instance="n:7302", target="c:7000"}'
+        values: '0x4 1x5 0x21'
+      - series: 'manta_uplink_target_enabled{job="manta", instance="n:7302", target="d:7000"}'
+        values: '1x30'
+      - series: 'manta_uplink_target_connected{job="manta", instance="n:7302", target="d:7000"}'
+        values: '1x4 0 1x25'
+      - series: 'manta_uplink_target_recent_reconnects{job="manta", instance="n:7302", target="d:7000"}'
+        values: '0x4 4x5 0x21'
+      - series: 'manta_uplink_target_enabled{job="manta", instance="n:7302", target="e:7000"}'
+        values: '0x30'
+      - series: 'manta_uplink_target_connected{job="manta", instance="n:7302", target="e:7000"}'
+        values: '0x30'
+      - series: 'manta_uplink_target_recent_reconnects{job="manta", instance="n:7302", target="e:7000"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MantaUplinkDisconnected
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: MantaUplinkDisconnected
+        exp_alerts:
+          - exp_labels: {severity: warning, job: manta, instance: "n:7302", target: "a:7000"}
+            exp_annotations:
+              summary: "RBN uplink a:7000 on n:7302 is not connected"
+              description: "a:7000 has been down or flapping for 10 minutes."
+              runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantauplinkdisconnected"
+      - eval_time: 12m
+        alertname: MantaUplinkDisconnected
+        exp_alerts:
+          - exp_labels: {severity: warning, job: manta, instance: "n:7302", target: "a:7000"}
+            exp_annotations:
+              summary: "RBN uplink a:7000 on n:7302 is not connected"
+              description: "a:7000 has been down or flapping for 10 minutes."
+              runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantauplinkdisconnected"
+      - eval_time: 13m
+        alertname: MantaUplinkDisconnected
+        exp_alerts:
+          - exp_labels: {severity: warning, job: manta, instance: "n:7302", target: "a:7000"}
+            exp_annotations:
+              summary: "RBN uplink a:7000 on n:7302 is not connected"
+              description: "a:7000 has been down or flapping for 10 minutes."
+              runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantauplinkdisconnected"
+          - exp_labels: {severity: warning, job: manta, instance: "n:7302", target: "b:7000"}
+            exp_annotations:
+              summary: "RBN uplink b:7000 on n:7302 is not connected"
+              description: "b:7000 has been down or flapping for 10 minutes."
+              runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantauplinkdisconnected"
+      - eval_time: 25m
+        alertname: MantaUplinkDisconnected
+        exp_alerts:
+          - exp_labels: {severity: warning, job: manta, instance: "n:7302", target: "a:7000"}
+            exp_annotations:
+              summary: "RBN uplink a:7000 on n:7302 is not connected"
+              description: "a:7000 has been down or flapping for 10 minutes."
+              runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantauplinkdisconnected"
+          - exp_labels: {severity: warning, job: manta, instance: "n:7302", target: "b:7000"}
+            exp_annotations:
+              summary: "RBN uplink b:7000 on n:7302 is not connected"
+              description: "b:7000 has been down or flapping for 10 minutes."
+              runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantauplinkdisconnected"
+
+  # The dashboard's "Uplink status" expression, node filter removed, gives GET /status's
+  # verdict for every target: 3 connected, 2 flapping, 1 down, 0 disabled.
+  - interval: 1m
+    input_series:
+      - series: 'manta_uplink_target_enabled{job="manta", instance="n:7302", target="connected:7000"}'
+        values: '1'
+      - series: 'manta_uplink_target_connected{job="manta", instance="n:7302", target="connected:7000"}'
+        values: '1'
+      - series: 'manta_uplink_target_recent_reconnects{job="manta", instance="n:7302", target="connected:7000"}'
+        values: '2'
+      - series: 'manta_uplink_target_enabled{job="manta", instance="n:7302", target="flapping-while-connected:7000"}'
+        values: '1'
+      - series: 'manta_uplink_target_connected{job="manta", instance="n:7302", target="flapping-while-connected:7000"}'
+        values: '1'
+      - series: 'manta_uplink_target_recent_reconnects{job="manta", instance="n:7302", target="flapping-while-connected:7000"}'
+        values: '3'
+      - series: 'manta_uplink_target_enabled{job="manta", instance="n:7302", target="flapping:7000"}'
+        values: '1'
+      - series: 'manta_uplink_target_connected{job="manta", instance="n:7302", target="flapping:7000"}'
+        values: '0'
+      - series: 'manta_uplink_target_recent_reconnects{job="manta", instance="n:7302", target="flapping:7000"}'
+        values: '5'
+      - series: 'manta_uplink_target_enabled{job="manta", instance="n:7302", target="down:7000"}'
+        values: '1'
+      - series: 'manta_uplink_target_connected{job="manta", instance="n:7302", target="down:7000"}'
+        values: '0'
+      - series: 'manta_uplink_target_recent_reconnects{job="manta", instance="n:7302", target="down:7000"}'
+        values: '1'
+      - series: 'manta_uplink_target_enabled{job="manta", instance="n:7302", target="disabled:7000"}'
+        values: '0'
+      - series: 'manta_uplink_target_connected{job="manta", instance="n:7302", target="disabled:7000"}'
+        values: '0'
+      - series: 'manta_uplink_target_recent_reconnects{job="manta", instance="n:7302", target="disabled:7000"}'
+        values: '0'
+      - series: 'manta_uplink_target_enabled{job="manta", instance="n:7302", target="disabled-but-retrying:7000"}'
+        values: '0'
+      - series: 'manta_uplink_target_connected{job="manta", instance="n:7302", target="disabled-but-retrying:7000"}'
+        values: '0'
+      - series: 'manta_uplink_target_recent_reconnects{job="manta", instance="n:7302", target="disabled-but-retrying:7000"}'
+        values: '4'
+    promql_expr_test:
+      - expr: 'manta_uplink_target_enabled * (1 + (manta_uplink_target_recent_reconnects >= bool 3) + 2 * manta_uplink_target_connected * (1 - (manta_uplink_target_recent_reconnects >= bool 3)))'
+        eval_time: 0m
+        exp_samples:
+          - labels: '{instance="n:7302", job="manta", target="connected:7000"}'
+            value: 3
+          - labels: '{instance="n:7302", job="manta", target="flapping-while-connected:7000"}'
+            value: 2
+          - labels: '{instance="n:7302", job="manta", target="flapping:7000"}'
+            value: 2
+          - labels: '{instance="n:7302", job="manta", target="down:7000"}'
+            value: 1
+          - labels: '{instance="n:7302", job="manta", target="disabled:7000"}'
+            value: 0
+          - labels: '{instance="n:7302", job="manta", target="disabled-but-retrying:7000"}'
+            value: 0

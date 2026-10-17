@@ -1,0 +1,18 @@
+#!/bin/sh
+# MAN-96 field-node recovery, run by manta-field-ledger.service's watchdog (D-G) through
+# `sudo -n` once the node has been continuously bad for 600 s. Restarts the SDR driver
+# service (if this host has one) and then manta. Install to /usr/local/sbin/, mode 0755.
+# SDR_SERVICE names the driver service (the SDRplay API installer's is sdrplay.service).
+# sudo drops SDR_SERVICE from the environment by default, so for another name edit the
+# default below.
+set -eu
+
+SDR_SERVICE="${SDR_SERVICE:-sdrplay.service}"
+
+if systemctl cat "$SDR_SERVICE" >/dev/null 2>&1; then
+    systemctl restart "$SDR_SERVICE"
+fi
+
+sleep 5
+
+systemctl restart manta-field.service

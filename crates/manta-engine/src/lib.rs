@@ -1,9 +1,35 @@
 //! M0 pipeline: WAV -> frequency estimate -> single channel -> decoder.
 //! Grows into the PFB/track-manager engine at M2 (ARCHITECTURE §4, §10).
 
+pub mod check;
+pub mod config_file;
 pub mod listen;
-pub use listen::listen;
+pub use listen::{
+    listen, listen_with_observers, ListenObservers, OperatorLists, OperatorListsUpdate,
+    RttyObserver,
+};
+pub mod latency;
+pub mod live;
+pub mod multi;
+pub use latency::{DecodeLatencyObserver, DecodeLatencySnapshot, DECODE_LATENCY_BUCKETS_SECONDS};
+pub use live::{
+    BandSample, LiveRecord, LiveStateSink, TrackSnapshot, LIVE_MAX_CANDIDATES, LIVE_TEXT_CHARS,
+};
+pub mod lifecycle;
+pub use lifecycle::{TrackLifecycleObserver, TrackLifecycleSnapshot};
+pub use multi::{
+    common_rate_hz, listen_inputs, open_inputs, InputEnd, InputObservers, InputOpener, InputSpec,
+    OpenedInput, OpenedInputs, SessionClock, SharedObservers, SourceClock, TrackIdSpace,
+    MAX_INPUTS,
+};
+pub mod quality;
+pub use quality::{DecodeQualityObserver, DecodeQualitySnapshot, RAIL_RATIO_BUCKETS};
+pub mod calibrate;
+pub use calibrate::{calibrate, CalibrateOptions, CalibrationReport};
+pub mod doctor;
+pub use doctor::{doctor, DoctorReport, Verdict, MAX_DURATION, MIN_DURATION};
 pub mod soak;
+pub use manta_spot::reference::ReferenceLists;
 pub use manta_spot::{Blocklist, NotchList, Spot, SpotType};
 pub use soak::{soak, soak_passed, SoakReport};
 pub mod soak_metrics;
@@ -11,37 +37,95 @@ pub use soak_metrics::{
     soak_metrics_passed, soak_with_metrics, SoakCloseCounts, SoakMetricsReport, SoakMetricsSample,
 };
 
+#[cfg(test)]
+mod static_crash_tests;
 mod track;
-pub use track::DetectorConfig;
+pub use manta_dsp::crash::CRASH_MIN_LIVE_CHANNELS;
+/// MAN-234: the input sample guard's limit (SPEC §1.3 step 0), for the
+/// CLI's wording.
+pub use manta_dsp::sample_guard::MAX_SAMPLE_MAGNITUDE;
+pub use track::{crash_live_channels, ChannelLevel, CrashFilter, DetectorConfig};
 
 use anyhow::{bail, Context, Result};
 use manta_decode::decoder::{events_to_text, DecodeConfig};
 use manta_decode::events::DecoderEvent;
+use manta_decode::timing::TimingEstimates;
 use manta_input::{read_all, IqSource, WavIqSource};
 use num_complex::Complex32;
 use std::path::Path;
+use std::sync::Arc;
 
-/// Applies the calibration factor to a `TrackMeta` event's `freq_hz`,
-/// leaving every other event variant untouched. Used to calibrate the
-/// public-facing event stream (`DecodeReport::events`, `listen()`'s
-/// `on_event` callback) -- both consumed directly by `decode --json`/
-/// `listen --json` -- WITHOUT touching the copy fed to
-/// `manta_spot::Validator::ingest`, which already applies its own
-/// calibration internally; applying it here too would double-correct the
-/// validator's spot output (MAN-29 review round 3).
-pub(crate) fn calibrate_track_meta(ev: &DecoderEvent, factor: f64) -> DecoderEvent {
+/// Applies the calibration factor to every event variant that carries a
+/// `freq_hz` (`TrackMeta`, `TrackPromoted`), leaving every other variant
+/// untouched. Used to calibrate the public-facing event stream
+/// (`DecodeReport::events`, `listen()`'s `on_event` callback) -- both
+/// consumed directly by `decode --json`/`listen --json` -- WITHOUT
+/// touching the copy fed to `manta_spot::Validator::ingest`, which already
+/// applies its own calibration internally; applying it here too would
+/// double-correct the validator's spot output (MAN-29 review round 3).
+/// `TrackPromoted` calibration added in round 5 of the doctor review:
+/// otherwise a promoted track's first-reported frequency is raw while
+/// every later `TrackMeta`/spot for the same track is calibrated.
+pub(crate) fn calibrate_freq_events(ev: &DecoderEvent, factor: f64) -> DecoderEvent {
     match ev {
         DecoderEvent::TrackMeta {
             track_id,
+            sample_ts,
             snr_2500_db,
             freq_hz,
         } => DecoderEvent::TrackMeta {
             track_id: *track_id,
+            sample_ts: *sample_ts,
             snr_2500_db: *snr_2500_db,
+            freq_hz: freq_hz * factor,
+        },
+        DecoderEvent::TrackPromoted {
+            track_id,
+            sample_ts,
+            freq_hz,
+        } => DecoderEvent::TrackPromoted {
+            track_id: *track_id,
+            sample_ts: *sample_ts,
             freq_hz: freq_hz * factor,
         },
         other => other.clone(),
     }
+}
+
+/// The last `TimingUpdate` in `track_events` (one track's events): the
+/// sender timing `DecodeReport::timing` reports (MAN-315).
+fn last_timing(track_events: &[DecoderEvent]) -> Option<TimingEstimates> {
+    track_events.iter().rev().find_map(|e| match e {
+        DecoderEvent::TimingUpdate { timing, .. } => Some(timing.clone()),
+        _ => None,
+    })
+}
+
+/// `decode_samples`'s single-track selection: the lowest track_id among
+/// events that represent real decoder output. `TrackPromoted` is a
+/// detector-internal diagnostic signal (added for `manta_engine::doctor()`'s
+/// NoSignal check, see docs/DECISIONS/2026-09-09-doctor-track-promoted-
+/// event.md) with no decoder output of its own -- excluded here so an
+/// early, low-track-id candidate that was promoted and then merged/
+/// evicted/reached EOF before producing any real decoder event never gets
+/// selected over a later track that actually decoded something (round-5
+/// review finding). `TrackClosed` is bookkeeping, not decoder output,
+/// and is excluded too (MAN-174): a merge survivor that never decoded
+/// still gets its own `TrackClosed`, and must not become the reported
+/// track on that alone. `None` means every event in `events` was a
+/// `TrackPromoted` or `TrackClosed` (or `events` was empty, already
+/// handled by the caller before this is reached).
+fn primary_track_id(events: &[DecoderEvent]) -> Option<u32> {
+    events
+        .iter()
+        .filter(|e| {
+            !matches!(
+                e,
+                DecoderEvent::TrackPromoted { .. } | DecoderEvent::TrackClosed { .. }
+            )
+        })
+        .map(track::event_track_id)
+        .min()
 }
 
 /// M0 pipeline tunables. SPEC §5.
@@ -69,6 +153,52 @@ pub struct PipelineConfig {
     /// Operator's notched-frequency list (MAN-31). Empty by default -- no
     /// suppression until the operator supplies one.
     pub notch: NotchList,
+    /// Operator-supplied cty.dat, parsed once. None uses the bundled table.
+    pub cty: Option<Arc<manta_spot::cty::Table>>,
+    /// Operator-supplied MASTER.SCP, parsed once. None uses the bundled set.
+    pub scp: Option<Arc<manta_spot::scp::Set>>,
+    /// Operator-supplied callsign-pattern table. None uses the bundled list.
+    pub patterns: Option<Arc<manta_spot::pattern::Table>>,
+    /// Repetition thresholds by callsign-pattern rarity.
+    pub validation_level: manta_spot::ValidationLevel,
+}
+
+impl PipelineConfig {
+    /// The resolved country table, shared with the daemon's geography lookup.
+    pub fn cty_table(&self) -> Arc<manta_spot::cty::Table> {
+        self.cty
+            .clone()
+            .unwrap_or_else(|| Arc::new(manta_spot::cty::Table::bundled()))
+    }
+    /// The resolved known-callsign set.
+    pub fn scp_set(&self) -> Arc<manta_spot::scp::Set> {
+        self.scp
+            .clone()
+            .unwrap_or_else(|| Arc::new(manta_spot::scp::Set::bundled()))
+    }
+    /// The resolved callsign-pattern table.
+    pub fn pattern_table(&self) -> Arc<manta_spot::pattern::Table> {
+        self.patterns
+            .clone()
+            .unwrap_or_else(|| Arc::new(manta_spot::pattern::Table::bundled()))
+    }
+    /// Builds the validator used by every production decode path.
+    pub fn validator(&self, fs: f64) -> Result<manta_spot::Validator> {
+        // Keep the checked ppm constructor so callers cannot supply an
+        // unchecked raw calibration factor (MAN-29).
+        let mut validator =
+            manta_spot::Validator::from_tables(fs, self.cty_table(), Some(self.scp_set()))
+                .with_freq_correction_ppm(self.freq_correction_ppm)
+                .map_err(|e| anyhow::anyhow!(e))?
+                .with_blocklist(self.blocklist.clone())
+                .with_notch(self.notch.clone())
+                .with_patterns(self.pattern_table())
+                .with_validation_level(self.validation_level);
+        for call in &self.allowlist {
+            validator.allowlist(call);
+        }
+        Ok(validator)
+    }
 }
 
 impl Default for PipelineConfig {
@@ -80,6 +210,10 @@ impl Default for PipelineConfig {
             allowlist: Vec::new(),
             blocklist: Blocklist::default(),
             notch: NotchList::default(),
+            cty: None,
+            scp: None,
+            patterns: None,
+            validation_level: manta_spot::ValidationLevel::default(),
         }
     }
 }
@@ -99,6 +233,80 @@ pub struct DecodeReport {
     /// Validated spots (`manta-spot::Validator`, ARCHITECTURE §6), run
     /// over the full multi-track event stream above.
     pub spots: Vec<Spot>,
+    /// The primary track's last `TimingUpdate` (its learned dot, dash and
+    /// gap timing), or `None` when it emitted none (MAN-315).
+    pub timing: Option<TimingEstimates>,
+    /// MAN-314: every RTTY signal the detector marked (SPEC §2.6); empty
+    /// for input without RTTY or with `rtty_filter` off.
+    pub rtty: Vec<RttySignalReport>,
+    /// MAN-234: input samples replaced with silence (SPEC §1.3 step 0).
+    /// Omitted from JSON when 0, so a clean decode's `--json` is unchanged.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub bad_samples: u64,
+    /// Input sample rate, for turning `rtty` sample timestamps into
+    /// seconds; not serialized.
+    #[serde(skip)]
+    pub sample_rate_hz: f64,
+}
+
+/// `skip_serializing_if` predicate for the MAN-234 `bad_samples` report
+/// fields: a clean run's JSON keeps its pre-MAN-234 shape.
+pub(crate) fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// MAN-234: the suffix `decode_samples` adds to its "no signal found"
+/// errors when the channelizer replaced any input samples, so an input
+/// that was all bad samples says so instead of only "no signal".
+fn bad_samples_suffix(n: u64) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    let (noun, verb) = if n == 1 {
+        ("sample", "was")
+    } else {
+        ("samples", "were")
+    };
+    format!(
+        "; {n} bad input {noun} (NaN, infinite, or larger than {:e} in magnitude) {verb} \
+         replaced with silence",
+        MAX_SAMPLE_MAGNITUDE
+    )
+}
+
+/// MAN-314: one marked RTTY signal (SPEC §2.6), frequencies calibrated
+/// like `TrackMeta::freq_hz`. `marked_sample_ts`/`cleared_sample_ts` are
+/// stream sample timestamps; `cleared_sample_ts` is `None` while marked.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RttySignalReport {
+    /// Upper tone.
+    pub mark_hz: f64,
+    /// Lower tone.
+    pub space_hz: f64,
+    /// Nearest standard shift (170/200/425/450/850 Hz).
+    pub shift_hz: f64,
+    /// Measured `mark_hz - space_hz`, uncalibrated.
+    pub measured_shift_hz: f64,
+    pub marked_sample_ts: u64,
+    pub cleared_sample_ts: Option<u64>,
+    /// Detector id, stable while marked; not serialized.
+    #[serde(skip)]
+    pub id: u32,
+}
+
+impl RttySignalReport {
+    /// `entry` with its frequencies multiplied by `calibration_factor`.
+    pub(crate) fn from_entry(entry: &track::RttyLogEntry, calibration_factor: f64) -> Self {
+        RttySignalReport {
+            mark_hz: entry.mark_hz * calibration_factor,
+            space_hz: entry.space_hz * calibration_factor,
+            shift_hz: entry.shift_hz,
+            measured_shift_hz: entry.measured_shift_hz,
+            marked_sample_ts: entry.marked_sample_ts,
+            cleared_sample_ts: entry.cleared_sample_ts,
+            id: entry.id,
+        }
+    }
 }
 
 /// M0 pipeline: estimate frequency, extract one channel, decode. SPEC
@@ -144,6 +352,10 @@ pub fn decode_samples(
         cfg.detector,
         cfg.decode.clone(),
     );
+    tm.skip_preroll_hops(pad_hops);
+    // MAN-314: `DecodeReport::rtty` lists every marked signal, so the
+    // streaming cap on the RTTY log does not apply to a file decode.
+    tm.keep_full_rtty_history();
     // Feed the channelizer/track-manager in bounded chunks rather than one
     // `ch.process(&padded_iq)` + one `tm.process_hops(...)` call over the
     // whole file. `Channelizer::process` is chunk-size-invariant (proved by
@@ -170,18 +382,41 @@ pub fn decode_samples(
         any_hops |= !hops.is_empty();
         events.extend(tm.process_hops(&hops, |m| (m.saturating_sub(pad_hops)) * hop));
     }
+    let bad_samples = ch.bad_samples();
     if !any_hops {
-        bail!("no signal found (input shorter than one filter length or empty)");
+        bail!(
+            "no signal found (input shorter than one filter length or empty){}",
+            bad_samples_suffix(bad_samples)
+        );
     }
+    let rtty: Vec<RttySignalReport> = tm
+        .rtty_signals()
+        .iter()
+        .map(|e| RttySignalReport::from_entry(e, calibration_factor))
+        .collect();
     events.extend(tm.finish());
 
-    if events.is_empty() {
-        bail!("no signal found (input shorter than one filter length or empty)");
+    // MAN-314: a marked RTTY signal is a finding on its own, so input with
+    // RTTY but no CW decoder output still returns a report (empty CW
+    // fields, `rtty` filled) instead of "no signal found". MAN-313: hops
+    // were produced, so the input was long enough; with `non_cw_filter` on
+    // an input of only speech, data or swept carriers lands here.
+    if events.is_empty() && rtty.is_empty() {
+        bail!(
+            "no signal found (no keyed CW signal in the input){}",
+            bad_samples_suffix(bad_samples)
+        );
     }
-    let min_track_id = events.iter().map(track::event_track_id).min().unwrap();
+    let min_track_id = primary_track_id(&events);
+    if min_track_id.is_none() && rtty.is_empty() {
+        bail!(
+            "no signal found (only detector promotion events, no decoder output){}",
+            bad_samples_suffix(bad_samples)
+        );
+    }
     let this_track: Vec<DecoderEvent> = events
         .iter()
-        .filter(|e| track::event_track_id(e) == min_track_id)
+        .filter(|e| Some(track::event_track_id(e)) == min_track_id)
         .cloned()
         .collect();
     let freq_hz = this_track
@@ -198,18 +433,8 @@ pub fn decode_samples(
         _ => None,
     });
     let text = events_to_text(&this_track);
-    // Re-derives the same factor already validated above -- kept behind
-    // the ppm-based constructor rather than a raw-factor setter so no
-    // caller of manta-spot's public API can smuggle in an unchecked
-    // factor (MAN-29 review: validate before construction, not after).
-    let mut validator = manta_spot::Validator::bundled(fs)
-        .with_freq_correction_ppm(cfg.freq_correction_ppm)
-        .map_err(|e| anyhow::anyhow!(e))?
-        .with_blocklist(cfg.blocklist.clone())
-        .with_notch(cfg.notch.clone());
-    for call in &cfg.allowlist {
-        validator.allowlist(call);
-    }
+    let timing = last_timing(&this_track);
+    let mut validator = cfg.validator(fs)?;
     let mut spots = Vec::new();
     for ev in &events {
         spots.extend(validator.ingest(ev));
@@ -222,8 +447,12 @@ pub fn decode_samples(
     // peak memory on a long/dense offline decode for no reason (MAN-29
     // review round 4).
     for ev in events.iter_mut() {
-        if let DecoderEvent::TrackMeta { freq_hz, .. } = ev {
-            *freq_hz *= calibration_factor;
+        match ev {
+            DecoderEvent::TrackMeta { freq_hz, .. }
+            | DecoderEvent::TrackPromoted { freq_hz, .. } => {
+                *freq_hz *= calibration_factor;
+            }
+            _ => {}
         }
     }
     Ok(DecodeReport {
@@ -232,13 +461,26 @@ pub fn decode_samples(
         text,
         events,
         spots,
+        timing,
+        rtty,
+        bad_samples,
+        sample_rate_hz: fs,
     })
 }
 
 /// decode_samples, sourced from a WAV file via manta-input. ARCHITECTURE
-/// §3; SPEC §3–§5.
-pub fn decode_wav(path: &Path, cfg: &PipelineConfig) -> Result<DecodeReport> {
-    let mut src = WavIqSource::open(path)?;
+/// §3; SPEC §3–§5. `center_freq_hz` overrides the sidecar's centre
+/// frequency, and the sidecar is then not read (MAN-131, `decode
+/// --center-freq-hz`); `None` keeps the sidecar's value, `0.0` without one.
+pub fn decode_wav(
+    path: &Path,
+    center_freq_hz: Option<f64>,
+    cfg: &PipelineConfig,
+) -> Result<DecodeReport> {
+    let mut src = match center_freq_hz {
+        Some(hz) => WavIqSource::open_with_center_freq_hz(path, hz)?,
+        None => WavIqSource::open(path)?,
+    };
     let fs = src.sample_rate();
     let center = src.center_freq_hz();
     let iq = read_all(&mut src)?;
@@ -248,6 +490,182 @@ pub fn decode_wav(path: &Path, cfg: &PipelineConfig) -> Result<DecodeReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The QQ9ZZZ fixture `cli.rs`'s allowlist test uses: V1, 30 s, an
+    /// unallocated-prefix call.
+    fn qq9zzz_spec() -> manta_testkit::vectors::VectorSpec {
+        let mut spec = manta_testkit::vectors::v1();
+        spec.duration_s = 30.0;
+        spec.signals[0].text = "CQ CQ DE QQ9ZZZ QQ9ZZZ K".into();
+        spec
+    }
+
+    fn cty_with_qq9() -> Arc<manta_spot::cty::Table> {
+        Arc::new(manta_spot::cty::Table::parse(&format!(
+            "{}Test DXpedition:  14:  27:  EU:  50.0:  -5.0:  0.0:  QQ9:\n    QQ9;\n",
+            manta_spot::CTY_DAT
+        )))
+    }
+
+    #[test]
+    fn decode_samples_spots_a_call_only_an_override_cty_allocates() {
+        let spec = qq9zzz_spec();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let calls = |cfg: &PipelineConfig| -> Vec<String> {
+            decode_samples(&rendered.samples, spec.fs, spec.center_freq_hz, cfg)
+                .unwrap()
+                .spots
+                .into_iter()
+                .map(|s| s.callsign)
+                .collect()
+        };
+        assert!(!calls(&PipelineConfig::default()).contains(&"QQ9ZZZ".to_string()));
+        let cfg = PipelineConfig {
+            cty: Some(cty_with_qq9()),
+            patterns: Some(Arc::new(
+                manta_spot::pattern::Table::parse("+QQ9@@@\n").unwrap(),
+            )),
+            ..Default::default()
+        };
+        assert!(
+            calls(&cfg).contains(&"QQ9ZZZ".to_string()),
+            "override must let QQ9ZZZ spot"
+        );
+    }
+
+    #[test]
+    fn default_pipeline_config_uses_the_built_in_tables() {
+        let cfg = PipelineConfig::default();
+        assert!(cfg.cty_table().is_allocated("W1AW"));
+        assert!(!cfg.cty_table().is_allocated("QQ9ZZZ"));
+        assert_eq!(cfg.scp_set().len(), manta_spot::scp::Set::bundled().len());
+    }
+
+    #[test]
+    fn an_override_table_is_shared_not_copied() {
+        let table = cty_with_qq9();
+        let cfg = PipelineConfig {
+            cty: Some(table.clone()),
+            ..Default::default()
+        };
+        assert!(Arc::ptr_eq(&cfg.cty_table(), &table));
+    }
+
+    #[test]
+    fn pipeline_config_debug_stays_short_with_tables_loaded() {
+        let cfg = PipelineConfig {
+            cty: Some(Arc::new(manta_spot::cty::Table::bundled())),
+            scp: Some(Arc::new(manta_spot::scp::Set::bundled())),
+            ..Default::default()
+        };
+        // Loaded tables add a size summary, not ~50k callsigns.
+        let baseline = format!("{:?}", PipelineConfig::default()).len();
+        assert!(format!("{cfg:?}").len() < baseline + 200);
+    }
+
+    /// Regression (round-5 review, P1): an early low-track-id candidate
+    /// that only ever produced a `TrackPromoted` (promoted, then merged/
+    /// evicted/EOF'd before any real decoder output) must never be
+    /// selected over a later track that actually decoded something.
+    #[test]
+    fn primary_track_id_skips_a_promotion_only_track() {
+        let events = vec![
+            DecoderEvent::TrackPromoted {
+                track_id: 1,
+                sample_ts: 0,
+                freq_hz: 14_000_100.0,
+            },
+            DecoderEvent::TrackPromoted {
+                track_id: 2,
+                sample_ts: 10,
+                freq_hz: 14_012_340.0,
+            },
+            DecoderEvent::TrackMeta {
+                track_id: 2,
+                sample_ts: 15,
+                snr_2500_db: 20.0,
+                freq_hz: 14_012_340.0,
+            },
+            DecoderEvent::CharDecoded {
+                track_id: 2,
+                sample_ts: 20,
+                glyph: manta_decode::tree::Glyph::Char('W'),
+                confidence: 1.0,
+                alternatives: Vec::new(),
+            },
+        ];
+        assert_eq!(primary_track_id(&events), Some(2));
+    }
+
+    /// MAN-174: a merge survivor that never decoded still gets its own
+    /// `TrackClosed`. That bookkeeping event must not make it the
+    /// reported track over a higher-id track with real decoder output.
+    #[test]
+    fn primary_track_id_ignores_track_closed() {
+        let events = vec![
+            DecoderEvent::TrackClosed {
+                track_id: 2,
+                closure: manta_decode::events::ClosureKind::SignalEnded,
+            },
+            DecoderEvent::word_boundary(5, 10),
+        ];
+        assert_eq!(primary_track_id(&events), Some(5));
+    }
+
+    /// MAN-315: `DecodeReport::timing` is the primary track's last
+    /// `TimingUpdate`, never another track's.
+    #[test]
+    fn decode_report_timing_is_primary_tracks_last() {
+        use manta_decode::timing::ClassEstimate;
+        let update = |track_id, sample_ts, dash: f32| DecoderEvent::TimingUpdate {
+            track_id,
+            sample_ts,
+            timing: TimingEstimates {
+                dit_ms: 48.0,
+                dot: None,
+                dash: Some(ClassEstimate {
+                    mean_dits: dash,
+                    var_dits2: 0.0,
+                    n: 1,
+                }),
+                element_gap: None,
+                char_gap: None,
+                word_gap: None,
+            },
+        };
+        let events = vec![
+            update(2, 10, 3.0),
+            update(3, 11, 2.6),
+            update(2, 20, 4.0),
+            update(3, 21, 2.7),
+        ];
+        let primary = primary_track_id(&events).unwrap();
+        assert_eq!(primary, 2);
+        let this_track: Vec<DecoderEvent> = events
+            .iter()
+            .filter(|e| track::event_track_id(e) == primary)
+            .cloned()
+            .collect();
+        let t = last_timing(&this_track).unwrap();
+        assert_eq!(t.dash.unwrap().mean_dits, 4.0);
+        assert_eq!(last_timing(&[]), None);
+    }
+
+    #[test]
+    fn primary_track_id_is_none_when_only_promotions_occurred() {
+        let events = vec![
+            DecoderEvent::TrackPromoted {
+                track_id: 1,
+                sample_ts: 0,
+                freq_hz: 14_000_100.0,
+            },
+            DecoderEvent::TrackPromoted {
+                track_id: 2,
+                sample_ts: 5,
+                freq_hz: 14_012_340.0,
+            },
+        ];
+        assert_eq!(primary_track_id(&events), None);
+    }
 
     /// MAN-31: `decode_samples` is one of the two production call sites
     /// that must apply an operator-supplied suppression list -- proves the
@@ -268,6 +686,90 @@ mod tests {
             "blocklisted callsign must never be spotted, got {:?}",
             report.spots
         );
+    }
+
+    /// MAN-234: V1 cut to 12 s, rendered once per test.
+    fn v1_12s() -> (manta_testkit::vectors::VectorSpec, Vec<Complex32>) {
+        let spec = manta_testkit::vectors::VectorSpec {
+            duration_s: 12.0,
+            ..manta_testkit::vectors::v1()
+        };
+        let samples = manta_testkit::vectors::render(&spec).unwrap().samples;
+        (spec, samples)
+    }
+
+    #[test]
+    fn decode_samples_survives_a_bad_sample_mid_track() {
+        // MAN-234 scenario 1: before the channelizer guard this panicked
+        // at `track.rs`'s `select_channel` `partial_cmp(..).unwrap()`.
+        let (spec, clean) = v1_12s();
+        let cfg = PipelineConfig::default();
+        let want = decode_samples(&clean, spec.fs, spec.center_freq_hz, &cfg).unwrap();
+        assert_eq!(want.bad_samples, 0);
+        let mut corrupt = clean.clone();
+        corrupt[576_000].re = f32::NAN; // t = 6 s
+        let got = decode_samples(&corrupt, spec.fs, spec.center_freq_hz, &cfg).unwrap();
+        assert_eq!(got.bad_samples, 1);
+        assert_eq!(got.text, want.text);
+    }
+
+    #[test]
+    fn decode_samples_survives_a_finite_overflow_sample_at_start() {
+        // MAN-234 D2: a finite `f32::MAX` latched the floor/gate EMAs at
+        // NaN and the decode failed "no signal found".
+        let (spec, clean) = v1_12s();
+        let cfg = PipelineConfig::default();
+        let want = decode_samples(&clean, spec.fs, spec.center_freq_hz, &cfg).unwrap();
+        let mut corrupt = clean.clone();
+        corrupt[96].re = f32::MAX; // t = 1 ms
+        let got = decode_samples(&corrupt, spec.fs, spec.center_freq_hz, &cfg).unwrap();
+        assert_eq!(got.bad_samples, 1);
+        assert_eq!(got.text, want.text);
+    }
+
+    #[test]
+    fn clean_decode_report_json_has_no_bad_samples_key() {
+        let (spec, clean) = v1_12s();
+        let mut report = decode_samples(
+            &clean,
+            spec.fs,
+            spec.center_freq_hz,
+            &PipelineConfig::default(),
+        )
+        .unwrap();
+        let v = serde_json::to_value(&report).unwrap();
+        assert!(v.get("bad_samples").is_none(), "clean JSON: {v}");
+        report.bad_samples = 3;
+        let s = serde_json::to_string(&report).unwrap();
+        assert!(s.contains("\"bad_samples\":3"), "{s}");
+    }
+
+    #[test]
+    fn no_signal_error_names_replaced_samples() {
+        let cfg = PipelineConfig::default();
+        let all_nan = vec![Complex32::new(f32::NAN, f32::NAN); 96_000];
+        let err = decode_samples(&all_nan, 96_000.0, 14_000_000.0, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("no signal found"), "{err}");
+        assert!(
+            err.contains(
+                "96000 bad input samples (NaN, infinite, or larger than 1e17 in magnitude) \
+                 were replaced with silence"
+            ),
+            "{err}"
+        );
+        let silence = vec![Complex32::new(0.0, 0.0); 96_000];
+        let err = decode_samples(&silence, 96_000.0, 14_000_000.0, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "input is digital silence");
+        assert_eq!(
+            bad_samples_suffix(1),
+            "; 1 bad input sample (NaN, infinite, or larger than 1e17 in magnitude) was \
+             replaced with silence"
+        );
+        assert_eq!(bad_samples_suffix(0), "");
     }
 
     #[test]

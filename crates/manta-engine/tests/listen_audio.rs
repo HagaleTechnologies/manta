@@ -78,3 +78,77 @@ fn listen_decodes_a_clean_real_audio_signal() {
         "expected W1AW in decoded text, got {decoded:?} (keyed: {keyed_text:?})"
     );
 }
+
+/// MAN-34: a center frequency configured on `AudioIqSource` itself reaches
+/// the emitted `TrackMeta.freq_hz` as `center + baseband offset`, not a bare
+/// offset. Deliberately asserts on frequency placement only, never on decoded
+/// text: routing real audio through `AudioIqSource`'s Hilbert front end trips
+/// the near-DC leakage of issue #21 (see this file's other test), which
+/// spawns extra spurious tracks. Selecting the track closest to the expected
+/// frequency makes this test immune to those extras, and the "nothing below
+/// 1 MHz" assertion is what actually fails if the center frequency is dropped.
+#[test]
+fn listen_applies_an_audio_sources_configured_center_freq_hz() {
+    const CENTER_HZ: f64 = 14_030_000.0;
+    const TONE_HZ: f64 = 750.0; // 8 * 93.75 Hz -- an exact channel center.
+    let fs = 48_000.0;
+    let spec = KeyerSpec::new(20.0);
+    let (env, _keyed) = key_text_loop("CQ CQ DE W1AW W1AW K", &spec, fs, 15.0).unwrap();
+
+    let mut real = vec![0.0f32; env.len()];
+    let dphi = std::f64::consts::TAU * TONE_HZ / fs;
+    let mut phi = 0.0f64;
+    for (i, r) in real.iter_mut().enumerate() {
+        *r = env.get(i).copied().unwrap_or(0.0) * phi.cos() as f32;
+        phi += dphi;
+    }
+
+    let src: Box<dyn manta_input::IqSource> = Box::new(
+        AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, 48_000)))
+            .unwrap()
+            .with_center_freq_hz(CENTER_HZ)
+            .unwrap(),
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let freqs = Arc::new(Mutex::new(Vec::<f64>::new()));
+    let freqs_cb = freqs.clone();
+    listen(
+        src,
+        &PipelineConfig::default(),
+        stop,
+        move |ev| {
+            if let manta_decode::events::DecoderEvent::TrackMeta { freq_hz, .. } = ev {
+                freqs_cb.lock().unwrap().push(*freq_hz);
+            }
+        },
+        |_spot| {},
+    )
+    .unwrap();
+
+    let freqs = freqs.lock().unwrap().clone();
+    assert!(!freqs.is_empty(), "expected at least one TrackMeta event");
+    // A dropped center frequency reports bare audio offsets (< 24 kHz).
+    for f in &freqs {
+        assert!(
+            (f - CENTER_HZ).abs() < fs / 2.0,
+            "TrackMeta.freq_hz {f} is outside the passband around {CENTER_HZ} -- \
+             a hardcoded center_freq_hz=0.0 would put it near the audio offset"
+        );
+    }
+    let best = freqs
+        .iter()
+        .copied()
+        .min_by(|a, b| {
+            (a - (CENTER_HZ + TONE_HZ))
+                .abs()
+                .total_cmp(&(b - (CENTER_HZ + TONE_HZ)).abs())
+        })
+        .unwrap();
+    assert!(
+        (best - (CENTER_HZ + TONE_HZ)).abs() < 200.0,
+        "closest TrackMeta.freq_hz {best} should be within 200 Hz of {} \
+         (center + keyed tone offset)",
+        CENTER_HZ + TONE_HZ
+    );
+}

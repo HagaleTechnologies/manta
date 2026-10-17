@@ -6,8 +6,11 @@
 
 use futures_util::StreamExt;
 use manta_server::bus::SpotBus;
+use manta_server::config::StationLocation;
 use manta_server::metrics::Metrics;
 use manta_spot::cty::Table;
+use manta_spot::reference::ReferenceLists;
+use manta_spot::scp;
 use manta_spot::{Spot, SpotType};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -23,15 +26,81 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
     JA,JD,JE,JF,JG,JH,JI,JJ,JK,JL,JM,JN,JO,JP,JQ,JR,JS;
 ";
 
+/// MAN-316: the stream reads `cty.dat` through the run's live
+/// `ReferenceLists`; these tests never swap it.
+fn fixture_lists() -> Arc<ReferenceLists> {
+    Arc::new(ReferenceLists::new(
+        Arc::new(Table::parse(CTY_FIXTURE)),
+        Arc::new(scp::Set::bundled()),
+    ))
+}
+
 async fn spawn_server() -> (
     std::net::SocketAddr,
     Arc<SpotBus>,
     Arc<Metrics>,
     tokio::sync::watch::Sender<bool>,
 ) {
-    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
+    spawn_server_with_drain_deadline(manta_server::tasks::CLIENT_DRAIN_DEADLINE).await
+}
+
+/// MAN-45 (PR #63 round-16 finding): lets a test drive the per-client
+/// shutdown-drain deadline directly (e.g. `Duration::ZERO`, to make an
+/// expiry exact rather than timing-dependent) instead of always waiting on
+/// the production `CLIENT_DRAIN_DEADLINE`.
+async fn spawn_server_with_drain_deadline(
+    drain_deadline: Duration,
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    spawn_server_with(drain_deadline, None).await
+}
+
+/// MAN-138: a server whose station has a configured position, the value
+/// `ServerConfig::station_location` hands the daemon's JSON listener.
+async fn spawn_server_with_location(
+    station_location: Option<StationLocation>,
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    spawn_server_with(manta_server::tasks::CLIENT_DRAIN_DEADLINE, station_location).await
+}
+
+async fn spawn_server_with(
+    drain_deadline: Duration,
+    station_location: Option<StationLocation>,
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    spawn_server_with_bus(
+        drain_deadline,
+        station_location,
+        Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0)),
+    )
+    .await
+}
+
+async fn spawn_server_with_bus(
+    drain_deadline: Duration,
+    station_location: Option<StationLocation>,
+    bus: Arc<SpotBus>,
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+) {
     let metrics = Arc::new(Metrics::new());
-    let cty = Arc::new(Table::parse(CTY_FIXTURE));
+    let lists = fixture_lists();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -48,10 +117,13 @@ async fn spawn_server() -> (
             manta_server::json_stream::JsonStreamConfig {
                 bus: bus2,
                 metrics: metrics2,
-                cty,
+                lists,
                 station_call: STATION_CALL.to_string(),
+                station_location,
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
+                drain_deadline,
+                stream: manta_server::json_stream::StreamKind::Spots,
             },
             tasks,
             limiter,
@@ -69,6 +141,53 @@ async fn spawn_server() -> (
     (addr, bus, metrics, shutdown_tx)
 }
 
+type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+
+async fn next_ws(ws: &mut Ws) -> serde_json::Value {
+    let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("frame timeout")
+        .expect("stream closed")
+        .expect("WebSocket error");
+    serde_json::from_str(frame.to_text().expect("text frame")).unwrap()
+}
+
+async fn next_tcp(tcp: &mut BufReader<TcpStream>) -> serde_json::Value {
+    let mut line = String::new();
+    let n = tokio::time::timeout(Duration::from_secs(5), tcp.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(n > 0, "stream closed");
+    serde_json::from_str(&line).unwrap()
+}
+
+fn assert_hello(v: &serde_json::Value) {
+    assert_eq!(v["kind"], "hello");
+    assert_eq!(v["schema"], "stream.v1");
+    assert!(v["session"].is_string());
+    assert!(v["seq"].is_u64());
+    assert!(v["historyFrom"].is_u64());
+    assert!(v["resumed"].is_boolean());
+}
+
+async fn connect_tcp(addr: std::net::SocketAddr) -> (BufReader<TcpStream>, serde_json::Value) {
+    let mut tcp = BufReader::new(TcpStream::connect(addr).await.unwrap());
+    let hello = next_tcp(&mut tcp).await;
+    assert_hello(&hello);
+    assert_eq!(hello["resumed"], false);
+    (tcp, hello)
+}
+
+async fn connect_ws(
+    url: impl AsRef<str>,
+) -> Result<(Ws, serde_json::Value), tokio_tungstenite::tungstenite::Error> {
+    let (mut ws, _) = tokio_tungstenite::connect_async(url.as_ref()).await?;
+    let hello = next_ws(&mut ws).await;
+    assert_hello(&hello);
+    Ok((ws, hello))
+}
+
 fn sample_spot() -> Spot {
     Spot {
         callsign: "JA1ABC".to_string(),
@@ -79,14 +198,15 @@ fn sample_spot() -> Spot {
         confidence: 0.9,
         track_id: 1,
         sample_ts: 0,
+        rst: None,
+        qrl_query: false,
     }
 }
 
 #[tokio::test]
 async fn tcp_client_receives_spot_as_json_lines_message() {
     let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
-    let stream = TcpStream::connect(addr).await.unwrap();
-    let mut reader = BufReader::new(stream);
+    let (mut reader, _) = connect_tcp(addr).await;
 
     // Give the server task a moment to accept + subscribe before the
     // spot is published (see the telnet server's subscribe-before-login
@@ -109,7 +229,48 @@ async fn tcp_client_receives_spot_as_json_lines_message() {
     assert_eq!(value["frequency"], 14_027_100);
     assert_eq!(value["dxContinent"], "AS");
     assert_eq!(value["dxCqZone"], 25);
-    assert!(value["dxDxcc"].is_null());
+    assert_eq!(value["dxDxcc"], 339);
+    // MAN-102/D3: the JSON stream keeps the native 2500 Hz measurement
+    // (no telnet/uplink +7 dB conversion) plus an explicit reference field.
+    assert_eq!(value["snr"], 23);
+    assert_eq!(value["snrRefHz"], 2500);
+    // MAN-138: no configured station position, so none on the wire -- not
+    // the cty.dat centroid of STATION_CALL's country.
+    assert!(
+        value["deGrid"].is_null() && value["deLat"].is_null() && value["deLon"].is_null(),
+        "{value}"
+    );
+}
+
+/// MAN-138: the configured station position reaches a real TCP client as
+/// `deGrid`/`deLat`/`deLon`.
+#[tokio::test]
+async fn tcp_client_receives_the_configured_station_position() {
+    let (lat, lon) = manta_server::maidenhead::square("FN31pr").unwrap().center();
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server_with_location(Some(StationLocation {
+        grid: "FN31pr".to_string(),
+        lat,
+        lon,
+    }))
+    .await;
+    let (mut reader, _) = connect_tcp(addr).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    bus.publish(sample_spot());
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for JSON line")
+        .unwrap();
+
+    let value: serde_json::Value = serde_json::from_str(&line).expect("valid JSON line");
+    assert_eq!(value["deGrid"], "FN31pr");
+    let de_lat = value["deLat"].as_f64().expect("deLat is a number");
+    let de_lon = value["deLon"].as_f64().expect("deLon is a number");
+    assert!((de_lat - 41.729_166_666_666_67).abs() < 1e-9, "{de_lat}");
+    assert!((de_lon - -72.708_333_333_333_33).abs() < 1e-9, "{de_lon}");
+    // The dx side still comes from cty.dat.
+    assert_eq!(value["dxDxcc"], 339);
 }
 
 #[tokio::test]
@@ -118,8 +279,7 @@ async fn shutdown_drains_an_already_queued_spot_before_disconnecting() {
     // must still reach the client, not be dropped when the runtime tears
     // the connection's task down.
     let (addr, bus, _metrics, shutdown_tx) = spawn_server().await;
-    let stream = TcpStream::connect(addr).await.unwrap();
-    let mut reader = BufReader::new(stream);
+    let (mut reader, _) = connect_tcp(addr).await;
     tokio::time::sleep(Duration::from_millis(600)).await; // past the WS-detection peek window
 
     bus.publish(sample_spot());
@@ -132,6 +292,152 @@ async fn shutdown_drains_an_already_queued_spot_before_disconnecting() {
         .unwrap();
     let value: serde_json::Value = serde_json::from_str(&line).expect("valid JSON line");
     assert_eq!(value["dxCall"], "JA1ABC");
+}
+
+/// MAN-45 (PR #63 round-16 finding): a drain that cannot finish inside its
+/// own deadline must COUNT everything it abandons, never truncate silently
+/// (ARCHITECTURE §8). Driven with a zero deadline so the expiry is exact
+/// rather than timing-dependent -- the property under test is the
+/// accounting, not the duration.
+///
+/// The assertion is the invariant, not a fixed split: `select!` may still
+/// deliver some spots through the LIVE arm before the shutdown arm wins, so
+/// what must hold is that every published spot is either delivered or
+/// counted, never neither.
+#[tokio::test]
+async fn tcp_shutdown_drain_deadline_counts_the_backlog_it_could_not_write() {
+    let (addr, bus, metrics, shutdown_tx) = spawn_server_with_drain_deadline(Duration::ZERO).await;
+    let (mut reader, _) = connect_tcp(addr).await;
+    tokio::time::sleep(Duration::from_millis(600)).await; // past the WS-detection peek window
+
+    for _ in 0..3 {
+        bus.publish(sample_spot());
+    }
+    let _ = shutdown_tx.send(true);
+
+    let mut delivered = 0usize;
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => delivered += 1,
+            }
+        }
+    })
+    .await;
+
+    assert_eq!(
+        delivered + metrics.spots_dropped_write_failed_total() as usize,
+        3,
+        "every published spot must be delivered or counted, never neither",
+    );
+}
+
+/// MAN-45 remediate (code-review round 18, finding 3): before this fix,
+/// `looks_like_websocket_handshake`'s classifying peek never observed
+/// `shutdown` at all -- the same gap telnet's pre-login handshake had
+/// before round 17's CR-1 fix. Sending fewer than 3 bytes keeps the peek
+/// loop's "seen some bytes" branch extending its own patience to the full
+/// `HANDSHAKE_TIMEOUT` (10s) rather than classifying quickly, so without
+/// the fix this task would sit unresponsive to `shutdown` for up to that
+/// budget -- the read below would time out well before the connection
+/// closed. Also asserts the abandoned backlog lands on the distinct
+/// shutdown counter, not the write-failure one (no write was ever
+/// attempted here).
+#[tokio::test]
+async fn shutdown_during_handshake_peek_disconnects_promptly_instead_of_waiting_out_the_full_budget(
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (addr, bus, metrics, shutdown_tx) = spawn_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    stream.write_all(b"GE").await.unwrap(); // fewer than 3 bytes: keeps the peek loop pinned
+    tokio::time::sleep(Duration::from_millis(100)).await; // let the peek see "GE" and extend its deadline
+
+    bus.publish(sample_spot());
+    let _ = shutdown_tx.send(true);
+
+    let mut trailing = [0u8; 1];
+    let read_result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut trailing))
+        .await
+        .expect(
+            "a client stalled mid-handshake-classification must disconnect promptly once \
+             shutdown is signalled, not wait out the full handshake budget",
+        );
+    // The peek used to classify never CONSUMES bytes from the kernel
+    // receive queue -- the "GE" sent above is still logically unread when
+    // the server closes its side, so Linux sends an abortive RST instead
+    // of an orderly FIN (EOF). Either is a valid "disconnected promptly"
+    // signal; only a hang (the `expect` above) would indicate the fix
+    // didn't work.
+    match read_result {
+        Ok(0) => {}
+        Ok(n) => panic!("expected disconnect, got {n} bytes"),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("expected EOF or a connection reset, got: {e}"),
+    }
+
+    assert_eq!(
+        metrics.spots_dropped_shutdown_total(),
+        1,
+        "the queued spot must be charged to the shutdown counter"
+    );
+    assert_eq!(
+        metrics.spots_dropped_write_failed_total(),
+        0,
+        "no write ever failed on this path -- it must not inflate the write-failure counter"
+    );
+}
+
+/// MAN-45 remediate (code-review round 18, finding 3): the same gap one
+/// step later in a WS client's lifecycle -- `handle_ws_client`'s own
+/// `accept_async_with_config` step never observed `shutdown` either. A
+/// `GET` request whose headers never terminate (no blank CRLFCRLF) is
+/// classified as a WS candidate by the peek (starts with "GET") and then
+/// held inside the handshake accept future indefinitely, up to
+/// `HANDSHAKE_TIMEOUT` (10s) without this fix.
+#[tokio::test]
+async fn shutdown_during_ws_accept_handshake_disconnects_promptly_instead_of_waiting_out_the_full_timeout(
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (addr, bus, metrics, shutdown_tx) = spawn_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    bus.publish(sample_spot());
+    let _ = shutdown_tx.send(true);
+
+    let mut trailing = [0u8; 1];
+    let read_result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut trailing))
+        .await
+        .expect(
+            "a client stalled mid-WS-handshake must disconnect promptly once shutdown is \
+             signalled, not wait out the full handshake timeout",
+        );
+    assert_eq!(
+        read_result.unwrap(),
+        0,
+        "expected EOF after shutdown during the WS accept handshake"
+    );
+
+    assert_eq!(
+        metrics.spots_dropped_shutdown_total(),
+        1,
+        "the queued spot must be charged to the shutdown counter"
+    );
+    assert_eq!(
+        metrics.spots_dropped_write_failed_total(),
+        0,
+        "no write ever failed on this path -- it must not inflate the write-failure counter"
+    );
 }
 
 #[tokio::test]
@@ -353,13 +659,10 @@ async fn tcp_and_websocket_clients_share_the_same_port() {
     // same listener and each get correctly classified.
     let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
 
-    let tcp_stream = TcpStream::connect(addr).await.unwrap();
-    let mut tcp_reader = BufReader::new(tcp_stream);
+    let (mut tcp_reader, _) = connect_tcp(addr).await;
 
     let url = format!("ws://{addr}");
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
-        .await
-        .expect("ws connect failed");
+    let (mut ws, _resp) = connect_ws(url).await.expect("ws connect failed");
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     bus.publish(sample_spot());
@@ -388,7 +691,7 @@ async fn tcp_and_websocket_clients_share_the_same_port() {
 async fn websocket_client_receives_spot_as_json_message() {
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
     let metrics = Arc::new(Metrics::new());
-    let cty = Arc::new(Table::parse(CTY_FIXTURE));
+    let lists = fixture_lists();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -404,10 +707,13 @@ async fn websocket_client_receives_spot_as_json_message() {
             manta_server::json_stream::JsonStreamConfig {
                 bus: bus2,
                 metrics,
-                cty,
+                lists,
                 station_call: STATION_CALL.to_string(),
+                station_location: None,
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                stream: manta_server::json_stream::StreamKind::Spots,
             },
             tasks,
             limiter,
@@ -423,9 +729,7 @@ async fn websocket_client_receives_spot_as_json_message() {
     });
 
     let url = format!("ws://{addr}");
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
-        .await
-        .expect("ws connect failed");
+    let (mut ws, _resp) = connect_ws(url).await.expect("ws connect failed");
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     bus.publish(sample_spot());
@@ -444,6 +748,38 @@ async fn websocket_client_receives_spot_as_json_message() {
     let _ = ws.close(None).await;
 }
 
+/// MAN-45 (PR #63 round-16 finding): the WS drain loop's own deadline, same
+/// invariant as `tcp_shutdown_drain_deadline_counts_the_backlog_it_could_not_write`.
+#[tokio::test]
+async fn ws_shutdown_drain_deadline_counts_the_backlog_it_could_not_write() {
+    let (addr, bus, metrics, shutdown_tx) = spawn_server_with_drain_deadline(Duration::ZERO).await;
+    let url = format!("ws://{addr}");
+    let (mut ws, _resp) = connect_ws(url).await.expect("ws connect failed");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for _ in 0..3 {
+        bus.publish(sample_spot());
+    }
+    let _ = shutdown_tx.send(true);
+
+    let mut delivered = 0usize;
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(msg)) if msg.is_text() => delivered += 1,
+                _ => return, // Close/None/error: the connection ended
+            }
+        }
+    })
+    .await;
+
+    assert_eq!(
+        delivered + metrics.spots_dropped_write_failed_total() as usize,
+        3,
+        "every published spot must be delivered or counted, never neither",
+    );
+}
+
 #[tokio::test]
 async fn websocket_client_sending_an_oversized_message_is_disconnected() {
     // Regression test (round-5 review): the WS handshake used to accept
@@ -457,7 +793,7 @@ async fn websocket_client_sending_an_oversized_message_is_disconnected() {
 
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
     let metrics = Arc::new(Metrics::new());
-    let cty = Arc::new(Table::parse(CTY_FIXTURE));
+    let lists = fixture_lists();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -472,10 +808,13 @@ async fn websocket_client_sending_an_oversized_message_is_disconnected() {
             manta_server::json_stream::JsonStreamConfig {
                 bus,
                 metrics,
-                cty,
+                lists,
                 station_call: STATION_CALL.to_string(),
+                station_location: None,
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                stream: manta_server::json_stream::StreamKind::Spots,
             },
             tasks,
             limiter,
@@ -491,9 +830,7 @@ async fn websocket_client_sending_an_oversized_message_is_disconnected() {
     });
 
     let url = format!("ws://{addr}");
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
-        .await
-        .expect("ws connect failed");
+    let (mut ws, _resp) = connect_ws(url).await.expect("ws connect failed");
 
     // Comfortably past MAX_INBOUND_WS_MESSAGE_BYTES (16 KiB).
     let oversized = "a".repeat(64 * 1024);
@@ -523,7 +860,7 @@ async fn websocket_client_sending_an_unsolicited_pong_is_disconnected() {
 
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
     let metrics = Arc::new(Metrics::new());
-    let cty = Arc::new(Table::parse(CTY_FIXTURE));
+    let lists = fixture_lists();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -538,10 +875,13 @@ async fn websocket_client_sending_an_unsolicited_pong_is_disconnected() {
             manta_server::json_stream::JsonStreamConfig {
                 bus,
                 metrics,
-                cty,
+                lists,
                 station_call: STATION_CALL.to_string(),
+                station_location: None,
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                stream: manta_server::json_stream::StreamKind::Spots,
             },
             tasks,
             limiter,
@@ -557,9 +897,7 @@ async fn websocket_client_sending_an_unsolicited_pong_is_disconnected() {
     });
 
     let url = format!("ws://{addr}");
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
-        .await
-        .expect("ws connect failed");
+    let (mut ws, _resp) = connect_ws(url).await.expect("ws connect failed");
 
     let _ = ws.send(Message::Pong(vec![].into())).await;
 
@@ -588,7 +926,7 @@ async fn websocket_client_sending_a_structurally_malformed_frame_is_disconnected
 
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
     let metrics = Arc::new(Metrics::new());
-    let cty = Arc::new(Table::parse(CTY_FIXTURE));
+    let lists = fixture_lists();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -610,10 +948,13 @@ async fn websocket_client_sending_a_structurally_malformed_frame_is_disconnected
             manta_server::json_stream::JsonStreamConfig {
                 bus,
                 metrics,
-                cty,
+                lists,
                 station_call: STATION_CALL.to_string(),
+                station_location: None,
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                stream: manta_server::json_stream::StreamKind::Spots,
             },
             tasks,
             limiter,
@@ -720,7 +1061,7 @@ async fn websocket_client_flooding_pings_past_the_budget_is_disconnected() {
 
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
     let metrics = Arc::new(Metrics::new());
-    let cty = Arc::new(Table::parse(CTY_FIXTURE));
+    let lists = fixture_lists();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -735,10 +1076,13 @@ async fn websocket_client_flooding_pings_past_the_budget_is_disconnected() {
             manta_server::json_stream::JsonStreamConfig {
                 bus,
                 metrics,
-                cty,
+                lists,
                 station_call: STATION_CALL.to_string(),
+                station_location: None,
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                stream: manta_server::json_stream::StreamKind::Spots,
             },
             tasks,
             limiter,
@@ -754,9 +1098,7 @@ async fn websocket_client_flooding_pings_past_the_budget_is_disconnected() {
     });
 
     let url = format!("ws://{addr}");
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
-        .await
-        .expect("ws connect failed");
+    let (mut ws, _resp) = connect_ws(url).await.expect("ws connect failed");
 
     for _ in 0..manta_server::json_stream::MAX_INBOUND_PINGS {
         ws.send(Message::Ping(vec![].into())).await.unwrap();
@@ -798,12 +1140,8 @@ async fn a_second_ws_connection_from_the_same_ip_cannot_multiply_the_ping_rate_b
     let (addr, _bus, _metrics, _shutdown_tx) = spawn_server().await;
 
     let url = format!("ws://{addr}");
-    let (mut ws_a, _resp) = tokio_tungstenite::connect_async(&url)
-        .await
-        .expect("ws connect A failed");
-    let (mut ws_b, _resp) = tokio_tungstenite::connect_async(&url)
-        .await
-        .expect("ws connect B failed");
+    let (mut ws_a, _resp) = connect_ws(&url).await.expect("ws connect A failed");
+    let (mut ws_b, _resp) = connect_ws(&url).await.expect("ws connect B failed");
 
     // Connection A alone consumes the ENTIRE shared per-source budget --
     // each Pong proves the Ping was accepted, well within what a lone
@@ -839,4 +1177,488 @@ async fn a_second_ws_connection_from_the_same_ip_cannot_multiply_the_ping_rate_b
              budget (already exhausted by connection A) was exceeded, got {other:?}"
         ),
     }
+}
+
+// ---- MAN-301: `spotGrade` records share the JSON stream ----
+
+const GRADE_LINE: &str = r#"{"kind":"spotGrade","spotId":"W3XYZ:0:1:0:JA1ABC","call":"JA1ABC","band":"20m","spotTime":1791720000,"windowClose":1791720180,"windowS":180,"grade":"match","disagreements":[],"mantaFreqHz":14027100,"mantaWpm":28,"rbnModalFreqHz":14027000,"rbnMedianWpm":28.0,"rbnSkimmers":1,"rbnReports":1,"freqOffsetHz":100,"rbnBands":["20m"],"spotterFilter":[]}"#;
+
+fn scraped(metrics: &Metrics, series: &str) -> u64 {
+    metrics
+        .render_prometheus_text()
+        .lines()
+        .find_map(|l| l.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+        .unwrap_or_else(|| panic!("{series} not rendered"))
+}
+
+/// MAN-301: a published grade line reaches raw-TCP and WebSocket clients
+/// verbatim, after the spot it grades.
+#[tokio::test]
+async fn grade_lines_reach_raw_tcp_and_websocket_clients() {
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (mut tcp, _) = connect_tcp(addr).await;
+    let (mut ws, _resp) = connect_ws(format!("ws://{addr}"))
+        .await
+        .expect("ws connect failed");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    bus.publish(sample_spot());
+    bus.publish_grade(|_| Arc::from(GRADE_LINE));
+
+    let mut lines = Vec::new();
+    for _ in 0..2 {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), tcp.read_line(&mut line))
+            .await
+            .expect("timed out waiting for a TCP line")
+            .unwrap();
+        lines.push(line);
+    }
+    let spot: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    assert_eq!(spot["dxCall"], "JA1ABC");
+    assert_eq!(
+        lines[1],
+        format!("{GRADE_LINE}\n"),
+        "TCP grade line verbatim"
+    );
+
+    let mut texts = Vec::new();
+    for _ in 0..2 {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("timed out waiting for a ws message")
+            .expect("stream ended")
+            .expect("ws error");
+        texts.push(msg.into_text().expect("text frame").to_string());
+    }
+    let spot: serde_json::Value = serde_json::from_str(&texts[0]).unwrap();
+    assert_eq!(spot["dxCall"], "JA1ABC");
+    assert_eq!(texts[1], GRADE_LINE, "WebSocket grade message verbatim");
+
+    let _ = ws.close(None).await;
+}
+
+/// MAN-301: with no grade ever published, a client sees exactly the spot
+/// lines it saw before the JSON channel learned to carry grades -- no
+/// extra line, no `kind` key. (The 19 pre-MAN-301 tests in this file stay
+/// unmodified for the same guarantee.)
+#[tokio::test]
+async fn stream_is_unchanged_when_no_grades_are_published() {
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (mut tcp, _) = connect_tcp(addr).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for track_id in 1..=3u32 {
+        let mut spot = sample_spot();
+        spot.track_id = track_id;
+        bus.publish(spot);
+    }
+
+    for _ in 0..3 {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), tcp.read_line(&mut line))
+            .await
+            .expect("timed out waiting for a spot line")
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["dxCall"], "JA1ABC");
+        assert!(value.get("kind").is_none(), "{line}");
+    }
+    let mut extra = String::new();
+    let more = tokio::time::timeout(Duration::from_millis(300), tcp.read_line(&mut extra)).await;
+    assert!(
+        more.is_err(),
+        "no line beyond the three spots, got {extra:?}"
+    );
+}
+
+/// MAN-301: grades count against a slow client's lag budget exactly as
+/// spots do -- it is disconnected, and every grade it never received is
+/// counted in `manta_spots_dropped_lagged_total`.
+#[tokio::test]
+async fn a_lagging_client_is_disconnected_and_lost_grades_are_counted() {
+    // `bus::CHANNEL_CAPACITY` (1024) plus a margin, published without
+    // yielding so the (current-thread) handler cannot drain in between.
+    const BURST: u64 = 1024 + 10;
+
+    let (addr, bus, metrics, _shutdown_tx) = spawn_server().await;
+    let (mut tcp, _) = connect_tcp(addr).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Prove the client is in its stream loop before the burst.
+    bus.publish(sample_spot());
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), tcp.read_line(&mut line))
+        .await
+        .expect("timed out waiting for the first spot")
+        .unwrap();
+
+    for _ in 0..BURST {
+        bus.publish_grade(|_| Arc::from(GRADE_LINE));
+    }
+
+    let mut delivered = 0u64;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            match tcp.read_line(&mut line).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {
+                    assert_eq!(line, format!("{GRADE_LINE}\n"));
+                    delivered += 1;
+                }
+            }
+        }
+    })
+    .await
+    .expect("a lagging client must be disconnected");
+
+    let lost = scraped(&metrics, "manta_spots_dropped_lagged_total");
+    assert!(lost > 0, "the burst must have lagged the client");
+    assert_eq!(
+        delivered + lost,
+        BURST,
+        "every grade is delivered or counted, never neither"
+    );
+}
+
+#[tokio::test]
+async fn tcp_client_first_line_is_hello() {
+    let (addr, _, _, _shutdown) = spawn_server().await;
+    let (_, hello) = connect_tcp(addr).await;
+    assert_eq!(
+        hello,
+        serde_json::json!({"kind":"hello","schema":"stream.v1","session":"0","seq":0,"historyFrom":1,"resumed":false})
+    );
+}
+
+#[tokio::test]
+async fn ws_client_first_frame_is_hello() {
+    let (addr, _, _, _shutdown) = spawn_server().await;
+    let (_, hello) = connect_ws(format!("ws://{addr}")).await.unwrap();
+    assert_eq!(hello["seq"], 0);
+    assert_eq!(hello["historyFrom"], 1);
+    assert_eq!(hello["session"], "0");
+    assert_eq!(hello["resumed"], false);
+}
+
+#[tokio::test]
+async fn hello_reports_the_session_and_the_newest_seq() {
+    let (addr, bus, _, _shutdown) = spawn_server().await;
+    for _ in 0..3 {
+        bus.publish(sample_spot());
+    }
+    let (mut tcp, hello) = connect_tcp(addr).await;
+    assert_eq!(hello["seq"], 3);
+    assert_eq!(hello["historyFrom"], 1);
+    assert_eq!(hello["session"], "0");
+    bus.publish(sample_spot());
+    assert_eq!(next_tcp(&mut tcp).await["seq"], 4);
+}
+
+#[tokio::test]
+async fn a_spot_published_before_the_hello_follows_it_exactly_once() {
+    let (addr, bus, _, _shutdown) = spawn_server().await;
+    let mut tcp = BufReader::new(TcpStream::connect(addr).await.unwrap());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    bus.publish(sample_spot());
+    let hello = next_tcp(&mut tcp).await;
+    assert_hello(&hello);
+    assert_eq!(hello["seq"], 0);
+    assert_eq!(next_tcp(&mut tcp).await["seq"], 1);
+    let mut extra = String::new();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), tcp.read_line(&mut extra))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn spot_lines_carry_seq_counting_from_one() {
+    let (addr, bus, _, _shutdown) = spawn_server().await;
+    let (mut tcp, _) = connect_tcp(addr).await;
+    let (mut ws, _) = connect_ws(format!("ws://{addr}")).await.unwrap();
+    for _ in 0..3 {
+        bus.publish(sample_spot());
+    }
+    for seq in 1..=3 {
+        assert_eq!(next_tcp(&mut tcp).await["seq"], seq);
+        assert_eq!(next_ws(&mut ws).await["seq"], seq);
+    }
+}
+
+fn publish_grade(bus: &SpotBus) {
+    use manta_server::rbn_compare::grade::{Grade, SpotGrade, SPOT_GRADE_KIND};
+    bus.publish_grade(|seq| {
+        serde_json::to_string(&SpotGrade {
+            kind: SPOT_GRADE_KIND,
+            seq: Some(seq),
+            spot_id: "W3XYZ:0:1:0:JA1ABC".into(),
+            call: "JA1ABC".into(),
+            band: "20m",
+            spot_time: 1791720000,
+            window_close: 1791720180,
+            window_s: 180,
+            grade: Grade::Match,
+            disagreements: vec![],
+            manta_freq_hz: 14027100,
+            manta_wpm: Some(28),
+            rbn_modal_freq_hz: Some(14027000),
+            rbn_median_wpm: Some(28.0),
+            rbn_skimmers: 1,
+            rbn_reports: 1,
+            freq_offset_hz: Some(100),
+            rbn_bands: vec!["20m"],
+            spotter_filter: vec![],
+        })
+        .unwrap()
+        .into()
+    });
+}
+
+#[tokio::test]
+async fn grade_lines_carry_seq_after_their_spot() {
+    let (addr, bus, _, _shutdown) = spawn_server().await;
+    let (mut tcp, _) = connect_tcp(addr).await;
+    let (mut ws, _) = connect_ws(format!("ws://{addr}")).await.unwrap();
+    bus.publish(sample_spot());
+    publish_grade(&bus);
+    bus.publish(sample_spot());
+    for seq in 1..=3 {
+        let a = next_tcp(&mut tcp).await;
+        let b = next_ws(&mut ws).await;
+        assert_eq!(a["seq"], seq);
+        assert_eq!(b["seq"], seq);
+        if seq == 2 {
+            assert_eq!(a["kind"], "spotGrade");
+            assert_eq!(b["kind"], "spotGrade");
+        }
+    }
+}
+
+#[tokio::test]
+async fn hello_session_is_the_bus_session_nonce() {
+    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0xDEAD_BEEF));
+    let (addr, _, _, _shutdown) = spawn_server_with_bus(Duration::from_secs(5), None, bus).await;
+    let (_, hello) = connect_tcp(addr).await;
+    assert_eq!(hello["session"], "3735928559");
+}
+
+#[tokio::test]
+async fn a_reconnecting_ws_client_receives_what_it_missed() {
+    let (addr, bus, metrics, _shutdown) = spawn_server().await;
+    let (mut ws, _) = connect_ws(format!("ws://{addr}")).await.unwrap();
+    for _ in 0..3 {
+        bus.publish(sample_spot());
+    }
+    for seq in 1..=3 {
+        assert_eq!(next_ws(&mut ws).await["seq"], seq);
+    }
+    ws.close(None).await.unwrap();
+    drop(ws);
+    bus.publish(sample_spot());
+    publish_grade(&bus);
+    bus.publish(sample_spot());
+    let (mut ws, hello) = connect_ws(format!("ws://{addr}/?session=0&since=3"))
+        .await
+        .unwrap();
+    assert_eq!(hello["seq"], 6);
+    assert_eq!(hello["historyFrom"], 1);
+    assert_eq!(hello["resumed"], true);
+    // Publish while replay is in progress, proving the history/live boundary.
+    bus.publish(sample_spot());
+    for seq in 4..=7 {
+        let v = next_ws(&mut ws).await;
+        assert_eq!(v["seq"], seq);
+        if seq == 5 {
+            assert_eq!(v["kind"], "spotGrade");
+        }
+    }
+    assert!(tokio::time::timeout(Duration::from_millis(100), ws.next())
+        .await
+        .is_err());
+    assert_eq!(
+        scraped(
+            &metrics,
+            "manta_json_stream_resumes_total{outcome=\"resumed\"}"
+        ),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_resume_after_a_restart_is_not_resumed_and_replays_the_new_session() {
+    let a = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 1));
+    for _ in 0..5 {
+        a.publish(sample_spot());
+    }
+    let (addr_a, _, _, _a_shutdown) = spawn_server_with_bus(Duration::from_secs(5), None, a).await;
+    let (_, old) = connect_ws(format!("ws://{addr_a}")).await.unwrap();
+    let b = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 2));
+    for _ in 0..2 {
+        b.publish(sample_spot());
+    }
+    let (addr, _, metrics, _shutdown) =
+        spawn_server_with_bus(Duration::from_secs(5), None, b).await;
+    let (mut ws, hello) = connect_ws(format!(
+        "ws://{addr}/?session={}&since={}",
+        old["session"].as_str().unwrap(),
+        old["seq"]
+    ))
+    .await
+    .unwrap();
+    assert_eq!(hello["session"], "2");
+    assert_eq!(hello["seq"], 2);
+    assert_eq!(hello["historyFrom"], 1);
+    assert_eq!(hello["resumed"], false);
+    for seq in 1..=2 {
+        assert_eq!(next_ws(&mut ws).await["seq"], seq);
+    }
+    assert_eq!(
+        scraped(
+            &metrics,
+            "manta_json_stream_resumes_total{outcome=\"reset\"}"
+        ),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_resume_older_than_the_window_reports_a_gap() {
+    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0).with_history_minutes(0));
+    for _ in 0..63 {
+        bus.publish(sample_spot());
+    }
+    let (addr, _, metrics, _shutdown) =
+        spawn_server_with_bus(Duration::from_secs(5), None, bus).await;
+    let (mut ws, hello) = connect_ws(format!("ws://{addr}/?session=0&since=3"))
+        .await
+        .unwrap();
+    assert_eq!(hello["resumed"], false);
+    assert_eq!(hello["historyFrom"], 14);
+    for seq in 14..=63 {
+        assert_eq!(next_ws(&mut ws).await["seq"], seq);
+    }
+    assert_eq!(
+        scraped(&metrics, "manta_json_stream_resumes_total{outcome=\"gap\"}"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_resume_with_a_since_ahead_of_the_session_resets() {
+    let (addr, bus, metrics, _shutdown) = spawn_server().await;
+    bus.publish(sample_spot());
+    let (mut ws, hello) = connect_ws(format!("ws://{addr}/?session=0&since=11"))
+        .await
+        .unwrap();
+    assert_eq!(hello["resumed"], false);
+    assert_eq!(next_ws(&mut ws).await["seq"], 1);
+    assert_eq!(
+        scraped(
+            &metrics,
+            "manta_json_stream_resumes_total{outcome=\"reset\"}"
+        ),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_resume_at_the_newest_seq_replays_nothing() {
+    let (addr, bus, _, _shutdown) = spawn_server().await;
+    bus.publish(sample_spot());
+    let (mut ws, hello) = connect_ws(format!("ws://{addr}/?session=0&since=1"))
+        .await
+        .unwrap();
+    assert_eq!(hello["resumed"], true);
+    bus.publish(sample_spot());
+    assert_eq!(next_ws(&mut ws).await["seq"], 2);
+}
+
+#[tokio::test]
+async fn a_malformed_since_is_rejected_with_400() {
+    let (addr, _, metrics, _shutdown) = spawn_server().await;
+    match tokio_tungstenite::connect_async(format!("ws://{addr}/?since=abc")).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => {
+            assert_eq!(r.status(), 400);
+            assert_eq!(
+                r.body().as_deref(),
+                Some(b"since must be a whole number".as_slice())
+            );
+        }
+        other => panic!("expected HTTP 400, got {other:?}"),
+    }
+    assert_eq!(
+        scraped(
+            &metrics,
+            "manta_json_stream_resumes_total{outcome=\"invalid\"}"
+        ),
+        1
+    );
+}
+
+#[tokio::test]
+async fn resume_requests_over_the_per_ip_budget_get_429() {
+    let (addr, _, metrics, _shutdown) = spawn_server().await;
+    for _ in 0..30 {
+        let (mut ws, _) = connect_ws(format!("ws://{addr}/?session=0&since=0"))
+            .await
+            .unwrap();
+        ws.close(None).await.unwrap();
+    }
+    match tokio_tungstenite::connect_async(format!("ws://{addr}/?session=0&since=0")).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => assert_eq!(r.status(), 429),
+        other => panic!("expected HTTP 429, got {other:?}"),
+    }
+    assert_eq!(
+        scraped(
+            &metrics,
+            "manta_json_stream_resumes_total{outcome=\"refused\"}"
+        ),
+        1
+    );
+    connect_ws(format!("ws://{addr}")).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_shutdown_mid_replay_accounts_for_every_replay_record() {
+    let (addr, bus, metrics, shutdown) = spawn_server().await;
+    for _ in 0..5000 {
+        bus.publish(sample_spot());
+    }
+    let (mut ws, hello) = connect_ws(format!("ws://{addr}/?session=0&since=0"))
+        .await
+        .unwrap();
+    assert_eq!(hello["seq"], 5000);
+    shutdown.send(true).unwrap();
+    let mut received = 0;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(Ok(frame)) = ws.next().await {
+            if let Ok(text) = frame.to_text() {
+                let v: serde_json::Value = serde_json::from_str(text).unwrap();
+                assert_eq!(v["seq"], received + 1);
+                received += 1;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        received + scraped(&metrics, "manta_json_stream_replay_abandoned_total"),
+        5000
+    );
+}
+
+#[tokio::test]
+async fn raw_tcp_connections_never_replay() {
+    let (addr, bus, _, _shutdown) = spawn_server().await;
+    for _ in 0..3 {
+        bus.publish(sample_spot());
+    }
+    let (mut tcp, hello) = connect_tcp(addr).await;
+    assert_eq!(hello["seq"], 3);
+    assert_eq!(hello["resumed"], false);
+    bus.publish(sample_spot());
+    assert_eq!(next_tcp(&mut tcp).await["seq"], 4);
 }

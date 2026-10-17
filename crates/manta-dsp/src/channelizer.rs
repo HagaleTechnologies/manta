@@ -2,10 +2,11 @@
 //! N-channel successor to the M0 single-channel shim (`single.rs`).
 
 use crate::proto::{design_prototype, TAPS_PER_BRANCH};
+use crate::sample_guard;
 use coppa_dsp::fft::FftProcessor;
 use num_complex::{Complex32, Complex64};
 
-const CHANNEL_SPACING_HZ: f64 = 93.75; // SPEC §1.1
+pub const CHANNEL_SPACING_HZ: f64 = 93.75; // SPEC §1.1
 /// SPEC §1.3/§1.4 power-to-dB epsilon.
 const POWER_DB_EPSILON: f64 = 1e-20;
 
@@ -25,6 +26,36 @@ pub struct HopOutput {
 /// `PdB = 10*log10(P + epsilon)`, SPEC §1.3/§1.4's epsilon = 1e-20.
 pub fn power_db(power: f32) -> f64 {
     10.0 * (power as f64 + POWER_DB_EPSILON).log10()
+}
+
+/// SPEC §1.3 step 2's circular rotation (`r = (m*hop) mod N`, `hop = N/4`)
+/// leaves a residual checkerboard sign artifact on `HopOutput::x[k]`: odd
+/// channels at odd hops come out negated relative to what a phase-
+/// continuous baseband signal would read, `(-1)^(m*k)`. Magnitude-only
+/// consumers (`power = |X[k]|^2`, everything before MAN-168) are
+/// invariant to this and never needed to correct it. A consumer working
+/// with the complex spectrum directly (MAN-168's narrowband refiner,
+/// which derotates and lowpass-filters `x[k]` and so needs a genuinely
+/// phase-continuous input) must multiply `x[k]` by this factor first.
+///
+/// Found by Codex review on PR #161's MAN-168 wiring (a probe using the
+/// real channelizer + refiner measured ~39 dB of spurious attenuation on
+/// one specific odd channel). The exact form here was verified
+/// empirically, not hand-derived from the rotation step's DFT shift
+/// theorem (an initial `exp(-j*2*pi*k*r/N)` derivation, mathematically
+/// plausible for an abstract circular shift, measured identical -- and
+/// still wrong -- results for both candidate signs; the real artifact
+/// turned out to be this much simpler period-2 real sign flip). Confirmed
+/// against both 96 kHz/1024-channel and 192 kHz/2048-channel
+/// configurations, multiple even/odd channel pairs, and both a centered
+/// and a fractionally-offset tone: after this correction, an odd
+/// channel's refined output exactly matches an even channel's.
+pub fn odd_channel_sign_correction(hop_m: u64, k: usize) -> f32 {
+    if hop_m % 2 == 1 && k % 2 == 1 {
+        -1.0
+    } else {
+        1.0
+    }
 }
 
 /// Per-hop fine-frequency interpolation (SPEC §1.4): quadratic
@@ -62,6 +93,9 @@ pub struct Channelizer {
     m: u64,
     fs: f64,
     center_freq_hz: f64,
+    /// MAN-234: input samples `process` replaced with silence since
+    /// construction.
+    bad_samples: u64,
 }
 
 impl Channelizer {
@@ -85,6 +119,7 @@ impl Channelizer {
             m: 0,
             fs,
             center_freq_hz,
+            bad_samples: 0,
         })
     }
 
@@ -113,9 +148,21 @@ impl Channelizer {
         self.center_freq_hz + signed * delta
     }
 
+    /// Input samples `process` has replaced with silence since construction
+    /// because a component was NaN, infinite or beyond
+    /// `sample_guard::MAX_SAMPLE_MAGNITUDE`. SPEC §1.3 step 0 (MAN-234).
+    pub fn bad_samples(&self) -> u64 {
+        self.bad_samples
+    }
+
     /// Feed input IQ; returns however many hops became available. SPEC §1.3.
+    /// Step 0 (MAN-234): an unusable sample (`sample_guard::is_usable`) is
+    /// replaced with `0+0j` as it enters the window and counted in
+    /// `bad_samples`; usable samples are never written.
     pub fn process(&mut self, iq: &[Complex32]) -> Vec<HopOutput> {
+        let start = self.buf.len();
         self.buf.extend_from_slice(iq);
+        self.bad_samples += sample_guard::replace_unusable(&mut self.buf[start..]);
         let ln = self.taps.len();
         let mut outputs = Vec::new();
         while self.read + ln <= self.buf.len() {
@@ -312,6 +359,101 @@ mod tests {
         }
     }
 
+    fn assert_hops_bitwise_equal(a: &[HopOutput], b: &[HopOutput]) {
+        assert_eq!(a.len(), b.len());
+        for (ha, hb) in a.iter().zip(b.iter()) {
+            assert_eq!(ha.m, hb.m);
+            for (xa, xb) in ha.x.iter().zip(hb.x.iter()) {
+                assert_eq!(xa.re.to_bits(), xb.re.to_bits());
+                assert_eq!(xa.im.to_bits(), xb.im.to_bits());
+            }
+            for (pa, pb) in ha.power.iter().zip(hb.power.iter()) {
+                assert_eq!(pa.to_bits(), pb.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn a_bad_sample_is_replaced_before_it_reaches_any_hop() {
+        // MAN-234: one NaN mid-stream must not reach channel power.
+        let mut iq = tone(6_000.0, 20_000, 1.0, FS);
+        iq[9_000].re = f32::NAN;
+        let mut ch = Channelizer::new(FS, 0.0).unwrap();
+        let hops = ch.process(&iq);
+        assert!(!hops.is_empty());
+        for hop in &hops {
+            assert!(hop.power.iter().all(|p| p.is_finite()), "hop {}", hop.m);
+        }
+        assert_eq!(ch.bad_samples(), 1);
+    }
+
+    #[test]
+    fn a_bad_sample_produces_the_same_hops_as_silence() {
+        // MAN-234 D3: the replacement is exactly `0+0j`, so a bad sample's
+        // hops equal those of the same input with that sample zeroed.
+        let clean = tone(6_000.0, 20_000, 1.0, FS);
+        let mut zeroed = clean.clone();
+        zeroed[9_000] = Complex32::new(0.0, 0.0);
+        for bad in [f32::INFINITY, f32::MAX] {
+            let mut corrupt = clean.clone();
+            corrupt[9_000].re = bad;
+            let mut ch_bad = Channelizer::new(FS, 0.0).unwrap();
+            let mut ch_zero = Channelizer::new(FS, 0.0).unwrap();
+            let hops_bad = ch_bad.process(&corrupt);
+            let hops_zero = ch_zero.process(&zeroed);
+            assert_hops_bitwise_equal(&hops_bad, &hops_zero);
+            assert_eq!(ch_bad.bad_samples(), 1);
+            assert_eq!(ch_zero.bad_samples(), 0);
+        }
+    }
+
+    #[test]
+    fn bad_samples_accumulate_across_process_calls() {
+        let mut a = tone(6_000.0, 5_000, 1.0, FS);
+        let mut b = tone(6_000.0, 5_000, 1.0, FS);
+        a[100].im = f32::NAN;
+        b[4_000].re = f32::NEG_INFINITY;
+        let mut ch = Channelizer::new(FS, 0.0).unwrap();
+        ch.process(&a);
+        assert_eq!(ch.bad_samples(), 1);
+        ch.process(&b);
+        assert_eq!(ch.bad_samples(), 2);
+
+        // One bad sample whose chunk is split across a call boundary is
+        // counted once, and the samples already in the window are not
+        // re-checked or re-counted.
+        let mut whole = tone(6_000.0, 20_000, 1.0, FS);
+        whole[10_000].re = f32::NAN;
+        let mut split = Channelizer::new(FS, 0.0).unwrap();
+        split.process(&whole[..9_999]);
+        split.process(&whole[9_999..10_002]);
+        split.process(&whole[10_002..]);
+        assert_eq!(split.bad_samples(), 1);
+    }
+
+    #[test]
+    fn full_scale_bound_keeps_every_power_finite() {
+        // MAN-234 D2: at the bound, DC (coherent worst case) and
+        // alternating-sign input keep every channel power finite.
+        let b = sample_guard::MAX_SAMPLE_MAGNITUDE;
+        let mut ch = Channelizer::new(FS, 0.0).unwrap();
+        let len = ch.filter_len() * 2;
+        let dc = vec![Complex32::new(b, b); len];
+        let alt: Vec<Complex32> = (0..len)
+            .map(|i| {
+                let v = if i % 2 == 0 { b } else { -b };
+                Complex32::new(v, -v)
+            })
+            .collect();
+        let mut hops = ch.process(&dc);
+        hops.extend(ch.process(&alt));
+        assert!(!hops.is_empty());
+        for hop in &hops {
+            assert!(hop.power.iter().all(|p| p.is_finite()), "hop {}", hop.m);
+        }
+        assert_eq!(ch.bad_samples(), 0);
+    }
+
     #[test]
     fn interpolate_offset_finds_symmetric_peak_at_zero() {
         // A true local max with equal neighbors -> delta = 0.
@@ -343,5 +485,50 @@ mod tests {
         // genuine valley is the unambiguous "no local max" case.
         // denom = db(0.5) - 2*db(0.1) + db(0.5) ~= 13.98 >= 0 -> unusable.
         assert_eq!(interpolate_offset(0.5, 0.1, 0.5), None);
+    }
+
+    #[test]
+    fn odd_channel_sign_correction_recovers_a_phase_continuous_odd_channel_tone() {
+        // Codex review, PR #161's MAN-168: a centered tone on an odd
+        // channel comes out of the channelizer with a spurious per-hop
+        // sign flip (`(-1)^(m*k)`) that a magnitude-only consumer never
+        // noticed; a consumer using the complex spectrum directly (the
+        // narrowband refiner) sees severe self-cancellation without this
+        // correction. Verify the corrected odd channel matches an even
+        // channel's amplitude exactly, using the real channelizer.
+        use crate::refine::Refiner;
+        let fs = 96_000.0;
+        let mean = |k: usize, corrected: bool| -> f32 {
+            let mut ch = Channelizer::new(fs, 0.0).unwrap();
+            let freq_hz = ch.channel_freq_hz(k);
+            let sig = tone(freq_hz, 60_000, 1.0, fs);
+            let hops = ch.process(&sig);
+            let mut r = Refiner::new(30.0, 0.0);
+            let mut sum = 0.0f32;
+            let mut count = 0u32;
+            for h in hops.iter().skip(20) {
+                let x = if corrected {
+                    h.x[k] * odd_channel_sign_correction(h.m, k)
+                } else {
+                    h.x[k]
+                };
+                sum += r.push(x);
+                count += 1;
+            }
+            sum / count as f32
+        };
+        let even_amp = mean(64, true);
+        let odd_uncorrected = mean(65, false);
+        let odd_corrected = mean(65, true);
+        assert!(
+            odd_uncorrected < even_amp * 0.5,
+            "sanity: an uncorrected odd channel must show real self-cancellation, got \
+             odd={odd_uncorrected} even={even_amp}"
+        );
+        assert!(
+            (odd_corrected - even_amp).abs() < 1e-3,
+            "corrected odd channel must match the even channel's amplitude exactly, got \
+             odd_corrected={odd_corrected} even={even_amp}"
+        );
     }
 }

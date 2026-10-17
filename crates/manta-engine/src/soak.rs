@@ -2,24 +2,30 @@
 //! panic and bounded memory growth. ROADMAP M1 accept criterion; reused by
 //! M2/M3's longer soaks (design doc §7).
 //!
-//! Deviation from the design doc: input-overrun tracking is NOT
+//! Deviation from the design doc: input-*ring*-overrun tracking is NOT
 //! implemented. coppa-audio's CpalSource doesn't expose its internal
 //! ring's overflow_count() publicly, and file-replay sources (what this
 //! harness runs against in CI) have no ring and cannot overrun by
 //! construction. Live-hardware overrun observability needs a coppa-audio
-//! API addition -- a real upstream ask, not made unilaterally here.
+//! API addition -- a real upstream ask, not made unilaterally here. This
+//! is a different, still-open gap from MAN-56 (closed 2026-09-04), which
+//! wired HPSDR's wire-level UDP packet loss/malformed-datagram counters
+//! (`manta_input::InputHealthCounters`) into manta-server's Prometheus
+//! endpoint -- lost/rejected datagrams before demux, not ring
+//! backpressure after it.
 
-use crate::{listen, PipelineConfig};
+use crate::{listen_with_observers, ListenObservers, PipelineConfig};
 use anyhow::Result;
 use manta_input::IqSource;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+// MAN-236: shared with soak_metrics.rs, including the peak-RSS helper below.
 /// Growth in peak RSS beyond this, after the warm-up window, fails the soak.
-const RSS_GROWTH_LIMIT_BYTES: u64 = 200 * 1024 * 1024; // 200 MiB
-const WARMUP: Duration = Duration::from_secs(10);
+pub(crate) const RSS_GROWTH_LIMIT_BYTES: u64 = 200 * 1024 * 1024; // 200 MiB
+pub(crate) const WARMUP: Duration = Duration::from_secs(10);
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
@@ -27,12 +33,15 @@ pub struct SoakReport {
     pub events_emitted: usize,
     pub rss_growth_bytes: u64,
     pub panicked: bool,
+    /// MAN-234: input samples replaced with silence because a component
+    /// was NaN, infinite or beyond `MAX_SAMPLE_MAGNITUDE` (SPEC §1.3 step 0).
+    pub bad_samples: u64,
 }
 
 // Windows has no libc::rusage/getrusage (POSIX-only) -- see this crate's
 // Cargo.toml for why windows-sys is target-gated in as the equivalent.
 #[cfg(unix)]
-fn peak_rss_bytes() -> u64 {
+pub(crate) fn peak_rss_bytes() -> u64 {
     unsafe {
         let mut usage: libc::rusage = std::mem::zeroed();
         libc::getrusage(libc::RUSAGE_SELF, &mut usage);
@@ -46,7 +55,7 @@ fn peak_rss_bytes() -> u64 {
 }
 
 #[cfg(windows)]
-fn peak_rss_bytes() -> u64 {
+pub(crate) fn peak_rss_bytes() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{
         GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
@@ -99,11 +108,16 @@ pub fn soak(
         stop_watchdog.store(true, Ordering::Relaxed);
     });
 
+    let bad_samples = Arc::new(AtomicU64::new(0));
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        listen(
+        listen_with_observers(
             src,
             cfg,
             stop.clone(),
+            ListenObservers {
+                bad_samples: Some(bad_samples.clone()),
+                ..Default::default()
+            },
             |_ev| {
                 event_count += 1;
                 if start.elapsed() >= WARMUP {
@@ -112,6 +126,7 @@ pub fn soak(
                 }
             },
             |_spot| {},
+            |_| {},
         )
     }));
     let _ = watchdog.join();
@@ -126,6 +141,7 @@ pub fn soak(
         events_emitted: event_count,
         rss_growth_bytes: worst_growth,
         panicked,
+        bad_samples: bad_samples.load(Ordering::Relaxed),
     })
 }
 
@@ -159,6 +175,35 @@ mod tests {
         let report = soak(src, &PipelineConfig::default(), Duration::from_secs(1)).unwrap();
         assert!(!report.panicked);
         assert!(soak_passed(&report));
+    }
+
+    /// MAN-254: a source that ends before `duration` does not end the
+    /// soak -- the watchdog is joined before the result is read, so even
+    /// listen's immediate "ended during startup calibration" error waits
+    /// out `duration`. `manta soak --help` promises exactly this; change
+    /// this test and that help together.
+    #[test]
+    fn soak_waits_out_its_duration_after_the_source_ends() {
+        let fs = manta_input::TARGET_RATE_HZ;
+        let src: Box<dyn manta_input::IqSource> = Box::new(
+            AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(
+                vec![0.0f32; fs as usize / 2],
+                fs,
+            )))
+            .unwrap(),
+        );
+        let duration = Duration::from_secs(2);
+        let start = Instant::now();
+        let err = soak(src, &PipelineConfig::default(), duration).unwrap_err();
+        assert!(
+            err.to_string().contains("startup calibration"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            start.elapsed() >= duration,
+            "soak() returned after {:?}, before its {duration:?}",
+            start.elapsed()
+        );
     }
 
     /// MAN-29 review round 2: an invalid `freq_correction_ppm` must fail

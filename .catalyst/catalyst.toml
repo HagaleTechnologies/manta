@@ -1,0 +1,50 @@
+#:schema https://staging.catalystcloud.dev/schemas/catalyst.schema.json
+
+[project]
+linear_team = "MAN"
+
+# Mirrors .github/workflows/ci-full.yml and rust-toolchain.toml. CI builds and
+# tests with no environment variables, so none are declared. The soapy feature
+# leg (extra SDR system packages) is not part of verify; HPSDR runs in the default gate.
+
+[[environment.toolchains]]
+name = "rust"
+# Catalyst's runner can't install Rust, so this must equal the image's exact
+# 1.98.0 (a short "1.98" is undocumented); rust-toolchain.toml pins the same
+# release (MAN-242), so no second toolchain is downloaded.
+version = "1.98.0"
+
+[[environment.system_packages]]
+name = "libasound2-dev"
+
+[[environment.setup]]
+name = "fetch-dependencies"
+run = ["cargo", "fetch", "--locked"]
+cache_key_files = ["Cargo.lock"]
+
+[[environment.verify]]
+name = "check-toolchain-pin"
+run = ["bash", "scripts/check-rust-toolchain-pin.sh"]
+timeout_seconds = 300
+
+[[environment.verify]]
+name = "check-format"
+run = ["cargo", "fmt", "--all", "--check"]
+timeout_seconds = 300
+
+[[environment.verify]]
+name = "clippy"
+run = ["cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"]
+timeout_seconds = 3000
+
+[[environment.verify]]
+name = "test-workspace"
+run = ["cargo", "test", "--workspace", "--locked"]
+timeout_seconds = 3300
+
+# MAN-240: the Dependabot diff verifier's tests, as in ci-full.yml's test job. The image's
+# python3 (3.12 when checked) is not pinned to auto-merge's 3.13; the verifier needs 3.11+.
+[[environment.verify]]
+name = "test-dependabot-verifier"
+run = ["python3", "-m", "unittest", "scripts.tests.test_verify_dependabot_diff_safe", "-v"]
+timeout_seconds = 300
