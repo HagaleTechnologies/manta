@@ -113,7 +113,7 @@ input (RTL-SDR, Airspy, SDRplay, HackRF), built and tested on Ubuntu
 that library and your receiver's SoapySDR module first. The archive
 bundles neither the vendor API nor driver modules. On other Linux systems,
 use `manta-linux-x86_64.tar.gz`, or [build from source](#build-from-source)
-with `--features hpsdr,soapy`.
+with `--features soapy`.
 
 ```sh
 sudo apt-get update
@@ -130,10 +130,10 @@ cd manta-linux-x86_64-soapy
 `apt-get` and `curl` print their usual, host-dependent output. The
 checksum command prints `manta-linux-x86_64-soapy.tar.gz: OK` when only
 this archive is present. `./manta --version` shows the release's
-version and build ID, and both features:
+version, build ID and selected Cargo feature:
 
 ```text
-manta 0.1.0 (git <build-id>; features: hpsdr,soapy)
+manta 0.1.0 (git <build-id>; features: soapy)
 ```
 
 The example installs the RTL-SDR module. Install your receiver's module
@@ -199,17 +199,20 @@ before compiling anything.
 ```sh
 git clone https://github.com/HagaleTechnologies/manta
 cd manta
-cargo install --path crates/manta-cli --features hpsdr
+cargo install --path crates/manta-cli
 ```
 
 That puts a `manta` binary in Cargo's bin directory (`~/.cargo/bin`
 unless you moved `CARGO_HOME`), which a standard Rust install already has
 on `PATH` — every command below assumes a bare `manta` resolves. To build
-without installing, `cargo build --release -p manta-cli --features hpsdr`
-leaves the binary at `target/release/manta`; run that path instead. Carry
-the `--features hpsdr` across: drop it and the binary has no `--hpsdr-host`
-flag at all, so it no longer matches the install above or the HPSDR row in
-the Inputs table below.
+without installing, `cargo build --release -p manta-cli`
+leaves the binary at `target/release/manta`; run that path instead.
+
+HPSDR input is included in every build and needs no native radio library.
+The `hpsdr` Cargo feature remains accepted for compatibility and has no
+effect on input support. `--version` lists selected Cargo features, so
+`features: none` still includes HPSDR. SoapySDR remains optional; build it
+with `--features soapy` after installing its native library.
 
 ### Docker
 
@@ -270,16 +273,12 @@ pages into `<dir>`.
   truncated silently. Use the same 60 s for `--stop-timeout` on `docker
   run`, `stop_grace_period` on Compose, and `terminationGracePeriodSeconds`
   on Kubernetes.
-- Input backends are cargo features, and a build that did not ask for
-  one has no flags for it — `--hpsdr-host` / `--soapy-driver` fail with
-  `error: unexpected argument` on a build without them. `hpsdr`
-  (OpenHPSDR/Hermes) has no native dependency, which is why the install
-  line above turns it on. `soapy` (RTL-SDR, Airspy, SDRplay, HackRF via
-  SoapySDR) is in the `manta-linux-x86_64-soapy.tar.gz` release archive
-  for Ubuntu 24.04 x86_64 (see [SoapySDR on Linux
+- SoapySDR is optional. A build without `soapy` rejects `--soapy-driver`
+  with `error: unexpected argument`. SoapySDR support for RTL-SDR, Airspy,
+  SDRplay and HackRF is in the `manta-linux-x86_64-soapy.tar.gz` release
+  archive for Ubuntu 24.04 x86_64 (see [SoapySDR on Linux
   x86_64](#soapysdr-on-linux-x86_64)). To build it yourself, install the
-  native SoapySDR development library first, then add it:
-  `--features hpsdr,soapy`.
+  native SoapySDR development library first, then use `--features soapy`.
 - Windows binaries from the release workflow link the MSVC runtime
   statically, so they need no Visual C++ Redistributable. A Windows build
   from source links it dynamically unless you set
@@ -616,8 +615,8 @@ JSON Lines) is unchanged.
 | IQ / audio WAV file | `decode`, `listen --source` (`--dial-freq-hz` sets absolute frequencies for audio files) | Working (`decode` takes IQ; `listen --source` takes 48 kHz mono audio, or raw complex IQ with `--source-iq`). IQ is never resampled: the rate must be one the channelizer supports (`fs / 93.75` a power of two — commonly 24, 48, 96, 192, 384, 768 kS/s, but the rule decides, not that list), and `--capture-rate-hz` only decimates from one of those to a lower one |
 | Sound card (rig audio passband) | `listen --device`, `--dial-freq-hz` for absolute frequencies | Working, 48 kHz input only |
 | KiwiSDR over the network | `listen --kiwi-host` — any receiver from the public directory at <https://kiwisdr.com/public/> | Working |
-| OpenHPSDR / Hermes (Hermes-Lite 2, Red Pitaya, QMTech) | `listen --hpsdr-host`, feature `hpsdr` — on in the install line above, no native dependency | Working; protocol verified against reference sources, not yet against hardware |
-| RTL-SDR, Airspy, SDRplay, HackRF, anything SoapySDR drives | `listen --soapy-driver`, feature `soapy` — in the `manta-linux-x86_64-soapy.tar.gz` release archive ([SoapySDR on Linux x86_64](#soapysdr-on-linux-x86_64)), **not** in the other archives or the install line above; from source, needs the SoapySDR system library, then `--features hpsdr,soapy` | Working, needs hardware soak |
+| OpenHPSDR / Hermes (Hermes-Lite 2, Red Pitaya, QMTech) | `listen --hpsdr-host`, included in every build, no native radio dependency | Working; protocol verified against reference sources, not yet against hardware |
+| RTL-SDR, Airspy, SDRplay, HackRF, anything SoapySDR drives | `listen --soapy-driver`, feature `soapy` — in the `manta-linux-x86_64-soapy.tar.gz` release archive ([SoapySDR on Linux x86_64](#soapysdr-on-linux-x86_64)), **not** in the other archives or the install line above; from source, needs the SoapySDR system library, then `--features soapy` | Working, needs hardware soak |
 | ka9q-radio (radiod) multicast IQ channel: RX-888, Airspy, anything radiod drives | `listen --ka9q-group`; no build feature | Working; protocol checked against ka9q-radio's docs and headers, not yet against a live radiod |
 
 The source frequency and rate flags end in `-hz`: `--kiwi-freq-hz`,
@@ -642,7 +641,7 @@ indexes. `devices` lists input-capable devices without opening a stream. From
 the `manta-linux-x86_64-soapy.tar.gz` archive or a `--features soapy` build,
 it also lists complete Soapy selector strings for `--soapy-driver`; any other
 binary says where to get one. HPSDR discovery is not supported; use `--hpsdr-host HOST`
-with an `hpsdr` build. KiwiSDR uses `--kiwi-host HOST`. ka9q-radio uses
+in any build. KiwiSDR uses `--kiwi-host HOST`. ka9q-radio uses
 `--ka9q-group GROUP`, the data group of a radiod IQ channel;
 `avahi-browse -rt _rtp._udp` lists them. `devices --json` reports
 empty, unavailable and failed enumeration separately; a backend error exits 1
@@ -737,7 +736,10 @@ the live-state stream only if it sets `[server].live_port`.
 
 `run` (alias `listen`) prints a `SPOT:` line on stdout for each confirmed
 spot, and decoded text on stderr, one line per track labelled with its track
-number, frequency and speed. With a `[server]` table the decoded text is off
+number, frequency and speed. A `SPOT:` line ends with ` rst=599` when its
+track decoded a signal report and ` QRL?` when the station asked whether the
+frequency is in use; the JSON stream carries both as `rst`/`qrlQuery` (see
+[docs/SPOT-SCHEMA.md](docs/SPOT-SCHEMA.md)). With a `[server]` table the decoded text is off
 unless you pass `--decoded-text`, so a service log holds spots and diagnostics
 only. Startup messages, warnings and errors also go to stderr, so the two
 streams can be captured separately:

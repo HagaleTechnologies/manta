@@ -185,15 +185,7 @@ fn guide_configs_load() {
             let out = check_config(&config);
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
-            if config["input"]["type"].as_str() == Some("hpsdr") && !cfg!(feature = "hpsdr") {
-                assert_eq!(out.status.code(), Some(1), "{guide}: {stdout}\n{stderr}");
-                assert!(
-                    stderr.contains("needs a manta built with --features hpsdr"),
-                    "{guide}: {stderr}"
-                );
-            } else {
-                assert_eq!(out.status.code(), Some(0), "{guide}: {stdout}\n{stderr}");
-            }
+            assert_eq!(out.status.code(), Some(0), "{guide}: {stdout}\n{stderr}");
             checked += 1;
         }
     }

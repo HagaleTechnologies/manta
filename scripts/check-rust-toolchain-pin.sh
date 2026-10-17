@@ -13,7 +13,7 @@
 #
 # Deliberately needs NO network and NO jq -- unlike
 # scripts/check-dependabot-cargo-unlock.sh, so it IS wired into required CI
-# (.github/workflows/ci.yml, `test` job). Runs identically on ubuntu-latest and
+# (.github/workflows/ci-full.yml, `test` job). Runs identically on ubuntu-latest and
 # macos-latest: BRE sed and awk only, no `sort -V` (not portable to BSD sort).
 #
 # See docs/DECISIONS/2026-09-04-man36-exact-rust-toolchain-pin.md.

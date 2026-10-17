@@ -35,10 +35,15 @@ marked **(research-dependent)** are the only intentionally open questions.
                         tcp/ws :7301 (JSON Lines spot stream → cqdx)
 ```
 
-Data flows one direction. Every stage is a bounded-queue actor on the tokio
-runtime except the channelizer and decoders, which run on dedicated
-compute threads fed by lock-free SPSC rings (`rtrb`, same as coppa-audio) —
-IQ never touches the async runtime.
+Data flows one direction. As built, every stage from the source read to the
+validator runs synchronously on one decode thread (live audio's capture
+callback fills coppa-audio's ring on cpal's own thread before that read;
+§10). The decoder pool is a
+rayon pass joined before the next batch, tokio serves sockets only, and the
+two meet through a non-blocking broadcast send and shared atomics or
+short-held locks, never an await, so IQ never touches the async runtime.
+§10 has the detail, and marks the ring-and-thread design as a target, not
+built.
 
 ## 2. Workspace layout
 
@@ -65,12 +70,14 @@ manta/
 Dependency graph (arrows = depends on):
 
 ```
-manta-cli ──▶ manta-engine ──▶ manta-input ──▶ manta-dsp
+manta-cli ──▶ manta-engine ──▶ manta-input ──▶ manta-dsp, coppa-audio
         │            │        ├──▶ manta-dsp ──────▶ coppa-dsp
         │            │        ├──▶ manta-decode
         │            │        └──▶ manta-spot ──────▶ manta-decode
-        └──────────────────▶ manta-server
-manta-testkit ──▶ manta-dsp, manta-decode, coppa-channel
+        ├──────────────────▶ manta-server ──▶ manta-spot
+        └──────────────────▶ manta-decode, manta-input, manta-spot,
+                             manta-testkit, coppa-audio
+manta-testkit ──▶ manta-dsp, manta-decode, manta-input, coppa-channel
 manta-soak-harness ──▶ manta-dsp, manta-input, manta-engine, manta-testkit
 ```
 
@@ -78,6 +85,10 @@ M1 added `manta-input → manta-dsp` (the shared Hilbert transformer, used
 by both `AudioIqSource` and `manta-testkit`'s Watterson vector rendering)
 and `manta-testkit → coppa-channel` (Watterson fading, see the M1
 pinned-decisions doc).
+
+The graph shows `[dependencies]` only; dev-only edges (for example
+`manta-cli → manta-dsp` and `manta-engine → manta-testkit`) are test
+fixtures and left out.
 
 ### Reused from coppa vs. new
 
@@ -111,9 +122,9 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
   8-bit), Airspy HF+ (768 kS/s, the reference device), SDRplay. Runtime device
   selection by driver string. Feature-gating keeps the core buildable without the
   native SoapySDR library (CI, contributors without hardware).
-- **OpenHPSDR/Hermes** (Protocol 1 "Metis" over UDP, feature-gated `hpsdr`):
+- **OpenHPSDR/Hermes** (Protocol 1 "Metis" over UDP, in every build):
   Hermes-Lite 2 and Pavel Demin's Red Pitaya and QMTech images. Pure UDP/std with
-  no native-library dependency; the gate mirrors `soapy`. The wire facts are
+  no native-library dependency. The wire facts are
   spike-pinned (`docs/DECISIONS/2026-09-02-hpsdr-hermes-protocol-spike.md`), not yet
   confirmed against live hardware.
 - **ka9q-radio (radiod) channel** (RTP over UDP multicast, no feature gate):
@@ -153,16 +164,19 @@ must itself satisfy the channelizer's `fs/93.75` table constraint.
 Motivated by live-hardware field evidence (2026-09-09) that a narrower
 capture bandwidth can improve real-signal detection on some hardware.
 
-All sources normalize to `Complex32` at the native rate into an `rtrb` ring;
-input overruns are counted, surfaced as metrics, and never block the SDR thread.
-This ring-overrun counting is still aspirational (`manta-engine::soak`'s module
-doc tracks the blocker: `coppa-audio::CpalSource` doesn't expose its ring's
-`overflow_count()` publicly). Distinct and already shipped (MAN-56): HPSDR's
-wire-level UDP packet loss/malformed-datagram counters
-(`manta_input::InputHealthCounters`, §8) reach the Prometheus `/metrics`
-endpoint today — a different layer (lost/rejected datagrams before demux, not
-ring backpressure after it), not a partial implementation of the ring gauge
-above.
+All sources normalize to `Complex32` at the native rate. The decode loop
+pulls them with a blocking `IqSource::read()` (§10); no manta crate puts a
+ring or an input thread between source and channelizer, so a slow batch
+delays the next read, and samples a device cannot buffer meanwhile are lost
+before manta sees them. The one ring on the input path is coppa-audio's `rtrb`
+ring behind `CpalSource`'s audio callback, and counting its overruns is still
+aspirational (`manta-engine::soak`'s module doc tracks the blocker:
+`coppa-audio::CpalSource` doesn't expose its ring's `overflow_count()`
+publicly). Distinct and already shipped (MAN-56): HPSDR's wire-level UDP
+packet loss/malformed-datagram counters (`manta_input::InputHealthCounters`,
+§8) reach the Prometheus `/metrics` endpoint today — a different layer
+(lost/rejected datagrams before demux, not ring backpressure after it), not a
+partial implementation of the ring gauge above.
 
 **Reconnect (MAN-73).** A live source's `IqSource::read()` can fail -- a
 stalled Kiwi socket, an HPSDR stall-escalation, a dropped audio device.
@@ -175,12 +189,15 @@ the current track segment and starting a fresh one with the sample clock
 advanced by the gap, so spot timestamps stay wall-clock-true with no
 audio spliced across the gap and no zero-fill (see
 `docs/DECISIONS/2026-10-05-man73-source-reconnect.md` for why zero-fill
-was rejected). File replay is exempt: its errors and EOF must reach
-`listen()` unchanged for byte-identical replay. Each reopen runs on its own
-short-lived `reopen-<kind>` thread, so a stop request during an outage
-abandons it and `read()` returns EOF within ~100 ms; the client drain,
-which starts only after `listen()` returns, therefore no longer waits for a
-stalled DNS lookup, connect or driver open (MAN-252).
+was rejected). A stop while the source is down (MAN-258) ends the stream
+with the outage still pending, so the open tracks close with the same
+outage teardown and no new segment starts. File replay is exempt: its
+errors and EOF must reach `listen()` unchanged for byte-identical replay.
+Each reopen runs on its own short-lived `reopen-<kind>` thread, so a stop
+request during an outage abandons it and `read()` returns EOF within
+~100 ms; the client drain, which starts only after `listen()` returns,
+therefore no longer waits for a stalled DNS lookup, connect or driver open
+(MAN-252).
 
 **Paced and looping replay (MAN-269).** File replay normally runs as fast
 as the machine decodes. `run --realtime` (`input.realtime`) wraps the file
@@ -331,6 +348,14 @@ transmission may never produce again).
    occurrence already evaluated as a Beacon before the guard appeared is
    not a loss and is not counted). Context
    determines spot type (CQ / DE / BEACON) — RBN spots carry this flag.
+
+   **Spot annotations (MAN-272).** Each completed word is also scanned for
+   an RST (the cut number `N` read as `9`, so `5NN` is `599`) and for
+   `QRL?` (`manta_spot::message`). A spot carries its track's latest report
+   and a sticky QRL? flag, read from the emitting track when the spot is
+   built. **Neither gates any validation step, and neither crosses a track
+   merge**: a merge loser's annotations end with its state, like its words.
+   See `docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md`.
 2. **Callsign plausibility**: structural grammar (prefix-digit-suffix, portable
    designators `/P /QRP /3`), which also rejects, by exact match, a fixed
    list of non-callsign CW conventions (`5NN`, `599`, `TEST`, `TU`, `QRZ`,
@@ -491,7 +516,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
 - **JSON Lines stream** (TCP and WebSocket, :7301): full-fidelity spot objects
   (adds confidence, track id, decoder text context). This is the cqdx ingest
   surface; schema published in `dispensa` as a JSON Schema contract alongside the
-  existing ecosystem contracts. Every spot carries a non-null, real `dxDxcc`/
+  existing ecosystem contracts. Each spot also carries `rst` (its track's most
+  recent RST, or `null`) and `qrlQuery` (the track sent `QRL?`), MAN-272's §6
+  annotations, ahead of dispensa; the telnet line and the RBN uplink do not
+  carry them. Every spot carries a non-null, real `dxDxcc`/
   `deDxcc` (an ADIF DXCC entity number, MAN-136) whenever the callsign
   resolves against `cty.dat`; when it doesn't, `dxDxcc`/`dxContinent`/
   `dxCqZone` (and their `de*` counterparts) carry named, out-of-domain
@@ -783,10 +811,13 @@ validation (MAN-28). Dedupe (step 5) still applies.
   (§3 — blocked on a `coppa-audio` API addition, `manta-engine::soak`'s documented
   deviation, a different gap from MAN-56's wire-level packet counters).
   The three `manta_input_*` series are published only for sources that
-  actually count wire-level packet loss (HPSDR and KiwiSDR — MAN-128
-  generalized MAN-56's gap-stat wiring to KiwiSDR's SND `seq` field;
-  soapy/audio report none) and are **absent**, not a frozen zero, for
-  every other source — "absent means not measured", so an operator never
+  actually count wire-level packet loss or driver overflow (HPSDR, KiwiSDR
+  (MAN-128's SND `seq` tracking), ka9q-radio (MAN-140) and SoapySDR, whose
+  driver overflow read errors each count one gap event — MAN-233; an
+  overflow flagged `SOAPY_SDR_END_ABRUPT` on a successful read is not
+  seen, and SoapySDR's `dropped_packets` stays 0 because an overflow
+  carries no lost-sample count) and are **absent**, not a frozen zero, for every other source
+  (audio) — "absent means not measured", so an operator never
   reads a placeholder as live data; the same distinction that motivated
   the `manta_active_tracks` caveat before it was populated.
 - **RBN comparison (MAN-301)**: `[rbn_compare]` is opt-in and disabled by
@@ -939,10 +970,95 @@ truth with realistic HF impairment already exists.**
 
 ## 10. Concurrency model
 
-- SDR/input thread → `rtrb` ring → **channelizer thread** (owns PFB, detector) →
-  per-track sample queues → **decoder pool** (rayon-style fixed worker pool,
-  tracks are work items; decoders are `Send` state machines, no shared state) →
-  crossbeam channel → **tokio runtime** (validator, servers, metrics, control).
-- Rationale: identical to coppa's proven audio/engine split — real-time DSP on
-  dedicated threads with lock-free handoff; everything with a socket lives in
-  async-land.
+**As built:** one decode thread, one rayon pass, tokio for sockets, and a
+non-blocking send plus shared atomics and short locks between them.
+
+- **Decode thread.** Every command that decodes runs the pipeline on its
+  calling thread; for `run` that is the process's main thread (`main` is not
+  async). `manta-engine::listen` reads up to 2048 samples with
+  `IqSource::read()`, runs `Channelizer::process` and
+  `TrackManager::process_hops`, feeds the batch's events to the validator,
+  and reads again. Validation runs on this thread.
+- **Decoder pool.** Inside `process_hops` the per-hop work (detector,
+  ownership, promotion, eviction) is sequential. Then one rayon parallel pass
+  on rayon's global pool drains each active track's `pending` buffer through
+  its decoder: tracks are work items, decoders are independent `Send` state
+  machines with no shared state. The pass is joined before `process_hops`
+  returns and its events are sequenced by `(sample_ts, track_id)` (SPEC §6
+  rule 6), so thread scheduling never reaches the output. `close_all` runs
+  the same pass at end of stream. `pending` is a per-track buffer on the
+  decode thread, not a cross-thread queue: a decoding track's buffer is
+  emptied every batch, and one still awaiting non-CW qualification (MAN-313)
+  keeps a bounded backlog until a decoder is leased, with hysteresis — once
+  it exceeds `MAX_UNQUALIFIED_BACKLOG` + `MAX_UNQUALIFIED_BACKLOG`/4
+  entries, the oldest are dropped back down to `MAX_UNQUALIFIED_BACKLOG`
+  (SPEC §2.8; at the default cap of 7500, a 9375-entry high-water mark).
+- **tokio.** `start_spot_server` builds its own multi-thread runtime for
+  telnet, JSON/WebSocket, metrics, the live-state stream, the RBN uplink and
+  the `[rbn_compare]` feed. Only `manta-cli` and `manta-server` depend on
+  tokio.
+- **Bridge.** The decode thread never awaits. Spots and live-state records
+  cross through `SpotBus` (§7): a short `std::sync::Mutex` section and a
+  `tokio::sync::broadcast` send, which does not block, so no subscriber
+  back-pressures the loop. A lagging telnet, JSON Lines or WebSocket client
+  is disconnected; the internal subscribers (the RBN uplink's forward loop
+  and `[rbn_compare]`) count the missed records and carry on. Counters and
+  gauges are atomics, plus short `Mutex` sections for RTTY marks and
+  per-band maps, that the decode thread writes: server tasks poll
+  `ListenObservers` every `ACTIVE_TRACKS_POLL_INTERVAL` (MAN-118 D6), and
+  `run`'s per-batch progress callback stores into the server's `Metrics`
+  directly.
+- **Other threads.** rayon's workers; watchdogs in `soak`, `soak_metrics` and
+  `doctor`; threads that put a timeout on one blocking call (doctor's checks,
+  the KiwiSDR connect, the list refresher's DNS lookup); and two background
+  threads that hand the validator new lists: `manta-reload` (SIGHUP, through
+  `OperatorListsUpdate`) and `manta-lists` (`[spot].refresh_lists`, through
+  `ReferenceLists`). The decode thread picks those up before it feeds the
+  validator its next event. During a live source's outage,
+  `ReconnectingSource` opens the replacement source on a short-lived
+  `reopen-<kind>` thread (MAN-252) while `read()` waits for it in slices,
+  checking the stop flag; a stop request mid-reopen returns EOF at once and
+  abandons the attempt, which then finishes on its own detached thread or
+  dies with the process. The reopen thread only opens the source; the
+  decode thread reads it.
+- **Live-audio capture callback.** The one exception to "only the decode
+  thread carries samples": live audio input (`AudioIqSource::from_device`)
+  wraps `coppa_audio::CpalSource`, whose capture callback runs on cpal's
+  audio thread and pushes samples into coppa-audio's internal `rtrb` SPSC
+  ring; the decode thread's `read()` pops them (§3). That is a real
+  producer/consumer boundary, and when the decode thread falls behind the
+  ring overruns where manta cannot count it (`CpalSource` does not expose
+  its `overflow_count()`). Every other source is read on the decode thread
+  itself, and no thread other than these two carries samples, and none but
+  the decode thread carries decoder events.
+
+A batch that takes longer than its own audio delays the next `read()`, and
+whatever the source cannot buffer meanwhile is lost before manta sees it —
+for live audio, in coppa-audio's ring, uncounted. No manta per-stage queue
+exists to measure.
+
+**Target, not built:** `rtrb` SPSC rings and crossbeam channels between
+dedicated threads: SDR/input thread → ring → **channelizer thread** (owns
+PFB, detector) → per-track sample queues → **decoder pool** (fixed workers,
+tracks as work items) → channel → **tokio runtime** (validator, servers,
+metrics, control). Rationale: coppa's audio/engine split, with real-time DSP
+on dedicated threads and lock-free handoff, so a slow batch never blocks
+input and overruns are counted where they happen.
+
+**Trigger for building it:** input lost because the decode loop fell
+behind, during a run at 192 kS/s on a Raspberry Pi 4 (ROADMAP M2's
+CPU-budget target). For SoapySDR the direct measure is the series MAN-233
+adds, `manta_input_gaps_detected_total{source="soapy"}`, which counts driver
+stream overflows: samples the host did not read in time. For HPSDR, KiwiSDR
+and ka9q the same series (docs/METRICS.md) counts packet-sequence gaps, which
+network or receiver loss causes as readily as a slow loop, so a gap there is
+a candidate signal only: it counts toward the trigger when it is absent from
+a run on the same receiver and network with a lighter decode load, or when
+it coincides with batches that took longer than their own audio.
+Until that series exists a SoapySDR run's observable signal is coarser:
+each overflow is retried silently, and only the read error after 100
+consecutive overflows surfaces, as a lost connection
+(`manta_source_health{source="soapy"}` drops to 0, with a reconnect
+warning). Until the trigger fires the synchronous loop stays: it is
+deterministic by construction and has no thread boundary between pipeline
+stages to get wrong.
