@@ -743,6 +743,16 @@ fn finite_positive(key: &str, v: f64) -> std::result::Result<f64, String> {
     Ok(v)
 }
 
+/// A float as an operator writes it in Hz: integral values keep one
+/// decimal (`30000000.0`, never the bare `30000000`).
+fn float_hz(v: f64) -> String {
+    if v.is_finite() && v == v.trunc() {
+        format!("{v:.1}")
+    } else {
+        format!("{v}")
+    }
+}
+
 /// MAN-140 D16: `input.group` is an IPv4 multicast literal or a host name,
 /// checked without resolving it. `check_group`'s IPv6 message is a full
 /// clause of its own, so it follows a colon; the other reads on from the key.
@@ -903,7 +913,7 @@ fn take_entry(
             return Err(format!(
                 "input.tuning_range_hz must be [low, high] in Hz with 0 <= low < high, got [{}]",
                 v.iter()
-                    .map(|x| format!("{x:?}"))
+                    .map(|x| float_hz(*x))
                     .collect::<Vec<_>>()
                     .join(", ")
             ))
