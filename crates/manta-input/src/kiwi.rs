@@ -361,12 +361,18 @@ impl KiwiIqSource {
         // working client while chasing that bug, and left in since removing
         // them was never verified safe against real nodes.
         //
-        // MAN-259: `SET mod=iq` in this loop starts the SND stream, so the
-        // handshake above is outage and everything after it (the resampler
-        // build below) is already live acquisition.
+        // MAN-259: `SET mod=iq` -- the first command in the loop below
+        // -- starts the SND stream, so everything before it is outage:
+        // the handshake above and the `SET ident_user` send just made,
+        // which on a slow or backpressured connection can block even
+        // though IQ acquisition has not started until the mode command
+        // goes out. Everything after it (the rest of the loop, the
+        // resampler build below) is already live acquisition.
+        socket
+            .send(Message::Text("SET ident_user=manta".to_string().into()))
+            .context("send SET ident_user")?;
         let acquisition_start_offset = entered.elapsed();
         for cmd in [
-            "SET ident_user=manta".to_string(),
             iq_mode_command(center_freq_hz),
             "SET agc=1 hang=0 thresh=-100 slope=6 decay=1000 manGain=50".to_string(),
             "SET squelch=0 max=0".to_string(),
