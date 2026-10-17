@@ -114,6 +114,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// reachable later address would never be tried at all.
 const OVERALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bound on a single WebSocket frame or message the client will buffer
+/// from a receiver (MAN-275): real SND frames are a constant 2068 bytes
+/// and MSG parameter frames are a few KiB, so 64 KiB is ~30x headroom
+/// over anything real while capping a hostile/broken receiver at a
+/// trivial allocation -- the client-side analogue of `manta-server`'s
+/// 16 KiB inbound convention (`json_stream.rs`'s
+/// MAX_INBOUND_WS_MESSAGE_BYTES). Without it, tungstenite's defaults
+/// (64 MiB message / 16 MiB frame) apply. An over-bound frame surfaces as
+/// a tungstenite `Capacity` error from `read()`, which the CLI's
+/// `ReconnectingSource` turns into a logged reconnect (MAN-73). The WS
+/// handshake itself is separately hard-bounded by tungstenite's
+/// unconditional `AttackCheck` (MAX_BYTES = 65536 / MAX_PACKETS = 512).
+const MAX_WS_FRAME_BYTES: usize = 64 * 1024;
+
 /// Resolves `host:port` and connects to the first address that accepts,
 /// the whole operation bounded by `OVERALL_CONNECT_TIMEOUT` (MAN-73, code
 /// review round 1): `(host, port).to_socket_addrs()` is a synchronous,
@@ -274,8 +288,12 @@ impl KiwiIqSource {
             .unwrap_or_default()
             .as_millis();
         let url = format!("ws://{host}:{port}/{timestamp}/SND");
+        let ws_config = tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(MAX_WS_FRAME_BYTES))
+            .max_frame_size(Some(MAX_WS_FRAME_BYTES));
         let (mut socket, _resp) =
-            tungstenite::client(url, tcp).context("KiwiSDR WebSocket handshake")?;
+            tungstenite::client::client_with_config(url, tcp, Some(ws_config))
+                .context("KiwiSDR WebSocket handshake")?;
 
         socket
             .send(Message::Text(

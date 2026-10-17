@@ -16,6 +16,16 @@ public infrastructure by nature, but enumerable by anyone who can reach
 the port, as `/metrics`'s `manta_uplink_target_*{target}` labels already
 are. See `docs/RUNBOOKS/uplink-health.md`.
 
+Everything above is inbound. manta has one *outbound* network exposure
+too: the KiwiSDR client (`--kiwi-host` / `[input] type = "kiwi"`)
+connects to an operator-chosen, third-party-operated receiver over
+plaintext `ws://` — including its optional password. Follow the
+password hygiene in `docs/GUIDES/kiwisdr.md` ("The password"), and read
+[MAN-275's threat-model decision](../DECISIONS/2026-10-17-man275-kiwi-threat-model.md)
+for the full disposition set (adversarial frames reconnect instead of
+killing the daemon; frames are size-bounded; the plaintext password is
+accepted risk).
+
 The telnet and JSON listeners bind `[server].bind_addr`, which defaults to
 `0.0.0.0`: both ports are reachable from any network that can route to
 the host, as a public cluster node expects. The metrics listener (and
