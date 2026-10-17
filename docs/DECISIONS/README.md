@@ -11,11 +11,8 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
-<<<<<<< HEAD
 | 2026-10-17 | MAN-108 | [MAN-108: a fading signal keeps its track through the fade (DORMANT re-acquisition)](2026-10-17-man108-dormant-track-reacquisition.md) |
-=======
 | 2026-10-17 | MAN-155 | [MAN-155: the related-projects page links other projects and makes no claims about them](2026-10-17-man155-related-projects-links-only.md) |
->>>>>>> 641fd02fb6dca0e9afbd3b8c775bd56c1dac718b
 | 2026-10-16 | MAN-272 | [MAN-272: a spot carries its track's latest RST and a QRL? flag](2026-10-16-man272-rst-and-qrl-on-spots.md) |
 | 2026-10-16 | MAN-252 | [MAN-252: a stop request abandons a source reopen in flight](2026-10-16-man252-cancellable-source-reopen.md) |
 | 2026-10-16 | MAN-245 | [MAN-245: the Codex gate fails closed on an incomplete thread read, Dependabot is classified by author, and each required check names its source](2026-10-16-man245-gate-verdict-integrity.md) |
