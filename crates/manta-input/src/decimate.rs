@@ -129,6 +129,13 @@ impl IqSource for DecimatingSource {
         self.trusted_half.map(|_| self.rf_passband_hz())
     }
 
+    /// MAN-273: forwarded -- the inner source's DC rim stays at DC after
+    /// decimation; the Nyquist rim lands in the conceded band beyond
+    /// `trusted_band_hz`, so vetoing it there costs nothing.
+    fn analytic_guard_hz(&self) -> f64 {
+        self.inner.analytic_guard_hz()
+    }
+
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
         while self.pending.is_empty() {
             let n = self.inner.read(&mut self.raw)?;

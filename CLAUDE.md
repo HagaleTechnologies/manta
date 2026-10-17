@@ -380,6 +380,19 @@ apply shows as `Codex review overridden by <login>`.
 the decision record; pinning `Supply Chain` to GitHub Actions is owner
 step O2. See docs/DECISIONS/2026-10-16-man245-gate-verdict-integrity.md.
 
+MAN-273: the live-audio Hilbert FIR is 511 taps (sparse over its 256
+nonzero taps; >= 70 dB image rejection over [600, 23400] Hz at 48 kHz),
+and `AudioIqSource` declares `IqSource::analytic_guard_hz()` = 600 Hz,
+which spawn-vetoes the DC and Nyquist rims (22 of 512 channels at
+48 kHz, spawns only, like MAN-196). Tones below ~515 Hz (or as close to
+Nyquist) start no track through rig audio; 600 Hz still does. Testkit
+fixtures keep the 129-tap `HILBERT_TAPS_M1_LEGACY`, so no golden vector
+moves. An analytic source
+also vetoes spawns on the mirror `(n - k) % n` of an owned or stronger
+channel (raw power, 3 dB margin): the FIR strips negative-side noise as
+deeply as the image, so the image cleared its floor. See
+docs/DECISIONS/2026-10-16-man273-hilbert-image-guard.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` — where operators, contributors and researchers each

@@ -319,3 +319,8 @@ each one with "not configurable yet" rather than ignoring it.
 | `char_gap_dits` | `[decode]` | `manta-decode::timing` |
 | `word_gap_dits` | `[decode]` | `manta-decode::timing` |
 | `cluster_alpha` | `[decode]` | `manta-decode::timing` |
+
+The loader also rejects `[detector] guard_hz`, which SPEC §9 does not list:
+it is the internal DC/Nyquist spawn guard, set from the input source
+(600 Hz for live audio, 0 otherwise; see
+[MAN-273](DECISIONS/2026-10-16-man273-hilbert-image-guard.md)).

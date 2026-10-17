@@ -348,6 +348,20 @@ track back to ACTIVE.
   cannot route around the veto. Spawns only: a track that already exists
   on an untrusted channel is never closed or de-weighted by it (MAN-196,
   the MAN-314 spawns-only lesson).
+- A channel inside the source's analytic guard may not start a spawn
+  decision either, in the same two slots: when `IqSource::analytic_guard_hz()`
+  (a real-to-analytic front end; `hilbert_guard_hz(48000)` = 600 Hz for
+  live audio, `0.0` for every complex-IQ source) or the internal
+  `DetectorConfig::guard_hz` is nonzero, the larger of the two masks every
+  channel whose whole band (`|f(k)| ± spacing/2`) lies below the guard
+  (DC rim) or above `fs/2 − guard` (Nyquist rim), where the Hilbert FIR does not guarantee
+  `HILBERT_MIN_IMAGE_REJECTION_DB`. 22 of 512 channels at 48 kHz. Spawns
+  only, as above. For such an analytic source, a spawn on `k` is also
+  refused while any channel within one of its mirror `(n − k) mod n` is
+  owned by a track or its raw `hop.power` is within 3 dB of `k`'s or
+  above it: real input has no negative frequencies, so the mirror holds
+  only `k`'s image (MAN-273, see
+  docs/DECISIONS/2026-10-16-man273-hilbert-image-guard.md).
 - A spawn decision at `k` is additionally rejected while *any* channel of
   the prospective ownership window `{k−1, k, k+1}` (neighbours wrap) is
   still serving a post-`Silent` respawn cooldown (§9's

@@ -132,7 +132,11 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
 - **Audio passband** (via `coppa-audio`): 48 kHz real audio from a rig's RX audio,
   Hilbert-transformed to analytic. Degenerate ~3 kHz "wideband" mode; exists
   because it makes manta useful to people with zero SDR hardware, and it is the
-  M1 bring-up path.
+  M1 bring-up path. The front end is a 511-tap analytic FIR, and the source
+  declares a 600 Hz DC/Nyquist spawn guard (`IqSource::analytic_guard_hz`)
+  where its image rejection is not guaranteed; tones that close to DC or
+  Nyquist start no track (MAN-273, see
+  docs/DECISIONS/2026-10-16-man273-hilbert-image-guard.md).
 
 **Sample-rate assumptions.** Design center: 96–192 kS/s complex (covers any HF CW
 band segment; CW allocations are ≤ 100 kHz wide). Supported ceiling: 768 kS/s
