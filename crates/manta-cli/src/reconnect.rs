@@ -37,6 +37,14 @@ pub(crate) trait ReconnectEnv {
     /// soon as `stop` is observed set (the sleep may not have run for the
     /// full duration), `true` otherwise.
     fn sleep(&mut self, d: Duration, stop: &AtomicBool) -> bool;
+    /// A handle reading the same clock as `now()` from another thread:
+    /// the reopen worker samples the outage anchor's base through it,
+    /// immediately before entering the opener (MAN-259, PR #342 review --
+    /// the base used to be sampled where the worker was spawned, so
+    /// whatever elapsed before the worker ran, signal-silent time, was
+    /// dropped from the outage while the driver's offset starts only at
+    /// the opener's entry).
+    fn clock(&self) -> Arc<dyn Fn() -> Instant + Send + Sync>;
 }
 
 /// Real wall clock, sleeping in short slices so a `stop` set mid-backoff
@@ -52,6 +60,10 @@ const REAL_ENV_SLEEP_SLICE: Duration = Duration::from_millis(100);
 impl ReconnectEnv for RealEnv {
     fn now(&mut self) -> Instant {
         Instant::now()
+    }
+
+    fn clock(&self) -> Arc<dyn Fn() -> Instant + Send + Sync> {
+        Arc::new(Instant::now)
     }
 
     fn sleep(&mut self, d: Duration, stop: &AtomicBool) -> bool {
@@ -75,9 +87,13 @@ pub(crate) type SendSource = Box<dyn IqSource + Send>;
 pub(crate) type Opener = Box<dyn FnMut() -> anyhow::Result<SendSource> + Send>;
 pub(crate) type HealthSink = Box<dyn FnMut(bool)>;
 
-/// A reopen running on its own thread (MAN-252).
+/// A reopen running on its own thread (MAN-252). The worker sends its
+/// result with the `Instant` it sampled immediately before entering the
+/// opener -- the base the outage anchor is built on (MAN-259, PR #342
+/// review), taken on the worker so the spawn-to-entry interval stays in
+/// the outage.
 struct PendingReopen {
-    rx: mpsc::Receiver<anyhow::Result<SendSource>>,
+    rx: mpsc::Receiver<(Instant, anyhow::Result<SendSource>)>,
     worker: JoinHandle<()>,
 }
 
@@ -214,11 +230,9 @@ pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
     /// the reopened source has returned data ends the stream with the
     /// outage still pending (MAN-258).
     reopened: bool,
-    /// MAN-259: when the reopen in progress was started, after its backoff
-    /// sleep. `None` outside a reopen attempt.
-    reopen_started_at: Option<Instant>,
     /// Where a reconnect's outage ends (MAN-259): the reopened source's
-    /// acquisition start, `reopen_started_at` plus its
+    /// acquisition start -- the base the reopen worker sampled just
+    /// before entering the opener, plus that source's
     /// `acquisition_start_offset()`. `Some` only while the current `inner`
     /// came from `opener` (a reconnect) rather than being the original
     /// source passed to `new`/`with_env` and has not yet returned data --
@@ -286,7 +300,6 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
             backoff: INITIAL_BACKOFF,
             productive: false,
             reopened: false,
-            reopen_started_at: None,
             resumption_anchor: None,
             last_ok,
             discontinuity: None,
@@ -323,13 +336,22 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
     fn spawn_reopen(&self) -> std::io::Result<PendingReopen> {
         let (tx, rx) = mpsc::channel();
         let opener = self.opener.clone();
+        let clock = self.env.clock();
         let worker = std::thread::Builder::new()
             .name(format!("reopen-{}", self.name))
             .spawn(move || {
-                let result = (opener.lock().expect("reopen lock poisoned"))();
+                let mut opener = opener.lock().expect("reopen lock poisoned");
+                // MAN-259, PR #342 review: sample the base here, in the
+                // worker and immediately before the opener runs -- not
+                // where the reading thread spawned it. Whatever elapses
+                // between the spawn and this instant is signal-silent
+                // (the driver's offset starts only at the opener's
+                // entry), so it belongs to the outage.
+                let base = clock();
+                let result = opener();
                 // The receiver is gone once a stop abandoned this attempt:
                 // the late source is then dropped here, on this thread.
-                let _ = tx.send(result);
+                let _ = tx.send((base, result));
             })?;
         Ok(PendingReopen { rx, worker })
     }
@@ -343,7 +365,7 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
     /// A result that arrives while the receive is waiting does not override
     /// a stop observed in that same window: the late source is dropped here
     /// rather than installed and read after the stop request (MAN-252).
-    fn await_reopen(&mut self) -> Option<anyhow::Result<SendSource>> {
+    fn await_reopen(&mut self) -> Option<(Instant, anyhow::Result<SendSource>)> {
         loop {
             if self.stop.load(Ordering::Relaxed) {
                 return None;
@@ -416,10 +438,6 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                         // outage left pending (MAN-258).
                         return Ok(self.end_during_outage());
                     }
-                    // MAN-259: the outage's end is measured from here, the
-                    // last instant that was certainly signal-silent before
-                    // the open call was started on the reopen thread.
-                    self.reopen_started_at = Some(self.env.now());
                     match self.spawn_reopen() {
                         Ok(pending) => self.reopen = Some(pending),
                         Err(e) => {
@@ -428,7 +446,7 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                         }
                     }
                 }
-                let Some(opened) = self.await_reopen() else {
+                let Some((base, opened)) = self.await_reopen() else {
                     // Ctrl-C mid-reopen (MAN-252): end of stream without
                     // waiting for the attempt to return, with the outage
                     // left pending (MAN-258).
@@ -471,21 +489,20 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                         }
                         // MAN-259: the outage ends where the reopened
                         // source began acquiring, which the open call
-                        // reports relative to its own start. Clamped to
+                        // reports relative to the base the worker
+                        // sampled just before entering it. Clamped to
                         // now, so no driver can end it in the future.
                         let now = self.env.now();
-                        self.resumption_anchor = self.reopen_started_at.take().map(|started| {
-                            started
-                                .checked_add(src.acquisition_start_offset())
-                                .map_or(now, |anchor| anchor.min(now))
-                        });
+                        self.resumption_anchor = Some(
+                            base.checked_add(src.acquisition_start_offset())
+                                .map_or(now, |anchor| anchor.min(now)),
+                        );
                         self.inner = Some(src as Box<dyn IqSource>);
                         self.productive = false;
                         self.reopened = true;
                         continue;
                     }
                     Err(e) => {
-                        self.reopen_started_at = None;
                         self.attempt_failed(&crate::fmt::cause_text(&e));
                         continue;
                     }
@@ -670,6 +687,11 @@ mod tests {
             }
             self.advance(d);
             !stop.load(Ordering::Relaxed)
+        }
+
+        fn clock(&self) -> Arc<dyn Fn() -> Instant + Send + Sync> {
+            let clock = self.clock.clone();
+            Arc::new(move || *clock.lock().unwrap())
         }
     }
 
@@ -1159,6 +1181,93 @@ mod tests {
         assert_eq!(
             gap_after_a_slow_reopen(Duration::from_secs(2), Duration::from_secs(5)),
             samples(INITIAL_BACKOFF + Duration::from_secs(2))
+        );
+    }
+
+    /// A fake env whose reopen-worker clock handle jumps `delay` forward
+    /// the first time the worker reads it, modeling the OS delay between
+    /// the reading thread spawning the `reopen-<kind>` worker and that
+    /// worker entering the opener (MAN-259, PR #342 review). No samples
+    /// are acquired during that interval -- every driver measures its
+    /// `acquisition_start_offset()` only from inside the opener -- so it
+    /// belongs to the outage.
+    #[derive(Clone)]
+    struct DelayedWorkerStartEnv {
+        clock: Arc<Mutex<Instant>>,
+        worker_has_read: Arc<AtomicBool>,
+        delay: Duration,
+    }
+
+    impl DelayedWorkerStartEnv {
+        fn new(delay: Duration) -> Self {
+            DelayedWorkerStartEnv {
+                clock: Arc::new(Mutex::new(Instant::now())),
+                worker_has_read: Arc::new(AtomicBool::new(false)),
+                delay,
+            }
+        }
+    }
+
+    impl ReconnectEnv for DelayedWorkerStartEnv {
+        fn now(&mut self) -> Instant {
+            *self.clock.lock().unwrap()
+        }
+
+        fn sleep(&mut self, d: Duration, stop: &AtomicBool) -> bool {
+            if stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            *self.clock.lock().unwrap() += d;
+            !stop.load(Ordering::Relaxed)
+        }
+
+        fn clock(&self) -> Arc<dyn Fn() -> Instant + Send + Sync> {
+            let (clock, has_read, delay) =
+                (self.clock.clone(), self.worker_has_read.clone(), self.delay);
+            Arc::new(move || {
+                if !has_read.swap(true, Ordering::Relaxed) {
+                    *clock.lock().unwrap() += delay;
+                }
+                *clock.lock().unwrap()
+            })
+        }
+    }
+
+    /// MAN-259, PR #342 review: the anchor's base is sampled in the reopen
+    /// worker immediately before it enters the opener, so the interval
+    /// between spawning the worker and the worker running -- during which
+    /// nothing acquires -- stays counted as outage. A base sampled at
+    /// spawn time omitted it, stamping every later spot early by exactly
+    /// that scheduling delay.
+    #[test]
+    fn discontinuity_includes_the_delay_before_the_reopen_worker_enters_the_opener() {
+        let first = scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]);
+        let env = DelayedWorkerStartEnv::new(Duration::from_millis(500));
+        let mut reopened = Some(AcquiringSource {
+            inner: scripted(FS, CENTER, vec![ok_chunk(8)]),
+            acquisition_start_offset: Duration::ZERO,
+        });
+        let opener: Opener = Box::new(move || {
+            Ok(Box::new(reopened.take().expect("reopened only once")) as SendSource)
+        });
+        let (health, _log) = health_recorder();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            env,
+        );
+
+        let mut b = buf(8);
+        src.read(&mut b).unwrap();
+        src.read(&mut b).unwrap(); // errors, sleeps 1s, worker runs 0.5s late, resumes
+        assert_eq!(
+            src.take_discontinuity(),
+            Some(samples(INITIAL_BACKOFF + Duration::from_millis(500))),
+            "the worker's start delay is signal-silent and belongs to the outage"
         );
     }
 

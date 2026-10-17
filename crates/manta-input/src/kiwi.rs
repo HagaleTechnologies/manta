@@ -257,8 +257,8 @@ pub struct KiwiIqSource {
     /// `health_counters()`, same as HPSDR's `GapDetector` handle.
     health: Arc<InputHealthCounters>,
     seq: SndSeqTracker,
-    /// MAN-259: `connect`'s runtime up to the post-handshake `SET` loop
-    /// that turns streaming on; surfaced by `acquisition_start_offset()`.
+    /// MAN-259: `connect`'s runtime up to the `SET mod=iq` command that
+    /// turns streaming on; surfaced by `acquisition_start_offset()`.
     acquisition_start_offset: Duration,
 }
 
@@ -361,12 +361,18 @@ impl KiwiIqSource {
         // working client while chasing that bug, and left in since removing
         // them was never verified safe against real nodes.
         //
-        // MAN-259: `SET mod=iq` in this loop starts the SND stream, so the
-        // handshake above is outage and everything after it (the resampler
-        // build below) is already live acquisition.
+        // MAN-259: `SET mod=iq` starts the SND stream, so the handshake
+        // above is outage and everything after it (the resampler build
+        // below) is already live acquisition. The timestamp sits after the
+        // `SET ident_user` send and immediately before the IQ-mode command
+        // (PR #342 review): a slow or backpressured connection can block
+        // in that earlier send while nothing streams yet, and such a
+        // block is outage, not acquisition.
+        socket
+            .send(Message::Text("SET ident_user=manta".into()))
+            .context("send post-handshake SET command")?;
         let acquisition_start_offset = entered.elapsed();
         for cmd in [
-            "SET ident_user=manta".to_string(),
             iq_mode_command(center_freq_hz),
             "SET agc=1 hang=0 thresh=-100 slope=6 decay=1000 manGain=50".to_string(),
             "SET squelch=0 max=0".to_string(),
