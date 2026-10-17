@@ -87,11 +87,9 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
-<<<<<<< HEAD
 - MAN-108: `[detector] reacquire_ms` (default `10000`), how long after
   `hang_ms` a decoded track keeps its identity waiting for its signal to
   return. `0` restores the previous close at `hang_ms`.
-=======
 - MAN-13: one `manta run` decodes several receivers into one spot output.
   Write `[[input]]` once per receiver (each with a `name`); every input
   decodes on its own thread into one shared validator, so a station two
@@ -99,7 +97,6 @@ the git history and `docs/DECISIONS/`.
   take `--input NAME`; `decode` needs `--freq-correction-ppm` when the
   entries' corrections differ. With several inputs `/healthz` stays `ok`
   while one input is healthy. Single-input runs are unchanged.
->>>>>>> e539c9b2a807402c7d5a00206277a1bf90016296
 - MAN-272: each spot carries its track's latest RST (`5NN` read as `599`)
   and whether it sent `QRL?`, as CW Skimmer's band map shows. JSON spots
   gain `rst` (string or `null`) and `qrlQuery` (boolean), `run --json` and
