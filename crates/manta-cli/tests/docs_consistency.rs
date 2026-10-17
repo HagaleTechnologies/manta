@@ -3016,3 +3016,26 @@ fn wiki_windows_build_setup_stamp_names_a_snapshot_without_release_yml() {
          body is substantively changed"
     );
 }
+
+// ---- MAN-273 (PR #340 review): the bad-sample fan-out tracks the FIR ----
+
+/// MAN-273 widened `HILBERT_TAPS` 129 -> 511 (evaluated over its nonzero
+/// taps), so one bad sound-card sample now reaches more channelizer inputs
+/// than the 129 `docs/METRICS.md` stated. Measure the fan-out through the
+/// live transformer and the sample guard the channelizer counts with.
+#[test]
+fn metrics_reference_states_the_hilbert_bad_sample_fan_out() {
+    use manta_dsp::hilbert::{HilbertTransformer, HILBERT_TAPS};
+    let mut input = vec![0.0f32; 2 * HILBERT_TAPS];
+    input[0] = f32::NAN;
+    let fan_out = HilbertTransformer::new()
+        .process(&input)
+        .into_iter()
+        .filter(|&s| !manta_dsp::sample_guard::is_usable(s))
+        .count();
+    let claim = format!("up to {fan_out} through a sound card's Hilbert filter");
+    assert!(
+        squash_whitespace(&doc(METRICS_REF)).contains(&claim),
+        "{METRICS_REF}'s `manta_input_bad_samples_total` row must say `{claim}`"
+    );
+}

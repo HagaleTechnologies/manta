@@ -1189,12 +1189,17 @@ pub(crate) fn run_input_front(
     let center_freq_hz = src.center_freq_hz();
     let rf_passband_hz = src.rf_passband_hz();
     let trusted_band_hz = src.trusted_band_hz();
+    // MAN-273: the analytic-signal guard, as `listen_with_observers`.
+    let analytic = src.analytic_guard_hz() > 0.0;
+    let guard_hz = effective_guard_hz(cfg.detector.guard_hz, src.analytic_guard_hz());
     let mut crash_base: u64 = 0;
     let mut seg = new_segment(
         fs,
         center_freq_hz,
         rf_passband_hz,
         trusted_band_hz,
+        guard_hz,
+        analytic,
         cfg,
         ids,
         ids.first,
@@ -1299,6 +1304,8 @@ pub(crate) fn run_input_front(
                 center_freq_hz,
                 rf_passband_hz,
                 trusted_band_hz,
+                guard_hz,
+                analytic,
                 cfg,
                 ids,
                 next_id,
@@ -1364,14 +1371,14 @@ mod tests {
     use super::*;
 
     #[test]
-<<<<<<< HEAD
     fn effective_guard_takes_the_max_of_config_and_source() {
         // MAN-273: configuration can widen the source's guard, never narrow it.
         assert_eq!(effective_guard_hz(0.0, 600.0), 600.0);
         assert_eq!(effective_guard_hz(900.0, 600.0), 900.0);
         assert_eq!(effective_guard_hz(0.0, 0.0), 0.0);
     }
-=======
+
+    #[test]
     fn live_closures_use_the_closing_inputs_batch_time() {
         for synthetic in [false, true] {
             let sink = crate::live::tests::RecordingSink::wanting();
@@ -1458,7 +1465,6 @@ mod tests {
         }
     }
 
->>>>>>> e539c9b2a807402c7d5a00206277a1bf90016296
     fn lifecycle_close_fields(c: crate::track::CloseCounts) -> [u64; 8] {
         [
             c.unconfirmed,
