@@ -1685,6 +1685,11 @@ impl IqSource for FixedCenterFreqSource {
         self.inner.analytic_guard_hz()
     }
 
+    /// MAN-273: forwarded with `analytic_guard_hz`.
+    fn analytic_nyquist_guard_hz(&self) -> f64 {
+        self.inner.analytic_nyquist_guard_hz()
+    }
+
     fn read(&mut self, buf: &mut [num_complex::Complex32]) -> Result<usize> {
         self.inner.read(buf)
     }

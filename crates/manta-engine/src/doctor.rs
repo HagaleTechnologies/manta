@@ -325,6 +325,11 @@ impl IqSource for SampleBoundedSource {
     fn analytic_guard_hz(&self) -> f64 {
         self.inner.analytic_guard_hz()
     }
+
+    /// MAN-273: forwarded with `analytic_guard_hz`.
+    fn analytic_nyquist_guard_hz(&self) -> f64 {
+        self.inner.analytic_nyquist_guard_hz()
+    }
 }
 
 /// Run `listen()` against `src` for `duration`, tabulating its event/spot

@@ -196,3 +196,58 @@ fn a_clean_audio_tone_does_not_churn_candidates() {
     );
     assert!(snap.peak_active_tracks <= 3, "{snap:?}");
 }
+
+/// MAN-273 validate round 1: rig audio decimated to 6 kHz
+/// (`--capture-rate-hz 6000`) still spawns a track near the top of its
+/// usable band. The decimator filters out the Hilbert FIR's Nyquist-rim
+/// leak, so `DecimatingSource` declares a DC rim only; forwarding the
+/// 48 kHz guard to both rims masked 2484-2672 Hz, inside the advertised
+/// 300-2716 Hz band, and this tone decoded nothing.
+#[test]
+fn a_decimated_audio_tone_near_the_band_top_still_decodes() {
+    let fs = 48_000.0;
+    let tone_hz = 2_625.0; // 28 * 93.75 Hz: a channel centre at 6 kHz too.
+    let spec = KeyerSpec::new(20.0);
+    let (env, keyed_text) = key_text_loop("CQ CQ DE W1AW W1AW K", &spec, fs, 15.0).unwrap();
+    let dphi = std::f64::consts::TAU * tone_hz / fs;
+    let mut real: Vec<f32> = env
+        .iter()
+        .enumerate()
+        .map(|(i, &e)| e * (dphi * i as f64).cos() as f32)
+        .collect();
+    let sigma = manta_testkit::noise::real_awgn_sigma_for_snr_2500(20.0, fs);
+    manta_testkit::noise::add_real_awgn(&mut real, sigma, 0x1234_5678);
+    let audio =
+        AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, 48_000))).unwrap();
+    let src: Box<dyn manta_input::IqSource> =
+        Box::new(manta_input::DecimatingSource::new(Box::new(audio), 6_000.0).unwrap());
+    let (_, hi) = src
+        .trusted_band_hz()
+        .expect("a decimated source has a trusted band");
+    assert!(
+        tone_hz < hi,
+        "the tone must sit inside the trusted band (< {hi} Hz)"
+    );
+
+    let text = Arc::new(Mutex::new(String::new()));
+    let text_clone = text.clone();
+    listen(
+        src,
+        &PipelineConfig::default(),
+        Arc::new(AtomicBool::new(false)),
+        move |ev| {
+            if let manta_decode::events::DecoderEvent::CharDecoded { glyph, .. } = ev {
+                if let Some(c) = glyph.text_char() {
+                    text_clone.lock().unwrap().push(c);
+                }
+            }
+        },
+        |_spot| {},
+    )
+    .unwrap();
+    let decoded = text.lock().unwrap().clone();
+    assert!(
+        decoded.contains("W1AW"),
+        "expected W1AW in decoded text, got {decoded:?} (keyed: {keyed_text:?})"
+    );
+}

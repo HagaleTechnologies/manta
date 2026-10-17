@@ -75,6 +75,16 @@ some rigs default to; the M1 live-copy runbook says to pick 600 Hz or
 higher. An asymmetric guard (a narrower DC rim where 511 taps already
 clear the floor) is a follow-up, not done here.
 
+Decimated rig audio (`--capture-rate-hz`) keeps the DC rim and has no
+Nyquist rim: `DecimatingSource` reports
+`IqSource::analytic_nyquist_guard_hz()` = 0.0, and every other wrapper
+forwards it. The leak sits at the 48 kHz input's Nyquist, which the
+decimator filters out. Validate round 1 found that the first version
+applied the 600 Hz rim at the decimated Nyquist instead. At 6 kHz that
+masked 2484–2672 Hz of the advertised 300–2716 Hz band, and at 1500 Hz
+it masked every channel. `a_decimated_audio_tone_near_the_band_top_still_decodes`
+pins the fix.
+
 ## D3 — a spawn-time mirror-image veto for analytic sources
 
 The plan made a third mechanism conditional on measurement: port the

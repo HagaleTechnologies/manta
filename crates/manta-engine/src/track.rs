@@ -74,7 +74,8 @@ pub struct DetectorConfig {
     /// a channel whose centre lies within this many Hz of DC or of
     /// Nyquist. Not in SPEC §9's table and not operator-settable -- a
     /// property of the source's analytic-signal construction, declared via
-    /// `IqSource::analytic_guard_hz` and raised (never lowered) to
+    /// `IqSource::analytic_guard_hz` (DC) and `analytic_nyquist_guard_hz`
+    /// (0.0 once decimated) and raised (never lowered) per rim to
     /// `max(configured, source)` in `listen`. 0.0 restores the
     /// pre-MAN-273 behaviour bit-identically.
     pub guard_hz: f64,
@@ -1710,25 +1711,28 @@ impl TrackManager {
     }
 
     /// MAN-273: never spawn a candidate on a channel whose whole band lies
-    /// within `guard_hz` of DC or of Nyquist -- where the source's
-    /// real-to-analytic front end (`manta-dsp::hilbert`) leaks a real
-    /// tone's negative-frequency image. `listen` supplies
-    /// `max(DetectorConfig::guard_hz, IqSource::analytic_guard_hz)`.
+    /// within `dc_guard_hz` of DC or within `nyquist_guard_hz` of Nyquist
+    /// -- where the source's real-to-analytic front end
+    /// (`manta-dsp::hilbert`) leaks a real tone's negative-frequency
+    /// image. `listen` supplies `max(DetectorConfig::guard_hz, …)` of
+    /// `IqSource::analytic_guard_hz` and `analytic_nyquist_guard_hz`.
     /// **Spawns only**, as `set_trusted_band_hz`: a running track on a
-    /// guarded channel keeps decoding. `guard_hz <= 0.0` clears the mask
-    /// (a no-op, pinned by `guard_zero_is_bit_identical_to_today`).
-    pub fn set_guard_hz(&mut self, guard_hz: f64) {
+    /// guarded channel keeps decoding. A rim `<= 0.0` masks nothing; both
+    /// clear the mask (a no-op, pinned by
+    /// `guard_zero_is_bit_identical_to_today`).
+    pub fn set_guard_hz(&mut self, dc_guard_hz: f64, nyquist_guard_hz: f64) {
         let n = self.n_channels();
         let spacing = self.channel_spacing_hz;
         let half = spacing * n as f64 / 2.0;
         // A channel straddling the guard edge keeps spawning: a 600 Hz
         // sidetone (channel 6 at 48 kHz, 515-609 Hz) must stay skimmable,
         // and the FIR already clears its contract floor there.
-        self.guard_channels = (guard_hz > 0.0).then(|| {
+        self.guard_channels = (dc_guard_hz > 0.0 || nyquist_guard_hz > 0.0).then(|| {
             (0..n)
                 .map(|k| {
                     let f = (wrapped_channel_offset(k, n) * spacing).abs();
-                    f + spacing / 2.0 < guard_hz || f - spacing / 2.0 > half - guard_hz
+                    (dc_guard_hz > 0.0 && f + spacing / 2.0 < dc_guard_hz)
+                        || (nyquist_guard_hz > 0.0 && f - spacing / 2.0 > half - nyquist_guard_hz)
                 })
                 .collect()
         });
@@ -4023,7 +4027,7 @@ mod tests {
     fn guard_hz_masks_exactly_the_two_rims() {
         let n = 512;
         let mut tm = trusted_band_manager(n);
-        tm.set_guard_hz(600.0);
+        tm.set_guard_hz(600.0, 600.0);
         let mut guarded = 0;
         for k in 0..n {
             let f = (wrapped_channel_offset(k, n) * 93.75).abs();
@@ -4037,7 +4041,7 @@ mod tests {
         // guard edge and still spawns.
         assert!(!tm.guard_vetoes_spawn(6));
         assert!(tm.guard_vetoes_spawn(5));
-        tm.set_guard_hz(0.0);
+        tm.set_guard_hz(0.0, 0.0);
         assert!((0..n).all(|k| !tm.guard_vetoes_spawn(k)));
     }
 
@@ -4053,7 +4057,7 @@ mod tests {
         let run = |set: bool| -> Vec<DecoderEvent> {
             let mut tm = trusted_band_manager(n);
             if set {
-                tm.set_guard_hz(0.0);
+                tm.set_guard_hz(0.0, 0.0);
                 tm.set_mirror_image_guard(false);
             }
             tm.process_hops(&hops, |m| m)
@@ -4074,14 +4078,17 @@ mod tests {
                 "control must spawn on {pair:?}"
             );
             assert_eq!(
-                births_after(|tm| tm.set_guard_hz(600.0), power),
+                births_after(|tm| tm.set_guard_hz(600.0, 600.0), power),
                 Vec::<usize>::new(),
                 "guarded pair {pair:?} spawned"
             );
         }
         // The channel straddling the DC rim (k = 6, 562.5 Hz) still spawns.
         let power = strong_on_all(512, &[(6, 20.0)]);
-        assert_eq!(births_after(|tm| tm.set_guard_hz(600.0), power), vec![6]);
+        assert_eq!(
+            births_after(|tm| tm.set_guard_hz(600.0, 600.0), power),
+            vec![6]
+        );
     }
 
     #[test]
@@ -4093,7 +4100,7 @@ mod tests {
                 "control {k}"
             );
             assert!(
-                births_after(|tm| tm.set_guard_hz(600.0), power).is_empty(),
+                births_after(|tm| tm.set_guard_hz(600.0, 600.0), power).is_empty(),
                 "channel {k} lies inside the DC guard"
             );
         }

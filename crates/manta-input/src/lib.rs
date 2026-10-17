@@ -151,6 +151,15 @@ pub trait IqSource {
     fn analytic_guard_hz(&self) -> f64 {
         0.0
     }
+    /// MAN-273: how much of `analytic_guard_hz` also applies at this
+    /// source's own Nyquist edge, in Hz. The default is the whole guard: an
+    /// analytic front end at the source's own rate leaks at both rims.
+    /// `DecimatingSource` reports `0.0`, because its decimator filters out
+    /// the front end's Nyquist rim, and the trusted band covers the new
+    /// edge. Every wrapper that forwards `analytic_guard_hz` forwards this.
+    fn analytic_nyquist_guard_hz(&self) -> f64 {
+        self.analytic_guard_hz()
+    }
     /// Fill `buf`, returning the number of samples written; 0 = EOF.
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize>;
 

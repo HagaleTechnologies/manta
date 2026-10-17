@@ -355,8 +355,11 @@ track back to ACTIVE.
   `DetectorConfig::guard_hz` is nonzero, the larger of the two masks every
   channel whose whole band (`|f(k)| ± spacing/2`) lies below the guard
   (DC rim) or above `fs/2 − guard` (Nyquist rim), where the Hilbert FIR does not guarantee
-  `HILBERT_MIN_IMAGE_REJECTION_DB`. 22 of 512 channels at 48 kHz. Spawns
-  only, as above. For such an analytic source, a spawn on `k` is also
+  `HILBERT_MIN_IMAGE_REJECTION_DB`. 22 of 512 channels at 48 kHz. A
+  `DecimatingSource` keeps the DC rim and drops the Nyquist rim
+  (`IqSource::analytic_nyquist_guard_hz()` = `0.0`): its decimator filters
+  out the front end's Nyquist, and the trusted band vetoes the decimated
+  edge. Spawns only, as above. For such an analytic source, a spawn on `k` is also
   refused while any channel within one of its mirror `(n − k) mod n` is
   owned by a track or its raw `hop.power` is within 3 dB of `k`'s or
   above it: real input has no negative frequencies, so the mirror holds

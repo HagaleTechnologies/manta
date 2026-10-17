@@ -130,10 +130,23 @@ impl IqSource for DecimatingSource {
     }
 
     /// MAN-273: forwarded -- the inner source's DC rim stays at DC after
-    /// decimation; the Nyquist rim lands in the conceded band beyond
-    /// `trusted_band_hz`, so vetoing it there costs nothing.
+    /// decimation.
     fn analytic_guard_hz(&self) -> f64 {
         self.inner.analytic_guard_hz()
+    }
+
+    /// MAN-273: none once decimated. The inner front end's Nyquist rim sits
+    /// at the inner rate's Nyquist, which the decimator filters out.
+    /// Applying the guard at the decimated Nyquist instead vetoed spawns
+    /// inside the trusted band: at 6 kHz it masked 2484-2672 Hz of the
+    /// advertised 300-2716 Hz, and at 1500 Hz it masked every channel.
+    /// `trusted_band_hz` already vetoes the decimated edge. A factor-1
+    /// pass-through filters nothing, so it forwards the inner rim.
+    fn analytic_nyquist_guard_hz(&self) -> f64 {
+        match self.trusted_half {
+            Some(_) => 0.0,
+            None => self.inner.analytic_nyquist_guard_hz(),
+        }
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
@@ -592,5 +605,33 @@ mod tests {
         .unwrap();
         assert_eq!(src.rf_passband_hz(), (300.0, 3_000.0));
         assert_eq!(src.trusted_band_hz(), Some((300.0, 3_000.0)));
+    }
+
+    /// MAN-273: decimation keeps an analytic source's DC rim and drops its
+    /// Nyquist rim, which the decimator filters out; a factor-1
+    /// pass-through filters nothing and keeps both.
+    #[test]
+    fn decimation_drops_the_analytic_nyquist_rim_only() {
+        struct AnalyticSource;
+        impl IqSource for AnalyticSource {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                0.0
+            }
+            fn analytic_guard_hz(&self) -> f64 {
+                600.0
+            }
+            fn read(&mut self, _buf: &mut [Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+        }
+        let decimated = DecimatingSource::new(Box::new(AnalyticSource), 6_000.0).unwrap();
+        assert_eq!(decimated.analytic_guard_hz(), 600.0);
+        assert_eq!(decimated.analytic_nyquist_guard_hz(), 0.0);
+        let passthrough = DecimatingSource::new(Box::new(AnalyticSource), 48_000.0).unwrap();
+        assert_eq!(passthrough.analytic_guard_hz(), 600.0);
+        assert_eq!(passthrough.analytic_nyquist_guard_hz(), 600.0);
     }
 }

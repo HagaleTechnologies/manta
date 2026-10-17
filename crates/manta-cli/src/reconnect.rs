@@ -202,6 +202,8 @@ pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
     trusted_band_hz: Option<(f64, f64)>,
     /// MAN-273: the first connection's `analytic_guard_hz`.
     analytic_guard_hz: f64,
+    /// MAN-273: the first connection's `analytic_nyquist_guard_hz`.
+    analytic_nyquist_guard_hz: f64,
     backoff: Duration,
     /// Whether the current `inner` has returned at least one real sample
     /// since it was (re)opened -- decides `Disconnected` vs
@@ -257,6 +259,7 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
         let rf_passband_hz = first.rf_passband_hz();
         let trusted_band_hz = first.trusted_band_hz();
         let analytic_guard_hz = first.analytic_guard_hz();
+        let analytic_nyquist_guard_hz = first.analytic_nyquist_guard_hz();
         let last_ok = env.now();
         let input_health = InputHealthTotals::for_source(first.as_ref());
         ReconnectingSource {
@@ -273,6 +276,7 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
             rf_passband_hz,
             trusted_band_hz,
             analytic_guard_hz,
+            analytic_nyquist_guard_hz,
             backoff: INITIAL_BACKOFF,
             productive: false,
             reopened: false,
@@ -399,6 +403,11 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
     /// `trusted_band_hz` above.
     fn analytic_guard_hz(&self) -> f64 {
         self.analytic_guard_hz
+    }
+
+    /// MAN-273: snapshotted with `analytic_guard_hz`.
+    fn analytic_nyquist_guard_hz(&self) -> f64 {
+        self.analytic_nyquist_guard_hz
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {

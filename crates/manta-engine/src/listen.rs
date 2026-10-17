@@ -348,10 +348,11 @@ struct Segment {
     pad_hops: u64,
 }
 
-/// MAN-273: the spawn guard `listen` applies -- the larger of the
-/// configured `DetectorConfig::guard_hz` and the source's
-/// `IqSource::analytic_guard_hz`, so configuration can widen the guard but
-/// never narrow what the front end declares.
+/// MAN-273: the spawn guard `listen` applies at one rim -- the larger of
+/// the configured `DetectorConfig::guard_hz` and the source's
+/// `IqSource::analytic_guard_hz` (DC) or `analytic_nyquist_guard_hz`, so
+/// configuration can widen the guard but never narrow what the front end
+/// declares.
 fn effective_guard_hz(configured: f64, source: f64) -> f64 {
     configured.max(source)
 }
@@ -362,7 +363,7 @@ fn new_segment(
     center_freq_hz: f64,
     rf_passband_hz: (f64, f64),
     trusted_band_hz: Option<(f64, f64)>,
-    guard_hz: f64,
+    guard_hz: (f64, f64),
     analytic: bool,
     cfg: &PipelineConfig,
     next_id: u32,
@@ -394,9 +395,10 @@ fn new_segment(
         tm.set_trusted_band_hz(lo, hi);
     }
     // MAN-273: never spawn tracks inside the analytic front end's
-    // DC/Nyquist guard (0.0, every complex-IQ source, sets nothing).
-    if guard_hz > 0.0 {
-        tm.set_guard_hz(guard_hz);
+    // DC/Nyquist guard, `(dc, nyquist)` Hz ((0.0, 0.0), every complex-IQ
+    // source, sets nothing).
+    if guard_hz.0 > 0.0 || guard_hz.1 > 0.0 {
+        tm.set_guard_hz(guard_hz.0, guard_hz.1);
     }
     // MAN-273 D3: an analytic source's negative channels carry only images.
     tm.set_mirror_image_guard(analytic);
@@ -589,11 +591,14 @@ pub fn listen_with_observers(
     // discontinuity rebuild below) -- `None` for every non-decimated
     // source leaves each segment's manager exactly as before.
     let trusted_band_hz = src.trusted_band_hz();
-    // MAN-273: the source's analytic-signal guard, widened (never narrowed)
-    // by the configured one and applied to every segment like the trusted
-    // band.
+    // MAN-273: the source's analytic-signal guard, per rim, widened (never
+    // narrowed) by the configured one and applied to every segment like
+    // the trusted band. A decimated source has no Nyquist rim.
     let analytic = src.analytic_guard_hz() > 0.0;
-    let guard_hz = effective_guard_hz(cfg.detector.guard_hz, src.analytic_guard_hz());
+    let guard_hz = (
+        effective_guard_hz(cfg.detector.guard_hz, src.analytic_guard_hz()),
+        effective_guard_hz(cfg.detector.guard_hz, src.analytic_nyquist_guard_hz()),
+    );
 
     let mut validator = cfg.validator(fs)?;
     let references = observers
