@@ -311,7 +311,7 @@ const FREQ_BUCKET_HZ: f64 = 100.0;
 /// joins, across a bucket boundary, two tracks the track layer keeps
 /// apart. Bucket adjacency alone allowed up to ~200 Hz (e.g. 13,999,950.1
 /// Hz and 14,000,149.9 Hz round to adjacent buckets 140000 and 140001).
-const SAME_SIGNAL_MAX_HZ: f64 = 93.75;
+pub const SAME_SIGNAL_MAX_HZ: f64 = 93.75;
 
 /// Minimum gap, in seconds, between two *different tracks'* decodes for
 /// the later one to count as a genuinely distinct occurrence rather than

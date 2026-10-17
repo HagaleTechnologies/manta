@@ -60,7 +60,7 @@ listed here change what the command does.
 | `check` | `[input]`: the source, `capture_rate_hz` and `center_freq_hz` | yes |
 | `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes, but `MANTA_SERVER_*` only alongside a config file |
 | `health` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon's `/healthz`; a named config that resolves to no `[server]` table is an error | yes, but `MANTA_SERVER_*` only alongside a config file |
-| `decode` | `[decode]` `[detector]` `[spot]` and `input.freq_correction_ppm` | no |
+| `decode` | `[decode]` `[detector]` `[spot]` and `input.freq_correction_ppm`; several `[[input]]` entries that disagree on it need `--freq-correction-ppm` | no |
 | `oracle` | `[decode]` | no |
 | `bench sensitivity` | `[decode]` `[detector]` | no |
 | `grade` | `[rbn_compare]` `window_secs`, the tolerances and the spotter lists, from the file `--config` names; its flags win | no |
@@ -206,13 +206,14 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | Key | Default | Wired | Notes |
 |---|---|---|---|
 | `type` | none; example `"kiwi"`; unset uses the default sound card, or the source the command line names | live: `run`, `soak`, `doctor`, `check` | `"audio"`, `"file"`, `"kiwi"`, `"soapy"`, `"hpsdr"` or `"ka9q"`. Each type accepts only its own keys below. |
+| `name` | none; example `"20m"`; unset uses the input's `type` (`audio` when untyped) | live: `run`, `soak`, `doctor`, `calibrate`, `check` | The input's name in log lines and in `--input NAME`. Letters, digits, `.`, `_` and `-`, starting with a letter or digit, at most 32 characters. Required on every entry when there are several `[[input]]` entries (MAN-13). |
 | `device` | none; example `"USB Audio"`; unset uses the system's default input | live: `type = "audio"` | Part of the device's name; `manta devices` lists them. `--device` overrides it. |
 | `path` | none; example `"capture.wav"`; required for `type = "file"` | live: `type = "file"` | WAV recording replayed as if live. A relative path set in the file is relative to the file's directory; from `--source`, which overrides it, or `MANTA_INPUT_PATH` it is relative to the working directory. |
 | `iq` | `false` | live: `type = "file"` | `true` for a two-channel IQ recording. `--source-iq` sets it. |
 | `realtime` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` paces the replay to the recording's own clock, so telnet/JSON clients can watch it. `--realtime` sets it; a live source refuses it. See [DECISIONS/2026-10-10-man269-paced-looping-replay.md](DECISIONS/2026-10-10-man269-paced-looping-replay.md). |
 | `loop` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` replays the file again from the start each time it ends, until stopped; implies `realtime`. `--loop` sets it; a live source refuses it. |
-| `host` | none; example `"<your-receiver-host>"`; required for kiwi and hpsdr | live: `type = "kiwi"` or `"hpsdr"` (hpsdr needs the build feature) | Receiver host name. `--kiwi-host` or `--hpsdr-host` overrides it. |
-| `port` | `8073`; `1024` for hpsdr; `5004` for ka9q | live: `type = "kiwi"`, `"hpsdr"` (hpsdr needs the build feature) or `"ka9q"` | Receiver port, 1 to 65535; for ka9q, the group's RTP data port. `--kiwi-port`, `--hpsdr-port` or `--ka9q-port` overrides it. |
+| `host` | none; example `"<your-receiver-host>"`; required for kiwi and hpsdr | live: `type = "kiwi"` or `"hpsdr"` | Receiver host name. `--kiwi-host` or `--hpsdr-host` overrides it. |
+| `port` | `8073`; `1024` for hpsdr; `5004` for ka9q | live: `type = "kiwi"`, `"hpsdr"` or `"ka9q"` | Receiver port, 1 to 65535; for ka9q, the group's RTP data port. `--kiwi-port`, `--hpsdr-port` or `--ka9q-port` overrides it. |
 | `password` | `""` | live: `type = "kiwi"` | KiwiSDR password; empty for a public receiver. `config check` prints only whether it is set. `--kiwi-password` overrides it. |
 | `driver` | none; example `"driver=rtlsdr"`; required for soapy | live: `type = "soapy"` (needs the build feature) | SoapySDR device arguments. `--soapy-driver` overrides it. |
 | `gain_db` | none; example `30.0`; unset uses the device's automatic gain | live: `type = "soapy"` (needs the build feature) | Receiver gain, dB. `--soapy-gain` overrides it. |
@@ -225,6 +226,40 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `center_freq_hz` | none; example `14030000.0`; unset leaves frequencies as audio offsets, and `run` with `[server]` refuses a source that carries no frequency of its own | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Your radio's dial frequency, Hz, for a source that carries none. `--dial-freq-hz` overrides it. |
 | `capture_rate_hz` | none; example `48000.0`; unset decodes at the receiver's own rate | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Decimated sample rate, Hz. It must be at least 1000 (checked before the receiver opens), divide the receiver's rate by a power of two, and be 93.75 Hz (the channel spacing) times a power of two of at least 4, so in practice 1500, 3000, 6000, 12000, 24000, 48000, 96000 and so on. A rate that divides evenly but fails the last rule, such as 50000 from a 100 kS/s receiver, is rejected at startup. The decimator's transition band (the outer ~9.4% of each side, 24 of 256 channels at 48 kS/s — beyond the <= 1 dB point at 0.4526 x the rate) is not usable: the reported passband, `manta check`, SETT segments and tracked channels stop at the trusted band, and `run`/`soak` say so in one startup line naming the source's intersected passband. `--capture-rate-hz` overrides it. |
 | `replay_epoch` | none; example `1700000000`; unset uses the file's modification time | live: `run` with `[server]` and a file source; ignored elsewhere | Unix seconds that the recording's first sample stands for. `--replay-epoch` overrides it. |
+
+### Several receivers: [[input]]
+
+MAN-13: one `run` can decode several receivers -- several SDRs, or several
+receiver channels of one SDR (ka9q-radio SSRCs on one radiod, channels of one
+KiwiSDR) -- into one spot output. Write the input table as `[[input]]` once
+per receiver. Each entry takes the keys above, plus `name`. A one-entry
+`[[input]]` is the same as `[input]`.
+
+- With two or more entries, every entry needs a `name` and a `type`. Names
+  are unique; at most 16 entries.
+- `freq_correction_ppm`, `center_freq_hz` and `capture_rate_hz` belong to
+  their entry. An `audio` entry needs `center_freq_hz`, and a file entry
+  needs a sidecar or `center_freq_hz`, so every input's frequencies can be
+  compared.
+- File replay and live receivers do not mix in one run. `replay_epoch` goes
+  on the first entry only, and every file entry has the same `realtime` and
+  `loop`.
+- Two entries on one HPSDR radio are refused until MAN-307.
+- `MANTA_INPUT_*` and the per-receiver flags `--freq-correction-ppm`,
+  `--dial-freq-hz` and `--capture-rate-hz` cannot say which entry they set,
+  so they are refused; a source flag (`--source`, `--kiwi-host`, ...) still
+  replaces every entry with the one receiver it names.
+- `calibrate`, `doctor`, `soak` and `check` examine one receiver: pass
+  `--input NAME`.
+- A station two receivers both hear is spotted once (the shared validator's
+  cross-input dedupe), on stdout and, with `[server]`, on the one telnet,
+  JSON and metrics server. `/healthz` stays `ok` while at least one input
+  is healthy. SIGHUP reloads `[spot]` lists and `dry_run`, `refresh_lists`
+  refreshes `cty.dat` and `MASTER.SCP` for every input, `manta_rtty_signals`
+  counts every input's RTTY marks, each input keeps its own
+  `manta_input_*{source}` counters, and with `live_port` set each input
+  sends its own `bandState` record, named in its `source` field. See
+  [DECISIONS/2026-10-15-man13-multi-input-daemon.md](DECISIONS/2026-10-15-man13-multi-input-daemon.md).
 
 ## [spot]
 

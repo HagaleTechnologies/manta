@@ -46,7 +46,8 @@ pub(crate) fn check(config_flag: Option<PathBuf>) -> Result<()> {
     // rejects source types this build cannot open), blocklist/notch reads.
     // Never `spec.open()`, never `is_rf_aware()` (it opens IQ WAVs), never
     // `start_spot_server`.
-    let prepared = crate::prepare_live(crate::CliOverrides::none(), path.clone(), None, true)?;
+    let prepared =
+        crate::prepare_live(crate::CliOverrides::none(), path.clone(), None, true, None)?;
     crate::refuse_rbn_compare_replay(&prepared.resolved, false)?;
     reject_placeholders(&prepared.loaded)?;
     reject_duplicate_ports(&prepared.loaded)?;
@@ -513,7 +514,70 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
         Some(rc) => rbn_compare_summary(rc, station),
     });
 
-    let mut input = match &loaded.input.source {
+    // MAN-13: one `input <name>:` line per entry when there are several;
+    // the single-input line is unchanged.
+    if loaded.inputs.len() >= 2 {
+        for named in &loaded.inputs {
+            let line = input_summary(&named.input);
+            lines.push(format!(
+                "input {}:{}",
+                named.name,
+                line.strip_prefix("input:").unwrap_or(&line)
+            ));
+        }
+    } else {
+        lines.push(input_summary(&loaded.input));
+    }
+
+    let path_or_none = |p: &Option<PathBuf>| {
+        p.as_ref()
+            .map_or("none".to_string(), |p| p.display().to_string())
+    };
+    let spot = &loaded.spot;
+    lines.push(format!(
+        "spot: allowlist={} blocklist_path={} notch_path={} cty_path={} scp_path={} \
+         cty_sha256={} scp_sha256={} refresh_lists={} list_cache_dir={} cty_url={} scp_url={} \
+         validation_level={} pattern_path={}",
+        if spot.allowlist.is_empty() {
+            "none".to_string()
+        } else {
+            spot.allowlist.join(",")
+        },
+        path_or_none(&spot.blocklist_path),
+        path_or_none(&spot.notch_path),
+        spot.cty_path
+            .as_ref()
+            .map_or("bundled".to_string(), |p| p.display().to_string()),
+        spot.scp_path
+            .as_ref()
+            .map_or("bundled".to_string(), |p| p.display().to_string()),
+        spot.cty_sha256.as_deref().unwrap_or("none"),
+        spot.scp_sha256.as_deref().unwrap_or("none"),
+        if spot.refresh_lists { "on" } else { "off" },
+        path_or_none(&spot.list_cache_dir),
+        spot.cty_url(),
+        spot.scp_url(),
+        spot.validation_level.as_str(),
+        spot.pattern_path
+            .as_ref()
+            .map_or("bundled".to_string(), |p| p.display().to_string()),
+    ));
+
+    let detector = set_keys(loaded, "detector", &[]);
+    lines.push(if detector.is_empty() {
+        "detector: defaults".to_string()
+    } else {
+        format!("detector: {} (other keys default)", detector.join(" "))
+    });
+    let mut decode = vec![format!("engine={}", engine_name(loaded.decode.engine))];
+    decode.extend(set_keys(loaded, "decode", &["engine"]));
+    lines.push(format!("decode: {} (other keys default)", decode.join(" ")));
+    lines
+}
+
+/// One input's `config check` summary line.
+fn input_summary(file: &crate::config::InputFile) -> String {
+    let mut input = match &file.source {
         None => "input: type=unset (the default sound card, unless a command-line flag picks \
                  the source)"
             .to_string(),
@@ -575,7 +639,7 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             interface.map_or("default".to_string(), |i| i.to_string())
         ),
     };
-    let shared = &loaded.input.shared;
+    let shared = &file.shared;
     for (key, value) in [
         (
             "freq_correction_ppm",
@@ -595,52 +659,7 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             input.push_str(&format!(" {key}={v}"));
         }
     }
-    lines.push(input);
-
-    let path_or_none = |p: &Option<PathBuf>| {
-        p.as_ref()
-            .map_or("none".to_string(), |p| p.display().to_string())
-    };
-    let spot = &loaded.spot;
-    lines.push(format!(
-        "spot: allowlist={} blocklist_path={} notch_path={} cty_path={} scp_path={} \
-         cty_sha256={} scp_sha256={} refresh_lists={} list_cache_dir={} cty_url={} scp_url={} \
-         validation_level={} pattern_path={}",
-        if spot.allowlist.is_empty() {
-            "none".to_string()
-        } else {
-            spot.allowlist.join(",")
-        },
-        path_or_none(&spot.blocklist_path),
-        path_or_none(&spot.notch_path),
-        spot.cty_path
-            .as_ref()
-            .map_or("bundled".to_string(), |p| p.display().to_string()),
-        spot.scp_path
-            .as_ref()
-            .map_or("bundled".to_string(), |p| p.display().to_string()),
-        spot.cty_sha256.as_deref().unwrap_or("none"),
-        spot.scp_sha256.as_deref().unwrap_or("none"),
-        if spot.refresh_lists { "on" } else { "off" },
-        path_or_none(&spot.list_cache_dir),
-        spot.cty_url(),
-        spot.scp_url(),
-        spot.validation_level.as_str(),
-        spot.pattern_path
-            .as_ref()
-            .map_or("bundled".to_string(), |p| p.display().to_string()),
-    ));
-
-    let detector = set_keys(loaded, "detector", &[]);
-    lines.push(if detector.is_empty() {
-        "detector: defaults".to_string()
-    } else {
-        format!("detector: {} (other keys default)", detector.join(" "))
-    });
-    let mut decode = vec![format!("engine={}", engine_name(loaded.decode.engine))];
-    decode.extend(set_keys(loaded, "decode", &["engine"]));
-    lines.push(format!("decode: {} (other keys default)", decode.join(" ")));
-    lines
+    input
 }
 
 /// D3/D4: stderr notes that never change the exit code. I/O-free: the dial

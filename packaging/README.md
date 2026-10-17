@@ -23,8 +23,9 @@ there.
 - **A network receiver.** The recipes are written for a KiwiSDR, which
   every build supports and which needs no device permissions. An HPSDR
   radio on the network works the same way. None of the recipes gives manta
-  access to a local sound card or USB SDR. Release binaries include
-  KiwiSDR and HPSDR support, not SoapySDR. Before you run the service against a receiver you don't own, read [the KiwiSDR guide](../docs/GUIDES/kiwisdr.md).
+  access to a local sound card or USB SDR. Every build includes KiwiSDR
+  and HPSDR; SoapySDR is optional and has a separate Linux x86_64 release archive.
+  Before you run the service against a receiver you don't own, read [the KiwiSDR guide](../docs/GUIDES/kiwisdr.md).
 - **Linux:** the binary needs the ALSA runtime library even when it never
   opens a sound card: `sudo apt install libasound2` on Debian, Ubuntu and
   Raspberry Pi OS (`libasound2t64` on Debian 13). Without it, `./manta`
@@ -35,7 +36,7 @@ there.
   refuses to run `./manta` because it was downloaded from the internet,
   clear the flag with `xattr -d com.apple.quarantine ./manta`.
 - **Source checkout:** build with
-  `cargo build --release -p manta-cli --features hpsdr` and use
+  `cargo build --release -p manta-cli` and use
   `target/release/manta` wherever a command below says `./manta`.
 
 ## Configure first
@@ -187,6 +188,9 @@ verify` must report no errors for the unit.
   manta stops decoding, gives connected clients up to 50 seconds to drain,
   and gives its runtime up to 2 more seconds to shut down.
   `TimeoutStopSec=60` leaves a margin before systemd sends SIGKILL.
+  A second SIGTERM while manta drains (for example a second
+  `systemctl kill manta`) ends it at once, without the rest of the drain,
+  with exit status 143.
 - **Logs.** stdout and stderr go to the journal under the identifier
   `manta`. Reading them with `journalctl -u manta` needs root or
   membership in the `systemd-journal` or `adm` group. journald keeps them

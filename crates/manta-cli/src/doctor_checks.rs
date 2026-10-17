@@ -9,7 +9,7 @@ use crate::config::Loaded;
 use crate::config_cmd::{self, Listener};
 use manta_server::config::{RbnCompareConfig, RbnUplinkConfig, ServerConfig};
 use manta_server::status_doc::escape_for_terminal;
-use std::io::{self, Write as _};
+use std::io;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::mpsc;
@@ -146,10 +146,13 @@ pub(crate) fn worst(checks: &[Check]) -> Status {
 }
 
 /// Where checks go: printed as each result is known (human mode), or only
-/// collected (`--json`).
+/// collected (`--json`). MAN-232: the first failed write is remembered, not
+/// panicked on, and later checks are collected without printing.
 pub(crate) struct Sink {
     json: bool,
     pub checks: Vec<Check>,
+    /// The first failed stdout write, if any.
+    failed: Option<anyhow::Error>,
 }
 
 impl Sink {
@@ -157,15 +160,24 @@ impl Sink {
         Self {
             json,
             checks: Vec::new(),
+            failed: None,
         }
     }
 
     pub fn push(&mut self, check: Check) {
-        if !self.json {
-            print!("{}", render(&check));
-            let _ = io::stdout().flush();
+        if !self.json && self.failed.is_none() {
+            if let Err(e) = crate::stdio::out!("{}", render(&check)) {
+                self.failed = Some(e);
+            }
         }
         self.checks.push(check);
+    }
+
+    /// The first failed write, so `doctor` stops instead of opening the
+    /// receiver and running the signal check for a reader that left
+    /// (MAN-232); `main` maps it to exit 141.
+    pub fn written(&mut self) -> anyhow::Result<()> {
+        self.failed.take().map_or(Ok(()), Err)
     }
 }
 
@@ -748,7 +760,6 @@ pub(crate) enum ReceiverKind {
     Kiwi,
     #[cfg(feature = "soapy")]
     Soapy,
-    #[cfg(feature = "hpsdr")]
     Hpsdr,
     Ka9q,
 }
@@ -762,7 +773,6 @@ impl ReceiverKind {
             ReceiverKind::Kiwi => "KiwiSDR",
             #[cfg(feature = "soapy")]
             ReceiverKind::Soapy => "SoapySDR",
-            #[cfg(feature = "hpsdr")]
             ReceiverKind::Hpsdr => "HPSDR",
             ReceiverKind::Ka9q => "ka9q-radio",
         }
@@ -786,7 +796,6 @@ impl ReceiverKind {
                 "check --soapy-driver/input.driver, and that SoapySDRUtil --find lists the \
                  radio; install its SoapySDR module if it does not"
             }
-            #[cfg(feature = "hpsdr")]
             ReceiverKind::Hpsdr => {
                 "check --hpsdr-host/input.host, and that the radio is powered on and on this \
                  network"
@@ -1601,7 +1610,6 @@ mod tests {
     #[test]
     fn receiver_fail_has_a_per_kind_fix() {
         let err = anyhow::anyhow!("inner").context("outer");
-        #[cfg_attr(not(any(feature = "soapy", feature = "hpsdr")), allow(unused_mut))]
         let mut cases: Vec<(crate::LiveSourceSpec, &str, &[&str])> = vec![
             (
                 crate::LiveSourceSpec::AudioDevice(None),
@@ -1638,7 +1646,6 @@ mod tests {
             "could not open SoapySDR device \"driver=rtlsdr\": outer: inner",
             &["--soapy-driver", "SoapySDRUtil --find"],
         ));
-        #[cfg(feature = "hpsdr")]
         cases.push((
             crate::LiveSourceSpec::Hpsdr(crate::HpsdrOpts {
                 host: Some("10.0.0.5".into()),

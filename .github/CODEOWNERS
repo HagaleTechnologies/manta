@@ -7,7 +7,6 @@
 # list an agent identity as an owner.
 
 /.github/            @thagale
-/.mergify.yml        @thagale
 
 # cargo build/test resolves exactly this dependency graph -- an unowned edit to any crate's OWN
 # Cargo.toml (not just the workspace root) can change a direct dependency's installed version
@@ -17,13 +16,19 @@
 Cargo.toml           @thagale
 /Cargo.lock          @thagale
 
+# A build script runs arbitrary code on every cargo build, test and clippy run, CI's and release's
+# included (crates/manta-cli/build.rs shells out to git today). No leading slash, like Cargo.toml
+# above, so a crate that adds its own build.rs is covered too; a custom `build = "..."` path
+# needs a Cargo.toml edit, which is already owned.
+build.rs             @thagale
+
 # deny.toml decides which advisories, licenses and dependency sources pass the "Supply Chain"
 # required check (MAN-156); an unowned edit could allowlist its way past it.
 /deny.toml           @thagale
 
 # Cross.toml controls the exact cross-compilation toolchain/image used to build release
 # artifacts -- an unowned edit here can substitute a different (unverified) build environment
-# for release builds without touching release.yml itself.
+# for release builds without touching the release workflow itself.
 /Cross.toml          @thagale
 
 # .cargo/config.toml sets git-fetch-with-cli (this workspace's git dependencies otherwise
@@ -34,7 +39,7 @@ Cargo.toml           @thagale
 /.cargo/             @thagale
 
 # rust-toolchain.toml is enforced by scripts/check-rust-toolchain-pin.sh, CI's own trust
-# mechanism (ci.yml's test job runs it before anything else, specifically so a toolchain
+# mechanism (ci-full.yml's test job runs it before anything else, specifically so a toolchain
 # mismatch reports as itself, not a confusing downstream diff) -- an unowned edit here changes
 # which toolchain CI/release actually compile with, silently invalidating what a green required
 # check proves.
@@ -42,6 +47,12 @@ Cargo.toml           @thagale
 
 /.gitignore          @thagale
 /.dockerignore       @thagale
+
+# .gitattributes decides the bytes every checkout writes, CI's and release builds' included. The
+# root file pins two byte-compared test fixtures to LF; an unowned edit, or a nested
+# .gitattributes (hence no leading slash), could rewrite them or the vendored CRLF cty.dat and
+# master.scp without touching those files.
+.gitattributes       @thagale
 
 /AGENTS.md           @thagale
 /CLAUDE.md           @thagale
@@ -86,3 +97,8 @@ Cargo.toml           @thagale
 # allowlist here is more likely to silently miss a new script than an unowned file elsewhere is
 # to wrongly gain review friction.
 /scripts/            @thagale
+
+# .catalyst/catalyst.toml lists the commands the Catalyst pipeline runs to set up and verify its
+# own work (fmt, clippy -D warnings, the test legs) before its PRs merge unattended; an unowned
+# edit could drop a verify step from the pipeline that wrote it. Whole directory, as for scripts/.
+/.catalyst/          @thagale

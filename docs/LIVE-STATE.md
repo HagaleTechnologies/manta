@@ -117,7 +117,9 @@ client limit and a larger lag allowance:
 
 ## `bandState` records
 
-Once per second of stream time, one record covering the whole passband:
+Once per second of stream time, one record covering the whole passband.
+With several `[[input]]` entries (MAN-13), one record per input per stream
+second, each covering that input's passband and naming it in `source`:
 
 ```json
 {"kind":"bandState","deCall":"W1AW","timestamp":1700000005,"bands":[{"band":"20m","loHz":14000000,"hiHz":14047906,"channels":512,"noiseFloorDb":-62.2,"occupancy":0.0059,"activeTracks":1},{"band":"unknown","loHz":13952000,"hiHz":13999906,"channels":512,"noiseFloorDb":-62.2,"occupancy":0.0,"activeTracks":0}]}
@@ -127,6 +129,7 @@ Once per second of stream time, one record covering the whole passband:
 |---|---|---|---|
 | `kind` | string | never | Always `"bandState"`. |
 | `deCall` | string | never | `[server].station_callsign`, uppercased, as in a spot's `deCall`. |
+| `source` | string | absent with one input | The `[[input]]` `name` whose passband the record covers. Present only with several inputs. |
 | `timestamp` | integer | never | The stream second this record describes. |
 | `bands` | array | never | One entry per band the passband covers, in band-table order (lowest band first), with the `unknown` entry last. Bands the passband does not reach are absent. Empty only if the passband has no channels. |
 
@@ -240,7 +243,7 @@ dashboard can drop the track's row on this record.
 | `deCall` | string | never | As in `bandState`. |
 | `timestamp` | integer | never | Stream time of the newest decoder event when the track closed. |
 | `trackId` | integer | never | The track that closed. |
-| `closure` | string | never | `signalEnded`: the signal ended (a sustained power drop, no character for the silence timeout, or the end of the input). `bookkeeping`: the track stopped being tracked with no evidence the signal ended: it merged into another track, was evicted, or was closed by a source reconnect. |
+| `closure` | string | never | `signalEnded`: the signal ended (a sustained power drop, no character for the silence timeout, or the end of the input). `bookkeeping`: the track stopped being tracked with no evidence the signal ended: it merged into another track, was evicted, or was closed by a source outage (a reconnect, or a stop while the source was down). |
 | `survivorTrackId` | integer or null | unless merged | For a `bookkeeping` closure that merged into another track, that track's `trackId`; the signal continues there. `null` otherwise. |
 
 ## Decisions and reasons

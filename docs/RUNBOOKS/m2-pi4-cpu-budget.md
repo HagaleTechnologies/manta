@@ -37,7 +37,7 @@ MAN-30's fate.
    the Pi4**, install the ALSA dev headers and `pkg-config` — a fresh
    Raspberry Pi OS install has neither, and `manta-engine` pulls in
    `manta-input` → `cpal` → `alsa-sys`, which needs both to build. This
-   mirrors the repo's own Linux CI step (`.github/workflows/ci.yml`):
+   mirrors the repo's own Linux CI step (`.github/workflows/ci-full.yml`):
    ```
    sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
    ```

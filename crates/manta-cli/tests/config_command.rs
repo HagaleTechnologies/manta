@@ -434,19 +434,18 @@ fn check_rejects_a_soapy_input_on_a_build_without_soapy() {
     );
 }
 
-#[cfg(not(feature = "hpsdr"))]
 #[test]
-fn check_rejects_an_hpsdr_input_on_a_build_without_hpsdr() {
+fn check_accepts_an_hpsdr_input_without_opening_the_receiver() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_cfg(
         dir.path(),
         "manta.toml",
-        "[input]\ntype = \"hpsdr\"\nhost = \"h\"\nfreq_hz = 7e6\nrate_hz = 48000.0\n",
+        "[input]\ntype = \"hpsdr\"\nhost = \"receiver.invalid\"\nfreq_hz = 7030000.0\nrate_hz = 48000.0\n",
     );
-    let err = fails(&check_file(&path));
-    assert!(
-        err.contains("input.type = \"hpsdr\" needs a manta built with --features hpsdr"),
-        "{err}"
+    let out = succeeds(&check_file(&path));
+    assert_eq!(
+        out.lines().find(|line| line.starts_with("input:")),
+        Some("input: type=hpsdr host=receiver.invalid port=1024 freq_hz=7030000 rate_hz=48000")
     );
 }
 
@@ -932,4 +931,95 @@ fn check_summary_reports_pattern_level_and_resolved_path() {
         ))),
         "{out}"
     );
+}
+
+// ---- MAN-13: several [[input]] entries
+
+/// Three ka9q channels of one radiod, the design section's topology B.
+const THREE_INPUTS_TOML: &str =
+    "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
+     telnet_port = 0\njson_port = 0\nmetrics_port = 0\n\n\
+     [[input]]\nname = \"40m\"\ntype = \"ka9q\"\ngroup = \"239.1.2.3\"\nssrc = 7030000\n\n\
+     [[input]]\nname = \"20m\"\ntype = \"ka9q\"\ngroup = \"239.1.2.3\"\nssrc = 14030000\n\n\
+     [[input]]\nname = \"15m\"\ntype = \"ka9q\"\ngroup = \"239.1.2.3\"\nssrc = 21030000\n\
+     freq_correction_ppm = 0.8\n";
+
+#[test]
+fn check_prints_one_input_line_per_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cfg(dir.path(), "manta.toml", THREE_INPUTS_TOML);
+    let out = succeeds(&check_file(&path));
+    let inputs: Vec<&str> = out.lines().filter(|l| l.starts_with("input")).collect();
+    assert_eq!(
+        inputs,
+        [
+            "input 40m: type=ka9q group=239.1.2.3 port=5004 ssrc=7030000 interface=default",
+            "input 20m: type=ka9q group=239.1.2.3 port=5004 ssrc=14030000 interface=default",
+            "input 15m: type=ka9q group=239.1.2.3 port=5004 ssrc=21030000 interface=default \
+             freq_correction_ppm=0.8",
+        ],
+        "{out}"
+    );
+}
+
+#[test]
+fn check_single_input_line_is_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cfg(
+        dir.path(),
+        "manta.toml",
+        "[input]\ntype = \"ka9q\"\ngroup = \"239.1.2.3\"\nssrc = 7030000\n\
+         freq_correction_ppm = 0.8\n",
+    );
+    let out = succeeds(&check_file(&path));
+    assert!(
+        out.lines().any(|l| l
+            == "input: type=ka9q group=239.1.2.3 port=5004 ssrc=7030000 interface=default \
+                freq_correction_ppm=0.8"),
+        "{out}"
+    );
+}
+
+#[test]
+fn check_binds_no_port_and_opens_no_receiver_with_several_inputs() {
+    // Hold the three server ports, and two fake KiwiSDRs that must see no
+    // connection.
+    let held: Vec<TcpListener> = (0..3)
+        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = held
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let kiwis: Vec<TcpListener> = (0..2)
+        .map(|_| {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.set_nonblocking(true).unwrap();
+            l
+        })
+        .collect();
+    let mut body = format!(
+        "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
+         telnet_port = {}\njson_port = {}\nmetrics_port = {}\n",
+        ports[0], ports[1], ports[2]
+    );
+    for (i, kiwi) in kiwis.iter().enumerate() {
+        body.push_str(&format!(
+            "\n[[input]]\nname = \"k{i}\"\ntype = \"kiwi\"\nhost = \"127.0.0.1\"\nport = {}\n\
+             freq_hz = 7030000.0\n",
+            kiwi.local_addr().unwrap().port()
+        ));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cfg(dir.path(), "manta.toml", &body);
+    let out = succeeds(&check_file(&path));
+    assert!(out.contains("input k0: type=kiwi"), "{out}");
+    assert!(out.contains("input k1: type=kiwi"), "{out}");
+    for kiwi in &kiwis {
+        match kiwi.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok((_, peer)) => panic!("config check connected to a receiver from {peer}"),
+            Err(e) => panic!("unexpected accept error: {e}"),
+        }
+    }
 }

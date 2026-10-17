@@ -1,5 +1,5 @@
 # Cross-compilation config for `cross` (cross-rs), used by
-# .github/workflows/release.yml and release-publish.yml for both Linux gnu
+# .github/workflows/release-publish.yml for both Linux gnu
 # targets.
 #
 # `git` is installed for both targets because the workspace's git

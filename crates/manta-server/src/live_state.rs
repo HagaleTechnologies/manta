@@ -124,6 +124,10 @@ pub fn band_rollup(input: BandInput<'_>) -> Vec<BandRow> {
 pub struct BandStateRecord {
     pub kind: &'static str,
     pub de_call: String,
+    /// MAN-13: the `[[input]]` name this record describes; absent with one
+    /// input, whose record covers the whole passband.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub timestamp: i64,
     pub bands: Vec<BandRow>,
 }
@@ -133,9 +137,16 @@ impl BandStateRecord {
         Self {
             kind: BAND_STATE_KIND,
             de_call: de_call.to_string(),
+            source: None,
             timestamp,
             bands,
         }
+    }
+
+    /// MAN-13: names the input the record describes.
+    pub fn with_source(mut self, source: &str) -> Self {
+        self.source = Some(source.to_string());
+        self
     }
 }
 
@@ -413,6 +424,14 @@ mod tests {
         )
     }
 
+    #[test]
+    fn band_state_names_its_input_only_when_given_one() {
+        let one = serde_json::to_value(sample_band_state()).unwrap();
+        assert!(one.get("source").is_none(), "{one}");
+        let named = serde_json::to_value(sample_band_state().with_source("20m")).unwrap();
+        assert_eq!(named["source"], "20m");
+    }
+
     fn sample_track_state() -> TrackStateRecord {
         TrackStateRecord::new(
             "W1AW",
@@ -539,6 +558,8 @@ mod tests {
             confidence: 0.9,
             track_id: 9,
             sample_ts: 0,
+            rst: None,
+            qrl_query: false,
         };
         let mut spotted = decision(Verdict::Spotted, None);
         spotted.spot = Some(spot);
@@ -666,7 +687,8 @@ mod tests {
             support: Support::default(),
         });
         let samples = [
-            serde_json::to_value(sample_band_state()).unwrap(),
+            // MAN-13: `source` is serialized with several inputs.
+            serde_json::to_value(sample_band_state().with_source("20m")).unwrap(),
             serde_json::to_value(sample_track_state()).unwrap(),
             serde_json::to_value(CandidateDecisionRecord::new("W1AW", 1, &variant, None)).unwrap(),
             serde_json::to_value(TrackClosedRecord::new(

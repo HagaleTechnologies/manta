@@ -1,5 +1,6 @@
 """Static checks for the MAN-243 CI trust boundary (which PR revisions may run in main's context,
-which runs may write the shared build cache, and that release builds start cold).
+which runs may write the shared build cache, and that release builds start cold), and for
+MAN-245's one Dependabot classification across the gate workflows.
 
 stdlib unittest only -- PyYAML is not available on every runner -- so workflows are read as text.
 Run: python3 -m unittest scripts.tests.test_ci_trust_boundary -v
@@ -20,12 +21,18 @@ REPO = "HagaleTechnologies/manta"
 TRUSTED = {"thagale", "catalyst-cloud-connector[bot]"}
 DISPATCH_CALL = "actions/workflows/ci-full.yml/dispatches"
 BLOCK_SCALARS = {"|", "|-", "|+", ">", ">-", ">+"}
-CI_TEST_JOBS = ("test", "test-soapy", "test-hpsdr")
+CI_TEST_JOBS = ("test", "test-soapy")
 SAVE_IF = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
-NATIVE_IF = ("github.event_name != 'pull_request' || github.actor == 'dependabot[bot]' || "
+NATIVE_IF = ("github.event_name != 'pull_request' || "
              "github.event.pull_request.head.repo.full_name != github.repository || "
              "!contains(fromJSON('[\"thagale\",\"catalyst-cloud-connector[bot]\"]'), "
              "github.event.pull_request.user.login)")
+# MAN-245: the one "Dependabot update" classification every gate workflow uses -- opened by
+# dependabot[bot] from a branch in this repository, and this event triggered by dependabot[bot].
+DEPENDABOT_UPDATE = ("github.actor == 'dependabot[bot]' && "
+                     "github.event.pull_request.user.login == 'dependabot[bot]' && "
+                     "github.event.pull_request.head.repo.full_name == github.repository")
+DEPENDABOT = "dependabot[bot]"
 
 
 def read(name):
@@ -347,7 +354,7 @@ CACHE_MARKERS = ("actions/cache@", "cache-from:", "cache-to:", "sccache")
 class CiFullCacheTests(unittest.TestCase):
     def test_rust_cache_saves_only_on_push_to_main(self):
         found = rust_cache_steps(read("ci-full.yml"))
-        self.assertEqual(len(found), 3, "expected exactly three rust-cache steps in ci-full.yml")
+        self.assertEqual(len(found), 2, "expected exactly two rust-cache steps in ci-full.yml")
         for job, step in found:
             with self.subTest(job=job):
                 with_block = sub(step, "with")
@@ -371,6 +378,19 @@ class CiFullNativePathTests(unittest.TestCase):
     def setUp(self):
         self.text = read("ci-full.yml")
 
+    def test_hpsdr_coverage_moves_to_default_ci_and_catalyst_together(self):
+        self.assertEqual(tuple(j for j in job_ids(self.text) if j.startswith("test")), CI_TEST_JOBS)
+        # This suite also runs on macOS; do not require Python 3.11's tomllib.
+        with open(os.path.join(ROOT, ".catalyst", "catalyst.toml"), encoding="utf-8") as f:
+            config = f.read()
+        names = set(re.findall(r'^name = "([^"\n]+)"$', config, re.M))
+        self.assertFalse({"clippy-hpsdr", "test-hpsdr"} & names)
+        command = re.search(r'^name = "test-workspace"\nrun = (\[[^\n]*\])$', config, re.M)
+        self.assertIsNotNone(command, "Catalyst must retain the workspace test gate")
+        self.assertEqual(json.loads(command.group(1)), ["cargo", "test", "--workspace", "--locked"])
+        self.assertTrue(any((run_body(s) or "").strip() == "cargo test --workspace --locked"
+                            for s in steps(job_block(self.text, "test"))))
+
     def test_test_jobs_run_natively_for_non_dispatch_eligible_prs(self):
         for job in CI_TEST_JOBS:
             with self.subTest(job=job):
@@ -388,6 +408,69 @@ class CiFullNativePathTests(unittest.TestCase):
         self.assertEqual(len(matches), 1, f"job test has no step running {wanted!r}")
         self.assertEqual(field(matches[0], "if"), "runner.os != 'Windows'")
 
+
+
+def is_dependabot_update(actor, author, head_repo):
+    """Python mirror of DEPENDABOT_UPDATE (tied to the YAML text by DependabotClassificationTests)."""
+    return actor == DEPENDABOT and author == DEPENDABOT and head_repo == REPO
+
+
+def runs_natively(author, head_repo):
+    """Python mirror of NATIVE_IF for a pull_request event."""
+    return head_repo != REPO or author not in TRUSTED
+
+
+DEPENDABOT_CASES = [  # (case, actor, author, head repo, Dependabot update?, ci-full native run?)
+    ("1 genuine update", DEPENDABOT, DEPENDABOT, REPO, True, True),
+    ("2 human pushes to bot PR", "thagale", DEPENDABOT, REPO, False, True),
+    ("3 owner PR", "thagale", "thagale", REPO, False, False),
+    ("4 agent PR", "catalyst-cloud-connector[bot]", "catalyst-cloud-connector[bot]", REPO, False, False),
+    ("5 outside contributor, in-repo branch", "someuser", "someuser", REPO, False, True),
+    ("6 owner event on contributor PR", "thagale", "someuser", REPO, False, True),
+    ("7 fork", "someuser", "someuser", "someuser/manta", False, True),
+    ("8 bot actor on human PR", DEPENDABOT, "thagale", REPO, False, False),
+    ("9 bot login from a fork", DEPENDABOT, DEPENDABOT, "someuser/manta", False, True),
+    ("10 deleted head repo", DEPENDABOT, DEPENDABOT, "", False, True),
+]
+
+
+class DependabotClassificationTests(unittest.TestCase):
+    """MAN-245 scenario 2: a PR not authored by Dependabot from this repository takes the normal
+    review path in every gate workflow, whoever triggered the event."""
+
+    def test_codex_gate_excludes_only_dependabot_updates(self):
+        step = step_by_id(job_block(read("wait-for-codex.yml"), "codex-review-request"), "create-check")
+        self.assertEqual(field(sub(step, "env"), "IS_EXCLUDED_DEPENDABOT"), "${{ " + DEPENDABOT_UPDATE + " }}")
+
+    def test_auto_merge_jobs_run_only_for_dependabot_updates(self):
+        text = read("dependabot-auto-merge.yml")
+        for job in ("verify", "check-needs-human", "auto-merge"):
+            with self.subTest(job=job):
+                self.assertEqual(field(job_block(text, job), "if"), DEPENDABOT_UPDATE)
+
+    def test_no_actor_only_dependabot_test(self):
+        negated = []
+        for path in workflow_files():
+            name = os.path.basename(path)
+            with open(path, encoding="utf-8") as f:
+                lines = code_lines(f.read())
+            for line in lines:
+                if "github.actor == 'dependabot[bot]'" in line:
+                    with self.subTest(file=name, line=line.strip()):
+                        self.assertIn("github.event.pull_request.user.login == 'dependabot[bot]'", line)
+                if "github.actor != 'dependabot[bot]'" in line:
+                    negated.append((name, line.strip()))
+        # The one actor-only test left is a capability check, not a classification: GitHub
+        # withholds Actions secrets from a Dependabot-actor run, so the app-token mint is skipped.
+        self.assertEqual(negated, [("wait-for-codex.yml", "if: github.actor != 'dependabot[bot]'")])
+        mint = step_by_id(job_block(read("wait-for-codex.yml"), "codex-review-request"), "app-token")
+        self.assertEqual(field(mint, "if"), "github.actor != 'dependabot[bot]'")
+
+    def test_classification_table(self):
+        for case, actor, author, head_repo, update, native in DEPENDABOT_CASES:
+            with self.subTest(case=case):
+                self.assertEqual(is_dependabot_update(actor, author, head_repo), update)
+                self.assertEqual(runs_natively(author, head_repo), native)
 
 
 def release_workflows():

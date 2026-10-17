@@ -28,6 +28,11 @@ pub struct StartupInfo<'a> {
     /// MAN-324: the live-state listener's bound address, when
     /// `[server].live_port` is set.
     pub live_addr: Option<SocketAddr>,
+    /// MAN-13: the `[[input]]` names, set only with two or more inputs.
+    /// The banner then names them (`inputs=a,b`) instead of one source's
+    /// `source=`/`sample_rate_hz=`/`dial_frequency=`; each input prints
+    /// its own line (`format_input_line`) and its own ready line instead.
+    pub inputs: Option<&'a [String]>,
 }
 
 /// Scenario 1's one-line banner. The verb is `listening:`, not `ready:`
@@ -39,24 +44,53 @@ pub struct StartupInfo<'a> {
 /// Readiness to decode is a separate, later event; see
 /// `format_pipeline_ready`.
 pub fn format_startup_banner(info: &StartupInfo<'_>) -> String {
-    let mut line = format!(
-        "manta {} listening: source={} sample_rate_hz={:.0} dial_frequency={} station={} \
-         telnet={} json={} metrics={}",
-        info.version,
-        info.source,
-        info.sample_rate_hz,
-        crate::human::khz(info.dial_freq_hz),
-        info.station_callsign,
-        info.telnet_addr,
-        info.json_addr,
-        info.metrics_addr,
-    );
+    // MAN-13: with two or more inputs there is no one source, rate or dial
+    // to name -- each input prints its own line (`format_input_line`) and
+    // its own ready line -- so the banner names the inputs instead.
+    let mut line = match info.inputs {
+        Some(inputs) if inputs.len() >= 2 => format!(
+            "manta {} listening: inputs={} station={} telnet={} json={} metrics={}",
+            info.version,
+            inputs.join(","),
+            info.station_callsign,
+            info.telnet_addr,
+            info.json_addr,
+            info.metrics_addr,
+        ),
+        _ => format!(
+            "manta {} listening: source={} sample_rate_hz={:.0} dial_frequency={} station={} \
+             telnet={} json={} metrics={}",
+            info.version,
+            info.source,
+            info.sample_rate_hz,
+            crate::human::khz(info.dial_freq_hz),
+            info.station_callsign,
+            info.telnet_addr,
+            info.json_addr,
+            info.metrics_addr,
+        ),
+    };
     // MAN-324: appended only when the live-state listener runs, so the
     // banner is unchanged without `live_port`.
     if let Some(live) = info.live_addr {
         line.push_str(&format!(" live={live}"));
     }
     line
+}
+
+/// MAN-13: one input's line after it opens, naming its type, sample rate
+/// and dial frequency -- the per-input detail the multi-input banner
+/// leaves out. One per `[[input]]` entry, in config order.
+pub fn format_input_line(
+    name: &str,
+    source_type: &str,
+    sample_rate_hz: f64,
+    dial_freq_hz: f64,
+) -> String {
+    format!(
+        "input {name}: type={source_type} sample_rate_hz={sample_rate_hz:.0} dial_frequency={}",
+        crate::human::khz(dial_freq_hz)
+    )
 }
 
 /// The readiness event proper: emitted once, by the daemon wiring layer,
@@ -165,12 +199,19 @@ pub struct StatusSnapshot {
     pub ws_clients: i64,
     pub uplink: UplinkState,
     pub pipeline: PipelineState,
+    /// MAN-13: `(decoding, configured)` inputs, set only with two or more,
+    /// so a one-input line is unchanged.
+    pub inputs: Option<(usize, usize)>,
 }
 
 pub fn format_status_line(s: &StatusSnapshot) -> String {
+    let inputs = match s.inputs {
+        Some((decoding, configured)) => format!(" inputs={decoding}/{configured}"),
+        None => String::new(),
+    };
     format!(
         "manta status: uptime_s={} pipeline={} tracks={} spots_per_min={:.1} spots_total={} \
-         clients={} (telnet={} json={} ws={}) uplink={}",
+         clients={} (telnet={} json={} ws={}) uplink={}{inputs}",
         s.uptime_s,
         s.pipeline.as_str(),
         s.active_tracks,
@@ -199,23 +240,19 @@ pub fn spots_per_min(delta_spots: u64, elapsed: Duration) -> f64 {
 /// periodic-task idiom (`tasks::spawn_reaper`, `rate_limit::
 /// spawn_stale_entry_reaper`): a bare sleep loop, not `tokio::time::
 /// interval` (unused anywhere in this workspace), but additionally raced
-/// against the shutdown watch so the task cannot emit a status line into
-/// the middle of the shutdown drain.
+/// against the status task's own shutdown watch for prompt termination.
 ///
-/// **The returned `JoinHandle` is part of the contract, not a convenience:
-/// a caller that signals shutdown MUST await it before it starts draining
-/// clients** (MAN-122 review round 4, P2). The two in-task guards below
-/// order shutdown against this task's own `select!` poll points, but
-/// nothing orders it against the wall clock between the post-sleep
-/// `shutdown.borrow()` returning `false` and the `tracing::info!` that
-/// follows -- a shutdown landing inside that window still yields one
-/// status line printed into the middle of the drain, claiming a liveness
-/// the daemon no longer has. Joining the handle is what makes shutdown and
-/// emission mutually ordered from the outside, and it is cheap: the
-/// `shutdown.changed()` arm is `biased`-first, so the task returns within
-/// one scheduler poll of the signal rather than at the next `interval`
-/// tick. `manta-cli`'s `main` does exactly this, via
-/// `SpotServer::status_line`.
+/// The caller must signal this dedicated stop channel and await the returned
+/// `JoinHandle` before broadcasting client shutdown (MAN-256). A join after
+/// a shared broadcast is too late: that same send already wakes the clients
+/// to drain. The in-task guards cannot close the window between the last
+/// `shutdown.borrow()` and `tracing::info!`, so the join must finish before
+/// clients receive their signal. `manta-cli` enforces this ordering through
+/// `signal_spot_server_shutdown` and `SpotServer::status_line`.
+///
+/// The `shutdown.changed()` arm is `biased`-first, so a sleeping task exits
+/// on its next scheduler poll rather than waiting for the next `interval`
+/// tick. An in-flight status line finishes before the join returns.
 pub fn spawn_status_line(
     metrics: Arc<Metrics>,
     interval: Duration,
@@ -257,18 +294,11 @@ pub fn spawn_status_line(
             // within one poll, it does not order them against the wall
             // clock. Cheap (one `watch` borrow).
             //
-            // MAN-122 review round 4 (P2): this guard narrows the window,
-            // it does NOT close it -- a shutdown signalled after this
-            // borrow reads `false` but before the `tracing::info!` at the
-            // bottom of the loop still produces one line inside the drain,
-            // and no in-task check can close that (the check and the log
-            // cannot be made atomic against an external signal). The
-            // ordering is established from the OUTSIDE instead, by the
-            // caller joining this task's `JoinHandle` immediately after
-            // sending shutdown and before starting the client drain -- see
-            // this function's doc comment and `SpotServer::status_line` in
-            // `manta-cli`. Once that join returns, this task is gone and no
-            // further line is possible.
+            // This guard narrows the check-to-log window, but a stop signal
+            // after this borrow can still allow one final line. MAN-256:
+            // the caller signals this task's own channel and joins it BEFORE
+            // broadcasting client shutdown. Joining after a shared broadcast
+            // would already have let clients start draining.
             if *shutdown.borrow() {
                 return;
             }
@@ -295,6 +325,10 @@ pub fn spawn_status_line(
                     UplinkState::Disconnected
                 },
                 pipeline: PipelineState::from_progress(last_batches, batches, since_start),
+                inputs: match metrics.source_health_counts() {
+                    (decoding, configured) if configured >= 2 => Some((decoding, configured)),
+                    _ => None,
+                },
             };
             last_sample = now;
             last_spots = spots_total;
@@ -308,6 +342,41 @@ pub fn spawn_status_line(
 mod tests {
     use super::*;
 
+    /// MAN-13: with two or more inputs the banner names them instead of one
+    /// source, and drops the per-source `sample_rate_hz`/`dial_frequency`
+    /// (each input prints its own `format_input_line` line and its own
+    /// ready line instead).
+    #[test]
+    fn multi_input_banner_lists_inputs() {
+        let inputs = ["40m".to_string(), "20m".to_string(), "15m".to_string()];
+        let line = format_startup_banner(&StartupInfo {
+            version: "0.1.0",
+            source: "40m,20m,15m",
+            sample_rate_hz: 96_000.0,
+            dial_freq_hz: 7_030_000.0,
+            station_callsign: "K5TR",
+            telnet_addr: "0.0.0.0:7300".parse().unwrap(),
+            json_addr: "0.0.0.0:7301".parse().unwrap(),
+            metrics_addr: "127.0.0.1:7302".parse().unwrap(),
+            live_addr: None,
+            inputs: Some(&inputs),
+        });
+        assert_eq!(
+            line,
+            "manta 0.1.0 listening: inputs=40m,20m,15m station=K5TR telnet=0.0.0.0:7300 \
+             json=0.0.0.0:7301 metrics=127.0.0.1:7302"
+        );
+    }
+
+    /// MAN-13: one input's own line names its type, rate and dial.
+    #[test]
+    fn input_line_names_type_rate_and_dial() {
+        assert_eq!(
+            format_input_line("20m", "ka9q", 96_000.0, 14_030_000.0),
+            "input 20m: type=ka9q sample_rate_hz=96000 dial_frequency=14030.0 kHz"
+        );
+    }
+
     #[test]
     fn the_banner_names_every_field_scenario_1_requires() {
         let line = format_startup_banner(&StartupInfo {
@@ -320,6 +389,7 @@ mod tests {
             json_addr: "127.0.0.1:7301".parse().unwrap(),
             metrics_addr: "127.0.0.1:7302".parse().unwrap(),
             live_addr: None,
+            inputs: None,
         });
         for needle in [
             "0.1.0",
@@ -346,6 +416,7 @@ mod tests {
             json_addr: "127.0.0.1:7301".parse().unwrap(),
             metrics_addr: "127.0.0.1:7302".parse().unwrap(),
             live_addr,
+            inputs: None,
         };
         let off = format_startup_banner(&info(None));
         assert!(off.ends_with("metrics=127.0.0.1:7302"), "{off}");
@@ -366,6 +437,7 @@ mod tests {
             ws_clients: 0,
             uplink: UplinkState::Connected,
             pipeline: PipelineState::Decoding,
+            inputs: None,
         });
         for needle in [
             "pipeline=decoding",
@@ -376,6 +448,29 @@ mod tests {
         ] {
             assert!(line.contains(needle), "{needle:?} missing from {line:?}");
         }
+    }
+
+    #[test]
+    fn status_line_appends_inputs_only_with_two_or_more() {
+        let mut snapshot = StatusSnapshot {
+            uptime_s: 600,
+            active_tracks: 7,
+            spots_per_min: 3.2,
+            spots_total: 31,
+            telnet_clients: 1,
+            json_clients: 1,
+            ws_clients: 0,
+            uplink: UplinkState::Connected,
+            pipeline: PipelineState::Decoding,
+            inputs: None,
+        };
+        assert!(format_status_line(&snapshot).ends_with(" uplink=connected"));
+        snapshot.inputs = Some((2, 3));
+        assert_eq!(
+            format_status_line(&snapshot),
+            "manta status: uptime_s=600 pipeline=decoding tracks=7 spots_per_min=3.2 \
+             spots_total=31 clients=2 (telnet=1 json=1 ws=0) uplink=connected inputs=2/3"
+        );
     }
 
     #[test]
@@ -467,6 +562,7 @@ mod tests {
             json_addr: "127.0.0.1:7301".parse().unwrap(),
             metrics_addr: "127.0.0.1:7302".parse().unwrap(),
             live_addr: None,
+            inputs: None,
         });
         assert!(banner.contains("listening:"), "{banner:?}");
         assert!(!banner.contains("ready:"), "{banner:?}");
