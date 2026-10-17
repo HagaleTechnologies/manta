@@ -78,6 +78,77 @@ fn listen_decodes_a_clean_real_audio_signal() {
     );
 }
 
+/// MAN-273 remediate: a decimated live-audio source must still decode a
+/// tone at the top of its advertised band. `DecimatingSource` forwards the
+/// 48 kHz Hilbert guard (600 Hz) unchanged, and while the guard's Nyquist
+/// rim was applied at the *decimated* rate's own Nyquist it vetoed trusted
+/// channels: at `--capture-rate-hz 6000` the startup line advertised
+/// 300-2716 Hz usable while channels 27-28 (2484-2672 Hz) could not spawn,
+/// so a 2600 Hz tone decoded nothing (at 1500 Hz every channel was
+/// masked). The rim now yields to the trusted band: the leak it guards
+/// sat at the 48 kHz input's Nyquist, which decimation already removed.
+#[test]
+fn decimated_audio_decodes_a_tone_at_the_top_of_the_band() {
+    let fs = 48_000.0;
+    let tone_hz = 2600.0;
+    let spec = KeyerSpec::new(20.0);
+    let (env, keyed_text) = key_text_loop("CQ CQ DE W1AW W1AW K", &spec, fs, 15.0).unwrap();
+
+    let mut real = vec![0.0f32; env.len()];
+    let dphi = std::f64::consts::TAU * tone_hz / fs;
+    let mut phi = 0.0f64;
+    for (i, r) in real.iter_mut().enumerate() {
+        *r = env.get(i).copied().unwrap_or(0.0) * phi.cos() as f32;
+        phi += dphi;
+    }
+    let sigma = manta_testkit::noise::real_awgn_sigma_for_snr_2500(20.0, fs);
+    manta_testkit::noise::add_real_awgn(&mut real, sigma, 0x1234_5678);
+
+    let audio =
+        AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, 48_000))).unwrap();
+    let src: Box<dyn manta_input::IqSource> =
+        Box::new(manta_input::DecimatingSource::new(Box::new(audio), 6_000.0).unwrap());
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let text = Arc::new(Mutex::new(String::new()));
+    let text_clone = text.clone();
+    let track_ids = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
+    let track_ids_clone = track_ids.clone();
+    listen(
+        src,
+        &PipelineConfig::default(),
+        stop,
+        move |ev| {
+            if let manta_decode::events::DecoderEvent::CharDecoded {
+                glyph, track_id, ..
+            } = ev
+            {
+                if let Some(c) = glyph.text_char() {
+                    text_clone.lock().unwrap().push(c);
+                }
+                track_ids_clone.lock().unwrap().insert(*track_id);
+            }
+            if matches!(ev, manta_decode::events::DecoderEvent::WordBoundary { .. }) {
+                text_clone.lock().unwrap().push(' ');
+            }
+        },
+        |_spot| {},
+    )
+    .unwrap();
+
+    let decoded = text.lock().unwrap().trim().to_string();
+    assert!(
+        decoded.contains("W1AW"),
+        "expected W1AW in decoded text, got {decoded:?} (keyed: {keyed_text:?})"
+    );
+    let seen_track_ids = track_ids.lock().unwrap().clone();
+    assert_eq!(
+        seen_track_ids.len(),
+        1,
+        "one clean decimated tone must produce exactly one emitting track, got {seen_track_ids:?}"
+    );
+}
+
 /// MAN-34: a center frequency configured on `AudioIqSource` itself reaches
 /// the emitted `TrackMeta.freq_hz` as `center + baseband offset`, not a bare
 /// offset. Deliberately asserts on frequency placement only, never on decoded

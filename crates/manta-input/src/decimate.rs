@@ -130,8 +130,12 @@ impl IqSource for DecimatingSource {
     }
 
     /// MAN-273: forwarded -- the inner source's DC rim stays at DC after
-    /// decimation; the Nyquist rim lands in the conceded band beyond
-    /// `trusted_band_hz`, so vetoing it there costs nothing.
+    /// decimation (the near-DC Hilbert leak survives resampling), and the
+    /// guard's being non-zero also keeps `listen`'s mirror-image veto on
+    /// (a decimated analytic signal is still analytic). The Nyquist rim
+    /// needs no handling here: `TrackManager::set_guard_hz` yields it to
+    /// this source's trusted band, because the leak it guards sat at the
+    /// input rate's Nyquist, which the decimator's stopband removed.
     fn analytic_guard_hz(&self) -> f64 {
         self.inner.analytic_guard_hz()
     }

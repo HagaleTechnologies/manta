@@ -1717,6 +1717,16 @@ impl TrackManager {
     /// **Spawns only**, as `set_trusted_band_hz`: a running track on a
     /// guarded channel keeps decoding. `guard_hz <= 0.0` clears the mask
     /// (a no-op, pinned by `guard_zero_is_bit_identical_to_today`).
+    ///
+    /// The Nyquist rim yields to an installed trusted band (call
+    /// `set_trusted_band_hz` first, as `listen`'s `new_segment` does): the
+    /// leak it guards sat at the analytic front end's *input*-rate Nyquist,
+    /// which a decimating source's stopband has already removed, so at a
+    /// decimated rate the rim may not veto a channel the source's own
+    /// filtering vouches for. Without the yield, `--capture-rate-hz` at
+    /// 6000 Hz or below on rig audio masked the top of the advertised
+    /// band (at 1500 Hz, every channel). The DC rim is unconditional:
+    /// the near-DC leak survives decimation unchanged.
     pub fn set_guard_hz(&mut self, guard_hz: f64) {
         let n = self.n_channels();
         let spacing = self.channel_spacing_hz;
@@ -1728,7 +1738,9 @@ impl TrackManager {
             (0..n)
                 .map(|k| {
                     let f = (wrapped_channel_offset(k, n) * spacing).abs();
-                    f + spacing / 2.0 < guard_hz || f - spacing / 2.0 > half - guard_hz
+                    f + spacing / 2.0 < guard_hz
+                        || (f - spacing / 2.0 > half - guard_hz
+                            && self.trusted_channels.as_ref().is_none_or(|t| !t[k]))
                 })
                 .collect()
         });
@@ -4039,6 +4051,50 @@ mod tests {
         assert!(tm.guard_vetoes_spawn(5));
         tm.set_guard_hz(0.0);
         assert!((0..n).all(|k| !tm.guard_vetoes_spawn(k)));
+    }
+
+    /// MAN-273 remediate: a decimated capture's trusted band must win over
+    /// the analytic guard's Nyquist rim. `DecimatingSource` forwards the
+    /// 48 kHz Hilbert guard (600 Hz) unchanged, but the leak that rim
+    /// guards sat at the *input* rate's Nyquist, which the decimator's
+    /// stopband already removed -- applied at the decimated rate's own
+    /// Nyquist it masked the top of the advertised band (at 6000 Hz:
+    /// channels 27-28, 2484-2672 Hz, inside the trusted band that runs to
+    /// 2715.6 Hz; at 1500 Hz it covered every channel). The DC rim is
+    /// unconditional: the near-DC leak survives decimation unchanged.
+    #[test]
+    fn guard_nyquist_rim_yields_to_the_trusted_band() {
+        // The 6000 Hz decimated-audio shape: 64 channels of 93.75 Hz,
+        // trusted band as DecimatingSource(AudioIqSource) reports it
+        // (the audio passband 300..3000 Hz clipped to the decimator's
+        // 0.4526 * 6000 Hz trusted half-bandwidth).
+        let n = 64;
+        let mut tm = trusted_band_manager(n);
+        tm.set_trusted_band_hz(300.0, 2715.6);
+        tm.set_guard_hz(600.0);
+        for k in 0..n {
+            let signed = wrapped_channel_offset(k, n) * 93.75;
+            let f = signed.abs();
+            let dc_rim = f + 46.875 < 600.0;
+            // `channels_within` tests the signed centre against the
+            // one-sided band, exactly as the code under test does.
+            let trusted = (300.0..=2715.6).contains(&signed);
+            let want = dc_rim || (f - 46.875 > 3000.0 - 600.0 && !trusted);
+            assert_eq!(tm.guard_vetoes_spawn(k), want, "channel {k} ({signed} Hz)");
+        }
+        // The top of the advertised band is trusted and spawns; before
+        // the yield both of these were Nyquist-rim masked.
+        assert!(!tm.guard_vetoes_spawn(27)); // 2484-2578 Hz
+        assert!(!tm.guard_vetoes_spawn(28)); // 2578-2672 Hz
+                                             // The DC rim still bites inside the trusted band: the near-DC
+                                             // leak is real at any decimated rate.
+        assert!(tm.guard_vetoes_spawn(3)); // 234-375 Hz
+                                           // Without a trusted band the rim applies in full (48 kHz audio).
+        let mut plain = trusted_band_manager(512);
+        plain.set_guard_hz(600.0);
+        let f = (wrapped_channel_offset(252, 512) * 93.75).abs();
+        assert!(f - 46.875 > 24_000.0 - 600.0);
+        assert!(plain.guard_vetoes_spawn(252));
     }
 
     #[test]

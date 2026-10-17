@@ -1,11 +1,6 @@
 {
-<<<<<<< HEAD
   "generated_at": "2026-10-17T00:45:00Z",
   "head_commit": "4529021",
-=======
-  "generated_at": "2026-10-16T22:46:15Z",
-  "head_commit": "b8b9367",
->>>>>>> 35deb42de4260c19220c0fec9cd847f70bf93828
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -153,7 +148,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:7ba4781b3986fe694f63d5dd6102d9f0258f1d40565f5a9568e9e03538b87c41",
+      "hash": "sha256:dd18f5b4961c9e2a585e910212a9120441379b64153785a28ad87f42e9cefad4",
       "id": "hilbert-image-guard",
       "kind": "gotcha",
       "links": [

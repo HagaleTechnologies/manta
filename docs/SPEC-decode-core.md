@@ -355,7 +355,12 @@ track back to ACTIVE.
   `DetectorConfig::guard_hz` is nonzero, the larger of the two masks every
   channel whose whole band (`|f(k)| ± spacing/2`) lies below the guard
   (DC rim) or above `fs/2 − guard` (Nyquist rim), where the Hilbert FIR does not guarantee
-  `HILBERT_MIN_IMAGE_REJECTION_DB`. 22 of 512 channels at 48 kHz. Spawns
+  `HILBERT_MIN_IMAGE_REJECTION_DB`. 22 of 512 channels at 48 kHz. The
+  Nyquist rim never vetoes a channel inside a supplied trusted band: the
+  leak it guards sat at the analytic front end's input-rate Nyquist, which
+  a decimating source's stopband removes, so at a decimated rate the rim
+  would otherwise mask the top of the trusted band (`--capture-rate-hz`
+  6000 Hz on rig audio; at 1500 Hz it masked every channel). Spawns
   only, as above. For such an analytic source, a spawn on `k` is also
   refused while any channel within one of its mirror `(n − k) mod n` is
   owned by a track or its raw `hop.power` is within 3 dB of `k`'s or

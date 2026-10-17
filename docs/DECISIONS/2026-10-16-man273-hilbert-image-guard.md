@@ -22,7 +22,13 @@ churning tracks on one clean CW tone. Three changes, all needed:
   `manta-cli` `config.rs`). `listen` takes
   `max(configured, source)` and calls `TrackManager::set_guard_hz`, which
   builds a mask of channels whose whole band lies below the guard (DC
-  rim) or above `fs/2 − guard` (Nyquist rim). The §2.5 spawn
+  rim) or above `fs/2 − guard` (Nyquist rim). The Nyquist rim yields to
+  an installed trusted band: `DecimatingSource` forwards the 600 Hz guard
+  unchanged, but the leak the rim guards sat at the 48 kHz input's
+  Nyquist, which the decimator's stopband removes — applied at the
+  decimated rate's own Nyquist it masked the top of the advertised band
+  (remediate round: at `--capture-rate-hz` 6000 Hz a 2600 Hz tone decoded
+  nothing; at 1500 Hz no channel could spawn). The §2.5 spawn
   conjunction vetoes masked channels in both the `k` and `k+1` slots,
   exactly like MAN-196's trusted band. **Spawns only** (the MAN-314
   lesson): a running track is never closed, de-weighted or held by it.
