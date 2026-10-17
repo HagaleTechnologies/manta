@@ -1,0 +1,361 @@
+name: CI
+
+# HAG-46: this file replaces ci.yml (renamed; workflow-level name "CI" kept unchanged, so
+# queue-retry-handler.yml's `workflows: ['CI', 'Supply Chain']` needs no update). The former
+# inline `codex-clean` job (a self-contained poll-for-label gate -- manta is PUBLIC and cannot
+# `uses:` credenza's private codex-clean-gate.yml, confirmed live on manta PR #199, the
+# Dependabot-auto-merge revert this same constraint broke) is gone entirely.
+#
+# wait-for-codex.yml (also self-contained, no `uses:` -- same public-repo constraint applies to
+# the new mechanism as the old one) now posts "@codex review" and reacts to Codex's own
+# review/comment event directly, then dispatches THIS file via workflow_dispatch once a
+# revision is confirmed clean -- no more polling for a label from either side.
+#
+# `pull_request` IS still a trigger here (Codex review, PR #200 round 1, P1), for every PR that
+# wait-for-codex.yml will not dispatch. Originally that was only Dependabot: GitHub withholds ALL
+# custom Actions secrets from a Dependabot-actor-triggered run, on every event type including
+# pull_request_target (see auto-merge-trigger.yml's own identical note) -- so wait-for-codex.yml's
+# pass-through dispatch for an excluded Dependabot PR has no CODEX_REVIEW_PAT available to call
+# the workflow_dispatch API (which GITHUB_TOKEN is rejected for outright, regardless of
+# permissions), and with no `pull_request` trigger left here at all, a Dependabot PR would NEVER
+# get its required test checks created -- permanently unmergeable. MAN-243 widened it: a
+# dispatched run executes the PR's code in main's context and Actions cache scope, so
+# wait-for-codex.yml now dispatches only a ready, in-repository PR opened by a trusted author.
+# Every other PR -- a fork head, or an author off the trusted list (Dependabot included) -- runs
+# `test`/`test-soapy` through this native trigger instead (MAN-245: by authorship
+# alone; a Dependabot-authored PR runs here because its author is not on the trusted list, and a
+# Dependabot-triggered event on a trusted author's PR does not): GitHub's isolated path
+# (refs/pull/N/merge cache scope; for a fork, a read-only token, no secrets, and the
+# fork-approval setting). A trusted in-repository PR is skipped here, so it still goes
+# exclusively through the workflow_dispatch path (no double-run, and no PR ever gets `test (...)`
+# check-runs from two apps). See docs/DECISIONS/2026-10-10-man243-ci-trust-boundary.md.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      head_sha:
+        description: "The PR revision Codex confirmed clean (dispatched at this repo's default branch to keep the executed workflow definition trusted -- see wait-for-codex.yml's codex-review-response job). Every job below checks this SHA out explicitly instead of defaulting to github.sha, which for a workflow_dispatch run is the default branch tip, not the reviewed commit."
+        type: string
+        required: false
+      is_dependabot:
+        description: "Set by wait-for-codex.yml's excluded-dependabot[bot] pass-through dispatch. A workflow_dispatch run always gets normal repository secrets regardless of who or what caused the dispatch -- unlike a Dependabot-authored pull_request, which GitHub itself redacts secrets from. Declared even though none of the jobs below currently consume a PR-controlled-code-adjacent secret; keeps this file forward-compatible if one is added later."
+        type: boolean
+        required: false
+        default: false
+  merge_group:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Keyed on the REVISION under test, not github.ref/branch -- workflow_dispatch always runs at
+# the default branch (see the head_sha input above), so github.ref is constant across every
+# PR's dispatch and would collide unrelated revisions into one group. Effective-SHA is unique
+# per revision for workflow_dispatch/push, and unique per merge-queue attempt for merge_group.
+# github.event_name is ALSO part of the key (same lesson as cqdx#470 P2, round 7): an operator
+# manually dispatching this workflow at main's current tip (no head_sha) resolves to the SAME
+# effective SHA as an already-running push-triggered run for that identical commit -- without
+# this, the two would share one group and the dispatch would cancel the legitimate push run out
+# from under it.
+#
+# Hardened per the bug Codex caught reviewing this identical pattern on vanity#325: a stale
+# rerun of an old failed attempt still joined this same group unconditionally -- GitHub's
+# concurrency model holds one RUNNING and one PENDING member per group, so an unconditional
+# cancel-in-progress: true let a stale rerun cancel (or, if only queued, evict from the pending
+# slot) a legitimately newer, currently-running revision. Non-first attempts key on
+# github.run_id instead, isolating every rerun into its own private group.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.run_attempt == 1 && (github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha) || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # A workflow_dispatch run's own native check-runs always attach to the DISPATCHED REF's tip
+  # (the default branch), never to an arbitrary head_sha input passed alongside it. The required
+  # test checks ("test (ubuntu-latest)", "test (macos-latest)", and "test (windows-latest)" once
+  # MAN-371's owner step O1 is applied -- see
+  # `gh api repos/HagaleTechnologies/manta/rules/branches/main`) need to land on the PR's OWN
+  # head commit, so this job creates them explicitly via the Checks API instead, matching the
+  # exact names GitHub's own matrix-strategy check-run naming produces natively -- the same
+  # pattern cqdx/widdershins/vanity use for their own single "CI" fan-in check, adapted here for
+  # independent matrix legs instead of one aggregate. push/merge_group need none of
+  # this: github.sha there already names the real commit under test, so this job is skipped
+  # entirely and the native per-job check-run attribution is already correct.
+  #
+  # MAN-156 added the third, "test (windows-latest)": without it a trusted PR never showed its
+  # Windows result -- that is how MAN-301's Windows-only regression (dispatched run 38244914017)
+  # merged with green PR checks. MAN-371 makes it required (owner step O1 of
+  # docs/DECISIONS/2026-10-15-man371-windows-required-check.md), so all three are created
+  # fail-closed: a failed POST fails this job instead of leaving a PR on "Expected".
+  #
+  # HAG-106/HAG-108: the check-runs are written with a hagale-agent App token, not
+  # github.token. A github.token POST lands in the OLDEST github-actions check suite on the SHA
+  # (often a pull_request_target Auto-Merge/Codex run or a branch-ref dispatch); when that suite
+  # is superseded the PR rollup hides it and the merge queue refuses the PR with 'Required status
+  # check "test (ubuntu-latest)" is expected'. hagale-agent gets exactly one suite of its own per
+  # commit, which the rollup always shows.
+  create-ci-check:
+    name: Create required test check-runs on the reviewed SHA
+    if: github.event_name == 'workflow_dispatch'
+    # Q-0068: the app key lives in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      ubuntu_check_id: ${{ steps.create.outputs.ubuntu_check_id }}
+      macos_check_id: ${{ steps.create.outputs.macos_check_id }}
+      windows_check_id: ${{ steps.create.outputs.windows_check_id }}
+    steps:
+      - name: Mint a hagale-agent installation token for the test check-runs
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Create in_progress check-runs on head_sha
+        id: create
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ inputs.head_sha || github.sha }}
+        run: |
+          ubuntu_id=$(gh api -X POST "repos/$REPO/check-runs" \
+            -f name="test (ubuntu-latest)" -f head_sha="$HEAD_SHA" -f status="in_progress" --jq '.id')
+          macos_id=$(gh api -X POST "repos/$REPO/check-runs" \
+            -f name="test (macos-latest)" -f head_sha="$HEAD_SHA" -f status="in_progress" --jq '.id')
+          echo "ubuntu_check_id=$ubuntu_id" >> "$GITHUB_OUTPUT"
+          echo "macos_check_id=$macos_id" >> "$GITHUB_OUTPUT"
+          # MAN-371: required like the two above, so no `||` fallback: a failed POST fails the step.
+          windows_id=$(gh api -X POST "repos/$REPO/check-runs" \
+            -f name="test (windows-latest)" -f head_sha="$HEAD_SHA" -f status="in_progress" --jq '.id')
+          echo "windows_check_id=$windows_id" >> "$GITHUB_OUTPUT"
+
+  # No longer gated on codex-clean (HAG-46): this whole workflow only ever gets
+  # workflow_dispatch'd once wait-for-codex.yml's codex-review-response job has already
+  # confirmed Codex is clean for this revision (or it's a merge_group/push run with no PR
+  # review context at all), so there is no mid-review-loop skip state left to account for here.
+  #
+  # MAN-243: `pull_request` is the isolated path -- refs/pull/N/merge cache scope; for a fork, a
+  # read-only token, no secrets, and the repo's fork-approval setting. It runs for every PR
+  # wait-for-codex.yml will not dispatch: a head outside this repository or an author off the
+  # trusted list -- Dependabot-authored PRs included, because their author is not on the list
+  # (MAN-245: no separate actor test). A trusted in-repository PR is skipped here and tested only
+  # through workflow_dispatch, so no PR ever gets both paths (two apps' `test (...)` check-runs on
+  # one SHA). Trusted drafts get no CI until ready for review. Keep the list identical to
+  # wait-for-codex.yml's trust steps and auto-merge-trigger.yml (test_ci_trust_boundary.py).
+  # See docs/DECISIONS/2026-10-10-man243-ci-trust-boundary.md.
+  test:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      !contains(fromJSON('["thagale","catalyst-cloud-connector[bot]"]'), github.event.pull_request.user.login)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # workflow_dispatch runs at the default branch (see the head_sha input at the top of
+          # this file) -- github.sha there is main's tip, not the reviewed revision, so this
+          # must explicitly check out the actual PR head Codex confirmed clean. push/merge_group
+          # already name the right commit via github.sha.
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+          # checkout persists the ambient GITHUB_TOKEN as a git credential by default -- for the
+          # is_dependabot dispatch flavor (or any PR-controlled code path generally), a
+          # compromised dependency executed during a cargo build/test could use that persisted,
+          # write-scoped credential to push directly to the repository, a strictly worse outcome
+          # than merely reading a withheld secret (same lesson as cqdx#470 P1, round 8). This job
+          # doesn't push anything back to the repo, so disabling this is safe unconditionally.
+          persist-credentials: false
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt, clippy
+      # MAN-36: fail loudly if this runner is not compiling with the exact
+      # release rust-toolchain.toml pins. Placed before Swatinem/rust-cache
+      # (which itself invokes cargo to fingerprint the cache key) so this is
+      # the first rustup-proxy call made from inside the checkout, and thus
+      # where the pinned toolchain actually gets auto-installed -- a
+      # toolchain mismatch is reported as itself rather than as a confusing
+      # downstream fmt/clippy diff or cache-key anomaly.
+      # MAN-212 (Codex, PR #184): explicit `shell: bash` is required on
+      # windows-latest -- a bare `run:` step defaults to pwsh there, which
+      # silently no-ops this Bash script (11ms, zero output, no error)
+      # instead of running it, defeating the toolchain guard on that leg
+      # entirely. Harmless on ubuntu-latest/macos-latest, where bash is
+      # already the default shell.
+      - run: scripts/check-rust-toolchain-pin.sh
+        shell: bash
+      # MAN-243: restore-only except on a push to main. Only merged code writes the cache scope that
+      # main and merge-queue runs restore from; dispatched PR runs, merge-group runs and native
+      # pull_request runs restore and never save. Not a security boundary on its own -- code
+      # running in a job can reach the cache credentials -- which is why wait-for-codex.yml only
+      # dispatches trusted heads.
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.1
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --all --check
+      # MAN-219: --locked makes cargo fail ("cannot update the lock file ...
+      # because --locked was passed") when Cargo.lock no longer matches the
+      # Cargo.toml dependency graph, instead of silently re-resolving it and
+      # passing. That silence hid the 2026-10-05 drift on main (#118 + #197,
+      # fixed by hand in #209). To fix a red run, build once locally without
+      # --locked and commit the updated Cargo.lock. fmt never reads the lockfile.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # MAN-156: a broken intra-doc link, an unclosed HTML tag or a bare URL in rustdoc fails the
+      # build instead of scrolling past (48 had accumulated unnoticed). Linux only: rustdoc's lints
+      # do not depend on the host, and this rides the already-required `test (ubuntu-latest)` check.
+      # manta-cli's clap help text is exempt in its own main.rs.
+      - if: runner.os == 'Linux'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --workspace --locked
+      - run: cargo test --workspace --locked
+      # MAN-65: the release pipeline's tag grammar and :latest recency
+      # logic are testable without pushing a tag, and this rides the
+      # ALREADY-REQUIRED `test` check (ubuntu + macos) rather than a new
+      # job auto-merge wouldn't wait for. Skipped on the windows-latest
+      # leg: scripts/release-version.sh only ever runs on the release
+      # workflows' ubuntu-latest runners.
+      - if: runner.os != 'Windows'
+        run: bash scripts/tests/release-version.test.sh
+      - if: runner.os != 'Windows'
+        run: bash scripts/tests/release-ancestry.test.sh
+      # MAN-243: the CI trust boundary (who may run in main's context, who writes the shared cache,
+      # cold release builds) rides the already-required `test` check, like release-version above.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_ci_trust_boundary -v
+      # MAN-80: the release job's SHA256SUMS and attestation steps, plus the operator's checksum
+      # commands (GNU sha256sum on ubuntu, macOS shasum on macos), ride the required `test` check.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_release_checksums -v
+      # MAN-82: the Soapy archive's verifier (fake POSIX-shell binaries) and its release-job wiring.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_soapy_release -v
+      # MAN-268: the service kit's shell and account-helper tests are Unix-only; the release-archive
+      # tests run on all three legs so Windows keeps its zip coverage (`python` in Git Bash there).
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_packaging -v
+      - shell: bash
+        run: |
+          py=python3
+          if [ "${{ runner.os }}" = "Windows" ]; then py=python; fi
+          "$py" -m unittest scripts.tests.test_package_release -v
+      # MAN-301: score-against-rbn.py --node-log's wrapper around `manta grade` (stub binary).
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_score_against_rbn_replay -v
+      # MAN-156: dependency, rustdoc, Windows-release and PR-title gates (workflow wiring and scripts).
+      # Linux only: these tests read workflow text and run pure functions, so the host adds nothing,
+      # and DenyPolicyTests needs tomllib (Python 3.11+), which ubuntu-latest's python3 has.
+      - if: runner.os == 'Linux'
+        run: python3 -m unittest scripts.tests.test_ci_gates -v
+      # MAN-240: the Dependabot diff verifier's own tests, under the Python dependabot-auto-merge.yml
+      # runs the verifier with (same setup-python pin). Last in the job so the pin does not change
+      # the python3 the steps above use.
+      - if: runner.os == 'Linux'
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13"
+      - if: runner.os == 'Linux'
+        run: python3 -m unittest scripts.tests.test_verify_dependabot_diff_safe -v
+  # Same MAN-243 routing as `test` above (Dependabot plus every PR wait-for-codex.yml won't
+  # dispatch) -- not itself a required check, but matches this job's own pre-migration behavior
+  # (ran for a Dependabot PR too, gated only by codex-clean's tolerant skip) rather than silently
+  # dropping coverage for a PR touching soapy-feature code.
+  test-soapy:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      !contains(fromJSON('["thagale","catalyst-cloud-connector[bot]"]'), github.event.pull_request.user.login)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+          persist-credentials: false
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libsoapysdr-dev soapysdr0.8-module-rtlsdr
+      - if: runner.os == 'macOS'
+        run: brew install soapysdr
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt, clippy
+      # MAN-243: same restore-only rule as `test`'s cache step.
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.1
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      # --locked: see the MAN-219 note in the test job above.
+      - run: cargo clippy -p manta-input -p manta-cli --all-targets --features soapy --locked -- -D warnings
+      - run: cargo test -p manta-input -p manta-cli --features soapy --locked
+
+  # Relays each matrix leg's OWN real conclusion onto the corresponding explicit check-run
+  # create-ci-check made on head_sha -- a job-level `needs.test.result` alone is a single
+  # aggregate across every matrix combination (success only if ALL legs succeeded), which
+  # cannot tell "ubuntu passed, macos failed" apart from "both failed"; each minted
+  # check-run needs its OWN independent, accurate conclusion. Looks up each leg's real
+  # conclusion from the Jobs API by its exact display name instead.
+  relay-check-runs:
+    name: Relay test results onto the reviewed SHA's check-runs
+    needs: [create-ci-check, test]
+    if: always() && github.event_name == 'workflow_dispatch'
+    # Q-0068: the app key lives in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      # Only the App that created a check-run can update it, so the PATCH uses the same
+      # hagale-agent identity as create-ci-check; github.token still reads this run's jobs.
+      - name: Mint a hagale-agent installation token for the test check-runs
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Patch each required check-run with its own matrix leg's real conclusion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          UBUNTU_CHECK_ID: ${{ needs.create-ci-check.outputs.ubuntu_check_id }}
+          MACOS_CHECK_ID: ${{ needs.create-ci-check.outputs.macos_check_id }}
+          WINDOWS_CHECK_ID: ${{ needs.create-ci-check.outputs.windows_check_id }}
+        run: |
+          jobs_json=$(gh api --paginate "repos/$REPO/actions/runs/${{ github.run_id }}/jobs")
+          relay() {
+            local job_name="$1" check_id="$2"
+            if [ -z "$check_id" ]; then
+              echo "::warning::No check-run id for '$job_name' -- create-ci-check must not have run or already failed."
+              return
+            fi
+            local conclusion
+            conclusion=$(echo "$jobs_json" | jq -r --arg n "$job_name" '.jobs[] | select(.name==$n) | .conclusion // empty')
+            if [ -z "$conclusion" ]; then
+              echo "::error::Could not find a conclusion for job '$job_name' in this run -- marking its check-run failed rather than leaving it stuck in_progress."
+              conclusion="failure"
+            fi
+            GH_TOKEN="$APP_TOKEN" gh api -X PATCH "repos/$REPO/check-runs/$check_id" -f status="completed" -f conclusion="$conclusion"
+          }
+          relay "test (ubuntu-latest)" "$UBUNTU_CHECK_ID"
+          relay "test (macos-latest)" "$MACOS_CHECK_ID"
+          relay "test (windows-latest)" "$WINDOWS_CHECK_ID"

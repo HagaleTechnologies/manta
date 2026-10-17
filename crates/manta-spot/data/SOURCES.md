@@ -10,8 +10,37 @@
   (N1MM+, Win-Test, CQRLOG, TR4W) follows. No separate license file is
   published upstream. Flagged here for visibility, not treated as a
   blocker; revisit if this ever needs a stricter provenance trail.
-- Refresh: re-run the `curl` in this crate's implementation plan (Task 1)
-  and replace this file by hand -- no refresh automation yet.
+- Refresh: download the source above and replace `data/cty.dat`. Update
+  `CTY_DAT_RETRIEVED` in `src/vintage.rs` and this section's retrieval date
+  together; a test enforces the match. Operators can use `--cty` or
+  `[spot] cty_path` to supply a newer file without a manta release, or
+  `[spot] refresh_lists` to have `manta run` download it every 7 days
+  (MAN-316; docs/DECISIONS/2026-10-12-man316-reference-list-refresh.md).
+  A download is used only when it is newer than this retrieval date.
+
+## dxcc.tsv
+
+- Source: derived from https://www.country-files.com/bigcty/cty.csv (AD1C),
+  columns 1 (primary prefix) and 3 (ADIF DXCC entity code).
+- Retrieved: 2026-09-07
+- Format: `<primary-prefix>\t<adif-dxcc-entity-number>\t<name, comment only>`;
+  `#`-prefixed and blank lines are ignored.
+- License/redistribution: same AD1C source and same convention as cty.dat.
+- Refresh: `scripts/gen-dxcc-table.sh` (no argument = fetch upstream). Refresh
+  it whenever cty.dat is refreshed, ideally from the same AD1C release;
+  `cty::tests::every_entity_in_the_vendored_cty_dat_resolves_an_adif_dxcc_number`
+  fails if the two drift apart, and at runtime any spot emitted while they
+  have drifted is counted by `manta_spots_unresolved_geography_total`. The
+  script's `awk` splitter is not CSV-aware, so it requires every row to have
+  exactly 10 comma-separated fields and aborts (writing nothing) if upstream
+  ever ships an unescaped comma inside a field -- better a loud failure than a
+  row whose ADIF number silently shifted a column.
+- Why keyed on primary prefix, not entity name: measured 2026-09-07 against a
+  cty.dat retrieved 2026-07-25 and a cty.csv published 2026-09-06 -- the prefix
+  join matched 346/346, the name join 343/346 (Cape Verde -> Cabo Verde, Juan
+  de Nova, Europa -> Juan de Nova & Europa, Tristan da Cunha & Gough -> ...
+  Gough Islands). ADIF 3.1.7's own release notes likewise renamed entities
+  207/462/468/502/518.
 
 ## master.scp
 
@@ -22,5 +51,29 @@
 - License/redistribution: same convention as cty.dat -- bundled by contest
   logging software as a matter of course; no separate license published
   upstream. Same flag-not-block note applies.
-- Refresh: re-run the `curl` in this crate's implementation plan (Task 1)
-  and replace this file by hand -- no refresh automation yet.
+- Refresh: download the source above and replace `data/master.scp`. Update
+  `MASTER_SCP_RETRIEVED` in `src/vintage.rs` and this section's retrieval
+  date together; a test enforces the match. Operators can use `--scp` or
+  `[spot] scp_path` to supply a newer file without a manta release, or
+  `[spot] refresh_lists` to have `manta run` download it every day
+  (MAN-316). A download is used only when it is newer than this retrieval
+  date.
+
+## patterns.lst
+
+- Source: mechanically derived from the vendored `master.scp`; independent of
+  Skimmer Server's licensed `Patt3Ch.lst`, with no entries copied from it.
+- Retrieved: generated 2026-10-14; the SCP release appears in the file header.
+- Format: one `[+]PATTERN` per line. `+` means at least two distinct plausible
+  SCP calls share the pattern; an unprefixed pattern has one. Blank lines and
+  `#` comments are ignored. Patterns preserve the first 3 call characters
+  (2 for letter-digit-letter, 4 for digit-letter-letter), then replace letters
+  with `@` and digits with `#`; portable suffixes are removed.
+- License/redistribution: same as `master.scp`, from which this list is derived.
+- Refresh: run `cargo run -p manta-spot --example gen_pattern_list` whenever
+  `master.scp` is refreshed (optional argument: an SCP input path). The generator
+  atomically replaces `data/patterns.lst`. The
+  `pattern::tests::vendored_list_is_derived_from_the_vendored_master_scp`
+  consistency test fails if the two drift apart. Operators override this list
+  separately with `--patterns` or `[spot] pattern_path`; neither `--scp` nor
+  a `refresh_lists` download (MAN-316) changes it.

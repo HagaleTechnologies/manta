@@ -6,9 +6,14 @@
 
 mod callsigns;
 pub mod cer;
+pub mod crash;
+pub mod fsk;
 pub mod keyer;
 pub mod noise;
+pub mod noncw;
+pub mod oracle;
 pub mod scene;
+pub mod sensitivity;
 pub mod vectors;
 pub mod wav;
 

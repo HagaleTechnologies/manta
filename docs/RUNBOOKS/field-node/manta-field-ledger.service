@@ -1,0 +1,18 @@
+[Unit]
+Description=manta MAN-96 field-node evidence ledger and SDR-service watchdog
+Wants=network-online.target
+After=network-online.target manta-field.service
+
+[Service]
+Type=simple
+User=manta
+Group=manta
+StateDirectory=manta-field
+# One ledger record per minute; restarts the SDR service and manta-field.service via
+# manta-field-recover after 600 s continuously bad (D-G). See the runbook for the sudoers line.
+ExecStart=/usr/bin/python3 /opt/manta/scripts/field-node.py sample --loop --interval-s 60 --metrics-url http://127.0.0.1:7302 --ledger /var/lib/manta-field/ledger.jsonl --rss-unit manta-field.service --recover-cmd "sudo -n /usr/local/sbin/manta-field-recover" --recover-after-s 600 --recover-cooldown-s 1800 --recover-max-per-day 6
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

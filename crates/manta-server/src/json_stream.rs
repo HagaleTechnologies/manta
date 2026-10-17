@@ -7,18 +7,133 @@
 //! server push), so a peek timeout with no bytes is itself the "not a
 //! WebSocket handshake" signal, not an error.
 
-use crate::bus::{BusSpot, SpotBus};
-use crate::metrics::Metrics;
+use crate::bus::{JsonItem, ResumeOutcome, SpotBus};
+use crate::metrics::{Metrics, ResumeMetricOutcome};
 use crate::rate_limit::IpRateLimiter;
 use crate::spot_message::SpotMessage;
 use crate::tasks::{ClientTasks, ConnectionLimiter, IpQuota};
-use manta_spot::cty::Table;
+use manta_spot::reference::ReferenceLists;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, watch};
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::http::StatusCode;
+
+/// The opening record on every spot-stream connection.
+pub const HELLO_KIND: &str = "hello";
+/// dispensa's `contracts/spots/stream.v1.md` framing contract.
+pub const STREAM_SCHEMA: &str = "stream.v1";
+
+/// Connection snapshot, sent before any replay or live record.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Hello {
+    pub kind: &'static str,
+    pub schema: &'static str,
+    pub session: String,
+    pub seq: u64,
+    pub history_from: u64,
+    pub resumed: bool,
+}
+impl Hello {
+    pub fn new(session: String, seq: u64, history_from: u64, resumed: bool) -> Self {
+        Self {
+            kind: HELLO_KIND,
+            schema: STREAM_SCHEMA,
+            session,
+            seq,
+            history_from,
+            resumed,
+        }
+    }
+}
+
+/// Same budget as telnet commands: a full resume can render 10,000 records.
+pub const MAX_RESUMES_PER_IP: u32 = 30;
+/// Resume budget window, matching telnet's command budget.
+pub const RESUME_RATE_WINDOW: Duration = Duration::from_secs(10);
+
+#[derive(Debug, PartialEq)]
+struct ResumeRequest {
+    session: Option<String>,
+    since: u64,
+}
+
+fn parse_resume_query(query: Option<&str>) -> Result<Option<ResumeRequest>, &'static str> {
+    let mut session = None;
+    let mut since = None;
+    for part in query.unwrap_or("").split('&') {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        match key {
+            "since" => {
+                if since.is_some() || value.is_empty() || !value.bytes().all(|c| c.is_ascii_digit())
+                {
+                    return Err("since must be a whole number");
+                }
+                since = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| "since must be a whole number")?,
+                );
+            }
+            "session" => {
+                if session.is_some() {
+                    return Err("session given more than once");
+                }
+                session = Some(value.to_string());
+            }
+            _ => {}
+        }
+    }
+    Ok(since.map(|since| ResumeRequest { session, since }))
+}
+
+// Implement the dependency's callback trait directly: its required ErrorResponse
+// is larger than Clippy permits for a free-standing closure's Result.
+struct ResumeHandshake<'a> {
+    stream: StreamKind,
+    metrics: &'a Metrics,
+    resume_limiter: &'a IpRateLimiter,
+    peer_ip: IpAddr,
+    request: &'a mut Option<ResumeRequest>,
+}
+
+impl tokio_tungstenite::tungstenite::handshake::server::Callback for ResumeHandshake<'_> {
+    fn on_request(self, req: &Request, response: Response) -> Result<Response, ErrorResponse> {
+        if self.stream == StreamKind::Live {
+            return Ok(response);
+        }
+        let error = match parse_resume_query(req.uri().query()) {
+            Err(msg) => {
+                self.metrics
+                    .record_json_stream_resume(ResumeMetricOutcome::Invalid);
+                Some((StatusCode::BAD_REQUEST, msg))
+            }
+            Ok(Some(_)) if !self.resume_limiter.allow(self.peer_ip) => {
+                self.metrics
+                    .record_json_stream_resume(ResumeMetricOutcome::Refused);
+                Some((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many resume requests from this address; retry later",
+                ))
+            }
+            Ok(parsed) => {
+                *self.request = parsed;
+                None
+            }
+        };
+        match error {
+            Some((status, message)) => Err(Response::builder()
+                .status(status)
+                .body(Some(message.to_string()))
+                .expect("valid HTTP error")),
+            None => Ok(response),
+        }
+    }
+}
 
 /// How long a slow client is given to accept one write before it's treated
 /// as stalled and disconnected -- otherwise a write blocked forever would
@@ -77,6 +192,19 @@ pub const MAX_JSON_STREAM_CONNECTIONS: usize = 512;
 /// admission to every other client. Same reasoning and value as
 /// `telnet::MAX_TELNET_CONNECTIONS_PER_IP`.
 pub const MAX_JSON_STREAM_CONNECTIONS_PER_IP: usize = 16;
+/// MAN-324: the live-state listener's total client cap. Each live client
+/// is served at roughly 290 times the spot rate, so the cap is far below
+/// the spot stream's.
+pub const MAX_LIVE_STREAM_CONNECTIONS: usize = 32;
+
+/// MAN-324: which broadcast channel a `serve` listener fans out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    /// The JSON spot stream (`:7301`): spots plus `spotGrade` records.
+    Spots,
+    /// The live-state stream (`[server].live_port`).
+    Live,
+}
 
 /// MAN-68 (PR #85 review round 6): `handle_ws_client`'s WS handshake
 /// rejection/timeout branches already log a specific warning before
@@ -114,22 +242,106 @@ impl From<anyhow::Error> for WsClientError {
 struct ClientCtx {
     bus: Arc<SpotBus>,
     metrics: Arc<Metrics>,
-    cty: Arc<Table>,
+    lists: Arc<ReferenceLists>,
     station_call: String,
+    station_location: Option<crate::config::StationLocation>,
     decoder_version: String,
     shutdown: watch::Receiver<bool>,
+    drain_deadline: Duration,
+    stream: StreamKind,
+    start_seq: Option<u64>,
+    resume_limiter: IpRateLimiter,
 }
 
 impl ClientCtx {
-    fn render(&self, bus_spot: &BusSpot) -> String {
+    // MAN-324: client gauges and loss counters go to the spot families
+    // for `:7301` and to the live families for the live-state listener,
+    // so `manta_spots_dropped_*` still counts only spots.
+    fn record_lagged(&self, n: u64) {
+        match self.stream {
+            StreamKind::Spots => self.metrics.record_lagged(n),
+            StreamKind::Live => self.metrics.record_live_lagged(n),
+        }
+    }
+
+    fn record_write_failed(&self, n: u64) {
+        match self.stream {
+            StreamKind::Spots => self.metrics.record_write_failed(n),
+            StreamKind::Live => self.metrics.record_live_write_failed(n),
+        }
+    }
+
+    fn record_dropped_shutdown(&self, n: u64) {
+        match self.stream {
+            StreamKind::Spots => self.metrics.record_dropped_shutdown(n),
+            StreamKind::Live => self.metrics.record_live_dropped_shutdown(n),
+        }
+    }
+
+    /// MAN-324: the live stream subscribes on accept, so records are built
+    /// and queued for a peer whose WebSocket handshake then fails or times
+    /// out; charge them to `write_failed` so the live loss counter stays
+    /// complete. The spot stream's counters keep their existing meaning.
+    fn record_failed_handshake(&self, still_queued: usize) {
+        if self.stream == StreamKind::Live {
+            self.metrics
+                .record_live_write_failed(crate::metrics::abandoned_spot_count(
+                    false,
+                    still_queued,
+                ));
+        }
+    }
+
+    fn inc_clients(&self, ws: bool) {
+        match (self.stream, ws) {
+            (StreamKind::Spots, true) => self.metrics.inc_ws_clients(),
+            (StreamKind::Spots, false) => self.metrics.inc_json_clients(),
+            (StreamKind::Live, _) => self.metrics.inc_live_clients(),
+        }
+    }
+
+    fn dec_clients(&self, ws: bool) {
+        match (self.stream, ws) {
+            (StreamKind::Spots, true) => self.metrics.dec_ws_clients(),
+            (StreamKind::Spots, false) => self.metrics.dec_json_clients(),
+            (StreamKind::Live, _) => self.metrics.dec_live_clients(),
+        }
+    }
+
+    /// One stream line: a spot rendered as today, or a MAN-301 `spotGrade`
+    /// record, already serialised, passed through verbatim. Both shapes,
+    /// and the `kind` key that tells them apart, are in `docs/SPOT-SCHEMA.md`.
+    fn render(&self, item: &JsonItem) -> String {
+        let (seq, bus_spot, rendered) = match item {
+            JsonItem::Spot {
+                seq,
+                spot,
+                rendered,
+            } => (seq, spot, rendered),
+            JsonItem::Grade { line, .. } | JsonItem::Live(line) => return line.to_string(),
+        };
+        // MAN-137: replay must repeat a record's contents, so the first
+        // rendering is kept with the item and every later delivery (live or
+        // resumed) reuses it.
+        rendered
+            .get_or_init(|| self.render_spot(*seq, bus_spot).into())
+            .to_string()
+    }
+
+    fn render_spot(&self, seq: u64, bus_spot: &crate::bus::BusSpot) -> String {
         let unix_ts = self.bus.unix_ts_for(bus_spot.spot.sample_ts);
+        // MAN-316: one snapshot per spot, so a refresh that swaps the table
+        // mid-render can never mix two tables' geography in one message.
+        let cty = self.lists.cty.load();
         let msg = SpotMessage::from_spot(
             &bus_spot.spot,
             &self.station_call,
-            &self.cty,
+            self.station_location.as_ref(),
+            &cty,
             &self.decoder_version,
             unix_ts,
             self.bus.session_nonce(),
+            seq,
         );
         serde_json::to_string(&msg).expect("SpotMessage always serializes")
     }
@@ -143,10 +355,24 @@ impl ClientCtx {
 pub struct JsonStreamConfig {
     pub bus: Arc<SpotBus>,
     pub metrics: Arc<Metrics>,
-    pub cty: Arc<Table>,
+    /// MAN-316: the run's reference lists; each client renders every spot
+    /// against the `cty.dat` in use at that moment, so a scheduled refresh
+    /// reaches connected clients without a reconnect.
+    pub lists: Arc<ReferenceLists>,
     pub station_call: String,
+    /// This station's `deGrid`/`deLat`/`deLon` (MAN-138), resolved once at
+    /// start-up by `ServerConfig::station_location`; `None` sends null
+    /// position fields.
+    pub station_location: Option<crate::config::StationLocation>,
     pub decoder_version: String,
     pub shutdown: watch::Receiver<bool>,
+    /// MAN-45 (round-16 finding): the per-client shutdown-drain deadline --
+    /// see `tasks::CLIENT_DRAIN_DEADLINE`'s doc comment for why this must
+    /// live on each handler's own loop rather than only the outer
+    /// registry-wide `await_all` deadline.
+    pub drain_deadline: Duration,
+    /// MAN-324: the spot stream or the live-state stream.
+    pub stream: StreamKind,
 }
 
 /// MAN-59 review round 2: same rationale as `telnet::QUOTA_REJECT_LOG_MAX_PER_WINDOW`
@@ -189,11 +415,17 @@ pub async fn serve(
     let ctx = ClientCtx {
         bus: config.bus,
         metrics: config.metrics,
-        cty: config.cty,
+        lists: config.lists,
         station_call: config.station_call,
+        station_location: config.station_location,
         decoder_version: config.decoder_version,
         shutdown: config.shutdown,
+        drain_deadline: config.drain_deadline,
+        stream: config.stream,
+        start_seq: None,
+        resume_limiter: IpRateLimiter::new(MAX_RESUMES_PER_IP, RESUME_RATE_WINDOW),
     };
+    crate::rate_limit::spawn_stale_entry_reaper(ctx.resume_limiter.clone());
     let quota_reject_log_limiter =
         IpRateLimiter::new(QUOTA_REJECT_LOG_MAX_PER_WINDOW, QUOTA_REJECT_LOG_WINDOW);
     crate::rate_limit::spawn_stale_entry_reaper(quota_reject_log_limiter.clone());
@@ -239,8 +471,15 @@ pub async fn serve(
         // broadcast channel's no-history-for-late-subscribers semantics on
         // a busy runtime or a high-rate stream (round-7 review finding;
         // same fix applied to the telnet accept path below).
-        let rx = ctx.bus.subscribe();
-        let ctx = ctx.clone();
+        let (rx, start_seq) = match ctx.stream {
+            StreamKind::Spots => {
+                let (rx, seq) = ctx.bus.subscribe_json_with_seq();
+                (rx, Some(seq))
+            }
+            StreamKind::Live => (ctx.bus.subscribe_live(), None),
+        };
+        let mut ctx = ctx.clone();
+        ctx.start_seq = start_seq;
         let peer_ip = peer.ip();
         let ip_ping_limiter = ip_ping_limiter.clone();
         let rejection_log_limiter = rejection_log_limiter.clone();
@@ -259,37 +498,71 @@ pub async fn serve(
             // OTHER disconnect path already logs its own specific reason
             // inline -- this is the one catch-all left uncovered without
             // it, and the only place that needs the raw error itself.
-            if looks_like_websocket_handshake(&socket).await {
-                ctx.metrics.inc_ws_clients();
-                let result = handle_ws_client(
-                    socket,
-                    rx,
-                    ctx.clone(),
-                    peer,
-                    peer_ip,
-                    ip_ping_limiter,
-                    log_enabled,
-                    rejection_log_limiter,
-                )
-                .await;
-                // MAN-68 (round 6): only the Unlogged variant reaches here
-                // -- Logged means the handshake reject/timeout branch
-                // already reported this exact error.
-                if log_enabled {
-                    if let Err(WsClientError::Unlogged(e)) = &result {
-                        tracing::warn!(peer = %peer, error = %e, "json_stream: WS client task ended with an error");
+            //
+            // A separate clone (not `ctx.shutdown` directly) purely so this
+            // classifying peek doesn't need `ctx` itself to be mutable --
+            // `handle_ws_client`/`handle_tcp_client` below still get their
+            // own independent clone via `ctx.clone()`, each tracking
+            // `shutdown` correctly for their own `select!` loop regardless
+            // of whether this peek ever observed a change.
+            let mut peek_shutdown = ctx.shutdown.clone();
+            match looks_like_websocket_handshake(&socket, &mut peek_shutdown).await {
+                None => {
+                    // MAN-45 remediate (code-review round 18, finding 3):
+                    // shutdown fired before classification completed --
+                    // this connection was never dispatched to either
+                    // handler and is not counted in either client gauge,
+                    // so nothing to decrement. Its subscribed `rx` backlog
+                    // is abandoned the same as telnet's pre-login CR-1
+                    // branches. At THIS site specifically no write has run
+                    // yet (classification only peeks at buffered input);
+                    // elsewhere the counter means only that no write
+                    // failed or timed out and no queued spot was offered
+                    // for delivery -- not that nothing was written.
+                    if log_enabled {
+                        tracing::info!(
+                            "json_stream: shutdown signalled during handshake classification, disconnecting"
+                        );
                     }
+                    ctx.record_dropped_shutdown(crate::metrics::abandoned_spot_count(
+                            false,
+                            rx.len(),
+                        ));
                 }
-                ctx.metrics.dec_ws_clients();
-            } else {
-                ctx.metrics.inc_json_clients();
-                let result = handle_tcp_client(socket, rx, ctx.clone(), peer, log_enabled).await;
-                if log_enabled {
-                    if let Err(e) = &result {
-                        tracing::warn!(peer = %peer, error = %e, "json_stream: raw TCP client task ended with an error");
+                Some(true) => {
+                    ctx.inc_clients(true);
+                    let result = handle_ws_client(
+                        socket,
+                        rx,
+                        ctx.clone(),
+                        peer,
+                        peer_ip,
+                        ip_ping_limiter,
+                        log_enabled,
+                        rejection_log_limiter,
+                    )
+                    .await;
+                    // MAN-68 (round 6): only the Unlogged variant reaches here
+                    // -- Logged means the handshake reject/timeout branch
+                    // already reported this exact error.
+                    if log_enabled {
+                        if let Err(WsClientError::Unlogged(e)) = &result {
+                            tracing::warn!(peer = %peer, error = %e, "json_stream: WS client task ended with an error");
+                        }
                     }
+                    ctx.dec_clients(true);
                 }
-                ctx.metrics.dec_json_clients();
+                Some(false) => {
+                    ctx.inc_clients(false);
+                    let result =
+                        handle_tcp_client(socket, rx, ctx.clone(), peer, log_enabled).await;
+                    if log_enabled {
+                        if let Err(e) = &result {
+                            tracing::warn!(peer = %peer, error = %e, "json_stream: raw TCP client task ended with an error");
+                        }
+                    }
+                    ctx.dec_clients(false);
+                }
             }
         });
     }
@@ -302,18 +575,43 @@ pub async fn serve(
 /// just because the first peek alone came up short.
 const PEEK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
-async fn looks_like_websocket_handshake(socket: &TcpStream) -> bool {
+/// `None` means `shutdown` fired before classification completed -- the
+/// caller must disconnect without dispatching to either handler. `Some(_)`
+/// is the ordinary classification result (`true` = WebSocket, `false` =
+/// raw JSON Lines), exactly as before this became shutdown-aware.
+///
+/// MAN-45 remediate (code-review round 18, finding 3): before this fix,
+/// this peek loop (up to `PEEK_TIMEOUT`, or `HANDSHAKE_TIMEOUT` once any
+/// byte had arrived) never observed `shutdown` at all -- the exact gap
+/// `telnet::handle_client`'s pre-login handshake had before round 17's
+/// CR-1 fix, just on this file's side of the port split. A client that
+/// connected and then stalled before completing (or ever starting) a WS
+/// handshake held this task outside any `select!` loop for up to that full
+/// budget, invisible to shutdown the whole time, with its already-
+/// subscribed `rx` backlog abandoned uncounted if `Runtime::shutdown_timeout`
+/// aborted it first. Racing each peek against `shutdown.changed()` keeps
+/// this phase's contribution to shutdown latency close to zero, matching
+/// telnet's fix and `SHUTDOWN_DRAIN_DEADLINE`'s (`manta-cli`) doc comment,
+/// which now covers this file's pre-loop phase too.
+async fn looks_like_websocket_handshake(
+    socket: &TcpStream,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<bool> {
     let mut deadline = tokio::time::Instant::now() + PEEK_TIMEOUT;
     let mut peek_buf = [0u8; 3];
     let mut seen_any_bytes = false;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return false; // budget exhausted with < 3 bytes ever seen
+            return Some(false); // budget exhausted with < 3 bytes ever seen
         }
-        match tokio::time::timeout(remaining, socket.peek(&mut peek_buf)).await {
-            Ok(Ok(n)) if n >= 3 => return &peek_buf[..3] == b"GET",
-            Ok(Ok(0)) => return false, // peer closed without sending anything
+        let peek_result = tokio::select! {
+            result = tokio::time::timeout(remaining, socket.peek(&mut peek_buf)) => result,
+            _ = shutdown.changed() => return None,
+        };
+        match peek_result {
+            Ok(Ok(n)) if n >= 3 => return Some(&peek_buf[..3] == b"GET"),
+            Ok(Ok(0)) => return Some(false), // peer closed without sending anything
             Ok(Ok(_)) => {
                 if !seen_any_bytes {
                     // Some evidence of an in-progress handshake (e.g. "G"
@@ -334,7 +632,7 @@ async fn looks_like_websocket_handshake(socket: &TcpStream) -> bool {
                 }
                 tokio::time::sleep(PEEK_RETRY_INTERVAL).await;
             }
-            Ok(Err(_)) | Err(_) => return false,
+            Ok(Err(_)) | Err(_) => return Some(false),
         }
     }
 }
@@ -346,7 +644,7 @@ async fn looks_like_websocket_handshake(socket: &TcpStream) -> bool {
 )]
 async fn handle_tcp_client(
     mut socket: TcpStream,
-    mut rx: broadcast::Receiver<BusSpot>,
+    mut rx: broadcast::Receiver<JsonItem>,
     mut ctx: ClientCtx,
     peer: std::net::SocketAddr,
     log_enabled: bool,
@@ -354,13 +652,36 @@ async fn handle_tcp_client(
     if log_enabled {
         tracing::info!("json_stream: raw TCP client connected");
     }
+    if let Some(seq) = ctx.start_seq {
+        let resume = ctx.bus.json_resume(None, None, seq);
+        let hello = Hello::new(ctx.bus.session_id(), seq, resume.history_from, false);
+        let line = serde_json::to_string(&hello).expect("Hello always serializes") + "\n";
+        let written = tokio::select! {
+            result = tokio::time::timeout(WRITE_TIMEOUT, socket.write_all(line.as_bytes())) => matches!(result, Ok(Ok(()))),
+            _ = ctx.shutdown.changed() => {
+                ctx.record_dropped_shutdown(crate::metrics::abandoned_spot_count(false, rx.len()));
+                return Ok(());
+            }
+        };
+        if !written {
+            ctx.record_write_failed(crate::metrics::abandoned_spot_count(false, rx.len()));
+            return Ok(());
+        }
+    }
     // This protocol is pure server push -- the client never needs to send
     // anything -- so this scratch buffer only exists to notice EOF/close;
     // any bytes a client does send are unexpected and simply discarded.
     let mut scratch = [0u8; 64];
     loop {
         tokio::select! {
-            spot = rx.recv() => {
+            // MAN-45 remediate (round-19 P1 review finding): disabled once
+            // `shutdown` is pending, so a backlogged client can't keep
+            // winning this arm and performing further live writes before
+            // the shutdown-drain arm below ever gets selected -- see
+            // `telnet::handle_client`'s identical precondition for the full
+            // rationale (`has_changed` only peeks; the drain arm still
+            // fires normally).
+            spot = rx.recv(), if !ctx.shutdown.has_changed().unwrap_or(true) => {
                 match spot {
                     Ok(bus_spot) => {
                         let line = ctx.render(&bus_spot);
@@ -381,7 +702,9 @@ async fn handle_tcp_client(
                             if log_enabled {
                                 tracing::warn!("json_stream: spot write failed, disconnecting");
                             }
-                            ctx.metrics.record_write_failed(1 + rx.len() as u64);
+                            ctx.record_write_failed(
+                                crate::metrics::abandoned_spot_count(true, rx.len()),
+                            );
                             return Ok(());
                         }
                     }
@@ -395,7 +718,7 @@ async fn handle_tcp_client(
                         if log_enabled {
                             tracing::warn!(lost, "json_stream: client lagged behind broadcast, disconnecting");
                         }
-                        ctx.metrics.record_lagged(lost);
+                        ctx.record_lagged(lost);
                         return Ok(());
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -405,7 +728,10 @@ async fn handle_tcp_client(
             // period -- without this, only `rx.recv()` is ever polled, so
             // a closed-but-idle client's task/socket/gauge would linger
             // until the next spot's write happened to fail.
-            read_result = socket.read(&mut scratch) => {
+            // Guarded for the same reason as the live-spot arm above --
+            // once shutdown is pending, the drain arm is the only thing
+            // this loop should still be able to select.
+            read_result = socket.read(&mut scratch), if !ctx.shutdown.has_changed().unwrap_or(true) => {
                 match read_result {
                     Ok(0) => {
                         if log_enabled {
@@ -438,22 +764,38 @@ async fn handle_tcp_client(
             // Explicit shutdown: drain whatever's already queued rather
             // than dropping it when the runtime forcibly tears down.
             _ = ctx.shutdown.changed() => {
+                // MAN-45 (round-16 finding): this loop's OWN deadline --
+                // see `telnet::handle_client`'s identical shutdown-drain
+                // branch, and `tasks::CLIENT_DRAIN_DEADLINE`'s doc comment,
+                // for the full rationale (a flat outer registry-wide
+                // deadline can't scale with any one client's backlog
+                // depth).
+                //
                 // A `Lagged(n)` mid-drain means this subscriber missed `n`
                 // spots, not that the channel is empty -- there can still
                 // be spots queued after the gap. Stopping on the first
                 // `Err` (the prior behavior) silently dropped everything
                 // from that point on without even recording the loss
                 // (round-6 review finding).
+                let drain_deadline = tokio::time::Instant::now() + ctx.drain_deadline;
                 loop {
                     match rx.try_recv() {
                         Ok(bus_spot) => {
                             let line = ctx.render(&bus_spot);
-                            let write_result = tokio::time::timeout(WRITE_TIMEOUT, async {
-                                socket.write_all(line.as_bytes()).await?;
-                                socket.write_all(b"\n").await
-                            })
-                            .await;
-                            if !matches!(write_result, Ok(Ok(()))) {
+                            // Checked BEFORE the write, not around it --
+                            // see telnet's identical comment for why.
+                            let remaining = drain_deadline
+                                .saturating_duration_since(tokio::time::Instant::now());
+                            let timed_out = remaining.is_zero()
+                                || !matches!(
+                                    tokio::time::timeout(WRITE_TIMEOUT.min(remaining), async {
+                                        socket.write_all(line.as_bytes()).await?;
+                                        socket.write_all(b"\n").await
+                                    })
+                                    .await,
+                                    Ok(Ok(())),
+                                );
+                            if timed_out {
                                 // The client's socket is presumably dead --
                                 // further writes would just fail too, so
                                 // stop draining and count what's abandoned
@@ -461,20 +803,26 @@ async fn handle_tcp_client(
                                 // retained), rather than silently
                                 // discarding the error and continuing to
                                 // burn the write timeout on every remaining
-                                // queued spot (round-12 review finding).
+                                // queued spot (round-12 review finding), or
+                                // letting the outer registry-wide deadline
+                                // abort this task mid-write once a
+                                // multi-spot backlog exceeded it, also
+                                // uncounted (round-16 review finding).
                                 // MAN-59 review round 2: returns Ok(()),
                                 // not Err -- log it directly.
                                 if log_enabled {
                                     tracing::warn!(
-                                        "json_stream: shutdown-drain write failed, disconnecting"
+                                        "json_stream: shutdown-drain write failed or ran out of budget, disconnecting"
                                     );
                                 }
-                                ctx.metrics.record_write_failed(1 + rx.len() as u64);
+                                ctx.record_write_failed(
+                                    crate::metrics::abandoned_spot_count(true, rx.len()),
+                                );
                                 return Ok(());
                             }
                         }
                         Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                            ctx.metrics.record_lagged(n);
+                            ctx.record_lagged(n);
                         }
                         Err(_) => break, // Empty or Closed: nothing left to drain
                     }
@@ -508,7 +856,7 @@ fn is_ws_protocol_violation(e: &tokio_tungstenite::tungstenite::Error) -> bool {
         // these routine resets to the rejection budget, defeating the
         // fix's own purpose.
         WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => false,
-        WsError::Protocol(_) | WsError::Capacity(_) | WsError::Utf8 | WsError::AttackAttempt => {
+        WsError::Protocol(_) | WsError::Capacity(_) | WsError::Utf8(_) | WsError::AttackAttempt => {
             true
         }
         _ => false,
@@ -531,7 +879,7 @@ fn is_ws_protocol_violation(e: &tokio_tungstenite::tungstenite::Error) -> bool {
 )]
 async fn handle_ws_client(
     socket: TcpStream,
-    mut rx: broadcast::Receiver<BusSpot>,
+    mut rx: broadcast::Receiver<JsonItem>,
     mut ctx: ClientCtx,
     peer: std::net::SocketAddr,
     peer_ip: IpAddr,
@@ -545,33 +893,128 @@ async fn handle_ws_client(
     let ws_config = WebSocketConfig::default()
         .max_message_size(Some(MAX_INBOUND_WS_MESSAGE_BYTES))
         .max_frame_size(Some(MAX_INBOUND_WS_MESSAGE_BYTES));
-    let ws_result = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        tokio_tungstenite::accept_async_with_config(socket, Some(ws_config)),
-    )
-    .await;
+    // MAN-45 remediate (code-review round 18, finding 3): races the
+    // handshake against `shutdown.changed()` too -- the same gap as
+    // `looks_like_websocket_handshake`'s, just the next step in a WS
+    // client's connection lifecycle. Uses `ctx.shutdown` itself (not a
+    // separate clone, unlike the classifying peek in `serve`): this is the
+    // SAME receiver the loop below's own `_ = ctx.shutdown.changed() =>`
+    // branch uses, and `select!` only marks a `watch::Receiver` as having
+    // seen a change on whichever branch actually wins -- a shutdown
+    // observed here consumes it and returns immediately, so there's
+    // nothing left for the loop to double-observe; one that DOESN'T fire
+    // here leaves the receiver exactly as unseen as before, so the loop's
+    // branch still fires normally afterward.
+    let mut request = None;
+    let callback = ResumeHandshake {
+        stream: ctx.stream,
+        metrics: &ctx.metrics,
+        resume_limiter: &ctx.resume_limiter,
+        peer_ip,
+        request: &mut request,
+    };
+    let ws_result = tokio::select! {
+        result = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            tokio_tungstenite::accept_hdr_async_with_config(socket, callback, Some(ws_config)),
+        ) => result,
+        _ = ctx.shutdown.changed() => {
+            if log_enabled {
+                tracing::info!("json_stream: shutdown signalled during WS handshake, disconnecting");
+            }
+            ctx.record_dropped_shutdown(crate::metrics::abandoned_spot_count(false, rx.len()));
+            return Ok(());
+        }
+    };
     let mut ws = match ws_result {
         Ok(Ok(ws)) => ws,
         Ok(Err(e)) => {
             if log_enabled {
                 tracing::warn!(error = %e, "json_stream: WS handshake rejected");
             }
+            ctx.record_failed_handshake(rx.len());
             return Err(WsClientError::Logged);
         }
         Err(_) => {
             if log_enabled {
                 tracing::warn!("json_stream: WS handshake timed out");
             }
+            ctx.record_failed_handshake(rx.len());
             return Err(WsClientError::Logged);
         }
     };
     if log_enabled {
         tracing::info!("json_stream: WS client connected");
     }
+    if let Some(seq) = ctx.start_seq {
+        let since = request.as_ref().map(|r| r.since);
+        let resume = ctx.bus.json_resume(
+            request.as_ref().and_then(|r| r.session.as_deref()),
+            since,
+            seq,
+        );
+        let metric = match resume.outcome {
+            ResumeOutcome::NoRequest => None,
+            ResumeOutcome::Resumed => Some(ResumeMetricOutcome::Resumed),
+            ResumeOutcome::Gap => Some(ResumeMetricOutcome::Gap),
+            ResumeOutcome::Reset => Some(ResumeMetricOutcome::Reset),
+        };
+        if let Some(outcome) = metric {
+            ctx.metrics.record_json_stream_resume(outcome);
+            if log_enabled {
+                tracing::info!(
+                    outcome = outcome.label(),
+                    since,
+                    replayed = resume.records.len(),
+                    "json_stream: resume"
+                );
+            }
+        }
+        let hello = Hello::new(
+            ctx.bus.session_id(),
+            seq,
+            resume.history_from,
+            resume.outcome == ResumeOutcome::Resumed,
+        );
+        let text = serde_json::to_string(&hello).expect("Hello always serializes");
+        let written = tokio::select! {
+            result = tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Text(text.into()))) => matches!(result, Ok(Ok(()))),
+            _ = ctx.shutdown.changed() => {
+                ctx.metrics.record_json_stream_replay_abandoned(resume.records.len() as u64);
+                ctx.record_dropped_shutdown(crate::metrics::abandoned_spot_count(false, rx.len()));
+                return Ok(());
+            }
+        };
+        if !written {
+            ctx.metrics
+                .record_json_stream_replay_abandoned(resume.records.len() as u64);
+            ctx.record_write_failed(crate::metrics::abandoned_spot_count(false, rx.len()));
+            return Ok(());
+        }
+        for (index, item) in resume.records.iter().enumerate() {
+            let remaining = (resume.records.len() - index) as u64;
+            if ctx.shutdown.has_changed().unwrap_or(true) {
+                ctx.metrics.record_json_stream_replay_abandoned(remaining);
+                break; // Leave the watch change unseen so the live backlog drains below.
+            }
+            let text = ctx.render(item);
+            if !matches!(
+                tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Text(text.into()))).await,
+                Ok(Ok(()))
+            ) {
+                ctx.metrics.record_json_stream_replay_abandoned(remaining);
+                ctx.record_write_failed(crate::metrics::abandoned_spot_count(false, rx.len()));
+                return Ok(());
+            }
+        }
+    }
     let mut ping_limiter = crate::rate_limit::RateLimiter::new(MAX_INBOUND_PINGS, PING_RATE_WINDOW);
     loop {
         tokio::select! {
-            spot = rx.recv() => {
+            // MAN-45 remediate (round-19 P1 review finding): disabled once
+            // `shutdown` is pending -- see `telnet::handle_client`'s
+            // identical precondition for the full rationale.
+            spot = rx.recv(), if !ctx.shutdown.has_changed().unwrap_or(true) => {
                 match spot {
                     Ok(bus_spot) => {
                         let text = ctx.render(&bus_spot);
@@ -590,7 +1033,9 @@ async fn handle_ws_client(
                             if log_enabled {
                                 tracing::warn!("json_stream: WS spot write failed, disconnecting");
                             }
-                            ctx.metrics.record_write_failed(1 + rx.len() as u64);
+                            ctx.record_write_failed(
+                                crate::metrics::abandoned_spot_count(true, rx.len()),
+                            );
                             return Ok(());
                         }
                     }
@@ -601,13 +1046,17 @@ async fn handle_ws_client(
                         if log_enabled {
                             tracing::warn!(lost, "json_stream: WS client lagged behind broadcast, disconnecting");
                         }
-                        ctx.metrics.record_lagged(lost);
+                        ctx.record_lagged(lost);
                         return Ok(());
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
-            frame = ws.next() => {
+            // Guarded like the live-spot arm above: this arm's Ping branch
+            // writes a Pong (its own `WRITE_TIMEOUT`), so a client pinging
+            // in a tight loop could otherwise keep deferring the drain arm
+            // indefinitely after shutdown was signalled.
+            frame = ws.next(), if !ctx.shutdown.has_changed().unwrap_or(true) => {
                 match frame {
                     Some(Ok(Message::Close(_))) | None => {
                         if log_enabled {
@@ -640,10 +1089,41 @@ async fn handle_ws_client(
                             }
                             return Ok(());
                         }
-                        tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Pong(payload)))
-                            .await
-                            .map_err(|_| anyhow::anyhow!("write timed out"))?
-                            .map_err(anyhow::Error::from)?;
+                        let write_result =
+                            tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Pong(payload)))
+                                .await;
+                        if !matches!(write_result, Ok(Ok(()))) {
+                            // MAN-45 (round-16 review finding): a bare `?`
+                            // here (the prior behavior) returned Err
+                            // straight out of the handler, abandoning
+                            // everything still retained in `rx` without
+                            // counting any of it -- the last write site in
+                            // this file that used to do that after
+                            // rounds 11-15 converted the rest. No spot was
+                            // in flight (this is a control frame), so only
+                            // the retained backlog is charged -- same shape
+                            // as telnet's filter-ack site.
+                            //
+                            // Validation round 17 (CR-4): `telnet.rs`'s
+                            // pre-login prompt and banner writes are now
+                            // shutdown-aware and charge their own retained
+                            // `rx` backlog on that path (CR-1), but still
+                            // propagate a genuine (non-shutdown) write I/O
+                            // error via bare `?`, uncounted -- a real,
+                            // still-open gap, just no longer the ONLY one
+                            // this comment's original "last write site"
+                            // claim implied. Left as-is: narrower in scope
+                            // than CR-1/CR-2/CR-3, and it fires only on an
+                            // already-failing socket during a phase before
+                            // the client has ever received a spot.
+                            if log_enabled {
+                                tracing::warn!("json_stream: WS Pong write failed, disconnecting");
+                            }
+                            ctx.record_write_failed(
+                                crate::metrics::abandoned_spot_count(false, rx.len()),
+                            );
+                            return Ok(());
+                        }
                     }
                     // This server never sends Ping, so ANY inbound Pong is
                     // unsolicited -- treat it the same as Text/Binary
@@ -709,36 +1189,55 @@ async fn handle_ws_client(
             // Explicit shutdown: drain whatever's already queued rather
             // than dropping it when the runtime forcibly tears down.
             _ = ctx.shutdown.changed() => {
-                // See the TCP handler's identical shutdown-drain branch
-                // above for why `Lagged` must not stop the drain.
+                // MAN-45 (round-16 finding): this loop's OWN deadline --
+                // see the TCP handler's identical shutdown-drain branch
+                // above, `telnet::handle_client`'s, and
+                // `tasks::CLIENT_DRAIN_DEADLINE`'s doc comment, for the
+                // full rationale. See the TCP handler's identical
+                // shutdown-drain branch above for why `Lagged` must not
+                // stop the drain.
+                let drain_deadline = tokio::time::Instant::now() + ctx.drain_deadline;
                 loop {
                     match rx.try_recv() {
                         Ok(bus_spot) => {
                             let text = ctx.render(&bus_spot);
-                            let write_result = tokio::time::timeout(
-                                WRITE_TIMEOUT,
-                                ws.send(Message::Text(text.into())),
-                            )
-                            .await;
-                            if !matches!(write_result, Ok(Ok(()))) {
+                            // Checked BEFORE the write, not around it --
+                            // see telnet's identical comment for why.
+                            let remaining = drain_deadline
+                                .saturating_duration_since(tokio::time::Instant::now());
+                            let timed_out = remaining.is_zero()
+                                || !matches!(
+                                    tokio::time::timeout(
+                                        WRITE_TIMEOUT.min(remaining),
+                                        ws.send(Message::Text(text.into())),
+                                    )
+                                    .await,
+                                    Ok(Ok(())),
+                                );
+                            if timed_out {
                                 // See the TCP handler's identical
-                                // shutdown-drain branch for why a failed
-                                // write stops the drain instead of
-                                // silently continuing (round-12 review
+                                // shutdown-drain branch for why a failed or
+                                // budget-exhausted write stops the drain
+                                // instead of silently continuing (round-12
+                                // review finding), and does so with its own
+                                // deadline rather than only the outer
+                                // registry-wide one (round-16 review
                                 // finding).
                                 // MAN-59 review round 2: returns Ok(()),
                                 // not Err -- log it directly.
                                 if log_enabled {
                                     tracing::warn!(
-                                        "json_stream: WS shutdown-drain write failed, disconnecting"
+                                        "json_stream: WS shutdown-drain write failed or ran out of budget, disconnecting"
                                     );
                                 }
-                                ctx.metrics.record_write_failed(1 + rx.len() as u64);
+                                ctx.record_write_failed(
+                                    crate::metrics::abandoned_spot_count(true, rx.len()),
+                                );
                                 return Ok(());
                             }
                         }
                         Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                            ctx.metrics.record_lagged(n);
+                            ctx.record_lagged(n);
                         }
                         Err(_) => break,
                     }
@@ -757,6 +1256,78 @@ mod tests {
         Error as WsError,
     };
 
+    #[test]
+    fn parse_resume_query_table() {
+        for q in [None, Some(""), Some("foo=1"), Some("session=12")] {
+            assert_eq!(parse_resume_query(q), Ok(None));
+        }
+        for (q, session, since) in [
+            ("since=0", None, 0),
+            ("session=12&since=007", Some("12"), 7),
+            ("since=12&session=9&x=y", Some("9"), 12),
+        ] {
+            assert_eq!(
+                parse_resume_query(Some(q)),
+                Ok(Some(ResumeRequest {
+                    session: session.map(String::from),
+                    since
+                }))
+            );
+        }
+        for q in [
+            "since=abc",
+            "since=",
+            "since",
+            "since=-1",
+            "since=+1",
+            "since=18446744073709551616",
+            "since=1&since=2",
+        ] {
+            assert_eq!(
+                parse_resume_query(Some(q)),
+                Err("since must be a whole number")
+            );
+        }
+        assert_eq!(
+            parse_resume_query(Some("session=1&session=2&since=1")),
+            Err("session given more than once")
+        );
+    }
+
+    #[test]
+    fn hello_serialises_in_contract_order() {
+        let h = Hello::new("1791719990000000000".into(), 41, 1, false);
+        assert_eq!(
+            serde_json::to_string(&h).unwrap(),
+            r#"{"kind":"hello","schema":"stream.v1","session":"1791719990000000000","seq":41,"historyFrom":1,"resumed":false}"#
+        );
+    }
+
+    #[test]
+    fn every_hello_field_is_documented_in_spot_schema() {
+        let h = Hello::new("0".into(), 0, 1, false);
+        let line = serde_json::to_string(&h).unwrap();
+        let v = serde_json::to_value(&h).unwrap();
+        let mut keys: Vec<_> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_by_key(|k| line.find(&format!("\"{k}\":")).unwrap());
+        let schema = include_str!("../../../docs/SPOT-SCHEMA.md").replace("\r\n", "\n");
+        let section = schema
+            .split_once("\n## `hello` record\n")
+            .unwrap()
+            .1
+            .split("\n## ")
+            .next()
+            .unwrap();
+        let rows: Vec<_> = section
+            .lines()
+            .filter_map(|l| l.strip_prefix("- `"))
+            .filter_map(|l| l.split_once("` ("))
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(rows, keys);
+        assert!(section.contains("all 6 keys"));
+    }
+
     /// MAN-68, PR #85 review round 8: a genuine protocol-shaped error
     /// must be classified as a rejection worth its own audit budget.
     #[test]
@@ -770,7 +1341,7 @@ mod tests {
                 max_size: 10,
             }
         )));
-        assert!(is_ws_protocol_violation(&WsError::Utf8));
+        assert!(is_ws_protocol_violation(&WsError::Utf8(String::new())));
         assert!(is_ws_protocol_violation(&WsError::AttackAttempt));
     }
 
@@ -799,5 +1370,81 @@ mod tests {
         assert!(!is_ws_protocol_violation(&WsError::Protocol(
             ProtocolError::ResetWithoutClosingHandshake
         )));
+    }
+
+    /// MAN-316: a `cty.dat` refresh reaches a client that is already
+    /// connected. The same `ClientCtx` renders an unallocated `QQ9ZZZ` with
+    /// the unknown-geography sentinels, then, once the refresher stores a
+    /// table that allocates QQ9, with that entity's continent and CQ zone
+    /// for the next publication. A spot already delivered replays unchanged.
+    #[test]
+    fn render_uses_the_current_cty_table() {
+        use crate::spot_message::{UNKNOWN_CONTINENT, UNKNOWN_CQ_ZONE, UNKNOWN_DXCC};
+        use manta_spot::{cty, scp, Spot, SpotType};
+
+        const QQ9: &str = "Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n";
+        let lists = Arc::new(ReferenceLists::new(
+            Arc::new(cty::Table::bundled()),
+            Arc::new(scp::Set::bundled()),
+        ));
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let ctx = ClientCtx {
+            bus: Arc::new(SpotBus::new(48_000.0, std::time::SystemTime::UNIX_EPOCH, 1)),
+            metrics: Arc::new(Metrics::new()),
+            lists: lists.clone(),
+            station_call: "W3XYZ".to_string(),
+            station_location: None,
+            decoder_version: "manta-test".to_string(),
+            shutdown,
+            drain_deadline: Duration::from_secs(1),
+            stream: StreamKind::Spots,
+            start_seq: None,
+            resume_limiter: IpRateLimiter::new(MAX_RESUMES_PER_IP, RESUME_RATE_WINDOW),
+        };
+        let publication = |seq: u64| JsonItem::Spot {
+            seq,
+            spot: crate::bus::BusSpot {
+                spot: Spot {
+                    callsign: "QQ9ZZZ".to_string(),
+                    freq_hz: 14_025_000.0,
+                    snr_db: 20.0,
+                    wpm: 25.0,
+                    spot_type: SpotType::Cq,
+                    confidence: 0.9,
+                    track_id: 1,
+                    sample_ts: 0,
+                    rst: None,
+                    qrl_query: false,
+                },
+                occurrence_count: 1,
+            },
+            rendered: Arc::default(),
+        };
+        let parse = |line: &str| -> serde_json::Value {
+            serde_json::from_str(line).expect("render emits JSON")
+        };
+
+        let delivered = publication(1);
+        // The history keeps a clone of the item the broadcast carried.
+        let replayed = delivered.clone();
+        let first_line = ctx.render(&delivered);
+        let before = parse(&first_line);
+        assert_eq!(before["dxDxcc"], UNKNOWN_DXCC);
+        assert_eq!(before["dxContinent"], UNKNOWN_CONTINENT);
+        assert_eq!(before["dxCqZone"], UNKNOWN_CQ_ZONE);
+        assert!(before["dxLat"].is_null(), "{before}");
+
+        lists.cty.store(Arc::new(cty::Table::parse(&format!(
+            "{}{QQ9}",
+            manta_spot::CTY_DAT
+        ))));
+        let after = parse(&ctx.render(&publication(2)));
+        assert_eq!(after["dxContinent"], "EU", "{after}");
+        assert_eq!(after["dxCqZone"], 14, "{after}");
+        assert!(!after["dxLat"].is_null(), "{after}");
+
+        // MAN-137: a resumed client gets the record it would have got live,
+        // byte for byte, not a re-rendering against the swapped table.
+        assert_eq!(ctx.render(&replayed), first_line);
     }
 }

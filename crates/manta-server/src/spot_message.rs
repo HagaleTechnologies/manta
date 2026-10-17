@@ -1,15 +1,197 @@
 //! `SpotMessage` -- the JSON Lines wire shape for manta's `:7301` stream.
 //! Field names/types mirror dispensa's `contracts/spots/spots.v1.schema.json`
-//! (ADR-0011): required fields manta cannot resolve from data it actually
-//! has (`dxDxcc`/`deDxcc` -- an ADIF DXCC entity-number table isn't
-//! vendored here) are serialized as JSON `null` rather than a fabricated
-//! placeholder value. `dxContinent`/`dxCqZone`/`dxLat`/`dxLon` (and the
-//! `de*` counterparts) ARE resolved, from the same vendored `cty.dat` the
+//! (ADR-0011). `dxDxcc`/`deDxcc`/`dxContinent`/`deContinent`/`dxCqZone` are
+//! ALL required and non-nullable on that contract -- see
+//! docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md.
+//! `dxDxcc`/`deDxcc` are resolved from the vendored `dxcc.tsv` ADIF entity-
+//! number table (MAN-136); `dxContinent`/`dxCqZone`/`dxLat`/`dxLon` and
+//! `deContinent` are resolved from the same vendored `cty.dat` the
 //! validator already trusts for the plausibility gate (`manta_spot::cty`).
+//! `deGrid`/`deLat`/`deLon` are NOT: they are the operator's configured
+//! station position (`[server].operator_grid`/`operator_lat`/`operator_lon`,
+//! MAN-138), `null` when none is configured -- never a `cty.dat` country
+//! centroid, which would put every station in one country on one point.
+//! When a callsign isn't cty-resolvable, each required field gets a named
+//! out-of-domain `UNKNOWN_*` sentinel below rather than a fabricated-looking
+//! real value or (where the contract forbids it) `null`. A maritime-mobile
+//! (`/MM`) or aeronautical-mobile (`/AM`) call is the separate, KNOWN case:
+//! `cty.lookup` resolves it through its base prefix, but the station is by
+//! definition outside every DXCC entity, so it gets ADIF's own
+//! `NO_DXCC_ENTITY` (0) plus unknown continent/zone/lat/lon instead of its
+//! home entity's geography.
+//!
+//! `snrRefHz` (MAN-102 / decision D3) is a manta-originated addition not
+//! yet reflected in dispensa's frozen schema -- see
+//! `docs/DECISIONS/2026-09-07-man102-snr-reference-and-estimator.md` for
+//! the proposed schema fragment, ready to lift into that repo's ADR-0011.
+//! `rst`/`qrlQuery` (MAN-272) are likewise manta-originated; their fragment
+//! is in `docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md`.
 
 use manta_spot::cty;
 use manta_spot::Spot;
 use serde::Serialize;
+
+/// Emitted for `dxDxcc`/`deDxcc` when `cty.lookup` cannot resolve the
+/// callsign. Deliberately NEGATIVE: ADIF entity codes run 1-522, and ADIF
+/// code 0 already has a specific different meaning -- "None: the contacted
+/// station is known to NOT be within a DXCC entity" -- which would be a false
+/// positive claim about a call manta merely failed to resolve. dispensa's
+/// spots.v1 declares this field required and non-nullable, so `null` is not
+/// available. See docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md.
+pub const UNKNOWN_DXCC: i64 = -1;
+
+/// Emitted for `dxContinent`/`deContinent` when `cty.lookup` cannot resolve
+/// the callsign. Outside the field's real domain -- the seven two-letter
+/// continent codes -- so it reads as "unknown", never as geography.
+pub const UNKNOWN_CONTINENT: &str = "";
+
+/// Emitted for `dxCqZone` when `cty.lookup` cannot resolve the callsign.
+/// Real CQ zones are 1-40, so 0 is unambiguously "unknown".
+pub const UNKNOWN_CQ_ZONE: u16 = 0;
+
+/// Emitted for `dxDxcc`/`deDxcc` when the callsign carries a maritime-mobile
+/// (`/MM`) or aeronautical-mobile (`/AM`) designator. This is ADIF's own
+/// entity code 0 -- "None: the contacted station is known to NOT be within a
+/// DXCC entity" -- and it is the exact case ADIF defines it for, so unlike
+/// `UNKNOWN_DXCC` no consumer has to learn a manta-local convention to read
+/// it. `cty.lookup` would otherwise happily resolve `K5ARH/MM` through its
+/// base prefix and report the United States (291) for a station that is, by
+/// the designator's own meaning, not there (round-7 review finding 2).
+pub const NO_DXCC_ENTITY: i64 = 0;
+
+/// True when `callsign` carries the maritime-mobile (`/MM`) or aeronautical-
+/// mobile (`/AM`) designator -- the two portable designators of
+/// `grammar::is_valid_portable`'s set that place a station outside every DXCC
+/// entity (at sea, or airborne). The others (`/P`, `/QRP`, `/M`, `/<digit>`)
+/// mean "somewhere else", which cty.dat's base-prefix answer still describes
+/// at entity granularity.
+///
+/// Checks EVERY segment after the first, not just the trailing one:
+/// `grammar::is_plausible` only admits a single `/`, but MAN-28's Watch List
+/// allowlist bypasses the grammar gate entirely (`validator.rs:676-688`), so
+/// a compound call like `PJ4/K5ARH/MM` -- or one that carries a further
+/// designator after the mobile one, `K5ARH/MM/QRP` -- can reach here, and
+/// both are just as maritime-mobile as the simple form. A trailing-segment-
+/// only test would hand the latter its base prefix's home entity, which is
+/// the exact corruption this function exists to prevent.
+///
+/// The FIRST segment is deliberately exempt: it is the base call or a
+/// prefix-override, never a designator, and `MM`/`AM` are real DXCC prefixes
+/// there (Scotland, Spain) -- `MM/K5ARH` is a station IN Scotland, whose
+/// geography cty.dat describes correctly.
+pub fn is_outside_any_dxcc_entity(callsign: &str) -> bool {
+    callsign.split('/').skip(1).any(|designator| {
+        designator.eq_ignore_ascii_case("MM") || designator.eq_ignore_ascii_case("AM")
+    })
+}
+
+/// True when `SpotMessage::from_spot` would emit the `UNKNOWN_DXCC` /
+/// `UNKNOWN_CONTINENT` / `UNKNOWN_CQ_ZONE` sentinels for `callsign`, i.e.
+/// exactly the condition `manta_spots_unresolved_geography_total` counts.
+///
+/// Lives HERE, beside the code it mirrors, rather than in `manta-cli`
+/// (PR #131 review, round 7): a predicate whose whole contract is "answers
+/// the same question `from_spot` answers" drifts the moment the two live in
+/// different crates -- which is precisely how the SSID gap below arose.
+///
+/// Deliberately keyed on the RESOLVED ADIF entity number, not merely on
+/// whether `lookup` returned an entry: `from_spot` emits `UNKNOWN_DXCC` on
+/// `dx.and_then(|e| e.dxcc).is_none()`, which is also true when `cty.dat`
+/// resolves the call but the vendored `dxcc.tsv` has no row for its primary
+/// prefix -- the drift state that arises when `cty.dat` is hand-refreshed
+/// (data/SOURCES.md) without regenerating the TSV. Counting `lookup`
+/// alone would let those spots go out carrying `dxDxcc: -1` with the
+/// counter still at zero, silently withholding the one signal this metric
+/// exists to give (MAN-136 round-1 validate code-review finding 1).
+///
+/// A maritime-mobile (`/MM`) or aeronautical-mobile (`/AM`) call counts too
+/// (MAN-136 round-7 review finding 2): `cty.lookup` answers for it through the
+/// base call's prefix, but `from_spot` deliberately discards that answer and
+/// emits `UNKNOWN_CONTINENT`/`UNKNOWN_CQ_ZONE` with null lat/lon -- the
+/// station's real position is unknown -- so the spot does carry the sentinels
+/// this counter is defined over. Its `dxDxcc` is ADIF's `NO_DXCC_ENTITY` (0)
+/// rather than `UNKNOWN_DXCC`, which is why the entity number alone can't be
+/// the whole test.
+///
+/// Takes the callsign VERBATIM: on the dx side that is decoder output, which
+/// never carries an SSID. For the operator's own configured identity use
+/// `station_geography_unresolved` below, which strips it.
+pub fn geography_is_unresolved(cty: &cty::Table, callsign: &str) -> bool {
+    is_outside_any_dxcc_entity(callsign) || cty.lookup(callsign).and_then(|e| e.dxcc).is_none()
+}
+
+/// `geography_is_unresolved` for the operator's OWN `[server].station_callsign`,
+/// which -- unlike decoder output -- may carry an RBN `-N` per-band SSID
+/// (MAN-89 / D4).
+///
+/// The SSID is stripped HERE rather than at the call site (PR #131 review,
+/// round 7): `from_spot` above resolves the de side through
+/// `config::strip_ssid`, so any caller that classified the raw configured
+/// value would be answering a different question than the one it is reporting
+/// on. Left unstripped, an SSID'd mobile identity like `K5ARH/MM-1` reaches
+/// `is_outside_any_dxcc_entity` as `MM-1` rather than `MM` (so the /MM test
+/// misses) while `cty.lookup` still resolves through the allocated `K`
+/// prefix -- and every spot from that node goes out carrying the de-side
+/// sentinels with `manta_spots_unresolved_geography_total` stuck at zero.
+pub fn station_geography_unresolved(cty: &cty::Table, station_call: &str) -> bool {
+    geography_is_unresolved(cty, crate::config::strip_ssid(station_call))
+}
+
+/// The contract-required geography fields for ONE side of a spot, resolved
+/// together so `dxDxcc` can never disagree with the continent/CQ zone/lat/lon
+/// emitted beside it. `cq_zone`, `lat` and `lon` are unused for the de side:
+/// `cq_zone` has no `de` counterpart on the wire schema, and `deLat`/`deLon`
+/// are the operator's configured position (MAN-138), not a country centroid.
+struct Geography {
+    dxcc: i64,
+    continent: String,
+    cq_zone: u16,
+    lat: Option<f64>,
+    lon: Option<f64>,
+}
+
+impl Geography {
+    /// Resolves one callsign against `cty.dat` + the vendored `dxcc.tsv`.
+    ///
+    /// A `/MM` or `/AM` call short-circuits the lookup: reporting the base
+    /// call's home entity for it corrupts the geography of every maritime-
+    /// or aeronautical-mobile spot, so the entity number becomes ADIF's
+    /// `NO_DXCC_ENTITY` and the rest of the geography becomes the `UNKNOWN_*`
+    /// sentinels / `null` -- we know the station is not in its home entity,
+    /// and we do not know where it actually is.
+    fn resolve(callsign: &str, cty: &cty::Table) -> Self {
+        if is_outside_any_dxcc_entity(callsign) {
+            return Self {
+                dxcc: NO_DXCC_ENTITY,
+                continent: UNKNOWN_CONTINENT.to_string(),
+                cq_zone: UNKNOWN_CQ_ZONE,
+                lat: None,
+                lon: None,
+            };
+        }
+        let entry = cty.lookup(callsign);
+        Self {
+            dxcc: entry
+                .and_then(|e| e.dxcc)
+                .map(i64::from)
+                .unwrap_or(UNKNOWN_DXCC),
+            continent: entry
+                .map(|e| e.continent.clone())
+                .unwrap_or_else(|| UNKNOWN_CONTINENT.to_string()),
+            cq_zone: entry.map(|e| e.cq_zone).unwrap_or(UNKNOWN_CQ_ZONE),
+            lat: entry.map(|e| e.lat),
+            lon: entry.map(|e| e.lon),
+        }
+    }
+}
+
+/// MAN-102 / decision D3: the reference bandwidth every `snr` on this
+/// stream is quoted in. Constant today -- SPEC §2.3 bakes the
+/// channel-to-2500 Hz conversion into where the value is computed, so no
+/// code path can produce another reference. Present so a consumer never
+/// has to infer it, and so the telnet surface's 500 Hz convention
+/// (`rbn::format_line`) cannot be confused with this one.
+pub const SNR_REF_HZ: u32 = 2500;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,20 +207,54 @@ pub struct SpotMessage {
     pub dx_grid: Option<String>,
     pub dx_lat: Option<f64>,
     pub dx_lon: Option<f64>,
-    pub dx_dxcc: Option<i64>,
+    pub dx_dxcc: i64,
     pub dx_continent: String,
     pub dx_cq_zone: u16,
     pub de_call: String,
     pub de_grid: Option<String>,
     pub de_lat: Option<f64>,
     pub de_lon: Option<f64>,
-    pub de_dxcc: Option<i64>,
+    pub de_dxcc: i64,
     pub de_continent: String,
     pub snr: Option<i32>,
+    /// The reference bandwidth `snr` is quoted in. MAN-102 / D3.
+    pub snr_ref_hz: u32,
     pub wpm: Option<i32>,
+    /// The spot's track's most recent RST, three digits. MAN-272; manta-originated, not yet in dispensa.
+    pub rst: Option<String>,
+    /// The spot's track decoded `QRL?`. MAN-272; manta-originated, not yet in dispensa.
+    pub qrl_query: bool,
     pub decode_confidence: Option<f32>,
     pub decoder_version: Option<String>,
     pub channelizer_resolution_hz: Option<f64>,
+    pub seq: u64,
+}
+
+/// A spot's JSON `id`: `{station_call}:{session_nonce}:{track_id}:{sample_ts}:{callsign}`.
+/// See `SpotMessage::from_spot` for why every component is needed.
+/// MAN-301: extracted so the live RBN comparator keys its `spotGrade`
+/// record on exactly the `id` the spot line carried, without building a
+/// whole `SpotMessage` (which needs `cty.dat`) per spot.
+pub fn spot_id(station_call: &str, session_nonce: u128, spot: &Spot) -> String {
+    format!(
+        "{station_call}:{session_nonce}:{}:{}:{}",
+        spot.track_id, spot.sample_ts, spot.callsign
+    )
+}
+
+/// A spot's JSON `frequency`: `freq_hz` rounded to whole Hz. MAN-301: the
+/// live comparator grades this value, not the unrounded one, so a live
+/// grade and an offline `manta grade` replay of the archived spot line see
+/// the same number (and the same band, near an edge).
+pub fn wire_frequency_hz(spot: &Spot) -> i64 {
+    spot.freq_hz.round() as i64
+}
+
+/// A spot's JSON `wpm`: the decoder's estimate rounded to whole WPM.
+/// MAN-301: shared with the live comparator for the same reason as
+/// [`wire_frequency_hz`].
+pub fn wire_wpm(spot: &Spot) -> Option<i32> {
+    Some(spot.wpm.round() as i32)
 }
 
 impl SpotMessage {
@@ -57,74 +273,121 @@ impl SpotMessage {
     /// before a track's first `TrackMeta`, all stamped by the metadata-
     /// arrival retry with that track's saved timestamp) -- without the
     /// callsign, those would collide too.
+    ///
+    /// `station_location` is this station's configured position
+    /// (`ServerConfig::station_location`, MAN-138), copied verbatim into
+    /// `deGrid`/`deLat`/`deLon`; `None` sends all three as `null`. The de
+    /// side's `deDxcc`/`deContinent` still come from `station_call` through
+    /// `cty.dat` -- they are entity-level fields, right at that granularity.
+    /// `seq` is the record's per-session position assigned by `SpotBus` (MAN-137).
+    #[allow(clippy::too_many_arguments)] // Wire construction needs both identity and stream position.
     pub fn from_spot(
         spot: &Spot,
         station_call: &str,
+        station_location: Option<&crate::config::StationLocation>,
         cty: &cty::Table,
         decoder_version: &str,
         unix_ts_secs: i64,
         session_nonce: u128,
+        seq: u64,
     ) -> Self {
-        // Falls back to empty-string/zero when `dx_call` isn't
-        // cty-allocated. Reachable in practice, not just a defensive
-        // fallback: MAN-28's Watch List lets an operator allowlist a call
-        // that bypasses `cty.is_allocated()` entirely (e.g. a deliberately
-        // unallocated or malformed test callsign), so `Validator` can emit
-        // a spot for a callsign `cty.lookup` genuinely can't resolve.
-        // dxContinent/dxCqZone (and their de* counterparts) are REQUIRED,
-        // non-nullable fields on dispensa's spots.v1 wire contract, unlike
-        // dxDxcc/deDxcc (declared nullable there) -- there is currently no
-        // contract-defined "unknown" representation for these two fields,
-        // so this fallback stays a real (if honestly imperfect) value
-        // rather than null, which the contract would reject outright. See
-        // the follow-up ticket linked from this PR's round-6 review thread
-        // for the cross-repo contract question this raises.
-        let dx = cty.lookup(&spot.callsign);
-        let de = cty.lookup(station_call);
+        // Falls back to the UNKNOWN_* sentinels above when the callsign
+        // isn't cty-allocated. Reachable in practice, not defensive: MAN-28's
+        // Watch List lets an operator allowlist a call that bypasses
+        // `cty.is_allocated()` entirely (validator.rs:669-680), so
+        // `Validator` can emit a spot for a callsign `cty.lookup` genuinely
+        // can't resolve.
+        //
+        // MAN-136 / broad-review D10: dxDxcc, deDxcc, dxContinent, deContinent
+        // and dxCqZone are ALL required and non-nullable on dispensa's
+        // spots.v1 contract -- emitting JSON `null` for any of them fails
+        // cqdx's ingest rather than satisfying it. So each has a named,
+        // out-of-domain sentinel instead. `dxLat`/`dxLon` ARE nullable on the
+        // contract and DO serialize as `null` here, which is the one
+        // contract-defined "geography unknown" signal a consumer can key on
+        // today. Occurrences are counted as
+        // `manta_spots_unresolved_geography_total` (main.rs, at publish).
+        //
+        // `Geography::resolve` also handles the /MM and /AM designators, for
+        // which cty.dat DOES answer (through the base call's prefix) but the
+        // answer is wrong by definition -- see its doc comment.
+        let dx = Geography::resolve(&spot.callsign, cty);
+        // MAN-89: `station_call` may carry an RBN `-N` per-band SSID, which is a
+        // manta node index with no geographic meaning -- and which `cty.dat`'s
+        // exact-call alias rows would refuse to match (cty.rs:143-169 strips
+        // `/`-portable suffixes only). Resolve the operator's actual callsign;
+        // `de_call` and `id` below keep the full identity. Stripping before
+        // `Geography::resolve` also keeps `is_outside_any_dxcc_entity`'s
+        // `/MM`//`AM` check reading the same string the lookup does.
+        let de = Geography::resolve(crate::config::strip_ssid(station_call), cty);
         // `band` must be derived from the SAME rounded value reported as
         // `frequency` -- computing it from the unrounded `spot.freq_hz`
         // separately (round-5 review finding) could disagree with
         // `frequency` near a band edge, e.g. 13_999_999.6 Hz rounds up
         // into 20m's `frequency` while the unrounded value alone still
         // reads as 40m's `band`.
-        let frequency_hz = spot.freq_hz.round();
+        let frequency_hz = wire_frequency_hz(spot);
 
         Self {
-            id: format!(
-                "{station_call}:{session_nonce}:{}:{}:{}",
-                spot.track_id, spot.sample_ts, spot.callsign
-            ),
+            id: spot_id(station_call, session_nonce, spot),
             source: "skimmer",
             timestamp: unix_ts_secs,
             // cqdx overwrites this on receipt; see the field's schema doc.
             ingested_at: unix_ts_secs,
-            frequency: frequency_hz as i64,
-            band: crate::band::band_for_freq_hz(frequency_hz).to_string(),
+            frequency: frequency_hz,
+            band: crate::band::band_for_freq_hz(frequency_hz as f64).to_string(),
             mode: "CW",
             dx_call: spot.callsign.clone(),
             dx_grid: None,
-            dx_lat: dx.map(|e| e.lat),
-            dx_lon: dx.map(|e| e.lon),
-            dx_dxcc: None,
-            dx_continent: dx.map(|e| e.continent.clone()).unwrap_or_default(),
-            dx_cq_zone: dx.map(|e| e.cq_zone).unwrap_or(0),
+            dx_lat: dx.lat,
+            dx_lon: dx.lon,
+            dx_dxcc: dx.dxcc,
+            dx_continent: dx.continent,
+            dx_cq_zone: dx.cq_zone,
             de_call: station_call.to_string(),
-            de_grid: None,
-            de_lat: de.map(|e| e.lat),
-            de_lon: de.map(|e| e.lon),
-            de_dxcc: None,
-            de_continent: de.map(|e| e.continent.clone()).unwrap_or_default(),
+            // MAN-138: the operator's statement of where this station is,
+            // never `de.lat`/`de.lon` -- a country centroid would stack every
+            // station in one DXCC entity on a single map point.
+            de_grid: station_location.map(|l| l.grid.clone()),
+            de_lat: station_location.map(|l| l.lat),
+            de_lon: station_location.map(|l| l.lon),
+            de_dxcc: de.dxcc,
+            de_continent: de.continent,
             snr: Some(spot.snr_db.round() as i32),
-            wpm: Some(spot.wpm.round() as i32),
+            snr_ref_hz: SNR_REF_HZ,
+            wpm: wire_wpm(spot),
+            rst: spot.rst.clone(),
+            qrl_query: spot.qrl_query,
             decode_confidence: Some(spot.confidence),
             decoder_version: Some(decoder_version.to_string()),
             channelizer_resolution_hz: None,
+            seq,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn human_rounding_never_changes_wire_confidence_frequency_or_snr_reference() {
+        let mut spot = sample_spot();
+        spot.freq_hz = 14_012_349.9;
+        spot.confidence = 0.269_430_5;
+        spot.snr_db = 20.4;
+        let cty = manta_spot::cty::Table::parse(CTY_FIXTURE);
+        let msg = SpotMessage::from_spot(&spot, "W3XYZ", None, &cty, "manta-test", 0, 0, 0);
+        assert_eq!(msg.decode_confidence, Some(spot.confidence));
+        // Preserve the existing whole-Hz wire contract, never human kHz rounding.
+        assert_eq!(msg.frequency, 14_012_350);
+        assert_eq!(msg.snr, Some(20));
+        assert_eq!(msg.snr_ref_hz, 2500);
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            json["decodeConfidence"].as_f64().unwrap() as f32,
+            spot.confidence
+        );
+    }
+
     use super::*;
     use manta_spot::SpotType;
 
@@ -145,7 +408,119 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
             confidence: 0.9,
             track_id: 7,
             sample_ts: 12_345,
+            rst: None,
+            qrl_query: false,
         }
+    }
+
+    /// A config-free `StationLocation` at `grid`'s centre -- what
+    /// `ServerConfig::station_location` resolves for a grid-only config.
+    fn location(grid: &str) -> crate::config::StationLocation {
+        let (lat, lon) = crate::maidenhead::square(grid).unwrap().center();
+        crate::config::StationLocation {
+            grid: crate::maidenhead::canonical(grid).unwrap(),
+            lat,
+            lon,
+        }
+    }
+
+    /// MAN-138, the ticket's scenario at the message level: two US stations
+    /// whose callsigns resolve to the SAME cty.dat entity, but whose operators
+    /// configured different locations, must report different positions --
+    /// never the shared US centroid (37.6, -91.87).
+    #[test]
+    fn de_position_is_the_configured_station_location_not_a_country_centroid() {
+        let cty = cty::Table::parse(manta_spot::CTY_DAT);
+        let w1aw = location("FN31pr");
+        let w5au = location("EM12kp");
+        let a = SpotMessage::from_spot(&sample_spot(), "W1AW", Some(&w1aw), &cty, "v", 0, 1, 0);
+        let b = SpotMessage::from_spot(&sample_spot(), "W5AU", Some(&w5au), &cty, "v", 0, 1, 0);
+        assert_eq!(a.de_grid.as_deref(), Some("FN31pr"));
+        assert_eq!(b.de_grid.as_deref(), Some("EM12kp"));
+        assert_eq!((a.de_lat, a.de_lon), (Some(w1aw.lat), Some(w1aw.lon)));
+        assert_ne!((a.de_lat, a.de_lon), (b.de_lat, b.de_lon));
+        for m in [&a, &b] {
+            assert_ne!((m.de_lat, m.de_lon), (Some(37.6), Some(-91.87)));
+            assert_eq!(m.de_dxcc, 291); // entity-level fields still from the callsign
+            assert_eq!(m.de_continent, "NA");
+        }
+    }
+
+    /// No configured location: all three are null -- the contract-legal
+    /// "unknown" -- even though the callsign resolves fine in cty.dat.
+    #[test]
+    fn an_unconfigured_station_sends_a_null_position() {
+        let cty = cty::Table::parse(manta_spot::CTY_DAT);
+        let msg = SpotMessage::from_spot(&sample_spot(), "W1AW", None, &cty, "v", 0, 1, 0);
+        assert_eq!(msg.de_dxcc, 291, "test premise: the callsign resolves");
+        assert_eq!((&msg.de_grid, msg.de_lat, msg.de_lon), (&None, None, None));
+        let json = serde_json::to_value(&msg).unwrap();
+        for key in ["deGrid", "deLat", "deLon"] {
+            assert!(json.get(key).is_some_and(|v| v.is_null()), "{key}: {json}");
+        }
+    }
+
+    /// The configured position is the operator's statement and wins even for a
+    /// /MM station; the entity number still follows the callsign rule.
+    #[test]
+    fn a_mobile_station_with_a_configured_location_reports_it() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let here = location("FN31pr");
+        let msg =
+            SpotMessage::from_spot(&sample_spot(), "W3XYZ/MM", Some(&here), &cty, "v", 0, 1, 0);
+        assert_eq!(msg.de_dxcc, NO_DXCC_ENTITY);
+        assert_eq!(msg.de_grid.as_deref(), Some("FN31pr"));
+        assert_eq!((msg.de_lat, msg.de_lon), (Some(here.lat), Some(here.lon)));
+    }
+
+    /// The dx side is untouched by MAN-138.
+    #[test]
+    fn dx_geography_is_unchanged_by_a_configured_station_location() {
+        let cty = cty::Table::parse(manta_spot::CTY_DAT);
+        let here = location("FN31pr");
+        let with = SpotMessage::from_spot(&sample_spot(), "W1AW", Some(&here), &cty, "v", 0, 1, 0);
+        let without = SpotMessage::from_spot(&sample_spot(), "W1AW", None, &cty, "v", 0, 1, 0);
+        assert_eq!((with.dx_lat, with.dx_lon), (without.dx_lat, without.dx_lon));
+        assert!(with.dx_lat.is_some(), "test premise: JA1ABC resolves");
+        assert_eq!(with.dx_grid, None);
+        assert_eq!(with.dx_dxcc, without.dx_dxcc);
+        assert_eq!(with.dx_continent, without.dx_continent);
+        assert_eq!(with.dx_cq_zone, without.dx_cq_zone);
+    }
+
+    /// MAN-89: `station_callsign` may now carry a `-N` SSID, but `cty.dat`'s
+    /// exact-call alias rows (`prefix_entry`, cty.rs:143-154) only tolerate a
+    /// `/`-portable suffix, never `-` -- so an operator whose OWN callsign has an
+    /// exact override (`4U1UN` etc.) would silently lose it and fall through to a
+    /// generic prefix with the wrong entity, continent and coordinates. Measured
+    /// before the fix: `4U1UN` -> NA/lat 40.75, `4U1UN-1` -> EU/lat 42.82.
+    /// The `-N` is a manta band index with no geographic meaning; strip it for
+    /// the lookup, keep it in the identity.
+    #[test]
+    fn de_geography_ignores_the_ssid_on_an_exact_alias_callsign() {
+        let cty = cty::Table::parse(manta_spot::CTY_DAT);
+        let bare = SpotMessage::from_spot(&sample_spot(), "4U1UN", None, &cty, "v", 0, 1, 0);
+        let ssid = SpotMessage::from_spot(&sample_spot(), "4U1UN-1", None, &cty, "v", 0, 1, 0);
+
+        assert_eq!(ssid.de_dxcc, bare.de_dxcc);
+        assert_eq!(ssid.de_continent, bare.de_continent);
+        // MAN-138: the position no longer comes from the callsign at all.
+        assert!(ssid.de_lat.is_none() && bare.de_lat.is_none());
+        // The wire identity keeps the SSID -- geography is stripped, identity is not.
+        assert_eq!(ssid.de_call, "4U1UN-1");
+        assert!(ssid.id.starts_with("4U1UN-1:"));
+    }
+
+    /// An ordinary prefix callsign was never affected either way; pin it so a
+    /// future change to `strip_ssid` can't quietly start mangling the common case.
+    #[test]
+    fn de_geography_is_unchanged_for_an_ordinary_prefix_callsign() {
+        let cty = cty::Table::parse(manta_spot::CTY_DAT);
+        let bare = SpotMessage::from_spot(&sample_spot(), "W5AU", None, &cty, "v", 0, 1, 0);
+        let ssid = SpotMessage::from_spot(&sample_spot(), "W5AU-1", None, &cty, "v", 0, 1, 0);
+        assert_eq!(ssid.de_dxcc, bare.de_dxcc);
+        assert_eq!(ssid.de_continent, bare.de_continent);
+        assert!(ssid.de_lat.is_none() && bare.de_lat.is_none());
     }
 
     #[test]
@@ -161,7 +536,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         let cty = cty::Table::parse(CTY_FIXTURE);
         let mut spot = sample_spot();
         spot.freq_hz = 13_999_999.6;
-        let msg = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 0);
+        let msg = SpotMessage::from_spot(&spot, "W3XYZ", None, &cty, "manta-0.1.0", 0, 0, 0);
 
         assert_eq!(msg.frequency, 14_000_000);
         assert_eq!(msg.band, "20m");
@@ -173,10 +548,12 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         let msg = SpotMessage::from_spot(
             &sample_spot(),
             "W3XYZ",
+            None,
             &cty,
             "manta-0.1.0",
             1_700_000_000,
             1_699_999_000,
+            0,
         );
 
         assert_eq!(msg.source, "skimmer");
@@ -196,10 +573,12 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         let msg = SpotMessage::from_spot(
             &sample_spot(),
             "W3XYZ",
+            None,
             &cty,
             "manta-0.1.0",
             0,
             1_699_999_000,
+            0,
         );
 
         assert_eq!(msg.dx_continent, "AS");
@@ -207,20 +586,226 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         assert_eq!(msg.de_continent, "NA");
     }
 
+    /// MAN-136 scenario 1: dispensa's spots.v1 declares dxDxcc REQUIRED and
+    /// non-nullable; manta used to emit `null` for EVERY spot, including ones
+    /// whose callsign cty.dat resolves fine -- cqdx's ingest would reject the
+    /// batch on this field alone. CTY_FIXTURE's entities carry the real primary
+    /// prefixes `JA` and `K`, so the real vendored dxcc.tsv resolves them.
     #[test]
-    fn dxcc_entity_numbers_are_null_not_fabricated() {
+    fn a_resolvable_callsign_carries_its_real_adif_dxcc_entity_number() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let msg =
+            SpotMessage::from_spot(&sample_spot(), "W3XYZ", None, &cty, "manta-0.1.0", 0, 0, 0);
+
+        assert_eq!(msg.dx_dxcc, 339, "JA1ABC -> Japan");
+        assert_eq!(msg.de_dxcc, 291, "W3XYZ -> United States");
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["dxDxcc"], 339);
+        assert_eq!(json["deDxcc"], 291);
+        assert!(!json["dxDxcc"].is_null(), "the whole point of MAN-136");
+    }
+
+    /// MAN-136 scenario 2 (also MAN-45 finding 1): MAN-28's Watch List allowlist
+    /// (validator.rs:669-680) lets an operator emit a spot for a call cty.lookup
+    /// genuinely cannot resolve. All three required geography fields must then
+    /// carry a named, out-of-domain sentinel -- never a fabricated-looking value,
+    /// and never null.
+    ///
+    /// Uses the REAL vendored cty.dat, not CTY_FIXTURE: a call that is
+    /// unallocated in a 2-entity fixture is usually allocated in the real file
+    /// (ZZ9ZZZ -> Brazil/108 via ZZ; NOCALL -> US/291 via N). ITU allocates no Q
+    /// prefixes, so QQ1AAA is genuinely unresolvable.
+    #[test]
+    fn an_unresolvable_callsign_emits_named_out_of_domain_sentinels() {
+        let cty = cty::Table::parse(manta_spot::CTY_DAT);
+        let mut spot = sample_spot();
+        spot.callsign = "QQ1AAA".to_string();
+        assert!(cty.lookup(&spot.callsign).is_none(), "test premise");
+
+        let msg = SpotMessage::from_spot(&spot, "W3XYZ", None, &cty, "manta-0.1.0", 0, 0, 0);
+
+        assert_eq!(msg.dx_dxcc, UNKNOWN_DXCC);
+        assert_eq!(msg.dx_continent, UNKNOWN_CONTINENT);
+        assert_eq!(msg.dx_cq_zone, UNKNOWN_CQ_ZONE);
+        // Each sentinel must be outside its field's real domain. UNKNOWN_DXCC's
+        // own doc comment covers why it's negative and not 0 (ADIF 0 means
+        // "confirmed not in any entity") -- both are constant properties, not
+        // something to assert at runtime here.
+        assert!(!(1..=40).contains(&msg.dx_cq_zone));
+        assert!(msg.dx_continent.len() != 2);
+        // The contract-legal unknown signal consumers can key on today.
+        assert!(msg.dx_lat.is_none());
+        assert!(msg.dx_lon.is_none());
+        // The station's own call still resolves -- de geography is unaffected.
+        assert_eq!(msg.de_dxcc, 291);
+        assert_eq!(msg.de_continent, "NA");
+    }
+
+    /// The de side gets the same treatment: `station_callsign` is operator config
+    /// and is not required to be cty-resolvable.
+    #[test]
+    fn an_unresolvable_station_callsign_also_gets_the_sentinels() {
+        let cty = cty::Table::parse(manta_spot::CTY_DAT);
+        let msg =
+            SpotMessage::from_spot(&sample_spot(), "QQ1AAA", None, &cty, "manta-0.1.0", 0, 0, 0);
+
+        assert_eq!(msg.de_dxcc, UNKNOWN_DXCC);
+        assert_eq!(msg.de_continent, UNKNOWN_CONTINENT);
+        assert!(msg.de_lat.is_none());
+        // dx geography is unaffected.
+        assert_eq!(msg.dx_dxcc, 339);
+    }
+
+    /// Round-7 review finding 2: `cty.lookup` resolves `K5ARH/MM` through the
+    /// base call's `K` prefix, so the entity mapping this ticket added used to
+    /// report the United States (291) for a station whose designator says it
+    /// is at sea (`/MM`) or airborne (`/AM`). ADIF entity code 0 -- "known NOT
+    /// to be within a DXCC entity" -- is precisely this case, and the rest of
+    /// the geography must not claim the home entity either: we know where the
+    /// station is NOT, and not where it is.
+    #[test]
+    fn maritime_and_aeronautical_mobile_calls_emit_adif_entity_zero() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        for call in ["K5ARH/MM", "K5ARH/AM", "k5arh/mm"] {
+            assert_eq!(
+                cty.lookup(call).and_then(|e| e.dxcc),
+                Some(291),
+                "test premise: {call}'s base prefix resolves to the home entity"
+            );
+            let mut spot = sample_spot();
+            spot.callsign = call.to_string();
+            let msg = SpotMessage::from_spot(&spot, "W3XYZ", None, &cty, "manta-0.1.0", 0, 0, 0);
+
+            assert_eq!(msg.dx_dxcc, NO_DXCC_ENTITY, "{call}");
+            assert_eq!(msg.dx_continent, UNKNOWN_CONTINENT, "{call}");
+            assert_eq!(msg.dx_cq_zone, UNKNOWN_CQ_ZONE, "{call}");
+            assert!(msg.dx_lat.is_none(), "{call}");
+            assert!(msg.dx_lon.is_none(), "{call}");
+            // The reporting station is an ordinary call -- unaffected.
+            assert_eq!(msg.de_dxcc, 291, "{call}");
+            assert_eq!(msg.de_continent, "NA", "{call}");
+        }
+    }
+
+    /// The station's own callsign gets the same rule: a shipboard or airborne
+    /// skimmer configures `station_callsign` as `.../MM` or `.../AM`, and its
+    /// home entity is just as wrong on the de side of the wire message.
+    #[test]
+    fn a_mobile_station_callsign_also_emits_adif_entity_zero() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let msg = SpotMessage::from_spot(
+            &sample_spot(),
+            "W3XYZ/MM",
+            None,
+            &cty,
+            "manta-0.1.0",
+            0,
+            0,
+            0,
+        );
+
+        assert_eq!(msg.de_dxcc, NO_DXCC_ENTITY);
+        assert_eq!(msg.de_continent, UNKNOWN_CONTINENT);
+        assert!(msg.de_lat.is_none());
+        assert!(msg.de_lon.is_none());
+        // dx geography is unaffected.
+        assert_eq!(msg.dx_dxcc, 339);
+    }
+
+    /// Only `/MM` and `/AM` mean "outside every entity". The other designators
+    /// `grammar::is_valid_portable` accepts mean "somewhere else", which the
+    /// base prefix still describes correctly at entity granularity -- narrowing
+    /// them to code 0 would throw away geography manta actually knows.
+    #[test]
+    fn the_other_portable_designators_keep_their_home_entity() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        for call in ["K5ARH/P", "K5ARH/QRP", "K5ARH/M", "K5ARH/3", "K5ARH"] {
+            let mut spot = sample_spot();
+            spot.callsign = call.to_string();
+            let msg = SpotMessage::from_spot(&spot, "W3XYZ", None, &cty, "manta-0.1.0", 0, 0, 0);
+
+            assert_eq!(msg.dx_dxcc, 291, "{call}");
+            assert_eq!(msg.dx_continent, "NA", "{call}");
+            assert_eq!(msg.dx_cq_zone, 5, "{call}");
+            assert!(msg.dx_lat.is_some(), "{call}");
+        }
+    }
+
+    /// MAN-28's Watch List allowlist bypasses `grammar::is_plausible`
+    /// entirely (validator.rs:676-688), so a compound call can reach
+    /// `from_spot` even though the grammar admits only one `/`. A mobile
+    /// designator anywhere after the first segment still decides --
+    /// `is_outside_any_dxcc_entity` tests all of them, so the marker counts
+    /// wherever in the compound it sits.
+    #[test]
+    fn a_compound_call_with_a_mobile_designator_is_still_mobile() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        // Trailing, and -- since the allowlist admits any number of `/`
+        // segments -- NOT trailing: a rsplit-once test would hand
+        // `K5ARH/MM/QRP` the United States (291) it is by definition not in.
+        for call in ["KP4/K5ARH/MM", "K5ARH/MM/QRP", "K5ARH/AM/P"] {
+            let mut spot = sample_spot();
+            spot.callsign = call.to_string();
+            let msg = SpotMessage::from_spot(&spot, "W3XYZ", None, &cty, "manta-0.1.0", 0, 0, 0);
+
+            assert_eq!(msg.dx_dxcc, NO_DXCC_ENTITY, "{call}");
+            assert_eq!(msg.dx_cq_zone, UNKNOWN_CQ_ZONE, "{call}");
+            assert_eq!(msg.dx_continent, UNKNOWN_CONTINENT, "{call}");
+            assert!(msg.dx_lat.is_none(), "{call}");
+        }
+    }
+
+    #[test]
+    fn is_outside_any_dxcc_entity_matches_only_the_two_mobile_designators() {
+        for call in [
+            "K5ARH/MM",
+            "K5ARH/AM",
+            "k5arh/am",
+            "KP4/K5ARH/MM",
+            "K5ARH/MM/QRP",
+        ] {
+            assert!(is_outside_any_dxcc_entity(call), "{call}");
+        }
+        // `MM`/`AM` in the FIRST segment are the Scottish and Spanish
+        // prefixes, not designators: `MM/K5ARH` is a station in Scotland and
+        // keeps the geography cty.dat resolves for it.
+        for call in [
+            "K5ARH",
+            "K5ARH/P",
+            "K5ARH/M",
+            "K5ARH/3",
+            "MM0ABC",
+            "AM1AB",
+            "MM/K5ARH",
+            "AM/K5ARH/P",
+        ] {
+            assert!(!is_outside_any_dxcc_entity(call), "{call}");
+        }
+    }
+
+    #[test]
+    fn json_snr_is_the_native_2500hz_value_with_an_explicit_reference() {
+        // MAN-102/D3: JSON must NOT carry the telnet/uplink +7 dB
+        // conversion -- that's a wire-boundary rendering step
+        // (`rbn::format_line`), not a pipeline value change.
         let cty = cty::Table::parse(CTY_FIXTURE);
         let msg = SpotMessage::from_spot(
             &sample_spot(),
             "W3XYZ",
+            None,
             &cty,
             "manta-0.1.0",
             0,
             1_699_999_000,
+            0,
         );
-
-        assert_eq!(msg.dx_dxcc, None);
-        assert_eq!(msg.de_dxcc, None);
+        assert_eq!(msg.snr, Some(23), "JSON must NOT carry the telnet +7 dB");
+        assert_eq!(msg.snr_ref_hz, 2500);
+        let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            v["snrRefHz"], 2500,
+            "camelCase wire key, per the struct's rename_all"
+        );
     }
 
     #[test]
@@ -229,10 +814,12 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         let msg = SpotMessage::from_spot(
             &sample_spot(),
             "W3XYZ",
+            None,
             &cty,
             "manta-0.1.0",
             0,
             1_699_999_000,
+            0,
         );
 
         assert_eq!(msg.decode_confidence, Some(0.9));
@@ -257,8 +844,10 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         assert_eq!(spot_a.track_id, spot_b.track_id);
         assert_eq!(spot_a.sample_ts, spot_b.sample_ts);
 
-        let msg_a = SpotMessage::from_spot(&spot_a, "W3XYZ", &cty, "manta-0.1.0", 0, 1_000);
-        let msg_b = SpotMessage::from_spot(&spot_b, "W3XYZ", &cty, "manta-0.1.0", 0, 1_000);
+        let msg_a =
+            SpotMessage::from_spot(&spot_a, "W3XYZ", None, &cty, "manta-0.1.0", 0, 1_000, 0);
+        let msg_b =
+            SpotMessage::from_spot(&spot_b, "W3XYZ", None, &cty, "manta-0.1.0", 0, 1_000, 0);
 
         assert_ne!(
             msg_a.id, msg_b.id,
@@ -271,9 +860,12 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         let cty = cty::Table::parse(CTY_FIXTURE);
         let spot = sample_spot();
 
-        let station_a = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 1_000);
-        let station_b = SpotMessage::from_spot(&spot, "N0CALL", &cty, "manta-0.1.0", 0, 1_000);
-        let restarted = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 2_000);
+        let station_a =
+            SpotMessage::from_spot(&spot, "W3XYZ", None, &cty, "manta-0.1.0", 0, 1_000, 0);
+        let station_b =
+            SpotMessage::from_spot(&spot, "N0CALL", None, &cty, "manta-0.1.0", 0, 1_000, 0);
+        let restarted =
+            SpotMessage::from_spot(&spot, "W3XYZ", None, &cty, "manta-0.1.0", 0, 2_000, 0);
 
         assert_ne!(
             station_a.id, station_b.id,
@@ -291,10 +883,12 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         let msg = SpotMessage::from_spot(
             &sample_spot(),
             "W3XYZ",
+            None,
             &cty,
             "manta-0.1.0",
             0,
             1_699_999_000,
+            0,
         );
         let json = serde_json::to_value(&msg).unwrap();
 
@@ -310,10 +904,17 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
             "dxDxcc",
             "dxContinent",
             "dxCqZone",
+            "dxGrid",
+            "dxLat",
+            "dxLon",
             "deCall",
+            "deGrid",
+            "deLat",
+            "deLon",
             "deDxcc",
             "deContinent",
             "snr",
+            "snrRefHz",
             "wpm",
             "decodeConfidence",
             "decoderVersion",
@@ -321,6 +922,131 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         ] {
             assert!(json.get(key).is_some(), "missing key: {key}");
         }
-        assert_eq!(json["dxDxcc"], serde_json::Value::Null);
+        assert_eq!(json["dxDxcc"], 339);
+        assert!(!json["dxDxcc"].is_null());
+    }
+
+    /// MAN-301: the comparator's `spotGrade.spotId` must be byte-identical
+    /// to the `id` of the spot line it grades.
+    #[test]
+    fn spot_id_helper_matches_from_spot() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let spot = sample_spot();
+        let nonce = 1_791_719_990_000_000_000u128;
+        let msg = SpotMessage::from_spot(&spot, "W3XYZ-1", None, &cty, "v", 0, nonce, 0);
+        assert_eq!(spot_id("W3XYZ-1", nonce, &spot), msg.id);
+        assert_eq!(msg.id, "W3XYZ-1:1791719990000000000:7:12345:JA1ABC");
+    }
+
+    /// MAN-301: the comparator's frequency and WPM are the spot line's
+    /// `frequency`/`wpm`, including at the band edge where rounding moves
+    /// 13_999_999.6 Hz into 20m (see `from_spot`'s comment).
+    #[test]
+    fn wire_frequency_and_wpm_helpers_match_from_spot() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        for (freq_hz, wpm) in [
+            (14_027_100.0, 28.0),
+            (13_999_999.6, 24.5),
+            (7_012_349.4, 17.4),
+        ] {
+            let spot = Spot {
+                freq_hz,
+                wpm,
+                ..sample_spot()
+            };
+            let msg = SpotMessage::from_spot(&spot, "W1AW", None, &cty, "v", 0, 1, 0);
+            assert_eq!(wire_frequency_hz(&spot), msg.frequency);
+            assert_eq!(wire_wpm(&spot), msg.wpm);
+            assert_eq!(
+                crate::band::band_for_freq_hz(wire_frequency_hz(&spot) as f64),
+                msg.band
+            );
+        }
+        let edge = Spot {
+            freq_hz: 13_999_999.6,
+            ..sample_spot()
+        };
+        assert_eq!(wire_frequency_hz(&edge), 14_000_000);
+        assert_eq!(
+            crate::band::band_for_freq_hz(wire_frequency_hz(&edge) as f64),
+            "20m"
+        );
+    }
+
+    /// MAN-149: dispensa's contract is private, so `docs/SPOT-SCHEMA.md` is
+    /// the field reference outside developers read. Its field table must
+    /// have exactly one row per key this struct puts on the wire.
+    #[test]
+    fn every_wire_field_is_documented() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let msg = SpotMessage::from_spot(&sample_spot(), "W1AW", None, &cty, "v", 0, 1, 0);
+        let json = serde_json::to_value(&msg).unwrap();
+        let keys: Vec<&String> = json.as_object().expect("an object").keys().collect();
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/SPOT-SCHEMA.md");
+        let schema = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("reading {path}: {e}"))
+            .replace("\r\n", "\n");
+        let rows: Vec<&str> = schema
+            .lines()
+            .filter_map(|l| l.strip_prefix("| `"))
+            .filter_map(|l| l.split_once("` |"))
+            .map(|(field, _)| field)
+            .collect();
+
+        for key in &keys {
+            assert!(
+                rows.contains(&key.as_str()),
+                "docs/SPOT-SCHEMA.md has no `| `{key}` |` row: add one to its Fields table"
+            );
+        }
+        for row in &rows {
+            assert!(
+                keys.iter().any(|k| k == row),
+                "docs/SPOT-SCHEMA.md documents `{row}`, which SpotMessage does not serialize"
+            );
+        }
+        assert_eq!(
+            rows.len(),
+            keys.len(),
+            "docs/SPOT-SCHEMA.md's Fields table must have exactly one row per wire field"
+        );
+    }
+    #[test]
+    fn from_spot_carries_the_seq_it_is_given_as_the_last_key() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let msg = SpotMessage::from_spot(&sample_spot(), "W1AW", None, &cty, "v", 0, 1, 7);
+        assert!(serde_json::to_string(&msg)
+            .unwrap()
+            .ends_with(r#","seq":7}"#));
+    }
+
+    /// MAN-272: a track's latest RST and its QRL? flag reach the JSON
+    /// stream as `rst`/`qrlQuery`, between `wpm` and `decodeConfidence`.
+    #[test]
+    fn rst_and_qrl_reach_the_wire_under_their_contract_names() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let mut spot = sample_spot();
+        spot.rst = Some("599".to_string());
+        spot.qrl_query = true;
+        let msg = SpotMessage::from_spot(&spot, "W1AW", None, &cty, "v", 0, 1, 0);
+        let line = serde_json::to_string(&msg).unwrap();
+        assert!(
+            line.contains(r#""wpm":28,"rst":"599","qrlQuery":true,"decodeConfidence""#),
+            "got {line}"
+        );
+    }
+
+    /// MAN-272: a spot whose track decoded neither annotation still sends
+    /// both keys -- SPOT-SCHEMA's keys-are-never-omitted invariant.
+    #[test]
+    fn a_spot_without_message_content_sends_null_rst_and_false_qrl() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let msg = SpotMessage::from_spot(&sample_spot(), "W1AW", None, &cty, "v", 0, 1, 0);
+        let line = serde_json::to_string(&msg).unwrap();
+        assert!(
+            line.contains(r#""rst":null,"qrlQuery":false"#),
+            "got {line}"
+        );
     }
 }

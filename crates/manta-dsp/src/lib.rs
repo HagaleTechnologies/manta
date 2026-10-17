@@ -4,10 +4,21 @@
 //! coppa-dsp has no FIR designer), a single-channel extractor shim, and an
 //! FFT-peak frequency estimator. `channelizer` is the M2 full N-channel WOLA
 //! polyphase filterbank (SPEC §1.1-1.3) that supersedes `single`/`freqest`.
+//! `refine` is decode-core-v2 §3's optional per-track narrowband refiner.
+//! `carrier` is the narrowband carrier-frequency estimator behind frequency calibration.
+//! `crash` is MAN-312's band-wide static-crash detector (SPEC §2.7).
+//! `sample_guard` is MAN-234's input sample guard (SPEC §1.3 step 0).
 
+pub mod carrier;
 pub mod channelizer;
+pub mod comod;
+pub mod crash;
+pub mod decimate;
 pub mod floor;
 pub mod freqest;
+pub mod fsk;
 pub mod hilbert;
 pub mod proto;
+pub mod refine;
+pub mod sample_guard;
 pub mod single;

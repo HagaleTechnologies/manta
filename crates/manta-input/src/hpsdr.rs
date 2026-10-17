@@ -2,10 +2,9 @@
 //! Pavel Demin's `sdr_receiver_hpsdr`/`sdr_transceiver_hpsdr` Red Pitaya
 //! images, and his QMTech+`qmtech-adc` board. ARCHITECTURE §3.
 //!
-//! Feature-gated `hpsdr`, matching how `soapy` is feature-gated — this
-//! module has no native-library dependency (pure UDP/std), but the gate is
-//! kept for symmetry with the other network/hardware sources and so a build
-//! can opt it out.
+//! Included in every build. This module uses UDP/std and needs no native
+//! radio library. A receiver is opened only by an explicit call to
+//! [`HpsdrDevice::open`].
 //!
 //! Wire facts below are pinned by
 //! `docs/DECISIONS/2026-09-02-hpsdr-hermes-protocol-spike.md` (MAN-10),
@@ -66,7 +65,7 @@
 //! time with an actionable error, rather than silently overrunning the
 //! link.
 
-use crate::IqSource;
+use crate::{InputHealthCounters, IqSource};
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
 use std::collections::VecDeque;
@@ -262,9 +261,9 @@ pub fn demux_metis_packet(
     }
     if packet[0..4] != METIS_IQ_ENDPOINT_HEADER {
         bail!(
-            "Metis packet header {:02x?} does not match the IQ endpoint 6 header {:02x?}",
-            &packet[0..4],
-            METIS_IQ_ENDPOINT_HEADER
+            "Metis packet header {} does not match the IQ endpoint 6 header {}",
+            hex_bytes(&packet[0..4]),
+            hex_bytes(&METIS_IQ_ENDPOINT_HEADER)
         );
     }
     if out.len() < num_receivers {
@@ -277,13 +276,25 @@ pub fn demux_metis_packet(
         let frame_start = METIS_HEADER_LEN + frame * USB_FRAME_LEN;
         let sync = &packet[frame_start..frame_start + 3];
         if sync != USB_SYNC {
-            bail!("USB frame {frame} has bad sync bytes {sync:02x?}, expected {USB_SYNC:02x?}");
+            bail!(
+                "USB frame {frame} has bad sync bytes {}, expected {}",
+                hex_bytes(sync),
+                hex_bytes(&USB_SYNC)
+            );
         }
         let payload_start = frame_start + USB_SUBHEADER_LEN;
         let payload = &packet[payload_start..payload_start + USB_PAYLOAD_LEN];
         demux_usb_payload(payload, num_receivers, out);
     }
     Ok(())
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Cadence-based UDP loss/reorder detector for a Protocol 1 stream that
@@ -294,9 +305,10 @@ pub struct GapDetector {
     expected_interval: Duration,
     tolerance: f64,
     last_arrival: Option<Instant>,
-    dropped_packets: u64,
-    gaps_detected: u64,
-    malformed_packets: u64,
+    /// MAN-56: shared with every `HpsdrIqSource` handle for this device (a
+    /// clone of the same `Arc`, mirroring `confirmed_live`) so a metrics
+    /// poller can read them without locking `Inner`.
+    counters: Arc<InputHealthCounters>,
 }
 
 impl GapDetector {
@@ -313,10 +325,14 @@ impl GapDetector {
             expected_interval,
             tolerance,
             last_arrival: None,
-            dropped_packets: 0,
-            gaps_detected: 0,
-            malformed_packets: 0,
+            counters: Arc::new(InputHealthCounters::new()),
         }
+    }
+
+    /// The shared handle backing this detector's counters -- clone it into
+    /// every `HpsdrIqSource` sharing this device's stream (MAN-56).
+    pub fn counters(&self) -> Arc<InputHealthCounters> {
+        self.counters.clone()
     }
 
     /// Record a datagram discarded because it wasn't a valid Metis/Hermes IQ
@@ -324,7 +340,7 @@ impl GapDetector {
     /// framing validation) — MAN-22: a malformed or adversarially-crafted
     /// UDP packet must be counted, not silently dropped.
     pub fn record_malformed(&mut self) {
-        self.malformed_packets += 1;
+        self.counters.record_malformed();
     }
 
     /// Record a packet's arrival at `now`, returning `true` if this arrival
@@ -337,8 +353,9 @@ impl GapDetector {
             if elapsed > threshold && self.expected_interval > Duration::ZERO {
                 let missed =
                     (elapsed.as_secs_f64() / self.expected_interval.as_secs_f64()).round() as u64;
-                self.dropped_packets += missed.saturating_sub(1).max(1);
-                self.gaps_detected += 1;
+                self.counters
+                    .record_dropped(missed.saturating_sub(1).max(1));
+                self.counters.record_gap();
                 flagged = true;
             }
         }
@@ -348,19 +365,19 @@ impl GapDetector {
 
     pub fn stats(&self) -> GapStats {
         GapStats {
-            dropped_packets: self.dropped_packets,
-            gaps_detected: self.gaps_detected,
-            malformed_packets: self.malformed_packets,
+            dropped_packets: self.counters.dropped_packets(),
+            gaps_detected: self.counters.gaps_detected(),
+            malformed_packets: self.counters.malformed_packets(),
         }
     }
 }
 
-/// Loss/reorder/malformed-packet counters for a device stream. Matching
-/// `manta-engine::soak`'s documented deviation, this is exposed as a plain
-/// getter rather than wired into a project-wide metrics system, which
-/// doesn't exist yet for live-hardware sources (tracked as a MAN-22
-/// follow-up: manta-input counters, `malformed_packets` included, aren't
-/// reachable from manta-server's Prometheus `/metrics` endpoint yet).
+/// Loss/reorder/malformed-packet counters for a device stream -- the
+/// HPSDR-facing snapshot of the shared `InputHealthCounters` handle
+/// (`GapDetector::counters`), which `manta-cli` polls into
+/// `manta_server::metrics::Metrics::set_input_health` (MAN-56). The
+/// *audio ring-overrun* deviation documented in `manta-engine::soak` is a
+/// different, still-open gap -- unrelated to these packet-level counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GapStats {
     pub dropped_packets: u64,
@@ -839,10 +856,13 @@ impl HpsdrDevice {
         let confirmed_live = Arc::new(AtomicBool::new(false));
         let cc_frame_count = cc_frames.len();
 
+        let gap = GapDetector::new(cfg.sample_rate_hz, cfg.ddc_count, 1.5);
+        let health_counters = gap.counters();
+
         let inner = Arc::new(Mutex::new(Inner {
             socket,
             queues: vec![VecDeque::new(); cfg.ddc_count],
-            gap: GapDetector::new(cfg.sample_rate_hz, cfg.ddc_count, 1.5),
+            gap,
             num_receivers: cfg.ddc_count,
             last_keepalive: Instant::now(),
             recv_buf: [0u8; RECV_BUF_LEN],
@@ -900,6 +920,7 @@ impl HpsdrDevice {
                 sample_rate_hz: cfg.sample_rate_hz,
                 center_freq_hz: cfg.center_freq_hz[ddc_index],
                 confirmed_live: confirmed_live.clone(),
+                health_counters: health_counters.clone(),
             })
             .collect())
     }
@@ -917,6 +938,10 @@ pub struct HpsdrIqSource {
     /// can hand it out without locking `inner`'s mutex just to read a
     /// liveness bit.
     confirmed_live: Arc<AtomicBool>,
+    /// Same counters as `Inner::gap`'s (a clone of the same `Arc`,
+    /// MAN-56) -- kept here too so `health_counters()` and `gap_stats()`
+    /// can read them without locking `inner`'s mutex.
+    health_counters: Arc<InputHealthCounters>,
 }
 
 impl HpsdrIqSource {
@@ -925,7 +950,11 @@ impl HpsdrIqSource {
     /// affected packet, so these counters are shared across all of a
     /// device's `HpsdrIqSource` handles).
     pub fn gap_stats(&self) -> GapStats {
-        self.inner.lock().unwrap().gap.stats()
+        GapStats {
+            dropped_packets: self.health_counters.dropped_packets(),
+            gaps_detected: self.health_counters.gaps_detected(),
+            malformed_packets: self.health_counters.malformed_packets(),
+        }
     }
 }
 
@@ -954,10 +983,36 @@ impl IqSource for HpsdrIqSource {
     fn confirmed_live_handle(&self) -> Option<Arc<AtomicBool>> {
         Some(self.confirmed_live.clone())
     }
+
+    fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
+        Some(self.health_counters.clone())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn packet_errors_use_deliberate_hex_byte_lists() {
+        let mut pkt = synth_metis_packet(1, |_| Complex32::new(0.0, 0.0));
+        let mut out = vec![Vec::new(); 1];
+        pkt[0] = 0;
+        assert_eq!(
+            demux_metis_packet(&pkt, 1, &mut out)
+                .unwrap_err()
+                .to_string(),
+            "Metis packet header 00 fe 01 06 does not match the IQ endpoint 6 header ef fe 01 06"
+        );
+        pkt[0] = 0xef;
+        pkt[METIS_HEADER_LEN] = 0;
+        assert_eq!(
+            demux_metis_packet(&pkt, 1, &mut out)
+                .unwrap_err()
+                .to_string(),
+            "USB frame 0 has bad sync bytes 00 7f 7f, expected 7f 7f 7f"
+        );
+    }
+
     use super::*;
     use std::net::UdpSocket as StdUdpSocket;
 
@@ -1484,6 +1539,77 @@ mod tests {
             stats.malformed_packets, 4,
             "all four malformed/adversarial datagrams must be counted, not silently dropped"
         );
+    }
+
+    /// MAN-56: the counters MAN-22 added must be readable through a shared
+    /// handle that survives `manta_engine::listen` taking ownership of the
+    /// source -- and readable without taking the packet pump's mutex.
+    #[test]
+    fn health_counters_handle_observes_malformed_packets_and_matches_gap_stats() {
+        let device_socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let device_addr = device_socket.local_addr().unwrap();
+        device_socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let cfg = HpsdrConfig {
+            host: device_addr.ip().to_string(),
+            port: device_addr.port(),
+            ddc_count: 1,
+            sample_rate_hz: 192_000.0,
+            center_freq_hz: vec![14_025_000.0],
+        };
+        let mut sources = HpsdrDevice::open(cfg).unwrap();
+        let client_addr = drain_initial_open_packets(&device_socket, 1);
+
+        // Grabbed BEFORE any read, exactly as manta-cli does before handing
+        // `src` to listen().
+        let counters = sources[0]
+            .health_counters()
+            .expect("HpsdrIqSource must expose health counters");
+        assert_eq!(counters.malformed_packets(), 0);
+
+        device_socket.send_to(&[0u8; 10], client_addr).unwrap();
+        device_socket
+            .send_to(&[0xFFu8; METIS_PACKET_LEN], client_addr)
+            .unwrap();
+        let value = Complex32::new(0.42, -0.17);
+        let pkt = synth_metis_packet(1, |_| value);
+        device_socket.send_to(&pkt, client_addr).unwrap();
+
+        let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
+        assert!(sources[0].read(&mut buf).unwrap() > 0);
+
+        assert_eq!(counters.malformed_packets(), 2);
+        assert_eq!(
+            counters.malformed_packets(),
+            sources[0].gap_stats().malformed_packets,
+            "the handle and the legacy snapshot getter must never disagree"
+        );
+    }
+
+    /// A gap applies to every DDC demuxed from the affected packet (module
+    /// docs), so every handle from one device must share ONE counter set --
+    /// not per-DDC copies that would each undercount.
+    #[test]
+    fn health_counters_are_shared_across_a_devices_ddc_handles() {
+        let device_socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let device_addr = device_socket.local_addr().unwrap();
+        device_socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let cfg = HpsdrConfig {
+            host: device_addr.ip().to_string(),
+            port: device_addr.port(),
+            ddc_count: 2,
+            sample_rate_hz: 192_000.0,
+            center_freq_hz: vec![14_025_000.0, 14_030_000.0],
+        };
+        let sources = HpsdrDevice::open(cfg).unwrap();
+        let a = sources[0].health_counters().unwrap();
+        let b = sources[1].health_counters().unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
     }
 
     /// PR #75 review, round 1, finding 1: a receive buffer sized exactly to

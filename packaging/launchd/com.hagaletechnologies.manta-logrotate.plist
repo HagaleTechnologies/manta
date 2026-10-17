@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- MAN-268: trims manta.log in place once a minute; log policy and install steps: packaging/README.md -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hagaletechnologies.manta-logrotate</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>/usr/local/libexec/manta-rotate-log.sh</string>
+    <string>/var/log/manta/manta.log</string>
+  </array>
+  <key>UserName</key>
+  <string>_manta</string>
+  <key>GroupName</key>
+  <string>_manta</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>KeepAlive</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+  <key>StandardErrorPath</key>
+  <string>/dev/null</string>
+</dict>
+</plist>

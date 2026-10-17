@@ -1,10 +1,44 @@
 //! Per-track decode glue: demod -> timing -> beam -> events. SPEC §3–§5.
 
 use crate::beam::{decode_char, BeamConfig};
+use crate::edge_demod::EdgeDemod;
 use crate::envelope::{Demod, DemodConfig, Run};
 use crate::events::DecoderEvent;
-use crate::timing::{GapClass, GapClassifier, SpeedTracker};
+use crate::evidence::{Evidence, EvidenceConfig, HopEvidence};
+use crate::hsmm::{Committed, HsmmConfig, HsmmDecoder};
+use crate::noise::{NoiseConfig, NoiseTracker};
+use crate::timing::{GapClass, GapClassifier, SenderTiming, SpeedTracker, TimingClass};
+use crate::tree::{pattern_for, Glyph};
 use crate::HOP_MS;
+use std::collections::VecDeque;
+
+/// Decode engine selection (SPEC v2 §0): which timing/beam chain and which
+/// keying-decision front end feeds it. `Hsmm` (`TrackDecoder::push_hop_hsmm`)
+/// has been fully implemented and reviewed since Task 8; it is still
+/// experimental/unmeasured for production use (that's what Tasks 11-12
+/// measure), but it is reachable from every CLI command as of Task 11.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Engine {
+    Legacy,
+    EdgeLegacy,
+    Hsmm,
+}
+
+impl std::str::FromStr for Engine {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "legacy" => Ok(Engine::Legacy),
+            "edge-legacy" => Ok(Engine::EdgeLegacy),
+            "hsmm" => Ok(Engine::Hsmm),
+            o => Err(format!(
+                "unknown decode engine '{}' (legacy | edge-legacy | hsmm)",
+                o.escape_debug()
+            )),
+        }
+    }
+}
 
 /// Tunables for one track's decode chain: demod + beam + flush threshold. SPEC §9.
 #[derive(Debug, Clone)]
@@ -13,6 +47,20 @@ pub struct DecodeConfig {
     pub beam: BeamConfig,
     /// SPEC §9 decode.flush_gap_dits
     pub flush_gap_dits: f32,
+    /// SPEC v2 §0: which decode engine drives this track.
+    pub engine: Engine,
+    /// SPEC v2 §1: `EdgeLegacy`/`Hsmm` evidence front-end tunables.
+    pub evidence: EvidenceConfig,
+    /// SPEC v2 §2: `EdgeLegacy`/`Hsmm` noise-reference tunables.
+    pub noise: NoiseConfig,
+    /// SPEC v2 §4: `Hsmm` token-passing decoder tunables.
+    pub hsmm: HsmmConfig,
+    /// SPEC v2 §3/§7 `decode.refine_bw_hz`: narrowband refiner bandwidth in
+    /// Hz (0 = off, the default). Live under every engine via
+    /// `manta-engine`'s `TrackManager`, which runs each track through a
+    /// `manta-dsp::refine::Refiner` when this is > 0 (MAN-168/MAN-194);
+    /// `oracle` does not apply it.
+    pub refine_bw_hz: f32,
 }
 
 // Manual impl: a derived Default would zero flush_gap_dits.
@@ -22,18 +70,41 @@ impl Default for DecodeConfig {
             demod: DemodConfig::default(),
             beam: BeamConfig::default(),
             flush_gap_dits: 7.0,
+            engine: Engine::Legacy,
+            evidence: EvidenceConfig::default(),
+            noise: NoiseConfig::default(),
+            hsmm: HsmmConfig::default(),
+            refine_bw_hz: 0.0,
         }
     }
 }
 
-const META_INTERVAL_HOPS: u64 = 375; // SPEC §5: TrackMeta at 1 Hz cadence
+/// SPEC §5: `TrackMeta` at 1 Hz cadence. `pub` (MAN-102 review round 2,
+/// finding 2) so `manta-engine`'s peak-hold reset can align to this
+/// boundary directly, rather than only via `TrackMeta` actually firing --
+/// see `TrackDecoder::hop_count`.
+pub const META_INTERVAL_HOPS: u64 = 375;
 const WPM_REPORT_DELTA: f32 = 1.0; // SPEC §5: SpeedUpdate on >= 1 WPM change
+/// One-character flushed words whose closed gap lengths
+/// `GapClassifier::reinit_from_flushed` rebuilds the long-gap statistics
+/// from (heavy Farnsworth; see that method). The same 5-sample count the
+/// pair's own init uses.
+const SINGLE_FLUSH_REINIT: usize = 5;
+
+// SPEC §2.3: 10*log10(2500/93.75) -- same bandwidth correction as
+// envelope::Demod's private constant of the same name/value, applied here
+// to the evidence front end's mark/noise levels for EdgeLegacy/Hsmm.
+const SNR_BW_CORR_DB: f32 = 14.3;
 
 /// Per-track decode glue: demod -> timing -> beam -> events. SPEC §3–§5.
 pub struct TrackDecoder {
     track_id: u32,
     cfg: DecodeConfig,
     demod: Demod,
+    evidence: Evidence,
+    noise: NoiseTracker,
+    edge: EdgeDemod,
+    hsmm: HsmmDecoder,
     tracker: SpeedTracker,
     gaps: GapClassifier,
     /// Runs buffered until the tracker is ready (first 5 marks). They are
@@ -41,12 +112,66 @@ pub struct TrackDecoder {
     pending: Vec<Run>,
     cur_marks: Vec<f32>,
     word_flushed: bool,
+    /// Characters (garbles included) committed since the last word
+    /// boundary; tells `check_flush` its flush closes a one-character word.
+    word_chars: u32,
+    /// Characters actually decoded since the last word boundary (garbles
+    /// excluded). Only a gap after two or more of them confirms a Farnsworth
+    /// rebuild: a garble is no evidence the preceding gap was a character
+    /// gap (MAN-264).
+    word_decoded: u32,
+    /// Set by `check_flush` when its flush closed a one-character word: the
+    /// gap's length at the flush, in ms. The rest of the gap arrives later
+    /// as the space run `process_run` skips.
+    single_flush_ms: Option<f32>,
+    /// Closed lengths, in dit units, of the latest gaps flushed after
+    /// decoded one-character words (at most `SINGLE_FLUSH_REINIT`). Cleared
+    /// by a word of two or more characters or by a flushed garble; a
+    /// one-character word that `classify` closes leaves it as it is.
+    single_flush_gaps: Vec<f32>,
+    /// The sender's learned dot/dash/gap durations (MAN-315). Legacy and
+    /// EdgeLegacy only; `Hsmm` keeps its own per-token speed.
+    sender: SenderTiming,
+    /// Set by `check_flush`/`check_flush_edge` to the flushed gap's length
+    /// so far, in ms; the remainder arrives as the space run `process_run`
+    /// skips, and the sum is the word gap's closed length (MAN-315 D2). A
+    /// remainder under the debounce window has no run of its own: the next
+    /// mark absorbs it and this length alone is learned.
+    flushed_gap_ms: Option<f32>,
+    /// The `SpeedTracker::regime` `sender` was learned in (MAN-315 D7).
+    sender_regime: u32,
+    /// `sender.total_count()` at the last `TimingUpdate` (MAN-315 D8).
+    last_timing_total: u64,
+    /// A drift re-init wiped timing a `TimingUpdate` had already reported,
+    /// so the next one must go out even with no new observation, or the
+    /// stale update would stand as the track's last (MAN-315 D8).
+    timing_reset_pending: bool,
+    /// Cleared by `finish` for the space the stream ends inside: its length
+    /// is a truncation, not the sender's gap, so `observe_gap` skips it.
+    learn_gaps: bool,
     last_reported_wpm: Option<f32>,
+    /// The centroid of the hop being pushed; `manta-engine` sets it before
+    /// each `push_hop` (MAN-211).
     freq_hz: f64,
     hop_count: u64,
     last_ts: u64,
+    /// SPEC v2 §2.3-derived SNR for the `EdgeLegacy`/`Hsmm` engines (the
+    /// `Legacy` engine keeps using `demod.snr_2500_db()` directly). Set by
+    /// `snr_from_evidence`, read by `emit_char`'s `q` and by `tick_meta`.
+    last_snr: Option<f32>,
+    /// [Task 8 fix, review round 2] Ring buffer of `(hop, sample_ts, snr)`
+    /// recorded on every real-mark hop (see `snr_from_evidence`'s doc
+    /// comment) and pruned to a fixed worst-case retention window. Used by
+    /// `emit_committed` to look up the SNR nearest a commit's own
+    /// `sample_ts` -- the statistically correct answer to "what was the
+    /// channel like when this character was actually keyed" -- rather
+    /// than a single running value that either goes stale (the
+    /// pre-fix bug) or, if made a running peak instead, latches onto one
+    /// outlier reading for the rest of the track's life.
+    snr_history: VecDeque<(u64, u64, f32)>,
     /// Decode-error counter (aborted garble characters). SPEC §4.4.
     pub garble_count: u32,
+<<<<<<< HEAD
     /// MAN-5: the next run `on_run` sees is left-censored -- it was already
     /// in progress before this decoder's first sample, so its duration is a
     /// truncated fragment, not a real element length. Set only by
@@ -56,26 +181,63 @@ pub struct TrackDecoder {
     /// held until the next run shows whether that gap ended within the
     /// demod's debounce of the flush (see `process_run`).
     flushed_gap_hops: Option<u32>,
+=======
+    /// SPEC §2.3's floor-based SNR for this track, supplied by the layer
+    /// that owns the gate/floor state (`manta-engine`), exactly as
+    /// `freq_hz` is. `None` when a `TrackDecoder` is driven standalone
+    /// (manta-decode's own tests, manta-testkit's roundtrip vectors), in
+    /// which case `TrackMeta` falls back to the M0 keying-rail estimate.
+    /// MAN-102.
+    snr_2500_db: Option<f32>,
+>>>>>>> 35deb42de4260c19220c0fec9cd847f70bf93828
 }
 
 impl TrackDecoder {
     /// A decoder for one track, awaiting its first samples. SPEC §5.
     pub fn new(track_id: u32, cfg: DecodeConfig) -> Self {
         let demod = Demod::new(cfg.demod.clone());
+        let evidence = Evidence::new(cfg.evidence.clone());
+        let noise = NoiseTracker::new(cfg.noise.clone());
+        let edge = EdgeDemod::new(cfg.demod.debounce_ms);
+        let hsmm = HsmmDecoder::new(cfg.hsmm.clone());
+        // SPEC v2 §0 (Task 5, timing.rs Step 6) used to split EdgeLegacy/
+        // Hsmm onto the SPEC-nominal char-gap threshold while Legacy kept a
+        // lowered 1.6 deviation to compensate for Demod's envelope
+        // overshoot. MAN-103 fixed that overshoot at its source, so all
+        // three engines now share the same nominal threshold (timing.rs's
+        // CHAR_GAP_DITS doc comment).
+        let gaps = GapClassifier::new();
         TrackDecoder {
             track_id,
             cfg,
             demod,
+            evidence,
+            noise,
+            edge,
+            hsmm,
             tracker: SpeedTracker::new(),
-            gaps: GapClassifier::new(),
+            gaps,
             pending: Vec::new(),
             cur_marks: Vec::new(),
             word_flushed: false,
+            word_chars: 0,
+            word_decoded: 0,
+            single_flush_ms: None,
+            single_flush_gaps: Vec::new(),
+            sender: SenderTiming::new(),
+            flushed_gap_ms: None,
+            sender_regime: 0,
+            last_timing_total: 0,
+            timing_reset_pending: false,
+            learn_gaps: true,
             last_reported_wpm: None,
             freq_hz: 0.0,
             hop_count: 0,
             last_ts: 0,
+            last_snr: None,
+            snr_history: VecDeque::new(),
             garble_count: 0,
+<<<<<<< HEAD
             lead_run_censored: false,
             flushed_gap_hops: None,
         }
@@ -96,16 +258,99 @@ impl TrackDecoder {
         TrackDecoder {
             lead_run_censored: true,
             ..TrackDecoder::new(track_id, cfg)
+=======
+            snr_2500_db: None,
+>>>>>>> 35deb42de4260c19220c0fec9cd847f70bf93828
         }
     }
 
     /// Set the track's absolute RF frequency, reported in TrackMeta events. SPEC §5.
+    /// `manta-engine` calls it before each `push_hop` with that hop's
+    /// centroid, so a `TrackMeta` pairs the frequency with the same hop's
+    /// `sample_ts` (MAN-211).
     pub fn set_freq_hz(&mut self, hz: f64) {
         self.freq_hz = hz;
     }
 
+    /// Set the track's floor-based SNR in the 2500 Hz reference bandwidth,
+    /// reported in TrackMeta events. SPEC §2.3/§5. See `set_freq_hz` for why
+    /// this is pushed down from `manta-engine` rather than computed here:
+    /// the noise floor and gate live one crate above this one. MAN-102.
+    /// Consumed by every engine (see `tick_meta`) as the peak-held reported
+    /// *value* -- `last_snr` (via `snr_from_evidence`) is `EdgeLegacy`/
+    /// `Hsmm`'s own SPEC v2 §2.3 evidence-derived estimate, but it is a
+    /// single running instantaneous reading, not peak-held, and can swing
+    /// tens of dB within one message the same way `Legacy`'s keying-rail
+    /// ratio does; `tick_meta` uses it only as the presence gate (Codex
+    /// review, PR #134 round 2) -- `self.snr_2500_db.is_some()` on every
+    /// engine once `manta-engine` has pushed at least one hop.
+    pub fn set_snr_2500_db(&mut self, snr_2500_db: f32) {
+        self.snr_2500_db = Some(snr_2500_db);
+    }
+
+    /// Hops fed to this decoder so far. `manta-engine`'s peak-hold reset
+    /// checks `hop_count() % META_INTERVAL_HOPS == 0` to detect the SPEC §5
+    /// reporting boundary independent of whether it actually produced a
+    /// `TrackMeta` -- it does not while `!self.demod.running()` (pre-init/
+    /// retrying, SPEC §3.2), and without this the peak window was
+    /// unbounded for however long init takes instead of one interval
+    /// (MAN-102 review round 2, finding 2).
+    pub fn hop_count(&self) -> u64 {
+        self.hop_count
+    }
+
+    /// MAN-118: the `Legacy` engine's keying-rail ratio (`Demod::rail_ratio`),
+    /// for the daemon's `manta_track_rail_ratio` histogram. `None` before
+    /// the rails initialize, and always for `EdgeLegacy`/`Hsmm`, whose front
+    /// ends have no `Demod` rails.
+    pub fn rail_ratio(&self) -> Option<f32> {
+        if self.cfg.engine == Engine::Legacy {
+            self.demod.rail_ratio()
+        } else {
+            None
+        }
+    }
+
+    /// One hop: linear amplitude, linear power, optional spectral noise
+    /// reference power (SPEC v2 §2.2), input sample counter.
+    pub fn push_hop(
+        &mut self,
+        amp: f32,
+        power: f32,
+        spectral_ref_power: Option<f32>,
+        sample_ts: u64,
+    ) -> Vec<DecoderEvent> {
+        self.last_ts = sample_ts;
+        match self.cfg.engine {
+            Engine::Legacy => self.push_envelope_legacy(amp, sample_ts),
+            Engine::EdgeLegacy => {
+                let n = self.noise.push(power, spectral_ref_power).max(1e-18).sqrt();
+                let mut events = Vec::new();
+                // Codex review, PR #161 round 9: `push` can now return more
+                // than one eligible center per input sample (a shrinking
+                // hold window draining its backlog) -- see
+                // `Evidence::push`'s doc comment.
+                for ev in self.evidence.push(amp, n, sample_ts) {
+                    self.snr_from_evidence(&ev);
+                    for run in self.edge.push(&ev) {
+                        self.on_run(run, &mut events);
+                    }
+                    self.check_flush_edge(&mut events);
+                }
+                self.tick_meta(&mut events);
+                events
+            }
+            Engine::Hsmm => self.push_hop_hsmm(amp, power, spectral_ref_power, sample_ts), // Task 8
+        }
+    }
+
     /// Feed one envelope sample at 375 Hz; returns any events it produced. SPEC §3–§5.
     pub fn push_envelope(&mut self, a: f32, sample_ts: u64) -> Vec<DecoderEvent> {
+        self.push_hop(a, a * a, None, sample_ts)
+    }
+
+    /// The `Legacy` engine's demod -> timing -> beam chain. SPEC §3–§5.
+    fn push_envelope_legacy(&mut self, a: f32, sample_ts: u64) -> Vec<DecoderEvent> {
         let mut events = Vec::new();
         self.last_ts = sample_ts;
         let runs = self.demod.push(a, sample_ts);
@@ -113,36 +358,428 @@ impl TrackDecoder {
             self.on_run(run, &mut events);
         }
         self.check_flush(&mut events);
+        self.tick_meta(&mut events);
+        events
+    }
+
+    /// The `Hsmm` engine's evidence -> token-passing -> commit chain. SPEC v2 §4.
+    fn push_hop_hsmm(
+        &mut self,
+        amp: f32,
+        power: f32,
+        spectral_ref_power: Option<f32>,
+        sample_ts: u64,
+    ) -> Vec<DecoderEvent> {
+        let n = self.noise.push(power, spectral_ref_power).max(1e-18).sqrt();
+        let mut events = Vec::new();
+        // Codex review, PR #161 round 11 (amended by MAN-190): round 9's
+        // fix (letting `push` return multiple eligible centers per input
+        // sample) eagerly materialized the whole newly-eligible batch
+        // using a single, START-of-call `h` -- so even though this loop
+        // calls `set_u_ref` after every returned hop, a speed change
+        // mid-batch never actually affected any LATER hop already in that
+        // same batch, only hops from the NEXT input sample onward. Using
+        // `record` + `drain_one` instead re-checks the live `h` on every
+        // single computed hop. Since MAN-190 each returned hop t was
+        // computed together with its still-pending successor t+1 (whose
+        // actual sign finalized t's anchor), the feedback applied here
+        // first affects the computation of hop t+2 -- before the next
+        // UNCOMPUTED hop, never rewriting the pending one.
+        self.evidence.record(amp, n, sample_ts);
+        while let Some(ev) = self.evidence.drain_one() {
+            self.feed_hsmm_hop(ev, &mut events);
+        }
+        self.tick_meta(&mut events);
+        events
+    }
+
+    /// Process one finalized evidence hop through the `Hsmm` engine and
+    /// apply the per-hop speed feedback (MAN-190 factored this sequence
+    /// out of `push_hop_hsmm` and `finish`'s `Engine::Hsmm` branch so the
+    /// live and EOF paths cannot drift): record SNR history keyed by the
+    /// hop's own timestamp, push it into the token decoder and emit any
+    /// committed entries, then feed the best live speed hypothesis back
+    /// into the evidence window -- which, per `set_u_ref`'s contract,
+    /// first affects the next hop Evidence has not computed yet. Never
+    /// move the `set_u_ref` call outside the drain loops that call this.
+    ///
+    /// Codex review, PR #161 round 6: the `report_wpm` half matters as
+    /// much in the EOF loop as live -- `hsmm.finish()` clears the live
+    /// token set (so nothing downstream can recover the speed from it)
+    /// and `flush_final_speed` only ever reads the Legacy-only
+    /// `SpeedTracker`, so a short recording's first usable Hsmm speed
+    /// estimate (or a late change) would emit no `SpeedUpdate` at all
+    /// without it.
+    fn feed_hsmm_hop(&mut self, ev: HopEvidence, events: &mut Vec<DecoderEvent>) {
+        self.snr_from_evidence(&ev);
+        for c in self.hsmm.push(&ev) {
+            self.emit_committed(c, events);
+        }
+        if let Some(u) = self.hsmm.best_u() {
+            self.evidence.set_u_ref(u);
+            self.report_wpm(450.0 / u, events);
+        }
+    }
+
+    /// Translate one `hsmm::Committed` entry into a `DecoderEvent`, applying
+    /// the same SPEC §4.5 `q` confidence scaling `emit_char` uses.
+    ///
+    /// [Task 8 fix, review round 2] Reads the `snr_history` ring buffer at
+    /// `c.sample_ts` (the instant the underlying marks were actually
+    /// keyed), not `self.last_snr` (the instant of this *commit*, which
+    /// can land many hops later under SPEC v2 §4.8's partial traceback --
+    /// see `snr_from_evidence`'s doc comment) and not a running peak
+    /// (rejected: a single outlier during a `present` hop would
+    /// permanently pin confidence scaling at a value the channel never
+    /// sustained, for the rest of the track's life).
+    fn emit_committed(&mut self, c: Committed, events: &mut Vec<DecoderEvent>) {
+        let q = self
+            .snr_near(c.sample_ts)
+            .map(|s| (s / 20.0).clamp(0.3, 1.0))
+            .unwrap_or(1.0);
+        match c.glyph {
+            Some(glyph) => events.push(DecoderEvent::CharDecoded {
+                track_id: self.track_id,
+                sample_ts: c.sample_ts,
+                glyph,
+                confidence: c.confidence * q,
+                alternatives: c.alternatives,
+            }),
+            None => events.push(DecoderEvent::WordBoundary {
+                track_id: self.track_id,
+                sample_ts: c.sample_ts,
+                confidence: c.confidence * q,
+            }),
+        }
+    }
+
+    /// SPEC §5: SpeedUpdate on >= 1 WPM change, factored out of `process_run`
+    /// so the `Hsmm` engine (whose speed comes from `HsmmDecoder::best_u`,
+    /// not `SpeedTracker`) can reuse the same reporting rule.
+    fn report_wpm(&mut self, w: f32, events: &mut Vec<DecoderEvent>) {
+        let report = match self.last_reported_wpm {
+            None => true,
+            Some(prev) => (w - prev).abs() >= WPM_REPORT_DELTA,
+        };
+        if report {
+            self.last_reported_wpm = Some(w);
+            events.push(DecoderEvent::SpeedUpdate {
+                track_id: self.track_id,
+                wpm: w,
+            });
+        }
+    }
+
+    /// SPEC §5: TrackMeta at the 1 Hz cadence. Every engine prefers the
+    /// engine-supplied floor-based SPEC §2.3 peak-hold estimate
+    /// (`snr_2500_db`, pushed down by `manta-engine`, MAN-102) as the
+    /// reported *value*; each engine's own local estimate is used only as
+    /// its presence gate and standalone-driven fallback (`TrackDecoder`
+    /// exercised outside `manta-engine`, e.g. this crate's own unit tests
+    /// and `manta-testkit`'s roundtrip vectors, where `snr_2500_db` is
+    /// never set). `EdgeLegacy`/`Hsmm`'s `last_snr` is a single running
+    /// instantaneous SPEC v2 §2.3 evidence-derived reading, not peak-held,
+    /// and can swing tens of dB within one message the same way `Legacy`'s
+    /// keying-rail ratio does -- reporting it directly reintroduced
+    /// MAN-102's own miscalibration for those two engines (Codex review,
+    /// PR #134 round 2).
+    fn tick_meta(&mut self, events: &mut Vec<DecoderEvent>) {
         self.hop_count += 1;
-        if self.hop_count % META_INTERVAL_HOPS == 0 {
-            if let Some(snr) = self.demod.snr_2500_db() {
+        if self.hop_count.is_multiple_of(META_INTERVAL_HOPS) {
+            let snr = if self.cfg.engine == Engine::Legacy {
+                // MAN-102 review round 1, finding 1: `self.demod.running()`
+                // is the real presence gate here -- it is what used to keep
+                // a never-keyed track (steady carrier, birdie, tuning note)
+                // from emitting `TrackMeta` at all, since the old code read
+                // presence straight off `self.demod.snr_2500_db()`, which
+                // returns `None` exactly when `!running()`. Falling back to
+                // `self.demod.snr_2500_db()` for the *value* without first
+                // checking `running()` let an engine-supplied
+                // `self.snr_2500_db` (always `Some` in production --
+                // `manta-engine` calls `set_snr_2500_db` on every queued
+                // hop) bypass that gate entirely. `running()` being true
+                // guarantees `self.demod.snr_2500_db()` is `Some`, so the
+                // `or_else` fallback always yields a value once we're past
+                // this check.
+                if self.demod.running() {
+                    self.snr_2500_db.or_else(|| self.demod.snr_2500_db())
+                } else {
+                    None
+                }
+            } else {
+                // `last_snr.is_some()` is the presence gate (evidence has
+                // been seen at least once) -- same role `running()` plays
+                // for `Legacy`. The reported *value* prefers the engine-
+                // supplied peak-hold, falling back to the instantaneous
+                // `last_snr` only when this decoder is driven standalone.
+                self.last_snr.and(self.snr_2500_db.or(self.last_snr))
+            };
+            if let Some(snr) = snr {
                 events.push(DecoderEvent::TrackMeta {
                     track_id: self.track_id,
+                    sample_ts: self.last_ts,
                     snr_2500_db: snr,
                     freq_hz: self.freq_hz,
                 });
             }
+            self.emit_timing(events);
         }
-        events
+    }
+
+    /// SPEC §5 `TimingUpdate` (MAN-315 D8): the sender's learned timing,
+    /// on the `TrackMeta` cadence and at track finish, only when a class
+    /// gained an observation since the last one or a drift re-init wiped
+    /// timing already reported. Never for `Hsmm`, which does not feed
+    /// `sender`.
+    fn emit_timing(&mut self, events: &mut Vec<DecoderEvent>) {
+        let total = self.sender.total_count();
+        if self.cfg.engine == Engine::Hsmm
+            || !self.tracker.ready()
+            || (total <= self.last_timing_total && !self.timing_reset_pending)
+        {
+            return;
+        }
+        self.last_timing_total = total;
+        self.timing_reset_pending = false;
+        events.push(DecoderEvent::TimingUpdate {
+            track_id: self.track_id,
+            sample_ts: self.last_ts,
+            timing: self.sender.estimates(self.tracker.dit_estimate_ms()),
+        });
+    }
+
+    /// SPEC v2 §2.3: SNR from the evidence front end's own mark/noise
+    /// levels, `20*log10(mark_level/noise_level) - 14.3` (same bandwidth
+    /// correction as `envelope::Demod::snr_2500_db`).
+    ///
+    /// [Task 8 fix, execution 2026-09-09]: two follow-on findings from
+    /// wiring `Hsmm`'s `emit_committed` onto this pre-existing (Task 5)
+    /// estimate, both stemming from the same root cause -- `last_snr` is
+    /// an *instantaneous* read, fine for `EdgeLegacy`'s synchronous
+    /// `emit_char` (fired right as each character's own gap is
+    /// classified, so `last_snr` is never far from a real mark) but a
+    /// poor fit for `Hsmm`'s partial-traceback commit (SPEC v2 §4.8),
+    /// which is *not* synchronous: a consensus or forced commit for a
+    /// character can land many hops into the *following* gap or silence.
+    ///
+    /// 1. Only update while `ev.present` (a real mark is keyed) --
+    ///    `HopEvidence::mark_level` is a legitimate, small local peak even
+    ///    during a confirmed-silent hop (SPEC v2 §1.2's centered-max
+    ///    window just isn't seeing a mark nearby), so an unconditionally
+    ///    updated estimate reads deeply negative deep into a trailing
+    ///    silence (observed: -26.9 dB by the time a final "U" committed).
+    ///    This also means `last_snr` stays `None` -- and `tick_meta`
+    ///    correspondingly emits no `TrackMeta` at all -- until the track's
+    ///    first real mark is observed, instead of firing immediately with
+    ///    a nonsensical negative-SNR reading against a still-silent
+    ///    channel; `TrackMeta` still arrives normally from that point on
+    ///    (never permanently suppressed, verified by
+    ///    `edge_legacy_track_meta_arrives_once_evidence_exists`), and its
+    ///    per-hop value keeps genuinely degrading/recovering with the
+    ///    channel exactly as before, unaffected by the `snr_history` fix
+    ///    below.
+    /// 2. Even gated to real marks, `NoiseTracker`'s own `noise_window_ms`
+    ///    (1500 ms, SPEC v2 §2's calibrated default) is far shorter than
+    ///    this test's whole message: an early, fully-settled low sample
+    ///    (this scene's cold-start lead-in) ages out of that rolling
+    ///    window well before the message ends, and every later real gap
+    ///    (13-91 hops) is too brief for the 40 ms EMA to settle back down
+    ///    to the same floor -- so `last_snr` itself genuinely degrades
+    ///    over the course of one message (observed: 23.5 dB for the first
+    ///    two characters, ~9.6 dB by mid-message), not from a bug in this
+    ///    function but from `NoiseTracker`'s window being tuned for
+    ///    ongoing-track noise tracking, not for holding a single
+    ///    early-message best estimate for the rest of a long message.
+    ///
+    /// `snr_history` (a small ring buffer of every reading taken while
+    /// `present`, looked up by `emit_committed` at each commit's own
+    /// `sample_ts`) fixes both for `Hsmm`'s confidence scaling without
+    /// touching `last_snr` itself -- `tick_meta`'s `TrackMeta` reporting
+    /// keeps reading the instantaneous `last_snr`, whose only behavior
+    /// change from Task 5 is finding 1 above (no reading, hence no
+    /// `TrackMeta`, before the first real mark).
+    fn snr_from_evidence(&mut self, ev: &HopEvidence) {
+        if !ev.present {
+            return;
+        }
+        let snr = 20.0 * (ev.mark_level / ev.noise_level.max(1e-18)).log10() - SNR_BW_CORR_DB;
+        self.last_snr = Some(snr);
+        self.snr_history.push_back((ev.hop, ev.sample_ts, snr));
+        // Bound retention to the largest window `HsmmDecoder`'s own anchors
+        // could ever use (SPEC v2 §4.6's `80 * u_max` hops), computed from
+        // the static config ceiling -- not the live, transiently-wrong
+        // tracked speed -- so this always covers every `sample_ts` a
+        // commit could still reference.
+        let prune_hops = (80.0 * self.cfg.hsmm.u_max).ceil() as u64;
+        while let Some(&(h, _, _)) = self.snr_history.front() {
+            if ev.hop - h > prune_hops {
+                self.snr_history.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// The `snr_history` reading nearest `sample_ts` (SPEC v2 §4.5's `q`
+    /// input for `Hsmm`, see `emit_committed`'s doc comment), or `None` if
+    /// no mark has ever been observed.
+    fn snr_near(&self, sample_ts: u64) -> Option<f32> {
+        self.snr_history
+            .iter()
+            .min_by_key(|&&(_, ts, _)| ts.abs_diff(sample_ts))
+            .map(|&(_, _, snr)| snr)
     }
 
     /// End of stream: flush the demod and any open character/word. SPEC §5.
+    ///
+    /// The three engines have disjoint front ends -- `Legacy`'s `demod`,
+    /// `EdgeLegacy`'s `evidence` + `edge`, `Hsmm`'s `evidence` + `hsmm` --
+    /// so this must branch on all three explicitly. A two-way
+    /// `EdgeLegacy`-vs-`else` split (as the pre-Task-8 code had, when
+    /// `Hsmm` was unreachable) silently drains `Hsmm`'s unused `demod`
+    /// instead of flushing its real `evidence`/`hsmm` state, dropping
+    /// every uncommitted token at end of stream.
+    ///
+    /// Only valid where a genuine, sustained on-air gap has actually been
+    /// observed (stream EOF, or manta-engine's HangExpired/Silent
+    /// closures) -- see `finish_speed_only` for closures that are pure
+    /// track bookkeeping instead (Merged/Evicted), where forcing an
+    /// in-progress mark sequence to resolve would fabricate content.
+    /// **Engine caveat (MAN-166/MAN-169 merge, 2026-09-09):**
+    /// `finish_speed_only` below was authored against `Legacy`'s
+    /// `self.demod`/`self.tracker` only and does not yet branch per engine
+    /// the way `finish`/`push_hop` do -- see that function's own doc
+    /// comment.
     pub fn finish(&mut self) -> Vec<DecoderEvent> {
         let mut events = Vec::new();
-        for run in self.demod.finish() {
-            self.on_run(run, &mut events);
+        match self.cfg.engine {
+            Engine::Legacy => {
+                let runs = self.demod.finish();
+                self.finish_runs(runs, &mut events);
+            }
+            Engine::EdgeLegacy => {
+                for ev in self.evidence.flush() {
+                    self.snr_from_evidence(&ev);
+                    for run in self.edge.push(&ev) {
+                        self.on_run(run, &mut events);
+                    }
+                }
+                let runs = self.edge.finish();
+                self.finish_runs(runs, &mut events);
+            }
+            Engine::Hsmm => {
+                // Codex review, PR #161 round 4 (amended by MAN-190): drain
+                // one hop at a time (`flush_one`, not the eager `flush()`)
+                // and apply `best_u()` -> `set_u_ref()` after each, exactly
+                // matching `push_hop_hsmm`'s live-path feedback loop (now
+                // via the shared `feed_hsmm_hop`) -- see
+                // `Evidence::flush_one`'s doc comment for why the eager
+                // batch drain let the tail run against a stale hold
+                // window instead of adapting to a genuine late speed
+                // change. `flush_one` also releases the terminal pending
+                // hop through this same sequence (base anchor only, no
+                // synthetic successor), so every real hop reaches HSMM
+                // before `hsmm.finish()` forces the final commitment.
+                while let Some(ev) = self.evidence.flush_one() {
+                    self.feed_hsmm_hop(ev, &mut events);
+                }
+                for c in self.hsmm.finish() {
+                    self.emit_committed(c, &mut events);
+                }
+            }
         }
         if !self.cur_marks.is_empty() && self.tracker.ready() {
             let ts = self.last_ts;
             self.emit_char(ts, &mut events);
             if !self.word_flushed {
-                events.push(DecoderEvent::WordBoundary {
+                events.push(DecoderEvent::word_boundary(self.track_id, ts));
+            }
+        }
+        self.flush_final_speed(&mut events);
+        self.emit_timing(&mut events);
+        events
+    }
+
+    /// Process the runs a demod's `finish` closed. The stream ends inside a
+    /// trailing space, so that space's length teaches the sender timing
+    /// nothing (MAN-315); it is still classified as before.
+    fn finish_runs(&mut self, runs: Vec<Run>, events: &mut Vec<DecoderEvent>) {
+        let last = runs.len().saturating_sub(1);
+        for (i, run) in runs.into_iter().enumerate() {
+            self.learn_gaps = !(i == last && !run.mark);
+            self.on_run(run, events);
+        }
+        self.learn_gaps = true;
+    }
+
+    /// Codex review on PR #154, round 7: a track closed via Merged/Evicted
+    /// (manta-engine::track.rs) is pure bookkeeping -- the RF signal could
+    /// still be genuinely mid-character at that instant, unlike a real
+    /// end-of-signal where a sustained real gap has already been
+    /// observed. `finish()` forces `Demod` to close its currently-open
+    /// run (mark OR space, whatever's mid-flight) and any accumulated
+    /// `cur_marks` to resolve into a character -- correct for a genuine
+    /// trailing gap, but fabricating one here previously let a mid-
+    /// character merge/eviction manufacture a synthetic character (e.g.
+    /// "T", forming the exact `<call> T` Beacon pattern from noise) out
+    /// of an in-progress, unconfirmed mark. This variant reports only the
+    /// speed estimate from marks ALREADY fully confirmed by ordinary
+    /// `push_envelope` calls -- no forced closure of anything still open.
+    ///
+    /// **Engine caveat (MAN-166/MAN-169 merge, 2026-09-09):** this reads
+    /// `self.demod` and `self.tracker`, both `Legacy`-only state (see
+    /// `finish`'s doc comment for the full three-way engine split) --
+    /// under `EdgeLegacy`/`Hsmm` this silently does nothing (no held-run
+    /// flush, `self.tracker.wpm()` is always `None` since those engines
+    /// never feed it) rather than reporting a genuine final speed. Zero
+    /// production impact today since `decode.engine` defaults `Legacy`
+    /// (MAN-169), but this needs a matching per-engine branch (the
+    /// `EdgeLegacy`/`Hsmm`-appropriate notion of "already confirmed,
+    /// nothing forced" -- `self.edge`'s held state / `HsmmDecoder`'s
+    /// current `best_u` without forcing a token to commit) before either
+    /// engine can safely go to production; the PR #154 Beacon-WPM
+    /// plausibility check this exists for silently loses its Merged/
+    /// Evicted-closure protection under those engines until it's added.
+    /// See MAN-169's comment thread for tracking.
+    pub fn finish_speed_only(&mut self) -> Vec<DecoderEvent> {
+        let mut events = Vec::new();
+        // `held` has already passed its own debounce confirmation --
+        // genuinely observed data, unlike `open` (still accumulating,
+        // could yet be an unconfirmed short blip). Safe to process
+        // through the ordinary (not forcing) run pipeline once nothing
+        // more will ever arrive for this decoder (round 8: without this,
+        // a mark/space fully confirmed just before a merge/eviction could
+        // sit unprocessed, leaving the "final" WPM stale on the wrong
+        // side of a consumer's cutoff even after `pending` was drained).
+        if let Some(run) = self.demod.take_held() {
+            self.on_run(run, &mut events);
+        }
+        self.flush_final_speed(&mut events);
+        self.emit_timing(&mut events);
+        events
+    }
+
+    /// Unconditional final report, bypassing WPM_REPORT_DELTA -- a
+    /// consumer that gates a decision on the track's true final speed
+    /// (manta-spot's Beacon-WPM plausibility check, added PR #154) has no
+    /// other event to observe it on. The live >= 1 WPM throttle exists to
+    /// reduce mid-stream chatter and stays as-is; this is an addition for
+    /// track finalization only, not a change to live reporting (round 4:
+    /// the tracker's speed can settle across a threshold-relevant
+    /// boundary the live throttle was never designed to catch, e.g.
+    /// 45.6 -> 44.9 WPM, and a short single-transmission track like a
+    /// beacon ID may never produce another WordBoundary to retry on
+    /// naturally).
+    fn flush_final_speed(&mut self, events: &mut Vec<DecoderEvent>) {
+        if let Some(w) = self.tracker.wpm() {
+            if self.last_reported_wpm != Some(w) {
+                self.last_reported_wpm = Some(w);
+                events.push(DecoderEvent::SpeedUpdate {
                     track_id: self.track_id,
-                    sample_ts: ts,
+                    wpm: w,
                 });
             }
         }
-        events
     }
 
     fn on_run(&mut self, run: Run, events: &mut Vec<DecoderEvent>) {
@@ -150,15 +787,22 @@ impl TrackDecoder {
         if !self.tracker.ready() {
             if run.mark && !censored {
                 self.tracker.on_mark(run.hops as f32 * HOP_MS as f32);
+                self.sync_sender_regime();
             }
             self.pending.push(run);
             if self.tracker.ready() {
-                // Retroactively assemble the buffered runs; their marks have
-                // already fed the tracker, so tracker updates are skipped.
+                // Retroactively assemble the buffered runs; their marks
+                // already fed the tracker, so mark updates are skipped,
+                // while their element gaps are learned here (MAN-315 D3).
                 let drained = std::mem::take(&mut self.pending);
                 for r in drained {
                     self.process_run(r, false, events);
                 }
+                // MAN-265: the readiness mark seeded wpm_ema before any
+                // element gap existed; replace that mark-only seed now
+                // that the replayed gaps are in, so a transmission that
+                // ends here reports the gap-corrected speed.
+                self.tracker.reseed_wpm_after_warmup();
                 self.demod.set_dit_ms(self.tracker.mu_dit_ms());
             }
             return;
@@ -169,34 +813,35 @@ impl TrackDecoder {
     fn process_run(&mut self, run: Run, live: bool, events: &mut Vec<DecoderEvent>) {
         let dur_ms = run.hops as f32 * HOP_MS as f32;
         if run.mark {
+<<<<<<< HEAD
             if let Some(hops) = self.flushed_gap_hops.take() {
                 // The flushed gap's remainder fell under the debounce and
                 // was absorbed into this mark: the gap ended within ~5 hops
                 // of the flush, so the flush-time length is its length.
                 self.gaps
                     .observe_flushed(hops as f32 * HOP_MS as f32, self.tracker.mu_dit_ms());
+=======
+            // A flushed gap this mark closed without a separate remainder
+            // run: the demod folded a remainder shorter than its debounce
+            // window into this mark, so the length at the flush is the
+            // closed length, short by less than that window (MAN-315 D2).
+            if let Some(flushed_ms) = self.flushed_gap_ms.take() {
+                self.observe_gap(GapClass::InterWord, flushed_ms);
+>>>>>>> 35deb42de4260c19220c0fec9cd847f70bf93828
             }
             if live {
                 self.tracker.on_mark(dur_ms);
+                self.sync_sender_regime();
                 self.demod.set_dit_ms(self.tracker.mu_dit_ms());
                 if let Some(w) = self.tracker.wpm() {
-                    let report = match self.last_reported_wpm {
-                        None => true,
-                        Some(prev) => (w - prev).abs() >= WPM_REPORT_DELTA,
-                    };
-                    if report {
-                        self.last_reported_wpm = Some(w);
-                        events.push(DecoderEvent::SpeedUpdate {
-                            track_id: self.track_id,
-                            wpm: w,
-                        });
-                    }
+                    self.report_wpm(w, events);
                 }
             }
             self.cur_marks.push(dur_ms);
             self.word_flushed = false;
         } else {
             if self.word_flushed {
+<<<<<<< HEAD
                 // This gap was already handled by the 7-dit flush; `run` is
                 // only its remainder (the flush closed the demod's open run).
                 // A remainder long enough to surface as its own run means
@@ -204,20 +849,117 @@ impl TrackDecoder {
                 // possibly a long pause -- so it stays out of the gap
                 // statistics.
                 self.flushed_gap_hops = None;
+=======
+                // This gap was already handled by the 7-dit flush. Its
+                // closed length is the sender's word gap (MAN-315 D2).
+                if let Some(flushed_ms) = self.flushed_gap_ms.take() {
+                    self.observe_gap(GapClass::InterWord, flushed_ms + dur_ms);
+                }
+                if let Some(flushed_ms) = self.single_flush_ms.take() {
+                    self.observe_single_flush(flushed_ms + dur_ms);
+                }
+>>>>>>> 35deb42de4260c19220c0fec9cd847f70bf93828
                 return;
             }
-            match self.gaps.classify(dur_ms, self.tracker.mu_dit_ms()) {
-                GapClass::InterElement => {}
+            let class = self.gaps.classify(dur_ms, self.gap_unit_ms());
+            self.observe_gap(class, dur_ms);
+            match class {
+                GapClass::InterElement => {
+                    // MAN-315 D3: also during the `pending` replay, whose
+                    // element gaps were never fed (nothing double-counts).
+                    self.tracker.on_element_gap(dur_ms);
+                }
                 GapClass::InterChar => self.emit_char(run.start_ts, events),
                 GapClass::InterWord => {
                     self.emit_char(run.start_ts, events);
-                    events.push(DecoderEvent::WordBoundary {
-                        track_id: self.track_id,
-                        sample_ts: run.start_ts,
-                    });
+                    events.push(DecoderEvent::word_boundary(self.track_id, run.start_ts));
+                    if self.word_decoded > 1 {
+                        self.single_flush_gaps.clear();
+                        self.gaps.confirm_rebuilt(dur_ms, self.gap_unit_ms(), None);
+                    }
+                    self.word_chars = 0;
+                    self.word_decoded = 0;
                 }
             }
         }
+    }
+
+    /// The dit period gaps are measured in: `SpeedTracker::dit_estimate_ms`,
+    /// the symmetric mark/gap period, not the mark centroid `mu_dit_ms`. The
+    /// transmitter's rise time shortens every mark and lengthens every gap
+    /// by the same amount, so in mark dits every gap read long and a
+    /// 4.5-dit letter gap crossed the word boundary. SPEC §4.2
+    /// **[DEVIATION]** (MAN-315 D3).
+    fn gap_unit_ms(&self) -> f32 {
+        self.tracker.dit_estimate_ms()
+    }
+
+    /// Fold one gap of `class`, `dur_ms` long, into the sender's timing and
+    /// refresh the sender word boundary the classifier uses (MAN-315 D2,
+    /// D4). A word gap of pause length is not the sender's spacing and is
+    /// not learned.
+    fn observe_gap(&mut self, class: GapClass, dur_ms: f32) {
+        if !self.learn_gaps {
+            return;
+        }
+        let unit = self.gap_unit_ms();
+        let class = match class {
+            GapClass::InterElement => TimingClass::ElementGap,
+            GapClass::InterChar => TimingClass::CharGap,
+            GapClass::InterWord => {
+                if self.sender.is_pause(dur_ms / unit) {
+                    return;
+                }
+                TimingClass::WordGap
+            }
+        };
+        self.sender.observe(class, dur_ms, unit);
+        self.gaps
+            .set_sender_word_dits(self.sender.sender_word_dits());
+    }
+
+    /// Drop the sender's timing when the tracker has rebuilt its mark
+    /// scale: the statistics were learned in the old scale's dits
+    /// (MAN-315 D7).
+    fn sync_sender_regime(&mut self) {
+        let regime = self.tracker.regime();
+        if regime == self.sender_regime {
+            return;
+        }
+        self.sender_regime = regime;
+        // `|=`: a second re-init before the next update must not drop a
+        // reset that has not been reported yet.
+        self.timing_reset_pending |= self.last_timing_total > 0;
+        self.sender.reset();
+        self.last_timing_total = 0;
+        self.gaps.set_sender_word_dits(None);
+        self.tracker.set_ratio_hint(None);
+    }
+
+    /// Learn the marks of a decoded character, labelled by its pattern, and
+    /// hand the tracker the sender's dash/dot ratio as its re-anchor target
+    /// (MAN-315 D2, D5). Garbles, prosigns and a pattern of another length
+    /// teach nothing.
+    fn observe_marks(&mut self, glyph: Glyph, marks: &[f32]) {
+        let Glyph::Char(c) = glyph else {
+            return;
+        };
+        let Some(pattern) = pattern_for(c) else {
+            return;
+        };
+        if pattern.len() != marks.len() {
+            return;
+        }
+        let unit = self.tracker.dit_estimate_ms();
+        for (e, &m) in pattern.chars().zip(marks) {
+            let class = if e == '.' {
+                TimingClass::Dot
+            } else {
+                TimingClass::Dash
+            };
+            self.sender.observe(class, m, unit);
+        }
+        self.tracker.set_ratio_hint(self.sender.dash_dot_ratio());
     }
 
     /// SPEC §4.2: a trailing space reaching 7*mu_dit forces char + word flush.
@@ -241,7 +983,27 @@ impl TrackDecoder {
         ) {
             let gap_ms = hops as f32 * HOP_MS as f32;
             let flush_dits = self.gaps.flush_threshold_dits(self.cfg.flush_gap_dits);
-            if gap_ms >= flush_dits * self.tracker.mu_dit_ms() {
+            if gap_ms >= flush_dits * self.gap_unit_ms() {
+                // This gap never reaches `classify` (it's resolved here,
+                // by the safety net) -- fold it into the Farnsworth
+                // long-gap statistics directly (MAN-103 D8). `gap_ms` is
+                // the flush threshold, not the gap's closed length, and
+                // that censoring is deliberate: observing the closed
+                // length of a pause flushed here (a track survives
+                // `hang_ms` of silence) would pin the word-gap cluster
+                // above every real word gap and merge all later words
+                // (`legacy_early_pause_does_not_merge_later_words`). It
+                // covers only pauses this flush resolves: a pause that
+                // reaches `classify` instead (replayed from `pending`
+                // during warmup, or open while the held last mark leaves
+                // `cur_marks` empty) still enters at full length -- see
+                // the MAN-103 decision doc, D8 correction. Heavy
+                // Farnsworth spacing, which this censoring hides, is
+                // recovered separately from the closed lengths of gaps
+                // flushed after one-character words (`observe_single_flush`).
+                // Both are folded in below, after the final character's
+                // decode is known, at the dit length measured here.
+                let mu_dit_ms = self.gap_unit_ms();
                 // Drain any held mark into cur_marks (live: it's a real
                 // keyed event and should count for speed tracking); the
                 // drained space itself is not separately gap-classified —
@@ -251,15 +1013,87 @@ impl TrackDecoder {
                         self.process_run(run, true, events);
                     }
                 }
+                let one_char_word = self.word_chars == 0;
+                let garbles = self.garble_count;
+                self.emit_char(ts, events);
+                // A word of two or more decoded characters ends here, so this
+                // gap can confirm such a rebuild (MAN-264) -- checked once the
+                // final character's decode is known, since a garble confirms
+                // nothing.
+                if self.word_decoded > 1 {
+                    self.gaps
+                        .confirm_rebuilt(gap_ms, mu_dit_ms, Some(self.cfg.flush_gap_dits));
+                }
+                self.gaps.observe_flushed(gap_ms, mu_dit_ms);
+                // A decoded one-character word: keep the gap's length so far
+                // for `observe_single_flush` once the space closes. A longer
+                // word or a garble ends the run.
+                if one_char_word && self.garble_count == garbles {
+                    self.single_flush_ms = Some(gap_ms);
+                } else {
+                    self.single_flush_ms = None;
+                    self.single_flush_gaps.clear();
+                }
+                if !self.word_flushed {
+                    events.push(DecoderEvent::word_boundary(self.track_id, ts));
+                }
+                self.word_chars = 0;
+                self.word_decoded = 0;
+                self.word_flushed = true;
+                self.flushed_gap_ms = Some(gap_ms);
+            }
+        }
+    }
+
+    /// Record the closed length of a gap `check_flush` flushed after a
+    /// one-character word, and rebuild the Farnsworth long-gap statistics
+    /// from the last `SINGLE_FLUSH_REINIT` of them when they show two gap
+    /// clusters -- heavy Farnsworth spacing the censored `observe_flushed`
+    /// cannot see (`GapClassifier::reinit_from_flushed`).
+    fn observe_single_flush(&mut self, gap_ms: f32) {
+        self.single_flush_gaps.push(gap_ms / self.gap_unit_ms());
+        if self.single_flush_gaps.len() > SINGLE_FLUSH_REINIT {
+            self.single_flush_gaps.remove(0);
+        }
+        if self.single_flush_gaps.len() == SINGLE_FLUSH_REINIT
+            && self
+                .gaps
+                .reinit_from_flushed(&self.single_flush_gaps, self.cfg.flush_gap_dits)
+        {
+            self.single_flush_gaps.clear();
+        }
+    }
+
+    /// SPEC §4.2: a trailing space reaching 7*mu_dit forces char + word
+    /// flush, for the `EdgeLegacy` engine (see `check_flush`'s doc comment
+    /// for the full rationale). `EdgeDemod` holds a run one flip behind
+    /// `open` for debounce confirmation, same as `Demod`; `self.edge.finish()`
+    /// drains it before committing the character.
+    fn check_flush_edge(&mut self, events: &mut Vec<DecoderEvent>) {
+        if self.word_flushed || !self.tracker.ready() || self.cur_marks.is_empty() {
+            return;
+        }
+        if let Some((hops, ts)) = self.edge.open_space() {
+            let gap_ms = hops as f32 * HOP_MS as f32;
+            let flush_dits = self.gaps.flush_threshold_dits(self.cfg.flush_gap_dits);
+            if gap_ms >= flush_dits * self.gap_unit_ms() {
+                for run in self.edge.finish() {
+                    if run.mark {
+                        self.process_run(run, true, events);
+                    }
+                }
                 self.emit_char(ts, events);
                 if !self.word_flushed {
-                    events.push(DecoderEvent::WordBoundary {
-                        track_id: self.track_id,
-                        sample_ts: ts,
-                    });
+                    events.push(DecoderEvent::word_boundary(self.track_id, ts));
                 }
+                self.word_chars = 0;
+                self.word_decoded = 0;
                 self.word_flushed = true;
+<<<<<<< HEAD
                 self.flushed_gap_hops = Some(hops);
+=======
+                self.flushed_gap_ms = Some(gap_ms);
+>>>>>>> 35deb42de4260c19220c0fec9cd847f70bf93828
             }
         }
     }
@@ -268,13 +1102,17 @@ impl TrackDecoder {
         if self.cur_marks.is_empty() {
             return;
         }
-        // SPEC §4.5: q = clamp(SNR_2500 / 20 dB, 0.3, 1.0)
-        let q = self
-            .demod
-            .snr_2500_db()
-            .map(|snr| (snr / 20.0).clamp(0.3, 1.0))
-            .unwrap_or(1.0);
+        // SPEC §4.5: q = clamp(SNR_2500 / 20 dB, 0.3, 1.0). Legacy reads the
+        // keying-rail SNR directly; EdgeLegacy/Hsmm use the evidence-derived
+        // estimate (SPEC v2 §2.3) stashed in `last_snr`.
+        let snr = if self.cfg.engine == Engine::Legacy {
+            self.demod.snr_2500_db()
+        } else {
+            self.last_snr
+        };
+        let q = snr.map(|snr| (snr / 20.0).clamp(0.3, 1.0)).unwrap_or(1.0);
         let marks = std::mem::take(&mut self.cur_marks);
+        self.word_chars = self.word_chars.saturating_add(1);
         match decode_char(
             &marks,
             self.tracker.mu_dit_ms(),
@@ -282,12 +1120,16 @@ impl TrackDecoder {
             q,
             &self.cfg.beam,
         ) {
-            Some(cd) => events.push(DecoderEvent::CharDecoded {
-                track_id: self.track_id,
-                sample_ts,
-                glyph: cd.glyph,
-                confidence: cd.confidence,
-            }),
+            Some(cd) => {
+                self.word_decoded = self.word_decoded.saturating_add(1);
+                self.observe_marks(cd.glyph, &marks);
+                events.push(DecoderEvent::char_decoded(
+                    self.track_id,
+                    sample_ts,
+                    cd.glyph,
+                    cd.confidence,
+                ));
+            }
             None => self.garble_count += 1,
         }
     }
@@ -351,6 +1193,215 @@ mod tests {
         env
     }
 
+    /// Rectangular envelope helper with `depth_db` keying depth (the existing
+    /// `rect_envelope` is 0/1; deep keying is what breaks the legacy chain).
+    /// Applies the same 4-hop linear ramp as evidence.rs's `keyed()` test
+    /// helper on every edge, emulating the SPEC v2 §1.2 channel filter --
+    /// without it a rectangular envelope doesn't exercise the legacy bias
+    /// this test exists to catch.
+    fn rect_envelope_depth(text: &str, dit_hops: u32, depth_db: f32) -> Vec<f32> {
+        let lo = 10f32.powf(-depth_db / 20.0);
+        let v: Vec<f32> = rect_envelope(text, dit_hops)
+            .into_iter()
+            .map(|v| if v > 0.5 { 1.0 } else { lo })
+            .collect();
+        let mut out = v.clone();
+        for i in 1..v.len() {
+            if (v[i] - v[i - 1]).abs() > 0.1 {
+                for j in 0..4 {
+                    let k = i + j;
+                    if k < out.len() {
+                        let f = (j as f32 + 0.5) / 4.0;
+                        out[k] = v[i - 1] + f * (v[i] - v[i - 1]);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn decode_with(engine: Engine, env: &[f32]) -> String {
+        let cfg = DecodeConfig {
+            engine,
+            ..Default::default()
+        };
+        let mut dec = TrackDecoder::new(1, cfg);
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        events_to_text(&events)
+    }
+
+    #[test]
+    fn edge_legacy_decodes_contest_speed_deep_keying() {
+        // 40 WPM = 11.25 hops/dit; use 11 hops. 45 dB depth. Legacy merges words here.
+        //
+        // [Finding, Task 5 execution]: as originally drafted (env starting
+        // directly with the first mark, no lead-in) this test loses the
+        // leading "C" entirely -- NOT the timing/beam defect this test
+        // exists to catch, but a distinct, separately-diagnosed artifact of
+        // `NoiseTracker`'s temporal-minimum EMA (tau_ms = 40 ms, SPEC v2
+        // §2.1, Task 3, calibrated against 60 s of real-style noise)
+        // starting from a stone-cold state: with no prior sample at all, its
+        // very first smoothed value is initialized directly from that first
+        // sample (`Evidence::push`/`NoiseTracker::push` both special-case
+        // "no history yet" as `= power`, not an EMA blend), so if that first
+        // sample happens to be a mark (as here), the noise estimate starts
+        // pinned near the MARK level and only decays on later low samples --
+        // confirmed by instrumented trace that it doesn't cross below the
+        // evidence gate's `present = mark_level >= 2*noise_level` threshold
+        // until ~23 hops into "C"'s own trailing 3-dit gap, well after "C"'s
+        // marks are over. A real track is never this cold: `NoiseTracker`
+        // has been accumulating real channel history, mark and noise alike,
+        // for as long as the track has existed before its first character
+        // starts keying. A tiny (4-hop) noise-floor lead-in restores that:
+        // it makes the very FIRST sample ever pushed a noise-floor sample
+        // instead of a mark, so `NoiseTracker`'s min and `Evidence`'s a_s
+        // both init near the true floor immediately (verified: the gate is
+        // open from "C"'s first element) -- without needing anywhere near
+        // NoiseTracker's ~60-hop convergence time, since the min only ever
+        // needs ONE low sample to seed it, not a sustained low stretch. 4
+        // hops is deliberately kept under EdgeDemod's 5-hop debounce
+        // (`ms_to_hops(12.0)`) so it merges into the first mark run instead
+        // of surfacing as its own space `Run` -- a longer, separately-
+        // surfaced lead-in space was tried first and broke word-boundary
+        // detection for the REST of the message: it fed one huge (~18-dit)
+        // outlier into `GapClassifier`'s Farnsworth long-gap statistics
+        // before any genuine word gap did, anchoring its bimodal "hi"
+        // (word-gap) cluster at that outlier and pushing the char/word
+        // boundary (`sqrt(lo*hi)`) above every real 7-dit word gap in the
+        // scene, merging every word after the first. This does not touch
+        // any Task 2-4 code; it is a test-scene fix only.
+        let lo = 10f32.powf(-45.0 / 20.0);
+        let mut env: Vec<f32> = vec![lo; 4];
+        env.extend(rect_envelope_depth("CQ TEST W5AU W5AU TEST", 11, 45.0));
+        assert_eq!(
+            decode_with(Engine::EdgeLegacy, &env),
+            "CQ TEST W5AU W5AU TEST"
+        );
+        // The Legacy chain's old geometric-mean key threshold (SPEC v1
+        // §3.2) merged words on this deep-keyed scene. MAN-103's midpoint
+        // key-decision band fixed that word-merge, MAN-213's fade-tracking
+        // rails kept the fix, and both engines now decode it exactly.
+        assert_eq!(decode_with(Engine::Legacy, &env), "CQ TEST W5AU W5AU TEST");
+    }
+
+    #[test]
+    fn edge_legacy_flush_path_confidence_is_not_crushed_on_a_clean_scene() {
+        // [Task 8 fix, review round 2] `finish()`'s `EdgeLegacy` branch
+        // force-closes whatever mark/space `EdgeDemod` still has open via
+        // `self.edge.finish()`, then gap-classifies and commits it --
+        // closing "K" without any following real mark to naturally end its
+        // keying, exactly like `check_flush_edge`'s in-stream timeout path.
+        //
+        // [Verification note, round 2]: I could NOT reproduce the specific
+        // "~3.3x improvement from the `ev.present` gate alone" delta by
+        // direct A/B (gate present vs removed) comparison on this or any
+        // deep-keying scene I tried, and I want to be precise about why
+        // rather than just asserting the round-1 claim again. The keying
+        // gate is `present = mark_level >= 2*noise_level`; the instant
+        // `present` transitions to false is, by that same definition,
+        // exactly where the RAW ratio crosses 2.0 (6 dB) -- which, after
+        // the fixed 14.3 dB bandwidth correction, reports as ~-8.3 dB,
+        // already inside `q`'s `[0.3, 1.0]` clamp floor. Gated or not,
+        // `last_snr` is identical for every hop up to that transition
+        // (both read the same value while `present` is true); the only
+        // difference is what happens *after*, and since both an
+        // unconditionally-continuing decay and a gate-frozen ~-8.3 dB
+        // value clamp to the *same* `q = 0.3`, `EdgeLegacy`'s reported
+        // `CharDecoded` confidence comes out byte-for-byte identical with
+        // the gate removed, confirmed by direct comparison at every
+        // trailing-silence length I tried (11 through 600 extra hops past
+        // this scene's own marks). So for `EdgeLegacy` specifically, the
+        // gate's *observable* effect is confined to suppressing
+        // `TrackMeta` before the first mark (covered by the next test),
+        // not to confidence scaling -- the confidence-scaling fix
+        // (`snr_history`, item 6) only actually changes behavior for
+        // `Hsmm`, whose commits are delayed far enough to land well past
+        // a transition rather than right at one.
+        //
+        // What *is* true and worth pinning as a regression test: a clean,
+        // deep-keyed scene's flush-closed final character must not be
+        // crushed toward the 0.3 floor merely because it closed without a
+        // following mark. This holds as long as the trailing gap actually
+        // fed to the decoder stays comfortably short of the point where
+        // the keying gate's own windowed peak-hold (SPEC v2 §1.2) decays
+        // past its 6 dB threshold (empirically, a handful of dits here);
+        // once it doesn't, `q`'s floor legitimately applies regardless of
+        // this fix, which is expected, not a defect.
+        let lo = 10f32.powf(-45.0 / 20.0);
+        let mut env: Vec<f32> = vec![lo; 4];
+        // Truncate rect_envelope_depth's own 8-dit synthetic tail down to a
+        // short 4-dit trailing gap -- enough for `finish()` to force-close
+        // "K" without a following mark, comfortably short of the keying
+        // gate's own decay window.
+        let full = rect_envelope_depth("CQ K", 11, 45.0);
+        env.extend(&full[..full.len() - 8 * 11 + 4 * 11]);
+        let cfg = DecodeConfig {
+            engine: Engine::EdgeLegacy,
+            ..Default::default()
+        };
+        let mut dec = TrackDecoder::new(1, cfg);
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        let conf = events
+            .iter()
+            .find_map(|e| match e {
+                DecoderEvent::CharDecoded {
+                    glyph: crate::tree::Glyph::Char('K'),
+                    confidence,
+                    ..
+                } => Some(*confidence),
+                _ => None,
+            })
+            .expect("K should have decoded, flushed by finish() without a following mark");
+        assert!(
+            conf > 0.9,
+            "flush-path confidence should reflect the clean keying, not be \
+             crushed toward the 0.3 floor: {conf}"
+        );
+    }
+
+    #[test]
+    fn edge_legacy_track_meta_arrives_once_evidence_exists() {
+        // [Task 8 fix, review round 2] `snr_from_evidence`'s `ev.present`
+        // gate means `last_snr` (hence `TrackMeta`) doesn't fire while a
+        // track has never seen a mark (previously it fired immediately with
+        // a nonsensical negative-SNR reading against pure silence); confirm
+        // this isn't a permanent suppression -- it must still arrive once
+        // real keying is observed.
+        let lo = 10f32.powf(-45.0 / 20.0);
+        let mut env: Vec<f32> = vec![lo; 4];
+        env.extend(rect_envelope_depth("CQ TEST W5AU W5AU TEST", 11, 45.0));
+        let cfg = DecodeConfig {
+            engine: Engine::EdgeLegacy,
+            ..Default::default()
+        };
+        let mut dec = TrackDecoder::new(1, cfg);
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackMeta { .. })),
+            "TrackMeta must eventually arrive once real keying occurs: {events:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_engine_is_untouched() {
+        let env = rect_envelope("CQ CQ DE W1AW", 18);
+        assert_eq!(decode_with(Engine::Legacy, &env), "CQ CQ DE W1AW");
+    }
+
     fn decode(text: &str) -> (String, Vec<DecoderEvent>) {
         let env = rect_envelope(text, 18);
         let mut dec = TrackDecoder::new(1, DecodeConfig::default());
@@ -394,6 +1445,272 @@ mod tests {
         ));
     }
 
+    /// Codex review on PR #154, round 4: the live path (`process_run`)
+    /// only reports a `SpeedUpdate` on a >= `WPM_REPORT_DELTA` change from
+    /// the last REPORTED value, so a track whose true estimate settles by
+    /// less than that delta never gets a correcting report -- a consumer
+    /// gating a decision on the track's true final speed (manta-spot's
+    /// Beacon-WPM check) has no other event to observe it on for a short,
+    /// single-transmission track. `finish()` must flush the true value
+    /// unconditionally.
+    #[test]
+    fn finish_flushes_a_final_speed_update_even_below_the_report_delta() {
+        let env = rect_envelope("CQ CQ DE W1AW W1AW K", 18);
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        let wpm_now = dec.tracker.wpm().expect("tracker must be ready by now");
+        // Pretend the last LIVE report already claimed a value stale by
+        // less than WPM_REPORT_DELTA -- the live path would never correct
+        // this on its own.
+        dec.last_reported_wpm = Some(wpm_now + (WPM_REPORT_DELTA - 0.1));
+
+        let finish_events = dec.finish();
+        assert!(
+            finish_events.iter().any(
+                |e| matches!(e, DecoderEvent::SpeedUpdate { wpm, .. } if (*wpm - wpm_now).abs() < 0.01)
+            ),
+            "finish() must flush the true final wpm even when it's within \
+             WPM_REPORT_DELTA of the last reported value, got {finish_events:?}"
+        );
+    }
+
+    /// MAN-265: feed exactly five marks and four element gaps (the
+    /// `pending`-buffered shape of a transmission that ends at the
+    /// tracker's readiness boundary) through `on_run`, returning the
+    /// decoder mid-flight so each test can pick its own finalization.
+    /// No sixth mark or following element gap exists -- the whole point
+    /// is that nothing live ever follows warmup.
+    fn feed_five_marks_four_gaps(
+        mark_hops: u32,
+        gap_hops: u32,
+    ) -> (TrackDecoder, Vec<DecoderEvent>) {
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        let mut ts = 0u64;
+        for i in 0..5 {
+            dec.on_run(
+                Run {
+                    mark: true,
+                    start_ts: ts,
+                    hops: mark_hops,
+                },
+                &mut events,
+            );
+            ts += mark_hops as u64 * 256;
+            if i < 4 {
+                dec.on_run(
+                    Run {
+                        mark: false,
+                        start_ts: ts,
+                        hops: gap_hops,
+                    },
+                    &mut events,
+                );
+                ts += gap_hops as u64 * 256;
+            }
+        }
+        (dec, events)
+    }
+
+    /// MAN-265: the WPM seeded at the 5-mark readiness boundary is
+    /// mark-only -- the element gaps between those marks only reach
+    /// `mu_egap` (hence `dit_estimate_ms`) during the `pending` replay
+    /// that follows, and nothing recomputed `wpm_ema` after it. A short
+    /// transmission (a beacon ID, a single contest exchange) that ends
+    /// there reported the biased speed forever. `(15, 21)` hops =
+    /// 40 ms marks + 56 ms gaps (mark-only seed 30 WPM), `(21, 15)` the
+    /// mirror bias (21.43 WPM), `(18, 18)` the symmetric control; the
+    /// true dit is (40+56)/2 = 48 ms = 25 WPM in every case.
+    #[test]
+    fn short_warmup_transmission_reports_gap_corrected_wpm() {
+        for (mark_hops, gap_hops) in [(15u32, 21u32), (21, 15), (18, 18)] {
+            let (mut dec, feed_events) = feed_five_marks_four_gaps(mark_hops, gap_hops);
+            assert!(
+                !feed_events
+                    .iter()
+                    .any(|e| matches!(e, DecoderEvent::SpeedUpdate { .. })),
+                "warmup readiness alone must not emit a live speed event, got {feed_events:?}"
+            );
+            let finish_events = dec.finish();
+            assert_eq!(
+                events_to_text(&finish_events),
+                "5",
+                "{mark_hops}/{gap_hops} hops"
+            );
+            let final_wpm = finish_events.iter().rev().find_map(|e| match e {
+                DecoderEvent::SpeedUpdate { wpm, .. } => Some(*wpm),
+                _ => None,
+            });
+            let final_wpm = final_wpm
+                .unwrap_or_else(|| panic!("no final SpeedUpdate for {mark_hops}/{gap_hops}"));
+            assert!(
+                (final_wpm - 25.0).abs() < 0.01,
+                "finish() reported {final_wpm} WPM for {mark_hops}/{gap_hops} hops, \
+                 expected the gap-corrected 25"
+            );
+
+            // Same seed through the bookkeeping-only finalization
+            // (manta-spot's Beacon-WPM check reads this path).
+            let (mut dec, _) = feed_five_marks_four_gaps(mark_hops, gap_hops);
+            let speed_only_wpm = dec
+                .finish_speed_only()
+                .into_iter()
+                .find_map(|e| match e {
+                    DecoderEvent::SpeedUpdate { wpm, .. } => Some(wpm),
+                    _ => None,
+                })
+                .expect("finish_speed_only must report the corrected final speed");
+            assert!(
+                (speed_only_wpm - 25.0).abs() < 0.01,
+                "finish_speed_only() reported {speed_only_wpm} WPM for \
+                 {mark_hops}/{gap_hops} hops, expected the gap-corrected 25"
+            );
+        }
+    }
+
+    /// MAN-265: the reseed replaces the warmup seed, not the smoothing --
+    /// a later live mark still takes exactly one `WPM_ALPHA = 0.1` EMA
+    /// step from the corrected seed. After the `(15, 21)` warmup (seed
+    /// 25), one 24-hop (64 ms) element gap moves `mu_egap` to
+    /// 56 + 0.15*8 = 57.2 ms, so the next 15-hop (40 ms) mark's raw
+    /// estimate is 1200/48.6 = 24.6914 WPM and the live report must be
+    /// 25 + 0.1*(24.6914 - 25) = 24.9691 -- not the raw value, and not
+    /// an EMA step from the old mark-only 30 WPM seed (29.4691).
+    /// The replay also counts no mark twice: the warmed-up tracker equals
+    /// one fed each of the five marks once (replaying the marks through
+    /// `on_mark` would also fill the drift ring and fail the comparison).
+    #[test]
+    fn live_marks_after_warmup_smooth_from_the_corrected_seed() {
+        let (mut dec, _) = feed_five_marks_four_gaps(15, 21);
+        let mut once = SpeedTracker::new();
+        for _ in 0..5 {
+            once.on_mark(15.0 * HOP_MS as f32);
+        }
+        for _ in 0..4 {
+            once.on_element_gap(21.0 * HOP_MS as f32);
+        }
+        once.reseed_wpm_after_warmup();
+        assert_eq!(
+            format!("{:?}", dec.tracker),
+            format!("{once:?}"),
+            "the warmup replay must not observe a mark twice"
+        );
+        let mut events = Vec::new();
+        dec.on_run(
+            Run {
+                mark: false,
+                start_ts: 159 * 256,
+                hops: 24,
+            },
+            &mut events,
+        );
+        dec.on_run(
+            Run {
+                mark: true,
+                start_ts: 183 * 256,
+                hops: 15,
+            },
+            &mut events,
+        );
+        let live_wpm = events.iter().find_map(|e| match e {
+            DecoderEvent::SpeedUpdate { wpm, .. } => Some(*wpm),
+            _ => None,
+        });
+        let live_wpm = live_wpm.expect("the first live mark must report its speed");
+        assert!(
+            (live_wpm - 24.9691).abs() < 0.01,
+            "live WPM after warmup must be the alpha-0.1 step from the \
+             corrected 25 WPM seed, got {live_wpm}"
+        );
+    }
+
+    /// MAN-265 end-to-end: a single "5" (five dots, 25 WPM, 40 dB keying
+    /// depth) whose transmission ends before any element gap follows its
+    /// fifth mark -- the last mark is force-closed by `finish()`, exactly
+    /// the on-air shape of a short transmission. The final `SpeedUpdate`
+    /// is the only speed a consumer ever sees, so it must carry the
+    /// gap-corrected estimate, agreeing with `dit_estimate_ms` (which
+    /// `TimingUpdate` reports) rather than the mark-only centroid.
+    #[test]
+    fn short_envelope_reports_gap_corrected_final_wpm() {
+        let lo = 10f32.powf(-40.0 / 20.0);
+        let mut env: Vec<f32> = vec![lo; 4];
+        env.extend(rect_envelope_depth("5", 18, 40.0));
+        while env.len() < 420 {
+            env.push(lo);
+        }
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        assert_eq!(events_to_text(&events), "5");
+        let final_wpm = events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                DecoderEvent::SpeedUpdate { wpm, .. } => Some(*wpm),
+                _ => None,
+            })
+            .expect("a short track must report its final speed");
+        let corrected = 1200.0 / dec.tracker.dit_estimate_ms();
+        assert!(
+            (final_wpm - corrected).abs() < 0.01,
+            "final {final_wpm} WPM must match the corrected estimate {corrected}"
+        );
+        assert!(
+            (final_wpm - 25.0).abs() < 1.0,
+            "final {final_wpm} WPM must be within 1 WPM of the 25 WPM input"
+        );
+    }
+
+    /// Codex review on PR #154, round 7: `finish()` forces whatever's
+    /// still "open" (an in-progress mark with no real trailing gap yet
+    /// observed) to resolve into a character -- correct for a genuine
+    /// end-of-signal, but a fabrication when the closure is pure
+    /// bookkeeping (manta-engine's Merged/Evicted). `finish_speed_only`
+    /// must never do this: only marks ALREADY closed by a real observed
+    /// gap (via ordinary `push_envelope` calls) may ever decode.
+    #[test]
+    fn finish_speed_only_does_not_fabricate_a_character_from_an_open_mark() {
+        let prefix = rect_envelope("PARIS", 18);
+        // A long dangling mark with NO trailing gap at all -- genuinely
+        // still "open" in `Demod`'s internal state, not a real completed
+        // run under any interpretation.
+        let dangling_mark = vec![1.0_f32; 60];
+
+        let mut dec_finish = TrackDecoder::new(1, DecodeConfig::default());
+        let mut dec_speed_only = TrackDecoder::new(2, DecodeConfig::default());
+        for (ts, &a) in prefix.iter().chain(dangling_mark.iter()).enumerate() {
+            let ts = ts as u64;
+            dec_finish.push_envelope(a, ts);
+            dec_speed_only.push_envelope(a, ts);
+        }
+
+        let full_finish_events = dec_finish.finish();
+        assert!(
+            full_finish_events
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::CharDecoded { .. })),
+            "sanity check: finish() should force the dangling mark into a \
+             character, got {full_finish_events:?}"
+        );
+
+        let speed_only_events = dec_speed_only.finish_speed_only();
+        assert!(
+            !speed_only_events.iter().any(|e| matches!(
+                e,
+                DecoderEvent::CharDecoded { .. } | DecoderEvent::WordBoundary { .. }
+            )),
+            "finish_speed_only must never fabricate a character/word from \
+             an in-progress mark, got {speed_only_events:?}"
+        );
+    }
+
     #[test]
     fn trailing_word_flushes_by_timeout_not_eof() {
         // The 7-dit rule (SPEC §4.2) must close "K" before the stream ends.
@@ -431,34 +1748,554 @@ mod tests {
     fn text_assembly_drops_prosigns_and_collapses_spaces() {
         use crate::tree::{Glyph, Prosign};
         let ev = vec![
-            DecoderEvent::CharDecoded {
-                track_id: 1,
-                sample_ts: 0,
-                glyph: Glyph::Char('A'),
-                confidence: 1.0,
-            },
-            DecoderEvent::WordBoundary {
-                track_id: 1,
-                sample_ts: 1,
-            },
-            DecoderEvent::CharDecoded {
-                track_id: 1,
-                sample_ts: 2,
-                glyph: Glyph::Prosign(Prosign::Ar),
-                confidence: 1.0,
-            },
-            DecoderEvent::WordBoundary {
-                track_id: 1,
-                sample_ts: 3,
-            },
-            DecoderEvent::CharDecoded {
-                track_id: 1,
-                sample_ts: 4,
-                glyph: Glyph::Char('B'),
-                confidence: 1.0,
-            },
+            DecoderEvent::char_decoded(1, 0, Glyph::Char('A'), 1.0),
+            DecoderEvent::word_boundary(1, 1),
+            DecoderEvent::char_decoded(1, 2, Glyph::Prosign(Prosign::Ar), 1.0),
+            DecoderEvent::word_boundary(1, 3),
+            DecoderEvent::char_decoded(1, 4, Glyph::Char('B'), 1.0),
         ];
         assert_eq!(events_to_text(&ev), "A B");
+    }
+
+    /// 375 hops (one META_INTERVAL_HOPS/SPEC §5 reporting interval) of a
+    /// keyed envelope, alternating enough to let `Demod`'s init succeed
+    /// (SPEC §3.1-§3.2's E_hi/E_lo ratio check) within this same window.
+    fn keyed_envelope_for_tests() -> Vec<f32> {
+        let mut env = Vec::new();
+        for _ in 0..12 {
+            env.extend(std::iter::repeat_n(1.0f32, 15));
+            env.extend(std::iter::repeat_n(0.01f32, 15));
+        }
+        env.extend(std::iter::repeat_n(1.0f32, 15));
+        env
+    }
+
+    /// MAN-118: `rail_ratio` reports the `Legacy` demod's rails once they
+    /// initialize, and nothing for an engine without them.
+    #[test]
+    fn rail_ratio_is_reported_under_legacy_only() {
+        let feed = |engine: Engine| {
+            let mut dec = TrackDecoder::new(
+                1,
+                DecodeConfig {
+                    engine,
+                    ..DecodeConfig::default()
+                },
+            );
+            assert_eq!(dec.rail_ratio(), None, "{engine:?} before any input");
+            for (i, a) in keyed_envelope_for_tests().into_iter().enumerate() {
+                dec.push_envelope(a, i as u64 * 256);
+            }
+            dec.rail_ratio()
+        };
+        let legacy = feed(Engine::Legacy).expect("legacy rails initialize within one interval");
+        assert!(legacy >= 2.0, "legacy rail ratio {legacy}");
+        assert_eq!(feed(Engine::Hsmm), None);
+    }
+
+    #[test]
+    fn track_meta_uses_the_engine_supplied_snr_when_set() {
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        dec.set_freq_hz(14_012_340.0);
+        let mut events = Vec::new();
+        // 375 hops of a keyed envelope is one META_INTERVAL_HOPS.
+        for (i, a) in keyed_envelope_for_tests().into_iter().enumerate() {
+            dec.set_snr_2500_db(19.5);
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        let meta = events.iter().find_map(|e| match e {
+            DecoderEvent::TrackMeta { snr_2500_db, .. } => Some(*snr_2500_db),
+            _ => None,
+        });
+        assert_eq!(meta, Some(19.5), "the engine-supplied value must win");
+    }
+
+    #[test]
+    fn track_meta_falls_back_to_the_rail_estimate_when_unset() {
+        // A TrackDecoder driven standalone (manta-decode's own tests,
+        // manta-testkit's roundtrip_envelope) never calls set_snr_2500_db
+        // and must keep emitting the M0 rail estimate rather than nothing
+        // at all.
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, a) in keyed_envelope_for_tests().into_iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        let rail_snr = dec.demod.snr_2500_db().expect(
+            "keyed_envelope_for_tests should bring the demod to Running within one interval",
+        );
+        let meta = events.iter().find_map(|e| match e {
+            DecoderEvent::TrackMeta { snr_2500_db, .. } => Some(*snr_2500_db),
+            _ => None,
+        });
+        assert_eq!(
+            meta,
+            Some(rail_snr),
+            "TrackMeta must carry the rail estimate exactly when no engine-supplied SNR is set"
+        );
+    }
+
+    #[test]
+    fn track_meta_is_not_emitted_for_a_track_whose_demod_never_initialized() {
+        // MAN-102 review round 1, finding 1 (regression). A steady carrier,
+        // birdie, or tuning note never lets `Demod` leave `Phase::Init`
+        // (E_hi/E_lo never crosses MIN_KEYING_RATIO -- see envelope.rs's
+        // `carrier_never_inits`), so `self.demod.running()` stays false
+        // forever. `manta-engine` calls `set_snr_2500_db` on every queued
+        // hop for every track it drives, including never-keyed ones, so a
+        // TrackDecoder here sees an engine-supplied SNR on every hop just
+        // like it would in production -- that must not be enough by itself
+        // to emit TrackMeta.
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        dec.set_freq_hz(14_012_340.0);
+        let mut events = Vec::new();
+        for i in 0..3000u64 {
+            dec.set_snr_2500_db(20.0);
+            events.extend(dec.push_envelope(0.5, i * 256));
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackMeta { .. })),
+            "a never-initialized demod (steady carrier) must not emit TrackMeta, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn hsmm_decodes_clean_text_at_three_speeds() {
+        // [Finding, Task 8 execution]: as originally drafted (no lead-in,
+        // matching the brief's literal text) this test's very first
+        // character misdecodes ("C" -> "EE") at all three speeds -- NOT an
+        // `HsmmDecoder` logic defect, but the SAME `NoiseTracker`/`Evidence`
+        // stone-cold-start artifact already diagnosed and fixed (via a
+        // test-scene lead-in, not a decoder code change) in Task 5's
+        // `edge_legacy_decodes_contest_speed_deep_keying` above: with no
+        // prior sample at all, the very first smoothed noise/mark estimate
+        // is initialized directly from that first sample, and since the
+        // scene's first-ever sample is a mark, the noise floor starts
+        // pinned near the mark level. For `EdgeLegacy` this only delayed
+        // the keying gate opening; for `Hsmm` it's worse -- confirmed by
+        // instrumented trace (HSMM_TRACE/HSMM_TRACE2 env-gated eprintln,
+        // since removed) that the corrupted early evidence stream causes a
+        // small-`u` seed to mis-segment a slice of the first (72-hop, u=24)
+        // dah as a complete short dit+gap, reach a premature "glyph E"
+        // conclusion, and dominate the beam before the correctly-scaled
+        // seed's own (longer) dah observation completes -- purely a
+        // front-end warm-up artifact of a signal that starts marking on
+        // sample 0, not a real-world scenario (a live track always has
+        // accumulated noise-floor history before its first character). The
+        // same 4-hop noise-floor lead-in Task 5 used (short enough to merge
+        // into the first mark's own debounce/hold window rather than
+        // surfacing as a separate leading space run) restores a realistic
+        // cold-start and is sufficient: every character, at every speed,
+        // decodes correctly with it.
+        for (dit_hops, label) in [(24u32, "19 WPM"), (13, "35 WPM"), (10, "45 WPM")] {
+            let lo = 10f32.powf(-40.0 / 20.0);
+            let mut env = vec![lo; 4];
+            env.extend(rect_envelope_depth(
+                "CQ TEST W5AU W5AU TEST",
+                dit_hops,
+                40.0,
+            ));
+            assert_eq!(
+                decode_with(Engine::Hsmm, &env),
+                "CQ TEST W5AU W5AU TEST",
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn hsmm_speed_converges_from_seeds() {
+        let env = rect_envelope_depth("PARIS PARIS PARIS", 13, 40.0);
+        let cfg = DecodeConfig {
+            engine: Engine::Hsmm,
+            ..Default::default()
+        };
+        let mut dec = TrackDecoder::new(1, cfg);
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        let wpm = events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                DecoderEvent::SpeedUpdate { wpm, .. } => Some(*wpm),
+                _ => None,
+            })
+            .unwrap();
+        assert!((wpm - 34.6).abs() < 2.0, "wpm {wpm}");
+    }
+
+    /// MAN-190 integration: the whole live chain through a mid-stream
+    /// speed change and a short final word that only `finish()` completes.
+    /// Protects the wiring and feedback order of the new one-hop-later
+    /// evidence schedule (each finalized hop is processed -- SNR history,
+    /// `hsmm.push`, committed events, `best_u` -> `set_u_ref` + WPM
+    /// report -- before the next finalized hop is requested, and the
+    /// terminal pending hop reaches HSMM before `hsmm.finish()` forces
+    /// the final commitment). This is a wiring/feedback-order regression
+    /// test, not a claim of an independently reproduced production miss.
+    #[test]
+    fn hsmm_streams_a_speed_change_and_finishes_the_final_word() {
+        let lo = 10f32.powf(-40.0 / 20.0);
+        let lead_in = 4usize;
+        let word1 = rect_envelope_depth("CQ DE", 13, 40.0); // ~35 WPM
+        let word2 = rect_envelope_depth("W5AU", 18, 40.0); // ~25 WPM
+        let w2_start = lead_in + word1.len();
+        let w2_end = w2_start + word2.len();
+        let mut env = vec![lo; lead_in];
+        env.extend(word1);
+        env.extend(word2);
+
+        let run = || {
+            let cfg = DecodeConfig {
+                engine: Engine::Hsmm,
+                ..Default::default()
+            };
+            let mut dec = TrackDecoder::new(1, cfg);
+            let mut events = Vec::new();
+            for (i, &a) in env.iter().enumerate() {
+                events.extend(dec.push_envelope(a, i as u64 * 256));
+            }
+            events.extend(dec.finish());
+            (events, dec)
+        };
+        let (events, mut dec) = run();
+
+        // Expected text across the speed change.
+        assert_eq!(events_to_text(&events), "CQ DE W5AU", "{events:?}");
+
+        // Final speed within the existing convergence tolerance
+        // (`hsmm_speed_converges_from_seeds` uses +/-2 WPM): the last
+        // reported speed must track the second word's 450/18 = 25 WPM.
+        let wpm = events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                DecoderEvent::SpeedUpdate { wpm, .. } => Some(*wpm),
+                _ => None,
+            })
+            .unwrap();
+        assert!((wpm - 25.0).abs() < 2.0, "final wpm {wpm}");
+
+        // Sample-based timestamps: the final word's characters are keyed
+        // inside the second envelope's own index range, at real marks.
+        let final_word_chars: Vec<&DecoderEvent> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    DecoderEvent::CharDecoded {
+                        sample_ts,
+                        glyph: crate::tree::Glyph::Char('W')
+                            | crate::tree::Glyph::Char('5')
+                            | crate::tree::Glyph::Char('A')
+                            | crate::tree::Glyph::Char('U'),
+                        ..
+                    } if *sample_ts >= (w2_start as u64) * 256
+                )
+            })
+            .collect();
+        assert!(
+            !final_word_chars.is_empty(),
+            "no characters keyed inside the final word's range"
+        );
+        for e in final_word_chars {
+            if let DecoderEvent::CharDecoded { sample_ts, .. } = e {
+                let idx = (*sample_ts / 256) as usize;
+                assert!(
+                    idx >= w2_start && idx < w2_end,
+                    "final-word char at ts {sample_ts} (idx {idx}) keyed outside word 2 \
+                     [{w2_start}, {w2_end})"
+                );
+                assert!(
+                    env[idx] > 0.5,
+                    "final-word char keyed at a space hop (idx {idx}, amp {})",
+                    env[idx]
+                );
+            }
+        }
+
+        // A second finish() must not repeat any character or word event.
+        let again = dec.finish();
+        assert!(
+            !again.iter().any(|e| matches!(
+                e,
+                DecoderEvent::CharDecoded { .. } | DecoderEvent::WordBoundary { .. }
+            )),
+            "second finish() repeated decode events: {again:?}"
+        );
+
+        // The streaming run must equal a reference run of the SAME
+        // incremental Evidence/HSMM schedule (two fresh decoders, events
+        // serialized): guards that the shared per-hop sequence stays
+        // deterministic under the h+1 release latency.
+        let (events_ref, _) = run();
+        assert_eq!(
+            serde_json::to_string(&events).unwrap(),
+            serde_json::to_string(&events_ref).unwrap()
+        );
+        assert_eq!(events_to_text(&events_ref), "CQ DE W5AU");
+    }
+
+    /// MAN-190: `EdgeLegacy` shares the Evidence front end, so it shares
+    /// the one-hop-later release too. A scene ending shortly after its
+    /// final mark -- whose final evidence hops are only released by
+    /// `finish()`'s terminal pending path -- must still decode fully.
+    #[test]
+    fn edge_legacy_tolerates_the_one_hop_evidence_release_delay() {
+        let lo = 10f32.powf(-40.0 / 20.0);
+        let mut env = vec![lo; 4];
+        let mut keyed = rect_envelope_depth("PARIS", 13, 40.0);
+        // Keep only ~4 dits of the auto-appended tail (still enough gap
+        // for EdgeDemod to close the final element): the last real
+        // evidence hops are released only by the terminal pending path.
+        let keep = keyed.len() - 50;
+        keyed.truncate(keep);
+        env.extend(keyed);
+        assert_eq!(decode_with(Engine::EdgeLegacy, &env), "PARIS");
+    }
+
+    #[test]
+    fn hsmm_commits_within_lookahead() {
+        // After "E" and a long silence, the E must be committed before 25 dits of silence pass.
+        let mut env = rect_envelope_depth("E", 13, 40.0);
+        env.truncate(13 + 4); // the dit plus 4 hops of space
+        env.extend(std::iter::repeat_n(0.01, 13 * 40));
+        let cfg = DecodeConfig {
+            engine: Engine::Hsmm,
+            ..Default::default()
+        };
+        let mut dec = TrackDecoder::new(1, cfg);
+        let mut first_char_hop = None;
+        let mut char_decoded_count = 0u32;
+        for (i, &a) in env.iter().enumerate() {
+            for e in dec.push_envelope(a, i as u64 * 256) {
+                if matches!(e, DecoderEvent::CharDecoded { .. }) {
+                    char_decoded_count += 1;
+                    if first_char_hop.is_none() {
+                        first_char_hop = Some(i);
+                    }
+                }
+            }
+        }
+        let h = first_char_hop.expect("E was never committed");
+        assert!(h < 13 + 13 * 25 + 60, "committed at hop {h}");
+        // [Task 8 fix, review round 2] Bug 2's stale-anchor re-derivation
+        // duplicated this exact commit six-fold before the `(sample_ts,
+        // glyph)` seal fix -- this test originally only checked the FIRST
+        // commit hop, so that regression would have sailed straight past
+        // it. Pin the count too.
+        assert_eq!(
+            char_decoded_count, 1,
+            "E must be committed exactly once, not duplicated by a stale anchor"
+        );
+    }
+
+    #[test]
+    fn hsmm_does_not_duplicate_commits_across_anchor_eviction() {
+        use crate::tree::Glyph;
+        // [Task 8 fix, review round 4] "K" at 13 hops/dit, then ~120 dits
+        // of silence: long enough for the anchor that stamped K's hist
+        // entry to age out of `reach_sil` while a newer, still-live
+        // anchor's frozen token carries the inherited entry -- the exact
+        // window round 3's anchor-history-only prune bound (removed by
+        // MAN-189) could (non-structurally) fail to cover.
+        let lo = 10f32.powf(-40.0 / 20.0);
+        let mut env = vec![lo; 4];
+        env.extend(rect_envelope_depth("K", 13, 40.0));
+        env.extend(std::iter::repeat_n(0.01f32, 13 * 120));
+        let cfg = DecodeConfig {
+            engine: Engine::Hsmm,
+            ..Default::default()
+        };
+        let mut dec = TrackDecoder::new(1, cfg);
+        let mut seen: Vec<(u64, Glyph)> = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            for e in dec.push_envelope(a, i as u64 * 256) {
+                if let DecoderEvent::CharDecoded {
+                    sample_ts, glyph, ..
+                } = e
+                {
+                    assert!(
+                        !seen.contains(&(sample_ts, glyph)),
+                        "duplicate commit {glyph:?}@{sample_ts} (seen {} so far)",
+                        seen.len()
+                    );
+                    seen.push((sample_ts, glyph));
+                }
+            }
+        }
+        assert!(
+            seen.iter().any(|(_, g)| *g == Glyph::Char('K')),
+            "K never decoded: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn hsmm_is_bit_deterministic() {
+        let env = rect_envelope_depth("CQ TEST W5AU", 13, 40.0);
+        let run = || {
+            let cfg = DecodeConfig {
+                engine: Engine::Hsmm,
+                ..Default::default()
+            };
+            let mut dec = TrackDecoder::new(1, cfg);
+            let mut ev = Vec::new();
+            for (i, &a) in env.iter().enumerate() {
+                ev.extend(dec.push_envelope(a, i as u64 * 256));
+            }
+            ev.extend(dec.finish());
+            serde_json::to_string(&ev).unwrap()
+        };
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn hsmm_confidence_and_alternatives_are_populated() {
+        // Same cold-start lead-in as `hsmm_decodes_clean_text_at_three_speeds`
+        // above (see its comment): without it the misdecoded first "C"
+        // pulls the mean confidence below the 0.6 clean-text bar.
+        let lo = 10f32.powf(-40.0 / 20.0);
+        let mut env = vec![lo; 4];
+        env.extend(rect_envelope_depth("CQ TEST W5AU", 13, 40.0));
+        let cfg = DecodeConfig {
+            engine: Engine::Hsmm,
+            ..Default::default()
+        };
+        let mut dec = TrackDecoder::new(1, cfg);
+        let mut ev = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            ev.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        ev.extend(dec.finish());
+        let confs: Vec<f32> = ev
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::CharDecoded { confidence, .. } => Some(*confidence),
+                _ => None,
+            })
+            .collect();
+        assert!(!confs.is_empty() && confs.iter().all(|c| *c > 0.0 && *c <= 1.0));
+        assert!(
+            confs.iter().sum::<f32>() / confs.len() as f32 > 0.6,
+            "clean text should be confident: {confs:?}"
+        );
+    }
+
+    #[test]
+    fn hsmm_no_spurious_speed_update_on_reseed() {
+        // [Task 8 fix, review round 2] `HsmmDecoder::push` resets `self.live`
+        // to a completely fresh, unscored seed set on every keying re-onset
+        // (present rising edge). Before the `best_u` fix, `push_hop_hsmm`'s
+        // `if let Some(u) = self.hsmm.best_u()` read `live.first()` on
+        // literally every such hop -- including however many hops it takes
+        // before any seed has processed real evidence -- returning
+        // `cfg.seed_units_hops[0]` (9.0 hops), i.e. EXACTLY 450.0/9.0 = 50.0
+        // WPM (an exact float division of two exact constants, so this is a
+        // precise, reproducible signature: `self.live.first()` right after
+        // a reseed is always the FIRST seed in definition order, never a
+        // different one, until candidate generation actually runs). This
+        // scene has TWO words ("E" and "E"), so the second word's mark
+        // onset re-triggers the reseed path after a real, multi-dit
+        // inter-word gap.
+        //
+        // [Verification note] `hsmm::tests::best_u_ignores_unscored_seeds`
+        // is the precise, deterministic regression test for the underlying
+        // mechanism (constructing the exact reseed state directly). This
+        // E2E test intentionally does NOT additionally assert a tight WPM
+        // band across every `SpeedUpdate`: I verified by hand that even
+        // with this fix, several seeds legitimately produce transient,
+        // widely-varying `SpeedUpdate`s while multiple speed hypotheses
+        // compete during a cold start (e.g. `HsmmDecoder::best_u`'s
+        // `hsmm_speed_converges_from_seeds` sibling test already only
+        // checks the LAST `SpeedUpdate` for exactly this reason) --
+        // including some that legitimately land exactly on another seed's
+        // own raw WPM (e.g. 25.0 = 450/18) via a non-speed-updating segment
+        // (SPEC v2 §4.3: `WGap`/`Silence` don't call `speed_alpha`), which
+        // is a real, scored token, not the zero-evidence bug. Asserting a
+        // blanket plausible-WPM range would either be too loose to catch
+        // anything or too strict and flag that legitimate noise; asserting
+        // "never exactly 50.0" is the one check that is both precise to
+        // this specific, fixed bug and free of that false-positive risk.
+        let lo = 10f32.powf(-40.0 / 20.0);
+        let mut env = vec![lo; 4];
+        env.extend(rect_envelope_depth("E E", 13, 40.0));
+        let cfg = DecodeConfig {
+            engine: Engine::Hsmm,
+            ..Default::default()
+        };
+        let mut dec = TrackDecoder::new(1, cfg);
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        for e in &events {
+            if let DecoderEvent::SpeedUpdate { wpm, .. } = e {
+                assert!(
+                    (wpm - 50.0).abs() > 1e-3,
+                    "SpeedUpdate reports exactly the raw, zero-evidence seed's WPM \
+                     (450/9.0 = 50.0) -- unscored-seed reseed artifact: {events:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hsmm_alternatives_populated_on_beam_disagreement() {
+        // [Task 8 fix, review round 2] `hsmm_confidence_and_alternatives_are_populated`
+        // only ever exercises a clean 40 dB scene where the beam always
+        // agrees, so `commit::margin`'s alternative-extraction/dedup/
+        // ordering/`.take(2)` logic (SPEC v2 §4.9, the actual point of this
+        // task) had zero coverage. This scene hand-crafts one 20-hop mark:
+        // with the default seed set `[9, 13, 18, 26, 38]` hops, a 20-hop
+        // mark is simultaneously a valid Dah for the u=9 seed (range
+        // [16.2, 40.5]) and a valid Dit for the u=18/26 seeds (ranges
+        // [10.8, 27] / [15.6, 39]) -- genuine, simultaneous disagreement
+        // over the element itself (not just speed), each side surviving
+        // merge under a different node/rounded-u key, so the eventual
+        // commit for this character must carry the losing interpretation(s)
+        // as `alternatives`.
+        let lo = 10f32.powf(-40.0 / 20.0);
+        let mut env = vec![lo; 4];
+        env.extend(std::iter::repeat_n(1.0, 20)); // the ambiguous mark
+        env.extend(std::iter::repeat_n(lo, 800)); // long trailing silence forces a decision
+        let cfg = DecodeConfig {
+            engine: Engine::Hsmm,
+            ..Default::default()
+        };
+        let mut dec = TrackDecoder::new(1, cfg);
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        let alt_lists: Vec<&Vec<(crate::tree::Glyph, f32)>> = events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::CharDecoded { alternatives, .. } => Some(alternatives),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !alt_lists.is_empty(),
+            "expected at least one CharDecoded event: {events:?}"
+        );
+        assert!(
+            alt_lists.iter().any(|a| !a.is_empty()),
+            "expected genuine beam disagreement to populate at least one \
+             CharDecoded's alternatives: {events:?}"
+        );
+        for a in &alt_lists {
+            assert!(
+                a.len() <= 2,
+                "alternatives must carry at most 2 entries: {a:?}"
+            );
+        }
     }
 
     #[test]
@@ -478,7 +2315,343 @@ mod tests {
         assert_eq!(events_to_text(&events), "TTTTT");
     }
 
+<<<<<<< HEAD
     fn decode_env(env: &[f32], mut dec: TrackDecoder) -> Vec<DecoderEvent> {
+=======
+    /// A 1.6 s pause inside the first five long gaps (a run station
+    /// listening between calls) must not merge the words that follow.
+    /// Guards against `check_flush` observing a flushed pause's closed
+    /// length (~33 dits) instead of the flush threshold: that lifts the
+    /// long-gap boundary above the 7-dit word gap, and this decodes as
+    /// "W1AW W1AWTESTW1AWTEST".
+    #[test]
+    fn legacy_early_pause_does_not_merge_later_words() {
+        let mut env = rect_envelope("W1AW", 18);
+        // rect_envelope's 8-dit (144-hop) tail + 456 hops = 600 hops = 1.6 s.
+        env.extend(std::iter::repeat_n(0.0, 456));
+        env.extend(rect_envelope("W1AW TEST W1AW TEST", 18));
+        assert_eq!(
+            decode_with(Engine::Legacy, &env),
+            "W1AW W1AW TEST W1AW TEST"
+        );
+    }
+
+    /// MAN-264: one-character words at ordinary spacing, two of them
+    /// followed by a 1.6 s pause, fill the rebuild window with
+    /// `[8, 8, 33, 33, 8]` dits. That split passes
+    /// `GapClassifier::reinit_from_flushed`'s check, so the word gaps
+    /// became the character cluster and every later word merged
+    /// ("W1AW R R R R R W1AWTESTW1AWTESTCQDEW1AWK"), from a warm start
+    /// and from a cold one.
+    #[test]
+    fn legacy_pauses_after_one_char_words_do_not_merge_later_words() {
+        // rect_envelope("R") ends in an 8-dit tail: concatenated, 8-dit
+        // word gaps that the 7-dit flush closes. 144 + 456 hops = 1.6 s.
+        let tail = "W1AW TEST W1AW TEST CQ DE W1AW K";
+        let mut env = rect_envelope("W1AW", 18);
+        for pause in [0, 0, 456, 456, 0] {
+            env.extend(rect_envelope("R", 18));
+            env.extend(std::iter::repeat_n(0.0, pause));
+        }
+        env.extend(rect_envelope(tail, 18));
+        assert_eq!(
+            decode_with(Engine::Legacy, &env),
+            format!("W1AW R R R R R {tail}")
+        );
+
+        let mut env = Vec::new();
+        for pause in [0, 0, 456, 456, 0, 0, 0] {
+            env.extend(rect_envelope("H", 18));
+            env.extend(std::iter::repeat_n(0.0, pause));
+        }
+        env.extend(rect_envelope(tail, 18));
+        let out = decode_with(Engine::Legacy, &env);
+        assert!(out.ends_with(tail), "{out:?}");
+    }
+
+    /// MAN-264: five more one-character words after the false rebuild
+    /// above. The rebuilt pair lifts the flush threshold to ~23 dits, so
+    /// their 8-dit word gaps reach `classify`. Counted as confirmations,
+    /// they locked the false rebuild in before the first ordinary
+    /// character gap, and every later word merged
+    /// ("…RRRRRW1AWTESTW1AWTESTCQDEW1AWK"), from a warm start and from a
+    /// cold one. So did a ~0.9 s pause (19 dits) after each of them.
+    #[test]
+    fn legacy_one_char_words_after_a_false_rebuild_do_not_confirm_it() {
+        let tail = "W1AW TEST W1AW TEST CQ DE W1AW K";
+        for extra_pause in [0, 200] {
+            let mut env = rect_envelope("W1AW", 18);
+            for pause in [0, 0, 456, 456, 0] {
+                env.extend(rect_envelope("R", 18));
+                env.extend(std::iter::repeat_n(0.0, pause));
+            }
+            for _ in 0..5 {
+                env.extend(rect_envelope("R", 18));
+                env.extend(std::iter::repeat_n(0.0, extra_pause));
+            }
+            env.extend(rect_envelope(tail, 18));
+            let out = decode_with(Engine::Legacy, &env);
+            assert!(out.ends_with(tail), "{extra_pause}: {out:?}");
+        }
+
+        let mut env = Vec::new();
+        for pause in [0, 0, 456, 456, 0, 0, 0, 0, 0, 0, 0] {
+            env.extend(rect_envelope("H", 18));
+            env.extend(std::iter::repeat_n(0.0, pause));
+        }
+        env.extend(rect_envelope(tail, 18));
+        let out = decode_with(Engine::Legacy, &env);
+        assert!(out.ends_with(tail), "{out:?}");
+    }
+
+    /// MAN-264 (Codex review, PR #217): a garble is no decoded character.
+    /// After the false rebuild above, a 10-dit gap sits between the
+    /// disproof bound and the rebuilt boundary, so it classifies `InterChar`
+    /// without discarding the rebuild. Five words of one decoded character,
+    /// that gap, and a garble (eight dahs, which `decode_char` rejects) must
+    /// not confirm the rebuild as two-character words, or every later word
+    /// merges.
+    #[test]
+    fn legacy_words_padded_with_garbles_do_not_confirm_a_false_rebuild() {
+        let tail = "W1AW TEST W1AW TEST CQ DE W1AW K";
+        let mut env = rect_envelope("W1AW", 18);
+        for pause in [0, 0, 456, 456, 0] {
+            env.extend(rect_envelope("R", 18));
+            env.extend(std::iter::repeat_n(0.0, pause));
+        }
+        let r_marks = rect_envelope("R", 18).len() - 8 * 18;
+        for _ in 0..5 {
+            env.extend(rect_envelope("R", 18).into_iter().take(r_marks));
+            env.extend(std::iter::repeat_n(0.0, 10 * 18));
+            for i in 0..8 {
+                if i > 0 {
+                    env.extend(std::iter::repeat_n(0.0, 18));
+                }
+                env.extend(std::iter::repeat_n(1.0, 3 * 18));
+            }
+            env.extend(std::iter::repeat_n(0.0, 30 * 18));
+        }
+        env.extend(rect_envelope(tail, 18));
+        let out = decode_with(Engine::Legacy, &env);
+        assert!(out.ends_with(tail), "{out:?}");
+    }
+
+    /// `rect_envelope` with Farnsworth spacing: characters keyed at
+    /// `char_wpm`, inter-character and word gaps stretched to the ARRL
+    /// Farnsworth timing for `eff_wpm`.
+    fn farnsworth_envelope(text: &str, char_wpm: f32, eff_wpm: f32) -> Vec<f32> {
+        let hops = |ms: f32| (ms / HOP_MS as f32).round() as u32;
+        let dit = hops(1200.0 / char_wpm);
+        let t_a = (60.0 * char_wpm - 37.2 * eff_wpm) / (eff_wpm * char_wpm);
+        let (cgap, wgap) = (hops(3000.0 * t_a / 19.0), hops(7000.0 * t_a / 19.0));
+        let mut env = Vec::new();
+        for (wi, word) in text.split_whitespace().enumerate() {
+            if wi > 0 {
+                env.extend(std::iter::repeat_n(0.0, wgap as usize));
+            }
+            for (ci, c) in word.chars().enumerate() {
+                if ci > 0 {
+                    env.extend(std::iter::repeat_n(0.0, cgap as usize));
+                }
+                for (ei, e) in pattern_for(c).unwrap().chars().enumerate() {
+                    if ei > 0 {
+                        env.extend(std::iter::repeat_n(0.0, dit as usize));
+                    }
+                    let n = if e == '.' { dit } else { 3 * dit };
+                    env.extend(std::iter::repeat_n(1.0, n as usize));
+                }
+            }
+        }
+        env.extend(std::iter::repeat_n(0.0, wgap as usize));
+        env
+    }
+
+    /// Heavy Farnsworth spacing (W1AW slow code practice keys 18 WPM
+    /// characters at 5-13 WPM): the character gap alone outruns the 7-dit
+    /// safety-net flush, so `observe_flushed` saw character and word gaps
+    /// alike as ~7 dits and the Legacy chain decoded every character as its
+    /// own word for the whole transmission ("C Q C Q D E G 4 X X X ...").
+    /// The long-gap statistics must rebuild from the flushed gaps' closed
+    /// lengths and decode every repeat after the first exactly.
+    #[test]
+    fn legacy_bootstraps_heavy_farnsworth() {
+        let rep = "CQ CQ DE G4XXX G4XXX K";
+        let text = [rep; 8].join(" ");
+        let settled = [rep; 7].join(" ");
+        for (char_wpm, eff_wpm) in [(18.0, 5.0), (20.0, 8.0), (25.0, 10.0), (30.0, 12.0)] {
+            let out = decode_with(
+                Engine::Legacy,
+                &farnsworth_envelope(&text, char_wpm, eff_wpm),
+            );
+            assert!(
+                out.ends_with(&format!(" {settled}")),
+                "{char_wpm}/{eff_wpm} WPM decoded {out:?}"
+            );
+        }
+    }
+
+    /// MAN-264: a fade that drops a dit inside a character, after the
+    /// heavy-Farnsworth rebuild has stood a while, leaves an ordinary
+    /// 3-dit gap. It must split only that character ("4" as "IA"), not
+    /// reset the long-gap statistics and decode the characters after it
+    /// as separate words ("GIA X X X G 4 X X X K").
+    #[test]
+    fn legacy_heavy_farnsworth_survives_a_dropped_dit() {
+        let rep = "CQ CQ DE G4XXX G4XXX K";
+        let mut damaged = farnsworth_envelope(rep, 18.0, 5.0);
+        let starts: Vec<usize> = (0..damaged.len())
+            .filter(|&i| damaged[i] > 0.0 && (i == 0 || damaged[i - 1] == 0.0))
+            .collect();
+        // Mark 25 is the third dit of "4" (....-), after C Q C Q D E G's
+        // 23 marks and the 4's first two.
+        let dit = (1200.0 / 18.0 / HOP_MS as f32).round() as usize;
+        damaged[starts[25]..starts[25] + dit].fill(0.0);
+        let mut env = farnsworth_envelope(&[rep; 4].join(" "), 18.0, 5.0);
+        env.extend(damaged);
+        env.extend(farnsworth_envelope(&[rep; 3].join(" "), 18.0, 5.0));
+        let out = decode_with(Engine::Legacy, &env);
+        let expected = format!(" {rep} CQ CQ DE GIAXXX G4XXX K {}", [rep; 3].join(" "));
+        assert!(out.ends_with(&expected), "{out:?}");
+    }
+
+    /// MAN-264: with `[decode] flush_gap_dits` below 5, a genuine
+    /// Farnsworth character gap between the two outruns the flush and
+    /// helps rebuild the pair, so it must not discard the rebuild as an
+    /// ordinary character gap would. At 3.5 dits, ~4.9-dit character gaps
+    /// undid two rebuilds and the second repeat decoded
+    /// "C Q CQ D E G 4 X X X G4XXX K".
+    #[test]
+    fn legacy_low_flush_keeps_a_genuine_rebuild() {
+        let rep = "CQ CQ DE G4XXX G4XXX K";
+        let text = [rep; 8].join(" ");
+        let settled = [rep; 7].join(" ");
+        for char_wpm in [15.0, 18.0, 20.0, 22.0] {
+            let eff_wpm = 0.82 * char_wpm;
+            let cfg = DecodeConfig {
+                flush_gap_dits: 3.5,
+                ..Default::default()
+            };
+            let mut dec = TrackDecoder::new(1, cfg);
+            let mut events = Vec::new();
+            let env = farnsworth_envelope(&text, char_wpm, eff_wpm);
+            for (i, &a) in env.iter().enumerate() {
+                events.extend(dec.push_envelope(a, i as u64 * 256));
+            }
+            events.extend(dec.finish());
+            let out = events_to_text(&events);
+            assert!(
+                out.ends_with(&format!(" {settled}")),
+                "{char_wpm}/{eff_wpm} WPM decoded {out:?}"
+            );
+        }
+    }
+
+    /// MAN-264: with `[decode] flush_gap_dits` below 5, the flush closes a
+    /// Farnsworth word gap at `flush_gap_dits * boundary / 5` dits, below
+    /// the rebuilt boundary. Those flushed word gaps must still confirm
+    /// the rebuild, so a dit dropped by a fade splits only its own
+    /// character. Measured at 3.5 dits, they confirmed nothing, and the
+    /// 3-dit gap reset the rebuild.
+    #[test]
+    fn legacy_low_flush_heavy_farnsworth_survives_a_dropped_dit() {
+        let rep = "CQ CQ DE G4XXX G4XXX K";
+        for char_wpm in [15.0, 18.0, 20.0, 22.0] {
+            let eff_wpm = 0.82 * char_wpm;
+            let mut damaged = farnsworth_envelope(rep, char_wpm, eff_wpm);
+            let starts: Vec<usize> = (0..damaged.len())
+                .filter(|&i| damaged[i] > 0.0 && (i == 0 || damaged[i - 1] == 0.0))
+                .collect();
+            // Mark 25 is the third dit of "4", as in
+            // `legacy_heavy_farnsworth_survives_a_dropped_dit`.
+            let dit = (1200.0 / char_wpm / HOP_MS as f32).round() as usize;
+            damaged[starts[25]..starts[25] + dit].fill(0.0);
+            let mut env = farnsworth_envelope(&[rep; 4].join(" "), char_wpm, eff_wpm);
+            env.extend(damaged);
+            env.extend(farnsworth_envelope(&[rep; 3].join(" "), char_wpm, eff_wpm));
+            let cfg = DecodeConfig {
+                flush_gap_dits: 3.5,
+                ..Default::default()
+            };
+            let mut dec = TrackDecoder::new(1, cfg);
+            let mut events = Vec::new();
+            for (i, &a) in env.iter().enumerate() {
+                events.extend(dec.push_envelope(a, i as u64 * 256));
+            }
+            events.extend(dec.finish());
+            let out = events_to_text(&events);
+            let expected = format!(" {rep} CQ CQ DE GIAXXX G4XXX K {}", [rep; 3].join(" "));
+            assert!(
+                out.ends_with(&expected),
+                "{char_wpm}/{eff_wpm} WPM decoded {out:?}"
+            );
+        }
+    }
+
+    /// MAN-213 Scenario 1: the Legacy chain's character stream stays exact
+    /// through a mid-text fade -- abrupt (-6 / -9 dB inside a word gap),
+    /// gradual (-6 dB ramp) and periodic QSB (10 dB peak-to-trough, 2 s).
+    #[test]
+    fn legacy_decodes_through_a_mid_text_fade() {
+        let text = "CQ CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K";
+        let base = rect_envelope_depth(text, 22, 30.0);
+        let n = base.len();
+        let lo = 10f32.powf(-30.0 / 20.0);
+        let profiles: [(&str, &dyn Fn(usize) -> f32); 4] = [
+            ("step -6 dB", &|i| if i < n / 3 { 1.0 } else { 0.5 }),
+            ("step -9 dB", &|i| if i < n / 3 { 1.0 } else { 0.355 }),
+            ("ramp -6 dB", &|i| {
+                1.0 - 0.5 * ((i as f32 / n as f32 - 0.3).clamp(0.0, 0.2) / 0.2)
+            }),
+            ("QSB 10 dB / 2 s", &|i| {
+                let t = i as f32 / 375.0;
+                0.658 + 0.342 * (std::f32::consts::PI * t).cos()
+            }),
+        ];
+        for (name, gain) in profiles {
+            let env: Vec<f32> = base
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| lo + (v - lo) * gain(i))
+                .collect();
+            assert_eq!(decode_with(Engine::Legacy, &env), text, "{name}");
+        }
+    }
+
+    /// `rect_envelope` with a `dash`-dit dash, `cgap`-dit character gap and
+    /// `wgap`-dit word gap (MAN-315).
+    fn weighted_envelope(text: &str, dit_hops: u32, dash: f32, cgap: f32, wgap: f32) -> Vec<f32> {
+        let n = |dits: f32| (dits * dit_hops as f32).round() as usize;
+        let mut env = Vec::new();
+        for (wi, word) in text.split_whitespace().enumerate() {
+            if wi > 0 {
+                env.extend(std::iter::repeat_n(0.0, n(wgap)));
+            }
+            for (ci, c) in word.chars().enumerate() {
+                if ci > 0 {
+                    env.extend(std::iter::repeat_n(0.0, n(cgap)));
+                }
+                for (ei, e) in pattern_for(c).unwrap().chars().enumerate() {
+                    if ei > 0 {
+                        env.extend(std::iter::repeat_n(0.0, dit_hops as usize));
+                    }
+                    let len = if e == '.' { dit_hops as usize } else { n(dash) };
+                    env.extend(std::iter::repeat_n(1.0, len));
+                }
+            }
+        }
+        env.extend(std::iter::repeat_n(0.0, n(wgap.max(8.0)) + 450));
+        env
+    }
+
+    fn decode_events(engine: Engine, env: &[f32]) -> Vec<DecoderEvent> {
+        let mut dec = TrackDecoder::new(
+            1,
+            DecodeConfig {
+                engine,
+                ..Default::default()
+            },
+        );
+>>>>>>> 35deb42de4260c19220c0fec9cd847f70bf93828
         let mut events = Vec::new();
         for (i, &a) in env.iter().enumerate() {
             events.extend(dec.push_envelope(a, i as u64 * 256));
@@ -487,6 +2660,7 @@ mod tests {
         events
     }
 
+<<<<<<< HEAD
     /// MAN-5's shape: a decoder joining mid-mark sees a truncated tail as
     /// its first run, and the next 4 marks are all dahs ("MM", as in the
     /// ticket's "GAMMAFOX" scene). 7 hops (just over the 5-hop debounce) of
@@ -550,5 +2724,199 @@ mod tests {
         );
         assert_eq!(events_to_text(&mid_signal), "CQ CQ DE W1AW");
         assert_eq!(mid_signal, from_start);
+=======
+    fn last_timing(events: &[DecoderEvent]) -> Option<&crate::timing::TimingEstimates> {
+        events.iter().rev().find_map(|e| match e {
+            DecoderEvent::TimingUpdate { timing, .. } => Some(timing),
+            _ => None,
+        })
+    }
+
+    /// MAN-315 D7: a drift re-init drops the sender timing learned in the
+    /// old scale. Only dits follow the speed step, so a reset leaves the
+    /// dash class empty.
+    #[test]
+    fn sender_timing_reset_on_drift_reinit() {
+        let mut env = rect_envelope("PARIS PARIS", 22);
+        env.extend(rect_envelope(&["E"; 30].join(" "), 12));
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut dashes_before_step = 0;
+        let step_at = rect_envelope("PARIS PARIS", 22).len();
+        for (i, &a) in env.iter().enumerate() {
+            dec.push_envelope(a, i as u64 * 256);
+            if i + 1 == step_at {
+                dashes_before_step = dec.sender.count(TimingClass::Dash);
+            }
+        }
+        assert!(dashes_before_step > 0);
+        assert!(dec.tracker.regime() >= 1, "no drift re-init");
+        assert_eq!(dec.sender_regime, dec.tracker.regime());
+        assert_eq!(dec.sender.count(TimingClass::Dash), 0);
+        assert!(dec.sender.count(TimingClass::Dot) > 0);
+    }
+
+    /// MAN-315 (measured on the RF heavy-dash scene): a 13 ms noise
+    /// fragment seeds the dit cluster, real dits join the dash cluster and
+    /// decode as dashes. With the 6.0 ratio ceiling (D5) the tracker heals
+    /// within the first callsigns instead of never (dit stuck at 20 ms).
+    #[test]
+    fn noise_seeded_scale_recovers_within_three_callsigns() {
+        let mut runs = Vec::new();
+        let mut ts = 0u64;
+        let mut push = |mark: bool, hops: u32| {
+            runs.push(Run {
+                mark,
+                start_ts: ts,
+                hops,
+            });
+            ts += hops as u64 * 256;
+        };
+        // [13, 51, 51, 53, 45] ms, then a word gap.
+        for (i, h) in [5u32, 19, 19, 20, 17].into_iter().enumerate() {
+            if i > 0 {
+                push(false, 18);
+            }
+            push(true, h);
+        }
+        let calls = 8;
+        for _ in 0..calls {
+            push(false, 126);
+            for (ci, c) in "K1ABC".chars().enumerate() {
+                if ci > 0 {
+                    push(false, 54);
+                }
+                for (ei, e) in pattern_for(c).unwrap().chars().enumerate() {
+                    if ei > 0 {
+                        push(false, 18);
+                    }
+                    push(true, if e == '.' { 18 } else { 72 });
+                }
+            }
+        }
+        push(false, 126);
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for r in runs {
+            dec.on_run(r, &mut events);
+        }
+        events.extend(dec.finish());
+        let text = events_to_text(&events);
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let first = words
+            .iter()
+            .position(|w| *w == "K1ABC")
+            .unwrap_or_else(|| panic!("no K1ABC in {text:?}"));
+        let after = &words[first..];
+        assert!(
+            after.iter().all(|w| *w == "K1ABC"),
+            "text after the first K1ABC is not exact: {text:?}"
+        );
+        // Measured: the 3rd callsign is the first exact one.
+        assert!(
+            after.len() >= calls - 2,
+            "first K1ABC is not within the first 3 callsigns: {text:?}"
+        );
+    }
+
+    /// MAN-315 D8 / scenario 3: the Legacy chain reports the sender's own
+    /// dash length.
+    #[test]
+    fn legacy_emits_timing_update_after_meta_tick() {
+        let text = ["CQ CQ DE K1ABC K1ABC K"; 3].join(" ");
+        let events = decode_events(Engine::Legacy, &weighted_envelope(&text, 18, 4.0, 3.0, 7.0));
+        assert_eq!(events_to_text(&events), text);
+        let updates: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, DecoderEvent::TimingUpdate { .. }))
+            .collect();
+        assert!(updates.len() >= 2, "{updates:?}");
+        let t = last_timing(&events).unwrap();
+        let dash = t.dash.unwrap().mean_dits;
+        assert!((3.6..=4.4).contains(&dash), "dash {dash} in {t:?}");
+        let dot = t.dot.unwrap().mean_dits;
+        assert!((0.8..=1.2).contains(&dot), "dot {dot}");
+        let cg = t.char_gap.unwrap().mean_dits;
+        assert!((2.6..=3.4).contains(&cg), "char gap {cg}");
+        assert!(t.element_gap.is_some() && t.word_gap.is_some(), "{t:?}");
+        assert!((t.dit_ms - 48.0).abs() < 5.0, "dit_ms {}", t.dit_ms);
+    }
+
+    /// MAN-315 review: the stream ends inside the trailing space, so its
+    /// cut-off length is not a word gap. An ideal 7-dit sender's learned
+    /// word gap stays at 7.0 with no spread (an 8-dit tail used to be
+    /// learned: mean 7.15, variance 0.13).
+    #[test]
+    fn trailing_space_at_finish_is_not_learned() {
+        let events = decode_events(Engine::Legacy, &rect_envelope("CQ CQ DE W1AW W1AW K", 18));
+        let wg = last_timing(&events).unwrap().word_gap.unwrap();
+        assert!((wg.mean_dits - 7.0).abs() < 0.1, "{wg:?}");
+        assert!(wg.var_dits2 < 0.01, "{wg:?}");
+    }
+
+    /// MAN-315 D2: a word gap the safety flush resolves still teaches the
+    /// sender's word gap when the next mark starts within the demod's
+    /// debounce window of the flush, so no separate remainder space run
+    /// closes it. 7.1-dit gaps cross the 7-dit flush 2 hops before the mark,
+    /// which absorbs that sub-debounce remainder.
+    #[test]
+    fn flushed_word_gap_closed_by_the_next_mark_is_learned() {
+        let env = weighted_envelope("CQ TEST W1AW TEST DE", 18, 3.0, 3.0, 7.1);
+        let events = decode_events(Engine::Legacy, &env);
+        assert_eq!(events_to_text(&events), "CQ TEST W1AW TEST DE");
+        let wg = last_timing(&events)
+            .unwrap()
+            .word_gap
+            .expect("no word gap learned");
+        assert_eq!(wg.n, 4, "{wg:?}");
+        assert!((wg.mean_dits - 7.1).abs() < 0.3, "{wg:?}");
+    }
+
+    /// MAN-315 D8 (Codex, PR #273): a drift re-init after a reported
+    /// `TimingUpdate` is itself reported, once, with the wiped classes
+    /// `null`, even when nothing new is observed before the track closes.
+    /// Two re-inits in a row still report it.
+    #[test]
+    fn timing_update_reports_a_drift_reset_with_no_new_observation() {
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        for (i, &a) in rect_envelope("PARIS PARIS", 22).iter().enumerate() {
+            dec.push_envelope(a, i as u64 * 256);
+        }
+        let mut events = Vec::new();
+        dec.emit_timing(&mut events);
+        assert_eq!(events.len(), 1, "no first TimingUpdate: {events:?}");
+        for _ in 0..2 {
+            dec.sender_regime = dec.tracker.regime().wrapping_add(1);
+            dec.sync_sender_regime();
+        }
+        assert_eq!(dec.sender.total_count(), 0);
+        let mut events = Vec::new();
+        dec.emit_timing(&mut events);
+        let [DecoderEvent::TimingUpdate { timing, .. }] = events.as_slice() else {
+            panic!("the reset was not reported: {events:?}");
+        };
+        assert!(
+            timing.dot.is_none()
+                && timing.dash.is_none()
+                && timing.element_gap.is_none()
+                && timing.char_gap.is_none()
+                && timing.word_gap.is_none(),
+            "{timing:?}"
+        );
+        let mut events = Vec::new();
+        dec.emit_timing(&mut events);
+        assert!(
+            events.is_empty(),
+            "the reset was reported twice: {events:?}"
+        );
+    }
+
+    #[test]
+    fn hsmm_emits_no_timing_update() {
+        let events = decode_events(Engine::Hsmm, &rect_envelope("CQ CQ DE W1AW W1AW K", 18));
+        assert!(!events_to_text(&events).is_empty());
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, DecoderEvent::TimingUpdate { .. })));
+>>>>>>> 35deb42de4260c19220c0fec9cd847f70bf93828
     }
 }

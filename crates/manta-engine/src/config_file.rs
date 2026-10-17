@@ -1,0 +1,409 @@
+//! TOML deserialization for the `[detector]` config table (SPEC §9), MAN-261.
+//! Mirrors `manta-decode`'s `config_file.rs` for `[decode]`.
+//!
+//! `manta-server`'s `DaemonConfigFile` does not model `[detector]`, for the
+//! same reason it skips `[decode]`: it has no dependency on this crate.
+//! Consumers that act on `[detector]` (`manta-cli`, when `--config` is
+//! given) deserialize the table into `DetectorConfigToml` and call
+//! `into_detector_config`. This lives in `manta-engine`, not `manta-cli`,
+//! so every absent key falls back to the real `DetectorConfig::default()`
+//! this crate owns, rather than a hand-copied set of constants downstream
+//! that could drift from it. That matters here more than for `[decode]`:
+//! the default `on_snr_db` is 12.0, a measured deviation from SPEC §9's
+//! literal 6.0 (see `DetectorConfig`'s `Default` impl), so a downstream copy
+//! of SPEC's table would be wrong on day one.
+//!
+//! Keys are SPEC §9's `on_snr_db`, `off_snr_db`, `confirm_ms`, `hang_ms`,
+//! `gc_ms` and `warmup_ms`, plus `track_cap` (ARCHITECTURE §4, configurable per §8) and
+//! `silent_respawn_cooldown_ms` (MAN-171), `rtty_filter` and
+//! `rtty_dwell_ms` (MAN-314, SPEC §2.6; the dwell must be at least one
+//! 1000 ms detector block), `crash_filter` (MAN-312, SPEC §2.7:
+//! `"full"`, `"starts-only"` or `"off"`), plus `non_cw_filter` and
+//! `unkeyed_close_ms` (MAN-313, SPEC §2.8; the timeout must be at least
+//! 1000 ms). Every key is an `Option`
+//! overlaid on `DetectorConfig::default()`, so an absent key keeps the exact
+//! default hop count instead of round-tripping it through milliseconds.
+//! Millisecond keys convert with `manta_decode::ms_to_hops`, SPEC §1.1's
+//! single normative rounding rule; SPEC's millisecond defaults
+//! (50/5000/30000/2000/30000) reproduce the hop defaults
+//! (19/1875/11250/750/11250) exactly.
+//!
+//! The bounds reject exactly the values the track manager treats as
+//! degenerate: `gc_hops = 0` closes every ACTIVE track immediately,
+//! `track_cap = 0` evicts every track, and `confirm_hops`/`hang_hops` are
+//! compared with `>=`, so 0 makes the window meaningless. `warmup_ms` and
+//! `silent_respawn_cooldown_ms` may be 0 (no warmup, no cooldown).
+//! `into_detector_config` builds `DetectorConfig` with an exhaustive struct
+//! literal (no `..DetectorConfig::default()`), so adding a field to
+//! `DetectorConfig` is a compile error here until it gets a key or an
+//! explicit decision not to have one.
+//!
+//! The constant-only SPEC §9 keys (`floor_quantile` and friends) are not
+//! fields here; `manta-cli` rejects them with a specific "not configurable
+//! yet" message before this struct ever sees them.
+
+use crate::track::{CrashFilter, DetectorConfig};
+use manta_decode::{ms_to_hops, HOP_MS};
+use serde::Deserialize;
+
+/// Upper bound for every `*_ms` key: one hour.
+const MAX_MS: f64 = 3_600_000.0;
+/// Upper bound for both dB keys.
+const MAX_SNR_DB: f64 = 100.0;
+
+/// The `[detector]` TOML table. Every key is optional; see the module doc
+/// for the key list, defaults and bounds.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetectorConfigToml {
+    pub on_snr_db: Option<f64>,
+    pub off_snr_db: Option<f64>,
+    pub confirm_ms: Option<f64>,
+    pub hang_ms: Option<f64>,
+    pub gc_ms: Option<f64>,
+    pub warmup_ms: Option<f64>,
+    pub track_cap: Option<usize>,
+    pub silent_respawn_cooldown_ms: Option<f64>,
+    /// MAN-312 (SPEC §2.7): `"full"`, `"starts-only"` or `"off"`.
+    pub crash_filter: Option<CrashFilter>,
+    pub rtty_filter: Option<bool>,
+    pub rtty_dwell_ms: Option<f64>,
+    pub non_cw_filter: Option<bool>,
+    pub unkeyed_close_ms: Option<f64>,
+}
+
+impl DetectorConfigToml {
+    /// Validates this table and overlays it on `DetectorConfig::default()`.
+    /// Every error names the offending key as `detector.<key>`.
+    pub fn into_detector_config(self) -> Result<DetectorConfig, String> {
+        let d = DetectorConfig::default();
+        let on_snr_db = db("on_snr_db", self.on_snr_db, d.on_snr_db)?;
+        let off_snr_db = db("off_snr_db", self.off_snr_db, d.off_snr_db)?;
+        if off_snr_db > on_snr_db {
+            return Err(format!(
+                "detector.off_snr_db ({off_snr_db}) must not exceed detector.on_snr_db ({on_snr_db})"
+            ));
+        }
+        Ok(DetectorConfig {
+            on_snr_db,
+            off_snr_db,
+            confirm_hops: hops("confirm_ms", self.confirm_ms, d.confirm_hops, true)?,
+            hang_hops: hops("hang_ms", self.hang_ms, d.hang_hops, true)?,
+            gc_hops: hops("gc_ms", self.gc_ms, d.gc_hops, true)?,
+            warmup_hops: hops("warmup_ms", self.warmup_ms, d.warmup_hops, false)?,
+            track_cap: track_cap(self.track_cap, d.track_cap)?,
+            silent_respawn_cooldown_hops: hops(
+                "silent_respawn_cooldown_ms",
+                self.silent_respawn_cooldown_ms,
+                d.silent_respawn_cooldown_hops,
+                false,
+            )?,
+            crash_filter: self.crash_filter.unwrap_or(d.crash_filter),
+            rtty_filter: self.rtty_filter.unwrap_or(d.rtty_filter),
+            rtty_dwell_hops: rtty_dwell(self.rtty_dwell_ms, d.rtty_dwell_hops)?,
+            non_cw_filter: self.non_cw_filter.unwrap_or(d.non_cw_filter),
+            unkeyed_close_hops: unkeyed_close(self.unkeyed_close_ms, d.unkeyed_close_hops)?,
+        })
+    }
+}
+
+/// MAN-314: `rtty_dwell_ms`, bounded like every `*_ms` key and at least
+/// one 1000 ms detector block (SPEC §2.6).
+fn rtty_dwell(value: Option<f64>, default: u64) -> Result<u64, String> {
+    let h = hops("rtty_dwell_ms", value, default, false)?;
+    if let Some(ms) = value {
+        if ms < 1000.0 {
+            return Err(format!(
+                "detector.rtty_dwell_ms = {ms} is shorter than one 1000 ms detector block; it must be at least 1000"
+            ));
+        }
+    }
+    Ok(h)
+}
+
+/// MAN-313: `unkeyed_close_ms`, bounded like every `*_ms` key and at
+/// least 1000 ms (SPEC §2.8): shorter would close a keyed track during an
+/// ordinary pause and give a new track too little time to show keying.
+fn unkeyed_close(value: Option<f64>, default: u64) -> Result<u64, String> {
+    let h = hops("unkeyed_close_ms", value, default, false)?;
+    if let Some(ms) = value {
+        if ms < 1000.0 {
+            return Err(format!(
+                "detector.unkeyed_close_ms = {ms} is shorter than 1000 ms; it must be at least 1000"
+            ));
+        }
+    }
+    Ok(h)
+}
+
+/// A dB key: finite and in `[0, 100]`, stored as `f32`.
+fn db(key: &str, value: Option<f64>, default: f32) -> Result<f32, String> {
+    let Some(v) = value else {
+        return Ok(default);
+    };
+    if !v.is_finite() || !(0.0..=MAX_SNR_DB).contains(&v) {
+        return Err(format!(
+            "detector.{key} must be finite and in [0, 100] dB, got {v}"
+        ));
+    }
+    Ok(v as f32)
+}
+
+/// A `*_ms` key: finite and in `[0, 3600000]`, converted to hops. When
+/// `at_least_one_hop` is set, a value that rounds to 0 hops is rejected.
+fn hops(
+    key: &str,
+    value: Option<f64>,
+    default: u64,
+    at_least_one_hop: bool,
+) -> Result<u64, String> {
+    let Some(ms) = value else {
+        return Ok(default);
+    };
+    if !ms.is_finite() || !(0.0..=MAX_MS).contains(&ms) {
+        return Err(format!(
+            "detector.{key} must be finite and in [0, 3600000] ms, got {ms}"
+        ));
+    }
+    let h = ms_to_hops(ms);
+    if at_least_one_hop && h == 0 {
+        return Err(format!(
+            "detector.{key} = {ms} rounds to 0 hops (1 hop = {HOP_MS:.3} ms); it must give at least 1 hop"
+        ));
+    }
+    Ok(u64::from(h))
+}
+
+/// `track_cap` must be at least 1: 0 evicts every track.
+fn track_cap(value: Option<usize>, default: usize) -> Result<usize, String> {
+    match value {
+        None => Ok(default),
+        Some(0) => {
+            Err("detector.track_cap must be at least 1 (0 evicts every track), got 0".into())
+        }
+        Some(n) => Ok(n),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(s: &str) -> Result<DetectorConfig, String> {
+        toml::from_str::<DetectorConfigToml>(s)
+            .map_err(|e| e.to_string())?
+            .into_detector_config()
+    }
+
+    fn err(s: &str) -> String {
+        match parse(s) {
+            Ok(cfg) => panic!("{s:?} should be rejected, got {cfg:?}"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn empty_table_is_the_default() {
+        assert_eq!(parse("").unwrap(), DetectorConfig::default());
+        assert_eq!(parse("").unwrap().crash_filter, CrashFilter::Full);
+    }
+
+    #[test]
+    fn crash_filter_values_parse() {
+        for (v, want) in [
+            ("full", CrashFilter::Full),
+            ("starts-only", CrashFilter::StartsOnly),
+            ("off", CrashFilter::Off),
+        ] {
+            let cfg = parse(&format!("crash_filter = \"{v}\"")).unwrap();
+            assert_eq!(cfg.crash_filter, want, "{v}");
+            assert_eq!(v.parse::<CrashFilter>(), Ok(want), "{v}");
+        }
+    }
+
+    #[test]
+    fn bad_crash_filter_is_rejected() {
+        let e = err("crash_filter = \"sometimes\"");
+        assert!(e.contains("sometimes"), "{e}");
+        assert!(e.contains("starts-only"), "{e}");
+        assert!("sometimes".parse::<CrashFilter>().is_err());
+    }
+
+    #[test]
+    fn spec_millisecond_defaults_reproduce_the_hop_defaults() {
+        let cfg = parse(
+            r#"
+            on_snr_db = 12.0
+            off_snr_db = 3.0
+            confirm_ms = 50.0
+            hang_ms = 5000.0
+            gc_ms = 30000.0
+            warmup_ms = 25.0
+            track_cap = 1200
+            silent_respawn_cooldown_ms = 30000.0
+            rtty_filter = true
+            rtty_dwell_ms = 20000.0
+            non_cw_filter = true
+            unkeyed_close_ms = 10000.0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg, DetectorConfig::default());
+        assert_eq!(cfg.confirm_hops, 19);
+        assert_eq!(cfg.hang_hops, 1875);
+        assert_eq!(cfg.gc_hops, 11250);
+        assert_eq!(cfg.warmup_hops, 9);
+        assert_eq!(cfg.silent_respawn_cooldown_hops, 11250);
+        assert_eq!(cfg.rtty_dwell_hops, 7500);
+        assert_eq!(cfg.unkeyed_close_hops, 3750);
+    }
+
+    #[test]
+    fn rtty_keys_default_to_on_and_20000_ms() {
+        let cfg = parse("").unwrap();
+        assert!(cfg.rtty_filter);
+        assert_eq!(cfg.rtty_dwell_hops, 7500);
+    }
+
+    #[test]
+    fn rtty_filter_false_is_accepted() {
+        let cfg = parse("rtty_filter = false").unwrap();
+        assert!(!cfg.rtty_filter);
+    }
+
+    #[test]
+    fn rtty_dwell_ms_below_one_block_is_rejected() {
+        assert_eq!(
+            err("rtty_dwell_ms = 500"),
+            "detector.rtty_dwell_ms = 500 is shorter than one 1000 ms detector block; it must be at least 1000"
+        );
+        assert!(err("rtty_dwell_ms = 1").contains("at least 1000"));
+    }
+
+    #[test]
+    fn rtty_dwell_ms_above_one_hour_is_rejected() {
+        let e = err("rtty_dwell_ms = 3600001");
+        assert!(e.contains("detector.rtty_dwell_ms"), "{e}");
+        assert!(e.contains("[0, 3600000]"), "{e}");
+    }
+
+    #[test]
+    fn non_cw_keys_default_to_on_and_10000_ms() {
+        let cfg = parse("").unwrap();
+        assert!(cfg.non_cw_filter);
+        assert_eq!(cfg.unkeyed_close_hops, 3750);
+    }
+
+    #[test]
+    fn non_cw_filter_false_is_accepted() {
+        let cfg = parse("non_cw_filter = false").unwrap();
+        assert!(!cfg.non_cw_filter);
+    }
+
+    #[test]
+    fn unkeyed_close_ms_below_one_second_is_rejected() {
+        assert_eq!(
+            err("unkeyed_close_ms = 500"),
+            "detector.unkeyed_close_ms = 500 is shorter than 1000 ms; it must be at least 1000"
+        );
+        assert!(err("unkeyed_close_ms = 0").contains("at least 1000"));
+        assert_eq!(
+            parse("unkeyed_close_ms = 1000").unwrap().unkeyed_close_hops,
+            375
+        );
+    }
+
+    #[test]
+    fn unkeyed_close_ms_above_one_hour_is_rejected() {
+        assert_eq!(
+            err("unkeyed_close_ms = 4000000"),
+            "detector.unkeyed_close_ms must be finite and in [0, 3600000] ms, got 4000000"
+        );
+        assert!(err("unkeyed_close_ms = nan").contains("[0, 3600000]"));
+    }
+
+    #[test]
+    fn rtty_filter_must_be_a_boolean() {
+        let e = err(r#"rtty_filter = "yes""#);
+        assert!(e.contains("rtty_filter"), "{e}");
+        assert!(e.contains("expected a boolean"), "{e}");
+    }
+
+    #[test]
+    fn integer_toml_values_are_accepted_for_float_keys() {
+        let cfg = parse("confirm_ms = 50").unwrap();
+        assert_eq!(cfg.confirm_hops, 19);
+    }
+
+    #[test]
+    fn non_finite_db_values_are_rejected() {
+        let e = err("on_snr_db = nan");
+        assert!(e.contains("detector.on_snr_db must be finite"), "{e}");
+        let e = err("off_snr_db = inf");
+        assert!(e.contains("detector.off_snr_db must be finite"), "{e}");
+    }
+
+    #[test]
+    fn off_above_default_on_is_rejected() {
+        let e = err("off_snr_db = 13.0");
+        assert_eq!(
+            e,
+            "detector.off_snr_db (13) must not exceed detector.on_snr_db (12)"
+        );
+    }
+
+    #[test]
+    fn on_snr_db_above_100_is_rejected() {
+        let e = err("on_snr_db = 101.0");
+        assert!(e.contains("detector.on_snr_db"), "{e}");
+        assert!(e.contains("[0, 100]"), "{e}");
+    }
+
+    #[test]
+    fn confirm_ms_that_rounds_to_zero_hops_is_rejected() {
+        let e = err("confirm_ms = 1");
+        assert!(e.contains("detector.confirm_ms"), "{e}");
+        assert!(e.contains("rounds to 0 hops (1 hop = 2.667 ms)"), "{e}");
+    }
+
+    #[test]
+    fn negative_gc_ms_is_rejected() {
+        let e = err("gc_ms = -5.0");
+        assert!(e.contains("detector.gc_ms"), "{e}");
+        assert!(e.contains("[0, 3600000]"), "{e}");
+    }
+
+    #[test]
+    fn hang_ms_above_one_hour_is_rejected() {
+        let e = err("hang_ms = 3600001");
+        assert!(e.contains("detector.hang_ms"), "{e}");
+        assert!(e.contains("[0, 3600000]"), "{e}");
+    }
+
+    #[test]
+    fn zero_track_cap_is_rejected() {
+        let e = err("track_cap = 0");
+        assert!(e.contains("detector.track_cap must be at least 1"), "{e}");
+    }
+
+    #[test]
+    fn negative_track_cap_is_a_type_error() {
+        let e = err("track_cap = -1");
+        assert!(e.contains("track_cap"), "{e}");
+        assert!(e.contains("expected usize"), "{e}");
+    }
+
+    #[test]
+    fn unknown_key_is_rejected() {
+        let e = err("onsnr_db = 1.0");
+        assert!(e.contains("unknown field"), "{e}");
+        assert!(e.contains("onsnr_db"), "{e}");
+    }
+
+    #[test]
+    fn warmup_and_cooldown_may_be_zero() {
+        let cfg = parse("warmup_ms = 0\nsilent_respawn_cooldown_ms = 0.0").unwrap();
+        assert_eq!(cfg.warmup_hops, 0);
+        assert_eq!(cfg.silent_respawn_cooldown_hops, 0);
+    }
+}

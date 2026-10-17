@@ -5,26 +5,100 @@ designed to be internet-reachable with no authentication, matching the DX
 cluster/RBN ecosystem's own long-standing convention (ARCHITECTURE.md §7).
 The Prometheus metrics endpoint is different: it's operationally useful, not
 part of that public-facing contract, and carries no authentication either.
+**`GET /healthz` (MAN-128) shares the metrics listener, its
+`metrics_bind_addr` and its port** — it is not a separate port, so every
+mitigation below that applies to `[server].metrics_port` covers
+`/healthz` too. See `docs/RUNBOOKS/node-health.md` for its semantics.
+**`GET /status`** (MAN-44, the JSON document `manta status` reads) is
+served by that same listener too, with the same exposure posture. It
+additionally lists every configured RBN uplink target's `host:port` —
+public infrastructure by nature, but enumerable by anyone who can reach
+the port, as `/metrics`'s `manta_uplink_target_*{target}` labels already
+are. See `docs/RUNBOOKS/uplink-health.md`.
 
-By default all three bind to `[server].bind_addr`, which defaults to
-`0.0.0.0` — every configured port is reachable from any network that can
-route to the host, metrics included.
+The telnet and JSON listeners bind `[server].bind_addr`, which defaults to
+`0.0.0.0`: both ports are reachable from any network that can route to
+the host, as a public cluster node expects. The metrics listener (and
+`/healthz`/`/status` with it) binds its own `[server].metrics_bind_addr`, which
+defaults to `127.0.0.1` (MAN-132,
+`docs/DECISIONS/2026-10-08-man132-metrics-loopback-bind.md`): out of the
+box, only this machine can reach it.
 
-**If you don't want `/metrics` reachable outside your own network**, the
-only safe option today is:
+**`bind_addr` and `metrics_bind_addr` are independent**: moving either
+one never moves the other. `bind_addr = "127.0.0.1"` takes telnet and
+JSON off the network and leaves metrics where it is; `metrics_bind_addr =
+"0.0.0.0"` exposes metrics and leaves telnet and JSON where they are.
 
-- **Firewall the metrics port** (`[server].metrics_port`) directly — e.g.
-  an iptables/nftables rule, or a cloud security-group rule, restricting
-  inbound access to it to your management network.
+**To keep `/metrics` private, do nothing**: that is the default. Run
+`manta config check` to see the effective `metrics_bind_addr` in its
+`server:` line.
 
-**A reverse proxy alone does NOT achieve this — it's a routing
-convenience, not access control, unless you separately block direct
-access to the real port it's proxying.** manta itself always binds every
-port to `bind_addr` directly (`0.0.0.0` by default), regardless of
-whether a proxy also exists in front of it — a proxy configured to
-"only forward the telnet/JSON ports" does nothing to stop a client from
-connecting straight to the metrics port itself, since that port is still
-listening and reachable on its own. The same applies to the TLS-proxy
+**To let a Prometheus server or health probe on another machine scrape
+it**, widen the metrics listener deliberately and restrict who can reach
+it:
+
+- Set `metrics_bind_addr = "0.0.0.0"` under `[server]` (or
+  `MANTA_SERVER_METRICS_BIND_ADDR=0.0.0.0`), or better, the IP of a
+  specific management interface, e.g. `metrics_bind_addr = "10.0.0.5"`.
+  `manta config check` prints a note whenever `metrics_bind_addr` is a
+  wildcard (`0.0.0.0` or `::`).
+- **Firewall the metrics port** (`[server].metrics_port`) — e.g. an
+  iptables/nftables rule, or a cloud security-group rule, restricting
+  inbound access to it to the machines that scrape it. The endpoint has
+  no password, so the firewall is the access control.
+
+**Containers and Kubernetes.** Docker's `-p 7302:7302` forwards to the
+container's own network interface, never to its loopback, and a
+Kubernetes `httpGet` probe connects to the pod IP — so with the default
+`metrics_bind_addr = "127.0.0.1"` neither can reach `/metrics` or
+`/healthz`. A container that must serve them through a published port or
+to the kubelet needs `MANTA_SERVER_METRICS_BIND_ADDR=0.0.0.0` (or the
+config key). In Docker, publish it as `-p 127.0.0.1:7302:7302` to keep it
+reachable from the host only, and firewall it like any other widened
+metrics port otherwise. `docs/RUNBOOKS/node-health.md` shows the
+Kubernetes probe.
+
+**The live-state stream (MAN-324) is opt-in and loopback by default.**
+It starts only when `[server].live_port` is set (for example `7303`), and
+binds its own `[server].live_bind_addr`, which defaults to `127.0.0.1`.
+Like metrics, it is not part of the public DX-cluster contract: it has no
+password and carries every track's decoded text, including text that never
+became a spot, and every validation decision
+(`docs/LIVE-STATE.md`,
+`docs/DECISIONS/2026-10-12-man324-live-state-stream.md` D2). `bind_addr`
+does not move it, and `live_bind_addr` moves nothing else.
+
+- **To keep it private, leave `live_bind_addr` unset.** A dashboard on the
+  same machine connects to `127.0.0.1:7303`. A dashboard elsewhere can reach
+  a loopback listener through an SSH tunnel
+  (`ssh -L 7303:127.0.0.1:7303 <node>`) without widening anything.
+- **To let a dashboard on another machine connect directly,** set
+  `live_bind_addr = "0.0.0.0"` (or `MANTA_SERVER_LIVE_BIND_ADDR=0.0.0.0`),
+  or better, one interface's address. `manta config check` prints a note
+  whenever `live_bind_addr` is a wildcard. **Firewall `live_port`** to the
+  dashboards that read it: the firewall is the access control.
+- **Behind a reverse proxy** (for example to add TLS for a browser
+  dashboard), every dashboard shares the proxy's IP. The live listener
+  applies `json_max_connections_per_ip` and `json_max_pings_per_ip`,
+  counted separately from the JSON spot port's, so raising or disabling
+  those keys for one proxy raises them for both listeners. The live
+  listener's total cap of 32 clients still applies. As with any proxy,
+  block direct access to `live_port` itself, per the bypass note below.
+- **Docker.** The image does not `EXPOSE` 7303. Publish it to the host
+  only with `-p 127.0.0.1:7303:7303`, and set
+  `MANTA_SERVER_LIVE_BIND_ADDR=0.0.0.0` inside the container: Docker
+  forwards to the container's own interface, never to its loopback, as for
+  metrics above.
+
+**A reverse proxy alone is NOT access control for a widened listener —
+it's a routing convenience, unless you separately block direct access to
+the real port it's proxying.** manta itself always binds telnet and JSON
+to `bind_addr`, and metrics to `metrics_bind_addr`, directly, regardless
+of whether a proxy also exists in front of it — once `metrics_bind_addr`
+is widened, a proxy configured to "only forward the telnet/JSON ports"
+does nothing to stop a client from connecting straight to the metrics
+port itself, since that port is still listening and reachable on its
+own. The same applies to the TLS-proxy
 suggestion below: fronting the JSON/WS port with a TLS-terminating proxy
 does not stop a client from connecting directly to manta's own plaintext
 port instead, bypassing TLS entirely, unless direct access to that
@@ -36,14 +110,6 @@ or transport-integrity enforcement when paired with one of:
 - A network topology where the manta host itself isn't otherwise
   reachable from the network you're defending against (e.g. it only has a
   private address, and the proxy is the sole thing with a public one).
-
-**Do NOT set `bind_addr = "127.0.0.1"` expecting it to hide only
-metrics** — `bind_addr` is shared across all three listeners
-(`crates/manta-cli/src/main.rs`), so that would *also* silently move the
-telnet and JSON listeners to loopback, taking the services you meant to
-keep public offline instead. A per-listener bind option doesn't exist yet;
-until it does, firewalling the specific port you want restricted is the
-only mitigation that doesn't have this side effect.
 
 If you want transport integrity (not just access restriction) for
 WebSocket consumers specifically, terminate TLS in a reverse proxy in
@@ -82,10 +148,14 @@ limit** at the proxy (most reverse proxies support this directly), not
 just a connection-rate limit, before disabling the backend's own per-IP
 quota.
 
-This publicly-bound-by-default posture is deliberate and documented (see
-`docs/DECISIONS/2026-09-02-man23-threat-model.md`, findings 11 and 20) —
-not an oversight — but it's easy to misconfigure if you're only thinking
-about the telnet/JSON ports as "the public ones."
+The publicly-bound-by-default posture of the telnet and JSON listeners is
+deliberate and documented (see
+`docs/DECISIONS/2026-09-02-man23-threat-model.md`, findings 10 and 20, and
+`docs/DECISIONS/2026-09-06-broad-review-decisions.md` D14) — not an
+oversight. It does not apply to metrics: finding 11's metrics posture
+changed with MAN-132, which moved the metrics listener to loopback by
+default. A widened `metrics_bind_addr` puts it back in the public
+posture, so treat that setting as the deliberate exposure it is.
 
 **Same caveat applies to `json_max_pings_per_ip`/`telnet_max_commands_per_ip`
 (MAN-57)** — separate from the connection quota above: each listener also
@@ -102,6 +172,42 @@ proxied JSON/WS deployment, raise or disable `json_max_pings_per_ip` the
 same way (`0` disables it; only each connection's own per-connection
 Ping budget still applies). Same reasoning for telnet's
 `telnet_max_commands_per_ip` if telnet is ever put behind a proxy too.
+
+**The metrics listener also has its own per-IP response budget (MAN-64,
+`docs/DECISIONS/2026-09-04-man64-metrics-request-rate-and-source-health.md`),
+separate from every field above.**
+`IpQuota` (`metrics_max_connections_per_ip`) and `ConnectionLimiter` bound
+how many connections one source may hold *at once*.
+`[server].metrics_max_requests_per_ip` limits normal response rendering and
+body writes for complete requests: an over-budget request gets an empty
+`429` response instead. It does not limit connection acceptance, task
+creation, header reads, or the rate of those rejection responses.
+Each admitted connection charges the budget once, before routing a complete
+request or on EOF, a header-read error, or a header timeout. Empty and
+malformed connections consume budget but are not refused based on it, so
+repeated connect-and-close or malformed attempts can still drive task/TCP
+work after the budget is exhausted. A bare TCP connect-and-close (e.g. a
+`tcpSocket` liveness probe) costs a charge just like `GET /metrics` or
+`GET /healthz` (MAN-128). The default budget is 60 charges per 60 seconds
+per source IP, roughly 5x the load of the
+tightest realistic single scraper (a 5s scrape interval is 12/min); a
+liveness probe sharing that IP counts against the same budget and should
+be sized accordingly — an over-budget `/healthz` probe gets the same `429`
+and will read it as a failed check.
+Raise it if several independent scrapers, a federation setup, or a proxy in
+front of the metrics port cause more than one real client to collapse into
+a single `peer.ip()`. Set it to `0` to disable request-rate bounding on
+this listener **entirely** — unlike telnet/JSON's rate overrides, there is
+no per-connection budget left underneath it once the per-IP tier is
+disabled, because this endpoint answers exactly one request per connection
+(`Connection: close` on every response) and a per-connection budget of one
+would bound nothing the connection-level tiers above don't already bound.
+Only the total `MAX_METRICS_CONNECTIONS` ceiling and the per-IP connection
+quota still apply once this is set to `0`. Observable symptom of hitting
+the default budget: scrapes returning `429 Too Many Requests` with a
+`Retry-After: 60` header, and up to 30 `WARN` lines per source IP per 60s
+log window (`CONNECTION_LOG_MAX_PER_WINDOW`), not one per rejection — the
+same shared log-budget rule as every other rejection path in this file.
 
 **Known limitation (MAN-59, review round 5): per-client audit-log
 attribution is unavailable for WS traffic behind this same reverse-proxy

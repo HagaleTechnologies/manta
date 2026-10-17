@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
 
 [dependencies]
 anyhow = { workspace = true }
@@ -20,3 +24,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,42 @@
+# MAN-36: exact Rust toolchain pin.
+#
+# Without this file three things picked the compiler independently and could
+# silently disagree: CI's `dtolnay/rust-toolchain@<sha> # stable` step (which
+# resolves the LIVE stable channel at each run -- the Action's SHA pin protects
+# its own code, not the Rust version it installs), the Dockerfile's
+# `rust:1-slim-bookworm` base tag, and whatever `rustup` default a contributor
+# last updated to.
+#
+# rustup's cargo/rustc proxies read this file from the current directory and its
+# ancestors on EVERY invocation, ahead of any other default or override, and
+# auto-install the named toolchain on first use. So CI, a fresh local clone, the
+# Docker builder stage, `cross` (which derives its container toolchain from
+# `rustc --print sysroot`, i.e. from this file), and any cloud runner all
+# converge here with no workflow edit and no new tool.
+#
+# Pinned to 1.98.0 (MAN-242, 2026-10-05): the Catalyst runner image carries
+# 1.98.0, not 1.98.1, so an exact 1.98.1 pin made every Catalyst run download a
+# second toolchain. 1.98.1 was the original MAN-36 pin (what the stable channel
+# served on 2026-09-04); the step back is one patch release.
+#
+# Cargo.toml's `rust-version` is set equal to this pin: the stated minimum is
+# the one toolchain CI actually builds with, so it is never untrue.
+# scripts/check-rust-toolchain-pin.sh asserts this pin never drops below it.
+#
+# Bumping: deliberate, in its own PR. See
+# docs/DECISIONS/2026-09-04-man36-exact-rust-toolchain-pin.md.
+[toolchain]
+channel = "1.98.0"
+# Mirrors exactly what ci-full.yml's toolchain step installs (`components: rustfmt,
+# clippy`), so a fresh clone can run the same fmt/clippy gate CI runs.
+# `minimal` keeps rust-docs (which no build step here reads) out of every
+# install this file drives; IDE users who want std sources run `rustup
+# component add rust-src`. The `components` line below still pulls rustfmt
+# and clippy into every install this file drives too, including the Docker
+# builder stage and `cross`'s container, neither of which runs fmt/clippy --
+# accepted, not fixed: both land in a discarded/ephemeral layer (see this
+# ticket's plan, "Performance Considerations"), so the cost is a few extra
+# seconds of install time, not image size, and the fresh-clone convenience is
+# worth that.
+profile = "minimal"
+components = ["rustfmt", "clippy"]
