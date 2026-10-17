@@ -1,6 +1,6 @@
 schema = "wiki-config/v1"
 repo = "manta"
-visibility = "private"
+visibility = "public"
 # public | private
 # optional overrides:
 # max_pages = 100

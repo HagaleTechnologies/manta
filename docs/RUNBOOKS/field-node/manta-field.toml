@@ -1,0 +1,20 @@
+# MAN-96 secondary-skimmer field node. Copy to /etc/manta/manta-field.toml, replace every
+# N0CALL / operator_* value, then: manta config check --config /etc/manta/manta-field.toml
+[server]
+station_callsign = "N0CALL-1"        # your call + an RBN SSID (MAN-89); the Aggregator sees CALL-1-#
+operator_name = "Operator"
+operator_qth = "City, ST"
+operator_grid = "EM10"
+bind_addr = "0.0.0.0"                # telnet must reach the Aggregator host; firewall 7301/7302 (D-M)
+line_format = "skimmer"              # CW Skimmer layout, for running behind an Aggregator
+status_interval_secs = 60
+
+# No [[rbn_uplink]]: the Aggregator forwards this node's spots (D-L).
+
+[input]
+type = "soapy"                       # see the runbook for kiwi / hpsdr swaps
+driver = "driver=sdrplay"
+gain_db = 15.0                       # SDRplay: an ATTENUATION scale; sweep 10-20 (2026-09-09 doc)
+freq_hz = 7030000.0
+rate_hz = 192000.0
+freq_correction_ppm = 0.0            # set from Stage 1's median frequency delta

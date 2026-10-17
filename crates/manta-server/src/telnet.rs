@@ -1,20 +1,24 @@
 //! Telnet DX-cluster server. ARCHITECTURE §7: "standard login prompt,
 //! emits RBN-format spots... enough command grammar (`sh/dx`, filters) for
-//! common clients not to choke." No real telnet IAC option negotiation --
-//! real cluster nodes and clients (N1MM, stock `telnet`) work fine over
-//! plain line-oriented text, and skipping IAC keeps this a small,
-//! auditable text protocol (MAN-22/23 harden it further).
+//! common clients not to choke." Line-oriented text protocol; telnet IAC
+//! option negotiation is stripped and refused rather than implemented
+//! (`crate::iac`) -- MAN-87: the earlier "skip IAC entirely" stance held
+//! for `nc` and piped `telnet`, but Windows `telnet.exe`, PuTTY's telnet
+//! mode and most DX-cluster clients negotiate on connect, and their
+//! `0xFF` bytes were failing the login read's UTF-8 validation outright
+//! (MAN-22/23 harden this listener further).
 
-use crate::bounded_io::{read_line_bounded, read_line_bounded_with_timeout};
-use crate::bus::SpotBus;
-use crate::command::{self, Command};
+use crate::bounded_io::{read_line_bounded_telnet, read_line_bounded_telnet_with_timeout};
+use crate::bus::{BusSpot, SpotBus};
+use crate::command::{self, Command, HistorySelection, QueryMode, ShowDxQuery};
+use crate::iac::IacFilter;
 use crate::metrics::Metrics;
 use crate::rate_limit::IpRateLimiter;
 use crate::rbn;
 use crate::tasks::{ClientTasks, ConnectionLimiter, IpQuota};
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
@@ -23,7 +27,14 @@ use tokio::sync::{broadcast, watch};
 /// stalled and disconnected -- ARCHITECTURE §7's "slow clients are
 /// disconnected, never back-pressured" policy applies to a client that
 /// stops reading, not just one that falls behind the broadcast channel.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// `pub` (not private): `manta-cli`'s `SHUTDOWN_DRAIN_DEADLINE` must stay
+/// sized against `2 * WRITE_TIMEOUT` -- the worst case a `select!` branch
+/// body here (`write_spot_line`'s two separately-timed writes) can run
+/// before that loop even gets back around to noticing `shutdown` -- plus
+/// `tasks::CLIENT_DRAIN_DEADLINE`. A cross-crate test asserts this
+/// relationship directly rather than re-deriving the constant by hand.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the accept loop backs off after a failed `accept()` before
 /// retrying -- a persistent resource error (e.g. `EMFILE`) makes
 /// `accept()` return immediately, and retrying with no delay turns this
@@ -34,8 +45,8 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// legitimately sends very few commands (`sh/dx`, an occasional filter
 /// change) -- but with no budget at all, an unauthenticated client could
 /// send an unlimited sequence of complete commands (e.g. repeated
-/// `sh/dx/50`), each one real CPU/bandwidth work formatting and writing up
-/// to 50 history entries (round-14 review finding). A RATE, not a
+/// `sh/dx/10000`), each one real CPU/bandwidth work formatting and writing up
+/// to `bus::MAX_HISTORY_SPOTS` history entries (MAN-93). A RATE, not a
 /// lifetime total (see `json_stream`'s identical reasoning for its Ping
 /// budget) -- a long session that occasionally issues commands must never
 /// be disconnected just for staying connected a long time.
@@ -141,7 +152,7 @@ const REJECTION_LOG_WINDOW: Duration = Duration::from_secs(60);
 /// two cases apart: `Logged` for an error a specific branch already
 /// reported (the catch-all skips it), `Unlogged` for anything else. The
 /// blanket `From<std::io::Error>` impl below defaults every OTHER
-/// fallible site (the bare `?` writes) to `Unlogged`, so they keep
+/// fallible site (the handshake writes) to `Unlogged`, so they keep
 /// reaching the catch-all exactly as before -- a future fallible call
 /// site added without an explicit `Logged` wrap still gets caught by it,
 /// preserving MAN-59's original "no disconnect goes unrecorded" guarantee
@@ -159,6 +170,109 @@ impl From<std::io::Error> for ClientError {
     }
 }
 
+/// MAN-134: whether a client's socket error is a transport-level
+/// disconnect (`ConnectionReset`/`ConnectionAborted` -- the peer reset the
+/// connection; `BrokenPipe` -- a write to a peer that already closed)
+/// rather than a rejection-shaped one (`bounded_io`'s `InvalidData`
+/// oversized/negotiation-flood/invalid-UTF-8 lines, its `TimedOut` idle
+/// read, or any other socket error). A health probe, load balancer or
+/// port-check script that connects and resets before logging in is
+/// routine churn, not a security-relevant rejection -- the same split
+/// `json_stream::is_ws_protocol_violation` makes on the WS path (MAN-68
+/// round 8). Only the log level and wording depend on this; the connection
+/// closes, and its line rides the same `log_enabled` budget, either way.
+fn is_transport_disconnect(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+    )
+}
+
+/// Everything a connected client is told about this station: the identity
+/// that appears in the greeting banner and every spot line, plus the
+/// settings `SKIMMER/SETT` reports. One struct rather than five positional
+/// `serve()` parameters, following `json_stream::JsonStreamConfig`'s
+/// precedent. MAN-88 threads a `line_format` field through this same call
+/// chain -- whichever of MAN-86/MAN-88 lands second adds its field HERE
+/// rather than as a parallel positional parameter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StationProfile {
+    pub call: String,
+    pub operator_name: Option<String>,
+    pub operator_qth: Option<String>,
+    pub operator_grid: Option<String>,
+    pub sett: crate::sett::SettSettings,
+}
+
+/// Greeting line 2. Shape taken from the CW Skimmer manual's own banner --
+/// "CW Skimmer 1.3 is operated by Alex, VE3NEA in Richmond Hill, ON
+/// (FN03GW)" -- which is where Aggregator learns this node's operator and
+/// location (Aggregator manual v6.0 §3.1/§9.2; the SETT reply itself
+/// carries neither). Every optional part is dropped cleanly when absent
+/// rather than rendering an empty placeholder.
+fn operator_line(
+    version: &str,
+    name: Option<&str>,
+    call: &str,
+    qth: Option<&str>,
+    grid: Option<&str>,
+) -> String {
+    let mut s = format!("manta {version} is operated by ");
+    match name {
+        Some(n) => s.push_str(&format!("{n}, {call}")),
+        None => s.push_str(call),
+    }
+    if let Some(q) = qth {
+        s.push_str(&format!(" in {q}"));
+    }
+    if let Some(g) = grid {
+        s.push_str(&format!(" ({g})"));
+    }
+    s
+}
+
+/// Trims a raw login line to a plausible callsign, or `None`.
+///
+/// Deliberately WIDER than `manta_spot::grammar::is_plausible`, which the
+/// MAN-45 research documents as rejecting the real callsigns `JW/LB2PG` and
+/// `GB3LER/B`, and which would also reject SSID forms like `W3XYZ-2`. This
+/// listener has no authentication by design (ARCHITECTURE §7 exposure
+/// policy) -- this is a SHAPE check whose job is to keep garbage and
+/// control bytes out of the audit log and off the wire, so rejecting a real
+/// operator's callsign is the worse failure.
+///
+/// Trailing CR/NUL is STRIPPED, not rejected: RFC 854 encodes Enter as
+/// CR NUL and real telnet clients send it (MAN-86's ticket records this
+/// from macOS telnet). An EMBEDDED control character is still a rejection.
+/// PR #128 review: stripping it here is only reachable because the read
+/// path that feeds this function now COMPLETES a line on `CR NUL` as well
+/// as on `LF` (`bounded_io::read_line_bounded_telnet`, MAN-87) -- an NVT client
+/// sending `N0CALL\r\0` and nothing more previously never got its login
+/// line delivered here at all, and was dropped by the idle-read timeout
+/// 30 s later. `trim_matches` takes the CR and the NUL in either order and
+/// in any number, so both `\r\0` and a `\r\n`-terminated line arrive here
+/// as the bare callsign.
+fn sanitize_login(raw: &str) -> Option<String> {
+    let call = raw
+        .trim_matches(|c: char| c.is_whitespace() || c == '\u{0}')
+        .to_string();
+    if !(3..=16).contains(&call.chars().count()) {
+        return None;
+    }
+    if !call
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '-')
+    {
+        return None;
+    }
+    if !call.chars().any(|c| c.is_ascii_digit()) || !call.chars().any(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(call)
+}
+
 /// Accepts connections on `listener` until it errors, spawning one task
 /// per client. Never returns under normal operation.
 #[allow(clippy::too_many_arguments)]
@@ -166,12 +280,14 @@ pub async fn serve(
     listener: TcpListener,
     bus: Arc<SpotBus>,
     metrics: Arc<Metrics>,
-    station_call: String,
+    profile: Arc<StationProfile>,
     shutdown: watch::Receiver<bool>,
     tasks: ClientTasks,
     limiter: ConnectionLimiter,
     ip_quota: IpQuota,
     ip_command_limiter: IpRateLimiter,
+    drain_deadline: Duration,
+    line_format: rbn::LineFormat,
 ) {
     let quota_reject_log_limiter =
         IpRateLimiter::new(QUOTA_REJECT_LOG_MAX_PER_WINDOW, QUOTA_REJECT_LOG_WINDOW);
@@ -221,7 +337,7 @@ pub async fn serve(
         let rx = bus.subscribe();
         let bus = bus.clone();
         let metrics = metrics.clone();
-        let station_call = station_call.clone();
+        let profile = profile.clone();
         let shutdown = shutdown.clone();
         let peer_ip = peer.ip();
         let ip_command_limiter = ip_command_limiter.clone();
@@ -242,13 +358,15 @@ pub async fn serve(
                 bus,
                 rx,
                 metrics.clone(),
-                station_call,
+                profile,
                 shutdown,
                 peer,
                 peer_ip,
                 ip_command_limiter,
                 log_enabled,
                 rejection_log_limiter,
+                drain_deadline,
+                line_format,
             )
             .await;
             // MAN-59 review: a socket error mid-session (e.g. a
@@ -260,9 +378,15 @@ pub async fn serve(
             // Logged means a specific branch (login/command read
             // rejection) already reported this exact error, and a second
             // generic warning for it would just double the audit record.
+            // MAN-134: a reset during the greeting write (a probe that
+            // never reads) is a routine disconnect, not a failure.
             if log_enabled {
                 if let Err(ClientError::Unlogged(e)) = &result {
-                    tracing::warn!(peer = %peer, error = %e, "telnet: client task ended with an error");
+                    if is_transport_disconnect(e) {
+                        tracing::info!(peer = %peer, error = %e, "telnet: client disconnected (transport error)");
+                    } else {
+                        tracing::warn!(peer = %peer, error = %e, "telnet: client task ended with an error");
+                    }
                 }
             }
             metrics.dec_telnet_clients();
@@ -278,12 +402,13 @@ pub async fn serve(
         bus,
         rx,
         metrics,
-        station_call,
+        profile,
         shutdown,
         peer_ip,
         ip_command_limiter,
         log_enabled,
-        rejection_log_limiter
+        rejection_log_limiter,
+        line_format
     ),
     fields(peer = %peer)
 )]
@@ -292,13 +417,15 @@ async fn handle_client(
     bus: Arc<SpotBus>,
     mut rx: broadcast::Receiver<crate::bus::BusSpot>,
     metrics: Arc<Metrics>,
-    station_call: String,
+    profile: Arc<StationProfile>,
     mut shutdown: watch::Receiver<bool>,
     peer: std::net::SocketAddr,
     peer_ip: IpAddr,
     ip_command_limiter: IpRateLimiter,
     log_enabled: bool,
     rejection_log_limiter: IpRateLimiter,
+    drain_deadline: Duration,
+    line_format: rbn::LineFormat,
 ) -> Result<(), ClientError> {
     if log_enabled {
         tracing::info!("telnet: client connected");
@@ -306,9 +433,81 @@ async fn handle_client(
     let (rd, mut wr) = socket.into_split();
     let mut reader = BufReader::new(rd);
 
-    write_with_timeout(&mut wr, b"login: \r\n").await?;
+    // MAN-45 remediate (round 17, CR-1): every step of this pre-loop
+    // handshake now races `shutdown.changed()` -- the worst-case model
+    // `SHUTDOWN_DRAIN_DEADLINE` (`manta-cli`) and its own doc comment
+    // assert (`2 * telnet::WRITE_TIMEOUT + CLIENT_DRAIN_DEADLINE`) only
+    // covers branches INSIDE the `select!` loop below; before this fix, a
+    // client that stalled before completing login held this task outside
+    // that loop for up to `WRITE_TIMEOUT + IDLE_READ_TIMEOUT +
+    // WRITE_TIMEOUT` (50s) with `shutdown` never observed at all, so
+    // `Runtime::shutdown_timeout` could abort it with its already-
+    // subscribed `rx` backlog abandoned uncounted -- precisely the
+    // silent-truncation failure round 16's P1 was raised about, just one
+    // step earlier in the connection's lifecycle. Racing each step keeps
+    // the pre-loop phase's contribution to shutdown latency close to zero
+    // instead of growing `SHUTDOWN_DRAIN_DEADLINE` a third time to cover
+    // it.
+    //
+    // MAN-45 remediate (code-review round 18, finding 2): these three
+    // branches record into `record_dropped_shutdown`, NOT
+    // `record_write_failed` -- no write failed or timed out here, the daemon
+    // shut down cleanly. (Writes may already have HAPPENED: the login-read
+    // and `de <call>-# >` prompt branches are only reached once the
+    // greeting banner (MAN-86; formerly the `login: ` prompt) went out
+    // successfully. What none of the three did is fail a write.) The
+    // prior version called `record_write_failed`, which contradicts that
+    // counter's own doc comment and Prometheus HELP text ("a write...
+    // timed out or failed") and would make an operator reading it suspect
+    // failing client sockets on every ordinary shutdown with a stalled
+    // pre-login client.
+    // MAN-86: the CW-Skimmer-shaped greeting banner (software/operator
+    // identity, then the callsign prompt) replaces the bare `login: `
+    // prompt -- RBN Aggregator reads operator name/QTH/grid from here.
+    let greeting = format!(
+        "Welcome to the manta Telnet cluster port!\r\n{}\r\nPlease enter your callsign: \r\n",
+        operator_line(
+            env!("CARGO_PKG_VERSION"),
+            profile.operator_name.as_deref(),
+            &profile.call,
+            profile.operator_qth.as_deref(),
+            profile.operator_grid.as_deref(),
+        )
+    );
+    tokio::select! {
+        result = write_with_timeout(&mut wr, greeting.as_bytes()) => {
+            // Same accounting as the negotiation-refusal write below
+            // (MAN-87 remediation, PR #129 Codex review).
+            if let Err(e) = result {
+                metrics.record_write_failed(crate::metrics::abandoned_spot_count(false, rx.len()));
+                return Err(e.into());
+            }
+        }
+        _ = shutdown.changed() => {
+            if log_enabled {
+                tracing::info!("telnet: shutdown signalled before greeting banner, disconnecting");
+            }
+            metrics.record_dropped_shutdown(crate::metrics::abandoned_spot_count(false, rx.len()));
+            return Ok(());
+        }
+    }
     let mut login_line = String::new();
-    match read_line_bounded_with_timeout(&mut reader, &mut login_line).await {
+    // Owned here, not inside the read: an IAC sequence can straddle a
+    // chunk boundary and the command read below is cancelled mid-line by
+    // `tokio::select!`, so the filter's parse state has to outlive any
+    // single read the same way `cmd_line` does.
+    let mut iac = IacFilter::new();
+    let login_result = tokio::select! {
+        result = read_line_bounded_telnet_with_timeout(&mut reader, &mut login_line, &mut iac) => result,
+        _ = shutdown.changed() => {
+            if log_enabled {
+                tracing::info!("telnet: shutdown signalled during login read, disconnecting");
+            }
+            metrics.record_dropped_shutdown(crate::metrics::abandoned_spot_count(false, rx.len()));
+            return Ok(());
+        }
+    };
+    match login_result {
         Ok(0) => {
             if log_enabled {
                 tracing::info!("telnet: client disconnected before completing login");
@@ -317,28 +516,80 @@ async fn handle_client(
         }
         Ok(_) => {}
         Err(e) => {
+            // MAN-134: a probe that resets after reading the banner is a
+            // routine disconnect -- only malformed, oversized or timed-out
+            // input keeps the rejection warning.
             if log_enabled {
-                tracing::warn!(error = %e, "telnet: login read rejected (oversized/malformed line or timeout), disconnecting");
+                if is_transport_disconnect(&e) {
+                    tracing::info!(error = %e, "telnet: client disconnected before completing login (transport error)");
+                } else {
+                    tracing::warn!(error = %e, "telnet: login read rejected (oversized/malformed line or timeout), disconnecting");
+                }
             }
             return Err(ClientError::Logged);
         }
     }
-    // MAN-59 review: the login line is client-supplied and unvalidated --
-    // Display (`%`) writes it into the log verbatim, letting an
-    // unauthenticated client embed CRs/ANSI escapes to forge additional
-    // bogus log lines or manipulate terminal output. Debug (`?`) escapes
-    // control characters instead.
+    // Answer the negotiation the client opened with, before the greeting.
+    // RFC 854 negotiation is asynchronous -- no client blocks waiting for
+    // a reply before sending its callsign -- so batching the refusals to
+    // the end of the login read costs nothing and keeps the writer out of
+    // `bounded_io`.
+    if iac.has_replies() {
+        let replies = iac.take_replies();
+        if let Err(e) = write_with_timeout(&mut wr, &replies).await {
+            // MAN-87 remediation (PR #129 Codex review): a bare `?` here
+            // ended the task through the logging-only catch-all, abandoning
+            // whatever queued on `rx` during the login read uncounted. A
+            // control-frame write, so nothing was in flight (`false`); the
+            // error still propagates so the catch-all logs it.
+            metrics.record_write_failed(crate::metrics::abandoned_spot_count(false, rx.len()));
+            return Err(e.into());
+        }
+    }
+    let Some(login) = sanitize_login(&login_line) else {
+        if log_enabled {
+            // Explicit quoting escapes untrusted CR/ANSI and C1 controls.
+            tracing::info!(login = %crate::human::quoted(&login_line), "telnet: implausible login callsign, disconnecting");
+        }
+        // One attempt, then close: this listener is unauthenticated by
+        // design, and a retry loop is free budget for a scanner.
+        // Same write-failure accounting as the negotiation-refusal write
+        // above (MAN-87 remediation, PR #129 Codex review).
+        if let Err(e) =
+            write_with_timeout(&mut wr, b"Sorry, that is not a valid callsign.\r\n").await
+        {
+            metrics.record_write_failed(crate::metrics::abandoned_spot_count(false, rx.len()));
+            return Err(e.into());
+        }
+        return Ok(());
+    };
+    // Keep explicit quoting even after validation, so future grammar changes
+    // cannot let client control bytes forge terminal or audit-log records.
     if log_enabled {
-        tracing::info!(login = ?login_line.trim(), "telnet: client logged in");
+        tracing::info!(login = %crate::human::quoted(&login), "telnet: client logged in");
     }
 
-    write_with_timeout(&mut wr, format!("de {station_call}-# >\r\n").as_bytes()).await?;
+    let banner = format!("de {}-# >\r\n", profile.call);
+    tokio::select! {
+        result = write_with_timeout(&mut wr, banner.as_bytes()) => {
+            // Same accounting as the negotiation-refusal write above.
+            if let Err(e) = result {
+                metrics.record_write_failed(crate::metrics::abandoned_spot_count(false, rx.len()));
+                return Err(e.into());
+            }
+        }
+        _ = shutdown.changed() => {
+            if log_enabled {
+                tracing::info!("telnet: shutdown signalled before login banner, disconnecting");
+            }
+            metrics.record_dropped_shutdown(crate::metrics::abandoned_spot_count(false, rx.len()));
+            return Ok(());
+        }
+    }
 
-    // `sh/dx` default when the client didn't specify a count.
-    const DEFAULT_SHOW_DX_COUNT: usize = 10;
     let mut min_unique: Option<u32> = None;
     // Not cleared at the top of the loop, deliberately: `tokio::select!`
-    // can cancel `read_line_bounded_with_timeout` mid-line (a spot arrived
+    // can cancel `read_line_bounded_telnet` mid-line (a spot arrived
     // first), and the bytes it already consumed from `reader` were
     // already appended into `cmd_line` as a side effect before that
     // cancellation point -- clearing here would discard them, silently
@@ -349,7 +600,29 @@ async fn handle_client(
         crate::rate_limit::RateLimiter::new(MAX_TELNET_COMMANDS, COMMAND_RATE_WINDOW);
     loop {
         tokio::select! {
-            spot = rx.recv() => {
+            // MAN-45 remediate (round-19 P1 review finding): every arm that
+            // can perform a client write is DISABLED once `shutdown` is
+            // pending, so the shutdown-drain arm below is the only one this
+            // `select!` can still take. `tokio::select!` picks a random
+            // ready arm, so without this precondition a client with a
+            // backlog could win the live-spot arm again and again --
+            // performing an unbounded number of two-`WRITE_TIMEOUT` writes
+            // AFTER shutdown was signalled and before its own
+            // `CLIENT_DRAIN_DEADLINE` clock ever started, which is exactly
+            // what `SHUTDOWN_DRAIN_DEADLINE`'s `2 * WRITE_TIMEOUT +
+            // CLIENT_DRAIN_DEADLINE` model assumes cannot happen. With the
+            // precondition, at most ONE such write can still be in flight
+            // (the one already selected when shutdown fired), which is what
+            // that model budgets for.
+            //
+            // `has_changed` (never `changed`) only PEEKS the pending value
+            // without marking it seen, so the `_ = shutdown.changed() =>`
+            // arm below still fires normally on the next trip -- the same
+            // idiom the `sh/dx` replay loop already uses. `unwrap_or(true)`
+            // treats a dropped sender as "shutting down": the drain arm
+            // resolves immediately in that case too, so the loop still
+            // makes progress rather than disabling every arm forever.
+            spot = rx.recv(), if !shutdown.has_changed().unwrap_or(true) => {
                 match spot {
                     Ok(bus_spot) => {
                         if let Some(min) = min_unique {
@@ -358,7 +631,7 @@ async fn handle_client(
                                 continue; // below threshold: filtered out
                             }
                         }
-                        if write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot)
+                        if write_spot_line(&mut wr, &bus, &profile.call, &bus_spot.spot, line_format)
                             .await
                             .is_err()
                         {
@@ -373,7 +646,10 @@ async fn handle_client(
                             if log_enabled {
                                 tracing::warn!("telnet: spot write failed, disconnecting");
                             }
-                            metrics.record_write_failed(1 + rx.len() as u64);
+                            metrics.record_write_failed(crate::metrics::abandoned_spot_count(
+                                true,
+                                rx.len(),
+                            ));
                             return Ok(());
                         }
                     }
@@ -404,7 +680,12 @@ async fn handle_client(
             // must never be disconnected just for staying quiet. (Round-5
             // review finding: this branch used to reuse the timed variant
             // here too, which cut off exactly that client after 30s.)
-            n = read_line_bounded(&mut reader, &mut cmd_line) => {
+            // Guarded for the same reason as the live-spot arm above: a
+            // command this arm accepts can itself write (a `sh/dx` replay,
+            // a filter ack), so leaving it enabled after shutdown was
+            // signalled would let a chatty client keep pushing the drain
+            // arm out of the way with writes of its own.
+            n = read_line_bounded_telnet(&mut reader, &mut cmd_line, &mut iac), if !shutdown.has_changed().unwrap_or(true) => {
                 let n = match n {
                     Ok(n) => n,
                     Err(e) => {
@@ -414,6 +695,33 @@ async fn handle_client(
                         return Err(ClientError::Logged);
                     }
                 };
+                // Mid-session negotiation (rare once every option has
+                // been refused once) is answered here rather than inside
+                // the read: `wr` is already mutably borrowed by this
+                // `select!`'s spot-writing branch, so the read future
+                // cannot hold it too.
+                if iac.has_replies() {
+                    let replies = iac.take_replies();
+                    if write_with_timeout(&mut wr, &replies).await.is_err() {
+                        // A bare `Ok(())` here (the prior behavior) was the
+                        // only write-failure site in this function that
+                        // left the accounting gap open -- the same one
+                        // every other write site already closes (round-15
+                        // review finding). The failed write itself isn't a
+                        // queued spot, so only the retained live-channel
+                        // backlog counts here (no `1 +`), matching the
+                        // filter-ack site below.
+                        // MAN-87 remediation (round-4 validation, code-
+                        // review finding F1).
+                        if log_enabled {
+                            tracing::warn!(
+                                "telnet: negotiation reply write failed, disconnecting"
+                            );
+                        }
+                        metrics.record_write_failed(rx.len() as u64);
+                        return Ok(());
+                    }
+                }
                 if n == 0 {
                     if log_enabled {
                         tracing::info!("telnet: client disconnected");
@@ -447,53 +755,170 @@ async fn handle_client(
                 // recorded, leaving the audit trail unable to reconstruct
                 // what happened -- only the over-budget disconnect above
                 // was logged. Logs the PARSED, normalized command
-                // (`Command`'s own Debug -- an enum variant plus already-
-                // validated numeric fields, e.g. `ShowDx { count: Some(50) }`
-                // or bare `Unknown`), never the raw client-supplied line,
-                // which is unescaped and could otherwise inject the same
-                // way the login field could (see the fix just above).
-                let parsed_command = command::parse(&cmd_line);
+                // with validated numeric fields, rendered as canonical text.
+                // Never log the raw client line, which could inject controls
+                // just like the login field above.
+                //
+                // MAN-87 remediation (code-review finding 1): trimmed with
+                // the same predicate as the login line before parsing.
+                // `read_line_bounded_telnet` now recognizes CR NUL as a
+                // line terminator (interactive BSD/macOS `telnet(1)`), and
+                // both terminator bytes stay in `cmd_line`; `command::parse`
+                // only calls `str::trim`, which does not strip NUL, so
+                // `"sh/dx\r\0"` tokenized to `["SH", "DX", "\0"]` and every
+                // command from that client class was silently `Unknown`.
+                // `command.rs` is outside this ticket's change scope, so
+                // the trim happens at this call site instead of inside it.
+                let parsed_command = command::parse(trim_login(&cmd_line));
                 if log_enabled {
-                    tracing::info!(command = ?parsed_command, "telnet: command received");
+                    tracing::info!(command = %command_description(&parsed_command), "telnet: command received");
                 }
                 match parsed_command {
-                    Command::ShowDx { count } => {
-                        let n = count.unwrap_or(DEFAULT_SHOW_DX_COUNT);
+                    Command::ShowDx(query) => {
+                        // MAN-92: band/mode/count/minutes selection happens
+                        // first, entirely off-socket; only the selected
+                        // entries reach the loop below. Entries the query
+                        // didn't ask for are outside the result, not lost
+                        // spots, so nothing is counted for them.
+                        //
                         // Apply the SAME `min_unique` predicate the live
                         // stream uses -- a spot suppressed live must stay
                         // suppressed when replayed via `sh/dx`, not leak
                         // through unfiltered and uncounted (round-11
                         // review finding). `bus.recent` carries each
                         // spot's publish-time occurrence_count precisely
-                        // so this comparison is possible here.
-                        let mut history = bus.recent(n).into_iter();
-                        while let Some(bus_spot) = history.next() {
+                        // so this comparison is possible here. Applied
+                        // AFTER count selection, without backfilling, as
+                        // before MAN-92.
+                        let mut history =
+                            select_history_at(&bus, &query, unix_now_secs()).into_iter();
+                        loop {
+                            // MAN-45 remediate (round-16 P1, finding 2):
+                            // checked BEFORE pulling the next history
+                            // entry, not left to `select!` to notice
+                            // `shutdown` between commands -- `select!` only
+                            // polls its other branches once THIS one's
+                            // future resolves, so a full un-checked replay
+                            // of up to `bus::MAX_HISTORY_SPOTS` entries (each
+                            // up to two `WRITE_TIMEOUT`s) could otherwise
+                            // run far beyond the drain deadline after shutdown was
+                            // already signalled, invisible to the shutdown-
+                            // drain branch below the whole time. `has_changed`
+                            // (never `changed`, which this loop doesn't own
+                            // as a `select!` branch) only PEEKS the pending
+                            // value without marking it seen, so the real
+                            // `_ = shutdown.changed() =>` branch still fires
+                            // normally afterwards for whatever's left on
+                            // the live channel.
+                            //
+                            // MAN-45 remediate (round 17, CR-2/CR-3): `break`
+                            // back to the `select!` loop instead of
+                            // `return`ing directly -- the loop's own
+                            // `_ = shutdown.changed() =>` branch still has
+                            // its full, unused `CLIENT_DRAIN_DEADLINE`
+                            // budget and can actually DELIVER the live `rx`
+                            // backlog (e.g. spots `TrackManager::finish()`
+                            // just published), rather than abandoning it
+                            // outright on a healthy, fast-reading client
+                            // (CR-2). The remaining `history` entries are
+                            // deliberately NOT charged to
+                            // `manta_spots_dropped_write_failed_total` here:
+                            // they are replays of spots already published
+                            // (and already counted once in
+                            // `manta_spots_total`, often already delivered
+                            // live to this same client), not newly-lost
+                            // live spots -- charging them on an ordinary,
+                            // no-write-failure shutdown fabricated data
+                            // loss on that counter (CR-3).
+                            //
+                            // MAN-45 remediate (code-review round 19, P2):
+                            // they are no longer SILENT either, though.
+                            // CR-3's argument was only ever about which
+                            // counter, not about whether the loss is
+                            // visible -- ARCHITECTURE §8 ("every
+                            // dropped/evicted/suppressed item is counted")
+                            // applies to abandoned replay entries as much
+                            // as it already does to replay entries a
+                            // filter suppresses a few lines below. They
+                            // now go to the dedicated
+                            // `manta_spots_replay_abandoned_total`, which
+                            // keeps `..._write_failed_total`'s
+                            // "delivered + counted == published"
+                            // arithmetic intact.
+                            if shutdown.has_changed().unwrap_or(true) {
+                                let unreplayed = history.len();
+                                if log_enabled {
+                                    tracing::info!(
+                                        unreplayed_history = unreplayed,
+                                        "telnet: shutdown signalled mid sh/dx replay, deferring to the drain loop for the live backlog"
+                                    );
+                                }
+                                metrics.record_replay_abandoned(unreplayed as u64);
+                                break;
+                            }
+                            let Some(bus_spot) = history.next() else {
+                                break;
+                            };
                             if let Some(min) = min_unique {
                                 if bus_spot.occurrence_count <= min {
                                     metrics.record_filter_suppressed(1);
                                     continue;
                                 }
                             }
-                            if write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot)
+                            if write_spot_line(&mut wr, &bus, &profile.call, &bus_spot.spot, line_format)
                                 .await
                                 .is_err()
                             {
                                 // A bare `?` here (the prior behavior)
-                                // abandoned not just the rest of this
-                                // history replay but every live spot
-                                // still retained in `rx` too, uncounted
-                                // (round-13 review finding) -- count this
-                                // failed write, whatever's left of the
-                                // history iterator, and whatever's still
-                                // retained on the live channel.
+                                // abandoned every live spot still retained
+                                // in `rx` too, uncounted (round-13 review
+                                // finding) -- that live backlog is real,
+                                // newly-lost data and must be counted.
+                                // MAN-45 remediate (code-review round 18,
+                                // finding 1): the failed write itself and
+                                // the rest of `history`, however, are NOT
+                                // added to THAT counter -- both are replays
+                                // of spots already published (and already
+                                // counted once in `manta_spots_total`,
+                                // often already delivered live to this same
+                                // client before `sh/dx` was even issued),
+                                // not newly-lost live spots. Charging replay
+                                // loss to `..._write_failed_total` would let
+                                // it overcount actual loss (and in principle
+                                // exceed `manta_spots_total`).
+                                //
+                                // MAN-45 remediate (code-review round 19,
+                                // P2): but not counting them ANYWHERE made
+                                // this site report zero loss whenever `rx`
+                                // happened to be empty, even though the
+                                // in-flight entry and all `history.len()`
+                                // entries behind it are abandoned -- which
+                                // contradicted ARCHITECTURE §8's
+                                // no-silent-loss rule and the filter-
+                                // suppression counting this very loop does
+                                // for replay entries a few lines above.
+                                // They now go to the dedicated
+                                // `manta_spots_replay_abandoned_total`
+                                // (the reviewer's own second remedy), so
+                                // the loss is visible without corrupting
+                                // the live-delivery counter's arithmetic.
                                 // MAN-59 review round 2: returns Ok(()),
                                 // not Err -- log it directly.
+                                let unreplayed = history.len();
                                 if log_enabled {
-                                    tracing::warn!("telnet: sh/dx history write failed, disconnecting");
+                                    tracing::warn!(
+                                        unreplayed_history = unreplayed,
+                                        "telnet: sh/dx history write failed, disconnecting"
+                                    );
                                 }
-                                metrics.record_write_failed(
-                                    1 + history.len() as u64 + rx.len() as u64,
-                                );
+                                metrics.record_write_failed(crate::metrics::abandoned_spot_count(
+                                    false,
+                                    rx.len(),
+                                ));
+                                // `1 +` for the entry whose write just
+                                // failed, mirroring `abandoned_spot_count`'s
+                                // `in_flight_spot` term on the live path.
+                                metrics.record_replay_abandoned(1 + unreplayed as u64);
                                 return Ok(());
                             }
                         }
@@ -520,14 +945,86 @@ async fn handle_client(
                             if log_enabled {
                                 tracing::warn!("telnet: filter-ack write failed, disconnecting");
                             }
+                            metrics.record_write_failed(crate::metrics::abandoned_spot_count(
+                                false,
+                                rx.len(),
+                            ));
+                            return Ok(());
+                        }
+                    }
+                    Command::Sett => {
+                        // Aggregator manual v6.0 §9.2: no SETT reply means
+                        // no spots forwarded. Uses the same write-failure
+                        // accounting every other write site in this loop
+                        // uses.
+                        if write_with_timeout(
+                            &mut wr,
+                            format!("{}\r\n", profile.sett).as_bytes(),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            if log_enabled {
+                                tracing::warn!("telnet: SETT reply write failed, disconnecting");
+                            }
                             metrics.record_write_failed(rx.len() as u64);
                             return Ok(());
                         }
                     }
-                    // Read-mostly protocol: any other line (unrecognized
-                    // commands the client sent) is accepted without
-                    // choking the connection.
-                    Command::Unknown => {}
+                    Command::Bye => {
+                        // Farewell, then close regardless: the client asked
+                        // to leave. A failed farewell write is a control-
+                        // write failure like the SETT and filter-ack sites
+                        // above, so it gets their accounting: the retained
+                        // live-channel backlog goes to `write_failed`
+                        // (no `1 +`, the farewell isn't a spot). After a
+                        // successful farewell the backlog is abandoned at
+                        // the client's own request, the same as a plain
+                        // client EOF (`n == 0` above), which also counts
+                        // nothing.
+                        if write_with_timeout(&mut wr, b"CU AGN!\r\n").await.is_err() {
+                            if log_enabled {
+                                tracing::warn!("telnet: BYE farewell write failed, disconnecting");
+                            }
+                            metrics.record_write_failed(rx.len() as u64);
+                            return Ok(());
+                        }
+                        if log_enabled {
+                            tracing::info!("telnet: client sent BYE, closing");
+                        }
+                        return Ok(());
+                    }
+                    Command::ShowVersion => {
+                        // MAN-92: the same compiled version the greeting
+                        // banner reports. Same control-write accounting as
+                        // SETT above.
+                        if write_with_timeout(
+                            &mut wr,
+                            format!("manta {}\r\n", env!("CARGO_PKG_VERSION")).as_bytes(),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            if log_enabled {
+                                tracing::warn!("telnet: version reply write failed, disconnecting");
+                            }
+                            metrics.record_write_failed(rx.len() as u64);
+                            return Ok(());
+                        }
+                    }
+                    // MAN-92: anything else (an unimplemented command, or a
+                    // known one with malformed arguments) gets a fixed
+                    // reply instead of silence, and the connection stays
+                    // up. Fixed text: the client's line is never echoed.
+                    Command::Unknown => {
+                        if write_with_timeout(&mut wr, b"Unknown command\r\n").await.is_err() {
+                            if log_enabled {
+                                tracing::warn!("telnet: unknown-command reply write failed, disconnecting");
+                            }
+                            metrics.record_write_failed(rx.len() as u64);
+                            return Ok(());
+                        }
+                    }
                 }
                 cmd_line.clear(); // a full line was consumed and processed
             }
@@ -537,38 +1034,72 @@ async fn handle_client(
             // published right before the daemon exited -- rather than
             // dropping them unsent.
             _ = shutdown.changed() => {
+                // MAN-45 (round-16 finding): this loop's OWN deadline. The
+                // outer `SHUTDOWN_DRAIN_DEADLINE`/`await_all` bound is
+                // registry-wide and cannot scale with any one client's
+                // backlog depth -- and when it expired,
+                // `Runtime::shutdown_timeout` aborted this task mid-write
+                // with everything abandoned uncounted. Same monotonic
+                // remaining-budget idiom `looks_like_websocket_handshake`
+                // already uses in `json_stream`.
+                //
                 // A `Lagged(n)` mid-drain means this subscriber missed `n`
                 // spots, not that the channel is empty -- there can still
                 // be spots queued after the gap. Stopping on the first
                 // `Err` (the prior behavior) silently dropped everything
                 // from that point on without even recording the loss
                 // (round-6 review finding).
+                let drain_deadline = tokio::time::Instant::now() + drain_deadline;
                 loop {
                     match rx.try_recv() {
                         Ok(bus_spot) => {
                             if let Some(min) = min_unique {
                                 if bus_spot.occurrence_count <= min {
                                     metrics.record_filter_suppressed(1);
-                                    continue;
+                                    continue; // a filtered spot costs no budget
                                 }
                             }
-                            if write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot)
-                                .await
-                                .is_err()
-                            {
-                                // The client's socket is presumably dead --
-                                // further writes would just fail too. A
-                                // bare `?` here (the prior behavior)
-                                // propagated the error out of the whole
-                                // handler, abandoning the rest of the
+                            // Checked BEFORE the write, not around it: this
+                            // spot has already left `rx`, so a `timeout`
+                            // wrapped around the whole loop would drop it
+                            // mid-write -- neither delivered nor counted,
+                            // reintroducing the silent loss this fix exists
+                            // to end. `true` (in-flight) is exactly that
+                            // spot.
+                            let remaining = drain_deadline
+                                .saturating_duration_since(tokio::time::Instant::now());
+                            let timed_out = remaining.is_zero()
+                                || !matches!(
+                                    tokio::time::timeout(
+                                        remaining,
+                                        write_spot_line(&mut wr, &bus, &profile.call, &bus_spot.spot, line_format),
+                                    )
+                                    .await,
+                                    Ok(Ok(())),
+                                );
+                            if timed_out {
+                                // The client's socket is presumably dead
+                                // (or hopelessly slow) -- further writes
+                                // would just fail or exhaust the budget
+                                // too. A bare `?` here (the pre-round-12
+                                // behavior) propagated the error out of the
+                                // whole handler, abandoning the rest of the
                                 // drain loop uncounted (round-12 review
-                                // finding).
-                                // MAN-59 review round 2: returns Ok(()),
-                                // not Err -- log it directly.
+                                // finding); a flat outer deadline alone
+                                // (the pre-round-16 behavior) let
+                                // `Runtime::shutdown_timeout` abort this
+                                // task mid-write once a multi-spot backlog
+                                // exceeded it, also uncounted (round-16
+                                // review finding).
                                 if log_enabled {
-                                    tracing::warn!("telnet: shutdown-drain write failed, disconnecting");
+                                    tracing::warn!(
+                                        "telnet: shutdown-drain write failed or ran out of budget, disconnecting"
+                                    );
                                 }
-                                metrics.record_write_failed(1 + rx.len() as u64);
+                                metrics.record_write_failed(crate::metrics::abandoned_spot_count(
+                                    true,
+                                    rx.len(),
+                                ));
                                 return Ok(());
                             }
                         }
@@ -584,14 +1115,66 @@ async fn handle_client(
     }
 }
 
+/// `sh/dx` default when the client asked for neither a count nor a
+/// minutes window (Aggregator manual v6.0 §10.5: "Shows the last 10 spots").
+const DEFAULT_SHOW_DX_COUNT: usize = 10;
+
+/// The retained history entries one `sh/dx` request replays, oldest first
+/// (MAN-92). Pure: no socket, no clock read (`now_unix_secs` is the
+/// caller's), no bus mutation.
+///
+/// Band, mode and minutes filtering run over the whole retained history
+/// BEFORE count truncation, so `sh/dx 5 BAND 20m` returns the five newest
+/// 20m entries even when newer 40m ones exist. A minutes window keeps every
+/// match (no ten-row default); it is matched against each entry's heard
+/// time -- the Zulu time the row shows -- inclusive at both ends, so an
+/// entry stamped in the future is excluded. Every request is still bounded
+/// by the bus's heard-time window, newest-entry floor and `bus::MAX_HISTORY_SPOTS`
+/// ceiling (MAN-93).
+fn select_history_at(bus: &SpotBus, query: &ShowDxQuery, now_unix_secs: i64) -> Vec<BusSpot> {
+    // manta decodes CW only: CW matches every spot, RTTY none.
+    if query.mode == Some(QueryMode::Rtty) {
+        return Vec::new();
+    }
+    let in_band = |entry: &BusSpot| {
+        query
+            .band
+            .is_none_or(|band| crate::band::band_for_freq_hz(entry.spot.freq_hz) == band)
+    };
+    match query.selection {
+        HistorySelection::Count(n) => {
+            bus.select_recent(in_band, n.unwrap_or(DEFAULT_SHOW_DX_COUNT))
+        }
+        // An explicit zero-minute window selects nothing, like `sh/dx 0`.
+        HistorySelection::Window { secs: 0 } => Vec::new(),
+        HistorySelection::Window { secs } => {
+            let oldest = now_unix_secs.saturating_sub(secs).max(0);
+            bus.select_recent(
+                |entry| {
+                    in_band(entry)
+                        && (oldest..=now_unix_secs).contains(&bus.unix_ts_for(entry.spot.sample_ts))
+                },
+                usize::MAX,
+            )
+        }
+    }
+}
+
+fn unix_now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
 async fn write_spot_line(
     wr: &mut tokio::net::tcp::OwnedWriteHalf,
     bus: &SpotBus,
     station_call: &str,
     spot: &manta_spot::Spot,
+    line_format: rbn::LineFormat,
 ) -> std::io::Result<()> {
     let unix_ts = bus.unix_ts_for(spot.sample_ts);
-    let line = rbn::format_line(spot, station_call, unix_ts);
+    let line = rbn::format_line(spot, station_call, unix_ts, line_format);
     write_with_timeout(wr, line.as_bytes()).await?;
     write_with_timeout(wr, b"\r\n").await
 }
@@ -603,4 +1186,550 @@ async fn write_with_timeout(
     tokio::time::timeout(WRITE_TIMEOUT, wr.write_all(buf))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "write timed out"))?
+}
+
+/// Strips the framing a real telnet client wraps its callsign in.
+///
+/// MAN-87 scenario 2: RFC 854's NVT encodes Enter as CR NUL, and macOS
+/// `telnet(1)` with piped stdin sends exactly that. `str::trim` alone is
+/// not enough -- it stops at the first character that is not Unicode
+/// whitespace, and NUL is not whitespace, so a trailing `\r\0` keeps BOTH
+/// bytes (the NUL stops the scan before the CR is ever reached) and they
+/// end up in the audit log, and in whatever identity this value grows
+/// into.
+///
+/// Trimming only. The login line itself goes through MAN-86's
+/// `sanitize_login` (this predicate plus callsign-shape checks); this
+/// function remains for post-login command lines, which have no shape
+/// to check.
+fn trim_login(raw: &str) -> &str {
+    raw.trim_matches(|c: char| c.is_whitespace() || c == '\u{0}')
+}
+
+/// Canonical audit text uses parsed fields only, never untrusted raw input.
+fn command_description(command: &Command) -> String {
+    match command {
+        Command::ShowDx(query) => {
+            let mut text = String::from("sh/dx");
+            match query.selection {
+                HistorySelection::Count(Some(n)) => text.push_str(&format!(" {n}")),
+                HistorySelection::Count(None) => {}
+                HistorySelection::Window { secs } => text.push_str(&format!(" {}m", secs / 60)),
+            }
+            if let Some(band) = query.band {
+                text.push_str(&format!(" BAND {band}"));
+            }
+            match query.mode {
+                Some(QueryMode::Cw) => text.push_str(" CW"),
+                Some(QueryMode::Rtty) => text.push_str(" RTTY"),
+                None => {}
+            }
+            text
+        }
+        Command::SetFilterUnique { min } => format!("set dx filter unique > {min}"),
+        Command::Sett => "SKIMMER/SETT".into(),
+        Command::Bye => "BYE".into(),
+        Command::ShowVersion => "sh/version".into(),
+        Command::Unknown => "unknown".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn command_audit_text_keeps_validated_arguments_without_debug_variants() {
+        let dx = |selection, band, mode| {
+            Command::ShowDx(ShowDxQuery {
+                selection,
+                band,
+                mode,
+            })
+        };
+        for (command, expected) in [
+            (Command::ShowDx(ShowDxQuery::DEFAULT), "sh/dx"),
+            (
+                dx(HistorySelection::Count(Some(50)), None, None),
+                "sh/dx 50",
+            ),
+            (
+                dx(
+                    HistorySelection::Window { secs: 20 * 60 },
+                    Some("20m"),
+                    Some(QueryMode::Cw),
+                ),
+                "sh/dx 20m BAND 20m CW",
+            ),
+            (
+                dx(HistorySelection::Count(None), None, Some(QueryMode::Rtty)),
+                "sh/dx RTTY",
+            ),
+            (
+                Command::SetFilterUnique { min: 2 },
+                "set dx filter unique > 2",
+            ),
+            (Command::Sett, "SKIMMER/SETT"),
+            (Command::Bye, "BYE"),
+            (Command::ShowVersion, "sh/version"),
+            (Command::Unknown, "unknown"),
+        ] {
+            assert_eq!(command_description(&command), expected);
+        }
+    }
+
+    use super::*;
+    use manta_spot::{Spot, SpotType};
+
+    /// One sample per second, so a spot's `sample_ts` is its heard time in
+    /// seconds after `SELECTOR_EPOCH_SECS`.
+    const SELECTOR_EPOCH_SECS: i64 = 1_700_000_000;
+
+    fn selector_bus() -> SpotBus {
+        SpotBus::new(
+            1.0,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(SELECTOR_EPOCH_SECS as u64),
+            0,
+        )
+    }
+
+    fn heard(callsign: &str, freq_hz: f64, secs_after_epoch: u64) -> Spot {
+        Spot {
+            callsign: callsign.to_string(),
+            freq_hz,
+            snr_db: 20.0,
+            wpm: 25.0,
+            spot_type: SpotType::Cq,
+            confidence: 0.9,
+            track_id: 1,
+            sample_ts: secs_after_epoch,
+            rst: None,
+            qrl_query: false,
+        }
+    }
+
+    fn calls(selected: &[BusSpot]) -> Vec<&str> {
+        selected.iter().map(|e| e.spot.callsign.as_str()).collect()
+    }
+
+    fn q(
+        selection: HistorySelection,
+        band: Option<&'static str>,
+        mode: Option<QueryMode>,
+    ) -> ShowDxQuery {
+        ShowDxQuery {
+            selection,
+            band,
+            mode,
+        }
+    }
+
+    const TWENTY: f64 = 14_027_100.0;
+    const FORTY: f64 = 7_027_000.0;
+
+    #[test]
+    fn legacy_count_selection_returns_the_newest_entries_oldest_first() {
+        let bus = selector_bus();
+        assert!(select_history_at(&bus, &ShowDxQuery::DEFAULT, 0).is_empty());
+        for i in 0..15 {
+            bus.publish(heard(&format!("K{i}AA"), TWENTY, i));
+        }
+        let expected_default: Vec<String> = (5..15).map(|i| format!("K{i}AA")).collect();
+        assert_eq!(
+            calls(&select_history_at(&bus, &ShowDxQuery::DEFAULT, 0)),
+            expected_default
+        );
+        assert_eq!(
+            calls(&select_history_at(
+                &bus,
+                &q(HistorySelection::Count(Some(3)), None, None),
+                0
+            )),
+            ["K12AA", "K13AA", "K14AA"]
+        );
+        assert!(
+            select_history_at(&bus, &q(HistorySelection::Count(Some(0)), None, None), 0).is_empty()
+        );
+        assert_eq!(
+            select_history_at(&bus, &q(HistorySelection::Count(Some(1000)), None, None), 0).len(),
+            15
+        );
+    }
+
+    #[test]
+    fn a_minutes_window_and_a_large_count_reach_every_retained_spot() {
+        let bus = selector_bus();
+        for i in 0..600 {
+            bus.publish(heard(&format!("K{i}AA"), TWENTY, i));
+        }
+        let expected: Vec<String> = (0..600).map(|i| format!("K{i}AA")).collect();
+        for selection in [
+            HistorySelection::Count(Some(1000)),
+            HistorySelection::Window { secs: 1800 },
+        ] {
+            assert_eq!(
+                calls(&select_history_at(
+                    &bus,
+                    &q(selection, None, None),
+                    SELECTOR_EPOCH_SECS + 600
+                )),
+                expected
+            );
+        }
+        assert_eq!(
+            calls(&select_history_at(&bus, &ShowDxQuery::DEFAULT, 0)),
+            expected[590..]
+        );
+    }
+
+    #[test]
+    fn selection_never_reaches_past_the_retained_history() {
+        let bus = selector_bus().with_history_minutes(1);
+        for i in 0..200 {
+            bus.publish(heard(&format!("K{i}AA"), TWENTY, i));
+        }
+        let expected: Vec<String> = (139..200).map(|i| format!("K{i}AA")).collect();
+        assert_eq!(
+            calls(&select_history_at(
+                &bus,
+                &q(HistorySelection::Count(Some(usize::MAX)), None, None),
+                0
+            )),
+            expected
+        );
+    }
+
+    #[test]
+    fn band_filtering_runs_before_count_truncation() {
+        // Newer 40m entries outnumber the requested count: truncating
+        // first would return nothing on 20m.
+        let bus = selector_bus();
+        for (call, freq) in [
+            ("K1AAA", TWENTY),
+            ("K2BBB", TWENTY),
+            ("K3CCC", TWENTY),
+            ("W4DDD", FORTY),
+            ("W5EEE", FORTY),
+            ("W6FFF", FORTY),
+            ("W7GGG", FORTY),
+            ("W8HHH", FORTY),
+        ] {
+            bus.publish(heard(call, freq, 0));
+        }
+        assert_eq!(
+            calls(&select_history_at(
+                &bus,
+                &q(HistorySelection::Count(Some(2)), Some("20m"), None),
+                0
+            )),
+            ["K2BBB", "K3CCC"]
+        );
+        assert_eq!(
+            calls(&select_history_at(
+                &bus,
+                &q(
+                    HistorySelection::Count(None),
+                    Some("20m"),
+                    Some(QueryMode::Cw)
+                ),
+                0
+            )),
+            ["K1AAA", "K2BBB", "K3CCC"]
+        );
+        assert!(select_history_at(
+            &bus,
+            &q(HistorySelection::Count(None), Some("15m"), None),
+            0
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn band_edges_are_inclusive_and_cover_every_allocation() {
+        let bus = selector_bus();
+        for (call, freq) in [
+            ("K1LOW", 14_000_000.0),
+            ("K1HIGH", 14_350_000.0),
+            ("K1BELOW", 13_999_999.0),
+            ("K1ABOVE", 14_350_001.0),
+            ("K1GAP", 15_000_000.0),
+            ("K1LF", 136_000.0),
+            ("K1SIX", 50_100_000.0),
+        ] {
+            bus.publish(heard(call, freq, 0));
+        }
+        let band = |name| {
+            calls(&select_history_at(
+                &bus,
+                &q(HistorySelection::Count(None), Some(name), None),
+                0,
+            ))
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(band("20m"), ["K1LOW", "K1HIGH"]);
+        assert_eq!(band("2200m"), ["K1LF"]);
+        assert_eq!(band("6m"), ["K1SIX"]);
+        // Every name the parser accepts selects something here or nothing,
+        // never an out-of-allocation frequency.
+        let named: usize = crate::band::allocations()
+            .iter()
+            .map(|(name, _, _)| band(name).len())
+            .sum();
+        assert_eq!(named, 4, "K1BELOW/K1ABOVE/K1GAP match no named band");
+    }
+
+    #[test]
+    fn minutes_window_bounds_are_inclusive_and_exclude_the_future() {
+        let bus = selector_bus();
+        // Published out of heard-time order on purpose: selection keeps
+        // publication order and never sorts by timestamp.
+        for (call, at) in [
+            ("K1NOW", 1_000),
+            ("K1EDGE", 940),
+            ("K1STALE", 939),
+            ("K1FUTURE", 1_001),
+            ("K1MID", 970),
+        ] {
+            bus.publish(heard(call, TWENTY, at));
+        }
+        let now = SELECTOR_EPOCH_SECS + 1_000;
+        let one_minute = q(HistorySelection::Window { secs: 60 }, None, None);
+        assert_eq!(
+            calls(&select_history_at(&bus, &one_minute, now)),
+            ["K1NOW", "K1EDGE", "K1MID"]
+        );
+        assert!(select_history_at(
+            &bus,
+            &q(HistorySelection::Window { secs: 0 }, None, None),
+            now
+        )
+        .is_empty());
+        assert_eq!(
+            calls(&select_history_at(
+                &bus,
+                &q(HistorySelection::Window { secs: i64::MAX }, None, None),
+                now
+            )),
+            ["K1NOW", "K1EDGE", "K1STALE", "K1MID"]
+        );
+    }
+
+    #[test]
+    fn a_minutes_window_is_not_truncated_to_the_default_count() {
+        let bus = selector_bus();
+        for i in 0..15 {
+            bus.publish(heard(&format!("K{i}AA"), TWENTY, 100 + i));
+        }
+        let now = SELECTOR_EPOCH_SECS + 200;
+        assert_eq!(
+            select_history_at(
+                &bus,
+                &q(HistorySelection::Window { secs: 600 }, None, None),
+                now
+            )
+            .len(),
+            15
+        );
+    }
+
+    #[test]
+    fn minutes_band_and_mode_combine() {
+        let bus = selector_bus();
+        bus.publish(heard("K1OLD", TWENTY, 0));
+        bus.publish(heard("K2NEW", TWENTY, 3_500));
+        bus.publish(heard("W3NEW", FORTY, 3_550));
+        let now = SELECTOR_EPOCH_SECS + 3_600;
+        let window = HistorySelection::Window { secs: 20 * 60 };
+        assert_eq!(
+            calls(&select_history_at(&bus, &q(window, None, None), now)),
+            ["K2NEW", "W3NEW"]
+        );
+        assert_eq!(
+            calls(&select_history_at(
+                &bus,
+                &q(window, Some("20m"), Some(QueryMode::Cw)),
+                now
+            )),
+            ["K2NEW"]
+        );
+    }
+
+    #[test]
+    fn cw_matches_all_of_mantas_spots_and_rtty_none() {
+        let bus = selector_bus();
+        bus.publish(heard("K1AAA", TWENTY, 0));
+        bus.publish(heard("W2BBB", FORTY, 1));
+        let unfiltered = calls(&select_history_at(&bus, &ShowDxQuery::DEFAULT, 0))
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls(&select_history_at(
+                &bus,
+                &q(HistorySelection::Count(None), None, Some(QueryMode::Cw)),
+                0
+            )),
+            unfiltered
+        );
+        for selection in [
+            HistorySelection::Count(None),
+            HistorySelection::Window { secs: i64::MAX },
+        ] {
+            assert!(select_history_at(
+                &bus,
+                &q(selection, None, Some(QueryMode::Rtty)),
+                SELECTOR_EPOCH_SECS + 10
+            )
+            .is_empty());
+        }
+    }
+
+    #[test]
+    fn trim_login_strips_the_cr_nul_a_real_telnet_client_sends() {
+        // Baseline first -- this is exactly why `str::trim` alone was not
+        // enough: NUL is not Unicode whitespace, so `trim` stops at it and
+        // never reaches the CR one position in.
+        assert_eq!("W5AU\r\u{0}".trim(), "W5AU\r\u{0}");
+
+        assert_eq!(trim_login("W5AU\r\u{0}"), "W5AU");
+        assert_eq!(trim_login("W5AU\r\u{0}\n"), "W5AU");
+        assert_eq!(trim_login("  W5AU  \r\n"), "W5AU");
+        assert_eq!(trim_login("W5AU\r\n"), "W5AU");
+        assert_eq!(trim_login("W5AU"), "W5AU");
+    }
+
+    #[test]
+    fn banner_line_carries_name_call_qth_and_grid() {
+        // Shape from the CW Skimmer manual's own greeting:
+        //   "CW Skimmer 1.3 is operated by Alex, VE3NEA in Richmond Hill, ON (FN03GW)"
+        assert_eq!(
+            operator_line(
+                "0.1.0",
+                Some("Art"),
+                "HB9H",
+                Some("Switzerland"),
+                Some("JN46la")
+            ),
+            "manta 0.1.0 is operated by Art, HB9H in Switzerland (JN46la)"
+        );
+    }
+
+    #[test]
+    fn banner_line_degrades_gracefully_when_optional_fields_are_absent() {
+        assert_eq!(
+            operator_line("0.1.0", None, "HB9H", Some("Switzerland"), Some("JN46la")),
+            "manta 0.1.0 is operated by HB9H in Switzerland (JN46la)"
+        );
+        assert_eq!(
+            operator_line("0.1.0", Some("Art"), "HB9H", None, Some("JN46la")),
+            "manta 0.1.0 is operated by Art, HB9H (JN46la)"
+        );
+        assert_eq!(
+            operator_line("0.1.0", None, "HB9H", None, None),
+            "manta 0.1.0 is operated by HB9H"
+        );
+    }
+
+    #[test]
+    fn login_check_accepts_real_world_callsign_shapes() {
+        // Deliberately wider than manta_spot::grammar::is_plausible, which
+        // MAN-45 finding 2 records as rejecting JW/LB2PG and GB3LER/B --
+        // both real. An SSID suffix is also legitimate from a cluster
+        // client.
+        for good in [
+            "N0CALL", "W1AW", "JW/LB2PG", "GB3LER/B", "W3XYZ-2", "VE3NEA", "4X1AA",
+        ] {
+            assert_eq!(
+                sanitize_login(&format!("{good}\r\n")).as_deref(),
+                Some(good)
+            );
+        }
+    }
+
+    #[test]
+    fn login_check_strips_the_trailing_cr_nul_a_real_telnet_client_sends() {
+        // RFC 854 encodes Enter as CR NUL; the ticket records these
+        // arriving from macOS telnet, and the prior research observed them
+        // reaching the audit log verbatim as login="N0CALL\r\0".
+        assert_eq!(sanitize_login("N0CALL\r\u{0}\n").as_deref(), Some("N0CALL"));
+        assert_eq!(sanitize_login("N0CALL\r\u{0}").as_deref(), Some("N0CALL"));
+        assert_eq!(sanitize_login("  N0CALL  \r\n").as_deref(), Some("N0CALL"));
+    }
+
+    #[test]
+    fn login_check_rejects_implausible_values() {
+        for bad in [
+            "NOT A CALLSIGN AT ALL",    // spaces
+            "",                         // empty
+            "\r\n",                     // bare terminator
+            "ABCDEF",                   // no digit
+            "12345",                    // no letter
+            "N0\u{0}CALL",              // EMBEDDED control byte, not trailing
+            "N0CALL\u{1b}[31m",         // ANSI escape
+            "AAAAAAAAAAAAAAAAAAAAAAAA", // over length
+        ] {
+            assert_eq!(
+                sanitize_login(bad),
+                None,
+                "{bad:?} should have been rejected"
+            );
+        }
+    }
+
+    /// MAN-134: a transport-level disconnect (a health probe, load
+    /// balancer or NAT dropping the connection with a reset) is routine
+    /// churn, not a security-relevant rejection -- same split as
+    /// `json_stream::is_ws_protocol_violation` (MAN-68 round 8).
+    #[test]
+    fn transport_level_errors_are_classified_as_disconnects() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+        ] {
+            assert!(
+                is_transport_disconnect(&Error::new(kind, "x")),
+                "{kind:?} should be a transport disconnect"
+            );
+        }
+        // The exact error the ticket's probe produced: the OS error a
+        // `fill_buf` read surfaces on an RST, not a hand-built one.
+        assert!(is_transport_disconnect(&Error::from_raw_os_error(
+            raw_econnreset()
+        )));
+    }
+
+    /// MAN-134: every rejection-shaped login-read error `bounded_io` can
+    /// produce -- oversized line, negotiation flood, invalid UTF-8, idle
+    /// timeout -- and any other socket error must keep the WARN rejection
+    /// line, not be downgraded to a routine disconnect.
+    #[test]
+    fn rejection_shaped_errors_are_not_classified_as_disconnects() {
+        use std::io::{Error, ErrorKind};
+        for e in [
+            Error::new(ErrorKind::InvalidData, "line exceeds maximum length"),
+            Error::new(ErrorKind::InvalidData, "excessive protocol negotiation"),
+            Error::new(ErrorKind::InvalidData, "line contains invalid UTF-8"),
+            Error::new(ErrorKind::TimedOut, "read timed out"),
+            Error::new(ErrorKind::PermissionDenied, "x"),
+        ] {
+            assert!(
+                !is_transport_disconnect(&e),
+                "{e:?} should stay a rejection"
+            );
+        }
+    }
+
+    /// ECONNRESET's raw value: 104 on Linux, 54 on macOS/BSD, 10054
+    /// (WSAECONNRESET) on Windows.
+    fn raw_econnreset() -> i32 {
+        if cfg!(target_os = "linux") {
+            104
+        } else if cfg!(windows) {
+            10054
+        } else {
+            54
+        }
+    }
 }

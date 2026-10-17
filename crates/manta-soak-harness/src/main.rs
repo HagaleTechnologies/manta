@@ -233,6 +233,8 @@ fn pileup_signals() -> Vec<SignalSpec> {
             let wpm = 18.0 + (i as f32 * 7.0) % 18.0; // 18..36 WPM spread
             let snr_2500_db = 4.0 + (i as f32 * 5.0) % 20.0; // 4..24 dB spread
             SignalSpec {
+                dit_units: 1.0,
+                element_gap_units: 1.0,
                 text: format!("CQ CQ DE {call} {call} K"),
                 loop_text: true,
                 wpm,
@@ -247,6 +249,10 @@ fn pileup_signals() -> Vec<SignalSpec> {
                 }),
                 watterson: None,
                 char_wpm: None,
+                weight: 3.0,
+                char_gap_units: 3.0,
+                word_gap_units: 7.0,
+                rise_ms: 5.0,
             }
         })
         .collect();
@@ -256,6 +262,8 @@ fn pileup_signals() -> Vec<SignalSpec> {
     // unit test (`soak_reports_no_panic_on_a_clean_short_signal`), which
     // is proven to decode "CQ CQ DE W1AW W1AW K" end to end.
     signals.push(SignalSpec {
+        dit_units: 1.0,
+        element_gap_units: 1.0,
         text: "CQ CQ DE N1CLR N1CLR K".to_string(),
         loop_text: true,
         wpm: 20.0,
@@ -265,6 +273,10 @@ fn pileup_signals() -> Vec<SignalSpec> {
         qsb: None,
         watterson: None,
         char_wpm: None,
+        weight: 3.0,
+        char_gap_units: 3.0,
+        word_gap_units: 7.0,
+        rise_ms: 5.0,
     });
     signals
 }
@@ -299,6 +311,15 @@ impl IqSource for LoopingAudioIqSource {
 
     fn center_freq_hz(&self) -> f64 {
         0.0 // audio has no RF reference, matches AudioIqSource
+    }
+
+    // MAN-312: matches AudioIqSource, so `soak_with_metrics` judges static
+    // crashes over the same rig-audio passband `manta run` does.
+    fn rf_passband_hz(&self) -> (f64, f64) {
+        (
+            manta_input::AUDIO_PASSBAND_LO_HZ,
+            manta_input::AUDIO_PASSBAND_HI_HZ,
+        )
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
@@ -435,7 +456,11 @@ fn main() -> Result<()> {
                 "silent": s.close_counts.silent,
                 "merged": s.close_counts.merged,
                 "evicted": s.close_counts.evicted,
+                "rtty": s.close_counts.rtty,
+                "not_cw": s.close_counts.not_cw,
+                "unkeyed": s.close_counts.unkeyed,
             },
+            "static_crashes": s.static_crashes,
         });
         let text = match serde_json::to_string(&line) {
             Ok(t) => t,
@@ -558,7 +583,11 @@ fn main() -> Result<()> {
             "silent": report.final_close_counts.silent,
             "merged": report.final_close_counts.merged,
             "evicted": report.final_close_counts.evicted,
+            "rtty": report.final_close_counts.rtty,
+            "not_cw": report.final_close_counts.not_cw,
+            "unkeyed": report.final_close_counts.unkeyed,
         },
+        "static_crashes": report.final_static_crashes,
         "man19_criteria": {
             "no_crash": no_crash,
             "no_input_overrun_by_construction": no_input_overrun,
@@ -595,4 +624,112 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use manta_engine::SoakMetricsReport;
+
+    /// `LoopingAudioIqSource` ending after `left` samples, so a run ends at a
+    /// fixed input length instead of `soak_with_metrics`' wall-clock watchdog.
+    /// That stop is why two otherwise identical `man19-soak` runs report
+    /// different totals (MAN-236).
+    struct BoundedSource {
+        inner: LoopingAudioIqSource,
+        left: usize,
+    }
+
+    impl IqSource for BoundedSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.sample_rate()
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz()
+        }
+        fn rf_passband_hz(&self) -> (f64, f64) {
+            self.inner.rf_passband_hz()
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            let n = buf.len().min(self.left);
+            if n == 0 {
+                return Ok(0);
+            }
+            let got = self.inner.read(&mut buf[..n])?;
+            self.left -= got;
+            Ok(got)
+        }
+    }
+
+    /// The harness scene at `seed`, `input_seconds` long, through
+    /// `soak_with_metrics` to EOF (an hour's duration is never reached).
+    fn bounded_report(real: &[f32], input_seconds: f64) -> SoakMetricsReport {
+        let src = Box::new(BoundedSource {
+            inner: LoopingAudioIqSource::new(real.to_vec()),
+            left: (input_seconds * FS_HZ).round() as usize,
+        });
+        let hour = Duration::from_secs(3600);
+        soak_with_metrics(src, &PipelineConfig::default(), hour, hour, |_| {}).unwrap()
+    }
+
+    fn scene(seed: u64, scene_seconds: f64) -> Vec<f32> {
+        let (complex, _) =
+            render_scene(&pileup_signals(), FS_HZ, scene_seconds, Some(seed)).unwrap();
+        complex.iter().map(|c| c.re).collect()
+    }
+
+    /// One line of the report's deterministic fields, for the MAN-236
+    /// before/after record (docs/DECISIONS/…-man236-…).
+    fn record_line(r: &SoakMetricsReport) -> String {
+        serde_json::json!({
+            "events_emitted": r.events_emitted,
+            "spots_emitted": r.spots_emitted,
+            "peak_active_tracks": r.peak_active_tracks,
+            "final_close_counts": {
+                "unconfirmed": r.final_close_counts.unconfirmed,
+                "hang_expired": r.final_close_counts.hang_expired,
+                "silent": r.final_close_counts.silent,
+                "merged": r.final_close_counts.merged,
+                "evicted": r.final_close_counts.evicted,
+                "rtty": r.final_close_counts.rtty,
+                "not_cw": r.final_close_counts.not_cw,
+                "unkeyed": r.final_close_counts.unkeyed,
+            },
+            "track_closed_events": r.track_closed_events,
+            "gate_records_total": r.gate_records_total,
+            "final_static_crashes": r.final_static_crashes,
+            "panicked": r.panicked,
+        })
+        .to_string()
+    }
+
+    /// MAN-236: a fixed-seed harness run bounded by input length reports the
+    /// same counts every time. Exact numbers are platform-dependent (libm),
+    /// so they live in the decision record, not here.
+    #[test]
+    fn a_bounded_fixed_seed_run_reproduces_its_report() {
+        let real = scene(DEFAULT_SEED, 10.0);
+        let a = bounded_report(&real, 30.0);
+        let b = bounded_report(&real, 30.0);
+        eprintln!("MAN-236 bounded report: {}", record_line(&a));
+        assert_eq!(record_line(&a), record_line(&b));
+        assert!(!a.panicked);
+        // The harness's own `workload_exercised` gate (main.rs:536-539).
+        assert!(a.events_emitted > 0 && a.peak_active_tracks > 0);
+        assert!(a.track_closed_events > 0 && a.gate_records_total > 0);
+    }
+
+    /// MAN-236 timing tool (release, ignored, like tests/cpu_budget.rs): the
+    /// harness's default 120 s scene, bounded to 300 s of input.
+    #[test]
+    #[ignore]
+    fn bounded_default_scene_timing() {
+        let real = scene(DEFAULT_SEED, 120.0);
+        let r = bounded_report(&real, 300.0);
+        eprintln!("MAN-236 bounded default-scene report: {}", record_line(&r));
+        eprintln!(
+            "MAN-236 bounded default-scene processing: {:.3} s",
+            r.duration_actual.as_secs_f64()
+        );
+    }
 }

@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
 
 [dependencies]
 anyhow = { workspace = true }
@@ -18,8 +22,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 manta-decode = { workspace = true }
 manta-dsp = { workspace = true }
+manta-input = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-manta-input = { workspace = true }
 tempfile = { workspace = true }

@@ -1,0 +1,18 @@
+[Unit]
+Description=manta CW skimmer, MAN-96 secondary-skimmer field node
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=manta
+Group=manta
+ExecStart=/usr/local/bin/manta run --config /etc/manta/manta-field.toml
+Restart=always
+RestartSec=10
+# SIGTERM drains (MAN-85): 50 s SHUTDOWN_DRAIN_DEADLINE + 2 s runtime shutdown, plus margin.
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

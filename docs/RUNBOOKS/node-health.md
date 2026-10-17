@@ -1,0 +1,260 @@
+# Node health runbook (MAN-128)
+
+How to tell whether a live manta node is healthy from its metrics endpoint
+alone — the question MAN-128 exists to answer. Covers `/healthz` as a
+liveness probe, the new `/metrics` families, and the known caveats.
+
+Both endpoints are served on the metrics listener (`[server].metrics_port`,
+bound to `[server].metrics_bind_addr`, `127.0.0.1` by default since
+MAN-132) — see `docs/RUNBOOKS/network-exposure.md` for exposure posture;
+`/healthz` carries exactly the same posture as `/metrics`, since it's the
+same listener.
+
+[`docs/METRICS.md`](../METRICS.md) lists every family the endpoint renders,
+with its type, labels and when it has samples.
+
+## `/healthz` as a liveness probe
+
+`GET /healthz` returns:
+
+- `200 OK`, body `ok\n` followed by one `<check>: <status>` line per check,
+  while every registered source is healthy, every registered listener
+  (telnet/JSON/metrics) is up, and the decode loop has made progress within
+  the last 10 seconds.
+- `503 Service Unavailable`, body `unhealthy\n` plus the same per-check
+  lines, otherwise — e.g. `source file: unhealthy`, `listener json: down`,
+  `decode: stalled 12s`, or `decode: stopped` (the daemon has exited the
+  decode loop and is draining shutdown).
+
+**The RBN uplink is deliberately not part of this verdict.** A dead uplink
+target does not make `/healthz` unhealthy — restarting a node that is
+decoding fine just because an upstream RBN collector is unreachable would
+make things worse, not better. Watch uplink health via the per-target
+`/metrics` families below instead.
+
+### Kubernetes
+
+The kubelet's `httpGet` probe connects to the pod IP, not to the
+container's loopback, so it needs the metrics listener widened: set
+`metrics_bind_addr = "0.0.0.0"` under `[server]` (or
+`MANTA_SERVER_METRICS_BIND_ADDR=0.0.0.0` in the pod spec), and restrict
+the port with a NetworkPolicy. The runtime image has no `curl`, but an
+`exec` probe can run `manta health --config <the pod's config path>`
+instead (MAN-81), which needs no widened listener.
+
+Each probe counts against the metrics listener's per-IP request budget
+(`[server].metrics_max_requests_per_ip`, 60 per 60 s per source address by
+default, MAN-64), shared with any scraper or other client on the same
+address. An over-budget probe gets `429 Too Many Requests`, which the
+kubelet counts as a failure; raise the key if probes and scrapers share an
+address at a combined rate above it. See `docs/RUNBOOKS/network-exposure.md`.
+
+```yaml
+livenessProbe:
+  # needs [server] metrics_bind_addr = "0.0.0.0": the kubelet probes the pod IP, not loopback
+  httpGet:
+    path: /healthz
+    port: 7302 # metrics_port
+  initialDelaySeconds: 10 # the decode loop's own ~2s calibration plus startup
+  periodSeconds: 10
+  failureThreshold: 3
+```
+
+### Docker
+
+The published image carries its own `HEALTHCHECK` (MAN-81):
+
+```dockerfile
+HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=3 \
+    CMD manta health --config "${MANTA_CONFIG:-/etc/manta/manta.toml}" --timeout-secs 3
+```
+
+`manta health` reads the config the daemon runs (the mounted
+`/etc/manta/manta.toml`, or `MANTA_CONFIG`) with the same `MANTA_SERVER_*`
+overrides, so it dials the `metrics_port` and `metrics_bind_addr` that file
+sets, and a wildcard bind is dialled on loopback. It re-reads the file at
+every check, while the daemon keeps the listener it started with: both keys
+are restart-only (SIGHUP reloads only `[spot]` lists and `dry_run`). After
+editing either one, restart the container: until then the check dials the
+new address, and reports unhealthy if the daemon is not listening there.
+An edit after which the file no longer loads, or has no `[server]` table,
+also fails the check, with the reason in the health log, until it is fixed
+or reverted. It asks
+`/healthz` and exits 0 on `200 ok`, 1 on anything else, and prints the
+report, which `docker inspect --format '{{json .State.Health.Log}}'`
+shows. It probes from inside the container, so `metrics_bind_addr` can
+stay `127.0.0.1`. Its 6 probes a minute count against the loopback
+address's per-IP budget (60 per 60 s by default). A container that is not
+running the daemon reports unhealthy; turn the check off with
+`docker run --no-healthcheck` or Compose's `healthcheck: disable: true`.
+Setup is in `packaging/README.md`.
+
+### systemd
+
+```ini
+[Service]
+ExecStartPost=/usr/bin/curl -f -s --retry 5 --retry-delay 2 \
+  http://127.0.0.1:7302/healthz
+```
+
+`manta health --config /path/to/manta.toml` is a config-aware alternative
+to the `curl` line: it dials the metrics port the config sets rather than a
+fixed 7302, and exits 0 only on a healthy report.
+
+(systemd has no native HTTP health-check unit type; pair this with a
+`Restart=on-failure` watchdog script polling the same endpoint on an
+interval if you need an ongoing liveness check, not just a post-start one.)
+
+## `/metrics` families this ticket added
+
+- `manta_spots_by_band_total{band,type}` — spot counts broken out by
+  amateur band and spot type (`cq`/`de`/`beacon`/`unknown`). Sums to the
+  pre-existing, still-unlabeled `manta_spots_total`.
+  ```promql
+  sum by (band) (rate(manta_spots_by_band_total[5m]))
+  ```
+- `manta_decode_latency_seconds` — a real histogram of per-chunk decode
+  wall-clock time (channelize + track + decode + validate, excluding the
+  source-read wait). Keeping up with real time requires the p99 to stay
+  below the chunk's real-time duration, `2048 / fs` seconds:
+  ```promql
+  histogram_quantile(0.99, rate(manta_decode_latency_seconds_bucket[5m]))
+  ```
+  Its `_count` rate is also the node's decode throughput in chunks/second.
+- `manta_start_time_seconds` / `manta_uptime_seconds` / `manta_build_info`
+  — process start time, uptime, and build metadata. Detect restarts:
+  ```promql
+  changes(manta_start_time_seconds[1h]) > 0
+  ```
+  `manta_build_info{git_sha="unknown"}` means the binary was built from a
+  context with no `.git` directory (e.g. a Docker build — `.dockerignore`
+  excludes `.git` on purpose) rather than a build failure.
+  `manta --version` on the host prints the same commit and feature list, and
+  the same `unknown` caveat applies.
+- `manta_uplink_target_*{target="host:port"}` — every uplink counter now
+  has a per-target series (`enabled`, `connected`, `sent_total`,
+  `suppressed_total`, `dropped_lagged_total`, `dropped_write_failed_total`,
+  `dropped_disconnected_total`, `reconnects_total`), alongside the
+  unchanged aggregate series (now derived sums). Find a stuck target:
+  ```promql
+  manta_uplink_target_connected == 0 and manta_uplink_target_enabled == 1
+  ```
+- `manta_healthy` / `manta_listener_up{listener}` — the exact same
+  evaluation `/healthz` reports, for a Prometheus-only operator with no
+  separate probe.
+- `manta_input_*{source="kiwi"}` — KiwiSDR sources now also publish the
+  packet-loss/malformed-frame counters HPSDR already had (MAN-56 generalized
+  beyond HPSDR). Under normal conditions the gap/malformed counters should
+  stay at 0; a steadily increasing `manta_input_gaps_detected_total` means
+  the receiver's network path is dropping SND frames.
+- `manta_input_*{source="soapy"}` — SoapySDR sources publish the same three
+  counters ([MAN-233](../DECISIONS/2026-10-15-man233-soapy-overflow-visibility.md)).
+  `manta_input_gaps_detected_total` counts driver stream overflows (samples
+  the host did not read in time), each also warned rate-limited on the log;
+  it should stay at 0, and a rising count means the host is not keeping up
+  with the radio's sample rate. `manta_input_dropped_packets_total` and
+  `manta_input_malformed_packets_total` always read 0 for SoapySDR: an
+  overflow carries no lost-sample estimate and there is no packet framing.
+- `manta_source_outages_total{source}` / `manta_source_down_seconds_total{source}`
+  (MAN-96) — how many times each input source went from healthy to unhealthy
+  (a lost connection or failed read), and the seconds it spent in outages
+  that have ended. Both start at 0 for every registered source; a source that
+  starts unhealthy (HPSDR until confirmed live) is not an outage. They catch
+  drops shorter than a scrape interval, which `manta_source_health` alone
+  misses. Source drops per day:
+  ```promql
+  increase(manta_source_outages_total[1d])
+  ```
+  An outage still in progress shows only as `manta_source_health == 0`; its
+  seconds are added to `manta_source_down_seconds_total` when it ends. The
+  30-day field-node ledger reads both
+  (`docs/RUNBOOKS/secondary-skimmer-field-node.md`).
+
+A ready Grafana dashboard and Prometheus alerts built on these queries are in
+[monitoring.md](monitoring.md) (MAN-129).
+
+## Decode quality (MAN-118)
+
+The families above say whether the node is running. Four more say whether
+its decoding looks healthy; see
+[MAN-118](../DECISIONS/2026-10-12-man118-decode-quality-metrics.md) for
+why they are node-wide, with no `track_id` label.
+
+- **Garble share.** `manta_decode_garbles_total` counts characters the
+  beam rejected outright; `manta_decode_chars_total` counts every decoded
+  character.
+  ```promql
+  rate(manta_decode_garbles_total[5m])
+    / (rate(manta_decode_garbles_total[5m]) + rate(manta_decode_chars_total[5m]))
+  ```
+  Expect this near 0 even on a hard band: the beam usually commits a wrong
+  character rather than a garble (the V8w pileup gave 3 in 9,690). A
+  sudden rise is a fault signal. The `hsmm` engine never garbles.
+- **Keying depth.** `manta_track_rail_ratio` samples each decoding track's
+  mark-rail / space-rail ratio once per second (`legacy` engine only).
+  ```promql
+  histogram_quantile(0.5, rate(manta_track_rail_ratio_bucket[5m]))
+  rate(manta_track_rail_ratio_bucket{le="2"}[5m]) / rate(manta_track_rail_ratio_count[5m])
+  ```
+  A clean strong signal reads around 20 to 30; the V5 CCIR-poor fading
+  vector reads a median of 3.3. A falling median, or a growing share at
+  `le="2"` (the floor the rails collapse to), means fading or QRM is eating
+  the keying depth the decoder relies on.
+- **Unconfirmed candidates.** `manta_candidate_repetitions` records, for
+  each callsign candidate the repetition gate scores, how many distinct
+  decodes of that call near that frequency it has seen in the last 90 s.
+  A candidate needs 2 to spot.
+  ```promql
+  rate(manta_candidate_repetitions_bucket{le="1"}[15m]) / rate(manta_candidate_repetitions_count[15m])
+  ```
+  A high share at `le="1"` means candidates are not confirming: busted
+  calls, or signals too short-lived to repeat.
+
+## Bad input samples (MAN-234)
+
+`manta_input_bad_samples_total{source}` counts input samples manta
+replaced with silence because a component was NaN, infinite, or larger
+than 1e17 in magnitude. Sources deliver full scale at 1.0, so any count
+above 0 means the source or its driver is delivering corrupt or
+mis-scaled floats. The series is 0 from startup and should stay there.
+
+```promql
+increase(manta_input_bad_samples_total[1h]) > 0
+```
+
+Decoding continues: each bad sample becomes `0+0j`, so the node does not
+crash or go deaf, but a burst of them is a gap in what it hears. One bad
+sample from a sound card or a `--capture-rate-hz` capture can count as
+several, because the filters ahead of the channelizer spread it (see
+[METRICS.md](../METRICS.md)).
+
+On stderr, `run` prints one line at the first bad sample and a total
+when the run ends if more followed:
+
+```text
+warning: the soapy input delivered 1 bad sample (NaN, infinite, or larger than 1e17 in magnitude); replaced with silence, decoding continues. Later ones are counted in manta_input_bad_samples_total and totalled when the run ends
+warning: the soapy input contained 12 bad samples (NaN, infinite, or larger than 1e17 in magnitude); each was replaced with silence and decoding continued -- check the source's sample format or driver
+```
+
+`manta decode` and `manta calibrate` print the second form, and the
+`doctor` and `soak` reports add an `input: N bad samples (…) replaced
+with silence` line. `manta check` on the same source does not replace
+anything: it fails with `source check failed: nonfinite input sample`
+when its window covers a NaN or infinite sample. Check the source's
+sample format (for example a float WAV written with the wrong scale) and
+the driver version, then watch the counter stay flat. See
+[MAN-234](../DECISIONS/2026-10-15-man234-bad-input-samples.md).
+
+## Known gaps
+
+- Signal-to-spot (track onset → first spot) latency is not yet a metric —
+  tracked as a follow-up to this ticket.
+- A SoapySDR driver that flags an overflow only with `SOAPY_SDR_END_ABRUPT`
+  on a successful read is not counted in
+  `manta_input_gaps_detected_total{source="soapy"}`; only overflows returned
+  as a read error are
+  ([MAN-233](../DECISIONS/2026-10-15-man233-soapy-overflow-visibility.md)).
+- Kiwi seq-gap counting is unit-tested against the documented frame layout
+  and upstream `kiwiclient` semantics, not yet live-verified against a real
+  receiver — tracked as a follow-up for the next live-hardware session (see
+  `wiki/pages/live-hardware-field-testing.md`).

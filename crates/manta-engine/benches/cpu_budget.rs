@@ -31,6 +31,8 @@ fn cpu_budget_scene() -> (Vec<Complex32>, f64, f64, PipelineConfig) {
         .map(|i| {
             let offset_hz = -90_000.0 + i as f64 * (180_000.0 / (N_SIGNALS - 1) as f64);
             SignalSpec {
+                dit_units: 1.0,
+                element_gap_units: 1.0,
                 text: "CQ CQ DE K1BNC K1BNC K".into(),
                 loop_text: true,
                 wpm: 20.0,
@@ -40,6 +42,10 @@ fn cpu_budget_scene() -> (Vec<Complex32>, f64, f64, PipelineConfig) {
                 qsb: None,
                 watterson: None,
                 char_wpm: None,
+                weight: 3.0,
+                char_gap_units: 3.0,
+                word_gap_units: 7.0,
+                rise_ms: 5.0,
             }
         })
         .collect();

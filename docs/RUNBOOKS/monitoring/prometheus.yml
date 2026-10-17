@@ -1,0 +1,13 @@
+# Example Prometheus configuration for manta nodes. See docs/RUNBOOKS/monitoring.md.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - manta-alerts.yml
+
+scrape_configs:
+  # MantaNodeDown matches up{job="manta"}: keep this job name, or edit that rule.
+  - job_name: manta
+    static_configs:
+      - targets: ["127.0.0.1:7302"]
