@@ -17,6 +17,27 @@ The Kiwi's native IQ stream is about 12 kHz. manta resamples it to 96 kS/s for
 its channelizer; that does not widen the 10 kHz of RF it requested. See the
 [KiwiSDR input notes](../DECISIONS/2026-07-25-m2-kiwisdr-input-pins.md).
 
+## Several CW segments from one Kiwi: `bands`
+
+`bands` plans one Kiwi channel per slice of a band's CW segment, instead of
+one `freq_hz` (MAN-310, [Band plans](../CONFIG.md#band-plans-bands)):
+
+```toml
+[server]
+station_callsign = "N0CALL"
+
+[input]
+type = "kiwi"
+host = "<your-kiwi-host>"
+bands = ["60m"]
+```
+
+60 m (5351.5 to 5366.5 kHz) is wider than one channel, so this opens two
+sessions, `kiwi-60m-1` at 5355.25 kHz and `kiwi-60m-2` at 5362.75 kHz, each
+starting tracks only on its own side of the split. Each stream is one Kiwi
+channel: keep a plan within the channels the owner lets you use. 40 m is
+five channels, and `"all"` (86) is over manta's 16 inputs.
+
 ## Use your own receiver, or a reserved slot
 
 Best: your own Kiwi, on your own network. Connections from the local network are
