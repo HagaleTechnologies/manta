@@ -1,0 +1,74 @@
+# Serena project definition for manta (MAN-274).
+#
+# Committed so the catalyst-dev codebase-analyzer / codebase-locator /
+# codebase-pattern-finder subagents get real symbol search here. Without it,
+# activate_project still succeeds, but Serena writes a config named after the
+# checkout directory, with read_only: false and no ignores, and leaves
+# untracked files in the tree. The index cache and an optional
+# project.local.yml override stay machine-local (.serena/.gitignore).
+#
+# All 25 ProjectConfig fields of Serena 2.0 are spelled out below under their
+# current key names (checked on oraios/serena 1de556f and d9e4c79). A missing
+# field, or a legacy key such as `languages:`, makes Serena re-save this file
+# on load and drop every comment in it. Serena 1.7 ignores the three keys it
+# does not know. crates/manta-decode/tests/serena_project_config.rs enforces
+# the key set; see docs/DECISIONS/2026-10-17-man274-serena-project-config.md.
+project_name: "manta"
+language_servers:
+- rust
+encoding: "utf-8"
+activation_command:
+activation_command_timeout: 180.0
+line_ending:
+language_backend:
+# The classic one-tool-per-operation interface (find_symbol,
+# find_referencing_symbols, ...), which the catalyst-dev agents call by name.
+# Serena 2.0.1's global default is the REPL interface. This value applies when
+# Serena starts with --project on this repo; activate_project in a running
+# session keeps the global setting.
+agent_interface: tools
+ignore_all_files_in_gitignore: true
+ls_specific_settings: {}
+ls_workspace_folders:
+- "."
+ls_additional_workspace_folders: []
+# Same syntax as .gitignore. Root-level entries are anchored with a leading /.
+ignored_paths:
+# Serena's own index cache.
+- ".serena/cache"
+# Build output. Restated from .gitignore:1 so it holds even if a local
+# override turns ignore_all_files_in_gitignore off.
+- "/target"
+# Cloud-runner cache. Some runners put CARGO_HOME (a vendored crates.io
+# registry) here and exclude it only through .git/info/exclude, which Serena
+# never reads: it reads files named .gitignore only.
+- "/.catalyst-cache"
+# Orchestrator config and runtime state, not source. Only three runtime files
+# under it are gitignored (.gitignore:33-35).
+- "/.catalyst"
+# Symlink out of the repo to the shared thoughts pool (.gitignore:41).
+- "/thoughts"
+# Transient parallel-work checkouts (.gitignore:8).
+- "/.worktrees"
+read_only: true
+excluded_tools: []
+included_optional_tools: []
+fixed_tools: []
+excluded_apis: []
+included_apis: []
+default_modes:
+added_modes:
+initial_prompt: |
+  manta: an open-source, cross-platform, wideband multi-signal CW skimmer in
+  Rust. It decodes every CW signal across an SDR passband and emits
+  RBN-compatible spots. 9-crate Cargo workspace under crates/; scripts/ holds
+  Python and shell release, CI and scoring tooling, not decode logic. Read
+  CLAUDE.md first: its "Documents (read in this order)" section lists the
+  documents to read and their order, and its status and key-constraints
+  sections apply to every change. manta reuses FFT, channel-impairment and
+  audio I/O code from the sibling coppa repo (wiki/pages/coppa-reuse.md).
+  Prefer get_symbols_overview, find_symbol and find_referencing_symbols over
+  grep for symbol questions; read_memory("codebase_map") has the crate map.
+symbol_info_budget:
+read_only_memory_patterns: []
+ignored_memory_patterns: []
