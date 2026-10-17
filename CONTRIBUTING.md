@@ -38,7 +38,7 @@ cargo build --locked -p manta-cli
 ```
 
 The debug executable is `target/debug/manta`, or `target/debug/manta.exe`
-on Windows. The default build does not include HPSDR or SoapySDR flags.
+on Windows. The default build includes HPSDR; SoapySDR remains optional.
 
 Run the core checks before requesting review:
 
@@ -67,15 +67,9 @@ version [the workflow](.github/workflows/supply-chain.yml) pins:
 license goes to an `ignore` or `allow` entry with a reason in `deny.toml`,
 which the code owner reviews.
 
-For changes affecting HPSDR, also run:
-
-```sh
-cargo clippy -p manta-input -p manta-cli --all-targets --features hpsdr --locked -- -D warnings
-cargo test -p manta-input -p manta-cli --features hpsdr --locked
-```
-
-HPSDR needs no additional native library. To build an executable with its
-flags, add `--features hpsdr` to the build command.
+HPSDR needs no additional native library, and the core checks above run
+its hardware-free tests. The `hpsdr` Cargo feature remains accepted as an
+empty compatibility feature; it does not change input support.
 
 For SoapySDR changes, first install the native SoapySDR development library
 and the driver module for your receiver. On Debian or Ubuntu the library

@@ -21,22 +21,10 @@ fn manta() -> Command {
     cmd
 }
 
-/// What rustc compiled this test crate with, independent of build.rs's
-/// `CARGO_CFG_FEATURE` read. Extend when manta-cli gains a feature.
+/// Verify CLI propagation against build metadata; the child-process feature
+/// matrix independently checks how that metadata is generated.
 fn expected_features() -> String {
-    let on: Vec<&str> = [
-        ("hpsdr", cfg!(feature = "hpsdr")),
-        ("soapy", cfg!(feature = "soapy")),
-    ]
-    .into_iter()
-    .filter(|(_, on)| *on)
-    .map(|(f, _)| f)
-    .collect();
-    if on.is_empty() {
-        "none".into()
-    } else {
-        on.join(",")
-    }
+    env!("MANTA_FEATURES").into()
 }
 
 /// `git rev-parse --short=12 HEAD` for this checkout, or None without git
@@ -272,21 +260,27 @@ fn exported_repository_variables_child() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), want);
 }
 
-/// Cargo passes an inherited `CARGO_FEATURE_*` through to build scripts, so
-/// `CARGO_FEATURE_SOAPY=1 cargo build` must not list soapy uncompiled. The
-/// child sees what Cargo sets for an hpsdr-only build plus a leaked soapy.
+/// Inherited `CARGO_FEATURE_*` variables must never contaminate Cargo's
+/// explicit feature list, including its empty and combined cases.
 #[test]
 fn build_script_ignores_inherited_feature_variables() {
     let one = std::ffi::OsStr::new("1");
-    run_child_test(
-        "inherited_feature_variables_child",
-        &[
-            ("CARGO_CFG_FEATURE", std::ffi::OsStr::new("hpsdr")),
-            ("CARGO_FEATURE_HPSDR", one),
-            ("CARGO_FEATURE_SOAPY", one),
-            ("BUILD_IDENTITY_FEATURES", std::ffi::OsStr::new("hpsdr")),
-        ],
-    );
+    for (selected, expected) in [
+        ("", "none"),
+        ("hpsdr", "hpsdr"),
+        ("soapy", "soapy"),
+        ("soapy,hpsdr", "hpsdr,soapy"),
+    ] {
+        run_child_test(
+            "inherited_feature_variables_child",
+            &[
+                ("CARGO_CFG_FEATURE", std::ffi::OsStr::new(selected)),
+                ("CARGO_FEATURE_HPSDR", one),
+                ("CARGO_FEATURE_SOAPY", one),
+                ("BUILD_IDENTITY_FEATURES", std::ffi::OsStr::new(expected)),
+            ],
+        );
+    }
 }
 
 /// Child half of `build_script_ignores_inherited_feature_variables`; a

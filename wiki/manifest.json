@@ -1,6 +1,11 @@
 {
+<<<<<<< HEAD
   "generated_at": "2026-10-17T00:45:00Z",
   "head_commit": "4529021",
+=======
+  "generated_at": "2026-10-16T22:46:15Z",
+  "head_commit": "b8b9367",
+>>>>>>> 35deb42de4260c19220c0fec9cd847f70bf93828
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -289,7 +294,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:eb40916133f50002e9dc5e628cbe0c77e70446b1b950c79c7418423a0d1cba7f",
+      "hash": "sha256:07e3ff49bc362e6abe31f465492ef507ed13e471be9d6d82e5915658ca3426f6",
       "id": "spot-output-contract",
       "kind": "interface",
       "links": [
@@ -307,16 +312,17 @@
         "docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md",
         "docs/RUNBOOKS/rbn-comparison.md",
         "docs/SPOT-SCHEMA.md",
-        "docs/DECISIONS/2026-10-14-man137-json-stream-resume.md"
+        "docs/DECISIONS/2026-10-14-man137-json-stream-resume.md",
+        "docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md"
       ],
       "status": "current",
       "title": "What spot-output contracts does manta expose (telnet RBN + JSON)?",
-      "verified_commit": "9636fe0494b4bce7973c3e0c5ad854f9ebc16f73",
-      "verified_date": "2026-10-14",
+      "verified_commit": "799379d",
+      "verified_date": "2026-10-16",
       "visibility": "public"
     },
     {
-      "hash": "sha256:9a55eface9ef3ab23316ec6056dd89bda124fc2757e00b7a4cd3a0654122ec8d",
+      "hash": "sha256:7b391ba7997d3069396aadb92d486b4997eeaa9f096d37fc52d62fb03d8d8e25",
       "id": "spot-validation",
       "kind": "subsystem",
       "links": [
@@ -332,12 +338,13 @@
         "docs/SPEC-decode-core.md#46-per-callsign-confidence-consumed-by-manta-spot",
         "docs/SPEC-decode-core.md#9-configuration-keys",
         "docs/DECISIONS/2026-09-09-beacon-emission-deferred-to-track-close.md",
-        "docs/DECISIONS/2026-10-14-man174-deferred-beacon-merge-bookkeeping.md"
+        "docs/DECISIONS/2026-10-14-man174-deferred-beacon-merge-bookkeeping.md",
+        "docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md"
       ],
       "status": "current",
       "title": "How does manta decide a decoded call is trustworthy enough to spot?",
-      "verified_commit": "60c4339",
-      "verified_date": "2026-10-14",
+      "verified_commit": "799379d",
+      "verified_date": "2026-10-16",
       "visibility": "public"
     },
     {
@@ -383,7 +390,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:4b7fed6fe439b6594d397e90be05c438ccb701d444a8007faebd118f5cffe503",
+      "hash": "sha256:9a2da65638fd93bd7dc66d89ef89b236fa4439ed1285102dec25872443b9ca0e",
       "id": "windows-build-setup",
       "kind": "howto",
       "links": [
@@ -395,13 +402,16 @@
       "sources": [
         ".github/workflows/ci-full.yml",
         ".github/workflows/release-publish.yml",
+        "CONTRIBUTING.md",
+        "scripts/check-release-ci.py",
+        "scripts/check-soapy-release.py",
         "docs/superpowers/specs/2026-09-11-man212-windows-platform-support-design.md",
         "docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md",
         "docs/DECISIONS/2026-10-15-man371-windows-required-check.md"
       ],
       "status": "current",
       "title": "How do I build and test manta on Windows?",
-      "verified_commit": "e7243d1",
+      "verified_commit": "799379d",
       "verified_date": "2026-10-16",
       "visibility": "public"
     }

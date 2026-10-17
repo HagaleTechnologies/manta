@@ -539,6 +539,8 @@ mod tests {
             confidence: 0.9,
             track_id: 9,
             sample_ts: 0,
+            rst: None,
+            qrl_query: false,
         };
         let mut spotted = decision(Verdict::Spotted, None);
         spotted.spot = Some(spot);

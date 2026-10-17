@@ -4,7 +4,7 @@
 Extracts ARCHIVE into a private temporary directory and runs only the extracted
 `manta`, never a build tree's binary:
 
-- `--version` succeeds and lists both the `hpsdr` and `soapy` features;
+- `--version` succeeds and lists the `soapy` feature;
 - `run`, `listen` and `check --help` succeed and offer every Soapy flag, and
   `--hpsdr-host` too;
 - the archive's own manta-run.1 and manta-check.1 document the Soapy flags;
@@ -41,7 +41,7 @@ REQUIRED_PAGES = ("manta.1", "manta-run.1", "manta-check.1", "manta-devices.1")
 SOAPY_FLAGS = ("--soapy-driver", "--soapy-freq-hz", "--soapy-rate-hz", "--soapy-gain")
 HELP_COMMANDS = ("run", "listen", "check")
 SOAPY_PAGES = ("manta-run.1", "manta-check.1")
-REQUIRED_FEATURES = {"hpsdr", "soapy"}
+REQUIRED_FEATURES = {"soapy"}
 MISSING_DRIVER = ("check", "--soapy-driver", "driver=man82_nonexistent",
                   "--soapy-freq-hz", "14025000", "--soapy-rate-hz", "96000")
 NO_MATCH = "SoapySDR::Device::make() no match"

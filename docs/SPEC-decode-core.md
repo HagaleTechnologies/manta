@@ -1006,6 +1006,15 @@ read long. Before any element gap has been observed, `dit_estimate = μ_dit`
 (no correction). Element gaps buffered during tracker warm-up (the first 5
 marks) feed `μ_egap` when they are replayed (MAN-315 D3).
 
+The mark that makes the tracker ready seeds the reporting EMA *before* that
+replay runs, so the seed itself is still mark-only. **[DEVIATION]** (MAN-265):
+immediately after the warm-up replay, the seed is replaced outright with
+`1200 / dit_estimate` — an assignment, not an EMA fold, because this is still
+the first sample (the replayed marks were already counted; only their gaps
+arrived late). A transmission that ends at the boundary — a beacon ID, a
+single exchange — reports the gap-corrected speed; every later live mark
+keeps the normal `α = 0.1` smoothing steps on top of the corrected seed.
+
 #### 4.1b Sender timing model
 
 **[DEVIATION]** (MAN-315, `docs/DECISIONS/2026-10-11-man315-sender-timing.md`):
@@ -1510,7 +1519,9 @@ Unlike V1–V10 (testkit-synthesized IQ), these operate at the
 `Validator::ingest` directly, no IQ synthesis involved. V11-V15, V18-V50
 are implemented in `crates/manta-spot/tests/golden_v11_v15.rs`; V16-V17
 (operator suppression, MAN-31 -- orthogonal to this pipeline, see
-ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
+ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`; V32-V33
+(non-gating RST/QRL? spot annotations, MAN-272) in
+`crates/manta-spot/tests/golden_v32_v33.rs`.
 
 | # | Name | Scenario | Pass criteria |
 |---|---|---|---|
@@ -1534,6 +1545,8 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V28 | reclassification-still-accepted | "DE K5ARH" spots as `De`; a `CQ` token then arrives as a genuinely new trailing word (not via aging) | A second spot promotes it to `Cq` -- V26/V27's fix rejects aging-driven changes specifically, not reclassification in general |
 | V29 | provenance-bound-to-occurrence | "CQ DE K5ARH K CQ DE K5ARH" repeats DE-K5ARH across two genuinely separate messages (MAN-100 Scenario 2 requires the gap); the newest K5ARH spots as `Cq` after 2 reps, then "CQ" and the first "DE" age out while the second "DE K5ARH" remains | No spot reclassifies to `De` -- provenance is bound to the exact word occurrence `evaluate_candidate` selects, not whichever occurrence the regex matched first |
 | V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37), track closed at a plausible speed | `BEACON`-tagged spot emits once the track closes, gate not applied regardless -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern; emission timing per V18's amendment note |
+| V32 | rst-on-spot | A track decodes `TU 5NN` before its callsign spots; a later `339` replaces it; a report aged out of the 16-word window is still carried | The spot carries `rst = "599"`, then `"339"`; aged-out still `"599"`; no report → `null` |
+| V33 | qrl-query-flag | A track sends `QRL?` before its callsign spots; bare `QRL`; a merge loser's `QRL?`; a closed track's `QRL?` | `qrl_query` true only in the first case; a merge survivor and a new track carry neither annotation (MAN-272 D5) |
 | V38 | variant-arbitration | A track decodes both a callsign and a confusable, less-supported variant of it (truncation or shared-prefix near-miss) inside one 90 s window -- variants V38b (per-track scoping) and V38c (a well-supported real call is not suppressed by a 1-rep head-merge artifact) | Only the better-supported candidate spots; arbitration is per track, and never fires against a form that could not itself be spotted |
 | V39 | same-message-repetition | One `CQ CQ DE <CALL> <CALL> K` transmission, then a second, genuinely later one | The first message's doubled call alone never satisfies the repetition gate (2 for its common pattern); the second message completes it |
 | V40 | truncation-arrives-first | A strict-prefix truncation clears the repetition gate on a track before the genuine, longer call has any support at all, which then appears | The genuine call still spots once observed -- the prefix-containment asymmetry fires regardless of arrival order (MAN-100 remediation C1) |
@@ -1677,7 +1690,7 @@ flush_gap_dits = 7.0
 #   file:  path*, iq, realtime, loop
 #   kiwi:  host*, freq_hz*, port, password
 #   soapy: driver*, freq_hz*, rate_hz*, gain_db   (build with --features soapy)
-#   hpsdr: host*, freq_hz*, rate_hz*, port        (build with --features hpsdr)
+#   hpsdr: host*, freq_hz*, rate_hz*, port        (included in every build)
 #   ka9q:  group*, port, ssrc, interface
 # Any source flag on the command line (--device, --source, --kiwi-host,
 # --soapy-driver, --hpsdr-host, --ka9q-group) replaces a typed [input]
@@ -1932,3 +1945,11 @@ defaults.
    (§3.2/§3.3, MAN-103): ARCHITECTURE §5's "adaptive threshold at their
    geometric mean" text is superseded — see
    `docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md`.
+7. **No ring-and-thread split** (ARCHITECTURE §1, §3, §10): ARCHITECTURE's
+   design put an `rtrb` ring between an input thread and a channelizer
+   thread, per-track queues in front of a decoder pool, and a crossbeam
+   channel into tokio. The implementation reads, channelizes, detects,
+   decodes and validates synchronously on one thread; the decoder pool is a
+   rayon pass joined every batch, and §6 rule 6 keeps its output independent
+   of scheduling. ARCHITECTURE §10 describes this model and keeps the ring
+   design as a target with the measurement that would justify building it.

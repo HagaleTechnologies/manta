@@ -11,9 +11,15 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+<<<<<<< HEAD
 | 2026-10-16 | MAN-273 | [MAN-273: a 511-tap Hilbert FIR and a source-declared DC/Nyquist spawn guard for live audio](2026-10-16-man273-hilbert-image-guard.md) |
+=======
+| 2026-10-16 | MAN-272 | [MAN-272: a spot carries its track's latest RST and a QRL? flag](2026-10-16-man272-rst-and-qrl-on-spots.md) |
+>>>>>>> 35deb42de4260c19220c0fec9cd847f70bf93828
 | 2026-10-16 | MAN-252 | [MAN-252: a stop request abandons a source reopen in flight](2026-10-16-man252-cancellable-source-reopen.md) |
 | 2026-10-16 | MAN-245 | [MAN-245: the Codex gate fails closed on an incomplete thread read, Dependabot is classified by author, and each required check names its source](2026-10-16-man245-gate-verdict-integrity.md) |
+| 2026-10-16 | MAN-238 | [MAN-238: CLAUDE.md is a short standing brief; its per-ticket log is archived here](2026-10-16-man238-standing-brief.md) |
+| 2026-10-15 | MAN-233 | [MAN-233: SoapySDR overflows are counted and warned, not silent](2026-10-15-man233-soapy-overflow-visibility.md) |
 | 2026-10-15 | MAN-236 | [MAN-236: the soak harness measures the loop manta run executes](2026-10-15-man236-soak-metrics-wraps-listen.md) |
 | 2026-10-15 | MAN-235 | [MAN-235: doctor hints a longer run, and --strict puts the verdict in the exit code](2026-10-15-man235-doctor-rerun-hint-and-strict-exit.md) |
 | 2026-10-15 | MAN-234 | [MAN-234: one bad input sample is replaced and counted, not fatal](2026-10-15-man234-bad-input-samples.md) |
