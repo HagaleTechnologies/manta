@@ -16,14 +16,19 @@ public infrastructure by nature, but enumerable by anyone who can reach
 the port, as `/metrics`'s `manta_uplink_target_*{target}` labels already
 are. See `docs/RUNBOOKS/uplink-health.md`.
 
-Everything above is inbound. manta has one *outbound* network exposure
-too: the KiwiSDR client (`--kiwi-host` / `[input] type = "kiwi"`)
-connects to an operator-chosen, third-party-operated receiver over
-plaintext `ws://` — including its optional password. Follow the
+Everything above is inbound. manta's *outbound* connections are the
+`[[rbn_uplink]]` targets (covered by
+[MAN-23's threat model](../DECISIONS/2026-09-02-man23-threat-model.md)),
+the `[rbn_compare]` telnet feed and the MAN-316 cty.dat/MASTER.SCP
+refresh (plain `http://`, see `docs/CONFIG.md`'s `refresh_lists`) —
+and the KiwiSDR client (`--kiwi-host` / `[input] type = "kiwi"`),
+which connects to an operator-chosen, third-party-operated receiver
+over plaintext `ws://` — including its optional password. Follow the
 password hygiene in `docs/GUIDES/kiwisdr.md` ("The password"), and read
 [MAN-275's threat-model decision](../DECISIONS/2026-10-17-man275-kiwi-threat-model.md)
-for the full disposition set (adversarial frames reconnect instead of
-killing the daemon; frames are size-bounded; the plaintext password is
+for the full disposition set (clean closes, protocol violations and
+oversized frames reconnect instead of killing the daemon; unknown-tag
+and too-short frames are discarded in place; the plaintext password is
 accepted risk).
 
 The telnet and JSON listeners bind `[server].bind_addr`, which defaults to
