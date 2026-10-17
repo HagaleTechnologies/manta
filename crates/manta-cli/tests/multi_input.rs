@@ -277,7 +277,7 @@ fn file_input_without_a_frequency_is_refused_naming_it() {
         stderr.contains(&format!(
             "input \"b\" ({}) carries no frequency of its own: set center_freq_hz in its \
              [[input]] entry",
-            bare.display()
+            toml_path(&bare)
         )),
         "{stderr}"
     );
