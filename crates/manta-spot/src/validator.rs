@@ -896,12 +896,17 @@ impl Validator {
                 // variant-arbitration ledger is still keyed by `track_id`
                 // (mirrors the pre-MAN-166 `RepetitionGate::forget_track`
                 // pattern), so it's still forgotten on close rather than
-                // swept. Known, unmeasured risk (not one of this ticket's
-                // measured V8/V8w cases): a real signal's track closing
-                // and reopening under a new `track_id` (MAN-166) resets
-                // its observed-word history here, the same class of bug
-                // MAN-166 fixed for the gate -- out of this ticket's scope
-                // to fix pre-emptively; revisit if measured in practice.
+                // swept. A real signal's track closing and reopening
+                // under a new `track_id` (MAN-166) resets its observed-
+                // word history here, the same class of bug MAN-166 fixed
+                // for the gate. MAN-108 measured that case (a Watterson
+                // fade outlasting the 5 s hang) and removed it at the
+                // source: a track that has decoded goes DORMANT for up to
+                // `hang_ms + reacquire_ms` and keeps its `track_id` when
+                // the signal returns, so no `TrackClosed` arrives and this
+                // state, `self.tracks`' and the MAN-272 annotations all
+                // survive such a fade. A signal gone longer than that
+                // still starts over here.
                 self.ledger.forget_track(*track_id);
                 self.maybe_sweep();
                 spots

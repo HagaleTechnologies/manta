@@ -20,7 +20,9 @@
 //! 1000 ms detector block), `crash_filter` (MAN-312, SPEC §2.7:
 //! `"full"`, `"starts-only"` or `"off"`), plus `non_cw_filter` and
 //! `unkeyed_close_ms` (MAN-313, SPEC §2.8; the timeout must be at least
-//! 1000 ms). Every key is an `Option`
+//! 1000 ms), plus `reacquire_ms` (MAN-108, SPEC §2.4: how long a decoded
+//! track stays DORMANT after `hang_ms`; 0 closes at `hang_ms` as before
+//! MAN-108). Every key is an `Option`
 //! overlaid on `DetectorConfig::default()`, so an absent key keeps the exact
 //! default hop count instead of round-tripping it through milliseconds.
 //! Millisecond keys convert with `manta_decode::ms_to_hops`, SPEC §1.1's
@@ -31,8 +33,9 @@
 //! The bounds reject exactly the values the track manager treats as
 //! degenerate: `gc_hops = 0` closes every ACTIVE track immediately,
 //! `track_cap = 0` evicts every track, and `confirm_hops`/`hang_hops` are
-//! compared with `>=`, so 0 makes the window meaningless. `warmup_ms` and
-//! `silent_respawn_cooldown_ms` may be 0 (no warmup, no cooldown).
+//! compared with `>=`, so 0 makes the window meaningless. `warmup_ms`,
+//! `silent_respawn_cooldown_ms` and `reacquire_ms` may be 0 (no warmup, no
+//! cooldown, no dormancy).
 //! `into_detector_config` builds `DetectorConfig` with an exhaustive struct
 //! literal (no `..DetectorConfig::default()`), so adding a field to
 //! `DetectorConfig` is a compile error here until it gets a key or an
@@ -70,6 +73,8 @@ pub struct DetectorConfigToml {
     pub rtty_dwell_ms: Option<f64>,
     pub non_cw_filter: Option<bool>,
     pub unkeyed_close_ms: Option<f64>,
+    /// MAN-108 (SPEC §2.4): DORMANT window after `hang_ms`; 0 disables it.
+    pub reacquire_ms: Option<f64>,
 }
 
 impl DetectorConfigToml {
@@ -103,6 +108,7 @@ impl DetectorConfigToml {
             rtty_dwell_hops: rtty_dwell(self.rtty_dwell_ms, d.rtty_dwell_hops)?,
             non_cw_filter: self.non_cw_filter.unwrap_or(d.non_cw_filter),
             unkeyed_close_hops: unkeyed_close(self.unkeyed_close_ms, d.unkeyed_close_hops)?,
+            reacquire_hops: hops("reacquire_ms", self.reacquire_ms, d.reacquire_hops, false)?,
         })
     }
 }
@@ -405,5 +411,26 @@ mod tests {
         let cfg = parse("warmup_ms = 0\nsilent_respawn_cooldown_ms = 0.0").unwrap();
         assert_eq!(cfg.warmup_hops, 0);
         assert_eq!(cfg.silent_respawn_cooldown_hops, 0);
+    }
+
+    #[test]
+    fn reacquire_ms_defaults_to_3750_hops() {
+        assert_eq!(parse("").unwrap().reacquire_hops, 3750);
+        assert_eq!(
+            parse("reacquire_ms = 10000.0").unwrap().reacquire_hops,
+            3750
+        );
+    }
+
+    #[test]
+    fn reacquire_ms_may_be_zero() {
+        assert_eq!(parse("reacquire_ms = 0").unwrap().reacquire_hops, 0);
+    }
+
+    #[test]
+    fn reacquire_ms_above_one_hour_is_rejected() {
+        let e = err("reacquire_ms = 3600001");
+        assert!(e.contains("detector.reacquire_ms"), "{e}");
+        assert!(e.contains("[0, 3600000]"), "{e}");
     }
 }
