@@ -1552,12 +1552,32 @@ mod tests {
 
     #[test]
     fn fragment_lock_on_dits_recovers_when_gaps_match_the_marks() {
-        // "HH" at 22.6 WPM with a 30 ms fragment: element gaps (53 ms) classify
-        // InterElement against dit_estimate 40.5 ms, so mu_egap is populated --
-        // and equals the marks, which makes them dits.
+        // "HH" at 22.6 WPM (dit 53 ms) with a 20 ms fragment: 53/20 = 2.65 >= 2.0
+        // splits the bootstrap, so the fragment is the lone dit (lo_n = 1). A
+        // 30 ms fragment (ratio 1.77) would take the unimodal init and never arm
+        // the trigger. The element gaps are fed directly, so mu_egap is populated
+        // and equals the marks (ratio 1.0), which makes them dits. This pins only
+        // that the trigger fires on such a centroid; the dah-side comparison is
+        // pinned by the two `_is_kept` tests above. In the decoder a 53 ms gap
+        // reads as a character gap against the 20 ms dit and is never fed.
         let mut t = SpeedTracker::new();
-        feed(&mut t, &[30.0, 53.0, 53.0, 53.0, 53.0]);
-        feed_with_egaps(&mut t, &[53.0; 24], 53.0);
+        feed(&mut t, &[20.0, 53.0, 53.0, 53.0, 53.0]);
+        assert!(
+            t.boundary_ms() < 53.0,
+            "bad lock not formed (boundary {})",
+            t.boundary_ms()
+        );
+        feed_with_egaps(&mut t, &[53.0; 11], 53.0);
+        assert_eq!(t.mu_egap_ms(), Some(53.0));
+        assert!(!t.take_badlock_recovered());
+        // The 12th streak mark: the trigger evaluates with mu_egap populated.
+        t.on_mark(53.0);
+        assert!(
+            t.take_badlock_recovered(),
+            "trigger must fire on a populated gap centroid that matches the marks"
+        );
+        t.on_element_gap(53.0);
+        feed_with_egaps(&mut t, &[53.0; 12], 53.0);
         assert!(
             (t.mu_dit_ms() - 53.0).abs() < 1.0,
             "mu_dit {}",

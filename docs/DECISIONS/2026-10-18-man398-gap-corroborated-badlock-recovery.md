@@ -210,8 +210,13 @@ condition (that is, whenever conditions 1 and 2 held) across all 288 rows at
 
 The threshold sits ×1.39 above the highest dah ratio and ×1.48 below the
 lowest populated dit ratio. The dah side rests on 31 rows. The populated dit
-side rests on one grid row plus the unit test
-`fragment_lock_on_dits_recovers_when_gaps_match_the_marks` (ratio 1.0).
+side rests on one grid row (125), the only decoder measurement of it. The
+unit test `fragment_lock_on_dits_recovers_when_gaps_match_the_marks` pins
+the tracker's populated-centroid fire at ratio 1.0 with hand-fed element
+gaps (a 20 ms fragment, 53 ms marks and gaps). It fails if the MAN-398
+trigger is removed or every populated centroid is read as dahs. It does not
+bound the threshold: any value up to 1.0 passes it. In the decoder, those
+gaps would read as character gaps against the 20 ms dit.
 
 ## Known limits
 
