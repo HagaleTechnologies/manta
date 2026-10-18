@@ -952,6 +952,26 @@ the §4.1a gap centroid below (a stale correction from the old speed regime
 must not carry into the new one), and the sender timing model (§4.1b,
 MAN-315 D7): its statistics were learned in the old scale's dits.
 
+**Fragment-seeded lock** — **[DEVIATION]** (MAN-398,
+`docs/DECISIONS/2026-10-18-man398-gap-corroborated-badlock-recovery.md`):
+a track attached mid-element hands the 5-mark initialization a short first
+run with no real leading edge. When the split isolates that one mark as the
+whole dit cluster, every real mark of dit-heavy text (`HH`, `5NN`) assigns
+to the dah cluster, and the streak sits on its own centroid, so the
+drift/regime rule above never fires. Second rule: if 12 consecutive marks
+assign to the dah cluster, *and* the dit cluster is still the lone low
+member of the 5-mark split with no later mark assigned to it, *and*
+`μ_egap` (§4.1a) is absent or `≥ μ_lq / √3`, where `μ_lq` is the 12 marks'
+lower-quartile duration, reinitialize from those 12 marks (not the last 5).
+A dah is three element gaps long and a dit one, so `μ_egap < μ_lq / √3`
+says the marks really are dahs and the lock stands; this is what keeps a
+genuine opening dit followed by many real dahs (`E 0000`, `MO`) locked. No
+CV condition applies: dit-heavy text with some dahs streaks with CV ≈ 0.6.
+The reinit has the regime-change side effects above (§4.1a gap centroid
+reset, regime bump, §4.1b reset), and the track's §4.2 gap classifier is
+reset too: its clusters were bootstrapped from gap ratios against the wrong
+`μ_dit`.
+
 #### 4.1a WPM reporting: symmetric mark/gap dit-period estimate
 
 **[DEVIATION]** (MAN-103, `docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md`):
