@@ -798,7 +798,10 @@ impl TrackDecoder {
                     // would otherwise stay wrong forever, permanently
                     // misclassifying every inter-word gap as inter-char
                     // (see SpeedTracker::badlock_recovered's doc comment).
+                    // The flushed one-character-word gaps it would rebuild
+                    // from were measured in the same bad unit.
                     self.gaps = GapClassifier::new();
+                    self.single_flush_gaps.clear();
                 }
                 self.sync_sender_regime();
                 self.demod.set_dit_ms(self.tracker.mu_dit_ms());

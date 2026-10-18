@@ -98,7 +98,10 @@ model), and `take_badlock_recovered()` returns true once. `TrackDecoder`
 then replaces its `GapClassifier`. That classifier's clusters were
 bootstrapped from gap ratios against the wrong `μ_dit` and cannot correct
 themselves, so without the reset every word gap after recovery would stay
-classified as a character gap.
+classified as a character gap. `TrackDecoder` also drops
+`single_flush_gaps`, the flushed one-character-word gap lengths the new
+classifier's Farnsworth rebuild (`reinit_from_flushed`) would otherwise read:
+they are in the same wrong dit unit.
 
 SPEC §4.1 records the rule as a **[DEVIATION]** (MAN-398).
 
@@ -214,10 +217,17 @@ side rests on one grid row plus the unit test
 
 - **Text of single-dah characters only** (e.g. `TT TT`) that opens with a
   fragment or a lone dit, with dahs under 150 ms. It has no element gaps, so
-  `μ_egap` stays `None` and the trigger would fire, and the unimodal re-seed
-  would then assume dits. No grid text has this shape, it was not measured,
-  and timing alone cannot tell `T` from a dit there without a word-gap model.
-  No ticket is filed because nothing was observed failing.
+  `μ_egap` stays `None`, the trigger fires, and the unimodal re-seed assumes
+  dits. No grid text has this shape. Measured hermetically (`TT` ×30, 48 ms
+  dit, a first mark of 5–36 hops cut from the end of the first dah): main
+  decodes 27–29 word-bounded `TT` when that first mark is 9–27 hops long,
+  and this change decodes 5–7, ending in `IIII…`. That is how main already
+  decodes the same stream from a clean start (`IIII…`, 0 `TT`), because a
+  144 ms dah is under the 150 ms dit ceiling. So the change takes away a
+  rescue that only a lucky first mark gave. Timing alone cannot tell this
+  text from dits at a third of the speed: `TT` at 25 WPM has the mark and
+  gap pattern of `I` at 8 WPM. Separating them needs a word-gap or language
+  model.
 - **Fragment locks with `hi/lo > 6`.** The constraint clamp re-anchors these
   and main's own SPEC regime rule then breaks them, with or without this
   change. The unit test `fragment_lock_on_all_dah_text_is_kept` therefore
