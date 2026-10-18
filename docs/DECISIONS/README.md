@@ -11,7 +11,11 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+<<<<<<< HEAD
 | 2026-10-17 | MAN-310 | [MAN-310: "all bands" skims the standard CW segments a receiver can tune](2026-10-17-man310-band-plan.md) |
+=======
+| 2026-10-17 | MAN-275 | [MAN-275: a hostile or broken KiwiSDR receiver cannot stop the daemon; the plaintext-password exposure is accepted risk](2026-10-17-man275-kiwi-threat-model.md) |
+>>>>>>> d8102792f2ba80016b17d6b010b2f49f11a2ef61
 | 2026-10-17 | MAN-274 | [MAN-274: manta commits a Serena project config for agent symbol search](2026-10-17-man274-serena-project-config.md) |
 | 2026-10-17 | MAN-155 | [MAN-155: the related-projects page links other projects and makes no claims about them](2026-10-17-man155-related-projects-links-only.md) |
 | 2026-10-16 | MAN-272 | [MAN-272: a spot carries its track's latest RST and a QRL? flag](2026-10-16-man272-rst-and-qrl-on-spots.md) |
