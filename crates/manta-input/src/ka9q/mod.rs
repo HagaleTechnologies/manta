@@ -223,7 +223,16 @@ fn check_joins(
     Ok(())
 }
 
-fn join_socket(group: Ipv4Addr, port: u16, interface: Option<Ipv4Addr>) -> Result<UdpSocket> {
+/// Builds and joins one group socket, returning it with the instant of
+/// its first successful `join_multicast_v4` (MAN-259 review round): the
+/// kernel queues a group's RTP only from a landed membership, so an
+/// anchor must not predate it -- socket creation, the bind and the
+/// failed interface attempts before it are signal-silent outage.
+fn join_socket(
+    group: Ipv4Addr,
+    port: u16,
+    interface: Option<Ipv4Addr>,
+) -> Result<(UdpSocket, Instant)> {
     let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
         .context("ka9q-radio: create UDP socket")?;
     s.set_reuse_address(true)
@@ -239,21 +248,27 @@ fn join_socket(group: Ipv4Addr, port: u16, interface: Option<Ipv4Addr>) -> Resul
     let bind = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
     s.bind(&SockAddr::from(bind))
         .with_context(|| format!("ka9q-radio: bind {bind}"))?;
+    let mut joined_at: Option<Instant> = None;
     let results: Vec<_> = join_interfaces(interface)
         .into_iter()
         .map(|i| {
-            (
-                i,
-                s.join_multicast_v4(&group, &i).map_err(|e| e.to_string()),
-            )
+            // The last instant that was certainly signal-silent: this
+            // membership is what starts the kernel queueing RTP.
+            let attempt = Instant::now();
+            let r = s.join_multicast_v4(&group, &i).map_err(|e| e.to_string());
+            if r.is_ok() {
+                joined_at.get_or_insert(attempt);
+            }
+            (i, r)
         })
         .collect();
     check_joins(interface, &results)
         .map_err(|e| anyhow::anyhow!("ka9q-radio group {group}:{port}: {e}"))?;
+    let joined_at = joined_at.expect("check_joins passed, so one membership landed");
     let u: UdpSocket = s.into();
     u.set_read_timeout(Some(READ_TIMEOUT))
         .context("ka9q-radio: set read timeout")?;
-    Ok(u)
+    Ok((u, joined_at))
 }
 
 fn khz(hz: f64) -> String {
@@ -363,16 +378,26 @@ pub struct Ka9qIqSource {
     stall_timeout: Duration,
     confirmed_live: Arc<AtomicBool>,
     counters: Arc<InputHealthCounters>,
+    /// MAN-259: `open`'s runtime up to where the replayed stream starts
+    /// -- the first stashed packet of the chosen channel that the replay
+    /// would accept, or the data socket's first landed group membership
+    /// when the stash retained nothing replayable of it; surfaced by
+    /// `acquisition_start_offset()`.
+    acquisition_start_offset: Duration,
 }
 
 impl Ka9qIqSource {
     /// Join the channel's group, wait for its status, validate it.
     pub fn open(cfg: Ka9qConfig) -> Result<Self> {
+        let entered = Instant::now();
         let group = resolve_group(&cfg.group, cfg.port)?;
         // Both sockets join before the status wait, so RTP queues in the
-        // kernel meanwhile.
-        let data = join_socket(group, cfg.port, cfg.interface)?;
-        let status_sock = join_socket(group, cfg.status_port, cfg.interface)?;
+        // kernel meanwhile. MAN-259: the kernel queues RTP from the data
+        // join -- but the stash below keeps only its newest RCVBUF_BYTES,
+        // so when the wait overflows it, the replay starts at the first
+        // packet the stash still holds (the anchor computed below).
+        let (data, data_joined_at) = join_socket(group, cfg.port, cfg.interface)?;
+        let (status_sock, _) = join_socket(group, cfg.status_port, cfg.interface)?;
         // The data socket is non-blocking for the wait: `wait_for_status`
         // drains it into a stash each round (the kernel's grant alone
         // holds less than the settle window at Linux's default
@@ -382,6 +407,27 @@ impl Ka9qIqSource {
             .context("ka9q-radio: set data socket non-blocking")?;
         let (status, stash) = wait_for_status(&status_sock, &data, &cfg)?;
         let enc = validate(&status, cfg.port)?;
+        let ssrc = status.ssrc.unwrap_or(0);
+        // MAN-259 (validate round 1): the startup stash evicts its oldest
+        // packets past RCVBUF_BYTES, so on a channel fast enough to
+        // overflow it during the wait the replay below starts well after
+        // the join. Anchor where the replay starts: the first stashed
+        // packet of the chosen channel that the replay would accept (the
+        // review round made "retained" mean replayable -- a packet
+        // `accept_rtp` rejects cannot end the outage before the first
+        // sample `read` can return). An evicted opening never reaches
+        // `read`, so it is outage, not data; anchoring at the join stamped
+        // post-reconnect spots early by the evicted span (at 1.536 MS/s
+        // f32le with no SSRC the stash holds ~0.32 s of a >= 1.5 s wait,
+        // so >= 1.18 s early). With nothing replayable retained, the
+        // data socket's first landed group membership remains the anchor.
+        let acquisition_start_offset = stash
+            .iter()
+            .find(|(_, pkt)| packet_yields_samples(pkt, ssrc, status.rtp_pt, enc))
+            .map_or(
+                data_joined_at.saturating_duration_since(entered),
+                |(arrived, _)| arrived.saturating_duration_since(entered),
+            );
         data.set_nonblocking(false)
             .context("ka9q-radio: restore data socket blocking mode")?;
         status_sock
@@ -392,7 +438,7 @@ impl Ka9qIqSource {
             status_sock,
             group_label: cfg.group.clone(),
             port: cfg.port,
-            ssrc: status.ssrc.unwrap_or(0),
+            ssrc,
             fs: status.sample_rate_hz.unwrap_or(0) as f64,
             center_hz: status.radio_frequency_hz.unwrap_or(0.0),
             status,
@@ -404,11 +450,12 @@ impl Ka9qIqSource {
             stall_timeout: cfg.stall_timeout,
             confirmed_live: Arc::new(AtomicBool::new(false)),
             counters: Arc::new(InputHealthCounters::new()),
+            acquisition_start_offset,
         };
         // Replay what the wait stashed, exactly as if it arrived now, so
-        // the stream starts at its first received packet with no startup
+        // the stream starts at its first retained packet with no startup
         // gap.
-        for pkt in &stash {
+        for (_, pkt) in &stash {
             src.recv_buf[..pkt.len()].copy_from_slice(pkt);
             src.accept_rtp(pkt.len());
         }
@@ -579,6 +626,11 @@ impl Ka9qIqSource {
     }
 }
 
+/// The startup stash: each retained packet and the `Instant` it was
+/// received, which `open` anchors acquisition at when the cap evicts the
+/// opening (MAN-259).
+type Stash = VecDeque<(Instant, Vec<u8>)>;
+
 /// Drains the data socket into `stash` while `open` waits for status, so
 /// the kernel's receive buffer cannot overflow while nothing reads it: on
 /// Linux's default grant it holds only ~0.17 s of 192 kS/s `f32` IQ, less
@@ -589,12 +641,15 @@ impl Ka9qIqSource {
 /// length plus `STASH_PACKET_OVERHEAD`, so empty datagrams count too),
 /// dropping its own oldest packets past that, so a fast
 /// channel never overflows the kernel and the replay in `open` runs
-/// straight into the socket's next packet with no gap. `open` replays the
+/// straight into the socket's next packet with no gap. Each packet keeps
+/// its arrival `Instant`, so `open` can anchor acquisition at the first
+/// packet of the chosen channel the stash still holds when the cap evicts
+/// the opening (MAN-259). `open` replays the
 /// stash through `accept_rtp` once the channel is chosen.
 fn stash_data(
     sock: &UdpSocket,
     buf: &mut [u8],
-    stash: &mut VecDeque<Vec<u8>>,
+    stash: &mut Stash,
     stashed: &mut usize,
     cap: usize,
 ) -> Result<()> {
@@ -607,7 +662,7 @@ fn stash_data(
 fn stash_data_up_to(
     sock: &UdpSocket,
     buf: &mut [u8],
-    stash: &mut VecDeque<Vec<u8>>,
+    stash: &mut Stash,
     stashed: &mut usize,
     cap: usize,
     limit: usize,
@@ -615,10 +670,10 @@ fn stash_data_up_to(
     for _ in 0..limit {
         match sock.recv(buf) {
             Ok(n) => {
-                stash.push_back(buf[..n].to_vec());
+                stash.push_back((Instant::now(), buf[..n].to_vec()));
                 *stashed += n + STASH_PACKET_OVERHEAD;
                 while *stashed > cap && stash.len() > 1 {
-                    let old = stash.pop_front().expect("len > 1");
+                    let (_, old) = stash.pop_front().expect("len > 1");
                     *stashed -= old.len() + STASH_PACKET_OVERHEAD;
                 }
             }
@@ -631,11 +686,33 @@ fn stash_data_up_to(
     Ok(())
 }
 
+/// MAN-259 (review round): whether `open`'s replay would accept `pkt` --
+/// the same checks `accept_rtp` applies (parse, the chosen SSRC, the
+/// status's RTP payload type, at least one decodable IQ sample), so the
+/// acquisition anchor lands only on a packet whose samples `read` can
+/// actually return. Anchoring on a packet `accept_rtp` rejects (an empty
+/// or undecodable payload, a foreign payload type) ended the outage
+/// before the first replayable sample, stamping later spots early by
+/// the interval between them.
+fn packet_yields_samples(pkt: &[u8], ssrc: u32, rtp_pt: Option<u8>, enc: Encoding) -> bool {
+    let Ok((h, payload)) = wire::parse_rtp(pkt) else {
+        return false;
+    };
+    if h.ssrc != ssrc {
+        return false;
+    }
+    if rtp_pt.is_some_and(|pt| pt != h.payload_type) {
+        return false;
+    }
+    let mut scratch = VecDeque::new();
+    wire::decode_iq(enc, payload, &mut scratch).is_ok_and(|got| got >= 1)
+}
+
 fn wait_for_status(
     sock: &UdpSocket,
     data: &UdpSocket,
     cfg: &Ka9qConfig,
-) -> Result<(ChannelStatus, VecDeque<Vec<u8>>)> {
+) -> Result<(ChannelStatus, Stash)> {
     let start = Instant::now();
     sock.set_read_timeout(Some(WAIT_POLL))
         .context("ka9q-radio: set status wait timeout")?;
@@ -643,7 +720,7 @@ fn wait_for_status(
     let mut more = false;
     let mut first_at: Option<Instant> = None;
     let mut buf = vec![0u8; RECV_BUF_LEN];
-    let mut stash: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut stash: Stash = VecDeque::new();
     let mut stashed: usize = 0;
     loop {
         if let (None, Some(t)) = (cfg.ssrc, first_at) {
@@ -742,6 +819,10 @@ impl IqSource for Ka9qIqSource {
             }
             _ => (-half, half),
         }
+    }
+
+    fn acquisition_start_offset(&self) -> Duration {
+        self.acquisition_start_offset
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
@@ -848,7 +929,7 @@ mod tests {
         let mut stashed = 0;
         let cap = 3 * (100 + STASH_PACKET_OVERHEAD);
         stash_data(&rx, &mut buf, &mut stash, &mut stashed, cap).unwrap();
-        let kept: Vec<u8> = stash.iter().map(|p| p[0]).collect();
+        let kept: Vec<u8> = stash.iter().map(|(_, p)| p[0]).collect();
         assert_eq!(kept, vec![7, 8, 9]);
         assert_eq!(stashed, cap);
         let e = rx.recv(&mut buf).unwrap_err();
@@ -1182,6 +1263,191 @@ mod tests {
             let f = FakeRadiod::start(vec![channel(SSRC, 14_000_000.0)]);
             let src = Ka9qIqSource::open(f.config(None)).unwrap();
             assert_eq!(src.ssrc(), SSRC);
+        }
+
+        /// MAN-259: nothing streams in this fixture, so the stash retains
+        /// nothing and the anchor falls back to the data-group join --
+        /// before the settle wait, not where `open` returned, which would
+        /// measure at least the settle window.
+        #[test]
+        fn acquisition_start_offset_is_measured_before_the_settle_wait() {
+            let f = FakeRadiod::start(vec![channel(SSRC, 14_000_000.0)]);
+            let cfg = f.config(None);
+            let settle = cfg.settle;
+            let started = Instant::now();
+            let src = Ka9qIqSource::open(cfg).unwrap();
+            assert!(
+                started.elapsed() >= settle,
+                "with no SSRC, open must have listened out the settle window"
+            );
+            assert!(
+                src.acquisition_start_offset() < settle,
+                "the offset must end at the join, before the settle wait: {:?}",
+                src.acquisition_start_offset()
+            );
+        }
+
+        /// MAN-259 (validate round 1): the startup stash keeps only its
+        /// newest `RCVBUF_BYTES`, dropping its oldest packets past that,
+        /// so a channel fast enough to overflow it during the no-SSRC
+        /// settle wait loses its opening to eviction and the replay starts
+        /// well after the join. The anchor must be the first retained
+        /// packet of the channel: at 1.536 MS/s `f32le` the stash holds
+        /// ~0.32 s of a >= 1.5 s wait, so a join anchor stamps every
+        /// post-reconnect spot >= 1.18 s early, past the ticket's one
+        /// second.
+        #[test]
+        fn acquisition_start_offset_lands_at_the_first_packet_retained_past_the_stash_cap() {
+            let mut s = channel(SSRC, 14e6);
+            s.sample_rate_hz = Some(6_144_000);
+            let f = FakeRadiod::start(vec![s]);
+            let mut cfg = f.config(None);
+            cfg.settle = Duration::from_millis(500);
+            cfg.open_timeout = Duration::from_millis(1500);
+            // One 1100-sample f32le RTP datagram charges its 8_812 bytes
+            // plus STASH_PACKET_OVERHEAD against the cap; twice the cap's
+            // worth of packets evicts the whole first half of the stream.
+            // 1100 samples keeps the datagram under macOS's default
+            // `net.inet.udp.maxdgram` (9216): a larger one fails `send_to`
+            // there and nothing arrives at all. Paced at four packets per
+            // millisecond (the 6.144 MS/s cadence in 1100-sample packets
+            // is 5.6/ms), well inside the one-DRAIN_BATCH-per-WAIT_POLL
+            // drain capacity, so the kernel drops nothing: what
+            // disappears goes through the cap.
+            const SAMPLES: usize = 1100;
+            let charged = 12 + SAMPLES * 8 + STASH_PACKET_OVERHEAD;
+            let packets = 2 * (RCVBUF_BYTES / charged);
+            let stop = Arc::new(AtomicBool::new(false));
+            let sender = {
+                let (stop, group, port) = (stop.clone(), f.group, f.data_port);
+                std::thread::spawn(move || {
+                    let tx = sender();
+                    let payload = wire::encode_iq(Encoding::F32Le, &ramp(SAMPLES, 0));
+                    // Let open() join the group first: a datagram sent
+                    // before the join is never received and cannot be
+                    // part of the expected stream.
+                    std::thread::sleep(Duration::from_millis(200));
+                    for seq in 0..packets as u16 {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let h = RtpHeader {
+                            payload_type: 111,
+                            seq,
+                            timestamp: u32::from(seq) * SAMPLES as u32,
+                            ssrc: SSRC,
+                            marker: false,
+                        };
+                        let _ = tx.send_to(
+                            &wire::encode_rtp(&h, &payload),
+                            SocketAddrV4::new(group, port),
+                        );
+                        // Four packets per millisecond: one sleep per
+                        // packet would need sub-millisecond sleeps.
+                        if seq % 4 == 3 {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                })
+            };
+            let started = Instant::now();
+            let src = Ka9qIqSource::open(cfg).unwrap();
+            let open_elapsed = started.elapsed();
+            stop.store(true, Ordering::Relaxed);
+            sender.join().unwrap();
+            // The cap evicted the opening: not everything sent was
+            // retained, and the offset must sit at the first retained
+            // packet's arrival -- past the join (an anchor at the join
+            // measures ~0) and past the first sent packet (which an
+            // uncapped-stash anchor would report): at no more than four
+            // packets per millisecond, packet RCVBUF_BYTES/charged
+            // arrives no earlier than ~320 ms into `open`.
+            assert!(!src.queue.is_empty(), "the stream must have arrived");
+            assert!(
+                src.queue.len() < packets * SAMPLES,
+                "the stash cap must have evicted the opening: {} of {} samples retained",
+                src.queue.len(),
+                packets * SAMPLES
+            );
+            let offset = src.acquisition_start_offset();
+            assert!(
+                offset >= Duration::from_millis(240),
+                "the anchor must be the first retained packet's arrival, not the join: {offset:?}"
+            );
+            assert!(offset < open_elapsed, "{offset:?} vs {open_elapsed:?}");
+        }
+
+        /// MAN-259 (review round): `accept_rtp` also rejects a wrong RTP
+        /// payload type and a payload that decodes to zero samples, so
+        /// the anchor must skip such packets -- anchoring on one ends
+        /// the outage before the first sample `read` can return,
+        /// stamping later spots early by the interval between them.
+        #[test]
+        fn acquisition_start_offset_skips_packets_that_cannot_yield_samples() {
+            let f = FakeRadiod::start(vec![channel(SSRC, 14_000_000.0)]);
+            let mut cfg = f.config(None);
+            cfg.settle = Duration::from_millis(1500);
+            cfg.open_timeout = Duration::from_millis(3000);
+            // Empty-payload RTP with the right SSRC parses and matches
+            // the channel, but decodes to zero samples: `accept_rtp`
+            // drops it, so it must not anchor either.
+            let empty = RtpHeader {
+                payload_type: 111,
+                seq: 0,
+                timestamp: 0,
+                ssrc: SSRC,
+                marker: false,
+            };
+            let empty_pkt = wire::encode_rtp(&empty, &[]);
+            let stop = Arc::new(AtomicBool::new(false));
+            let sender = {
+                let (stop, group, port, empty_pkt) =
+                    (stop.clone(), f.group, f.data_port, empty_pkt);
+                std::thread::spawn(move || {
+                    let tx = sender();
+                    // Let open() join the group first: a datagram sent
+                    // before the join is never received.
+                    std::thread::sleep(Duration::from_millis(150));
+                    for seq in 1..=20u16 {
+                        let _ = tx.send_to(&empty_pkt, SocketAddrV4::new(group, port));
+                        if seq % 4 == 0 {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                    // The first packet whose samples read() can return.
+                    std::thread::sleep(Duration::from_millis(650));
+                    for seq in 21..25u16 {
+                        let mut h = empty;
+                        h.seq = seq;
+                        let _ = tx.send_to(
+                            &wire::encode_rtp(&h, &wire::encode_iq(Encoding::F32Le, &ramp(480, 0))),
+                            SocketAddrV4::new(group, port),
+                        );
+                    }
+                    while !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                })
+            };
+            let started = Instant::now();
+            let src = Ka9qIqSource::open(cfg).unwrap();
+            let open_elapsed = started.elapsed();
+            stop.store(true, Ordering::Relaxed);
+            sender.join().unwrap();
+            assert!(
+                !src.queue.is_empty(),
+                "the real packets must have been retained and replayed"
+            );
+            let offset = src.acquisition_start_offset();
+            // The empty datagrams land from 150 ms and the real ones no
+            // earlier than 800 ms (sleeps only overshoot), so an anchor
+            // at or past 500 ms cannot be an empty packet's arrival.
+            assert!(
+                offset >= Duration::from_millis(500),
+                "the anchor must be the first replayable packet's arrival, \
+                 not the first SSRC-matching one: {offset:?}"
+            );
+            assert!(offset < open_elapsed, "{offset:?} vs {open_elapsed:?}");
         }
 
         #[test]
