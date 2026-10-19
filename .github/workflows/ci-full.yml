@@ -256,6 +256,12 @@ jobs:
       # MAN-301: score-against-rbn.py --node-log's wrapper around `manta grade` (stub binary).
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_score_against_rbn_replay -v
+      # MAN-119: the corpus manifest, fetch/score tooling and corpus.yml's shape; the
+      # transcript scorer. Pure Python against temp files and a stub binary.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_corpus -v
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_score_transcript -v
       # MAN-156: dependency, rustdoc, Windows-release and PR-title gates (workflow wiring and scripts).
       # Linux only: these tests read workflow text and run pure functions, so the host adds nothing,
       # and DenyPolicyTests needs tomllib (Python 3.11+), which ubuntu-latest's python3 has.

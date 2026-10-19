@@ -74,6 +74,44 @@ pub fn interpolate_offset(p_minus: f32, p_zero: f32, p_plus: f32) -> Option<f64>
     }
 }
 
+/// hop = N/4 (SPEC §1.1): a 2π phase advance per hop spans 4 channels on
+/// every channel table.
+pub const CHANNELS_PER_PHASE_CYCLE: f64 = 4.0;
+
+/// Lag-1 phase product of channel `k` between consecutive hops (SPEC §1.4,
+/// MAN-114), rotated into the absolute frame so products from different
+/// channels of one track can be averaged: its argument is
+/// `2π·p/4 (mod 2π)` for a tone at channel position `p`. Both hops get
+/// `odd_channel_sign_correction`. `None` unless `cur.m == prev.m + 1`, both
+/// spectra are `n` long (power-only hops carry an empty `x`) and `k < n`.
+///
+/// The rotation `e^{jπ(k mod 4)/2}` undoes channel `k`'s downconversion:
+/// the corrected output of channel `k` advances `2π·(p − k)/4` per hop.
+/// It holds for upper-half (negative-frequency) channels too, because N
+/// is a multiple of 4.
+pub fn phase_lag_product(prev: &HopOutput, cur: &HopOutput, k: usize) -> Option<Complex64> {
+    let n = cur.power.len();
+    if prev.m.checked_add(1) != Some(cur.m) || cur.x.len() != n || prev.x.len() != n || k >= n {
+        return None;
+    }
+    let a = cur.x[k] * odd_channel_sign_correction(cur.m, k);
+    let b = prev.x[k] * odd_channel_sign_correction(prev.m, k);
+    let z = a * b.conj();
+    let z = Complex64::new(z.re as f64, z.im as f64);
+    Some(z * Complex64::from_polar(1.0, std::f64::consts::FRAC_PI_2 * (k % 4) as f64))
+}
+
+/// Channel position of an absolute-frame phase sum (`phase_lag_product`
+/// accumulated): `arg(z)/2π·4`, unwrapped to the value nearest `near`
+/// (a track's `center`). `None` for a zero sum. SPEC §1.4.
+pub fn phase_position(z: Complex64, near: f64) -> Option<f64> {
+    if z.re == 0.0 && z.im == 0.0 {
+        return None;
+    }
+    let p = z.arg() / std::f64::consts::TAU * CHANNELS_PER_PHASE_CYCLE;
+    Some(p + CHANNELS_PER_PHASE_CYCLE * ((near - p) / CHANNELS_PER_PHASE_CYCLE).round())
+}
+
 /// WOLA polyphase filterbank: N channels, 4x oversampled (hop = N/4).
 /// SPEC §1.1-1.3.
 pub struct Channelizer {
@@ -452,6 +490,99 @@ mod tests {
             assert!(hop.power.iter().all(|p| p.is_finite()), "hop {}", hop.m);
         }
         assert_eq!(ch.bad_samples(), 0);
+    }
+
+    /// MAN-114: a clean tone at `freq_hz`, channelized at `fs`; returns the
+    /// `phase_position` (unwrapped near `k0`) of the summed
+    /// `phase_lag_product` of each post-warm-up hop's strongest channel
+    /// among `k0 - 1..=k0 + 1`.
+    fn phase_position_of_tone(fs: f64, freq_hz: f64, k0: usize) -> f64 {
+        let mut ch = Channelizer::new(fs, 0.0).unwrap();
+        let n = ch.n_channels();
+        let iq = tone(freq_hz, 2 * ch.filter_len() + 64 * ch.hop(), 1.0, fs);
+        let hops = ch.process(&iq);
+        let warmup = ch.filter_len() / ch.hop() + 1;
+        let mut z = Complex64::new(0.0, 0.0);
+        for pair in hops[warmup..].windows(2) {
+            let k = [(k0 + n - 1) % n, k0, (k0 + 1) % n]
+                .into_iter()
+                .max_by(|&a, &b| pair[1].power[a].total_cmp(&pair[1].power[b]))
+                .unwrap();
+            z += phase_lag_product(&pair[0], &pair[1], k).expect("consecutive full hops");
+        }
+        phase_position(z, k0 as f64).expect("a tone gives a non-zero sum")
+    }
+
+    #[test]
+    fn phase_position_is_exact_for_a_clean_tone_across_the_channel() {
+        // MAN-114: the dB parabola's S-curve bias (up to ~12 Hz on a clean
+        // tone) is absent from the phase estimator on every table, on even
+        // and odd channels, at every fractional offset.
+        for fs in [48_000.0, 96_000.0, 192_000.0] {
+            for k0 in [64usize, 65] {
+                for step in 0..=20 {
+                    let frac = -0.5 + 0.05 * step as f64;
+                    let truth = k0 as f64 + frac;
+                    let got = phase_position_of_tone(fs, truth * CHANNEL_SPACING_HZ, k0);
+                    let err_hz = (got - truth) * CHANNEL_SPACING_HZ;
+                    assert!(
+                        err_hz.abs() < 0.05,
+                        "fs {fs} k0 {k0} frac {frac:.2}: phase position {got} vs {truth} \
+                         ({err_hz:+.4} Hz)"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn phase_position_handles_negative_frequency_channels() {
+        // -6000 Hz is channel N-64 (SPEC §1.1's f(k)); 0.3 channel below it.
+        let n = (FS / CHANNEL_SPACING_HZ) as usize;
+        let k0 = n - 64;
+        let truth = k0 as f64 - 0.3;
+        let got = phase_position_of_tone(FS, -6_000.0 - 0.3 * CHANNEL_SPACING_HZ, k0);
+        let err_hz = (got - truth) * CHANNEL_SPACING_HZ;
+        assert!(
+            err_hz.abs() < 0.05,
+            "phase position {got} vs {truth} ({err_hz:+.4} Hz)"
+        );
+    }
+
+    #[test]
+    fn phase_lag_product_none_on_hop_gap_or_power_only_hop() {
+        let full = |m: u64| HopOutput {
+            m,
+            x: vec![Complex32::new(1.0, 0.5); 8],
+            power: vec![1.25; 8],
+        };
+        assert!(phase_lag_product(&full(4), &full(5), 3).is_some());
+        // Not consecutive: a hop gap (or a reset stream) breaks the lag.
+        assert_eq!(phase_lag_product(&full(4), &full(6), 3), None);
+        assert_eq!(phase_lag_product(&full(5), &full(5), 3), None);
+        // Power-only hops (an empty `x`) carry no phase.
+        let power_only = |m: u64| HopOutput {
+            m,
+            x: Vec::new(),
+            power: vec![1.25; 8],
+        };
+        assert_eq!(phase_lag_product(&full(4), &power_only(5), 3), None);
+        assert_eq!(phase_lag_product(&power_only(4), &full(5), 3), None);
+        // Out-of-range channel.
+        assert_eq!(phase_lag_product(&full(4), &full(5), 8), None);
+    }
+
+    #[test]
+    fn phase_position_unwraps_near_reference() {
+        // arg = 2π·0.25 is position 1.0 (mod 4); nearest 9.1 is 9.0.
+        let z = Complex64::from_polar(2.5, std::f64::consts::TAU * 0.25);
+        let p = phase_position(z, 9.1).unwrap();
+        assert!((p - 9.0).abs() < 1e-12, "got {p}");
+        // Near a negative-side reference too: nearest 1022.6 is 1021.0
+        // (1021 ≡ 1 mod 4) rather than 1025.0.
+        let p = phase_position(z, 1022.6).unwrap();
+        assert!((p - 1021.0).abs() < 1e-9, "got {p}");
+        assert_eq!(phase_position(Complex64::new(0.0, 0.0), 9.1), None);
     }
 
     #[test]

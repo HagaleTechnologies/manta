@@ -94,9 +94,9 @@ enum Command {
     /// CW in it, and prints the copied text plus a spot summary. Fully
     /// deterministic: the same file always produces the same output.
     Decode {
-        /// Stereo IQ WAV file. Its centre frequency is read from the
-        /// matching `<name>.json` sidecar next to it, unless
-        /// --center-freq-hz is given.
+        /// Stereo IQ WAV file: 32-bit float, or 16-, 24- or 32-bit integer
+        /// samples. Its centre frequency is read from the matching
+        /// `<name>.json` sidecar next to it, unless --center-freq-hz is given.
         path: PathBuf,
         /// RF centre frequency of the recording, in Hz, overriding its sidecar.
         ///
@@ -141,8 +141,9 @@ enum Command {
     /// time with the tracker bypassed, and reports how many callsigns came
     /// back. For measuring decode quality, not for day-to-day operating.
     Oracle {
-        /// Stereo IQ WAV file. Its centre frequency is read from the
-        /// matching `<name>.json` sidecar next to it.
+        /// Stereo IQ WAV file: 32-bit float, or 16-, 24- or 32-bit integer
+        /// samples. Its centre frequency is read from the matching
+        /// `<name>.json` sidecar next to it.
         path: PathBuf,
         /// Reverse Beacon Network daily-dump CSV, pre-filtered to the
         /// recording's time window.

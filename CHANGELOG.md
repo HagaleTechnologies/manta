@@ -160,6 +160,18 @@ the git history and `docs/DECISIONS/`.
   (MAN-129).
 - MAN-140: `--ka9q-group` / `[input] type = "ka9q"` reads one ka9q-radio
   (radiod) IQ channel over RTP multicast; see docs/GUIDES/ka9q-radio.md
+- `manta decode`, `manta oracle` and `run`/`check --source-iq` read 24- and
+  32-bit integer IQ WAVs (plain PCM, WAVE_FORMAT_EXTENSIBLE, and 24-bit
+  samples in 4-byte containers), alongside 32-bit float and 16-bit integer
+  (MAN-119).
+
+### Changed
+
+- IQ WAV input streams from disk: `manta decode`'s memory no longer grows
+  with the recording's length (a 1 GB recording decodes in under 20 MiB), and
+  `run --loop` re-opens a recording without re-reading it. A WAV whose data
+  chunk is shorter than its header declares fails when the read reaches the
+  gap, naming the file (MAN-119).
 
 ### Changed
 

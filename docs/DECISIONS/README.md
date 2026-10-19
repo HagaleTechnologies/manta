@@ -11,7 +11,11 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+<<<<<<< HEAD
 | 2026-10-17 | MAN-310 | [MAN-310: "all bands" skims the standard CW segments a receiver can tune](2026-10-17-man310-band-plan.md) |
+=======
+| 2026-10-17 | MAN-114 | [MAN-114: the spot frequency comes from a power-weighted phase estimator](2026-10-17-man114-phase-difference-spot-frequency.md) |
+>>>>>>> 5d669936ee6cdf0d5f72c8815cbceaeb3868733e
 | 2026-10-17 | MAN-275 | [MAN-275: a hostile or broken KiwiSDR receiver cannot stop the daemon; the plaintext-password exposure is accepted risk](2026-10-17-man275-kiwi-threat-model.md) |
 | 2026-10-17 | MAN-274 | [MAN-274: manta commits a Serena project config for agent symbol search](2026-10-17-man274-serena-project-config.md) |
 | 2026-10-17 | MAN-155 | [MAN-155: the related-projects page links other projects and makes no claims about them](2026-10-17-man155-related-projects-links-only.md) |
@@ -37,6 +41,7 @@ Add a row here in the same change that adds a record:
 | 2026-10-14 | MAN-192 | [MAN-192: the HSMM decoder reseeds after a committed Silence, not only on a gate re-onset](2026-10-14-man192-silence-reseed.md) |
 | 2026-10-14 | MAN-193 | [MAN-193: Evidence's centered maximum is a monotonic deque](2026-10-14-man193-centered-maximum-deque.md) |
 | 2026-10-14 | MAN-95 | [MAN-95: callsign-pattern rarity sets the repetition requirement](2026-10-14-man95-pattern-rarity-repetition-tiers.md) |
+| 2026-10-14 | MAN-119 | [MAN-119: streaming IQ WAVs, 24/32-bit PCM, and the real-audio corpus as a CI fixture](2026-10-14-man119-streaming-wav-and-real-audio-corpus.md) |
 | 2026-10-13 | MAN-313 | [Non-CW rejection: no CW track on speech, data or a swept carrier](2026-10-13-man313-non-cw-rejection.md) |
 | 2026-10-13 | MAN-189 | [MAN-189: the HSMM decoder commits each stretch of time once](2026-10-13-man189-hsmm-commit-frontier.md) |
 | 2026-10-13 | MAN-190 | [MAN-190: evidence anchors confirmed from actual adjacent hops, not predicted](2026-10-13-man190-confirmed-evidence-anchors.md) |
