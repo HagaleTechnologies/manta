@@ -87,7 +87,6 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
-<<<<<<< HEAD
 - MAN-305: protocol-2 openHPSDR radios (ANAN-class: Hermes, Angelia,
   Orion, Orion II, Saturn/G2) as inputs, alongside protocol 1 (Hermes-Lite
   2). `--hpsdr-protocol auto|1|2`, `[input] protocol` (`"auto"`, `"1"`,
@@ -104,11 +103,9 @@ the git history and `docs/DECISIONS/`.
   `listen` advances its sample clock by that many samples without closing
   tracks, so spot timestamps stay true across a short loss. Wrappers must
   forward it, as they forward `take_discontinuity()`.
-=======
 - MAN-108: `[detector] reacquire_ms` (default `10000`), how long after
   `hang_ms` a decoded track keeps its identity waiting for its signal to
   return. `0` restores the previous close at `hang_ms`.
->>>>>>> a1761da5598d5f338c00da0dc6faa3578d5b7bf2
 - MAN-13: one `manta run` decodes several receivers into one spot output.
   Write `[[input]]` once per receiver (each with a `name`); every input
   decodes on its own thread into one shared validator, so a station two
