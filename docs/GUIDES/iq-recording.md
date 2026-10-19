@@ -33,7 +33,7 @@ samples is 120 s at 48 kS/s.
 
 ### Where it writes
 
-- The samples go to `PATH` exactly as given.
+- The samples go to `PATH` exactly as given (`--record-iq` or `record_iq`).
 - The metadata goes to `PATH.meta.jsonl`: the suffix is appended to the
   whole path, so `session.cf32` gets `session.cf32.meta.jsonl`. While the
   session runs it is `PATH.meta.jsonl.partial`, renamed only after the
@@ -59,9 +59,27 @@ samples is 120 s at 48 kS/s.
      /var/lib/manta/captures/session.cf32.meta.jsonl /srv/archive/
   ```
 
-`--record-iq` names one recording, so it is refused when the config has
-several `[[input]]` entries. Recording each receiver of a multi-input
-daemon, and the `record_iq` config key, are a follow-up.
+A service sets it in its config instead; changing it needs a restart:
+
+```toml
+[input]
+type = "audio"
+center_freq_hz = 14000000
+record_iq = "captures/session.cf32"
+```
+
+A relative `record_iq` in a config file is relative to that file's
+directory; from `--record-iq` or `MANTA_INPUT_RECORD_IQ` it is relative to
+the working directory. The precedence is the usual command line >
+environment > file. `manta config check` shows the resolved path and
+creates nothing.
+
+With several receivers, put `record_iq` in each `[[input]]` entry that
+should be recorded, each with its own file; two entries cannot share one,
+and `--record-iq` (one file) is refused. Each recording replays on its own
+at its own start time; replaying several together uses the first input's
+start time, as any multi-file replay does (MAN-13), not the original
+staggered start of each receiver.
 
 ### Disk use
 

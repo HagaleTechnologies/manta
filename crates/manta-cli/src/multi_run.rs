@@ -277,6 +277,10 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         (0..n).map(|_| Arc::new(RttyObserver::default())).collect();
     let rtty_marks = Arc::new(RttyMarks::new(n));
     // MAN-56: each input's packet counters, taken on its own thread at open.
+    // MAN-309: each recorded input's completion handle, kept outside the
+    // source the engine owns.
+    let recordings: Arc<Mutex<Vec<Option<manta_input::RecordingHandle>>>> =
+        Arc::new(Mutex::new((0..n).map(|_| None).collect()));
     let input_counters: Arc<Mutex<Vec<Option<Arc<InputHealthTotals>>>>> =
         Arc::new(Mutex::new(vec![None; n]));
 
@@ -287,6 +291,12 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         .map(|(index, input)| {
             let spec = input.spec.clone();
             let (capture, dial) = (input.capture_rate_hz, input.dial_freq_hz);
+            let record_iq = input.record_iq.clone();
+            let record_file = match &spec {
+                LiveSourceSpec::File { path, .. } => Some(path.clone()),
+                _ => None,
+            };
+            let recordings = recordings.clone();
             let name = input.name.clone();
             let replay = m.replay;
             let stop = stop.clone();
@@ -310,45 +320,59 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                     ..Default::default()
                 },
                 open: Box::new(move || {
-                    let first = spec.open(capture, dial)?;
-                    if let Ok(mut at) = opened_at.lock() {
-                        at[index] = Some(Instant::now());
-                    }
-                    let reopen = spec.clone();
-                    if spec.is_reconnectable() {
-                        // As the one-input path: a source that confirms it
-                        // is live (Kiwi, ka9q) is healthy once it has.
-                        let initial_healthy = first.confirmed_live_handle().is_none();
-                        let on_health = input_health_sink(index, name.clone(), health);
-                        let wrapped = ReconnectingSource::new(
-                            name,
-                            first,
-                            Box::new(move || reopen.open(capture, dial)),
-                            stop,
-                            initial_healthy,
-                            on_health,
-                        );
-                        if let Ok(mut slot) = input_counters.lock() {
-                            slot[index] = wrapped.input_health();
+                    let src = (move || -> Result<Box<dyn manta_input::IqSource>> {
+                        let first = spec.open(capture, dial)?;
+                        if let Ok(mut at) = opened_at.lock() {
+                            at[index] = Some(Instant::now());
                         }
-                        Ok(Box::new(wrapped) as Box<dyn manta_input::IqSource>)
-                    } else {
-                        if let Ok(mut slot) = input_counters.lock() {
-                            slot[index] = InputHealthTotals::for_source(first.as_ref());
+                        let reopen = spec.clone();
+                        if spec.is_reconnectable() {
+                            // As the one-input path: a source that confirms it
+                            // is live (Kiwi, ka9q) is healthy once it has.
+                            let initial_healthy = first.confirmed_live_handle().is_none();
+                            let on_health = input_health_sink(index, name.clone(), health);
+                            let wrapped = ReconnectingSource::new(
+                                name,
+                                first,
+                                Box::new(move || reopen.open(capture, dial)),
+                                stop,
+                                initial_healthy,
+                                on_health,
+                            );
+                            if let Ok(mut slot) = input_counters.lock() {
+                                slot[index] = wrapped.input_health();
+                            }
+                            Ok(Box::new(wrapped) as Box<dyn manta_input::IqSource>)
+                        } else {
+                            if let Ok(mut slot) = input_counters.lock() {
+                                slot[index] = InputHealthTotals::for_source(first.as_ref());
+                            }
+                            let label = match &spec {
+                                LiveSourceSpec::File { path, .. } => path.display().to_string(),
+                                _ => String::new(),
+                            };
+                            wrap_file_replay(
+                                first,
+                                replay,
+                                label,
+                                Box::new(move || {
+                                    Ok(reopen.open(capture, dial)?
+                                        as Box<dyn manta_input::IqSource>)
+                                }),
+                            )
                         }
-                        let label = match &spec {
-                            LiveSourceSpec::File { path, .. } => path.display().to_string(),
-                            _ => String::new(),
-                        };
-                        wrap_file_replay(
-                            first,
-                            replay,
-                            label,
-                            Box::new(move || {
-                                Ok(reopen.open(capture, dial)? as Box<dyn manta_input::IqSource>)
-                            }),
-                        )
+                    })()?;
+                    // MAN-309: this input's recording wraps exactly what it
+                    // hands the engine; a replay starts at its own epoch.
+                    let Some(path) = &record_iq else {
+                        return Ok(src);
+                    };
+                    let start = crate::resolve_epoch(record_file.as_deref(), None)?;
+                    let (src, handle) = crate::start_input_recording(src, path, start)?;
+                    if let Ok(mut slot) = recordings.lock() {
+                        slot[index] = Some(handle);
                     }
+                    Ok(src)
                 }),
             }
         })
@@ -703,6 +727,16 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     // MAN-78 D7: draining from here on; a later SIGHUP is ignored.
     drain_gate.close();
     stop_ready.store(true, Ordering::Relaxed);
+    // MAN-309: every input has ended, so every queue is closed; finalize
+    // each recording (one failing does not stop the others).
+    let handles: Vec<_> = recordings
+        .lock()
+        .map(|mut slots| slots.iter_mut().filter_map(Option::take).collect())
+        .unwrap_or_default();
+    let recording_result = handles
+        .into_iter()
+        .map(crate::finish_recording)
+        .fold(Ok(()), |acc: Result<()>, r| acc.and(r));
     if print_text {
         for line in text.finish() {
             if logging::is_json() {
@@ -734,6 +768,8 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     // now, after the drain, does it become the exit status (141 / 1). An
     // input failure still wins, because it is reported first.
     stdout_lines.finish()?;
+    // MAN-309: a recording that did not complete fails the run last.
+    recording_result?;
     Ok(std::process::ExitCode::SUCCESS)
 }
 
@@ -884,6 +920,7 @@ mod tests {
             freq_correction_ppm: 0.0,
             dial_freq_hz: None,
             capture_rate_hz: None,
+            record_iq: None,
         }];
         let err = check_rf_references(&inputs).unwrap_err().to_string();
         assert_eq!(

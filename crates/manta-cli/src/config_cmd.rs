@@ -654,6 +654,10 @@ fn input_summary(file: &crate::config::InputFile) -> String {
             shared.capture_rate_hz.map(|v| v.to_string()),
         ),
         ("replay_epoch", shared.replay_epoch.map(|v| v.to_string())),
+        (
+            "record_iq",
+            shared.record_iq.as_ref().map(|p| p.display().to_string()),
+        ),
     ] {
         if let Some(v) = value {
             input.push_str(&format!(" {key}={v}"));
@@ -1761,6 +1765,7 @@ mod tests {
         ("input", "center_freq_hz"),
         ("input", "capture_rate_hz"),
         ("input", "replay_epoch"),
+        ("input", "record_iq"),
         ("spot", "blocklist_path"),
         ("spot", "notch_path"),
         ("spot", "cty_path"),

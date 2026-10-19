@@ -87,8 +87,8 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
-- MAN-309: `manta run --record-iq PATH` records the IQ it decodes, from any
-  input, to a little-endian cf32 file plus `PATH.meta.jsonl` (rate,
+- MAN-309: `manta run --record-iq PATH` (or `record_iq` in each `[input]`/
+  `[[input]]`) records the IQ it decodes, from any input, to a little-endian cf32 file plus `PATH.meta.jsonl` (rate,
   centre, start time, source passband and guards, input gaps). `decode`
   and `run --source PATH --source-iq` replay it to the same output on every
   run; `run` reproduces its input gaps. Both commands also read headerless

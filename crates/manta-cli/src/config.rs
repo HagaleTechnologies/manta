@@ -83,6 +83,7 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("input", "type"),
     ("input", "device"),
     ("input", "path"),
+    ("input", "record_iq"),
     ("input", "host"),
     ("input", "password"),
     ("input", "driver"),
@@ -333,6 +334,8 @@ struct InputToml {
     center_freq_hz: Option<f64>,
     capture_rate_hz: Option<f64>,
     replay_epoch: Option<i64>,
+    /// MAN-309: `run` records this input's IQ here.
+    record_iq: Option<PathBuf>,
 }
 
 /// MAN-13: one `[[input]]` entry (or the single `[input]` table) and its
@@ -360,6 +363,8 @@ pub(crate) struct SharedInput {
     pub center_freq_hz: Option<f64>,
     pub capture_rate_hz: Option<f64>,
     pub replay_epoch: Option<i64>,
+    /// MAN-309: `run` records this input's IQ to this path.
+    pub record_iq: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -522,13 +527,13 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
     };
     let inputs = match doc.get("input") {
         Some(toml::Value::Array(entries)) if !entries.is_empty() => {
-            take_input_array(entries, &origin, &|p| resolve_path("input", "path", p))?
+            take_input_array(entries, &origin, &|key, p| resolve_path("input", key, p))?
         }
         _ => {
             let input_toml =
                 take_typed::<InputToml>(&doc, "input", &origin, &overlay)?.unwrap_or_default();
             let name = input_toml.name.clone();
-            let input = validate_input(input_toml, &|p| resolve_path("input", "path", p))
+            let input = validate_input(input_toml, &|key, p| resolve_path("input", key, p))
                 .map_err(|e| anyhow!("{origin}: [input]: {e}{}", overlay.suffix("input")))?;
             let name = match name {
                 Some(name) => {
@@ -758,7 +763,7 @@ fn check_input_name(name: &str) -> Result<()> {
 fn take_input_array(
     entries: &[toml::Value],
     origin: &str,
-    resolve_path: &dyn Fn(PathBuf) -> PathBuf,
+    resolve_path: &dyn Fn(&str, PathBuf) -> PathBuf,
 ) -> Result<Vec<NamedInput>> {
     if entries.len() > manta_engine::MAX_INPUTS {
         bail!(
@@ -862,7 +867,7 @@ fn check_input_entries(inputs: &[NamedInput], origin: &str) -> Result<()> {
 
 fn validate_input(
     t: InputToml,
-    resolve_path: &dyn Fn(PathBuf) -> PathBuf,
+    resolve_path: &dyn Fn(&str, PathBuf) -> PathBuf,
 ) -> std::result::Result<InputFile, String> {
     let shared = SharedInput {
         freq_correction_ppm: t
@@ -881,6 +886,7 @@ fn validate_input(
             .replay_epoch
             .map(|v| crate::check_replay_epoch("input.replay_epoch", v))
             .transpose()?,
+        record_iq: t.record_iq.clone().map(|p| resolve_path("record_iq", p)),
     };
     let set: [(&str, bool); 15] = [
         ("device", t.device.is_some()),
@@ -934,7 +940,7 @@ fn validate_input(
             device: t.device.clone(),
         },
         InputKind::File => SourceFromFile::File {
-            path: resolve_path(req(t.path.clone(), "path", name)?),
+            path: resolve_path("path", req(t.path.clone(), "path", name)?),
             iq: t.iq.unwrap_or(false),
             realtime: t.realtime.unwrap_or(false),
             looped: t.looped.unwrap_or(false),

@@ -1987,6 +1987,48 @@ fn check_record_destination(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// MAN-309: each `[[input]]`'s `record_iq` passes `check_record_destination`
+/// and no two inputs record to the same file.
+fn check_record_destinations(inputs: &[ResolvedInput]) -> Result<()> {
+    let mut seen: Vec<&Path> = Vec::new();
+    for input in inputs {
+        let Some(path) = input.record_iq.as_deref() else {
+            continue;
+        };
+        if seen.contains(&path) {
+            bail!(
+                "two [[input]] entries record to {}; give each its own record_iq",
+                path.display()
+            );
+        }
+        check_record_destination(path)?;
+        seen.push(path);
+    }
+    Ok(())
+}
+
+/// MAN-309: starts recording `src` to `path` and logs where.
+fn start_input_recording(
+    src: Box<dyn IqSource>,
+    path: &Path,
+    start: std::time::SystemTime,
+) -> Result<(Box<dyn IqSource>, manta_input::RecordingHandle)> {
+    let (rec, handle) = manta_input::start_recording(
+        src,
+        path,
+        start,
+        Some(Box::new(|msg: &str| {
+            logging::warning(&format!("warning: {msg}"))
+        })),
+    )?;
+    logging::note(&format!(
+        "recording IQ to {}; metadata: {}",
+        path.display(),
+        manta_input::metadata_path(path).display()
+    ));
+    Ok((Box::new(rec), handle))
+}
+
 /// MAN-309: how long `run` waits for a recording to finalize at shutdown.
 const RECORDING_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -4517,6 +4559,8 @@ struct ResolvedInput {
     freq_correction_ppm: f64,
     dial_freq_hz: Option<f64>,
     capture_rate_hz: Option<f64>,
+    /// MAN-309: `run` records this input's IQ here (`record_iq`).
+    record_iq: Option<PathBuf>,
 }
 
 /// MAN-13: a one-receiver command (`calibrate`, `doctor`, `soak`, `check`)
@@ -4662,6 +4706,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
                     freq_correction_ppm: n.input.shared.freq_correction_ppm.unwrap_or(0.0),
                     dial_freq_hz: n.input.shared.center_freq_hz,
                     capture_rate_hz: n.input.shared.capture_rate_hz,
+                    record_iq: n.input.shared.record_iq.clone(),
                 })
             })
             .collect::<Result<Vec<_>>>()?
@@ -6028,14 +6073,18 @@ fn run_command() -> Result<std::process::ExitCode> {
             // MAN-309: one recording per input; `--record-iq` names one.
             if record_iq.is_some() && !resolved.inputs.is_empty() {
                 bail!(
-                    "--record-iq records one input; this run has {} inputs",
+                    "--record-iq records one input; this run has {} inputs: set record_iq in \
+                     each [[input]] entry to record",
                     resolved.inputs.len()
                 );
             }
+            // CLI > environment > file (`input.record_iq`).
+            let record_iq = record_iq.or_else(|| loaded.input.shared.record_iq.clone());
             // An existing --source is an existing destination too.
             if let Some(path) = &record_iq {
                 check_record_destination(path)?;
             }
+            check_record_destinations(&resolved.inputs)?;
             // MAN-79's stale built-in cty.dat warning, before any I/O,
             // unless the cache may replace that copy: `prepare_run_lists`
             // warns then, once it has chosen (MAN-316).
@@ -6595,23 +6644,11 @@ fn run_command() -> Result<std::process::ExitCode> {
             // MAN-309: the exact samples, gaps and source properties handed
             // to the engine are recorded; the decoder never waits on the
             // writer. A replay's recording starts at the replay's epoch.
-            let (src, recording): (Box<dyn IqSource>, _) = match &record_iq {
+            let (src, recording) = match &record_iq {
                 Some(path) => {
                     let start = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
-                    let (rec, handle) = manta_input::start_recording(
-                        src,
-                        path,
-                        start,
-                        Some(Box::new(|msg: &str| {
-                            logging::warning(&format!("warning: {msg}"))
-                        })),
-                    )?;
-                    logging::note(&format!(
-                        "recording IQ to {}; metadata: {}",
-                        path.display(),
-                        manta_input::metadata_path(path).display()
-                    ));
-                    (Box::new(rec), Some(handle))
+                    let (src, handle) = start_input_recording(src, path, start)?;
+                    (src, Some(handle))
                 }
                 None => (src, None),
             };
@@ -9442,8 +9479,7 @@ mod tests {
     fn a_native_recording_replays_at_its_recorded_start_not_its_mtime() {
         let dir = tempfile::tempdir().unwrap();
         let rec = native_pair(dir.path(), "a.cf32", 1_792_407_600, 7);
-        let recorded =
-            std::time::UNIX_EPOCH + std::time::Duration::new(1_792_407_600, 500);
+        let recorded = std::time::UNIX_EPOCH + std::time::Duration::new(1_792_407_600, 500);
         assert_eq!(resolve_epoch(Some(&rec), None).unwrap(), recorded);
         // --replay-epoch still wins.
         assert_eq!(
@@ -11490,6 +11526,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("dial_freq_hz", "input.center_freq_hz"),
         ("capture_rate_hz", "input.capture_rate_hz"),
         ("replay_epoch", "input.replay_epoch"),
+        ("record_iq", "input.record_iq"),
         ("allowlist", "spot.allowlist"),
         ("blocklist", "spot.blocklist_path"),
         ("notch", "spot.notch_path"),
@@ -11514,6 +11551,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         "center_freq_hz",
         // `decode --timing` (MAN-315): an output choice, like `json`.
         "timing",
+        // MAN-309: headerless IQ is described per command line; a follow-up
+        // may add `input.iq_format`/`input.sample_rate_hz`.
+        "iq_format",
+        "sample_rate_hz",
         "help",
         "version",
         "reference_hz",
@@ -11652,6 +11693,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 "[input]\ncapture_rate_hz = 6000.0\n",
             ),
             ("input.replay_epoch", "[input]\nreplay_epoch = 0\n"),
+            ("input.record_iq", "[input]\nrecord_iq = \"s.cf32\"\n"),
             ("spot.allowlist", "[spot]\nallowlist = [\"W1AW\"]\n"),
             (
                 "spot.blocklist_path",

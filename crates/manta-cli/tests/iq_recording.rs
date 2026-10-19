@@ -412,3 +412,119 @@ fn headerless_cf32_and_ci16_decode_like_the_equivalent_wavs() {
         "{stderr}"
     );
 }
+
+#[test]
+fn a_service_config_records_relative_to_its_file_and_config_check_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = dir.path().join("svc");
+    std::fs::create_dir(&svc).unwrap();
+    let (wav, manifest) = v1_fixture(&svc);
+    let toml = svc.join("manta.toml");
+    std::fs::write(
+        &toml,
+        "[input]\ntype = \"file\"\npath = \"v1.wav\"\niq = true\nrecord_iq = \"cap.cf32\"\n",
+    )
+    .unwrap();
+    let rec = svc.join("cap.cf32");
+
+    let check = run_ok(&[
+        "config".as_ref(),
+        "check".as_ref(),
+        "--config".as_ref(),
+        toml.as_os_str(),
+    ]);
+    let summary = String::from_utf8_lossy(&check.stdout).into_owned()
+        + &String::from_utf8_lossy(&check.stderr);
+    assert!(
+        summary.contains(&format!("record_iq={}", rec.display())),
+        "{summary}"
+    );
+    assert!(!rec.exists());
+    assert!(!manta_input::partial_metadata_path(&rec).exists());
+
+    // Run from another directory: the path is the config file's, not the
+    // working directory's.
+    let out = manta()
+        .current_dir(dir.path())
+        .args(["run", "--json", "--config"])
+        .arg(&toml)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let recs = records(&rec);
+    assert_eq!(
+        recs.last().unwrap(),
+        &MetadataRecord::End {
+            sample_count: (manifest.fs * manifest.duration_s) as u64,
+            reason: EndReason::Eof
+        }
+    );
+    assert_eq!(std::fs::read(&rec).unwrap(), cf32_bytes(&wav_samples(&wav)));
+    // A restart with the same destination fails and touches nothing.
+    let before = std::fs::read(metadata_path(&rec)).unwrap();
+    let out = manta()
+        .args(["run", "--json", "--config"])
+        .arg(&toml)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(std::fs::read(metadata_path(&rec)).unwrap(), before);
+}
+
+#[test]
+fn each_input_of_a_multi_input_daemon_records_its_own_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, manifest) = v1_fixture(dir.path());
+    let entry = |name: &str, rec: &str| {
+        format!(
+            "[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = \"{}\"\niq = true\n\
+             record_iq = \"{rec}\"\n\n",
+            wav.display()
+        )
+    };
+    let toml = dir.path().join("multi.toml");
+    std::fs::write(&toml, entry("a", "a.cf32") + &entry("b", "b.cf32")).unwrap();
+    let out = manta()
+        .args(["run", "--json", "--config"])
+        .arg(&toml)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let n = (manifest.fs * manifest.duration_s) as u64;
+    for rec in ["a.cf32", "b.cf32"] {
+        let rec = dir.path().join(rec);
+        assert!(
+            stderr.contains(&format!(
+                "recording finished: {}, {n} samples",
+                rec.display()
+            )),
+            "{stderr}"
+        );
+        assert_eq!(std::fs::read(&rec).unwrap(), cf32_bytes(&wav_samples(&wav)));
+    }
+
+    // Two inputs on one destination, or --record-iq with several inputs,
+    // fail before anything opens.
+    let dup = dir.path().join("dup.toml");
+    std::fs::write(&dup, entry("a", "same.cf32") + &entry("b", "same.cf32")).unwrap();
+    let out = manta()
+        .args(["run", "--config"])
+        .arg(&dup)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("give each its own record_iq"));
+    assert!(!dir.path().join("same.cf32").exists());
+    let out = manta()
+        .args(["run", "--record-iq", "x.cf32", "--config"])
+        .arg(&toml)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--record-iq records one input"));
+}

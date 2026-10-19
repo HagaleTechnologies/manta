@@ -12,7 +12,11 @@ use std::time::{Duration, SystemTime};
 /// One scripted read: `(gap, samples)`, or an error.
 type ScriptedRead = std::result::Result<(Option<u64>, Vec<Complex32>), String>;
 /// One traced read: `(n or error, gap, sample bits)`.
-type TracedRead = (std::result::Result<usize, String>, Option<u64>, Vec<(u32, u32)>);
+type TracedRead = (
+    std::result::Result<usize, String>,
+    Option<u64>,
+    Vec<(u32, u32)>,
+);
 
 /// Replays scripted reads.
 struct Scripted {
@@ -75,9 +79,7 @@ fn bits(s: &[Complex32]) -> Vec<(u32, u32)> {
 }
 
 /// Every read as `(n or error, gap, sample bits)`.
-fn trace(
-    src: &mut dyn IqSource,
-) -> Vec<TracedRead> {
+fn trace(src: &mut dyn IqSource) -> Vec<TracedRead> {
     let mut out = Vec::new();
     let mut buf = vec![Complex32::new(0.0, 0.0); 20_000];
     loop {

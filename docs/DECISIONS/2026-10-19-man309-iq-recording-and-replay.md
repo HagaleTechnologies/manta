@@ -34,6 +34,14 @@ described on the command line. Operator guide:
   and leaves the `.partial` metadata. Either warns once, decoding
   continues, and `run` exits 1 at the end. Shutdown waits at most 5 s; a
   timeout cancels publication if it has not begun.
+- **D3a — configuration.** `record_iq` is a shared `[input]` key (and
+  `MANTA_INPUT_RECORD_IQ`), resolved against the config file's directory
+  like `path` (the input path resolver now takes the key name). Each
+  `[[input]]` records independently through `multi_run`'s opener; its
+  handle lives beside the engine's source and is finished after
+  `listen_inputs` returns. `--record-iq` overrides the single form and is
+  refused with several inputs; duplicate destinations are refused at
+  startup. `config check` reports it and creates nothing.
 - **D4 — never overwrite.** Payload and partial metadata are created with
   `create_new`, after a startup check that fails `run` with exit 1 before
   any input or listener opens. Publication hard-links the partial file to
@@ -60,8 +68,7 @@ These planned items are follow-ups:
 
 - Gap-aware `decode` (segment the offline decode at each gap, with source
   guards).
-- The `record_iq`, `iq_format` and `sample_rate_hz` config keys,
-  `MANTA_INPUT_RECORD_IQ`, and per-input recording in a multi-input daemon.
+- `iq_format` and `sample_rate_hz` config keys (the flags are CLI-only).
 - Native-recording support in `oracle`, `check`, `soak` and `bench`.
 
 ## Verification
@@ -79,5 +86,8 @@ These planned items are follow-ups:
   on three runs with W1AW in them; `decode` of the recording equals
   `decode` of the WAV; a copied pair replays the same; a gapped recording
   replays deterministically and differently from its gap-free twin; cf32
-  and ci16 decode exactly like the equivalent Float32 and PCM16 WAVs.
+  and ci16 decode exactly like the equivalent Float32 and PCM16 WAVs; a
+  config `record_iq` resolves against the config file, `config check`
+  creates nothing, a restart onto the same file fails untouched; each input
+  of a two-input daemon records its own file.
 - No golden vector or legacy WAV output changes.

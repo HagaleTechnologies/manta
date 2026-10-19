@@ -133,6 +133,6 @@ ignores the config's entries.
 - A per-receiver identity on RBN or a receiver field on spots: MAN-14. The
   combined output has one station identity.
 - Adding or removing receivers without a restart.
-- Recording each receiver's IQ: `run --record-iq` records a single input
-  and is refused with several `[[input]]` entries
+- One `--record-iq` file for all receivers: set `record_iq` in each
+  `[[input]]` entry instead, one file per receiver
   ([iq-recording.md](iq-recording.md)).

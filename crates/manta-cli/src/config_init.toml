@@ -217,6 +217,11 @@
 # sample stands for. No default: the file's modification time.
 #replay_epoch = 1700000000
 
+# `manta run` only: record this input's IQ while decoding, as little-endian
+# complex float32 plus FILE.meta.jsonl. Existing files are never
+# overwritten, so a restart needs a new name. No default: no recording.
+#record_iq = "captures/session.cf32"
+
 
 # --- Spot filters ------------------------------------------------------------
 
