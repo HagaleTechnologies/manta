@@ -220,6 +220,25 @@ impl IqSource for DecimatingSource {
     fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
         self.inner.health_counters()
     }
+
+    /// MAN-73: the inner source's gap, rescaled from inner-rate samples to
+    /// this wrapper's `sample_rate()`, the unit the trait reports it in.
+    /// Forwarded rather than left to the trait's `None` default, which
+    /// swallowed it (MAN-259); harmless until now only because no raw
+    /// driver reports one (`ReconnectingSource`, the only reporter, wraps
+    /// this type, never the reverse).
+    fn take_discontinuity(&mut self) -> Option<u64> {
+        let ratio = self.fs_out / self.inner.sample_rate();
+        self.inner
+            .take_discontinuity()
+            .map(|gap| (gap as f64 * ratio).round() as u64)
+    }
+
+    /// MAN-259: the inner driver's acquisition start; decimation adds no
+    /// open-time work of its own.
+    fn acquisition_start_offset(&self) -> std::time::Duration {
+        self.inner.acquisition_start_offset()
+    }
 }
 
 #[cfg(test)]
@@ -488,6 +507,74 @@ mod tests {
         counters.record_dropped(5);
         // Verify the forwarded reference sees the same update
         assert_eq!(forwarded_counters.dropped_packets(), 5);
+    }
+
+    /// An `InMemorySource` that reports a reconnect-side signal: an
+    /// acquisition-start offset (MAN-259) and a one-shot discontinuity
+    /// (MAN-73), as a reopened live driver does.
+    struct ReopenedSource {
+        inner: InMemorySource,
+        acquisition_start_offset: std::time::Duration,
+        gap: Option<u64>,
+    }
+
+    impl IqSource for ReopenedSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.sample_rate()
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz()
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            self.inner.read(buf)
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            self.gap.take()
+        }
+        fn acquisition_start_offset(&self) -> std::time::Duration {
+            self.acquisition_start_offset
+        }
+    }
+
+    fn reopened(
+        acquisition_start_offset: std::time::Duration,
+        gap: Option<u64>,
+    ) -> DecimatingSource {
+        let inner: Box<dyn IqSource + Send> = Box::new(ReopenedSource {
+            inner: InMemorySource {
+                samples: tone(1_000.0, 1_000, 192_000.0),
+                cursor: 0,
+                fs: 192_000.0,
+                center_freq_hz: 14_000_000.0,
+                live: None,
+                counters: None,
+            },
+            acquisition_start_offset,
+            gap,
+        });
+        DecimatingSource::new(inner, 48_000.0).unwrap()
+    }
+
+    /// MAN-259: without forwarding, the trait's `ZERO` default would put
+    /// every `--capture-rate-hz` reconnect's outage end at the start of
+    /// the open call, dropping the driver's pre-start handshake from it.
+    #[test]
+    fn acquisition_start_offset_forwards_to_the_inner_source() {
+        let src = reopened(std::time::Duration::from_millis(250), None);
+        assert_eq!(
+            src.acquisition_start_offset(),
+            std::time::Duration::from_millis(250)
+        );
+    }
+
+    /// MAN-259: the same forwarding duty for MAN-73's discontinuity, which
+    /// this wrapper used to swallow through the trait's `None` default. One
+    /// second at the inner 192 kS/s is one second at the decimated 48 kS/s.
+    #[test]
+    fn take_discontinuity_forwards_to_the_inner_source() {
+        let mut src = reopened(std::time::Duration::ZERO, Some(192_000));
+        assert_eq!(src.take_discontinuity(), Some(48_000));
+        assert_eq!(src.take_discontinuity(), None, "reported only once");
     }
 
     /// MAN-86: a decimated source must report the inner source's delivered

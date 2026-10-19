@@ -193,6 +193,7 @@ pub trait IqSource {
         None
     }
 
+<<<<<<< HEAD
     /// MAN-305: samples (at `sample_rate()`) lost immediately before the
     /// samples returned by the most recent `read()`, which the source spliced
     /// over instead of reporting a discontinuity: a short loss on a numbered
@@ -202,6 +203,33 @@ pub trait IqSource {
     /// **Wrapper types must forward this**, as they forward `take_discontinuity`.
     fn take_missing_samples(&mut self) -> Option<u64> {
         None
+=======
+    /// MAN-259: how far into this connection's `open()` call the stream
+    /// `read()` returns began -- the offset from the call starting to
+    /// immediately before the call that told the hardware to start
+    /// streaming (Kiwi's IQ-mode `SET`, Soapy's `activate`, HPSDR's start
+    /// command, cpal's `start`, ka9q's data-group join), or, when the
+    /// driver cannot return everything captured since its trigger, to the
+    /// first sample it can still return (ka9q's startup stash evicts its
+    /// oldest packets past a byte cap). Everything before it was
+    /// certainly signal-silent; samples captured from it on are returned
+    /// by `read()`.
+    /// `manta-cli`'s `ReconnectingSource` ends a reconnect's outage there
+    /// rather than where `open()` returned, so the open call's remaining
+    /// runtime is not counted both as outage and as returned samples,
+    /// which shifted every later spot timestamp late. A relative
+    /// `Duration`, like `take_discontinuity`'s sample count, so this crate
+    /// stays independent of the caller's clock. Default `ZERO`:
+    /// acquisition begins as soon as `open()` is entered.
+    ///
+    /// **Wrapper types must forward this**, exactly as `health_counters`
+    /// below -- the default `ZERO` otherwise silently moves the wrapped
+    /// source's anchor back to the start of `open()`, so its pre-start
+    /// handshake drops out of the outage. Not enforceable by the type
+    /// system.
+    fn acquisition_start_offset(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+>>>>>>> 80cc42d213d6f5982a319308c2a5fc4696efd601
     }
 
     /// Shared packet-loss/malformed counters for sources that can lose or

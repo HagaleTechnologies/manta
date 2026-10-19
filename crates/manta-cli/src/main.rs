@@ -1788,9 +1788,16 @@ impl IqSource for FixedCenterFreqSource {
         self.inner.take_discontinuity()
     }
 
+<<<<<<< HEAD
     /// MAN-305: forwarded as `take_discontinuity` is.
     fn take_missing_samples(&mut self) -> Option<u64> {
         self.inner.take_missing_samples()
+=======
+    /// MAN-259: `ReconnectingSource` reads this off the opener's result to
+    /// end an outage where acquisition began.
+    fn acquisition_start_offset(&self) -> std::time::Duration {
+        self.inner.acquisition_start_offset()
+>>>>>>> 80cc42d213d6f5982a319308c2a5fc4696efd601
     }
 
     fn health_counters(&self) -> Option<std::sync::Arc<manta_input::InputHealthCounters>> {
@@ -10186,6 +10193,7 @@ mod tests {
         assert_eq!(src.take_discontinuity(), None);
     }
 
+<<<<<<< HEAD
     /// MAN-305: the inner source's spliced loss reaches `listen()`, once.
     #[test]
     fn fixed_center_freq_source_forwards_take_missing_samples() {
@@ -10193,15 +10201,29 @@ mod tests {
             missing: Option<u64>,
         }
         impl IqSource for MissingProbeSource {
+=======
+    /// MAN-259: the reconnect wrapper reads the acquisition-start offset
+    /// off the opener's result, which is this wrapper whenever
+    /// `--dial-freq-hz` or a fixed centre is in effect.
+    #[test]
+    fn fixed_center_freq_source_forwards_acquisition_start_offset() {
+        struct OffsetSource;
+        impl IqSource for OffsetSource {
+>>>>>>> 80cc42d213d6f5982a319308c2a5fc4696efd601
             fn sample_rate(&self) -> f64 {
                 48_000.0
             }
             fn center_freq_hz(&self) -> f64 {
+<<<<<<< HEAD
                 14_000_000.0
+=======
+                0.0
+>>>>>>> 80cc42d213d6f5982a319308c2a5fc4696efd601
             }
             fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
                 Ok(0)
             }
+<<<<<<< HEAD
             fn take_missing_samples(&mut self) -> Option<u64> {
                 self.missing.take()
             }
@@ -10215,6 +10237,21 @@ mod tests {
         assert_eq!(src.take_missing_samples(), Some(11_900));
         assert_eq!(src.take_missing_samples(), None);
         assert_eq!(src.take_discontinuity(), None);
+=======
+            fn acquisition_start_offset(&self) -> std::time::Duration {
+                std::time::Duration::from_millis(250)
+            }
+        }
+
+        let src = FixedCenterFreqSource {
+            inner: Box::new(OffsetSource),
+            freq_hz: 14_000_000.0,
+        };
+        assert_eq!(
+            src.acquisition_start_offset(),
+            std::time::Duration::from_millis(250)
+        );
+>>>>>>> 80cc42d213d6f5982a319308c2a5fc4696efd601
     }
 
     // MAN-56: input-layer health counters wiring.

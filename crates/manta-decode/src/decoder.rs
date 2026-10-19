@@ -815,6 +815,23 @@ impl TrackDecoder {
             }
             if live {
                 self.tracker.on_mark(dur_ms);
+                if self.tracker.take_badlock_recovered() {
+                    // MAN-398: the tracker just re-seeded mu_dit/mu_dah from a
+                    // fragment-seeded bad lock (the gap-corroborated lone-dit
+                    // trigger in `SpeedTracker::check_drift`, see
+                    // docs/DECISIONS/2026-10-18-man398-gap-corroborated-badlock-recovery.md).
+                    // `GapClassifier`'s own
+                    // cluster pair was bootstrapped from gap/mu_dit ratios
+                    // computed against the bad mu_dit and has no
+                    // self-correction path of its own, so its boundary
+                    // would otherwise stay wrong forever, permanently
+                    // misclassifying every inter-word gap as inter-char
+                    // (see SpeedTracker::badlock_recovered's doc comment).
+                    // The flushed one-character-word gaps it would rebuild
+                    // from were measured in the same bad unit.
+                    self.gaps = GapClassifier::new();
+                    self.single_flush_gaps.clear();
+                }
                 self.sync_sender_regime();
                 self.demod.set_dit_ms(self.tracker.mu_dit_ms());
                 if let Some(w) = self.tracker.wpm() {
@@ -1382,6 +1399,201 @@ mod tests {
         }
         events.extend(dec.finish());
         (events_to_text(&events), events)
+    }
+
+    /// MAN-6 regression, hermetic. A track promoted mid-element makes the
+    /// demod's init window open mid-dah; the resulting un-anchored fragment
+    /// becomes sample #1 of SpeedTracker's 5-mark bootstrap, tipping
+    /// ClusterPair::initialize's largest-ratio-gap split onto a bad,
+    /// self-consistent fixed point: mu_dit collapses, every mark
+    /// reclassifies as a dah, every inter-element gap promotes to
+    /// inter-character. Pre-fix this became an endless "TT TTT TT TTT ..."
+    /// that never re-synced; `SpeedTracker`'s gap-corroborated bad-lock
+    /// recovery (MAN-398) bounds it to a fixed-size garbled prefix that
+    /// recovers after `DRIFT_LEN` (12) marks and never grows, however long
+    /// the stream runs -- see
+    /// `mid_element_start_error_does_not_grow_with_duration` below and
+    /// docs/DECISIONS/2026-10-18-man398-gap-corroborated-badlock-recovery.md.
+    /// (A companion fix that discarded the fabricated leading fragment in
+    /// `Demod` outright was tried and reverted: it also discards genuine
+    /// leading elements on ordinary decodes whenever the demod's init window
+    /// happens to open on a real edge, regressing golden V1/V10 -- see that
+    /// doc.) Reproduced here with ZERO noise, which is the point: this is a
+    /// deterministic timing-bootstrap defect, not a noise-robustness limit.
+    ///
+    /// `skip_hops` starts the fresh `TrackDecoder` (simulating a
+    /// track-promotion attach) partway through a real element: at
+    /// `dit_hops = 25`, "A" = dit(25) gap(25) dah(75), so its dah spans
+    /// hops [50, 125). `skip_hops = 125 - 7` starts 7 hops before that dah
+    /// ends, leaving a 7-hop fragment: above the 5-hop debounce floor, and
+    /// (66.67/18.7 ~= 3.6 > 200/66.67 = 3.0) large enough to win
+    /// `ClusterPair::initialize`'s largest-ratio-gap split against the real
+    /// dit/dah population.
+    fn decode_from_hop(text: &str, dit_hops: u32, skip_hops: usize) -> (String, Vec<DecoderEvent>) {
+        let env = rect_envelope(text, dit_hops);
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().skip(skip_hops).enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        (events_to_text(&events), events)
+    }
+
+    #[test]
+    fn mid_element_start_does_not_lock_bad_timing() {
+        // 10 repetitions of "AU"; start 7 hops before the end of A's first
+        // dah (see decode_from_hop's doc comment for the derivation). The
+        // bad lock produces a fixed-size garbled prefix, then recovers and
+        // decodes "AU" cleanly -- as its own space-bounded word, not merely
+        // as a substring -- for the remainder of the stream. MAN-6 F3: a
+        // `matches("AU")` substring count also passes on a run that has
+        // recovered its 'T'/'E' garbling but lost every word boundary
+        // (e.g. "UAUAUAUAUAUAU" contains "AU" six times too), because
+        // `GapClassifier`'s own stale cluster state kept misclassifying
+        // every inter-word gap as inter-char. Counting whitespace-delimited
+        // "AU" tokens instead only passes once spacing is genuinely intact.
+        let text = "AU AU AU AU AU AU AU AU AU AU";
+        let (decoded, events) = decode_from_hop(text, 25, 125 - 7);
+        let au_words = decoded.split_whitespace().filter(|&w| w == "AU").count();
+        assert!(
+            au_words >= 5,
+            "expected clean, word-bounded recovery after the garbled prefix -- {decoded:?}"
+        );
+        // 25 hops/dit = 66.67 ms = 18.0 WPM.
+        let wpm = events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::SpeedUpdate { wpm, .. } => Some(*wpm),
+                _ => None,
+            })
+            .next_back()
+            .expect("no SpeedUpdate emitted");
+        assert!((wpm - 18.0).abs() < 2.0, "wpm {wpm}");
+    }
+
+    #[test]
+    fn mid_element_start_error_does_not_grow_with_duration() {
+        // The ticket's actual acceptance criterion: error must stabilize or
+        // shrink as the scene lengthens, not accumulate. The bad-lock
+        // recovery bounds the garbled run to a fixed-size prefix that does
+        // not grow as more repetitions are appended -- it does not
+        // eliminate the garbled prefix outright (that would require
+        // discarding the fabricated leading fragment in `Demod`, which was
+        // tried and reverted for regressing ordinary decodes; see
+        // docs/DECISIONS/2026-10-18-man398-gap-corroborated-badlock-recovery.md).
+        //
+        // Assert against a measured baseline (reps=4, the shortest case
+        // whose prefix is already complete) rather than a hard-coded count:
+        // the bound is a property of where the bad-lock trigger first
+        // fires on this tuple, not a number worth freezing independent of
+        // the mechanism that produces it.
+        let baseline_text = std::iter::repeat_n("AU", 4usize)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (baseline_decoded, _) = decode_from_hop(&baseline_text, 25, 125 - 7);
+        let baseline_t = baseline_decoded.chars().filter(|&c| c == 'T').count();
+        let mut long_decoded = String::new();
+        for reps in [10usize, 24, 60] {
+            let text = std::iter::repeat_n("AU", reps)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let (decoded, _) = decode_from_hop(&text, 25, 125 - 7);
+            let t_count = decoded.chars().filter(|&c| c == 'T').count();
+            assert!(
+                t_count <= baseline_t,
+                "reps {reps}: garbled prefix grew past its fixed size ({t_count} > baseline {baseline_t}) -- {decoded:?}"
+            );
+            long_decoded = decoded;
+        }
+        // MAN-6 F3: the 'T' prefix staying flat is necessary but not
+        // sufficient -- `GapClassifier`'s own stale cluster state could
+        // still silently delete every word boundary after the recovery
+        // point even while the 'T' count stayed bounded. Assert the
+        // recovered tail is genuinely word-separated, not glued together
+        // (`long_decoded` is the loop's last, 60-repetition, decode).
+        let au_words = long_decoded
+            .split_whitespace()
+            .filter(|&w| w == "AU")
+            .count();
+        assert!(
+            au_words >= 50,
+            "recovered decode must keep word boundaries -- {long_decoded:?}"
+        );
+    }
+
+    #[test]
+    fn mid_element_start_on_homogeneous_text_does_not_grow_with_duration() {
+        // MAN-6 on all-dit text: looped "HH" ("H" = 4 dits), started 7 hops
+        // before the end of H's second dit (hops [50, 75) at dit_hops = 25),
+        // the same trigger as the "AU" tests above. The fragment seeds
+        // mu_dit and the real dits seed mu_dah, so every dit reads as a dah
+        // ('T'). The streak that follows sits on its own centroid, which
+        // the SPEC drift rule cannot see, so without the MAN-398 bad-lock
+        // trigger this grew without bound: 'T' count 30 -> 78 -> 190
+        // -> 478 at reps 4/10/24/60. Started on an edge (skip 0), the same
+        // scene decodes perfectly, so the fragment is the whole cause.
+        let decode_reps = |reps: usize| {
+            let text = std::iter::repeat_n("HH", reps)
+                .collect::<Vec<_>>()
+                .join(" ");
+            decode_from_hop(&text, 25, 75 - 7).0
+        };
+        let baseline = decode_reps(4);
+        let baseline_t = baseline.chars().filter(|&c| c == 'T').count();
+        let mut long = String::new();
+        for reps in [10usize, 24, 60] {
+            let decoded = decode_reps(reps);
+            let t_count = decoded.chars().filter(|&c| c == 'T').count();
+            assert!(
+                t_count <= baseline_t,
+                "reps {reps}: garbled prefix grew past its fixed size ({t_count} > baseline {baseline_t}) -- {decoded:?}"
+            );
+            long = decoded;
+        }
+        let hh_words = long.split_whitespace().filter(|&w| w == "HH").count();
+        assert!(
+            hh_words >= 50,
+            "recovered decode must read the dits as dits, word-bounded -- {long:?}"
+        );
+    }
+
+    #[test]
+    fn genuine_opening_dit_then_dahs_decodes_cleanly() {
+        // MAN-398: "E 0000" at 32 WPM (dit 37.3 ms, dah 112 ms -- under the
+        // 150 ms dit ceiling) from a clean start. The bootstrap isolates the real
+        // E as a lone dit and 20 dahs follow; the element gaps say they are dahs,
+        // so no re-seed may turn them into dits (the MAN-6 port decoded
+        // "E 0005EEEEEEEEE").
+        let text = std::iter::repeat_n("E 0000", 10)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (decoded, _) = decode_from_hop(&text, 14, 0);
+        assert_eq!(decoded.matches("E 0000").count(), 10, "{decoded:?}");
+    }
+
+    #[test]
+    fn mid_element_start_on_sparse_dah_text_recovers() {
+        // MAN-398 (MAN-6 validation M1): dit-heavy text with a lone dah per
+        // repetition. Its streak mixes dits and dahs, which the CV-gated
+        // homogeneous trigger could not see; started 7 hops before the end of
+        // H's second dit (as in the "HH" test above).
+        for word in ["HV", "HU", "SV"] {
+            let text = std::iter::repeat_n(word, 30).collect::<Vec<_>>().join(" ");
+            let (decoded, _) = decode_from_hop(&text, 25, 75 - 7);
+            let words = decoded.split_whitespace().filter(|&w| w == word).count();
+            assert!(words >= 25, "{word}: {decoded:?}");
+        }
+    }
+
+    #[test]
+    fn mid_element_start_on_mixed_dit_text_recovers() {
+        // MAN-398 scenario 2's shape, hermetic: "5NN" started 7 hops before the
+        // end of 5's second dit.
+        let text = std::iter::repeat_n("5NN", 30).collect::<Vec<_>>().join(" ");
+        let (decoded, _) = decode_from_hop(&text, 25, 75 - 7);
+        let words = decoded.split_whitespace().filter(|&w| w == "5NN").count();
+        assert!(words >= 25, "{decoded:?}");
     }
 
     #[test]

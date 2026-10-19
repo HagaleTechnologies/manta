@@ -207,10 +207,21 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+<<<<<<< HEAD
 - `ReconnectingSource`, `DecimatingSource` and `manta doctor`'s
   `SampleBoundedSource` now forward the inner source's gap reports
   (`take_discontinuity()` and the new `take_missing_samples()`); they
   swallowed them, so no live source's gap reached the decoder (MAN-305).
+=======
+- MAN-259: after a live source reconnects, `manta run`'s spot timestamps
+  are no longer stamped late by the time the receiver spent reopening while
+  already streaming. The reported outage now ends where the stream the
+  device returns began, not where its open call returned; for ka9q-radio
+  with no SSRC set that was the span its startup stash actually replayed
+  (up to the 1.5 s settle window at 192 kS/s, and only ~0.32 s at
+  1.536 MS/s, where the stash's 4 MiB cap evicts the opening -- that
+  evicted span is outage, not data).
+>>>>>>> 80cc42d213d6f5982a319308c2a5fc4696efd601
 - `manta run` stopped while waiting to reconnect to a lost receiver no
   longer force-decodes the open tracks' last element or judges their
   pending beacons as if the signal had ended; they close as an outage
