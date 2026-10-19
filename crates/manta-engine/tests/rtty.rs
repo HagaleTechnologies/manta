@@ -54,7 +54,7 @@ fn scene(cws: &[SignalSpec], rttys: &[FskSpec], duration_s: f64) -> Vec<Complex3
 }
 
 fn decode(iq: &[Complex32]) -> DecodeReport {
-    decode_samples(iq, FS, CENTER, &PipelineConfig::default()).unwrap()
+    decode_samples(iq, FS, CENTER, &classifier_config()).unwrap()
 }
 
 fn promotions(report: &DecodeReport) -> Vec<(u32, u64, f64)> {
@@ -259,14 +259,22 @@ fn fading_rtty_is_marked() {
     );
 }
 
-fn off() -> PipelineConfig {
+/// MAN-311: The RTTY scenes include tones inside the new HF digital windows.
+/// Keep testing signal classification across the whole original fixture.
+fn classifier_config() -> PipelineConfig {
     let mut cfg = PipelineConfig::default();
+    cfg.detector.digital_window_filter = false;
+    cfg
+}
+
+fn off() -> PipelineConfig {
+    let mut cfg = classifier_config();
     cfg.detector.rtty_filter = false;
     cfg
 }
 
 fn assert_on_off_equal(iq: &[Complex32], fs: f64, center: f64) {
-    let on = decode_samples(iq, fs, center, &PipelineConfig::default()).unwrap();
+    let on = decode_samples(iq, fs, center, &classifier_config()).unwrap();
     let off = decode_samples(iq, fs, center, &off()).unwrap();
     assert!(on.rtty.is_empty(), "{:?}", on.rtty);
     assert!(off.rtty.is_empty());
@@ -332,7 +340,7 @@ fn decode_report_carries_calibrated_rtty_entries() {
     let plain = decode(&iq);
     let cfg = PipelineConfig {
         freq_correction_ppm: 10.0,
-        ..PipelineConfig::default()
+        ..classifier_config()
     };
     let cal = decode_samples(&iq, FS, CENTER, &cfg).unwrap();
     let factor = manta_spot::calibration_factor_from_ppm(10.0).unwrap();
@@ -350,7 +358,7 @@ fn decode_report_rtty_is_empty_without_rtty() {
         &rendered.samples,
         v1.fs,
         v1.center_freq_hz,
-        &PipelineConfig::default(),
+        &classifier_config(),
     )
     .unwrap();
     assert!(report.rtty.is_empty());
@@ -361,7 +369,7 @@ fn decode_report_rtty_is_empty_without_rtty() {
 #[test]
 fn decode_report_keeps_rtty_without_cw_output() {
     let iq = scene(&[], &[rtty(15_000.0, 170.0, 30.0)], 4.0);
-    let mut cfg = PipelineConfig::default();
+    let mut cfg = classifier_config();
     cfg.detector.rtty_dwell_hops = manta_dsp::fsk::BLOCK_HOPS as u64;
     cfg.detector.confirm_hops = 1_000_000;
     let report = decode_samples(&iq, FS, CENTER, &cfg).unwrap();

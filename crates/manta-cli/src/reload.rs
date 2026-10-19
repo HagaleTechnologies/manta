@@ -729,6 +729,16 @@ blocklist_path = \"bl.txt\"
     }
 
     #[test]
+    fn digital_window_changes_need_a_restart() {
+        let old = table("[detector]\ndigital_window_filter = true\n");
+        let new = table("[detector]\ndigital_window_filter = false\n");
+        assert_eq!(
+            restart_only_changes(&old, &new),
+            vec!["detector.digital_window_filter"]
+        );
+    }
+
+    #[test]
     fn pattern_settings_need_a_restart() {
         let old = table("[spot]\nvalidation_level = 'normal'\npattern_path = 'old.lst'\n");
         let new = table("[spot]\nvalidation_level = 'minimal'\npattern_path = 'new.lst'\n");

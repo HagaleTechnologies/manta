@@ -300,6 +300,10 @@
 
 [detector]
 
+# Skip the common HF FT8, FT4, WSPR and JS8 windows when starting CW tracks.
+# Set false to include these windows. Restart required.
+#digital_window_filter = true
+
 #on_snr_db = 12.0                    # signal-to-noise ratio, dB, that starts a track (0 to 100)
 #off_snr_db = 3.0                    # ratio below which a track counts as silent (0 to on_snr_db)
 #confirm_ms = 50.0                   # how long a signal must last before it is decoded
