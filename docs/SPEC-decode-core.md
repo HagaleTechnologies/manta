@@ -316,7 +316,8 @@ and §7's vector pass criteria are all unchanged and remain defined in
 
 ### 2.4 Track lifecycle state machine
 
-States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`.
+States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`, plus `DORMANT`
+between HANG and CLOSED for a track that has decoded (MAN-108).
 
 | Transition | Condition |
 |---|---|
@@ -326,13 +327,34 @@ States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`.
 | ACTIVE → HANG | drop condition met (below off threshold) |
 | HANG → ACTIVE | `S ≥ F + on_snr_db` again (hang timer reset) |
 | HANG → CLOSED | hang timer (5 000 ms) expires → decoder returned, final spots flushed |
+| HANG → DORMANT | hang timer expires on a track that has decoded a character while qualified, with `reacquire_ms > 0` (MAN-108) → decoder flushed exactly as a hang close flushes it, then released; `track_id`, centroid and ownership kept |
+| DORMANT → ACTIVE | rise sustained `confirm_hops` (19) consecutive hops on an owned channel within `reacquire_ms` (10 000 ms) → fresh decoder leased under the same `track_id`; no MAN-313 requalification, no new `TrackPromoted` |
+| DORMANT → CLOSED | `reacquire_ms` expires with no re-acquisition → closed as a hang expiry (`HangExpired`, `ClosureKind::SignalEnded`); nothing left to flush |
 | ACTIVE/HANG → CLOSED | **garbage collect:** no character emitted for 30 000 ms (`detector.gc_ms`) — carrier or non-CW signal; the channel is marked *suppressed* for 60 s (re-detection allowed but logged) |
-| any → CLOSED | eviction: track cap reached and this is the lowest-SNR track (counted in metrics, per ARCHITECTURE §4) |
-| ACTIVE/HANG/CANDIDATE → CLOSED | `round(c)` inside a marked RTTY signal's hard span (§2.6) → closed as bookkeeping (`CloseReason` `rtty`, counted) |
+| any → CLOSED | eviction: track cap reached and this is the lowest-SNR track (counted in metrics, per ARCHITECTURE §4); a DORMANT track's SNR is noise-level, so it goes first. Merging (§2.5) also applies to DORMANT tracks |
+| ACTIVE/HANG/DORMANT/CANDIDATE → CLOSED | `round(c)` inside a marked RTTY signal's hard span (§2.6) → closed as bookkeeping (`CloseReason` `rtty`, counted) |
 | ACTIVE/HANG → CLOSED | promoted but not qualified as keyed CW within `unkeyed_close_hops` of promotion (§2.8) → closed as bookkeeping (`CloseReason` `not_cw`, counted); no events, because no decoder was leased |
 | ACTIVE → CLOSED | qualified track key-down for `unkeyed_close_hops` with no re-rise, no decoded character and no callsign read (§2.8) → closed as bookkeeping (`CloseReason` `unkeyed`, counted), flushed like the garbage-collect close |
 
 All timers are hop-counted (integers), never wall-clock.
+
+**DORMANT (MAN-108).** A Watterson-faded signal can stay under the rise
+threshold for longer than the hang, and before MAN-108 each such fade
+closed the track and spawned a new one that paid warm-up, qualification
+and the validator's first-meta wait again. DORMANT keeps the identity
+instead. The `reacquirable` latch is set when a qualified track decodes a
+character, batch-granular like the GC reset (§2.8 G); a track that never
+decoded closes at the hang as before. While DORMANT no decoder runs, the
+garbage-collect timer holds, the centroid `c` and the spot-frequency
+phase sum `Z` (§1.4, MAN-114) are frozen (the frequency the track held is what re-acquisition matches on, so noise or a neighbour must
+not drag it), and the track keeps owning `{round(c) − 1, round(c),
+round(c) + 1}`. The wake rule is the same `confirm_hops` a fresh
+CANDIDATE needs, not a single rise hop: a single-hop wake was measured to
+lose word boundaries (the decoder is sensitive to its start hop, MAN-166).
+The decoder is fresh on wake: a decoder kept through the fade was
+measured to stay locked to the wrong speed. A woken track's wake counts as
+a re-rise for the §2.8 unkeyed close. `detector.reacquire_ms = 0` restores
+the pre-MAN-108 behaviour exactly.
 
 **Lazy lease (MAN-313).** With `detector.non_cw_filter = true` (the
 default) the lifecycle above is unchanged, but CANDIDATE → ACTIVE does not
@@ -348,10 +370,12 @@ channels. `non_cw_filter = false` leases at promotion, as before.
 On a hop where a static crash is suppressed (§2.7, `detector.crash_filter`
 `"full"` or `"starts-only"`), no IDLE → CANDIDATE transition happens, a
 CANDIDATE's lifecycle does not step (its confirm count neither advances
-nor resets), and ACTIVE/HANG tracks step on rise/drop recomputed from the
+nor resets), a DORMANT track's wake confirmation likewise does not step
+(neither advancing nor resetting) while its `reacquire_ms` window keeps
+aging, and ACTIVE/HANG tracks step on rise/drop recomputed from the
 gate's held `S[k]` (its value before the crash) against the current floor.
-The crash's energy therefore cannot confirm a candidate or turn a HANG
-track back to ACTIVE.
+The crash's energy therefore cannot confirm a candidate, finish a
+DORMANT track's wake, or turn a HANG track back to ACTIVE.
 
 ### 2.5 Adjacent-channel ownership (one signal ⇒ one track)
 
@@ -360,6 +384,8 @@ track back to ACTIVE.
   `{round(c) − 1, round(c), round(c) + 1}`.
 - A CANDIDATE in an owned channel is absorbed: no new track; ownership stays
   with the incumbent.
+- A DORMANT track (§2.4) keeps its ownership: its channels block spawns,
+  and a rise sustained there re-acquires it instead (MAN-108).
 - A rising, unowned channel `k` may start a spawn decision only if its
   smoothed power `S[k]` is ≥ both `S[k−1]` and `S[k+1]` (a local maximum;
   neighbours wrap). (MAN-172, see docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md)
@@ -1366,7 +1392,8 @@ TrackClosed    { track_id, closure: SignalEnded
                  `closure` kind says what a consumer holding deferred
                  per-track evidence, such as manta-spot's pending Beacon
                  candidates (§4 amendment), does with it:
-                   SignalEnded — `HangExpired`, or end of stream
+                   SignalEnded — `HangExpired` (including a DORMANT
+                     track's expiry, §2.4), or end of stream
                      (`finish()`): the signal is gone; deferred evidence
                      is judged now.
                    Bookkeeping { survivor_track_id: Some(s) } — `Merged`:
@@ -1378,7 +1405,14 @@ TrackClosed    { track_id, closure: SignalEnded
                      including a stop while the source is down (MAN-258):
                      tracking stopped with no successor; deferred evidence
                      is discarded and counted.
-                 Missing in JSON, `closure` defaults to `SignalEnded`.)
+                 Missing in JSON, `closure` defaults to `SignalEnded`.
+                 MAN-108: a DORMANT track (§2.4) that re-acquires its
+                 signal keeps its track_id and emits no TrackClosed or
+                 TrackPromoted for the fade; its TrackMeta/SpeedUpdate/
+                 TimingUpdate sequence restarts from a fresh decoder
+                 (TrackMeta resumes once the new demod has initialised,
+                 about 1 s). TrackClosed is still emitted once, at the
+                 track's real close.)
 TimingUpdate   { track_id, sample_ts: u64, dit_ms: f32, dot, dash, element_gap,
                  char_gap, word_gap }  (added post-freeze, MAN-315 — the
                  track's §4.1b sender timing; each class is
@@ -1508,6 +1542,7 @@ in the fixture manifest. Text payload (unless stated):
 | V9 | drift | 18 WPM, +12 dB, drift +50 Hz/min, EA8AAA | AWGN | 1 track (no split); char ≥ 90 %; final freq tracks within 15 Hz |
 | V10 | farnsworth | 15 WPM chars / 25 WPM char-speed (Farnsworth), +15 dB, G4XXX | AWGN | char ≥ 95 %; word boundaries 100 % correct |
 | V31 | decimated-clean-20 | Same scene as V1 (20 WPM, +20 dB, offset +12.34 kHz, W1AW), synthesized at 192 kHz then decimated to 48 kHz via `manta_dsp::decimate::Decimator` | AWGN only, no jitter | char ≥ 98%; 1 track; freq error ≤ 10 Hz |
+| V34 | fade-good-reacquire | 20 WPM, +3 dB, offset +9.1 kHz, W1AW, 120 s; fade seed `0x0BAD`, noise seed `0x4D41_4E01_3B95` (MAN-108) | Watterson CCIR-good, no jitter | 1 promoted track within 300 Hz; W1AW spotted, every W1AW spot on that track; CER ≤ 0.20; with `detector.reacquire_ms = 0` the same WAV promotes ≥ 2 tracks (the scene still fades past the hang) |
 | V51 | drift-refine | Same scene as V9 (18 WPM, +12 dB, drift +50 Hz/min, EA8AAA), decoded with `decode.refine_bw_hz = 30` (the narrowband refiner, MAN-168/MAN-194) via a `--config` TOML | AWGN only, no jitter (as V9) | 1 track (no split); char ≥ 90 %; final freq within 15 Hz; the refine-on report differs from the refine-off control (the config reaches the pipeline) |
 
 V31's freq-error bound was 25 Hz until MAN-114. The dB-parabola spot
@@ -1703,6 +1738,8 @@ rtty_dwell_ms = 20000   # 7500 hops; whole 1 s blocks
 # MAN-313: non-CW rejection, §2.8. unkeyed_close_ms >= 1000.
 non_cw_filter = true
 unkeyed_close_ms = 10000.0   # 3750 hops; qualification timeout and unkeyed close
+# MAN-108: DORMANT re-acquisition window after hang_ms, §2.4. 0 = off.
+reacquire_ms = 10000         # 3750 hops
 # floor_quantile = 0.25       # not configurable yet: compile-time constant in manta-dsp::floor
 # floor_window_ms = 10000     # not configurable yet: compile-time constant in manta-dsp::floor
 # block_channels = 32         # not configurable yet: compile-time constant in manta-dsp::floor

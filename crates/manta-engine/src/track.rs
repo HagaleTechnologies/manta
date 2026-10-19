@@ -14,7 +14,9 @@ pub struct DetectorConfig {
     pub off_snr_db: f32,
     /// SPEC §2.3/§2.4: rise sustained this many hops (~50ms) before CANDIDATE -> ACTIVE.
     pub confirm_hops: u64,
-    /// SPEC §2.3/§2.4: drop sustained this many hops (5000ms) before ACTIVE/HANG -> CLOSED.
+    /// SPEC §2.3/§2.4: drop sustained this many hops (5000ms) before ACTIVE/HANG -> CLOSED,
+    /// or, for a track that decoded a character while qualified and
+    /// `reacquire_hops > 0`, HANG -> DORMANT (MAN-108).
     pub hang_hops: u64,
     /// SPEC §2.4: no character emitted for this many hops (30000ms) -> CLOSED (garbage collect).
     pub gc_hops: u64,
@@ -66,6 +68,11 @@ pub struct DetectorConfig {
     /// qualified track may stay key-down with no keying, no decoded
     /// character and no callsign read (else it closes `Unkeyed`), in hops.
     pub unkeyed_close_hops: u64,
+    /// MAN-108 (SPEC §2.4): after `hang_hops`, how long a track that decoded
+    /// a character while qualified stays DORMANT -- no decoder, identity,
+    /// centroid and ownership kept -- waiting to re-acquire its signal. 0
+    /// restores the pre-MAN-108 close at `hang_hops` exactly.
+    pub reacquire_hops: u64,
     /// MAN-312 (SPEC §2.7): what a band-wide static crash does to track
     /// starts and to running tracks' decoder input. Not in SPEC §9's
     /// original table; `[detector].crash_filter`.
@@ -217,6 +224,16 @@ impl Default for DetectorConfig {
     /// on, and 25 ms is the value measured to clear all three; 0 ms turns
     /// V8w's garbled fading W8WLR decode into a bogus `<call> T` Beacon
     /// spot. `warmup_ms = 2000` restores the old behaviour.
+    ///
+    /// **`reacquire_hops` is new with MAN-108** (SPEC §2.4, not in SPEC
+    /// v1's §9 table): 3750 hops = 10 s of DORMANT after the 5 s hang for a
+    /// track that has decoded a character, so a Watterson-faded signal
+    /// keeps one `track_id` instead of respawning per fade. A plain longer
+    /// `hang_hops` was measured and rejected: it keeps one track but leaves
+    /// a decoder that lost lock in the fade decoding at the wrong speed.
+    /// 5 s left 2 of 18 fading scenes split; 10 s and 15 s left none. See
+    /// `docs/DECISIONS/2026-10-17-man108-dormant-track-reacquisition.md`.
+    /// `reacquire_ms = 0` restores the old behaviour.
     fn default() -> Self {
         DetectorConfig {
             on_snr_db: 12.0,
@@ -242,6 +259,8 @@ impl Default for DetectorConfig {
             // MAN-313: on; 3750 hops = 10 s.
             non_cw_filter: true,
             unkeyed_close_hops: 3750,
+            // MAN-108: 3750 hops = 10 s of DORMANT after the hang.
+            reacquire_hops: 3750,
             // MAN-273: off; the live-audio source raises it.
             guard_hz: 0.0,
         }
@@ -257,6 +276,11 @@ pub(crate) enum LifecycleState {
     Active,
     /// Waiting for recovery: drop threshold sustained, hang timer running.
     Hang,
+    /// MAN-108 (SPEC §2.4): the hang timer expired on a track that decoded
+    /// a character while qualified. No decoder; identity, centroid and
+    /// ownership kept for `reacquire_hops`, waiting for the signal to come
+    /// back on an owned channel.
+    Dormant,
 }
 
 /// SPEC §2.4/§2.5: reason for track closure.
@@ -264,7 +288,9 @@ pub(crate) enum LifecycleState {
 pub(crate) enum CloseReason {
     /// Rise never confirmed within `confirm_hops` (SPEC §2.4: CANDIDATE -> IDLE).
     Unconfirmed,
-    /// Hang timer expired (SPEC §2.4: HANG -> CLOSED).
+    /// Hang timer expired (SPEC §2.4: HANG -> CLOSED), or, MAN-108, the
+    /// re-acquisition window of a DORMANT track did (DORMANT -> CLOSED).
+    /// Both are an observed RF gap: `ClosureKind::SignalEnded`.
     HangExpired,
     /// No character emitted for `gc_hops` (SPEC §2.4: garbage collect).
     Silent,
@@ -345,6 +371,12 @@ pub(crate) enum LifecycleEvent {
     None,
     /// CANDIDATE -> ACTIVE: lease a decoder from the pool.
     Promoted,
+    /// MAN-108 (SPEC §2.4): HANG -> DORMANT this hop: flush and release the
+    /// decoder, keep the track.
+    Dormant,
+    /// MAN-108 (SPEC §2.4): DORMANT -> ACTIVE this hop: lease a fresh
+    /// decoder under the same `track_id`.
+    Reacquired,
     /// Track closed: cease decoding and release resources.
     Closed(CloseReason),
 }
@@ -361,6 +393,13 @@ pub(crate) struct Lifecycle {
     confirm_hops: u64,
     hang_hops: u64,
     gc_hops: u64,
+    /// MAN-108: `DetectorConfig::reacquire_hops`.
+    reacquire_hops: u64,
+    /// MAN-108: latched once the track decodes a character while
+    /// qualified; only such a track goes DORMANT instead of closing.
+    reacquirable: bool,
+    /// MAN-108: hops spent DORMANT so far.
+    dormant_count: u64,
 }
 
 impl Lifecycle {
@@ -374,7 +413,17 @@ impl Lifecycle {
             confirm_hops: cfg.confirm_hops,
             hang_hops: cfg.hang_hops,
             gc_hops: cfg.gc_hops,
+            reacquire_hops: cfg.reacquire_hops,
+            reacquirable: false,
+            dormant_count: 0,
         }
+    }
+
+    /// MAN-108 (SPEC §2.4): latch this track as worth keeping through a
+    /// fade. `TrackManager::process_hops` calls it when a qualified track
+    /// decodes a character, batch-granular like `note_char_decoded`.
+    pub(crate) fn set_reacquirable(&mut self) {
+        self.reacquirable = true;
     }
 
     /// Query the current lifecycle state.
@@ -399,6 +448,22 @@ impl Lifecycle {
     /// track every 30 s.
     pub(crate) fn note_char_decoded(&mut self) {
         self.silent_count = 0;
+    }
+
+    /// MAN-312 + MAN-108 (SPEC §2.4/§2.7): one suppressed-crash hop for a
+    /// DORMANT track. The gate's EMA is held through a static crash, so
+    /// this hop's `rise` is not evidence the signal came back: the wake
+    /// confirmation holds, neither advancing nor resetting, exactly as a
+    /// CANDIDATE's confirm window freezes on the same hops. The expiry
+    /// timer keeps aging -- a HANG track's hang timer runs on held hops
+    /// too -- so a crash cannot stretch the re-acquisition window either.
+    pub(crate) fn age_dormant(&mut self) -> LifecycleEvent {
+        debug_assert_eq!(self.state, LifecycleState::Dormant);
+        self.dormant_count += 1;
+        if self.dormant_count >= self.reacquire_hops {
+            return LifecycleEvent::Closed(CloseReason::HangExpired);
+        }
+        LifecycleEvent::None
     }
 
     /// Advance one hop. `rise`/`drop` are this hop's gate booleans for the
@@ -450,8 +515,39 @@ impl Lifecycle {
                 } else {
                     self.hang_count += 1;
                     if self.hang_count >= self.hang_hops {
+                        // MAN-108: a track that has decoded keeps its
+                        // identity through the fade instead of closing.
+                        if self.reacquirable && self.reacquire_hops > 0 {
+                            self.state = LifecycleState::Dormant;
+                            self.dormant_count = 0;
+                            self.confirm_count = 0;
+                            return LifecycleEvent::Dormant;
+                        }
                         return LifecycleEvent::Closed(CloseReason::HangExpired);
                     }
+                }
+                LifecycleEvent::None
+            }
+            // MAN-108 (SPEC §2.4): no decoder runs, so the GC timer holds.
+            // Waking needs the same `confirm_hops` of sustained rise a
+            // fresh CANDIDATE needs: the decoder is sensitive to the hop it
+            // starts on (MAN-166), and a single-hop wake was measured to
+            // lose word boundaries.
+            LifecycleState::Dormant => {
+                if rise {
+                    self.confirm_count += 1;
+                    if self.confirm_count >= self.confirm_hops {
+                        self.state = LifecycleState::Active;
+                        self.hang_count = 0;
+                        self.silent_count = 0;
+                        return LifecycleEvent::Reacquired;
+                    }
+                } else {
+                    self.confirm_count = 0;
+                }
+                self.dormant_count += 1;
+                if self.dormant_count >= self.reacquire_hops {
+                    return LifecycleEvent::Closed(CloseReason::HangExpired);
                 }
                 LifecycleEvent::None
             }
@@ -798,7 +894,11 @@ impl KeyingEvidence {
         power: &[f32],
         power_db: &[f64],
     ) {
-        if prev == LifecycleState::Hang && now == LifecycleState::Active {
+        // MAN-108: a DORMANT track's wake is a re-rise too, so a woken
+        // track without a callsign is not closed `Unkeyed` at once.
+        if matches!(prev, LifecycleState::Hang | LifecycleState::Dormant)
+            && now == LifecycleState::Active
+        {
             if self.active_run <= MAX_MARK_HOPS {
                 self.cycles += 1;
             }
@@ -1293,6 +1393,35 @@ impl Track {
         events
     }
 
+    /// MAN-108 (SPEC §2.4): HANG -> DORMANT. Flushes the decoder exactly as
+    /// a `HangExpired` close does (refiner backlog drained, then the
+    /// forcing `finish_decoder`: the hang is an observed RF gap) and drops
+    /// it, resetting the per-decoder state a fresh decoder must not
+    /// inherit. Identity, centroid, ownership, keying evidence and
+    /// `has_emitted` are kept. Returns the flush.
+    fn go_dormant(&mut self, quality: Option<&DecodeQualityObserver>) -> Vec<DecoderEvent> {
+        self.drain_refiner_into_pending();
+        let events = self.finish_decoder(quality);
+        self.decoder = None;
+        self.pending.clear();
+        self.refiner = None;
+        self.refiner_channel = None;
+        self.refiner_hops_since_reset = 0;
+        self.clean_hist.clear();
+        self.snr_peak_db = f32::NEG_INFINITY;
+        self.garbles_published = 0;
+        events
+    }
+
+    /// MAN-108 (SPEC §2.4): DORMANT -> ACTIVE. Leases a fresh decoder under
+    /// the same `id`, deliberately not the old one's timing: a decoder that
+    /// lost lock in the fade was measured to stay at the wrong speed.
+    fn reacquire(&mut self, id: u32, cfg: &DecodeConfig, freq_hz: f64) {
+        let mut decoder = TrackDecoder::new(id, cfg.clone());
+        decoder.set_freq_hz(freq_hz);
+        self.decoder = Some(decoder);
+    }
+
     /// Query the current lifecycle state. SPEC §2.4.
     // Temporary: no non-test caller yet until a later task filters/reports
     // tracks by lifecycle state (e.g. spot output limited to ACTIVE tracks).
@@ -1545,6 +1674,16 @@ pub struct TrackManager {
     /// channel is live until `set_rf_passband_hz` narrows it to the
     /// source's real passband.
     crash: CrashDetector,
+    /// MAN-108 (SPEC §2.4): the flush of every decoder released at
+    /// HANG -> DORMANT since the last `process_hops` drained it. Kept apart
+    /// from `drain_pool`'s output and placed ahead of it, so the old
+    /// decoder's events (a `SpeedUpdate` sorts at ts 0) cannot sort after a
+    /// same-batch woken decoder's under the batch's stable sort.
+    dormant_flush: Vec<DecoderEvent>,
+    /// MAN-108: DORMANT -> ACTIVE re-acquisitions so far. See
+    /// `reacquisition_count`; counted in test builds only.
+    #[cfg(test)]
+    reacquisitions: u64,
     /// MAN-114: the previous hop `step_hop` saw, the lag partner of
     /// `phase_lag_product`. Kept across `process_hops` calls so chunking
     /// cannot change a track's frequency; its buffers are reused hop to
@@ -1680,6 +1819,9 @@ impl TrackManager {
             #[cfg(test)]
             total_spawns: 0,
             crash: CrashDetector::new(n_channels),
+            dormant_flush: Vec::new(),
+            #[cfg(test)]
+            reacquisitions: 0,
             prev_hop: None,
             comod: detector_cfg
                 .non_cw_filter
@@ -2097,7 +2239,9 @@ impl TrackManager {
     /// `Hang` (the decoder is leased on CANDIDATE -> ACTIVE and kept
     /// across HANG, `step_hop`; with `DetectorConfig::non_cw_filter` on,
     /// MAN-313 defers the lease until the track qualifies as keyed CW, so
-    /// a promoted track still awaiting qualification is not counted). This is the daemon's live
+    /// a promoted track still awaiting qualification is not counted; a
+    /// MAN-108 DORMANT track has released its decoder, so it is not
+    /// counted either until it wakes). This is the daemon's live
     /// `manta_active_tracks` gauge (MAN-122), and it is deliberately a
     /// *lifecycle* count rather than one derived from the decoder event
     /// stream: a promoted track whose demodulator has not latched yet
@@ -2116,6 +2260,14 @@ impl TrackManager {
     /// existing meaning for `soak_metrics`' peak/eviction accounting.
     pub fn decoding_track_count(&self) -> usize {
         self.tracks.values().filter(|t| t.decoder.is_some()).count()
+    }
+
+    /// MAN-108 (SPEC §2.4): DORMANT -> ACTIVE re-acquisitions so far, each
+    /// a faded signal that came back under its old `track_id` instead of
+    /// spawning a new track. A test accessor: not exported as a metric.
+    #[cfg(test)]
+    pub(crate) fn reacquisition_count(&self) -> u64 {
+        self.reacquisitions
     }
 
     /// Rebuild `owner_of` from scratch against the current `tracks` map.
@@ -2259,6 +2411,8 @@ impl TrackManager {
         // Merged/Evicted.
         let mut close_reasons: std::collections::HashMap<u32, CloseReason> =
             std::collections::HashMap::new();
+        // MAN-108: for the DORMANT-entry flush inside the loop.
+        let dormant_quality = self.quality.clone();
         let ids: Vec<u32> = self.tracks.keys().copied().collect();
         for id in ids {
             let n = self.n_channels();
@@ -2272,11 +2426,16 @@ impl TrackManager {
                 &self.channel_cooldown_until,
                 self.hop_counter,
             );
+            let prev_state = track.lifecycle.state();
             // MAN-312: a crash's energy would drag the centroid toward
-            // wherever the smear happens to peak this hop.
+            // wherever the smear happens to peak this hop. MAN-108: a
+            // DORMANT track's centroid and spot-frequency phase sum are
+            // frozen (including on its wake hop): the frequency it held is
+            // what re-acquisition matches on, and noise or a neighbour must
+            // not drag it away.
             if crash_onset {
                 track.rollback_phase();
-            } else if !suppress {
+            } else if !suppress && prev_state != LifecycleState::Dormant {
                 track.update_centroid(k, &hop.power, n);
                 track.note_phase();
                 // MAN-114 (SPEC §1.4): key-down hops at >= 6 dB feed the
@@ -2289,8 +2448,6 @@ impl TrackManager {
             }
             let f = self.floor.effective_floor_db(k);
             track.current_snr_db = (self.gate.smoothed_db(k) - f) as f32;
-            let char_emitted = false; // GC timer input; refined below once a decoder exists.
-            let prev_state = track.lifecycle.state();
             // MAN-313 (SPEC §2.8 A): a track awaiting qualification has no
             // decoder, so "no character decoded" says nothing about it yet;
             // hold its garbage-collect timer at zero. `NotCw` bounds its
@@ -2298,14 +2455,45 @@ impl TrackManager {
             if track.keying.is_some() && !track.qualified {
                 track.lifecycle.note_char_decoded();
             }
-            // MAN-312: a CANDIDATE's confirm window is frozen through a
-            // crash rather than counted for or against it; ACTIVE/HANG
-            // tracks step on the held rise/drop so their hang timers run.
-            let mut event = if suppress && prev_state == LifecycleState::Candidate {
-                LifecycleEvent::None
+            let char_emitted = false; // GC timer input; refined below once a decoder exists.
+                                      // MAN-312: a CANDIDATE's confirm window is frozen through a
+                                      // crash rather than counted for or against it; ACTIVE/HANG
+                                      // tracks step on the held rise/drop so their hang timers run.
+                                      // MAN-108 (review round 1, PR #344): a DORMANT track's wake
+                                      // confirmation freezes the same way -- the held `rise` is not
+                                      // evidence the signal returned -- while its expiry timer keeps
+                                      // aging (`Lifecycle::age_dormant`), as a HANG track's does.
+            let mut event = if suppress {
+                match prev_state {
+                    LifecycleState::Candidate => LifecycleEvent::None,
+                    LifecycleState::Dormant => track.lifecycle.age_dormant(),
+                    _ => track.lifecycle.on_hop(rise[k], drop[k], char_emitted),
+                }
             } else {
                 track.lifecycle.on_hop(rise[k], drop[k], char_emitted)
             };
+            // MAN-108 (SPEC §2.4): DORMANT entry flushes and releases the
+            // decoder (the flush goes ahead of this batch's pool output);
+            // a wake leases a fresh one. Either way the hop then proceeds
+            // as a no-transition hop, so a woken track's decoder takes this
+            // hop's input in the `None` arm below.
+            match event {
+                LifecycleEvent::Dormant => {
+                    self.dormant_flush
+                        .extend(track.go_dormant(dormant_quality.as_deref()));
+                    event = LifecycleEvent::None;
+                }
+                LifecycleEvent::Reacquired => {
+                    let freq_hz = track.freq_hz(self.center_freq_hz, self.channel_spacing_hz, n);
+                    track.reacquire(id, &self.decode_cfg, freq_hz);
+                    #[cfg(test)]
+                    {
+                        self.reacquisitions += 1;
+                    }
+                    event = LifecycleEvent::None;
+                }
+                _ => {}
+            }
             // MAN-313 (SPEC §2.8): keying evidence for a promoted track, then
             // the two filter-only closes. `keying` is `None` with the filter
             // off, so none of this runs there.
@@ -2340,6 +2528,10 @@ impl TrackManager {
                 }
             }
             match event {
+                // MAN-108: handled right after `on_hop` above.
+                LifecycleEvent::Dormant | LifecycleEvent::Reacquired => {
+                    unreachable!("DORMANT entry and wake are handled before this match")
+                }
                 LifecycleEvent::Closed(reason) => {
                     self.close_counts.record(reason);
                     close_reasons.insert(id, reason);
@@ -2589,7 +2781,10 @@ impl TrackManager {
             // Only a genuine, sustained observed RF gap (HangExpired) may
             // force an in-progress mark to resolve; Silent's own trigger
             // (no character decoded) says nothing about whether the
-            // signal is still there (round 8).
+            // signal is still there (round 8). MAN-108: a DORMANT track's
+            // expiry is `HangExpired` too; its decoder was already flushed
+            // at DORMANT entry (`Track::go_dormant`), so this flushes
+            // nothing more.
             let events = if close_reasons.get(id) == Some(&CloseReason::HangExpired) {
                 track.finish_decoder(quality.as_deref())
             } else {
@@ -2651,7 +2846,8 @@ impl TrackManager {
         }
         self.recompute_ownership();
         // Round 10 (PR #154, Codex): only HangExpired is a genuine observed
-        // RF gap -- proof the signal actually ended. Silent fires after 30 s
+        // RF gap -- proof the signal actually ended. MAN-108: that includes
+        // a DORMANT track whose re-acquisition window ran out. Silent fires after 30 s
         // of no *decoded character*, which a continuous carrier or other
         // undecodable signal satisfies just as well as a real end-of-signal;
         // `finish_decoder_speed_only()` above deliberately can't force such
@@ -2907,6 +3103,12 @@ impl TrackManager {
             closure_flush_events.extend(closure_flush);
         }
         let pool_events = self.drain_pool();
+        // MAN-108: this batch's DORMANT-entry flushes, taken here so the
+        // loop below also runs over them: a DORMANT track lives on, so a
+        // word or callsign its released decoder completed must reach its
+        // MAN-313 `KeyingEvidence`, or the woken decoder's first word would
+        // be appended to the stale partial one.
+        let dormant_flush = std::mem::take(&mut self.dormant_flush);
         // SPEC §2.4 GC timer: reset the silent counter for every track that
         // actually decoded a character this batch. `step_hop` advances it
         // every hop with `char_emitted = false` (the pool has not run yet),
@@ -2931,7 +3133,7 @@ impl TrackManager {
         // for a *different* consumer (`doctor()`'s NoSignal check) with no
         // per-track_id state to leak (manta-spot's `Validator` treats it as
         // a pure no-op, never touching `self.tracks`).
-        for e in &pool_events {
+        for e in dormant_flush.iter().chain(&pool_events) {
             if let Some(t) = self.tracks.get_mut(&event_track_id(e)) {
                 t.has_emitted = true;
             }
@@ -2941,6 +3143,13 @@ impl TrackManager {
                 } => {
                     if let Some(t) = self.tracks.get_mut(track_id) {
                         t.lifecycle.note_char_decoded();
+                        // MAN-108 (SPEC §2.4): a qualified track that has
+                        // decoded a character goes DORMANT, not CLOSED, when
+                        // its hang timer runs out. Batch-granular, like the
+                        // GC reset above (SPEC §2.8 G precedent).
+                        if t.qualified {
+                            t.lifecycle.set_reacquirable();
+                        }
                         // MAN-313: the unkeyed close's character timer and
                         // callsign read.
                         if let Some(ev) = t.keying.as_mut() {
@@ -2968,7 +3177,11 @@ impl TrackManager {
             .iter()
             .map(|e| (event_track_id(e), event_sample_ts(e)))
             .collect();
-        let mut events = pool_events;
+        // MAN-108: this batch's DORMANT-entry flushes go first, so the
+        // stable sort keeps a released decoder's events ahead of a
+        // same-batch woken decoder's wherever their keys tie.
+        let mut events = dormant_flush;
+        events.extend(pool_events);
         events.extend(promoted_events);
         // Final `finish()` events from tracks closed THIS batch via
         // HangExpired/Silent/Merged/Evicted (Codex review on PR #154,
@@ -3039,7 +3252,7 @@ impl TrackManager {
         // just fed into `pending` above needs, and a no-op for any track
         // whose `pending` was already empty (every track, before MAN-194).
         let quality = self.quality.as_deref();
-        let mut events: Vec<DecoderEvent> = self
+        let flushed: Vec<DecoderEvent> = self
             .tracks
             .values_mut()
             .par_bridge()
@@ -3051,6 +3264,10 @@ impl TrackManager {
                 }
             })
             .collect();
+        // MAN-108: a DORMANT-entry flush not yet drained by `process_hops`
+        // (only possible when `step_hop` ran outside it) goes first.
+        let mut events = std::mem::take(&mut self.dormant_flush);
+        events.extend(flushed);
         events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
         // MAN-19 round 3: honor the same teardown contract `process_hops`
         // does -- a track still open when the stream ends (EOF/Ctrl-C/
@@ -4140,6 +4357,126 @@ mod tests {
             lc.on_hop(false, true, true),
             LifecycleEvent::Closed(CloseReason::HangExpired)
         ); // hang_count=10 >= hang_hops=10
+    }
+
+    // ---- MAN-108 (SPEC §2.4): DORMANT ----
+
+    /// `cfg()` with an 8-hop re-acquisition window.
+    fn reacq_cfg() -> DetectorConfig {
+        DetectorConfig {
+            reacquire_hops: 8,
+            ..cfg()
+        }
+    }
+
+    /// Promoted, then one drop hop: HANG with `hang_count == 1`.
+    fn lc_in_hang(cfg: &DetectorConfig, reacquirable: bool) -> Lifecycle {
+        let mut lc = Lifecycle::new(cfg);
+        for _ in 0..4 {
+            lc.on_hop(true, false, false); // the 4th promotes
+        }
+        if reacquirable {
+            lc.set_reacquirable();
+        }
+        lc.on_hop(false, true, true); // -> HANG, hang_count=1
+        assert_eq!(lc.state(), LifecycleState::Hang);
+        lc
+    }
+
+    /// HANG run out on a reacquirable track: DORMANT.
+    fn lc_dormant(cfg: &DetectorConfig) -> Lifecycle {
+        let mut lc = lc_in_hang(cfg, true);
+        for _ in 0..(cfg.hang_hops - 2) {
+            assert_eq!(lc.on_hop(false, true, true), LifecycleEvent::None);
+        }
+        assert_eq!(lc.on_hop(false, true, true), LifecycleEvent::Dormant);
+        lc
+    }
+
+    #[test]
+    fn reacquirable_track_goes_dormant_instead_of_closing() {
+        let lc = lc_dormant(&reacq_cfg());
+        assert_eq!(lc.state(), LifecycleState::Dormant);
+    }
+
+    #[test]
+    fn dormant_track_reacquires_after_confirm_hops_of_rise() {
+        // A 20-hop window: the 4 + 1 + 4 non-waking hops below would
+        // otherwise run out `reacq_cfg()`'s 8.
+        let cfg = DetectorConfig {
+            reacquire_hops: 20,
+            ..cfg()
+        };
+        let mut lc = lc_dormant(&cfg);
+        for _ in 0..4 {
+            assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::None);
+        }
+        // A gap resets the wake count.
+        assert_eq!(lc.on_hop(false, true, false), LifecycleEvent::None);
+        for _ in 0..4 {
+            assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::None);
+        }
+        assert_eq!(lc.state(), LifecycleState::Dormant);
+        assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::Reacquired);
+        assert_eq!(lc.state(), LifecycleState::Active);
+    }
+
+    #[test]
+    fn dormant_track_closes_hang_expired_after_reacquire_hops() {
+        let mut lc = lc_dormant(&reacq_cfg());
+        for _ in 0..7 {
+            assert_eq!(lc.on_hop(false, true, false), LifecycleEvent::None);
+        }
+        assert_eq!(
+            lc.on_hop(false, true, false),
+            LifecycleEvent::Closed(CloseReason::HangExpired)
+        ); // dormant_count=8 >= reacquire_hops=8
+    }
+
+    #[test]
+    fn dormant_does_not_advance_the_gc_timer() {
+        // A 30-hop window, longer than `gc_hops` (20): a GC timer running
+        // while DORMANT would close it `Silent` first.
+        let cfg = DetectorConfig {
+            reacquire_hops: 30,
+            ..cfg()
+        };
+        let mut lc = lc_dormant(&cfg);
+        for _ in 0..29 {
+            assert_eq!(lc.on_hop(false, true, false), LifecycleEvent::None);
+        }
+        assert_eq!(
+            lc.on_hop(false, true, false),
+            LifecycleEvent::Closed(CloseReason::HangExpired)
+        );
+    }
+
+    #[test]
+    fn unreacquirable_track_still_closes_at_hang_hops() {
+        let mut lc = lc_in_hang(&reacq_cfg(), false);
+        for _ in 0..8 {
+            assert_eq!(lc.on_hop(false, true, true), LifecycleEvent::None);
+        }
+        assert_eq!(
+            lc.on_hop(false, true, true),
+            LifecycleEvent::Closed(CloseReason::HangExpired)
+        );
+    }
+
+    #[test]
+    fn reacquire_hops_zero_closes_at_hang_hops_even_when_reacquirable() {
+        let cfg = DetectorConfig {
+            reacquire_hops: 0,
+            ..cfg()
+        };
+        let mut lc = lc_in_hang(&cfg, true);
+        for _ in 0..8 {
+            assert_eq!(lc.on_hop(false, true, true), LifecycleEvent::None);
+        }
+        assert_eq!(
+            lc.on_hop(false, true, true),
+            LifecycleEvent::Closed(CloseReason::HangExpired)
+        );
     }
 
     #[test]
@@ -7659,6 +7996,400 @@ mod tests {
         assert!(tm.tracks.values().all(|t| t.keying.is_none()));
     }
 
+    // ---- MAN-108 (SPEC §2.4): DORMANT re-acquisition, TrackManager ----
+
+    /// Per-hop key state for `text`: `dit` hops per dit, 3-dit character
+    /// and 7-dit word gaps, and a trailing 7-dit gap.
+    fn rq_keying(text: &str, dit: usize) -> Vec<bool> {
+        let mut out = Vec::new();
+        let mut push = |on: bool, hops: usize| out.extend(std::iter::repeat_n(on, hops));
+        for (wi, word) in text.split(' ').enumerate() {
+            if wi > 0 {
+                push(false, 7 * dit);
+            }
+            for (ci, c) in word.chars().enumerate() {
+                if ci > 0 {
+                    push(false, 3 * dit);
+                }
+                let pat = manta_decode::tree::pattern_for(c).unwrap();
+                for (ei, e) in pat.chars().enumerate() {
+                    if ei > 0 {
+                        push(false, dit);
+                    }
+                    push(true, if e == '.' { dit } else { 3 * dit });
+                }
+            }
+        }
+        push(false, 7 * dit);
+        out
+    }
+
+    /// `text` keyed at +30 dB on channel `ch`, one power vector per hop.
+    fn rq_keyed(text: &str, dit: usize, ch: usize) -> Vec<Vec<f32>> {
+        rq_keying(text, dit)
+            .into_iter()
+            .map(|on| nc_tone(ch, on, 30.0))
+            .collect()
+    }
+
+    fn rq_quiet(hops: u64) -> Vec<Vec<f32>> {
+        (0..hops).map(|_| quiet_power(NC_N)).collect()
+    }
+
+    /// 22-hop dits: ~17 WPM.
+    const RQ_DIT: usize = 22;
+    const RQ_TEXT: &str = "CQ DE W1AW W1AW K";
+
+    /// A warmed-up 64-channel manager, MAN-313 filter off (the decoder is
+    /// leased at promotion) unless `cfg` says otherwise.
+    fn rq_mgr(reacquire_hops: u64) -> TrackManager {
+        nc_mgr(DetectorConfig {
+            non_cw_filter: false,
+            reacquire_hops,
+            ..DetectorConfig::default()
+        })
+    }
+
+    /// Feeds `powers` through `process_hops` in `batch`-hop slices; `m`
+    /// continues from `tm.hop_counter`. `each` runs after every slice.
+    fn rq_feed(
+        tm: &mut TrackManager,
+        powers: &[Vec<f32>],
+        batch: usize,
+        mut each: impl FnMut(&TrackManager, &[DecoderEvent]),
+    ) -> Vec<DecoderEvent> {
+        let mut events = Vec::new();
+        for slice in powers.chunks(batch) {
+            let hops: Vec<HopOutput> = slice
+                .iter()
+                .enumerate()
+                .map(|(i, p)| hop(tm.hop_counter + i as u64, p.clone()))
+                .collect();
+            let out = tm.process_hops(&hops, |m| m);
+            each(tm, &out);
+            events.extend(out);
+        }
+        events
+    }
+
+    fn rq_promoted_ids(events: &[DecoderEvent]) -> Vec<u32> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::TrackPromoted { track_id, .. } => Some(*track_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn rq_chars(events: &[DecoderEvent], after_ts: u64) -> Vec<(u32, char)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::CharDecoded {
+                    track_id,
+                    sample_ts,
+                    glyph,
+                    ..
+                } if *sample_ts > after_ts => glyph.text_char().map(|c| (*track_id, c)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Keyed, `gap` quiet hops, keyed again, in 16-hop batches (`decode`'s
+    /// 4096-sample chunks). Returns the batch events, the `finish()`
+    /// events and the hop the second transmission starts on.
+    fn rq_fade_scene(
+        tm: &mut TrackManager,
+        gap: u64,
+        second_ch: usize,
+    ) -> (Vec<DecoderEvent>, Vec<DecoderEvent>, u64) {
+        let mut events = rq_feed(tm, &rq_keyed(RQ_TEXT, RQ_DIT, 10), 16, |_, _| {});
+        events.extend(rq_feed(tm, &rq_quiet(gap), 16, |_, _| {}));
+        let back = tm.hop_counter;
+        events.extend(rq_feed(
+            tm,
+            &rq_keyed(RQ_TEXT, RQ_DIT, second_ch),
+            16,
+            |_, _| {},
+        ));
+        let fin = tm.finish();
+        (events, fin, back)
+    }
+
+    #[test]
+    fn fading_decoded_track_is_reacquired_under_the_same_id() {
+        let mut tm = rq_mgr(DetectorConfig::default().reacquire_hops);
+        // 8 s: past the 5 s hang, inside the 10 s window.
+        let (events, fin, back) = rq_fade_scene(&mut tm, 3000, 10);
+        let promoted = rq_promoted_ids(&events);
+        assert_eq!(promoted.len(), 1, "{promoted:?}");
+        let id = promoted[0];
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackClosed { .. })),
+            "no track may close before finish()"
+        );
+        assert_eq!(tm.reacquisition_count(), 1);
+        let after = rq_chars(&events, back);
+        assert!(!after.is_empty(), "the second transmission decoded nothing");
+        assert!(after.iter().all(|&(t, _)| t == id), "{after:?}");
+        assert!(fin.contains(&DecoderEvent::TrackClosed {
+            track_id: id,
+            closure: ClosureKind::SignalEnded,
+        }));
+    }
+
+    #[test]
+    fn gap_longer_than_hang_plus_reacquire_closes_signal_ended_and_respawns() {
+        let cfg = DetectorConfig::default();
+        let mut tm = rq_mgr(cfg.reacquire_hops);
+        // Keyed, then 16 s of quiet, one hop per batch so each hop's state
+        // is seen: the drop hop is the last ACTIVE -> HANG.
+        let mut scene = rq_keyed(RQ_TEXT, RQ_DIT, 10);
+        scene.extend(rq_quiet(6000));
+        let mut prev = BTreeMap::new();
+        let mut drop_hop = BTreeMap::new();
+        let mut close_hop = None;
+        let mut events = rq_feed(&mut tm, &scene, 1, |tm, out| {
+            for (&id, t) in &tm.tracks {
+                if prev.get(&id) == Some(&LifecycleState::Active)
+                    && t.state() == LifecycleState::Hang
+                {
+                    drop_hop.insert(id, tm.hop_counter);
+                }
+                prev.insert(id, t.state());
+            }
+            for e in out {
+                if let DecoderEvent::TrackClosed {
+                    track_id,
+                    closure: ClosureKind::SignalEnded,
+                } = e
+                {
+                    close_hop = Some((*track_id, tm.hop_counter));
+                }
+            }
+        });
+        let id = rq_promoted_ids(&events)[0];
+        let (closed_id, close_hop) = close_hop.expect("closed SignalEnded");
+        assert_eq!(closed_id, id);
+        let drop_hop = drop_hop[&id];
+        // The drop hop is the hang's first hop.
+        assert_eq!(close_hop - drop_hop + 1, cfg.hang_hops + cfg.reacquire_hops);
+        events.extend(rq_feed(
+            &mut tm,
+            &rq_keyed(RQ_TEXT, RQ_DIT, 10),
+            16,
+            |_, _| {},
+        ));
+        let promoted = rq_promoted_ids(&events);
+        assert_eq!(promoted.len(), 2, "{promoted:?}");
+        assert_ne!(promoted[1], id);
+        assert_eq!(tm.reacquisition_count(), 0);
+    }
+
+    #[test]
+    fn undecoded_track_closes_at_hang_hops_as_before() {
+        let cfg = DetectorConfig::default();
+        let mut tm = rq_mgr(cfg.reacquire_hops);
+        // An unmodulated carrier: promoted, never decodes a character.
+        let carrier: Vec<Vec<f32>> = (0..600).map(|_| nc_tone(10, true, 30.0)).collect();
+        let events = rq_feed(&mut tm, &carrier, 16, |_, _| {});
+        assert!(rq_chars(&events, 0).is_empty());
+        let id = rq_promoted_ids(&events)[0];
+        let mut drop_hop = None;
+        let mut gone_hop = None;
+        rq_feed(&mut tm, &rq_quiet(3000), 1, |tm, _| {
+            match tm.tracks.get(&id) {
+                Some(t) if t.state() == LifecycleState::Hang && drop_hop.is_none() => {
+                    drop_hop = Some(tm.hop_counter);
+                }
+                None if gone_hop.is_none() => gone_hop = Some(tm.hop_counter),
+                _ => {}
+            }
+        });
+        assert_eq!(gone_hop.unwrap() - drop_hop.unwrap() + 1, cfg.hang_hops);
+        assert_eq!(tm.close_counts().hang_expired, 1);
+        assert_eq!(tm.reacquisition_count(), 0);
+    }
+
+    #[test]
+    fn dormant_track_has_no_decoder_and_frozen_centroid() {
+        let cfg = DetectorConfig::default();
+        let mut tm = rq_mgr(cfg.reacquire_hops);
+        let events = rq_feed(&mut tm, &rq_keyed(RQ_TEXT, RQ_DIT, 10), 16, |_, _| {});
+        let id = rq_promoted_ids(&events)[0];
+        rq_feed(&mut tm, &rq_quiet(cfg.hang_hops + 200), 16, |_, _| {});
+        let track = &tm.tracks[&id];
+        assert_eq!(track.state(), LifecycleState::Dormant);
+        assert!(track.decoder.is_none());
+        assert_eq!(tm.decoding_track_count(), 0);
+        let center = track.center;
+        // A +20 dB neighbour two channels up (MAN-197's drag) for 2000
+        // hops: the dormant centroid must not move.
+        let neighbour: Vec<Vec<f32>> = (0..2000).map(|_| nc_tone(12, true, 20.0)).collect();
+        rq_feed(&mut tm, &neighbour, 1, |tm, _| {
+            let t = &tm.tracks[&id];
+            assert_eq!(t.state(), LifecycleState::Dormant);
+            assert_eq!(t.center, center);
+        });
+    }
+
+    /// Runs keyed text then `quiet` hops; the batch events.
+    fn rq_fade_out(reacquire_hops: u64, quiet: u64) -> Vec<DecoderEvent> {
+        let mut tm = rq_mgr(reacquire_hops);
+        let mut events = rq_feed(&mut tm, &rq_keyed(RQ_TEXT, RQ_DIT, 10), 16, |_, _| {});
+        events.extend(rq_feed(&mut tm, &rq_quiet(quiet), 16, |_, _| {}));
+        events
+    }
+
+    #[test]
+    fn dormancy_flush_matches_hang_expired_flush() {
+        let quiet = DetectorConfig::default().hang_hops + 100;
+        let dormant = rq_fade_out(DetectorConfig::default().reacquire_hops, quiet);
+        let closed = rq_fade_out(0, quiet);
+        assert!(closed
+            .iter()
+            .any(|e| matches!(e, DecoderEvent::TrackClosed { .. })));
+        let without_close: Vec<DecoderEvent> = closed
+            .into_iter()
+            .filter(|e| !matches!(e, DecoderEvent::TrackClosed { .. }))
+            .collect();
+        assert_eq!(dormant, without_close);
+    }
+
+    #[test]
+    fn woken_track_is_not_closed_unkeyed_immediately() {
+        // MAN-313 filter on; this step-only harness decodes nothing, so
+        // the reacquirable latch is set by hand.
+        let cfg = nc_cfg(500);
+        let mut tm = nc_mgr(cfg);
+        let used = nc_qualify(&mut tm);
+        let id = *tm.tracks.keys().next().unwrap();
+        tm.tracks.get_mut(&id).unwrap().lifecycle.set_reacquirable();
+        nc_drive(
+            &mut tm,
+            used,
+            cfg.hang_hops + 100,
+            |_| quiet_power(NC_N),
+            |_, _| {},
+        );
+        assert_eq!(tm.tracks[&id].state(), LifecycleState::Dormant);
+        // Key down for good: wake, then no further keying.
+        let start = used + cfg.hang_hops + 100;
+        let mut woke = None;
+        nc_drive(
+            &mut tm,
+            start,
+            600,
+            |_| nc_tone(10, true, 30.0),
+            |tm, _| {
+                if woke.is_none() && tm.tracks[&id].state() == LifecycleState::Active {
+                    woke = Some(tm.hop_counter);
+                }
+                if let Some(w) = woke {
+                    if tm.hop_counter - w < cfg.unkeyed_close_hops {
+                        assert!(
+                            tm.tracks.contains_key(&id),
+                            "closed at {}",
+                            tm.hop_counter - w
+                        );
+                    }
+                }
+            },
+        );
+        assert!(woke.is_some());
+        assert_eq!(tm.reacquisition_count(), 1);
+        assert_eq!(
+            tm.close_counts().unkeyed,
+            1,
+            "it still closes Unkeyed later"
+        );
+    }
+
+    fn rq_speed_updates(events: &[DecoderEvent], id: u32) -> Vec<f32> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::SpeedUpdate { track_id, wpm } if *track_id == id => Some(*wpm),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dormancy_and_wake_in_one_batch_keep_old_decoder_events_first() {
+        let hang = DetectorConfig::default().hang_hops;
+        // Batch A: the old signal speeds up (14-hop dits) and fades past
+        // the hang, so the old decoder's `SpeedUpdate`s (sort key ts 0) all
+        // come out of the DORMANT-entry flush. Batch B: the signal returns
+        // slower (30-hop dits), so the woken decoder reports its own.
+        let mut a = rq_keyed("W1AW W1AW W1AW", 14, 10);
+        a.extend(rq_quiet(hang + 200));
+        let b = rq_keyed(RQ_TEXT, 30, 10);
+        let run = |batches: &[Vec<Vec<f32>>]| {
+            let mut tm = rq_mgr(DetectorConfig::default().reacquire_hops);
+            let events = rq_feed(&mut tm, &rq_keyed(RQ_TEXT, RQ_DIT, 10), 16, |_, _| {});
+            let id = rq_promoted_ids(&events)[0];
+            let out: Vec<Vec<DecoderEvent>> = batches
+                .iter()
+                .map(|batch| rq_feed(&mut tm, batch, batch.len(), |_, _| {}))
+                .collect();
+            assert_eq!(tm.reacquisition_count(), 1);
+            (id, out)
+        };
+        let (id, split) = run(&[a.clone(), b.clone()]);
+        let old = rq_speed_updates(&split[0], id);
+        let new = rq_speed_updates(&split[1], id);
+        assert!(!old.is_empty() && !new.is_empty(), "{old:?} {new:?}");
+        let mut ab = a;
+        ab.extend(b);
+        let (_, one) = run(&[ab]);
+        let both = rq_speed_updates(&one[0], id);
+        assert_eq!(both, [old, new].concat());
+    }
+
+    #[test]
+    fn second_station_inside_the_window_wakes_the_dormant_track() {
+        // The accepted trade-off (MAN-108 D5): a different station keying up
+        // on an owned channel inside the window wakes the old track.
+        let mut tm = rq_mgr(DetectorConfig::default().reacquire_hops);
+        let (events, _, back) = rq_fade_scene(&mut tm, 3000, 11);
+        let promoted = rq_promoted_ids(&events);
+        assert_eq!(promoted.len(), 1, "{promoted:?}");
+        let after = rq_chars(&events, back);
+        assert!(!after.is_empty());
+        assert!(after.iter().all(|&(t, _)| t == promoted[0]), "{after:?}");
+        assert_eq!(tm.reacquisition_count(), 1);
+    }
+
+    #[test]
+    fn reacquire_zero_is_pre_man108() {
+        let mut tm = rq_mgr(0);
+        let (events, _, _) = rq_fade_scene(&mut tm, 3000, 10);
+        let promoted = rq_promoted_ids(&events);
+        assert_eq!(promoted.len(), 2, "{promoted:?}");
+        let (first, second) = (promoted[0], promoted[1]);
+        assert_ne!(first, second);
+        let close = events
+            .iter()
+            .position(|e| {
+                *e == DecoderEvent::TrackClosed {
+                    track_id: first,
+                    closure: ClosureKind::SignalEnded,
+                }
+            })
+            .expect("the first track closes SignalEnded");
+        let second_promo = events
+            .iter()
+            .position(|e| matches!(e, DecoderEvent::TrackPromoted { track_id, .. } if *track_id == second))
+            .unwrap();
+        assert!(close < second_promo);
+        assert_eq!(tm.reacquisition_count(), 0);
+    }
+
     /// MAN-312 (SPEC §2.7): the live-channel rule. Rig audio is too narrow
     /// for the detector; a KiwiSDR's ±5 kHz holds 105 channels with one
     /// channel of margin; a full-Nyquist source is every channel.
@@ -7670,5 +8401,133 @@ mod tests {
         );
         assert_eq!(crash_live_channels(96_000.0, (-5000.0, 5000.0)), 105);
         assert_eq!(crash_live_channels(96_000.0, (-48_000.0, 48_000.0)), 1024);
+    }
+
+    // ---- MAN-108 review round 1 (PR #344): DORMANT vs MAN-312's
+    // suppressed static crashes ----
+
+    /// The static-crash detector arms on `CRASH_MIN_LIVE_CHANNELS` (96)
+    /// live channels; the 64-channel `NC_N` harness cannot fire one, so
+    /// these tests run a 128-channel manager.
+    const SC_N: usize = 128;
+
+    /// A band-wide static crash: every channel lifted `db` over the
+    /// -90 dBFS quiet floor, peaking `peak_extra_db` higher on `peak_ch`
+    /// (a real crash's channelizer smear peaks somewhere; here it lands
+    /// on the tracked channel, so the dormant track's max-power
+    /// selection keeps reading it).
+    fn sc_crash(db: f32, peak_ch: usize, peak_extra_db: f32) -> Vec<f32> {
+        let mut p = vec![1e-9 * 10f32.powf(db / 10.0); SC_N];
+        p[peak_ch] *= 10f32.powf(peak_extra_db / 10.0);
+        p
+    }
+
+    /// The quiet floor with a +30 dB tone on channel 10.
+    fn sc_tone() -> Vec<f32> {
+        let mut p = quiet_power(SC_N);
+        p[10] = nc_db(30.0);
+        p
+    }
+
+    /// A promoted, qualified track on channel 10 (non-CW filter off, RTTY
+    /// filter off -- pure lifecycle), latched `reacquirable` by hand (this
+    /// step-only harness decodes nothing, like
+    /// `woken_track_is_not_closed_unkeyed_immediately`), then faded quiet
+    /// for `quiet_hops` hops so it sits DORMANT.
+    fn sc_dormant_track(cfg: &DetectorConfig, quiet_hops: u64) -> (TrackManager, u32) {
+        let mut tm = TrackManager::new(SC_N, 96_000.0, 14_000_000.0, *cfg, DecodeConfig::default());
+        feed_warmup(&mut tm, SC_N);
+        let mut id = None;
+        for i in 0..60 {
+            let m = 250 * 15 + i;
+            let (_, promoted, _) = tm.step_hop(&hop(m, sc_tone()), m);
+            if let Some(DecoderEvent::TrackPromoted { track_id, .. }) = promoted.first() {
+                id = Some(*track_id);
+            }
+        }
+        let id = id.expect("the tone never promoted");
+        tm.tracks.get_mut(&id).unwrap().lifecycle.set_reacquirable();
+        for i in 0..quiet_hops {
+            let m = 250 * 15 + 60 + i;
+            let p = quiet_power(SC_N);
+            tm.step_hop(&hop(m, p), m);
+        }
+        assert_eq!(
+            tm.tracks[&id].state(),
+            LifecycleState::Dormant,
+            "the fade must have reached DORMANT"
+        );
+        (tm, id)
+    }
+
+    /// A crash that starts before the wake's 19 confirm hops are done must
+    /// not finish them: the gate's EMA is held through a suppressed crash,
+    /// so its `rise` is not evidence the signal returned (MAN-312 freezes
+    /// a CANDIDATE's confirm window for exactly this reason). The signal
+    /// here is gone -- only the crash remains, peaking on the dormant
+    /// track's own channel.
+    #[test]
+    fn suppressed_crash_cannot_finish_dormant_wake_confirmation() {
+        let cfg = DetectorConfig {
+            hang_hops: 10,
+            non_cw_filter: false,
+            rtty_filter: false,
+            ..DetectorConfig::default()
+        };
+        // 70 quiet hops: the max-power tie moves selection to a flat
+        // floor-level channel, `drop` fires at once, `hang_hops` more
+        // hops reach DORMANT (~11), leaving ~59 of the window aged.
+        let (mut tm, id) = sc_dormant_track(&cfg, 70);
+        // The signal returns: the EMA needs ~14 hops to cross the rise
+        // threshold again, then 4 more confirm hops accrue (of 19)...
+        for _ in 0..17 {
+            let m = tm.hop_counter;
+            tm.step_hop(&hop(m, sc_tone()), m);
+        }
+        // ...then it disappears under a 20-hop band-wide crash.
+        for i in 0..20 {
+            let m = tm.hop_counter;
+            tm.step_hop(&hop(m, sc_crash(26.0, 10, 4.0)), m);
+            assert_eq!(
+                tm.tracks.get(&id).map(|t| t.state()),
+                Some(LifecycleState::Dormant),
+                "suppressed crash hop {i}: the crash must not wake the track"
+            );
+        }
+        assert_eq!(tm.static_crash_count(), 1);
+        assert_eq!(tm.reacquisition_count(), 0);
+        // After the crash the signal really returns: the wake still works.
+        for _ in 0..(cfg.confirm_hops + 10) {
+            let m = tm.hop_counter;
+            tm.step_hop(&hop(m, sc_tone()), m);
+        }
+        assert_eq!(tm.tracks[&id].state(), LifecycleState::Active);
+        assert_eq!(tm.reacquisition_count(), 1);
+    }
+
+    /// The freeze must not freeze the window itself: a suppressed crash
+    /// still ages `reacquire_hops`, so a crash longer than the remaining
+    /// window closes the track `HangExpired` mid-crash, as a HANG track's
+    /// hang timer runs on the same held hops.
+    #[test]
+    fn suppressed_crash_still_ages_the_dormant_expiry() {
+        let cfg = DetectorConfig {
+            hang_hops: 10,
+            non_cw_filter: false,
+            reacquire_hops: 15,
+            rtty_filter: false,
+            ..DetectorConfig::default()
+        };
+        // 18 quiet hops: DORMANT from ~hop 11, ~7 of the 15 window hops
+        // aged.
+        let (mut tm, id) = sc_dormant_track(&cfg, 18);
+        for _ in 0..20 {
+            let m = tm.hop_counter;
+            tm.step_hop(&hop(m, sc_crash(26.0, 10, 4.0)), m);
+        }
+        assert!(!tm.tracks.contains_key(&id), "the window must expire");
+        assert_eq!(tm.close_counts().hang_expired, 1);
+        assert_eq!(tm.static_crash_count(), 1);
+        assert_eq!(tm.reacquisition_count(), 0);
     }
 }
