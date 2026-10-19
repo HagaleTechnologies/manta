@@ -100,6 +100,38 @@ pub(crate) fn reload_once(ctx: &ReloadContext) -> Result<ReloadOutcome> {
     let restart_needed = restart_only_changes(&ctx.startup_raw, &prepared.loaded.raw);
     let dry_run_skipped = restart_needed.iter().any(|p| p.starts_with("rbn_uplink"))
         || prepared.loaded.rbn_uplink.len() != ctx.uplinks.len();
+    // MAN-319: `load()` checked the locator gate against this file, but
+    // `[server]` is restart-only, so a grid added in the same edit never
+    // reaches the running daemon. A flip that goes live must find a
+    // 6-character grid in the startup document (validated at startup, so
+    // only absent / 4 / 6 remain).
+    if !dry_run_skipped {
+        let running_grid = ctx
+            .startup_raw
+            .get("server")
+            .and_then(|s| s.get("operator_grid"))
+            .and_then(toml::Value::as_str);
+        if !running_grid.is_some_and(|g| g.chars().count() == 6) {
+            let going_live = ctx
+                .uplinks
+                .iter()
+                .zip(&prepared.loaded.rbn_uplink)
+                .find(|(live, new)| live.enabled && !new.dry_run);
+            if let Some((live, _)) = going_live {
+                let running = running_grid.map_or_else(
+                    || "no operator_grid".to_string(),
+                    |g| format!("operator_grid \"{g}\""),
+                );
+                anyhow::bail!(
+                    "[[rbn_uplink]] target {} has dry_run = false -- sending spots needs \
+                     [server].operator_grid set to a 6-character Maidenhead locator, and this \
+                     daemon started with {running}; [server] changes take effect only after a \
+                     restart, so restart manta to go live",
+                    live.label,
+                );
+            }
+        }
+    }
 
     let pipeline = prepared.pipeline;
     let allowlist_calls = pipeline
@@ -615,6 +647,39 @@ blocklist_path = \"bl.txt\"
             "{:?}",
             report.restart_needed
         );
+    }
+
+    /// MAN-319 (PR #362 review): `[server]` is restart-only, so a SIGHUP
+    /// that adds the grid and flips `dry_run` off in one edit is refused --
+    /// the new file passes `load()`, but the running daemon still has the
+    /// grid it started with.
+    #[test]
+    fn a_live_flip_is_checked_against_the_grid_the_daemon_started_with() {
+        for (startup_grid, running) in [
+            ("", "no operator_grid"),
+            ("operator_grid = \"FN03\"\n", "operator_grid \"FN03\""),
+        ] {
+            let startup = BASE.replace("operator_grid = \"FN03ab\"\n", startup_grid);
+            let f = start(
+                &format!("{startup}{}", uplink_block(true, 7000)),
+                CliOverrides::none(),
+            );
+            write(
+                &f.path("manta.toml"),
+                &format!("{BASE}{}", uplink_block(false, 7000)),
+            );
+            let err = format!("{:#}", reload_once(&f.ctx).unwrap_err());
+            assert!(
+                err.contains(
+                    "target 127.0.0.1:7000 has dry_run = false -- sending spots needs \
+                     [server].operator_grid set to a 6-character Maidenhead locator"
+                ),
+                "{err}"
+            );
+            assert!(err.contains(&format!("started with {running}")), "{err}");
+            assert!(f.ctx.lists.take().is_none());
+            assert_eq!(flags(&f.ctx), vec![true]);
+        }
     }
 
     /// A disabled target transmits nothing either way, so its flip is not

@@ -174,6 +174,9 @@ the git history and `docs/DECISIONS/`.
   `"FN03ab"`). `config check`, `run`, `doctor` and a SIGHUP reload refuse a
   live uplink without one, naming the target and the key to set; dry-run
   uplinks (the default) are unchanged. A 4-character grid is refused too.
+  A SIGHUP that goes live is checked against the grid the daemon started
+  with (`[server]` needs a restart), so adding the grid in the same reload
+  is refused.
   The registration/settings exchange itself stays blocked on MAN-90's
   Aggregator→RBN capture (claims C8–C11).
 - IQ WAV input streams from disk: `manta decode`'s memory no longer grows

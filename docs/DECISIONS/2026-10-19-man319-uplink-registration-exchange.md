@@ -39,9 +39,15 @@ with exit 0 (reproduced with the real binary at `b17da2a`).
   bail, so `config check`, `run`, `doctor` and the SIGHUP reload path all
   enforce it from one place; a reload whose new config goes live without a
   grid is an invalid reload (MAN-78 semantics: logged, ignored, the previous
-  configuration keeps running). The error names the target and the key:
-  `dry_run = false -- sending spots needs [server].operator_grid set to a
-  6-character Maidenhead locator (e.g. "FN03ab")`. Rejected alternatives:
+  configuration keeps running). `load()`'s error names the target and the
+  key: `dry_run = false -- sending spots needs [server].operator_grid set to
+  a 6-character Maidenhead locator (e.g. "FN03ab")`. The reload adds one
+  check of its own (PR #362 review): `[server]` is restart-only, so
+  `reload_once` checks a live flip against the grid in the startup document;
+  a grid added in the same SIGHUP as the flip is rejected (its error keeps
+  the text above up to "locator", then names the running grid, e.g. `this
+  daemon started with no operator_grid`, and says to restart), and going
+  live then takes a restart. Rejected alternatives:
   gating every enabled uplink including dry-run rehearsals (Scenario 1's own
   Given ties the locator to dry-run being off, and every guide example is a
   dry-run config); accepting a locator derived from

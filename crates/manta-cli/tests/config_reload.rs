@@ -254,7 +254,16 @@ fn an_invalid_reload_is_logged_and_the_previous_lists_stay() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("manta.toml");
     let blocklist = dir.path().join("bl.txt");
-    std::fs::write(&config, server_toml("", &uplink_toml(uplink_port, true))).unwrap();
+    // MAN-319: `[server]` is restart-only, so the grid the positive control
+    // goes live with must already be there at startup.
+    std::fs::write(
+        &config,
+        server_toml(
+            "operator_grid = \"FN03ab\"",
+            &uplink_toml(uplink_port, true),
+        ),
+    )
+    .unwrap();
     std::fs::write(&blocklist, "W1AW\n").unwrap();
     let mut daemon = Daemon::start(dir.path());
 
@@ -287,7 +296,7 @@ fn an_invalid_reload_is_logged_and_the_previous_lists_stay() {
 
     // Positive control: a valid reload after the rejections still applies,
     // lists and dry_run alike. MAN-319: going live needs the 6-character
-    // grid, so the flipped config carries one.
+    // grid, so the flipped config keeps the startup one.
     std::fs::write(
         &config,
         server_toml(
@@ -322,6 +331,7 @@ fn an_invalid_reload_is_logged_and_the_previous_lists_stay() {
 /// MAN-319: going live over SIGHUP without a 6-character
 /// `[server].operator_grid` is an invalid reload (MAN-78: logged, ignored,
 /// the previous configuration keeps running) -- never a silent go-live.
+/// The grid counts only if the daemon started with it.
 #[test]
 fn a_reload_that_goes_live_without_a_grid_is_refused_and_dry_run_stays_on() {
     // A target that refuses connections: the uplink only has to exist for
@@ -347,6 +357,28 @@ fn a_reload_that_goes_live_without_a_grid_is_refused_and_dry_run_stays_on() {
             "reload: rejected; still running the previous configuration",
             "dry_run = false -- sending spots needs [server].operator_grid set to a \
              6-character Maidenhead locator",
+        ],
+        LINE_TIMEOUT,
+    );
+
+    // The grid added in the same edit as the flip (PR #362 review): the file
+    // is valid, but `[server]` is restart-only, so the running daemon still
+    // has no grid -- rejected too.
+    std::fs::write(
+        &config,
+        server_toml(
+            "operator_grid = \"FN03ab\"",
+            &uplink_toml(uplink_port, false),
+        ),
+    )
+    .unwrap();
+    daemon.signal(libc::SIGHUP);
+    expect_line(
+        &daemon.stderr,
+        &[
+            "ERROR",
+            "reload: rejected; still running the previous configuration",
+            "this daemon started with no operator_grid",
         ],
         LINE_TIMEOUT,
     );
