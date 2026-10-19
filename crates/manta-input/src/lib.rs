@@ -1,5 +1,5 @@
 //! IQ sources. At M0: WAV file playback only (ARCHITECTURE §3).
-//! WAV layout: 2 channels, ch0 = I, ch1 = Q; Float32 or Int16.
+//! WAV layout: 2 channels, ch0 = I, ch1 = Q; Float32 or 16/24/32-bit integer PCM, streamed.
 //! Center frequency comes from a JSON sidecar `<stem>.json`.
 
 pub mod devices;
@@ -263,16 +263,30 @@ pub fn read_sidecar(wav: &Path) -> Result<Option<Sidecar>> {
 /// docs/DECISIONS/2026-10-10-man269-paced-looping-replay.md.
 pub const MAX_IQ_WAV_RATE_HZ: f64 = 10_000_000.0;
 
+type WavFile = std::io::BufReader<std::fs::File>;
+
 /// Stereo WAV file (ch0=I, ch1=Q) as an IqSource, with an optional `<stem>.json` sidecar for center frequency. ARCHITECTURE §3.
+/// Streams: `open` reads the header only and `read` decodes just the frames it
+/// returns, so memory does not grow with the file (MAN-119).
 pub struct WavIqSource {
-    samples: Vec<Complex32>,
-    cursor: usize,
+    frames: WavFrames,
+    path: PathBuf,
     fs: f64,
     center_freq_hz: f64,
 }
 
+/// The data chunk, as the sample type hound decodes it to.
+enum WavFrames {
+    Float(hound::WavIntoSamples<WavFile, f32>),
+    /// 16-, 24- or 32-bit PCM through `i32`, divided by `full_scale` = 2^(bits-1).
+    Int {
+        samples: hound::WavIntoSamples<WavFile, i32>,
+        full_scale: f32,
+    },
+}
+
 impl WavIqSource {
-    /// Eager-loads the whole file (M0 pinned decision 15; files are <~100 MB). ARCHITECTURE §3.
+    /// Opens `path`, reading only its header. ARCHITECTURE §3.
     /// The centre frequency comes from the `<stem>.json` sidecar, `0.0` without one.
     pub fn open(path: &Path) -> Result<Self> {
         let mut src = Self::open_with_center_freq_hz(path, 0.0)?;
@@ -284,7 +298,7 @@ impl WavIqSource {
     /// read at all, so a malformed or foreign `<stem>.json` cannot fail it
     /// (MAN-131, `decode --center-freq-hz`).
     pub fn open_with_center_freq_hz(path: &Path, center_freq_hz: f64) -> Result<Self> {
-        let mut reader =
+        let reader =
             hound::WavReader::open(path).with_context(|| format!("open WAV {}", path.display()))?;
         let spec = reader.spec();
         if spec.channels != 2 {
@@ -302,29 +316,48 @@ impl WavIqSource {
                 MAX_IQ_WAV_RATE_HZ as u64
             );
         }
-        let interleaved: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
-            (hound::SampleFormat::Float, 32) => {
-                reader.samples::<f32>().collect::<Result<_, _>>()?
-            }
-            (hound::SampleFormat::Int, 16) => reader
-                .samples::<i16>()
-                .map(|s| s.map(|v| v as f32 / 32768.0))
-                .collect::<Result<_, _>>()?,
+        let frames = match (spec.sample_format, spec.bits_per_sample) {
+            (hound::SampleFormat::Float, 32) => WavFrames::Float(reader.into_samples()),
+            (hound::SampleFormat::Int, bits @ (16 | 24 | 32)) => WavFrames::Int {
+                samples: reader.into_samples(),
+                full_scale: (1u64 << (bits - 1)) as f32,
+            },
             (f, b) => return Err(unsupported_wav(f, b)),
         };
-        let samples = interleaved
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&[re, im]| Complex32::new(re, im))
-            .collect();
 
         Ok(WavIqSource {
-            samples,
-            cursor: 0,
+            frames,
+            path: path.to_path_buf(),
             fs,
             center_freq_hz,
         })
+    }
+
+    /// The next (I, Q) frame; `None` at EOF. hound rejects a data chunk
+    /// holding a half frame at `open`, so a lone trailing I sample is only
+    /// handled defensively (dropped, as `as_chunks::<2>` did).
+    fn next_frame(&mut self) -> Result<Option<Complex32>> {
+        let (re, im) = match &mut self.frames {
+            WavFrames::Float(samples) => (samples.next(), samples.next()),
+            WavFrames::Int {
+                samples,
+                full_scale,
+            } => {
+                let full_scale = *full_scale;
+                let mut next = || samples.next().map(|r| r.map(|v| v as f32 / full_scale));
+                (next(), next())
+            }
+        };
+        let path = &self.path;
+        let context = || format!("read WAV {}", path.display());
+        match (re, im) {
+            (Some(re), Some(im)) => Ok(Some(Complex32::new(
+                re.with_context(context)?,
+                im.with_context(context)?,
+            ))),
+            (Some(Err(e)), None) => Err(e).with_context(context),
+            _ => Ok(None),
+        }
     }
 }
 
@@ -338,9 +371,14 @@ impl IqSource for WavIqSource {
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
-        let n = buf.len().min(self.samples.len() - self.cursor);
-        buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
-        self.cursor += n;
+        let mut n = 0;
+        while n < buf.len() {
+            match self.next_frame()? {
+                Some(frame) => buf[n] = frame,
+                None => break,
+            }
+            n += 1;
+        }
         Ok(n)
     }
 }
@@ -363,7 +401,7 @@ fn unsupported_wav(format: hound::SampleFormat, bits: u16) -> anyhow::Error {
         hound::SampleFormat::Float => "Float",
         hound::SampleFormat::Int => "Int",
     };
-    anyhow::anyhow!("unsupported WAV format {name}/{bits}-bit (need Float32 or Int16)")
+    anyhow::anyhow!("unsupported WAV format {name}/{bits}-bit (need Float32 or Int16/24/32)")
 }
 
 #[cfg(test)]
@@ -373,11 +411,11 @@ mod tests {
     fn unsupported_wav_text_names_sample_formats() {
         assert_eq!(
             unsupported_wav(hound::SampleFormat::Float, 64).to_string(),
-            "unsupported WAV format Float/64-bit (need Float32 or Int16)"
+            "unsupported WAV format Float/64-bit (need Float32 or Int16/24/32)"
         );
         assert_eq!(
-            unsupported_wav(hound::SampleFormat::Int, 24).to_string(),
-            "unsupported WAV format Int/24-bit (need Float32 or Int16)"
+            unsupported_wav(hound::SampleFormat::Int, 8).to_string(),
+            "unsupported WAV format Int/8-bit (need Float32 or Int16/24/32)"
         );
     }
 
@@ -496,6 +534,197 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert!((all[0].re - 0.5).abs() < 1e-4);
         assert!((all[0].im + 0.5).abs() < 1e-4);
+    }
+
+    /// The 24-bit test frames: two (I, Q) pairs and what they read back as.
+    const I24_SAMPLES: [i32; 4] = [4_194_304, -4_194_304, 8_388_607, -8_388_608];
+
+    fn i24_frames() -> Vec<Complex32> {
+        vec![
+            Complex32::new(0.5, -0.5),
+            Complex32::new(8_388_607.0 / 8_388_608.0, -1.0),
+        ]
+    }
+
+    fn int_spec(bits_per_sample: u16) -> hound::WavSpec {
+        hound::WavSpec {
+            channels: 2,
+            sample_rate: 96_000,
+            bits_per_sample,
+            sample_format: hound::SampleFormat::Int,
+        }
+    }
+
+    /// A RIFF/WAVE file from a raw `fmt ` chunk body and `data` bytes, for
+    /// header shapes `hound::WavWriter` does not write.
+    fn riff_wav(path: &std::path::Path, fmt: &[u8], data: &[u8]) {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(4 + 8 + fmt.len() as u32 + 8 + data.len() as u32).to_le_bytes());
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+        b.extend_from_slice(fmt);
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        b.extend_from_slice(data);
+        std::fs::write(path, b).unwrap();
+    }
+
+    /// A 16-byte `fmt ` body: 2 channels at 96 kHz.
+    fn fmt_body(tag: u16, bytes_per_sample: u16, bits: u16) -> Vec<u8> {
+        let block_align = 2 * bytes_per_sample;
+        let mut f = Vec::new();
+        f.extend_from_slice(&tag.to_le_bytes());
+        f.extend_from_slice(&2u16.to_le_bytes());
+        f.extend_from_slice(&96_000u32.to_le_bytes());
+        f.extend_from_slice(&(96_000 * u32::from(block_align)).to_le_bytes());
+        f.extend_from_slice(&block_align.to_le_bytes());
+        f.extend_from_slice(&bits.to_le_bytes());
+        f
+    }
+
+    #[test]
+    fn reads_i24_wav_normalized() {
+        // hound writes this as WAVE_FORMAT_EXTENSIBLE.
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("fix24.wav");
+        let mut w = hound::WavWriter::create(&wav, int_spec(24)).unwrap();
+        for v in I24_SAMPLES {
+            w.write_sample(v).unwrap();
+        }
+        w.finalize().unwrap();
+        let all = read_all(&mut WavIqSource::open(&wav).unwrap()).unwrap();
+        assert_eq!(all, i24_frames());
+    }
+
+    #[test]
+    fn reads_pcm24_wav_without_an_extensible_header() {
+        // Format tag 1 (plain PCM) with 24 bits: the header shape CWSL and
+        // Python's `wave` write.
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("pcm24.wav");
+        let data: Vec<u8> = I24_SAMPLES
+            .iter()
+            .flat_map(|v| v.to_le_bytes()[..3].to_vec())
+            .collect();
+        riff_wav(&wav, &fmt_body(1, 3, 24), &data);
+        let all = read_all(&mut WavIqSource::open(&wav).unwrap()).unwrap();
+        assert_eq!(all, i24_frames());
+    }
+
+    #[test]
+    fn reads_24_bit_samples_in_4_byte_containers() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("fix24in32.wav");
+        let spec_ex = hound::WavSpecEx {
+            spec: int_spec(24),
+            bytes_per_sample: 4,
+        };
+        let file = std::io::BufWriter::new(std::fs::File::create(&wav).unwrap());
+        let mut w = hound::WavWriter::new_with_spec_ex(file, spec_ex).unwrap();
+        for v in I24_SAMPLES {
+            w.write_sample(v).unwrap();
+        }
+        w.finalize().unwrap();
+        let all = read_all(&mut WavIqSource::open(&wav).unwrap()).unwrap();
+        assert_eq!(all, i24_frames());
+    }
+
+    #[test]
+    fn reads_i32_wav_normalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("fix32.wav");
+        let mut w = hound::WavWriter::create(&wav, int_spec(32)).unwrap();
+        w.write_sample(1_073_741_824i32).unwrap(); // I = 0.5
+        w.write_sample(i32::MIN).unwrap(); // Q = -1.0
+        w.finalize().unwrap();
+        let all = read_all(&mut WavIqSource::open(&wav).unwrap()).unwrap();
+        assert_eq!(all, vec![Complex32::new(0.5, -1.0)]);
+    }
+
+    #[test]
+    fn open_reads_only_the_header() {
+        // The header declares 1000 Float32 frames; the file holds 10. An
+        // eager open fails here ("Failed to read enough bytes." from `open`);
+        // a streaming open succeeds, returns the 10 frames, then errors
+        // naming the file.
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("trunc.wav");
+        header_only_iq_wav(&wav, 96_000, 1000);
+        let mut bytes = std::fs::read(&wav).unwrap();
+        bytes.truncate(44);
+        for i in 0..10u8 {
+            bytes.extend_from_slice(&(f32::from(i) / 10.0).to_le_bytes());
+            bytes.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+        std::fs::write(&wav, bytes).unwrap();
+
+        let mut src = WavIqSource::open_with_center_freq_hz(&wav, 14_000_000.0).unwrap();
+        let mut buf = vec![Complex32::new(0.0, 0.0); 10];
+        assert_eq!(src.read(&mut buf).unwrap(), 10);
+        assert_eq!(buf[3], Complex32::new(0.3, 0.0));
+        let err = format!("{:#}", src.read(&mut buf).unwrap_err());
+        assert!(
+            err.contains(&format!("read WAV {}", wav.display())),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_trailing_half_frame_is_rejected_at_open() {
+        // A data chunk of 3 Float32 samples: hound 3.5.1 checks the sample
+        // count against the channel count in the header, so the half frame
+        // never reaches `read` (as on HEAD, where `open` failed the same way).
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("half.wav");
+        let data: Vec<u8> = [0.25f32, -0.25, 0.75]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        riff_wav(&wav, &fmt_body(3, 4, 32), &data);
+        let err = format!("{:#}", WavIqSource::open(&wav).err().expect("half frame"));
+        assert!(
+            err.contains(&format!("open WAV {}", wav.display())),
+            "{err}"
+        );
+        assert!(err.contains("invalid data chunk length"), "{err}");
+    }
+
+    #[test]
+    fn eight_bit_and_float64_wavs_are_rejected_naming_the_formats() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav8 = dir.path().join("fix8.wav");
+        let mut w = hound::WavWriter::create(&wav8, int_spec(8)).unwrap();
+        w.write_sample(64i8).unwrap();
+        w.write_sample(-64i8).unwrap();
+        w.finalize().unwrap();
+        let err = WavIqSource::open(&wav8).err().expect("8-bit").to_string();
+        assert_eq!(
+            err,
+            "unsupported WAV format Int/8-bit (need Float32 or Int16/24/32)"
+        );
+
+        // hound reads Float64 only from a WAVE_FORMAT_EXTENSIBLE header (a
+        // plain tag-3 header fails inside hound as "bits per sample is not 32").
+        let wav64 = dir.path().join("fix64.wav");
+        let mut fmt = fmt_body(0xFFFE, 8, 64);
+        fmt.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+        fmt.extend_from_slice(&64u16.to_le_bytes()); // wValidBitsPerSample
+        fmt.extend_from_slice(&3u32.to_le_bytes()); // dwChannelMask
+        fmt.extend_from_slice(&[
+            0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38,
+            0x9b, 0x71,
+        ]); // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+        riff_wav(&wav64, &fmt, &[0u8; 16]);
+        let err = WavIqSource::open(&wav64)
+            .err()
+            .expect("Float64")
+            .to_string();
+        assert_eq!(
+            err,
+            "unsupported WAV format Float/64-bit (need Float32 or Int16/24/32)"
+        );
     }
 
     #[test]
