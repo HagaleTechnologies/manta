@@ -439,14 +439,14 @@ impl SpeedTracker {
         (mu_dit - delta).clamp(DIT_CLAMP_MS.0, DIT_CLAMP_MS.1)
     }
 
-<<<<<<< HEAD
     /// True exactly once after the MAN-398 bad-lock branch has fired
     /// since the last call; cleared on read. See `badlock_recovered`'s doc
     /// comment for why callers (`TrackDecoder`) need this to also reset
     /// `GapClassifier`.
     pub fn take_badlock_recovered(&mut self) -> bool {
         std::mem::take(&mut self.badlock_recovered)
-=======
+    }
+
     /// MAN-271 (SPEC §4.1 **\[DEVIATION\]**): initialize the mark clusters
     /// from the `BOOTSTRAP_MIN_MARKS`..4 marks a short single transmission
     /// leaves, at a genuine end-of-signal flush (`TrackDecoder::finish` --
@@ -467,7 +467,6 @@ impl SpeedTracker {
         self.apply_constraints();
         self.wpm_ema = Some(1200.0 / self.dit_estimate_ms());
         true
->>>>>>> a1761da5598d5f338c00da0dc6faa3578d5b7bf2
     }
 
     /// Feed one mark duration, updating the clusters, constraints, and drift check. SPEC §4.1.
@@ -589,6 +588,13 @@ impl SpeedTracker {
             self.mu_egap_ms = None;
             self.regime = self.regime.wrapping_add(1);
             self.badlock_recovered = true;
+            // The reporting EMA holds measurements derived from the discarded
+            // fragment scale; re-seed it from the corrected estimate (as
+            // `bootstrap` and `reseed_wpm_after_warmup` do after replacing a
+            // scale), so a track ending within a few marks does not publish,
+            // or have a deferred beacon rejected against, a speed the
+            // corrected scale no longer supports.
+            self.wpm_ema = Some(1200.0 / self.dit_estimate_ms());
         }
     }
 
@@ -1674,6 +1680,28 @@ mod tests {
             t.mu_dit_ms()
         );
         assert!(t.boundary_ms() > 53.0, "boundary {}", t.boundary_ms());
+    }
+
+    #[test]
+    fn badlock_recovery_reseeds_wpm_from_the_corrected_scale() {
+        // The fragment lock of the test above reports ~44-49 WPM while it
+        // holds (the 20 ms fragment's estimate, gap-corrected). The mark
+        // that fires the trigger replaces that scale with the real 53 ms
+        // dit: the reporting EMA must be re-seeded from it, not left to
+        // average down from the discarded scale at WPM_ALPHA = 0.1 per
+        // mark -- a track ending in the next few marks would otherwise
+        // publish ~47 WPM for a 22.6 WPM sender, over manta-spot's 45 WPM
+        // beacon plausibility gate.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[20.0, 53.0, 53.0, 53.0, 53.0]);
+        feed_with_egaps(&mut t, &[53.0; 11], 53.0);
+        // The 12th streak mark fires the trigger.
+        t.on_mark(53.0);
+        let wpm = t.wpm().expect("tracker ready");
+        assert!(
+            (wpm - 1200.0 / 53.0).abs() < 1.0,
+            "post-recovery wpm {wpm} still averages in the fragment scale"
+        );
     }
 
     #[test]

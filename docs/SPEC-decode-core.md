@@ -1106,7 +1106,9 @@ says the marks really are dahs and the lock stands; this is what keeps a
 genuine opening dit followed by many real dahs (`E 0000`, `MO`) locked. No
 CV condition applies: dit-heavy text with some dahs streaks with CV ≈ 0.6.
 The reinit has the regime-change side effects above (§4.1a gap centroid
-reset, regime bump, §4.1b reset), and the track's §4.2 gap classifier is
+reset, regime bump, §4.1b reset), the §4.1a WPM reporting EMA is re-seeded
+from the corrected `dit_estimate_ms()` (its held value derived from the
+discarded scale), and the track's §4.2 gap classifier is
 reset too: its clusters were bootstrapped from gap ratios against the wrong
 `μ_dit`.
 

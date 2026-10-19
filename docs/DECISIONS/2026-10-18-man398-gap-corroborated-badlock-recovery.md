@@ -94,7 +94,12 @@ Why each choice:
 When the trigger fires it re-seeds from the 12-mark ring (not the last 5) and
 has the regime-change side effects: the §4.1a gap centroid is reset, the
 regime counter bumps (so `TrackDecoder` resets the §4.1b sender timing
-model), and `take_badlock_recovered()` returns true once. `TrackDecoder`
+model), the §4.1a WPM reporting EMA is re-seeded from the corrected
+`dit_estimate_ms()` (its held samples derived from the fabricated scale and
+would otherwise decay toward the true speed at only `wpm_alpha` = 0.1 per
+mark — a track ending in those marks reported ~47 WPM for the 22.6 WPM
+`HH` case, over manta-spot's 45 WPM beacon plausibility gate), and
+`take_badlock_recovered()` returns true once. `TrackDecoder`
 then replaces its `GapClassifier`. That classifier's clusters were
 bootstrapped from gap ratios against the wrong `μ_dit` and cannot correct
 themselves, so without the reset every word gap after recovery would stay
