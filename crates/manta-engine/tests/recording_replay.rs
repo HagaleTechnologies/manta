@@ -307,6 +307,31 @@ fn listen_round_trip(split: usize, name: &str, expect_closure: bool) {
         }
         other => panic!("recording did not finish: {other:?}"),
     }
+    // The pair holds the source's rate, centre and start, and each outage
+    // at its exact stored-sample position, the EOF one included.
+    let mut replay = RecordedIqSource::open(&path).unwrap();
+    assert_eq!(
+        (replay.sample_rate(), replay.center_freq_hz()),
+        (spec.fs, spec.center_freq_hz)
+    );
+    assert_eq!(replay.summary().header.start_time(), Some(start));
+    let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
+    let (mut at, mut gaps) = (0usize, Vec::new());
+    loop {
+        let n = replay.read(&mut buf).unwrap();
+        if let Some(g) = replay.take_discontinuity() {
+            gaps.push((at, g));
+        }
+        if n == 0 {
+            break;
+        }
+        at += n;
+    }
+    assert_eq!(
+        gaps,
+        vec![(split, 4 * spec.fs as u64), (r.samples.len(), 9_600)]
+    );
+
     let replay = RecordedIqSource::open(&path).unwrap();
     assert_eq!(listen_events(Box::new(replay)), want);
     std::fs::remove_dir_all(&dir).unwrap();

@@ -524,12 +524,14 @@ mod tests {
         (sink, bytes)
     }
 
-    #[allow(clippy::type_complexity)]
+    /// A sink, its byte count and the bytes it kept.
+    type KeptSink = (Sink, Arc<AtomicUsize>, Arc<Mutex<Vec<u8>>>);
+
     fn kept_sink(
         gate: Option<std::sync::mpsc::Receiver<()>>,
         fail: bool,
         fail_flush: bool,
-    ) -> (Sink, Arc<AtomicUsize>, Arc<Mutex<Vec<u8>>>) {
+    ) -> KeptSink {
         let bytes = Arc::new(AtomicUsize::new(0));
         let kept = Arc::new(Mutex::new(Vec::new()));
         (
