@@ -18,8 +18,9 @@ both protocols keeps its P2 answer; explicit host can force the P1 path.
 
 All five source commands use the same opener. Reconnect invokes discovery
 again, so a pinned MAC follows an address change. Two configured inputs with
-the same MAC or two unqualified discovery inputs are refused, like duplicate
-host inputs. Several receivers on one radio remain MAN-307's work.
+the same MAC, or an unqualified discovery input beside any other hostless
+input on its port, are refused, like duplicate host inputs. Several
+receivers on one radio remain MAN-307's work.
 
 ## Discovery
 
@@ -33,6 +34,9 @@ Destinations are limited broadcast `255.255.255.255` and loopback-directed
 broadcast `127.255.255.255`, both on the configured control port, normally
 1024. No dependency was added. On a host with several interfaces, limited
 broadcast may miss the radio's LAN; an explicit host remains the solution.
+The protocol spike records avahi/mDNS discovery for Red Pitaya images (QMTech
+unconfirmed), which is not implemented: such a radio is found only if it
+answers this broadcast, and otherwise needs an explicit host.
 A failed destination does not discard a successful send to another destination.
 If every send fails, or socket setup/receive fails, discovery reports an error.
 

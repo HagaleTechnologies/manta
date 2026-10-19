@@ -245,7 +245,7 @@ per receiver. Each entry takes the keys above, plus `name`. A one-entry
 - File replay and live receivers do not mix in one run. `replay_epoch` goes
   on the first entry only, and every file entry has the same `realtime` and
   `loop`.
-- Two entries on one HPSDR radio are refused until MAN-307, including duplicate MACs or two entries with neither host nor MAC. Pin each radio by a distinct MAC when several share the LAN.
+- Two entries on one HPSDR radio are refused until MAN-307, including duplicate MACs, or an entry with neither host nor MAC beside another entry without a host on the same port. Pin each radio by a distinct MAC when several share the LAN.
 - `MANTA_INPUT_*` and the per-receiver flags `--freq-correction-ppm`,
   `--dial-freq-hz` and `--capture-rate-hz` cannot say which entry they set,
   so they are refused; a source flag (`--source`, `--kiwi-host`, ...) still

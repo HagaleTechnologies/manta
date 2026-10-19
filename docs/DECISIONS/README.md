@@ -11,12 +11,9 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
-<<<<<<< HEAD
 | 2026-10-19 | MAN-306 | [Discover an openHPSDR radio when no address is configured](2026-10-19-man306-openhpsdr-discovery.md) |
-=======
 | 2026-10-18 | MAN-398 | [MAN-398: gap-corroborated recovery from a fragment-seeded speed lock](2026-10-18-man398-gap-corroborated-badlock-recovery.md) |
 | 2026-10-17 | MAN-108 | [MAN-108: a fading signal keeps its track through the fade (DORMANT re-acquisition)](2026-10-17-man108-dormant-track-reacquisition.md) |
->>>>>>> b17da2a84fb1511e38cac58da815bab0b63f9a73
 | 2026-10-17 | MAN-114 | [MAN-114: the spot frequency comes from a power-weighted phase estimator](2026-10-17-man114-phase-difference-spot-frequency.md) |
 | 2026-10-17 | MAN-275 | [MAN-275: a hostile or broken KiwiSDR receiver cannot stop the daemon; the plaintext-password exposure is accepted risk](2026-10-17-man275-kiwi-threat-model.md) |
 | 2026-10-17 | MAN-274 | [MAN-274: manta commits a Serena project config for agent symbol search](2026-10-17-man274-serena-project-config.md) |
