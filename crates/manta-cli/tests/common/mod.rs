@@ -224,8 +224,9 @@ pub fn fake_kiwi_then_stalled_reconnect(
 
 /// Accepts manta's KiwiSDR connection and plays the handshake just far
 /// enough for `KiwiIqSource::connect` (crates/manta-input/src/kiwi.rs) to
-/// return.
-fn accept_kiwi_session(
+/// return. `pub` for `kiwi_adversarial.rs` (MAN-275), which scripts its own
+/// misbehaving-receiver scenarios on top of this.
+pub fn accept_kiwi_session(
     listener: &TcpListener,
     done: &AtomicBool,
 ) -> Result<tungstenite::WebSocket<TcpStream>, String> {
@@ -259,8 +260,8 @@ fn accept_kiwi_session(
 }
 
 /// Streams real-time `SND` frames of quiet noise until `stop()` or the
-/// client hangs up.
-fn send_snd_frames(ws: &mut tungstenite::WebSocket<TcpStream>, stop: impl Fn() -> bool) {
+/// client hangs up. `pub` for `kiwi_adversarial.rs` (MAN-275).
+pub fn send_snd_frames(ws: &mut tungstenite::WebSocket<TcpStream>, stop: impl Fn() -> bool) {
     use tungstenite::Message;
 
     // KiwiSDR's native frame: 512 complex pairs, i.e. 1/23.4375 s at

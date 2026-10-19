@@ -114,6 +114,35 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// reachable later address would never be tried at all.
 const OVERALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bound on a single WebSocket frame or message the client will buffer
+/// from a receiver (MAN-275): real SND frames are a constant 2068 bytes
+/// and MSG parameter frames are a few KiB, so 64 KiB is ~30x headroom
+/// over anything real while capping a hostile/broken receiver at a
+/// trivial allocation -- the client-side analogue of `manta-server`'s
+/// 16 KiB inbound convention (`json_stream.rs`'s
+/// MAX_INBOUND_WS_MESSAGE_BYTES). Without it, tungstenite's defaults
+/// (64 MiB message / 16 MiB frame) apply. An over-bound frame surfaces as
+/// a tungstenite `Capacity` error from `read()`, which the CLI's
+/// `ReconnectingSource` turns into a logged reconnect (MAN-73). The WS
+/// handshake itself is separately hard-bounded by tungstenite's
+/// unconditional `AttackCheck` (MAX_BYTES = 65536 / MAX_PACKETS = 512).
+const MAX_WS_FRAME_BYTES: usize = 64 * 1024;
+
+/// Accepted range for the receiver-reported `MSG sample_rate=` (Hz, after
+/// rounding), checked before the resampler is built (MAN-275, Codex review
+/// round 1). `rubato::Fft` sizes its buffers from the rate ratio, so an
+/// unchecked hostile value is a memory bomb: `sample_rate=1` asks for
+/// ~1.57e9 output frames per `RESAMPLER_CHUNK` (~12.6 GB per stereo f32
+/// buffer), and a huge rate coprime with 96000 makes the FFT block itself
+/// that large. An allocation that size can abort the process or get it
+/// OOM-killed instead of returning a reconnectable `Err`. Inside this
+/// range the largest buffer is ~1.63 M frames (~13 MB, at 1001 Hz). Real
+/// receivers report ~12 kHz (measured 11998.860-11998.964 Hz, see
+/// RESAMPLER_CHUNK), so 1 kHz up to `TARGET_RATE_HZ` leaves wide headroom
+/// either side.
+const MIN_PLAUSIBLE_SAMPLE_RATE_HZ: usize = 1_000;
+const MAX_PLAUSIBLE_SAMPLE_RATE_HZ: usize = TARGET_RATE_HZ;
+
 /// Resolves `host:port` and connects to the first address that accepts,
 /// the whole operation bounded by `OVERALL_CONNECT_TIMEOUT` (MAN-73, code
 /// review round 1): `(host, port).to_socket_addrs()` is a synchronous,
@@ -278,8 +307,12 @@ impl KiwiIqSource {
             .unwrap_or_default()
             .as_millis();
         let url = format!("ws://{host}:{port}/{timestamp}/SND");
+        let ws_config = tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(MAX_WS_FRAME_BYTES))
+            .max_frame_size(Some(MAX_WS_FRAME_BYTES));
         let (mut socket, _resp) =
-            tungstenite::client(url, tcp).context("KiwiSDR WebSocket handshake")?;
+            tungstenite::client::client_with_config(url, tcp, Some(ws_config))
+                .context("KiwiSDR WebSocket handshake")?;
 
         socket
             .send(Message::Text(
@@ -380,8 +413,13 @@ impl KiwiIqSource {
                 .context("send post-handshake SET command")?;
         }
 
-        if rate_in_hz == 0 {
-            bail!("KiwiSDR reported sample_rate=0");
+        // `as usize` saturates: NaN and negatives land on 0, +inf on
+        // usize::MAX, so this one range check rejects all of them.
+        if !(MIN_PLAUSIBLE_SAMPLE_RATE_HZ..=MAX_PLAUSIBLE_SAMPLE_RATE_HZ).contains(&rate_in_hz) {
+            bail!(
+                "KiwiSDR reported an implausible sample_rate ({rate_in_hz} Hz after rounding); \
+                 expected {MIN_PLAUSIBLE_SAMPLE_RATE_HZ}..={MAX_PLAUSIBLE_SAMPLE_RATE_HZ} Hz"
+            );
         }
         let resampler = Fft::<f32>::new(
             rate_in_hz,
@@ -843,6 +881,67 @@ mod tests {
             TARGET_RATE_HZ as f64,
             "if these ever coincide this test proves nothing"
         );
+    }
+
+    /// Plays a loopback fake receiver that reports `MSG sample_rate=<rate>`
+    /// and returns what `connect()` made of it.
+    fn connect_to_a_receiver_reporting(rate: &'static str) -> Result<KiwiIqSource> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let _ = ws.read(); // SET auth
+            let _ = ws.send(Message::binary(
+                format!("MSG sample_rate={rate}").into_bytes(),
+            ));
+            // Swallow the post-handshake SETs until the client hangs up
+            // (bounded by the read timeout above).
+            while ws.read().is_ok() {}
+        });
+        let result = KiwiIqSource::connect("127.0.0.1", port, 14_025_000.0, "");
+        if let Ok(src) = &result {
+            // Drop the socket, so the fake receiver sees EOF and exits.
+            let _ = src.socket.get_ref().shutdown(std::net::Shutdown::Both);
+        }
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn an_implausible_reported_sample_rate_fails_connect_before_the_resampler_is_built() {
+        // MAN-275, Codex review round 1: before the range check,
+        // `sample_rate=1` sized rubato's buffers at ~12.6 GB and the huge
+        // coprime value made the FFT block itself enormous; either one
+        // aborted the process on allocation rather than returning an Err.
+        for rate in [
+            "1",
+            "999.4",
+            "96000.6",
+            "1000000007",
+            "1e300",
+            "inf",
+            "NaN",
+            "-12000",
+            "0",
+        ] {
+            let err = match connect_to_a_receiver_reporting(rate) {
+                Ok(_) => panic!("sample_rate={rate} must be rejected"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("implausible sample_rate"),
+                "sample_rate={rate}: {err:#}"
+            );
+        }
+        // Both ends of the range are inclusive.
+        for rate in ["1000", "96000"] {
+            connect_to_a_receiver_reporting(rate)
+                .unwrap_or_else(|e| panic!("sample_rate={rate} must be accepted: {e:#}"));
+        }
     }
 
     #[test]

@@ -1507,6 +1507,8 @@ fn docs_describe_the_separate_metrics_bind_addr() {
         "ARCHITECTURE.md",
         "docs/RUNBOOKS/network-exposure.md",
         "docs/RUNBOOKS/node-health.md",
+        "docs/RUNBOOKS/uplink-health.md",
+        "wiki/pages/uplink-health-observability.md",
     ] {
         let text = squash_whitespace(&doc(rel));
         assert!(
@@ -1518,9 +1520,27 @@ fn docs_describe_the_separate_metrics_bind_addr() {
             "omit it and all three servers bind",
             "shares the same publicly-bound-by-default posture",
             "default bind `[server].bind_addr`",
+            "`0.0.0.0`-by-default exposure posture",
         ] {
             assert!(!text.contains(stale), "{rel} still says {stale:?}");
         }
+    }
+}
+
+/// MAN-287: the uplink-health runbook says what checking a daemon on another
+/// host takes, not just that it is loopback-only by default.
+#[test]
+fn uplink_health_runbook_says_how_to_reach_a_remote_daemon() {
+    let text = squash_whitespace(&doc("docs/RUNBOOKS/uplink-health.md"));
+    for needle in [
+        "--addr <that host>:<metrics_port>",
+        "set `[server].metrics_bind_addr`",
+        "firewall `[server].metrics_port`",
+    ] {
+        assert!(
+            text.contains(needle),
+            "uplink-health.md does not say {needle:?}"
+        );
     }
 }
 
@@ -2752,6 +2772,7 @@ fn reference_docs_relative_links_resolve() {
         METRICS_REF,
         "docs/SPOT-SCHEMA.md",
         "docs/LIVE-STATE.md",
+        "docs/COMPARISON.md",
         DOCS_INDEX,
         DECISIONS_INDEX,
     ] {
@@ -2896,6 +2917,68 @@ fn spec_section_5_track_closed_names_its_closure_kinds() {
             "SPEC §5's `TrackClosed` entry never names `{needle}`"
         );
     }
+}
+
+// ---- MAN-155 (scoped by the MAN-360 decision, option B): a neutral
+// related-projects page, links only ----
+
+/// MAN-155, as narrowed by MAN-360 (B): a neutral related-projects page
+/// links each closest alternative's own documentation with no capability
+/// claims about any of them, and a visitor reaches it from the README and
+/// the docs index.
+#[test]
+fn related_projects_page_links_each_alternative_without_capability_claims() {
+    let page = doc("docs/COMPARISON.md");
+    for project in [
+        "SparkSDR",
+        "sdroxide",
+        "OpenWebRX+",
+        "csdr-skimmer",
+        "sdrainer",
+    ] {
+        assert!(
+            page.contains(project),
+            "docs/COMPARISON.md never names {project}"
+        );
+    }
+    let targets = link_targets(&page);
+    for home in [
+        "https://www.sparksdr.com/",
+        "https://github.com/dividebysandwich/sdroxide",
+        "https://github.com/luarvique/openwebrx",
+        "https://github.com/luarvique/csdr-skimmer",
+        "https://github.com/ftl/sdrainer",
+    ] {
+        assert!(
+            targets.iter().any(|t| t == home),
+            "docs/COMPARISON.md does not link {home}"
+        );
+    }
+    assert!(
+        page.contains("no capability claims"),
+        "docs/COMPARISON.md must state its neutrality: links only, no \
+         capability claims about any listed project (MAN-360 decision B)"
+    );
+    assert!(
+        !page.lines().any(|l| l.trim_start().starts_with('|')),
+        "docs/COMPARISON.md has a table row; MAN-360 (B) scoped the page to \
+         a neutral links-only list with no capability claims"
+    );
+    let readme = doc("README.md");
+    for heading in ["Why", "Related projects"] {
+        assert!(
+            link_targets(section(&readme, heading))
+                .iter()
+                .any(|t| t == "docs/COMPARISON.md"),
+            "README `## {heading}` does not link docs/COMPARISON.md"
+        );
+    }
+    assert!(
+        link_targets(&doc(DOCS_INDEX))
+            .iter()
+            .any(|t| t == "COMPARISON.md"),
+        "{DOCS_INDEX} does not link COMPARISON.md"
+    );
 }
 
 /// MAN-13: one daemon reads several receivers, so ARCHITECTURE no longer
