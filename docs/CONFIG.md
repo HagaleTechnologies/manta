@@ -296,6 +296,7 @@ milliseconds, 0 to 3600000.
 | `off_snr_db` | `3.0` | live | SNR, dB, below which a track counts as silent; 0 to `on_snr_db`. |
 | `confirm_ms` | `50.0` | live | How long a signal must last before it is decoded; at most 3600000 (1 h), and must round to at least one hop. |
 | `hang_ms` | `5000.0` | live | How long a silent track waits before it closes; at most 3600000 (1 h), and must round to at least one hop. |
+| `reacquire_ms` | `10000.0` | live | After `hang_ms`, how long a track that has decoded characters keeps its identity and frequency while its signal is gone. No decoder runs in that time. If the signal comes back, the track resumes under the same track ID with a fresh decoder. 0 to 3600000 (1 h); `0` restores the previous behaviour (close at `hang_ms`). See [SPEC §2.4](SPEC-decode-core.md#24-track-lifecycle-state-machine) and [MAN-108](DECISIONS/2026-10-17-man108-dormant-track-reacquisition.md). |
 | `gc_ms` | `30000.0` | live | A track that decodes no character for this long is closed; at most 3600000 (1 h), and must round to at least one hop. |
 | `warmup_ms` | `25.0` | live | Start-up time spent measuring the noise; no track opens before it ends. 0 to 3600000 (1 h); 0 means no warmup. |
 | `track_cap` | `1200` | live | Most tracks open at once, counting unconfirmed candidates that have no decoder yet; past it the lowest-SNR track is evicted. At least 1. |
@@ -354,3 +355,8 @@ each one with "not configurable yet" rather than ignoring it.
 | `char_gap_dits` | `[decode]` | `manta-decode::timing` |
 | `word_gap_dits` | `[decode]` | `manta-decode::timing` |
 | `cluster_alpha` | `[decode]` | `manta-decode::timing` |
+
+The loader also rejects `[detector] guard_hz`, which SPEC §9 does not list:
+it is the internal DC/Nyquist spawn guard, set from the input source
+(600 Hz for live audio, 0 otherwise; see
+[MAN-273](DECISIONS/2026-10-16-man273-hilbert-image-guard.md)).

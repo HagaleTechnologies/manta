@@ -304,6 +304,7 @@
 #off_snr_db = 3.0                    # ratio below which a track counts as silent (0 to on_snr_db)
 #confirm_ms = 50.0                   # how long a signal must last before it is decoded
 #hang_ms = 5000.0                    # how long a silent track waits before it closes
+#reacquire_ms = 10000.0              # after hang_ms, how long a decoded track keeps its identity waiting for its signal to return; 0 = close at hang_ms
 #gc_ms = 30000.0                     # a track that decodes no character this long is closed
 #warmup_ms = 25.0                    # start-up time spent measuring the noise; no tracks before it
 #track_cap = 1200                    # most open tracks, candidates included

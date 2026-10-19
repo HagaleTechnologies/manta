@@ -45,6 +45,14 @@ const CONSTANT_ONLY_KEYS: &[(&str, &str, &str)] = &[
     ("decode", "cluster_alpha", "manta-decode::timing"),
 ];
 
+/// MAN-273: `DetectorConfig` fields the source supplies, never the operator
+/// (not in SPEC §9): rejected with their own message.
+const SOURCE_DERIVED_KEYS: &[(&str, &str, &str)] = &[(
+    "detector",
+    "guard_hz",
+    "derived from the source's audio front end (manta-dsp::hilbert, MAN-273)",
+)];
+
 const ENV_PREFIX: &str = "MANTA_";
 /// The `--config` fallback (run/soak/doctor only).
 pub(crate) const ENV_CONFIG: &str = "MANTA_CONFIG";
@@ -646,6 +654,15 @@ fn reject_constant_only_keys(doc: &toml::Table, origin: &str) -> Result<()> {
                 "{origin}: {table}.{key} is not configurable yet: it is a compile-time constant \
                  in {home} (SPEC §9 lists it for reference)"
             );
+        }
+    }
+    for (table, key, why) in SOURCE_DERIVED_KEYS {
+        if doc
+            .get(*table)
+            .and_then(toml::Value::as_table)
+            .is_some_and(|t| t.contains_key(*key))
+        {
+            bail!("{origin}: {table}.{key} is not configurable: it is {why}");
         }
     }
     Ok(())
@@ -1571,6 +1588,18 @@ mod tests {
                  entirely)",
                 f.path().display()
             )
+        );
+    }
+
+    #[test]
+    fn detector_guard_hz_is_rejected_as_source_derived() {
+        let err = err_of("[detector]\nguard_hz = 900.0\n");
+        assert!(
+            err.contains(
+                "detector.guard_hz is not configurable: it is derived from the source's audio \
+                 front end (manta-dsp::hilbert, MAN-273)"
+            ),
+            "{err}"
         );
     }
 

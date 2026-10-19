@@ -11,11 +11,17 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+<<<<<<< HEAD
 | 2026-10-18 | MAN-398 | [MAN-398: gap-corroborated recovery from a fragment-seeded speed lock](2026-10-18-man398-gap-corroborated-badlock-recovery.md) |
+=======
+| 2026-10-17 | MAN-108 | [MAN-108: a fading signal keeps its track through the fade (DORMANT re-acquisition)](2026-10-17-man108-dormant-track-reacquisition.md) |
+>>>>>>> a1761da5598d5f338c00da0dc6faa3578d5b7bf2
 | 2026-10-17 | MAN-114 | [MAN-114: the spot frequency comes from a power-weighted phase estimator](2026-10-17-man114-phase-difference-spot-frequency.md) |
 | 2026-10-17 | MAN-275 | [MAN-275: a hostile or broken KiwiSDR receiver cannot stop the daemon; the plaintext-password exposure is accepted risk](2026-10-17-man275-kiwi-threat-model.md) |
 | 2026-10-17 | MAN-274 | [MAN-274: manta commits a Serena project config for agent symbol search](2026-10-17-man274-serena-project-config.md) |
 | 2026-10-17 | MAN-155 | [MAN-155: the related-projects page links other projects and makes no claims about them](2026-10-17-man155-related-projects-links-only.md) |
+| 2026-10-16 | MAN-271 | [MAN-271: a short single-shot high-WPM transmission decodes to at least one character (finish-time tracker bootstrap + SPEC §2.8 D′)](2026-10-16-man271-short-transmission-decode.md) |
+| 2026-10-16 | MAN-273 | [MAN-273: a 511-tap Hilbert FIR and a source-declared DC/Nyquist spawn guard for live audio](2026-10-16-man273-hilbert-image-guard.md) |
 | 2026-10-16 | MAN-272 | [MAN-272: a spot carries its track's latest RST and a QRL? flag](2026-10-16-man272-rst-and-qrl-on-spots.md) |
 | 2026-10-16 | MAN-252 | [MAN-252: a stop request abandons a source reopen in flight](2026-10-16-man252-cancellable-source-reopen.md) |
 | 2026-10-16 | MAN-245 | [MAN-245: the Codex gate fails closed on an incomplete thread read, Dependabot is classified by author, and each required check names its source](2026-10-16-man245-gate-verdict-integrity.md) |
