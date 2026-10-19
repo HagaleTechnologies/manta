@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-16T22:46:15Z",
-  "head_commit": "b8b9367",
+  "generated_at": "2026-10-17T00:45:00Z",
+  "head_commit": "4529021",
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -146,6 +146,29 @@
       "title": "Why must the golden test vectors pin an exact coppa commit?",
       "verified_commit": "d286147",
       "verified_date": "2026-10-13",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:dd18f5b4961c9e2a585e910212a9120441379b64153785a28ad87f42e9cefad4",
+      "id": "hilbert-image-guard",
+      "kind": "gotcha",
+      "links": [
+        "detector-tracks",
+        "pfb-channelizer"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/hilbert-image-guard.md",
+      "sources": [
+        "docs/DECISIONS/2026-10-16-man273-hilbert-image-guard.md",
+        "crates/manta-dsp/src/hilbert.rs",
+        "crates/manta-engine/src/track.rs",
+        "docs/SPEC-decode-core.md#25-adjacent-channel-ownership-one-signal--one-track"
+      ],
+      "status": "current",
+      "title": "Why did the live-audio path spawn several tracks on one clean tone?",
+      "verified_commit": "4529021",
+      "verified_date": "2026-10-16",
       "visibility": "public"
     },
     {

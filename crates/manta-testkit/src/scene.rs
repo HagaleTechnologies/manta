@@ -139,7 +139,14 @@ pub fn render_scene(
                 fade.preset,
                 fade.seed,
             );
-            let mut analytic = manta_dsp::hilbert::HilbertTransformer::new().process(&faded);
+            // MAN-273 D4: fixture synthesis stays on the M1 129-tap design so
+            // widening the live-decode default cannot move a golden-vector
+            // byte; every vector reaching this branch sits at >= 5.6 kHz
+            // offsets, where 129 taps already gives >= 94 dB image rejection.
+            let mut analytic = manta_dsp::hilbert::HilbertTransformer::with_taps(
+                manta_dsp::hilbert::HILBERT_TAPS_M1_LEGACY,
+            )
+            .process(&faded);
             if sig.offset_hz < 0.0 {
                 for a in &mut analytic {
                     *a = a.conj();

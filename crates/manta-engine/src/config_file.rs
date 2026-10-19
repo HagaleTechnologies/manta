@@ -109,6 +109,10 @@ impl DetectorConfigToml {
             non_cw_filter: self.non_cw_filter.unwrap_or(d.non_cw_filter),
             unkeyed_close_hops: unkeyed_close(self.unkeyed_close_ms, d.unkeyed_close_hops)?,
             reacquire_hops: hops("reacquire_ms", self.reacquire_ms, d.reacquire_hops, false)?,
+            // MAN-273: source-derived (`IqSource::analytic_guard_hz`), not
+            // an operator key -- `[detector] guard_hz` is rejected as not
+            // configurable.
+            guard_hz: d.guard_hz,
         })
     }
 }

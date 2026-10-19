@@ -320,6 +320,11 @@ impl IqSource for SampleBoundedSource {
     fn trusted_band_hz(&self) -> Option<(f64, f64)> {
         self.inner.trusted_band_hz()
     }
+
+    /// MAN-273: forwarded with `trusted_band_hz`.
+    fn analytic_guard_hz(&self) -> f64 {
+        self.inner.analytic_guard_hz()
+    }
 }
 
 /// Run `listen()` against `src` for `duration`, tabulating its event/spot

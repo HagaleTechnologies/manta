@@ -76,7 +76,13 @@ pub fn token_order(a: &Token, b: &Token) -> Ordering {
 }
 
 pub fn merge_key(t: &Token) -> (NodeId, Phase, i32) {
-    (t.node, t.phase, (2.0 * t.u).round() as i32)
+    (t.node, t.phase, speed_bucket(t.u))
+}
+
+/// `merge_key`'s speed field, `round(2·u)`. MAN-191's `Silence` hot carry
+/// keys on it too, so the two must stay one function.
+pub fn speed_bucket(u: f32) -> i32 {
+    (2.0 * u).round() as i32
 }
 
 impl Token {
