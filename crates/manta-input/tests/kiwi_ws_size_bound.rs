@@ -33,10 +33,13 @@ fn frame_larger_than_the_bound_is_rejected_not_buffered() {
         oversized.extend_from_slice(b"SND");
         oversized.resize(64 * 1024 + 4096, 0);
         ws.send(Message::binary(oversized)).unwrap();
-        // Park with a bounded read: hold the connection open so neither a
-        // close nor a reset from this side can be what ends the client's
-        // read -- only the frame's size may end it.
-        let _ = ws.read();
+        // Hold the connection open until the client hangs up (or the 30 s
+        // read timeout fires), so neither a close nor a reset from this side
+        // can be what ends the client's read -- only the frame's size may
+        // end it. A single read was not a hold: it returned on the client's
+        // next SET, and the close that followed reset the connection
+        // mid-handshake (MAN-411: EPIPE on macOS, 10053 on Windows).
+        while ws.read().is_ok() {}
     });
 
     let mut src = KiwiIqSource::connect("127.0.0.1", port, 14_025_000.0, "").unwrap();
