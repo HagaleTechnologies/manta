@@ -32,6 +32,7 @@ mod doctor_checks;
 mod fmt;
 mod grade_cmd;
 mod health_cmd;
+mod hpsdr_group;
 mod list_cache;
 mod list_http;
 mod list_refresh;
@@ -1554,19 +1555,24 @@ impl LiveSourceSpec {
                 open_audio_source(None, Some(path.clone()), *source_iq, None)?
             }
         };
-        let src = maybe_decimate(src, capture_rate_hz)?;
-        Ok(match dial_freq_hz {
-            // A radiod retune moves the override by the same amount, so
-            // `ReconnectingSource`'s reopen check still sees it and ends the
-            // run, as it does with no override, instead of publishing spots
-            // against the old frequency.
-            Some(freq_hz) => Box::new(FixedCenterFreqSource {
-                inner: src,
-                freq_hz: freq_hz + retune_hz,
-            }),
-            None => src,
-        })
+        transform_source(src, capture_rate_hz, dial_freq_hz.map(|hz| hz + retune_hz))
     }
+}
+
+/// Apply identical wrappers to standalone and grouped initial/reopened sources.
+fn transform_source(
+    src: reconnect::SendSource,
+    capture_rate_hz: Option<f64>,
+    dial_freq_hz: Option<f64>,
+) -> Result<reconnect::SendSource> {
+    let src = maybe_decimate(src, capture_rate_hz)?;
+    Ok(match dial_freq_hz {
+        Some(freq_hz) => Box::new(FixedCenterFreqSource {
+            inner: src,
+            freq_hz,
+        }),
+        None => src,
+    })
 }
 
 /// `--source <path>.wav` covers two distinct file formats sharing the same
@@ -3362,6 +3368,7 @@ fn input_health_of(
     counters: &manta_input::InputHealthCounters,
 ) -> manta_server::metrics::InputHealth {
     manta_server::metrics::InputHealth {
+        queue_dropped_samples: counters.queue_dropped_samples(),
         dropped_packets: counters.dropped_packets(),
         gaps_detected: counters.gaps_detected(),
         malformed_packets: counters.malformed_packets(),
@@ -4514,6 +4521,7 @@ fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Resul
             port,
             freq_hz,
             rate_hz,
+            ..
         } => LiveSourceSpec::Hpsdr(HpsdrOpts {
             host: Some(host.clone()),
             port: *port,
@@ -5807,6 +5815,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 let reload = None;
                 return multi_run::run(multi_run::MultiRun {
                     inputs: &resolved.inputs,
+                    hpsdr_allocations: config::hpsdr_allocations(&loaded.inputs),
                     replay: resolved.replay,
                     cfg: &cfg,
                     json,

@@ -176,8 +176,18 @@ input feeds one shared validator, so the repetition gate and the 10-minute
 dedupe see every input's reports and a station two inputs hear is spotted
 once. Inputs share one clock at the highest input rate and interleave their
 track ids; see `manta-engine::multi` and
-`docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md`. Several receivers
-on one HPSDR radio wait on MAN-307.
+`docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md`. MAN-307 groups
+HPSDR entries by configured host and port. `manta-cli::hpsdr_group` owns one
+startup/reconnect generation per radio, probes shared HL2 capacity before
+control I/O, and supplies one source per DDC to those existing front ends.
+Endpoint aliases are rejected before control I/O. Retirement stops the old
+pump and keepalives before a replacement starts; stale readers cannot retire
+or publish into a newer generation. Each DDC queue retains at most two seconds
+of native IQ. Eviction reports an exact per-receiver discontinuity and queue
+counter. Decimation resets filter history and converts gaps with carried
+remainders. Acquisition timing is captured at the radio's start command;
+buffered samples and discarded old-generation samples are accounted for once.
+See `docs/DECISIONS/2026-10-19-man307-hpsdr-multiple-receivers.md`.
 
 **Variable-width capture** (issue #169): an optional decimation stage
 (`manta-dsp::decimate::Decimator`, wrapped as

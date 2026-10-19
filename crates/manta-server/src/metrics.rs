@@ -164,6 +164,8 @@ pub fn abandoned_spot_count(in_flight_spot: bool, still_queued: usize) -> u64 {
 /// deltas -- `set_input_health` overwrites, it does not accumulate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InputHealth {
+    /// Complex hardware-rate samples evicted from this input's bounded queue.
+    pub queue_dropped_samples: u64,
     pub dropped_packets: u64,
     pub gaps_detected: u64,
     pub malformed_packets: u64,
@@ -2022,6 +2024,14 @@ impl Metrics {
             ));
         }
 
+        out.push_str("# HELP manta_input_queue_dropped_samples_total Complex IQ samples discarded from an input queue because its consumer fell behind.\n");
+        out.push_str("# TYPE manta_input_queue_dropped_samples_total counter\n");
+        for (source, h) in input_health.iter() {
+            out.push_str(&format!(
+                "manta_input_queue_dropped_samples_total{{source=\"{source}\"}} {}\n",
+                h.queue_dropped_samples
+            ));
+        }
         drop(input_health);
 
         // MAN-234: replaced input samples, every source, 0 from startup.
@@ -2878,6 +2888,7 @@ mod tests {
         m.set_input_health(
             "hpsdr",
             InputHealth {
+                queue_dropped_samples: 0,
                 dropped_packets: 12,
                 gaps_detected: 3,
                 malformed_packets: 4,
@@ -2885,6 +2896,7 @@ mod tests {
         );
         let text = m.render_prometheus_text();
         assert!(text.contains("# TYPE manta_input_dropped_packets_total counter"));
+        assert!(text.contains(r#"manta_input_queue_dropped_samples_total{source="hpsdr"} 0"#));
         assert!(text.contains(r#"manta_input_dropped_packets_total{source="hpsdr"} 12"#));
         assert!(text.contains(r#"manta_input_gaps_detected_total{source="hpsdr"} 3"#));
         assert!(text.contains(r#"manta_input_malformed_packets_total{source="hpsdr"} 4"#));
@@ -2898,6 +2910,7 @@ mod tests {
         m.set_input_health(
             "hpsdr",
             InputHealth {
+                queue_dropped_samples: 0,
                 dropped_packets: 2,
                 ..Default::default()
             },
@@ -2905,6 +2918,7 @@ mod tests {
         m.set_input_health(
             "hpsdr",
             InputHealth {
+                queue_dropped_samples: 0,
                 dropped_packets: 5,
                 ..Default::default()
             },
@@ -2924,6 +2938,7 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains("# TYPE manta_input_malformed_packets_total counter"));
         assert!(!text.contains("manta_input_malformed_packets_total{"));
+        assert!(!text.contains("manta_input_queue_dropped_samples_total{"));
     }
 
     #[test]
@@ -2935,6 +2950,7 @@ mod tests {
         m.set_input_health(
             "hpsdr",
             InputHealth {
+                queue_dropped_samples: 0,
                 dropped_packets: 1,
                 gaps_detected: 1,
                 malformed_packets: 1,

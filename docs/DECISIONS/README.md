@@ -11,6 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-19 | MAN-307 | [MAN-307: several bands from one HPSDR radio](2026-10-19-man307-hpsdr-multiple-receivers.md) |
 | 2026-10-17 | MAN-114 | [MAN-114: the spot frequency comes from a power-weighted phase estimator](2026-10-17-man114-phase-difference-spot-frequency.md) |
 | 2026-10-17 | MAN-275 | [MAN-275: a hostile or broken KiwiSDR receiver cannot stop the daemon; the plaintext-password exposure is accepted risk](2026-10-17-man275-kiwi-threat-model.md) |
 | 2026-10-17 | MAN-274 | [MAN-274: manta commits a Serena project config for agent symbol search](2026-10-17-man274-serena-project-config.md) |

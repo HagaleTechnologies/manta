@@ -327,6 +327,7 @@ pub fn open_inputs(specs: Vec<InputSpec>, stop: Arc<AtomicBool>) -> Result<Opene
         }
     }
     if let Some(e) = first_error {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
         // Release every thread: dropping its go-sender makes one that
         // finished opening drop its source and exit, so it can be joined.
         // One still inside `open` is detached -- joining it would wait on
