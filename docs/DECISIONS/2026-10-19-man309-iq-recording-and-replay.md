@@ -19,7 +19,9 @@ described on the command line. Operator guide:
   live capture at 192 kS/s outgrows in under two hours, and a WAV header
   cannot hold a non-integer rate, gaps or source guards. JSON Lines streams
   gaps without an in-memory array; the reader validates in one bounded
-  pass (64 KiB line cap) and streams gaps in a second.
+  pass (64 KiB line cap) and streams gaps in a second. A recording may span
+  at most 2^53 samples, stored plus missing, so a hostile gap length
+  cannot overflow the engine's sample clock.
 - **D2 — where it records.** `manta_input::RecordingSource` wraps the final
   source just before `listen_with_observers`, outside reconnect, decimation,
   the dial override and file-replay wrappers, so the file holds exactly the

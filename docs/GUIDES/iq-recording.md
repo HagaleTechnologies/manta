@@ -238,8 +238,9 @@ stored sample 192 000:
 
 Gap positions strictly increase. A reader refuses lines over 64 KiB,
 missing or repeated header or end records, records after the end, unknown
-record types, gaps out of order or past the end, and a payload whose
-length disagrees with `sample_count`. It ignores unknown fields, so later
+record types, gaps out of order or past the end, a recording spanning more
+than 2^53 samples (stored plus missing), and a payload whose length
+disagrees with `sample_count`. It ignores unknown fields, so later
 versions can add some. The metadata is read in a streaming pass, so a
 recording with many gaps needs no more memory than one with none.
 
