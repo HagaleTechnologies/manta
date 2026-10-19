@@ -50,6 +50,11 @@ pub struct Committed {
 }
 
 struct Anchor {
+    /// MAN-191: this snapshot's identity, unique for the decoder's life
+    /// (`HsmmDecoder::next_anchor_id`). `hop` is not one: a gate rise on
+    /// an anchor step pushes the seed anchor and then the merged anchor
+    /// at the same hop (Codex review, PR #292).
+    id: u64,
     hop: u64,
     sample_ts: u64,
     prefix: f64,
@@ -105,7 +110,7 @@ fn silence_key(u: f32) -> i32 {
     speed_bucket(u)
 }
 
-/// MAN-191: a candidate successor, its `Silence` origin `(anchor hop,
+/// MAN-191: a candidate successor, its `Silence` origin `(anchor id,
 /// token index)` when it is a `Silence` successor, and its position in
 /// the step's enumeration order (`token_order`'s final tie-break).
 type Candidate = (Token, Option<(u64, usize)>, u32);
@@ -156,15 +161,17 @@ pub struct HsmmDecoder {
     prev_step: Option<u64>,
     /// MAN-191: hot carry. For each `Silence` merge key (the
     /// successor's `round(2u)`; its node and phase are always `ROOT`/
-    /// `AfterSpace`), the `(origin anchor hop, token index, key)` of the
+    /// `AfterSpace`), the `(origin anchor id, token index, key)` of the
     /// best `Silence` candidate the previous productive anchor step
     /// produced -- whether or not it won its merge key or survived beam
-    /// truncation. Sorted by `(hop, token index)`. At most one entry per
+    /// truncation. Sorted by `(anchor id, token index)`. At most one entry per
     /// key, so it adds at most one evaluation per distinct `round(2u)`
     /// per step against the ~1,300 per step the cadence removes. See
     /// `push`'s MAN-191 comment for why this matches evaluating every
     /// origin every step, up to f32 rounding of near-tied scores.
     hot_silence: Vec<(u64, usize, i32)>,
+    /// MAN-191: the `Anchor::id` the next pushed anchor gets.
+    next_anchor_id: u64,
     /// MAN-191 test instrumentation: every `Silence` evaluation beyond
     /// `reach_norm`, as `(origin anchor hop, token index, d, why, u)` --
     /// the evaluating token's `u` lets the cadence assertions
@@ -196,6 +203,7 @@ impl HsmmDecoder {
             last_ts: 0,
             prev_step: None,
             hot_silence: Vec::new(),
+            next_anchor_id: 0,
             #[cfg(test)]
             silence_trace: Vec::new(),
             #[cfg(test)]
@@ -296,12 +304,7 @@ impl HsmmDecoder {
             let offset = self.live.first().map(|t| t.score).unwrap_or(0.0);
             self.shift_anchor_scores(offset);
             let seeds = self.seed(ev.hop);
-            self.anchors.push_back(Anchor {
-                hop: ev.hop,
-                sample_ts: ev.sample_ts,
-                prefix: ev.prefix,
-                tokens: seeds.clone(),
-            });
+            self.push_anchor(ev, seeds.clone());
             self.live = seeds;
             self.scored_live_len = 0;
         }
@@ -408,10 +411,15 @@ impl HsmmDecoder {
                         if d < (10.0 * tok.u) as u64 {
                             continue;
                         }
+                        // Codex review, PR #292: match on the anchor's id,
+                        // not its hop (a seed anchor and a merged anchor
+                        // can share one), and only a carried entry whose
+                        // key is this pair's own Silence key.
                         hot = self
                             .hot_silence
-                            .binary_search_by(|h| (h.0, h.1).cmp(&(a.hop, ti)))
-                            .ok();
+                            .binary_search_by(|h| (h.0, h.1).cmp(&(a.id, ti)))
+                            .ok()
+                            .filter(|&h| self.hot_silence[h].2 == silence_key(tok.u));
                         let sampled = silence_sampled(d, d_prev, tok.u, reach_norm);
                         #[cfg(test)]
                         let sampled = sampled || self.every_step_silence;
@@ -445,7 +453,7 @@ impl HsmmDecoder {
                         if let Some(h) = hot {
                             hot_produced[h] = true;
                         }
-                        let tag = (seg == SegType::Silence).then_some((a.hop, ti));
+                        let tag = (seg == SegType::Silence).then_some((a.id, ti));
                         cands.push((s, tag, here));
                     }
                 }
@@ -478,7 +486,7 @@ impl HsmmDecoder {
                     ev.hop,
                     a.sample_ts,
                 ) {
-                    cands.push((s, Some((a.hop, ti)), here));
+                    cands.push((s, Some((a.id, ti)), here));
                 }
             }
         }
@@ -500,10 +508,10 @@ impl HsmmDecoder {
         // Hot carry for the next step: each Silence key's best candidate.
         let mut hot: Vec<(u64, usize, i32)> = Vec::new();
         for (t, tag, _) in &cands {
-            if let Some((hop, ti)) = *tag {
+            if let Some((id, ti)) = *tag {
                 let key = merge_key(t).2;
                 if !hot.iter().any(|h| h.2 == key) {
-                    hot.push((hop, ti, key));
+                    hot.push((id, ti, key));
                 }
             }
         }
@@ -560,13 +568,20 @@ impl HsmmDecoder {
         // now runs unconditionally earlier in this function (see the
         // round-21 comment above), which already covers this anchor's
         // eventual retirement on some later hop.
+        self.push_anchor(ev, merged);
+        out
+    }
+
+    /// Append an anchor snapshot at `ev`'s hop with a fresh `Anchor::id`.
+    fn push_anchor(&mut self, ev: &HopEvidence, tokens: Vec<Token>) {
         self.anchors.push_back(Anchor {
+            id: self.next_anchor_id,
             hop: ev.hop,
             sample_ts: ev.sample_ts,
             prefix: ev.prefix,
-            tokens: merged,
+            tokens,
         });
-        out
+        self.next_anchor_id += 1;
     }
 
     /// End of stream: flush any remaining committable history from the best
@@ -876,6 +891,63 @@ mod tests {
         assert!(SegType::Silence.log_dur_prior(138, u, &cfg).is_some());
         assert!(!silence_sampled(130, 122, u, 100));
         assert!(silence_sampled(138, 130, u, 100));
+    }
+
+    #[test]
+    fn hot_carry_names_one_anchor_snapshot_when_two_share_a_hop() {
+        // Codex review, PR #292: a gate rise on an anchor step pushes the
+        // seed anchor and then the merged anchor at the same hop, so
+        // `(hop, token index)` names two snapshots. The scene's every
+        // gate rise is an anchor step; after each push, every carried
+        // pair must name exactly one retained snapshot (or none, once its
+        // anchor ages out) whose token carries the entry's Silence key.
+        let (marks, total) = n_scene();
+        let mut dec = HsmmDecoder::new(HsmmConfig::default());
+        let (mut prefix, mut prev_present, mut prev_llr) = (0.0f64, false, 0.0f32);
+        let (mut shared_hops, mut carried_on_shared) = (0, 0);
+        for hop in 0..total {
+            let present = marks.iter().any(|&(s, l)| hop >= s && hop < s + l);
+            let llr = if present { 10.0 } else { -10.0 };
+            prefix += llr as f64;
+            let anchor = llr != prev_llr || hop.is_multiple_of(8) || present != prev_present;
+            dec.push(&HopEvidence {
+                hop,
+                sample_ts: hop * 512,
+                llr,
+                present,
+                anchor,
+                prefix,
+                amp: if present { 1.0 } else { 0.01 },
+                mark_level: 1.0,
+                noise_level: 0.1,
+            });
+            (prev_present, prev_llr) = (present, llr);
+            if dec.anchors.len() >= 2 {
+                let n = dec.anchors.len();
+                if dec.anchors[n - 1].hop == dec.anchors[n - 2].hop {
+                    shared_hops += 1;
+                    assert_ne!(dec.anchors[n - 1].id, dec.anchors[n - 2].id);
+                }
+            }
+            for &(id, ti, key) in &dec.hot_silence {
+                let named: Vec<&Anchor> = dec.anchors.iter().filter(|a| a.id == id).collect();
+                assert!(
+                    named.len() <= 1,
+                    "hop {hop}: id {id} names {} anchors",
+                    named.len()
+                );
+                if let Some(a) = named.first() {
+                    assert_eq!(silence_key(a.tokens[ti].u), key, "hop {hop}");
+                    if dec.anchors.iter().filter(|b| b.hop == a.hop).count() > 1 {
+                        carried_on_shared += 1;
+                    }
+                }
+            }
+        }
+        // The scene really exercises the collision: anchors share a hop,
+        // and carried pairs originate at such hops.
+        assert!(shared_hops > 0, "no gate rise landed on an anchor step");
+        assert!(carried_on_shared > 0, "no carried pair sat on a shared hop");
     }
 
     #[test]
