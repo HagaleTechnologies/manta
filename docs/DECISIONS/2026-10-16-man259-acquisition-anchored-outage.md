@@ -50,17 +50,19 @@ backoff (96 000 samples).
    `(source, Instant)` was rejected: the signal is read off the returned
    source, like `health_counters` and the sample-rate, centre and passband
    checks already are.
-2. **The outage ends at the reopen's start plus that offset.**
-   `ReconnectingSource::read` takes `env.now()` when it calls the opener,
-   after the backoff sleep (the sleep is real outage). When it installs
-   the reopened source it computes the anchor as that instant plus the
-   offset, clamped to the install instant so no driver can end the
-   outage in the future. The first productive read uses this anchor
-   instead of its own start. The anchor is never later than that read's
-   start, so PR #207 round 3's rule (the first read's capture time is not
-   outage) still holds. Handshake time before the trigger (Kiwi's
-   WebSocket handshake and `sample_rate` wait, HPSDR's C&C burst,
-   ka9q-radio's group resolve) stays in the outage.
+2. **The outage ends at the reopen worker's entry into the opener, plus
+    that offset.** The reopen worker timestamps its own entry into the
+    open call (`ReconnectEnv::clock()`, a `Send` read on the injected
+    clock) and sends that base back with its result, after the backoff
+    sleep (the sleep is real outage). When it installs the reopened
+    source it computes the anchor as that base plus the offset, clamped
+    to the install instant so no driver can end the
+    outage in the future. The first productive read uses this anchor
+    instead of its own start. The anchor is never later than that read's
+    start, so PR #207 round 3's rule (the first read's capture time is not
+    outage) still holds. Handshake time before the trigger (Kiwi's
+    WebSocket handshake and `sample_rate` wait, HPSDR's C&C burst,
+    ka9q-radio's group resolve) stays in the outage.
 3. **Wrappers forward it.** `DecimatingSource` and `manta-cli`'s
    `FixedCenterFreqSource` sit between the driver and
    `ReconnectingSource` inside the opener, and both forward
@@ -85,6 +87,24 @@ backoff (96 000 samples).
    one-second tolerance (at 768 kS/s, >= 0.85 s). At the project's
    reference 192 kS/s the stash holds the whole window and the join and
    first-retained anchors coincide.
+5. **The PR review round tightened the anchor's edges** (PR #342). Four
+   second-order gaps, each dropping signal-silent time from the outage
+   and so stamping later spots early: the base instant moved from the
+   reading thread's spawn-side sample into the worker itself (decision 2
+   above), so the OS's scheduling delay for the `reopen-<kind>` thread
+   stays counted; KiwiSDR sends `SET ident_user` before sampling its
+   offset, immediately before the SET loop whose first command is the
+   `SET mod=iq` trigger, so a blocking `ident_user` send on a slow or
+   backpressured connection stays outage; ka9q-radio's fallback anchor is
+   the data socket's first landed group membership rather than an
+   instant taken before the socket even existed, so socket setup and the
+   interface attempts stay outage; and its retained-packet anchor
+   accepts only a packet the replay would accept
+   (`packet_yields_samples` applies `accept_rtp`'s own checks: SSRC,
+   RTP payload type, at least one decodable IQ sample), so a packet with
+   an empty or undecodable payload or a foreign payload type -- which
+   `read` never returns -- cannot end the outage before the first
+   replayable sample.
 
 ## Residual
 
@@ -134,3 +154,14 @@ documented gap); this record only re-anchors the outage around it.
   pattern; their test harnesses cannot reach a real start trigger, so
   only the build and their existing suites cover them. SoapySDR cannot be
   built here (no `libsoapysdr`); CI's soapy leg compiles and tests it.
+- Review round (PR #342):
+  `discontinuity_includes_the_delay_before_the_reopen_worker_enters_the_opener`
+  (a worker 500 ms late to enter the opener keeps that delay in the gap;
+  with the base restored to the spawn-side sample it failed with 96 000
+  vs 144 000 samples) and
+  `acquisition_start_offset_skips_packets_that_cannot_yield_samples`
+  (empty-payload RTP with the right SSRC cannot anchor; the SSRC-only
+  predicate anchored at the first empty packet, 150 ms into the open).
+  The KiwiSDR and ka9q join-instant changes are structural -- no harness
+  can make a `SET` send block or delay a socket's creation -- and are
+  covered by the build and the suites above.
