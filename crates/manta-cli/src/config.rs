@@ -2221,6 +2221,24 @@ mod tests {
     }
 
     #[test]
+    fn digital_window_env_overrides_the_file() {
+        for (file, env, expected) in [("true", "false", false), ("false", "true", true)] {
+            let loaded = load_env(
+                Some(&format!("[detector]\ndigital_window_filter = {file}\n")),
+                &[("MANTA_DETECTOR_DIGITAL_WINDOW_FILTER", env)],
+            )
+            .unwrap();
+            assert_eq!(
+                loaded.detector,
+                DetectorConfig {
+                    digital_window_filter: expected,
+                    ..DetectorConfig::default()
+                }
+            );
+        }
+    }
+
+    #[test]
     fn env_non_cw_filter_overrides_the_file() {
         let loaded = load_env(
             Some("[detector]\nnon_cw_filter = true\nunkeyed_close_ms = 20000\n"),
