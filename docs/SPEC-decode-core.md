@@ -727,6 +727,10 @@ Constants (compile-time; `COMOD_*` in `manta-dsp::comod`, the rest in
 | `ISO_DB` | 6.0 | flat-neighbourhood threshold |
 | `ISO_MIN_FRACTION` | 0.5 | smallest qualifying non-flat fraction |
 | `MAX_UNQUALIFIED_BACKLOG` | 7500 | most queued demod inputs an unqualified track keeps (20 s) |
+| `SHORT_MIN_MARKS` | 3 | D′: fewest debounced keyed marks in the queued input |
+| `SHORT_MARK_DEBOUNCE_HOPS` | 4 | D′: key-down/key-up run debounce for a keyed mark |
+| `SHORT_HYST_FRAC` | 0.15 | D′: keyed-marks hysteresis half-band, fraction of the Q10–Q90 gap |
+| `SHORT_MIN_KEYING_RATIO` | 2.0 | D′: Q90/Q10 ratio the queued input must show at all |
 
 **A. Lazy lease.** At CANDIDATE → ACTIVE the track records its promotion
 hop, `sample_ts` and `freq_hz`, queues the promotion burst, and from then
@@ -749,6 +753,9 @@ cannot decode a character; `NotCw` (D) bounds its life instead.
 - `cycles += 1` on each HANG → ACTIVE whose preceding ACTIVE run lasted
   ≤ `MAX_MARK_HOPS`.
 - `active_hops` += 1 on each ACTIVE hop; reset to 0 at each evaluation.
+- `dropped_since_eval` (MAN-271) is set on each ACTIVE → HANG and cleared
+  at each evaluation, so D′ can fire only at the first evaluation after a
+  drop.
 - A **key-down hop** is one with `PdB[k] − F_eff[k] ≥ on_snr_db`, `k` the
   track's selected channel (§2.5). On it, until the track qualifies:
   - **Slope:** accumulate `n, Σt, Σf, Σt², Σtf` in `f64`, with
@@ -810,6 +817,54 @@ A track not qualified `unkeyed_close_hops` after its promotion closes
 `CloseReason::NotCw` (`ClosureKind::Bookkeeping`, `CloseCounts::not_cw`).
 It has no decoder, so it emits nothing. Its channels get the MAN-171
 respawn cooldown.
+
+**D′. Short-transmission qualification** (MAN-271,
+docs/DECISIONS/2026-10-16-man271-short-transmission-decode.md). A second
+way to qualify, checked at the same evaluations as D. A single short
+transmission — one 2-character exchange at contest speed — can never show
+`cycles ≥ 1` (its whole message is one ACTIVE run bridged by the gate's
+40 ms EMA, and it never re-rises) nor span `KEYDOWN_SPAN_MIN_HOPS`. At the
+first evaluation after an ACTIVE → HANG drop, a promoted, unqualified
+track qualifies when all hold:
+
+- the track's state is HANG and it dropped ACTIVE → HANG since the
+  previous evaluation (`dropped_since_eval`);
+- `active_run ≤ MAX_MARK_HOPS` (the drop ends one mark, not a carrier);
+- `!in_span(k)` and `!comodulated_with_span(k)`, exactly as D;
+- key-down hops `n ≥ SLOPE_MIN_SAMPLES`;
+- `|slope| ≤ MAX_SWEEP_HZ_PER_S · (KEYDOWN_SPAN_MIN_HOPS / max(t_last,
+  1))^1.5` when `t_last < KEYDOWN_SPAN_MIN_HOPS`, else
+  `MAX_SWEEP_HZ_PER_S`: a least-squares slope's standard error over
+  evenly keyed samples grows as span^−1.5, so the short-span tolerance
+  scales to keep the 150-hop reference span's noise margin;
+- non-flat fraction ≥ `ISO_MIN_FRACTION`, exactly as D;
+- **keyed marks ≥ `SHORT_MIN_MARKS`**, counted from the track's queued
+  input (§2.8 A's `pending` amplitudes — never drained before
+  qualification, so the count is deterministic and chunk-size invariant):
+
+  1. Rails: nearest-rank Q90 and Q10 over the queued amplitudes (Q10
+     floored at 1e-12; `f32::total_cmp` selection). No mark at all is
+     counted when `Q90 < SHORT_MIN_KEYING_RATIO · Q10` — flat input is
+     unkeyed.
+  2. Threshold `mid = (Q90 + Q10)/2` with hysteresis
+     `±SHORT_HYST_FRAC · (Q90 − Q10)`: while key-down, go key-up below
+     `mid − half`; while key-up, go key-down above `mid + half`.
+  3. A key-down (or key-up) run counts once it reaches
+     `SHORT_MARK_DEBOUNCE_HOPS` hops; a key-up run shorter than that is a
+     dip inside a mark, not a gap between two marks. These are Demod's
+     own §3.2/§3.3 shapes, so "a mark" means what the leased decoder will
+     see.
+
+  A swept carrier crossing one channel is a single smooth bump and counts
+  one mark; a real short CW message counts its dits and dahs. This is the
+  measured discriminator that lets D′ waive `cycles` and `t_last` safely.
+  The count is computed only at an evaluation where the track is in HANG
+  with `dropped_since_eval` set — one quantile selection over the bounded
+  queue per drop, nowhere else.
+
+Qualification through D′ leases the decoder, replays the queue and emits
+the deferred `TrackPromoted` exactly as D does. A track still unqualified
+at end of input is dropped with no events, unchanged.
 
 **E. Spawn veto.** A spawn decision at `k`, and the same-hop `k+1`
 pairing (§2.5), is vetoed while `in_span(k)`, next to the RTTY veto
@@ -992,6 +1047,21 @@ Special case: an all-dah opening (plausible for `CQ` at the margin) corrects
 itself via the constraint clamp below the first time a real dit arrives —
 the dit falls far below `μ_dit`, gets assigned to the dit cluster, drags it
 down, and the clamp re-anchors `μ_dah`.
+
+**[DEVIATION] (MAN-271)** — at a **genuine end-of-signal** `finish()`
+(stream EOF, or a HangExpired/Silent closure, where a sustained real
+on-air gap has been observed), a tracker that saw **2–4 marks**
+initializes from them with exactly the split rule above, and the runs
+buffered while the quorum was unfilled replay through the ordinary
+pipeline; the trailing truncated space teaches the sender timing nothing
+(same rule as `finish`'s MAN-315 truncation handling). Without this, a
+short single transmission (2-character text at 34–39 WPM, whose leading
+element is consumed before the decoder exists) ends with zero decoded
+characters. `finish_speed_only` — the bookkeeping close path
+(Merged/Evicted) — never bootstraps: fabricating characters there was the
+PR #154 defect. One mark carries no ratio to split and bootstraps
+nothing; `Hsmm`, which never feeds `SpeedTracker`, is unaffected. See
+docs/DECISIONS/2026-10-16-man271-short-transmission-decode.md.
 
 **Update** — per mark of duration `d`: assign to the nearer cluster in log
 space (i.e. `dit` iff `d < B`), then EMA the assigned centroid:
