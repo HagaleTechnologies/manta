@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "recordings": [
+    {
+      "file": "B2_20251129_000000_7080kHz.source.wav",
+      "kind": "iq",
+      "sha256": "74eba71e00fede9cab8067f9ff5a043396066015bbf8c23232788279b9f1c5f2",
+      "sample_rate_hz": 192000,
+      "bits_per_sample": 24,
+      "center_freq_hz": 7080000,
+      "capture_start": "2025-11-29T00:00:00Z",
+      "truth": { "kind": "rbn", "path": "ground-truth/B2_20251129_000000_7080kHz.rbn.csv", "spotter": "K5TR" },
+      "floors": { "min_spots": 50, "min_precision": 0.20, "min_recall": 0.02 }
+    },
+    {
+      "file": "wpx_cw_iq_96khz.wav",
+      "kind": "iq",
+      "sha256": null,
+      "sample_rate_hz": 96000,
+      "bits_per_sample": 24,
+      "center_freq_hz": null,
+      "floors": { "min_spots": 10 }
+    },
+    {
+      "file": "vp8geo_cw_48khz.wav",
+      "kind": "audio",
+      "sha256": null,
+      "sample_rate_hz": 48000
+    }
+  ]
+}
