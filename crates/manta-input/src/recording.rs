@@ -490,11 +490,13 @@ mod tests {
     }
 
     /// A sink that waits for `gate` before its first write, then fails or
-    /// counts bytes.
+    /// counts (and keeps) bytes; `fail_flush` fails every flush instead.
     struct Sink {
         gate: Option<std::sync::mpsc::Receiver<()>>,
         fail: bool,
+        fail_flush: bool,
         bytes: Arc<AtomicUsize>,
+        kept: Arc<Mutex<Vec<u8>>>,
     }
 
     impl Write for Sink {
@@ -506,23 +508,70 @@ mod tests {
                 return Err(std::io::Error::other("disk on fire"));
             }
             self.bytes.fetch_add(buf.len(), Ordering::Relaxed);
+            self.kept.lock().unwrap().extend_from_slice(buf);
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                return Err(std::io::Error::other("flush lost"));
+            }
             Ok(())
         }
     }
 
     fn sink(gate: Option<std::sync::mpsc::Receiver<()>>, fail: bool) -> (Sink, Arc<AtomicUsize>) {
+        let (sink, bytes, _) = kept_sink(gate, fail, false);
+        (sink, bytes)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn kept_sink(
+        gate: Option<std::sync::mpsc::Receiver<()>>,
+        fail: bool,
+        fail_flush: bool,
+    ) -> (Sink, Arc<AtomicUsize>, Arc<Mutex<Vec<u8>>>) {
         let bytes = Arc::new(AtomicUsize::new(0));
+        let kept = Arc::new(Mutex::new(Vec::new()));
         (
             Sink {
                 gate,
                 fail,
+                fail_flush,
                 bytes: bytes.clone(),
+                kept: kept.clone(),
             },
             bytes,
+            kept,
         )
+    }
+
+    /// Endless constant source whose read number `gap_after` (1-based) is
+    /// followed by a `missing`-sample discontinuity.
+    struct GapOnce {
+        reads: usize,
+        gap_after: usize,
+        missing: u64,
+        pending: Option<u64>,
+    }
+
+    impl IqSource for GapOnce {
+        fn sample_rate(&self) -> f64 {
+            48_000.0
+        }
+        fn center_freq_hz(&self) -> f64 {
+            0.0
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            buf.fill(Complex32::new(0.25, -0.25));
+            self.reads += 1;
+            if self.reads == self.gap_after {
+                self.pending = Some(self.missing);
+            }
+            Ok(buf.len())
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            self.pending.take()
+        }
     }
 
     struct Notices(Arc<Mutex<Vec<String>>>);
@@ -670,5 +719,83 @@ mod tests {
         }
         assert!(!published.load(Ordering::Acquire));
         assert!(notices.get().is_empty());
+    }
+
+    #[test]
+    fn a_flush_failure_is_a_failed_recording() {
+        for flush_payload in [true, false] {
+            let (payload, _, _) = kept_sink(None, false, flush_payload);
+            let (meta, _, _) = kept_sink(None, false, !flush_payload);
+            let published = Arc::new(AtomicBool::new(false));
+            let (notices, notice) = Notices::new();
+            let (mut rec, handle) = start(payload, meta, published.clone(), notice);
+            let mut buf = vec![Complex32::new(0.0, 0.0); 5000];
+            for _ in 0..10 {
+                assert_eq!(rec.read(&mut buf).unwrap(), 5000);
+            }
+            drop(rec);
+            match handle.finish(Duration::from_secs(10)) {
+                RecordingOutcome::Failed(msg) => {
+                    assert!(msg.contains("flush lost"), "{msg}");
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(notices.get().len(), 1, "{:?}", notices.get());
+            assert!(!published.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn a_gap_refused_by_a_full_queue_describes_no_unrecorded_samples() {
+        let (release, gate) = std::sync::mpsc::channel();
+        let (payload, payload_bytes, _) = kept_sink(None, false, false);
+        // The metadata header write holds the writer before any block.
+        let (meta, _, meta_kept) = kept_sink(Some(gate), false, false);
+        let published = Arc::new(AtomicBool::new(false));
+        let (notices, notice) = Notices::new();
+        let src = GapOnce {
+            reads: 0,
+            gap_after: 2,
+            missing: 1000,
+            pending: None,
+        };
+        let header = RecordingHeader::for_source(&src, std::time::UNIX_EPOCH);
+        let (mut rec, handle) = start_with_sinks(
+            Box::new(src),
+            Path::new("gap.cf32"),
+            header,
+            Box::new(payload),
+            Box::new(meta),
+            Box::new(move || {
+                published.store(true, Ordering::Release);
+                Ok(())
+            }),
+            Some(notice),
+        );
+        // Read 1 fills the queue exactly; read 2 carries the gap and is
+        // refused, so the recording ends before it.
+        let mut full = vec![Complex32::new(0.0, 0.0); QUEUE_BLOCKS * RECORDING_BLOCK_FRAMES];
+        assert_eq!(rec.read(&mut full).unwrap(), full.len());
+        assert_eq!(rec.take_discontinuity(), None);
+        let mut one = vec![Complex32::new(0.0, 0.0); RECORDING_BLOCK_FRAMES];
+        assert_eq!(rec.read(&mut one).unwrap(), one.len());
+        // The engine still sees the gap.
+        assert_eq!(rec.take_discontinuity(), Some(1000));
+        assert_eq!(notices.get().len(), 1, "{:?}", notices.get());
+        release.send(()).unwrap();
+        drop(rec);
+        match handle.finish(Duration::from_secs(10)) {
+            RecordingOutcome::Finished {
+                samples, reason, ..
+            } => {
+                assert_eq!(reason, EndReason::Backpressure);
+                assert_eq!(samples, (QUEUE_BLOCKS * RECORDING_BLOCK_FRAMES) as u64);
+                assert_eq!(payload_bytes.load(Ordering::Relaxed), samples as usize * 8);
+            }
+            other => panic!("{other:?}"),
+        }
+        let meta = String::from_utf8(meta_kept.lock().unwrap().clone()).unwrap();
+        assert!(!meta.contains("\"gap\""), "{meta}");
+        assert!(meta.contains("\"backpressure\""), "{meta}");
     }
 }

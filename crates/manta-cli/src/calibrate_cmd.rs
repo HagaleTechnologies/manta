@@ -439,6 +439,10 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
             name: args.input.as_deref(),
         },
     )?;
+    // MAN-309: only `run` records; say so rather than ignore it silently.
+    if let Some(note) = crate::record_iq_ignored_note("calibrate", &loaded) {
+        crate::logging::note(&note);
+    }
     let opts = CalibrateOptions {
         duration,
         search_ppm: args.search_ppm,

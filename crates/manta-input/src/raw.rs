@@ -143,11 +143,6 @@ impl RawIqSource {
             bytes: Vec::new(),
         })
     }
-
-    /// The stored sample layout.
-    pub fn format(&self) -> RawIqFormat {
-        self.format
-    }
 }
 
 impl IqSource for RawIqSource {

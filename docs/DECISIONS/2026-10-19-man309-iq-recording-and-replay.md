@@ -34,16 +34,18 @@ described on the command line. Operator guide:
   full queue stops the recording at the last accepted block
   (`reason: backpressure`); a write, flush or publication error stops it
   and leaves the `.partial` metadata. Either warns once, decoding
-  continues, and `run` exits 1 at the end. Shutdown waits at most 5 s; a
-  timeout cancels publication if it has not begun.
+  continues, and `run` exits 1 at the end. Shutdown waits at most 5 s in
+  total, one deadline shared by every recording input, before the client
+  drain (`TimeoutStopSec=60` covers 5 + 50 + 2 s); a timeout cancels
+  publication if it has not begun.
 - **D3a — configuration.** `record_iq` is a shared `[input]` key (and
   `MANTA_INPUT_RECORD_IQ`), resolved against the config file's directory
   like `path` (the input path resolver now takes the key name). Each
   `[[input]]` records independently through `multi_run`'s opener; its
   handle lives beside the engine's source and is finished after
   `listen_inputs` returns. `--record-iq` overrides the single form and is
-  refused with several inputs; duplicate destinations are refused at
-  startup. `config check` reports it and creates nothing.
+  refused with several inputs; duplicate destinations, however spelled,
+  are refused at startup. `config check` reports it and creates nothing.
 - **D4 — never overwrite.** Payload and partial metadata are created with
   `create_new`, after a startup check that fails `run` with exit 1 before
   any input or listener opens. Publication hard-links the partial file to
@@ -53,8 +55,9 @@ described on the command line. Operator guide:
   passband and guards; an explicit format or rate must match its
   metadata; a centre override moves only the RF origin. Under `run`, the
   server epoch is `--replay-epoch` > recorded start > file mtime, and the
-  session nonce continues the payload's FNV-1a hash over the metadata
-  bytes; a plain file's nonce is unchanged.
+  session nonce continues the payload's FNV-1a hash over the metadata's
+  canonical header and gap records and its sample count (not the end
+  reason or the file's formatting); a plain file's nonce is unchanged.
 - **D6 — gaps.** `run --source` replays recorded gaps through
   `take_discontinuity`, so `listen` closes and re-opens segments exactly as
   it did live. `PacedSource` counts a gap's samples once in its pacing
@@ -84,7 +87,8 @@ described on the command line. Operator guide:
   centre is `center_freq_hz` or `--dial-freq-hz`, checked once merged, and
   the flags override them. `soak`, `doctor` and `check` open a configured
   file through the same `LiveSourceSpec::open` as `run`, so they read
-  recordings and headerless files alike; `oracle` reads a gap-free
+  recordings and headerless files alike, and with `calibrate` they note
+  that they ignore `record_iq`; `oracle` reads a gap-free
   recording through `open_iq_file` and refuses a gapped one (it decodes one
   continuous capture). `bench` reads no file.
 
@@ -129,4 +133,14 @@ described on the command line. Operator guide:
   recording is identical on three runs and differs from its gap-free twin;
   a config-described headerless file runs like the flags; `oracle` reads a
   gap-free recording like its WAV and refuses a gapped one.
+- Second round: a flush failure and a gap refused by a full queue (no gap
+  record describes unrecorded samples); a gap inside `listen`'s
+  calibration window, recording on and off; a copied pair with a moved
+  mtime keeps its epoch and nonce, and replays identically with the spot
+  servers up; `record_iq` precedence (CLI > environment > file, CLI and
+  environment paths from the working directory); ci16 through `run`
+  equals its PCM16 WAV; two recordings replay as a two-input daemon to
+  the same bytes three times; a same-rate request on a gapped recording
+  and decimation of a gap-free one still work; recording onto the
+  replayed file and two spellings of one destination are refused.
 - No golden vector or legacy WAV output changes.

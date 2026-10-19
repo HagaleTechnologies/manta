@@ -1982,19 +1982,34 @@ fn check_record_destination(path: &Path) -> Result<()> {
 /// MAN-309: each `[[input]]`'s `record_iq` passes `check_record_destination`
 /// and no two inputs record to the same file.
 fn check_record_destinations(inputs: &[ResolvedInput]) -> Result<()> {
-    let mut seen: Vec<&Path> = Vec::new();
+    let mut seen: Vec<PathBuf> = Vec::new();
     for input in inputs {
         let Some(path) = input.record_iq.as_deref() else {
             continue;
         };
-        if seen.contains(&path) {
+        check_record_destination(path)?;
+        // The directory exists (checked above), so its canonical form
+        // catches two spellings of one destination (`a/../x`, a symlinked
+        // directory).
+        let canonical = match (path.parent(), path.file_name()) {
+            (Some(dir), Some(name)) => {
+                let dir = if dir.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    dir
+                };
+                dir.canonicalize()
+                    .map_or_else(|_| path.to_path_buf(), |d| d.join(name))
+            }
+            _ => path.to_path_buf(),
+        };
+        if seen.contains(&canonical) {
             bail!(
                 "two [[input]] entries record to {}; give each its own record_iq",
                 path.display()
             );
         }
-        check_record_destination(path)?;
-        seen.push(path);
+        seen.push(canonical);
     }
     Ok(())
 }
@@ -2022,15 +2037,38 @@ fn start_input_recording(
     Ok((Box::new(rec.with_stop_flag(stop)), handle))
 }
 
-/// MAN-309: how long `run` waits for a recording to finalize at shutdown.
+/// MAN-309: how long `run` waits, in total, for its recordings to finalize
+/// at shutdown. The wait comes before the client drain, so the service
+/// manager's stop budget (`TimeoutStopSec=60` against the 50 s
+/// `SHUTDOWN_DRAIN_DEADLINE` plus 2 s of runtime shutdown) still covers it.
 const RECORDING_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// MAN-309: finalizes `run`'s recording and logs the outcome; `Err` when the
-/// recording did not complete, which `run` turns into its exit status after
-/// the drain.
-fn finish_recording(handle: manta_input::RecordingHandle) -> Result<()> {
+/// MAN-309: finalizes every recording of `run` within one shared
+/// `RECORDING_FINISH_TIMEOUT`, however many inputs record, and logs each
+/// outcome. `Err` (the first failure) when any recording did not complete,
+/// which `run` turns into its exit status after the drain; one failing
+/// recording does not stop the others from finishing.
+fn finish_recordings(
+    handles: impl IntoIterator<Item = manta_input::RecordingHandle>,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + RECORDING_FINISH_TIMEOUT;
+    let mut result = Ok(());
+    for handle in handles {
+        let finished = finish_recording(handle, deadline);
+        if result.is_ok() {
+            result = finished;
+        }
+    }
+    result
+}
+
+/// MAN-309: finalizes one recording, waiting no later than `deadline`.
+fn finish_recording(
+    handle: manta_input::RecordingHandle,
+    deadline: std::time::Instant,
+) -> Result<()> {
     let recorded = handle.path().to_path_buf();
-    match handle.finish(RECORDING_FINISH_TIMEOUT) {
+    match handle.finish(deadline.saturating_duration_since(std::time::Instant::now())) {
         manta_input::RecordingOutcome::Finished {
             path,
             samples,
@@ -2055,12 +2093,15 @@ fn finish_recording(handle: manta_input::RecordingHandle) -> Result<()> {
             recorded.display()
         )),
         manta_input::RecordingOutcome::TimedOut(path) => {
-            let msg = format!(
-                "IQ recording finalization timed out: {}; completion is unconfirmed",
+            logging::warning(&format!(
+                "warning: IQ recording finalization timed out: {}; completion is unconfirmed",
                 path.display()
-            );
-            logging::warning(&format!("warning: {msg}"));
-            Err(anyhow!(msg))
+            ));
+            Err(anyhow!(
+                "IQ recording {} is unconfirmed: it did not finalize in time (see the warning \
+                 above)",
+                path.display()
+            ))
         }
     }
 }
@@ -2251,9 +2292,48 @@ fn session_nonce_for_replay_path(path: &std::path::Path) -> Result<u128> {
     // MAN-309: a manta IQ recording's metadata (start, gaps, guards) is part
     // of the recording, so it continues the same hash. Its name is not.
     if manta_input::is_native_recording(path) {
-        hash = fnv1a_file(hash, &manta_input::metadata_path(path))?;
+        hash = fnv1a_recording_metadata(hash, path)?;
     }
     Ok(hash as u128)
+}
+
+/// MAN-309: continues `hash` over the replay-relevant content of `payload`'s
+/// metadata: the header and every gap, each re-serialized canonically, and
+/// the stored sample count. The end reason (`eof`, `stopped`,
+/// `backpressure`) says how the capture ended, not what it replays, so it
+/// is left out, as is the formatting of the file itself.
+fn fnv1a_recording_metadata(mut hash: u64, payload: &std::path::Path) -> Result<u64> {
+    use std::io::BufRead;
+
+    // Validates every line (and bounds its length) before the pass below.
+    manta_input::read_recording_summary(payload)?;
+    let meta = manta_input::metadata_path(payload);
+    let file = std::fs::File::open(&meta)
+        .with_context(|| format!("opening {} to derive its replay identity", meta.display()))?;
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line
+            .with_context(|| format!("reading {} to derive its replay identity", meta.display()))?;
+        let record: manta_input::recording_format::MetadataRecord =
+            serde_json::from_str(&line).with_context(|| format!("parsing {}", meta.display()))?;
+        let canonical = match record {
+            manta_input::recording_format::MetadataRecord::End { sample_count, .. } => {
+                format!("end {sample_count}\n")
+            }
+            other => other.to_line(),
+        };
+        hash = fnv1a_bytes(hash, canonical.as_bytes());
+    }
+    Ok(hash)
+}
+
+/// FNV-1a-64 over `bytes`, continuing from `hash`.
+fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 /// FNV-1a-64 over `path`'s bytes, continuing from `hash`.
@@ -2262,7 +2342,6 @@ fn fnv1a_file(mut hash: u64, path: &std::path::Path) -> Result<u64> {
 
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("opening {} to derive its replay identity", path.display()))?;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = file
@@ -2271,10 +2350,7 @@ fn fnv1a_file(mut hash: u64, path: &std::path::Path) -> Result<u64> {
         if n == 0 {
             break;
         }
-        for &byte in &buf[..n] {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(PRIME);
-        }
+        hash = fnv1a_bytes(hash, &buf[..n]);
     }
     Ok(hash)
 }
@@ -6885,7 +6961,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             stop_ready.store(true, std::sync::atomic::Ordering::Relaxed);
             // MAN-309: the source is gone, so the queue is closed; finalize
             // the recording before the drain, within its own deadline.
-            let recording_result = recording.map_or(Ok(()), finish_recording);
+            let recording_result = finish_recordings(recording);
             // MAN-234: the run's total, only when it grew past the count
             // the first-sample line reported (success and error alike).
             let bad_total = bad_samples.load(std::sync::atomic::Ordering::Relaxed);
@@ -9556,6 +9632,55 @@ mod tests {
             u128::from(fnv1a_file(0xcbf29ce484222325, &plain).unwrap())
         );
         assert_ne!(session_nonce_for_replay_path(&plain).unwrap(), nonce);
+    }
+
+    /// MAN-309: copying a recording pair and touching its mtime keeps the
+    /// server's epoch and spot identity; how the capture ended (the end
+    /// reason) and the metadata's formatting are not part of the identity.
+    #[test]
+    fn a_copied_recording_with_a_new_mtime_keeps_its_epoch_and_nonce() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = native_pair(dir.path(), "a.cf32", 1_792_407_600, 7);
+        let copy = dir.path().join("copy.cf32");
+        std::fs::copy(&a, &copy).unwrap();
+        std::fs::copy(
+            manta_input::metadata_path(&a),
+            manta_input::metadata_path(&copy),
+        )
+        .unwrap();
+        let touched = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        for p in [copy.clone(), manta_input::metadata_path(&copy)] {
+            std::fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(touched)
+                .unwrap();
+        }
+        assert_eq!(
+            std::fs::metadata(&copy).unwrap().modified().unwrap(),
+            touched
+        );
+        assert_eq!(
+            resolve_epoch(Some(&copy), None).unwrap(),
+            resolve_epoch(Some(&a), None).unwrap()
+        );
+        let nonce = session_nonce_for_replay_path(&a).unwrap();
+        assert_eq!(session_nonce_for_replay_path(&copy).unwrap(), nonce);
+
+        // Same samples, start and gaps, but ended `eof` and written with
+        // the keys spaced out: the same recording.
+        let meta = manta_input::metadata_path(&copy);
+        let text = std::fs::read_to_string(&meta)
+            .unwrap()
+            .replace("\"stopped\"", "\"eof\"")
+            .replace("\":", "\": ");
+        std::fs::write(&meta, text).unwrap();
+        assert_eq!(
+            manta_input::read_recording_summary(&copy).unwrap().reason,
+            manta_input::EndReason::Eof
+        );
+        assert_eq!(session_nonce_for_replay_path(&copy).unwrap(), nonce);
     }
 
     #[test]

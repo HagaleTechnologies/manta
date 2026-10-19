@@ -737,18 +737,13 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     drain_gate.close();
     stop_ready.store(true, Ordering::Relaxed);
     // MAN-309: every input has ended, so every queue is closed; finalize
-    // each recording (one failing does not stop the others).
+    // every recording within one shared deadline (one failing does not stop
+    // the others).
     let handles: Vec<_> = recordings
         .lock()
         .map(|mut slots| slots.iter_mut().filter_map(Option::take).collect())
         .unwrap_or_default();
-    let mut recording_result = Ok(());
-    for handle in handles {
-        let finished = crate::finish_recording(handle);
-        if recording_result.is_ok() {
-            recording_result = finished;
-        }
-    }
+    let recording_result = crate::finish_recordings(handles);
     if print_text {
         for line in text.finish() {
             if logging::is_json() {

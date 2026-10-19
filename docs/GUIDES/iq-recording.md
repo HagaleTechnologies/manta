@@ -72,11 +72,12 @@ A relative `record_iq` in a config file is relative to that file's
 directory; from `--record-iq` or `MANTA_INPUT_RECORD_IQ` it is relative to
 the working directory. The precedence is the usual command line >
 environment > file. `manta config check` shows the resolved path and
-creates nothing.
+creates nothing. Only `run` records: `check`, `calibrate`, `soak` and
+`doctor` print a note that they ignore `record_iq`.
 
 With several receivers, put `record_iq` in each `[[input]]` entry that
-should be recorded, each with its own file; two entries cannot share one,
-and `--record-iq` (one file) is refused. Each recording replays on its own
+should be recorded, each with its own file; two entries cannot share one
+(however the path is spelled), and `--record-iq` (one file) is refused. Each recording replays on its own
 at its own start time; replaying several together uses the first input's
 start time, as any multi-file replay does (MAN-13), not the original
 staggered start of each receiver.
@@ -113,8 +114,10 @@ recording is finalized with `"reason":"backpressure"` and replays as the
 contiguous part it holds. A failed write leaves the `.partial` metadata,
 which replay refuses.
 
-At shutdown, `run` waits at most 5 s for the writer to finish. If it does
-not:
+At shutdown, `run` waits at most 5 s in total for its recordings to
+finish, however many inputs record, before it drains its clients. The
+systemd unit's `TimeoutStopSec=60` covers that wait, the 50 s client
+drain and the runtime shutdown. If a recording does not finish in time:
 
 ```text
 warning: IQ recording finalization timed out: session.cf32; completion is unconfirmed
@@ -143,8 +146,9 @@ differently, so their outputs are not compared with each other.
 Under `run --config` with a `[server]` table, spot timestamps start at
 the recorded start time, not the file's modification time, so a copied
 pair keeps its timestamps. `--replay-epoch` still overrides it. The spot
-ids' session nonce covers the samples and the metadata, not the file's
-name.
+ids' session nonce covers the samples and the metadata's header, gaps
+and sample count, not the file's name, how the capture ended (`reason`)
+or how the metadata lines are formatted.
 
 A recording whose metadata is missing, partial or malformed is refused:
 

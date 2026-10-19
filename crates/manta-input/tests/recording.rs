@@ -274,6 +274,86 @@ fn two_recorders_racing_for_one_destination_get_one_winner() {
     ));
 }
 
+/// Eight recorders started at once on one destination: exactly one wins,
+/// every other fails as an existing destination, and the winner's pair is
+/// complete.
+#[test]
+fn concurrent_recorders_for_one_destination_get_one_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("race.cf32");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let results: Vec<std::result::Result<RecordingOutcome, String>> = std::thread::scope(|s| {
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let path = &path;
+                s.spawn(move || {
+                    barrier.wait();
+                    match start_recording(
+                        Box::new(Scripted::new(vec![(None, block(0, 10))])),
+                        path,
+                        SystemTime::now(),
+                        None,
+                    ) {
+                        Ok((mut rec, handle)) => {
+                            let mut buf = vec![Complex32::new(0.0, 0.0); 16];
+                            while rec.read(&mut buf).unwrap() > 0 {}
+                            drop(rec);
+                            Ok(handle.finish(Duration::from_secs(5)))
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                })
+            })
+            .collect();
+        threads.into_iter().map(|t| t.join().unwrap()).collect()
+    });
+    let winners: Vec<_> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+    assert_eq!(winners.len(), 1, "{results:?}");
+    assert!(
+        matches!(winners[0], RecordingOutcome::Finished { samples: 10, .. }),
+        "{results:?}"
+    );
+    for err in results.iter().filter_map(|r| r.as_ref().err()) {
+        assert!(
+            err.starts_with("IQ recording destination already exists: "),
+            "{err}"
+        );
+    }
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 80);
+    assert!(metadata_path(&path).exists());
+    assert!(!partial_metadata_path(&path).exists());
+}
+
+/// When the payload is created but its partial metadata cannot be (here a
+/// dangling symlink, which the existence check does not see but exclusive
+/// creation refuses), startup removes the payload it created and nothing
+/// else.
+#[cfg(unix)]
+#[test]
+fn a_failed_startup_removes_only_what_it_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("half.cf32");
+    let target = dir.path().join("nowhere");
+    std::os::unix::fs::symlink(&target, partial_metadata_path(&path)).unwrap();
+    let err = start_recording(
+        Box::new(Scripted::new(Vec::new())),
+        &path,
+        SystemTime::now(),
+        None,
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(
+        err.starts_with("IQ recording destination already exists: "),
+        "{err}"
+    );
+    assert!(!path.exists(), "the created payload is removed");
+    assert!(std::fs::symlink_metadata(partial_metadata_path(&path)).is_ok());
+    assert!(!target.exists(), "the symlink was not followed");
+}
+
 /// A source that ends after the run's stop flag is set (a live source
 /// answering the stop) finalizes as `stopped`; one that ends on its own,
 /// as `eof`.

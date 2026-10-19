@@ -192,11 +192,129 @@ fn a_recording_replays_to_the_same_spots_on_every_run() {
     assert!(String::from_utf8_lossy(&first).contains("W1AW"));
     assert_eq!(replay(&rec), first);
     assert_eq!(replay(&rec), first);
-    // A copied pair (new mtime) replays the same.
+    // A copied pair, its mtime moved, replays the same.
     let copy = dir.path().join("copy.cf32");
     std::fs::copy(&rec, &copy).unwrap();
     std::fs::copy(metadata_path(&rec), metadata_path(&copy)).unwrap();
+    let touched = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    for p in [copy.clone(), metadata_path(&copy)] {
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(touched)
+            .unwrap();
+    }
     assert_eq!(replay(&copy), first);
+
+    // With the spot servers up (the epoch and spot ids come from the
+    // recording), the original and the copy replay identically, run after
+    // run.
+    let served = |p: &Path| {
+        let [telnet, json, metrics] = free_ports();
+        let cfg = dir.path().join("server.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
+                 telnet_port = {telnet}\njson_port = {json}\nmetrics_port = {metrics}\n"
+            ),
+        )
+        .unwrap();
+        run_ok(&[
+            "run".as_ref(),
+            "--config".as_ref(),
+            cfg.as_os_str(),
+            "--source".as_ref(),
+            p.as_os_str(),
+            "--source-iq".as_ref(),
+            "--json".as_ref(),
+        ])
+        .stdout
+    };
+    let first_served = served(&rec);
+    assert!(String::from_utf8_lossy(&first_served).contains("W1AW"));
+    assert_eq!(served(&rec), first_served);
+    assert_eq!(served(&copy), first_served);
+
+    // Recording onto the replayed file itself is refused, untouched.
+    let before = std::fs::read(&rec).unwrap();
+    let (code, stderr) = stderr_of(&[
+        "run".as_ref(),
+        "--source".as_ref(),
+        rec.as_os_str(),
+        "--source-iq".as_ref(),
+        "--record-iq".as_ref(),
+        rec.as_os_str(),
+    ]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("error: IQ recording destination already exists:"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(&rec).unwrap(), before);
+}
+
+/// `N` distinct loopback ports nothing listens on right now, all held until
+/// every one is read.
+fn free_ports<const N: usize>() -> [u16; N] {
+    let held: [std::net::TcpListener; N] =
+        std::array::from_fn(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+    held.map(|l| l.local_addr().unwrap().port())
+}
+
+/// `record_iq` follows `run`'s precedence, `--record-iq` over
+/// `MANTA_INPUT_RECORD_IQ` over the config file, and a CLI or environment
+/// path resolves against the working directory, not the config's.
+#[test]
+fn record_iq_precedence_is_cli_then_environment_then_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, _) = v1_fixture(dir.path());
+    let cfg_dir = dir.path().join("cfg");
+    let work = dir.path().join("work");
+    std::fs::create_dir(&cfg_dir).unwrap();
+    std::fs::create_dir(&work).unwrap();
+    let cfg = cfg_dir.join("manta.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[input]\ntype = \"file\"\npath = \"{}\"\niq = true\nrecord_iq = \"file.cf32\"\n",
+            wav.display()
+        ),
+    )
+    .unwrap();
+    let run = |env: Option<&str>, cli: Option<&str>| {
+        let mut cmd = manta();
+        cmd.current_dir(&work)
+            .args(["run", "--json", "--config"])
+            .arg(&cfg);
+        if let Some(env) = env {
+            cmd.env("MANTA_INPUT_RECORD_IQ", env);
+        }
+        if let Some(cli) = cli {
+            cmd.args(["--record-iq", cli]);
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(Some("env-only.cf32"), None);
+    assert!(work.join("env-only.cf32").exists());
+    assert!(metadata_path(&work.join("env-only.cf32")).exists());
+    assert!(!cfg_dir.join("file.cf32").exists());
+    assert!(!cfg_dir.join("env-only.cf32").exists());
+
+    run(Some("env-ignored.cf32"), Some("cli.cf32"));
+    assert!(work.join("cli.cf32").exists());
+    assert!(!work.join("env-ignored.cf32").exists());
+    assert!(!cfg_dir.join("file.cf32").exists());
+
+    run(None, None);
+    assert!(cfg_dir.join("file.cf32").exists());
+    assert!(!work.join("file.cf32").exists());
 }
 
 #[test]
@@ -309,6 +427,31 @@ fn recorded_gaps_replay_through_run_and_decode_without_splicing() {
         ),
         "{stderr}"
     );
+    // Asking for the recorded rate is no rate change; a gap-free recording
+    // still decimates.
+    let rate = format!("{}", manifest.fs);
+    let same_rate = run_ok(&[
+        "run".as_ref(),
+        "--source".as_ref(),
+        gapped.as_os_str(),
+        "--source-iq".as_ref(),
+        "--json".as_ref(),
+        "--capture-rate-hz".as_ref(),
+        rate.as_ref(),
+    ])
+    .stdout;
+    assert_eq!(same_rate, first);
+    let decimated = run_ok(&[
+        "run".as_ref(),
+        "--source".as_ref(),
+        smooth.as_os_str(),
+        "--source-iq".as_ref(),
+        "--json".as_ref(),
+        "--capture-rate-hz".as_ref(),
+        "48000".as_ref(),
+    ])
+    .stdout;
+    assert!(String::from_utf8_lossy(&decimated).contains("W1AW"));
 }
 
 #[test]
@@ -429,6 +572,31 @@ fn headerless_cf32_and_ci16_decode_like_the_equivalent_wavs() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("W1AW"));
+    // ci16 through run: the same as the equivalent PCM16 WAV through run.
+    let run16 = |p: &Path, extra: &[&std::ffi::OsStr]| {
+        let mut args: Vec<&std::ffi::OsStr> = vec![
+            "run".as_ref(),
+            "--source".as_ref(),
+            p.as_os_str(),
+            "--source-iq".as_ref(),
+            "--dial-freq-hz".as_ref(),
+            centre.as_ref(),
+            "--json".as_ref(),
+        ];
+        args.extend_from_slice(extra);
+        run_ok(&args).stdout
+    };
+    let ci16_run = run16(
+        &raw16,
+        &[
+            "--iq-format".as_ref(),
+            "ci16".as_ref(),
+            "--sample-rate-hz".as_ref(),
+            rate.as_ref(),
+        ],
+    );
+    assert!(String::from_utf8_lossy(&ci16_run).contains("W1AW"));
+    assert_eq!(ci16_run, run16(&pcm, &[]));
 
     // The same file described by `[input]` keys (relative to the config)
     // runs exactly as the flags describe it; `config check` reports them.
@@ -511,6 +679,23 @@ fn a_service_config_records_relative_to_its_file_and_config_check_creates_nothin
     assert!(!rec.exists());
     assert!(!manta_input::partial_metadata_path(&rec).exists());
 
+    // `check` reads the input but only `run` records: it says so and
+    // creates nothing.
+    let check = run_ok(&[
+        "check".as_ref(),
+        "--duration".as_ref(),
+        "1".as_ref(),
+        "--config".as_ref(),
+        toml.as_os_str(),
+    ]);
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        stderr.contains("check does not record IQ; ignoring input.record_iq"),
+        "{stderr}"
+    );
+    assert!(!rec.exists());
+    assert!(!manta_input::partial_metadata_path(&rec).exists());
+
     // Run from another directory: the path is the config file's, not the
     // working directory's.
     let out = manta()
@@ -577,6 +762,31 @@ fn each_input_of_a_multi_input_daemon_records_its_own_file() {
         assert_eq!(std::fs::read(&rec).unwrap(), cf32_bytes(&wav_samples(&wav)));
     }
 
+    // The two recordings replay as a two-input daemon (MAN-13's zero-offset
+    // file policy) to the same bytes on every run.
+    let replay_toml = dir.path().join("replay.toml");
+    let replay_entry = |name: &str, rec: &str| {
+        format!("[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = \"{rec}\"\niq = true\n\n")
+    };
+    std::fs::write(
+        &replay_toml,
+        replay_entry("a", "a.cf32") + &replay_entry("b", "b.cf32"),
+    )
+    .unwrap();
+    let replay = || {
+        run_ok(&[
+            "run".as_ref(),
+            "--json".as_ref(),
+            "--config".as_ref(),
+            replay_toml.as_os_str(),
+        ])
+        .stdout
+    };
+    let first = replay();
+    assert!(String::from_utf8_lossy(&first).contains("W1AW"));
+    assert_eq!(replay(), first);
+    assert_eq!(replay(), first);
+
     // Two inputs on one destination, or --record-iq with several inputs,
     // fail before anything opens.
     let dup = dir.path().join("dup.toml");
@@ -584,6 +794,22 @@ fn each_input_of_a_multi_input_daemon_records_its_own_file() {
     let out = manta()
         .args(["run", "--config"])
         .arg(&dup)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("give each its own record_iq"));
+    assert!(!dir.path().join("same.cf32").exists());
+    // Two spellings of one destination are the same destination.
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let alias = dir.path().join("alias.toml");
+    std::fs::write(
+        &alias,
+        entry("a", "same.cf32") + &entry("b", "sub/../same.cf32"),
+    )
+    .unwrap();
+    let out = manta()
+        .args(["run", "--config"])
+        .arg(&alias)
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
@@ -829,6 +1055,7 @@ fn a_live_input_outage_is_recorded_as_a_gap() {
         }
     });
     let rec = dir.path().join("kiwi.cf32");
+    let launched = std::time::SystemTime::now();
     let mut child = KillOnDrop(
         manta()
             .args([
@@ -866,6 +1093,12 @@ fn a_live_input_outage_is_recorded_as_a_gap() {
     };
     assert_eq!(header.center_freq_hz, 14_025_000.0);
     assert!(header.sample_rate_hz > 0.0);
+    // Sample zero was taken during this run.
+    let start = header.start_time().expect("a start time");
+    assert!(
+        start >= launched - Duration::from_secs(1) && start <= std::time::SystemTime::now(),
+        "{header:?}"
+    );
     let (lo, hi) = (header.rf_passband_hz[0], header.rf_passband_hz[1]);
     assert!(
         hi - lo < header.sample_rate_hz,
@@ -895,4 +1128,70 @@ fn a_live_input_outage_is_recorded_as_a_gap() {
         "{records:?}"
     );
     assert_eq!(std::fs::metadata(&rec).unwrap().len(), sample_count * 8);
+}
+
+/// The headerless-IQ flags refuse a bad format or rate, and a rate without
+/// a format, at parse time (exit 2), before any file is read.
+#[test]
+fn headerless_iq_flags_refuse_bad_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = dir.path().join("x.cf32");
+    std::fs::write(&raw, [0u8; 80]).unwrap();
+    let raw = raw.as_os_str();
+    for (args, want) in [
+        (
+            vec![
+                "decode".as_ref(),
+                raw,
+                "--iq-format".as_ref(),
+                "cs8".as_ref(),
+            ],
+            "cs8",
+        ),
+        (
+            vec![
+                "decode".as_ref(),
+                raw,
+                "--iq-format".as_ref(),
+                "cf32".as_ref(),
+                "--sample-rate-hz".as_ref(),
+                "0".as_ref(),
+            ],
+            "--sample-rate-hz must be above 0",
+        ),
+        (
+            vec![
+                "decode".as_ref(),
+                raw,
+                "--iq-format".as_ref(),
+                "ci16".as_ref(),
+                "--sample-rate-hz".as_ref(),
+                "10000001".as_ref(),
+            ],
+            "--sample-rate-hz must be above 0",
+        ),
+        (
+            vec![
+                "decode".as_ref(),
+                raw,
+                "--sample-rate-hz".as_ref(),
+                "96000".as_ref(),
+            ],
+            "--iq-format",
+        ),
+        (
+            vec![
+                "run".as_ref(),
+                "--source".as_ref(),
+                raw,
+                "--iq-format".as_ref(),
+                "cf32".as_ref(),
+            ],
+            "--source-iq",
+        ),
+    ] {
+        let (code, stderr) = stderr_of(&args);
+        assert_eq!(code, 2, "{args:?}: {stderr}");
+        assert!(stderr.contains(want), "{args:?}: {stderr}");
+    }
 }

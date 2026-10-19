@@ -261,10 +261,20 @@ fn listen_events(src: Box<dyn IqSource>) -> Vec<String> {
 /// recording replays through `listen` to those events again.
 #[test]
 fn listen_is_unchanged_by_recording_and_its_replay_matches() {
+    listen_round_trip(1_440_123, "listen", true);
+}
+
+/// As above, with the outage inside `listen`'s 2 s calibration window
+/// (1 s in), whose samples the live path discards.
+#[test]
+fn a_gap_during_calibration_is_unchanged_by_recording_and_replays() {
+    listen_round_trip(96_000, "listen-calibration", false);
+}
+
+fn listen_round_trip(split: usize, name: &str, expect_closure: bool) {
     let mut spec = manta_testkit::vectors::v1();
     spec.duration_s = 30.0;
     let r = manta_testkit::vectors::render(&spec).unwrap();
-    let split = 1_440_123;
     let source = || Gapped {
         parts: vec![
             (None, r.samples[..split].to_vec()),
@@ -278,12 +288,15 @@ fn listen_is_unchanged_by_recording_and_its_replay_matches() {
         pending: None,
     };
     let want = listen_events(Box::new(source()));
-    assert!(
-        want.iter().any(|e| e.contains("Bookkeeping")),
-        "no discontinuity closure"
-    );
+    assert!(!want.is_empty(), "no events");
+    if expect_closure {
+        assert!(
+            want.iter().any(|e| e.contains("Bookkeeping")),
+            "no discontinuity closure"
+        );
+    }
 
-    let dir = scratch("listen");
+    let dir = scratch(name);
     let path = dir.join("live.cf32");
     let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_792_407_600);
     let (rec, handle) = start_recording(Box::new(source()), &path, start, None).unwrap();
