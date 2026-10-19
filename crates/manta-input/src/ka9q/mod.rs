@@ -1302,8 +1302,12 @@ mod tests {
             s.sample_rate_hz = Some(6_144_000);
             let f = FakeRadiod::start(vec![s]);
             let mut cfg = f.config(None);
-            cfg.settle = Duration::from_millis(500);
-            cfg.open_timeout = Duration::from_millis(1500);
+            // A settle window well past the ~435 ms the sender needs, so a
+            // loaded runner whose 1 ms sleeps run long still sends twice
+            // the cap's worth before `open` returns and stops it (CI
+            // macOS sent too little inside 500 ms and nothing was evicted).
+            cfg.settle = Duration::from_millis(1500);
+            cfg.open_timeout = Duration::from_millis(3000);
             // One 1100-sample f32le RTP datagram charges its 8_812 bytes
             // plus STASH_PACKET_OVERHEAD against the cap; twice the cap's
             // worth of packets evicts the whole first half of the stream.
@@ -1338,10 +1342,16 @@ mod tests {
                             ssrc: SSRC,
                             marker: false,
                         };
-                        let _ = tx.send_to(
-                            &wire::encode_rtp(&h, &payload),
-                            SocketAddrV4::new(group, port),
-                        );
+                        // Retry a send the kernel refuses (ENOBUFS on a
+                        // busy host): a datagram dropped here is neither
+                        // sent nor evicted, and the test needs every one.
+                        let pkt = wire::encode_rtp(&h, &payload);
+                        for _ in 0..1000 {
+                            if tx.send_to(&pkt, SocketAddrV4::new(group, port)).is_ok() {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_micros(200));
+                        }
                         // Four packets per millisecond: one sleep per
                         // packet would need sub-millisecond sleeps.
                         if seq % 4 == 3 {
