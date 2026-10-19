@@ -9407,6 +9407,75 @@ mod tests {
         );
     }
 
+    /// MAN-309: a manta IQ recording pair in `dir`, `gap` its one gap.
+    fn native_pair(dir: &Path, name: &str, start_secs: i64, gap: u64) -> PathBuf {
+        use manta_input::recording_format::MetadataRecord;
+        let path = dir.join(name);
+        std::fs::write(&path, [0u8; 80]).unwrap();
+        let header = manta_input::RecordingHeader {
+            schema: "manta-iq.v1".into(),
+            sample_format: "cf32_le".into(),
+            sample_rate_hz: 48_000.0,
+            center_freq_hz: 14_000_000.0,
+            start_unix_seconds: start_secs,
+            start_nanoseconds: 500,
+            rf_passband_hz: [-24_000.0, 24_000.0],
+            trusted_band_hz: None,
+            analytic_guard_hz: 0.0,
+        };
+        let meta = MetadataRecord::Header(header).to_line()
+            + &MetadataRecord::Gap {
+                before_sample: 5,
+                missing_samples: gap,
+            }
+            .to_line()
+            + &MetadataRecord::End {
+                sample_count: 10,
+                reason: manta_input::EndReason::Stopped,
+            }
+            .to_line();
+        std::fs::write(manta_input::metadata_path(&path), meta).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_native_recording_replays_at_its_recorded_start_not_its_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = native_pair(dir.path(), "a.cf32", 1_792_407_600, 7);
+        let recorded =
+            std::time::UNIX_EPOCH + std::time::Duration::new(1_792_407_600, 500);
+        assert_eq!(resolve_epoch(Some(&rec), None).unwrap(), recorded);
+        // --replay-epoch still wins.
+        assert_eq!(
+            resolve_epoch(Some(&rec), Some(1_751_635_200)).unwrap(),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_751_635_200)
+        );
+        // A pre-1970 recorded start is refused, as a pre-1970 mtime is.
+        let old = native_pair(dir.path(), "old.cf32", -5, 7);
+        assert!(resolve_epoch(Some(&old), None).is_err());
+    }
+
+    #[test]
+    fn a_native_recordings_nonce_covers_its_metadata_but_not_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = native_pair(dir.path(), "a.cf32", 1_792_407_600, 7);
+        let renamed = native_pair(dir.path(), "renamed.cf32", 1_792_407_600, 7);
+        let other_gap = native_pair(dir.path(), "gap.cf32", 1_792_407_600, 8);
+        let other_start = native_pair(dir.path(), "start.cf32", 1_792_407_601, 7);
+        let nonce = session_nonce_for_replay_path(&a).unwrap();
+        assert_eq!(session_nonce_for_replay_path(&renamed).unwrap(), nonce);
+        assert_ne!(session_nonce_for_replay_path(&other_gap).unwrap(), nonce);
+        assert_ne!(session_nonce_for_replay_path(&other_start).unwrap(), nonce);
+        // A plain file's nonce is still its bytes' hash alone.
+        let plain = dir.path().join("plain.cf32");
+        std::fs::write(&plain, [0u8; 80]).unwrap();
+        assert_eq!(
+            session_nonce_for_replay_path(&plain).unwrap(),
+            u128::from(fnv1a_file(0xcbf29ce484222325, &plain).unwrap())
+        );
+        assert_ne!(session_nonce_for_replay_path(&plain).unwrap(), nonce);
+    }
+
     #[test]
     fn resolve_epoch_is_now_for_a_live_session_with_no_replay_path() {
         let before = std::time::SystemTime::now();

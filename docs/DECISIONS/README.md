@@ -11,6 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-19 | MAN-309 | [MAN-309: record the decoded IQ to a file and replay it deterministically](2026-10-19-man309-iq-recording-and-replay.md) |
 | 2026-10-17 | MAN-108 | [MAN-108: a fading signal keeps its track through the fade (DORMANT re-acquisition)](2026-10-17-man108-dormant-track-reacquisition.md) |
 | 2026-10-17 | MAN-114 | [MAN-114: the spot frequency comes from a power-weighted phase estimator](2026-10-17-man114-phase-difference-spot-frequency.md) |
 | 2026-10-17 | MAN-275 | [MAN-275: a hostile or broken KiwiSDR receiver cannot stop the daemon; the plaintext-password exposure is accepted risk](2026-10-17-man275-kiwi-threat-model.md) |

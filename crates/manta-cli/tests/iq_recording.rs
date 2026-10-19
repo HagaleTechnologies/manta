@@ -51,8 +51,10 @@ fn v1_fixture(dir: &Path) -> (PathBuf, manta_testkit::vectors::Manifest) {
 fn wav_samples(path: &Path) -> Vec<Complex32> {
     let mut r = hound::WavReader::open(path).unwrap();
     let s: Vec<f32> = r.samples::<f32>().map(Result::unwrap).collect();
-    s.chunks_exact(2)
-        .map(|c| Complex32::new(c[0], c[1]))
+    s.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[re, im]| Complex32::new(re, im))
         .collect()
 }
 

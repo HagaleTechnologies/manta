@@ -27,7 +27,11 @@ pub type Reopen = Box<dyn FnMut() -> Result<Box<dyn IqSource>>>;
 pub struct PacedSource {
     inner: Box<dyn IqSource>,
     fs: f64,
+    /// Samples delivered plus samples a recorded gap skipped (MAN-309): an
+    /// outage takes its own time in a paced replay, as it did live.
     delivered: u64,
+    /// A gap taken from `inner` after a read, for the caller to take.
+    pending_gap: Option<u64>,
     /// Started on the first `read`, not at construction: the CLI binds its
     /// listeners and hashes the file for the session nonce in between, and
     /// charging that to the recording would shorten the window a client has
@@ -47,6 +51,7 @@ impl PacedSource {
             inner,
             fs,
             delivered: 0,
+            pending_gap: None,
             start: None,
         })
     }
@@ -54,6 +59,14 @@ impl PacedSource {
     /// Wall-clock since the first `read`, or zero before it.
     fn elapsed(&self) -> Duration {
         self.start.map_or(Duration::ZERO, |start| start.elapsed())
+    }
+}
+
+/// Two gaps at one stream position, as one (MAN-309).
+fn add_gap(pending: Option<u64>, gap: u64) -> Result<u64> {
+    match pending.unwrap_or(0).checked_add(gap) {
+        Some(total) => Ok(total),
+        None => bail!("recorded input gaps overflow the sample clock"),
     }
 }
 
@@ -96,6 +109,11 @@ impl IqSource for PacedSource {
         // spends producing this buffer is part of the recording's interval.
         self.start.get_or_insert_with(Instant::now);
         let n = self.inner.read(buf)?;
+        // MAN-309: a gap before these samples is paced once, then handed on.
+        if let Some(gap) = self.inner.take_discontinuity() {
+            self.pending_gap = Some(add_gap(self.pending_gap, gap)?);
+            self.delivered = self.delivered.saturating_add(gap);
+        }
         self.delivered += n as u64;
         // Sleep after the read, against the count that includes this buffer,
         // so even `listen`'s first read (the whole 2 s calibration buffer)
@@ -111,7 +129,9 @@ impl IqSource for PacedSource {
     }
 
     fn take_discontinuity(&mut self) -> Option<u64> {
-        self.inner.take_discontinuity()
+        self.pending_gap
+            .take()
+            .or_else(|| self.inner.take_discontinuity())
     }
 
     fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
@@ -127,13 +147,16 @@ impl IqSource for PacedSource {
 /// (last sample straight to first) that the channelizer hears as a click.
 /// It deliberately does NOT report a discontinuity: `listen` discards a
 /// partial calibration fill on one, so a recording shorter than the 2 s
-/// calibration window would never finish calibrating.
+/// calibration window would never finish calibrating. A recording that
+/// itself ends in a gap (MAN-309) keeps it: the gap is reported at the
+/// start of the next pass, added to any gap that pass opens with.
 pub struct LoopingSource {
     label: String,
     inner: Box<dyn IqSource>,
     reopen: Reopen,
     fs: f64,
     center_freq_hz: f64,
+    pending_gap: Option<u64>,
 }
 
 impl LoopingSource {
@@ -148,6 +171,7 @@ impl LoopingSource {
             reopen,
             fs,
             center_freq_hz,
+            pending_gap: None,
         }
     }
 }
@@ -183,6 +207,8 @@ impl IqSource for LoopingSource {
         if n > 0 {
             return Ok(n);
         }
+        // MAN-309: a gap at the end of this pass survives the reopen.
+        let terminal = self.inner.take_discontinuity();
         // One reopen per call, so an empty recording ends (returns 0)
         // instead of spinning.
         let next = (self.reopen)()?;
@@ -202,8 +228,26 @@ impl IqSource for LoopingSource {
                 self.center_freq_hz
             );
         }
+        if next.analytic_guard_hz() != self.inner.analytic_guard_hz()
+            || next.rf_passband_hz() != self.inner.rf_passband_hz()
+            || next.trusted_band_hz() != self.inner.trusted_band_hz()
+        {
+            bail!(
+                "replay {} changed between loop passes: its passband or guards differ",
+                self.label
+            );
+        }
         self.inner = next;
-        self.inner.read(buf)
+        let n = self.inner.read(buf)?;
+        let first = self.inner.take_discontinuity();
+        let gap = match (terminal, first) {
+            (None, None) => None,
+            (a, b) => Some(add_gap(a, b.unwrap_or(0))?),
+        };
+        if let Some(gap) = gap {
+            self.pending_gap = Some(add_gap(self.pending_gap, gap)?);
+        }
+        Ok(n)
     }
 
     fn confirmed_live_handle(&self) -> Option<Arc<AtomicBool>> {
@@ -211,7 +255,9 @@ impl IqSource for LoopingSource {
     }
 
     fn take_discontinuity(&mut self) -> Option<u64> {
-        self.inner.take_discontinuity()
+        self.pending_gap
+            .take()
+            .or_else(|| self.inner.take_discontinuity())
     }
 
     fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
@@ -574,5 +620,119 @@ mod tests {
             "three 50 ms passes took only {:?}",
             start.elapsed()
         );
+    }
+
+    /// MAN-309: scripted reads, each `(gap before it, sample count)`.
+    struct GapSource {
+        reads: std::collections::VecDeque<(Option<u64>, usize)>,
+        pending: Option<u64>,
+        fs: f64,
+    }
+
+    fn gap_source(reads: &[(Option<u64>, usize)], fs: f64) -> GapSource {
+        GapSource {
+            reads: reads.iter().copied().collect(),
+            pending: None,
+            fs,
+        }
+    }
+
+    impl IqSource for GapSource {
+        fn sample_rate(&self) -> f64 {
+            self.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            0.0
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            let Some((gap, n)) = self.reads.pop_front() else {
+                return Ok(0);
+            };
+            self.pending = gap;
+            buf[..n].fill(Complex32::new(1.0, 0.0));
+            Ok(n)
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            self.pending.take()
+        }
+    }
+
+    /// Every read as `(n, gap taken after it)`, through EOF.
+    fn read_gaps(src: &mut dyn IqSource, reads: usize) -> Vec<(usize, Option<u64>)> {
+        let mut buf = vec![Complex32::new(0.0, 0.0); 64];
+        (0..reads)
+            .map(|_| {
+                let n = src.read(&mut buf).unwrap();
+                (n, src.take_discontinuity())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pacing_counts_a_recorded_gap_once_and_still_forwards_it() {
+        // A huge rate keeps the sleeps at nanoseconds.
+        let inner = gap_source(&[(Some(0), 4), (Some(1_000), 8), (Some(5), 0)], 1e12);
+        let mut paced = PacedSource::new(Box::new(inner)).unwrap();
+        assert_eq!(
+            read_gaps(&mut paced, 3),
+            vec![(4, Some(0)), (8, Some(1_000)), (0, Some(5))]
+        );
+        assert_eq!(paced.delivered, 4 + 1_000 + 8 + 5);
+        assert_eq!(paced.take_discontinuity(), None);
+    }
+
+    #[test]
+    fn looping_keeps_a_terminal_gap_and_adds_the_next_passes_first_gap() {
+        let passes = Rc::new(Cell::new(0));
+        let counter = passes.clone();
+        let reopen: Reopen = Box::new(move || {
+            counter.set(counter.get() + 1);
+            Ok(Box::new(gap_source(&[(Some(3), 2), (None, 0)], 1000.0)) as Box<dyn IqSource>)
+        });
+        let first = gap_source(&[(None, 2), (Some(40), 0)], 1000.0);
+        let mut looped = LoopingSource::new("rec", Box::new(first), reopen);
+        assert_eq!(
+            read_gaps(&mut looped, 4),
+            // 40 at the end of pass 1 plus 3 at the start of pass 2; pass 2
+            // ends without a gap, so pass 3 starts with only its own 3.
+            vec![(2, None), (2, Some(43)), (2, Some(3)), (2, Some(3))]
+        );
+        assert_eq!(passes.get(), 3);
+    }
+
+    #[test]
+    fn looping_a_gap_free_recording_still_reports_no_discontinuity() {
+        let reopen: Reopen =
+            Box::new(|| Ok(Box::new(gap_source(&[(None, 2)], 1000.0)) as Box<dyn IqSource>));
+        let mut looped =
+            LoopingSource::new("rec", Box::new(gap_source(&[(None, 2)], 1000.0)), reopen);
+        assert_eq!(
+            read_gaps(&mut looped, 3),
+            vec![(2, None), (2, None), (2, None)]
+        );
+    }
+
+    #[test]
+    fn looping_refuses_a_pass_with_different_guards() {
+        struct Guarded(f64);
+        impl IqSource for Guarded {
+            fn sample_rate(&self) -> f64 {
+                1000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                0.0
+            }
+            fn analytic_guard_hz(&self) -> f64 {
+                self.0
+            }
+            fn read(&mut self, _buf: &mut [Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+        }
+        let reopen: Reopen = Box::new(|| Ok(Box::new(Guarded(600.0)) as Box<dyn IqSource>));
+        let mut looped = LoopingSource::new("rec", Box::new(Guarded(0.0)), reopen);
+        let mut buf = [Complex32::new(0.0, 0.0); 4];
+        let err = looped.read(&mut buf).unwrap_err().to_string();
+        assert!(err.contains("passband or guards differ"), "{err}");
     }
 }

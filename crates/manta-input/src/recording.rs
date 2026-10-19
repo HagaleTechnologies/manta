@@ -582,7 +582,7 @@ mod tests {
         }
         assert!(published.load(Ordering::Acquire));
         // Queued payload never exceeded the bound.
-        assert!(QUEUE_BLOCKS * RECORDING_BLOCK_FRAMES * 8 <= RECORDING_QUEUE_BYTES);
+        const { assert!(QUEUE_BLOCKS * RECORDING_BLOCK_FRAMES * 8 <= RECORDING_QUEUE_BYTES) };
     }
 
     #[test]

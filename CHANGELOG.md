@@ -87,6 +87,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-309: `manta run --record-iq PATH` records the IQ it decodes, from any
+  input, to a little-endian cf32 file plus `PATH.meta.jsonl` (rate,
+  centre, start time, source passband and guards, input gaps). `decode`
+  and `run --source PATH --source-iq` replay it to the same output on every
+  run; `run` reproduces its input gaps. Both commands also read headerless
+  cf32/ci16 files with `--iq-format` and `--sample-rate-hz`. Decoder
+  output for existing WAV inputs is unchanged. See
+  [docs/GUIDES/iq-recording.md](docs/GUIDES/iq-recording.md).
 - MAN-108: `[detector] reacquire_ms` (default `10000`), how long after
   `hang_ms` a decoded track keeps its identity waiting for its signal to
   return. `0` restores the previous close at `hang_ms`.

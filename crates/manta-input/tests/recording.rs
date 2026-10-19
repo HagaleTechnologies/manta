@@ -9,9 +9,14 @@ use num_complex::Complex32;
 use std::collections::VecDeque;
 use std::time::{Duration, SystemTime};
 
-/// Replays scripted reads: `(gap, samples)`, or an error.
+/// One scripted read: `(gap, samples)`, or an error.
+type ScriptedRead = std::result::Result<(Option<u64>, Vec<Complex32>), String>;
+/// One traced read: `(n or error, gap, sample bits)`.
+type TracedRead = (std::result::Result<usize, String>, Option<u64>, Vec<(u32, u32)>);
+
+/// Replays scripted reads.
 struct Scripted {
-    reads: VecDeque<std::result::Result<(Option<u64>, Vec<Complex32>), String>>,
+    reads: VecDeque<ScriptedRead>,
     pending: Option<u64>,
     guard: f64,
 }
@@ -72,11 +77,7 @@ fn bits(s: &[Complex32]) -> Vec<(u32, u32)> {
 /// Every read as `(n or error, gap, sample bits)`.
 fn trace(
     src: &mut dyn IqSource,
-) -> Vec<(
-    std::result::Result<usize, String>,
-    Option<u64>,
-    Vec<(u32, u32)>,
-)> {
+) -> Vec<TracedRead> {
     let mut out = Vec::new();
     let mut buf = vec![Complex32::new(0.0, 0.0); 20_000];
     loop {
@@ -141,11 +142,7 @@ fn a_recorded_source_reads_exactly_like_the_bare_one_and_replays_its_trace() {
     assert_eq!(h.trusted_band_hz, Some([-20_000.0, 20_000.0]));
     assert_eq!(replay.analytic_guard_hz(), 600.0);
     // The replay splits reads at gaps, so compare positions and samples.
-    let flatten = |t: Vec<(
-        std::result::Result<usize, String>,
-        Option<u64>,
-        Vec<(u32, u32)>,
-    )>| {
+    let flatten = |t: Vec<TracedRead>| {
         let mut gaps = Vec::new();
         let mut all = Vec::new();
         for (_, g, s) in t {
