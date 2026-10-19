@@ -362,6 +362,7 @@ bind_addr = \"127.0.0.1\"
 telnet_port = 0
 json_port = 0
 metrics_port = 0
+operator_grid = \"FN03ab\"
 
 [spot]
 allowlist = [\"k5arh\"]
