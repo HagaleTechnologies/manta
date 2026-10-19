@@ -656,7 +656,11 @@ pub fn probe_receiver_capacity(host: &str, port: u16) -> Result<Option<usize>> {
         .context("send HPSDR capacity query")?;
     let deadline = Instant::now() + Duration::from_secs(1);
     let mut buf = [0; RECV_BUF_LEN];
-    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+    // A zero read timeout is an error, so an exhausted deadline ends the loop.
+    while let Some(left) = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+    {
         socket.set_read_timeout(Some(left.min(Duration::from_millis(100))))?;
         match socket.recv_from(&mut buf) {
             Ok((n, from)) if from == peer => {

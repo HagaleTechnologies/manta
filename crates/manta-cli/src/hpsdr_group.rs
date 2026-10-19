@@ -305,6 +305,18 @@ impl Group {
         self.changed.notify_all();
     }
 
+    /// Take this member's source from `generation`. A sibling's failure can
+    /// retire the generation between `wait` and this claim; `None` then
+    /// means wait for the replacement rather than end the input.
+    fn claim(&self, generation: &Generation, index: usize) -> Result<Option<SendSource>> {
+        let source = generation.slots.lock().expect("HPSDR slots poisoned")[index].take();
+        match source {
+            Some(source) => Ok(Some(source)),
+            None if !self.is_current(generation) => Ok(None),
+            None => bail!("HPSDR receiver already assigned"),
+        }
+    }
+
     fn productive(&self, generation: &Generation, index: usize) -> bool {
         let mut health = self.health.lock().expect("HPSDR health poisoned");
         if !self.is_current(generation) {
@@ -327,24 +339,26 @@ pub(crate) struct Member {
 }
 impl Member {
     pub(crate) fn open(self) -> Result<GroupSource> {
-        let generation = self
-            .group
-            .wait(self.index)?
-            .ok_or_else(|| anyhow!("HPSDR startup cancelled"))?;
-        let metadata = generation.metadata[self.index].clone();
-        let source = generation.slots.lock().expect("HPSDR slots poisoned")[self.index]
-            .take()
-            .ok_or_else(|| anyhow!("HPSDR receiver already assigned"))?;
-        Ok(GroupSource {
-            group: self.group,
-            index: self.index,
-            metadata,
-            boundary: generation.started_at,
-            samples: 0,
-            current: Some((generation, source)),
-            gap: None,
-            resumed: None,
-        })
+        loop {
+            let generation = self
+                .group
+                .wait(self.index)?
+                .ok_or_else(|| anyhow!("HPSDR startup cancelled"))?;
+            let Some(source) = self.group.claim(&generation, self.index)? else {
+                continue;
+            };
+            let metadata = generation.metadata[self.index].clone();
+            return Ok(GroupSource {
+                group: self.group,
+                index: self.index,
+                metadata,
+                boundary: generation.started_at,
+                samples: 0,
+                current: Some((generation, source)),
+                gap: None,
+                resumed: None,
+            });
+        }
     }
 }
 
@@ -419,9 +433,9 @@ impl IqSource for GroupSource {
                     );
                     return Ok(0);
                 };
-                let source = generation.slots.lock().expect("HPSDR slots poisoned")[self.index]
-                    .take()
-                    .ok_or_else(|| anyhow!("HPSDR receiver already assigned"))?;
+                let Some(source) = self.group.claim(&generation, self.index)? else {
+                    continue;
+                };
                 self.resumed = Some(
                     (generation
                         .started_at
@@ -601,6 +615,7 @@ pub(crate) fn prepare(
         let endpoints = endpoints.clone();
         let worker_stop = stop.clone();
         let mut accepted = None;
+        let mut reopen = false;
         let opener = Box::new(move || {
             let peer = match accepted {
                 Some(peer) => peer,
@@ -627,9 +642,18 @@ pub(crate) fn prepare(
             if worker_stop.load(Ordering::Relaxed) {
                 bail!("HPSDR startup cancelled");
             }
+            // The first open uses the probed address. A reopen resolves the
+            // configured host again, as a standalone HPSDR input does, so a
+            // radio that changed address comes back without a restart.
+            let (host, port) = if reopen {
+                (allocation.host.clone(), allocation.port)
+            } else {
+                (peer.ip().to_string(), peer.port())
+            };
+            reopen = true;
             let raw = manta_input::HpsdrDevice::open(manta_input::HpsdrConfig {
-                host: peer.ip().to_string(),
-                port: peer.port(),
+                host,
+                port,
                 ddc_count: allocation.members.len(),
                 sample_rate_hz: allocation.rate,
                 center_freq_hz: allocation.frequencies.clone(),
@@ -866,6 +890,22 @@ mod tests {
         assert_eq!(f.retires.load(Ordering::Relaxed), 1);
         drop(sources);
         assert_eq!(f.retires.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_claim_racing_a_sibling_failure_waits_for_the_replacement() {
+        let f = fixture();
+        let mut sources = open_pair(&f.group);
+        let old = current(&f.group);
+        // Member 1 adopts the generation and fails it before member 0 claims.
+        f.group.failed(&old);
+        assert!(f.group.claim(&old, 0).unwrap().is_none());
+        *f.time.lock().unwrap() += Duration::from_secs(2);
+        let replacement = f.group.wait(0).unwrap().unwrap();
+        assert!(f.group.claim(&replacement, 0).unwrap().is_some());
+        let err = f.group.claim(&replacement, 0).err().unwrap().to_string();
+        assert!(err.contains("already assigned"), "{err}");
+        assert_eq!(sources[1].read(&mut [Complex32::default(); 4]).unwrap(), 4);
     }
 
     #[test]

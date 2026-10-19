@@ -36,7 +36,10 @@ until `run`. Exact examples and diagnostics are in the
 ## One owner per radio
 
 `hpsdr_group` resolves endpoints concurrently and rejects alias collisions
-before control I/O. Probe and open use the same resolved address. One opener
+before control I/O. Probe and first open use the same resolved address; a
+reopen resolves the configured host again, as a standalone HPSDR input does,
+without probing capacity again. A member that loses a race with a sibling's
+failure waits for the replacement instead of ending its input. One opener
 owns a generation, and concurrent members await it with 100 ms stop checks.
 Initial failures are attributed to the first configured member; engine startup
 failure cancels the other pending workers and releases completed sources.
