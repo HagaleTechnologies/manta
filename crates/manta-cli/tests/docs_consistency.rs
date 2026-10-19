@@ -131,6 +131,7 @@ fn readme_inputs_table_covers_every_shipped_input() {
         "--hpsdr-host",
         "--hpsdr-mac",
         "found automatically when no host is set",
+        "for Red Pitaya and QMTech give `--hpsdr-host`",
         "--ka9q-group",
     ] {
         assert!(

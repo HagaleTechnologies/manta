@@ -619,7 +619,7 @@ JSON Lines) is unchanged.
 | IQ / audio WAV file | `decode`, `listen --source` (`--dial-freq-hz` sets absolute frequencies for audio files) | Working (`decode` takes IQ; `listen --source` takes 48 kHz mono audio, or raw complex IQ with `--source-iq`). IQ is never resampled: the rate must be one the channelizer supports (`fs / 93.75` a power of two — commonly 24, 48, 96, 192, 384, 768 kS/s, but the rule decides, not that list), and `--capture-rate-hz` only decimates from one of those to a lower one |
 | Sound card (rig audio passband) | `listen --device`, `--dial-freq-hz` for absolute frequencies | Working, 48 kHz input only |
 | KiwiSDR over the network | `listen --kiwi-host` — any receiver from the public directory at <https://kiwisdr.com/public/> | Working |
-| OpenHPSDR / Hermes (Hermes-Lite 2, Red Pitaya, QMTech) | `listen --hpsdr-host` or `--hpsdr-mac`, included in every build, no native radio dependency; found automatically when no host is set | Working; protocol verified against reference sources, not yet against hardware |
+| OpenHPSDR / Hermes (Hermes-Lite 2, Red Pitaya, QMTech) | `listen --hpsdr-host` or `--hpsdr-mac`, included in every build, no native radio dependency; a Hermes-Lite 2 is found automatically when no host is set; for Red Pitaya and QMTech give `--hpsdr-host`, since their documented discovery path is avahi/mDNS, which manta does not implement | Working; protocol verified against reference sources, not yet against hardware |
 | RTL-SDR, Airspy, SDRplay, HackRF, anything SoapySDR drives | `listen --soapy-driver`, feature `soapy` — in the `manta-linux-x86_64-soapy.tar.gz` release archive ([SoapySDR on Linux x86_64](#soapysdr-on-linux-x86_64)), **not** in the other archives or the install line above; from source, needs the SoapySDR system library, then `--features soapy` | Working, needs hardware soak |
 | ka9q-radio (radiod) multicast IQ channel: RX-888, Airspy, anything radiod drives | `listen --ka9q-group`; no build feature | Working; protocol checked against ka9q-radio's docs and headers, not yet against a live radiod |
 
@@ -644,8 +644,11 @@ Audio selectors are names matched case-insensitively by substring, not numeric
 indexes. `devices` lists input-capable devices without opening a stream. From
 the `manta-linux-x86_64-soapy.tar.gz` archive or a `--features soapy` build,
 it also lists complete Soapy selector strings for `--soapy-driver`; any other
-binary says where to get one. openHPSDR radios are discovered automatically when
-no host is set; `devices` lists their address, MAC and board type. Pin one with
+binary says where to get one. openHPSDR radios that answer UDP broadcast
+discovery, such as the Hermes-Lite 2, are found automatically when no host is
+set; `devices` lists their address, MAC and board type. For Red Pitaya and
+QMTech give `--hpsdr-host`: their documented discovery path is avahi/mDNS,
+which manta does not implement. Pin a discovered radio with
 `--hpsdr-mac AA:BB:CC:DD:EE:FF` or `input.mac`, or use `--hpsdr-host HOST`
 to bypass discovery. Frequency and sample rate are still required. Discovery
 uses limited broadcast on the default-route LAN; set a host for other subnets. KiwiSDR uses `--kiwi-host HOST`. ka9q-radio uses

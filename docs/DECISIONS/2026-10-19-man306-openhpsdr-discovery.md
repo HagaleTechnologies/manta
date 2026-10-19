@@ -19,7 +19,12 @@ both protocols keeps its P2 answer; explicit host can force the P1 path.
 All five source commands use the same opener. Reconnect invokes discovery
 again, so a pinned MAC follows an address change. Two configured inputs with
 the same MAC or two unqualified discovery inputs are refused, like duplicate
-host inputs. Several receivers on one radio remain MAN-307's work.
+host inputs; so is an unqualified discovery input beside a MAC-pinned one on
+the same port, since the unqualified one takes the only radio that answers.
+The spike documents an avahi/mDNS discovery path for Red Pitaya and QMTech
+boards, which this ticket does not implement, so the docs tell their operators
+to set an explicit host. Several receivers on one
+radio remain MAN-307's work.
 
 ## Discovery
 

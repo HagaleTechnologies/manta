@@ -128,7 +128,8 @@ ignores the config's entries.
 
 - Several receivers on one HPSDR radio: MAN-307. The config loader refuses
   two entries on one radio, including duplicate MACs and two entries with
-  neither host nor MAC. Use a distinct `input.mac` per radio to survive DHCP
+  neither host nor MAC, and an entry with neither beside a MAC-pinned entry
+  on the same port. Use a distinct `input.mac` per radio to survive DHCP
   address changes; `manta devices` lists the MACs.
 - Several channels of one SoapySDR device in one stream (a dual-tuner
   RSPduo): two Soapy devices, one entry each, work today.

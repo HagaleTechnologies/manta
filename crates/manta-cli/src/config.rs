@@ -859,6 +859,23 @@ fn check_input_entries(inputs: &[NamedInput], origin: &str) -> Result<()> {
                         crate::fmt::quoted(&earlier.name)
                     );
                 }
+                // MAN-306: an entry with neither host nor mac takes the only
+                // radio that answers, so it cannot share a port's discovery
+                // with a MAC-pinned entry either.
+                let unpinned = inputs[..i].iter().find(|o| {
+                    matches!(&o.input.source, Some(SourceFromFile::Hpsdr { host: None, mac: m, port: p, .. })
+                        if host.is_none() && p == port && (mac.is_none() || m.is_none()))
+                });
+                if let Some(earlier) = unpinned {
+                    let earlier_name = crate::fmt::quoted(&earlier.name);
+                    let bare = if mac.is_none() { &name } else { &earlier_name };
+                    bail!(
+                        "{origin}: [[input]] {name}: input {earlier_name} also discovers HPSDR \
+                         radios on port {port}, and input {bare} has neither input.host nor \
+                         input.mac, so it takes the only radio that answers; give each of them \
+                         a distinct input.mac"
+                    );
+                }
             }
             Some(SourceFromFile::Audio { .. }) if n.input.shared.center_freq_hz.is_none() => {
                 bail!(
@@ -1289,6 +1306,43 @@ mod tests {
             let body = ["a", "b"].map(|name| format!("[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n{selector}")).join("\n");
             assert!(err_of(&body).contains("several receivers on one HPSDR radio"));
         }
+    }
+
+    #[test]
+    fn hpsdr_discovery_unpinned_input_beside_a_pinned_one_is_refused() {
+        let entry = |name: &str, selector: &str| {
+            format!("[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n{selector}")
+        };
+        let pinned = "mac = \"aabbccddeeff\"\n";
+        for (a, b) in [("", pinned), (pinned, "")] {
+            let err = err_of(&format!("{}\n{}", entry("a", a), entry("b", b)));
+            assert!(
+                err.contains(
+                    ": [[input]] \"b\": input \"a\" also discovers HPSDR radios on port 1024"
+                ),
+                "{err}"
+            );
+            let bare = if a.is_empty() { "\"a\"" } else { "\"b\"" };
+            assert!(
+                err.contains(&format!(
+                    "input {bare} has neither input.host nor input.mac"
+                )),
+                "{err}"
+            );
+            assert!(err.contains("distinct input.mac"), "{err}");
+        }
+        assert!(load_file(&format!(
+            "{}\n{}",
+            entry("a", "mac = \"aabbccddeeff\"\n"),
+            entry("b", "mac = \"001122334455\"\n")
+        ))
+        .is_ok());
+        assert!(load_file(&format!(
+            "{}\n{}",
+            entry("a", ""),
+            entry("b", "mac = \"001122334455\"\nport = 1025\n")
+        ))
+        .is_ok());
     }
 
     const SERVER: &str = "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
