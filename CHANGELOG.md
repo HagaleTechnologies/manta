@@ -96,7 +96,8 @@ the git history and `docs/DECISIONS/`.
   samples. Both commands also read headerless cf32/ci16 files with
   `--iq-format` and `--sample-rate-hz` (or `[input] iq_format`/
   `sample_rate_hz`). Decoder output for existing gap-free WAV inputs is
-  unchanged; only sources that report gaps gain the segmented behaviour. See
+  unchanged; only sources that report gaps gain the segmented behaviour,
+  and a recording of rig audio keeps its analytic guard under `decode`. See
   [docs/GUIDES/iq-recording.md](docs/GUIDES/iq-recording.md).
 - MAN-108: `[detector] reacquire_ms` (default `10000`), how long after
   `hang_ms` a decoded track keeps its identity waiting for its signal to

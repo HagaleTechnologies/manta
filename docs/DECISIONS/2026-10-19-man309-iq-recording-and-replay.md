@@ -76,7 +76,8 @@ described on the command line. Operator guide:
   (no 2 s calibration). The validator, RTTY rows and bad-sample count span
   every segment. Every segment applies the source's passband, trusted
   band, guard and mirror veto as `listen::new_segment` does; for a plain
-  complex source those setters are no-ops, so a gap-free WAV decodes
+  complex source those setters are no-ops (`DetectorConfig::guard_hz` is 0;
+  the loader rejects `[detector] guard_hz`), so a gap-free WAV decodes
   byte-for-byte as before.
 - **D8 — config and diagnostics.** `[input] iq_format`/`sample_rate_hz`
   (file inputs with `iq = true`, together) describe headerless IQ; the

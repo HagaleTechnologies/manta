@@ -390,7 +390,8 @@ impl SourceBands {
     /// A fresh segment starting at `base`, numbering tracks from `next_id`.
     /// The band setters are no-ops for a plain complex source (full
     /// Nyquist, no trusted band, zero guard), so a WAV or slice decode is
-    /// unchanged.
+    /// unchanged while `DetectorConfig::guard_hz` is 0 (the config loader
+    /// rejects `[detector] guard_hz`, so only code can raise it).
     fn segment(&self, cfg: &PipelineConfig, base: u64, next_id: u32) -> Result<OfflineSegment> {
         let ch = manta_dsp::channelizer::Channelizer::new(self.fs, self.center_freq_hz)
             .map_err(|e| anyhow::anyhow!(e))
