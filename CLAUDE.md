@@ -34,6 +34,14 @@ deprecated in place and stay. A ticket's outcome goes in its decision record
 and docs/DECISIONS/README.md row, not here. The log this section held until
 2026-10-16 is docs/DECISIONS/2026-10-16-man238-standing-brief.md.
 
+MAN-272 (replaces MAN-33): each spot carries its track's latest RST (`5NN`
+read as `599`) and a sticky `QRL?` flag, scanned per completed word by
+`manta_spot::message`; neither gates validation. JSON spots gain `rst`/
+`qrlQuery` (ahead of dispensa) and the `SPOT:` line an optional ` rst=599`/
+` QRL?`; telnet and the RBN uplink are unchanged. A track merge does not
+carry the loser's annotations (D5). SPEC §7.1 V32/V33. See
+docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` (start here, by audience); `README.md` (goals, install)

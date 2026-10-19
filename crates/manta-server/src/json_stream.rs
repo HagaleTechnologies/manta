@@ -1413,6 +1413,8 @@ mod tests {
                     confidence: 0.9,
                     track_id: 1,
                     sample_ts: 0,
+                    rst: None,
+                    qrl_query: false,
                 },
                 occurrence_count: 1,
             },

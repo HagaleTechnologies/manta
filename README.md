@@ -56,6 +56,10 @@ daemon, open source, with documented algorithms and golden-vector regression
 tests anyone can read, run, and check. Shared infrastructure is healthier with
 more than one implementation of it, on more than one operating system.
 
+[docs/COMPARISON.md](docs/COMPARISON.md) links SparkSDR, sdroxide,
+OpenWebRX+/csdr-skimmer and sdrainer, with no capability claims about
+any of them.
+
 ## Installation
 
 ### Download a release
@@ -736,7 +740,10 @@ the live-state stream only if it sets `[server].live_port`.
 
 `run` (alias `listen`) prints a `SPOT:` line on stdout for each confirmed
 spot, and decoded text on stderr, one line per track labelled with its track
-number, frequency and speed. With a `[server]` table the decoded text is off
+number, frequency and speed. A `SPOT:` line ends with ` rst=599` when its
+track decoded a signal report and ` QRL?` when the station asked whether the
+frequency is in use; the JSON stream carries both as `rst`/`qrlQuery` (see
+[docs/SPOT-SCHEMA.md](docs/SPOT-SCHEMA.md)). With a `[server]` table the decoded text is off
 unless you pass `--decoded-text`, so a service log holds spots and diagnostics
 only. Startup messages, warnings and errors also go to stderr, so the two
 streams can be captured separately:
@@ -914,6 +921,9 @@ recall/CER-vs-SNR curve on synthetic signals, regenerable from any build.
 
 ## Related projects
 
+- [docs/COMPARISON.md](docs/COMPARISON.md): neutral links to SparkSDR,
+  sdroxide, OpenWebRX+/csdr-skimmer and sdrainer — no capability claims
+  about any of them (MAN-360).
 - [coppa](https://github.com/HagaleTechnologies/coppa): `manta` reuses its
   FFT and its AWGN / Watterson HF channel models for the DSP core and test
   harness.

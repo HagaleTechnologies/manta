@@ -45,6 +45,18 @@ short-held locks, never an await, so IQ never touches the async runtime.
 §10 has the detail, and marks the ring-and-thread design as a target, not
 built.
 
+With several `[[input]]` entries (MAN-13) the left half of the diagram
+repeats once per input: each input has its own source, channelizer,
+detector and decoder pool on its own thread, and every input's events
+converge on the one validator, spot server and metrics registry:
+
+```
+ input "40m" ─▶ channelizer ─▶ detector ─▶ decoder pool ─┐
+ input "20m" ─▶ channelizer ─▶ detector ─▶ decoder pool ─┼─▶ validator ─▶ spot server
+ input "15m" ─▶ channelizer ─▶ detector ─▶ decoder pool ─┘   (one gate,     (one telnet,
+                                                              one dedupe)    JSON, uplink)
+```
+
 ## 2. Workspace layout
 
 Multi-crate workspace following coppa's conventions (edition 2021, MIT/Apache-2.0,
@@ -148,8 +160,16 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
 **Sample-rate assumptions.** Design center: 96–192 kS/s complex (covers any HF CW
 band segment; CW allocations are ≤ 100 kHz wide). Supported ceiling: 768 kS/s
 (Airspy HF+ full span). The channelizer parameterizes N to hold channel spacing
-near 100 Hz regardless of input rate (§4). Multi-band via multiple daemon
-instances, not one instance retuning — simpler, and SDRs are cheap.
+near 100 Hz regardless of input rate (§4). Several bands, or several segments
+of one band, run as several inputs of one daemon (MAN-13): each `[[input]]`
+entry -- an SDR, a ka9q-radio channel, a KiwiSDR channel -- gets its own
+thread with its own channelizer, track manager and decoder pool, and every
+input feeds one shared validator, so the repetition gate and the 10-minute
+dedupe see every input's reports and a station two inputs hear is spotted
+once. Inputs share one clock at the highest input rate and interleave their
+track ids; see `manta-engine::multi` and
+`docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md`. Several receivers
+on one HPSDR radio wait on MAN-307.
 
 **Variable-width capture** (issue #169): an optional decimation stage
 (`manta-dsp::decimate::Decimator`, wrapped as
@@ -348,6 +368,14 @@ transmission may never produce again).
    occurrence already evaluated as a Beacon before the guard appeared is
    not a loss and is not counted). Context
    determines spot type (CQ / DE / BEACON) — RBN spots carry this flag.
+
+   **Spot annotations (MAN-272).** Each completed word is also scanned for
+   an RST (the cut number `N` read as `9`, so `5NN` is `599`) and for
+   `QRL?` (`manta_spot::message`). A spot carries its track's latest report
+   and a sticky QRL? flag, read from the emitting track when the spot is
+   built. **Neither gates any validation step, and neither crosses a track
+   merge**: a merge loser's annotations end with its state, like its words.
+   See `docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md`.
 2. **Callsign plausibility**: structural grammar (prefix-digit-suffix, portable
    designators `/P /QRP /3`), which also rejects, by exact match, a fixed
    list of non-callsign CW conventions (`5NN`, `599`, `TEST`, `TU`, `QRZ`,
@@ -508,7 +536,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
 - **JSON Lines stream** (TCP and WebSocket, :7301): full-fidelity spot objects
   (adds confidence, track id, decoder text context). This is the cqdx ingest
   surface; schema published in `dispensa` as a JSON Schema contract alongside the
-  existing ecosystem contracts. Every spot carries a non-null, real `dxDxcc`/
+  existing ecosystem contracts. Each spot also carries `rst` (its track's most
+  recent RST, or `null`) and `qrlQuery` (the track sent `QRL?`), MAN-272's §6
+  annotations, ahead of dispensa; the telnet line and the RBN uplink do not
+  carry them. Every spot carries a non-null, real `dxDxcc`/
   `deDxcc` (an ADIF DXCC entity number, MAN-136) whenever the callsign
   resolves against `cty.dat`; when it doesn't, `dxDxcc`/`dxContinent`/
   `dxCqZone` (and their `de*` counterparts) carry named, out-of-domain
@@ -727,9 +758,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   reconnect loop reads as unhealthy even while technically connected at
   the instant it's checked. Exit code doubles as a cron/Nagios check.
   Unlike `/healthz`, which deliberately ignores the uplink (MAN-128 D10),
-  `/status` is about the uplink. Inherits `/metrics`'s unauthenticated,
-  `0.0.0.0`-by-default exposure posture
-  (`docs/RUNBOOKS/network-exposure.md`). `docs/METRICS.md` lists every
+  `/status` is about the uplink. Inherits `/metrics`'s unauthenticated
+  listener and its `[server].metrics_bind_addr`, `127.0.0.1` by default
+  (MAN-132, §7): reachable from another host only once an operator widens
+  it, per `docs/RUNBOOKS/network-exposure.md`. `docs/METRICS.md` lists every
   rendered family with its type, labels and when it has samples. Prometheus text
   endpoint (compiled in unconditionally, no feature flag — the "(feature
   `metrics`)" phrasing in older revisions of this doc was stale, no Cargo
@@ -795,6 +827,14 @@ validation (MAN-28). Dedupe (step 5) still applies.
   per second) and `manta_candidate_repetitions` (the repetition gate's
   count per candidate), fed by `manta_engine::DecodeQualityObserver` — see
   [MAN-118](docs/DECISIONS/2026-10-12-man118-decode-quality-metrics.md).
+  **MAN-13** (several `[[input]]` entries) adds no family: the `{source}`
+  label of `manta_source_health` and the other per-source families is each
+  input's `name`; `manta_active_tracks` and `manta_static_crashes_total`
+  are sums over inputs; and `manta_healthy`/`/healthz` pass while every
+  listener is up, the decode watchdog passes and at least one input is
+  healthy (with one input: that input), with the `MantaInputDown` alert
+  reporting a dead input — see
+  [MAN-13](docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md).
   What's still genuinely missing: per-stage queue depths, spots/min,
   spot-confidence histogram, and **ring**-overrun counting for live audio
   (§3 — blocked on a `coppa-audio` API addition, `manta-engine::soak`'s documented
@@ -968,6 +1008,15 @@ non-blocking send plus shared atomics and short locks between them.
   `IqSource::read()`, runs `Channelizer::process` and
   `TrackManager::process_hops`, feeds the batch's events to the validator,
   and reads again. Validation runs on this thread.
+- **Several inputs (MAN-13).** With several `[[input]]` entries
+  (`manta-engine::multi`) each input's read, channelizer, track manager and
+  decoder pool run on its own `manta-input-<name>` thread, that input's
+  decode thread in everything below, which sends whole batches of events
+  to one back end on `run`'s thread; the back end owns the only
+  `Validator` and every callback. Replay merges batches in `(batch end
+  time, input index)` order, so output stays byte-identical across runs;
+  live inputs merge in arrival order, so no input waits on another. An
+  input that fails or panics ends only its own thread.
 - **Decoder pool.** Inside `process_hops` the per-hop work (detector,
   ownership, promotion, eviction) is sequential. Then one rayon parallel pass
   on rayon's global pool drains each active track's `pending` buffer through

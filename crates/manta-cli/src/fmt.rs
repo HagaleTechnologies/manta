@@ -7,9 +7,17 @@ pub fn wpm_opt(value: Option<f32>) -> String {
     value.map(wpm).unwrap_or_else(|| "unknown".into())
 }
 
+/// MAN-272: ` rst=<RST>` and ` QRL?` follow `conf=` only when the spot's
+/// track decoded them, so an unannotated spot prints the same line as before.
 pub fn spot_line(spot: &manta_spot::Spot) -> String {
+    let rst = spot
+        .rst
+        .as_deref()
+        .map(|r| format!(" rst={r}"))
+        .unwrap_or_default();
+    let qrl = if spot.qrl_query { " QRL?" } else { "" };
     format!(
-        "SPOT: {} ({}) {} {} {} conf={}",
+        "SPOT: {} ({}) {} {} {} conf={}{rst}{qrl}",
         spot.callsign,
         spot.spot_type,
         khz(spot.freq_hz),
@@ -196,10 +204,21 @@ mod tests {
             spot_type: SpotType::Cq,
             track_id: 1,
             sample_ts: 0,
+            rst: None,
+            qrl_query: false,
         };
         assert_eq!(
             spot_line(&spot),
             "SPOT: W1AW (CQ) 14000.8 kHz 29 dB 20 WPM conf=0.79"
+        );
+        let annotated = Spot {
+            rst: Some("599".into()),
+            qrl_query: true,
+            ..spot
+        };
+        assert_eq!(
+            spot_line(&annotated),
+            "SPOT: W1AW (CQ) 14000.8 kHz 29 dB 20 WPM conf=0.79 rst=599 QRL?"
         );
         for (value, human, json) in [
             (SpotType::Cq, "CQ", "Cq"),

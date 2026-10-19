@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-16T15:47:53Z",
-  "head_commit": "4529021",
+  "generated_at": "2026-10-16T22:46:15Z",
+  "head_commit": "b8b9367",
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -87,7 +87,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:d6642b2d8281515140b20a7eb05facde2e4514f7be9119449d8a4f6c9a52522b",
+      "hash": "sha256:46dbe069431a9e5c1fe681d35277bca8a881b72097841924660d7f7240422758",
       "id": "determinism",
       "kind": "gotcha",
       "links": [
@@ -98,12 +98,13 @@
       "path": "pages/determinism.md",
       "sources": [
         "docs/SPEC-decode-core.md#6-determinism-requirements",
-        "ARCHITECTURE.md"
+        "ARCHITECTURE.md",
+        "docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md"
       ],
       "status": "current",
       "title": "What will bite you about the byte-identical decode requirement?",
-      "verified_commit": "d286147",
-      "verified_date": "2026-10-13",
+      "verified_commit": "6596e3a",
+      "verified_date": "2026-10-15",
       "visibility": "public"
     },
     {
@@ -195,7 +196,7 @@
         "CLAUDE.md"
       ],
       "status": "current",
-      "title": "manta — what is this and where do things live?",
+      "title": "manta \u2014 what is this and where do things live?",
       "verified_commit": "d286147",
       "verified_date": "2026-10-13",
       "visibility": "public"
@@ -243,7 +244,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:70ce6a10a24c459e7985a8e31f224298041289617c982c8907375cb9fdf373f1",
+      "hash": "sha256:73012b6f4002a218f3503361244f408d314175ba450b5d27ef9b22899fd982b6",
       "id": "source-reconnect",
       "kind": "gotcha",
       "links": [
@@ -257,6 +258,7 @@
         "crates/manta-cli/src/reconnect.rs",
         "crates/manta-cli/src/reconnect.rs (InputHealthTotals)",
         "crates/manta-input/src/lib.rs (IqSource::take_discontinuity)",
+        "docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md",
         "docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md"
       ],
       "status": "current",
@@ -266,7 +268,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:eb40916133f50002e9dc5e628cbe0c77e70446b1b950c79c7418423a0d1cba7f",
+      "hash": "sha256:07e3ff49bc362e6abe31f465492ef507ed13e471be9d6d82e5915658ca3426f6",
       "id": "spot-output-contract",
       "kind": "interface",
       "links": [
@@ -284,16 +286,17 @@
         "docs/DECISIONS/2026-10-11-man301-live-rbn-comparison.md",
         "docs/RUNBOOKS/rbn-comparison.md",
         "docs/SPOT-SCHEMA.md",
-        "docs/DECISIONS/2026-10-14-man137-json-stream-resume.md"
+        "docs/DECISIONS/2026-10-14-man137-json-stream-resume.md",
+        "docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md"
       ],
       "status": "current",
       "title": "What spot-output contracts does manta expose (telnet RBN + JSON)?",
-      "verified_commit": "9636fe0494b4bce7973c3e0c5ad854f9ebc16f73",
-      "verified_date": "2026-10-14",
+      "verified_commit": "799379d",
+      "verified_date": "2026-10-16",
       "visibility": "public"
     },
     {
-      "hash": "sha256:9a55eface9ef3ab23316ec6056dd89bda124fc2757e00b7a4cd3a0654122ec8d",
+      "hash": "sha256:70777e011e96d6b0797b03d61b2c1efa0babebe1a542a1d2b73043e72491b543",
       "id": "spot-validation",
       "kind": "subsystem",
       "links": [
@@ -309,12 +312,14 @@
         "docs/SPEC-decode-core.md#46-per-callsign-confidence-consumed-by-manta-spot",
         "docs/SPEC-decode-core.md#9-configuration-keys",
         "docs/DECISIONS/2026-09-09-beacon-emission-deferred-to-track-close.md",
-        "docs/DECISIONS/2026-10-14-man174-deferred-beacon-merge-bookkeeping.md"
+        "docs/DECISIONS/2026-10-14-man174-deferred-beacon-merge-bookkeeping.md",
+        "docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md",
+        "docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md"
       ],
       "status": "current",
       "title": "How does manta decide a decoded call is trustworthy enough to spot?",
-      "verified_commit": "60c4339",
-      "verified_date": "2026-10-14",
+      "verified_commit": "799379d",
+      "verified_date": "2026-10-16",
       "visibility": "public"
     },
     {
