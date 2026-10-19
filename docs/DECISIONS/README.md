@@ -11,6 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-19 | MAN-291 | [MAN-291: `field-node.py report` fails ledger integrity until a sample follows the window](2026-10-19-man291-post-window-sample.md) |
 | 2026-10-17 | MAN-275 | [MAN-275: a hostile or broken KiwiSDR receiver cannot stop the daemon; the plaintext-password exposure is accepted risk](2026-10-17-man275-kiwi-threat-model.md) |
 | 2026-10-17 | MAN-274 | [MAN-274: manta commits a Serena project config for agent symbol search](2026-10-17-man274-serena-project-config.md) |
 | 2026-10-17 | MAN-155 | [MAN-155: the related-projects page links other projects and makes no claims about them](2026-10-17-man155-related-projects-links-only.md) |

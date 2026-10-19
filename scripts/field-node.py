@@ -992,8 +992,14 @@ def summarize(records, params=None):
     # count and (if the recorder missed them) the archive, so spots_missed
     # cannot be counted and the D-I gate must not GO (PR #219 review).
     tail_restart = False
-    after = [s for s in reach if s["ts"] > end]
-    if seq and after and after[0].get("spots_total") is not None:
+    # A last sample exactly at the window end leaves no tail. Any other tail
+    # needs a reachable sample after the window with a spot counter; a report
+    # run before that scrape (right at END) cannot count it, so spots_missed
+    # is incomplete and ledger integrity fails (PRRT_kwDOTQvU8M6qmtCB, MAN-291).
+    tail_open = not seq or seq[-1]["ts"] < end
+    after = [s for s in reach if s["ts"] > end and s.get("spots_total") is not None]
+    tail_missing = tail_open and not after
+    if tail_open and seq and after:
         a_, b_ = seq[-1], after[0]
         bs_, as_t = b_["spots_total"], a_.get("spots_total")
         if a_["start_time"] == b_["start_time"] and as_t is not None:
@@ -1120,6 +1126,7 @@ def summarize(records, params=None):
     coverage = None
     spots_missed = None
     spots_missed_indeterminate = False
+    spots_missed_incomplete = False
     if recorded is not None:
         recorded_total = sum(v for k, v in recorded.items())
         # Emitted spots the archive lacks. Stage 1's D-I gate counts them as
@@ -1140,7 +1147,14 @@ def summarize(records, params=None):
             warnings.append(
                 "spots missed by the recorder are indeterminate: %s, so Stage 1 (D-I) cannot GO; "
                 "pass --missed-spots indeterminate to shadow-compare.py" % "; ".join(why))
-        else:
+        if tail_missing:
+            spots_missed_incomplete = True
+            warnings.append(
+                "no reachable sample after the window end (%s) yet: the spots emitted after the last "
+                "reachable sample (%s) are uncounted, so spots missed by the recorder are incomplete "
+                "and ledger integrity fails; run report again after the next scrape"
+                % (_iso(end), _iso(seq[-1]["ts"]) if seq else "none"))
+        if not why and not tail_missing:
             spots_missed = max(0, spots_emitted_total + tail_emitted - recorded_total)
         if spots_emitted_total > 0:
             coverage = recorded_total / float(spots_emitted_total)
@@ -1168,7 +1182,8 @@ def summarize(records, params=None):
     # blind to what that family detects (a restart without start_time, an
     # outage without the outage counters), so no verdict can rest on it:
     # an integrity failure fails the run, like unobserved time (D-F).
-    integrity_ok = not missing_counts and not int(p["interior_unparseable_lines"])
+    integrity_ok = (not missing_counts and not int(p["interior_unparseable_lines"])
+                    and not spots_missed_incomplete)
     if not all(c["pass"] for c in criteria) or not integrity_ok:
         verdict = "FAIL"
     elif in_progress:
@@ -1205,6 +1220,7 @@ def summarize(records, params=None):
         "recorded_coverage": coverage,
         "spots_missed": spots_missed,
         "spots_missed_indeterminate": spots_missed_indeterminate,
+        "spots_missed_incomplete": spots_missed_incomplete,
         "builds": builds,
         "notes": [{"at": _iso(n["ts"]), "ts": n["ts"], "note": n.get("note"), "reason": n.get("reason")}
                   for n in win_notes],
@@ -1214,6 +1230,7 @@ def summarize(records, params=None):
                       "samples": len(win_samples),
                       "reachable_samples": len(reachable_win),
                       "missing_metrics": missing_counts,
+                      "missing_post_window_sample": spots_missed_incomplete,
                       "pass": integrity_ok},
         "warnings": warnings,
     }
@@ -1250,8 +1267,12 @@ def render_markdown(s):
     span_label = s["progress"] if s["in_progress"] else "PASS (span)"
     w("- Span: %.1f/%s days: %s" % (s["window"]["span_days"], _fmt_num(s["params"]["min_days"]), span_label))
     if not s["integrity"]["pass"]:
-        w("- Ledger integrity: required metrics missing or ledger lines lost (see Ledger integrity): "
-          "FAIL (integrity)")
+        integ = s["integrity"]
+        causes = [c for c, bad in (("required metrics missing", integ["missing_metrics"]),
+                                   ("ledger lines lost", integ["interior_unparseable_lines"]),
+                                   ("no reachable sample after the window end yet",
+                                    integ["missing_post_window_sample"])) if bad]
+        w("- Ledger integrity: %s (see Ledger integrity): FAIL (integrity)" % ", ".join(causes))
     w("")
     w("## Window")
     w("")
@@ -1318,6 +1339,9 @@ def render_markdown(s):
         if s["spots_missed_indeterminate"]:
             w("Spots missed by the recorder: indeterminate, see the warnings "
               "(Stage 1: shadow-compare.py --missed-spots indeterminate; D-I cannot GO)")
+        elif s["spots_missed_incomplete"]:
+            w("Spots missed by the recorder: incomplete, no reachable sample after the window end yet "
+              "(Stage 1: run report again after the next scrape; D-I cannot GO until then)")
         else:
             w("Spots missed by the recorder: %d (Stage 1: shadow-compare.py --missed-spots %d)"
               % (s["spots_missed"], s["spots_missed"]))
@@ -1462,7 +1486,9 @@ def build_parser():
     rep.add_argument("--ledger", required=True, help="ledger JSON Lines file written by `sample`/`note`")
     rep.add_argument("--spots-dir", default=None,
                      help="record-spots output directory, for recorded-vs-emitted coverage and the "
-                          "spots_missed count Stage 1 passes to shadow-compare.py --missed-spots")
+                          "spots_missed count Stage 1 passes to shadow-compare.py --missed-spots; "
+                          "unless a sample falls exactly on the window end, that count needs a "
+                          "reachable sample after it, else it is incomplete and integrity fails")
     rep.add_argument("--from", dest="from_", default=None, metavar="ISO",
                      help="ISO-8601 window start (default: the last `start` note, else the first sample)")
     rep.add_argument("--to", default=None, metavar="ISO",
