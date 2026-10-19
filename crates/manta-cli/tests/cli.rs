@@ -1551,7 +1551,7 @@ fn hpsdr_host_without_freq_and_rate_is_a_clean_error() {
     assert!(out.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "note: empty.toml has no [server] table; the telnet/JSON/metrics servers are not started\nerror: --hpsdr-freq-hz is required with --hpsdr-host\n"
+        "note: empty.toml has no [server] table; the telnet/JSON/metrics servers are not started\nerror: --hpsdr-freq-hz is required with the hpsdr source\n"
     );
 }
 
@@ -3295,4 +3295,58 @@ fn decode_minimal_config_spots_an_unlisted_pattern() {
     assert!(decode_spots(&minimal_out)
         .iter()
         .any(|s| s["callsign"] == "QQ9ZZZ"));
+}
+
+#[test]
+fn hpsdr_discovery_flags_exist_and_conflict_with_other_sources() {
+    for sub in ["run", "soak", "doctor", "calibrate", "check"] {
+        let help = manta().args([sub, "--help"]).output().unwrap();
+        assert!(help.status.success());
+        assert!(
+            String::from_utf8_lossy(&help.stdout).contains("--hpsdr-mac"),
+            "{sub}"
+        );
+        let pairs = [
+            (["--hpsdr-host", "h"], ["--hpsdr-mac", "001122334455"]),
+            (["--kiwi-host", "h"], ["--hpsdr-freq-hz", "7030000"]),
+            (["--source", "f.wav"], ["--hpsdr-mac", "001122334455"]),
+            (["--ka9q-group", "239.1.1.1"], ["--hpsdr-rate-hz", "192000"]),
+            (["--device", "D"], ["--hpsdr-port", "1024"]),
+        ];
+        for (a, b) in pairs {
+            for args in [[a, b], [b, a]] {
+                let out = manta()
+                    .arg(sub)
+                    .args(args.into_iter().flatten())
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    out.status.code(),
+                    Some(2),
+                    "{sub}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&out.stderr).contains("cannot be used with"),
+                    "{sub}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn hpsdr_discovery_freq_and_port_select_hpsdr_without_a_host() {
+    for (args, missing) in [
+        (["--hpsdr-freq-hz", "7030000"], "--hpsdr-rate-hz"),
+        (["--hpsdr-port", "1024"], "--hpsdr-freq-hz"),
+        (["--hpsdr-mac", "001122334455"], "--hpsdr-freq-hz"),
+        (["--hpsdr-rate-hz", "192000"], "--hpsdr-freq-hz"),
+    ] {
+        let out = manta().arg("run").args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&out.stderr)
+            .contains(&format!("{missing} is required with the hpsdr source")));
+    }
 }

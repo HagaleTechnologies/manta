@@ -535,14 +535,24 @@ fn devices_json_smoke_is_inventory_independent_and_does_not_load_config() {
             .collect();
         assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
     }
-    assert_eq!(inventory["hpsdr"]["status"], "not_supported");
+    let hpsdr = &inventory["hpsdr"];
+    assert!(["ok", "error"].contains(&hpsdr["status"].as_str().unwrap()));
+    any_error |= hpsdr["status"] == "error";
+    assert_eq!(hpsdr["error"].is_string(), hpsdr["status"] == "error");
+    for radio in hpsdr["devices"].as_array().unwrap() {
+        for key in ["ip", "mac", "board", "status"] {
+            assert!(radio[key].is_string());
+        }
+        assert!(radio["firmware"].is_u64());
+        assert!([1, 2].contains(&radio["protocol"].as_u64().unwrap()));
+    }
     assert_eq!(inventory["kiwi"]["status"], "explicit_host");
     status(&output, i32::from(any_error));
     let output = manta().arg("devices").output().unwrap();
     assert!(matches!(output.status.code(), Some(0 | 1)));
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("Audio inputs:"));
-    assert!(text.contains("HPSDR: automatic discovery is not supported"));
+    assert!(text.contains("openHPSDR"));
     assert!(text.contains("KiwiSDR: use --kiwi-host HOST."));
 }
 

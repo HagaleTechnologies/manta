@@ -84,6 +84,7 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("input", "device"),
     ("input", "path"),
     ("input", "host"),
+    ("input", "mac"),
     ("input", "password"),
     ("input", "driver"),
     ("input", "group"),
@@ -297,7 +298,7 @@ impl InputKind {
             InputKind::File => &["path", "iq", "realtime", "loop"],
             InputKind::Kiwi => &["host", "port", "freq_hz", "password"],
             InputKind::Soapy => &["driver", "freq_hz", "rate_hz", "gain_db"],
-            InputKind::Hpsdr => &["host", "port", "freq_hz", "rate_hz"],
+            InputKind::Hpsdr => &["host", "mac", "port", "freq_hz", "rate_hz"],
             InputKind::Ka9q => &["group", "port", "ssrc", "interface"],
         }
     }
@@ -317,6 +318,7 @@ struct InputToml {
     #[serde(rename = "loop")]
     looped: Option<bool>,
     host: Option<String>,
+    mac: Option<String>,
     port: Option<u16>,
     freq_hz: Option<f64>,
     password: Option<String>,
@@ -388,7 +390,8 @@ pub(crate) enum SourceFromFile {
         gain_db: Option<f64>,
     },
     Hpsdr {
-        host: String,
+        host: Option<String>,
+        mac: Option<String>,
         port: u16,
         freq_hz: f64,
         rate_hz: f64,
@@ -833,16 +836,26 @@ fn check_input_entries(inputs: &[NamedInput], origin: &str) -> Result<()> {
                 ),
                 Some(_) => {}
             },
-            Some(SourceFromFile::Hpsdr { host, port, .. }) => {
+            Some(SourceFromFile::Hpsdr {
+                host, mac, port, ..
+            }) => {
                 let earlier = inputs[..i].iter().find(|o| {
-                    matches!(&o.input.source, Some(SourceFromFile::Hpsdr { host: h, port: p, .. })
-                        if h.eq_ignore_ascii_case(host) && p == port)
+                    matches!(&o.input.source, Some(SourceFromFile::Hpsdr { host: h, mac: m, port: p, .. })
+                        if p == port && match (host, h) {
+                            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                            (None, None) => mac == m,
+                            _ => false,
+                        })
                 });
                 if let Some(earlier) = earlier {
+                    let identity = host
+                        .as_deref()
+                        .or(mac.as_deref())
+                        .unwrap_or("discovery (no input.host or input.mac)");
                     bail!(
-                        "{origin}: [[input]] {name}: the HPSDR radio at {host}:{port} is \
+                        "{origin}: [[input]] {name}: the HPSDR radio at {identity}:{port} is \
                          already input {}; several receivers on one HPSDR radio are not \
-                         supported yet",
+                         supported yet (MAN-307)",
                         crate::fmt::quoted(&earlier.name)
                     );
                 }
@@ -858,6 +871,14 @@ fn check_input_entries(inputs: &[NamedInput], origin: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn check_hpsdr_mac(text: &str) -> std::result::Result<String, String> {
+    let mac = crate::parse_hpsdr_mac(text).map_err(|_| {
+        "input.mac must contain twelve hexadecimal digits, for example AA:BB:CC:DD:EE:FF"
+            .to_string()
+    })?;
+    Ok(manta_input::hpsdr::discovery::format_mac(&mac))
 }
 
 fn validate_input(
@@ -882,13 +903,14 @@ fn validate_input(
             .map(|v| crate::check_replay_epoch("input.replay_epoch", v))
             .transpose()?,
     };
-    let set: [(&str, bool); 15] = [
+    let set: [(&str, bool); 16] = [
         ("device", t.device.is_some()),
         ("path", t.path.is_some()),
         ("iq", t.iq.is_some()),
         ("realtime", t.realtime.is_some()),
         ("loop", t.looped.is_some()),
         ("host", t.host.is_some()),
+        ("mac", t.mac.is_some()),
         ("port", t.port.is_some()),
         ("freq_hz", t.freq_hz.is_some()),
         ("password", t.password.is_some()),
@@ -958,7 +980,13 @@ fn validate_input(
         },
         InputKind::Hpsdr => SourceFromFile::Hpsdr {
             port: port(crate::HPSDR_CONTROL_PORT)?,
-            host: req(t.host.clone(), "host", name)?,
+            host: {
+                if t.host.is_some() && t.mac.is_some() {
+                    return Err("input.host and input.mac cannot both be set".into());
+                }
+                t.host.clone()
+            },
+            mac: t.mac.as_deref().map(check_hpsdr_mac).transpose()?,
             freq_hz: crate::check_hpsdr_freq_hz("input.freq_hz", req(t.freq_hz, "freq_hz", name)?)?,
             rate_hz: crate::check_hpsdr_rate_hz("input.rate_hz", req(t.rate_hz, "rate_hz", name)?)?,
         },
@@ -1209,6 +1237,57 @@ mod tests {
                 load(Some(f.path()), Env::Read(&v))
             }
             None => load(None, Env::Read(&v)),
+        }
+    }
+
+    const HPSDR_DISCOVERY: &str =
+        "[input]\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n";
+
+    #[test]
+    fn hpsdr_discovery_accepts_neither_address_or_one_selector() {
+        for selector in [
+            "",
+            "host = \"radio.local\"\n",
+            "mac = \"aa-bbcc-ddee-ff\"\n",
+            "mac = \"aabbccddeeff\"\n",
+        ] {
+            assert!(
+                load_file(&format!("{HPSDR_DISCOVERY}{selector}")).is_ok(),
+                "{selector}"
+            );
+        }
+        let err = err_of(&format!(
+            "{HPSDR_DISCOVERY}host = \"h\"\nmac = \"aabbccddeeff\"\n"
+        ));
+        assert!(
+            err.contains("input.host and input.mac cannot both be set"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn hpsdr_discovery_mac_env_is_string_typed_and_normalized() {
+        let loaded = load_env(
+            Some(HPSDR_DISCOVERY),
+            &[("MANTA_INPUT_MAC", "001122334455")],
+        )
+        .unwrap();
+        let debug = format!("{:?}", loaded.input.source);
+        assert!(debug.contains("00:11:22:33:44:55"), "{debug}");
+        assert!(err_of(&format!("{HPSDR_DISCOVERY}mac = \"AA\"\n")).contains("input.mac"));
+        assert!(
+            err_of("[input]\ntype = \"audio\"\nmac = \"001122334455\"\n")
+                .contains("input.mac does not apply")
+        );
+        assert!(err_of(&format!("{HPSDR_DISCOVERY}device = \"wrong\"\n"))
+            .contains("hpsdr takes host, mac, port"));
+    }
+
+    #[test]
+    fn hpsdr_discovery_duplicate_hostless_inputs_are_refused() {
+        for selector in ["", "mac = \"aabbccddeeff\"\n"] {
+            let body = ["a", "b"].map(|name| format!("[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n{selector}")).join("\n");
+            assert!(err_of(&body).contains("several receivers on one HPSDR radio"));
         }
     }
 
@@ -1937,11 +2016,8 @@ mod tests {
                 "rate_hz",
                 "soapy",
             ),
-            (
-                "type = \"hpsdr\"\nfreq_hz = 7e6\nrate_hz = 48000.0\n",
-                "host",
-                "hpsdr",
-            ),
+            ("type = \"hpsdr\"\nfreq_hz = 7e6\n", "rate_hz", "hpsdr"),
+            ("type = \"hpsdr\"\nrate_hz = 192000.0\n", "freq_hz", "hpsdr"),
         ] {
             let err = err_of(&format!("[input]\n{body}"));
             assert!(

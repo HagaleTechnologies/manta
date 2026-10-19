@@ -797,8 +797,8 @@ impl ReceiverKind {
                  radio; install its SoapySDR module if it does not"
             }
             ReceiverKind::Hpsdr => {
-                "check --hpsdr-host/input.host, and that the radio is powered on and on this \
-                 network"
+                "let manta discover the radio, pin it with --hpsdr-mac/input.mac, or check \
+                 --hpsdr-host/input.host; the radio must be powered on and on this network"
             }
             ReceiverKind::Ka9q => {
                 "check --ka9q-group/input.group and --ka9q-ssrc/input.ssrc against the radiod \
@@ -1649,7 +1649,8 @@ mod tests {
         cases.push((
             crate::LiveSourceSpec::Hpsdr(crate::HpsdrOpts {
                 host: Some("10.0.0.5".into()),
-                port: 1024,
+                mac: None,
+                port: Some(1024),
                 freq: Some(7e6),
                 rate: Some(48_000.0),
             }),

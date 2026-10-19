@@ -622,11 +622,19 @@ fn input_summary(file: &crate::config::InputFile) -> String {
         ),
         Some(SourceFromFile::Hpsdr {
             host,
+            mac,
             port,
             freq_hz,
             rate_hz,
         }) => {
-            format!("input: type=hpsdr host={host} port={port} freq_hz={freq_hz} rate_hz={rate_hz}")
+            let mut line = format!(
+                "input: type=hpsdr host={} port={port} freq_hz={freq_hz} rate_hz={rate_hz}",
+                host.as_deref().unwrap_or("discovery")
+            );
+            if let Some(mac) = mac {
+                line.push_str(&format!(" mac={mac}"));
+            }
+            line
         }
         Some(SourceFromFile::Ka9q {
             group,
@@ -1751,6 +1759,7 @@ mod tests {
         ("input", "device"),
         ("input", "path"),
         ("input", "host"),
+        ("input", "mac"),
         ("input", "freq_hz"),
         ("input", "driver"),
         ("input", "rate_hz"),
@@ -2004,6 +2013,22 @@ mod tests {
     }
 
     #[test]
+    fn hpsdr_scaffold_mac_alternative_is_valid_without_host() {
+        let body = format!(
+            "[input]\ntype = \"hpsdr\"\n{}",
+            uncommented("input", |k| InputKind::Hpsdr.keys().contains(&k)
+                && k != "host")
+        );
+        match loaded(&body).input.source {
+            Some(SourceFromFile::Hpsdr { host, mac, .. }) => {
+                assert_eq!(host, None);
+                assert_eq!(mac.as_deref(), Some("02:11:22:33:44:55"));
+            }
+            other => panic!("wrong source: {other:?}"),
+        }
+    }
+
+    #[test]
     fn no_default_examples_are_valid_when_uncommented() {
         let server = format!("[server]\n{}", uncommented("server", |_| true));
         let l = loaded(&server);
@@ -2028,7 +2053,8 @@ mod tests {
             let body = format!(
                 "[input]\ntype = \"{}\"\n{}",
                 kind.name(),
-                uncommented("input", |k| kind.keys().contains(&k))
+                uncommented("input", |k| kind.keys().contains(&k)
+                    && !(kind == InputKind::Hpsdr && k == "mac"))
             );
             let l = loaded(&body);
             assert_eq!(l.input.source.map(|s| s.kind()), Some(kind), "{body}");

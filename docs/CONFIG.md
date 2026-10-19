@@ -212,7 +212,8 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `iq` | `false` | live: `type = "file"` | `true` for a two-channel IQ recording. `--source-iq` sets it. |
 | `realtime` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` paces the replay to the recording's own clock, so telnet/JSON clients can watch it. `--realtime` sets it; a live source refuses it. See [DECISIONS/2026-10-10-man269-paced-looping-replay.md](DECISIONS/2026-10-10-man269-paced-looping-replay.md). |
 | `loop` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` replays the file again from the start each time it ends, until stopped; implies `realtime`. `--loop` sets it; a live source refuses it. |
-| `host` | none; example `"<your-receiver-host>"`; required for kiwi and hpsdr | live: `type = "kiwi"` or `"hpsdr"` | Receiver host name. `--kiwi-host` or `--hpsdr-host` overrides it. |
+| `host` | none; example `"<your-receiver-host>"`; required for kiwi; optional for hpsdr | live: `type = "kiwi"` or `"hpsdr"` | Receiver host name. `--kiwi-host` or `--hpsdr-host` overrides it. For hpsdr, set host or mac, or neither to discover the only available radio. An explicit host sends no discovery requests; host and mac together are refused. |
+| `mac` | none; example `"02:11:22:33:44:55"`; unset selects the only discovered radio | live: `type = "hpsdr"` | Pin a radio across address changes. `--hpsdr-mac` or `MANTA_INPUT_MAC` sets it. Accepts colon, dash or bare hexadecimal spelling, case-insensitively; summaries print uppercase colon-separated bytes. Cannot be combined with host. |
 | `port` | `8073`; `1024` for hpsdr; `5004` for ka9q | live: `type = "kiwi"`, `"hpsdr"` or `"ka9q"` | Receiver port, 1 to 65535; for ka9q, the group's RTP data port. `--kiwi-port`, `--hpsdr-port` or `--ka9q-port` overrides it. |
 | `password` | `""` | live: `type = "kiwi"` | KiwiSDR password; empty for a public receiver. `config check` prints only whether it is set. `--kiwi-password` overrides it. |
 | `driver` | none; example `"driver=rtlsdr"`; required for soapy | live: `type = "soapy"` (needs the build feature) | SoapySDR device arguments. `--soapy-driver` overrides it. |
@@ -244,7 +245,7 @@ per receiver. Each entry takes the keys above, plus `name`. A one-entry
 - File replay and live receivers do not mix in one run. `replay_epoch` goes
   on the first entry only, and every file entry has the same `realtime` and
   `loop`.
-- Two entries on one HPSDR radio are refused until MAN-307.
+- Two entries on one HPSDR radio are refused until MAN-307, including duplicate MACs or two entries with neither host nor MAC. Pin each radio by a distinct MAC when several share the LAN.
 - `MANTA_INPUT_*` and the per-receiver flags `--freq-correction-ppm`,
   `--dial-freq-hz` and `--capture-rate-hz` cannot say which entry they set,
   so they are refused; a source flag (`--source`, `--kiwi-host`, ...) still

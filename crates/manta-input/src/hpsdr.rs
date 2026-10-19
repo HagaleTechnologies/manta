@@ -65,6 +65,8 @@
 //! time with an actionable error, rather than silently overrunning the
 //! link.
 
+pub mod discovery;
+
 use crate::{InputHealthCounters, IqSource};
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
@@ -74,12 +76,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Metis/Hermes discovery and control port. Spike doc: "standard Metis
-/// broadcast, UDP port 1024" for HL2; Red-Pitaya-family devices are reached
-/// the same way once their IP is known (this driver does not implement the
-/// separate avahi/mDNS discovery path the spike flags for that family —
-/// callers supply the host directly, matching `KiwiIqSource::connect`'s
-/// host/port convention).
+/// Metis/Hermes discovery and control port. [`discovery`] broadcasts on
+/// this port when no host is configured. Explicit hosts bypass discovery.
+/// The separate avahi/mDNS path for Red Pitaya is not implemented.
 pub const CONTROL_PORT: u16 = 1024;
 
 const METIS_HEADER_LEN: usize = 8;

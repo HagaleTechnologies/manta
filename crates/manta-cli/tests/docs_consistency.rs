@@ -129,6 +129,8 @@ fn readme_inputs_table_covers_every_shipped_input() {
         "--kiwi-host",
         "--soapy-driver",
         "--hpsdr-host",
+        "--hpsdr-mac",
+        "found automatically when no host is set",
         "--ka9q-group",
     ] {
         assert!(
@@ -1274,6 +1276,7 @@ fn spec_documents_every_input_and_spot_key() {
                 "realtime",
                 "loop",
                 "host",
+                "mac",
                 "port",
                 "freq_hz",
                 "password",
