@@ -180,7 +180,11 @@ pub fn add_fsk(iq: &mut [Complex32], fs: f64, spec: &FskSpec) {
                 phi = wrap(phi + std::f64::consts::TAU * f / fs);
             }
             let faded = coppa_channel::watterson::watterson_preset(&real, fs as f32, preset, seed);
-            let mut hilbert = manta_dsp::hilbert::HilbertTransformer::new();
+            // MAN-273 D4: frozen at the M1 129-tap design so the RTTY
+            // fixtures' bytes do not move with the live-decode default.
+            let mut hilbert = manta_dsp::hilbert::HilbertTransformer::with_taps(
+                manta_dsp::hilbert::HILBERT_TAPS_M1_LEGACY,
+            );
             // The Hilbert output lags its input by `delay()` samples.
             let lag = hilbert.delay() as f64;
             let analytic = hilbert.process(&faded);
