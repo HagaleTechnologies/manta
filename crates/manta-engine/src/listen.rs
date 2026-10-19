@@ -359,12 +359,22 @@ fn spawn_veto_band(trusted: Option<(f64, f64)>, own: Option<(f64, f64)>) -> Opti
     }
 }
 
+/// MAN-273: the spawn guard `listen` applies -- the larger of the
+/// configured `DetectorConfig::guard_hz` and the source's
+/// `IqSource::analytic_guard_hz`, so configuration can widen the guard but
+/// never narrow what the front end declares.
+fn effective_guard_hz(configured: f64, source: f64) -> f64 {
+    configured.max(source)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn new_segment(
     fs: f64,
     center_freq_hz: f64,
     rf_passband_hz: (f64, f64),
     trusted_band_hz: Option<(f64, f64)>,
+    guard_hz: f64,
+    analytic: bool,
     cfg: &PipelineConfig,
     ids: crate::multi::TrackIdSpace,
     next_id: u32,
@@ -399,6 +409,13 @@ fn new_segment(
     if let Some((lo, hi)) = trusted_band_hz {
         tm.set_trusted_band_hz(lo, hi);
     }
+    // MAN-273: never spawn tracks inside the analytic front end's
+    // DC/Nyquist guard (0.0, every complex-IQ source, sets nothing).
+    if guard_hz > 0.0 {
+        tm.set_guard_hz(guard_hz);
+    }
+    // MAN-273 D3: an analytic source's negative channels carry only images.
+    tm.set_mirror_image_guard(analytic);
     // MAN-118: a post-discontinuity segment keeps reporting.
     tm.set_quality_observer(quality);
     // MAN-324: a post-discontinuity segment keeps the live occupancy window.
@@ -588,6 +605,11 @@ pub fn listen_with_observers(
     // discontinuity rebuild below) -- `None` for every non-decimated
     // source leaves each segment's manager exactly as before.
     let trusted_band_hz = src.trusted_band_hz();
+    // MAN-273: the source's analytic-signal guard, widened (never narrowed)
+    // by the configured one and applied to every segment like the trusted
+    // band.
+    let analytic = src.analytic_guard_hz() > 0.0;
+    let guard_hz = effective_guard_hz(cfg.detector.guard_hz, src.analytic_guard_hz());
 
     let mut validator = cfg.validator(fs)?;
     let references = observers
@@ -662,6 +684,8 @@ pub fn listen_with_observers(
         center_freq_hz,
         rf_passband_hz,
         trusted_band_hz,
+        guard_hz,
+        analytic,
         cfg,
         crate::multi::TrackIdSpace::SINGLE,
         1,
@@ -831,6 +855,8 @@ pub fn listen_with_observers(
                 center_freq_hz,
                 rf_passband_hz,
                 trusted_band_hz,
+                guard_hz,
+                analytic,
                 cfg,
                 crate::multi::TrackIdSpace::SINGLE,
                 next_id,
@@ -1177,12 +1203,16 @@ pub(crate) fn run_input_front(
     let rf_passband_hz = src.rf_passband_hz();
     // MAN-310: a split band plan's stream spawns only on its own share.
     let trusted_band_hz = spawn_veto_band(src.trusted_band_hz(), spawn_band_hz);
+    let analytic = src.analytic_guard_hz() > 0.0;
+    let guard_hz = effective_guard_hz(cfg.detector.guard_hz, src.analytic_guard_hz());
     let mut crash_base: u64 = 0;
     let mut seg = new_segment(
         fs,
         center_freq_hz,
         rf_passband_hz,
         trusted_band_hz,
+        guard_hz,
+        analytic,
         cfg,
         ids,
         ids.first,
@@ -1287,6 +1317,8 @@ pub(crate) fn run_input_front(
                 center_freq_hz,
                 rf_passband_hz,
                 trusted_band_hz,
+                guard_hz,
+                analytic,
                 cfg,
                 ids,
                 next_id,
@@ -1375,6 +1407,14 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn effective_guard_takes_the_max_of_config_and_source() {
+        // MAN-273: configuration can widen the source's guard, never narrow it.
+        assert_eq!(effective_guard_hz(0.0, 600.0), 600.0);
+        assert_eq!(effective_guard_hz(900.0, 600.0), 900.0);
+        assert_eq!(effective_guard_hz(0.0, 0.0), 0.0);
+    }
 
     #[test]
     fn live_closures_use_the_closing_inputs_batch_time() {
