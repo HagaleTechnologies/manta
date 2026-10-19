@@ -1557,7 +1557,10 @@ inside the decode path. A live source's disconnect/reconnect (MAN-73) reports
 the missed span, in samples, via `IqSource::take_discontinuity()`; `listen()`
 advances the sample clock by that count and starts a fresh track segment, so
 `sample_ts` stays monotonic and wall-clock-true across the gap with no audio
-spliced in. File replay never reports a discontinuity. An end of stream
+spliced in. The reported span ends where the reopened source's acquisition
+began (`IqSource::acquisition_start_offset()` into its open call), not where
+its opener returned, so samples it captured while opening are not counted
+twice (MAN-259). File replay never reports a discontinuity. An end of stream
 reported with a discontinuity pending (MAN-258: a stop while the source is
 down) closes the segment the same way and starts none.
 
