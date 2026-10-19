@@ -232,8 +232,9 @@ tail -n 1 /var/lib/manta-field/ledger.jsonl
 
 After 24 h, evaluate the ledger over the 24 h window. No Aggregator is connected in Stage 1, so
 pass `--min-aggregator 0` to switch off the D-B criterion. Wait at least one scrape interval (60 s)
-after `END` first: spots emitted between the last scrape and `END` only show on the next scrape,
-and without it the missed-spot count below can come out low (MAN-291 makes `report` enforce this):
+after `END` first: spots emitted between the last scrape and `END` only show on the next scrape.
+Until the ledger has a reachable sample after `END`, `report` cannot count them, so it fails ledger
+integrity (exit 1) and reads the missed-spot count below as `incomplete`:
 
 ```sh
 START=2026-11-01T12:00:00Z   # the stage 1 start note's time, UTC
@@ -250,6 +251,11 @@ comparison below counts them as uncorroborated.
 If manta restarted in the window, or no sample precedes the start note, that line reads
 `indeterminate` (the spot counter is per process, and spots before the first sample are unseen);
 pass `indeterminate` and Stage 1 is NO-GO.
+
+If it reads `incomplete`, the ledger has no reachable sample after `END` yet: wait for the next
+scrape and run `report` again. `shadow-compare.py` refuses `--missed-spots incomplete`. If the node
+stays unreachable after `END`, the count cannot complete: pass `indeterminate` and Stage 1 is
+NO-GO.
 
 ```sh
 MISSED=0   # N from "Spots missed by the recorder: N", or indeterminate
@@ -410,6 +416,10 @@ What to do with what it shows:
   which never replays (resume is WebSocket-only), so spots emitted while the recorder is disconnected are lost to it. Check
   `systemctl status manta-field-spots` and `journalctl -u manta-field-spots`, and the
   `manta_spots_dropped_lagged_total` counter.
+- **Ledger integrity: no reachable sample after the window end yet.** With no `--to` and no end
+  note the window ends at the newest sample. If that sample is unreachable (the node is down
+  now), the spots emitted since the last reachable sample are uncounted. Run the check again
+  once the node answers.
 
 ## 8. Day 7: record the comparison (scenario 2)
 
@@ -446,6 +456,7 @@ section 10, with the "Timeline" and "Scenario 2 (day 7)" sections filled in and 
 ```sh
 sudo -u manta python3 /opt/manta/scripts/field-node.py note \
   --ledger /var/lib/manta-field/ledger.jsonl --kind end --reason "day 30"
+sleep 90   # one scrape after the end note; until then report fails ledger integrity
 python3 /opt/manta/scripts/field-node.py report \
   --ledger /var/lib/manta-field/ledger.jsonl --spots-dir /var/lib/manta-field/spots \
   --min-days 30 > ~/day30-report.md; echo "exit $?"
@@ -454,7 +465,9 @@ python3 /opt/manta/scripts/field-node.py report \
   --min-days 30 --format json > ~/day30-report.json
 ```
 
-Exit 0 is PASS. Then download the daily archives for the whole run and compare the full window:
+Exit 0 is PASS. If `## Verdict` says `Ledger integrity: no reachable sample after the window end
+yet`, the report ran before the ledger's next scrape: run both commands again. Then download the
+daily archives for the whole run and compare the full window:
 
 ```sh
 cd ~/rbn

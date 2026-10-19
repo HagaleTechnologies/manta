@@ -943,6 +943,97 @@ class ReportTests(unittest.TestCase):
         s = summ(recs, from_ts=T0, to_ts=T0 + 143 * IV + 300, recorded_by_day={})
         self.assertEqual(s["spots_emitted_total"], 0)
         self.assertEqual(s["spots_missed"], 3)
+        self.assertFalse(s["spots_missed_incomplete"])
+        self.assertTrue(s["integrity"]["pass"])
+
+    def test_no_post_window_sample_makes_spots_missed_incomplete(self):
+        # PRRT_kwDOTQvU8M6qmtCB (MAN-291): report runs at END, before the
+        # first scrape after --to. The 3 spots the recorder missed after the
+        # last in-window sample are on no sample yet, so spots_missed must
+        # not read 0 (a GO): it is incomplete and ledger integrity fails.
+        ov = {i: {"spots_inc": 0} for i in range(1, 145)}
+        ov[144] = {"spots_inc": 3}
+        to = T0 + 143 * IV + 300
+        recs = [r for r in make_ledger(days=1, end_note=False, overrides=ov) if r["ts"] <= to]
+        s = summ(recs, from_ts=T0, to_ts=to, recorded_by_day={})
+        self.assertIsNone(s["spots_missed"])
+        self.assertTrue(s["spots_missed_incomplete"])
+        self.assertFalse(s["spots_missed_indeterminate"])
+        self.assertTrue(s["integrity"]["missing_post_window_sample"])
+        self.assertFalse(s["integrity"]["pass"])
+        self.assertEqual(s["verdict"], "FAIL")
+        self.assertTrue(any("no reachable sample after the window end (2026-01-01T23:55:00Z) yet" in w
+                            and "(2026-01-01T23:50:00Z)" in w for w in s["warnings"]))
+        # A post-window sample without manta_spots_total cannot count the tail either.
+        late = dict(make_ledger(days=1, end_note=False, overrides=ov)[-1], spots_total=None)
+        self.assertTrue(summ(recs + [late], from_ts=T0, to_ts=to,
+                             recorded_by_day={})["spots_missed_incomplete"])
+        # Without --spots-dir nothing needs the tail, so integrity holds.
+        s = summ(recs, from_ts=T0, to_ts=to)
+        self.assertFalse(s["spots_missed_incomplete"])
+        self.assertTrue(s["integrity"]["pass"])
+        spots_dir = os.path.join(self.tmp.name, "spots")
+        os.makedirs(spots_dir)
+        frm, end = fn._iso(T0), "2026-01-01T23:55:00Z"
+        r = self.report(recs, "--spots-dir", spots_dir, "--from", frm, "--to", end, "--min-days", "1")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("Spots missed by the recorder: incomplete", r.stdout)
+        self.assertIn("- Ledger integrity: no reachable sample after the window end yet "
+                      "(see Ledger integrity): FAIL (integrity)", r.stdout)
+        r = self.report(recs, "--spots-dir", spots_dir, "--from", frm, "--to", end, "--min-days", "1",
+                        "--format", "json")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        out = json.loads(r.stdout)
+        self.assertIsNone(out["spots_missed"])
+        self.assertTrue(out["spots_missed_incomplete"])
+        self.assertTrue(out["integrity"]["missing_post_window_sample"])
+        self.assertFalse(out["integrity"]["pass"])
+
+    def test_end_note_between_scrapes_waits_for_the_next_sample(self):
+        # The day-30 path: `note --kind end`, then report with no --to.
+        ov = {i: {"spots_inc": 0} for i in range(1, 145)}
+        ov[144] = {"spots_inc": 3}
+        full = make_ledger(days=1, end_note=False, overrides=ov)
+        note = {"v": 1, "kind": "note", "ts": T0 + 143 * IV + 300, "note": "end", "reason": "day 30"}
+        early = [r for r in full if r["ts"] <= note["ts"]] + [note]
+        s = summ(early, recorded_by_day={})
+        self.assertTrue(s["spots_missed_incomplete"])
+        self.assertFalse(s["integrity"]["pass"])
+        s = summ(full + [note], recorded_by_day={})
+        self.assertFalse(s["spots_missed_incomplete"])
+        self.assertEqual(s["spots_missed"], 3)
+
+    def test_sample_at_window_end_needs_no_post_window_sample(self):
+        # MAN-291 scenario 3: the last in-window sample sits on --to, so
+        # there is no tail. Spots and a restart after --to are outside the
+        # window and must not reach spots_missed.
+        ov = {i: {"spots_inc": 0} for i in range(1, 145)}
+        ov[144] = {"spots_inc": 3, "start_time": T0 + 143 * IV + 100}
+        full = make_ledger(days=1, end_note=False, overrides=ov)
+        to = T0 + 143 * IV
+        for recs in ([r for r in full if r["ts"] <= to], full):
+            s = summ(recs, from_ts=T0, to_ts=to, recorded_by_day={})
+            self.assertEqual(s["spots_missed"], 0)
+            self.assertFalse(s["spots_missed_incomplete"])
+            self.assertFalse(s["spots_missed_indeterminate"])
+            self.assertTrue(s["integrity"]["pass"])
+        # The default window ends at the last sample, which is reachable here.
+        s = summ([r for r in full if r["ts"] <= to], recorded_by_day={})
+        self.assertFalse(s["spots_missed_incomplete"])
+
+    def test_indeterminate_outranks_incomplete(self):
+        # A restart in the window is final; the missing tail still fails integrity.
+        ov = {i: {"spots_inc": 0} for i in range(1, 145)}
+        ov[50] = {"spots_inc": 0, "start_time": T0 + 49 * IV + 300}
+        to = T0 + 143 * IV + 300
+        recs = [r for r in make_ledger(days=1, end_note=False, overrides=ov) if r["ts"] <= to]
+        s = summ(recs, from_ts=T0, to_ts=to, recorded_by_day={})
+        self.assertTrue(s["spots_missed_indeterminate"])
+        self.assertTrue(s["spots_missed_incomplete"])
+        self.assertFalse(s["integrity"]["pass"])
+        md = fn.render_markdown(s)
+        self.assertIn("Spots missed by the recorder: indeterminate", md)
+        self.assertIn("no reachable sample after the window end yet", md)
 
     def test_restart_makes_spots_missed_indeterminate(self):
         # PRRT_kwDOTQvU8M6qo5Ff, Codex's example: 20 spots emitted and
