@@ -3100,7 +3100,6 @@ fn wiki_windows_build_setup_stamp_names_a_snapshot_without_release_yml() {
     );
 }
 
-<<<<<<< HEAD
 // ---- MAN-310: docs/CONFIG.md's band table is CW_SEGMENTS ----
 
 /// `"5351.5"` kHz as Hz; `None` for the table's `–`.
@@ -3140,7 +3139,8 @@ fn config_md_band_table_matches_cw_segments() {
         assert_eq!(khz_cell(row[2]), seg.beacon_hz, "{}", seg.band);
         assert_eq!(khz_range_cell(row[3]), seg.span_hz(), "{}", seg.band);
     }
-=======
+}
+
 // ---- MAN-119: the corpus runbook's test commands can be run as written ----
 
 /// Cargo runs an integration test from its package root
@@ -3175,5 +3175,4 @@ fn corpus_runbook_passes_an_absolute_corpus_dir() {
         seen > 0,
         "{rel} no longer sets MANTA_CORPUS_DIR in a command; this test needs updating"
     );
->>>>>>> 5d669936ee6cdf0d5f72c8815cbceaeb3868733e
 }
