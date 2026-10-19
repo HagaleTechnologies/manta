@@ -101,9 +101,14 @@ The choices, each with what it rules out:
    signal half a channel off centre 19 Hz off after the crash; at +60 and
    +80 dB the two hops moved the estimate by at most 1.2 Hz, because they
    sit near the 3 dB lift threshold (`freq_across_channel.rs`). The
-   rollback does not reach values already reported on those two hops: a
-   `TrackMeta` (every 375 hops) or a promotion that lands on one of them
-   still carries it.
+   rollback alone did not reach values already reported on those two hops
+   (Codex round 2): a `TrackMeta` (every 375 hops) or a promotion landing
+   on one of them, whose entry was already queued (or drained in an
+   earlier batch), carried the contaminated value. So `freq_hz` reports
+   `Z` from before the last two unsuppressed hops, not the live `Z`: a
+   hop's report never includes a phase product the crash detector could
+   still roll back. At α = 0.01 (a ~100-hop time constant) the two-hop
+   lag is immaterial.
 
 ## Per-table characterisation (MAN-187)
 

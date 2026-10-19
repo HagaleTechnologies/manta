@@ -127,6 +127,9 @@ Per hop, for a track whose selected channel is `k₀`, two estimators run.
 - Track phase sum: `Z ← Z + α·(z_m − Z)`, α = 0.01, accumulated in `f64`.
 - Position `C_f = arg(Z)/2π · 4`, unwrapped to the value nearest the
   centroid `C`. Until the first contributing hop (`Z = 0`), `C_f = C`.
+  The reported `C_f` uses `Z` as it stood before the last two unsuppressed
+  hops (the two a crash declared on the next hop rolls back, §2.7), so no
+  report carries a crash's onset hops.
 - Spot frequency: `f_spot = f(0) + C_f·Δ` rounded to **0.01 kHz** for the
   telnet output (MAN-88 — RBN's live feed carries 2 decimals of kHz; the
   previous one-decimal rounding discarded 10 Hz of the estimator's real

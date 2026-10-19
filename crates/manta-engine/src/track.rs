@@ -1379,7 +1379,8 @@ impl Track {
     /// `CRASH_MIN_HOPS - 1` lifted hops before it (MAN-114, Codex review
     /// PR #346). They were not yet flagged, and `phase_z` is power-weighted:
     /// a +100 dB crash's onset hops put a +6 dB signal's spot 19 Hz off
-    /// (`freq_across_channel.rs`).
+    /// (`freq_across_channel.rs`). `freq_hz` reports from `phase_hist`'s
+    /// front, so nothing already queued carries those two hops either.
     fn rollback_phase(&mut self) {
         if let Some(&z) = self.phase_hist.front() {
             self.phase_z = z;
@@ -1415,8 +1416,20 @@ impl Track {
     /// `CENTER_EMA_ALPHA` instead, so the report tracks ongoing drift. See
     /// `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md` (item 5)
     /// for the full rationale.
+    ///
+    /// **Reported two unsuppressed hops late (MAN-114, Codex review PR
+    /// #346).** The phase used is `phase_hist`'s front entry -- `phase_z`
+    /// before the last `CRASH_MIN_HOPS - 1` unsuppressed hops -- not the
+    /// live `phase_z`. Those are exactly the hops a crash declared on the
+    /// next hop has `rollback_phase` undo, so no report (a queued
+    /// `TrackMeta` entry, a promotion, the live state) ever carries their
+    /// phase products before the crash detector has had its say on them.
+    /// After a rollback, and through a crash, `phase_hist` is empty and the
+    /// (already restored) `phase_z` is used. At α = 0.01 the two-hop lag is
+    /// far below the estimator's own time constant.
     fn freq_hz(&self, center_freq_hz: f64, channel_spacing_hz: f64, n_channels: usize) -> f64 {
-        let pos = phase_position(self.phase_z, self.center).unwrap_or(self.center);
+        let z = self.phase_hist.front().copied().unwrap_or(self.phase_z);
+        let pos = phase_position(z, self.center).unwrap_or(self.center);
         let k0_freq = center_freq_hz
             + wrapped_channel_offset(self.birth_channel, n_channels) * channel_spacing_hz;
         k0_freq + (pos - self.birth_channel as f64) * channel_spacing_hz
@@ -3584,6 +3597,54 @@ mod tests {
         let got = track.freq_hz(14_000_000.0, 93.75, 64);
         let want = 14_000_000.0 + (pos - 64.0) * 93.75;
         assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+    }
+
+    #[test]
+    fn freq_hz_never_reports_the_two_hops_a_crash_onset_rolls_back() {
+        // MAN-114 (Codex review, PR #346, round 2): a crash is declared on
+        // its third lifted hop, after the first two have already folded
+        // into `phase_z` and been queued with a `freq_hz`. Those per-hop
+        // reports must not carry the lifted hops' phase products: neither
+        // on the lifted hops themselves nor after the rollback.
+        let mut track = Track::new(1, 5, &cfg());
+        track.center = 5.1;
+        let pos = track.center + 0.3;
+        let clean = Complex64::from_polar(0.7, std::f64::consts::TAU * pos / 4.0);
+        for _ in 0..1000 {
+            track.note_phase();
+            track.update_phase(clean);
+        }
+        let want = track.freq_hz(14_000_000.0, 93.75, 64);
+        assert!(
+            (want - (14_000_000.0 + pos * 93.75)).abs() < 1e-6,
+            "got {want}"
+        );
+        // Two lifted hops at a wildly different phase and +100 dB.
+        let lifted = Complex64::from_polar(1e10, std::f64::consts::TAU * (pos + 0.45) / 4.0);
+        for hop in 0..2 {
+            track.note_phase();
+            track.update_phase(lifted);
+            let got = track.freq_hz(14_000_000.0, 93.75, 64);
+            assert!(
+                (got - want).abs() < 1e-6,
+                "lifted hop {hop} reported {got}, want {want}"
+            );
+        }
+        // Crash onset: rollback, then suppressed hops.
+        track.rollback_phase();
+        let got = track.freq_hz(14_000_000.0, 93.75, 64);
+        assert!(
+            (got - want).abs() < 1e-6,
+            "onset reported {got}, want {want}"
+        );
+        // Back to clean hops after the crash.
+        track.note_phase();
+        track.update_phase(clean);
+        let got = track.freq_hz(14_000_000.0, 93.75, 64);
+        assert!(
+            (got - want).abs() < 1e-6,
+            "post-crash reported {got}, want {want}"
+        );
     }
 
     #[test]
