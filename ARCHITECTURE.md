@@ -981,7 +981,14 @@ validation (MAN-28). Dedupe (step 5) still applies.
   deployment, the runtime tears down microseconds later. See
   `docs/DECISIONS/2026-09-04-man64-metrics-request-rate-and-source-health.md`.
 - Every dropped/evicted/suppressed item is counted. **No silent loss anywhere in
-  the pipeline** — if coverage was bounded, the metrics say so.
+  the pipeline** — if coverage was bounded, the metrics say so. With several
+  `[[input]]` entries, MAN-14's per-input hearing counters count each
+  cross-input dedupe withhold against the input that lost
+  (`manta_input_cross_input_dupes_total{source}`) and expose each input's
+  spots, distinct calls and silence (`manta_input_spots_total`,
+  `manta_input_distinct_calls_total`, `manta_input_silent`) on `/metrics`,
+  the status line and `/status` — see
+  [MAN-14](docs/DECISIONS/2026-10-19-man14-per-receiver-hearing-visibility.md).
 
 ## 9. Test strategy (`manta-testkit`)
 

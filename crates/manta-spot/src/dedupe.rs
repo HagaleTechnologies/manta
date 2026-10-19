@@ -34,6 +34,19 @@ struct LastSpot {
     freq_hz: f64,
 }
 
+/// MAN-14: what `Dedupe::assess` decided for one candidate spot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupeOutcome {
+    /// Emit it (and it is now the stored spot).
+    Emit,
+    /// The same input already reported it inside the window, with no SNR
+    /// improvement or type change.
+    WithheldRepeat,
+    /// A different input already reported the same signal inside the
+    /// window (MAN-13 D6): the reporting input's cross-input duplicate.
+    WithheldCrossInput,
+}
+
 pub struct Dedupe {
     suppression_window_samples: u64,
     last: BTreeMap<(String, i64), LastSpot>,
@@ -85,6 +98,25 @@ impl Dedupe {
         sample_ts: u64,
         input: u32,
     ) -> bool {
+        matches!(
+            self.assess(callsign, freq_hz, snr_db, spot_type, sample_ts, input),
+            DedupeOutcome::Emit
+        )
+    }
+
+    /// `should_emit`, saying why a withheld spot was withheld (MAN-14): a
+    /// different input's in-window spot, in this bucket or across the edge,
+    /// is `WithheldCrossInput`; this input's own in-window repeat is
+    /// `WithheldRepeat`. Records the spot exactly when it returns `Emit`.
+    pub fn assess(
+        &mut self,
+        callsign: &str,
+        freq_hz: f64,
+        snr_db: f32,
+        spot_type: SpotType,
+        sample_ts: u64,
+        input: u32,
+    ) -> DedupeOutcome {
         let bucket = Self::bucket(freq_hz);
         let key = (callsign.to_string(), bucket);
         let window = self.suppression_window_samples;
@@ -105,17 +137,31 @@ impl Dedupe {
                     && (freq_hz - prev.freq_hz).abs() < CROSS_INPUT_MAX_HZ
                     && in_window(prev)
             });
-        let emit = !across_edge
-            && match self.last.get(&key) {
-                None => true,
-                Some(prev) if prev.input != input => !in_window(prev),
+        let outcome = if across_edge {
+            DedupeOutcome::WithheldCrossInput
+        } else {
+            match self.last.get(&key) {
+                None => DedupeOutcome::Emit,
+                Some(prev) if prev.input != input => {
+                    if in_window(prev) {
+                        DedupeOutcome::WithheldCrossInput
+                    } else {
+                        DedupeOutcome::Emit
+                    }
+                }
                 Some(prev) => {
-                    !in_window(prev)
+                    if !in_window(prev)
                         || snr_db - prev.snr_db >= SNR_IMPROVEMENT_DB
                         || spot_type != prev.spot_type
+                    {
+                        DedupeOutcome::Emit
+                    } else {
+                        DedupeOutcome::WithheldRepeat
+                    }
                 }
-            };
-        if emit {
+            }
+        };
+        if outcome == DedupeOutcome::Emit {
             let stored_ts = self
                 .last
                 .get(&key)
@@ -131,7 +177,7 @@ impl Dedupe {
                 },
             );
         }
-        emit
+        outcome
     }
 }
 
@@ -272,5 +318,78 @@ mod tests {
         // A late-merged, older report that still emits through an SNR jump.
         assert!(d.should_emit("W1AW", 14_012_340.0, 30.0, SpotType::Cq, 10_000, 0));
         assert_eq!(d.last_sample_ts("W1AW", 14_012_340.0), Some(50_000));
+    }
+
+    /// MAN-14: `assess` names the withhold reason.
+    #[test]
+    fn assess_classifies_each_withhold_reason() {
+        use DedupeOutcome::*;
+        let window = (SUPPRESSION_SECONDS * FS) as u64;
+        // Another input, same bucket, in window.
+        let mut d = Dedupe::new(FS);
+        assert_eq!(
+            d.assess("W1AW", 14_012_340.0, 20.0, SpotType::Cq, 0, 0),
+            Emit
+        );
+        assert_eq!(
+            d.assess("W1AW", 14_012_340.0, 30.0, SpotType::De, 1000, 1),
+            WithheldCrossInput
+        );
+        // This input's own repeat.
+        assert_eq!(
+            d.assess("W1AW", 14_012_340.0, 20.0, SpotType::Cq, 2000, 0),
+            WithheldRepeat
+        );
+        // SNR improvement and a type change on the same input emit.
+        assert_eq!(
+            d.assess("W1AW", 14_012_340.0, 26.0, SpotType::Cq, 3000, 0),
+            Emit
+        );
+        assert_eq!(
+            d.assess("W1AW", 14_012_340.0, 26.0, SpotType::De, 4000, 0),
+            Emit
+        );
+        // After the window, another input emits.
+        assert_eq!(
+            d.assess("W1AW", 14_012_340.0, 20.0, SpotType::De, 4000 + window, 1),
+            Emit
+        );
+        // Another input across a bucket edge, within one channel.
+        let mut e = Dedupe::new(FS);
+        assert_eq!(
+            e.assess("W1AW", 14_012_540.0, 20.0, SpotType::Cq, 0, 0),
+            Emit
+        );
+        assert_eq!(
+            e.assess("W1AW", 14_012_560.0, 20.0, SpotType::Cq, 1000, 1),
+            WithheldCrossInput
+        );
+    }
+
+    /// MAN-14: `should_emit` is `assess == Emit` on the same sequence.
+    #[test]
+    fn should_emit_agrees_with_assess() {
+        let window = (SUPPRESSION_SECONDS * FS) as u64;
+        let steps: [(f64, f32, SpotType, u64, u32); 8] = [
+            (14_012_340.0, 20.0, SpotType::Cq, 0, 0),
+            (14_012_340.0, 20.0, SpotType::Cq, 1000, 1),
+            (14_012_340.0, 20.0, SpotType::Cq, 2000, 0),
+            (14_012_340.0, 27.0, SpotType::Cq, 3000, 0),
+            (14_012_560.0, 20.0, SpotType::Cq, 4000, 1),
+            (14_012_540.0, 20.0, SpotType::Cq, 5000, 0),
+            (14_012_340.0, 20.0, SpotType::De, 6000, 1),
+            (14_012_340.0, 20.0, SpotType::Cq, 6000 + window, 1),
+        ];
+        let mut a = Dedupe::new(FS);
+        let mut b = Dedupe::new(FS);
+        for (freq, snr, ty, ts, input) in steps {
+            let emitted = a.should_emit("W1AW", freq, snr, ty, ts, input);
+            let outcome = b.assess("W1AW", freq, snr, ty, ts, input);
+            assert_eq!(
+                emitted,
+                outcome == DedupeOutcome::Emit,
+                "{freq} {ts} {input}"
+            );
+        }
     }
 }

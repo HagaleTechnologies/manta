@@ -186,6 +186,9 @@ pub struct SharedObservers {
     pub operator_lists: Option<Arc<OperatorListsUpdate>>,
     pub reference_lists: Option<Arc<ReferenceLists>>,
     pub live_state: Option<Arc<dyn LiveStateSink>>,
+    /// MAN-14: the shared validator's per-input cross-input dedupe
+    /// withholds, updated after each batch. `None` skips the copy.
+    pub suppressions: Option<Arc<crate::SuppressionObserver>>,
 }
 
 enum Msg {
