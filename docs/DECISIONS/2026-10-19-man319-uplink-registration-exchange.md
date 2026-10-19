@@ -41,7 +41,12 @@ with exit 0 (reproduced with the real binary at `b17da2a`).
   grid is an invalid reload (MAN-78 semantics: logged, ignored, the previous
   configuration keeps running). The error names the target and the key:
   `dry_run = false -- sending spots needs [server].operator_grid set to a
-  6-character Maidenhead locator (e.g. "FN03ab")`. Rejected alternatives:
+  6-character Maidenhead locator (e.g. "FN03ab")`. `[server]` is
+  restart-only, so `reload_once` adds a second, reload-only check (PR #362
+  review): a reload that would flip an enabled target live is refused when
+  the daemon started without a 6-character grid, even when the same edit
+  adds one, since that grid is not in effect until a restart.
+  Rejected alternatives:
   gating every enabled uplink including dry-run rehearsals (Scenario 1's own
   Given ties the locator to dry-run being off, and every guide example is a
   dry-run config); accepting a locator derived from
