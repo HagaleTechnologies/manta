@@ -87,6 +87,11 @@ const NOMINAL_WORD_CHAR_RATIO: f32 = 7.0 / 3.0;
 /// A closed word gap at or above `max(this, 4 * char-gap mean)` dits is a
 /// pause, not the sender's word spacing, and is not learned (MAN-315 D2).
 pub const PAUSE_MIN_DITS: f32 = 15.0;
+/// MAN-271: the few marks a genuine end-of-signal finish may bootstrap the
+/// 5-mark init quorum down to. SPEC §4.1 **\[DEVIATION\]** -- see
+/// `SpeedTracker::bootstrap` and
+/// docs/DECISIONS/2026-10-16-man271-short-transmission-decode.md.
+const BOOTSTRAP_MIN_MARKS: usize = 2;
 
 fn mean(xs: &[f32]) -> f32 {
     let mut acc = 0.0f64;
@@ -259,6 +264,20 @@ impl ClusterPair {
         self.confirmed = false;
         self.initialize();
     }
+
+    /// MAN-271: force the 5-observation init quorum down to `min` for a
+    /// genuine end-of-signal flush (`SpeedTracker::bootstrap`). Returns
+    /// false (and changes nothing) when already ready or under `min`
+    /// observations; otherwise the ordinary `initialize` split runs over
+    /// what arrived. The split rule itself is unchanged: it works for any
+    /// count >= 1, only `observe`'s fixed 5 gates it.
+    fn force_initialize(&mut self, min: usize) -> bool {
+        if self.ready || self.init.len() < min {
+            return false;
+        }
+        self.initialize();
+        true
+    }
 }
 
 /// Mark-duration speed tracker. SPEC §4.1.
@@ -381,6 +400,28 @@ impl SpeedTracker {
         let cap = DIT_BIAS_CAP_FRAC * mu_dit;
         let delta = (0.5 * (mu_dit - g)).clamp(-cap, cap);
         (mu_dit - delta).clamp(DIT_CLAMP_MS.0, DIT_CLAMP_MS.1)
+    }
+
+    /// MAN-271 (SPEC §4.1 **\[DEVIATION\]**): initialize the mark clusters
+    /// from the `BOOTSTRAP_MIN_MARKS`..4 marks a short single transmission
+    /// leaves, at a genuine end-of-signal flush (`TrackDecoder::finish` --
+    /// stream EOF or a HangExpired/Silent closure, where a sustained real
+    /// on-air gap has been observed). Two marks is the least a dit/dah
+    /// ratio can be split from; the ordinary `initialize` rule
+    /// (largest-ratio split, unimodal fallback) runs over them unchanged.
+    /// Returns false (and changes nothing) when the tracker is already
+    /// ready or saw fewer than two marks -- `Hsmm`, which never feeds the
+    /// tracker, is a no-op. Only `finish` may call this:
+    /// `finish_speed_only` (bookkeeping closes: Merged/Evicted) must never
+    /// fabricate content, and bootstrapping mid-stream would need a
+    /// dit-unit threshold before any dit estimate exists.
+    pub fn bootstrap(&mut self) -> bool {
+        if !self.pair.force_initialize(BOOTSTRAP_MIN_MARKS) {
+            return false;
+        }
+        self.apply_constraints();
+        self.wpm_ema = Some(1200.0 / self.dit_estimate_ms());
+        true
     }
 
     /// Feed one mark duration, updating the clusters, constraints, and drift check. SPEC §4.1.
@@ -959,6 +1000,54 @@ mod tests {
         assert!((t.mu_dah_ms() - 3.0 * t.mu_dit_ms()).abs() < 2.0);
         t.on_mark(185.0); // first real dah re-anchors
         assert!((t.mu_dah_ms() - 185.0).abs() < 0.1);
+    }
+
+    /// MAN-271: "DA" @ 35 WPM reaches the decoder as these four marks
+    /// (promotion consumed the leading element); the live quorum never
+    /// fills, a genuine end-of-signal finish bootstraps from them.
+    #[test]
+    fn bootstrap_initializes_from_four_marks() {
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[32.0, 34.7, 32.0, 104.0]);
+        assert!(!t.ready());
+        assert!(t.bootstrap());
+        assert!(t.ready());
+        assert!(
+            (t.mu_dit_ms() - 32.9).abs() < 0.5,
+            "mu_dit {}",
+            t.mu_dit_ms()
+        );
+        assert!(
+            (t.mu_dah_ms() - 104.0).abs() < 0.5,
+            "mu_dah {}",
+            t.mu_dah_ms()
+        );
+        assert!(t.wpm().is_some());
+    }
+
+    /// MAN-271: one mark carries no dit/dah ratio to split; zero marks
+    /// even less. The bootstrap refuses and the tracker stays not ready.
+    #[test]
+    fn bootstrap_needs_two_marks() {
+        let mut t = SpeedTracker::new();
+        assert!(!t.bootstrap());
+        assert!(!t.ready());
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[32.0]);
+        assert!(!t.bootstrap());
+        assert!(!t.ready());
+    }
+
+    /// MAN-271: once the ordinary quorum filled, the bootstrap is a no-op.
+    #[test]
+    fn bootstrap_is_a_no_op_once_ready() {
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        assert!(t.ready());
+        let (dit, dah) = (t.mu_dit_ms(), t.mu_dah_ms());
+        assert!(!t.bootstrap());
+        assert!((t.mu_dit_ms() - dit).abs() < 1e-6);
+        assert!((t.mu_dah_ms() - dah).abs() < 1e-6);
     }
 
     #[test]
