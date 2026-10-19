@@ -504,6 +504,8 @@ fn calibrate_with_clock(
                 e.discontinuity();
             }
         }
+        // MAN-305: `take_missing_samples()` is deliberately not read: the
+        // estimators splice over a short loss, as the source already did.
         for e in &mut estimators {
             e.push(&buf[..n]);
         }

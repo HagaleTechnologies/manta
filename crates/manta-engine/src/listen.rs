@@ -691,6 +691,15 @@ pub fn listen_with_observers(
             }
             anyhow::bail!("audio source ended during startup calibration");
         }
+        // MAN-305: samples the source lost and spliced over. The pre-gap
+        // fill stays (a splice, as the source made it); only the sample
+        // clock moves. The whole buffer is mapped from the final
+        // `seg_base`, so the post-loss samples land wall-clock-true and
+        // the pre-loss ones `k` late -- inside calibration, where nothing
+        // has been decoded yet.
+        if let Some(k) = src.take_missing_samples() {
+            seg_base += k;
+        }
         if let Some(gap) = src.take_discontinuity() {
             // A discontinuity during calibration: the pre-gap partial
             // buffer was never processed through the channelizer, so it's
@@ -788,6 +797,14 @@ pub fn listen_with_observers(
         };
         if n == 0 {
             break;
+        }
+        // MAN-305: a short loss the source spliced over. Advancing
+        // `seg_base` mid-segment re-times every later event, including
+        // those of tracks begun before the loss, so spot timestamps stay
+        // wall-clock-true without closing a track (a discontinuity below
+        // would lose a spot whose transmission spans the loss).
+        if let Some(k) = src.take_missing_samples() {
+            seg_base += k;
         }
         if let Some(gap) = src.take_discontinuity() {
             // Not `finish()`: an outage is not an end of signal (see
@@ -1216,6 +1233,11 @@ pub(crate) fn run_input_front(
             }
             anyhow::bail!("audio source ended during startup calibration");
         }
+        // MAN-305, as `listen_with_observers`: the splice stays, only the
+        // clock moves.
+        if let Some(k) = src.take_missing_samples() {
+            seg_base += k;
+        }
         if let Some(gap) = src.take_discontinuity() {
             calib.copy_within(filled..filled + n, 0);
             seg_base += filled as u64 + gap;
@@ -1257,6 +1279,11 @@ pub(crate) fn run_input_front(
         };
         if n == 0 {
             break;
+        }
+        // MAN-305, as `listen_with_observers`: a spliced loss advances
+        // this input's clock without closing its tracks.
+        if let Some(k) = src.take_missing_samples() {
+            seg_base += k;
         }
         let mut pending = Vec::new();
         if let Some(gap) = src.take_discontinuity() {
@@ -2179,6 +2206,223 @@ mod tests {
             }
             gap
         }
+    }
+
+    // ---- MAN-305: a spliced loss advances the clock, not the segment ----
+
+    /// One protocol-2 IQ datagram's worth of samples.
+    const LOSS_BLOCK: usize = 238;
+
+    /// MAN-305 test double: serves `samples` and, at each `(at, blocks)` in
+    /// `losses` (`at` a position in `samples`), drops the next
+    /// `blocks × LOSS_BLOCK` samples and splices over them, as a source
+    /// losing numbered datagrams does. With `report` set, the next
+    /// `take_missing_samples()` returns the total dropped; without it the
+    /// splice goes unreported (the control). A `read()` never straddles a
+    /// loss, so a report always describes the samples that call returns.
+    struct LossySource {
+        samples: Arc<Vec<Complex32>>,
+        cursor: usize,
+        fs: f64,
+        center_freq_hz: f64,
+        losses: std::collections::VecDeque<(usize, usize)>,
+        report: bool,
+        pending_missing: Option<u64>,
+    }
+
+    impl LossySource {
+        /// V1 at 192 kHz for 30 s (`v1_192k_spec`), losing `blocks`
+        /// datagrams at each `(at_s, blocks)`.
+        fn v1_192k(losses: &[(f64, usize)], report: bool) -> Self {
+            let spec = v1_192k_spec();
+            LossySource {
+                samples: v1_192k_samples(),
+                cursor: 0,
+                fs: spec.fs,
+                center_freq_hz: spec.center_freq_hz,
+                losses: losses
+                    .iter()
+                    .map(|&(at_s, blocks)| ((at_s * spec.fs).round() as usize, blocks))
+                    .collect(),
+                report,
+                pending_missing: None,
+            }
+        }
+    }
+
+    impl manta_input::IqSource for LossySource {
+        fn sample_rate(&self) -> f64 {
+            self.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.center_freq_hz
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            while let Some(&(at, blocks)) = self.losses.front() {
+                if self.cursor < at {
+                    break;
+                }
+                self.losses.pop_front();
+                let lost = (blocks * LOSS_BLOCK).min(self.samples.len() - self.cursor);
+                self.cursor += lost;
+                if self.report {
+                    *self.pending_missing.get_or_insert(0) += lost as u64;
+                }
+            }
+            let end = self
+                .losses
+                .front()
+                .map_or(self.samples.len(), |&(at, _)| at);
+            let n = buf.len().min(end - self.cursor);
+            buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
+            self.cursor += n;
+            Ok(n)
+        }
+        fn take_missing_samples(&mut self) -> Option<u64> {
+            self.pending_missing.take()
+        }
+    }
+
+    /// The plan's fixture: V1 at 192 kHz, 30 s, one W1AW spot.
+    fn v1_192k_spec() -> manta_testkit::vectors::VectorSpec {
+        manta_testkit::vectors::VectorSpec {
+            fs: 192_000.0,
+            duration_s: 30.0,
+            ..manta_testkit::vectors::v1()
+        }
+    }
+
+    /// Rendered once for every MAN-305 test in this process.
+    fn v1_192k_samples() -> Arc<Vec<Complex32>> {
+        static RENDERED: std::sync::OnceLock<Arc<Vec<Complex32>>> = std::sync::OnceLock::new();
+        RENDERED
+            .get_or_init(|| {
+                Arc::new(
+                    manta_testkit::vectors::render(&v1_192k_spec())
+                        .unwrap()
+                        .samples,
+                )
+            })
+            .clone()
+    }
+
+    /// `(callsign, sample_ts)` of every spot `listen()` emits over `src`.
+    fn lossy_spots(src: LossySource) -> Vec<(String, u64)> {
+        let mut spots = Vec::new();
+        listen(
+            Box::new(src),
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+            |s| spots.push((s.callsign.clone(), s.sample_ts)),
+        )
+        .unwrap();
+        spots
+    }
+
+    /// As `lossy_spots`, through the multi-input path (`run_input_front`)
+    /// with `src` as the session's only input.
+    fn lossy_spots_multi(src: LossySource) -> Vec<(String, u64)> {
+        let mut src = Some(src);
+        let opened = crate::multi::open_inputs(
+            vec![crate::multi::InputSpec {
+                name: "a".into(),
+                open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
+                freq_correction_ppm: 0.0,
+                observers: Default::default(),
+            }],
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut spots = Vec::new();
+        crate::multi::listen_inputs(
+            opened,
+            &PipelineConfig::default(),
+            crate::multi::SessionClock::Replay,
+            crate::multi::SharedObservers::default(),
+            |_| {},
+            |s| spots.push((s.callsign.clone(), s.sample_ts)),
+            |_, _| {},
+            |_| {},
+        )
+        .unwrap();
+        spots
+    }
+
+    /// The `sample_ts` of the single W1AW spot in `spots`.
+    fn the_one_w1aw(spots: &[(String, u64)]) -> u64 {
+        assert_eq!(spots.len(), 1, "exactly one spot expected: {spots:?}");
+        assert_eq!(spots[0].0, "W1AW", "{spots:?}");
+        spots[0].1
+    }
+
+    /// The loss-free baseline's spot, decoded once per process.
+    fn lossless_baseline_ts() -> u64 {
+        static BASELINE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *BASELINE.get_or_init(|| the_one_w1aw(&lossy_spots(LossySource::v1_192k(&[], true))))
+    }
+
+    /// One channelizer hop at 192 kHz: the tolerance a clock-true spot
+    /// must meet against the loss-free baseline.
+    const CLOCK_TOLERANCE: u64 = 512;
+
+    fn assert_clock_true(spots: &[(String, u64)], baseline: u64) {
+        let ts = the_one_w1aw(spots);
+        assert!(
+            ts.abs_diff(baseline) <= CLOCK_TOLERANCE,
+            "spot sample_ts {ts} is {} from the loss-free {baseline}; at most \
+             {CLOCK_TOLERANCE} allowed",
+            ts as i64 - baseline as i64
+        );
+    }
+
+    /// MAN-305: 50 datagrams lost at 3.0 s and reported through
+    /// `take_missing_samples()` advance the clock without closing a track:
+    /// the one W1AW spot survives and lands within a hop of the loss-free
+    /// replay's.
+    #[test]
+    fn missing_samples_advance_the_clock_without_closing_tracks() {
+        let spots = lossy_spots(LossySource::v1_192k(&[(3.0, 50)], true));
+        assert_clock_true(&spots, lossless_baseline_ts());
+    }
+
+    /// MAN-305: the same loss at 10.0 s, mid-transmission -- the case where
+    /// a `take_discontinuity()` report lost the spot in this 30 s fixture.
+    #[test]
+    fn missing_samples_inside_a_transmission_keep_the_spot() {
+        let spots = lossy_spots(LossySource::v1_192k(&[(10.0, 50)], true));
+        assert_clock_true(&spots, lossless_baseline_ts());
+    }
+
+    /// MAN-305: a loss at 1.0 s, inside the startup calibration fill, keeps
+    /// the splice and still advances the clock.
+    #[test]
+    fn missing_samples_during_calibration_advance_the_clock() {
+        let spots = lossy_spots(LossySource::v1_192k(&[(1.0, 50)], true));
+        assert_clock_true(&spots, lossless_baseline_ts());
+    }
+
+    /// MAN-305: the multi-input front end (`run_input_front`) advances that
+    /// input's clock the same way.
+    #[test]
+    fn multi_input_missing_samples_advance_that_inputs_clock() {
+        let baseline = the_one_w1aw(&lossy_spots_multi(LossySource::v1_192k(&[], true)));
+        let spots = lossy_spots_multi(LossySource::v1_192k(&[(3.0, 50)], true));
+        assert_clock_true(&spots, baseline);
+    }
+
+    /// MAN-305 control: the same splice unreported puts the spot early by
+    /// about the 11,900 lost samples (measured −11,776), which proves the
+    /// tolerance asserted above can fail.
+    #[test]
+    fn unreported_splice_is_early_by_the_lost_samples() {
+        let baseline = lossless_baseline_ts();
+        let ts = the_one_w1aw(&lossy_spots(LossySource::v1_192k(&[(3.0, 50)], false)));
+        assert!(
+            baseline.saturating_sub(ts) > 11_000,
+            "an unreported splice must leave the spot more than 11,000 samples early: \
+             {ts} vs the loss-free {baseline}"
+        );
     }
 
     /// MAN-73: a discontinuity reported mid-stream closes the current

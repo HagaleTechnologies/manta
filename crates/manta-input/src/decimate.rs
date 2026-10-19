@@ -47,6 +47,36 @@ pub struct DecimatingSource {
     /// Reused scratch buffer for `inner.read()`, sized once at construction
     /// (`RAW_CHUNK_SAMPLES * factor`) -- see `RAW_CHUNK_SAMPLES`.
     raw: Vec<Complex32>,
+    /// MAN-305: the decimation factor, `fs_in / fs_out` exactly, for
+    /// scaling the inner source's gap reports to the output rate.
+    factor: u64,
+    /// MAN-305: the inner source's gap reports, scaled to the output rate
+    /// and held for the outer `take_discontinuity()` /
+    /// `take_missing_samples()`. Taken after every inner read, so neither
+    /// is lost behind a buffered `pending`.
+    gap: GapScaler,
+    missing: GapScaler,
+}
+
+/// MAN-305: one gap hook's pending report at the output rate. Each inner
+/// report of `k` input samples adds `(carry + k·fs_out) / fs_in` output
+/// samples -- `(carry + k) / factor` here, `fs_in` being exactly
+/// `factor·fs_out` -- and carries the remainder to the next report, so a
+/// run of small reports sums to the same total as one large one.
+#[derive(Default)]
+struct GapScaler {
+    carry: u64,
+    pending: Option<u64>,
+}
+
+impl GapScaler {
+    fn add(&mut self, inner: Option<u64>, factor: u64) {
+        if let Some(k) = inner {
+            let total = self.carry + k;
+            self.carry = total % factor;
+            *self.pending.get_or_insert(0) += total / factor;
+        }
+    }
 }
 
 impl DecimatingSource {
@@ -77,6 +107,9 @@ impl DecimatingSource {
             trusted_half,
             pending: VecDeque::new(),
             raw: vec![Complex32::new(0.0, 0.0); RAW_CHUNK_SAMPLES * factor],
+            factor: factor as u64,
+            gap: GapScaler::default(),
+            missing: GapScaler::default(),
         })
     }
 }
@@ -132,6 +165,20 @@ impl IqSource for DecimatingSource {
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
         while self.pending.is_empty() {
             let n = self.inner.read(&mut self.raw)?;
+            // MAN-305: the inner reports describe the samples this inner
+            // read returned, which `pending` (empty here) will start with,
+            // so they reach the caller with the first outer read that
+            // returns them. Taken on an EOF too: an end of stream may
+            // leave an outage pending (MAN-258).
+            let gap = self.inner.take_discontinuity();
+            self.gap.add(gap, self.factor);
+            self.missing
+                .add(self.inner.take_missing_samples(), self.factor);
+            if gap.is_some() {
+                // An outage is not spliced: no pre-gap sample may leak
+                // into post-gap output through the filter history.
+                self.decimator.reset();
+            }
             if n == 0 {
                 return Ok(0);
             }
@@ -147,6 +194,16 @@ impl IqSource for DecimatingSource {
 
     fn confirmed_live_handle(&self) -> Option<Arc<AtomicBool>> {
         self.inner.confirmed_live_handle()
+    }
+
+    /// MAN-305: the inner source's outage, scaled to the output rate.
+    fn take_discontinuity(&mut self) -> Option<u64> {
+        self.gap.pending.take()
+    }
+
+    /// MAN-305: the inner source's spliced loss, scaled to the output rate.
+    fn take_missing_samples(&mut self) -> Option<u64> {
+        self.missing.pending.take()
     }
 
     fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
@@ -585,5 +642,173 @@ mod tests {
         .unwrap();
         assert_eq!(src.rf_passband_hz(), (300.0, 3_000.0));
         assert_eq!(src.trusted_band_hz(), Some((300.0, 3_000.0)));
+    }
+    // ---- MAN-305: both gap hooks forwarded, scaled to the output rate ----
+
+    /// Serves `samples` `chunk` at a time; on inner read number `i`
+    /// (0-based) leaves pending whatever `gaps`/`missing` hold for `i`.
+    struct GapReportingSource {
+        samples: Vec<Complex32>,
+        cursor: usize,
+        chunk: usize,
+        reads: usize,
+        gaps: Vec<(usize, u64)>,
+        missing: Vec<(usize, u64)>,
+        pending_gap: Option<u64>,
+        pending_missing: Option<u64>,
+    }
+
+    impl GapReportingSource {
+        fn new(samples: Vec<Complex32>, chunk: usize) -> Self {
+            GapReportingSource {
+                samples,
+                cursor: 0,
+                chunk,
+                reads: 0,
+                gaps: Vec::new(),
+                missing: Vec::new(),
+                pending_gap: None,
+                pending_missing: None,
+            }
+        }
+    }
+
+    impl IqSource for GapReportingSource {
+        fn sample_rate(&self) -> f64 {
+            192_000.0
+        }
+        fn center_freq_hz(&self) -> f64 {
+            0.0
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            let i = self.reads;
+            self.reads += 1;
+            for &(_, k) in self.gaps.iter().filter(|(at, _)| *at == i) {
+                *self.pending_gap.get_or_insert(0) += k;
+            }
+            for &(_, k) in self.missing.iter().filter(|(at, _)| *at == i) {
+                *self.pending_missing.get_or_insert(0) += k;
+            }
+            let n = buf
+                .len()
+                .min(self.chunk)
+                .min(self.samples.len() - self.cursor);
+            buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
+            self.cursor += n;
+            Ok(n)
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            self.pending_gap.take()
+        }
+        fn take_missing_samples(&mut self) -> Option<u64> {
+            self.pending_missing.take()
+        }
+    }
+
+    /// `(take_discontinuity(), take_missing_samples())` after one read.
+    type GapReport = (Option<u64>, Option<u64>);
+
+    /// Reads `src` to EOF with a `buf_len` buffer: every decimated sample,
+    /// and `(take_discontinuity(), take_missing_samples())` after each read
+    /// that returned samples.
+    fn drain_with_reports(
+        src: &mut DecimatingSource,
+        buf_len: usize,
+    ) -> (Vec<Complex32>, Vec<GapReport>) {
+        let mut out = Vec::new();
+        let mut reports = Vec::new();
+        let mut buf = vec![Complex32::new(0.0, 0.0); buf_len];
+        loop {
+            let n = src.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+            reports.push((src.take_discontinuity(), src.take_missing_samples()));
+        }
+        (out, reports)
+    }
+
+    fn assert_bit_identical(a: &[Complex32], b: &[Complex32]) {
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b) {
+            assert_eq!(x.re.to_bits(), y.re.to_bits());
+            assert_eq!(x.im.to_bits(), y.im.to_bits());
+        }
+    }
+
+    /// MAN-305: an inner outage of 11,900 samples at 192 kHz reaches the
+    /// caller as 5,950 at 96 kHz, once, with the read that returns the
+    /// post-gap samples; and the filter history is reset there, so the
+    /// post-gap output is exactly a fresh decimator's.
+    #[test]
+    fn decimating_source_forwards_take_discontinuity_scaled() {
+        let samples = tone(2_000.0, 4_000, 192_000.0);
+        let mut inner = GapReportingSource::new(samples.clone(), 1_000);
+        inner.gaps.push((2, 11_900));
+        let mut src = DecimatingSource::new(Box::new(inner), 96_000.0).unwrap(); // factor 2
+        let (out, reports) = drain_with_reports(&mut src, 500);
+        assert_eq!(
+            reports,
+            vec![
+                (None, None),
+                (None, None),
+                (Some(5_950), None),
+                (None, None)
+            ]
+        );
+        assert_eq!(src.take_discontinuity(), None);
+
+        let fresh = manta_dsp::decimate::Decimator::new(192_000.0, 2)
+            .unwrap()
+            .process(&samples[2_000..]);
+        assert_bit_identical(&out[1_000..], &fresh);
+    }
+
+    /// MAN-305: a spliced inner loss is forwarded the same way, scaled and
+    /// once, but it is a splice: the filter history is kept, so the output
+    /// is the uninterrupted decimation of every sample served.
+    #[test]
+    fn decimating_source_forwards_take_missing_samples_scaled() {
+        let samples = tone(2_000.0, 4_000, 192_000.0);
+        let mut inner = GapReportingSource::new(samples.clone(), 1_000);
+        inner.missing.push((2, 11_900));
+        let mut src = DecimatingSource::new(Box::new(inner), 96_000.0).unwrap();
+        let (out, reports) = drain_with_reports(&mut src, 500);
+        assert_eq!(
+            reports,
+            vec![
+                (None, None),
+                (None, None),
+                (None, Some(5_950)),
+                (None, None)
+            ]
+        );
+        assert_eq!(src.take_missing_samples(), None);
+
+        let whole = manta_dsp::decimate::Decimator::new(192_000.0, 2)
+            .unwrap()
+            .process(&samples);
+        assert_bit_identical(&out, &whole);
+    }
+
+    /// MAN-305: 238-sample losses (one protocol-2 datagram each) at factor
+    /// 4 are not whole output samples; the remainder is carried, so four of
+    /// them report 59, 60, 59, 60 -- exactly the 238 output samples the
+    /// 952 lost input samples are.
+    #[test]
+    fn decimating_source_carries_the_fractional_remainder() {
+        let samples = tone(2_000.0, 4_000, 192_000.0);
+        let mut inner = GapReportingSource::new(samples, 1_000);
+        inner.missing.extend((0..4).map(|i| (i, 238)));
+        inner.gaps.extend((0..4).map(|i| (i, 238)));
+        let mut src = DecimatingSource::new(Box::new(inner), 48_000.0).unwrap(); // factor 4
+        let (_, reports) = drain_with_reports(&mut src, 250);
+        let scaled = [59, 60, 59, 60].map(Some);
+        assert_eq!(
+            reports,
+            scaled.iter().map(|&k| (k, k)).collect::<Vec<_>>(),
+            "each hook carries its own remainder"
+        );
     }
 }

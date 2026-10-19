@@ -109,6 +109,11 @@ impl IqSource for PacedSource {
         self.inner.take_discontinuity()
     }
 
+    /// MAN-305: forwarded as `take_discontinuity` is.
+    fn take_missing_samples(&mut self) -> Option<u64> {
+        self.inner.take_missing_samples()
+    }
+
     fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
         self.inner.health_counters()
     }
@@ -204,6 +209,11 @@ impl IqSource for LoopingSource {
         self.inner.take_discontinuity()
     }
 
+    /// MAN-305: forwarded as `take_discontinuity` is.
+    fn take_missing_samples(&mut self) -> Option<u64> {
+        self.inner.take_missing_samples()
+    }
+
     fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
         self.inner.health_counters()
     }
@@ -251,6 +261,7 @@ mod tests {
         live: Arc<AtomicBool>,
         counters: Arc<InputHealthCounters>,
         gap: Option<u64>,
+        missing: Option<u64>,
     }
 
     impl Distinctive {
@@ -259,6 +270,7 @@ mod tests {
                 live: Arc::new(AtomicBool::new(true)),
                 counters: Arc::new(InputHealthCounters::new()),
                 gap: Some(7),
+                missing: Some(11),
             }
         }
     }
@@ -281,6 +293,9 @@ mod tests {
         }
         fn take_discontinuity(&mut self) -> Option<u64> {
             self.gap.take()
+        }
+        fn take_missing_samples(&mut self) -> Option<u64> {
+            self.missing.take()
         }
         fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
             Some(self.counters.clone())
@@ -541,6 +556,22 @@ mod tests {
             Box::new(|| bail!("not reached")),
         );
         assert_forwards(&mut looped, (&live, &counters));
+    }
+
+    /// MAN-305: both wrappers hand the inner source's spliced loss to the
+    /// caller, once.
+    #[test]
+    fn paced_and_looping_sources_forward_take_missing_samples() {
+        let mut paced = PacedSource::new(Box::new(Distinctive::new())).unwrap();
+        let mut looped = LoopingSource::new(
+            "rec.wav",
+            Box::new(Distinctive::new()),
+            Box::new(|| bail!("not reached")),
+        );
+        for src in [&mut paced as &mut dyn IqSource, &mut looped] {
+            assert_eq!(src.take_missing_samples(), Some(11));
+            assert_eq!(src.take_missing_samples(), None);
+        }
     }
 
     // ---- composition

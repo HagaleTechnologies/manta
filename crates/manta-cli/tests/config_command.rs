@@ -445,7 +445,10 @@ fn check_accepts_an_hpsdr_input_without_opening_the_receiver() {
     let out = succeeds(&check_file(&path));
     assert_eq!(
         out.lines().find(|line| line.starts_with("input:")),
-        Some("input: type=hpsdr host=receiver.invalid port=1024 freq_hz=7030000 rate_hz=48000")
+        Some(
+            "input: type=hpsdr host=receiver.invalid port=1024 protocol=auto freq_hz=7030000 \
+             rate_hz=48000"
+        )
     );
 }
 

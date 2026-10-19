@@ -1275,6 +1275,7 @@ fn spec_documents_every_input_and_spot_key() {
                 "loop",
                 "host",
                 "port",
+                "protocol",
                 "freq_hz",
                 "password",
                 "driver",
