@@ -799,22 +799,25 @@ fn each_input_of_a_multi_input_daemon_records_its_own_file() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("give each its own record_iq"));
     assert!(!dir.path().join("same.cf32").exists());
-    // Two spellings of one destination are the same destination.
+    // Two spellings of one destination are the same destination, case
+    // included (a case-insensitive filesystem would open one file).
     std::fs::create_dir(dir.path().join("sub")).unwrap();
-    let alias = dir.path().join("alias.toml");
-    std::fs::write(
-        &alias,
-        entry("a", "same.cf32") + &entry("b", "sub/../same.cf32"),
-    )
-    .unwrap();
-    let out = manta()
-        .args(["run", "--config"])
-        .arg(&alias)
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("give each its own record_iq"));
-    assert!(!dir.path().join("same.cf32").exists());
+    for other in ["sub/../same.cf32", "SAME.cf32"] {
+        let alias = dir.path().join("alias.toml");
+        std::fs::write(&alias, entry("a", "same.cf32") + &entry("b", other)).unwrap();
+        let out = manta()
+            .args(["run", "--config"])
+            .arg(&alias)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{other}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("give each its own record_iq"),
+            "{other}"
+        );
+        assert!(!dir.path().join("same.cf32").exists());
+        assert!(!dir.path().join("SAME.cf32").exists());
+    }
     let out = manta()
         .args(["run", "--record-iq", "x.cf32", "--config"])
         .arg(&toml)

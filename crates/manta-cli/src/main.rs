@@ -1982,7 +1982,7 @@ fn check_record_destination(path: &Path) -> Result<()> {
 /// MAN-309: each `[[input]]`'s `record_iq` passes `check_record_destination`
 /// and no two inputs record to the same file.
 fn check_record_destinations(inputs: &[ResolvedInput]) -> Result<()> {
-    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     for input in inputs {
         let Some(path) = input.record_iq.as_deref() else {
             continue;
@@ -1990,7 +1990,9 @@ fn check_record_destinations(inputs: &[ResolvedInput]) -> Result<()> {
         check_record_destination(path)?;
         // The directory exists (checked above), so its canonical form
         // catches two spellings of one destination (`a/../x`, a symlinked
-        // directory).
+        // directory). Compared without ASCII case, since macOS and Windows
+        // filesystems ignore it by default: on a case-sensitive one this
+        // refuses two names that differ only in case, which is harmless.
         let canonical = match (path.parent(), path.file_name()) {
             (Some(dir), Some(name)) => {
                 let dir = if dir.as_os_str().is_empty() {
@@ -2003,6 +2005,7 @@ fn check_record_destinations(inputs: &[ResolvedInput]) -> Result<()> {
             }
             _ => path.to_path_buf(),
         };
+        let canonical = canonical.to_string_lossy().to_ascii_lowercase();
         if seen.contains(&canonical) {
             bail!(
                 "two [[input]] entries record to {}; give each its own record_iq",
