@@ -53,7 +53,7 @@ pub const SHADOW_DEPTH_DB: f64 = 40.0;
 /// SPEC §1.1 channel spacing.
 const CHANNEL_SPACING_HZ: f64 = 93.75;
 /// hop = N/4 (SPEC §1.1), so a 2*pi phase advance per hop spans 4 channels.
-const CHANNELS_PER_CYCLE: f64 = 4.0;
+const CHANNELS_PER_CYCLE: f64 = crate::channelizer::CHANNELS_PER_PHASE_CYCLE;
 
 /// One marked RTTY signal. Channel positions `low_j`/`high_j` and `span_j`
 /// are in frequency order (`j = (k + n/2) mod n`; `j = n/2` is the centre).

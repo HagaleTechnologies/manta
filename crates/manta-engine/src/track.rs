@@ -548,13 +548,15 @@ impl Lifecycle {
 use manta_decode::decoder::{DecodeConfig, Engine, TrackDecoder};
 use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_dsp::channelizer::{
-    interpolate_offset, odd_channel_sign_correction, power_db, HopOutput,
+    interpolate_offset, odd_channel_sign_correction, phase_lag_product, phase_position, power_db,
+    HopOutput,
 };
 use manta_dsp::comod::CoModDetector;
 use manta_dsp::crash::{CrashDetector, CRASH_MIN_HOPS};
 use manta_dsp::floor::{FloorBank, Gate};
 use manta_dsp::fsk::{FskDetector, BLOCK_HOPS as FSK_BLOCK_HOPS};
 use manta_dsp::refine::{Refiner, GROUP_DELAY_HOPS};
+use num_complex::Complex64;
 use smallvec::{smallvec, SmallVec};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -713,6 +715,18 @@ pub(crate) struct Track {
     /// MAN-313: this promoted track qualified as keyed CW and holds a
     /// decoder. Set at promotion when the filter is off.
     qualified: bool,
+    /// MAN-114 (SPEC §1.4): power-weighted EMA (`CENTER_EMA_ALPHA`) of
+    /// absolute-frame lag-1 phase products (`phase_lag_product`) of the
+    /// selected channel, fed by key-down hops at or above
+    /// `FINE_FREQ_MIN_SNR_DB`; feeds `freq_hz` only. Zero until the first
+    /// such hop. A merge survivor keeps its own (D5).
+    phase_z: Complex64,
+    /// MAN-114 (Codex review, PR #346): `phase_z` before each of the last
+    /// `CRASH_MIN_HOPS - 1` unsuppressed hops, oldest first. A crash is
+    /// only declared on its `CRASH_MIN_HOPS`-th lifted hop, so on that hop
+    /// the front entry is `phase_z` from before the lift began: the value
+    /// `rollback_phase` restores, as `clean_hist` does for the decoder.
+    phase_hist: VecDeque<Complex64>,
 }
 
 /// MAN-118: adds `decoder`'s garbles since the last call to `quality`, and
@@ -980,6 +994,9 @@ impl KeyingEvidence {
 /// against V9 in Task 9 and pinned there.
 const CENTER_EMA_ALPHA: f64 = 0.01;
 
+/// SPEC §1.4: only key-down hops at or above this SNR feed the spot-frequency estimator.
+const FINE_FREQ_MIN_SNR_DB: f64 = 6.0;
+
 /// MAN-324: one channel's state for the live-state stream's band rollup,
 /// read by `TrackManager::take_channel_levels`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1021,6 +1038,8 @@ impl Track {
             garbles_published: 0,
             keying: None,
             qualified: false,
+            phase_z: Complex64::new(0.0, 0.0),
+            phase_hist: VecDeque::new(),
         }
     }
 
@@ -1468,9 +1487,51 @@ impl Track {
         }
     }
 
-    /// Absolute Hz for this track's current centroid, reported as
-    /// `TrackDecoder`'s live `TrackMeta.freq_hz` (SPEC §5). `step_hop` calls
-    /// this every hop a decoder exists to keep it current.
+    /// Fold one gated hop's `phase_lag_product` into `phase_z` (MAN-114).
+    /// The product is not normalised, so a hop weighs in by its power:
+    /// low-power keying transitions pull the estimate less than steady
+    /// key-down.
+    fn update_phase(&mut self, z: Complex64) {
+        self.phase_z += CENTER_EMA_ALPHA * (z - self.phase_z);
+    }
+
+    /// Record `phase_z` at the start of an unsuppressed hop, before that
+    /// hop's `update_phase` (MAN-114, Codex review PR #346).
+    fn note_phase(&mut self) {
+        self.phase_hist.push_back(self.phase_z);
+        if self.phase_hist.len() > CRASH_MIN_HOPS as usize - 1 {
+            self.phase_hist.pop_front();
+        }
+    }
+
+    /// On the hop a crash is declared, undo the phase products of its
+    /// `CRASH_MIN_HOPS - 1` lifted hops before it (MAN-114, Codex review
+    /// PR #346). They were not yet flagged, and `phase_z` is power-weighted:
+    /// a +100 dB crash's onset hops put a +6 dB signal's spot 19 Hz off
+    /// (`freq_across_channel.rs`). `freq_hz` reports from `phase_hist`'s
+    /// front, so nothing already queued carries those two hops either.
+    fn rollback_phase(&mut self) {
+        if let Some(&z) = self.phase_hist.front() {
+            self.phase_z = z;
+        }
+        self.phase_hist.clear();
+    }
+
+    /// Absolute Hz for this track's current fine-frequency estimate,
+    /// reported as `TrackDecoder`'s live `TrackMeta.freq_hz` (SPEC §5).
+    /// `step_hop` calls this every hop a decoder exists to keep it current.
+    ///
+    /// **MAN-114: the reported position is the phase estimator, not
+    /// `center`.** `phase_position(phase_z, center)` -- the argument of the
+    /// power-weighted EMA of lag-1 phase products, unwrapped nearest
+    /// `center` -- replaces SPEC §1.4's dB-domain parabola for the spot
+    /// frequency. The parabola stays the ownership centroid (`center`), but
+    /// AWGN on its weak neighbour bins biased it by up to ~38 Hz at
+    /// fractional offsets inside a channel, on every channel table; the
+    /// phase estimator measures within ~4 Hz across the channel (see
+    /// `docs/DECISIONS/2026-10-17-man114-phase-difference-spot-frequency.md`).
+    /// Falls back to `center` while `phase_z` is still zero (no gated hop
+    /// yet, or power-only test hops with an empty `x`).
     ///
     /// **Deviates from SPEC §1.4's literal formula.** §1.4 specifies a
     /// lifetime power-weighted running mean with no decay
@@ -1480,21 +1541,27 @@ impl Track {
     /// undecayed lifetime average of a linearly-drifting quantity converges
     /// toward the midpoint of the observed range, not the current/final
     /// value (measured 48.3 Hz error on V9's 120 s / 100 Hz drift, ~3x over
-    /// tolerance). Reporting `self.center` -- the same live, per-hop EMA
-    /// (`CENTER_EMA_ALPHA`) already used for ownership/read-selection --
-    /// instead tracks ongoing drift: measured in-pipeline at 9.7 Hz error on
-    /// V9 (real pipeline; an offline centroid replica used to pick this
-    /// estimator predicted 3.9 Hz -- the >2x gap is attributed to the
-    /// channelizer's known parabolic-interpolation bias, deferred
-    /// separately, not to this estimator choice) and 9.9 Hz on V1
-    /// (non-drifting; improved from 16.5 Hz under the old lifetime-mean
-    /// formula, not a regression). Both are within SPEC §7's ±15 Hz
-    /// criterion. See `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md`
-    /// (item 5) for the full rationale.
+    /// tolerance). Both `center` and `phase_z` are live EMAs at the same
+    /// `CENTER_EMA_ALPHA` instead, so the report tracks ongoing drift. See
+    /// `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md` (item 5)
+    /// for the full rationale.
+    ///
+    /// **Reported two unsuppressed hops late (MAN-114, Codex review PR
+    /// #346).** The phase used is `phase_hist`'s front entry -- `phase_z`
+    /// before the last `CRASH_MIN_HOPS - 1` unsuppressed hops -- not the
+    /// live `phase_z`. Those are exactly the hops a crash declared on the
+    /// next hop has `rollback_phase` undo, so no report (a queued
+    /// `TrackMeta` entry, a promotion, the live state) ever carries their
+    /// phase products before the crash detector has had its say on them.
+    /// After a rollback, and through a crash, `phase_hist` is empty and the
+    /// (already restored) `phase_z` is used. At α = 0.01 the two-hop lag is
+    /// far below the estimator's own time constant.
     fn freq_hz(&self, center_freq_hz: f64, channel_spacing_hz: f64, n_channels: usize) -> f64 {
+        let z = self.phase_hist.front().copied().unwrap_or(self.phase_z);
+        let pos = phase_position(z, self.center).unwrap_or(self.center);
         let k0_freq = center_freq_hz
             + wrapped_channel_offset(self.birth_channel, n_channels) * channel_spacing_hz;
-        k0_freq + (self.center - self.birth_channel as f64) * channel_spacing_hz
+        k0_freq + (pos - self.birth_channel as f64) * channel_spacing_hz
     }
 }
 
@@ -1590,6 +1657,11 @@ pub struct TrackManager {
     /// `reacquisition_count`; counted in test builds only.
     #[cfg(test)]
     reacquisitions: u64,
+    /// MAN-114: the previous hop `step_hop` saw, the lag partner of
+    /// `phase_lag_product`. Kept across `process_hops` calls so chunking
+    /// cannot change a track's frequency; its buffers are reused hop to
+    /// hop.
+    prev_hop: Option<HopOutput>,
 }
 
 /// MAN-312 (SPEC §2.7): the channels inside `rf_passband_hz` with one
@@ -1712,6 +1784,7 @@ impl TrackManager {
             dormant_flush: Vec::new(),
             #[cfg(test)]
             reacquisitions: 0,
+            prev_hop: None,
             comod: detector_cfg
                 .non_cw_filter
                 .then(|| CoModDetector::new(n_channels)),
@@ -2111,6 +2184,9 @@ impl TrackManager {
             self.n_channels()
         );
         let power_db_vals: Vec<f64> = hop.power.iter().map(|&p| power_db(p)).collect();
+        // MAN-114: the lag partner for this hop's phase products; put back,
+        // holding this hop, at the end.
+        let prev_hop = self.prev_hop.take();
         // MAN-312 (SPEC §2.7): a static crash is band-wide, so each channel
         // judging it on its own (the gate's 19-hop confirm) cannot reject
         // it -- the channelizer smears a few-ms crash over ~85 ms of every
@@ -2126,6 +2202,9 @@ impl TrackManager {
             .crash
             .update(&power_db_vals, self.hop_counter >= self.cfg.warmup_hops);
         let suppress = crash_hop.suppress() && self.cfg.crash_filter != CrashFilter::Off;
+        // MAN-114 (Codex review, PR #346): the hop this crash was declared
+        // on; each track's phase sum drops the lifted hops before it.
+        let crash_onset = suppress && crash_hop.run_hops == 1;
         let hold = crash_hop.hold_decoder() && self.cfg.crash_filter == CrashFilter::Full;
         self.floor.update_holding_reference(&power_db_vals, hold);
         let (rise, drop) = if suppress {
@@ -2226,11 +2305,22 @@ impl TrackManager {
             let prev_state = track.lifecycle.state();
             // MAN-312: a crash's energy would drag the centroid toward
             // wherever the smear happens to peak this hop. MAN-108: a
-            // DORMANT track's centroid is frozen (including on its wake
-            // hop): the frequency it held is what re-acquisition matches
-            // on, and noise or a neighbour must not drag it away.
-            if !suppress && prev_state != LifecycleState::Dormant {
+            // DORMANT track's centroid and spot-frequency phase sum are
+            // frozen (including on its wake hop): the frequency it held is
+            // what re-acquisition matches on, and noise or a neighbour must
+            // not drag it away.
+            if crash_onset {
+                track.rollback_phase();
+            } else if !suppress && prev_state != LifecycleState::Dormant {
                 track.update_centroid(k, &hop.power, n);
+                track.note_phase();
+                // MAN-114 (SPEC §1.4): key-down hops at >= 6 dB feed the
+                // spot-frequency estimator.
+                if power_db_vals[k] - self.floor.effective_floor_db(k) >= FINE_FREQ_MIN_SNR_DB {
+                    if let Some(z) = prev_hop.as_ref().and_then(|p| phase_lag_product(p, hop, k)) {
+                        track.update_phase(z);
+                    }
+                }
             }
             let f = self.floor.effective_floor_db(k);
             track.current_snr_db = (self.gate.smoothed_db(k) - f) as f32;
@@ -2658,6 +2748,17 @@ impl TrackManager {
         let (evicted_ids, evicted_flush) = self.evict_over_cap();
         closed_with_kind.extend(evicted_ids);
         closure_flush_events.extend(evicted_flush);
+        // MAN-114: this hop is the next hop's lag partner; reuse the
+        // previous hop's buffers rather than allocating a fresh copy.
+        let mut slot = prev_hop.unwrap_or_else(|| HopOutput {
+            m: 0,
+            x: Vec::new(),
+            power: Vec::new(),
+        });
+        slot.m = hop.m;
+        slot.x.clone_from(&hop.x);
+        slot.power.clone_from(&hop.power);
+        self.prev_hop = Some(slot);
         (closed_with_kind, promoted_events, closure_flush_events)
     }
 
@@ -3669,6 +3770,98 @@ mod tests {
                 "{path} must report the frequency of the entry whose sample_ts it reports"
             );
         }
+    }
+
+    #[test]
+    fn freq_hz_falls_back_to_center_without_phase() {
+        // MAN-114: no gated hop yet (`phase_z == 0`) reports `center`, so
+        // power-only test hops keep their pre-MAN-114 values.
+        let mut track = Track::new(1, 5, &cfg());
+        track.center = 5.25;
+        assert_eq!(track.phase_z, Complex64::new(0.0, 0.0));
+        let got = track.freq_hz(14_000_000.0, 93.75, 64);
+        assert!(
+            (got - (14_000_000.0 + 5.25 * 93.75)).abs() < 1e-9,
+            "got {got}"
+        );
+    }
+
+    #[test]
+    fn freq_hz_uses_phase_position_when_accumulated() {
+        // MAN-114: an accumulated phase product for channel position
+        // `center + 0.3` reports that position, not `center`.
+        let mut track = Track::new(1, 5, &cfg());
+        track.center = 5.1;
+        let pos = track.center + 0.3;
+        let z = Complex64::from_polar(0.7, std::f64::consts::TAU * pos / 4.0);
+        for _ in 0..1000 {
+            track.update_phase(z);
+        }
+        let got = track.freq_hz(14_000_000.0, 93.75, 64);
+        assert!(
+            (got - (14_000_000.0 + pos * 93.75)).abs() < 1e-6,
+            "got {got}, want {}",
+            14_000_000.0 + pos * 93.75
+        );
+        // Same on the negative-frequency side: channel 60 of 64 is -4.
+        let mut track = Track::new(1, 60, &cfg());
+        track.center = 59.8;
+        let pos = track.center + 0.3;
+        track.update_phase(Complex64::from_polar(
+            0.7,
+            std::f64::consts::TAU * pos / 4.0,
+        ));
+        let got = track.freq_hz(14_000_000.0, 93.75, 64);
+        let want = 14_000_000.0 + (pos - 64.0) * 93.75;
+        assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+    }
+
+    #[test]
+    fn freq_hz_never_reports_the_two_hops_a_crash_onset_rolls_back() {
+        // MAN-114 (Codex review, PR #346, round 2): a crash is declared on
+        // its third lifted hop, after the first two have already folded
+        // into `phase_z` and been queued with a `freq_hz`. Those per-hop
+        // reports must not carry the lifted hops' phase products: neither
+        // on the lifted hops themselves nor after the rollback.
+        let mut track = Track::new(1, 5, &cfg());
+        track.center = 5.1;
+        let pos = track.center + 0.3;
+        let clean = Complex64::from_polar(0.7, std::f64::consts::TAU * pos / 4.0);
+        for _ in 0..1000 {
+            track.note_phase();
+            track.update_phase(clean);
+        }
+        let want = track.freq_hz(14_000_000.0, 93.75, 64);
+        assert!(
+            (want - (14_000_000.0 + pos * 93.75)).abs() < 1e-6,
+            "got {want}"
+        );
+        // Two lifted hops at a wildly different phase and +100 dB.
+        let lifted = Complex64::from_polar(1e10, std::f64::consts::TAU * (pos + 0.45) / 4.0);
+        for hop in 0..2 {
+            track.note_phase();
+            track.update_phase(lifted);
+            let got = track.freq_hz(14_000_000.0, 93.75, 64);
+            assert!(
+                (got - want).abs() < 1e-6,
+                "lifted hop {hop} reported {got}, want {want}"
+            );
+        }
+        // Crash onset: rollback, then suppressed hops.
+        track.rollback_phase();
+        let got = track.freq_hz(14_000_000.0, 93.75, 64);
+        assert!(
+            (got - want).abs() < 1e-6,
+            "onset reported {got}, want {want}"
+        );
+        // Back to clean hops after the crash.
+        track.note_phase();
+        track.update_phase(clean);
+        let got = track.freq_hz(14_000_000.0, 93.75, 64);
+        assert!(
+            (got - want).abs() < 1e-6,
+            "post-crash reported {got}, want {want}"
+        );
     }
 
     #[test]

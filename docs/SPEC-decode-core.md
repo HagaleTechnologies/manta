@@ -104,27 +104,48 @@ channel index; conversion to Hz happens only when a spot is emitted.
 
 ### 1.4 Fine frequency estimate (for ±10 Hz spot accuracy)
 
-Per hop, for a track with peak channel `k₀`:
+Per hop, for a track whose selected channel is `k₀`, two estimators run.
+
+**Ownership centroid** (§2.5) and the drift fitter's input (§2.8):
 
 - Quadratic interpolation on **dB** powers of `(k₀−1, k₀, k₀+1)`:
   `δ_m = 0.5·(P₋ − P₊) / (P₋ − 2P₀ + P₊)` where `P• = PdB[k₀•, m]`.
   Clamp `δ_m` to `[−0.5, +0.5]`; if the denominator ≥ 0 (no local max — a
   peak requires `P₋ − 2P₀ + P₊ < 0`), set `δ_m = 0` and mark the hop unusable.
-- Only **key-down** hops (§3.4) with `SNR ≥ 6 dB` contribute.
-- Track centroid: power-weighted running mean over the track lifetime:
-  `C = Σ (k₀ + δ_m)·P₀[m] / Σ P₀[m]` (accumulate in `f64`).
-- Spot frequency: `f_spot = f(0) + C·Δ` rounded to **0.01 kHz** for the
+- Centroid `C`: an EMA of `k₀ + δ_m` with α = 0.01 over the usable hops.
+
+**Spot frequency** (MAN-114): a power-weighted lag-1 phase estimator.
+
+- Only **key-down** hops (§3.4) with `SNR ≥ 6 dB` contribute. Each one, with
+  the previous hop `m−1` also available, gives
+  `z_m = X̃[k₀,m]·conj(X̃[k₀,m−1])·e^{jπ(k₀ mod 4)/2}`, where
+  `X̃[k,m] = X[k,m]·s(m,k)` and `s` is the odd-channel sign correction
+  (`odd_channel_sign_correction`: −1 when `m` and `k` are both odd). The
+  rotation puts every channel's product in one absolute frame: with
+  hop = N/4, a tone at channel position `p` gives `arg z_m = 2π·p/4`.
+  `z_m` is not normalised, so a hop weighs in by its power.
+- Track phase sum: `Z ← Z + α·(z_m − Z)`, α = 0.01, accumulated in `f64`.
+- Position `C_f = arg(Z)/2π · 4`, unwrapped to the value nearest the
+  centroid `C`. Until the first contributing hop (`Z = 0`), `C_f = C`.
+  The reported `C_f` uses `Z` as it stood before the last two unsuppressed
+  hops (the two a crash declared on the next hop rolls back, §2.7), so no
+  report carries a crash's onset hops.
+- Spot frequency: `f_spot = f(0) + C_f·Δ` rounded to **0.01 kHz** for the
   telnet output (MAN-88 — RBN's live feed carries 2 decimals of kHz; the
   previous one-decimal rounding discarded 10 Hz of the estimator's real
   precision), full precision (Hz) in the JSON stream.
 
-With ≥ 100 key-down hops (any real CW transmission) the estimator's standard
-error is ≪ 10 Hz; absolute accuracy is then bounded by the SDR's reference
-oscillator, which is out of scope (config `input.freq_correction_ppm` exists).
-`manta calibrate` measures it against a known carrier.
-This ≪ 10 Hz claim is empirically channel-table-size (N) dependent: it was
-measured at N = 1024 (the 96 kHz table V1 uses); V31's 48 kHz/N = 512 table
-measures ~17 Hz instead (see the V31 row below; tracked in issue #177).
+Both are live EMAs rather than a lifetime power-weighted mean
+(`Σ (k₀ + δ_m)·P₀[m] / Σ P₀[m]`): an undecayed lifetime mean of a drifting
+signal converges to the midpoint of its range and fails V9 (see
+`docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md` item 5).
+
+Absolute accuracy is bounded by the SDR's reference oscillator, which is out
+of scope (config `input.freq_correction_ppm` exists). `manta calibrate`
+measures it against a known carrier. The spot frequency's measured worst
+error across a channel is ≤ 4 Hz on all three tables (48, 96 and 192 kHz) at
++6 and +20 dB; the dB parabola it replaced measured up to 38 Hz, on every
+table (`docs/DECISIONS/2026-10-17-man114-phase-difference-spot-frequency.md`).
 
 ### 1.5 Decimation (variable-width capture, issue #169)
 
@@ -324,8 +345,8 @@ and the validator's first-meta wait again. DORMANT keeps the identity
 instead. The `reacquirable` latch is set when a qualified track decodes a
 character, batch-granular like the GC reset (§2.8 G); a track that never
 decoded closes at the hang as before. While DORMANT no decoder runs, the
-garbage-collect timer holds, the centroid `c` is frozen (the frequency the
-track held is what re-acquisition matches on, so noise or a neighbour must
+garbage-collect timer holds, the centroid `c` and the spot-frequency
+phase sum `Z` (§1.4, MAN-114) are frozen (the frequency the track held is what re-acquisition matches on, so noise or a neighbour must
 not drag it), and the track keeps owning `{round(c) − 1, round(c),
 round(c) + 1}`. The wake rule is the same `confirm_hops` a fresh
 CANDIDATE needs, not a single rise hop: a single-hop wake was measured to
@@ -565,7 +586,8 @@ where Q25 never fired.
 The hop's outputs are `suppress = in_crash and run_hops ≤ CRASH_MAX_HOPS`
 and `hold_decoder = in_crash and run_hops ≤ CRASH_HOLD_MAX_HOPS`. A crash
 begins on its third lifted hop, so its first two lifted hops are neither
-suppressed nor held; the decoder hold below reaches back past them.
+suppressed nor held; the decoder hold and the phase-sum rollback below
+reach back past them.
 A lift that outlasts `CRASH_MAX_HOPS` is a level change rather than a
 crash (a gain step, or input returning from silence): suppression ends,
 the reference unfreezes and tracks the new level, the lift falls back
@@ -595,6 +617,7 @@ manager does on a hop with `suppress` set:
 | CANDIDATE lifecycles do not step | no | yes | yes |
 | gate EMA `S[k]` held; rise/drop recomputed from the held `S[k]` against the current floor | no | yes | yes |
 | track centroids (§1.4, §2.5) not updated | no | yes | yes |
+| spot-frequency phase sum `Z` (§1.4) not updated, and on the hop the crash begins reset to its value before the two lifted hops that preceded it | no | yes | yes |
 | ACTIVE/HANG lifecycles step on the held rise/drop | no (live rise/drop) | yes | yes |
 | decoder input held at its pre-onset value (hops with `hold_decoder`) | no | no | yes |
 | spectral reference (`FloorBank`'s 40 ms linear-power EMA, SPEC-decode-core-v2 §2.2) held (hops with `hold_decoder`) | no | no | yes |
@@ -1499,17 +1522,18 @@ in the fixture manifest. Text payload (unless stated):
 | V8w | pileup-50-fading | same scene as V8 | Watterson CCIR-poor, jitter 8 % | ≥ 90 % of signals with mean SNR ≥ +6 dB decoded with CER < 10 %; 0 bogus callsigns; 0 cross-channel ghost decodes |
 | V9 | drift | 18 WPM, +12 dB, drift +50 Hz/min, EA8AAA | AWGN | 1 track (no split); char ≥ 90 %; final freq tracks within 15 Hz |
 | V10 | farnsworth | 15 WPM chars / 25 WPM char-speed (Farnsworth), +15 dB, G4XXX | AWGN | char ≥ 95 %; word boundaries 100 % correct |
-| V31 | decimated-clean-20 | Same scene as V1 (20 WPM, +20 dB, offset +12.34 kHz, W1AW), synthesized at 192 kHz then decimated to 48 kHz via `manta_dsp::decimate::Decimator` | AWGN only, no jitter | char ≥ 98%; 1 track; freq error ≤ 25 Hz |
+| V31 | decimated-clean-20 | Same scene as V1 (20 WPM, +20 dB, offset +12.34 kHz, W1AW), synthesized at 192 kHz then decimated to 48 kHz via `manta_dsp::decimate::Decimator` | AWGN only, no jitter | char ≥ 98%; 1 track; freq error ≤ 10 Hz |
 | V34 | fade-good-reacquire | 20 WPM, +3 dB, offset +9.1 kHz, W1AW, 120 s; fade seed `0x0BAD`, noise seed `0x4D41_4E01_3B95` (MAN-108) | Watterson CCIR-good, no jitter | 1 promoted track within 300 Hz; W1AW spotted, every W1AW spot on that track; CER ≤ 0.20; with `detector.reacquire_ms = 0` the same WAV promotes ≥ 2 tracks (the scene still fades past the hang) |
 | V51 | drift-refine | Same scene as V9 (18 WPM, +12 dB, drift +50 Hz/min, EA8AAA), decoded with `decode.refine_bw_hz = 30` (the narrowband refiner, MAN-168/MAN-194) via a `--config` TOML | AWGN only, no jitter (as V9) | 1 track (no split); char ≥ 90 %; final freq within 15 Hz; the refine-on report differs from the refine-off control (the config reaches the pipeline) |
 
-V31's freq-error bound (25 Hz) differs from V1's (10 Hz) because the fine-
-frequency estimator's error is channel-table-size dependent, not a
-`Decimator` regression: measured ~17.4 Hz at the decimated path's N = 512
-table size vs. V1's N = 1024 (96 kHz) table. Confirmed by two no-decimator
-control renders of the same scene -- native 48 kHz and native 192 kHz both
-independently measure a similar ~15-17 Hz error with zero decimator
-involvement (see `crates/manta-cli/tests/golden_decimated_capture.rs`).
+V31's freq-error bound was 25 Hz until MAN-114. The dB-parabola spot
+frequency measured ~17.4 Hz here, and ~15-17 Hz on native 48 kHz and 192 kHz
+control renders of the same scene, which was read as a channel-table-size
+effect. MAN-114 found it is not: the error depends on the signal's
+fractional position inside its channel plus AWGN on the parabola's weak
+neighbour bin, and every table shows it (V1 and V31 share the +12.34 kHz
+offset, so the same fractional position). The §1.4 phase estimator measures
+1.4 Hz on V31 (`crates/manta-cli/tests/golden_decimated_capture.rs`).
 
 V51 (MAN-210) gates the narrowband refiner's refine-enabled path
 (`Track::decoder_input`'s delay-compensated hold-back/drain, MAN-194)
