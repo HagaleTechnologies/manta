@@ -18,6 +18,10 @@ pub const RECORDING_SCHEMA: &str = "manta-iq.v1";
 pub const RECORDING_SAMPLE_FORMAT: &str = "cf32_le";
 /// The longest metadata line a reader accepts, in bytes.
 pub const MAX_METADATA_LINE_BYTES: usize = 64 * 1024;
+/// The most samples a recording may span, stored plus missing: 2^53, about
+/// 28 years at 10 MS/s. Keeps every sample clock built from it (the
+/// engine's included) far from overflow.
+pub const MAX_RECORDING_SPAN_SAMPLES: u64 = 1 << 53;
 
 /// `PATH.meta.jsonl`: the suffix is appended to the whole path.
 pub fn metadata_path(payload: &Path) -> PathBuf {
@@ -276,6 +280,7 @@ pub fn read_recording_summary(payload: &Path) -> Result<RecordingSummary> {
     let mut end: Option<(u64, EndReason)> = None;
     let mut gap_count = 0u64;
     let mut last_gap: Option<u64> = None;
+    let mut missing_total = 0u64;
     while read_line(&mut reader, &mut buf, &meta)? {
         line_no += 1;
         let record = parse_record(&buf, &meta, line_no)?;
@@ -299,7 +304,20 @@ pub fn read_recording_summary(payload: &Path) -> Result<RecordingSummary> {
                     meta.display()
                 );
             }
-            MetadataRecord::Gap { before_sample, .. } => {
+            MetadataRecord::Gap {
+                before_sample,
+                missing_samples,
+            } => {
+                missing_total = missing_total
+                    .checked_add(missing_samples)
+                    .filter(|t| *t <= MAX_RECORDING_SPAN_SAMPLES)
+                    .with_context(|| {
+                        format!(
+                            "{} line {line_no}: the gaps exceed {MAX_RECORDING_SPAN_SAMPLES} \
+                             missing samples",
+                            meta.display()
+                        )
+                    })?;
                 if last_gap.is_some_and(|last| before_sample <= last) {
                     bail!(
                         "{} line {line_no}: gap positions must strictly increase",
@@ -330,6 +348,15 @@ pub fn read_recording_summary(payload: &Path) -> Result<RecordingSummary> {
     let want = sample_count
         .checked_mul(RawIqFormat::Cf32.frame_bytes() as u64)
         .with_context(|| format!("{}: sample_count overflows", meta.display()))?;
+    if sample_count
+        .checked_add(missing_total)
+        .is_none_or(|span| span > MAX_RECORDING_SPAN_SAMPLES)
+    {
+        bail!(
+            "{}: the recording spans more than {MAX_RECORDING_SPAN_SAMPLES} samples",
+            meta.display()
+        );
+    }
     let len = std::fs::metadata(payload)
         .with_context(|| format!("open IQ recording {}", payload.display()))?
         .len();

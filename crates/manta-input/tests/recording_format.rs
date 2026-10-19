@@ -249,6 +249,21 @@ fn malformed_metadata_is_rejected() {
             format!("{}\n", "x".repeat(MAX_METADATA_LINE_BYTES + 10)),
             "longer than",
         ),
+        // A gap too long for any sample clock (MAN-309 review).
+        (
+            good.replace(
+                "\"missing_samples\":1",
+                "\"missing_samples\":18446744073709551615",
+            ),
+            "gaps exceed",
+        ),
+        (
+            good.replace(
+                "\"missing_samples\":1",
+                "\"missing_samples\":9007199254740990",
+            ),
+            "spans more than",
+        ),
     ];
     for (text, needle) in cases {
         std::fs::write(&meta, &text).unwrap();

@@ -6157,6 +6157,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 let reload = None;
                 return multi_run::run(multi_run::MultiRun {
                     inputs: &resolved.inputs,
+                    replay_epoch: resolved.replay_epoch,
                     replay: resolved.replay,
                     cfg: &cfg,
                     json,

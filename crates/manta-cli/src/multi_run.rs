@@ -25,6 +25,8 @@ use std::time::{Duration, Instant, SystemTime};
 /// What `run` hands the multi-input path.
 pub(crate) struct MultiRun<'a> {
     pub inputs: &'a [ResolvedInput],
+    /// `--replay-epoch`/`input.replay_epoch`, for recordings' start times.
+    pub replay_epoch: Option<i64>,
     pub replay: ReplayMode,
     pub cfg: &'a PipelineConfig,
     pub json: bool,
@@ -277,6 +279,12 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         (0..n).map(|_| Arc::new(RttyObserver::default())).collect();
     let rtty_marks = Arc::new(RttyMarks::new(n));
     // MAN-56: each input's packet counters, taken on its own thread at open.
+    // MAN-309: a replay's recordings start at the session's epoch.
+    let session_file = m.inputs.iter().find_map(|i| match &i.spec {
+        LiveSourceSpec::File { path, .. } => Some(path.clone()),
+        _ => None,
+    });
+    let replay_epoch = m.replay_epoch;
     // MAN-309: each recorded input's completion handle, kept outside the
     // source the engine owns.
     let recordings: Arc<Mutex<Vec<Option<manta_input::RecordingHandle>>>> =
@@ -292,11 +300,8 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             let spec = input.spec.clone();
             let (capture, dial) = (input.capture_rate_hz, input.dial_freq_hz);
             let record_iq = input.record_iq.clone();
-            let record_file = match &spec {
-                LiveSourceSpec::File { path, .. } => Some(path.clone()),
-                _ => None,
-            };
             let recordings = recordings.clone();
+            let session_file = session_file.clone();
             let name = input.name.clone();
             let replay = m.replay;
             let stop = stop.clone();
@@ -367,7 +372,9 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                     let Some(path) = &record_iq else {
                         return Ok(src);
                     };
-                    let start = crate::resolve_epoch(record_file.as_deref(), None)?;
+                    // The session's epoch, as the spot clock uses: the first
+                    // file's (or --replay-epoch) for a replay, now for live.
+                    let start = crate::resolve_epoch(session_file.as_deref(), replay_epoch)?;
                     let (src, handle) = crate::start_input_recording(src, path, start)?;
                     if let Ok(mut slot) = recordings.lock() {
                         slot[index] = Some(handle);
