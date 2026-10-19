@@ -933,6 +933,7 @@ mod tests {
         let mut r = resolved_with(LiveSourceSpec::File {
             path: "x.wav".into(),
             source_iq: true,
+            raw: None,
         });
         let e = apply_tune_hz(&mut r, 9_998_500.0).unwrap_err();
         assert!(e.to_string().contains("cannot retune a recording"), "{e}");

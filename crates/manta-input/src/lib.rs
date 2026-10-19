@@ -19,6 +19,20 @@ pub use decimate::DecimatingSource;
 pub mod replay;
 pub use replay::{LoopingSource, PacedSource, Reopen};
 
+pub mod raw;
+pub use raw::{RawIqFormat, RawIqSource};
+
+pub mod recording_format;
+pub use recording_format::{
+    is_native_recording, metadata_path, partial_metadata_path, read_recording_summary, EndReason,
+    RecordedIqSource, RecordingHeader, RecordingSummary,
+};
+
+pub mod recording;
+pub use recording::{
+    start_recording, RecordingHandle, RecordingNotice, RecordingOutcome, RecordingSource,
+};
+
 #[cfg(feature = "soapy")]
 pub mod soapy;
 #[cfg(feature = "soapy")]
@@ -365,6 +379,69 @@ impl IqSource for WavIqSource {
         }
         Ok(n)
     }
+}
+
+/// How to open an IQ file (MAN-309): all `None` opens a WAV (centre from its
+/// sidecar) or a manta recording (everything from its metadata).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct IqFileOptions {
+    /// Read the file as headerless IQ in this layout.
+    pub raw_format: Option<RawIqFormat>,
+    /// The stored sample rate of headerless IQ.
+    pub sample_rate_hz: Option<f64>,
+    /// Overrides the centre frequency; required for headerless IQ.
+    pub center_freq_hz: Option<f64>,
+}
+
+/// Opens an IQ file: a manta recording when `PATH.meta.jsonl` (or its
+/// partial marker) is next to it, headerless IQ when `opts.raw_format` is
+/// set, and a stereo IQ WAV otherwise. A recording's format and rate come
+/// from its metadata; explicit values must agree with it, so they cannot
+/// discard its gaps or guards. A centre override changes only the RF origin.
+pub fn open_iq_file(path: &Path, opts: IqFileOptions) -> Result<Box<dyn IqSource + Send>> {
+    if is_native_recording(path) {
+        let src = RecordedIqSource::open(path)?;
+        if opts.raw_format.is_some_and(|f| f != RawIqFormat::Cf32) {
+            bail!(
+                "{} is a manta IQ recording (cf32); --iq-format {} does not match its metadata",
+                path.display(),
+                opts.raw_format.map_or("", RawIqFormat::as_str)
+            );
+        }
+        if let Some(fs) = opts.sample_rate_hz {
+            if fs != src.sample_rate() {
+                bail!(
+                    "{} is a manta IQ recording at {} Hz; --sample-rate-hz {fs} does not match \
+                     its metadata",
+                    path.display(),
+                    src.sample_rate()
+                );
+            }
+        }
+        return Ok(match opts.center_freq_hz {
+            Some(hz) => {
+                raw::check_iq_file_center(path, hz)?;
+                Box::new(src.with_center_freq_hz(hz))
+            }
+            None => Box::new(src),
+        });
+    }
+    if let Some(format) = opts.raw_format {
+        let (Some(fs), Some(center)) = (opts.sample_rate_hz, opts.center_freq_hz) else {
+            bail!("headerless IQ requires a sample rate and a centre frequency");
+        };
+        return Ok(Box::new(RawIqSource::open(path, format, fs, center)?));
+    }
+    if opts.sample_rate_hz.is_some() {
+        bail!(
+            "a sample rate applies only to headerless IQ (--iq-format); {} is read as a WAV",
+            path.display()
+        );
+    }
+    Ok(match opts.center_freq_hz {
+        Some(hz) => Box::new(WavIqSource::open_with_center_freq_hz(path, hz)?),
+        None => Box::new(WavIqSource::open(path)?),
+    })
 }
 
 /// Drain an IqSource to a Vec (file-mode helper). ARCHITECTURE §3.
