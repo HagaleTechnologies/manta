@@ -100,6 +100,33 @@ pub(crate) fn reload_once(ctx: &ReloadContext) -> Result<ReloadOutcome> {
     let restart_needed = restart_only_changes(&ctx.startup_raw, &prepared.loaded.raw);
     let dry_run_skipped = restart_needed.iter().any(|p| p.starts_with("rbn_uplink"))
         || prepared.loaded.rbn_uplink.len() != ctx.uplinks.len();
+    // MAN-319: `load()` checked the new document's grid, but
+    // `[server].operator_grid` is restart-only, so going live needs the
+    // 6-character grid the daemon started with (PR #362 review).
+    if !dry_run_skipped {
+        let startup_grid = ctx
+            .startup_raw
+            .get("server")
+            .and_then(|s| s.get("operator_grid"))
+            .and_then(toml::Value::as_str);
+        if !startup_grid.is_some_and(|g| g.chars().count() == 6) {
+            let live_flip = ctx
+                .uplinks
+                .iter()
+                .zip(&prepared.loaded.rbn_uplink)
+                .find(|(live, new)| live.enabled && !new.dry_run);
+            if let Some((live, _)) = live_flip {
+                let started = startup_grid
+                    .map_or_else(|| "without one".to_string(), |g| format!("with \"{g}\""));
+                anyhow::bail!(
+                    "[[rbn_uplink]] target {}: dry_run = false needs a 6-character \
+                     [server].operator_grid in effect, and operator_grid takes effect only \
+                     after a restart -- this daemon started {started}; restart it to go live",
+                    live.label
+                );
+            }
+        }
+    }
 
     let pipeline = prepared.pipeline;
     let allowlist_calls = pipeline
@@ -632,6 +659,51 @@ blocklist_path = \"bl.txt\"
             report.dry_run_changes
         );
         assert!(!report.dry_run_skipped);
+    }
+
+    /// MAN-319 (PR #362 review): `[server].operator_grid` is restart-only,
+    /// so a reload that adds it and goes live in one edit would transmit
+    /// with no grid in effect. Rejected before anything applies; a daemon
+    /// that started with a 6-character grid still goes live.
+    #[test]
+    fn going_live_needs_a_six_character_grid_in_effect_since_startup() {
+        for startup_grid in ["", "operator_grid = \"FN03\""] {
+            let base = BASE.replace("operator_grid = \"FN03ab\"", startup_grid);
+            let f = start(
+                &format!("{base}{}", uplink_block(true, 7000)),
+                CliOverrides::none(),
+            );
+            write(
+                &f.path("manta.toml"),
+                &format!("{BASE}{}", uplink_block(false, 7000)),
+            );
+            let err = format!("{:#}", reload_once(&f.ctx).unwrap_err());
+            assert!(
+                err.contains(
+                    "dry_run = false needs a 6-character [server].operator_grid in effect, \
+                     and operator_grid takes effect only after a restart"
+                ),
+                "{startup_grid:?}: {err}"
+            );
+            assert!(f.ctx.lists.take().is_none());
+            assert_eq!(flags(&f.ctx), vec![true]);
+        }
+
+        let f = start(
+            &format!("{BASE}{}", uplink_block(true, 7000)),
+            CliOverrides::none(),
+        );
+        write(
+            &f.path("manta.toml"),
+            &format!(
+                "{}{}",
+                BASE.replace("FN03ab", "FN03cd"),
+                uplink_block(false, 7000)
+            ),
+        );
+        let report = applied(&f.ctx);
+        assert_eq!(flags(&f.ctx), vec![false]);
+        assert_eq!(report.restart_needed, vec!["server.operator_grid"]);
     }
 
     /// What `manta config check` rejects beyond `run`'s config stage, a

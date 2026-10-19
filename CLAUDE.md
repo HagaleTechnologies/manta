@@ -59,11 +59,12 @@ MAN-319: a live `[[rbn_uplink]]` (`enabled` + `dry_run = false`) refuses
 to load without a 6-character `[server].operator_grid`, from the one
 cross-table rule in `manta-cli`'s `load()` (check, run, doctor and the
 SIGHUP reload all share it; a no-grid live flip is an invalid reload per
-MAN-78). The ticket's registration/settings/wait/reference-file scenarios
-put nothing on the wire: they are blocked on MAN-90's capture and recorded
-as open claims C8–C11 in the MAN-90 table. Dry-run keeps its recorded
-"logs in, sends no spots" reading; the future registration phase must not
-register while dry-run is on. See
+MAN-78, and since the grid is restart-only a reload goes live only on a
+daemon that started with one). The ticket's registration/settings/wait/
+reference-file scenarios put nothing on the wire: they are blocked on
+MAN-90's capture and recorded as open claims C8–C11 in the MAN-90 table.
+Dry-run keeps its recorded "logs in, sends no spots" reading; the future
+registration phase must not register while dry-run is on. See
 docs/DECISIONS/2026-10-19-man319-uplink-registration-exchange.md.
 
 ## Documents (read in this order)

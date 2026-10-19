@@ -37,9 +37,13 @@ with exit 0 (reproduced with the real binary at `b17da2a`).
   `[server].operator_grid` is exactly 6 characters. One rule in `manta-cli`'s
   `load()`, beside the existing "`[[rbn_uplink]]` needs a `[server]` table"
   bail, so `config check`, `run`, `doctor` and the SIGHUP reload path all
-  enforce it from one place; a reload whose new config goes live without a
+  enforce it through `load()`; a reload whose new config goes live without a
   grid is an invalid reload (MAN-78 semantics: logged, ignored, the previous
-  configuration keeps running). The error names the target and the key:
+  configuration keeps running). `operator_grid` itself is restart-only, so
+  `reload_once` also rejects a reload that turns an enabled uplink live
+  unless the daemon started with a 6-character grid: adding the grid and
+  flipping `dry_run` in one edit needs a restart (PR #362 review). The
+  `load()` error names the target and the key:
   `dry_run = false -- sending spots needs [server].operator_grid set to a
   6-character Maidenhead locator (e.g. "FN03ab")`. Rejected alternatives:
   gating every enabled uplink including dry-run rehearsals (Scenario 1's own

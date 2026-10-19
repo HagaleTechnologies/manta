@@ -254,7 +254,10 @@ fn an_invalid_reload_is_logged_and_the_previous_lists_stay() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("manta.toml");
     let blocklist = dir.path().join("bl.txt");
-    std::fs::write(&config, server_toml("", &uplink_toml(uplink_port, true))).unwrap();
+    // MAN-319: going live needs a 6-character grid, and the grid is
+    // restart-only, so the daemon starts with one.
+    let grid = "operator_grid = \"FN03ab\"";
+    std::fs::write(&config, server_toml(grid, &uplink_toml(uplink_port, true))).unwrap();
     std::fs::write(&blocklist, "W1AW\n").unwrap();
     let mut daemon = Daemon::start(dir.path());
 
@@ -286,16 +289,8 @@ fn an_invalid_reload_is_logged_and_the_previous_lists_stay() {
     daemon.assert_no_w1aw_spot_for(Duration::from_millis(1500));
 
     // Positive control: a valid reload after the rejections still applies,
-    // lists and dry_run alike. MAN-319: going live needs the 6-character
-    // grid, so the flipped config carries one.
-    std::fs::write(
-        &config,
-        server_toml(
-            "operator_grid = \"FN03ab\"",
-            &uplink_toml(uplink_port, false),
-        ),
-    )
-    .unwrap();
+    // lists and dry_run alike.
+    std::fs::write(&config, server_toml(grid, &uplink_toml(uplink_port, false))).unwrap();
     std::fs::write(&blocklist, "K1BAD\n").unwrap();
     daemon.signal(libc::SIGHUP);
     expect_line(
@@ -347,6 +342,27 @@ fn a_reload_that_goes_live_without_a_grid_is_refused_and_dry_run_stays_on() {
             "reload: rejected; still running the previous configuration",
             "dry_run = false -- sending spots needs [server].operator_grid set to a \
              6-character Maidenhead locator",
+        ],
+        LINE_TIMEOUT,
+    );
+
+    // Adding the grid in the same edit does not help: it is restart-only,
+    // so this daemon still has none in effect (PR #362 review).
+    std::fs::write(
+        &config,
+        server_toml(
+            "operator_grid = \"FN03ab\"",
+            &uplink_toml(uplink_port, false),
+        ),
+    )
+    .unwrap();
+    daemon.signal(libc::SIGHUP);
+    expect_line(
+        &daemon.stderr,
+        &[
+            "ERROR",
+            "reload: rejected; still running the previous configuration",
+            "operator_grid takes effect only after a restart",
         ],
         LINE_TIMEOUT,
     );

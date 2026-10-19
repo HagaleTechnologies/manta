@@ -238,7 +238,8 @@ agrees to accept your spots and confirms their collector expects manta's login a
 `DX de` lines, set `dry_run = false`. Before you flip it, set
 `[server].operator_grid` to a 6-character Maidenhead locator (e.g. `"FN03ab"`) —
 a live uplink needs one, and `config check` (and so the SIGHUP reload) refuses
-`dry_run = false` without it. For the service in step 7, edit
+`dry_run = false` without it. The grid takes effect only at a restart, so a
+SIGHUP goes live only on a daemon that started with one. For the service in step 7, edit
 `/etc/manta/manta.toml`, validate it with
 `sudo manta config check --config /etc/manta/manta.toml`, then run
 `sudo systemctl restart manta`. The kit uses `LoadCredential`, so
