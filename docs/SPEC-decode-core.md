@@ -1733,13 +1733,14 @@ flush_gap_dits = 7.0
 #   file:  path*, iq, realtime, loop
 #   kiwi:  host*, freq_hz*, port, password
 #   soapy: driver*, freq_hz*, rate_hz*, gain_db   (build with --features soapy)
-#   hpsdr: host*, freq_hz*, rate_hz*, port        (included in every build)
+#   hpsdr: host, mac, freq_hz*, rate_hz*, port        (included in every build)
 #   ka9q:  group*, port, ssrc, interface
 # Any source flag on the command line (--device, --source, --kiwi-host,
 # --soapy-driver, --hpsdr-host, --ka9q-group) replaces a typed [input]
 # table whole, its shared keys below included. Example:
 # type = "kiwi"               # audio | file | kiwi | soapy | hpsdr | ka9q
-# host = "<your-kiwi-host>"   # kiwi, hpsdr
+# host = "<your-kiwi-host>"   # kiwi required; hpsdr optional (omit host and mac to discover)
+# mac = "02:11:22:33:44:55"   # hpsdr: pin by MAC instead of host; never set both
 # port = 8073                 # kiwi (default 8073), hpsdr (default 1024), ka9q (default 5004)
 # freq_hz = 7030000.0         # kiwi, soapy, hpsdr: RF center frequency, Hz
 # password = ""               # kiwi (default "")

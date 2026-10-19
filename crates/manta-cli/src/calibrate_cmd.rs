@@ -369,10 +369,14 @@ fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<Str
     // stands for them.
     flag(kiwi.host.is_some(), "--kiwi-host");
     flag(kiwi.freq.is_some(), "--kiwi-freq-hz");
-    // Likewise every other --soapy-* / --hpsdr-* flag requires these.
+    // Every other --soapy-* flag requires the driver.
     #[cfg(feature = "soapy")]
     flag(soapy.driver.is_some(), "--soapy-driver");
     flag(hpsdr.host.is_some(), "--hpsdr-host");
+    flag(hpsdr.mac.is_some(), "--hpsdr-mac");
+    flag(hpsdr.freq.is_some(), "--hpsdr-freq-hz");
+    flag(hpsdr.rate.is_some(), "--hpsdr-rate-hz");
+    flag(hpsdr.port.is_some(), "--hpsdr-port");
     // --ka9q-port, --ka9q-ssrc and --ka9q-interface require --ka9q-group.
     flag(ka9q.group.is_some(), "--ka9q-group");
     flag(dial_freq_hz.is_some(), "--dial-freq-hz");
@@ -917,7 +921,8 @@ mod tests {
         {
             let mut r = resolved_with(LiveSourceSpec::Hpsdr(crate::HpsdrOpts {
                 host: Some("h".into()),
-                port: manta_input::hpsdr::CONTROL_PORT,
+                mac: None,
+                port: Some(manta_input::hpsdr::CONTROL_PORT),
                 freq: Some(7_030_000.0),
                 rate: Some(192_000.0),
             }));

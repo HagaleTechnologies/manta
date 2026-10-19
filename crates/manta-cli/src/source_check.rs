@@ -30,8 +30,8 @@ pub(crate) struct Args {
     source: Option<PathBuf>,
     /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
     #[arg(help_heading = "KiwiSDR source")]
-    #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-    #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+    #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port", "soapy_driver"], requires = "kiwi_freq_hz"))]
+    #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port"], requires = "kiwi_freq_hz"))]
     #[arg(group = "source_selector")]
     kiwi_host: Option<String>,
     /// KiwiSDR receiver port.
@@ -65,7 +65,7 @@ pub(crate) struct Args {
     /// builds made with the `soapy` feature.
     #[cfg(feature = "soapy")]
     #[arg(help_heading = "SoapySDR source")]
-    #[arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"])]
+    #[arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port", "kiwi_host"])]
     #[arg(group = "source_selector")]
     soapy_driver: Option<String>,
     /// Receiver centre frequency, in Hz. Required with --soapy-driver.
@@ -97,32 +97,34 @@ pub(crate) struct Args {
     #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
     #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
     #[arg(group = "source_selector")]
+    #[arg(conflicts_with_all = ["path", "device", "source"])]
+    #[arg(conflicts_with = "hpsdr_mac")]
     hpsdr_host: Option<String>,
+    /// Discover and select a radio by MAC address; omit host to discover.
+    #[arg(long, value_parser = parse_hpsdr_mac, help_heading = "HPSDR source", conflicts_with_all = ["path", "hpsdr_host", "device", "source"])]
+    hpsdr_mac: Option<[u8; 6]>,
     /// HPSDR/Hermes control port.
-    #[arg(
-        long,
-        default_value_t = manta_input::hpsdr::CONTROL_PORT,
-        requires = "hpsdr_host",
-        help_heading = "HPSDR source"
-    )]
-    hpsdr_port: u16,
-    /// Receiver centre frequency, in Hz. Required with --hpsdr-host.
+    #[arg(long, help_heading = "HPSDR source")]
+    #[arg(conflicts_with_all = ["path", "device", "source"])]
+    #[arg(value_parser = clap::value_parser!(u16).range(1..))]
+    hpsdr_port: Option<u16>,
+    /// Receiver centre frequency, in Hz. Required with the hpsdr source.
     #[arg(
         long = "hpsdr-freq-hz",
         alias = "hpsdr-freq",
-        requires = "hpsdr_host",
         value_parser = parse_hpsdr_freq_hz,
         help_heading = "HPSDR source"
     )]
+    #[arg(conflicts_with_all = ["path", "device", "source"])]
     hpsdr_freq_hz: Option<f64>,
-    /// Sample rate, in Hz. Required with --hpsdr-host.
+    /// Sample rate, in Hz. Required with the hpsdr source.
     #[arg(
         long = "hpsdr-rate-hz",
         alias = "hpsdr-rate",
-        requires = "hpsdr_host",
         value_parser = parse_hpsdr_rate_hz,
         help_heading = "HPSDR source"
     )]
+    #[arg(conflicts_with_all = ["path", "device", "source"])]
     hpsdr_rate_hz: Option<f64>,
     /// Multicast data group of a ka9q-radio (radiod) IQ channel
     ///
@@ -132,8 +134,8 @@ pub(crate) struct Args {
     /// encoding and frequency from radiod's status packets; it does not
     /// create or retune channels.
     #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
-    #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
-    #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
+    #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port", "soapy_driver"]))]
+    #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port"]))]
     #[arg(group = "source_selector")]
     ka9q_group: Option<String>,
     /// RTP data port of the group.
@@ -222,6 +224,7 @@ pub(crate) fn run(args: Args) -> Result<i32> {
             },
             hpsdr: HpsdrOpts {
                 host: args.hpsdr_host,
+                mac: args.hpsdr_mac,
                 port: args.hpsdr_port,
                 freq: args.hpsdr_freq_hz,
                 rate: args.hpsdr_rate_hz,
