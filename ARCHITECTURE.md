@@ -762,9 +762,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   reconnect loop reads as unhealthy even while technically connected at
   the instant it's checked. Exit code doubles as a cron/Nagios check.
   Unlike `/healthz`, which deliberately ignores the uplink (MAN-128 D10),
-  `/status` is about the uplink. Inherits `/metrics`'s unauthenticated,
-  `0.0.0.0`-by-default exposure posture
-  (`docs/RUNBOOKS/network-exposure.md`). `docs/METRICS.md` lists every
+  `/status` is about the uplink. Inherits `/metrics`'s unauthenticated
+  listener and its `[server].metrics_bind_addr`, `127.0.0.1` by default
+  (MAN-132, §7): reachable from another host only once an operator widens
+  it, per `docs/RUNBOOKS/network-exposure.md`. `docs/METRICS.md` lists every
   rendered family with its type, labels and when it has samples. Prometheus text
   endpoint (compiled in unconditionally, no feature flag — the "(feature
   `metrics`)" phrasing in older revisions of this doc was stale, no Cargo
