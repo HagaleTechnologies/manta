@@ -77,7 +77,10 @@ and additionally discloses configured RBN uplink target `host:port` pairs
 — public RBN infrastructure by nature, but newly enumerable by anyone who
 can reach the port. The runbook's existing firewall guidance is the
 mitigation, unchanged in kind from what `/metrics`'s `manta_source_health`
-labels already expose.
+labels already expose. **MAN-132 (2026-10-08): the metrics listener, and
+`/status` with it, now binds its own `[server].metrics_bind_addr`, default
+`127.0.0.1`, so this exposure exists only when an operator widens that key
+— see `docs/DECISIONS/2026-10-08-man132-metrics-loopback-bind.md`.**
 
 ## What was built
 

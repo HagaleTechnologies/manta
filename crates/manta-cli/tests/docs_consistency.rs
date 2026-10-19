@@ -1508,6 +1508,8 @@ fn docs_describe_the_separate_metrics_bind_addr() {
         "ARCHITECTURE.md",
         "docs/RUNBOOKS/network-exposure.md",
         "docs/RUNBOOKS/node-health.md",
+        "docs/RUNBOOKS/uplink-health.md",
+        "wiki/pages/uplink-health-observability.md",
     ] {
         let text = squash_whitespace(&doc(rel));
         assert!(
@@ -1519,9 +1521,27 @@ fn docs_describe_the_separate_metrics_bind_addr() {
             "omit it and all three servers bind",
             "shares the same publicly-bound-by-default posture",
             "default bind `[server].bind_addr`",
+            "`0.0.0.0`-by-default exposure posture",
         ] {
             assert!(!text.contains(stale), "{rel} still says {stale:?}");
         }
+    }
+}
+
+/// MAN-287: the uplink-health runbook says what checking a daemon on another
+/// host takes, not just that it is loopback-only by default.
+#[test]
+fn uplink_health_runbook_says_how_to_reach_a_remote_daemon() {
+    let text = squash_whitespace(&doc("docs/RUNBOOKS/uplink-health.md"));
+    for needle in [
+        "--addr <that host>:<metrics_port>",
+        "set `[server].metrics_bind_addr`",
+        "firewall `[server].metrics_port`",
+    ] {
+        assert!(
+            text.contains(needle),
+            "uplink-health.md does not say {needle:?}"
+        );
     }
 }
 
