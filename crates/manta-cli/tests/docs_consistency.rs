@@ -1207,6 +1207,7 @@ fn spec_detector_values_equal_the_code_defaults() {
         "rtty_dwell_ms",
         "non_cw_filter",
         "unkeyed_close_ms",
+        "reacquire_ms",
     ] {
         assert!(
             table.contains_key(key),
