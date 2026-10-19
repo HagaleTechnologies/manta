@@ -140,6 +140,36 @@ fn readme_inputs_table_covers_every_shipped_input() {
     }
 }
 
+/// MAN-306: hostless discovery is a UDP broadcast only. The Red Pitaya and
+/// QMTech images use avahi/mDNS discovery instead (hpsdr spike decision), so
+/// every claim of automatic discovery carries that exclusion.
+#[test]
+fn readme_hpsdr_discovery_claims_exclude_red_pitaya() {
+    let readme = doc("README.md");
+    let row = section(&readme, "Inputs")
+        .lines()
+        .find(|l| l.starts_with("| OpenHPSDR"))
+        .expect("README Inputs table has no OpenHPSDR row");
+    assert!(
+        row.contains("Red Pitaya and QMTech images need `--hpsdr-host`"),
+        "README OpenHPSDR row promises discovery without excluding Red Pitaya and QMTech"
+    );
+    let inputs = squash_whitespace(section(&readme, "Inputs"));
+    let claims = inputs.matches("automatically when no host is set").count();
+    let exclusions = inputs
+        .matches("Red Pitaya and QMTech images need `--hpsdr-host`")
+        .count();
+    assert!(
+        claims > 0,
+        "README Inputs no longer mentions HPSDR discovery"
+    );
+    assert_eq!(
+        claims, exclusions,
+        "README Inputs promises HPSDR discovery {claims} times but says Red Pitaya and QMTech \
+         images need `--hpsdr-host` only {exclusions} times"
+    );
+}
+
 // ---- Scenario 1: Outputs and Status describe shipped capability ----
 
 /// The telnet server, JSON/WebSocket stream, RBN uplink and Prometheus

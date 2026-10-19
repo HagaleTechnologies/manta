@@ -19,7 +19,9 @@ both protocols keeps its P2 answer; explicit host can force the P1 path.
 All five source commands use the same opener. Reconnect invokes discovery
 again, so a pinned MAC follows an address change. Two configured inputs with
 the same MAC or two unqualified discovery inputs are refused, like duplicate
-host inputs. Several receivers on one radio remain MAN-307's work.
+host inputs. So is an unqualified discovery input beside a MAC-pinned one on
+the same port: the unqualified one takes whichever radio answers, so it either
+lands on the pinned radio or fails as ambiguous. Several receivers on one radio remain MAN-307's work.
 
 ## Discovery
 

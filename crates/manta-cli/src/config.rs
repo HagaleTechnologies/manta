@@ -839,15 +839,36 @@ fn check_input_entries(inputs: &[NamedInput], origin: &str) -> Result<()> {
             Some(SourceFromFile::Hpsdr {
                 host, mac, port, ..
             }) => {
-                let earlier = inputs[..i].iter().find(|o| {
-                    matches!(&o.input.source, Some(SourceFromFile::Hpsdr { host: h, mac: m, port: p, .. })
-                        if p == port && match (host, h) {
+                let earlier = inputs[..i].iter().find_map(|o| match &o.input.source {
+                    Some(SourceFromFile::Hpsdr {
+                        host: h,
+                        mac: m,
+                        port: p,
+                        ..
+                    }) if p == port
+                        && match (host, h) {
                             (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-                            (None, None) => mac == m,
+                            // An entry with neither host nor MAC takes whichever radio
+                            // answers, which can be the other hostless entry's radio.
+                            (None, None) => mac.is_none() || m.is_none() || mac == m,
                             _ => false,
-                        })
+                        } =>
+                    {
+                        Some((o, m))
+                    }
+                    _ => None,
                 });
-                if let Some(earlier) = earlier {
+                if let Some((earlier, m)) = earlier {
+                    if mac != m {
+                        bail!(
+                            "{origin}: [[input]] {name}: input {} also discovers an HPSDR radio \
+                             on port {port}, and an entry without input.mac takes whichever \
+                             radio answers, so both can select the same radio; give each entry \
+                             its own input.mac (several receivers on one HPSDR radio are not \
+                             supported yet, MAN-307)",
+                            crate::fmt::quoted(&earlier.name)
+                        );
+                    }
                     let identity = host
                         .as_deref()
                         .or(mac.as_deref())
@@ -1289,6 +1310,39 @@ mod tests {
             let body = ["a", "b"].map(|name| format!("[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n{selector}")).join("\n");
             assert!(err_of(&body).contains("several receivers on one HPSDR radio"));
         }
+    }
+
+    #[test]
+    fn hpsdr_discovery_pinned_and_unpinned_hostless_inputs_are_refused() {
+        let entry = |name: &str, selector: &str| {
+            format!(
+                "[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = \
+                 192000.0\n{selector}"
+            )
+        };
+        let pinned = "mac = \"aabbccddeeff\"\n";
+        for (a, b) in [(pinned, ""), ("", pinned)] {
+            let err = err_of(&format!("{}{}", entry("a", a), entry("b", b)));
+            assert!(
+                err.contains(
+                    ": [[input]] \"b\": input \"a\" also discovers an HPSDR radio on port 1024, \
+                     and an entry without input.mac takes whichever radio answers"
+                ),
+                "{err}"
+            );
+        }
+        assert!(load_file(&format!(
+            "{}{}",
+            entry("a", pinned),
+            entry("b", "mac = \"001122334455\"\n")
+        ))
+        .is_ok());
+        assert!(load_file(&format!(
+            "{}{}",
+            entry("a", pinned),
+            entry("b", "port = 1025\n")
+        ))
+        .is_ok());
     }
 
     const SERVER: &str = "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
