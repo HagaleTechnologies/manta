@@ -317,6 +317,27 @@ fn is_audio(spec: &LiveSourceSpec) -> bool {
     }
 }
 
+/// MAN-127 Decision 11, MAN-334: plan on `configured` -- the centre and
+/// passband the configuration gives, when it gives them -- before `open`
+/// touches the receiver, so a passband that holds no reference gets the
+/// retune hint and no receiver I/O. Then plan again on what the opened
+/// source reports: a SoapySDR driver may round the centre or rate, and a
+/// ka9q-radio channel or a recording only says once open. The second plan
+/// is the one measured.
+fn open_planned(
+    configured: Option<(f64, (f64, f64))>,
+    is_audio: bool,
+    opts: &CalibrateOptions,
+    open: impl FnOnce() -> Result<crate::reconnect::SendSource>,
+) -> Result<(crate::reconnect::SendSource, Vec<PlannedReference>)> {
+    if let Some((center_hz, passband)) = configured {
+        plan_references(center_hz, passband, is_audio, opts)?;
+    }
+    let src = open()?;
+    let planned = plan_references(src.center_freq_hz(), src.rf_passband_hz(), is_audio, opts)?;
+    Ok((src, planned))
+}
+
 /// Every input override in effect, deny-by-default: each command-line flag
 /// that changes the source, receiver, centre/dial frequency, IQ mode, sample
 /// rate, device or file, and every `MANTA_INPUT_*` variable but
@@ -471,12 +492,11 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
              radio's dial frequency"
         );
     }
-    let src = spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz)?;
-    let planned = plan_references(
-        src.center_freq_hz(),
-        src.rf_passband_hz(),
+    let (src, planned) = open_planned(
+        spec.configured_center_and_passband(resolved.capture_rate_hz, resolved.dial_freq_hz),
         is_audio(spec),
         &opts,
+        || spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz),
     )?;
     eprintln!("{}", measuring_line(&planned, duration));
     let report = manta_engine::calibrate(src, &planned, &opts)?;
@@ -969,5 +989,138 @@ mod tests {
             ..CliOverrides::none()
         };
         assert_eq!(input_overrides(&cli, &[]), vec!["--ka9q-group".to_string()]);
+    }
+
+    /// A receiver already open, reporting `center_hz` and `passband`
+    /// (MAN-334's `open_planned` tests).
+    struct Tuned {
+        center_hz: f64,
+        passband: (f64, f64),
+    }
+
+    impl manta_input::IqSource for Tuned {
+        fn sample_rate(&self) -> f64 {
+            96_000.0
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.center_hz
+        }
+        fn rf_passband_hz(&self) -> (f64, f64) {
+            self.passband
+        }
+        fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+            Ok(0)
+        }
+    }
+
+    fn tuned(center_hz: f64, passband: (f64, f64)) -> crate::reconnect::SendSource {
+        Box::new(Tuned {
+            center_hz,
+            passband,
+        })
+    }
+
+    /// A KiwiSDR's passband, `manta_input::kiwi::IQ_PASSBAND_HZ`.
+    const KIWI: (f64, f64) = (-5_000.0, 5_000.0);
+
+    /// The retune hint for a KiwiSDR window centred at 7.030 MHz.
+    const KIWI_7030_HINT: &str = "no known reference frequency is usable in this receiver's \
+        passband (7025000.0 to 7035000.0 Hz); retune it for the measurement, e.g. --tune-hz \
+        4998500 for the 5000000.0 Hz time standard (WWV, WWVH, BPM) or --tune-hz 9998500 for \
+        the 10000000.0 Hz time standard (WWV, WWVH, BPM), or name a carrier you know with \
+        --reference-hz";
+
+    fn planned_err(r: Result<(crate::reconnect::SendSource, Vec<PlannedReference>)>) -> String {
+        match r {
+            Ok(_) => panic!("expected open_planned to refuse"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// MAN-334 scenarios 1 and 2: a configured passband that holds no
+    /// reference is refused with the retune hint, and the receiver is never
+    /// opened.
+    #[test]
+    fn open_planned_refuses_an_unusable_configured_passband_without_opening() {
+        let opened = std::cell::Cell::new(false);
+        let r = open_planned(
+            Some((7_030_000.0, KIWI)),
+            false,
+            &CalibrateOptions::default(),
+            || {
+                opened.set(true);
+                Ok(tuned(7_030_000.0, KIWI))
+            },
+        );
+        assert_eq!(planned_err(r), KIWI_7030_HINT);
+        assert!(!opened.get(), "the receiver was opened");
+    }
+
+    /// MAN-334 scenario 3: the preflight passed on the configured values, but
+    /// the receiver negotiated a centre with no reference in reach.
+    #[test]
+    fn open_planned_replans_on_the_values_the_receiver_negotiated() {
+        let r = open_planned(
+            Some((9_998_500.0, KIWI)),
+            false,
+            &CalibrateOptions::default(),
+            || Ok(tuned(7_030_000.0, KIWI)),
+        );
+        assert_eq!(planned_err(r), KIWI_7030_HINT);
+    }
+
+    /// MAN-334 scenario 3: the plan measured is the opened source's, not the
+    /// configured one's.
+    #[test]
+    fn open_planned_measures_the_plan_of_the_opened_source() {
+        let opts = CalibrateOptions::default();
+        // 10 MHz sits 300 Hz above the configured centre: half-width
+        // 300 - DC_GUARD_HZ = 275 Hz.
+        let configured = plan_references(9_999_700.0, KIWI, false, &opts).unwrap();
+        assert_eq!(configured[0].reference.hz, 10_000_000.0);
+        assert_eq!(configured[0].half_width_hz, 275.0);
+        let (_src, planned) = open_planned(Some((9_999_700.0, KIWI)), false, &opts, || {
+            Ok(tuned(9_999_650.0, KIWI))
+        })
+        .unwrap();
+        assert_eq!(
+            planned,
+            plan_references(9_999_650.0, KIWI, false, &opts).unwrap()
+        );
+        assert_eq!(planned[0].reference.hz, 10_000_000.0);
+        assert_eq!(planned[0].half_width_hz, 325.0);
+    }
+
+    /// MAN-334: a ka9q-radio channel or a recording has no configured
+    /// passband, so it is opened and planned once, on what it reports.
+    #[test]
+    fn open_planned_without_a_configured_passband_plans_once_open() {
+        let opened = std::cell::Cell::new(false);
+        let r = open_planned(None, false, &CalibrateOptions::default(), || {
+            opened.set(true);
+            Ok(tuned(7_030_000.0, KIWI))
+        });
+        assert_eq!(planned_err(r), KIWI_7030_HINT);
+        assert!(opened.get(), "the receiver was not opened");
+    }
+
+    /// MAN-334: a usable configured passband still opens the receiver, so
+    /// an offline one keeps reporting why it could not be opened.
+    #[test]
+    fn open_planned_reports_the_open_error_when_the_preflight_passes() {
+        let r = open_planned(
+            Some((9_998_500.0, KIWI)),
+            false,
+            &CalibrateOptions::default(),
+            || {
+                Err(anyhow::anyhow!(
+                    "TCP connect to 127.0.0.1:1: Connection refused"
+                ))
+            },
+        );
+        assert_eq!(
+            planned_err(r),
+            "TCP connect to 127.0.0.1:1: Connection refused"
+        );
     }
 }
