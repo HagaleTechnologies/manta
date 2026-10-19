@@ -733,10 +733,13 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         .lock()
         .map(|mut slots| slots.iter_mut().filter_map(Option::take).collect())
         .unwrap_or_default();
-    let recording_result = handles
-        .into_iter()
-        .map(crate::finish_recording)
-        .fold(Ok(()), |acc: Result<()>, r| acc.and(r));
+    let mut recording_result = Ok(());
+    for handle in handles {
+        let finished = crate::finish_recording(handle);
+        if recording_result.is_ok() {
+            recording_result = finished;
+        }
+    }
     if print_text {
         for line in text.finish() {
             if logging::is_json() {

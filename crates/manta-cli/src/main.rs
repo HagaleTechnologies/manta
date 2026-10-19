@@ -4862,6 +4862,22 @@ fn replay_mode_ignored_note(command: &str, replay: ReplayMode, origin: &str) -> 
     })
 }
 
+/// MAN-309: `record_iq` takes effect only in `run`; another command that
+/// reads the input says so instead of recording. `None` when unset.
+fn record_iq_ignored_note(command: &str, loaded: &config::Loaded) -> Option<String> {
+    let set = loaded.input.shared.record_iq.is_some()
+        || loaded
+            .inputs
+            .iter()
+            .any(|n| n.input.shared.record_iq.is_some());
+    set.then(|| {
+        format!(
+            "note: {command} does not record IQ; ignoring input.record_iq from {}",
+            loaded.origin
+        )
+    })
+}
+
 /// Wraps an opened file replay for `mode` (MAN-269 D8): the loop sits inside
 /// the pacing, so one clock spans every pass. `reopen` opens each later pass.
 /// The default mode returns `first` unchanged.
@@ -7091,6 +7107,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             if let Some(note) = replay_mode_ignored_note("soak", resolved.replay, &loaded.origin) {
                 errln!("{note}");
             }
+            if let Some(note) = record_iq_ignored_note("soak", &loaded) {
+                errln!("{note}");
+            }
             note_pinned_lists(&resolved.spot, &lists_in_use);
             // MAN-316: soak never refreshes; for a file it says so, as `run` does.
             if resolved.spot.refresh_lists && !resolved.spec.is_reconnectable() {
@@ -7282,6 +7301,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             note_pinned_lists(&resolved.spot, &lists_in_use);
             if let Some(note) = replay_mode_ignored_note("doctor", resolved.replay, &loaded.origin)
             {
+                errln!("{note}");
+            }
+            if let Some(note) = record_iq_ignored_note("doctor", &loaded) {
                 errln!("{note}");
             }
             // MAN-126: named setup checks first, each printed as it is
@@ -9441,6 +9463,20 @@ mod tests {
         assert_eq!(
             resolve_epoch(Some(f.path()), None).unwrap(),
             epoch_for_replay_path(f.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn soak_and_doctor_say_they_ignore_record_iq() {
+        let loaded = loaded_from("[input]\ntype = \"audio\"\nrecord_iq = \"s.cf32\"\n");
+        let note = record_iq_ignored_note("soak", &loaded).unwrap();
+        assert!(
+            note.starts_with("note: soak does not record IQ; ignoring input.record_iq from "),
+            "{note}"
+        );
+        assert_eq!(
+            record_iq_ignored_note("doctor", &loaded_from("[input]\ntype = \"audio\"\n")),
+            None
         );
     }
 
