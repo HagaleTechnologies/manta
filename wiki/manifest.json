@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-17T00:45:00Z",
-  "head_commit": "4529021",
+  "generated_at": "2026-10-19T09:10:00Z",
+  "head_commit": "cdf8487",
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -267,7 +267,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:73012b6f4002a218f3503361244f408d314175ba450b5d27ef9b22899fd982b6",
+      "hash": "sha256:031dc594e55ccebd2a0eaa97dc902f7d58f1b09bd563edde6add942874a85938",
       "id": "source-reconnect",
       "kind": "gotcha",
       "links": [
@@ -282,12 +282,14 @@
         "crates/manta-cli/src/reconnect.rs (InputHealthTotals)",
         "crates/manta-input/src/lib.rs (IqSource::take_discontinuity)",
         "docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md",
-        "docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md"
+        "docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md",
+        "docs/DECISIONS/2026-10-19-man307-hpsdr-multiple-receivers.md",
+        "crates/manta-cli/src/hpsdr_group.rs"
       ],
       "status": "current",
       "title": "What's the gotcha with a live source disconnecting?",
-      "verified_commit": "9a79a72",
-      "verified_date": "2026-10-16",
+      "verified_commit": "cdf8487",
+      "verified_date": "2026-10-19",
       "visibility": "public"
     },
     {

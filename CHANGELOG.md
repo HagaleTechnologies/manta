@@ -24,6 +24,11 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-307: live HPSDR queue losses reset only the affected decode segment.
+  Decimation resets its filter and forwards converted gaps, and reconnect
+  wrappers preserve inner gaps, including an EOF with a pending gap. Clean
+  file replay remains unchanged.
+
 - MAN-265: a transmission that ends at the speed tracker's warm-up
   boundary (e.g. a beacon ID or a single exchange) now reports its
   gap-corrected WPM. The readiness mark's seed was computed before the
@@ -79,6 +84,16 @@ the git history and `docs/DECISIONS/`.
   `[detector] non_cw_filter = false` restores the previous behaviour.
 
 ### Added
+
+- MAN-307: several HPSDR inputs can share one radio, with one independently
+  tuned receiver per band, capacity probing for HL2, and an optional
+  `receivers` declaration for other gateware. Each radio reconnects as a
+  group. Bounded per-receiver queues report exact discarded samples through
+  `manta_input_queue_dropped_samples_total`.
+- Rust API: `manta_input::hpsdr::probe_receiver_capacity`, radio session
+  retirement/timing handles, and `InputHealthCounters::queue_dropped_samples`.
+  Exhaustive `manta_server::metrics::InputHealth` literals must initialize the
+  new `queue_dropped_samples` field or use `Default`.
 
 - MAN-13: one `manta run` decodes several receivers into one spot output.
   Write `[[input]]` once per receiver (each with a `name`); every input

@@ -188,6 +188,9 @@
 
 # Shared by kiwi, soapy and hpsdr:
 #freq_hz = 7030000.0                 # required: the receiver's centre frequency, Hz
+# Optional HPSDR capacity declaration, only on the first input for a radio.
+# Shared HL2 receivers are probed at startup; other gateware needs this fallback.
+#receivers = 4
 #rate_hz = 192000.0                  # required for soapy and hpsdr: sample rate, Hz
 
 # type = "ka9q", a ka9q-radio (radiod) IQ channel over multicast. It reads

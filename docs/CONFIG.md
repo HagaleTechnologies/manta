@@ -219,6 +219,7 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `gain_db` | none; example `30.0`; unset uses the device's automatic gain | live: `type = "soapy"` (needs the build feature) | Receiver gain, dB. `--soapy-gain` overrides it. |
 | `freq_hz` | none; example `7030000.0`; required for kiwi, soapy and hpsdr | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"` | Receiver centre frequency, Hz. `--kiwi-freq-hz`, `--soapy-freq-hz` or `--hpsdr-freq-hz` overrides it. |
 | `rate_hz` | none; example `192000.0`; required for soapy and hpsdr | live: `type = "soapy"` or `"hpsdr"` | Sample rate, Hz. `--soapy-rate-hz` or `--hpsdr-rate-hz` overrides it. |
+| `receivers` | none; example `4` | live: `type = "hpsdr"` | Optional hardware capacity declaration, integer 1 to 255, on the first entry for a radio only. Shared HL2 radios report capacity at startup; other gateware needs this fallback. The smaller reported/declared count applies. This is not the active receiver count. |
 | `group` | none; example `"239.101.6.1"`; required for ka9q | live: `type = "ka9q"` | Multicast data group of one ka9q-radio (radiod) IQ channel: an IPv4 multicast address, or the name in the channel's `data =` line, resolved by the system resolver when the source opens. Checked when the file loads; an IPv6 group is refused. manta reads the channel's sample rate, encoding and frequency from radiod's status packets. `--ka9q-group` overrides it. |
 | `ssrc` | none; example `14100000`; unset reads the group's only channel | live: `type = "ka9q"` | SSRC of the channel to read, 0 to 4294967295; needed only when the group carries more than one channel. `--ka9q-ssrc` overrides it. |
 | `interface` | none; example `"192.168.1.20"`; unset joins on the kernel's choice | live: `type = "ka9q"` | IPv4 address of the local interface to join the group on (an interface name is refused). manta also joins on `127.0.0.1`, for a radiod on the same machine. `--ka9q-interface` overrides it. |
@@ -244,7 +245,10 @@ per receiver. Each entry takes the keys above, plus `name`. A one-entry
 - File replay and live receivers do not mix in one run. `replay_epoch` goes
   on the first entry only, and every file entry has the same `realtime` and
   `loop`.
-- Two entries on one HPSDR radio are refused until MAN-307.
+- HPSDR entries sharing a case-insensitive host and effective port use one
+  radio session, with receivers assigned in file order. Native `rate_hz`
+  must match. Capacity is checked at startup, while `config check` remains
+  offline. See [the four-band example and diagnostics](GUIDES/multiple-receivers.md#several-bands-on-one-hpsdr-radio).
 - `MANTA_INPUT_*` and the per-receiver flags `--freq-correction-ppm`,
   `--dial-freq-hz` and `--capture-rate-hz` cannot say which entry they set,
   so they are refused; a source flag (`--source`, `--kiwi-host`, ...) still

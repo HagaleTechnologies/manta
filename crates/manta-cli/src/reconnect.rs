@@ -104,6 +104,7 @@ struct TotalsState {
 
 fn add_health(a: InputHealth, b: InputHealth) -> InputHealth {
     InputHealth {
+        queue_dropped_samples: a.queue_dropped_samples + b.queue_dropped_samples,
         dropped_packets: a.dropped_packets + b.dropped_packets,
         gaps_detected: a.gaps_detected + b.gaps_detected,
         malformed_packets: a.malformed_packets + b.malformed_packets,
@@ -141,7 +142,7 @@ impl InputHealthTotals {
 
     /// The live connection was lost (and already dropped, so its counts
     /// are final): fold them into `retired`.
-    fn retire_current(&self) {
+    pub(crate) fn retire_current(&self) {
         let mut state = self.state.lock().expect("input health lock poisoned");
         if let Some(counters) = state.current.take() {
             state.retired = add_health(state.retired, crate::input_health_of(&counters));
@@ -150,7 +151,7 @@ impl InputHealthTotals {
 
     /// A reopened connection's counters, which start at 0. Only ever
     /// called after `retire_current`, so nothing still attached is lost.
-    fn attach(&self, counters: Option<Arc<InputHealthCounters>>) {
+    pub(crate) fn attach(&self, counters: Option<Arc<InputHealthCounters>>) {
         let mut state = self.state.lock().expect("input health lock poisoned");
         debug_assert!(
             state.current.is_none(),
@@ -404,6 +405,9 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         loop {
             if self.inner.is_none() {
                 if self.reopen.is_none() {
@@ -492,8 +496,15 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
             }
             let first_read_started = self.reopened.then(|| self.env.now());
             let inner = self.inner.as_mut().expect("checked Some above");
-            match inner.read(buf) {
-                Ok(0) => return Ok(0),
+            let result = inner.read(buf);
+            let inner_gap = inner.take_discontinuity();
+            match result {
+                Ok(0) => {
+                    if let Some(gap) = inner_gap {
+                        self.discontinuity = Some(self.discontinuity.unwrap_or(0) + gap);
+                    }
+                    return Ok(0);
+                }
                 Ok(n) => {
                     if !self.productive {
                         self.productive = true;
@@ -509,6 +520,9 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                                 outage.as_secs_f64()
                             ));
                         }
+                    }
+                    if let Some(gap) = inner_gap {
+                        self.discontinuity = Some(self.discontinuity.unwrap_or(0) + gap);
                     }
                     self.last_ok = self.env.now();
                     self.report_health(true);
@@ -683,6 +697,71 @@ mod tests {
 
     fn buf(n: usize) -> Vec<Complex32> {
         vec![Complex32::new(0.0, 0.0); n]
+    }
+
+    #[test]
+    fn totals_include_exact_queue_losses() {
+        let total = add_health(
+            InputHealth {
+                queue_dropped_samples: 1200,
+                dropped_packets: 3,
+                ..Default::default()
+            },
+            InputHealth {
+                queue_dropped_samples: 17,
+                dropped_packets: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(total.queue_dropped_samples, 1217);
+        assert_eq!(total.dropped_packets, 5);
+    }
+
+    #[test]
+    fn inner_discontinuities_survive_reconnect_wrapper_and_eof() {
+        struct Gaps {
+            reads: usize,
+            pending: Option<u64>,
+        }
+        impl IqSource for Gaps {
+            fn sample_rate(&self) -> f64 {
+                48000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                7e6
+            }
+            fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {
+                self.reads += 1;
+                self.pending = Some(if self.reads == 1 { 17 } else { 5 });
+                if self.reads == 1 {
+                    buf[0] = Complex32::new(0.5, 0.0);
+                    Ok(1)
+                } else {
+                    Ok(0)
+                }
+            }
+            fn take_discontinuity(&mut self) -> Option<u64> {
+                self.pending.take()
+            }
+        }
+        let mut source = ReconnectingSource::new(
+            "queue",
+            Box::new(Gaps {
+                reads: 0,
+                pending: None,
+            }),
+            Box::new(|| panic!("no transport failure")),
+            Arc::new(AtomicBool::new(false)),
+            false,
+            Box::new(|_| {}),
+        );
+        assert_eq!(source.read(&mut []).unwrap(), 0);
+        assert_eq!(source.take_discontinuity(), None);
+        assert_eq!(source.read(&mut buf(4)).unwrap(), 1);
+        assert_eq!(source.take_discontinuity(), Some(17));
+        assert_eq!(source.take_discontinuity(), None);
+        assert_eq!(source.read(&mut buf(4)).unwrap(), 0);
+        assert_eq!(source.take_discontinuity(), Some(5));
     }
 
     /// MAN-312: the wrapper reports the wrapped source's passband, not the

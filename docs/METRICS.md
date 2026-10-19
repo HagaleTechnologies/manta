@@ -103,6 +103,7 @@ missing series as "no loss" or "no traffic".
 | `manta_input_dropped_packets_total` | counter | `source` | Input packets estimated lost in transit before reaching the decoder. With several `[[input]]` entries, one series per entry's `name` (MAN-13). | HPSDR, KiwiSDR, ka9q-radio and SoapySDR sources only: from startup at 0, sampled every second, summed across reconnects. SoapySDR stays at 0 (a driver overflow carries no lost-sample estimate; see [MAN-233](DECISIONS/2026-10-15-man233-soapy-overflow-visibility.md)). Other sources (file, audio) show the `# TYPE` line but no samples: absent, not zero. |
 | `manta_input_gaps_detected_total` | counter | `source` | Distinct input-stream gap events detected. One gap may account for several dropped packets. | HPSDR, KiwiSDR, ka9q-radio and SoapySDR sources only, as for `manta_input_dropped_packets_total`. SoapySDR counts driver stream-overflow events, one per overflow the driver returns as a read error, each also warned rate-limited on the log; an overflow a driver flags only with `SOAPY_SDR_END_ABRUPT` on a successful read is not counted (MAN-233). Other sources: absent, not zero. |
 | `manta_input_malformed_packets_total` | counter | `source` | Input datagrams discarded as malformed: wrong length, or correct length but failed framing or sync validation (MAN-22). | HPSDR, KiwiSDR, ka9q-radio and SoapySDR sources only, as for `manta_input_dropped_packets_total`. SoapySDR stays at 0 (no malformed-packet concept; MAN-233). Other sources: absent, not zero. |
+| `manta_input_queue_dropped_samples_total` | counter | `source` | Complex IQ samples evicted from this input's bounded queue because its consumer fell behind, at the hardware rate before decimation. Exact sample count, not packets, network loss or outage duration. Cumulative across reconnects; resets on process restart. Reduce load or configured rate if it grows. | Inputs with `InputHealthCounters`; zero if no queue samples have been lost, including other packet sources. Sources without counters omit the series. |
 | `manta_input_bad_samples_total` | counter | `source` | Input samples replaced with silence (`0+0j`) because a component was NaN, infinite, or larger than 1e17 in magnitude, counted where they enter the channelizer. Decoding continues. A filter that runs before the channelizer can turn one bad source sample into several replaced ones: up to about 64 per halfband stage with `--capture-rate-hz`, or about 257 through a sound card's Hilbert filter (511 taps, 256 of them nonzero: that many outputs' imaginary parts, plus one delay-matched real part; MAN-273). See [SPEC §1.3](SPEC-decode-core.md#13-structure-and-per-hop-processing-wola-form) step 0 and [MAN-234](DECISIONS/2026-10-15-man234-bad-input-samples.md). | Every source; 0 from startup with a `[server]` table; summed across reconnects. |
 | `manta_list_info` | gauge | `list`, `sha256`, `origin` | Always 1. Names the reference list each consumer uses now: `list` is `cty` or `scp`; `sha256` is the SHA-256 of its bytes; `origin` is `bundled`, `file`, `cache` or `download`. A swap replaces the series. | Always with `[server]`; one series per list. |
 | `manta_list_refresh_total` | counter | `list`, `outcome` | Download attempts by outcome: `updated` (a new version passed the checks and is in use), `unchanged` (304, or the same bytes), `failed` (network or HTTP error, or rejected by the checks). | With `refresh_lists` on, for each list the refresher manages; all three outcomes start at 0. No samples otherwise. |
@@ -180,6 +181,20 @@ manta_listener_up{listener="telnet"} 1
 The file source has no packet-loss model and the config has no
 `[[rbn_uplink]]`, so the input and per-target families show only their
 `# TYPE` lines.
+
+For shared HPSDR radios, packet-drop, transport-gap and malformed-packet
+series are per-input views of the same radio-wide transport counters. Do not
+sum those series across receivers for a radio total. Queue-drop counters are
+independent per receiver. For example:
+
+```text
+# HELP manta_input_queue_dropped_samples_total Complex IQ samples discarded from an input queue because its consumer fell behind.
+# TYPE manta_input_queue_dropped_samples_total counter
+manta_input_queue_dropped_samples_total{source="80m"} 1200
+manta_input_queue_dropped_samples_total{source="40m"} 0
+manta_input_queue_dropped_samples_total{source="20m"} 0
+manta_input_queue_dropped_samples_total{source="15m"} 0
+```
 
 ## /healthz
 

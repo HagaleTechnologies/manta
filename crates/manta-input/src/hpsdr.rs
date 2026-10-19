@@ -398,8 +398,7 @@ pub struct HpsdrConfig {
     pub ddc_count: usize,
     pub sample_rate_hz: f64,
     /// Per-DDC center frequency, reported by the corresponding
-    /// `HpsdrIqSource::center_freq_hz()` (metadata only — see module docs;
-    /// this driver does not itself send per-receiver tuning words).
+    /// `HpsdrIqSource::center_freq_hz()` and sent in the receiver's tuning word.
     pub center_freq_hz: Vec<f64>,
 }
 
@@ -638,9 +637,97 @@ fn build_start_command() -> [u8; 60] {
     pkt
 }
 
+/// Query one configured radio without tuning or starting it. A recognized
+/// Hermes-Lite 2 reply reports its positive gateware receiver capacity.
+/// Unknown or silent hardware returns `None` after at most one second of
+/// receiving. Address resolution and socket errors retain their causes.
+pub fn probe_receiver_capacity(host: &str, port: u16) -> Result<Option<usize>> {
+    use std::net::ToSocketAddrs;
+    let peer = (host, port)
+        .to_socket_addrs()
+        .context("resolve HPSDR capacity endpoint")?
+        .find(|a| a.is_ipv4())
+        .ok_or_else(|| anyhow::anyhow!("HPSDR needs an IPv4 endpoint"))?;
+    let socket = UdpSocket::bind("0.0.0.0:0").context("bind HPSDR capacity socket")?;
+    let mut request = [0; 60];
+    request[..3].copy_from_slice(&[0xef, 0xfe, 2]);
+    socket
+        .send_to(&request, peer)
+        .context("send HPSDR capacity query")?;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut buf = [0; RECV_BUF_LEN];
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        socket.set_read_timeout(Some(left.min(Duration::from_millis(100))))?;
+        match socket.recv_from(&mut buf) {
+            Ok((n, from)) if from == peer => {
+                if let Some(n) = parse_receiver_capacity(&buf[..n]) {
+                    return Ok(Some(n));
+                }
+            }
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => return Err(e).context("receive HPSDR capacity reply"),
+        }
+    }
+    Ok(None)
+}
+
+// HL2 Protocol discovery extension: radio ID 0x06, receiver count at 0x13.
+// Generic Hermes padding is not evidence of receiver capacity.
+fn parse_receiver_capacity(reply: &[u8]) -> Option<usize> {
+    (reply.len() == 60
+        && reply[..2] == [0xef, 0xfe]
+        && matches!(reply[2], 2 | 3)
+        && reply[10] == 6
+        && reply[19] > 0)
+        .then(|| usize::from(reply[19]))
+}
+
+/// Control authority for one generation. Retire it before starting a
+/// replacement. Dropping a receiver never sends a stop to a newer session.
+#[derive(Clone)]
+pub struct HpsdrSession {
+    inner: Arc<Mutex<Inner>>,
+    retired: Arc<AtomicBool>,
+    authority: Arc<Mutex<()>>,
+    started_at: Instant,
+}
+
+impl HpsdrSession {
+    /// Actual acquisition trigger, captured immediately before the start send.
+    pub fn started_at(&self) -> Instant {
+        self.started_at
+    }
+
+    /// Stop pumping, discard pending samples and send one best-effort stop.
+    /// The pump observes retirement between bounded UDP reads.
+    pub fn retire(&self) {
+        let _authority = self.authority.lock().expect("HPSDR retirement poisoned");
+        if !self.retired.swap(true, Ordering::SeqCst) {
+            let mut inner = self.inner.lock().expect("HPSDR pump lock poisoned");
+            for queue in &mut inner.queues {
+                queue.clear();
+            }
+            inner.confirmed_live.store(false, Ordering::Relaxed);
+            let mut stop = build_start_command();
+            stop[3] = 0;
+            let _ = inner.socket.send(&stop);
+        }
+    }
+}
+
 struct Inner {
     socket: UdpSocket,
     queues: Vec<VecDeque<Complex32>>,
+    active: Vec<bool>,
+    queue_limit: usize,
+    queue_gaps: Vec<u64>,
+    counters: Vec<Arc<InputHealthCounters>>,
+    retired: Arc<AtomicBool>,
     gap: GapDetector,
     num_receivers: usize,
     last_keepalive: Instant,
@@ -678,6 +765,26 @@ struct Inner {
 }
 
 impl Inner {
+    fn enqueue(&mut self, index: usize, samples: impl IntoIterator<Item = Complex32>) {
+        if !self.active[index] {
+            return;
+        }
+        let queue = &mut self.queues[index];
+        // Insert without ever growing past the bound, even for a large batch.
+        let mut dropped = 0;
+        for sample in samples {
+            if queue.len() == self.queue_limit {
+                queue.pop_front();
+                dropped += 1;
+            }
+            queue.push_back(sample);
+        }
+        if dropped > 0 {
+            self.queue_gaps[index] += dropped;
+            self.counters[index].record_queue_dropped(dropped);
+        }
+    }
+
     /// Receive and demux Metis packets until one yields real IQ samples,
     /// filling every DDC's queue and updating the gap detector. All
     /// consumer threads share this single socket, so whichever
@@ -700,6 +807,9 @@ impl Inner {
             // starve the HL2 gateware watchdog of the periodic traffic it
             // needs (PR #75 review, round 1) -- `send_keepalive_if_due`
             // itself is a cheap no-op except once per `KEEPALIVE_INTERVAL`.
+            if self.retired.load(Ordering::SeqCst) {
+                bail!("HPSDR session retired");
+            }
             self.send_keepalive_if_due()?;
 
             match self.socket.recv(&mut self.recv_buf) {
@@ -733,8 +843,11 @@ impl Inner {
                             // time, cheap enough not to bother special-
                             // casing.
                             self.confirmed_live.store(true, Ordering::Relaxed);
-                            for (queue, samples) in self.queues.iter_mut().zip(demuxed) {
-                                queue.extend(samples);
+                            if self.retired.load(Ordering::SeqCst) {
+                                bail!("HPSDR session retired");
+                            }
+                            for (index, samples) in demuxed.into_iter().enumerate() {
+                                self.enqueue(index, samples);
                             }
                             return Ok(());
                         }
@@ -857,11 +970,22 @@ impl HpsdrDevice {
         let cc_frame_count = cc_frames.len();
 
         let gap = GapDetector::new(cfg.sample_rate_hz, cfg.ddc_count, 1.5);
-        let health_counters = gap.counters();
+        let health_counters: Vec<_> = (0..cfg.ddc_count)
+            .map(|_| Arc::new(gap.counters().with_shared_transport()))
+            .collect();
+        let retired = Arc::new(AtomicBool::new(false));
+        let authority = Arc::new(Mutex::new(()));
 
         let inner = Arc::new(Mutex::new(Inner {
             socket,
-            queues: vec![VecDeque::new(); cfg.ddc_count],
+            queues: (0..cfg.ddc_count)
+                .map(|_| VecDeque::with_capacity(2 * cfg.sample_rate_hz as usize))
+                .collect(),
+            active: vec![true; cfg.ddc_count],
+            queue_limit: 2 * cfg.sample_rate_hz as usize,
+            queue_gaps: vec![0; cfg.ddc_count],
+            counters: health_counters.clone(),
+            retired: retired.clone(),
             gap,
             num_receivers: cfg.ddc_count,
             last_keepalive: Instant::now(),
@@ -900,6 +1024,7 @@ impl HpsdrDevice {
         // flip true on pre-configuration data. `send_next_cc_frames`
         // advances by 2 frames per call, so `div_ceil(cc_frame_count, 2)`
         // calls cover every entry at least once per repeat.
+        let started_at;
         {
             let mut guard = inner.lock().unwrap();
             for _ in 0..INITIAL_BURST_REPEATS * cc_frame_count.div_ceil(2) {
@@ -907,6 +1032,7 @@ impl HpsdrDevice {
                     .send_next_cc_frames()
                     .context("send initial HPSDR C&C tuning frames")?;
             }
+            started_at = Instant::now();
             guard
                 .socket
                 .send(&build_start_command())
@@ -920,7 +1046,14 @@ impl HpsdrDevice {
                 sample_rate_hz: cfg.sample_rate_hz,
                 center_freq_hz: cfg.center_freq_hz[ddc_index],
                 confirmed_live: confirmed_live.clone(),
-                health_counters: health_counters.clone(),
+                health_counters: health_counters[ddc_index].clone(),
+                discontinuity: None,
+                session: HpsdrSession {
+                    inner: inner.clone(),
+                    retired: retired.clone(),
+                    authority: authority.clone(),
+                    started_at,
+                },
             })
             .collect())
     }
@@ -929,6 +1062,8 @@ impl HpsdrDevice {
 /// One receiver channel (DDC) of an [`HpsdrDevice`] connection, as an
 /// independent `IqSource`. ARCHITECTURE §3.
 pub struct HpsdrIqSource {
+    discontinuity: Option<u64>,
+    session: HpsdrSession,
     inner: Arc<Mutex<Inner>>,
     ddc_index: usize,
     sample_rate_hz: f64,
@@ -938,13 +1073,17 @@ pub struct HpsdrIqSource {
     /// can hand it out without locking `inner`'s mutex just to read a
     /// liveness bit.
     confirmed_live: Arc<AtomicBool>,
-    /// Same counters as `Inner::gap`'s (a clone of the same `Arc`,
-    /// MAN-56) -- kept here too so `health_counters()` and `gap_stats()`
-    /// can read them without locking `inner`'s mutex.
+    /// Shared transport atomics plus this DDC's own queue-loss counter.
+    /// Metrics readers never need to lock the packet pump.
     health_counters: Arc<InputHealthCounters>,
 }
 
 impl HpsdrIqSource {
+    /// Authority for retiring this receiver's entire radio generation.
+    pub fn session(&self) -> HpsdrSession {
+        self.session.clone()
+    }
+
     /// Loss/reorder counters observed on this device's shared stream so
     /// far (module docs: a gap applies to every DDC demuxed from the
     /// affected packet, so these counters are shared across all of a
@@ -968,9 +1107,19 @@ impl IqSource for HpsdrIqSource {
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let mut inner = self.inner.lock().unwrap();
+        if inner.retired.load(Ordering::SeqCst) {
+            bail!("HPSDR session retired");
+        }
         while inner.queues[self.ddc_index].is_empty() {
             inner.pump_one_packet()?;
+        }
+        let missed = std::mem::take(&mut inner.queue_gaps[self.ddc_index]);
+        if missed > 0 {
+            self.discontinuity = Some(self.discontinuity.unwrap_or(0) + missed);
         }
         let queue = &mut inner.queues[self.ddc_index];
         let n = buf.len().min(queue.len());
@@ -978,6 +1127,10 @@ impl IqSource for HpsdrIqSource {
             *slot = queue.pop_front().expect("checked len above");
         }
         Ok(n)
+    }
+
+    fn take_discontinuity(&mut self) -> Option<u64> {
+        self.discontinuity.take()
     }
 
     fn confirmed_live_handle(&self) -> Option<Arc<AtomicBool>> {
@@ -989,8 +1142,211 @@ impl IqSource for HpsdrIqSource {
     }
 }
 
+impl Drop for HpsdrIqSource {
+    fn drop(&mut self) {
+        let mut inner = self.inner.lock().expect("HPSDR pump lock poisoned");
+        inner.active[self.ddc_index] = false;
+        inner.queues[self.ddc_index].clear();
+        inner.queue_gaps[self.ddc_index] = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn retired_session_and_stale_handle_drops_cannot_control_a_replacement() {
+        let socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let cfg = HpsdrConfig {
+            host: "127.0.0.1".into(),
+            port: socket.local_addr().unwrap().port(),
+            ddc_count: 1,
+            sample_rate_hz: 48000.0,
+            center_freq_hz: vec![7e6],
+        };
+        let mut old = HpsdrDevice::open(cfg.clone()).unwrap();
+        drain_initial_open_packets(&socket, 1);
+        let session = old[0].session();
+        let a = session.clone();
+        let b = session.clone();
+        let first = std::thread::spawn(move || a.retire());
+        let second = std::thread::spawn(move || b.retire());
+        first.join().unwrap();
+        second.join().unwrap();
+        let mut datagram = [0; 65536];
+        let (n, _) = socket.recv_from(&mut datagram).unwrap();
+        assert_eq!(n, 60);
+        assert_eq!(&datagram[..4], &[0xef, 0xfe, 4, 0]);
+        let mut replacement = HpsdrDevice::open(cfg).unwrap();
+        let peer = drain_initial_open_packets(&socket, 1);
+        assert!(old[0].read(&mut [Complex32::default(); 1]).is_err());
+        session.retire();
+        drop(old);
+        socket.set_nonblocking(true).unwrap();
+        assert!(
+            socket.recv_from(&mut datagram).is_err(),
+            "no stale stop or keepalive"
+        );
+        socket
+            .send_to(&synth_metis_packet(1, |_| Complex32::new(0.5, 0.0)), peer)
+            .unwrap();
+        let mut sample = [Complex32::default(); 1];
+        assert_eq!(replacement[0].read(&mut sample).unwrap(), 1);
+        assert!((sample[0].re - 0.5).abs() <= 1.0 / IQ_FULL_SCALE);
+    }
+
+    fn capacity_reply(status: u8, board: u8, count: u8) -> [u8; 60] {
+        let mut reply = [0; 60];
+        reply[..3].copy_from_slice(&[0xef, 0xfe, status]);
+        reply[10] = board;
+        reply[19] = count;
+        reply
+    }
+
+    #[test]
+    fn capacity_parser_accepts_only_recognized_positive_exact_replies() {
+        for status in [2, 3] {
+            for count in [4, 10] {
+                assert_eq!(
+                    parse_receiver_capacity(&capacity_reply(status, 6, count)),
+                    Some(count as usize)
+                );
+            }
+        }
+        for reply in [
+            capacity_reply(1, 6, 4),
+            capacity_reply(2, 1, 4),
+            capacity_reply(2, 6, 0),
+        ] {
+            assert_eq!(parse_receiver_capacity(&reply), None);
+        }
+        let good = capacity_reply(2, 6, 4);
+        assert_eq!(parse_receiver_capacity(&good[..59]), None);
+        let mut oversized = good.to_vec();
+        oversized.push(0);
+        assert_eq!(parse_receiver_capacity(&oversized), None);
+    }
+
+    #[test]
+    fn capacity_query_is_directed_and_never_starts_the_radio() {
+        let socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let addr = socket.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut buf = [0; 100];
+            let (n, peer) = socket.recv_from(&mut buf).unwrap();
+            assert_eq!(n, 60);
+            assert_eq!(&buf[..3], &[0xef, 0xfe, 2]);
+            assert!(buf[3..n].iter().all(|&v| v == 0));
+            let wrong_peer = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+            wrong_peer.send_to(&capacity_reply(2, 6, 1), peer).unwrap();
+            socket.send_to(&capacity_reply(3, 6, 10), peer).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            assert!(socket.recv_from(&mut buf).is_err());
+        });
+        assert_eq!(
+            probe_receiver_capacity("127.0.0.1", addr.port()).unwrap(),
+            Some(10)
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn capacity_timeout_and_malformed_flood_have_a_total_deadline() {
+        let socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let addr = socket.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (_, peer) = socket.recv_from(&mut [0; 100]).unwrap();
+            let until = Instant::now() + Duration::from_millis(1300);
+            while Instant::now() < until {
+                socket.send_to(&[0; 61], peer).unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let start = Instant::now();
+        assert_eq!(
+            probe_receiver_capacity("127.0.0.1", addr.port()).unwrap(),
+            None
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+        worker.join().unwrap();
+        let silent = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        assert_eq!(
+            probe_receiver_capacity("127.0.0.1", silent.local_addr().unwrap().port()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn bounded_queues_keep_newest_and_latch_gaps_to_the_read() {
+        let socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut sources = HpsdrDevice::open(HpsdrConfig {
+            host: "127.0.0.1".into(),
+            port: socket.local_addr().unwrap().port(),
+            ddc_count: 2,
+            sample_rate_hz: 48000.0,
+            center_freq_hz: vec![7e6, 14e6],
+        })
+        .unwrap();
+        let shared = sources[0].inner.clone();
+        {
+            let mut inner = shared.lock().unwrap();
+            inner.queue_limit = 4;
+            inner.queues = (0..2).map(|_| VecDeque::with_capacity(4)).collect();
+            inner.enqueue(0, (0..7).map(|i| Complex32::new(i as f32, 0.0)));
+            inner.enqueue(1, [Complex32::new(9.0, 0.0)]);
+            assert_eq!(inner.queues[0].len(), 4);
+            assert_eq!(inner.queues[0].capacity(), 4);
+        }
+        assert_eq!(sources[0].read(&mut []).unwrap(), 0);
+        assert_eq!(sources[0].take_discontinuity(), None);
+        let mut buf = [Complex32::default(); 2];
+        assert_eq!(sources[0].read(&mut buf).unwrap(), 2);
+        assert_eq!(buf.map(|s| s.re), [3.0, 4.0]);
+        shared
+            .lock()
+            .unwrap()
+            .enqueue(0, (7..12).map(|i| Complex32::new(i as f32, 0.0)));
+        assert_eq!(sources[0].take_discontinuity(), Some(3));
+        assert_eq!(sources[0].take_discontinuity(), None);
+        assert_eq!(sources[0].read(&mut buf).unwrap(), 2);
+        assert_eq!(buf.map(|s| s.re), [8.0, 9.0]);
+        assert_eq!(sources[0].take_discontinuity(), Some(3));
+        assert_eq!(
+            sources[0]
+                .health_counters()
+                .unwrap()
+                .queue_dropped_samples(),
+            6
+        );
+        assert_eq!(sources[1].read(&mut buf).unwrap(), 1);
+        assert_eq!(sources[1].take_discontinuity(), None);
+        assert_eq!(
+            sources[1]
+                .health_counters()
+                .unwrap()
+                .queue_dropped_samples(),
+            0
+        );
+        drop(sources.remove(0));
+        let mut inner = shared.lock().unwrap();
+        inner.enqueue(0, [Complex32::default(); 20]);
+        assert!(inner.queues[0].is_empty());
+        assert!(!inner.active[0]);
+        drop(inner);
+        drop(sources);
+        assert!(shared.lock().unwrap().active.iter().all(|v| !v));
+    }
 
     #[test]
     fn packet_errors_use_deliberate_hex_byte_lists() {
@@ -1609,7 +1965,11 @@ mod tests {
         let sources = HpsdrDevice::open(cfg).unwrap();
         let a = sources[0].health_counters().unwrap();
         let b = sources[1].health_counters().unwrap();
-        assert!(Arc::ptr_eq(&a, &b));
+        a.record_dropped(3);
+        assert_eq!(b.dropped_packets(), 3);
+        a.record_queue_dropped(7);
+        assert_eq!(a.queue_dropped_samples(), 7);
+        assert_eq!(b.queue_dropped_samples(), 0);
     }
 
     /// PR #75 review, round 1, finding 1: a receive buffer sized exactly to
