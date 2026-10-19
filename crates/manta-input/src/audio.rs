@@ -313,6 +313,12 @@ impl IqSource for AudioIqSource {
         (AUDIO_PASSBAND_LO_HZ, AUDIO_PASSBAND_HI_HZ)
     }
 
+    /// MAN-273: the Hilbert front end's DC/Nyquist guard at this source's
+    /// pinned rate, the band its image-rejection contract excludes.
+    fn analytic_guard_hz(&self) -> f64 {
+        manta_dsp::hilbert::hilbert_guard_hz(TARGET_RATE_HZ as f64)
+    }
+
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
         let mut real = vec![0.0f32; buf.len()];
         let got = self.read_real(&mut real)?;
@@ -652,5 +658,19 @@ mod tests {
                 "with_center_freq_hz({bad}) should have been rejected"
             );
         }
+    }
+
+    #[test]
+    fn audio_source_declares_the_rate_derived_hilbert_guard() {
+        let src: Box<dyn AudioSource> = Box::new(coppa_audio::WavSource::from_samples(
+            vec![0.0; 64],
+            TARGET_RATE_HZ,
+        ));
+        let aiq = AudioIqSource::new(src).unwrap();
+        assert_eq!(aiq.analytic_guard_hz(), 600.0);
+        assert_eq!(
+            aiq.analytic_guard_hz(),
+            manta_dsp::hilbert::hilbert_guard_hz(48_000.0)
+        );
     }
 }
