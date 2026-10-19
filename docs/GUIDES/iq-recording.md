@@ -105,7 +105,9 @@ A write error stops the recording the same way:
 warning: IQ recording stopped: write failed for session.cf32: <cause>; decoding continues
 ```
 
-Either way `run` exits 1 at the end, so a script recording a finite
+Either way `run` exits 1 at the end, after a final
+`error: IQ recording session.cf32 is incomplete: it stopped early (see the warning above)`
+for a failed write, so a script recording a finite
 session does not mistake it for a complete capture. A stopped-on-backlog
 recording is finalized with `"reason":"backpressure"` and replays as the
 contiguous part it holds. A failed write leaves the `.partial` metadata,

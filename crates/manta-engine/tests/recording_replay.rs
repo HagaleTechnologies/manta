@@ -4,7 +4,7 @@
 //! return, and recording does not change the decode it rides on.
 
 use anyhow::Result;
-use manta_engine::{decode_source, DecodeReport, PipelineConfig};
+use manta_engine::{decode_source, listen, DecodeReport, PipelineConfig};
 use manta_input::{start_recording, IqSource, RecordedIqSource, RecordingOutcome};
 use manta_testkit::keyer::{key_text_loop, KeyerSpec};
 use num_complex::Complex32;
@@ -238,4 +238,63 @@ fn a_recording_keeps_the_audio_source_guards() {
         assert_eq!(report_text(&got), report_text(&want), "{name}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
+}
+
+/// Every event `listen` emits for `src`, as text.
+fn listen_events(src: Box<dyn IqSource>) -> Vec<String> {
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = events.clone();
+    listen(
+        src,
+        &PipelineConfig::default(),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        move |ev| sink.lock().unwrap().push(format!("{ev:?}")),
+        |_spot| {},
+    )
+    .unwrap();
+    let events = events.lock().unwrap().clone();
+    events
+}
+
+/// The live path: `listen` over a source with a post-calibration gap and an
+/// outage at EOF emits the same events with recording on or off, and the
+/// recording replays through `listen` to those events again.
+#[test]
+fn listen_is_unchanged_by_recording_and_its_replay_matches() {
+    let mut spec = manta_testkit::vectors::v1();
+    spec.duration_s = 30.0;
+    let r = manta_testkit::vectors::render(&spec).unwrap();
+    let split = 1_440_123;
+    let source = || Gapped {
+        parts: vec![
+            (None, r.samples[..split].to_vec()),
+            (Some(4 * spec.fs as u64), r.samples[split..].to_vec()),
+        ],
+        terminal: Some(9_600),
+        fs: spec.fs,
+        center: spec.center_freq_hz,
+        part: 0,
+        at: 0,
+        pending: None,
+    };
+    let want = listen_events(Box::new(source()));
+    assert!(
+        want.iter().any(|e| e.contains("Bookkeeping")),
+        "no discontinuity closure"
+    );
+
+    let dir = scratch("listen");
+    let path = dir.join("live.cf32");
+    let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_792_407_600);
+    let (rec, handle) = start_recording(Box::new(source()), &path, start, None).unwrap();
+    assert_eq!(listen_events(Box::new(rec)), want);
+    match handle.finish(Duration::from_secs(5)) {
+        RecordingOutcome::Finished { samples, .. } => {
+            assert_eq!(samples, r.samples.len() as u64)
+        }
+        other => panic!("recording did not finish: {other:?}"),
+    }
+    let replay = RecordedIqSource::open(&path).unwrap();
+    assert_eq!(listen_events(Box::new(replay)), want);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

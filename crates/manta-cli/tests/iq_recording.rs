@@ -595,3 +595,199 @@ fn each_input_of_a_multi_input_daemon_records_its_own_file() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("--record-iq records one input"));
 }
+
+/// `dir/v1.wav` rendered for `seconds`.
+#[cfg(unix)]
+fn v1_fixture_secs(dir: &Path, seconds: f64) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    let spec = manta_testkit::vectors::VectorSpec {
+        duration_s: seconds,
+        ..manta_testkit::vectors::v1()
+    };
+    manta_testkit::vectors::write_fixture_set(&spec, dir).unwrap();
+    dir.join("v1.wav")
+}
+
+/// `manta` limited to writing files of at most `bytes` (a write past it
+/// fails with EFBIG instead of raising SIGXFSZ): a storage failure for the
+/// recorder only, since stdout and stderr are pipes.
+#[cfg(unix)]
+fn manta_with_file_size_limit(bytes: u64) -> Command {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = manta();
+    // SAFETY: async-signal-safe libc calls only, between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let limit = libc::rlimit {
+                rlim_cur: bytes as libc::rlim_t,
+                rlim_max: bytes as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd
+}
+
+/// A recording that cannot be written warns once, leaves decoding exactly
+/// as without it, publishes no complete pair and makes `run` exit 1.
+#[cfg(unix)]
+#[test]
+fn a_recording_write_failure_keeps_decoding_and_fails_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture_secs(&dir.path().join("long"), 30.0);
+    let args = |extra: &[&std::ffi::OsStr]| {
+        let mut a: Vec<std::ffi::OsString> = vec![
+            "run".into(),
+            "--source".into(),
+            wav.as_os_str().into(),
+            "--source-iq".into(),
+            "--json".into(),
+        ];
+        a.extend(extra.iter().map(|s| s.to_os_string()));
+        a
+    };
+    let plain = run_ok(&args(&[]).iter().map(|a| a.as_os_str()).collect::<Vec<_>>());
+    assert!(String::from_utf8_lossy(&plain.stdout).contains("W1AW"));
+
+    let rec = dir.path().join("session.cf32");
+    let out = manta_with_file_size_limit(1 << 20)
+        .args(args(&["--record-iq".as_ref(), rec.as_os_str()]))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert_eq!(out.stdout, plain.stdout, "decoding changed: {stderr}");
+    let warning = format!("IQ recording stopped: write failed for {}", rec.display());
+    assert_eq!(stderr.matches(&warning).count(), 1, "{stderr}");
+    assert!(stderr.contains("decoding continues"), "{stderr}");
+    assert!(!stderr.contains("recording finished:"), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "error: IQ recording {} is incomplete: it stopped early",
+            rec.display()
+        )),
+        "{stderr}"
+    );
+    assert!(!metadata_path(&rec).exists());
+    assert!(manta_input::partial_metadata_path(&rec).exists());
+}
+
+/// In a two-input daemon one recording failing leaves the other input's
+/// recording to finish, and the run still exits 1.
+#[cfg(unix)]
+#[test]
+fn one_failing_recording_of_a_multi_input_daemon_leaves_the_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let short = v1_fixture_secs(&dir.path().join("short"), 2.0);
+    let long = v1_fixture_secs(&dir.path().join("long"), 30.0);
+    let entry = |name: &str, wav: &Path, rec: &str| {
+        format!(
+            "[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = \"{}\"\niq = true\n\
+             record_iq = \"{rec}\"\n\n",
+            wav.display()
+        )
+    };
+    let toml = dir.path().join("multi.toml");
+    std::fs::write(
+        &toml,
+        entry("a", &short, "a.cf32") + &entry("b", &long, "b.cf32"),
+    )
+    .unwrap();
+    // 2 s at 96 kS/s is 1.5 MB of cf32; 30 s is 23 MB.
+    let out = manta_with_file_size_limit(4 << 20)
+        .args(["run", "--json", "--config"])
+        .arg(&toml)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    let (a, b) = (dir.path().join("a.cf32"), dir.path().join("b.cf32"));
+    assert!(
+        stderr.contains(&format!(
+            "recording finished: {}, 192000 samples",
+            a.display()
+        )),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(&a).unwrap(), cf32_bytes(&wav_samples(&short)));
+    assert!(
+        stderr.contains(&format!(
+            "IQ recording stopped: write failed for {}",
+            b.display()
+        )),
+        "{stderr}"
+    );
+    assert!(!metadata_path(&b).exists());
+}
+
+/// A stop signal ends a never-ending (looping, paced) input through `run`'s
+/// shutdown path, which finalizes the recording as `stopped`.
+#[cfg(unix)]
+#[test]
+fn a_stop_signal_finalizes_the_recording() {
+    use std::io::BufRead;
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture_secs(&dir.path().join("fixture"), 30.0);
+    let rec = dir.path().join("live.cf32");
+    let mut child = manta()
+        .args([
+            "run".as_ref(),
+            "--source".as_ref(),
+            wav.as_os_str(),
+            "--source-iq".as_ref(),
+            "--loop".as_ref(),
+            "--json".as_ref(),
+            "--record-iq".as_ref(),
+            rec.as_os_str(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut all = String::new();
+        for line in std::io::BufReader::new(stderr).lines() {
+            let line = line.unwrap();
+            let _ = tx.send(line.clone());
+            all.push_str(&line);
+            all.push('\n');
+        }
+        all
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let line = rx
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("run never started recording");
+        if line.contains("recording IQ to") {
+            break;
+        }
+    }
+    // Some paced samples, then a stop.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let status = child.wait().unwrap();
+    let stderr = reader.join().unwrap();
+    assert!(status.success(), "{status:?}: {stderr}");
+    assert!(
+        stderr.contains(&format!("recording finished: {}", rec.display())),
+        "{stderr}"
+    );
+    let records = records(&rec);
+    let Some(MetadataRecord::End {
+        sample_count,
+        reason,
+    }) = records.last()
+    else {
+        panic!("no end record: {records:?}");
+    };
+    assert_eq!(*reason, EndReason::Stopped);
+    assert!(*sample_count > 0);
+    assert_eq!(std::fs::metadata(&rec).unwrap().len(), sample_count * 8);
+}

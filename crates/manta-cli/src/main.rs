@@ -2028,6 +2028,7 @@ const RECORDING_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// recording did not complete, which `run` turns into its exit status after
 /// the drain.
 fn finish_recording(handle: manta_input::RecordingHandle) -> Result<()> {
+    let recorded = handle.path().to_path_buf();
     match handle.finish(RECORDING_FINISH_TIMEOUT) {
         manta_input::RecordingOutcome::Finished {
             path,
@@ -2047,8 +2048,11 @@ fn finish_recording(handle: manta_input::RecordingHandle) -> Result<()> {
             ));
             Ok(())
         }
-        // Already reported once, as a warning, when it happened.
-        manta_input::RecordingOutcome::Failed(msg) => Err(anyhow!(msg)),
+        // Its cause was reported once, as a warning, when it happened.
+        manta_input::RecordingOutcome::Failed(_) => Err(anyhow!(
+            "IQ recording {} is incomplete: it stopped early (see the warning above)",
+            recorded.display()
+        )),
         manta_input::RecordingOutcome::TimedOut(path) => {
             let msg = format!(
                 "IQ recording finalization timed out: {}; completion is unconfirmed",

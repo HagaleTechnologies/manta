@@ -358,3 +358,23 @@ fn the_dedupe_window_spans_a_gap() {
     assert!(far[0] < iq.len() as u64);
     assert!(far[1] >= iq.len() as u64 + (700.0 * fs) as u64, "{far:?}");
 }
+
+/// MAN-309: the report's bad-sample total covers every segment, and the
+/// zero pre-roll of each new segment counts none.
+#[test]
+fn bad_samples_are_totalled_across_segments() {
+    let (mut iq, fs, center) = v1_samples(10.0);
+    let split = iq.len() / 2;
+    for i in [100, split - 1, split, iq.len() - 5] {
+        iq[i] = Complex32::new(f32::NAN, 0.0);
+    }
+    let cfg = PipelineConfig::default();
+    let plain = decode_source(&mut Stepped::new(&iq, fs, center, 4096), &cfg).unwrap();
+    assert_eq!(plain.bad_samples, 4);
+    let parts = vec![
+        (None, iq[..split].to_vec()),
+        (Some(48_000), iq[split..].to_vec()),
+    ];
+    let gapped = decode_source(&mut Gapped::new(parts, fs, center, 4096), &cfg).unwrap();
+    assert_eq!(gapped.bad_samples, 4);
+}
