@@ -221,19 +221,6 @@ impl IqSource for DecimatingSource {
         self.inner.health_counters()
     }
 
-    /// MAN-73: the inner source's gap, rescaled from inner-rate samples to
-    /// this wrapper's `sample_rate()`, the unit the trait reports it in.
-    /// Forwarded rather than left to the trait's `None` default, which
-    /// swallowed it (MAN-259); harmless until now only because no raw
-    /// driver reports one (`ReconnectingSource`, the only reporter, wraps
-    /// this type, never the reverse).
-    fn take_discontinuity(&mut self) -> Option<u64> {
-        let ratio = self.fs_out / self.inner.sample_rate();
-        self.inner
-            .take_discontinuity()
-            .map(|gap| (gap as f64 * ratio).round() as u64)
-    }
-
     /// MAN-259: the inner driver's acquisition start; decimation adds no
     /// open-time work of its own.
     fn acquisition_start_offset(&self) -> std::time::Duration {
@@ -570,9 +557,13 @@ mod tests {
     /// MAN-259: the same forwarding duty for MAN-73's discontinuity, which
     /// this wrapper used to swallow through the trait's `None` default. One
     /// second at the inner 192 kS/s is one second at the decimated 48 kS/s.
+    /// The report is taken during `read()` (MAN-305), so it reaches the
+    /// caller with the first samples that follow the gap.
     #[test]
     fn take_discontinuity_forwards_to_the_inner_source() {
         let mut src = reopened(std::time::Duration::ZERO, Some(192_000));
+        let mut buf = vec![Complex32::new(0.0, 0.0); 1_024];
+        assert!(src.read(&mut buf).unwrap() > 0);
         assert_eq!(src.take_discontinuity(), Some(48_000));
         assert_eq!(src.take_discontinuity(), None, "reported only once");
     }

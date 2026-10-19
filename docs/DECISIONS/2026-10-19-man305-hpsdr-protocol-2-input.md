@@ -213,6 +213,14 @@ It reports samples lost immediately before the most recent `read()`'s
 samples, which the source spliced over. `manta_engine::listen` reads it ahead
 of `take_discontinuity` at all four read sites (single-input calibration and
 main loop, multi-input calibration and main loop) and adds it to `seg_base`.
+In the main loops the add lands between reads, so it re-times nothing already
+buffered. In the calibration fills (PR #357 review) the loss is recorded at
+the fill offset where it happened and the fill is processed in pieces split
+at each recorded loss, `seg_base` advancing between pieces exactly as the
+main loop advances it between reads -- so events originating in the pre-gap
+part of a fill keep their pre-loss timestamps instead of all being mapped
+from the post-gap base. A discontinuity that discards a partial fill puts
+that part's recorded losses onto the clock with the discarded samples.
 The engine maps hop index *m* to `seg_base + m·hop` when it emits events, so
 advancing `seg_base` re-times every later event, including those of tracks
 begun before the gap, and closes nothing. `check` and `calibrate` ignore it:

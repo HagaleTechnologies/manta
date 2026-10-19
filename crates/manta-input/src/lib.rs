@@ -193,7 +193,6 @@ pub trait IqSource {
         None
     }
 
-<<<<<<< HEAD
     /// MAN-305: samples (at `sample_rate()`) lost immediately before the
     /// samples returned by the most recent `read()`, which the source spliced
     /// over instead of reporting a discontinuity: a short loss on a numbered
@@ -203,7 +202,8 @@ pub trait IqSource {
     /// **Wrapper types must forward this**, as they forward `take_discontinuity`.
     fn take_missing_samples(&mut self) -> Option<u64> {
         None
-=======
+    }
+
     /// MAN-259: how far into this connection's `open()` call the stream
     /// `read()` returns began -- the offset from the call starting to
     /// immediately before the call that told the hardware to start
@@ -229,7 +229,6 @@ pub trait IqSource {
     /// system.
     fn acquisition_start_offset(&self) -> std::time::Duration {
         std::time::Duration::ZERO
->>>>>>> 80cc42d213d6f5982a319308c2a5fc4696efd601
     }
 
     /// Shared packet-loss/malformed counters for sources that can lose or
