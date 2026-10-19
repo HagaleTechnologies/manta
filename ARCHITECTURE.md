@@ -248,10 +248,12 @@ See `docs/DECISIONS/2026-10-10-man269-paced-looping-replay.md`.
 
 IQ files and recordings (MAN-309): `open_iq_file` picks a manta recording
 (`RecordedIqSource`, found by its `PATH.meta.jsonl`), headerless cf32/ci16
-(`RawIqSource`, rate and centre from the command line) or an IQ WAV. A
-recording restores the recorded source's rate, centre, passband, trusted
-band and analytic guard, and replays each recorded gap once through
-`take_discontinuity`. `RecordingSource` wraps the final source `run` hands
+(`RawIqSource`, rate and centre from the command line or `[input]
+iq_format`/`sample_rate_hz`) or an IQ WAV. A recording restores the
+recorded source's rate, centre, passband, trusted band and analytic guard,
+and replays each recorded gap once through `take_discontinuity`, which
+both `listen` and the offline `decode_source` turn into a new segment
+(fresh channelizer and track manager, clock advanced past the outage). `RecordingSource` wraps the final source `run` hands
 to `listen` (`--record-iq`): reads pass through unchanged while a bounded,
 non-blocking queue feeds one writer thread per recording, which stops the
 recording rather than make the decoder wait. Format and failure handling:

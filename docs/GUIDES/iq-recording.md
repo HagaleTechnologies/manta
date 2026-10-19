@@ -163,14 +163,14 @@ not filled with zeros. A loss the input reports without a sample count
 (for example a SoapySDR overflow) reaches neither the engine nor the
 recording as a gap.
 
+`manta decode` handles them the same way: it closes its tracks at each
+gap, as a discontinuity rather than an end of signal, and starts a fresh
+segment whose timestamps continue after the missing samples and whose
+track ids follow on. The spot validator spans every segment, so a call
+repeated across a short outage is still a duplicate. A recording without
+gaps decodes exactly as before.
+
 Two limits apply to recordings with gaps:
-
-- `manta decode` refuses them, because it decodes a file as one continuous
-  stream and would splice audio across the outage:
-
-  ```text
-  error: IQ recording session.cf32 has input gaps, which manta decode cannot replay yet; replay it with manta run --source session.cf32 --source-iq
-  ```
 
 - They replay only at their recorded rate, because the decimator does not
   carry gaps:
@@ -178,6 +178,8 @@ Two limits apply to recordings with gaps:
   ```text
   error: cannot decimate an IQ recording with gaps; replay at its recorded sample rate
   ```
+
+- `manta oracle` reads one continuous capture and refuses them.
 
 `--realtime` waits out each gap once, as the outage took that long live.
 `--loop` keeps a gap at the end of the recording and reports it at the
@@ -208,6 +210,23 @@ error: headerless IQ requires --sample-rate-hz and --dial-freq-hz
 ```
 
 (the first from `decode`, the second from `run`).
+
+A service describes a headerless file with config keys instead; the
+centre is `center_freq_hz`:
+
+```toml
+[input]
+type = "file"
+path = "external.cf32"
+iq = true
+iq_format = "cf32"
+sample_rate_hz = 96000
+center_freq_hz = 14000000
+```
+
+`iq_format` and `sample_rate_hz` go together and need `iq = true`; the
+command-line flags override them. `manta config check` shows
+`iq_format=cf32 sample_rate_hz=96000` for such an input.
 
 ## The metadata format
 

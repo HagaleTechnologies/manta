@@ -590,9 +590,14 @@ fn input_summary(file: &crate::config::InputFile) -> String {
             iq,
             realtime,
             looped,
+            raw,
         }) => {
             // MAN-269: shown only when set, so existing summaries are unchanged.
             let mut line = format!("input: type=file path={} iq={iq}", path.display());
+            // MAN-309: only for headerless IQ.
+            if let Some((format, rate)) = raw {
+                line.push_str(&format!(" iq_format={format} sample_rate_hz={rate}"));
+            }
             if *realtime {
                 line.push_str(" realtime=true");
             }
@@ -1766,6 +1771,8 @@ mod tests {
         ("input", "capture_rate_hz"),
         ("input", "replay_epoch"),
         ("input", "record_iq"),
+        ("input", "iq_format"),
+        ("input", "sample_rate_hz"),
         ("spot", "blocklist_path"),
         ("spot", "notch_path"),
         ("spot", "cty_path"),
@@ -2030,13 +2037,24 @@ mod tests {
             InputKind::Hpsdr,
             InputKind::Ka9q,
         ] {
+            // MAN-309: the headerless-IQ keys need `iq = true`; checked below.
             let body = format!(
                 "[input]\ntype = \"{}\"\n{}",
                 kind.name(),
-                uncommented("input", |k| kind.keys().contains(&k))
+                uncommented("input", |k| kind.keys().contains(&k)
+                    && !RAW_IQ.contains(&k))
             );
             let l = loaded(&body);
             assert_eq!(l.input.source.map(|s| s.kind()), Some(kind), "{body}");
+        }
+        const RAW_IQ: [&str; 2] = ["iq_format", "sample_rate_hz"];
+        let body = format!(
+            "[input]\ntype = \"file\"\npath = \"x.cf32\"\niq = true\n{}",
+            uncommented("input", |k| RAW_IQ.contains(&k))
+        );
+        match loaded(&body).input.source {
+            Some(SourceFromFile::File { raw: Some(_), .. }) => {}
+            other => panic!("{body}: {other:?}"),
         }
         let shared = [
             "freq_correction_ppm",

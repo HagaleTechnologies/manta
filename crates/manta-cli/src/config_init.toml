@@ -175,6 +175,8 @@
 #iq = false                          # true for a two-channel IQ recording, not mono audio
 #realtime = false                    # true to replay at the recording's own pace, so clients can watch (run only)
 #loop = false                        # true to replay again from the start each time it ends; implies realtime (run only)
+#iq_format = "cf32"                  # headerless little-endian IQ, cf32 or ci16 (needs iq = true and center_freq_hz); omit for WAV or a manta recording
+#sample_rate_hz = 96000              # the headerless file's stored sample rate, with iq_format
 
 # type = "kiwi", a KiwiSDR web receiver, and type = "hpsdr", an
 # HPSDR/Hermes radio (both inputs are included in every build):

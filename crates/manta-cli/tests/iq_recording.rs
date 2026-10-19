@@ -198,7 +198,7 @@ fn a_recording_replays_to_the_same_spots_on_every_run() {
 }
 
 #[test]
-fn recorded_gaps_replay_through_run_and_decode_refuses_to_splice_them() {
+fn recorded_gaps_replay_through_run_and_decode_without_splicing() {
     let dir = tempfile::tempdir().unwrap();
     let (wav, manifest) = v1_fixture(dir.path());
     let samples = wav_samples(&wav);
@@ -253,9 +253,45 @@ fn recorded_gaps_replay_through_run_and_decode_refuses_to_splice_them() {
     // recording of the same samples.
     assert_ne!(replay(&smooth), first);
 
-    let (code, stderr) = stderr_of(&["decode".as_ref(), gapped.as_os_str()]);
-    assert_eq!(code, 1);
-    assert!(stderr.contains("has input gaps"), "{stderr}");
+    // `decode` segments at the gap too: the same bytes on every run, a
+    // spot in them, and not the gap-free recording's report.
+    let decode = |p: &Path| run_ok(&["decode".as_ref(), p.as_os_str(), "--json".as_ref()]).stdout;
+    let report = decode(&gapped);
+    assert!(String::from_utf8_lossy(&report).contains("W1AW"));
+    assert_eq!(decode(&gapped), report);
+    assert_eq!(decode(&gapped), report);
+    assert_ne!(decode(&smooth), report);
+
+    // `oracle` reads a gap-free recording as it reads the WAV, and refuses
+    // to splice a gapped one.
+    let csv = dir.path().join("rbn.csv");
+    std::fs::write(
+        &csv,
+        "callsign,de_pfx,de_cont,freq,band,dx,dx_pfx,dx_cont,mode,db,date,speed,tx_mode\n",
+    )
+    .unwrap();
+    let oracle = |p: &Path| {
+        manta()
+            .args([
+                "oracle".as_ref(),
+                p.as_os_str(),
+                csv.as_os_str(),
+                "--capture-start".as_ref(),
+                "2026-10-19T00:00:00Z".as_ref(),
+            ])
+            .output()
+            .unwrap()
+    };
+    let from_wav = oracle(&wav);
+    assert!(from_wav.status.success());
+    assert_eq!(oracle(&smooth).stdout, from_wav.stdout);
+    let out = oracle(&gapped);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("has input gaps"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let (code, stderr) = stderr_of(&[
         "run".as_ref(),
         "--source".as_ref(),
@@ -391,6 +427,37 @@ fn headerless_cf32_and_ci16_decode_like_the_equivalent_wavs() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("W1AW"));
+
+    // The same file described by `[input]` keys (relative to the config)
+    // runs exactly as the flags describe it; `config check` reports them.
+    let cfg = dir.path().join("manta.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[input]\ntype = \"file\"\npath = \"external.cf32\"\niq = true\n\
+             iq_format = \"cf32\"\nsample_rate_hz = {rate}\ncenter_freq_hz = {centre}\n"
+        ),
+    )
+    .unwrap();
+    let from_config = run_ok(&[
+        "run".as_ref(),
+        "--config".as_ref(),
+        cfg.as_os_str(),
+        "--json".as_ref(),
+    ]);
+    assert_eq!(from_config.stdout, out.stdout);
+    let check = run_ok(&[
+        "config".as_ref(),
+        "check".as_ref(),
+        "--config".as_ref(),
+        cfg.as_os_str(),
+    ]);
+    let check = String::from_utf8_lossy(&check.stdout).into_owned()
+        + &String::from_utf8_lossy(&check.stderr);
+    assert!(
+        check.contains(&format!("iq_format=cf32 sample_rate_hz={rate}")),
+        "{check}"
+    );
 
     // Missing metadata: the command-specific message.
     let (code, stderr) = stderr_of(&[

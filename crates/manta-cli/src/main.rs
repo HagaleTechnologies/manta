@@ -155,7 +155,8 @@ enum Command {
     Oracle {
         /// Stereo IQ WAV file: 32-bit float, or 16-, 24- or 32-bit integer
         /// samples. Its centre frequency is read from the matching
-        /// `<name>.json` sidecar next to it.
+        /// `<name>.json` sidecar next to it. A gap-free manta IQ recording
+        /// (with its PATH.meta.jsonl) is read from its metadata instead.
         path: PathBuf,
         /// Reverse Beacon Network daily-dump CSV, pre-filtered to the
         /// recording's time window.
@@ -1917,29 +1918,20 @@ fn refuse_gapped_decimation(path: &Path, fs: f64, capture_rate_hz: Option<f64>) 
     Ok(())
 }
 
-/// MAN-309: `decode` batches a file into one continuous segment, so it
-/// would splice audio across a recorded outage; `run` replays the gaps.
-fn refuse_gapped_decode(path: &Path) -> Result<()> {
-    if manta_input::read_recording_summary(path)?.has_gaps() {
-        bail!(
-            "IQ recording {} has input gaps, which manta decode cannot replay yet; replay it \
-             with manta run --source {} --source-iq",
-            path.display(),
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-/// MAN-309: `--iq-format`/`--sample-rate-hz` describe a headerless IQ file
-/// source; with them, `--dial-freq-hz` (or `input.center_freq_hz`) is its
-/// centre and required.
+/// MAN-309: `--iq-format`/`--sample-rate-hz` (or `input.iq_format`/
+/// `input.sample_rate_hz`) describe a headerless IQ file source; with them,
+/// `--dial-freq-hz` (or `input.center_freq_hz`) is its centre and required.
 fn apply_raw_iq(
     resolved: &mut Resolved,
     iq_format: Option<manta_input::RawIqFormat>,
     sample_rate_hz: Option<f64>,
 ) -> Result<()> {
     let Some(format) = iq_format else {
+        if let LiveSourceSpec::File { raw: Some(_), .. } = &resolved.spec {
+            if resolved.dial_freq_hz.is_none() {
+                bail!("headerless IQ requires --sample-rate-hz and --dial-freq-hz");
+            }
+        }
         return Ok(());
     };
     let (Some(sample_rate_hz), Some(_)) = (sample_rate_hz, resolved.dial_freq_hz) else {
@@ -4759,10 +4751,13 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
 fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Result<LiveSourceSpec> {
     Ok(match source {
         config::SourceFromFile::Audio { device } => LiveSourceSpec::AudioDevice(device.clone()),
-        config::SourceFromFile::File { path, iq, .. } => LiveSourceSpec::File {
+        config::SourceFromFile::File { path, iq, raw, .. } => LiveSourceSpec::File {
             path: path.clone(),
             source_iq: *iq || cli_source_iq,
-            raw: None,
+            raw: raw.map(|(format, sample_rate_hz)| RawIq {
+                format,
+                sample_rate_hz,
+            }),
         },
         config::SourceFromFile::Kiwi {
             host,
@@ -5851,18 +5846,16 @@ fn run_command() -> Result<std::process::ExitCode> {
                         center_freq_hz,
                     },
                 )?;
-                if native {
-                    refuse_gapped_decode(&path)?;
-                    if center_freq_hz.is_none() && src.center_freq_hz() <= 0.0 {
-                        errln!(
-                            "warning: IQ recording {} has no RF centre frequency in its \
-                             metadata -- reported frequencies are baseband offsets from the \
-                             recording's centre, not absolute RF frequencies. Pass the centre \
-                             frequency, e.g. --center-freq-hz 14000000.",
-                            path.display()
-                        );
-                    }
+                if native && center_freq_hz.is_none() && src.center_freq_hz() <= 0.0 {
+                    errln!(
+                        "warning: IQ recording {} has no RF centre frequency in its \
+                         metadata -- reported frequencies are baseband offsets from the \
+                         recording's centre, not absolute RF frequencies. Pass the centre \
+                         frequency, e.g. --center-freq-hz 14000000.",
+                        path.display()
+                    );
                 }
+                // `decode_source` segments the decode at each recorded gap.
                 manta_engine::decode_source(src.as_mut(), &cfg)?
             } else {
                 if center_freq_hz.is_none() && path.is_file() {
@@ -5917,9 +5910,20 @@ fn run_command() -> Result<std::process::ExitCode> {
         } => {
             let loaded = config::load(config.as_deref(), config::Env::Ignore)?;
             note_ignored_tables(&loaded, "oracle", &["decode"]);
-            let mut src = manta_input::WavIqSource::open(&path)?;
+            // MAN-309: a manta IQ recording opens through the same reader as
+            // `decode`; the oracle reads one continuous capture, so a
+            // recording with gaps is refused rather than spliced.
+            if manta_input::is_native_recording(&path)
+                && manta_input::read_recording_summary(&path)?.has_gaps()
+            {
+                bail!(
+                    "IQ recording {} has input gaps; manta oracle needs one continuous capture",
+                    path.display()
+                );
+            }
+            let mut src = manta_input::open_iq_file(&path, manta_input::IqFileOptions::default())?;
             let (fs, center) = (src.sample_rate(), src.center_freq_hz());
-            let iq = manta_input::read_all(&mut src)?;
+            let iq = manta_input::read_all(src.as_mut())?;
             let spots = manta_testkit::oracle::parse_rbn_spots(&rbn_csv, &spotter, capture_start)?;
             let cfg = merge_cli_engine(engine, loaded.decode);
             let (results, summary) =
@@ -11564,6 +11568,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("capture_rate_hz", "input.capture_rate_hz"),
         ("replay_epoch", "input.replay_epoch"),
         ("record_iq", "input.record_iq"),
+        ("iq_format", "input.iq_format"),
+        ("sample_rate_hz", "input.sample_rate_hz"),
         ("allowlist", "spot.allowlist"),
         ("blocklist", "spot.blocklist_path"),
         ("notch", "spot.notch_path"),
@@ -11588,10 +11594,6 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         "center_freq_hz",
         // `decode --timing` (MAN-315): an output choice, like `json`.
         "timing",
-        // MAN-309: headerless IQ is described per command line; a follow-up
-        // may add `input.iq_format`/`input.sample_rate_hz`.
-        "iq_format",
-        "sample_rate_hz",
         "help",
         "version",
         "reference_hz",
@@ -11699,7 +11701,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             ("audio", "type = \"audio\"\ndevice = \"d\"\n"),
             (
                 "file",
-                "type = \"file\"\npath = \"x.wav\"\niq = true\nrealtime = true\nloop = true\n",
+                "type = \"file\"\npath = \"x.wav\"\niq = true\nrealtime = true\nloop = true\n\
+                 iq_format = \"cf32\"\nsample_rate_hz = 96000\n",
             ),
             (
                 "kiwi",

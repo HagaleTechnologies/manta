@@ -60,18 +60,32 @@ described on the command line. Operator guide:
   it did live. `PacedSource` counts a gap's samples once in its pacing
   debt; `LoopingSource` carries a terminal gap into the next pass, added
   (checked) to that pass's first gap, and refuses a pass whose passband or
-  guards differ. A gap-free loop still splices without a discontinuity. A recording with any gap is refused by `decode` (its
-  single-segment batching would splice the outage) and by a rate-changing
+  guards differ. A gap-free loop still splices without a discontinuity. A
+  recording with any gap is refused by a rate-changing
   `--capture-rate-hz` (the decimator does not carry gaps).
-
-## Not done here
-
-These planned items are follow-ups:
-
-- Gap-aware `decode` (segment the offline decode at each gap, with source
-  guards).
-- `iq_format` and `sample_rate_hz` config keys (the flags are CLI-only).
-- Native-recording support in `oracle`, `check`, `soak` and `bench`.
+- **D7 — gap-aware `decode`.** `manta_engine::decode_source` checks
+  `take_discontinuity` after every read and at EOF. At a gap it processes
+  the pre-gap partial chunk, closes the segment with
+  `finish_for_discontinuity` (a `Bookkeeping` closure, as `listen`), and
+  starts a fresh channelizer and track manager whose clock is the old
+  segment's base plus its consumed and missing samples and whose track ids
+  continue; the post-gap samples open the new segment after its zero
+  pre-roll. A gap pending at EOF closes the last tracks the same way
+  (MAN-258). Each segment keeps the 4096-sample chunking of its own
+  zero-padded stream, so `decode` keeps its batching and is not `listen`
+  (no 2 s calibration). The validator, RTTY rows and bad-sample count span
+  every segment. Every segment applies the source's passband, trusted
+  band, guard and mirror veto as `listen::new_segment` does; for a plain
+  complex source those setters are no-ops, so a gap-free WAV decodes
+  byte-for-byte as before.
+- **D8 — config and diagnostics.** `[input] iq_format`/`sample_rate_hz`
+  (file inputs with `iq = true`, together) describe headerless IQ; the
+  centre is `center_freq_hz` or `--dial-freq-hz`, checked once merged, and
+  the flags override them. `soak`, `doctor` and `check` open a configured
+  file through the same `LiveSourceSpec::open` as `run`, so they read
+  recordings and headerless files alike; `oracle` reads a gap-free
+  recording through `open_iq_file` and refuses a gapped one (it decodes one
+  continuous capture). `bench` reads no file.
 
 ## Verification
 
@@ -92,4 +106,19 @@ These planned items are follow-ups:
   config `record_iq` resolves against the config file, `config check`
   creates nothing, a restart onto the same file fails untouched; each input
   of a two-input daemon records its own file.
+- `crates/manta-engine/tests/decode_source.rs`: a gap inside a chunk and
+  on a chunk boundary, at read sizes 1 to 65 536, gives identical reports,
+  no event inside the outage, fresh track ids and a `Bookkeeping` close; a
+  gap before the first sample only moves every timestamp; a terminal gap
+  closes the last tracks as `Bookkeeping`; W1AW repeated across a 10 s gap
+  is one spot and across a 700 s gap two, the second at its true time.
+- `crates/manta-engine/tests/recording_replay.rs`: a gapped source decoded
+  through a recorder gives the same report as without, and its recording
+  replays to that report at every read size; rig-audio recordings (750 Hz
+  at 48 kHz, 2600 Hz decimated to 6 kS/s) keep their passband, trusted band
+  and guard and decode to one emitting track, as the live source does.
+- `crates/manta-cli/tests/iq_recording.rs` also: `decode` of a gapped
+  recording is identical on three runs and differs from its gap-free twin;
+  a config-described headerless file runs like the flags; `oracle` reads a
+  gap-free recording like its WAV and refuses a gapped one.
 - No golden vector or legacy WAV output changes.
