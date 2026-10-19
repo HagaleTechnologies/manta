@@ -1918,12 +1918,18 @@ fn live_uplink_docs_name_the_six_character_locator_requirement() {
             "docs/CONFIG.md [[rbn_uplink]] section",
             section(&doc("docs/CONFIG.md"), "[[rbn_uplink]]").to_string(),
         ),
-        ("manta.example.toml dry_run comment", doc("manta.example.toml")),
+        (
+            "manta.example.toml dry_run comment",
+            doc("manta.example.toml"),
+        ),
         (
             "packaging/README.md Uplinks paragraph",
             doc("packaging/README.md"),
         ),
-        ("docs/GUIDES/rbn-node.md Going live section", going_live.to_string()),
+        (
+            "docs/GUIDES/rbn-node.md Going live section",
+            going_live.to_string(),
+        ),
     ] {
         let text = squash_whitespace(&text);
         assert!(

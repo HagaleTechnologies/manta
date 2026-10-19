@@ -800,7 +800,8 @@ target_host = "rbn.example.org"
 target_port = 7000
 # dry_run defaults to TRUE: manta connects and logs in, so you can verify
 # credentials and reachability, but transmits no spots. Set it to false
-# only once you actually intend to feed a live target.
+# only once you actually intend to feed a live target; going live then also
+# needs [server] operator_grid set to a 6-character Maidenhead locator.
 # dry_run = false
 # spot_types defaults to "cq_beacon": only CQ and beacon spots, as RBN
 # requires. "all" also sends DE and untyped spots.

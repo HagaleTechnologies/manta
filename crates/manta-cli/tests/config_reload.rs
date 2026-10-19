@@ -290,7 +290,10 @@ fn an_invalid_reload_is_logged_and_the_previous_lists_stay() {
     // grid, so the flipped config carries one.
     std::fs::write(
         &config,
-        server_toml("operator_grid = \"FN03ab\"", &uplink_toml(uplink_port, false)),
+        server_toml(
+            "operator_grid = \"FN03ab\"",
+            &uplink_toml(uplink_port, false),
+        ),
     )
     .unwrap();
     std::fs::write(&blocklist, "K1BAD\n").unwrap();

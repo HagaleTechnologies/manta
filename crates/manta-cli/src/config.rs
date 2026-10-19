@@ -1520,7 +1520,8 @@ mod tests {
 
     /// MAN-319: the live-uplink locator gate's message, pinned once here so
     /// the implementation below cannot drift from the docs' phrasing.
-    const MAN319_LOCATOR_MSG: &str = "dry_run = false -- sending spots needs [server].operator_grid \
+    const MAN319_LOCATOR_MSG: &str =
+        "dry_run = false -- sending spots needs [server].operator_grid \
                                      set to a 6-character Maidenhead locator";
 
     fn live_uplink(host: &str) -> String {
