@@ -119,7 +119,8 @@ station_callsign = "N0CALL"
 #login_callsign = "N0CALL"           # default: station_callsign from [server]
 
 # true: connect and log in, but send no spots. Set false only once you mean
-# to send spots to the collector.
+# to send spots to the collector; going live also needs [server]
+# operator_grid set to a 6-character Maidenhead locator (e.g. "FN03ab").
 #dry_run = true
 
 # Which spots to send: "cq_beacon" sends only stations calling CQ (or CQ

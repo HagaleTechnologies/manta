@@ -475,6 +475,9 @@ reading this node's telnet server (see the
 Forwarding straight to an upstream collector is an experimental
 `[[rbn_uplink]]` block. `dry_run` defaults to `true`, so an uplink connects
 and logs in but transmits nothing until you set it to `false` deliberately.
+Going live (`dry_run = false`) also needs `[server].operator_grid` set to a
+6-character Maidenhead locator (e.g. `"FN03ab"`); `config check` refuses the
+flip without one.
 
 To see, live, whether RBN heard what manta spots, add an `[rbn_compare]`
 table (MAN-301). manta then reads RBN's public CW feed, read-only, and

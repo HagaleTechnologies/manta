@@ -291,7 +291,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:07e3ff49bc362e6abe31f465492ef507ed13e471be9d6d82e5915658ca3426f6",
+      "hash": "sha256:98ad81e0b364655b1039dfd6a9d62e0aacd185dfa3f31ee83c1f8a800fa937be",
       "id": "spot-output-contract",
       "kind": "interface",
       "links": [
