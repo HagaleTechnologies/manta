@@ -1539,38 +1539,26 @@ fn soapy_driver_without_freq_and_rate_is_a_clean_error() {
 }
 
 #[test]
-#[cfg(feature = "hpsdr")]
 fn hpsdr_host_without_freq_and_rate_is_a_clean_error() {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
-        .args(["listen", "--hpsdr-host", "192.168.1.100"])
+    let dir = tempfile::tempdir().unwrap();
+    write_cfg(dir.path(), "empty.toml", "");
+    let out = manta()
+        .current_dir(dir.path())
+        .args(["run", "--config", "empty.toml", "--hpsdr-host", "127.0.0.1"])
         .output()
         .unwrap();
-    assert!(
-        !out.status.success(),
-        "expected a clean failure without --hpsdr-freq/--hpsdr-rate"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("hpsdr-freq")
-            || stderr.contains("hpsdr-rate")
-            || stderr.contains("required"),
-        "expected an explanatory error, got: {stderr}"
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "note: empty.toml has no [server] table; the telnet/JSON/metrics servers are not started\nerror: --hpsdr-freq-hz is required with --hpsdr-host\n"
     );
 }
 
 #[test]
-#[cfg(feature = "hpsdr")]
 fn hpsdr_flags_are_recognized_by_listen_and_soak() {
-    // Flag-recognition smoke test (MAN-51 acceptance): confirms
-    // --hpsdr-host/--hpsdr-port/--hpsdr-freq/--hpsdr-rate exist on both
-    // subcommands per the ticket's Gherkin -- clap must not reject them as
-    // unknown arguments. Checked via --help rather than a real invocation
-    // (round-1 review finding): actually running `listen`/`soak` with a
-    // plausible LAN host like 192.168.1.100 risks an unbounded hang on any
-    // machine where something really answers on that address -- `--help`
-    // proves flag recognition with zero I/O. Connecting to a real device
-    // is MAN-52's job.
-    for sub in ["listen", "soak"] {
+    // Help exercises the complete option schema without opening a receiver.
+    for sub in ["run", "listen", "soak", "doctor", "calibrate", "check"] {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
             .args([sub, "--help"])
             .output()
@@ -1580,19 +1568,27 @@ fn hpsdr_flags_are_recognized_by_listen_and_soak() {
         for flag in [
             "--hpsdr-host",
             "--hpsdr-port",
-            "--hpsdr-freq",
-            "--hpsdr-rate",
+            "--hpsdr-freq-hz",
+            "--hpsdr-rate-hz",
+            "--kiwi-host",
+            "--ka9q-group",
         ] {
             assert!(
-                stdout.contains(flag),
+                stdout
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some(flag)),
                 "{sub} --help should list {flag}, got: {stdout}"
             );
         }
+        assert!(
+            stdout
+                .contains("Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Included in every build."),
+            "{sub} --help must describe built-in HPSDR support: {stdout}"
+        );
     }
 }
 
 #[test]
-#[cfg(feature = "hpsdr")]
 fn hpsdr_rate_rejects_non_finite_values() {
     // Round-1 review finding: `HpsdrConfig::validate`'s bandwidth check
     // silently passes NaN (comparisons against NaN are always false), and
@@ -1632,7 +1628,6 @@ fn hpsdr_rate_rejects_non_finite_values() {
 }
 
 #[test]
-#[cfg(feature = "hpsdr")]
 fn hpsdr_freq_rejects_non_finite_and_non_positive_values() {
     // Round-2 review finding: --hpsdr-freq was never validated at all --
     // `HpsdrConfig` only length-checks `center_freq_hz`, not its values, so
@@ -1651,6 +1646,11 @@ fn hpsdr_freq_rejects_non_finite_and_non_positive_values() {
             ])
             .output()
             .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("unexpected argument '--hpsdr-host'"),
+            "{stderr}"
+        );
         assert!(
             !out.status.success(),
             "--hpsdr-freq {bad_freq} should be rejected before any I/O"
@@ -1659,7 +1659,6 @@ fn hpsdr_freq_rejects_non_finite_and_non_positive_values() {
 }
 
 #[test]
-#[cfg(feature = "hpsdr")]
 fn hpsdr_host_conflicts_with_kiwi_host() {
     // Round-1 review finding: without this, clap accepted --hpsdr-* and
     // --kiwi-* together, opened the HPSDR source first, but reported the
@@ -1692,17 +1691,76 @@ fn hpsdr_host_conflicts_with_kiwi_host() {
     );
 }
 
+/// Every source command rejects conflicting selections in either order before I/O.
+#[test]
+fn hpsdr_host_conflicts_with_every_other_source_flag() {
+    let others = vec![
+        vec!["--source", "missing.wav"],
+        vec!["--device", "USB Audio"],
+        vec![
+            "--kiwi-host",
+            "receiver.invalid",
+            "--kiwi-freq-hz",
+            "7030000",
+        ],
+        vec!["--ka9q-group", "239.1.2.3"],
+        #[cfg(feature = "soapy")]
+        vec![
+            "--soapy-driver",
+            "driver=rtlsdr",
+            "--soapy-freq-hz",
+            "7030000",
+            "--soapy-rate-hz",
+            "48000",
+        ],
+    ];
+    let hpsdr = [
+        "--hpsdr-host",
+        "receiver.invalid",
+        "--hpsdr-freq-hz",
+        "7030000",
+        "--hpsdr-rate-hz",
+        "48000",
+    ];
+    for sub in ["run", "listen", "soak", "doctor", "calibrate", "check"] {
+        let mut conflicts = others.clone();
+        if sub == "calibrate" {
+            conflicts.push(vec!["--tune-hz", "7030000"]);
+        }
+        if sub == "check" {
+            conflicts.push(vec!["missing.wav"]);
+        }
+        for other in conflicts {
+            for hpsdr_first in [true, false] {
+                let mut args = vec![sub];
+                if sub == "soak" {
+                    args.extend(["--duration", "1"]);
+                }
+                if hpsdr_first {
+                    args.extend(hpsdr);
+                    args.extend(other.iter().copied());
+                } else {
+                    args.extend(other.iter().copied());
+                    args.extend(hpsdr);
+                }
+                let out = manta().args(&args).output().unwrap();
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+                assert!(stderr.contains("cannot be used with"), "{args:?}: {stderr}");
+            }
+        }
+    }
+}
+
 /// MAN-140: `--ka9q-group` is a source selector like the others, so naming
 /// another source with it is clap's conflict error (exit 2), before any I/O.
 #[test]
 fn ka9q_group_conflicts_with_every_other_source_flag() {
-    #[allow(unused_mut)]
     let mut others: Vec<Vec<&str>> = vec![
         vec!["--kiwi-host", "x", "--kiwi-freq-hz", "7030000"],
         vec!["--device", "USB Audio"],
         vec!["--source", "v1.wav"],
     ];
-    #[cfg(feature = "hpsdr")]
     others.push(vec![
         "--hpsdr-host",
         "192.168.1.100",
@@ -1815,7 +1873,6 @@ fn legacy_kiwi_freq_spelling_still_parses() {
 }
 
 #[test]
-#[cfg(feature = "hpsdr")]
 fn legacy_hpsdr_freq_and_rate_spellings_still_parse() {
     for spelling in ["--hpsdr-freq-hz", "--hpsdr-freq"] {
         let out = manta()
@@ -2775,7 +2832,7 @@ fn decode_ignores_the_environment() {
 /// ephemeral port before this subprocess ever dials it, especially on a
 /// host with a narrower ephemeral port range (observed: this was flaky
 /// specifically on `macos-latest`, never on `ubuntu-latest`, across
-/// `test`/`test-soapy`/`test-hpsdr` -- all three share this file, none
+/// `test`/`test-soapy` -- both share this file, neither
 /// share a root cause that would be feature- or OS-conditional otherwise).
 /// Keeping the listener alive but never calling `.accept()` on it removes
 /// the race entirely: the kernel completes the TCP handshake into the

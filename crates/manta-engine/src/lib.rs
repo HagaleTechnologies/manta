@@ -10,12 +10,18 @@ pub use listen::{
 };
 pub mod latency;
 pub mod live;
+pub mod multi;
 pub use latency::{DecodeLatencyObserver, DecodeLatencySnapshot, DECODE_LATENCY_BUCKETS_SECONDS};
 pub use live::{
     BandSample, LiveRecord, LiveStateSink, TrackSnapshot, LIVE_MAX_CANDIDATES, LIVE_TEXT_CHARS,
 };
 pub mod lifecycle;
 pub use lifecycle::{TrackLifecycleObserver, TrackLifecycleSnapshot};
+pub use multi::{
+    common_rate_hz, listen_inputs, open_inputs, InputEnd, InputObservers, InputOpener, InputSpec,
+    OpenedInput, OpenedInputs, SessionClock, SharedObservers, SourceClock, TrackIdSpace,
+    MAX_INPUTS,
+};
 pub mod quality;
 pub use quality::{DecodeQualityObserver, DecodeQualitySnapshot, RAIL_RATIO_BUCKETS};
 pub mod calibrate;

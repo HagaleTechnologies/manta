@@ -118,8 +118,7 @@ fn every_doc_states_the_real_crate_count() {
 // ---- Scenario 2: the Inputs table lists every shipped input ----
 
 /// Every input the CLI can be built with needs a row. HPSDR/Hermes shipped
-/// (crates/manta-input/src/hpsdr.rs, feature `hpsdr`, which the README's
-/// install line turns on) and had no row at all.
+/// (crates/manta-input/src/hpsdr.rs) and had no row at all.
 #[test]
 fn readme_inputs_table_covers_every_shipped_input() {
     let readme = doc("README.md");
@@ -287,7 +286,7 @@ fn readme_installation_documents_the_soapy_archive() {
         "soapysdr0.8-module-airspy",
         "soapysdr0.8-module-hackrf",
         "releases/latest/download/manta-linux-x86_64-soapy.tar.gz",
-        "features: hpsdr,soapy",
+        "features: soapy",
         "libSoapySDR.so.0.8: cannot open shared object file",
         "SoapySDR::Device::make() no match",
         "unexpected argument '--soapy-driver'",
@@ -437,29 +436,6 @@ fn fenced_commands(md: &str) -> Vec<String> {
         out.push(pending);
     }
     out
-}
-
-/// Every documented way of building the CLI must produce the same binary the
-/// rest of the README describes. `manta-cli` declares no default features and
-/// gates `--hpsdr-host` behind `hpsdr`, so a build command without
-/// `--features hpsdr` yields a binary that rejects the input flag the
-/// Installation notes and the Inputs table both advertise.
-#[test]
-fn readme_build_commands_keep_the_hpsdr_feature() {
-    let readme = doc("README.md");
-    for line in readme.lines() {
-        if !line.contains("manta-cli") {
-            continue;
-        }
-        if !(line.contains("cargo build") || line.contains("cargo install")) {
-            continue;
-        }
-        assert!(
-            line.contains("--features hpsdr"),
-            "README builds manta-cli without `--features hpsdr`, so the binary has no \
-             `--hpsdr-host` flag: {line}"
-        );
-    }
 }
 
 /// The Kiwi prose tells the reader to substitute the receiver's hostname
@@ -1531,6 +1507,8 @@ fn docs_describe_the_separate_metrics_bind_addr() {
         "ARCHITECTURE.md",
         "docs/RUNBOOKS/network-exposure.md",
         "docs/RUNBOOKS/node-health.md",
+        "docs/RUNBOOKS/uplink-health.md",
+        "wiki/pages/uplink-health-observability.md",
     ] {
         let text = squash_whitespace(&doc(rel));
         assert!(
@@ -1542,9 +1520,27 @@ fn docs_describe_the_separate_metrics_bind_addr() {
             "omit it and all three servers bind",
             "shares the same publicly-bound-by-default posture",
             "default bind `[server].bind_addr`",
+            "`0.0.0.0`-by-default exposure posture",
         ] {
             assert!(!text.contains(stale), "{rel} still says {stale:?}");
         }
+    }
+}
+
+/// MAN-287: the uplink-health runbook says what checking a daemon on another
+/// host takes, not just that it is loopback-only by default.
+#[test]
+fn uplink_health_runbook_says_how_to_reach_a_remote_daemon() {
+    let text = squash_whitespace(&doc("docs/RUNBOOKS/uplink-health.md"));
+    for needle in [
+        "--addr <that host>:<metrics_port>",
+        "set `[server].metrics_bind_addr`",
+        "firewall `[server].metrics_port`",
+    ] {
+        assert!(
+            text.contains(needle),
+            "uplink-health.md does not say {needle:?}"
+        );
     }
 }
 
@@ -2776,6 +2772,7 @@ fn reference_docs_relative_links_resolve() {
         METRICS_REF,
         "docs/SPOT-SCHEMA.md",
         "docs/LIVE-STATE.md",
+        "docs/COMPARISON.md",
         DOCS_INDEX,
         DECISIONS_INDEX,
     ] {
@@ -2922,6 +2919,98 @@ fn spec_section_5_track_closed_names_its_closure_kinds() {
     }
 }
 
+// ---- MAN-155 (scoped by the MAN-360 decision, option B): a neutral
+// related-projects page, links only ----
+
+/// MAN-155, as narrowed by MAN-360 (B): a neutral related-projects page
+/// links each closest alternative's own documentation with no capability
+/// claims about any of them, and a visitor reaches it from the README and
+/// the docs index.
+#[test]
+fn related_projects_page_links_each_alternative_without_capability_claims() {
+    let page = doc("docs/COMPARISON.md");
+    for project in [
+        "SparkSDR",
+        "sdroxide",
+        "OpenWebRX+",
+        "csdr-skimmer",
+        "sdrainer",
+    ] {
+        assert!(
+            page.contains(project),
+            "docs/COMPARISON.md never names {project}"
+        );
+    }
+    let targets = link_targets(&page);
+    for home in [
+        "https://www.sparksdr.com/",
+        "https://github.com/dividebysandwich/sdroxide",
+        "https://github.com/luarvique/openwebrx",
+        "https://github.com/luarvique/csdr-skimmer",
+        "https://github.com/ftl/sdrainer",
+    ] {
+        assert!(
+            targets.iter().any(|t| t == home),
+            "docs/COMPARISON.md does not link {home}"
+        );
+    }
+    assert!(
+        page.contains("no capability claims"),
+        "docs/COMPARISON.md must state its neutrality: links only, no \
+         capability claims about any listed project (MAN-360 decision B)"
+    );
+    assert!(
+        !page.lines().any(|l| l.trim_start().starts_with('|')),
+        "docs/COMPARISON.md has a table row; MAN-360 (B) scoped the page to \
+         a neutral links-only list with no capability claims"
+    );
+    let readme = doc("README.md");
+    for heading in ["Why", "Related projects"] {
+        assert!(
+            link_targets(section(&readme, heading))
+                .iter()
+                .any(|t| t == "docs/COMPARISON.md"),
+            "README `## {heading}` does not link docs/COMPARISON.md"
+        );
+    }
+    assert!(
+        link_targets(&doc(DOCS_INDEX))
+            .iter()
+            .any(|t| t == "COMPARISON.md"),
+        "{DOCS_INDEX} does not link COMPARISON.md"
+    );
+}
+
+/// MAN-13: one daemon reads several receivers, so ARCHITECTURE no longer
+/// prescribes one daemon per band, and ROADMAP's post-1.0 list no longer
+/// offers multi-SDR orchestration as future work.
+#[test]
+fn architecture_no_longer_says_one_daemon_per_band() {
+    let architecture = doc("ARCHITECTURE.md");
+    assert!(
+        !architecture.contains("Multi-band via multiple daemon instances"),
+        "ARCHITECTURE.md still prescribes one daemon per band"
+    );
+    assert!(
+        architecture.contains("[[input]]"),
+        "ARCHITECTURE.md must describe the [[input]] model"
+    );
+    let roadmap = doc("ROADMAP.md");
+    for line in roadmap
+        .lines()
+        .filter(|l| l.contains("Multi-SDR single-daemon orchestration"))
+    {
+        assert!(
+            line.contains("~~Multi-SDR single-daemon orchestration.~~"),
+            "ROADMAP.md still offers multi-SDR orchestration: {line}"
+        );
+    }
+    assert!(
+        roadmap.contains("delivered by\n  MAN-13"),
+        "ROADMAP.md must record MAN-13 as delivering it"
+    );
+}
+
 // ---- MAN-190 (PR #290 review): the docs follow the pending-hop redesign ----
 
 /// MAN-190 added a gotcha to `wiki/pages/decode-chain.md` (v2 evidence
@@ -2963,6 +3052,22 @@ fn spec_v2_drops_the_man193_lookahead_sentence() {
             !spec.contains(stale),
             "SPEC-decode-core-v2.md still says `{stale}`, but `CenteredMax::peek_next` is \
              test-only since MAN-190: each center's `M` comes from the query that computes it"
+        );
+    }
+}
+
+/// MAN-217 names two admission gates for the native merge queue:
+/// `auto-merge-trigger.yml`'s trusted-author check and
+/// `dependabot-auto-merge.yml`'s verified-bump check. Each arms auto-merge on
+/// its own, so CLAUDE.md's "Merge rules" must name both; MAN-238's trim named
+/// only the first and called it the only gate.
+#[test]
+fn claude_merge_rules_name_both_admission_workflows() {
+    let rules = squash_whitespace(section(&doc("CLAUDE.md"), "Merge rules"));
+    for workflow in ["auto-merge-trigger.yml", "dependabot-auto-merge.yml"] {
+        assert!(
+            rules.contains(workflow),
+            "CLAUDE.md's Merge rules never name `{workflow}`, which arms auto-merge on its own"
         );
     }
 }

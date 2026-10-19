@@ -4,9 +4,9 @@
 # MAN-65 findings 1 and 3 (PR #78 review, chatgpt-codex-connector round).
 # Lives in a script rather than inline `run:` blocks so it can be tested
 # without pushing a tag -- see scripts/tests/release-version.test.sh, run
-# by ci.yml's `test` job on every PR.
+# by ci-full.yml's `test` job on every PR.
 #
-# bash 3.2 compatible (ci.yml's test matrix includes macos-latest).
+# bash 3.2 compatible (ci-full.yml's test matrix includes macos-latest).
 #
 # Usage:
 #   release-version.sh validate <git-ref-name>          # -> version on stdout

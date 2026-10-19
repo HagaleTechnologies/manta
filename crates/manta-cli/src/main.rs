@@ -37,6 +37,7 @@ mod list_http;
 mod list_refresh;
 mod live_state;
 mod logging;
+mod multi_run;
 mod reconnect;
 mod reload;
 mod source_check;
@@ -228,10 +229,8 @@ enum Command {
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -264,8 +263,7 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
+        #[arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"])]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -291,15 +289,12 @@ enum Command {
         soapy_gain: Option<f64>,
         /// HPSDR/Hermes device hostname or IP address.
         ///
-        /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Available only in
-        /// builds made with the `hpsdr` feature.
-        #[cfg(feature = "hpsdr")]
+        /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Included in every build.
         #[arg(help_heading = "HPSDR source")]
         #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
         #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
-        #[cfg(feature = "hpsdr")]
         #[arg(
             long,
             default_value_t = manta_input::hpsdr::CONTROL_PORT,
@@ -308,7 +303,6 @@ enum Command {
         )]
         hpsdr_port: u16,
         /// Receiver centre frequency, in Hz. Required with --hpsdr-host.
-        #[cfg(feature = "hpsdr")]
         #[arg(
             long = "hpsdr-freq-hz",
             alias = "hpsdr-freq",
@@ -318,7 +312,6 @@ enum Command {
         )]
         hpsdr_freq_hz: Option<f64>,
         /// Sample rate, in Hz. Required with --hpsdr-host.
-        #[cfg(feature = "hpsdr")]
         #[arg(
             long = "hpsdr-rate-hz",
             alias = "hpsdr-rate",
@@ -335,10 +328,8 @@ enum Command {
         /// encoding and frequency from radiod's status packets; it does not
         /// create or retune channels.
         #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
         ka9q_group: Option<String>,
         /// RTP data port of the group.
         #[arg(
@@ -485,6 +476,10 @@ enum Command {
     /// the run: soak waits out the rest of --duration before it reports.
     /// Intended for unattended stability runs, not for day-to-day operating.
     Soak {
+        /// With several [[input]] entries in the config, the one to examine,
+        /// by its name. Optional with one input.
+        #[arg(long, value_name = "NAME")]
+        input: Option<String>,
         /// How long to run, in seconds. The run lasts this long even when a
         /// --source recording ends sooner.
         #[arg(long)]
@@ -504,10 +499,8 @@ enum Command {
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -540,8 +533,7 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
+        #[arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"])]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -567,15 +559,12 @@ enum Command {
         soapy_gain: Option<f64>,
         /// HPSDR/Hermes device hostname or IP address.
         ///
-        /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Available only in
-        /// builds made with the `hpsdr` feature.
-        #[cfg(feature = "hpsdr")]
+        /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Included in every build.
         #[arg(help_heading = "HPSDR source")]
         #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
         #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
-        #[cfg(feature = "hpsdr")]
         #[arg(
             long,
             default_value_t = manta_input::hpsdr::CONTROL_PORT,
@@ -584,7 +573,6 @@ enum Command {
         )]
         hpsdr_port: u16,
         /// Receiver centre frequency, in Hz. Required with --hpsdr-host.
-        #[cfg(feature = "hpsdr")]
         #[arg(
             long = "hpsdr-freq-hz",
             alias = "hpsdr-freq",
@@ -594,7 +582,6 @@ enum Command {
         )]
         hpsdr_freq_hz: Option<f64>,
         /// Sample rate, in Hz. Required with --hpsdr-host.
-        #[cfg(feature = "hpsdr")]
         #[arg(
             long = "hpsdr-rate-hz",
             alias = "hpsdr-rate",
@@ -611,10 +598,8 @@ enum Command {
         /// encoding and frequency from radiod's status packets; it does not
         /// create or retune channels.
         #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
         ka9q_group: Option<String>,
         /// RTP data port of the group.
         #[arg(
@@ -733,6 +718,10 @@ enum Command {
     // MAN-126: the setup checks live in doctor_checks.rs and clock_check.rs.
     // MAN-235: `strict_exit_code` maps a verdict to its --strict code.
     Doctor {
+        /// With several [[input]] entries in the config, the one to examine,
+        /// by its name. Optional with one input.
+        #[arg(long, value_name = "NAME")]
+        input: Option<String>,
         /// How long to listen for, in seconds (3 to 3600).
         #[arg(long, default_value_t = 10)]
         duration: u64,
@@ -749,10 +738,8 @@ enum Command {
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -785,8 +772,7 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
+        #[arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"])]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -812,15 +798,12 @@ enum Command {
         soapy_gain: Option<f64>,
         /// HPSDR/Hermes device hostname or IP address.
         ///
-        /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Available only in
-        /// builds made with the `hpsdr` feature.
-        #[cfg(feature = "hpsdr")]
+        /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Included in every build.
         #[arg(help_heading = "HPSDR source")]
         #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
         #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
-        #[cfg(feature = "hpsdr")]
         #[arg(
             long,
             default_value_t = manta_input::hpsdr::CONTROL_PORT,
@@ -829,7 +812,6 @@ enum Command {
         )]
         hpsdr_port: u16,
         /// Receiver centre frequency, in Hz. Required with --hpsdr-host.
-        #[cfg(feature = "hpsdr")]
         #[arg(
             long = "hpsdr-freq-hz",
             alias = "hpsdr-freq",
@@ -839,7 +821,6 @@ enum Command {
         )]
         hpsdr_freq_hz: Option<f64>,
         /// Sample rate, in Hz. Required with --hpsdr-host.
-        #[cfg(feature = "hpsdr")]
         #[arg(
             long = "hpsdr-rate-hz",
             alias = "hpsdr-rate",
@@ -856,10 +837,8 @@ enum Command {
         /// encoding and frequency from radiod's status packets; it does not
         /// create or retune channels.
         #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
         ka9q_group: Option<String>,
         /// RTP data port of the group.
         #[arg(
@@ -952,6 +931,10 @@ enum Command {
     // docs/DECISIONS/2026-10-11-man127-calibrate-command.md. The source flag
     // block is copied from `Doctor`, as run/soak/doctor each copy it.
     Calibrate {
+        /// With several [[input]] entries in the config, the one to examine,
+        /// by its name. Optional with one input.
+        #[arg(long, value_name = "NAME")]
+        input: Option<String>,
         /// How long to measure, in seconds (10 to 3600). NCDXF beacons take
         /// turns on each frequency, so give them 180.
         #[arg(long, default_value_t = 60)]
@@ -971,13 +954,8 @@ enum Command {
         /// Keep the reference 1 to 2 kHz from the centre, e.g. 9998500 for
         /// the 10 MHz time signal.
         #[arg(long, value_parser = parse_tune_hz)]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(conflicts_with_all = ["kiwi_host", "hpsdr_host", "soapy_driver"]))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(conflicts_with_all = ["kiwi_host", "hpsdr_host"]))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(conflicts_with_all = ["kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(
-            not(any(feature = "hpsdr", feature = "soapy")),
-            arg(conflicts_with = "kiwi_host")
-        )]
+        #[cfg_attr(feature = "soapy", arg(conflicts_with_all = ["kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(conflicts_with_all = ["kiwi_host", "hpsdr_host"]))]
         tune_hz: Option<f64>,
         /// Sound-card input device; matched by substring. Defaults to the
         /// system default input.
@@ -992,10 +970,8 @@ enum Command {
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
         #[arg(help_heading = "KiwiSDR source")]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "soapy_driver"], requires = "kiwi_freq_hz"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "ka9q_group"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port.
         #[arg(
@@ -1028,8 +1004,7 @@ enum Command {
         /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
         #[arg(help_heading = "SoapySDR source")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
+        #[arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "kiwi_host"])]
         soapy_driver: Option<String>,
         /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -1055,15 +1030,12 @@ enum Command {
         soapy_gain: Option<f64>,
         /// HPSDR/Hermes device hostname or IP address.
         ///
-        /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Available only in
-        /// builds made with the `hpsdr` feature.
-        #[cfg(feature = "hpsdr")]
+        /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Included in every build.
         #[arg(help_heading = "HPSDR source")]
         #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
         #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port.
-        #[cfg(feature = "hpsdr")]
         #[arg(
             long,
             default_value_t = manta_input::hpsdr::CONTROL_PORT,
@@ -1072,7 +1044,6 @@ enum Command {
         )]
         hpsdr_port: u16,
         /// Receiver centre frequency, in Hz. Required with --hpsdr-host.
-        #[cfg(feature = "hpsdr")]
         #[arg(
             long = "hpsdr-freq-hz",
             alias = "hpsdr-freq",
@@ -1082,7 +1053,6 @@ enum Command {
         )]
         hpsdr_freq_hz: Option<f64>,
         /// Sample rate, in Hz. Required with --hpsdr-host.
-        #[cfg(feature = "hpsdr")]
         #[arg(
             long = "hpsdr-rate-hz",
             alias = "hpsdr-rate",
@@ -1099,10 +1069,8 @@ enum Command {
         /// encoding and frequency from radiod's status packets; it does not
         /// create or retune channels.
         #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host"]))]
         ka9q_group: Option<String>,
         /// RTP data port of the group.
         #[arg(
@@ -1380,8 +1348,7 @@ struct SoapyOpts {
     gain: Option<f64>,
 }
 
-/// HPSDR/Hermes connection flags (feature `hpsdr`), grouped for the same reason.
-#[cfg(feature = "hpsdr")]
+/// HPSDR/Hermes connection flags, grouped for the same reason.
 #[derive(Clone)]
 struct HpsdrOpts {
     host: Option<String>,
@@ -1427,7 +1394,6 @@ enum LiveSourceSpec {
     Kiwi(KiwiOpts),
     #[cfg(feature = "soapy")]
     Soapy(SoapyOpts),
-    #[cfg(feature = "hpsdr")]
     Hpsdr(HpsdrOpts),
     Ka9q(Ka9qOpts),
     AudioDevice(Option<String>),
@@ -1445,7 +1411,6 @@ impl LiveSourceSpec {
             LiveSourceSpec::Kiwi(_) => "kiwi",
             #[cfg(feature = "soapy")]
             LiveSourceSpec::Soapy(_) => "soapy",
-            #[cfg(feature = "hpsdr")]
             LiveSourceSpec::Hpsdr(_) => "hpsdr",
             LiveSourceSpec::Ka9q(_) => "ka9q",
             LiveSourceSpec::AudioDevice(_) => "audio",
@@ -1527,11 +1492,17 @@ impl LiveSourceSpec {
                 let rate = soapy
                     .rate
                     .ok_or_else(|| anyhow!("--soapy-rate-hz is required with --soapy-driver"))?;
-                Box::new(manta_input::soapy::SoapySdrIqSource::open(
-                    driver, rate, freq, soapy.gain,
-                )?)
+                // Each (re)open gets a fresh rate-limit state, mirroring
+                // the audio silence notice (MAN-233; the reconnect itself
+                // already logs per-attempt).
+                let warn_driver = driver.to_string();
+                Box::new(
+                    manta_input::soapy::SoapySdrIqSource::open(driver, rate, freq, soapy.gain)?
+                        .with_overflow_notice(Box::new(move || {
+                            logging::warning(&soapy_overflow_warning(&warn_driver))
+                        })),
+                )
             }
-            #[cfg(feature = "hpsdr")]
             LiveSourceSpec::Hpsdr(hpsdr) => {
                 let host = hpsdr
                     .host
@@ -1781,9 +1752,24 @@ fn trusted_band_notice(fs_out_hz: f64, lo_hz: f64, hi_hz: f64) -> String {
 fn audio_silence_warning(device: &str) -> String {
     format!(
         "warning: audio input {device} is delivering digital silence at {} Hz \
-         (every sample is exactly zero) -- {}",
+          (every sample is exactly zero) -- {}",
         manta_input::TARGET_RATE_HZ,
         manta_input::audio::audio_input_hint()
+    )
+}
+
+/// MAN-233: a SoapySDR stream overflow error means this chunk was dropped
+/// by a full driver ring buffer -- the host is not keeping up. Counted, and
+/// rate-limited so a sustained overflow burst logs one line per 60 s. An
+/// overflow flagged `SOAPY_SDR_END_ABRUPT` on a successful read never
+/// reaches here (see `SoapySdrIqSource::read`), hence "overflow error".
+#[cfg(feature = "soapy")]
+fn soapy_overflow_warning(driver: &str) -> String {
+    format!(
+        "warning: SoapySDR input ({driver}) dropped samples: the driver reported a \
+         stream overflow -- the host is not keeping up; every overflow error is counted in \
+         manta_input_gaps_detected_total{{source=\"soapy\"}} (this warning is \
+         rate-limited to once per 60 s)"
     )
 }
 
@@ -2125,11 +2111,9 @@ const MIN_HPSDR_RATE_HZ: f64 = 1_000.0;
 /// pin an exact hardware ceiling this CLI layer has no authority over.
 const MAX_HPSDR_RATE_HZ: f64 = 10_000_000.0;
 
-/// Default HPSDR/Hermes control port for `[input] type = "hpsdr"`, defined
-/// on every build so the table validates identically with or without
-/// `--features hpsdr` (MAN-261); pinned to manta-input's own constant below.
+/// Default HPSDR/Hermes control port for `[input] type = "hpsdr"`
+/// (MAN-261); pinned to manta-input's own constant below.
 const HPSDR_CONTROL_PORT: u16 = 1024;
-#[cfg(feature = "hpsdr")]
 const _: () = assert!(HPSDR_CONTROL_PORT == manta_input::hpsdr::CONTROL_PORT);
 
 /// Clap value parser for `--hpsdr-rate-hz`: rejects non-finite (NaN/infinity)
@@ -2140,7 +2124,6 @@ const _: () = assert!(HPSDR_CONTROL_PORT == manta_input::hpsdr::CONTROL_PORT);
 /// / sample_rate_hz)`, which panics on NaN or an unrepresentable Duration
 /// -- caught here instead, before any source is opened, matching
 /// `parse_dial_freq_hz`'s pattern.
-#[cfg(feature = "hpsdr")]
 fn parse_hpsdr_rate_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s.parse().map_err(|e| format!("{e}"))?;
     check_hpsdr_rate_hz("--hpsdr-rate-hz", hz)
@@ -2164,7 +2147,6 @@ fn check_hpsdr_rate_hz(name: &str, hz: f64) -> std::result::Result<f64, String> 
 /// `--hpsdr-freq-hz NaN`/`inf` reaches `HpsdrConfig.center_freq_hz`, which
 /// is only length-checked, not value-checked, and then propagates into
 /// every emitted spot's frequency field).
-#[cfg(feature = "hpsdr")]
 fn parse_hpsdr_freq_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s.parse().map_err(|e| format!("{e}"))?;
     check_hpsdr_freq_hz("--hpsdr-freq-hz", hz)
@@ -2917,8 +2899,8 @@ struct SpotServer {
     /// Signals the telnet/JSON/WS client tasks to drain their already-
     /// queued spots and exit, instead of being forcibly cut off by
     /// `Runtime::shutdown_timeout`'s raw deadline with no chance to finish
-    /// an in-flight write. Call `.send(true)` before shutting the runtime
-    /// down.
+    /// an in-flight write. `signal_spot_server_shutdown` first calls
+    /// `stop_status_line`, then sends here before shutting the runtime down.
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// Every spawned telnet/JSON/WS per-client connection task, tracked so
     /// shutdown can genuinely AWAIT their completion (bounded by
@@ -2939,25 +2921,20 @@ struct SpotServer {
     /// MAN-324: also `deCall` on every live record, and the station half of
     /// a spotted decision's `spotId`.
     station_callsign: String,
-    /// MAN-122 review round 4 (P2): the periodic status task's `JoinHandle`
-    /// is RETAINED, not discarded, so the shutdown sequence can AWAIT the
-    /// task's actual exit right after `shutdown_tx.send(true)` and before
-    /// the client drain begins. The task's own two shutdown guards (a
-    /// `biased` select and a re-borrow after the sleep) still leave a
-    /// check-to-log window: shutdown can be signalled between the second
-    /// borrow returning `false` and the `tracing::info!` that follows, so a
-    /// status line could still land in the middle of the drain. Awaiting
-    /// the handle here is what makes shutdown and emission mutually
-    /// ordered -- once the join returns, the task is gone and no further
-    /// line can be emitted. `None` when the status line is disabled
-    /// (`status_interval_secs = 0`), in which case there is nothing to
-    /// await. `Mutex<Option<..>>` because shutdown only ever holds
-    /// `&SpotServer` and must `take()` the handle to join it.
+    /// The periodic status task's retained handle. `stop_status_line` sends
+    /// its dedicated stop signal and joins it before `shutdown_tx` wakes
+    /// any client (MAN-256). The task's own guards leave a check-to-log
+    /// window, so joining after a shared broadcast would be too late.
+    /// `None` when `status_interval_secs = 0`. The mutex lets shutdown
+    /// take the handle while holding only `&SpotServer`.
     status_line: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The status task's own stop signal, sent and joined before
+    /// `shutdown_tx` wakes clients (MAN-256).
+    status_shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// MAN-301: the live RBN comparator's task, `None` when `[rbn_compare]`
-    /// is off. Retained for the same reason as `status_line`: shutdown
-    /// joins it right after `shutdown_tx.send(true)`, so no `spotGrade`
-    /// lands in the middle of the client drain.
+    /// is off. Joined after the client broadcast, bounded by
+    /// `SHUTDOWN_DRAIN_DEADLINE`; its exit is not ordered against the
+    /// start of the client drain.
     rbn_compare: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The metrics/status HTTP listener's real bound address (MAN-44),
     /// from `TcpListener::local_addr()`, so a port-0 bind is reachable by
@@ -3196,6 +3173,35 @@ fn source_health_sink(
 /// `ACTIVE_TRACKS_POLL_INTERVAL`.
 const DECODE_LATENCY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Stops status emission completely before clients can begin draining.
+fn stop_status_line(rt: &tokio::runtime::Runtime, server: &SpotServer) {
+    let _ = server.status_shutdown_tx.send(true);
+    if let Some(status_line) = server
+        .status_line
+        .lock()
+        .expect("status-line handle mutex poisoned")
+        .take()
+    {
+        let _ = rt.block_on(status_line);
+    }
+}
+
+/// MAN-256: join the status task before broadcasting client shutdown.
+/// The comparator still joins after the broadcast, with its existing bound.
+fn signal_spot_server_shutdown(rt: &tokio::runtime::Runtime, server: &SpotServer) {
+    stop_status_line(rt, server);
+    let _ = server.shutdown_tx.send(true);
+    if let Some(rbn_compare) = server
+        .rbn_compare
+        .lock()
+        .expect("rbn_compare handle mutex poisoned")
+        .take()
+    {
+        let _ =
+            rt.block_on(async { tokio::time::timeout(SHUTDOWN_DRAIN_DEADLINE, rbn_compare).await });
+    }
+}
+
 /// Shuts down `rt`, first AWAITING (not just giving scheduler time to)
 /// every spawned client-connection task tracked in `tasks`, bounded by
 /// `SHUTDOWN_DRAIN_DEADLINE`. `Runtime::shutdown_timeout`'s `duration`
@@ -3285,6 +3291,13 @@ struct SourceInfo<'a> {
     /// the supported +/-1000 ppm limit manta advertises bounds that exclude
     /// frequencies from its own spot stream.
     freq_calibration: f64,
+    /// MAN-13 (D15): with several inputs, every input's `(centre,
+    /// passband, calibration)`; `SKIMMER/SETT` advertises their union.
+    /// Empty: the one source above.
+    coverage: &'a [(f64, (f64, f64), f64)],
+    /// MAN-13: the `[[input]]` names, set only with two or more inputs;
+    /// the startup banner then prints the `inputs=` form.
+    inputs: Option<&'a [String]>,
 }
 
 /// MAN-128: the engine's `DecodeLatencySnapshot` and `manta-server`'s
@@ -3597,6 +3610,7 @@ fn start_spot_server(
     // docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md.
     let decoder_version = build_info::DECODER_VERSION.to_string();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (status_shutdown_tx, status_shutdown_rx) = tokio::sync::watch::channel(false);
     let tasks = manta_server::tasks::new_client_tasks();
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -3684,6 +3698,7 @@ fn start_spot_server(
                     json_addr: json_listener.local_addr()?,
                     metrics_addr: metrics_listener.local_addr()?,
                     live_addr,
+                    inputs: source.inputs,
                 })
             );
 
@@ -3725,13 +3740,17 @@ fn start_spot_server(
                  operator_lat and operator_lon, so deGrid/deLat/deLon name this node's location"
                 );
             }
-            let profile = std::sync::Arc::new(station_profile(
+            let mut profile = station_profile(
                 &cfg,
                 source.dial_freq_hz,
                 source.rf_passband_hz,
                 source.freq_calibration,
                 validation_level,
-            ));
+            );
+            if !source.coverage.is_empty() {
+                profile.sett.segments = manta_server::sett::segments_for_inputs(source.coverage);
+            }
+            let profile = std::sync::Arc::new(profile);
             spawn_tracked_listener(
                 LISTENER_TELNET,
                 metrics.clone(),
@@ -3952,7 +3971,7 @@ fn start_spot_server(
                         std::time::Duration::from_secs(secs)
                     }),
                 enabled_uplinks,
-                shutdown_rx.clone(),
+                status_shutdown_rx,
             );
 
             anyhow::Ok((
@@ -3975,6 +3994,7 @@ fn start_spot_server(
             station_callsign: cfg.station_callsign.clone(),
             lists,
             status_line: std::sync::Mutex::new(status_line),
+            status_shutdown_tx,
             rbn_compare: std::sync::Mutex::new(rbn_task),
             metrics_addr,
             json_addr,
@@ -3998,7 +4018,6 @@ struct CliOverrides {
     kiwi: KiwiOpts,
     #[cfg(feature = "soapy")]
     soapy: SoapyOpts,
-    #[cfg(feature = "hpsdr")]
     hpsdr: HpsdrOpts,
     ka9q: Ka9qOpts,
     freq_correction_ppm: Option<f64>,
@@ -4041,7 +4060,6 @@ impl CliOverrides {
                 rate: None,
                 gain: None,
             },
-            #[cfg(feature = "hpsdr")]
             hpsdr: HpsdrOpts {
                 host: None,
                 port: manta_input::hpsdr::CONTROL_PORT,
@@ -4071,7 +4089,6 @@ impl CliOverrides {
         if self.ka9q.group.is_some() {
             return Some("--ka9q-group");
         }
-        #[cfg(feature = "hpsdr")]
         if self.hpsdr.host.is_some() {
             return Some("--hpsdr-host");
         }
@@ -4098,7 +4115,6 @@ impl CliOverrides {
         if self.ka9q.group.is_some() {
             return LiveSourceSpec::Ka9q(self.ka9q);
         }
-        #[cfg(feature = "hpsdr")]
         if self.hpsdr.host.is_some() {
             return LiveSourceSpec::Hpsdr(self.hpsdr);
         }
@@ -4242,6 +4258,63 @@ struct Resolved {
     /// The flag that replaced a typed `[input]` from the file, if one did:
     /// that file's receiver is then not the one being opened (MAN-127).
     replaced_file_source: Option<&'static str>,
+    /// MAN-13: every `[[input]]` entry, resolved, when the config names two
+    /// or more and no source flag replaced them; empty otherwise (the
+    /// fields above then describe the one receiver). `spec`,
+    /// `freq_correction_ppm`, `dial_freq_hz` and `capture_rate_hz` above
+    /// are the first entry's.
+    inputs: Vec<ResolvedInput>,
+}
+
+/// MAN-13: one `[[input]]` entry, resolved: its own source, receiver
+/// correction, dial and capture rate.
+#[derive(Clone)]
+struct ResolvedInput {
+    name: String,
+    spec: LiveSourceSpec,
+    freq_correction_ppm: f64,
+    dial_freq_hz: Option<f64>,
+    capture_rate_hz: Option<f64>,
+}
+
+/// MAN-13: a one-receiver command (`calibrate`, `doctor`, `soak`, `check`)
+/// against a config with several inputs must say which one it examines.
+/// Narrows `loaded` to the named input; with one input, `name` may name
+/// it or be omitted.
+fn select_input(loaded: &mut config::Loaded, name: Option<&str>, command: &str) -> Result<()> {
+    let origin = loaded.origin.clone();
+    let names: Vec<&str> = loaded.inputs.iter().map(|n| n.name.as_str()).collect();
+    let index = match name {
+        None if names.len() < 2 => return Ok(()),
+        None => {
+            let options = match names.split_last() {
+                Some((last, rest)) => format!(
+                    "{} or --input {last}",
+                    rest.iter()
+                        .map(|n| format!("--input {n}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                None => String::new(),
+            };
+            bail!(
+                "manta {command} checks one receiver at a time and {origin} has {} inputs: pass \
+                 {options}",
+                names.len()
+            );
+        }
+        Some(name) => names.iter().position(|n| *n == name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--input {} is not one of {origin}'s inputs ({})",
+                fmt::quoted(name),
+                names.join(", ")
+            )
+        })?,
+    };
+    let chosen = loaded.inputs[index].clone();
+    loaded.input = chosen.input.clone();
+    loaded.inputs = vec![chosen];
+    Ok(())
 }
 
 /// MAN-301: the flag enables; a non-empty `--rbn-spotter` replaces
@@ -4287,6 +4360,72 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
     );
     let mut replaced_file_source = None;
     let (cli_realtime, cli_loop) = (cli.realtime, cli.loop_replay);
+    // MAN-13: several `[[input]]` entries, unless a source flag picks one
+    // receiver instead.
+    let several = loaded.inputs.len() >= 2;
+    if several {
+        if let Some(flag) = cli.source_selector() {
+            notes.push(format!(
+                "note: {flag} selects the source; ignoring the {} [[input]] entries from {}",
+                loaded.inputs.len(),
+                loaded.origin
+            ));
+            let spec = cli.into_spec();
+            let replay = resolve_replay_mode(cli_realtime, cli_loop, None, &spec)?;
+            return Ok(Resolved {
+                spec,
+                replay,
+                freq_correction_ppm: freq_correction_ppm.unwrap_or(0.0),
+                dial_freq_hz,
+                capture_rate_hz,
+                replay_epoch,
+                spot,
+                rbn_compare,
+                notes,
+                replaced_file_source: Some(flag),
+                inputs: Vec::new(),
+            });
+        }
+        for (flag, set) in [
+            ("--freq-correction-ppm", freq_correction_ppm.is_some()),
+            ("--dial-freq-hz", dial_freq_hz.is_some()),
+            ("--capture-rate-hz", capture_rate_hz.is_some()),
+        ] {
+            if set {
+                let key = match flag {
+                    "--freq-correction-ppm" => "freq_correction_ppm",
+                    "--dial-freq-hz" => "center_freq_hz",
+                    _ => "capture_rate_hz",
+                };
+                bail!(
+                    "{flag} applies to one receiver and {} has {} [[input]] entries; set {key} \
+                     in the entry, or name one receiver with a source flag",
+                    loaded.origin,
+                    loaded.inputs.len()
+                );
+            }
+        }
+    }
+    let inputs = if several {
+        loaded
+            .inputs
+            .iter()
+            .map(|n| {
+                let Some(source) = &n.input.source else {
+                    bail!("[[input]] {} has no type", fmt::quoted(&n.name));
+                };
+                Ok(ResolvedInput {
+                    name: n.name.clone(),
+                    spec: spec_from_file(source, cli.source_iq)?,
+                    freq_correction_ppm: n.input.shared.freq_correction_ppm.unwrap_or(0.0),
+                    dial_freq_hz: n.input.shared.center_freq_hz,
+                    capture_rate_hz: n.input.shared.capture_rate_hz,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
     // MAN-269 D3: a config `type = "file"` source contributes its own
     // realtime/loop only when no CLI flag selects the source.
     let file_replay = match (cli.source_selector(), &loaded.input.source) {
@@ -4324,6 +4463,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
         rbn_compare,
         notes,
         replaced_file_source,
+        inputs,
     })
 }
 
@@ -4363,7 +4503,6 @@ fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Resul
         config::SourceFromFile::Soapy { .. } => {
             bail!("input.type = \"soapy\" needs a manta built with --features soapy")
         }
-        #[cfg(feature = "hpsdr")]
         config::SourceFromFile::Hpsdr {
             host,
             port,
@@ -4375,10 +4514,6 @@ fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Resul
             freq: Some(*freq_hz),
             rate: Some(*rate_hz),
         }),
-        #[cfg(not(feature = "hpsdr"))]
-        config::SourceFromFile::Hpsdr { .. } => {
-            bail!("input.type = \"hpsdr\" needs a manta built with --features hpsdr")
-        }
         config::SourceFromFile::Ka9q {
             group,
             port,
@@ -4488,7 +4623,6 @@ fn receiver_desc(spec: &LiveSourceSpec) -> doctor_checks::ReceiverDesc {
                 soapy.driver.as_deref().unwrap_or_default()
             ),
         ),
-        #[cfg(feature = "hpsdr")]
         LiveSourceSpec::Hpsdr(hpsdr) => (
             ReceiverKind::Hpsdr,
             format!(
@@ -4569,10 +4703,32 @@ struct SourcePrepared {
     resolved: Resolved,
 }
 
-fn prepare_source(cli: CliOverrides, config_flag: Option<PathBuf>) -> Result<SourcePrepared> {
+/// MAN-13: a command that examines one receiver, and the `--input` it was
+/// given (see `select_input`).
+#[derive(Debug, Clone, Copy)]
+struct OneInput<'a> {
+    command: &'a str,
+    name: Option<&'a str>,
+}
+
+/// A source flag names a standalone receiver and `resolve` ignores the
+/// configured entries for it, so only an explicit `--input` still narrows
+/// them (Codex, PR 313).
+fn needs_input_selection(cli: &CliOverrides, one: OneInput<'_>) -> bool {
+    one.name.is_some() || cli.source_selector().is_none()
+}
+
+fn prepare_source(
+    cli: CliOverrides,
+    config_flag: Option<PathBuf>,
+    one: OneInput<'_>,
+) -> Result<SourcePrepared> {
     let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
     let config_path = config_flag.or_else(|| config::config_path_from_env(&vars));
-    let loaded = config::load(config_path.as_deref(), config::Env::Read(&vars))?;
+    let mut loaded = config::load(config_path.as_deref(), config::Env::Read(&vars))?;
+    if needs_input_selection(&cli, one) {
+        select_input(&mut loaded, one.name, one.command)?;
+    }
     let resolved = resolve(cli, &loaded)?;
     for note in &resolved.notes {
         logging::note(note);
@@ -4591,10 +4747,11 @@ fn prepare_live(
     config_flag: Option<PathBuf>,
     cli_engine: Option<Engine>,
     warn_stale_cty: bool,
+    one: Option<OneInput<'_>>,
 ) -> Result<Prepared> {
     let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
     let config_path = config_flag.or_else(|| config::config_path_from_env(&vars));
-    let prepared = prepare_config(cli, config_path, cli_engine, &vars)?;
+    let prepared = prepare_config_for(cli, config_path, cli_engine, &vars, one)?;
     for note in &prepared.resolved.notes {
         logging::note(note);
     }
@@ -4618,7 +4775,22 @@ fn prepare_config(
     cli_engine: Option<Engine>,
     vars: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> Result<Prepared> {
-    let loaded = config::load(config_path.as_deref(), config::Env::Read(vars))?;
+    prepare_config_for(cli, config_path, cli_engine, vars, None)
+}
+
+/// `prepare_config`, narrowed to one input for a one-receiver command
+/// (MAN-13).
+fn prepare_config_for(
+    cli: CliOverrides,
+    config_path: Option<PathBuf>,
+    cli_engine: Option<Engine>,
+    vars: &[(std::ffi::OsString, std::ffi::OsString)],
+    one: Option<OneInput<'_>>,
+) -> Result<Prepared> {
+    let mut loaded = config::load(config_path.as_deref(), config::Env::Read(vars))?;
+    if let Some(one) = one.filter(|one| needs_input_selection(&cli, *one)) {
+        select_input(&mut loaded, one.name, one.command)?;
+    }
     let rbn_opts = cli.rbn.clone();
     let resolved = resolve(cli, &loaded)?;
     check_rbn_compare(&rbn_opts, &loaded, &resolved)?;
@@ -5290,8 +5462,37 @@ fn run_command() -> Result<std::process::ExitCode> {
             // apply, with the CLI over the file.
             let loaded = config::load(config.as_deref(), config::Env::Ignore)?;
             note_ignored_tables(&loaded, "decode", &["decode", "detector", "spot", "input"]);
+            // MAN-13: a recording came from one receiver, and decode cannot
+            // tell which entry that was: entries that disagree on the
+            // correction need --freq-correction-ppm, never the first one's.
+            let several = loaded.inputs.len() >= 2;
+            let ppm_of = |n: &config::NamedInput| n.input.shared.freq_correction_ppm.unwrap_or(0.0);
+            if several
+                && freq_correction_ppm.is_none()
+                && loaded
+                    .inputs
+                    .iter()
+                    .any(|n| ppm_of(n) != ppm_of(&loaded.inputs[0]))
+            {
+                let names: Vec<&str> = loaded.inputs.iter().map(|n| n.name.as_str()).collect();
+                bail!(
+                    "manta decode cannot tell which of {}'s {} inputs ({}) recorded {}: pass \
+                     --freq-correction-ppm with that receiver's correction (0 for none)",
+                    loaded.origin,
+                    names.len(),
+                    names.join(", "),
+                    path.display()
+                );
+            }
             let shared = &loaded.input.shared;
-            if loaded.input.source.is_some()
+            if several {
+                errln!(
+                    "note: decode applies only freq_correction_ppm from the {} [[input]] entries \
+                     in {}",
+                    loaded.inputs.len(),
+                    loaded.origin
+                );
+            } else if loaded.input.source.is_some()
                 || shared.center_freq_hz.is_some()
                 || shared.capture_rate_hz.is_some()
                 || shared.replay_epoch.is_some()
@@ -5449,13 +5650,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             soapy_rate_hz,
             #[cfg(feature = "soapy")]
             soapy_gain,
-            #[cfg(feature = "hpsdr")]
             hpsdr_host,
-            #[cfg(feature = "hpsdr")]
             hpsdr_port,
-            #[cfg(feature = "hpsdr")]
             hpsdr_freq_hz,
-            #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
             ka9q_group,
             ka9q_port,
@@ -5508,7 +5705,6 @@ fn run_command() -> Result<std::process::ExitCode> {
                     rate: soapy_rate_hz,
                     gain: soapy_gain,
                 },
-                #[cfg(feature = "hpsdr")]
                 hpsdr: HpsdrOpts {
                     host: hpsdr_host,
                     port: hpsdr_port,
@@ -5548,7 +5744,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 resolved,
                 pipeline: cfg,
                 lists_in_use,
-            } = prepare_live(cli, config, engine, false)?;
+            } = prepare_live(cli, config, engine, false, None)?;
             // MAN-79's stale built-in cty.dat warning, before any I/O,
             // unless the cache may replace that copy: `prepare_run_lists`
             // warns then, once it has chosen (MAN-316).
@@ -5570,6 +5766,51 @@ fn run_command() -> Result<std::process::ExitCode> {
             // only; `config check` keeps the broad placeholder scan. See
             // docs/DECISIONS/2026-10-10-man268-unattended-packaging.md.
             config_cmd::reject_example_callsigns(&loaded)?;
+            // MAN-13: several [[input]] entries decode on their own threads
+            // into one validator and one spot output.
+            if !resolved.inputs.is_empty() {
+                // MAN-316: as with one input; mixing file and live inputs
+                // is refused, so the first input's kind is every input's,
+                // and `prepare_run_lists` warns of a stale copy once the
+                // cache has had its say.
+                let live = resolved.inputs.iter().any(|i| i.spec.is_reconnectable());
+                let run_lists = prepare_run_lists(live, &resolved.spot, lists_in_use, &cfg)?;
+                let mut cfg = cfg;
+                if run_lists.refresh.is_some() {
+                    cfg.cty = Some(run_lists.lists.cty.load());
+                    cfg.scp = Some(run_lists.lists.scp.load());
+                }
+                let server = match loaded.server.clone() {
+                    None => None,
+                    Some(server_cfg) => Some(multi_run::ServerSetup {
+                        cfg: server_cfg,
+                        rbn_uplink: loaded.rbn_uplink.clone(),
+                        rbn_compare: resolved.rbn_compare.clone(),
+                        replay_epoch: resolved.replay_epoch,
+                    }),
+                };
+                #[cfg(unix)]
+                let reload = Some(multi_run::ReloadSetup {
+                    config_path: config_path.clone(),
+                    cli: reload_cli,
+                    cli_engine: engine,
+                    vars,
+                    startup_raw: loaded.raw.clone(),
+                });
+                #[cfg(not(unix))]
+                let reload = None;
+                return multi_run::run(multi_run::MultiRun {
+                    inputs: &resolved.inputs,
+                    replay: resolved.replay,
+                    cfg: &cfg,
+                    json,
+                    decoded_text,
+                    server,
+                    run_lists,
+                    spot: &resolved.spot,
+                    reload,
+                });
+            }
             let spec = &resolved.spec;
             let dial_freq_hz = resolved.dial_freq_hz;
             // The resolved (CLI > env > file) capture rate, for the first open
@@ -5786,6 +6027,8 @@ fn run_command() -> Result<std::process::ExitCode> {
                             dial_freq_hz: first.center_freq_hz(),
                             rf_passband_hz: first.rf_passband_hz(),
                             freq_calibration,
+                            coverage: &[],
+                            inputs: None,
                         },
                         epoch,
                         session_nonce,
@@ -6359,41 +6602,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                 // runtime tears down microseconds later and no scrape can
                 // land (see `record_terminal_source_health`'s doc comment).
                 record_terminal_source_health(&server.metrics, source_name, &listen_result);
-                let _ = server.shutdown_tx.send(true);
-                // MAN-122 review round 4 (P2): shutdown is signalled ABOVE
-                // and the periodic status task is joined HERE, before the
-                // client drain below starts -- the task's own guards order
-                // shutdown against its two `select!` poll points, but not
-                // against the wall clock between its last `shutdown.borrow()`
-                // and the `tracing::info!` that follows, so a line could
-                // otherwise still be emitted into the middle of the drain.
-                // Joining makes the two mutually ordered: `spawn_status_line`
-                // returns from its `shutdown.changed()` arm as soon as the
-                // send above is observed, so this wait is bounded by one
-                // scheduler poll, not by `status_interval_secs`.
-                if let Some(status_line) = server
-                    .status_line
-                    .lock()
-                    .expect("status-line handle mutex poisoned")
-                    .take()
-                {
-                    if let Some(rt) = server_runtime.as_ref() {
-                        let _ = rt.block_on(status_line);
-                    }
-                }
-                // MAN-301: the comparator watches the same shutdown signal;
-                // joined like the status line, bounded so a stuck feed
-                // connect can never hold the drain past its deadline.
-                if let Some(rbn_compare) = server
-                    .rbn_compare
-                    .lock()
-                    .expect("rbn_compare handle mutex poisoned")
-                    .take()
-                {
-                    if let Some(rt) = server_runtime.as_ref() {
-                        let _ =
-                            rt.block_on(tokio::time::timeout(SHUTDOWN_DRAIN_DEADLINE, rbn_compare));
-                    }
+                // Finish the status task before the broadcast wakes clients
+                // to drain, including any line already past its last guard.
+                if let Some(rt) = server_runtime.as_ref() {
+                    signal_spot_server_shutdown(rt, server);
                 }
             }
             // `server_runtime`/`spot_server` are always constructed as a
@@ -6411,6 +6623,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             stdout_lines.finish()?;
         }
         Command::Soak {
+            input,
             duration,
             device,
             source,
@@ -6426,13 +6639,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             soapy_rate_hz,
             #[cfg(feature = "soapy")]
             soapy_gain,
-            #[cfg(feature = "hpsdr")]
             hpsdr_host,
-            #[cfg(feature = "hpsdr")]
             hpsdr_port,
-            #[cfg(feature = "hpsdr")]
             hpsdr_freq_hz,
-            #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
             ka9q_group,
             ka9q_port,
@@ -6481,7 +6690,6 @@ fn run_command() -> Result<std::process::ExitCode> {
                         rate: soapy_rate_hz,
                         gain: soapy_gain,
                     },
-                    #[cfg(feature = "hpsdr")]
                     hpsdr: HpsdrOpts {
                         host: hpsdr_host,
                         port: hpsdr_port,
@@ -6512,6 +6720,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                 config,
                 None,
                 true,
+                Some(OneInput {
+                    command: "soak",
+                    name: input.as_deref(),
+                }),
             )?;
             if loaded.server.is_some() {
                 errln!(
@@ -6590,6 +6802,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             ));
         }
         Command::Doctor {
+            input,
             duration,
             device,
             source,
@@ -6606,13 +6819,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             soapy_rate_hz,
             #[cfg(feature = "soapy")]
             soapy_gain,
-            #[cfg(feature = "hpsdr")]
             hpsdr_host,
-            #[cfg(feature = "hpsdr")]
             hpsdr_port,
-            #[cfg(feature = "hpsdr")]
             hpsdr_freq_hz,
-            #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
             ka9q_group,
             ka9q_port,
@@ -6678,7 +6887,6 @@ fn run_command() -> Result<std::process::ExitCode> {
                         rate: soapy_rate_hz,
                         gain: soapy_gain,
                     },
-                    #[cfg(feature = "hpsdr")]
                     hpsdr: HpsdrOpts {
                         host: hpsdr_host,
                         port: hpsdr_port,
@@ -6709,6 +6917,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                 config,
                 None,
                 true,
+                Some(OneInput {
+                    command: "doctor",
+                    name: input.as_deref(),
+                }),
             )?;
             note_pinned_lists(&resolved.spot, &lists_in_use);
             if let Some(note) = replay_mode_ignored_note("doctor", resolved.replay, &loaded.origin)
@@ -6820,6 +7032,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             }
         }
         Command::Calibrate {
+            input,
             duration,
             reference_hz,
             search_ppm,
@@ -6838,13 +7051,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             soapy_rate_hz,
             #[cfg(feature = "soapy")]
             soapy_gain,
-            #[cfg(feature = "hpsdr")]
             hpsdr_host,
-            #[cfg(feature = "hpsdr")]
             hpsdr_port,
-            #[cfg(feature = "hpsdr")]
             hpsdr_freq_hz,
-            #[cfg(feature = "hpsdr")]
             hpsdr_rate_hz,
             ka9q_group,
             ka9q_port,
@@ -6857,6 +7066,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             write,
             json,
         } => calibrate_cmd::run(calibrate_cmd::CalibrateArgs {
+            input,
             duration_secs: duration,
             reference_hz,
             search_ppm,
@@ -6881,7 +7091,6 @@ fn run_command() -> Result<std::process::ExitCode> {
                     rate: soapy_rate_hz,
                     gain: soapy_gain,
                 },
-                #[cfg(feature = "hpsdr")]
                 hpsdr: HpsdrOpts {
                     host: hpsdr_host,
                     port: hpsdr_port,
@@ -7177,6 +7386,21 @@ mod tests {
             "{w}"
         );
         assert!(w.ends_with(manta_input::audio::audio_input_hint()), "{w}");
+    }
+
+    /// MAN-233: pins the design section's exact wording, so a future edit
+    /// cannot quietly change what the operator is told to watch
+    /// (`ka9q_agc_warning_is_design_section_3s_text` precedent).
+    #[cfg(feature = "soapy")]
+    #[test]
+    fn soapy_overflow_warning_names_the_driver_the_counter_and_the_interval() {
+        assert_eq!(
+            soapy_overflow_warning("driver=rtlsdr"),
+            "warning: SoapySDR input (driver=rtlsdr) dropped samples: the driver reported a \
+             stream overflow -- the host is not keeping up; every overflow error is counted in \
+             manta_input_gaps_detected_total{source=\"soapy\"} (this warning is \
+             rate-limited to once per 60 s)"
+        );
     }
 
     #[test]
@@ -7641,6 +7865,8 @@ mod tests {
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0),
                 freq_calibration: 1.0,
+                coverage: &[],
+                inputs: None,
             },
             std::time::UNIX_EPOCH,
             0,
@@ -7690,6 +7916,8 @@ mod tests {
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0),
                 freq_calibration: 1.0,
+                coverage: &[],
+                inputs: None,
             },
             std::time::UNIX_EPOCH,
             0,
@@ -8082,16 +8310,9 @@ mod tests {
         );
     }
 
-    /// MAN-122 review round 4 (P2): `spawn_status_line`'s in-task guards
-    /// cannot close the window between its post-sleep `shutdown.borrow()`
-    /// and its `tracing::info!`, so the daemon must order the two from the
-    /// outside -- retain the task's `JoinHandle` and AWAIT it right after
-    /// signalling shutdown, before the client drain starts. This pins both
-    /// halves of that: the handle really is retained on `SpotServer` for a
-    /// config that enables the status line (a discarded handle is
-    /// unjoinable and the ordering is unenforceable), and joining it after
-    /// `shutdown_tx.send(true)` completes promptly rather than blocking for
-    /// a whole `status_interval_secs`.
+    /// The status task retains a joinable handle and exits promptly on its
+    /// own stop signal, even with an hour-long interval. The separate
+    /// broadcast-order test pins when that join happens relative to clients.
     #[test]
     fn the_status_line_task_is_retained_and_joins_promptly_on_shutdown() {
         let cfg_file = write_temp_file(
@@ -8117,6 +8338,8 @@ mod tests {
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
                 freq_calibration: 1.0,                 // --freq-correction-ppm 0
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -8130,7 +8353,7 @@ mod tests {
                 "a non-zero status_interval_secs must leave a joinable handle on SpotServer",
             );
 
-        let _ = server.shutdown_tx.send(true);
+        let _ = server.status_shutdown_tx.send(true);
         // One hour of configured interval against a one-second budget: this
         // can only pass because the task's `shutdown.changed()` arm is
         // `biased`-first and returns without waiting for the next tick.
@@ -8146,6 +8369,89 @@ mod tests {
             joined.unwrap().is_ok(),
             "the status task must exit cleanly, not panic"
         );
+    }
+
+    /// MAN-256: a held watch borrow blocks the client shutdown send. The
+    /// status task must finish while that borrow is held, proving that the
+    /// production helper joins it before any client can observe shutdown.
+    /// Checking only after a receiver wakes would race the status task.
+    #[test]
+    fn the_status_line_task_has_exited_before_client_shutdown_is_broadcast() {
+        let cfg_file = write_temp_file(
+            br#"
+                [server]
+                station_callsign = "W3XYZ"
+                bind_addr = "127.0.0.1"
+                telnet_port = 0
+                json_port = 0
+                metrics_port = 0
+                status_interval_secs = 3600
+                "#,
+        );
+
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
+        let (rt, server) = start_spot_server(
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
+            None,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
+                freq_calibration: 1.0,                 // --freq-correction-ppm 0
+                coverage: &[],
+                inputs: None,
+            },
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+            bundled_reference_lists(),
+            &PipelineConfig::default(),
+        )
+        .unwrap();
+
+        let status_task = server
+            .status_line
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("status task enabled")
+            .abort_handle();
+        // Exercise the optional comparator join too. Its timer must be
+        // created inside the runtime, and its stop still follows the client
+        // broadcast. No external RBN connection is needed for this check.
+        let mut client_shutdown = server.shutdown_tx.subscribe();
+        let comparator = rt.spawn(async move {
+            client_shutdown
+                .wait_for(|stopping| *stopping)
+                .await
+                .unwrap();
+        });
+        let comparator_task = comparator.abort_handle();
+        *server.rbn_compare.lock().unwrap() = Some(comparator);
+        let held = server.shutdown_tx.borrow();
+        let finished = std::thread::scope(|scope| {
+            let shutdown = scope.spawn(|| signal_spot_server_shutdown(&rt, &server));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !status_task.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let finished = status_task.is_finished();
+            assert!(!*held, "clients must not have received shutdown yet");
+            if !finished {
+                // A miswired status receiver must fail rather than hang the join.
+                status_task.abort();
+            }
+            drop(held);
+            shutdown.join().unwrap();
+            finished
+        });
+        assert!(comparator_task.is_finished(), "comparator must be joined");
+        assert!(
+            finished,
+            "the status task must exit before client shutdown is broadcast"
+        );
+        shutdown_runtime_after_drain(rt, &server.tasks);
     }
 
     #[test]
@@ -8950,6 +9256,8 @@ mod tests {
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
                 freq_calibration: 1.0,                 // --freq-correction-ppm 0
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -9011,6 +9319,8 @@ mod tests {
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
                 freq_calibration: 1.0,                 // --freq-correction-ppm 0
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -9070,6 +9380,8 @@ mod tests {
                 dial_freq_hz: 14_040_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
                 freq_calibration: 1.0,                 // --freq-correction-ppm 0
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -9105,6 +9417,8 @@ mod tests {
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0),
                 freq_calibration: 1.0,
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -9131,6 +9445,8 @@ mod tests {
                 confidence: 0.9,
                 track_id: 7,
                 sample_ts: 12_345,
+                rst: None,
+                qrl_query: false,
             });
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
@@ -9213,6 +9529,8 @@ mod tests {
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0),
                 freq_calibration: 1.0,
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -9271,6 +9589,8 @@ mod tests {
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
                 freq_calibration: 1.0,                 // --freq-correction-ppm 0
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -9363,7 +9683,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "hpsdr")]
     #[test]
     fn live_source_spec_open_errors_name_the_hpsdr_hz_flags() {
         let hpsdr = |freq, rate| {
@@ -9781,10 +10100,8 @@ mod tests {
     }
 
     #[test]
-    fn build_info_reports_none_when_no_optional_feature_is_compiled_in() {
-        if !cfg!(feature = "hpsdr") && !cfg!(feature = "soapy") {
-            assert_eq!(daemon_build_info().features, "none");
-        }
+    fn daemon_build_info_propagates_the_selected_cargo_features() {
+        assert_eq!(daemon_build_info().features, build_info::FEATURES);
     }
 
     #[test]
@@ -9947,6 +10264,169 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     const KIWI_INPUT: &str =
         "[input]\ntype = \"kiwi\"\nhost = \"127.0.0.1\"\nfreq_hz = 14025000.0\n\
                               freq_correction_ppm = 2.5\ncenter_freq_hz = 14000000.0\n";
+
+    // ---- MAN-13: several [[input]] entries ----
+
+    const THREE_KA9Q: &str = "[[input]]\nname = \"40m\"\ntype = \"ka9q\"\ngroup = \"239.1.2.3\"\n\
+        ssrc = 7030000\n\n[[input]]\nname = \"20m\"\ntype = \"ka9q\"\ngroup = \"239.1.2.3\"\n\
+        ssrc = 14030000\nfreq_correction_ppm = -1.5\ncapture_rate_hz = 48000.0\n\n\
+        [[input]]\nname = \"15m\"\ntype = \"kiwi\"\nhost = \"127.0.0.1\"\n\
+        freq_hz = 21030000.0\ncenter_freq_hz = 21000000.0\nfreq_correction_ppm = 0.8\n";
+
+    #[test]
+    fn resolve_returns_one_resolved_input_per_entry_with_its_own_ppm_dial_and_capture_rate() {
+        let loaded = loaded_from(THREE_KA9Q);
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        let names: Vec<&str> = r.inputs.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["40m", "20m", "15m"]);
+        assert!(matches!(r.inputs[0].spec, LiveSourceSpec::Ka9q(_)));
+        assert!(matches!(r.inputs[2].spec, LiveSourceSpec::Kiwi(_)));
+        assert_eq!(r.inputs[0].freq_correction_ppm, 0.0);
+        assert_eq!(r.inputs[1].freq_correction_ppm, -1.5);
+        assert_eq!(r.inputs[1].capture_rate_hz, Some(48_000.0));
+        assert_eq!(r.inputs[2].freq_correction_ppm, 0.8);
+        assert_eq!(r.inputs[2].dial_freq_hz, Some(21_000_000.0));
+        assert_eq!(r.inputs[0].dial_freq_hz, None);
+    }
+
+    #[test]
+    fn a_cli_source_flag_replaces_the_input_list_with_a_note() {
+        let loaded = loaded_from(THREE_KA9Q);
+        let cli = CliOverrides {
+            kiwi: KiwiOpts {
+                host: Some("kiwi.example.net".into()),
+                port: 8073,
+                freq: Some(14_030_000.0),
+                password: String::new(),
+            },
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded).unwrap();
+        assert!(r.inputs.is_empty());
+        assert!(matches!(r.spec, LiveSourceSpec::Kiwi(_)));
+        assert_eq!(r.freq_correction_ppm, 0.0);
+        assert_eq!(
+            r.notes,
+            vec![format!(
+                "note: --kiwi-host selects the source; ignoring the 3 [[input]] entries from {}",
+                loaded.origin
+            )]
+        );
+    }
+
+    #[test]
+    fn per_receiver_cli_flags_are_refused_with_two_or_more_inputs() {
+        let loaded = loaded_from(THREE_KA9Q);
+        for (cli, flag, key) in [
+            (
+                CliOverrides {
+                    freq_correction_ppm: Some(1.0),
+                    ..cli_overrides()
+                },
+                "--freq-correction-ppm",
+                "freq_correction_ppm",
+            ),
+            (
+                CliOverrides {
+                    dial_freq_hz: Some(7_000_000.0),
+                    ..cli_overrides()
+                },
+                "--dial-freq-hz",
+                "center_freq_hz",
+            ),
+            (
+                CliOverrides {
+                    capture_rate_hz: Some(48_000.0),
+                    ..cli_overrides()
+                },
+                "--capture-rate-hz",
+                "capture_rate_hz",
+            ),
+        ] {
+            let err = resolve(cli, &loaded).err().unwrap().to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "{flag} applies to one receiver and {} has 3 [[input]] entries; set {key} in \
+                     the entry, or name one receiver with a source flag",
+                    loaded.origin
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn realtime_loop_and_replay_epoch_flags_apply_to_every_file_input() {
+        let loaded = loaded_from(
+            "[[input]]\nname = \"a\"\ntype = \"file\"\npath = \"/x/a.wav\"\n\n\
+             [[input]]\nname = \"b\"\ntype = \"file\"\npath = \"/x/b.wav\"\n",
+        );
+        let cli = CliOverrides {
+            realtime: true,
+            replay_epoch: Some(1_700_000_000),
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded).unwrap();
+        assert_eq!(r.inputs.len(), 2);
+        assert!(r.replay.paced);
+        assert_eq!(r.replay_epoch, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn single_input_resolution_is_unchanged() {
+        let loaded = loaded_from(KIWI_INPUT);
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        assert!(r.inputs.is_empty());
+        assert!(matches!(r.spec, LiveSourceSpec::Kiwi(_)));
+        assert_eq!(r.freq_correction_ppm, 2.5);
+        assert_eq!(r.dial_freq_hz, Some(14_000_000.0));
+    }
+
+    #[test]
+    fn select_input_requires_a_name_with_two_or_more_inputs() {
+        let mut loaded = loaded_from(THREE_KA9Q);
+        let err = select_input(&mut loaded, None, "doctor")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "manta doctor checks one receiver at a time and {} has 3 inputs: pass --input \
+                 40m, --input 20m or --input 15m",
+                loaded.origin
+            )
+        );
+    }
+
+    #[test]
+    fn select_input_refuses_an_unknown_name() {
+        let mut loaded = loaded_from(THREE_KA9Q);
+        let err = select_input(&mut loaded, Some("nope"), "check")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "--input \"nope\" is not one of {}'s inputs (40m, 20m, 15m)",
+                loaded.origin
+            )
+        );
+        select_input(&mut loaded, Some("20m"), "check").unwrap();
+        assert_eq!(loaded.inputs.len(), 1);
+        assert_eq!(loaded.input.shared.freq_correction_ppm, Some(-1.5));
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        assert!(r.inputs.is_empty());
+        assert_eq!(r.freq_correction_ppm, -1.5);
+        assert_eq!(r.capture_rate_hz, Some(48_000.0));
+    }
+
+    #[test]
+    fn select_input_accepts_the_single_inputs_name_or_none() {
+        let mut loaded = loaded_from(KIWI_INPUT);
+        select_input(&mut loaded, None, "soak").unwrap();
+        select_input(&mut loaded, Some("kiwi"), "soak").unwrap();
+        assert!(select_input(&mut loaded, Some("other"), "soak").is_err());
+    }
 
     #[test]
     fn cli_source_flag_discards_a_typed_input_layer_with_a_note() {
@@ -10347,7 +10827,6 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             .name(),
             "soapy"
         );
-        #[cfg(feature = "hpsdr")]
         assert_eq!(
             LiveSourceSpec::Hpsdr(HpsdrOpts {
                 host: Some("h".into()),
@@ -10373,16 +10852,41 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
     }
 
-    #[cfg(not(feature = "hpsdr"))]
     #[test]
-    fn hpsdr_input_type_needs_the_hpsdr_feature() {
+    fn spec_from_file_maps_an_hpsdr_input_without_opening_it() {
         let loaded = loaded_from(
-            "[input]\ntype = \"hpsdr\"\nhost = \"h\"\nfreq_hz = 7e6\nrate_hz = 48000.0\n",
+            "[input]\ntype = \"hpsdr\"\nhost = \"receiver.invalid\"\nfreq_hz = 7030000.0\nrate_hz = 48000.0\n",
         );
-        let err = resolve(cli_overrides(), &loaded).err().unwrap().to_string();
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        let LiveSourceSpec::Hpsdr(h) = &r.spec else {
+            panic!("expected the HPSDR source from [input]");
+        };
+        assert_eq!(h.host.as_deref(), Some("receiver.invalid"));
+        assert_eq!(h.port, 1024);
+        assert_eq!(h.freq, Some(7_030_000.0));
+        assert_eq!(h.rate, Some(48_000.0));
+        assert_eq!(r.replaced_file_source, None);
+    }
+
+    #[test]
+    fn absent_hpsdr_selection_preserves_audio_and_file_sources() {
+        let cli = CliOverrides::none();
+        assert_eq!(cli.source_selector(), None);
+        assert!(matches!(cli.into_spec(), LiveSourceSpec::AudioDevice(None)));
+
+        let mut cli = CliOverrides::none();
+        cli.device = Some("test audio".into());
+        assert_eq!(cli.source_selector(), Some("--device"));
         assert!(
-            err.contains("input.type = \"hpsdr\" needs a manta built with --features hpsdr"),
-            "{err}"
+            matches!(cli.into_spec(), LiveSourceSpec::AudioDevice(Some(name)) if name == "test audio")
+        );
+
+        let mut cli = CliOverrides::none();
+        cli.source = Some(PathBuf::from("capture.wav"));
+        cli.source_iq = true;
+        assert_eq!(cli.source_selector(), Some("--source"));
+        assert!(
+            matches!(cli.into_spec(), LiveSourceSpec::File { path, source_iq: true } if path == std::path::Path::new("capture.wav"))
         );
     }
 
@@ -10628,6 +11132,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         "quiet",
         "log_level",
         "log_format",
+        // `--input NAME` (MAN-13): picks one `[[input]]` entry by name.
+        "input",
     ];
 
     /// MAN-124: `run`'s `Logging` flags, parsed (or refused) by clap.
@@ -10964,6 +11470,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0),
                 freq_calibration: 1.0,
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -11013,6 +11521,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 dial_freq_hz: 14_000_000.0,
                 rf_passband_hz: (-48_000.0, 48_000.0),
                 freq_calibration: 1.0,
+                coverage: &[],
+                inputs: None,
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,

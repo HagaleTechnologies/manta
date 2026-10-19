@@ -9,11 +9,12 @@ use crate::quality::DecodeQualityObserver;
 use crate::track::CloseCounts;
 use crate::PipelineConfig;
 use anyhow::Result;
-use manta_decode::events::DecoderEvent;
+use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_input::IqSource;
 use manta_spot::reference::ReferenceLists;
 use manta_spot::{Blocklist, NotchList, Validator};
 use num_complex::Complex32;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -355,6 +356,7 @@ fn new_segment(
     rf_passband_hz: (f64, f64),
     trusted_band_hz: Option<(f64, f64)>,
     cfg: &PipelineConfig,
+    ids: crate::multi::TrackIdSpace,
     next_id: u32,
     quality: Option<Arc<DecodeQualityObserver>>,
     occupancy: bool,
@@ -371,6 +373,8 @@ fn new_segment(
         cfg.detector,
         cfg.decode.clone(),
     );
+    // MAN-13 (D3): each input numbers its tracks in its own residue class.
+    tm.set_track_id_space(ids);
     tm.resume_track_ids_from(next_id);
     tm.skip_preroll_hops(pad_hops);
     // MAN-312 (SPEC §2.7): judge static crashes over the source's real
@@ -484,7 +488,9 @@ fn emit(
 /// onto post-outage audio or zero-filling the gap (zero-fill pins the
 /// noise floor and floods false tracks on resume -- see
 /// `IqSource::take_discontinuity`'s doc comment). File replay never
-/// reports a discontinuity, so this is a no-op there.
+/// reports a discontinuity, so this is a no-op there. An end of stream
+/// reported with a gap pending (MAN-258: a stop while the source was down)
+/// closes the segment the same way and starts no new one.
 ///
 /// Unchanged entry point: `listen_with_observers` with no observers. Kept so
 /// MAN-45's engine addition costs its four existing call sites nothing.
@@ -645,6 +651,7 @@ pub fn listen_with_observers(
         rf_passband_hz,
         trusted_band_hz,
         cfg,
+        crate::multi::TrackIdSpace::SINGLE,
         1,
         observers.decode_quality.clone(),
         occupancy,
@@ -813,6 +820,7 @@ pub fn listen_with_observers(
                 rf_passband_hz,
                 trusted_band_hz,
                 cfg,
+                crate::multi::TrackIdSpace::SINGLE,
                 next_id,
                 observers.decode_quality.clone(),
                 occupancy,
@@ -872,7 +880,13 @@ pub fn listen_with_observers(
     if let Some(obs) = lifecycle {
         obs.observe_peak(seg.tm.active_track_count());
     }
-    let events = seg.tm.finish();
+    // MAN-258: an end of stream with an outage pending (a stop while a live
+    // source was down) is not an end of signal either.
+    let events = if src.take_discontinuity().is_some() {
+        seg.tm.finish_for_discontinuity()
+    } else {
+        seg.tm.finish()
+    };
     emit(
         events,
         &mut validator,
@@ -900,9 +914,516 @@ pub fn listen_with_observers(
     Ok(())
 }
 
+/// MAN-13: one input's decode batch, handed from its front end (source
+/// read, channelizer, `TrackManager`) to the shared back end (the one
+/// `Validator`). Every `sample_ts` is already on the session's common clock
+/// and every `TrackMeta`/`TrackPromoted` frequency is already calibrated
+/// with the input's own factor (D4).
+pub(crate) struct Batch {
+    pub(crate) events: Vec<DecoderEvent>,
+    /// Common-clock timestamp of the last sample this batch covers: the
+    /// replay merge's ordering key (D5).
+    pub(crate) end_ts: u64,
+    /// `TrackManager::decoding_track_count()` after the batch.
+    pub(crate) n_tracks: usize,
+    /// The ids the input's `TrackManager` still holds, for the live tap's
+    /// bookkeeping; `None` when no live-state sink is attached.
+    pub(crate) live_ids: Option<Vec<u32>>,
+    /// The input's band sample when this batch crossed one of its stream
+    /// seconds, on the common clock; only with a live-state sink.
+    pub(crate) band: Option<crate::live::BandSample>,
+}
+
+/// MAN-13 (D1): the shared back end of a multi-input session: the one
+/// `Validator` and everything `emit` feeds, on the caller's thread.
+pub(crate) struct Back<'a> {
+    validator: Validator,
+    ctx: EmitCtx<'a>,
+    /// Every track that has reported and not yet closed, across inputs:
+    /// what an input that ends without its `finish()` batch still owes a
+    /// `TrackClosed` (`close_input`).
+    open: BTreeSet<u32>,
+    /// Last received batch per input, for synthetic closures after a
+    /// failure. Only populated when the live tap needs closure times.
+    input_end_ts: Vec<u64>,
+}
+
+impl<'a> Back<'a> {
+    /// `validator` is the session's shared one (factor 1.0: every batch
+    /// arrives calibrated).
+    pub(crate) fn new(
+        shared: &'a crate::multi::SharedObservers,
+        mut validator: Validator,
+        rate_hz: f64,
+    ) -> Self {
+        let references = shared
+            .reference_lists
+            .clone()
+            .map(|lists| ReferenceWatch::new(lists, &mut validator));
+        let live = shared
+            .live_state
+            .clone()
+            .map(|sink| LiveTap::new(sink, rate_hz, 1.0));
+        Self {
+            validator,
+            ctx: EmitCtx {
+                lists: shared.operator_lists.as_deref(),
+                quality: shared.decode_quality.as_deref(),
+                calibration_factor: 1.0,
+                live,
+                references,
+            },
+            open: BTreeSet::new(),
+            input_end_ts: Vec::new(),
+        }
+    }
+
+    /// Feeds one input's batch through the validator, exactly as
+    /// `listen_with_observers` feeds its own.
+    pub(crate) fn ingest(
+        &mut self,
+        input: usize,
+        n_inputs: usize,
+        batch: Batch,
+        on_event: &mut impl FnMut(&DecoderEvent),
+        on_spot: &mut impl FnMut(&crate::Spot),
+    ) {
+        if let Some(tap) = self.ctx.live.as_mut() {
+            self.input_end_ts.resize(n_inputs, 0);
+            self.input_end_ts[input] = batch.end_ts;
+            tap.set_closure_time(batch.end_ts);
+        }
+        // The tracks that earn a `TrackClosed` (MAN-19): any event but a
+        // bare promotion, or being named a merge survivor (MAN-174).
+        for ev in &batch.events {
+            match ev {
+                DecoderEvent::TrackPromoted { .. } => {}
+                DecoderEvent::TrackClosed { track_id, closure } => {
+                    self.open.remove(track_id);
+                    if let ClosureKind::Bookkeeping {
+                        survivor_track_id: Some(survivor),
+                    } = closure
+                    {
+                        self.open.insert(*survivor);
+                    }
+                }
+                DecoderEvent::CharDecoded { track_id, .. }
+                | DecoderEvent::WordBoundary { track_id, .. }
+                | DecoderEvent::SpeedUpdate { track_id, .. }
+                | DecoderEvent::TrackMeta { track_id, .. }
+                | DecoderEvent::TimingUpdate { track_id, .. } => {
+                    self.open.insert(*track_id);
+                }
+            }
+        }
+        emit(
+            batch.events,
+            &mut self.validator,
+            &mut self.ctx,
+            on_event,
+            on_spot,
+        );
+        if let (Some(tap), Some(ids)) = (self.ctx.live.as_mut(), batch.live_ids.as_deref()) {
+            tap.retain_input_tracks(input, n_inputs, ids);
+        }
+        // MAN-324 per input: after the batch it closes, as `maybe_tick`.
+        if let (Some(tap), Some(band)) = (self.ctx.live.as_ref(), batch.band) {
+            tap.publish_band(band);
+        }
+    }
+
+    /// An input has ended. One that errored or panicked sent no `finish()`
+    /// batch, so its tracks still open here are closed now, in id order, as
+    /// `finish_for_discontinuity` closes them at an outage
+    /// (`Bookkeeping`, no survivor: a dead receiver is not evidence the
+    /// signal ended). The validator frees their state and the live tap
+    /// publishes their closure and forgets the input's tracks. After a
+    /// clean end nothing is left open and this changes nothing.
+    pub(crate) fn close_input(
+        &mut self,
+        input: usize,
+        n_inputs: usize,
+        on_event: &mut impl FnMut(&DecoderEvent),
+        on_spot: &mut impl FnMut(&crate::Spot),
+    ) {
+        let owned: Vec<u32> = self
+            .open
+            .iter()
+            .copied()
+            .filter(|id| self.validator.input_of(*id) as usize == input)
+            .collect();
+        if !owned.is_empty() {
+            if let Some(tap) = self.ctx.live.as_mut() {
+                tap.set_closure_time(self.input_end_ts[input]);
+            }
+            for id in &owned {
+                self.open.remove(id);
+            }
+            let events = owned
+                .into_iter()
+                .map(|track_id| DecoderEvent::TrackClosed {
+                    track_id,
+                    closure: ClosureKind::Bookkeeping {
+                        survivor_track_id: None,
+                    },
+                })
+                .collect();
+            emit(
+                events,
+                &mut self.validator,
+                &mut self.ctx,
+                on_event,
+                on_spot,
+            );
+        }
+        if let Some(tap) = self.ctx.live.as_mut() {
+            tap.retain_input_tracks(input, n_inputs, &[]);
+        }
+    }
+}
+
+/// MAN-13: what one input's front end publishes on its own thread.
+pub(crate) struct FrontObservers {
+    pub(crate) active_tracks: Option<Arc<AtomicU64>>,
+    pub(crate) static_crashes: Option<Arc<AtomicU64>>,
+    pub(crate) bad_samples: Option<Arc<AtomicU64>>,
+    pub(crate) rtty: Option<Arc<RttyObserver>>,
+    pub(crate) decode_latency: Option<Arc<DecodeLatencyObserver>>,
+    pub(crate) decode_quality: Option<Arc<DecodeQualityObserver>>,
+    pub(crate) live_ids: bool,
+    /// The input's index, for its band samples.
+    pub(crate) input: usize,
+}
+
+/// Maps a batch's local timestamps onto the common clock and calibrates
+/// its frequencies.
+fn to_common(
+    events: Vec<DecoderEvent>,
+    clock: crate::multi::SourceClock,
+    factor: f64,
+) -> Vec<DecoderEvent> {
+    events
+        .into_iter()
+        .map(|ev| {
+            let mut ev = crate::calibrate_freq_events(&ev, factor);
+            match &mut ev {
+                DecoderEvent::CharDecoded { sample_ts, .. }
+                | DecoderEvent::WordBoundary { sample_ts, .. }
+                | DecoderEvent::TrackMeta { sample_ts, .. }
+                | DecoderEvent::TimingUpdate { sample_ts, .. }
+                | DecoderEvent::TrackPromoted { sample_ts, .. } => {
+                    *sample_ts = clock.to_common(*sample_ts);
+                }
+                DecoderEvent::SpeedUpdate { .. } | DecoderEvent::TrackClosed { .. } => {}
+            }
+            ev
+        })
+        .collect()
+}
+
+/// MAN-13 (D1): one input's front end -- the part of
+/// `listen_with_observers` before the validator, run on the input's own
+/// thread. Reads `src` until EOF, `stop`, a read error or `send` returning
+/// false (the back end has gone), and hands every batch to `send` in the
+/// order `listen_with_observers` would emit it. Segment restarts on a
+/// discontinuity, the startup calibration fill and the per-chunk observers
+/// behave exactly as there.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_input_front(
+    src: &mut dyn IqSource,
+    cfg: &PipelineConfig,
+    stop: &AtomicBool,
+    clock: crate::multi::SourceClock,
+    ids: crate::multi::TrackIdSpace,
+    calibration_factor: f64,
+    observers: &FrontObservers,
+    send: &mut dyn FnMut(Batch) -> bool,
+) -> Result<()> {
+    let _active_tracks_guard = ActiveTracksGuard::new(observers.active_tracks.clone());
+    let mut rtty = RttyPublisher::new(observers.rtty.clone(), calibration_factor);
+    let report_active_tracks = |n_tracks: usize| {
+        if let Some(gauge) = &observers.active_tracks {
+            gauge.store(n_tracks as u64, Ordering::Relaxed);
+        }
+    };
+    let report_static_crashes = |n: u64| {
+        if let Some(counter) = &observers.static_crashes {
+            counter.fetch_max(n, Ordering::Relaxed);
+        }
+    };
+    // MAN-234: samples replaced by segments a discontinuity already
+    // replaced, as `listen_with_observers` counts them.
+    let mut bad_base: u64 = 0;
+    let report_bad_samples = |n: u64| {
+        if let Some(counter) = &observers.bad_samples {
+            counter.fetch_max(n, Ordering::Relaxed);
+        }
+    };
+    let fs = src.sample_rate();
+    let center_freq_hz = src.center_freq_hz();
+    let rf_passband_hz = src.rf_passband_hz();
+    let trusted_band_hz = src.trusted_band_hz();
+    let mut crash_base: u64 = 0;
+    let mut seg = new_segment(
+        fs,
+        center_freq_hz,
+        rf_passband_hz,
+        trusted_band_hz,
+        cfg,
+        ids,
+        ids.first,
+        observers.decode_quality.clone(),
+        observers.live_ids,
+    )?;
+    let mut seg_base: u64 = 0;
+    let mut seg_consumed: u64 = 0;
+    let padding = vec![Complex32::new(0.0, 0.0); seg.ch.filter_len()];
+    let batch =
+        |events: Vec<DecoderEvent>, end_local: u64, tm: &crate::track::TrackManager| Batch {
+            events: to_common(events, clock, calibration_factor),
+            end_ts: clock.to_common(end_local),
+            n_tracks: tm.decoding_track_count(),
+            live_ids: observers.live_ids.then(|| tm.track_ids()),
+            band: None,
+        };
+    let mut band_ticker = observers
+        .live_ids
+        .then(|| crate::live::BandTicker::new(observers.input, fs, calibration_factor));
+    // Once per stream second, on the batch that crossed it (MAN-324).
+    let mut tick = |b: &mut Batch, tm: &mut crate::track::TrackManager, local_ts: u64| {
+        if let Some(ticker) = band_ticker.as_mut() {
+            b.band = ticker.tick(tm, local_ts).map(|mut sample| {
+                sample.sample_ts = clock.to_common(sample.sample_ts);
+                sample
+            });
+        }
+    };
+
+    let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
+    let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];
+    let mut filled = 0;
+    while filled < calib_n {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let n = src.read(&mut calib[filled..])?;
+        if n == 0 {
+            // MAN-252, as `listen_with_observers`: a live source's wrapper
+            // reports a stop request during an outage as EOF; that is the
+            // stop, not a source that ended.
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            anyhow::bail!("audio source ended during startup calibration");
+        }
+        if let Some(gap) = src.take_discontinuity() {
+            calib.copy_within(filled..filled + n, 0);
+            seg_base += filled as u64 + gap;
+            filled = n;
+            continue;
+        }
+        filled += n;
+    }
+    for (i, block) in [&padding[..], &calib[..filled]].into_iter().enumerate() {
+        let events = seg.tm.process_hops(&seg.ch.process(block), |m| {
+            seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
+        });
+        let mut b = batch(events, seg_base + filled as u64, &seg.tm);
+        if i == 1 {
+            tick(&mut b, &mut seg.tm, seg_base + filled as u64);
+        }
+        report_active_tracks(b.n_tracks);
+        report_static_crashes(crash_base + seg.tm.static_crash_count());
+        report_bad_samples(bad_base + seg.ch.bad_samples());
+        rtty.update(&seg.tm);
+        if !send(b) {
+            return Ok(());
+        }
+    }
+    seg_consumed += filled as u64;
+
+    let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
+    let mut read_error = None;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let n = match src.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) => {
+                read_error = Some(e);
+                break;
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        let mut pending = Vec::new();
+        if let Some(gap) = src.take_discontinuity() {
+            let finish_events = seg.tm.finish_for_discontinuity();
+            pending.push(batch(finish_events, seg_base + seg_consumed, &seg.tm));
+            let next_id = seg.tm.next_track_id();
+            crash_base += seg.tm.static_crash_count();
+            bad_base += seg.ch.bad_samples();
+            rtty.restart(seg_base + seg_consumed);
+            seg_base += seg_consumed + gap;
+            seg_consumed = 0;
+            seg = new_segment(
+                fs,
+                center_freq_hz,
+                rf_passband_hz,
+                trusted_band_hz,
+                cfg,
+                ids,
+                next_id,
+                observers.decode_quality.clone(),
+                observers.live_ids,
+            )?;
+            let events = seg.tm.process_hops(&seg.ch.process(&padding), |m| {
+                seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
+            });
+            pending.push(batch(events, seg_base, &seg.tm));
+        }
+        let t0 = observers
+            .decode_latency
+            .as_ref()
+            .map(|_| std::time::Instant::now());
+        let events = seg.tm.process_hops(&seg.ch.process(&chunk[..n]), |m| {
+            seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
+        });
+        seg_consumed += n as u64;
+        let mut b = batch(events, seg_base + seg_consumed, &seg.tm);
+        tick(&mut b, &mut seg.tm, seg_base + seg_consumed);
+        pending.push(b);
+        report_active_tracks(seg.tm.decoding_track_count());
+        report_static_crashes(crash_base + seg.tm.static_crash_count());
+        report_bad_samples(bad_base + seg.ch.bad_samples());
+        rtty.update(&seg.tm);
+        if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
+            obs.observe(t0.elapsed());
+        }
+        for b in pending {
+            if !send(b) {
+                return Ok(());
+            }
+        }
+    }
+    // Every way out of the read loop finishes the input's tracks here, so
+    // the shared validator, the live tap and the track count never keep a
+    // dead input's tracks. A read error is not evidence the signal ended,
+    // nor is an end of stream with an outage pending (MAN-258: a stop
+    // while a live source was down): both take the outage teardown, as
+    // `listen_with_observers` does. Only a plain end of stream or a stop
+    // is `SignalEnded`.
+    let events = if read_error.is_some() || src.take_discontinuity().is_some() {
+        seg.tm.finish_for_discontinuity()
+    } else {
+        seg.tm.finish()
+    };
+    let mut last = batch(events, seg_base + seg_consumed, &seg.tm);
+    last.n_tracks = 0;
+    report_static_crashes(crash_base + seg.tm.static_crash_count());
+    report_bad_samples(bad_base + seg.ch.bad_samples());
+    report_active_tracks(0);
+    rtty.restart(seg_base + seg_consumed);
+    send(last);
+    match read_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_closures_use_the_closing_inputs_batch_time() {
+        for synthetic in [false, true] {
+            let sink = crate::live::tests::RecordingSink::wanting();
+            let shared = crate::multi::SharedObservers {
+                live_state: Some(sink.clone()),
+                ..Default::default()
+            };
+            let cfg = PipelineConfig::default();
+            let mut back = Back::new(
+                &shared,
+                cfg.shared_validator(48_000.0, 2).unwrap(),
+                48_000.0,
+            );
+            let batch = |end_ts, events| Batch {
+                events,
+                end_ts,
+                n_tracks: 1,
+                live_ids: None,
+                band: None,
+            };
+            let meta = |track_id, sample_ts| DecoderEvent::TrackMeta {
+                track_id,
+                sample_ts,
+                snr_2500_db: 20.0,
+                freq_hz: 14_030_000.0,
+            };
+            // Live batches arrive in input order, not common-clock order.
+            back.ingest(
+                0,
+                2,
+                batch(1_000, vec![meta(1, 900)]),
+                &mut |_| {},
+                &mut |_| {},
+            );
+            back.ingest(
+                1,
+                2,
+                batch(400, vec![meta(2, 300)]),
+                &mut |_| {},
+                &mut |_| {},
+            );
+            let closure = ClosureKind::Bookkeeping {
+                survivor_track_id: None,
+            };
+            let events = if synthetic {
+                Vec::new()
+            } else {
+                vec![DecoderEvent::TrackClosed {
+                    track_id: 2,
+                    closure,
+                }]
+            };
+            // Even an eventless batch advances this input's last known time.
+            back.ingest(1, 2, batch(500, events), &mut |_| {}, &mut |_| {});
+            if synthetic {
+                // Another input advances before the failed input is retired.
+                back.ingest(
+                    0,
+                    2,
+                    batch(2_000, vec![meta(1, 1_900)]),
+                    &mut |_| {},
+                    &mut |_| {},
+                );
+                back.close_input(1, 2, &mut |_| {}, &mut |_| {});
+            }
+            back.close_input(0, 2, &mut |_| {}, &mut |_| {});
+            let closures: Vec<_> = sink
+                .take()
+                .into_iter()
+                .filter_map(|r| match r {
+                    crate::live::LiveRecord::TrackClosed {
+                        track_id,
+                        sample_ts,
+                        ..
+                    } => Some((track_id, sample_ts)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                closures,
+                vec![(2, 500), (1, if synthetic { 2_000 } else { 1_000 })],
+                "synthetic={synthetic}"
+            );
+        }
+    }
+
     fn lifecycle_close_fields(c: crate::track::CloseCounts) -> [u64; 8] {
         [
             c.unconfirmed,
@@ -1800,6 +2321,182 @@ mod tests {
                     survivor_track_id: None
                 }),
             "a discontinuity must close tracks as Bookkeeping, not SignalEnded: {closed_at_gap:?}"
+        );
+    }
+
+    /// Serves `samples`, then ends the stream (`Ok(0)`). With `gap_at_end`
+    /// set, that last read leaves a gap pending, as a `ReconnectingSource`
+    /// stopped mid-outage does (MAN-258); without it, a plain end of stream.
+    struct EndsWithGapSource {
+        samples: Vec<Complex32>,
+        cursor: usize,
+        fs: f64,
+        center_freq_hz: f64,
+        gap_at_end: Option<u64>,
+        pending_gap: Option<u64>,
+        /// Set by the read that returns 0, so a test can tell the
+        /// teardown's events from those before it.
+        ended: Arc<AtomicBool>,
+    }
+
+    impl manta_input::IqSource for EndsWithGapSource {
+        fn sample_rate(&self) -> f64 {
+            self.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.center_freq_hz
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            if self.cursor == self.samples.len() {
+                self.pending_gap = self.gap_at_end.take();
+                self.ended.store(true, Ordering::Relaxed);
+                return Ok(0);
+            }
+            let n = buf.len().min(self.samples.len() - self.cursor);
+            buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
+            self.cursor += n;
+            Ok(n)
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            self.pending_gap.take()
+        }
+    }
+
+    /// The closures `listen()` emits at the end of 12 s of V1's CQ, which
+    /// is mid-transmission there, ended with `gap_at_end` pending.
+    fn closures_at_end_of_stream(
+        gap_at_end: Option<u64>,
+    ) -> Vec<(u32, manta_decode::events::ClosureKind)> {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let ended = Arc::new(AtomicBool::new(false));
+        let src = EndsWithGapSource {
+            samples: rendered.samples[..(spec.fs * 12.0) as usize].to_vec(),
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+            gap_at_end,
+            pending_gap: None,
+            ended: ended.clone(),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut spots = Vec::new();
+        let mut closed: Vec<(u32, manta_decode::events::ClosureKind)> = Vec::new();
+        manta_engine_listen_with_discontinuity_probe(Box::new(src), &stop, &mut spots, |ev| {
+            if let DecoderEvent::TrackClosed { track_id, closure } = ev {
+                if ended.load(Ordering::Relaxed) {
+                    closed.push((*track_id, *closure));
+                }
+            }
+        })
+        .unwrap();
+        closed
+    }
+
+    /// MAN-258: an end of stream reported with a gap pending -- a live
+    /// source stopped while it was down -- closes the open tracks with the
+    /// outage teardown, as a mid-stream discontinuity does, not as
+    /// `SignalEnded`.
+    #[test]
+    fn an_eof_with_a_pending_gap_closes_tracks_as_bookkeeping() {
+        use manta_decode::events::ClosureKind;
+
+        let closed = closures_at_end_of_stream(Some(48_000));
+        assert!(
+            !closed.is_empty(),
+            "test setup: a track must still be open at the end of stream"
+        );
+        assert!(
+            closed.iter().all(|(_, closure)| *closure
+                == ClosureKind::Bookkeeping {
+                    survivor_track_id: None
+                }),
+            "an end of stream with a gap pending must close tracks as Bookkeeping: {closed:?}"
+        );
+    }
+
+    /// MAN-13 x MAN-258: an input of a multi-input session takes the same
+    /// outage teardown at an end of stream reported with a gap pending; its
+    /// front end must not close those tracks as `SignalEnded`.
+    #[test]
+    fn a_multi_input_eof_with_a_pending_gap_closes_tracks_as_bookkeeping() {
+        use manta_decode::events::ClosureKind;
+
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let samples = rendered.samples[..(spec.fs * 12.0) as usize].to_vec();
+        let (fs, center_freq_hz) = (spec.fs, spec.center_freq_hz);
+        let ended = Arc::new(AtomicBool::new(false));
+        let ended_src = ended.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let opened = crate::multi::open_inputs(
+            vec![crate::multi::InputSpec {
+                name: "a".into(),
+                open: Box::new(move || {
+                    Ok(Box::new(EndsWithGapSource {
+                        samples,
+                        cursor: 0,
+                        fs,
+                        center_freq_hz,
+                        gap_at_end: Some(48_000),
+                        pending_gap: None,
+                        ended: ended_src,
+                    }) as Box<dyn IqSource>)
+                }),
+                freq_correction_ppm: 0.0,
+                observers: Default::default(),
+            }],
+            stop,
+        )
+        .unwrap();
+        let mut closed = Vec::new();
+        crate::multi::listen_inputs(
+            opened,
+            &PipelineConfig::default(),
+            crate::multi::SessionClock::Replay,
+            crate::multi::SharedObservers::default(),
+            |ev| {
+                if let DecoderEvent::TrackClosed { track_id, closure } = ev {
+                    if ended.load(Ordering::Relaxed) {
+                        closed.push((*track_id, *closure));
+                    }
+                }
+            },
+            |_| {},
+            |_, _| {},
+            |_| {},
+        )
+        .unwrap();
+        assert!(
+            !closed.is_empty(),
+            "test setup: a track must still be open at the end of stream"
+        );
+        assert!(
+            closed.iter().all(|(_, closure)| *closure
+                == ClosureKind::Bookkeeping {
+                    survivor_track_id: None
+                }),
+            "an input's end of stream with a gap pending must close tracks as \
+             Bookkeeping: {closed:?}"
+        );
+    }
+
+    /// The control for the test above: with no gap pending, an end of
+    /// stream is still an end of signal.
+    #[test]
+    fn a_plain_eof_still_closes_tracks_as_signal_ended() {
+        use manta_decode::events::ClosureKind;
+
+        let closed = closures_at_end_of_stream(None);
+        assert!(
+            !closed.is_empty(),
+            "test setup: a track must still be open at the end of stream"
+        );
+        assert!(
+            closed
+                .iter()
+                .all(|(_, closure)| *closure == ClosureKind::SignalEnded),
+            "a plain end of stream must close tracks as SignalEnded: {closed:?}"
         );
     }
 
@@ -2951,6 +3648,61 @@ mod tests {
             Some(0),
             "the stopped run must still end through finish(), got {counts:?}"
         );
+    }
+
+    /// MAN-13 x MAN-252 (Codex, PR 313): an input of a multi-input session
+    /// whose EOF during calibration follows a stop request ends cleanly, as
+    /// the one-input path does, and an unasked EOF there is still an error.
+    #[test]
+    fn a_multi_input_eof_after_a_stop_request_during_calibration_is_a_clean_end() {
+        for stops_at_eof in [true, false] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let src_stop = stop.clone();
+            let opened = crate::multi::open_inputs(
+                vec![crate::multi::InputSpec {
+                    name: "a".into(),
+                    open: Box::new(move || {
+                        Ok(Box::new(EndsDuringCalibrationSource {
+                            stop: src_stop,
+                            stops_at_eof,
+                            reads: 0,
+                        }) as Box<dyn IqSource>)
+                    }),
+                    freq_correction_ppm: 0.0,
+                    observers: Default::default(),
+                }],
+                stop,
+            )
+            .unwrap();
+            let ends = crate::multi::listen_inputs(
+                opened,
+                &PipelineConfig::default(),
+                crate::multi::SessionClock::Replay,
+                crate::multi::SharedObservers::default(),
+                |_| {},
+                |_| {},
+                |_, _| {},
+                |_| {},
+            )
+            .unwrap();
+            if stops_at_eof {
+                assert!(
+                    ends[0].result.is_ok(),
+                    "an EOF that follows a stop request is a clean shutdown: {:?}",
+                    ends[0].result
+                );
+            } else {
+                let err = ends[0]
+                    .result
+                    .as_ref()
+                    .expect_err("an unasked EOF is an error");
+                assert!(
+                    err.to_string()
+                        .contains("audio source ended during startup calibration"),
+                    "got: {err}"
+                );
+            }
+        }
     }
 
     /// The control: an EOF during calibration with no stop request is still

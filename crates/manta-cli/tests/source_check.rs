@@ -484,21 +484,16 @@ fn check_help_exposes_only_source_and_measurement_options() {
         "must explain native call timeout limitation: {text}"
     );
     assert_eq!(text.contains("--soapy-driver"), cfg!(feature = "soapy"));
-    assert_eq!(text.contains("--hpsdr-host"), cfg!(feature = "hpsdr"));
+    assert!(text.contains("--hpsdr-host"));
 }
 
 #[test]
 fn disabled_source_flags_are_usage_errors() {
     let dir = tempfile::tempdir().unwrap();
-    for (enabled, flag) in [
-        (cfg!(feature = "soapy"), "--soapy-driver"),
-        (cfg!(feature = "hpsdr"), "--hpsdr-host"),
-    ] {
-        if !enabled {
-            let output = check(dir.path(), &[flag, "unused"]);
-            status(&output, 2);
-            assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
-        }
+    if !cfg!(feature = "soapy") {
+        let output = check(dir.path(), &["--soapy-driver", "unused"]);
+        status(&output, 2);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
     }
 }
 

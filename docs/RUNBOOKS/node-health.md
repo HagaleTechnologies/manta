@@ -20,7 +20,11 @@ with its type, labels and when it has samples.
 - `200 OK`, body `ok\n` followed by one `<check>: <status>` line per check,
   while every registered source is healthy, every registered listener
   (telnet/JSON/metrics) is up, and the decode loop has made progress within
-  the last 10 seconds.
+  the last 10 seconds. With several `[[input]]` entries (MAN-13) one healthy
+  input is enough: the node stays `ok` while at least one input delivers
+  samples, each input keeps its own `source <name>:` line, and the
+  `MantaInputDown` alert ([monitoring.md](monitoring.md#mantainputdown))
+  reports a dead one.
 - `503 Service Unavailable`, body `unhealthy\n` plus the same per-check
   lines, otherwise — e.g. `source file: unhealthy`, `listener json: down`,
   `decode: stalled 12s`, or `decode: stopped` (the daemon has exited the
@@ -147,6 +151,14 @@ interval if you need an ongoing liveness check, not just a post-start one.)
   beyond HPSDR). Under normal conditions the gap/malformed counters should
   stay at 0; a steadily increasing `manta_input_gaps_detected_total` means
   the receiver's network path is dropping SND frames.
+- `manta_input_*{source="soapy"}` — SoapySDR sources publish the same three
+  counters ([MAN-233](../DECISIONS/2026-10-15-man233-soapy-overflow-visibility.md)).
+  `manta_input_gaps_detected_total` counts driver stream overflows (samples
+  the host did not read in time), each also warned rate-limited on the log;
+  it should stay at 0, and a rising count means the host is not keeping up
+  with the radio's sample rate. `manta_input_dropped_packets_total` and
+  `manta_input_malformed_packets_total` always read 0 for SoapySDR: an
+  overflow carries no lost-sample estimate and there is no packet framing.
 - `manta_source_outages_total{source}` / `manta_source_down_seconds_total{source}`
   (MAN-96) — how many times each input source went from healthy to unhealthy
   (a lost connection or failed read), and the seconds it spent in outages
@@ -241,9 +253,11 @@ the driver version, then watch the counter stay flat. See
 
 - Signal-to-spot (track onset → first spot) latency is not yet a metric —
   tracked as a follow-up to this ticket.
-- SoapySDR does not yet publish `manta_input_*` counters (no stream-overflow
-  wiring) — tracked as a follow-up; untestable in an environment without
-  `libsoapysdr-dev`.
+- A SoapySDR driver that flags an overflow only with `SOAPY_SDR_END_ABRUPT`
+  on a successful read is not counted in
+  `manta_input_gaps_detected_total{source="soapy"}`; only overflows returned
+  as a read error are
+  ([MAN-233](../DECISIONS/2026-10-15-man233-soapy-overflow-visibility.md)).
 - Kiwi seq-gap counting is unit-tested against the documented frame layout
   and upstream `kiwiclient` semantics, not yet live-verified against a real
   receiver — tracked as a follow-up for the next live-hardware session (see

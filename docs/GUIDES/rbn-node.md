@@ -25,12 +25,13 @@ including its Linux ALSA development packages and Rust toolchain prerequisites:
 ```sh
 git clone https://github.com/HagaleTechnologies/manta
 cd manta
-cargo install --path crates/manta-cli --features hpsdr
+cargo install --path crates/manta-cli
 manta --version
 ```
 
-Keep `--features hpsdr` to support OpenHPSDR receivers. The version output names
-the version, git commit and enabled features. If manta is already installed, run
+Every build supports OpenHPSDR receivers. The version output names
+the version, git commit and selected Cargo features; `features: none` includes
+HPSDR. If manta is already installed, run
 only the version check. Once a release exists, use the download and verification
 notes in [Installation](../../README.md#installation); keep the kit files next to
 the binary. On Debian-family hosts, the probes and firewall below need these tools:
@@ -48,8 +49,8 @@ Stop other manta processes using that receiver before checking it.
 | Receiver | Setup |
 | --- | --- |
 | KiwiSDR | Prefer your own receiver, or read [KiwiSDR etiquette](kiwisdr.md) first. Get its hostname, port and any user password. Reserve one channel; obtain the owner's agreement before unattended use of a public receiver. |
-| OpenHPSDR / Hermes-Lite 2 | Use an `hpsdr` build and the radio's IP, centre frequency and sample rate. Protocol support has not yet been verified against hardware. |
-| SoapySDR | On Ubuntu 24.04 x86_64, use the `manta-linux-x86_64-soapy.tar.gz` release archive and install `libsoapysdr0.8` and your receiver's SoapySDR module ([README](../../README.md#soapysdr-on-linux-x86_64)). The other release archives do not include SoapySDR; elsewhere, install the native SoapySDR library and receiver driver, then build with `--features hpsdr,soapy`. |
+| OpenHPSDR / Hermes-Lite 2 | Use any build and the radio's IP, centre frequency and sample rate. Protocol support has not yet been verified against hardware. |
+| SoapySDR | On Ubuntu 24.04 x86_64, use the `manta-linux-x86_64-soapy.tar.gz` release archive and install `libsoapysdr0.8` and your receiver's SoapySDR module ([README](../../README.md#soapysdr-on-linux-x86_64)). The other release archives do not include SoapySDR; elsewhere, install the native SoapySDR library and receiver driver, then build with `--features soapy`. |
 | Sound card | Use a 48000 Hz input device and set `[input].center_freq_hz` to the actual radio dial frequency. The packaged service below needs a network receiver. |
 
 This tutorial uses KiwiSDR. The command assumes port 8073; add
@@ -287,7 +288,7 @@ systemctl --version
 Run these commands from the repository root or extracted release kit. The install
 lines match [packaging/README.md](../../packaging/README.md#linux-systemd).
 For a source build, replace `./manta` in the first line with `target/release/manta`
-after `cargo build --release -p manta-cli --features hpsdr`, or with the full path
+after `cargo build --release -p manta-cli`, or with the full path
 to the binary installed by `cargo install` in step 1.
 
 ```sh
