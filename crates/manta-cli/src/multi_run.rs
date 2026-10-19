@@ -325,6 +325,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                     ..Default::default()
                 },
                 open: Box::new(move || {
+                    let record_stop = stop.clone();
                     let src = (move || -> Result<Box<dyn manta_input::IqSource>> {
                         let first = spec.open(capture, dial)?;
                         if let Ok(mut at) = opened_at.lock() {
@@ -375,7 +376,8 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                     // The session's epoch, as the spot clock uses: the first
                     // file's (or --replay-epoch) for a replay, now for live.
                     let start = crate::resolve_epoch(session_file.as_deref(), replay_epoch)?;
-                    let (src, handle) = crate::start_input_recording(src, path, start)?;
+                    let (src, handle) =
+                        crate::start_input_recording(src, path, start, record_stop)?;
                     if let Ok(mut slot) = recordings.lock() {
                         slot[index] = Some(handle);
                     }

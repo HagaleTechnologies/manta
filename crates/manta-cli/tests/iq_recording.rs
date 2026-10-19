@@ -3,6 +3,8 @@
 //! `run` to the same output on every run. Real binary, `manta gen`-shaped
 //! V1 fixtures, no hardware.
 
+mod common;
+
 use manta_input::recording_format::MetadataRecord;
 use manta_input::{metadata_path, EndReason, RecordingHeader};
 use num_complex::Complex32;
@@ -789,5 +791,108 @@ fn a_stop_signal_finalizes_the_recording() {
     };
     assert_eq!(*reason, EndReason::Stopped);
     assert!(*sample_count > 0);
+    assert_eq!(std::fs::metadata(&rec).unwrap().len(), sample_count * 8);
+}
+
+/// The live path: a (fake) KiwiSDR drops its connection and comes back.
+/// `run` keeps decoding through the reconnect, and its recording holds the
+/// receiver's rate, centre and passband and the outage as a gap record at
+/// the stored sample where the stream resumed.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_input_outage_is_recorded_as_a_gap() {
+    use common::{
+        accept_kiwi_session, expect_line, line_channel, send_snd_frames, wait_bounded, KillOnDrop,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const WAIT: Duration = Duration::from_secs(60);
+    let dir = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    let done = Arc::new(AtomicBool::new(false));
+    let fake = std::thread::spawn({
+        let done = done.clone();
+        move || -> Result<(), String> {
+            // Past the 2 s calibration, then a hang-up; the second session
+            // streams until the test ends.
+            for secs in [4, 120] {
+                let mut ws = accept_kiwi_session(&listener, &done)?;
+                let until = Instant::now() + Duration::from_secs(secs);
+                send_snd_frames(&mut ws, || {
+                    done.load(Ordering::Relaxed) || Instant::now() >= until
+                });
+            }
+            Ok(())
+        }
+    });
+    let rec = dir.path().join("kiwi.cf32");
+    let mut child = KillOnDrop(
+        manta()
+            .args([
+                "run".as_ref(),
+                "--kiwi-host".as_ref(),
+                "127.0.0.1".as_ref(),
+                "--kiwi-port".as_ref(),
+                port.as_ref(),
+                "--kiwi-freq-hz".as_ref(),
+                "14025000".as_ref(),
+                "--json".as_ref(),
+                "--record-iq".as_ref(),
+                rec.as_os_str(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = line_channel(child.0.stderr.take().unwrap());
+    expect_line(&stderr, &["recording IQ to"], WAIT);
+    expect_line(&stderr, &["reconnected after"], WAIT);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(unsafe { libc::kill(child.0.id() as i32, libc::SIGINT) }, 0);
+    let finished = expect_line(&stderr, &["recording finished:"], WAIT);
+    assert!(finished.contains(&rec.display().to_string()), "{finished}");
+    let status = wait_bounded(&mut child.0, WAIT).expect("run did not exit");
+    assert!(status.success(), "{status:?}");
+    done.store(true, Ordering::Relaxed);
+    let _ = fake.join();
+
+    let records = records(&rec);
+    let Some(MetadataRecord::Header(header)) = records.first() else {
+        panic!("no header: {records:?}");
+    };
+    assert_eq!(header.center_freq_hz, 14_025_000.0);
+    assert!(header.sample_rate_hz > 0.0);
+    let (lo, hi) = (header.rf_passband_hz[0], header.rf_passband_hz[1]);
+    assert!(
+        hi - lo < header.sample_rate_hz,
+        "a KiwiSDR carries less than its Nyquist span: {header:?}"
+    );
+    let gaps: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            MetadataRecord::Gap { before_sample, .. } => Some(*before_sample),
+            _ => None,
+        })
+        .collect();
+    let Some(MetadataRecord::End {
+        sample_count,
+        reason,
+    }) = records.last()
+    else {
+        panic!("no end record: {records:?}");
+    };
+    assert_eq!(*reason, EndReason::Stopped);
+    // The reconnect inside the stream; a stop can add an outage at the end
+    // (MAN-258), recorded as a terminal gap at `sample_count`.
+    let inside = gaps.iter().filter(|&&g| g > 0 && g < *sample_count).count();
+    assert_eq!(inside, 1, "{records:?}");
+    assert!(
+        gaps.iter().all(|&g| g > 0 && g <= *sample_count),
+        "{records:?}"
+    );
     assert_eq!(std::fs::metadata(&rec).unwrap().len(), sample_count * 8);
 }

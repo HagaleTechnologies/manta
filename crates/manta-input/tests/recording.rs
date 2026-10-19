@@ -273,3 +273,39 @@ fn two_recorders_racing_for_one_destination_get_one_winner() {
         RecordingOutcome::Finished { .. }
     ));
 }
+
+/// A source that ends after the run's stop flag is set (a live source
+/// answering the stop) finalizes as `stopped`; one that ends on its own,
+/// as `eof`.
+#[test]
+fn an_end_after_a_stop_request_is_a_stopped_recording() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, stopping, want) in [
+        ("eof.cf32", false, EndReason::Eof),
+        ("stopped.cf32", true, EndReason::Stopped),
+    ] {
+        let path = dir.path().join(name);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (rec, handle) = start_recording(
+            Box::new(Scripted::new(vec![(None, block(0, 10))])),
+            &path,
+            SystemTime::now(),
+            None,
+        )
+        .unwrap();
+        let mut rec = rec.with_stop_flag(stop.clone());
+        let mut buf = vec![Complex32::new(0.0, 0.0); 64];
+        assert_eq!(rec.read(&mut buf).unwrap(), 10);
+        stop.store(stopping, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(rec.read(&mut buf).unwrap(), 0);
+        drop(rec);
+        match handle.finish(Duration::from_secs(5)) {
+            RecordingOutcome::Finished {
+                samples: 10,
+                reason,
+                ..
+            } => assert_eq!(reason, want, "{name}"),
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+}

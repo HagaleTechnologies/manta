@@ -117,7 +117,14 @@ described on the command line. Operator guide:
   replays to that report at every read size; rig-audio recordings (750 Hz
   at 48 kHz, 2600 Hz decimated to 6 kS/s) keep their passband, trusted band
   and guard and decode to one emitting track, as the live source does.
-- `crates/manta-cli/tests/iq_recording.rs` also: `decode` of a gapped
+- `crates/manta-cli/tests/iq_recording.rs` also: a fake KiwiSDR that hangs
+  up and comes back is recorded with its rate, centre, 10 kHz passband and
+  the outage as a gap record, and SIGINT finalizes it as `stopped` (the
+  recorder holds `run`'s stop flag, since a live source answers a stop
+  with EOF); SIGINT finalizes a looping replay's recording; a write failure
+  under `RLIMIT_FSIZE` leaves stdout identical, warns once and exits 1,
+  and in a two-input daemon leaves the other input's recording to finish;
+  `decode` of a gapped
   recording is identical on three runs and differs from its gap-free twin;
   a config-described headerless file runs like the flags; `oracle` reads a
   gap-free recording like its WAV and refuses a gapped one.

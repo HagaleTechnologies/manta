@@ -2004,6 +2004,7 @@ fn start_input_recording(
     src: Box<dyn IqSource>,
     path: &Path,
     start: std::time::SystemTime,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(Box<dyn IqSource>, manta_input::RecordingHandle)> {
     let (rec, handle) = manta_input::start_recording(
         src,
@@ -2018,7 +2019,7 @@ fn start_input_recording(
         path.display(),
         manta_input::metadata_path(path).display()
     ));
-    Ok((Box::new(rec), handle))
+    Ok((Box::new(rec.with_stop_flag(stop)), handle))
 }
 
 /// MAN-309: how long `run` waits for a recording to finalize at shutdown.
@@ -6672,7 +6673,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             let (src, recording) = match &record_iq {
                 Some(path) => {
                     let start = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
-                    let (src, handle) = start_input_recording(src, path, start)?;
+                    let (src, handle) = start_input_recording(src, path, start, stop.clone())?;
                     (src, Some(handle))
                 }
                 None => (src, None),

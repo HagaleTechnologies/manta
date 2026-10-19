@@ -378,3 +378,36 @@ fn bad_samples_are_totalled_across_segments() {
     let gapped = decode_source(&mut Gapped::new(parts, fs, center, 4096), &cfg).unwrap();
     assert_eq!(gapped.bad_samples, 4);
 }
+
+/// MAN-309: RTTY marked on both sides of a gap gives one report row per
+/// segment, timed on the source's clock, with distinct ids.
+#[test]
+fn rtty_rows_span_a_gap_with_distinct_ids() {
+    let (fs, center) = (96_000.0, 14_070_000.0);
+    let (mut iq, _) = manta_testkit::scene::render_scene(&[], fs, 25.0, Some(11)).unwrap();
+    manta_testkit::fsk::add_fsk(
+        &mut iq,
+        fs,
+        &manta_testkit::fsk::FskSpec {
+            mark_offset_hz: 15_000.0,
+            shift_hz: 170.0,
+            baud: 45.45,
+            snr_2500_db: 30.0,
+            text: "CQ TEST DE W1AW W1AW RYRYRY 599 001 ".into(),
+            start_s: 0.0,
+            watterson: None,
+            seed: 15_000,
+        },
+    );
+    let missing = 96_000u64;
+    let parts = vec![(None, iq.clone()), (Some(missing), iq.clone())];
+    let report = decode_source(
+        &mut Gapped::new(parts, fs, center, 4096),
+        &PipelineConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(report.rtty.len(), 2, "{:?}", report.rtty);
+    assert_ne!(report.rtty[0].id, report.rtty[1].id);
+    assert!(report.rtty[0].marked_sample_ts < iq.len() as u64);
+    assert!(report.rtty[1].marked_sample_ts >= iq.len() as u64 + missing);
+}

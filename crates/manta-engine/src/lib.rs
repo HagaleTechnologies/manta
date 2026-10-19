@@ -435,6 +435,22 @@ impl SourceBands {
     }
 }
 
+/// Appends `tm`'s marked RTTY signals to `rtty` (MAN-309): each segment's
+/// detector numbers its signals from 1, so a later segment's ids continue
+/// after the largest already reported. One segment's ids are unchanged.
+fn append_rtty(
+    rtty: &mut Vec<RttySignalReport>,
+    tm: &track::TrackManager,
+    calibration_factor: f64,
+) {
+    let base = rtty.iter().map(|r| r.id).max().unwrap_or(0);
+    rtty.extend(tm.rtty_signals().iter().map(|e| {
+        let mut row = RttySignalReport::from_entry(e, calibration_factor);
+        row.id += base;
+        row
+    }));
+}
+
 /// `decode_samples` over a source (MAN-119): reads `src` to EOF in
 /// `CHUNK_SAMPLES` chunks of the zero-padded stream and holds no copy of the
 /// input, so memory does not grow with the recording. Its output is identical
@@ -542,12 +558,7 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
             continue;
         };
         // Not `finish()`: an outage is not an end of signal (MAN-73).
-        rtty.extend(
-            seg.tm
-                .rtty_signals()
-                .iter()
-                .map(|e| RttySignalReport::from_entry(e, calibration_factor)),
-        );
+        append_rtty(&mut rtty, &seg.tm, calibration_factor);
         events.extend(seg.tm.finish_for_discontinuity());
         bad_samples += seg.ch.bad_samples();
         let base = seg
@@ -571,12 +582,7 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
             bad_samples_suffix(bad_samples)
         );
     }
-    rtty.extend(
-        seg.tm
-            .rtty_signals()
-            .iter()
-            .map(|e| RttySignalReport::from_entry(e, calibration_factor)),
-    );
+    append_rtty(&mut rtty, &seg.tm, calibration_factor);
     events.extend(if terminal_gap {
         seg.tm.finish_for_discontinuity()
     } else {

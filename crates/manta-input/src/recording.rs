@@ -88,6 +88,7 @@ pub struct RecordingSource<S: ?Sized> {
     inner: Box<S>,
     shared: Arc<Shared>,
     pending_gap: Option<u64>,
+    stop: Option<Arc<AtomicBool>>,
 }
 
 /// The completion side of a recording, kept outside the source.
@@ -219,6 +220,7 @@ fn start_with_sinks<S: IqSource + ?Sized>(
             inner,
             shared: shared.clone(),
             pending_gap: None,
+            stop: None,
         },
         RecordingHandle {
             path: path.to_path_buf(),
@@ -330,6 +332,13 @@ fn write_recording(
 }
 
 impl<S: ?Sized> RecordingSource<S> {
+    /// Finalizes as `stopped`, not `eof`, when the source ends after `stop`
+    /// is set: a live source answers a stop request with EOF.
+    pub fn with_stop_flag(mut self, stop: Arc<AtomicBool>) -> Self {
+        self.stop = Some(stop);
+        self
+    }
+
     /// Copies `samples` (and the gap before them) into the queue; on a full
     /// queue, stops the recording at the last accepted block.
     fn enqueue(&self, mut gap: Option<u64>, samples: &[Complex32]) {
@@ -400,7 +409,13 @@ impl<S: IqSource + ?Sized> IqSource for RecordingSource<S> {
         self.pending_gap = gap;
         self.enqueue(gap, &buf[..n]);
         if n == 0 {
-            if self.shared.reason.load(Ordering::Acquire) == REASON_STOPPED {
+            // A live source answers a stop request with EOF: that is a
+            // stopped session, not an input that ended.
+            let stopping = self
+                .stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(Ordering::Relaxed));
+            if !stopping && self.shared.reason.load(Ordering::Acquire) == REASON_STOPPED {
                 self.shared.reason.store(REASON_EOF, Ordering::Release);
             }
             self.shared.close();
