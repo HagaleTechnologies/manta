@@ -981,6 +981,16 @@ fn take_entry(
             band_plan::exact_khz(usable_hz)
         ));
     }
+    // MAN-310 (Codex review, PR #345): one absolute centre override cannot
+    // describe several differently tuned streams.
+    if n > 1 && t.center_freq_hz.is_some() {
+        return Err(format!(
+            "input.bands plans {} ({}), but input.center_freq_hz fixes one centre for all of \
+             them; drop center_freq_hz, or list bands that fit one stream",
+            band_plan::count_streams(n),
+            plan.band_list()
+        ));
+    }
     let shown = texts
         .iter()
         .map(|t| format!("\"{t}\""))
@@ -1503,6 +1513,33 @@ mod tests {
             Ok(_) => panic!("expected an error for {body:?}"),
             Err(e) => format!("{e:#}"),
         }
+    }
+
+    #[test]
+    fn a_multi_stream_plan_refuses_a_fixed_center() {
+        // MAN-310 (Codex review, PR #345): every generated stream would
+        // otherwise report the same overridden centre.
+        let err = err_of(
+            "[input]\ntype = \"kiwi\"\nhost = \"h\"\nbands = [\"60m\"]\n\
+             center_freq_hz = 5357000.0\n",
+        );
+        assert!(
+            err.contains("input.center_freq_hz fixes one centre for all of them"),
+            "{err}"
+        );
+        // One stream keeps the override.
+        let l = load_file(
+            "[input]\ntype = \"kiwi\"\nhost = \"h\"\nbands = [\"7030\"]\n\
+             center_freq_hz = 7030000.0\n",
+        )
+        .unwrap();
+        assert_eq!(l.inputs.len(), 1);
+    }
+
+    #[test]
+    fn a_tiny_soapy_rate_is_refused_without_materializing_the_plan() {
+        let err = err_of("[input]\ntype = \"soapy\"\nrate_hz = 0.001\nbands = \"all\"\n");
+        assert!(err.contains("more than 256 streams"), "{err}");
     }
 
     #[test]

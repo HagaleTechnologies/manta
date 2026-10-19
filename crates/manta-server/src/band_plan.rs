@@ -172,6 +172,12 @@ fn range_text(lo: f64, hi: f64) -> String {
     format!("{} to {} kHz", exact_khz(lo), exact_khz(hi))
 }
 
+/// The most streams one entry may plan. Far above any real plan ("all" on
+/// a Kiwi-width stream is 14), it bounds what [`plan`] materializes when a
+/// tiny stream width would otherwise split a band into millions of slices
+/// (MAN-310, Codex review PR #345).
+pub const MAX_PLANNED_STREAMS: usize = 256;
+
 /// Plans an entry's streams: each item's span clipped to the tuning range,
 /// split into `ceil(span / usable_width_hz)` equal slices centred on their
 /// midpoints (whole Hz), sorted by centre. Overlapping streams split the
@@ -281,6 +287,16 @@ pub fn plan(
             }
             let width = c_hi - c_lo;
             let n = ((width / usable_width_hz).ceil() as usize).max(1);
+            if streams.len().saturating_add(n) > MAX_PLANNED_STREAMS {
+                return Err(format!(
+                    "input.bands would plan more than {MAX_PLANNED_STREAMS} streams: a {} kHz \
+                     stream skims too little of {} ({}); raise the stream's rate or list fewer \
+                     bands",
+                    exact_khz(usable_width_hz),
+                    s.band,
+                    range_text(c_lo, c_hi)
+                ));
+            }
             let slice = width / n as f64;
             for i in 0..n {
                 streams.push(PlannedStream {
@@ -532,6 +548,17 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn a_tiny_stream_width_is_refused_before_materializing_the_plan() {
+        // MAN-310 (Codex review, PR #345): rate_hz = 0.001 on "all" would
+        // otherwise build hundreds of millions of streams.
+        let err = plan(&items(&["all"]), (0.0, 30e6), 0.001).unwrap_err();
+        assert!(
+            err.contains(&format!("more than {MAX_PLANNED_STREAMS} streams")),
+            "{err}"
+        );
     }
 
     #[test]

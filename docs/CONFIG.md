@@ -290,8 +290,12 @@ every stream of that receiver.
 **Capacity.** A kiwi entry opens one KiwiSDR channel per stream, within the
 receiver's free channels. An hpsdr or soapy entry opens one stream; a plan
 that needs more is refused naming it (several receivers on one HPSDR radio
-is MAN-307). All inputs together stay within manta's 16. ka9q, file and
-audio inputs do not take `bands`.
+is MAN-307). All inputs together stay within manta's 16, and one entry
+plans at most 256 streams before that check (a near-zero `rate_hz` is
+refused rather than split into millions of slices). A plan of several
+streams refuses `center_freq_hz`: one fixed centre cannot describe
+differently tuned streams. ka9q, file and audio inputs do not take
+`bands`.
 
 **CPU.** Each stream is one input thread with its own channelizer. At one
 Raspberry Pi 4 core per 192 kS/s stream, 14 streams at 96 kS/s need about
