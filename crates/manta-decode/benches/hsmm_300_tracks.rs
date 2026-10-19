@@ -30,8 +30,23 @@ fn envelope(hops: usize) -> Vec<f32> {
     (0..hops).map(|i| pat[i % pat.len()]).collect()
 }
 
+/// MAN-191: the continuous scene above never reaches the `10·u` Silence
+/// threshold (longest quiet stretch 39 hops), so the bench could not see
+/// the long-silence candidate load SPEC v2 §4.6's cadence governs. This
+/// scene keys ~3 s of the same pattern, drops the gate to 0.01 for 5 s
+/// (1,875 hops -- one full track-hang window of inter-transmission
+/// silence), then keys again to 10 s total.
+fn gappy_envelope() -> Vec<f32> {
+    let mut env = envelope(375 * 10);
+    for a in env.iter_mut().skip(375 * 3).take(375 * 5) {
+        *a = 0.01;
+    }
+    env
+}
+
 fn bench(c: &mut Criterion) {
     let env = envelope(375 * 10); // 10 s
+    let gappy = gappy_envelope();
     let mut g = c.benchmark_group("hsmm");
     g.throughput(Throughput::Elements((300 * env.len()) as u64));
     g.bench_function("300_tracks_10s", |b| {
@@ -48,6 +63,22 @@ fn bench(c: &mut Criterion) {
                 };
                 let mut d = TrackDecoder::new(id, cfg);
                 for (i, &a) in env.iter().enumerate() {
+                    total += d.push_envelope(a, i as u64 * 512).len();
+                }
+            }
+            total
+        })
+    });
+    g.bench_function("300_tracks_10s_gappy", |b| {
+        b.iter(|| {
+            let mut total = 0usize;
+            for id in 0..300u32 {
+                let cfg = DecodeConfig {
+                    engine: Engine::Hsmm,
+                    ..Default::default()
+                };
+                let mut d = TrackDecoder::new(id, cfg);
+                for (i, &a) in gappy.iter().enumerate() {
                     total += d.push_envelope(a, i as u64 * 512).len();
                 }
             }

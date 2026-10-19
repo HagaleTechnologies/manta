@@ -104,27 +104,48 @@ channel index; conversion to Hz happens only when a spot is emitted.
 
 ### 1.4 Fine frequency estimate (for ±10 Hz spot accuracy)
 
-Per hop, for a track with peak channel `k₀`:
+Per hop, for a track whose selected channel is `k₀`, two estimators run.
+
+**Ownership centroid** (§2.5) and the drift fitter's input (§2.8):
 
 - Quadratic interpolation on **dB** powers of `(k₀−1, k₀, k₀+1)`:
   `δ_m = 0.5·(P₋ − P₊) / (P₋ − 2P₀ + P₊)` where `P• = PdB[k₀•, m]`.
   Clamp `δ_m` to `[−0.5, +0.5]`; if the denominator ≥ 0 (no local max — a
   peak requires `P₋ − 2P₀ + P₊ < 0`), set `δ_m = 0` and mark the hop unusable.
-- Only **key-down** hops (§3.4) with `SNR ≥ 6 dB` contribute.
-- Track centroid: power-weighted running mean over the track lifetime:
-  `C = Σ (k₀ + δ_m)·P₀[m] / Σ P₀[m]` (accumulate in `f64`).
-- Spot frequency: `f_spot = f(0) + C·Δ` rounded to **0.01 kHz** for the
+- Centroid `C`: an EMA of `k₀ + δ_m` with α = 0.01 over the usable hops.
+
+**Spot frequency** (MAN-114): a power-weighted lag-1 phase estimator.
+
+- Only **key-down** hops (§3.4) with `SNR ≥ 6 dB` contribute. Each one, with
+  the previous hop `m−1` also available, gives
+  `z_m = X̃[k₀,m]·conj(X̃[k₀,m−1])·e^{jπ(k₀ mod 4)/2}`, where
+  `X̃[k,m] = X[k,m]·s(m,k)` and `s` is the odd-channel sign correction
+  (`odd_channel_sign_correction`: −1 when `m` and `k` are both odd). The
+  rotation puts every channel's product in one absolute frame: with
+  hop = N/4, a tone at channel position `p` gives `arg z_m = 2π·p/4`.
+  `z_m` is not normalised, so a hop weighs in by its power.
+- Track phase sum: `Z ← Z + α·(z_m − Z)`, α = 0.01, accumulated in `f64`.
+- Position `C_f = arg(Z)/2π · 4`, unwrapped to the value nearest the
+  centroid `C`. Until the first contributing hop (`Z = 0`), `C_f = C`.
+  The reported `C_f` uses `Z` as it stood before the last two unsuppressed
+  hops (the two a crash declared on the next hop rolls back, §2.7), so no
+  report carries a crash's onset hops.
+- Spot frequency: `f_spot = f(0) + C_f·Δ` rounded to **0.01 kHz** for the
   telnet output (MAN-88 — RBN's live feed carries 2 decimals of kHz; the
   previous one-decimal rounding discarded 10 Hz of the estimator's real
   precision), full precision (Hz) in the JSON stream.
 
-With ≥ 100 key-down hops (any real CW transmission) the estimator's standard
-error is ≪ 10 Hz; absolute accuracy is then bounded by the SDR's reference
-oscillator, which is out of scope (config `input.freq_correction_ppm` exists).
-`manta calibrate` measures it against a known carrier.
-This ≪ 10 Hz claim is empirically channel-table-size (N) dependent: it was
-measured at N = 1024 (the 96 kHz table V1 uses); V31's 48 kHz/N = 512 table
-measures ~17 Hz instead (see the V31 row below; tracked in issue #177).
+Both are live EMAs rather than a lifetime power-weighted mean
+(`Σ (k₀ + δ_m)·P₀[m] / Σ P₀[m]`): an undecayed lifetime mean of a drifting
+signal converges to the midpoint of its range and fails V9 (see
+`docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md` item 5).
+
+Absolute accuracy is bounded by the SDR's reference oscillator, which is out
+of scope (config `input.freq_correction_ppm` exists). `manta calibrate`
+measures it against a known carrier. The spot frequency's measured worst
+error across a channel is ≤ 4 Hz on all three tables (48, 96 and 192 kHz) at
++6 and +20 dB; the dB parabola it replaced measured up to 38 Hz, on every
+table (`docs/DECISIONS/2026-10-17-man114-phase-difference-spot-frequency.md`).
 
 ### 1.5 Decimation (variable-width capture, issue #169)
 
@@ -295,7 +316,8 @@ and §7's vector pass criteria are all unchanged and remain defined in
 
 ### 2.4 Track lifecycle state machine
 
-States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`.
+States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`, plus `DORMANT`
+between HANG and CLOSED for a track that has decoded (MAN-108).
 
 | Transition | Condition |
 |---|---|
@@ -305,13 +327,34 @@ States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`.
 | ACTIVE → HANG | drop condition met (below off threshold) |
 | HANG → ACTIVE | `S ≥ F + on_snr_db` again (hang timer reset) |
 | HANG → CLOSED | hang timer (5 000 ms) expires → decoder returned, final spots flushed |
+| HANG → DORMANT | hang timer expires on a track that has decoded a character while qualified, with `reacquire_ms > 0` (MAN-108) → decoder flushed exactly as a hang close flushes it, then released; `track_id`, centroid and ownership kept |
+| DORMANT → ACTIVE | rise sustained `confirm_hops` (19) consecutive hops on an owned channel within `reacquire_ms` (10 000 ms) → fresh decoder leased under the same `track_id`; no MAN-313 requalification, no new `TrackPromoted` |
+| DORMANT → CLOSED | `reacquire_ms` expires with no re-acquisition → closed as a hang expiry (`HangExpired`, `ClosureKind::SignalEnded`); nothing left to flush |
 | ACTIVE/HANG → CLOSED | **garbage collect:** no character emitted for 30 000 ms (`detector.gc_ms`) — carrier or non-CW signal; the channel is marked *suppressed* for 60 s (re-detection allowed but logged) |
-| any → CLOSED | eviction: track cap reached and this is the lowest-SNR track (counted in metrics, per ARCHITECTURE §4) |
-| ACTIVE/HANG/CANDIDATE → CLOSED | `round(c)` inside a marked RTTY signal's hard span (§2.6) → closed as bookkeeping (`CloseReason` `rtty`, counted) |
+| any → CLOSED | eviction: track cap reached and this is the lowest-SNR track (counted in metrics, per ARCHITECTURE §4); a DORMANT track's SNR is noise-level, so it goes first. Merging (§2.5) also applies to DORMANT tracks |
+| ACTIVE/HANG/DORMANT/CANDIDATE → CLOSED | `round(c)` inside a marked RTTY signal's hard span (§2.6) → closed as bookkeeping (`CloseReason` `rtty`, counted) |
 | ACTIVE/HANG → CLOSED | promoted but not qualified as keyed CW within `unkeyed_close_hops` of promotion (§2.8) → closed as bookkeeping (`CloseReason` `not_cw`, counted); no events, because no decoder was leased |
 | ACTIVE → CLOSED | qualified track key-down for `unkeyed_close_hops` with no re-rise, no decoded character and no callsign read (§2.8) → closed as bookkeeping (`CloseReason` `unkeyed`, counted), flushed like the garbage-collect close |
 
 All timers are hop-counted (integers), never wall-clock.
+
+**DORMANT (MAN-108).** A Watterson-faded signal can stay under the rise
+threshold for longer than the hang, and before MAN-108 each such fade
+closed the track and spawned a new one that paid warm-up, qualification
+and the validator's first-meta wait again. DORMANT keeps the identity
+instead. The `reacquirable` latch is set when a qualified track decodes a
+character, batch-granular like the GC reset (§2.8 G); a track that never
+decoded closes at the hang as before. While DORMANT no decoder runs, the
+garbage-collect timer holds, the centroid `c` and the spot-frequency
+phase sum `Z` (§1.4, MAN-114) are frozen (the frequency the track held is what re-acquisition matches on, so noise or a neighbour must
+not drag it), and the track keeps owning `{round(c) − 1, round(c),
+round(c) + 1}`. The wake rule is the same `confirm_hops` a fresh
+CANDIDATE needs, not a single rise hop: a single-hop wake was measured to
+lose word boundaries (the decoder is sensitive to its start hop, MAN-166).
+The decoder is fresh on wake: a decoder kept through the fade was
+measured to stay locked to the wrong speed. A woken track's wake counts as
+a re-rise for the §2.8 unkeyed close. `detector.reacquire_ms = 0` restores
+the pre-MAN-108 behaviour exactly.
 
 **Lazy lease (MAN-313).** With `detector.non_cw_filter = true` (the
 default) the lifecycle above is unchanged, but CANDIDATE → ACTIVE does not
@@ -327,10 +370,12 @@ channels. `non_cw_filter = false` leases at promotion, as before.
 On a hop where a static crash is suppressed (§2.7, `detector.crash_filter`
 `"full"` or `"starts-only"`), no IDLE → CANDIDATE transition happens, a
 CANDIDATE's lifecycle does not step (its confirm count neither advances
-nor resets), and ACTIVE/HANG tracks step on rise/drop recomputed from the
+nor resets), a DORMANT track's wake confirmation likewise does not step
+(neither advancing nor resetting) while its `reacquire_ms` window keeps
+aging, and ACTIVE/HANG tracks step on rise/drop recomputed from the
 gate's held `S[k]` (its value before the crash) against the current floor.
-The crash's energy therefore cannot confirm a candidate or turn a HANG
-track back to ACTIVE.
+The crash's energy therefore cannot confirm a candidate, finish a
+DORMANT track's wake, or turn a HANG track back to ACTIVE.
 
 ### 2.5 Adjacent-channel ownership (one signal ⇒ one track)
 
@@ -339,6 +384,8 @@ track back to ACTIVE.
   `{round(c) − 1, round(c), round(c) + 1}`.
 - A CANDIDATE in an owned channel is absorbed: no new track; ownership stays
   with the incumbent.
+- A DORMANT track (§2.4) keeps its ownership: its channels block spawns,
+  and a rise sustained there re-acquires it instead (MAN-108).
 - A rising, unowned channel `k` may start a spawn decision only if its
   smoothed power `S[k]` is ≥ both `S[k−1]` and `S[k+1]` (a local maximum;
   neighbours wrap). (MAN-172, see docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md)
@@ -348,6 +395,25 @@ track back to ACTIVE.
   cannot route around the veto. Spawns only: a track that already exists
   on an untrusted channel is never closed or de-weighted by it (MAN-196,
   the MAN-314 spawns-only lesson).
+- A channel inside the source's analytic guard may not start a spawn
+  decision either, in the same two slots: when `IqSource::analytic_guard_hz()`
+  (a real-to-analytic front end; `hilbert_guard_hz(48000)` = 600 Hz for
+  live audio, `0.0` for every complex-IQ source) or the internal
+  `DetectorConfig::guard_hz` is nonzero, the larger of the two masks every
+  channel whose whole band (`|f(k)| ± spacing/2`) lies below the guard
+  (DC rim) or above `fs/2 − guard` (Nyquist rim), where the Hilbert FIR does not guarantee
+  `HILBERT_MIN_IMAGE_REJECTION_DB`. 22 of 512 channels at 48 kHz. The
+  Nyquist rim never vetoes a channel inside a supplied trusted band: the
+  leak it guards sat at the analytic front end's input-rate Nyquist, which
+  a decimating source's stopband removes, so at a decimated rate the rim
+  would otherwise mask the top of the trusted band (`--capture-rate-hz`
+  6000 Hz on rig audio; at 1500 Hz it masked every channel). Spawns
+  only, as above. For such an analytic source, a spawn on `k` is also
+  refused while any channel within one of its mirror `(n − k) mod n` is
+  owned by a track or its raw `hop.power` is within 3 dB of `k`'s or
+  above it: real input has no negative frequencies, so the mirror holds
+  only `k`'s image (MAN-273, see
+  docs/DECISIONS/2026-10-16-man273-hilbert-image-guard.md).
 - A spawn decision at `k` is additionally rejected while *any* channel of
   the prospective ownership window `{k−1, k, k+1}` (neighbours wrap) is
   still serving a post-`Silent` respawn cooldown (§9's
@@ -539,7 +605,8 @@ where Q25 never fired.
 The hop's outputs are `suppress = in_crash and run_hops ≤ CRASH_MAX_HOPS`
 and `hold_decoder = in_crash and run_hops ≤ CRASH_HOLD_MAX_HOPS`. A crash
 begins on its third lifted hop, so its first two lifted hops are neither
-suppressed nor held; the decoder hold below reaches back past them.
+suppressed nor held; the decoder hold and the phase-sum rollback below
+reach back past them.
 A lift that outlasts `CRASH_MAX_HOPS` is a level change rather than a
 crash (a gain step, or input returning from silence): suppression ends,
 the reference unfreezes and tracks the new level, the lift falls back
@@ -569,6 +636,7 @@ manager does on a hop with `suppress` set:
 | CANDIDATE lifecycles do not step | no | yes | yes |
 | gate EMA `S[k]` held; rise/drop recomputed from the held `S[k]` against the current floor | no | yes | yes |
 | track centroids (§1.4, §2.5) not updated | no | yes | yes |
+| spot-frequency phase sum `Z` (§1.4) not updated, and on the hop the crash begins reset to its value before the two lifted hops that preceded it | no | yes | yes |
 | ACTIVE/HANG lifecycles step on the held rise/drop | no (live rise/drop) | yes | yes |
 | decoder input held at its pre-onset value (hops with `hold_decoder`) | no | no | yes |
 | spectral reference (`FloorBank`'s 40 ms linear-power EMA, SPEC-decode-core-v2 §2.2) held (hops with `hold_decoder`) | no | no | yes |
@@ -659,6 +727,10 @@ Constants (compile-time; `COMOD_*` in `manta-dsp::comod`, the rest in
 | `ISO_DB` | 6.0 | flat-neighbourhood threshold |
 | `ISO_MIN_FRACTION` | 0.5 | smallest qualifying non-flat fraction |
 | `MAX_UNQUALIFIED_BACKLOG` | 7500 | most queued demod inputs an unqualified track keeps (20 s) |
+| `SHORT_MIN_MARKS` | 3 | D′: fewest debounced keyed marks in the queued input |
+| `SHORT_MARK_DEBOUNCE_HOPS` | 4 | D′: key-down/key-up run debounce for a keyed mark |
+| `SHORT_HYST_FRAC` | 0.15 | D′: keyed-marks hysteresis half-band, fraction of the Q10–Q90 gap |
+| `SHORT_MIN_KEYING_RATIO` | 2.0 | D′: Q90/Q10 ratio the queued input must show at all |
 
 **A. Lazy lease.** At CANDIDATE → ACTIVE the track records its promotion
 hop, `sample_ts` and `freq_hz`, queues the promotion burst, and from then
@@ -681,6 +753,9 @@ cannot decode a character; `NotCw` (D) bounds its life instead.
 - `cycles += 1` on each HANG → ACTIVE whose preceding ACTIVE run lasted
   ≤ `MAX_MARK_HOPS`.
 - `active_hops` += 1 on each ACTIVE hop; reset to 0 at each evaluation.
+- `dropped_since_eval` (MAN-271) is set on each ACTIVE → HANG and cleared
+  at each evaluation, so D′ can fire only at the first evaluation after a
+  drop.
 - A **key-down hop** is one with `PdB[k] − F_eff[k] ≥ on_snr_db`, `k` the
   track's selected channel (§2.5). On it, until the track qualifies:
   - **Slope:** accumulate `n, Σt, Σf, Σt², Σtf` in `f64`, with
@@ -742,6 +817,54 @@ A track not qualified `unkeyed_close_hops` after its promotion closes
 `CloseReason::NotCw` (`ClosureKind::Bookkeeping`, `CloseCounts::not_cw`).
 It has no decoder, so it emits nothing. Its channels get the MAN-171
 respawn cooldown.
+
+**D′. Short-transmission qualification** (MAN-271,
+docs/DECISIONS/2026-10-16-man271-short-transmission-decode.md). A second
+way to qualify, checked at the same evaluations as D. A single short
+transmission — one 2-character exchange at contest speed — can never show
+`cycles ≥ 1` (its whole message is one ACTIVE run bridged by the gate's
+40 ms EMA, and it never re-rises) nor span `KEYDOWN_SPAN_MIN_HOPS`. At the
+first evaluation after an ACTIVE → HANG drop, a promoted, unqualified
+track qualifies when all hold:
+
+- the track's state is HANG and it dropped ACTIVE → HANG since the
+  previous evaluation (`dropped_since_eval`);
+- `active_run ≤ MAX_MARK_HOPS` (the drop ends one mark, not a carrier);
+- `!in_span(k)` and `!comodulated_with_span(k)`, exactly as D;
+- key-down hops `n ≥ SLOPE_MIN_SAMPLES`;
+- `|slope| ≤ MAX_SWEEP_HZ_PER_S · (KEYDOWN_SPAN_MIN_HOPS / max(t_last,
+  1))^1.5` when `t_last < KEYDOWN_SPAN_MIN_HOPS`, else
+  `MAX_SWEEP_HZ_PER_S`: a least-squares slope's standard error over
+  evenly keyed samples grows as span^−1.5, so the short-span tolerance
+  scales to keep the 150-hop reference span's noise margin;
+- non-flat fraction ≥ `ISO_MIN_FRACTION`, exactly as D;
+- **keyed marks ≥ `SHORT_MIN_MARKS`**, counted from the track's queued
+  input (§2.8 A's `pending` amplitudes — never drained before
+  qualification, so the count is deterministic and chunk-size invariant):
+
+  1. Rails: nearest-rank Q90 and Q10 over the queued amplitudes (Q10
+     floored at 1e-12; `f32::total_cmp` selection). No mark at all is
+     counted when `Q90 < SHORT_MIN_KEYING_RATIO · Q10` — flat input is
+     unkeyed.
+  2. Threshold `mid = (Q90 + Q10)/2` with hysteresis
+     `±SHORT_HYST_FRAC · (Q90 − Q10)`: while key-down, go key-up below
+     `mid − half`; while key-up, go key-down above `mid + half`.
+  3. A key-down (or key-up) run counts once it reaches
+     `SHORT_MARK_DEBOUNCE_HOPS` hops; a key-up run shorter than that is a
+     dip inside a mark, not a gap between two marks. These are Demod's
+     own §3.2/§3.3 shapes, so "a mark" means what the leased decoder will
+     see.
+
+  A swept carrier crossing one channel is a single smooth bump and counts
+  one mark; a real short CW message counts its dits and dahs. This is the
+  measured discriminator that lets D′ waive `cycles` and `t_last` safely.
+  The count is computed only at an evaluation where the track is in HANG
+  with `dropped_since_eval` set — one quantile selection over the bounded
+  queue per drop, nowhere else.
+
+Qualification through D′ leases the decoder, replays the queue and emits
+the deferred `TrackPromoted` exactly as D does. A track still unqualified
+at end of input is dropped with no events, unchanged.
 
 **E. Spawn veto.** A spawn decision at `k`, and the same-hop `k+1`
 pairing (§2.5), is vetoed while `in_span(k)`, next to the RTTY veto
@@ -924,6 +1047,21 @@ Special case: an all-dah opening (plausible for `CQ` at the margin) corrects
 itself via the constraint clamp below the first time a real dit arrives —
 the dit falls far below `μ_dit`, gets assigned to the dit cluster, drags it
 down, and the clamp re-anchors `μ_dah`.
+
+**[DEVIATION] (MAN-271)** — at a **genuine end-of-signal** `finish()`
+(stream EOF, or a HangExpired/Silent closure, where a sustained real
+on-air gap has been observed), a tracker that saw **2–4 marks**
+initializes from them with exactly the split rule above, and the runs
+buffered while the quorum was unfilled replay through the ordinary
+pipeline; the trailing truncated space teaches the sender timing nothing
+(same rule as `finish`'s MAN-315 truncation handling). Without this, a
+short single transmission (2-character text at 34–39 WPM, whose leading
+element is consumed before the decoder exists) ends with zero decoded
+characters. `finish_speed_only` — the bookkeeping close path
+(Merged/Evicted) — never bootstraps: fabricating characters there was the
+PR #154 defect. One mark carries no ratio to split and bootstraps
+nothing; `Hsmm`, which never feeds `SpeedTracker`, is unaffected. See
+docs/DECISIONS/2026-10-16-man271-short-transmission-decode.md.
 
 **Update** — per mark of duration `d`: assign to the nearer cluster in log
 space (i.e. `dit` iff `d < B`), then EMA the assigned centroid:
@@ -1324,7 +1462,8 @@ TrackClosed    { track_id, closure: SignalEnded
                  `closure` kind says what a consumer holding deferred
                  per-track evidence, such as manta-spot's pending Beacon
                  candidates (§4 amendment), does with it:
-                   SignalEnded — `HangExpired`, or end of stream
+                   SignalEnded — `HangExpired` (including a DORMANT
+                     track's expiry, §2.4), or end of stream
                      (`finish()`): the signal is gone; deferred evidence
                      is judged now.
                    Bookkeeping { survivor_track_id: Some(s) } — `Merged`:
@@ -1336,7 +1475,14 @@ TrackClosed    { track_id, closure: SignalEnded
                      including a stop while the source is down (MAN-258):
                      tracking stopped with no successor; deferred evidence
                      is discarded and counted.
-                 Missing in JSON, `closure` defaults to `SignalEnded`.)
+                 Missing in JSON, `closure` defaults to `SignalEnded`.
+                 MAN-108: a DORMANT track (§2.4) that re-acquires its
+                 signal keeps its track_id and emits no TrackClosed or
+                 TrackPromoted for the fade; its TrackMeta/SpeedUpdate/
+                 TimingUpdate sequence restarts from a fresh decoder
+                 (TrackMeta resumes once the new demod has initialised,
+                 about 1 s). TrackClosed is still emitted once, at the
+                 track's real close.)
 TimingUpdate   { track_id, sample_ts: u64, dit_ms: f32, dot, dash, element_gap,
                  char_gap, word_gap }  (added post-freeze, MAN-315 — the
                  track's §4.1b sender timing; each class is
@@ -1465,16 +1611,18 @@ in the fixture manifest. Text payload (unless stated):
 | V8w | pileup-50-fading | same scene as V8 | Watterson CCIR-poor, jitter 8 % | ≥ 90 % of signals with mean SNR ≥ +6 dB decoded with CER < 10 %; 0 bogus callsigns; 0 cross-channel ghost decodes |
 | V9 | drift | 18 WPM, +12 dB, drift +50 Hz/min, EA8AAA | AWGN | 1 track (no split); char ≥ 90 %; final freq tracks within 15 Hz |
 | V10 | farnsworth | 15 WPM chars / 25 WPM char-speed (Farnsworth), +15 dB, G4XXX | AWGN | char ≥ 95 %; word boundaries 100 % correct |
-| V31 | decimated-clean-20 | Same scene as V1 (20 WPM, +20 dB, offset +12.34 kHz, W1AW), synthesized at 192 kHz then decimated to 48 kHz via `manta_dsp::decimate::Decimator` | AWGN only, no jitter | char ≥ 98%; 1 track; freq error ≤ 25 Hz |
+| V31 | decimated-clean-20 | Same scene as V1 (20 WPM, +20 dB, offset +12.34 kHz, W1AW), synthesized at 192 kHz then decimated to 48 kHz via `manta_dsp::decimate::Decimator` | AWGN only, no jitter | char ≥ 98%; 1 track; freq error ≤ 10 Hz |
+| V34 | fade-good-reacquire | 20 WPM, +3 dB, offset +9.1 kHz, W1AW, 120 s; fade seed `0x0BAD`, noise seed `0x4D41_4E01_3B95` (MAN-108) | Watterson CCIR-good, no jitter | 1 promoted track within 300 Hz; W1AW spotted, every W1AW spot on that track; CER ≤ 0.20; with `detector.reacquire_ms = 0` the same WAV promotes ≥ 2 tracks (the scene still fades past the hang) |
 | V51 | drift-refine | Same scene as V9 (18 WPM, +12 dB, drift +50 Hz/min, EA8AAA), decoded with `decode.refine_bw_hz = 30` (the narrowband refiner, MAN-168/MAN-194) via a `--config` TOML | AWGN only, no jitter (as V9) | 1 track (no split); char ≥ 90 %; final freq within 15 Hz; the refine-on report differs from the refine-off control (the config reaches the pipeline) |
 
-V31's freq-error bound (25 Hz) differs from V1's (10 Hz) because the fine-
-frequency estimator's error is channel-table-size dependent, not a
-`Decimator` regression: measured ~17.4 Hz at the decimated path's N = 512
-table size vs. V1's N = 1024 (96 kHz) table. Confirmed by two no-decimator
-control renders of the same scene -- native 48 kHz and native 192 kHz both
-independently measure a similar ~15-17 Hz error with zero decimator
-involvement (see `crates/manta-cli/tests/golden_decimated_capture.rs`).
+V31's freq-error bound was 25 Hz until MAN-114. The dB-parabola spot
+frequency measured ~17.4 Hz here, and ~15-17 Hz on native 48 kHz and 192 kHz
+control renders of the same scene, which was read as a channel-table-size
+effect. MAN-114 found it is not: the error depends on the signal's
+fractional position inside its channel plus AWGN on the parabola's weak
+neighbour bin, and every table shows it (V1 and V31 share the +12.34 kHz
+offset, so the same fractional position). The §1.4 phase estimator measures
+1.4 Hz on V31 (`crates/manta-cli/tests/golden_decimated_capture.rs`).
 
 V51 (MAN-210) gates the narrowband refiner's refine-enabled path
 (`Track::decoder_input`'s delay-compensated hold-back/drain, MAN-194)
@@ -1660,6 +1808,8 @@ rtty_dwell_ms = 20000   # 7500 hops; whole 1 s blocks
 # MAN-313: non-CW rejection, §2.8. unkeyed_close_ms >= 1000.
 non_cw_filter = true
 unkeyed_close_ms = 10000.0   # 3750 hops; qualification timeout and unkeyed close
+# MAN-108: DORMANT re-acquisition window after hang_ms, §2.4. 0 = off.
+reacquire_ms = 10000         # 3750 hops
 # floor_quantile = 0.25       # not configurable yet: compile-time constant in manta-dsp::floor
 # floor_window_ms = 10000     # not configurable yet: compile-time constant in manta-dsp::floor
 # block_channels = 32         # not configurable yet: compile-time constant in manta-dsp::floor

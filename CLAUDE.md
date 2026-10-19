@@ -42,12 +42,25 @@ read as `599`) and a sticky `QRL?` flag, scanned per completed word by
 carry the loser's annotations (D5). SPEC §7.1 V32/V33. See
 docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md.
 
+MAN-273: the live-audio Hilbert FIR is 511 taps (sparse over its 256
+nonzero taps; >= 70 dB image rejection over [600, 23400] Hz at 48 kHz),
+and `AudioIqSource` declares `IqSource::analytic_guard_hz()` = 600 Hz,
+which spawn-vetoes the DC and Nyquist rims (22 of 512 channels at
+48 kHz, spawns only, like MAN-196). Tones below ~515 Hz (or as close to
+Nyquist) start no track through rig audio; 600 Hz still does. Testkit
+fixtures keep the 129-tap `HILBERT_TAPS_M1_LEGACY`, so no golden vector
+moves. An analytic source
+also vetoes spawns on the mirror `(n - k) % n` of an owned or stronger
+channel (raw power, 3 dB margin): the FIR strips negative-side noise as
+deeply as the image, so the image cleared its floor. See
+docs/DECISIONS/2026-10-16-man273-hilbert-image-guard.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` (start here, by audience); `README.md` (goals, install)
 - `ARCHITECTURE.md` — 9-crate workspace, data flow, component design
 - `docs/SPEC-decode-core.md` — the algorithm spec to implement from. §7 has
-  the golden vectors: V1–V10, V31 and V51 (decode), V11–V30 and V38–V50
+  the golden vectors: V1–V10, V31, V34 and V51 (decode), V11–V30 and V38–V50
   (validator), VC1–VC3, VW1–VW5; `docs/SPEC-decode-core-v2.md` §8.2 has
   VR1–VR8.
 - `ROADMAP.md` — milestones M0–M4 with acceptance criteria

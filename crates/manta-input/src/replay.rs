@@ -86,6 +86,11 @@ impl IqSource for PacedSource {
         self.inner.trusted_band_hz()
     }
 
+    /// MAN-273: forwarded with `trusted_band_hz`.
+    fn analytic_guard_hz(&self) -> f64 {
+        self.inner.analytic_guard_hz()
+    }
+
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
         // The clock starts before the inner read: the time the inner source
         // spends producing this buffer is part of the recording's interval.
@@ -171,6 +176,11 @@ impl IqSource for LoopingSource {
     /// band) is the same on every pass.
     fn trusted_band_hz(&self) -> Option<(f64, f64)> {
         self.inner.trusted_band_hz()
+    }
+
+    /// MAN-273: forwarded with `trusted_band_hz`.
+    fn analytic_guard_hz(&self) -> f64 {
+        self.inner.analytic_guard_hz()
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {

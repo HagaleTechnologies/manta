@@ -17,7 +17,12 @@ copying speed for a first pass.
    (sound card line-in, USB audio interface, or a rig with built-in USB
    audio CODEC).
 2. Tune to a W1AW code-practice frequency/time slot, confirm you can hear
-   clean CW in your normal audio monitoring path first.
+   clean CW in your normal audio monitoring path first. Set the sidetone
+   (CW pitch) to 600 Hz or higher: tones below about 515 Hz, or as close
+   to Nyquist (24 kHz at 48 kHz), start no track through rig audio,
+   because the Hilbert front end's image rejection is not guaranteed there
+   ([MAN-273](../DECISIONS/2026-10-16-man273-hilbert-image-guard.md)). A
+   400–500 Hz sidetone decodes nothing.
 3. `cargo run --release -p manta-cli -- listen --device <your interface name>`
    (omit `--device` to use the system default input; run
    `cargo run -p manta-cli -- listen --device nonexistent` first if

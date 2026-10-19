@@ -140,6 +140,17 @@ pub trait IqSource {
     fn trusted_band_hz(&self) -> Option<(f64, f64)> {
         None
     }
+    /// MAN-273: offset from DC (and, symmetrically, from Nyquist) inside
+    /// which this source's spectrum is not trustworthy, in Hz. Non-zero
+    /// only for sources that build an analytic signal from real input:
+    /// `AudioIqSource`'s Hilbert FIR leaks a real tone's negative-frequency
+    /// image near DC and Nyquist, and the detector would spawn tracks on
+    /// that leak. Complex-IQ sources (files, SoapySDR, KiwiSDR, HPSDR,
+    /// ka9q-radio) keep the default `0.0`: their channel 0 is a real RF
+    /// frequency. `listen` vetoes spawns there, as for `trusted_band_hz`.
+    fn analytic_guard_hz(&self) -> f64 {
+        0.0
+    }
     /// Fill `buf`, returning the number of samples written; 0 = EOF.
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize>;
 
@@ -446,6 +457,17 @@ mod tests {
         assert_eq!(src.center_freq_hz(), 14_000_000.0);
         let all = read_all(&mut src).unwrap();
         assert_eq!(all, samples());
+    }
+
+    #[test]
+    fn analytic_guard_defaults_to_zero_for_complex_iq_sources() {
+        // MAN-273: a complex-IQ file has no Hilbert stage; channel 0 is a
+        // real RF frequency and must not be guarded.
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("fix.wav");
+        write_f32_wav(&wav, &samples(), 96_000);
+        let src = WavIqSource::open(&wav).unwrap();
+        assert_eq!(src.analytic_guard_hz(), 0.0);
     }
 
     #[test]

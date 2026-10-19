@@ -33,17 +33,12 @@ fn v1_lite_decodes_end_to_end() {
     };
     let (iq, texts) = render_scene(std::slice::from_ref(&sig), 96_000.0, 20.0, Some(1)).unwrap();
     let report = decode_samples(&iq, 96_000.0, 14_000_000.0, &PipelineConfig::default()).unwrap();
-    // Re-measured (Task 11 Step 3) against SPEC's original 10 Hz: this 20 s
-    // scene measures 11.51 Hz, deterministic (reproduced identically across
-    // 3 runs) -- just over SPEC's original bound, unlike golden_v1.rs's
-    // full 120 s V1 gate (which now clears 10 Hz: more signal time gives
-    // Task 9's EMA freq estimate more room to converge). Partially
-    // tightened to 15 Hz rather than fully reverted or left at the old
-    // 25 Hz -- gives real (~30 %) margin over the measured 11.51 Hz without
-    // claiming a bound this shorter scene doesn't reliably clear. See
-    // docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md.
+    // SPEC's 10 Hz. This 20 s scene sits 0.627 channels from centre, where
+    // the dB-parabola spot frequency measured 11.51 Hz and forced a 15 Hz
+    // bound; MAN-114's phase estimator measures +1.53 Hz here. See
+    // docs/DECISIONS/2026-10-17-man114-phase-difference-spot-frequency.md.
     assert!(
-        (report.freq_hz - 14_012_340.0).abs() <= 15.0,
+        (report.freq_hz - 14_012_340.0).abs() <= 10.0,
         "freq {} off by {}",
         report.freq_hz,
         (report.freq_hz - 14_012_340.0).abs()

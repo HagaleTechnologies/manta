@@ -202,6 +202,24 @@ fn swept_carrier_7000_to_7040_starts_no_cw_track() {
     assert!(offp.len() > 100, "the scene no longer exercises the bug");
 }
 
+/// MAN-271: a 1000 Hz/s sweep crossing the band looks, in any one channel,
+/// like a single smooth bump -- exactly the shape a short-transmission
+/// rule (SPEC §2.8 D′) could mistake for one long keyed mark. The
+/// keyed-marks count is what rejects it: a naive D′ without that check
+/// promoted 13 tracks in this scene. The full D′ keeps zero, and the
+/// decode errors with no keyed CW in the input (asserted inside
+/// `promotions_and_spots`).
+#[test]
+fn single_channel_sweep_bumps_do_not_qualify_as_short_transmissions() {
+    let iq = sweep_scene(1_000.0, 20.0, 5.0, 22.0);
+    let (on, _) = promotions_and_spots(&iq, SWEEP_CENTER, &PipelineConfig::default());
+    println!(
+        "1000 Hz/s sweep with 5 ms ramp, filter on: {} TrackPromoted",
+        on.len()
+    );
+    assert!(on.is_empty(), "{on:?}");
+}
+
 #[test]
 fn cw_next_to_ssb_is_decoded_and_spotted() {
     let cw_hz = CENTER + 43_000.0;

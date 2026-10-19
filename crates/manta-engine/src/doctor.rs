@@ -321,6 +321,7 @@ impl IqSource for SampleBoundedSource {
         self.inner.trusted_band_hz()
     }
 
+<<<<<<< HEAD
     // MAN-305: forward both gap hooks, as `listen()` reads them. With the
     // trait defaults `doctor` would splice an outage it was told about and
     // time spots after a short loss early by the lost samples.
@@ -330,6 +331,11 @@ impl IqSource for SampleBoundedSource {
 
     fn take_missing_samples(&mut self) -> Option<u64> {
         self.inner.take_missing_samples()
+=======
+    /// MAN-273: forwarded with `trusted_band_hz`.
+    fn analytic_guard_hz(&self) -> f64 {
+        self.inner.analytic_guard_hz()
+>>>>>>> a1761da5598d5f338c00da0dc6faa3578d5b7bf2
     }
 }
 

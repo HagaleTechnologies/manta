@@ -303,7 +303,27 @@ clamped to `[7.5, 56]` hops (60…8 WPM). `WGap`/`Silence` do not update
 
 At each anchor `t` (ascending), with `A(t)` the set of earlier anchors
 `s` with `t − s ≤ 1.5 · 7 · u_max_live` (and up to `80·u` for `Silence`,
-sampled every `round(u)` hops):
+sampled every `round(u)` hops — exactly: for origin anchor `s`, token
+`τ` with `d = t − s` and `d_prev` the same distance at the previous
+anchor step, evaluate `Silence` iff `d ≥ 10·u` and one of (a) `d ≤
+1.5·7·u_max_live` (inside the normal reach: not sampled); (b) `d_prev <
+10·u ≤ d` (the first crossing of the prior's lower bound is always
+evaluated); (c) a sample point `10·u + m·round(u)`, `m ≥ 1`, falls in
+`(d_prev, d]`; (d) the `(s, index-of-τ)` pair produced the best
+`Silence` candidate of its merge key `round(2·u)` at the previous
+productive anchor step, whether or not that candidate won its key or
+survived the beam ("hot carry", at most one pair per key); or (e) that
+key's carried pair produces no candidate at `t` (it passed `80·u`, or
+its anchor aged out), in which case every pair of the key is evaluated
+at `t`. The ranking of `Silence` candidates is invariant in `t`
+(`C[t]` cancels between origins), and a pair can only start producing
+through (a) or (b), so (d) and (e) keep each key's best `Silence`
+candidate evaluated: the merged beam is the one evaluating every
+origin at every step gives, up to `f32` rounding of near-tied scores
+(the evidence term is rounded per step, so two candidates within a
+rounding step can swap order). Candidates evaluated late under (e) keep
+their place in step 1's enumeration order for §6 ties; see
+`docs/DECISIONS/2026-10-14-man191-silence-cadence.md`):
 
 1. For each `s ∈ A(t)` ascending, for each token `τ` alive at `s` in
    ascending stored order, for each segment type valid for `τ.phase`,
@@ -516,4 +536,8 @@ worst case for 300 simultaneously keying tracks**, typically a third of
 that (most tracks are idle or slow). §1–§2 add < 40 op per hop per track
 (≈ 4.5 MFLOP/s for 300 tracks). Criterion bench `hsmm_300_tracks` gates
 this; `beam` and `fallback_hops` are the knobs if the Pi 4 leg needs
-them.
+them. §4.6's `Silence` cadence (MAN-191) measured −77 %/−66 % Silence
+evaluations on V3/V8 and −36 % gap-phase evaluations on the synthetic
+long-gap scene, while all 25 golden vectors decode byte-identically to
+evaluating every origin at every step; the `hsmm/300_tracks_10s_gappy`
+scene covers the long-silence path.
