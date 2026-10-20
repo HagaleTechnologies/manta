@@ -10,6 +10,7 @@
 use std::net::{TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn manta() -> Command {
@@ -39,28 +40,117 @@ fn silent_48k_wav(dir: &Path, seconds: u32) -> PathBuf {
     path
 }
 
-/// A port nothing listens on right now (bound, read, released).
+/// The private band every "nothing is here" port below is drawn from:
+/// 20000-20255. It sits below the kernel's ephemeral range on every
+/// default (Linux starts at 32768, macOS and Windows at 49152), so no
+/// sibling test's `bind(…, 0)` — which the OS feeds from that ephemeral
+/// pool — can ever be handed a number this file has handed out, and
+/// nothing else in the suite binds this band (MAN-333). A runner that
+/// runs test *binaries* in parallel (cargo-nextest, unused in this repo)
+/// would run this binary twice at once and needs a per-binary offset
+/// into the band.
+const BAND_START: u16 = 20_000;
+const BAND_LEN: u16 = 256;
+
+/// Allocation state for the band: a monotonic cursor, so each band port
+/// is issued at most once per process, behind a process-global mutex.
+struct Band {
+    next: u16,
+    range_checked: bool,
+}
+
+static BAND: Mutex<Band> = Mutex::new(Band {
+    next: 0,
+    range_checked: false,
+});
+
+impl Band {
+    /// Fail loudly, once, if this host's ephemeral port range reaches into
+    /// the band: a widened range would hand `bind(…, 0)` ports inside the
+    /// band and silently reintroduce the race the band exists to remove.
+    /// Linux states its range in `/proc/sys/net/ipv4/ip_local_port_range`;
+    /// macOS and Windows default to 49152-65535, far above the band, and
+    /// are not checked.
+    fn check_ephemeral_range_once(&mut self) {
+        if self.range_checked {
+            return;
+        }
+        self.range_checked = true;
+        #[cfg(target_os = "linux")]
+        {
+            let text = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+                .expect("read /proc/sys/net/ipv4/ip_local_port_range");
+            let ends: [u32; 2] = text
+                .split_whitespace()
+                .map(|t| t.parse().expect("ip_local_port_range endpoint"))
+                .collect::<Vec<_>>()
+                .try_into()
+                .expect("ip_local_port_range holds two numbers");
+            let [lo, hi] = ends;
+            let band_lo = u32::from(BAND_START);
+            let band_hi = band_lo + u32::from(BAND_LEN) - 1;
+            assert!(
+                hi < band_lo || lo > band_hi,
+                "this host's ephemeral port range {lo}-{hi} overlaps the test port band \
+                 {band_lo}-{band_hi}: move the band out from under it"
+            );
+        }
+    }
+}
+
+/// The next unissued band port whose `free` probe succeeds. Candidates a
+/// foreign listener already holds are skipped (bind errors, including the
+/// port ranges Windows excludes); a port is never issued twice, so two
+/// tests in this binary cannot be handed the same number. Exhaustion
+/// panics: one full binary run needs 26 ports (8 `Setup` tests × 3, one
+/// uplink, one NTP), so the 256-port band holds ~10× headroom.
+fn next_band_port(free: impl Fn(u16) -> bool) -> u16 {
+    let mut band = BAND.lock().unwrap();
+    band.check_ephemeral_range_once();
+    loop {
+        if band.next >= BAND_LEN {
+            panic!(
+                "test port band {}-{} exhausted",
+                BAND_START,
+                BAND_START + BAND_LEN - 1
+            );
+        }
+        let port = BAND_START + band.next;
+        band.next += 1;
+        if free(port) {
+            return port;
+        }
+    }
+}
+
+/// A TCP port nothing listens on for this test (see `free_ports`).
 fn free_port() -> u16 {
     let [port] = free_ports();
     port
 }
 
-/// `N` distinct ports nothing listens on right now. All `N` listeners are
-/// held until every port is read: releasing each before binding the next
-/// lets the OS hand the same port out twice (Windows does, and then the
-/// config is rejected as "two servers cannot share a port").
+/// `N` distinct TCP ports nothing listens on. They come from the private
+/// band above — distinct by construction (one cursor under one mutex
+/// hands out each port at most once, where a released ephemeral port can
+/// be handed straight to the next `bind(0)`, as Windows does), and never
+/// from the kernel's ephemeral pool, so no concurrently running test can
+/// claim one between allocation and the moment `manta doctor` probes it.
+/// Holding a socket instead cannot express "nothing here": a
+/// listening-but-never-accepted socket still accepts connections, and a
+/// held listener is exactly what doctor's own bind probe reports as
+/// already in use.
 fn free_ports<const N: usize>() -> [u16; N] {
-    let held: [TcpListener; N] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
-    held.map(|l| l.local_addr().unwrap().port())
+    std::array::from_fn(|_| next_band_port(|p| TcpListener::bind(("127.0.0.1", p)).is_ok()))
 }
 
-/// A UDP port nothing answers on, for an NTP server that refuses.
+/// A UDP port nothing answers on, for an NTP server that refuses — same
+/// band contract as `free_ports`, so the port stays unanswered until the
+/// check runs. The socket is not held: a bound-but-unread UDP socket
+/// swallows the request and would cost doctor's clock check its full 3 s
+/// budget where nothing bound gets the instant ICMP refusal this test
+/// wants.
 fn closed_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    next_band_port(|p| UdpSocket::bind(("127.0.0.1", p)).is_ok())
 }
 
 const NTP_UNIX_OFFSET: f64 = 2_208_988_800.0;
@@ -655,4 +745,34 @@ fn strict_keeps_exit_1_for_a_failed_check() {
     );
     assert!(stdout.contains("FAIL  clock: "), "{stdout}");
     assert!(stdout.contains("verdict: NO_SIGNAL"), "{stdout}");
+}
+
+/// MAN-333 scenario 2: tests drawing "nothing here" ports concurrently
+/// never collide — every port comes from the band, is issued at most once
+/// per process, and stays clear of the kernel's ephemeral pool.
+#[test]
+fn concurrent_port_handouts_are_distinct_and_inside_the_band() {
+    const THREADS: usize = 8;
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            std::thread::spawn(|| {
+                let trio = free_ports::<3>();
+                let tcp = free_port();
+                let udp = closed_port();
+                [trio[0], trio[1], trio[2], tcp, udp]
+            })
+        })
+        .collect();
+    let mut ports = Vec::new();
+    for handle in handles {
+        ports.extend(handle.join().unwrap());
+    }
+    let band = BAND_START..BAND_START + BAND_LEN;
+    for &port in &ports {
+        assert!(band.contains(&port), "{port} outside the band");
+    }
+    let total = ports.len();
+    ports.sort_unstable();
+    ports.dedup();
+    assert_eq!(ports.len(), total, "a port was handed out twice");
 }
