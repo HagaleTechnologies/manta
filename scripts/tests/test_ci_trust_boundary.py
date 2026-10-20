@@ -1,6 +1,7 @@
 """Static checks for the MAN-243 CI trust boundary (which PR revisions may run in main's context,
-which runs may write the shared build cache, and that release builds start cold), and for
-MAN-245's one Dependabot classification across the gate workflows.
+which runs may write the shared build cache, and that release builds start cold), for MAN-245's
+one Dependabot classification across the gate workflows, and for MAN-340's dispatched-tree merge
+(a dispatched run tests the PR head merged with the main commit its workflow file came from).
 
 stdlib unittest only -- PyYAML is not available on every runner -- so workflows are read as text.
 Run: python3 -m unittest scripts.tests.test_ci_trust_boundary -v
@@ -409,6 +410,294 @@ class CiFullNativePathTests(unittest.TestCase):
         self.assertEqual(field(matches[0], "if"), "runner.os != 'Windows'")
 
 
+# MAN-340: a dispatched run merges github.sha -- the main commit its workflow file came from --
+# into the PR head before any other step of ci-full.yml's test jobs.
+MERGE_STEP_ID = "merge-main"
+MERGE_STEP_NAME = "Merge the main commit this workflow came from into the PR head"
+DISPATCH_ONLY = "github.event_name == 'workflow_dispatch'"
+FETCH_DEPTH = "${{ github.event_name != 'workflow_dispatch' && 1 || 0 }}"
+MERGE_ENV = {"HEAD_SHA": "${{ inputs.head_sha || github.sha }}", "BASE_SHA": "${{ github.sha }}"}
+CHECKOUT_REF = ("${{ github.event_name == 'workflow_dispatch' && "
+                "(inputs.head_sha || github.sha) || github.sha }}")
+
+
+def gh_truthy(value):
+    """GitHub expression truthiness: false, 0, -0, '' and null are falsy."""
+    return value not in (False, 0, "", None)
+
+
+def gh_and(a, b):
+    return b if gh_truthy(a) else a
+
+
+def gh_or(a, b):
+    return a if gh_truthy(a) else b
+
+
+def fetch_depth(event_name):
+    """Python mirror of FETCH_DEPTH (tied to the YAML text by CiFullDispatchMergeWiringTests)."""
+    return gh_or(gh_and(event_name != "workflow_dispatch", 1), 0)
+
+
+def test_job_head(job):
+    """(checkout step, step after it) for one of ci-full.yml's test jobs."""
+    job_steps = steps(job_block(read("ci-full.yml"), job))
+    return job_steps[0], (job_steps[1] if len(job_steps) > 1 else None)
+
+
+def merge_step_body():
+    """The run: body of the merge-main step in ci-full.yml's `test` job, or None."""
+    step = step_by_id(job_block(read("ci-full.yml"), "test"), MERGE_STEP_ID)
+    return None if step is None else run_body(step)
+
+
+def scrubbed_git_env(home):
+    """os.environ with no ambient git configuration: the container's GIT_CONFIG_KEY_n entries,
+    the system and global config files and any GIT_DIR-style redirection are all dropped."""
+    env = dict(os.environ, GIT_CONFIG_COUNT="0", GIT_CONFIG_NOSYSTEM="1",
+               GIT_CONFIG_GLOBAL=os.devnull, HOME=home, PYTHONDONTWRITEBYTECODE="1")
+    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        env.pop(key, None)
+    return env
+
+
+class CiFullDispatchMergeWiringTests(unittest.TestCase):
+    """MAN-340: where the merge-main step sits, when it runs and what it may touch."""
+
+    def setUp(self):
+        self.text = read("ci-full.yml")
+
+    def test_merge_step_follows_checkout_in_every_test_job(self):
+        for job in CI_TEST_JOBS:
+            with self.subTest(job=job):
+                checkout, step = test_job_head(job)
+                self.assertTrue((field(checkout, "uses") or "").startswith("actions/checkout@"),
+                                f"{job}: the first step is not actions/checkout")
+                self.assertIsNotNone(step, f"{job}: no merge-main step after checkout")
+                self.assertEqual(field(step, "id"), MERGE_STEP_ID, f"{job}: no merge-main step after checkout")
+                self.assertEqual(field(step, "if"), DISPATCH_ONLY)
+                self.assertEqual(field(step, "shell"), "bash")
+                self.assertEqual(field(step, "name"), MERGE_STEP_NAME)
+                env = sub(step, "env")
+                self.assertIsNotNone(env, f"{job}: the merge-main step has no env: block")
+                for key, value in MERGE_ENV.items():
+                    self.assertEqual(field(env, key), value, f"{job}: env {key}")
+                keys = [line for line in code_lines(env[1:]) if line.strip()]
+                self.assertEqual(len(keys), len(MERGE_ENV), f"{job}: unexpected env keys {keys}")
+
+    def test_checkout_fetches_full_history_only_on_dispatch(self):
+        for job in CI_TEST_JOBS:
+            with self.subTest(job=job):
+                checkout, _ = test_job_head(job)
+                with_block = sub(checkout, "with")
+                self.assertIsNotNone(with_block, f"{job}: checkout has no with: block")
+                self.assertEqual(field(with_block, "fetch-depth"), FETCH_DEPTH)
+                self.assertEqual(field(with_block, "ref"), CHECKOUT_REF)
+                self.assertEqual(field(with_block, "persist-credentials"), "false")
+        self.assertEqual(fetch_depth("workflow_dispatch"), 0)
+        for event in ("pull_request", "push", "merge_group"):
+            with self.subTest(event=event):
+                self.assertEqual(fetch_depth(event), 1)
+        # The form not to use: `cond && 0 || 1` is 1 whatever cond is, because 0 is falsy.
+        self.assertEqual(gh_or(gh_and(True, 0), 1), 1)
+
+    def test_merge_step_bodies_are_byte_identical(self):
+        bodies = {}
+        for job in CI_TEST_JOBS:
+            step = step_by_id(job_block(self.text, job), MERGE_STEP_ID)
+            self.assertIsNotNone(step, f"{job}: no merge-main step")
+            bodies[job] = run_body(step)
+            self.assertTrue(bodies[job] and bodies[job].strip(), f"{job}: merge-main has no run: body")
+        self.assertEqual(bodies["test"], bodies["test-soapy"],
+                         "the two merge-main steps' run: bodies must be byte-identical")
+
+    def test_merge_step_holds_no_credentials(self):
+        for job in CI_TEST_JOBS:
+            with self.subTest(job=job):
+                block = job_block(self.text, job)
+                step = step_by_id(block, MERGE_STEP_ID)
+                self.assertIsNotNone(step, f"{job}: no merge-main step")
+                body = run_body(step)
+                for needle in ("${{", "secrets.", "github.token", "GH_TOKEN", "git push",
+                               "git fetch", "git remote", "scripts/"):
+                    self.assertNotIn(needle, body, f"{job}: merge-main body contains {needle!r}")
+                self.assertIsNone(sub(step, "with"), f"{job}: merge-main has a with: block")
+                self.assertIsNone(sub(step, "permissions"), f"{job}: merge-main declares permissions")
+                self.assertIsNone(field(block, "permissions"), f"{job}: job-level permissions added")
+        self.assertIn("\npermissions:\n  contents: read\n", self.text)
+
+    def test_native_and_merged_runs_never_merge(self):
+        for job in CI_TEST_JOBS:
+            with self.subTest(job=job):
+                step = step_by_id(job_block(self.text, job), MERGE_STEP_ID)
+                self.assertIsNotNone(step, f"{job}: no merge-main step")
+                cond = field(step, "if")
+                self.assertEqual(cond, DISPATCH_ONLY)
+                for event in ("pull_request", "push", "merge_group"):
+                    self.assertNotIn(event, cond, f"{job}: merge-main runs on {event}")
+
+
+TEST_PACKAGING = textwrap.dedent("""\
+    import unittest
+
+
+    class Packaging(unittest.TestCase):
+        def test_ok(self):
+            self.assertTrue(True)
+""")
+MISSING_MODULE = "No module named 'scripts.tests.test_packaging'"
+
+
+class CiFullDispatchMergeBehaviourTests(unittest.TestCase):
+    """MAN-340: the real merge-main body from ci-full.yml, run against throwaway repositories
+    shaped like the ticket's scenario (a PR cut before main gained a test module)."""
+
+    def setUp(self):
+        self.body = merge_step_body()
+        self.assertIsNotNone(self.body, "no merge-main step in ci-full.yml's test job")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.env = scrubbed_git_env(self.tmp)
+        self.script = os.path.join(self.tmp, "merge-main.sh")
+        with open(self.script, "w", encoding="utf-8") as f:
+            f.write(self.body)
+
+    def git(self, cwd, *args, check=True):
+        proc = subprocess.run(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", *args],
+            cwd=cwd, env=self.env, capture_output=True, text=True,
+        )
+        if check:
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc
+
+    def rev(self, cwd, ref):
+        return self.git(cwd, "rev-parse", ref).stdout.strip()
+
+    def _write(self, root, edits):
+        for path, content in edits.items():
+            full = os.path.join(root, path)
+            if content is None:
+                self.git(root, "rm", "-q", path)
+                continue
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8") as f:
+                f.write(content)
+            self.git(root, "add", path)
+
+    def _commit(self, root, edits, message):
+        self._write(root, edits)
+        self.git(root, "commit", "-q", "-m", message)
+        return self.rev(root, "HEAD")
+
+    def _fixture(self, pr_edits=None, main_edits=None):
+        """(work, a, pr, b): commit A, a `pr` branch from A (the PR's own code), main's B on A
+        adding scripts/tests/test_packaging.py, and `work`, a full clone at the PR head."""
+        src = os.path.join(self.tmp, "src")
+        os.mkdir(src)
+        self.git(src, "init", "-q", "-b", "main")
+        a = self._commit(src, {"scripts/__init__.py": "", "scripts/tests/__init__.py": "",
+                               "shared.txt": "base\n"}, "A")
+        self.git(src, "checkout", "-q", "-b", "pr")
+        pr = self._commit(src, dict({"pr_change.txt": "the PR's own code\n"}, **(pr_edits or {})), "PR")
+        self.git(src, "checkout", "-q", "main")
+        b = self._commit(src, dict({"scripts/tests/test_packaging.py": TEST_PACKAGING},
+                                   **(main_edits or {})), "B")
+        self.git(self.tmp, "clone", "-q", "--no-checkout", src, "work")
+        work = os.path.join(self.tmp, "work")
+        self.git(work, "checkout", "-q", "--detach", pr)
+        return work, a, pr, b
+
+    def run_step(self, cwd, head_sha, base_sha):
+        return subprocess.run(
+            ["bash", "--noprofile", "--norc", "-eo", "pipefail", self.script],
+            cwd=cwd, env=dict(self.env, HEAD_SHA=head_sha, BASE_SHA=base_sha),
+            capture_output=True, text=True,
+        )
+
+    def unittest_packaging(self, cwd):
+        return subprocess.run(
+            ["python3", "-m", "unittest", "scripts.tests.test_packaging"],
+            cwd=cwd, env=self.env, capture_output=True, text=True,
+        )
+
+    def test_a_pr_cut_before_a_new_test_module_is_judged_with_it(self):
+        work, _, pr, b = self._fixture()
+        before = self.unittest_packaging(work)
+        self.assertNotEqual(before.returncode, 0, "the fixture no longer reproduces the bug")
+        self.assertIn(MISSING_MODULE, before.stderr)
+        proc = self.run_step(work, pr, b)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.rev(work, "HEAD^1"), pr)
+        self.assertEqual(self.rev(work, "HEAD^2"), b)
+        after = self.unittest_packaging(work)
+        self.assertEqual(after.returncode, 0, after.stdout + after.stderr)
+        self.assertNotIn("No module named", after.stderr)
+        self.assertIn("::notice title=Tested with main merged in::", proc.stdout)
+
+    def test_the_merged_tree_keeps_the_prs_own_changes(self):
+        work, _, pr, b = self._fixture()
+        proc = self.run_step(work, pr, b)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.git(work, "diff", "--name-only", b, "HEAD").stdout.split(), ["pr_change.txt"])
+        self.assertEqual(self.git(work, "show", "HEAD:pr_change.txt").stdout,
+                         self.git(work, "show", f"{pr}:pr_change.txt").stdout)
+
+    def test_a_pr_that_deletes_a_needed_file_still_fails_on_its_own_change(self):
+        work, _, pr, b = self._fixture(pr_edits={"shared.txt": None})
+        proc = self.run_step(work, pr, b)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(os.path.exists(os.path.join(work, "shared.txt")),
+                         "the merge restored a file the PR deleted")
+
+    def test_a_head_that_already_contains_main_is_tested_as_is(self):
+        work, _, _, b = self._fixture()
+        self.git(work, "checkout", "-q", "--detach", b)
+        c = self._commit(work, {"rebased.txt": "rebased onto main\n"}, "C")
+        proc = self.run_step(work, c, b)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.rev(work, "HEAD"), c)
+        self.assertIn("already contains", proc.stdout)
+
+    def test_a_manual_dispatch_without_head_sha_is_a_no_op(self):
+        work, _, _, b = self._fixture()
+        self.git(work, "checkout", "-q", "--detach", b)
+        proc = self.run_step(work, b, b)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.rev(work, "HEAD"), b)
+
+    def test_a_conflict_fails_fast_naming_the_files(self):
+        work, _, pr, b = self._fixture(pr_edits={"shared.txt": "pr\n"}, main_edits={"shared.txt": "main\n"})
+        proc = self.run_step(work, pr, b)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("::error title=PR head conflicts with main::", proc.stdout)
+        self.assertIn("shared.txt", proc.stdout)
+        self.assertEqual(self.rev(work, "HEAD"), pr)
+        self.assertNotEqual(self.git(work, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).returncode, 0,
+                            "the conflicted merge was not aborted")
+
+    def test_a_shallow_checkout_fails_closed(self):
+        _, _, pr, b = self._fixture()
+        src = os.path.join(self.tmp, "src")
+        self.git(self.tmp, "clone", "-q", "--depth=1", "--branch", "pr", "file://" + src, "shallow")
+        proc = self.run_step(os.path.join(self.tmp, "shallow"), pr, b)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("::error title=Shallow checkout::", proc.stdout)
+
+    def test_an_unexpected_checkout_fails_closed(self):
+        work, _, _, b = self._fixture()
+        proc = self.run_step(work, b, b)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("::error title=Unexpected checkout::", proc.stdout)
+
+    def test_a_missing_main_commit_fails_closed(self):
+        work, _, pr, _ = self._fixture()
+        proc = self.run_step(work, pr, "f" * 40)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("::error title=Default-branch commit missing::", proc.stdout)
+
+
 
 def is_dependabot_update(actor, author, head_repo):
     """Python mirror of DEPENDABOT_UPDATE (tied to the YAML text by DependabotClassificationTests)."""
@@ -500,6 +789,7 @@ class ReleaseColdBuildTests(unittest.TestCase):
 DECISION_PATH_RE = re.compile(r"docs/DECISIONS/[0-9]{4}-[0-9]{2}-[0-9]{2}-man243-[A-Za-z0-9._-]*?\.md")
 DOC_PATH_RE = re.compile(r"docs/[A-Za-z0-9/._-]*?man243[A-Za-z0-9._-]*?\.md")
 RUNBOOK_PATH = "docs/RUNBOOKS/ci-trust-boundary.md"
+MAN340_DECISION_RE = re.compile(r"docs/DECISIONS/[0-9]{4}-[0-9]{2}-[0-9]{2}-man340-[A-Za-z0-9._-]*?\.md")
 
 
 class DocsReferenceTests(unittest.TestCase):
@@ -514,6 +804,18 @@ class DocsReferenceTests(unittest.TestCase):
                     refs.add(RUNBOOK_PATH)
                 for ref in sorted(refs):
                     self.assertTrue(os.path.isfile(os.path.join(ROOT, ref)), f"{name} names missing {ref}")
+
+    def test_man340_decision_record_is_named_and_exists(self):
+        refs = set(MAN340_DECISION_RE.findall(read("ci-full.yml")))
+        self.assertTrue(refs, "ci-full.yml never names the MAN-340 decision record")
+        for ref in sorted(refs):
+            self.assertTrue(os.path.isfile(os.path.join(ROOT, ref)), f"ci-full.yml names missing {ref}")
+
+    def test_runbook_explains_a_conflicted_dispatch(self):
+        with open(os.path.join(ROOT, RUNBOOK_PATH), encoding="utf-8") as f:
+            runbook = f.read()
+        self.assertIn("PR head conflicts with main", runbook)
+        self.assertTrue(MAN340_DECISION_RE.search(runbook), "the runbook never names the MAN-340 record")
 
 
 if __name__ == "__main__":
