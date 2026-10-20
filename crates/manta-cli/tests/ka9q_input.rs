@@ -560,3 +560,34 @@ fn ka9q_retune_ends_run_even_with_a_dial_override() {
         );
     }
 }
+
+/// MAN-334: a ka9q-radio channel has no configured centre or passband, so
+/// calibrate plans on what radiod reports once joined -- the re-plan after
+/// open that every source gets.
+#[test]
+fn ka9q_calibrate_plans_on_the_frequency_radiod_reports() {
+    let group = unique_group();
+    let data_port = free_udp_port();
+    let status = ChannelStatus {
+        radio_frequency_hz: Some(7_030_000.0),
+        ..channel_status(group, data_port, false)
+    };
+    let fake = FakeRadiod::status_only(group, status);
+    let out = manta()
+        .args(["calibrate", "--ka9q-group"])
+        .arg(group.to_string())
+        .args(["--ka9q-port", &data_port.to_string(), "--duration", "10"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    drop(fake);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(
+            "no known reference frequency is usable in this receiver's passband \
+             (6985000.0 to 7075000.0 Hz)"
+        ),
+        "{stderr}"
+    );
+}

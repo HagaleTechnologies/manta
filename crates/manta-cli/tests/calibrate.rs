@@ -1,9 +1,15 @@
 //! MAN-127: `manta calibrate` end to end, on hermetic IQ WAV fixtures whose
 //! carrier frequency is known exactly.
 
+mod common;
+
 use num_complex::Complex32;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 const FS: f64 = 48_000.0;
 const CENTRE: f64 = 9_998_500.0;
@@ -564,4 +570,141 @@ fn calibrate_write_saves_into_the_named_input_entry() {
             "freq_correction_ppm = 2.5 # old"
         )
     );
+}
+
+/// MAN-334: the retune hint for a KiwiSDR window centred at 7.030 MHz
+/// (+/-5 kHz).
+const KIWI_7030_HINT: &str = "no known reference frequency is usable in this receiver's \
+    passband (7025000.0 to 7035000.0 Hz); retune it for the measurement, e.g. --tune-hz \
+    4998500 for the 5000000.0 Hz time standard (WWV, WWVH, BPM) or --tune-hz 9998500 for the \
+    10000000.0 Hz time standard (WWV, WWVH, BPM), or name a carrier you know with \
+    --reference-hz";
+
+fn kiwi_input(port: u16, freq_hz: f64) -> String {
+    format!(
+        "[input]\ntype = \"kiwi\"\nhost = \"127.0.0.1\"\nport = {port}\nfreq_hz = {freq_hz:.1}\n"
+    )
+}
+
+/// A fake KiwiSDR on a loopback port, and the flag that tells it to stop.
+fn fake_kiwi() -> (
+    u16,
+    Arc<AtomicBool>,
+    std::thread::JoinHandle<Result<(), String>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let done = Arc::new(AtomicBool::new(false));
+    let fake = std::thread::spawn({
+        let done = done.clone();
+        move || common::fake_kiwi(listener, done)
+    });
+    (port, done, fake)
+}
+
+/// MAN-334 scenario 1: an offline receiver whose configured passband holds
+/// no reference gets the retune hint, not a connection error.
+#[test]
+fn calibrate_gives_an_offline_receiver_the_retune_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    // Nothing listens on port 1.
+    let cfg = write_cfg(dir.path(), &kiwi_input(1, 7_030_000.0));
+    let out = calibrate(&cfg, &[]);
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains(KIWI_7030_HINT), "{stderr}");
+    assert!(!stderr.contains("TCP connect"), "{stderr}");
+    assert!(!stderr.contains("Connection refused"), "{stderr}");
+    assert!(out.stdout.is_empty(), "{}", text(&out.stdout));
+}
+
+/// MAN-334 scenario 2: an online receiver whose configured passband holds no
+/// reference is never connected to, so no session is held on it.
+#[test]
+fn calibrate_does_not_connect_to_a_receiver_whose_passband_holds_no_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, done, fake) = fake_kiwi();
+    let cfg = write_cfg(dir.path(), &kiwi_input(port, 7_030_000.0));
+    let out = calibrate(&cfg, &[]);
+    done.store(true, Ordering::Relaxed);
+    let session = fake.join().unwrap();
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains(KIWI_7030_HINT), "{stderr}");
+    assert_eq!(
+        session,
+        Err("manta never connected to the fake KiwiSDR".to_string()),
+        "calibrate opened the receiver before refusing its passband"
+    );
+}
+
+/// MAN-334: the preflight does not refuse a passband that holds a reference;
+/// the receiver is opened and measured on the plan of the opened source.
+#[test]
+fn calibrate_opens_a_receiver_whose_passband_holds_a_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let (port, done, fake) = fake_kiwi();
+    let cfg = write_cfg(dir.path(), &kiwi_input(port, 9_998_500.0));
+    let mut child = common::KillOnDrop(
+        manta()
+            .args(["calibrate", "--duration", "12", "--config"])
+            .arg(&cfg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = common::line_channel(child.0.stderr.take().unwrap());
+    common::expect_line(
+        &stderr,
+        &["measuring 10000000.0 Hz, time standard (WWV, WWVH, BPM) for 12 s"],
+        Duration::from_secs(60),
+    );
+    drop(child);
+    done.store(true, Ordering::Relaxed);
+    assert_eq!(fake.join().unwrap(), Ok(()));
+}
+
+/// MAN-334: an HPSDR receiver's centre and rate are configured, so an offline
+/// one also gets the retune hint before any C&C frame is sent.
+#[test]
+fn calibrate_gives_an_offline_hpsdr_receiver_the_retune_hint() {
+    let out = manta()
+        .args(["calibrate", "--duration", "12", "--hpsdr-host", "127.0.0.1"])
+        .args(["--hpsdr-freq-hz", "7030000", "--hpsdr-rate-hz", "48000"])
+        .output()
+        .unwrap();
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(
+            "no known reference frequency is usable in this receiver's passband \
+             (7006000.0 to 7054000.0 Hz)"
+        ),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--tune-hz 9998500"), "{stderr}");
+    assert!(!stderr.contains("HPSDR"), "{stderr}");
+}
+
+/// MAN-334: a sound card's centre is the dial, so a dial far from any
+/// reference gets the dial hint without the device being opened.
+#[test]
+fn calibrate_gives_a_sound_card_the_dial_hint_without_opening_it() {
+    let out = manta()
+        .args(["calibrate", "--duration", "12", "--device", "NoSuchCard"])
+        .args(["--dial-freq-hz", "7030000"])
+        .output()
+        .unwrap();
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(
+            "no known reference frequency is usable in this receiver's passband \
+             (7030300.0 to 7033000.0 Hz)"
+        ),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--dial-freq-hz 9998350"), "{stderr}");
+    assert!(!stderr.contains("no audio input"), "{stderr}");
 }

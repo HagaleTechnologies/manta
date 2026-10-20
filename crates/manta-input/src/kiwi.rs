@@ -60,6 +60,15 @@ const TARGET_RATE_HZ: usize = 96_000;
 const IQ_LOW_CUT_HZ: i32 = -5_000;
 const IQ_HIGH_CUT_HZ: i32 = 5_000;
 
+/// MAN-334: the passband `rf_passband_hz` reports, public so `manta
+/// calibrate` can plan its references on a configured KiwiSDR before it
+/// connects. Derived from the `SET mod=iq` cuts, never a separate literal.
+pub const IQ_PASSBAND_HZ: (f64, f64) = (IQ_LOW_CUT_HZ as f64, IQ_HIGH_CUT_HZ as f64);
+
+/// MAN-334: the rate `sample_rate` reports. Every stream is resampled to
+/// it, whatever rate the receiver sends, so it is known before connecting.
+pub const OUTPUT_RATE_HZ: f64 = TARGET_RATE_HZ as f64;
+
 /// Resampler chunk size (in complex sample-pairs) fed to `rubato::Fft` per
 /// `process_into_buffer` call.
 ///
@@ -440,7 +449,7 @@ impl KiwiIqSource {
 
         Ok(KiwiIqSource {
             socket,
-            fs: TARGET_RATE_HZ as f64,
+            fs: OUTPUT_RATE_HZ,
             center_freq_hz,
             resampler,
             raw: Vec::new(),
@@ -681,7 +690,7 @@ impl IqSource for KiwiIqSource {
     /// the requested cuts verbatim rather than a symmetric width, so an
     /// asymmetric `low_cut`/`high_cut` would stay honest here too.
     fn rf_passband_hz(&self) -> (f64, f64) {
-        (f64::from(IQ_LOW_CUT_HZ), f64::from(IQ_HIGH_CUT_HZ))
+        IQ_PASSBAND_HZ
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
@@ -882,6 +891,8 @@ mod tests {
             (f64::from(IQ_LOW_CUT_HZ), f64::from(IQ_HIGH_CUT_HZ)),
             (low, high)
         );
+        // MAN-334: and the public const `manta calibrate` plans on.
+        assert_eq!(IQ_PASSBAND_HZ, (low, high));
         assert_ne!(
             high - low,
             TARGET_RATE_HZ as f64,
@@ -915,6 +926,19 @@ mod tests {
         }
         server.join().unwrap();
         result
+    }
+
+    /// MAN-334: `manta calibrate` plans on these before it connects, so a
+    /// connected source must report exactly them, whatever rate the receiver
+    /// sends.
+    #[test]
+    fn a_connected_source_reports_the_values_known_before_connecting() {
+        for rate in ["12000.000", "20250"] {
+            let src = connect_to_a_receiver_reporting(rate).unwrap();
+            assert_eq!(src.sample_rate(), OUTPUT_RATE_HZ, "sample_rate={rate}");
+            assert_eq!(src.rf_passband_hz(), IQ_PASSBAND_HZ, "sample_rate={rate}");
+            assert_eq!(src.center_freq_hz(), 14_025_000.0, "sample_rate={rate}");
+        }
     }
 
     #[test]
