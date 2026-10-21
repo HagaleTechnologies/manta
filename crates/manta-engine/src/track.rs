@@ -824,6 +824,14 @@ pub const SHORT_HYST_FRAC: f32 = 0.15;
 /// before any mark is counted at all -- flat (unkeyed) input has no marks.
 pub const SHORT_MIN_KEYING_RATIO: f32 = 2.0;
 
+/// MAN-372 research diagnostics: set `MANTA_MAN372_DIAG=1` to print each
+/// classifier evaluation's hot runs, marked spans, and every unqualified
+/// track's qualification gates to stderr.
+fn man372_diag() -> bool {
+    static DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DIAG.get_or_init(|| std::env::var("MANTA_MAN372_DIAG").is_ok())
+}
+
 /// MAN-271 (SPEC §2.8 D′): count the debounced key-down runs ("keyed
 /// marks") in a track's queued decoder input, with Demod-style relative
 /// rails: nearest-rank Q90/Q10 quantiles over a copy (Q10 floored at
@@ -1041,6 +1049,21 @@ impl KeyingEvidence {
             return 0.0;
         }
         self.non_flat as f64 / self.n as f64
+    }
+
+    /// MAN-372 diagnostics: gate-by-gate qualification verdicts.
+    fn diag_gates(&self, comod: &CoModDetector, k: usize, spacing_hz: f64) -> String {
+        format!(
+            "cycles>={} active_se>={} !in_span={} !comod_ws={} n>={} |slope|<={} t_last>={} nf>={:.2}",
+            self.cycles >= 1,
+            self.active_hops_since_eval >= QUALIFY_MIN_ACTIVE_HOPS,
+            !comod.in_span(k),
+            !comod.comodulated_with_span(k),
+            self.n >= SLOPE_MIN_SAMPLES,
+            self.slope_hz_s(spacing_hz).abs() <= MAX_SWEEP_HZ_PER_S,
+            self.t_last >= KEYDOWN_SPAN_MIN_HOPS,
+            self.non_flat_fraction(),
+        )
     }
 
     /// SPEC §2.8's qualification rule, checked at a classifier evaluation
@@ -2827,6 +2850,30 @@ impl TrackManager {
             if let Some(comod) = self.comod.as_ref() {
                 let n = self.n_channels();
                 let spacing = self.channel_spacing_hz;
+                if man372_diag() {
+                    eprintln!(
+                        "[man372] eval hop={} hot_runs={:?} spans={:?}",
+                        self.hop_counter,
+                        comod.diag_hot_runs(),
+                        comod.spans()
+                    );
+                    if let Ok(band) = std::env::var("MANTA_MAN372_BAND") {
+                        let mut it = band.split(':');
+                        if let (Some(lo), Some(hi)) = (it.next(), it.next()) {
+                            let (lo, hi) = (
+                                lo.parse::<usize>().unwrap_or(0),
+                                hi.parse::<usize>().unwrap_or(0),
+                            );
+                            let prof: Vec<String> = (lo..=hi)
+                                .map(|k| {
+                                    let (m, _, _) = comod.diag_channel(k);
+                                    format!("{}:{m:.0}", k)
+                                })
+                                .collect();
+                            eprintln!("[man372] band {}..{} mean {}", lo, hi, prof.join(" "));
+                        }
+                    }
+                }
                 for (&id, track) in self.tracks.iter_mut() {
                     if track.qualified || close_reasons.contains_key(&id) {
                         continue;
@@ -2851,6 +2898,19 @@ impl TrackManager {
                     };
                     let qualifies = ev.qualifies(comod, k, spacing)
                         || ev.qualifies_short(comod, k, spacing, state, marks);
+                    if man372_diag() {
+                        let (mean, peak, count) = comod.diag_channel(k);
+                        eprintln!(
+                            "[man372]   id={id} k={k} state={state:?} D={} Dp={} | slope={:.1} n={} t_last={} mean={mean:.1} peak={peak:.1} count={count} rho={:.2} marks={marks} qual={qualifies} || {}",
+                            ev.qualifies(comod, k, spacing),
+                            ev.qualifies_short(comod, k, spacing, state, marks),
+                            ev.slope_hz_s(spacing),
+                            ev.n,
+                            ev.t_last,
+                            comod.diag_best_rho(k),
+                            ev.diag_gates(comod, k, spacing),
+                        );
+                    }
                     ev.active_hops_since_eval = 0;
                     ev.dropped_since_eval = false;
                     if qualifies {

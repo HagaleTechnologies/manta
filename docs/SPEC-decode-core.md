@@ -717,7 +717,7 @@ Constants (compile-time; `COMOD_*` in `manta-dsp::comod`, the rest in
 | `COMOD_EVAL_HOPS` | 75 | evaluation cadence, 0.2 s |
 | `COMOD_MIN_FILL_HOPS` | 188 | first evaluation once this many hops are stored |
 | `COMOD_HOT_DB` | 6.0 | a channel is hot when its window-mean SNR reaches this |
-| `COMOD_LAG_MIN`, `COMOD_LAG_MAX` | 3, 16 | pair distances in channels, inclusive |
+| `COMOD_LAG_MIN`, `COMOD_LAG_MAX` | 3, 30 | pair distances in channels, inclusive (MAN-372 re-measured the maximum against the testkit voice: the voice's 2.6 kHz band spans 28 channels, so partners beyond 16 are what mark its span from the first evaluation) |
 | `COMOD_RHO` | 0.5 | Pearson ρ of a hot pair's per-hop SNR must be ≥ this |
 | `COMOD_COUNT` | 4 | a channel with ≥ 4 co-modulated partners joins a span |
 | `COMOD_SPAN_MIN_WIDTH` | 8 | span width, first to last channel inclusive |

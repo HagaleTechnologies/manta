@@ -30,7 +30,12 @@ pub const COMOD_MIN_FILL_HOPS: usize = 188;
 pub const COMOD_HOT_DB: f64 = 6.0;
 /// Channel distances judged for co-modulation, inclusive.
 pub const COMOD_LAG_MIN: usize = 3;
-pub const COMOD_LAG_MAX: usize = 16;
+/// The upper lag bound spans a whole voice band: the testkit voice's
+/// 2.6 kHz harmonic comb is 28 channels wide at 96 kHz, and only
+/// cross-band partners (beyond 16) mark its span from the first
+/// evaluation (MAN-372). Still far above a keyed tone's ±2-channel
+/// click skirt, which the `COMOD_LAG_MIN` floor already excludes.
+pub const COMOD_LAG_MAX: usize = 30;
 /// Pearson rho of two hot channels' per-hop SNR at or above this counts.
 pub const COMOD_RHO: f64 = 0.5;
 /// A channel with at least this many co-modulated partners joins a span.
@@ -117,6 +122,87 @@ impl CoModDetector {
     /// Whether FFT-order channel `k` lies in a marked co-modulated span.
     pub fn in_span(&self, k: usize) -> bool {
         self.span_until[self.j(k)] > self.hop
+    }
+
+    /// MAN-372 diagnostics: window mean, peak and partner count of
+    /// FFT-order channel `k` at the latest evaluation.
+    #[doc(hidden)]
+    pub fn diag_channel(&self, k: usize) -> (f64, f64, u16) {
+        let j = self.j(k);
+        (self.mean[j], self.peak[j], self.count[j])
+    }
+
+    /// MAN-372 diagnostics: runs of consecutive hot channels (window mean
+    /// >= `COMOD_HOT_DB`), inclusive FFT-order channel ranges, at the
+    /// latest evaluation.
+    #[doc(hidden)]
+    pub fn diag_hot_runs(&self) -> Vec<(usize, usize)> {
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut hot = (0..self.n)
+            .filter(|&j| self.mean[j] >= COMOD_HOT_DB)
+            .map(|j| self.un_j(j));
+        if let Some(first) = hot.next() {
+            let mut run = (first, first);
+            for k in hot {
+                if k == run.1 + 1 {
+                    run.1 = k;
+                } else {
+                    runs.push(run);
+                    run = (k, k);
+                }
+            }
+            runs.push(run);
+        }
+        runs
+    }
+
+    fn un_j(&self, j: usize) -> usize {
+        (j + self.n / 2) % self.n
+    }
+
+    /// MAN-372 diagnostics: the largest Pearson rho between FFT-order
+    /// channel `k`'s window and any hot channel's window at least
+    /// `COMOD_LAG_MIN` channels away, at the latest evaluation.
+    #[doc(hidden)]
+    pub fn diag_best_rho(&self, k: usize) -> f64 {
+        let j = self.j(k);
+        if self.filled < 2 {
+            return 0.0;
+        }
+        let a = self.row(j);
+        let len = a.len() as f64;
+        let ma = a.iter().map(|&v| v as f64).sum::<f64>() / len;
+        let na: f64 = a
+            .iter()
+            .map(|&v| (v as f64 - ma).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        if na <= 0.0 {
+            return 0.0;
+        }
+        let mut best = 0.0f64;
+        for s in 0..self.n {
+            if s.abs_diff(j) < COMOD_LAG_MIN || self.mean[s] < COMOD_HOT_DB {
+                continue;
+            }
+            let b = self.row(s);
+            let mb = b.iter().map(|&v| v as f64).sum::<f64>() / len;
+            let nb: f64 = b
+                .iter()
+                .map(|&v| (v as f64 - mb).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            if nb <= 0.0 {
+                continue;
+            }
+            let dot: f64 = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (*x as f64 - ma) * (*y as f64 - mb))
+                .sum();
+            best = best.max(dot / (na * nb));
+        }
+        best
     }
 
     /// Whether FFT-order channel `k`'s window co-modulates (Pearson rho >=
