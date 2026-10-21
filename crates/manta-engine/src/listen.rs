@@ -2501,6 +2501,7 @@ mod tests {
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
                 observers: Default::default(),
+                spawn_band_hz: None,
             }],
             Arc::new(AtomicBool::new(false)),
         )
@@ -2639,6 +2640,7 @@ mod tests {
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
                 observers: Default::default(),
+                spawn_band_hz: None,
             }],
             Arc::new(AtomicBool::new(false)),
         )
@@ -2830,6 +2832,7 @@ mod tests {
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
                 observers: Default::default(),
+                spawn_band_hz: None,
             }],
             Arc::new(AtomicBool::new(false)),
         )
