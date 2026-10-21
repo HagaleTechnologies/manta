@@ -321,7 +321,7 @@ between HANG and CLOSED for a track that has decoded (MAN-108).
 
 | Transition | Condition |
 |---|---|
-| IDLE → CANDIDATE | rise condition first met on channel `k`, `k` is not owned by an existing track (§2.5), `k` is not RTTY-vetoed (§2.6), no static crash is being suppressed this hop (§2.7), `k` is not inside a co-modulation span (§2.8), and `k`'s centre is not outside the source's trusted band when one was supplied (§1.5, MAN-196) |
+| IDLE → CANDIDATE | rise condition first met on channel `k`, `k` is not owned by an existing track (§2.5), `k` is not RTTY-vetoed (§2.6), no static crash is being suppressed this hop (§2.7), `k` is not inside a co-modulation span (§2.8), and `k`'s centre is not outside the source's trusted band when one was supplied (§1.5, MAN-196), or outside the input's spawn band (MAN-310) |
 | CANDIDATE → ACTIVE | rise sustained 19 hops → lease decoder from pool; with `non_cw_filter` on, the lease waits for qualification (below, §2.8) |
 | CANDIDATE → IDLE | rise condition lost before 19 hops |
 | ACTIVE → HANG | drop condition met (below off threshold) |
@@ -395,6 +395,12 @@ DORMANT track's wake, or turn a HANG track back to ACTIVE.
   cannot route around the veto. Spawns only: a track that already exists
   on an untrusted channel is never closed or de-weighted by it (MAN-196,
   the MAN-314 spawns-only lesson).
+- A channel whose centre lies outside the input's spawn band, when one was
+  supplied, may not start a spawn decision, in the same slots as the
+  trusted-band veto. Only the streams of one split band plan carry a spawn
+  band (MAN-310): from the midpoint with the lower sibling's centre minus
+  one channel spacing to the midpoint with the upper sibling's plus one,
+  intersected with the trusted band. Spawns only.
 - A channel inside the source's analytic guard may not start a spawn
   decision either, in the same two slots: when `IqSource::analytic_guard_hz()`
   (a real-to-analytic front end; `hilbert_guard_hz(48000)` = 600 Hz for
@@ -1551,7 +1557,10 @@ inside the decode path. A live source's disconnect/reconnect (MAN-73) reports
 the missed span, in samples, via `IqSource::take_discontinuity()`; `listen()`
 advances the sample clock by that count and starts a fresh track segment, so
 `sample_ts` stays monotonic and wall-clock-true across the gap with no audio
-spliced in. File replay never reports a discontinuity. An end of stream
+spliced in. The reported span ends where the reopened source's acquisition
+began (`IqSource::acquisition_start_offset()` into its open call), not where
+its opener returned, so samples it captured while opening are not counted
+twice (MAN-259). File replay never reports a discontinuity. An end of stream
 reported with a discontinuity pending (MAN-258: a stop while the source is
 down) closes the segment the same way and starts none.
 

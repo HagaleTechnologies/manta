@@ -87,6 +87,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-310: `[input].bands` (`"all"`, band names or centre frequencies in
+  kHz) plans a receiver's streams from the standard CW segments, 160
+  through 10 m with 60 m and the NCDXF beacons. `tuning_range_hz` drops
+  bands the receiver cannot tune, and a band wider than one stream is
+  split, each stream starting tracks only on its own side of the split.
+  Several KiwiSDR sessions to one receiver now open side by side. See
+  [docs/DECISIONS/2026-10-17-man310-band-plan.md](docs/DECISIONS/2026-10-17-man310-band-plan.md).
+
 - MAN-108: `[detector] reacquire_ms` (default `10000`), how long after
   `hang_ms` a decoded track keeps its identity waiting for its signal to
   return. `0` restores the previous close at `hang_ms`.
@@ -191,6 +199,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-259: after a live source reconnects, `manta run`'s spot timestamps
+  are no longer stamped late by the time the receiver spent reopening while
+  already streaming. The reported outage now ends where the stream the
+  device returns began, not where its open call returned; for ka9q-radio
+  with no SSRC set that was the span its startup stash actually replayed
+  (up to the 1.5 s settle window at 192 kS/s, and only ~0.32 s at
+  1.536 MS/s, where the stash's 4 MiB cap evicts the opening -- that
+  evicted span is outage, not data).
 - `manta run` stopped while waiting to reconnect to a lost receiver no
   longer force-decodes the open tracks' last element or judges their
   pending beacons as if the signal had ended; they close as an outage

@@ -19,6 +19,7 @@ use manta_engine::{decode_wav, PipelineConfig};
 use manta_input::IqSource;
 use std::path::{Path, PathBuf};
 
+mod band_streams;
 mod bench;
 mod build_info;
 mod calibrate_cmd;
@@ -1709,6 +1710,12 @@ impl IqSource for FixedCenterFreqSource {
 
     fn take_discontinuity(&mut self) -> Option<u64> {
         self.inner.take_discontinuity()
+    }
+
+    /// MAN-259: `ReconnectingSource` reads this off the opener's result to
+    /// end an outage where acquisition began.
+    fn acquisition_start_offset(&self) -> std::time::Duration {
+        self.inner.acquisition_start_offset()
     }
 
     fn health_counters(&self) -> Option<std::sync::Arc<manta_input::InputHealthCounters>> {
@@ -4281,6 +4288,8 @@ struct ResolvedInput {
     freq_correction_ppm: f64,
     dial_freq_hz: Option<f64>,
     capture_rate_hz: Option<f64>,
+    /// MAN-310: this stream's share of a split band plan.
+    spawn_band_hz: Option<(f64, f64)>,
 }
 
 /// MAN-13: a one-receiver command (`calibrate`, `doctor`, `soak`, `check`)
@@ -4309,13 +4318,48 @@ fn select_input(loaded: &mut config::Loaded, name: Option<&str>, command: &str) 
                 names.len()
             );
         }
-        Some(name) => names.iter().position(|n| *n == name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "--input {} is not one of {origin}'s inputs ({})",
-                fmt::quoted(name),
-                names.join(", ")
-            )
-        })?,
+        Some(name) => match names.iter().position(|n| *n == name) {
+            Some(index) => index,
+            None => {
+                // MAN-310: the entry whose `bands` planned several streams.
+                let streams: Vec<&str> = loaded
+                    .inputs
+                    .iter()
+                    .filter(|n| match &n.entry {
+                        Some(entry) => entry == name,
+                        // The `[input]` table's streams are `<its name>-<label>`.
+                        None => n
+                            .name
+                            .strip_prefix(name)
+                            .is_some_and(|rest| rest.starts_with('-')),
+                    })
+                    .map(|n| n.name.as_str())
+                    .collect();
+                if streams.len() >= 2 {
+                    let options = match streams.split_last() {
+                        Some((last, rest)) => format!(
+                            "{} or --input {last}",
+                            rest.iter()
+                                .map(|n| format!("--input {n}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        None => String::new(),
+                    };
+                    bail!(
+                        "--input {} is one receiver with {} streams ({}); pass {options}",
+                        fmt::quoted(name),
+                        streams.len(),
+                        streams.join(", ")
+                    );
+                }
+                bail!(
+                    "--input {} is not one of {origin}'s inputs ({})",
+                    fmt::quoted(name),
+                    names.join(", ")
+                );
+            }
+        },
     };
     let chosen = loaded.inputs[index].clone();
     loaded.input = chosen.input.clone();
@@ -4369,11 +4413,26 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
     // MAN-13: several `[[input]]` entries, unless a source flag picks one
     // receiver instead.
     let several = loaded.inputs.len() >= 2;
+    // MAN-310: several inputs that all came from one entry's `bands`.
+    let planned = several
+        && loaded
+            .inputs
+            .iter()
+            .all(|n| n.entry == loaded.inputs[0].entry);
+    let what = if planned {
+        let section = match &loaded.inputs[0].entry {
+            Some(entry) => format!("[[input]] {}", fmt::quoted(entry)),
+            None => "[input]".to_string(),
+        };
+        format!("{} streams {section}.bands plans", loaded.inputs.len())
+    } else {
+        format!("{} [[input]] entries", loaded.inputs.len())
+    };
     if several {
         if let Some(flag) = cli.source_selector() {
+            let from = if planned { "in" } else { "from" };
             notes.push(format!(
-                "note: {flag} selects the source; ignoring the {} [[input]] entries from {}",
-                loaded.inputs.len(),
+                "note: {flag} selects the source; ignoring the {what} {from} {}",
                 loaded.origin
             ));
             let spec = cli.into_spec();
@@ -4404,10 +4463,9 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
                     _ => "capture_rate_hz",
                 };
                 bail!(
-                    "{flag} applies to one receiver and {} has {} [[input]] entries; set {key} \
-                     in the entry, or name one receiver with a source flag",
-                    loaded.origin,
-                    loaded.inputs.len()
+                    "{flag} applies to one receiver and {} has {what}; set {key} in the entry, \
+                     or name one receiver with a source flag",
+                    loaded.origin
                 );
             }
         }
@@ -4426,6 +4484,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
                     freq_correction_ppm: n.input.shared.freq_correction_ppm.unwrap_or(0.0),
                     dial_freq_hz: n.input.shared.center_freq_hz,
                     capture_rate_hz: n.input.shared.capture_rate_hz,
+                    spawn_band_hz: n.spawn_band_hz,
                 })
             })
             .collect::<Result<Vec<_>>>()?
@@ -10027,6 +10086,37 @@ mod tests {
         assert_eq!(src.take_discontinuity(), None);
     }
 
+    /// MAN-259: the reconnect wrapper reads the acquisition-start offset
+    /// off the opener's result, which is this wrapper whenever
+    /// `--dial-freq-hz` or a fixed centre is in effect.
+    #[test]
+    fn fixed_center_freq_source_forwards_acquisition_start_offset() {
+        struct OffsetSource;
+        impl IqSource for OffsetSource {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                0.0
+            }
+            fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+            fn acquisition_start_offset(&self) -> std::time::Duration {
+                std::time::Duration::from_millis(250)
+            }
+        }
+
+        let src = FixedCenterFreqSource {
+            inner: Box::new(OffsetSource),
+            freq_hz: 14_000_000.0,
+        };
+        assert_eq!(
+            src.acquisition_start_offset(),
+            std::time::Duration::from_millis(250)
+        );
+    }
+
     // MAN-56: input-layer health counters wiring.
 
     /// A wrapper `IqSource` that forgets to forward `health_counters`
@@ -10424,6 +10514,61 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(r.inputs.is_empty());
         assert_eq!(r.freq_correction_ppm, -1.5);
         assert_eq!(r.capture_rate_hz, Some(48_000.0));
+    }
+
+    #[test]
+    fn select_input_names_the_streams_of_a_band_plan() {
+        let body = "[input]\ntype = \"kiwi\"\nhost = \"h\"\nbands = [\"60m\"]\n";
+        let mut loaded = loaded_from(body);
+        let err = select_input(&mut loaded, None, "doctor")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.ends_with("has 2 inputs: pass --input kiwi-60m-1 or --input kiwi-60m-2"),
+            "{err}"
+        );
+        let err = select_input(&mut loaded, Some("kiwi"), "doctor")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "--input \"kiwi\" is one receiver with 2 streams (kiwi-60m-1, kiwi-60m-2); pass \
+             --input kiwi-60m-1 or --input kiwi-60m-2"
+        );
+        // A named `[input]`'s streams are found by its name, not its type.
+        let mut named = loaded_from(
+            "[input]\nname = \"mykiwi\"\ntype = \"kiwi\"\nhost = \"h\"\nbands = [\"60m\"]\n",
+        );
+        let err = select_input(&mut named, Some("mykiwi"), "doctor")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("--input \"mykiwi\" is one receiver with 2 streams"),
+            "{err}"
+        );
+        let err = select_input(&mut named, Some("kiwi"), "doctor")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not one of"), "{err}");
+        let mut loaded = loaded_from(body);
+        let cli = CliOverrides {
+            source: Some(PathBuf::from("v1.wav")),
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded).unwrap();
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("ignoring the 2 streams [input].bands plans in")),
+            "{:?}",
+            r.notes
+        );
+        select_input(&mut loaded, Some("kiwi-60m-2"), "doctor").unwrap();
+        assert_eq!(loaded.inputs.len(), 1);
+        assert_eq!(
+            loaded.input.source.as_ref().and_then(|s| s.freq_hz()),
+            Some(5_362_750.0)
+        );
     }
 
     #[test]
