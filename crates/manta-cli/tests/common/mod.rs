@@ -296,3 +296,40 @@ pub fn send_snd_frames(ws: &mut tungstenite::WebSocket<TcpStream>, stop: impl Fn
         }
     }
 }
+
+/// MAN-310: plays `n` KiwiSDR sessions on one listener, one per stream of a
+/// band plan. Sends each session's `SET mod=iq ... freq=...` tune line on
+/// `tunes`, then streams SND noise until `done`.
+pub fn fake_kiwi_sessions(
+    listener: TcpListener,
+    n: usize,
+    tunes: mpsc::Sender<String>,
+    done: Arc<AtomicBool>,
+) -> Result<(), String> {
+    use tungstenite::Message;
+
+    let mut sessions = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut ws = accept_kiwi_session(&listener, &done)?;
+        let tunes = tunes.clone();
+        let done = done.clone();
+        sessions.push(std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                match ws.read() {
+                    Ok(Message::Text(text)) if text.starts_with("SET mod=iq") => {
+                        let _ = tunes.send(text.to_string());
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+            send_snd_frames(&mut ws, || done.load(Ordering::Relaxed));
+        }));
+    }
+    for s in sessions {
+        let _ = s.join();
+    }
+    Ok(())
+}

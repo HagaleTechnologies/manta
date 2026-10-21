@@ -87,6 +87,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-310: `[input].bands` (`"all"`, band names or centre frequencies in
+  kHz) plans a receiver's streams from the standard CW segments, 160
+  through 10 m with 60 m and the NCDXF beacons. `tuning_range_hz` drops
+  bands the receiver cannot tune, and a band wider than one stream is
+  split, each stream starting tracks only on its own side of the split.
+  Several KiwiSDR sessions to one receiver now open side by side. See
+  [docs/DECISIONS/2026-10-17-man310-band-plan.md](docs/DECISIONS/2026-10-17-man310-band-plan.md).
+
 - MAN-108: `[detector] reacquire_ms` (default `10000`), how long after
   `hang_ms` a decoded track keeps its identity waiting for its signal to
   return. `0` restores the previous close at `hang_ms`.

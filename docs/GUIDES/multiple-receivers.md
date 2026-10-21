@@ -178,6 +178,14 @@ Each receiver needs about one Raspberry Pi 4 core at 192 kS/s, so a Pi 4 runs
 up to four 192 kS/s receivers, or more at 96 kS/s
 ([raspberry-pi.md](raspberry-pi.md)).
 
+## One receiver, several bands: `bands`
+
+An entry's `bands` (`"all"`, band names, or centres in kHz) expands to one
+input per stream of the standard CW segments, named `<entry>-<band>-<n>`.
+Streams of one plan that overlap split the overlap at the midpoint of their
+centres. See [Band plans](../CONFIG.md#band-plans-bands) for the table, the
+rules and what each receiver type can open.
+
 ## Commands that examine one receiver
 
 `manta calibrate`, `manta doctor`, `manta soak` and `manta check` look at one
@@ -189,6 +197,8 @@ ignores the config's entries.
 
 - Several receivers on one HPSDR radio: MAN-307. The config loader refuses
   two entries on one radio.
+- `bands` that needs several streams from one HPSDR radio (MAN-307) or one
+  SoapySDR device, and radiod channels created from `bands`.
 - Several channels of one SoapySDR device in one stream (a dual-tuner
   RSPduo): two Soapy devices, one entry each, work today.
 - A per-receiver identity on RBN or a receiver field on spots. The combined
