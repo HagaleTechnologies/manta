@@ -134,10 +134,20 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
   8-bit), Airspy HF+ (768 kS/s, the reference device), SDRplay. Runtime device
   selection by driver string. Feature-gating keeps the core buildable without the
   native SoapySDR library (CI, contributors without hardware).
-- **OpenHPSDR/Hermes** (Protocol 1 "Metis" over UDP, in every build):
-  Hermes-Lite 2 and Pavel Demin's Red Pitaya and QMTech images. Pure UDP/std with
-  no native-library dependency. The wire facts are
-  spike-pinned (`docs/DECISIONS/2026-09-02-hpsdr-hermes-protocol-spike.md`), not yet
+- **OpenHPSDR** (UDP, both protocols, in every build): protocol 1 ("Metis":
+  Hermes-Lite 2 and Pavel Demin's Red Pitaya and QMTech images) and protocol 2
+  (ANAN-class: Hermes, Angelia, Orion, Orion II, Saturn/G2), behind one
+  `hpsdr` source type. Under `--hpsdr-protocol auto` the open sends a directed
+  discovery probe to the configured host and picks the protocol from the
+  answer. Protocol 2 streams on one unconnected socket that demultiplexes by
+  the radio's source port: DDC0 IQ arrives from `port + 11`, a port manta never
+  sent to. Its datagrams are numbered, so a short loss is reported through
+  `IqSource::take_missing_samples()`: `listen` advances its sample clock
+  without closing tracks, and a loss of 0.5 s or more, or a radio restart,
+  goes through `take_discontinuity()`. Pure UDP/std plus `socket2`, with no
+  native-library dependency. The wire facts are pinned against reference
+  sources (`docs/DECISIONS/2026-09-02-hpsdr-hermes-protocol-spike.md`,
+  `docs/DECISIONS/2026-10-19-man305-hpsdr-protocol-2-input.md`), not yet
   confirmed against live hardware.
 - **ka9q-radio (radiod) channel** (RTP over UDP multicast, no feature gate):
   joins the multicast data group of one existing radiod IQ channel and reads

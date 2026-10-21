@@ -445,7 +445,10 @@ fn check_accepts_an_hpsdr_input_without_opening_the_receiver() {
     let out = succeeds(&check_file(&path));
     assert_eq!(
         out.lines().find(|line| line.starts_with("input:")),
-        Some("input: type=hpsdr host=receiver.invalid port=1024 freq_hz=7030000 rate_hz=48000")
+        Some(
+            "input: type=hpsdr host=receiver.invalid port=1024 protocol=auto freq_hz=7030000 \
+             rate_hz=48000"
+        )
     );
 }
 
@@ -1118,7 +1121,7 @@ fn one_band_that_fits_an_hpsdr_stream_is_that_stream() {
     let o = check_body(&format!("{HL2}bands = [\"40m\"]\n"));
     assert_eq!(
         input_lines(&succeeds(&o)),
-        ["input: type=hpsdr host=192.168.1.40 port=1024 freq_hz=7020000 rate_hz=96000"]
+        ["input: type=hpsdr host=192.168.1.40 port=1024 protocol=auto freq_hz=7020000 rate_hz=96000"]
     );
     assert!(stderr(&o).contains("note: [input]: bands = [\"40m\"] plans 1 stream: 40m\n"));
 }

@@ -153,6 +153,26 @@ missing series as "no loss" or "no traffic".
 | `manta_live_records_total` | counter | `kind` | Live-state records published to at least one connected client, by `kind`: `bandState`, `trackState`, `candidateDecision` or `trackClosed`. Records are built only while a live client is connected, so nothing is counted while none is. | Only with `[server].live_port` set, as for `manta_live_clients_connected`. |
 | `manta_live_records_dropped_total` | counter | `reason` | Live-state records a disconnected client never received, by `reason`: `lagged` (the client fell more than 4096 records behind), `write_failed` (a write, or the client's WebSocket handshake, timed out or failed) or `shutdown` (unsent when the daemon stopped). The spot-loss counters (`manta_spots_dropped_lagged_total`, `manta_spots_dropped_write_failed_total`, `manta_spots_dropped_shutdown_total`) never count live records, so they still mean spots. | Only with `[server].live_port` set, as for `manta_live_clients_connected`. |
 
+### HPSDR input counters by protocol
+
+MAN-305: the names, labels and 1 Hz sampling are the same for both openHPSDR
+protocols; the meaning differs. For a protocol-1 radio (Hermes-Lite 2) the
+counters keep their meaning above: losses are estimated from packet timing,
+because protocol 1 carries no sequence number. For a protocol-2 radio (ANAN):
+
+| Metric | Definition for a protocol-2 radio | Source |
+|---|---|---|
+| `manta_input_dropped_packets_total{source="hpsdr"}` | IQ datagrams proven lost by DDC0's 32-bit sequence number: a jump from *n* to *n + k + 1* adds *k*. Each datagram is 238 samples (1.24 ms at 192 kHz). Radio restarts add nothing, because the count is unknown, and neither does a jump larger than the time since the last datagram allows (one full socket buffer beyond it), which counts as a restart. | `Protocol2IqSource` sequence tracker → `InputHealthCounters::record_dropped` |
+| `manta_input_gaps_detected_total{source="hpsdr"}` | Loss events: one per sequence jump, plus one per radio restart (sequence back to 0). | `record_gap` |
+| `manta_input_malformed_packets_total{source="hpsdr"}` | Datagrams discarded unread: a wrong length or header on the IQ port, an unknown source port from the radio, or any datagram from another address. | `record_malformed` |
+| `manta_source_health{source="hpsdr"}` | Unchanged: 1 once a valid IQ datagram has arrived since the last open, else 0. | `confirmed_live_handle` |
+
+On the decoder side, a gap shorter than 0.5 s is spliced and the spot clock
+jumps by the lost samples, so spot timestamps stay true and tracks stay open;
+a gap of 0.5 s or more, or a restart, also closes every track in progress, as
+a reconnect does. See
+[MAN-305](DECISIONS/2026-10-19-man305-hpsdr-protocol-2-input.md).
+
 ### Sample
 
 Lines from `/metrics` during the V1 replay. `# HELP` lines, most families

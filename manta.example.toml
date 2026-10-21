@@ -191,6 +191,7 @@ station_callsign = "N0CALL"
 # HPSDR/Hermes radio (both inputs are included in every build):
 #host = "<your-receiver-host>"       # required for kiwi and hpsdr
 #port = 8073                         # default 8073 for kiwi, 1024 for hpsdr, 5004 for ka9q
+#protocol = "auto"                   # hpsdr: "auto" asks the radio; "1" (Hermes-Lite 2) or "2" (ANAN) skips asking
 #password = ""                       # kiwi only; leave empty for public receivers
 
 # type = "soapy", a SoapySDR device (needs a manta built with soapy support):

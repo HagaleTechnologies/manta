@@ -214,7 +214,8 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `realtime` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` paces the replay to the recording's own clock, so telnet/JSON clients can watch it. `--realtime` sets it; a live source refuses it. See [DECISIONS/2026-10-10-man269-paced-looping-replay.md](DECISIONS/2026-10-10-man269-paced-looping-replay.md). |
 | `loop` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` replays the file again from the start each time it ends, until stopped; implies `realtime`. `--loop` sets it; a live source refuses it. |
 | `host` | none; example `"<your-receiver-host>"`; required for kiwi and hpsdr | live: `type = "kiwi"` or `"hpsdr"` | Receiver host name. `--kiwi-host` or `--hpsdr-host` overrides it. |
-| `port` | `8073`; `1024` for hpsdr; `5004` for ka9q | live: `type = "kiwi"`, `"hpsdr"` or `"ka9q"` | Receiver port, 1 to 65535; for ka9q, the group's RTP data port. `--kiwi-port`, `--hpsdr-port` or `--ka9q-port` overrides it. |
+| `port` | `8073`; `1024` for hpsdr; `5004` for ka9q | live: `type = "kiwi"`, `"hpsdr"` or `"ka9q"` | Receiver port, 1 to 65535; for ka9q, the group's RTP data port; for an hpsdr protocol-2 radio, the base of its port map (see [HPSDR protocol 2](#hpsdr-protocol-2)). `--kiwi-port`, `--hpsdr-port` or `--ka9q-port` overrides it. |
+| `protocol` | `"auto"` | live: `type = "hpsdr"` | openHPSDR protocol the radio speaks: `"auto"`, `"1"` or `"2"`; the integers `1` and `2` are accepted too. `"auto"` sends a discovery probe to `host` on every open and uses protocol 2 when the radio answers as protocol 2, protocol 1 otherwise (a warning names the key when the radio does not answer within 1 s). `"1"` (Hermes-Lite 2) and `"2"` (ANAN) skip the probe. `--hpsdr-protocol` or `MANTA_INPUT_PROTOCOL` (read verbatim as a string) overrides it. Any other `type` refuses the key. |
 | `password` | `""` | live: `type = "kiwi"` | KiwiSDR password; empty for a public receiver. `config check` prints only whether it is set. `--kiwi-password` overrides it. |
 | `driver` | none; example `"driver=rtlsdr"`; required for soapy | live: `type = "soapy"` (needs the build feature) | SoapySDR device arguments. `--soapy-driver` overrides it. |
 | `gain_db` | none; example `30.0`; unset uses the device's automatic gain | live: `type = "soapy"` (needs the build feature) | Receiver gain, dB. `--soapy-gain` overrides it. |
@@ -229,6 +230,54 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `center_freq_hz` | none; example `14030000.0`; unset leaves frequencies as audio offsets, and `run` with `[server]` refuses a source that carries no frequency of its own | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Your radio's dial frequency, Hz, for a source that carries none. `--dial-freq-hz` overrides it. |
 | `capture_rate_hz` | none; example `48000.0`; unset decodes at the receiver's own rate | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Decimated sample rate, Hz. It must be at least 1000 (checked before the receiver opens), divide the receiver's rate by a power of two, and be 93.75 Hz (the channel spacing) times a power of two of at least 4, so in practice 1500, 3000, 6000, 12000, 24000, 48000, 96000 and so on. A rate that divides evenly but fails the last rule, such as 50000 from a 100 kS/s receiver, is rejected at startup. The decimator's transition band (the outer ~9.4% of each side, 24 of 256 channels at 48 kS/s — beyond the <= 1 dB point at 0.4526 x the rate) is not usable: the reported passband, `manta check`, SETT segments and tracked channels stop at the trusted band, and `run`/`soak` say so in one startup line naming the source's intersected passband. `--capture-rate-hz` overrides it. |
 | `replay_epoch` | none; example `1700000000`; unset uses the file's modification time | live: `run` with `[server]` and a file source; ignored elsewhere | Unix seconds that the recording's first sample stands for. `--replay-epoch` overrides it. |
+
+### HPSDR protocol 2
+
+MAN-305: ANAN-class radios (Hermes, Angelia, Orion, Orion II, Saturn/G2)
+speak openHPSDR protocol 2; Hermes-Lite 2 and older boards speak protocol 1.
+Both use `type = "hpsdr"` and `--hpsdr-*`, chosen by `protocol` above
+(`--hpsdr-protocol auto|1|2`). The probe under `"auto"` goes to the
+configured host only; manta never broadcasts, and `manta devices` does not
+list radios.
+
+Protocol 2 uses a port map relative to `port` (`1024` by default):
+
+| Direction | Stream | Port |
+|---|---|---|
+| manta → radio | general (and discovery) | `port` (1024) |
+| manta → radio | receiver settings | `port + 1` (1025) |
+| manta → radio | transmitter settings | `port + 2` (1026) |
+| manta → radio | high priority (run, frequency, filters) | `port + 3` (1027) |
+| radio → manta | command response | from `port` (1024) |
+| radio → manta | high-priority status | from `port + 1` (1025) |
+| radio → manta | microphone | from `port + 2` (1026) |
+| radio → manta | wideband | from `port + 3` to `port + 10` (1027–1034) |
+| radio → manta | DDC0 IQ, the stream manta decodes | from `port + 11` (1035) |
+
+manta receives every stream on one unconnected UDP socket and sorts the
+datagrams by the radio's source port.
+
+- **Firewall.** Protocol 2 needs a host firewall rule allowing inbound UDP
+  from the radio: IQ arrives from `port + 11`, which manta never sent to, so
+  a stateful firewall does not treat it as a reply. Without the rule the
+  open succeeds and the stream stalls after 10 s with an error that names
+  the firewall.
+- **Network.** Protocol 2 radios want Gigabit Ethernet. One receiver at
+  192 kHz is about 9.6 Mbit/s, which 100 Mbit/s carries, but the radios are
+  built and tested for Gigabit.
+- **Receive buffer.** manta asks for a 4 MiB socket receive buffer; Linux
+  grants at most `net.core.rmem_max` (about 416 KiB by default, 0.36 s at
+  192 kHz). Raise `net.core.rmem_max` if
+  `manta_input_dropped_packets_total{source="hpsdr"}` climbs on a quiet LAN.
+- A radio that reports itself already streaming to another program is
+  refused under `"auto"`; `protocol = "2"` takes it over.
+- One receiver (DDC0) per radio until MAN-307. The rate must be exactly
+  48000, 96000, 192000 or 384000 Hz, and `freq_hz` a whole number of Hz below
+  61440000.
+- With `protocol = "2"`, or a board manta does not know, the radio's
+  front-end filters are bypassed (ANT1, no high-pass, the 6 m low-pass).
+
+See [DECISIONS/2026-10-19-man305-hpsdr-protocol-2-input.md](DECISIONS/2026-10-19-man305-hpsdr-protocol-2-input.md).
 
 ### Band plans: bands
 
