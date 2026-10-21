@@ -62,7 +62,10 @@ inside `open_receiver` under `Auto` on every open and reopen.
   firmware 13, DDC count 20). Anything else is ignored.
 - The first protocol-2 reply ends discovery. A protocol-1 reply opens a
   100 ms window in which a protocol-2 reply still wins, because dual-firmware
-  radios may answer both. No reply by 1 s: protocol 1, with a warning.
+  radios may answer both; the first protocol-1 reply also resends the
+  protocol-2 request once, since the window closes before the next try and a
+  single lost protocol-2 datagram would otherwise settle on protocol 1. No
+  reply by 1 s: protocol 1, with a warning.
 - Protocol-2 status `0x03` (already streaming) is refused under `auto`.
   Protocol-1 status is not acted on.
 - `1` and `2` send no discovery datagram.

@@ -238,9 +238,20 @@ pub fn probe(host: &str, port: u16, timing: &ProbeTiming) -> Result<Discovery> {
                 return Ok(Discovery::Answered(reply))
             }
             // The first protocol-1 reply starts the grace; later ones do
-            // not extend it.
+            // not extend it. It also resends the protocol-2 request once:
+            // the grace ends before the next scheduled try, so a lost
+            // protocol-2 request or reply would otherwise settle a
+            // dual-protocol radio on protocol 1 (D3, MAN-305 review).
             Some(reply @ DiscoveryReply::Protocol1 { .. }) if fallback.is_none() => {
                 fallback = Some((reply, Instant::now() + timing.grace));
+                match socket.send_to(&protocol2_request(), radio) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == ErrorKind::ConnectionReset => {}
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("sending HPSDR discovery to {host}:{port}"))
+                    }
+                }
             }
             _ => {}
         }
@@ -504,6 +515,39 @@ mod tests {
             ),
             "{result:?}"
         );
+    }
+
+    #[test]
+    fn a_protocol_1_reply_resends_the_protocol_2_request_inside_the_grace() {
+        // A dual-protocol radio whose first protocol-2 exchange is lost:
+        // the grace (30 ms) ends long before the next try (250 ms), so only
+        // the resend triggered by the protocol-1 reply can still find it.
+        let timing = ProbeTiming {
+            tries: 4,
+            interval: Duration::from_millis(250),
+            window: Duration::from_secs(1),
+            grace: Duration::from_millis(30),
+        };
+        let mut p2_requests = 0;
+        let (result, took, seen) = probe_fake(timing, |radio, d, src| {
+            if is_p1_request(d) {
+                radio.send_to(&p1_reply(STATUS_IDLE), src).unwrap();
+            } else if is_p2_request(d) {
+                p2_requests += 1;
+                if p2_requests > 1 {
+                    radio.send_to(&p2_reply(STATUS_IDLE), src).unwrap();
+                }
+            }
+        });
+        assert!(
+            matches!(
+                result,
+                Discovery::Answered(DiscoveryReply::Protocol2 { board: 5, .. })
+            ),
+            "{result:?}"
+        );
+        assert!(took < timing.interval, "{took:?}");
+        assert_eq!(seen.iter().filter(|d| is_p2_request(d)).count(), 2);
     }
 
     #[test]
