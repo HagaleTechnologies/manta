@@ -257,7 +257,10 @@ every existing caller as it was.
 datagram, never on a discovery reply or a status datagram (MAN-55). A stall is
 10 s since the last valid IQ datagram, the same budget as protocol 1's
 40 × 250 ms but measured as elapsed time, so periodic status datagrams cannot
-hide a dead IQ stream. The stall error names the firewall. The 10,000
+hide a dead IQ stream. The clock runs only while a read waits (from the
+later of the last valid IQ datagram and entering the read), so a caller that
+pauses between reads finds its queued IQ instead of a stall. The stall error
+names the firewall. The 10,000
 consecutive-malformed bound applies as in protocol 1. Both bounds are
 `pub(crate)` fields with production defaults, so tests use short values.
 

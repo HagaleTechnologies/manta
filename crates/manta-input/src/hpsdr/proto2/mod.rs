@@ -410,8 +410,13 @@ impl Protocol2IqSource {
 
     /// Receive datagrams until the queue holds DDC0 samples (D5 demux).
     fn fill_queue(&mut self) -> Result<()> {
+        // D13's stall clock runs only while a read waits: time the caller
+        // spent not reading (a multi-input run parks sources until every
+        // opener finishes) is not the radio's silence, and the IQ it sent
+        // meanwhile is still queued on the socket (MAN-305 review).
+        let entered = Instant::now();
         while self.queue_pos >= self.queue.len() {
-            if self.last_valid_iq.elapsed() >= self.stall_after {
+            if self.last_valid_iq.max(entered).elapsed() >= self.stall_after {
                 bail!(
                     "HPSDR protocol 2 radio {host} stalled: no IQ datagram for {secs} s -- if the \
                      radio is on, allow inbound UDP from {host} in the host firewall (protocol 2 \
@@ -1110,6 +1115,20 @@ mod tests {
                 fake.base + 11
             )
         );
+    }
+
+    #[test]
+    fn a_pause_between_reads_is_not_a_stall() {
+        let fake = FakeP2Radio::start();
+        let mut src = open(&fake);
+        src.stall_after = Duration::from_millis(300);
+        fake.send_iq(0);
+        assert_eq!(read_one(&mut src), (0, 238));
+        // The caller stops reading for longer than the stall bound while
+        // the radio keeps sending: the queued IQ is read, not a stall.
+        fake.send_iq(1);
+        thread::sleep(Duration::from_millis(600));
+        assert_eq!(read_one(&mut src), (1, 238));
     }
 
     #[test]
