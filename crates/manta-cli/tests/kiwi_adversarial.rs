@@ -129,7 +129,10 @@ fn clean_close_midstream_is_survived() {
             });
             // The adversarial event: a clean Close, mid-stream.
             let _ = ws.send(Message::Close(None));
-            drop(ws);
+            // Hold the connection until the client hangs up. Dropping it
+            // now, with the SET burst and keepalives still unread, would
+            // send an RST that can replace the Close (MAN-421, as MAN-418).
+            while ws.read().is_ok() {}
             // The daemon should reconnect (1 s backoff): accept again and
             // stream once more so the reconnected line has data to chew.
             let mut ws2 = accept_kiwi_session(&listener, &done)?;
@@ -188,8 +191,7 @@ fn raw_protocol_violation_midstream_is_survived() {
             // Hold the poisoned connection until the client hangs up on
             // it (its read errors first), so the violation -- not a
             // reset from our side -- is what ends the client's read.
-            let _ = ws.read();
-            drop(ws);
+            while ws.read().is_ok() {}
             let mut ws2 = accept_kiwi_session(&listener, &done)?;
             send_snd_frames(&mut ws2, || done.load(Ordering::Relaxed));
             Ok(())
@@ -199,7 +201,17 @@ fn raw_protocol_violation_midstream_is_survived() {
     let mut child = spawn_manta(kiwi_port);
     let stderr = line_channel(child.0.stderr.take().expect("stderr piped"));
 
-    expect_line(&stderr, &["source kiwi lost"], WAIT);
+    // tungstenite rejects the reserved opcode 0xF in the frame header,
+    // before it looks at the bogus length.
+    expect_line(
+        &stderr,
+        &[
+            "source kiwi lost",
+            "WebSocket protocol error",
+            "invalid opcode: 15",
+        ],
+        WAIT,
+    );
     expect_line(&stderr, &["source kiwi reconnected"], WAIT);
     assert!(
         child.0.try_wait().unwrap().is_none(),
