@@ -426,7 +426,6 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
     // receiver `resolved` describes and the text the save is checked against
     // come from the same file and bytes.
     let snapshot_before = config_flag_or_env.map(|path| config_edit::ReadBefore::read(&path).ok());
-    let input_name = args.input.clone();
     let SourcePrepared {
         config_path,
         loaded,
@@ -439,6 +438,8 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
             name: args.input.as_deref(),
         },
     )?;
+    // MAN-310: a stream of a band plan saves into the entry it came from.
+    let input_name = save_entry_name(&loaded.inputs, args.input.as_deref());
     let opts = CalibrateOptions {
         duration,
         search_ppm: args.search_ppm,
@@ -553,10 +554,15 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
                 &mut save_error,
             )),
             (SaveDecision::Ask, Some(path)) => {
+                let streams = entry_stream_count(path, input_name.as_deref());
                 let prompt = format!(
-                    "Save freq_correction_ppm = {value_lit} to {} in {}?",
+                    "Save freq_correction_ppm = {value_lit} to {} in {}{}?",
                     entry.section,
-                    path.display()
+                    path.display(),
+                    match streams {
+                        n if n > 1 => format!(" (all {n} streams of this receiver)"),
+                        _ => String::new(),
+                    }
                 );
                 if confirm(
                     &mut std::io::stderr(),
@@ -656,8 +662,77 @@ fn save(
     }
 }
 
+/// MAN-310: the config entry a calibrated input saves into: the entry
+/// whose `bands` planned the selected stream, else the entry `--input`
+/// named (`None`: the single `[input]` table).
+fn save_entry_name(selected: &[config::NamedInput], input: Option<&str>) -> Option<String> {
+    match selected {
+        [one] if input.is_some() && one.entry.as_deref() != Some(one.name.as_str()) => {
+            one.entry.clone()
+        }
+        _ => input.map(str::to_string),
+    }
+}
+
+/// MAN-310: how many streams the entry a save targets plans (1 when the
+/// file no longer loads; the save itself then reports why).
+fn entry_stream_count(path: &std::path::Path, entry: Option<&str>) -> usize {
+    match config::load(Some(path), config::Env::Ignore) {
+        Ok(l) if l.inputs.len() > 1 => l
+            .inputs
+            .iter()
+            .filter(|n| n.entry.as_deref() == entry)
+            .count(),
+        _ => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn calibrating_a_stream_saves_into_its_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        for (text, stream, want) in [
+            (
+                "[input]\ntype = \"kiwi\"\nhost = \"k\"\nbands = [\"60m\"]\n",
+                "kiwi-60m-1",
+                None,
+            ),
+            (
+                "[[input]]\nname = \"kiwi-a\"\ntype = \"kiwi\"\nhost = \"k\"\n\
+                 bands = [\"60m\"]\n\n[[input]]\nname = \"b\"\ntype = \"kiwi\"\n\
+                 host = \"k\"\nfreq_hz = 7030000.0\n",
+                "kiwi-a-60m-2",
+                Some("kiwi-a"),
+            ),
+        ] {
+            let path = dir.path().join("m.toml");
+            std::fs::write(&path, text).unwrap();
+            let mut loaded = crate::config::load(Some(&path), crate::config::Env::Ignore).unwrap();
+            crate::select_input(&mut loaded, Some(stream), "calibrate").unwrap();
+            let target = super::save_entry_name(&loaded.inputs, Some(stream));
+            assert_eq!(target.as_deref(), want);
+            assert_eq!(super::entry_stream_count(&path, want), 2);
+            let (saved, _) =
+                crate::config_edit::set_freq_correction_ppm(text, -1.1, target.as_deref()).unwrap();
+            assert!(
+                saved.contains("bands = [\"60m\"]\n"),
+                "the bands line is kept: {saved}"
+            );
+            std::fs::write(&path, &saved).unwrap();
+            let reloaded = crate::config::load(Some(&path), crate::config::Env::Ignore).unwrap();
+            let streams: Vec<_> = reloaded
+                .inputs
+                .iter()
+                .filter(|n| n.entry.as_deref() == want)
+                .collect();
+            assert_eq!(streams.len(), 2);
+            assert!(streams
+                .iter()
+                .all(|n| n.input.shared.freq_correction_ppm == Some(-1.1)));
+        }
+    }
+
     use super::*;
     use manta_engine::calibrate::ReferenceKind;
 

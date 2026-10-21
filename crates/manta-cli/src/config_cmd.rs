@@ -1779,6 +1779,7 @@ mod tests {
         ("input", "path"),
         ("input", "host"),
         ("input", "freq_hz"),
+        ("input", "bands"),
         ("input", "driver"),
         ("input", "rate_hz"),
         ("input", "gain_db"),
@@ -1894,6 +1895,11 @@ mod tests {
             ("input", "protocol") => {
                 "[input]\ntype = \"hpsdr\"\nhost = \"h\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n"
                     .to_string()
+            }
+            // MAN-310: a band plan needs a receiver; the range needs a plan.
+            ("input", "bands") => "[input]\ntype = \"kiwi\"\nhost = \"h\"\n".to_string(),
+            ("input", "tuning_range_hz") => {
+                "[input]\ntype = \"kiwi\"\nhost = \"h\"\nbands = [\"40m\"]\n".to_string()
             }
             // Absolute, so both loads resolve it the same from their temp dirs.
             ("input", "iq" | "realtime" | "loop") => {
@@ -2056,13 +2062,18 @@ mod tests {
             InputKind::Hpsdr,
             InputKind::Ka9q,
         ] {
-            let body = format!(
-                "[input]\ntype = \"{}\"\n{}",
-                kind.name(),
-                uncommented("input", |k| kind.keys().contains(&k))
-            );
-            let l = loaded(&body);
-            assert_eq!(l.input.source.map(|s| s.kind()), Some(kind), "{body}");
+            // MAN-310: `bands` replaces `freq_hz`, so each is tried alone.
+            for skip in ["bands", "freq_hz"] {
+                let body = format!(
+                    "[input]\ntype = \"{}\"\n{}",
+                    kind.name(),
+                    uncommented("input", |k| kind.keys().contains(&k)
+                        && k != skip
+                        && !(skip == "bands" && k == "tuning_range_hz"))
+                );
+                let l = loaded(&body);
+                assert_eq!(l.input.source.map(|s| s.kind()), Some(kind), "{body}");
+            }
         }
         let shared = [
             "freq_correction_ppm",

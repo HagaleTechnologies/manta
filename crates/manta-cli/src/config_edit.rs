@@ -288,7 +288,10 @@ fn save_with_env(
         Some(name) => loaded
             .inputs
             .iter()
-            .find(|entry| entry.name == name)
+            // MAN-310 (Codex review, PR #345): a band-plan entry loads as
+            // generated streams (`a-60m-1`, ...) that keep its name in
+            // `entry`.
+            .find(|entry| entry.name == name || entry.entry.as_deref() == Some(name))
             .map(|entry| &entry.input),
         None => Some(&loaded.input),
     };
@@ -734,6 +737,30 @@ mod tests {
             Some(-2.0)
         );
         assert_eq!(entries(dir.path()), ["manta.toml"]);
+    }
+
+    #[test]
+    fn save_into_a_named_band_plan_entry_validates_its_streams() {
+        // MAN-310 (Codex review, PR #345): entry "a" loads as streams
+        // "a-60m-1" and "a-60m-2", none named "a".
+        let dir = tempfile::tempdir().unwrap();
+        let body = "[[input]]\nname = \"a\"\ntype = \"kiwi\"\nhost = \"h\"\nbands = [\"60m\"]\n\n\
+                    [[input]]\nname = \"b\"\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7030000.0\n";
+        let p = write(dir.path(), "manta.toml", body);
+        assert_eq!(
+            save_freq_correction_ppm(&p, -2.0, None, Some("a")).unwrap(),
+            None
+        );
+        let loaded = load(Some(&p), Env::Ignore).unwrap();
+        let a: Vec<_> = loaded
+            .inputs
+            .iter()
+            .filter(|n| n.entry.as_deref() == Some("a"))
+            .collect();
+        assert_eq!(a.len(), 2);
+        assert!(a
+            .iter()
+            .all(|n| n.input.shared.freq_correction_ppm == Some(-2.0)));
     }
 
     #[test]

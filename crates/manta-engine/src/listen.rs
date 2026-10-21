@@ -349,6 +349,16 @@ struct Segment {
     pad_hops: u64,
 }
 
+/// MAN-310: where a segment may spawn: the source's trusted band (MAN-196)
+/// narrowed to the input's own share of a split band plan. Spawns only.
+fn spawn_veto_band(trusted: Option<(f64, f64)>, own: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    match (trusted, own) {
+        (None, None) => None,
+        (Some(b), None) | (None, Some(b)) => Some(b),
+        (Some((tl, th)), Some((ol, oh))) => Some((tl.max(ol), th.min(oh))),
+    }
+}
+
 /// MAN-273: the spawn guard `listen` applies -- the larger of the
 /// configured `DetectorConfig::guard_hz` and the source's
 /// `IqSource::analytic_guard_hz`, so configuration can widen the guard but
@@ -393,7 +403,9 @@ fn new_segment(
     // MAN-196: never spawn tracks outside the source's trusted band (the
     // decimator's <= 1 dB boundary on a decimated capture; `None`, no
     // decimator, leaves the manager exactly as it was). Spawns-only per
-    // segment, same threading as the RF passband above.
+    // segment, same threading as the RF passband above. MAN-310: on the
+    // multi-input path the band is already narrowed to the input's share
+    // of a split band plan (`spawn_veto_band`).
     if let Some((lo, hi)) = trusted_band_hz {
         tm.set_trusted_band_hz(lo, hi);
     }
@@ -1230,6 +1242,7 @@ pub(crate) fn run_input_front(
     clock: crate::multi::SourceClock,
     ids: crate::multi::TrackIdSpace,
     calibration_factor: f64,
+    spawn_band_hz: Option<(f64, f64)>,
     observers: &FrontObservers,
     send: &mut dyn FnMut(Batch) -> bool,
 ) -> Result<()> {
@@ -1256,7 +1269,8 @@ pub(crate) fn run_input_front(
     let fs = src.sample_rate();
     let center_freq_hz = src.center_freq_hz();
     let rf_passband_hz = src.rf_passband_hz();
-    let trusted_band_hz = src.trusted_band_hz();
+    // MAN-310: a split band plan's stream spawns only on its own share.
+    let trusted_band_hz = spawn_veto_band(src.trusted_band_hz(), spawn_band_hz);
     let analytic = src.analytic_guard_hz() > 0.0;
     let guard_hz = effective_guard_hz(cfg.detector.guard_hz, src.analytic_guard_hz());
     let mut crash_base: u64 = 0;
@@ -1486,6 +1500,31 @@ pub(crate) fn run_input_front(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spawn_veto_band_narrows_the_trusted_band() {
+        use super::spawn_veto_band;
+        assert_eq!(spawn_veto_band(None, None), None);
+        assert_eq!(
+            spawn_veto_band(Some((-40.0, 40.0)), None),
+            Some((-40.0, 40.0))
+        );
+        assert_eq!(
+            spawn_veto_band(None, Some((-10.0, 20.0))),
+            Some((-10.0, 20.0))
+        );
+        assert_eq!(
+            spawn_veto_band(Some((-40.0, 40.0)), Some((-10.0, 50.0))),
+            Some((-10.0, 40.0))
+        );
+        assert_eq!(
+            spawn_veto_band(
+                Some((-43_449.6, 43_449.6)),
+                Some((f64::NEG_INFINITY, 37_593.75))
+            ),
+            Some((-43_449.6, 37_593.75))
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -3080,6 +3119,7 @@ mod tests {
                 }),
                 freq_correction_ppm: 0.0,
                 observers: Default::default(),
+                spawn_band_hz: None,
             }],
             stop,
         )
@@ -4305,6 +4345,7 @@ mod tests {
                     }),
                     freq_correction_ppm: 0.0,
                     observers: Default::default(),
+                    spawn_band_hz: None,
                 }],
                 stop,
             )

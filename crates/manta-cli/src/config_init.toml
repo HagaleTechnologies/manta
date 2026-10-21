@@ -188,7 +188,9 @@
 #gain_db = 30.0                      # no default: the device's automatic gain
 
 # Shared by kiwi, soapy and hpsdr:
-#freq_hz = 7030000.0                 # required: the receiver's centre frequency, Hz
+#freq_hz = 7030000.0                 # required unless bands is set: the receiver's centre frequency, Hz
+#bands = ["40m"]                     # instead of freq_hz: "all", bands such as "40m", or centres in kHz such as "7030"
+#tuning_range_hz = [0.0, 30000000.0] # with bands: the receiver's tuning range, Hz; bands outside it are skipped
 #rate_hz = 192000.0                  # required for soapy and hpsdr: sample rate, Hz
 
 # type = "ka9q", a ka9q-radio (radiod) IQ channel over multicast. It reads

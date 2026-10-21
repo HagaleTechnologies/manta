@@ -46,6 +46,8 @@ ASSETS = (
     "docs/RUNBOOKS/network-exposure.md",
     # MAN-148: the service kit links the operator guides. Keep their direct
     # relative-link targets available when reading an extracted release too.
+    # MAN-310: docs/CONFIG.md is kiwisdr.md's Band plans target.
+    "docs/CONFIG.md",
     "docs/GUIDES/rbn-node.md",
     "docs/GUIDES/kiwisdr.md",
     "docs/GUIDES/raspberry-pi.md",

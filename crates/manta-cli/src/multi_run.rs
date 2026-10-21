@@ -98,6 +98,23 @@ fn sum(counters: &[Arc<AtomicU64>]) -> u64 {
 
 /// Each input's open-completion time after the earliest one (the session
 /// epoch), in input order; an input with no time reads zero.
+/// MAN-310: where a split band plan's stream starts new tracks, as an
+/// absolute kHz range: its spawn band within the trusted band (or the RF
+/// passband when the source is not decimated).
+fn spawn_band_line(input: &manta_engine::OpenedInput) -> Option<String> {
+    use manta_server::band_plan::exact_khz;
+    let (own_lo, own_hi) = input.spawn_band_hz?;
+    let (lo, hi) = input.trusted_band_hz.unwrap_or(input.rf_passband_hz);
+    let (lo, hi) = (lo.max(own_lo), hi.min(own_hi));
+    Some(format!(
+        "input {}: new tracks start only from {} to {} kHz; the rest of its passband is nearer \
+         another stream's centre",
+        input.name,
+        exact_khz(input.center_freq_hz + lo),
+        exact_khz(input.center_freq_hz + hi)
+    ))
+}
+
 fn live_offsets(opened_at: &[Option<Instant>]) -> Vec<Duration> {
     let epoch = opened_at.iter().flatten().min().copied();
     opened_at
@@ -303,6 +320,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             InputSpec {
                 name: input.name.clone(),
                 freq_correction_ppm: input.freq_correction_ppm,
+                spawn_band_hz: input.spawn_band_hz,
                 observers: manta_engine::InputObservers {
                     static_crashes: Some(crashes[index].clone()),
                     bad_samples: Some(bad),
@@ -373,6 +391,11 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 "{}",
                 crate::trusted_band_notice(input.sample_rate_hz, lo, hi)
             );
+        }
+        // MAN-310: a split band plan's stream starts tracks only on its
+        // own side of the split.
+        if let Some(line) = spawn_band_line(input) {
+            tracing::info!("{line}");
         }
     }
     let clock = if live {
@@ -877,6 +900,25 @@ mod tests {
     }
 
     #[test]
+    fn a_split_streams_spawn_band_is_logged_in_absolute_khz() {
+        let mut input = manta_engine::OpenedInput {
+            name: "kiwi-60m-1".into(),
+            sample_rate_hz: 96_000.0,
+            center_freq_hz: 5_355_250.0,
+            rf_passband_hz: (-5_000.0, 5_000.0),
+            trusted_band_hz: None,
+            spawn_band_hz: Some((f64::NEG_INFINITY, 3_843.75)),
+        };
+        assert_eq!(
+            spawn_band_line(&input).unwrap(),
+            "input kiwi-60m-1: new tracks start only from 5350.25 to 5359.094 kHz; the rest of \
+             its passband is nearer another stream's centre"
+        );
+        input.spawn_band_hz = None;
+        assert_eq!(spawn_band_line(&input), None);
+    }
+
+    #[test]
     fn an_input_without_a_frequency_is_refused_naming_it() {
         let inputs = [ResolvedInput {
             name: "b".into(),
@@ -884,6 +926,7 @@ mod tests {
             freq_correction_ppm: 0.0,
             dial_freq_hz: None,
             capture_rate_hz: None,
+            spawn_band_hz: None,
         }];
         let err = check_rf_references(&inputs).unwrap_err().to_string();
         assert_eq!(
