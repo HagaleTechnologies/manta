@@ -85,6 +85,8 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("input", "path"),
     ("input", "host"),
     ("input", "password"),
+    // MAN-305: `MANTA_INPUT_PROTOCOL=2` is the string "2", like the file key.
+    ("input", "protocol"),
     ("input", "driver"),
     ("input", "group"),
     ("input", "interface"),
@@ -314,6 +316,7 @@ impl InputKind {
             InputKind::Hpsdr => &[
                 "host",
                 "port",
+                "protocol",
                 "freq_hz",
                 "rate_hz",
                 "bands",
@@ -339,6 +342,7 @@ struct InputToml {
     looped: Option<bool>,
     host: Option<String>,
     port: Option<u16>,
+    protocol: Option<ProtocolValue>,
     freq_hz: Option<f64>,
     /// MAN-310: `"all"`, band names or centres in kHz, instead of
     /// `freq_hz`. Typed by hand, so a wrong type gets manta's message.
@@ -359,6 +363,35 @@ struct InputToml {
     center_freq_hz: Option<f64>,
     capture_rate_hz: Option<f64>,
     replay_epoch: Option<i64>,
+}
+
+/// MAN-305: `input.protocol`, written `"auto"`, `"1"`, `"2"` or the
+/// integers 1 and 2; anything else is refused when the input is built.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+enum ProtocolValue {
+    Text(String),
+    Number(i64),
+}
+
+impl ProtocolValue {
+    fn protocol(&self) -> std::result::Result<manta_input::hpsdr::HpsdrProtocol, String> {
+        use manta_input::hpsdr::HpsdrProtocol;
+        match self {
+            ProtocolValue::Text(t) if t == "auto" => Ok(HpsdrProtocol::Auto),
+            ProtocolValue::Text(t) if t == "1" => Ok(HpsdrProtocol::One),
+            ProtocolValue::Text(t) if t == "2" => Ok(HpsdrProtocol::Two),
+            ProtocolValue::Number(1) => Ok(HpsdrProtocol::One),
+            ProtocolValue::Number(2) => Ok(HpsdrProtocol::Two),
+            ProtocolValue::Text(t) => Err(format!(
+                "input.protocol must be \"auto\", \"1\" or \"2\", got {}",
+                crate::fmt::quoted(t)
+            )),
+            ProtocolValue::Number(n) => Err(format!(
+                "input.protocol must be \"auto\", \"1\" or \"2\", got {n}"
+            )),
+        }
+    }
 }
 
 /// MAN-13: one `[[input]]` entry (or the single `[input]` table) and its
@@ -423,6 +456,8 @@ pub(crate) enum SourceFromFile {
     Hpsdr {
         host: String,
         port: u16,
+        /// MAN-305 D2: `input.protocol`, `Auto` when absent.
+        protocol: manta_input::hpsdr::HpsdrProtocol,
         freq_hz: f64,
         rate_hz: f64,
     },
@@ -1237,6 +1272,12 @@ fn validate_input(
         },
         InputKind::Hpsdr => SourceFromFile::Hpsdr {
             port: port(crate::HPSDR_CONTROL_PORT)?,
+            protocol: t
+                .protocol
+                .as_ref()
+                .map(ProtocolValue::protocol)
+                .transpose()?
+                .unwrap_or_default(),
             host: req(t.host.clone(), "host", name)?,
             freq_hz: crate::check_hpsdr_freq_hz("input.freq_hz", req_freq(t.freq_hz)?)?,
             rate_hz: crate::check_hpsdr_rate_hz("input.rate_hz", req(t.rate_hz, "rate_hz", name)?)?,
@@ -1261,7 +1302,7 @@ fn validate_input(
 /// D5: every source key set belongs to `input.type`, and a source key
 /// needs a type.
 fn check_input_keys(t: &InputToml) -> std::result::Result<(), String> {
-    let set: [(&str, bool); 17] = [
+    let set: [(&str, bool); 18] = [
         ("device", t.device.is_some()),
         ("path", t.path.is_some()),
         ("iq", t.iq.is_some()),
@@ -1269,6 +1310,7 @@ fn check_input_keys(t: &InputToml) -> std::result::Result<(), String> {
         ("loop", t.looped.is_some()),
         ("host", t.host.is_some()),
         ("port", t.port.is_some()),
+        ("protocol", t.protocol.is_some()),
         ("freq_hz", t.freq_hz.is_some()),
         ("password", t.password.is_some()),
         ("driver", t.driver.is_some()),
@@ -2363,6 +2405,96 @@ mod tests {
             err.contains("input.rate_hz must be a finite number of Hz between"),
             "{err}"
         );
+    }
+
+    const HPSDR_BODY: &str =
+        "[input]\ntype = \"hpsdr\"\nhost = \"192.0.2.10\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n";
+
+    fn hpsdr_protocol_of(source: &Option<SourceFromFile>) -> manta_input::hpsdr::HpsdrProtocol {
+        match source {
+            Some(SourceFromFile::Hpsdr { protocol, .. }) => *protocol,
+            other => panic!("expected an hpsdr input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hpsdr_protocol_key_accepts_auto_1_2_strings_and_integers() {
+        use manta_input::hpsdr::HpsdrProtocol;
+        for (value, want) in [
+            ("\"auto\"", HpsdrProtocol::Auto),
+            ("\"1\"", HpsdrProtocol::One),
+            ("\"2\"", HpsdrProtocol::Two),
+            ("1", HpsdrProtocol::One),
+            ("2", HpsdrProtocol::Two),
+        ] {
+            let body = format!("{HPSDR_BODY}protocol = {value}\n");
+            let loaded = load_file(&body).unwrap_or_else(|e| panic!("{value}: {e:#}"));
+            assert_eq!(hpsdr_protocol_of(&loaded.input.source), want, "{value}");
+        }
+    }
+
+    #[test]
+    fn hpsdr_protocol_defaults_to_auto() {
+        let loaded = load_file(HPSDR_BODY).unwrap();
+        assert_eq!(
+            loaded.input.source,
+            Some(SourceFromFile::Hpsdr {
+                host: "192.0.2.10".into(),
+                port: 1024,
+                protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
+                freq_hz: 7_030_000.0,
+                rate_hz: 192_000.0,
+            })
+        );
+    }
+
+    #[test]
+    fn protocol_key_is_refused_for_other_input_types() {
+        let err =
+            err_of("[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7e6\nprotocol = \"2\"\n");
+        assert!(
+            err.contains("input.protocol does not apply to input.type = \"kiwi\""),
+            "{err}"
+        );
+        let err = err_of("[input]\nprotocol = \"2\"\n");
+        assert!(err.contains("input.protocol needs input.type"), "{err}");
+    }
+
+    #[test]
+    fn manta_input_protocol_env_is_read_verbatim() {
+        assert!(STRING_TYPED_ENV_KEYS.contains(&("input", "protocol")));
+        let loaded = load_env(
+            None,
+            &[
+                ("MANTA_INPUT_TYPE", "hpsdr"),
+                ("MANTA_INPUT_HOST", "192.0.2.10"),
+                ("MANTA_INPUT_FREQ_HZ", "7030000"),
+                ("MANTA_INPUT_RATE_HZ", "192000"),
+                ("MANTA_INPUT_PROTOCOL", "2"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            hpsdr_protocol_of(&loaded.input.source),
+            manta_input::hpsdr::HpsdrProtocol::Two
+        );
+    }
+
+    #[test]
+    fn invalid_protocol_value_names_the_choices() {
+        for (value, got) in [
+            ("\"3\"", "got \"3\""),
+            ("3", "got 3"),
+            ("\"two\"", "got \"two\""),
+        ] {
+            let err = err_of(&format!("{HPSDR_BODY}protocol = {value}\n"));
+            assert!(
+                err.contains(&format!(
+                    "input.protocol must be \"auto\", \"1\" or \"2\", {got}"
+                )),
+                "{value}: {err}"
+            );
+        }
     }
 
     #[test]

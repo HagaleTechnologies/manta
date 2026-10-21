@@ -286,6 +286,16 @@ impl Decimator {
         TRUSTED_HALF_BAND_FRACTION * self.fs_out
     }
 
+    /// Return every stage to its just-constructed state: zeroed history,
+    /// decimation phase 0. Used across an input discontinuity (MAN-305,
+    /// `manta-input`'s `DecimatingSource`) so pre-gap samples never leak
+    /// into post-gap output.
+    pub fn reset(&mut self) {
+        for stage in &mut self.stages {
+            stage.reset();
+        }
+    }
+
     /// Feed input IQ at fs_in; returns however many decimated samples
     /// became available (possibly 0, if too few input samples have
     /// accumulated through every cascade stage so far).

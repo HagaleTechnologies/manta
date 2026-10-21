@@ -1871,7 +1871,7 @@ flush_gap_dits = 7.0
 #   file:  path*, iq, realtime, loop
 #   kiwi:  host*, freq_hz*, port, password
 #   soapy: driver*, freq_hz*, rate_hz*, gain_db   (build with --features soapy)
-#   hpsdr: host*, freq_hz*, rate_hz*, port        (included in every build)
+#   hpsdr: host*, freq_hz*, rate_hz*, port, protocol (included in every build)
 #   ka9q:  group*, port, ssrc, interface
 # Any source flag on the command line (--device, --source, --kiwi-host,
 # --soapy-driver, --hpsdr-host, --ka9q-group) replaces a typed [input]
@@ -1879,6 +1879,7 @@ flush_gap_dits = 7.0
 # type = "kiwi"               # audio | file | kiwi | soapy | hpsdr | ka9q
 # host = "<your-kiwi-host>"   # kiwi, hpsdr
 # port = 8073                 # kiwi (default 8073), hpsdr (default 1024), ka9q (default 5004)
+# protocol = "auto"           # hpsdr: "auto" (default) asks the radio; "1" (Hermes-Lite 2) or "2" (ANAN) skips asking (--hpsdr-protocol)
 # freq_hz = 7030000.0         # kiwi, soapy, hpsdr: RF center frequency, Hz
 # password = ""               # kiwi (default "")
 # The other types' keys:

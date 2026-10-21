@@ -289,14 +289,16 @@ enum Command {
         #[cfg(feature = "soapy")]
         #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
         soapy_gain: Option<f64>,
-        /// HPSDR/Hermes device hostname or IP address.
+        /// openHPSDR radio hostname or IP address (protocol 1: Hermes-Lite 2, Hermes; protocol 2: ANAN).
         ///
         /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Included in every build.
         #[arg(help_heading = "HPSDR source")]
         #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
         #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
-        /// HPSDR/Hermes control port.
+        /// openHPSDR control port.
+        ///
+        /// Protocol 2 also sends to the three ports above it and receives IQ from this port + 11 (1035 by default).
         #[arg(
             long,
             default_value_t = manta_input::hpsdr::CONTROL_PORT,
@@ -304,6 +306,17 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_port: u16,
+        /// openHPSDR protocol the radio speaks.
+        ///
+        /// auto asks the radio and uses protocol 2 when it answers as protocol 2, protocol 1 otherwise; 1 and 2 skip the question.
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = HpsdrProtocolArg::Auto,
+            requires = "hpsdr_host",
+            help_heading = "HPSDR source"
+        )]
+        hpsdr_protocol: HpsdrProtocolArg,
         /// Receiver centre frequency, in Hz. Required with --hpsdr-host.
         #[arg(
             long = "hpsdr-freq-hz",
@@ -559,14 +572,16 @@ enum Command {
         #[cfg(feature = "soapy")]
         #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
         soapy_gain: Option<f64>,
-        /// HPSDR/Hermes device hostname or IP address.
+        /// openHPSDR radio hostname or IP address (protocol 1: Hermes-Lite 2, Hermes; protocol 2: ANAN).
         ///
         /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Included in every build.
         #[arg(help_heading = "HPSDR source")]
         #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
         #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
-        /// HPSDR/Hermes control port.
+        /// openHPSDR control port.
+        ///
+        /// Protocol 2 also sends to the three ports above it and receives IQ from this port + 11 (1035 by default).
         #[arg(
             long,
             default_value_t = manta_input::hpsdr::CONTROL_PORT,
@@ -574,6 +589,17 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_port: u16,
+        /// openHPSDR protocol the radio speaks.
+        ///
+        /// auto asks the radio and uses protocol 2 when it answers as protocol 2, protocol 1 otherwise; 1 and 2 skip the question.
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = HpsdrProtocolArg::Auto,
+            requires = "hpsdr_host",
+            help_heading = "HPSDR source"
+        )]
+        hpsdr_protocol: HpsdrProtocolArg,
         /// Receiver centre frequency, in Hz. Required with --hpsdr-host.
         #[arg(
             long = "hpsdr-freq-hz",
@@ -798,14 +824,16 @@ enum Command {
         #[cfg(feature = "soapy")]
         #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
         soapy_gain: Option<f64>,
-        /// HPSDR/Hermes device hostname or IP address.
+        /// openHPSDR radio hostname or IP address (protocol 1: Hermes-Lite 2, Hermes; protocol 2: ANAN).
         ///
         /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Included in every build.
         #[arg(help_heading = "HPSDR source")]
         #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
         #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
-        /// HPSDR/Hermes control port.
+        /// openHPSDR control port.
+        ///
+        /// Protocol 2 also sends to the three ports above it and receives IQ from this port + 11 (1035 by default).
         #[arg(
             long,
             default_value_t = manta_input::hpsdr::CONTROL_PORT,
@@ -813,6 +841,17 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_port: u16,
+        /// openHPSDR protocol the radio speaks.
+        ///
+        /// auto asks the radio and uses protocol 2 when it answers as protocol 2, protocol 1 otherwise; 1 and 2 skip the question.
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = HpsdrProtocolArg::Auto,
+            requires = "hpsdr_host",
+            help_heading = "HPSDR source"
+        )]
+        hpsdr_protocol: HpsdrProtocolArg,
         /// Receiver centre frequency, in Hz. Required with --hpsdr-host.
         #[arg(
             long = "hpsdr-freq-hz",
@@ -1030,14 +1069,16 @@ enum Command {
         #[cfg(feature = "soapy")]
         #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
         soapy_gain: Option<f64>,
-        /// HPSDR/Hermes device hostname or IP address.
+        /// openHPSDR radio hostname or IP address (protocol 1: Hermes-Lite 2, Hermes; protocol 2: ANAN).
         ///
         /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Included in every build.
         #[arg(help_heading = "HPSDR source")]
         #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
         #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
         hpsdr_host: Option<String>,
-        /// HPSDR/Hermes control port.
+        /// openHPSDR control port.
+        ///
+        /// Protocol 2 also sends to the three ports above it and receives IQ from this port + 11 (1035 by default).
         #[arg(
             long,
             default_value_t = manta_input::hpsdr::CONTROL_PORT,
@@ -1045,6 +1086,17 @@ enum Command {
             help_heading = "HPSDR source"
         )]
         hpsdr_port: u16,
+        /// openHPSDR protocol the radio speaks.
+        ///
+        /// auto asks the radio and uses protocol 2 when it answers as protocol 2, protocol 1 otherwise; 1 and 2 skip the question.
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = HpsdrProtocolArg::Auto,
+            requires = "hpsdr_host",
+            help_heading = "HPSDR source"
+        )]
+        hpsdr_protocol: HpsdrProtocolArg,
         /// Receiver centre frequency, in Hz. Required with --hpsdr-host.
         #[arg(
             long = "hpsdr-freq-hz",
@@ -1355,8 +1407,30 @@ struct SoapyOpts {
 struct HpsdrOpts {
     host: Option<String>,
     port: u16,
+    /// `--hpsdr-protocol` or `input.protocol` (MAN-305 D2).
+    protocol: manta_input::hpsdr::HpsdrProtocol,
     freq: Option<f64>,
     rate: Option<f64>,
+}
+
+/// `--hpsdr-protocol` values (MAN-305 §1): `auto`, `1`, `2`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum HpsdrProtocolArg {
+    Auto,
+    #[value(name = "1")]
+    One,
+    #[value(name = "2")]
+    Two,
+}
+
+impl From<HpsdrProtocolArg> for manta_input::hpsdr::HpsdrProtocol {
+    fn from(arg: HpsdrProtocolArg) -> Self {
+        match arg {
+            HpsdrProtocolArg::Auto => Self::Auto,
+            HpsdrProtocolArg::One => Self::One,
+            HpsdrProtocolArg::Two => Self::Two,
+        }
+    }
 }
 
 /// ka9q-radio (radiod) multicast flags, grouped for the same reason. No
@@ -1523,8 +1597,11 @@ impl LiveSourceSpec {
                     sample_rate_hz: rate,
                     center_freq_hz: vec![freq],
                 };
-                let mut sources = manta_input::hpsdr::HpsdrDevice::open(cfg)?;
-                Box::new(sources.remove(0))
+                // MAN-305 D2/D17: run, listen, soak, calibrate, check and
+                // doctor all open here, so each prints the same §4 line.
+                let opened = manta_input::hpsdr::open_receiver(&cfg, hpsdr.protocol)?;
+                log_hpsdr_open_line(&cfg.host, cfg.port, &opened);
+                opened.source
             }
             LiveSourceSpec::Ka9q(ka9q) => {
                 let group = ka9q
@@ -1712,6 +1789,11 @@ impl IqSource for FixedCenterFreqSource {
         self.inner.take_discontinuity()
     }
 
+    /// MAN-305: forwarded as `take_discontinuity` is.
+    fn take_missing_samples(&mut self) -> Option<u64> {
+        self.inner.take_missing_samples()
+    }
+
     /// MAN-259: `ReconnectingSource` reads this off the opener's result to
     /// end an outage where acquisition began.
     fn acquisition_start_offset(&self) -> std::time::Duration {
@@ -1795,6 +1877,71 @@ fn ka9q_agc_warning(ssrc: u32) -> String {
          in its radiod section, or one strong signal changes the gain for every signal in \
          the passband"
     )
+}
+
+/// A stderr line printed when an HPSDR radio opens (MAN-305 §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HpsdrOpenLine {
+    Note(String),
+    Warning(String),
+}
+
+/// MAN-305 §4: how the protocol was chosen, rendered from what
+/// `open_receiver` returned. `None` under `--hpsdr-protocol 1`, which
+/// prints nothing new.
+fn hpsdr_open_line(
+    host: &str,
+    port: u16,
+    protocol: manta_input::hpsdr::HpsdrProtocol,
+    discovery: &manta_input::hpsdr::Discovery,
+) -> Option<HpsdrOpenLine> {
+    use manta_input::hpsdr::{Discovery, DiscoveryReply, HpsdrProtocol};
+    match discovery {
+        Discovery::Answered(DiscoveryReply::Protocol2 {
+            board,
+            protocol_version,
+            firmware,
+            ..
+        }) => {
+            let (name, tail) = match manta_input::hpsdr::proto2::wire::board_info(Some(*board)).name
+            {
+                Some(name) => (name, ""),
+                None => ("unknown board", ", front-end filters bypassed"),
+            };
+            Some(HpsdrOpenLine::Note(format!(
+                "note: HPSDR radio {host}:{port} answered discovery as openHPSDR protocol 2 \
+                 (board {board}, {name}; protocol version {protocol_version}; firmware \
+                 {firmware}); connecting with protocol 2{tail}"
+            )))
+        }
+        Discovery::Answered(DiscoveryReply::Protocol1 {
+            board, firmware, ..
+        }) => Some(HpsdrOpenLine::Note(format!(
+            "note: HPSDR radio {host}:{port} answered discovery as openHPSDR protocol 1 \
+             (board {board}; firmware {firmware}); connecting with protocol 1"
+        ))),
+        Discovery::NoAnswer => Some(HpsdrOpenLine::Warning(format!(
+            "warning: HPSDR radio {host}:{port} did not answer discovery within 1 s; connecting \
+             with protocol 1 -- pass --hpsdr-protocol 2 (protocol = \"2\" under [input]) for a \
+             protocol-2 radio"
+        ))),
+        Discovery::Skipped => match protocol {
+            HpsdrProtocol::Two => Some(HpsdrOpenLine::Note(format!(
+                "note: HPSDR radio {host}:{port}: protocol 2 as configured; discovery skipped, \
+                 board unknown, front-end filters bypassed"
+            ))),
+            HpsdrProtocol::One | HpsdrProtocol::Auto => None,
+        },
+    }
+}
+
+/// Print [`hpsdr_open_line`] for a radio `open_receiver` just opened.
+fn log_hpsdr_open_line(host: &str, port: u16, opened: &manta_input::hpsdr::OpenedHpsdr) {
+    match hpsdr_open_line(host, port, opened.protocol, &opened.discovery) {
+        Some(HpsdrOpenLine::Note(line)) => logging::note(&line),
+        Some(HpsdrOpenLine::Warning(line)) => logging::warning(&line),
+        None => {}
+    }
 }
 
 /// MAN-131: `decode`'s analogue of `warn_if_audio_source_has_no_rf_reference`.
@@ -4076,6 +4223,7 @@ impl CliOverrides {
             hpsdr: HpsdrOpts {
                 host: None,
                 port: manta_input::hpsdr::CONTROL_PORT,
+                protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
                 freq: None,
                 rate: None,
             },
@@ -4571,11 +4719,13 @@ fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Resul
         config::SourceFromFile::Hpsdr {
             host,
             port,
+            protocol,
             freq_hz,
             rate_hz,
         } => LiveSourceSpec::Hpsdr(HpsdrOpts {
             host: Some(host.clone()),
             port: *port,
+            protocol: *protocol,
             freq: Some(*freq_hz),
             rate: Some(*rate_hz),
         }),
@@ -5717,6 +5867,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             soapy_gain,
             hpsdr_host,
             hpsdr_port,
+            hpsdr_protocol,
             hpsdr_freq_hz,
             hpsdr_rate_hz,
             ka9q_group,
@@ -5773,6 +5924,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 hpsdr: HpsdrOpts {
                     host: hpsdr_host,
                     port: hpsdr_port,
+                    protocol: hpsdr_protocol.into(),
                     freq: hpsdr_freq_hz,
                     rate: hpsdr_rate_hz,
                 },
@@ -6706,6 +6858,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             soapy_gain,
             hpsdr_host,
             hpsdr_port,
+            hpsdr_protocol,
             hpsdr_freq_hz,
             hpsdr_rate_hz,
             ka9q_group,
@@ -6758,6 +6911,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     hpsdr: HpsdrOpts {
                         host: hpsdr_host,
                         port: hpsdr_port,
+                        protocol: hpsdr_protocol.into(),
                         freq: hpsdr_freq_hz,
                         rate: hpsdr_rate_hz,
                     },
@@ -6886,6 +7040,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             soapy_gain,
             hpsdr_host,
             hpsdr_port,
+            hpsdr_protocol,
             hpsdr_freq_hz,
             hpsdr_rate_hz,
             ka9q_group,
@@ -6955,6 +7110,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     hpsdr: HpsdrOpts {
                         host: hpsdr_host,
                         port: hpsdr_port,
+                        protocol: hpsdr_protocol.into(),
                         freq: hpsdr_freq_hz,
                         rate: hpsdr_rate_hz,
                     },
@@ -7118,6 +7274,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             soapy_gain,
             hpsdr_host,
             hpsdr_port,
+            hpsdr_protocol,
             hpsdr_freq_hz,
             hpsdr_rate_hz,
             ka9q_group,
@@ -7159,6 +7316,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 hpsdr: HpsdrOpts {
                     host: hpsdr_host,
                     port: hpsdr_port,
+                    protocol: hpsdr_protocol.into(),
                     freq: hpsdr_freq_hz,
                     rate: hpsdr_rate_hz,
                 },
@@ -9754,6 +9912,7 @@ mod tests {
             LiveSourceSpec::Hpsdr(HpsdrOpts {
                 host: Some("192.168.1.100".into()),
                 port: manta_input::hpsdr::CONTROL_PORT,
+                protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
                 freq,
                 rate,
             })
@@ -10083,6 +10242,37 @@ mod tests {
             freq_hz: 14_000_000.0,
         };
         assert_eq!(src.take_discontinuity(), Some(48_000));
+        assert_eq!(src.take_discontinuity(), None);
+    }
+
+    /// MAN-305: the inner source's spliced loss reaches `listen()`, once.
+    #[test]
+    fn fixed_center_freq_source_forwards_take_missing_samples() {
+        struct MissingProbeSource {
+            missing: Option<u64>,
+        }
+        impl IqSource for MissingProbeSource {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                14_000_000.0
+            }
+            fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+            fn take_missing_samples(&mut self) -> Option<u64> {
+                self.missing.take()
+            }
+        }
+        let mut src = FixedCenterFreqSource {
+            inner: Box::new(MissingProbeSource {
+                missing: Some(11_900),
+            }),
+            freq_hz: 14_000_000.0,
+        };
+        assert_eq!(src.take_missing_samples(), Some(11_900));
+        assert_eq!(src.take_missing_samples(), None);
         assert_eq!(src.take_discontinuity(), None);
     }
 
@@ -10982,6 +11172,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             LiveSourceSpec::Hpsdr(HpsdrOpts {
                 host: Some("h".into()),
                 port: 1024,
+                protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
                 freq: Some(7e6),
                 rate: Some(48e3)
             })
@@ -11209,6 +11400,117 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
     }
 
+    const HPSDR_P2_REPLY: manta_input::hpsdr::DiscoveryReply =
+        manta_input::hpsdr::DiscoveryReply::Protocol2 {
+            status: 2,
+            mac: [0; 6],
+            board: 5,
+            protocol_version: 39,
+            firmware: 21,
+            ddc_count: 4,
+        };
+
+    #[test]
+    fn hpsdr_protocol_2_note_names_board_version_firmware() {
+        use manta_input::hpsdr::{Discovery, HpsdrProtocol};
+        assert_eq!(
+            hpsdr_open_line(
+                "192.0.2.10",
+                1024,
+                HpsdrProtocol::Two,
+                &Discovery::Answered(HPSDR_P2_REPLY)
+            ),
+            Some(HpsdrOpenLine::Note(
+                "note: HPSDR radio 192.0.2.10:1024 answered discovery as openHPSDR protocol 2 \
+                 (board 5, Orion II; protocol version 39; firmware 21); connecting with protocol 2"
+                    .into()
+            ))
+        );
+    }
+
+    #[test]
+    fn hpsdr_protocol_1_note() {
+        use manta_input::hpsdr::{Discovery, DiscoveryReply, HpsdrProtocol};
+        let reply = DiscoveryReply::Protocol1 {
+            status: 2,
+            mac: [0; 6],
+            firmware: 73,
+            board: 6,
+        };
+        assert_eq!(
+            hpsdr_open_line(
+                "192.0.2.10",
+                1024,
+                HpsdrProtocol::One,
+                &Discovery::Answered(reply)
+            ),
+            Some(HpsdrOpenLine::Note(
+                "note: HPSDR radio 192.0.2.10:1024 answered discovery as openHPSDR protocol 1 \
+                 (board 6; firmware 73); connecting with protocol 1"
+                    .into()
+            ))
+        );
+    }
+
+    #[test]
+    fn hpsdr_no_answer_warning_names_the_flag_and_key() {
+        use manta_input::hpsdr::{Discovery, HpsdrProtocol};
+        assert_eq!(
+            hpsdr_open_line("192.0.2.10", 1024, HpsdrProtocol::One, &Discovery::NoAnswer),
+            Some(HpsdrOpenLine::Warning(
+                "warning: HPSDR radio 192.0.2.10:1024 did not answer discovery within 1 s; \
+                 connecting with protocol 1 -- pass --hpsdr-protocol 2 (protocol = \"2\" under \
+                 [input]) for a protocol-2 radio"
+                    .into()
+            ))
+        );
+    }
+
+    #[test]
+    fn hpsdr_forced_protocol_2_note() {
+        use manta_input::hpsdr::{Discovery, HpsdrProtocol};
+        assert_eq!(
+            hpsdr_open_line("192.0.2.10", 1024, HpsdrProtocol::Two, &Discovery::Skipped),
+            Some(HpsdrOpenLine::Note(
+                "note: HPSDR radio 192.0.2.10:1024: protocol 2 as configured; discovery \
+                 skipped, board unknown, front-end filters bypassed"
+                    .into()
+            ))
+        );
+        // `--hpsdr-protocol 1` prints nothing new.
+        assert_eq!(
+            hpsdr_open_line("192.0.2.10", 1024, HpsdrProtocol::One, &Discovery::Skipped),
+            None
+        );
+    }
+
+    #[test]
+    fn hpsdr_unknown_board_note() {
+        use manta_input::hpsdr::{Discovery, DiscoveryReply, HpsdrProtocol};
+        let reply = DiscoveryReply::Protocol2 {
+            status: 2,
+            mac: [0; 6],
+            board: 42,
+            protocol_version: 41,
+            firmware: 12,
+            ddc_count: 2,
+        };
+        assert_eq!(
+            hpsdr_open_line(
+                "192.0.2.10",
+                1024,
+                HpsdrProtocol::Two,
+                &Discovery::Answered(reply)
+            ),
+            Some(HpsdrOpenLine::Note(
+                "note: HPSDR radio 192.0.2.10:1024 answered discovery as openHPSDR protocol 2 \
+                 (board 42, unknown board; protocol version 41; firmware 12); connecting with \
+                 protocol 2, front-end filters bypassed"
+                    .into()
+            ))
+        );
+    }
+
     #[test]
     fn ka9q_agc_warning_is_design_section_3s_text() {
         assert_eq!(
@@ -11236,6 +11538,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("soapy_gain", "input.gain_db"),
         ("hpsdr_host", "input.host"),
         ("hpsdr_port", "input.port"),
+        ("hpsdr_protocol", "input.protocol"),
         ("hpsdr_freq_hz", "input.freq_hz"),
         ("hpsdr_rate_hz", "input.rate_hz"),
         ("ka9q_group", "input.group"),
@@ -11389,7 +11692,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             ),
             (
                 "hpsdr",
-                "type = \"hpsdr\"\nhost = \"h\"\nport = 1024\nfreq_hz = 7e6\nrate_hz = 48000.0\n",
+                "type = \"hpsdr\"\nhost = \"h\"\nport = 1024\nprotocol = \"2\"\nfreq_hz = 7e6\nrate_hz = 48000.0\n",
             ),
             (
                 "ka9q",
