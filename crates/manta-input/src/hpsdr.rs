@@ -971,6 +971,9 @@ pub(crate) fn open_receiver_with(
     protocol: HpsdrProtocol,
     timing: &discovery::ProbeTiming,
 ) -> Result<OpenedHpsdr> {
+    // MAN-259: the discovery probe runs inside the reconnect's open call
+    // and streams nothing, so it is outage too.
+    let entered = Instant::now();
     let discovery = match protocol {
         HpsdrProtocol::Auto => discovery::probe(&cfg.host, cfg.port, timing)?,
         HpsdrProtocol::One | HpsdrProtocol::Two => Discovery::Skipped,
@@ -992,12 +995,18 @@ pub(crate) fn open_receiver_with(
         }
         _ => (HpsdrProtocol::One, None),
     };
+    let before_open = entered.elapsed();
     let source: Box<dyn IqSource + Send> = match protocol {
-        HpsdrProtocol::Two => Box::new(Protocol2IqSource::open(
-            cfg,
-            proto2::wire::board_info(board),
-        )?),
-        _ => Box::new(open_protocol_1(cfg)?),
+        HpsdrProtocol::Two => {
+            let mut src = Protocol2IqSource::open(cfg, proto2::wire::board_info(board))?;
+            src.acquisition_start_offset += before_open;
+            Box::new(src)
+        }
+        _ => {
+            let mut src = open_protocol_1(cfg)?;
+            src.acquisition_start_offset += before_open;
+            Box::new(src)
+        }
     };
     Ok(OpenedHpsdr {
         source,
@@ -2243,6 +2252,12 @@ mod open_receiver_tests {
         assert!(
             took >= Duration::from_secs(1) && took < Duration::from_millis(1500),
             "open took {took:?}"
+        );
+        // MAN-259: the silent probe is outage, so acquisition starts after it.
+        let offset = opened.source.acquisition_start_offset();
+        assert!(
+            offset >= Duration::from_secs(1) && offset <= took,
+            "offset {offset:?}, open took {took:?}"
         );
         let first = wait_for(&fake, 0, |d| !is_discovery(d));
         assert_eq!(first[..3], [0xEF, 0xFE, 0x01]);

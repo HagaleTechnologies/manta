@@ -193,7 +193,15 @@ move the spot clock by days (self-review finding;
 - otherwise it is added to a pending `take_discontinuity()` value;
 - a restart reports `take_discontinuity()` with the wall-clock estimate
   `max(0, round(elapsed_since_last_valid_datagram × fs) − 238)`, so the clock
-  stays true across a watchdog stop and restart;
+  stays true across a watchdog stop and restart. "Valid" here (and in D10's
+  plausible-jump bound) means accepted: stale datagrams move only the D13
+  stall clock, so a restart after seven stale ones still measures the whole
+  outage (PR #357 review; `a_restart_after_stale_datagrams_measures_the_whole_outage`);
+- `acquisition_start_offset()` (MAN-259) is the time from entering
+  `open_receiver` (the `auto` probe included) to immediately before the
+  first run = 1, so a reconnect counts the probe and the 200 ms bring-up as
+  outage rather than shifting later spots early (PR #357 review). Protocol 1
+  under `auto` adds the probe time to its own offset the same way;
 - when a gap is found after `read()` has filled n > 0 samples in the current
   call, `read()` returns n at once and holds the new datagram for the next
   call, so a report always describes the samples that call returns.

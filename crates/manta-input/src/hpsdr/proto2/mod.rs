@@ -175,9 +175,17 @@ pub struct Protocol2IqSource {
     queue_pos: usize,
     pending_missing: Option<u64>,
     pending_discontinuity: Option<u64>,
-    /// Time of the last valid IQ datagram (or of the open): the stall
-    /// clock and the restart estimate (D11/D13).
+    /// Time of the last valid IQ datagram (or of the open), stale ones
+    /// included: the stall clock (D13).
     last_valid_iq: Instant,
+    /// Time of the last IQ datagram the tracker accepted (or of the open):
+    /// the restart estimate and the plausible-gap bound (D10/D11). Stale
+    /// datagrams do not move it, so a restart after stale ones still
+    /// measures the whole outage.
+    last_accepted_iq: Instant,
+    /// MAN-259: offset from entering `open()` to immediately before the
+    /// first run command; [`super::open_receiver`] adds its discovery time.
+    pub(crate) acquisition_start_offset: Duration,
     consecutive_malformed: u32,
     recv_buf: Box<[u8]>,
     sample_rate_hz: f64,
@@ -193,6 +201,7 @@ pub struct Protocol2IqSource {
 impl Protocol2IqSource {
     /// Validate `cfg` for protocol 2, bring the radio up and return DDC0.
     pub fn open(cfg: &HpsdrConfig, board: wire::BoardInfo) -> Result<Self> {
+        let entered = Instant::now();
         let (rate_khz, freq_hz) = validate_protocol2(cfg)?;
         let radio_ip = (cfg.host.as_str(), cfg.port)
             .to_socket_addrs()
@@ -234,6 +243,8 @@ impl Protocol2IqSource {
             pending_missing: None,
             pending_discontinuity: None,
             last_valid_iq: now,
+            last_accepted_iq: now,
+            acquisition_start_offset: Duration::ZERO,
             consecutive_malformed: 0,
             recv_buf: vec![0u8; RECV_BUF_LEN].into_boxed_slice(),
             sample_rate_hz: cfg.sample_rate_hz,
@@ -257,6 +268,9 @@ impl Protocol2IqSource {
             }
             thread::sleep(wait);
         }
+        // MAN-259: the radio streams from run = 1 on; the bring-up before
+        // it is still outage.
+        src.acquisition_start_offset = entered.elapsed();
         for _ in 0..INITIAL_BURST_REPEATS {
             src.send(Stream::HighPriority, true)
                 .context("send HPSDR protocol 2 start (high-priority run = 1)")?;
@@ -266,6 +280,7 @@ impl Protocol2IqSource {
         src.last_rx_tx_specific = now;
         src.last_general = now;
         src.last_valid_iq = now;
+        src.last_accepted_iq = now;
         Ok(src)
     }
 
@@ -352,9 +367,13 @@ impl Protocol2IqSource {
         self.consecutive_malformed = 0;
         self.confirmed_live.store(true, Ordering::Relaxed);
         let now = Instant::now();
-        let since_last = now.duration_since(self.last_valid_iq);
+        let since_last = now.duration_since(self.last_accepted_iq);
         self.last_valid_iq = now;
-        match self.tracker.observe(seq) {
+        let event = self.tracker.observe(seq);
+        if !matches!(event, wire::SeqEvent::Stale) {
+            self.last_accepted_iq = now;
+        }
+        match event {
             wire::SeqEvent::InOrder => {}
             wire::SeqEvent::Stale => self.queue.clear(),
             // A jump no wall clock allows is a restart, not a loss: a
@@ -480,6 +499,10 @@ impl IqSource for Protocol2IqSource {
 
     fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
         Some(self.health_counters.clone())
+    }
+
+    fn acquisition_start_offset(&self) -> Duration {
+        self.acquisition_start_offset
     }
 }
 
@@ -903,6 +926,45 @@ mod tests {
         let stats = src.gap_stats();
         assert_eq!(stats.dropped_packets, 0);
         assert_eq!(stats.gaps_detected, 1);
+    }
+
+    #[test]
+    fn a_restart_after_stale_datagrams_measures_the_whole_outage() {
+        let fake = FakeP2Radio::start();
+        let mut src = open(&fake);
+        let seqs: Vec<u32> = (0..200).collect();
+        feed(&fake, &mut src, &seqs);
+        thread::sleep(Duration::from_millis(300));
+        // Seven stale datagrams, then the eighth restarts the stream: the
+        // estimate still runs from 199, not from the last stale one.
+        for s in 190..197 {
+            fake.send_iq(s);
+        }
+        fake.send_iq(197);
+        assert_eq!(read_one(&mut src), (197, 238));
+        let d = src
+            .take_discontinuity()
+            .expect("restart reports a discontinuity");
+        assert!((52_600..=62_600).contains(&d), "discontinuity {d}");
+        assert_eq!(src.gap_stats().dropped_packets, 0);
+    }
+
+    #[test]
+    fn acquisition_starts_after_the_bring_up_before_run() {
+        let fake = FakeP2Radio::start();
+        let start = Instant::now();
+        let src = open(&fake);
+        let open_took = start.elapsed();
+        let offset = src.acquisition_start_offset();
+        let bring_up = AFTER_GENERAL + AFTER_RX_SPECIFIC + AFTER_TX_SPECIFIC;
+        assert!(
+            offset >= bring_up,
+            "offset {offset:?} < bring-up {bring_up:?}"
+        );
+        assert!(
+            offset <= open_took,
+            "offset {offset:?} > open {open_took:?}"
+        );
     }
 
     #[test]
