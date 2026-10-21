@@ -33,10 +33,13 @@ fn frame_larger_than_the_bound_is_rejected_not_buffered() {
         oversized.extend_from_slice(b"SND");
         oversized.resize(64 * 1024 + 4096, 0);
         ws.send(Message::binary(oversized)).unwrap();
-        // Park with a bounded read: hold the connection open so neither a
-        // close nor a reset from this side can be what ends the client's
-        // read -- only the frame's size may end it.
-        let _ = ws.read();
+        // Park with bounded reads until the client hangs up (or the 30 s
+        // read timeout fires): hold the connection open so neither a close
+        // nor a reset from this side can be what ends the client's read --
+        // only the frame's size may end it. One read is not a park: it
+        // returns with the client's next SET, and closing then resets
+        // `connect()` mid SET burst (MAN-411).
+        while ws.read().is_ok() {}
     });
 
     let mut src = KiwiIqSource::connect("127.0.0.1", port, 14_025_000.0, "").unwrap();

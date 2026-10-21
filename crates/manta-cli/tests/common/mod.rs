@@ -104,27 +104,62 @@ pub fn line_channel(reader: impl Read + Send + 'static) -> Receiver<String> {
 }
 
 /// Waits up to `timeout` for a line containing every one of `needles`, and
-/// returns it. Panics naming what was missing; a disconnected channel means
-/// the stream ended first (the process exited, or the socket closed).
+/// returns it. Panics naming what was missing, followed by every line
+/// scanned on the way (MAN-411: a bare needle left a day of macOS timeouts
+/// undiagnosed); a disconnected channel means the stream ended first (the
+/// process exited, or the socket closed).
 pub fn expect_line(rx: &Receiver<String>, needles: &[&str], timeout: Duration) -> String {
-    let deadline = Instant::now() + timeout;
+    expect_line_all(rx, needles, timeout).0
+}
+
+/// [`expect_line`], also returning every line scanned before the match, for
+/// assertions on what the daemon logged on the way there.
+pub fn expect_line_all(
+    rx: &Receiver<String>,
+    needles: &[&str],
+    timeout: Duration,
+) -> (String, Vec<String>) {
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let mut scanned: Vec<(Duration, String)> = Vec::new();
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left) {
             Ok(line) => {
                 if needles.iter().all(|n| line.contains(n)) {
-                    return line;
+                    return (line, scanned.into_iter().map(|(_, l)| l).collect());
                 }
+                scanned.push((start.elapsed(), line));
             }
-            Err(RecvTimeoutError::Timeout) => {
-                panic!("no line containing {needles:?} within {timeout:?}")
-            }
+            Err(RecvTimeoutError::Timeout) => panic!(
+                "no line containing {needles:?} within {timeout:?}; scanned:\n{}",
+                dump_scanned(&scanned)
+            ),
             Err(RecvTimeoutError::Disconnected) => panic!(
                 "the stream ended before a line containing {needles:?} -- if the daemon \
-                 exited, the fixture ended before it; raise FIXTURE_SECONDS"
+                 exited, the fixture ended before it; raise FIXTURE_SECONDS; scanned:\n{}",
+                dump_scanned(&scanned)
             ),
         }
     }
+}
+
+/// The most scanned lines a failed [`expect_line`] dumps: enough for a whole
+/// reconnect ladder, few enough that a chatty daemon cannot bury the panic.
+const DUMP_LINES: usize = 200;
+
+/// The last [`DUMP_LINES`] of `scanned`, one per line, each prefixed with
+/// its arrival time since the wait began.
+fn dump_scanned(scanned: &[(Duration, String)]) -> String {
+    let skip = scanned.len().saturating_sub(DUMP_LINES);
+    let mut out = String::new();
+    if skip > 0 {
+        out.push_str(&format!("  ({skip} earlier lines omitted)\n"));
+    }
+    for (at, line) in &scanned[skip..] {
+        out.push_str(&format!("  +{:7.3}s {line}\n", at.as_secs_f64()));
+    }
+    out
 }
 
 /// How long the fake KiwiSDR waits for manta to connect.

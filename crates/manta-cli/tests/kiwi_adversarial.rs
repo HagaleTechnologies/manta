@@ -13,13 +13,17 @@
 //! observable outcome: reconnect logged and still running, in-place
 //! discard with NO reconnect, or a prompt clean startup failure.
 //!
-//! Run serialized (`-- --test-threads=1`): the SND pacing is real-time,
-//! matching the existing fake-Kiwi tests' discipline.
+//! The SND pacing is real-time. CI runs this binary in parallel with the
+//! rest of `cargo test --workspace`, with no `--test-threads` override, so
+//! each scenario must tolerate a loaded machine by construction: no fake
+//! receiver may depend on how soon the OS reports a hang-up (MAN-411). A
+//! serialized run (`-- --test-threads=1`) still works but is not required.
 
 mod common;
 
 use common::{
-    accept_kiwi_session, expect_line, line_channel, send_snd_frames, wait_bounded, KillOnDrop,
+    accept_kiwi_session, expect_line, expect_line_all, line_channel, send_snd_frames, wait_bounded,
+    KillOnDrop,
 };
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
@@ -299,6 +303,38 @@ fn unknown_tag_and_truncated_frames_are_discarded_in_place() {
     fake.join().expect("the fake KiwiSDR panicked").unwrap();
 }
 
+/// MAN-411: serves every connection manta opens after its first, until
+/// `done` or `WAIT` passes: the handshake, then real-time SND frames until
+/// `done` or the client hangs up, then the next connection. A connection
+/// that fails the handshake -- a reopen attempt manta has already
+/// abandoned, which EOFs at `SET auth` -- is recorded and skipped, never
+/// fatal, so the listener stays open for the attempt after it. Errs only if
+/// no session was ever served, naming the connections that failed.
+fn serve_reconnects(listener: &TcpListener, done: &AtomicBool) -> Result<(), String> {
+    let deadline = Instant::now() + WAIT;
+    let mut served = 0usize;
+    let mut failed = Vec::new();
+    while !done.load(Ordering::Relaxed) && Instant::now() < deadline {
+        match accept_kiwi_session(listener, done) {
+            Ok(mut ws) => {
+                served += 1;
+                send_snd_frames(&mut ws, || done.load(Ordering::Relaxed));
+            }
+            Err(e) => {
+                failed.push(e);
+                // An accept error that persists must not spin the loop.
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    if served == 0 {
+        return Err(format!(
+            "manta never reconnected to the fake KiwiSDR; failed connections: {failed:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// One WebSocket frame larger than `kiwi.rs`'s `MAX_WS_FRAME_BYTES`
 /// (MAN-275) mid-stream: the client's read errors (tungstenite Capacity),
 /// the connection is dropped and reconnected -- the daemon keeps running.
@@ -313,6 +349,20 @@ fn oversized_frame_midstream_is_survived() {
         let done = done.clone();
         move || -> Result<(), String> {
             let mut ws = accept_kiwi_session(&listener, &done)?;
+            // MAN-411: the reconnect is served by its own acceptor, so it
+            // never waits on a send below failing -- how soon the poisoned
+            // socket's hang-up surfaces as a write error depends on the OS
+            // and its load, and one missed reconnect left a one-shot accept
+            // serving a stale connection, then refusing every later one.
+            // Spawned only now: started earlier, it races this thread for
+            // manta's first connection.
+            let reconnects = {
+                let listener = listener
+                    .try_clone()
+                    .map_err(|e| format!("cloning the listener: {e}"))?;
+                let done = done.clone();
+                std::thread::spawn(move || serve_reconnects(&listener, &done))
+            };
             let until = Instant::now() + STREAM_FOR;
             send_snd_frames(&mut ws, || {
                 done.load(Ordering::Relaxed) || Instant::now() >= until
@@ -330,10 +380,11 @@ fn oversized_frame_midstream_is_survived() {
                 .map_err(|e| format!("sending the oversized frame: {e}"))?;
             send_snd_frames(&mut ws, || done.load(Ordering::Relaxed));
             // The client drops the poisoned connection once its read
-            // errors; accept and stream once more.
-            let mut ws2 = accept_kiwi_session(&listener, &done)?;
-            send_snd_frames(&mut ws2, || done.load(Ordering::Relaxed));
-            Ok(())
+            // errors; `reconnects` serves whatever it opens next.
+            drop(ws);
+            reconnects
+                .join()
+                .map_err(|_| "the reconnect acceptor panicked".to_string())?
         }
     });
 
@@ -341,7 +392,18 @@ fn oversized_frame_midstream_is_survived() {
     let stderr = line_channel(child.0.stderr.take().expect("stderr piped"));
 
     expect_line(&stderr, &["source kiwi lost"], WAIT);
-    expect_line(&stderr, &["source kiwi reconnected"], WAIT);
+    let (_, before) = expect_line_all(&stderr, &["source kiwi reconnected"], WAIT);
+    // The reconnect must be prompt, not the end of a backoff ladder: one
+    // stale connection may cost an attempt or two, a dead receiver all.
+    let failed = before
+        .iter()
+        .filter(|l| l.contains("reconnect attempt failed"))
+        .count();
+    assert!(
+        failed < 3,
+        "{failed} reopen attempts failed before the reconnect; stderr:\n{}",
+        before.join("\n")
+    );
     assert!(
         child.0.try_wait().unwrap().is_none(),
         "the daemon must still be running after an oversized frame"
