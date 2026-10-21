@@ -149,6 +149,39 @@ impl RttyObserver {
     }
 }
 
+/// MAN-14: the shared validator's per-input cross-input dedupe withholds
+/// (`SuppressionCounts::cross_input_dedupe_by_input`), copied by the
+/// multi-input back end after each batch for a poller to publish. Values
+/// never decrease (`fetch_max`, as `static_crashes`).
+#[derive(Debug, Default)]
+pub struct SuppressionObserver {
+    per_input: Vec<AtomicU64>,
+}
+
+impl SuppressionObserver {
+    /// One zeroed count per input.
+    pub fn new(n_inputs: usize) -> Self {
+        Self {
+            per_input: (0..n_inputs).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    /// Each input's count so far, in input order.
+    pub fn per_input(&self) -> Vec<u64> {
+        self.per_input
+            .iter()
+            .map(|n| n.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    /// Raises each input's count to `counts[i]`; a lower value is ignored.
+    pub fn store_max(&self, counts: &[u64]) {
+        for (slot, &n) in self.per_input.iter().zip(counts) {
+            slot.fetch_max(n, Ordering::Relaxed);
+        }
+    }
+}
+
 /// MAN-314: empties the RTTY observer on construction and on every exit
 /// path, like `ActiveTracksGuard`, and publishes the segment's marked set
 /// when the track manager reports a change.
@@ -1052,6 +1085,9 @@ pub(crate) struct Back<'a> {
     /// Last received batch per input, for synthetic closures after a
     /// failure. Only populated when the live tap needs closure times.
     input_end_ts: Vec<u64>,
+    /// MAN-14: where the validator's per-input cross-input dedupe counts
+    /// go after each batch; `None` skips the copy.
+    suppressions: Option<Arc<SuppressionObserver>>,
 }
 
 impl<'a> Back<'a> {
@@ -1081,6 +1117,20 @@ impl<'a> Back<'a> {
             },
             open: BTreeSet::new(),
             input_end_ts: Vec::new(),
+            suppressions: shared.suppressions.clone(),
+        }
+    }
+
+    /// MAN-14: publishes the validator's per-input cross-input dedupe
+    /// counts, when an observer is registered.
+    fn report_suppressions(&self) {
+        if let Some(observer) = &self.suppressions {
+            observer.store_max(
+                &self
+                    .validator
+                    .suppression_counts()
+                    .cross_input_dedupe_by_input,
+            );
         }
     }
 
@@ -1136,6 +1186,7 @@ impl<'a> Back<'a> {
         if let (Some(tap), Some(band)) = (self.ctx.live.as_ref(), batch.band) {
             tap.publish_band(band);
         }
+        self.report_suppressions();
     }
 
     /// An input has ended. One that errored or panicked sent no `finish()`
@@ -1185,6 +1236,7 @@ impl<'a> Back<'a> {
         if let Some(tap) = self.ctx.live.as_mut() {
             tap.retain_input_tracks(input, n_inputs, &[]);
         }
+        self.report_suppressions();
     }
 }
 
@@ -1533,6 +1585,91 @@ mod tests {
         assert_eq!(effective_guard_hz(0.0, 600.0), 600.0);
         assert_eq!(effective_guard_hz(900.0, 600.0), 900.0);
         assert_eq!(effective_guard_hz(0.0, 0.0), 0.0);
+    }
+
+    /// MAN-14: one input's transmission, as the validator tests build it.
+    fn transmission(track_id: u32, start_ts: u64) -> Vec<DecoderEvent> {
+        let mut events = vec![DecoderEvent::TrackMeta {
+            track_id,
+            sample_ts: start_ts,
+            snr_2500_db: 20.0,
+            freq_hz: 14_012_340.0 + f64::from(track_id),
+        }];
+        let mut ts = start_ts;
+        for word in ["DE", "W1AW", "K"] {
+            for c in word.chars() {
+                events.push(DecoderEvent::char_decoded(
+                    track_id,
+                    ts,
+                    manta_decode::tree::Glyph::Char(c),
+                    0.95,
+                ));
+                ts += 100;
+            }
+            events.push(DecoderEvent::word_boundary(track_id, ts));
+            ts += 100;
+        }
+        events
+    }
+
+    #[test]
+    fn back_publishes_cross_input_dedupe_counts_per_withheld_input() {
+        let observer = Arc::new(SuppressionObserver::new(2));
+        let shared = crate::multi::SharedObservers {
+            suppressions: Some(observer.clone()),
+            ..Default::default()
+        };
+        let cfg = PipelineConfig::default();
+        let mut back = Back::new(
+            &shared,
+            cfg.shared_validator(48_000.0, 2).unwrap(),
+            48_000.0,
+        );
+        let batch = |end_ts, events| Batch {
+            events,
+            end_ts,
+            n_tracks: 1,
+            live_ids: None,
+            band: None,
+        };
+        let mut spots = Vec::new();
+        // Input 0 (track 1) spots W1AW first; input 1 (track 2) hears the
+        // same signal and is withheld.
+        for start in [0, 100_000, 200_000] {
+            back.ingest(
+                0,
+                2,
+                batch(start + 5_000, transmission(1, start)),
+                &mut |_| {},
+                &mut |s| spots.push(s.clone()),
+            );
+            back.ingest(
+                1,
+                2,
+                batch(start + 5_050, transmission(2, start + 50)),
+                &mut |_| {},
+                &mut |s| spots.push(s.clone()),
+            );
+        }
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        assert_eq!(spots[0].track_id, 1);
+        let counts = observer.per_input();
+        assert_eq!(counts[0], 0, "{counts:?}");
+        assert!(counts[1] >= 1, "{counts:?}");
+        // A stale, lower snapshot never lowers a published count.
+        observer.store_max(&[0, 0]);
+        assert_eq!(observer.per_input(), counts);
+        // No observer registered: the same batches run without one.
+        let none = crate::multi::SharedObservers::default();
+        let mut quiet = Back::new(&none, cfg.shared_validator(48_000.0, 2).unwrap(), 48_000.0);
+        quiet.ingest(
+            0,
+            2,
+            batch(5_000, transmission(1, 0)),
+            &mut |_| {},
+            &mut |_| {},
+        );
+        quiet.close_input(0, 2, &mut |_| {}, &mut |_| {});
     }
 
     #[test]

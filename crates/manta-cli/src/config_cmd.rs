@@ -432,6 +432,7 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             }
             let optional = [
                 ("status_interval_secs", s.status_interval_secs),
+                ("silent_input_warning_secs", s.silent_input_warning_secs),
                 ("history_minutes", s.history_minutes.map(u64::from)),
                 (
                     "telnet_max_connections_per_ip",
@@ -1803,6 +1804,7 @@ mod tests {
     /// that value changes the typed config (None -> Some) but not behaviour.
     const BUILTIN_EQUIVALENT: &[(&str, &str)] = &[
         ("server", "status_interval_secs"),
+        ("server", "silent_input_warning_secs"),
         ("server", "history_minutes"),
         ("server", "telnet_max_connections_per_ip"),
         ("server", "json_max_connections_per_ip"),
@@ -1993,6 +1995,10 @@ mod tests {
         assert_eq!(
             int("status_interval_secs"),
             status::DEFAULT_STATUS_INTERVAL.as_secs()
+        );
+        assert_eq!(
+            int("silent_input_warning_secs"),
+            manta_server::config::DEFAULT_SILENT_INPUT_WARNING_SECS
         );
         assert_eq!(
             int("history_minutes"),

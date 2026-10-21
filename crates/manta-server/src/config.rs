@@ -361,6 +361,35 @@ where
     Ok(value)
 }
 
+/// MAN-14: the silent-input window's default, in seconds.
+pub const DEFAULT_SILENT_INPUT_WARNING_SECS: u64 = 600;
+/// MAN-14: a non-zero silent-input window's bounds, in seconds.
+pub const SILENT_INPUT_WARNING_SECS: std::ops::RangeInclusive<u64> = 60..=86_400;
+
+fn check_silent_input_warning_secs(value: u64) -> Result<(), String> {
+    if value != 0 && !SILENT_INPUT_WARNING_SECS.contains(&value) {
+        return Err(format!(
+            "silent_input_warning_secs must be 0 (off) or {} to {}, got {value}",
+            SILENT_INPUT_WARNING_SECS.start(),
+            SILENT_INPUT_WARNING_SECS.end()
+        ));
+    }
+    Ok(())
+}
+
+fn deserialize_optional_silent_input_warning_secs<'de, D>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: Option<u64> = Option::deserialize(deserializer)?;
+    if let Some(value) = value {
+        check_silent_input_warning_secs(value).map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
+}
+
 fn deserialize_optional_latitude<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
 where
     D: Deserializer<'de>,
@@ -534,6 +563,16 @@ pub struct ServerConfig {
     /// See `docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md`.
     #[serde(default, deserialize_with = "deserialize_optional_history_minutes")]
     pub history_minutes: Option<u32>,
+    /// MAN-14: seconds an input of a multi-input daemon may decode no
+    /// spots -- while another input does -- before manta warns and sets
+    /// `manta_input_silent{source}` to 1. `None` (field omitted) uses
+    /// `DEFAULT_SILENT_INPUT_WARNING_SECS` (600); `0` turns the check off;
+    /// otherwise `SILENT_INPUT_WARNING_SECS`. Ignored with one input.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_silent_input_warning_secs"
+    )]
+    pub silent_input_warning_secs: Option<u64>,
     /// Which telnet wire layout the INBOUND cluster server emits
     /// (MAN-88). Defaults to `"rbn"`, the RBN relay's fixed-column AK1A
     /// layout that downstream loggers parse today. `"skimmer"` selects
@@ -627,6 +666,17 @@ pub struct StationLocation {
 }
 
 impl ServerConfig {
+    /// MAN-14: the silent-input check's window, `None` when it is off.
+    pub fn silent_input_window(&self) -> Option<std::time::Duration> {
+        match self
+            .silent_input_warning_secs
+            .unwrap_or(DEFAULT_SILENT_INPUT_WARNING_SECS)
+        {
+            0 => None,
+            secs => Some(std::time::Duration::from_secs(secs)),
+        }
+    }
+
     /// The cross-key rules serde's per-field validators cannot express:
     /// lat and lon come as a pair, and a point given alongside a grid must
     /// lie inside it -- otherwise `deGrid` and `deLat`/`deLon` would
@@ -1096,6 +1146,7 @@ pub struct DaemonConfigFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn parses_station_callsign_with_default_ports() {
@@ -2295,6 +2346,37 @@ mod tests {
             assert_eq!(
                 server_with(&format!("history_minutes = {minutes}")).history_minutes,
                 Some(minutes)
+            );
+        }
+    }
+
+    /// MAN-14: the silent-input window: 600 by default, 0 turns it off,
+    /// otherwise 60 to 86400.
+    #[test]
+    fn silent_input_warning_secs_defaults_to_600_and_accepts_0_or_60_through_86400() {
+        let cfg = server_with("");
+        assert_eq!(cfg.silent_input_warning_secs, None);
+        assert_eq!(cfg.silent_input_window(), Some(Duration::from_secs(600)));
+        assert_eq!(
+            server_with("silent_input_warning_secs = 0").silent_input_window(),
+            None
+        );
+        for secs in [60, 600, 86_400] {
+            assert_eq!(
+                server_with(&format!("silent_input_warning_secs = {secs}")).silent_input_window(),
+                Some(Duration::from_secs(secs))
+            );
+        }
+        for secs in [1, 59, 86_401] {
+            let error = toml::from_str::<ServerConfig>(&format!(
+                "station_callsign = \"W1AW\"\nsilent_input_warning_secs = {secs}"
+            ))
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(&format!(
+                    "silent_input_warning_secs must be 0 (off) or 60 to 86400, got {secs}"
+                )),
+                "{error}"
             );
         }
     }

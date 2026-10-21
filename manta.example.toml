@@ -84,6 +84,12 @@ station_callsign = "N0CALL"
 # Seconds between the one-line status reports in the log; 0 turns them off.
 #status_interval_secs = 60
 
+# With two or more [[input]] entries: seconds an input may decode no spots
+# for -- while another input does -- before manta warns and sets
+# manta_input_silent{source} to 1. 0 turns the check off; otherwise 60 to
+# 86400.
+#silent_input_warning_secs = 600
+
 # Minutes of spot history a telnet client can replay with sh/dx after it
 # connects; a logger fills its band map with "sh/dx 30m". manta always
 # keeps the 50 newest spots and never more than 10000, so a very busy band

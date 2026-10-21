@@ -41,6 +41,7 @@ mod logging;
 mod multi_run;
 mod reconnect;
 mod reload;
+mod silent;
 mod source_check;
 mod stdio;
 mod text_lines;
@@ -12336,6 +12337,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 flapping_threshold: 3,
                 targets: vec![],
             },
+            inputs: vec![],
         }
     }
 
