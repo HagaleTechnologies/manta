@@ -13,13 +13,18 @@
 //! observable outcome: reconnect logged and still running, in-place
 //! discard with NO reconnect, or a prompt clean startup failure.
 //!
-//! Run serialized (`-- --test-threads=1`): the SND pacing is real-time,
-//! matching the existing fake-Kiwi tests' discipline.
+//! CI runs this binary with the rest of `cargo test --workspace`, tests in
+//! parallel and no thread control, and the SND pacing is real-time, so the
+//! scenarios must tolerate a loaded machine. In particular, no fake receiver
+//! gates serving the reconnect on a failed send to the connection the
+//! daemon dropped: how soon that send fails is up to the OS (MAN-411).
+//! Serialized runs (`-- --test-threads=1`) still work but are not required.
 
 mod common;
 
 use common::{
-    accept_kiwi_session, expect_line, line_channel, send_snd_frames, wait_bounded, KillOnDrop,
+    accept_kiwi_session, expect_line, expect_line_all, line_channel, send_snd_frames, wait_bounded,
+    KillOnDrop,
 };
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
@@ -311,6 +316,40 @@ fn unknown_tag_and_truncated_frames_are_discarded_in_place() {
     fake.join().expect("the fake KiwiSDR panicked").unwrap();
 }
 
+/// MAN-411: serves every connection after the first until `done` (no new
+/// accept once `WAIT` has passed), so the daemon's reconnect never waits on
+/// this side noticing its hang-up. A connection that fails the handshake --
+/// an attempt the daemon already abandoned, EOF at `SET auth` -- is skipped,
+/// never fatal: the listener stays open for the next attempt. A one-shot
+/// second accept, gated on a failed send, missed the daemon's first reopen
+/// on loaded macOS runners and left the rest of the backoff ladder refused.
+fn serve_reconnects(listener: &TcpListener, done: &AtomicBool) -> Result<(), String> {
+    let deadline = Instant::now() + WAIT;
+    let mut served = 0;
+    let mut skipped = Vec::new();
+    while !done.load(Ordering::Relaxed) && Instant::now() < deadline {
+        match accept_kiwi_session(listener, done) {
+            Ok(mut ws) => {
+                served += 1;
+                send_snd_frames(&mut ws, || done.load(Ordering::Relaxed));
+            }
+            Err(_) if done.load(Ordering::Relaxed) => break,
+            Err(e) => {
+                // Printed as it happens: a failing test never joins this.
+                eprintln!("fake KiwiSDR: skipped a reconnect connection: {e}");
+                skipped.push(e);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    if served == 0 {
+        return Err(format!(
+            "the fake KiwiSDR never served a reconnect; skipped: {skipped:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// One WebSocket frame larger than `kiwi.rs`'s `MAX_WS_FRAME_BYTES`
 /// (MAN-275) mid-stream: the client's read errors (tungstenite Capacity),
 /// the connection is dropped and reconnected -- the daemon keeps running.
@@ -325,6 +364,15 @@ fn oversized_frame_midstream_is_survived() {
         let done = done.clone();
         move || -> Result<(), String> {
             let mut ws = accept_kiwi_session(&listener, &done)?;
+            // Only now: an acceptor started before this accept would race
+            // it for the daemon's startup connection.
+            let acceptor = std::thread::spawn({
+                let listener = listener
+                    .try_clone()
+                    .map_err(|e| format!("cloning the listener: {e}"))?;
+                let done = done.clone();
+                move || serve_reconnects(&listener, &done)
+            });
             let until = Instant::now() + STREAM_FOR;
             send_snd_frames(&mut ws, || {
                 done.load(Ordering::Relaxed) || Instant::now() >= until
@@ -340,12 +388,14 @@ fn oversized_frame_midstream_is_survived() {
             oversized.resize(64 * 1024 + 4096, 0);
             ws.send(Message::binary(oversized))
                 .map_err(|e| format!("sending the oversized frame: {e}"))?;
+            // Ends when a send fails on the connection the client dropped.
+            // How soon is up to the OS; the acceptor serves the reconnect
+            // either way.
             send_snd_frames(&mut ws, || done.load(Ordering::Relaxed));
-            // The client drops the poisoned connection once its read
-            // errors; accept and stream once more.
-            let mut ws2 = accept_kiwi_session(&listener, &done)?;
-            send_snd_frames(&mut ws2, || done.load(Ordering::Relaxed));
-            Ok(())
+            drop(ws);
+            acceptor
+                .join()
+                .map_err(|_| "the reconnect acceptor panicked".to_string())?
         }
     });
 
@@ -353,7 +403,19 @@ fn oversized_frame_midstream_is_survived() {
     let stderr = line_channel(child.0.stderr.take().expect("stderr piped"));
 
     expect_line(&stderr, &["source kiwi lost"], WAIT);
-    expect_line(&stderr, &["source kiwi reconnected"], WAIT);
+    let (_, before) = expect_line_all(&stderr, &["source kiwi reconnected"], WAIT);
+    // Reconnecting promptly is the property, counted in attempts rather
+    // than seconds. Expected 0; the slack absorbs one stale connection.
+    let failed = before
+        .iter()
+        .filter(|l| l.contains("reconnect attempt failed"))
+        .count();
+    assert!(
+        failed < 3,
+        "the reconnect took {failed} failed attempts, i.e. the backoff ladder; \
+         stderr since the loss:\n{}",
+        before.join("\n")
+    );
     assert!(
         child.0.try_wait().unwrap().is_none(),
         "the daemon must still be running after an oversized frame"

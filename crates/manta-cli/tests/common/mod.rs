@@ -107,21 +107,55 @@ pub fn line_channel(reader: impl Read + Send + 'static) -> Receiver<String> {
 /// returns it. Panics naming what was missing; a disconnected channel means
 /// the stream ended first (the process exited, or the socket closed).
 pub fn expect_line(rx: &Receiver<String>, needles: &[&str], timeout: Duration) -> String {
-    let deadline = Instant::now() + timeout;
+    expect_line_all(rx, needles, timeout).0
+}
+
+/// Most scanned lines a failed [`expect_line_all`] prints, so a chatty
+/// daemon cannot bury the panic message.
+const DUMP_LINES: usize = 200;
+
+/// [`expect_line`], also returning every line scanned before the match,
+/// for assertions about what led up to it. A failure prints the scanned
+/// lines (the last [`DUMP_LINES`]), each with its arrival time: MAN-411's
+/// macOS-only timeouts went undiagnosed for a day because the panic named
+/// only the missing needle.
+pub fn expect_line_all(
+    rx: &Receiver<String>,
+    needles: &[&str],
+    timeout: Duration,
+) -> (String, Vec<String>) {
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let mut scanned: Vec<(Duration, String)> = Vec::new();
+    let dump = |scanned: &[(Duration, String)]| {
+        let skipped = scanned.len().saturating_sub(DUMP_LINES);
+        let mut out = format!("scanned {} line(s)", scanned.len());
+        if skipped > 0 {
+            out.push_str(&format!(", the first {skipped} omitted"));
+        }
+        out.push(':');
+        for (at, line) in &scanned[skipped..] {
+            out.push_str(&format!("\n  +{:.3}s {line}", at.as_secs_f64()));
+        }
+        out
+    };
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left) {
             Ok(line) => {
                 if needles.iter().all(|n| line.contains(n)) {
-                    return line;
+                    return (line, scanned.into_iter().map(|(_, l)| l).collect());
                 }
+                scanned.push((start.elapsed(), line));
             }
-            Err(RecvTimeoutError::Timeout) => {
-                panic!("no line containing {needles:?} within {timeout:?}")
-            }
+            Err(RecvTimeoutError::Timeout) => panic!(
+                "no line containing {needles:?} within {timeout:?}; {}",
+                dump(&scanned)
+            ),
             Err(RecvTimeoutError::Disconnected) => panic!(
                 "the stream ended before a line containing {needles:?} -- if the daemon \
-                 exited, the fixture ended before it; raise FIXTURE_SECONDS"
+                 exited, the fixture ended before it; raise FIXTURE_SECONDS; {}",
+                dump(&scanned)
             ),
         }
     }
