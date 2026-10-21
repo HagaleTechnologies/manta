@@ -216,8 +216,8 @@ jobs:
       # (not fail -- the new head's own synchronize event already queued a fresh run that will
       # verify/approve it on its own merits) on any mismatch, and create the review through the
       # REST API with `commit_id` pinned so the review record itself is anchored to the
-      # verified commit. GH_TOKEN is DEPENDABOT_APPROVE_PAT (org-wide secret, Pull requests:
-      # Read and write, a real CODEOWNERS-listed identity) -- github-actions[bot]/GITHUB_TOKEN
+      # verified commit. GH_TOKEN is DEPENDABOT_APPROVE_PAT (org-wide secret, Pull requests and
+      # Contents: Read and write, a real CODEOWNERS-listed identity) -- github-actions[bot]/GITHUB_TOKEN
       # cannot satisfy require_code_owner_review, live on manta-review-gate since 2026-09-12
       # (MAN-209), and this repo's own settings additionally block GITHUB_TOKEN from approving
       # PRs at all (`can_approve_pull_request_reviews: false`).
@@ -277,6 +277,7 @@ jobs:
           # enqueues a PR whose auto-merge was enabled by github-actions[bot]: 9 of 9 such PRs
           # (2026-10-10..20) and 8 of 8 before that needed a manual or sweeper enqueue. Fall back to
           # GITHUB_TOKEN only when the PAT is missing or refused, and say so (the sweeper then enqueues).
+          # Arming needs Contents: write on the PAT as well as Pull requests: write.
           arm_auto_merge() {
             if [ -n "${ARM_TOKEN:-}" ] && GH_TOKEN="$ARM_TOKEN" gh pr merge "$@"; then
               return 0
