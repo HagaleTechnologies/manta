@@ -910,18 +910,40 @@ mod tests {
         assert_eq!(src.gap_stats().dropped_packets, 404);
     }
 
+    /// The restart estimate is wall clock from the last accepted datagram to
+    /// the restart one, so bound it by what the test itself measured around
+    /// both reads: a fixed window flakes on a loaded runner whose 300 ms
+    /// sleep overshoots by 50-150 ms (macOS CI, MAN-305).
+    fn assert_wall_clock_discontinuity(d: u64, at_least: Duration, at_most: Duration) {
+        let samples = |t: Duration| t.as_secs_f64() * 192_000.0;
+        let lo = (samples(at_least) - wire::SAMPLES_PER_DATAGRAM as f64 - 1.0).max(0.0);
+        let hi = samples(at_most) + 1.0;
+        assert!(
+            (lo..=hi).contains(&(d as f64)),
+            "discontinuity {d}, measured {at_least:?}..={at_most:?} => {lo:.0}..={hi:.0}"
+        );
+    }
+
     #[test]
     fn radio_restart_resyncs_with_a_wall_clock_discontinuity() {
         let fake = FakeP2Radio::start();
         let mut src = open(&fake);
         let seqs: Vec<u32> = (0..10).collect();
+        let before_last = Instant::now();
         feed(&fake, &mut src, &seqs);
+        let after_last = Instant::now();
         thread::sleep(Duration::from_millis(300));
+        let before_restart = Instant::now();
         let reads = feed(&fake, &mut src, &seqs);
+        let after_restart = Instant::now();
         assert_eq!(reads[0].0, 0);
         assert_eq!(reads[0].1, None);
         let d = reads[0].2.expect("restart reports a discontinuity");
-        assert!((52_600..=62_600).contains(&d), "discontinuity {d}");
+        assert_wall_clock_discontinuity(
+            d,
+            before_restart - after_last,
+            after_restart - before_last,
+        );
         assert!(reads[1..].iter().all(|r| r.1.is_none() && r.2.is_none()));
         let stats = src.gap_stats();
         assert_eq!(stats.dropped_packets, 0);
@@ -933,8 +955,11 @@ mod tests {
         let fake = FakeP2Radio::start();
         let mut src = open(&fake);
         let seqs: Vec<u32> = (0..200).collect();
+        let before_last = Instant::now();
         feed(&fake, &mut src, &seqs);
+        let after_last = Instant::now();
         thread::sleep(Duration::from_millis(300));
+        let before_restart = Instant::now();
         // Seven stale datagrams, then the eighth restarts the stream: the
         // estimate still runs from 199, not from the last stale one.
         for s in 190..197 {
@@ -942,10 +967,15 @@ mod tests {
         }
         fake.send_iq(197);
         assert_eq!(read_one(&mut src), (197, 238));
+        let after_restart = Instant::now();
         let d = src
             .take_discontinuity()
             .expect("restart reports a discontinuity");
-        assert!((52_600..=62_600).contains(&d), "discontinuity {d}");
+        assert_wall_clock_discontinuity(
+            d,
+            before_restart - after_last,
+            after_restart - before_last,
+        );
         assert_eq!(src.gap_stats().dropped_packets, 0);
     }
 

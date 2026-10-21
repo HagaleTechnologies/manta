@@ -2206,7 +2206,14 @@ mod open_receiver_tests {
                 p2_reply(discovery::STATUS_IDLE, 4),
             ),
         ]);
-        let opened = open(&fake, HpsdrProtocol::Auto, &ProbeTiming::default());
+        // A wide grace: the fake's 20 ms gap between replies overran the
+        // production 100 ms on a loaded macOS runner (MAN-305). Grace
+        // expiry has its own test in discovery.rs.
+        let timing = ProbeTiming {
+            grace: Duration::from_secs(1),
+            ..ProbeTiming::default()
+        };
+        let opened = open(&fake, HpsdrProtocol::Auto, &timing);
         assert_eq!(opened.protocol, HpsdrProtocol::Two);
         assert!(matches!(
             opened.discovery,
