@@ -1277,6 +1277,7 @@ fn spec_documents_every_input_and_spot_key() {
                 "loop",
                 "host",
                 "port",
+                "protocol",
                 "freq_hz",
                 "password",
                 "driver",
@@ -3152,6 +3153,47 @@ fn wiki_windows_build_setup_stamp_names_a_snapshot_without_release_yml() {
          `verified.commit`/`verified.date` (and the manifest entry) whenever the \
          body is substantively changed"
     );
+}
+
+// ---- MAN-310: docs/CONFIG.md's band table is CW_SEGMENTS ----
+
+/// `"5351.5"` kHz as Hz; `None` for the table's `–`.
+fn khz_cell(cell: &str) -> Option<f64> {
+    let cell = cell.trim();
+    (cell != "–").then(|| cell.parse::<f64>().expect("a kHz number") * 1000.0)
+}
+
+/// `"5351.5–5366.5"` as Hz.
+fn khz_range_cell(cell: &str) -> (f64, f64) {
+    let (lo, hi) = cell.trim().split_once('–').expect("a lo–hi range");
+    (khz_cell(lo).unwrap(), khz_cell(hi).unwrap())
+}
+
+#[test]
+fn config_md_band_table_matches_cw_segments() {
+    let text = doc("docs/CONFIG.md");
+    let start = text
+        .find("| band | CW segment, kHz | NCDXF beacon, kHz | skimmed span, kHz |")
+        .expect("docs/CONFIG.md has the band table");
+    let rows: Vec<Vec<&str>> = text[start..]
+        .lines()
+        .skip(2)
+        .take_while(|l| l.starts_with('|'))
+        .map(|l| l.trim_matches('|').split('|').map(str::trim).collect())
+        .collect();
+    let segments = manta_server::band_plan::CW_SEGMENTS;
+    assert_eq!(rows.len(), segments.len(), "one row per CW_SEGMENTS row");
+    for (row, seg) in rows.iter().zip(segments) {
+        assert_eq!(row[0], seg.band);
+        assert_eq!(
+            khz_range_cell(row[1]),
+            (seg.cw_lo_hz, seg.cw_hi_hz),
+            "{}",
+            seg.band
+        );
+        assert_eq!(khz_cell(row[2]), seg.beacon_hz, "{}", seg.band);
+        assert_eq!(khz_range_cell(row[3]), seg.span_hz(), "{}", seg.band);
+    }
 }
 
 // ---- MAN-119: the corpus runbook's test commands can be run as written ----

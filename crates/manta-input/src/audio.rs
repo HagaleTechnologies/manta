@@ -182,6 +182,9 @@ pub struct AudioIqSource {
     center_freq_hz: f64,
     /// `Some` only for `from_device`; file sources keep `0 = EOF`.
     live: Option<LiveDevice>,
+    /// MAN-259: `from_device`'s runtime up to `cpal`'s `start`; `ZERO`
+    /// for a file. Surfaced by `acquisition_start_offset()`.
+    acquisition_start_offset: Duration,
 }
 
 impl AudioIqSource {
@@ -198,13 +201,22 @@ impl AudioIqSource {
             hilbert: HilbertTransformer::new(),
             center_freq_hz: 0.0,
             live: None,
+            acquisition_start_offset: Duration::ZERO,
         })
     }
 
     /// Wrap a started live device: `read` waits up to `stall_timeout` for
     /// samples instead of reporting an empty ring as end of stream.
-    fn live(src: Box<dyn AudioSource>, label: String, stall_timeout: Duration) -> Result<Self> {
+    /// `acquisition_start_offset` is how long the open took before the
+    /// device was started (MAN-259).
+    fn live(
+        src: Box<dyn AudioSource>,
+        label: String,
+        stall_timeout: Duration,
+        acquisition_start_offset: Duration,
+    ) -> Result<Self> {
         let mut source = Self::new(src)?;
+        source.acquisition_start_offset = acquisition_start_offset;
         source.live = Some(LiveDevice {
             label,
             stall_timeout,
@@ -261,6 +273,7 @@ impl AudioIqSource {
     /// for samples and fails after `DEVICE_STALL_TIMEOUT` of none (MAN-231).
     pub fn from_device(name: Option<&str>) -> Result<Self> {
         use cpal::traits::{DeviceTrait, HostTrait};
+        let entered = Instant::now();
         let device = match name {
             Some(n) => {
                 coppa_audio::find_input_device_by_name(n).ok_or_else(|| no_matching_input(n))?
@@ -286,8 +299,15 @@ impl AudioIqSource {
         }
         let mut cpal_src = coppa_audio::CpalSource::from_device(device, native_rate, 8192)
             .map_err(|e| did_not_open(&label, &e))?;
+        // MAN-259: the capture ring fills from `start` on.
+        let acquisition_start_offset = entered.elapsed();
         cpal_src.start().map_err(|e| did_not_open(&label, &e))?;
-        AudioIqSource::live(Box::new(cpal_src), label, DEVICE_STALL_TIMEOUT)
+        AudioIqSource::live(
+            Box::new(cpal_src),
+            label,
+            DEVICE_STALL_TIMEOUT,
+            acquisition_start_offset,
+        )
     }
 
     /// Open a WAV file, replayed as an audio source (soak harness / `listen
@@ -311,6 +331,10 @@ impl IqSource for AudioIqSource {
     /// `+/- TARGET_RATE_HZ / 2`. See `AUDIO_PASSBAND_LO_HZ`.
     fn rf_passband_hz(&self) -> (f64, f64) {
         (AUDIO_PASSBAND_LO_HZ, AUDIO_PASSBAND_HI_HZ)
+    }
+
+    fn acquisition_start_offset(&self) -> Duration {
+        self.acquisition_start_offset
     }
 
     /// MAN-273: the Hilbert front end's DC/Nyquist guard at this source's
@@ -397,7 +421,13 @@ mod tests {
         let ring = ScriptedRing {
             script: script.iter().copied().collect(),
         };
-        AudioIqSource::live(Box::new(ring), "\"Test Mic\"".to_string(), stall).unwrap()
+        AudioIqSource::live(
+            Box::new(ring),
+            "\"Test Mic\"".to_string(),
+            stall,
+            Duration::ZERO,
+        )
+        .unwrap()
     }
 
     /// A notice that records each name it is called with.

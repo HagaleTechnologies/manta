@@ -56,6 +56,44 @@ pub struct StatusDoc {
     /// rather than a fabricated `0`.
     pub active_tracks: Option<u64>,
     pub uplink: UplinkStatus,
+    /// MAN-14: each input's hearing, in config order. Present only with
+    /// two or more `[[input]]` entries (additive, so `schema_version`
+    /// stays 1 and a one-input document is unchanged).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<InputHearingSnapshot>,
+}
+
+/// MAN-14: one input's row in `GET /status`'s `inputs`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InputHearingSnapshot {
+    pub name: String,
+    pub spots_total: u64,
+    pub distinct_calls: u64,
+    pub cross_input_dupes_total: u64,
+    pub silent: bool,
+    /// Seconds since this input's latest spot; `null` before its first.
+    pub last_spot_age_seconds: Option<f64>,
+}
+
+impl InputHearingSnapshot {
+    fn rows(metrics: &Metrics, now: Instant) -> Vec<Self> {
+        let rows = metrics.input_hearing();
+        if rows.len() < 2 {
+            return Vec::new();
+        }
+        rows.into_iter()
+            .map(|r| InputHearingSnapshot {
+                name: r.name,
+                spots_total: r.spots,
+                distinct_calls: r.distinct_calls,
+                cross_input_dupes_total: r.cross_input_dupes,
+                silent: r.silent,
+                last_spot_age_seconds: r
+                    .last_spot
+                    .map(|at| now.saturating_duration_since(at).as_secs_f64().round()),
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -90,7 +128,8 @@ impl StatusDoc {
         // own later instant (CR-2), so `/status` could report totals that
         // disagreed with `sum(targets[].sent/suppressed/reconnects)` for a
         // spot forwarded in between.
-        let targets = metrics.uplink_snapshot_at(Instant::now());
+        let now = Instant::now();
+        let targets = metrics.uplink_snapshot_at(now);
         let enabled_targets = targets.iter().filter(|t| t.enabled).count();
         let connected_targets = targets
             .iter()
@@ -125,6 +164,7 @@ impl StatusDoc {
                 flapping_threshold: FLAPPING_RECONNECTS,
                 targets,
             },
+            inputs: InputHearingSnapshot::rows(metrics, now),
         }
     }
 
@@ -218,6 +258,29 @@ pub fn render_human(doc: &StatusDoc) -> String {
         }
     ));
 
+    // MAN-14: each input's hearing, so a deaf receiver stands out.
+    if !doc.inputs.is_empty() {
+        out.push_str(&format!(
+            "Inputs:\n  {:<32} {:>8} {:>8} {:>8} {:>10} {:>7}\n",
+            "NAME", "SPOTS", "CALLS", "XDUPES", "LAST SPOT", "SILENT"
+        ));
+        for i in &doc.inputs {
+            out.push_str(&format!(
+                "  {:<32} {:>8} {:>8} {:>8} {:>10} {:>7}\n",
+                escape_for_terminal(&i.name),
+                i.spots_total,
+                i.distinct_calls,
+                i.cross_input_dupes_total,
+                match i.last_spot_age_seconds {
+                    Some(age) => format!("{age:.0}s ago"),
+                    None => "never".to_string(),
+                },
+                if i.silent { "yes" } else { "no" }
+            ));
+        }
+        out.push('\n');
+    }
+
     if doc.uplink.targets.is_empty() {
         out.push_str("RBN uplink: not configured\n");
         return out;
@@ -278,6 +341,43 @@ mod tests {
         assert!(!serde_json::to_string(&doc)
             .unwrap()
             .contains("login_callsign"));
+    }
+
+    /// MAN-14: two or more inputs add `inputs` rows; one input adds none.
+    #[test]
+    fn status_doc_carries_input_hearing_rows_only_with_two_or_more_inputs() {
+        let m = Metrics::new();
+        m.register_input_hearing(&["only".to_string()]);
+        let json = serde_json::to_string(&StatusDoc::from_metrics(&m)).unwrap();
+        assert!(!json.contains("\"inputs\""), "{json}");
+        assert!(json.starts_with("{\"schema_version\":1,"), "{json}");
+
+        let m = Metrics::new();
+        m.register_input_hearing(&["live".to_string(), "deaf".to_string()]);
+        m.record_input_spot("live");
+        m.record_input_distinct_call("live");
+        m.set_input_silent("deaf", true);
+        let doc = StatusDoc::from_metrics(&m);
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(
+            json.contains(
+                "\"inputs\":[{\"name\":\"live\",\"spots_total\":1,\"distinct_calls\":1,\
+                 \"cross_input_dupes_total\":0,\"silent\":false,\"last_spot_age_seconds\":0.0},\
+                 {\"name\":\"deaf\",\"spots_total\":0,\"distinct_calls\":0,\
+                 \"cross_input_dupes_total\":0,\"silent\":true,\"last_spot_age_seconds\":null}]"
+            ),
+            "{json}"
+        );
+        let parsed: StatusDoc = serde_json::from_str(&doc.to_json()).unwrap();
+        assert_eq!(parsed, doc);
+        let human = render_human(&doc);
+        assert!(human.contains("Inputs:"), "{human}");
+        let deaf = human
+            .lines()
+            .find(|l| l.trim_start().starts_with("deaf"))
+            .unwrap();
+        assert!(deaf.contains("never") && deaf.ends_with("yes"), "{deaf}");
+        assert!(human.lines().all(|l| l.chars().count() <= 80), "{human}");
     }
 
     #[test]

@@ -1650,6 +1650,7 @@ mod tests {
             crate::LiveSourceSpec::Hpsdr(crate::HpsdrOpts {
                 host: Some("10.0.0.5".into()),
                 port: 1024,
+                protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
                 freq: Some(7e6),
                 rate: Some(48_000.0),
             }),

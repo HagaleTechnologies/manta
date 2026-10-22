@@ -321,7 +321,7 @@ between HANG and CLOSED for a track that has decoded (MAN-108).
 
 | Transition | Condition |
 |---|---|
-| IDLE → CANDIDATE | rise condition first met on channel `k`, `k` is not owned by an existing track (§2.5), `k` is not RTTY-vetoed (§2.6), no static crash is being suppressed this hop (§2.7), `k` is not inside a co-modulation span (§2.8), and `k`'s centre is not outside the source's trusted band when one was supplied (§1.5, MAN-196) |
+| IDLE → CANDIDATE | rise condition first met on channel `k`, `k` is not owned by an existing track (§2.5), `k` is not RTTY-vetoed (§2.6), no static crash is being suppressed this hop (§2.7), `k` is not inside a co-modulation span (§2.8), and `k`'s centre is not outside the source's trusted band when one was supplied (§1.5, MAN-196), or outside the input's spawn band (MAN-310) |
 | CANDIDATE → ACTIVE | rise sustained 19 hops → lease decoder from pool; with `non_cw_filter` on, the lease waits for qualification (below, §2.8) |
 | CANDIDATE → IDLE | rise condition lost before 19 hops |
 | ACTIVE → HANG | drop condition met (below off threshold) |
@@ -395,6 +395,12 @@ DORMANT track's wake, or turn a HANG track back to ACTIVE.
   cannot route around the veto. Spawns only: a track that already exists
   on an untrusted channel is never closed or de-weighted by it (MAN-196,
   the MAN-314 spawns-only lesson).
+- A channel whose centre lies outside the input's spawn band, when one was
+  supplied, may not start a spawn decision, in the same slots as the
+  trusted-band veto. Only the streams of one split band plan carry a spawn
+  band (MAN-310): from the midpoint with the lower sibling's centre minus
+  one channel spacing to the midpoint with the upper sibling's plus one,
+  intersected with the trusted band. Spawns only.
 - A channel inside the source's analytic guard may not start a spawn
   decision either, in the same two slots: when `IqSource::analytic_guard_hz()`
   (a real-to-analytic front end; `hilbert_guard_hz(48000)` = 600 Hz for
@@ -1090,6 +1096,28 @@ the §4.1a gap centroid below (a stale correction from the old speed regime
 must not carry into the new one), and the sender timing model (§4.1b,
 MAN-315 D7): its statistics were learned in the old scale's dits.
 
+**Fragment-seeded lock** — **[DEVIATION]** (MAN-398,
+`docs/DECISIONS/2026-10-18-man398-gap-corroborated-badlock-recovery.md`):
+a track attached mid-element hands the 5-mark initialization a short first
+run with no real leading edge. When the split isolates that one mark as the
+whole dit cluster, every real mark of dit-heavy text (`HH`, `5NN`) assigns
+to the dah cluster, and the streak sits on its own centroid, so the
+drift/regime rule above never fires. Second rule: if 12 consecutive marks
+assign to the dah cluster, *and* the dit cluster is still the lone low
+member of the 5-mark split with no later mark assigned to it, *and*
+`μ_egap` (§4.1a) is absent or `≥ μ_lq / √3`, where `μ_lq` is the 12 marks'
+lower-quartile duration, reinitialize from those 12 marks (not the last 5).
+A dah is three element gaps long and a dit one, so `μ_egap < μ_lq / √3`
+says the marks really are dahs and the lock stands; this is what keeps a
+genuine opening dit followed by many real dahs (`E 0000`, `MO`) locked. No
+CV condition applies: dit-heavy text with some dahs streaks with CV ≈ 0.6.
+The reinit has the regime-change side effects above (§4.1a gap centroid
+reset, regime bump, §4.1b reset), the §4.1a WPM reporting EMA is re-seeded
+from the corrected `dit_estimate_ms()` (its held value derived from the
+discarded scale), and the track's §4.2 gap classifier is
+reset too: its clusters were bootstrapped from gap ratios against the wrong
+`μ_dit`.
+
 #### 4.1a WPM reporting: symmetric mark/gap dit-period estimate
 
 **[DEVIATION]** (MAN-103, `docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md`):
@@ -1529,7 +1557,10 @@ inside the decode path. A live source's disconnect/reconnect (MAN-73) reports
 the missed span, in samples, via `IqSource::take_discontinuity()`; `listen()`
 advances the sample clock by that count and starts a fresh track segment, so
 `sample_ts` stays monotonic and wall-clock-true across the gap with no audio
-spliced in. File replay never reports a discontinuity. An end of stream
+spliced in. The reported span ends where the reopened source's acquisition
+began (`IqSource::acquisition_start_offset()` into its open call), not where
+its opener returned, so samples it captured while opening are not counted
+twice (MAN-259). File replay never reports a discontinuity. An end of stream
 reported with a discontinuity pending (MAN-258: a stop while the source is
 down) closes the segment the same way and starts none.
 
@@ -1860,7 +1891,7 @@ flush_gap_dits = 7.0
 #   file:  path*, iq, realtime, loop
 #   kiwi:  host*, freq_hz*, port, password
 #   soapy: driver*, freq_hz*, rate_hz*, gain_db   (build with --features soapy)
-#   hpsdr: host*, freq_hz*, rate_hz*, port        (included in every build)
+#   hpsdr: host*, freq_hz*, rate_hz*, port, protocol (included in every build)
 #   ka9q:  group*, port, ssrc, interface
 # Any source flag on the command line (--device, --source, --kiwi-host,
 # --soapy-driver, --hpsdr-host, --ka9q-group) replaces a typed [input]
@@ -1868,6 +1899,7 @@ flush_gap_dits = 7.0
 # type = "kiwi"               # audio | file | kiwi | soapy | hpsdr | ka9q
 # host = "<your-kiwi-host>"   # kiwi, hpsdr
 # port = 8073                 # kiwi (default 8073), hpsdr (default 1024), ka9q (default 5004)
+# protocol = "auto"           # hpsdr: "auto" (default) asks the radio; "1" (Hermes-Lite 2) or "2" (ANAN) skips asking (--hpsdr-protocol)
 # freq_hz = 7030000.0         # kiwi, soapy, hpsdr: RF center frequency, Hz
 # password = ""               # kiwi (default "")
 # The other types' keys:

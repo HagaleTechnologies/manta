@@ -271,7 +271,7 @@ jobs:
       # runs the verifier with (same setup-python pin). Last in the job so the pin does not change
       # the python3 the steps above use.
       - if: runner.os == 'Linux'
-        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
       - if: runner.os == 'Linux'
@@ -297,8 +297,16 @@ jobs:
           persist-credentials: false
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libsoapysdr-dev soapysdr0.8-module-rtlsdr
+      # MAN-380: macos-latest images pour different soapysdr bottles, and Cargo never re-runs
+      # soapysdr-sys's build script on a cache hit, so a cache built against one version links
+      # the other's dead Cellar path. SoapySDR_DIR points the build script at the version-free
+      # opt/ prefix (not SOAPY_SDR_ROOT: the SoapySDR runtime reads that as its module root);
+      # SOAPYSDR_BREW_VERSION keys the cache to the poured version via env-vars below.
       - if: runner.os == 'macOS'
-        run: brew install soapysdr
+        run: |
+          brew install soapysdr
+          echo "SoapySDR_DIR=$(brew --prefix soapysdr)" >> "$GITHUB_ENV"
+          echo "SOAPYSDR_BREW_VERSION=$(brew list --versions soapysdr)" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
@@ -306,6 +314,7 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.1
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          env-vars: SOAPYSDR_BREW_VERSION
       # --locked: see the MAN-219 note in the test job above.
       - run: cargo clippy -p manta-input -p manta-cli --all-targets --features soapy --locked -- -D warnings
       - run: cargo test -p manta-input -p manta-cli --features soapy --locked

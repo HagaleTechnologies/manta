@@ -1588,6 +1588,86 @@ fn hpsdr_flags_are_recognized_by_listen_and_soak() {
     }
 }
 
+/// MAN-305 §1: `--hpsdr-protocol` and its help, in every command that
+/// takes `--hpsdr-host`.
+#[test]
+fn hpsdr_protocol_flag_is_recognized_by_run_listen_soak_calibrate_and_check() {
+    for sub in ["run", "listen", "soak", "doctor", "calibrate", "check"] {
+        let out = manta().args([sub, "--help"]).output().unwrap();
+        assert!(out.status.success(), "{sub} --help should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for needle in [
+            "--hpsdr-protocol <HPSDR_PROTOCOL>",
+            "openHPSDR radio hostname or IP address (protocol 1: Hermes-Lite 2, Hermes; \
+             protocol 2: ANAN).",
+            "openHPSDR control port.",
+            "Protocol 2 also sends to the three ports above it and receives IQ from this port \
+             + 11 (1035 by default).",
+            "openHPSDR protocol the radio speaks.",
+            "auto asks the radio and uses protocol 2 when it answers as protocol 2, protocol 1 \
+             otherwise; 1 and 2 skip the question.",
+            "[default: auto]",
+            "[possible values: auto, 1, 2]",
+        ] {
+            assert!(
+                stdout.contains(needle),
+                "{sub} --help should contain {needle:?}, got: {stdout}"
+            );
+        }
+    }
+}
+
+/// MAN-305: `--hpsdr-protocol` means nothing without `--hpsdr-host`.
+#[test]
+fn hpsdr_protocol_requires_hpsdr_host() {
+    for sub in ["run", "listen", "soak", "doctor", "calibrate", "check"] {
+        let mut args = vec![sub];
+        if sub == "soak" {
+            args.extend(["--duration", "1"]);
+        }
+        args.extend(["--hpsdr-protocol", "2"]);
+        let out = manta().args(&args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("the following required arguments were not provided")
+                && stderr.contains("--hpsdr-host <HPSDR_HOST>"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+/// MAN-305 §1: an unknown protocol is clap's invalid-value error.
+#[test]
+fn hpsdr_protocol_rejects_unknown_values() {
+    for sub in ["run", "listen", "soak", "doctor", "calibrate", "check"] {
+        let out = manta()
+            .args([
+                sub,
+                "--hpsdr-host",
+                "192.0.2.10",
+                "--hpsdr-freq-hz",
+                "7030000",
+                "--hpsdr-rate-hz",
+                "192000",
+                "--hpsdr-protocol",
+                "3",
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{sub}: {stderr}");
+        assert!(
+            stderr.contains("error: invalid value '3' for '--hpsdr-protocol <HPSDR_PROTOCOL>'"),
+            "{sub}: {stderr}"
+        );
+        assert!(
+            stderr.contains("[possible values: auto, 1, 2]"),
+            "{sub}: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn hpsdr_rate_rejects_non_finite_values() {
     // Round-1 review finding: `HpsdrConfig::validate`'s bandwidth check
@@ -1721,6 +1801,8 @@ fn hpsdr_host_conflicts_with_every_other_source_flag() {
         "7030000",
         "--hpsdr-rate-hz",
         "48000",
+        "--hpsdr-protocol",
+        "2",
     ];
     for sub in ["run", "listen", "soak", "doctor", "calibrate", "check"] {
         let mut conflicts = others.clone();

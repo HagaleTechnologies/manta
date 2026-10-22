@@ -93,6 +93,13 @@ pub const PAUSE_MIN_DITS: f32 = 15.0;
 /// docs/DECISIONS/2026-10-16-man271-short-transmission-decode.md.
 const BOOTSTRAP_MIN_MARKS: usize = 2;
 
+/// MAN-398: below this fraction of a streak's lower-quartile mark, the
+/// element-gap centroid says the streak's marks really are dahs. A dah is
+/// three element gaps long and a dit one, so the ratio sits near 1/3 for a
+/// dah streak and near 1 for dits read as dahs; 1/sqrt(3) is the log-space
+/// midpoint, the rule `ClusterPair::boundary` uses between mark clusters.
+const BADLOCK_DAH_GAP_FRAC: f32 = 0.577_35;
+
 fn mean(xs: &[f32]) -> f32 {
     let mut acc = 0.0f64;
     for &x in xs {
@@ -141,6 +148,12 @@ struct ClusterPair {
     /// and can misfire on long real-audio silence gaps) preserves the original
     /// "always assume the low cluster is real" default.
     unimodal_ceiling: Option<f32>,
+    /// How many init samples the last `initialize()`'s bimodal split put in
+    /// `lo` (0 after a unimodal init, whose `lo` is either the whole
+    /// population or a placeholder). Read only by `SpeedTracker`'s MAN-398
+    /// bad-lock check, which needs to know when `lo` rests on a single
+    /// bootstrap sample.
+    lo_n: usize,
 }
 
 impl ClusterPair {
@@ -153,6 +166,7 @@ impl ClusterPair {
             confirmed: false,
             placeholder_is_lo: false,
             unimodal_ceiling,
+            lo_n: 0,
         }
     }
 
@@ -240,6 +254,7 @@ impl ClusterPair {
             self.hi = mean(&s[best_i + 1..]);
             self.confirmed = true;
             self.placeholder_is_lo = false;
+            self.lo_n = best_i + 1;
         } else {
             let m = mean(&s);
             let assume_dah = self.unimodal_ceiling.is_some_and(|ceiling| m > ceiling);
@@ -253,6 +268,7 @@ impl ClusterPair {
                 self.placeholder_is_lo = false;
             }
             self.confirmed = false;
+            self.lo_n = 0;
         }
         self.ready = true;
         self.init.clear();
@@ -298,6 +314,25 @@ pub struct SpeedTracker {
     /// mark scale, so a caller holding statistics in the old scale's units
     /// knows to drop them (MAN-315 D7).
     regime: u32,
+    /// MAN-398: set for exactly one `on_mark()` call after the bad-lock
+    /// branch of `check_drift` reinitializes `pair`, then cleared by
+    /// `take_badlock_recovered()`. `GapClassifier` has its own `ClusterPair`
+    /// bootstrapped from `gap_ms / mu_dit_ms` ratios computed against
+    /// whatever `mu_dit_ms` was in effect at the time -- during a bad lock
+    /// that is the corrupted value, so its cluster boundary latches onto a
+    /// wrong scale and never self-corrects even after this tracker recovers
+    /// (`ClusterPair` has no drift/reinit machinery of its own; only
+    /// `SpeedTracker::check_drift` calls `reinit_from`). Without a signal to
+    /// reset it too, every inter-word gap keeps misclassifying as
+    /// inter-char forever, silently deleting every word boundary from the
+    /// recovery point on. See
+    /// docs/DECISIONS/2026-10-18-man398-gap-corroborated-badlock-recovery.md.
+    badlock_recovered: bool,
+    /// MAN-398: true while `mu_dit` still rests on the
+    /// single bootstrap sample `ClusterPair::initialize`'s split isolated as
+    /// the whole dit cluster, with no later mark assigned to it. Cleared by
+    /// the first post-bootstrap dit and by any reinit.
+    lo_uncorroborated: bool,
 }
 
 impl SpeedTracker {
@@ -312,6 +347,8 @@ impl SpeedTracker {
             mu_egap_ms: None,
             ratio_hint: None,
             regime: 0,
+            badlock_recovered: false,
+            lo_uncorroborated: false,
         }
     }
 
@@ -402,6 +439,14 @@ impl SpeedTracker {
         (mu_dit - delta).clamp(DIT_CLAMP_MS.0, DIT_CLAMP_MS.1)
     }
 
+    /// True exactly once after the MAN-398 bad-lock branch has fired
+    /// since the last call; cleared on read. See `badlock_recovered`'s doc
+    /// comment for why callers (`TrackDecoder`) need this to also reset
+    /// `GapClassifier`.
+    pub fn take_badlock_recovered(&mut self) -> bool {
+        std::mem::take(&mut self.badlock_recovered)
+    }
+
     /// MAN-271 (SPEC §4.1 **\[DEVIATION\]**): initialize the mark clusters
     /// from the `BOOTSTRAP_MIN_MARKS`..4 marks a short single transmission
     /// leaves, at a genuine end-of-signal flush (`TrackDecoder::finish` --
@@ -432,13 +477,20 @@ impl SpeedTracker {
         }
         let pre_lo = self.pair.lo;
         let pre_hi = self.pair.hi;
+        let was_ready = self.pair.ready();
         let was_init = self.pair.observe(dur_ms);
         if !self.pair.ready() {
             return;
         }
+        if !was_ready {
+            self.lo_uncorroborated = self.pair.lo_n == 1;
+        }
         self.apply_constraints();
         if !was_init {
             let is_dit = dur_ms < self.pair.boundary();
+            if is_dit {
+                self.lo_uncorroborated = false;
+            }
             self.ring.push_back((dur_ms, is_dit, pre_lo, pre_hi));
             if self.ring.len() > DRIFT_LEN {
                 self.ring.pop_front();
@@ -516,7 +568,50 @@ impl SpeedTracker {
             // into the new one's dit_estimate_ms correction (MAN-103 D6).
             self.mu_egap_ms = None;
             self.regime = self.regime.wrapping_add(1);
+            self.lo_uncorroborated = false;
+            return;
         }
+        // MAN-398: a fragment-seeded lock. A track attached mid-element hands the
+        // 5-mark bootstrap a short first run with no real leading edge; the split
+        // isolates it as the whole dit cluster and every real mark lands in the dah
+        // cluster. The SPEC rule above cannot see it (the streak sits on its own
+        // centroid). Re-seed from the streak when the dit cluster still rests on
+        // that lone bootstrap mark and the gap scale does not say the streak's marks
+        // are dahs. No CV term: dit-heavy text with some dahs (5NN, HV) streaks with
+        // CV ~0.6. See docs/DECISIONS/2026-10-18-man398-gap-corroborated-badlock-recovery.md.
+        if all_dah && self.lo_uncorroborated && !self.streak_marks_are_dahs() {
+            let durs: Vec<f32> = self.ring.iter().map(|&(d, _, _, _)| d).collect();
+            self.pair.reinit_from(&durs);
+            self.apply_constraints();
+            self.ring.clear();
+            self.lo_uncorroborated = false;
+            self.mu_egap_ms = None;
+            self.regime = self.regime.wrapping_add(1);
+            self.badlock_recovered = true;
+            // The reporting EMA holds measurements derived from the discarded
+            // fragment scale; re-seed it from the corrected estimate (as
+            // `bootstrap` and `reseed_wpm_after_warmup` do after replacing a
+            // scale), so a track ending within a few marks does not publish,
+            // or have a deferred beacon rejected against, a speed the
+            // corrected scale no longer supports.
+            self.wpm_ema = Some(1200.0 / self.dit_estimate_ms());
+        }
+    }
+
+    /// MAN-398: whether the gap scale says the 12-mark streak's marks are dahs:
+    /// the element-gap centroid is under `BADLOCK_DAH_GAP_FRAC` of the streak's
+    /// lower-quartile mark. `None` is not evidence of dahs: against a fragment's
+    /// dit unit every real element gap reads as a character gap, so the
+    /// centroid starves exactly when the lock is wrong. Compared with the
+    /// streak, not `mu_dit`: in a fragment lock on all-dah text `mu_dit` is the
+    /// fragment and disagrees with every gap, although the dahs are right.
+    fn streak_marks_are_dahs(&self) -> bool {
+        let Some(g) = self.mu_egap_ms else {
+            return false;
+        };
+        let mut d: Vec<f32> = self.ring.iter().map(|&(d, _, _, _)| d).collect();
+        d.sort_by(f32::total_cmp);
+        g < BADLOCK_DAH_GAP_FRAC * d[d.len() / 4]
     }
 }
 
@@ -1392,6 +1487,260 @@ mod tests {
             t.mu_egap_ms()
         );
         assert_eq!(t.dit_estimate_ms(), t.mu_dit_ms());
+    }
+
+    #[test]
+    fn mixed_streak_badlock_recovers() {
+        // MAN-398: force the exact self-consistent bad lock -- a fabricated 30 ms
+        // first sample isolates itself as the whole dit cluster, so mu_dit = 30 and
+        // the boundary lands below every real element. check_drift's SPEC rule
+        // is blind to this (the 12-mark streak's CV is ~0.47, over DRIFT_CV_MAX).
+        // The CV-free lone-dit trigger catches it: the 30 ms first sample is the
+        // lone dit and no element gap was fed, so mu_egap is None.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[30.0, 84.0, 217.0, 84.0, 84.0]);
+        assert!(
+            t.boundary_ms() < 84.0,
+            "precondition: bad lock not reproduced (boundary {})",
+            t.boundary_ms()
+        );
+        // Now a long stream of genuine, correctly-measured elements.
+        for _ in 0..6 {
+            feed(&mut t, &[84.0, 217.0, 84.0, 84.0, 217.0]);
+        }
+        assert!(
+            (t.mu_dit_ms() - 84.0).abs() < 12.0,
+            "mu_dit failed to recover: {}",
+            t.mu_dit_ms()
+        );
+        assert!(
+            84.0 < t.boundary_ms() && t.boundary_ms() < 217.0,
+            "boundary must separate dits from dahs: {}",
+            t.boundary_ms()
+        );
+    }
+
+    #[test]
+    fn healthy_stream_never_triggers_badlock_recovery() {
+        // A correctly-locked tracker sees marks in BOTH clusters, so the
+        // all-one-cluster precondition never holds. 20 WPM, 60 marks.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        for _ in 0..11 {
+            feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        }
+        assert!(
+            (t.mu_dit_ms() - 60.0).abs() < 3.0,
+            "mu_dit {}",
+            t.mu_dit_ms()
+        );
+        assert!(
+            (t.mu_dah_ms() - 180.0).abs() < 8.0,
+            "mu_dah {}",
+            t.mu_dah_ms()
+        );
+    }
+
+    #[test]
+    fn homogeneous_badlock_recovers() {
+        // MAN-6 on all-dit text ("HH"): the fabricated 30 ms first sample
+        // isolates itself as the whole dit cluster and the real 84 ms dits
+        // become mu_dah, so every dit reads as a dah. The 12-mark streak
+        // sits on mu_dah (out of the SPEC drift rule's reach); the MAN-398
+        // lone-dit branch must catch it.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[30.0, 84.0, 84.0, 84.0, 84.0]);
+        assert!(
+            t.boundary_ms() < 84.0,
+            "bad lock not formed (boundary {})",
+            t.boundary_ms()
+        );
+        feed(&mut t, &[84.0; 60]);
+        assert!(
+            (t.mu_dit_ms() - 84.0).abs() < 1.0,
+            "mu_dit failed to recover: {}",
+            t.mu_dit_ms()
+        );
+        assert!(
+            t.boundary_ms() > 84.0,
+            "real dits must classify as dits: boundary {}",
+            t.boundary_ms()
+        );
+    }
+
+    #[test]
+    fn corroborated_singleton_dit_does_not_trigger_homogeneous_recovery() {
+        // A singleton dit cluster that a later mark lands in is a real dit,
+        // not a fabricated fragment: a following run of 12 dahs must not
+        // re-split it.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[66.0, 200.0, 200.0, 200.0, 200.0]);
+        t.on_mark(66.0);
+        feed(&mut t, &[200.0; 12]);
+        assert!(
+            (t.mu_dit_ms() - 66.0).abs() < 1.0,
+            "mu_dit should stay at 66, got {}",
+            t.mu_dit_ms()
+        );
+        assert!(!t.take_badlock_recovered());
+    }
+
+    #[test]
+    fn healthy_lock_survives_long_dah_run() {
+        // A lock bootstrapped from several dits ("0", "MOM", "OOOO" all send
+        // long dah runs) must not be touched by the homogeneous branch.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        feed(&mut t, &[180.0; 24]);
+        assert!(
+            (t.mu_dit_ms() - 60.0).abs() < 1.0,
+            "mu_dit should stay at 60, got {}",
+            t.mu_dit_ms()
+        );
+        assert!(!t.take_badlock_recovered());
+    }
+
+    /// Feed `marks`, each followed by an element gap of `egap_ms` (the decoder
+    /// feeds `on_element_gap` only for gaps it classified `InterElement`).
+    fn feed_with_egaps(t: &mut SpeedTracker, marks: &[f32], egap_ms: f32) {
+        for &m in marks {
+            t.on_mark(m);
+            t.on_element_gap(egap_ms);
+        }
+    }
+
+    #[test]
+    fn fragment_lock_on_all_dah_text_is_kept() {
+        // "MO" at 25 WPM: dit 48 ms, dah 144 ms (under DIT_CLAMP_MS.1). A 30 ms
+        // fragment isolates itself as the dit cluster; the dahs are dahs and
+        // their element gaps (48 ms) say so.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[30.0, 144.0, 144.0, 144.0, 144.0]);
+        feed_with_egaps(&mut t, &[144.0; 48], 48.0);
+        assert!(!t.take_badlock_recovered());
+        assert!(
+            (t.mu_dah_ms() - 144.0).abs() < 1.0,
+            "mu_dah {}",
+            t.mu_dah_ms()
+        );
+        assert!(t.boundary_ms() < 144.0, "boundary {}", t.boundary_ms());
+    }
+
+    #[test]
+    fn genuine_opening_dit_then_dahs_is_kept() {
+        // "E 0000" at 32 WPM: one real 37.5 ms dit, then 20 dahs of 112.5 ms
+        // with 37.5 ms element gaps.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[37.5, 112.5, 112.5, 112.5, 112.5]);
+        feed_with_egaps(&mut t, &[112.5; 20], 37.5);
+        assert!(!t.take_badlock_recovered());
+        assert!(
+            (t.mu_dit_ms() - 37.5).abs() < 1.0,
+            "mu_dit {}",
+            t.mu_dit_ms()
+        );
+        assert!(
+            (t.mu_dah_ms() - 112.5).abs() < 1.0,
+            "mu_dah {}",
+            t.mu_dah_ms()
+        );
+    }
+
+    #[test]
+    fn fragment_lock_on_dits_recovers_when_gaps_match_the_marks() {
+        // "HH" at 22.6 WPM (dit 53 ms) with a 20 ms fragment: 53/20 = 2.65 >= 2.0
+        // splits the bootstrap, so the fragment is the lone dit (lo_n = 1). A
+        // 30 ms fragment (ratio 1.77) would take the unimodal init and never arm
+        // the trigger. The element gaps are fed directly, so mu_egap is populated
+        // and equals the marks (ratio 1.0), which makes them dits. This pins only
+        // that the trigger fires on such a centroid; the dah-side comparison is
+        // pinned by the two `_is_kept` tests above. In the decoder a 53 ms gap
+        // reads as a character gap against the 20 ms dit and is never fed.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[20.0, 53.0, 53.0, 53.0, 53.0]);
+        assert!(
+            t.boundary_ms() < 53.0,
+            "bad lock not formed (boundary {})",
+            t.boundary_ms()
+        );
+        feed_with_egaps(&mut t, &[53.0; 11], 53.0);
+        assert_eq!(t.mu_egap_ms(), Some(53.0));
+        assert!(!t.take_badlock_recovered());
+        // The 12th streak mark: the trigger evaluates with mu_egap populated.
+        t.on_mark(53.0);
+        assert!(
+            t.take_badlock_recovered(),
+            "trigger must fire on a populated gap centroid that matches the marks"
+        );
+        t.on_element_gap(53.0);
+        feed_with_egaps(&mut t, &[53.0; 12], 53.0);
+        assert!(
+            (t.mu_dit_ms() - 53.0).abs() < 1.0,
+            "mu_dit {}",
+            t.mu_dit_ms()
+        );
+        assert!(t.boundary_ms() > 53.0, "boundary {}", t.boundary_ms());
+    }
+
+    #[test]
+    fn badlock_recovery_reseeds_wpm_from_the_corrected_scale() {
+        // The fragment lock of the test above reports ~44-49 WPM while it
+        // holds (the 20 ms fragment's estimate, gap-corrected). The mark
+        // that fires the trigger replaces that scale with the real 53 ms
+        // dit: the reporting EMA must be re-seeded from it, not left to
+        // average down from the discarded scale at WPM_ALPHA = 0.1 per
+        // mark -- a track ending in the next few marks would otherwise
+        // publish ~47 WPM for a 22.6 WPM sender, over manta-spot's 45 WPM
+        // beacon plausibility gate.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[20.0, 53.0, 53.0, 53.0, 53.0]);
+        feed_with_egaps(&mut t, &[53.0; 11], 53.0);
+        // The 12th streak mark fires the trigger.
+        t.on_mark(53.0);
+        let wpm = t.wpm().expect("tracker ready");
+        assert!(
+            (wpm - 1200.0 / 53.0).abs() < 1.0,
+            "post-recovery wpm {wpm} still averages in the fragment scale"
+        );
+    }
+
+    #[test]
+    fn mixed_fragment_lock_recovers_without_cv_gate() {
+        // "5NN" at 17 WPM (dit 70 ms): every mark lands in the dah cluster, the
+        // 12-mark streak mixes dits and dahs (CV ~0.6), and no element gap
+        // classifies InterElement against the 20 ms fragment.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[20.0, 70.0, 70.0, 70.0, 70.0]);
+        for _ in 0..4 {
+            feed(
+                &mut t,
+                &[70.0, 70.0, 70.0, 70.0, 70.0, 210.0, 70.0, 210.0, 70.0],
+            );
+        }
+        assert!(
+            (t.mu_dit_ms() - 70.0).abs() < 5.0,
+            "mu_dit {}",
+            t.mu_dit_ms()
+        );
+        assert!(
+            (t.mu_dah_ms() - 210.0).abs() < 15.0,
+            "mu_dah {}",
+            t.mu_dah_ms()
+        );
+    }
+
+    #[test]
+    fn corroborated_lock_is_not_resplit_by_a_bimodal_streak() {
+        // A lock bootstrapped from three dits is corroborated. Twelve marks that
+        // all land above its boundary and split 6/6 at ratio 2.27 (a fading
+        // signal's stretched elements) must not re-seed it.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        for _ in 0..6 {
+            feed(&mut t, &[110.0, 250.0]);
+        }
+        assert!(!t.take_badlock_recovered());
+        assert!(t.mu_dit_ms() < 80.0, "mu_dit {}", t.mu_dit_ms());
     }
 
     #[test]

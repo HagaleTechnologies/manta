@@ -728,6 +728,21 @@ blocklist_path = \"bl.txt\"
         assert!(f.ctx.lists.take().is_some());
     }
 
+    /// MAN-310: a band plan decides which streams are open, so it is
+    /// restart-only like every other `input.*` key.
+    #[test]
+    fn changing_input_bands_needs_a_restart() {
+        let old = table("[input]\ntype = 'kiwi'\nhost = 'h'\nbands = ['60m']\n");
+        let new = table(
+            "[input]\ntype = 'kiwi'\nhost = 'h'\nbands = ['60m', '40m']\n\
+             tuning_range_hz = [3000000.0, 30000000.0]\n",
+        );
+        assert_eq!(
+            restart_only_changes(&old, &new),
+            vec!["input.bands", "input.tuning_range_hz"]
+        );
+    }
+
     #[test]
     fn digital_window_changes_need_a_restart() {
         let old = table("[detector]\ndigital_window_filter = true\n");
