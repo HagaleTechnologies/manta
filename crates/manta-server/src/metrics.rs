@@ -103,6 +103,25 @@ fn prune_reconnects(recent: &mut VecDeque<Instant>, now: Instant) {
     }
 }
 
+/// MAN-14: one input's hearing, as `/metrics`, the status line and
+/// `GET /status` report it. A hearing receiver decodes spots; a deaf or
+/// miscalibrated one stands out against the others.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InputHearing {
+    /// The input's `[[input]]` name.
+    pub name: String,
+    /// Spots attributed to this input and published.
+    pub spots: u64,
+    /// Distinct callsigns among them (capped by the caller).
+    pub distinct_calls: u64,
+    /// Candidate spots withheld because another input reported them first.
+    pub cross_input_dupes: u64,
+    /// Set by the silent-input check.
+    pub silent: bool,
+    /// When this input's latest spot was published.
+    pub last_spot: Option<Instant>,
+}
+
 /// One target's point-in-time state, as `GET /status` reports it
 /// (MAN-44). Taken by `UplinkTarget::snapshot_at` so a whole registry is
 /// read against one consistent `now`.
@@ -684,6 +703,11 @@ pub struct Metrics {
     /// with silence (NaN, infinite, or beyond `MAX_SAMPLE_MAGNITUDE`).
     /// Unlike `input_health`, every source publishes it, at 0 from startup.
     input_bad_samples: RwLock<BTreeMap<String, u64>>,
+    /// MAN-14: each input's hearing -- spots, distinct calls, cross-input
+    /// dedupe withholds, silence -- in registration (config) order. Only
+    /// the multi-input daemon registers rows, so a one-input `/metrics`,
+    /// status line and `/status` are unchanged.
+    input_hearing: RwLock<Vec<InputHearing>>,
     /// MAN-316: per reference list (`cty`, `scp`), fed by `manta-cli`'s
     /// startup resolution and list refresher. Ordered so `/metrics`
     /// renders the lists in a stable order.
@@ -1455,6 +1479,78 @@ impl Metrics {
         *entry = (*entry).max(count);
     }
 
+    /// MAN-14: publishes every input's hearing series at 0, in config
+    /// order, so each exists from the first scrape. Rows already present
+    /// keep their counts.
+    pub fn register_input_hearing(&self, names: &[String]) {
+        let mut rows = self.hearing_rows_mut();
+        for name in names {
+            if !rows.iter().any(|r| &r.name == name) {
+                rows.push(InputHearing {
+                    name: name.clone(),
+                    ..InputHearing::default()
+                });
+            }
+        }
+    }
+
+    fn hearing_rows_mut(&self) -> std::sync::RwLockWriteGuard<'_, Vec<InputHearing>> {
+        self.input_hearing
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn with_hearing_row(&self, source: &str, f: impl FnOnce(&mut InputHearing)) {
+        let mut rows = self.hearing_rows_mut();
+        let index = match rows.iter().position(|r| r.name == source) {
+            Some(i) => i,
+            None => {
+                rows.push(InputHearing {
+                    name: source.to_string(),
+                    ..InputHearing::default()
+                });
+                rows.len() - 1
+            }
+        };
+        f(&mut rows[index]);
+    }
+
+    /// MAN-14: one published spot attributed to `source`.
+    pub fn record_input_spot(&self, source: &str) {
+        let now = Instant::now();
+        self.with_hearing_row(source, |r| {
+            r.spots += 1;
+            r.last_spot = Some(now);
+        });
+    }
+
+    /// MAN-14: the first spot of a callsign `source` had not spotted yet.
+    pub fn record_input_distinct_call(&self, source: &str) {
+        self.with_hearing_row(source, |r| r.distinct_calls += 1);
+    }
+
+    /// MAN-14: `source`'s running count of cross-input dedupe withholds.
+    /// Keeps the maximum, so a stale value never makes it go backwards.
+    pub fn set_input_cross_input_dupes(&self, source: &str, count: u64) {
+        self.with_hearing_row(source, |r| {
+            r.cross_input_dupes = r.cross_input_dupes.max(count);
+        });
+    }
+
+    /// MAN-14: the silent-input check's verdict for `source`.
+    pub fn set_input_silent(&self, source: &str, silent: bool) {
+        self.with_hearing_row(source, |r| r.silent = silent);
+    }
+
+    /// MAN-14: every registered input's hearing, in config order; empty
+    /// with one input.
+    pub fn input_hearing(&self) -> Vec<InputHearing> {
+        self.input_hearing
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// MAN-316: the reference lists' entries, tolerating a poisoned lock --
     /// a panic elsewhere must not take `/metrics` down with it.
     fn list_metrics(&self) -> std::sync::MutexGuard<'_, BTreeMap<&'static str, ListMetrics>> {
@@ -2050,6 +2146,44 @@ impl Metrics {
             ));
         }
 
+        // MAN-14: each input's hearing, multi-input only, 0 from startup.
+        // One read for all four families. `[[input]]` names are
+        // `[A-Za-z0-9._-]`, so they need no label escaping.
+        let hearing = self.input_hearing();
+        type Family = (&'static str, &'static str, fn(&InputHearing) -> u64);
+        let families: [Family; 4] = [
+            (
+                "manta_input_spots_total",
+                "# HELP manta_input_spots_total Spots this input decoded and published, per source. Absent with a single [input] entry: the node-wide manta_spots_total is that input's count.\n\
+                 # TYPE manta_input_spots_total counter\n",
+                |r| r.spots,
+            ),
+            (
+                "manta_input_distinct_calls_total",
+                "# HELP manta_input_distinct_calls_total Distinct callsigns this input decoded spots for this session, per source (64-bit FNV-1a set; stops counting new calls past 20000 distinct per input).\n\
+                 # TYPE manta_input_distinct_calls_total counter\n",
+                |r| r.distinct_calls,
+            ),
+            (
+                "manta_input_cross_input_dupes_total",
+                "# HELP manta_input_cross_input_dupes_total Candidate spots this input had withheld because another input already reported the same signal (MAN-13 D6 cross-input dedupe), per source.\n\
+                 # TYPE manta_input_cross_input_dupes_total counter\n",
+                |r| r.cross_input_dupes,
+            ),
+            (
+                "manta_input_silent",
+                "# HELP manta_input_silent 1 when this input decoded no spots for silent_input_warning_secs while another input did decode in that window, else 0. Delivery health stays manta_source_health.\n\
+                 # TYPE manta_input_silent gauge\n",
+                |r| u64::from(r.silent),
+            ),
+        ];
+        for (name, header, value) in families {
+            out.push_str(header);
+            for r in &hearing {
+                out.push_str(&format!("{name}{{source=\"{}\"}} {}\n", r.name, value(r)));
+            }
+        }
+
         // MAN-316: the reference lists in use and their refresh history.
         // HELP/TYPE always render; each family has samples only for the
         // lists whose setter has run (see `ListMetrics`).
@@ -2635,6 +2769,62 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains("# TYPE manta_static_crashes_total counter\n"));
         assert!(text.contains("\nmanta_static_crashes_total 3\n"), "{text}");
+    }
+
+    /// MAN-14: the four hearing families, in config order.
+    #[test]
+    fn input_hearing_families_are_labelled_eager_and_never_go_backwards() {
+        let m = Metrics::new();
+        let text = m.render_prometheus_text();
+        for (family, kind) in [
+            ("manta_input_spots_total", "counter"),
+            ("manta_input_distinct_calls_total", "counter"),
+            ("manta_input_cross_input_dupes_total", "counter"),
+            ("manta_input_silent", "gauge"),
+        ] {
+            assert!(text.contains(&format!("# HELP {family} ")), "{text}");
+            assert!(
+                text.contains(&format!("# TYPE {family} {kind}\n")),
+                "{text}"
+            );
+            assert!(!text.contains(&format!("{family}{{")), "{text}");
+        }
+        m.register_input_hearing(&["live".to_string(), "deaf".to_string()]);
+        let text = m.render_prometheus_text();
+        assert!(text.contains(
+            "\nmanta_input_spots_total{source=\"live\"} 0\nmanta_input_spots_total{source=\"deaf\"} 0\n"
+        ), "{text}");
+        assert!(
+            text.contains("\nmanta_input_silent{source=\"deaf\"} 0\n"),
+            "{text}"
+        );
+        m.record_input_spot("live");
+        m.record_input_spot("live");
+        m.record_input_distinct_call("live");
+        m.set_input_cross_input_dupes("deaf", 3);
+        m.set_input_cross_input_dupes("deaf", 2);
+        m.set_input_silent("deaf", true);
+        // A second registration keeps the counts.
+        m.register_input_hearing(&["live".to_string(), "deaf".to_string()]);
+        let text = m.render_prometheus_text();
+        for line in [
+            "manta_input_spots_total{source=\"live\"} 2",
+            "manta_input_distinct_calls_total{source=\"live\"} 1",
+            "manta_input_cross_input_dupes_total{source=\"deaf\"} 3",
+            "manta_input_cross_input_dupes_total{source=\"live\"} 0",
+            "manta_input_silent{source=\"deaf\"} 1",
+            "manta_input_silent{source=\"live\"} 0",
+        ] {
+            assert!(text.contains(&format!("\n{line}\n")), "{line}: {text}");
+        }
+        let rows = m.input_hearing();
+        assert_eq!(rows[0].name, "live");
+        assert_eq!((rows[0].spots, rows[0].distinct_calls), (2, 1));
+        assert!(rows[0].last_spot.is_some() && rows[1].last_spot.is_none());
+        m.set_input_silent("deaf", false);
+        assert!(m
+            .render_prometheus_text()
+            .contains("\nmanta_input_silent{source=\"deaf\"} 0\n"));
     }
 
     #[test]

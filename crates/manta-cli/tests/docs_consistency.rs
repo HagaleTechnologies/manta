@@ -1205,6 +1205,7 @@ fn spec_detector_values_equal_the_code_defaults() {
         "rtty_dwell_ms",
         "non_cw_filter",
         "unkeyed_close_ms",
+        "reacquire_ms",
     ] {
         assert!(
             table.contains_key(key),
@@ -1275,6 +1276,7 @@ fn spec_documents_every_input_and_spot_key() {
                 "loop",
                 "host",
                 "port",
+                "protocol",
                 "freq_hz",
                 "password",
                 "driver",
@@ -1891,6 +1893,84 @@ fn man90_records_list_every_open_claim_and_link_each_other() {
         runbook.contains("\n## Captures"),
         "runbook has no Captures log"
     );
+}
+
+// ---- MAN-319 ----
+
+/// Where the locator gate's sentence lives, per surface. The README's and
+/// packaging README's paragraphs are whole-file (no `##` section to slice);
+/// the guide's is its `### Going live` subsection (the `section` helper
+/// slices only `##`, so it is cut by hand here); CONFIG.md's is the
+/// `[[rbn_uplink]]` section; the example file's is the dry_run comment.
+#[test]
+fn live_uplink_docs_name_the_six_character_locator_requirement() {
+    let guide = doc("docs/GUIDES/rbn-node.md");
+    let going_live = guide
+        .split("### Going live\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("rbn-node.md has no `### Going live` section"));
+    let going_live = &going_live[..going_live
+        .find("\n### ")
+        .or_else(|| going_live.find("\n## "))
+        .unwrap_or(going_live.len())];
+    for (what, text) in [
+        ("README.md uplink paragraph", doc("README.md")),
+        (
+            "docs/CONFIG.md [[rbn_uplink]] section",
+            section(&doc("docs/CONFIG.md"), "[[rbn_uplink]]").to_string(),
+        ),
+        (
+            "manta.example.toml dry_run comment",
+            doc("manta.example.toml"),
+        ),
+        (
+            "packaging/README.md Uplinks paragraph",
+            doc("packaging/README.md"),
+        ),
+        (
+            "docs/GUIDES/rbn-node.md Going live section",
+            going_live.to_string(),
+        ),
+    ] {
+        let text = squash_whitespace(&text);
+        assert!(
+            text.contains("6-character") && text.contains("operator_grid"),
+            "{what} does not name the 6-character operator_grid requirement"
+        );
+    }
+}
+
+/// MAN-319: the rescope is on record -- the wire scenarios are blocked on
+/// MAN-90's capture, and dry-run must stay registration-free even when the
+/// registration phase exists.
+#[test]
+fn man319_decision_record_rescopes_the_wire_scenarios_on_man90() {
+    let record = doc("docs/DECISIONS/2026-10-19-man319-uplink-registration-exchange.md");
+    let text = squash_whitespace(&record);
+    assert!(
+        text.contains("no Aggregator→RBN capture exists"),
+        "decision record does not name MAN-90's missing capture as the block"
+    );
+    assert!(
+        text.contains("must not perform registration while dry_run is on"),
+        "decision record does not bind the future registration phase to dry-run"
+    );
+}
+
+/// MAN-319: the four new claims sit in MAN-90's table, all still open.
+#[test]
+fn man90_claims_table_carries_the_man319_claims() {
+    let decision = doc(MAN90_DECISION);
+    for id in ["C8", "C9", "C10", "C11"] {
+        let row = decision
+            .lines()
+            .find(|l| l.contains(&format!("| {id} |")))
+            .unwrap_or_else(|| panic!("decision record has no {id} row"));
+        assert!(
+            row.trim_end().ends_with("| open |"),
+            "{id} row is not open: {row}"
+        );
+    }
 }
 
 /// MAN-90: every relative link in the two records resolves.
@@ -3135,6 +3215,47 @@ fn wiki_windows_build_setup_stamp_names_a_snapshot_without_release_yml() {
          `verified.commit`/`verified.date` (and the manifest entry) whenever the \
          body is substantively changed"
     );
+}
+
+// ---- MAN-310: docs/CONFIG.md's band table is CW_SEGMENTS ----
+
+/// `"5351.5"` kHz as Hz; `None` for the table's `–`.
+fn khz_cell(cell: &str) -> Option<f64> {
+    let cell = cell.trim();
+    (cell != "–").then(|| cell.parse::<f64>().expect("a kHz number") * 1000.0)
+}
+
+/// `"5351.5–5366.5"` as Hz.
+fn khz_range_cell(cell: &str) -> (f64, f64) {
+    let (lo, hi) = cell.trim().split_once('–').expect("a lo–hi range");
+    (khz_cell(lo).unwrap(), khz_cell(hi).unwrap())
+}
+
+#[test]
+fn config_md_band_table_matches_cw_segments() {
+    let text = doc("docs/CONFIG.md");
+    let start = text
+        .find("| band | CW segment, kHz | NCDXF beacon, kHz | skimmed span, kHz |")
+        .expect("docs/CONFIG.md has the band table");
+    let rows: Vec<Vec<&str>> = text[start..]
+        .lines()
+        .skip(2)
+        .take_while(|l| l.starts_with('|'))
+        .map(|l| l.trim_matches('|').split('|').map(str::trim).collect())
+        .collect();
+    let segments = manta_server::band_plan::CW_SEGMENTS;
+    assert_eq!(rows.len(), segments.len(), "one row per CW_SEGMENTS row");
+    for (row, seg) in rows.iter().zip(segments) {
+        assert_eq!(row[0], seg.band);
+        assert_eq!(
+            khz_range_cell(row[1]),
+            (seg.cw_lo_hz, seg.cw_hi_hz),
+            "{}",
+            seg.band
+        );
+        assert_eq!(khz_cell(row[2]), seg.beacon_hz, "{}", seg.band);
+        assert_eq!(khz_range_cell(row[3]), seg.span_hz(), "{}", seg.band);
+    }
 }
 
 // ---- MAN-119: the corpus runbook's test commands can be run as written ----

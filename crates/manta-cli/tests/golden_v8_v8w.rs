@@ -299,11 +299,12 @@ fn vc3_pileup_fading_with_crashes_spots_no_bogus_callsigns() {
 /// captures less than the full transmission): for 31/34 strong signals,
 /// `decoded_text.len() / expected_text.len()` is 1.0-1.3 (full-duration
 /// capture, exactly one track within 300 Hz of the expected frequency) yet
-/// CER still fails, ruling out fragmentation as the primary driver. Only
-/// 3/34 signals (AC3AGO-band idx 25, W7QLO idx 41, W8SHR idx 44) show that
-/// fragmentation pattern (len_ratio 0.09-0.22, 5-15 tracks within 300 Hz of
-/// the expected frequency) -- a secondary, QSB-driven track-continuity
-/// symptom (same family as issue #26), not the majority cause.
+/// CER still fails, ruling out fragmentation as the primary driver. That
+/// sentence once counted 3/34 strong signals split into 5-15 tracks within
+/// 300 Hz; on `35deb42` none was, and with MAN-108's DORMANT re-acquisition
+/// still 0/34 have more than one track within 300 Hz of the expected
+/// frequency (docs/DECISIONS/2026-10-17-man108-dormant-track-reacquisition.md),
+/// so fragmentation plays no part in this CER gap.
 ///
 /// The dominant pattern for the other 31 is scattered character-level
 /// corruption throughout an otherwise full-length decode, e.g. signal 1

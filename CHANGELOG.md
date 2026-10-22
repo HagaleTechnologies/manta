@@ -24,11 +24,21 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+<<<<<<< HEAD
 - MAN-307: live HPSDR queue losses reset only the affected decode segment.
   Decimation resets its filter and forwards converted gaps, and reconnect
   wrappers preserve inner gaps, including an EOF with a pending gap. Clean
   file replay remains unchanged.
 
+=======
+- MAN-108: a fading signal keeps one `track_id` through fades of up to
+  15 s instead of respawning a new track each time the 5 s hang ran out.
+  A track that has decoded goes DORMANT for `reacquire_ms` (10 s) after
+  the hang and wakes under the same id with a fresh decoder; the text it
+  decodes is unchanged, its spots carry one id, and the validator's
+  per-track state (RST, `QRL?`) survives the fade. A track whose signal
+  really ends now closes 15 s after the drop instead of 5 s.
+>>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
 - MAN-265: a transmission that ends at the speed tracker's warm-up
   boundary (e.g. a beacon ID or a single exchange) now reports its
   gap-corrected WPM. The readiness mark's seed was computed before the
@@ -85,6 +95,7 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+<<<<<<< HEAD
 - MAN-307: several HPSDR inputs can share one radio, with one independently
   tuned receiver per band, capacity probing for HL2, and an optional
   `receivers` declaration for other gateware. Each radio reconnects as a
@@ -95,6 +106,35 @@ the git history and `docs/DECISIONS/`.
   Exhaustive `manta_server::metrics::InputHealth` literals must initialize the
   new `queue_dropped_samples` field or use `Default`.
 
+=======
+- MAN-305: protocol-2 openHPSDR radios (ANAN-class: Hermes, Angelia,
+  Orion, Orion II, Saturn/G2) as inputs, alongside protocol 1 (Hermes-Lite
+  2). `--hpsdr-protocol auto|1|2`, `[input] protocol` (`"auto"`, `"1"`,
+  `"2"` or the integers 1 and 2) and `MANTA_INPUT_PROTOCOL` choose it; the
+  default `auto` sends one directed discovery probe to the configured host
+  (never a broadcast), uses protocol 2 when the radio answers as protocol 2
+  and protocol 1 otherwise, and prints which on every open. `manta config
+  check` prints `protocol=`. A protocol-2 radio sends IQ from port + 11
+  (1035 by default), so the host firewall must allow inbound UDP from it;
+  see docs/CONFIG.md. Its `manta_input_dropped_packets_total{source="hpsdr"}`
+  counts datagrams proven lost by sequence number.
+- MAN-305: `IqSource::take_missing_samples()`, a defaulted hook through
+  which a source reports samples lost before a read and spliced over.
+  `listen` advances its sample clock by that many samples without closing
+  tracks, so spot timestamps stay true across a short loss. Wrappers must
+  forward it, as they forward `take_discontinuity()`.
+- MAN-310: `[input].bands` (`"all"`, band names or centre frequencies in
+  kHz) plans a receiver's streams from the standard CW segments, 160
+  through 10 m with 60 m and the NCDXF beacons. `tuning_range_hz` drops
+  bands the receiver cannot tune, and a band wider than one stream is
+  split, each stream starting tracks only on its own side of the split.
+  Several KiwiSDR sessions to one receiver now open side by side. See
+  [docs/DECISIONS/2026-10-17-man310-band-plan.md](docs/DECISIONS/2026-10-17-man310-band-plan.md).
+
+- MAN-108: `[detector] reacquire_ms` (default `10000`), how long after
+  `hang_ms` a decoded track keeps its identity waiting for its signal to
+  return. `0` restores the previous close at `hang_ms`.
+>>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
 - MAN-13: one `manta run` decodes several receivers into one spot output.
   Write `[[input]]` once per receiver (each with a `name`); every input
   decodes on its own thread into one shared validator, so a station two
@@ -174,6 +214,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-319: a live `[[rbn_uplink]]` (`dry_run = false`) also needs
+  `[server].operator_grid` set to a 6-character Maidenhead locator (e.g.
+  `"FN03ab"`). `config check`, `run`, `doctor` and a SIGHUP reload refuse a
+  live uplink without one, naming the target and the key to set; dry-run
+  uplinks (the default) are unchanged. A 4-character grid is refused too.
+  `[server]` needs a restart, so a SIGHUP reload goes live only if the
+  daemon started with the grid. The registration/settings exchange itself
+  stays blocked on MAN-90's Aggregator→RBN capture (claims C8–C11).
 - IQ WAV input streams from disk: `manta decode`'s memory no longer grows
   with the recording's length (a 1 GB recording decodes in under 20 MiB), and
   `run --loop` re-opens a recording without re-reading it. A WAV whose data
@@ -196,10 +244,28 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- `ReconnectingSource`, `DecimatingSource` and `manta doctor`'s
+  `SampleBoundedSource` now forward the inner source's gap reports
+  (`take_discontinuity()` and the new `take_missing_samples()`); they
+  swallowed them, so no live source's gap reached the decoder (MAN-305).
+- MAN-259: after a live source reconnects, `manta run`'s spot timestamps
+  are no longer stamped late by the time the receiver spent reopening while
+  already streaming. The reported outage now ends where the stream the
+  device returns began, not where its open call returned; for ka9q-radio
+  with no SSRC set that was the span its startup stash actually replayed
+  (up to the 1.5 s settle window at 192 kS/s, and only ~0.32 s at
+  1.536 MS/s, where the stash's 4 MiB cap evicts the opening -- that
+  evicted span is outage, not data).
 - `manta run` stopped while waiting to reconnect to a lost receiver no
   longer force-decodes the open tracks' last element or judges their
   pending beacons as if the signal had ended; they close as an outage
   (MAN-258).
+- `manta calibrate --write` no longer fails on every run with
+  `creating temp file …: File exists` after a save was killed before it
+  finished, as when manta runs as PID 1 in a container (MAN-335). Each save
+  now picks a random temp name and tries another if that one is taken. A
+  killed save's `.<config>.calibrate-*.tmp` file is left in place and is
+  safe to delete.
 
 ## [0.1.0] - 2026-10-11
 

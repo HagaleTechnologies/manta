@@ -3,7 +3,7 @@
 Not part of CI. manta's direct `[[rbn_uplink]]` is experimental: its login and
 spot format are manta's assumption, never observed against RBN's real ingest.
 This runbook records what a real RBN Aggregator sends to RBN's server, so the
-uplink's open claims C1–C7 in
+uplink's open claims C1–C11 in
 [the MAN-90 decision record](../DECISIONS/2026-10-11-man90-uplink-protocol-verification.md)
 can each be marked `matches` or `differs`. Until a capture is logged at the
 end of this page, the supported route into RBN is manta's telnet server behind
@@ -211,10 +211,10 @@ one pair of transcripts each (C1). A refused or failed attempt gives an empty
 transcript, so skip it.
 
 If the first command prints anything for a stream, that session is TLS and
-the file holds only ciphertext for it. Record C2 as `differs: TLS` and C3–C7
+the file holds only ciphertext for it. Record C2 as `differs: TLS` and C3–C11
 as `not observable: TLS`, take no bytes from that stream's transcripts, and
 open the rework ticket the decision record's D-5 asks for: a TLS session is
-not the line-oriented ingest the uplink logs into. Settling C3–C7 for that
+not the line-oriented ingest the uplink logs into. Settling C3–C11 for that
 session needs its TLS session keys or decrypted payload; that ticket decides
 how to get them, and this runbook does not collect them. The `16:03` test catches a TLS handshake on a port
 tshark does not decode as TLS. The `.txt` view is for reading: `ascii` mode
@@ -228,7 +228,7 @@ a pair of transcripts with
 `tshark -r aggregator-rbn.pcapng -q -z follow,udp,ascii,$N > transcript-udp-$N.txt`
 and
 `tshark -r aggregator-rbn.pcapng -q -z follow,udp,raw,$N > transcript-udp-$N.hex`.
-Then fill a C1–C7 table by comparing each `.hex` transcript with the decision
+Then fill a C1–C11 table by comparing each `.hex` transcript with the decision
 record's reference session (the bytes
 `the_uplink_session_bytes_match_the_man90_reference` pins):
 
@@ -244,6 +244,18 @@ record's reference session (the bytes
 - **C6:** any server→Aggregator traffic after login, and Aggregator's answers.
 - **C7:** whether the server sends a prompt at all, and how it ends (newline or
   not).
+- **C8 (MAN-319):** whether any locator bytes leave Aggregator before spots —
+  in which field, spelling and phase of the exchange (C3's first bytes and
+  everything up to the first spot).
+- **C9 (MAN-319):** every collector→Aggregator line after login, and whether
+  Aggregator's sending changed after it — that would be a spot-settings
+  payload a submitter must apply.
+- **C10 (MAN-319):** whether any such line directs Aggregator to hold spots,
+  and Aggregator's reaction (the Skimmer Traffic tab shows whether forwards
+  stopped).
+- **C11 (MAN-319):** any reference-file identity, version or transfer on the
+  connection — filenames, checksums, or file bodies Aggregator fetches from
+  RBN.
 
 ## Recording a result
 
@@ -251,7 +263,7 @@ Append a dated entry under `## Captures` with:
 
 - the operator, named only with their consent;
 - the Aggregator version and the capture length;
-- the C1–C7 results;
+- the C1–C11 results;
 - a redacted excerpt of at most 10 lines (any password replaced by
   `<redacted>`), approved by the operator.
 
