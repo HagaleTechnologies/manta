@@ -11,6 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-22 | MAN-94 | [MAN-94: an NCDXF/IARU beacon spot reads `NCDXF B` on the wire](2026-10-22-man94-ncdxf-beacon-label.md) |
 | 2026-10-19 | MAN-334 | [MAN-334: calibrate plans its references before it opens the receiver](2026-10-19-man334-calibrate-plans-before-opening.md) |
 | 2026-10-19 | MAN-319 | [MAN-319: the live uplink needs a 6-character locator now; the registration exchange waits for MAN-90's capture](2026-10-19-man319-uplink-registration-exchange.md) |
 | 2026-10-19 | MAN-311 | [Exclude common digital-mode windows from CW track starts](2026-10-19-man311-digital-window-exclusions.md) |
