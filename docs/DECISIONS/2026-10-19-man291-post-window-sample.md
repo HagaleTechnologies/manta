@@ -19,15 +19,25 @@ describes; its D-A to D-N thresholds are unchanged.
 
 - **D1 — A missing post-window sample fails ledger integrity.** With
   `--spots-dir`, when the last reachable sample in the window is before the
-  window end and no reachable sample carrying `manta_spots_total` follows the
-  window, `spots_missed` is null, `spots_missed_incomplete` and
-  `integrity.missing_post_window_sample` are true, `integrity.pass` is false
-  and the verdict is FAIL (exit 1). It fails rather than warns because a
-  rerun one scrape later fixes it, while a warning under `## Daily` can sit
-  below `**Overall: PASS**`.
+  window end and no reachable sample follows the window, `spots_missed` is
+  null, `spots_missed_incomplete` and `integrity.missing_post_window_sample`
+  are true, `integrity.pass` is false and the verdict is FAIL (exit 1). It
+  fails rather than warns because a rerun one scrape later fixes it, while a
+  warning under `## Daily` can sit below `**Overall: PASS**`.
+- **D1a — Only the first reachable post-window sample counts the tail.** Its
+  delta can already include spots emitted after the window end, which the
+  archive (cut at the window end) leaves out; a later sample would add more
+  of them as missed (PR #376 review). When that first sample lacks
+  `manta_spots_total` or `manta_start_time_seconds`, `spots_missed` is null,
+  `spots_missed_incomplete` and
+  `integrity.post_window_sample_missing_metrics` are true, and integrity
+  fails as in D1. It is a gap in the ledger, like a required metric missing
+  from an in-window sample, so it reads `incomplete` and fails integrity
+  rather than reading `indeterminate` (D2). Unlike D1 no rerun completes
+  the count, so the line tells Stage 1 to pass `indeterminate`.
 - **D2 — `incomplete`, not `indeterminate`.** The `Spots missed by the
-  recorder` line says `incomplete` and tells the operator to run `report`
-  again after the next scrape. `indeterminate` stays for the causes a rerun
+  recorder` line says `incomplete` and, in D1's case, tells the operator to
+  run `report` again after the next scrape. `indeterminate` stays for the causes a rerun
   cannot fix (a restart in the window, no sample before the window start);
   when both apply, the line says `indeterminate` and integrity still fails.
   `shadow-compare.py --missed-spots` is unchanged and rejects `incomplete`

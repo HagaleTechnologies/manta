@@ -252,10 +252,10 @@ If manta restarted in the window, or no sample precedes the start note, that lin
 `indeterminate` (the spot counter is per process, and spots before the first sample are unseen);
 pass `indeterminate` and Stage 1 is NO-GO.
 
-If it reads `incomplete`, the ledger has no reachable sample after `END` yet: wait for the next
-scrape and run `report` again. `shadow-compare.py` refuses `--missed-spots incomplete`. If the node
-stays unreachable after `END`, the count cannot complete: pass `indeterminate` and Stage 1 is
-NO-GO.
+If it reads `incomplete, no reachable sample after the window end yet`, wait for the next scrape
+and run `report` again. `shadow-compare.py` refuses `--missed-spots incomplete`. If the node stays
+unreachable after `END`, or the line says the first reachable sample after the window end lacks a
+required metric, the count cannot complete: pass `indeterminate` and Stage 1 is NO-GO.
 
 ```sh
 MISSED=0   # N from "Spots missed by the recorder: N", or indeterminate

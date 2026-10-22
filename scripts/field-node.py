@@ -996,10 +996,18 @@ def summarize(records, params=None):
     # needs a reachable sample after the window with a spot counter; a report
     # run before that scrape (right at END) cannot count it, so spots_missed
     # is incomplete and ledger integrity fails (PRRT_kwDOTQvU8M6qmtCB, MAN-291).
+    # Only the first reachable sample after the window may count it. Its delta
+    # can already include spots emitted after the window end, which the
+    # archive (cut at the window end) leaves out, and a later sample would add
+    # more of them as missed. If that first sample lacks a counter, the tail
+    # stays uncounted (PR #376).
     tail_open = not seq or seq[-1]["ts"] < end
-    after = [s for s in reach if s["ts"] > end and s.get("spots_total") is not None]
-    tail_missing = tail_open and not after
-    if tail_open and seq and after:
+    after = [s for s in samples if s.get("reachable") and s["ts"] > end]
+    post_window_lacks = [m for m, k in (("manta_spots_total", "spots_total"),
+                                        ("manta_start_time_seconds", "start_time"))
+                         if after and after[0].get(k) is None]
+    tail_missing = tail_open and (not after or bool(post_window_lacks))
+    if tail_open and seq and not tail_missing:
         a_, b_ = seq[-1], after[0]
         bs_, as_t = b_["spots_total"], a_.get("spots_total")
         if a_["start_time"] == b_["start_time"] and as_t is not None:
@@ -1147,7 +1155,16 @@ def summarize(records, params=None):
             warnings.append(
                 "spots missed by the recorder are indeterminate: %s, so Stage 1 (D-I) cannot GO; "
                 "pass --missed-spots indeterminate to shadow-compare.py" % "; ".join(why))
-        if tail_missing:
+        if tail_missing and after:
+            spots_missed_incomplete = True
+            warnings.append(
+                "the first reachable sample after the window end (%s), at %s, lacks %s: the spots "
+                "emitted after the last reachable sample (%s) are uncounted, so spots missed by the "
+                "recorder are incomplete and ledger integrity fails; a later sample would count more "
+                "spots emitted after the window end as missed, so no rerun completes the count"
+                % (_iso(end), _iso(after[0]["ts"]), " and ".join(post_window_lacks),
+                   _iso(seq[-1]["ts"]) if seq else "none"))
+        elif tail_missing:
             spots_missed_incomplete = True
             warnings.append(
                 "no reachable sample after the window end (%s) yet: the spots emitted after the last "
@@ -1230,7 +1247,8 @@ def summarize(records, params=None):
                       "samples": len(win_samples),
                       "reachable_samples": len(reachable_win),
                       "missing_metrics": missing_counts,
-                      "missing_post_window_sample": spots_missed_incomplete,
+                      "missing_post_window_sample": spots_missed_incomplete and not after,
+                      "post_window_sample_missing_metrics": spots_missed_incomplete and bool(after),
                       "pass": integrity_ok},
         "warnings": warnings,
     }
@@ -1271,7 +1289,9 @@ def render_markdown(s):
         causes = [c for c, bad in (("required metrics missing", integ["missing_metrics"]),
                                    ("ledger lines lost", integ["interior_unparseable_lines"]),
                                    ("no reachable sample after the window end yet",
-                                    integ["missing_post_window_sample"])) if bad]
+                                    integ["missing_post_window_sample"]),
+                                   ("the first sample after the window end lacks a required metric",
+                                    integ["post_window_sample_missing_metrics"])) if bad]
         w("- Ledger integrity: %s (see Ledger integrity): FAIL (integrity)" % ", ".join(causes))
     w("")
     w("## Window")
@@ -1339,6 +1359,10 @@ def render_markdown(s):
         if s["spots_missed_indeterminate"]:
             w("Spots missed by the recorder: indeterminate, see the warnings "
               "(Stage 1: shadow-compare.py --missed-spots indeterminate; D-I cannot GO)")
+        elif s["integrity"]["post_window_sample_missing_metrics"]:
+            w("Spots missed by the recorder: incomplete, the first reachable sample after the window end "
+              "lacks a required metric, see the warnings (Stage 1: no rerun completes it; "
+              "shadow-compare.py --missed-spots indeterminate; D-I cannot GO)")
         elif s["spots_missed_incomplete"]:
             w("Spots missed by the recorder: incomplete, no reachable sample after the window end yet "
               "(Stage 1: run report again after the next scrape; D-I cannot GO until then)")

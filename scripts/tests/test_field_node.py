@@ -989,6 +989,33 @@ class ReportTests(unittest.TestCase):
         self.assertTrue(out["integrity"]["missing_post_window_sample"])
         self.assertFalse(out["integrity"]["pass"])
 
+    def test_first_post_window_sample_without_counters_is_incomplete(self):
+        # PR #376 review: the first reachable scrape after --to lacks a
+        # counter. The next one also counts the 5 spots emitted after the
+        # window, which the archive (cut at --to) leaves out, so using it
+        # would report them as missed. The tail stays incomplete instead.
+        ov = {i: {"spots_inc": 0} for i in range(1, 146)}
+        ov[144] = {"spots_inc": 3}
+        ov[145] = {"spots_inc": 5}
+        full = make_ledger(days=145 * IV / DAY, end_note=False, overrides=ov)
+        to = T0 + 143 * IV + 300
+        for key, metric in (("spots_total", "manta_spots_total"),
+                            ("start_time", "manta_start_time_seconds")):
+            recs = [dict(r, **{key: None}) if r["ts"] == T0 + 144 * IV else r for r in full]
+            s = summ(recs, from_ts=T0, to_ts=to, recorded_by_day={})
+            self.assertIsNone(s["spots_missed"], key)
+            self.assertTrue(s["spots_missed_incomplete"])
+            self.assertFalse(s["integrity"]["missing_post_window_sample"])
+            self.assertTrue(s["integrity"]["post_window_sample_missing_metrics"])
+            self.assertFalse(s["integrity"]["pass"])
+            self.assertTrue(any("the first reachable sample after the window end (2026-01-01T23:55:00Z), "
+                                "at 2026-01-02T00:00:00Z, lacks %s" % metric in w for w in s["warnings"]))
+            md = fn.render_markdown(s)
+            self.assertIn("Spots missed by the recorder: incomplete, the first reachable sample after "
+                          "the window end lacks a required metric", md)
+            self.assertIn("- Ledger integrity: the first sample after the window end lacks a required "
+                          "metric (see Ledger integrity): FAIL (integrity)", md)
+
     def test_end_note_between_scrapes_waits_for_the_next_sample(self):
         # The day-30 path: `note --kind end`, then report with no --to.
         ov = {i: {"spots_inc": 0} for i in range(1, 145)}
