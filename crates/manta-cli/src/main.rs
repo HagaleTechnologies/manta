@@ -2135,7 +2135,7 @@ fn check_record_destination(path: &Path) -> Result<()> {
 }
 
 /// MAN-309: each `[[input]]`'s `record_iq` passes `check_record_destination`
-/// and no two inputs record to the same file.
+/// and no payload, metadata or partial marker overlaps another input's.
 fn check_record_destinations(inputs: &[ResolvedInput]) -> Result<()> {
     let mut seen: Vec<String> = Vec::new();
     for input in inputs {
@@ -2160,14 +2160,20 @@ fn check_record_destinations(inputs: &[ResolvedInput]) -> Result<()> {
             }
             _ => path.to_path_buf(),
         };
-        let canonical = canonical.to_string_lossy().to_ascii_lowercase();
-        if seen.contains(&canonical) {
-            bail!(
-                "two [[input]] entries record to {}; give each its own record_iq",
-                path.display()
-            );
+        for reserved in [
+            manta_input::metadata_path(&canonical),
+            manta_input::partial_metadata_path(&canonical),
+            canonical,
+        ] {
+            let reserved = reserved.to_string_lossy().to_ascii_lowercase();
+            if seen.contains(&reserved) {
+                bail!(
+                    "two [[input]] entries record to {}; give each its own record_iq",
+                    path.display()
+                );
+            }
+            seen.push(reserved);
         }
-        seen.push(canonical);
     }
     Ok(())
 }

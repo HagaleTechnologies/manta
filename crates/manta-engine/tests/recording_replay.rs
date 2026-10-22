@@ -344,3 +344,49 @@ fn listen_round_trip(split: usize, name: &str, expect_closure: bool) {
     assert_eq!(listen_events(Box::new(replay)), want);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn rtty_marks_close_at_gap_boundaries() {
+    let fs = 96_000.0;
+    // End off the canonical chunk boundary to check the consumed-sample clock.
+    let mut iq = vec![Complex32::new(0.0, 0.0); 384_123];
+    manta_testkit::fsk::add_fsk(
+        &mut iq,
+        fs,
+        &manta_testkit::fsk::FskSpec {
+            mark_offset_hz: 15_000.0,
+            shift_hz: 170.0,
+            baud: 45.45,
+            snr_2500_db: 30.0,
+            text: "CQ TEST DE W1AW W1AW RYRYRY 599 001 ".into(),
+            start_s: 0.0,
+            watterson: None,
+            seed: 15_000,
+        },
+    );
+    let mut cfg = PipelineConfig::default();
+    cfg.detector.rtty_dwell_hops = manta_dsp::fsk::BLOCK_HOPS as u64;
+    cfg.detector.confirm_hops = 1_000_000;
+    for missing in [0, 96_000] {
+        for terminal in [None, Some(0), Some(48_000)] {
+            let mut src = Gapped {
+                parts: vec![(None, iq.clone()), (Some(missing), iq.clone())],
+                terminal,
+                fs,
+                center: 14_070_000.0,
+                part: 0,
+                at: 0,
+                pending: None,
+            };
+            let report = decode_source(&mut src, &cfg).unwrap();
+            assert_eq!(report.rtty.len(), 2, "{:?}", report.rtty);
+            assert_eq!(report.rtty[0].cleared_sample_ts, Some(iq.len() as u64));
+            assert_eq!(
+                report.rtty[1].cleared_sample_ts,
+                terminal.map(|_| 2 * iq.len() as u64 + missing)
+            );
+            assert!(report.rtty[1].marked_sample_ts >= iq.len() as u64 + missing);
+            assert_ne!(report.rtty[0].id, report.rtty[1].id);
+        }
+    }
+}

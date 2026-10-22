@@ -834,6 +834,46 @@ fn a_service_config_records_relative_to_its_file_and_config_check_creates_nothin
 }
 
 #[test]
+fn recording_destinations_reject_generated_path_collisions_before_opening() {
+    let dir = tempfile::tempdir().unwrap();
+    v1_fixture(dir.path());
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    for other in [
+        "capture.meta.jsonl",
+        "capture.meta.jsonl.partial",
+        "sub/../CAPTURE.META.JSONL",
+        "sub/../CAPTURE.META.JSONL.PARTIAL",
+    ] {
+        for paths in [["capture", other], [other, "capture"]] {
+            let config = dir.path().join("collision.toml");
+            let entries: String = paths.iter().enumerate().map(|(i, path)| {
+                format!(
+                    "[[input]]\nname = \"rx{i}\"\ntype = \"file\"\npath = \"v1.wav\"\niq = true\nrecord_iq = \"{path}\"\n"
+                )
+            }).collect();
+            std::fs::write(&config, entries).unwrap();
+            let out = manta()
+                .args(["run", "--config"])
+                .arg(&config)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{paths:?}: {stderr}");
+            assert!(
+                stderr.contains("give each its own record_iq"),
+                "{paths:?}: {stderr}"
+            );
+            for path in paths {
+                let path = dir.path().join(path);
+                assert!(!path.exists());
+                assert!(!metadata_path(&path).exists());
+                assert!(!manta_input::partial_metadata_path(&path).exists());
+            }
+        }
+    }
+}
+
+#[test]
 fn each_input_of_a_multi_input_daemon_records_its_own_file() {
     let dir = tempfile::tempdir().unwrap();
     let (wav, manifest) = v1_fixture(dir.path());
