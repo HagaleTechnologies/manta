@@ -152,13 +152,35 @@ impl Drop for TempGuard {
 /// Temp names a save tries before it gives up.
 const TEMP_ATTEMPTS: usize = 16;
 
-/// `.{name}.calibrate-{pid}-{suffix}.tmp`, beside the config.
+/// Common filesystems cap a file name at 255 bytes (`NAME_MAX`); a longer
+/// temp basename would fail the open with an error the retry cannot mend.
+const TEMP_NAME_MAX: usize = 255;
+
+/// `.{name}.calibrate-{pid}-{suffix}.tmp`, beside the config. A `name` that
+/// would push the basename past `TEMP_NAME_MAX` is truncated (on a char
+/// boundary): a valid long config name must not cost the save, and the
+/// random suffix keeps even truncated names from colliding.
 fn temp_path(dir: &Path, name: &OsStr, suffix: u64) -> PathBuf {
-    dir.join(format!(
+    let name = name.to_string_lossy();
+    let temp = format!(
         ".{}.calibrate-{}-{suffix:016x}.tmp",
-        name.to_string_lossy(),
+        name,
         std::process::id()
-    ))
+    );
+    let temp = if temp.len() <= TEMP_NAME_MAX {
+        temp
+    } else {
+        let mut end = name.len() - (temp.len() - TEMP_NAME_MAX);
+        while end > 0 && !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!(
+            ".{}.calibrate-{}-{suffix:016x}.tmp",
+            &name[..end],
+            std::process::id()
+        )
+    };
+    dir.join(temp)
 }
 
 /// A random temp-name suffix, from std's randomly keyed SipHash: a run that
@@ -840,6 +862,29 @@ mod tests {
         assert_eq!(calls, TEMP_ATTEMPTS);
         assert_eq!(fs::read_to_string(&p).unwrap(), "[input]\n");
         assert_eq!(fs::read_to_string(&leftover).unwrap(), "half-written");
+    }
+
+    /// MAN-335: a config name long enough that the old PID-only temp name
+    /// fit but the 16-hex-digit suffix does not still saves: the embedded
+    /// name is truncated within the filesystem's `NAME_MAX`, not abandoned.
+    #[test]
+    fn save_truncates_a_temp_name_past_name_max() {
+        let dir = tempfile::tempdir().unwrap();
+        // 234 bytes: `.{name}.calibrate-{pid}.tmp` fit, the suffixed form
+        // overflows a 255-byte file name for every PID length.
+        let long = format!("{}.toml", "a".repeat(229));
+        let p = write(dir.path(), &long, "[input]\n");
+        let mut suffixes = [7].into_iter();
+        let mut suffix = || suffixes.next().unwrap();
+        assert_eq!(
+            save_with_env(&p, -1.42, None, None, &[], &mut suffix).unwrap(),
+            None
+        );
+        assert_eq!(
+            fs::read_to_string(&p).unwrap(),
+            "[input]\nfreq_correction_ppm = -1.42\n"
+        );
+        assert_eq!(entries(dir.path()), [long.as_str()]);
     }
 
     #[test]
