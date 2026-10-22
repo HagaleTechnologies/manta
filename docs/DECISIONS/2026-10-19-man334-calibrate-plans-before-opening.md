@@ -42,11 +42,14 @@ sound card (`no audio input matching "NoSuchCard"`) behaved the same way.
    `LiveSourceSpec::configured_center_and_passband` returns `None` when only
    opening can tell (a ka9q-radio channel, a recording) or when `open`
    itself would refuse (a missing frequency or rate, an HPSDR rate or
-   frequency that `HpsdrConfig::validate` refuses before any I/O, a
-   `--capture-rate-hz` that `DecimatingSource::new` refuses). `open`
-   reports those errors as before. For KiwiSDR, HPSDR and a sound card the
-   configured values are exactly what the opened source reports, so the
-   preflight refuses nothing that opening would not.
+   frequency that `hpsdr::validate_before_open` refuses before any I/O, a
+   `--capture-rate-hz` that `DecimatingSource::new` refuses). That check
+   is protocol 2's own with `--hpsdr-protocol 2` and protocol 1's
+   `HpsdrConfig::validate` otherwise: under `auto` only discovery, which is
+   I/O, picks the protocol. `open` reports those errors as before. For
+   KiwiSDR, HPSDR and a sound card the configured values are exactly what
+   the opened source reports, so the preflight refuses nothing that opening
+   would not.
 4. **SoapySDR on the requested values.** The preflight uses
    `--soapy-freq-hz`/`--soapy-rate-hz` (or their `[input]` keys), as the
    ticket asks. A driver may round either: a requested window that holds no
