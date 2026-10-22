@@ -2,8 +2,9 @@
 //!
 //! `RecordingSource` wraps the source handed to the engine and passes every
 //! read, error, property and discontinuity through unchanged. A copy of each
-//! read goes, in fixed 4096-frame blocks, through a bounded non-blocking
-//! queue to one writer thread per recording, which alone touches the files.
+//! read goes, in blocks of at most 4096 frames, through a non-blocking queue
+//! bounded at 16 MiB of payload (a small read is charged as 64 frames) to
+//! one writer thread per recording, which alone touches the files.
 //! A full queue stops the recording (the file keeps a contiguous prefix) and
 //! never makes the decoder wait; a write failure stops it too. Neither
 //! becomes a source error. `RecordingHandle` reports the outcome.
@@ -16,8 +17,8 @@ use anyhow::Result;
 use num_complex::Complex32;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,7 +26,9 @@ use std::time::Duration;
 pub const RECORDING_BLOCK_FRAMES: usize = 4096;
 /// Payload bytes the queue may hold per recording.
 pub const RECORDING_QUEUE_BYTES: usize = 16 * 1024 * 1024;
-const QUEUE_BLOCKS: usize = RECORDING_QUEUE_BYTES / (RECORDING_BLOCK_FRAMES * 8);
+/// The least a queued message is charged, in frames: it bounds the number
+/// of queued messages, and so their bookkeeping, for any read size.
+const MIN_CHARGED_FRAMES: usize = 64;
 
 /// Called once, from whichever thread sees it, when a recording stops early.
 pub type RecordingNotice = Box<dyn Fn(&str) + Send + Sync>;
@@ -54,12 +57,26 @@ enum Msg {
     TerminalGap(u64),
 }
 
+impl Msg {
+    /// What this message counts against `RECORDING_QUEUE_BYTES` while
+    /// queued.
+    fn charge(&self) -> usize {
+        let frames = match self {
+            Msg::Block { samples, .. } => samples.len(),
+            Msg::TerminalGap(_) => 0,
+        };
+        frames.max(MIN_CHARGED_FRAMES) * 8
+    }
+}
+
 const REASON_STOPPED: u8 = 0;
 const REASON_EOF: u8 = 1;
 const REASON_BACKPRESSURE: u8 = 2;
 
 struct Shared {
-    sender: Mutex<Option<SyncSender<Msg>>>,
+    sender: Mutex<Option<Sender<Msg>>>,
+    /// The charge of every message sent and not yet written.
+    queued: AtomicUsize,
     reason: AtomicU8,
     cancelled: AtomicBool,
     notified: AtomicBool,
@@ -182,10 +199,11 @@ fn start_with_sinks<S: IqSource + ?Sized>(
     publish: Publish,
     notice: Option<RecordingNotice>,
 ) -> (RecordingSource<S>, RecordingHandle) {
-    let (tx, rx) = mpsc::sync_channel(QUEUE_BLOCKS);
+    let (tx, rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
     let shared = Arc::new(Shared {
         sender: Mutex::new(Some(tx)),
+        queued: AtomicUsize::new(0),
         reason: AtomicU8::new(REASON_STOPPED),
         cancelled: AtomicBool::new(false),
         notified: AtomicBool::new(false),
@@ -279,6 +297,7 @@ fn write_recording(
             None => Ok(()),
         };
     while let Ok(msg) = rx.recv() {
+        let charge = msg.charge();
         let result = match msg {
             Msg::Block {
                 gap,
@@ -299,6 +318,7 @@ fn write_recording(
             }
             Msg::TerminalGap(g) => add_gap(&mut pending, g),
         };
+        shared.queued.fetch_sub(charge, Ordering::AcqRel);
         if let Err(e) = result {
             return fail(e);
         }
@@ -345,8 +365,9 @@ impl<S: ?Sized> RecordingSource<S> {
         self
     }
 
-    /// Copies `samples` (and the gap before them) into the queue; on a full
-    /// queue, stops the recording at the last accepted block.
+    /// Copies `samples` (and the gap before them) into the queue; when a
+    /// block would take the queue past `RECORDING_QUEUE_BYTES`, stops the
+    /// recording at the last accepted block.
     fn enqueue(&self, mut gap: Option<u64>, samples: &[Complex32]) {
         let Ok(mut guard) = self.shared.sender.lock() else {
             return;
@@ -364,23 +385,25 @@ impl<S: ?Sized> RecordingSource<S> {
                 (None, Some(g)) if samples.is_empty() => Msg::TerminalGap(g),
                 (None, _) => return,
             };
-            match tx.try_send(msg) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    self.shared
-                        .reason
-                        .store(REASON_BACKPRESSURE, Ordering::Release);
-                    guard.take();
-                    drop(guard);
-                    self.shared
-                        .notify("IQ recording stopped: writer queue full; decoding continues");
-                    return;
-                }
+            let charge = msg.charge();
+            let queued = self.shared.queued.fetch_add(charge, Ordering::AcqRel);
+            if queued + charge > RECORDING_QUEUE_BYTES {
+                self.shared.queued.fetch_sub(charge, Ordering::AcqRel);
+                self.shared
+                    .reason
+                    .store(REASON_BACKPRESSURE, Ordering::Release);
+                guard.take();
+                drop(guard);
+                self.shared
+                    .notify("IQ recording stopped: writer queue full; decoding continues");
+                return;
+            }
+            // Unbounded, so it never waits; the charge above bounds it.
+            if tx.send(msg).is_err() {
                 // The writer has stopped (and reported why).
-                Err(TrySendError::Disconnected(_)) => {
-                    guard.take();
-                    return;
-                }
+                self.shared.queued.fetch_sub(charge, Ordering::AcqRel);
+                guard.take();
+                return;
             }
         }
     }
@@ -493,7 +516,9 @@ impl Drop for RecordingHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+
+    /// Whole 4096-frame blocks the queue holds.
+    const QUEUE_BLOCKS: usize = RECORDING_QUEUE_BYTES / (RECORDING_BLOCK_FRAMES * 8);
 
     /// Endless constant source, `n` frames per read.
     struct Endless;
@@ -645,7 +670,8 @@ mod tests {
         let (notices, notice) = Notices::new();
         let (mut rec, handle) = start(payload, meta, published.clone(), notice);
         let mut buf = vec![Complex32::new(0.0, 0.0); RECORDING_BLOCK_FRAMES * 100];
-        // 6 reads x 100 blocks overflow the 512-block queue; none waits.
+        // 6 reads x 100 blocks overflow the 16 MiB (512-block) queue; none
+        // waits.
         for _ in 0..6 {
             assert_eq!(rec.read(&mut buf).unwrap(), buf.len());
         }
@@ -671,6 +697,63 @@ mod tests {
         assert!(published.load(Ordering::Acquire));
         // Queued payload never exceeded the bound.
         const { assert!(QUEUE_BLOCKS * RECORDING_BLOCK_FRAMES * 8 <= RECORDING_QUEUE_BYTES) };
+    }
+
+    /// The 16 MiB bound counts queued bytes, not reads: small live reads
+    /// (an HPSDR packet is 126 frames) fill it as 4096-frame blocks do.
+    #[test]
+    fn small_reads_fill_the_whole_byte_bound_before_backpressure() {
+        const PACKET: usize = 126;
+        let (release, gate) = std::sync::mpsc::channel();
+        let (payload, payload_bytes) = sink(None, false);
+        // The metadata header write blocks the writer before any block.
+        let (meta, _) = sink(Some(gate), false);
+        let published = Arc::new(AtomicBool::new(false));
+        let (notices, notice) = Notices::new();
+        let (mut rec, handle) = start(payload, meta, published.clone(), notice);
+        let mut buf = vec![Complex32::new(0.0, 0.0); PACKET];
+        let fits = RECORDING_QUEUE_BYTES / (PACKET * 8);
+        for _ in 0..=fits {
+            assert_eq!(rec.read(&mut buf).unwrap(), PACKET);
+        }
+        assert_eq!(notices.get().len(), 1, "{:?}", notices.get());
+        release.send(()).unwrap();
+        drop(rec);
+        match handle.finish(Duration::from_secs(10)) {
+            RecordingOutcome::Finished {
+                samples, reason, ..
+            } => {
+                assert_eq!(reason, EndReason::Backpressure);
+                assert_eq!(samples, (fits * PACKET) as u64);
+                assert_eq!(payload_bytes.load(Ordering::Relaxed), samples as usize * 8);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(published.load(Ordering::Acquire));
+    }
+
+    /// A read below `MIN_CHARGED_FRAMES` is charged as that many frames,
+    /// so tiny reads cannot queue unbounded bookkeeping.
+    #[test]
+    fn tiny_reads_are_charged_the_minimum_block() {
+        let (release, gate) = std::sync::mpsc::channel();
+        let (payload, _) = sink(None, false);
+        let (meta, _) = sink(Some(gate), false);
+        let published = Arc::new(AtomicBool::new(false));
+        let (notices, notice) = Notices::new();
+        let (mut rec, handle) = start(payload, meta, published, notice);
+        let mut buf = vec![Complex32::new(0.0, 0.0); 1];
+        let fits = RECORDING_QUEUE_BYTES / (MIN_CHARGED_FRAMES * 8);
+        for _ in 0..=fits {
+            assert_eq!(rec.read(&mut buf).unwrap(), 1);
+        }
+        assert_eq!(notices.get().len(), 1, "{:?}", notices.get());
+        release.send(()).unwrap();
+        drop(rec);
+        match handle.finish(Duration::from_secs(10)) {
+            RecordingOutcome::Finished { samples, .. } => assert_eq!(samples, fits as u64),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

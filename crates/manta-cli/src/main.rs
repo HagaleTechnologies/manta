@@ -2238,7 +2238,44 @@ fn finish_recording(
     deadline: std::time::Instant,
 ) -> Result<()> {
     let recorded = handle.path().to_path_buf();
+    let outcome = handle.finish(deadline.saturating_duration_since(std::time::Instant::now()));
+    report_recording(&recorded, outcome)
+}
+
+/// MAN-309: on an early return from a multi-input `run`, finalizes one
+/// recording by `deadline` and removes the published pair when it holds no
+/// samples: nothing was recorded, and the destination would refuse the
+/// next start. Any other outcome is kept and logged as `finish_recording`
+/// reports it; the run is failing already, so nothing is returned.
+fn discard_empty_recording(handle: manta_input::RecordingHandle, deadline: std::time::Instant) {
+    let recorded = handle.path().to_path_buf();
     match handle.finish(deadline.saturating_duration_since(std::time::Instant::now())) {
+        manta_input::RecordingOutcome::Finished { samples: 0, .. } => {
+            let removed = std::fs::remove_file(manta_input::metadata_path(&recorded))
+                .and_then(|()| std::fs::remove_file(&recorded));
+            match removed {
+                Ok(()) => logging::note(&format!(
+                    "removed IQ recording {}: it holds no samples",
+                    recorded.display()
+                )),
+                Err(e) => logging::warning(&format!(
+                    "warning: cannot remove the empty IQ recording {}: {e}",
+                    recorded.display()
+                )),
+            }
+        }
+        outcome => {
+            if let Err(e) = report_recording(&recorded, outcome) {
+                logging::warning(&format!("warning: {e:#}"));
+            }
+        }
+    }
+}
+
+/// MAN-309: logs how the recording at `recorded` ended; `Err` when it did
+/// not complete.
+fn report_recording(recorded: &Path, outcome: manta_input::RecordingOutcome) -> Result<()> {
+    match outcome {
         manta_input::RecordingOutcome::Finished {
             path,
             samples,
@@ -6406,8 +6443,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                     resolved.inputs.len()
                 );
             }
-            // CLI > environment > file (`input.record_iq`).
-            let record_iq = record_iq.or_else(|| loaded.input.shared.record_iq.clone());
+            // CLI > environment > file (`input.record_iq`). A source flag
+            // that replaced the configured input(s) drops their record_iq
+            // with their other keys, as `resolve` does.
+            let record_iq = record_iq.or_else(|| match resolved.replaced_file_source {
+                Some(_) => None,
+                None => loaded.input.shared.record_iq.clone(),
+            });
             // An existing --source is an existing destination too.
             if let Some(path) = &record_iq {
                 check_record_destination(path)?;

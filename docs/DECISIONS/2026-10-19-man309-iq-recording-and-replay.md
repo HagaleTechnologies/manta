@@ -27,9 +27,11 @@ described on the command line. Operator guide:
   the dial override and file-replay wrappers, so the file holds exactly the
   samples, gaps and source properties the engine saw. Every read, error,
   property and discontinuity passes through unchanged.
-- **D3 — the decoder never waits.** A copy of each read goes in 4096-frame
-  blocks through a bounded (16 MiB) `try_send` queue to one writer thread,
-  which alone touches the files. A gap travels with the first block after
+- **D3 — the decoder never waits.** A copy of each read goes, in blocks of
+  at most 4096 frames, through a non-blocking queue bounded at 16 MiB of
+  queued payload (a block under 64 frames counts as 64, which bounds the
+  number of queued blocks) to one writer thread, which alone touches the
+  files. A gap travels with the first block after
   it, so a full queue never leaves a gap describing unrecorded samples. A
   full queue stops the recording at the last accepted block
   (`reason: backpressure`); a write, flush or publication error stops it
@@ -49,6 +51,13 @@ described on the command line. Operator guide:
   `listen_inputs` returns. `--record-iq` overrides the single form and is
   refused with several inputs; duplicate destinations, however spelled,
   are refused at startup. `config check` reports it and creates nothing.
+  A source flag that replaces the configured input(s) drops their file or
+  environment `record_iq` with their other keys; `--record-iq` still
+  applies. A multi-input `run` creates each recording in its opener, so
+  one that returns before its normal shutdown (a failed startup) finalizes
+  every recording it holds and removes each that finished with no samples,
+  so those do not refuse the next start; one that failed or timed out is
+  kept and reported, as at shutdown.
 - **D4 — never overwrite.** Payload and partial metadata are created with
   `create_new`, after a startup check that fails `run` with exit 1 before
   any input or listener opens. Publication hard-links the partial file to

@@ -317,6 +317,53 @@ fn record_iq_precedence_is_cli_then_environment_then_file() {
     assert!(!work.join("file.cf32").exists());
 }
 
+/// A source flag that replaces the configured input(s) drops their
+/// `record_iq` (file or environment) with their other keys: the new
+/// source is not recorded to the replaced receiver's capture path.
+#[test]
+fn a_source_flag_drops_the_replaced_inputs_record_iq() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, _) = v1_fixture(dir.path());
+    let typed = dir.path().join("typed.toml");
+    std::fs::write(
+        &typed,
+        format!(
+            "[input]\ntype = \"file\"\npath = \"{}\"\niq = true\nrecord_iq = \"typed.cf32\"\n",
+            wav.display()
+        ),
+    )
+    .unwrap();
+    let entry = |name: &str, rec: &str| {
+        format!(
+            "[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = \"{}\"\niq = true\n\
+             record_iq = \"{rec}\"\n\n",
+            wav.display()
+        )
+    };
+    let several = dir.path().join("several.toml");
+    std::fs::write(&several, entry("a", "a.cf32") + &entry("b", "b.cf32")).unwrap();
+    for (cfg, env) in [(&typed, None), (&typed, Some("env.cf32")), (&several, None)] {
+        let mut cmd = manta();
+        cmd.current_dir(dir.path())
+            .args(["run", "--json", "--source"])
+            .arg(&wav)
+            .args(["--source-iq", "--config"])
+            .arg(cfg);
+        if let Some(env) = env {
+            cmd.env("MANTA_INPUT_RECORD_IQ", env);
+        }
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        assert!(!stderr.contains("recording IQ to"), "{stderr}");
+        for rec in ["typed.cf32", "env.cf32", "a.cf32", "b.cf32"] {
+            let rec = dir.path().join(rec);
+            assert!(!rec.exists(), "{}: {stderr}", rec.display());
+            assert!(!metadata_path(&rec).exists(), "{}", rec.display());
+        }
+    }
+}
+
 #[test]
 fn recorded_gaps_replay_through_run_and_decode_without_splicing() {
     let dir = tempfile::tempdir().unwrap();
@@ -882,6 +929,64 @@ fn each_input_of_a_multi_input_daemon_records_its_own_file() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("--record-iq records one input"));
+}
+
+/// A multi-input startup that fails after its inputs opened (here, an
+/// occupied telnet port) removes the empty recordings its openers created,
+/// so the next start is not refused by them.
+#[test]
+fn a_failed_multi_input_startup_leaves_no_recording_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, _) = v1_fixture(dir.path());
+    let entry = |name: &str, rec: &str| {
+        format!(
+            "[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = \"{}\"\niq = true\n\
+             record_iq = \"{rec}\"\n\n",
+            wav.display()
+        )
+    };
+    let inputs = entry("a", "a.cf32") + &entry("b", "b.cf32");
+    let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let toml = dir.path().join("busy.toml");
+    std::fs::write(
+        &toml,
+        format!(
+            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
+             telnet_port = {}\njson_port = 0\nmetrics_port = 0\n\n{inputs}",
+            busy.local_addr().unwrap().port()
+        ),
+    )
+    .unwrap();
+    let out = manta()
+        .args(["run", "--json", "--config"])
+        .arg(&toml)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    for rec in ["a.cf32", "b.cf32"] {
+        let rec = dir.path().join(rec);
+        assert!(
+            stderr.contains(&format!("recording IQ to {}", rec.display())),
+            "{stderr}"
+        );
+        assert!(!rec.exists(), "{}: {stderr}", rec.display());
+        assert!(!metadata_path(&rec).exists(), "{}", rec.display());
+        assert!(!manta_input::partial_metadata_path(&rec).exists());
+    }
+    drop(busy);
+
+    let restart = dir.path().join("restart.toml");
+    std::fs::write(&restart, inputs).unwrap();
+    run_ok(&[
+        "run".as_ref(),
+        "--json".as_ref(),
+        "--config".as_ref(),
+        restart.as_os_str(),
+    ]);
+    for rec in ["a.cf32", "b.cf32"] {
+        assert!(metadata_path(&dir.path().join(rec)).exists());
+    }
 }
 
 /// `dir/v1.wav` rendered for `seconds`.

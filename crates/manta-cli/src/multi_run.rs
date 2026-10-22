@@ -19,8 +19,45 @@ use anyhow::{bail, Result};
 use manta_engine::{InputSpec, PipelineConfig, RttyObserver, SessionClock, SharedObservers};
 use manta_server::metrics::Metrics;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
+
+/// MAN-309: each recorded input's completion handle, kept outside the
+/// source the engine owns. `None` once `run` has taken them: an opener
+/// still running after that (a failed startup detaches it) records nothing.
+type RecordingSlots = Arc<Mutex<Option<Vec<Option<manta_input::RecordingHandle>>>>>;
+
+/// MAN-309: takes every handle the openers stored, closing the slots.
+fn take_recordings(slots: &RecordingSlots) -> Vec<manta_input::RecordingHandle> {
+    slots
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// MAN-309: when `run` returns early (a failed startup, or an error before
+/// the normal shutdown takes the handles), finalizes every recording still
+/// held, as the one-input path does on a decode error, and removes each
+/// one that finished with no samples, so those do not refuse the next
+/// start (`discard_empty_recording` keeps and reports any other outcome).
+struct UnwindRecordings(RecordingSlots);
+
+impl Drop for UnwindRecordings {
+    fn drop(&mut self) {
+        let handles = take_recordings(&self.0);
+        if handles.is_empty() {
+            return;
+        }
+        let deadline = crate::close_recordings(&handles);
+        for handle in handles {
+            crate::discard_empty_recording(handle, deadline);
+        }
+    }
+}
 
 /// What `run` hands the multi-input path.
 pub(crate) struct MultiRun<'a> {
@@ -416,10 +453,10 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         _ => None,
     });
     let replay_epoch = m.replay_epoch;
-    // MAN-309: each recorded input's completion handle, kept outside the
-    // source the engine owns.
-    let recordings: Arc<Mutex<Vec<Option<manta_input::RecordingHandle>>>> =
-        Arc::new(Mutex::new((0..n).map(|_| None).collect()));
+    // MAN-309: each recorded input's completion handle; the guard handles
+    // every early return from here on.
+    let recordings: RecordingSlots = Arc::new(Mutex::new(Some((0..n).map(|_| None).collect())));
+    let _unwind_recordings = UnwindRecordings(recordings.clone());
     let input_counters: Arc<Mutex<Vec<Option<Arc<InputHealthTotals>>>>> =
         Arc::new(Mutex::new(vec![None; n]));
 
@@ -508,11 +545,18 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                     // The session's epoch, as the spot clock uses: the first
                     // file's (or --replay-epoch) for a replay, now for live.
                     let start = crate::resolve_epoch(session_file.as_deref(), replay_epoch)?;
+                    // Created under the lock, so a startup that already
+                    // failed (and took the handles) is never recorded to.
+                    let mut slots = recordings.lock().unwrap_or_else(PoisonError::into_inner);
+                    let Some(slots) = slots.as_mut() else {
+                        bail!(
+                            "startup failed elsewhere; not recording to {}",
+                            path.display()
+                        );
+                    };
                     let (src, handle) =
                         crate::start_input_recording(src, path, start, record_stop)?;
-                    if let Ok(mut slot) = recordings.lock() {
-                        slot[index] = Some(handle);
-                    }
+                    slots[index] = Some(handle);
                     Ok(src)
                 }),
             }
@@ -899,10 +943,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     // MAN-309: every input has ended, so every queue is closed; the writers
     // finalize during the drain and are collected after it, by one shared
     // deadline (one failing does not stop the others).
-    let handles: Vec<_> = recordings
-        .lock()
-        .map(|mut slots| slots.iter_mut().filter_map(Option::take).collect())
-        .unwrap_or_default();
+    let handles = take_recordings(&recordings);
     let recording_deadline = crate::close_recordings(&handles);
     if print_text {
         for line in text.finish() {

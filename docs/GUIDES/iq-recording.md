@@ -71,13 +71,19 @@ record_iq = "captures/session.cf32"
 A relative `record_iq` in a config file is relative to that file's
 directory; from `--record-iq` or `MANTA_INPUT_RECORD_IQ` it is relative to
 the working directory. The precedence is the usual command line >
-environment > file. `manta config check` shows the resolved path and
-creates nothing. Only `run` records: `check`, `calibrate`, `soak` and
+environment > file. A source flag (`--source`, `--kiwi-host`, ...) that
+replaces the configured input also drops its `record_iq`, file or
+environment; give `--record-iq` to record the new source. `manta config
+check` shows the resolved path and creates nothing. Only `run` records: `check`, `calibrate`, `soak` and
 `doctor` print a note that they ignore `record_iq`.
 
 With several receivers, put `record_iq` in each `[[input]]` entry that
 should be recorded, each with its own file; two entries cannot share one
-(however the path is spelled), and `--record-iq` (one file) is refused. Each recording replays on its own
+(however the path is spelled), and `--record-iq` (one file) is refused.
+If startup fails after the inputs opened (a busy port, say), `run`
+removes the recordings it created that finished with no samples, so the
+restart can use the same names; one whose write failed is left, as at
+shutdown. Each recording replays on its own
 at its own start time; replaying several together uses the first input's
 start time, as any multi-file replay does (MAN-13), not the original
 staggered start of each receiver.
