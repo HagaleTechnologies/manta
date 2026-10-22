@@ -846,6 +846,7 @@ pub(crate) fn signal_check(e: &anyhow::Error) -> Check {
 mod tests {
     use super::*;
     use crate::config::{self, Env};
+    use crate::test_ports::free_port;
     use std::net::TcpListener;
 
     fn loaded(body: &str) -> (tempfile::TempDir, std::path::PathBuf, Loaded) {
@@ -860,14 +861,6 @@ mod tests {
     fn server(lines: &str) -> ServerConfig {
         let (_dir, _path, l) = loaded(&format!("[server]\nstation_callsign = \"W1AW\"\n{lines}"));
         l.server.unwrap()
-    }
-
-    fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
     }
 
     fn uplinks(body: &str) -> Vec<RbnUplinkConfig> {
