@@ -193,6 +193,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-319: a live `[[rbn_uplink]]` (`dry_run = false`) also needs
+  `[server].operator_grid` set to a 6-character Maidenhead locator (e.g.
+  `"FN03ab"`). `config check`, `run`, `doctor` and a SIGHUP reload refuse a
+  live uplink without one, naming the target and the key to set; dry-run
+  uplinks (the default) are unchanged. A 4-character grid is refused too.
+  `[server]` needs a restart, so a SIGHUP reload goes live only if the
+  daemon started with the grid. The registration/settings exchange itself
+  stays blocked on MAN-90's Aggregator→RBN capture (claims C8–C11).
 - IQ WAV input streams from disk: `manta decode`'s memory no longer grows
   with the recording's length (a 1 GB recording decodes in under 20 MiB), and
   `run --loop` re-opens a recording without re-reading it. A WAV whose data
