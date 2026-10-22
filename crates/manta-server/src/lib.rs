@@ -3,6 +3,7 @@
 
 pub mod backoff;
 pub mod band;
+pub mod band_plan;
 pub mod bounded_io;
 pub mod bus;
 pub mod command;

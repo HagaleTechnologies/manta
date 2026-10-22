@@ -445,7 +445,10 @@ fn check_accepts_an_hpsdr_input_without_opening_the_receiver() {
     let out = succeeds(&check_file(&path));
     assert_eq!(
         out.lines().find(|line| line.starts_with("input:")),
-        Some("input: type=hpsdr host=receiver.invalid port=1024 freq_hz=7030000 rate_hz=48000")
+        Some(
+            "input: type=hpsdr host=receiver.invalid port=1024 protocol=auto freq_hz=7030000 \
+             rate_hz=48000"
+        )
     );
 }
 
@@ -1024,6 +1027,7 @@ fn check_binds_no_port_and_opens_no_receiver_with_several_inputs() {
     }
 }
 
+<<<<<<< HEAD
 #[test]
 fn hpsdr_discovery_config_check_normalizes_mac_without_opening_a_radio() {
     let dir = tempfile::tempdir().unwrap();
@@ -1037,4 +1041,293 @@ fn hpsdr_discovery_config_check_normalizes_mac_without_opening_a_radio() {
         .output()
         .unwrap();
     assert!(succeeds(&overridden).contains("mac=00:11:22:33:44:55"));
+=======
+// MAN-310: `bands` plans a receiver's streams from the CW segment table.
+
+const KIWI: &str = "[input]\ntype = \"kiwi\"\nhost = \"kiwi.example.net\"\n";
+const HL2: &str = "[input]\ntype = \"hpsdr\"\nhost = \"192.168.1.40\"\nrate_hz = 96000.0\n";
+
+fn check_body(body: &str) -> Output {
+    let dir = tempfile::tempdir().unwrap();
+    check_file(&write_cfg(dir.path(), "m.toml", body))
+}
+
+fn input_lines(out: &str) -> Vec<&str> {
+    out.lines().filter(|l| l.starts_with("input")).collect()
+}
+
+/// Scenario 4: a bare centre in kHz is one stream on that frequency.
+#[test]
+fn a_bare_centre_in_bands_is_one_stream_on_that_frequency() {
+    for bands in ["[\"7030\"]", "\"7030\"", "7030"] {
+        let o = check_body(&format!("{KIWI}bands = {bands}\n"));
+        let out = succeeds(&o);
+        assert_eq!(
+            input_lines(&out),
+            ["input: type=kiwi host=kiwi.example.net port=8073 freq_hz=7030000 password=none"],
+            "bands = {bands}"
+        );
+        assert!(
+            stderr(&o).contains("note: [input]: bands = [\"7030\"] plans 1 stream: 7030 kHz\n"),
+            "{}",
+            stderr(&o)
+        );
+    }
+}
+
+/// Scenario 2: a band outside the tuning range is skipped, with a note.
+#[test]
+fn a_band_outside_the_tuning_range_is_skipped_with_a_note() {
+    let o = check_body(&format!(
+        "{KIWI}bands = [\"160m\", \"60m\"]\ntuning_range_hz = [3000000.0, 30000000.0]\n"
+    ));
+    let out = succeeds(&o);
+    assert_eq!(
+        input_lines(&out),
+        [
+            "input kiwi-60m-1: type=kiwi host=kiwi.example.net port=8073 freq_hz=5355250 \
+             password=none",
+            "input kiwi-60m-2: type=kiwi host=kiwi.example.net port=8073 freq_hz=5362750 \
+             password=none",
+        ]
+    );
+    assert!(
+        stderr(&o).starts_with(
+            "note: [input]: bands = [\"160m\", \"60m\"] plans 2 streams: 60m (2)\n\
+             note: [input]: 160m skipped: 1810 to 1840 kHz is outside the receiver's tuning \
+             range, 3000 to 30000 kHz\n"
+        ),
+        "{}",
+        stderr(&o)
+    );
+}
+
+/// Scenario 3, config side: the split streams print exactly what two
+/// hand-written entries at the same centres print.
+#[test]
+fn a_band_wider_than_one_stream_is_split_into_named_streams() {
+    let planned = succeeds(&check_body(&format!("{KIWI}bands = [\"60m\"]\n")));
+    let by_hand = succeeds(&check_body(
+        "[[input]]\nname = \"kiwi-60m-1\"\ntype = \"kiwi\"\nhost = \"kiwi.example.net\"\n\
+         freq_hz = 5355250.0\n\n[[input]]\nname = \"kiwi-60m-2\"\ntype = \"kiwi\"\n\
+         host = \"kiwi.example.net\"\nfreq_hz = 5362750.0\n",
+    ));
+    assert_eq!(input_lines(&planned), input_lines(&by_hand));
+    assert_eq!(input_lines(&planned).len(), 2);
+}
+
+/// Scenario 1, config side: "all" on one HPSDR radio names the plan.
+#[test]
+fn bands_all_on_one_hpsdr_radio_is_refused_naming_the_14_stream_plan() {
+    let err = fails(&check_body(&format!("{HL2}bands = [\"all\"]\n")));
+    assert!(
+        err.ends_with(
+            "[input]: input.bands plans 14 streams (160m, 80m, 60m, 40m, 30m, 20m (2), 17m, \
+             15m (2), 12m, 10m (3)), but several receivers on one HPSDR radio are not \
+             supported yet; list bands that fit one stream (a 96000 Hz stream skims 86.899 \
+             kHz), or give each its own radio\n"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn one_band_that_fits_an_hpsdr_stream_is_that_stream() {
+    let o = check_body(&format!("{HL2}bands = [\"40m\"]\n"));
+    assert_eq!(
+        input_lines(&succeeds(&o)),
+        ["input: type=hpsdr host=192.168.1.40 port=1024 protocol=auto freq_hz=7020000 rate_hz=96000"]
+    );
+    assert!(stderr(&o).contains("note: [input]: bands = [\"40m\"] plans 1 stream: 40m\n"));
+}
+
+#[test]
+fn a_soapy_device_refuses_a_two_stream_plan() {
+    let err = fails(&check_body(
+        "[input]\ntype = \"soapy\"\ndriver = \"driver=rtlsdr\"\nrate_hz = 96000.0\n\
+         bands = \"15m\"\n",
+    ));
+    assert!(
+        err.ends_with(
+            "[input]: input.bands plans 2 streams (15m (2)), but manta opens one stream from a \
+             SoapySDR device; list bands that fit one stream (a 96000 Hz stream skims 86.899 \
+             kHz), or give each its own device\n"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn bands_all_on_a_kiwi_exceeds_the_input_cap_naming_each_band() {
+    let err = fails(&check_body(&format!("{KIWI}bands = \"all\"\n")));
+    assert!(
+        err.ends_with(
+            "m.toml: input.bands plans 86 streams for [input] (160m (4), 80m (9), 60m (2), \
+             40m (5), 30m (4), 20m (12), 17m (5), 15m (17), 12m (5), 10m (23)), and manta runs \
+             at most 16 inputs; list fewer bands\n"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn stream_plans_across_entries_share_the_input_cap() {
+    let entry = |name: &str| {
+        format!(
+            "[[input]]\nname = \"{name}\"\ntype = \"kiwi\"\nhost = \"kiwi.example.net\"\n\
+             bands = [\"80m\"]\n"
+        )
+    };
+    let err = fails(&check_body(&format!(
+        "{}\n{}",
+        entry("kiwi-a"),
+        entry("kiwi-b")
+    )));
+    assert!(
+        err.ends_with(
+            "m.toml: the [[input]] entries plan 18 streams (\"kiwi-a\" 9, \"kiwi-b\" 9), and \
+             manta runs at most 16 inputs; list fewer bands\n"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn bands_and_freq_hz_together_are_refused() {
+    let err = fails(&check_body(&format!(
+        "{KIWI}freq_hz = 7030000.0\nbands = \"40m\"\n"
+    )));
+    assert!(
+        err.ends_with(
+            "[input]: input.bands and input.freq_hz both set the receiver's centre; keep one\n"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn tuning_range_needs_bands_and_a_low_below_high() {
+    let err = fails(&check_body(&format!(
+        "{KIWI}freq_hz = 7030000.0\ntuning_range_hz = [0.0, 30000000.0]\n"
+    )));
+    assert!(
+        err.ends_with("[input]: input.tuning_range_hz applies only with input.bands\n"),
+        "{err}"
+    );
+    let err = fails(&check_body(&format!(
+        "{KIWI}bands = \"40m\"\ntuning_range_hz = [30000000.0, 3000000.0]\n"
+    )));
+    assert!(
+        err.ends_with(
+            "[input]: input.tuning_range_hz must be [low, high] in Hz with 0 <= low < high, \
+             got [30000000.0, 3000000.0]\n"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_unknown_band_lists_the_vocabulary() {
+    let err = fails(&check_body(&format!("{KIWI}bands = [\"6m\"]\n")));
+    assert!(
+        err.ends_with(
+            "[input]: input.bands: \"6m\" is not \"all\", a band (160m, 80m, 60m, 40m, 30m, \
+             20m, 17m, 15m, 12m or 10m) or a centre frequency in kHz such as \"7030\"\n"
+        ),
+        "{err}"
+    );
+    let err = fails(&check_body(&format!("{KIWI}bands = true\n")));
+    assert!(
+        err.ends_with(
+            "[input]: input.bands must be \"all\", a band such as \"40m\", a centre frequency \
+             in kHz such as \"7030\", or a list of them; got true\n"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn bands_on_a_ka9q_input_does_not_apply() {
+    let err = fails(&check_body(
+        "[input]\ntype = \"ka9q\"\ngroup = \"239.101.6.1\"\nbands = \"40m\"\n",
+    ));
+    assert!(
+        err.ends_with(
+            "[input]: input.bands does not apply to input.type = \"ka9q\" (ka9q takes group, \
+             port, ssrc, interface)\n"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_kiwi_without_freq_hz_or_bands_names_both() {
+    let err = fails(&check_body(KIWI));
+    assert!(
+        err.ends_with(
+            "[input]: input.freq_hz or input.bands is required when input.type = \"kiwi\"\n"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn generated_stream_names_must_fit_and_be_unique() {
+    let err = fails(&check_body(
+        "[input]\nname = \"a-very-long-kiwi-receiver-name\"\ntype = \"kiwi\"\n\
+         host = \"kiwi.example.net\"\nbands = \"60m\"\n",
+    ));
+    assert!(
+        err.ends_with(
+            "m.toml: the stream name \"a-very-long-kiwi-receiver-name-60m-1\" is longer than 32 \
+             characters; shorten the entry's name\n"
+        ),
+        "{err}"
+    );
+    let err = fails(&check_body(
+        "[[input]]\nname = \"kiwi-60m-1\"\ntype = \"kiwi\"\nhost = \"other.example.net\"\n\
+         freq_hz = 7030000.0\n\n[[input]]\nname = \"kiwi\"\ntype = \"kiwi\"\n\
+         host = \"kiwi.example.net\"\nbands = \"60m\"\n",
+    ));
+    assert!(
+        err.ends_with("m.toml: the stream name \"kiwi-60m-1\" is already input \"kiwi-60m-1\"\n"),
+        "{err}"
+    );
+}
+
+#[test]
+fn nothing_in_range_is_refused() {
+    let err = fails(&check_body(&format!(
+        "{KIWI}bands = \"160m\"\ntuning_range_hz = [3000000.0, 30000000.0]\n"
+    )));
+    assert!(
+        err.ends_with(
+            "[input]: input.bands leaves nothing to skim inside the receiver's tuning range, \
+             3000 to 30000 kHz: 160m (1810 to 1840 kHz) is outside it\n"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn bands_from_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(dir.path(), "m.toml", KIWI);
+    let run = |value: &str| {
+        manta()
+            .current_dir(dir.path())
+            .env("MANTA_INPUT_BANDS", value)
+            .args(["config", "check", "--config"])
+            .arg(&cfg)
+            .output()
+            .unwrap()
+    };
+    let out = succeeds(&run("7030"));
+    assert!(out.contains("freq_hz=7030000"), "{out}");
+    let err = fails(&run("all"));
+    assert!(
+        err.contains("and manta runs at most 16 inputs; list fewer bands"),
+        "{err}"
+    );
+>>>>>>> 63af0dfbe77d16e5c31a55fdd191c23e6a764a87
 }

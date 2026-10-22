@@ -222,6 +222,32 @@ pub fn v5() -> VectorSpec {
     }
 }
 
+/// SPEC §7 V34 "fade-good-reacquire" (MAN-108): 20 WPM, +3 dB, W1AW,
+/// Watterson CCIR-good, 120 s. One slowly fading signal that, before
+/// MAN-108's DORMANT re-acquisition, fragmented into 3 tracks on `35deb42`
+/// (each fade outlasted the 5 s hang and respawned a new `track_id`); with
+/// it, one track holds the whole scene with the same spot and CER. `v4()`
+/// with the signal, seeds and duration changed; the noise seed is
+/// `0x4D41_4E31_3038 ^ fade_seed ^ (snr_db << 20)`, the planning sweep's
+/// rule. See `docs/DECISIONS/2026-10-17-man108-dormant-track-reacquisition.md`.
+pub fn v34() -> VectorSpec {
+    let mut spec = v4();
+    spec.name = "v34";
+    spec.duration_s = 120.0;
+    spec.noise_seed = 0x4D41_4E01_3B95;
+    let sig = &mut spec.signals[0];
+    sig.text = "CQ CQ DE W1AW W1AW K".into();
+    sig.wpm = 20.0;
+    sig.offset_hz = 9_100.0;
+    sig.snr_2500_db = 3.0;
+    sig.jitter = None;
+    sig.watterson = Some(WattersonFade {
+        preset: WattersonPreset::Good,
+        seed: 0x0BAD,
+    });
+    spec
+}
+
 /// SPEC §7 V7 "adjacent": 24 WPM @ channel 107 (10,031.25 Hz) and 28 WPM @
 /// channel 111 (10,406.25 Hz), both +15 dB, AWGN. Pass: exactly 2 tracks;
 /// both char >= 95%; both freqs within ±15 Hz.

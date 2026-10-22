@@ -90,7 +90,7 @@ pub(crate) struct Args {
     #[cfg(feature = "soapy")]
     #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
     soapy_gain: Option<f64>,
-    /// HPSDR/Hermes device hostname or IP address.
+    /// openHPSDR radio hostname or IP address (protocol 1: Hermes-Lite 2, Hermes; protocol 2: ANAN).
     ///
     /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Included in every build.
     #[arg(help_heading = "HPSDR source")]
@@ -100,6 +100,7 @@ pub(crate) struct Args {
     #[arg(conflicts_with_all = ["path", "device", "source"])]
     #[arg(conflicts_with = "hpsdr_mac")]
     hpsdr_host: Option<String>,
+<<<<<<< HEAD
     /// Discover and select a radio by MAC address; omit host to discover.
     #[arg(long, value_parser = parse_hpsdr_mac, help_heading = "HPSDR source", conflicts_with_all = ["path", "hpsdr_host", "device", "source"])]
     hpsdr_mac: Option<[u8; 6]>,
@@ -109,6 +110,30 @@ pub(crate) struct Args {
     #[arg(value_parser = clap::value_parser!(u16).range(1..))]
     hpsdr_port: Option<u16>,
     /// Receiver centre frequency, in Hz. Required with the hpsdr source.
+=======
+    /// openHPSDR control port.
+    ///
+    /// Protocol 2 also sends to the three ports above it and receives IQ from this port + 11 (1035 by default).
+    #[arg(
+        long,
+        default_value_t = manta_input::hpsdr::CONTROL_PORT,
+        requires = "hpsdr_host",
+        help_heading = "HPSDR source"
+    )]
+    hpsdr_port: u16,
+    /// openHPSDR protocol the radio speaks.
+    ///
+    /// auto asks the radio and uses protocol 2 when it answers as protocol 2, protocol 1 otherwise; 1 and 2 skip the question.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = HpsdrProtocolArg::Auto,
+        requires = "hpsdr_host",
+        help_heading = "HPSDR source"
+    )]
+    hpsdr_protocol: HpsdrProtocolArg,
+    /// Receiver centre frequency, in Hz. Required with --hpsdr-host.
+>>>>>>> 63af0dfbe77d16e5c31a55fdd191c23e6a764a87
     #[arg(
         long = "hpsdr-freq-hz",
         alias = "hpsdr-freq",
@@ -226,6 +251,7 @@ pub(crate) fn run(args: Args) -> Result<i32> {
                 host: args.hpsdr_host,
                 mac: args.hpsdr_mac,
                 port: args.hpsdr_port,
+                protocol: args.hpsdr_protocol.into(),
                 freq: args.hpsdr_freq_hz,
                 rate: args.hpsdr_rate_hz,
             },
