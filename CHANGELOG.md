@@ -231,6 +231,12 @@ the git history and `docs/DECISIONS/`.
   longer force-decodes the open tracks' last element or judges their
   pending beacons as if the signal had ended; they close as an outage
   (MAN-258).
+- `manta calibrate --write` no longer fails on every run with
+  `creating temp file …: File exists` after a save was killed before it
+  finished, as when manta runs as PID 1 in a container (MAN-335). Each save
+  now picks a random temp name and tries another if that one is taken. A
+  killed save's `.<config>.calibrate-*.tmp` file is left in place and is
+  safe to delete.
 
 ## [0.1.0] - 2026-10-11
 
