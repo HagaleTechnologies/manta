@@ -6,7 +6,7 @@ pub mod config_file;
 pub mod listen;
 pub use listen::{
     listen, listen_with_observers, ListenObservers, OperatorLists, OperatorListsUpdate,
-    RttyObserver,
+    RttyObserver, SuppressionObserver,
 };
 pub mod latency;
 pub mod live;
@@ -37,6 +37,7 @@ pub use soak_metrics::{
     soak_metrics_passed, soak_with_metrics, SoakCloseCounts, SoakMetricsReport, SoakMetricsSample,
 };
 
+mod digital_windows;
 #[cfg(test)]
 mod static_crash_tests;
 mod track;

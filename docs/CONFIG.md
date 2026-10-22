@@ -148,6 +148,7 @@ the config for both. The table needs `station_callsign`.
 | `live_bind_addr` | `"127.0.0.1"` | live: `run` with `[server]` and `live_port`; restart required | Address of the live-state listener, which has no password. The stream carries every track's decoded text; set `"0.0.0.0"` only for a dashboard on another machine, and firewall `live_port`. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
 | `line_format` | `"rbn"` | live: `run` with `[server]` | Telnet spot-line layout, `"rbn"` or `"skimmer"`. The uplink always sends the `"rbn"` layout. |
 | `status_interval_secs` | `60` | live: `run` with `[server]` | Seconds between one-line status reports in the log; `0` turns them off. |
+| `silent_input_warning_secs` | `600` | live: `run` with `[server]` and 2+ `[[input]]` | Seconds an input may decode no spots, while another input decodes some, before manta warns and sets `manta_input_silent{source}` to 1; `0` turns the check off; otherwise 60 to 86400. See [MAN-14](DECISIONS/2026-10-19-man14-per-receiver-hearing-visibility.md). |
 | `history_minutes` | `30` | live: `run` with `[server]`; restart required | Telnet replay retention in whole minutes, 0–1440, measured from the newest published spot's sample timestamp. Keeps at least the newest 50 spots and at most 10,000; `0` keeps only the newest 50. Loggers request `sh/dx 30m`; bare `sh/dx` returns 10 rows. See [MAN-93](DECISIONS/2026-10-11-man93-sh-dx-history-window.md). Also bounds the separate JSON resume history, with spots and grades together under the same floor and ceiling, counted in records; see [MAN-137](DECISIONS/2026-10-14-man137-json-stream-resume.md). |
 | `telnet_max_connections_per_ip` | `16` | live: `run` with `[server]` | Open telnet connections per client IP; `0` removes the limit. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
 | `json_max_connections_per_ip` | `16` | live: `run` with `[server]` | Open JSON and WebSocket connections per client IP; `0` removes the limit. The live-state listener applies the same quota, counted separately. |
@@ -159,7 +160,10 @@ the config for both. The table needs `station_callsign`.
 ## [[rbn_uplink]]
 
 One block per upstream collector. A block needs a `[server]` table, and the
-environment cannot set these keys. Only `run` logs in; `doctor` opens and
+environment cannot set these keys. Going live (`dry_run = false`) also needs
+`[server].operator_grid` set to a 6-character Maidenhead locator (e.g.
+`"FN03ab"`); `config check` refuses a live block without one (MAN-319). Only
+`run` logs in; `doctor` opens and
 immediately closes one TCP connection to each enabled target, sending
 nothing, and flags an example `login_callsign`.
 
@@ -169,7 +173,7 @@ nothing, and flags an example `login_callsign`.
 | `target_host` | none; example `"<collector-host>"`; required | live: `run` with `[server]` | The collector's host name. `config check` rejects the `<...>` placeholder. |
 | `target_port` | none; example `7000`; required | live: `run` with `[server]` | The collector's port. |
 | `login_callsign` | none; example `"N0CALL"`; unset logs in as `station_callsign` | live: `run` with `[server]` | Callsign sent at login. `run` and `config check` reject `N0CALL`. |
-| `dry_run` | `true` | live: `run` with `[server]`; reloads on SIGHUP | `true` connects and logs in but sends no spots. See [RUNBOOKS/uplink-health.md](RUNBOOKS/uplink-health.md). |
+| `dry_run` | `true` | live: `run` with `[server]`; reloads on SIGHUP | `true` connects and logs in but sends no spots. `false` (going live) needs `[server].operator_grid` set to a 6-character Maidenhead locator (MAN-319); a SIGHUP reload goes live only if the daemon started with one, since `[server]` needs a restart. See [RUNBOOKS/uplink-health.md](RUNBOOKS/uplink-health.md). |
 | `spot_types` | `"cq_beacon"` | live: `run` with `[server]` | `"cq_beacon"` sends CQ and beacon spots only, as RBN requires; `"all"` sends every spot. Telnet and JSON still carry every spot. |
 | `max_spots_per_minute` | `600` | live: `run` with `[server]` | Max spots written to this target per 60 s window (the window resets at the first spot after it elapses); further spots are counted in `manta_uplink_ceiling_suppressed_total` and skipped, and the connection stays up. `0` disables the ceiling. Needs a restart; SIGHUP reloads only `dry_run`. |
 
@@ -213,7 +217,8 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `realtime` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` paces the replay to the recording's own clock, so telnet/JSON clients can watch it. `--realtime` sets it; a live source refuses it. See [DECISIONS/2026-10-10-man269-paced-looping-replay.md](DECISIONS/2026-10-10-man269-paced-looping-replay.md). |
 | `loop` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` replays the file again from the start each time it ends, until stopped; implies `realtime`. `--loop` sets it; a live source refuses it. |
 | `host` | none; example `"<your-receiver-host>"`; required for kiwi and hpsdr | live: `type = "kiwi"` or `"hpsdr"` | Receiver host name. `--kiwi-host` or `--hpsdr-host` overrides it. |
-| `port` | `8073`; `1024` for hpsdr; `5004` for ka9q | live: `type = "kiwi"`, `"hpsdr"` or `"ka9q"` | Receiver port, 1 to 65535; for ka9q, the group's RTP data port. `--kiwi-port`, `--hpsdr-port` or `--ka9q-port` overrides it. |
+| `port` | `8073`; `1024` for hpsdr; `5004` for ka9q | live: `type = "kiwi"`, `"hpsdr"` or `"ka9q"` | Receiver port, 1 to 65535; for ka9q, the group's RTP data port; for an hpsdr protocol-2 radio, the base of its port map (see [HPSDR protocol 2](#hpsdr-protocol-2)). `--kiwi-port`, `--hpsdr-port` or `--ka9q-port` overrides it. |
+| `protocol` | `"auto"` | live: `type = "hpsdr"` | openHPSDR protocol the radio speaks: `"auto"`, `"1"` or `"2"`; the integers `1` and `2` are accepted too. `"auto"` sends a discovery probe to `host` on every open and uses protocol 2 when the radio answers as protocol 2, protocol 1 otherwise (a warning names the key when the radio does not answer within 1 s). `"1"` (Hermes-Lite 2) and `"2"` (ANAN) skip the probe. `--hpsdr-protocol` or `MANTA_INPUT_PROTOCOL` (read verbatim as a string) overrides it. Any other `type` refuses the key. |
 | `password` | `""` | live: `type = "kiwi"` | KiwiSDR password; empty for a public receiver. `config check` prints only whether it is set. `--kiwi-password` overrides it. |
 | `driver` | none; example `"driver=rtlsdr"`; required for soapy | live: `type = "soapy"` (needs the build feature) | SoapySDR device arguments. `--soapy-driver` overrides it. |
 | `gain_db` | none; example `30.0`; unset uses the device's automatic gain | live: `type = "soapy"` (needs the build feature) | Receiver gain, dB. `--soapy-gain` overrides it. |
@@ -228,6 +233,54 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `center_freq_hz` | none; example `14030000.0`; unset leaves frequencies as audio offsets, and `run` with `[server]` refuses a source that carries no frequency of its own | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Your radio's dial frequency, Hz, for a source that carries none. `--dial-freq-hz` overrides it. |
 | `capture_rate_hz` | none; example `48000.0`; unset decodes at the receiver's own rate | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Decimated sample rate, Hz. It must be at least 1000 (checked before the receiver opens), divide the receiver's rate by a power of two, and be 93.75 Hz (the channel spacing) times a power of two of at least 4, so in practice 1500, 3000, 6000, 12000, 24000, 48000, 96000 and so on. A rate that divides evenly but fails the last rule, such as 50000 from a 100 kS/s receiver, is rejected at startup. The decimator's transition band (the outer ~9.4% of each side, 24 of 256 channels at 48 kS/s — beyond the <= 1 dB point at 0.4526 x the rate) is not usable: the reported passband, `manta check`, SETT segments and tracked channels stop at the trusted band, and `run`/`soak` say so in one startup line naming the source's intersected passband. `--capture-rate-hz` overrides it. |
 | `replay_epoch` | none; example `1700000000`; unset uses the file's modification time | live: `run` with `[server]` and a file source; ignored elsewhere | Unix seconds that the recording's first sample stands for. `--replay-epoch` overrides it. |
+
+### HPSDR protocol 2
+
+MAN-305: ANAN-class radios (Hermes, Angelia, Orion, Orion II, Saturn/G2)
+speak openHPSDR protocol 2; Hermes-Lite 2 and older boards speak protocol 1.
+Both use `type = "hpsdr"` and `--hpsdr-*`, chosen by `protocol` above
+(`--hpsdr-protocol auto|1|2`). The probe under `"auto"` goes to the
+configured host only; manta never broadcasts, and `manta devices` does not
+list radios.
+
+Protocol 2 uses a port map relative to `port` (`1024` by default):
+
+| Direction | Stream | Port |
+|---|---|---|
+| manta → radio | general (and discovery) | `port` (1024) |
+| manta → radio | receiver settings | `port + 1` (1025) |
+| manta → radio | transmitter settings | `port + 2` (1026) |
+| manta → radio | high priority (run, frequency, filters) | `port + 3` (1027) |
+| radio → manta | command response | from `port` (1024) |
+| radio → manta | high-priority status | from `port + 1` (1025) |
+| radio → manta | microphone | from `port + 2` (1026) |
+| radio → manta | wideband | from `port + 3` to `port + 10` (1027–1034) |
+| radio → manta | DDC0 IQ, the stream manta decodes | from `port + 11` (1035) |
+
+manta receives every stream on one unconnected UDP socket and sorts the
+datagrams by the radio's source port.
+
+- **Firewall.** Protocol 2 needs a host firewall rule allowing inbound UDP
+  from the radio: IQ arrives from `port + 11`, which manta never sent to, so
+  a stateful firewall does not treat it as a reply. Without the rule the
+  open succeeds and the stream stalls after 10 s with an error that names
+  the firewall.
+- **Network.** Protocol 2 radios want Gigabit Ethernet. One receiver at
+  192 kHz is about 9.6 Mbit/s, which 100 Mbit/s carries, but the radios are
+  built and tested for Gigabit.
+- **Receive buffer.** manta asks for a 4 MiB socket receive buffer; Linux
+  grants at most `net.core.rmem_max` (about 416 KiB by default, 0.36 s at
+  192 kHz). Raise `net.core.rmem_max` if
+  `manta_input_dropped_packets_total{source="hpsdr"}` climbs on a quiet LAN.
+- A radio that reports itself already streaming to another program is
+  refused under `"auto"`; `protocol = "2"` takes it over.
+- One receiver (DDC0) per radio until MAN-307. The rate must be exactly
+  48000, 96000, 192000 or 384000 Hz, and `freq_hz` a whole number of Hz below
+  61440000.
+- With `protocol = "2"`, or a board manta does not know, the radio's
+  front-end filters are bypassed (ANT1, no high-pass, the 6 m low-pass).
+
+See [DECISIONS/2026-10-19-man305-hpsdr-protocol-2-input.md](DECISIONS/2026-10-19-man305-hpsdr-protocol-2-input.md).
 
 ### Band plans: bands
 
@@ -393,8 +446,53 @@ milliseconds, 0 to 3600000.
 | `crash_filter` | `"full"` | live | What a static crash (a band-wide lift of 3 dB or more on at least three quarters of the passband's channels for 8 ms or more) does. `"full"`: no track starts on it, and running tracks do not decode it. `"starts-only"`: no track starts on it, but running tracks decode it as received. `"off"`: no filtering. Crashes are counted in `manta_static_crashes_total` whatever the value. Inactive when the source passband holds fewer than 96 channels (rig audio; captures of 6 kHz or less). Needs a restart. See [SPEC §2.7](SPEC-decode-core.md#27-band-wide-static-crash-detection-man-312) and [MAN-312](DECISIONS/2026-10-13-man312-static-crash-filter.md). |
 | `rtty_filter` | `true` | live | Recognise RTTY (two-tone FSK) signals and start no CW track on them or their keying sidebands; `false` restores the previous behaviour. See [SPEC §2.6](SPEC-decode-core.md#26-two-tone-fsk-rtty-recognition) and [MAN-314](DECISIONS/2026-10-11-man314-rtty-recognition.md). |
 | `rtty_dwell_ms` | `20000.0` | live | How long an FSK signal must last before it is marked as RTTY; 1000 to 3600000 (1 h), counted in whole 1000 ms detector blocks. |
+| `digital_window_filter` | `true` | live | Skip the common HF FT8, FT4, WSPR and JS8 windows when starting CW tracks. Set `false` to include them. Applies to file decoding and every service input. Restart required. |
 | `non_cw_filter` | `true` | live | A new track is decoded only once it shows CW keying. Noise-like wideband data and swept carriers start no CW track and strong SSB voice starts far fewer (7 against 81 at +30 dB with the testkit voice, none spotted; zero is MAN-372), and a track whose signal stops keying closes after `unkeyed_close_ms`. `false` restores the pre-MAN-313 behaviour. See [SPEC §2.8](SPEC-decode-core.md#28-non-cw-rejection-man-313) and [MAN-313](DECISIONS/2026-10-13-man313-non-cw-rejection.md). Restart required (every `[detector]` key is). |
 | `unkeyed_close_ms` | `10000.0` | live | With `non_cw_filter` on, two limits: how long a qualified track may stay key-down with no keying, no decoded character and no callsign read before it closes; and how long a new track may take to show CW keying. Range 1000 to 3600000 (1 h). |
+
+### Digital-mode windows
+
+`digital_window_filter` defaults to `true`, including in existing files that
+omit the key. To include CW signals in these windows, set a boolean:
+
+```toml
+[detector]
+digital_window_filter = false
+```
+
+The environment override is `MANTA_DETECTOR_DIGITAL_WINDOW_FILTER=false`.
+The quoted TOML string `"false"` is invalid. Restart the process after a change.
+Opting in enables CW decoding there; it does not decode digital protocols or
+disable other signal filters.
+
+Each window starts at the USB dial below and ends 3 kHz above it. All values
+are in kHz; `-` means no entry. Overlapping windows act as their union.
+
+| Band | FT8 | FT4 | WSPR | JS8 |
+|---|---:|---:|---:|---:|
+| 160 m | 1840 | - | 1836.6 | 1842 |
+| 80 m | 3573 | 3575 | 3568.6 | 3578 |
+| 60 m | 5357 | 5357 | - | - |
+| 40 m | 7074 | 7047.5 | 7038.6 | 7078 |
+| 30 m | 10136 | 10140 | 10138.7 | 10130 |
+| 20 m | 14074 | 14080 | 14095.6 | 14078 |
+| 17 m | 18100 | 18104 | 18104.6 | 18104 |
+| 15 m | 21074 | 21140 | 21094.6 | 21078 |
+| 12 m | 24915 | 24919 | 24924.6 | 24922 |
+| 10 m | 28074 | 28180 | 28124.6 | 28078 |
+
+Membership is half-open, `[dial_hz, dial_hz + 3000)`, evaluated at each
+channel's source-reported RF center before frequency correction. Thus
+14074.5 kHz is excluded, while 14077 kHz is outside the isolated FT8 window.
+An endpoint can still lie in another mode's overlapping window. Boundaries
+follow the channel grid, normally 93.75 Hz. This is a track-start restriction;
+leakage near an edge can reach an allowed channel, and an existing track can
+drift across an edge without being closed.
+
+The table covers common HF defaults, including 60 m. It excludes regional
+and DXpedition alternatives and VHF/UHF. It makes no statement about transmit
+permissions. See the [MAN-311 decision](DECISIONS/2026-10-19-man311-digital-window-exclusions.md)
+for pinned frequency sources and verification.
 
 ## [decode]
 

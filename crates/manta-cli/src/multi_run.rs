@@ -240,6 +240,120 @@ fn retire_input_gauges(
     metrics.set_rtty_signals(&union);
 }
 
+/// MAN-14: distinct callsigns counted per input before the set stops
+/// growing (8 bytes each), so a Pi 4's memory stays bounded.
+const MAX_DISTINCT_CALLS_PER_INPUT: usize = 20_000;
+
+/// MAN-14: how often the silent-input check samples the inputs.
+const SILENT_INPUT_TICK: Duration = Duration::from_secs(1);
+
+/// 64-bit FNV-1a: a deterministic, dependency-free callsign hash.
+fn fnv1a64(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// MAN-14: attributes each published spot to the input whose track
+/// produced it -- input `i` of `n` numbers its tracks `1+i, 1+i+n, ...`
+/// (MAN-13 D3) -- and counts its spots and distinct callsigns.
+struct HearingCounters {
+    calls: Vec<std::collections::BTreeSet<u64>>,
+    cap_warned: Vec<bool>,
+}
+
+impl HearingCounters {
+    fn new(n: usize) -> Self {
+        Self {
+            calls: vec![std::collections::BTreeSet::new(); n],
+            cap_warned: vec![false; n],
+        }
+    }
+
+    fn record(&mut self, metrics: &Metrics, names: &[String], spot: &manta_spot::Spot) {
+        let input = (spot.track_id.saturating_sub(1) % names.len().max(1) as u32) as usize;
+        let Some(name) = names.get(input) else {
+            return;
+        };
+        metrics.record_input_spot(name);
+        let hash = fnv1a64(&spot.callsign);
+        let calls = &mut self.calls[input];
+        if calls.contains(&hash) {
+            return;
+        }
+        if calls.len() >= MAX_DISTINCT_CALLS_PER_INPUT {
+            if !self.cap_warned[input] {
+                self.cap_warned[input] = true;
+                logging::warning(&format!(
+                    "warning: input {name}: {MAX_DISTINCT_CALLS_PER_INPUT} distinct calls \
+                     heard; manta_input_distinct_calls_total{{source=\"{name}\"}} stops \
+                     counting new ones"
+                ));
+            }
+            return;
+        }
+        calls.insert(hash);
+        metrics.record_input_distinct_call(name);
+    }
+}
+
+/// Each input's published spot total, in `names` order.
+fn input_spot_totals(metrics: &Metrics, names: &[String]) -> Vec<u64> {
+    let rows = metrics.input_hearing();
+    names
+        .iter()
+        .map(|name| rows.iter().find(|r| &r.name == name).map_or(0, |r| r.spots))
+        .collect()
+}
+
+/// MAN-14: the silent-input check, once a second until the run stops.
+fn spawn_silent_watch(
+    rt: &tokio::runtime::Runtime,
+    metrics: Arc<Metrics>,
+    names: Vec<String>,
+    healthy: Arc<Vec<AtomicBool>>,
+    stop: Arc<AtomicBool>,
+    window: Duration,
+) {
+    use crate::silent::{recovered_line, silent_warning, SilentNote, SilentWatch};
+    rt.spawn(async move {
+        let mut watch =
+            SilentWatch::new(window, Instant::now(), &input_spot_totals(&metrics, &names));
+        loop {
+            tokio::time::sleep(SILENT_INPUT_TICK).await;
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let up: Vec<bool> = healthy.iter().map(|h| h.load(Ordering::Relaxed)).collect();
+            let totals = input_spot_totals(&metrics, &names);
+            for note in watch.tick(Instant::now(), &totals, &up) {
+                match note {
+                    SilentNote::Silent {
+                        input,
+                        other,
+                        other_spots,
+                    } => {
+                        metrics.set_input_silent(&names[input], true);
+                        logging::warning(&silent_warning(
+                            &names[input],
+                            window,
+                            &names[other],
+                            other_spots,
+                        ));
+                    }
+                    SilentNote::Recovered { input, silent_for } => {
+                        metrics.set_input_silent(&names[input], false);
+                        tracing::info!("{}", recovered_line(&names[input], silent_for));
+                    }
+                    SilentNote::Cleared { input } => {
+                        metrics.set_input_silent(&names[input], false);
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Runs every input until each has ended. Exit 0 when every input ended
 /// cleanly; an input that ended in error makes the run fail, naming it.
 pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
@@ -456,6 +570,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 .collect::<Result<Vec<_>>>()?;
             let factor = manta_spot::calibration_factor_from_ppm(m.inputs[0].freq_correction_ppm)
                 .map_err(|e| anyhow::anyhow!(e))?;
+            let silent_window = setup.cfg.silent_input_window();
             let (rt, server) = crate::start_spot_server(
                 setup.cfg,
                 setup.rbn_uplink,
@@ -515,13 +630,21 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 .set_decode_quality(crate::decode_quality_of(&quality.snapshot()));
             shared.decode_latency = Some(latency.clone());
             shared.decode_quality = Some(quality.clone());
+            // MAN-14: the shared validator's per-input cross-input dedupe
+            // withholds, copied into `Metrics` by the same poller.
+            let suppressions = Arc::new(manta_engine::SuppressionObserver::new(n));
+            shared.suppressions = Some(suppressions.clone());
             let poll_metrics = server.metrics.clone();
+            let poll_names = names.clone();
             rt.spawn(async move {
                 loop {
                     tokio::time::sleep(crate::DECODE_LATENCY_POLL_INTERVAL).await;
                     poll_metrics
                         .set_decode_latency(crate::latency_histogram_of(&latency.snapshot()));
                     poll_metrics.set_decode_quality(crate::decode_quality_of(&quality.snapshot()));
+                    for (name, count) in poll_names.iter().zip(suppressions.per_input()) {
+                        poll_metrics.set_input_cross_input_dupes(name, count);
+                    }
                 }
             });
             server.metrics.arm_decode_watchdog();
@@ -535,6 +658,18 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 // MAN-234: every input's bad-sample series exists from the
                 // first scrape, as the one-input path publishes it.
                 server.metrics.set_input_bad_samples(name, 0);
+            }
+            // MAN-14: every input's hearing series, at 0, in config order.
+            server.metrics.register_input_hearing(&names);
+            if let Some(window) = silent_window {
+                spawn_silent_watch(
+                    &rt,
+                    server.metrics.clone(),
+                    names.clone(),
+                    healthy.clone(),
+                    stop.clone(),
+                    window,
+                );
             }
             Some((rt, server))
         }
@@ -605,6 +740,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         .collect();
     let stop_ready = stop.clone();
     let stop_end = stop.clone();
+    let mut hearing = HearingCounters::new(n);
     let ends = manta_engine::listen_inputs(
         opened,
         m.cfg,
@@ -639,6 +775,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                     truncated.stream_history_truncated as u64,
                 );
                 server.metrics.record_spot(spot);
+                hearing.record(&server.metrics, &names, spot);
                 let cty = server.lists.cty.load();
                 if crate::geography_is_unresolved(&cty, &spot.callsign)
                     || crate::station_geography_unresolved(&cty, &server.station_callsign)
@@ -763,6 +900,45 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spot(callsign: &str, track_id: u32) -> manta_spot::Spot {
+        manta_spot::Spot {
+            callsign: callsign.to_string(),
+            freq_hz: 14_025_000.0,
+            snr_db: 20.0,
+            wpm: 25.0,
+            spot_type: manta_spot::SpotType::Cq,
+            confidence: 0.9,
+            track_id,
+            sample_ts: 0,
+            rst: None,
+            qrl_query: false,
+        }
+    }
+
+    /// MAN-14: a spot counts against the input its track id belongs to
+    /// (MAN-13 D3), and a callsign once per input.
+    #[test]
+    fn hearing_counters_attribute_spots_and_distinct_calls_by_track_id() {
+        let names = vec!["alpha".to_string(), "beta".to_string()];
+        let metrics = Metrics::new();
+        metrics.register_input_hearing(&names);
+        let mut hearing = HearingCounters::new(2);
+        for (call, track_id) in [("W1AW", 1), ("W1AW", 3), ("K5ARH", 5), ("W1AW", 2)] {
+            hearing.record(&metrics, &names, &spot(call, track_id));
+        }
+        let rows = metrics.input_hearing();
+        assert_eq!((rows[0].spots, rows[0].distinct_calls), (3, 2));
+        assert_eq!((rows[1].spots, rows[1].distinct_calls), (1, 1));
+        assert_eq!(input_spot_totals(&metrics, &names), vec![3, 1]);
+    }
+
+    #[test]
+    fn fnv1a64_matches_the_reference_vectors() {
+        assert_eq!(fnv1a64(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_ne!(fnv1a64("W1AW"), fnv1a64("W1AX"));
+    }
 
     #[test]
     fn session_nonce_for_one_file_is_todays_and_for_several_hashes_them_in_order() {

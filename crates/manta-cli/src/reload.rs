@@ -100,6 +100,30 @@ pub(crate) fn reload_once(ctx: &ReloadContext) -> Result<ReloadOutcome> {
     let restart_needed = restart_only_changes(&ctx.startup_raw, &prepared.loaded.raw);
     let dry_run_skipped = restart_needed.iter().any(|p| p.starts_with("rbn_uplink"))
         || prepared.loaded.rbn_uplink.len() != ctx.uplinks.len();
+    // MAN-319: `load()` checked the new document's grid, but `[server]` is
+    // restart-only, so a grid this reload adds is not in effect yet. Going
+    // live here needs the 6-character grid the daemon started with
+    // (`startup_raw` is after the `MANTA_*` overlay; no flag sets it).
+    let startup_grid = ctx
+        .startup_raw
+        .get("server")
+        .and_then(|s| s.get("operator_grid"))
+        .and_then(toml::Value::as_str);
+    if !dry_run_skipped && !startup_grid.is_some_and(|g| g.chars().count() == 6) {
+        if let Some((live, _)) = ctx
+            .uplinks
+            .iter()
+            .zip(&prepared.loaded.rbn_uplink)
+            .find(|(live, new)| live.enabled && !new.dry_run)
+        {
+            anyhow::bail!(
+                "[[rbn_uplink]] target {} has dry_run = false, but this daemon started \
+                 without a 6-character [server].operator_grid, and a reload does not \
+                 change [server]: restart manta to go live",
+                live.label
+            );
+        }
+    }
 
     let pipeline = prepared.pipeline;
     let allowlist_calls = pipeline
@@ -362,6 +386,7 @@ bind_addr = \"127.0.0.1\"
 telnet_port = 0
 json_port = 0
 metrics_port = 0
+operator_grid = \"FN03ab\"
 
 [spot]
 allowlist = [\"k5arh\"]
@@ -616,6 +641,51 @@ blocklist_path = \"bl.txt\"
         );
     }
 
+    /// MAN-319 (PR #362 review): `[server]` is restart-only, so a grid the
+    /// reload adds is not in effect yet. Started without a 6-character grid
+    /// (none, or 4 characters), a reload that adds one and flips `dry_run`
+    /// off in the same edit is rejected before anything applies.
+    #[test]
+    fn going_live_needs_a_six_character_grid_in_effect_since_startup() {
+        for startup_grid in ["", "operator_grid = \"FN03\"\n"] {
+            let startup = BASE.replace("operator_grid = \"FN03ab\"\n", startup_grid);
+            let f = start(
+                &format!("{startup}{}", uplink_block(true, 7000)),
+                CliOverrides::none(),
+            );
+            write(&f.path("bl.txt"), "W1AW\n");
+            write(
+                &f.path("manta.toml"),
+                &format!("{BASE}{}", uplink_block(false, 7000)),
+            );
+            let err = format!("{:#}", reload_once(&f.ctx).unwrap_err());
+            assert!(err.contains("target 127.0.0.1:7000"), "{err}");
+            assert!(
+                err.contains("started without a 6-character [server].operator_grid"),
+                "{err}"
+            );
+            assert!(err.contains("restart manta to go live"), "{err}");
+            assert!(f.ctx.lists.take().is_none());
+            assert_eq!(flags(&f.ctx), vec![true]);
+        }
+
+        // An edit that also changes the uplink beyond `dry_run` flips
+        // nothing, so it goes nowhere live and still applies its lists.
+        let startup = BASE.replace("operator_grid = \"FN03ab\"\n", "");
+        let f = start(
+            &format!("{startup}{}", uplink_block(true, 7000)),
+            CliOverrides::none(),
+        );
+        write(
+            &f.path("manta.toml"),
+            &format!("{BASE}{}", uplink_block(false, 7001)),
+        );
+        let report = applied(&f.ctx);
+        assert!(report.dry_run_skipped);
+        assert!(f.ctx.lists.take().is_some());
+        assert_eq!(flags(&f.ctx), vec![true]);
+    }
+
     /// A disabled target transmits nothing either way, so its flip is not
     /// logged as one (PR #232 review).
     #[test]
@@ -740,6 +810,16 @@ blocklist_path = \"bl.txt\"
         assert_eq!(
             restart_only_changes(&old, &new),
             vec!["input.bands", "input.tuning_range_hz"]
+        );
+    }
+
+    #[test]
+    fn digital_window_changes_need_a_restart() {
+        let old = table("[detector]\ndigital_window_filter = true\n");
+        let new = table("[detector]\ndigital_window_filter = false\n");
+        assert_eq!(
+            restart_only_changes(&old, &new),
+            vec!["detector.digital_window_filter"]
         );
     }
 

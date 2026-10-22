@@ -149,6 +149,39 @@ impl RttyObserver {
     }
 }
 
+/// MAN-14: the shared validator's per-input cross-input dedupe withholds
+/// (`SuppressionCounts::cross_input_dedupe_by_input`), copied by the
+/// multi-input back end after each batch for a poller to publish. Values
+/// never decrease (`fetch_max`, as `static_crashes`).
+#[derive(Debug, Default)]
+pub struct SuppressionObserver {
+    per_input: Vec<AtomicU64>,
+}
+
+impl SuppressionObserver {
+    /// One zeroed count per input.
+    pub fn new(n_inputs: usize) -> Self {
+        Self {
+            per_input: (0..n_inputs).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    /// Each input's count so far, in input order.
+    pub fn per_input(&self) -> Vec<u64> {
+        self.per_input
+            .iter()
+            .map(|n| n.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    /// Raises each input's count to `counts[i]`; a lower value is ignored.
+    pub fn store_max(&self, counts: &[u64]) {
+        for (slot, &n) in self.per_input.iter().zip(counts) {
+            slot.fetch_max(n, Ordering::Relaxed);
+        }
+    }
+}
+
 /// MAN-314: empties the RTTY observer on construction and on every exit
 /// path, like `ActiveTracksGuard`, and publishes the segment's marked set
 /// when the track manager reports a change.
@@ -699,6 +732,12 @@ pub fn listen_with_observers(
     let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
     let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];
     let mut filled = 0;
+    // MAN-305 (PR #357 review): spliced losses during the fill, at the
+    // fill offset they happened. The fill below is processed in pieces
+    // split at each recorded loss, so samples captured before a loss keep
+    // their pre-loss timestamps instead of all being mapped from the
+    // post-gap `seg_base`.
+    let mut calib_losses: Vec<(usize, u64)> = Vec::new();
     while filled < calib_n {
         // MAN-122 review round 7: checked before EVERY calibration read, not
         // only once the decode loop below starts. The daemon installs its
@@ -727,14 +766,25 @@ pub fn listen_with_observers(
             }
             anyhow::bail!("audio source ended during startup calibration");
         }
+        // MAN-305: samples the source lost and spliced over. The pre-gap
+        // fill stays (a splice, as the source made it); only the sample
+        // clock moves. Recorded at the fill offset where the loss happened
+        // (`filled`, the samples before it being pre-gap), not added to
+        // `seg_base` straight away: one base shift would re-time the whole
+        // buffered fill, pre-loss samples included.
+        if let Some(k) = src.take_missing_samples() {
+            calib_losses.push((filled, k));
+        }
         if let Some(gap) = src.take_discontinuity() {
             // A discontinuity during calibration: the pre-gap partial
             // buffer was never processed through the channelizer, so it's
             // simply discarded (not spliced) -- keep the post-gap samples
             // just read, advance the sample clock by the discarded samples
-            // plus the gap, and keep filling from there.
+            // plus the gap, and keep filling from there. The losses
+            // recorded inside the discarded part still passed wall-clock
+            // time, so they go onto the clock with it (PR #357 review).
             calib.copy_within(filled..filled + n, 0);
-            seg_base += filled as u64 + gap;
+            seg_base += calib_losses.drain(..).map(|(_, k)| k).sum::<u64>() + filled as u64 + gap;
             filled = n;
             continue;
         }
@@ -767,10 +817,53 @@ pub fn listen_with_observers(
         );
     }
     on_tracks(n_tracks);
-    // `..filled`: the whole buffer unless a stop request cut the fill short.
-    let events = seg.tm.process_hops(&seg.ch.process(&calib[..filled]), |m| {
-        seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
-    });
+    // `..filled`: the whole buffer unless a stop request cut the fill
+    // short. MAN-305 (PR #357 review): processed in pieces split at each
+    // recorded loss, the pre-loss piece first -- each piece is mapped from
+    // the `seg_base` true for its samples, and the loss advances the clock
+    // between pieces exactly as the decode loop advances it between reads,
+    // so a track or event originating before the loss keeps its pre-loss
+    // timestamp. The final piece runs even when empty (a stop request cut
+    // the fill before any sample), keeping the per-batch callbacks below
+    // at one call per calibration block, as before the split.
+    let mut piece = 0usize;
+    for &(at, k) in &calib_losses {
+        let at = at.min(filled);
+        if at > piece {
+            let events = seg
+                .tm
+                .process_hops(&seg.ch.process(&calib[piece..at]), |m| {
+                    seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
+                });
+            emit(
+                events,
+                &mut validator,
+                &mut ctx,
+                &mut on_event,
+                &mut on_spot,
+            );
+            let n_tracks = seg.tm.decoding_track_count();
+            report_active_tracks(n_tracks);
+            report_confirmations(confirmations_base + seg.tm.confirmations());
+            report_static_crashes(crash_base + seg.tm.static_crash_count());
+            report_bad_samples(bad_base + seg.ch.bad_samples());
+            rtty.update(&seg.tm);
+            if let Some(obs) = lifecycle {
+                obs.publish_counts(
+                    close_base + seg.tm.close_counts(),
+                    validator.gate_records_total(),
+                );
+            }
+            on_tracks(n_tracks);
+        }
+        seg_base += k;
+        piece = at;
+    }
+    let events = seg
+        .tm
+        .process_hops(&seg.ch.process(&calib[piece..filled]), |m| {
+            seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
+        });
     emit(
         events,
         &mut validator,
@@ -824,6 +917,14 @@ pub fn listen_with_observers(
         };
         if n == 0 {
             break;
+        }
+        // MAN-305: a short loss the source spliced over. Advancing
+        // `seg_base` mid-segment re-times every later event, including
+        // those of tracks begun before the loss, so spot timestamps stay
+        // wall-clock-true without closing a track (a discontinuity below
+        // would lose a spot whose transmission spans the loss).
+        if let Some(k) = src.take_missing_samples() {
+            seg_base += k;
         }
         if let Some(gap) = src.take_discontinuity() {
             // Not `finish()`: an outage is not an end of signal (see
@@ -984,6 +1085,9 @@ pub(crate) struct Back<'a> {
     /// Last received batch per input, for synthetic closures after a
     /// failure. Only populated when the live tap needs closure times.
     input_end_ts: Vec<u64>,
+    /// MAN-14: where the validator's per-input cross-input dedupe counts
+    /// go after each batch; `None` skips the copy.
+    suppressions: Option<Arc<SuppressionObserver>>,
 }
 
 impl<'a> Back<'a> {
@@ -1013,6 +1117,20 @@ impl<'a> Back<'a> {
             },
             open: BTreeSet::new(),
             input_end_ts: Vec::new(),
+            suppressions: shared.suppressions.clone(),
+        }
+    }
+
+    /// MAN-14: publishes the validator's per-input cross-input dedupe
+    /// counts, when an observer is registered.
+    fn report_suppressions(&self) {
+        if let Some(observer) = &self.suppressions {
+            observer.store_max(
+                &self
+                    .validator
+                    .suppression_counts()
+                    .cross_input_dedupe_by_input,
+            );
         }
     }
 
@@ -1068,6 +1186,7 @@ impl<'a> Back<'a> {
         if let (Some(tap), Some(band)) = (self.ctx.live.as_ref(), batch.band) {
             tap.publish_band(band);
         }
+        self.report_suppressions();
     }
 
     /// An input has ended. One that errored or panicked sent no `finish()`
@@ -1117,6 +1236,7 @@ impl<'a> Back<'a> {
         if let Some(tap) = self.ctx.live.as_mut() {
             tap.retain_input_tracks(input, n_inputs, &[]);
         }
+        self.report_suppressions();
     }
 }
 
@@ -1246,6 +1366,9 @@ pub(crate) fn run_input_front(
     let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
     let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];
     let mut filled = 0;
+    // MAN-305 (PR #357 review): spliced losses during the fill, at the
+    // fill offset they happened, as `listen_with_observers` records them.
+    let mut calib_losses: Vec<(usize, u64)> = Vec::new();
     while filled < calib_n {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -1260,29 +1383,72 @@ pub(crate) fn run_input_front(
             }
             anyhow::bail!("audio source ended during startup calibration");
         }
+        // MAN-305, as `listen_with_observers`: the splice stays, only the
+        // clock moves -- recorded at the fill offset where the loss
+        // happened, so the fill below is split at it.
+        if let Some(k) = src.take_missing_samples() {
+            calib_losses.push((filled, k));
+        }
         if let Some(gap) = src.take_discontinuity() {
             calib.copy_within(filled..filled + n, 0);
-            seg_base += filled as u64 + gap;
+            seg_base += calib_losses.drain(..).map(|(_, k)| k).sum::<u64>() + filled as u64 + gap;
             filled = n;
             continue;
         }
         filled += n;
     }
-    for (i, block) in [&padding[..], &calib[..filled]].into_iter().enumerate() {
-        let events = seg.tm.process_hops(&seg.ch.process(block), |m| {
+    // MAN-305 (PR #357 review): the fill is processed in pieces split at
+    // each recorded loss, as `listen_with_observers` splits it. Every
+    // piece's batch keeps the unsplit fill's `end_ts`, so the replay
+    // merge's ordering against the other inputs' batches does not change,
+    // and `tick` still fires on the batch that closes the fill.
+    let losses_total: u64 = calib_losses.iter().map(|&(_, k)| k).sum();
+    let fill_end = seg_base + losses_total + filled as u64;
+    let events = seg.tm.process_hops(&seg.ch.process(&padding[..]), |m| {
+        seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
+    });
+    let b = batch(events, fill_end, &seg.tm);
+    report_active_tracks(b.n_tracks);
+    report_static_crashes(crash_base + seg.tm.static_crash_count());
+    report_bad_samples(bad_base + seg.ch.bad_samples());
+    rtty.update(&seg.tm);
+    if !send(b) {
+        return Ok(());
+    }
+    let mut piece = 0usize;
+    for &(at, k) in &calib_losses {
+        let at = at.min(filled);
+        if at > piece {
+            let events = seg
+                .tm
+                .process_hops(&seg.ch.process(&calib[piece..at]), |m| {
+                    seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
+                });
+            let b = batch(events, fill_end, &seg.tm);
+            report_active_tracks(b.n_tracks);
+            report_static_crashes(crash_base + seg.tm.static_crash_count());
+            report_bad_samples(bad_base + seg.ch.bad_samples());
+            rtty.update(&seg.tm);
+            if !send(b) {
+                return Ok(());
+            }
+        }
+        seg_base += k;
+        piece = at;
+    }
+    let events = seg
+        .tm
+        .process_hops(&seg.ch.process(&calib[piece..filled]), |m| {
             seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
         });
-        let mut b = batch(events, seg_base + filled as u64, &seg.tm);
-        if i == 1 {
-            tick(&mut b, &mut seg.tm, seg_base + filled as u64);
-        }
-        report_active_tracks(b.n_tracks);
-        report_static_crashes(crash_base + seg.tm.static_crash_count());
-        report_bad_samples(bad_base + seg.ch.bad_samples());
-        rtty.update(&seg.tm);
-        if !send(b) {
-            return Ok(());
-        }
+    let mut b = batch(events, fill_end, &seg.tm);
+    tick(&mut b, &mut seg.tm, fill_end);
+    report_active_tracks(b.n_tracks);
+    report_static_crashes(crash_base + seg.tm.static_crash_count());
+    report_bad_samples(bad_base + seg.ch.bad_samples());
+    rtty.update(&seg.tm);
+    if !send(b) {
+        return Ok(());
     }
     seg_consumed += filled as u64;
 
@@ -1301,6 +1467,11 @@ pub(crate) fn run_input_front(
         };
         if n == 0 {
             break;
+        }
+        // MAN-305, as `listen_with_observers`: a spliced loss advances
+        // this input's clock without closing its tracks.
+        if let Some(k) = src.take_missing_samples() {
+            seg_base += k;
         }
         let mut pending = Vec::new();
         if let Some(gap) = src.take_discontinuity() {
@@ -1414,6 +1585,91 @@ mod tests {
         assert_eq!(effective_guard_hz(0.0, 600.0), 600.0);
         assert_eq!(effective_guard_hz(900.0, 600.0), 900.0);
         assert_eq!(effective_guard_hz(0.0, 0.0), 0.0);
+    }
+
+    /// MAN-14: one input's transmission, as the validator tests build it.
+    fn transmission(track_id: u32, start_ts: u64) -> Vec<DecoderEvent> {
+        let mut events = vec![DecoderEvent::TrackMeta {
+            track_id,
+            sample_ts: start_ts,
+            snr_2500_db: 20.0,
+            freq_hz: 14_012_340.0 + f64::from(track_id),
+        }];
+        let mut ts = start_ts;
+        for word in ["DE", "W1AW", "K"] {
+            for c in word.chars() {
+                events.push(DecoderEvent::char_decoded(
+                    track_id,
+                    ts,
+                    manta_decode::tree::Glyph::Char(c),
+                    0.95,
+                ));
+                ts += 100;
+            }
+            events.push(DecoderEvent::word_boundary(track_id, ts));
+            ts += 100;
+        }
+        events
+    }
+
+    #[test]
+    fn back_publishes_cross_input_dedupe_counts_per_withheld_input() {
+        let observer = Arc::new(SuppressionObserver::new(2));
+        let shared = crate::multi::SharedObservers {
+            suppressions: Some(observer.clone()),
+            ..Default::default()
+        };
+        let cfg = PipelineConfig::default();
+        let mut back = Back::new(
+            &shared,
+            cfg.shared_validator(48_000.0, 2).unwrap(),
+            48_000.0,
+        );
+        let batch = |end_ts, events| Batch {
+            events,
+            end_ts,
+            n_tracks: 1,
+            live_ids: None,
+            band: None,
+        };
+        let mut spots = Vec::new();
+        // Input 0 (track 1) spots W1AW first; input 1 (track 2) hears the
+        // same signal and is withheld.
+        for start in [0, 100_000, 200_000] {
+            back.ingest(
+                0,
+                2,
+                batch(start + 5_000, transmission(1, start)),
+                &mut |_| {},
+                &mut |s| spots.push(s.clone()),
+            );
+            back.ingest(
+                1,
+                2,
+                batch(start + 5_050, transmission(2, start + 50)),
+                &mut |_| {},
+                &mut |s| spots.push(s.clone()),
+            );
+        }
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        assert_eq!(spots[0].track_id, 1);
+        let counts = observer.per_input();
+        assert_eq!(counts[0], 0, "{counts:?}");
+        assert!(counts[1] >= 1, "{counts:?}");
+        // A stale, lower snapshot never lowers a published count.
+        observer.store_max(&[0, 0]);
+        assert_eq!(observer.per_input(), counts);
+        // No observer registered: the same batches run without one.
+        let none = crate::multi::SharedObservers::default();
+        let mut quiet = Back::new(&none, cfg.shared_validator(48_000.0, 2).unwrap(), 48_000.0);
+        quiet.ingest(
+            0,
+            2,
+            batch(5_000, transmission(1, 0)),
+            &mut |_| {},
+            &mut |_| {},
+        );
+        quiet.close_input(0, 2, &mut |_| {}, &mut |_| {});
     }
 
     #[test]
@@ -2258,6 +2514,485 @@ mod tests {
             }
             gap
         }
+    }
+
+    // ---- MAN-305: a spliced loss advances the clock, not the segment ----
+
+    /// One protocol-2 IQ datagram's worth of samples.
+    const LOSS_BLOCK: usize = 238;
+
+    /// MAN-305 test double: serves `samples` and, at each `(at, blocks)` in
+    /// `losses` (`at` a position in `samples`), drops the next
+    /// `blocks × LOSS_BLOCK` samples and splices over them, as a source
+    /// losing numbered datagrams does. With `report` set, the next
+    /// `take_missing_samples()` returns the total dropped; without it the
+    /// splice goes unreported (the control). A `read()` never straddles a
+    /// loss, so a report always describes the samples that call returns.
+    struct LossySource {
+        samples: Arc<Vec<Complex32>>,
+        cursor: usize,
+        fs: f64,
+        center_freq_hz: f64,
+        losses: std::collections::VecDeque<(usize, usize)>,
+        report: bool,
+        pending_missing: Option<u64>,
+    }
+
+    impl LossySource {
+        /// V1 at 192 kHz for 30 s (`v1_192k_spec`), losing `blocks`
+        /// datagrams at each `(at_s, blocks)`.
+        fn v1_192k(losses: &[(f64, usize)], report: bool) -> Self {
+            let spec = v1_192k_spec();
+            LossySource {
+                samples: v1_192k_samples(),
+                cursor: 0,
+                fs: spec.fs,
+                center_freq_hz: spec.center_freq_hz,
+                losses: losses
+                    .iter()
+                    .map(|&(at_s, blocks)| ((at_s * spec.fs).round() as usize, blocks))
+                    .collect(),
+                report,
+                pending_missing: None,
+            }
+        }
+    }
+
+    impl manta_input::IqSource for LossySource {
+        fn sample_rate(&self) -> f64 {
+            self.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.center_freq_hz
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            while let Some(&(at, blocks)) = self.losses.front() {
+                if self.cursor < at {
+                    break;
+                }
+                self.losses.pop_front();
+                let lost = (blocks * LOSS_BLOCK).min(self.samples.len() - self.cursor);
+                self.cursor += lost;
+                if self.report {
+                    *self.pending_missing.get_or_insert(0) += lost as u64;
+                }
+            }
+            let end = self
+                .losses
+                .front()
+                .map_or(self.samples.len(), |&(at, _)| at);
+            let n = buf.len().min(end - self.cursor);
+            buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
+            self.cursor += n;
+            Ok(n)
+        }
+        fn take_missing_samples(&mut self) -> Option<u64> {
+            self.pending_missing.take()
+        }
+    }
+
+    /// The plan's fixture: V1 at 192 kHz, 30 s, one W1AW spot.
+    fn v1_192k_spec() -> manta_testkit::vectors::VectorSpec {
+        manta_testkit::vectors::VectorSpec {
+            fs: 192_000.0,
+            duration_s: 30.0,
+            ..manta_testkit::vectors::v1()
+        }
+    }
+
+    /// Rendered once for every MAN-305 test in this process.
+    fn v1_192k_samples() -> Arc<Vec<Complex32>> {
+        static RENDERED: std::sync::OnceLock<Arc<Vec<Complex32>>> = std::sync::OnceLock::new();
+        RENDERED
+            .get_or_init(|| {
+                Arc::new(
+                    manta_testkit::vectors::render(&v1_192k_spec())
+                        .unwrap()
+                        .samples,
+                )
+            })
+            .clone()
+    }
+
+    /// `(callsign, sample_ts)` of every spot `listen()` emits over `src`.
+    fn lossy_spots(src: LossySource) -> Vec<(String, u64)> {
+        let mut spots = Vec::new();
+        listen(
+            Box::new(src),
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+            |s| spots.push((s.callsign.clone(), s.sample_ts)),
+        )
+        .unwrap();
+        spots
+    }
+
+    /// As `lossy_spots`, through the multi-input path (`run_input_front`)
+    /// with `src` as the session's only input.
+    fn lossy_spots_multi(src: LossySource) -> Vec<(String, u64)> {
+        let mut src = Some(src);
+        let opened = crate::multi::open_inputs(
+            vec![crate::multi::InputSpec {
+                name: "a".into(),
+                open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
+                freq_correction_ppm: 0.0,
+                observers: Default::default(),
+                spawn_band_hz: None,
+            }],
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut spots = Vec::new();
+        crate::multi::listen_inputs(
+            opened,
+            &PipelineConfig::default(),
+            crate::multi::SessionClock::Replay,
+            crate::multi::SharedObservers::default(),
+            |_| {},
+            |s| spots.push((s.callsign.clone(), s.sample_ts)),
+            |_, _| {},
+            |_| {},
+        )
+        .unwrap();
+        spots
+    }
+
+    /// The `sample_ts` of the single W1AW spot in `spots`.
+    fn the_one_w1aw(spots: &[(String, u64)]) -> u64 {
+        assert_eq!(spots.len(), 1, "exactly one spot expected: {spots:?}");
+        assert_eq!(spots[0].0, "W1AW", "{spots:?}");
+        spots[0].1
+    }
+
+    /// The loss-free baseline's spot, decoded once per process.
+    fn lossless_baseline_ts() -> u64 {
+        static BASELINE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *BASELINE.get_or_init(|| the_one_w1aw(&lossy_spots(LossySource::v1_192k(&[], true))))
+    }
+
+    /// One channelizer hop at 192 kHz: the tolerance a clock-true spot
+    /// must meet against the loss-free baseline.
+    const CLOCK_TOLERANCE: u64 = 512;
+
+    fn assert_clock_true(spots: &[(String, u64)], baseline: u64) {
+        let ts = the_one_w1aw(spots);
+        assert!(
+            ts.abs_diff(baseline) <= CLOCK_TOLERANCE,
+            "spot sample_ts {ts} is {} from the loss-free {baseline}; at most \
+             {CLOCK_TOLERANCE} allowed",
+            ts as i64 - baseline as i64
+        );
+    }
+
+    /// MAN-305: 50 datagrams lost at 3.0 s and reported through
+    /// `take_missing_samples()` advance the clock without closing a track:
+    /// the one W1AW spot survives and lands within a hop of the loss-free
+    /// replay's.
+    #[test]
+    fn missing_samples_advance_the_clock_without_closing_tracks() {
+        let spots = lossy_spots(LossySource::v1_192k(&[(3.0, 50)], true));
+        assert_clock_true(&spots, lossless_baseline_ts());
+    }
+
+    /// MAN-305: the same loss at 10.0 s, mid-transmission -- the case where
+    /// a `take_discontinuity()` report lost the spot in this 30 s fixture.
+    #[test]
+    fn missing_samples_inside_a_transmission_keep_the_spot() {
+        let spots = lossy_spots(LossySource::v1_192k(&[(10.0, 50)], true));
+        assert_clock_true(&spots, lossless_baseline_ts());
+    }
+
+    /// MAN-305: a loss at 1.0 s, inside the startup calibration fill, keeps
+    /// the splice and still advances the clock.
+    #[test]
+    fn missing_samples_during_calibration_advance_the_clock() {
+        let spots = lossy_spots(LossySource::v1_192k(&[(1.0, 50)], true));
+        assert_clock_true(&spots, lossless_baseline_ts());
+    }
+
+    /// MAN-305: the multi-input front end (`run_input_front`) advances that
+    /// input's clock the same way.
+    #[test]
+    fn multi_input_missing_samples_advance_that_inputs_clock() {
+        let baseline = the_one_w1aw(&lossy_spots_multi(LossySource::v1_192k(&[], true)));
+        let spots = lossy_spots_multi(LossySource::v1_192k(&[(3.0, 50)], true));
+        assert_clock_true(&spots, baseline);
+    }
+
+    /// MAN-305 control: the same splice unreported puts the spot early by
+    /// about the 11,900 lost samples (measured −11,776), which proves the
+    /// tolerance asserted above can fail.
+    #[test]
+    fn unreported_splice_is_early_by_the_lost_samples() {
+        let baseline = lossless_baseline_ts();
+        let ts = the_one_w1aw(&lossy_spots(LossySource::v1_192k(&[(3.0, 50)], false)));
+        assert!(
+            baseline.saturating_sub(ts) > 11_000,
+            "an unreported splice must leave the spot more than 11,000 samples early: \
+             {ts} vs the loss-free {baseline}"
+        );
+    }
+
+    /// The `sample_ts` of a genuinely timestamped decoder event.
+    fn timestamped(ev: &DecoderEvent) -> Option<u64> {
+        match ev {
+            DecoderEvent::CharDecoded { sample_ts, .. }
+            | DecoderEvent::WordBoundary { sample_ts, .. }
+            | DecoderEvent::TrackPromoted { sample_ts, .. }
+            | DecoderEvent::TrackMeta { sample_ts, .. }
+            | DecoderEvent::TimingUpdate { sample_ts, .. } => Some(*sample_ts),
+            _ => None,
+        }
+    }
+
+    /// As `lossy_spots`, but collects every timestamped event's
+    /// `sample_ts` (sorted), not spots: the finest-grained view of what
+    /// the calibration mapping does to event times.
+    fn lossy_event_ts(src: LossySource) -> Vec<u64> {
+        let mut ts = Vec::new();
+        listen(
+            Box::new(src),
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            |ev| {
+                if let Some(t) = timestamped(ev) {
+                    ts.push(t);
+                }
+            },
+            |_| {},
+        )
+        .unwrap();
+        ts.sort_unstable();
+        ts
+    }
+
+    /// As `lossy_event_ts`, through the multi-input path
+    /// (`run_input_front`) with `src` as the session's only input.
+    fn lossy_event_ts_multi(src: LossySource) -> Vec<u64> {
+        let mut src = Some(src);
+        let opened = crate::multi::open_inputs(
+            vec![crate::multi::InputSpec {
+                name: "a".into(),
+                open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
+                freq_correction_ppm: 0.0,
+                observers: Default::default(),
+                spawn_band_hz: None,
+            }],
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut ts = Vec::new();
+        crate::multi::listen_inputs(
+            opened,
+            &PipelineConfig::default(),
+            crate::multi::SessionClock::Replay,
+            crate::multi::SharedObservers::default(),
+            |ev| {
+                if let Some(t) = timestamped(ev) {
+                    ts.push(t);
+                }
+            },
+            |_| {},
+            |_, _| {},
+            |_| {},
+        )
+        .unwrap();
+        ts.sort_unstable();
+        ts
+    }
+
+    /// MAN-305 (PR #357 review): a spliced loss reported after the
+    /// calibration fill is part-full must not re-time the samples captured
+    /// before it. The fill is processed in pieces split at the loss, so a
+    /// pre-loss event keeps the loss-free replay's timestamp; before the
+    /// fix the whole fill was mapped from the post-gap base and every
+    /// pre-loss event came out `k` samples late (50 datagrams = 11,900
+    /// samples at 192 kHz).
+    #[test]
+    fn missing_samples_during_calibration_keep_pre_loss_event_times() {
+        let at_s = 1.5_f64; // inside the 2 s calibration fill, after 1.5 s of it
+        let cut = (at_s * 192_000.0).round() as u64;
+        let baseline = lossy_event_ts(LossySource::v1_192k(&[], true));
+        let lossy = lossy_event_ts(LossySource::v1_192k(&[(at_s, 50)], true));
+        let pre: Vec<u64> = baseline.iter().copied().filter(|&t| t < cut).collect();
+        assert!(
+            pre.len() >= 3,
+            "test setup: expected pre-loss events, got {baseline:?}"
+        );
+        for t in pre {
+            assert!(
+                lossy.contains(&t),
+                "pre-loss event {t} re-timed: {baseline:?} vs {lossy:?}"
+            );
+        }
+    }
+
+    /// MAN-305 (PR #357 review): the multi-input front end
+    /// (`run_input_front`) keeps the same pre-loss event times through its
+    /// own calibration fill.
+    #[test]
+    fn multi_input_missing_samples_during_calibration_keep_pre_loss_event_times() {
+        let at_s = 1.5_f64; // inside the 2 s calibration fill, after 1.5 s of it
+        let cut = (at_s * 192_000.0).round() as u64;
+        let baseline = lossy_event_ts_multi(LossySource::v1_192k(&[], true));
+        let lossy = lossy_event_ts_multi(LossySource::v1_192k(&[(at_s, 50)], true));
+        let pre: Vec<u64> = baseline.iter().copied().filter(|&t| t < cut).collect();
+        assert!(
+            pre.len() >= 3,
+            "test setup: expected pre-loss events, got {baseline:?}"
+        );
+        for t in pre {
+            assert!(
+                lossy.contains(&t),
+                "pre-loss event {t} re-timed: {baseline:?} vs {lossy:?}"
+            );
+        }
+    }
+
+    /// MAN-305 review test double: V1 at 192 kHz that, inside the 2 s
+    /// calibration fill, first splices away `lost` samples at stream
+    /// position `loss_at` (reporting them through `take_missing_samples`,
+    /// as `LossySource` does) and then reports a `gap`-sample
+    /// discontinuity at stream position `gap_at`. Reads never straddle
+    /// either point, so each report describes the samples that read
+    /// returns, as the protocol-2 source's do.
+    struct LossThenGapSource {
+        samples: Arc<Vec<Complex32>>,
+        cursor: usize,
+        fs: f64,
+        center_freq_hz: f64,
+        loss_at: usize,
+        lost: usize,
+        gap_at: usize,
+        gap: u64,
+        gap_armed: bool,
+        pending_missing: Option<u64>,
+        pending_gap: Option<u64>,
+    }
+
+    impl LossThenGapSource {
+        /// Loss at `loss_at_s` s of stream time (losing `lost` samples),
+        /// then a `gap_samples` discontinuity at `gap_at_s` s of stream
+        /// time, both inside the 2 s calibration fill.
+        fn v1_192k(loss_at_s: f64, lost: usize, gap_at_s: f64, gap_samples: u64) -> Self {
+            let spec = v1_192k_spec();
+            LossThenGapSource {
+                samples: v1_192k_samples(),
+                cursor: 0,
+                fs: spec.fs,
+                center_freq_hz: spec.center_freq_hz,
+                loss_at: (loss_at_s * spec.fs).round() as usize,
+                lost,
+                gap_at: (gap_at_s * spec.fs).round() as usize,
+                gap: gap_samples,
+                gap_armed: true,
+                pending_missing: None,
+                pending_gap: None,
+            }
+        }
+    }
+
+    impl manta_input::IqSource for LossThenGapSource {
+        fn sample_rate(&self) -> f64 {
+            self.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.center_freq_hz
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            if self.cursor == self.loss_at {
+                self.cursor += self.lost;
+                *self.pending_missing.get_or_insert(0) += self.lost as u64;
+            }
+            if self.gap_armed && self.cursor == self.gap_at {
+                self.gap_armed = false;
+                self.pending_gap = Some(self.gap);
+            }
+            let end = if self.cursor < self.loss_at {
+                self.loss_at
+            } else if self.gap_armed && self.cursor < self.gap_at {
+                self.gap_at
+            } else {
+                self.samples.len()
+            };
+            let n = buf.len().min(end - self.cursor);
+            buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
+            self.cursor += n;
+            Ok(n)
+        }
+        fn take_missing_samples(&mut self) -> Option<u64> {
+            self.pending_missing.take()
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            self.pending_gap.take()
+        }
+    }
+
+    /// MAN-305 (PR #357 review): a discontinuity that discards a partial
+    /// calibration fill carrying recorded losses keeps those losses on the
+    /// clock: the discarded span's wall-clock time includes them, so the
+    /// spot lands a gap past the loss-free baseline, not a gap minus the
+    /// losses.
+    #[test]
+    fn calibration_discontinuity_keeps_the_fills_losses_on_the_clock() {
+        let baseline = lossless_baseline_ts();
+        let gap = 192_000u64; // 1 s at 192 kHz
+        let mut spots = Vec::new();
+        listen(
+            Box::new(LossThenGapSource::v1_192k(1.0, 11_900, 1.7, gap)),
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+            |s| spots.push((s.callsign.clone(), s.sample_ts)),
+        )
+        .unwrap();
+        let ts = the_one_w1aw(&spots);
+        assert!(
+            ts.abs_diff(baseline + gap) <= CLOCK_TOLERANCE,
+            "spot sample_ts {ts} is {} from the expected {} (baseline {baseline} + gap {gap})",
+            ts as i64 - (baseline + gap) as i64,
+            baseline + gap
+        );
+    }
+
+    /// MAN-305 (PR #357 review): the multi-input front end keeps the same
+    /// clock accounting when its calibration fill is discarded.
+    #[test]
+    fn multi_input_calibration_discontinuity_keeps_the_fills_losses_on_the_clock() {
+        let baseline = the_one_w1aw(&lossy_spots_multi(LossySource::v1_192k(&[], true)));
+        let gap = 192_000u64; // 1 s at 192 kHz
+        let mut src = Some(LossThenGapSource::v1_192k(1.0, 11_900, 1.7, gap));
+        let opened = crate::multi::open_inputs(
+            vec![crate::multi::InputSpec {
+                name: "a".into(),
+                open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
+                freq_correction_ppm: 0.0,
+                observers: Default::default(),
+                spawn_band_hz: None,
+            }],
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut spots = Vec::new();
+        crate::multi::listen_inputs(
+            opened,
+            &PipelineConfig::default(),
+            crate::multi::SessionClock::Replay,
+            crate::multi::SharedObservers::default(),
+            |_| {},
+            |s| spots.push((s.callsign.clone(), s.sample_ts)),
+            |_, _| {},
+            |_| {},
+        )
+        .unwrap();
+        let ts = the_one_w1aw(&spots);
+        assert!(
+            ts.abs_diff(baseline + gap) <= CLOCK_TOLERANCE,
+            "spot sample_ts {ts} is {} from the expected {} (baseline {baseline} + gap {gap})",
+            ts as i64 - (baseline + gap) as i64,
+            baseline + gap
+        );
     }
 
     /// MAN-73: a discontinuity reported mid-stream closes the current

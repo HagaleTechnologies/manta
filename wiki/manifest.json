@@ -66,7 +66,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:e3b1fb325833b66b57b7a4d0d3ad27a96fb653e74876b2c9af38914e24772901",
+      "hash": "sha256:38b9d762bee6eacbf2208ba206954b674e3a3725cdee6c0666d7fba84b97b6da",
       "id": "detector-tracks",
       "kind": "subsystem",
       "links": [
@@ -293,7 +293,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:07e3ff49bc362e6abe31f465492ef507ed13e471be9d6d82e5915658ca3426f6",
+      "hash": "sha256:98ad81e0b364655b1039dfd6a9d62e0aacd185dfa3f31ee83c1f8a800fa937be",
       "id": "spot-output-contract",
       "kind": "interface",
       "links": [

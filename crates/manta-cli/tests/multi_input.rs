@@ -5,9 +5,12 @@
 
 use manta_testkit::scene::{render_scene, SignalSpec};
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 /// `manta` with no `MANTA_*` variable from the test runner's environment.
 fn manta() -> Command {
@@ -239,9 +242,146 @@ fn single_input_banner_and_metrics_labels_are_unchanged() {
         "{stderr}"
     );
     assert!(
-        !stderr.contains("inputs="),
+        !stderr.contains("inputs=") && !stderr.contains("hearing="),
         "a one-input run must not grow the multi-input fields: {stderr}"
     );
+}
+
+/// `N` distinct ports nothing listens on right now, every listener held
+/// until all are read (MAN-371).
+fn free_ports<const N: usize>() -> [u16; N] {
+    let held: [TcpListener; N] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
+    held.map(|l| l.local_addr().unwrap().port())
+}
+
+/// `GET /metrics` over a raw TCP connection; the body, or `None` while the
+/// listener is not up (or already gone).
+fn scrape_metrics(port: u16) -> Option<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .ok()?;
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).ok()?;
+    resp.split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+}
+
+/// The value of the sample line `family{source="<source>"}`, if rendered.
+fn input_sample(body: &str, family: &str, source: &str) -> Option<u64> {
+    let prefix = format!("{family}{{source=\"{source}\"}} ");
+    body.lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+const HEARING_FAMILIES: [&str; 4] = [
+    "manta_input_spots_total",
+    "manta_input_distinct_calls_total",
+    "manta_input_cross_input_dupes_total",
+    "manta_input_silent",
+];
+
+/// MAN-14 scenario 1 end to end: a two-input daemon publishes each
+/// input's hearing on `/metrics`, labelled by `[[input]].name`, from its
+/// first scrape, and its status line carries the same counts. A file run
+/// ends with its files (the multi-input daemon has no `--loop`), so the
+/// test scrapes while it decodes and checks what every scrape must show;
+/// the exact attribution is pinned by the unit tests beside each counter.
+#[test]
+fn multi_input_daemon_publishes_each_inputs_hearing() {
+    let (dir, a, b) = fixtures();
+    let [telnet_port, json_port, metrics_port] = free_ports();
+    let config = write_config(
+        dir.path(),
+        "hearing.toml",
+        &format!(
+            "[server]\nstation_callsign = \"K5TR\"\nbind_addr = \"127.0.0.1\"\n\
+             metrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {telnet_port}\n\
+             json_port = {json_port}\nmetrics_port = {metrics_port}\n\
+             status_interval_secs = 1\n\n\
+             [[input]]\nname = \"a\"\ntype = \"file\"\npath = \"{}\"\niq = true\n\n\
+             [[input]]\nname = \"b\"\ntype = \"file\"\npath = \"{}\"\niq = true\n",
+            toml_path(a),
+            toml_path(b)
+        ),
+    );
+    let logs = tempfile::tempdir().unwrap();
+    let stdout_path = logs.path().join("stdout");
+    let stderr_path = logs.path().join("stderr");
+    let mut child = manta()
+        .args(["run", "--config"])
+        .arg(&config)
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::from(std::fs::File::create(&stdout_path).unwrap()))
+        .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut scrapes = Vec::new();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("manta run did not finish within 300 s");
+        }
+        if let Some(body) = scrape_metrics(metrics_port) {
+            if body.contains("manta_input_spots_total{") {
+                scrapes.push(body);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+    assert!(status.success(), "{stderr}");
+    let stdout = std::fs::read_to_string(&stdout_path).unwrap();
+    let want: BTreeMap<String, usize> = [("JA1ABC", 1), ("W1AW", 1), ("ZL2XYZ", 1)]
+        .iter()
+        .map(|(c, n)| (c.to_string(), *n))
+        .collect();
+    assert_eq!(spot_calls(&stdout), want, "{stdout}\n{stderr}");
+
+    assert!(
+        !scrapes.is_empty(),
+        "no /metrics scrape during the run: {stderr}"
+    );
+    let mut last = [[0u64; 2]; 4];
+    for body in &scrapes {
+        for (f, family) in HEARING_FAMILIES.iter().enumerate() {
+            for (i, source) in ["a", "b"].iter().enumerate() {
+                let value = input_sample(body, family, source)
+                    .unwrap_or_else(|| panic!("no {family}{{source={source:?}}} row: {body}"));
+                if *family == "manta_input_silent" {
+                    // The 600 s default window never ends in this run.
+                    assert_eq!(value, 0, "{body}");
+                } else {
+                    assert!(
+                        value >= last[f][i],
+                        "{family}{{{source}}} went backwards: {body}"
+                    );
+                }
+                last[f][i] = value;
+            }
+        }
+        // Three stations, one spot each: the inputs' spots never exceed it.
+        assert!(last[0][0] + last[0][1] <= 3, "{body}");
+    }
+    assert!(!stderr.contains("no spots decoded for"), "{stderr}");
+    // The status line names every input's spots/calls/dupes after
+    // `inputs=k/n`, in config order.
+    let status_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("manta status: "))
+        .collect();
+    assert!(!status_lines.is_empty(), "no status line: {stderr}");
+    let hearing = regex::Regex::new(r" inputs=\d/2 hearing=a:\d+/\d+/\d+,b:\d+/\d+/\d+$").unwrap();
+    for line in status_lines {
+        assert!(hearing.is_match(line), "{line}");
+    }
 }
 
 #[test]

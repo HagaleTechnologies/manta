@@ -217,12 +217,12 @@ struct Run {
     ends: Vec<InputEnd>,
 }
 
-fn run_opened(opened: OpenedInputs, clock: SessionClock) -> Run {
+fn run_opened(opened: OpenedInputs, clock: SessionClock, cfg: &PipelineConfig) -> Run {
     let mut spots = Vec::new();
     let mut events = Vec::new();
     let ends = listen_inputs(
         opened,
-        &PipelineConfig::default(),
+        cfg,
         clock,
         SharedObservers::default(),
         |e| events.push(e.clone()),
@@ -240,7 +240,11 @@ fn run_opened(opened: OpenedInputs, clock: SessionClock) -> Run {
 
 fn run(specs: Vec<InputSpec>) -> Run {
     let stop = Arc::new(AtomicBool::new(false));
-    run_opened(open_inputs(specs, stop).unwrap(), SessionClock::Replay)
+    run_opened(
+        open_inputs(specs, stop).unwrap(),
+        SessionClock::Replay,
+        &PipelineConfig::default(),
+    )
 }
 
 fn call_counts(spots: &[Spot]) -> BTreeMap<String, usize> {
@@ -617,7 +621,7 @@ fn stop_ends_every_input() {
     )
     .unwrap();
     stop.store(true, Ordering::Relaxed);
-    let got = run_opened(opened, SessionClock::Replay);
+    let got = run_opened(opened, SessionClock::Replay, &PipelineConfig::default());
     assert_eq!(got.ends.len(), 2);
     assert!(got.ends.iter().all(|e| e.result.is_ok()));
     assert!(got.spots.is_empty());
@@ -903,18 +907,34 @@ fn split_pair(signals: &[(&str, f64)], seed: u64) -> Run {
             .collect();
         render(&stations, 96_000.0, center, 120.0, seed)
     };
-    run(vec![
-        split_spec(
-            "15m-1",
-            &scene(M310_LO_CENTER, seed),
-            (f64::NEG_INFINITY, M310_BOUND_HZ),
-        ),
-        split_spec(
-            "15m-2",
-            &scene(M310_HI_CENTER, seed + 1),
-            (-M310_BOUND_HZ, f64::INFINITY),
-        ),
-    ])
+    // MAN-311: these split fixtures sit at 21 075 kHz (15 m FT8 window) and
+    // 21 080 kHz (15 m JS8 window), and both frequencies are load-bearing
+    // for the split geometry under test, so they opt out of the
+    // digital-window spawn veto; the veto itself is covered by
+    // crates/manta-engine/tests/digital_windows.rs.
+    let mut cfg = PipelineConfig::default();
+    cfg.detector.digital_window_filter = false;
+    let stop = Arc::new(AtomicBool::new(false));
+    run_opened(
+        open_inputs(
+            vec![
+                split_spec(
+                    "15m-1",
+                    &scene(M310_LO_CENTER, seed),
+                    (f64::NEG_INFINITY, M310_BOUND_HZ),
+                ),
+                split_spec(
+                    "15m-2",
+                    &scene(M310_HI_CENTER, seed + 1),
+                    (-M310_BOUND_HZ, f64::INFINITY),
+                ),
+            ],
+            stop,
+        )
+        .unwrap(),
+        SessionClock::Replay,
+        &cfg,
+    )
 }
 
 /// MAN-310 scenario 3: a signal in a split band's overlap is tracked only
