@@ -15,7 +15,8 @@ run bridging ≤ `COMOD_SPEECH_GAP` (2) cold channels — that is
 **speech-shaped** (≥ `COMOD_SPEECH_MIN_HOT` (3) hot channels, aggregate
 envelope carrying ≥ `COMOD_SPEECH_RATIO` (2.2)× more 1–5 Hz than 8–30 Hz
 DFT magnitude) and is **wide** (≥ `COMOD_SPEECH_MIN_WIDTH` (9) channels)
-**or has a speech-shaped sibling within `COMOD_SPEECH_MAX_GAP` (30)**
+**or has a speech-shaped sibling within `COMOD_SPEECH_MAX_GAP` (30)
+with aggregate-envelope Pearson rho ≥ `COMOD_RHO` (0.5)**
 marks `[first−1, last+1]` for `COMOD_HOLD_HOPS` (5 s), exactly as a span.
 `in_speech_band(k)` then gates rules D and D′ alike and the spawn veto,
 spawns only (MAN-314's lesson: a veto closes nothing).
@@ -92,6 +93,32 @@ structure clause, the 2-hot keeps sit at 2), `COMOD_SPEECH_RATIO` 2.2
 — separated by structure, not ratio), `COMOD_SPEECH_MIN_WIDTH` 9
 (voice 10–11; controls ≤ 7), `COMOD_SPEECH_MAX_GAP` 30 (voice 3–15;
 controls ≥ 128).
+
+## PR #374 correction: sibling regions need shared modulation
+
+The original sibling rule accepted proximity alone. Review identified
+that two nearby CW skirts could therefore validate each other even when
+their envelopes were unrelated. The classifier regression
+`narrow_speech_regions_require_shared_modulation` reproduces this with
+two six-channel regions 14 cold channels apart, each above the speech
+ratio threshold, with independent 2 Hz and 3 Hz aggregate envelopes.
+Before the correction, it fails because both regions are marked.
+
+The sibling rule now also requires Pearson rho ≥ the existing
+`COMOD_RHO` (0.5) between the regions' hot-channel sums in the current
+window. Each sum is centred and normalized once, with deterministic
+`f64` accumulation. Constant envelopes contribute no evidence. The
+same test also checks that two narrow regions sharing a 2 Hz envelope
+still mark. This adds band-level evidence, not a per-track taint, and
+does not change the wide-region rule or the five-second hold.
+
+The separate `nearby_loud_cw_decodes_identically_with_the_filter` control
+places +45 dB CW signals 2 kHz apart at 30 and 31 WPM, with different
+texts. That scene passes before and after the correction; the synthetic
+classifier test is the regression that fails before it. Correlation is
+evidence, not proof of source identity: coincidentally correlated CW
+envelopes can still satisfy the threshold. The rule makes no universal
+claim that every independent CW pair is distinguishable.
 
 ## Why per-channel statistics stayed dead
 

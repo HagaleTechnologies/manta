@@ -734,7 +734,7 @@ Constants (compile-time; `COMOD_*` in `manta-dsp::comod`, the rest in
 | `COMOD_SPEECH_MIN_HOT` | 3 | C′: fewest hot channels in a speech-shaped region (kill regions measure 3; every control's ≤ 2) |
 | `COMOD_SPEECH_RATIO` | 2.2 | C′: the region's aggregate-envelope 1–5 Hz DFT magnitude must be ≥ 2.2× its 8–30 Hz magnitude (kills 2.53–3.59; the hardest keep alone reaches 2.92, which is why C′ also needs the structure clauses) |
 | `COMOD_SPEECH_MIN_WIDTH` | 9 | C′: a region this wide (first to last) is a band on its own (voice sub-bands 10–11 wide; controls ≤ 7) |
-| `COMOD_SPEECH_MAX_GAP` | 30 | C′: a narrower speech-shaped region still marks when a sibling speech-shaped region lies this close, edge to edge (voice sub-bands 3–15 apart; controls ≥ 128) |
+| `COMOD_SPEECH_MAX_GAP` | 30 | C′: maximum edge-to-edge gap for a speech-shaped sibling; their aggregate envelopes must also have Pearson rho ≥ `COMOD_RHO` |
 | `MAX_MARK_HOPS` | 1125 | longest ACTIVE run (3 s) that still counts as a keying cycle |
 | `QUALIFY_MIN_ACTIVE_HOPS` | 8 | ACTIVE hops needed since the previous evaluation |
 | `SLOPE_MIN_SAMPLES` | 20 | key-down hops needed for the slope |
@@ -831,12 +831,14 @@ in range):
    (CW keying: 8 elements/s at 20 WPM to ~30 Hz at 35 WPM).
 3. **A speech band** is a speech-shaped region at least
    `COMOD_SPEECH_MIN_WIDTH` channels wide, or with another
-   speech-shaped region within `COMOD_SPEECH_MAX_GAP` edge to edge: a
-   voice band is a wide structure (its strong lower harmonics and upper
-   harmonic run, split by the formant gap), while a real CW's own
-   carrier+skirt region can look speech-shaped only in isolation —
-   measured, V8w's pileup coincidences and a +45 dB 30 WPM carrier never
-   satisfy the structure clause.
+   speech-shaped region within `COMOD_SPEECH_MAX_GAP` edge to edge
+   whose aggregate envelope has Pearson rho ≥ `COMOD_RHO` with its own.
+   Correlation uses the current window's hot-channel sums, centred and
+   normalized with index-order `f64` sums. A constant envelope supplies
+   no correlation evidence. The voice's sub-bands can share modulation
+   across a formant gap; two nearby CW skirts can each look
+   speech-shaped, so proximity alone is insufficient. This correlation
+   threshold is evidence of shared modulation, not proof of one source.
 4. Each speech band marks `[first − COMOD_SPAN_GUARD, last +
    COMOD_SPAN_GUARD]` until `hop + COMOD_HOLD_HOPS`. `in_speech_band(k)`
    is true while `k` is marked. Like span marking this is

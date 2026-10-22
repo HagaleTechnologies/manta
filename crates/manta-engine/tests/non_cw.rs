@@ -456,6 +456,17 @@ fn loud_cw_decodes_identically_with_the_filter() {
     }
 }
 
+/// Nearby loud CW carriers must not validate each other's speech-shaped
+/// skirts solely because both regions are inside the sibling distance.
+#[test]
+fn nearby_loud_cw_decodes_identically_with_the_filter() {
+    let mut spec = vectors::vr3();
+    spec.duration_s = 30.0;
+    spec.signals.push(cw(14_340.0, 45.0, 31.0, 5.0));
+    let iq = render_vector(&spec);
+    assert_on_off_equivalent("nearby loud CW", &iq, FS, CENTER);
+}
+
 #[test]
 #[ignore = "heavy: all 20 golden vectors at full length"]
 fn all_golden_vectors_decode_identically_with_the_filter() {

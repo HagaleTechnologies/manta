@@ -11,7 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
-| 2026-10-21 | MAN-372 | [MAN-372: a speech-band marking closes the non-CW filter's residual — zero in-band tracks from SSB voice at +30/+45 dB](2026-10-21-man372-speech-band-veto.md) |
+| 2026-10-21 | MAN-372 | [MAN-372: zero in-band tracks from SSB voice at +30/+45 dB; narrow sibling regions require shared modulation](2026-10-21-man372-speech-band-veto.md) |
 | 2026-10-19 | MAN-334 | [MAN-334: calibrate plans its references before it opens the receiver](2026-10-19-man334-calibrate-plans-before-opening.md) |
 | 2026-10-19 | MAN-319 | [MAN-319: the live uplink needs a 6-character locator now; the registration exchange waits for MAN-90's capture](2026-10-19-man319-uplink-registration-exchange.md) |
 | 2026-10-19 | MAN-291 | [MAN-291: `field-node.py report` fails ledger integrity until a sample follows the window](2026-10-19-man291-post-window-sample.md) |

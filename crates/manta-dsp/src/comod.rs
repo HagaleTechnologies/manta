@@ -92,7 +92,8 @@ pub const COMOD_SPEECH_RATIO: f64 = 2.2;
 /// margin.
 pub const COMOD_SPEECH_MIN_WIDTH: usize = 9;
 /// MAN-372 (SPEC §2.8 E): a narrow speech-shaped region still marks
-/// when another speech-shaped region lies this close (edge to edge) --
+/// when another speech-shaped region lies this close (edge to edge)
+/// and their aggregate envelopes correlate at `COMOD_RHO` or above --
 /// a voice band's sub-bands (its strong lower harmonics and its upper
 /// harmonic run, split by the internal formant gap) sit 3-15 channels
 /// apart. Measured: the closest two speech-shaped regions ever come in
@@ -134,6 +135,8 @@ struct SpeechRegion {
     hot: usize,
     low: f64,
     high: f64,
+    /// Hot-channel sum, centred and normalized for sibling correlation.
+    envelope: Vec<f64>,
 }
 
 /// The classifier. Channel positions are in frequency order internally
@@ -362,12 +365,23 @@ impl CoModDetector {
                         high += mag;
                     }
                 }
+                let mean = env.iter().sum::<f64>() / w as f64;
+                for e in &mut env {
+                    *e -= mean;
+                }
+                let norm = env.iter().map(|e| e * e).sum::<f64>().sqrt();
+                if norm > 0.0 {
+                    for e in &mut env {
+                        *e /= norm;
+                    }
+                }
                 SpeechRegion {
                     first: a,
                     last: b,
                     hot: count,
                     low,
                     high,
+                    envelope: env,
                 }
             })
             .collect()
@@ -588,10 +602,12 @@ impl CoModDetector {
         // carries `COMOD_SPEECH_RATIO` times more 1-5 Hz speech than
         // 8-30 Hz keying magnitude) -- is a speech band when the region
         // is itself wide (`COMOD_SPEECH_MIN_WIDTH`) or a sibling
-        // speech-shaped region sits within `COMOD_SPEECH_MAX_GAP`: a
+        // speech-shaped region sits within `COMOD_SPEECH_MAX_GAP` and
+        // their aggregate envelopes correlate at `COMOD_RHO`: a
         // voice band is a wide structure (its sub-bands split by the
         // internal formant gap), while a real CW's own carrier+skirt
-        // region can look speech-shaped only in isolation. It marks
+        // region can also look speech-shaped. Proximity alone cannot
+        // distinguish two independent CW carriers from voice. It marks
         // `[first - COMOD_SPAN_GUARD, last + COMOD_SPAN_GUARD]` until
         // `hop + COMOD_HOLD_HOPS`, exactly as a span does. Like span
         // marking this is per-evaluation evidence over the current
@@ -613,6 +629,12 @@ impl CoModDetector {
                     && shaped[s]
                     && (o.first > r.last && o.first - r.last - 1 <= COMOD_SPEECH_MAX_GAP
                         || r.first > o.last && r.first - o.last - 1 <= COMOD_SPEECH_MAX_GAP)
+                    && r.envelope
+                        .iter()
+                        .zip(&o.envelope)
+                        .map(|(a, b)| a * b)
+                        .sum::<f64>()
+                        >= COMOD_RHO
             });
             if !wide && !sibling {
                 continue;
@@ -885,6 +907,45 @@ mod tests {
             },
         );
         assert!(evals > 40);
+    }
+
+    /// Two narrow regions with speech-rate envelopes need shared
+    /// modulation before they can count as one speech source.
+    #[test]
+    fn narrow_speech_regions_require_shared_modulation() {
+        for shared in [false, true] {
+            let mut det = CoModDetector::new(N);
+            // Judge one full window, without earlier held markings.
+            det.next_eval = COMOD_WINDOW_HOPS as u64;
+            let mut noise = Rng::new(25);
+            let mut t = 0;
+            drive(
+                &mut det,
+                &mut noise,
+                COMOD_WINDOW_HOPS,
+                |row| {
+                    for (first, hz) in [(100, 2.0), (120, if shared { 2.0 } else { 3.0 })] {
+                        let env = 0.6 + 0.4 * (std::f64::consts::TAU * hz * t as f64 / 375.0).cos();
+                        for (i, level) in [20.0, 30.0, 60.0, 50.0, 30.0, 20.0].iter().enumerate() {
+                            row[first + i] += level * env;
+                        }
+                    }
+                    t += 1;
+                },
+                |d| {
+                    let regions = d.diag_speech_regions();
+                    assert_eq!(regions.len(), 2);
+                    for r in regions {
+                        assert_eq!(r.hot, 6);
+                        assert!(r.ratio() >= COMOD_SPEECH_RATIO);
+                        assert!(r.last_k - r.first_k + 1 < COMOD_SPEECH_MIN_WIDTH);
+                    }
+                    for j in [100, 105, 120, 125] {
+                        assert_eq!(d.in_speech_band(k_of(j)), shared, "shared={shared}, j={j}");
+                    }
+                },
+            );
+        }
     }
 
     /// MAN-372: a loud tone with its click skirt (the +45 dB loud-CW
