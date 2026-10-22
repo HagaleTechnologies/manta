@@ -629,21 +629,17 @@ fn input_summary(file: &crate::config::InputFile) -> String {
             rate_hz,
             receivers,
         }) => {
-<<<<<<< HEAD
-            let declared = receivers.map_or(String::new(), |n| format!(" receivers={n}"));
-            format!("input: type=hpsdr host={host} port={port} freq_hz={freq_hz} rate_hz={rate_hz}{declared}")
-=======
             // MAN-305 §3: the protocol as the operator writes it.
             let protocol = match protocol {
                 manta_input::hpsdr::HpsdrProtocol::Auto => "auto",
                 manta_input::hpsdr::HpsdrProtocol::One => "1",
                 manta_input::hpsdr::HpsdrProtocol::Two => "2",
             };
+            let declared = receivers.map_or(String::new(), |n| format!(" receivers={n}"));
             format!(
                 "input: type=hpsdr host={host} port={port} protocol={protocol} freq_hz={freq_hz} \
-                 rate_hz={rate_hz}"
+                 rate_hz={rate_hz}{declared}"
             )
->>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
         }
         Some(SourceFromFile::Ka9q {
             group,

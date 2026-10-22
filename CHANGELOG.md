@@ -24,13 +24,6 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
-<<<<<<< HEAD
-- MAN-307: live HPSDR queue losses reset only the affected decode segment.
-  Decimation resets its filter and forwards converted gaps, and reconnect
-  wrappers preserve inner gaps, including an EOF with a pending gap. Clean
-  file replay remains unchanged.
-
-=======
 - MAN-108: a fading signal keeps one `track_id` through fades of up to
   15 s instead of respawning a new track each time the 5 s hang ran out.
   A track that has decoded goes DORMANT for `reacquire_ms` (10 s) after
@@ -38,7 +31,10 @@ the git history and `docs/DECISIONS/`.
   decodes is unchanged, its spots carry one id, and the validator's
   per-track state (RST, `QRL?`) survives the fade. A track whose signal
   really ends now closes 15 s after the drop instead of 5 s.
->>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
+- MAN-307: live HPSDR queue losses reset only the affected decode segment.
+  Decimation resets its filter and forwards converted gaps, and reconnect
+  wrappers preserve inner gaps, including an EOF with a pending gap. Clean
+  file replay remains unchanged.
 - MAN-265: a transmission that ends at the speed tracker's warm-up
   boundary (e.g. a beacon ID or a single exchange) now reports its
   gap-corrected WPM. The readiness mark's seed was computed before the
@@ -95,7 +91,6 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
-<<<<<<< HEAD
 - MAN-307: several HPSDR inputs can share one radio, with one independently
   tuned receiver per band, capacity probing for HL2, and an optional
   `receivers` declaration for other gateware. Each radio reconnects as a
@@ -105,8 +100,6 @@ the git history and `docs/DECISIONS/`.
   retirement/timing handles, and `InputHealthCounters::queue_dropped_samples`.
   Exhaustive `manta_server::metrics::InputHealth` literals must initialize the
   new `queue_dropped_samples` field or use `Default`.
-
-=======
 - MAN-305: protocol-2 openHPSDR radios (ANAN-class: Hermes, Angelia,
   Orion, Orion II, Saturn/G2) as inputs, alongside protocol 1 (Hermes-Lite
   2). `--hpsdr-protocol auto|1|2`, `[input] protocol` (`"auto"`, `"1"`,
@@ -134,7 +127,6 @@ the git history and `docs/DECISIONS/`.
 - MAN-108: `[detector] reacquire_ms` (default `10000`), how long after
   `hang_ms` a decoded track keeps its identity waiting for its signal to
   return. `0` restores the previous close at `hang_ms`.
->>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
 - MAN-13: one `manta run` decodes several receivers into one spot output.
   Write `[[input]]` once per receiver (each with a `name`); every input
   decodes on its own thread into one shared validator, so a station two

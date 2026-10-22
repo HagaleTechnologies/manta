@@ -652,6 +652,40 @@ pub(crate) fn prepare(
                 (peer.ip().to_string(), peer.port())
             };
             reopen = true;
+            // MAN-305: a lone input keeps the protocol it configured (and
+            // `auto`'s discovery), exactly as the standalone path opens it.
+            // Several receivers on one radio speak protocol 1 in manta; the
+            // config loader refuses anything else for a shared radio.
+            if allocation.members.len() == 1
+                && allocation.protocol != manta_input::hpsdr::HpsdrProtocol::One
+            {
+                let entered = Instant::now();
+                let opened = manta_input::hpsdr::open_receiver(
+                    &manta_input::HpsdrConfig {
+                        host: host.clone(),
+                        port,
+                        ddc_count: 1,
+                        sample_rate_hz: allocation.rate,
+                        center_freq_hz: allocation.frequencies.clone(),
+                    },
+                    allocation.protocol,
+                )?;
+                crate::log_hpsdr_open_line(&host, port, &opened);
+                // MAN-259: the open call's runtime before the radio started
+                // streaming is outage, not samples.
+                let started_at = entered + opened.source.acquisition_start_offset();
+                let (capture, dial) = transforms[0];
+                let source = crate::transform_source(opened.source, capture, dial)
+                    .context("prepare HPSDR receivers")?;
+                return Ok(Opened {
+                    sources: vec![source],
+                    started_at,
+                    // A protocol-2 radio stops on drop (run 0); a boxed
+                    // protocol-1 receiver detaches its slot, as the
+                    // standalone path's reopen always has.
+                    retire: Box::new(|| {}),
+                });
+            }
             let raw = manta_input::HpsdrDevice::open(manta_input::HpsdrConfig {
                 host,
                 port,

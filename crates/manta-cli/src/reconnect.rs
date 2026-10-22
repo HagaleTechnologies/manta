@@ -567,21 +567,11 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                 return Ok(self.end_during_outage());
             }
             let inner = self.inner.as_mut().expect("checked Some above");
-<<<<<<< HEAD
-            let result = inner.read(buf);
-            let inner_gap = inner.take_discontinuity();
-            match result {
-                Ok(0) => {
-                    if let Some(gap) = inner_gap {
-                        self.discontinuity = Some(self.discontinuity.unwrap_or(0) + gap);
-                    }
-=======
             match inner.read(buf) {
                 Ok(0) => {
                     // An inner end of stream may leave a gap pending too
                     // (MAN-258).
                     self.absorb_inner_gaps();
->>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
                     return Ok(0);
                 }
                 Ok(n) => {
@@ -600,15 +590,9 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                             ));
                         }
                     }
-<<<<<<< HEAD
-                    if let Some(gap) = inner_gap {
-                        self.discontinuity = Some(self.discontinuity.unwrap_or(0) + gap);
-                    }
-=======
                     // After this wrapper's own outage, so an inner report
                     // adds to it rather than being overwritten.
                     self.absorb_inner_gaps();
->>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
                     self.last_ok = self.env.now();
                     self.report_health(true);
                     return Ok(n);
@@ -793,7 +777,6 @@ mod tests {
         vec![Complex32::new(0.0, 0.0); n]
     }
 
-<<<<<<< HEAD
     #[test]
     fn totals_include_exact_queue_losses() {
         let total = add_health(
@@ -857,7 +840,8 @@ mod tests {
         assert_eq!(source.take_discontinuity(), None);
         assert_eq!(source.read(&mut buf(4)).unwrap(), 0);
         assert_eq!(source.take_discontinuity(), Some(5));
-=======
+    }
+
     /// MAN-305: a `ScriptedSource` that, on its read number `i` (0-based),
     /// leaves pending the outage or spliced loss `gaps`/`missing` hold for
     /// `i`, as a numbered-packet source that detected a loss does.
@@ -1001,7 +985,6 @@ mod tests {
             reports,
             vec![(None, None), (Some(11_900), None), (None, None)]
         );
->>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
     }
 
     /// MAN-312: the wrapper reports the wrapped source's passband, not the

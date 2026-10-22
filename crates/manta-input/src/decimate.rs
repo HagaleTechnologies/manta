@@ -30,9 +30,6 @@ pub struct DecimatingSource {
     inner: Box<dyn IqSource + Send>,
     decimator: Decimator,
     fs_out: f64,
-    factor: usize,
-    gap_remainder: u64,
-    discontinuity: Option<u64>,
     /// MAN-196: the decimator's <= 1 dB half-bandwidth, captured at
     /// construction (a constant multiply -- zero per-read cost) so both
     /// `rf_passband_hz` and `trusted_band_hz` derive from one number.
@@ -107,9 +104,6 @@ impl DecimatingSource {
             inner,
             decimator,
             fs_out,
-            factor,
-            gap_remainder: 0,
-            discontinuity: None,
             trusted_half,
             pending: VecDeque::new(),
             raw: vec![Complex32::new(0.0, 0.0); RAW_CHUNK_SAMPLES * factor],
@@ -185,18 +179,6 @@ impl IqSource for DecimatingSource {
         }
         while self.pending.is_empty() {
             let n = self.inner.read(&mut self.raw)?;
-<<<<<<< HEAD
-            if let Some(gap) = self.inner.take_discontinuity() {
-                // pending is empty here: this call never returns samples
-                // from both sides of a discontinuity. Reset filter history
-                // before processing the first samples after the gap.
-                self.decimator = Decimator::new(self.inner.sample_rate(), self.factor)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                let native = gap.saturating_add(self.gap_remainder);
-                self.gap_remainder = native % self.factor as u64;
-                self.discontinuity =
-                    Some(self.discontinuity.unwrap_or(0) + native / self.factor as u64);
-=======
             // MAN-305: the inner reports describe the samples this inner
             // read returned, which `pending` (empty here) will start with,
             // so they reach the caller with the first outer read that
@@ -210,7 +192,6 @@ impl IqSource for DecimatingSource {
                 // An outage is not spliced: no pre-gap sample may leak
                 // into post-gap output through the filter history.
                 self.decimator.reset();
->>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
             }
             if n == 0 {
                 return Ok(0);
@@ -223,10 +204,6 @@ impl IqSource for DecimatingSource {
             *slot = s;
         }
         Ok(n)
-    }
-
-    fn take_discontinuity(&mut self) -> Option<u64> {
-        self.discontinuity.take()
     }
 
     fn confirmed_live_handle(&self) -> Option<Arc<AtomicBool>> {

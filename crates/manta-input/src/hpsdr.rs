@@ -1029,30 +1029,24 @@ impl HpsdrDevice {
         // flip true on pre-configuration data. `send_next_cc_frames`
         // advances by 2 frames per call, so `div_ceil(cc_frame_count, 2)`
         // calls cover every entry at least once per repeat.
-<<<<<<< HEAD
-        let started_at;
-        {
-=======
         // MAN-259: the device streams from the start command on; the
-        // C&C burst before it is still outage.
-        let acquisition_start_offset = {
->>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
+        // C&C burst before it is still outage. `started_at` (MAN-307's
+        // group recovery boundary) and `acquisition_start_offset` mark
+        // the same instant: immediately before the start send.
+        let (acquisition_start_offset, started_at) = {
             let mut guard = inner.lock().unwrap();
             for _ in 0..INITIAL_BURST_REPEATS * cc_frame_count.div_ceil(2) {
                 guard
                     .send_next_cc_frames()
                     .context("send initial HPSDR C&C tuning frames")?;
             }
-<<<<<<< HEAD
-            started_at = Instant::now();
-=======
+            let started_at = Instant::now();
             let acquisition_start_offset = entered.elapsed();
->>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
             guard
                 .socket
                 .send(&build_start_command())
                 .context("send HPSDR start command")?;
-            acquisition_start_offset
+            (acquisition_start_offset, started_at)
         };
 
         Ok((0..cfg.ddc_count)
@@ -1062,7 +1056,6 @@ impl HpsdrDevice {
                 sample_rate_hz: cfg.sample_rate_hz,
                 center_freq_hz: cfg.center_freq_hz[ddc_index],
                 confirmed_live: confirmed_live.clone(),
-<<<<<<< HEAD
                 health_counters: health_counters[ddc_index].clone(),
                 discontinuity: None,
                 session: HpsdrSession {
@@ -1071,10 +1064,7 @@ impl HpsdrDevice {
                     authority: authority.clone(),
                     started_at,
                 },
-=======
-                health_counters: health_counters.clone(),
                 acquisition_start_offset,
->>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
             })
             .collect())
     }
