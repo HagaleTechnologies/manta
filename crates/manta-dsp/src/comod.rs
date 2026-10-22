@@ -1,4 +1,4 @@
-//! Band co-modulation classifier, SPEC §2.8 (MAN-313).
+//! Band co-modulation classifier, SPEC §2.8 (MAN-313, MAN-372).
 //!
 //! Speech (SSB voice) raises many adjacent channels' power together: every
 //! harmonic of the voice follows the same syllable envelope. Independent CW
@@ -10,6 +10,12 @@
 //! `COMOD_RHO`). A wide run of high-count channels that holds several
 //! comparably strong channels is a co-modulated span; the track manager
 //! starts and qualifies no CW track inside it for `COMOD_HOLD_HOPS`.
+//! MAN-372 adds the speech-band marking: a hot region wide enough to be
+//! a band whose aggregate envelope breathes at speech rate (1-5 Hz), not
+//! keying rate (8-30 Hz), is marked the same way — the band-level
+//! evidence that closes the co-modulation span's coverage gaps (a voice
+//! harmonic sitting in the band's internal formant gap correlates with
+//! nothing the span rules see).
 //!
 //! Lags start at 3 so a keyed tone's own key-click splatter (its +/-1 and
 //! +/-2 channels share its edges) never counts. The span's "strong" test
@@ -30,7 +36,12 @@ pub const COMOD_MIN_FILL_HOPS: usize = 188;
 pub const COMOD_HOT_DB: f64 = 6.0;
 /// Channel distances judged for co-modulation, inclusive.
 pub const COMOD_LAG_MIN: usize = 3;
-pub const COMOD_LAG_MAX: usize = 16;
+/// The upper lag bound spans a whole voice band: the testkit voice's
+/// 2.6 kHz harmonic comb is 28 channels wide at 96 kHz, and only
+/// cross-band partners (beyond 16) mark its span from the first
+/// evaluation (MAN-372). Still far above a keyed tone's ±2-channel
+/// click skirt, which the `COMOD_LAG_MIN` floor already excludes.
+pub const COMOD_LAG_MAX: usize = 30;
 /// Pearson rho of two hot channels' per-hop SNR at or above this counts.
 pub const COMOD_RHO: f64 = 0.5;
 /// A channel with at least this many co-modulated partners joins a span.
@@ -48,6 +59,82 @@ const COMOD_SPAN_CONTEXT: usize = 2;
 pub const COMOD_SPAN_GUARD: usize = 1;
 /// A marked span stays marked this many hops (5 s) after its evaluation.
 pub const COMOD_HOLD_HOPS: u64 = 1875;
+/// Hops per second: the channelizer's hop rate (4 x its channel spacing,
+/// 93.75 Hz). Every `COMOD_*` constant above already assumes it.
+pub const COMOD_HOPS_PER_S: f64 = 375.0;
+/// MAN-372 measurement: hot runs this many cold channels apart are one
+/// speech-band region (the span-run tolerance `evaluate` already uses).
+pub const COMOD_SPEECH_GAP: usize = 2;
+/// MAN-372 (SPEC §2.8 E): a speech-band region holds at least this many
+/// hot channels. Measured against the testkit voice (seed 1) at +30 dB:
+/// the tightest kill region -- the surviving track at k 445, qualifying
+/// through D' at hop 1763 -- sits in a 3-hot region (k 445..447, ratio
+/// 2.53), while every real-CW keep's region never exceeds 2 hot
+/// channels (the coexistence CW at k 459 with its skirt; the CW-only
+/// track; every V8w pileup signal). 3 is the only integer between.
+pub const COMOD_SPEECH_MIN_HOT: usize = 3;
+/// MAN-372 (SPEC §2.8 E): a speech band's aggregate envelope must carry
+/// at least this much more 1-5 Hz (speech: phrase pauses, syllables)
+/// than 8-30 Hz (CW keying: 8 elements/s at 20 WPM to ~30 Hz at 35 WPM)
+/// DFT magnitude. Measured (testkit voice, seed 1, +30 dB): the kill
+/// regions' ratios are 2.53 (hop 1763, 3 hot) and 3.59 (hop 713, 11
+/// hot); the binding keep -- a +45 dB CW's own click-skirt region --
+/// measures 1.92 (20 WPM) though a harder one, VR3 at 30 WPM, reaches
+/// 2.92 on its own: the ratio alone does not separate, which is why the
+/// `COMOD_SPEECH_MIN_WIDTH`/`COMOD_SPEECH_MAX_GAP` structure clauses
+/// below exist. 2.2 sits near the measured interval's midpoint.
+pub const COMOD_SPEECH_RATIO: f64 = 2.2;
+/// MAN-372 (SPEC §2.8 E): a speech-shaped region this wide (first to
+/// last, inclusive) is a band on its own. Measured: the voice's
+/// sub-band regions at the kill evaluations are 10-11 channels wide;
+/// every control's speech-shaped region (V8w pileup coincidences, the
+/// VR3 carrier's skirt) stays at most 7 wide. 9 maximizes the measured
+/// margin.
+pub const COMOD_SPEECH_MIN_WIDTH: usize = 9;
+/// MAN-372 (SPEC §2.8 E): a narrow speech-shaped region still marks
+/// when another speech-shaped region lies this close (edge to edge) --
+/// a voice band's sub-bands (its strong lower harmonics and its upper
+/// harmonic run, split by the internal formant gap) sit 3-15 channels
+/// apart. Measured: the closest two speech-shaped regions ever come in
+/// a control scene is 128 channels (V8w). 30 is the module's existing
+/// whole-voice-band scale (`COMOD_LAG_MAX`).
+pub const COMOD_SPEECH_MAX_GAP: usize = 30;
+
+/// MAN-372 diagnostics: one hot region's band-level speech features
+/// (see `CoModDetector::diag_speech_regions`).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DiagSpeechRegion {
+    /// Inclusive FFT-order channel range of the region.
+    pub first_k: usize,
+    pub last_k: usize,
+    /// Hot channels (window mean >= `COMOD_HOT_DB`) inside the range.
+    pub hot: usize,
+    /// Aggregate-envelope DFT magnitude summed over 1-5 Hz (speech:
+    /// phrase pauses and syllables).
+    pub low: f64,
+    /// Aggregate-envelope DFT magnitude summed over 8-30 Hz (CW keying:
+    /// 8 elements/s at 20 WPM up to ~30 Hz at 35 WPM).
+    pub high: f64,
+}
+
+impl DiagSpeechRegion {
+    /// Speech-rate dominance over keying-rate energy: `low / high`.
+    #[doc(hidden)]
+    pub fn ratio(&self) -> f64 {
+        self.low / self.high.max(1e-12)
+    }
+}
+
+/// MAN-372: one hot region's band-level features, in frequency order
+/// (internal; the `#[doc(hidden)]` diagnostics expose FFT order).
+struct SpeechRegion {
+    first: usize,
+    last: usize,
+    hot: usize,
+    low: f64,
+    high: f64,
+}
 
 /// The classifier. Channel positions are in frequency order internally
 /// (`j = (k + n/2) mod n`, `j = n/2` is the centre); the public API takes
@@ -69,6 +156,9 @@ pub struct CoModDetector {
     count: Vec<u16>,
     /// Per frequency-order channel: marked while `hop < span_until`.
     span_until: Vec<u64>,
+    /// MAN-372: per frequency-order channel: marked while
+    /// `hop < speech_until` (a speech band covers it).
+    speech_until: Vec<u64>,
 }
 
 impl CoModDetector {
@@ -85,6 +175,7 @@ impl CoModDetector {
             peak: vec![0.0; n],
             count: vec![0; n],
             span_until: vec![0; n],
+            speech_until: vec![0; n],
         }
     }
 
@@ -117,6 +208,214 @@ impl CoModDetector {
     /// Whether FFT-order channel `k` lies in a marked co-modulated span.
     pub fn in_span(&self, k: usize) -> bool {
         self.span_until[self.j(k)] > self.hop
+    }
+
+    /// MAN-372 (SPEC §2.8 E): whether FFT-order channel `k` lies inside
+    /// a marked speech band -- a hot region wide enough to be a band
+    /// whose aggregate envelope breathes at speech rate, not keying
+    /// rate. Like `in_span`, this is re-judged at every evaluation from
+    /// the current window (never a sticky per-track taint) and held
+    /// `COMOD_HOLD_HOPS`.
+    pub fn in_speech_band(&self, k: usize) -> bool {
+        self.speech_until[self.j(k)] > self.hop
+    }
+
+    /// MAN-372 diagnostics: window mean, peak and partner count of
+    /// FFT-order channel `k` at the latest evaluation.
+    #[doc(hidden)]
+    pub fn diag_channel(&self, k: usize) -> (f64, f64, u16) {
+        let j = self.j(k);
+        (self.mean[j], self.peak[j], self.count[j])
+    }
+
+    /// MAN-372 diagnostics: runs of consecutive hot channels (window mean
+    /// >= `COMOD_HOT_DB`), inclusive FFT-order channel ranges, at the
+    /// latest evaluation.
+    #[doc(hidden)]
+    pub fn diag_hot_runs(&self) -> Vec<(usize, usize)> {
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut hot = (0..self.n)
+            .filter(|&j| self.mean[j] >= COMOD_HOT_DB)
+            .map(|j| self.un_j(j));
+        if let Some(first) = hot.next() {
+            let mut run = (first, first);
+            for k in hot {
+                if k == run.1 + 1 {
+                    run.1 = k;
+                } else {
+                    runs.push(run);
+                    run = (k, k);
+                }
+            }
+            runs.push(run);
+        }
+        runs
+    }
+
+    fn un_j(&self, j: usize) -> usize {
+        (j + self.n / 2) % self.n
+    }
+
+    /// MAN-372 diagnostics: the current evaluation's hot regions with
+    /// their band-level speech features -- maximal runs of hot channels
+    /// bridged across gaps of at most `COMOD_SPEECH_GAP` cold channels,
+    /// each with its hot-channel count and the modulation spectrum of its
+    /// aggregate envelope (the sum of its hot channels' ring rows,
+    /// explicit index-order `f64` DFT, no dependency). Computed from the
+    /// same `mean`/`ring` state `evaluate` holds, so what this reports is
+    /// what `evaluate`'s speech-band marking judged.
+    #[doc(hidden)]
+    pub fn diag_speech_regions(&self) -> Vec<DiagSpeechRegion> {
+        self.speech_regions()
+            .into_iter()
+            .map(|r| DiagSpeechRegion {
+                first_k: self.un_j(r.first),
+                last_k: self.un_j(r.last),
+                hot: r.hot,
+                low: r.low,
+                high: r.high,
+            })
+            .collect()
+    }
+
+    /// MAN-372 diagnostics: currently marked speech bands as inclusive
+    /// frequency-order channel ranges, lowest first (like `spans`).
+    #[doc(hidden)]
+    pub fn diag_speech_bands(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut run: Option<(usize, usize)> = None;
+        for j in 0..self.n {
+            if self.speech_until[j] > self.hop {
+                run = Some(match run {
+                    Some((a, _)) => (a, j),
+                    None => (j, j),
+                });
+            } else if let Some(r) = run.take() {
+                out.push(r);
+            }
+        }
+        if let Some(r) = run {
+            out.push(r);
+        }
+        out
+    }
+
+    /// MAN-372: the current evaluation's hot regions (frequency order),
+    /// maximal runs of hot channels bridged across gaps of at most
+    /// `COMOD_SPEECH_GAP` cold channels, each with its hot-channel count
+    /// and the modulation spectrum of its aggregate envelope (the sum of
+    /// its hot channels' ring rows, explicit index-order `f64` DFT over
+    /// 1-5 Hz and 8-30 Hz at `COMOD_HOPS_PER_S`).
+    fn speech_regions(&self) -> Vec<SpeechRegion> {
+        let n = self.n;
+        let hot: Vec<bool> = (0..n).map(|j| self.mean[j] >= COMOD_HOT_DB).collect();
+        // Maximal hot runs, bridged across <= COMOD_SPEECH_GAP cold
+        // channels (the tolerance `evaluate`'s span runs already use).
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut run: Option<(usize, usize)> = None;
+        for (j, &h) in hot.iter().enumerate() {
+            if !h {
+                continue;
+            }
+            run = Some(match run {
+                Some((a, last)) if j - last <= COMOD_SPEECH_GAP + 1 => (a, j),
+                Some(r) => {
+                    ranges.push(r);
+                    (j, j)
+                }
+                None => (j, j),
+            });
+        }
+        if let Some(r) = run {
+            ranges.push(r);
+        }
+        let w = self.filled;
+        ranges
+            .into_iter()
+            .filter(|&(a, b)| hot[a..=b].iter().filter(|&&h| h).count() >= 2)
+            .map(|(a, b)| {
+                let mut count = 0;
+                let mut env = vec![0.0f64; w];
+                for (j, &h) in hot.iter().enumerate().take(b + 1).skip(a) {
+                    if !h {
+                        continue;
+                    }
+                    count += 1;
+                    for (t, &v) in self.row(j).iter().enumerate() {
+                        env[t] += v as f64;
+                    }
+                }
+                let mut low = 0.0f64;
+                let mut high = 0.0f64;
+                for f in 1u32..=30 {
+                    let mut re = 0.0f64;
+                    let mut im = 0.0f64;
+                    for (t, &e) in env.iter().enumerate() {
+                        let th = std::f64::consts::TAU * f64::from(f) * t as f64 / COMOD_HOPS_PER_S;
+                        re += e * th.cos();
+                        im -= e * th.sin();
+                    }
+                    let mag = (re * re + im * im).sqrt();
+                    if f <= 5 {
+                        low += mag;
+                    } else if f >= 8 {
+                        high += mag;
+                    }
+                }
+                SpeechRegion {
+                    first: a,
+                    last: b,
+                    hot: count,
+                    low,
+                    high,
+                }
+            })
+            .collect()
+    }
+
+    /// MAN-372 diagnostics: the largest Pearson rho between FFT-order
+    /// channel `k`'s window and any hot channel's window at least
+    /// `COMOD_LAG_MIN` channels away, at the latest evaluation.
+    #[doc(hidden)]
+    pub fn diag_best_rho(&self, k: usize) -> f64 {
+        let j = self.j(k);
+        if self.filled < 2 {
+            return 0.0;
+        }
+        let a = self.row(j);
+        let len = a.len() as f64;
+        let ma = a.iter().map(|&v| v as f64).sum::<f64>() / len;
+        let na: f64 = a
+            .iter()
+            .map(|&v| (v as f64 - ma).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        if na <= 0.0 {
+            return 0.0;
+        }
+        let mut best = 0.0f64;
+        for s in 0..self.n {
+            if s.abs_diff(j) < COMOD_LAG_MIN || self.mean[s] < COMOD_HOT_DB {
+                continue;
+            }
+            let b = self.row(s);
+            let mb = b.iter().map(|&v| v as f64).sum::<f64>() / len;
+            let nb: f64 = b
+                .iter()
+                .map(|&v| (v as f64 - mb).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            if nb <= 0.0 {
+                continue;
+            }
+            let dot: f64 = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (*x as f64 - ma) * (*y as f64 - mb))
+                .sum();
+            best = best.max(dot / (na * nb));
+        }
+        best
     }
 
     /// Whether FFT-order channel `k`'s window co-modulates (Pearson rho >=
@@ -280,6 +579,48 @@ impl CoModDetector {
             let a = first.saturating_sub(COMOD_SPAN_GUARD);
             let b = (last + COMOD_SPAN_GUARD).min(n - 1);
             for s in &mut self.span_until[a..=b] {
+                *s = (*s).max(until);
+            }
+        }
+        // MAN-372 (SPEC §2.8 E): speech-band marking. A speech-shaped
+        // hot region -- wide enough to be a band
+        // (`COMOD_SPEECH_MIN_HOT` channels whose aggregate envelope
+        // carries `COMOD_SPEECH_RATIO` times more 1-5 Hz speech than
+        // 8-30 Hz keying magnitude) -- is a speech band when the region
+        // is itself wide (`COMOD_SPEECH_MIN_WIDTH`) or a sibling
+        // speech-shaped region sits within `COMOD_SPEECH_MAX_GAP`: a
+        // voice band is a wide structure (its sub-bands split by the
+        // internal formant gap), while a real CW's own carrier+skirt
+        // region can look speech-shaped only in isolation. It marks
+        // `[first - COMOD_SPAN_GUARD, last + COMOD_SPAN_GUARD]` until
+        // `hop + COMOD_HOLD_HOPS`, exactly as a span does. Like span
+        // marking this is per-evaluation evidence over the current
+        // window, never a per-track taint.
+        let regions = self.speech_regions();
+        let shaped: Vec<bool> = regions
+            .iter()
+            .map(|r| {
+                r.hot >= COMOD_SPEECH_MIN_HOT && r.low >= COMOD_SPEECH_RATIO * r.high.max(1e-12)
+            })
+            .collect();
+        for (i, r) in regions.iter().enumerate() {
+            if !shaped[i] {
+                continue;
+            }
+            let wide = r.last - r.first + 1 >= COMOD_SPEECH_MIN_WIDTH;
+            let sibling = regions.iter().enumerate().any(|(s, o)| {
+                s != i
+                    && shaped[s]
+                    && (o.first > r.last && o.first - r.last - 1 <= COMOD_SPEECH_MAX_GAP
+                        || r.first > o.last && r.first - o.last - 1 <= COMOD_SPEECH_MAX_GAP)
+            });
+            if !wide && !sibling {
+                continue;
+            }
+            let until = self.hop + COMOD_HOLD_HOPS;
+            let a = r.first.saturating_sub(COMOD_SPAN_GUARD);
+            let b = (r.last + COMOD_SPAN_GUARD).min(n - 1);
+            for s in &mut self.speech_until[a..=b] {
                 *s = (*s).max(until);
             }
         }
@@ -451,6 +792,181 @@ mod tests {
         assert!(!det.in_span(k_of(131)));
         assert!(det.count_at(k_of(115)) >= COMOD_COUNT);
         assert_eq!(det.spans(), vec![(99, 130)]);
+    }
+
+    /// MAN-372: 30 adjacent channels sharing one smooth speech-rate
+    /// envelope (a raised cosine at 3 Hz) -- the idealized voice -- are a
+    /// speech band from the first evaluation. (A binary syllable key
+    /// cannot model this: a square wave's odd harmonics land in the
+    /// 8-30 Hz keying band and a half-filled first window holds a single
+    /// step; both measure below `COMOD_SPEECH_RATIO`. The real voice's
+    /// envelope is smooth.)
+    #[test]
+    fn speech_block_marks_a_speech_band() {
+        let mut det = CoModDetector::new(N);
+        let mut noise = Rng::new(21);
+        let mut rng = Rng::new(7 ^ 0xb10c);
+        let levels: Vec<f64> = (0..30).map(|_| 30.0 + 10.0 * rng.unit()).collect();
+        // A smooth pink-weighted random process over 0.5-4.5 Hz at
+        // random phases -- the voice envelope's shape: energy across the
+        // whole speech-rate band, dominant at the slowest rates.
+        let lines: Vec<(f64, f64)> = (1..=9)
+            .map(|i| {
+                let f = i as f64 * 0.5;
+                (f, std::f64::consts::TAU * rng.unit())
+            })
+            .collect();
+        let norm: f64 = lines.iter().map(|(f, _)| 1.0 / f).sum();
+        let mut t = 0u64;
+        let mut evals = 0;
+        drive(
+            &mut det,
+            &mut noise,
+            375 * 3,
+            |row| {
+                let mut env = 0.55;
+                for &(f, ph) in &lines {
+                    env += 0.45
+                        * (1.0 / f)
+                        * (std::f64::consts::TAU * f * t as f64 / 375.0 + ph).cos()
+                        / norm;
+                }
+                for (i, &l) in levels.iter().enumerate() {
+                    row[100 + i] += l * env;
+                }
+                t += 1;
+            },
+            |d| {
+                evals += 1;
+                // A half-filled window truncates the envelope and dips
+                // its ratio below the threshold (the real +30 dB voice
+                // measures 2.28 at the first evaluation but 1.4-1.6 over
+                // the next three); from the first full window (filled ==
+                // COMOD_WINDOW_HOPS, the 4th evaluation of this drive)
+                // the band is marked at every evaluation.
+                if evals < 4 {
+                    return;
+                }
+                for j in 100..=129 {
+                    assert!(d.in_speech_band(k_of(j)), "eval {evals}: j = {j}");
+                }
+                // The marking carries the span guard, so 99 and 130 are
+                // marked too; one channel beyond each edge is not.
+                assert!(d.in_speech_band(k_of(99)));
+                assert!(d.in_speech_band(k_of(130)));
+                assert!(!d.in_speech_band(k_of(98)));
+                assert!(!d.in_speech_band(k_of(131)));
+            },
+        );
+        assert!(evals >= 3);
+        assert_eq!(det.diag_speech_bands(), vec![(99, 130)]);
+    }
+
+    /// MAN-372: twelve independently keyed Morse tones -- the pileup
+    /// shape (V8w's 51 signals all stay decoded with the filter on) --
+    /// never form a speech band, at any evaluation, on any channel.
+    #[test]
+    fn independent_morse_tones_form_no_speech_band() {
+        let mut det = CoModDetector::new(N);
+        let mut noise = Rng::new(22);
+        let mut tones = independent_tones(3);
+        let mut evals = 0;
+        drive(
+            &mut det,
+            &mut noise,
+            375 * 10,
+            |row| tones.iter_mut().for_each(|t| t.add(row)),
+            |d| {
+                evals += 1;
+                for k in 0..N {
+                    assert!(!d.in_speech_band(k), "eval {evals}: k = {k}");
+                }
+                assert!(d.diag_speech_bands().is_empty());
+            },
+        );
+        assert!(evals > 40);
+    }
+
+    /// MAN-372: a loud tone with its click skirt (the +45 dB loud-CW
+    /// gate's shape) forms no speech band: its hot region reaches the
+    /// occupancy floor, so the envelope's modulation spectrum -- keying
+    /// rate, not speech rate -- is what keeps it out.
+    #[test]
+    fn loud_tone_with_click_skirt_forms_no_speech_band() {
+        let j0 = 128;
+        let mut det = CoModDetector::new(N);
+        let mut noise = Rng::new(23);
+        let mut key = Key::new(KeyKind::Morse { dit: 18 }, 8);
+        let mut wide_regions = 0;
+        drive(
+            &mut det,
+            &mut noise,
+            375 * 6,
+            |row| {
+                if key.step() {
+                    row[j0] += 60.0;
+                    for s in [-1i64, 1] {
+                        row[(j0 as i64 + s) as usize] += 53.0;
+                        row[(j0 as i64 + 2 * s) as usize] += 38.0;
+                        for d in 3..=10i64 {
+                            let lvl = 30.0 - (d - 3) as f64 * 30.0 / 7.0;
+                            row[(j0 as i64 + s * d) as usize] += lvl;
+                        }
+                    }
+                }
+            },
+            |d| {
+                for k in 0..N {
+                    assert!(!d.in_speech_band(k), "k = {k}");
+                }
+                assert!(d.diag_speech_bands().is_empty());
+                if d.diag_speech_regions()
+                    .iter()
+                    .any(|r| r.hot >= COMOD_SPEECH_MIN_HOT)
+                {
+                    wide_regions += 1;
+                }
+            },
+        );
+        // The occupancy floor alone would have fired; the ratio did not.
+        assert!(wide_regions > 0);
+    }
+
+    /// MAN-372: a 9-wide hot run under one Morse key -- the weaker-
+    /// neighbour gate's shape, a weak CW swallowed by a louder keyed
+    /// signal's hot run -- forms no speech band.
+    #[test]
+    fn nine_wide_morse_run_forms_no_speech_band() {
+        let first = 120;
+        let mut det = CoModDetector::new(N);
+        let mut noise = Rng::new(24);
+        let mut key = Key::new(KeyKind::Morse { dit: 20 }, 25);
+        let mut wide_regions = 0;
+        drive(
+            &mut det,
+            &mut noise,
+            375 * 6,
+            |row| {
+                if key.step() {
+                    for slot in row.iter_mut().skip(first).take(9) {
+                        *slot += 18.0;
+                    }
+                }
+            },
+            |d| {
+                for k in 0..N {
+                    assert!(!d.in_speech_band(k), "k = {k}");
+                }
+                assert!(d.diag_speech_bands().is_empty());
+                if d.diag_speech_regions()
+                    .iter()
+                    .any(|r| r.hot >= COMOD_SPEECH_MIN_HOT)
+                {
+                    wide_regions += 1;
+                }
+            },
+        );
+        assert!(wide_regions > 0);
     }
 
     /// Twelve Morse tones, three to six channels apart, each keyed
@@ -677,13 +1193,24 @@ mod tests {
                     block.add(row);
                     tones.iter_mut().for_each(|t| t.add(row));
                 },
-                |d| log.push((d.count.clone(), d.spans())),
+                |d| {
+                    log.push((
+                        d.count.clone(),
+                        d.spans(),
+                        d.diag_speech_regions(),
+                        d.diag_speech_bands(),
+                    ))
+                },
             );
             log
         };
         let a = run();
         assert!(!a.is_empty());
-        assert!(a.iter().any(|(_, s)| !s.is_empty()));
+        assert!(a.iter().any(|(_, s, _, _)| !s.is_empty()));
+        // MAN-372: the block's hot regions are logged with their
+        // features, and the whole log -- speech regions and bands
+        // included -- is identical across runs.
+        assert!(a.iter().any(|(_, _, r, _)| !r.is_empty()));
         assert_eq!(a, run());
     }
 }
