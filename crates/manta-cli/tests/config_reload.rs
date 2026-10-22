@@ -254,7 +254,10 @@ fn an_invalid_reload_is_logged_and_the_previous_lists_stay() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("manta.toml");
     let blocklist = dir.path().join("bl.txt");
-    std::fs::write(&config, server_toml("", &uplink_toml(uplink_port, true))).unwrap();
+    // MAN-319: going live needs the 6-character grid in effect since
+    // startup (`[server]` is restart-only), so the daemon starts with it.
+    let grid = "operator_grid = \"FN03ab\"";
+    std::fs::write(&config, server_toml(grid, &uplink_toml(uplink_port, true))).unwrap();
     std::fs::write(&blocklist, "W1AW\n").unwrap();
     let mut daemon = Daemon::start(dir.path());
 
@@ -286,16 +289,8 @@ fn an_invalid_reload_is_logged_and_the_previous_lists_stay() {
     daemon.assert_no_w1aw_spot_for(Duration::from_millis(1500));
 
     // Positive control: a valid reload after the rejections still applies,
-    // lists and dry_run alike. MAN-319: going live needs the 6-character
-    // grid, so the flipped config carries one.
-    std::fs::write(
-        &config,
-        server_toml(
-            "operator_grid = \"FN03ab\"",
-            &uplink_toml(uplink_port, false),
-        ),
-    )
-    .unwrap();
+    // lists and dry_run alike.
+    std::fs::write(&config, server_toml(grid, &uplink_toml(uplink_port, false))).unwrap();
     std::fs::write(&blocklist, "K1BAD\n").unwrap();
     daemon.signal(libc::SIGHUP);
     expect_line(
@@ -320,8 +315,9 @@ fn an_invalid_reload_is_logged_and_the_previous_lists_stay() {
 }
 
 /// MAN-319: going live over SIGHUP without a 6-character
-/// `[server].operator_grid` is an invalid reload (MAN-78: logged, ignored,
-/// the previous configuration keeps running) -- never a silent go-live.
+/// `[server].operator_grid` in effect since startup is an invalid reload
+/// (MAN-78: logged, ignored, the previous configuration keeps running) --
+/// never a silent go-live.
 #[test]
 fn a_reload_that_goes_live_without_a_grid_is_refused_and_dry_run_stays_on() {
     // A target that refuses connections: the uplink only has to exist for
@@ -347,6 +343,29 @@ fn a_reload_that_goes_live_without_a_grid_is_refused_and_dry_run_stays_on() {
             "reload: rejected; still running the previous configuration",
             "dry_run = false -- sending spots needs [server].operator_grid set to a \
              6-character Maidenhead locator",
+        ],
+        LINE_TIMEOUT,
+    );
+
+    // The same flip adding the grid in that one edit: `[server]` waits for
+    // a restart, so the grid is not in effect and the reload is refused too.
+    std::fs::write(
+        &config,
+        server_toml(
+            "operator_grid = \"FN03ab\"",
+            &uplink_toml(uplink_port, false),
+        ),
+    )
+    .unwrap();
+    daemon.signal(libc::SIGHUP);
+    expect_line(
+        &daemon.stderr,
+        &[
+            "ERROR",
+            "reload: rejected; still running the previous configuration",
+            &format!("target 127.0.0.1:{uplink_port} has dry_run = false"),
+            "started without a 6-character [server].operator_grid",
+            "restart manta to go live",
         ],
         LINE_TIMEOUT,
     );
