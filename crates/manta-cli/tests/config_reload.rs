@@ -254,7 +254,10 @@ fn an_invalid_reload_is_logged_and_the_previous_lists_stay() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("manta.toml");
     let blocklist = dir.path().join("bl.txt");
-    std::fs::write(&config, server_toml("", &uplink_toml(uplink_port, true))).unwrap();
+    // MAN-319: going live needs the 6-character grid in effect since
+    // startup (`[server]` is restart-only), so the daemon starts with it.
+    let grid = "operator_grid = \"FN03ab\"";
+    std::fs::write(&config, server_toml(grid, &uplink_toml(uplink_port, true))).unwrap();
     std::fs::write(&blocklist, "W1AW\n").unwrap();
     let mut daemon = Daemon::start(dir.path());
 
@@ -287,7 +290,7 @@ fn an_invalid_reload_is_logged_and_the_previous_lists_stay() {
 
     // Positive control: a valid reload after the rejections still applies,
     // lists and dry_run alike.
-    std::fs::write(&config, server_toml("", &uplink_toml(uplink_port, false))).unwrap();
+    std::fs::write(&config, server_toml(grid, &uplink_toml(uplink_port, false))).unwrap();
     std::fs::write(&blocklist, "K1BAD\n").unwrap();
     daemon.signal(libc::SIGHUP);
     expect_line(
@@ -308,6 +311,80 @@ fn an_invalid_reload_is_logged_and_the_previous_lists_stay() {
     );
     expect_line(&daemon.telnet_lines, &["DX de", "W1AW"], LINE_TIMEOUT);
 
+    daemon.stop();
+}
+
+/// MAN-319: going live over SIGHUP without a 6-character
+/// `[server].operator_grid` in effect since startup is an invalid reload
+/// (MAN-78: logged, ignored, the previous configuration keeps running) --
+/// never a silent go-live.
+#[test]
+fn a_reload_that_goes_live_without_a_grid_is_refused_and_dry_run_stays_on() {
+    // A target that refuses connections: the uplink only has to exist for
+    // its `dry_run` flag to be reloaded.
+    let uplink_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("manta.toml");
+    let blocklist = dir.path().join("bl.txt");
+    std::fs::write(&config, server_toml("", &uplink_toml(uplink_port, true))).unwrap();
+    std::fs::write(&blocklist, "W1AW\n").unwrap();
+    let mut daemon = Daemon::start(dir.path());
+
+    // The live flip with no grid anywhere: rejected.
+    std::fs::write(&config, server_toml("", &uplink_toml(uplink_port, false))).unwrap();
+    daemon.signal(libc::SIGHUP);
+    expect_line(
+        &daemon.stderr,
+        &[
+            "ERROR",
+            "reload: rejected; still running the previous configuration",
+            "dry_run = false -- sending spots needs [server].operator_grid set to a \
+             6-character Maidenhead locator",
+        ],
+        LINE_TIMEOUT,
+    );
+
+    // The same flip adding the grid in that one edit: `[server]` waits for
+    // a restart, so the grid is not in effect and the reload is refused too.
+    std::fs::write(
+        &config,
+        server_toml(
+            "operator_grid = \"FN03ab\"",
+            &uplink_toml(uplink_port, false),
+        ),
+    )
+    .unwrap();
+    daemon.signal(libc::SIGHUP);
+    expect_line(
+        &daemon.stderr,
+        &[
+            "ERROR",
+            "reload: rejected; still running the previous configuration",
+            &format!("target 127.0.0.1:{uplink_port} has dry_run = false"),
+            "started without a 6-character [server].operator_grid",
+            "restart manta to go live",
+        ],
+        LINE_TIMEOUT,
+    );
+
+    // Dry-run stays on: no "transmitting real spots" WARN may follow.
+    let warn_deadline = Instant::now() + Duration::from_millis(1500);
+    while let Some(left) = warn_deadline.checked_duration_since(Instant::now()) {
+        match daemon.stderr.recv_timeout(left) {
+            Ok(line) => assert!(
+                !line.contains("transmitting real spots"),
+                "the refused reload still went live: {line:?}"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the daemon exited after the refused reload")
+            }
+        }
+    }
+    daemon.assert_still_running("after the refused live flip");
     daemon.stop();
 }
 
