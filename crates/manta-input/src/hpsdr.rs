@@ -966,6 +966,19 @@ pub fn open_receiver(cfg: &HpsdrConfig, protocol: HpsdrProtocol) -> Result<Opene
     open_receiver_with(cfg, protocol, &discovery::ProbeTiming::default())
 }
 
+/// The I/O-free check `protocol`'s own open makes first, without opening
+/// anything (MAN-334): [`Protocol2IqSource::open`]'s (D14) for `Two`,
+/// [`HpsdrDevice::open`]'s [`HpsdrConfig::validate`] for `One`. Under
+/// `Auto` [`open_receiver`] picks the protocol by discovery, which is I/O,
+/// so this applies protocol 1's; a protocol-2 radio found by discovery can
+/// still refuse what it accepts.
+pub fn validate_before_open(cfg: &HpsdrConfig, protocol: HpsdrProtocol) -> Result<()> {
+    match protocol {
+        HpsdrProtocol::Two => proto2::validate_protocol2(cfg).map(|_| ()),
+        HpsdrProtocol::Auto | HpsdrProtocol::One => cfg.validate(),
+    }
+}
+
 pub(crate) fn open_receiver_with(
     cfg: &HpsdrConfig,
     protocol: HpsdrProtocol,

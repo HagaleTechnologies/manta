@@ -193,6 +193,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-319: a live `[[rbn_uplink]]` (`dry_run = false`) also needs
+  `[server].operator_grid` set to a 6-character Maidenhead locator (e.g.
+  `"FN03ab"`). `config check`, `run`, `doctor` and a SIGHUP reload refuse a
+  live uplink without one, naming the target and the key to set; dry-run
+  uplinks (the default) are unchanged. A 4-character grid is refused too.
+  `[server]` needs a restart, so a SIGHUP reload goes live only if the
+  daemon started with the grid. The registration/settings exchange itself
+  stays blocked on MAN-90's Aggregator→RBN capture (claims C8–C11).
 - IQ WAV input streams from disk: `manta decode`'s memory no longer grows
   with the recording's length (a 1 GB recording decodes in under 20 MiB), and
   `run --loop` re-opens a recording without re-reading it. A WAV whose data
@@ -231,6 +239,12 @@ the git history and `docs/DECISIONS/`.
   longer force-decodes the open tracks' last element or judges their
   pending beacons as if the signal had ended; they close as an outage
   (MAN-258).
+- `manta calibrate --write` no longer fails on every run with
+  `creating temp file …: File exists` after a save was killed before it
+  finished, as when manta runs as PID 1 in a container (MAN-335). Each save
+  now picks a random temp name and tries another if that one is taken. A
+  killed save's `.<config>.calibrate-*.tmp` file is left in place and is
+  safe to delete.
 
 ## [0.1.0] - 2026-10-11
 
