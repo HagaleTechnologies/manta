@@ -60,6 +60,7 @@ const TARGET_RATE_HZ: usize = 96_000;
 const IQ_LOW_CUT_HZ: i32 = -5_000;
 const IQ_HIGH_CUT_HZ: i32 = 5_000;
 
+<<<<<<< HEAD
 /// MAN-334: the passband `rf_passband_hz` reports, public so `manta
 /// calibrate` can plan its references on a configured KiwiSDR before it
 /// connects. Derived from the `SET mod=iq` cuts, never a separate literal.
@@ -69,6 +70,12 @@ pub const IQ_PASSBAND_HZ: (f64, f64) = (IQ_LOW_CUT_HZ as f64, IQ_HIGH_CUT_HZ as 
 /// it, whatever rate the receiver sends, so it is known before connecting.
 pub const OUTPUT_RATE_HZ: f64 = TARGET_RATE_HZ as f64;
 
+=======
+/// The same passband as Hz from the tuned centre: the width of one KiwiSDR
+/// stream, which MAN-310's band planner splits bands into.
+pub const IQ_PASSBAND_HZ: (f64, f64) = (IQ_LOW_CUT_HZ as f64, IQ_HIGH_CUT_HZ as f64);
+
+>>>>>>> f47bc13cb3ed24cdbae09961bda78f97c6474942
 /// Resampler chunk size (in complex sample-pairs) fed to `rubato::Fft` per
 /// `process_into_buffer` call.
 ///
@@ -162,9 +169,9 @@ const MAX_PLAUSIBLE_SAMPLE_RATE_HZ: usize = TARGET_RATE_HZ;
 /// equivalent async call with `tokio::time::timeout`; there is no Tokio
 /// runtime here, so resolution plus every per-address connect attempt
 /// instead run on a detached thread (see `run_with_overall_timeout`).
-fn resolve_and_connect(host: &str, port: u16) -> Result<TcpStream> {
+fn resolve_and_connect(host: &str, port: u16, center_freq_hz: f64) -> Result<TcpStream> {
     let owned_host = host.to_string();
-    run_with_overall_timeout(host, port, move || {
+    run_with_overall_timeout(host, port, center_freq_hz.to_bits(), move || {
         (owned_host.as_str(), port)
             .to_socket_addrs()
             .map_err(|e| anyhow!("resolve {owned_host}:{port}: {e}"))
@@ -191,10 +198,16 @@ fn resolve_and_connect(host: &str, port: u16) -> Result<TcpStream> {
 /// thread behind on every attempt. With it, at most one worker per target
 /// is ever outstanding -- the same bound `uplink.rs`'s `resolver_slot`
 /// gives its lookups, and keyed per target for the same reason (PR #80
-/// review round 11): one stuck target must not block another.
-static OUTSTANDING_CONNECTS: Mutex<BTreeSet<(String, u16)>> = Mutex::new(BTreeSet::new());
+/// review round 11): one stuck target must not block another. MAN-310: the
+/// key includes the tuned frequency (`f64::to_bits`), so the streams of one
+/// band plan, each a session on the same KiwiSDR at its own centre, open
+/// side by side while each stream's own retries stay bounded.
+static OUTSTANDING_CONNECTS: Mutex<BTreeSet<ConnectKey>> = Mutex::new(BTreeSet::new());
 
-fn outstanding_connects() -> MutexGuard<'static, BTreeSet<(String, u16)>> {
+/// `(host, port, channel)`: the channel is the session's tuned frequency.
+type ConnectKey = (String, u16, u64);
+
+fn outstanding_connects() -> MutexGuard<'static, BTreeSet<ConnectKey>> {
     // The set stays consistent even if a holder panicked: every critical
     // section is a single insert or remove.
     OUTSTANDING_CONNECTS
@@ -203,7 +216,7 @@ fn outstanding_connects() -> MutexGuard<'static, BTreeSet<(String, u16)>> {
 }
 
 /// Holds one target's `OUTSTANDING_CONNECTS` entry; removes it on drop.
-struct OutstandingConnect((String, u16));
+struct OutstandingConnect(ConnectKey);
 
 impl Drop for OutstandingConnect {
     fn drop(&mut self) {
@@ -223,9 +236,10 @@ impl Drop for OutstandingConnect {
 fn run_with_overall_timeout<T: Send + 'static>(
     host: &str,
     port: u16,
+    channel: u64,
     attempt: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    let target = (host.to_string(), port);
+    let target = (host.to_string(), port, channel);
     if !outstanding_connects().insert(target.clone()) {
         bail!(
             "TCP connect to {host}:{port} skipped: a previous attempt's DNS resolution or \
@@ -307,7 +321,7 @@ impl KiwiIqSource {
     /// receivers (most public ones).
     pub fn connect(host: &str, port: u16, center_freq_hz: f64, password: &str) -> Result<Self> {
         let entered = Instant::now();
-        let tcp = resolve_and_connect(host, port)?;
+        let tcp = resolve_and_connect(host, port, center_freq_hz)?;
         tcp.set_read_timeout(Some(READ_TIMEOUT))
             .context("set TCP read timeout")?;
 
@@ -812,7 +826,7 @@ mod tests {
         // the per-address loop moves on. The overall window must still be
         // open when the next, reachable address accepts -- a window of one
         // CONNECT_TIMEOUT expired first, so every reconnect failed forever.
-        let outcome = run_with_overall_timeout("kiwi.example", 8073, || {
+        let outcome = run_with_overall_timeout("kiwi.example", 8073, 0, || {
             std::thread::sleep(CONNECT_TIMEOUT + Duration::from_millis(200));
             Ok("second address")
         });
@@ -832,7 +846,7 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let first = std::thread::spawn(move || {
-            run_with_overall_timeout("kiwi.example", 8074, move || {
+            run_with_overall_timeout("kiwi.example", 8074, 0, move || {
                 started_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 Ok("first")
@@ -842,7 +856,7 @@ mod tests {
 
         let ran = Arc::new(AtomicBool::new(false));
         let ran_in_attempt = ran.clone();
-        let err = run_with_overall_timeout("kiwi.example", 8074, move || {
+        let err = run_with_overall_timeout("kiwi.example", 8074, 0, move || {
             ran_in_attempt.store(true, Ordering::SeqCst);
             Ok("second")
         })
@@ -854,15 +868,22 @@ mod tests {
         );
 
         assert_eq!(
-            run_with_overall_timeout("kiwi.example", 8075, || Ok("other target")).unwrap(),
+            run_with_overall_timeout("kiwi.example", 8075, 0, || Ok("other target")).unwrap(),
             "other target",
             "a stuck target must not block a different one"
+        );
+        // MAN-310: another stream of a band plan, on the same receiver at
+        // another frequency, is a different channel.
+        assert_eq!(
+            run_with_overall_timeout("kiwi.example", 8074, 1, || Ok("other channel")).unwrap(),
+            "other channel",
+            "a stuck channel must not block another channel of the same receiver"
         );
 
         release_tx.send(()).unwrap();
         assert_eq!(first.join().unwrap().unwrap(), "first");
         assert_eq!(
-            run_with_overall_timeout("kiwi.example", 8074, || Ok("third")).unwrap(),
+            run_with_overall_timeout("kiwi.example", 8074, 0, || Ok("third")).unwrap(),
             "third",
             "the slot is free again once the earlier worker has finished"
         );

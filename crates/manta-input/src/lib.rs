@@ -185,7 +185,22 @@ pub trait IqSource {
     /// A `read()` that returns 0 may leave a gap pending too (MAN-258): the
     /// stream ended during an outage, and `listen` then closes its tracks
     /// with `finish_for_discontinuity` rather than as an end of signal.
+    /// A short loss the source splices over instead (a few numbered
+    /// packets) is reported through [`IqSource::take_missing_samples`].
+    /// **Wrapper types must forward this**, as they forward
+    /// `health_counters`.
     fn take_discontinuity(&mut self) -> Option<u64> {
+        None
+    }
+
+    /// MAN-305: samples (at `sample_rate()`) lost immediately before the
+    /// samples returned by the most recent `read()`, which the source spliced
+    /// over instead of reporting a discontinuity: a short loss on a numbered
+    /// packet stream. Returns the value once, then `None` until the next loss.
+    /// `manta_engine::listen` advances its sample clock by this many samples
+    /// without closing tracks, so spot timestamps stay wall-clock-true.
+    /// **Wrapper types must forward this**, as they forward `take_discontinuity`.
+    fn take_missing_samples(&mut self) -> Option<u64> {
         None
     }
 
@@ -229,8 +244,9 @@ pub trait IqSource {
     ///
     /// **Wrapper types must forward this**, exactly as `manta-cli`'s
     /// `FixedCenterFreqSource` does -- the default `None` otherwise
-    /// silently swallows the inner source's counters. Not enforceable by
-    /// the type system; see that impl.
+    /// silently swallows the inner source's counters. The same holds for
+    /// both gap hooks, `take_discontinuity` and `take_missing_samples`
+    /// (MAN-305). Not enforceable by the type system; see that impl.
     fn health_counters(&self) -> Option<std::sync::Arc<InputHealthCounters>> {
         None
     }
@@ -880,6 +896,17 @@ mod tests {
         write_f32_wav(&wav, &samples(), 96_000);
         let mut src = WavIqSource::open(&wav).unwrap();
         assert_eq!(src.take_discontinuity(), None);
+    }
+
+    #[test]
+    fn default_take_missing_samples_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("fix.wav");
+        write_f32_wav(&wav, &samples(), 96_000);
+        let mut src = WavIqSource::open(&wav).unwrap();
+        let mut buf = vec![Complex32::new(0.0, 0.0); 300];
+        assert_eq!(src.read(&mut buf).unwrap(), 300);
+        assert_eq!(src.take_missing_samples(), None);
     }
 
     #[test]

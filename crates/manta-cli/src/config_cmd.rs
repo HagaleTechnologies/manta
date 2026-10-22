@@ -432,6 +432,7 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             }
             let optional = [
                 ("status_interval_secs", s.status_interval_secs),
+                ("silent_input_warning_secs", s.silent_input_warning_secs),
                 ("history_minutes", s.history_minutes.map(u64::from)),
                 (
                     "telnet_max_connections_per_ip",
@@ -623,10 +624,20 @@ fn input_summary(file: &crate::config::InputFile) -> String {
         Some(SourceFromFile::Hpsdr {
             host,
             port,
+            protocol,
             freq_hz,
             rate_hz,
         }) => {
-            format!("input: type=hpsdr host={host} port={port} freq_hz={freq_hz} rate_hz={rate_hz}")
+            // MAN-305 §3: the protocol as the operator writes it.
+            let protocol = match protocol {
+                manta_input::hpsdr::HpsdrProtocol::Auto => "auto",
+                manta_input::hpsdr::HpsdrProtocol::One => "1",
+                manta_input::hpsdr::HpsdrProtocol::Two => "2",
+            };
+            format!(
+                "input: type=hpsdr host={host} port={port} protocol={protocol} freq_hz={freq_hz} \
+                 rate_hz={rate_hz}"
+            )
         }
         Some(SourceFromFile::Ka9q {
             group,
@@ -1025,6 +1036,23 @@ mod tests {
     }
 
     #[test]
+    fn config_check_prints_hpsdr_protocol() {
+        let body = "[input]\ntype = \"hpsdr\"\nhost = \"192.0.2.10\"\nport = 1024\n\
+                    freq_hz = 7030000.0\nrate_hz = 192000.0\n";
+        assert_eq!(
+            line(&lines_of(body), "input:"),
+            "input: type=hpsdr host=192.0.2.10 port=1024 protocol=auto freq_hz=7030000 \
+             rate_hz=192000"
+        );
+        let body = body.replace("port = 1024\n", "port = 1024\nprotocol = 2\n");
+        assert_eq!(
+            line(&lines_of(&body), "input:"),
+            "input: type=hpsdr host=192.0.2.10 port=1024 protocol=2 freq_hz=7030000 \
+             rate_hz=192000"
+        );
+    }
+
+    #[test]
     fn config_check_prints_rbn_compare_summary() {
         let lines =
             lines_of("[server]\nstation_callsign = \"W3XYZ-1\"\n[rbn_compare]\nenabled = true\n");
@@ -1144,8 +1172,8 @@ mod tests {
         );
         assert_eq!(
             line(&lines, "input:"),
-            "input: type=hpsdr host=10.0.0.5 port=1024 freq_hz=7000000 rate_hz=192000 \
-             capture_rate_hz=48000 replay_epoch=0"
+            "input: type=hpsdr host=10.0.0.5 port=1024 protocol=auto freq_hz=7000000 \
+             rate_hz=192000 capture_rate_hz=48000 replay_epoch=0"
         );
     }
 
@@ -1752,6 +1780,7 @@ mod tests {
         ("input", "path"),
         ("input", "host"),
         ("input", "freq_hz"),
+        ("input", "bands"),
         ("input", "driver"),
         ("input", "rate_hz"),
         ("input", "gain_db"),
@@ -1775,6 +1804,7 @@ mod tests {
     /// that value changes the typed config (None -> Some) but not behaviour.
     const BUILTIN_EQUIVALENT: &[(&str, &str)] = &[
         ("server", "status_interval_secs"),
+        ("server", "silent_input_warning_secs"),
         ("server", "history_minutes"),
         ("server", "telnet_max_connections_per_ip"),
         ("server", "json_max_connections_per_ip"),
@@ -1863,6 +1893,15 @@ mod tests {
             ),
             ("input", "port" | "password") => {
                 "[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7030000.0\n".to_string()
+            }
+            ("input", "protocol") => {
+                "[input]\ntype = \"hpsdr\"\nhost = \"h\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n"
+                    .to_string()
+            }
+            // MAN-310: a band plan needs a receiver; the range needs a plan.
+            ("input", "bands") => "[input]\ntype = \"kiwi\"\nhost = \"h\"\n".to_string(),
+            ("input", "tuning_range_hz") => {
+                "[input]\ntype = \"kiwi\"\nhost = \"h\"\nbands = [\"40m\"]\n".to_string()
             }
             // Absolute, so both loads resolve it the same from their temp dirs.
             ("input", "iq" | "realtime" | "loop") => {
@@ -1958,6 +1997,10 @@ mod tests {
             status::DEFAULT_STATUS_INTERVAL.as_secs()
         );
         assert_eq!(
+            int("silent_input_warning_secs"),
+            manta_server::config::DEFAULT_SILENT_INPUT_WARNING_SECS
+        );
+        assert_eq!(
             int("history_minutes"),
             u64::from(manta_server::bus::DEFAULT_HISTORY_MINUTES)
         );
@@ -2025,13 +2068,18 @@ mod tests {
             InputKind::Hpsdr,
             InputKind::Ka9q,
         ] {
-            let body = format!(
-                "[input]\ntype = \"{}\"\n{}",
-                kind.name(),
-                uncommented("input", |k| kind.keys().contains(&k))
-            );
-            let l = loaded(&body);
-            assert_eq!(l.input.source.map(|s| s.kind()), Some(kind), "{body}");
+            // MAN-310: `bands` replaces `freq_hz`, so each is tried alone.
+            for skip in ["bands", "freq_hz"] {
+                let body = format!(
+                    "[input]\ntype = \"{}\"\n{}",
+                    kind.name(),
+                    uncommented("input", |k| kind.keys().contains(&k)
+                        && k != skip
+                        && !(skip == "bands" && k == "tuning_range_hz"))
+                );
+                let l = loaded(&body);
+                assert_eq!(l.input.source.map(|s| s.kind()), Some(kind), "{body}");
+            }
         }
         let shared = [
             "freq_correction_ppm",

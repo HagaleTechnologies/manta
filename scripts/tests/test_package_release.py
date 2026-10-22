@@ -39,6 +39,7 @@ KIT = (
     "packaging/launchd/create-service-account.sh",
     "packaging/launchd/rotate-log.sh",
     "docs/RUNBOOKS/network-exposure.md",
+    "docs/CONFIG.md",
     "docs/GUIDES/rbn-node.md",
     "docs/GUIDES/kiwisdr.md",
     "docs/GUIDES/raspberry-pi.md",

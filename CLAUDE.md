@@ -55,6 +55,15 @@ channel (raw power, 3 dB margin): the FIR strips negative-side noise as
 deeply as the image, so the image cleared its floor. See
 docs/DECISIONS/2026-10-16-man273-hilbert-image-guard.md.
 
+MAN-14: with 2+ `[[input]]` entries, /metrics carries per-input
+`manta_input_spots_total`, `manta_input_distinct_calls_total`,
+`manta_input_cross_input_dupes_total` (label = the withheld input) and
+`manta_input_silent`; the status line appends `hearing=name:spots/calls/dupes`
+and /status an `inputs` array. `[server].silent_input_warning_secs` (default
+600, 0 off) warns when one input decodes nothing while another decodes;
+/healthz and the spot wire are unchanged. See
+docs/DECISIONS/2026-10-19-man14-per-receiver-hearing-visibility.md.
+
 ## Documents (read in this order)
 
 - `docs/README.md` (start here, by audience); `README.md` (goals, install)

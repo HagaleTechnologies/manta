@@ -87,6 +87,30 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-305: protocol-2 openHPSDR radios (ANAN-class: Hermes, Angelia,
+  Orion, Orion II, Saturn/G2) as inputs, alongside protocol 1 (Hermes-Lite
+  2). `--hpsdr-protocol auto|1|2`, `[input] protocol` (`"auto"`, `"1"`,
+  `"2"` or the integers 1 and 2) and `MANTA_INPUT_PROTOCOL` choose it; the
+  default `auto` sends one directed discovery probe to the configured host
+  (never a broadcast), uses protocol 2 when the radio answers as protocol 2
+  and protocol 1 otherwise, and prints which on every open. `manta config
+  check` prints `protocol=`. A protocol-2 radio sends IQ from port + 11
+  (1035 by default), so the host firewall must allow inbound UDP from it;
+  see docs/CONFIG.md. Its `manta_input_dropped_packets_total{source="hpsdr"}`
+  counts datagrams proven lost by sequence number.
+- MAN-305: `IqSource::take_missing_samples()`, a defaulted hook through
+  which a source reports samples lost before a read and spliced over.
+  `listen` advances its sample clock by that many samples without closing
+  tracks, so spot timestamps stay true across a short loss. Wrappers must
+  forward it, as they forward `take_discontinuity()`.
+- MAN-310: `[input].bands` (`"all"`, band names or centre frequencies in
+  kHz) plans a receiver's streams from the standard CW segments, 160
+  through 10 m with 60 m and the NCDXF beacons. `tuning_range_hz` drops
+  bands the receiver cannot tune, and a band wider than one stream is
+  split, each stream starting tracks only on its own side of the split.
+  Several KiwiSDR sessions to one receiver now open side by side. See
+  [docs/DECISIONS/2026-10-17-man310-band-plan.md](docs/DECISIONS/2026-10-17-man310-band-plan.md).
+
 - MAN-108: `[detector] reacquire_ms` (default `10000`), how long after
   `hang_ms` a decoded track keeps its identity waiting for its signal to
   return. `0` restores the previous close at `hang_ms`.
@@ -191,6 +215,10 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- `ReconnectingSource`, `DecimatingSource` and `manta doctor`'s
+  `SampleBoundedSource` now forward the inner source's gap reports
+  (`take_discontinuity()` and the new `take_missing_samples()`); they
+  swallowed them, so no live source's gap reached the decoder (MAN-305).
 - MAN-259: after a live source reconnects, `manta run`'s spot timestamps
   are no longer stamped late by the time the receiver spent reopening while
   already streaming. The reported outage now ends where the stream the
