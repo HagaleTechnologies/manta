@@ -85,6 +85,8 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("input", "path"),
     ("input", "host"),
     ("input", "password"),
+    // MAN-305: `MANTA_INPUT_PROTOCOL=2` is the string "2", like the file key.
+    ("input", "protocol"),
     ("input", "driver"),
     ("input", "group"),
     ("input", "interface"),
@@ -295,15 +297,37 @@ impl InputKind {
         match self {
             InputKind::Audio => &["device"],
             InputKind::File => &["path", "iq", "realtime", "loop"],
-            InputKind::Kiwi => &["host", "port", "freq_hz", "password"],
-            InputKind::Soapy => &["driver", "freq_hz", "rate_hz", "gain_db"],
-            InputKind::Hpsdr => &["host", "port", "freq_hz", "rate_hz"],
+            InputKind::Kiwi => &[
+                "host",
+                "port",
+                "freq_hz",
+                "password",
+                "bands",
+                "tuning_range_hz",
+            ],
+            InputKind::Soapy => &[
+                "driver",
+                "freq_hz",
+                "rate_hz",
+                "gain_db",
+                "bands",
+                "tuning_range_hz",
+            ],
+            InputKind::Hpsdr => &[
+                "host",
+                "port",
+                "protocol",
+                "freq_hz",
+                "rate_hz",
+                "bands",
+                "tuning_range_hz",
+            ],
             InputKind::Ka9q => &["group", "port", "ssrc", "interface"],
         }
     }
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InputToml {
     /// MAN-13: the input's name (required with two or more `[[input]]`).
@@ -318,7 +342,13 @@ struct InputToml {
     looped: Option<bool>,
     host: Option<String>,
     port: Option<u16>,
+    protocol: Option<ProtocolValue>,
     freq_hz: Option<f64>,
+    /// MAN-310: `"all"`, band names or centres in kHz, instead of
+    /// `freq_hz`. Typed by hand, so a wrong type gets manta's message.
+    bands: Option<toml::Value>,
+    /// MAN-310: with `bands`, the receiver's tuning range, Hz.
+    tuning_range_hz: Option<Vec<f64>>,
     password: Option<String>,
     driver: Option<String>,
     rate_hz: Option<f64>,
@@ -335,12 +365,48 @@ struct InputToml {
     replay_epoch: Option<i64>,
 }
 
+/// MAN-305: `input.protocol`, written `"auto"`, `"1"`, `"2"` or the
+/// integers 1 and 2; anything else is refused when the input is built.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+enum ProtocolValue {
+    Text(String),
+    Number(i64),
+}
+
+impl ProtocolValue {
+    fn protocol(&self) -> std::result::Result<manta_input::hpsdr::HpsdrProtocol, String> {
+        use manta_input::hpsdr::HpsdrProtocol;
+        match self {
+            ProtocolValue::Text(t) if t == "auto" => Ok(HpsdrProtocol::Auto),
+            ProtocolValue::Text(t) if t == "1" => Ok(HpsdrProtocol::One),
+            ProtocolValue::Text(t) if t == "2" => Ok(HpsdrProtocol::Two),
+            ProtocolValue::Number(1) => Ok(HpsdrProtocol::One),
+            ProtocolValue::Number(2) => Ok(HpsdrProtocol::Two),
+            ProtocolValue::Text(t) => Err(format!(
+                "input.protocol must be \"auto\", \"1\" or \"2\", got {}",
+                crate::fmt::quoted(t)
+            )),
+            ProtocolValue::Number(n) => Err(format!(
+                "input.protocol must be \"auto\", \"1\" or \"2\", got {n}"
+            )),
+        }
+    }
+}
+
 /// MAN-13: one `[[input]]` entry (or the single `[input]` table) and its
 /// name. The single form's name defaults to its type (`audio` untyped).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NamedInput {
     pub name: String,
     pub input: InputFile,
+    /// MAN-310: the config entry this input came from: `None` for the
+    /// single `[input]` table, else the `[[input]]` entry's name. Several
+    /// inputs share it when the entry's `bands` plans several streams.
+    pub entry: Option<String>,
+    /// MAN-310: this stream's share of a split band plan, Hz from its
+    /// centre (`band_plan::PlannedStream::spawn_band_hz`).
+    pub spawn_band_hz: Option<(f64, f64)>,
 }
 
 /// MAN-13: the longest input name.
@@ -390,6 +456,8 @@ pub(crate) enum SourceFromFile {
     Hpsdr {
         host: String,
         port: u16,
+        /// MAN-305 D2: `input.protocol`, `Auto` when absent.
+        protocol: manta_input::hpsdr::HpsdrProtocol,
         freq_hz: f64,
         rate_hz: f64,
     },
@@ -412,6 +480,16 @@ impl SourceFromFile {
             SourceFromFile::Soapy { .. } => InputKind::Soapy,
             SourceFromFile::Hpsdr { .. } => InputKind::Hpsdr,
             SourceFromFile::Ka9q { .. } => InputKind::Ka9q,
+        }
+    }
+
+    /// The tuned centre, for the types that take `freq_hz`.
+    pub(crate) fn freq_hz(&self) -> Option<f64> {
+        match self {
+            SourceFromFile::Kiwi { freq_hz, .. }
+            | SourceFromFile::Soapy { freq_hz, .. }
+            | SourceFromFile::Hpsdr { freq_hz, .. } => Some(*freq_hz),
+            _ => None,
         }
     }
 }
@@ -544,27 +622,41 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         validation_level: spot_toml.validation_level,
     };
     let inputs = match doc.get("input") {
-        Some(toml::Value::Array(entries)) if !entries.is_empty() => {
-            take_input_array(entries, &origin, &|p| resolve_path("input", "path", p))?
-        }
+        Some(toml::Value::Array(entries)) if !entries.is_empty() => take_input_array(
+            entries,
+            &origin,
+            &|p| resolve_path("input", "path", p),
+            &mut notes,
+        )?,
         _ => {
             let input_toml =
                 take_typed::<InputToml>(&doc, "input", &origin, &overlay)?.unwrap_or_default();
-            let name = input_toml.name.clone();
-            let input = validate_input(input_toml, &|p| resolve_path("input", "path", p))
-                .map_err(|e| anyhow!("{origin}: [input]: {e}{}", overlay.suffix("input")))?;
-            let name = match name {
+            let name = match input_toml.name.clone() {
                 Some(name) => {
                     check_input_name(&name).map_err(|e| anyhow!("{origin}: {e}"))?;
                     name
                 }
-                None => input
-                    .source
-                    .as_ref()
-                    .map_or("audio", |s| s.kind().name())
-                    .to_string(),
+                None => input_toml.kind.map_or("audio", InputKind::name).to_string(),
             };
-            vec![NamedInput { name, input }]
+            let (inputs, entry_notes) = take_entry(input_toml, name, None, "[input]", &|p| {
+                resolve_path("input", "path", p)
+            })
+            .map_err(|e| anyhow!("{origin}: [input]: {e}{}", overlay.suffix("input")))?;
+            notes.extend(entry_notes);
+            if inputs.len() > manta_engine::MAX_INPUTS {
+                bail!(
+                    "{origin}: input.bands plans {} for [input] ({}), and manta runs at most {} \
+                     inputs; list fewer bands",
+                    manta_server::band_plan::count_streams(inputs.len()),
+                    plan_list(&inputs),
+                    manta_engine::MAX_INPUTS
+                );
+            }
+            check_stream_names(&inputs, &origin)?;
+            if inputs.len() > 1 {
+                check_input_entries(&inputs, &origin)?;
+            }
+            inputs
         }
     };
     let input = inputs[0].input.clone();
@@ -735,6 +827,16 @@ fn finite_positive(key: &str, v: f64) -> std::result::Result<f64, String> {
     Ok(v)
 }
 
+/// A float as an operator writes it in Hz: integral values keep one
+/// decimal (`30000000.0`, never the bare `30000000`).
+fn float_hz(v: f64) -> String {
+    if v.is_finite() && v == v.trunc() {
+        format!("{v:.1}")
+    } else {
+        format!("{v}")
+    }
+}
+
 /// MAN-140 D16: `input.group` is an IPv4 multicast literal or a host name,
 /// checked without resolving it. `check_group`'s IPv6 message is a full
 /// clause of its own, so it follows a colon; the other reads on from the key.
@@ -791,6 +893,7 @@ fn take_input_array(
     entries: &[toml::Value],
     origin: &str,
     resolve_path: &dyn Fn(PathBuf) -> PathBuf,
+    notes: &mut Vec<String>,
 ) -> Result<Vec<NamedInput>> {
     if entries.len() > manta_engine::MAX_INPUTS {
         bail!(
@@ -823,12 +926,246 @@ fn take_input_array(
                  one names its receiver type"
             );
         }
-        let input = validate_input(t, resolve_path)
-            .map_err(|e| anyhow!("{origin}: [[input]] {quoted}: {e}"))?;
-        inputs.push(NamedInput { name, input });
+        let section = format!("[[input]] {quoted}");
+        let (streams, entry_notes) =
+            take_entry(t, name.clone(), Some(name), &section, resolve_path)
+                .map_err(|e| anyhow!("{origin}: {section}: {e}"))?;
+        notes.extend(entry_notes);
+        inputs.extend(streams);
     }
+    if inputs.len() > manta_engine::MAX_INPUTS {
+        let mut per_entry: Vec<(String, usize)> = Vec::new();
+        for n in &inputs {
+            let entry = n.entry.clone().unwrap_or_default();
+            match per_entry.last_mut() {
+                Some((e, count)) if *e == entry => *count += 1,
+                _ => per_entry.push((entry, 1)),
+            }
+        }
+        bail!(
+            "{origin}: the [[input]] entries plan {} ({}), and manta runs at most {} inputs; \
+             list fewer bands",
+            manta_server::band_plan::count_streams(inputs.len()),
+            per_entry
+                .iter()
+                .map(|(e, n)| format!("{} {n}", crate::fmt::quoted(e)))
+                .collect::<Vec<_>>()
+                .join(", "),
+            manta_engine::MAX_INPUTS
+        );
+    }
+    check_stream_names(&inputs, origin)?;
     check_input_entries(&inputs, origin)?;
     Ok(inputs)
+}
+
+/// MAN-310: one config entry's inputs: the entry itself, or with `bands`
+/// one copy per planned stream (`freq_hz` = the stream's centre), each
+/// checked by `validate_input` like a hand-written entry. Returns the
+/// inputs and the plan's notes, prefixed with `section`.
+fn take_entry(
+    t: InputToml,
+    name: String,
+    entry: Option<String>,
+    section: &str,
+    resolve_path: &dyn Fn(PathBuf) -> PathBuf,
+) -> std::result::Result<(Vec<NamedInput>, Vec<String>), String> {
+    use manta_server::band_plan;
+    check_input_keys(&t)?;
+    let Some(bands) = t.bands.clone() else {
+        if t.tuning_range_hz.is_some() {
+            return Err("input.tuning_range_hz applies only with input.bands".to_string());
+        }
+        let input = validate_input(t, resolve_path)?;
+        let one = NamedInput {
+            name,
+            input,
+            entry,
+            spawn_band_hz: None,
+        };
+        return Ok((vec![one], Vec::new()));
+    };
+    if t.freq_hz.is_some() {
+        return Err(
+            "input.bands and input.freq_hz both set the receiver's centre; keep one".to_string(),
+        );
+    }
+    let range = match t.tuning_range_hz.as_deref() {
+        None => band_plan::DEFAULT_TUNING_RANGE_HZ,
+        Some(&[lo, hi]) if lo.is_finite() && hi.is_finite() && 0.0 <= lo && lo < hi => (lo, hi),
+        Some(v) => {
+            return Err(format!(
+                "input.tuning_range_hz must be [low, high] in Hz with 0 <= low < high, got [{}]",
+                v.iter()
+                    .map(|x| float_hz(*x))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
+    };
+    let texts = band_item_texts(&bands)?;
+    let items = texts
+        .iter()
+        .map(|t| band_plan::parse_item(t))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let kind = t
+        .kind
+        .ok_or_else(|| "input.bands needs input.type (one of kiwi, soapy, hpsdr)".to_string())?;
+    let rate_hz = match kind {
+        InputKind::Kiwi => None,
+        InputKind::Hpsdr => Some(crate::check_hpsdr_rate_hz(
+            "input.rate_hz",
+            t.rate_hz
+                .ok_or("input.rate_hz is required when input.type = \"hpsdr\"")?,
+        )?),
+        _ => Some(finite_positive(
+            "rate_hz",
+            t.rate_hz
+                .ok_or("input.rate_hz is required when input.type = \"soapy\"")?,
+        )?),
+    };
+    let capture_rate_hz = t
+        .capture_rate_hz
+        .map(|v| crate::check_capture_rate_hz("input.capture_rate_hz", v))
+        .transpose()?;
+    let width_hz = crate::band_streams::stream_width_hz(kind, rate_hz, capture_rate_hz);
+    let usable_hz = crate::band_streams::usable_width_hz(width_hz);
+    let plan = band_plan::plan(&items, range, usable_hz)?;
+    let n = plan.streams.len();
+    if n > 1 && matches!(kind, InputKind::Hpsdr | InputKind::Soapy) {
+        let (why, own) = match kind {
+            InputKind::Hpsdr => (
+                "several receivers on one HPSDR radio are not supported yet",
+                "radio",
+            ),
+            _ => ("manta opens one stream from a SoapySDR device", "device"),
+        };
+        return Err(format!(
+            "input.bands plans {} ({}), but {why}; list bands that fit one stream (a {width_hz} \
+             Hz stream skims {} kHz), or give each its own {own}",
+            band_plan::count_streams(n),
+            plan.band_list(),
+            band_plan::exact_khz(usable_hz)
+        ));
+    }
+    // MAN-310 (Codex review, PR #345): one absolute centre override cannot
+    // describe several differently tuned streams.
+    if n > 1 && t.center_freq_hz.is_some() {
+        return Err(format!(
+            "input.bands plans {} ({}), but input.center_freq_hz fixes one centre for all of \
+             them; drop center_freq_hz, or list bands that fit one stream",
+            band_plan::count_streams(n),
+            plan.band_list()
+        ));
+    }
+    let shown = texts
+        .iter()
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut notes = vec![format!(
+        "note: {section}: bands = [{shown}] plans {}",
+        plan.summary()
+    )];
+    notes.extend(
+        plan.notes()
+            .into_iter()
+            .map(|note| format!("note: {section}: {note}")),
+    );
+    let mut inputs = Vec::with_capacity(n);
+    for (i, stream) in plan.streams.iter().enumerate() {
+        let mut copy = t.clone();
+        copy.bands = None;
+        copy.tuning_range_hz = None;
+        copy.freq_hz = Some(stream.centre_hz);
+        // One instant starts every replayed input (MAN-13): the first
+        // stream keeps the entry's replay_epoch.
+        if i > 0 {
+            copy.replay_epoch = None;
+        }
+        let input = validate_input(copy, resolve_path)?;
+        inputs.push(NamedInput {
+            name: match n {
+                1 => name.clone(),
+                _ => format!("{name}-{}", stream.label),
+            },
+            input,
+            entry: entry.clone(),
+            spawn_band_hz: stream.spawn_band_hz,
+        });
+    }
+    Ok((inputs, notes))
+}
+
+/// MAN-310: `input.bands` as item texts: a string, a number (its TOML
+/// text) or a list of them.
+fn band_item_texts(v: &toml::Value) -> std::result::Result<Vec<String>, String> {
+    fn one(v: &toml::Value) -> Option<String> {
+        match v {
+            toml::Value::String(s) => Some(s.clone()),
+            toml::Value::Integer(i) => Some(i.to_string()),
+            toml::Value::Float(f) => Some(f.to_string()),
+            _ => None,
+        }
+    }
+    let wrong = || {
+        format!(
+            "input.bands must be \"all\", a band such as \"40m\", a centre frequency in kHz \
+             such as \"7030\", or a list of them; got {v}"
+        )
+    };
+    match v {
+        toml::Value::Array(items) => items.iter().map(|i| one(i).ok_or_else(wrong)).collect(),
+        v => one(v).map(|t| vec![t]).ok_or_else(wrong),
+    }
+}
+
+/// MAN-310: a split plan's streams, per band, for the input-cap message.
+fn plan_list(inputs: &[NamedInput]) -> String {
+    let mut parts: Vec<(String, usize)> = Vec::new();
+    for n in inputs {
+        let band = n
+            .input
+            .source
+            .as_ref()
+            .and_then(SourceFromFile::freq_hz)
+            .map(manta_server::band::band_for_freq_hz)
+            .unwrap_or("unknown")
+            .to_string();
+        match parts.last_mut() {
+            Some((b, count)) if *b == band => *count += 1,
+            _ => parts.push((band, 1)),
+        }
+    }
+    parts
+        .iter()
+        .map(|(b, n)| match n {
+            1 => b.clone(),
+            n => format!("{b} ({n})"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// MAN-310: a generated stream name must fit the name rules and not repeat
+/// another input's name.
+fn check_stream_names(inputs: &[NamedInput], origin: &str) -> Result<()> {
+    for (i, n) in inputs.iter().enumerate() {
+        let quoted = crate::fmt::quoted(&n.name);
+        if n.name.chars().count() > MAX_INPUT_NAME_CHARS {
+            bail!(
+                "{origin}: the stream name {quoted} is longer than {MAX_INPUT_NAME_CHARS} \
+                 characters; shorten the entry's name"
+            );
+        }
+        if let Some(earlier) = inputs[..i].iter().find(|o| o.name == n.name) {
+            bail!(
+                "{origin}: the stream name {quoted} is already input {}",
+                crate::fmt::quoted(&earlier.name)
+            );
+        }
+    }
+    Ok(())
 }
 
 /// MAN-13: the rules that relate several `[[input]]` entries.
@@ -914,46 +1251,23 @@ fn validate_input(
             .map(|v| crate::check_replay_epoch("input.replay_epoch", v))
             .transpose()?,
     };
-    let set: [(&str, bool); 15] = [
-        ("device", t.device.is_some()),
-        ("path", t.path.is_some()),
-        ("iq", t.iq.is_some()),
-        ("realtime", t.realtime.is_some()),
-        ("loop", t.looped.is_some()),
-        ("host", t.host.is_some()),
-        ("port", t.port.is_some()),
-        ("freq_hz", t.freq_hz.is_some()),
-        ("password", t.password.is_some()),
-        ("driver", t.driver.is_some()),
-        ("rate_hz", t.rate_hz.is_some()),
-        ("gain_db", t.gain_db.is_some()),
-        ("group", t.group.is_some()),
-        ("ssrc", t.ssrc.is_some()),
-        ("interface", t.interface.is_some()),
-    ];
+    check_input_keys(&t)?;
     let Some(kind) = t.kind else {
-        if let Some((key, _)) = set.iter().find(|(_, is_set)| *is_set) {
-            return Err(format!(
-                "input.{key} needs input.type (one of audio, file, kiwi, soapy, hpsdr, ka9q)"
-            ));
-        }
         return Ok(InputFile {
             source: None,
             shared,
         });
     };
     let name = kind.name();
-    for (key, is_set) in set {
-        if is_set && !kind.keys().contains(&key) {
-            return Err(format!(
-                "input.{key} does not apply to input.type = \"{name}\" ({name} takes {})",
-                kind.keys().join(", ")
-            ));
-        }
-    }
     fn req<T>(v: Option<T>, key: &str, name: &str) -> std::result::Result<T, String> {
         v.ok_or_else(|| format!("input.{key} is required when input.type = \"{name}\""))
     }
+    // MAN-310: kiwi, soapy and hpsdr take a centre or a band plan.
+    let req_freq = |v: Option<f64>| -> std::result::Result<f64, String> {
+        v.ok_or_else(|| {
+            format!("input.freq_hz or input.bands is required when input.type = \"{name}\"")
+        })
+    };
     let port = |default: u16| -> std::result::Result<u16, String> {
         match t.port {
             Some(0) => Err("input.port must be between 1 and 65535, got 0".to_string()),
@@ -974,12 +1288,12 @@ fn validate_input(
         InputKind::Kiwi => SourceFromFile::Kiwi {
             port: port(8073)?,
             host: req(t.host.clone(), "host", name)?,
-            freq_hz: finite_positive("freq_hz", req(t.freq_hz, "freq_hz", name)?)?,
+            freq_hz: finite_positive("freq_hz", req_freq(t.freq_hz)?)?,
             password: t.password.clone().unwrap_or_default(),
         },
         InputKind::Soapy => SourceFromFile::Soapy {
             driver: req(t.driver.clone(), "driver", name)?,
-            freq_hz: finite_positive("freq_hz", req(t.freq_hz, "freq_hz", name)?)?,
+            freq_hz: finite_positive("freq_hz", req_freq(t.freq_hz)?)?,
             rate_hz: finite_positive("rate_hz", req(t.rate_hz, "rate_hz", name)?)?,
             gain_db: match t.gain_db {
                 Some(g) if !g.is_finite() => {
@@ -990,8 +1304,14 @@ fn validate_input(
         },
         InputKind::Hpsdr => SourceFromFile::Hpsdr {
             port: port(crate::HPSDR_CONTROL_PORT)?,
+            protocol: t
+                .protocol
+                .as_ref()
+                .map(ProtocolValue::protocol)
+                .transpose()?
+                .unwrap_or_default(),
             host: req(t.host.clone(), "host", name)?,
-            freq_hz: crate::check_hpsdr_freq_hz("input.freq_hz", req(t.freq_hz, "freq_hz", name)?)?,
+            freq_hz: crate::check_hpsdr_freq_hz("input.freq_hz", req_freq(t.freq_hz)?)?,
             rate_hz: crate::check_hpsdr_rate_hz("input.rate_hz", req(t.rate_hz, "rate_hz", name)?)?,
         },
         InputKind::Ka9q => SourceFromFile::Ka9q {
@@ -1009,6 +1329,49 @@ fn validate_input(
         source: Some(source),
         shared,
     })
+}
+
+/// D5: every source key set belongs to `input.type`, and a source key
+/// needs a type.
+fn check_input_keys(t: &InputToml) -> std::result::Result<(), String> {
+    let set: [(&str, bool); 18] = [
+        ("device", t.device.is_some()),
+        ("path", t.path.is_some()),
+        ("iq", t.iq.is_some()),
+        ("realtime", t.realtime.is_some()),
+        ("loop", t.looped.is_some()),
+        ("host", t.host.is_some()),
+        ("port", t.port.is_some()),
+        ("protocol", t.protocol.is_some()),
+        ("freq_hz", t.freq_hz.is_some()),
+        ("password", t.password.is_some()),
+        ("driver", t.driver.is_some()),
+        ("rate_hz", t.rate_hz.is_some()),
+        ("gain_db", t.gain_db.is_some()),
+        ("group", t.group.is_some()),
+        ("ssrc", t.ssrc.is_some()),
+        ("interface", t.interface.is_some()),
+        ("bands", t.bands.is_some()),
+        ("tuning_range_hz", t.tuning_range_hz.is_some()),
+    ];
+    let Some(kind) = t.kind else {
+        if let Some((key, _)) = set.iter().find(|(_, is_set)| *is_set) {
+            return Err(format!(
+                "input.{key} needs input.type (one of audio, file, kiwi, soapy, hpsdr, ka9q)"
+            ));
+        }
+        return Ok(());
+    };
+    let name = kind.name();
+    for (key, is_set) in set {
+        if is_set && !kind.keys().contains(&key) {
+            return Err(format!(
+                "input.{key} does not apply to input.type = \"{name}\" ({name} takes {})",
+                kind.keys().join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// What the environment contributed: per table, the variable names (for
@@ -1224,6 +1587,82 @@ mod tests {
             Ok(_) => panic!("expected an error for {body:?}"),
             Err(e) => format!("{e:#}"),
         }
+    }
+
+    #[test]
+    fn a_multi_stream_plan_refuses_a_fixed_center() {
+        // MAN-310 (Codex review, PR #345): every generated stream would
+        // otherwise report the same overridden centre.
+        let err = err_of(
+            "[input]\ntype = \"kiwi\"\nhost = \"h\"\nbands = [\"60m\"]\n\
+             center_freq_hz = 5357000.0\n",
+        );
+        assert!(
+            err.contains("input.center_freq_hz fixes one centre for all of them"),
+            "{err}"
+        );
+        // One stream keeps the override.
+        let l = load_file(
+            "[input]\ntype = \"kiwi\"\nhost = \"h\"\nbands = [\"7030\"]\n\
+             center_freq_hz = 7030000.0\n",
+        )
+        .unwrap();
+        assert_eq!(l.inputs.len(), 1);
+    }
+
+    #[test]
+    fn a_tiny_soapy_rate_is_refused_without_materializing_the_plan() {
+        let err = err_of("[input]\ntype = \"soapy\"\nrate_hz = 0.001\nbands = \"all\"\n");
+        assert!(err.contains("more than 256 streams"), "{err}");
+    }
+
+    #[test]
+    fn an_expanded_entry_carries_its_entry_and_spawn_band() {
+        let l = load_file("[input]\ntype = \"kiwi\"\nhost = \"h\"\nbands = [\"60m\"]\n").unwrap();
+        let names: Vec<&str> = l.inputs.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["kiwi-60m-1", "kiwi-60m-2"]);
+        assert!(l.inputs.iter().all(|n| n.entry.is_none()));
+        assert_eq!(
+            l.inputs[0].spawn_band_hz,
+            Some((f64::NEG_INFINITY, 3_843.75))
+        );
+        assert_eq!(l.inputs[1].spawn_band_hz, Some((-3_843.75, f64::INFINITY)));
+        assert_eq!(l.input, l.inputs[0].input);
+        assert!(l.notes[0].starts_with("note: [input]: bands = [\"60m\"] plans 2 streams"));
+
+        let l = load_file(
+            "[[input]]\nname = \"hl2\"\ntype = \"hpsdr\"\nhost = \"h\"\nrate_hz = 96000.0\n\
+             bands = \"40m\"\n\n[[input]]\nname = \"k\"\ntype = \"kiwi\"\nhost = \"h\"\n\
+             freq_hz = 7030000.0\n",
+        )
+        .unwrap();
+        assert_eq!(l.inputs[0].name, "hl2");
+        assert_eq!(l.inputs[0].entry.as_deref(), Some("hl2"));
+        assert_eq!(l.inputs[0].spawn_band_hz, None);
+        assert_eq!(
+            l.inputs[0]
+                .input
+                .source
+                .as_ref()
+                .and_then(SourceFromFile::freq_hz),
+            Some(7_020_000.0)
+        );
+        assert_eq!(l.inputs[1].entry.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn each_stream_passes_validate_input() {
+        let with_freq = err_of("[input]\ntype = \"kiwi\"\nhost = \"h\"\nport = 0\nfreq_hz = 7e6\n");
+        let with_bands =
+            err_of("[input]\ntype = \"kiwi\"\nhost = \"h\"\nport = 0\nbands = \"60m\"\n");
+        assert!(
+            with_freq.ends_with("input.port must be between 1 and 65535, got 0"),
+            "{with_freq}"
+        );
+        assert!(
+            with_bands.ends_with("input.port must be between 1 and 65535, got 0"),
+            "{with_bands}"
+        );
     }
 
     fn vars(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
@@ -2057,6 +2496,11 @@ mod tests {
             ),
         ] {
             let err = err_of(&format!("[input]\n{body}"));
+            // MAN-310: kiwi, soapy and hpsdr take freq_hz or bands.
+            let key = match key {
+                "freq_hz" => "freq_hz or input.bands",
+                k => k,
+            };
             assert!(
                 err.contains(&format!(
                     "input.{key} is required when input.type = \"{kind}\""
@@ -2074,6 +2518,96 @@ mod tests {
             err.contains("input.rate_hz must be a finite number of Hz between"),
             "{err}"
         );
+    }
+
+    const HPSDR_BODY: &str =
+        "[input]\ntype = \"hpsdr\"\nhost = \"192.0.2.10\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n";
+
+    fn hpsdr_protocol_of(source: &Option<SourceFromFile>) -> manta_input::hpsdr::HpsdrProtocol {
+        match source {
+            Some(SourceFromFile::Hpsdr { protocol, .. }) => *protocol,
+            other => panic!("expected an hpsdr input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hpsdr_protocol_key_accepts_auto_1_2_strings_and_integers() {
+        use manta_input::hpsdr::HpsdrProtocol;
+        for (value, want) in [
+            ("\"auto\"", HpsdrProtocol::Auto),
+            ("\"1\"", HpsdrProtocol::One),
+            ("\"2\"", HpsdrProtocol::Two),
+            ("1", HpsdrProtocol::One),
+            ("2", HpsdrProtocol::Two),
+        ] {
+            let body = format!("{HPSDR_BODY}protocol = {value}\n");
+            let loaded = load_file(&body).unwrap_or_else(|e| panic!("{value}: {e:#}"));
+            assert_eq!(hpsdr_protocol_of(&loaded.input.source), want, "{value}");
+        }
+    }
+
+    #[test]
+    fn hpsdr_protocol_defaults_to_auto() {
+        let loaded = load_file(HPSDR_BODY).unwrap();
+        assert_eq!(
+            loaded.input.source,
+            Some(SourceFromFile::Hpsdr {
+                host: "192.0.2.10".into(),
+                port: 1024,
+                protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
+                freq_hz: 7_030_000.0,
+                rate_hz: 192_000.0,
+            })
+        );
+    }
+
+    #[test]
+    fn protocol_key_is_refused_for_other_input_types() {
+        let err =
+            err_of("[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7e6\nprotocol = \"2\"\n");
+        assert!(
+            err.contains("input.protocol does not apply to input.type = \"kiwi\""),
+            "{err}"
+        );
+        let err = err_of("[input]\nprotocol = \"2\"\n");
+        assert!(err.contains("input.protocol needs input.type"), "{err}");
+    }
+
+    #[test]
+    fn manta_input_protocol_env_is_read_verbatim() {
+        assert!(STRING_TYPED_ENV_KEYS.contains(&("input", "protocol")));
+        let loaded = load_env(
+            None,
+            &[
+                ("MANTA_INPUT_TYPE", "hpsdr"),
+                ("MANTA_INPUT_HOST", "192.0.2.10"),
+                ("MANTA_INPUT_FREQ_HZ", "7030000"),
+                ("MANTA_INPUT_RATE_HZ", "192000"),
+                ("MANTA_INPUT_PROTOCOL", "2"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            hpsdr_protocol_of(&loaded.input.source),
+            manta_input::hpsdr::HpsdrProtocol::Two
+        );
+    }
+
+    #[test]
+    fn invalid_protocol_value_names_the_choices() {
+        for (value, got) in [
+            ("\"3\"", "got \"3\""),
+            ("3", "got 3"),
+            ("\"two\"", "got \"two\""),
+        ] {
+            let err = err_of(&format!("{HPSDR_BODY}protocol = {value}\n"));
+            assert!(
+                err.contains(&format!(
+                    "input.protocol must be \"auto\", \"1\" or \"2\", {got}"
+                )),
+                "{value}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -2419,7 +2953,7 @@ mod tests {
         assert!(
             err.contains(
                 "input.loop does not apply to input.type = \"kiwi\" (kiwi takes host, port, \
-                 freq_hz, password)"
+                 freq_hz, password, bands, tuning_range_hz)"
             ),
             "{err}"
         );

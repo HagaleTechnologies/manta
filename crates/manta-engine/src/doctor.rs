@@ -321,6 +321,17 @@ impl IqSource for SampleBoundedSource {
         self.inner.trusted_band_hz()
     }
 
+    // MAN-305: forward both gap hooks, as `listen()` reads them. With the
+    // trait defaults `doctor` would splice an outage it was told about and
+    // time spots after a short loss early by the lost samples.
+    fn take_discontinuity(&mut self) -> Option<u64> {
+        self.inner.take_discontinuity()
+    }
+
+    fn take_missing_samples(&mut self) -> Option<u64> {
+        self.inner.take_missing_samples()
+    }
+
     /// MAN-273: forwarded with `trusted_band_hz`.
     fn analytic_guard_hz(&self) -> f64 {
         self.inner.analytic_guard_hz()
@@ -596,6 +607,47 @@ mod tests {
             "the wrapped source's narrowed passband must reach the crash live set and reported \
              channel levels, not the default +/-fs_out/2"
         );
+    }
+
+    /// MAN-305: `SampleBoundedSource` hands the inner source's outage and
+    /// spliced loss to `listen()`, each once.
+    #[test]
+    fn sample_bounded_source_forwards_both_gap_reports() {
+        struct GapReportingSource {
+            gap: Option<u64>,
+            missing: Option<u64>,
+        }
+        impl IqSource for GapReportingSource {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                0.0
+            }
+            fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+                Ok(buf.len())
+            }
+            fn take_discontinuity(&mut self) -> Option<u64> {
+                self.gap.take()
+            }
+            fn take_missing_samples(&mut self) -> Option<u64> {
+                self.missing.take()
+            }
+        }
+        let mut src = SampleBoundedSource {
+            inner: Box::new(GapReportingSource {
+                gap: Some(48_000),
+                missing: Some(11_900),
+            }),
+            max_samples: 1_000,
+            samples_read: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let mut buf = vec![Complex32::new(0.0, 0.0); 100];
+        assert_eq!(src.read(&mut buf).unwrap(), 100);
+        assert_eq!(src.take_discontinuity(), Some(48_000));
+        assert_eq!(src.take_missing_samples(), Some(11_900));
+        assert_eq!(src.take_discontinuity(), None);
+        assert_eq!(src.take_missing_samples(), None);
     }
 
     #[test]
