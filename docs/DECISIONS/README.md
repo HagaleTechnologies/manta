@@ -11,11 +11,8 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
-<<<<<<< HEAD
 | 2026-10-21 | MAN-372 | [MAN-372: a speech-band marking closes the non-CW filter's residual — zero in-band tracks from SSB voice at +30/+45 dB](2026-10-21-man372-speech-band-veto.md) |
-=======
 | 2026-10-19 | MAN-291 | [MAN-291: `field-node.py report` fails ledger integrity until a sample follows the window](2026-10-19-man291-post-window-sample.md) |
->>>>>>> 6e49885e2428bd13990ece9c46768ff7497d7dc8
 | 2026-10-19 | MAN-14 | [MAN-14: each receiver's hearing on /metrics, the status line and /status](2026-10-19-man14-per-receiver-hearing-visibility.md) |
 | 2026-10-19 | MAN-305 | [MAN-305: protocol-2 openHPSDR radios are inputs; the protocol is discovered, and lost datagrams reach the decoder as missing input](2026-10-19-man305-hpsdr-protocol-2-input.md) |
 | 2026-10-18 | MAN-398 | [MAN-398: gap-corroborated recovery from a fragment-seeded speed lock](2026-10-18-man398-gap-corroborated-badlock-recovery.md) |
