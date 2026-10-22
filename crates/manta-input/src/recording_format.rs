@@ -156,16 +156,16 @@ impl RecordingHeader {
             lo.is_finite() && hi.is_finite() && lo < hi && lo >= -half - 1e-6 && hi <= half + 1e-6
         };
         if !band_ok(self.rf_passband_hz) {
+            let [lo, hi] = self.rf_passband_hz;
             bail!(
-                "{}: rf_passband_hz {:?} is not an ordered band inside +/-{half} Hz",
-                meta.display(),
-                self.rf_passband_hz
+                "{}: rf_passband_hz [{lo}, {hi}] is not an ordered band inside +/-{half} Hz",
+                meta.display()
             );
         }
-        if let Some(band) = self.trusted_band_hz {
+        if let Some(band @ [lo, hi]) = self.trusted_band_hz {
             if !band_ok(band) {
                 bail!(
-                    "{}: trusted_band_hz {band:?} is not an ordered band inside +/-{half} Hz",
+                    "{}: trusted_band_hz [{lo}, {hi}] is not an ordered band inside +/-{half} Hz",
                     meta.display()
                 );
             }
