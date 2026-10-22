@@ -1,8 +1,8 @@
-//! MAN-313: SSB voice, wideband data, swept carriers and unkeyed carriers
-//! start no CW track (or close one that stops keying), while CW beside
-//! them, and every golden vector, decodes as before. Scenes come from
-//! `manta_testkit::noncw` at 96 kHz with noise seed 11. Measured counts
-//! print with `--nocapture`.
+//! MAN-313/MAN-372: SSB voice, wideband data, swept carriers and unkeyed
+//! carriers start no CW track (or close one that stops keying), while CW
+//! beside them, and every golden vector, decodes as before. Scenes come
+//! from `manta_testkit::noncw` at 96 kHz with noise seed 11. Measured
+//! counts print with `--nocapture`.
 
 use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_engine::{decode_samples, DecodeReport, PipelineConfig};
@@ -128,13 +128,12 @@ fn add_carrier(iq: &mut [Complex32], offset_hz: f64, snr: f32) {
     }
 }
 
-/// Scenario 1, strict: zero in-band tracks at +30 and +45 dB. Ignored:
-/// with this testkit voice model the co-modulation span (SPEC §2.8) forms
-/// late and covers only the strong lower harmonics, so a residual of
-/// tracks qualifies (measured 7 in band at +30 dB against 81 with the
-/// filter off). See the MAN-313 decision record's known limits.
+/// Scenario 1, strict: zero in-band tracks at +30 and +45 dB. MAN-372's
+/// speech-band veto (SPEC §2.8 E) closes the co-modulation span's
+/// coverage gaps: a voice harmonic sitting in the band's internal
+/// formant gap is marked by the band-level speech detector even when no
+/// span covers its channel.
 #[test]
-#[ignore = "MAN-372: 7 in-band tracks at +30 dB with this voice model; zero is MAN-372's goal"]
 fn ssb_voice_at_14040_starts_no_cw_track() {
     let (lo, hi) = (CENTER + 40_200.0, CENTER + 42_900.0);
     for snr in [30.0, 45.0] {

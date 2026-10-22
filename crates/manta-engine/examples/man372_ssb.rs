@@ -1,9 +1,11 @@
-//! MAN-372 scratch measurement: SSB voice residual tracks under the
-//! non-CW filter, and the CW-next-to-SSB coexistence scene. Scratch tool
-//! for the research phase; not part of the shipped test suite.
+//! MAN-372 measurement harness: SSB voice residual tracks under the
+//! non-CW filter, the CW-next-to-SSB coexistence scene, and the real-CW
+//! control scenes, plus the `measure` mode that produced the MAN-372
+//! decision record's tables. Kept (D7): it renders every scene the
+//! non-CW gates use — the tool for the next non-CW ticket.
 //!
 //! Run with `MANTA_MAN372_DIAG=1` for the per-evaluation qualification
-//! trace on stderr.
+//! trace on stderr; `measure` sets it itself.
 
 use manta_engine::{decode_samples, PipelineConfig};
 use manta_testkit::noise::amplitude_for_snr_2500;
@@ -97,6 +99,74 @@ fn report(name: &str, iq: &[Complex32], cfg: &PipelineConfig) {
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "ssb".into());
     match mode.as_str() {
+        // MAN-372 Phase 1 go/no-go measurement: run the SSB and control
+        // scenes with the per-evaluation band-feature trace on (stderr),
+        // plus each scene's promotions (stdout). `MANTA_MAN372_DIAG` is
+        // read once per process, so it must be set before the first
+        // decode. Scene names select a subset; default is all of them.
+        "measure" => {
+            std::env::set_var("MANTA_MAN372_DIAG", "1");
+            let want: Vec<String> = std::env::args().skip(2).collect();
+            let all = [
+                "ssb30", "ssb45", "coexist", "weakrtty", "loudcw", "cw", "v8w",
+            ];
+            for name in all {
+                if !want.is_empty() && !want.iter().any(|w| w == name) {
+                    continue;
+                }
+                eprintln!("=== scene {name} ===");
+                match name {
+                    "ssb30" => report(
+                        "ssb+30 filter-on",
+                        &ssb_scene(30.0, 40.0),
+                        &PipelineConfig::default(),
+                    ),
+                    "ssb45" => report(
+                        "ssb+45 filter-on",
+                        &ssb_scene(45.0, 40.0),
+                        &PipelineConfig::default(),
+                    ),
+                    "coexist" => {
+                        let mut iq = scene(&[cw(43_000.0, 15.0, 20.0, 5.0)], 40.0);
+                        add_ssb_voice(&mut iq, FS, 40_000.0, 30.0, VOICE_SEED, 0.0);
+                        report("coexist filter-on", &iq, &PipelineConfig::default());
+                    }
+                    "weakrtty" => {
+                        use manta_testkit::fsk::{add_fsk, FskSpec};
+                        let mut iq = scene(&[cw(12_340.0, 10.0, 25.0, 5.0)], 40.0);
+                        add_fsk(
+                            &mut iq,
+                            FS,
+                            &FskSpec {
+                                mark_offset_hz: 12_040.0,
+                                shift_hz: 170.0,
+                                baud: 45.45,
+                                snr_2500_db: 30.0,
+                                text: "CQ TEST DE W1AW W1AW RYRYRY 599 001 ".into(),
+                                start_s: 0.0,
+                                watterson: None,
+                                seed: 3,
+                            },
+                        );
+                        report("weakrtty filter-on", &iq, &PipelineConfig::default());
+                    }
+                    "loudcw" => {
+                        let iq = scene(&[cw(12_340.0, 45.0, 20.0, 1.0)], 30.0);
+                        report("loudcw filter-on", &iq, &PipelineConfig::default());
+                    }
+                    "cw" => {
+                        let iq = scene(&[cw(12_340.0, 20.0, 20.0, 5.0)], 30.0);
+                        report("cw-only filter-on", &iq, &PipelineConfig::default());
+                    }
+                    "v8w" => {
+                        let spec = manta_testkit::vectors::v8w();
+                        let iq = manta_testkit::vectors::render(&spec).unwrap().samples;
+                        report("v8w filter-on", &iq, &PipelineConfig::default());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
         // SSB-only at one or more levels.
         "ssb" => {
             let levels: Vec<f32> = std::env::args()

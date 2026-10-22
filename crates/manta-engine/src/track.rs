@@ -1054,10 +1054,11 @@ impl KeyingEvidence {
     /// MAN-372 diagnostics: gate-by-gate qualification verdicts.
     fn diag_gates(&self, comod: &CoModDetector, k: usize, spacing_hz: f64) -> String {
         format!(
-            "cycles>={} active_se>={} !in_span={} !comod_ws={} n>={} |slope|<={} t_last>={} nf>={:.2}",
+            "cycles>={} active_se>={} !in_span={} !speech={} !comod_ws={} n>={} |slope|<={} t_last>={} nf>={:.2}",
             self.cycles >= 1,
             self.active_hops_since_eval >= QUALIFY_MIN_ACTIVE_HOPS,
             !comod.in_span(k),
+            !comod.in_speech_band(k),
             !comod.comodulated_with_span(k),
             self.n >= SLOPE_MIN_SAMPLES,
             self.slope_hz_s(spacing_hz).abs() <= MAX_SWEEP_HZ_PER_S,
@@ -1072,6 +1073,7 @@ impl KeyingEvidence {
         self.cycles >= 1
             && self.active_hops_since_eval >= QUALIFY_MIN_ACTIVE_HOPS
             && !comod.in_span(k)
+            && !comod.in_speech_band(k)
             && !comod.comodulated_with_span(k)
             && self.n >= SLOPE_MIN_SAMPLES
             && self.slope_hz_s(spacing_hz).abs() <= MAX_SWEEP_HZ_PER_S
@@ -1117,6 +1119,7 @@ impl KeyingEvidence {
             && self.dropped_since_eval
             && self.active_run <= MAX_MARK_HOPS
             && !comod.in_span(k)
+            && !comod.in_speech_band(k)
             && !comod.comodulated_with_span(k)
             && self.n >= SLOPE_MIN_SAMPLES
             && self.slope_hz_s(spacing_hz).abs() <= self.short_slope_tolerance()
@@ -2261,10 +2264,15 @@ impl TrackManager {
         self.rtty_changed_sample_ts = sample_ts;
     }
 
-    /// MAN-313 (SPEC §2.8): may no CW candidate spawn on channel `k`? True
-    /// inside a marked co-modulated (speech) span.
+    /// MAN-313/MAN-372 (SPEC §2.8): may no CW candidate spawn on channel
+    /// `k`? True inside a marked co-modulated (speech) span or a marked
+    /// speech band. Spawns only (MAN-314's lesson): an existing or
+    /// already-qualified track inside a later-marked band keeps its
+    /// decoder until `NotCw`/`Unkeyed` close it.
     fn comod_vetoes_spawn(&self, k: usize) -> bool {
-        self.comod.as_ref().is_some_and(|c| c.in_span(k))
+        self.comod
+            .as_ref()
+            .is_some_and(|c| c.in_span(k) || c.in_speech_band(k))
     }
 
     /// MAN-314 (SPEC §2.6): may no CW candidate spawn on channel `k`? True
@@ -2851,11 +2859,32 @@ impl TrackManager {
                 let n = self.n_channels();
                 let spacing = self.channel_spacing_hz;
                 if man372_diag() {
+                    // MAN-270: no Debug renderings in output paths, even
+                    // env-gated diagnostics.
+                    let ranges = |v: &[(usize, usize)]| {
+                        v.iter()
+                            .map(|(a, b)| format!("[{a}..{b}]"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    };
                     eprintln!(
-                        "[man372] eval hop={} hot_runs={:?} spans={:?}",
+                        "[man372] eval hop={} hot_runs={} spans={}",
                         self.hop_counter,
-                        comod.diag_hot_runs(),
-                        comod.spans()
+                        ranges(&comod.diag_hot_runs()),
+                        ranges(&comod.spans())
+                    );
+                    let regions = comod
+                        .diag_speech_regions()
+                        .iter()
+                        .map(|r| {
+                            format!("[{}..{} h{} r{:.2}]", r.first_k, r.last_k, r.hot, r.ratio())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    eprintln!(
+                        "[man372] eval hop={} speech_regions={regions} speech_bands={}",
+                        self.hop_counter,
+                        ranges(&comod.diag_speech_bands())
                     );
                     if let Ok(band) = std::env::var("MANTA_MAN372_BAND") {
                         let mut it = band.split(':');
@@ -2900,8 +2929,14 @@ impl TrackManager {
                         || ev.qualifies_short(comod, k, spacing, state, marks);
                     if man372_diag() {
                         let (mean, peak, count) = comod.diag_channel(k);
+                        let state_tag = match state {
+                            LifecycleState::Candidate => "C",
+                            LifecycleState::Active => "A",
+                            LifecycleState::Hang => "H",
+                            LifecycleState::Dormant => "D",
+                        };
                         eprintln!(
-                            "[man372]   id={id} k={k} state={state:?} D={} Dp={} | slope={:.1} n={} t_last={} mean={mean:.1} peak={peak:.1} count={count} rho={:.2} marks={marks} qual={qualifies} || {}",
+                            "[man372]   id={id} k={k} state={state_tag} D={} Dp={} | slope={:.1} n={} t_last={} mean={mean:.1} peak={peak:.1} count={count} rho={:.2} marks={marks} qual={qualifies} || {}",
                             ev.qualifies(comod, k, spacing),
                             ev.qualifies_short(comod, k, spacing, state, marks),
                             ev.slope_hz_s(spacing),
