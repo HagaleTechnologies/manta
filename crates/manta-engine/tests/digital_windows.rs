@@ -187,6 +187,7 @@ fn digital_window_each_service_input_uses_its_own_rf_center() {
                     }),
                     freq_correction_ppm: 0.0,
                     observers: Default::default(),
+                    spawn_band_hz: None,
                 }
             })
             .collect();
