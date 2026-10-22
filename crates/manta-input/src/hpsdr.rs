@@ -98,12 +98,12 @@ const IQ_FULL_SCALE: f32 = 8_388_607.0;
 /// UDP read timeout: bounds how long a single socket read blocks, so
 /// `read()` stays responsive to repeated calls rather than hanging forever
 /// on a stalled link. Matches `KiwiIqSource`'s `READ_TIMEOUT` convention.
-const READ_TIMEOUT: Duration = Duration::from_millis(250);
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Bound on consecutive read timeouts before `read()` gives up with a real
 /// `Err` instead of hanging indefinitely. Matches `KiwiIqSource`'s
 /// `MAX_CONSECUTIVE_TIMEOUTS` convention (~10 s at 250 ms/timeout).
-const MAX_CONSECUTIVE_TIMEOUTS: u32 = 40;
+pub(crate) const MAX_CONSECUTIVE_TIMEOUTS: u32 = 40;
 
 /// Bound on consecutive malformed datagrams (PR #75 review, round 1) before
 /// `pump_one_packet` gives up with a real `Err`, the same way
@@ -118,7 +118,7 @@ const MAX_CONSECUTIVE_TIMEOUTS: u32 = 40;
 /// malformed-packet arrival rate is attacker/peer-controlled and
 /// unbounded, unlike a timeout's fixed cadence -- a count bound is what
 /// actually caps worst-case work here.
-const MAX_CONSECUTIVE_MALFORMED: u32 = 10_000;
+pub(crate) const MAX_CONSECUTIVE_MALFORMED: u32 = 10_000;
 
 /// Socket receive buffer size (PR #75 review, round 1): deliberately larger
 /// than [`METIS_PACKET_LEN`], not equal to it. A buffer sized exactly to
@@ -138,7 +138,7 @@ const MAX_CONSECUTIVE_MALFORMED: u32 = 10_000;
 /// of platform -- an oversized datagram is now always visible as
 /// `Ok(n)` with `n != METIS_PACKET_LEN`, handled by the same malformed
 /// path as every other length mismatch.
-const RECV_BUF_LEN: usize = 65536;
+pub(crate) const RECV_BUF_LEN: usize = 65536;
 
 /// How often the start command is re-sent as a keepalive. The spike doc
 /// flags the HL2 skimmer gateware's FPGA watchdog as timing out without
@@ -156,7 +156,7 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 /// calibration buffer to consume real IQ under a stale setting. 2 is the
 /// minimum redundancy that tolerates a single lost packet per setting;
 /// resending an already-applied setting is harmless and idempotent.
-const INITIAL_BURST_REPEATS: usize = 2;
+pub(crate) const INITIAL_BURST_REPEATS: usize = 2;
 
 /// One 100 Mbps Ethernet link's practical DDC budget at 192 kHz: 8 DDCs x
 /// ~9.8 Mbps/DDC on-wire (spike doc "Bandwidth math" — 9.216 Mbps raw + ~6%
@@ -942,6 +942,7 @@ impl HpsdrDevice {
     /// they may be moved to independent threads, matching how
     /// `manta-engine` runs each source. ARCHITECTURE §3.
     pub fn open(cfg: HpsdrConfig) -> Result<Vec<HpsdrIqSource>> {
+        let entered = Instant::now();
         cfg.validate()?;
 
         let socket = UdpSocket::bind("0.0.0.0:0").context("bind HPSDR UDP socket")?;
@@ -1028,20 +1029,31 @@ impl HpsdrDevice {
         // flip true on pre-configuration data. `send_next_cc_frames`
         // advances by 2 frames per call, so `div_ceil(cc_frame_count, 2)`
         // calls cover every entry at least once per repeat.
+<<<<<<< HEAD
         let started_at;
         {
+=======
+        // MAN-259: the device streams from the start command on; the
+        // C&C burst before it is still outage.
+        let acquisition_start_offset = {
+>>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
             let mut guard = inner.lock().unwrap();
             for _ in 0..INITIAL_BURST_REPEATS * cc_frame_count.div_ceil(2) {
                 guard
                     .send_next_cc_frames()
                     .context("send initial HPSDR C&C tuning frames")?;
             }
+<<<<<<< HEAD
             started_at = Instant::now();
+=======
+            let acquisition_start_offset = entered.elapsed();
+>>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
             guard
                 .socket
                 .send(&build_start_command())
                 .context("send HPSDR start command")?;
-        }
+            acquisition_start_offset
+        };
 
         Ok((0..cfg.ddc_count)
             .map(|ddc_index| HpsdrIqSource {
@@ -1050,6 +1062,7 @@ impl HpsdrDevice {
                 sample_rate_hz: cfg.sample_rate_hz,
                 center_freq_hz: cfg.center_freq_hz[ddc_index],
                 confirmed_live: confirmed_live.clone(),
+<<<<<<< HEAD
                 health_counters: health_counters[ddc_index].clone(),
                 discontinuity: None,
                 session: HpsdrSession {
@@ -1058,9 +1071,102 @@ impl HpsdrDevice {
                     authority: authority.clone(),
                     started_at,
                 },
+=======
+                health_counters: health_counters.clone(),
+                acquisition_start_offset,
+>>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
             })
             .collect())
     }
+}
+
+pub mod discovery;
+pub mod proto2;
+
+pub use discovery::{Discovery, DiscoveryReply};
+pub use proto2::Protocol2IqSource;
+
+/// Which openHPSDR protocol to speak (MAN-305 D2). `Auto` asks the radio
+/// with a directed discovery probe and uses protocol 2 when it answers as
+/// protocol 2, protocol 1 otherwise; `One` and `Two` skip the question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HpsdrProtocol {
+    #[default]
+    Auto,
+    One,
+    Two,
+}
+
+/// A receiver opened by [`open_receiver`]: the source, the protocol it
+/// speaks (`One` or `Two`, never `Auto`) and what discovery found, so the
+/// caller can say how the protocol was chosen.
+pub struct OpenedHpsdr {
+    pub source: Box<dyn IqSource + Send>,
+    pub protocol: HpsdrProtocol,
+    pub discovery: Discovery,
+}
+
+/// Open DDC 0 of the radio at `cfg.host:cfg.port` in `protocol` (MAN-305
+/// D2/D3). Under `Auto` this runs [`discovery::probe`] first; a
+/// protocol-2 radio that reports itself busy is refused, since taking it
+/// over needs an explicit `Two`.
+pub fn open_receiver(cfg: &HpsdrConfig, protocol: HpsdrProtocol) -> Result<OpenedHpsdr> {
+    open_receiver_with(cfg, protocol, &discovery::ProbeTiming::default())
+}
+
+pub(crate) fn open_receiver_with(
+    cfg: &HpsdrConfig,
+    protocol: HpsdrProtocol,
+    timing: &discovery::ProbeTiming,
+) -> Result<OpenedHpsdr> {
+    // MAN-259: the discovery probe runs inside the reconnect's open call
+    // and streams nothing, so it is outage too.
+    let entered = Instant::now();
+    let discovery = match protocol {
+        HpsdrProtocol::Auto => discovery::probe(&cfg.host, cfg.port, timing)?,
+        HpsdrProtocol::One | HpsdrProtocol::Two => Discovery::Skipped,
+    };
+    let (protocol, board) = match (protocol, discovery) {
+        (HpsdrProtocol::One, _) => (HpsdrProtocol::One, None),
+        (HpsdrProtocol::Two, _) => (HpsdrProtocol::Two, None),
+        (_, Discovery::Answered(DiscoveryReply::Protocol2 { status, board, .. })) => {
+            if status == discovery::STATUS_BUSY {
+                bail!(
+                    "HPSDR radio {}:{} answered discovery as openHPSDR protocol 2 but is already \
+                     streaming to another program; stop that program, or pass --hpsdr-protocol 2 \
+                     to take the radio over",
+                    cfg.host,
+                    cfg.port
+                );
+            }
+            (HpsdrProtocol::Two, Some(board))
+        }
+        _ => (HpsdrProtocol::One, None),
+    };
+    let before_open = entered.elapsed();
+    let source: Box<dyn IqSource + Send> = match protocol {
+        HpsdrProtocol::Two => {
+            let mut src = Protocol2IqSource::open(cfg, proto2::wire::board_info(board))?;
+            src.acquisition_start_offset += before_open;
+            Box::new(src)
+        }
+        _ => {
+            let mut src = open_protocol_1(cfg)?;
+            src.acquisition_start_offset += before_open;
+            Box::new(src)
+        }
+    };
+    Ok(OpenedHpsdr {
+        source,
+        protocol,
+        discovery,
+    })
+}
+
+/// Protocol 1's DDC 0, exactly as [`HpsdrDevice::open`] has always opened it.
+fn open_protocol_1(cfg: &HpsdrConfig) -> Result<HpsdrIqSource> {
+    let mut sources = HpsdrDevice::open(cfg.clone())?;
+    Ok(sources.remove(0))
 }
 
 /// One receiver channel (DDC) of an [`HpsdrDevice`] connection, as an
@@ -1080,6 +1186,9 @@ pub struct HpsdrIqSource {
     /// Shared transport atomics plus this DDC's own queue-loss counter.
     /// Metrics readers never need to lock the packet pump.
     health_counters: Arc<InputHealthCounters>,
+    /// MAN-259: `HpsdrDevice::open`'s runtime up to the start command,
+    /// shared by every DDC of the connection.
+    acquisition_start_offset: Duration,
 }
 
 impl HpsdrIqSource {
@@ -1143,6 +1252,10 @@ impl IqSource for HpsdrIqSource {
 
     fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
         Some(self.health_counters.clone())
+    }
+
+    fn acquisition_start_offset(&self) -> Duration {
+        self.acquisition_start_offset
     }
 }
 
@@ -2363,5 +2476,263 @@ mod tests {
         let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
         let n = sources[0].read(&mut buf).expect("read real IQ samples");
         assert!(n > 0, "expected real samples from a live device");
+    }
+}
+
+/// MAN-305 Phase 4: protocol selection in [`open_receiver`], against the
+/// loopback [`proto2::fake::FakeP2Radio`] (every port ephemeral).
+#[cfg(test)]
+mod open_receiver_tests {
+    use super::discovery::{protocol1_request, protocol2_request, ProbeTiming};
+    use super::proto2::fake::FakeP2Radio;
+    use super::proto2::wire;
+    use super::*;
+    use std::net::SocketAddr;
+    use std::thread;
+
+    const MAC: [u8; 6] = [0x00, 0x1C, 0xC0, 0xA2, 0x13, 0x5D];
+
+    fn p1_reply() -> Vec<u8> {
+        let mut r = vec![0u8; 60];
+        r[0..3].copy_from_slice(&[0xEF, 0xFE, discovery::STATUS_IDLE]);
+        r[3..9].copy_from_slice(&MAC);
+        r[9] = 73; // firmware
+        r[10] = 6; // board: Hermes Lite
+        r
+    }
+
+    fn p2_reply(status: u8, board: u8) -> Vec<u8> {
+        let mut r = vec![0u8; 60];
+        r[4] = status;
+        r[5..11].copy_from_slice(&MAC);
+        r[11] = board;
+        r[12] = 39; // protocol version
+        r[13] = 21; // firmware
+        r[20] = 1; // DDC count
+        r
+    }
+
+    /// Short probe timings so the tests do not each wait a second.
+    fn fast() -> ProbeTiming {
+        ProbeTiming {
+            tries: 4,
+            interval: Duration::from_millis(50),
+            window: Duration::from_millis(300),
+            grace: Duration::from_millis(60),
+        }
+    }
+
+    fn is_discovery(d: &[u8]) -> bool {
+        d == protocol2_request() || d == protocol1_request()
+    }
+
+    fn open(fake: &FakeP2Radio, protocol: HpsdrProtocol, timing: &ProbeTiming) -> OpenedHpsdr {
+        open_receiver_with(&fake.cfg(), protocol, timing).expect("open_receiver")
+    }
+
+    /// Wait (up to 1 s) until the fake has logged a datagram on
+    /// `base + offset` that `pred` accepts.
+    fn wait_for(fake: &FakeP2Radio, offset: u16, pred: impl Fn(&[u8]) -> bool) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(d) = fake.received(offset).into_iter().find(|d| pred(d)) {
+                return d;
+            }
+            assert!(Instant::now() < deadline, "the fake never saw the datagram");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn auto_selects_protocol_2_when_the_radio_answers_as_protocol_2() {
+        let fake = FakeP2Radio::with_discovery(vec![(
+            Duration::ZERO,
+            p2_reply(discovery::STATUS_IDLE, 5),
+        )]);
+        let mut opened = open(&fake, HpsdrProtocol::Auto, &fast());
+        assert_eq!(opened.protocol, HpsdrProtocol::Two);
+        match opened.discovery {
+            Discovery::Answered(DiscoveryReply::Protocol2 {
+                status,
+                board,
+                protocol_version,
+                firmware,
+                ..
+            }) => {
+                assert_eq!(status, discovery::STATUS_IDLE);
+                assert_eq!(board, 5);
+                assert_eq!(protocol_version, 39);
+                assert_eq!(firmware, 21);
+            }
+            other => panic!("expected a protocol-2 answer, got {other:?}"),
+        }
+        // The opened source really is the protocol-2 stream.
+        fake.send_iq(0);
+        let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
+        assert_eq!(opened.source.read(&mut buf).unwrap(), 238);
+    }
+
+    #[test]
+    fn auto_prefers_protocol_2_when_both_answers_arrive() {
+        let fake = FakeP2Radio::with_discovery(vec![
+            (Duration::ZERO, p1_reply()),
+            (
+                Duration::from_millis(20),
+                p2_reply(discovery::STATUS_IDLE, 4),
+            ),
+        ]);
+        // A wide grace: the fake's 20 ms gap between replies overran the
+        // production 100 ms on a loaded macOS runner (MAN-305). Grace
+        // expiry has its own test in discovery.rs.
+        let timing = ProbeTiming {
+            grace: Duration::from_secs(1),
+            ..ProbeTiming::default()
+        };
+        let opened = open(&fake, HpsdrProtocol::Auto, &timing);
+        assert_eq!(opened.protocol, HpsdrProtocol::Two);
+        assert!(matches!(
+            opened.discovery,
+            Discovery::Answered(DiscoveryReply::Protocol2 { board: 4, .. })
+        ));
+    }
+
+    #[test]
+    fn auto_uses_protocol_1_when_only_a_protocol_1_answer_arrives() {
+        let fake = FakeP2Radio::with_discovery(vec![(Duration::ZERO, p1_reply())]);
+        let opened = open(&fake, HpsdrProtocol::Auto, &fast());
+        assert_eq!(opened.protocol, HpsdrProtocol::One);
+        assert!(matches!(
+            opened.discovery,
+            Discovery::Answered(DiscoveryReply::Protocol1 {
+                board: 6,
+                firmware: 73,
+                ..
+            })
+        ));
+        // After discovery, the control port sees protocol 1's C&C burst
+        // (`EF FE 01`, 1032 bytes) and no protocol-2 bring-up anywhere.
+        let first = wait_for(&fake, 0, |d| !is_discovery(d));
+        assert_eq!(first.len(), METIS_PACKET_LEN);
+        assert_eq!(first[..3], [0xEF, 0xFE, 0x01]);
+        thread::sleep(Duration::from_millis(50));
+        for offset in 1..=3 {
+            assert!(
+                fake.received(offset).is_empty(),
+                "protocol-2 datagram on base+{offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_falls_back_to_protocol_1_after_one_second_of_silence() {
+        let fake = FakeP2Radio::start();
+        let start = Instant::now();
+        let opened = open(&fake, HpsdrProtocol::Auto, &ProbeTiming::default());
+        let took = start.elapsed();
+        assert_eq!(opened.protocol, HpsdrProtocol::One);
+        assert_eq!(opened.discovery, Discovery::NoAnswer);
+        assert!(
+            took >= Duration::from_secs(1) && took < Duration::from_millis(1500),
+            "open took {took:?}"
+        );
+        // MAN-259: the silent probe is outage, so acquisition starts after it.
+        let offset = opened.source.acquisition_start_offset();
+        assert!(
+            offset >= Duration::from_secs(1) && offset <= took,
+            "offset {offset:?}, open took {took:?}"
+        );
+        let first = wait_for(&fake, 0, |d| !is_discovery(d));
+        assert_eq!(first[..3], [0xEF, 0xFE, 0x01]);
+    }
+
+    #[test]
+    fn auto_refuses_a_busy_protocol_2_radio() {
+        let fake = FakeP2Radio::with_discovery(vec![(
+            Duration::ZERO,
+            p2_reply(discovery::STATUS_BUSY, 5),
+        )]);
+        let err = open_receiver_with(&fake.cfg(), HpsdrProtocol::Auto, &fast())
+            .err()
+            .expect("a busy radio is refused under auto");
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "HPSDR radio 127.0.0.1:{} answered discovery as openHPSDR protocol 2 but is \
+                 already streaming to another program; stop that program, or pass \
+                 --hpsdr-protocol 2 to take the radio over",
+                fake.base
+            )
+        );
+        // Nothing was started: no bring-up reached the radio.
+        thread::sleep(Duration::from_millis(50));
+        assert!(fake.received(3).is_empty());
+    }
+
+    #[test]
+    fn forced_protocols_send_no_discovery() {
+        for protocol in [HpsdrProtocol::One, HpsdrProtocol::Two] {
+            let fake = FakeP2Radio::start();
+            let opened = open(&fake, protocol, &fast());
+            assert_eq!(opened.protocol, protocol);
+            assert_eq!(opened.discovery, Discovery::Skipped);
+            // Something reached the radio, and none of it was discovery.
+            wait_for(&fake, 0, |_| true);
+            thread::sleep(Duration::from_millis(50));
+            assert!(
+                fake.records().iter().all(|r| !is_discovery(&r.1)),
+                "{protocol:?} sent a discovery datagram"
+            );
+        }
+    }
+
+    #[test]
+    fn forced_protocol_2_uses_bypass_filter_words() {
+        let fake = FakeP2Radio::start();
+        let _opened = open(&fake, HpsdrProtocol::Two, &fast());
+        let hp = wait_for(&fake, 3, |d| {
+            d.len() == wire::HIGH_PRIORITY_LEN && d[4] & 1 == 1
+        });
+        let word = |at: usize| u32::from_be_bytes(hp[at..at + 4].try_into().unwrap());
+        assert_eq!(word(1428), 0x2000_0000, "alex1: 6 m/bypass low-pass");
+        assert_eq!(
+            word(1432),
+            0x2000_1000,
+            "alex0: bypass high-pass and low-pass"
+        );
+        let general = wait_for(&fake, 0, |d| d.len() == wire::GENERAL_LEN);
+        assert_eq!(general[59], 0x01, "filter board enabled");
+    }
+
+    #[test]
+    fn discovery_socket_is_closed_before_streaming() {
+        let fake = FakeP2Radio::with_discovery(vec![(
+            Duration::ZERO,
+            p2_reply(discovery::STATUS_IDLE, 5),
+        )]);
+        let _opened = open(&fake, HpsdrProtocol::Auto, &fast());
+        let streaming = fake.wait_for_run();
+        let probes: Vec<SocketAddr> = fake
+            .records()
+            .into_iter()
+            .filter(|r| is_discovery(&r.1))
+            .map(|r| r.2)
+            .collect();
+        assert!(!probes.is_empty());
+        for probe in probes {
+            assert_ne!(
+                probe.port(),
+                streaming.port(),
+                "streaming reused the discovery socket"
+            );
+        }
+        // The discovery socket is gone: its port can be bound again.
+        let probe_port = fake
+            .records()
+            .into_iter()
+            .find(|r| is_discovery(&r.1))
+            .unwrap()
+            .2
+            .port();
+        assert!(UdpSocket::bind(("0.0.0.0", probe_port)).is_ok());
     }
 }

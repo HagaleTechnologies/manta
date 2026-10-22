@@ -32,6 +32,8 @@ coppa-audio = { workspace = true }
 hound = { workspace = true }
 serde_json = { workspace = true }
 manta-decode = { workspace = true }
+# MAN-310: the decimator's trusted fraction sizes a band plan's streams.
+manta-dsp = { workspace = true }
 manta-engine = { workspace = true }
 manta-input = { workspace = true }
 manta-server = { workspace = true }
@@ -79,14 +81,13 @@ coppa-audio = { workspace = true }
 socket2 = { workspace = true }
 libc = { workspace = true }
 serde_json = { workspace = true }
-manta-dsp = { workspace = true }
 manta-testkit = { workspace = true }
 tempfile = { workspace = true }
 hound = { workspace = true }
 regex = { workspace = true }
 tungstenite = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 # MAN-268: tests/packaging_examples.rs parses the shipped docker-compose.yml
 # as YAML rather than matching text fragments. Test-only; pinned here, not

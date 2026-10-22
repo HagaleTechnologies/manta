@@ -1,6 +1,7 @@
 """Static checks for the MAN-243 CI trust boundary (which PR revisions may run in main's context,
-which runs may write the shared build cache, and that release builds start cold), and for
-MAN-245's one Dependabot classification across the gate workflows.
+which runs may write the shared build cache, and that release builds start cold), for
+MAN-245's one Dependabot classification across the gate workflows, and for MAN-380's test-soapy
+cache key on the installed Homebrew soapysdr.
 
 stdlib unittest only -- PyYAML is not available on every runner -- so workflows are read as text.
 Run: python3 -m unittest scripts.tests.test_ci_trust_boundary -v
@@ -360,6 +361,22 @@ class CiFullCacheTests(unittest.TestCase):
                 with_block = sub(step, "with")
                 self.assertIsNotNone(with_block, f"{job}: rust-cache step has no with: block")
                 self.assertEqual(field(with_block, "save-if"), SAVE_IF)
+
+    def test_soapy_cache_is_keyed_to_the_installed_soapysdr(self):
+        # MAN-380: a cache restored across a Homebrew soapysdr version change replays a dead
+        # Cellar link path, so the macOS install exports the version the cache key hashes.
+        job_steps = steps(job_block(read("ci-full.yml"), "test-soapy"))
+        brew = [i for i, s in enumerate(job_steps) if "brew install soapysdr" in (run_body(s) or "")]
+        cache = [i for i, s in enumerate(job_steps)
+                 if (field(s, "uses") or "").startswith("Swatinem/rust-cache@")]
+        self.assertEqual(len(brew), 1, "test-soapy: expected one brew install soapysdr step")
+        self.assertEqual(len(cache), 1, "test-soapy: expected one rust-cache step")
+        self.assertLess(brew[0], cache[0], "test-soapy: the version must be exported before the cache key")
+        body = run_body(job_steps[brew[0]])
+        self.assertIn('SoapySDR_DIR=$(brew --prefix soapysdr)', body)
+        self.assertIn('SOAPYSDR_BREW_VERSION=$(brew list --versions soapysdr)', body)
+        self.assertNotIn("Cellar", body)
+        self.assertEqual(field(sub(job_steps[cache[0]], "with"), "env-vars"), "SOAPYSDR_BREW_VERSION")
 
     def test_only_ci_full_uses_a_build_cache(self):
         users = set()

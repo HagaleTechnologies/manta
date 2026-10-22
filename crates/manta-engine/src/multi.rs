@@ -141,6 +141,10 @@ pub struct InputSpec {
     /// This input's receiver correction (D4).
     pub freq_correction_ppm: f64,
     pub observers: InputObservers,
+    /// MAN-310: this input's share of a split band plan, Hz from its
+    /// centre (an edge may be infinite); `None`: its whole band. Narrows
+    /// the trusted-band spawn veto; spawns only.
+    pub spawn_band_hz: Option<(f64, f64)>,
 }
 
 /// What an input reported once open.
@@ -155,6 +159,8 @@ pub struct OpenedInput {
     /// usable passband than its rate suggests (MAN-196), and `run` says
     /// so per input.
     pub trusted_band_hz: Option<(f64, f64)>,
+    /// MAN-310: the spec's `spawn_band_hz`, echoed for `run`'s notice.
+    pub spawn_band_hz: Option<(f64, f64)>,
 }
 
 /// How a session's inputs share one clock.
@@ -186,6 +192,9 @@ pub struct SharedObservers {
     pub operator_lists: Option<Arc<OperatorListsUpdate>>,
     pub reference_lists: Option<Arc<ReferenceLists>>,
     pub live_state: Option<Arc<dyn LiveStateSink>>,
+    /// MAN-14: the shared validator's per-input cross-input dedupe
+    /// withholds, updated after each batch. `None` skips the copy.
+    pub suppressions: Option<Arc<crate::SuppressionObserver>>,
 }
 
 enum Msg {
@@ -288,10 +297,11 @@ pub fn open_inputs(specs: Vec<InputSpec>, stop: Arc<AtomicBool>) -> Result<Opene
         let done_tx = done_tx.clone();
         let name = spec.name.clone();
         let open = spec.open;
+        let spawn_band_hz = spec.spawn_band_hz;
         let stop = stop.clone();
         let handle = std::thread::Builder::new()
             .name(format!("manta-input-{name}"))
-            .spawn(move || input_thread(name, open, index, done_tx, go_rx, stop))
+            .spawn(move || input_thread(name, open, spawn_band_hz, index, done_tx, go_rx, stop))
             .map_err(|e| anyhow!("input \"{}\": cannot start its thread: {e}", spec.name))?;
         ppm.push(spec.freq_correction_ppm);
         observers.push(spec.observers);
@@ -354,6 +364,7 @@ pub fn open_inputs(specs: Vec<InputSpec>, stop: Arc<AtomicBool>) -> Result<Opene
 fn input_thread(
     name: String,
     open: InputOpener,
+    spawn_band_hz: Option<(f64, f64)>,
     index: usize,
     done: mpsc::Sender<(usize, Result<OpenedInput>)>,
     go_rx: Receiver<Go>,
@@ -370,6 +381,7 @@ fn input_thread(
             center_freq_hz: src.center_freq_hz(),
             rf_passband_hz: src.rf_passband_hz(),
             trusted_band_hz: src.trusted_band_hz(),
+            spawn_band_hz,
         };
         Ok((src, info))
     }))
@@ -403,6 +415,7 @@ fn input_thread(
             clock,
             ids,
             factor,
+            spawn_band_hz,
             &observers,
             &mut |b| outbox.send(Msg::Batch(b)),
         )

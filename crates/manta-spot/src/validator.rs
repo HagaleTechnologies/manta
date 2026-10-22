@@ -6,7 +6,7 @@ use crate::confidence;
 use crate::context::{self, SpotType};
 use crate::cty;
 use crate::decision::{CandidateSupport, Decision, Reason, Rival};
-use crate::dedupe::Dedupe;
+use crate::dedupe::{Dedupe, DedupeOutcome};
 use crate::gate::{RepetitionCounts, RepetitionGate, WINDOW_SECONDS as GATE_WINDOW_SECONDS};
 use crate::grammar;
 use crate::message;
@@ -273,7 +273,7 @@ pub fn calibration_factor_from_ppm(ppm: f64) -> Result<f64, InvalidCalibration> 
 /// read, mirroring `manta_engine::track::CloseCounts` -- nothing wires it
 /// externally yet, since the Prometheus text endpoint itself is explicit
 /// M3 scope (ROADMAP.md).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SuppressionCounts {
     pub blocklist: u64,
     pub notch: u64,
@@ -329,6 +329,12 @@ pub struct SuppressionCounts {
     /// confusable, better-supported rival existed on the same track in the
     /// same window. See `support::SupportLedger`.
     pub variant: u64,
+    /// MAN-14: candidate spots withheld by MAN-13 D6's cross-input dedupe
+    /// -- a different input had already reported the same signal inside
+    /// the window -- indexed by the WITHHELD input (`input_of` its track):
+    /// its report proves it hears. One element per input
+    /// (`with_input_count`); a same-input repeat is not counted here.
+    pub cross_input_dedupe_by_input: Vec<u64>,
 }
 
 pub struct Validator {
@@ -449,7 +455,10 @@ impl Validator {
             allowlist: std::collections::BTreeSet::new(),
             blocklist: Blocklist::default(),
             notch: NotchList::default(),
-            suppression_counts: SuppressionCounts::default(),
+            suppression_counts: SuppressionCounts {
+                cross_input_dedupe_by_input: vec![0],
+                ..SuppressionCounts::default()
+            },
             now_ts: 0,
             last_swept_ts: 0,
             sweep_interval_samples: (SWEEP_INTERVAL_SECONDS * fs) as u64,
@@ -468,7 +477,24 @@ impl Validator {
     /// default) is the single-input validator, unchanged. `0` is taken as 1.
     pub fn with_input_count(mut self, n: u32) -> Self {
         self.input_count = n.max(1);
+        self.suppression_counts
+            .cross_input_dedupe_by_input
+            .resize(self.input_count as usize, 0);
         self
+    }
+
+    /// MAN-14: counts a cross-input dedupe withhold against the withheld
+    /// input; a same-input repeat is not counted.
+    fn count_cross_input_dedupe(&mut self, outcome: DedupeOutcome, input: u32) {
+        if outcome == DedupeOutcome::WithheldCrossInput {
+            if let Some(n) = self
+                .suppression_counts
+                .cross_input_dedupe_by_input
+                .get_mut(input as usize)
+            {
+                *n += 1;
+            }
+        }
     }
 
     /// MAN-13: the input that spawned `track_id` (see `with_input_count`).
@@ -662,7 +688,7 @@ impl Validator {
     /// Per-reason counts of operator-suppressed spots so far (MAN-31,
     /// ARCHITECTURE §8).
     pub fn suppression_counts(&self) -> SuppressionCounts {
-        self.suppression_counts
+        self.suppression_counts.clone()
     }
 
     /// Feeds one decoder event in. Returns zero or more validated spots
@@ -916,12 +942,17 @@ impl Validator {
                 // variant-arbitration ledger is still keyed by `track_id`
                 // (mirrors the pre-MAN-166 `RepetitionGate::forget_track`
                 // pattern), so it's still forgotten on close rather than
-                // swept. Known, unmeasured risk (not one of this ticket's
-                // measured V8/V8w cases): a real signal's track closing
-                // and reopening under a new `track_id` (MAN-166) resets
-                // its observed-word history here, the same class of bug
-                // MAN-166 fixed for the gate -- out of this ticket's scope
-                // to fix pre-emptively; revisit if measured in practice.
+                // swept. A real signal's track closing and reopening
+                // under a new `track_id` (MAN-166) resets its observed-
+                // word history here, the same class of bug MAN-166 fixed
+                // for the gate. MAN-108 measured that case (a Watterson
+                // fade outlasting the 5 s hang) and removed it at the
+                // source: a track that has decoded goes DORMANT for up to
+                // `hang_ms + reacquire_ms` and keeps its `track_id` when
+                // the signal returns, so no `TrackClosed` arrives and this
+                // state, `self.tracks`' and the MAN-272 annotations all
+                // survive such a fade. A signal gone longer than that
+                // still starts over here.
                 self.ledger.forget_track(*track_id);
                 self.maybe_sweep();
                 spots
@@ -1446,14 +1477,12 @@ impl Validator {
             return None;
         }
 
-        if !self.dedupe.should_emit(
-            &candidate,
-            freq_hz,
-            snr_db,
-            spot_type,
-            sample_ts,
-            self.input_of(track_id),
-        ) {
+        let input = self.input_of(track_id);
+        let outcome = self
+            .dedupe
+            .assess(&candidate, freq_hz, snr_db, spot_type, sample_ts, input);
+        if outcome != DedupeOutcome::Emit {
+            self.count_cross_input_dedupe(outcome, input);
             self.decide(|| withheld(Reason::Dedupe).with_reps(reps));
             return None;
         }
@@ -1773,14 +1802,16 @@ impl Validator {
                     }
                 }
                 let input = self.input_of(pb.origin_track_id);
-                if !self.dedupe.should_emit(
+                let outcome = self.dedupe.assess(
                     &pb.candidate,
                     pb.freq_hz,
                     pb.snr_db,
                     SpotType::Beacon,
                     pb.sample_ts,
                     input,
-                ) {
+                );
+                if outcome != DedupeOutcome::Emit {
+                    self.count_cross_input_dedupe(outcome, input);
                     self.decide(|| beacon_decision(track_id, &pb, Reason::Dedupe).with_reps(reps));
                     return None;
                 }
@@ -2284,6 +2315,54 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         }
         assert_eq!(spots.len(), 1, "{spots:?}");
         assert_eq!(spots[0].callsign, "K5ARH");
+    }
+
+    /// MAN-14: the D6 withhold counts against the withheld input only.
+    #[test]
+    fn a_cross_input_duplicate_counts_against_the_withheld_input() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None).with_input_count(2);
+        assert_eq!(
+            v.suppression_counts().cross_input_dedupe_by_input,
+            vec![0, 0]
+        );
+        meta_at(&mut v, 1, 14_012_349.9);
+        meta_at(&mut v, 2, 14_012_352.7);
+        let mut spots = Vec::new();
+        for start in [0, 100_000, 200_000] {
+            spots.extend(run(&interleaved((1, "K5ARH"), (2, "K5ARH"), start), &mut v));
+        }
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        let winner = v.input_of(spots[0].track_id) as usize;
+        let counts = v.suppression_counts().cross_input_dedupe_by_input;
+        assert_eq!(counts[winner], 0, "{counts:?}");
+        assert!(counts[1 - winner] >= 1, "{counts:?}");
+    }
+
+    /// MAN-14: two stations, a same-input repeat and one input count none.
+    #[test]
+    fn no_cross_input_duplicate_counts_nothing() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None).with_input_count(2);
+        meta_at(&mut v, 1, 14_012_340.0);
+        meta_at(&mut v, 2, 14_085_000.0);
+        for start in [0, 100_000, 200_000] {
+            run(&interleaved((1, "K5ARH"), (2, "W1AW"), start), &mut v);
+        }
+        assert_eq!(
+            v.suppression_counts().cross_input_dedupe_by_input,
+            vec![0, 0]
+        );
+        let mut one = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut one, 1);
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = Vec::new();
+        for start in [0, 100_000, 200_000] {
+            spots.extend(run(&transmission_events(1, &words, start), &mut one));
+        }
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        assert_eq!(
+            one.suppression_counts().cross_input_dedupe_by_input,
+            vec![0]
+        );
     }
 
     #[test]

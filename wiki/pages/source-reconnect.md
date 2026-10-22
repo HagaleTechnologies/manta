@@ -6,16 +6,23 @@ status: current
 maintainer: agent
 sources:
   - docs/DECISIONS/2026-10-05-man73-source-reconnect.md
+  - docs/DECISIONS/2026-10-16-man259-acquisition-anchored-outage.md
   - crates/manta-cli/src/reconnect.rs
   - crates/manta-cli/src/reconnect.rs (InputHealthTotals)
   - crates/manta-input/src/lib.rs (IqSource::take_discontinuity)
+  - crates/manta-input/src/lib.rs (IqSource::acquisition_start_offset)
   - docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md
   - docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md
   - docs/DECISIONS/2026-10-19-man307-hpsdr-multiple-receivers.md
   - crates/manta-cli/src/hpsdr_group.rs
 verified:
+<<<<<<< HEAD
   commit: cdf8487
   date: 2026-10-19
+=======
+  commit: b8b9367
+  date: 2026-10-16
+>>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
 links:
   - determinism
 ---
@@ -35,12 +42,18 @@ new device with fresh counters, so poll `ReconnectingSource::input_health()` (MA
 syncing counts after `read()` returns is not enough, because HPSDR counts inside a `read()` that
 blocks until a valid packet arrives. Gotcha (MAN-252): every reopen runs on its own `reopen-<kind>`
 thread, which a stop request abandons, so anything `LiveSourceSpec::open` builds must be `Send`; a
-source or wrapper holding `Rc` or raw pointers will not compile into the opener.
+source or wrapper holding `Rc` or raw pointers will not compile into the opener. Gotcha: the
+outage ends where the reopened device started streaming, not where its opener returned (MAN-259).
+Every driver starts acquiring inside its open call and returns what it buffered meanwhile, so each
+reports `IqSource::acquisition_start_offset()` and every wrapper between it and
+`ReconnectingSource` (`DecimatingSource`, `FixedCenterFreqSource`) must forward it; anchoring at
+the opener's return counts those samples twice and stamps every later spot late.
 
 ## Symptom
 
 A reconnect test (real or simulated) shows a burst of bogus callsigns right after the source comes
-back, or spot timestamps jump backwards relative to the outage.
+back, or spot timestamps jump backwards relative to the outage, or run late after it by about as
+long as the receiver took to reopen.
 
 ## Where this is implemented
 
