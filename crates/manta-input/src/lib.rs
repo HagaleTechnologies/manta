@@ -199,8 +199,50 @@ pub trait IqSource {
     /// A `read()` that returns 0 may leave a gap pending too (MAN-258): the
     /// stream ended during an outage, and `listen` then closes its tracks
     /// with `finish_for_discontinuity` rather than as an end of signal.
+    /// A short loss the source splices over instead (a few numbered
+    /// packets) is reported through [`IqSource::take_missing_samples`].
+    /// **Wrapper types must forward this**, as they forward
+    /// `health_counters`.
     fn take_discontinuity(&mut self) -> Option<u64> {
         None
+    }
+
+    /// MAN-305: samples (at `sample_rate()`) lost immediately before the
+    /// samples returned by the most recent `read()`, which the source spliced
+    /// over instead of reporting a discontinuity: a short loss on a numbered
+    /// packet stream. Returns the value once, then `None` until the next loss.
+    /// `manta_engine::listen` advances its sample clock by this many samples
+    /// without closing tracks, so spot timestamps stay wall-clock-true.
+    /// **Wrapper types must forward this**, as they forward `take_discontinuity`.
+    fn take_missing_samples(&mut self) -> Option<u64> {
+        None
+    }
+
+    /// MAN-259: how far into this connection's `open()` call the stream
+    /// `read()` returns began -- the offset from the call starting to
+    /// immediately before the call that told the hardware to start
+    /// streaming (Kiwi's IQ-mode `SET`, Soapy's `activate`, HPSDR's start
+    /// command, cpal's `start`, ka9q's data-group join), or, when the
+    /// driver cannot return everything captured since its trigger, to the
+    /// first sample it can still return (ka9q's startup stash evicts its
+    /// oldest packets past a byte cap). Everything before it was
+    /// certainly signal-silent; samples captured from it on are returned
+    /// by `read()`.
+    /// `manta-cli`'s `ReconnectingSource` ends a reconnect's outage there
+    /// rather than where `open()` returned, so the open call's remaining
+    /// runtime is not counted both as outage and as returned samples,
+    /// which shifted every later spot timestamp late. A relative
+    /// `Duration`, like `take_discontinuity`'s sample count, so this crate
+    /// stays independent of the caller's clock. Default `ZERO`:
+    /// acquisition begins as soon as `open()` is entered.
+    ///
+    /// **Wrapper types must forward this**, exactly as `health_counters`
+    /// below -- the default `ZERO` otherwise silently moves the wrapped
+    /// source's anchor back to the start of `open()`, so its pre-start
+    /// handshake drops out of the outage. Not enforceable by the type
+    /// system.
+    fn acquisition_start_offset(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
     }
 
     /// Shared packet-loss/malformed counters for sources that can lose or
@@ -216,8 +258,9 @@ pub trait IqSource {
     ///
     /// **Wrapper types must forward this**, exactly as `manta-cli`'s
     /// `FixedCenterFreqSource` does -- the default `None` otherwise
-    /// silently swallows the inner source's counters. Not enforceable by
-    /// the type system; see that impl.
+    /// silently swallows the inner source's counters. The same holds for
+    /// both gap hooks, `take_discontinuity` and `take_missing_samples`
+    /// (MAN-305). Not enforceable by the type system; see that impl.
     fn health_counters(&self) -> Option<std::sync::Arc<InputHealthCounters>> {
         None
     }
@@ -930,6 +973,17 @@ mod tests {
         write_f32_wav(&wav, &samples(), 96_000);
         let mut src = WavIqSource::open(&wav).unwrap();
         assert_eq!(src.take_discontinuity(), None);
+    }
+
+    #[test]
+    fn default_take_missing_samples_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("fix.wav");
+        write_f32_wav(&wav, &samples(), 96_000);
+        let mut src = WavIqSource::open(&wav).unwrap();
+        let mut buf = vec![Complex32::new(0.0, 0.0); 300];
+        assert_eq!(src.read(&mut buf).unwrap(), 300);
+        assert_eq!(src.take_missing_samples(), None);
     }
 
     #[test]

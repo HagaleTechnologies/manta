@@ -148,6 +148,7 @@ the config for both. The table needs `station_callsign`.
 | `live_bind_addr` | `"127.0.0.1"` | live: `run` with `[server]` and `live_port`; restart required | Address of the live-state listener, which has no password. The stream carries every track's decoded text; set `"0.0.0.0"` only for a dashboard on another machine, and firewall `live_port`. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
 | `line_format` | `"rbn"` | live: `run` with `[server]` | Telnet spot-line layout, `"rbn"` or `"skimmer"`. The uplink always sends the `"rbn"` layout. |
 | `status_interval_secs` | `60` | live: `run` with `[server]` | Seconds between one-line status reports in the log; `0` turns them off. |
+| `silent_input_warning_secs` | `600` | live: `run` with `[server]` and 2+ `[[input]]` | Seconds an input may decode no spots, while another input decodes some, before manta warns and sets `manta_input_silent{source}` to 1; `0` turns the check off; otherwise 60 to 86400. See [MAN-14](DECISIONS/2026-10-19-man14-per-receiver-hearing-visibility.md). |
 | `history_minutes` | `30` | live: `run` with `[server]`; restart required | Telnet replay retention in whole minutes, 0–1440, measured from the newest published spot's sample timestamp. Keeps at least the newest 50 spots and at most 10,000; `0` keeps only the newest 50. Loggers request `sh/dx 30m`; bare `sh/dx` returns 10 rows. See [MAN-93](DECISIONS/2026-10-11-man93-sh-dx-history-window.md). Also bounds the separate JSON resume history, with spots and grades together under the same floor and ceiling, counted in records; see [MAN-137](DECISIONS/2026-10-14-man137-json-stream-resume.md). |
 | `telnet_max_connections_per_ip` | `16` | live: `run` with `[server]` | Open telnet connections per client IP; `0` removes the limit. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
 | `json_max_connections_per_ip` | `16` | live: `run` with `[server]` | Open JSON and WebSocket connections per client IP; `0` removes the limit. The live-state listener applies the same quota, counted separately. |
@@ -216,11 +217,14 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `realtime` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` paces the replay to the recording's own clock, so telnet/JSON clients can watch it. `--realtime` sets it; a live source refuses it. See [DECISIONS/2026-10-10-man269-paced-looping-replay.md](DECISIONS/2026-10-10-man269-paced-looping-replay.md). |
 | `loop` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` replays the file again from the start each time it ends, until stopped; implies `realtime`. `--loop` sets it; a live source refuses it. |
 | `host` | none; example `"<your-receiver-host>"`; required for kiwi and hpsdr | live: `type = "kiwi"` or `"hpsdr"` | Receiver host name. `--kiwi-host` or `--hpsdr-host` overrides it. |
-| `port` | `8073`; `1024` for hpsdr; `5004` for ka9q | live: `type = "kiwi"`, `"hpsdr"` or `"ka9q"` | Receiver port, 1 to 65535; for ka9q, the group's RTP data port. `--kiwi-port`, `--hpsdr-port` or `--ka9q-port` overrides it. |
+| `port` | `8073`; `1024` for hpsdr; `5004` for ka9q | live: `type = "kiwi"`, `"hpsdr"` or `"ka9q"` | Receiver port, 1 to 65535; for ka9q, the group's RTP data port; for an hpsdr protocol-2 radio, the base of its port map (see [HPSDR protocol 2](#hpsdr-protocol-2)). `--kiwi-port`, `--hpsdr-port` or `--ka9q-port` overrides it. |
+| `protocol` | `"auto"` | live: `type = "hpsdr"` | openHPSDR protocol the radio speaks: `"auto"`, `"1"` or `"2"`; the integers `1` and `2` are accepted too. `"auto"` sends a discovery probe to `host` on every open and uses protocol 2 when the radio answers as protocol 2, protocol 1 otherwise (a warning names the key when the radio does not answer within 1 s). `"1"` (Hermes-Lite 2) and `"2"` (ANAN) skip the probe. `--hpsdr-protocol` or `MANTA_INPUT_PROTOCOL` (read verbatim as a string) overrides it. Any other `type` refuses the key. |
 | `password` | `""` | live: `type = "kiwi"` | KiwiSDR password; empty for a public receiver. `config check` prints only whether it is set. `--kiwi-password` overrides it. |
 | `driver` | none; example `"driver=rtlsdr"`; required for soapy | live: `type = "soapy"` (needs the build feature) | SoapySDR device arguments. `--soapy-driver` overrides it. |
 | `gain_db` | none; example `30.0`; unset uses the device's automatic gain | live: `type = "soapy"` (needs the build feature) | Receiver gain, dB. `--soapy-gain` overrides it. |
-| `freq_hz` | none; example `7030000.0`; required for kiwi, soapy and hpsdr | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"` | Receiver centre frequency, Hz. `--kiwi-freq-hz`, `--soapy-freq-hz` or `--hpsdr-freq-hz` overrides it. |
+| `freq_hz` | none; example `7030000.0`; required for kiwi, soapy and hpsdr unless `bands` is set | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"` | Receiver centre frequency, Hz. `--kiwi-freq-hz`, `--soapy-freq-hz` or `--hpsdr-freq-hz` overrides it. |
+| `bands` | none; example `["40m"]`; set instead of `freq_hz` | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"`; restart required | `"all"`, band names such as `"40m"`, or centre frequencies in kHz such as `"7030"` (a string, a number or a list of them). manta plans one stream per slice of each band's CW segment and runs each as an input. See [Band plans: bands](#band-plans-bands) (MAN-310). |
+| `tuning_range_hz` | `[0.0, 30000000.0]`; only with `bands` | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"`; restart required | The receiver's tuning range, `[low, high]` in Hz. A band outside it is skipped and a band partly outside it is clipped, each with a note. See [Band plans: bands](#band-plans-bands). |
 | `rate_hz` | none; example `192000.0`; required for soapy and hpsdr | live: `type = "soapy"` or `"hpsdr"` | Sample rate, Hz. `--soapy-rate-hz` or `--hpsdr-rate-hz` overrides it. |
 | `group` | none; example `"239.101.6.1"`; required for ka9q | live: `type = "ka9q"` | Multicast data group of one ka9q-radio (radiod) IQ channel: an IPv4 multicast address, or the name in the channel's `data =` line, resolved by the system resolver when the source opens. Checked when the file loads; an IPv6 group is refused. manta reads the channel's sample rate, encoding and frequency from radiod's status packets. `--ka9q-group` overrides it. |
 | `ssrc` | none; example `14100000`; unset reads the group's only channel | live: `type = "ka9q"` | SSRC of the channel to read, 0 to 4294967295; needed only when the group carries more than one channel. `--ka9q-ssrc` overrides it. |
@@ -229,6 +233,141 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `center_freq_hz` | none; example `14030000.0`; unset leaves frequencies as audio offsets, and `run` with `[server]` refuses a source that carries no frequency of its own | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Your radio's dial frequency, Hz, for a source that carries none. `--dial-freq-hz` overrides it. |
 | `capture_rate_hz` | none; example `48000.0`; unset decodes at the receiver's own rate | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Decimated sample rate, Hz. It must be at least 1000 (checked before the receiver opens), divide the receiver's rate by a power of two, and be 93.75 Hz (the channel spacing) times a power of two of at least 4, so in practice 1500, 3000, 6000, 12000, 24000, 48000, 96000 and so on. A rate that divides evenly but fails the last rule, such as 50000 from a 100 kS/s receiver, is rejected at startup. The decimator's transition band (the outer ~9.4% of each side, 24 of 256 channels at 48 kS/s — beyond the <= 1 dB point at 0.4526 x the rate) is not usable: the reported passband, `manta check`, SETT segments and tracked channels stop at the trusted band, and `run`/`soak` say so in one startup line naming the source's intersected passband. `--capture-rate-hz` overrides it. |
 | `replay_epoch` | none; example `1700000000`; unset uses the file's modification time | live: `run` with `[server]` and a file source; ignored elsewhere | Unix seconds that the recording's first sample stands for. `--replay-epoch` overrides it. |
+
+### HPSDR protocol 2
+
+MAN-305: ANAN-class radios (Hermes, Angelia, Orion, Orion II, Saturn/G2)
+speak openHPSDR protocol 2; Hermes-Lite 2 and older boards speak protocol 1.
+Both use `type = "hpsdr"` and `--hpsdr-*`, chosen by `protocol` above
+(`--hpsdr-protocol auto|1|2`). The probe under `"auto"` goes to the
+configured host only; manta never broadcasts, and `manta devices` does not
+list radios.
+
+Protocol 2 uses a port map relative to `port` (`1024` by default):
+
+| Direction | Stream | Port |
+|---|---|---|
+| manta → radio | general (and discovery) | `port` (1024) |
+| manta → radio | receiver settings | `port + 1` (1025) |
+| manta → radio | transmitter settings | `port + 2` (1026) |
+| manta → radio | high priority (run, frequency, filters) | `port + 3` (1027) |
+| radio → manta | command response | from `port` (1024) |
+| radio → manta | high-priority status | from `port + 1` (1025) |
+| radio → manta | microphone | from `port + 2` (1026) |
+| radio → manta | wideband | from `port + 3` to `port + 10` (1027–1034) |
+| radio → manta | DDC0 IQ, the stream manta decodes | from `port + 11` (1035) |
+
+manta receives every stream on one unconnected UDP socket and sorts the
+datagrams by the radio's source port.
+
+- **Firewall.** Protocol 2 needs a host firewall rule allowing inbound UDP
+  from the radio: IQ arrives from `port + 11`, which manta never sent to, so
+  a stateful firewall does not treat it as a reply. Without the rule the
+  open succeeds and the stream stalls after 10 s with an error that names
+  the firewall.
+- **Network.** Protocol 2 radios want Gigabit Ethernet. One receiver at
+  192 kHz is about 9.6 Mbit/s, which 100 Mbit/s carries, but the radios are
+  built and tested for Gigabit.
+- **Receive buffer.** manta asks for a 4 MiB socket receive buffer; Linux
+  grants at most `net.core.rmem_max` (about 416 KiB by default, 0.36 s at
+  192 kHz). Raise `net.core.rmem_max` if
+  `manta_input_dropped_packets_total{source="hpsdr"}` climbs on a quiet LAN.
+- A radio that reports itself already streaming to another program is
+  refused under `"auto"`; `protocol = "2"` takes it over.
+- One receiver (DDC0) per radio until MAN-307. The rate must be exactly
+  48000, 96000, 192000 or 384000 Hz, and `freq_hz` a whole number of Hz below
+  61440000.
+- With `protocol = "2"`, or a board manta does not know, the radio's
+  front-end filters are bypassed (ANT1, no high-pass, the 6 m low-pass).
+
+See [DECISIONS/2026-10-19-man305-hpsdr-protocol-2-input.md](DECISIONS/2026-10-19-man305-hpsdr-protocol-2-input.md).
+
+### Band plans: bands
+
+`bands` names what a receiver skims instead of one centre (MAN-310). Write
+`"all"`, band names, or centre frequencies in kHz:
+
+```toml
+[input]
+type = "kiwi"
+host = "kiwi.example.net"
+bands = ["60m"]            # or "all", ["40m", "20m"], "7030", 7030
+#tuning_range_hz = [3000000.0, 30000000.0]
+```
+
+The band table below is the one manta uses (`manta_server::band_plan::CW_SEGMENTS`;
+a test holds the two equal). Each band's skimmed span runs from the bottom
+of its CW segment up to the higher of the segment's top and its NCDXF/IARU
+beacon. The segment limits are not configurable.
+
+| band | CW segment, kHz | NCDXF beacon, kHz | skimmed span, kHz |
+|---|---|---|---|
+| 160m | 1810–1840 | – | 1810–1840 |
+| 80m | 3500–3580 | – | 3500–3580 |
+| 60m | 5351.5–5366.5 | – | 5351.5–5366.5 |
+| 40m | 7000–7040 | – | 7000–7040 |
+| 30m | 10100–10130 | – | 10100–10130 |
+| 20m | 14000–14070 | 14100 | 14000–14100 |
+| 17m | 18068–18095 | 18110 | 18068–18110 |
+| 15m | 21000–21070 | 21150 | 21000–21150 |
+| 12m | 24890–24915 | 24930 | 24890–24930 |
+| 10m | 28000–28070 | 28200 | 28000–28200 |
+
+How a plan is made:
+
+- **Width.** One stream skims 2 × 0.4526 × its width: the decimator's
+  <= 1 dB band. The width is one KiwiSDR channel (10 kHz) for kiwi, and
+  `rate_hz` for soapy and hpsdr, capped by `capture_rate_hz` when set. A
+  96000 Hz stream skims 86.899 kHz.
+- **Split.** A span wider than that is cut into equal slices, one stream
+  each, centred on whole Hz. `"all"` on a 0 to 30 MHz receiver is 14
+  streams at 96 kS/s, 11 at 192 kS/s and 20 at 48 kS/s.
+- **Ownership.** Streams whose bands overlap split the overlap at the
+  midpoint of their centres: each starts new tracks only on its own side,
+  plus one channel (93.75 Hz). A signal in the overlap is decoded by the
+  nearer stream; within one channel of the split both may decode it, and
+  the cross-input dedupe spots it once. A running track is never stopped.
+- **Tuning range.** A band outside `tuning_range_hz` is skipped, a band
+  partly outside it is clipped, and a bare centre outside it is skipped,
+  each with a note. Nothing left to skim is an error.
+- **Repeats.** A band listed twice, a band `"all"` already includes, or a
+  bare centre inside a listed band is refused.
+
+**Names.** A plan of one stream keeps the entry's name (`[input]`'s is its
+type). Several streams are named `<entry>-<label>`: `kiwi-60m-1`,
+`kiwi-60m-2`, `kiwi-7030`. Each is an ordinary input: its own `/healthz`
+line, metric series and `--input` name. `calibrate --input kiwi-60m-1`
+saves into the entry the stream came from, so one measurement corrects
+every stream of that receiver.
+
+**Capacity.** A kiwi entry opens one KiwiSDR channel per stream, within the
+receiver's free channels. An hpsdr or soapy entry opens one stream; a plan
+that needs more is refused naming it (several receivers on one HPSDR radio
+is MAN-307). All inputs together stay within manta's 16, and one entry
+plans at most 256 streams before that check (a near-zero `rate_hz` is
+refused rather than split into millions of slices). A plan of several
+streams refuses `center_freq_hz`: one fixed centre cannot describe
+differently tuned streams. ka9q, file and audio inputs do not take
+`bands`.
+
+**CPU.** Each stream is one input thread with its own channelizer. At one
+Raspberry Pi 4 core per 192 kS/s stream, 14 streams at 96 kS/s need about
+seven cores.
+
+**Environment.** `MANTA_INPUT_BANDS=all`, `MANTA_INPUT_BANDS=7030` or
+`MANTA_INPUT_BANDS='["40m","20m"]'`.
+
+`config check` and `run` print the plan and every skipped or clipped band
+as notes before their output:
+
+```text
+note: [input]: bands = ["160m", "60m"] plans 2 streams: 60m (2)
+note: [input]: 160m skipped: 1810 to 1840 kHz is outside the receiver's tuning range, 3000 to 30000 kHz
+```
+
+`run` logs, for each stream of a split, where it starts new tracks:
+`input kiwi-60m-1: new tracks start only from 5350.25 to 5359.094 kHz; the
+rest of its passband is nearer another stream's centre`.
 
 ### Several receivers: [[input]]
 

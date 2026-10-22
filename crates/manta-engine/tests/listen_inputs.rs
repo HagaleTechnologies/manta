@@ -203,6 +203,7 @@ fn spec(name: &str, scene: &Scene, ppm: f64, fail_at: usize, fault: Fault) -> In
         }),
         freq_correction_ppm: ppm,
         observers: Default::default(),
+        spawn_band_hz: None,
     }
 }
 
@@ -457,6 +458,7 @@ fn live_merge_does_not_wait_for_a_stalled_input() {
             }),
             freq_correction_ppm: 0.0,
             observers: Default::default(),
+            spawn_band_hz: None,
         },
     ];
     let opened = open_inputs(specs, stop.clone()).unwrap();
@@ -502,6 +504,7 @@ fn open_inputs_fails_fast_naming_the_input() {
             open: Box::new(|| anyhow::bail!("boom")),
             freq_correction_ppm: 0.0,
             observers: Default::default(),
+            spawn_band_hz: None,
         },
         plain("c", forty_metre_scene()),
     ];
@@ -530,12 +533,14 @@ fn open_inputs_does_not_wait_for_a_hung_opener_after_a_failure() {
             }),
             freq_correction_ppm: 0.0,
             observers: Default::default(),
+            spawn_band_hz: None,
         },
         InputSpec {
             name: "b".into(),
             open: Box::new(|| anyhow::bail!("boom")),
             freq_correction_ppm: 0.0,
             observers: Default::default(),
+            spawn_band_hz: None,
         },
     ];
     let (result_tx, result_rx) = std::sync::mpsc::channel();
@@ -584,6 +589,7 @@ fn open_inputs_fails_when_a_source_panics_reading_its_metadata() {
             }),
             freq_correction_ppm: 0.0,
             observers: Default::default(),
+            spawn_band_hz: None,
         },
     ];
     let (result_tx, result_rx) = std::sync::mpsc::channel();
@@ -850,6 +856,7 @@ fn an_inputs_replaced_samples_reach_only_its_own_counter() {
                 bad_samples: Some(counter),
                 ..Default::default()
             },
+            spawn_band_hz: None,
         }
     };
     let specs = vec![
@@ -874,5 +881,94 @@ fn an_inputs_replaced_samples_reach_only_its_own_counter() {
         bad[1].load(Ordering::Relaxed) >= 2,
         "poisoned input counted {} bad samples",
         bad[1].load(Ordering::Relaxed)
+    );
+}
+
+/// MAN-310: the planned 15 m split at 96 kS/s (`band_plan::plan`).
+const M310_LO_CENTER: f64 = 21_037_500.0;
+const M310_HI_CENTER: f64 = 21_112_500.0;
+const M310_BOUND_HZ: f64 = 37_593.75;
+
+fn split_spec(name: &str, scene: &Scene, spawn_band_hz: (f64, f64)) -> InputSpec {
+    let mut s = plain(name, scene);
+    s.spawn_band_hz = Some(spawn_band_hz);
+    s
+}
+
+fn split_pair(signals: &[(&str, f64)], seed: u64) -> Run {
+    let scene = |center: f64, seed: u64| {
+        let stations: Vec<SignalSpec> = signals
+            .iter()
+            .map(|(text, hz)| station(text, hz - center))
+            .collect();
+        render(&stations, 96_000.0, center, 120.0, seed)
+    };
+    run(vec![
+        split_spec(
+            "15m-1",
+            &scene(M310_LO_CENTER, seed),
+            (f64::NEG_INFINITY, M310_BOUND_HZ),
+        ),
+        split_spec(
+            "15m-2",
+            &scene(M310_HI_CENTER, seed + 1),
+            (-M310_BOUND_HZ, f64::INFINITY),
+        ),
+    ])
+}
+
+/// MAN-310 scenario 3: a signal in a split band's overlap is tracked only
+/// by the stream whose centre is nearer, and spotted once.
+#[test]
+fn a_split_bands_overlap_signal_is_decoded_once_by_the_nearer_stream() {
+    const DL1ABC_HZ: f64 = 21_070_000.0;
+    const JA1XYZ_HZ: f64 = 21_080_000.0;
+    let got = split_pair(
+        &[
+            ("CQ CQ DE DL1ABC DL1ABC K", DL1ABC_HZ),
+            ("CQ CQ DE JA1XYZ JA1XYZ K", JA1XYZ_HZ),
+        ],
+        31,
+    );
+    assert_eq!(
+        call_counts(&got.spots),
+        counts(&[("DL1ABC", 1), ("JA1XYZ", 1)]),
+        "{:#?}",
+        got.spots
+    );
+    // D3: input i numbers its tracks i+1, i+1+n, ...
+    let input_of = |track_id: u32| (track_id - 1) % 2;
+    for s in &got.spots {
+        let want = if s.callsign == "DL1ABC" { 0 } else { 1 };
+        assert_eq!(input_of(s.track_id), want, "{s:?}");
+    }
+    for e in &got.events {
+        if let DecoderEvent::TrackPromoted {
+            track_id, freq_hz, ..
+        } = e
+        {
+            let input = input_of(*track_id);
+            assert!(
+                !(input == 1 && (freq_hz - DL1ABC_HZ).abs() <= 93.75),
+                "the upper stream promoted DL1ABC: {e:?}"
+            );
+            assert!(
+                !(input == 0 && (freq_hz - JA1XYZ_HZ).abs() <= 93.75),
+                "the lower stream promoted JA1XYZ: {e:?}"
+            );
+        }
+    }
+    assert!(got.ends.iter().all(|e| e.result.is_ok()));
+}
+
+/// MAN-310: the one-channel guard leaves no gap at the split point.
+#[test]
+fn a_signal_on_the_split_point_is_spotted_once() {
+    let got = split_pair(&[("CQ CQ DE OH2XX OH2XX K", 21_075_000.0)], 41);
+    assert_eq!(
+        call_counts(&got.spots),
+        counts(&[("OH2XX", 1)]),
+        "{:#?}",
+        got.spots
     );
 }

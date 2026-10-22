@@ -4,13 +4,22 @@
 //! of data per frame: `KiwiIqSource::connect` configures
 //! `MAX_WS_FRAME_BYTES` (64 KiB, ~30x the constant 2068-byte real SND
 //! capture), and an over-bound frame must surface as a connection-level
-//! `Err` from `read()` -- which the CLI's `ReconnectingSource` (MAN-73)
-//! turns into a logged reconnect, exactly like any other lost connection.
+//! `Err` -- which the CLI's `ReconnectingSource` (MAN-73) turns into a
+//! logged reconnect, exactly like any other lost connection.
+//!
+//! MAN-418: the fake server must hold the connection until the client hangs
+//! up. A single `ws.read()` returns on the client's first post-handshake
+//! `SET`; dropping the socket then, with the rest of `connect()`'s `SET`
+//! burst still arriving, resets the connection and fails a later send
+//! inside `connect()` (EPIPE on macOS, WSAECONNABORTED on Windows) -- a
+//! reset from this side, not the size bound. The assertion also pins the
+//! error to tungstenite's `Capacity`, so a reset can never pass for it.
 
 use manta_input::{kiwi::KiwiIqSource, IqSource};
 use num_complex::Complex32;
 use std::net::TcpListener;
 use std::time::Duration;
+use tungstenite::error::CapacityError;
 use tungstenite::Message;
 
 #[test]
@@ -33,21 +42,36 @@ fn frame_larger_than_the_bound_is_rejected_not_buffered() {
         oversized.extend_from_slice(b"SND");
         oversized.resize(64 * 1024 + 4096, 0);
         ws.send(Message::binary(oversized)).unwrap();
-        // Park with a bounded read: hold the connection open so neither a
-        // close nor a reset from this side can be what ends the client's
-        // read -- only the frame's size may end it.
-        let _ = ws.read();
+        // Park until the client hangs up (its read errors on the oversized
+        // frame, then it drops the socket): drain every SET it sends, so
+        // neither a close nor a reset from this side can be what ends the
+        // client's connection -- only the frame's size may end it. The 30 s
+        // read timeout bounds this if the client never hangs up.
+        while ws.read().is_ok() {}
     });
 
-    let mut src = KiwiIqSource::connect("127.0.0.1", port, 14_025_000.0, "").unwrap();
+    // Whichever call meets the oversized frame -- today read(), since
+    // connect()'s handshake stops at `sample_rate=` -- it must be the
+    // connection-level size-bound error.
     let mut buf = vec![Complex32::new(0.0, 0.0); 8192];
-    let outcome = src.read(&mut buf);
+    let outcome = KiwiIqSource::connect("127.0.0.1", port, 14_025_000.0, "")
+        .and_then(|mut src| src.read(&mut buf));
+    let err = match outcome {
+        Ok(n) => panic!(
+            "a frame larger than MAX_WS_FRAME_BYTES must surface a connection-level Err, \
+             not be accepted and decoded -- read returned Ok({n})"
+        ),
+        Err(e) => e,
+    };
     assert!(
-        outcome.is_err(),
-        "a frame larger than MAX_WS_FRAME_BYTES must surface a connection-level Err \
-         (tungstenite Capacity), not be accepted and decoded -- read returned {:?}",
-        outcome.map(|_| "Ok(..)")
+        err.chain().any(|c| matches!(
+            c.downcast_ref::<tungstenite::Error>(),
+            Some(tungstenite::Error::Capacity(
+                CapacityError::MessageTooLong { .. }
+            ))
+        )),
+        "the Err must be the size bound (tungstenite Capacity), not some other \
+         connection failure: {err:#}"
     );
-    drop(src);
-    let _ = server.join();
+    server.join().expect("the fake KiwiSDR panicked");
 }

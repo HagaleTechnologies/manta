@@ -431,6 +431,16 @@ impl<S: IqSource + ?Sized> IqSource for RecordingSource<S> {
         self.pending_gap.take()
     }
 
+    // MAN-305: a spliced loss reaches the engine; the recording does not
+    // carry it (docs/GUIDES/iq-recording.md).
+    fn take_missing_samples(&mut self) -> Option<u64> {
+        self.inner.take_missing_samples()
+    }
+
+    fn acquisition_start_offset(&self) -> std::time::Duration {
+        self.inner.acquisition_start_offset()
+    }
+
     fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
         self.inner.health_counters()
     }
