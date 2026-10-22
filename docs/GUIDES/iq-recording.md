@@ -114,10 +114,12 @@ recording is finalized with `"reason":"backpressure"` and replays as the
 contiguous part it holds. A failed write leaves the `.partial` metadata,
 which replay refuses.
 
-At shutdown, `run` waits at most 5 s in total for its recordings to
-finish, however many inputs record, before it drains its clients. The
-systemd unit's `TimeoutStopSec=60` covers that wait, the 50 s client
-drain and the runtime shutdown. If a recording does not finish in time:
+At shutdown, `run` closes its recordings when decoding ends and gives
+them 5 s in total to finish, however many inputs record. They finish
+while the clients drain, so only what the drain leaves of those 5 s is
+waited out after it, and the systemd unit's `TimeoutStopSec=60` still
+covers the 50 s client drain and the runtime shutdown. If a recording
+does not finish in time:
 
 ```text
 warning: IQ recording finalization timed out: session.cf32; completion is unconfirmed
@@ -167,7 +169,11 @@ it had and starts again with its sample clock moved on by the outage
 `run --source` replays it the same way: the outage is not spliced out and
 not filled with zeros. A loss the input reports without a sample count
 (for example a SoapySDR overflow) reaches neither the engine nor the
-recording as a gap.
+recording as a gap. A loss the input splices over and counts instead
+(MAN-305: HPSDR protocol 2's lost datagrams, `take_missing_samples`)
+moves the live engine's clock on without closing tracks, but the
+recording does not carry it: a replay runs the spliced samples together,
+so its timestamps after such a loss are early by the lost duration.
 
 `manta decode` handles them the same way: it closes its tracks at each
 gap, as a discontinuity rather than an end of signal, and starts a fresh

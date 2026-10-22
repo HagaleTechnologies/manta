@@ -34,10 +34,13 @@ described on the command line. Operator guide:
   full queue stops the recording at the last accepted block
   (`reason: backpressure`); a write, flush or publication error stops it
   and leaves the `.partial` metadata. Either warns once, decoding
-  continues, and `run` exits 1 at the end. Shutdown waits at most 5 s in
-  total, one deadline shared by every recording input, before the client
-  drain (`TimeoutStopSec=60` covers 5 + 50 + 2 s); a timeout cancels
-  publication if it has not begun.
+  continues, and `run` exits 1 at the end. When decoding ends, `run`
+  closes every recording and gives them one 5 s deadline in total; the
+  writers finalize during the client drain and are collected after it, so
+  recording adds no time to the 50 + 2 s that `TimeoutStopSec=60` covers
+  (a drain shorter than 5 s waits out the rest). A timeout cancels
+  publication if it has not begun. A live recording's start time is the
+  spot servers' session epoch, one value for both.
 - **D3a — configuration.** `record_iq` is a shared `[input]` key (and
   `MANTA_INPUT_RECORD_IQ`), resolved against the config file's directory
   like `path` (the input path resolver now takes the key name). Each
@@ -136,11 +139,20 @@ described on the command line. Operator guide:
 - Second round: a flush failure and a gap refused by a full queue (no gap
   record describes unrecorded samples); a gap inside `listen`'s
   calibration window, recording on and off; a copied pair with a moved
-  mtime keeps its epoch and nonce, and replays identically with the spot
-  servers up; `record_iq` precedence (CLI > environment > file, CLI and
+  mtime keeps its epoch and nonce (unit tests on the resolved values), and
+  replays to the same `run --json` output with the spot servers up;
+  `record_iq` precedence (CLI > environment > file, CLI and
   environment paths from the working directory); ci16 through `run`
   equals its PCM16 WAV; two recordings replay as a two-input daemon to
   the same bytes three times; a same-rate request on a gapped recording
   and decimation of a gap-free one still work; recording onto the
   replayed file and two spellings of one destination are refused.
+- Third round (after merging main at `63af0df`): the recorder forwards
+  MAN-305's `take_missing_samples` and MAN-259's
+  `acquisition_start_offset`; a spliced loss is not recorded (see the
+  guide). A multi-stream `bands` plan refuses one `record_iq`. Tests add
+  bands outside the stored spectrum, a guard wider than a decimated
+  Nyquist, every forwarded hook with a gap before a multi-block read, a
+  restart leaving the payload untouched, a centre override on a gapped
+  recording, and decimation of headerless cf32.
 - No golden vector or legacy WAV output changes.

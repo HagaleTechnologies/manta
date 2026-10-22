@@ -315,6 +315,14 @@ fn listen_round_trip(split: usize, name: &str, expect_closure: bool) {
         (spec.fs, spec.center_freq_hz)
     );
     assert_eq!(replay.summary().header.start_time(), Some(start));
+    // And its source guards: a plain complex source's full Nyquist band,
+    // no trusted band and no analytic guard (rig audio's are kept by
+    // `a_recording_keeps_the_audio_source_guards`).
+    let bare = source();
+    assert_eq!(replay.rf_passband_hz(), bare.rf_passband_hz());
+    assert_eq!(replay.rf_passband_hz(), (-spec.fs / 2.0, spec.fs / 2.0));
+    assert_eq!(replay.trusted_band_hz(), None);
+    assert_eq!(replay.analytic_guard_hz(), 0.0);
     let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
     let (mut at, mut gaps) = (0usize, Vec::new());
     loop {

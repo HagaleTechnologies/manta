@@ -896,14 +896,14 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     // MAN-78 D7: draining from here on; a later SIGHUP is ignored.
     drain_gate.close();
     stop_ready.store(true, Ordering::Relaxed);
-    // MAN-309: every input has ended, so every queue is closed; finalize
-    // every recording within one shared deadline (one failing does not stop
-    // the others).
+    // MAN-309: every input has ended, so every queue is closed; the writers
+    // finalize during the drain and are collected after it, by one shared
+    // deadline (one failing does not stop the others).
     let handles: Vec<_> = recordings
         .lock()
         .map(|mut slots| slots.iter_mut().filter_map(Option::take).collect())
         .unwrap_or_default();
-    let recording_result = crate::finish_recordings(handles);
+    let recording_deadline = crate::close_recordings(&handles);
     if print_text {
         for line in text.finish() {
             if logging::is_json() {
@@ -923,6 +923,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         crate::signal_spot_server_shutdown(&rt, &server);
         crate::shutdown_runtime_after_drain(rt, &server.tasks);
     }
+    let recording_result = crate::finish_recordings(handles, recording_deadline);
     if let Some(failed) = ends.iter().find(|e| e.result.is_err()) {
         let e = failed.result.as_ref().err().map(|e| format!("{e:#}"));
         bail!(

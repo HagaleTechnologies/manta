@@ -2195,21 +2195,33 @@ fn start_input_recording(
     Ok((Box::new(rec.with_stop_flag(stop)), handle))
 }
 
-/// MAN-309: how long `run` waits, in total, for its recordings to finalize
-/// at shutdown. The wait comes before the client drain, so the service
-/// manager's stop budget (`TimeoutStopSec=60` against the 50 s
-/// `SHUTDOWN_DRAIN_DEADLINE` plus 2 s of runtime shutdown) still covers it.
+/// MAN-309: how long `run` gives its recordings, in total, to finalize
+/// once decoding ends. The writers finalize while the clients drain, and
+/// only what the drain left of this is waited out after it, so recording
+/// adds nothing to the stop budget the service manager allows
+/// (`TimeoutStopSec=60` against the 50 s `SHUTDOWN_DRAIN_DEADLINE` plus
+/// 2 s of runtime shutdown) beyond this bound when the drain is shorter.
 const RECORDING_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// MAN-309: finalizes every recording of `run` within one shared
-/// `RECORDING_FINISH_TIMEOUT`, however many inputs record, and logs each
-/// outcome. `Err` (the first failure) when any recording did not complete,
-/// which `run` turns into its exit status after the drain; one failing
-/// recording does not stop the others from finishing.
+/// MAN-309: closes every recording's queue once decoding has ended, so
+/// each writer finalizes during the client drain. Returns the one deadline
+/// `finish_recordings` waits until, however many inputs record.
+fn close_recordings(handles: &[manta_input::RecordingHandle]) -> std::time::Instant {
+    for handle in handles {
+        handle.close();
+    }
+    std::time::Instant::now() + RECORDING_FINISH_TIMEOUT
+}
+
+/// MAN-309: collects every recording of `run` by `deadline` (from
+/// `close_recordings`) and logs each outcome. `Err` (the first failure)
+/// when any recording did not complete, which `run` turns into its exit
+/// status after the drain; one failing recording does not stop the others
+/// from finishing.
 fn finish_recordings(
     handles: impl IntoIterator<Item = manta_input::RecordingHandle>,
+    deadline: std::time::Instant,
 ) -> Result<()> {
-    let deadline = std::time::Instant::now() + RECORDING_FINISH_TIMEOUT;
     let mut result = Ok(());
     for handle in handles {
         let finished = finish_recording(handle, deadline);
@@ -6621,6 +6633,14 @@ fn run_command() -> Result<std::process::ExitCode> {
             // the entire replayed file a second time after it's already
             // been opened; skip that full-file pass entirely when nothing
             // downstream needs it (round-7 review finding).
+            // MAN-309: one epoch for the spot servers and the recording, so
+            // a live recording starts at the instant its spots are timed
+            // from; resolved only when one of them consumes it.
+            let session_epoch = if loaded.server.is_some() || record_iq.is_some() {
+                Some(resolve_epoch(replay_path.as_deref(), replay_epoch)?)
+            } else {
+                None
+            };
             let (
                 server_runtime,
                 spot_server,
@@ -6653,7 +6673,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                     // for a live session (so two live sessions started
                     // within the same wall-clock second don't collide
                     // either).
-                    let epoch = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
+                    let epoch = match session_epoch {
+                        Some(epoch) => epoch,
+                        None => resolve_epoch(replay_path.as_deref(), replay_epoch)?,
+                    };
                     let session_nonce: u128 = match &replay_path {
                         Some(replay_path) => session_nonce_for_replay_path(replay_path)?,
                         // Live session: `epoch` above is already SystemTime::now().
@@ -6960,10 +6983,14 @@ fn run_command() -> Result<std::process::ExitCode> {
             }
             // MAN-309: the exact samples, gaps and source properties handed
             // to the engine are recorded; the decoder never waits on the
-            // writer. A replay's recording starts at the replay's epoch.
+            // writer. The recording starts at the session's epoch: a live
+            // run's spot-server epoch, or a replay's own.
             let (src, recording) = match &record_iq {
                 Some(path) => {
-                    let start = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
+                    let start = match session_epoch {
+                        Some(epoch) => epoch,
+                        None => resolve_epoch(replay_path.as_deref(), replay_epoch)?,
+                    };
                     let (src, handle) = start_input_recording(src, path, start, stop.clone())?;
                     (src, Some(handle))
                 }
@@ -7174,9 +7201,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             // mid-drain.
             drain_gate.close();
             stop_ready.store(true, std::sync::atomic::Ordering::Relaxed);
-            // MAN-309: the source is gone, so the queue is closed; finalize
-            // the recording before the drain, within its own deadline.
-            let recording_result = finish_recordings(recording);
+            // MAN-309: the source is gone, so the queue is closed; the
+            // writer finalizes during the drain and is collected after it.
+            let recording_deadline = close_recordings(recording.as_slice());
             // MAN-234: the run's total, only when it grew past the count
             // the first-sample line reported (success and error alike).
             let bad_total = bad_samples.load(std::sync::atomic::Ordering::Relaxed);
@@ -7287,6 +7314,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             if let Some((rt, server)) = server_runtime.zip(spot_server.as_ref()) {
                 shutdown_runtime_after_drain(rt, &server.tasks);
             }
+            let recording_result = finish_recordings(recording, recording_deadline);
             listen_result?;
             // MAN-232: a closed (or otherwise failed) stdout reader stopped
             // the loop above through `stop`; only now, with the drain done,

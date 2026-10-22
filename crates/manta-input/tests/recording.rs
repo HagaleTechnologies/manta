@@ -389,3 +389,108 @@ fn an_end_after_a_stop_request_is_a_stopped_recording() {
         }
     }
 }
+
+/// A live-like source: health counters, a confirmed-live flag, a spliced
+/// loss, an acquisition offset and a gap before a read that spans several
+/// writer blocks.
+struct LiveLike {
+    reads: VecDeque<(Option<u64>, Vec<Complex32>)>,
+    pending: Option<u64>,
+    missing: Option<u64>,
+    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    counters: std::sync::Arc<manta_input::InputHealthCounters>,
+}
+
+impl IqSource for LiveLike {
+    fn sample_rate(&self) -> f64 {
+        96_000.0
+    }
+    fn center_freq_hz(&self) -> f64 {
+        7_030_000.0
+    }
+    fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+        let Some((gap, s)) = self.reads.pop_front() else {
+            return Ok(0);
+        };
+        buf[..s.len()].copy_from_slice(&s);
+        self.pending = gap;
+        Ok(s.len())
+    }
+    fn confirmed_live_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        Some(self.live.clone())
+    }
+    fn take_discontinuity(&mut self) -> Option<u64> {
+        self.pending.take()
+    }
+    fn take_missing_samples(&mut self) -> Option<u64> {
+        self.missing.take()
+    }
+    fn acquisition_start_offset(&self) -> Duration {
+        Duration::from_millis(250)
+    }
+    fn health_counters(&self) -> Option<std::sync::Arc<manta_input::InputHealthCounters>> {
+        Some(self.counters.clone())
+    }
+}
+
+#[test]
+fn the_recorder_forwards_every_live_hook_and_records_a_gap_before_a_multi_block_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.cf32");
+    let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let counters = std::sync::Arc::new(manta_input::InputHealthCounters::new());
+    let src = LiveLike {
+        // 3 blocks of 4096 frames and part of a fourth, after a gap.
+        reads: VecDeque::from(vec![
+            (None, block(0, 100)),
+            (Some(4_800), block(100, 13_000)),
+        ]),
+        pending: None,
+        missing: Some(11),
+        live: live.clone(),
+        counters: counters.clone(),
+    };
+    let (mut rec, handle) = start_recording(Box::new(src), &path, SystemTime::now(), None).unwrap();
+    let rec_live = rec
+        .confirmed_live_handle()
+        .expect("confirmed_live_handle forwarded");
+    assert!(std::sync::Arc::ptr_eq(&rec_live, &live));
+    let rec_counters = rec.health_counters().expect("health_counters forwarded");
+    assert!(std::sync::Arc::ptr_eq(&rec_counters, &counters));
+    assert_eq!(rec.acquisition_start_offset(), Duration::from_millis(250));
+    assert_eq!(rec.take_missing_samples(), Some(11));
+    assert_eq!(rec.take_missing_samples(), None);
+    let t = trace(&mut rec);
+    assert_eq!(t[0].0, Ok(100));
+    assert_eq!(t[0].1, None);
+    assert_eq!(t[1].0, Ok(13_000));
+    assert_eq!(t[1].1, Some(4_800));
+    assert_eq!(t[1].2, bits(&block(100, 13_000)));
+    drop(rec);
+    match handle.finish(Duration::from_secs(5)) {
+        RecordingOutcome::Finished { samples, .. } => assert_eq!(samples, 13_100),
+        other => panic!("{other:?}"),
+    }
+    let meta = std::fs::read_to_string(metadata_path(&path)).unwrap();
+    let gaps: Vec<&str> = meta.lines().filter(|l| l.contains("\"gap\"")).collect();
+    assert_eq!(
+        gaps,
+        [r#"{"type":"gap","before_sample":100,"missing_samples":4800}"#]
+    );
+    let mut replay = RecordedIqSource::open(&path).unwrap();
+    let mut buf = vec![Complex32::new(0.0, 0.0); 20_000];
+    let mut all = Vec::new();
+    let mut gap_at = Vec::new();
+    loop {
+        let n = replay.read(&mut buf).unwrap();
+        if let Some(g) = replay.take_discontinuity() {
+            gap_at.push((all.len(), g));
+        }
+        if n == 0 {
+            break;
+        }
+        all.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(gap_at, [(100, 4_800)]);
+    assert_eq!(bits(&all), bits(&block(0, 13_100)));
+}

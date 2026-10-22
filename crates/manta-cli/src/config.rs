@@ -635,10 +635,9 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
                 }
                 None => input_toml.kind.map_or("audio", InputKind::name).to_string(),
             };
-            let (inputs, entry_notes) =
-                take_entry(input_toml, name, None, "[input]", &|key, p| {
-                    resolve_path("input", key, p)
-                })
+            let (inputs, entry_notes) = take_entry(input_toml, name, None, "[input]", &|key, p| {
+                resolve_path("input", key, p)
+            })
             .map_err(|e| anyhow!("{origin}: [input]: {e}{}", overlay.suffix("input")))?;
             notes.extend(entry_notes);
             if inputs.len() > manta_engine::MAX_INPUTS {

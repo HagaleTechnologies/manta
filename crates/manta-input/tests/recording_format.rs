@@ -245,6 +245,25 @@ fn malformed_metadata_is_rejected() {
             good.replace("[-24000.0,24000.0]", "[1000.0,-1000.0]"),
             "rf_passband_hz",
         ),
+        // Bands must lie inside the stored spectrum.
+        (
+            good.replace("[-24000.0,24000.0]", "[-30000.0,24000.0]"),
+            "rf_passband_hz",
+        ),
+        (
+            good.replace(
+                "\"trusted_band_hz\":null",
+                "\"trusted_band_hz\":[-1000.0,25000.0]",
+            ),
+            "trusted_band_hz",
+        ),
+        (
+            good.replace(
+                "\"trusted_band_hz\":null",
+                "\"trusted_band_hz\":[500.0,-500.0]",
+            ),
+            "trusted_band_hz",
+        ),
         (
             format!("{}\n", "x".repeat(MAX_METADATA_LINE_BYTES + 10)),
             "longer than",
@@ -276,6 +295,20 @@ fn malformed_metadata_is_rejected() {
     )
     .unwrap();
     expect_err(&path, "strictly increase");
+}
+
+#[test]
+fn a_decimated_recording_keeps_a_guard_wider_than_its_nyquist() {
+    // MAN-273: rig audio decimated to 6 kS/s keeps the 48 kS/s analytic
+    // guard; it vetoes nothing new there, and the recording keeps it.
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = header(6_000.0);
+    h.analytic_guard_hz = 4_000.0;
+    h.trusted_band_hz = Some([-2_500.0, 2_500.0]);
+    let path = write_pair(dir.path(), &h, &samples(10), &[]);
+    let src = RecordedIqSource::open(&path).unwrap();
+    assert_eq!(src.analytic_guard_hz(), 4_000.0);
+    assert_eq!(src.trusted_band_hz(), Some((-2_500.0, 2_500.0)));
 }
 
 #[test]

@@ -255,6 +255,16 @@ fn write_recording(
     // position become one record.
     let mut pending: Option<u64> = None;
     let mut bytes = Vec::with_capacity(RECORDING_BLOCK_FRAMES * 8);
+    // Checked: an overflowing sum fails the recording, not the decoder.
+    let add_gap = |pending: &mut Option<u64>, g: u64| match pending.unwrap_or(0).checked_add(g) {
+        Some(total) => {
+            *pending = Some(total);
+            Ok(())
+        }
+        None => Err(std::io::Error::other(
+            "input gaps overflow the sample clock",
+        )),
+    };
     let flush_gap =
         |pending: &mut Option<u64>, meta: &mut Box<dyn Write + Send>, at: u64| match pending.take()
         {
@@ -274,24 +284,20 @@ fn write_recording(
                 gap,
                 samples: block,
             } => {
-                if let Some(g) = gap {
-                    pending = Some(pending.unwrap_or(0).saturating_add(g));
-                }
                 bytes.clear();
                 for s in &block {
                     bytes.extend_from_slice(&s.re.to_bits().to_le_bytes());
                     bytes.extend_from_slice(&s.im.to_bits().to_le_bytes());
                 }
-                flush_gap(&mut pending, &mut meta, samples).and_then(|()| {
-                    payload.write_all(&bytes)?;
-                    samples += block.len() as u64;
-                    Ok(())
-                })
+                gap.map_or(Ok(()), |g| add_gap(&mut pending, g))
+                    .and_then(|()| flush_gap(&mut pending, &mut meta, samples))
+                    .and_then(|()| {
+                        payload.write_all(&bytes)?;
+                        samples += block.len() as u64;
+                        Ok(())
+                    })
             }
-            Msg::TerminalGap(g) => {
-                pending = Some(pending.unwrap_or(0).saturating_add(g));
-                Ok(())
-            }
+            Msg::TerminalGap(g) => add_gap(&mut pending, g),
         };
         if let Err(e) = result {
             return fail(e);
@@ -456,6 +462,12 @@ impl RecordingHandle {
     /// The payload path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Closes the queue, so the writer finalizes what it accepted while
+    /// the caller does other shutdown work; `finish` collects the outcome.
+    pub fn close(&self) {
+        self.shared.close();
     }
 
     /// Closes the queue and waits at most `timeout` for the writer to

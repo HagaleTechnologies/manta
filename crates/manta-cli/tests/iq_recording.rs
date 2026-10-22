@@ -452,6 +452,61 @@ fn recorded_gaps_replay_through_run_and_decode_without_splicing() {
     ])
     .stdout;
     assert!(String::from_utf8_lossy(&decimated).contains("W1AW"));
+
+    // A centre override moves only the RF origin: the recording's gap
+    // still segments `decode`, and still refuses decimation under `run`.
+    let moved = format!("{}", manifest.center_freq_hz + 1_000.0);
+    let decode_at = |p: &Path| {
+        run_ok(&[
+            "decode".as_ref(),
+            p.as_os_str(),
+            "--json".as_ref(),
+            "--center-freq-hz".as_ref(),
+            moved.as_ref(),
+        ])
+        .stdout
+    };
+    let moved_report = decode_at(&gapped);
+    assert!(String::from_utf8_lossy(&moved_report).contains("W1AW"));
+    assert_ne!(moved_report, report);
+    assert_ne!(decode_at(&smooth), moved_report);
+    let (code, stderr) = stderr_of(&[
+        "run".as_ref(),
+        "--source".as_ref(),
+        gapped.as_os_str(),
+        "--source-iq".as_ref(),
+        "--dial-freq-hz".as_ref(),
+        moved.as_ref(),
+        "--capture-rate-hz".as_ref(),
+        "48000".as_ref(),
+    ]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("cannot decimate an IQ recording with gaps"),
+        "{stderr}"
+    );
+
+    // Headerless cf32 (the same samples without metadata) decimates too.
+    let raw = dir.path().join("raw.cf32");
+    std::fs::write(&raw, cf32_bytes(&samples)).unwrap();
+    let centre = format!("{}", manifest.center_freq_hz);
+    let raw_decimated = run_ok(&[
+        "run".as_ref(),
+        "--source".as_ref(),
+        raw.as_os_str(),
+        "--source-iq".as_ref(),
+        "--iq-format".as_ref(),
+        "cf32".as_ref(),
+        "--sample-rate-hz".as_ref(),
+        rate.as_ref(),
+        "--dial-freq-hz".as_ref(),
+        centre.as_ref(),
+        "--json".as_ref(),
+        "--capture-rate-hz".as_ref(),
+        "48000".as_ref(),
+    ])
+    .stdout;
+    assert!(String::from_utf8_lossy(&raw_decimated).contains("W1AW"));
 }
 
 #[test]
@@ -718,8 +773,9 @@ fn a_service_config_records_relative_to_its_file_and_config_check_creates_nothin
         }
     );
     assert_eq!(std::fs::read(&rec).unwrap(), cf32_bytes(&wav_samples(&wav)));
-    // A restart with the same destination fails and touches nothing.
+    // A restart with the same destination fails and touches neither file.
     let before = std::fs::read(metadata_path(&rec)).unwrap();
+    let payload_before = std::fs::read(&rec).unwrap();
     let out = manta()
         .args(["run", "--json", "--config"])
         .arg(&toml)
@@ -727,6 +783,7 @@ fn a_service_config_records_relative_to_its_file_and_config_check_creates_nothin
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(std::fs::read(metadata_path(&rec)).unwrap(), before);
+    assert_eq!(std::fs::read(&rec).unwrap(), payload_before);
 }
 
 #[test]

@@ -112,7 +112,7 @@ impl IqSource for PacedSource {
         // MAN-309: a gap before these samples is paced once, then handed on.
         if let Some(gap) = self.inner.take_discontinuity() {
             self.pending_gap = Some(add_gap(self.pending_gap, gap)?);
-            self.delivered = self.delivered.saturating_add(gap);
+            self.delivered = add_gap(Some(self.delivered), gap)?;
         }
         self.delivered += n as u64;
         // Sleep after the read, against the count that includes this buffer,
