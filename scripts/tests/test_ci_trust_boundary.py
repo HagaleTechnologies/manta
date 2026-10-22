@@ -1,13 +1,8 @@
 """Static checks for the MAN-243 CI trust boundary (which PR revisions may run in main's context,
-<<<<<<< HEAD
 which runs may write the shared build cache, and that release builds start cold), for MAN-245's
-one Dependabot classification across the gate workflows, and for MAN-340's dispatched-tree merge
-(a dispatched run tests the PR head merged with the main commit its workflow file came from).
-=======
-which runs may write the shared build cache, and that release builds start cold), for
-MAN-245's one Dependabot classification across the gate workflows, and for MAN-380's test-soapy
-cache key on the installed Homebrew soapysdr.
->>>>>>> c9468240e2b44d8b74d98e660e3125867a50d344
+one Dependabot classification across the gate workflows, for MAN-340's dispatched-tree merge
+(a dispatched run tests the PR head merged with the main commit its workflow file came from),
+and for MAN-380's test-soapy cache key on the installed Homebrew soapysdr.
 
 stdlib unittest only -- PyYAML is not available on every runner -- so workflows are read as text.
 Run: python3 -m unittest scripts.tests.test_ci_trust_boundary -v
