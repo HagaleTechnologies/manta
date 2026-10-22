@@ -532,7 +532,8 @@ impl Endpoints {
                     .spawn(move || {
                         let result = (host.as_str(), port)
                             .to_socket_addrs()
-                            .map_err(|e| e.to_string())
+                            // Name the endpoint: any group's worker may report it.
+                            .map_err(|e| format!("{host}:{port}: {e}"))
                             .and_then(|mut addresses| {
                                 addresses
                                     .find(|a| a.is_ipv4())
