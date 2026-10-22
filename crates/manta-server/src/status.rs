@@ -5,7 +5,7 @@
 //! `RUST_LOG`-gated, stderr-only `tracing` conventions MAN-59 established
 //! (`docs/DECISIONS/2026-09-03-man59-connection-audit-logging.md`).
 
-use crate::metrics::Metrics;
+use crate::metrics::{InputHearing, Metrics};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -202,6 +202,9 @@ pub struct StatusSnapshot {
     /// MAN-13: `(decoding, configured)` inputs, set only with two or more,
     /// so a one-input line is unchanged.
     pub inputs: Option<(usize, usize)>,
+    /// MAN-14: each input's hearing in config order, set only with two or
+    /// more inputs, so a one-input line is unchanged.
+    pub hearing: Option<Vec<InputHearing>>,
 }
 
 pub fn format_status_line(s: &StatusSnapshot) -> String {
@@ -209,9 +212,25 @@ pub fn format_status_line(s: &StatusSnapshot) -> String {
         Some((decoding, configured)) => format!(" inputs={decoding}/{configured}"),
         None => String::new(),
     };
+    // MAN-14: `name:spots/distinct calls/cross-input dupes`, per input.
+    let hearing = match &s.hearing {
+        Some(rows) => {
+            let rows: Vec<String> = rows
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{}:{}/{}/{}",
+                        r.name, r.spots, r.distinct_calls, r.cross_input_dupes
+                    )
+                })
+                .collect();
+            format!(" hearing={}", rows.join(","))
+        }
+        None => String::new(),
+    };
     format!(
         "manta status: uptime_s={} pipeline={} tracks={} spots_per_min={:.1} spots_total={} \
-         clients={} (telnet={} json={} ws={}) uplink={}{inputs}",
+         clients={} (telnet={} json={} ws={}) uplink={}{inputs}{hearing}",
         s.uptime_s,
         s.pipeline.as_str(),
         s.active_tracks,
@@ -223,6 +242,11 @@ pub fn format_status_line(s: &StatusSnapshot) -> String {
         s.ws_clients,
         s.uplink.as_str(),
     )
+}
+
+/// MAN-14: the status line's hearing rows, only with two or more inputs.
+fn hearing_of(metrics: &Metrics) -> Option<Vec<InputHearing>> {
+    Some(metrics.input_hearing()).filter(|rows| rows.len() >= 2)
 }
 
 /// Spots per minute over the elapsed window. Returns 0.0 for a zero window
@@ -329,6 +353,7 @@ pub fn spawn_status_line(
                     (decoding, configured) if configured >= 2 => Some((decoding, configured)),
                     _ => None,
                 },
+                hearing: hearing_of(&metrics),
             };
             last_sample = now;
             last_spots = spots_total;
@@ -438,6 +463,7 @@ mod tests {
             uplink: UplinkState::Connected,
             pipeline: PipelineState::Decoding,
             inputs: None,
+            hearing: None,
         });
         for needle in [
             "pipeline=decoding",
@@ -463,6 +489,7 @@ mod tests {
             uplink: UplinkState::Connected,
             pipeline: PipelineState::Decoding,
             inputs: None,
+            hearing: None,
         };
         assert!(format_status_line(&snapshot).ends_with(" uplink=connected"));
         snapshot.inputs = Some((2, 3));
@@ -471,6 +498,47 @@ mod tests {
             "manta status: uptime_s=600 pipeline=decoding tracks=7 spots_per_min=3.2 \
              spots_total=31 clients=2 (telnet=1 json=1 ws=0) uplink=connected inputs=2/3"
         );
+    }
+
+    /// MAN-14: the hearing segment follows `inputs=k/n`, one
+    /// `name:spots/calls/dupes` triple per input in config order.
+    #[test]
+    fn status_line_appends_hearing_after_inputs() {
+        let row = |name: &str, spots, distinct_calls, cross_input_dupes| InputHearing {
+            name: name.to_string(),
+            spots,
+            distinct_calls,
+            cross_input_dupes,
+            ..InputHearing::default()
+        };
+        let line = format_status_line(&StatusSnapshot {
+            uptime_s: 90,
+            active_tracks: 2,
+            spots_per_min: 0.7,
+            spots_total: 1,
+            telnet_clients: 0,
+            json_clients: 0,
+            ws_clients: 0,
+            uplink: UplinkState::NotConfigured,
+            pipeline: PipelineState::Decoding,
+            inputs: Some((2, 2)),
+            hearing: Some(vec![row("live", 1, 1, 0), row("deaf", 0, 0, 0)]),
+        });
+        assert!(
+            line.ends_with(" inputs=2/2 hearing=live:1/1/0,deaf:0/0/0"),
+            "{line}"
+        );
+    }
+
+    /// MAN-14: the status task shows hearing only with two or more inputs.
+    #[test]
+    fn hearing_rows_come_from_metrics_with_two_or_more_inputs() {
+        let m = Metrics::new();
+        assert_eq!(hearing_of(&m), None);
+        m.register_input_hearing(&["only".to_string()]);
+        assert_eq!(hearing_of(&m), None);
+        m.register_input_hearing(&["only".to_string(), "second".to_string()]);
+        assert_eq!(hearing_of(&m).map(|rows| rows.len()), Some(2));
     }
 
     #[test]

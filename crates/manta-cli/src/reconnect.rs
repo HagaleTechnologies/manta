@@ -238,7 +238,12 @@ pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
     /// first successful read produces a discontinuity, which takes it.
     resumption_anchor: Option<Instant>,
     last_ok: Instant,
+    /// This wrapper's own outage plus any the inner source reported
+    /// (MAN-305), pending for `take_discontinuity()`.
     discontinuity: Option<u64>,
+    /// MAN-305: the inner source's spliced losses, pending for
+    /// `take_missing_samples()`.
+    missing: Option<u64>,
     /// MAN-228: `None` when the first source counts nothing (MAN-56's
     /// "absent means not measured").
     input_health: Option<Arc<InputHealthTotals>>,
@@ -303,6 +308,7 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
             resumption_anchor: None,
             last_ok,
             discontinuity: None,
+            missing: None,
             input_health,
         }
     }
@@ -319,6 +325,23 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
         if healthy != self.reported_healthy {
             (self.on_health)(healthy);
             self.reported_healthy = healthy;
+        }
+    }
+
+    /// MAN-305: fold the gap reports the inner source left for the read
+    /// that just returned into this wrapper's own. An inner outage adds to
+    /// any outage of this wrapper's still pending (until MAN-305 it was
+    /// dropped, so no live source's gap report reached `listen()`), and a
+    /// spliced loss is passed through.
+    fn absorb_inner_gaps(&mut self) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        if let Some(k) = inner.take_discontinuity() {
+            *self.discontinuity.get_or_insert(0) += k;
+        }
+        if let Some(k) = inner.take_missing_samples() {
+            *self.missing.get_or_insert(0) += k;
         }
     }
 
@@ -541,7 +564,12 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
             }
             let inner = self.inner.as_mut().expect("checked Some above");
             match inner.read(buf) {
-                Ok(0) => return Ok(0),
+                Ok(0) => {
+                    // An inner end of stream may leave a gap pending too
+                    // (MAN-258).
+                    self.absorb_inner_gaps();
+                    return Ok(0);
+                }
                 Ok(n) => {
                     if !self.productive {
                         self.productive = true;
@@ -558,6 +586,9 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                             ));
                         }
                     }
+                    // After this wrapper's own outage, so an inner report
+                    // adds to it rather than being overwritten.
+                    self.absorb_inner_gaps();
                     self.last_ok = self.env.now();
                     self.report_health(true);
                     return Ok(n);
@@ -587,6 +618,10 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
 
     fn take_discontinuity(&mut self) -> Option<u64> {
         self.discontinuity.take()
+    }
+
+    fn take_missing_samples(&mut self) -> Option<u64> {
+        self.missing.take()
     }
 }
 
@@ -736,6 +771,151 @@ mod tests {
 
     fn buf(n: usize) -> Vec<Complex32> {
         vec![Complex32::new(0.0, 0.0); n]
+    }
+
+    /// MAN-305: a `ScriptedSource` that, on its read number `i` (0-based),
+    /// leaves pending the outage or spliced loss `gaps`/`missing` hold for
+    /// `i`, as a numbered-packet source that detected a loss does.
+    struct GapScriptedSource {
+        inner: ScriptedSource,
+        reads: usize,
+        gaps: Vec<(usize, u64)>,
+        missing: Vec<(usize, u64)>,
+        pending_gap: Option<u64>,
+        pending_missing: Option<u64>,
+    }
+
+    impl GapScriptedSource {
+        fn new(script: Vec<anyhow::Result<Vec<Complex32>>>) -> Self {
+            GapScriptedSource {
+                inner: scripted(FS, CENTER, script),
+                reads: 0,
+                gaps: Vec::new(),
+                missing: Vec::new(),
+                pending_gap: None,
+                pending_missing: None,
+            }
+        }
+    }
+
+    impl IqSource for GapScriptedSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.sample_rate()
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz()
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {
+            let i = self.reads;
+            self.reads += 1;
+            for &(_, k) in self.gaps.iter().filter(|(at, _)| *at == i) {
+                *self.pending_gap.get_or_insert(0) += k;
+            }
+            for &(_, k) in self.missing.iter().filter(|(at, _)| *at == i) {
+                *self.pending_missing.get_or_insert(0) += k;
+            }
+            self.inner.read(buf)
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            self.pending_gap.take()
+        }
+        fn take_missing_samples(&mut self) -> Option<u64> {
+            self.pending_missing.take()
+        }
+    }
+
+    /// A `ReconnectingSource` over `first`, with no reopen scripted.
+    fn wrapping(first: GapScriptedSource) -> ReconnectingSource<FakeEnv> {
+        let (opener, _calls) = opener_from(VecDeque::new());
+        let (health, _log) = health_recorder();
+        ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            FakeEnv::new(),
+        )
+    }
+
+    /// MAN-305: an outage the inner source reports itself reaches
+    /// `listen()`, once, with the read that returns the post-gap samples.
+    /// Until MAN-305 the wrapper returned only its own outage and dropped
+    /// this one.
+    #[test]
+    fn inner_discontinuity_is_forwarded() {
+        let mut first = GapScriptedSource::new(vec![ok_chunk(8), ok_chunk(8)]);
+        first.gaps.push((1, 11_900));
+        let mut src = wrapping(first);
+        let mut b = buf(8);
+        assert_eq!(src.read(&mut b).unwrap(), 8);
+        assert_eq!(src.take_discontinuity(), None);
+        assert_eq!(src.read(&mut b).unwrap(), 8);
+        assert_eq!(src.take_discontinuity(), Some(11_900));
+        assert_eq!(src.take_discontinuity(), None, "reported only once");
+        assert_eq!(
+            src.take_missing_samples(),
+            None,
+            "an outage is not a splice"
+        );
+    }
+
+    /// MAN-305: an inner outage reported on a reopened source's first read
+    /// adds to the reconnect's own outage instead of replacing it or being
+    /// dropped.
+    #[test]
+    fn inner_discontinuity_adds_to_a_pending_outage() {
+        let first = scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]);
+        let mut reopened = GapScriptedSource::new(vec![ok_chunk(8)]);
+        reopened.gaps.push((0, 11_900));
+        let mut reopened = Some(reopened);
+        let opener: Opener =
+            Box::new(move || Ok(Box::new(reopened.take().expect("opened once")) as SendSource));
+        let (health, _log) = health_recorder();
+        let env = FakeEnv::new();
+        let env_handle = env.clone();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            env,
+        );
+
+        let mut b = buf(8);
+        src.read(&mut b).unwrap(); // t0: last_ok set here
+        let t0 = env_handle.clock_now();
+        src.read(&mut b).unwrap(); // errors, sleeps 1s, reopens, resumes
+        let outage = ((env_handle.clock_now() - t0).as_secs_f64() * FS).round() as u64;
+        assert!(
+            outage > 0,
+            "test setup: the reconnect must measure an outage"
+        );
+
+        assert_eq!(src.take_discontinuity(), Some(outage + 11_900));
+        assert_eq!(src.take_discontinuity(), None, "reported only once");
+    }
+
+    /// MAN-305: a loss the inner source spliced over is passed through as
+    /// a spliced loss, once, and never turned into an outage.
+    #[test]
+    fn inner_missing_samples_are_forwarded() {
+        let mut first = GapScriptedSource::new(vec![ok_chunk(8), ok_chunk(8), ok_chunk(8)]);
+        first.missing.push((1, 11_900));
+        let mut src = wrapping(first);
+        let mut b = buf(8);
+        let mut reports = Vec::new();
+        for _ in 0..3 {
+            assert_eq!(src.read(&mut b).unwrap(), 8);
+            reports.push((src.take_missing_samples(), src.take_discontinuity()));
+        }
+        assert_eq!(
+            reports,
+            vec![(None, None), (Some(11_900), None), (None, None)]
+        );
     }
 
     /// MAN-312: the wrapper reports the wrapped source's passband, not the

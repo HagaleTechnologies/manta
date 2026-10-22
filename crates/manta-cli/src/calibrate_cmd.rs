@@ -993,6 +993,7 @@ mod tests {
             let mut r = resolved_with(LiveSourceSpec::Hpsdr(crate::HpsdrOpts {
                 host: Some("h".into()),
                 port: manta_input::hpsdr::CONTROL_PORT,
+                protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
                 freq: Some(7_030_000.0),
                 rate: Some(192_000.0),
             }));

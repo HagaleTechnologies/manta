@@ -179,6 +179,9 @@ fn check_source_with_clock(
         if let Some(missed) = source.take_discontinuity() {
             bail!("source discontinuity ({missed} missing samples)");
         }
+        // MAN-305: `take_missing_samples()` is deliberately not read. A
+        // spliced loss is not a discontinuity, and the source's loss
+        // counters (`health_counters()`) already show it.
         for sample in &buffer[..n] {
             ensure!(
                 sample.re.is_finite() && sample.im.is_finite(),
