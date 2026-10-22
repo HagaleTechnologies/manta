@@ -1813,8 +1813,28 @@ code still hard-codes are listed commented out, marked `not configurable
 yet` -- the loader rejects them with that message rather than ignoring
 them.
 
+MAN-311's `digital_window_filter` defaults to `true`. The fixed dial table
+in [CONFIG.md, Digital-mode windows](CONFIG.md#digital-mode-windows) defines
+the common HF FT8, FT4, WSPR and JS8 exclusions, including 60 m. For each
+receiver, `TrackManager::new` builds a channel mask from
+`center_freq_hz + wrapped_channel_offset(k, n) * fs / n`. A channel is
+excluded when its raw RF center lies in any half-open `[dial_hz, dial_hz +
+3000)` window. Overlaps form a union. Both spawn arbitration slots consult
+the mask before choosing a birth channel. Existing tracks are not closed at
+an edge; leakage can reach an adjacent allowed channel. The normal grid is
+93.75 Hz. Downstream frequency correction does not move the mask.
+
+`false` allocates no mask and removes only this veto. The setting applies to
+file decoding and every service input and requires a restart. The environment
+override is `MANTA_DETECTOR_DIGITAL_WINDOW_FILTER=false`. A quoted TOML string
+is invalid; use a boolean. No decoder engine, ongoing-track lifecycle or spot
+format changes. See the [decision record](DECISIONS/2026-10-19-man311-digital-window-exclusions.md).
+
 ```toml
 [detector]
+# MAN-311: common HF digital-mode windows; false includes them for CW.
+# Restart required. Uses raw channel RF centers before frequency correction.
+digital_window_filter = true
 # Bounds: 0 <= off_snr_db <= on_snr_db <= 100; every *_ms in [0, 3600000],
 # converted with ms_to_hops (§1.1); confirm_ms/hang_ms/gc_ms must round to
 # >= 1 hop; track_cap >= 1.

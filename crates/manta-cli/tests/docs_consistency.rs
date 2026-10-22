@@ -1204,6 +1204,7 @@ fn spec_detector_values_equal_the_code_defaults() {
         "rtty_filter",
         "rtty_dwell_ms",
         "non_cw_filter",
+        "digital_window_filter",
         "unkeyed_close_ms",
         "reacquire_ms",
     ] {
@@ -2625,6 +2626,21 @@ fn spot_schema_documents_uppercased_station_identity() {
             "SPOT-SCHEMA.md {field} still promises to preserve config casing"
         );
     }
+}
+
+#[test]
+fn digital_window_scaffold_states_the_default_and_restart_opt_out() {
+    let scaffold = doc("crates/manta-cli/src/config_init.toml");
+    assert!(scaffold.contains(
+        "# Skip the common HF FT8, FT4, WSPR and JS8 windows when starting CW tracks.\n\
+         # Set false to include these windows. Restart required.\n\
+         #digital_window_filter = true"
+    ));
+    assert!(scaffold_settings()
+        .iter()
+        .any(|(table, key, value)| table == "detector"
+            && key == "digital_window_filter"
+            && value == "true"));
 }
 
 /// Every `#key = value` line of the `manta config init` scaffold, as
