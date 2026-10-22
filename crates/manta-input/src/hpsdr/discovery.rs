@@ -1,14 +1,19 @@
-<<<<<<< HEAD
-//! Bounded Metis discovery, shared by LAN enumeration and source selection.
+//! openHPSDR discovery: a bounded Metis broadcast that enumerates the LAN
+//! and selects a radio when no address is configured (MAN-306), and a
+//! directed probe of one configured radio that never broadcasts (MAN-305
+//! D3, MAN-239).
 //!
 //! P1 offsets follow piHPSDR old_discovery.c and hpsdr-rs discovery.rs;
-//! P2 offsets follow piHPSDR new_discovery.c and sdroxide's discovery module.
-//! The reply's source address, not its payload, supplies the radio's IP.
+//! P2 offsets follow piHPSDR new_discovery.c and sdroxide's discovery
+//! module. A broadcast reply's source address, not its payload, supplies
+//! the radio's IP.
 
+use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::io::ErrorKind;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
 /// Total collection window, including retransmissions.
@@ -256,7 +261,9 @@ pub enum DiscoveryError {
         /// Radios that did answer.
         found: Vec<DiscoveredRadio>,
     },
-    /// The selected radio needs a protocol this driver cannot stream.
+    /// The selected radio answered as protocol 2; automatic discovery
+    /// connects protocol-1 radios only, so it needs an explicit host
+    /// (which the protocol-2 driver serves).
     Unsupported(DiscoveredRadio),
     /// The selected radio is already streaming.
     InUse(DiscoveredRadio),
@@ -279,18 +286,62 @@ impl fmt::Display for DiscoveryError {
                 for r in found { write!(f, "\n  {}", describe_radio(r))?; }
                 Ok(())
             }
-            Self::Unsupported(r) => write!(f, "the openHPSDR radio at {} (MAC {}, {}) speaks openHPSDR protocol 2, which this manta does not support yet; set input.host / --hpsdr-host to force a protocol-1 connection (MAN-305 adds protocol 2)", r.ip, format_mac(&r.mac), board_name(r.protocol, r.board_id)),
+            Self::Unsupported(r) => write!(f, "the openHPSDR radio at {} (MAC {}, {}) answered as protocol 2; automatic discovery connects protocol-1 radios only, so set input.host / --hpsdr-host to use it", r.ip, format_mac(&r.mac), board_name(r.protocol, r.board_id)),
             Self::InUse(r) => write!(f, "the openHPSDR radio is in use: {}; stop the other client, or set input.host / --hpsdr-host to override", describe_radio(r)),
-=======
-//! openHPSDR discovery of one configured radio (MAN-305 D3): a directed
-//! probe sending both the protocol-1 and the protocol-2 request to
-//! `host:port`, never a broadcast (MAN-239). Run by
-//! [`super::open_receiver`] under [`super::HpsdrProtocol::Auto`] only.
+        }
+    }
+}
 
-use anyhow::{anyhow, Context, Result};
-use std::io::ErrorKind;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
-use std::time::{Duration, Instant};
+impl std::error::Error for DiscoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+fn select_found(
+    found: Vec<DiscoveredRadio>,
+    want_mac: Option<[u8; 6]>,
+) -> Result<DiscoveredRadio, DiscoveryError> {
+    if found.is_empty() {
+        return Err(DiscoveryError::NoAnswer);
+    }
+    let candidates = match want_mac {
+        Some(want) => {
+            let matches: Vec<_> = found.iter().filter(|r| r.mac == want).cloned().collect();
+            if matches.is_empty() {
+                return Err(DiscoveryError::NoMatch { want, found });
+            }
+            matches
+        }
+        None => found,
+    };
+    if candidates.len() != 1 {
+        return Err(DiscoveryError::Ambiguous(candidates));
+    }
+    let radio = candidates.into_iter().next().expect("one candidate");
+    if radio.protocol == DiscoveryProtocol::P2 {
+        return Err(DiscoveryError::Unsupported(radio));
+    }
+    if radio.status == DiscoveryStatus::InUse {
+        return Err(DiscoveryError::InUse(radio));
+    }
+    Ok(radio)
+}
+
+/// Discover once per open attempt, then select a lone available P1 radio.
+pub fn select_radio(
+    port: u16,
+    destinations: &[SocketAddr],
+    want_mac: Option<[u8; 6]>,
+) -> Result<DiscoveredRadio, DiscoveryError> {
+    select_found(
+        discover(port, destinations, DISCOVERY_TIMEOUT).map_err(DiscoveryError::Io)?,
+        want_mac,
+    )
+}
 
 /// Length of the protocol-2 discovery request (D3).
 pub const PROTOCOL2_REQUEST_LEN: usize = 60;
@@ -538,61 +589,10 @@ pub fn probe(host: &str, port: u16, timing: &ProbeTiming) -> Result<Discovery> {
                 }
             }
             _ => {}
->>>>>>> 63af0dfbe77d16e5c31a55fdd191c23e6a764a87
         }
     }
 }
 
-<<<<<<< HEAD
-impl std::error::Error for DiscoveryError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-fn select_found(
-    found: Vec<DiscoveredRadio>,
-    want_mac: Option<[u8; 6]>,
-) -> Result<DiscoveredRadio, DiscoveryError> {
-    if found.is_empty() {
-        return Err(DiscoveryError::NoAnswer);
-    }
-    let candidates = match want_mac {
-        Some(want) => {
-            let matches: Vec<_> = found.iter().filter(|r| r.mac == want).cloned().collect();
-            if matches.is_empty() {
-                return Err(DiscoveryError::NoMatch { want, found });
-            }
-            matches
-        }
-        None => found,
-    };
-    if candidates.len() != 1 {
-        return Err(DiscoveryError::Ambiguous(candidates));
-    }
-    let radio = candidates.into_iter().next().expect("one candidate");
-    if radio.protocol == DiscoveryProtocol::P2 {
-        return Err(DiscoveryError::Unsupported(radio));
-    }
-    if radio.status == DiscoveryStatus::InUse {
-        return Err(DiscoveryError::InUse(radio));
-    }
-    Ok(radio)
-}
-
-/// Discover once per open attempt, then select a lone available P1 radio.
-pub fn select_radio(
-    port: u16,
-    destinations: &[SocketAddr],
-    want_mac: Option<[u8; 6]>,
-) -> Result<DiscoveredRadio, DiscoveryError> {
-    select_found(
-        discover(port, destinations, DISCOVERY_TIMEOUT).map_err(DiscoveryError::Io)?,
-        want_mac,
-=======
 /// `recv_from` errors that mean "nothing yet, keep waiting": the read
 /// timeout (`WouldBlock` on Unix, `TimedOut` on Windows), a signal, and
 /// Windows' report of an earlier ICMP port-unreachable on an unconnected
@@ -604,14 +604,13 @@ fn is_retry(kind: ErrorKind) -> bool {
             | ErrorKind::TimedOut
             | ErrorKind::Interrupted
             | ErrorKind::ConnectionReset
->>>>>>> 63af0dfbe77d16e5c31a55fdd191c23e6a764a87
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-<<<<<<< HEAD
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
     fn p1(status: u8) -> Vec<u8> {
@@ -752,9 +751,153 @@ mod tests {
             "éééééé",
         ] {
             assert_eq!(parse_mac(text), None);
-=======
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::thread;
+        }
+    }
+
+    #[test]
+    fn formats_the_canonical_uppercase_colon_form() {
+        assert_eq!(
+            format_mac(&[10, 187, 12, 221, 14, 255]),
+            "0A:BB:0C:DD:0E:FF"
+        );
+    }
+
+    #[test]
+    fn dedupes_by_mac_keeping_the_higher_protocol() {
+        let mut found = BTreeMap::new();
+        let a = radio();
+        let mut b = parse_reply(&p2()).unwrap();
+        b.ip = "192.0.2.1".parse().unwrap();
+        remember(&mut found, a.clone());
+        remember(&mut found, b.clone());
+        remember(&mut found, a);
+        assert_eq!(found.into_values().collect::<Vec<_>>(), vec![b]);
+    }
+
+    #[test]
+    fn select_returns_the_lone_available_radio() {
+        assert_eq!(select_found(vec![radio()], None).unwrap(), radio());
+    }
+
+    #[test]
+    fn select_refuses_a_lone_in_use_radio() {
+        let mut r = radio();
+        r.status = DiscoveryStatus::InUse;
+        let err = select_found(vec![r], None).unwrap_err().to_string();
+        assert!(err.contains("in use"));
+        assert!(err.contains("02:11:22:33:44:55"));
+        assert!(err.contains("--hpsdr-host"));
+    }
+
+    #[test]
+    fn select_lists_ambiguous_radios_with_the_exact_error_text() {
+        let a = radio();
+        let mut b = a.clone();
+        b.mac = [2, 187, 187, 187, 187, 2];
+        b.status = DiscoveryStatus::InUse;
+        assert_eq!(select_found(vec![a, b], None).unwrap_err().to_string(),
+            "multiple openHPSDR radios answered discovery (2); choose one with --hpsdr-mac or input.mac:\n  127.0.0.1  MAC 02:11:22:33:44:55  Hermes-Lite  firmware 43  available\n  127.0.0.1  MAC 02:BB:BB:BB:BB:02  Hermes-Lite  firmware 43  in use");
+    }
+
+    #[test]
+    fn select_filters_by_mac_and_reports_a_no_match_listing() {
+        let a = radio();
+        let mut b = a.clone();
+        b.mac[5] = 99;
+        assert_eq!(select_found(vec![a.clone(), b], Some(a.mac)).unwrap(), a);
+        let err = select_found(vec![a], Some([0; 6])).unwrap_err().to_string();
+        assert!(err.contains("00:00:00:00:00:00"));
+        assert!(err.contains("02:11:22:33:44:55"));
+    }
+
+    #[test]
+    fn select_reports_unsupported_for_a_p2_only_radio() {
+        let err = select_found(vec![parse_reply(&p2()).unwrap()], None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("protocol 2"));
+        assert!(err.contains("--hpsdr-host"));
+    }
+
+    #[test]
+    fn select_reports_no_answer_on_an_empty_lan() {
+        assert_eq!(select_found(vec![], None).unwrap_err().to_string(), "no openHPSDR radio answered discovery; run `manta devices`, or set input.host / --hpsdr-host");
+    }
+
+    #[test]
+    fn discover_finds_a_fake_radio_on_a_loopback_destination() {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let dest = sock.local_addr().unwrap();
+        let h = thread::spawn(move || {
+            let mut b = [0; 100];
+            let (n, addr) = sock.recv_from(&mut b).unwrap();
+            assert_eq!(&b[..n], &discovery_request_p1());
+            sock.send_to(&p1(2), addr).unwrap();
+        });
+        let found = discover(dest.port(), &[dest], Duration::from_millis(100)).unwrap();
+        h.join().unwrap();
+        assert_eq!(found, vec![radio()]);
+    }
+
+    #[test]
+    fn discover_is_bounded_when_nothing_answers() {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dest = sock.local_addr().unwrap();
+        let start = Instant::now();
+        assert!(discover(dest.port(), &[dest], DISCOVERY_TIMEOUT)
+            .unwrap()
+            .is_empty());
+        assert!(start.elapsed() < Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn discover_retries_both_protocols_four_times() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let dest = socket.local_addr().unwrap();
+        let receiver = thread::spawn(move || {
+            let mut counts = [0, 0];
+            for _ in 0..8 {
+                let mut buf = [0; 100];
+                let (n, _) = socket.recv_from(&mut buf).unwrap();
+                if buf[..n] == discovery_request_p1() {
+                    counts[0] += 1;
+                } else {
+                    assert_eq!(&buf[..n], &discovery_request_p2());
+                    counts[1] += 1;
+                }
+            }
+            counts
+        });
+        assert!(discover(dest.port(), &[dest], DISCOVERY_TIMEOUT)
+            .unwrap()
+            .is_empty());
+        assert_eq!(receiver.join().unwrap(), [4, 4]);
+    }
+
+    #[test]
+    fn discovery_io_failure_is_distinct_from_an_empty_lan() {
+        let error = discover(1024, &[], DISCOVERY_TIMEOUT).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(DiscoveryError::Io(error)
+            .to_string()
+            .contains("discovery failed"));
+    }
+
+    #[test]
+    #[ignore = "needs a real openHPSDR radio on the LAN (MAN-52)"]
+    fn discovers_a_real_radio() {
+        assert!(!discover(
+            super::super::CONTROL_PORT,
+            &broadcast_destinations(super::super::CONTROL_PORT),
+            DISCOVERY_TIMEOUT
+        )
+        .unwrap()
+        .is_empty());
+    }
 
     const MAC: [u8; 6] = [0x00, 0x1C, 0xC0, 0xA2, 0x13, 0x5D];
 
@@ -940,17 +1083,10 @@ mod tests {
                 }
             });
             assert_eq!(result, Discovery::NoAnswer);
->>>>>>> 63af0dfbe77d16e5c31a55fdd191c23e6a764a87
         }
     }
 
     #[test]
-<<<<<<< HEAD
-    fn formats_the_canonical_uppercase_colon_form() {
-        assert_eq!(
-            format_mac(&[10, 187, 12, 221, 14, 255]),
-            "0A:BB:0C:DD:0E:FF"
-=======
     fn probe_returns_protocol_2_reply() {
         let (result, took, _) = probe_fake(fast(), |radio, d, src| {
             if is_p2_request(d) {
@@ -971,147 +1107,10 @@ mod tests {
         assert!(
             took < fast().window,
             "the first reply ends discovery: {took:?}"
->>>>>>> 63af0dfbe77d16e5c31a55fdd191c23e6a764a87
         );
     }
 
     #[test]
-<<<<<<< HEAD
-    fn dedupes_by_mac_keeping_the_higher_protocol() {
-        let mut found = BTreeMap::new();
-        let a = radio();
-        let mut b = parse_reply(&p2()).unwrap();
-        b.ip = "192.0.2.1".parse().unwrap();
-        remember(&mut found, a.clone());
-        remember(&mut found, b.clone());
-        remember(&mut found, a);
-        assert_eq!(found.into_values().collect::<Vec<_>>(), vec![b]);
-    }
-
-    #[test]
-    fn select_returns_the_lone_available_radio() {
-        assert_eq!(select_found(vec![radio()], None).unwrap(), radio());
-    }
-
-    #[test]
-    fn select_refuses_a_lone_in_use_radio() {
-        let mut r = radio();
-        r.status = DiscoveryStatus::InUse;
-        let err = select_found(vec![r], None).unwrap_err().to_string();
-        assert!(err.contains("in use"));
-        assert!(err.contains("02:11:22:33:44:55"));
-        assert!(err.contains("--hpsdr-host"));
-    }
-
-    #[test]
-    fn select_lists_ambiguous_radios_with_the_exact_error_text() {
-        let a = radio();
-        let mut b = a.clone();
-        b.mac = [2, 187, 187, 187, 187, 2];
-        b.status = DiscoveryStatus::InUse;
-        assert_eq!(select_found(vec![a, b], None).unwrap_err().to_string(),
-            "multiple openHPSDR radios answered discovery (2); choose one with --hpsdr-mac or input.mac:\n  127.0.0.1  MAC 02:11:22:33:44:55  Hermes-Lite  firmware 43  available\n  127.0.0.1  MAC 02:BB:BB:BB:BB:02  Hermes-Lite  firmware 43  in use");
-    }
-
-    #[test]
-    fn select_filters_by_mac_and_reports_a_no_match_listing() {
-        let a = radio();
-        let mut b = a.clone();
-        b.mac[5] = 99;
-        assert_eq!(select_found(vec![a.clone(), b], Some(a.mac)).unwrap(), a);
-        let err = select_found(vec![a], Some([0; 6])).unwrap_err().to_string();
-        assert!(err.contains("00:00:00:00:00:00"));
-        assert!(err.contains("02:11:22:33:44:55"));
-    }
-
-    #[test]
-    fn select_reports_unsupported_for_a_p2_only_radio() {
-        let err = select_found(vec![parse_reply(&p2()).unwrap()], None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("protocol 2"));
-        assert!(err.contains("--hpsdr-host"));
-    }
-
-    #[test]
-    fn select_reports_no_answer_on_an_empty_lan() {
-        assert_eq!(select_found(vec![], None).unwrap_err().to_string(), "no openHPSDR radio answered discovery; run `manta devices`, or set input.host / --hpsdr-host");
-    }
-
-    #[test]
-    fn discover_finds_a_fake_radio_on_a_loopback_destination() {
-        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let dest = sock.local_addr().unwrap();
-        let h = thread::spawn(move || {
-            let mut b = [0; 100];
-            let (n, addr) = sock.recv_from(&mut b).unwrap();
-            assert_eq!(&b[..n], &discovery_request_p1());
-            sock.send_to(&p1(2), addr).unwrap();
-        });
-        let found = discover(dest.port(), &[dest], Duration::from_millis(100)).unwrap();
-        h.join().unwrap();
-        assert_eq!(found, vec![radio()]);
-    }
-
-    #[test]
-    fn discover_is_bounded_when_nothing_answers() {
-        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let dest = sock.local_addr().unwrap();
-        let start = Instant::now();
-        assert!(discover(dest.port(), &[dest], DISCOVERY_TIMEOUT)
-            .unwrap()
-            .is_empty());
-        assert!(start.elapsed() < Duration::from_millis(2500));
-    }
-
-    #[test]
-    fn discover_retries_both_protocols_four_times() {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        let dest = socket.local_addr().unwrap();
-        let receiver = thread::spawn(move || {
-            let mut counts = [0, 0];
-            for _ in 0..8 {
-                let mut buf = [0; 100];
-                let (n, _) = socket.recv_from(&mut buf).unwrap();
-                if buf[..n] == discovery_request_p1() {
-                    counts[0] += 1;
-                } else {
-                    assert_eq!(&buf[..n], &discovery_request_p2());
-                    counts[1] += 1;
-                }
-            }
-            counts
-        });
-        assert!(discover(dest.port(), &[dest], DISCOVERY_TIMEOUT)
-            .unwrap()
-            .is_empty());
-        assert_eq!(receiver.join().unwrap(), [4, 4]);
-    }
-
-    #[test]
-    fn discovery_io_failure_is_distinct_from_an_empty_lan() {
-        let error = discover(1024, &[], DISCOVERY_TIMEOUT).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(DiscoveryError::Io(error)
-            .to_string()
-            .contains("discovery failed"));
-    }
-
-    #[test]
-    #[ignore = "needs a real openHPSDR radio on the LAN (MAN-52)"]
-    fn discovers_a_real_radio() {
-        assert!(!discover(
-            super::super::CONTROL_PORT,
-            &broadcast_destinations(super::super::CONTROL_PORT),
-            DISCOVERY_TIMEOUT
-        )
-        .unwrap()
-        .is_empty());
-=======
     fn probe_prefers_protocol_2_within_the_grace_window() {
         let timing = ProbeTiming {
             grace: Duration::from_millis(100),
@@ -1201,6 +1200,5 @@ mod tests {
         });
         assert_eq!(result, Discovery::NoAnswer);
         assert!(took >= fast().window, "{took:?}");
->>>>>>> 63af0dfbe77d16e5c31a55fdd191c23e6a764a87
     }
 }

@@ -629,27 +629,21 @@ fn input_summary(file: &crate::config::InputFile) -> String {
             freq_hz,
             rate_hz,
         }) => {
-<<<<<<< HEAD
-            let mut line = format!(
-                "input: type=hpsdr host={} port={port} freq_hz={freq_hz} rate_hz={rate_hz}",
-                host.as_deref().unwrap_or("discovery")
-            );
-            if let Some(mac) = mac {
-                line.push_str(&format!(" mac={mac}"));
-            }
-            line
-=======
             // MAN-305 §3: the protocol as the operator writes it.
             let protocol = match protocol {
                 manta_input::hpsdr::HpsdrProtocol::Auto => "auto",
                 manta_input::hpsdr::HpsdrProtocol::One => "1",
                 manta_input::hpsdr::HpsdrProtocol::Two => "2",
             };
-            format!(
-                "input: type=hpsdr host={host} port={port} protocol={protocol} freq_hz={freq_hz} \
-                 rate_hz={rate_hz}"
-            )
->>>>>>> 63af0dfbe77d16e5c31a55fdd191c23e6a764a87
+            let mut line = format!(
+                "input: type=hpsdr host={} port={port} protocol={protocol} freq_hz={freq_hz} \
+                 rate_hz={rate_hz}",
+                host.as_deref().unwrap_or("discovery")
+            );
+            if let Some(mac) = mac {
+                line.push_str(&format!(" mac={mac}"));
+            }
+            line
         }
         Some(SourceFromFile::Ka9q {
             group,
@@ -2063,8 +2057,10 @@ mod tests {
     fn hpsdr_scaffold_mac_alternative_is_valid_without_host() {
         let body = format!(
             "[input]\ntype = \"hpsdr\"\n{}",
+            // bands replaces freq_hz and drags tuning_range_hz with it, so
+            // neither belongs in the freq_hz spelling this test uncomments.
             uncommented("input", |k| InputKind::Hpsdr.keys().contains(&k)
-                && k != "host")
+                && !matches!(k, "host" | "bands" | "tuning_range_hz"))
         );
         match loaded(&body).input.source {
             Some(SourceFromFile::Hpsdr { host, mac, .. }) => {
@@ -2097,16 +2093,6 @@ mod tests {
             InputKind::Hpsdr,
             InputKind::Ka9q,
         ] {
-<<<<<<< HEAD
-            let body = format!(
-                "[input]\ntype = \"{}\"\n{}",
-                kind.name(),
-                uncommented("input", |k| kind.keys().contains(&k)
-                    && !(kind == InputKind::Hpsdr && k == "mac"))
-            );
-            let l = loaded(&body);
-            assert_eq!(l.input.source.map(|s| s.kind()), Some(kind), "{body}");
-=======
             // MAN-310: `bands` replaces `freq_hz`, so each is tried alone.
             for skip in ["bands", "freq_hz"] {
                 let body = format!(
@@ -2114,12 +2100,12 @@ mod tests {
                     kind.name(),
                     uncommented("input", |k| kind.keys().contains(&k)
                         && k != skip
+                        && !(kind == InputKind::Hpsdr && k == "mac")
                         && !(skip == "bands" && k == "tuning_range_hz"))
                 );
                 let l = loaded(&body);
                 assert_eq!(l.input.source.map(|s| s.kind()), Some(kind), "{body}");
             }
->>>>>>> 63af0dfbe77d16e5c31a55fdd191c23e6a764a87
         }
         let shared = [
             "freq_correction_ppm",

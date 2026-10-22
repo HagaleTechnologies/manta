@@ -298,11 +298,6 @@ impl InputKind {
         match self {
             InputKind::Audio => &["device"],
             InputKind::File => &["path", "iq", "realtime", "loop"],
-<<<<<<< HEAD
-            InputKind::Kiwi => &["host", "port", "freq_hz", "password"],
-            InputKind::Soapy => &["driver", "freq_hz", "rate_hz", "gain_db"],
-            InputKind::Hpsdr => &["host", "mac", "port", "freq_hz", "rate_hz"],
-=======
             InputKind::Kiwi => &[
                 "host",
                 "port",
@@ -321,6 +316,7 @@ impl InputKind {
             ],
             InputKind::Hpsdr => &[
                 "host",
+                "mac",
                 "port",
                 "protocol",
                 "freq_hz",
@@ -328,7 +324,6 @@ impl InputKind {
                 "bands",
                 "tuning_range_hz",
             ],
->>>>>>> 63af0dfbe77d16e5c31a55fdd191c23e6a764a87
             InputKind::Ka9q => &["group", "port", "ssrc", "interface"],
         }
     }
@@ -1186,7 +1181,13 @@ fn check_input_entries(inputs: &[NamedInput], origin: &str) -> Result<()> {
                     matches!(&o.input.source, Some(SourceFromFile::Hpsdr { host: h, mac: m, port: p, .. })
                         if p == port && match (host, h) {
                             (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-                            (None, None) => mac == m,
+                            // Two hostless entries select from the same LAN,
+                            // so an unqualified one beside any other can name
+                            // the same radio: both must pin distinct MACs.
+                            (None, None) => match (mac.as_deref(), m.as_deref()) {
+                                (Some(a), Some(b)) => a == b,
+                                _ => true,
+                            },
                             _ => false,
                         })
                 });
@@ -1246,28 +1247,7 @@ fn validate_input(
             .map(|v| crate::check_replay_epoch("input.replay_epoch", v))
             .transpose()?,
     };
-<<<<<<< HEAD
-    let set: [(&str, bool); 16] = [
-        ("device", t.device.is_some()),
-        ("path", t.path.is_some()),
-        ("iq", t.iq.is_some()),
-        ("realtime", t.realtime.is_some()),
-        ("loop", t.looped.is_some()),
-        ("host", t.host.is_some()),
-        ("mac", t.mac.is_some()),
-        ("port", t.port.is_some()),
-        ("freq_hz", t.freq_hz.is_some()),
-        ("password", t.password.is_some()),
-        ("driver", t.driver.is_some()),
-        ("rate_hz", t.rate_hz.is_some()),
-        ("gain_db", t.gain_db.is_some()),
-        ("group", t.group.is_some()),
-        ("ssrc", t.ssrc.is_some()),
-        ("interface", t.interface.is_some()),
-    ];
-=======
     check_input_keys(&t)?;
->>>>>>> 63af0dfbe77d16e5c31a55fdd191c23e6a764a87
     let Some(kind) = t.kind else {
         return Ok(InputFile {
             source: None,
@@ -1320,7 +1300,6 @@ fn validate_input(
         },
         InputKind::Hpsdr => SourceFromFile::Hpsdr {
             port: port(crate::HPSDR_CONTROL_PORT)?,
-<<<<<<< HEAD
             host: {
                 if t.host.is_some() && t.mac.is_some() {
                     return Err("input.host and input.mac cannot both be set".into());
@@ -1328,17 +1307,13 @@ fn validate_input(
                 t.host.clone()
             },
             mac: t.mac.as_deref().map(check_hpsdr_mac).transpose()?,
-            freq_hz: crate::check_hpsdr_freq_hz("input.freq_hz", req(t.freq_hz, "freq_hz", name)?)?,
-=======
             protocol: t
                 .protocol
                 .as_ref()
                 .map(ProtocolValue::protocol)
                 .transpose()?
                 .unwrap_or_default(),
-            host: req(t.host.clone(), "host", name)?,
             freq_hz: crate::check_hpsdr_freq_hz("input.freq_hz", req_freq(t.freq_hz)?)?,
->>>>>>> 63af0dfbe77d16e5c31a55fdd191c23e6a764a87
             rate_hz: crate::check_hpsdr_rate_hz("input.rate_hz", req(t.rate_hz, "rate_hz", name)?)?,
         },
         InputKind::Ka9q => SourceFromFile::Ka9q {
@@ -1361,13 +1336,14 @@ fn validate_input(
 /// D5: every source key set belongs to `input.type`, and a source key
 /// needs a type.
 fn check_input_keys(t: &InputToml) -> std::result::Result<(), String> {
-    let set: [(&str, bool); 18] = [
+    let set: [(&str, bool); 19] = [
         ("device", t.device.is_some()),
         ("path", t.path.is_some()),
         ("iq", t.iq.is_some()),
         ("realtime", t.realtime.is_some()),
         ("loop", t.looped.is_some()),
         ("host", t.host.is_some()),
+        ("mac", t.mac.is_some()),
         ("port", t.port.is_some()),
         ("protocol", t.protocol.is_some()),
         ("freq_hz", t.freq_hz.is_some()),
@@ -1759,6 +1735,33 @@ mod tests {
             let body = ["a", "b"].map(|name| format!("[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n{selector}")).join("\n");
             assert!(err_of(&body).contains("several receivers on one HPSDR radio"));
         }
+    }
+
+    #[test]
+    fn hpsdr_unqualified_hostless_input_beside_a_hostless_peer_is_refused() {
+        let entry = |name: &str, selector: &str| {
+            format!("[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n{selector}")
+        };
+        // An unqualified hostless entry beside a pinned one can select the
+        // same radio, in either order.
+        for (first, second) in [
+            ("mac = \"aabbccddeeff\"\n", ""),
+            ("", "mac = \"aabbccddeeff\"\n"),
+        ] {
+            let body = format!("{}\n{}", entry("a", first), entry("b", second));
+            let err = err_of(&body);
+            assert!(
+                err.contains("several receivers on one HPSDR radio"),
+                "{body} -> {err}"
+            );
+        }
+        // Two hostless entries pinned to distinct MACs name two radios.
+        let body = format!(
+            "{}\n{}",
+            entry("a", "mac = \"aabbccddeeff\"\n"),
+            entry("b", "mac = \"001122334455\"\n")
+        );
+        load_file(&body).unwrap_or_else(|e| panic!("{body} -> {e:#}"));
     }
 
     const SERVER: &str = "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
@@ -2546,7 +2549,8 @@ mod tests {
         assert_eq!(
             loaded.input.source,
             Some(SourceFromFile::Hpsdr {
-                host: "192.0.2.10".into(),
+                host: Some("192.0.2.10".into()),
+                mac: None,
                 port: 1024,
                 protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
                 freq_hz: 7_030_000.0,

@@ -1649,13 +1649,9 @@ mod tests {
         cases.push((
             crate::LiveSourceSpec::Hpsdr(crate::HpsdrOpts {
                 host: Some("10.0.0.5".into()),
-<<<<<<< HEAD
                 mac: None,
                 port: Some(1024),
-=======
-                port: 1024,
                 protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
->>>>>>> 63af0dfbe77d16e5c31a55fdd191c23e6a764a87
                 freq: Some(7e6),
                 rate: Some(48_000.0),
             }),

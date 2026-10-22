@@ -196,15 +196,12 @@ ignores the config's entries.
 ## Not supported yet
 
 - Several receivers on one HPSDR radio: MAN-307. The config loader refuses
-<<<<<<< HEAD
-  two entries on one radio, including duplicate MACs and two entries with
-  neither host nor MAC. Use a distinct `input.mac` per radio to survive DHCP
-  address changes; `manta devices` lists the MACs.
-=======
-  two entries on one radio.
+  two entries on one radio, including duplicate MACs, two entries with
+  neither host nor MAC, and an unqualified hostless entry beside a pinned
+  one. Use a distinct `input.mac` per radio to survive DHCP address
+  changes; `manta devices` lists the MACs.
 - `bands` that needs several streams from one HPSDR radio (MAN-307) or one
   SoapySDR device, and radiod channels created from `bands`.
->>>>>>> 63af0dfbe77d16e5c31a55fdd191c23e6a764a87
 - Several channels of one SoapySDR device in one stream (a dual-tuner
   RSPduo): two Soapy devices, one entry each, work today.
 - A per-receiver identity on RBN or a receiver field on spots. The combined

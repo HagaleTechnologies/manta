@@ -1871,11 +1871,7 @@ flush_gap_dits = 7.0
 #   file:  path*, iq, realtime, loop
 #   kiwi:  host*, freq_hz*, port, password
 #   soapy: driver*, freq_hz*, rate_hz*, gain_db   (build with --features soapy)
-<<<<<<< HEAD
-#   hpsdr: host, mac, freq_hz*, rate_hz*, port        (included in every build)
-=======
-#   hpsdr: host*, freq_hz*, rate_hz*, port, protocol (included in every build)
->>>>>>> 63af0dfbe77d16e5c31a55fdd191c23e6a764a87
+#   hpsdr: host, mac, freq_hz*, rate_hz*, port, protocol (included in every build)
 #   ka9q:  group*, port, ssrc, interface
 # Any source flag on the command line (--device, --source, --kiwi-host,
 # --soapy-driver, --hpsdr-host, --ka9q-group) replaces a typed [input]

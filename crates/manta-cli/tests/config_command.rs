@@ -1027,21 +1027,6 @@ fn check_binds_no_port_and_opens_no_receiver_with_several_inputs() {
     }
 }
 
-<<<<<<< HEAD
-#[test]
-fn hpsdr_discovery_config_check_normalizes_mac_without_opening_a_radio() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_cfg(dir.path(), "manta.toml", "[input]\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\nmac = \"aa-bbcc-ddee-ff\"\n");
-    let checked = check_file(&path);
-    assert!(succeeds(&checked).contains("mac=AA:BB:CC:DD:EE:FF"));
-    let overridden = manta()
-        .args(["config", "check", "--config"])
-        .arg(&path)
-        .env("MANTA_INPUT_MAC", "001122334455")
-        .output()
-        .unwrap();
-    assert!(succeeds(&overridden).contains("mac=00:11:22:33:44:55"));
-=======
 // MAN-310: `bands` plans a receiver's streams from the CW segment table.
 
 const KIWI: &str = "[input]\ntype = \"kiwi\"\nhost = \"kiwi.example.net\"\n";
@@ -1329,5 +1314,20 @@ fn bands_from_the_environment() {
         err.contains("and manta runs at most 16 inputs; list fewer bands"),
         "{err}"
     );
->>>>>>> 63af0dfbe77d16e5c31a55fdd191c23e6a764a87
+}
+
+/// MAN-306: config check prints the canonical MAC without opening a radio.
+#[test]
+fn hpsdr_discovery_config_check_normalizes_mac_without_opening_a_radio() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cfg(dir.path(), "manta.toml", "[input]\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\nmac = \"aa-bbcc-ddee-ff\"\n");
+    let checked = check_file(&path);
+    assert!(succeeds(&checked).contains("mac=AA:BB:CC:DD:EE:FF"));
+    let overridden = manta()
+        .args(["config", "check", "--config"])
+        .arg(&path)
+        .env("MANTA_INPUT_MAC", "001122334455")
+        .output()
+        .unwrap();
+    assert!(succeeds(&overridden).contains("mac=00:11:22:33:44:55"));
 }

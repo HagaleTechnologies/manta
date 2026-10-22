@@ -931,7 +931,6 @@ impl HpsdrDevice {
     }
 }
 
-pub mod discovery;
 pub mod proto2;
 
 pub use discovery::{Discovery, DiscoveryReply};
