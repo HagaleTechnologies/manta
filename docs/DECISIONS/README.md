@@ -11,7 +11,12 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+<<<<<<< HEAD
 | 2026-10-21 | MAN-372 | [MAN-372: a speech-band marking closes the non-CW filter's residual — zero in-band tracks from SSB voice at +30/+45 dB](2026-10-21-man372-speech-band-veto.md) |
+=======
+| 2026-10-19 | MAN-334 | [MAN-334: calibrate plans its references before it opens the receiver](2026-10-19-man334-calibrate-plans-before-opening.md) |
+| 2026-10-19 | MAN-319 | [MAN-319: the live uplink needs a 6-character locator now; the registration exchange waits for MAN-90's capture](2026-10-19-man319-uplink-registration-exchange.md) |
+>>>>>>> 574e3e77762881e4ef0af038a3b9d0f8b59da15f
 | 2026-10-19 | MAN-291 | [MAN-291: `field-node.py report` fails ledger integrity until a sample follows the window](2026-10-19-man291-post-window-sample.md) |
 | 2026-10-19 | MAN-14 | [MAN-14: each receiver's hearing on /metrics, the status line and /status](2026-10-19-man14-per-receiver-hearing-visibility.md) |
 | 2026-10-19 | MAN-305 | [MAN-305: protocol-2 openHPSDR radios are inputs; the protocol is discovered, and lost datagrams reach the decoder as missing input](2026-10-19-man305-hpsdr-protocol-2-input.md) |

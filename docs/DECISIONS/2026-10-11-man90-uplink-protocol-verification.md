@@ -102,6 +102,10 @@ a capture updates the Status cell, it never renumbers.
 | C5 | The spotter field is the station call plus `-#` (`CALL-N-#` with an SSID, MAN-89) | Relay convention only | How a submitted spot names its spotter, or whether identity comes from the login or the `.ini`. | open |
 | C6 | The collector sends nothing meaningful after login, and manta never replies | None | Any collector→Aggregator traffic after login, and Aggregator's answers to it. | open |
 | C7 | The collector's prompt ends with a newline | **Reproduced 2026-10-11.** When the collector sends `login: ` or `Please enter your callsign: ` with no newline, manta writes nothing, drops the connection after 30 s (`IDLE_READ_TIMEOUT`) and retries indefinitely; `/status` shows the target `down`. | Whether the ingest sends a prompt at all, and how the prompt ends. | open |
+| C8 | Registration carries no locator (MAN-319 would need one to; manta assumes nothing about a registration phase at all) | None. No claim here — an assumption MAN-319 would need but does not make. | Whether any locator bytes leave Aggregator before spots, and in which field, spelling and phase. | open |
+| C9 | RBN returns no spot settings a submitter must apply (MAN-319's Scenario 1 would need such a payload) | None. An assumption MAN-319 would need but does not make. | Any collector→Aggregator payload after login that changes what Aggregator sends. | open |
+| C10 | RBN cannot direct a submitter to hold spots (MAN-319's Scenario 2 would need such a directive) | None. An assumption MAN-319 would need but does not make. | Any such line, and Aggregator's reaction to it. | open |
+| C11 | RBN serves no reference files whose versions a submitter must match (MAN-319's Scenario 3 would need such an exchange) | None. An assumption MAN-319 would need but does not make. The third-party `cty.dat`/`MASTER.SCP` refresh (MAN-316) is unrelated to the uplink connection. | Any reference-file identity, version or transfer on the connection. | open |
 
 ### C7 reproduction
 
