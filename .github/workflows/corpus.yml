@@ -1,0 +1,49 @@
+name: Corpus
+
+# MAN-119: nightly decode + score of the real-audio corpus against its pinned
+# ground truth. Skipped until a maintainer sets the MANTA_CORPUS_BASE_URL
+# repository variable, which waits on confirmed redistribution rights.
+# No build cache: only ci-full.yml may restore one (MAN-243). See
+# docs/DECISIONS/2026-10-14-man119-streaming-wav-and-real-audio-corpus.md.
+on:
+  schedule:
+    - cron: '41 7 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: corpus
+  cancel-in-progress: false
+
+jobs:
+  corpus:
+    name: Real-audio corpus
+    if: vars.MANTA_CORPUS_BASE_URL != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # `runner` is not available in job-level env:, so the corpus directory is
+    # spelled $RUNNER_TEMP in shell and ${{ runner.temp }} in step-level env:.
+    env:
+      MANTA_CORPUS_BASE_URL: ${{ vars.MANTA_CORPUS_BASE_URL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - run: scripts/check-rust-toolchain-pin.sh
+        shell: bash
+      - run: python3 scripts/corpus.py fetch --dest "$RUNNER_TEMP/corpus"
+      - run: cargo build --release --locked -p manta-cli
+      - env:
+          MANTA_CORPUS_DIR: ${{ runner.temp }}/corpus
+        run: cargo test --release --locked -p manta-testkit --test real_audio_corpus -- --nocapture
+      - run: python3 scripts/corpus.py score --corpus-dir "$RUNNER_TEMP/corpus" --manta target/release/manta --json-out "$RUNNER_TEMP/corpus-results.json"
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: corpus-results
+          path: ${{ runner.temp }}/corpus-results.json
+          if-no-files-found: ignore

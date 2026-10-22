@@ -40,6 +40,9 @@ pub struct SoapySdrIqSource {
     /// overflow. The rate-limit gate's state, kept where the events live so
     /// a burst inside one `read()` logs at most once.
     last_overflow_warn: Option<Instant>,
+    /// MAN-259: `open`'s runtime up to `stream.activate`; surfaced by
+    /// `acquisition_start_offset()`.
+    acquisition_start_offset: Duration,
 }
 
 /// Read timeout, microseconds. Short enough that a caller polling a stop
@@ -136,6 +139,7 @@ impl SoapySdrIqSource {
         center_freq_hz: f64,
         gain_db: Option<f64>,
     ) -> Result<Self> {
+        let entered = Instant::now();
         let device = soapysdr::Device::new(driver_args)?;
         device.set_sample_rate(Rx, 0, fs)?;
         device.set_frequency(Rx, 0, center_freq_hz, ())?;
@@ -165,6 +169,8 @@ impl SoapySdrIqSource {
         let actual_fs = device.sample_rate(Rx, 0)?;
         let actual_freq = device.frequency(Rx, 0)?;
         let mut stream = device.rx_stream::<Complex32>(&[0])?;
+        // MAN-259: the device buffers samples from activation on.
+        let acquisition_start_offset = entered.elapsed();
         stream.activate(None)?;
         Ok(SoapySdrIqSource {
             stream,
@@ -173,6 +179,7 @@ impl SoapySdrIqSource {
             health: Arc::new(InputHealthCounters::new()),
             overflow_notice: None,
             last_overflow_warn: None,
+            acquisition_start_offset,
         })
     }
 
@@ -197,6 +204,10 @@ impl IqSource for SoapySdrIqSource {
 
     fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
         Some(self.health.clone())
+    }
+
+    fn acquisition_start_offset(&self) -> Duration {
+        self.acquisition_start_offset
     }
 
     /// A per-call SoapySDR read timeout (`ErrorCode::Timeout`) or buffer

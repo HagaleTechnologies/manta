@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-16T22:46:15Z",
-  "head_commit": "b8b9367",
+  "generated_at": "2026-10-19T13:34:50Z",
+  "head_commit": "1826448",
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -66,7 +66,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:34a3f77ef10a671d063c8acbeaa30032f612d0e0721f1e8b47d8e4c4a39a05d9",
+      "hash": "sha256:e3b1fb325833b66b57b7a4d0d3ad27a96fb653e74876b2c9af38914e24772901",
       "id": "detector-tracks",
       "kind": "subsystem",
       "links": [
@@ -82,8 +82,8 @@
       ],
       "status": "current",
       "title": "How does the detector and track manager decide what to decode?",
-      "verified_commit": "d286147",
-      "verified_date": "2026-10-13",
+      "verified_commit": "d0fd24d",
+      "verified_date": "2026-10-16",
       "visibility": "public"
     },
     {
@@ -149,6 +149,29 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:dd18f5b4961c9e2a585e910212a9120441379b64153785a28ad87f42e9cefad4",
+      "id": "hilbert-image-guard",
+      "kind": "gotcha",
+      "links": [
+        "detector-tracks",
+        "pfb-channelizer"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/hilbert-image-guard.md",
+      "sources": [
+        "docs/DECISIONS/2026-10-16-man273-hilbert-image-guard.md",
+        "crates/manta-dsp/src/hilbert.rs",
+        "crates/manta-engine/src/track.rs",
+        "docs/SPEC-decode-core.md#25-adjacent-channel-ownership-one-signal--one-track"
+      ],
+      "status": "current",
+      "title": "Why did the live-audio path spawn several tracks on one clean tone?",
+      "verified_commit": "4529021",
+      "verified_date": "2026-10-16",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:bf44087476bbcc5b0804e515aa41f1e24f96e9118bdeeffeee4ee76ed0def60a",
       "id": "live-hardware-field-testing",
       "kind": "howto",
@@ -202,7 +225,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:a73e645854380e782f0d916f378ac5ce759f47c2c894ba2bb2fdf373548f1d8f",
+      "hash": "sha256:bf2494e0e0424df3107484cc288a649eae3e4eb1522a5de4f073d53644e42d71",
       "id": "pfb-channelizer",
       "kind": "subsystem",
       "links": [
@@ -244,7 +267,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:73012b6f4002a218f3503361244f408d314175ba450b5d27ef9b22899fd982b6",
+      "hash": "sha256:e88333e03827c806dde99f4c1d8950a6ec13f9bbd36f9f47276efe390cbc4c37",
       "id": "source-reconnect",
       "kind": "gotcha",
       "links": [
@@ -255,15 +278,17 @@
       "path": "pages/source-reconnect.md",
       "sources": [
         "docs/DECISIONS/2026-10-05-man73-source-reconnect.md",
+        "docs/DECISIONS/2026-10-16-man259-acquisition-anchored-outage.md",
         "crates/manta-cli/src/reconnect.rs",
         "crates/manta-cli/src/reconnect.rs (InputHealthTotals)",
         "crates/manta-input/src/lib.rs (IqSource::take_discontinuity)",
+        "crates/manta-input/src/lib.rs (IqSource::acquisition_start_offset)",
         "docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md",
         "docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md"
       ],
       "status": "current",
       "title": "What's the gotcha with a live source disconnecting?",
-      "verified_commit": "9a79a72",
+      "verified_commit": "b8b9367",
       "verified_date": "2026-10-16",
       "visibility": "public"
     },

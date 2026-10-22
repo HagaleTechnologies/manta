@@ -6,7 +6,7 @@ pub mod config_file;
 pub mod listen;
 pub use listen::{
     listen, listen_with_observers, ListenObservers, OperatorLists, OperatorListsUpdate,
-    RttyObserver,
+    RttyObserver, SuppressionObserver,
 };
 pub mod latency;
 pub mod live;
@@ -50,7 +50,7 @@ use anyhow::{bail, Context, Result};
 use manta_decode::decoder::{events_to_text, DecodeConfig};
 use manta_decode::events::DecoderEvent;
 use manta_decode::timing::TimingEstimates;
-use manta_input::{read_all, IqSource, WavIqSource};
+use manta_input::{IqSource, WavIqSource};
 use num_complex::Complex32;
 use std::path::Path;
 use std::sync::Arc;
@@ -317,16 +317,54 @@ pub fn decode_samples(
     center_freq_hz: f64,
     cfg: &PipelineConfig,
 ) -> Result<DecodeReport> {
+    decode_source(
+        &mut SliceSource {
+            iq,
+            fs,
+            center_freq_hz,
+        },
+        cfg,
+    )
+}
+
+/// An in-memory `IqSource` over a sample slice, for `decode_samples`.
+struct SliceSource<'a> {
+    iq: &'a [Complex32],
+    fs: f64,
+    center_freq_hz: f64,
+}
+
+impl IqSource for SliceSource<'_> {
+    fn sample_rate(&self) -> f64 {
+        self.fs
+    }
+
+    fn center_freq_hz(&self) -> f64 {
+        self.center_freq_hz
+    }
+
+    fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+        let n = buf.len().min(self.iq.len());
+        buf[..n].copy_from_slice(&self.iq[..n]);
+        self.iq = &self.iq[n..];
+        Ok(n)
+    }
+}
+
+/// `decode_samples` over a source (MAN-119): reads `src` to EOF in
+/// `CHUNK_SAMPLES` chunks of the zero-padded stream and holds no copy of the
+/// input, so memory does not grow with the recording. Its output is identical
+/// to `decode_samples` over the same samples, whatever sizes `src`'s reads
+/// return. SPEC §1.3–§1.4, §3–§5.
+pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<DecodeReport> {
     // Validated up front so a bad config value (NaN, infinite, or ppm so
     // negative it flips the factor negative/zero) fails fast rather than
     // after the channelizer/decoder work below (MAN-29).
     let calibration_factor = manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    if iq.iter().all(|s| s.re == 0.0 && s.im == 0.0) {
-        bail!("input is digital silence");
-    }
-
+    let fs = src.sample_rate();
+    let center_freq_hz = src.center_freq_hz();
     let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
         .map_err(|e| anyhow::anyhow!(e))
         .context("channelizer")?;
@@ -341,9 +379,6 @@ pub fn decode_samples(
 
     let pad_samples = ch.filter_len();
     let pad_hops = (pad_samples as u64).div_ceil(hop);
-    let mut padded_iq = Vec::with_capacity(pad_samples + iq.len());
-    padded_iq.resize(pad_samples, Complex32::new(0.0, 0.0));
-    padded_iq.extend_from_slice(iq);
 
     let mut tm = track::TrackManager::new(
         ch.n_channels(),
@@ -357,7 +392,7 @@ pub fn decode_samples(
     // streaming cap on the RTTY log does not apply to a file decode.
     tm.keep_full_rtty_history();
     // Feed the channelizer/track-manager in bounded chunks rather than one
-    // `ch.process(&padded_iq)` + one `tm.process_hops(...)` call over the
+    // `ch.process(&whole_input)` + one `tm.process_hops(...)` call over the
     // whole file. `Channelizer::process` is chunk-size-invariant (proved by
     // `channelizer_chunking_determinism.rs`/`chunking_determinism.rs`), so
     // this doesn't change any hop's numeric output -- but `TrackManager`'s
@@ -373,14 +408,39 @@ pub fn decode_samples(
     // signal never stopped -- discovered via a 120 s golden-vector decode
     // silently truncating to ~30 s of text. Chunking keeps `process_hops`
     // (and so `note_char_decoded`) running frequently enough that a
-    // continuously-decoding track's GC timer never falsely expires.
+    // continuously-decoding track's GC timer never falsely expires. The
+    // chunks are those of the zero-padded stream, whatever sizes `src`'s
+    // reads return (MAN-119).
     const CHUNK_SAMPLES: usize = 4096;
     let mut events = Vec::new();
     let mut any_hops = false;
-    for chunk in padded_iq.chunks(CHUNK_SAMPLES) {
-        let hops = ch.process(chunk);
+    let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
+    let (mut pad_left, mut nonzero, mut eof) = (pad_samples, false, false);
+    while !eof {
+        // The zero pre-roll first, then the source's samples.
+        let mut filled = pad_left.min(CHUNK_SAMPLES);
+        chunk[..filled].fill(Complex32::new(0.0, 0.0));
+        pad_left -= filled;
+        while filled < CHUNK_SAMPLES {
+            let n = src.read(&mut chunk[filled..])?;
+            if n == 0 {
+                eof = true;
+                break;
+            }
+            nonzero |= chunk[filled..filled + n]
+                .iter()
+                .any(|s| s.re != 0.0 || s.im != 0.0);
+            filled += n;
+        }
+        if filled == 0 {
+            break;
+        }
+        let hops = ch.process(&chunk[..filled]);
         any_hops |= !hops.is_empty();
         events.extend(tm.process_hops(&hops, |m| (m.saturating_sub(pad_hops)) * hop));
+    }
+    if !nonzero {
+        bail!("input is digital silence");
     }
     let bad_samples = ch.bad_samples();
     if !any_hops {
@@ -481,10 +541,7 @@ pub fn decode_wav(
         Some(hz) => WavIqSource::open_with_center_freq_hz(path, hz)?,
         None => WavIqSource::open(path)?,
     };
-    let fs = src.sample_rate();
-    let center = src.center_freq_hz();
-    let iq = read_all(&mut src)?;
-    decode_samples(&iq, fs, center, cfg)
+    decode_source(&mut src, cfg)
 }
 
 #[cfg(test)]

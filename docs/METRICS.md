@@ -68,7 +68,7 @@ in `RUNBOOKS/monitoring/`; see
 
 ## Metric families
 
-All 63 families, in the order `/metrics` renders them. Every family's
+All 73 families, in the order `/metrics` renders them. Every family's
 `# HELP` and `# TYPE` lines are always rendered, except two groups at the
 end of the table: the ten RBN comparison families (MAN-301), rendered only
 when `[rbn_compare]` is enabled, and the three live-state families
@@ -103,7 +103,11 @@ missing series as "no loss" or "no traffic".
 | `manta_input_dropped_packets_total` | counter | `source` | Input packets estimated lost in transit before reaching the decoder. With several `[[input]]` entries, one series per entry's `name` (MAN-13). | HPSDR, KiwiSDR, ka9q-radio and SoapySDR sources only: from startup at 0, sampled every second, summed across reconnects. SoapySDR stays at 0 (a driver overflow carries no lost-sample estimate; see [MAN-233](DECISIONS/2026-10-15-man233-soapy-overflow-visibility.md)). Other sources (file, audio) show the `# TYPE` line but no samples: absent, not zero. |
 | `manta_input_gaps_detected_total` | counter | `source` | Distinct input-stream gap events detected. One gap may account for several dropped packets. | HPSDR, KiwiSDR, ka9q-radio and SoapySDR sources only, as for `manta_input_dropped_packets_total`. SoapySDR counts driver stream-overflow events, one per overflow the driver returns as a read error, each also warned rate-limited on the log; an overflow a driver flags only with `SOAPY_SDR_END_ABRUPT` on a successful read is not counted (MAN-233). Other sources: absent, not zero. |
 | `manta_input_malformed_packets_total` | counter | `source` | Input datagrams discarded as malformed: wrong length, or correct length but failed framing or sync validation (MAN-22). | HPSDR, KiwiSDR, ka9q-radio and SoapySDR sources only, as for `manta_input_dropped_packets_total`. SoapySDR stays at 0 (no malformed-packet concept; MAN-233). Other sources: absent, not zero. |
-| `manta_input_bad_samples_total` | counter | `source` | Input samples replaced with silence (`0+0j`) because a component was NaN, infinite, or larger than 1e17 in magnitude, counted where they enter the channelizer. Decoding continues. A filter that runs before the channelizer can turn one bad source sample into several replaced ones: up to about 64 per halfband stage with `--capture-rate-hz`, or about 129 through a sound card's Hilbert filter. See [SPEC §1.3](SPEC-decode-core.md#13-structure-and-per-hop-processing-wola-form) step 0 and [MAN-234](DECISIONS/2026-10-15-man234-bad-input-samples.md). | Every source; 0 from startup with a `[server]` table; summed across reconnects. |
+| `manta_input_bad_samples_total` | counter | `source` | Input samples replaced with silence (`0+0j`) because a component was NaN, infinite, or larger than 1e17 in magnitude, counted where they enter the channelizer. Decoding continues. A filter that runs before the channelizer can turn one bad source sample into several replaced ones: up to about 64 per halfband stage with `--capture-rate-hz`, or about 257 through a sound card's Hilbert filter (511 taps, 256 of them nonzero: that many outputs' imaginary parts, plus one delay-matched real part; MAN-273). See [SPEC §1.3](SPEC-decode-core.md#13-structure-and-per-hop-processing-wola-form) step 0 and [MAN-234](DECISIONS/2026-10-15-man234-bad-input-samples.md). | Every source; 0 from startup with a `[server]` table; summed across reconnects. |
+| `manta_input_spots_total` | counter | `source` | Spots this input decoded and published, attributed by the emitting track's id (MAN-13's interleaved ids). With several `[[input]]` entries the series sum to `manta_spots_total`; with one entry there is no series, and `manta_spots_total` is that input's count. See [MAN-14](DECISIONS/2026-10-19-man14-per-receiver-hearing-visibility.md). | Only with two or more `[[input]]` entries: one series per entry's `name`, 0 from startup. With one input, the `# TYPE` line but no samples. |
+| `manta_input_distinct_calls_total` | counter | `source` | Distinct callsigns this input decoded spots for since the daemon started. Kept as a set of 64-bit FNV-1a hashes, at most 20,000 per input: past that, new calls are not counted (a one-time warning says so), so the value is then a floor. | As `manta_input_spots_total`. |
+| `manta_input_cross_input_dupes_total` | counter | `source` | Candidate spots this input had withheld because another input had already spotted the same signal (MAN-13's cross-input dedupe: within 600 s, in the same 300 Hz bucket or within one channel across a bucket edge). `source` is the withheld input, the one that lost: each count shows that it heard the station too. | As `manta_input_spots_total`. |
+| `manta_input_silent` | gauge | `source` | 1 when this input decoded no spots over the last `[server].silent_input_warning_secs` window while another input decoded at least one, else 0. Evaluated once per window; an input whose sample delivery was unhealthy during the window is not flagged, nor is any input when every input was quiet. Back to 0 when the input decodes again. Not part of `/healthz`: a silent input that still delivers samples reads `manta_source_health` 1. | As `manta_input_spots_total`. Stays 0 with `silent_input_warning_secs = 0`. |
 | `manta_list_info` | gauge | `list`, `sha256`, `origin` | Always 1. Names the reference list each consumer uses now: `list` is `cty` or `scp`; `sha256` is the SHA-256 of its bytes; `origin` is `bundled`, `file`, `cache` or `download`. A swap replaces the series. | Always with `[server]`; one series per list. |
 | `manta_list_refresh_total` | counter | `list`, `outcome` | Download attempts by outcome: `updated` (a new version passed the checks and is in use), `unchanged` (304, or the same bytes), `failed` (network or HTTP error, or rejected by the checks). | With `refresh_lists` on, for each list the refresher manages; all three outcomes start at 0. No samples otherwise. |
 | `manta_list_last_success_timestamp_seconds` | gauge | `list` | Unix time manta last confirmed the list in use is current with its URL (an `updated` or `unchanged` attempt, or the cache's `checked_at` at startup). Alert on `time() - manta_list_last_success_timestamp_seconds{list="cty"} > 8*86400`. | With `refresh_lists` on, once the list has been confirmed at least once. Absent means never confirmed. |
@@ -148,6 +152,26 @@ missing series as "no loss" or "no traffic".
 | `manta_live_clients_connected` | gauge | — | Live-state stream clients connected now, raw TCP and WebSocket together. Live clients are not counted in `manta_json_clients_connected` or `manta_ws_clients_connected`. See [LIVE-STATE.md](LIVE-STATE.md). | Only with `[server].live_port` set: the family's `# HELP`/`# TYPE` lines are absent otherwise. |
 | `manta_live_records_total` | counter | `kind` | Live-state records published to at least one connected client, by `kind`: `bandState`, `trackState`, `candidateDecision` or `trackClosed`. Records are built only while a live client is connected, so nothing is counted while none is. | Only with `[server].live_port` set, as for `manta_live_clients_connected`. |
 | `manta_live_records_dropped_total` | counter | `reason` | Live-state records a disconnected client never received, by `reason`: `lagged` (the client fell more than 4096 records behind), `write_failed` (a write, or the client's WebSocket handshake, timed out or failed) or `shutdown` (unsent when the daemon stopped). The spot-loss counters (`manta_spots_dropped_lagged_total`, `manta_spots_dropped_write_failed_total`, `manta_spots_dropped_shutdown_total`) never count live records, so they still mean spots. | Only with `[server].live_port` set, as for `manta_live_clients_connected`. |
+
+### HPSDR input counters by protocol
+
+MAN-305: the names, labels and 1 Hz sampling are the same for both openHPSDR
+protocols; the meaning differs. For a protocol-1 radio (Hermes-Lite 2) the
+counters keep their meaning above: losses are estimated from packet timing,
+because protocol 1 carries no sequence number. For a protocol-2 radio (ANAN):
+
+| Metric | Definition for a protocol-2 radio | Source |
+|---|---|---|
+| `manta_input_dropped_packets_total{source="hpsdr"}` | IQ datagrams proven lost by DDC0's 32-bit sequence number: a jump from *n* to *n + k + 1* adds *k*. Each datagram is 238 samples (1.24 ms at 192 kHz). Radio restarts add nothing, because the count is unknown, and neither does a jump larger than the time since the last datagram allows (one full socket buffer beyond it), which counts as a restart. | `Protocol2IqSource` sequence tracker → `InputHealthCounters::record_dropped` |
+| `manta_input_gaps_detected_total{source="hpsdr"}` | Loss events: one per sequence jump, plus one per radio restart (sequence back to 0). | `record_gap` |
+| `manta_input_malformed_packets_total{source="hpsdr"}` | Datagrams discarded unread: a wrong length or header on the IQ port, an unknown source port from the radio, or any datagram from another address. | `record_malformed` |
+| `manta_source_health{source="hpsdr"}` | Unchanged: 1 once a valid IQ datagram has arrived since the last open, else 0. | `confirmed_live_handle` |
+
+On the decoder side, a gap shorter than 0.5 s is spliced and the spot clock
+jumps by the lost samples, so spot timestamps stay true and tracks stay open;
+a gap of 0.5 s or more, or a restart, also closes every track in progress, as
+a reconnect does. See
+[MAN-305](DECISIONS/2026-10-19-man305-hpsdr-protocol-2-input.md).
 
 ### Sample
 
@@ -209,8 +233,10 @@ The node is healthy only when every line passes, with one exception
 (MAN-13): with two or more inputs, the source lines need only one input
 healthy, so one dead receiver does not make a health check restart the
 daemon and interrupt the inputs still spotting. Each input keeps its own
-line and its own `manta_source_health` series. RBN uplink state is not
-part of the verdict; use the uplink families or `/status` for that.
+line and its own `manta_source_health` series. An input that delivers
+samples but decodes nothing stays `healthy` here; `manta_input_silent`
+reports it (MAN-14). RBN uplink state is not part of the verdict; use the
+uplink families or `/status` for that.
 `manta_healthy` and `manta_listener_up` come from the same evaluation.
 
 Captured during the V1 replay:
@@ -253,6 +279,7 @@ document.
 | `uplink.reconnect_window_seconds` | The flapping window, 300. |
 | `uplink.flapping_threshold` | Recent reconnect attempts that mark a target flapping, 3. |
 | `uplink.targets` | One object per `[[rbn_uplink]]` entry in config order, disabled entries included. |
+| `inputs` | One object per `[[input]]` entry in config order. Present only with two or more entries (MAN-14); a one-input document has no `inputs` key. |
 
 Each `uplink.targets` object has `target` (the same `host:port` label as
 the per-target metrics), `enabled`, `connected`, `sent`, `suppressed`,
@@ -263,6 +290,14 @@ otherwise `flapping` if `recent_reconnects` is 3 or more, otherwise
 `connected` or `down`. `flapping` takes precedence over `connected`, so
 `/status` can report a target as flapping while
 `manta_uplink_target_connected` reads 1.
+
+Each `inputs` object has `name`, `spots_total`, `distinct_calls` and
+`cross_input_dupes_total` (that input's `manta_input_spots_total`,
+`manta_input_distinct_calls_total` and
+`manta_input_cross_input_dupes_total`), `silent` (`manta_input_silent` as
+a boolean) and `last_spot_age_seconds` (seconds since the input's last
+spot, `null` before its first). `manta status` prints them as an Inputs
+table: NAME, SPOTS, CALLS, XDUPES, LAST SPOT, SILENT.
 
 Captured during the V1 replay (no `[[rbn_uplink]]` configured):
 
@@ -295,6 +330,32 @@ Connection: close
 }
 ```
 
+With two inputs, `live` and `deaf`, the document also carries `inputs`
+(shown alone here; the other fields are as above):
+
+```json
+{
+  "inputs": [
+    {
+      "name": "live",
+      "spots_total": 1,
+      "distinct_calls": 1,
+      "cross_input_dupes_total": 0,
+      "silent": false,
+      "last_spot_age_seconds": 12.0
+    },
+    {
+      "name": "deaf",
+      "spots_total": 0,
+      "distinct_calls": 0,
+      "cross_input_dupes_total": 0,
+      "silent": true,
+      "last_spot_age_seconds": null
+    }
+  ]
+}
+```
+
 For what each uplink state means and what to do about it, see
 [RUNBOOKS/uplink-health.md](RUNBOOKS/uplink-health.md).
 
@@ -318,3 +379,6 @@ For what each uplink state means and what to do about it, see
   live-state families and the `live` listener.
 - [MAN-129](DECISIONS/2026-10-12-man129-dashboard-and-alerts.md): the shipped
   Grafana dashboard and Prometheus alert rules.
+- [MAN-14](DECISIONS/2026-10-19-man14-per-receiver-hearing-visibility.md): the
+  per-input hearing families, `/status` `inputs` and the silent-input
+  warning.

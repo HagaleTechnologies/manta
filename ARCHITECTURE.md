@@ -134,10 +134,20 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
   8-bit), Airspy HF+ (768 kS/s, the reference device), SDRplay. Runtime device
   selection by driver string. Feature-gating keeps the core buildable without the
   native SoapySDR library (CI, contributors without hardware).
-- **OpenHPSDR/Hermes** (Protocol 1 "Metis" over UDP, in every build):
-  Hermes-Lite 2 and Pavel Demin's Red Pitaya and QMTech images. Pure UDP/std with
-  no native-library dependency. The wire facts are
-  spike-pinned (`docs/DECISIONS/2026-09-02-hpsdr-hermes-protocol-spike.md`), not yet
+- **OpenHPSDR** (UDP, both protocols, in every build): protocol 1 ("Metis":
+  Hermes-Lite 2 and Pavel Demin's Red Pitaya and QMTech images) and protocol 2
+  (ANAN-class: Hermes, Angelia, Orion, Orion II, Saturn/G2), behind one
+  `hpsdr` source type. Under `--hpsdr-protocol auto` the open sends a directed
+  discovery probe to the configured host and picks the protocol from the
+  answer. Protocol 2 streams on one unconnected socket that demultiplexes by
+  the radio's source port: DDC0 IQ arrives from `port + 11`, a port manta never
+  sent to. Its datagrams are numbered, so a short loss is reported through
+  `IqSource::take_missing_samples()`: `listen` advances its sample clock
+  without closing tracks, and a loss of 0.5 s or more, or a radio restart,
+  goes through `take_discontinuity()`. Pure UDP/std plus `socket2`, with no
+  native-library dependency. The wire facts are pinned against reference
+  sources (`docs/DECISIONS/2026-09-02-hpsdr-hermes-protocol-spike.md`,
+  `docs/DECISIONS/2026-10-19-man305-hpsdr-protocol-2-input.md`), not yet
   confirmed against live hardware.
 - **ka9q-radio (radiod) channel** (RTP over UDP multicast, no feature gate):
   joins the multicast data group of one existing radiod IQ channel and reads
@@ -149,13 +159,21 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
 - **KiwiSDR client**: the kiwisdr websocket IQ protocol (12 kHz IQ per channel) —
   narrow, but gives instant worldwide receiver access for development and lets
   low-budget nodes contribute spots.
-- **File playback**: WAV (via `hound`, matching coppa) and raw interleaved
+- **File playback**: WAV (via `hound`, matching coppa): Float32 or
+  16/24/32-bit integer PCM, streamed from disk, so memory does not grow with
+  the recording
+  ([docs/DECISIONS/2026-10-14-man119-streaming-wav-and-real-audio-corpus.md](docs/DECISIONS/2026-10-14-man119-streaming-wav-and-real-audio-corpus.md)),
+  and raw interleaved
   `f32`/`i16` IQ with a small JSON sidecar for rate/center-freq. Drives the entire
   test strategy; the daemon must run identically from file and live SDR.
 - **Audio passband** (via `coppa-audio`): 48 kHz real audio from a rig's RX audio,
   Hilbert-transformed to analytic. Degenerate ~3 kHz "wideband" mode; exists
   because it makes manta useful to people with zero SDR hardware, and it is the
-  M1 bring-up path.
+  M1 bring-up path. The front end is a 511-tap analytic FIR, and the source
+  declares a 600 Hz DC/Nyquist spawn guard (`IqSource::analytic_guard_hz`)
+  where its image rejection is not guaranteed; tones that close to DC or
+  Nyquist start no track (MAN-273, see
+  docs/DECISIONS/2026-10-16-man273-hilbert-image-guard.md).
 
 **Sample-rate assumptions.** Design center: 96–192 kS/s complex (covers any HF CW
 band segment; CW allocations are ≤ 100 kHz wide). Supported ceiling: 768 kS/s
@@ -209,15 +227,20 @@ the current track segment and starting a fresh one with the sample clock
 advanced by the gap, so spot timestamps stay wall-clock-true with no
 audio spliced across the gap and no zero-fill (see
 `docs/DECISIONS/2026-10-05-man73-source-reconnect.md` for why zero-fill
-was rejected). A stop while the source is down (MAN-258) ends the stream
-with the outage still pending, so the open tracks close with the same
-outage teardown and no new segment starts. File replay is exempt: its
-errors and EOF must reach `listen()` unchanged for byte-identical replay.
-Each reopen runs on its own short-lived `reopen-<kind>` thread, so a stop
-request during an outage abandons it and `read()` returns EOF within
-~100 ms; the client drain, which starts only after `listen()` returns,
-therefore no longer waits for a stalled DNS lookup, connect or driver open
-(MAN-252).
+was rejected). The gap ends where the reopened device started streaming,
+which each driver reports as `IqSource::acquisition_start_offset()`, not
+where its open call returned: samples it buffered while still opening are
+returned as data and must not also count as outage, or every later spot
+is stamped late by the reopen time (MAN-259,
+`docs/DECISIONS/2026-10-16-man259-acquisition-anchored-outage.md`). A stop
+while the source is down (MAN-258) ends the stream with the outage still
+pending, so the open tracks close with the same outage teardown and no new
+segment starts. File replay is exempt: its errors and EOF must reach
+`listen()` unchanged for byte-identical replay. Each reopen runs on its own
+short-lived `reopen-<kind>` thread, so a stop request during an outage
+abandons it and `read()` returns EOF within ~100 ms; the client drain,
+which starts only after `listen()` returns, therefore no longer waits for a
+stalled DNS lookup, connect or driver open (MAN-252).
 
 **Paced and looping replay (MAN-269).** File replay normally runs as fast
 as the machine decodes. `run --realtime` (`input.realtime`) wraps the file
@@ -678,8 +701,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   Unknown tables, keys and `MANTA_*` variables
   are errors. `docs/CONFIG.md` is the per-key reference (default, and
   which commands and engines each key affects); `docs/SPEC-decode-core.md`
-  §9 stays normative for the decode-core defaults. Not yet
-  configurable: a band plan (CW segment limits) and the
+  §9 stays normative for the decode-core defaults. A band plan:
+  `[input].bands` expands to streams over
+  `manta_server::band_plan::CW_SEGMENTS` (MAN-310); the segment limits
+  themselves are not configurable, nor are the
   compile-time constants SPEC §9 marks `not configurable yet`.
   `manta config check` runs `run`'s config pipeline up to its first source
   I/O (load, environment overlay, source resolution, blocklist/notch
@@ -968,7 +993,14 @@ validation (MAN-28). Dedupe (step 5) still applies.
   deployment, the runtime tears down microseconds later. See
   `docs/DECISIONS/2026-09-04-man64-metrics-request-rate-and-source-health.md`.
 - Every dropped/evicted/suppressed item is counted. **No silent loss anywhere in
-  the pipeline** — if coverage was bounded, the metrics say so.
+  the pipeline** — if coverage was bounded, the metrics say so. With several
+  `[[input]]` entries, MAN-14's per-input hearing counters count each
+  cross-input dedupe withhold against the input that lost
+  (`manta_input_cross_input_dupes_total{source}`) and expose each input's
+  spots, distinct calls and silence (`manta_input_spots_total`,
+  `manta_input_distinct_calls_total`, `manta_input_silent`) on `/metrics`,
+  the status line and `/status` — see
+  [MAN-14](docs/DECISIONS/2026-10-19-man14-per-receiver-hearing-visibility.md).
 
 ## 9. Test strategy (`manta-testkit`)
 

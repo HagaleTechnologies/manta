@@ -1205,6 +1205,7 @@ fn spec_detector_values_equal_the_code_defaults() {
         "rtty_dwell_ms",
         "non_cw_filter",
         "unkeyed_close_ms",
+        "reacquire_ms",
     ] {
         assert!(
             table.contains_key(key),
@@ -1275,6 +1276,7 @@ fn spec_documents_every_input_and_spot_key() {
                 "loop",
                 "host",
                 "port",
+                "protocol",
                 "freq_hz",
                 "password",
                 "driver",
@@ -2488,6 +2490,43 @@ fn metrics_reference_documents_non_request_budget_charges() {
     );
 }
 
+/// MAN-273 PR #340 review: `manta_input_bad_samples_total`'s row states the
+/// worst-case fan-out one bad source sample suffers through the live-audio
+/// Hilbert filter, and the 511-tap sparse FIR changed it. `process()`
+/// evaluates only the nonzero taps, so one NaN real input poisons the
+/// imaginary part of every output whose window holds it at a nonzero tap
+/// plus the real part of the one output where it sits at the delay tap --
+/// and the row must state exactly that count, measured here through the
+/// shipped transformer and the metric's own usability rule.
+#[test]
+fn metrics_reference_states_the_hilbert_bad_sample_fan_out() {
+    let mut h = manta_dsp::hilbert::HilbertTransformer::new();
+    let mut input: Vec<f32> = (0..1024).map(|i| (i as f32 * 0.05).sin()).collect();
+    input[512] = f32::NAN;
+    let out = h.process(&input);
+    let fanout = out
+        .iter()
+        .filter(|s| !manta_dsp::sample_guard::is_usable(**s))
+        .count();
+    assert!(
+        fanout > 0,
+        "one NaN source sample poisoned no Hilbert output; the metric's fan-out \
+         contract has moved and this test needs re-deriving"
+    );
+    let md = doc(METRICS_REF);
+    let row = md
+        .lines()
+        .find(|l| l.starts_with("| `manta_input_bad_samples_total` |"))
+        .unwrap_or_else(|| panic!("{METRICS_REF} has no `manta_input_bad_samples_total` row"));
+    assert!(
+        row.contains(&format!("about {fanout} through")),
+        "{METRICS_REF}'s `manta_input_bad_samples_total` row states the wrong Hilbert \
+         fan-out: one bad source sample makes {fanout} outputs unusable through the \
+         {}-tap live filter",
+        manta_dsp::hilbert::HILBERT_TAPS,
+    );
+}
+
 /// MAN-149 M2: config deserialization uppercases the station identity;
 /// SpotMessage uses that identity for both deCall and the id prefix.
 #[test]
@@ -3097,5 +3136,82 @@ fn wiki_windows_build_setup_stamp_names_a_snapshot_without_release_yml() {
          deleted `.github/workflows/release.yml` still existed: refresh \
          `verified.commit`/`verified.date` (and the manifest entry) whenever the \
          body is substantively changed"
+    );
+}
+
+// ---- MAN-310: docs/CONFIG.md's band table is CW_SEGMENTS ----
+
+/// `"5351.5"` kHz as Hz; `None` for the table's `–`.
+fn khz_cell(cell: &str) -> Option<f64> {
+    let cell = cell.trim();
+    (cell != "–").then(|| cell.parse::<f64>().expect("a kHz number") * 1000.0)
+}
+
+/// `"5351.5–5366.5"` as Hz.
+fn khz_range_cell(cell: &str) -> (f64, f64) {
+    let (lo, hi) = cell.trim().split_once('–').expect("a lo–hi range");
+    (khz_cell(lo).unwrap(), khz_cell(hi).unwrap())
+}
+
+#[test]
+fn config_md_band_table_matches_cw_segments() {
+    let text = doc("docs/CONFIG.md");
+    let start = text
+        .find("| band | CW segment, kHz | NCDXF beacon, kHz | skimmed span, kHz |")
+        .expect("docs/CONFIG.md has the band table");
+    let rows: Vec<Vec<&str>> = text[start..]
+        .lines()
+        .skip(2)
+        .take_while(|l| l.starts_with('|'))
+        .map(|l| l.trim_matches('|').split('|').map(str::trim).collect())
+        .collect();
+    let segments = manta_server::band_plan::CW_SEGMENTS;
+    assert_eq!(rows.len(), segments.len(), "one row per CW_SEGMENTS row");
+    for (row, seg) in rows.iter().zip(segments) {
+        assert_eq!(row[0], seg.band);
+        assert_eq!(
+            khz_range_cell(row[1]),
+            (seg.cw_lo_hz, seg.cw_hi_hz),
+            "{}",
+            seg.band
+        );
+        assert_eq!(khz_cell(row[2]), seg.beacon_hz, "{}", seg.band);
+        assert_eq!(khz_range_cell(row[3]), seg.span_hz(), "{}", seg.band);
+    }
+}
+
+// ---- MAN-119: the corpus runbook's test commands can be run as written ----
+
+/// Cargo runs an integration test from its package root
+/// (`crates/manta-testkit`), and `real_audio_corpus.rs` joins file names onto
+/// `MANTA_CORPUS_DIR` as given. The runbook told contributors to pass
+/// `MANTA_CORPUS_DIR=crates/manta-testkit/audio-corpus` from the workspace
+/// root, which resolved under `crates/manta-testkit/crates/...` and failed
+/// with "holds none of the manifest's recordings" while the files were there.
+/// Every copyable `MANTA_CORPUS_DIR=` value, quotes aside, must start with
+/// `/` or a `$` expansion; the test cannot check what an expansion yields.
+#[test]
+fn corpus_runbook_passes_an_absolute_corpus_dir() {
+    let rel = "docs/RUNBOOKS/real-audio-corpus.md";
+    let runbook = doc(rel);
+    let mut seen = 0;
+    for cmd in fenced_commands(&runbook) {
+        for tok in cmd.split_whitespace() {
+            let Some(value) = tok.strip_prefix("MANTA_CORPUS_DIR=") else {
+                continue;
+            };
+            seen += 1;
+            let unquoted = value.trim_start_matches('"');
+            assert!(
+                unquoted.starts_with('/') || unquoted.starts_with('$'),
+                "{rel} runs the corpus test with `MANTA_CORPUS_DIR={value}`; cargo runs \
+                 it from crates/manta-testkit, so the value must be an absolute path \
+                 (e.g. \"$PWD/...\"): {cmd}"
+            );
+        }
+    }
+    assert!(
+        seen > 0,
+        "{rel} no longer sets MANTA_CORPUS_DIR in a command; this test needs updating"
     );
 }

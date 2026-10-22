@@ -85,11 +85,9 @@ proptest! {
     // in play, the fix gives a small, constant, measurable CER floor from
     // the lost leading repetition(s) -- not the runaway failures below.
     //
-    // Still `#[ignore]`d, though, because un-ignoring surfaced THREE
-    // separate, pre-existing, out-of-scope real-detector bugs across this
-    // proptest's WPM/offset/SNR/text space (Tasks 4-8, not a Task 11
-    // tolerance issue -- same "don't force a real bug to pass" principle
-    // this plan applies to V2 in `golden_v2_v3.rs`):
+    // Still `#[ignore]`d, though, because un-ignoring surfaced separate,
+    // pre-existing, out-of-scope real-detector bugs across this proptest's
+    // WPM/offset/SNR/text space:
     //   1. offset_hz == 0 (channel 0, dead DC center): total decode failure
     //      (zero CharDecoded events) at every WPM/SNR tried. Noted on
     //      <https://github.com/HagaleTechnologies/manta/issues/12>.
@@ -97,17 +95,28 @@ proptest! {
     //      (CER > 1) clearing completely by 10.2 WPM, independent of
     //      text/offset/SNR. Filed as
     //      <https://github.com/HagaleTechnologies/manta/issues/22>.
-    //   3. Some other (text, wpm, offset, snr) combinations well outside
-    //      both of the above (e.g. wpm=18.117826, offset=-20kHz, snr=28dB,
-    //      text "AU") produce *persistent, non-converging* garbled decode
-    //      -- CER that grows with scene duration rather than stabilizing,
-    //      unlike every warmup-floor case in this task. Filed as
-    //      <https://github.com/HagaleTechnologies/manta/issues/23>.
-    // Given #3's breadth (not confined to a narrow, excludable parameter
-    // band the way #1 and #2 are), narrowing the proptest strategy further
-    // isn't a real fix, just whack-a-mole -- re-ignoring instead of forcing
-    // a pass, per this plan's escalation guidance. Un-ignore once #12/#22/#23
-    // (or their eventual root cause, possibly shared) are resolved.
+    // A third failure mode -- persistent, non-converging garbled decode on
+    // some (text, wpm, offset, snr, seed) tuples, issue #23 / MAN-6 -- is
+    // **MITIGATED**: the gap-corroborated bad-lock recovery in `SpeedTracker`
+    // (MAN-398) bounds the garbled run to a fixed-size prefix that stops
+    // growing with scene duration (the ticket's actual Gherkin criterion).
+    // A companion fix
+    // (discarding `Demod`'s un-anchored leading run at track promotion) was
+    // tried and reverted: it also discards genuine leading elements whenever
+    // the demod's init window happens to open on a real edge, regressing
+    // golden V1/V10 and any ordinary decode whose leading character starts
+    // with a mark — see
+    // docs/DECISIONS/2026-10-18-man398-gap-corroborated-badlock-recovery.md.
+    // Its regression coverage lives in
+    // `crates/manta-engine/tests/regression_man6_persistent_garble.rs`, which
+    // samples this same parameter space on a fixed deterministic grid --
+    // deliberately, rather than un-ignoring this proptest, because #12 and #22
+    // still make a randomized sweep of the full 10-40 WPM / +/-40 kHz space
+    // fail. Given #12/#22's remaining breadth, narrowing the proptest
+    // strategy further isn't a real fix, just whack-a-mole -- re-ignoring
+    // instead of forcing a pass, per this plan's escalation guidance.
+    // Un-ignore once #12 and #22 (or their eventual root cause, possibly
+    // shared) are resolved.
     #[test]
     #[ignore]
     fn iq_roundtrip_with_noise(
@@ -146,28 +155,22 @@ proptest! {
         // Loosened from the original exact `CER == 0`: like every other
         // continuously-keyed scenario in this task, the leading
         // repetition(s) played during warmup+confirm are structurally lost.
-        // This tolerance is aspirational pending issues #12/#22/#23 above --
-        // it holds for the ordinary warmup-floor-only cases but this test
-        // stays `#[ignore]`d because of the three real-bug cases that
-        // violate it regardless of tolerance.
+        // This tolerance is aspirational pending issues #12/#22 above -- it
+        // holds for the ordinary warmup-floor-only cases and for #23/MAN-6
+        // (mitigated) but this test stays `#[ignore]`d because of the two
+        // remaining real-bug cases that violate it regardless of tolerance.
         prop_assert!(
             cer(&texts[0], &report.text) < 0.25,
             "wpm {} snr {} offset {} kHz: keyed {:?} decoded {:?} (CER {:.4})",
             wpm, snr, offset_khz, texts[0], report.text, cer(&texts[0], &report.text)
         );
-        // V1's frequency criterion, generalized: within 25 Hz. Re-measured
-        // (Task 11 Step 3) against SPEC's original 10 Hz using a manual
-        // sweep across this proptest's wpm/snr/offset space (bypassing the
-        // proptest harness itself, which the CER bugs above dominate):
-        // clean-CER cases showed freq errors up to ~20.5 Hz, NOT reliably
-        // under 10 Hz -- unlike golden_v1.rs's V1 gate (fixed, narrow
-        // +12.34 kHz offset, now measured at ~9.9 Hz). This proptest's much
-        // wider offset range (+/-40 kHz vs. V1's single fixed offset)
-        // exposes more of the channelizer's known, separately-deferred
-        // fine-frequency interpolator bias (`interpolate_offset`,
-        // `manta-dsp::channelizer`; ~+/-21 Hz depending on fractional
-        // channel position -- see this plan's Task 11 context). Left at the
-        // original 25 Hz rather than tightened.
-        prop_assert!((report.freq_hz - offset_khz as f64 * 1000.0).abs() <= 25.0);
+        // V1's frequency criterion, generalized: within SPEC's 10 Hz. A
+        // manual sweep of this space under the dB-parabola spot frequency
+        // measured up to ~20.5 Hz on clean-CER cases (its bias depends on
+        // fractional channel position, which this wide offset range covers),
+        // forcing 25 Hz. MAN-114's phase estimator measures <= 4 Hz at every
+        // fractional offset on every table (`freq_across_channel.rs`;
+        // docs/DECISIONS/2026-10-17-man114-phase-difference-spot-frequency.md).
+        prop_assert!((report.freq_hz - offset_khz as f64 * 1000.0).abs() <= 10.0);
     }
 }
