@@ -16,13 +16,8 @@ sources:
   - docs/DECISIONS/2026-10-19-man307-hpsdr-multiple-receivers.md
   - crates/manta-cli/src/hpsdr_group.rs
 verified:
-<<<<<<< HEAD
   commit: cdf8487
   date: 2026-10-19
-=======
-  commit: b8b9367
-  date: 2026-10-16
->>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
 links:
   - determinism
 ---

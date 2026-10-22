@@ -15,6 +15,15 @@ processing rate, dial override and calibration remain per input. An optional
 It declares hardware capacity, while the existing eight-active-DDC and link
 budget limits still apply to the requested allocation. Changes require restart.
 
+After main's MAN-305 landed, every entry also carries `protocol` (default
+`auto`). The merge keeps both features: a lone HPSDR input in a multi-input
+daemon opens through MAN-305's `open_receiver`, honoring its protocol and
+`auto` discovery exactly as the standalone path does; a radio shared by
+several entries speaks Protocol 1 (both `auto` and `"1"` are accepted, and
+`"2"` is refused at config load, because manta's protocol-2 implementation
+opens one receiver per radio). Members of one radio must agree on the
+protocol.
+
 The research phase assumed Protocol 1 could not report capacity. Generic
 Protocol 1 has no portable count, but HL2 extends its discovery reply. The
 [vendor protocol](https://github.com/softerhardware/Hermes-Lite2/wiki/Protocol)

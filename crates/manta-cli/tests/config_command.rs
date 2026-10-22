@@ -1080,7 +1080,6 @@ fn check_binds_no_port_and_opens_no_receiver_with_several_inputs() {
     }
 }
 
-<<<<<<< HEAD
 #[test]
 fn shared_hpsdr_check_is_offline_and_reports_declaration() {
     let dir = tempfile::tempdir().unwrap();
@@ -1108,7 +1107,8 @@ fn shared_hpsdr_check_is_offline_and_reports_declaration() {
         );
     std::fs::write(&path, body).unwrap();
     assert!(fails(&check_file(&path)).contains("declares 4 receivers; 5 bands are configured"));
-=======
+}
+
 // MAN-310: `bands` plans a receiver's streams from the CW segment table.
 
 const KIWI: &str = "[input]\ntype = \"kiwi\"\nhost = \"kiwi.example.net\"\n";
@@ -1190,9 +1190,9 @@ fn bands_all_on_one_hpsdr_radio_is_refused_naming_the_14_stream_plan() {
     assert!(
         err.ends_with(
             "[input]: input.bands plans 14 streams (160m, 80m, 60m, 40m, 30m, 20m (2), 17m, \
-             15m (2), 12m, 10m (3)), but several receivers on one HPSDR radio are not \
-             supported yet; list bands that fit one stream (a 96000 Hz stream skims 86.899 \
-             kHz), or give each its own radio\n"
+             15m (2), 12m, 10m (3)), but bands opens one stream on an HPSDR radio; list bands \
+             that fit one stream (a 96000 Hz stream skims 86.899 kHz), or give each its own \
+             [[input]] on that radio (several receivers on one radio are one entry each)\n"
         ),
         "{err}"
     );
@@ -1396,5 +1396,4 @@ fn bands_from_the_environment() {
         err.contains("and manta runs at most 16 inputs; list fewer bands"),
         "{err}"
     );
->>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
 }

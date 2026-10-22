@@ -608,3 +608,102 @@ fn check_reports_a_protocol2_radio() {
         "{stderr}"
     );
 }
+
+/// MAN-307 x MAN-305: with several `[[input]]` entries every HPSDR radio
+/// opens through the shared-radio group, and a radio with one entry keeps
+/// MAN-305's protocol choice there: `auto` discovers each protocol-2 radio
+/// and streams from it, as the one-input path above does.
+#[test]
+fn lone_protocol2_radios_in_a_multi_input_run_are_discovered_and_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture(dir.path());
+    let samples = Arc::new(wav_samples(&wav));
+    let go = Arc::new(AtomicBool::new(false));
+    let (done_tx, _done_rx) = mpsc::channel();
+    let radios: Vec<FakeP2Radio> = (0..2)
+        .map(|_| {
+            FakeP2Radio::start(
+                Stream {
+                    samples: samples.clone(),
+                    speed: 2.0,
+                    skip: None,
+                    looping: true,
+                    go: go.clone(),
+                },
+                done_tx.clone(),
+            )
+        })
+        .collect();
+    let [telnet_port, json_port, metrics_port] = free_ports();
+    let mut text = format!(
+        "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {telnet_port}\njson_port = {json_port}\nmetrics_port = {metrics_port}\n"
+    );
+    for (name, radio) in ["a", "b"].iter().zip(&radios) {
+        text += &format!(
+            "\n[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nhost = \"127.0.0.1\"\nport = {}\nfreq_hz = 14000000.0\nrate_hz = 192000.0\n",
+            radio.base
+        );
+    }
+    let cfg = dir.path().join("manta.toml");
+    std::fs::write(&cfg, text).unwrap();
+    let mut child = manta()
+        .args(["run", "--json", "--config"])
+        .arg(&cfg)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let _guard = ChildGuard(child);
+    let err_lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    {
+        let err_lines = err_lines.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                err_lines.lock().unwrap().push(line);
+            }
+        });
+    }
+    let (spot_tx, spot_rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                if let Some(s) = v.get("spot") {
+                    let _ = spot_tx.send(spot_of(s));
+                }
+            }
+        }
+    });
+    let stderr_now = || err_lines.lock().unwrap().join("\n");
+    go.store(true, Ordering::SeqCst);
+    let spot = spot_rx
+        .recv_timeout(Duration::from_secs(60))
+        .unwrap_or_else(|_| panic!("no spot within 60 s; stderr:\n{}", stderr_now()));
+    assert_eq!(spot.0, "W1AW");
+    let healthy = |m: &str| {
+        ["a", "b"].iter().all(|name| {
+            metric_value(m, &format!("manta_source_health{{source=\"{name}\"}}")) == Some(1)
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let metrics = loop {
+        let body = scrape_metrics(metrics_port).unwrap_or_default();
+        if healthy(&body) || Instant::now() >= deadline {
+            break body;
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
+    assert!(healthy(&metrics), "{metrics}");
+    let stderr = stderr_now();
+    for radio in &radios {
+        assert!(
+            stderr.contains(&format!(
+                "HPSDR radio 127.0.0.1:{} answered discovery as openHPSDR protocol 2 (board 5, \
+                 Orion II",
+                radio.base
+            )),
+            "{stderr}"
+        );
+    }
+}

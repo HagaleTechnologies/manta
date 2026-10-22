@@ -1943,7 +1943,7 @@ fn hpsdr_open_line(
 }
 
 /// Print [`hpsdr_open_line`] for a radio `open_receiver` just opened.
-fn log_hpsdr_open_line(host: &str, port: u16, opened: &manta_input::hpsdr::OpenedHpsdr) {
+pub(crate) fn log_hpsdr_open_line(host: &str, port: u16, opened: &manta_input::hpsdr::OpenedHpsdr) {
     match hpsdr_open_line(host, port, opened.protocol, &opened.discovery) {
         Some(HpsdrOpenLine::Note(line)) => logging::note(&line),
         Some(HpsdrOpenLine::Warning(line)) => logging::warning(&line),

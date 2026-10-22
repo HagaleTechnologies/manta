@@ -1,11 +1,6 @@
 {
-<<<<<<< HEAD
-  "generated_at": "2026-10-19T09:10:00Z",
-  "head_commit": "cdf8487",
-=======
-  "generated_at": "2026-10-19T13:34:50Z",
-  "head_commit": "1826448",
->>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
+  "generated_at": "2026-10-22T14:52:00Z",
+  "head_commit": "038edf6",
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -272,11 +267,7 @@
       "visibility": "public"
     },
     {
-<<<<<<< HEAD
-      "hash": "sha256:031dc594e55ccebd2a0eaa97dc902f7d58f1b09bd563edde6add942874a85938",
-=======
-      "hash": "sha256:e88333e03827c806dde99f4c1d8950a6ec13f9bbd36f9f47276efe390cbc4c37",
->>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
+      "hash": "sha256:70e05a68528eae9a2cf1a799a43c8482e4e70b3a063d7f113b87cddc869fb9b8",
       "id": "source-reconnect",
       "kind": "gotcha",
       "links": [
@@ -299,13 +290,8 @@
       ],
       "status": "current",
       "title": "What's the gotcha with a live source disconnecting?",
-<<<<<<< HEAD
       "verified_commit": "cdf8487",
       "verified_date": "2026-10-19",
-=======
-      "verified_commit": "b8b9367",
-      "verified_date": "2026-10-16",
->>>>>>> 90e7406b565c582487848e6fb21638838fb3baf1
       "visibility": "public"
     },
     {

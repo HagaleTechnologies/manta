@@ -275,9 +275,10 @@ datagrams by the radio's source port.
   `manta_input_dropped_packets_total{source="hpsdr"}` climbs on a quiet LAN.
 - A radio that reports itself already streaming to another program is
   refused under `"auto"`; `protocol = "2"` takes it over.
-- One receiver (DDC0) per radio until MAN-307. The rate must be exactly
-  48000, 96000, 192000 or 384000 Hz, and `freq_hz` a whole number of Hz below
-  61440000.
+- One receiver (DDC0) per radio: several receivers on one radio (MAN-307)
+  speak protocol 1, so a shared radio refuses `protocol = "2"`. The rate
+  must be exactly 48000, 96000, 192000 or 384000 Hz, and `freq_hz` a whole
+  number of Hz below 61440000.
 - With `protocol = "2"`, or a board manta does not know, the radio's
   front-end filters are bypassed (ANT1, no high-pass, the 6 m low-pass).
 
@@ -344,7 +345,9 @@ every stream of that receiver.
 **Capacity.** A kiwi entry opens one KiwiSDR channel per stream, within the
 receiver's free channels. An hpsdr or soapy entry opens one stream; a plan
 that needs more is refused naming it (several receivers on one HPSDR radio
-is MAN-307). All inputs together stay within manta's 16, and one entry
+are one `[[input]]` each — see
+[the multiple-receivers guide](GUIDES/multiple-receivers.md#several-bands-on-one-hpsdr-radio)).
+All inputs together stay within manta's 16, and one entry
 plans at most 256 streams before that check (a near-zero `rate_hz` is
 refused rather than split into millions of slices). A plan of several
 streams refuses `center_freq_hz`: one fixed centre cannot describe
@@ -389,7 +392,8 @@ per receiver. Each entry takes the keys above, plus `name`. A one-entry
   `loop`.
 - HPSDR entries sharing a case-insensitive host and effective port use one
   radio session, with receivers assigned in file order. Native `rate_hz`
-  must match. Capacity is checked at startup, while `config check` remains
+  and `protocol` must match, and `protocol = "2"` is refused there.
+  Capacity is checked at startup, while `config check` remains
   offline. See [the four-band example and diagnostics](GUIDES/multiple-receivers.md#several-bands-on-one-hpsdr-radio).
 - `MANTA_INPUT_*` and the per-receiver flags `--freq-correction-ppm`,
   `--dial-freq-hz` and `--capture-rate-hz` cannot say which entry they set,
