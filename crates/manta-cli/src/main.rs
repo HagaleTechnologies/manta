@@ -1587,24 +1587,12 @@ impl LiveSourceSpec {
                 let rate = hpsdr
                     .rate
                     .ok_or_else(|| anyhow!("--hpsdr-rate-hz is required with --hpsdr-host"))?;
-<<<<<<< HEAD
-                let mut sources =
-                    manta_input::hpsdr::HpsdrDevice::open(hpsdr_config(hpsdr, freq, rate))?;
-                Box::new(sources.remove(0))
-=======
-                let cfg = manta_input::hpsdr::HpsdrConfig {
-                    host,
-                    port: hpsdr.port,
-                    ddc_count: 1,
-                    sample_rate_hz: rate,
-                    center_freq_hz: vec![freq],
-                };
+                let cfg = hpsdr_config(hpsdr, freq, rate);
                 // MAN-305 D2/D17: run, listen, soak, calibrate, check and
                 // doctor all open here, so each prints the same §4 line.
                 let opened = manta_input::hpsdr::open_receiver(&cfg, hpsdr.protocol)?;
                 log_hpsdr_open_line(&cfg.host, cfg.port, &opened);
                 opened.source
->>>>>>> f47bc13cb3ed24cdbae09961bda78f97c6474942
             }
             LiveSourceSpec::Ka9q(ka9q) => {
                 let group = ka9q
@@ -10062,6 +10050,7 @@ mod tests {
             LiveSourceSpec::Hpsdr(HpsdrOpts {
                 host: Some("h".into()),
                 port: manta_input::hpsdr::CONTROL_PORT,
+                protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
                 freq,
                 rate,
             })

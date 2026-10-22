@@ -60,22 +60,17 @@ const TARGET_RATE_HZ: usize = 96_000;
 const IQ_LOW_CUT_HZ: i32 = -5_000;
 const IQ_HIGH_CUT_HZ: i32 = 5_000;
 
-<<<<<<< HEAD
-/// MAN-334: the passband `rf_passband_hz` reports, public so `manta
-/// calibrate` can plan its references on a configured KiwiSDR before it
-/// connects. Derived from the `SET mod=iq` cuts, never a separate literal.
+/// The same passband as Hz from the tuned centre: the width of one KiwiSDR
+/// stream, which MAN-310's band planner splits bands into, and the passband
+/// `rf_passband_hz` reports, so `manta calibrate` can plan its references on
+/// a configured KiwiSDR before it connects (MAN-334). Derived from the
+/// `SET mod=iq` cuts, never a separate literal.
 pub const IQ_PASSBAND_HZ: (f64, f64) = (IQ_LOW_CUT_HZ as f64, IQ_HIGH_CUT_HZ as f64);
 
 /// MAN-334: the rate `sample_rate` reports. Every stream is resampled to
 /// it, whatever rate the receiver sends, so it is known before connecting.
 pub const OUTPUT_RATE_HZ: f64 = TARGET_RATE_HZ as f64;
 
-=======
-/// The same passband as Hz from the tuned centre: the width of one KiwiSDR
-/// stream, which MAN-310's band planner splits bands into.
-pub const IQ_PASSBAND_HZ: (f64, f64) = (IQ_LOW_CUT_HZ as f64, IQ_HIGH_CUT_HZ as f64);
-
->>>>>>> f47bc13cb3ed24cdbae09961bda78f97c6474942
 /// Resampler chunk size (in complex sample-pairs) fed to `rubato::Fft` per
 /// `process_into_buffer` call.
 ///
