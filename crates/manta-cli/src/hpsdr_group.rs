@@ -356,6 +356,7 @@ impl Member {
                 samples: 0,
                 current: Some((generation, source)),
                 gap: None,
+                missing: None,
                 resumed: None,
             });
         }
@@ -370,6 +371,7 @@ pub(crate) struct GroupSource {
     boundary: Instant,
     samples: u64,
     gap: Option<u64>,
+    missing: Option<u64>,
     resumed: Option<u64>,
 }
 impl GroupSource {
@@ -455,6 +457,10 @@ impl IqSource for GroupSource {
             let (generation, source) = self.current.as_mut().expect("adopted generation");
             let result = source.read(buf);
             let inner_gap = source.take_discontinuity();
+            // MAN-305: a short loss the inner source spliced over (a
+            // protocol-2 packet drop) advances the clock without closing
+            // tracks; the wrapper contract forwards it.
+            let inner_missing = source.take_missing_samples();
             if !self.group.is_current(generation) {
                 continue;
             }
@@ -470,7 +476,10 @@ impl IqSource for GroupSource {
                                 + inner_gap.unwrap_or(0),
                         );
                     }
-                    self.samples += n as u64 + inner_gap.unwrap_or(0);
+                    if let Some(k) = inner_missing {
+                        *self.missing.get_or_insert(0) += k;
+                    }
+                    self.samples += n as u64 + inner_gap.unwrap_or(0) + inner_missing.unwrap_or(0);
                     self.boundary = generation.started_at
                         + Duration::from_secs_f64(self.samples as f64 / self.metadata.rate);
                     return Ok(n);
@@ -481,6 +490,9 @@ impl IqSource for GroupSource {
     }
     fn take_discontinuity(&mut self) -> Option<u64> {
         self.gap.take()
+    }
+    fn take_missing_samples(&mut self) -> Option<u64> {
+        self.missing.take()
     }
 }
 impl Drop for GroupSource {
@@ -742,6 +754,7 @@ mod tests {
         counters: Arc<InputHealthCounters>,
         value: f32,
         gap: Option<u64>,
+        missing: Option<u64>,
     }
     impl IqSource for Samples {
         fn sample_rate(&self) -> f64 {
@@ -763,6 +776,9 @@ mod tests {
         }
         fn take_discontinuity(&mut self) -> Option<u64> {
             self.gap.take()
+        }
+        fn take_missing_samples(&mut self) -> Option<u64> {
+            self.missing.take()
         }
     }
 
@@ -806,6 +822,7 @@ mod tests {
                             counters,
                             value: generation as f32,
                             gap: None,
+                            missing: None,
                         }) as SendSource
                     })
                     .collect();
@@ -1023,6 +1040,7 @@ mod tests {
                         counters: Arc::new(InputHealthCounters::new()),
                         value: 0.0,
                         gap: None,
+                        missing: None,
                     })],
                     started_at: Instant::now(),
                     retire: Box::new(move || {
@@ -1084,6 +1102,45 @@ mod tests {
         assert_eq!(
             sources[0].boundary,
             current(&f.group).started_at + Duration::from_secs_f64(4.0 / 48000.0)
+        );
+    }
+
+    #[test]
+    fn inner_missing_samples_advance_the_clock_without_an_outage() {
+        // MAN-305: a protocol-2 receiver splices short packet losses and
+        // reports them through `take_missing_samples`; a wrapper that drops
+        // the hook leaves every later spot early by the lost duration.
+        let group = Group::new(
+            Box::new(|| {
+                Ok(Opened {
+                    sources: vec![Box::new(Samples {
+                        fail: Arc::new(AtomicBool::new(false)),
+                        counters: Arc::new(InputHealthCounters::new()),
+                        value: 0.0,
+                        gap: None,
+                        missing: Some(4800),
+                    })],
+                    started_at: Instant::now(),
+                    retire: Box::new(|| {}),
+                })
+            }),
+            Arc::new(AtomicBool::new(false)),
+            vec![Box::new(|_| {})],
+            Arc::new(Instant::now),
+        );
+        let mut source = Member {
+            group: group.clone(),
+            index: 0,
+        }
+        .open()
+        .unwrap();
+        assert_eq!(source.read(&mut [Complex32::default(); 4]).unwrap(), 4);
+        assert_eq!(source.take_missing_samples(), Some(4800));
+        assert_eq!(source.take_missing_samples(), None);
+        assert_eq!(source.take_discontinuity(), None);
+        assert_eq!(
+            source.boundary,
+            current(&group).started_at + Duration::from_secs_f64(4804.0 / 48000.0)
         );
     }
     #[test]
@@ -1196,6 +1253,7 @@ mod tests {
                         counters: Arc::new(InputHealthCounters::new()),
                         value: 2.0,
                         gap: None,
+                        missing: None,
                     }) as SendSource
                 })
                 .collect();
