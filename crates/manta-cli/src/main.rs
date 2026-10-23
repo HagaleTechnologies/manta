@@ -45,6 +45,8 @@ mod reload;
 mod silent;
 mod source_check;
 mod stdio;
+#[cfg(test)]
+mod test_ports;
 mod text_lines;
 use list_cache::ListKind;
 use reconnect::ReconnectingSource;
