@@ -16,11 +16,13 @@ the raw text of the first tag holding the maximum, then compared that text
 to the requested version with string `=`.
 
 `validate` rejects `v02.0.0`, but the tag can still exist after a mistaken
-push. `git tag --list` sorts byte-wise, so a leading-zero twin always lists
-before its corrected tag, in any component. The two tie under
+push. With the default tag ordering, `git tag --list` lists `v02.0.0`
+before `v2.0.0`. The two tie under
 `version_gt`, so the scan kept `"02.0.0"` and `"02.0.0" = "2.0.0"` failed.
 With `v02.0.0` and `v2.0.0` both tagged and nothing higher, the check
-printed `false` for `v2.0.0` every time, not just when a race hit.
+printed `false` for `v2.0.0` under that ordering, without a race.
+This ordering does not hold for every twin: `v0.0.0` lists before
+`v00.00.00`, so the all-zero test preserves behavior that already worked.
 
 Two steps in `.github/workflows/release-publish.yml` call this check, so
 both declined:
