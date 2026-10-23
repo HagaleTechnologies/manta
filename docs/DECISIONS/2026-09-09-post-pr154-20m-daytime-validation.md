@@ -60,13 +60,19 @@ candidate had to pass the gate (a flat 2 repetitions at the time of this
 session; MAN-95's later pattern tiers put `XE1@@` in the Common tier,
 also 2), so its factor is at least 0.75, and it gains the 15%
 `master.scp` boost `G0K` lacks (`crates/manta-spot/src/confidence.rs:23-44`,
-`crates/manta-spot/src/validator.rs:1419-1432,1763-1774`). Neither
-spot's repetition count is recorded. Backing the factors out at each
-spot's minimum count gives character evidence of ≈0.296 for `G0K` and
-≈0.300 for `XE1EE` -- nearly identical. More repetitions lower both
-(`G0K` ≈0.197 at two; `XE1EE` ≈0.23-0.26 at three to five, ≈0.23-0.30
-across its range), and either can come out ahead. So the confidence
-value does not separate this catch from the artifact band. `XE1EE` is a
+`crates/manta-spot/src/validator.rs:1419-1432,1763-1774`). `XE1EE`'s
+repetition count was exactly 2, so its factor was exactly 0.75: in
+`455e1af`'s `Validator::evaluate_candidate` an ordinary candidate emits
+the first time `RepetitionGate::record` (at most one more per call)
+returns 2, with no variant arbitration yet (MAN-100 landed later) and
+dedupe passing a first spot, and `listen --json` and the summarizer
+print every emitted spot -- this record reports 2 spots, one of them
+`XE1EE`. `G0K`'s count is not recorded. Backing the factors out gives
+character evidence of ≈0.300 for `XE1EE`, and at most ≈0.296 for `G0K`
+(the single decode the residual-gap shape describes; ≈0.197 at two).
+At `G0K`'s single-decode reading the two are nearly identical, so the
+confidence value does not separate this catch from the artifact band.
+`XE1EE` is a
 well-formed Mexican amateur callsign (XE + region digit + 2 letters). Not
 independently verified against a callsign database or DX cluster in this
 session -- flagging as *plausible*, not confirmed-correct copy.
