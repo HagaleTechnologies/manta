@@ -11,8 +11,13 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+<<<<<<< HEAD
 | 2026-10-23 | MAN-179 | [MAN-179: the MAN-166 writeup's 41,174 and 409,675 count different track populations](2026-10-23-man179-man166-track-populations.md) |
+=======
+| 2026-10-23 | MAN-158 | [MAN-158: ROADMAP holds gates and pointers; SECURITY.md states the shipped scope](2026-10-23-man158-roadmap-security-scope-refresh.md) |
+>>>>>>> cd790841d3ed6ef20d8f0ae7dd30c0d772fe5b60
 | 2026-10-23 | MAN-176 | [Superseded track-cap defaults in decision records](2026-10-23-man176-track-cap-default-docs.md) |
+| 2026-10-23 | MAN-173 | [MAN-173: a word-boundary gate fails a decode that adds word breaks](2026-10-23-man173-word-boundaries-count-extra-splits.md) |
 | 2026-10-22 | MAN-94 | [MAN-94: an NCDXF/IARU beacon spot reads `NCDXF B` on the wire](2026-10-22-man94-ncdxf-beacon-label.md) |
 | 2026-10-20 | MAN-340 | [MAN-340: a dispatched CI run tests the PR head merged with the main commit its workflow came from](2026-10-20-man340-dispatched-ci-tests-the-merge-with-main.md) |
 | 2026-10-19 | MAN-334 | [MAN-334: calibrate plans its references before it opens the receiver](2026-10-19-man334-calibrate-plans-before-opening.md) |
@@ -109,7 +114,7 @@ Add a row here in the same change that adds a record:
 | 2026-09-10 | MAN-171 | [MAN-171's "dead zone" traces to the RF/antenna path on the test rig, not manta's channelizer/detector/track-manager; the startup-transient comb is a real, absolute-frequency-locked hardware artifact, and it now has a real fix](2026-09-10-man171-dead-zone-is-rf-path-not-manta-code.md) |
 | 2026-09-10 | — | [Reseating connections and adding a common-mode choke resolves the live-hardware detection gap](2026-09-10-antenna-path-fix-resolves-detection-gap.md) |
 | 2026-09-09 | — | [`--soapy-gain` on this RSP1B is a gain-*reduction* (attenuation) scale, not a gain scale -- every prior fixed-gain field session used a heavily-attenuated setting](2026-09-09-soapy-gain-is-inverted-attenuation-scale.md) |
-| 2026-09-09 | — | [Post-PR#154 20m daytime session: fix holds, first plausible real off-air catch](2026-09-09-post-pr154-20m-daytime-validation.md) |
+| 2026-09-09 | — | [Post-PR#154 20m daytime session: new code runs live, first plausible real off-air catch](2026-09-09-post-pr154-20m-daytime-validation.md) |
 | 2026-09-09 | — | [Overnight 40m SoapySDR field test: fixed a real crash, still no confirmed off-air copy](2026-09-09-overnight-40m-soapy-field-test.md) |
 | 2026-09-09 | MAN-166 | [MAN-166: track_cap raised; confirm_hops investigated and deliberately left alone](2026-09-09-man166-confirm-hops-and-track-cap.md) |
 | 2026-09-09 | — | [`manta doctor`: a real `TrackPromoted` event replaces decode-timing proxies](2026-09-09-doctor-track-promoted-event.md) |
