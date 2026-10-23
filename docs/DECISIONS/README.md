@@ -11,7 +11,11 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+<<<<<<< HEAD
 | 2026-10-23 | MAN-266 | [MAN-266: a corrected release tag takes `:latest` beside its rejected leading-zero twin](2026-10-23-man266-corrected-release-latest.md) |
+=======
+| 2026-10-23 | MAN-195 | [MAN-195: `spectral_beta = 0.0` skips the spectral-reference scan](2026-10-23-man195-spectral-beta-zero-skips-spectral-reference-scan.md) |
+>>>>>>> 444bc69a4a6d7ff083d35fa4905a8a983f9b90d1
 | 2026-10-23 | MAN-158 | [MAN-158: ROADMAP holds gates and pointers; SECURITY.md states the shipped scope](2026-10-23-man158-roadmap-security-scope-refresh.md) |
 | 2026-10-23 | MAN-176 | [Superseded track-cap defaults in decision records](2026-10-23-man176-track-cap-default-docs.md) |
 | 2026-10-23 | MAN-173 | [MAN-173: a word-boundary gate fails a decode that adds word breaks](2026-10-23-man173-word-boundaries-count-extra-splits.md) |
@@ -111,7 +115,7 @@ Add a row here in the same change that adds a record:
 | 2026-09-10 | — | [Post-antenna-fix 90-minute (wall-clock) unattended soak: real detection confirmed at scale; SDRplay stream/device failures are a real, recurring operational problem](2026-09-10-post-antenna-fix-90min-soak-and-service-reliability.md) |
 | 2026-09-10 | MAN-171 | [MAN-171's "dead zone" traces to the RF/antenna path on the test rig, not manta's channelizer/detector/track-manager; the startup-transient comb is a real, absolute-frequency-locked hardware artifact, and it now has a real fix](2026-09-10-man171-dead-zone-is-rf-path-not-manta-code.md) |
 | 2026-09-10 | — | [Reseating connections and adding a common-mode choke resolves the live-hardware detection gap](2026-09-10-antenna-path-fix-resolves-detection-gap.md) |
-| 2026-09-09 | — | [`--soapy-gain` on this RSP1B is a gain-*reduction* (attenuation) scale, not a gain scale -- every prior fixed-gain field session used a heavily-attenuated setting](2026-09-09-soapy-gain-is-inverted-attenuation-scale.md) |
+| 2026-09-09 | — | [`--soapy-gain` on this RSP1B is a gain-*reduction* (attenuation) scale, not a gain scale -- every prior fixed-gain field session used a heavily-attenuated setting](2026-09-09-soapy-gain-is-inverted-attenuation-scale.md); MAN-226 correction, 2026-10-23 |
 | 2026-09-09 | — | [Post-PR#154 20m daytime session: new code runs live, first plausible real off-air catch](2026-09-09-post-pr154-20m-daytime-validation.md) |
 | 2026-09-09 | — | [Overnight 40m SoapySDR field test: fixed a real crash, still no confirmed off-air copy](2026-09-09-overnight-40m-soapy-field-test.md) |
 | 2026-09-09 | MAN-166 | [MAN-166: track_cap raised; confirm_hops investigated and deliberately left alone](2026-09-09-man166-confirm-hops-and-track-cap.md) |
@@ -119,7 +123,7 @@ Add a row here in the same change that adds a record:
 | 2026-09-09 | — | [Manta: twenty investigations toward exceptional CW reception](2026-09-09-decoder-recall-research.md) |
 | 2026-09-09 | — | [decode-core-v2 stage-2 gate (Hsmm engine) -- measured, FAIL](2026-09-09-decode-core-v2-stage2-gate.md) |
 | 2026-09-09 | — | [Non-allowlisted Beacon spots: emission deferred from first-decode to track-close](2026-09-09-beacon-emission-deferred-to-track-close.md) |
-| 2026-09-09 | — | [Dial-shift test confirms a passband-edge track-promotion artifact on 20m; the interior 20m cluster is not the same artifact (likely RTTY/digital, unconfirmed)](2026-09-09-20m-dial-shift-edge-artifact-confirmed.md) |
+| 2026-09-09 | — | [Dial-shift test confirms a passband-edge track-promotion artifact on 20m; the interior 20m cluster is not the same artifact (likely RTTY/digital, unconfirmed)](2026-09-09-20m-dial-shift-edge-artifact-confirmed.md); MAN-226 correction, 2026-10-23 |
 | 2026-09-08 | — | [First live SDRplay RSP1B run: findings](2026-09-08-first-live-rsp1b-run.md) |
 | 2026-09-07 | MAN-87 | [MAN-87: telnet IAC option-negotiation policy, and login control-byte trimming](2026-09-07-man87-telnet-iac-policy.md) |
 | 2026-09-07 | MAN-86 | [MAN-86: Aggregator `SKIMMER/SETT` handshake, greeting banner, `BYE`, login validation](2026-09-07-man86-aggregator-sett-handshake.md) |
