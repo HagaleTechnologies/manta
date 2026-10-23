@@ -11,6 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-23 | MAN-266 | [MAN-266: a corrected release tag takes `:latest` beside its rejected leading-zero twin](2026-10-23-man266-corrected-release-latest.md) |
 | 2026-10-23 | MAN-158 | [MAN-158: ROADMAP holds gates and pointers; SECURITY.md states the shipped scope](2026-10-23-man158-roadmap-security-scope-refresh.md) |
 | 2026-10-23 | MAN-176 | [Superseded track-cap defaults in decision records](2026-10-23-man176-track-cap-default-docs.md) |
 | 2026-10-23 | MAN-173 | [MAN-173: a word-boundary gate fails a decode that adds word breaks](2026-10-23-man173-word-boundaries-count-extra-splits.md) |
