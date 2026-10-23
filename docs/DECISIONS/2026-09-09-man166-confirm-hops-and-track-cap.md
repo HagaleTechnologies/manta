@@ -28,6 +28,16 @@ when the cap was removed, the opposite of what pure cap pressure would
 predict (Codex review, PR #152, round 8 -- an earlier draft of this doc
 conflated the two under one "tracks killed purely to make room" framing).
 
+**[Clarified: MAN-179, annotated 2026-10-23]** The closes above are
+`TrackManager::close_counts()` totals: every track the detector closed,
+CANDIDATEs included, one close per `track_id`. The three reasons named sum
+to 409,675; the 68.8%/29.7% shares put the full total near 416,000, the
+rest being `hang_expired` and `silent` closes not listed here. This is
+not the population behind the audio-corpus README's 41,174, which counts
+promoted tracks in the baseline `manta decode --json` report: an
+`unconfirmed` close never promoted, so it never reached that report. See
+[MAN-179](2026-10-23-man179-man166-track-populations.md).
+
 ## track_cap: raised 500 -> 1200
 
 500 (ARCHITECTURE §4, not a SPEC value) was never stress-tested against
