@@ -729,7 +729,7 @@ class ReportTests(unittest.TestCase):
         self.assertAlmostEqual(s["down_s"], 12 * IV)
 
     def test_planned_window_counts_a_reboot_seen_after_the_cap(self):
-        # host reboot: no samples for 50 min, then a new process past the cap
+        # host reboot: no samples for 60 min, then a new process past the cap
         ov = {i: {"start_time": T0 + 105 * IV + 30} for i in range(106, 4321)}
         note = {"v": 1, "kind": "note", "ts": T0 + 100 * IV + 60, "note": "planned", "reason": "reboot"}
         s = summ(make_ledger(overrides=ov, skip=set(range(101, 106)), extra=[note]))

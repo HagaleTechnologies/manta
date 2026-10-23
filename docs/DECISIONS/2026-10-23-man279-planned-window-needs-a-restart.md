@@ -39,16 +39,10 @@ excluded 1140 s, hid it, and turned the run into a PASS (exit 0, 0.9900).
 ## Consequences
 
 - A cancelled maintenance excludes 0 s, and any outage after its note
-  counts against D-A. Tests: `test_planned_note_without_a_restart_excludes_nothing`,
-  `test_outage_inside_a_cancelled_planned_window_counts_as_down` and
-  `test_planned_window_capped_without_a_restart_excludes_nothing` in
-  `scripts/tests/test_field_node.py`.
-- A same-process recovery inside the window before a later restart now
-  excludes 0 s (it excluded up to that recovery before), while the later
-  restart is still listed `planned`. Extending the window to the later
-  restart could exclude more than before and hide the earlier outage.
-- A `report` run while a planned restart is still down excludes 0 s until
-  a sample shows the new `start_time`; running it again restores the
-  window. The day-30 report always follows a post-window sample (MAN-291).
+  counts against D-A (`scripts/tests/test_field_node.py`).
+- A same-process recovery inside the window before a later restart, and a
+  `report` run while a planned restart is still down, now exclude 0 s.
+  Running `report` once the new process is sampled restores the window;
+  the day-30 report always follows a post-window sample (MAN-291).
 - The 1800 s cap, the flags, the JSON and Markdown shape and every other
   D-* threshold are unchanged.
