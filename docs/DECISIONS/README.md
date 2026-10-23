@@ -11,7 +11,11 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+<<<<<<< HEAD
 | 2026-10-22 | MAN-94 | [MAN-94: an NCDXF/IARU beacon spot reads `NCDXF B` on the wire](2026-10-22-man94-ncdxf-beacon-label.md) |
+=======
+| 2026-10-20 | MAN-340 | [MAN-340: a dispatched CI run tests the PR head merged with the main commit its workflow came from](2026-10-20-man340-dispatched-ci-tests-the-merge-with-main.md) |
+>>>>>>> 5b7fabd18ef47dc9f4ec46b740bc5b2344310d4d
 | 2026-10-19 | MAN-334 | [MAN-334: calibrate plans its references before it opens the receiver](2026-10-19-man334-calibrate-plans-before-opening.md) |
 | 2026-10-19 | MAN-319 | [MAN-319: the live uplink needs a 6-character locator now; the registration exchange waits for MAN-90's capture](2026-10-19-man319-uplink-registration-exchange.md) |
 | 2026-10-19 | MAN-311 | [Exclude common digital-mode windows from CW track starts](2026-10-19-man311-digital-window-exclusions.md) |
