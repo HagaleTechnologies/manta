@@ -731,9 +731,10 @@ pub(crate) fn prepare(
                 return Ok(Opened {
                     sources: vec![source],
                     started_at,
-                    // A protocol-2 radio stops on drop (run 0); a boxed
-                    // protocol-1 receiver detaches its slot, as the
-                    // standalone path's reopen always has.
+                    // The lone source owns its session: a protocol-2
+                    // radio stops on drop (run 0), and so does the
+                    // protocol-1 receiver `open_receiver` returns
+                    // (MAN-306), before this member's next wait reopens.
                     retire: Box::new(|| {}),
                 });
             }
