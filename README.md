@@ -356,6 +356,10 @@ rejected with `unsupported sample rate …: fs/93.75 must be a power of two`.
 That list is examples, not the whole set: divide your own rate by 93.75,
 and it replays if the answer is a power of two of at least 4 and the rate
 is at most 10 MS/s.
+`--source-iq` also reads a manta IQ recording (`run --record-iq PATH`
+writes one while it decodes, from any input) and headerless cf32/ci16
+files given `--iq-format`, `--sample-rate-hz` and `--dial-freq-hz`; see
+[docs/GUIDES/iq-recording.md](docs/GUIDES/iq-recording.md).
 `--capture-rate-hz` decimates by a power of two into a *lower* table rate
 (`--capture-rate-hz 48000` on a 192 kS/s capture, to spend less CPU on a
 narrower passband); it is not a general resampler and cannot rescue an

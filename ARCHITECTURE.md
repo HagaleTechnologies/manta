@@ -261,6 +261,20 @@ than 10 MS/s (`MAX_IQ_WAV_RATE_HZ`) before reading samples, so a shape-valid
 but absurd header rate cannot reach the rate-sized allocations downstream.
 See `docs/DECISIONS/2026-10-10-man269-paced-looping-replay.md`.
 
+IQ files and recordings (MAN-309): `open_iq_file` picks a manta recording
+(`RecordedIqSource`, found by its `PATH.meta.jsonl`), headerless cf32/ci16
+(`RawIqSource`, rate and centre from the command line or `[input]
+iq_format`/`sample_rate_hz`) or an IQ WAV. A recording restores the
+recorded source's rate, centre, passband, trusted band and analytic guard,
+and replays each recorded gap once through `take_discontinuity`, which
+both `listen` and the offline `decode_source` turn into a new segment
+(fresh channelizer and track manager, clock advanced past the outage). `RecordingSource` wraps the final source `run` hands
+to `listen` (`--record-iq`): reads pass through unchanged while a bounded,
+non-blocking queue feeds one writer thread per recording, which stops the
+recording rather than make the decoder wait. Format and failure handling:
+`docs/GUIDES/iq-recording.md` and
+`docs/DECISIONS/2026-10-19-man309-iq-recording-and-replay.md`.
+
 ## 4. Channelizer (`manta-dsp`)
 
 **Implemented** as of M2 sub-project 1 (`manta-dsp::channelizer`) -- the

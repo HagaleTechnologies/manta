@@ -91,15 +91,18 @@ enum Command {
         long_about = "Read a short source sample and report its level without decoding. SOURCE is an audio WAV path, equivalent to --source PATH; use --source-iq for complex IQ. Without a selector, use the configured input or default audio input. The sampling deadline is duration + 5 seconds after opening, checked between reads. Native open/read calls can exceed it."
     )]
     Check(source_check::Args),
-    /// Decode CW from a recorded IQ WAV file.
+    /// Decode CW from a recorded IQ file.
     ///
-    /// Reads a stereo WAV file (channel 0 = I, channel 1 = Q), decodes the
-    /// CW in it, and prints the copied text plus a spot summary. Fully
-    /// deterministic: the same file always produces the same output.
+    /// Reads a stereo WAV file (channel 0 = I, channel 1 = Q), a manta IQ
+    /// recording, or headerless IQ, decodes the CW in it, and prints the
+    /// copied text plus a spot summary. Fully deterministic: the same file
+    /// always produces the same output.
     Decode {
         /// Stereo IQ WAV file: 32-bit float, or 16-, 24- or 32-bit integer
         /// samples. Its centre frequency is read from the matching
         /// `<name>.json` sidecar next to it, unless --center-freq-hz is given.
+        /// A manta IQ recording (`run --record-iq`) is found by its
+        /// PATH.meta.jsonl, which supplies its rate and centre.
         path: PathBuf,
         /// RF centre frequency of the recording, in Hz, overriding its sidecar.
         ///
@@ -107,6 +110,16 @@ enum Command {
         /// offsets from the recording's centre, and manta prints a warning.
         #[arg(long, value_name = "HZ", value_parser = parse_center_freq_hz)]
         center_freq_hz: Option<f64>,
+        /// Read headerless little-endian IQ: cf32 or ci16.
+        ///
+        /// Requires a sample rate and centre frequency (--sample-rate-hz,
+        /// --center-freq-hz). Omit for WAV or a manta recording with
+        /// metadata.
+        #[arg(long, value_name = "FORMAT")]
+        iq_format: Option<manta_input::RawIqFormat>,
+        /// Sample rate of headerless IQ.
+        #[arg(long, value_name = "HZ", value_parser = parse_iq_sample_rate_hz, requires = "iq_format")]
+        sample_rate_hz: Option<f64>,
         /// Print the full decode report as one JSON object.
         #[arg(long, help_heading = "Output")]
         json: bool,
@@ -146,7 +159,8 @@ enum Command {
     Oracle {
         /// Stereo IQ WAV file: 32-bit float, or 16-, 24- or 32-bit integer
         /// samples. Its centre frequency is read from the matching
-        /// `<name>.json` sidecar next to it.
+        /// `<name>.json` sidecar next to it. A gap-free manta IQ recording
+        /// (with its PATH.meta.jsonl) is read from its metadata instead.
         path: PathBuf,
         /// Reverse Beacon Network daily-dump CSV, pre-filtered to the
         /// recording's time window.
@@ -377,14 +391,34 @@ enum Command {
         /// decode at the source's native rate.
         #[arg(long, value_parser = parse_capture_rate_hz)]
         capture_rate_hz: Option<f64>,
-        /// Read --source as a raw complex-IQ recording rather than ordinary
-        /// mono audio.
+        /// Read --source as complex IQ rather than ordinary mono audio.
         ///
-        /// Without this, --source is taken as mono real audio at 48000 Hz.
-        /// A stereo audio recording and a two-channel IQ capture cannot be
-        /// told apart from the WAV header alone, so say which you have.
+        /// IQ is a two-channel IQ WAV, a manta IQ recording (found by its
+        /// PATH.meta.jsonl), or headerless IQ described by --iq-format,
+        /// --sample-rate-hz and --dial-freq-hz. Without this, --source is
+        /// taken as mono real audio at 48000 Hz. A stereo audio recording
+        /// and a two-channel IQ capture cannot be told apart from the WAV
+        /// header alone, so say which you have.
         #[arg(long)]
         source_iq: bool,
+        /// Read headerless little-endian IQ: cf32 or ci16.
+        ///
+        /// Requires --source-iq, a sample rate and centre frequency
+        /// (--sample-rate-hz, --dial-freq-hz). Omit for WAV or a manta
+        /// recording with metadata.
+        #[arg(long, value_name = "FORMAT", requires = "source_iq")]
+        iq_format: Option<manta_input::RawIqFormat>,
+        /// Sample rate of headerless IQ before any capture-rate decimation.
+        #[arg(long, value_name = "HZ", value_parser = parse_iq_sample_rate_hz, requires = "iq_format")]
+        sample_rate_hz: Option<f64>,
+        /// Record the input IQ while decoding.
+        ///
+        /// Writes little-endian complex-float32 samples to PATH and its
+        /// metadata to PATH.meta.jsonl. Existing files are never
+        /// overwritten. Recording stops if storage cannot keep up; decoding
+        /// continues.
+        #[arg(long, value_name = "PATH")]
+        record_iq: Option<PathBuf>,
         /// Replay the file at the recording's own pace instead of as fast as
         /// possible.
         ///
@@ -1481,7 +1515,17 @@ enum LiveSourceSpec {
     File {
         path: PathBuf,
         source_iq: bool,
+        /// MAN-309: `--iq-format`/`--sample-rate-hz` for headerless IQ.
+        raw: Option<RawIq>,
     },
+}
+
+/// MAN-309: how to read a headerless IQ `--source` (`--iq-format`,
+/// `--sample-rate-hz`); its centre is `--dial-freq-hz`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RawIq {
+    format: manta_input::RawIqFormat,
+    sample_rate_hz: f64,
 }
 
 impl LiveSourceSpec {
@@ -1512,9 +1556,11 @@ impl LiveSourceSpec {
     fn is_rf_aware(&self) -> bool {
         match self {
             LiveSourceSpec::AudioDevice(_) => false,
-            LiveSourceSpec::File { path, source_iq } => {
-                source_iq_has_real_rf_center(path, *source_iq)
-            }
+            LiveSourceSpec::File {
+                path,
+                source_iq,
+                raw,
+            } => raw.is_none() && source_iq_has_real_rf_center(path, *source_iq),
             _ => true,
         }
     }
@@ -1621,8 +1667,17 @@ impl LiveSourceSpec {
                     Box::new(|device| logging::warning(&audio_silence_warning(device))),
                 ),
             ),
-            LiveSourceSpec::File { path, source_iq } => {
-                open_audio_source(None, Some(path.clone()), *source_iq, None)?
+            LiveSourceSpec::File {
+                path,
+                source_iq: true,
+                raw,
+            } => {
+                let src = open_iq_source_file(path, *raw, dial_freq_hz)?;
+                refuse_gapped_decimation(path, src.sample_rate(), capture_rate_hz)?;
+                src
+            }
+            LiveSourceSpec::File { path, .. } => {
+                open_audio_source(None, Some(path.clone()), false, None)?
             }
         };
         let src = maybe_decimate(src, capture_rate_hz)?;
@@ -1740,7 +1795,7 @@ fn open_audio_source(
         // audio sources to a native dial frequency; this keeps the IQ
         // replay path honoring `--dial-freq-hz` exactly as before.)
         Some(path) if source_iq => {
-            let src: reconnect::SendSource = Box::new(manta_input::WavIqSource::open(&path)?);
+            let src = open_iq_source_file(&path, None, None)?;
             match dial_freq_hz {
                 Some(freq_hz) => Box::new(FixedCenterFreqSource {
                     inner: src,
@@ -1787,9 +1842,30 @@ fn source_iq_has_real_rf_center(path: &Path, source_iq: bool) -> bool {
     if !source_iq {
         return false;
     }
-    manta_input::WavIqSource::open(path)
+    open_iq_source_file(path, None, None)
         .map(|src| src.center_freq_hz() > 0.0)
         .unwrap_or(false)
+}
+
+/// MAN-309: opens an IQ `--source`: a manta recording (by its metadata), a
+/// headerless file described by `raw` (centred on `dial_freq_hz`), or an IQ
+/// WAV. The dial override of a recording or WAV is applied by the caller.
+fn open_iq_source_file(
+    path: &Path,
+    raw: Option<RawIq>,
+    dial_freq_hz: Option<f64>,
+) -> Result<reconnect::SendSource> {
+    let opts = match raw {
+        Some(raw) => manta_input::IqFileOptions {
+            raw_format: Some(raw.format),
+            sample_rate_hz: Some(raw.sample_rate_hz),
+            center_freq_hz: Some(dial_freq_hz.ok_or_else(|| {
+                anyhow!("headerless IQ requires --sample-rate-hz and --dial-freq-hz")
+            })?),
+        },
+        None => manta_input::IqFileOptions::default(),
+    };
+    manta_input::open_iq_file(path, opts)
 }
 
 /// Overrides an inner source's `center_freq_hz()` with a fixed value.
@@ -2067,6 +2143,265 @@ fn hpsdr_config(hpsdr: &HpsdrOpts, freq: f64, rate: f64) -> manta_input::hpsdr::
     }
 }
 
+/// MAN-309: the decimator does not carry discontinuities, so a manta IQ
+/// recording with any gap record replays only at its recorded rate.
+fn refuse_gapped_decimation(path: &Path, fs: f64, capture_rate_hz: Option<f64>) -> Result<()> {
+    let rate_change = capture_rate_hz.is_some_and(|target| (target - fs).abs() > 1e-6);
+    if rate_change
+        && manta_input::is_native_recording(path)
+        && manta_input::read_recording_summary(path)?.has_gaps()
+    {
+        bail!("cannot decimate an IQ recording with gaps; replay at its recorded sample rate");
+    }
+    Ok(())
+}
+
+/// MAN-309: `--iq-format`/`--sample-rate-hz` (or `input.iq_format`/
+/// `input.sample_rate_hz`) describe a headerless IQ file source; with them,
+/// `--dial-freq-hz` (or `input.center_freq_hz`) is its centre and required.
+fn apply_raw_iq(
+    resolved: &mut Resolved,
+    iq_format: Option<manta_input::RawIqFormat>,
+    sample_rate_hz: Option<f64>,
+) -> Result<()> {
+    let Some(format) = iq_format else {
+        if let LiveSourceSpec::File { raw: Some(_), .. } = &resolved.spec {
+            if resolved.dial_freq_hz.is_none() {
+                bail!("headerless IQ requires --sample-rate-hz and --dial-freq-hz");
+            }
+        }
+        return Ok(());
+    };
+    let (Some(sample_rate_hz), Some(_)) = (sample_rate_hz, resolved.dial_freq_hz) else {
+        bail!("headerless IQ requires --sample-rate-hz and --dial-freq-hz");
+    };
+    match &mut resolved.spec {
+        LiveSourceSpec::File {
+            source_iq: true,
+            raw,
+            ..
+        } if resolved.inputs.is_empty() => {
+            *raw = Some(RawIq {
+                format,
+                sample_rate_hz,
+            });
+            Ok(())
+        }
+        _ => bail!("--iq-format applies to one IQ file source (--source PATH --source-iq)"),
+    }
+}
+
+/// MAN-309: `--record-iq`'s startup check, before any listener or source
+/// opens: the payload, its metadata and the partial marker must not exist,
+/// and the directory must. `start_recording` creates them exclusively.
+fn check_record_destination(path: &Path) -> Result<()> {
+    for p in [
+        path.to_path_buf(),
+        manta_input::metadata_path(path),
+        manta_input::partial_metadata_path(path),
+    ] {
+        if p.exists() {
+            bail!("IQ recording destination already exists: {}", p.display());
+        }
+    }
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if !parent.is_dir() {
+        bail!(
+            "IQ recording directory does not exist: {}",
+            parent.display()
+        );
+    }
+    Ok(())
+}
+
+/// MAN-309: each `[[input]]`'s `record_iq` passes `check_record_destination`
+/// and no payload, metadata or partial marker overlaps another input's.
+fn check_record_destinations(inputs: &[ResolvedInput]) -> Result<()> {
+    let mut seen: Vec<String> = Vec::new();
+    for input in inputs {
+        let Some(path) = input.record_iq.as_deref() else {
+            continue;
+        };
+        check_record_destination(path)?;
+        // The directory exists (checked above), so its canonical form
+        // catches two spellings of one destination (`a/../x`, a symlinked
+        // directory). Compared without ASCII case, since macOS and Windows
+        // filesystems ignore it by default: on a case-sensitive one this
+        // refuses two names that differ only in case, which is harmless.
+        let canonical = match (path.parent(), path.file_name()) {
+            (Some(dir), Some(name)) => {
+                let dir = if dir.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    dir
+                };
+                dir.canonicalize()
+                    .map_or_else(|_| path.to_path_buf(), |d| d.join(name))
+            }
+            _ => path.to_path_buf(),
+        };
+        for reserved in [
+            manta_input::metadata_path(&canonical),
+            manta_input::partial_metadata_path(&canonical),
+            canonical,
+        ] {
+            let reserved = reserved.to_string_lossy().to_ascii_lowercase();
+            if seen.contains(&reserved) {
+                bail!(
+                    "two [[input]] entries record to {}; give each its own record_iq",
+                    path.display()
+                );
+            }
+            seen.push(reserved);
+        }
+    }
+    Ok(())
+}
+
+/// MAN-309: starts recording `src` to `path` and logs where.
+fn start_input_recording(
+    src: Box<dyn IqSource>,
+    path: &Path,
+    start: std::time::SystemTime,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(Box<dyn IqSource>, manta_input::RecordingHandle)> {
+    let (rec, handle) = manta_input::start_recording(
+        src,
+        path,
+        start,
+        Some(Box::new(|msg: &str| {
+            logging::warning(&format!("warning: {msg}"))
+        })),
+    )?;
+    logging::note(&format!(
+        "recording IQ to {}; metadata: {}",
+        path.display(),
+        manta_input::metadata_path(path).display()
+    ));
+    Ok((Box::new(rec.with_stop_flag(stop)), handle))
+}
+
+/// MAN-309: how long `run` gives its recordings, in total, to finalize
+/// once decoding ends. The writers finalize while the clients drain, and
+/// only what the drain left of this is waited out after it, so recording
+/// adds nothing to the stop budget the service manager allows
+/// (`TimeoutStopSec=60` against the 50 s `SHUTDOWN_DRAIN_DEADLINE` plus
+/// 2 s of runtime shutdown) beyond this bound when the drain is shorter.
+const RECORDING_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// MAN-309: closes every recording's queue once decoding has ended, so
+/// each writer finalizes during the client drain. Returns the one deadline
+/// `finish_recordings` waits until, however many inputs record.
+fn close_recordings(handles: &[manta_input::RecordingHandle]) -> std::time::Instant {
+    for handle in handles {
+        handle.close();
+    }
+    std::time::Instant::now() + RECORDING_FINISH_TIMEOUT
+}
+
+/// MAN-309: collects every recording of `run` by `deadline` (from
+/// `close_recordings`) and logs each outcome. `Err` (the first failure)
+/// when any recording did not complete, which `run` turns into its exit
+/// status after the drain; one failing recording does not stop the others
+/// from finishing.
+fn finish_recordings(
+    handles: impl IntoIterator<Item = manta_input::RecordingHandle>,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    let mut result = Ok(());
+    for handle in handles {
+        let finished = finish_recording(handle, deadline);
+        if result.is_ok() {
+            result = finished;
+        }
+    }
+    result
+}
+
+/// MAN-309: finalizes one recording, waiting no later than `deadline`.
+fn finish_recording(
+    handle: manta_input::RecordingHandle,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    let recorded = handle.path().to_path_buf();
+    let outcome = handle.finish(deadline.saturating_duration_since(std::time::Instant::now()));
+    report_recording(&recorded, outcome)
+}
+
+/// MAN-309: on an early return from a multi-input `run`, finalizes one
+/// recording by `deadline` and removes the published pair when it holds no
+/// samples: nothing was recorded, and the destination would refuse the
+/// next start. Any other outcome is kept and logged as `finish_recording`
+/// reports it; the run is failing already, so nothing is returned.
+fn discard_empty_recording(handle: manta_input::RecordingHandle, deadline: std::time::Instant) {
+    let recorded = handle.path().to_path_buf();
+    match handle.finish(deadline.saturating_duration_since(std::time::Instant::now())) {
+        manta_input::RecordingOutcome::Finished { samples: 0, .. } => {
+            let removed = std::fs::remove_file(manta_input::metadata_path(&recorded))
+                .and_then(|()| std::fs::remove_file(&recorded));
+            match removed {
+                Ok(()) => logging::note(&format!(
+                    "removed IQ recording {}: it holds no samples",
+                    recorded.display()
+                )),
+                Err(e) => logging::warning(&format!(
+                    "warning: cannot remove the empty IQ recording {}: {e}",
+                    recorded.display()
+                )),
+            }
+        }
+        outcome => {
+            if let Err(e) = report_recording(&recorded, outcome) {
+                logging::warning(&format!("warning: {e:#}"));
+            }
+        }
+    }
+}
+
+/// MAN-309: logs how the recording at `recorded` ended; `Err` when it did
+/// not complete.
+fn report_recording(recorded: &Path, outcome: manta_input::RecordingOutcome) -> Result<()> {
+    match outcome {
+        manta_input::RecordingOutcome::Finished {
+            path,
+            samples,
+            reason,
+        } => {
+            if reason == manta_input::EndReason::Backpressure {
+                bail!(
+                    "IQ recording {} holds only the first {samples} samples: the writer fell \
+                     behind",
+                    path.display()
+                );
+            }
+            logging::note(&format!(
+                "recording finished: {}, {samples} samples",
+                path.display()
+            ));
+            Ok(())
+        }
+        // Its cause was reported once, as a warning, when it happened.
+        manta_input::RecordingOutcome::Failed(_) => Err(anyhow!(
+            "IQ recording {} is incomplete: it stopped early (see the warning above)",
+            recorded.display()
+        )),
+        manta_input::RecordingOutcome::TimedOut(path) => {
+            logging::warning(&format!(
+                "warning: IQ recording finalization timed out: {}; completion is unconfirmed",
+                path.display()
+            ));
+            Err(anyhow!(
+                "IQ recording {} is unconfirmed: it did not finalize in time (see the warning \
+                 above)",
+                path.display()
+            ))
+        }
+    }
+}
+
 /// Lower bound for `--capture-rate-hz`. `manta_dsp::decimate::Decimator::
 /// new` rejects any target rate whose channel count (`fs_out/93.75`) is
 /// below 4 (a `Channelizer` with `hop = n/4 == 0` never terminates its
@@ -2149,6 +2484,21 @@ fn parse_engine(s: &str) -> std::result::Result<Engine, String> {
 /// handled by `session_nonce_for_replay_path` below, independently of
 /// this epoch.
 fn epoch_for_replay_path(path: &std::path::Path) -> Result<std::time::SystemTime> {
+    // MAN-309: a manta IQ recording knows when its sample zero was taken,
+    // so a copy with a new mtime keeps its timestamps.
+    if manta_input::is_native_recording(path) {
+        let start = manta_input::read_recording_summary(path)?
+            .header
+            .start_time()
+            .filter(|t| *t >= std::time::SystemTime::UNIX_EPOCH);
+        return start.with_context(|| {
+            format!(
+                "{} records a start time before the Unix epoch (1970-01-01), which can't be \
+                 used as a replay epoch -- pass --replay-epoch explicitly instead",
+                path.display()
+            )
+        });
+    }
     let mtime = std::fs::metadata(path)
         .with_context(|| {
             format!(
@@ -2233,13 +2583,61 @@ fn resolve_epoch(
 /// real time (nanoseconds-since-Unix-epoch reinterpreted as a wall clock).
 /// A network client's `timestamp` must always be truthful.
 fn session_nonce_for_replay_path(path: &std::path::Path) -> Result<u128> {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    let mut hash = fnv1a_file(OFFSET_BASIS, path)?;
+    // MAN-309: a manta IQ recording's metadata (start, gaps, guards) is part
+    // of the recording, so it continues the same hash. Its name is not.
+    if manta_input::is_native_recording(path) {
+        hash = fnv1a_recording_metadata(hash, path)?;
+    }
+    Ok(hash as u128)
+}
+
+/// MAN-309: continues `hash` over the replay-relevant content of `payload`'s
+/// metadata: the header and every gap, each re-serialized canonically, and
+/// the stored sample count. The end reason (`eof`, `stopped`,
+/// `backpressure`) says how the capture ended, not what it replays, so it
+/// is left out, as is the formatting of the file itself.
+fn fnv1a_recording_metadata(mut hash: u64, payload: &std::path::Path) -> Result<u64> {
+    use std::io::BufRead;
+
+    // Validates every line (and bounds its length) before the pass below.
+    manta_input::read_recording_summary(payload)?;
+    let meta = manta_input::metadata_path(payload);
+    let file = std::fs::File::open(&meta)
+        .with_context(|| format!("opening {} to derive its replay identity", meta.display()))?;
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line
+            .with_context(|| format!("reading {} to derive its replay identity", meta.display()))?;
+        let record: manta_input::recording_format::MetadataRecord =
+            serde_json::from_str(&line).with_context(|| format!("parsing {}", meta.display()))?;
+        let canonical = match record {
+            manta_input::recording_format::MetadataRecord::End { sample_count, .. } => {
+                format!("end {sample_count}\n")
+            }
+            other => other.to_line(),
+        };
+        hash = fnv1a_bytes(hash, canonical.as_bytes());
+    }
+    Ok(hash)
+}
+
+/// FNV-1a-64 over `bytes`, continuing from `hash`.
+fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// FNV-1a-64 over `path`'s bytes, continuing from `hash`.
+fn fnv1a_file(mut hash: u64, path: &std::path::Path) -> Result<u64> {
     use std::io::Read;
 
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("opening {} to derive its replay identity", path.display()))?;
-    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET_BASIS;
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = file
@@ -2248,12 +2646,9 @@ fn session_nonce_for_replay_path(path: &std::path::Path) -> Result<u128> {
         if n == 0 {
             break;
         }
-        for &byte in &buf[..n] {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(PRIME);
-        }
+        hash = fnv1a_bytes(hash, &buf[..n]);
     }
-    Ok(hash as u128)
+    Ok(hash)
 }
 
 /// Clap value parser for `--dial-freq-hz`: rejects non-finite (NaN/infinity)
@@ -2284,6 +2679,19 @@ fn parse_window_s(s: &str) -> std::result::Result<f64, String> {
         ));
     }
     Ok(window_s)
+}
+
+/// MAN-309: `--sample-rate-hz` for headerless IQ: finite, above 0 and at
+/// most `MAX_IQ_WAV_RATE_HZ`, before any rate-sized allocation.
+fn parse_iq_sample_rate_hz(s: &str) -> std::result::Result<f64, String> {
+    let hz: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    if !hz.is_finite() || hz <= 0.0 || hz > manta_input::MAX_IQ_WAV_RATE_HZ {
+        return Err(format!(
+            "--sample-rate-hz must be above 0 and at most {} Hz",
+            manta_input::MAX_IQ_WAV_RATE_HZ as u64
+        ));
+    }
+    Ok(hz)
 }
 
 fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
@@ -4374,6 +4782,7 @@ impl CliOverrides {
             Some(path) => LiveSourceSpec::File {
                 path,
                 source_iq: self.source_iq,
+                raw: None,
             },
             None => LiveSourceSpec::AudioDevice(self.device),
         }
@@ -4520,6 +4929,8 @@ struct ResolvedInput {
     freq_correction_ppm: f64,
     dial_freq_hz: Option<f64>,
     capture_rate_hz: Option<f64>,
+    /// MAN-309: `run` records this input's IQ here (`record_iq`).
+    record_iq: Option<PathBuf>,
     /// MAN-310: this stream's share of a split band plan.
     spawn_band_hz: Option<(f64, f64)>,
 }
@@ -4716,6 +5127,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
                     freq_correction_ppm: n.input.shared.freq_correction_ppm.unwrap_or(0.0),
                     dial_freq_hz: n.input.shared.center_freq_hz,
                     capture_rate_hz: n.input.shared.capture_rate_hz,
+                    record_iq: n.input.shared.record_iq.clone(),
                     spawn_band_hz: n.spawn_band_hz,
                 })
             })
@@ -4769,9 +5181,13 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
 fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Result<LiveSourceSpec> {
     Ok(match source {
         config::SourceFromFile::Audio { device } => LiveSourceSpec::AudioDevice(device.clone()),
-        config::SourceFromFile::File { path, iq, .. } => LiveSourceSpec::File {
+        config::SourceFromFile::File { path, iq, raw, .. } => LiveSourceSpec::File {
             path: path.clone(),
             source_iq: *iq || cli_source_iq,
+            raw: raw.map(|(format, sample_rate_hz)| RawIq {
+                format,
+                sample_rate_hz,
+            }),
         },
         config::SourceFromFile::Kiwi {
             host,
@@ -4869,6 +5285,22 @@ fn replay_mode_ignored_note(command: &str, replay: ReplayMode, origin: &str) -> 
         format!(
             "note: {command} replays files as fast as it can; ignoring \
              input.realtime/input.loop from {origin}"
+        )
+    })
+}
+
+/// MAN-309: `record_iq` takes effect only in `run`; another command that
+/// reads the input says so instead of recording. `None` when unset.
+fn record_iq_ignored_note(command: &str, loaded: &config::Loaded) -> Option<String> {
+    let set = loaded.input.shared.record_iq.is_some()
+        || loaded
+            .inputs
+            .iter()
+            .any(|n| n.input.shared.record_iq.is_some());
+    set.then(|| {
+        format!(
+            "note: {command} does not record IQ; ignoring input.record_iq from {}",
+            loaded.origin
         )
     })
 }
@@ -5739,6 +6171,8 @@ fn run_command() -> Result<std::process::ExitCode> {
         Command::Decode {
             path,
             center_freq_hz,
+            iq_format,
+            sample_rate_hz,
             json,
             timing,
             filters,
@@ -5829,18 +6263,46 @@ fn run_command() -> Result<std::process::ExitCode> {
             // will be baseband offsets. Only for an existing file, so a
             // missing WAV still fails with just its `open WAV` error.
             let mut center_freq_hz = center_freq_hz;
-            if center_freq_hz.is_none() && path.is_file() {
-                let sidecar = manta_input::read_sidecar(&path)?;
-                if let Some(warning) =
-                    recording_center_warning(&path, sidecar.map(|sc| sc.center_freq_hz))
-                {
-                    errln!("{warning}");
-                    // Keep the warning true: a negative sidecar centre
-                    // decodes at 0.0, not shifted by itself.
-                    center_freq_hz = Some(0.0);
+            // MAN-309: a manta IQ recording or headerless IQ; a WAV
+            // otherwise, exactly as before.
+            let native = manta_input::is_native_recording(&path);
+            let report = if native || iq_format.is_some() {
+                if !native && (sample_rate_hz.is_none() || center_freq_hz.is_none()) {
+                    bail!("headerless IQ requires --sample-rate-hz and --center-freq-hz");
                 }
-            }
-            let report = decode_wav(&path, center_freq_hz, &cfg)?;
+                let mut src = manta_input::open_iq_file(
+                    &path,
+                    manta_input::IqFileOptions {
+                        raw_format: iq_format,
+                        sample_rate_hz,
+                        center_freq_hz,
+                    },
+                )?;
+                if native && center_freq_hz.is_none() && src.center_freq_hz() <= 0.0 {
+                    errln!(
+                        "warning: IQ recording {} has no RF centre frequency in its \
+                         metadata -- reported frequencies are baseband offsets from the \
+                         recording's centre, not absolute RF frequencies. Pass the centre \
+                         frequency, e.g. --center-freq-hz 14000000.",
+                        path.display()
+                    );
+                }
+                // `decode_source` segments the decode at each recorded gap.
+                manta_engine::decode_source(src.as_mut(), &cfg)?
+            } else {
+                if center_freq_hz.is_none() && path.is_file() {
+                    let sidecar = manta_input::read_sidecar(&path)?;
+                    if let Some(warning) =
+                        recording_center_warning(&path, sidecar.map(|sc| sc.center_freq_hz))
+                    {
+                        errln!("{warning}");
+                        // Keep the warning true: a negative sidecar centre
+                        // decodes at 0.0, not shifted by itself.
+                        center_freq_hz = Some(0.0);
+                    }
+                }
+                decode_wav(&path, center_freq_hz, &cfg)?
+            };
             if json {
                 outln!("{}", serde_json::to_string(&report)?)?;
             } else {
@@ -5880,9 +6342,20 @@ fn run_command() -> Result<std::process::ExitCode> {
         } => {
             let loaded = config::load(config.as_deref(), config::Env::Ignore)?;
             note_ignored_tables(&loaded, "oracle", &["decode"]);
-            let mut src = manta_input::WavIqSource::open(&path)?;
+            // MAN-309: a manta IQ recording opens through the same reader as
+            // `decode`; the oracle reads one continuous capture, so a
+            // recording with gaps is refused rather than spliced.
+            if manta_input::is_native_recording(&path)
+                && manta_input::read_recording_summary(&path)?.has_gaps()
+            {
+                bail!(
+                    "IQ recording {} has input gaps; manta oracle needs one continuous capture",
+                    path.display()
+                );
+            }
+            let mut src = manta_input::open_iq_file(&path, manta_input::IqFileOptions::default())?;
             let (fs, center) = (src.sample_rate(), src.center_freq_hz());
-            let iq = manta_input::read_all(&mut src)?;
+            let iq = manta_input::read_all(src.as_mut())?;
             let spots = manta_testkit::oracle::parse_rbn_spots(&rbn_csv, &spotter, capture_start)?;
             let cfg = merge_cli_engine(engine, loaded.decode);
             let (results, summary) =
@@ -5960,6 +6433,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             ka9q_interface,
             capture_rate_hz,
             source_iq,
+            iq_format,
+            sample_rate_hz,
+            record_iq,
             realtime,
             loop_replay,
             filters,
@@ -6042,10 +6518,32 @@ fn run_command() -> Result<std::process::ExitCode> {
             let Prepared {
                 config_path,
                 loaded,
-                resolved,
+                mut resolved,
                 pipeline: cfg,
                 lists_in_use,
             } = prepare_live(cli, config, engine, false, None)?;
+            // MAN-309: headerless IQ is described on the command line.
+            apply_raw_iq(&mut resolved, iq_format, sample_rate_hz)?;
+            // MAN-309: one recording per input; `--record-iq` names one.
+            if record_iq.is_some() && !resolved.inputs.is_empty() {
+                bail!(
+                    "--record-iq records one input; this run has {} inputs: set record_iq in \
+                     each [[input]] entry to record",
+                    resolved.inputs.len()
+                );
+            }
+            // CLI > environment > file (`input.record_iq`). A source flag
+            // that replaced the configured input(s) drops their record_iq
+            // with their other keys, as `resolve` does.
+            let record_iq = record_iq.or_else(|| match resolved.replaced_file_source {
+                Some(_) => None,
+                None => loaded.input.shared.record_iq.clone(),
+            });
+            // An existing --source is an existing destination too.
+            if let Some(path) = &record_iq {
+                check_record_destination(path)?;
+            }
+            check_record_destinations(&resolved.inputs)?;
             // MAN-79's stale built-in cty.dat warning, before any I/O,
             // unless the cache may replace that copy: `prepare_run_lists`
             // warns then, once it has chosen (MAN-316).
@@ -6102,6 +6600,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 let reload = None;
                 return multi_run::run(multi_run::MultiRun {
                     inputs: &resolved.inputs,
+                    replay_epoch: resolved.replay_epoch,
                     replay: resolved.replay,
                     cfg: &cfg,
                     json,
@@ -6140,10 +6639,11 @@ fn run_command() -> Result<std::process::ExitCode> {
                 if let LiveSourceSpec::File {
                     path,
                     source_iq: true,
+                    raw,
                 } = spec
                 {
                     if path.exists() {
-                        manta_input::WavIqSource::open(path)?;
+                        open_iq_source_file(path, *raw, dial_freq_hz)?;
                     }
                 }
                 bail!(
@@ -6264,6 +6764,14 @@ fn run_command() -> Result<std::process::ExitCode> {
             // the entire replayed file a second time after it's already
             // been opened; skip that full-file pass entirely when nothing
             // downstream needs it (round-7 review finding).
+            // MAN-309: one epoch for the spot servers and the recording, so
+            // a live recording starts at the instant its spots are timed
+            // from; resolved only when one of them consumes it.
+            let session_epoch = if loaded.server.is_some() || record_iq.is_some() {
+                Some(resolve_epoch(replay_path.as_deref(), replay_epoch)?)
+            } else {
+                None
+            };
             let (
                 server_runtime,
                 spot_server,
@@ -6296,7 +6804,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                     // for a live session (so two live sessions started
                     // within the same wall-clock second don't collide
                     // either).
-                    let epoch = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
+                    let epoch = match session_epoch {
+                        Some(epoch) => epoch,
+                        None => resolve_epoch(replay_path.as_deref(), replay_epoch)?,
+                    };
                     let session_nonce: u128 = match &replay_path {
                         Some(replay_path) => session_nonce_for_replay_path(replay_path)?,
                         // Live session: `epoch` above is already SystemTime::now().
@@ -6601,6 +7112,21 @@ fn run_command() -> Result<std::process::ExitCode> {
             } else {
                 logging::note("manta: listening; send SIGINT or SIGTERM to stop");
             }
+            // MAN-309: the exact samples, gaps and source properties handed
+            // to the engine are recorded; the decoder never waits on the
+            // writer. The recording starts at the session's epoch: a live
+            // run's spot-server epoch, or a replay's own.
+            let (src, recording) = match &record_iq {
+                Some(path) => {
+                    let start = match session_epoch {
+                        Some(epoch) => epoch,
+                        None => resolve_epoch(replay_path.as_deref(), replay_epoch)?,
+                    };
+                    let (src, handle) = start_input_recording(src, path, start, stop.clone())?;
+                    (src, Some(handle))
+                }
+                None => (src, None),
+            };
             // Captured before `src` is moved into the pipeline, for the
             // readiness event below.
             let source_sample_rate_hz = src.sample_rate();
@@ -6806,6 +7332,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             // mid-drain.
             drain_gate.close();
             stop_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+            // MAN-309: the source is gone, so the queue is closed; the
+            // writer finalizes during the drain and is collected after it.
+            let recording_deadline = close_recordings(recording.as_slice());
             // MAN-234: the run's total, only when it grew past the count
             // the first-sample line reported (success and error alike).
             let bad_total = bad_samples.load(std::sync::atomic::Ordering::Relaxed);
@@ -6916,12 +7445,15 @@ fn run_command() -> Result<std::process::ExitCode> {
             if let Some((rt, server)) = server_runtime.zip(spot_server.as_ref()) {
                 shutdown_runtime_after_drain(rt, &server.tasks);
             }
+            let recording_result = finish_recordings(recording, recording_deadline);
             listen_result?;
             // MAN-232: a closed (or otherwise failed) stdout reader stopped
             // the loop above through `stop`; only now, with the drain done,
             // does it become the run's exit status (141 / 1). A source
             // failure still wins, because it is reported first.
             stdout_lines.finish()?;
+            // MAN-309: a recording that did not complete fails the run last.
+            recording_result?;
         }
         Command::Soak {
             input,
@@ -7035,6 +7567,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                 );
             }
             if let Some(note) = replay_mode_ignored_note("soak", resolved.replay, &loaded.origin) {
+                errln!("{note}");
+            }
+            if let Some(note) = record_iq_ignored_note("soak", &loaded) {
                 errln!("{note}");
             }
             note_pinned_lists(&resolved.spot, &lists_in_use);
@@ -7230,6 +7765,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             note_pinned_lists(&resolved.spot, &lists_in_use);
             if let Some(note) = replay_mode_ignored_note("doctor", resolved.replay, &loaded.origin)
             {
+                errln!("{note}");
+            }
+            if let Some(note) = record_iq_ignored_note("doctor", &loaded) {
                 errln!("{note}");
             }
             // MAN-126: named setup checks first, each printed as it is
@@ -9395,6 +9933,137 @@ mod tests {
     }
 
     #[test]
+    fn soak_and_doctor_say_they_ignore_record_iq() {
+        let loaded = loaded_from("[input]\ntype = \"audio\"\nrecord_iq = \"s.cf32\"\n");
+        let note = record_iq_ignored_note("soak", &loaded).unwrap();
+        assert!(
+            note.starts_with("note: soak does not record IQ; ignoring input.record_iq from "),
+            "{note}"
+        );
+        assert_eq!(
+            record_iq_ignored_note("doctor", &loaded_from("[input]\ntype = \"audio\"\n")),
+            None
+        );
+    }
+
+    /// MAN-309: a manta IQ recording pair in `dir`, `gap` its one gap.
+    fn native_pair(dir: &Path, name: &str, start_secs: i64, gap: u64) -> PathBuf {
+        use manta_input::recording_format::MetadataRecord;
+        let path = dir.join(name);
+        std::fs::write(&path, [0u8; 80]).unwrap();
+        let header = manta_input::RecordingHeader {
+            schema: "manta-iq.v1".into(),
+            sample_format: "cf32_le".into(),
+            sample_rate_hz: 48_000.0,
+            center_freq_hz: 14_000_000.0,
+            start_unix_seconds: start_secs,
+            start_nanoseconds: 500,
+            rf_passband_hz: [-24_000.0, 24_000.0],
+            trusted_band_hz: None,
+            analytic_guard_hz: 0.0,
+        };
+        let meta = MetadataRecord::Header(header).to_line()
+            + &MetadataRecord::Gap {
+                before_sample: 5,
+                missing_samples: gap,
+            }
+            .to_line()
+            + &MetadataRecord::End {
+                sample_count: 10,
+                reason: manta_input::EndReason::Stopped,
+            }
+            .to_line();
+        std::fs::write(manta_input::metadata_path(&path), meta).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_native_recording_replays_at_its_recorded_start_not_its_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = native_pair(dir.path(), "a.cf32", 1_792_407_600, 7);
+        let recorded = std::time::UNIX_EPOCH + std::time::Duration::new(1_792_407_600, 500);
+        assert_eq!(resolve_epoch(Some(&rec), None).unwrap(), recorded);
+        // --replay-epoch still wins.
+        assert_eq!(
+            resolve_epoch(Some(&rec), Some(1_751_635_200)).unwrap(),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_751_635_200)
+        );
+        // A pre-1970 recorded start is refused, as a pre-1970 mtime is.
+        let old = native_pair(dir.path(), "old.cf32", -5, 7);
+        assert!(resolve_epoch(Some(&old), None).is_err());
+    }
+
+    #[test]
+    fn a_native_recordings_nonce_covers_its_metadata_but_not_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = native_pair(dir.path(), "a.cf32", 1_792_407_600, 7);
+        let renamed = native_pair(dir.path(), "renamed.cf32", 1_792_407_600, 7);
+        let other_gap = native_pair(dir.path(), "gap.cf32", 1_792_407_600, 8);
+        let other_start = native_pair(dir.path(), "start.cf32", 1_792_407_601, 7);
+        let nonce = session_nonce_for_replay_path(&a).unwrap();
+        assert_eq!(session_nonce_for_replay_path(&renamed).unwrap(), nonce);
+        assert_ne!(session_nonce_for_replay_path(&other_gap).unwrap(), nonce);
+        assert_ne!(session_nonce_for_replay_path(&other_start).unwrap(), nonce);
+        // A plain file's nonce is still its bytes' hash alone.
+        let plain = dir.path().join("plain.cf32");
+        std::fs::write(&plain, [0u8; 80]).unwrap();
+        assert_eq!(
+            session_nonce_for_replay_path(&plain).unwrap(),
+            u128::from(fnv1a_file(0xcbf29ce484222325, &plain).unwrap())
+        );
+        assert_ne!(session_nonce_for_replay_path(&plain).unwrap(), nonce);
+    }
+
+    /// MAN-309: copying a recording pair and touching its mtime keeps the
+    /// server's epoch and spot identity; how the capture ended (the end
+    /// reason) and the metadata's formatting are not part of the identity.
+    #[test]
+    fn a_copied_recording_with_a_new_mtime_keeps_its_epoch_and_nonce() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = native_pair(dir.path(), "a.cf32", 1_792_407_600, 7);
+        let copy = dir.path().join("copy.cf32");
+        std::fs::copy(&a, &copy).unwrap();
+        std::fs::copy(
+            manta_input::metadata_path(&a),
+            manta_input::metadata_path(&copy),
+        )
+        .unwrap();
+        let touched = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        for p in [copy.clone(), manta_input::metadata_path(&copy)] {
+            std::fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(touched)
+                .unwrap();
+        }
+        assert_eq!(
+            std::fs::metadata(&copy).unwrap().modified().unwrap(),
+            touched
+        );
+        assert_eq!(
+            resolve_epoch(Some(&copy), None).unwrap(),
+            resolve_epoch(Some(&a), None).unwrap()
+        );
+        let nonce = session_nonce_for_replay_path(&a).unwrap();
+        assert_eq!(session_nonce_for_replay_path(&copy).unwrap(), nonce);
+
+        // Same samples, start and gaps, but ended `eof` and written with
+        // the keys spaced out: the same recording.
+        let meta = manta_input::metadata_path(&copy);
+        let text = std::fs::read_to_string(&meta)
+            .unwrap()
+            .replace("\"stopped\"", "\"eof\"")
+            .replace("\":", "\": ");
+        std::fs::write(&meta, text).unwrap();
+        assert_eq!(
+            manta_input::read_recording_summary(&copy).unwrap().reason,
+            manta_input::EndReason::Eof
+        );
+        assert_eq!(session_nonce_for_replay_path(&copy).unwrap(), nonce);
+    }
+
+    #[test]
     fn resolve_epoch_is_now_for_a_live_session_with_no_replay_path() {
         let before = std::time::SystemTime::now();
         let epoch = resolve_epoch(None, None).unwrap();
@@ -9937,6 +10606,7 @@ mod tests {
         assert!(!LiveSourceSpec::File {
             path: PathBuf::from("rec.wav"),
             source_iq: false,
+            raw: None,
         }
         .is_reconnectable());
     }
@@ -9961,6 +10631,7 @@ mod tests {
             LiveSourceSpec::File {
                 path: PathBuf::from("rec.wav"),
                 source_iq: false,
+                raw: None,
             }
             .name(),
             "file"
@@ -11085,7 +11756,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             )),
         )
         .unwrap();
-        let LiveSourceSpec::File { path, source_iq } = &r.spec else {
+        let LiveSourceSpec::File {
+            path, source_iq, ..
+        } = &r.spec
+        else {
             panic!("expected the file source from [input]");
         };
         assert_eq!(path, &wav);
@@ -11390,7 +12064,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert_eq!(
             LiveSourceSpec::File {
                 path: PathBuf::from("x.wav"),
-                source_iq: false
+                source_iq: false,
+                raw: None,
             }
             .name(),
             "file"
@@ -11466,7 +12141,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         cli.source_iq = true;
         assert_eq!(cli.source_selector(), Some("--source"));
         assert!(
-            matches!(cli.into_spec(), LiveSourceSpec::File { path, source_iq: true } if path == std::path::Path::new("capture.wav"))
+            matches!(cli.into_spec(), LiveSourceSpec::File { path, source_iq: true, .. } if path == std::path::Path::new("capture.wav"))
         );
     }
 
@@ -11787,6 +12462,9 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("dial_freq_hz", "input.center_freq_hz"),
         ("capture_rate_hz", "input.capture_rate_hz"),
         ("replay_epoch", "input.replay_epoch"),
+        ("record_iq", "input.record_iq"),
+        ("iq_format", "input.iq_format"),
+        ("sample_rate_hz", "input.sample_rate_hz"),
         ("allowlist", "spot.allowlist"),
         ("blocklist", "spot.blocklist_path"),
         ("notch", "spot.notch_path"),
@@ -11918,7 +12596,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             ("audio", "type = \"audio\"\ndevice = \"d\"\n"),
             (
                 "file",
-                "type = \"file\"\npath = \"x.wav\"\niq = true\nrealtime = true\nloop = true\n",
+                "type = \"file\"\npath = \"x.wav\"\niq = true\nrealtime = true\nloop = true\n\
+                 iq_format = \"cf32\"\nsample_rate_hz = 96000\n",
             ),
             (
                 "kiwi",
@@ -11949,6 +12628,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 "[input]\ncapture_rate_hz = 6000.0\n",
             ),
             ("input.replay_epoch", "[input]\nreplay_epoch = 0\n"),
+            ("input.record_iq", "[input]\nrecord_iq = \"s.cf32\"\n"),
             ("spot.allowlist", "[spot]\nallowlist = [\"W1AW\"]\n"),
             (
                 "spot.blocklist_path",

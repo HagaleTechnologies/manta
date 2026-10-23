@@ -87,6 +87,18 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-309: `manta run --record-iq PATH` (or `record_iq` in each `[input]`/
+  `[[input]]`) records the IQ it decodes, from any input, to a little-endian cf32 file plus `PATH.meta.jsonl` (rate,
+  centre, start time, source passband and guards, input gaps). `decode`
+  and `run --source PATH --source-iq` replay it to the same output on every
+  run, and both reproduce its input gaps: `decode` now closes its tracks
+  at each gap and continues on a fresh segment timed after the missing
+  samples. Both commands also read headerless cf32/ci16 files with
+  `--iq-format` and `--sample-rate-hz` (or `[input] iq_format`/
+  `sample_rate_hz`). Decoder output for existing gap-free WAV inputs is
+  unchanged; only sources that report gaps gain the segmented behaviour,
+  and a recording of rig audio keeps its analytic guard under `decode`. See
+  [docs/GUIDES/iq-recording.md](docs/GUIDES/iq-recording.md).
 - MAN-305: protocol-2 openHPSDR radios (ANAN-class: Hermes, Angelia,
   Orion, Orion II, Saturn/G2) as inputs, alongside protocol 1 (Hermes-Lite
   2). `--hpsdr-protocol auto|1|2`, `[input] protocol` (`"auto"`, `"1"`,

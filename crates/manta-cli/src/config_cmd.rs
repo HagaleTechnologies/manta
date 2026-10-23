@@ -591,9 +591,14 @@ fn input_summary(file: &crate::config::InputFile) -> String {
             iq,
             realtime,
             looped,
+            raw,
         }) => {
             // MAN-269: shown only when set, so existing summaries are unchanged.
             let mut line = format!("input: type=file path={} iq={iq}", path.display());
+            // MAN-309: only for headerless IQ.
+            if let Some((format, rate)) = raw {
+                line.push_str(&format!(" iq_format={format} sample_rate_hz={rate}"));
+            }
             if *realtime {
                 line.push_str(" realtime=true");
             }
@@ -665,6 +670,10 @@ fn input_summary(file: &crate::config::InputFile) -> String {
             shared.capture_rate_hz.map(|v| v.to_string()),
         ),
         ("replay_epoch", shared.replay_epoch.map(|v| v.to_string())),
+        (
+            "record_iq",
+            shared.record_iq.as_ref().map(|p| p.display().to_string()),
+        ),
     ] {
         if let Some(v) = value {
             input.push_str(&format!(" {key}={v}"));
@@ -1790,6 +1799,9 @@ mod tests {
         ("input", "center_freq_hz"),
         ("input", "capture_rate_hz"),
         ("input", "replay_epoch"),
+        ("input", "record_iq"),
+        ("input", "iq_format"),
+        ("input", "sample_rate_hz"),
         ("spot", "blocklist_path"),
         ("spot", "notch_path"),
         ("spot", "cty_path"),
@@ -2069,17 +2081,28 @@ mod tests {
             InputKind::Ka9q,
         ] {
             // MAN-310: `bands` replaces `freq_hz`, so each is tried alone.
+            // MAN-309: the headerless-IQ keys need `iq = true`; checked below.
             for skip in ["bands", "freq_hz"] {
                 let body = format!(
                     "[input]\ntype = \"{}\"\n{}",
                     kind.name(),
                     uncommented("input", |k| kind.keys().contains(&k)
                         && k != skip
-                        && !(skip == "bands" && k == "tuning_range_hz"))
+                        && !(skip == "bands" && k == "tuning_range_hz")
+                        && !RAW_IQ.contains(&k))
                 );
                 let l = loaded(&body);
                 assert_eq!(l.input.source.map(|s| s.kind()), Some(kind), "{body}");
             }
+        }
+        const RAW_IQ: [&str; 2] = ["iq_format", "sample_rate_hz"];
+        let body = format!(
+            "[input]\ntype = \"file\"\npath = \"x.cf32\"\niq = true\n{}",
+            uncommented("input", |k| RAW_IQ.contains(&k))
+        );
+        match loaded(&body).input.source {
+            Some(SourceFromFile::File { raw: Some(_), .. }) => {}
+            other => panic!("{body}: {other:?}"),
         }
         let shared = [
             "freq_correction_ppm",

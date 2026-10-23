@@ -459,6 +459,10 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
             name: args.input.as_deref(),
         },
     )?;
+    // MAN-309: only `run` records; say so rather than ignore it silently.
+    if let Some(note) = crate::record_iq_ignored_note("calibrate", &loaded) {
+        crate::logging::note(&note);
+    }
     // MAN-310: a stream of a band plan saves into the entry it came from.
     let input_name = save_entry_name(&loaded.inputs, args.input.as_deref());
     let opts = CalibrateOptions {
@@ -1029,6 +1033,7 @@ mod tests {
         let mut r = resolved_with(LiveSourceSpec::File {
             path: "x.wav".into(),
             source_iq: true,
+            raw: None,
         });
         let e = apply_tune_hz(&mut r, 9_998_500.0).unwrap_err();
         assert!(e.to_string().contains("cannot retune a recording"), "{e}");

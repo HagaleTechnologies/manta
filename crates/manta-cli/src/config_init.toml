@@ -182,6 +182,8 @@
 #iq = false                          # true for a two-channel IQ recording, not mono audio
 #realtime = false                    # true to replay at the recording's own pace, so clients can watch (run only)
 #loop = false                        # true to replay again from the start each time it ends; implies realtime (run only)
+#iq_format = "cf32"                  # headerless little-endian IQ, cf32 or ci16 (needs iq = true and center_freq_hz); omit for WAV or a manta recording
+#sample_rate_hz = 96000              # the headerless file's stored sample rate, with iq_format
 
 # type = "kiwi", a KiwiSDR web receiver, and type = "hpsdr", an
 # HPSDR/Hermes radio (both inputs are included in every build):
@@ -226,6 +228,11 @@
 # WAV replay only: the time, in Unix seconds, that the recording's first
 # sample stands for. No default: the file's modification time.
 #replay_epoch = 1700000000
+
+# `manta run` only: record this input's IQ while decoding, as little-endian
+# complex float32 plus FILE.meta.jsonl. Existing files are never
+# overwritten, so a restart needs a new name. No default: no recording.
+#record_iq = "captures/session.cf32"
 
 
 # --- Spot filters ------------------------------------------------------------
