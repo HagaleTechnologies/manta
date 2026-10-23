@@ -109,7 +109,7 @@ Add a row here in the same change that adds a record:
 | 2026-09-10 | MAN-171 | [MAN-171's "dead zone" traces to the RF/antenna path on the test rig, not manta's channelizer/detector/track-manager; the startup-transient comb is a real, absolute-frequency-locked hardware artifact, and it now has a real fix](2026-09-10-man171-dead-zone-is-rf-path-not-manta-code.md) |
 | 2026-09-10 | — | [Reseating connections and adding a common-mode choke resolves the live-hardware detection gap](2026-09-10-antenna-path-fix-resolves-detection-gap.md) |
 | 2026-09-09 | — | [`--soapy-gain` on this RSP1B is a gain-*reduction* (attenuation) scale, not a gain scale -- every prior fixed-gain field session used a heavily-attenuated setting](2026-09-09-soapy-gain-is-inverted-attenuation-scale.md) |
-| 2026-09-09 | — | [Post-PR#154 20m daytime session: fix holds, first plausible real off-air catch](2026-09-09-post-pr154-20m-daytime-validation.md) |
+| 2026-09-09 | — | [Post-PR#154 20m daytime session: new code runs live, first plausible real off-air catch](2026-09-09-post-pr154-20m-daytime-validation.md) |
 | 2026-09-09 | — | [Overnight 40m SoapySDR field test: fixed a real crash, still no confirmed off-air copy](2026-09-09-overnight-40m-soapy-field-test.md) |
 | 2026-09-09 | MAN-166 | [MAN-166: track_cap raised; confirm_hops investigated and deliberately left alone](2026-09-09-man166-confirm-hops-and-track-cap.md) |
 | 2026-09-09 | — | [`manta doctor`: a real `TrackPromoted` event replaces decode-timing proxies](2026-09-09-doctor-track-promoted-event.md) |

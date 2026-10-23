@@ -95,20 +95,28 @@ need to fool the repetition gate to produce a public spot. PR #154
 (`crates/manta-spot/src/validator.rs`, `grammar.rs` — merged 2026-09-09
 as `455e1af`) adds a WPM-implausibility check scoped to `SpotType::Beacon`
 candidates specifically, and defers non-allowlisted Beacon candidates
-until the track's true final close (a genuine observed RF gap), requiring
-a confirmed real `SpeedUpdate` before resolving one. A small residual
-(structurally plausible, not-implausibly-fast garble) isn't caught and is
-a known, accepted gap (tracked in issue #163, deprioritized).
+until the track's true final close (the track/input's final observed
+state -- `ClosureKind::SignalEnded` fires at the capture's end too, not
+only an observed RF gap), requiring a confirmed real `SpeedUpdate` before
+resolving one. A small residual (structurally plausible,
+not-implausibly-fast garble) isn't caught and is a known, accepted gap
+(tracked in issue #163, deprioritized).
 
-**Confirmed live, one session in** (`2026-09-09-post-pr154-20m-daytime-
-validation.md`): a 15-minute 20m daytime capture went from the overnight
-run's 29/29 false positives to 1 residual Beacon garble matching the
-documented gap above (low confidence, 3-char non-callsign text, WPM just
-under `MAX_PLAUSIBLE_WPM`) plus 1 plausible genuine `SpotType::Cq` catch
-(realistic WPM, above-artifact-band confidence, well-formed callsign) --
-the first non-Beacon confirmed spot across all live sessions to date. One
-session isn't a solid statistical answer yet, but the fix is behaving as
-designed so far.
+**Seen live, one session in** (`2026-09-09-post-pr154-20m-daytime-
+validation.md`): a 15-minute 20m daytime capture confirmed 2 spots -- 1
+Beacon matching the documented gap above (low confidence, WPM just under
+`MAX_PLAUSIBLE_WPM`; a 3-char decode in the UK special contest call shape,
+so unresolved, not proven garble) plus 1 plausible genuine
+`SpotType::Cq` catch (realistic WPM, well-formed callsign) -- the first
+non-Beacon confirmed spot across all live sessions to date. Its higher
+published confidence reflects Beacon-vs-Cq bookkeeping (repetition
+factor, `master.scp` boost), not evidence of better character copy.
+Against the overnight run's same-band 20m baseline (10 spots in 1.5h,
+most sharing the low-confidence, floor-pinned signature), the rate of
+spots with that signature is unchanged within these tiny samples
+(≈4.7/h -> 4/h), so this shows the fix running live with the expected
+residual shape, not a measured reduction. One session isn't a solid
+statistical answer yet.
 
 The frequency-clustering data point from the original finding is still
 worth knowing when you see the same defect: only one of the observed
