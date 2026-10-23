@@ -228,11 +228,10 @@ fn beacon_spots_exactly_once_under_watterson_poor() {
         "exactly one Beacon spot expected, got {spots:?}"
     );
     assert_eq!(beacons[0].0, "K5ARH", "the beacon's call: {spots:?}");
-    let others: Vec<&(String, String, f64)> =
-        spots.iter().filter(|(c, _, _)| c != "K5ARH").collect();
-    assert!(
-        others.is_empty(),
-        "zero bogus callsigns of any type expected: {others:?}"
+    assert_eq!(
+        spots.len(),
+        1,
+        "the one Beacon must be the only spot, of any call or type: {spots:?}"
     );
 }
 

@@ -50,6 +50,16 @@ overrides (+6 dB SNR jump, spot-type change) hold against that entry.
   `last_sample_ts` (the deferred-beacon peek) is untouched by
   construction. No key movement, no anchor migration — a withheld
   cross-edge report does not rewrite state.
+- **The deferred-beacon stale peek follows the join** (Codex review on
+  PR #387): `last_sample_ts` takes the reporting input and returns the
+  newer of the own-bucket entry and that input's entry one bucket over
+  within one channel. Without it, a Beacon resolving at `TrackClosed`
+  with an older `sample_ts` than a spot of the same station stored
+  across the edge passed the stale check and emitted on its spot-type
+  change. It is now dropped and counted in `pending_beacon_stale`, like
+  the own-bucket case. Pinned by
+  `resolved_beacon_never_emits_against_a_newer_spot_across_a_bucket_edge`
+  (`validator.rs`). `assess` is unchanged by this.
 - **Supersession**: MAN-13's D6
   (docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md) deliberately
   kept same-input behaviour unchanged; this record supersedes exactly

@@ -84,9 +84,35 @@ impl Dedupe {
     /// `should_emit` with a `sample_ts` older than what's already
     /// recorded here -- that would silently roll the watermark backward
     /// and let a later real spot escape the suppression window early.
-    pub(crate) fn last_sample_ts(&self, callsign: &str, freq_hz: f64) -> Option<u64> {
-        let key = (callsign.to_string(), Self::bucket(freq_hz));
-        self.last.get(&key).map(|s| s.sample_ts)
+    ///
+    /// MAN-120: the identity includes `input`'s own spot one bucket over
+    /// within one channel (`assess`'s same-input edge join), so the peek
+    /// returns the newer of the two stored timestamps -- a newer spot of
+    /// the same station across the edge makes the deferred candidate
+    /// stale too (Codex review on PR #387).
+    pub(crate) fn last_sample_ts(&self, callsign: &str, freq_hz: f64, input: u32) -> Option<u64> {
+        let bucket = Self::bucket(freq_hz);
+        let own = self
+            .last
+            .get(&(callsign.to_string(), bucket))
+            .map(|s| s.sample_ts);
+        let across_edge = self
+            .last
+            .get(&(callsign.to_string(), Self::neighbour(freq_hz, bucket)))
+            .filter(|prev| {
+                prev.input == input && (freq_hz - prev.freq_hz).abs() < CROSS_INPUT_MAX_HZ
+            })
+            .map(|s| s.sample_ts);
+        own.max(across_edge)
+    }
+
+    /// The bucket across the 300 Hz edge nearer to `freq_hz`.
+    fn neighbour(freq_hz: f64, bucket: i64) -> i64 {
+        if freq_hz / FREQ_BUCKET_HZ >= bucket as f64 {
+            bucket + 1
+        } else {
+            bucket - 1
+        }
     }
 
     /// True if a spot for this `(callsign, freq_hz)` should be emitted now
@@ -134,11 +160,7 @@ impl Dedupe {
         // MAN-13: a different input's spot one bucket over, within one
         // channel, is the same signal straddling the edge -- whatever this
         // bucket holds (nothing, an expired spot, or this input's own).
-        let neighbour = if freq_hz / FREQ_BUCKET_HZ >= bucket as f64 {
-            bucket + 1
-        } else {
-            bucket - 1
-        };
+        let neighbour = Self::neighbour(freq_hz, bucket);
         let across_edge = self
             .last
             .get(&(callsign.to_string(), neighbour))
@@ -435,7 +457,7 @@ mod tests {
         assert!(d.should_emit("W1AW", 14_012_340.0, 20.0, SpotType::Cq, 50_000, 0));
         // A late-merged, older report that still emits through an SNR jump.
         assert!(d.should_emit("W1AW", 14_012_340.0, 30.0, SpotType::Cq, 10_000, 0));
-        assert_eq!(d.last_sample_ts("W1AW", 14_012_340.0), Some(50_000));
+        assert_eq!(d.last_sample_ts("W1AW", 14_012_340.0, 0), Some(50_000));
     }
 
     /// MAN-14: `assess` names the withhold reason.
