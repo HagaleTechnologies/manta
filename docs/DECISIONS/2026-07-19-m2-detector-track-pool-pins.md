@@ -8,7 +8,16 @@ decided; SPEC and docs/ still win on anything not listed here.
 
 ## Deviations and pinned decisions
 
-1. **`DetectorConfig.track_cap` is not in SPEC §9's literal `[detector]`
+1. **[Superseded in part: MAN-166 / MAN-261, annotated 2026-10-23]**
+   The current default requirement is `DetectorConfig::default().track_cap == 1200`,
+   replacing the historical 500 requirement below; see
+   [MAN-166](2026-09-09-man166-confirm-hops-and-track-cap.md).
+   The key now appears in [SPEC §9](../SPEC-decode-core.md#9-configuration-keys),
+   following [MAN-261](2026-10-06-man261-config-surface.md).
+   The deliberate ARCHITECTURE-sourced field and lowest-SNR eviction remain;
+   only the default and SPEC-location claims below are superseded.
+
+   **Historical pin:** **`DetectorConfig.track_cap` is not in SPEC §9's literal `[detector]`
    table.** `crates/manta-engine/src/track.rs`'s `DetectorConfig` struct
    docs this explicitly: "SPEC §9 `[detector]` table, plus ARCHITECTURE §4's
    track cap (not in the literal SPEC table)." Sourced from ARCHITECTURE
