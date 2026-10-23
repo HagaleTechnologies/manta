@@ -1099,7 +1099,19 @@ pub struct OpenedHpsdr {
 /// protocol-2 radio that reports itself busy is refused, since taking it
 /// over needs an explicit `Two`.
 pub fn open_receiver(cfg: &HpsdrConfig, protocol: HpsdrProtocol) -> Result<OpenedHpsdr> {
-    open_receiver_with(cfg, protocol, &discovery::ProbeTiming::default())
+    open_receiver_since(cfg, protocol, Instant::now())
+}
+
+/// [`open_receiver`], with the source's `acquisition_start_offset` measured
+/// from `entered` rather than from this call (MAN-306): a caller that
+/// discovers a hostless radio first passes the instant its open began, so
+/// discovery counts as outage too.
+pub fn open_receiver_since(
+    cfg: &HpsdrConfig,
+    protocol: HpsdrProtocol,
+    entered: Instant,
+) -> Result<OpenedHpsdr> {
+    open_receiver_with(cfg, protocol, &discovery::ProbeTiming::default(), entered)
 }
 
 /// The I/O-free check `protocol`'s own open makes first, without opening
@@ -1119,10 +1131,11 @@ pub(crate) fn open_receiver_with(
     cfg: &HpsdrConfig,
     protocol: HpsdrProtocol,
     timing: &discovery::ProbeTiming,
+    entered: Instant,
 ) -> Result<OpenedHpsdr> {
     // MAN-259: the discovery probe runs inside the reconnect's open call
-    // and streams nothing, so it is outage too.
-    let entered = Instant::now();
+    // and streams nothing, so it is outage too, as is anything the caller
+    // did since `entered` (MAN-306's discovery of a hostless radio).
     let discovery = match protocol {
         HpsdrProtocol::Auto => discovery::probe(&cfg.host, cfg.port, timing)?,
         HpsdrProtocol::One | HpsdrProtocol::Two => Discovery::Skipped,
@@ -2528,7 +2541,7 @@ mod open_receiver_tests {
     }
 
     fn open(fake: &FakeP2Radio, protocol: HpsdrProtocol, timing: &ProbeTiming) -> OpenedHpsdr {
-        open_receiver_with(&fake.cfg(), protocol, timing).expect("open_receiver")
+        open_receiver_with(&fake.cfg(), protocol, timing, Instant::now()).expect("open_receiver")
     }
 
     /// Wait (up to 1 s) until the fake has logged a datagram on
@@ -2646,13 +2659,33 @@ mod open_receiver_tests {
         assert_eq!(first[..3], [0xEF, 0xFE, 0x01]);
     }
 
+    /// MAN-306: a caller's discovery before the open (`entered` earlier
+    /// than this call) is outage, so the offset counts it.
+    #[test]
+    fn open_receiver_since_counts_time_before_the_call_as_outage() {
+        let before = Duration::from_millis(300);
+        for protocol in [HpsdrProtocol::One, HpsdrProtocol::Two] {
+            let fake = FakeP2Radio::start();
+            let entered = Instant::now() - before;
+            let start = Instant::now();
+            let opened =
+                open_receiver_with(&fake.cfg(), protocol, &fast(), entered).expect("open_receiver");
+            let took = start.elapsed();
+            let offset = opened.source.acquisition_start_offset();
+            assert!(
+                offset >= before && offset <= before + took,
+                "{protocol:?}: offset {offset:?}, open took {took:?}"
+            );
+        }
+    }
+
     #[test]
     fn auto_refuses_a_busy_protocol_2_radio() {
         let fake = FakeP2Radio::with_discovery(vec![(
             Duration::ZERO,
             p2_reply(discovery::STATUS_BUSY, 5),
         )]);
-        let err = open_receiver_with(&fake.cfg(), HpsdrProtocol::Auto, &fast())
+        let err = open_receiver_with(&fake.cfg(), HpsdrProtocol::Auto, &fast(), Instant::now())
             .err()
             .expect("a busy radio is refused under auto");
         assert_eq!(

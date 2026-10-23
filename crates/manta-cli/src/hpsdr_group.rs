@@ -691,6 +691,9 @@ pub(crate) fn prepare(
             let (host, port) = if reopen {
                 match &allocation.host {
                     Some(host) => (host.clone(), allocation.port),
+                    // Rediscovery here is outage without any offset
+                    // bookkeeping: `started_at` below is an absolute
+                    // instant taken after it, not an offset from entry.
                     None => {
                         let peer = resolve(&allocation).map_err(anyhow::Error::msg)?;
                         (peer.ip().to_string(), peer.port())

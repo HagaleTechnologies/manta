@@ -4,6 +4,9 @@ use super::*;
 use manta_engine::check::{check_source, CheckOptions, CheckReport, StopReason};
 
 #[derive(clap::Args)]
+// MAN-306: --hpsdr-protocol needs an HPSDR selector: a host, a MAC, or
+// the flags of a hostless (discovered) radio.
+#[command(group(clap::ArgGroup::new("hpsdr_selector").args(["hpsdr_host", "hpsdr_mac", "hpsdr_port", "hpsdr_freq_hz", "hpsdr_rate_hz"]).multiple(true)))]
 pub(crate) struct Args {
     /// Audio WAV path, equivalent to --source PATH.
     #[arg(value_name = "SOURCE", group = "source_selector")]
@@ -117,7 +120,7 @@ pub(crate) struct Args {
         long,
         value_enum,
         default_value_t = HpsdrProtocolArg::Auto,
-        requires = "hpsdr_host",
+        requires = "hpsdr_selector",
         help_heading = "HPSDR source"
     )]
     hpsdr_protocol: HpsdrProtocolArg,

@@ -1617,9 +1617,10 @@ fn hpsdr_protocol_flag_is_recognized_by_run_listen_soak_calibrate_and_check() {
     }
 }
 
-/// MAN-305: `--hpsdr-protocol` means nothing without `--hpsdr-host`.
+/// MAN-305/MAN-306: `--hpsdr-protocol` means nothing without an HPSDR
+/// selector (a host, a MAC, or a hostless radio's flags).
 #[test]
-fn hpsdr_protocol_requires_hpsdr_host() {
+fn hpsdr_protocol_requires_an_hpsdr_selector() {
     for sub in ["run", "listen", "soak", "doctor", "calibrate", "check"] {
         let mut args = vec![sub];
         if sub == "soak" {
@@ -1631,7 +1632,8 @@ fn hpsdr_protocol_requires_hpsdr_host() {
         assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
         assert!(
             stderr.contains("the following required arguments were not provided")
-                && stderr.contains("--hpsdr-host <HPSDR_HOST>"),
+                && stderr.contains("--hpsdr-host <HPSDR_HOST>")
+                && stderr.contains("--hpsdr-mac <HPSDR_MAC>"),
             "{args:?}: {stderr}"
         );
     }

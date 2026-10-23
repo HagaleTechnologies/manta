@@ -219,7 +219,9 @@ enum Command {
     // `run` is the daemon entry point; `listen` stays as a visible alias
     // for ad hoc audio/dev testing (D11/MAN-77, see
     // docs/DECISIONS/2026-09-06-broad-review-decisions.md).
-    #[command(visible_alias = "listen")]
+    // MAN-306: --hpsdr-protocol needs an HPSDR selector: a host, a MAC, or
+    // the flags of a hostless (discovered) radio.
+    #[command(visible_alias = "listen", group(clap::ArgGroup::new("hpsdr_selector").args(["hpsdr_host", "hpsdr_mac", "hpsdr_port", "hpsdr_freq_hz", "hpsdr_rate_hz"]).multiple(true)))]
     Run {
         /// Sound-card input device; matched by substring. Defaults to the
         /// system default input.
@@ -319,7 +321,7 @@ enum Command {
             long,
             value_enum,
             default_value_t = HpsdrProtocolArg::Auto,
-            requires = "hpsdr_host",
+            requires = "hpsdr_selector",
             help_heading = "HPSDR source"
         )]
         hpsdr_protocol: HpsdrProtocolArg,
@@ -496,6 +498,9 @@ enum Command {
     /// use keeps growing. A --source recording that ends sooner does not end
     /// the run: soak waits out the rest of --duration before it reports.
     /// Intended for unattended stability runs, not for day-to-day operating.
+    // MAN-306: --hpsdr-protocol needs an HPSDR selector: a host, a MAC, or
+    // the flags of a hostless (discovered) radio.
+    #[command(group(clap::ArgGroup::new("hpsdr_selector").args(["hpsdr_host", "hpsdr_mac", "hpsdr_port", "hpsdr_freq_hz", "hpsdr_rate_hz"]).multiple(true)))]
     Soak {
         /// With several [[input]] entries in the config, the one to examine,
         /// by its name. Optional with one input.
@@ -604,7 +609,7 @@ enum Command {
             long,
             value_enum,
             default_value_t = HpsdrProtocolArg::Auto,
-            requires = "hpsdr_host",
+            requires = "hpsdr_selector",
             help_heading = "HPSDR source"
         )]
         hpsdr_protocol: HpsdrProtocolArg,
@@ -753,6 +758,9 @@ enum Command {
     /// DECODING.
     // MAN-126: the setup checks live in doctor_checks.rs and clock_check.rs.
     // MAN-235: `strict_exit_code` maps a verdict to its --strict code.
+    // MAN-306: --hpsdr-protocol needs an HPSDR selector: a host, a MAC, or
+    // the flags of a hostless (discovered) radio.
+    #[command(group(clap::ArgGroup::new("hpsdr_selector").args(["hpsdr_host", "hpsdr_mac", "hpsdr_port", "hpsdr_freq_hz", "hpsdr_rate_hz"]).multiple(true)))]
     Doctor {
         /// With several [[input]] entries in the config, the one to examine,
         /// by its name. Optional with one input.
@@ -858,7 +866,7 @@ enum Command {
             long,
             value_enum,
             default_value_t = HpsdrProtocolArg::Auto,
-            requires = "hpsdr_host",
+            requires = "hpsdr_selector",
             help_heading = "HPSDR source"
         )]
         hpsdr_protocol: HpsdrProtocolArg,
@@ -981,6 +989,9 @@ enum Command {
     // MAN-127: see calibrate_cmd.rs and
     // docs/DECISIONS/2026-10-11-man127-calibrate-command.md. The source flag
     // block is copied from `Doctor`, as run/soak/doctor each copy it.
+    // MAN-306: --hpsdr-protocol needs an HPSDR selector: a host, a MAC, or
+    // the flags of a hostless (discovered) radio.
+    #[command(group(clap::ArgGroup::new("hpsdr_selector").args(["hpsdr_host", "hpsdr_mac", "hpsdr_port", "hpsdr_freq_hz", "hpsdr_rate_hz"]).multiple(true)))]
     Calibrate {
         /// With several [[input]] entries in the config, the one to examine,
         /// by its name. Optional with one input.
@@ -1105,7 +1116,7 @@ enum Command {
             long,
             value_enum,
             default_value_t = HpsdrProtocolArg::Auto,
-            requires = "hpsdr_host",
+            requires = "hpsdr_selector",
             help_heading = "HPSDR source"
         )]
         hpsdr_protocol: HpsdrProtocolArg,
@@ -1443,13 +1454,29 @@ impl HpsdrOpts {
         self.selector().is_some()
     }
 
-    fn resolve_host(&self) -> Result<String> {
-        self.resolve_host_with(|port, mac| {
-            use manta_input::hpsdr::discovery::{broadcast_destinations, select_radio};
-            Ok(select_radio(port, &broadcast_destinations(port), mac)?
-                .ip
-                .to_string())
-        })
+    /// Resolve the radio (discovering a hostless one) and open it, with
+    /// the source's acquisition offset measured from before discovery:
+    /// `ReconnectingSource` anchors the offset at entry to the whole
+    /// reopen, so discovery is outage like the open's own probe (MAN-259,
+    /// PR #359 review).
+    fn open_with(
+        &self,
+        freq: f64,
+        rate: f64,
+        discover: impl FnOnce(u16, Option<[u8; 6]>) -> Result<String>,
+        open: impl FnOnce(
+            &manta_input::hpsdr::HpsdrConfig,
+            manta_input::hpsdr::HpsdrProtocol,
+            std::time::Instant,
+        ) -> Result<manta_input::hpsdr::OpenedHpsdr>,
+    ) -> Result<(
+        manta_input::hpsdr::HpsdrConfig,
+        manta_input::hpsdr::OpenedHpsdr,
+    )> {
+        let entered = std::time::Instant::now();
+        let cfg = hpsdr_config(self, self.resolve_host_with(discover)?, freq, rate);
+        let opened = open(&cfg, self.protocol, entered)?;
+        Ok((cfg, opened))
     }
 
     fn resolve_host_with(
@@ -1647,10 +1674,19 @@ impl LiveSourceSpec {
                     .ok_or_else(|| anyhow!("--hpsdr-rate-hz is required with the hpsdr source"))?;
                 // MAN-306: a hostless entry discovers its radio here, on
                 // each (re)open, so a radio that moved address is found again.
-                let cfg = hpsdr_config(hpsdr, hpsdr.resolve_host()?, freq, rate);
+                let (cfg, opened) = hpsdr.open_with(
+                    freq,
+                    rate,
+                    |port, mac| {
+                        use manta_input::hpsdr::discovery::{broadcast_destinations, select_radio};
+                        Ok(select_radio(port, &broadcast_destinations(port), mac)?
+                            .ip
+                            .to_string())
+                    },
+                    manta_input::hpsdr::open_receiver_since,
+                )?;
                 // MAN-305 D2/D17: run, listen, soak, calibrate, check and
                 // doctor all open here, so each prints the same §4 line.
-                let opened = manta_input::hpsdr::open_receiver(&cfg, hpsdr.protocol)?;
                 log_hpsdr_open_line(&cfg.host, cfg.port, &opened);
                 opened.source
             }
@@ -10087,6 +10123,57 @@ mod tests {
         );
     }
 
+    /// MAN-306 (PR #359 review, P1): a hostless reopen's discovery is
+    /// outage, so the opened source's acquisition offset includes it.
+    #[test]
+    fn hpsdr_discovery_time_is_inside_the_acquisition_offset() {
+        struct Offset(std::time::Duration);
+        impl IqSource for Offset {
+            fn sample_rate(&self) -> f64 {
+                192_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                0.0
+            }
+            fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+            fn acquisition_start_offset(&self) -> std::time::Duration {
+                self.0
+            }
+        }
+        let discovery = std::time::Duration::from_millis(200);
+        let mut options = CliOverrides::none().hpsdr;
+        options.mac = Some([2, 17, 34, 51, 68, 85]);
+        let start = std::time::Instant::now();
+        let (cfg, opened) = options
+            .open_with(
+                7_030_000.0,
+                192_000.0,
+                |_, _| {
+                    std::thread::sleep(discovery);
+                    Ok("192.0.2.1".into())
+                },
+                // Stands in for `open_receiver_since`: acquisition begins
+                // the moment the open is called, measured from `entered`.
+                |_, _, entered| {
+                    Ok(manta_input::hpsdr::OpenedHpsdr {
+                        source: Box::new(Offset(entered.elapsed())),
+                        protocol: manta_input::hpsdr::HpsdrProtocol::One,
+                        discovery: manta_input::hpsdr::Discovery::Skipped,
+                    })
+                },
+            )
+            .unwrap();
+        let took = start.elapsed();
+        assert_eq!(cfg.host, "192.0.2.1");
+        let offset = opened.source.acquisition_start_offset();
+        assert!(
+            offset >= discovery && offset <= took,
+            "offset {offset:?}, discovery {discovery:?}, open took {took:?}"
+        );
+    }
+
     #[test]
     fn explicit_hpsdr_host_bypasses_discovery_and_hostless_reopens_discover() {
         let mut options = CliOverrides::none().hpsdr;
@@ -11612,6 +11699,44 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(
             matches!(cli.into_spec(), LiveSourceSpec::File { path, source_iq: true } if path == std::path::Path::new("capture.wav"))
         );
+    }
+
+    /// MAN-306 (PR #359 review): `--hpsdr-protocol` names how to speak to a
+    /// radio discovery finds, by MAC or alone, not only one given by host.
+    #[test]
+    fn hpsdr_protocol_accepts_hostless_selectors() {
+        for command in ["run", "listen", "soak", "doctor", "calibrate", "check"] {
+            let mut base = vec!["manta", command];
+            if command == "soak" {
+                base.extend(["--duration", "1"]);
+            }
+            let tuning = ["--hpsdr-freq-hz", "7030000", "--hpsdr-rate-hz", "192000"];
+            for (selector, protocol) in [
+                (&["--hpsdr-mac", "02:11:22:33:44:55"][..], "1"),
+                (&["--hpsdr-mac", "02:11:22:33:44:55"][..], "2"),
+                (&[][..], "1"),
+                (&[][..], "2"),
+            ] {
+                let args: Vec<&str> = base
+                    .iter()
+                    .copied()
+                    .chain(selector.iter().copied())
+                    .chain(tuning)
+                    .chain(["--hpsdr-protocol", protocol])
+                    .collect();
+                if let Err(error) = Cli::try_parse_from(&args) {
+                    panic!("{args:?}: {error}");
+                }
+            }
+            // Still meaningless with no HPSDR flag at all.
+            let args: Vec<&str> = base
+                .iter()
+                .copied()
+                .chain(["--hpsdr-protocol", "2"])
+                .collect();
+            let error = Cli::try_parse_from(&args).err().expect("refused");
+            assert_eq!(error.exit_code(), 2, "{args:?}: {error}");
+        }
     }
 
     // ---- MAN-140: the ka9q-radio source
