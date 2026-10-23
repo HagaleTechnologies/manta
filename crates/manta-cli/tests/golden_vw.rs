@@ -147,9 +147,11 @@ fn char_alignment_ops(a: &[char], b: &[char]) -> Vec<AlignOp> {
     ops
 }
 
-/// Fraction of `expected`'s word boundaries reproduced in `decoded`, the
-/// first forgiven when the whole first word is genuinely absent (SPEC
-/// §2.1 warm-up). Copied from golden_vr.rs.
+/// 1 minus the share of `expected`'s word boundaries `decoded` misses or
+/// adds (a decoded space no expected space matches is spurious), floored
+/// at 0; the first boundary is forgiven when the whole first word is
+/// genuinely absent (SPEC §2.1 warm-up). Copied from golden_vr.rs, whose
+/// doc comment derives it (MAN-173); keep the two bodies identical.
 fn word_boundary_fraction(expected: &str, decoded: &str) -> f64 {
     let normalize = |s: &str| -> Vec<char> {
         s.split_whitespace()
@@ -166,17 +168,21 @@ fn word_boundary_fraction(expected: &str, decoded: &str) -> f64 {
         .filter(|&(_, &c)| c == ' ')
         .map(|(i, _)| i)
         .collect();
+    let decoded_boundaries = d.iter().filter(|&&c| c == ' ').count();
     if boundaries.is_empty() {
-        return 1.0;
+        return if decoded_boundaries == 0 { 1.0 } else { 0.0 };
     }
     let ops = char_alignment_ops(&e, &d);
     let boundary0_genuinely_dropped = ops[..=boundaries[0]].iter().all(|&op| op == AlignOp::Del);
-    let correct = boundaries
+    let matched = boundaries
         .iter()
-        .enumerate()
-        .filter(|&(idx, &p)| ops[p] == AlignOp::Match || (idx == 0 && boundary0_genuinely_dropped))
+        .filter(|&&p| ops[p] == AlignOp::Match)
         .count();
-    correct as f64 / boundaries.len() as f64
+    let credited = matched + usize::from(boundary0_genuinely_dropped);
+    // A `Match` pairs one expected space with one decoded space, so every
+    // other decoded space is a word break `expected` does not have.
+    let spurious = decoded_boundaries - matched;
+    credited.saturating_sub(spurious) as f64 / boundaries.len() as f64
 }
 
 /// Decode a single-signal VW vector; returns `(report, keyed, decoded,

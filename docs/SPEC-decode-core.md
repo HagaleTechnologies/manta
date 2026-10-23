@@ -1774,7 +1774,8 @@ Senders who do not key ideal 1:3 / 3 / 7 timing, decoded on the default
 `vw5`). All: 96 kHz, 14 MHz centre, offset +12.34 kHz unless stated, 5 ms
 rise, AWGN, looped text, 60 s unless stated. `dit_units`/`element_gap_units`
 set the dot and the element gap in dits (1.0 standard). Learned timing is
-read from the track's last `TimingUpdate` (§5).
+read from the track's last `TimingUpdate` (§5). Word boundaries are scored
+as SPEC v2 §8.2 defines (`docs/SPEC-decode-core-v2.md`).
 
 | # | Name | Signal(s) | Impairment | Pass criteria |
 |---|---|---|---|---|
