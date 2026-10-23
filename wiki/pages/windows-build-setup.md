@@ -32,7 +32,18 @@ Requires the [Visual Studio Build Tools](https://visualstudio.microsoft.com/down
 (the MSVC linker `link.exe`, not Visual Studio itself) and a `git`
 executable on `PATH` (same git-dependency requirement as every platform --
 see the main `README.md`'s Quickstart, `coppa` is a rev-pinned git
-dependency). Then:
+dependency).
+
+Installing the Build Tools alone does not install the compiler, linker or
+Windows SDK. In the Visual Studio Installer, select the
+**Desktop development with C++** workload (rustc's linker error calls it
+the "C++ build tools" workload), and make sure its
+MSVC x64/x86 build tools and Windows SDK components are checked under
+Installation details. Without the build tools, `cargo build` stops with
+``error: linker `link.exe` not found``; without the Windows SDK, linking
+fails on missing Windows import libraries. rustup's
+[MSVC prerequisites](https://rust-lang.github.io/rustup/installation/windows-msvc.html)
+page lists the same selections. Then:
 
 ```powershell
 cargo build --release -p manta-cli
