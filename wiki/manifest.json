@@ -172,7 +172,11 @@
       "visibility": "public"
     },
     {
+<<<<<<< HEAD
       "hash": "sha256:0f214cdae0c9eaa89e791d2260e8b61db6960dfa1b09d725c7698b4ffd6a2476",
+=======
+      "hash": "sha256:dc9b1f3c6f8c9ce3b9406a9e646d57b1fc1ca2330d56ee113dcd384a53a46a36",
+>>>>>>> 7aa7c465b8c995b732b800c5e02dab1530a263c7
       "id": "live-hardware-field-testing",
       "kind": "howto",
       "links": [
