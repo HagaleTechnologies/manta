@@ -14,14 +14,18 @@ lists (286,196 `unconfirmed`, 71,149 `evicted`, 52,330 `merged`) total 409,675.
 Both figures stand, labelled as different populations in the README, in a
 dated annotation on the MAN-166 record, and here.
 
-- **41,174 is promoted tracks in the decoder output**, taken from the
-  2026-09-08 baseline's `manta decode --json` report (PR #144 calls it "41,174
-  tracks opened"). The command that counted it was not recorded. The run
-  predates `TrackPromoted` (PR #145; `02863cd` has it only because PR #144 was
-  rebased onto #145 before merging). Its report carried events only from tracks
-  that were promoted and then emitted decoder output, and a CANDIDATE emitted
-  nothing, so a track count read from it, most likely its distinct
-  `track_id`s, is a lower bound on promotions.
+- **41,174 counts promoted tracks -- held as a hypothesis, not a verified
+  fact.** What is verified: PR #144 reports "41,174 tracks opened" for the
+  2026-09-08 baseline and names a fresh `manta decode --json` run as the
+  source of its numbers; the run predates `TrackPromoted` (PR #145;
+  `02863cd` has it only because PR #144 was rebased onto #145 before
+  merging); and a report from that tree carried events only from tracks
+  that were promoted and then emitted decoder output, while a CANDIDATE
+  emitted nothing. What is not: the command that counted it was not
+  recorded and the report is not in the tree, so the most likely reading
+  -- that 41,174 is the report's distinct `track_id`s, a count of
+  promoted tracks and a lower bound on promotions -- stays an unverified
+  hypothesis until the original report or command is recovered.
 - **409,675 is three of five close reasons** from `close_counts()` on the same
   configuration (`track_cap=500`, `confirm_hops=19`): every closed track,
   CANDIDATEs included. The shares (68.8%, 29.7%) put the full total near
@@ -46,12 +50,12 @@ channels (`track_cap=4`: 407,433 spawns; `track_cap=40`: 3,613); and a 30 s,
 audio stays out of git and off public hosts until K5TR's redistribution
 permission is recorded. Today's tree would not reproduce September's numbers
 anyway: `track_cap` is now 1200, and MAN-313 defers a promoted track's decoder
-lease and `TrackPromoted` until it qualifies as CW. A
-like-for-like run takes both counts from the PCM16 conversion (SHA-256
-`d2ea5247…d4d4a621`) at `track_cap=500`, `confirm_hops=19`: `TrackPromoted`
-from `manta decode --json --config` (`[detector] track_cap = 500`), and
-`final_close_counts` from `cargo run --release -p manta-engine --example
-close_counts -- <wav>` with a scratch edit of the `PipelineConfig::default()`
-it runs (it has no config flag).
+lease and `TrackPromoted` until it qualifies as CW. A like-for-like run
+takes both counts from the PCM16 conversion (SHA-256 `d2ea5247…d4d4a621`)
+at `track_cap=500`, `confirm_hops=19`: `TrackPromoted` from `manta decode
+<wav> --json --config <toml>` (`[detector] track_cap = 500` in the toml),
+and `final_close_counts` from `cargo run --release -p manta-engine
+--example close_counts -- <wav>` with a scratch edit of the
+`PipelineConfig::default()` it runs (it has no config flag).
 
 This changes only docs, with no change to code or defaults.

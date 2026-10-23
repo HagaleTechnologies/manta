@@ -33,9 +33,11 @@ conflated the two under one "tracks killed purely to make room" framing).
 CANDIDATEs included, one close per `track_id`. The three reasons named sum
 to 409,675; the 68.8%/29.7% shares put the full total near 416,000, the
 rest being `hang_expired` and `silent` closes not listed here. This is
-not the population behind the audio-corpus README's 41,174, which counts
-promoted tracks in the baseline `manta decode --json` report: an
-`unconfirmed` close never promoted, so it never reached that report. See
+not the population behind the audio-corpus README's 41,174, which most
+likely counts promoted tracks in the baseline `manta decode --json`
+report -- a reconstruction kept labelled a hypothesis (the counting
+command was not recorded; an `unconfirmed` close never promoted, so it
+never reached that report). See
 [MAN-179](2026-10-23-man179-man166-track-populations.md).
 
 ## track_cap: raised 500 -> 1200
