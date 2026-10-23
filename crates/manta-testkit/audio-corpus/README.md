@@ -130,15 +130,18 @@ First baseline run (2026-09-08, the PCM16 conversion, unmodified pipeline):
 scorer bugs -- unbounded-time matching, and RBN truth rows manta's own
 grammar can structurally never accept counted as misses; both fixed in
 `scripts/score-against-rbn.py`, see that script's docstring), alongside
-41,174 promoted tracks over the 15 minutes (613k characters decoded) for
-those 197 spots -- the detector is promoting far more tracks than the
-real simultaneous-signal count implies, and most never survive to a
-validated spot. Filed as MAN-166. The 41,174 counts the `TrackPromoted`
-events in that run's `manta decode --json` report (PR #144 names a fresh
-`decode --json` run as the source of these numbers). At that commit every
-promotion emitted one `TrackPromoted` and a CANDIDATE emitted nothing, so
-it equals the distinct `track_id`s in the report. It does not count every
-track the detector opened; the follow-up below does.
+41,174 promoted tracks in the decoder output over the 15 minutes (613k
+characters decoded) for those 197 spots -- the detector is promoting far
+more tracks than the real simultaneous-signal count implies, and most
+never survive to a validated spot. Filed as MAN-166. The 41,174 was taken
+from that run's `manta decode --json` report (PR #144 calls it "41,174
+tracks opened"); the command that counted it was not recorded. The run
+predates the `TrackPromoted` event (PR #145): its report carried events
+only from tracks that were promoted and then emitted decoder output, and
+a CANDIDATE emitted nothing. So a track count read from it, most likely
+its distinct `track_id`s, counts only those tracks, a lower bound on
+promotions. It does not count every track the detector opened; the
+follow-up below does.
 
 Follow-up (2026-09-09, `docs/DECISIONS/
 2026-09-09-man166-confirm-hops-and-track-cap.md`): counted every track
@@ -146,8 +149,9 @@ the detector closed in the same configuration with
 `TrackManager::close_counts()` (`crates/manta-engine/examples/
 close_counts.rs`). That is a different population from the 41,174 above,
 about ten times larger: the detector gives every CANDIDATE its own
-`track_id` and closes each one exactly once, but only promoted tracks
-reach `manta decode --json`. `unconfirmed` (a CANDIDATE that never
+`track_id`, and `close_counts()` counts each one once, when it closes (a
+track still open when the stream ends is not counted), but only promoted
+tracks reach `manta decode --json`. `unconfirmed` (a CANDIDATE that never
 sustains `confirm_hops`, so never promoted) was 286,196 closes, 68.8% of
 the total; `evicted` (71,149, `track_cap=500` pinned at its ceiling the
 entire recording) and `merged` (52,330, `merge_converged()`, independent
