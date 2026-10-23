@@ -71,5 +71,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # DSP in debug tests is unusably slow without this; golden V1 runs in seconds.
 [profile.dev]
 opt-level = 1
+# HAR-101: a cold `cargo test --workspace` build wrote a ~16 GB target/debug
+# on Linux, most of it full debug info in deps/ plus the incremental cache --
+# tens of GB of disk writes per fresh checkout. Line tables keep file:line in
+# panic backtraces (all the test suite needs); nothing here reads full
+# debuginfo. Incremental caches only pay off on repeated edit-rebuild cycles
+# in one checkout, never in fresh/CI checkouts. Tests inherit this profile.
+# Local debugging can opt back in: CARGO_PROFILE_DEV_DEBUG=2 CARGO_INCREMENTAL=1.
+debug = "line-tables-only"
+incremental = false
 [profile.dev.package."*"]
 opt-level = 2
