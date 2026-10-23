@@ -1,4 +1,4 @@
-//! Unbound loopback ports for this binary's unit tests (MAN-410).
+//! Unbound loopback TCP ports for this binary's unit tests (MAN-410).
 //!
 //! Binding `127.0.0.1:0` and dropping the listener lets the kernel hand
 //! the freed number to a sibling test before the caller probes it. Use
@@ -10,24 +10,36 @@
 //!
 //! All unit tests in this binary that need an unbound port must share
 //! this allocator. A second cursor over the same band in this process
-//! would issue the same numbers. Like the integration-test allocator,
-//! this assumes cargo test's single process per binary, not nextest.
+//! would issue the same numbers.
+//!
+//! Other processes start their own cursor at the band's first port: a
+//! second `cargo test` on the same host, or nextest's process per test.
+//! So each issued port is also claimed, until this process exits, by a
+//! UDP socket bound to the same number on 127.0.0.1. TCP and UDP ports
+//! are separate, so the TCP port stays unbound (the UDP one does not),
+//! and another process using this allocator fails to bind the claim and
+//! skips the port. The claim
+//! excludes only processes that use this allocator; the integration-test
+//! band in `tests/doctor_checks.rs` has none.
 
-use std::net::TcpListener;
+use std::net::{TcpListener, UdpSocket};
 use std::sync::Mutex;
 
 const BAND_START: u16 = 20_256;
 const BAND_LEN: u16 = 256;
 
-/// A monotonic cursor issues each port at most once per process.
+/// A monotonic cursor issues each port at most once per process; the
+/// claim of each issued port is held until the process exits.
 struct Band {
     next: u16,
     range_checked: bool,
+    claims: Vec<UdpSocket>,
 }
 
 static BAND: Mutex<Band> = Mutex::new(Band {
     next: 0,
     range_checked: false,
+    claims: Vec::new(),
 });
 
 impl Band {
@@ -64,9 +76,10 @@ impl Band {
     }
 }
 
-/// The next unissued band port that a TCP bind on 127.0.0.1 accepts.
-/// Skip candidates a foreign program holds or Windows excludes; panic
-/// when the band is exhausted.
+/// The next unissued band port that this process can claim and that a
+/// TCP bind on 127.0.0.1 accepts. Skip candidates another process has
+/// claimed, a foreign program holds or Windows excludes; panic when the
+/// band is exhausted.
 pub(crate) fn free_port() -> u16 {
     let mut band = BAND.lock().unwrap();
     band.check_ephemeral_range_once();
@@ -79,7 +92,11 @@ pub(crate) fn free_port() -> u16 {
         );
         let port = BAND_START + band.next;
         band.next += 1;
+        let Ok(claim) = UdpSocket::bind(("127.0.0.1", port)) else {
+            continue;
+        };
         if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            band.claims.push(claim);
             return port;
         }
     }
@@ -100,4 +117,50 @@ fn concurrent_handouts_are_distinct_and_inside_the_band() {
     ports.sort_unstable();
     ports.dedup();
     assert_eq!(ports.len(), total, "a port was handed out twice");
+}
+
+/// Set in the copy of this binary that the test below spawns.
+const CHILD: &str = "MANTA_TEST_PORTS_CHILD";
+
+/// Two processes using this allocator at once (a second `cargo test` on
+/// the same host, or nextest's process per test) each start their cursor
+/// at the band's first port; the second may not be issued a port the
+/// first holds.
+#[test]
+fn another_process_is_never_issued_a_port_this_one_holds() {
+    const NAME: &str = "test_ports::another_process_is_never_issued_a_port_this_one_holds";
+    if std::env::var_os(CHILD).is_some() {
+        println!("child port={}", free_port());
+        return;
+    }
+    free_port();
+    let held: Vec<u16> = BAND
+        .lock()
+        .unwrap()
+        .claims
+        .iter()
+        .map(|claim| claim.local_addr().unwrap().port())
+        .collect();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", NAME, "--nocapture"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let theirs: Option<u16> = stdout
+        .split("child port=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|port| port.parse().ok());
+    let Some(theirs) = theirs.filter(|_| out.status.success()) else {
+        panic!(
+            "child: {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    assert!(
+        !held.contains(&theirs),
+        "the child was issued {theirs}, which this process holds: {held:?}"
+    );
 }
