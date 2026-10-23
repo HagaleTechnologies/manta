@@ -24,11 +24,12 @@ dated annotation on the MAN-166 record, and here.
   CANDIDATEs included. The shares (68.8%, 29.7%) put the full total near
   416,000; the rest is `hang_expired` + `silent`, listed in neither document.
 
-**No double count.** `next_id` never reuses an id, and a track leaves
-`TrackManager` (`crates/manta-engine/src/track.rs`) through exactly one
-`close_counts.record` site: the `step_hop` lifecycle close, the RTTY close,
-`merge_converged()` or `evict_over_cap()`. `finish()` records nothing, so the
-total slightly undercounts tracks opened. Two checks made while planning,
+**No double count.** `next_id` never reuses an id, and a track that closes
+mid-stream passes exactly one `close_counts.record` site in
+`crates/manta-engine/src/track.rs`: the `step_hop` lifecycle close, the RTTY
+close, `merge_converged()` or `evict_over_cap()`. `finish()` records nothing
+for tracks still open at the end, so the total slightly undercounts tracks
+opened. Two checks made while planning,
 not committed: a scratch test held `sum(close_counts) + tracks.len() ==
 total_spawns()` after every one of 40,000 hops of random keyed bursts on 64
 channels (`track_cap=4`: 407,433 spawns; `track_cap=40`: 3,613); and a 30 s,
