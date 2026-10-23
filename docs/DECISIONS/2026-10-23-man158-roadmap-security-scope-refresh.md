@@ -56,8 +56,13 @@ by default, metrics binds to loopback by default, the MAN-324 live-state
 stream is opt-in and loopback by default, and the outbound RBN uplink
 defaults to dry-run. Untrusted-input examples now include hostile network
 peers on the SDR inputs, the `[rbn_compare]` feed and the MAN-316
-cty.dat/MASTER.SCP refresh, which downloads over plain HTTP. It points to the
-[MAN-23 threat model and its follow-ups](2026-09-02-man23-threat-model.md)
-and the [network-exposure guide](../RUNBOOKS/network-exposure.md), without
-claiming that MAN-23 covered every input. The vulnerability-reporting
-instructions and response expectation stay unchanged.
+cty.dat/MASTER.SCP refresh, which downloads over plain HTTP. It points to
+both recorded threat models, each with the surfaces it covers: the
+[MAN-23 threat model](2026-09-02-man23-threat-model.md) (HPSDR input;
+telnet, JSON/WebSocket and metrics servers; RBN uplink) and the
+[MAN-275 KiwiSDR threat model](2026-10-17-man275-kiwi-threat-model.md),
+which replaced MAN-60. It also points to the
+[network-exposure guide](../RUNBOOKS/network-exposure.md). It does not
+claim that the two records cover every input or surface. The
+vulnerability-reporting instructions and response expectation stay
+unchanged.
