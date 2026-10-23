@@ -52,14 +52,20 @@ ordinary repetition gate, not the exemption path that produced every prior
 false positive. WPM 21.32 is squarely realistic hand-sent CW speed (the
 overnight doc's artifact averaged ~51.5 WPM, implausibly fast). Its
 confidence (0.259) is not separate evidence: the two published
-confidences are not on a comparable scale. A non-allowlisted Beacon is
-evaluated from a single decode (repetition factor 0.5), while this
-ordinary Cq candidate had to pass the Common-tier gate (`+XE1@@`,
-`required_reps` 2, so a factor of at least 0.75) and gains the 15%
+confidences are not on a comparable scale. A non-allowlisted Beacon
+skips the repetition gate and is scored at the track's close with
+however many repetitions it had -- repetition factor 0.5 for the single
+decode the residual-gap shape describes -- while this ordinary Cq
+candidate had to pass the gate (a flat 2 repetitions at the time of this
+session; MAN-95's later pattern tiers put `XE1@@` in the Common tier,
+also 2), so its factor is at least 0.75, and it gains the 15%
 `master.scp` boost `G0K` lacks (`crates/manta-spot/src/confidence.rs:23-44`,
-`crates/manta-spot/src/validator.rs:1419-1432`). Backing those out gives
-character evidence of ≈0.296 for `G0K` and ≈0.23-0.30 for `XE1EE` across
-its unrecorded repetition count -- nearly identical -- so the confidence
+`crates/manta-spot/src/validator.rs:1419-1432,1763-1774`). Neither
+spot's repetition count is recorded. Backing the factors out at each
+spot's minimum count gives character evidence of ≈0.296 for `G0K` and
+≈0.300 for `XE1EE` -- nearly identical. More repetitions lower both
+(`G0K` ≈0.197 at two; `XE1EE` ≈0.23-0.26 at three to five, ≈0.23-0.30
+across its range), and either can come out ahead. So the confidence
 value does not separate this catch from the artifact band. `XE1EE` is a
 well-formed Mexican amateur callsign (XE + region digit + 2 letters). Not
 independently verified against a callsign database or DX cluster in this
@@ -70,29 +76,33 @@ session -- flagging as *plausible*, not confirmed-correct copy.
 Per-hour rates, from each record's own self-reported counts (no raw
 capture of either session is committed, so nothing is recomputed):
 
-| Session | Window | Spots | Spots/h | Beacon-signature spots | Signature/h |
+| Session | Window | Spots | Spots/h | Artifact-signature spots | Signature/h |
 |---|---|---|---|---|---|
-| Pre-fix 20m (overnight doc, Finding 4) | 1.5h (3 x 30 min) | 10 | 6.67 | 7 | 4.67 |
-| Post-PR#154 20m (this session) | 0.25h (15 min) | 2 | 8.0 | 1 (`G0K`; plus 1 Cq, `XE1EE`, 4.0/h) | 4.0 |
+| Pre-fix 20m (overnight doc, Finding 4) | 1.5h (3 x 30 min) | 10 | 6.67 | 7 (SpotType not recorded) | 4.67 |
+| Post-PR#154 20m (this session) | 0.25h (15 min) | 2 | 8.0 | 1 (`G0K`, Beacon; plus 1 Cq, `XE1EE`, 4.0/h) | 4.0 |
 | Pre-fix 40m (overnight doc) -- the cross-band figure the earlier draft compared against | ~5.5h | 29 | 5.27 | 29 | 5.27 |
 
-The pre-fix 20m signature count is 7 by elimination: Finding 4 says most
-of the 10 share the 40m artifact's low-confidence signature and names 3
-that do not. On the same band the Beacon-signature rate went from ≈4.7/h
-to 4.0/h, at samples of 7 and 1 -- unchanged within noise. 20m was not
-untested before this session: the Finding 4 windows ran pre-fix on the
-same hardware and gain. The earlier "29/29 false positives -> 1 residual
-+ 1 catch" reading compared a ~5.5h 40m count with a 15-minute 20m
-count; per hour, this session's total (8.0/h) is above the 40m figure
-(5.27/h), not below it. So this session does not demonstrate a reduction
-attributable to PR #154. What it shows is the post-PR#154 code
-completing a live 15-minute 20m run with the expected residual shape: 1
-Beacon consistent with the documented gap (`G0K`, unresolved) and 1
-plausible Cq catch (`XE1EE`). Not yet a statistically solid answer to
-"does live 20m daytime produce real validated CW copy reliably" -- one
-session, one plausible catch. A longer 20m daytime session (ideally with
-independent callsign/DX cluster corroboration) would strengthen this;
-the interior-passband-cluster question from the overnight doc
+The signature is the 40m artifact's: confidence pinned low (0.12-0.17)
+with `snr_db` at or near the -8.28 dB clamp floor. The pre-fix 20m count
+is 7 by elimination: Finding 4 says most of the 10 share it and names 3
+that sit measurably above the floor (all 10 had low confidence). It does
+not record their SpotType; every 40m spot with this signature was a
+Beacon, and `G0K` (Beacon, 0.148, -8.214 dB) fits it. On the same band
+the signature rate went from ≈4.7/h to 4.0/h, at samples of 7 and 1 --
+unchanged within noise. 20m was not untested before this session: the
+Finding 4 windows ran pre-fix on the same hardware and gain. The earlier
+"29/29 false positives -> 1 residual + 1 catch" reading compared a
+~5.5h 40m count with a 15-minute 20m count; per hour, this session's
+total (8.0/h) is above the 40m figure (5.27/h), not below it. So this
+session does not demonstrate a reduction attributable to PR #154. What
+it shows is the post-PR#154 code completing a live 15-minute 20m run
+with the expected residual shape: 1 Beacon consistent with the
+documented gap (`G0K`, unresolved) and 1 plausible Cq catch (`XE1EE`).
+Not yet a statistically solid answer to "does live 20m daytime produce
+real validated CW copy reliably" -- one session, one plausible catch. A
+longer 20m daytime session (ideally with independent callsign/DX cluster
+corroboration) would strengthen this; the interior-passband-cluster
+question from the overnight doc
 (6936.0/6944.0/6968.0/7064.0 kHz) remains untouched by this session
 (different band, no dial-shift retest done here).
 

@@ -98,9 +98,9 @@ candidates specifically, and defers non-allowlisted Beacon candidates
 until the track's true final close (the track/input's final observed
 state -- `ClosureKind::SignalEnded` fires at the capture's end too, not
 only an observed RF gap), requiring a confirmed real `SpeedUpdate` before
-resolving one. A small residual
-(structurally plausible, not-implausibly-fast garble) isn't caught and is
-a known, accepted gap (tracked in issue #163, deprioritized).
+resolving one. A small residual (structurally plausible,
+not-implausibly-fast garble) isn't caught and is a known, accepted gap
+(tracked in issue #163, deprioritized).
 
 **Seen live, one session in** (`2026-09-09-post-pr154-20m-daytime-
 validation.md`): a 15-minute 20m daytime capture confirmed 2 spots -- 1
@@ -110,12 +110,13 @@ so unresolved, not proven garble) plus 1 plausible genuine
 `SpotType::Cq` catch (realistic WPM, well-formed callsign) -- the first
 non-Beacon confirmed spot across all live sessions to date. Its higher
 published confidence reflects Beacon-vs-Cq bookkeeping (repetition
-factor, `master.scp` boost), not better character evidence. Against the
-overnight run's same-band 20m baseline (10 spots in 1.5h, most sharing
-the low-confidence signature), the Beacon rate is unchanged within these
-tiny samples (≈4.7/h -> 4/h), so this shows the fix running live with
-the expected residual shape, not a measured reduction. One session isn't
-a solid statistical answer yet.
+factor, `master.scp` boost), not evidence of better character copy.
+Against the overnight run's same-band 20m baseline (10 spots in 1.5h,
+most sharing the low-confidence, floor-pinned signature), the rate of
+spots with that signature is unchanged within these tiny samples
+(≈4.7/h -> 4/h), so this shows the fix running live with the expected
+residual shape, not a measured reduction. One session isn't a solid
+statistical answer yet.
 
 The frequency-clustering data point from the original finding is still
 worth knowing when you see the same defect: only one of the observed
