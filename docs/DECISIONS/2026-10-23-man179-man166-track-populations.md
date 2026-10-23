@@ -49,7 +49,8 @@ anyway: `track_cap` is now 1200, and MAN-313 defers a promoted track's decoder
 lease and `TrackPromoted` until it qualifies as CW. A
 like-for-like run takes both counts from the PCM16 conversion (SHA-256
 `d2ea5247…d4d4a621`) at `track_cap=500`, `confirm_hops=19`: `TrackPromoted`
-from `manta decode --json --config` (`[detector] track_cap = 500`), and
+from `manta decode <wav> --json --config <toml>` (the TOML sets
+`[detector] track_cap = 500`), and
 `final_close_counts` from `cargo run --release -p manta-engine --example
 close_counts -- <wav>` with a scratch edit of the `PipelineConfig::default()`
 it runs (it has no config flag).
