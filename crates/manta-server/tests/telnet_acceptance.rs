@@ -1944,8 +1944,9 @@ async fn sh_dx_history_window_is_configurable() {
     );
 }
 
-/// Sends one blank keepalive line and asserts it is answered rather than
-/// ending the session.
+/// Sends one blank keepalive line, as CRLF, and asserts it is answered
+/// rather than ending the session. These are not the bytes N1MM's manual
+/// gives for its keep-alive; see the test below.
 async fn send_blank_keepalive(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
     wr: &mut tokio::net::tcp::OwnedWriteHalf,
@@ -1973,8 +1974,13 @@ async fn send_blank_keepalive(
 /// Real sockets cannot use paused time (see the login-idle test above),
 /// and a window plus one second is the same case, each keepalive starting
 /// its own window, for a sixth of the wait. This covers a keepalive sent
-/// as a CRLF blank line; N1MM's manual gives its bytes as a space and a
-/// bare CR, which completes no line and so never reaches this budget.
+/// as a CRLF blank line only. N1MM's manual (Telnet window, Clusters tab)
+/// gives its bytes as `" "<cr>`, a space and a bare CR, which completes no
+/// line: it never reaches this budget, but each keepalive adds 2 bytes to
+/// the pending line, which only a completed line clears, and the client is
+/// disconnected once that passes `MAX_LINE_BYTES`. A client that sends
+/// nothing else goes at the 513th keepalive, about 8.5 h at one a minute.
+/// No test here covers that shape.
 #[tokio::test]
 async fn blank_keepalive_lines_cost_one_command_each_and_a_window_later_the_budget_is_fresh() {
     let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
