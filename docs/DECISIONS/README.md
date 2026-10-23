@@ -11,12 +11,9 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
-<<<<<<< HEAD
 | 2026-10-23 | MAN-195 | [MAN-195: `spectral_beta = 0.0` skips the spectral-reference scan](2026-10-23-man195-spectral-beta-zero-skips-spectral-reference-scan.md) |
-=======
 | 2026-10-23 | MAN-158 | [MAN-158: ROADMAP holds gates and pointers; SECURITY.md states the shipped scope](2026-10-23-man158-roadmap-security-scope-refresh.md) |
 | 2026-10-23 | MAN-176 | [Superseded track-cap defaults in decision records](2026-10-23-man176-track-cap-default-docs.md) |
->>>>>>> 7aa7c465b8c995b732b800c5e02dab1530a263c7
 | 2026-10-22 | MAN-94 | [MAN-94: an NCDXF/IARU beacon spot reads `NCDXF B` on the wire](2026-10-22-man94-ncdxf-beacon-label.md) |
 | 2026-10-20 | MAN-340 | [MAN-340: a dispatched CI run tests the PR head merged with the main commit its workflow came from](2026-10-20-man340-dispatched-ci-tests-the-merge-with-main.md) |
 | 2026-10-19 | MAN-334 | [MAN-334: calibrate plans its references before it opens the receiver](2026-10-19-man334-calibrate-plans-before-opening.md) |
