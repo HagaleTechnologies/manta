@@ -13,9 +13,11 @@ sources:
   - crates/manta-input/src/lib.rs (IqSource::acquisition_start_offset)
   - docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md
   - docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md
+  - docs/DECISIONS/2026-10-19-man307-hpsdr-multiple-receivers.md
+  - crates/manta-cli/src/hpsdr_group.rs
 verified:
-  commit: b8b9367
-  date: 2026-10-16
+  commit: cdf8487
+  date: 2026-10-19
 links:
   - determinism
 ---
@@ -50,8 +52,7 @@ long as the receiver took to reopen.
 
 ## Where this is implemented
 
-`manta-cli::reconnect::ReconnectingSource` wraps every reconnectable source (everything but file
-replay) and retries with `manta-server::backoff`'s shared 1s-60s policy; `manta_source_health`
+`manta-cli::reconnect::ReconnectingSource` wraps independently reconnectable sources and retries with `manta-server::backoff`'s shared 1s-60s policy; `manta_source_health`
 tracks it live (ARCHITECTURE §8).
 `manta_source_outages_total`/`manta_source_down_seconds_total` (MAN-96) count each drop and its
 completed down time, so a reconnect between two scrapes still shows; the 30-day field-node
@@ -59,10 +60,16 @@ procedure reads them (`docs/RUNBOOKS/secondary-skimmer-field-node.md`).
 
 ## Several inputs
 
-With several `[[input]]` entries (MAN-13) every input owns its own `ReconnectingSource` on its own
+With several independent `[[input]]` entries (MAN-13), each input reconnects on its own
 thread: one input dropping changes only its own `manta_source_health{source}` series and logs
 `input NAME: lost; retrying, k of n inputs decoding` — the others keep decoding, `/healthz` stays
 `ok` while at least one input is healthy, and the `MantaInputDown` alert (not `MantaNodeUnhealthy`)
 reports the dead one. Track ids are interleaved per input, so an input's per-track validator state
 never collides with another's. See
 [the decision record](../../docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md).
+
+
+HPSDR receivers sharing a radio instead share one control/reconnect owner
+(MAN-307). Do not wrap each DDC in an independent opener. See the
+[four-band guide](../../docs/GUIDES/multiple-receivers.md#several-bands-on-one-hpsdr-radio)
+and [generation, queue-loss and timing decisions](../../docs/DECISIONS/2026-10-19-man307-hpsdr-multiple-receivers.md).

@@ -3309,3 +3309,46 @@ fn corpus_runbook_passes_an_absolute_corpus_dir() {
         "{rel} no longer sets MANTA_CORPUS_DIR in a command; this test needs updating"
     );
 }
+
+#[test]
+fn shared_hpsdr_docs_describe_capacity_and_queue_loss_and_example_checks_offline() {
+    let guide = doc("docs/GUIDES/multiple-receivers.md");
+    assert!(!guide.contains("The config loader refuses\n  two entries on one radio"));
+    let example = guide
+        .split_once("<!-- MAN-307 four-band example -->")
+        .expect("four-band example")
+        .1
+        .split_once("```toml\n")
+        .unwrap()
+        .1
+        .split_once("```")
+        .unwrap()
+        .0;
+    let parsed: toml::Value = toml::from_str(example).unwrap();
+    assert_eq!(parsed["input"].as_array().unwrap().len(), 4);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("four-bands.toml");
+    std::fs::write(&path, example).unwrap();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_manta"));
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().starts_with(b"MANTA_") {
+            cmd.env_remove(key);
+        }
+    }
+    let output = cmd
+        .args(["config", "check", "--config"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("receiver capacity at 192.168.1.40:1024 is checked when manta run starts"));
+    assert!(doc("docs/CONFIG.md").contains("| `receivers` |"));
+    assert!(doc("docs/METRICS.md").contains("| `manta_input_queue_dropped_samples_total` |"));
+    assert!(guide.contains("has 4 receivers; 6 bands are configured"));
+    assert!(guide.contains("not a measured"));
+}

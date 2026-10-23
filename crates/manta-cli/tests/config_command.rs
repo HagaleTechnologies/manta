@@ -1080,6 +1080,35 @@ fn check_binds_no_port_and_opens_no_receiver_with_several_inputs() {
     }
 }
 
+#[test]
+fn shared_hpsdr_check_is_offline_and_reports_declaration() {
+    let dir = tempfile::tempdir().unwrap();
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp.set_nonblocking(true).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut body = format!(
+        "[server]\nstation_callsign = \"W1AW\"\ntelnet_port = {}\n",
+        listener.local_addr().unwrap().port()
+    );
+    for (i, name) in ["80m", "40m", "20m", "15m"].iter().enumerate() {
+        body += &format!("[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nhost = \"127.0.0.1\"\nport = {}\nfreq_hz = 7025000.0\nrate_hz = 192000.0\n{}", udp.local_addr().unwrap().port(), if i == 0 { "receivers = 4\n" } else { "" });
+    }
+    let path = write_cfg(dir.path(), "four.toml", &body);
+    let output = check_file(&path);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("receivers=4"));
+    assert!(stderr(&output).contains("is checked when manta run starts"));
+    assert!(udp.recv_from(&mut [0; 100]).is_err());
+    let body = body
+        + "[[input]]\nname = \"10m\"\ntype = \"hpsdr\"\nhost = \"127.0.0.1\"\n"
+        + &format!(
+            "port = {}\nfreq_hz = 28025000.0\nrate_hz = 192000.0\n",
+            udp.local_addr().unwrap().port()
+        );
+    std::fs::write(&path, body).unwrap();
+    assert!(fails(&check_file(&path)).contains("declares 4 receivers; 5 bands are configured"));
+}
+
 // MAN-310: `bands` plans a receiver's streams from the CW segment table.
 
 const KIWI: &str = "[input]\ntype = \"kiwi\"\nhost = \"kiwi.example.net\"\n";
@@ -1161,9 +1190,9 @@ fn bands_all_on_one_hpsdr_radio_is_refused_naming_the_14_stream_plan() {
     assert!(
         err.ends_with(
             "[input]: input.bands plans 14 streams (160m, 80m, 60m, 40m, 30m, 20m (2), 17m, \
-             15m (2), 12m, 10m (3)), but several receivers on one HPSDR radio are not \
-             supported yet; list bands that fit one stream (a 96000 Hz stream skims 86.899 \
-             kHz), or give each its own radio\n"
+             15m (2), 12m, 10m (3)), but bands opens one stream on an HPSDR radio; list bands \
+             that fit one stream (a 96000 Hz stream skims 86.899 kHz), or give each its own \
+             [[input]] on that radio (several receivers on one radio are one entry each)\n"
         ),
         "{err}"
     );
