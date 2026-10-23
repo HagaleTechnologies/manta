@@ -3,18 +3,22 @@
 ## Behavior
 
 An HPSDR input with frequency and sample rate but no `host` now discovers
-radios on the LAN. One available Protocol-1 radio is selected. Several radios
+radios on the LAN. One available radio of either protocol is selected. Several radios
 produce an error listing every address, MAC, board type, firmware byte and
 availability. `input.mac`, `MANTA_INPUT_MAC` and `--hpsdr-mac` pin a radio
 across DHCP address changes. MACs accept hexadecimal digits with colons,
 dashes or no separators and print in uppercase colon form.
 
-An explicit `host` keeps the existing direct connection and sends no discovery
-requests. Setting both host and MAC is an error. Frequency and sample rate
-remain required. A busy radio is listed but refused for automatic selection;
-an explicit host is the deliberate override. Protocol-2 responses are listed
-but refused for streaming until MAN-305 supplies that driver. A radio answering
-both protocols keeps its P2 answer; explicit host can force the P1 path.
+An explicit `host` keeps the existing direct connection and sends no LAN
+broadcast; under the default `protocol = "auto"`, MAN-305's directed protocol
+probe still goes to that host. Setting both host and MAC is an error.
+Frequency and sample rate remain required. A busy radio is listed but refused
+for automatic selection; an explicit host is the deliberate override. The
+selected address goes to the same opener as an explicit host, so its
+`protocol` setting picks the driver: under `auto` a protocol-2 radio streams
+through MAN-305's driver, which was on this branch's base. A radio answering
+both protocols keeps its P2 answer; `protocol = "1"` or an explicit host can
+force the P1 path.
 
 All five source commands use the same opener. Reconnect invokes discovery
 again, so a pinned MAC follows an address change. Two configured inputs with
@@ -29,12 +33,17 @@ reply lengths, sync and status, takes the IP from the datagram source and
 deduplicates by MAC. Board names use separate protocol tables; ID 4 means
 Angelia in P1 and Orion in P2. Unknown IDs are displayed as Unknown.
 
-Destinations are limited broadcast `255.255.255.255` and loopback-directed
-broadcast `127.255.255.255`, both on the configured control port, normally
+Destinations are limited broadcast `255.255.255.255`, loopback-directed
+broadcast `127.255.255.255` and `127.0.0.1` (macOS delivers neither broadcast
+to a local simulator; a simulator heard twice is deduplicated by MAC), all on
+the configured control port, normally
 1024. No dependency was added. On a host with several interfaces, limited
 broadcast may miss the radio's LAN; an explicit host remains the solution.
 A failed destination does not discard a successful send to another destination.
-If every send fails, or socket setup/receive fails, discovery reports an error.
+If every send fails, or socket setup/receive fails, discovery reports an error;
+a receive's "connection reset" (Windows' report of an ICMP port-unreachable,
+which `127.0.0.1` draws when no simulator listens) is retried, as MAN-305's
+probe does.
 
 `manta devices` now broadcasts by design. It reports HPSDR discovery separately
 from audio and Soapy, retaining successful sections if another fails. Empty
@@ -74,9 +83,11 @@ container ships no `strace`, so the fd table stands in for the MAN-239
 
 Live HL2 reply capture and behavior under another client remain MAN-52's
 hardware leg. The new ignored real-radio discovery test records that boundary.
-P2 live streaming remains MAN-305; the port-1025-first variant used by one HL2
-tool is not implemented. Broadcast delivery is tested on Linux in this run;
-macOS and Windows retain the same tests for CI verification.
+Live P2 hardware remains MAN-305's MAN-52 leg; a hostless protocol-2 radio
+is covered by `check_discovers_a_protocol2_radio_without_an_address` against
+MAN-305's loopback fake. The port-1025-first variant used by one HL2 tool is
+not implemented. The CLI acceptance tests pass on macOS through the
+`127.0.0.1` destination.
 
 ## Follow-up scope
 
@@ -87,7 +98,8 @@ this phase:
 - Operators on hosts with several subnets should discover radios on each local
   LAN. Add per-interface directed broadcasts to the existing destination list;
   retain explicit-host behavior and test interface enumeration without hardware.
-- When MAN-305 lands, reuse this discovery parser and socket loop for its
-  directed probe, filter replies to the selected host, and replace the P2
-  streaming refusal with the new driver. Keep one set of board tables and
-  request builders.
+- MAN-305 has landed and the P2 streaming refusal is gone. Still open: reuse
+  this discovery parser and socket loop for its directed probe, filter
+  replies to the selected host, and keep one set of board tables and request
+  builders (the two tables disagree on some protocol-2 board names).
+

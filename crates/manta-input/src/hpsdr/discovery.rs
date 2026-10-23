@@ -171,10 +171,15 @@ pub fn describe_radio(r: &DiscoveredRadio) -> String {
 
 /// LAN limited broadcast plus loopback for local radio simulators.
 /// Hosts on another interface/subnet can use an explicit host address.
-pub fn broadcast_destinations(port: u16) -> [SocketAddr; 2] {
+/// Linux delivers the loopback-directed broadcast to a simulator bound on
+/// any address; macOS delivers neither broadcast to a local socket, so
+/// `127.0.0.1` itself is asked too (a simulator heard twice is deduplicated
+/// by MAC).
+pub fn broadcast_destinations(port: u16) -> [SocketAddr; 3] {
     [
         SocketAddr::from(([255, 255, 255, 255], port)),
         SocketAddr::from(([127, 255, 255, 255], port)),
+        SocketAddr::from(([127, 0, 0, 1], port)),
     ]
 }
 
@@ -234,13 +239,10 @@ pub fn discover(
                 }
             }
             Ok(_) => {}
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
-                ) => {}
+            // Includes Windows' `ConnectionReset` for an ICMP
+            // port-unreachable, which the `127.0.0.1` destination draws when
+            // no simulator listens there.
+            Err(err) if is_retry(err.kind()) => {}
             Err(err) => return Err(err),
         }
     }
@@ -261,10 +263,6 @@ pub enum DiscoveryError {
         /// Radios that did answer.
         found: Vec<DiscoveredRadio>,
     },
-    /// The selected radio answered as protocol 2; automatic discovery
-    /// connects protocol-1 radios only, so it needs an explicit host
-    /// (which the protocol-2 driver serves).
-    Unsupported(DiscoveredRadio),
     /// The selected radio is already streaming.
     InUse(DiscoveredRadio),
     /// Several radios require an explicit choice.
@@ -286,7 +284,6 @@ impl fmt::Display for DiscoveryError {
                 for r in found { write!(f, "\n  {}", describe_radio(r))?; }
                 Ok(())
             }
-            Self::Unsupported(r) => write!(f, "the openHPSDR radio at {} (MAC {}, {}) answered as protocol 2; automatic discovery connects protocol-1 radios only, so set input.host / --hpsdr-host to use it", r.ip, format_mac(&r.mac), board_name(r.protocol, r.board_id)),
             Self::InUse(r) => write!(f, "the openHPSDR radio is in use: {}; stop the other client, or set input.host / --hpsdr-host to override", describe_radio(r)),
         }
     }
@@ -322,16 +319,16 @@ fn select_found(
         return Err(DiscoveryError::Ambiguous(candidates));
     }
     let radio = candidates.into_iter().next().expect("one candidate");
-    if radio.protocol == DiscoveryProtocol::P2 {
-        return Err(DiscoveryError::Unsupported(radio));
-    }
     if radio.status == DiscoveryStatus::InUse {
         return Err(DiscoveryError::InUse(radio));
     }
     Ok(radio)
 }
 
-/// Discover once per open attempt, then select a lone available P1 radio.
+/// Discover once per open attempt, then select a lone available radio of
+/// either protocol. The caller opens the selected address through
+/// [`super::open_receiver`], whose `protocol` setting picks the driver (under
+/// `Auto` its probe routes a protocol-2 radio to the MAN-305 driver).
 pub fn select_radio(
     port: u16,
     destinations: &[SocketAddr],
@@ -811,12 +808,11 @@ mod tests {
     }
 
     #[test]
-    fn select_reports_unsupported_for_a_p2_only_radio() {
-        let err = select_found(vec![parse_reply(&p2()).unwrap()], None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("protocol 2"));
-        assert!(err.contains("--hpsdr-host"));
+    fn select_returns_a_lone_available_p2_radio_for_the_protocol2_driver() {
+        let p2 = parse_reply(&p2()).unwrap();
+        assert_eq!(p2.protocol, DiscoveryProtocol::P2);
+        assert_eq!(select_found(vec![p2.clone()], None).unwrap(), p2);
+        assert_eq!(select_found(vec![p2.clone()], Some(p2.mac)).unwrap(), p2);
     }
 
     #[test]

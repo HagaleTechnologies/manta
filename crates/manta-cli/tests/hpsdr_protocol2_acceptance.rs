@@ -206,7 +206,13 @@ struct FakeP2Radio {
 
 impl FakeP2Radio {
     fn start(stream: Stream, done: mpsc::Sender<()>) -> Self {
-        let (base, cmd, iq) = Self::bind();
+        Self::start_on([127, 0, 0, 1], stream, done)
+    }
+
+    /// As [`Self::start`], bound on `ip`: `[0, 0, 0, 0]` also hears the
+    /// broadcast discovery a hostless input sends (MAN-306).
+    fn start_on(ip: [u8; 4], stream: Stream, done: mpsc::Sender<()>) -> Self {
+        let (base, cmd, iq) = Self::bind(ip);
         let stop = Arc::new(AtomicBool::new(false));
         let run_from: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
         let mut threads = Vec::new();
@@ -305,19 +311,20 @@ impl FakeP2Radio {
         }
     }
 
-    /// Bind `base..=base+3` and `base+11` on 127.0.0.1 for some free base.
-    fn bind() -> (u16, Vec<UdpSocket>, UdpSocket) {
+    /// Bind `base..=base+3` and `base+11` on `ip` for some free base.
+    fn bind(ip: [u8; 4]) -> (u16, Vec<UdpSocket>, UdpSocket) {
+        let ip = std::net::Ipv4Addr::from(ip);
         for _ in 0..200 {
-            let first = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let first = UdpSocket::bind((ip, 0)).unwrap();
             let base = first.local_addr().unwrap().port();
             if base > u16::MAX - 11 {
                 continue;
             }
             let rest: Option<Vec<UdpSocket>> = (1..=3)
-                .map(|o| UdpSocket::bind(("127.0.0.1", base + o)).ok())
+                .map(|o| UdpSocket::bind((ip, base + o)).ok())
                 .collect();
             let Some(rest) = rest else { continue };
-            let Ok(iq) = UdpSocket::bind(("127.0.0.1", base + 11)) else {
+            let Ok(iq) = UdpSocket::bind((ip, base + 11)) else {
                 continue;
             };
             let mut cmd = vec![first];
@@ -603,6 +610,50 @@ fn check_reports_a_protocol2_radio() {
     ] {
         assert!(stdout.contains(want), "missing {want:?} in:\n{stdout}");
     }
+    assert!(
+        stderr.contains("answered discovery as openHPSDR protocol 2 (board 5, Orion II"),
+        "{stderr}"
+    );
+}
+
+/// MAN-306: with no address, discovery finds the protocol-2 radio and the
+/// MAN-305 driver opens it, exactly as with an explicit host.
+#[test]
+fn check_discovers_a_protocol2_radio_without_an_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture(dir.path());
+    let mut samples = wav_samples(&wav);
+    samples.truncate(3 * RATE as usize);
+    let (done_tx, _done_rx) = mpsc::channel();
+    let fake = FakeP2Radio::start_on(
+        [0, 0, 0, 0],
+        Stream {
+            samples: Arc::new(samples),
+            speed: 1.0,
+            skip: None,
+            looping: true,
+            go: Arc::new(AtomicBool::new(true)),
+        },
+        done_tx,
+    );
+    let out = manta()
+        .args(["check", "--hpsdr-port"])
+        .arg(fake.base.to_string())
+        .args([
+            "--hpsdr-freq-hz",
+            "14000000",
+            "--hpsdr-rate-hz",
+            "192000",
+            "--duration",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    drop(fake);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("Stream sample rate: 192000 Hz"), "{stdout}");
     assert!(
         stderr.contains("answered discovery as openHPSDR protocol 2 (board 5, Orion II"),
         "{stderr}"
