@@ -11,6 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-23 | MAN-280 | [MAN-280: shadow-compare renders the comparison window in true UTC](2026-10-23-man280-shadow-compare-utc-window.md) |
 | 2026-10-23 | MAN-195 | [MAN-195: `spectral_beta = 0.0` skips the spectral-reference scan](2026-10-23-man195-spectral-beta-zero-skips-spectral-reference-scan.md) |
 | 2026-10-23 | MAN-158 | [MAN-158: ROADMAP holds gates and pointers; SECURITY.md states the shipped scope](2026-10-23-man158-roadmap-security-scope-refresh.md) |
 | 2026-10-23 | MAN-176 | [Superseded track-cap defaults in decision records](2026-10-23-man176-track-cap-default-docs.md) |
