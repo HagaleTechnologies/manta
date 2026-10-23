@@ -321,7 +321,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:70777e011e96d6b0797b03d61b2c1efa0babebe1a542a1d2b73043e72491b543",
+      "hash": "sha256:5ca169108ae1274e462ef60bd00032eb7c4e0bcfdf6b7b262f9185b03a8d9e60",
       "id": "spot-validation",
       "kind": "subsystem",
       "links": [
