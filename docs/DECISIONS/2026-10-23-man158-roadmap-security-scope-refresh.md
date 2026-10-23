@@ -58,7 +58,7 @@ defaults to dry-run. Untrusted-input examples now include hostile network
 peers on the SDR inputs, the `[rbn_compare]` feed and the MAN-316
 cty.dat/MASTER.SCP refresh, which downloads over plain HTTP. It points to
 both recorded threat models, each with the surfaces it covers: the
-[MAN-23 threat model](2026-09-02-man23-threat-model.md) (HPSDR input;
+[MAN-23 threat model](2026-09-02-man23-threat-model.md) (HPSDR Protocol 1 input;
 telnet, JSON/WebSocket and metrics servers; RBN uplink) and the
 [MAN-275 KiwiSDR threat model](2026-10-17-man275-kiwi-threat-model.md),
 which replaced MAN-60. It also points to the
