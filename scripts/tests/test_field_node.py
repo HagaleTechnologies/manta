@@ -542,6 +542,51 @@ class CliTests(unittest.TestCase):
                 self.assertIn("http://", r.stderr)
             self.assertFalse(os.path.exists(ledger))
 
+    def test_non_finite_or_huge_interval_is_usage_error_before_any_sample(self):
+        # PRRT_kwDOTQvU8M6qedLU (MAN-277): nan and inf passed the old `<= 0` check
+        # and crashed sleep() after one sample (nan with --recover-cmd: the watchdog
+        # constructor, before it). Under Restart=always that is a restart loop.
+        url = "http://127.0.0.1:%d" % closed_port()
+        with tempfile.TemporaryDirectory() as d:
+            ledger = os.path.join(d, "l.jsonl")
+            for interval in (["--interval-s", "nan"], ["--interval-s", "inf"], ["--interval-s", "-inf"],
+                             ["--interval-s=-inf"], ["--interval-s", "1e308"]):
+                for extra in ([], ["--recover-cmd", "true"]):
+                    with self.subTest(interval=interval, extra=extra):
+                        r = run_cli("sample", "--loop", *interval, "--metrics-url", url,
+                                    "--ledger", ledger, *extra)
+                        self.assertEqual(r.returncode, 2, r.stderr)
+                        self.assertIn("field-node.py sample: error:", r.stderr)
+                        self.assertIn("--interval-s", r.stderr)
+                        self.assertNotIn("Traceback", r.stderr)
+            self.assertFalse(os.path.exists(ledger))
+
+    def test_interval_over_a_day_is_usage_error(self):
+        # report rejects --interval-s above a day, so sample cannot write a
+        # ledger the report could not read at its own interval.
+        url = "http://127.0.0.1:%d" % closed_port()
+        with tempfile.TemporaryDirectory() as d:
+            ledger = os.path.join(d, "l.jsonl")
+            sleeps = []
+            args = sample_args(url, ledger, loop=True, interval_s=86400.5)
+            with self.assertRaisesRegex(fn.UsageError, r"--interval-s must be > 0 and <= 86400"):
+                fn.cmd_sample(args, sleep=sleeps.append, max_iterations=2)
+            self.assertEqual(sleeps, [])
+            self.assertFalse(os.path.exists(ledger))
+
+    def test_finite_interval_still_samples(self):
+        url = "http://127.0.0.1:%d" % closed_port()
+        with tempfile.TemporaryDirectory() as d:
+            ledger = os.path.join(d, "l.jsonl")
+            for interval in (60.0, 86400.0):
+                with self.subTest(interval=interval):
+                    sleeps = []
+                    args = sample_args(url, ledger, loop=True, interval_s=interval)
+                    self.assertEqual(fn.cmd_sample(args, sleep=sleeps.append, clock=lambda: 1000.0,
+                                                   max_iterations=2), 0)
+                    self.assertEqual(sleeps, [interval - 1000.0 % interval])
+            self.assertEqual([r["kind"] for r in read_ledger(ledger)], ["sample"] * 4)
+
     def test_bad_json_addr_exit_2(self):
         with tempfile.TemporaryDirectory() as d:
             r = run_cli("record-spots", "--json-addr", "localhost", "--out-dir", d)

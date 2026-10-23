@@ -465,10 +465,24 @@ class Watchdog:
         return rec
 
 
+# --interval-s is how often `sample` samples and, for `report`, the interval the
+# ledger was sampled at, so both take the same bound. NaN compares false against
+# everything, so a plain `<= 0` passes it. NaN, inf and huge values then crash
+# `sample --loop` in sleep() (a restart loop under Restart=always: PR #219 review,
+# MAN-277) and overflow report's gap arithmetic, turning a failing ledger into a PASS.
+MAX_INTERVAL_S = 86400.0
+
+
+def validate_interval_s(v):
+    if not math.isfinite(v):
+        raise UsageError("--interval-s must be a finite number")
+    if not 0 < v <= MAX_INTERVAL_S:
+        raise UsageError("--interval-s must be > 0 and <= %s" % _fmt_num(MAX_INTERVAL_S))
+
+
 def cmd_sample(args, sleep=time.sleep, clock=time.time, max_iterations=None):
     base = validate_http_url(args.metrics_url)
-    if args.interval_s <= 0:
-        raise UsageError("--interval-s must be > 0")
+    validate_interval_s(args.interval_s)
     watchdog = None
     if args.recover_cmd:
         if not shlex.split(args.recover_cmd):
@@ -1397,18 +1411,11 @@ def render_markdown(s):
     return "\n".join(out) + "\n"
 
 
-# A NaN compares false against everything and inf/huge values overflow the gap
-# arithmetic, so either would turn a failing ledger into a PASS. Reject them up front.
-MAX_REPORT_INTERVAL_S = 86400.0
-
-
 def validate_report_thresholds(args):
     def finite(flag, v):
         if not math.isfinite(v):
             raise UsageError("%s must be a finite number" % flag)
-    finite("--interval-s", args.interval_s)
-    if not 0 < args.interval_s <= MAX_REPORT_INTERVAL_S:
-        raise UsageError("--interval-s must be > 0 and <= %s" % _fmt_num(MAX_REPORT_INTERVAL_S))
+    validate_interval_s(args.interval_s)
     finite("--min-days", args.min_days)
     if args.min_days <= 0:
         raise UsageError("--min-days must be > 0")
