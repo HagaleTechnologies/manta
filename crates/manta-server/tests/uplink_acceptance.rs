@@ -841,6 +841,52 @@ async fn default_spot_types_forwards_cq_and_beacon_but_not_de_or_untyped() {
     let _ = harness.shutdown_tx.send(true);
 }
 
+/// MAN-94: a Beacon spot from one of the 18 NCDXF/IARU beacons goes out
+/// labelled `NCDXF B`, as RBN's own feed labels it, while a generic Beacon
+/// keeps `BEACON`. Both pass the default spot-type filter. The expected
+/// bytes are literal, CRLF included, not built with `rbn::format_line`:
+/// `NCDXF B` runs one column past the 6-wide type field and the time still
+/// starts on column 71.
+#[tokio::test]
+async fn an_ncdxf_beacon_is_forwarded_with_rbns_ncdxf_b_label() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let harness = spawn_uplink(listener.local_addr().unwrap().port(), false);
+
+    let (_login_line, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+
+    harness.bus.publish(Spot {
+        callsign: "4U1UN".to_string(),
+        freq_hz: 14_100_000.0,
+        spot_type: SpotType::Beacon,
+        ..sample_spot()
+    });
+    harness.bus.publish(Spot {
+        callsign: "JA1BCN".to_string(),
+        spot_type: SpotType::Beacon,
+        ..sample_spot()
+    });
+
+    let mut lines = Vec::new();
+    for _ in 0..2 {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .expect("timed out waiting for a forwarded beacon line")
+            .unwrap();
+        lines.push(line);
+    }
+    assert_eq!(
+        lines,
+        [
+            "DX de W3XYZ-#:  14100.00  4U1UN          CW    30 dB  28 WPM  NCDXF B 2213Z\r\n",
+            "DX de W3XYZ-#:  14027.10  JA1BCN         CW    30 dB  28 WPM  BEACON  2213Z\r\n",
+        ]
+    );
+    assert_eq!(harness.metrics.uplink_sent_total(), 2);
+
+    let _ = harness.shutdown_tx.send(true);
+}
+
 /// MAN-91 scenario 3: `spot_types = "all"` forwards every type, DE and
 /// untyped included, in publish order.
 #[tokio::test]
