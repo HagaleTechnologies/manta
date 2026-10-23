@@ -545,6 +545,29 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
              the servers publish)"
         );
     }
+    // MAN-319: a live uplink (`dry_run = false`) will one day register with
+    // the collector, and registration carries the station's 6-character
+    // locator. Refuse at config load -- every entry point (check, run,
+    // doctor, SIGHUP reload) shares this -- rather than letting a live
+    // uplink start without it. Dry-run blocks are exempt: rehearsal must
+    // not need what only the live path transmits. `station_location` above
+    // has already rejected any malformed grid, so only absent / 4 / 6
+    // remain to tell apart.
+    for uplink in &rbn_uplink {
+        if uplink.enabled && !uplink.dry_run {
+            let grid = server.as_ref().and_then(|s| s.operator_grid.as_deref());
+            if !grid.is_some_and(|g| g.chars().count() == 6) {
+                let short = short_grid_suffix(grid);
+                bail!(
+                    "{origin}: [[rbn_uplink]] target {}:{} has dry_run = false -- sending \
+                     spots needs [server].operator_grid set to a 6-character Maidenhead \
+                     locator (e.g. \"FN03ab\"){short}",
+                    uplink.target_host,
+                    uplink.target_port,
+                );
+            }
+        }
+    }
     let mut notes = Vec::new();
     let rbn_compare = take_typed::<RbnCompareConfig>(&doc, "rbn_compare", &origin, &overlay)?;
     if let Some(rc) = &rbn_compare {
@@ -788,6 +811,15 @@ fn take_uplinks(doc: &toml::Table, origin: &str) -> Result<Vec<RbnUplinkConfig>>
         .clone()
         .try_into::<Vec<RbnUplinkConfig>>()
         .map_err(|e| anyhow!("{origin}: [[rbn_uplink]]: {e}"))
+}
+
+/// MAN-319's locator gate names a set-but-too-short grid so the operator
+/// sees which value to fix; empty when no grid is configured at all.
+fn short_grid_suffix(grid: Option<&str>) -> String {
+    match grid {
+        Some(g) => format!(" -- \"{g}\" is only {} characters", g.chars().count()),
+        None => String::new(),
+    }
 }
 
 fn finite_positive(key: &str, v: f64) -> std::result::Result<f64, String> {
@@ -2038,6 +2070,87 @@ mod tests {
         );
     }
 
+    /// MAN-319: the live-uplink locator gate's message, pinned once here so
+    /// the implementation below cannot drift from the docs' phrasing.
+    const MAN319_LOCATOR_MSG: &str =
+        "dry_run = false -- sending spots needs [server].operator_grid \
+                                     set to a 6-character Maidenhead locator";
+
+    fn live_uplink(host: &str) -> String {
+        format!(
+            "[[rbn_uplink]]\nenabled = true\ntarget_host = \"{host}\"\ntarget_port = 7300\ndry_run \
+             = false\n"
+        )
+    }
+
+    #[test]
+    fn live_uplink_without_operator_grid_fails_load() {
+        let err = err_of(&format!("{SERVER}{}", live_uplink("127.0.0.1")));
+        assert!(err.contains(MAN319_LOCATOR_MSG), "{err}");
+        assert!(err.contains("target 127.0.0.1:7300"), "{err}");
+    }
+
+    #[test]
+    fn live_uplink_with_a_four_character_grid_fails_load() {
+        let err = err_of(&format!(
+            "{SERVER}operator_grid = \"FN03\"\n{}",
+            live_uplink("127.0.0.1")
+        ));
+        assert!(err.contains(MAN319_LOCATOR_MSG), "{err}");
+        assert!(err.contains("\"FN03\" is only 4 characters"), "{err}");
+    }
+
+    #[test]
+    fn live_uplink_with_a_six_character_grid_loads() {
+        let loaded = load_file(&format!(
+            "{SERVER}operator_grid = \"FN03ab\"\n{}",
+            live_uplink("127.0.0.1")
+        ))
+        .unwrap();
+        assert_eq!(loaded.rbn_uplink.len(), 1);
+    }
+
+    #[test]
+    fn dry_run_uplink_without_a_grid_still_loads() {
+        // `dry_run` omitted: the default (true, MAN-159) needs no locator.
+        load_file(&format!(
+            "{SERVER}[[rbn_uplink]]\nenabled = true\ntarget_host = \"x\"\ntarget_port = 7300\n"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn explicitly_dry_run_uplink_without_a_grid_still_loads() {
+        load_file(&format!(
+            "{SERVER}[[rbn_uplink]]\nenabled = true\ntarget_host = \"x\"\ntarget_port = \
+             7300\ndry_run = true\n"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn disabled_uplink_with_dry_run_false_and_no_grid_still_loads() {
+        load_file(&format!(
+            "{SERVER}[[rbn_uplink]]\nenabled = false\ntarget_host = \"x\"\ntarget_port = \
+             7300\ndry_run = false\n"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn second_live_uplink_without_a_grid_is_named() {
+        // A dry-run entry first, then the live one: the error names the
+        // live target, not the first entry.
+        let err = err_of(&format!(
+            "{SERVER}[[rbn_uplink]]\nenabled = true\ntarget_host = \"dry.example\"\
+             \ntarget_port = 7000\ndry_run = true\n{}",
+            live_uplink("live.example")
+        ));
+        assert!(err.contains(MAN319_LOCATOR_MSG), "{err}");
+        assert!(err.contains("target live.example:7300"), "{err}");
+        assert!(!err.contains("dry.example"), "{err}");
+    }
+
     #[test]
     fn server_table_is_optional() {
         let loaded = load_file("[decode]\nengine = \"legacy\"\n").unwrap();
@@ -2863,6 +2976,24 @@ mod tests {
         .unwrap();
         assert!(!loaded.detector.rtty_filter);
         assert_eq!(loaded.detector.rtty_dwell_hops, 11250);
+    }
+
+    #[test]
+    fn digital_window_env_overrides_the_file() {
+        for (file, env, expected) in [("true", "false", false), ("false", "true", true)] {
+            let loaded = load_env(
+                Some(&format!("[detector]\ndigital_window_filter = {file}\n")),
+                &[("MANTA_DETECTOR_DIGITAL_WINDOW_FILTER", env)],
+            )
+            .unwrap();
+            assert_eq!(
+                loaded.detector,
+                DetectorConfig {
+                    digital_window_filter: expected,
+                    ..DetectorConfig::default()
+                }
+            );
+        }
     }
 
     #[test]

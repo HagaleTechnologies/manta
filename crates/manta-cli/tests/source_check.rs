@@ -405,7 +405,7 @@ fn check_binds_no_server_and_connects_to_no_uplink_or_unused_assets() {
     collector.set_nonblocking(true).unwrap();
     let collector_port = collector.local_addr().unwrap().port();
     let cfg = config(dir.path(), "probe.toml", &format!(
-        "[server]\nstation_callsign='W1AW'\nbind_addr='127.0.0.1'\nmetrics_bind_addr='127.0.0.1'\ntelnet_port={}\njson_port={}\nmetrics_port={}\n\
+        "[server]\nstation_callsign='W1AW'\nbind_addr='127.0.0.1'\nmetrics_bind_addr='127.0.0.1'\ntelnet_port={}\njson_port={}\nmetrics_port={}\noperator_grid='FN03ab'\n\
          [[rbn_uplink]]\nenabled=true\ntarget_host='127.0.0.1'\ntarget_port={collector_port}\nlogin_callsign='W1AW'\ndry_run=false\n\
          [input]\ntype='file'\npath='capture.wav'\niq=true\n\
          [spot]\ncty_path='absent.dat'\nscp_path='absent.scp'\nblocklist_path='absent-blocklist.txt'\nnotch_path='absent-notches.txt'\n", ports[0], ports[1], ports[2]));

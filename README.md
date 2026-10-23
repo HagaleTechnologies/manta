@@ -475,6 +475,9 @@ reading this node's telnet server (see the
 Forwarding straight to an upstream collector is an experimental
 `[[rbn_uplink]]` block. `dry_run` defaults to `true`, so an uplink connects
 and logs in but transmits nothing until you set it to `false` deliberately.
+Going live (`dry_run = false`) also needs `[server].operator_grid` set to a
+6-character Maidenhead locator (e.g. `"FN03ab"`); `config check` refuses the
+flip without one.
 
 To see, live, whether RBN heard what manta spots, add an `[rbn_compare]`
 table (MAN-301). manta then reads RBN's public CW feed, read-only, and
@@ -805,7 +808,8 @@ target_host = "rbn.example.org"
 target_port = 7000
 # dry_run defaults to TRUE: manta connects and logs in, so you can verify
 # credentials and reachability, but transmits no spots. Set it to false
-# only once you actually intend to feed a live target.
+# only once you actually intend to feed a live target; going live then also
+# needs [server] operator_grid set to a 6-character Maidenhead locator.
 # dry_run = false
 # spot_types defaults to "cq_beacon": only CQ and beacon spots, as RBN
 # requires. "all" also sends DE and untyped spots.

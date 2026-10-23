@@ -11,6 +11,14 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-23 | MAN-158 | [MAN-158: ROADMAP holds gates and pointers; SECURITY.md states the shipped scope](2026-10-23-man158-roadmap-security-scope-refresh.md) |
+| 2026-10-23 | MAN-176 | [Superseded track-cap defaults in decision records](2026-10-23-man176-track-cap-default-docs.md) |
+| 2026-10-22 | MAN-94 | [MAN-94: an NCDXF/IARU beacon spot reads `NCDXF B` on the wire](2026-10-22-man94-ncdxf-beacon-label.md) |
+| 2026-10-20 | MAN-340 | [MAN-340: a dispatched CI run tests the PR head merged with the main commit its workflow came from](2026-10-20-man340-dispatched-ci-tests-the-merge-with-main.md) |
+| 2026-10-19 | MAN-334 | [MAN-334: calibrate plans its references before it opens the receiver](2026-10-19-man334-calibrate-plans-before-opening.md) |
+| 2026-10-19 | MAN-319 | [MAN-319: the live uplink needs a 6-character locator now; the registration exchange waits for MAN-90's capture](2026-10-19-man319-uplink-registration-exchange.md) |
+| 2026-10-19 | MAN-311 | [Exclude common digital-mode windows from CW track starts](2026-10-19-man311-digital-window-exclusions.md) |
+| 2026-10-19 | MAN-291 | [MAN-291: `field-node.py report` fails ledger integrity until a sample follows the window](2026-10-19-man291-post-window-sample.md) |
 | 2026-10-19 | MAN-14 | [MAN-14: each receiver's hearing on /metrics, the status line and /status](2026-10-19-man14-per-receiver-hearing-visibility.md) |
 | 2026-10-19 | MAN-305 | [MAN-305: protocol-2 openHPSDR radios are inputs; the protocol is discovered, and lost datagrams reach the decoder as missing input](2026-10-19-man305-hpsdr-protocol-2-input.md) |
 | 2026-10-19 | MAN-306 | [Discover an openHPSDR radio when no address is configured](2026-10-19-man306-openhpsdr-discovery.md) |

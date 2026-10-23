@@ -398,6 +398,58 @@ mod tests {
         );
     }
 
+    /// MAN-99: N1MM Logger+ sends a cluster keep-alive every N whole
+    /// minutes, N >= 1, and a keepalive that completes a line costs one
+    /// command. Over a day at the fastest interval N1MM offers, every
+    /// keepalive must land in a window of its own on both limiters a
+    /// telnet line is checked against, built with the telnet listener's
+    /// real budget: one unit of `MAX_TELNET_COMMANDS` per window, never a
+    /// refusal. Keepalives 60 s apart cannot share a `COMMAND_RATE_WINDOW`,
+    /// so this holds for any window placement, not only this limiter's
+    /// reset-on-elapsed one.
+    #[tokio::test(start_paused = true)]
+    async fn n1mm_keepalive_once_a_minute_for_a_day_costs_one_command_per_window() {
+        use crate::telnet::{COMMAND_RATE_WINDOW, MAX_TELNET_COMMANDS};
+        const N1MM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+        let mut per_connection = RateLimiter::new(MAX_TELNET_COMMANDS, COMMAND_RATE_WINDOW);
+        let per_ip = IpRateLimiter::new(MAX_TELNET_COMMANDS, COMMAND_RATE_WINDOW);
+        let ip = addr(1);
+        for keepalive in 0..24 * 60 {
+            assert!(
+                per_connection.allow(),
+                "keepalive #{keepalive} tripped the per-connection command budget"
+            );
+            assert!(
+                per_ip.allow(ip),
+                "keepalive #{keepalive} tripped the per-IP command budget"
+            );
+            assert_eq!(per_connection.count, 1, "keepalive #{keepalive}");
+            assert_eq!(
+                per_ip.state.lock().unwrap().entries[&ip].count,
+                1,
+                "keepalive #{keepalive}"
+            );
+            tokio::time::advance(N1MM_KEEPALIVE_INTERVAL).await;
+        }
+    }
+
+    /// MAN-99's "never approaches": a keepalive every second, 60 times
+    /// N1MM's fastest rate, still fits the telnet budget (10 of 30 per
+    /// window). A tuning change that brings the budget within that margin
+    /// of a keepalive client fails here first.
+    #[tokio::test(start_paused = true)]
+    async fn a_keepalive_every_second_still_fits_the_telnet_command_budget() {
+        use crate::telnet::{COMMAND_RATE_WINDOW, MAX_TELNET_COMMANDS};
+        let mut per_connection = RateLimiter::new(MAX_TELNET_COMMANDS, COMMAND_RATE_WINDOW);
+        let per_ip = IpRateLimiter::new(MAX_TELNET_COMMANDS, COMMAND_RATE_WINDOW);
+        let ip = addr(1);
+        for keepalive in 0..60 * 60 {
+            assert!(per_connection.allow(), "keepalive #{keepalive}");
+            assert!(per_ip.allow(ip), "keepalive #{keepalive}");
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+    }
+
     /// MAN-68, PR #85 review round 6: a source with access to many
     /// distinct addresses (a routed prefix) must not grow
     /// `IpRateLimiter`'s tracked-entry count without bound between reaper

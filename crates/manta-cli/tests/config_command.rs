@@ -565,6 +565,59 @@ fn check_notes_that_an_enabled_uplink_is_experimental() {
     );
 }
 
+/// MAN-319: a live uplink (`dry_run = false`) without a 6-character
+/// `[server].operator_grid` is an invalid config: exit 1, the error on
+/// stderr naming the target and the key to set, no `valid` on stdout.
+const MAN319_LOCATOR_MSG: &str =
+    "dry_run = false -- sending spots needs [server].operator_grid set to a 6-character \
+     Maidenhead locator";
+
+#[test]
+fn config_check_refuses_a_live_uplink_without_a_six_character_locator() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cfg(
+        dir.path(),
+        "nogrid-live.toml",
+        "[server]\nstation_callsign = \"W1AW\"\n\
+         [[rbn_uplink]]\nenabled = true\ntarget_host = \"127.0.0.1\"\ntarget_port = 7300\n\
+         dry_run = false\n",
+    );
+    let o = check_file(&path);
+    let err = fails(&o);
+    assert!(err.contains(MAN319_LOCATOR_MSG), "{err}");
+    assert!(err.contains("target 127.0.0.1:7300"), "{err}");
+    assert!(!stdout(&o).contains(" valid"), "stdout: {}", stdout(&o));
+}
+
+#[test]
+fn config_check_refuses_a_live_uplink_with_only_a_four_character_grid() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cfg(
+        dir.path(),
+        "shortgrid-live.toml",
+        "[server]\nstation_callsign = \"W1AW\"\noperator_grid = \"FN03\"\n\
+         [[rbn_uplink]]\nenabled = true\ntarget_host = \"127.0.0.1\"\ntarget_port = 7300\n\
+         dry_run = false\n",
+    );
+    let err = fails(&check_file(&path));
+    assert!(err.contains(MAN319_LOCATOR_MSG), "{err}");
+    assert!(err.contains("\"FN03\" is only 4 characters"), "{err}");
+}
+
+#[test]
+fn config_check_accepts_a_live_uplink_with_a_six_character_grid() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cfg(
+        dir.path(),
+        "grid-live.toml",
+        "[server]\nstation_callsign = \"W1AW\"\noperator_grid = \"FN03ab\"\n\
+         [[rbn_uplink]]\nenabled = true\ntarget_host = \"127.0.0.1\"\ntarget_port = 7300\n\
+         dry_run = false\n",
+    );
+    let out = succeeds(&check_file(&path));
+    assert!(out.contains("dry_run=false"), "{out}");
+}
+
 // ---- Scenario 3: a fresh config is scaffolded
 
 fn init_in(dir: &Path, args: &[&str]) -> Output {

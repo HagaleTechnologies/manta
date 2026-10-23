@@ -44,6 +44,8 @@ mod reload;
 mod silent;
 mod source_check;
 mod stdio;
+#[cfg(test)]
+mod test_ports;
 mod text_lines;
 use list_cache::ListKind;
 use reconnect::ReconnectingSource;
@@ -1642,13 +1644,9 @@ impl LiveSourceSpec {
                 let rate = hpsdr
                     .rate
                     .ok_or_else(|| anyhow!("--hpsdr-rate-hz is required with the hpsdr source"))?;
-                let cfg = manta_input::hpsdr::HpsdrConfig {
-                    host: hpsdr.resolve_host()?,
-                    port: hpsdr.port.unwrap_or(HPSDR_CONTROL_PORT),
-                    ddc_count: 1,
-                    sample_rate_hz: rate,
-                    center_freq_hz: vec![freq],
-                };
+                // MAN-306: a hostless entry discovers its radio here, on
+                // each (re)open, so a radio that moved address is found again.
+                let cfg = hpsdr_config(hpsdr, hpsdr.resolve_host()?, freq, rate);
                 // MAN-305 D2/D17: run, listen, soak, calibrate, check and
                 // doctor all open here, so each prints the same §4 line.
                 let opened = manta_input::hpsdr::open_receiver(&cfg, hpsdr.protocol)?;
@@ -1696,6 +1694,76 @@ impl LiveSourceSpec {
             }),
             None => src,
         })
+    }
+
+    /// MAN-334: the centre and RF passband `open(capture_rate_hz,
+    /// dial_freq_hz)` will report, from configuration alone and without
+    /// touching the receiver, so `calibrate` can refuse a passband that holds
+    /// no reference before any receiver I/O (MAN-127 Decision 11). It mirrors
+    /// `open`: the source's own values, then `maybe_decimate`, then the
+    /// `--dial-freq-hz` override; a change to how `open` composes a source
+    /// must change this too. `None` when only opening can tell -- a ka9q-radio
+    /// channel (radiod reports both), a recording (its header and sidecar do)
+    /// -- or when `open` itself would refuse (a missing frequency or rate, an
+    /// HPSDR rate or frequency `hpsdr::validate_before_open` refuses for the
+    /// configured protocol -- protocol 1's under `Auto`, which discovery
+    /// resolves only by I/O -- a capture rate the source cannot decimate
+    /// to), so `open` keeps reporting its own errors. KiwiSDR, HPSDR and
+    /// sound-card values are exact, so the preflight refuses nothing the
+    /// opened source would not. SoapySDR values
+    /// are the requested ones (MAN-334 decision 4): a driver may round them,
+    /// so a window the request leaves without a reference is refused even if
+    /// the driver would have widened it, and a narrower negotiated window is
+    /// caught by `calibrate`'s re-plan once open.
+    fn configured_center_and_passband(
+        &self,
+        capture_rate_hz: Option<f64>,
+        dial_freq_hz: Option<f64>,
+    ) -> Option<(f64, (f64, f64))> {
+        let (center_hz, rate_hz, passband) = match self {
+            LiveSourceSpec::Kiwi(kiwi) => (
+                kiwi.freq?,
+                manta_input::kiwi::OUTPUT_RATE_HZ,
+                manta_input::kiwi::IQ_PASSBAND_HZ,
+            ),
+            #[cfg(feature = "soapy")]
+            LiveSourceSpec::Soapy(soapy) => {
+                let rate = soapy.rate?;
+                (soapy.freq?, rate, (-rate / 2.0, rate / 2.0))
+            }
+            LiveSourceSpec::Hpsdr(hpsdr) => {
+                let (freq, rate) = (hpsdr.freq?, hpsdr.rate?);
+                // `HpsdrDevice::open` (protocol 1) and `Protocol2IqSource::
+                // open` validate the rate and frequency before their own
+                // I/O; a refusal there stays `open`'s to report.
+                manta_input::hpsdr::validate_before_open(
+                    // Validation reads only rate and frequency: no discovery
+                    // runs while planning (MAN-306).
+                    &hpsdr_config(hpsdr, String::new(), freq, rate),
+                    hpsdr.protocol,
+                )
+                .ok()?;
+                (freq, rate, (-rate / 2.0, rate / 2.0))
+            }
+            // A sound card reports no frequency of its own: the dial is its
+            // centre.
+            LiveSourceSpec::AudioDevice(_) => (
+                dial_freq_hz?,
+                f64::from(manta_input::TARGET_RATE_HZ),
+                (
+                    manta_input::AUDIO_PASSBAND_LO_HZ,
+                    manta_input::AUDIO_PASSBAND_HI_HZ,
+                ),
+            ),
+            LiveSourceSpec::Ka9q(_) | LiveSourceSpec::File { .. } => return None,
+        };
+        let passband = match decimation_target(rate_hz, capture_rate_hz) {
+            Some(target) => {
+                manta_input::DecimatingSource::passband_for(rate_hz, target, passband).ok()?
+            }
+            None => passband,
+        };
+        Some((dial_freq_hz.unwrap_or(center_hz), passband))
     }
 }
 
@@ -2027,11 +2095,36 @@ fn maybe_decimate(
     src: reconnect::SendSource,
     capture_rate_hz: Option<f64>,
 ) -> Result<reconnect::SendSource> {
-    match capture_rate_hz {
-        Some(target) if (target - src.sample_rate()).abs() > 1e-6 => {
-            Ok(Box::new(manta_input::DecimatingSource::new(src, target)?))
-        }
-        _ => Ok(src),
+    match decimation_target(src.sample_rate(), capture_rate_hz) {
+        Some(target) => Ok(Box::new(manta_input::DecimatingSource::new(src, target)?)),
+        None => Ok(src),
+    }
+}
+
+/// The rate `maybe_decimate` decimates a `native_rate_hz` source to, or
+/// `None` when it leaves it alone. Shared with
+/// `LiveSourceSpec::configured_center_and_passband` (MAN-334), so the
+/// preflight and the opened source never disagree on whether it decimates.
+fn decimation_target(native_rate_hz: f64, capture_rate_hz: Option<f64>) -> Option<f64> {
+    capture_rate_hz.filter(|target| (target - native_rate_hz).abs() > 1e-6)
+}
+
+/// The one-DDC `HpsdrConfig` `LiveSourceSpec::open` opens an HPSDR receiver
+/// with. Shared with `LiveSourceSpec::configured_center_and_passband`
+/// (MAN-334), which plans on it only when `hpsdr::validate_before_open` --
+/// the I/O-free check the protocol's own open makes first -- accepts it.
+fn hpsdr_config(
+    hpsdr: &HpsdrOpts,
+    host: String,
+    freq: f64,
+    rate: f64,
+) -> manta_input::hpsdr::HpsdrConfig {
+    manta_input::hpsdr::HpsdrConfig {
+        host,
+        port: hpsdr.port.unwrap_or(HPSDR_CONTROL_PORT),
+        ddc_count: 1,
+        sample_rate_hz: rate,
+        center_freq_hz: vec![freq],
     }
 }
 
@@ -10046,6 +10139,163 @@ mod tests {
         assert_eq!(
             open_error(hpsdr(Some(7_030_000.0), None)),
             "--hpsdr-rate-hz is required with the hpsdr source"
+        );
+    }
+
+    /// MAN-334: what `calibrate` plans on before opening. Each case mirrors
+    /// what `LiveSourceSpec::open` composes: the source's values, then
+    /// `maybe_decimate`, then the `--dial-freq-hz` override.
+    #[test]
+    fn configured_center_and_passband_mirrors_open() {
+        let kiwi = |freq| {
+            LiveSourceSpec::Kiwi(KiwiOpts {
+                host: Some("h".into()),
+                port: 8073,
+                freq,
+                password: String::new(),
+            })
+        };
+        let trusted = |fs_out: f64| manta_dsp::decimate::TRUSTED_HALF_BAND_FRACTION * fs_out;
+        let k = kiwi(Some(7_030_000.0));
+        assert_eq!(
+            k.configured_center_and_passband(None, None),
+            Some((7_030_000.0, (-5_000.0, 5_000.0)))
+        );
+        // The dial override relabels the centre only.
+        assert_eq!(
+            k.configured_center_and_passband(None, Some(7_031_000.0)),
+            Some((7_031_000.0, (-5_000.0, 5_000.0)))
+        );
+        // Decimation from KiwiSDR's 96 kS/s: 12 kS/s keeps +/-5000 (trusted
+        // 5431.2), 6 kS/s clips it.
+        assert_eq!(
+            k.configured_center_and_passband(Some(12_000.0), None),
+            Some((7_030_000.0, (-5_000.0, 5_000.0)))
+        );
+        assert_eq!(
+            k.configured_center_and_passband(Some(6_000.0), None),
+            Some((7_030_000.0, (-trusted(6_000.0), trusted(6_000.0))))
+        );
+        // The native rate itself is no decimation.
+        assert_eq!(
+            k.configured_center_and_passband(Some(96_000.0), None),
+            Some((7_030_000.0, (-5_000.0, 5_000.0)))
+        );
+        // A rate `open` refuses, or a missing frequency: no preflight, `open`
+        // reports it.
+        assert_eq!(k.configured_center_and_passband(Some(50_000.0), None), None);
+        assert_eq!(kiwi(None).configured_center_and_passband(None, None), None);
+
+        let hpsdr = |freq, rate| {
+            LiveSourceSpec::Hpsdr(HpsdrOpts {
+                host: Some("h".into()),
+                mac: None,
+                port: Some(manta_input::hpsdr::CONTROL_PORT),
+                protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
+                freq,
+                rate,
+            })
+        };
+        assert_eq!(
+            hpsdr(Some(7_030_000.0), Some(48_000.0)).configured_center_and_passband(None, None),
+            Some((7_030_000.0, (-24_000.0, 24_000.0)))
+        );
+        assert_eq!(
+            hpsdr(Some(7_030_000.0), Some(192_000.0))
+                .configured_center_and_passband(Some(48_000.0), None),
+            Some((7_030_000.0, (-trusted(48_000.0), trusted(48_000.0))))
+        );
+        assert_eq!(
+            hpsdr(Some(7_030_000.0), None).configured_center_and_passband(None, None),
+            None
+        );
+        assert_eq!(
+            hpsdr(None, Some(48_000.0)).configured_center_and_passband(None, None),
+            None
+        );
+        // A rate Protocol 1 cannot encode, or a fractional frequency:
+        // `HpsdrDevice::open` refuses them before any I/O, so it reports them.
+        assert_eq!(
+            hpsdr(Some(7_030_000.0), Some(50_000.0)).configured_center_and_passband(None, None),
+            None
+        );
+        assert_eq!(
+            hpsdr(Some(7_030_000.5), Some(48_000.0)).configured_center_and_passband(None, None),
+            None
+        );
+        // A frequency protocol 1 accepts but protocol 2 refuses (not below
+        // its 61.44 MHz ADC Nyquist limit): with `--hpsdr-protocol 2`,
+        // `Protocol2IqSource::open` refuses it before any I/O, so it
+        // reports it; under `Auto` discovery picks the protocol, so the
+        // preflight plans on protocol 1's validation.
+        let protocol2 = LiveSourceSpec::Hpsdr(HpsdrOpts {
+            host: Some("h".into()),
+            mac: None,
+            port: Some(manta_input::hpsdr::CONTROL_PORT),
+            protocol: manta_input::hpsdr::HpsdrProtocol::Two,
+            freq: Some(100_000_000.0),
+            rate: Some(48_000.0),
+        });
+        assert_eq!(protocol2.configured_center_and_passband(None, None), None);
+        let protocol2 = LiveSourceSpec::Hpsdr(HpsdrOpts {
+            host: Some("h".into()),
+            mac: None,
+            port: Some(manta_input::hpsdr::CONTROL_PORT),
+            protocol: manta_input::hpsdr::HpsdrProtocol::Two,
+            freq: Some(7_030_000.0),
+            rate: Some(48_000.0),
+        });
+        assert_eq!(
+            protocol2.configured_center_and_passband(None, None),
+            Some((7_030_000.0, (-24_000.0, 24_000.0)))
+        );
+        assert_eq!(
+            hpsdr(Some(100_000_000.0), Some(48_000.0)).configured_center_and_passband(None, None),
+            Some((100_000_000.0, (-24_000.0, 24_000.0)))
+        );
+
+        // A sound card's centre is the dial; without one there is none.
+        let audio = LiveSourceSpec::AudioDevice(None);
+        assert_eq!(
+            audio.configured_center_and_passband(None, Some(7_030_000.0)),
+            Some((7_030_000.0, (300.0, 3_000.0)))
+        );
+        assert_eq!(audio.configured_center_and_passband(None, None), None);
+
+        // Only opening tells: radiod's status, a recording's header and
+        // sidecar.
+        let ka9q = LiveSourceSpec::Ka9q(Ka9qOpts {
+            group: Some("239.1.2.3".into()),
+            ..Ka9qOpts::unset()
+        });
+        assert_eq!(
+            ka9q.configured_center_and_passband(None, Some(7_030_000.0)),
+            None
+        );
+        for source_iq in [false, true] {
+            let file = LiveSourceSpec::File {
+                path: PathBuf::from("rec.wav"),
+                source_iq,
+            };
+            assert_eq!(
+                file.configured_center_and_passband(None, Some(7_030_000.0)),
+                None
+            );
+        }
+    }
+
+    #[cfg(feature = "soapy")]
+    #[test]
+    fn configured_center_and_passband_uses_the_requested_soapy_values() {
+        let s = LiveSourceSpec::Soapy(SoapyOpts {
+            driver: Some("driver=rtlsdr".into()),
+            freq: Some(7_030_000.0),
+            rate: Some(240_000.0),
+            gain: None,
+        });
+        assert_eq!(
+            s.configured_center_and_passband(None, None),
+            Some((7_030_000.0, (-120_000.0, 120_000.0)))
         );
     }
 

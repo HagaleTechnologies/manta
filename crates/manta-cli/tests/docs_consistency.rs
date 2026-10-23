@@ -1206,6 +1206,7 @@ fn spec_detector_values_equal_the_code_defaults() {
         "rtty_filter",
         "rtty_dwell_ms",
         "non_cw_filter",
+        "digital_window_filter",
         "unkeyed_close_ms",
         "reacquire_ms",
     ] {
@@ -1898,6 +1899,84 @@ fn man90_records_list_every_open_claim_and_link_each_other() {
     );
 }
 
+// ---- MAN-319 ----
+
+/// Where the locator gate's sentence lives, per surface. The README's and
+/// packaging README's paragraphs are whole-file (no `##` section to slice);
+/// the guide's is its `### Going live` subsection (the `section` helper
+/// slices only `##`, so it is cut by hand here); CONFIG.md's is the
+/// `[[rbn_uplink]]` section; the example file's is the dry_run comment.
+#[test]
+fn live_uplink_docs_name_the_six_character_locator_requirement() {
+    let guide = doc("docs/GUIDES/rbn-node.md");
+    let going_live = guide
+        .split("### Going live\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("rbn-node.md has no `### Going live` section"));
+    let going_live = &going_live[..going_live
+        .find("\n### ")
+        .or_else(|| going_live.find("\n## "))
+        .unwrap_or(going_live.len())];
+    for (what, text) in [
+        ("README.md uplink paragraph", doc("README.md")),
+        (
+            "docs/CONFIG.md [[rbn_uplink]] section",
+            section(&doc("docs/CONFIG.md"), "[[rbn_uplink]]").to_string(),
+        ),
+        (
+            "manta.example.toml dry_run comment",
+            doc("manta.example.toml"),
+        ),
+        (
+            "packaging/README.md Uplinks paragraph",
+            doc("packaging/README.md"),
+        ),
+        (
+            "docs/GUIDES/rbn-node.md Going live section",
+            going_live.to_string(),
+        ),
+    ] {
+        let text = squash_whitespace(&text);
+        assert!(
+            text.contains("6-character") && text.contains("operator_grid"),
+            "{what} does not name the 6-character operator_grid requirement"
+        );
+    }
+}
+
+/// MAN-319: the rescope is on record -- the wire scenarios are blocked on
+/// MAN-90's capture, and dry-run must stay registration-free even when the
+/// registration phase exists.
+#[test]
+fn man319_decision_record_rescopes_the_wire_scenarios_on_man90() {
+    let record = doc("docs/DECISIONS/2026-10-19-man319-uplink-registration-exchange.md");
+    let text = squash_whitespace(&record);
+    assert!(
+        text.contains("no Aggregator→RBN capture exists"),
+        "decision record does not name MAN-90's missing capture as the block"
+    );
+    assert!(
+        text.contains("must not perform registration while dry_run is on"),
+        "decision record does not bind the future registration phase to dry-run"
+    );
+}
+
+/// MAN-319: the four new claims sit in MAN-90's table, all still open.
+#[test]
+fn man90_claims_table_carries_the_man319_claims() {
+    let decision = doc(MAN90_DECISION);
+    for id in ["C8", "C9", "C10", "C11"] {
+        let row = decision
+            .lines()
+            .find(|l| l.contains(&format!("| {id} |")))
+            .unwrap_or_else(|| panic!("decision record has no {id} row"));
+        assert!(
+            row.trim_end().ends_with("| open |"),
+            "{id} row is not open: {row}"
+        );
+    }
+}
+
 /// MAN-90: every relative link in the two records resolves.
 #[test]
 fn man90_records_relative_links_resolve() {
@@ -2550,6 +2629,21 @@ fn spot_schema_documents_uppercased_station_identity() {
             "SPOT-SCHEMA.md {field} still promises to preserve config casing"
         );
     }
+}
+
+#[test]
+fn digital_window_scaffold_states_the_default_and_restart_opt_out() {
+    let scaffold = doc("crates/manta-cli/src/config_init.toml");
+    assert!(scaffold.contains(
+        "# Skip the common HF FT8, FT4, WSPR and JS8 windows when starting CW tracks.\n\
+         # Set false to include these windows. Restart required.\n\
+         #digital_window_filter = true"
+    ));
+    assert!(scaffold_settings()
+        .iter()
+        .any(|(table, key, value)| table == "detector"
+            && key == "digital_window_filter"
+            && value == "true"));
 }
 
 /// Every `#key = value` line of the `manta config init` scaffold, as

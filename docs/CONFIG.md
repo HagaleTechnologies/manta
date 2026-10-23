@@ -160,7 +160,10 @@ the config for both. The table needs `station_callsign`.
 ## [[rbn_uplink]]
 
 One block per upstream collector. A block needs a `[server]` table, and the
-environment cannot set these keys. Only `run` logs in; `doctor` opens and
+environment cannot set these keys. Going live (`dry_run = false`) also needs
+`[server].operator_grid` set to a 6-character Maidenhead locator (e.g.
+`"FN03ab"`); `config check` refuses a live block without one (MAN-319). Only
+`run` logs in; `doctor` opens and
 immediately closes one TCP connection to each enabled target, sending
 nothing, and flags an example `login_callsign`.
 
@@ -170,7 +173,7 @@ nothing, and flags an example `login_callsign`.
 | `target_host` | none; example `"<collector-host>"`; required | live: `run` with `[server]` | The collector's host name. `config check` rejects the `<...>` placeholder. |
 | `target_port` | none; example `7000`; required | live: `run` with `[server]` | The collector's port. |
 | `login_callsign` | none; example `"N0CALL"`; unset logs in as `station_callsign` | live: `run` with `[server]` | Callsign sent at login. `run` and `config check` reject `N0CALL`. |
-| `dry_run` | `true` | live: `run` with `[server]`; reloads on SIGHUP | `true` connects and logs in but sends no spots. See [RUNBOOKS/uplink-health.md](RUNBOOKS/uplink-health.md). |
+| `dry_run` | `true` | live: `run` with `[server]`; reloads on SIGHUP | `true` connects and logs in but sends no spots. `false` (going live) needs `[server].operator_grid` set to a 6-character Maidenhead locator (MAN-319); a SIGHUP reload goes live only if the daemon started with one, since `[server]` needs a restart. See [RUNBOOKS/uplink-health.md](RUNBOOKS/uplink-health.md). |
 | `spot_types` | `"cq_beacon"` | live: `run` with `[server]` | `"cq_beacon"` sends CQ and beacon spots only, as RBN requires; `"all"` sends every spot. Telnet and JSON still carry every spot. |
 | `max_spots_per_minute` | `600` | live: `run` with `[server]` | Max spots written to this target per 60 s window (the window resets at the first spot after it elapses); further spots are counted in `manta_uplink_ceiling_suppressed_total` and skipped, and the connection stays up. `0` disables the ceiling. Needs a restart; SIGHUP reloads only `dry_run`. |
 
@@ -444,8 +447,53 @@ milliseconds, 0 to 3600000.
 | `crash_filter` | `"full"` | live | What a static crash (a band-wide lift of 3 dB or more on at least three quarters of the passband's channels for 8 ms or more) does. `"full"`: no track starts on it, and running tracks do not decode it. `"starts-only"`: no track starts on it, but running tracks decode it as received. `"off"`: no filtering. Crashes are counted in `manta_static_crashes_total` whatever the value. Inactive when the source passband holds fewer than 96 channels (rig audio; captures of 6 kHz or less). Needs a restart. See [SPEC §2.7](SPEC-decode-core.md#27-band-wide-static-crash-detection-man-312) and [MAN-312](DECISIONS/2026-10-13-man312-static-crash-filter.md). |
 | `rtty_filter` | `true` | live | Recognise RTTY (two-tone FSK) signals and start no CW track on them or their keying sidebands; `false` restores the previous behaviour. See [SPEC §2.6](SPEC-decode-core.md#26-two-tone-fsk-rtty-recognition) and [MAN-314](DECISIONS/2026-10-11-man314-rtty-recognition.md). |
 | `rtty_dwell_ms` | `20000.0` | live | How long an FSK signal must last before it is marked as RTTY; 1000 to 3600000 (1 h), counted in whole 1000 ms detector blocks. |
+| `digital_window_filter` | `true` | live | Skip the common HF FT8, FT4, WSPR and JS8 windows when starting CW tracks. Set `false` to include them. Applies to file decoding and every service input. Restart required. |
 | `non_cw_filter` | `true` | live | A new track is decoded only once it shows CW keying. Noise-like wideband data and swept carriers start no CW track and strong SSB voice starts far fewer (7 against 81 at +30 dB with the testkit voice, none spotted; zero is MAN-372), and a track whose signal stops keying closes after `unkeyed_close_ms`. `false` restores the pre-MAN-313 behaviour. See [SPEC §2.8](SPEC-decode-core.md#28-non-cw-rejection-man-313) and [MAN-313](DECISIONS/2026-10-13-man313-non-cw-rejection.md). Restart required (every `[detector]` key is). |
 | `unkeyed_close_ms` | `10000.0` | live | With `non_cw_filter` on, two limits: how long a qualified track may stay key-down with no keying, no decoded character and no callsign read before it closes; and how long a new track may take to show CW keying. Range 1000 to 3600000 (1 h). |
+
+### Digital-mode windows
+
+`digital_window_filter` defaults to `true`, including in existing files that
+omit the key. To include CW signals in these windows, set a boolean:
+
+```toml
+[detector]
+digital_window_filter = false
+```
+
+The environment override is `MANTA_DETECTOR_DIGITAL_WINDOW_FILTER=false`.
+The quoted TOML string `"false"` is invalid. Restart the process after a change.
+Opting in enables CW decoding there; it does not decode digital protocols or
+disable other signal filters.
+
+Each window starts at the USB dial below and ends 3 kHz above it. All values
+are in kHz; `-` means no entry. Overlapping windows act as their union.
+
+| Band | FT8 | FT4 | WSPR | JS8 |
+|---|---:|---:|---:|---:|
+| 160 m | 1840 | - | 1836.6 | 1842 |
+| 80 m | 3573 | 3575 | 3568.6 | 3578 |
+| 60 m | 5357 | 5357 | - | - |
+| 40 m | 7074 | 7047.5 | 7038.6 | 7078 |
+| 30 m | 10136 | 10140 | 10138.7 | 10130 |
+| 20 m | 14074 | 14080 | 14095.6 | 14078 |
+| 17 m | 18100 | 18104 | 18104.6 | 18104 |
+| 15 m | 21074 | 21140 | 21094.6 | 21078 |
+| 12 m | 24915 | 24919 | 24924.6 | 24922 |
+| 10 m | 28074 | 28180 | 28124.6 | 28078 |
+
+Membership is half-open, `[dial_hz, dial_hz + 3000)`, evaluated at each
+channel's source-reported RF center before frequency correction. Thus
+14074.5 kHz is excluded, while 14077 kHz is outside the isolated FT8 window.
+An endpoint can still lie in another mode's overlapping window. Boundaries
+follow the channel grid, normally 93.75 Hz. This is a track-start restriction;
+leakage near an edge can reach an allowed channel, and an existing track can
+drift across an edge without being closed.
+
+The table covers common HF defaults, including 60 m. It excludes regional
+and DXpedition alternatives and VHF/UHF. It makes no statement about transmit
+permissions. See the [MAN-311 decision](DECISIONS/2026-10-19-man311-digital-window-exclusions.md)
+for pinned frequency sources and verification.
 
 ## [decode]
 

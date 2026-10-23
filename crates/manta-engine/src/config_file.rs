@@ -22,7 +22,8 @@
 //! `unkeyed_close_ms` (MAN-313, SPEC §2.8; the timeout must be at least
 //! 1000 ms), plus `reacquire_ms` (MAN-108, SPEC §2.4: how long a decoded
 //! track stays DORMANT after `hang_ms`; 0 closes at `hang_ms` as before
-//! MAN-108). Every key is an `Option`
+//! MAN-108), plus `digital_window_filter` (MAN-311, common HF digital windows).
+//! Every key is an `Option`
 //! overlaid on `DetectorConfig::default()`, so an absent key keeps the exact
 //! default hop count instead of round-tripping it through milliseconds.
 //! Millisecond keys convert with `manta_decode::ms_to_hops`, SPEC §1.1's
@@ -72,6 +73,7 @@ pub struct DetectorConfigToml {
     pub rtty_filter: Option<bool>,
     pub rtty_dwell_ms: Option<f64>,
     pub non_cw_filter: Option<bool>,
+    pub digital_window_filter: Option<bool>,
     pub unkeyed_close_ms: Option<f64>,
     /// MAN-108 (SPEC §2.4): DORMANT window after `hang_ms`; 0 disables it.
     pub reacquire_ms: Option<f64>,
@@ -107,6 +109,9 @@ impl DetectorConfigToml {
             rtty_filter: self.rtty_filter.unwrap_or(d.rtty_filter),
             rtty_dwell_hops: rtty_dwell(self.rtty_dwell_ms, d.rtty_dwell_hops)?,
             non_cw_filter: self.non_cw_filter.unwrap_or(d.non_cw_filter),
+            digital_window_filter: self
+                .digital_window_filter
+                .unwrap_or(d.digital_window_filter),
             unkeyed_close_hops: unkeyed_close(self.unkeyed_close_ms, d.unkeyed_close_hops)?,
             reacquire_hops: hops("reacquire_ms", self.reacquire_ms, d.reacquire_hops, false)?,
             // MAN-273: source-derived (`IqSource::analytic_guard_hz`), not
@@ -266,6 +271,33 @@ mod tests {
         assert_eq!(cfg.silent_respawn_cooldown_hops, 11250);
         assert_eq!(cfg.rtty_dwell_hops, 7500);
         assert_eq!(cfg.unkeyed_close_hops, 3750);
+    }
+
+    #[test]
+    fn digital_window_config_defaults_and_boolean_values() {
+        assert!(parse("").unwrap().digital_window_filter);
+        assert!(
+            parse("digital_window_filter = true")
+                .unwrap()
+                .digital_window_filter
+        );
+        let off = parse("digital_window_filter = false").unwrap();
+        assert_eq!(
+            off,
+            DetectorConfig {
+                digital_window_filter: false,
+                ..DetectorConfig::default()
+            }
+        );
+    }
+
+    #[test]
+    fn digital_window_config_rejects_wrong_types() {
+        for value in ["\"false\"", "0", "[]"] {
+            let e = err(&format!("digital_window_filter = {value}"));
+            assert!(e.contains("digital_window_filter"), "{e}");
+            assert!(e.contains("expected a boolean"), "{e}");
+        }
     }
 
     #[test]
