@@ -24,7 +24,7 @@ input (malformed WAV/IQ files, malformed telnet/JSON client input, hostile
 network peers on the SDR inputs, the `[rbn_compare]` feed or the plain-HTTP
 cty.dat/MASTER.SCP refresh), and dependency vulnerabilities affecting this
 project's usage. Recorded threat models:
-`docs/DECISIONS/2026-09-02-man23-threat-model.md` (HPSDR input; telnet,
-JSON/WebSocket and metrics servers; RBN uplink) and
+`docs/DECISIONS/2026-09-02-man23-threat-model.md` (HPSDR Protocol 1 input;
+telnet, JSON/WebSocket and metrics servers; RBN uplink) and
 `docs/DECISIONS/2026-10-17-man275-kiwi-threat-model.md` (KiwiSDR input).
 Network exposure is covered in `docs/RUNBOOKS/network-exposure.md`.
