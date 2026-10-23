@@ -463,8 +463,10 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 open: Box::new(move || {
                     if let Some(member) = grouped {
                         let source = member.open()?;
+                        // A member claimed after its siblings has still been
+                        // acquiring since the shared generation started.
                         if let Ok(mut at) = opened_at.lock() {
-                            at[index] = Some(Instant::now());
+                            at[index] = Some(source.acquired_at());
                         }
                         if let Ok(mut slot) = input_counters.lock() {
                             slot[index] = source.input_health();

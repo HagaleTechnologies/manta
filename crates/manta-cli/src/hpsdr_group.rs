@@ -352,6 +352,7 @@ impl Member {
                 group: self.group,
                 index: self.index,
                 metadata,
+                acquired_at: generation.started_at,
                 boundary: generation.started_at,
                 samples: 0,
                 current: Some((generation, source)),
@@ -368,6 +369,10 @@ pub(crate) struct GroupSource {
     index: usize,
     metadata: Metadata,
     current: Option<(Arc<Generation>, SendSource)>,
+    /// The shared generation's acquisition start at adoption: every member
+    /// of one radio has been buffering samples since this instant, however
+    /// late its own thread claimed them.
+    acquired_at: Instant,
     boundary: Instant,
     samples: u64,
     gap: Option<u64>,
@@ -377,6 +382,12 @@ pub(crate) struct GroupSource {
 impl GroupSource {
     pub(crate) fn input_health(&self) -> Option<Arc<InputHealthTotals>> {
         self.group.totals[self.index].get().cloned()
+    }
+    /// When this member's first sample was acquired: the shared
+    /// generation's start, not when this member's thread claimed it, so
+    /// siblings opened on one radio share one live clock origin.
+    pub(crate) fn acquired_at(&self) -> Instant {
+        self.acquired_at
     }
 }
 impl IqSource for GroupSource {
@@ -1103,6 +1114,31 @@ mod tests {
             sources[0].boundary,
             current(&f.group).started_at + Duration::from_secs_f64(4.0 / 48000.0)
         );
+    }
+
+    #[test]
+    fn a_member_claimed_late_reports_the_shared_acquisition_start() {
+        // A sibling whose thread claims its slot after the generation
+        // started has been buffering since that start; anchoring its live
+        // clock at the claim would stamp every spot late by the delay.
+        let f = fixture();
+        let first = Member {
+            group: f.group.clone(),
+            index: 0,
+        }
+        .open()
+        .unwrap();
+        let started = current(&f.group).started_at;
+        *f.time.lock().unwrap() += Duration::from_secs(2);
+        let late = Member {
+            group: f.group.clone(),
+            index: 1,
+        }
+        .open()
+        .unwrap();
+        assert_eq!(f.opens.load(Ordering::Relaxed), 1);
+        assert_eq!(first.acquired_at(), started);
+        assert_eq!(late.acquired_at(), started);
     }
 
     #[test]
