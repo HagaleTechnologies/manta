@@ -628,6 +628,7 @@ fn input_summary(file: &crate::config::InputFile) -> String {
             protocol,
             freq_hz,
             rate_hz,
+            receivers,
         }) => {
             // MAN-305 §3: the protocol as the operator writes it.
             let protocol = match protocol {
@@ -635,9 +636,10 @@ fn input_summary(file: &crate::config::InputFile) -> String {
                 manta_input::hpsdr::HpsdrProtocol::One => "1",
                 manta_input::hpsdr::HpsdrProtocol::Two => "2",
             };
+            let declared = receivers.map_or(String::new(), |n| format!(" receivers={n}"));
             let mut line = format!(
                 "input: type=hpsdr host={} port={port} protocol={protocol} freq_hz={freq_hz} \
-                 rate_hz={rate_hz}",
+                 rate_hz={rate_hz}{declared}",
                 host.as_deref().unwrap_or("discovery")
             );
             if let Some(mac) = mac {
@@ -684,6 +686,14 @@ fn input_summary(file: &crate::config::InputFile) -> String {
 /// opens IQ WAVs. MAN-90: an enabled uplink is experimental.
 fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> Vec<String> {
     let mut notes = Vec::new();
+    for group in crate::config::hpsdr_allocations(&loaded.inputs) {
+        if group.members.len() > 1 {
+            notes.push(format!(
+                "note: HPSDR receiver capacity at {} is checked when manta run starts",
+                group.endpoint()
+            ));
+        }
+    }
     match source {
         ConfigSource::None => notes.push(format!(
             "note: no config file given (--config, MANTA_CONFIG) or found ({DEFAULT_PATH} in \
@@ -1790,6 +1800,7 @@ mod tests {
         ("input", "bands"),
         ("input", "driver"),
         ("input", "rate_hz"),
+        ("input", "receivers"),
         ("input", "gain_db"),
         ("input", "group"),
         ("input", "ssrc"),

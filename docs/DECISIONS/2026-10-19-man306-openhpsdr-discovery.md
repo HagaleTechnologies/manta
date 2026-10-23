@@ -21,9 +21,11 @@ both protocols keeps its P2 answer; `protocol = "1"` or an explicit host can
 force the P1 path.
 
 All five source commands use the same opener. Reconnect invokes discovery
-again, so a pinned MAC follows an address change. Two configured inputs with
-the same MAC or two unqualified discovery inputs are refused, like duplicate
-host inputs. Several receivers on one radio remain MAN-307's work.
+again, so a pinned MAC follows an address change. With MAN-307 merged,
+hostless inputs with the same MAC (or none) share one radio's receivers, as
+inputs with the same host do; a radio named two ways (a host and a MAC, or a
+pinned and an unqualified hostless input) is refused when the run resolves
+both to one address. A shared hostless radio rediscovers on reopen.
 
 ## Discovery
 

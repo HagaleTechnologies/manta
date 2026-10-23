@@ -233,6 +233,7 @@ async fn operator_get_request_sees_input_packet_loss_counters() {
     metrics.set_input_health(
         "hpsdr",
         InputHealth {
+            queue_dropped_samples: 1200,
             dropped_packets: 9,
             gaps_detected: 2,
             malformed_packets: 4,
@@ -287,6 +288,10 @@ async fn operator_get_request_sees_input_packet_loss_counters() {
     let mut body = String::new();
     reader.read_to_string(&mut body).await.unwrap();
 
+    assert!(
+        body.contains(r#"manta_input_queue_dropped_samples_total{source="hpsdr"} 1200"#),
+        "{body}"
+    );
     assert!(
         body.contains(r#"manta_input_dropped_packets_total{source="hpsdr"} 9"#),
         "body: {body}"

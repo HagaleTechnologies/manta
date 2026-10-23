@@ -321,6 +321,7 @@ impl InputKind {
                 "protocol",
                 "freq_hz",
                 "rate_hz",
+                "receivers",
                 "bands",
                 "tuning_range_hz",
             ],
@@ -360,6 +361,7 @@ struct InputToml {
     // i64, not u32, so a negative or too-large value gets the range message
     // rather than serde's.
     ssrc: Option<i64>,
+    receivers: Option<toml::Value>,
     interface: Option<String>,
     // Shared keys, valid with any (or no) type.
     freq_correction_ppm: Option<f64>,
@@ -457,6 +459,7 @@ pub(crate) enum SourceFromFile {
         gain_db: Option<f64>,
     },
     Hpsdr {
+        receivers: Option<usize>,
         host: Option<String>,
         mac: Option<String>,
         port: u16,
@@ -960,7 +963,130 @@ fn take_input_array(
     }
     check_stream_names(&inputs, origin)?;
     check_input_entries(&inputs, origin)?;
+    validate_hpsdr_allocations(&inputs, origin)?;
     Ok(inputs)
+}
+
+/// Ordered, offline allocation shared by config validation and the daemon.
+#[derive(Debug, Clone)]
+pub(crate) struct HpsdrAllocation {
+    /// MAN-306: `None` discovers the radio at open, selected by `mac`
+    /// when set (normalized `AA:BB:CC:DD:EE:FF`).
+    pub host: Option<String>,
+    pub mac: Option<String>,
+    pub port: u16,
+    pub rate: f64,
+    pub receivers: Option<usize>,
+    /// MAN-305: the radio's protocol, taken from the first member. A
+    /// lone input may resolve `auto` by discovery at open; several
+    /// receivers on one radio speak protocol 1 in manta.
+    pub protocol: manta_input::hpsdr::HpsdrProtocol,
+    pub members: Vec<usize>,
+    pub frequencies: Vec<f64>,
+}
+
+impl HpsdrAllocation {
+    /// The radio as the operator configured it, for messages: `host:port`,
+    /// or how discovery selects it (MAN-306).
+    pub fn endpoint(&self) -> String {
+        match (&self.host, &self.mac) {
+            (Some(host), _) => format!("{host}:{}", self.port),
+            (None, Some(mac)) => format!("MAC {mac} (discovery, port {})", self.port),
+            (None, None) => format!("discovery (port {})", self.port),
+        }
+    }
+}
+
+pub(crate) fn hpsdr_allocations(inputs: &[NamedInput]) -> Vec<HpsdrAllocation> {
+    let mut groups: Vec<HpsdrAllocation> = Vec::new();
+    for (index, input) in inputs.iter().enumerate() {
+        if let Some(SourceFromFile::Hpsdr {
+            host,
+            mac,
+            port,
+            protocol,
+            rate_hz,
+            freq_hz,
+            receivers,
+        }) = &input.input.source
+        {
+            // MAN-306 x MAN-307: entries naming one radio the same way share
+            // it -- one host (case-insensitive), or hostless entries with
+            // the same MAC selector (or none). Different spellings of one
+            // radio are caught when the run resolves them to one address.
+            let same_radio = |g: &HpsdrAllocation| {
+                g.port == *port
+                    && match (&g.host, host) {
+                        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                        (None, None) => g.mac == *mac,
+                        _ => false,
+                    }
+            };
+            if let Some(group) = groups.iter_mut().find(|g| same_radio(g)) {
+                group.members.push(index);
+                group.frequencies.push(*freq_hz);
+            } else {
+                groups.push(HpsdrAllocation {
+                    host: host.clone(),
+                    mac: mac.clone(),
+                    port: *port,
+                    rate: *rate_hz,
+                    receivers: *receivers,
+                    protocol: *protocol,
+                    members: vec![index],
+                    frequencies: vec![*freq_hz],
+                });
+            }
+        }
+    }
+    groups
+}
+
+fn validate_hpsdr_allocations(inputs: &[NamedInput], origin: &str) -> Result<()> {
+    for group in hpsdr_allocations(inputs) {
+        let first = &inputs[group.members[0]].name;
+        if group.members.len() > 1
+            && matches!(group.protocol, manta_input::hpsdr::HpsdrProtocol::Two)
+        {
+            bail!("{origin}: [[input]] \"{first}\": HPSDR protocol 2 opens one receiver per radio in manta; give each band its own receiver with protocol \"1\"");
+        }
+        for &index in group.members.iter().skip(1) {
+            let name = &inputs[index].name;
+            if let Some(SourceFromFile::Hpsdr {
+                rate_hz,
+                receivers,
+                protocol,
+                ..
+            }) = &inputs[index].input.source
+            {
+                if receivers.is_some() {
+                    bail!("{origin}: [[input]] \"{name}\": receivers belongs on the first input for this HPSDR radio (\"{first}\")");
+                }
+                if *protocol != group.protocol {
+                    bail!("{origin}: [[input]] \"{name}\": protocol must match the HPSDR radio's other receivers (set by input \"{first}\")");
+                }
+                if *rate_hz != group.rate {
+                    bail!("{origin}: [[input]] \"{name}\": rate_hz must match the HPSDR radio's other receivers ({} Hz, set by input \"{first}\")", group.rate);
+                }
+            }
+        }
+        if let Some(capacity) = group.receivers {
+            if group.members.len() > capacity {
+                bail!("{origin}: [[input]] \"{first}\": HPSDR radio at {} declares {capacity} receivers; {} bands are configured", group.endpoint(), group.members.len());
+            }
+        }
+        manta_input::HpsdrConfig {
+            // Offline: validation never reads the host.
+            host: group.host.clone().unwrap_or_default(),
+            port: group.port,
+            ddc_count: group.members.len(),
+            sample_rate_hz: group.rate,
+            center_freq_hz: group.frequencies.clone(),
+        }
+        .validate()
+        .map_err(|e| anyhow!("{origin}: [[input]] \"{first}\": {e}"))?;
+    }
+    Ok(())
 }
 
 /// MAN-310: one config entry's inputs: the entry itself, or with `bands`
@@ -1039,8 +1165,9 @@ fn take_entry(
     if n > 1 && matches!(kind, InputKind::Hpsdr | InputKind::Soapy) {
         let (why, own) = match kind {
             InputKind::Hpsdr => (
-                "several receivers on one HPSDR radio are not supported yet",
-                "radio",
+                "bands opens one stream on an HPSDR radio",
+                "[[input]] on that radio (several receivers on one radio are one \
+                 entry each)",
             ),
             _ => ("manta opens one stream from a SoapySDR device", "device"),
         };
@@ -1206,36 +1333,6 @@ fn check_input_entries(inputs: &[NamedInput], origin: &str) -> Result<()> {
                 ),
                 Some(_) => {}
             },
-            Some(SourceFromFile::Hpsdr {
-                host, mac, port, ..
-            }) => {
-                let earlier = inputs[..i].iter().find(|o| {
-                    matches!(&o.input.source, Some(SourceFromFile::Hpsdr { host: h, mac: m, port: p, .. })
-                        if p == port && match (host, h) {
-                            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-                            // Two hostless entries select from the same LAN,
-                            // so an unqualified one beside any other can name
-                            // the same radio: both must pin distinct MACs.
-                            (None, None) => match (mac.as_deref(), m.as_deref()) {
-                                (Some(a), Some(b)) => a == b,
-                                _ => true,
-                            },
-                            _ => false,
-                        })
-                });
-                if let Some(earlier) = earlier {
-                    let identity = host
-                        .as_deref()
-                        .or(mac.as_deref())
-                        .unwrap_or("discovery (no input.host or input.mac)");
-                    bail!(
-                        "{origin}: [[input]] {name}: the HPSDR radio at {identity}:{port} is \
-                         already input {}; several receivers on one HPSDR radio are not \
-                         supported yet (MAN-307)",
-                        crate::fmt::quoted(&earlier.name)
-                    );
-                }
-            }
             Some(SourceFromFile::Audio { .. }) if n.input.shared.center_freq_hz.is_none() => {
                 bail!(
                     "{origin}: [[input]] {name}: type = \"audio\" needs center_freq_hz when \
@@ -1331,6 +1428,16 @@ fn validate_input(
             },
         },
         InputKind::Hpsdr => SourceFromFile::Hpsdr {
+            receivers: t
+                .receivers
+                .as_ref()
+                .map(|v| {
+                    v.as_integer()
+                        .filter(|n| (1..=255).contains(n))
+                        .map(|n| n as usize)
+                        .ok_or_else(|| "receivers must be an integer from 1 to 255".to_string())
+                })
+                .transpose()?,
             port: port(crate::HPSDR_CONTROL_PORT)?,
             host: {
                 if t.host.is_some() && t.mac.is_some() {
@@ -1368,7 +1475,8 @@ fn validate_input(
 /// D5: every source key set belongs to `input.type`, and a source key
 /// needs a type.
 fn check_input_keys(t: &InputToml) -> std::result::Result<(), String> {
-    let set: [(&str, bool); 19] = [
+    let set: [(&str, bool); 20] = [
+        ("receivers", t.receivers.is_some()),
         ("device", t.device.is_some()),
         ("path", t.path.is_some()),
         ("iq", t.iq.is_some()),
@@ -1762,38 +1870,38 @@ mod tests {
     }
 
     #[test]
-    fn hpsdr_discovery_duplicate_hostless_inputs_are_refused() {
+    fn hpsdr_hostless_inputs_with_one_selector_share_one_radio() {
+        // MAN-306 x MAN-307: hostless entries with the same MAC selector (or
+        // none) name one discovered radio, so they share its receivers.
         for selector in ["", "mac = \"aabbccddeeff\"\n"] {
             let body = ["a", "b"].map(|name| format!("[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n{selector}")).join("\n");
-            assert!(err_of(&body).contains("several receivers on one HPSDR radio"));
+            let loaded = load_file(&body).unwrap_or_else(|e| panic!("{body} -> {e:#}"));
+            let groups = hpsdr_allocations(&loaded.inputs);
+            assert_eq!(groups.len(), 1, "{body}");
+            assert_eq!(groups[0].members, vec![0, 1]);
+            assert_eq!(groups[0].host, None);
         }
     }
 
     #[test]
-    fn hpsdr_unqualified_hostless_input_beside_a_hostless_peer_is_refused() {
+    fn hpsdr_hostless_inputs_with_different_selectors_are_separate_radios() {
         let entry = |name: &str, selector: &str| {
             format!("[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n{selector}")
         };
-        // An unqualified hostless entry beside a pinned one can select the
-        // same radio, in either order.
+        // Distinct MACs, or a pinned entry beside an unqualified one: two
+        // radios offline. The run refuses the pair if both resolve to one
+        // address.
         for (first, second) in [
+            ("mac = \"aabbccddeeff\"\n", "mac = \"001122334455\"\n"),
             ("mac = \"aabbccddeeff\"\n", ""),
             ("", "mac = \"aabbccddeeff\"\n"),
+            ("host = \"192.0.2.10\"\n", ""),
         ] {
             let body = format!("{}\n{}", entry("a", first), entry("b", second));
-            let err = err_of(&body);
-            assert!(
-                err.contains("several receivers on one HPSDR radio"),
-                "{body} -> {err}"
-            );
+            let loaded = load_file(&body).unwrap_or_else(|e| panic!("{body} -> {e:#}"));
+            let groups = hpsdr_allocations(&loaded.inputs);
+            assert_eq!(groups.len(), 2, "{body}");
         }
-        // Two hostless entries pinned to distinct MACs name two radios.
-        let body = format!(
-            "{}\n{}",
-            entry("a", "mac = \"aabbccddeeff\"\n"),
-            entry("b", "mac = \"001122334455\"\n")
-        );
-        load_file(&body).unwrap_or_else(|e| panic!("{body} -> {e:#}"));
     }
 
     const SERVER: &str = "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
@@ -1969,32 +2077,112 @@ mod tests {
         .is_ok());
     }
 
+    fn hpsdr_entry(name: &str, host: &str, extra: &str) -> String {
+        format!("[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nhost = \"{host}\"\nrate_hz = 192000.0\nfreq_hz = 14030000.0\n{extra}")
+    }
+
     #[test]
-    fn one_hpsdr_radio_is_at_most_one_input() {
-        let hpsdr = |name: &str, host: &str| {
-            format!(
-                "[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nhost = \"{host}\"\nrate_hz = 192000.0\nfreq_hz = \
-                 14030000.0\n"
-            )
-        };
-        let err = err_of(&format!(
+    fn hpsdr_allocation_is_ordered_and_offline() {
+        let text = format!(
+            "{}{}{}{}{}",
+            hpsdr_entry("a", "RADIO.invalid", "receivers = 10\n"),
+            hpsdr_entry("other", "another.invalid", ""),
+            hpsdr_entry("b", "radio.invalid", "port = 1024\n"),
+            hpsdr_entry("c", "radio.invalid", ""),
+            hpsdr_entry("d", "radio.invalid", "")
+        );
+        let loaded = load_file(&text).unwrap();
+        let groups = hpsdr_allocations(&loaded.inputs);
+        assert_eq!(groups[0].members, vec![0, 2, 3, 4]);
+        assert_eq!(groups[0].receivers, Some(10));
+        assert_eq!(groups[1].members, vec![1]);
+        assert!(load_file(&format!(
             "{}{}",
-            hpsdr("a", "192.168.1.40"),
-            hpsdr("b", "192.168.1.40")
-        ));
+            hpsdr_entry("a", "radio", ""),
+            hpsdr_entry("b", "radio", "port = 1025\n")
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn hpsdr_groups_share_one_protocol_and_refuse_protocol_2() {
+        // A protocol-2 radio opens one receiver per radio in manta, so a
+        // shared radio must speak protocol 1.
+        let err = err_of(
+            &(hpsdr_entry("a", "radio", "protocol = \"2\"\n") + &hpsdr_entry("b", "radio", "")),
+        );
         assert!(
             err.contains(
-                ": [[input]] \"b\": the HPSDR radio at 192.168.1.40:1024 is already input \"a\"; \
-                 several receivers on one HPSDR radio are not supported yet"
+                "HPSDR protocol 2 opens one receiver per radio in manta; give each band its own \
+                 receiver with protocol \"1\""
             ),
             "{err}"
         );
-        assert!(load_file(&format!(
-            "{}{}",
-            hpsdr("a", "192.168.1.40"),
-            hpsdr("b", "192.168.1.41")
-        ))
+        // Members of one radio must agree on the protocol.
+        let err = err_of(
+            &(hpsdr_entry("a", "radio", "") + &hpsdr_entry("b", "radio", "protocol = \"2\"\n")),
+        );
+        assert!(
+            err.contains(
+                "protocol must match the HPSDR radio's other receivers (set by input \"a\")"
+            ),
+            "{err}"
+        );
+        // A lone input keeps the protocol it configured, including 2.
+        assert!(load_file(&hpsdr_entry("a", "radio", "protocol = \"2\"\n")).is_ok());
+        // Protocol 1 on every member of a shared radio is accepted.
+        assert!(load_file(
+            &(hpsdr_entry("a", "radio", "protocol = \"1\"\n")
+                + &hpsdr_entry("b", "radio", "protocol = \"1\"\n"))
+        )
         .is_ok());
+    }
+
+    #[test]
+    fn hpsdr_declarations_and_active_limits_are_checked() {
+        for value in ["0", "-1", "1.5", "256", "\"four\""] {
+            let err = err_of(&hpsdr_entry(
+                "a",
+                "radio",
+                &format!("receivers = {value}\n"),
+            ));
+            assert!(
+                err.contains("receivers must be an integer from 1 to 255"),
+                "{err}"
+            );
+        }
+        let first = hpsdr_entry("a", "radio", "receivers = 4\n");
+        let rest: String = (1..6)
+            .map(|i| hpsdr_entry(&format!("b{i}"), "radio", ""))
+            .collect();
+        assert!(err_of(&(first + &rest)).contains("declares 4 receivers; 6 bands are configured"));
+        let err = err_of(
+            &(hpsdr_entry("a", "radio", "") + &hpsdr_entry("b", "radio", "receivers = 4\n")),
+        );
+        assert!(
+            err.contains("receivers belongs on the first input for this HPSDR radio (\"a\")"),
+            "{err}"
+        );
+        let err = err_of(
+            &(hpsdr_entry("a", "radio", "")
+                + &hpsdr_entry("b", "radio", "").replace("192000.0", "96000.0")),
+        );
+        assert!(err.contains("rate_hz must match the HPSDR radio's other receivers (192000 Hz, set by input \"a\")"), "{err}");
+        let nine: String = (0..9)
+            .map(|i| hpsdr_entry(&format!("b{i}"), "radio", ""))
+            .collect();
+        assert!(load_file(&nine).is_err());
+        for header in ["[input]", "[[input]]"] {
+            let text = hpsdr_entry("a", "radio", "receivers = 4\n").replace("[[input]]", header);
+            assert!(load_file(&text).is_ok());
+        }
+        let err = err_of(
+            "[input]\ntype = \"kiwi\"\nhost = \"kiwi\"\nfreq_hz = 7030000.0\nreceivers = 4\n",
+        );
+        assert!(
+            err.contains("input.receivers does not apply to input.type = \"kiwi\""),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2668,6 +2856,7 @@ mod tests {
                 protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
                 freq_hz: 7_030_000.0,
                 rate_hz: 192_000.0,
+                receivers: None,
             })
         );
     }
