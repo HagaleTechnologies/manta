@@ -77,7 +77,7 @@ tables rather than appending duplicates. Read [KiwiSDR etiquette](kiwisdr.md)
 before using a public receiver.
 
 For a Hermes-Lite 2 or other OpenHPSDR receiver, this is a complete alternative
-minimal config. Replace `N0CALL` and `<your-hpsdr-host>`, choose the actual centre
+minimal config. Replace `N0CALL`, choose the actual centre
 frequency, and use a sample rate the radio supports. This example requests 192 kS/s:
 
 ```toml
@@ -86,12 +86,14 @@ station_callsign = "N0CALL"
 
 [input]
 type = "hpsdr"
-host = "<your-hpsdr-host>"
 freq_hz = 7030000.0
 rate_hz = 192000.0
 ```
 
-It uses the default HPSDR port 1024. Protocol support is implemented, but live
+It uses the default HPSDR port 1024 and discovers the only available radio.
+When several answer, manta lists their addresses, MACs and board types and
+exits. Set `mac = "02:11:22:33:44:55"` in `[input]` with the MAC from
+`manta devices` to select one. Use `host` instead of `mac` to bypass discovery. Protocol support is implemented, but live
 HPSDR hardware validation remains outstanding. Check your edited config:
 
 ```sh
