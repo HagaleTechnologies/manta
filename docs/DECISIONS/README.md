@@ -11,15 +11,12 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
-<<<<<<< HEAD
 | 2026-10-24 | MAN-281 | [MAN-281: `manta status` saturates a spoofed endpoint's json/ws client count](2026-10-24-man281-status-client-count-overflow.md) |
-=======
 | 2026-10-23 | MAN-277 | [MAN-277: `field-node.py sample` rejects a non-finite or out-of-range `--interval-s`](2026-10-23-man277-sample-interval-bound.md) |
 | 2026-10-23 | MAN-266 | [MAN-266: a corrected release tag takes `:latest` beside its rejected leading-zero twin](2026-10-23-man266-corrected-release-latest.md) |
 | 2026-10-23 | MAN-279 | [MAN-279: a planned-restart window counts only when the restart happened](2026-10-23-man279-planned-window-needs-a-restart.md) |
 | 2026-10-23 | MAN-280 | [MAN-280: shadow-compare renders the comparison window in true UTC](2026-10-23-man280-shadow-compare-utc-window.md) |
 | 2026-10-23 | MAN-220 | [MAN-220: the Dependabot diff verifier reads omitted requirement components as Cargo does; a lockfile edge may follow its target's own bump](2026-10-23-man220-dependency-verifier-omitted-components-and-followed-bumps.md) |
->>>>>>> 40d275a475d5ef477c0d661e6bd923da60794e46
 | 2026-10-23 | MAN-179 | [MAN-179: the MAN-166 writeup's 41,174 and 409,675 count different track populations](2026-10-23-man179-man166-track-populations.md) |
 | 2026-10-23 | MAN-195 | [MAN-195: `spectral_beta = 0.0` skips the spectral-reference scan](2026-10-23-man195-spectral-beta-zero-skips-spectral-reference-scan.md) |
 | 2026-10-23 | MAN-158 | [MAN-158: ROADMAP holds gates and pointers; SECURITY.md states the shipped scope](2026-10-23-man158-roadmap-security-scope-refresh.md) |
