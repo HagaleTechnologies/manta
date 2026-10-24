@@ -216,7 +216,8 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `iq` | `false` | live: `type = "file"` | `true` for a two-channel IQ recording. `--source-iq` sets it. |
 | `realtime` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` paces the replay to the recording's own clock, so telnet/JSON clients can watch it. `--realtime` sets it; a live source refuses it. See [DECISIONS/2026-10-10-man269-paced-looping-replay.md](DECISIONS/2026-10-10-man269-paced-looping-replay.md). |
 | `loop` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` replays the file again from the start each time it ends, until stopped; implies `realtime`. `--loop` sets it; a live source refuses it. |
-| `host` | none; example `"<your-receiver-host>"`; required for kiwi and hpsdr | live: `type = "kiwi"` or `"hpsdr"` | Receiver host name. `--kiwi-host` or `--hpsdr-host` overrides it. |
+| `host` | none; example `"<your-receiver-host>"`; required for kiwi; optional for hpsdr | live: `type = "kiwi"` or `"hpsdr"` | Receiver host name. `--kiwi-host` or `--hpsdr-host` overrides it. For hpsdr, set host or mac, or neither to discover the only available radio. An explicit host skips the LAN broadcast, though under `protocol = "auto"` the protocol probe still goes to that host; host and mac together are refused. |
+| `mac` | none; example `"02:11:22:33:44:55"`; unset selects the only discovered radio | live: `type = "hpsdr"` | Pin a radio across address changes. `--hpsdr-mac` or `MANTA_INPUT_MAC` sets it. Accepts colon, dash or bare hexadecimal spelling, case-insensitively; summaries print uppercase colon-separated bytes. Cannot be combined with host. |
 | `port` | `8073`; `1024` for hpsdr; `5004` for ka9q | live: `type = "kiwi"`, `"hpsdr"` or `"ka9q"` | Receiver port, 1 to 65535; for ka9q, the group's RTP data port; for an hpsdr protocol-2 radio, the base of its port map (see [HPSDR protocol 2](#hpsdr-protocol-2)). `--kiwi-port`, `--hpsdr-port` or `--ka9q-port` overrides it. |
 | `protocol` | `"auto"` | live: `type = "hpsdr"` | openHPSDR protocol the radio speaks: `"auto"`, `"1"` or `"2"`; the integers `1` and `2` are accepted too. `"auto"` sends a discovery probe to `host` on every open and uses protocol 2 when the radio answers as protocol 2, protocol 1 otherwise (a warning names the key when the radio does not answer within 1 s). `"1"` (Hermes-Lite 2) and `"2"` (ANAN) skip the probe. `--hpsdr-protocol` or `MANTA_INPUT_PROTOCOL` (read verbatim as a string) overrides it. Any other `type` refuses the key. |
 | `password` | `""` | live: `type = "kiwi"` | KiwiSDR password; empty for a public receiver. `config check` prints only whether it is set. `--kiwi-password` overrides it. |
@@ -240,9 +241,11 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 MAN-305: ANAN-class radios (Hermes, Angelia, Orion, Orion II, Saturn/G2)
 speak openHPSDR protocol 2; Hermes-Lite 2 and older boards speak protocol 1.
 Both use `type = "hpsdr"` and `--hpsdr-*`, chosen by `protocol` above
-(`--hpsdr-protocol auto|1|2`). The probe under `"auto"` goes to the
-configured host only; manta never broadcasts, and `manta devices` does not
-list radios.
+(`--hpsdr-protocol auto|1|2`). The probe under `"auto"` goes to one
+address: the configured host, or, with no host, the radio that LAN discovery
+selected (MAN-306), so a hostless protocol-2 radio streams through this
+driver too. `manta devices` lists the radios that answer discovery, of
+either protocol.
 
 Protocol 2 uses a port map relative to `port` (`1024` by default):
 
@@ -390,8 +393,9 @@ per receiver. Each entry takes the keys above, plus `name`. A one-entry
 - File replay and live receivers do not mix in one run. `replay_epoch` goes
   on the first entry only, and every file entry has the same `realtime` and
   `loop`.
-- HPSDR entries sharing a case-insensitive host and effective port use one
-  radio session, with receivers assigned in file order. Native `rate_hz`
+- HPSDR entries sharing a case-insensitive host and effective port, or
+  hostless entries sharing an `input.mac` (or neither), use one radio
+  session, with receivers assigned in file order. Native `rate_hz`
   and `protocol` must match, and `protocol = "2"` is refused there.
   Capacity is checked at startup, while `config check` remains
   offline. See [the four-band example and diagnostics](GUIDES/multiple-receivers.md#several-bands-on-one-hpsdr-radio).
