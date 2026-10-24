@@ -76,6 +76,9 @@ libc = { workspace = true }
 
 [dev-dependencies]
 coppa-audio = { workspace = true }
+# MAN-120: tests/man120_beacon_fading.rs builds a Watterson-poor scene;
+# `WattersonPreset` lives here and manta-testkit does not re-export it.
+coppa-channel = { workspace = true }
 # MAN-140: tests/ka9q_input.rs's fake radiod sends loopback multicast
 # (IP_MULTICAST_IF 127.0.0.1, TTL 0), which std's UdpSocket cannot set.
 socket2 = { workspace = true }
