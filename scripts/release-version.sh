@@ -139,7 +139,11 @@ cmd_is_newest_stable() {
   # than informative.
   [ -n "$newest" ] || die \
     "no stable release tags found while checking recency for ${version} -- expected at least ${version} itself to be visible after 'git fetch --tags'; refusing to silently decide"
-  if [ "$newest" = "$version" ]; then
+  # Numeric equality, not `=`: `$newest` is the raw triple of the first tag
+  # holding the maximum, and a rejected leading-zero twin (v02.0.0) lists
+  # before its corrected tag (v2.0.0) and ties it, so it stays "02.0.0"
+  # (MAN-266).
+  if ! version_gt "$newest" "$version" && ! version_gt "$version" "$newest"; then
     printf 'true\n'
   else
     printf 'false\n'
