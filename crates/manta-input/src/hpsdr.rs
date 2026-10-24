@@ -65,6 +65,8 @@
 //! time with an actionable error, rather than silently overrunning the
 //! link.
 
+pub mod discovery;
+
 use crate::{InputHealthCounters, IqSource};
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
@@ -74,12 +76,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Metis/Hermes discovery and control port. Spike doc: "standard Metis
-/// broadcast, UDP port 1024" for HL2; Red-Pitaya-family devices are reached
-/// the same way once their IP is known (this driver does not implement the
-/// separate avahi/mDNS discovery path the spike flags for that family —
-/// callers supply the host directly, matching `KiwiIqSource::connect`'s
-/// host/port convention).
+/// Metis/Hermes discovery and control port. [`discovery`] broadcasts on
+/// this port when no host is configured. Explicit hosts bypass discovery.
+/// The separate avahi/mDNS path for Red Pitaya is not implemented.
 pub const CONTROL_PORT: u16 = 1024;
 
 const METIS_HEADER_LEN: usize = 8;
@@ -1065,12 +1064,12 @@ impl HpsdrDevice {
                     started_at,
                 },
                 acquisition_start_offset,
+                retire_on_drop: false,
             })
             .collect())
     }
 }
 
-pub mod discovery;
 pub mod proto2;
 
 pub use discovery::{Discovery, DiscoveryReply};
@@ -1101,7 +1100,19 @@ pub struct OpenedHpsdr {
 /// protocol-2 radio that reports itself busy is refused, since taking it
 /// over needs an explicit `Two`.
 pub fn open_receiver(cfg: &HpsdrConfig, protocol: HpsdrProtocol) -> Result<OpenedHpsdr> {
-    open_receiver_with(cfg, protocol, &discovery::ProbeTiming::default())
+    open_receiver_since(cfg, protocol, Instant::now())
+}
+
+/// [`open_receiver`], with the source's `acquisition_start_offset` measured
+/// from `entered` rather than from this call (MAN-306): a caller that
+/// discovers a hostless radio first passes the instant its open began, so
+/// discovery counts as outage too.
+pub fn open_receiver_since(
+    cfg: &HpsdrConfig,
+    protocol: HpsdrProtocol,
+    entered: Instant,
+) -> Result<OpenedHpsdr> {
+    open_receiver_with(cfg, protocol, &discovery::ProbeTiming::default(), entered)
 }
 
 /// The I/O-free check `protocol`'s own open makes first, without opening
@@ -1121,10 +1132,11 @@ pub(crate) fn open_receiver_with(
     cfg: &HpsdrConfig,
     protocol: HpsdrProtocol,
     timing: &discovery::ProbeTiming,
+    entered: Instant,
 ) -> Result<OpenedHpsdr> {
     // MAN-259: the discovery probe runs inside the reconnect's open call
-    // and streams nothing, so it is outage too.
-    let entered = Instant::now();
+    // and streams nothing, so it is outage too, as is anything the caller
+    // did since `entered` (MAN-306's discovery of a hostless radio).
     let discovery = match protocol {
         HpsdrProtocol::Auto => discovery::probe(&cfg.host, cfg.port, timing)?,
         HpsdrProtocol::One | HpsdrProtocol::Two => Discovery::Skipped,
@@ -1167,9 +1179,16 @@ pub(crate) fn open_receiver_with(
 }
 
 /// Protocol 1's DDC 0, exactly as [`HpsdrDevice::open`] has always opened it.
+///
+/// The lone receiver owns its session, so dropping it retires the session
+/// and stops the radio (as a protocol-2 source's drop does). Otherwise a
+/// reconnect's rediscovery would find the radio still streaming to the
+/// dropped socket and refuse it as in use (MAN-306, PR #359 review).
 fn open_protocol_1(cfg: &HpsdrConfig) -> Result<HpsdrIqSource> {
     let mut sources = HpsdrDevice::open(cfg.clone())?;
-    Ok(sources.remove(0))
+    let mut source = sources.remove(0);
+    source.retire_on_drop = true;
+    Ok(source)
 }
 
 /// One receiver channel (DDC) of an [`HpsdrDevice`] connection, as an
@@ -1192,6 +1211,10 @@ pub struct HpsdrIqSource {
     /// MAN-259: `HpsdrDevice::open`'s runtime up to the start command,
     /// shared by every DDC of the connection.
     acquisition_start_offset: Duration,
+    /// Set only for [`open_receiver`]'s lone protocol-1 receiver, which
+    /// owns its session. A grouped receiver's session is retired by its
+    /// group (MAN-307), never by one member's drop.
+    retire_on_drop: bool,
 }
 
 impl HpsdrIqSource {
@@ -1264,10 +1287,16 @@ impl IqSource for HpsdrIqSource {
 
 impl Drop for HpsdrIqSource {
     fn drop(&mut self) {
-        let mut inner = self.inner.lock().expect("HPSDR pump lock poisoned");
-        inner.active[self.ddc_index] = false;
-        inner.queues[self.ddc_index].clear();
-        inner.queue_gaps[self.ddc_index] = 0;
+        {
+            let mut inner = self.inner.lock().expect("HPSDR pump lock poisoned");
+            inner.active[self.ddc_index] = false;
+            inner.queues[self.ddc_index].clear();
+            inner.queue_gaps[self.ddc_index] = 0;
+        }
+        // After releasing `inner`: `retire` takes the authority lock first.
+        if self.retire_on_drop {
+            self.session.retire();
+        }
     }
 }
 
@@ -2530,7 +2559,7 @@ mod open_receiver_tests {
     }
 
     fn open(fake: &FakeP2Radio, protocol: HpsdrProtocol, timing: &ProbeTiming) -> OpenedHpsdr {
-        open_receiver_with(&fake.cfg(), protocol, timing).expect("open_receiver")
+        open_receiver_with(&fake.cfg(), protocol, timing, Instant::now()).expect("open_receiver")
     }
 
     /// Wait (up to 1 s) until the fake has logged a datagram on
@@ -2648,13 +2677,158 @@ mod open_receiver_tests {
         assert_eq!(first[..3], [0xEF, 0xFE, 0x01]);
     }
 
+    /// A protocol-1 radio that, like gateware which keeps its streaming
+    /// state until told to stop, answers discovery as in use from a start
+    /// command until a stop command.
+    struct StatefulP1Radio {
+        port: u16,
+        streaming: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl StatefulP1Radio {
+        fn start() -> Self {
+            let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            sock.set_read_timeout(Some(Duration::from_millis(10)))
+                .unwrap();
+            let port = sock.local_addr().unwrap().port();
+            let streaming = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let handle = {
+                let (streaming, stop) = (streaming.clone(), stop.clone());
+                thread::spawn(move || {
+                    let mut buf = [0u8; 2048];
+                    while !stop.load(Ordering::SeqCst) {
+                        let Ok((n, from)) = sock.recv_from(&mut buf) else {
+                            continue;
+                        };
+                        let d = &buf[..n];
+                        if d == protocol1_request() {
+                            let mut reply = p1_reply();
+                            if streaming.load(Ordering::SeqCst) {
+                                reply[2] = discovery::STATUS_BUSY;
+                            }
+                            let _ = sock.send_to(&reply, from);
+                        } else if n >= 4 && d[..3] == [0xEF, 0xFE, 0x04] {
+                            streaming.store(d[3] & 1 == 1, Ordering::SeqCst);
+                        }
+                    }
+                })
+            };
+            Self {
+                port,
+                streaming,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn cfg(&self) -> HpsdrConfig {
+            HpsdrConfig {
+                host: "127.0.0.1".into(),
+                port: self.port,
+                ddc_count: 1,
+                sample_rate_hz: 192_000.0,
+                center_freq_hz: vec![7_030_000.0],
+            }
+        }
+
+        fn wait_streaming(&self, want: bool) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while self.streaming.load(Ordering::SeqCst) != want {
+                assert!(
+                    Instant::now() < deadline,
+                    "radio never saw streaming = {want}"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    impl Drop for StatefulP1Radio {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// MAN-306 (PR #359 review): dropping the lone protocol-1 receiver
+    /// stops the radio, so a hostless reconnect's rediscovery finds it
+    /// available instead of refusing manta's own dropped session as in use.
+    #[test]
+    fn dropping_a_lone_protocol_1_receiver_stops_the_radio_for_rediscovery() {
+        let radio = StatefulP1Radio::start();
+        let dest = [SocketAddr::from(([127, 0, 0, 1], radio.port))];
+        let opened = open_receiver_with(&radio.cfg(), HpsdrProtocol::One, &fast(), Instant::now())
+            .expect("open_receiver");
+        radio.wait_streaming(true);
+        // While streaming, discovery reports the radio in use.
+        let found = discovery::discover(radio.port, &dest, Duration::from_millis(300)).unwrap();
+        assert!(
+            found
+                .iter()
+                .all(|r| r.status == discovery::DiscoveryStatus::InUse),
+            "{found:?}"
+        );
+        drop(opened);
+        radio.wait_streaming(false);
+        let selected = discovery::select_radio(radio.port, &dest, None)
+            .expect("rediscovery after the receiver dropped");
+        assert_eq!(selected.status, discovery::DiscoveryStatus::Available);
+        let _reopened =
+            open_receiver_with(&radio.cfg(), HpsdrProtocol::One, &fast(), Instant::now())
+                .expect("reopen");
+        radio.wait_streaming(true);
+    }
+
+    /// MAN-307: a grouped receiver's drop only detaches its slot; the
+    /// group retires the shared session.
+    #[test]
+    fn dropping_a_grouped_protocol_1_receiver_leaves_the_session_to_its_group() {
+        let radio = StatefulP1Radio::start();
+        let mut sources = HpsdrDevice::open(radio.cfg()).expect("open");
+        radio.wait_streaming(true);
+        let session = sources[0].session();
+        drop(sources.remove(0));
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            radio.streaming.load(Ordering::SeqCst),
+            "a member drop stopped the radio"
+        );
+        session.retire();
+        radio.wait_streaming(false);
+    }
+
+    /// MAN-306: a caller's discovery before the open (`entered` earlier
+    /// than this call) is outage, so the offset counts it.
+    #[test]
+    fn open_receiver_since_counts_time_before_the_call_as_outage() {
+        let before = Duration::from_millis(300);
+        for protocol in [HpsdrProtocol::One, HpsdrProtocol::Two] {
+            let fake = FakeP2Radio::start();
+            let entered = Instant::now() - before;
+            let start = Instant::now();
+            let opened =
+                open_receiver_with(&fake.cfg(), protocol, &fast(), entered).expect("open_receiver");
+            let took = start.elapsed();
+            let offset = opened.source.acquisition_start_offset();
+            assert!(
+                offset >= before && offset <= before + took,
+                "{protocol:?}: offset {offset:?}, open took {took:?}"
+            );
+        }
+    }
+
     #[test]
     fn auto_refuses_a_busy_protocol_2_radio() {
         let fake = FakeP2Radio::with_discovery(vec![(
             Duration::ZERO,
             p2_reply(discovery::STATUS_BUSY, 5),
         )]);
-        let err = open_receiver_with(&fake.cfg(), HpsdrProtocol::Auto, &fast())
+        let err = open_receiver_with(&fake.cfg(), HpsdrProtocol::Auto, &fast(), Instant::now())
             .err()
             .expect("a busy radio is refused under auto");
         assert_eq!(
