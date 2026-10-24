@@ -12,6 +12,10 @@ several channels of one SDR means ka9q-radio SSRCs on one radiod and
 channels of one KiwiSDR, whose transports are already independent; the
 loader refuses two entries on one HPSDR radio until MAN-307.
 
+**Superseded in part (2026-10-19):** MAN-307 lets several entries share
+one HPSDR radio; see
+[its record](2026-10-19-man307-hpsdr-multiple-receivers.md).
+
 ## Problem
 
 A manta process read one receiver. Operators with several SDRs, or several

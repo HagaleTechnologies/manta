@@ -248,6 +248,19 @@ fn char_alignment_ops(a: &[char], b: &[char]) -> Vec<AlignOp> {
 /// independently: boundary 0 is forgiven if genuinely dropped or credited
 /// if it matches; every other boundary is credited only if it matches, on
 /// its own, regardless of boundary 0's outcome.
+///
+/// MAN-173: rounds 1-7 all scored recall -- the share of `expected`'s
+/// boundaries the decode reproduced -- so a decode that ADDED word breaks
+/// kept 1.0 however many it added: V10's stage-2 HSMM decode, a space
+/// between every character, would have scored a perfect 1.0, and VR7's
+/// CER and boundary bars both passed its real decode with 17 calls split
+/// in two. A decoded space that no expected space matched is a spurious
+/// boundary and costs what a missed one costs: the score is
+/// (credited - spurious) / expected boundaries, floored at 0 -- 1 minus a
+/// boundary error rate, as char accuracy is 1 - CER. A moved boundary
+/// ("CQ TEST" -> "CQT EST") is two errors, as it is on air: a word gap
+/// read as a character gap and a character gap read as a word gap. With
+/// no expected boundary, a decode scores 1 only if it adds none.
 fn word_boundary_fraction(expected: &str, decoded: &str) -> f64 {
     let normalize = |s: &str| -> Vec<char> {
         s.split_whitespace()
@@ -264,17 +277,21 @@ fn word_boundary_fraction(expected: &str, decoded: &str) -> f64 {
         .filter(|&(_, &c)| c == ' ')
         .map(|(i, _)| i)
         .collect();
+    let decoded_boundaries = d.iter().filter(|&&c| c == ' ').count();
     if boundaries.is_empty() {
-        return 1.0;
+        return if decoded_boundaries == 0 { 1.0 } else { 0.0 };
     }
     let ops = char_alignment_ops(&e, &d);
     let boundary0_genuinely_dropped = ops[..=boundaries[0]].iter().all(|&op| op == AlignOp::Del);
-    let correct = boundaries
+    let matched = boundaries
         .iter()
-        .enumerate()
-        .filter(|&(idx, &p)| ops[p] == AlignOp::Match || (idx == 0 && boundary0_genuinely_dropped))
+        .filter(|&&p| ops[p] == AlignOp::Match)
         .count();
-    correct as f64 / boundaries.len() as f64
+    let credited = matched + usize::from(boundary0_genuinely_dropped);
+    // A `Match` pairs one expected space with one decoded space, so every
+    // other decoded space is a word break `expected` does not have.
+    let spurious = decoded_boundaries - matched;
+    credited.saturating_sub(spurious) as f64 / boundaries.len() as f64
 }
 
 #[test]
@@ -300,16 +317,54 @@ fn word_boundary_fraction_counts_a_single_merge_as_one_error_not_two() {
 }
 
 #[test]
-fn word_boundary_fraction_does_not_penalize_a_pure_extra_split() {
-    // NOT a mirror of the merge case, deliberately: splitting a word adds a
-    // space that a Levenshtein alignment can absorb as a pure insertion
-    // without disturbing either of expected's own boundaries (unlike a
-    // merge, which genuinely deletes an expected space, i.e. loses a real
-    // boundary). This metric measures recall of EXPECTED boundaries, not
-    // precision against decoded's own extra ones -- a decoded-side-only
-    // extra split, elsewhere confirmed correct, scores 1.0, not 2/3.
+fn word_boundary_fraction_penalizes_a_pure_extra_split() {
+    // MAN-173: the mirror of the merge case. Splitting "TESTW5AU" adds a
+    // decoded space no expected space matches -- a spurious boundary --
+    // and it costs what a missed one would: 1 - 1/2.
     let wb = word_boundary_fraction("CQ TESTW5AU W5AU", "CQ TEST W5AU W5AU");
+    assert!((wb - 0.5).abs() < 1e-9, "got {wb}");
+}
+
+#[test]
+fn word_boundary_fraction_costs_an_extra_split_the_same_as_a_merge() {
+    // MAN-173: over- and under-segmentation are symmetric. One merge and
+    // one extra split each cost one boundary of three.
+    let merged = word_boundary_fraction("CQ TEST W5AU W5AU", "CQ TESTW5AU W5AU");
+    let split = word_boundary_fraction("CQ TEST W5AU W5AU", "CQ TEST W5 AU W5AU");
+    assert!((merged - 2.0 / 3.0).abs() < 1e-9, "merge: got {merged}");
+    assert!((split - 2.0 / 3.0).abs() < 1e-9, "split: got {split}");
+}
+
+#[test]
+fn word_boundary_fraction_scores_a_split_between_every_character_as_zero() {
+    // MAN-173: V10's stage-2 HSMM failure, a space between every
+    // character (docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md
+    // section 3), reproduces all 4 expected boundaries and adds 17 more.
+    let wb = word_boundary_fraction(
+        "CQ TEST JA1ZZZ JA1ZZZ TEST",
+        "C Q T E S T J A 1 Z Z Z J A 1 Z Z Z T E S T",
+    );
+    assert!((wb - 0.0).abs() < 1e-9, "got {wb}");
+}
+
+#[test]
+fn word_boundary_fraction_penalizes_a_split_of_a_single_word() {
+    // No expected boundary to divide by: a decode that adds one scores 0,
+    // one that adds none scores 1, as `manta_testkit::cer` treats an
+    // empty expected text.
+    let wb = word_boundary_fraction("TEST", "TE ST");
+    assert!((wb - 0.0).abs() < 1e-9, "got {wb}");
+    let wb = word_boundary_fraction("TEST", "TEST");
     assert!((wb - 1.0).abs() < 1e-9, "got {wb}");
+}
+
+#[test]
+fn word_boundary_fraction_counts_an_extra_split_after_a_dropped_first_word() {
+    // Warm-up forgiveness and the spurious-boundary penalty are
+    // independent, as round 7 made forgiveness independent of misses:
+    // 1 forgiven + 2 matched - 1 spurious ("W5 AU") = 2 of 3.
+    let wb = word_boundary_fraction("CQ TEST W5AU W5AU", "TEST W5 AU W5AU");
+    assert!((wb - 2.0 / 3.0).abs() < 1e-9, "got {wb}");
 }
 
 #[test]
@@ -347,9 +402,11 @@ fn word_boundary_fraction_does_not_forgive_a_split_first_word_with_more_words_af
     // EVERY later boundary matching cleanly (the disruption is local), so
     // "every other boundary already right" alone isn't enough to prove
     // genuine content loss -- must also require the drop to actually be a
-    // deletion, not a misplaced substitution.
+    // deletion, not a misplaced substitution. MAN-173: the moved
+    // boundary is two errors, missed after "CQ" and spurious after "CQT",
+    // so (1 - 1)/2 = 0; a wrongly forgiven first boundary would read 0.5.
     let wb = word_boundary_fraction("CQ TEST W5AU", "CQT EST W5AU");
-    assert!((wb - 0.5).abs() < 1e-9, "got {wb}");
+    assert!((wb - 0.0).abs() < 1e-9, "got {wb}");
 }
 
 #[test]
@@ -541,6 +598,10 @@ fn vr6b_weighting_3_4_passes_end_to_end() {
     assert_vr6_passes(&manta_testkit::vectors::vr6b());
 }
 
+/// SPEC v2 section 8.2 VR7 bars: char >= 95 %, word boundaries >= 90 %.
+const VR7_MAX_CER: f64 = 0.05;
+const VR7_MIN_WORD_BOUNDARIES: f64 = 0.90;
+
 // Measured passing (2026-09-09, stage-2 gate) -- see
 // docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
 #[test]
@@ -550,13 +611,45 @@ fn vr7_tight_spacing_passes_end_to_end() {
     let decoded = report["text"].as_str().unwrap();
     let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
     assert!(
-        cer <= 0.05,
+        cer <= VR7_MAX_CER,
         "VR7 char accuracy must be >= 95% (CER <= 0.05), got CER {cer}\nexpected: {}\ndecoded:  {}",
         manifest.keyed_texts[0],
         decoded
     );
     let wb = word_boundary_fraction(&manifest.keyed_texts[0], decoded);
-    assert!(wb >= 0.90, "VR7 word boundaries must be >= 90%, got {wb}");
+    assert!(
+        wb >= VR7_MIN_WORD_BOUNDARIES,
+        "VR7 word boundaries must be >= 90%, got {wb}; decoded {decoded:?}"
+    );
+}
+
+/// MAN-173: VR7 exists to catch character gaps read as word gaps. Seven
+/// calls split in two in an otherwise exact decode stay inside VR7's CER
+/// bar (7 of 350 characters), so its word-boundary bar must fail it.
+#[test]
+fn vr7_fails_a_decode_that_over_segments_words() {
+    let message = manta_testkit::vectors::vr7().signals[0].text.clone();
+    let keyed = [message.as_str(); 13].join(" ");
+    let mut splits = 0;
+    let decoded = keyed
+        .split(' ')
+        .map(|w| {
+            if w == "JA1ZZZ" && splits < 7 {
+                splits += 1;
+                "JA1 ZZZ"
+            } else {
+                w
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cer = manta_testkit::cer::cer(&keyed, &decoded);
+    assert!(cer <= VR7_MAX_CER, "CER {cer} already fails this decode");
+    let wb = word_boundary_fraction(&keyed, &decoded);
+    assert!(
+        wb < VR7_MIN_WORD_BOUNDARIES,
+        "VR7 passed a decode with 7 extra word breaks: word boundaries {wb}"
+    );
 }
 
 #[test]
@@ -591,10 +684,15 @@ fn word_boundary_fraction_known_limitation_repeated_structure_can_launder_a_boun
     // -- a materially larger redesign than a character-alignment patch,
     // and out of scope for this review round. Documented here, not
     // silently accepted: this exact input is a known false positive.
+    // MAN-173 narrowed it: the decode has 5 spaces to the 4 the alignment
+    // matched, so one spurious boundary now costs 1/4 (1.0 -> 0.75). The
+    // laundered pairing still hides the missed boundary after "CQ" and a
+    // second spurious one; the correct score is 1 - (1 + 2)/4 = 0.25.
     let wb = word_boundary_fraction("CQ TEST W5AU W5AU TEST", "CQT E ST W5AU W5AU TEST");
     assert!(
-        (wb - 1.0).abs() < 1e-9,
-        "documenting the known false positive (got {wb}, expected exactly the buggy 1.0) -- \
+        (wb - 0.75).abs() < 1e-9,
+        "documenting the known false positive (got {wb}, expected exactly the buggy 0.75; \
+         correct is 0.25) -- \
          if this assertion ever fails, the bug is FIXED, not broken; update this test to assert \
          the correct value instead of reverting whatever fixed it"
     );

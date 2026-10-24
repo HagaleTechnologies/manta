@@ -1782,7 +1782,8 @@ Senders who do not key ideal 1:3 / 3 / 7 timing, decoded on the default
 `vw5`). All: 96 kHz, 14 MHz centre, offset +12.34 kHz unless stated, 5 ms
 rise, AWGN, looped text, 60 s unless stated. `dit_units`/`element_gap_units`
 set the dot and the element gap in dits (1.0 standard). Learned timing is
-read from the track's last `TimingUpdate` (§5).
+read from the track's last `TimingUpdate` (§5). Word boundaries are scored
+as SPEC v2 §8.2 defines (`docs/SPEC-decode-core-v2.md`).
 
 | # | Name | Signal(s) | Impairment | Pass criteria |
 |---|---|---|---|---|
@@ -1899,13 +1900,14 @@ flush_gap_dits = 7.0
 #   file:  path*, iq, realtime, loop
 #   kiwi:  host*, freq_hz*, port, password
 #   soapy: driver*, freq_hz*, rate_hz*, gain_db   (build with --features soapy)
-#   hpsdr: host*, freq_hz*, rate_hz*, port, protocol (included in every build)
+#   hpsdr: host, mac, freq_hz*, rate_hz*, port, protocol (included in every build)
 #   ka9q:  group*, port, ssrc, interface
 # Any source flag on the command line (--device, --source, --kiwi-host,
 # --soapy-driver, --hpsdr-host, --ka9q-group) replaces a typed [input]
 # table whole, its shared keys below included. Example:
 # type = "kiwi"               # audio | file | kiwi | soapy | hpsdr | ka9q
-# host = "<your-kiwi-host>"   # kiwi, hpsdr
+# host = "<your-kiwi-host>"   # kiwi required; hpsdr optional (omit host and mac to discover)
+# mac = "02:11:22:33:44:55"   # hpsdr: pin by MAC instead of host; never set both
 # port = 8073                 # kiwi (default 8073), hpsdr (default 1024), ka9q (default 5004)
 # protocol = "auto"           # hpsdr: "auto" (default) asks the radio; "1" (Hermes-Lite 2) or "2" (ANAN) skips asking (--hpsdr-protocol)
 # freq_hz = 7030000.0         # kiwi, soapy, hpsdr: RF center frequency, Hz

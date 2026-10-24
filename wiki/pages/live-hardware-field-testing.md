@@ -95,20 +95,28 @@ need to fool the repetition gate to produce a public spot. PR #154
 (`crates/manta-spot/src/validator.rs`, `grammar.rs` — merged 2026-09-09
 as `455e1af`) adds a WPM-implausibility check scoped to `SpotType::Beacon`
 candidates specifically, and defers non-allowlisted Beacon candidates
-until the track's true final close (a genuine observed RF gap), requiring
-a confirmed real `SpeedUpdate` before resolving one. A small residual
-(structurally plausible, not-implausibly-fast garble) isn't caught and is
-a known, accepted gap (tracked in issue #163, deprioritized).
+until the track's true final close (the track/input's final observed
+state -- `ClosureKind::SignalEnded` fires at the capture's end too, not
+only an observed RF gap), requiring a confirmed real `SpeedUpdate` before
+resolving one. A small residual (structurally plausible,
+not-implausibly-fast garble) isn't caught and is a known, accepted gap
+(tracked in issue #163, deprioritized).
 
-**Confirmed live, one session in** (`2026-09-09-post-pr154-20m-daytime-
-validation.md`): a 15-minute 20m daytime capture went from the overnight
-run's 29/29 false positives to 1 residual Beacon garble matching the
-documented gap above (low confidence, 3-char non-callsign text, WPM just
-under `MAX_PLAUSIBLE_WPM`) plus 1 plausible genuine `SpotType::Cq` catch
-(realistic WPM, above-artifact-band confidence, well-formed callsign) --
-the first non-Beacon confirmed spot across all live sessions to date. One
-session isn't a solid statistical answer yet, but the fix is behaving as
-designed so far.
+**Seen live, one session in** (`2026-09-09-post-pr154-20m-daytime-
+validation.md`): a 15-minute 20m daytime capture confirmed 2 spots -- 1
+Beacon matching the documented gap above (low confidence, WPM just under
+`MAX_PLAUSIBLE_WPM`; a 3-char decode in the UK special contest call shape,
+so unresolved, not proven garble) plus 1 plausible genuine
+`SpotType::Cq` catch (realistic WPM, well-formed callsign) -- the first
+non-Beacon confirmed spot across all live sessions to date. Its higher
+published confidence reflects Beacon-vs-Cq bookkeeping (repetition
+factor, `master.scp` boost), not evidence of better character copy.
+Against the overnight run's same-band 20m baseline (10 spots in 1.5h,
+most sharing the low-confidence, floor-pinned signature), the rate of
+spots with that signature is unchanged within these tiny samples
+(≈4.7/h -> 4/h), so this shows the fix running live with the expected
+residual shape, not a measured reduction. One session isn't a solid
+statistical answer yet.
 
 The frequency-clustering data point from the original finding is still
 worth knowing when you see the same defect: only one of the observed
@@ -122,21 +130,31 @@ signal, not a detection/spot-generation bug) — see
 for the full original reasoning; treat the interior-passband clusters as
 a separate, still-untracked question until proven otherwise.
 
-**Update, confirmed on 20m** (`2026-09-09-20m-dial-shift-edge-artifact-
-confirmed.md`): a two-run dial-shift test (+30 kHz between runs) nails
-down both halves of this. **Both passband edges are a real detector/
-channelizer artifact** — `TrackPromoted` rate spikes ~3 kHz in from each
-true edge of the tuned passband in both runs, tracking the edge as it
-moves, and none of these edge tracks ever confirmed a spot. Together they
-were 28-35% of all promoted tracks in that session — a real cost even
-though they don't produce false spots. Separately, **an interior cluster
-around 14075 kHz did NOT move with the dial** — same absolute frequency
-both times — so it's not the same artifact; it's inside the US 20m RTTY/
-data segment (14070-14095 kHz) and is more likely a real continuous
-digital-mode signal whose keying trips the CW detector into promoting
-tracks that never validate (not confirmed against a live waterfall). Root
-cause of the edge artifact itself is still open (PFB edge-channel
-behavior is the leading suspect).
+The [20m dial-shift test](../../docs/DECISIONS/2026-09-09-20m-dial-shift-edge-artifact-confirmed.md),
+corrected by MAN-226 on 2026-10-23, found `TrackPromoted` clusters ~3 kHz
+inside both passband edges after a +30 kHz retune. Both edge clusters
+moved approximately with the dial, ruling out one fixed absolute-frequency
+external signal explaining them. Their origin remains unresolved: both
+captures used the same RSP1B and driver, so SDR front-end, anti-alias/filter
+or driver effects remain alternatives to manta detector/PFB effects.
+Compare raw IQ and channelizer output before assigning the source.
+
+The edge clusters accounted for 28-35% of promotion events, not a measured
+share of processing cost. None produced a confirmed spot in these runs.
+An interior cluster around 14075 kHz stayed at approximately the same
+absolute frequency. A digital-mode signal in the US 20m RTTY/data
+segment (14070-14095 kHz) remains a hypothesis, unconfirmed by a live
+waterfall.
+
+Remote RBN skimmers reported 20-39 dB SNR, establishing transmitter
+activity and remote reception, not strength or receivability at this
+RSP1B's QTH. Local track activity occurred at only one of five selected
+frequencies. The [MAN-171 caveat](../../docs/DECISIONS/2026-09-10-man171-dead-zone-is-rf-path-not-manta-code.md)
+requires raw-IQ evidence and a local reference check before assigning a
+receiver or detector cause. Its later WWV check does not measure these
+September 9 captures. An isolated 10 MHz bin is insufficient to identify
+WWV without modulation/sideband or equivalent evidence; see the
+[antenna-path record](../../docs/DECISIONS/2026-09-10-antenna-path-fix-resolves-detection-gap.md).
 
 **`snr_db` is not a useful signal here on its own.** A weak/flat-envelope
 track commonly lands at or near `20*log10(2) - 14.3 = -8.2794 dB` via
@@ -281,30 +299,37 @@ maximum sensitivity, `48` is minimum. Every fixed-gain field session through
 2026-09-09 used `--soapy-gain 40`, which pins the IF stage at its
 absolute maximum attenuation (`IFGR=59`, the top of its whole `[20,59]`
 range) — chosen only to avoid the top-of-range activation failure above,
-never checked against actual sensitivity. A live sweep found chars-
-decoded markedly higher at `gain=10-20` than at `40`, and peak SNR higher
-at `gain=20` only (`gain=10`'s 2.43 dB was below `40`'s 3.81 dB)
-(`gain=0` is worse than `40`, though — the front end likely overloads on
-this busy an antenna at max sensitivity, so it's not simply "always use
-the minimum"). **Do not keep using `40` by default; sweep gain per session instead
-of assuming an optimum.** The sweep's better peak SNR at `gain=10-20` is
-provisional: the follow-up below found it came with artifact clusters and
-still no activity at real CW targets, so no gain is established as best
-until a locally present real signal or raw-IQ dynamic-range measurement is
-compared across gains.
+never checked against actual sensitivity. The 60-second sweep recorded
+more decoded characters at gains 10 and 20 than at 40. In that 10-20
+range, only gain 20 exceeded gain 40's peak SNR (6.52 vs. 3.81 dB);
+gain 10 recorded 2.43 dB. Gain 30 also exceeded gain 40, at 4.11 dB.
+Gain 0 recorded zero characters and a -1.58 dB peak; the sweep does not
+establish overload as the cause. No setting produced a confirmed spot,
+so these measurements do not establish an optimum for receiving real CW.
+Sweep gain using a locally present real signal or raw-IQ dynamic-range
+measurements instead of assuming an optimum.
 
-**Confirmed real but NOT a full fix**: a same-session follow-up capture
-at `gain=15` against live RBN found peak SNR much improved (18.65 dB vs.
-`gain=40`'s 3.81 dB) but **still zero track activity within ±3 kHz of 6
-specific real, multi-skimmer-confirmed RBN spots** in the same window.
-The gain bug is real and worth fixing, but it is not the (or not the
-whole) explanation for "almost no real CW heard" — something else, most
-plausibly the physical antenna/feedline path specifically feeding the
-RSP1B, was the open question at that point. The later
-`2026-09-10-man171-dead-zone-is-rf-path-not-manta-code.md` measured raw
-channelizer power plus a local WWV check and concluded the detector/DSP
-side is ruled out, so treat the RF path as the working explanation. See the
-same doc's follow-up section.
+The later six-minute capture at gain 15 recorded an 18.65 dB peak from
+the ~14075/14045 kHz artifact/interference clusters. It still showed zero
+`TrackMeta` events within ±3 kHz of six frequencies reported active by
+multiple remote RBN skimmers. Their reception does not establish local
+strength or receivability. The maxima came from different capture
+lengths and RF conditions, so they do not demonstrate a gain-induced
+improvement in real-CW reception. Nor can the ~55% edge share of
+`TrackMeta` events at gain 15 establish a change from the 28-35% share of
+`TrackPromoted` events at gain 40: the event denominators differ.
+
+The [gain record](../../docs/DECISIONS/2026-09-09-soapy-gain-is-inverted-attenuation-scale.md),
+corrected by MAN-226 on 2026-10-23, preserves the gain-reduction mapping
+without assigning a cause for the missing local activity. The
+[MAN-171 record](../../docs/DECISIONS/2026-09-10-man171-dead-zone-is-rf-path-not-manta-code.md)
+used raw channelizer power and a local WWV check in addition to RBN;
+local evidence is needed before ranking RF-path and detector explanations.
+That later check does not measure the September 9 captures, and an
+isolated 10 MHz bin does not identify WWV without modulation/sideband or
+equivalent evidence, as the
+[antenna-path record](../../docs/DECISIONS/2026-09-10-antenna-path-fix-resolves-detection-gap.md)
+explains.
 
 **The SDRplay stream can stop activating mid-session, apparently with the
 `sdrplay_apiService` daemon wedged** (cause not established; root-owned

@@ -50,70 +50,34 @@ KiwiSDR input.
 **Accept when:**
 - Pileup vector V8 (AWGN: ≥ 45/50 callsigns validated, 0 bogus) passes per
   SPEC-decode-core §7. V8w (same scene under Watterson CCIR-poor, ≥ 90 % of
-  signals ≥ +6 dB SNR at CER < 10 %) is **not** a blocking M2 gate — measured
-  at 1/34 (2.9 %), tracked as issue #28, and reclassified as a known
-  classical-decoder fading-robustness limitation in the same family as
-  V2/V5/V6/issue #25. V8w's spot-validated recall was restored by MAN-213
-  (28/50, 0 bogus); its per-signal CER gate is still open. Per this repo's own design ("classical decoder first;
-  ML fusion only at M4, gated on beating the classical baseline under
-  simulated fading"), closing that gap is M4's job, not M2's.
-- **Real-conditions vectors VR1–VR8** (`docs/SPEC-decode-core-v2.md` §8.2:
-  contest speed 40/45 WPM, ≥ 45 dB in-channel keying depth, hard transmitter
-  edges/clicks, co-channel occupancy, non-3:1 weighting, tight Farnsworth-free
-  spacing) pass per that spec's §8.4 gate. Added 2026-09-09 (MAN-166,
-  decision recorded in
-  `docs/superpowers/specs/2026-09-09-decode-core-real-hf-design.md` §8):
-  V1–V10 alone did not catch the real-signal keying-threshold defect that
-  the B2/K5TR benchmark exposed (a threshold decision 17–30 dB below the
-  mark on real 25–60 dB-deep signals), because none of V1–V10 exercises
-  contest speed above 35 WPM with deep keying and hard edges together. VR
-  vectors are a standing acceptance bar for every future decode-core
-  change, not a one-time gate for the v2 redesign. **Measured against
-  `engine = "hsmm"` 2026-09-09** (SPEC v2 §8.4 Task 12,
-  `docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md`): 3/9 pass
-  (VR6a, VR6b, VR7), 6/9 fail (VR1–VR5, VR8) — this gate is **not yet
-  cleared**.
-- Criterion bench: full pipeline at 192 kS/s with 300 active tracks uses < 50 %
-  of one core on an M-series Mac AND < 1 core on a Raspberry Pi 4. **Neither
-  leg is currently a resolved pass** — see
-  `docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md` and the run
-  procedure in `docs/RUNBOOKS/m2-pi4-cpu-budget.md`.
-  - **Mac leg: unresolved, not passing.** A 0.360x realtime figure was
-    recorded as a pass on 2026-07-24 (per M3's engine-wiring sub-project,
-    including `manta-spot::Validator` cost — see
-    `crates/manta-engine/benches/cpu_budget.rs`), and this session
-    initially reconfirmed ~0.457x-0.472x. Both numbers turned out to omit
-    the detector's 2s warmup from the timing, diluting the ratio by
-    ~13%; corrected, this session measured ≈0.53x-0.58x against the <
-    0.5x budget — i.e. likely failing, not the comfortable pass on
-    record. Both the original 0.360x and this session's corrected numbers
-    are superseded, historical measurements now, not a settled result —
-    a clean rerun of the now-fixed `crates/manta-engine/tests/cpu_budget.rs`
-    on a quiet, dedicated machine is needed to resolve this leg.
-  - **Pi4 leg: outstanding** — needs real Raspberry Pi 4 hardware, tracked
-    as MAN-18. A cross-architecture estimate (not a measurement — no Pi4
-    was reachable to measure against) puts it at ~5.3x realtime CPU-time,
-    well over the < 1.0x budget.
+  signals ≥ +6 dB SNR at CER < 10 %) is **not** a blocking M2 gate: it is a
+  known classical-decoder fading-robustness limitation in the same family as
+  V2/V5/V6/issue #25, and closing it is classical-DSP work that lands before
+  M4's ML fusion (broad-review decision D8,
+  `docs/DECISIONS/2026-09-06-broad-review-decisions.md`). V8w's
+  spot-validated recall was restored by MAN-213 (28/50, 0 bogus); its
+  per-signal CER gate is still open (issue #28). History:
+  `docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md` and
+  `docs/DECISIONS/2026-10-23-man158-roadmap-security-scope-refresh.md`.
+- **Real-conditions vectors VR1–VR8** (`docs/SPEC-decode-core-v2.md` §8.2)
+  pass per that spec's §8.4 gate. VR vectors are a standing acceptance bar
+  for every future decode-core change, not a one-time gate. **Not yet
+  cleared**: 3/9 pass (VR6a, VR6b, VR7), 6/9 fail, measured against
+  `engine = "hsmm"` on 2026-09-09 —
+  `docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md`.
+- Criterion bench: full pipeline at 192 kS/s with 300 active tracks uses
+  < 50 % of one core on an M-series Mac AND < 1 core on a Raspberry Pi 4.
+  **Neither leg is a resolved pass**; both need a clean rerun on quiet,
+  dedicated hardware — `docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md`
+  (including the superseded Mac measurements), procedure in
+  `docs/RUNBOOKS/m2-pi4-cpu-budget.md`.
 - 24 h soak on live 40 m CW segment via SDR: no crash, no overrun, track
-  count and evictions visible in metrics. **Outstanding** — needs a real SDR
-  and 24 unattended hours.
-  Procedure: `docs/RUNBOOKS/secondary-skimmer-field-node.md` (MAN-96); still
-  outstanding until a run's evidence is recorded.
+  count and evictions visible in metrics. **Outstanding** — procedure:
+  `docs/RUNBOOKS/secondary-skimmer-field-node.md` (MAN-96).
 
-M2 sub-project 1 (PFB channelizer, `manta-dsp::channelizer`) is complete —
-see `docs/superpowers/plans/2026-07-18-m2-pfb-channelizer.md` and
-`docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md`. M2 sub-project 2
-(detector/track manager + decoder pool, `manta-dsp::floor` +
-`manta-engine::track`) is complete — see
-`docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md` and
-`docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md`. All remaining M2
-sub-projects (V8/V8w pileup-scene validation + CPU-budget criterion bench,
-SoapySDR input, KiwiSDR input) are implemented, each with an open/merging
-PR — see docs/DECISIONS/2026-07-24-m2-pileup-cpu-budget-pins.md,
-docs/DECISIONS/2026-07-25-m2-soapysdr-input-pins.md, and
-docs/DECISIONS/2026-07-25-m2-kiwisdr-input-pins.md. **M2 itself is still not
-complete**: the Pi4 CPU-budget leg and the 24 h live-SDR soak are real,
-unmet acceptance gates, not sub-project work.
+**Status: M2 is not complete.** Open gates: the VR1–VR8 gate, both CPU-budget
+legs (Mac and Pi4), and the 24 h live-SDR soak. All five M2 sub-projects are
+complete; their pins records are linked from `docs/DECISIONS/README.md`.
 
 ## M3 — Spots: validation + servers + RBN parity benchmark
 
@@ -188,6 +152,7 @@ confidence weighting. ONNX/candle inference, feature-gated.
 
 - RTTY/FT4-adjacent modes on the same channelizer.
 - ~~Multi-SDR single-daemon orchestration.~~ Pulled forward and delivered by
-  MAN-13 (`[[input]]`); several receivers on one HPSDR radio remain MAN-307.
+  MAN-13 (`[[input]]`); several receivers on one HPSDR radio followed in
+  MAN-307.
 - Spot quality feedback loop: cqdx-side confirmation (same call spotted by other
   nodes) fed back to tune validation thresholds.
