@@ -176,7 +176,12 @@ No alert rule ships for `manta_input_silent`.
 
 Give each band an entry with the same `host` and `port`. Entries are assigned
 receivers 0, 1, 2 and 3 in file order, even if other radios occur between them.
-Host comparison ignores letter case; an omitted port means 1024. All entries
+Host comparison ignores letter case; an omitted port means 1024. Without
+`host`, entries share the radio discovery finds when they give the same
+`input.mac` (or none); pin each radio by its MAC (`manta devices` lists them)
+when several share the LAN, which also survives DHCP address changes. Two
+spellings of one radio (a host and a MAC, or a pinned and an unpinned
+hostless entry) are refused when the run resolves them. All entries
 on a radio must use the same native `rate_hz` and the same `protocol`
 (default `auto`); a radio shared by several entries speaks protocol 1, so
 `protocol = "2"` is refused there — a protocol-2 radio opens one receiver
