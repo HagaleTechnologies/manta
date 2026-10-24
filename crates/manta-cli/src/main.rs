@@ -5443,7 +5443,7 @@ fn run_status(
     server_config: Option<&std::path::Path>,
     addr: Option<&str>,
     timeout_secs: u64,
-) -> Result<manta_server::status_doc::StatusDoc> {
+) -> Result<StatusReply> {
     // An explicit `--addr` needs no config at all.
     let server = if addr.is_some() {
         None
@@ -5604,7 +5604,7 @@ const MAX_STATUS_HEADER_LINES: usize = 100;
 async fn fetch_status(
     addrs: &[std::net::SocketAddr],
     timeout: std::time::Duration,
-) -> Result<manta_server::status_doc::StatusDoc> {
+) -> Result<StatusReply> {
     tokio::time::timeout(timeout, fetch_status_inner(addrs, timeout))
         .await
         .map_err(|_| anyhow!("timed out talking to {}", format_addrs(addrs)))?
@@ -5673,7 +5673,7 @@ where
 async fn fetch_status_inner(
     addrs: &[std::net::SocketAddr],
     timeout: std::time::Duration,
-) -> Result<manta_server::status_doc::StatusDoc> {
+) -> Result<StatusReply> {
     let (_, status_line, reader) = http_get(addrs, "/status", "status", timeout).await?;
     if !status_line.starts_with("HTTP/1.1 200") {
         bail!(
@@ -5752,6 +5752,15 @@ async fn read_http_body(
     String::from_utf8(body).with_context(|| format!("{what} body was not valid UTF-8"))
 }
 
+/// A parsed `/status` reply (MAN-285): `doc` drives the summary and the
+/// exit code; `raw` is the same body as parsed, so `--json` keeps fields
+/// this build's `StatusDoc` does not declare.
+#[derive(Debug)]
+struct StatusReply {
+    doc: manta_server::status_doc::StatusDoc,
+    raw: serde_json::Value,
+}
+
 /// Parses a `/status` body AND enforces its `schema_version` (Codex
 /// review, PR #95).
 ///
@@ -5787,10 +5796,15 @@ async fn read_http_body(
 /// `GET /status`, and it falls through to the structural parse so it
 /// fails on "not a valid status document" instead.
 ///
+/// The same `Value` is kept for `--json` (MAN-285), preserving additive
+/// fields at every depth. The typed document is deserialized from it, so
+/// output and exit code agree on one parse, including duplicate keys.
+///
 /// Separated from `fetch_status_inner` so this is testable without a
 /// socket; `fetch_status_inner` has no other post-read logic to keep.
-fn parse_status_doc(body: &str) -> Result<manta_server::status_doc::StatusDoc> {
-    use manta_server::status_doc::STATUS_SCHEMA_VERSION;
+fn parse_status_doc(body: &str) -> Result<StatusReply> {
+    use manta_server::status_doc::{StatusDoc, STATUS_SCHEMA_VERSION};
+    use serde::Deserialize;
 
     let value: serde_json::Value = serde_json::from_str(body).map_err(invalid_status_doc)?;
     if let Some(version) = value
@@ -5806,9 +5820,8 @@ fn parse_status_doc(body: &str) -> Result<manta_server::status_doc::StatusDoc> {
             );
         }
     }
-    let doc: manta_server::status_doc::StatusDoc =
-        serde_json::from_value(value).map_err(invalid_status_doc)?;
-    Ok(doc)
+    let doc = StatusDoc::deserialize(&value).map_err(invalid_status_doc)?;
+    Ok(StatusReply { doc, raw: value })
 }
 
 /// serde_json's data errors quote the offending value ("unknown variant
@@ -7208,19 +7221,19 @@ fn run_command() -> Result<std::process::ExitCode> {
             // (`docs/RUNBOOKS/uplink-health.md`'s exit-code table) -- a
             // typo'd config path was indistinguishable from a genuinely
             // degraded uplink.
-            let doc = match run_status(config.as_deref(), addr.as_deref(), timeout_secs) {
-                Ok(doc) => doc,
+            let reply = match run_status(config.as_deref(), addr.as_deref(), timeout_secs) {
+                Ok(reply) => reply,
                 Err(e) => {
                     errln!("{}", status_failure_message(&e));
                     return Ok(std::process::ExitCode::from(2));
                 }
             };
             if json {
-                out!("{}", doc.to_json())?;
+                out!("{}", manta_server::status_doc::value_to_json(&reply.raw))?;
             } else {
-                out!("{}", manta_server::status_doc::render_human(&doc))?;
+                out!("{}", manta_server::status_doc::render_human(&reply.doc))?;
             }
-            return Ok(std::process::ExitCode::from(status_exit_code(&doc)));
+            return Ok(std::process::ExitCode::from(status_exit_code(&reply.doc)));
         }
         Command::Health {
             config,
@@ -12502,7 +12515,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 &[server.metrics_addr],
                 std::time::Duration::from_secs(5),
             ))
-            .unwrap();
+            .unwrap()
+            .doc;
 
         assert!(
             doc.uplink.targets.iter().any(|t| t.label == "127.0.0.1:1"),
@@ -12672,7 +12686,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
 
         let doc = fetch_status(&[dead, live], std::time::Duration::from_secs(5))
             .await
-            .expect("must fall back to the second address after the first refuses");
+            .expect("must fall back to the second address after the first refuses")
+            .doc;
         assert_eq!(doc.schema_version, 1);
     }
 
@@ -12853,6 +12868,21 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     }
 
     #[test]
+    fn parse_status_doc_keeps_fields_this_build_does_not_declare() {
+        use manta_server::metrics::OverallUplinkHealth;
+        let doc = doc_with(OverallUplinkHealth::Down);
+        let mut value = serde_json::to_value(&doc).unwrap();
+        value["foo"] = serde_json::json!(1);
+        value["uplink"]["uplink_extra"] = serde_json::json!("x");
+
+        let reply = parse_status_doc(&value.to_string()).unwrap();
+        assert_eq!(reply.raw["foo"], 1);
+        assert_eq!(reply.raw["uplink"]["uplink_extra"], "x");
+        assert_eq!(reply.doc, doc);
+        assert_eq!(status_exit_code(&reply.doc), 1);
+    }
+
+    #[test]
     fn status_exit_code_is_zero_when_healthy_one_when_degraded() {
         use manta_server::metrics::OverallUplinkHealth;
         assert_eq!(status_exit_code(&doc_with(OverallUplinkHealth::Ok)), 0);
@@ -12900,7 +12930,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
 
         let doc = fetch_status(&[addr], std::time::Duration::from_secs(5))
             .await
-            .expect("must parse a response split across several writes");
+            .expect("must parse a response split across several writes")
+            .doc;
         assert_eq!(doc.schema_version, 1);
     }
 

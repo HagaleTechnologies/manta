@@ -29,6 +29,7 @@ use std::time::Instant;
 /// not bump it: `serde` ignores unknown keys, so an older CLI keeps
 /// reading a newer daemon correctly, which is the whole reason a version
 /// mismatch can be treated as fatal rather than best-effort.
+/// Additive fields are still printed by `manta status --json` (MAN-285).
 pub const STATUS_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -169,25 +170,37 @@ impl StatusDoc {
     }
 
     /// Pretty-printed JSON with DEL and the C1 controls (U+007F-U+009F)
-    /// `\u`-escaped as well (Codex review, PR #95): serde_json escapes only
-    /// U+0000-U+001F, so those would otherwise reach the terminal raw
-    /// through `manta status --json` when a spoofed endpoint puts them in a
-    /// label. serde_json never emits them outside a string literal, so
-    /// escaping each one keeps the output valid JSON with the same decoded
-    /// value.
+    /// `\u`-escaped as well (Codex review, PR #95).
     pub fn to_json(&self) -> String {
-        let json =
-            serde_json::to_string_pretty(self).expect("StatusDoc is infallibly serializable");
-        let mut out = String::with_capacity(json.len());
-        for c in json.chars() {
-            if ('\u{7f}'..='\u{9f}').contains(&c) {
-                out.push_str(&format!("\\u{:04x}", u32::from(c)));
-            } else {
-                out.push(c);
-            }
-        }
-        out
+        escape_del_and_c1(
+            &serde_json::to_string_pretty(self).expect("StatusDoc is infallibly serializable"),
+        )
     }
+}
+
+/// Pretty-prints the parsed daemon response for `manta status --json`
+/// (MAN-285), preserving unknown fields and escaping DEL/C1 controls.
+pub fn value_to_json(value: &serde_json::Value) -> String {
+    escape_del_and_c1(
+        &serde_json::to_string_pretty(value).expect("JSON Value is infallibly serializable"),
+    )
+}
+
+/// serde_json escapes only U+0000-U+001F, so DEL/C1 controls would
+/// otherwise reach the terminal raw through `manta status --json` when a
+/// spoofed endpoint puts them in a string. serde_json never emits them
+/// outside a string literal, so escaping each one keeps the output valid
+/// JSON with the same decoded value.
+fn escape_del_and_c1(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        if ('\u{7f}'..='\u{9f}').contains(&c) {
+            out.push_str(&format!("\\u{:04x}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn overall_health_label(health: OverallUplinkHealth) -> &'static str {
@@ -469,6 +482,24 @@ mod tests {
             back.uplink.targets[0].label, hostile,
             "the decoded value must be unchanged"
         );
+    }
+
+    #[test]
+    fn value_to_json_escapes_del_and_c1_in_a_field_status_doc_does_not_declare() {
+        let mut value = serde_json::to_value(StatusDoc::from_metrics(&metrics_fixture())).unwrap();
+        value["note"] = serde_json::json!("evil\u{9b}2J\u{9d}0;pwned\u{9c}\u{7f}");
+
+        let json = value_to_json(&value);
+        assert!(
+            !json.chars().any(|c| c.is_control() && c != '\n'),
+            "only the pretty-printer's line breaks may reach the terminal: {json:?}"
+        );
+        assert!(
+            json.contains(r"evil\u009b2J\u009d0;pwned\u009c\u007f"),
+            "{json:?}"
+        );
+        let back: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, value, "the decoded value must be unchanged");
     }
 
     #[test]
