@@ -1,5 +1,9 @@
 # `--soapy-gain` on this RSP1B is a gain-*reduction* (attenuation) scale, not a gain scale -- every prior fixed-gain field session used a heavily-attenuated setting
 
+MAN-226 correction, 2026-10-23: narrowed the gain and remote-RBN
+inferences below; gain-element mappings and recorded measurements are
+unchanged.
+
 Triggered by Tony's suspicion that the RSP1B itself, not the antenna or
 propagation, might be misconfigured: the same antenna hears FT8 very
 strongly (a different receiver, an FTdx10), but every manta field session
@@ -57,35 +61,31 @@ repo's own empirical data, not quoted from those threads.
 ## But minimum attenuation isn't automatically best either
 
 A live 60s `manta doctor` sweep on 20m (14030 kHz, same antenna/time
-window) shows an apparent interior peak (provisional -- see the follow-up below: the
-improved peak SNR coincided with artifact clusters, not confirmed CW), not
-"lower is always better":
+window) recorded the following character counts, peak SNR and verdicts.
+These measurements alone do not establish real-CW reception quality.
 
 | gain | chars_decoded | snr_db_max | verdict |
 |---|---|---|---|
-| 0 | 0 | -1.58 | `NoisyNoDecode` (worse than 40) |
+| 0 | 0 | -1.58 | `NoisyNoDecode` |
 | 10 | 6465 | 2.43 | `WeakNoDecode` |
 | 20 | 5008 | 6.52 (**best peak SNR of all tested**) | `WeakNoDecode` |
 | 30 | 3677 | 4.11 | `WeakNoDecode` |
 | 40 (prior sessions' value) | 1138 | 3.81 | `WeakNoDecode` |
 
-At `gain=0` (max sensitivity, min attenuation) the front end is plausibly
-overloaded/desensitized by broadband energy across the busy antenna and
-192 kHz passband -- worse than 40, not better. But `chars_decoded` fell at every step from 10 to 40 as attenuation
-increased (peak SNR did not: it peaked at 20, 6.52 dB, above 10's 2.43 dB),
-and `gain=40`'s own peak SNR (3.81 dB) and char count (1138) are both
-well below `gain=20`'s (6.52 dB, 5008 chars). The best-looking region for this
-antenna/band/time is around 10-20 rather than 40, provisionally -- and every prior
-field session's data should be read with this in mind: **the "almost no
-real CW heard" finding across all three prior live-hardware sessions may
-be partly explained by running the receiver 20-30 dB more
-attenuated than the better-looking settings, not by propagation, antenna, or a manta decoder
-bug.** No confirmed `Spot` was produced in any of these short 60s sweeps
-at any gain value, so this reframes rather than closes the open question
-from `2026-09-09-20m-dial-shift-edge-artifact-confirmed.md` (why 4/5
-known-strong RBN frequencies showed zero manta track activity) -- that
-test was run entirely at the old `gain=40` and should be re-run at a
-better-tuned value before drawing further conclusions from it.
+At `gain=0` (max sensitivity, min attenuation), the sweep recorded zero
+decoded characters and a -1.58 dB peak. It does not establish overload or
+desensitization as the cause. `chars_decoded` fell at every step from 10
+to 40 as attenuation increased. Peak SNR did not: in the gain 10-20
+range, only gain 20 (6.52 dB) exceeded gain 40 (3.81 dB); gain 10
+recorded 2.43 dB. Gain 30 (4.11 dB) also exceeded gain 40.
+
+No setting produced a confirmed `Spot` in these short 60s sweeps, so
+these values do not establish an optimum for receiving real CW or explain
+the earlier sessions' poor reception. The
+[dial-shift record](2026-09-09-20m-dial-shift-edge-artifact-confirmed.md)
+reported zero track activity at four of five remotely reported active
+frequencies at gain 40. Compare gains using a locally present real signal
+or raw-IQ dynamic-range measurements before selecting a preferred value.
 
 ## Blocked mid-session: SDRplay API service degraded
 
@@ -102,10 +102,10 @@ device; a proper holder check was not done. This points at the root-owned
 sdrplay_apiService`, `com.sdrplay.service.plist`) itself being wedged,
 requiring a privileged restart (`sudo launchctl kickstart -k
 system/com.sdrplay.service` or equivalent) that this session cannot
-perform without an interactive password. **Live-hardware verification of
-a better gain value is blocked until the service is restarted.**
+perform without an interactive password. Further live-hardware gain
+comparisons are blocked until streaming recovers.
 
-## Follow-up, same session: service restarted, device replugged, gain fix confirmed real but does NOT close the detection gap
+## Follow-up, same session: streaming recovered; gain-15 capture still showed no activity at the RBN targets
 
 `sudo launchctl kickstart` alone did not clear the wedged service (new
 PID confirmed via `ps`, but `activateStream()` still failed identically)
@@ -115,28 +115,27 @@ that, streaming activation worked cleanly again at every tested gain.
 A 6-minute `manta run --json` capture at `--soapy-gain 15` against a
 simultaneous fresh RBN capture (20m, nighttime this time -- different
 DX than the earlier daytime session, but the point is the same-window
-comparison) confirms the gain fix is real: `snr_2500_db` peaked at 18.65
-dB (vs. `gain=40`'s 3.81 dB, and the earlier short sweep's best of 6.52
-dB at `gain=20`) and total decoded-character volume was far higher.
+comparison) recorded a peak `snr_2500_db` of 18.65 dB, versus 3.81 dB at
+gain 40 and the earlier short sweep's maximum of 6.52 dB at gain 20.
+Total decoded-character volume was also far higher. These are different
+captures with different durations and RF conditions, not a controlled
+gain comparison or evidence of improved real-CW reception.
 
-**But it does not close the detection gap from
-`2026-09-09-20m-dial-shift-edge-artifact-confirmed.md`.** Checked against
-6 specific real, multi-skimmer-confirmed RBN spots in the exact capture
-window (K9YII @ 14037.0, WB7DND @ 14041.5, RT5T @ 14034.0, UA9URS @
-14022.8, W6ME @ 14052.5, W5MP @ 14012.5 kHz) -- **zero `TrackMeta` events
-within +/-3 kHz of any of them.** The 18.65 dB peak SNR traced back to
-the ~14075/14045 kHz artifact clusters (the same suspected-RTTY/unknown-
-interference clusters from the dial-shift doc), not a real CW station --
-and there was no RBN-confirmed spot at all near 14045-14050 kHz in this
-window either, so that in-CW-segment cluster isn't confirmed real either.
-A wider frequency search (+/-3 kHz, ruling out simple LO/calibration
-drift) still found nothing. Also notable: the passband-edge artifact's
-*share* of total track activity got worse at the better gain (~55% of
-all `TrackMeta` events in this run; the 28-35% at `gain=40` was computed
-from `TrackPromoted` events, so the two figures are not directly
-comparable and the direction is indicative only) -- less
-attenuation lets more energy through everywhere, including whatever's
-driving the edge-channel artifact.
+Checked against six stations reported active by multiple remote RBN
+skimmers in the exact capture window (K9YII @ 14037.0, WB7DND @ 14041.5,
+RT5T @ 14034.0, UA9URS @ 14022.8, W6ME @ 14052.5, W5MP @ 14012.5 kHz),
+there were zero `TrackMeta` events within +/-3 kHz of any of them. Remote
+reception does not establish their strength or receivability at this
+RSP1B's QTH. The 18.65 dB peak traced back to the ~14075/14045 kHz
+artifact/interference clusters, not a confirmed real CW station. There
+was no RBN-confirmed spot near 14045-14050 kHz in this window either;
+that absence does not identify the cluster's origin. The wider +/-3 kHz
+search still found no activity at the six targets.
+
+The passband-edge clusters accounted for ~55% of `TrackMeta` events in
+this run; the 28-35% at gain 40 came from `TrackPromoted` events. These
+unlike event denominators cannot establish whether the share increased
+or decreased, or how gain affected it.
 
 A same-session audit of every other RSP1B-specific setting manta doesn't
 explicitly touch came back clean: `biasT_ctrl=false`, `rfnotch_ctrl=
@@ -146,15 +145,16 @@ and DC-offset correction on (both beneficial), and `bandwidth` auto-
 selected to 200 kHz (correctly matched to the 192 kHz sample rate, not
 suspiciously wide). None of these explain the gap.
 
-**Conclusion: the gain-scale bug was real and worth fixing, but it is not
-the (or not the whole) explanation for "almost no real CW heard."**
-Something else -- most plausibly the physical antenna/feedline path
-specifically feeding the RSP1B (distinct from whatever feeds the
-FTdx10), or a detector/DSP issue that only manifests on real narrowband
-CW under real noise and isn't caught by synthetic Watterson-channel test
-vectors -- is still preventing this receive chain from hearing signals
-that other stations clearly hear. Not resolvable from software
-alone tonight.
+The gain-reduction mapping is established; a reception improvement or a
+cause for the missing local track activity is not. Establish local
+reception with raw IQ and a local reference check before ranking RF-path
+and detector/DSP explanations. The later
+[MAN-171 record](2026-09-10-man171-dead-zone-is-rf-path-not-manta-code.md)
+explains the remote-SNR caveat and used a WWV check as additional local
+evidence. It does not retroactively measure these September 9 captures.
+As the [antenna-path record](2026-09-10-antenna-path-fix-resolves-detection-gap.md)
+notes, an isolated 10 MHz bin does not identify WWV without
+modulation/sideband or equivalent evidence.
 
 ## Next steps
 
@@ -162,18 +162,15 @@ alone tonight.
    needed a physical USB replug of the RSP1B (both are human/privileged
    actions; note for next time a stream won't activate despite the
    service looking fresh).
-2. Physically verify the RSP1B's actual antenna connection: is it truly
-   tapped off the same feedline as the FTdx10 (splitter/multicoupler), is
-   that connection solid, and does swapping which receiver sits on which
-   tap change which one hears real CW? This is the most direct way to
-   tell "antenna path to the RSP1B specifically" from "manta's detector"
-   as the culprit.
-3. If the antenna path checks out, the detector/DSP side needs real
-   investigation -- e.g. capture a raw IQ file at a known-strong RBN
-   frequency and inspect it independently of manta's own track/detector
-   pipeline (a spectrum/waterfall view, or a minimal non-manta CW
-   demodulator) to see if the signal is present in the IQ stream at all
-   before blaming detection logic.
+2. Establish whether the remotely reported CW targets are locally present
+   using raw IQ and a local reference check before assigning a cause to
+   the receiver or detector. Inspect the IQ independently of manta's
+   track/detector pipeline with a spectrum/waterfall view or a minimal
+   CW demodulator.
+3. Use that local evidence to guide checks of the RSP1B's antenna/feedline,
+   gain settings and detector/DSP behavior. A feedline/tap comparison
+   with the FTdx10 can test the RF-path hypothesis; the remote RBN
+   reports alone do not rank it above other explanations.
 4. Consider whether `manta`'s `--soapy-gain` CLI docs/help text should
    warn explicitly that higher values mean *more* attenuation on this
    driver, since that's the opposite of the ordinary-English reading of
