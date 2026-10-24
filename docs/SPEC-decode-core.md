@@ -1283,9 +1283,17 @@ ll(d | dah) = −(ln d − ln μ_dah)² / (2·0.25²)
 ```
 
 (σ = 0.25 ⇒ ±28 % duration at 1σ — measured human keying jitter is 10–20 %,
-QSB-induced edge erosion adds the rest. **This is the riskiest constant in
-the spec**; it is config `decode.timing_sigma` and must be validated against
-the golden corpus at M3.)
+QSB-induced edge erosion adds the rest. σ is config `decode.timing_sigma`.
+Once called the riskiest constant in this spec: validated 2026-09 (MAN-9,
+decision 5) and re-measured at MAN-120 — it is **decode-invariant**: every
+hypothesis surviving a beam step has consumed the same marks, so σ enters
+each candidate's score as a common positive factor and cannot change the
+emitted glyph, the beam order, or the truncation set; it scales
+`confidence` only (measured: spot confidence 0.55 → 0.20 as σ goes 0.10 →
+1.50 with byte-identical decode text on V1 and V5). The non-inert sibling
+is beam width (§4.4): width 1 changed V5's decode; widths 2–16 measured
+identical to the default 4. Both properties are pinned by
+`crates/manta-engine/tests/beam_constant_invariance.rs`.)
 
 Spaces inside a character contribute no score (already classified by §4.2);
 the character boundary decision itself is hard, not beamed — beaming gap

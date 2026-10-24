@@ -1,5 +1,5 @@
 import csv, importlib.util, io, json, math, os, re, tempfile, unittest, zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(__file__)
 spec = importlib.util.spec_from_file_location("shadow_compare", os.path.join(HERE, "..", "shadow-compare.py"))
@@ -54,6 +54,8 @@ RBN_DAY2 = [
 
 PASSBANDS = ["--passband-khz", "14000-14070", "--passband-khz", "7000-7040"]
 WINDOW = ["--start", "2026-09-09T00:00:00Z", "--end", "2026-09-11T00:00:00Z"]
+OFFSET_WINDOW = ["--start", "2026-09-09T00:00:00-05:00", "--end", "2026-09-10T00:00:00-05:00"]
+SAME_INSTANTS_Z = ["--start", "2026-09-09T05:00:00Z", "--end", "2026-09-10T05:00:00Z"]
 
 
 def write_rbn_csv(path, rows):
@@ -418,6 +420,41 @@ class ShadowCompareTest(unittest.TestCase):
         self.assertEqual(int(m.group(1)), a["node_only_corroborated"])
         self.assertEqual(a["node_confirmed_by_primary"] + a["node_only_corroborated"] + a["uncorroborated"],
                          a["node_spots"])
+
+    def test_offset_window_recorded_as_its_utc_instant(self):
+        # PR #219 review comment 4223328415 (MAN-280): the window line and JSON inputs
+        # must name the window actually evaluated, not echo the stored wall clock with a Z.
+        code, out, err, summary = self.run_tool(window=OFFSET_WINDOW)
+        self.assertEqual(code, 0, err)
+        self.assertIn("- Window (UTC): 2026-09-09T05:00:00Z to 2026-09-10T05:00:00Z "
+                      "(start inclusive, end exclusive)", out)
+        self.assertEqual(summary["inputs"]["start"], "2026-09-09T05:00:00Z")
+        self.assertEqual(summary["inputs"]["end"], "2026-09-10T05:00:00Z")
+
+    def test_z_window_recorded_unchanged(self):
+        code, out, err, summary = self.run_tool(window=["--start", "2026-09-09T00:00:00Z",
+                                                        "--end", "2026-09-10T00:00:00Z"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("- Window (UTC): 2026-09-09T00:00:00Z to 2026-09-10T00:00:00Z "
+                      "(start inclusive, end exclusive)", out)
+        self.assertEqual(summary["inputs"]["start"], "2026-09-09T00:00:00Z")
+        self.assertEqual(summary["inputs"]["end"], "2026-09-10T00:00:00Z")
+
+    def test_offset_window_summary_equals_z_window_summary(self):
+        # Same instants in two spellings: identical evaluation, only the labels differ.
+        _, _, _, a = self.run_tool(window=OFFSET_WINDOW)
+        _, _, _, b = self.run_tool(window=SAME_INSTANTS_Z)
+        for k in ("start", "end"):
+            a["inputs"].pop(k); b["inputs"].pop(k)
+        self.assertEqual(a, b)
+
+    def test_iso_unit_converts_before_labelling(self):
+        self.assertEqual(sc._iso(datetime(2026, 9, 9, tzinfo=timezone(timedelta(hours=-5)))),
+                         "2026-09-09T05:00:00Z")
+        self.assertEqual(sc._iso(datetime(2026, 9, 9, tzinfo=timezone(timedelta(hours=5, minutes=30)))),
+                         "2026-09-08T18:30:00Z")  # date rolls back across +05:30
+        self.assertEqual(sc._iso(datetime(2026, 9, 9, tzinfo=timezone.utc)), "2026-09-09T00:00:00Z")
+        self.assertEqual(sc._iso(datetime(2026, 9, 9)), "2026-09-09T00:00:00Z")  # naive = UTC
 
 
 if __name__ == "__main__":

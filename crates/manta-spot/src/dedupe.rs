@@ -7,10 +7,20 @@
 //! one channel ([`CROSS_INPUT_MAX_HZ`]) of the stored spot across a bucket
 //! edge. No SNR or spot-type override applies across inputs: two receivers
 //! hearing one transmission must not spot it twice just because one antenna
-//! hears it 6 dB louder. A report from the stored spot's own input keeps
-//! the single-input rule unchanged. The stored timestamp never moves
-//! backwards: an override emitted with an older `sample_ts` (another
-//! input's batch merged late) keeps the newer one.
+//! hears it 6 dB louder. The stored timestamp never moves backwards: an
+//! override emitted with an older `sample_ts` (another input's batch merged
+//! late) keeps the newer one.
+//!
+//! MAN-120: a report from the stored spot's **own input** that lands in
+//! the neighbouring bucket within one channel of the stored spot is the
+//! same station straddling a 300 Hz bucket edge, and is withheld as a
+//! repeat (same-input SNR/type overrides still apply) -- the same
+//! Hz-bounded neighbour join the repetition gate adopted in MAN-175
+//! (`gate.rs`), never bare bucket adjacency (a bare join reaches ~200 Hz
+//! apart). This supersedes the same-input-unchanged sliver of MAN-13's
+//! D6; the wider tolerance-versus-bucket question for all spots stays
+//! with MAN-16
+//! (docs/DECISIONS/2026-09-03-cross-source-dedup-algorithm-spike.md).
 
 use crate::context::SpotType;
 use std::collections::BTreeMap;
@@ -74,9 +84,35 @@ impl Dedupe {
     /// `should_emit` with a `sample_ts` older than what's already
     /// recorded here -- that would silently roll the watermark backward
     /// and let a later real spot escape the suppression window early.
-    pub(crate) fn last_sample_ts(&self, callsign: &str, freq_hz: f64) -> Option<u64> {
-        let key = (callsign.to_string(), Self::bucket(freq_hz));
-        self.last.get(&key).map(|s| s.sample_ts)
+    ///
+    /// MAN-120: the identity includes `input`'s own spot one bucket over
+    /// within one channel (`assess`'s same-input edge join), so the peek
+    /// returns the newer of the two stored timestamps -- a newer spot of
+    /// the same station across the edge makes the deferred candidate
+    /// stale too (Codex review on PR #387).
+    pub(crate) fn last_sample_ts(&self, callsign: &str, freq_hz: f64, input: u32) -> Option<u64> {
+        let bucket = Self::bucket(freq_hz);
+        let own = self
+            .last
+            .get(&(callsign.to_string(), bucket))
+            .map(|s| s.sample_ts);
+        let across_edge = self
+            .last
+            .get(&(callsign.to_string(), Self::neighbour(freq_hz, bucket)))
+            .filter(|prev| {
+                prev.input == input && (freq_hz - prev.freq_hz).abs() < CROSS_INPUT_MAX_HZ
+            })
+            .map(|s| s.sample_ts);
+        own.max(across_edge)
+    }
+
+    /// The bucket across the 300 Hz edge nearer to `freq_hz`.
+    fn neighbour(freq_hz: f64, bucket: i64) -> i64 {
+        if freq_hz / FREQ_BUCKET_HZ >= bucket as f64 {
+            bucket + 1
+        } else {
+            bucket - 1
+        }
     }
 
     /// True if a spot for this `(callsign, freq_hz)` should be emitted now
@@ -124,11 +160,7 @@ impl Dedupe {
         // MAN-13: a different input's spot one bucket over, within one
         // channel, is the same signal straddling the edge -- whatever this
         // bucket holds (nothing, an expired spot, or this input's own).
-        let neighbour = if freq_hz / FREQ_BUCKET_HZ >= bucket as f64 {
-            bucket + 1
-        } else {
-            bucket - 1
-        };
+        let neighbour = Self::neighbour(freq_hz, bucket);
         let across_edge = self
             .last
             .get(&(callsign.to_string(), neighbour))
@@ -160,6 +192,36 @@ impl Dedupe {
                     }
                 }
             }
+        };
+        // MAN-120: an own-key Emit whose neighbouring bucket holds this
+        // same input's in-window spot within one channel is the same
+        // station straddling the 300 Hz edge -- withhold it as a repeat
+        // unless the same-input overrides (SNR jump / type change) hold
+        // against that entry. Hz-bounded like the gate's MAN-175 anchor
+        // join, never bare bucket adjacency (which reaches ~200 Hz apart,
+        // `gate.rs`'s recorded incident). A neighbour entry from another
+        // input cannot reach here in-window within one channel: the
+        // `across_edge` check above already returned `WithheldCrossInput`
+        // for exactly that shape, so `prev.input != input` would mean an
+        // expired or beyond-one-channel entry, which these range checks
+        // filter anyway. A withheld report stores nothing, so every
+        // stored entry and `last_sample_ts` are untouched by
+        // construction: state moves only where today's Emit path below
+        // already stored.
+        let outcome = if outcome == DedupeOutcome::Emit
+            && self
+                .last
+                .get(&(callsign.to_string(), neighbour))
+                .is_some_and(|prev| {
+                    prev.input == input
+                        && (freq_hz - prev.freq_hz).abs() < CROSS_INPUT_MAX_HZ
+                        && in_window(prev)
+                        && !(snr_db - prev.snr_db >= SNR_IMPROVEMENT_DB
+                            || spot_type != prev.spot_type)
+                }) {
+            DedupeOutcome::WithheldRepeat
+        } else {
+            outcome
         };
         if outcome == DedupeOutcome::Emit {
             let stored_ts = self
@@ -198,11 +260,89 @@ mod tests {
         assert!(d.should_emit("W1AW", 14_012_540.0, 20.0, SpotType::Cq, 0, 0));
         assert!(d.should_emit("W1AW", 14_012_560.0, 20.0, SpotType::Cq, window + 1000, 1));
         assert!(!d.should_emit("W1AW", 14_012_540.0, 20.0, SpotType::Cq, window + 2000, 0));
-        // One input alone keeps today's rule: its expired spot re-emits.
+        // One input alone: an *expired* cross-edge spot re-emits; an
+        // in-window one is a repeat (MAN-120).
         let mut one = Dedupe::new(FS);
         assert!(one.should_emit("W1AW", 14_012_540.0, 20.0, SpotType::Cq, 0, 0));
         assert!(one.should_emit("W1AW", 14_012_560.0, 20.0, SpotType::Cq, window + 1000, 0));
-        assert!(one.should_emit("W1AW", 14_012_540.0, 20.0, SpotType::Cq, window + 2000, 0));
+        assert!(!one.should_emit("W1AW", 14_012_540.0, 20.0, SpotType::Cq, window + 2000, 0));
+    }
+
+    // MAN-120: same-input straddle across a 300 Hz bucket edge.
+
+    /// The ticket's gherkin scenario, pinned: a station whose frequency
+    /// sits on a 300 Hz bucket boundary and drifts 2 Hz across it between
+    /// spots is one station. bucket(14_012_549) == 46_708 and
+    /// bucket(14_012_551) == 46_709, so the drift crosses the edge at
+    /// 14_012_550 Hz. Reproduced failing at HEAD by the MAN-120 plan
+    /// phase: the second report emitted ("DOUBLE-SPOTTED: same input,
+    /// same station, 2 Hz drift across a bucket edge").
+    #[test]
+    fn same_input_report_across_a_bucket_edge_within_one_channel_is_a_repeat() {
+        let mut d = Dedupe::new(FS);
+        assert_eq!(Dedupe::bucket(14_012_549.0), 46_708);
+        assert_eq!(Dedupe::bucket(14_012_551.0), 46_709);
+        assert_eq!(
+            d.assess("W1AW", 14_012_549.0, 20.0, SpotType::Cq, 0, 0),
+            DedupeOutcome::Emit
+        );
+        assert_eq!(
+            d.assess("W1AW", 14_012_551.0, 20.0, SpotType::Cq, FS as u64, 0),
+            DedupeOutcome::WithheldRepeat
+        );
+    }
+
+    /// The same-input overrides travel with the join: a +6 dB SNR jump
+    /// across the edge emits (and stores -- the follow-up without the
+    /// override is then an own-key repeat).
+    #[test]
+    fn same_input_snr_jump_across_the_edge_still_emits() {
+        let mut d = Dedupe::new(FS);
+        assert!(d.should_emit("W1AW", 14_012_549.0, 20.0, SpotType::Cq, 0, 0));
+        assert!(d.should_emit("W1AW", 14_012_551.0, 26.0, SpotType::Cq, FS as u64, 0));
+        assert!(!d.should_emit("W1AW", 14_012_551.0, 26.0, SpotType::Cq, 2 * FS as u64, 0));
+    }
+
+    /// ... and so does a spot-type change.
+    #[test]
+    fn same_input_type_change_across_the_edge_still_emits() {
+        let mut d = Dedupe::new(FS);
+        assert!(d.should_emit("W1AW", 14_012_549.0, 20.0, SpotType::Cq, 0, 0));
+        assert!(d.should_emit("W1AW", 14_012_551.0, 20.0, SpotType::De, FS as u64, 0));
+        assert!(!d.should_emit("W1AW", 14_012_551.0, 20.0, SpotType::De, 2 * FS as u64, 0));
+    }
+
+    /// Hz-bounded, not bare adjacency (gate.rs's MAN-175 lesson: a bare
+    /// ±1-bucket join reaches ~200 Hz apart): 14_012_500 and 14_012_600
+    /// round to adjacent buckets but sit 100 Hz apart -- more than one
+    /// channel -- so they are two different stations.
+    #[test]
+    fn same_input_across_edge_more_than_one_channel_away_emits() {
+        let mut d = Dedupe::new(FS);
+        assert_ne!(Dedupe::bucket(14_012_500.0), Dedupe::bucket(14_012_600.0));
+        assert!(d.should_emit("W1AW", 14_012_500.0, 20.0, SpotType::Cq, 0, 0));
+        assert!(d.should_emit("W1AW", 14_012_600.0, 20.0, SpotType::Cq, FS as u64, 0));
+    }
+
+    /// An expired neighbour-bucket spot no longer joins: the window
+    /// elapsed, so this is a fresh transmission.
+    #[test]
+    fn same_input_across_edge_after_the_window_elapses_emits() {
+        let mut d = Dedupe::new(FS);
+        let window = (SUPPRESSION_SECONDS * FS) as u64;
+        assert!(d.should_emit("W1AW", 14_012_549.0, 20.0, SpotType::Cq, 0, 0));
+        assert!(d.should_emit("W1AW", 14_012_551.0, 20.0, SpotType::Cq, window + 1000, 0));
+    }
+
+    /// Wobbling back and forth across the edge is withheld in both
+    /// directions: the cross-edge report via the neighbour join, the
+    /// return via the own-key entry it never overwrote.
+    #[test]
+    fn straddle_then_drift_back_is_withheld_both_ways() {
+        let mut d = Dedupe::new(FS);
+        assert!(d.should_emit("W1AW", 14_012_549.0, 20.0, SpotType::Cq, 0, 0));
+        assert!(!d.should_emit("W1AW", 14_012_551.0, 20.0, SpotType::Cq, FS as u64, 0));
+        assert!(!d.should_emit("W1AW", 14_012_549.0, 20.0, SpotType::Cq, 2 * FS as u64, 0));
     }
 
     #[test]
@@ -317,7 +457,7 @@ mod tests {
         assert!(d.should_emit("W1AW", 14_012_340.0, 20.0, SpotType::Cq, 50_000, 0));
         // A late-merged, older report that still emits through an SNR jump.
         assert!(d.should_emit("W1AW", 14_012_340.0, 30.0, SpotType::Cq, 10_000, 0));
-        assert_eq!(d.last_sample_ts("W1AW", 14_012_340.0), Some(50_000));
+        assert_eq!(d.last_sample_ts("W1AW", 14_012_340.0, 0), Some(50_000));
     }
 
     /// MAN-14: `assess` names the withhold reason.
