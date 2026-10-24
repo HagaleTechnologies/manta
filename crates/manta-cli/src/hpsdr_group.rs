@@ -549,19 +549,11 @@ impl Endpoints {
         self.started.get_or_init(|| {
             for (i, group) in self.groups.iter().enumerate() {
                 let endpoints = self.clone();
-                let (host, port) = (group.host.clone(), group.port);
+                let group = group.clone();
                 let spawn = std::thread::Builder::new()
                     .name("hpsdr-resolve".into())
                     .spawn(move || {
-                        let result = (host.as_str(), port)
-                            .to_socket_addrs()
-                            // Name the endpoint: any group's worker may report it.
-                            .map_err(|e| format!("{host}:{port}: {e}"))
-                            .and_then(|mut addresses| {
-                                addresses
-                                    .find(|a| a.is_ipv4())
-                                    .ok_or_else(|| format!("no IPv4 address for {host}:{port}"))
-                            });
+                        let result = resolve(&group);
                         endpoints.results.lock().expect("HPSDR endpoints poisoned")[i] =
                             Some(result);
                         endpoints.changed.notify_all();
@@ -612,6 +604,32 @@ impl Endpoints {
     }
 }
 
+/// One radio's address: its configured host, or (MAN-306) the radio
+/// discovery selects, by MAC when the entry pins one. Errors name the
+/// endpoint, since any group's worker may report them.
+fn resolve(group: &HpsdrAllocation) -> std::result::Result<SocketAddr, String> {
+    let port = group.port;
+    let Some(host) = &group.host else {
+        use manta_input::hpsdr::discovery::{broadcast_destinations, select_radio};
+        let mac = group
+            .mac
+            .as_deref()
+            .map(crate::parse_hpsdr_mac)
+            .transpose()?;
+        return select_radio(port, &broadcast_destinations(port), mac)
+            .map(|radio| SocketAddr::new(radio.ip, port))
+            .map_err(|e| format!("{}: {e}", group.endpoint()));
+    };
+    (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|e| format!("{host}:{port}: {e}"))
+        .and_then(|mut addresses| {
+            addresses
+                .find(|a| a.is_ipv4())
+                .ok_or_else(|| format!("no IPv4 address for {host}:{port}"))
+        })
+}
+
 pub(crate) fn prepare(
     allocations: Vec<HpsdrAllocation>,
     inputs: &[ResolvedInput],
@@ -650,7 +668,7 @@ pub(crate) fn prepare(
                             &peer.ip().to_string(),
                             peer.port(),
                         )?;
-                        let endpoint = format!("{}:{}", allocation.host, allocation.port);
+                        let endpoint = allocation.endpoint();
                         if let Some(count) = count {
                             if allocation.members.len() > count {
                                 bail!("HPSDR radio at {endpoint} has {count} receivers; {} bands are configured", allocation.members.len());
@@ -667,10 +685,20 @@ pub(crate) fn prepare(
                 bail!("HPSDR startup cancelled");
             }
             // The first open uses the probed address. A reopen resolves the
-            // configured host again, as a standalone HPSDR input does, so a
-            // radio that changed address comes back without a restart.
+            // configured host again (or rediscovers a hostless radio,
+            // MAN-306), as a standalone HPSDR input does, so a radio that
+            // changed address comes back without a restart.
             let (host, port) = if reopen {
-                (allocation.host.clone(), allocation.port)
+                match &allocation.host {
+                    Some(host) => (host.clone(), allocation.port),
+                    // Rediscovery here is outage without any offset
+                    // bookkeeping: `started_at` below is an absolute
+                    // instant taken after it, not an offset from entry.
+                    None => {
+                        let peer = resolve(&allocation).map_err(anyhow::Error::msg)?;
+                        (peer.ip().to_string(), peer.port())
+                    }
+                }
             } else {
                 (peer.ip().to_string(), peer.port())
             };
@@ -703,9 +731,10 @@ pub(crate) fn prepare(
                 return Ok(Opened {
                     sources: vec![source],
                     started_at,
-                    // A protocol-2 radio stops on drop (run 0); a boxed
-                    // protocol-1 receiver detaches its slot, as the
-                    // standalone path's reopen always has.
+                    // The lone source owns its session: a protocol-2
+                    // radio stops on drop (run 0), and so does the
+                    // protocol-1 receiver `open_receiver` returns
+                    // (MAN-306), before this member's next wait reopens.
                     retire: Box::new(|| {}),
                 });
             }
