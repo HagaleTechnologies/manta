@@ -12,6 +12,7 @@ Add a row here in the same change that adds a record:
 | Date | Ticket | Title |
 |---|---|---|
 | 2026-10-23 | MAN-277 | [MAN-277: `field-node.py sample` rejects a non-finite or out-of-range `--interval-s`](2026-10-23-man277-sample-interval-bound.md) |
+| 2026-10-23 | MAN-266 | [MAN-266: a corrected release tag takes `:latest` beside its rejected leading-zero twin](2026-10-23-man266-corrected-release-latest.md) |
 | 2026-10-23 | MAN-279 | [MAN-279: a planned-restart window counts only when the restart happened](2026-10-23-man279-planned-window-needs-a-restart.md) |
 | 2026-10-23 | MAN-280 | [MAN-280: shadow-compare renders the comparison window in true UTC](2026-10-23-man280-shadow-compare-utc-window.md) |
 | 2026-10-23 | MAN-220 | [MAN-220: the Dependabot diff verifier reads omitted requirement components as Cargo does; a lockfile edge may follow its target's own bump](2026-10-23-man220-dependency-verifier-omitted-components-and-followed-bumps.md) |
