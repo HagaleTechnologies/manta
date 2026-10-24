@@ -426,3 +426,17 @@ fn node_guide_leads_with_the_aggregator_route_and_marks_the_uplink_experimental(
         "step 5 never calls the uplink experimental"
     );
 }
+
+#[test]
+fn raspberry_pi_guide_explains_hpsdr_discovery_and_mac_pinning() {
+    let guide = doc("docs/GUIDES/raspberry-pi.md");
+    for needle in [
+        "discovers the only available radio",
+        "manta devices",
+        "MACs and board types",
+        "instead of `mac` to bypass discovery",
+    ] {
+        assert!(guide.contains(needle), "missing {needle}");
+    }
+    assert!(!guide.contains("host = \"<your-hpsdr-host>\""));
+}

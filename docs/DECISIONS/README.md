@@ -11,7 +11,11 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+<<<<<<< HEAD
 | 2026-10-23 | MAN-266 | [MAN-266: a corrected release tag takes `:latest` beside its rejected leading-zero twin](2026-10-23-man266-corrected-release-latest.md) |
+=======
+| 2026-10-23 | MAN-179 | [MAN-179: the MAN-166 writeup's 41,174 and 409,675 count different track populations](2026-10-23-man179-man166-track-populations.md) |
+>>>>>>> be8e088ac083f267d0ebd1e81d0cce6c6a0b150f
 | 2026-10-23 | MAN-195 | [MAN-195: `spectral_beta = 0.0` skips the spectral-reference scan](2026-10-23-man195-spectral-beta-zero-skips-spectral-reference-scan.md) |
 | 2026-10-23 | MAN-158 | [MAN-158: ROADMAP holds gates and pointers; SECURITY.md states the shipped scope](2026-10-23-man158-roadmap-security-scope-refresh.md) |
 | 2026-10-23 | MAN-176 | [Superseded track-cap defaults in decision records](2026-10-23-man176-track-cap-default-docs.md) |
@@ -25,6 +29,7 @@ Add a row here in the same change that adds a record:
 | 2026-10-19 | MAN-14 | [MAN-14: each receiver's hearing on /metrics, the status line and /status](2026-10-19-man14-per-receiver-hearing-visibility.md) |
 | 2026-10-19 | MAN-307 | [MAN-307: several bands from one HPSDR radio](2026-10-19-man307-hpsdr-multiple-receivers.md) |
 | 2026-10-19 | MAN-305 | [MAN-305: protocol-2 openHPSDR radios are inputs; the protocol is discovered, and lost datagrams reach the decoder as missing input](2026-10-19-man305-hpsdr-protocol-2-input.md) |
+| 2026-10-19 | MAN-306 | [Discover an openHPSDR radio when no address is configured](2026-10-19-man306-openhpsdr-discovery.md) |
 | 2026-10-18 | MAN-398 | [MAN-398: gap-corroborated recovery from a fragment-seeded speed lock](2026-10-18-man398-gap-corroborated-badlock-recovery.md) |
 | 2026-10-17 | MAN-108 | [MAN-108: a fading signal keeps its track through the fade (DORMANT re-acquisition)](2026-10-17-man108-dormant-track-reacquisition.md) |
 | 2026-10-17 | MAN-310 | [MAN-310: "all bands" skims the standard CW segments a receiver can tune](2026-10-17-man310-band-plan.md) |
