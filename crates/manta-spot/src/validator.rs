@@ -297,7 +297,8 @@ pub struct SuppressionCounts {
     /// A captured `PendingBeacon` discarded at resolution because a spot
     /// for the same (callsign, frequency bucket) with a strictly newer
     /// `sample_ts` was already emitted, so emitting it would rewind
-    /// `Dedupe`'s watermark (MAN-174).
+    /// `Dedupe`'s watermark (MAN-174) -- or, since MAN-120, because the
+    /// same input's newer spot sits one bucket over within one channel.
     pub pending_beacon_stale: u64,
     /// Power-step beacon occurrences (MAN-37 `<call> T`) discarded by the
     /// coarse whole-window CQ/DE framing guard -- see `context::parse`'s own
@@ -1791,8 +1792,12 @@ impl Validator {
                 // completing a word on the same input hop -- so it goes
                 // through `should_emit` exactly like a non-deferred
                 // candidate: suppressed as a duplicate, or emitted on a
-                // spot-type change or SNR jump (MAN-174).
-                if let Some(last_ts) = self.dedupe.last_sample_ts(&pb.candidate, pb.freq_hz) {
+                // spot-type change or SNR jump (MAN-174). MAN-120: the
+                // identity includes this input's own spot one bucket over
+                // within one channel (Codex review on PR #387).
+                let input = self.input_of(pb.origin_track_id);
+                if let Some(last_ts) = self.dedupe.last_sample_ts(&pb.candidate, pb.freq_hz, input)
+                {
                     if pb.sample_ts < last_ts {
                         self.suppression_counts.pending_beacon_stale += 1;
                         self.decide(|| {
@@ -1801,7 +1806,6 @@ impl Validator {
                         return None;
                     }
                 }
-                let input = self.input_of(pb.origin_track_id);
                 let outcome = self.dedupe.assess(
                     &pb.candidate,
                     pb.freq_hz,
@@ -2998,7 +3002,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let newer_ts = spots2[0].sample_ts;
 
         assert_eq!(
-            v.dedupe.last_sample_ts("K5ARH", 14_000_000.0),
+            v.dedupe.last_sample_ts("K5ARH", 14_000_000.0, 0),
             Some(newer_ts),
             "dedupe must have recorded the newer, ordinary spot's timestamp"
         );
@@ -3021,12 +3025,67 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             "an already-superseded deferred candidate must not emit, got {spots3:?}"
         );
         assert_eq!(
-            v.dedupe.last_sample_ts("K5ARH", 14_000_000.0),
+            v.dedupe.last_sample_ts("K5ARH", 14_000_000.0, 0),
             Some(newer_ts),
             "resolving the stale deferred candidate must not roll the \
              dedupe watermark backward"
         );
         // MAN-174 finding 6: the stale drop is counted.
+        assert_eq!(v.suppression_counts().pending_beacon_stale, 1);
+    }
+
+    /// MAN-120 (Codex review on PR #387): the same shape across a 300 Hz
+    /// bucket edge. The newer ordinary spot is stored one bucket over,
+    /// 2 Hz away -- the same station under MAN-120's same-input edge
+    /// join -- so the older deferred Beacon is stale against it too, and
+    /// must not emit on its spot-type change.
+    #[test]
+    fn resolved_beacon_never_emits_against_a_newer_spot_across_a_bucket_edge() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        let meta = |v: &mut Validator, track_id: u32, freq_hz: f64| {
+            v.ingest(&DecoderEvent::TrackMeta {
+                track_id,
+                sample_ts: 0,
+                snr_2500_db: 20.0,
+                freq_hz,
+            });
+        };
+
+        // bucket(14_012_549) == 46_708, bucket(14_012_551) == 46_709.
+        meta(&mut v, 1, 14_012_549.0);
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 1_000), &mut v);
+        assert!(spots.is_empty(), "should be captured, not yet resolved");
+
+        meta(&mut v, 2, 14_012_551.0);
+        let words2 = ["DE", "K5ARH", "K"];
+        let mut spots2 = run(&transmission_events(2, &words2, 5_000_000), &mut v);
+        spots2.extend(run(&transmission_events(2, &words2, 5_100_000), &mut v));
+        assert_eq!(spots2.len(), 1, "the ordinary path must spot normally");
+        let newer_ts = spots2[0].sample_ts;
+        assert_eq!(
+            v.dedupe.last_sample_ts("K5ARH", 14_012_549.0, 0),
+            Some(newer_ts),
+            "the peek must see the same input's spot across the edge"
+        );
+
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots3 = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(
+            spots3.is_empty(),
+            "an older deferred Beacon across the edge from a newer spot of \
+             the same station must not emit, got {spots3:?}"
+        );
+        assert_eq!(
+            v.dedupe.last_sample_ts("K5ARH", 14_012_551.0, 0),
+            Some(newer_ts),
+            "the newer spot's watermark must stand"
+        );
         assert_eq!(v.suppression_counts().pending_beacon_stale, 1);
     }
 
