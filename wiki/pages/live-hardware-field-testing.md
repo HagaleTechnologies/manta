@@ -120,8 +120,9 @@ statistical answer yet.
 
 The frequency-clustering data point from the original finding is still
 worth knowing when you see the same defect: only one of the observed
-clusters is dial-shift-confirmed as tracking the input passband edge
-specifically; the others sit well inside the passband with an unconfirmed
+clusters has dial-shift evidence for an input-passband-edge mechanism,
+and it supports a hypothesis rather than confirming it (the record's
+Finding 2); the others sit well inside the passband with an unconfirmed
 mechanism. A dial-shift test (retune, see if a cluster moves with the new
 passband edge) is the fast way to check a given cluster. **Not confirmed
 as MAN-7/103** (that's a per-channel WPM-*estimation* bug on a real
