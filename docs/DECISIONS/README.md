@@ -11,11 +11,8 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
-<<<<<<< HEAD
 | 2026-10-24 | MAN-282 | [MAN-282: an absurd `--timeout-secs` fails with a plain error — 2 for `manta status`, 1 for `manta health` — instead of a panic](2026-10-24-man282-timeout-secs-overflow.md) |
-=======
 | 2026-10-23 | MAN-220 | [MAN-220: the Dependabot diff verifier reads omitted requirement components as Cargo does; a lockfile edge may follow its target's own bump](2026-10-23-man220-dependency-verifier-omitted-components-and-followed-bumps.md) |
->>>>>>> d9b54644126ab172f5c61de514cb47df140c79d5
 | 2026-10-23 | MAN-179 | [MAN-179: the MAN-166 writeup's 41,174 and 409,675 count different track populations](2026-10-23-man179-man166-track-populations.md) |
 | 2026-10-23 | MAN-195 | [MAN-195: `spectral_beta = 0.0` skips the spectral-reference scan](2026-10-23-man195-spectral-beta-zero-skips-spectral-reference-scan.md) |
 | 2026-10-23 | MAN-158 | [MAN-158: ROADMAP holds gates and pointers; SECURITY.md states the shipped scope](2026-10-23-man158-roadmap-security-scope-refresh.md) |
