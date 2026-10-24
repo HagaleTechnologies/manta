@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-10-19T13:34:50Z",
+  "generated_at": "2026-10-22T14:52:00Z",
   "head_commit": "1826448",
   "pages": [
     {
@@ -172,7 +172,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:97b8d8e662d81af89ee8cb5322519a7eef0298a4b416f03372f20e1a34410b18",
+      "hash": "sha256:a5be19671c5e7f4b50b1165916e23bd242faad3e99a7e8439d23b4b6b5269628",
       "id": "live-hardware-field-testing",
       "kind": "howto",
       "links": [
@@ -267,7 +267,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:e88333e03827c806dde99f4c1d8950a6ec13f9bbd36f9f47276efe390cbc4c37",
+      "hash": "sha256:70e05a68528eae9a2cf1a799a43c8482e4e70b3a063d7f113b87cddc869fb9b8",
       "id": "source-reconnect",
       "kind": "gotcha",
       "links": [
@@ -284,12 +284,14 @@
         "crates/manta-input/src/lib.rs (IqSource::take_discontinuity)",
         "crates/manta-input/src/lib.rs (IqSource::acquisition_start_offset)",
         "docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md",
-        "docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md"
+        "docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md",
+        "docs/DECISIONS/2026-10-19-man307-hpsdr-multiple-receivers.md",
+        "crates/manta-cli/src/hpsdr_group.rs"
       ],
       "status": "current",
       "title": "What's the gotcha with a live source disconnecting?",
-      "verified_commit": "b8b9367",
-      "verified_date": "2026-10-16",
+      "verified_commit": "cdf8487",
+      "verified_date": "2026-10-19",
       "visibility": "public"
     },
     {
@@ -390,7 +392,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:9a2da65638fd93bd7dc66d89ef89b236fa4439ed1285102dec25872443b9ca0e",
+      "hash": "sha256:653613a0e8158c55a27e34757c1a1ef996f815b45aa95a2b9a5e1f5cc7b97d29",
       "id": "windows-build-setup",
       "kind": "howto",
       "links": [

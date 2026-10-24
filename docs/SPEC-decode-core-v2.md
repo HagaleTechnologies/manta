@@ -480,6 +480,15 @@ All: `fs = 96 000`, 120 s, seeds recorded, SNR in 2500 Hz, text
 | VR7 | tight-spacing | 35 WPM, +20 dB, word gaps 5 dits, char gaps 2.5 dits, JA1ZZZ | AWGN | word boundaries ≥ 90 %; char ≥ 95 % |
 | VR8 | qsb-fast | 30 WPM, +10 dB, Watterson CCIR-poor, DL9ABC | Watterson | char ≥ 85 % |
 
+"Word boundaries" (VR1, VR7; VW2 in v1 §7.3) score 1 − (missed +
+spurious) ÷ the keyed text's word boundaries, floored at 0. A
+character-level Levenshtein alignment of the decoded text against the
+keyed text decides which keyed spaces the decode reproduced; every other
+decoded space is spurious, so a word gap read as a character gap and a
+character gap read as a word gap cost the same. A whole first word lost to
+the warm-up floor (v1 §2.1) is not a miss. `word_boundary_fraction` in
+`crates/manta-cli/tests/golden_vr.rs` implements it (MAN-173).
+
 `manta-testkit::keyer` gains `rise_ms` per scene (exists), `weight`
 (dah/dit ratio), and `gap_units` (character/word gap multipliers) to
 render VR6/VR7; `scene` gains a co-channel pair for VR5.

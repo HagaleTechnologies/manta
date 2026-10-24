@@ -2546,7 +2546,10 @@ impl TrackManager {
         // evaluations/sec at 300-1200 tracks for callers that can never
         // consume the result. Gated at each push site below (Promoted /
         // decoder-present) instead of computed here for every track.
-        let compute_spectral_ref_power = !matches!(self.decode_cfg.engine, Engine::Legacy);
+        // MAN-195: spectral_beta = 0.0 (the documented "no spectral discount"
+        // setting) makes NoiseTracker::push discard the term, so skip the scan.
+        let compute_spectral_ref_power = !matches!(self.decode_cfg.engine, Engine::Legacy)
+            && self.decode_cfg.noise.spectral_beta > 0.0;
 
         // Drive existing tracks; collect closures to apply after the loop
         // (avoids mutating `self.tracks` while iterating it).
@@ -6476,6 +6479,53 @@ mod tests {
         assert!(
             spectral_ref_power.is_none(),
             "the Legacy engine must never pay for computing spectral_ref_power"
+        );
+    }
+
+    #[test]
+    fn step_hop_skips_spectral_ref_power_when_spectral_beta_is_zero() {
+        // MAN-195: `spectral_beta = 0.0` is the documented way to disable the
+        // spectral discount, and `NoiseTracker::push` reduces to the `None`
+        // branch when it is 0 (`max(n_temp, 0.0 * b_spec * r) == n_temp`), so
+        // computing `FloorBank::spectral_reference_db` anyway is the same waste
+        // class the Legacy gate above closed (PR #178 round 4).
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            default_filter_off(),
+            DecodeConfig {
+                engine: Engine::Hsmm,
+                noise: manta_decode::noise::NoiseConfig {
+                    spectral_beta: 0.0,
+                    ..manta_decode::noise::NoiseConfig::default()
+                },
+                ..DecodeConfig::default()
+            },
+        );
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        let mut promoted_id = None;
+        for m in (250 * 15)..(250 * 15 + 60) {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            if let Some(id) = promoted.iter().find_map(|e| match e {
+                DecoderEvent::TrackPromoted { track_id, .. } => Some(*track_id),
+                _ => None,
+            }) {
+                promoted_id = Some(id);
+                break;
+            }
+        }
+        let id = promoted_id.expect("must promote a track within the loop");
+        let track = tm.tracks.get(&id).unwrap();
+        let (_, _, spectral_ref_power, _, _, _) = *track
+            .pending
+            .last()
+            .expect("the promotion hop itself must have queued a pending entry");
+        assert!(
+            spectral_ref_power.is_none(),
+            "spectral_beta = 0.0 must skip computing spectral_ref_power (MAN-195)"
         );
     }
 

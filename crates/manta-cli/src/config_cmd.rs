@@ -623,10 +623,12 @@ fn input_summary(file: &crate::config::InputFile) -> String {
         ),
         Some(SourceFromFile::Hpsdr {
             host,
+            mac,
             port,
             protocol,
             freq_hz,
             rate_hz,
+            receivers,
         }) => {
             // MAN-305 §3: the protocol as the operator writes it.
             let protocol = match protocol {
@@ -634,10 +636,16 @@ fn input_summary(file: &crate::config::InputFile) -> String {
                 manta_input::hpsdr::HpsdrProtocol::One => "1",
                 manta_input::hpsdr::HpsdrProtocol::Two => "2",
             };
-            format!(
-                "input: type=hpsdr host={host} port={port} protocol={protocol} freq_hz={freq_hz} \
-                 rate_hz={rate_hz}"
-            )
+            let declared = receivers.map_or(String::new(), |n| format!(" receivers={n}"));
+            let mut line = format!(
+                "input: type=hpsdr host={} port={port} protocol={protocol} freq_hz={freq_hz} \
+                 rate_hz={rate_hz}{declared}",
+                host.as_deref().unwrap_or("discovery")
+            );
+            if let Some(mac) = mac {
+                line.push_str(&format!(" mac={mac}"));
+            }
+            line
         }
         Some(SourceFromFile::Ka9q {
             group,
@@ -678,6 +686,14 @@ fn input_summary(file: &crate::config::InputFile) -> String {
 /// opens IQ WAVs. MAN-90: an enabled uplink is experimental.
 fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> Vec<String> {
     let mut notes = Vec::new();
+    for group in crate::config::hpsdr_allocations(&loaded.inputs) {
+        if group.members.len() > 1 {
+            notes.push(format!(
+                "note: HPSDR receiver capacity at {} is checked when manta run starts",
+                group.endpoint()
+            ));
+        }
+    }
     match source {
         ConfigSource::None => notes.push(format!(
             "note: no config file given (--config, MANTA_CONFIG) or found ({DEFAULT_PATH} in \
@@ -1779,10 +1795,12 @@ mod tests {
         ("input", "device"),
         ("input", "path"),
         ("input", "host"),
+        ("input", "mac"),
         ("input", "freq_hz"),
         ("input", "bands"),
         ("input", "driver"),
         ("input", "rate_hz"),
+        ("input", "receivers"),
         ("input", "gain_db"),
         ("input", "group"),
         ("input", "ssrc"),
@@ -2047,6 +2065,24 @@ mod tests {
     }
 
     #[test]
+    fn hpsdr_scaffold_mac_alternative_is_valid_without_host() {
+        let body = format!(
+            "[input]\ntype = \"hpsdr\"\n{}",
+            // bands replaces freq_hz and drags tuning_range_hz with it, so
+            // neither belongs in the freq_hz spelling this test uncomments.
+            uncommented("input", |k| InputKind::Hpsdr.keys().contains(&k)
+                && !matches!(k, "host" | "bands" | "tuning_range_hz"))
+        );
+        match loaded(&body).input.source {
+            Some(SourceFromFile::Hpsdr { host, mac, .. }) => {
+                assert_eq!(host, None);
+                assert_eq!(mac.as_deref(), Some("02:11:22:33:44:55"));
+            }
+            other => panic!("wrong source: {other:?}"),
+        }
+    }
+
+    #[test]
     fn no_default_examples_are_valid_when_uncommented() {
         let server = format!("[server]\n{}", uncommented("server", |_| true));
         let l = loaded(&server);
@@ -2075,6 +2111,7 @@ mod tests {
                     kind.name(),
                     uncommented("input", |k| kind.keys().contains(&k)
                         && k != skip
+                        && !(kind == InputKind::Hpsdr && k == "mac")
                         && !(skip == "bands" && k == "tuning_range_hz"))
                 );
                 let l = loaded(&body);
