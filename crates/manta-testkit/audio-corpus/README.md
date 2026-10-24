@@ -130,16 +130,38 @@ First baseline run (2026-09-08, the PCM16 conversion, unmodified pipeline):
 scorer bugs -- unbounded-time matching, and RBN truth rows manta's own
 grammar can structurally never accept counted as misses; both fixed in
 `scripts/score-against-rbn.py`, see that script's docstring), alongside
-41,174 distinct tracks opened over the 15 minutes (613k characters
+41,174 tracks opened over the 15 minutes (613k characters decoded) for
+those 197 spots. Filed as MAN-166. PR #144, which reports the figure
+("41,174 tracks opened"), names a fresh `manta decode --json` run as the
+source of its numbers, but the command that counted it was not recorded
+and the report is not in the tree, so the figure's population is a
+reconstruction, not a verified fact. The run predates the `TrackPromoted`
+event (PR #145): a report from that tree carried events only from tracks
+that were promoted and then emitted decoder output, and a CANDIDATE
+emitted nothing. On the most likely reading -- the report's distinct
+`track_id`s -- it counts 41,174 promoted tracks, a lower bound on
+promotions: far more than the real simultaneous-signal count implies,
+and most never survive to a validated spot. It does not count every
+track the detector opened; the follow-up below does.
 
 Follow-up (2026-09-09, `docs/DECISIONS/
-2026-09-09-man166-confirm-hops-and-track-cap.md`): root-caused the
-41,174-tracks figure to two structural closure reasons
-(`TrackManager::close_counts()`, `crates/manta-engine/examples/
-close_counts.rs`) -- `unconfirmed` (Candidate never sustains
-`confirm_hops`, 68.8% of all churn) and `evicted`/`merged`
-(`track_cap=500` pinned at its ceiling the entire recording, 29.7%). Fixed
-a real repetition-gate bug (was keyed by the ephemeral `track_id`, so a
+2026-09-09-man166-confirm-hops-and-track-cap.md`): counted every track
+the detector closed in the same configuration with
+`TrackManager::close_counts()` (`crates/manta-engine/examples/
+close_counts.rs`). That is a different population from the 41,174 above,
+about ten times larger: the detector gives every CANDIDATE its own
+`track_id`, and `close_counts()` counts each one once, when it closes (a
+track still open when the stream ends is not counted), but only promoted
+tracks reach `manta decode --json`. `unconfirmed` (a CANDIDATE that never
+sustains `confirm_hops`, so never promoted) was 286,196 closes, 68.8% of
+the total; `evicted` (71,149, `track_cap=500` pinned at its ceiling the
+entire recording) and `merged` (52,330, `merge_converged()`, independent
+of the cap) together 123,479, 29.7%. Those three sum to 409,675; the
+percentages put the full total near 416,000, the rest being
+`hang_expired` and `silent` closes the decision doc does not list
+(MAN-179, `docs/DECISIONS/
+2026-10-23-man179-man166-track-populations.md`). Fixed a real
+repetition-gate bug (was keyed by the ephemeral `track_id`, so a
 track closing and reopening under real fragmentation reset its
 confirmation count every time) and raised `track_cap` to 1200 (measured
 real organic peak demand: 886). Result: **198 spots, 31.8% precision, 4.4%
@@ -154,6 +176,7 @@ track within 1.0 channel" assumption doesn't hold in dense real contest
 packing, and most surviving real spots still reflect only one clean
 decode ever captured (not a repetition/tracking problem) -- pointing at
 raw decode-core accuracy under genuine HF noise as the dominant remaining
+gap. Both folded into MAN-166 as open follow-up work.
 
 **Legacy-vs-hsmm and K5TR-only comparison**: see
 `docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md` §2 for the
