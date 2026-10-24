@@ -866,7 +866,11 @@ def summarize(records, params=None):
     # From the note until the node is healthy again, capped. "Again": the
     # first up sample after the restart was observed (a not-up sample or a
     # start_time change), so a sample taken between writing the note and
-    # actually restarting does not close the window early.
+    # actually restarting does not close the window early. The window counts
+    # only if the process restarted: a sample up to its end (past the cap, up
+    # to the first up sample) carries a start_time other than the last one
+    # before the note, so a cancelled maintenance cannot hide an outage from
+    # D-A (MAN-279).
     planned = []
     for n in notes:
         if n.get("note") != "planned":
@@ -876,19 +880,24 @@ def summarize(records, params=None):
         before = [s.get("start_time") for s in samples if s["ts"] <= t and s.get("start_time") is not None]
         st_before = before[-1] if before else None
         w_end = cap
-        went_down = False
+        went_down = restarted = False
         for s in samples:
             if s["ts"] <= t:
                 continue
+            st = s.get("start_time")
+            if st_before is not None and st is not None and st != st_before:
+                restarted = True
             if s["ts"] >= cap:
-                break
+                if _is_up(s):
+                    break
+                continue
             if not _is_up(s):
                 went_down = True
-            elif went_down or (s.get("start_time") is not None and s.get("start_time") != st_before):
+            elif went_down or (st is not None and st != st_before):
                 w_end = s["ts"]
                 break
         lo, hi = max(t, start), min(w_end, end)
-        if hi > lo:
+        if restarted and hi > lo:
             planned.append((lo, hi))
     planned_merged = _merge(planned)
     planned_excluded = sum(b - a for a, b in planned_merged)
