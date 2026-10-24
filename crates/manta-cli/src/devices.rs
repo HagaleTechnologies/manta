@@ -4,11 +4,59 @@ use std::io::{self, Write};
 
 use manta_input::devices::quoted_name as quoted;
 use manta_input::devices::{AudioDevice, DeviceInventory, Enumeration, SoapyDevice};
+use manta_input::hpsdr::discovery::{
+    self, board_name, describe_radio, format_mac, DiscoveredRadio, DiscoveryProtocol,
+    DiscoveryStatus,
+};
 use serde::Serialize;
+
+fn enumerate_hpsdr(port: u16) -> Enumeration<DiscoveredRadio> {
+    match discovery::discover(
+        port,
+        &discovery::broadcast_destinations(port),
+        discovery::DISCOVERY_TIMEOUT,
+    ) {
+        Ok(radios) => Enumeration::Ok(radios),
+        Err(err) => Enumeration::Error(err.to_string()),
+    }
+}
+
+#[derive(Serialize)]
+struct HpsdrRadio {
+    ip: std::net::IpAddr,
+    mac: String,
+    board: &'static str,
+    firmware: u8,
+    status: &'static str,
+    protocol: u8,
+    #[serde(skip)]
+    radio: DiscoveredRadio,
+}
+
+impl From<DiscoveredRadio> for HpsdrRadio {
+    fn from(radio: DiscoveredRadio) -> Self {
+        Self {
+            ip: radio.ip,
+            mac: format_mac(&radio.mac),
+            board: board_name(radio.protocol, radio.board_id),
+            firmware: radio.firmware,
+            status: match radio.status {
+                DiscoveryStatus::Available => "available",
+                DiscoveryStatus::InUse => "in_use",
+            },
+            protocol: match radio.protocol {
+                DiscoveryProtocol::P1 => 1,
+                DiscoveryProtocol::P2 => 2,
+            },
+            radio,
+        }
+    }
+}
 
 /// Write one complete inventory, then return the discovery exit status.
 pub fn run(json: bool) -> anyhow::Result<i32> {
-    let report = DeviceReport::from(manta_input::devices::enumerate());
+    let report = DeviceReport::from(manta_input::devices::enumerate())
+        .with_hpsdr(enumerate_hpsdr(manta_input::hpsdr::CONTROL_PORT));
     let mut stdout = io::stdout().lock();
     if json {
         serde_json::to_writer(&mut stdout, &report)?;
@@ -54,7 +102,7 @@ impl<T> From<Enumeration<T>> for Section<T> {
 struct DeviceReport {
     audio: Section<AudioDevice>,
     soapy: Section<SoapyDevice>,
-    hpsdr: Section<()>,
+    hpsdr: Section<HpsdrRadio>,
     kiwi: Section<()>,
     /// MAN-140: a radiod channel is named by its multicast data group;
     /// manta does no discovery of its own.
@@ -67,7 +115,7 @@ impl From<DeviceInventory> for DeviceReport {
             audio: inventory.audio.into(),
             soapy: inventory.soapy.into(),
             hpsdr: Section {
-                status: "not_supported",
+                status: "ok",
                 devices: vec![],
                 error: None,
             },
@@ -86,8 +134,22 @@ impl From<DeviceInventory> for DeviceReport {
 }
 
 impl DeviceReport {
+    fn with_hpsdr(mut self, result: Enumeration<DiscoveredRadio>) -> Self {
+        self.hpsdr = match result {
+            Enumeration::Ok(radios) => {
+                Enumeration::Ok(radios.into_iter().map(HpsdrRadio::from).collect())
+            }
+            Enumeration::Error(error) => Enumeration::Error(error),
+            Enumeration::Disabled => Enumeration::Disabled,
+        }
+        .into();
+        self
+    }
+
     fn exit_code(&self) -> i32 {
-        i32::from(self.audio.error.is_some() || self.soapy.error.is_some())
+        i32::from(
+            self.audio.error.is_some() || self.soapy.error.is_some() || self.hpsdr.error.is_some(),
+        )
     }
 
     fn errors(&self) -> String {
@@ -95,6 +157,7 @@ impl DeviceReport {
         for (name, error) in [
             ("audio", &self.audio.error),
             ("SoapySDR", &self.soapy.error),
+            ("openHPSDR", &self.hpsdr.error),
         ] {
             if let Some(error) = error {
                 // Backend error strings are untrusted terminal text too.
@@ -139,7 +202,18 @@ impl DeviceReport {
             }
             output.push_str("Select a SoapySDR device with --soapy-driver ARGS.\n");
         }
-        output.push_str("HPSDR: automatic discovery is not supported; use --hpsdr-host HOST (included in every build).\nKiwiSDR: use --kiwi-host HOST.\n");
+        if self.hpsdr.error.is_some() {
+            output.push_str("openHPSDR radios: discovery failed.\n");
+        } else if self.hpsdr.devices.is_empty() {
+            output.push_str("No openHPSDR radio answered discovery.\n");
+        } else {
+            output.push_str("openHPSDR radios on the LAN:\n");
+            for device in &self.hpsdr.devices {
+                output.push_str(&format!("  {}\n", describe_radio(&device.radio)));
+            }
+            output.push_str("Connect with --hpsdr-host, or pin one by MAC with --hpsdr-mac.\n");
+        }
+        output.push_str("KiwiSDR: use --kiwi-host HOST.\n");
         output.push_str("ka9q-radio: use --ka9q-group GROUP, the data group of a radiod IQ channel (avahi-browse -rt _rtp._udp lists them).\n");
         output
     }
@@ -164,6 +238,86 @@ mod tests {
     use manta_input::devices::{AudioDevice, SoapyDevice};
 
     #[test]
+    fn hpsdr_discovery_inventory_renders_identity_and_errors() {
+        use manta_input::hpsdr::discovery::{DiscoveryProtocol, DiscoveryStatus};
+        let radio = DiscoveredRadio {
+            ip: "192.0.2.1".parse().unwrap(),
+            mac: [2, 17, 34, 51, 68, 85],
+            board_id: 6,
+            firmware: 43,
+            protocol: DiscoveryProtocol::P1,
+            status: DiscoveryStatus::Available,
+            receivers: None,
+        };
+        let report = DeviceReport::from(DeviceInventory {
+            audio: Enumeration::Ok(vec![]),
+            soapy: Enumeration::Disabled,
+        })
+        .with_hpsdr(Enumeration::Ok(vec![radio.clone()]));
+        assert_eq!(report.exit_code(), 0);
+        assert!(report.text().contains(&describe_radio(&radio)));
+        assert!(report.text().contains("openHPSDR radios on the LAN:"));
+        assert!(report
+            .text()
+            .contains("Connect with --hpsdr-host, or pin one by MAC with --hpsdr-mac."));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["hpsdr"],
+            serde_json::json!({"status":"ok", "devices":[{"ip":"192.0.2.1", "mac":"02:11:22:33:44:55", "board":"Hermes-Lite", "firmware":43, "status":"available", "protocol":1}], "error":null})
+        );
+        let failed = report.with_hpsdr(Enumeration::Error("socket denied".into()));
+        assert_eq!(failed.exit_code(), 1);
+        assert!(failed
+            .errors()
+            .contains("openHPSDR device enumeration failed: socket denied"));
+        assert_eq!(
+            serde_json::to_value(&failed).unwrap()["hpsdr"]["status"],
+            "error"
+        );
+        let empty = failed.with_hpsdr(Enumeration::Ok(vec![]));
+        assert_eq!(empty.exit_code(), 0);
+        assert!(empty
+            .text()
+            .contains("No openHPSDR radio answered discovery."));
+    }
+
+    #[test]
+    fn enumerate_hpsdr_finds_a_fake_on_an_ephemeral_port() {
+        use std::net::UdpSocket;
+        use std::time::{Duration, Instant};
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let fake = std::thread::spawn(move || {
+            let end = Instant::now() + Duration::from_secs(2);
+            let mut buf = [0; 100];
+            while Instant::now() < end {
+                if let Ok((n, peer)) = socket.recv_from(&mut buf) {
+                    if n == 63 && buf[..3] == [0xef, 0xfe, 2] {
+                        let mut reply = [0; 60];
+                        reply[..3].copy_from_slice(&[0xef, 0xfe, 2]);
+                        reply[3..9].copy_from_slice(&[2, 17, 34, 51, 68, 85]);
+                        reply[9] = 43;
+                        reply[10] = 6;
+                        socket.send_to(&reply, peer).unwrap();
+                    }
+                }
+            }
+        });
+        let result = enumerate_hpsdr(port);
+        fake.join().unwrap();
+        match result {
+            Enumeration::Ok(radios) => {
+                assert_eq!(radios.len(), 1);
+                assert_eq!(radios[0].mac, [2, 17, 34, 51, 68, 85]);
+            }
+            _ => panic!("discovery failed"),
+        }
+    }
+
+    #[test]
     fn empty_disabled_and_host_guidance_have_distinct_statuses() {
         let inventory = DeviceInventory {
             audio: Enumeration::Ok(vec![]),
@@ -173,14 +327,14 @@ mod tests {
         assert_eq!(report.exit_code(), 0);
         assert_eq!(
             report.text(),
-            "Audio inputs: none found.\nSoapySDR: unavailable in this build; on Ubuntu 24.04 x86_64, download manta-linux-x86_64-soapy.tar.gz, or build from source with --features soapy.\nHPSDR: automatic discovery is not supported; use --hpsdr-host HOST (included in every build).\nKiwiSDR: use --kiwi-host HOST.\nka9q-radio: use --ka9q-group GROUP, the data group of a radiod IQ channel (avahi-browse -rt _rtp._udp lists them).\n"
+            "Audio inputs: none found.\nSoapySDR: unavailable in this build; on Ubuntu 24.04 x86_64, download manta-linux-x86_64-soapy.tar.gz, or build from source with --features soapy.\nNo openHPSDR radio answered discovery.\nKiwiSDR: use --kiwi-host HOST.\nka9q-radio: use --ka9q-group GROUP, the data group of a radiod IQ channel (avahi-browse -rt _rtp._udp lists them).\n"
         );
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["audio"]["status"], "ok");
         assert_eq!(json["audio"]["devices"], serde_json::json!([]));
         assert!(json["audio"]["error"].is_null());
         assert_eq!(json["soapy"]["status"], "disabled");
-        assert_eq!(json["hpsdr"]["status"], "not_supported");
+        assert_eq!(json["hpsdr"]["status"], "ok");
         assert_eq!(json["kiwi"]["status"], "explicit_host");
         assert_eq!(json["ka9q"]["status"], "explicit_group");
         assert_eq!(json["ka9q"]["devices"], serde_json::json!([]));
