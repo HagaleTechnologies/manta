@@ -84,6 +84,7 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("input", "device"),
     ("input", "path"),
     ("input", "host"),
+    ("input", "mac"),
     ("input", "password"),
     // MAN-305: `MANTA_INPUT_PROTOCOL=2` is the string "2", like the file key.
     ("input", "protocol"),
@@ -315,6 +316,7 @@ impl InputKind {
             ],
             InputKind::Hpsdr => &[
                 "host",
+                "mac",
                 "port",
                 "protocol",
                 "freq_hz",
@@ -342,6 +344,7 @@ struct InputToml {
     #[serde(rename = "loop")]
     looped: Option<bool>,
     host: Option<String>,
+    mac: Option<String>,
     port: Option<u16>,
     protocol: Option<ProtocolValue>,
     freq_hz: Option<f64>,
@@ -457,7 +460,8 @@ pub(crate) enum SourceFromFile {
     },
     Hpsdr {
         receivers: Option<usize>,
-        host: String,
+        host: Option<String>,
+        mac: Option<String>,
         port: u16,
         /// MAN-305 D2: `input.protocol`, `Auto` when absent.
         protocol: manta_input::hpsdr::HpsdrProtocol,
@@ -966,7 +970,10 @@ fn take_input_array(
 /// Ordered, offline allocation shared by config validation and the daemon.
 #[derive(Debug, Clone)]
 pub(crate) struct HpsdrAllocation {
-    pub host: String,
+    /// MAN-306: `None` discovers the radio at open, selected by `mac`
+    /// when set (normalized `AA:BB:CC:DD:EE:FF`).
+    pub host: Option<String>,
+    pub mac: Option<String>,
     pub port: u16,
     pub rate: f64,
     pub receivers: Option<usize>,
@@ -978,11 +985,24 @@ pub(crate) struct HpsdrAllocation {
     pub frequencies: Vec<f64>,
 }
 
+impl HpsdrAllocation {
+    /// The radio as the operator configured it, for messages: `host:port`,
+    /// or how discovery selects it (MAN-306).
+    pub fn endpoint(&self) -> String {
+        match (&self.host, &self.mac) {
+            (Some(host), _) => format!("{host}:{}", self.port),
+            (None, Some(mac)) => format!("MAC {mac} (discovery, port {})", self.port),
+            (None, None) => format!("discovery (port {})", self.port),
+        }
+    }
+}
+
 pub(crate) fn hpsdr_allocations(inputs: &[NamedInput]) -> Vec<HpsdrAllocation> {
     let mut groups: Vec<HpsdrAllocation> = Vec::new();
     for (index, input) in inputs.iter().enumerate() {
         if let Some(SourceFromFile::Hpsdr {
             host,
+            mac,
             port,
             protocol,
             rate_hz,
@@ -990,15 +1010,25 @@ pub(crate) fn hpsdr_allocations(inputs: &[NamedInput]) -> Vec<HpsdrAllocation> {
             receivers,
         }) = &input.input.source
         {
-            if let Some(group) = groups
-                .iter_mut()
-                .find(|g| g.host.eq_ignore_ascii_case(host) && g.port == *port)
-            {
+            // MAN-306 x MAN-307: entries naming one radio the same way share
+            // it -- one host (case-insensitive), or hostless entries with
+            // the same MAC selector (or none). Different spellings of one
+            // radio are caught when the run resolves them to one address.
+            let same_radio = |g: &HpsdrAllocation| {
+                g.port == *port
+                    && match (&g.host, host) {
+                        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                        (None, None) => g.mac == *mac,
+                        _ => false,
+                    }
+            };
+            if let Some(group) = groups.iter_mut().find(|g| same_radio(g)) {
                 group.members.push(index);
                 group.frequencies.push(*freq_hz);
             } else {
                 groups.push(HpsdrAllocation {
                     host: host.clone(),
+                    mac: mac.clone(),
                     port: *port,
                     rate: *rate_hz,
                     receivers: *receivers,
@@ -1042,11 +1072,12 @@ fn validate_hpsdr_allocations(inputs: &[NamedInput], origin: &str) -> Result<()>
         }
         if let Some(capacity) = group.receivers {
             if group.members.len() > capacity {
-                bail!("{origin}: [[input]] \"{first}\": HPSDR radio at {}:{} declares {capacity} receivers; {} bands are configured", group.host, group.port, group.members.len());
+                bail!("{origin}: [[input]] \"{first}\": HPSDR radio at {} declares {capacity} receivers; {} bands are configured", group.endpoint(), group.members.len());
             }
         }
         manta_input::HpsdrConfig {
-            host: group.host.clone(),
+            // Offline: validation never reads the host.
+            host: group.host.clone().unwrap_or_default(),
             port: group.port,
             ddc_count: group.members.len(),
             sample_rate_hz: group.rate,
@@ -1315,6 +1346,14 @@ fn check_input_entries(inputs: &[NamedInput], origin: &str) -> Result<()> {
     Ok(())
 }
 
+fn check_hpsdr_mac(text: &str) -> std::result::Result<String, String> {
+    let mac = crate::parse_hpsdr_mac(text).map_err(|_| {
+        "input.mac must contain twelve hexadecimal digits, for example AA:BB:CC:DD:EE:FF"
+            .to_string()
+    })?;
+    Ok(manta_input::hpsdr::discovery::format_mac(&mac))
+}
+
 fn validate_input(
     t: InputToml,
     resolve_path: &dyn Fn(PathBuf) -> PathBuf,
@@ -1400,13 +1439,19 @@ fn validate_input(
                 })
                 .transpose()?,
             port: port(crate::HPSDR_CONTROL_PORT)?,
+            host: {
+                if t.host.is_some() && t.mac.is_some() {
+                    return Err("input.host and input.mac cannot both be set".into());
+                }
+                t.host.clone()
+            },
+            mac: t.mac.as_deref().map(check_hpsdr_mac).transpose()?,
             protocol: t
                 .protocol
                 .as_ref()
                 .map(ProtocolValue::protocol)
                 .transpose()?
                 .unwrap_or_default(),
-            host: req(t.host.clone(), "host", name)?,
             freq_hz: crate::check_hpsdr_freq_hz("input.freq_hz", req_freq(t.freq_hz)?)?,
             rate_hz: crate::check_hpsdr_rate_hz("input.rate_hz", req(t.rate_hz, "rate_hz", name)?)?,
         },
@@ -1430,7 +1475,7 @@ fn validate_input(
 /// D5: every source key set belongs to `input.type`, and a source key
 /// needs a type.
 fn check_input_keys(t: &InputToml) -> std::result::Result<(), String> {
-    let set: [(&str, bool); 19] = [
+    let set: [(&str, bool); 20] = [
         ("receivers", t.receivers.is_some()),
         ("device", t.device.is_some()),
         ("path", t.path.is_some()),
@@ -1438,6 +1483,7 @@ fn check_input_keys(t: &InputToml) -> std::result::Result<(), String> {
         ("realtime", t.realtime.is_some()),
         ("loop", t.looped.is_some()),
         ("host", t.host.is_some()),
+        ("mac", t.mac.is_some()),
         ("port", t.port.is_some()),
         ("protocol", t.protocol.is_some()),
         ("freq_hz", t.freq_hz.is_some()),
@@ -1777,6 +1823,84 @@ mod tests {
                 load(Some(f.path()), Env::Read(&v))
             }
             None => load(None, Env::Read(&v)),
+        }
+    }
+
+    const HPSDR_DISCOVERY: &str =
+        "[input]\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n";
+
+    #[test]
+    fn hpsdr_discovery_accepts_neither_address_or_one_selector() {
+        for selector in [
+            "",
+            "host = \"radio.local\"\n",
+            "mac = \"aa-bbcc-ddee-ff\"\n",
+            "mac = \"aabbccddeeff\"\n",
+        ] {
+            assert!(
+                load_file(&format!("{HPSDR_DISCOVERY}{selector}")).is_ok(),
+                "{selector}"
+            );
+        }
+        let err = err_of(&format!(
+            "{HPSDR_DISCOVERY}host = \"h\"\nmac = \"aabbccddeeff\"\n"
+        ));
+        assert!(
+            err.contains("input.host and input.mac cannot both be set"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn hpsdr_discovery_mac_env_is_string_typed_and_normalized() {
+        let loaded = load_env(
+            Some(HPSDR_DISCOVERY),
+            &[("MANTA_INPUT_MAC", "001122334455")],
+        )
+        .unwrap();
+        let debug = format!("{:?}", loaded.input.source);
+        assert!(debug.contains("00:11:22:33:44:55"), "{debug}");
+        assert!(err_of(&format!("{HPSDR_DISCOVERY}mac = \"AA\"\n")).contains("input.mac"));
+        assert!(
+            err_of("[input]\ntype = \"audio\"\nmac = \"001122334455\"\n")
+                .contains("input.mac does not apply")
+        );
+        assert!(err_of(&format!("{HPSDR_DISCOVERY}device = \"wrong\"\n"))
+            .contains("hpsdr takes host, mac, port"));
+    }
+
+    #[test]
+    fn hpsdr_hostless_inputs_with_one_selector_share_one_radio() {
+        // MAN-306 x MAN-307: hostless entries with the same MAC selector (or
+        // none) name one discovered radio, so they share its receivers.
+        for selector in ["", "mac = \"aabbccddeeff\"\n"] {
+            let body = ["a", "b"].map(|name| format!("[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n{selector}")).join("\n");
+            let loaded = load_file(&body).unwrap_or_else(|e| panic!("{body} -> {e:#}"));
+            let groups = hpsdr_allocations(&loaded.inputs);
+            assert_eq!(groups.len(), 1, "{body}");
+            assert_eq!(groups[0].members, vec![0, 1]);
+            assert_eq!(groups[0].host, None);
+        }
+    }
+
+    #[test]
+    fn hpsdr_hostless_inputs_with_different_selectors_are_separate_radios() {
+        let entry = |name: &str, selector: &str| {
+            format!("[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n{selector}")
+        };
+        // Distinct MACs, or a pinned entry beside an unqualified one: two
+        // radios offline. The run refuses the pair if both resolve to one
+        // address.
+        for (first, second) in [
+            ("mac = \"aabbccddeeff\"\n", "mac = \"001122334455\"\n"),
+            ("mac = \"aabbccddeeff\"\n", ""),
+            ("", "mac = \"aabbccddeeff\"\n"),
+            ("host = \"192.0.2.10\"\n", ""),
+        ] {
+            let body = format!("{}\n{}", entry("a", first), entry("b", second));
+            let loaded = load_file(&body).unwrap_or_else(|e| panic!("{body} -> {e:#}"));
+            let groups = hpsdr_allocations(&loaded.inputs);
+            assert_eq!(groups.len(), 2, "{body}");
         }
     }
 
@@ -2666,11 +2790,8 @@ mod tests {
                 "rate_hz",
                 "soapy",
             ),
-            (
-                "type = \"hpsdr\"\nfreq_hz = 7e6\nrate_hz = 48000.0\n",
-                "host",
-                "hpsdr",
-            ),
+            ("type = \"hpsdr\"\nfreq_hz = 7e6\n", "rate_hz", "hpsdr"),
+            ("type = \"hpsdr\"\nrate_hz = 192000.0\n", "freq_hz", "hpsdr"),
         ] {
             let err = err_of(&format!("[input]\n{body}"));
             // MAN-310: kiwi, soapy and hpsdr take freq_hz or bands.
@@ -2729,7 +2850,8 @@ mod tests {
         assert_eq!(
             loaded.input.source,
             Some(SourceFromFile::Hpsdr {
-                host: "192.0.2.10".into(),
+                host: Some("192.0.2.10".into()),
+                mac: None,
                 port: 1024,
                 protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
                 freq_hz: 7_030_000.0,
