@@ -369,7 +369,11 @@ ROADMAP M2's 24 h live-SDR soak gate.
 Definitions (D-D, D-E, D-G):
 
 - **Planned restart.** Write the note *before* restarting. Its window runs from the note until
-  the first healthy sample after it, capped at 1800 s, and is excluded from availability.
+  the first healthy sample after it, capped at 1800 s, and is excluded from availability. It is
+  excluded only if the restart happens: a sample in the window, or up to the first healthy
+  sample after the cap, must show a new `manta_start_time_seconds`. A note with no restart
+  after it (a cancelled maintenance) excludes nothing, and any outage after it counts against
+  availability.
 
   ```sh
   sudo -u manta python3 /opt/manta/scripts/field-node.py note \
