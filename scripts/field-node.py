@@ -924,11 +924,13 @@ def summarize(records, params=None):
         a, b = max(a, start), min(b, end)
         if b <= a:
             return
-        length = (b - a) - _overlap(a, b, planned_merged)
+        overlap = _overlap(a, b, planned_merged)
+        length = (b - a) - overlap
         if length <= 0:
             return
         if state == "up":
-            moved = min(extra_down, length)
+            # Counters carry duration, not timestamps: credit planned overlap first.
+            moved = min(max(0.0, extra_down - overlap), length)
             up_s += length - moved
             down_s += moved
             counter_down_s += moved

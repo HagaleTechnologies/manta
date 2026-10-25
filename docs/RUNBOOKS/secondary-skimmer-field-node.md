@@ -375,6 +375,10 @@ Definitions (D-D, D-E, D-G):
   after it (a cancelled maintenance) excludes nothing, and any outage after it counts against
   availability.
 
+  Within each sample interval, the report subtracts its registered planned-window overlap
+  from counter-attributed downtime, floored at zero. The source-outage totals still show
+  the full counter duration; the counters do not record exact outage timestamps.
+
   ```sh
   sudo -u manta python3 /opt/manta/scripts/field-node.py note \
     --ledger /var/lib/manta-field/ledger.jsonl --kind planned --reason "kernel update reboot"
