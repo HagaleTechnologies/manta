@@ -645,12 +645,19 @@ pub(crate) fn score_point(stations: &[Station], report: Option<&DecodeReport>) -
         }
         track_events.entry(id).or_default().push(ev.clone());
     }
-    let tracks: Vec<(f64, String)> = track_events
+    let tracks: Vec<(u64, f64, String)> = track_events
         .iter()
         .filter_map(|(id, evs)| {
             let freq = meta_freq.get(id).or_else(|| promoted_freq.get(id))?;
-            Some((*freq, events_to_text(evs)))
+            Some((*id as u64, *freq, events_to_text(evs)))
         })
+        .collect();
+    // MAN-120/FU-3: the frequency-join copy CER runs through
+    // manta-testkit's shared helper (same convention as the golden V8/V8w
+    // gates since MAN-120), so the two harnesses cannot drift apart.
+    let track_refs: Vec<(u64, f64, &str)> = tracks
+        .iter()
+        .map(|(id, freq, text)| (*id, *freq, text.as_str()))
         .collect();
 
     let is_correct = |st: &Station, call: &str, freq_hz: f64| {
@@ -659,12 +666,9 @@ pub(crate) fn score_point(stations: &[Station], report: Option<&DecodeReport>) -
     let scores = stations
         .iter()
         .map(|st| {
-            let copy: Vec<&str> = tracks
-                .iter()
-                .filter(|(f, text)| (f - st.freq_hz).abs() <= MATCH_HZ && !text.is_empty())
-                .map(|(_, text)| text.as_str())
-                .collect();
-            let cer = manta_testkit::cer::cer(&st.keyed_text, &copy.join(" ")).min(1.0);
+            let cer =
+                manta_testkit::cer::joined_cer(&st.keyed_text, &track_refs, st.freq_hz, MATCH_HZ)
+                    .min(1.0);
             let correct: Vec<_> = report
                 .spots
                 .iter()

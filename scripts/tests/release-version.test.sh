@@ -141,6 +141,21 @@ newest_case false v1.0.0 v1.0.0 v9223372036854775808.0.0
 newest_case true  v9223372036854775808.0.0 v1.0.0 v9223372036854775808.0.0
 newest_case true  v1.2.3 v1.02.2 v1.2.3         # leading zeros are stripped,
                                                  # not counted as digits
+# MAN-266 (PR #107 thread PRRT_kwDOTQvU8M6qMMjj): a rejected leading-zero
+# twin (v02.0.0) lists before its corrected tag (v2.0.0), ties it
+# numerically, so the scan kept "02.0.0" and a string compare with "2.0.0"
+# declined :latest for the newest release. Equality is now numeric.
+reject v02.0.0                                   # the twin is not publishable
+newest_case true  v2.0.0 v02.0.0 v2.0.0          # the ticket's scenario
+newest_case true  v1.2.3 v1.02.3 v1.2.3          # minor-component twin
+newest_case true  v1.2.3 v1.2.03 v1.2.3          # patch-component twin
+newest_case true  v0.0.0 v00.00.00 v0.0.0        # all-zero components
+newest_case true  v9223372036854775808.0.0 v09223372036854775808.0.0 v9223372036854775808.0.0
+newest_case false v2.0.0 v2.0.0 v03.0.0          # a genuinely higher malformed
+newest_case false v2.0.0 v2.0.0 v03.0.0+meta     # tag still blocks
+newest_case false v2.0.0 v1.0.0                  # own tag missing, older seen:
+                                                 # numeric equality must not
+                                                 # turn "not seen" into true
 
 echo "== is-newest-stable: hard failure on an unreadable/empty tag list =="
 # MAN-65 remediate round 7, finding 3.C: an empty tag listing used to be

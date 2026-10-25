@@ -855,6 +855,7 @@ dependencies = [
  "clap_complete",
  "clap_mangen",
  "coppa-audio",
+ "coppa-channel",
  "ctrlc",
  "hound",
  "libc",
