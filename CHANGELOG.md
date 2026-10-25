@@ -238,6 +238,15 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-423: with a protocol-2 openHPSDR radio, decodes from just before a
+  lost datagram run are no longer stamped late by the lost samples (up to
+  ~11,900 samples, 62 ms, for 50 datagrams at 192 kS/s); only events at or
+  after the loss carry it, on both single- and multi-input runs and during
+  startup calibration. A protocol-2 receiver that sat unread while another
+  input opened, long enough for its socket buffer to overflow, now counts
+  the overflow as dropped datagrams and moves its clock by them, instead of
+  reading it as a radio restart of zero length that left later spots early
+  by the dropped span.
 - `ReconnectingSource`, `DecimatingSource` and `manta doctor`'s
   `SampleBoundedSource` now forward the inner source's gap reports
   (`take_discontinuity()` and the new `take_missing_samples()`); they
