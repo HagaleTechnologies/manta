@@ -24,6 +24,12 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-402: looped dah-heavy text keyed at 25-40 WPM (`MO`, `OO`, `0000`,
+  `T0M`) now decodes as its own words. The speed tracker read five equal
+  dahs of 90-150 ms as dits, so `MO` at 33 WPM printed `H5555...` and `0000`
+  at 37.5 WPM printed nothing. When the gaps between those five marks are a
+  third of a mark long, the tracker now takes them as dahs. Text made only
+  of single-dah characters (`TT`) is unchanged.
 - MAN-108: a fading signal keeps one `track_id` through fades of up to
   15 s instead of respawning a new track each time the 5 s hang ran out.
   A track that has decoded goes DORMANT for `reacquire_ms` (10 s) after
@@ -238,6 +244,9 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-285: `manta status --json` now prints every field the daemon served,
+  including fields newer than this build, with object keys in alphabetical
+  order. The human-readable `manta status` summary and exit codes are unchanged.
 - `ReconnectingSource`, `DecimatingSource` and `manta doctor`'s
   `SampleBoundedSource` now forward the inner source's gap reports
   (`take_discontinuity()` and the new `take_missing_samples()`); they

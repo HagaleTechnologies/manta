@@ -2968,6 +2968,32 @@ fn status_with_an_invalid_addr_fails_with_exit_code_two_not_one() {
     );
 }
 
+/// MAN-282: a clap-valid but absurd `--timeout-secs` (u64::MAX) must
+/// exit 2 with a plain "invalid --timeout-secs" message, not panic
+/// with exit 101 before ever dialing. The deadline is computed before
+/// any resolution or connect, so a closed port needs no listener and
+/// the test cannot race an ephemeral port.
+#[test]
+fn status_with_an_absurd_timeout_secs_exits_two_with_a_plain_message() {
+    let out = manta()
+        .args([
+            "status",
+            "--addr",
+            "127.0.0.1:1",
+            "--timeout-secs",
+            "18446744073709551615",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("invalid --timeout-secs"),
+        "expected a plain invalid --timeout-secs message, got: {stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "must not panic: {stderr}");
+}
+
 /// MAN-44 CR-A regression: an unreadable `--server-config` must exit 2, not
 /// 1, for the same reason -- this used to `?`-propagate out of `main` and
 /// exit 1, colliding with the "unhealthy uplink" code.

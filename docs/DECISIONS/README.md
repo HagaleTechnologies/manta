@@ -12,6 +12,12 @@ Add a row here in the same change that adds a record:
 | Date | Ticket | Title |
 |---|---|---|
 | 2026-10-26 | MAN-289 | [MAN-289: a node spot without a `deCall` is malformed](2026-10-26-man289-node-spot-needs-decall.md) |
+| 2026-10-25 | MAN-402 | [MAN-402: a unimodal speed bootstrap reads its marks as dahs when the gaps between them say so](2026-10-25-man402-dah-heavy-bootstrap.md) |
+| 2026-10-25 | MAN-288 | [MAN-288: planned windows absorb counter-attributed downtime](2026-10-25-man288-planned-outage-counter-overlap.md) |
+| 2026-10-24 | MAN-284 | [MAN-284: `field-node.py report` counts the time before the first sample as unobserved](2026-10-24-man284-unsampled-prefix-unobserved.md) |
+| 2026-10-24 | MAN-285 | [MAN-285: status JSON preserves every served field](2026-10-24-man285-status-json-every-served-field.md) |
+| 2026-10-24 | MAN-282 | [MAN-282: an absurd `--timeout-secs` fails with a plain error — 2 for `manta status`, 1 for `manta health` — instead of a panic](2026-10-24-man282-timeout-secs-overflow.md) |
+| 2026-10-24 | MAN-281 | [MAN-281: `manta status` saturates a spoofed endpoint's json/ws client count](2026-10-24-man281-status-client-count-overflow.md) |
 | 2026-10-23 | MAN-277 | [MAN-277: `field-node.py sample` rejects a non-finite or out-of-range `--interval-s`](2026-10-23-man277-sample-interval-bound.md) |
 | 2026-10-23 | MAN-266 | [MAN-266: a corrected release tag takes `:latest` beside its rejected leading-zero twin](2026-10-23-man266-corrected-release-latest.md) |
 | 2026-10-23 | MAN-279 | [MAN-279: a planned-restart window counts only when the restart happened](2026-10-23-man279-planned-window-needs-a-restart.md) |
