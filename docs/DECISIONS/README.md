@@ -11,11 +11,8 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
-<<<<<<< HEAD
 | 2026-10-26 | MAN-289 | [MAN-289: a node spot without a `deCall` is malformed](2026-10-26-man289-node-spot-needs-decall.md) |
-=======
 | 2026-10-24 | MAN-281 | [MAN-281: `manta status` saturates a spoofed endpoint's json/ws client count](2026-10-24-man281-status-client-count-overflow.md) |
->>>>>>> a6e60506d5b5237a7a24f447e6d75447cd4fcdc2
 | 2026-10-23 | MAN-277 | [MAN-277: `field-node.py sample` rejects a non-finite or out-of-range `--interval-s`](2026-10-23-man277-sample-interval-bound.md) |
 | 2026-10-23 | MAN-266 | [MAN-266: a corrected release tag takes `:latest` beside its rejected leading-zero twin](2026-10-23-man266-corrected-release-latest.md) |
 | 2026-10-23 | MAN-279 | [MAN-279: a planned-restart window counts only when the restart happened](2026-10-23-man279-planned-window-needs-a-restart.md) |
