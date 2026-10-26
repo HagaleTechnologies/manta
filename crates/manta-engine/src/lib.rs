@@ -220,10 +220,16 @@ impl Default for PipelineConfig {
 }
 
 /// Result of decoding one signal from an IQ scene. SPEC §5.
+///
+/// `decode --json` prints it; its keys are camelCase (MAN-139,
+/// docs/CLI-JSON.md).
 #[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DecodeReport {
     /// Absolute spot frequency (center + estimated offset), full precision.
     /// SPEC §1.4: full Hz precision belongs to the JSON surface.
+    /// `frequency` in JSON (MAN-139).
+    #[serde(rename = "frequency")]
     pub freq_hz: f64,
     /// Most recently reported speed, if any.
     pub wpm: Option<f32>,
@@ -241,7 +247,7 @@ pub struct DecodeReport {
     /// for input without RTTY or with `rtty_filter` off.
     pub rtty: Vec<RttySignalReport>,
     /// MAN-234: input samples replaced with silence (SPEC §1.3 step 0).
-    /// Omitted from JSON when 0, so a clean decode's `--json` is unchanged.
+    /// `badSamples` in JSON, omitted when 0.
     #[serde(skip_serializing_if = "is_zero")]
     pub bad_samples: u64,
     /// Input sample rate, for turning `rtty` sample timestamps into
@@ -278,7 +284,9 @@ fn bad_samples_suffix(n: u64) -> String {
 /// MAN-314: one marked RTTY signal (SPEC §2.6), frequencies calibrated
 /// like `TrackMeta::freq_hz`. `marked_sample_ts`/`cleared_sample_ts` are
 /// stream sample timestamps; `cleared_sample_ts` is `None` while marked.
+/// JSON keys are camelCase (MAN-139).
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RttySignalReport {
     /// Upper tone.
     pub mark_hz: f64,
@@ -545,6 +553,36 @@ pub fn decode_wav(
     decode_source(&mut src, cfg)
 }
 
+/// A JSON object's top-level keys in document order (the workspace's
+/// `serde_json` has no `preserve_order`, so `Map` sorts them).
+#[cfg(test)]
+pub(crate) fn json_keys_in_order(json: &str) -> Vec<String> {
+    struct Keys(Vec<String>);
+    impl<'de> serde::Deserialize<'de> for Keys {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> serde::de::Visitor<'de> for V {
+                type Value = Keys;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a JSON object")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Keys, A::Error> {
+                    let mut keys = Vec::new();
+                    while let Some((k, _)) = map.next_entry::<String, serde::de::IgnoredAny>()? {
+                        keys.push(k);
+                    }
+                    Ok(Keys(keys))
+                }
+            }
+            d.deserialize_map(V)
+        }
+    }
+    serde_json::from_str::<Keys>(json).unwrap().0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,10 +834,68 @@ mod tests {
         )
         .unwrap();
         let v = serde_json::to_value(&report).unwrap();
-        assert!(v.get("bad_samples").is_none(), "clean JSON: {v}");
+        assert!(v.get("badSamples").is_none(), "clean JSON: {v}");
         report.bad_samples = 3;
         let s = serde_json::to_string(&report).unwrap();
-        assert!(s.contains("\"bad_samples\":3"), "{s}");
+        assert!(s.contains("\"badSamples\":3"), "{s}");
+    }
+
+    /// MAN-139: `decode --json`'s top-level and `rtty[]` keys are camelCase,
+    /// with the stream's `frequency` for the spot frequency.
+    #[test]
+    fn decode_report_json_is_camel_case() {
+        let report = DecodeReport {
+            freq_hz: 14_012_341.5,
+            wpm: Some(20.0),
+            text: "CQ".into(),
+            events: Vec::new(),
+            spots: Vec::new(),
+            timing: Some(TimingEstimates {
+                dit_ms: 60.0,
+                dot: None,
+                dash: None,
+                element_gap: None,
+                char_gap: None,
+                word_gap: None,
+            }),
+            rtty: vec![RttySignalReport {
+                mark_hz: 14_080_170.0,
+                space_hz: 14_080_000.0,
+                shift_hz: 170.0,
+                measured_shift_hz: 170.5,
+                marked_sample_ts: 96_000,
+                cleared_sample_ts: None,
+                id: 7,
+            }],
+            bad_samples: 1,
+            sample_rate_hz: 96_000.0,
+        };
+        let s = serde_json::to_string(&report).unwrap();
+        assert_eq!(
+            json_keys_in_order(&s),
+            [
+                "frequency",
+                "wpm",
+                "text",
+                "events",
+                "spots",
+                "timing",
+                "rtty",
+                "badSamples"
+            ]
+        );
+        let rtty = serde_json::to_string(&report.rtty[0]).unwrap();
+        assert_eq!(
+            json_keys_in_order(&rtty),
+            [
+                "markHz",
+                "spaceHz",
+                "shiftHz",
+                "measuredShiftHz",
+                "markedSampleTs",
+                "clearedSampleTs"
+            ]
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ pub enum Element {
 
 /// Prosigns emitted as text tokens in the JSON stream, dropped from
 /// telnet-facing text. SPEC §4.4.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Prosign {
     Ar,
     Sk,
@@ -22,7 +22,16 @@ pub enum Prosign {
 }
 
 impl Prosign {
-    /// Returns the JSON-stream token for this prosign (e.g. `"<AR>"`). SPEC §4.4.
+    const ALL: [Prosign; 5] = [
+        Prosign::Ar,
+        Prosign::Sk,
+        Prosign::As,
+        Prosign::Sn,
+        Prosign::Err,
+    ];
+
+    /// Returns the JSON-stream token for this prosign (e.g. `"<AR>"`), which
+    /// is also a prosign `Glyph`'s JSON form (MAN-139). SPEC §4.4.
     pub fn token(&self) -> &'static str {
         match self {
             Prosign::Ar => "<AR>",
@@ -32,13 +41,47 @@ impl Prosign {
             Prosign::Err => "<ERR>",
         }
     }
+
+    /// The prosign whose `token()` is `token`, if any.
+    pub fn from_token(token: &str) -> Option<Prosign> {
+        Prosign::ALL.into_iter().find(|p| p.token() == token)
+    }
 }
 
 /// A decoded tree node's payload: a plain character or a prosign. SPEC §4.4.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// JSON: the character as a one-character string (`"A"`), or the
+/// prosign's `token()` (`"<AR>"`) (MAN-139).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Glyph {
     Char(char),
     Prosign(Prosign),
+}
+
+impl serde::Serialize for Glyph {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Glyph::Char(c) => s.serialize_char(*c),
+            Glyph::Prosign(p) => s.serialize_str(p.token()),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Glyph {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        let mut chars = text.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            return Ok(Glyph::Char(c));
+        }
+        Prosign::from_token(&text)
+            .map(Glyph::Prosign)
+            .ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "glyph {text:?} is neither one character nor a prosign token"
+                ))
+            })
+    }
 }
 
 impl Glyph {
@@ -193,6 +236,29 @@ pub fn pattern_for(c: char) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MAN-139: a glyph's JSON is its character or SPEC §4.4's prosign
+    /// token, and reads back to itself.
+    #[test]
+    fn glyph_json_is_its_character_or_prosign_token() {
+        let prosigns = Prosign::ALL.map(Glyph::Prosign);
+        for g in TABLE.iter().map(|(_, g)| *g).chain(prosigns) {
+            let json = serde_json::to_string(&g).unwrap();
+            let expected = match g {
+                Glyph::Char(c) => serde_json::to_string(&c.to_string()).unwrap(),
+                Glyph::Prosign(p) => format!("\"{}\"", p.token()),
+            };
+            assert_eq!(json, expected);
+            assert_eq!(serde_json::from_str::<Glyph>(&json).unwrap(), g, "{json}");
+        }
+        assert_eq!(
+            serde_json::to_string(&Glyph::Prosign(Prosign::Err)).unwrap(),
+            r#""<ERR>""#
+        );
+        for bad in [r#""""#, r#""AB""#, r#""<XX>""#, r#"{"Char":"A"}"#] {
+            assert!(serde_json::from_str::<Glyph>(bad).is_err(), "{bad}");
+        }
+    }
 
     fn walk(pattern: &str) -> Option<Glyph> {
         let t = MorseTree::shared();

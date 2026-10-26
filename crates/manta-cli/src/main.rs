@@ -936,8 +936,8 @@ enum Command {
         #[arg(long)]
         source_iq: bool,
         /// Radio dial frequency, in Hz. See `run --dial-freq-hz`; without it
-        /// an audio source's reported frequencies, and the report's
-        /// `center_freq_hz`, are baseband offsets.
+        /// an audio source's reported frequencies, and the report's center
+        /// frequency, are baseband offsets.
         #[arg(long, value_parser = parse_dial_freq_hz, help_heading = "Audio input")]
         dial_freq_hz: Option<f64>,
         /// TOML config file whose `[input]`, `[spot]`, `[detector]` and
@@ -6869,7 +6869,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                         }
                     }
                     if json {
-                        stdout_lines.line(format_args!("{}", serde_json::json!({ "spot": spot })));
+                        stdout_lines.line(format_args!("{}", fmt::spot_json(spot)));
                         return;
                     }
                     stdout_lines.line(format_args!("{}", fmt::spot_line(spot)));
@@ -7450,23 +7450,25 @@ fn run_command() -> Result<std::process::ExitCode> {
                 // `serde_json::to_string(&report)` omits the command's
                 // primary health classification entirely -- merge it in as
                 // an extra key rather than making JSON consumers duplicate
-                // the classification policy themselves.
-                let mut map = serde_json::Map::new();
-                if let Some(report) = &report {
-                    if let serde_json::Value::Object(fields) = serde_json::to_value(report)? {
-                        map = fields;
-                    }
-                    map.insert(
-                        "verdict".to_string(),
-                        serde_json::to_value(report.verdict())?,
-                    );
+                // the classification policy themselves. A struct, not a
+                // `Map`, so the keys keep declaration order (MAN-139).
+                #[derive(serde::Serialize)]
+                #[serde(rename_all = "camelCase")]
+                struct DoctorJson<'a> {
+                    #[serde(flatten)]
+                    report: Option<&'a manta_engine::DoctorReport>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    verdict: Option<manta_engine::Verdict>,
+                    checks: &'a [doctor_checks::Check],
+                    checks_status: doctor_checks::Status,
                 }
-                map.insert("checks".to_string(), serde_json::to_value(&checks)?);
-                map.insert(
-                    "checks_status".to_string(),
-                    serde_json::to_value(doctor_checks::worst(&checks))?,
-                );
-                outln!("{}", serde_json::to_string(&map)?)?;
+                let doctor_json = DoctorJson {
+                    report: report.as_ref(),
+                    verdict: report.as_ref().map(|r| r.verdict()),
+                    checks: &checks,
+                    checks_status: doctor_checks::worst(&checks),
+                };
+                outln!("{}", serde_json::to_string(&doctor_json)?)?;
             } else {
                 outln!()?;
                 outln!("{}", doctor_checks::summary(&checks))?;
@@ -8428,6 +8430,17 @@ mod tests {
 
     /// MAN-235: `doctor --help` names every verdict with its `--strict`
     /// code, and the code it names is the one `strict_exit_code` returns.
+    #[test]
+    fn doctor_help_names_no_json_key() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let doctor = cli.find_subcommand_mut("doctor").unwrap();
+        let help = doctor.render_long_help().to_string();
+        // MAN-139: the report's JSON keys are camelCase now; the help names
+        // the concept, not a key.
+        assert!(!help.contains("center_freq_hz"), "{help}");
+    }
+
     #[test]
     fn doctor_help_lists_the_strict_code_for_every_verdict() {
         use clap::CommandFactory;
