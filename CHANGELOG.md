@@ -238,6 +238,9 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-285: `manta status --json` now prints every field the daemon served,
+  including fields newer than this build, with object keys in alphabetical
+  order. The human-readable `manta status` summary and exit codes are unchanged.
 - `ReconnectingSource`, `DecimatingSource` and `manta doctor`'s
   `SampleBoundedSource` now forward the inner source's gap reports
   (`take_discontinuity()` and the new `take_missing_samples()`); they
