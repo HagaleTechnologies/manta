@@ -37,6 +37,7 @@ pub use soak_metrics::{
     soak_metrics_passed, soak_with_metrics, SoakCloseCounts, SoakMetricsReport, SoakMetricsSample,
 };
 
+mod digital_windows;
 #[cfg(test)]
 mod static_crash_tests;
 mod track;

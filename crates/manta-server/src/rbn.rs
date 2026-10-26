@@ -18,10 +18,27 @@ use manta_spot::{Spot, SpotType};
 /// Also used by `manta bench sensitivity` to quote its SNR axis in 500 Hz (MAN-116).
 pub const RBN_REF_BW_CORRECTION_DB: f32 = 6.989_7;
 
-fn spot_type_label(spot_type: SpotType) -> &'static str {
+/// MAN-94: the 18 stations of the NCDXF/IARU International Beacon Project,
+/// per https://www.ncdxf.org/beacon/beaconlocations.html. RBN's own feed
+/// labels a spot of one of these `NCDXF B` rather than `BEACON`. A member
+/// stays listed while it is off the air; the list changes only when the
+/// network does.
+const NCDXF_BEACONS: [&str; 18] = [
+    "4U1UN", "VE8AT", "W6WX", "KH6RS", "ZL6B", "VK6RBP", "JA2IGY", "RR9O", "VR2B", "4S7B", "ZS6DN",
+    "5Z4B", "4X6TU", "OH2B", "CS3B", "LU4AA", "OA4B", "YV5B",
+];
+
+/// The wire label for a spot's type. A Beacon spot whose callsign is
+/// exactly one of `NCDXF_BEACONS` reads `NCDXF B` (MAN-94); any other
+/// Beacon, including a portable or suffixed form of a member's call, reads
+/// `BEACON`. A roster call the validator did not classify Beacon keeps its
+/// own type's label: the decoder's classification, not the callsign alone,
+/// says this spot is a beacon transmission.
+fn spot_type_label(spot_type: SpotType, callsign: &str) -> &'static str {
     match spot_type {
         SpotType::Cq => "CQ",
         SpotType::De => "DE",
+        SpotType::Beacon if NCDXF_BEACONS.contains(&callsign) => "NCDXF B",
         SpotType::Beacon => "BEACON",
         SpotType::Unknown => "",
     }
@@ -114,8 +131,9 @@ const SNR_END_OFFSET: usize = 2;
 /// WPM is right-justified so its last char lands 9 columns past the mode
 /// field (RBN column 56), then a literal ` WPM`.
 const WPM_END_OFFSET: usize = 9;
-/// The 6-wide, left-justified spot-type field starts 16 columns past the
-/// mode field (RBN columns 63-68).
+/// The left-justified spot-type field, 6 columns at minimum, starts 16
+/// columns past the mode field (RBN columns 63-68). MAN-94's 7-character
+/// `NCDXF B` also takes column 69 and leaves one space before the time.
 const TYPE_START_OFFSET: usize = 16;
 /// The `HHMMZ` time field starts 24 columns past the mode field -- RBN
 /// column 71, the column MAN-88 exists to restore.
@@ -228,10 +246,12 @@ pub fn format_line(
     // ` WPM` is part of the WPM field, not a separator.
     let wpm_unit_end_col = wpm_end_col + " WPM".len();
 
-    // The type field is left-justified in 6 columns; `BEACON` fills it
-    // exactly, so nothing in `spot_type_label` overruns it today, but the
-    // time anchor below is computed from its rendered width regardless.
-    let ctx = format!("{:<6}", spot_type_label(spot.spot_type));
+    // The type field is left-justified in a 6-column MINIMUM; `BEACON`
+    // fills it exactly. MAN-94's `NCDXF B` is 7 characters and runs one
+    // column past it, into the two-column gap before the time field, so
+    // one separating space remains and the time keeps its anchor. The time
+    // anchor below is computed from the rendered width either way.
+    let ctx = format!("{:<6}", spot_type_label(spot.spot_type, &spot.callsign));
     let type_gap = (mode_end_col + TYPE_START_OFFSET)
         .saturating_sub(wpm_unit_end_col + 1)
         .max(1);
@@ -355,10 +375,12 @@ mod tests {
     }
 
     #[test]
-    fn every_spot_type_label_fits_the_six_wide_type_field() {
-        // BEACON is exactly 6 characters -- the width's binding constraint.
-        // The expected text is asserted alongside the column, so the test
-        // cannot pass with two labels swapped or every label emptied.
+    fn every_generic_spot_type_label_pads_to_the_six_column_minimum() {
+        // The type field is a 6-column MINIMUM: BEACON fills it exactly and
+        // the shorter labels pad out to it. MAN-94's 7-character `NCDXF B`
+        // is the one label that runs past it (tested below). The expected
+        // text is asserted alongside the column, so the test cannot pass
+        // with two labels swapped or every label emptied.
         for (spot_type, label) in [
             (SpotType::Cq, "CQ"),
             (SpotType::De, "DE"),
@@ -375,6 +397,112 @@ mod tests {
                 format!("{label:<6}"),
                 "{spot_type:?}: {line}"
             );
+        }
+    }
+
+    /// MAN-94: the 18 NCDXF/IARU beacons, written out literally rather than
+    /// read back from `NCDXF_BEACONS`, so a dropped or misspelt roster entry
+    /// fails here. Source: https://www.ncdxf.org/beacon/beaconlocations.html
+    const NCDXF_ROSTER: [&str; 18] = [
+        "4U1UN", "VE8AT", "W6WX", "KH6RS", "ZL6B", "VK6RBP", "JA2IGY", "RR9O", "VR2B", "4S7B",
+        "ZS6DN", "5Z4B", "4X6TU", "OH2B", "CS3B", "LU4AA", "OA4B", "YV5B",
+    ];
+
+    /// A Beacon spot for `call` on the NCDXF 20 m frequency, otherwise the
+    /// capture spot (14 dB(2500) -> 21 dB(500), 25 WPM).
+    fn beacon_spot(call: &str) -> Spot {
+        Spot {
+            callsign: call.to_string(),
+            freq_hz: 14_100_000.0,
+            spot_type: SpotType::Beacon,
+            ..capture_spot()
+        }
+    }
+
+    /// MAN-94 design fixtures: a roster beacon's full line in both layouts.
+    /// `NCDXF B` starts on the type column (63 RBN, 59 Skimmer), runs one
+    /// column past the 6-wide field, and keeps one space before the time
+    /// on its own column (71 RBN, 67 Skimmer).
+    #[test]
+    fn a_roster_beacon_renders_the_ncdxf_label_in_both_layouts() {
+        let ts = 2 * 3600 + 36 * 60;
+        let spot = beacon_spot("4U1UN");
+        assert_eq!(
+            format_line(&spot, "S53A", ts, LineFormat::Rbn),
+            "DX de S53A-#:   14100.00  4U1UN          CW    21 dB  25 WPM  NCDXF B 0236Z"
+        );
+        assert_eq!(
+            format_line(&spot, "S53A", ts, LineFormat::Skimmer),
+            "DX de S53A-#:   14100.00  4U1UN            21 dB  25 WPM  NCDXF B 0236Z"
+        );
+    }
+
+    /// MAN-94: every one of the 18 roster calls typed Beacon renders the
+    /// complete `NCDXF B` label on the type column, in both layouts, with
+    /// the time still on its own column.
+    #[test]
+    fn every_ncdxf_roster_beacon_renders_ncdxf_b_on_the_type_column() {
+        let ts = 2 * 3600 + 36 * 60;
+        for call in NCDXF_ROSTER {
+            let spot = beacon_spot(call);
+            for (format, type_col, time_col) in
+                [(LineFormat::Rbn, 63, 71), (LineFormat::Skimmer, 59, 67)]
+            {
+                let line = format_line(&spot, "S53A", ts, format);
+                let ctx = format!("{call} {format:?}: {line}");
+                assert_eq!(col_of(&line, "NCDXF B"), type_col, "{ctx}");
+                assert_eq!(&line[type_col - 1..time_col - 1], "NCDXF B ", "{ctx}");
+                assert_eq!(col_of(&line, "0236Z"), time_col, "{ctx}");
+                assert!(!line.contains("BEACON"), "{ctx}");
+            }
+        }
+    }
+
+    /// MAN-94: membership is an exact, full-callsign match. A generic
+    /// beacon, or a lookalike that only shares a roster call's stem, keeps
+    /// the generic `BEACON` label -- no portable prefix or suffix is
+    /// stripped, and matching is case-sensitive on the uppercase calls the
+    /// validator emits.
+    #[test]
+    fn a_generic_or_lookalike_beacon_keeps_the_beacon_label() {
+        let ts = 2 * 3600 + 36 * 60;
+        for call in [
+            "K5ARH", "JA1BCN", "4U1UN/P", "4U1UNA", "4U1U", "W6WX/B", "KH6/W6WX", "4u1un", "ZL6",
+        ] {
+            let spot = beacon_spot(call);
+            for (format, type_col, time_col) in
+                [(LineFormat::Rbn, 63, 71), (LineFormat::Skimmer, 59, 67)]
+            {
+                let line = format_line(&spot, "S53A", ts, format);
+                let ctx = format!("{call} {format:?}: {line}");
+                assert_eq!(&line[type_col - 1..time_col - 1], "BEACON  ", "{ctx}");
+                assert_eq!(col_of(&line, "0236Z"), time_col, "{ctx}");
+                assert!(!line.contains("NCDXF"), "{ctx}");
+            }
+        }
+    }
+
+    /// MAN-94: the label depends on the decoder's Beacon classification as
+    /// well as the call. A roster call typed CQ, DE or Unknown -- e.g. a
+    /// Watch List hit without beacon framing -- keeps that type's label.
+    #[test]
+    fn a_roster_call_with_any_other_spot_type_keeps_its_own_label() {
+        let ts = 2 * 3600 + 36 * 60;
+        for call in NCDXF_ROSTER {
+            for (spot_type, label) in [
+                (SpotType::Cq, "CQ"),
+                (SpotType::De, "DE"),
+                (SpotType::Unknown, ""),
+            ] {
+                let spot = Spot {
+                    spot_type,
+                    ..beacon_spot(call)
+                };
+                let line = format_line(&spot, "S53A", ts, LineFormat::Rbn);
+                let ctx = format!("{call} {spot_type:?}: {line}");
+                assert_eq!(&line[62..70], format!("{label:<8}"), "{ctx}");
+                assert_eq!(col_of(&line, "0236Z"), 71, "{ctx}");
+            }
         }
     }
 

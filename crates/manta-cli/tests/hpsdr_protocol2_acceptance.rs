@@ -206,7 +206,13 @@ struct FakeP2Radio {
 
 impl FakeP2Radio {
     fn start(stream: Stream, done: mpsc::Sender<()>) -> Self {
-        let (base, cmd, iq) = Self::bind();
+        Self::start_on([127, 0, 0, 1], stream, done)
+    }
+
+    /// As [`Self::start`], bound on `ip`: `[0, 0, 0, 0]` also hears the
+    /// broadcast discovery a hostless input sends (MAN-306).
+    fn start_on(ip: [u8; 4], stream: Stream, done: mpsc::Sender<()>) -> Self {
+        let (base, cmd, iq) = Self::bind(ip);
         let stop = Arc::new(AtomicBool::new(false));
         let run_from: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
         let mut threads = Vec::new();
@@ -305,19 +311,20 @@ impl FakeP2Radio {
         }
     }
 
-    /// Bind `base..=base+3` and `base+11` on 127.0.0.1 for some free base.
-    fn bind() -> (u16, Vec<UdpSocket>, UdpSocket) {
+    /// Bind `base..=base+3` and `base+11` on `ip` for some free base.
+    fn bind(ip: [u8; 4]) -> (u16, Vec<UdpSocket>, UdpSocket) {
+        let ip = std::net::Ipv4Addr::from(ip);
         for _ in 0..200 {
-            let first = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let first = UdpSocket::bind((ip, 0)).unwrap();
             let base = first.local_addr().unwrap().port();
             if base > u16::MAX - 11 {
                 continue;
             }
             let rest: Option<Vec<UdpSocket>> = (1..=3)
-                .map(|o| UdpSocket::bind(("127.0.0.1", base + o)).ok())
+                .map(|o| UdpSocket::bind((ip, base + o)).ok())
                 .collect();
             let Some(rest) = rest else { continue };
-            let Ok(iq) = UdpSocket::bind(("127.0.0.1", base + 11)) else {
+            let Ok(iq) = UdpSocket::bind((ip, base + 11)) else {
                 continue;
             };
             let mut cmd = vec![first];
@@ -607,4 +614,147 @@ fn check_reports_a_protocol2_radio() {
         stderr.contains("answered discovery as openHPSDR protocol 2 (board 5, Orion II"),
         "{stderr}"
     );
+}
+
+/// MAN-306: with no address, discovery finds the protocol-2 radio and the
+/// MAN-305 driver opens it, exactly as with an explicit host.
+#[test]
+fn check_discovers_a_protocol2_radio_without_an_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture(dir.path());
+    let mut samples = wav_samples(&wav);
+    samples.truncate(3 * RATE as usize);
+    let (done_tx, _done_rx) = mpsc::channel();
+    let fake = FakeP2Radio::start_on(
+        [0, 0, 0, 0],
+        Stream {
+            samples: Arc::new(samples),
+            speed: 1.0,
+            skip: None,
+            looping: true,
+            go: Arc::new(AtomicBool::new(true)),
+        },
+        done_tx,
+    );
+    let out = manta()
+        .args(["check", "--hpsdr-port"])
+        .arg(fake.base.to_string())
+        .args([
+            "--hpsdr-freq-hz",
+            "14000000",
+            "--hpsdr-rate-hz",
+            "192000",
+            "--duration",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    drop(fake);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("Stream sample rate: 192000 Hz"), "{stdout}");
+    assert!(
+        stderr.contains("answered discovery as openHPSDR protocol 2 (board 5, Orion II"),
+        "{stderr}"
+    );
+}
+
+/// MAN-307 x MAN-305: with several `[[input]]` entries every HPSDR radio
+/// opens through the shared-radio group, and a radio with one entry keeps
+/// MAN-305's protocol choice there: `auto` discovers each protocol-2 radio
+/// and streams from it, as the one-input path above does.
+#[test]
+fn lone_protocol2_radios_in_a_multi_input_run_are_discovered_and_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture(dir.path());
+    let samples = Arc::new(wav_samples(&wav));
+    let go = Arc::new(AtomicBool::new(false));
+    let (done_tx, _done_rx) = mpsc::channel();
+    let radios: Vec<FakeP2Radio> = (0..2)
+        .map(|_| {
+            FakeP2Radio::start(
+                Stream {
+                    samples: samples.clone(),
+                    speed: 2.0,
+                    skip: None,
+                    looping: true,
+                    go: go.clone(),
+                },
+                done_tx.clone(),
+            )
+        })
+        .collect();
+    let [telnet_port, json_port, metrics_port] = free_ports();
+    let mut text = format!(
+        "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {telnet_port}\njson_port = {json_port}\nmetrics_port = {metrics_port}\n"
+    );
+    for (name, radio) in ["a", "b"].iter().zip(&radios) {
+        text += &format!(
+            "\n[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nhost = \"127.0.0.1\"\nport = {}\nfreq_hz = 14000000.0\nrate_hz = 192000.0\n",
+            radio.base
+        );
+    }
+    let cfg = dir.path().join("manta.toml");
+    std::fs::write(&cfg, text).unwrap();
+    let mut child = manta()
+        .args(["run", "--json", "--config"])
+        .arg(&cfg)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let _guard = ChildGuard(child);
+    let err_lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    {
+        let err_lines = err_lines.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                err_lines.lock().unwrap().push(line);
+            }
+        });
+    }
+    let (spot_tx, spot_rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                if let Some(s) = v.get("spot") {
+                    let _ = spot_tx.send(spot_of(s));
+                }
+            }
+        }
+    });
+    let stderr_now = || err_lines.lock().unwrap().join("\n");
+    go.store(true, Ordering::SeqCst);
+    let spot = spot_rx
+        .recv_timeout(Duration::from_secs(60))
+        .unwrap_or_else(|_| panic!("no spot within 60 s; stderr:\n{}", stderr_now()));
+    assert_eq!(spot.0, "W1AW");
+    let healthy = |m: &str| {
+        ["a", "b"].iter().all(|name| {
+            metric_value(m, &format!("manta_source_health{{source=\"{name}\"}}")) == Some(1)
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let metrics = loop {
+        let body = scrape_metrics(metrics_port).unwrap_or_default();
+        if healthy(&body) || Instant::now() >= deadline {
+            break body;
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
+    assert!(healthy(&metrics), "{metrics}");
+    let stderr = stderr_now();
+    for radio in &radios {
+        assert!(
+            stderr.contains(&format!(
+                "HPSDR radio 127.0.0.1:{} answered discovery as openHPSDR protocol 2 (board 5, \
+                 Orion II",
+                radio.base
+            )),
+            "{stderr}"
+        );
+    }
 }

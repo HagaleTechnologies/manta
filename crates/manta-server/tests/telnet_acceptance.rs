@@ -1943,3 +1943,65 @@ async fn sh_dx_history_window_is_configurable() {
         expected[300..]
     );
 }
+
+/// Sends one blank keepalive line, as CRLF, and asserts it is answered
+/// rather than ending the session. These are not the bytes N1MM's manual
+/// gives for its keep-alive; see the test below.
+async fn send_blank_keepalive(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    wr: &mut tokio::net::tcp::OwnedWriteHalf,
+    keepalive: u32,
+) {
+    wr.write_all(b"\r\n").await.unwrap();
+    let mut reply = String::new();
+    let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut reply))
+        .await
+        .unwrap_or_else(|_| panic!("keepalive #{keepalive} must be answered"))
+        .unwrap();
+    assert!(n > 0, "connection closed at keepalive #{keepalive}");
+    assert_eq!(
+        reply, "Unknown command\r\n",
+        "reply to keepalive #{keepalive}"
+    );
+}
+
+/// MAN-99: N1MM Logger+ sends a cluster keep-alive every N whole minutes.
+/// Over a real socket a blank keepalive line costs exactly one unit of the
+/// command budget, so a full `MAX_TELNET_COMMANDS` of them is answered;
+/// one window later the next keepalive draws on a fresh budget on both the
+/// per-connection and per-IP limiters, and spots still flow. N1MM's 60 s
+/// cadence over a day is pinned by `rate_limit.rs`'s paused-time tests.
+/// Real sockets cannot use paused time (see the login-idle test above),
+/// and a window plus one second is the same case, each keepalive starting
+/// its own window, for a sixth of the wait. This covers a keepalive sent
+/// as a CRLF blank line only. N1MM's manual (Telnet window, Clusters tab)
+/// gives its bytes as `" "<cr>`, a space and a bare CR, which completes no
+/// line: it never reaches this budget, but each keepalive adds 2 bytes to
+/// the pending line, which only a completed line clears, and the client is
+/// disconnected once that passes `MAX_LINE_BYTES`. A client that sends
+/// nothing else goes at the 513th keepalive, about 8.5 h at one a minute.
+/// No test here covers that shape.
+#[tokio::test]
+async fn blank_keepalive_lines_cost_one_command_each_and_a_window_later_the_budget_is_fresh() {
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+
+    for keepalive in 0..manta_server::telnet::MAX_TELNET_COMMANDS {
+        send_blank_keepalive(&mut reader, &mut wr, keepalive).await;
+    }
+    tokio::time::sleep(manta_server::telnet::COMMAND_RATE_WINDOW + Duration::from_secs(1)).await;
+    send_blank_keepalive(
+        &mut reader,
+        &mut wr,
+        manta_server::telnet::MAX_TELNET_COMMANDS,
+    )
+    .await;
+
+    bus.publish(sample_spot());
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("spots must still flow after the keepalives")
+        .unwrap();
+    assert!(line.contains("DX de"), "line was: {line:?}");
+}

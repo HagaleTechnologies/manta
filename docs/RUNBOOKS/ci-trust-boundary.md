@@ -8,6 +8,9 @@ account or hosted GitHub. The rationale is in
 gate classifies Dependabot, titles an override and fails closed on an
 incomplete thread read, and which source may report each required check,
 are in `docs/DECISIONS/2026-10-16-man245-gate-verdict-integrity.md`.
+Why a dispatched run tests the PR head merged with `main`, and what
+`PR head conflicts with main` means, is in
+`docs/DECISIONS/2026-10-20-man340-dispatched-ci-tests-the-merge-with-main.md`.
 
 ## Routing
 
@@ -17,7 +20,7 @@ in `HagaleTechnologies/manta`, not a fork.
 
 | PR | Codex gate check | CI path | Cache writes | Auto-merge |
 |---|---|---|---|---|
-| Trusted, in-repository, ready | Codex request → verdict, as before; a `codex-clean:<sha12>` label the gate did not apply passes as `Codex review overridden by <login>` (MAN-245) | `ci-full.yml` dispatched on `main` after a clean verdict (or the existing `codex-clean:<sha12>` label) | none (restore-only) | arms |
+| Trusted, in-repository, ready | Codex request → verdict, as before; a `codex-clean:<sha12>` label the gate did not apply passes as `Codex review overridden by <login>` (MAN-245) | `ci-full.yml` dispatched on `main` after a clean verdict (or the existing `codex-clean:<sha12>` label); each `test`/`test-soapy` leg tests the PR head merged with the `main` commit the run was dispatched from (MAN-340) | none (restore-only) | arms |
 | Trusted, in-repository, draft | completed as success at once, as before | none until marked ready for review | none | does not arm (draft) |
 | Untrusted author, in-repository | Codex request → verdict, as before | `ci-full.yml` native `pull_request` run (`refs/pull/N/merge` scope) | none (restore-only) | never arms; owner merges |
 | Fork (any author) | Codex request → verdict, as before | native `pull_request` run; waits for approval under the fork-approval setting below | none (restore-only) | never arms; owner merges |
@@ -42,6 +45,31 @@ builds (`release-publish.yml`) restore none.
 Never run `gh workflow run ci-full.yml -f head_sha=<outside sha>` before
 reading the diff. That runs the outside code in `main`'s context, which is
 exactly what MAN-243 closed.
+
+## When a trusted PR's dispatched test check fails
+
+A dispatched run reads `ci-full.yml` from `main`, so its steps are
+`main`'s. Before any other step, each `test` and `test-soapy` leg merges
+`github.sha` (the `main` commit the run was dispatched from) into the PR
+head, in the runner's own checkout. Nothing is pushed. A step added to
+`main` after the branch was cut therefore finds its files, and the PR is
+judged as it would land.
+
+- If a leg's first error is `PR head conflicts with main`, the head does
+  not merge cleanly with that `main` commit. The annotation names the
+  conflicted files. Merge `main` into the branch, resolve those files and
+  push. The new head gets a fresh Codex round and dispatch.
+- `Unexpected checkout`, `Shallow checkout` or
+  `Default-branch commit missing` means the run's own setup broke, not the
+  PR. Re-run the failed jobs; if it repeats, the checkout step changed.
+- Any other failure is the PR's code as it would land on `main`.
+
+Find the run and what it tested:
+
+```bash
+gh run list -R HagaleTechnologies/manta --workflow ci-full.yml --event workflow_dispatch --limit 20 --json databaseId,createdAt,conclusion
+gh run view <id> -R HagaleTechnologies/manta --log | grep -m3 -E 'HEAD is now at|Tested with main merged in|already contains|PR head conflicts with main'
+```
 
 ## One-time owner steps
 
@@ -130,6 +158,32 @@ gh run view <id> -R HagaleTechnologies/manta --log | grep -cE 'Restoring cache|C
 The next trusted, ready PR goes Codex clean → dispatched CI → auto-merge
 armed → merge queue → merged, with no manual merge:
 `gh pr view <n> -R HagaleTechnologies/manta --json mergedAt,mergedBy`.
+
+### O9. A dispatched run tests the merge with main (MAN-340)
+
+The MAN-340 PR's own dispatched run still reads the old `ci-full.yml` from
+`main`, so these checks start with the first dispatch after it merges.
+
+- **O9a, first dispatch.** On the next trusted PR's dispatched run, every
+  `test (...)` and `test-soapy (...)` leg shows the step
+  `Merge the main commit this workflow came from into the PR head`, and its
+  log shows `already contains` or `Tested with main merged in`. Check the
+  Windows leg too: it is the only run of the step under Git Bash. The PR
+  head's three `test (...)` check-runs still complete with the legs'
+  conclusions.
+- **O9b, a stale branch (optional).** From a trusted account, push a branch
+  cut from a `main` commit before MAN-301 (so
+  `scripts/tests/test_score_against_rbn_replay.py` is absent) with a
+  one-line docs change, and open it ready for review. Expect every leg to
+  pass `python3 -m unittest scripts.tests.test_score_against_rbn_replay -v`,
+  or to fail only with `PR head conflicts with main`. Close the PR and
+  delete the branch afterwards.
+- **O9c, the native path is unchanged.** On the next native `pull_request`
+  run (a Dependabot PR is the usual one), the merge step shows as skipped
+  and the checkout fetched one commit:
+  `gh run view <id> -R HagaleTechnologies/manta --log | grep -m1 -- '--depth=1'`.
+  The Codex gate's log for an untrusted PR still reads
+  `Not dispatching ci-full.yml: …`.
 
 ## Changing the trusted list
 

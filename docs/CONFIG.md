@@ -216,7 +216,8 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `iq` | `false` | live: `type = "file"` | `true` for a two-channel IQ recording. `--source-iq` sets it. |
 | `realtime` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` paces the replay to the recording's own clock, so telnet/JSON clients can watch it. `--realtime` sets it; a live source refuses it. See [DECISIONS/2026-10-10-man269-paced-looping-replay.md](DECISIONS/2026-10-10-man269-paced-looping-replay.md). |
 | `loop` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` replays the file again from the start each time it ends, until stopped; implies `realtime`. `--loop` sets it; a live source refuses it. |
-| `host` | none; example `"<your-receiver-host>"`; required for kiwi and hpsdr | live: `type = "kiwi"` or `"hpsdr"` | Receiver host name. `--kiwi-host` or `--hpsdr-host` overrides it. |
+| `host` | none; example `"<your-receiver-host>"`; required for kiwi; optional for hpsdr | live: `type = "kiwi"` or `"hpsdr"` | Receiver host name. `--kiwi-host` or `--hpsdr-host` overrides it. For hpsdr, set host or mac, or neither to discover the only available radio. An explicit host skips the LAN broadcast, though under `protocol = "auto"` the protocol probe still goes to that host; host and mac together are refused. |
+| `mac` | none; example `"02:11:22:33:44:55"`; unset selects the only discovered radio | live: `type = "hpsdr"` | Pin a radio across address changes. `--hpsdr-mac` or `MANTA_INPUT_MAC` sets it. Accepts colon, dash or bare hexadecimal spelling, case-insensitively; summaries print uppercase colon-separated bytes. Cannot be combined with host. |
 | `port` | `8073`; `1024` for hpsdr; `5004` for ka9q | live: `type = "kiwi"`, `"hpsdr"` or `"ka9q"` | Receiver port, 1 to 65535; for ka9q, the group's RTP data port; for an hpsdr protocol-2 radio, the base of its port map (see [HPSDR protocol 2](#hpsdr-protocol-2)). `--kiwi-port`, `--hpsdr-port` or `--ka9q-port` overrides it. |
 | `protocol` | `"auto"` | live: `type = "hpsdr"` | openHPSDR protocol the radio speaks: `"auto"`, `"1"` or `"2"`; the integers `1` and `2` are accepted too. `"auto"` sends a discovery probe to `host` on every open and uses protocol 2 when the radio answers as protocol 2, protocol 1 otherwise (a warning names the key when the radio does not answer within 1 s). `"1"` (Hermes-Lite 2) and `"2"` (ANAN) skip the probe. `--hpsdr-protocol` or `MANTA_INPUT_PROTOCOL` (read verbatim as a string) overrides it. Any other `type` refuses the key. |
 | `password` | `""` | live: `type = "kiwi"` | KiwiSDR password; empty for a public receiver. `config check` prints only whether it is set. `--kiwi-password` overrides it. |
@@ -226,6 +227,7 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `bands` | none; example `["40m"]`; set instead of `freq_hz` | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"`; restart required | `"all"`, band names such as `"40m"`, or centre frequencies in kHz such as `"7030"` (a string, a number or a list of them). manta plans one stream per slice of each band's CW segment and runs each as an input. See [Band plans: bands](#band-plans-bands) (MAN-310). |
 | `tuning_range_hz` | `[0.0, 30000000.0]`; only with `bands` | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"`; restart required | The receiver's tuning range, `[low, high]` in Hz. A band outside it is skipped and a band partly outside it is clipped, each with a note. See [Band plans: bands](#band-plans-bands). |
 | `rate_hz` | none; example `192000.0`; required for soapy and hpsdr | live: `type = "soapy"` or `"hpsdr"` | Sample rate, Hz. `--soapy-rate-hz` or `--hpsdr-rate-hz` overrides it. |
+| `receivers` | none; example `4` | live: `type = "hpsdr"` | Optional hardware capacity declaration, integer 1 to 255, on the first entry for a radio only. Shared HL2 radios report capacity at startup; other gateware needs this fallback. The smaller reported/declared count applies. This is not the active receiver count. |
 | `group` | none; example `"239.101.6.1"`; required for ka9q | live: `type = "ka9q"` | Multicast data group of one ka9q-radio (radiod) IQ channel: an IPv4 multicast address, or the name in the channel's `data =` line, resolved by the system resolver when the source opens. Checked when the file loads; an IPv6 group is refused. manta reads the channel's sample rate, encoding and frequency from radiod's status packets. `--ka9q-group` overrides it. |
 | `ssrc` | none; example `14100000`; unset reads the group's only channel | live: `type = "ka9q"` | SSRC of the channel to read, 0 to 4294967295; needed only when the group carries more than one channel. `--ka9q-ssrc` overrides it. |
 | `interface` | none; example `"192.168.1.20"`; unset joins on the kernel's choice | live: `type = "ka9q"` | IPv4 address of the local interface to join the group on (an interface name is refused). manta also joins on `127.0.0.1`, for a radiod on the same machine. `--ka9q-interface` overrides it. |
@@ -239,9 +241,11 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 MAN-305: ANAN-class radios (Hermes, Angelia, Orion, Orion II, Saturn/G2)
 speak openHPSDR protocol 2; Hermes-Lite 2 and older boards speak protocol 1.
 Both use `type = "hpsdr"` and `--hpsdr-*`, chosen by `protocol` above
-(`--hpsdr-protocol auto|1|2`). The probe under `"auto"` goes to the
-configured host only; manta never broadcasts, and `manta devices` does not
-list radios.
+(`--hpsdr-protocol auto|1|2`). The probe under `"auto"` goes to one
+address: the configured host, or, with no host, the radio that LAN discovery
+selected (MAN-306), so a hostless protocol-2 radio streams through this
+driver too. `manta devices` lists the radios that answer discovery, of
+either protocol.
 
 Protocol 2 uses a port map relative to `port` (`1024` by default):
 
@@ -274,9 +278,10 @@ datagrams by the radio's source port.
   `manta_input_dropped_packets_total{source="hpsdr"}` climbs on a quiet LAN.
 - A radio that reports itself already streaming to another program is
   refused under `"auto"`; `protocol = "2"` takes it over.
-- One receiver (DDC0) per radio until MAN-307. The rate must be exactly
-  48000, 96000, 192000 or 384000 Hz, and `freq_hz` a whole number of Hz below
-  61440000.
+- One receiver (DDC0) per radio: several receivers on one radio (MAN-307)
+  speak protocol 1, so a shared radio refuses `protocol = "2"`. The rate
+  must be exactly 48000, 96000, 192000 or 384000 Hz, and `freq_hz` a whole
+  number of Hz below 61440000.
 - With `protocol = "2"`, or a board manta does not know, the radio's
   front-end filters are bypassed (ANT1, no high-pass, the 6 m low-pass).
 
@@ -343,7 +348,9 @@ every stream of that receiver.
 **Capacity.** A kiwi entry opens one KiwiSDR channel per stream, within the
 receiver's free channels. An hpsdr or soapy entry opens one stream; a plan
 that needs more is refused naming it (several receivers on one HPSDR radio
-is MAN-307). All inputs together stay within manta's 16, and one entry
+are one `[[input]]` each — see
+[the multiple-receivers guide](GUIDES/multiple-receivers.md#several-bands-on-one-hpsdr-radio)).
+All inputs together stay within manta's 16, and one entry
 plans at most 256 streams before that check (a near-zero `rate_hz` is
 refused rather than split into millions of slices). A plan of several
 streams refuses `center_freq_hz`: one fixed centre cannot describe
@@ -386,7 +393,12 @@ per receiver. Each entry takes the keys above, plus `name`. A one-entry
 - File replay and live receivers do not mix in one run. `replay_epoch` goes
   on the first entry only, and every file entry has the same `realtime` and
   `loop`.
-- Two entries on one HPSDR radio are refused until MAN-307.
+- HPSDR entries sharing a case-insensitive host and effective port, or
+  hostless entries sharing an `input.mac` (or neither), use one radio
+  session, with receivers assigned in file order. Native `rate_hz`
+  and `protocol` must match, and `protocol = "2"` is refused there.
+  Capacity is checked at startup, while `config check` remains
+  offline. See [the four-band example and diagnostics](GUIDES/multiple-receivers.md#several-bands-on-one-hpsdr-radio).
 - `MANTA_INPUT_*` and the per-receiver flags `--freq-correction-ppm`,
   `--dial-freq-hz` and `--capture-rate-hz` cannot say which entry they set,
   so they are refused; a source flag (`--source`, `--kiwi-host`, ...) still
@@ -446,8 +458,53 @@ milliseconds, 0 to 3600000.
 | `crash_filter` | `"full"` | live | What a static crash (a band-wide lift of 3 dB or more on at least three quarters of the passband's channels for 8 ms or more) does. `"full"`: no track starts on it, and running tracks do not decode it. `"starts-only"`: no track starts on it, but running tracks decode it as received. `"off"`: no filtering. Crashes are counted in `manta_static_crashes_total` whatever the value. Inactive when the source passband holds fewer than 96 channels (rig audio; captures of 6 kHz or less). Needs a restart. See [SPEC §2.7](SPEC-decode-core.md#27-band-wide-static-crash-detection-man-312) and [MAN-312](DECISIONS/2026-10-13-man312-static-crash-filter.md). |
 | `rtty_filter` | `true` | live | Recognise RTTY (two-tone FSK) signals and start no CW track on them or their keying sidebands; `false` restores the previous behaviour. See [SPEC §2.6](SPEC-decode-core.md#26-two-tone-fsk-rtty-recognition) and [MAN-314](DECISIONS/2026-10-11-man314-rtty-recognition.md). |
 | `rtty_dwell_ms` | `20000.0` | live | How long an FSK signal must last before it is marked as RTTY; 1000 to 3600000 (1 h), counted in whole 1000 ms detector blocks. |
+| `digital_window_filter` | `true` | live | Skip the common HF FT8, FT4, WSPR and JS8 windows when starting CW tracks. Set `false` to include them. Applies to file decoding and every service input. Restart required. |
 | `non_cw_filter` | `true` | live | A new track is decoded only once it shows CW keying. Noise-like wideband data, swept carriers and strong SSB voice start no CW track (0 in-band tracks at +15 to +45 dB is not yet universal: 8 at +15 dB and 2 at +20 dB remain, none spotted; 0 at +30/+45 dB, against 81 at +30 dB with the filter off, testkit voice seed 1), and a track whose signal stops keying closes after `unkeyed_close_ms`. `false` restores the pre-MAN-313 behaviour. See [SPEC §2.8](SPEC-decode-core.md#28-non-cw-rejection-man-313), [MAN-313](DECISIONS/2026-10-13-man313-non-cw-rejection.md) and [MAN-372](DECISIONS/2026-10-21-man372-speech-band-veto.md). Restart required (every `[detector]` key is). |
 | `unkeyed_close_ms` | `10000.0` | live | With `non_cw_filter` on, two limits: how long a qualified track may stay key-down with no keying, no decoded character and no callsign read before it closes; and how long a new track may take to show CW keying. Range 1000 to 3600000 (1 h). |
+
+### Digital-mode windows
+
+`digital_window_filter` defaults to `true`, including in existing files that
+omit the key. To include CW signals in these windows, set a boolean:
+
+```toml
+[detector]
+digital_window_filter = false
+```
+
+The environment override is `MANTA_DETECTOR_DIGITAL_WINDOW_FILTER=false`.
+The quoted TOML string `"false"` is invalid. Restart the process after a change.
+Opting in enables CW decoding there; it does not decode digital protocols or
+disable other signal filters.
+
+Each window starts at the USB dial below and ends 3 kHz above it. All values
+are in kHz; `-` means no entry. Overlapping windows act as their union.
+
+| Band | FT8 | FT4 | WSPR | JS8 |
+|---|---:|---:|---:|---:|
+| 160 m | 1840 | - | 1836.6 | 1842 |
+| 80 m | 3573 | 3575 | 3568.6 | 3578 |
+| 60 m | 5357 | 5357 | - | - |
+| 40 m | 7074 | 7047.5 | 7038.6 | 7078 |
+| 30 m | 10136 | 10140 | 10138.7 | 10130 |
+| 20 m | 14074 | 14080 | 14095.6 | 14078 |
+| 17 m | 18100 | 18104 | 18104.6 | 18104 |
+| 15 m | 21074 | 21140 | 21094.6 | 21078 |
+| 12 m | 24915 | 24919 | 24924.6 | 24922 |
+| 10 m | 28074 | 28180 | 28124.6 | 28078 |
+
+Membership is half-open, `[dial_hz, dial_hz + 3000)`, evaluated at each
+channel's source-reported RF center before frequency correction. Thus
+14074.5 kHz is excluded, while 14077 kHz is outside the isolated FT8 window.
+An endpoint can still lie in another mode's overlapping window. Boundaries
+follow the channel grid, normally 93.75 Hz. This is a track-start restriction;
+leakage near an edge can reach an allowed channel, and an existing track can
+drift across an edge without being closed.
+
+The table covers common HF defaults, including 60 m. It excludes regional
+and DXpedition alternatives and VHF/UHF. It makes no statement about transmit
+permissions. See the [MAN-311 decision](DECISIONS/2026-10-19-man311-digital-window-exclusions.md)
+for pinned frequency sources and verification.
 
 ## [decode]
 

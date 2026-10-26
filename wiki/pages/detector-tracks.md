@@ -101,3 +101,10 @@ Order statistics rather than a mean floor is the load-bearing choice: CW is burs
   taught that a looped test passes for an unrelated reason. See SPEC §2.8
   D′/§4.1 and the
   [decision record](../../docs/DECISIONS/2026-10-16-man271-short-transmission-decode.md).
+
+- MAN-311: common HF digital windows veto candidate births by default in
+  both spawn slots. Build the mask in each `TrackManager::new` so offline
+  and multi-input paths share it. Tests of signal classifiers whose scenes
+  cross these windows need an explicit opt-out. See the
+  [decision record](../../docs/DECISIONS/2026-10-19-man311-digital-window-exclusions.md)
+  and [config table](../../docs/CONFIG.md#digital-mode-windows).

@@ -213,6 +213,9 @@ impl IqSource for DecimatingSource {
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         while self.pending.is_empty() {
             let n = self.inner.read(&mut self.raw)?;
             // MAN-305: the inner reports describe the samples this inner
@@ -270,6 +273,73 @@ impl IqSource for DecimatingSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct GapChunks {
+        chunks: std::collections::VecDeque<(Vec<Complex32>, Option<u64>)>,
+        gap: Option<u64>,
+    }
+    impl IqSource for GapChunks {
+        fn sample_rate(&self) -> f64 {
+            192000.0
+        }
+        fn center_freq_hz(&self) -> f64 {
+            7e6
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            let Some((samples, gap)) = self.chunks.pop_front() else {
+                return Ok(0);
+            };
+            buf[..samples.len()].copy_from_slice(&samples);
+            self.gap = gap;
+            Ok(samples.len())
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            self.gap.take()
+        }
+    }
+
+    #[test]
+    fn gaps_reset_filter_and_are_latched_to_post_gap_samples() {
+        let before = vec![Complex32::new(1.0, 0.0); 128];
+        let after = vec![Complex32::new(-0.5, 0.0); 128];
+        let chunks = GapChunks {
+            chunks: [(before, None), (after.clone(), Some(7))].into(),
+            gap: None,
+        };
+        let mut src = DecimatingSource::new(Box::new(chunks), 48000.0).unwrap();
+        let mut buf = [Complex32::default(); 256];
+        assert_eq!(src.read(&mut buf).unwrap(), 32);
+        assert_eq!(src.take_discontinuity(), None);
+        let n = src.read(&mut buf).unwrap();
+        assert_eq!(src.take_discontinuity(), Some(1));
+        assert_eq!(src.take_discontinuity(), None);
+        let mut fresh = Decimator::new(192000.0, 4).unwrap();
+        assert_eq!(&buf[..n], fresh.process(&after));
+    }
+
+    #[test]
+    fn decimated_gaps_carry_remainders_and_survive_eof() {
+        let chunk = vec![Complex32::default(); 16];
+        let chunks = GapChunks {
+            chunks: [
+                (chunk.clone(), Some(3)),
+                (chunk, Some(3)),
+                (vec![], Some(2)),
+            ]
+            .into(),
+            gap: None,
+        };
+        let mut src = DecimatingSource::new(Box::new(chunks), 48000.0).unwrap();
+        let mut buf = [Complex32::default(); 256];
+        assert_eq!(src.read(&mut []).unwrap(), 0);
+        assert_eq!(src.take_discontinuity(), None);
+        assert_eq!(src.read(&mut buf).unwrap(), 4);
+        assert_eq!(src.take_discontinuity(), Some(0));
+        assert_eq!(src.read(&mut buf).unwrap(), 4);
+        assert_eq!(src.take_discontinuity(), Some(1));
+        assert_eq!(src.read(&mut buf).unwrap(), 0);
+        assert_eq!(src.take_discontinuity(), Some(1));
+    }
 
     /// A minimal in-memory IqSource test double, mirroring
     /// `manta-engine::listen`'s own `FixedFreqSource` test helper.

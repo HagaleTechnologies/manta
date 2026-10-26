@@ -1101,6 +1101,41 @@ itself via the constraint clamp below the first time a real dit arrives —
 the dit falls far below `μ_dit`, gets assigned to the dit cluster, drags it
 down, and the clamp re-anchors `μ_dah`.
 
+Unimodal direction prior (pinned decision 20): when the one cluster's mean
+exceeds the `150 ms` dit clamp ceiling below, it cannot be dits, so the
+marks are taken as dahs instead: `μ_dah = mean`, `μ_dit = mean / 3`
+provisionally, unconfirmed until a mark lands ≤ `0.5·μ_dah` (then
+`μ_dit = that duration`). At or under `150 ms` the cluster is still assumed
+to be dits. The prior applies to marks only; §4.2's gap ratios keep the
+plain dit-assumed rule.
+
+**[DEVIATION] (MAN-402)** — dahs of 90–150 ms (24–40 WPM) are also
+plausible dits, and a stream of equal dahs (`MO`, `OO`, `0000`, `T0M`)
+never supplies the long mark that confirms a dit-assumed cluster: every dah
+decodes as a dit, character gaps read as element gaps and word gaps as
+character gaps.
+So when the 5-mark initialization lands in that dit-assumed unimodal case
+(ready, unconfirmed, `μ_dit` the observed mean `m`, and `m ≥ 60 ms` — a
+shorter dah would put the dit under the `20 ms` clamp), the decoder hands the
+tracker the completed spaces between those five marks — only spaces
+bounded by a mark on both sides, before the buffered runs replay; leading
+silence and an unfinished trailing space are excluded, and the gaps are not
+classified first. The gaps with `m/6 ≤ g < m/√3` (finite, positive) are
+dah-scale element gaps: a dah is three element gaps long, `1/√3` is the
+log-space midpoint between ratios 1/3 and 1, and `1/6` the shortest gap any
+dash/dot ratio within the `6.0` ceiling allows. If at least **two** remain
+and their population coefficient of variation is `< 0.35`, the marks are
+dahs: `μ_dah = m`, `μ_dit = m / 3` provisionally (the pinned-decision-20
+direction above, still unconfirmed, so the first genuine dit re-anchors
+it), the constraints apply, and the WPM reporting EMA is re-seeded from the
+corrected `dit_estimate`. Two gaps, not more: five marks can straddle two
+character or word boundaries and leave only two element gaps. The check
+runs once, at the ordinary 5-mark readiness; it never runs on a confirmed
+split, on the over-ceiling dah-assumed case, at the MAN-271 finish-time
+bootstrap below, or later in the stream. Text whose characters are single
+dahs (`TT`) has no element gaps and keeps the dit assumption. See
+docs/DECISIONS/2026-10-25-man402-dah-heavy-bootstrap.md.
+
 **[DEVIATION] (MAN-271)** — at a **genuine end-of-signal** `finish()`
 (stream EOF, or a HangExpired/Silent closure, where a sustained real
 on-air gap has been observed), a tracker that saw **2–4 marks**
@@ -1330,9 +1365,17 @@ ll(d | dah) = −(ln d − ln μ_dah)² / (2·0.25²)
 ```
 
 (σ = 0.25 ⇒ ±28 % duration at 1σ — measured human keying jitter is 10–20 %,
-QSB-induced edge erosion adds the rest. **This is the riskiest constant in
-the spec**; it is config `decode.timing_sigma` and must be validated against
-the golden corpus at M3.)
+QSB-induced edge erosion adds the rest. σ is config `decode.timing_sigma`.
+Once called the riskiest constant in this spec: validated 2026-09 (MAN-9,
+decision 5) and re-measured at MAN-120 — it is **decode-invariant**: every
+hypothesis surviving a beam step has consumed the same marks, so σ enters
+each candidate's score as a common positive factor and cannot change the
+emitted glyph, the beam order, or the truncation set; it scales
+`confidence` only (measured: spot confidence 0.55 → 0.20 as σ goes 0.10 →
+1.50 with byte-identical decode text on V1 and V5). The non-inert sibling
+is beam width (§4.4): width 1 changed V5's decode; widths 2–16 measured
+identical to the default 4. Both properties are pinned by
+`crates/manta-engine/tests/beam_constant_invariance.rs`.)
 
 Spaces inside a character contribute no score (already classified by §4.2);
 the character boundary decision itself is hard, not beamed — beaming gap
@@ -1821,7 +1864,8 @@ Senders who do not key ideal 1:3 / 3 / 7 timing, decoded on the default
 `vw5`). All: 96 kHz, 14 MHz centre, offset +12.34 kHz unless stated, 5 ms
 rise, AWGN, looped text, 60 s unless stated. `dit_units`/`element_gap_units`
 set the dot and the element gap in dits (1.0 standard). Learned timing is
-read from the track's last `TimingUpdate` (§5).
+read from the track's last `TimingUpdate` (§5). Word boundaries are scored
+as SPEC v2 §8.2 defines (`docs/SPEC-decode-core-v2.md`).
 
 | # | Name | Signal(s) | Impairment | Pass criteria |
 |---|---|---|---|---|
@@ -1860,8 +1904,28 @@ code still hard-codes are listed commented out, marked `not configurable
 yet` -- the loader rejects them with that message rather than ignoring
 them.
 
+MAN-311's `digital_window_filter` defaults to `true`. The fixed dial table
+in [CONFIG.md, Digital-mode windows](CONFIG.md#digital-mode-windows) defines
+the common HF FT8, FT4, WSPR and JS8 exclusions, including 60 m. For each
+receiver, `TrackManager::new` builds a channel mask from
+`center_freq_hz + wrapped_channel_offset(k, n) * fs / n`. A channel is
+excluded when its raw RF center lies in any half-open `[dial_hz, dial_hz +
+3000)` window. Overlaps form a union. Both spawn arbitration slots consult
+the mask before choosing a birth channel. Existing tracks are not closed at
+an edge; leakage can reach an adjacent allowed channel. The normal grid is
+93.75 Hz. Downstream frequency correction does not move the mask.
+
+`false` allocates no mask and removes only this veto. The setting applies to
+file decoding and every service input and requires a restart. The environment
+override is `MANTA_DETECTOR_DIGITAL_WINDOW_FILTER=false`. A quoted TOML string
+is invalid; use a boolean. No decoder engine, ongoing-track lifecycle or spot
+format changes. See the [decision record](DECISIONS/2026-10-19-man311-digital-window-exclusions.md).
+
 ```toml
 [detector]
+# MAN-311: common HF digital-mode windows; false includes them for CW.
+# Restart required. Uses raw channel RF centers before frequency correction.
+digital_window_filter = true
 # Bounds: 0 <= off_snr_db <= on_snr_db <= 100; every *_ms in [0, 3600000],
 # converted with ms_to_hops (§1.1); confirm_ms/hang_ms/gc_ms must round to
 # >= 1 hop; track_cap >= 1.
@@ -1918,13 +1982,14 @@ flush_gap_dits = 7.0
 #   file:  path*, iq, realtime, loop
 #   kiwi:  host*, freq_hz*, port, password
 #   soapy: driver*, freq_hz*, rate_hz*, gain_db   (build with --features soapy)
-#   hpsdr: host*, freq_hz*, rate_hz*, port, protocol (included in every build)
+#   hpsdr: host, mac, freq_hz*, rate_hz*, port, protocol (included in every build)
 #   ka9q:  group*, port, ssrc, interface
 # Any source flag on the command line (--device, --source, --kiwi-host,
 # --soapy-driver, --hpsdr-host, --ka9q-group) replaces a typed [input]
 # table whole, its shared keys below included. Example:
 # type = "kiwi"               # audio | file | kiwi | soapy | hpsdr | ka9q
-# host = "<your-kiwi-host>"   # kiwi, hpsdr
+# host = "<your-kiwi-host>"   # kiwi required; hpsdr optional (omit host and mac to discover)
+# mac = "02:11:22:33:44:55"   # hpsdr: pin by MAC instead of host; never set both
 # port = 8073                 # kiwi (default 8073), hpsdr (default 1024), ka9q (default 5004)
 # protocol = "auto"           # hpsdr: "auto" (default) asks the radio; "1" (Hermes-Lite 2) or "2" (ANAN) skips asking (--hpsdr-protocol)
 # freq_hz = 7030000.0         # kiwi, soapy, hpsdr: RF center frequency, Hz

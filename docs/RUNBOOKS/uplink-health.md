@@ -54,6 +54,9 @@ manta status --addr 10.0.0.5:7302
 manta status --addr 10.0.0.5:7302 --json | jq .uplink
 ```
 
+`--json` prints every field the daemon served, even fields newer than this
+`manta` build, with object keys in alphabetical order.
+
 (`--server-config` still works everywhere `--config` does here — it is a
 deprecated alias, kept so existing runbooks and cron jobs don't break, and
 it prints a one-line deprecation notice on stderr.)

@@ -227,6 +227,54 @@ def caret_ceiling_component(comparator):
     return (2, patch)
 
 
+def caret_upper_bound(comparator):
+    """The exclusive (major, minor, patch) upper bound of a caret comparator, per the Cargo
+    Book's caret table: the leftmost NONZERO specified component is incremented, or, when every
+    specified component is zero, the last specified one is.
+
+      ^1.2.3 / ^1.2 / ^1 -> <2.0.0        ^0.2.3 / ^0.2 -> <0.3.0
+      ^0.0.3             -> <0.0.4        ^0.0          -> <0.1.0
+      ^0                 -> <1.0.0        ^0.0.0        -> <0.0.1
+
+    MAN-220, Finding V (Codex, manta#194 round 15): requirement_is_satisfied_by compared
+    caret_ceiling_component identities, which carry None for an omitted component -- `^0` gave
+    (1, None) and `^0.0` gave (2, None), which no concrete locked version's identity can equal,
+    so a valid `^0`/`^0.0` declaration failed the consistency pass on every Dependabot PR.
+    Confirmed against cargo 1.98.0: `^0` accepts 0.5.0 and 0.0.5, `^0.0` accepts 0.0.5 and
+    rejects 0.1.0, `^0.0.0` accepts only 0.0.0.
+    """
+    _kind, major, minor, patch, _pre = comparator
+    if major != 0 or minor is None:
+        return (major + 1, 0, 0)
+    if minor != 0 or patch is None:
+        return (0, minor + 1, 0)
+    return (0, 0, patch + 1)
+
+
+def lower_bound_key(comparator):
+    """A sortable key for the lowest version a floor-carrying comparator admits:
+    (version_sort_key, 0) for an inclusive floor, (version_sort_key, 1) for a strict one, so a
+    larger key is always the stricter floor.
+
+    MAN-220, Finding AK (Codex, manta#194 round 26): compare_requirements compared zero-filled
+    floor_tuple values, but Cargo reads an omitted component in `>` as excluding that whole
+    release line -- `>1.2` is `>=1.3.0` and `>1` is `>=2.0.0` (the same semantics
+    _comparator_boundary ports for satisfaction). Zero-filling made `>1.2` -> `>1.2.1` look like
+    a floor raise although the head admits 1.2.2 and the base did not. Every other
+    floor-carrying kind's omitted components really are zero (`>=1.2`, `=1.2`, `^1.2` and `~1.2`
+    all start at 1.2.0), so they keep floor_tuple. A prerelease on a partial `>` is ignored:
+    cargo 1.98.0 refuses to parse one (`>1.2-alpha`).
+    """
+    kind, major, minor, patch, pre = comparator
+    if kind == GT:
+        if minor is None:
+            return (version_sort_key(major + 1, 0, 0, None), 0)
+        if patch is None:
+            return (version_sort_key(major, minor + 1, 0, None), 0)
+        return (version_sort_key(major, minor, patch, pre), 1)
+    return (floor_tuple(comparator), 0)
+
+
 def compare_requirements(base_req, head_req):
     """Return None if head_req is a safe (non-downgrade, non-ceiling-widening) bump of
     base_req, or a string reason if not.
@@ -286,9 +334,16 @@ def compare_requirements(base_req, head_req):
                 )
             continue
 
-        base_floor = floor_tuple(base_cmp)
-        head_floor = floor_tuple(head_cmp)
+        base_floor = lower_bound_key(base_cmp)
+        head_floor = lower_bound_key(head_cmp)
         if head_floor < base_floor:
+            if base_kind == GT:
+                return (
+                    f'strict requirement lowered its effective floor ("{base_req}" -> '
+                    f'"{head_req}") -- Cargo reads ">1.2" as ">=1.3.0", so the new requirement '
+                    "admits versions the old one excluded; a widened range is never a safe "
+                    "auto-approvable bump"
+                )
             return (
                 f'requirement decreased its version ("{base_req}" -> "{head_req}") -- a '
                 "downgrade is never a safe auto-approvable bump"
@@ -373,8 +428,10 @@ def requirement_is_satisfied_by(req, version_str):
     check_manifest_lockfile_consistency into one correctly-designed predicate, built entirely
     from primitives already tested across rounds 3-9 (floor_tuple, caret_ceiling_component,
     version_sort_key -- the SAME bucket logic check_lockfile_diff's own major/0.x-boundary check
-    already relies on): round 8's first cut checked only the FLOOR (missing that a strict `>`
-    excludes its own floor value -- fixed in round 9), and neither ever handled a dependency with
+    already relies on; since MAN-220, Finding V, the caret ceiling is caret_upper_bound, a range
+    bound that also covers `^0`/`^0.0`, rather than caret_ceiling_component): round 8's first
+    cut checked only the FLOOR (missing that a strict `>` excludes its own floor value -- fixed
+    in round 9), and neither ever handled a dependency with
     MULTIPLE simultaneous lockfile candidates (a real diamond dependency, e.g. manta's own
     rand_core 0.9.5 AND 0.10.1 coexisting today) -- those names were skipped wholesale as
     "ambiguous," so raising a requirement while the wrong stale candidate remained locked passed
@@ -455,8 +512,9 @@ def requirement_is_satisfied_by(req, version_str):
         elif kind == CARET:
             if v_key < floor_tuple(comparator):
                 return False
-            v_as_caret = (CARET, v_major, v_minor, v_patch, v_pre)
-            if caret_ceiling_component(v_as_caret) != caret_ceiling_component(comparator):
+            # Numeric only: a prerelease of the bound itself (2.0.0-alpha for ^1.2.3) is still
+            # outside the range, exactly as the real semver crate's matches_caret rejects it.
+            if (v_major, v_minor, v_patch) >= caret_upper_bound(comparator):
                 return False
         elif kind == TILDE:
             if v_key < floor_tuple(comparator):
@@ -716,7 +774,7 @@ def _resolve_dependency_ref(ref, candidates):
     return matches[0] if len(matches) == 1 else None
 
 
-def _resolved_dependency_identities(deps, own_by_name, other_by_name):
+def _resolved_dependency_identities(deps, own_by_name, other_by_name, replaced=None):
     """Resolve a `dependencies` list to the set of identities it references, for comparison
     against the SAME package's dependency list on the other side of the diff.
 
@@ -737,6 +795,10 @@ def _resolved_dependency_identities(deps, own_by_name, other_by_name):
     naming a crate with no matching [[package]] entry at all) falls back to a sentinel keyed on
     its own raw text -- two unresolvable refs only compare equal if their raw text is identical,
     so this never silently treats a real change as unchanged, it only ever fails toward "flag it."
+
+    `replaced` (head side only) maps each matched replacement pair's added key to the removed
+    key it replaced: a head-side edge to a matched pair's added entry compares as the base entry
+    it replaced, since it followed that entry's own validated bump (MAN-220).
     """
     resolved = set()
     for ref in deps:
@@ -747,11 +809,13 @@ def _resolved_dependency_identities(deps, own_by_name, other_by_name):
             resolved.add(name)
             continue
         key = _resolve_dependency_ref(ref, own_candidates)
+        if key is not None and replaced:
+            key = replaced.get(key, key)
         resolved.add(key if key is not None else ("__unresolved__", ref))
     return resolved
 
 
-def _resolved_dependency_source_identities(deps, own_by_name, other_by_name):
+def _resolved_dependency_source_identities(deps, own_by_name, other_by_name, replaced=None):
     """Like _resolved_dependency_identities, but resolves each edge to (name, kind,
     source_identity) rather than the full (name, kind, version, source) key -- used for a
     MATCHED REPLACEMENT entry's own dependencies field (round 12/13), where the full-identity
@@ -768,6 +832,10 @@ def _resolved_dependency_source_identities(deps, own_by_name, other_by_name):
     kind/source can't meaningfully "swap" without either an old entry disappearing -- caught by
     the kind/source-identity checks on that name's own matched pair -- or a genuine diamond
     appearing, which is exactly the >1-candidate case this falls through to below).
+
+    `replaced` (head side only) maps each matched replacement pair's added key to the removed
+    key it replaced, so an edge that followed its target's own validated bump compares equal to
+    the base edge it came from (MAN-220, Finding AM).
     """
     resolved = set()
     for ref in deps:
@@ -778,6 +846,8 @@ def _resolved_dependency_source_identities(deps, own_by_name, other_by_name):
             resolved.add(name)
             continue
         key = _resolve_dependency_ref(ref, own_candidates)
+        if key is not None and replaced:
+            key = replaced.get(key, key)
         if key is None:
             resolved.add(("__unresolved__", ref))
         else:
@@ -795,6 +865,9 @@ def _resolved_dependency_source_identities(deps, own_by_name, other_by_name):
             # newly added foo@bbbb, while another consumer keeps foo@aaaa retained, so the
             # top-level same-version-git-swap guard never runs on foo at all) was invisible.
             # Registry sources are unaffected: `_source_identity` is already a no-op for them.
+            # The raw source compared is the one after `replaced` mapped a head-side pair entry
+            # back to the entry it replaced, so an edge that follows its target's own bump
+            # (foo@aaaa -> foo@bbbb as one matched pair) compares equal (MAN-220, Finding AM).
             resolved.add((name, rkind, rsource))
     return resolved
 
@@ -880,6 +953,23 @@ def check_lockfile_diff(base_lock, head_lock):
 
     removed_grouped = by_name(removed)
     added_grouped = by_name(added)
+
+    # MAN-220, Finding AM (Codex, manta#195): a name with exactly one removed and one added
+    # entry is a matched replacement pair, which the loop below validates (kind, source
+    # identity, same-version Git commit swap, downgrade, major boundary, checksum, its own
+    # edges) and reports if any check fails. An edge that pointed at the pair's removed entry
+    # and now points at its added entry has followed that validated bump, not been retargeted,
+    # so the edge comparisons map a head-side pair entry back to the base entry it replaced.
+    # Every other edge change keeps its full comparison, round 27's raw Git source (Finding AL)
+    # included -- stripping the SHA instead would let an edge move from a retained foo@aaaa to a
+    # foo@bbbb laundered as the "replacement" of some third foo@cccc.
+    removed_by_name = _index_pkgs_by_name(removed)
+    added_by_name = _index_pkgs_by_name(added)
+    replaced = {
+        added_by_name[name][0]: keys[0]
+        for name, keys in removed_by_name.items()
+        if len(keys) == 1 and len(added_by_name.get(name, [])) == 1
+    }
 
     for name, removed_entries in removed_grouped.items():
         added_entries = added_grouped.pop(name, [])
@@ -1027,7 +1117,7 @@ def check_lockfile_diff(base_lock, head_lock):
             old_entry.get("dependencies", []), base_by_name, head_by_name
         )
         new_dep_ids = _resolved_dependency_source_identities(
-            new_entry.get("dependencies", []), head_by_name, base_by_name
+            new_entry.get("dependencies", []), head_by_name, base_by_name, replaced
         )
         if old_dep_ids != new_dep_ids:
             reasons.append(
@@ -1139,13 +1229,21 @@ def check_lockfile_diff(base_lock, head_lock):
         # and "syn 2.0.118" still resolve to the SAME single syn entry when only one exists (the
         # benign case above), but "foo 1.0.0" and "foo 2.0.0" resolve to two DIFFERENT entries
         # when both exist, so the edge change is correctly visible.
+        #
+        # A retained entry's edge that follows its target's own matched replacement is unchanged
+        # (MAN-220, same cause as Finding AM): with syn 2.x and 3.x coexisting, Cargo writes the
+        # edge as "syn 3.0.4", so a plain syn 3.0.4 -> 3.0.5 bump rewrote every such edge and
+        # full-identity comparison flagged each retained consumer. The head side maps a matched
+        # pair's added entry back to the removed entry it replaced, which the replacement loop
+        # above validates on its own. Finding I's retarget to a target added with no matching
+        # removal (or to a retained coexisting instance) is not a pair, so it is still visible.
         base_fields = dict(base_entry)
         head_fields = dict(head_entry)
         base_dep_ids = _resolved_dependency_identities(
             base_fields.pop("dependencies", []), base_by_name, head_by_name
         )
         head_dep_ids = _resolved_dependency_identities(
-            head_fields.pop("dependencies", []), head_by_name, base_by_name
+            head_fields.pop("dependencies", []), head_by_name, base_by_name, replaced
         )
         changed_fields = sorted(
             f

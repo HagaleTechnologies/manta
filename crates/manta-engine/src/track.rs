@@ -63,6 +63,9 @@ pub struct DetectorConfig {
     /// that stops keying closes `Unkeyed`. `false` restores the pre-MAN-313
     /// behaviour exactly.
     pub non_cw_filter: bool,
+    /// Skip common HF FT8, FT4, WSPR and JS8 dial-to-dial+3000 Hz windows
+    /// when starting tracks. Uses raw channel RF centers; restart required.
+    pub digital_window_filter: bool,
     /// MAN-313: with `non_cw_filter` on, both how long a promoted track may
     /// take to qualify as keyed CW (else it closes `NotCw`) and how long a
     /// qualified track may stay key-down with no keying, no decoded
@@ -258,6 +261,7 @@ impl Default for DetectorConfig {
             rtty_dwell_hops: 7500,
             // MAN-313: on; 3750 hops = 10 s.
             non_cw_filter: true,
+            digital_window_filter: true,
             unkeyed_close_hops: 3750,
             // MAN-108: 3750 hops = 10 s of DORMANT after the hang.
             reacquire_hops: 3750,
@@ -1812,6 +1816,9 @@ pub struct TrackManager {
     /// the default) vetoes nothing. Spawn scan only, like
     /// `trusted_channels`.
     guard_channels: Option<Vec<bool>>,
+    /// MAN-311: raw RF channel centers inside digital windows, spawn-only.
+    /// Built once per receiver; disabled filtering allocates no mask.
+    digital_channels: Option<Vec<bool>>,
     /// MAN-273 D3: whether the source is analytic (built from real input,
     /// `IqSource::analytic_guard_hz() > 0.0`), so channel `k`'s mirror
     /// `(n - k) % n` carries only the image of whatever sits on `k`.
@@ -1967,6 +1974,16 @@ impl TrackManager {
             rf_channels: None,
             trusted_channels: None,
             guard_channels: None,
+            digital_channels: detector_cfg.digital_window_filter.then(|| {
+                (0..n_channels)
+                    .map(|k| {
+                        crate::digital_windows::contains(
+                            center_freq_hz
+                                + wrapped_channel_offset(k, n_channels) * fs / n_channels as f64,
+                        )
+                    })
+                    .collect()
+            }),
             mirror_image_guard: false,
             #[cfg(test)]
             spawns_by_channel: vec![0; n_channels],
@@ -2127,6 +2144,11 @@ impl TrackManager {
     /// scan only.
     fn guard_vetoes_spawn(&self, k: usize) -> bool {
         self.guard_channels.as_ref().is_some_and(|g| g[k])
+    }
+
+    /// MAN-311: only the birth channel is masked; existing tracks may drift.
+    fn digital_vetoes_spawn(&self, k: usize) -> bool {
+        self.digital_channels.as_ref().is_some_and(|mask| mask[k])
     }
 
     /// MAN-273 D3: veto spawns on the mirror image of a stronger or owned
@@ -2555,7 +2577,10 @@ impl TrackManager {
         // evaluations/sec at 300-1200 tracks for callers that can never
         // consume the result. Gated at each push site below (Promoted /
         // decoder-present) instead of computed here for every track.
-        let compute_spectral_ref_power = !matches!(self.decode_cfg.engine, Engine::Legacy);
+        // MAN-195: spectral_beta = 0.0 (the documented "no spectral discount"
+        // setting) makes NoiseTracker::push discard the term, so skip the scan.
+        let compute_spectral_ref_power = !matches!(self.decode_cfg.engine, Engine::Legacy)
+            && self.decode_cfg.noise.spectral_beta > 0.0;
 
         // Drive existing tracks; collect closures to apply after the loop
         // (avoids mutating `self.tracks` while iterating it).
@@ -3056,6 +3081,7 @@ impl TrackManager {
                     && !self.comod_vetoes_spawn(k)
                     && !self.trusted_vetoes_spawn(k)
                     && !self.guard_vetoes_spawn(k)
+                    && !self.digital_vetoes_spawn(k)
                     && !self.mirror_vetoes_spawn(k, &hop.power)
                 {
                     let mut winner = k;
@@ -3067,6 +3093,7 @@ impl TrackManager {
                         && !self.comod_vetoes_spawn(k + 1)
                         && !self.trusted_vetoes_spawn(k + 1)
                         && !self.guard_vetoes_spawn(k + 1)
+                        && !self.digital_vetoes_spawn(k + 1)
                         && !self.mirror_vetoes_spawn(k + 1, &hop.power)
                     {
                         if hop.power[k + 1] > hop.power[winner] {
@@ -4780,6 +4807,138 @@ mod tests {
         }
     }
 
+    fn digital_window_manager(center: f64, cfg: DetectorConfig) -> TrackManager {
+        TrackManager::new(512, 48_000.0, center, cfg, DecodeConfig::default())
+    }
+
+    #[test]
+    fn digital_window_opt_out_and_other_filters_are_independent() {
+        for digital in [true, false] {
+            for classifiers in [true, false] {
+                let mut tm = digital_window_manager(
+                    14_070_000.0,
+                    DetectorConfig {
+                        digital_window_filter: digital,
+                        non_cw_filter: classifiers,
+                        rtty_filter: classifiers,
+                        ..DetectorConfig::default()
+                    },
+                );
+                assert_eq!(tm.digital_channels.is_some(), digital);
+                feed_warmup(&mut tm, 512);
+                for m in 3750..3810 {
+                    tm.step_hop(&hop(m, strong_on(512, 48)), m);
+                    if digital {
+                        assert_eq!(tm.total_spawns(), 0);
+                    }
+                }
+                assert_eq!(tm.spawns_by_channel()[48], u64::from(!digital));
+                assert_eq!(tm.total_spawns(), u64::from(!digital));
+            }
+        }
+    }
+
+    #[test]
+    fn digital_window_receiver_centers_and_wrapped_offsets() {
+        // The same RF signal falls in the positive and negative channel halves.
+        for (center, excluded, allowed) in [(14_070_000.0, 48, 32), (14_080_500.0, 448, 432)] {
+            let mut tm = digital_window_manager(center, DetectorConfig::default());
+            assert!(tm.digital_vetoes_spawn(excluded));
+            assert!(!tm.digital_vetoes_spawn(allowed));
+            feed_warmup(&mut tm, 512);
+            for m in 3750..3810 {
+                tm.step_hop(
+                    &hop(m, strong_on_all(512, &[(excluded, 20.0), (allowed, 20.0)])),
+                    m,
+                );
+                assert_eq!(tm.spawns_by_channel()[excluded], 0);
+            }
+            assert_eq!(tm.total_spawns(), 1);
+            assert_eq!(tm.spawns_by_channel()[allowed], 1);
+        }
+        let a = digital_window_manager(14_070_000.0, DetectorConfig::default());
+        let b = digital_window_manager(14_050_000.0, DetectorConfig::default());
+        assert!(a.digital_vetoes_spawn(48));
+        assert!(!b.digital_vetoes_spawn(48));
+    }
+
+    #[test]
+    fn digital_window_vetoes_both_spawn_arbitration_slots() {
+        // Both positive and wrapped-negative boundaries. k is allowed and
+        // k+1 excluded. Seed the gate before spawning so k remains the local
+        // smoothed peak while k+1 has the greater instantaneous power.
+        for (center, k) in [(14_070_000.0, 42), (14_080_000.0, 447)] {
+            for enabled in [true, false] {
+                let mut tm = digital_window_manager(
+                    center,
+                    DetectorConfig {
+                        digital_window_filter: enabled,
+                        warmup_hops: 3810,
+                        ..DetectorConfig::default()
+                    },
+                );
+                feed_warmup(&mut tm, 512);
+                for m in 3750..3810 {
+                    tm.step_hop(&hop(m, strong_on_all(512, &[(k, 22.0), (k + 1, 20.0)])), m);
+                }
+                assert_eq!(tm.total_spawns(), 0);
+                tm.step_hop(
+                    &hop(3810, strong_on_all(512, &[(k, 22.0), (k + 1, 23.0)])),
+                    3810,
+                );
+                assert!(tm.is_local_peak(k), "test must exercise k+1 arbitration");
+                assert_eq!(tm.total_spawns(), 1);
+                assert_eq!(tm.spawns_by_channel()[k], u64::from(enabled));
+                assert_eq!(tm.spawns_by_channel()[k + 1], u64::from(!enabled));
+            }
+            // Both candidates excluded: neither scan leg may create a track.
+            let mut tm = digital_window_manager(center, DetectorConfig::default());
+            feed_warmup(&mut tm, 512);
+            for m in 3750..3810 {
+                tm.step_hop(
+                    &hop(m, strong_on_all(512, &[(k + 1, 20.0), (k + 2, 23.0)])),
+                    m,
+                );
+                assert_eq!(tm.total_spawns(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn digital_window_allowed_spawning_matches_opt_out() {
+        let run = |enabled| {
+            let mut tm = digital_window_manager(
+                14_070_000.0,
+                DetectorConfig {
+                    digital_window_filter: enabled,
+                    ..DetectorConfig::default()
+                },
+            );
+            feed_warmup(&mut tm, 512);
+            let hops: Vec<_> = (3750..3950).map(|m| hop(m, strong_on(512, 32))).collect();
+            let events = tm.process_hops(&hops, |m| m);
+            assert_eq!(tm.total_spawns(), 1);
+            (events, tm.spawns_by_channel().to_vec())
+        };
+        assert_eq!(run(true), run(false));
+    }
+
+    #[test]
+    fn digital_window_continuous_14074500_starts_no_candidate() {
+        let mut tm = TrackManager::new(
+            512,
+            48_000.0,
+            14_070_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, 512);
+        for m in 3750..3810 {
+            tm.step_hop(&hop(m, strong_on(512, 48)), m);
+            assert_eq!(tm.total_spawns(), 0, "14074.5 kHz spawned at hop {m}");
+        }
+    }
+
     #[test]
     fn spawns_and_promotes_a_track_on_a_strong_channel() {
         let mut tm = TrackManager::new(
@@ -6415,6 +6574,53 @@ mod tests {
         assert!(
             spectral_ref_power.is_none(),
             "the Legacy engine must never pay for computing spectral_ref_power"
+        );
+    }
+
+    #[test]
+    fn step_hop_skips_spectral_ref_power_when_spectral_beta_is_zero() {
+        // MAN-195: `spectral_beta = 0.0` is the documented way to disable the
+        // spectral discount, and `NoiseTracker::push` reduces to the `None`
+        // branch when it is 0 (`max(n_temp, 0.0 * b_spec * r) == n_temp`), so
+        // computing `FloorBank::spectral_reference_db` anyway is the same waste
+        // class the Legacy gate above closed (PR #178 round 4).
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            default_filter_off(),
+            DecodeConfig {
+                engine: Engine::Hsmm,
+                noise: manta_decode::noise::NoiseConfig {
+                    spectral_beta: 0.0,
+                    ..manta_decode::noise::NoiseConfig::default()
+                },
+                ..DecodeConfig::default()
+            },
+        );
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        let mut promoted_id = None;
+        for m in (250 * 15)..(250 * 15 + 60) {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            if let Some(id) = promoted.iter().find_map(|e| match e {
+                DecoderEvent::TrackPromoted { track_id, .. } => Some(*track_id),
+                _ => None,
+            }) {
+                promoted_id = Some(id);
+                break;
+            }
+        }
+        let id = promoted_id.expect("must promote a track within the loop");
+        let track = tm.tracks.get(&id).unwrap();
+        let (_, _, spectral_ref_power, _, _, _) = *track
+            .pending
+            .last()
+            .expect("the promotion hop itself must have queued a pending entry");
+        assert!(
+            spectral_ref_power.is_none(),
+            "spectral_beta = 0.0 must skip computing spectral_ref_power (MAN-195)"
         );
     }
 

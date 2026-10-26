@@ -129,6 +129,8 @@ fn readme_inputs_table_covers_every_shipped_input() {
         "--kiwi-host",
         "--soapy-driver",
         "--hpsdr-host",
+        "--hpsdr-mac",
+        "found automatically when no host is set",
         "--ka9q-group",
     ] {
         assert!(
@@ -1204,6 +1206,7 @@ fn spec_detector_values_equal_the_code_defaults() {
         "rtty_filter",
         "rtty_dwell_ms",
         "non_cw_filter",
+        "digital_window_filter",
         "unkeyed_close_ms",
         "reacquire_ms",
     ] {
@@ -1275,6 +1278,7 @@ fn spec_documents_every_input_and_spot_key() {
                 "realtime",
                 "loop",
                 "host",
+                "mac",
                 "port",
                 "protocol",
                 "freq_hz",
@@ -2627,6 +2631,21 @@ fn spot_schema_documents_uppercased_station_identity() {
     }
 }
 
+#[test]
+fn digital_window_scaffold_states_the_default_and_restart_opt_out() {
+    let scaffold = doc("crates/manta-cli/src/config_init.toml");
+    assert!(scaffold.contains(
+        "# Skip the common HF FT8, FT4, WSPR and JS8 windows when starting CW tracks.\n\
+         # Set false to include these windows. Restart required.\n\
+         #digital_window_filter = true"
+    ));
+    assert!(scaffold_settings()
+        .iter()
+        .any(|(table, key, value)| table == "detector"
+            && key == "digital_window_filter"
+            && value == "true"));
+}
+
 /// Every `#key = value` line of the `manta config init` scaffold, as
 /// `(table, key, value_src)` -- the same two patterns `config_cmd.rs`'s
 /// scaffold drift tests parse it with. `value_src` keeps any trailing
@@ -3292,4 +3311,47 @@ fn corpus_runbook_passes_an_absolute_corpus_dir() {
         seen > 0,
         "{rel} no longer sets MANTA_CORPUS_DIR in a command; this test needs updating"
     );
+}
+
+#[test]
+fn shared_hpsdr_docs_describe_capacity_and_queue_loss_and_example_checks_offline() {
+    let guide = doc("docs/GUIDES/multiple-receivers.md");
+    assert!(!guide.contains("The config loader refuses\n  two entries on one radio"));
+    let example = guide
+        .split_once("<!-- MAN-307 four-band example -->")
+        .expect("four-band example")
+        .1
+        .split_once("```toml\n")
+        .unwrap()
+        .1
+        .split_once("```")
+        .unwrap()
+        .0;
+    let parsed: toml::Value = toml::from_str(example).unwrap();
+    assert_eq!(parsed["input"].as_array().unwrap().len(), 4);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("four-bands.toml");
+    std::fs::write(&path, example).unwrap();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_manta"));
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().starts_with(b"MANTA_") {
+            cmd.env_remove(key);
+        }
+    }
+    let output = cmd
+        .args(["config", "check", "--config"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("receiver capacity at 192.168.1.40:1024 is checked when manta run starts"));
+    assert!(doc("docs/CONFIG.md").contains("| `receivers` |"));
+    assert!(doc("docs/METRICS.md").contains("| `manta_input_queue_dropped_samples_total` |"));
+    assert!(guide.contains("has 4 receivers; 6 bands are configured"));
+    assert!(guide.contains("not a measured"));
 }

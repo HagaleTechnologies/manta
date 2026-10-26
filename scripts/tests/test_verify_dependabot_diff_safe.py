@@ -16,6 +16,24 @@ spec = importlib.util.spec_from_file_location(
 v = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(v)
 
+REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
+FOO_GIT = "git+https://good.example/foo.git?branch=main"
+FOO_AAAA = FOO_GIT + "#" + "a" * 40
+FOO_BBBB = FOO_GIT + "#" + "b" * 40
+FOO_CCCC = FOO_GIT + "#" + "c" * 40
+
+
+def _pkg(name, version, source=None, dependencies=None):
+    """One Cargo.lock [[package]] entry; a registry entry gets the checksum Cargo always writes."""
+    entry = {"name": name, "version": version}
+    if source is not None:
+        entry["source"] = source
+    if source is not None and source.startswith("registry+"):
+        entry["checksum"] = f"{name}-{version}"
+    if dependencies:
+        entry["dependencies"] = dependencies
+    return entry
+
 
 class CompareRequirementsTests(unittest.TestCase):
     def assert_safe(self, base, head):
@@ -424,6 +442,49 @@ class ExactAndLowerBoundMajorBoundaryTests(unittest.TestCase):
     def test_ge_patch_bump_within_major_is_safe(self):
         reason = v.compare_requirements(">=1.2.3", ">=1.9.0")
         self.assertIsNone(reason)
+
+
+class StrictLowerBoundEditTests(unittest.TestCase):
+    """MAN-220, Finding AK (Codex, manta#194 round 26): Cargo reads an omitted component in `>`
+    as excluding that whole release line (cargo 1.98.0: `>1.2` rejects 1.2.2 and accepts 1.3.0;
+    `>1` rejects 1.5.0), so `>1.2` -> `>1.2.1` WIDENS the range. Zero-filled floors read it as a
+    raise, and with an unchanged lock entry the consistency check cannot see it either.
+    """
+
+    def test_strict_bound_gaining_a_component_is_unsafe(self):
+        for base, head in ((">1.2", ">1.2.1"), (">1.2", ">1.2.0"), (">1.2", ">1.2.9"),
+                           (">1", ">1.5"), (">1", ">1.5.0"), (">0.2", ">0.2.5")):
+            reason = v.compare_requirements(base, head)
+            self.assertIsNotNone(reason, (base, head))
+            self.assertIn("effective floor", reason)
+
+    def test_strict_bound_in_a_compound_requirement_is_unsafe(self):
+        self.assertIsNotNone(v.compare_requirements(">1.2, <2.0.0", ">1.2.1, <2.0.0"))
+
+    def test_strict_bound_raises_are_safe(self):
+        # `>1.2.1` -> `>1.2` NARROWS (`>1.2` is `>=1.3.0`); main rejected it as a downgrade.
+        for base, head in ((">1.2", ">1.3"), (">1.2.1", ">1.2.2"), (">1.2.1", ">1.2")):
+            self.assertIsNone(v.compare_requirements(base, head), (base, head))
+
+    def test_widened_strict_bound_fails_end_to_end(self):
+        lock = ('[[package]]\nname = "demo"\nversion = "1.3.0"\n'
+                f'source = "{REGISTRY}"\nchecksum = "aaa"\n')
+        base_files = {
+            "Cargo.toml": '[workspace]\nmembers = []\n\n[workspace.dependencies]\ndemo = ">1.2"\n',
+            "Cargo.lock": lock,
+        }
+        head_files = {
+            "Cargo.toml": '[workspace]\nmembers = []\n\n[workspace.dependencies]\ndemo = ">1.2.1"\n',
+            "Cargo.lock": lock,
+        }
+
+        def fake_git_show(ref, path):
+            return (base_files if ref == "base" else head_files).get(path)
+
+        with mock.patch.object(v, "git_show", side_effect=fake_git_show), \
+             mock.patch.object(v, "check_diff_scope", return_value=[]), \
+             mock.patch.object(v, "WORKSPACE_MEMBERS", []):
+            self.assertEqual(v.main("base", "head"), 1)
 
 
 class WildcardPrefixPreservedTests(unittest.TestCase):
@@ -1096,6 +1157,39 @@ class LockfileDependencyDisambiguationSuffixTests(unittest.TestCase):
         self.assertEqual(len(reasons), 1)
         self.assertIn("consumer_b", reasons[0])
         self.assertIn("dependencies", reasons[0])
+
+
+class LockfileRetainedEdgeFollowsReplacementTests(unittest.TestCase):
+    """MAN-220 (found while planning, same cause as Finding AM): when a crate exists at two
+    versions (manta's real lock holds syn 2.x and 3.x, rand_core 0.9 and 0.10), Cargo writes
+    each edge as "name version", so a retained consumer's edge follows a patch bump of its
+    target ("syn 3.0.4" -> "syn 3.0.5"). Full-identity comparison read that as a changed edge,
+    so a plain syn 3.0.4 -> 3.0.5 bump was NOT SAFE on six retained entries. Finding I's
+    retarget to a coexisting instance must still be caught.
+    """
+
+    def _lock(self, root_edge, foo_one):
+        return {"package": [
+            _pkg("root", "0.1.0", dependencies=[root_edge, "qux"]),
+            _pkg("foo", foo_one, REGISTRY),
+            _pkg("qux", "1.0.0", REGISTRY, ["foo 2.0.0"]),
+            _pkg("foo", "2.0.0", REGISTRY)]}
+
+    def test_retained_edge_following_its_targets_own_bump_is_safe(self):
+        self.assertEqual(
+            v.check_lockfile_diff(self._lock("foo 1.0.0", "1.0.0"), self._lock("foo 1.0.1", "1.0.1")),
+            [],
+        )
+
+    def test_retained_edge_moving_to_a_different_instance_is_still_flagged(self):
+        base = self._lock("foo 1.0.0", "1.0.0")
+        head = {"package": [
+            _pkg("root", "0.1.0", dependencies=["foo 2.0.1", "qux"]),
+            _pkg("foo", "1.0.0", REGISTRY),
+            _pkg("qux", "1.0.0", REGISTRY, ["foo 2.0.1"]),
+            _pkg("foo", "2.0.1", REGISTRY)]}
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertTrue(any('"root"' in r and "dependencies" in r for r in reasons), reasons)
 
 
 class RequirementIsSatisfiedByTests(unittest.TestCase):
@@ -1978,6 +2072,49 @@ class RequirementOmittedComponentBoundaryTests(unittest.TestCase):
         self.assertFalse(v.requirement_is_satisfied_by(">1.2", "1.2.9"))
 
 
+class CaretOmittedZeroComponentTests(unittest.TestCase):
+    """MAN-220, Finding V (Codex, manta#194 round 15): `^0` and `^0.0` are valid requirements
+    whose ceiling an omitted component sets. Checked against cargo 1.98.0 (a path dependency's
+    `version` requirement against the path crate's own version): `^0` accepts 0.5.0 and 0.0.5
+    and rejects 1.0.0; `^0.0` accepts 0.0.5 and rejects 0.1.0; `^0.0.0` accepts only 0.0.0.
+    """
+
+    def test_caret_zero_admits_every_zero_major_release(self):
+        for version in ("0.0.0", "0.0.5", "0.5.0", "0.99.99"):
+            self.assertTrue(v.requirement_is_satisfied_by("^0", version), version)
+            self.assertTrue(v.requirement_is_satisfied_by("0", version), version)
+        self.assertFalse(v.requirement_is_satisfied_by("^0", "1.0.0"))
+
+    def test_caret_zero_zero_admits_only_the_zero_zero_line(self):
+        for version in ("0.0.0", "0.0.5"):
+            self.assertTrue(v.requirement_is_satisfied_by("^0.0", version), version)
+            self.assertTrue(v.requirement_is_satisfied_by("0.0", version), version)
+        self.assertFalse(v.requirement_is_satisfied_by("^0.0", "0.1.0"))
+
+    def test_caret_zero_zero_zero_admits_only_itself(self):
+        self.assertTrue(v.requirement_is_satisfied_by("^0.0.0", "0.0.0"))
+        self.assertFalse(v.requirement_is_satisfied_by("^0.0.0", "0.0.1"))
+
+    def test_caret_ceilings_with_a_nonzero_component_are_unchanged(self):
+        cases = [("^1", "1.9.9", True), ("^1", "2.0.0", False), ("^1.2", "1.9.0", True),
+                 ("^1.2", "2.0.0", False), ("^0.2", "0.2.9", True), ("^0.2", "0.3.0", False),
+                 ("^0.0.3", "0.0.3", True), ("^0.0.3", "0.0.4", False)]
+        for req, version, expected in cases:
+            self.assertEqual(v.requirement_is_satisfied_by(req, version), expected, (req, version))
+
+    def test_caret_ceiling_excludes_a_prerelease_of_the_ceiling_itself(self):
+        self.assertFalse(v.requirement_is_satisfied_by("^1.2.3-alpha", "2.0.0-alpha"))
+        self.assertTrue(v.requirement_is_satisfied_by("^1.2.3-alpha", "1.2.3-beta"))
+
+    def test_consistency_accepts_a_lock_that_satisfies_caret_zero(self):
+        # The ticket's symptom: the consistency pass checks every declaration, so one unrelated
+        # `^0` declaration made every Dependabot PR NOT SAFE.
+        for req, version in (("^0", "0.5.0"), ("^0.0", "0.0.5")):
+            head_tomls = {"Cargo.toml": {"dependencies": {"demo": req}}}
+            lock = {"package": [_pkg("demo", version, REGISTRY)]}
+            self.assertEqual(v.check_manifest_lockfile_consistency(head_tomls, lock), [], req)
+
+
 class LockfileWorkspaceReplacementTests(unittest.TestCase):
     """Codex P1, manta#194 round 18, Finding AA: a workspace member's lockfile-recorded version
     comes from that member's own Cargo.toml, never from a registry or git source -- Dependabot
@@ -2646,6 +2783,63 @@ class LockfileReplacementGitCommitSwapTests(unittest.TestCase):
             ]
         }
         self.assertEqual(v.check_lockfile_diff(base, head), [])
+
+
+class LockfileReplacementGitTargetBumpTests(unittest.TestCase):
+    """MAN-220, Finding AM (Codex, manta#195): a replacement entry's edge that follows its Git
+    target's OWN validated bump (foo 1.0.0@aaaa -> 1.0.1@bbbb) is not a retarget, even when a
+    second same-name package (here a registry foo 2.0.0) forces full-identity resolution. Round
+    27's raw-SHA comparison (Finding AL) must still catch an edge moved between two coexisting
+    instances, including when the new target is laundered as the "replacement" of a third.
+    """
+
+    def _am(self, head_foo_version, head_foo_source):
+        base = {"package": [
+            _pkg("root", "0.1.0", dependencies=["bar", "qux"]),
+            _pkg("bar", "1.0.0", REGISTRY, [f"foo 1.0.0 ({FOO_AAAA})"]),
+            _pkg("foo", "1.0.0", FOO_AAAA),
+            _pkg("qux", "1.0.0", REGISTRY, ["foo 2.0.0"]),
+            _pkg("foo", "2.0.0", REGISTRY)]}
+        head = {"package": [
+            _pkg("root", "0.1.0", dependencies=["bar", "qux"]),
+            _pkg("bar", "1.0.1", REGISTRY, [f"foo {head_foo_version} ({head_foo_source})"]),
+            _pkg("foo", head_foo_version, head_foo_source),
+            _pkg("qux", "1.0.0", REGISTRY, ["foo 2.0.0"]),
+            _pkg("foo", "2.0.0", REGISTRY)]}
+        return base, head
+
+    def test_edge_following_its_git_targets_own_bump_is_safe(self):
+        self.assertEqual(v.check_lockfile_diff(*self._am("1.0.1", FOO_BBBB)), [])
+
+    def test_target_pair_failing_its_own_checks_is_still_reported(self):
+        # The edge tolerance relies on the pair's own checks: a major jump on foo is reported
+        # once, on foo, and bar's edge following it adds nothing.
+        reasons = v.check_lockfile_diff(*self._am("3.0.0", FOO_BBBB))
+        self.assertEqual(len(reasons), 1, reasons)
+        self.assertIn('"foo" (git) crossed a major/0.x boundary', reasons[0])
+
+    def test_retarget_laundered_through_another_instances_replacement_is_flagged(self):
+        # AL': x keeps foo 1.5.0@aaaa; foo 1.4.0@cccc is "replaced" by foo 1.5.0@bbbb (a pair
+        # that passes its own checks); bar moves from aaaa to bbbb -- round 27's same-version
+        # commit swap. y followed cccc's own replacement and is not flagged.
+        base = {"package": [
+            _pkg("root", "0.1.0", dependencies=["bar", "x", "y"]),
+            _pkg("bar", "1.0.0", REGISTRY, [f"foo 1.5.0 ({FOO_AAAA})"]),
+            _pkg("x", "1.0.0", REGISTRY, [f"foo 1.5.0 ({FOO_AAAA})"]),
+            _pkg("y", "1.0.0", REGISTRY, [f"foo 1.4.0 ({FOO_CCCC})"]),
+            _pkg("foo", "1.5.0", FOO_AAAA),
+            _pkg("foo", "1.4.0", FOO_CCCC)]}
+        head = {"package": [
+            _pkg("root", "0.1.0", dependencies=["bar", "x", "y"]),
+            _pkg("bar", "1.0.1", REGISTRY, [f"foo 1.5.0 ({FOO_BBBB})"]),
+            _pkg("x", "1.0.0", REGISTRY, [f"foo 1.5.0 ({FOO_AAAA})"]),
+            _pkg("y", "1.0.1", REGISTRY, [f"foo 1.5.0 ({FOO_BBBB})"]),
+            _pkg("foo", "1.5.0", FOO_AAAA),
+            _pkg("foo", "1.5.0", FOO_BBBB)]}
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1, reasons)
+        self.assertIn('"bar"', reasons[0])
+        self.assertIn("changed its dependencies", reasons[0])
 
 
 if __name__ == "__main__":

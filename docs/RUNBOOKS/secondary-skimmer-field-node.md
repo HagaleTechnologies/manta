@@ -219,7 +219,8 @@ the Aggregator operator stops all forwarding (Aggregator manual §5.6). So the q
 
 Start the three units, wait for the ledger's first scrape (one sample line in the ledger, about
 60 s), then write the start note. A start note before the first sample leaves the spots emitted
-before it uncounted, and `report` marks the missed-spot count indeterminate (NO-GO):
+before it uncounted, and `report` marks the missed-spot count indeterminate (NO-GO); the time
+between that note and the first sample also counts as unobserved against availability (D-A):
 
 ```sh
 sudo systemctl enable --now manta-field.service manta-field-ledger.service manta-field-spots.service
@@ -369,7 +370,15 @@ ROADMAP M2's 24 h live-SDR soak gate.
 Definitions (D-D, D-E, D-G):
 
 - **Planned restart.** Write the note *before* restarting. Its window runs from the note until
-  the first healthy sample after it, capped at 1800 s, and is excluded from availability.
+  the first healthy sample after it, capped at 1800 s, and is excluded from availability. It is
+  excluded only if the restart happens: a sample in the window, or up to the first healthy
+  sample after the cap, must show a new `manta_start_time_seconds`. A note with no restart
+  after it (a cancelled maintenance) excludes nothing, and any outage after it counts against
+  availability.
+
+  Within each sample interval, the report subtracts its registered planned-window overlap
+  from counter-attributed downtime, floored at zero. The source-outage totals still show
+  the full counter duration; the counters do not record exact outage timestamps.
 
   ```sh
   sudo -u manta python3 /opt/manta/scripts/field-node.py note \
