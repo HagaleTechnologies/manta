@@ -940,9 +940,12 @@ def summarize(records, params=None):
             unobserved_s += length
 
     first, last = samples[0], samples[-1]
+    # No sample at or before the window start: nothing observed the node
+    # before the first one, however soon it came, so that prefix is
+    # unobserved (D-A). D-F's jitter bridge needs a sample at both ends
+    # (PRRT_kwDOTQvU8M6qhuV8, MAN-284).
     if first["ts"] > start:
-        account(start, first["ts"],
-                "unobserved" if first["ts"] - start > gap_limit else ("up" if _is_up(first) else "down"))
+        account(start, first["ts"], "unobserved")
     # Pair intervals as [a.ts, b.ts, state, extra_down, same_process],
     # accounted after the walk so a later pair can move counter-reported
     # down time into an earlier healthy interval.

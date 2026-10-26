@@ -702,6 +702,41 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("FAIL (D-A)", r.stdout)
 
+    def test_unsampled_prefix_counts_as_unobserved(self):
+        # PRRT_kwDOTQvU8M6qhuV8, MAN-284: with the window start (a start
+        # note or --from) before the first sample, nothing observed the
+        # node before that sample, so the prefix is unobserved (D-A),
+        # however soon the sample came and whatever it read. D-F's jitter
+        # bridge needs a sample at both ends.
+        note = {"v": 1, "kind": "note", "ts": T0 - 120.0, "note": "start", "reason": "go"}
+        for name, ov, down in (("healthy first sample", None, 0.0),
+                               ("down first sample", {0: {"healthz": 503}}, 60.0)):
+            with self.subTest(name):
+                recs = make_ledger(days=1, step=60.0, start_note=False,
+                                   overrides=ov, extra=[note])
+                s = summ(recs, interval_s=60.0)
+                self.assertAlmostEqual(s["unobserved_s"], 120.0)
+                self.assertAlmostEqual(s["window"]["span_s"], DAY + 120.0)
+                self.assertAlmostEqual(s["down_s"], down)
+        # --from instead of a start note reaches the same walk.
+        recs = make_ledger(days=1, step=60.0, start_note=False, end_note=False)
+        s = summ(recs, from_ts=T0 - 120.0, to_ts=T0 + DAY, interval_s=60.0)
+        self.assertAlmostEqual(s["unobserved_s"], 120.0)
+        write_ledger(self.ledger, make_ledger(days=1, step=60.0, start_note=False, extra=[note]))
+        r = run_cli("report", "--ledger", self.ledger, "--interval-s", "60", "--min-days", "1")
+        self.assertIn("unobserved 120 s", r.stdout)
+
+    def test_sample_at_or_before_window_start_keeps_the_walk(self):
+        # PRRT_kwDOTQvU8M6qhuV8, MAN-284: a sample at or before the window
+        # start leaves the interval walk unchanged.
+        recs = make_ledger(days=1, step=60.0, start_note=False, end_note=False)
+        for from_ts in (T0, T0 + 30.0):
+            with self.subTest(from_ts=from_ts):
+                s = summ(recs, from_ts=from_ts, to_ts=T0 + DAY, interval_s=60.0)
+                self.assertAlmostEqual(s["unobserved_s"], 0.0)
+                self.assertAlmostEqual(s["up_s"], T0 + DAY - from_ts)
+                self.assertAlmostEqual(s["availability"], 1.0)
+
     def test_planned_restart_window_excluded_and_listed(self):
         unreachable = {"reachable": False}
         ov = {101: unreachable, 102: unreachable}
@@ -1292,6 +1327,7 @@ class ReportTests(unittest.TestCase):
         self.assertTrue(s["spots_missed_indeterminate"])
         self.assertTrue(any("no reachable sample at or before the window start" in w
                             for w in s["warnings"]))
+        self.assertAlmostEqual(s["unobserved_s"], 120.0)
 
     def test_no_restart_keeps_spots_missed_a_count(self):
         ov = {i: {"spots_inc": 1 if 1 <= i <= 20 else 0} for i in range(0, 145)}
