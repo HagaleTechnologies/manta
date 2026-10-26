@@ -1984,7 +1984,10 @@ mod tests {
         let l = load(Some(f.path()), Env::Read(&v)).unwrap();
         assert_eq!(l.inputs.len(), 1);
         assert_eq!(l.inputs[0].input.shared.freq_correction_ppm, Some(1.25));
-        assert_eq!(l.env_vars, vec!["MANTA_INPUT_FREQ_CORRECTION_PPM".to_string()]);
+        assert_eq!(
+            l.env_vars,
+            vec!["MANTA_INPUT_FREQ_CORRECTION_PPM".to_string()]
+        );
     }
 
     #[test]
