@@ -45,7 +45,7 @@ decided; SPEC and docs/ still win on anything not listed here.
 2. **Real device sample rate observed during live testing: ~11998.86–
    11998.96 Hz across 3 different live public receivers** (`MSG
    sample_rate=<float>`, never a round number, never hardcoded). The final
-   live-integration test connects to `kiwisdr.inf.dhbw-ravensburg.de:8073`
+   live-integration test connects to `<public-kiwisdr-host>:8073`
    and asserts the *resampled* output rate is ~96000 Hz — the raw
    ~11998.9 Hz device rate itself is not asserted in the shipped test
    (device-specific and non-deterministic across nodes/time), only that
@@ -96,7 +96,7 @@ decided; SPEC and docs/ still win on anything not listed here.
    hardware — the shipped `#[ignore]`d test
    `connects_to_a_real_public_receiver_and_streams_iq`
    (`crates/manta-input/src/kiwi.rs`) performs a genuine live connection
-   to a real public receiver (`kiwisdr.inf.dhbw-ravensburg.de:8073`),
+   to a real public receiver (`<public-kiwisdr-host>:8073`),
    completes the real handshake, and reads real streamed IQ. Measured
    result from an independently-run fresh pass: `sample_rate=96000`
    (correctly resampled), 153,344 total real samples drained across
