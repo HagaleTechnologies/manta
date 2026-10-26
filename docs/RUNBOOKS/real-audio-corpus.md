@@ -22,6 +22,12 @@ them. B2 is the as-received file, `B2_20251129_000000_7080kHz.source.wav`,
 not the older PCM16 conversion. `crates/manta-testkit/audio-corpus/` itself
 works: `.gitignore` keeps the audio there out of git.
 
+B2's truth, `ground-truth/B2_20251129_000000_7080kHz.rbn.csv`, is RBN's data
+and not in git (MAN-249). Build it first with the recipe in the corpus
+README's
+[*Ground truth*](../../crates/manta-testkit/audio-corpus/README.md#ground-truth)
+section; without it, `score` reports B2 as `cannot score against …`.
+
 Check a pinned file is the one the manifest means:
 
 ```sh
@@ -129,12 +135,16 @@ permission is recorded. Do the steps in order.
    python3 scripts/corpus.py fetch --dest "$(mktemp -d)" \
      --base-url https://github.com/HagaleTechnologies/manta/releases/download/corpus-v1
    ```
-5. Set the repository variable that turns the workflow on:
+5. Add a step to `corpus.yml`, before `score`, that builds B2's truth CSV
+   with the corpus README's *Ground truth* recipe. The CSV is not in git
+   (MAN-249), so without that step every nightly run reports B2 as
+   `cannot score against …`.
+6. Set the repository variable that turns the workflow on:
    ```sh
    gh variable set MANTA_CORPUS_BASE_URL \
      --body https://github.com/HagaleTechnologies/manta/releases/download/corpus-v1
    ```
-6. Run the workflow once instead of waiting for the night:
+7. Run the workflow once instead of waiting for the night:
    ```sh
    gh workflow run corpus.yml
    gh run watch

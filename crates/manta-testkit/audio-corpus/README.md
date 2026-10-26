@@ -11,7 +11,8 @@ wideband noise, real IQ) that a synthetic scene generator doesn't model.
 
 **None of the audio files themselves are committed** — see `.gitignore`.
 Reasons differ per file (below). This directory tracks the documentation,
-`manifest.json` and the ground truth, not the audio.
+`manifest.json` and hand-transcript ground truth, not the audio or RBN's
+spot extract (see *Ground truth*).
 
 ## Using the corpus (MAN-119)
 
@@ -112,12 +113,28 @@ Score a `manta decode --json` report against it with
 `scripts/score-against-rbn.py` (repo root); see that script's docstring
 for usage, including `--spotter`/`--min-spotters` filtering -- spotter
 filtering is useful for co-located reference validation (the co-located
-skimmer's signal path is nearly identical to manta's hardware); consensus filtering
-(multi-spotter agreement) is useful for rejecting receiver artifacts that
-don't appear on multiple independent systems. This is the ARCHITECTURE.md
+skimmer's signal path is nearly identical to manta's hardware); consensus
+filtering (multi-spotter agreement) is useful for rejecting receiver
+artifacts that don't appear on multiple independent systems. This is the ARCHITECTURE.md
 §9 "Golden IQ corpus" benchmark (recorded band segment + RBN's own spots
 as reference labels -> recall/precision) for real M3-grade validation, not
 just synthetic fixtures.
+
+The CSV is RBN's data, not manta's, so it is not in git: `.gitignore`
+ignores `ground-truth/*.rbn.csv` (MAN-249). Build it from RBN's archive
+before scoring B2. The filter keeps the header and every `40m` spot before
+00:15:00 UTC, and the result is byte-identical to the copy this directory
+tracked until MAN-249:
+
+```sh
+mkdir -p crates/manta-testkit/audio-corpus/ground-truth
+curl -fsSLO https://data.reversebeacon.net/rbn_history/20251129.zip
+unzip -p 20251129.zip \
+  | awk -F, 'NR == 1 || ($5 == "40m" && $11 < "2025-11-29 00:15:00")' \
+  > crates/manta-testkit/audio-corpus/ground-truth/B2_20251129_000000_7080kHz.rbn.csv
+sha256sum crates/manta-testkit/audio-corpus/ground-truth/B2_20251129_000000_7080kHz.rbn.csv
+# 6bc6d3d7f7e52fc68b571f43c6ef3ec32436fc849b12f2a04a85b37e40500068  (shasum -a 256 on macOS)
+```
 
 The baselines below were measured on the PCM16 conversion with the legacy
 engine, and decoding has changed since (MAN-172, MAN-115, MAN-213,
@@ -230,8 +247,8 @@ capture against it: spot precision, call recall and word recall, within 10 s
 and 100 Hz by default. Spot precision is a lower bound, because a transcriber
 can miss weak callers that manta copied. Once the manifest entry has
 `"truth": {"kind": "transcript", ...}`, `scripts/corpus.py score` runs it.
-The `ground-truth/` directory is tracked in git, so a new transcript there is
-not ignored. How to transcribe VP8GEO and record its first numbers:
+Transcripts in `ground-truth/` are tracked; the RBN extract there is ignored,
+so a new transcript is committed like any other file. How to transcribe VP8GEO and record its first numbers:
 [docs/RUNBOOKS/real-audio-corpus.md §5](../../../docs/RUNBOOKS/real-audio-corpus.md#5-transcribing-vp8geo).
 No transcript exists yet.
 
