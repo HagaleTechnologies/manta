@@ -542,6 +542,51 @@ class CliTests(unittest.TestCase):
                 self.assertIn("http://", r.stderr)
             self.assertFalse(os.path.exists(ledger))
 
+    def test_non_finite_or_huge_interval_is_usage_error_before_any_sample(self):
+        # PRRT_kwDOTQvU8M6qedLU (MAN-277): nan and inf passed the old `<= 0` check
+        # and crashed sleep() after one sample (nan with --recover-cmd: the watchdog
+        # constructor, before it). Under Restart=always that is a restart loop.
+        url = "http://127.0.0.1:%d" % closed_port()
+        with tempfile.TemporaryDirectory() as d:
+            ledger = os.path.join(d, "l.jsonl")
+            for interval in (["--interval-s", "nan"], ["--interval-s", "inf"], ["--interval-s", "-inf"],
+                             ["--interval-s=-inf"], ["--interval-s", "1e308"]):
+                for extra in ([], ["--recover-cmd", "true"]):
+                    with self.subTest(interval=interval, extra=extra):
+                        r = run_cli("sample", "--loop", *interval, "--metrics-url", url,
+                                    "--ledger", ledger, *extra)
+                        self.assertEqual(r.returncode, 2, r.stderr)
+                        self.assertIn("field-node.py sample: error:", r.stderr)
+                        self.assertIn("--interval-s", r.stderr)
+                        self.assertNotIn("Traceback", r.stderr)
+            self.assertFalse(os.path.exists(ledger))
+
+    def test_interval_over_a_day_is_usage_error(self):
+        # report rejects --interval-s above a day, so sample cannot write a
+        # ledger the report could not read at its own interval.
+        url = "http://127.0.0.1:%d" % closed_port()
+        with tempfile.TemporaryDirectory() as d:
+            ledger = os.path.join(d, "l.jsonl")
+            sleeps = []
+            args = sample_args(url, ledger, loop=True, interval_s=86400.5)
+            with self.assertRaisesRegex(fn.UsageError, r"--interval-s must be > 0 and <= 86400"):
+                fn.cmd_sample(args, sleep=sleeps.append, max_iterations=2)
+            self.assertEqual(sleeps, [])
+            self.assertFalse(os.path.exists(ledger))
+
+    def test_finite_interval_still_samples(self):
+        url = "http://127.0.0.1:%d" % closed_port()
+        with tempfile.TemporaryDirectory() as d:
+            ledger = os.path.join(d, "l.jsonl")
+            for interval in (60.0, 86400.0):
+                with self.subTest(interval=interval):
+                    sleeps = []
+                    args = sample_args(url, ledger, loop=True, interval_s=interval)
+                    self.assertEqual(fn.cmd_sample(args, sleep=sleeps.append, clock=lambda: 1000.0,
+                                                   max_iterations=2), 0)
+                    self.assertEqual(sleeps, [interval - 1000.0 % interval])
+            self.assertEqual([r["kind"] for r in read_ledger(ledger)], ["sample"] * 4)
+
     def test_bad_json_addr_exit_2(self):
         with tempfile.TemporaryDirectory() as d:
             r = run_cli("record-spots", "--json-addr", "localhost", "--out-dir", d)
@@ -686,12 +731,55 @@ class ReportTests(unittest.TestCase):
 
     def test_planned_window_capped_at_1800_s(self):
         ov = {i: {"reachable": False} for i in range(101, 113)}  # 2 h down
+        for i in range(113, 4321):
+            ov[i] = {"start_time": T0 + 112 * IV + 30}
         note = {"v": 1, "kind": "note", "ts": T0 + 101 * IV, "note": "planned", "reason": "x"}
         recs = make_ledger(overrides=ov, extra=[note])
         s = summ(recs)
         self.assertAlmostEqual(s["planned_excluded_s"], 1800.0)
         down = 12 * IV - 1800.0
         self.assertAlmostEqual(s["availability"], 1 - down / (30 * DAY - 1800.0))
+
+    def test_planned_note_without_a_restart_excludes_nothing(self):
+        # cancelled maintenance: a note, then only healthy samples of one process
+        note = {"v": 1, "kind": "note", "ts": T0 + 100 * IV + 60, "note": "planned", "reason": "upgrade"}
+        r = self.report(make_ledger(extra=[note]), "--format", "json")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        s = json.loads(r.stdout)
+        self.assertEqual(s["planned_excluded_s"], 0)
+        self.assertEqual(s["planned_windows"], [])
+        self.assertEqual(s["restarts"], [])
+
+    def test_outage_inside_a_cancelled_planned_window_counts_as_down(self):
+        # 43 intervals down elsewhere put the run just above 99%; a further
+        # 10 min outage after a cancelled note must still fail D-A
+        ov = {i: {"reachable": False} for i in range(2001, 2044)}
+        ov[101] = {"reachable": False}
+        note = {"v": 1, "kind": "note", "ts": T0 + 100 * IV + 60, "note": "planned", "reason": "upgrade"}
+        recs = make_ledger(overrides=ov, extra=[note])
+        s = summ(recs)
+        self.assertAlmostEqual(s["planned_excluded_s"], 0.0)
+        self.assertAlmostEqual(s["down_s"], 44 * IV)
+        self.assertEqual(s["verdict"], "FAIL")
+        r = self.report(recs)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("FAIL (D-A)", r.stdout)
+
+    def test_planned_window_capped_without_a_restart_excludes_nothing(self):
+        # 2 h down, but the same process comes back: an outage, not a restart
+        ov = {i: {"reachable": False} for i in range(101, 113)}
+        note = {"v": 1, "kind": "note", "ts": T0 + 101 * IV, "note": "planned", "reason": "x"}
+        s = summ(make_ledger(overrides=ov, extra=[note]))
+        self.assertAlmostEqual(s["planned_excluded_s"], 0.0)
+        self.assertAlmostEqual(s["down_s"], 12 * IV)
+
+    def test_planned_window_counts_a_reboot_seen_after_the_cap(self):
+        # host reboot: no samples for 60 min, then a new process past the cap
+        ov = {i: {"start_time": T0 + 105 * IV + 30} for i in range(106, 4321)}
+        note = {"v": 1, "kind": "note", "ts": T0 + 100 * IV + 60, "note": "planned", "reason": "reboot"}
+        s = summ(make_ledger(overrides=ov, skip=set(range(101, 106)), extra=[note]))
+        self.assertAlmostEqual(s["planned_excluded_s"], 1800.0)
+        self.assertEqual([r["class"] for r in s["restarts"]], ["planned"])
 
     def test_unexplained_restart_listed_not_failed(self):
         ov = {200: {"reachable": False}}

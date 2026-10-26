@@ -12,10 +12,16 @@ Add a row here in the same change that adds a record:
 | Date | Ticket | Title |
 |---|---|---|
 | 2026-10-24 | MAN-282 | [MAN-282: an absurd `--timeout-secs` fails with a plain error — 2 for `manta status`, 1 for `manta health` — instead of a panic](2026-10-24-man282-timeout-secs-overflow.md) |
+| 2026-10-23 | MAN-277 | [MAN-277: `field-node.py sample` rejects a non-finite or out-of-range `--interval-s`](2026-10-23-man277-sample-interval-bound.md) |
+| 2026-10-23 | MAN-266 | [MAN-266: a corrected release tag takes `:latest` beside its rejected leading-zero twin](2026-10-23-man266-corrected-release-latest.md) |
+| 2026-10-23 | MAN-279 | [MAN-279: a planned-restart window counts only when the restart happened](2026-10-23-man279-planned-window-needs-a-restart.md) |
+| 2026-10-23 | MAN-280 | [MAN-280: shadow-compare renders the comparison window in true UTC](2026-10-23-man280-shadow-compare-utc-window.md) |
+| 2026-10-23 | MAN-220 | [MAN-220: the Dependabot diff verifier reads omitted requirement components as Cargo does; a lockfile edge may follow its target's own bump](2026-10-23-man220-dependency-verifier-omitted-components-and-followed-bumps.md) |
 | 2026-10-23 | MAN-179 | [MAN-179: the MAN-166 writeup's 41,174 and 409,675 count different track populations](2026-10-23-man179-man166-track-populations.md) |
 | 2026-10-23 | MAN-195 | [MAN-195: `spectral_beta = 0.0` skips the spectral-reference scan](2026-10-23-man195-spectral-beta-zero-skips-spectral-reference-scan.md) |
 | 2026-10-23 | MAN-158 | [MAN-158: ROADMAP holds gates and pointers; SECURITY.md states the shipped scope](2026-10-23-man158-roadmap-security-scope-refresh.md) |
 | 2026-10-23 | MAN-176 | [Superseded track-cap defaults in decision records](2026-10-23-man176-track-cap-default-docs.md) |
+| 2026-10-23 | MAN-120 | [MAN-120: dedupe edge hysteresis, a beacon fading regression, the σ invariance pin, and shared frequency-joined CER](2026-10-23-man120-dedupe-beacon-sigma-cer-cleanup.md) |
 | 2026-10-23 | MAN-173 | [MAN-173: a word-boundary gate fails a decode that adds word breaks](2026-10-23-man173-word-boundaries-count-extra-splits.md) |
 | 2026-10-22 | MAN-94 | [MAN-94: an NCDXF/IARU beacon spot reads `NCDXF B` on the wire](2026-10-22-man94-ncdxf-beacon-label.md) |
 | 2026-10-20 | MAN-340 | [MAN-340: a dispatched CI run tests the PR head merged with the main commit its workflow came from](2026-10-20-man340-dispatched-ci-tests-the-merge-with-main.md) |
