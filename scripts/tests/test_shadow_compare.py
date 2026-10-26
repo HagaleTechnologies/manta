@@ -195,6 +195,43 @@ class ShadowCompareTest(unittest.TestCase):
         self.assertIn("AB1CDE", self.unc_calls(s))   # the FT8 K5TR row does not confirm it
         self.assertNotIn("AB1CDE", [m["dxCall"] for m in s["primary_missed_calls"]])
 
+    def test_non_cw_row_neither_confirms_nor_corroborates(self):
+        # MAN-290 scenario 2: one FT8 row matching a node spot, from the primary or
+        # from another spotter, leaves it uncorroborated; the same row as CW does not.
+        npath, rpath = os.path.join(self.d, "ab1cde.jsonl"), os.path.join(self.d, "one.csv")
+        write_lines(npath, [NODE_DAY2[2]])
+        for spotter, mode, confirmed, corroborated in (
+                ("K5TR", "FT8", 0, 0), ("DL1ABC", "FT8", 0, 0),
+                ("K5TR", "CW", 1, 0), ("DL1ABC", "CW", 0, 1)):
+            with self.subTest(spotter=spotter, tx_mode=mode):
+                write_rbn_csv(rpath, [(spotter, "14050.0", "AB1CDE", "10",
+                                       "2026-09-10 10:00:30", "20", mode)])
+                code, _, _, s = self.run_tool(node=[npath], rbn=[rpath])
+                self.assertEqual(code, 0)
+                a = s["agreement"]
+                self.assertEqual((a["node_confirmed_by_primary"], a["node_only_corroborated"]),
+                                 (confirmed, corroborated))
+                self.assertEqual(a["uncorroborated"], 1 - confirmed - corroborated)
+                self.assertEqual(s["inputs"]["rbn_rows"]["non_cw"], int(mode != "CW"))
+
+    def test_rbn_csv_without_tx_mode_is_input_error_exit_2(self):
+        # PRRT_kwDOTQvU8M6qktNz (MAN-290): with no tx_mode column every row was kept,
+        # so an FT8 or RTTY row could confirm or corroborate a node spot (a false GO).
+        rpath, zpath = os.path.join(self.d, "no-mode.csv"), os.path.join(self.d, "no-mode.zip")
+        with open(rpath, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([c for c in RBN_HEADER if c != "tx_mode"])
+            w.writerow(["DL1ABC", "", "", "14050.0", "", "AB1CDE", "", "", "CQ", "10",
+                        "2026-09-10 10:00:30", "20"])
+        with zipfile.ZipFile(zpath, "w") as z:
+            z.write(rpath, "20260910.csv")
+        for path in (rpath, zpath):
+            with self.subTest(rbn=os.path.basename(path)):
+                code, md, err, _ = self.run_tool(rbn=[self.rbn1, path])
+                self.assertEqual(code, 2)
+                self.assertIn("%s: RBN CSV lacks column(s) tx_mode" % path, err)
+                self.assertEqual(md, "")
+
     def test_out_of_passband_and_out_of_window_ignored_both_sides(self):
         _, md, _, s = self.run_tool()
         self.assertEqual(s["node_filter"], {"loaded": 7, "out_of_passband": 1, "out_of_window": 1,
