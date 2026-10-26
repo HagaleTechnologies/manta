@@ -11,11 +11,8 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
-<<<<<<< HEAD
 | 2026-10-26 | MAN-393 | [MAN-393: a one-entry `[[input]]` already loads and takes `MANTA_INPUT_*` like `[input]`](2026-10-26-man393-one-entry-input-array.md) |
-=======
 | 2026-10-26 | MAN-290 | [MAN-290: shadow-compare requires the RBN archive's `tx_mode` column](2026-10-26-man290-shadow-compare-requires-tx-mode.md) |
->>>>>>> ce35ed4ba4bc09b3a7ec37a21827f2d8345c01f0
 | 2026-10-25 | MAN-402 | [MAN-402: a unimodal speed bootstrap reads its marks as dahs when the gaps between them say so](2026-10-25-man402-dah-heavy-bootstrap.md) |
 | 2026-10-25 | MAN-288 | [MAN-288: planned windows absorb counter-attributed downtime](2026-10-25-man288-planned-outage-counter-overlap.md) |
 | 2026-10-24 | MAN-284 | [MAN-284: `field-node.py report` counts the time before the first sample as unobserved](2026-10-24-man284-unsampled-prefix-unobserved.md) |
