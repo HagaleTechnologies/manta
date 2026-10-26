@@ -21,6 +21,11 @@
 //! D6; the wider tolerance-versus-bucket question for all spots stays
 //! with MAN-16
 //! (docs/DECISIONS/2026-09-03-cross-source-dedup-algorithm-spike.md).
+//!
+//! MAN-436: those same-input overrides are decided against the newer of
+//! the two spots (this bucket's and the joined one across the edge), so a
+//! station wobbling `Cq -> De -> Cq` across the edge re-emits as it does
+//! at one frequency.
 
 use crate::context::SpotType;
 use std::collections::BTreeMap;
@@ -157,71 +162,46 @@ impl Dedupe {
         let key = (callsign.to_string(), bucket);
         let window = self.suppression_window_samples;
         let in_window = |prev: &LastSpot| sample_ts.saturating_sub(prev.sample_ts) < window;
-        // MAN-13: a different input's spot one bucket over, within one
-        // channel, is the same signal straddling the edge -- whatever this
-        // bucket holds (nothing, an expired spot, or this input's own).
+        // The neighbouring bucket's in-window spot within one channel is
+        // the same signal straddling the edge -- whatever this bucket holds
+        // (nothing, an expired spot, or this input's own). From another
+        // input it is a cross-input duplicate (MAN-13); from this input it
+        // is this station's spot (MAN-120's join). Hz-bounded like the
+        // gate's MAN-175 anchor join, never bare bucket adjacency (which
+        // reaches ~200 Hz apart, `gate.rs`'s recorded incident).
         let neighbour = Self::neighbour(freq_hz, bucket);
-        let across_edge = self
+        let joined = self
             .last
             .get(&(callsign.to_string(), neighbour))
-            .is_some_and(|prev| {
-                prev.input != input
-                    && (freq_hz - prev.freq_hz).abs() < CROSS_INPUT_MAX_HZ
-                    && in_window(prev)
-            });
-        let outcome = if across_edge {
+            .filter(|prev| (freq_hz - prev.freq_hz).abs() < CROSS_INPUT_MAX_HZ && in_window(prev));
+        let own = self.last.get(&key);
+        let outcome = if joined.is_some_and(|prev| prev.input != input)
+            || own.is_some_and(|prev| prev.input != input && in_window(prev))
+        {
             DedupeOutcome::WithheldCrossInput
         } else {
-            match self.last.get(&key) {
-                None => DedupeOutcome::Emit,
-                Some(prev) if prev.input != input => {
-                    if in_window(prev) {
-                        DedupeOutcome::WithheldCrossInput
-                    } else {
-                        DedupeOutcome::Emit
-                    }
-                }
-                Some(prev) => {
-                    if !in_window(prev)
-                        || snr_db - prev.snr_db >= SNR_IMPROVEMENT_DB
-                        || spot_type != prev.spot_type
-                    {
-                        DedupeOutcome::Emit
-                    } else {
-                        DedupeOutcome::WithheldRepeat
-                    }
-                }
+            // MAN-436: decide against this station's newest spot, on
+            // either side of the edge, as one frequency decides against
+            // the last spot it stored. A stale spot on the other side
+            // neither withholds a type change against the newer one nor
+            // stands in for it. Ties keep the own-bucket spot. A withheld
+            // report stores nothing, so every stored entry and
+            // `last_sample_ts` are untouched by construction.
+            let own = own.filter(|prev| prev.input == input);
+            let edge = joined.filter(|prev| prev.input == input);
+            let latest = match (own, edge) {
+                (Some(o), Some(e)) if e.sample_ts > o.sample_ts => Some(e),
+                (o, e) => o.or(e),
+            };
+            if latest.is_none_or(|prev| {
+                !in_window(prev)
+                    || snr_db - prev.snr_db >= SNR_IMPROVEMENT_DB
+                    || spot_type != prev.spot_type
+            }) {
+                DedupeOutcome::Emit
+            } else {
+                DedupeOutcome::WithheldRepeat
             }
-        };
-        // MAN-120: an own-key Emit whose neighbouring bucket holds this
-        // same input's in-window spot within one channel is the same
-        // station straddling the 300 Hz edge -- withhold it as a repeat
-        // unless the same-input overrides (SNR jump / type change) hold
-        // against that entry. Hz-bounded like the gate's MAN-175 anchor
-        // join, never bare bucket adjacency (which reaches ~200 Hz apart,
-        // `gate.rs`'s recorded incident). A neighbour entry from another
-        // input cannot reach here in-window within one channel: the
-        // `across_edge` check above already returned `WithheldCrossInput`
-        // for exactly that shape, so `prev.input != input` would mean an
-        // expired or beyond-one-channel entry, which these range checks
-        // filter anyway. A withheld report stores nothing, so every
-        // stored entry and `last_sample_ts` are untouched by
-        // construction: state moves only where today's Emit path below
-        // already stored.
-        let outcome = if outcome == DedupeOutcome::Emit
-            && self
-                .last
-                .get(&(callsign.to_string(), neighbour))
-                .is_some_and(|prev| {
-                    prev.input == input
-                        && (freq_hz - prev.freq_hz).abs() < CROSS_INPUT_MAX_HZ
-                        && in_window(prev)
-                        && !(snr_db - prev.snr_db >= SNR_IMPROVEMENT_DB
-                            || spot_type != prev.spot_type)
-                }) {
-            DedupeOutcome::WithheldRepeat
-        } else {
-            outcome
         };
         if outcome == DedupeOutcome::Emit {
             let stored_ts = self
@@ -504,6 +484,58 @@ mod tests {
             e.assess("W1AW", 14_012_560.0, 20.0, SpotType::Cq, 1000, 1),
             WithheldCrossInput
         );
+    }
+
+    /// MAN-436: a station wobbling across the edge decides each report as
+    /// one frequency would -- against its newest spot, on either side.
+    /// Reproduced at HEAD: the ticket's `Cq(L) De(R) Cq(L)`, its mirror,
+    /// and `Cq(R) De(L) Cq(L)` each withheld the third report.
+    #[test]
+    fn an_edge_wobble_decides_against_the_newest_spot_as_one_frequency_does() {
+        use DedupeOutcome::{Emit, WithheldRepeat};
+        use SpotType::{Cq, De};
+        type Step = (f64, f32, SpotType);
+        let (l, r) = (14_012_549.0, 14_012_551.0);
+        let run = |steps: &[Step], one_freq: bool| -> Vec<DedupeOutcome> {
+            let mut d = Dedupe::new(FS);
+            (0u64..)
+                .zip(steps)
+                .map(|(i, &(f, snr, ty))| {
+                    let f = if one_freq { l } else { f };
+                    d.assess("W1AW", f, snr, ty, i * FS as u64, 0)
+                })
+                .collect()
+        };
+        let cases: [(&[Step], &[DedupeOutcome]); 6] = [
+            (
+                &[(l, 20.0, Cq), (r, 20.0, De), (l, 20.0, Cq)],
+                &[Emit, Emit, Emit],
+            ),
+            (
+                &[(r, 20.0, De), (l, 20.0, Cq), (r, 20.0, De)],
+                &[Emit, Emit, Emit],
+            ),
+            (
+                &[(r, 20.0, Cq), (l, 20.0, De), (l, 20.0, Cq)],
+                &[Emit, Emit, Emit],
+            ),
+            (
+                &[(l, 20.0, Cq), (r, 20.0, De), (l, 20.0, Cq), (r, 20.0, De)],
+                &[Emit, Emit, Emit, Emit],
+            ),
+            (
+                &[(l, 20.0, Cq), (r, 20.0, De), (l, 20.0, De)],
+                &[Emit, Emit, WithheldRepeat],
+            ),
+            (
+                &[(l, 20.0, Cq), (r, 26.0, Cq), (l, 20.0, Cq)],
+                &[Emit, Emit, WithheldRepeat],
+            ),
+        ];
+        for (steps, want) in cases {
+            assert_eq!(run(steps, false), want, "across the edge: {steps:?}");
+            assert_eq!(run(steps, true), want, "one frequency: {steps:?}");
+        }
     }
 
     /// MAN-14: `should_emit` is `assess == Emit` on the same sequence.
