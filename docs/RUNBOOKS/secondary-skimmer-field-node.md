@@ -219,7 +219,8 @@ the Aggregator operator stops all forwarding (Aggregator manual §5.6). So the q
 
 Start the three units, wait for the ledger's first scrape (one sample line in the ledger, about
 60 s), then write the start note. A start note before the first sample leaves the spots emitted
-before it uncounted, and `report` marks the missed-spot count indeterminate (NO-GO):
+before it uncounted, and `report` marks the missed-spot count indeterminate (NO-GO); the time
+between that note and the first sample also counts as unobserved against availability (D-A):
 
 ```sh
 sudo systemctl enable --now manta-field.service manta-field-ledger.service manta-field-spots.service
