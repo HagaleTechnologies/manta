@@ -355,6 +355,34 @@ class ShadowCompareTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("bad-ts.jsonl line 1: malformed node spot record", err)
 
+    def test_node_spot_without_de_call_is_malformed(self):
+        # PRRT_kwDOTQvU8M6qkqnn (MAN-289): a spot with no deCall loaded with an empty
+        # identity, so self-exclusion missed the node's call and its own forwarded RBN
+        # rows corroborated its spots.
+        base = json.loads(NODE_DAY2[0])
+        bad = [{k: v for k, v in base.items() if k != "deCall"}]
+        bad += [dict(base, deCall=v) for v in (None, "", "   ", 5)]
+        npath = os.path.join(self.d, "no-de.jsonl")
+        for rec in bad:
+            with self.subTest(rec=rec.get("deCall", "<absent>")):
+                write_lines(npath, [NODE_DAY2[1], json.dumps(rec)])
+                code, md, err, _ = self.run_tool(node=[npath])
+                self.assertEqual(code, 2)
+                self.assertIn("no-de.jsonl line 2: malformed node spot record", err)
+                self.assertEqual(md, "")
+
+    def test_exclude_spotter_covers_a_forwarding_call_other_than_de_call(self):
+        # MAN-289 scenario 3: with every spot carrying a deCall, --exclude-spotter still
+        # excludes a call the node's spots reach RBN under that is not its deCall.
+        rpath = os.path.join(self.d, "fwd.csv")
+        write_rbn_csv(rpath, [("N0CALL-2", "14040.0", "W9XYZ", "10", "2026-09-10 08:00:30", "20", "CW")])
+        _, _, _, s = self.run_tool(rbn=[rpath])
+        self.assertNotIn("W9XYZ", self.unc_calls(s))
+        _, _, _, s = self.run_tool(rbn=[rpath], extra=["--exclude-spotter", "n0call-2"])
+        self.assertIn("W9XYZ", self.unc_calls(s))
+        self.assertEqual(s["excluded_spotters"]["manual"], ["N0CALL-2"])
+        self.assertEqual(s["agreement"]["rbn_rows_from_excluded_spotters"], 1)
+
     def test_torn_final_node_line_is_tolerated(self):
         npath = os.path.join(self.d, "torn.jsonl")
         with open(npath, "w", encoding="utf-8") as f:

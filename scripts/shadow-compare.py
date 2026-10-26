@@ -26,7 +26,9 @@ docs/DECISIONS/2026-10-07-man96-secondary-skimmer-field-node.md):
 Self-exclusion rule: every `deCall` seen in the node's spots, both as-is and
 without its `-N` SSID suffix (e.g. `N0CALL-1` and `N0CALL`), plus every
 `--exclude-spotter`, never counts as a corroborating RBN spotter. Otherwise the
-node's own spots, forwarded to RBN, would corroborate themselves.
+node's own spots, forwarded to RBN, would corroborate themselves. A node spot
+without a nonempty string `deCall` is a malformed record (MAN-289): with no
+identity to exclude, the node's own forwarded RBN rows would corroborate it.
 
 Matching reuses `_is_plausible_callsign`, `dedup_truth` and `match` from
 scripts/score-against-rbn.py (callsign + nearest kHz bin +/-1 + frequency and
@@ -238,7 +240,10 @@ def load_node_spots(paths):
                     ts = float(d["timestamp"])
                     freq = float(d["frequency"])
                     call = str(d["dxCall"]).upper()
-                    de = str(d.get("deCall") or "").upper()
+                    de = d["deCall"]
+                    if not isinstance(de, str) or not de.strip():
+                        raise ValueError("missing deCall")
+                    de = de.strip().upper()
                     when = datetime.fromtimestamp(ts, tz=timezone.utc)
                 except (ValueError, KeyError, TypeError, OverflowError, OSError):
                     if raw.endswith("\n"):
