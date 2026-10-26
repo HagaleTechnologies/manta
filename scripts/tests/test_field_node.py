@@ -702,6 +702,41 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("FAIL (D-A)", r.stdout)
 
+    def test_unsampled_prefix_counts_as_unobserved(self):
+        # PRRT_kwDOTQvU8M6qhuV8, MAN-284: with the window start (a start
+        # note or --from) before the first sample, nothing observed the
+        # node before that sample, so the prefix is unobserved (D-A),
+        # however soon the sample came and whatever it read. D-F's jitter
+        # bridge needs a sample at both ends.
+        note = {"v": 1, "kind": "note", "ts": T0 - 120.0, "note": "start", "reason": "go"}
+        for name, ov, down in (("healthy first sample", None, 0.0),
+                               ("down first sample", {0: {"healthz": 503}}, 60.0)):
+            with self.subTest(name):
+                recs = make_ledger(days=1, step=60.0, start_note=False,
+                                   overrides=ov, extra=[note])
+                s = summ(recs, interval_s=60.0)
+                self.assertAlmostEqual(s["unobserved_s"], 120.0)
+                self.assertAlmostEqual(s["window"]["span_s"], DAY + 120.0)
+                self.assertAlmostEqual(s["down_s"], down)
+        # --from instead of a start note reaches the same walk.
+        recs = make_ledger(days=1, step=60.0, start_note=False, end_note=False)
+        s = summ(recs, from_ts=T0 - 120.0, to_ts=T0 + DAY, interval_s=60.0)
+        self.assertAlmostEqual(s["unobserved_s"], 120.0)
+        write_ledger(self.ledger, make_ledger(days=1, step=60.0, start_note=False, extra=[note]))
+        r = run_cli("report", "--ledger", self.ledger, "--interval-s", "60", "--min-days", "1")
+        self.assertIn("unobserved 120 s", r.stdout)
+
+    def test_sample_at_or_before_window_start_keeps_the_walk(self):
+        # PRRT_kwDOTQvU8M6qhuV8, MAN-284: a sample at or before the window
+        # start leaves the interval walk unchanged.
+        recs = make_ledger(days=1, step=60.0, start_note=False, end_note=False)
+        for from_ts in (T0, T0 + 30.0):
+            with self.subTest(from_ts=from_ts):
+                s = summ(recs, from_ts=from_ts, to_ts=T0 + DAY, interval_s=60.0)
+                self.assertAlmostEqual(s["unobserved_s"], 0.0)
+                self.assertAlmostEqual(s["up_s"], T0 + DAY - from_ts)
+                self.assertAlmostEqual(s["availability"], 1.0)
+
     def test_planned_restart_window_excluded_and_listed(self):
         unreachable = {"reachable": False}
         ov = {101: unreachable, 102: unreachable}
@@ -908,6 +943,106 @@ class ReportTests(unittest.TestCase):
         s = summ(recs)
         self.assertEqual(s["spots_emitted_total"], 2 * 4320)
         self.assertTrue(all(r["spots_emitted"] >= 0 for r in s["daily"]))
+
+    def test_direct_counter_outage_credits_planned_overlap(self):
+        # Later restart evidence registers the capped window under MAN-279.
+        # The healthy left sample classifies [0, 60] as up even though the
+        # next health check fails after the source outage has completed.
+        for cap, delta, down, up in ((20, 20, 0, 40), (10, 20, 10, 40),
+                                     (None, 20, 20, 40), (20, 5, 0, 40)):
+            with self.subTest(cap=cap, delta=delta):
+                note = {"v": 1, "kind": "note", "ts": 10, "note": "planned", "reason": "upgrade"}
+                recs = make_ledger(days=120 / DAY, start=0, step=60, overrides={
+                    1: {"healthz": 503, "source_down_s": {"soapy": float(delta)}},
+                    2: {"start_time": 110},
+                }, extra=[note] if cap is not None else [])
+                s = summ(recs, interval_s=60, planned_window_max_s=cap or 20,
+                         from_ts=0, to_ts=60, min_days=0.0001)
+                self.assertEqual(s["down_s"], down)
+                self.assertEqual(s["counter_down_s"], down)
+                self.assertEqual(s["up_s"], up)
+                self.assertEqual(s["unobserved_s"], 0)
+                self.assertEqual(s["planned_excluded_s"], cap or 0)
+                self.assertEqual(s["planned_windows"], [
+                    {"start": "1970-01-01T00:00:10Z", "end": fn._iso(10 + cap), "s": cap}
+                ] if cap is not None else [])
+                self.assertEqual(s["source_outages"]["down_s"], delta)
+                self.assertAlmostEqual(s["availability"], up / (60 - (cap or 0)))
+                self.assertEqual(crit(s, "D-A")["pass"], down == 0)
+                self.assertEqual(s["up_s"] + s["down_s"] + s["unobserved_s"],
+                                 60 - s["planned_excluded_s"])
+
+    def test_reassigned_counter_outage_credits_planned_overlap(self):
+        # The unhealthy [60, 120] run consumes 60 of the 80 counter seconds.
+        # Its 20-second remainder moves back into [0, 60] before accounting.
+        for cap, down, counter in ((20, 60, 0), (10, 70, 10), (None, 80, 20)):
+            with self.subTest(cap=cap):
+                note = {"v": 1, "kind": "note", "ts": 10, "note": "planned", "reason": "upgrade"}
+                recs = make_ledger(days=180 / DAY, start=0, step=60, overrides={
+                    1: {"healthz": 503},
+                    2: {"healthz": 503, "source_down_s": {"soapy": 80.0}},
+                    3: {"start_time": 170},
+                }, extra=[note] if cap is not None else [])
+                s = summ(recs, interval_s=60, planned_window_max_s=cap or 20,
+                         from_ts=0, to_ts=120)
+                self.assertEqual(s["down_s"], down)
+                self.assertEqual(s["counter_down_s"], counter)
+                self.assertEqual(s["up_s"], 40)
+                self.assertEqual(s["unobserved_s"], 0)
+                self.assertEqual(s["planned_excluded_s"], cap or 0)
+                self.assertEqual(s["planned_windows"], [
+                    {"start": "1970-01-01T00:00:10Z", "end": fn._iso(10 + cap), "s": cap}
+                ] if cap is not None else [])
+                self.assertEqual(s["source_outages"]["down_s"], 80)
+                self.assertAlmostEqual(s["availability"], 40 / (120 - (cap or 0)))
+                self.assertEqual(s["up_s"] + s["down_s"] + s["unobserved_s"],
+                                 120 - s["planned_excluded_s"])
+
+    def test_counter_outage_with_cancelled_planned_note_counts_in_full(self):
+        note = {"v": 1, "kind": "note", "ts": 10, "note": "planned", "reason": "cancelled"}
+        recs = make_ledger(days=120 / DAY, start=0, step=60, overrides={
+            1: {"healthz": 503, "source_down_s": {"soapy": 20.0}},
+            2: {"source_down_s": {"soapy": 20.0}},
+        }, extra=[note])
+        s = summ(recs, interval_s=60, planned_window_max_s=20, from_ts=0, to_ts=60)
+        self.assertEqual(s["planned_windows"], [])
+        self.assertEqual(s["planned_excluded_s"], 0)
+        self.assertEqual(s["restarts"], [])
+        self.assertEqual(s["down_s"], 20)
+        self.assertEqual(s["counter_down_s"], 20)
+        self.assertEqual(s["source_outages"]["down_s"], 20)
+        self.assertEqual(s["up_s"], 40)
+        self.assertEqual(s["unobserved_s"], 0)
+        self.assertAlmostEqual(s["availability"], 40 / 60)
+
+    def test_planned_counter_overlap_report_passes_in_both_formats(self):
+        note = {"v": 1, "kind": "note", "ts": 10, "note": "planned", "reason": "upgrade"}
+        recs = make_ledger(days=120 / DAY, start=0, step=60, overrides={
+            1: {"healthz": 503, "source_down_s": {"soapy": 20.0}},
+            2: {"start_time": 110},
+        }, extra=[note])
+        for fmt in ("json", "markdown"):
+            with self.subTest(format=fmt):
+                r = self.report(recs, "--from", "1970-01-01T00:00:00Z",
+                                "--to", "1970-01-01T00:01:00Z", "--interval-s", "60",
+                                "--planned-window-max-s", "20", "--min-days", "0.0001",
+                                "--format", fmt)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                if fmt == "json":
+                    s = json.loads(r.stdout)
+                    self.assertEqual(s["verdict"], "PASS")
+                    self.assertTrue(crit(s, "D-A")["pass"])
+                    self.assertEqual(s["availability"], 1.0)
+                    self.assertEqual(s["up_s"], 40)
+                    self.assertEqual(s["down_s"], 0)
+                    self.assertEqual(s["counter_down_s"], 0)
+                    self.assertEqual(s["planned_excluded_s"], 20)
+                    self.assertEqual(s["source_outages"]["down_s"], 20)
+                else:
+                    self.assertIn("Availability: 100.00% (min 99.00%): PASS (D-A)", r.stdout)
+                    self.assertIn("Up 40 s, down 0 s (of which 0 s from source-outage counters), "
+                                  "unobserved 0 s", r.stdout)
+                    self.assertIn("**Overall: PASS**", r.stdout)
 
     def test_sub_interval_outage_counted_from_counters(self):
         ov = {}
@@ -1192,6 +1327,7 @@ class ReportTests(unittest.TestCase):
         self.assertTrue(s["spots_missed_indeterminate"])
         self.assertTrue(any("no reachable sample at or before the window start" in w
                             for w in s["warnings"]))
+        self.assertAlmostEqual(s["unobserved_s"], 120.0)
 
     def test_no_restart_keeps_spots_missed_a_count(self):
         ov = {i: {"spots_inc": 1 if 1 <= i <= 20 else 0} for i in range(0, 145)}
