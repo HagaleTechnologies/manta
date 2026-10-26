@@ -78,7 +78,7 @@ impl<'de> serde::Deserialize<'de> for Glyph {
             .map(Glyph::Prosign)
             .ok_or_else(|| {
                 serde::de::Error::custom(format!(
-                    "glyph {text:?} is neither one character nor a prosign token"
+                    "glyph \"{text}\" is neither one character nor a prosign token"
                 ))
             })
     }
