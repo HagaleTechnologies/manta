@@ -24,10 +24,10 @@ Example:
 
 The capture is `run --json`'s stdout: decoder events (`CharDecoded`,
 `WordBoundary`, `TrackPromoted`, `TrackMeta`, `TrackClosed`, ...) and
-`{"spot": {...}}` lines. A spot's time is `sample_ts / --sample-rate-hz`;
-its pitch, and a track's, is `freq_hz - --dial-freq-hz`. --dial-freq-hz
-defaults to 0, which matches `run` without --dial-freq-hz (freq_hz is then
-the audio tone). A row's window is [start_s - tol, end_s + tol]
+`{"spot": {...}}` lines. A spot's time is `sampleTs / --sample-rate-hz`;
+its pitch, and a track's, is `frequency - --dial-freq-hz`. --dial-freq-hz
+defaults to 0, which matches `run` without --dial-freq-hz (frequency is
+then the audio tone). A row's window is [start_s - tol, end_s + tol]
 (--time-tol-s, default 10); a pitch matches within --pitch-tol-hz (default
 100) when the row gives one, and any pitch when it does not.
 
@@ -142,8 +142,8 @@ def load_run(path, sample_rate_hz, dial_freq_hz=0.0):
     "words": [{text, track_id, time_s, pitch_hz}]}. Raises ValueError naming
     the line on a line that is not a JSON object."""
     spots, words = [], []
-    open_words = {}     # track_id -> (text, first sample_ts)
-    track_freq = {}     # track_id -> latest freq_hz
+    open_words = {}     # track_id -> (text, first sampleTs)
+    track_freq = {}     # track_id -> latest frequency
     pending = []        # words whose track had no frequency yet when they ended
 
     def flush(track_id):
@@ -170,20 +170,21 @@ def load_run(path, sample_rate_hz, dial_freq_hz=0.0):
                 raise ValueError("%s:%d: not a JSON object" % (path, lineno))
             if "spot" in obj:
                 s = obj["spot"]
-                spots.append({"callsign": str(s["callsign"]).upper(),
-                              "time_s": s["sample_ts"] / sample_rate_hz,
-                              "pitch_hz": s["freq_hz"] - dial_freq_hz,
-                              "track_id": s.get("track_id")})
+                spots.append({"callsign": str(s["dxCall"]).upper(),
+                              "time_s": s["sampleTs"] / sample_rate_hz,
+                              "pitch_hz": s["frequency"] - dial_freq_hz,
+                              "track_id": s.get("trackId")})
                 continue
             event = obj.get("event")
-            track_id = obj.get("track_id")
-            if event in ("TrackPromoted", "TrackMeta") and "freq_hz" in obj:
-                track_freq[track_id] = obj["freq_hz"]
+            track_id = obj.get("trackId")
+            if event in ("TrackPromoted", "TrackMeta") and "frequency" in obj:
+                track_freq[track_id] = obj["frequency"]
             elif event == "CharDecoded":
-                glyph = obj.get("glyph") or {}
-                if "Char" in glyph:
-                    text, ts = open_words.get(track_id, ("", obj["sample_ts"]))
-                    open_words[track_id] = (text + str(glyph["Char"]).upper(), ts)
+                # One character, or a prosign token such as "<SK>".
+                glyph = obj.get("glyph")
+                if isinstance(glyph, str) and len(glyph) == 1:
+                    text, ts = open_words.get(track_id, ("", obj["sampleTs"]))
+                    open_words[track_id] = (text + glyph.upper(), ts)
                 else:
                     flush(track_id)  # a prosign ends the word
             elif event in ("WordBoundary", "TrackClosed"):
@@ -272,9 +273,9 @@ def main(argv=None):
     ap.add_argument("transcript_csv", help="Hand transcript of the same recording")
     ap.add_argument("--sample-rate-hz", required=True,
                     type=scorer._finite("--sample-rate-hz", min_exclusive=0),
-                    help="The recording's sample rate (sample_ts units)")
+                    help="The recording's sample rate (sampleTs units)")
     ap.add_argument("--dial-freq-hz", type=scorer._finite("--dial-freq-hz"), default=0.0,
-                    help="Subtracted from freq_hz to get a pitch (default 0, as for run without --dial-freq-hz)")
+                    help="Subtracted from frequency to get a pitch (default 0, as for run without --dial-freq-hz)")
     ap.add_argument("--time-tol-s", type=scorer._finite("--time-tol-s", min_inclusive=0),
                     default=DEFAULT_TIME_TOL_S, help="Seconds either side of a row (default 10)")
     ap.add_argument("--pitch-tol-hz", type=scorer._finite("--pitch-tol-hz", min_inclusive=0),

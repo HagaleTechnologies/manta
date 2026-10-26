@@ -16,8 +16,8 @@ sources:
   - docs/DECISIONS/2026-09-10-post-antenna-fix-90min-soak-and-service-reliability.md
   - docs/DECISIONS/2026-10-11-man131-actionable-errors.md
 verified:
-  commit: d286147
-  date: 2026-10-13
+  commit: 420a580
+  date: 2026-10-26
 links:
   - spot-validation
   - overview
@@ -46,13 +46,15 @@ claim to the historical findings below.
 
 - `manta doctor --duration <secs> --json` assesses decoding after checking sample delivery: bounded,
   self-terminating, gives a verdict from track/SNR/decode stats —
-  `NoSignal` (no decoder evidence at all), `ActivityNoSnr` (a track opened
+  `NO_SIGNAL` (no decoder evidence at all), `NOT_CW` (signals seen but
+  none keyed CW), `ACTIVITY_NO_SNR` (a track opened
   or decoded characters, but the run ended before any `TrackMeta` landed —
   "unmeasured," not "measured and low"; retry with a longer `--duration`),
-  `NoisyNoDecode` (every track read at or below the noise floor),
-  `WeakNoDecode` (real signal-level SNR, but nothing validated into a
-  spot), or `Decoding` (at least one confirmed spot; the full path works
-  end to end). It does **not** expose what a confirmed spot actually
+  `NOISY_NO_DECODE` (every track read at or below the noise floor),
+  `WEAK_NO_DECODE` (real signal-level SNR, but nothing validated into a
+  spot), or `DECODING` (at least one confirmed spot; the full path works
+  end to end). The text report and `--json` spell them the same way
+  ([docs/CLI-JSON.md](../../docs/CLI-JSON.md#doctor---json)). It does **not** expose what a confirmed spot actually
   contained — the callback that counts them throws the `Spot` away
   (`crates/manta-engine/src/doctor.rs`'s `|_spot| spots_confirmed += 1`).
 - `manta listen --json` is what you need to actually see spot content
@@ -73,7 +75,7 @@ claim to the historical findings below.
 
 ## A confirmed `Spot` is not proof of a real signal
 
-Don't trust `spots_confirmed > 0` (or a `Decoding` verdict) alone. Field-
+Don't trust `spotsConfirmed > 0` (or a `DECODING` verdict) alone. Field-
 confirmed 2026-09-09: 29/29 confirmed spots in an overnight 40m session
 shared one signature — confidence pinned to the low end (~0.12-0.17),
 often-implausible WPM, malformed callsign text, and (tellingly) clustered
@@ -157,7 +159,7 @@ September 9 captures. An isolated 10 MHz bin is insufficient to identify
 WWV without modulation/sideband or equivalent evidence; see the
 [antenna-path record](../../docs/DECISIONS/2026-09-10-antenna-path-fix-resolves-detection-gap.md).
 
-**`snr_db` is not a useful signal here on its own.** A weak/flat-envelope
+**A spot's `snr` is not a useful signal here on its own.** A weak/flat-envelope
 track commonly lands at or near `20*log10(2) - 14.3 = -8.2794 dB` via
 `envelope.rs`'s rail-collapse clamp (`e_hi >= 2*e_lo`, SPEC §3.2) — but
 that's not a proven hard floor: `e_lo` is only clamped to `E_LO_FLOOR` at
@@ -167,7 +169,7 @@ value pinned near -8.2794 dB is *consistent with* the clamp firing, not
 guaranteed proof of it — either way it's completely unremarkable for
 both this artifact and a real weak signal, and proves nothing on its
 own. Frequency recurrence and confidence are the actual warning signs to
-check; don't lean on `snr_db` to distinguish real from artifact.
+check; don't lean on `snr` to distinguish real from artifact.
 
 ## A quiet `doctor`/`listen` run on a non-CW signal doesn't mean the RF chain is broken
 

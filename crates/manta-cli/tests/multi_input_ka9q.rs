@@ -319,7 +319,7 @@ impl Daemon {
         loop {
             let calls: BTreeSet<&str> = seen
                 .iter()
-                .filter_map(|(_, s): &(Instant, serde_json::Value)| s["callsign"].as_str())
+                .filter_map(|(_, s): &(Instant, serde_json::Value)| s["dxCall"].as_str())
                 .collect();
             if want.iter().all(|c| calls.contains(c)) {
                 return seen;
@@ -375,8 +375,8 @@ fn two_ka9q_channels_on_one_radiod_feed_one_spot_stream() {
 
     let spots = daemon.spots_until(&["W1AW", "JA1ABC"], Duration::from_secs(90));
     for (_, spot) in &spots {
-        let call = spot["callsign"].as_str().unwrap_or_default();
-        let freq = spot["freq_hz"].as_f64().unwrap_or_default();
+        let call = spot["dxCall"].as_str().unwrap_or_default();
+        let freq = spot["frequency"].as_f64().unwrap_or_default();
         match call {
             "W1AW" => assert!((freq - 14_012_340.0).abs() < 100.0, "{spot}"),
             "JA1ABC" => assert!((freq - 7_012_340.0).abs() < 100.0, "{spot}"),

@@ -260,8 +260,8 @@ fn file_replay_spot(wav: &Path) -> (String, f64) {
         .collect();
     assert_eq!(spots.len(), 1, "file replay spots: {spots:?}");
     (
-        spots[0]["callsign"].as_str().unwrap().to_string(),
-        spots[0]["freq_hz"].as_f64().unwrap(),
+        spots[0]["dxCall"].as_str().unwrap().to_string(),
+        spots[0]["frequency"].as_f64().unwrap(),
     )
 }
 
@@ -350,9 +350,9 @@ fn ka9q_stream_spots_w1aw_like_the_file_replay() {
                 err_lines.lock().unwrap().join("\n")
             )
         });
-    assert_eq!(spot["callsign"].as_str(), Some(file_call.as_str()));
+    assert_eq!(spot["dxCall"].as_str(), Some(file_call.as_str()));
     assert_eq!(file_call, "W1AW");
-    let freq = spot["freq_hz"].as_f64().unwrap();
+    let freq = spot["frequency"].as_f64().unwrap();
     assert!(
         (freq - file_freq).abs() <= 1.0,
         "ka9q spot at {freq} Hz, file replay at {file_freq} Hz"

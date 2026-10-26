@@ -23,16 +23,16 @@ fn decode_report(
     (serde_json::from_slice(&out.stdout).unwrap(), manifest)
 }
 
-/// Group `report["events"]` by `track_id`, returning each track's decoded
+/// Group `report["events"]` by `trackId`, returning each track's decoded
 /// text and its last-reported TrackMeta freq_hz.
 fn per_track(report: &serde_json::Value) -> BTreeMap<u64, (String, Option<f64>)> {
     let mut texts: BTreeMap<u64, String> = BTreeMap::new();
     let mut freqs: BTreeMap<u64, f64> = BTreeMap::new();
     for ev in report["events"].as_array().unwrap() {
-        let tid = ev["track_id"].as_u64().unwrap();
+        let tid = ev["trackId"].as_u64().unwrap();
         match ev["event"].as_str().unwrap() {
             "CharDecoded" => {
-                if let Some(c) = ev["glyph"]["Char"].as_str() {
+                if let Some(c) = ev["glyph"].as_str().filter(|g| g.chars().count() == 1) {
                     texts.entry(tid).or_default().push_str(c);
                 }
             }
@@ -43,7 +43,7 @@ fn per_track(report: &serde_json::Value) -> BTreeMap<u64, (String, Option<f64>)>
                 }
             }
             "TrackMeta" => {
-                freqs.insert(tid, ev["freq_hz"].as_f64().unwrap());
+                freqs.insert(tid, ev["frequency"].as_f64().unwrap());
             }
             _ => {}
         }
@@ -63,7 +63,7 @@ fn promoted_track_ids(report: &serde_json::Value) -> BTreeSet<u64> {
         .unwrap()
         .iter()
         .filter(|ev| ev["event"] == "TrackPromoted")
-        .map(|ev| ev["track_id"].as_u64().unwrap())
+        .map(|ev| ev["trackId"].as_u64().unwrap())
         .collect()
 }
 
@@ -73,10 +73,10 @@ fn promoted_track_ids(report: &serde_json::Value) -> BTreeSet<u64> {
 #[test]
 fn promoted_track_ids_counts_a_track_that_decoded_nothing() {
     let report = serde_json::json!({ "events": [
-        { "event": "TrackPromoted", "track_id": 1 },
-        { "event": "TrackPromoted", "track_id": 2 },
-        { "event": "CharDecoded", "track_id": 1, "glyph": { "Char": "E" } },
-        { "event": "TrackClosed", "track_id": 2 },
+        { "event": "TrackPromoted", "trackId": 1 },
+        { "event": "TrackPromoted", "trackId": 2 },
+        { "event": "CharDecoded", "trackId": 1, "glyph": "E" },
+        { "event": "TrackClosed", "trackId": 2 },
     ] });
     assert_eq!(per_track(&report).len(), 1);
     assert_eq!(promoted_track_ids(&report), BTreeSet::from([1, 2]));

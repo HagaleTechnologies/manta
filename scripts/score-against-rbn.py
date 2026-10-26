@@ -98,14 +98,15 @@ def load_manta_spots(path, capture_start, sample_rate_hz):
         report = json.load(f)
     out = []
     for s in report["spots"]:
-        t = capture_start + timedelta(seconds=s["sample_ts"] / sample_rate_hz)
+        t = capture_start + timedelta(seconds=s["sampleTs"] / sample_rate_hz)
+        # Left: this script's internal names (match(), confidence-separation.py); right: decode --json's.
         out.append({
-            "callsign": s["callsign"].upper(),
-            "freq_hz": s["freq_hz"],
+            "callsign": s["dxCall"].upper(),
+            "freq_hz": s["frequency"],
             "time": t,
-            "snr_db": s["snr_db"],
-            "confidence": s["confidence"],
-            "spot_type": s["spot_type"],
+            "snr_db": s["snr"],
+            "confidence": s["decodeConfidence"],
+            "spot_type": s["spotType"],
         })
     return out
 
@@ -230,7 +231,7 @@ def score_report(decode_report, rbn_truth_csv, capture_start, sample_rate_hz,
 def parse_iso(s):
     """Parses --capture-start. A timezone-naive value (no trailing Z or
     explicit offset) is assumed UTC, matching every other timestamp this
-    script handles (RBN truth rows, sample_ts-derived spot times) --
+    script handles (RBN truth rows, sampleTs-derived spot times) --
     otherwise a naive value here would crash the time-tolerance matching
     in `match()` (Codex review, PR #144) the first time it's subtracted
     against an RBN truth row's timezone-aware UTC timestamp."""
@@ -248,7 +249,7 @@ def _finite(name, *, min_exclusive=None, min_inclusive=None):
     (any spot, arbitrarily far from a truth observation, would pass); a
     negative tolerance would silently reject even an exact match; and a
     zero or negative `--sample-rate-hz` would crash or corrupt every
-    spot's derived time (dividing `sample_ts` by it)."""
+    spot's derived time (dividing `sampleTs` by it)."""
     def parse(s):
         v = float(s)
         finite = (v == v) and v not in (float("inf"), float("-inf"))

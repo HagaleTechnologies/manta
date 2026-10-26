@@ -110,14 +110,14 @@ fn scrape_metrics(port: u16) -> Option<String> {
     Some(body)
 }
 
-/// A spot's callsign, absolute frequency and `sample_ts`.
+/// A spot's `dxCall`, absolute `frequency` and `sampleTs`.
 type Spot = (String, f64, u64);
 
 fn spot_of(v: &serde_json::Value) -> Spot {
     (
-        v["callsign"].as_str().unwrap().to_string(),
-        v["freq_hz"].as_f64().unwrap(),
-        v["sample_ts"].as_u64().unwrap(),
+        v["dxCall"].as_str().unwrap().to_string(),
+        v["frequency"].as_f64().unwrap(),
+        v["sampleTs"].as_u64().unwrap(),
     )
 }
 

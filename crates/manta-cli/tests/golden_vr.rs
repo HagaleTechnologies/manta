@@ -41,17 +41,17 @@ fn decode_report_with_engine(
     (serde_json::from_slice(&out.stdout).unwrap(), manifest)
 }
 
-/// Group `report["events"]` by `track_id`, returning each track's decoded
+/// Group `report["events"]` by `trackId`, returning each track's decoded
 /// text and its last-reported TrackMeta freq_hz. Same shape as
 /// golden_v7_v9_v10.rs's/golden_v8_v8w.rs's helper of the same name.
 fn per_track(report: &serde_json::Value) -> std::collections::BTreeMap<u64, (String, Option<f64>)> {
     let mut texts: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let mut freqs: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
     for ev in report["events"].as_array().unwrap() {
-        let tid = ev["track_id"].as_u64().unwrap();
+        let tid = ev["trackId"].as_u64().unwrap();
         match ev["event"].as_str().unwrap() {
             "CharDecoded" => {
-                if let Some(c) = ev["glyph"]["Char"].as_str() {
+                if let Some(c) = ev["glyph"].as_str().filter(|g| g.chars().count() == 1) {
                     texts.entry(tid).or_default().push_str(c);
                 }
             }
@@ -62,7 +62,7 @@ fn per_track(report: &serde_json::Value) -> std::collections::BTreeMap<u64, (Str
                 }
             }
             "TrackMeta" => {
-                freqs.insert(tid, ev["freq_hz"].as_f64().unwrap());
+                freqs.insert(tid, ev["frequency"].as_f64().unwrap());
             }
             _ => {}
         }
@@ -99,8 +99,8 @@ fn spotted_calls(report: &serde_json::Value) -> Vec<(String, u64)> {
         .iter()
         .map(|s| {
             (
-                s["callsign"].as_str().unwrap().to_string(),
-                s["track_id"].as_u64().unwrap(),
+                s["dxCall"].as_str().unwrap().to_string(),
+                s["trackId"].as_u64().unwrap(),
             )
         })
         .collect()

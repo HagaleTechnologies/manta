@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Summarize one `manta listen --json` capture into the same shape as
-# `manta doctor`'s report (chars/distinct-chars/tracks/SNR stats), plus
-# every confirmed Spot's full content -- something `doctor` deliberately
-# doesn't expose (crates/manta-engine/src/doctor.rs discards the spot in
-# its callback, `|_spot| spots_confirmed += 1`, and only counts it).
+# `manta doctor`'s report (chars/distinct-chars/tracks/SNR stats, each
+# labelled with its `doctor --json` key), plus every confirmed Spot's
+# full content -- something `doctor` deliberately doesn't expose
+# (crates/manta-engine/src/doctor.rs discards the spot in its callback,
+# `|_spot| spots_confirmed += 1`, and only counts it).
 #
 # Use this after a live-hardware field-test capture (see
 # wiki/pages/live-hardware-field-testing.md) to see what `doctor` can only
@@ -29,11 +30,13 @@ if [ $# -ne 1 ]; then
 fi
 file="$1"
 
-echo "chars_decoded:   $(grep -c '"event":"CharDecoded"' "$file" || true)"
-echo "distinct_chars:  $(jq -c 'select(.event == "CharDecoded") | .glyph.Char // empty' "$file" | sort -u | wc -l | tr -d ' ')"
-echo "tracks_promoted: $(grep -c '"event":"TrackPromoted"' "$file" || true)"
-echo "tracks_closed:   $(grep -c '"event":"TrackClosed"' "$file" || true)"
-echo "track_meta_count: $(grep -c '"event":"TrackMeta"' "$file" || true)"
+echo "charsDecoded:   $(grep -c '"event":"CharDecoded"' "$file" || true)"
+# A glyph is one character or a prosign token such as "<SK>"; count only
+# the characters, as doctor's distinctChars does.
+echo "distinctChars:  $(jq -c 'select(.event == "CharDecoded") | .glyph | select(length == 1)' "$file" | sort -u | wc -l | tr -d ' ')"
+echo "tracksPromoted: $(grep -c '"event":"TrackPromoted"' "$file" || true)"
+echo "tracksClosed:   $(grep -c '"event":"TrackClosed"' "$file" || true)"
+echo "trackMetaCount: $(grep -c '"event":"TrackMeta"' "$file" || true)"
 
 # Bounded-memory median: stream the raw file line-by-line (jq -c, never
 # -s/--slurp) so the dominant CharDecoded/WordBoundary/TrackMeta volume of
@@ -46,10 +49,10 @@ echo "track_meta_count: $(grep -c '"event":"TrackMeta"' "$file" || true)"
 # array in one process's heap (Codex review, PR #153, round 2).
 snr_file=$(mktemp)
 trap 'rm -f "$snr_file" "${sorted_file:-}"' EXIT
-jq -c 'select(has("event") and .event == "TrackMeta") | .snr_2500_db' "$file" > "$snr_file"
+jq -c 'select(has("event") and .event == "TrackMeta") | .snr' "$file" > "$snr_file"
 n=$(wc -l < "$snr_file" | tr -d ' ')
 if [ "$n" -eq 0 ]; then
-    echo "snr_2500_db: no TrackMeta events"
+    echo "snr (2500 Hz reference): no TrackMeta events"
 else
     sorted_file=$(mktemp)
     sort -n "$snr_file" > "$sorted_file"
@@ -63,7 +66,7 @@ else
     else
         median=$(sed -n "$((mid + 1))p" "$sorted_file")
     fi
-    echo "snr_2500_db: min=${min} median=${median} max=${max}"
+    echo "snr (2500 Hz reference): min=${min} median=${median} max=${max}"
 fi
 
 echo
@@ -73,10 +76,10 @@ jq -c 'select(has("spot")) | .spot' "$file" | jq -r '
   # 93.75 Hz, so whole-kHz rounding collapses ~10 distinct channel positions
   # into one displayed value and hides exactly the clustering/dial-shift
   # movement this script exists to help spot (Codex review, PR #153).
-  # Every other field (including snr_db and wpm, previously rounded, and
-  # track_id/sample_ts, previously omitted) is printed at full precision so
+  # Every other field (including snr and wpm, previously rounded, and
+  # trackId/sampleTs, previously omitted) is printed at full precision so
   # this is genuinely the full Spot content, not a lossy subset (Codex
   # review, PR #153, round 3) -- correlate a spot back to its TrackMeta/
-  # TrackPromoted/TrackClosed events in the same capture via track_id.
-  "  \(.callsign)\tfreq=\((.freq_hz | round) / 1000)kHz\tsnr_db=\(.snr_db)\tconfidence=\(.confidence)\twpm=\(.wpm)\ttype=\(.spot_type)\ttrack_id=\(.track_id)\tsample_ts=\(.sample_ts)"
+  # TrackPromoted/TrackClosed events in the same capture via trackId.
+  "  \(.dxCall)\tfrequency=\((.frequency | round) / 1000)kHz\tsnr=\(.snr)\tdecodeConfidence=\(.decodeConfidence)\twpm=\(.wpm)\tspotType=\(.spotType)\ttrackId=\(.trackId)\tsampleTs=\(.sampleTs)"
 '

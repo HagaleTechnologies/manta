@@ -74,9 +74,9 @@ def write_rbn_csv(path):
 
 def decode_report(rate=192000):
     """N4RV matches truth; W9ZZZ is a false positive."""
-    def s(call, freq_hz, t):
-        return {"callsign": call, "freq_hz": freq_hz, "snr_db": 12.0, "wpm": 28.0,
-                "spot_type": "Cq", "confidence": 0.9, "track_id": 1, "sample_ts": int(t * rate)}
+    def s(call, frequency, t):
+        return {"dxCall": call, "frequency": frequency, "snr": 12.0, "wpm": 28.0,
+                "spotType": "cq", "decodeConfidence": 0.9, "trackId": 1, "sampleTs": int(t * rate)}
     return {"events": [], "spots": [s("N4RV", 7021000.0, 35.0), s("W9ZZZ", 7040000.0, 50.0)]}
 
 
@@ -89,8 +89,8 @@ class ScoreReportTests(unittest.TestCase):
         self.csv = os.path.join(self.tmp, "t.csv")
         rbn_tests.write_csv(self.csv)  # test_score_against_rbn.py's fixture rows
         self.report = os.path.join(self.tmp, "r.json")
-        spots = [{"callsign": c, "freq_hz": f, "snr_db": 10.0, "confidence": 0.8,
-                  "spot_type": "Cq", "sample_ts": 0}
+        spots = [{"dxCall": c, "frequency": f, "snr": 10.0, "decodeConfidence": 0.8,
+                  "spotType": "cq", "sampleTs": 0}
                  for c, f in (("N4RV", 7021000.0), ("N3RS", 7049400.0), ("W9ZZZ", 7040000.0))]
         with open(self.report, "w") as f:
             json.dump({"spots": spots}, f)
@@ -505,7 +505,8 @@ class ScoreTests(ScriptTest):
         # Move the one spot 60 s past its row: spot precision drops to 0.
         with open(self.run_jsonl) as f:
             text = f.read()
-        moved = text.replace('"track_id":1,"sample_ts":700800}}', '"track_id":1,"sample_ts":3600000}}')
+        moved = text.replace('"sampleTs":700800,"rst":null,"qrlQuery":false}}',
+                             '"sampleTs":3600000,"rst":null,"qrlQuery":false}}')
         self.assertNotEqual(moved, text)
         with open(self.run_jsonl, "w") as f:
             f.write(moved)

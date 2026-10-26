@@ -8,8 +8,8 @@ sources:
   - crates/manta-cli/examples/replay_spots.rs
   - docs/DECISIONS/2026-09-07-man100-variant-arbitration.md
 verified:
-  commit: d286147
-  date: 2026-10-13
+  commit: 420a580
+  date: 2026-10-26
 links:
   - spot-validation
 ---
@@ -31,8 +31,8 @@ cargo run --release -p manta-cli -- decode --json v8w.wav > v8w-report.json   # 
 
 Every `manta-spot` rule change (MAN-100's variant arbitration and message-aware repetition gate, and its remediation round's C1–C3 fixes) was iterated against this harness, then re-confirmed end to end through the real `manta decode` binary once. Without it, testing a rule-variant hypothesis against a real fading pileup costs a 6-minute IQ decode per iteration — intractable for the kind of measure-a-dozen-variants work `docs/DECISIONS/2026-09-07-man100-variant-arbitration.md`'s rule-variant table required. Any future `manta-spot` change touching a multi-signal scene should use this loop rather than re-running `manta decode` per iteration.
 
-`DecoderEvent` derives both `Serialize` and `Deserialize`, so the harness deserializes the saved report's `events` array directly rather than reconstructing it field-by-field. `sample_ts` values in a saved report are raw-IQ sample indices at the WAV's own sample rate — the harness defaults to 96 kHz (every fixture `manta-testkit::vectors` generates) but takes an optional third `[sample_rate_hz]` argument that **must** be set to the WAV's actual rate when replaying a report produced with `manta decode --capture-rate-hz <n>` (Codex review, PR #133): a saved report carries no sample rate (`DecodeReport::sample_rate_hz` is `#[serde(skip)]`, not serialized), so the correct rate can't be read out of the report and has to be supplied.
+`DecoderEvent` derives both `Serialize` and `Deserialize`, so the harness deserializes the saved report's `events` array directly rather than reconstructing it field-by-field. A report saved before MAN-139 (snake_case keys such as `track_id`) no longer loads: regenerate it with `manta decode --json`. `sampleTs` values in a saved report are raw-IQ sample indices at the WAV's own sample rate — the harness defaults to 96 kHz (every fixture `manta-testkit::vectors` generates) but takes an optional third `[sample_rate_hz]` argument that **must** be set to the WAV's actual rate when replaying a report produced with `manta decode --capture-rate-hz <n>` (Codex review, PR #133): a saved report carries no sample rate (`DecodeReport::sample_rate_hz` is `#[serde(skip)]`, not serialized), so the correct rate can't be read out of the report and has to be supplied.
 
 `DecodeReport` likewise carries none of the original run's allowlist/blocklist/notch settings (Codex review, PR #133 round 3) — those affect admission, suppression, and dedupe buckets in the real validator just as much as the sample rate does. `replay_spots` accepts `--allowlist <CALL>` (repeatable), `--blocklist <path>`, and `--notch <path>`, mirroring `manta decode`'s own flags of the same name — pass the SAME values the original `manta decode` run used, or the replayed spot list won't match it.
 
-`--freq-correction-ppm` is deliberately NOT one of the mirrored flags (Codex review, PR #133 round 5): `decode_samples` already mutates every serialized `TrackMeta`/`TrackPromoted` `freq_hz` by the calibration factor before writing the report, so the events this harness replays already carry corrected frequencies — passing the ppm through again would double-correct them, moving notch/dedupe buckets and producing a spot list that doesn't match the original run.
+`--freq-correction-ppm` is deliberately NOT one of the mirrored flags (Codex review, PR #133 round 5): `decode_samples` already mutates every serialized `TrackMeta`/`TrackPromoted` `frequency` by the calibration factor before writing the report, so the events this harness replays already carry corrected frequencies — passing the ppm through again would double-correct them, moving notch/dedupe buckets and producing a spot list that doesn't match the original run.

@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-22T14:52:00Z",
-  "head_commit": "1826448",
+  "generated_at": "2026-10-26T12:19:52Z",
+  "head_commit": "420a580",
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -172,7 +172,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:a5be19671c5e7f4b50b1165916e23bd242faad3e99a7e8439d23b4b6b5269628",
+      "hash": "sha256:4ef4db9db0573ea0a4872badbc03f3138f47ee0bcb175f903d8cb6d7d6f68152",
       "id": "live-hardware-field-testing",
       "kind": "howto",
       "links": [
@@ -196,8 +196,8 @@
       ],
       "status": "current",
       "title": "How do I run manta against real RF and trust what it tells me?",
-      "verified_commit": "d286147",
-      "verified_date": "2026-10-13",
+      "verified_commit": "420a580",
+      "verified_date": "2026-10-26",
       "visibility": "public"
     },
     {
@@ -247,7 +247,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:3b3bcc1ad0594f3cd4441ae8a1202798f61b1e3e3705c845e22d47081add9db8",
+      "hash": "sha256:bfd0ed493a94efe1b2374106dedcc1ef22ba037fcb4ccc11d4cce5fafdcae023",
       "id": "replay-spots-harness",
       "kind": "gotcha",
       "links": [
@@ -262,8 +262,8 @@
       ],
       "status": "current",
       "title": "How do you iterate on manta-spot rules without a 6-minute IQ decode?",
-      "verified_commit": "d286147",
-      "verified_date": "2026-10-13",
+      "verified_commit": "420a580",
+      "verified_date": "2026-10-26",
       "visibility": "public"
     },
     {

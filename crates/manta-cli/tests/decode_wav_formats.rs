@@ -80,7 +80,7 @@ fn spot_calls(report: &serde_json::Value) -> Vec<String> {
         .as_array()
         .expect("decode --json output must include a 'spots' array")
         .iter()
-        .map(|s| s["callsign"].as_str().unwrap().to_string())
+        .map(|s| s["dxCall"].as_str().unwrap().to_string())
         .collect()
 }
 

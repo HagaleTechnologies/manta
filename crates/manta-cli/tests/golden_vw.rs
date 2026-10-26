@@ -27,17 +27,17 @@ fn decode_report(
     (serde_json::from_slice(&out.stdout).unwrap(), manifest)
 }
 
-/// Group `report["events"]` by `track_id`: each track's decoded text and
+/// Group `report["events"]` by `trackId`: each track's decoded text and
 /// its last-reported TrackMeta freq_hz. Same shape as golden_vr.rs's
 /// helper of the same name, keyed by track id.
 fn per_track(report: &serde_json::Value) -> BTreeMap<u64, (String, Option<f64>)> {
     let mut texts: BTreeMap<u64, String> = BTreeMap::new();
     let mut freqs: BTreeMap<u64, f64> = BTreeMap::new();
     for ev in report["events"].as_array().unwrap() {
-        let tid = ev["track_id"].as_u64().unwrap();
+        let tid = ev["trackId"].as_u64().unwrap();
         match ev["event"].as_str().unwrap() {
             "CharDecoded" => {
-                if let Some(c) = ev["glyph"]["Char"].as_str() {
+                if let Some(c) = ev["glyph"].as_str().filter(|g| g.chars().count() == 1) {
                     texts.entry(tid).or_default().push_str(c);
                 }
             }
@@ -48,7 +48,7 @@ fn per_track(report: &serde_json::Value) -> BTreeMap<u64, (String, Option<f64>)>
                 }
             }
             "TrackMeta" => {
-                freqs.insert(tid, ev["freq_hz"].as_f64().unwrap());
+                freqs.insert(tid, ev["frequency"].as_f64().unwrap());
             }
             _ => {}
         }
@@ -79,14 +79,14 @@ fn last_timing(report: &serde_json::Value, track_id: u64) -> serde_json::Value {
         .unwrap()
         .iter()
         .rev()
-        .find(|ev| ev["event"] == "TimingUpdate" && ev["track_id"].as_u64() == Some(track_id))
+        .find(|ev| ev["event"] == "TimingUpdate" && ev["trackId"].as_u64() == Some(track_id))
         .unwrap_or_else(|| panic!("track {track_id} emitted no TimingUpdate"))
         .clone()
 }
 
-/// `timing[class].mean_dits`.
+/// `timing[class].meanDits`.
 fn mean_dits(timing: &serde_json::Value, class: &str) -> f64 {
-    timing[class]["mean_dits"]
+    timing[class]["meanDits"]
         .as_f64()
         .unwrap_or_else(|| panic!("no {class} estimate in {timing}"))
 }
@@ -200,15 +200,12 @@ fn decode_single(
         spec.name
     );
     // `decode --json`'s top-level `timing` is the primary track's last
-    // TimingUpdate, without its track_id/sample_ts.
-    for key in [
-        "dit_ms",
-        "dot",
-        "dash",
-        "element_gap",
-        "char_gap",
-        "word_gap",
-    ] {
+    // TimingUpdate, without its trackId/sampleTs.
+    for key in ["ditMs", "dot", "dash", "elementGap", "charGap", "wordGap"] {
+        assert!(
+            !timing[key].is_null(),
+            "TimingUpdate has no {key}: {timing}"
+        );
         assert_eq!(report["timing"][key], timing[key], "top-level timing.{key}");
     }
     (report, keyed, decoded, cer, timing)
@@ -255,9 +252,9 @@ fn vw2_long_gaps_keep_word_boundaries() {
     assert!(cer <= 0.06, "VW2 CER {cer} > 0.06");
     let wb = word_boundary_fraction(&keyed, &decoded);
     assert!(wb >= 0.95, "VW2 word boundaries {wb} < 0.95");
-    let cg = mean_dits(&timing, "char_gap");
+    let cg = mean_dits(&timing, "charGap");
     assert!((4.0..=5.0).contains(&cg), "VW2 learned char gap {cg}");
-    let wg = mean_dits(&timing, "word_gap");
+    let wg = mean_dits(&timing, "wordGap");
     assert!((8.0..=10.0).contains(&wg), "VW2 learned word gap {wg}");
 }
 
@@ -330,12 +327,12 @@ fn vw5_adjacent_senders_keep_their_own_timing() {
             (want_dash.0..=want_dash.1).contains(&dash),
             "VW5 signal {i} learned dash {dash}"
         );
-        let cg = mean_dits(&timing, "char_gap");
+        let cg = mean_dits(&timing, "charGap");
         assert!(
             (want_cg.0..=want_cg.1).contains(&cg),
             "VW5 signal {i} learned char gap {cg}"
         );
-        for key in ["dot", "element_gap", "word_gap"] {
+        for key in ["dot", "elementGap", "wordGap"] {
             assert!(
                 timing[key]["n"].as_u64().unwrap_or(0) > 0,
                 "signal {i}: no {key}"

@@ -1534,9 +1534,15 @@ TimingUpdate   { track_id, sample_ts: u64, dit_ms: f32, dot, dash, element_gap,
 ```
 
 `manta decode --json` also reports the primary track's last `TimingUpdate`
-(without `track_id`/`sample_ts`) as the top-level `timing`, and
+(without `trackId`/`sampleTs`) as the top-level `timing`, and
 `manta decode --timing` prints it on stderr, after the summary line, as
 `timing (dits, mean ± sd): dot … dash … element gap … char gap … word gap …`.
+
+In `manta decode --json` and `run --json` these fields are camelCase.
+`TrackMeta`'s `snr_2500_db` is `snr`, and its `freq_centroid` and
+`TrackPromoted`'s `freq_hz` are `frequency`; a glyph is its character or
+§4.4 token; `closure` is `signalEnded` or `bookkeeping` beside
+`survivorTrackId`. [CLI-JSON.md](CLI-JSON.md) lists every key.
 
 `TrackMeta.snr_2500_db` is §2.3's floor-based `S − F` estimate (peak-held
 over the reporting interval, per §2.3), supplied by the detector layer that

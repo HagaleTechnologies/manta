@@ -777,9 +777,11 @@ SIGINT or SIGTERM twice: the second ends manta at once, without the drain
 See [closed or stalled output](docs/DECISIONS/2026-10-14-man232-closed-and-stalled-output.md).
 
 `decode` prints decoded text on stdout and a measurement summary on stderr.
-`run --json` and `decode --json` keep full-precision JSON on stdout. This
-terminal output is a debugging aid, not a stable interface — the servers above
-are. Human units, report streams and error conventions are defined in the
+`run --json` and `decode --json` keep full-precision JSON on stdout. Their
+fields, and those of `doctor --json`, are listed in
+[docs/CLI-JSON.md](docs/CLI-JSON.md). This terminal output is a debugging
+aid, not a stable interface — the servers above are. Human units, report
+streams and error conventions are defined in the
 [command output style decision](docs/DECISIONS/2026-10-10-man270-cli-output-style.md).
 
 The decode path is deterministic: the same file in produces byte-identical

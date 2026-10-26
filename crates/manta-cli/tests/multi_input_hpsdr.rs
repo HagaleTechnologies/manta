@@ -471,7 +471,7 @@ fn four_bands_tune_four_receivers_and_share_stdout_json_and_health() {
             let spots = daemon.output.lock().unwrap();
             CALLS
                 .iter()
-                .all(|call| spots.iter().any(|s| s["callsign"] == *call))
+                .all(|call| spots.iter().any(|s| s["dxCall"] == *call))
         },
         || {
             format!(
@@ -483,9 +483,9 @@ fn four_bands_tune_four_receivers_and_share_stdout_json_and_health() {
     );
     for (i, call) in CALLS.iter().enumerate() {
         let spots = daemon.output.lock().unwrap();
-        let spot = spots.iter().find(|s| s["callsign"] == *call).unwrap();
+        let spot = spots.iter().find(|s| s["dxCall"] == *call).unwrap();
         assert!(
-            (spot["freq_hz"].as_f64().unwrap() - (f64::from(FREQUENCIES[i]) + 12340.0)).abs()
+            (spot["frequency"].as_f64().unwrap() - (f64::from(FREQUENCIES[i]) + 12340.0)).abs()
                 < 100.0,
             "{spot}"
         );
@@ -632,7 +632,7 @@ fn a_radio_outage_preserves_other_radio_output_and_restores_transformed_receiver
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|s| s["callsign"] == "JA1ABC")
+                .any(|s| s["dxCall"] == "JA1ABC")
         },
         || daemon.errors.lock().unwrap().clone(),
     );
@@ -641,11 +641,11 @@ fn a_radio_outage_preserves_other_radio_output_and_restores_transformed_receiver
         .lock()
         .unwrap()
         .iter()
-        .find(|s| s["callsign"] == "JA1ABC")
+        .find(|s| s["dxCall"] == "JA1ABC")
         .unwrap()
         .clone();
     assert!(
-        (spot["freq_hz"].as_f64().unwrap() - 7112340.0 * 1.0001).abs() < 100.0,
+        (spot["frequency"].as_f64().unwrap() - 7112340.0 * 1.0001).abs() < 100.0,
         "{spot}"
     );
     assert_eq!(radio.generations().len(), 1);
@@ -664,7 +664,7 @@ fn a_radio_outage_preserves_other_radio_output_and_restores_transformed_receiver
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|s| s["callsign"] == "VK2ABC")
+                .any(|s| s["dxCall"] == "VK2ABC")
         },
         || daemon.errors.lock().unwrap().clone(),
     );
@@ -687,7 +687,7 @@ fn a_radio_outage_preserves_other_radio_output_and_restores_transformed_receiver
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|s| s["callsign"] == "DL1ABC")
+                .any(|s| s["dxCall"] == "DL1ABC")
         },
         || daemon.errors.lock().unwrap().clone(),
     );
@@ -696,11 +696,11 @@ fn a_radio_outage_preserves_other_radio_output_and_restores_transformed_receiver
         .lock()
         .unwrap()
         .iter()
-        .find(|s| s["callsign"] == "DL1ABC")
+        .find(|s| s["dxCall"] == "DL1ABC")
         .unwrap()
         .clone();
     assert!(
-        (spot["freq_hz"].as_f64().unwrap() - 7112340.0 * 1.0001).abs() < 100.0,
+        (spot["frequency"].as_f64().unwrap() - 7112340.0 * 1.0001).abs() < 100.0,
         "{spot}"
     );
     let sessions = radio.generations();

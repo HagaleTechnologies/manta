@@ -108,8 +108,8 @@ fn ok(name: &str, out: &Output) -> (String, String) {
 
 const ONE_BAD: &str = "1 bad sample (NaN, infinite, or larger than 1e17 in magnitude)";
 
-/// The `(event, track_id, sample_ts, glyph)` identity of one `run --json`
-/// or `decode --json` event, plus its `sample_ts` when it has one.
+/// The `(event, trackId, sampleTs, glyph)` identity of one `run --json`
+/// or `decode --json` event, plus its `sampleTs` when it has one.
 fn identity(v: &serde_json::Value) -> (String, Option<u64>, Option<u64>, Option<String>) {
     // Decoder events are tagged `{"event":"TrackMeta",...}`; a spot line is
     // `{"spot":{...}}`.
@@ -120,8 +120,8 @@ fn identity(v: &serde_json::Value) -> (String, Option<u64>, Option<u64>, Option<
     };
     (
         event,
-        body.get("track_id").and_then(|x| x.as_u64()),
-        body.get("sample_ts").and_then(|x| x.as_u64()),
+        body.get("trackId").and_then(|x| x.as_u64()),
+        body.get("sampleTs").and_then(|x| x.as_u64()),
         body.get("glyph").map(|g| g.to_string()),
     )
 }
@@ -159,9 +159,9 @@ fn decode_json_reports_bad_samples_only_when_nonzero() {
         serde_json::from_str(stdout.trim()).unwrap()
     };
     let clean = json("clean", &fixtures[0].1);
-    assert!(clean.get("bad_samples").is_none(), "{clean}");
+    assert!(clean.get("badSamples").is_none(), "{clean}");
     let nan = json("nan_mid", &fixtures[1].1);
-    assert_eq!(nan["bad_samples"], 1);
+    assert_eq!(nan["badSamples"], 1);
 
     let (clean_obj, nan_obj) = (clean.as_object().unwrap(), nan.as_object().unwrap());
     for (key, want) in clean_obj {
@@ -252,7 +252,7 @@ fn doctor_verdict_survives_a_bad_sample_before_any_track() {
     assert!(!clean.contains("input:"), "{clean}");
     let clean_json: serde_json::Value =
         serde_json::from_str(doctor("clean", &fixtures[0].1, true).trim()).unwrap();
-    assert!(clean_json.get("bad_samples").is_none(), "{clean_json}");
+    assert!(clean_json.get("badSamples").is_none(), "{clean_json}");
     for (name, path) in &fixtures[1..] {
         let report = doctor(name, path, false);
         assert_eq!(verdict(&report), clean_verdict, "{name}:\n{report}");
@@ -263,7 +263,7 @@ fn doctor_verdict_survives_a_bad_sample_before_any_track() {
         );
         let json: serde_json::Value =
             serde_json::from_str(doctor(name, path, true).trim()).unwrap();
-        assert_eq!(json["bad_samples"], 1, "{name}: {json}");
+        assert_eq!(json["badSamples"], 1, "{name}: {json}");
     }
 }
 
