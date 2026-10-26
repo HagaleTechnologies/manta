@@ -254,7 +254,7 @@ jobs:
       # pull_request runs restore and never save. Not a security boundary on its own -- code
       # running in a job can reach the cache credentials -- which is why wait-for-codex.yml only
       # dispatches trusted heads.
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.1
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2.9.1
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
@@ -401,7 +401,7 @@ jobs:
         with:
           components: rustfmt, clippy
       # MAN-243: same restore-only rule as `test`'s cache step.
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.1
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2.9.1
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           env-vars: SOAPYSDR_BREW_VERSION
