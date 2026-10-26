@@ -948,11 +948,10 @@ def summarize(records, params=None):
     for a, b in zip(samples, samples[1:]):
         if b["ts"] < start or a["ts"] > end:
             continue
-        if b["ts"] - a["ts"] > gap_limit:
-            segs.append([a["ts"], b["ts"], "unobserved", 0.0, False])
-            continue
         sa, sb = a.get("start_time"), b.get("start_time")
-        if sa is not None and sb is not None and sa != sb:
+        same = sa is not None and sa == sb
+        long_gap = b["ts"] - a["ts"] > gap_limit
+        if not long_gap and sa is not None and sb is not None and sa != sb:
             # The process restarted inside (a.ts, b.ts]: it was down from
             # some point after a until the new process started at sb, and
             # that point is unobserved, so count all of (a.ts, sb] as down
@@ -964,23 +963,24 @@ def summarize(records, params=None):
             else:
                 segs.append([a["ts"], b["ts"], "down", 0.0, False])
             continue
-        same = sa is not None and sa == sb
         delta, _ = _counter_delta(a.get("source_down_s"), b.get("source_down_s")) if same else (0.0, {})
-        if _is_up(a):
+        if not long_gap and _is_up(a):
             seg = [a["ts"], b["ts"], "up", delta, same]
         else:
-            seg = [a["ts"], b["ts"], "down", 0.0, same]
+            seg = [a["ts"], b["ts"], "unobserved" if long_gap else "down", 0.0, same]
             if same and delta > 0:
                 # An outage that ended inside (a.ts, b.ts] but began before
                 # a: its completed counter delta lands on this pair while
-                # the contiguous unhealthy run back to the last healthy
-                # sample is already counted down. Move the remainder out
+                # the contiguous same-process down/unobserved run back to
+                # the last healthy sample is already unavailable. Keep
+                # gaps unobserved and move only the uncovered remainder out
                 # of the healthy interval just before that run, where the
-                # outage must have started (PR #219 review).
+                # outage must have started (PR #219 review, MAN-292).
                 run = seg[1] - seg[0]
                 j = len(segs) - 1
                 edge = seg[0]
-                while j >= 0 and segs[j][2] == "down" and segs[j][4] and segs[j][1] == edge:
+                while (j >= 0 and segs[j][2] in ("down", "unobserved")
+                       and segs[j][4] and segs[j][1] == edge):
                     run += segs[j][1] - segs[j][0]
                     edge = segs[j][0]
                     j -= 1
