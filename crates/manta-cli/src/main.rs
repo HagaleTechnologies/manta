@@ -5513,7 +5513,12 @@ where
         // connect/read window, so `--timeout-secs 5` could take nearly ten
         // seconds -- twice the give-up bound the flag advertises, and twice
         // what a cron/Nagios check budgeted for.
-        let deadline = tokio::time::Instant::now() + timeout;
+        // MAN-282: a clap-valid but unrepresentable `--timeout-secs`
+        // (u64::MAX overflows every platform's `Instant`) must fail
+        // through the command's own error path, not panic here.
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| anyhow!("invalid --timeout-secs {timeout_secs}: too large"))?;
         let targets = tokio::time::timeout_at(
             deadline,
             tokio::task::spawn_blocking(move || {
