@@ -2172,7 +2172,7 @@ impl Metrics {
             ),
             (
                 "manta_input_silent",
-                "# HELP manta_input_silent 1 when this input decoded no spots for silent_input_warning_secs while another input did decode in that window, else 0. Delivery health stays manta_source_health.\n\
+                "# HELP manta_input_silent 1 when this input published no spots and lost no cross-input dedupes for silent_input_warning_secs while another input published a spot in that window, else 0. Unhealthy delivery clears silence; delivery health stays manta_source_health.\n\
                  # TYPE manta_input_silent gauge\n",
                 |r| u64::from(r.silent),
             ),
@@ -2776,6 +2776,7 @@ mod tests {
     fn input_hearing_families_are_labelled_eager_and_never_go_backwards() {
         let m = Metrics::new();
         let text = m.render_prometheus_text();
+        assert!(text.contains("# HELP manta_input_silent 1 when this input published no spots and lost no cross-input dedupes for silent_input_warning_secs while another input published a spot in that window, else 0. Unhealthy delivery clears silence; delivery health stays manta_source_health.\n"));
         for (family, kind) in [
             ("manta_input_spots_total", "counter"),
             ("manta_input_distinct_calls_total", "counter"),
