@@ -30,6 +30,7 @@ Add a row here in the same change that adds a record:
 | 2026-10-23 | MAN-120 | [MAN-120: dedupe edge hysteresis, a beacon fading regression, the σ invariance pin, and shared frequency-joined CER](2026-10-23-man120-dedupe-beacon-sigma-cer-cleanup.md) |
 | 2026-10-23 | MAN-173 | [MAN-173: a word-boundary gate fails a decode that adds word breaks](2026-10-23-man173-word-boundaries-count-extra-splits.md) |
 | 2026-10-22 | MAN-94 | [MAN-94: an NCDXF/IARU beacon spot reads `NCDXF B` on the wire](2026-10-22-man94-ncdxf-beacon-label.md) |
+| 2026-10-21 | MAN-372 | [MAN-372: zero in-band tracks from SSB voice at +30/+45 dB; narrow sibling regions require shared modulation](2026-10-21-man372-speech-band-veto.md) |
 | 2026-10-20 | MAN-340 | [MAN-340: a dispatched CI run tests the PR head merged with the main commit its workflow came from](2026-10-20-man340-dispatched-ci-tests-the-merge-with-main.md) |
 | 2026-10-19 | MAN-334 | [MAN-334: calibrate plans its references before it opens the receiver](2026-10-19-man334-calibrate-plans-before-opening.md) |
 | 2026-10-19 | MAN-319 | [MAN-319: the live uplink needs a 6-character locator now; the registration exchange waits for MAN-90's capture](2026-10-19-man319-uplink-registration-exchange.md) |
