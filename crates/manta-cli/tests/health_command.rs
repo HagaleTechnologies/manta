@@ -155,6 +155,30 @@ fn health_against_a_closed_port_exits_one_not_two() {
     assert!(stderr(&o).starts_with("manta health: "), "{}", stderr(&o));
 }
 
+/// MAN-282: `manta health` shares `query_daemon`'s deadline, so an
+/// absurd `--timeout-secs` must exit 1 (never 2 -- Docker reserves
+/// it) with a plain message, not panic.
+#[test]
+fn health_with_an_absurd_timeout_secs_exits_one_not_two() {
+    let out = manta()
+        .args([
+            "health",
+            "--addr",
+            "127.0.0.1:1",
+            "--timeout-secs",
+            "18446744073709551615",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("invalid --timeout-secs"),
+        "expected a plain invalid --timeout-secs message, got: {stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "must not panic: {stderr}");
+}
+
 #[test]
 fn health_with_a_missing_config_exits_one_and_names_the_path() {
     let missing = "/nonexistent/manta.toml";
