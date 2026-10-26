@@ -517,7 +517,8 @@ fn load_node_spots(paths: &[PathBuf]) -> Result<(Vec<(String, GradeInput)>, Spot
 }
 
 /// The RBN CSV columns `manta grade` cannot work without
-/// (`shadow-compare.py`'s `RBN_REQUIRED_COLUMNS`).
+/// (`shadow-compare.py`'s `RBN_REQUIRED_COLUMNS` less `tx_mode`, which only
+/// that script requires: MAN-290).
 const RBN_REQUIRED_COLUMNS: [&str; 4] = ["callsign", "freq", "dx", "date"];
 
 /// RBN daily-dump CSVs to CW reports, one list per file (`grade_batch`
