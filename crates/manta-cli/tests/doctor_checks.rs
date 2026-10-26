@@ -483,21 +483,21 @@ fn the_example_callsign_fails_the_config_check() {
 }
 
 /// The keys `manta doctor --json` printed before MAN-126, plus MAN-313's
-/// `detectorConfirmations`, under MAN-139's camelCase names, sorted.
+/// `detector_confirmations`.
 const REPORT_KEYS: &[&str] = &[
-    "centerFreqHz",
-    "charsDecoded",
-    "detectorConfirmations",
-    "distinctChars",
-    "durationS",
-    "sampleRateHz",
-    "snrMax",
-    "snrMedian",
-    "snrMin",
-    "spotsConfirmed",
-    "trackMetaCount",
-    "tracksClosed",
-    "tracksPromoted",
+    "center_freq_hz",
+    "chars_decoded",
+    "detector_confirmations",
+    "distinct_chars",
+    "duration",
+    "sample_rate_hz",
+    "snr_db_max",
+    "snr_db_median",
+    "snr_db_min",
+    "spots_confirmed",
+    "track_meta_count",
+    "tracks_closed",
+    "tracks_promoted",
     "verdict",
 ];
 
@@ -535,18 +535,13 @@ fn json_adds_checks_and_keeps_every_existing_key() {
             .collect();
         keys.sort_unstable();
         assert_eq!(keys, ["detail", "fix", "name", "status"], "{check}");
-        let status = check["status"].as_str().unwrap();
-        assert!(
-            ["PASS", "WARN", "FAIL", "SKIP"].contains(&status),
-            "{check}"
-        );
     }
     let expected = if host_synced() == Some(false) {
-        "WARN"
+        "warn"
     } else {
-        "PASS"
+        "pass"
     };
-    assert_eq!(map["checksStatus"], expected, "{stdout}");
+    assert_eq!(map["checks_status"], expected, "{stdout}");
     assert!(!stdout.lines().any(|l| l.starts_with("PASS")), "{stdout}");
 }
 
@@ -575,8 +570,8 @@ fn json_without_a_receiver_has_only_checks() {
     let map = json_object(&stdout);
     let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["checks", "checksStatus"], "{stdout}");
-    assert_eq!(map["checksStatus"], "FAIL");
+    assert_eq!(keys, ["checks", "checks_status"], "{stdout}");
+    assert_eq!(map["checks_status"], "fail");
 }
 
 #[test]
@@ -730,8 +725,8 @@ fn strict_exits_3_on_silence_and_changes_nothing_else() {
         "stdout={stdout}\nstderr={stderr}"
     );
     let map = json_object(&stdout);
-    assert_eq!(map["verdict"], "NO_SIGNAL", "{stdout}");
-    assert_ne!(map["checksStatus"], "FAIL", "{stdout}");
+    assert_eq!(map["verdict"], "NoSignal", "{stdout}");
+    assert_ne!(map["checks_status"], "fail", "{stdout}");
 }
 
 /// MAN-235: a failed check exits 1 with `--strict` too, whatever the

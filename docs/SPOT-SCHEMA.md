@@ -226,10 +226,8 @@ MINOR version.
 
 ## Not this schema
 
-- `manta decode --json` and `manta run --json` print a debugging format
-  with the same field names for shared concepts, but unrounded and without
-  the spot's identity and geography fields. It is listed in
-  [CLI-JSON.md](CLI-JSON.md), not here.
+- `manta decode --json` and `manta run --json` print a debugging format.
+  That format is not stable and is not described here.
 - The live-state stream on `[server].live_port` (band noise floor, each
   track's text and candidates, and every validation decision) is a
   separate listener with its own record kinds; this stream never carries

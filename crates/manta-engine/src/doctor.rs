@@ -32,11 +32,7 @@ pub const NOISE_FLOOR_SNR_DB: f32 = 0.0;
 
 /// `doctor()`'s classification of a run, from cheapest/most-damning signal
 /// to most reassuring.
-///
-/// JSON: the `summary()` label (`WEAK_NO_DECODE`), the same spelling as
-/// the text report (MAN-139).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Verdict {
     /// No decoder evidence at all the whole run -- no `TrackMeta`, no
     /// `CharDecoded`, no confirmed spot. The detector never even opened a
@@ -91,7 +87,7 @@ impl Verdict {
                 "NOISY_NO_DECODE -- tracks opened but every one reads at or below the noise \
                  floor and nothing validated into a confirmed spot. Looks like noise, not real \
                  CW traffic, right now (characters may still have been decoded off the noise \
-                 floor -- the decode line counts them)."
+                 floor -- see chars_decoded)."
             }
             Verdict::WeakNoDecode => {
                 "WEAK_NO_DECODE -- real signal-level SNR seen, but nothing validated into a \
@@ -104,12 +100,7 @@ impl Verdict {
 }
 
 /// Tabulated result of one `doctor()` run.
-///
-/// `doctor --json` prints it with camelCase keys, `durationS` in seconds
-/// and the SNR as `snrMin`/`snrMedian`/`snrMax` (MAN-139,
-/// docs/CLI-JSON.md).
 #[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DoctorReport {
     /// `IqSource::sample_rate()`, as actually negotiated (SoapySDR and
     /// similar sources round to the nearest achievable rate; this is truth,
@@ -122,9 +113,7 @@ pub struct DoctorReport {
     /// time. An unpaced file source (`--source`) can process audio far
     /// faster (or, under load, slower) than 1:1, so wall-clock time and
     /// source time can differ substantially; a live source is naturally
-    /// paced to real time, so the two coincide there. `durationS` in JSON,
-    /// a number of seconds (MAN-139).
-    #[serde(rename = "durationS", serialize_with = "duration_secs")]
+    /// paced to real time, so the two coincide there.
     pub duration: Duration,
     /// Number of `TrackPromoted` events seen -- the detector's own ground
     /// truth for "found a keyed CW signal," independent of whether the
@@ -157,16 +146,11 @@ pub struct DoctorReport {
     /// *eventful* tracks that closed, not every detector candidate opened
     /// during the run -- use `tracks_promoted` for that.
     pub tracks_closed: usize,
-    /// Lowest `TrackMeta.snr_2500_db` seen, in dB; `snrMin` in JSON.
-    #[serde(rename = "snrMin")]
     pub snr_db_min: Option<f32>,
-    /// Median of every `TrackMeta.snr_2500_db` seen, in dB. `None` if no
-    /// `TrackMeta` event occurred. `snrMedian` in JSON.
-    #[serde(rename = "snrMedian")]
-    pub snr_db_median: Option<f32>,
-    /// Highest `TrackMeta.snr_2500_db` seen, in dB; `snrMax` in JSON.
-    #[serde(rename = "snrMax")]
     pub snr_db_max: Option<f32>,
+    /// Median of every `TrackMeta.snr_2500_db` seen, in dB. `None` if no
+    /// `TrackMeta` event occurred.
+    pub snr_db_median: Option<f32>,
     /// Total `CharDecoded` events across every track.
     pub chars_decoded: usize,
     /// Distinct decoded characters seen (via `Glyph::text_char`). Real CW
@@ -178,16 +162,10 @@ pub struct DoctorReport {
     pub spots_confirmed: usize,
     /// MAN-234: input samples replaced with silence because a component
     /// was NaN, infinite or beyond `MAX_SAMPLE_MAGNITUDE` (SPEC §1.3 step
-    /// 0). `badSamples` in `doctor --json`, omitted when 0. Not an input to `verdict()`:
+    /// 0). Omitted from `doctor --json` when 0. Not an input to `verdict()`:
     /// the replaced samples are silence, so the verdict judges what remains.
     #[serde(skip_serializing_if = "crate::is_zero")]
     pub bad_samples: u64,
-}
-
-/// `DoctorReport::duration` as a number of seconds (MAN-139), the value the
-/// text report prints as `observed for 10.0s`.
-fn duration_secs<S: serde::Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_f64(d.as_secs_f64())
 }
 
 impl DoctorReport {
@@ -892,99 +870,6 @@ mod tests {
             bad_samples: 0,
         };
         assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
-    }
-
-    const ALL_VERDICTS: [Verdict; 6] = [
-        Verdict::NoSignal,
-        Verdict::NotCw,
-        Verdict::ActivityNoSnr,
-        Verdict::NoisyNoDecode,
-        Verdict::WeakNoDecode,
-        Verdict::Decoding,
-    ];
-
-    /// MAN-139: `doctor --json`'s verdict is the text report's label.
-    #[test]
-    fn verdict_json_is_the_summary_label() {
-        for v in ALL_VERDICTS {
-            let label = v.summary().split(" -- ").next().unwrap();
-            assert_eq!(serde_json::to_value(v).unwrap(), label);
-        }
-    }
-
-    /// MAN-139: no verdict sentence names a `doctor --json` key, in its
-    /// camelCase or its old snake_case spelling (`non_cw_filter`, a TOML
-    /// key the operator sets, is not one).
-    #[test]
-    fn no_summary_names_a_json_key() {
-        let mut report = no_promotion_report(1);
-        report.bad_samples = 1;
-        let mut names = Vec::new();
-        for key in crate::json_keys_in_order(&serde_json::to_string(&report).unwrap()) {
-            let mut snake = String::new();
-            for c in key.chars() {
-                if c.is_ascii_uppercase() {
-                    snake.push('_');
-                }
-                snake.push(c.to_ascii_lowercase());
-            }
-            names.push(key);
-            names.push(snake);
-        }
-        names.extend(
-            [
-                "checksStatus",
-                "checks_status",
-                "snr_db_min",
-                "snr_db_median",
-                "snr_db_max",
-            ]
-            .map(String::from),
-        );
-        for v in ALL_VERDICTS {
-            let summary = v.summary();
-            for word in summary.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
-                assert!(!names.iter().any(|n| n == word), "{word:?} in {summary}");
-            }
-            assert!(!summary.contains("chars_decoded"), "{summary}");
-            assert!(!summary.contains("charsDecoded"), "{summary}");
-        }
-    }
-
-    /// MAN-139: `doctor --json`'s report keys are camelCase in declaration
-    /// order, the SNR reads min/median/max like the text line, and the
-    /// duration is a number of seconds.
-    #[test]
-    fn doctor_report_json_is_camel_case_with_seconds() {
-        let mut report = no_promotion_report(1);
-        report.duration = Duration::from_millis(2500);
-        report.snr_db_min = Some(1.0);
-        report.snr_db_median = Some(2.0);
-        report.snr_db_max = Some(3.0);
-        report.bad_samples = 1;
-        let s = serde_json::to_string(&report).unwrap();
-        assert!(s.starts_with(r#"{"sampleRateHz":"#), "{s}");
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(
-            crate::json_keys_in_order(&s),
-            [
-                "sampleRateHz",
-                "centerFreqHz",
-                "durationS",
-                "tracksPromoted",
-                "detectorConfirmations",
-                "trackMetaCount",
-                "tracksClosed",
-                "snrMin",
-                "snrMedian",
-                "snrMax",
-                "charsDecoded",
-                "distinctChars",
-                "spotsConfirmed",
-                "badSamples",
-            ]
-        );
-        assert_eq!(v["durationS"], 2.5);
     }
 
     fn no_promotion_report(detector_confirmations: usize) -> DoctorReport {

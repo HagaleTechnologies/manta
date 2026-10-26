@@ -10,8 +10,8 @@ fn one() -> f32 {
 /// Decoder output events, in emission order. SPEC §5.
 ///
 /// The JSON form (`decode --json`, `run --json`) has camelCase fields, with
-/// the JSON stream's names for shared concepts (MAN-139,
-/// docs/CLI-JSON.md); the `event` tag keeps SPEC §5's variant names.
+/// the JSON stream's names for shared concepts (MAN-139); the `event` tag
+/// keeps SPEC §5's variant names.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "event", rename_all_fields = "camelCase")]
 pub enum DecoderEvent {
