@@ -214,6 +214,9 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-249: `manta oracle --spotter` has no default and must name the
+  reference skimmer's callsign; without it `oracle` exits 2 with a usage
+  error.
 - MAN-319: a live `[[rbn_uplink]]` (`dry_run = false`) also needs
   `[server].operator_grid` set to a 6-character Maidenhead locator (e.g.
   `"FN03ab"`). `config check`, `run`, `doctor` and a SIGHUP reload refuse a

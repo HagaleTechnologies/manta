@@ -106,8 +106,8 @@ recording before uploading it. WPX and VP8GEO are not pinned yet.
 
 ## 3. Hosting after rights are confirmed
 
-Nothing is uploaded until George K5TR's redistribution permission is
-recorded. Do the steps in order.
+Nothing is uploaded until the volunteer operator's redistribution
+permission is recorded. Do the steps in order.
 
 1. Record the permission in the corpus README's *Provenance and licensing*
    section, and merge that change. If the permission covers only some

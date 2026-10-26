@@ -54,13 +54,14 @@ Decisions:
   yet.
 - `vp8geo_cw.mp3` (1.2 MB) — the original capture. ~5 min CW pileup on
   VP8GEO, listener tuning around within an SSB-bandwidth (~2.4-3 kHz)
-  capture, with wideband noise present. Source: George, 2026-09-02.
+  capture, with wideband noise present. Source: a volunteer operator,
+  2026-09-02.
   Not committed pending confirmed redistribution rights (see Provenance
   and licensing below) — regenerate the WAV above from a local copy.
 - `wpx_cw_iq_96khz.wav` (389 MB) — WPX CW contest capture, last 10
   minutes, 96 kHz, 24-bit stereo. Likely a true I/Q capture (stereo
-  channels = I/Q), per George: "different stuff." Original filename
-  `WPXCWLast10min96KHz.wav`, dated 2008-06-08. Source: George,
+  channels = I/Q), per the operator: "different stuff." Original filename
+  `WPXCWLast10min96KHz.wav`, dated 2008-06-08. Source: the operator,
   2026-09-02. Not committed: too large for this repo's git history
   without LFS. `manta decode` reads it as received: `WavIqSource` reads
   24-bit PCM and streams the file, so no conversion is needed and memory
@@ -73,7 +74,7 @@ Decisions:
   PCM24 @ 192 kHz, 00:14:59), captured by CWSL (`HrochL/CWSL`, per the
   file's own `encoder` RIFF chunk). Its embedded metadata gives capture
   start `2025-11-29 00:00:00 UTC` and center frequency 7,080,000 Hz.
-  Source: George K5TR, received 2026-09-06. SHA-256
+  Source: the operator, received 2026-09-06. SHA-256
   `74eba71e00fede9cab8067f9ff5a043396066015bbf8c23232788279b9f1c5f2`,
   pinned in `manifest.json`. This file is the benchmark input: `manta
   decode` reads it natively (24-bit, streamed, native 192 kHz), and
@@ -110,8 +111,8 @@ straight from real skimmers copying the real air during CQ WW CW 2025.
 Score a `manta decode --json` report against it with
 `scripts/score-against-rbn.py` (repo root); see that script's docstring
 for usage, including `--spotter`/`--min-spotters` filtering -- spotter
-filtering is useful for co-located reference validation (K5TR's signal
-path is nearly identical to manta's hardware); consensus filtering
+filtering is useful for co-located reference validation (the co-located
+skimmer's signal path is nearly identical to manta's hardware); consensus filtering
 (multi-spotter agreement) is useful for rejecting receiver artifacts that
 don't appear on multiple independent systems. This is the ARCHITECTURE.md
 §9 "Golden IQ corpus" benchmark (recorded band segment + RBN's own spots
@@ -178,11 +179,11 @@ decode ever captured (not a repetition/tracking problem) -- pointing at
 raw decode-core accuracy under genuine HF noise as the dominant remaining
 gap. Both folded into MAN-166 as open follow-up work.
 
-**Legacy-vs-hsmm and K5TR-only comparison**: see
+**Legacy-vs-hsmm and single co-located spotter comparison**: see
 `docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md` §2 for the
 canonical follow-up measurement against this same recording (MAN-166's
-decode-core-v2 stage-2 gate) -- both engines, both K5TR-only and all-RBN
-recall/precision. Its all-RBN legacy figures (59/1441 = 4.09% recall,
+decode-core-v2 stage-2 gate) -- both engines, both single co-located
+spotter and all-RBN recall/precision. Its all-RBN legacy figures (59/1441 = 4.09% recall,
 197 spots -> 29.95% precision) are the same measurement as the baseline
 above, to within rounding; don't duplicate a second, independently-drifting
 copy of these numbers here -- point to that doc instead.
@@ -220,8 +221,8 @@ Example:
 ```
 start_s,end_s,pitch_hz,text
 12.4,15.9,640,VP8GEO UP
-16.2,17.5,710,K5TR
-18.0,20.1,640,K5TR 5NN
+16.2,17.5,710,N0ABC
+18.0,20.1,640,N0ABC 5NN
 ```
 
 `scripts/score-transcript.py` scores a `manta run --source <file> --json`
@@ -236,11 +237,14 @@ No transcript exists yet.
 
 ## Provenance and licensing
 
-`vp8geo_cw.mp3` and `wpx_cw_iq_96khz.wav` were received from George on
-2026-09-02; `B2_20251129_000000_7080kHz.wav` was received from George
-K5TR on 2026-09-06 — same source. All as real-radio test material for the
-manta audio corpus. **Redistribution rights are not established** for any
-of them: provenance is recorded as George (K5TR) only, with no confirmed
+`vp8geo_cw.mp3`, `wpx_cw_iq_96khz.wav` and
+`B2_20251129_000000_7080kHz.wav` all came from one volunteer operator: the
+first two received on 2026-09-02, B2 on 2026-09-06. The maintainers hold
+the operator's contact details; the operator is not named here because
+consent to be named is not recorded (MAN-249). All as real-radio test
+material for the manta audio corpus.
+**Redistribution rights are not established** for any of them: provenance
+is recorded as that one operator only, with no confirmed
 ownership/authorship of the recordings and no explicit license or
 permission for redistribution under this repo's MIT/Apache-2.0 dual
 license. Unlike the vendored data documented in
@@ -248,6 +252,6 @@ license. Unlike the vendored data documented in
 basis for redistributing the recordings — so the audio stays off git
 entirely (not just out of this PR) until that's confirmed. If rights get
 confirmed later, update this section with the license/permission
-statement before re-adding a file to git. That statement (George K5TR's
+statement before re-adding a file to git. That statement (the operator's
 redistribution permission) must be recorded here before any recording is
 uploaded to a public host or `MANTA_CORPUS_BASE_URL` is set.
