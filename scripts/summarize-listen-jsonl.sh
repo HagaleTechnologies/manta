@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Summarize one `manta listen --json` capture into the same shape as
-# `manta doctor`'s report (chars/distinct-chars/tracks/SNR stats, each
-# labelled with its `doctor --json` key), plus every confirmed Spot's
-# full content -- something `doctor` deliberately doesn't expose
-# (crates/manta-engine/src/doctor.rs discards the spot in its callback,
-# `|_spot| spots_confirmed += 1`, and only counts it).
+# `manta doctor`'s report (chars/distinct-chars/tracks/SNR stats), plus
+# every confirmed Spot's full content -- something `doctor` deliberately
+# doesn't expose (crates/manta-engine/src/doctor.rs discards the spot in
+# its callback, `|_spot| spots_confirmed += 1`, and only counts it).
 #
 # Use this after a live-hardware field-test capture (see
 # wiki/pages/live-hardware-field-testing.md) to see what `doctor` can only
@@ -30,13 +29,13 @@ if [ $# -ne 1 ]; then
 fi
 file="$1"
 
-echo "charsDecoded:   $(grep -c '"event":"CharDecoded"' "$file" || true)"
+echo "chars_decoded:   $(grep -c '"event":"CharDecoded"' "$file" || true)"
 # A glyph is one character or a prosign token such as "<SK>"; count only
-# the characters, as doctor's distinctChars does.
-echo "distinctChars:  $(jq -c 'select(.event == "CharDecoded") | .glyph | select(length == 1)' "$file" | sort -u | wc -l | tr -d ' ')"
-echo "tracksPromoted: $(grep -c '"event":"TrackPromoted"' "$file" || true)"
-echo "tracksClosed:   $(grep -c '"event":"TrackClosed"' "$file" || true)"
-echo "trackMetaCount: $(grep -c '"event":"TrackMeta"' "$file" || true)"
+# the characters, as doctor's distinct_chars does.
+echo "distinct_chars:  $(jq -c 'select(.event == "CharDecoded") | .glyph | select(length == 1)' "$file" | sort -u | wc -l | tr -d ' ')"
+echo "tracks_promoted: $(grep -c '"event":"TrackPromoted"' "$file" || true)"
+echo "tracks_closed:   $(grep -c '"event":"TrackClosed"' "$file" || true)"
+echo "track_meta_count: $(grep -c '"event":"TrackMeta"' "$file" || true)"
 
 # Bounded-memory median: stream the raw file line-by-line (jq -c, never
 # -s/--slurp) so the dominant CharDecoded/WordBoundary/TrackMeta volume of

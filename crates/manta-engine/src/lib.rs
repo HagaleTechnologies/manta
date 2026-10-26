@@ -221,8 +221,7 @@ impl Default for PipelineConfig {
 
 /// Result of decoding one signal from an IQ scene. SPEC §5.
 ///
-/// `decode --json` prints it; its keys are camelCase (MAN-139,
-/// docs/CLI-JSON.md).
+/// `decode --json` prints it; its keys are camelCase (MAN-139).
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DecodeReport {

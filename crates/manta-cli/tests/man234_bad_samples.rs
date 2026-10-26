@@ -252,7 +252,7 @@ fn doctor_verdict_survives_a_bad_sample_before_any_track() {
     assert!(!clean.contains("input:"), "{clean}");
     let clean_json: serde_json::Value =
         serde_json::from_str(doctor("clean", &fixtures[0].1, true).trim()).unwrap();
-    assert!(clean_json.get("badSamples").is_none(), "{clean_json}");
+    assert!(clean_json.get("bad_samples").is_none(), "{clean_json}");
     for (name, path) in &fixtures[1..] {
         let report = doctor(name, path, false);
         assert_eq!(verdict(&report), clean_verdict, "{name}:\n{report}");
@@ -263,7 +263,7 @@ fn doctor_verdict_survives_a_bad_sample_before_any_track() {
         );
         let json: serde_json::Value =
             serde_json::from_str(doctor(name, path, true).trim()).unwrap();
-        assert_eq!(json["badSamples"], 1, "{name}: {json}");
+        assert_eq!(json["bad_samples"], 1, "{name}: {json}");
     }
 }
 
