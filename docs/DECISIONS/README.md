@@ -11,6 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-26 | MAN-302 | [MAN-302: UberSDR wide IQ, clean-room provenance; the input waits on a hardware-free local receiver](2026-10-26-man302-ubersdr-iq-clean-room.md) |
 | 2026-10-24 | MAN-284 | [MAN-284: `field-node.py report` counts the time before the first sample as unobserved](2026-10-24-man284-unsampled-prefix-unobserved.md) |
 | 2026-10-24 | MAN-285 | [MAN-285: status JSON preserves every served field](2026-10-24-man285-status-json-every-served-field.md) |
 | 2026-10-24 | MAN-282 | [MAN-282: an absurd `--timeout-secs` fails with a plain error — 2 for `manta status`, 1 for `manta health` — instead of a panic](2026-10-24-man282-timeout-secs-overflow.md) |
