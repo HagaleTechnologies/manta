@@ -556,7 +556,9 @@ def _fmt_num(v, digits=1):
 
 
 def _iso(dt):
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if dt.tzinfo is None:  # parse_iso never yields naive; keep direct callers host-TZ-independent
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def render_markdown(res, args, files, rbn_counts, node_malformed, show, node_grade_records=0):
