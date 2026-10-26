@@ -598,7 +598,8 @@ generator, no additional hardware-specific features to disable.
   own pass/fail status is unresolved too** — a warmup-dilution bug found
   on this same PR invalidates the Mac numbers recorded before 2026-09-02
   (including the 0.360x on record since 2026-07-24); a clean rerun of the
-  now-fixed test on a quiet, uncontended machine is needed before either leg of this M2 criterion can be called
-  settled. See `docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md`
-  for the full history, a cross-architecture Pi4 *estimate* (not a
-  measurement), and why neither should be treated as satisfying this gate.
+  now-fixed test on a quiet, uncontended machine is needed before either
+  leg of this M2 criterion can be called settled. See
+  `docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md` for the full
+  history, a cross-architecture Pi4 *estimate* (not a measurement), and
+  why neither should be treated as satisfying this gate.
