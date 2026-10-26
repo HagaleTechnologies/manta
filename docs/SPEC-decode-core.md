@@ -1054,6 +1054,41 @@ itself via the constraint clamp below the first time a real dit arrives —
 the dit falls far below `μ_dit`, gets assigned to the dit cluster, drags it
 down, and the clamp re-anchors `μ_dah`.
 
+Unimodal direction prior (pinned decision 20): when the one cluster's mean
+exceeds the `150 ms` dit clamp ceiling below, it cannot be dits, so the
+marks are taken as dahs instead: `μ_dah = mean`, `μ_dit = mean / 3`
+provisionally, unconfirmed until a mark lands ≤ `0.5·μ_dah` (then
+`μ_dit = that duration`). At or under `150 ms` the cluster is still assumed
+to be dits. The prior applies to marks only; §4.2's gap ratios keep the
+plain dit-assumed rule.
+
+**[DEVIATION] (MAN-402)** — dahs of 90–150 ms (24–40 WPM) are also
+plausible dits, and a stream of equal dahs (`MO`, `OO`, `0000`, `T0M`)
+never supplies the long mark that confirms a dit-assumed cluster: every dah
+decodes as a dit, character gaps read as element gaps and word gaps as
+character gaps.
+So when the 5-mark initialization lands in that dit-assumed unimodal case
+(ready, unconfirmed, `μ_dit` the observed mean `m`, and `m ≥ 60 ms` — a
+shorter dah would put the dit under the `20 ms` clamp), the decoder hands the
+tracker the completed spaces between those five marks — only spaces
+bounded by a mark on both sides, before the buffered runs replay; leading
+silence and an unfinished trailing space are excluded, and the gaps are not
+classified first. The gaps with `m/6 ≤ g < m/√3` (finite, positive) are
+dah-scale element gaps: a dah is three element gaps long, `1/√3` is the
+log-space midpoint between ratios 1/3 and 1, and `1/6` the shortest gap any
+dash/dot ratio within the `6.0` ceiling allows. If at least **two** remain
+and their population coefficient of variation is `< 0.35`, the marks are
+dahs: `μ_dah = m`, `μ_dit = m / 3` provisionally (the pinned-decision-20
+direction above, still unconfirmed, so the first genuine dit re-anchors
+it), the constraints apply, and the WPM reporting EMA is re-seeded from the
+corrected `dit_estimate`. Two gaps, not more: five marks can straddle two
+character or word boundaries and leave only two element gaps. The check
+runs once, at the ordinary 5-mark readiness; it never runs on a confirmed
+split, on the over-ceiling dah-assumed case, at the MAN-271 finish-time
+bootstrap below, or later in the stream. Text whose characters are single
+dahs (`TT`) has no element gaps and keeps the dit assumption. See
+docs/DECISIONS/2026-10-25-man402-dah-heavy-bootstrap.md.
+
 **[DEVIATION] (MAN-271)** — at a **genuine end-of-signal** `finish()`
 (stream EOF, or a HangExpired/Silent closure, where a sustained real
 on-air gap has been observed), a tracker that saw **2–4 marks**
