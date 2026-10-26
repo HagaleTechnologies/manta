@@ -255,10 +255,12 @@ pub fn render_human(doc: &StatusDoc) -> String {
     let minutes = (doc.uptime_seconds % 3600) / 60;
     out.push_str(&format!("manta status — daemon up {hours}h {minutes}m\n\n"));
     out.push_str(&format!("  spots published      {}\n", doc.spots_total));
+    // Saturating (MAN-281): the counts are peer-supplied through `manta
+    // status --addr`, so a spoofed `i64::MAX` must not panic or wrap.
     out.push_str(&format!(
         "  telnet clients       {}      json/ws clients  {}\n",
         doc.telnet_clients,
-        doc.json_clients + doc.ws_clients
+        doc.json_clients.saturating_add(doc.ws_clients)
     ));
     // A daemon that reports no `active_tracks` at all (an older one, or a
     // future one that drops the field) is shown as "n/a" rather than a
@@ -429,6 +431,27 @@ mod tests {
         let mut doc = StatusDoc::from_metrics(&metrics_fixture());
         doc.active_tracks = None;
         assert!(render_human(&doc).contains("active tracks  n/a"));
+    }
+
+    #[test]
+    fn human_render_saturates_overflowing_client_counts() {
+        // MAN-281 (Codex review, PR #95): `manta status --addr` can reach a
+        // spoofed endpoint, and any `i64` is schema-valid, so the json/ws sum
+        // must neither panic (debug) nor wrap negative (release).
+        for (json, ws, want) in [
+            (
+                i64::MAX,
+                1,
+                "  telnet clients       0      json/ws clients  9223372036854775807",
+            ),
+            (2, 1, "  telnet clients       0      json/ws clients  3"),
+        ] {
+            let mut doc = StatusDoc::from_metrics(&metrics_fixture());
+            doc.json_clients = json;
+            doc.ws_clients = ws;
+            let out = render_human(&doc);
+            assert!(out.lines().any(|l| l == want), "{want:?} not in {out:?}");
+        }
     }
 
     #[test]
