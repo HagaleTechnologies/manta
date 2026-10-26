@@ -895,7 +895,8 @@ fn check_input_name(name: &str) -> Result<()> {
 }
 
 /// MAN-13: `[[input]]` with two or more entries: each typed, named and
-/// validated like `[input]`, then the cross-entry rules.
+/// validated like `[input]`, then the cross-entry rules. `load()` has
+/// already turned a one-entry array into `[input]` (MAN-393).
 fn take_input_array(
     entries: &[toml::Value],
     origin: &str,
@@ -1593,6 +1594,8 @@ fn apply_env_overlay(doc: &mut toml::Table, vars: &[(OsString, OsString)]) -> Re
     }
 
     // MAN-13: one variable cannot say which of several receivers it sets.
+    // `load()` turned a one-entry `[[input]]` into the table before this
+    // point, so an array of tables here has two or more entries (MAN-393).
     if let Some(toml::Value::Array(inputs)) = doc.get("input") {
         if let Some((name, _, key, _)) = entries.iter().find(|(_, table, _, _)| *table == "input") {
             bail!(
@@ -1966,6 +1969,25 @@ mod tests {
     }
 
     #[test]
+    fn a_named_one_entry_audio_input_array_needs_no_center_freq_hz() {
+        let array = load_file("[[input]]\nname = \"rig\"\ntype = \"audio\"\n").unwrap();
+        let table = load_file("[input]\nname = \"rig\"\ntype = \"audio\"\n").unwrap();
+        assert_eq!(array.inputs, table.inputs);
+        assert_eq!(array.inputs[0].name, "rig");
+        assert_eq!(array.inputs[0].input.shared.center_freq_hz, None);
+    }
+
+    #[test]
+    fn manta_input_env_applies_to_a_one_entry_input_array() {
+        let v = vars(&[("MANTA_INPUT_FREQ_CORRECTION_PPM", "1.25")]);
+        let f = write_cfg("[[input]]\ntype = \"audio\"\nfreq_correction_ppm = 0.5\n");
+        let l = load(Some(f.path()), Env::Read(&v)).unwrap();
+        assert_eq!(l.inputs.len(), 1);
+        assert_eq!(l.inputs[0].input.shared.freq_correction_ppm, Some(1.25));
+        assert_eq!(l.env_vars, vec!["MANTA_INPUT_FREQ_CORRECTION_PPM".to_string()]);
+    }
+
+    #[test]
     fn input_names_are_required_with_two_or_more_entries() {
         let err = err_of(&format!(
             "{KA9Q_40}[[input]]\ntype = \"kiwi\"\nhost = \"k\"\nfreq_hz = 14030000.0\n"
@@ -2214,6 +2236,13 @@ mod tests {
         assert_eq!(
             err,
             "MANTA_INPUT_FREQ_CORRECTION_PPM cannot say which of the 3 [[input]] entries it \
+             sets; set freq_correction_ppm in that entry instead"
+        );
+        let two = write_cfg(&format!("{KA9Q_40}{KA9Q_20}"));
+        let err = format!("{:#}", load(Some(two.path()), Env::Read(&v)).unwrap_err());
+        assert_eq!(
+            err,
+            "MANTA_INPUT_FREQ_CORRECTION_PPM cannot say which of the 2 [[input]] entries it \
              sets; set freq_correction_ppm in that entry instead"
         );
     }

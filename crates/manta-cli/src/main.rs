@@ -11137,6 +11137,23 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     }
 
     #[test]
+    fn manta_input_env_reaches_run_through_a_one_entry_input_array() {
+        use std::ffi::OsString;
+        let f = write_temp_file(
+            b"[[input]]\ntype = \"kiwi\"\nhost = \"127.0.0.1\"\nfreq_hz = 14025000.0\n\
+              freq_correction_ppm = 0.5\n",
+        );
+        let vars = [(
+            OsString::from("MANTA_INPUT_FREQ_CORRECTION_PPM"),
+            OsString::from("1.25"),
+        )];
+        let loaded = config::load(Some(f.path()), config::Env::Read(&vars)).unwrap();
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        assert!(r.inputs.is_empty());
+        assert_eq!(r.freq_correction_ppm, 1.25);
+    }
+
+    #[test]
     fn select_input_requires_a_name_with_two_or_more_inputs() {
         let mut loaded = loaded_from(THREE_KA9Q);
         let err = select_input(&mut loaded, None, "doctor")
