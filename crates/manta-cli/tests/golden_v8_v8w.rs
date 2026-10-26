@@ -68,27 +68,21 @@ fn call_from_keyed_text(text: &str) -> &str {
         .expect("keyed text must follow the 'CQ CQ DE <CALL> <CALL> K' template")
 }
 
-/// For each expected signal (`manifest.expected_freqs_hz` order), the
-/// decoded track whose last-reported freq_hz is closest to that signal's
-/// expected absolute frequency.
-fn match_tracks_by_freq<'a>(
-    manifest: &manta_testkit::vectors::Manifest,
-    tracks: &'a BTreeMap<u64, (String, Option<f64>)>,
-) -> Vec<(&'a str, Option<f64>)> {
-    manifest
-        .expected_freqs_hz
+/// MAN-120 (FU-3 of MAN-116): CER here is scored over the frequency-
+/// joined copy of every track within this distance of the expected
+/// signal, in ascending track_id -- the same convention `manta bench
+/// sensitivity` scores with (`bench.rs`'s `MATCH_HZ`), so a fading-
+/// fragmented station is scored on its joined copy, not on whichever
+/// single track was nearest, and fragmentation can never inflate these
+/// numbers (MAN-116 decision D6).
+const CER_JOIN_HZ: f64 = 150.0;
+
+/// `per_track`'s entries as `joined_cer` tuples; tracks with no reported
+/// frequency are skipped (they can never sit inside a match window).
+fn track_refs(tracks: &BTreeMap<u64, (String, Option<f64>)>) -> Vec<(u64, f64, &str)> {
+    tracks
         .iter()
-        .map(|&expected_freq| {
-            tracks
-                .values()
-                .min_by(|(_, fa), (_, fb)| {
-                    let da = (fa.unwrap_or(f64::MAX) - expected_freq).abs();
-                    let db = (fb.unwrap_or(f64::MAX) - expected_freq).abs();
-                    da.partial_cmp(&db).unwrap()
-                })
-                .map(|(text, freq)| (text.as_str(), *freq))
-                .unwrap()
-        })
+        .filter_map(|(&id, (text, freq))| freq.map(|f| (id, f, text.as_str())))
         .collect()
 }
 
@@ -288,15 +282,20 @@ fn vc3_pileup_fading_with_crashes_spots_no_bogus_callsigns() {
 /// 0.200, 0.205, 0.207, 0.226, 0.232, 0.235, 0.244, 0.271, 0.275, 0.276,
 /// 0.286, 0.298, 0.308, 0.327, 0.337, 0.373, 0.384, 0.393, 0.441, 0.521,
 /// 0.526, 0.654, 0.686, 0.784, 0.844, 0.918 -- median ~0.276, ~2.76x the gate.
+/// (CERs recorded under the pre-MAN-120 nearest-single-track pick; MAN-120
+/// moved scoring onto the frequency-joined copy, which selects the same
+/// single track on every one of these scenes -- see below -- so the
+/// recorded numbers carry over unchanged.)
 ///
 /// Ruled out as a harness/matching artifact two ways. First, the sibling
 /// AWGN-only V8 test (identical 50-signal scene: same offsets/WPM/SNR/
-/// jitter, same `match_tracks_by_freq` matching) passes 49/50 validated,
+/// jitter, same frequency-join matching) passes 49/50 validated,
 /// 0 bogus -- fading is the only variable that changed. Second, within V8w
-/// itself, checked whether CER was inflated by the harness matching only a
+/// itself, checked whether CER was inflated by the harness scoring only a
 /// fragment of a fading-split track (a deep fade causing drop/reacquire as
-/// a new track_id, so `match_tracks_by_freq`'s nearest-single-track pick
-/// captures less than the full transmission): for 31/34 strong signals,
+/// a new track_id, so the nearest-single-track pick -- the rule here
+/// before MAN-120 moved CER onto the frequency-joined copy -- captures
+/// less than the full transmission): for 31/34 strong signals,
 /// `decoded_text.len() / expected_text.len()` is 1.0-1.3 (full-duration
 /// capture, exactly one track within 300 Hz of the expected frequency) yet
 /// CER still fails, ruling out fragmentation as the primary driver. That
@@ -304,7 +303,12 @@ fn vc3_pileup_fading_with_crashes_spots_no_bogus_callsigns() {
 /// 300 Hz; on `35deb42` none was, and with MAN-108's DORMANT re-acquisition
 /// still 0/34 have more than one track within 300 Hz of the expected
 /// frequency (docs/DECISIONS/2026-10-17-man108-dormant-track-reacquisition.md),
-/// so fragmentation plays no part in this CER gap.
+/// so fragmentation plays no part in this CER gap -- and since MAN-120 the
+/// scoring is structurally immune to it anyway: CER is scored over the
+/// texts of all tracks within `CER_JOIN_HZ` joined in id order
+/// (manta-testkit's `joined_cer`, the `manta bench sensitivity`
+/// convention), so a future fragmentation regression can no longer
+/// inflate these numbers either.
 ///
 /// The dominant pattern for the other 31 is scattered character-level
 /// corruption throughout an otherwise full-length decode, e.g. signal 1
@@ -329,7 +333,7 @@ fn v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts() {
         .map(|t| call_from_keyed_text(t))
         .collect();
 
-    let matched = match_tracks_by_freq(&manifest, &tracks);
+    let refs = track_refs(&tracks);
     let strong: Vec<usize> = spec
         .signals
         .iter()
@@ -344,8 +348,12 @@ fn v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts() {
 
     let mut good = 0;
     for &i in &strong {
-        let (decoded_text, _freq) = matched[i];
-        let cer = manta_testkit::cer::cer(&manifest.keyed_texts[i], decoded_text);
+        let cer = manta_testkit::cer::joined_cer(
+            &manifest.keyed_texts[i],
+            &refs,
+            manifest.expected_freqs_hz[i],
+            CER_JOIN_HZ,
+        );
         if cer < 0.10 {
             good += 1;
         }
@@ -452,7 +460,7 @@ fn v8w_pileup_fading_decodes_90pct_of_strong_signals_with_hsmm_engine() {
         .map(|t| call_from_keyed_text(t))
         .collect();
 
-    let matched = match_tracks_by_freq(&manifest, &tracks);
+    let refs = track_refs(&tracks);
     let strong: Vec<usize> = spec
         .signals
         .iter()
@@ -467,8 +475,12 @@ fn v8w_pileup_fading_decodes_90pct_of_strong_signals_with_hsmm_engine() {
 
     let mut good = 0;
     for &i in &strong {
-        let (decoded_text, _freq) = matched[i];
-        let cer = manta_testkit::cer::cer(&manifest.keyed_texts[i], decoded_text);
+        let cer = manta_testkit::cer::joined_cer(
+            &manifest.keyed_texts[i],
+            &refs,
+            manifest.expected_freqs_hz[i],
+            CER_JOIN_HZ,
+        );
         if cer < 0.10 {
             good += 1;
         }
