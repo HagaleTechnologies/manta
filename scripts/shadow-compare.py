@@ -18,8 +18,9 @@ docs/DECISIONS/2026-10-07-man96-secondary-skimmer-field-node.md):
   --time-tol-s 600    manta's dedupe SUPPRESSION_SECONDS: the longest gap
                       between two spots of a continuing station, so a re-spot
                       at a different phase is not miscounted as disagreement.
-  CW rows only        RBN rows with a `tx_mode` column other than "CW" (FT8,
-                      RTTY, ...) are dropped before anything else.
+  CW rows only        RBN rows whose `tx_mode` is not "CW" (FT8, RTTY, ...)
+                      are dropped before anything else. A CSV without a
+                      `tx_mode` column is an input error (MAN-290).
   --passband-khz      required: only spots inside the node's passband(s) can
                       be compared fairly, on both sides.
 
@@ -75,7 +76,7 @@ _spec = importlib.util.spec_from_file_location(
 scorer = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(scorer)
 
-RBN_REQUIRED_COLUMNS = ("callsign", "freq", "dx", "date")
+RBN_REQUIRED_COLUMNS = ("callsign", "freq", "dx", "date", "tx_mode")
 SNR_REF_HZ = 500.0
 DEFAULT_SNR_REF_HZ = 2500.0
 SSID_RE = re.compile(r"-\d+$")
@@ -287,7 +288,7 @@ def _open_rbn_texts(path):
 
 
 def load_rbn(paths, passbands, start, end, margin_s=0.0):
-    """Streams RBN rows, filtering CW (when `tx_mode` exists), then passband,
+    """Streams RBN rows, filtering CW (`tx_mode`, a required column), then passband,
     then window. Rows outside [start, end) but within `margin_s` of it are
     still returned, marked `in_window: False`: `compare` uses them only as
     match references, so a spot near a window edge is not counted as
@@ -305,10 +306,9 @@ def load_rbn(paths, passbands, start, end, margin_s=0.0):
             missing = [c for c in RBN_REQUIRED_COLUMNS if c not in fields]
             if missing:
                 raise InputError("%s: RBN CSV lacks column(s) %s" % (path, ", ".join(missing)))
-            has_tx_mode = "tx_mode" in fields
             for row in reader:
                 rows += 1
-                if has_tx_mode and (row.get("tx_mode") or "").strip().upper() != "CW":
+                if (row.get("tx_mode") or "").strip().upper() != "CW":
                     counts["non_cw"] += 1
                     continue
                 freq_khz = _num(row.get("freq"))

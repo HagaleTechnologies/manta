@@ -262,7 +262,8 @@ MISSED=0   # N from "Spots missed by the recorder: N", or indeterminate
 ```
 
 Download the RBN daily archive for every UTC date the window touches. A day's file appears after
-that UTC day ends.
+that UTC day ends. Pass the zips as downloaded: `shadow-compare.py` compares CW rows only, by the
+archive's `tx_mode` column, and stops with exit 2 on a CSV without one.
 
 ```sh
 mkdir -p ~/rbn && cd ~/rbn
