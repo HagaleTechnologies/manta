@@ -3355,3 +3355,84 @@ fn shared_hpsdr_docs_describe_capacity_and_queue_loss_and_example_checks_offline
     assert!(guide.contains("has 4 receivers; 6 bands are configured"));
     assert!(guide.contains("not a measured"));
 }
+
+// ---- MAN-249: internal machine names stay out of the public docs ----
+
+/// FNV-1a 64 of each internal fleet host name, lowercase. The names are kept
+/// out of the tree: a plain-text deny-list would publish what it guards.
+const INTERNAL_HOST_FNV1A: [u64; 5] = [
+    0xa0a3_3c22_a179_5c43,
+    0x76cf_9c53_5733_dc78,
+    0x61e7_8d4c_2055_7f92,
+    0x66fd_ea01_023f_f308,
+    0x602c_5552_1693_98cc,
+];
+
+fn fnv1a_64(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// The 1-based line of each ASCII-alphanumeric word whose lowercase FNV-1a
+/// is in `deny`.
+fn denied_word_lines(text: &str, deny: &[u64]) -> Vec<usize> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            line.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|w| !w.is_empty() && deny.contains(&fnv1a_64(&w.to_ascii_lowercase())))
+        })
+        .map(|(i, _)| i + 1)
+        .collect()
+}
+
+/// Every file under a directory, recursively.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display())) {
+        let p = e.expect("dir entry").path();
+        if p.is_dir() {
+            out.extend(files_under(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn deny_list_matches_whole_words_in_any_case() {
+    let deny = [fnv1a_64("examplehost")];
+    assert_eq!(
+        denied_word_lines("ok\nran on ExampleHost.local\n", &deny),
+        [2]
+    );
+    assert!(denied_word_lines("examplehosts, example host", &deny).is_empty());
+}
+
+#[test]
+fn public_docs_name_no_internal_machine() {
+    let root = repo_root();
+    let mut found = Vec::new();
+    for dir in ["docs", "wiki"] {
+        for path in files_under(&root.join(dir)) {
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in denied_word_lines(&text, &INTERNAL_HOST_FNV1A) {
+                found.push(format!(
+                    "{}:{line}",
+                    path.strip_prefix(&root).unwrap().display()
+                ));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "an internal machine name is in the public docs (MAN-249); name its role \
+         instead (\"the CI host\", \"the Pi 4 under test\"):\n{}",
+        found.join("\n")
+    );
+}
