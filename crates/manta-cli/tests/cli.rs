@@ -2950,6 +2950,43 @@ fn status_against_a_dead_address_fails_with_exit_code_two_and_a_plain_message() 
     );
 }
 
+/// MAN-332: given `--addr`, `run_status` skips `daemon_server_config`, so
+/// an unparseable `MANTA_CONFIG` file is never read and no `MANTA_*`
+/// variable is applied or validated -- as docs/CONFIG.md's Precedence
+/// section says. Same never-accepted listener as the test above.
+#[test]
+fn status_with_addr_ignores_manta_config_and_manta_variables() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad = write_cfg(dir.path(), "bad.toml", "garbage not toml [[[\n");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let out = manta()
+        .env("MANTA_CONFIG", &bad)
+        .env("MANTA_SERVER_METRICS_PORT", "notaport")
+        .env("MANTA_NO_SUCH_TABLE_KEY", "1")
+        .args(["status", "--addr", &addr.to_string(), "--timeout-secs", "1"])
+        .output()
+        .unwrap();
+    drop(listener);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&addr.to_string()),
+        "expected the --addr address in the error message, got: {stderr}"
+    );
+    for unread in [
+        "bad.toml",
+        "MANTA_SERVER_METRICS_PORT",
+        "MANTA_NO_SUCH_TABLE_KEY",
+    ] {
+        assert!(
+            !stderr.contains(unread),
+            "--addr must not read MANTA_CONFIG or MANTA_*, but stderr names {unread}: {stderr}"
+        );
+    }
+}
+
 /// MAN-44 CR-A regression: an invalid `--addr` must exit 2 ("couldn't
 /// ask"), not 1 -- exit 1 is the documented "reached the daemon, uplink is
 /// unhealthy" code (`docs/RUNBOOKS/uplink-health.md`), and a typo'd

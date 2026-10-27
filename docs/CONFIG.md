@@ -27,7 +27,10 @@ A value comes from the first of these that sets it:
 `--config FILE` names the file. Without it, `run`, `soak`, `doctor`, `check`,
 `status`, `health` and `config check` read the path from `MANTA_CONFIG`. The
 same seven commands apply the `MANTA_*` variables, though `status` and `health`
-apply them only when `--config` or `MANTA_CONFIG` names a file. `decode`,
+apply them only when `--config` or `MANTA_CONFIG` names a file. Given
+`--addr`, `status` and `health` load no config file and apply no `MANTA_*`
+variable: they dial that address even when `MANTA_CONFIG` names a missing or
+invalid file, and check neither the file nor the variables. `decode`,
 `oracle` and `bench sensitivity` read only the file `--config` names and never
 the environment, so their output does not depend on it. `[[rbn_uplink]]` cannot be
 set from the environment. An unknown table, key or `MANTA_*` variable is an
@@ -58,8 +61,8 @@ listed here change what the command does.
 | `doctor` | `[input]` `[spot]` `[detector]` `[decode]`, plus `[server]`, `[[rbn_uplink]]` and `[rbn_compare]` to check them without starting a server or logging in (MAN-126; see [RUNBOOKS/setup-checks.md](RUNBOOKS/setup-checks.md)) | yes |
 | `config check` | all seven, resolved exactly as `run` resolves them | yes |
 | `check` | `[input]`: the source, `capture_rate_hz` and `center_freq_hz` | yes |
-| `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes, but `MANTA_SERVER_*` only alongside a config file |
-| `health` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon's `/healthz`; a named config that resolves to no `[server]` table is an error | yes, but `MANTA_SERVER_*` only alongside a config file |
+| `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes, but `MANTA_SERVER_*` only alongside a config file; `--addr` loads no config file and applies no `MANTA_*` variable |
+| `health` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon's `/healthz`; a named config that resolves to no `[server]` table is an error | yes, but `MANTA_SERVER_*` only alongside a config file; `--addr` loads no config file and applies no `MANTA_*` variable |
 | `decode` | `[decode]` `[detector]` `[spot]` and `input.freq_correction_ppm`; several `[[input]]` entries that disagree on it need `--freq-correction-ppm` | no |
 | `oracle` | `[decode]` | no |
 | `bench sensitivity` | `[decode]` `[detector]` | no |
@@ -143,7 +146,7 @@ the config for both. The table needs `station_callsign`.
 | `metrics_bind_addr` | `"127.0.0.1"` | live: `run` with `[server]`, `status` and `health` | Address of `/metrics` and `/healthz`, which have no password. See [DECISIONS/2026-10-08-man132-metrics-loopback-bind.md](DECISIONS/2026-10-08-man132-metrics-loopback-bind.md). |
 | `telnet_port` | `7300` | live: `run` with `[server]` | DX-cluster telnet port. |
 | `json_port` | `7301` | live: `run` with `[server]` | JSON Lines and WebSocket spot stream; both share this port. |
-| `metrics_port` | `7302` | live: `run` with `[server]`, `status` and `health` | Prometheus metrics port; `manta status` and `manta health` dial it when given `--config` or `MANTA_CONFIG`. |
+| `metrics_port` | `7302` | live: `run` with `[server]`, `status` and `health` | Prometheus metrics port; `manta status` and `manta health` dial it when given `--config` or `MANTA_CONFIG` and no `--addr`. |
 | `live_port` | none; example `7303`; unset runs no live-state listener | live: `run` with `[server]`; restart required | Live-state stream port; see [LIVE-STATE.md](LIVE-STATE.md). |
 | `live_bind_addr` | `"127.0.0.1"` | live: `run` with `[server]` and `live_port`; restart required | Address of the live-state listener, which has no password. The stream carries every track's decoded text; set `"0.0.0.0"` only for a dashboard on another machine, and firewall `live_port`. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
 | `line_format` | `"rbn"` | live: `run` with `[server]` | Telnet spot-line layout, `"rbn"` or `"skimmer"`. The uplink always sends the `"rbn"` layout. |

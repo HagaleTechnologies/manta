@@ -2595,6 +2595,33 @@ fn config_reference_names_health_as_a_server_reader() {
     }
 }
 
+/// MAN-332 (PR #251 review): run_status and health_cmd::probe skip
+/// daemon_server_config when given --addr, so neither resolves
+/// MANTA_CONFIG nor applies or validates any MANTA_* variable. The
+/// reference must say so in Precedence and in both matrix rows.
+#[test]
+fn config_reference_says_addr_skips_config_and_environment() {
+    let md = doc(CONFIG_REF);
+    let precedence = squash_whitespace(section(&md, "Precedence"));
+    assert!(
+        precedence.contains(
+            "Given `--addr`, `status` and `health` load no config file and apply no `MANTA_*` variable"
+        ),
+        "{CONFIG_REF} Precedence must say --addr skips the config file and MANTA_*"
+    );
+    let matrix = backticked_rows(section(&md, "Which commands read which tables"));
+    for command in ["`status`", "`health`"] {
+        let row = matrix
+            .iter()
+            .find(|r| r[0] == command)
+            .unwrap_or_else(|| panic!("{CONFIG_REF} command matrix has no {command} row"));
+        assert!(
+            row[2].contains("`--addr` loads no config file and applies no `MANTA_*` variable"),
+            "{CONFIG_REF} {command} row must say --addr skips the config file and MANTA_*"
+        );
+    }
+}
+
 /// MAN-149 PR #251 review: config::load joins a relative path to the
 /// config file's directory only when the file set it; a `MANTA_*` value
 /// or a flag stays relative to the working directory.
