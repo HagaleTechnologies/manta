@@ -16,6 +16,7 @@ use crate::{InputHealthCounters, IqSource};
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use std::collections::VecDeque;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +34,25 @@ const RCVBUF_BYTES: usize = 4 << 20;
 /// allows, because that datagram may have waited in the buffer while its
 /// successors were dropped.
 const MAX_BUFFERED_DATAGRAMS: u64 = 8192;
+
+/// MAN-423: a pause between reads at least this long parks the socket: the
+/// radio keeps sending, and what it sends either waits in the receive buffer
+/// or, once that is full, is dropped. The radio cannot outrun the 8,192
+/// allowance in less (81 datagrams at 192 kS/s), and a decode loop keeping
+/// up reads a datagram every 1.24 ms at 192 kS/s.
+const PARKED_AFTER: Duration = Duration::from_millis(100);
+
+/// MAN-423: a pause in reading whose backlog may still be draining.
+#[derive(Debug, Clone, Copy)]
+struct Parked {
+    /// When the pause began: the stream's clock is accounted up to here.
+    from: Instant,
+    /// Samples accounted since `from`: every accepted datagram's 238 plus
+    /// whatever it reported lost or estimated for a restart.
+    accounted: u64,
+    /// Accepted datagrams until the backlog is surely drained.
+    left: u64,
+}
 
 /// The four rates rx-specific can encode (D14), for the error text.
 const ENCODABLE_RATES_TEXT: &str = "48000/96000/192000/384000";
@@ -183,6 +203,17 @@ pub struct Protocol2IqSource {
     /// datagrams do not move it, so a restart after stale ones still
     /// measures the whole outage.
     last_accepted_iq: Instant,
+    /// MAN-423: when the last `read()` returned (or the open's run = 1):
+    /// a longer pause than [`PARKED_AFTER`] before the next opens `parked`.
+    read_returned: Instant,
+    /// MAN-423: the pause whose backlog may still be draining, if any.
+    parked: Option<Parked>,
+    /// MAN-423: accepted datagrams a pause's window lasts (one full socket
+    /// buffer, [`MAX_BUFFERED_DATAGRAMS`]).
+    pub(crate) park_window: u64,
+    /// MAN-423 review: datagrams already received by a restart's look-ahead
+    /// ([`Self::restart_outage`]), handled before the socket's next.
+    look_ahead: VecDeque<(Vec<u8>, SocketAddr)>,
     /// MAN-259: offset from entering `open()` to immediately before the
     /// first run command; [`super::open_receiver`] adds its discovery time.
     pub(crate) acquisition_start_offset: Duration,
@@ -244,6 +275,10 @@ impl Protocol2IqSource {
             pending_discontinuity: None,
             last_valid_iq: now,
             last_accepted_iq: now,
+            read_returned: now,
+            parked: None,
+            park_window: MAX_BUFFERED_DATAGRAMS,
+            look_ahead: VecDeque::new(),
             acquisition_start_offset: Duration::ZERO,
             consecutive_malformed: 0,
             recv_buf: vec![0u8; RECV_BUF_LEN].into_boxed_slice(),
@@ -281,6 +316,7 @@ impl Protocol2IqSource {
         src.last_general = now;
         src.last_valid_iq = now;
         src.last_accepted_iq = now;
+        src.read_returned = now;
         Ok(src)
     }
 
@@ -367,22 +403,26 @@ impl Protocol2IqSource {
         self.consecutive_malformed = 0;
         self.confirmed_live.store(true, Ordering::Relaxed);
         let now = Instant::now();
-        let since_last = now.duration_since(self.last_accepted_iq);
+        let since_last = self.unaccounted(now);
         self.last_valid_iq = now;
         let event = self.tracker.observe(seq);
         if !matches!(event, wire::SeqEvent::Stale) {
             self.last_accepted_iq = now;
         }
-        match event {
-            wire::SeqEvent::InOrder => {}
-            wire::SeqEvent::Stale => self.queue.clear(),
+        let reported = match event {
+            wire::SeqEvent::InOrder => 0,
+            wire::SeqEvent::Stale => {
+                self.queue.clear();
+                return Ok(());
+            }
             // A jump no wall clock allows is a restart, not a loss: a
             // corrupt or spoofed sequence number must not move the spot
             // clock by days (the next real datagram then resyncs).
             wire::SeqEvent::Gap(k)
                 if u64::from(k) > plausible_lost_datagrams(since_last, self.sample_rate_hz) =>
             {
-                self.report_restart(since_last);
+                let outage = self.restart_outage(since_last);
+                self.report_restart(outage)
             }
             wire::SeqEvent::Gap(k) => {
                 self.health_counters.record_dropped(u64::from(k));
@@ -393,19 +433,134 @@ impl Protocol2IqSource {
                 } else {
                     Self::add_pending(&mut self.pending_discontinuity, missing);
                 }
+                missing
             }
-            wire::SeqEvent::Restart => self.report_restart(since_last),
+            wire::SeqEvent::Restart => {
+                let outage = self.restart_outage(since_last);
+                self.report_restart(outage)
+            }
+        };
+        if let Some(p) = self.parked.as_mut() {
+            p.accounted += wire::SAMPLES_PER_DATAGRAM as u64 + reported;
+            p.left = p.left.saturating_sub(1);
+            if p.left == 0 {
+                self.parked = None;
+            }
         }
         Ok(())
     }
 
+    /// The wall clock a gap or restart is judged against (D10/D11): since
+    /// the last accepted datagram, or, while a parked backlog drains
+    /// (MAN-423), since the pause began less the samples accounted since,
+    /// whichever is longer. A datagram drained from the backlog may have
+    /// waited the whole pause, so the time since it arrived says nothing
+    /// about how far the radio has moved on.
+    fn unaccounted(&self, now: Instant) -> Duration {
+        let since_last = now.duration_since(self.last_accepted_iq);
+        match self.parked {
+            Some(p) => {
+                let accounted = Duration::from_secs_f64(p.accounted as f64 / self.sample_rate_hz);
+                since_last.max(now.duration_since(p.from).saturating_sub(accounted))
+            }
+            None => since_last,
+        }
+    }
+
+    /// MAN-423 review: the outage a restart reports. Outside a park it is
+    /// `since_last`. While a parked backlog drains, the pause is only an
+    /// upper bound: a radio that restarted early in the pause kept
+    /// streaming, and what it sent since still waits on the socket (or in
+    /// `look_ahead`), so the whole pause read as missing would run every
+    /// later timestamp ahead by what that backlog holds (and count a later
+    /// overflow gap twice). The backlog is received now, without blocking,
+    /// and the radio time it represents -- every queued datagram, across any
+    /// further restarts in it -- comes off the unaccounted pause. The
+    /// datagrams are handled afterwards as if just received; a later
+    /// restart among them measures the same way, so the pause is assigned
+    /// exactly once.
+    fn restart_outage(&mut self, since_last: Duration) -> Duration {
+        if self.parked.is_none() {
+            return since_last;
+        }
+        self.receive_backlog();
+        let bound = self.unaccounted(Instant::now());
+        let covered = Duration::from_secs_f64(
+            self.backlog_datagrams(bound) as f64 * wire::SAMPLES_PER_DATAGRAM as f64
+                / self.sample_rate_hz,
+        );
+        bound.saturating_sub(covered)
+    }
+
+    /// Receive what the socket already holds into `look_ahead`, up to
+    /// [`MAX_BUFFERED_DATAGRAMS`] queued. A socket that cannot be made
+    /// non-blocking adds nothing (the pause bound then stands).
+    fn receive_backlog(&mut self) {
+        if self.socket.set_nonblocking(true).is_err() {
+            return;
+        }
+        let mut buf = vec![0u8; RECV_BUF_LEN];
+        while self.look_ahead.len() < MAX_BUFFERED_DATAGRAMS as usize {
+            let Ok((len, from)) = self.socket.recv_from(&mut buf) else {
+                // WouldBlock: drained. Any other error surfaces on the
+                // next blocking receive.
+                break;
+            };
+            self.look_ahead.push_back((buf[..len].to_vec(), from));
+        }
+        // A failure here leaves the socket non-blocking; the next receive
+        // reports it as an error rather than waiting.
+        let _ = self.socket.set_nonblocking(false);
+    }
+
+    /// The datagrams of radio time `look_ahead`'s DDC0 IQ represents after
+    /// the current one, judged as `handle_iq` will judge them (a copy of the
+    /// tracker): each accepted datagram is one, a plausible gap also counts
+    /// its lost datagrams, a stale one counts nothing. A jump `bound` cannot
+    /// explain is a restart, as in `handle_iq`, and counts only itself.
+    fn backlog_datagrams(&self, bound: Duration) -> u64 {
+        let plausible = plausible_lost_datagrams(bound, self.sample_rate_hz);
+        let mut tracker = self.tracker.clone();
+        let mut scratch = Vec::with_capacity(wire::SAMPLES_PER_DATAGRAM);
+        let mut total = 0u64;
+        for (bytes, from) in &self.look_ahead {
+            if !self.is_ddc0(*from) {
+                continue;
+            }
+            scratch.clear();
+            let Ok(seq) = wire::parse_iq_datagram(bytes, &mut scratch) else {
+                continue;
+            };
+            total += match tracker.observe(seq) {
+                wire::SeqEvent::InOrder | wire::SeqEvent::Restart => 1,
+                wire::SeqEvent::Stale => 0,
+                wire::SeqEvent::Gap(k) if u64::from(k) > plausible => 1,
+                wire::SeqEvent::Gap(k) => u64::from(k) + 1,
+            };
+        }
+        total
+    }
+
+    /// Whether `from` is the radio's DDC0 IQ port.
+    fn is_ddc0(&self, from: SocketAddr) -> bool {
+        let SocketAddr::V4(v4) = from else {
+            return false;
+        };
+        *v4.ip() == self.radio_ip
+            && from.port() >= self.port
+            && u32::from(from.port()).wrapping_sub(u32::from(self.port))
+                == u32::from(DDC0_PORT_OFFSET)
+    }
+
     /// A restart (D10/D11): one gap, no dropped count (the true count is
-    /// unknown), and a discontinuity estimated from the wall clock.
-    fn report_restart(&mut self, since_last: Duration) {
+    /// unknown), and a discontinuity estimated from the wall clock. Returns
+    /// the samples it reported missing.
+    fn report_restart(&mut self, since_last: Duration) -> u64 {
         self.health_counters.record_gap();
         let elapsed = (since_last.as_secs_f64() * self.sample_rate_hz).round();
         let missing = (elapsed - wire::SAMPLES_PER_DATAGRAM as f64).max(0.0) as u64;
         Self::add_pending(&mut self.pending_discontinuity, missing);
+        missing
     }
 
     /// Receive datagrams until the queue holds DDC0 samples (D5 demux).
@@ -427,14 +582,19 @@ impl Protocol2IqSource {
                 );
             }
             self.send_keepalive_if_due()?;
-            let (len, from) = match self.socket.recv_from(&mut self.recv_buf) {
-                Ok(got) => got,
-                Err(e) => match classify_recv_error(&e) {
-                    RecvErrorAction::Retry | RecvErrorAction::Timeout => continue,
-                    RecvErrorAction::Fatal => {
-                        return Err(e).context("receive from HPSDR protocol 2 radio");
-                    }
-                },
+            let (len, from) = if let Some((bytes, from)) = self.look_ahead.pop_front() {
+                self.recv_buf[..bytes.len()].copy_from_slice(&bytes);
+                (bytes.len(), from)
+            } else {
+                match self.socket.recv_from(&mut self.recv_buf) {
+                    Ok(got) => got,
+                    Err(e) => match classify_recv_error(&e) {
+                        RecvErrorAction::Retry | RecvErrorAction::Timeout => continue,
+                        RecvErrorAction::Fatal => {
+                            return Err(e).context("receive from HPSDR protocol 2 radio");
+                        }
+                    },
+                }
             };
             let from_radio = match from {
                 SocketAddr::V4(v4) => *v4.ip() == self.radio_ip,
@@ -482,11 +642,31 @@ impl IqSource for Protocol2IqSource {
         if buf.is_empty() {
             return Ok(0);
         }
+        // MAN-423: the caller paused; what the radio sent meanwhile is
+        // queued on the socket, or dropped once the buffer filled. A pause
+        // opens a window anchored where it began. A pause while an earlier
+        // window is still open keeps that anchor and what it accounted --
+        // `(now - from) - accounted` stays the radio time not yet seen, the
+        // earlier pause's included -- and only refills `left`, since the
+        // socket may now hold a full buffer again (PR review).
+        if self.read_returned.elapsed() >= PARKED_AFTER {
+            match self.parked.as_mut() {
+                Some(p) => p.left = self.park_window,
+                None => {
+                    self.parked = Some(Parked {
+                        from: self.read_returned,
+                        accounted: 0,
+                        left: self.park_window,
+                    });
+                }
+            }
+        }
         self.fill_queue()?;
         let avail = &self.queue[self.queue_pos..];
         let n = buf.len().min(avail.len());
         buf[..n].copy_from_slice(&avail[..n]);
         self.queue_pos += n;
+        self.read_returned = Instant::now();
         Ok(n)
     }
 
@@ -944,10 +1124,14 @@ mod tests {
         assert_eq!(reads[0].0, 0);
         assert_eq!(reads[0].1, None);
         let d = reads[0].2.expect("restart reports a discontinuity");
+        // The 300 ms pause parks the socket (MAN-423), so the nine
+        // post-restart datagrams already queued behind sequence 0 count as
+        // radio time since the restart, not as outage (MAN-423 review).
+        let queued = Duration::from_secs_f64(9.0 * 238.0 / 192_000.0);
         assert_wall_clock_discontinuity(
             d,
-            before_restart - after_last,
-            after_restart - before_last,
+            (before_restart - after_last).saturating_sub(queued),
+            (after_restart - before_last).saturating_sub(queued),
         );
         assert!(reads[1..].iter().all(|r| r.1.is_none() && r.2.is_none()));
         let stats = src.gap_stats();
@@ -1281,6 +1465,241 @@ mod tests {
             "HPSDR protocol 2 only encodes exactly 48000/96000/192000/384000 Hz sample rates, \
              got 250000"
         );
+    }
+
+    /// MAN-423: an open source the caller has not read yet (a multi-input
+    /// run parks it while another opener blocks) keeps ten datagrams, then
+    /// its full socket drops 8,492 more -- past the 8,192 allowance. Read a
+    /// second later, the drained backlog says nothing about how far the
+    /// radio moved on: the jump is a loss counted from the pause, not a
+    /// zero-length restart (before the fix: `Some(0)`, no dropped count).
+    #[test]
+    fn a_gap_past_the_allowance_after_a_park_is_a_loss() {
+        let fake = FakeP2Radio::start();
+        let mut src = open(&fake);
+        for s in 0..10 {
+            fake.send_iq(s);
+        }
+        thread::sleep(Duration::from_secs(1));
+        fake.send_iq(10 + 8_492);
+        let reads: Vec<_> = (0..11)
+            .map(|_| {
+                let (seq, _) = read_one(&mut src);
+                (seq, src.take_missing_samples(), src.take_discontinuity())
+            })
+            .collect();
+        assert!(
+            reads[..10].iter().all(|r| r.1.is_none() && r.2.is_none()),
+            "{reads:?}"
+        );
+        assert_eq!(reads[10], (10 + 8_492, None, Some(8_492 * 238)));
+        let stats = src.gap_stats();
+        assert_eq!(stats.dropped_packets, 8_492);
+        assert_eq!(stats.gaps_detected, 1);
+    }
+
+    /// MAN-423: a radio restart behind the same park is measured from the
+    /// pause, less the ten datagrams drained (before the fix: `Some(0)`).
+    #[test]
+    fn a_restart_behind_a_park_is_measured_from_the_pause() {
+        let fake = FakeP2Radio::start();
+        let before_open = Instant::now();
+        let mut src = open(&fake);
+        let after_open = Instant::now();
+        for s in 0..10 {
+            fake.send_iq(s);
+        }
+        thread::sleep(Duration::from_secs(1));
+        fake.send_iq(0);
+        let before_read = Instant::now();
+        for _ in 0..10 {
+            read_one(&mut src);
+        }
+        assert_eq!(read_one(&mut src), (0, 238));
+        let after_read = Instant::now();
+        let d = src
+            .take_discontinuity()
+            .expect("restart reports a discontinuity");
+        let drained = Duration::from_secs_f64(10.0 * 238.0 / 192_000.0);
+        assert_wall_clock_discontinuity(
+            d,
+            (before_read - after_open).saturating_sub(drained),
+            (after_read - before_open).saturating_sub(drained),
+        );
+        assert_eq!(src.gap_stats().dropped_packets, 0);
+    }
+
+    /// MAN-423 review: a radio that restarts early in a pause keeps
+    /// streaming into the socket, so the backlog holds five pre-restart
+    /// datagrams, then a post-restart run 0..=119 with 20 lost to overflow.
+    /// The restart's outage is the pause less what that run covers: every
+    /// sample the source accounts for after the pause (read, missing or
+    /// discontinuity) adds up to the pause's wall clock, not the pause plus
+    /// the run (before the review fix: about 28,300 samples, the run's 119 datagrams,
+    /// ahead).
+    #[test]
+    fn an_early_restart_behind_a_park_does_not_count_its_backlog_twice() {
+        let fake = FakeP2Radio::start();
+        let mut src = open(&fake);
+        for s in 0..5 {
+            fake.send_iq(s);
+        }
+        for _ in 0..4 {
+            read_one(&mut src);
+        }
+        let before_pause = Instant::now();
+        read_one(&mut src);
+        let pause = Instant::now();
+        for s in 5..10 {
+            fake.send_iq(s);
+        }
+        thread::sleep(Duration::from_millis(20));
+        for s in (0..60).chain(80..120) {
+            fake.send_iq(s);
+        }
+        thread::sleep(Duration::from_millis(500));
+        let before_read = Instant::now();
+        let mut accounted = 0u64;
+        let mut discontinuities = Vec::new();
+        for _ in 0..105 {
+            let (_, n) = read_one(&mut src);
+            accounted += n as u64;
+            accounted += src.take_missing_samples().unwrap_or(0);
+            if let Some(d) = src.take_discontinuity() {
+                discontinuities.push(d);
+                accounted += d;
+            }
+        }
+        let after_read = Instant::now();
+        assert_eq!(discontinuities.len(), 1, "{discontinuities:?}");
+        let stats = src.gap_stats();
+        assert_eq!(stats.dropped_packets, 20);
+        assert_eq!(stats.gaps_detected, 2);
+        assert_wall_clock_discontinuity(accounted, before_read - pause, after_read - before_pause);
+    }
+
+    /// MAN-423 review: two restarts in one pause queue two runs, 0..60 and
+    /// 0..60. The first restart's look-ahead holds both, and both are radio
+    /// time, so the pause is assigned once: everything accounted after it
+    /// adds up to its wall clock (before: the second run, 14,280 samples,
+    /// ahead), and the second restart reports no more than the drift.
+    #[test]
+    fn two_restarts_behind_a_park_assign_the_pause_once() {
+        let fake = FakeP2Radio::start();
+        let mut src = open(&fake);
+        for s in 0..5 {
+            fake.send_iq(s);
+        }
+        for _ in 0..4 {
+            read_one(&mut src);
+        }
+        let before_pause = Instant::now();
+        read_one(&mut src);
+        let pause = Instant::now();
+        for s in 5..10 {
+            fake.send_iq(s);
+        }
+        thread::sleep(Duration::from_millis(20));
+        for s in 0..60 {
+            fake.send_iq(s);
+        }
+        thread::sleep(Duration::from_millis(20));
+        for s in 0..60 {
+            fake.send_iq(s);
+        }
+        thread::sleep(Duration::from_millis(500));
+        let before_read = Instant::now();
+        let mut accounted = 0u64;
+        let mut discontinuities = Vec::new();
+        for _ in 0..125 {
+            let (_, n) = read_one(&mut src);
+            accounted += n as u64;
+            accounted += src.take_missing_samples().unwrap_or(0);
+            if let Some(d) = src.take_discontinuity() {
+                discontinuities.push(d);
+                accounted += d;
+            }
+        }
+        let after_read = Instant::now();
+        assert_eq!(discontinuities.len(), 2, "{discontinuities:?}");
+        // The second restart finds the pause already assigned: what is left
+        // is the time spent reading, well under one 10 ms datagram budget.
+        assert!(discontinuities[1] < 1_920, "{discontinuities:?}");
+        assert_eq!(src.gap_stats().gaps_detected, 2);
+        assert_eq!(src.gap_stats().dropped_packets, 0);
+        assert_wall_clock_discontinuity(accounted, before_read - pause, after_read - before_pause);
+    }
+
+    /// MAN-423 review: a second pause while the first park's backlog still
+    /// drains keeps the first anchor. A 4 s park (the review's 15 s, scaled
+    /// for test time), half the 100-datagram backlog drained, a 200 ms
+    /// pause, the rest drained: an 11,000-datagram jump then fits the
+    /// 4 s bound (about 11,400 datagrams) and is a loss of 2,618,000
+    /// samples. Before the fix the second pause re-anchored the window, the
+    /// bound fell to about 0.2 s (8,355 datagrams), and the jump read as a
+    /// restart of a few tens of thousands of samples.
+    #[test]
+    fn a_second_pause_while_a_park_drains_keeps_its_anchor() {
+        let fake = FakeP2Radio::start();
+        let mut src = open(&fake);
+        fake.send_iq(0);
+        read_one(&mut src);
+        thread::sleep(Duration::from_secs(4));
+        for s in 1..101 {
+            fake.send_iq(s);
+        }
+        for _ in 0..50 {
+            read_one(&mut src);
+        }
+        thread::sleep(Duration::from_millis(200));
+        for _ in 0..50 {
+            read_one(&mut src);
+        }
+        let jump = 101 + 11_000;
+        fake.send_iq(jump);
+        assert_eq!(read_one(&mut src), (jump, 238));
+        assert_eq!(src.take_missing_samples(), None);
+        assert_eq!(src.take_discontinuity(), Some(11_000 * 238));
+        let stats = src.gap_stats();
+        assert_eq!(stats.dropped_packets, 11_000);
+        assert_eq!(stats.gaps_detected, 1);
+    }
+
+    /// MAN-423: a source read without pause keeps the fixed allowance: a
+    /// jump 2,000 past it is still a restart, whatever the backlog held.
+    #[test]
+    fn a_drained_source_keeps_the_fixed_allowance() {
+        let fake = FakeP2Radio::start();
+        let mut src = open(&fake);
+        let seqs: Vec<u32> = (0..40).chain([40 + 10_192]).collect();
+        let reads = feed(&fake, &mut src, &seqs);
+        let last = reads.last().unwrap();
+        assert_eq!((last.0, last.1), (40 + 10_192, None));
+        assert!(last.2.expect("a restart") < 192_000, "{last:?}");
+        assert_eq!(src.gap_stats().dropped_packets, 0);
+    }
+
+    /// MAN-423: a pause's window ends once its backlog is surely drained
+    /// (`park_window` accepted datagrams); a later jump past the allowance
+    /// is a restart again.
+    #[test]
+    fn a_park_window_ends_after_its_datagrams() {
+        let fake = FakeP2Radio::start();
+        let mut src = open(&fake);
+        src.park_window = 20;
+        for s in 0..10 {
+            fake.send_iq(s);
+        }
+        thread::sleep(Duration::from_secs(1));
+        for _ in 0..10 {
+            read_one(&mut src);
+        }
+        let seqs: Vec<u32> = (10..30).chain([30 + 8_492]).collect();
+        let reads = feed(&fake, &mut src, &seqs);
+        let last = reads.last().unwrap();
+        assert_eq!((last.0, last.1), (30 + 8_492, None));
+        assert!(last.2.expect("a restart") < 192_000, "{last:?}");
+        assert_eq!(src.gap_stats().dropped_packets, 0);
     }
 
     /// MAN-52: `MANTA_TEST_P2_HOST=<radio> cargo test -p manta-input --locked
