@@ -534,7 +534,8 @@ def parse_host_port(text):
 
 def validate_spot_line(line):
     """Return the spot dict if `line` (bytes, no newline) is a SpotMessage
-    with dxCall/frequency/timestamp; else raise ValueError."""
+    with dxCall/frequency/timestamp and a nonempty deCall; else raise
+    ValueError."""
     try:
         obj = json.loads(line.decode("utf-8"))
     except Exception as e:  # noqa: BLE001
@@ -551,6 +552,9 @@ def validate_spot_line(line):
         _utc_day(float(obj["timestamp"]))
     except (OverflowError, OSError, ValueError) as e:
         raise ValueError("bad timestamp: %s" % e)
+    de = obj.get("deCall")
+    if not isinstance(de, str) or not de.strip():
+        raise ValueError("missing deCall")
     return obj
 
 

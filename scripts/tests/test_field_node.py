@@ -432,6 +432,21 @@ class RecordSpotsTests(unittest.TestCase):
         self.assertEqual(self.read("spots-2026-10-01.jsonl"), good + b"\n")
         self.assertEqual(sum(1 for m in logs if m.startswith("invalid line")), 5)
 
+    def test_spot_without_de_call_is_invalid(self):
+        # PRRT_kwDOTQvU8M6qkqnn (MAN-289): a spot with no deCall was archived, and
+        # shadow-compare.py then had no node identity to exclude from corroboration.
+        ts = int(datetime(2026, 10, 1, 12, tzinfo=timezone.utc).timestamp())
+        good = spot_line("W1AW", ts)
+        base = json.loads(good)
+        bad = [json.dumps({k: v for k, v in base.items() if k != "deCall"}).encode()]
+        bad += [json.dumps(dict(base, deCall=v)).encode() for v in (None, "", "   ", 5)]
+        srv = LineServer([b"\n".join(bad + [good]) + b"\n"])
+        logs = []
+        stats = self.run_until(srv, 1, logs=logs)
+        self.assertEqual((stats["invalid"], stats["written"]), (5, 1))
+        self.assertEqual(self.read("spots-2026-10-01.jsonl"), good + b"\n")
+        self.assertEqual(sum(1 for m in logs if m.startswith("invalid line skipped (missing deCall)")), 5)
+
     def test_record_spots_archives_grades_separately(self):
         spot_ts = int(datetime(2026, 10, 11, 23, 58, tzinfo=timezone.utc).timestamp())
         spot = spot_line("W1AW", spot_ts)
