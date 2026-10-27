@@ -99,6 +99,25 @@ Measured with the fix: the 1 s park then a jump of 8,492 reports
 `Some(2_021_096)` (8,492 × 238) and 8,492 dropped datagrams; a restart behind
 the same park is measured from the pause, less the ten drained datagrams.
 
+**D5a (PR review). The pause bounds a restart's outage; it is not the
+outage.** A radio that restarts early in the pause keeps streaming, so its
+post-restart datagrams are queued behind sequence 0, and reporting the whole
+unaccounted pause as missing would run every later timestamp ahead by what
+they hold (and count a later overflow gap again). On a restart while a
+window is open, `restart_outage` receives the socket's backlog without
+blocking (at most `MAX_BUFFERED_DATAGRAMS`, kept in `look_ahead` and handled
+next as if just received), takes how far DDC0's increasing sequence runs past
+the restart, and reports `(now - from) - accounted / fs` less that many
+datagrams' time. Outside a window the estimate is the old `since_last`.
+Test `an_early_restart_behind_a_park_does_not_count_its_backlog_twice`: five
+pre-restart datagrams, then 0..=119 with 20 lost, behind a 0.5 s pause; every
+sample accounted after the pause adds up to the pause's wall clock (before:
+about 28,300 samples, the run's 119 datagrams, ahead). Real radios pace their
+datagrams, so the queued run is radio time since the restart;
+`radio_restart_resyncs_with_a_wall_clock_discontinuity`, whose fake sends
+its ten restart datagrams in one burst after a 300 ms pause, now expects the
+nine queued behind sequence 0 to come off the estimate.
+
 ## Consequences
 
 - This record supersedes, in the MAN-305 record, D12's sentence "In the main
