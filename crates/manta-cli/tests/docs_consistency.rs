@@ -2082,44 +2082,57 @@ fn man304_addon_note_records_sources_gate_and_stop_rule() {
         .iter()
         .filter(|name| name.contains("-man302-"))
         .any(|name| verdict_lines(&doc(&format!("docs/DECISIONS/{name}"))).0);
+    // A later GO record may sit beside this note, as MAN-302's test allows.
+    let mut any_go = false;
+    for name in &records {
+        if verdict_lines(&doc(&format!("docs/DECISIONS/{name}"))).0 {
+            any_go = true;
+            assert!(
+                man302_go,
+                "docs/DECISIONS/{name} says **Verdict: GO** but no MAN-302 record does: the add-on needs the UberSDR input"
+            );
+        }
+    }
     assert!(
-        !go || man302_go,
-        "{rel} says **Verdict: GO** but no MAN-302 record does: the add-on needs the UberSDR input"
-    );
-    assert!(
-        go || !repo_root().join("packaging/ubersdr").exists(),
-        "packaging/ubersdr exists but {rel} says **Verdict: STOP** (stop rule)"
+        any_go || !repo_root().join("packaging/ubersdr").exists(),
+        "packaging/ubersdr exists but {rel} says **Verdict: STOP** and no MAN-304 record says **Verdict: GO** (stop rule)"
     );
 
     // A claim leaves `open` only by citing a pinned document or a trace in the repo.
-    for row in id_rows(&raw, 'C') {
-        let status = row
-            .trim_end()
-            .trim_end_matches('|')
-            .rsplit('|')
-            .next()
-            .unwrap()
-            .trim();
-        if status == "open" {
-            continue;
-        }
-        if let Some(path) = status.strip_prefix("observed: ") {
+    for name in &records {
+        let rec = format!("docs/DECISIONS/{name}");
+        let body = doc(&rec);
+        for row in id_rows(&body, 'C') {
+            let status = row
+                .trim_end()
+                .trim_end_matches('|')
+                .rsplit('|')
+                .next()
+                .unwrap()
+                .trim();
+            if status == "open" {
+                continue;
+            }
+            if let Some(path) = status.strip_prefix("observed: ") {
+                assert!(
+                    repo_root().join(path).exists(),
+                    "{rec}: {row} cites a missing trace"
+                );
+                continue;
+            }
+            let url = status.strip_prefix("documented: ").unwrap_or_else(|| {
+                panic!("{rec}: C-row status must be `open`, `documented: <url>` or `observed: <path>`: {row}")
+            });
+            // D1: only the receiver's published Markdown, at a pinned commit.
             assert!(
-                repo_root().join(path).exists(),
-                "{rel}: {row} cites a missing trace"
+                url.starts_with("https://raw.githubusercontent.com/madpsy/")
+                    && url.ends_with(".md")
+                    && url
+                        .split('/')
+                        .any(|seg| seg.len() == 40 && seg.bytes().all(|c| c.is_ascii_hexdigit())),
+                "{rec}: {row} must cite a raw Markdown document at a pinned 40-hex commit"
             );
-            continue;
         }
-        let url = status.strip_prefix("documented: ").unwrap_or_else(|| {
-            panic!("{rel}: C-row status must be `open`, `documented: <url>` or `observed: <path>`: {row}")
-        });
-        assert!(
-            url.starts_with("https://raw.githubusercontent.com/madpsy/")
-                && url
-                    .split('/')
-                    .any(|seg| seg.len() == 40 && seg.bytes().all(|c| c.is_ascii_hexdigit())),
-            "{rel}: {row} must cite a raw document at a pinned 40-hex commit"
-        );
     }
 }
 
