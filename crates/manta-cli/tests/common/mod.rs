@@ -2,12 +2,13 @@
 //! signals (`signal_shutdown.rs`, MAN-85; `config_reload.rs`, MAN-78), and
 //! a fake KiwiSDR for live-source daemons (`config_reload.rs`;
 //! `list_refresh.rs`, MAN-316; `signal_shutdown.rs`'s reconnect stall,
-//! MAN-252).
+//! MAN-252), and a fake metrics listener (`health_command.rs` and
+//! `status_command.rs`, MAN-285).
 // Each test binary compiles this module separately and uses only part of it.
 #![allow(dead_code)]
 
-use std::io::{BufRead, BufReader, Read};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -366,4 +367,54 @@ pub fn fake_kiwi_sessions(
         let _ = s.join();
     }
     Ok(())
+}
+
+/// A fake metrics listener on 127.0.0.1 that answers up to `conns`
+/// connections with `response`: it reads each request through the blank
+/// line, writes the canned reply, half-closes, and waits for the client to
+/// close. Each request's first line is sent on the returned channel.
+pub fn fake_server(response: Vec<u8>, conns: usize) -> (SocketAddr, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for _ in 0..conns {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            let _ = reader.read_line(&mut first);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) if line == "\r\n" => break,
+                    Ok(_) => {}
+                }
+            }
+            let _ = tx.send(first);
+            let _ = stream.write_all(&response);
+            // MAN-156: close gracefully. Dropping the socket straight after the
+            // write let Windows reset the connection before `manta health` read
+            // the body ("forcibly closed", os error 10054; about 1 in 8 Windows
+            // merge-queue runs). Send FIN, then wait, bounded, for the client
+            // to close its side.
+            let _ = stream.shutdown(Shutdown::Write);
+            let _ = reader
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+        }
+    });
+    (addr, rx)
+}
+
+pub fn http_reply(status: &str, body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
 }
