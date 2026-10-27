@@ -982,7 +982,7 @@ pub fn listen_with_observers(
             rtty.restart(seg_base + seg_consumed);
             seg_base += seg_consumed + gap;
             seg_consumed = 0;
-            seg = new_segment(
+            seg = match new_segment(
                 fs,
                 center_freq_hz,
                 rf_passband_hz,
@@ -994,7 +994,14 @@ pub fn listen_with_observers(
                 next_id,
                 observers.decode_quality.clone(),
                 occupancy,
-            )?;
+            ) {
+                Ok(seg) => seg,
+                Err(e) => {
+                    // MAN-318: decoding ends here, so no held spot is lost.
+                    settle_lookups(&mut validator, &mut ctx, &mut on_spot);
+                    return Err(e);
+                }
+            };
             let events = seg.tm.process_hops(&seg.ch.process(&padding), |m| {
                 seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
             });

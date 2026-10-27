@@ -61,7 +61,14 @@ The feature is the opt-in `[callsign_lookup]` table
 - **D6. Two independent 10 s bounds.** Each held call has a deadline taken
   when it is first held, enforced on the decode side in `settled()`; each
   HTTP request has ureq's own 10 s timeout. An answer that arrives after its
-  deadline still fills the cache.
+  deadline still fills the cache. The deadline is checked once per decode
+  batch, so it bounds a hold to 10 s while samples flow. During a
+  single-input source outage `ReconnectingSource::read()` blocks and no batch
+  runs: a held spot waits for decoding to resume (or the run to end) and is
+  released then, with QRZ.com's answer if one arrived, else unverified. With
+  several inputs, the other inputs' batches keep releasing. Accepted, not
+  prevented: the spot keeps its decode timestamp, and the spot bus and the
+  JSON `seq` already tolerate a late publish.
 - **D7. The cache.** In memory, keyed by the base call (`W1AW/P` asks about
   `W1AW`). Found and not-found answers live 24 h from the answer; failures
   are never cached. At most 20,000 entries, oldest evicted first. Spots of

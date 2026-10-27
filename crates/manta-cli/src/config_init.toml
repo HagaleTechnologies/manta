@@ -165,7 +165,7 @@
 
 #[callsign_lookup]
 
-#enabled = false
+#enabled = false                     # true withholds spots whose callsign QRZ.com does not list
 #qrz_username = ""                    # your QRZ.com user name; required when enabled
 #qrz_password = ""                    # required when enabled; or MANTA_CALLSIGN_LOOKUP_QRZ_PASSWORD
 #qrz_url = "https://xmldata.qrz.com/xml/current/"  # https://; http:// only to a loopback test server

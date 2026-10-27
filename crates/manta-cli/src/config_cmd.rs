@@ -1978,6 +1978,7 @@ mod tests {
             "server" => a.server == b.server,
             "rbn_uplink" => a.rbn_uplink == b.rbn_uplink,
             "rbn_compare" => a.rbn_compare == b.rbn_compare,
+            "callsign_lookup" => a.callsign_lookup == b.callsign_lookup,
             "input" => a.input == b.input,
             "spot" => a.spot == b.spot,
             "detector" => a.detector == b.detector,
