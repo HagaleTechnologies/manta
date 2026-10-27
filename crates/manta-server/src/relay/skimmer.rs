@@ -263,7 +263,8 @@ fn relay_line(
         stats.record_dropped(DropReason::BadCall);
         return;
     }
-    bus.publish_relay(RelaySpot {
+    // Counted only when an uplink connection received it (see wsjtx.rs).
+    if bus.publish_relay(RelaySpot {
         spotter: Arc::from(cfg.callsign.as_str()),
         callsign: spot.call,
         freq_hz: spot.freq_khz * 1000.0,
@@ -271,6 +272,7 @@ fn relay_line(
         snr_db: spot.snr_db,
         spot_type: spot.spot_type,
         unix_ts: clock(),
-    });
-    stats.record_spot();
+    }) {
+        stats.record_spot();
+    }
 }

@@ -154,6 +154,13 @@ impl Dedupe {
         self.last.insert(key, now);
         true
     }
+
+    /// Withdraws an admission whose spot reached no uplink (none was
+    /// connected), so the next CQ from that call is not a duplicate of a
+    /// spot that was never sent.
+    pub fn forget(&mut self, call: &str, mode: RelayMode, band: &'static str) {
+        self.last.remove(&(call.to_string(), mode, band));
+    }
 }
 
 #[derive(Debug)]
@@ -236,8 +243,19 @@ impl Relay {
         }
         match self.gate(&d) {
             Ok(spot) => {
-                self.bus.publish_relay(spot);
-                self.stats.record_spot();
+                let key = (
+                    spot.callsign.clone(),
+                    spot.mode,
+                    band_for_freq_hz(spot.freq_hz),
+                );
+                // `manta_relay_spots_total` counts spots an uplink
+                // connection received; with none connected (reconnect
+                // backoff) the spot is lost, as manta's own are (D6).
+                if self.bus.publish_relay(spot) {
+                    self.stats.record_spot();
+                } else {
+                    self.dedupe.forget(&key.0, key.1, key.2);
+                }
             }
             Err(reason) => self.stats.record_dropped(reason),
         }
