@@ -31,8 +31,9 @@ recording's window).
 `cargo run --release -p manta-cli -- oracle <B2 wav> <B2 rbn csv>
 --capture-start 2025-11-29T00:00:00Z --engine <engine> --jsonl <out>`. `n` =
 221 both engines (unchanged fixture set). (`--capture-start` became
-required after this measurement, PR #161 -- add it when re-running this
-command.)
+required after this measurement, PR #161, and so did `--spotter`, MAN-249,
+which then defaulted to this section's spotter -- add both when re-running
+this command.)
 
 | metric | gate (§8.4 stage 2) | legacy | hsmm | hsmm meets gate? |
 |---|---|---|---|---|
