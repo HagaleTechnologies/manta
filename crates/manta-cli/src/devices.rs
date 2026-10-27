@@ -301,10 +301,7 @@ mod tests {
                         reply[3..9].copy_from_slice(&[2, 17, 34, 51, 68, 85]);
                         reply[9] = 43;
                         reply[10] = 6;
-                        // Conntrack can drop this reply with EPERM when it
-                        // races the client's own probe to 127.0.0.1 (MAN-450);
-                        // discovery asks every destination again each round.
-                        let _ = socket.send_to(&reply, peer);
+                        socket.send_to(&reply, peer).unwrap();
                     }
                 }
             }

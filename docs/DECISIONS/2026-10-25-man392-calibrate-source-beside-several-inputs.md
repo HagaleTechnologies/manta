@@ -55,23 +55,3 @@ was rejected because it would also hide a parse or type error in the file.
 - The test is `calibrate_a_source_flag_beside_several_inputs_reports_the_measurement`
   in `crates/manta-cli/tests/calibrate.rs`. The MAN-13 and MAN-127 records
   are not rewritten.
-
-## The HPSDR discovery fakes (MAN-450)
-
-This branch's gate failed in two tests it does not otherwise touch:
-`devices::tests::enumerate_hpsdr_finds_a_fake_on_an_ephemeral_port` and
-`tests/hpsdr_discovery.rs`. A fake radio's reply `send_to(...).unwrap()`
-panicked with EPERM. Discovery sends to `127.255.255.255`, then
-`127.0.0.1`, from one client port. The fake's reply to the first probe and
-the client's second probe are opposite-direction flows between the same two
-loopback ports. When both are new at once, Linux conntrack keeps one and
-drops the other, and the dropped send returns EPERM. Whether it happens
-depends on timing, so the tests failed intermittently, on the base too.
-
-The MAN-450 decision chose a fix outside this change: reorder
-`broadcast_destinations`, or make the two fakes tolerate a dropped reply.
-This session can push only this branch, so the fake-side fix rides here.
-Both fakes ignore a failed reply, like the stream fake already does.
-Discovery sends four rounds to all three destinations, so another reply
-still arrives. `broadcast_destinations` is unchanged: the client already
-tolerates its own dropped probes.
