@@ -784,6 +784,12 @@ impl TrackDecoder {
             }
             self.pending.push(run);
             if self.tracker.ready() {
+                // MAN-402: a unimodal bootstrap of same-length marks under the
+                // dit ceiling assumed dits; let the completed gaps between
+                // them say dahs, before the replay below classifies a single
+                // gap or assembles a character in the assumed scale.
+                let gaps = completed_gaps_ms(&self.pending);
+                self.tracker.resolve_unimodal_bootstrap(&gaps);
                 // Retroactively assemble the buffered runs; their marks
                 // already fed the tracker, so mark updates are skipped,
                 // while their element gaps are learned here (MAN-315 D3).
@@ -1140,6 +1146,17 @@ pub fn events_to_text(events: &[DecoderEvent]) -> String {
         }
     }
     s.trim().to_string()
+}
+
+/// MAN-402: the durations, in ms, of the spaces in `runs` bounded by a mark
+/// on both sides. Leading silence and an unfinished trailing space are not
+/// gaps between elements and carry no timing evidence. Over the warmup
+/// `pending` buffer (five marks) this is at most four values.
+fn completed_gaps_ms(runs: &[Run]) -> Vec<f32> {
+    runs.windows(3)
+        .filter(|w| w[0].mark && !w[1].mark && w[2].mark)
+        .map(|w| w[1].hops as f32 * HOP_MS as f32)
+        .collect()
 }
 
 #[cfg(test)]
@@ -2624,6 +2641,181 @@ mod tests {
         }
         events.extend(dec.finish());
         assert_eq!(events_to_text(&events), "TTTTT");
+    }
+
+    fn last_wpm(events: &[DecoderEvent]) -> Option<f32> {
+        events.iter().rev().find_map(|e| match e {
+            DecoderEvent::SpeedUpdate { wpm, .. } => Some(*wpm),
+            _ => None,
+        })
+    }
+
+    /// MAN-402: looped all-dah words keyed at 22.5, 25, 30 and 37.5 WPM. From
+    /// 25 WPM up their 144-96 ms dahs sit under the 150 ms dit ceiling, so the
+    /// five-mark bootstrap read them as dits ("MO" -> repeated '5'; the
+    /// others decoded nothing). The completed gaps between those marks are a
+    /// third of a mark long and say dahs. Dit-text controls stay exact.
+    #[test]
+    fn looped_dah_heavy_words_decode_at_high_speed() {
+        for dit_hops in [20u32, 18, 15, 12] {
+            let keyed_wpm = 1200.0 / (dit_hops as f32 * HOP_MS as f32);
+            for word in ["MO", "0000", "OO", "T0M", "HH", "EE"] {
+                let text = std::iter::repeat_n(word, 30).collect::<Vec<_>>().join(" ");
+                let (decoded, events) = decode_from_hop(&text, dit_hops, 0);
+                assert_eq!(
+                    decoded.split_whitespace().collect::<Vec<_>>(),
+                    vec![word; 30],
+                    "{word} @ {keyed_wpm} WPM: {decoded:?}"
+                );
+                let wpm = last_wpm(&events).expect("no SpeedUpdate");
+                assert!(
+                    (wpm - keyed_wpm).abs() < 2.0,
+                    "{word} @ {keyed_wpm} WPM: reported {wpm}"
+                );
+            }
+        }
+    }
+
+    /// MAN-402: attached at the start of M's second dah, looped "MO" hands the
+    /// bootstrap T | char gap | O | word gap | M: only two of its four
+    /// completed gaps are element gaps, the least the rule accepts.
+    #[test]
+    fn dah_heavy_attach_with_two_element_gaps_decodes() {
+        for dit_hops in [18u32, 15, 12] {
+            let text = std::iter::repeat_n("MO", 30).collect::<Vec<_>>().join(" ");
+            let skip = 4 * dit_hops as usize; // dah + element gap
+            let (decoded, _) = decode_from_hop(&text, dit_hops, skip);
+            let words: Vec<&str> = decoded.split_whitespace().collect();
+            assert_eq!(words.first(), Some(&"TO"), "{dit_hops} hops: {decoded:?}");
+            assert_eq!(
+                words[1..],
+                vec!["MO"; 29][..],
+                "{dit_hops} hops: {decoded:?}"
+            );
+        }
+    }
+
+    /// MAN-402: a transmission that ends at the readiness boundary ("MO" at
+    /// 30 WPM is exactly five marks) must report the keyed speed, not the
+    /// one-third speed of its marks read as dits.
+    #[test]
+    fn dah_heavy_warmup_transmission_reports_the_keyed_speed() {
+        let dit = 15u32; // 40 ms, 30 WPM
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        let mut ts = 0u64;
+        for (mark, hops) in [
+            (true, 3 * dit),
+            (false, dit),
+            (true, 3 * dit),
+            (false, 3 * dit),
+            (true, 3 * dit),
+            (false, dit),
+            (true, 3 * dit),
+            (false, dit),
+            (true, 3 * dit),
+        ] {
+            let start_ts = ts;
+            ts += hops as u64 * 256;
+            dec.on_run(
+                Run {
+                    mark,
+                    start_ts,
+                    hops,
+                },
+                &mut events,
+            );
+        }
+        assert!(dec.tracker.ready());
+        events.extend(dec.finish());
+        assert_eq!(events_to_text(&events), "MO");
+        let wpm = last_wpm(&events).expect("no final SpeedUpdate");
+        assert!((wpm - 30.0).abs() < 0.01, "reported {wpm} WPM");
+    }
+
+    /// MAN-402: only gaps between two marks are evidence; leading silence and
+    /// an unfinished trailing space are not.
+    #[test]
+    fn completed_gaps_exclude_leading_and_trailing_spaces() {
+        let run = |mark, hops| Run {
+            mark,
+            start_ts: 0,
+            hops,
+        };
+        let runs = [
+            run(false, 15),
+            run(true, 45),
+            run(false, 14),
+            run(true, 45),
+            run(false, 45),
+            run(true, 45),
+            run(false, 300),
+        ];
+        let ms = |hops: u32| hops as f32 * HOP_MS as f32;
+        assert_eq!(completed_gaps_ms(&runs), vec![ms(14), ms(45)]);
+        assert!(completed_gaps_ms(&runs[..2]).is_empty());
+    }
+
+    /// MAN-402: a leading space of element-gap length before five 120 ms marks
+    /// with only one interior element gap must not supply the second piece of
+    /// evidence; and the replay learns the element gaps exactly once.
+    #[test]
+    fn leading_silence_is_not_bootstrap_evidence_and_gaps_are_learned_once() {
+        let feed = |runs: &[(bool, u32)]| {
+            let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+            let mut events = Vec::new();
+            for &(mark, hops) in runs {
+                dec.on_run(
+                    Run {
+                        mark,
+                        start_ts: 0,
+                        hops,
+                    },
+                    &mut events,
+                );
+            }
+            dec
+        };
+        // 45 hops = 120 ms marks; a 15-hop (40 ms) leading space; interior
+        // gaps 15, 45, 105, 45 hops: one element gap.
+        let dec = feed(&[
+            (false, 15),
+            (true, 45),
+            (false, 15),
+            (true, 45),
+            (false, 45),
+            (true, 45),
+            (false, 105),
+            (true, 45),
+            (false, 45),
+            (true, 45),
+        ]);
+        assert!(dec.tracker.ready());
+        assert!(
+            (dec.tracker.mu_dit_ms() - 120.0).abs() < 1e-3,
+            "flipped on leading silence: mu_dit {}",
+            dec.tracker.mu_dit_ms()
+        );
+
+        // "MO" at 30 WPM with unequal element gaps (14, 16, 16 hops): flipped,
+        // then the replay folds each element gap into mu_egap once.
+        let dec = feed(&[
+            (true, 45),
+            (false, 14),
+            (true, 45),
+            (false, 45),
+            (true, 45),
+            (false, 16),
+            (true, 45),
+            (false, 16),
+            (true, 45),
+        ]);
+        assert!((dec.tracker.mu_dah_ms() - 120.0).abs() < 1e-3);
+        let mut once = SpeedTracker::new();
+        for hops in [14u32, 16, 16] {
+            once.on_element_gap(hops as f32 * HOP_MS as f32);
+        }
+        assert_eq!(dec.tracker.mu_egap_ms(), once.mu_egap_ms());
     }
 
     /// A 1.6 s pause inside the first five long gaps (a run station
