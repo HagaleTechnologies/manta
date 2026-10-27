@@ -12,9 +12,9 @@ not reach **on-disk fleet state**: each machine's clone directory name
 per-host `execution-core/registry.json`. MAN-27 is that remaining half.
 
 No environment available to implement this ticket has SSH or filesystem
-access to any of the five named fleet hosts (aldebaran, rigel, sophon, vega,
-or a persistent "this machine" — every dispatch container is a fresh,
-single-use target, not one of the fleet's long-lived hosts). This ADR
+access to any of the fleet's long-lived hosts (or a persistent "this
+machine" — every dispatch container is a fresh, single-use target, not
+one of the fleet's long-lived hosts). This ADR
 therefore documents **tooling and a runbook**, not a completed migration —
 see `docs/RUNBOOKS/fleet-checkout-rename.md`'s evidence table, which records
 "not run" against every host for that same reason. Each decision below is
@@ -153,13 +153,11 @@ decided, self-checking, host-side step instead of an open question.
 
 ## Decision 7 — the host list is enumerated explicitly, not derived from the Catalyst cluster roster
 
-The live Catalyst dispatch cluster's `staticRoster` is `["aldebaran",
-"sophon", "vega"]` — three hosts. `rigel` is a real, separate fleet host
-(it runs `vanity`'s refinery service and is a Claude-in-Chrome runner host)
-that sits outside that roster. Deriving the host list from `staticRoster`
-would silently skip `rigel`. The runbook enumerates the ticket's five hosts
-by name (aldebaran, rigel, sophon, vega, plus whichever host is "this
-machine" at execution time) instead.
+The live Catalyst dispatch cluster's static roster lists three hosts. A
+fourth long-lived fleet host, which runs other services, sits outside it,
+so a host list derived from the roster would silently skip it. The runbook
+therefore lists the hosts by role: the three roster hosts, the off-roster
+host, and whichever host is "this machine" at execution time.
 
 ## Not wired into required CI
 

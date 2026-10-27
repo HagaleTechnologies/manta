@@ -107,10 +107,10 @@ One row per host, filled in during execution. `–` = not yet run.
 
 | Host | Checkout present? | `--check` before | `--apply` result | `--check` after | Notes |
 |---|---|---|---|---|---|
-| aldebaran | – | – | – | – | not run — no SSH/filesystem access to this host from the container this tooling was authored in (MAN-27 implementation phase, 2026-09-04) |
-| rigel | – | – | – | – | not run — same reason; also outside the 3-host Catalyst dispatch roster, so may not have a checkout at all (research §G) |
-| sophon | – | – | – | – | not run — same reason |
-| vega | – | – | – | – | not run — same reason |
+| roster host 1 | – | – | – | – | not run — no SSH/filesystem access to this host from the container this tooling was authored in (MAN-27 implementation phase, 2026-09-04) |
+| off-roster host | – | – | – | – | not run — same reason; also outside the 3-host Catalyst dispatch roster, so may not have a checkout at all (research §G) |
+| roster host 2 | – | – | – | – | not run — same reason |
+| roster host 3 | – | – | – | – | not run — same reason |
 | *(implementation host)* | – | – | – | – | not run — the container this was authored in has no `~/catalyst/`, no `~/code-repos/`, and is not a persistent fleet host (research §F) |
 
 ## Troubleshooting
