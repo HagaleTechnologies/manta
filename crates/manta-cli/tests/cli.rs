@@ -2951,40 +2951,47 @@ fn status_against_a_dead_address_fails_with_exit_code_two_and_a_plain_message() 
 }
 
 /// MAN-332: given `--addr`, `run_status` skips `daemon_server_config`, so
-/// an unparseable `MANTA_CONFIG` file is never read and no `MANTA_*`
-/// variable is applied or validated -- as docs/CONFIG.md's Precedence
-/// section says. Same never-accepted listener as the test above.
+/// `MANTA_CONFIG` is never read and no `MANTA_*` variable is applied or
+/// validated -- as docs/CONFIG.md's Precedence section says. An
+/// unparseable file fails the load before the variables are checked, so a
+/// valid file pins the variables on their own. Same never-accepted
+/// listener as the test above.
 #[test]
 fn status_with_addr_ignores_manta_config_and_manta_variables() {
     let dir = tempfile::tempdir().unwrap();
     let bad = write_cfg(dir.path(), "bad.toml", "garbage not toml [[[\n");
+    let good = write_cfg(dir.path(), "good.toml", SERVER_TOML);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let out = manta()
-        .env("MANTA_CONFIG", &bad)
-        .env("MANTA_SERVER_METRICS_PORT", "notaport")
-        .env("MANTA_NO_SUCH_TABLE_KEY", "1")
-        .args(["status", "--addr", &addr.to_string(), "--timeout-secs", "1"])
-        .output()
-        .unwrap();
-    drop(listener);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
-    assert!(
-        stderr.contains(&addr.to_string()),
-        "expected the --addr address in the error message, got: {stderr}"
-    );
-    for unread in [
-        "bad.toml",
-        "MANTA_SERVER_METRICS_PORT",
-        "MANTA_NO_SUCH_TABLE_KEY",
-    ] {
+    for config in [&bad, &good] {
+        let out = manta()
+            .env("MANTA_CONFIG", config)
+            .env("MANTA_SERVER_METRICS_PORT", "notaport")
+            .env("MANTA_NO_SUCH_TABLE_KEY", "1")
+            .args(["status", "--addr", &addr.to_string(), "--timeout-secs", "1"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let config = config.display();
+        assert_eq!(out.status.code(), Some(2), "{config}: stderr: {stderr}");
         assert!(
-            !stderr.contains(unread),
-            "--addr must not read MANTA_CONFIG or MANTA_*, but stderr names {unread}: {stderr}"
+            stderr.contains(&addr.to_string()),
+            "{config}: expected the --addr address in the error message, got: {stderr}"
         );
+        for unread in [
+            "bad.toml",
+            "good.toml",
+            "MANTA_SERVER_METRICS_PORT",
+            "MANTA_NO_SUCH_TABLE_KEY",
+        ] {
+            assert!(
+                !stderr.contains(unread),
+                "{config}: --addr must not read MANTA_CONFIG or MANTA_*, but stderr names {unread}: {stderr}"
+            );
+        }
     }
+    drop(listener);
 }
 
 /// MAN-44 CR-A regression: an invalid `--addr` must exit 2 ("couldn't
