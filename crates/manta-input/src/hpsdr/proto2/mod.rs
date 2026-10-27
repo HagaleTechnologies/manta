@@ -643,14 +643,23 @@ impl IqSource for Protocol2IqSource {
             return Ok(0);
         }
         // MAN-423: the caller paused; what the radio sent meanwhile is
-        // queued on the socket, or dropped once the buffer filled. Each such
-        // pause starts its own window.
+        // queued on the socket, or dropped once the buffer filled. A pause
+        // opens a window anchored where it began. A pause while an earlier
+        // window is still open keeps that anchor and what it accounted --
+        // `(now - from) - accounted` stays the radio time not yet seen, the
+        // earlier pause's included -- and only refills `left`, since the
+        // socket may now hold a full buffer again (PR review).
         if self.read_returned.elapsed() >= PARKED_AFTER {
-            self.parked = Some(Parked {
-                from: self.read_returned,
-                accounted: 0,
-                left: self.park_window,
-            });
+            match self.parked.as_mut() {
+                Some(p) => p.left = self.park_window,
+                None => {
+                    self.parked = Some(Parked {
+                        from: self.read_returned,
+                        accounted: 0,
+                        left: self.park_window,
+                    });
+                }
+            }
         }
         self.fill_queue()?;
         let avail = &self.queue[self.queue_pos..];
@@ -1619,6 +1628,41 @@ mod tests {
         assert_eq!(src.gap_stats().gaps_detected, 2);
         assert_eq!(src.gap_stats().dropped_packets, 0);
         assert_wall_clock_discontinuity(accounted, before_read - pause, after_read - before_pause);
+    }
+
+    /// MAN-423 review: a second pause while the first park's backlog still
+    /// drains keeps the first anchor. A 4 s park (the review's 15 s, scaled
+    /// for test time), half the 100-datagram backlog drained, a 200 ms
+    /// pause, the rest drained: an 11,000-datagram jump then fits the
+    /// 4 s bound (about 11,400 datagrams) and is a loss of 2,618,000
+    /// samples. Before the fix the second pause re-anchored the window, the
+    /// bound fell to about 0.2 s (8,355 datagrams), and the jump read as a
+    /// restart of a few tens of thousands of samples.
+    #[test]
+    fn a_second_pause_while_a_park_drains_keeps_its_anchor() {
+        let fake = FakeP2Radio::start();
+        let mut src = open(&fake);
+        fake.send_iq(0);
+        read_one(&mut src);
+        thread::sleep(Duration::from_secs(4));
+        for s in 1..101 {
+            fake.send_iq(s);
+        }
+        for _ in 0..50 {
+            read_one(&mut src);
+        }
+        thread::sleep(Duration::from_millis(200));
+        for _ in 0..50 {
+            read_one(&mut src);
+        }
+        let jump = 101 + 11_000;
+        fake.send_iq(jump);
+        assert_eq!(read_one(&mut src), (jump, 238));
+        assert_eq!(src.take_missing_samples(), None);
+        assert_eq!(src.take_discontinuity(), Some(11_000 * 238));
+        let stats = src.gap_stats();
+        assert_eq!(stats.dropped_packets, 11_000);
+        assert_eq!(stats.gaps_detected, 1);
     }
 
     /// MAN-423: a source read without pause keeps the fixed allowance: a

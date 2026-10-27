@@ -85,7 +85,11 @@ with `at <= pos` subtracts nothing); it only bounds the queue to about
 the time since the previous `read()` returned (or since `open()`'s run = 1).
 A pause of at least 100 ms (`PARKED_AFTER`) opens a window
 `Parked { from, accounted: 0, left: park_window }` anchored where the pause
-began; each pause opens its own. While a window is open, `handle_iq` judges
+began. A pause while a window is still open keeps its anchor and
+`accounted` (the earlier pause's unseen radio time is still owed) and only
+refills `left` (third review round: a 4 s park, half its backlog drained, a
+200 ms pause re-anchored the window and an 11,000-datagram loss read as a
+0.14 s restart; test `a_second_pause_while_a_park_drains_keeps_its_anchor`). While a window is open, `handle_iq` judges
 a gap or restart against `max(since_last, (now - from) - accounted / fs)`,
 for both D10's plausible-jump bound and D11's restart estimate. Each
 accepted datagram adds its 238 samples plus whatever it reported to
