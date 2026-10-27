@@ -11,6 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-26 | MAN-249 | [MAN-249: public docs name roles, not machines, people or receiver hosts](2026-10-26-man249-public-disclosure.md) |
 | 2026-10-26 | MAN-292 | [Reconcile completed outages across long sample gaps](2026-10-26-man292-outage-deltas-across-sample-gaps.md) |
 | 2026-10-26 | MAN-436 | [MAN-436: same-input dedupe decides against the station's newest spot across a bucket edge](2026-10-26-man436-dedupe-edge-newest-spot.md) |
 | 2026-10-26 | MAN-302 | [MAN-302: UberSDR wide IQ, clean-room provenance; the input waits on a hardware-free local receiver](2026-10-26-man302-ubersdr-iq-clean-room.md) |

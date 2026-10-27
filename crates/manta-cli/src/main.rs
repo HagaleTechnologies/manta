@@ -167,8 +167,9 @@ enum Command {
         /// recording's time window.
         rbn_csv: PathBuf,
         /// Spotter callsign whose spots are the reference set -- normally
-        /// the skimmer that sat next to this receiver.
-        #[arg(long, default_value = "K5TR")]
+        /// the skimmer that sat next to this receiver. Required: the right
+        /// call depends on the recording.
+        #[arg(long)]
         spotter: String,
         /// When the recording starts, as ISO-8601 UTC (for example
         /// 2025-11-29T00:00:00Z).
@@ -12879,6 +12880,32 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         }
     }
 
+    /// MAN-249: `oracle --spotter` has no default, because the reference
+    /// skimmer depends on the recording.
+    #[test]
+    fn oracle_requires_a_spotter() {
+        use clap::error::ErrorKind;
+        let argv = [
+            "manta",
+            "oracle",
+            "a.wav",
+            "b.csv",
+            "--capture-start",
+            "2025-11-29T00:00:00Z",
+        ];
+        let err = match Cli::try_parse_from(argv) {
+            Ok(_) => panic!("oracle parsed without --spotter"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument, "{err}");
+        assert!(err.to_string().contains("--spotter <SPOTTER>"), "{err}");
+        let with = argv.iter().copied().chain(["--spotter", "N0ABC"]);
+        match Cli::try_parse_from(with).unwrap().command {
+            Command::Oracle { spotter, .. } => assert_eq!(spotter, "N0ABC"),
+            _ => unreachable!("`manta oracle` parses as Command::Oracle"),
+        }
+    }
+
     #[test]
     fn every_config_backed_flag_maps_to_a_key() {
         use clap::CommandFactory;
@@ -12968,7 +12995,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             (
                 "rbn_compare.spotters",
                 "[server]\nstation_callsign = \"W1AW\"\n[rbn_compare]\n\
-                 spotters = [\"K5TR\"]\n",
+                 spotters = [\"N0ABC\"]\n",
             ),
         ];
         for (_, key) in FLAG_KEYS {
@@ -13788,12 +13815,12 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
 
     #[test]
     fn rbn_spotter_flag_replaces_file_spotters() {
-        let rbn = run_rbn_opts(&["--rbn-spotter", "k5tr", "--rbn-spotter", "N0XYZ"]).unwrap();
+        let rbn = run_rbn_opts(&["--rbn-spotter", "n0abc", "--rbn-spotter", "N0XYZ"]).unwrap();
         assert_eq!(
             rbn.rbn_spotter,
-            vec!["K5TR".to_string(), "N0XYZ".to_string()]
+            vec!["N0ABC".to_string(), "N0XYZ".to_string()]
         );
-        assert!(run_rbn_opts(&["--rbn-spotter", "K5TR-#"]).is_err());
+        assert!(run_rbn_opts(&["--rbn-spotter", "N0ABC-#"]).is_err());
         assert!(run_rbn_opts(&["--rbn-spotter", "not a call"]).is_err());
         let body = format!("{RBN_SERVER}[rbn_compare]\nenabled = true\nspotters = [\"W1AW\"]\n");
         let rc = prepare_rbn(&body, rbn, None)
@@ -13801,7 +13828,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             .resolved
             .rbn_compare
             .unwrap();
-        assert_eq!(rc.spotters, vec!["K5TR".to_string(), "N0XYZ".to_string()]);
+        assert_eq!(rc.spotters, vec!["N0ABC".to_string(), "N0XYZ".to_string()]);
         let rc = prepare_rbn(&body, RbnCompareOpts::default(), None)
             .unwrap()
             .resolved
@@ -13818,7 +13845,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
         // So is one the file's exclude_spotters names.
         let body = format!("{body}exclude_spotters = [\"N0XYZ\"]\n");
-        let excluded = run_rbn_opts(&["--rbn-spotter", "K5TR", "--rbn-spotter", "n0xyz"]).unwrap();
+        let excluded = run_rbn_opts(&["--rbn-spotter", "N0ABC", "--rbn-spotter", "n0xyz"]).unwrap();
         let err = format!("{:#}", prepare_rbn(&body, excluded, None).err().unwrap());
         assert_eq!(
             err,
@@ -13829,7 +13856,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
 
     #[test]
     fn rbn_spotter_without_comparison_is_refused() {
-        let rbn = run_rbn_opts(&["--rbn-spotter", "K5TR"]).unwrap();
+        let rbn = run_rbn_opts(&["--rbn-spotter", "N0ABC"]).unwrap();
         for body in [
             RBN_SERVER.to_string(),
             format!("{RBN_SERVER}[rbn_compare]\nenabled = false\n"),
@@ -13841,7 +13868,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                  [rbn_compare].enabled = true"
             );
         }
-        let with_flag = run_rbn_opts(&["--rbn-compare", "--rbn-spotter", "K5TR"]).unwrap();
+        let with_flag = run_rbn_opts(&["--rbn-compare", "--rbn-spotter", "N0ABC"]).unwrap();
         assert!(prepare_rbn(RBN_SERVER, with_flag, None).is_ok());
     }
 

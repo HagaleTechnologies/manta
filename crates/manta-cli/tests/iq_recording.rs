@@ -455,6 +455,9 @@ fn recorded_gaps_replay_through_run_and_decode_without_splicing() {
                 "oracle".as_ref(),
                 p.as_os_str(),
                 csv.as_os_str(),
+                // MAN-249: `oracle --spotter` has no default.
+                "--spotter".as_ref(),
+                "N0ABC".as_ref(),
                 "--capture-start".as_ref(),
                 "2026-10-19T00:00:00Z".as_ref(),
             ])
