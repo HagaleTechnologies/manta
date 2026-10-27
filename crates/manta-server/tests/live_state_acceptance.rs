@@ -347,9 +347,11 @@ async fn a_live_client_that_stops_reading_is_dropped_and_publishing_never_blocks
     only_the_stalled_live_client_is_dropped(None).await;
 }
 
-/// MAN-353: a client that keeps reading, but slower than the publisher
-/// could run, is not dropped with the stalled one. The clock-paced test
-/// #302 replaced fails this way on every host ("the reading client was
+/// MAN-353: a client that keeps reading, slower than a free-running
+/// publisher would go, is not dropped with the stalled one while the node
+/// stays within the 4096-record allowance of it (past that it is dropped
+/// too, as docs/LIVE-STATE.md says). The clock-paced test #302 replaced
+/// overruns the allowance on every host here ("the reading client was
 /// disconnected after N lines"), not only on `windows-latest`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_live_client_that_reads_slowly_stays_connected_while_a_stalled_one_is_dropped() {

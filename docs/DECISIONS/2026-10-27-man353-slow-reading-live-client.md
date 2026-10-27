@@ -22,9 +22,10 @@ specifies. The server was not at fault.
 
 PR #302 (`d9b2218`, 2026-10-14) paced the publisher on what the reading
 client has read instead, keeping it at most `LIVE_CHANNEL_CAPACITY / 2`
-records ahead. From then through 2026-10-27, 324 of 324 passing
-`test (windows-latest)` jobs ran the test `ok`, and it failed in none.
-Nobody linked #302 to this ticket.
+records ahead. From then through 2026-10-27 the test was `ok` in all 324
+passing `test (windows-latest)` jobs. None of the 97 failed Windows jobs
+of that period failed on it; the three of those that reached it ran it
+`ok`. Nobody linked #302 to this ticket.
 
 Windows is not a required check, and on Linux the clock-paced test passes
 even pinned to two cores beside four busy loops. CPU load does not expose
