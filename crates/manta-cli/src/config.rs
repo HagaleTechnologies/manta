@@ -860,7 +860,8 @@ fn check_relays(
     let uplink_on = server.is_some() && rbn_uplink.iter().any(|u| u.enabled);
     let needs_uplink = |table: &str, label: &str| {
         anyhow!(
-            "{origin}: [[{table}]] {label} forwards spots only through [[rbn_uplink]] -- add an              enabled [[rbn_uplink]] block, or set enabled = false on this relay"
+            "{origin}: [[{table}]] {label} forwards spots only through [[rbn_uplink]] -- add an \
+             enabled [[rbn_uplink]] block, or set enabled = false on this relay"
         )
     };
     let mut seen = std::collections::BTreeSet::new();
@@ -881,7 +882,10 @@ fn check_relays(
             for call in own {
                 if call.eq_ignore_ascii_case(&r.callsign) {
                     bail!(
-                        "{origin}: [[skimmer_relay]] {label} has callsign = \"{}\", this                          station's own call -- a skimmer relay forwards another skimmer's spots                          under that skimmer's own call (e.g. \"{}-2\"); manta already forwards                          its own",
+                        "{origin}: [[skimmer_relay]] {label} has callsign = \"{}\", this \
+                         station's own call -- a skimmer relay forwards another skimmer's spots \
+                         under that skimmer's own call (e.g. \"{}-2\"); manta already forwards \
+                         its own",
                         r.callsign,
                         manta_server::config::strip_ssid(&r.callsign),
                     );
@@ -2346,6 +2350,182 @@ mod tests {
         assert!(err.contains(": [[input]] \"b\": input.ssrc"), "{err}");
     }
 
+    // ---- MAN-320: [[skimmer_relay]] / [[wsjtx_relay]]
+
+    const UPLINK_ON: &str =
+        "[[rbn_uplink]]\nenabled = true\ntarget_host = \"127.0.0.1\"\ntarget_port = 7550\n";
+    const SKIMMER: &str =
+        "[[skimmer_relay]]\nhost = \"192.168.1.20\"\nport = 7300\ncallsign = \"W1AW-2\"\n";
+    const WSJTX: &str = "[[wsjtx_relay]]\ncallsign = \"W1AW\"\n";
+
+    #[test]
+    fn load_accepts_both_relay_tables() {
+        let loaded = load_file(&format!("{SERVER}{UPLINK_ON}{SKIMMER}{WSJTX}")).unwrap();
+        assert_eq!(loaded.skimmer_relay.len(), 1);
+        assert_eq!(loaded.wsjtx_relay.len(), 1);
+        assert_eq!(loaded.skimmer_relay[0].callsign, "W1AW-2");
+        assert_eq!(loaded.wsjtx_relay[0].label(), "127.0.0.1:2237");
+    }
+
+    #[test]
+    fn an_enabled_relay_without_an_enabled_uplink_is_rejected() {
+        let uplink_off = UPLINK_ON.replace("enabled = true", "enabled = false");
+        for uplink in ["", uplink_off.as_str()] {
+            let err = err_of(&format!("{SERVER}{uplink}{SKIMMER}"));
+            assert!(
+                err.ends_with(
+                    ": [[skimmer_relay]] 192.168.1.20:7300 forwards spots only through \
+                     [[rbn_uplink]] -- add an enabled [[rbn_uplink]] block, or set enabled = \
+                     false on this relay"
+                ),
+                "{err}"
+            );
+            let err = err_of(&format!("{SERVER}{uplink}{WSJTX}"));
+            assert!(
+                err.ends_with(
+                    ": [[wsjtx_relay]] 127.0.0.1:2237 forwards spots only through \
+                     [[rbn_uplink]] -- add an enabled [[rbn_uplink]] block, or set enabled = \
+                     false on this relay"
+                ),
+                "{err}"
+            );
+        }
+        // Without [server] either.
+        let err = err_of(WSJTX);
+        assert!(
+            err.contains("forwards spots only through [[rbn_uplink]]"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_relay_without_an_uplink_loads() {
+        let loaded = load_file(&format!(
+            "{}{}",
+            SKIMMER.replace("callsign", "enabled = false\ncallsign"),
+            WSJTX.replace("callsign", "enabled = false\ncallsign"),
+        ))
+        .unwrap();
+        assert!(!loaded.skimmer_relay[0].enabled);
+        assert!(!loaded.wsjtx_relay[0].enabled);
+    }
+
+    #[test]
+    fn a_skimmer_relay_may_not_use_the_station_call_or_an_uplink_login_call() {
+        let err = err_of(&format!(
+            "{SERVER}{UPLINK_ON}{}",
+            SKIMMER.replace("W1AW-2", "w1aw")
+        ));
+        assert!(
+            err.ends_with(
+                ": [[skimmer_relay]] 192.168.1.20:7300 has callsign = \"W1AW\", this station's \
+                 own call -- a skimmer relay forwards another skimmer's spots under that \
+                 skimmer's own call (e.g. \"W1AW-2\"); manta already forwards its own"
+            ),
+            "{err}"
+        );
+        let err = err_of(&format!(
+            "{SERVER}{UPLINK_ON}login_callsign = \"W1AW-5\"\n{}",
+            SKIMMER.replace("W1AW-2", "W1AW-5")
+        ));
+        assert!(
+            err.contains("has callsign = \"W1AW-5\", this station's own call"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_wsjtx_relay_may_use_the_station_call() {
+        let loaded = load_file(&format!("{SERVER}{UPLINK_ON}{WSJTX}")).unwrap();
+        assert_eq!(loaded.wsjtx_relay[0].callsign, "W1AW");
+    }
+
+    #[test]
+    fn duplicate_relays_are_rejected() {
+        let err = err_of(&format!("{SERVER}{UPLINK_ON}{SKIMMER}{SKIMMER}"));
+        assert!(
+            err.ends_with(": [[skimmer_relay]] 192.168.1.20:7300 is listed twice"),
+            "{err}"
+        );
+        let err = err_of(&format!("{SERVER}{UPLINK_ON}{WSJTX}{WSJTX}"));
+        assert!(
+            err.ends_with(": [[wsjtx_relay]] 127.0.0.1:2237 is listed twice"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn relay_tables_must_be_arrays() {
+        let err = err_of(&format!(
+            "{SERVER}[skimmer_relay]\nhost = \"h\"\nport = 1\ncallsign = \"W1AW-2\"\n"
+        ));
+        assert!(
+            err.ends_with(": skimmer_relay must be written [[skimmer_relay]] (an array of tables)"),
+            "{err}"
+        );
+        let err = err_of(&format!("{SERVER}[wsjtx_relay]\ncallsign = \"W1AW\"\n"));
+        assert!(
+            err.ends_with(": wsjtx_relay must be written [[wsjtx_relay]] (an array of tables)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unrecognized_table_message_lists_the_relay_tables() {
+        let err = err_of("[relay_source]\nx = 1\n");
+        assert!(
+            err.contains("[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [input], "),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn relay_field_errors_name_the_table() {
+        let err = err_of(&format!(
+            "{SERVER}{UPLINK_ON}{}",
+            SKIMMER.replace("W1AW-2", "W1AW-100")
+        ));
+        assert!(
+            err.contains(
+                ": [[skimmer_relay]]: callsign \"W1AW-100\" is not a plausible callsign (an \
+                 SSID must be -1 through -99)"
+            ),
+            "{err}"
+        );
+        let err = err_of(&format!(
+            "{SERVER}{UPLINK_ON}{}",
+            SKIMMER.replace("192.168.1.20", "<skimmer-host>")
+        ));
+        assert!(
+            err.ends_with(
+                ": [[skimmer_relay]]: host \"<skimmer-host>\" is the scaffold placeholder -- set \
+                 the skimmer's host name or address"
+            ),
+            "{err}"
+        );
+        let err = err_of(&format!(
+            "{SERVER}{UPLINK_ON}[[wsjtx_relay]]\ncallsign = \"W1AW\"\nlisten = \"[ff02::1]:2237\"\n"
+        ));
+        assert!(
+            err.ends_with(
+                ": [[wsjtx_relay]]: listen \"[ff02::1]:2237\" is an IPv6 multicast group -- use \
+                 an IPv4 group such as \"224.0.0.1:2237\", or a unicast address"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn relay_tables_cannot_be_set_from_env() {
+        for var in ["MANTA_SKIMMER_RELAY_HOST", "MANTA_WSJTX_RELAY_LISTEN"] {
+            let err = format!("{:#}", load_env(None, &[(var, "x")]).unwrap_err());
+            assert!(
+                err.contains("cannot be set from the environment; use the config file"),
+                "{err}"
+            );
+        }
+    }
+
     #[test]
     fn rbn_uplink_as_a_plain_table_is_rejected() {
         let err = err_of(&format!("{SERVER}[rbn_uplink]\nenabled = false\n"));
@@ -3766,8 +3946,8 @@ mod tests {
         let err = err_of("[telemetry]\nx = 1\n");
         assert!(
             err.ends_with(
-                "-- manta reads [server], [[rbn_uplink]], [rbn_compare], [input], [spot], \
-                 [detector], [decode]"
+                "-- manta reads [server], [[rbn_uplink]], [rbn_compare], [[skimmer_relay]], \
+                 [[wsjtx_relay]], [input], [spot], [detector], [decode]"
             ),
             "{err}"
         );

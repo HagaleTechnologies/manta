@@ -10103,6 +10103,82 @@ mod tests {
         assert!(err.starts_with("[server]: "), "{err}");
     }
 
+    /// MAN-320: the loaded relay blocks, as `run` hands them over.
+    fn relay_test_start(body: &str) -> Result<(tokio::runtime::Runtime, SpotServer)> {
+        let cfg_file = write_temp_file(body.as_bytes());
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
+        start_spot_server(
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
+            None,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0),
+                freq_calibration: 1.0,
+                coverage: &[],
+                inputs: None,
+            },
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+            bundled_reference_lists(),
+            &PipelineConfig::default(),
+            RelayConfigs {
+                skimmer: loaded.skimmer_relay,
+                wsjtx: loaded.wsjtx_relay,
+            },
+        )
+    }
+
+    const RELAY_SERVER: &str =
+        "[server]\nstation_callsign = \"W3XYZ\"\nbind_addr = \"127.0.0.1\"\n\
+         telnet_port = 0\njson_port = 0\nmetrics_port = 0\n\
+         [[rbn_uplink]]\nenabled = true\ntarget_host = \"127.0.0.1\"\ntarget_port = 9\n";
+
+    #[test]
+    fn a_taken_unicast_port_is_a_startup_error_naming_the_relay() {
+        let taken = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = taken.local_addr().unwrap();
+        let Err(err) = relay_test_start(&format!(
+            "{RELAY_SERVER}[[wsjtx_relay]]\nlisten = \"{addr}\"\ncallsign = \"W3XYZ\"\n"
+        )) else {
+            panic!("a taken UDP port must fail startup");
+        };
+        let err = format!("{err:#}");
+        assert!(
+            err.starts_with(&format!("[[wsjtx_relay]] cannot listen on {addr}: ")),
+            "{err}"
+        );
+        assert!(err.contains("another program may own the port"), "{err}");
+    }
+
+    #[test]
+    fn start_spot_server_registers_one_relay_series_per_block() {
+        let (_rt, server) = relay_test_start(&format!(
+            "{RELAY_SERVER}[[skimmer_relay]]\nhost = \"127.0.0.1\"\nport = 9\n\
+             callsign = \"W3XYZ-2\"\n\
+             [[skimmer_relay]]\nhost = \"192.0.2.1\"\nport = 7300\ncallsign = \"W3XYZ-3\"\n\
+             enabled = false\n\
+             [[wsjtx_relay]]\nlisten = \"127.0.0.1:0\"\ncallsign = \"W3XYZ\"\n\
+             [[wsjtx_relay]]\nlisten = \"127.0.0.1:2237\"\ncallsign = \"W3XYZ\"\n\
+             enabled = false\n"
+        ))
+        .unwrap();
+        let text = server.metrics.render_prometheus_text();
+        for series in [
+            "relay=\"127.0.0.1:9\",kind=\"skimmer\"",
+            "relay=\"192.0.2.1:7300\",kind=\"skimmer\"",
+            "relay=\"127.0.0.1:0\",kind=\"wsjtx\"",
+            "relay=\"127.0.0.1:2237\",kind=\"wsjtx\"",
+        ] {
+            assert!(
+                text.contains(&format!("manta_relay_spots_total{{{series}}} 0")),
+                "{series} missing:\n{text}"
+            );
+        }
+    }
+
     #[test]
     fn two_enabled_uplink_targets_each_independently_connect() {
         let target1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
