@@ -212,8 +212,9 @@ pub struct Protocol2IqSource {
     /// buffer, [`MAX_BUFFERED_DATAGRAMS`]).
     pub(crate) park_window: u64,
     /// MAN-423 review: datagrams already received by a restart's look-ahead
-    /// ([`Self::restart_outage`]), handled before the socket's next.
-    look_ahead: VecDeque<(Vec<u8>, SocketAddr)>,
+    /// ([`Self::restart_outage`]), handled before the socket's next, each
+    /// with its sequence number if it is a valid DDC0 IQ datagram.
+    look_ahead: VecDeque<(Vec<u8>, SocketAddr, Option<u32>)>,
     /// MAN-259: offset from entering `open()` to immediately before the
     /// first run command; [`super::open_receiver`] adds its discovery time.
     pub(crate) acquisition_start_offset: Duration,
@@ -421,7 +422,7 @@ impl Protocol2IqSource {
             wire::SeqEvent::Gap(k)
                 if u64::from(k) > plausible_lost_datagrams(since_last, self.sample_rate_hz) =>
             {
-                let outage = self.restart_outage(since_last, seq);
+                let outage = self.restart_outage(since_last);
                 self.report_restart(outage)
             }
             wire::SeqEvent::Gap(k) => {
@@ -436,7 +437,7 @@ impl Protocol2IqSource {
                 missing
             }
             wire::SeqEvent::Restart => {
-                let outage = self.restart_outage(since_last, seq);
+                let outage = self.restart_outage(since_last);
                 self.report_restart(outage)
             }
         };
@@ -467,61 +468,74 @@ impl Protocol2IqSource {
         }
     }
 
-    /// MAN-423 review: the outage a restart at `seq` reports. Outside a
-    /// park it is `since_last`. While a parked backlog drains, the pause is
-    /// only an upper bound: a radio that restarted early in the pause kept
-    /// streaming, and its post-restart datagrams still wait on the socket,
-    /// so the whole pause read as missing would run every later timestamp
-    /// ahead by what they hold (and count a later overflow gap twice). The
-    /// backlog is received now, without blocking: the highest sequence of
-    /// its increasing post-restart run says how many datagrams the radio has
-    /// sent since `seq`, and only the unaccounted time beyond those is the
-    /// outage. The datagrams are handled afterwards as if just received.
-    fn restart_outage(&mut self, since_last: Duration, seq: u32) -> Duration {
+    /// MAN-423 review: the outage the restart just observed reports.
+    /// Outside a park it is `since_last`. While a parked backlog drains, the
+    /// pause is only an upper bound: a radio that restarted early in the
+    /// pause kept streaming, and its post-restart datagrams still wait on
+    /// the socket, so the whole pause read as missing would run every later
+    /// timestamp ahead by what they hold (and count a later overflow gap
+    /// twice). The backlog is received now, without blocking: what it holds
+    /// says how many datagrams of radio time have passed since the restart
+    /// ([`Self::receive_backlog`]), and only the unaccounted time beyond
+    /// those is the outage. The datagrams are handled afterwards as if just
+    /// received.
+    fn restart_outage(&mut self, since_last: Duration) -> Duration {
         if self.parked.is_none() {
             return since_last;
         }
-        let sent_since = self.receive_backlog(seq);
+        let sent_since = self.receive_backlog(since_last);
         let covered = Duration::from_secs_f64(
             sent_since as f64 * wire::SAMPLES_PER_DATAGRAM as f64 / self.sample_rate_hz,
         );
         self.unaccounted(Instant::now()).saturating_sub(covered)
     }
 
-    /// Receive what the socket already holds into `look_ahead` (at most
-    /// [`MAX_BUFFERED_DATAGRAMS`]) and return how far DDC0's sequence runs
-    /// past `restart_seq` while it keeps increasing. A socket that cannot be
-    /// made non-blocking reads as no backlog (the pause bound then stands).
-    fn receive_backlog(&mut self, restart_seq: u32) -> u64 {
-        if self.socket.set_nonblocking(true).is_err() {
-            return 0;
-        }
-        let mut last = restart_seq;
-        let mut increasing = true;
-        let mut scratch = Vec::with_capacity(wire::SAMPLES_PER_DATAGRAM);
-        let mut buf = vec![0u8; RECV_BUF_LEN];
-        while self.look_ahead.len() < MAX_BUFFERED_DATAGRAMS as usize {
-            let Ok((len, from)) = self.socket.recv_from(&mut buf) else {
-                // WouldBlock: drained. Any other error surfaces on the
-                // next blocking receive.
-                break;
-            };
-            if increasing && self.is_ddc0(from) {
+    /// Receive what the socket already holds onto `look_ahead` (at most
+    /// [`MAX_BUFFERED_DATAGRAMS`] queued) and return how many datagrams of
+    /// radio time everything queued there covers after the datagram the
+    /// tracker last observed. DDC0's sequence is read through a copy of the
+    /// tracker, as it will be read when handled: a datagram the tracker will
+    /// discard as stale (a reordered one, say) covers nothing and the run
+    /// goes on past it; a gap within the bound the restart was judged
+    /// against (`since_last`, D10) covers its lost datagrams too, and a
+    /// larger one, which will be handled as a restart, only itself; a later
+    /// restart's run counts in full, since it is radio time after this
+    /// restart as well. What an earlier restart's look-ahead still holds is
+    /// counted first. A socket that cannot be made non-blocking adds nothing
+    /// to what is queued.
+    fn receive_backlog(&mut self, since_last: Duration) -> u64 {
+        if self.socket.set_nonblocking(true).is_ok() {
+            let mut buf = vec![0u8; RECV_BUF_LEN];
+            let mut scratch = Vec::with_capacity(wire::SAMPLES_PER_DATAGRAM);
+            while self.look_ahead.len() < MAX_BUFFERED_DATAGRAMS as usize {
+                let Ok((len, from)) = self.socket.recv_from(&mut buf) else {
+                    // WouldBlock: drained. Any other error surfaces on the
+                    // next blocking receive.
+                    break;
+                };
+                // Parsed once here, not again by every later restart's count.
                 scratch.clear();
-                if let Ok(s) = wire::parse_iq_datagram(&buf[..len], &mut scratch) {
-                    if (s.wrapping_sub(last) as i32) > 0 {
-                        last = s;
-                    } else {
-                        increasing = false;
-                    }
-                }
+                let seq = self
+                    .is_ddc0(from)
+                    .then(|| wire::parse_iq_datagram(&buf[..len], &mut scratch).ok())
+                    .flatten();
+                self.look_ahead.push_back((buf[..len].to_vec(), from, seq));
             }
-            self.look_ahead.push_back((buf[..len].to_vec(), from));
+            // A failure here leaves the socket non-blocking; the next
+            // receive reports it as an error rather than waiting.
+            let _ = self.socket.set_nonblocking(false);
         }
-        // A failure here leaves the socket non-blocking; the next receive
-        // reports it as an error rather than waiting.
-        let _ = self.socket.set_nonblocking(false);
-        u64::from(last.wrapping_sub(restart_seq))
+        let plausible = plausible_lost_datagrams(since_last, self.sample_rate_hz);
+        let mut tracker = self.tracker.clone();
+        self.look_ahead
+            .iter()
+            .filter_map(|(_, _, seq)| *seq)
+            .map(|seq| match tracker.observe(seq) {
+                wire::SeqEvent::Stale => 0,
+                wire::SeqEvent::Gap(k) if u64::from(k) <= plausible => u64::from(k) + 1,
+                wire::SeqEvent::InOrder | wire::SeqEvent::Gap(_) | wire::SeqEvent::Restart => 1,
+            })
+            .sum()
     }
 
     /// Whether `from` is the radio's DDC0 IQ port.
@@ -565,7 +579,7 @@ impl Protocol2IqSource {
                 );
             }
             self.send_keepalive_if_due()?;
-            let (len, from) = if let Some((bytes, from)) = self.look_ahead.pop_front() {
+            let (len, from) = if let Some((bytes, from, _)) = self.look_ahead.pop_front() {
                 self.recv_buf[..bytes.len()].copy_from_slice(&bytes);
                 (bytes.len(), from)
             } else {
@@ -1550,6 +1564,94 @@ mod tests {
         assert_eq!(stats.dropped_packets, 20);
         assert_eq!(stats.gaps_detected, 2);
         assert_wall_clock_discontinuity(accounted, before_read - pause, after_read - before_pause);
+    }
+
+    /// MAN-423 review: read five datagrams, pause, queue five more and then
+    /// each of `runs` 20 ms apart, and read `reads` datagrams back 500 ms
+    /// later. Every sample accounted after the pause (read, missing or
+    /// discontinuity) must add up to the pause's wall clock. Returns the
+    /// discontinuities reported and the gap counters.
+    fn drain_runs_behind_a_park(runs: &[Vec<u32>], reads: usize) -> (Vec<u64>, GapStats) {
+        let fake = FakeP2Radio::start();
+        let mut src = open(&fake);
+        for s in 0..5 {
+            fake.send_iq(s);
+        }
+        for _ in 0..4 {
+            read_one(&mut src);
+        }
+        let before_pause = Instant::now();
+        read_one(&mut src);
+        let pause = Instant::now();
+        for s in 5..10 {
+            fake.send_iq(s);
+        }
+        for run in runs {
+            thread::sleep(Duration::from_millis(20));
+            for &s in run {
+                fake.send_iq(s);
+            }
+        }
+        thread::sleep(Duration::from_millis(500));
+        let before_read = Instant::now();
+        let mut accounted = 0u64;
+        let mut discontinuities = Vec::new();
+        for _ in 0..reads {
+            let (_, n) = read_one(&mut src);
+            accounted += n as u64;
+            accounted += src.take_missing_samples().unwrap_or(0);
+            if let Some(d) = src.take_discontinuity() {
+                discontinuities.push(d);
+                accounted += d;
+            }
+        }
+        let after_read = Instant::now();
+        assert_wall_clock_discontinuity(accounted, before_read - pause, after_read - before_pause);
+        (discontinuities, src.gap_stats())
+    }
+
+    /// MAN-423 review: a reordered datagram in a parked restart's queued run
+    /// (`0, 1, 3, 2, 4, ..., 99`) is discarded as stale when read, and the
+    /// run goes on; the restart's outage must take off the whole run, not
+    /// stop at 3 (before the fix: 96 datagrams, about 22,800 samples,
+    /// ahead).
+    #[test]
+    fn a_reordered_datagram_does_not_end_a_parked_restarts_run() {
+        let run: Vec<u32> = [0, 1, 3, 2].into_iter().chain(4..100).collect();
+        // 5 pre-restart datagrams and the run less the stale 2.
+        let (discontinuities, stats) = drain_runs_behind_a_park(&[run], 5 + 99);
+        assert_eq!(discontinuities.len(), 1, "{discontinuities:?}");
+        assert_eq!(stats.dropped_packets, 1);
+        assert_eq!(stats.gaps_detected, 2);
+    }
+
+    /// MAN-423 review: a radio that restarts twice in one pause leaves two
+    /// post-restart runs queued (`0..50, 0..50`). The first restart's
+    /// outage must take off both, since the second run is radio time after
+    /// it too, and the second restart's must see the run still queued
+    /// (before the fix: the second run, 11,900 samples, ahead).
+    #[test]
+    fn two_restarts_behind_a_park_take_both_runs_off_the_outage() {
+        let run: Vec<u32> = (0..50).collect();
+        let (discontinuities, stats) = drain_runs_behind_a_park(&[run.clone(), run], 5 + 100);
+        assert_eq!(discontinuities.len(), 2, "{discontinuities:?}");
+        assert_eq!(stats.dropped_packets, 0);
+        assert_eq!(stats.gaps_detected, 2);
+    }
+
+    /// MAN-423 review: a corrupt sequence number in a parked restart's
+    /// queued run (`0..20`, then 2^30, then `20..50`) will be handled as a
+    /// restart, not as 2^30 lost datagrams, so it covers only itself: the
+    /// first restart still reports the pause less the queue (before the
+    /// fix: 0, the jump covering the whole pause).
+    #[test]
+    fn a_corrupt_jump_in_a_parked_restarts_run_covers_only_itself() {
+        let run: Vec<u32> = (0..20).chain([1 << 30]).chain(20..50).collect();
+        let (discontinuities, stats) = drain_runs_behind_a_park(&[run], 5 + 51);
+        assert_eq!(discontinuities.len(), 3, "{discontinuities:?}");
+        assert!(discontinuities[0] > 50_000, "{discontinuities:?}");
+        assert_eq!(stats.dropped_packets, 0);
+        assert_eq!(stats.gaps_detected, 3);
     }
 
     /// MAN-423: a source read without pause keeps the fixed allowance: a

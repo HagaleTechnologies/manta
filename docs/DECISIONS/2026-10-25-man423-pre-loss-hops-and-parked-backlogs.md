@@ -105,15 +105,32 @@ post-restart datagrams are queued behind sequence 0, and reporting the whole
 unaccounted pause as missing would run every later timestamp ahead by what
 they hold (and count a later overflow gap again). On a restart while a
 window is open, `restart_outage` receives the socket's backlog without
-blocking (at most `MAX_BUFFERED_DATAGRAMS`, kept in `look_ahead` and handled
-next as if just received), takes how far DDC0's increasing sequence runs past
-the restart, and reports `(now - from) - accounted / fs` less that many
-datagrams' time. Outside a window the estimate is the old `since_last`.
+blocking (at most `MAX_BUFFERED_DATAGRAMS` queued, kept in `look_ahead` and
+handled next as if just received), counts the datagrams of radio time
+everything queued covers after the restart, and reports `(now - from) -
+accounted / fs` less that many datagrams' time. Outside a window the
+estimate is the old `since_last`. The count reads DDC0's sequence through a
+copy of the tracker, as handling will: a datagram the tracker will discard
+as stale (a reordered one, say) counts nothing and the run goes on past it;
+a gap within the bound the restart was judged against counts its lost
+datagrams, and a larger one, which handling takes for a restart, only
+itself; a later restart's queued run counts in full, and a later restart
+counts what `look_ahead` still holds before the socket. With two restarts in
+one pause the split of the outage between them is unknown, so the first
+takes it all: its run is stamped late by the second outage, while the
+backlog as a whole still sums to the pause's wall clock.
 Test `an_early_restart_behind_a_park_does_not_count_its_backlog_twice`: five
 pre-restart datagrams, then 0..=119 with 20 lost, behind a 0.5 s pause; every
 sample accounted after the pause adds up to the pause's wall clock (before:
-about 28,300 samples, the run's 119 datagrams, ahead). Real radios pace their
-datagrams, so the queued run is radio time since the restart;
+about 28,300 samples, the run's 119 datagrams, ahead). Tests
+`a_reordered_datagram_does_not_end_a_parked_restarts_run` (run `0, 1, 3, 2,
+4, ..., 99`; before: 96 datagrams ahead, the count stopping at 3) and
+`two_restarts_behind_a_park_take_both_runs_off_the_outage` (`0..50, 0..50`;
+before: the second run, 11,900 samples, ahead) pin the same sum, and
+`a_corrupt_jump_in_a_parked_restarts_run_covers_only_itself` (a jump of 2^30
+inside the run; before: the first restart reported 0) pins the bound. Real
+radios pace their datagrams, so the queued run is radio time since the
+restart;
 `radio_restart_resyncs_with_a_wall_clock_discontinuity`, whose fake sends
 its ten restart datagrams in one burst after a 300 ms pause, now expects the
 nine queued behind sequence 0 to come off the estimate.
