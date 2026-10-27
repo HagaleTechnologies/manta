@@ -2974,15 +2974,33 @@ fn docs_index_links_every_runbook() {
     }
 }
 
+/// MAN-440: scripts/decisions-index.py builds each docs/DECISIONS/README.md row from the
+/// record's file name (date, ticket) and its one-line `# ` heading (title), so a record PR
+/// adds only its file. Keep this equal to NAME in scripts/decisions-index.py;
+/// scripts/tests/test_decisions_index.py checks the two match.
+const DECISION_RECORD_NAME: &str =
+    r"^([0-9]{4}-[0-9]{2}-[0-9]{2})-(?:man-?([0-9]+)-)?[a-z0-9][a-z0-9-]*\.md$";
+
 #[test]
-fn decisions_index_links_every_record() {
-    let targets = link_targets(&doc(DECISIONS_INDEX));
+fn decision_records_have_indexable_names_and_headings() {
+    let name = regex::Regex::new(DECISION_RECORD_NAME).unwrap();
     let records = md_files_in("docs/DECISIONS");
     assert!(!records.is_empty(), "docs/DECISIONS has no records");
-    for name in records {
+    for file in records {
         assert!(
-            targets.iter().any(|t| t.split('#').next() == Some(name.as_str())),
-            "{DECISIONS_INDEX} does not link {name}: add a `| date | ticket | [title]({name}) |` row"
+            name.is_match(&file),
+            "docs/DECISIONS/{file}: name it YYYY-MM-DD-manNNN-slug.md (lowercase slug); the index reads the date and ticket from the name"
+        );
+        let md = doc(&format!("docs/DECISIONS/{file}"));
+        let mut lines = md.lines();
+        let first = lines.next().unwrap_or("");
+        assert!(
+            first.len() > 2 && first.starts_with("# "),
+            "docs/DECISIONS/{file}: line 1 must be the record's `# ` title"
+        );
+        assert!(
+            lines.next().is_none_or(|l| l.trim().is_empty()),
+            "docs/DECISIONS/{file}: line 2 must be blank; a `# ` heading is one line and the index title is that line"
         );
     }
 }
