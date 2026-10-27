@@ -302,13 +302,17 @@ impl HearingCounters {
     }
 }
 
-/// Each input's published spot total, in `names` order.
-fn input_spot_totals(metrics: &Metrics, names: &[String]) -> Vec<u64> {
+/// Each input's published spot and cross-input dedupe totals, in `names` order.
+fn input_hearing_totals(metrics: &Metrics, names: &[String]) -> (Vec<u64>, Vec<u64>) {
     let rows = metrics.input_hearing();
     names
         .iter()
-        .map(|name| rows.iter().find(|r| &r.name == name).map_or(0, |r| r.spots))
-        .collect()
+        .map(|name| {
+            rows.iter()
+                .find(|r| &r.name == name)
+                .map_or((0, 0), |r| (r.spots, r.cross_input_dupes))
+        })
+        .unzip()
 }
 
 /// MAN-14: the silent-input check, once a second until the run stops.
@@ -322,16 +326,16 @@ fn spawn_silent_watch(
 ) {
     use crate::silent::{recovered_line, silent_warning, SilentNote, SilentWatch};
     rt.spawn(async move {
-        let mut watch =
-            SilentWatch::new(window, Instant::now(), &input_spot_totals(&metrics, &names));
+        let (spots, dupes) = input_hearing_totals(&metrics, &names);
+        let mut watch = SilentWatch::new(window, Instant::now(), &spots, &dupes);
         loop {
             tokio::time::sleep(SILENT_INPUT_TICK).await;
             if stop.load(Ordering::Relaxed) {
                 return;
             }
             let up: Vec<bool> = healthy.iter().map(|h| h.load(Ordering::Relaxed)).collect();
-            let totals = input_spot_totals(&metrics, &names);
-            for note in watch.tick(Instant::now(), &totals, &up) {
+            let (spots, dupes) = input_hearing_totals(&metrics, &names);
+            for note in watch.tick(Instant::now(), &spots, &dupes, &up) {
                 match note {
                     SilentNote::Silent {
                         input,
@@ -961,7 +965,11 @@ mod tests {
         let rows = metrics.input_hearing();
         assert_eq!((rows[0].spots, rows[0].distinct_calls), (3, 2));
         assert_eq!((rows[1].spots, rows[1].distinct_calls), (1, 1));
-        assert_eq!(input_spot_totals(&metrics, &names), vec![3, 1]);
+        metrics.set_input_cross_input_dupes("beta", 2);
+        assert_eq!(
+            input_hearing_totals(&metrics, &names),
+            (vec![3, 1], vec![0, 2])
+        );
     }
 
     #[test]
