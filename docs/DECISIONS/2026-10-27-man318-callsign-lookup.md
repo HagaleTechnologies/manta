@@ -24,7 +24,9 @@ The feature is the opt-in `[callsign_lookup]` table
   beacon path at track close), so no lookup is spent on a call validation
   already rejects. A call without an answer yet is held and recorded as
   `deferred`/`lookupPending`; the later decision is `spotted` or
-  `withheld`/`lookupNotFound`. Every side effect of a spot stays in the one
+  `withheld`/`lookupNotFound`, or `withheld`/`blocklist` or `notch` when a
+  SIGHUP reload changed those lists while it was held (the MAN-78
+  pending-beacon rule). Every side effect of a spot stays in the one
   existing `on_spot` path, so a withheld call reaches no surface (telnet,
   JSON/WebSocket, the RBN uplink, stdout, `manta_spots_total`). Rejected: a
   gate in `run`'s `on_spot` closures (duplicated across the single- and
