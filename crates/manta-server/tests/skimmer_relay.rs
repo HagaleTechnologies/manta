@@ -329,3 +329,50 @@ async fn a_second_skimmers_spot_reaches_the_collector_under_its_own_call() {
     let _ = h.shutdown_tx.send(true);
     let _ = up_tx.send(true);
 }
+
+/// D10: no idle timeout -- two silent hours keep the session (paused time
+/// auto-advances while the runtime is idle).
+#[tokio::test(start_paused = true)]
+async fn a_quiet_skimmer_is_not_disconnected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let h = spawn_relay(listener.local_addr().unwrap().port());
+    let (_login, mut r, _w) = accept_and_login(&listener).await;
+    wait_for("up", || h.stats.up()).await;
+    // Drain keepalives for two hours; the session never drops.
+    let end = tokio::time::Instant::now() + Duration::from_secs(2 * 3600);
+    while tokio::time::Instant::now() < end {
+        let mut line = String::new();
+        let _ = tokio::time::timeout(Duration::from_secs(600), r.read_line(&mut line)).await;
+        assert!(h.stats.up(), "a quiet skimmer was disconnected");
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), listener.accept())
+            .await
+            .is_err(),
+        "the relay reconnected"
+    );
+    let _ = h.shutdown_tx.send(true);
+}
+
+#[tokio::test(start_paused = true)]
+async fn sends_a_blank_keepalive_every_300_s() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let h = spawn_relay(listener.local_addr().unwrap().port());
+    let (_login, mut r, _w) = accept_and_login(&listener).await;
+    let start = tokio::time::Instant::now();
+    for n in 1..=2u64 {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(400), r.read_line(&mut line))
+            .await
+            .expect("no keepalive")
+            .unwrap();
+        assert_eq!(line, "\r\n");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= skimmer::KEEPALIVE_INTERVAL * n as u32 - Duration::from_secs(1)
+                && elapsed < skimmer::KEEPALIVE_INTERVAL * n as u32 + Duration::from_secs(1),
+            "keepalive {n} at {elapsed:?}"
+        );
+    }
+    let _ = h.shutdown_tx.send(true);
+}
