@@ -515,7 +515,8 @@ transmission may never produce again).
    through `manta_spot::CallsignLookup`. A call QRZ.com does not list is
    withheld (`lookupNotFound`); one without an answer yet is held
    (`lookupPending`) for at most 10 s, then published, unverified if QRZ.com
-   never answered. Answers are cached 24 h; `[spot].allowlist` calls skip
+   never answered, unless a SIGHUP reload has since blocklisted or notched
+   it. Answers are cached 24 h; `[spot].allowlist` calls skip
    the step. A file replay never runs it. See
    `docs/DECISIONS/2026-10-27-man318-callsign-lookup.md`.
 

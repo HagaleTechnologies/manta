@@ -535,13 +535,17 @@ impl Validator {
     }
 
     /// MAN-318: settles every held spot, waiting at most each call's own
-    /// deadline. Anything the lookup failed to report is spotted (as
-    /// `Unknown`), so no held spot is ever lost.
-    pub fn finish_lookups(&mut self) -> Vec<Spot> {
+    /// deadline, then runs `before_release` (where the engine takes a
+    /// reload's lists, MAN-78: the wait can last 10 s). Anything the lookup
+    /// failed to report is spotted (as `Unknown`), so no held spot is ever
+    /// lost.
+    pub fn finish_lookups(&mut self, before_release: impl FnOnce(&mut Self)) -> Vec<Spot> {
         let Some(lookup) = self.lookup.clone() else {
             return Vec::new();
         };
-        let mut spots = self.release(lookup.settle_all());
+        let settled = lookup.settle_all();
+        before_release(self);
+        let mut spots = self.release(settled);
         let rest: Vec<(String, Existence)> = self
             .held
             .keys()
@@ -551,7 +555,9 @@ impl Validator {
         spots
     }
 
-    /// MAN-318: decides the held spots of each settled call.
+    /// MAN-318: decides the held spots of each settled call, under the
+    /// current blocklist and notch list (MAN-78: a reload can replace them
+    /// mid-hold).
     fn release(&mut self, settled: Vec<(String, Existence)>) -> Vec<Spot> {
         let mut spots = Vec::new();
         for (key, existence) in settled {
@@ -559,7 +565,20 @@ impl Validator {
                 continue;
             };
             for HeldSpot { spot, reps } in held {
-                if existence == Existence::NotFound {
+                if let Some(reason) = self.operator_suppressed(&spot.callsign, spot.freq_hz) {
+                    // No `reps`, like every blocklist/notch decision
+                    // (docs/LIVE-STATE.md).
+                    self.decide(|| {
+                        Decision::withheld(
+                            spot.track_id,
+                            spot.sample_ts,
+                            &spot.callsign,
+                            spot.freq_hz,
+                            spot.spot_type,
+                            reason,
+                        )
+                    });
+                } else if existence == Existence::NotFound {
                     self.decide(|| lookup_decision(&spot, Reason::LookupNotFound, reps));
                 } else {
                     self.decide(|| Decision::spotted(&spot, reps));
@@ -1790,15 +1809,16 @@ impl Validator {
     /// value covers every pending candidate on this track -- it's a
     /// track-level property, not a per-candidate one.
     /// MAN-78: the lists can be replaced between a beacon's capture and its
-    /// track's close. Counts and reports a pending beacon the current lists
-    /// suppress; a no-op when they were not replaced, since capture already
-    /// passed the same checks.
-    fn operator_suppressed(&mut self, pb: &PendingBeacon) -> Option<Reason> {
-        if self.blocklist.contains(&pb.candidate) {
+    /// track's close, or while a spot is held for its lookup (MAN-318).
+    /// Counts and reports a candidate the current lists suppress; a no-op
+    /// when they were not replaced, since capture already passed the same
+    /// checks.
+    fn operator_suppressed(&mut self, call: &str, freq_hz: f64) -> Option<Reason> {
+        if self.blocklist.contains(call) {
             self.suppression_counts.blocklist += 1;
             return Some(Reason::Blocklist);
         }
-        if self.notch.contains(pb.freq_hz) {
+        if self.notch.contains(freq_hz) {
             self.suppression_counts.notch += 1;
             return Some(Reason::Notch);
         }
@@ -1832,7 +1852,7 @@ impl Validator {
             // unconfirmed and implausible speed alike (MAN-174,
             // ARCHITECTURE §8) -- exactly one counter per candidate.
             for pb in &pending {
-                let reason = match self.operator_suppressed(pb) {
+                let reason = match self.operator_suppressed(&pb.candidate, pb.freq_hz) {
                     Some(reason) => reason,
                     None => {
                         self.suppression_counts.pending_beacon_rejected_wpm += 1;
@@ -1848,7 +1868,7 @@ impl Validator {
             .filter_map(|pb| {
                 // Before `gate.record`, so a suppressed beacon never feeds
                 // the repetition gate.
-                if let Some(reason) = self.operator_suppressed(&pb) {
+                if let Some(reason) = self.operator_suppressed(&pb.candidate, pb.freq_hz) {
                     self.decide(|| beacon_decision(track_id, &pb, reason));
                     return None;
                 }
@@ -2309,11 +2329,41 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let lookup = Arc::new(ScriptedLookup::default());
         let (mut v, _) = k5arh_with(Some(lookup.clone()));
         assert!(v.poll_lookups().is_empty());
-        let released = v.finish_lookups();
+        let released = v.finish_lookups(|_| {});
         assert_eq!(released.len(), 1);
         assert_eq!(released[0].callsign, "K5ARH");
         assert!(v.held.is_empty());
-        assert!(v.finish_lookups().is_empty());
+        assert!(v.finish_lookups(|_| {}).is_empty());
+    }
+
+    /// Codex review on PR #442: lists reloaded while a spot is held apply
+    /// when it settles, as they do to a pending beacon (MAN-78).
+    #[test]
+    fn a_spot_held_across_a_blocklist_or_notch_reload_is_not_released() {
+        let lookup = Arc::new(ScriptedLookup::default());
+        let (mut v, _) = k5arh_with(Some(lookup.clone()));
+        v.replace_operator_lists(&[], Blocklist::parse("K5ARH\n"), NotchList::default());
+        lookup.settle("K5ARH", Existence::Exists);
+        assert!(v.poll_lookups().is_empty());
+        assert_eq!(v.suppression_counts().blocklist, 1);
+        let d = last_k5arh_decision(&mut v);
+        assert_eq!(d.verdict, Verdict::Withheld);
+        assert_eq!(d.reason, Some(Reason::Blocklist));
+        assert_eq!(d.reps, None);
+
+        let lookup = Arc::new(ScriptedLookup::default());
+        let (mut v, _) = k5arh_with(Some(lookup.clone()));
+        v.replace_operator_lists(
+            &[],
+            Blocklist::default(),
+            NotchList::parse("13999900-14000100\n"),
+        );
+        assert!(v.finish_lookups(|_| {}).is_empty());
+        assert_eq!(v.suppression_counts().notch, 1);
+        let d = last_k5arh_decision(&mut v);
+        assert_eq!(d.verdict, Verdict::Withheld);
+        assert_eq!(d.reason, Some(Reason::Notch));
+        assert_eq!(d.reps, None);
     }
 
     #[test]
@@ -2321,7 +2371,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let (mut v, spots) = k5arh_with(None);
         assert_eq!(spots.len(), 1);
         assert!(v.poll_lookups().is_empty());
-        assert!(v.finish_lookups().is_empty());
+        assert!(v.finish_lookups(|_| {}).is_empty());
     }
 
     #[test]
