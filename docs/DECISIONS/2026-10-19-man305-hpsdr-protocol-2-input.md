@@ -1,5 +1,11 @@
 # 2026-10-19 — MAN-305: protocol-2 openHPSDR radios are inputs; the protocol is discovered, and lost datagrams reach the decoder as missing input
 
+> **Partly superseded by MAN-423** (`2026-10-25-man423-pre-loss-hops-and-parked-backlogs.md`):
+> D10's plausible-jump bound and D11's restart estimate run from the start
+> of a pause in reading while its backlog drains, and D12's loss is held at
+> its boundary rather than added between reads, so hops already buffered
+> keep their time.
+
 **Status:** Implemented (branch `MAN-305`) against a fake protocol-2 radio in
 the tests. No protocol-2 radio was reachable; seven facts stay open until one
 is ([D-HW](#d-hw-settled-only-with-a-protocol-2-radio-on-the-lan-man-52)),
