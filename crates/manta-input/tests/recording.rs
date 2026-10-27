@@ -115,7 +115,9 @@ fn a_recorded_source_reads_exactly_like_the_bare_one_and_replays_its_trace() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("s.cf32");
     let bare = trace(&mut Scripted::new(script()));
-    let start = SystemTime::UNIX_EPOCH + Duration::new(1_792_407_600, 123);
+    // A multiple of 100 ns: Windows `SystemTime` has 100 ns resolution, so a
+    // finer value would be truncated before it reaches the header.
+    let start = SystemTime::UNIX_EPOCH + Duration::new(1_792_407_600, 123_400);
     let (mut rec, handle) =
         start_recording(Box::new(Scripted::new(script())), &path, start, None).unwrap();
     assert_eq!(rec.sample_rate(), 48_000.0);
@@ -138,7 +140,7 @@ fn a_recorded_source_reads_exactly_like_the_bare_one_and_replays_its_trace() {
     let mut replay = RecordedIqSource::open(&path).unwrap();
     let h = &replay.summary().header;
     assert_eq!(h.start_unix_seconds, 1_792_407_600);
-    assert_eq!(h.start_nanoseconds, 123);
+    assert_eq!(h.start_nanoseconds, 123_400);
     assert_eq!(h.analytic_guard_hz, 600.0);
     assert_eq!(h.rf_passband_hz, [0.0, 3_000.0]);
     assert_eq!(h.trusted_band_hz, Some([-20_000.0, 20_000.0]));
