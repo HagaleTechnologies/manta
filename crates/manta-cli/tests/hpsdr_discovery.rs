@@ -42,7 +42,10 @@ impl FakeDiscoveryRadio {
                             reply[3..9].copy_from_slice(mac);
                             reply[9] = 43;
                             reply[10] = 6;
-                            socket.send_to(&reply, addr).unwrap();
+                            // Conntrack can drop this reply with EPERM when it
+                            // races the client's own probe to 127.0.0.1 (MAN-450);
+                            // discovery asks every destination again each round.
+                            let _ = socket.send_to(&reply, addr);
                         }
                     } else if n == 60 && buf[..4] == [0xef, 0xfe, 4, 1] {
                         client = Some(addr);
