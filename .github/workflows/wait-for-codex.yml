@@ -138,7 +138,7 @@ jobs:
         # credenza#71 (487064f9) -- see that commit's identical step in codex-review-request.yml
         # for the full history; manta inlines this pattern rather than calling credenza's
         # reusable workflow because it's PUBLIC while credenza is PRIVATE.
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: 4696353
           private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
@@ -445,7 +445,7 @@ jobs:
         # outright for the Checks API entirely ("You must authenticate via a GitHub App", HTTP
         # 403). Confirmed live on vanity#395/#396/#398 (2026-09-19/20). HAG-74: hand-ported from
         # credenza#71 -- see codex-review-request's identical step above for the full history.
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: 4696353
           private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}

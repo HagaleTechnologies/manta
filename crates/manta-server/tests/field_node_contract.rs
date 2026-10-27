@@ -93,10 +93,11 @@ fn the_committed_live_fixture_carries_every_required_metric() {
 }
 
 /// MAN-301: `scripts/field-node.py`'s `validate_spot_line` accepts any JSON
-/// object carrying `dxCall`, `frequency` and `timestamp` as a spot. A
-/// `spotGrade` record sharing the stream must never carry those three keys,
-/// or every grade would be archived (and later loaded by
-/// `shadow-compare.py`) as a second spot. Pinned here for every grade kind.
+/// object carrying `dxCall`, `frequency`, `timestamp` and (MAN-289) a
+/// nonempty `deCall` as a spot. A `spotGrade` record sharing the stream must
+/// never carry the first three keys, or every grade would be archived (and
+/// later loaded by `shadow-compare.py`) as a second spot. Pinned here for
+/// every grade kind.
 #[test]
 fn grade_records_never_look_like_spots_to_field_node() {
     use manta_server::rbn_compare::grade::{grade_spot, GradeConfig, GradeInput, RbnReport};
