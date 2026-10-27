@@ -18,6 +18,7 @@ use std::sync::Arc;
 pub mod skimmer;
 pub mod skimmer_line;
 pub mod wsjtx;
+pub mod wsjtx_proto;
 
 /// One spot another local program decoded, on its way to the RBN uplink
 /// only (MAN-320 D4).
