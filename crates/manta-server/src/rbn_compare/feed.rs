@@ -193,7 +193,7 @@ pub async fn run(
 /// Completes once shutdown is true, or its sender is gone (nobody can
 /// ask for one any more, and a dropped sender would otherwise make
 /// `changed()` return at once forever). Cancel-safe.
-async fn shutdown_signalled(shutdown: &mut watch::Receiver<bool>) {
+pub(crate) async fn shutdown_signalled(shutdown: &mut watch::Receiver<bool>) {
     loop {
         if *shutdown.borrow_and_update() {
             return;
@@ -330,7 +330,7 @@ async fn session(
 
 /// The unterminated buffer ends in `:` plus optional spaces: a prompt
 /// such as `Please enter your call: ` waiting for an answer.
-fn ends_like_a_prompt(buf: &[u8]) -> bool {
+pub(crate) fn ends_like_a_prompt(buf: &[u8]) -> bool {
     let trimmed = buf
         .iter()
         .rposition(|&b| b != b' ')
@@ -341,7 +341,7 @@ fn ends_like_a_prompt(buf: &[u8]) -> bool {
 
 /// Resolves (unless `host` is an IP literal) and connects with
 /// `uplink.rs`'s per-address and overall connect bounds.
-async fn connect(
+pub(crate) async fn connect(
     host: &str,
     port: u16,
     resolver_slot: &Arc<Semaphore>,
