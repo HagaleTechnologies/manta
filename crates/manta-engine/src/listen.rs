@@ -525,6 +525,13 @@ struct EmitCtx<'a> {
     references: Option<ReferenceWatch>,
 }
 
+/// MAN-78: hands the validator a reload's lists, if one is waiting.
+fn take_operator_lists(validator: &mut Validator, lists: Option<&OperatorListsUpdate>) {
+    if let Some(l) = lists.and_then(OperatorListsUpdate::take) {
+        validator.replace_operator_lists(&l.allowlist, l.blocklist, l.notch);
+    }
+}
+
 /// MAN-318: when decoding ends, settles every spot still held for its
 /// callsign lookup (each waits at most its own deadline) and hands the
 /// released ones to `on_spot`, with their decisions.
@@ -533,6 +540,8 @@ fn settle_lookups(
     ctx: &mut EmitCtx<'_>,
     on_spot: &mut impl FnMut(&crate::Spot),
 ) {
+    // A reload's lists apply to the held spots released here.
+    take_operator_lists(validator, ctx.lists);
     for spot in validator.finish_lookups() {
         on_spot(&spot);
     }
@@ -562,12 +571,11 @@ fn emit(
         if matches!(ev, DecoderEvent::CharDecoded { .. }) {
             chars += 1;
         }
-        // MAN-78: the one place the validator is fed, so the one place a
-        // reload's lists are taken, for calibration, steady state, outage
-        // and end-of-stream batches alike.
-        if let Some(l) = ctx.lists.and_then(OperatorListsUpdate::take) {
-            validator.replace_operator_lists(&l.allowlist, l.blocklist, l.notch);
-        }
+        // MAN-78: the one place the validator is fed, so a reload's lists
+        // are taken here for calibration, steady state, outage and
+        // end-of-stream batches alike (and before held spots are released
+        // below and in `settle_lookups`, MAN-318).
+        take_operator_lists(validator, ctx.lists);
         // MAN-316: likewise for a list refresh's new cty/scp tables.
         if let Some(watch) = ctx.references.as_mut() {
             watch.sync(validator);
@@ -591,7 +599,9 @@ fn emit(
         }
     }
     // MAN-318: spots whose callsign lookup settled since the last batch,
-    // with their decisions, after the batch's own.
+    // with their decisions, after the batch's own. A reload's lists apply
+    // to them even when the batch had no events.
+    take_operator_lists(validator, ctx.lists);
     for spot in validator.poll_lookups() {
         on_spot(&spot);
     }
@@ -3684,6 +3694,82 @@ mod tests {
         });
         assert_eq!(update.take().unwrap().allowlist, vec!["B".to_string()]);
         assert!(update.take().is_none());
+    }
+
+    /// MAN-318 (Codex review on PR #442): a reload offered while a spot is
+    /// held for its lookup applies when the spot is released, on a batch
+    /// with no decoder events and at the end-of-stream settle alike.
+    #[test]
+    fn a_reload_reaches_held_spots_on_an_empty_batch_and_at_the_final_settle() {
+        use manta_spot::{CallsignLookup, Existence, LookupStatus};
+        struct Settles(Mutex<Vec<(String, Existence)>>);
+        impl CallsignLookup for Settles {
+            fn check(&self, _call: &str) -> LookupStatus {
+                LookupStatus::Pending
+            }
+            fn settled(&self) -> Vec<(String, Existence)> {
+                std::mem::take(&mut *self.0.lock().unwrap())
+            }
+            fn settle_all(&self) -> Vec<(String, Existence)> {
+                vec![("K5ARH".to_string(), Existence::Unknown)]
+            }
+        }
+        for at_end in [false, true] {
+            let lookup = Arc::new(Settles(Mutex::new(Vec::new())));
+            let mut validator = Validator::new(96_000.0, manta_spot::CTY_DAT, None);
+            validator.set_callsign_lookup(lookup.clone());
+            validator.ingest(&DecoderEvent::TrackMeta {
+                track_id: 1,
+                sample_ts: 0,
+                snr_2500_db: 20.0,
+                freq_hz: 14_000_000.0,
+            });
+            for start in [0u64, 100_000] {
+                let mut ts = start;
+                for word in ["DE", "K5ARH", "K"] {
+                    for c in word.chars() {
+                        let glyph = manta_decode::tree::Glyph::Char(c);
+                        let ev = DecoderEvent::char_decoded(1, ts, glyph, 0.95);
+                        assert!(validator.ingest(&ev).is_empty());
+                        ts += 100;
+                    }
+                    let ev = DecoderEvent::word_boundary(1, ts);
+                    assert!(validator.ingest(&ev).is_empty(), "held, not spotted");
+                    ts += 100;
+                }
+            }
+            let update = OperatorListsUpdate::default();
+            update.offer(OperatorLists {
+                blocklist: Blocklist::parse("K5ARH\n"),
+                ..OperatorLists::default()
+            });
+            let mut ctx = EmitCtx {
+                lists: Some(&update),
+                quality: None,
+                calibration_factor: 1.0,
+                live: None,
+                references: None,
+            };
+            let mut spots = Vec::new();
+            if at_end {
+                settle_lookups(&mut validator, &mut ctx, &mut |s| spots.push(s.clone()));
+            } else {
+                lookup
+                    .0
+                    .lock()
+                    .unwrap()
+                    .push(("K5ARH".to_string(), Existence::Exists));
+                emit(
+                    Vec::new(),
+                    &mut validator,
+                    &mut ctx,
+                    &mut |_| {},
+                    &mut |s| spots.push(s.clone()),
+                );
+            }
+            assert!(spots.is_empty(), "at_end={at_end}: {spots:?}");
+            assert_eq!(validator.suppression_counts().blocklist, 1);
+        }
     }
 
     /// Vector v7 through `listen_with_observers`, offering `lists` from
