@@ -1,0 +1,1414 @@
+//! MAN-309 acceptance: `run --record-iq` records the IQ it decodes, and the
+//! recording (or headerless cf32/ci16 IQ) replays through `decode` and
+//! `run` to the same output on every run. Real binary, `manta gen`-shaped
+//! V1 fixtures, no hardware.
+
+mod common;
+
+use manta_input::recording_format::MetadataRecord;
+use manta_input::{metadata_path, EndReason, RecordingHeader};
+use num_complex::Complex32;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+/// `manta` with no `MANTA_*` variable from the test runner's environment.
+fn manta() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().starts_with(b"MANTA_") {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
+fn run_ok(args: &[&std::ffi::OsStr]) -> Output {
+    let out = manta().args(args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "manta {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+fn stderr_of(args: &[&std::ffi::OsStr]) -> (i32, String) {
+    let out = manta().args(args).output().unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// `dir/v1.wav` (+ sidecar, centre 14 MHz): V1 rendered for 30 s.
+fn v1_fixture(dir: &Path) -> (PathBuf, manta_testkit::vectors::Manifest) {
+    let spec = manta_testkit::vectors::VectorSpec {
+        duration_s: 30.0,
+        ..manta_testkit::vectors::v1()
+    };
+    let manifest = manta_testkit::vectors::write_fixture_set(&spec, dir).unwrap();
+    (dir.join("v1.wav"), manifest)
+}
+
+fn wav_samples(path: &Path) -> Vec<Complex32> {
+    let mut r = hound::WavReader::open(path).unwrap();
+    let s: Vec<f32> = r.samples::<f32>().map(Result::unwrap).collect();
+    s.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[re, im]| Complex32::new(re, im))
+        .collect()
+}
+
+fn cf32_bytes(samples: &[Complex32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(samples.len() * 8);
+    for s in samples {
+        b.extend_from_slice(&s.re.to_le_bytes());
+        b.extend_from_slice(&s.im.to_le_bytes());
+    }
+    b
+}
+
+/// The metadata records of a recording.
+fn records(payload: &Path) -> Vec<MetadataRecord> {
+    std::fs::read_to_string(metadata_path(payload))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// `p` as a quoted TOML basic string with backslashes and quotes escaped,
+/// so a Windows temp path's `\U` is not read as a unicode escape.
+fn toml_str(p: &Path) -> String {
+    format!(
+        "\"{}\"",
+        p.display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    )
+}
+
+#[test]
+fn a_run_records_its_input_and_decodes_exactly_as_without_recording() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, manifest) = v1_fixture(dir.path());
+    let rec = dir.path().join("session.cf32");
+    let wav = wav.as_os_str();
+    let plain = run_ok(&[
+        "run".as_ref(),
+        "--source".as_ref(),
+        wav,
+        "--source-iq".as_ref(),
+        "--json".as_ref(),
+    ]);
+    let recorded = run_ok(&[
+        "run".as_ref(),
+        "--source".as_ref(),
+        wav,
+        "--source-iq".as_ref(),
+        "--json".as_ref(),
+        "--record-iq".as_ref(),
+        rec.as_os_str(),
+    ]);
+    // Decoding continues unaffected: the same stdout, byte for byte.
+    assert!(!plain.stdout.is_empty());
+    assert_eq!(plain.stdout, recorded.stdout);
+    let stderr = String::from_utf8_lossy(&recorded.stderr);
+    let n = (manifest.fs * manifest.duration_s) as u64;
+    assert!(
+        stderr.contains(&format!(
+            "recording IQ to {}; metadata: {}",
+            rec.display(),
+            metadata_path(&rec).display()
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "recording finished: {}, {n} samples",
+            rec.display()
+        )),
+        "{stderr}"
+    );
+    // Rate, centre and start time; the replay's epoch is the WAV's mtime.
+    let mtime = std::fs::metadata(wav).unwrap().modified().unwrap();
+    let start = mtime.duration_since(std::time::UNIX_EPOCH).unwrap();
+    let recs = records(&rec);
+    let MetadataRecord::Header(h) = &recs[0] else {
+        panic!("{recs:?}")
+    };
+    assert_eq!(
+        h,
+        &RecordingHeader {
+            schema: "manta-iq.v1".into(),
+            sample_format: "cf32_le".into(),
+            sample_rate_hz: manifest.fs,
+            center_freq_hz: manifest.center_freq_hz,
+            start_unix_seconds: start.as_secs() as i64,
+            start_nanoseconds: start.subsec_nanos(),
+            rf_passband_hz: [-manifest.fs / 2.0, manifest.fs / 2.0],
+            trusted_band_hz: None,
+            analytic_guard_hz: 0.0,
+        }
+    );
+    assert_eq!(
+        recs.last().unwrap(),
+        &MetadataRecord::End {
+            sample_count: n,
+            reason: EndReason::Eof
+        }
+    );
+    // The payload is the decoded samples, bit for bit.
+    assert_eq!(
+        std::fs::read(&rec).unwrap(),
+        cf32_bytes(&wav_samples(Path::new(wav)))
+    );
+}
+
+#[test]
+fn a_recording_replays_to_the_same_spots_on_every_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, _) = v1_fixture(dir.path());
+    let rec = dir.path().join("session.cf32");
+    run_ok(&[
+        "run".as_ref(),
+        "--source".as_ref(),
+        wav.as_os_str(),
+        "--source-iq".as_ref(),
+        "--json".as_ref(),
+        "--record-iq".as_ref(),
+        rec.as_os_str(),
+    ]);
+    // decode: three runs, identical, with the known callsign; and the same
+    // report as the WAV it was recorded from.
+    let decode = |p: &Path| run_ok(&["decode".as_ref(), p.as_os_str(), "--json".as_ref()]).stdout;
+    let first = decode(&rec);
+    assert!(String::from_utf8_lossy(&first).contains("W1AW"));
+    assert_eq!(decode(&rec), first);
+    assert_eq!(decode(&rec), first);
+    assert_eq!(decode(&wav), first);
+    // run: three runs, identical, with a spot.
+    let replay = |p: &Path| {
+        run_ok(&[
+            "run".as_ref(),
+            "--source".as_ref(),
+            p.as_os_str(),
+            "--source-iq".as_ref(),
+            "--json".as_ref(),
+        ])
+        .stdout
+    };
+    let first = replay(&rec);
+    assert!(String::from_utf8_lossy(&first).contains("W1AW"));
+    assert_eq!(replay(&rec), first);
+    assert_eq!(replay(&rec), first);
+    // A copied pair, its mtime moved, replays the same.
+    let copy = dir.path().join("copy.cf32");
+    std::fs::copy(&rec, &copy).unwrap();
+    std::fs::copy(metadata_path(&rec), metadata_path(&copy)).unwrap();
+    let touched = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    for p in [copy.clone(), metadata_path(&copy)] {
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(touched)
+            .unwrap();
+    }
+    assert_eq!(replay(&copy), first);
+
+    // With the spot servers up (the epoch and spot ids come from the
+    // recording), the original and the copy replay identically, run after
+    // run.
+    let served = |p: &Path| {
+        let [telnet, json, metrics] = free_ports();
+        let cfg = dir.path().join("server.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
+                 telnet_port = {telnet}\njson_port = {json}\nmetrics_port = {metrics}\n"
+            ),
+        )
+        .unwrap();
+        run_ok(&[
+            "run".as_ref(),
+            "--config".as_ref(),
+            cfg.as_os_str(),
+            "--source".as_ref(),
+            p.as_os_str(),
+            "--source-iq".as_ref(),
+            "--json".as_ref(),
+        ])
+        .stdout
+    };
+    let first_served = served(&rec);
+    assert!(String::from_utf8_lossy(&first_served).contains("W1AW"));
+    assert_eq!(served(&rec), first_served);
+    assert_eq!(served(&copy), first_served);
+
+    // Recording onto the replayed file itself is refused, untouched.
+    let before = std::fs::read(&rec).unwrap();
+    let (code, stderr) = stderr_of(&[
+        "run".as_ref(),
+        "--source".as_ref(),
+        rec.as_os_str(),
+        "--source-iq".as_ref(),
+        "--record-iq".as_ref(),
+        rec.as_os_str(),
+    ]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("error: IQ recording destination already exists:"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(&rec).unwrap(), before);
+}
+
+/// `N` distinct loopback ports nothing listens on right now, all held until
+/// every one is read.
+fn free_ports<const N: usize>() -> [u16; N] {
+    let held: [std::net::TcpListener; N] =
+        std::array::from_fn(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+    held.map(|l| l.local_addr().unwrap().port())
+}
+
+/// `record_iq` follows `run`'s precedence, `--record-iq` over
+/// `MANTA_INPUT_RECORD_IQ` over the config file, and a CLI or environment
+/// path resolves against the working directory, not the config's.
+#[test]
+fn record_iq_precedence_is_cli_then_environment_then_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, _) = v1_fixture(dir.path());
+    let cfg_dir = dir.path().join("cfg");
+    let work = dir.path().join("work");
+    std::fs::create_dir(&cfg_dir).unwrap();
+    std::fs::create_dir(&work).unwrap();
+    let cfg = cfg_dir.join("manta.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[input]\ntype = \"file\"\npath = {}\niq = true\nrecord_iq = \"file.cf32\"\n",
+            toml_str(&wav)
+        ),
+    )
+    .unwrap();
+    let run = |env: Option<&str>, cli: Option<&str>| {
+        let mut cmd = manta();
+        cmd.current_dir(&work)
+            .args(["run", "--json", "--config"])
+            .arg(&cfg);
+        if let Some(env) = env {
+            cmd.env("MANTA_INPUT_RECORD_IQ", env);
+        }
+        if let Some(cli) = cli {
+            cmd.args(["--record-iq", cli]);
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(Some("env-only.cf32"), None);
+    assert!(work.join("env-only.cf32").exists());
+    assert!(metadata_path(&work.join("env-only.cf32")).exists());
+    assert!(!cfg_dir.join("file.cf32").exists());
+    assert!(!cfg_dir.join("env-only.cf32").exists());
+
+    run(Some("env-ignored.cf32"), Some("cli.cf32"));
+    assert!(work.join("cli.cf32").exists());
+    assert!(!work.join("env-ignored.cf32").exists());
+    assert!(!cfg_dir.join("file.cf32").exists());
+
+    run(None, None);
+    assert!(cfg_dir.join("file.cf32").exists());
+    assert!(!work.join("file.cf32").exists());
+}
+
+/// A source flag that replaces the configured input(s) drops their
+/// `record_iq` (file or environment) with their other keys: the new
+/// source is not recorded to the replaced receiver's capture path.
+#[test]
+fn a_source_flag_drops_the_replaced_inputs_record_iq() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, _) = v1_fixture(dir.path());
+    let typed = dir.path().join("typed.toml");
+    std::fs::write(
+        &typed,
+        format!(
+            "[input]\ntype = \"file\"\npath = {}\niq = true\nrecord_iq = \"typed.cf32\"\n",
+            toml_str(&wav)
+        ),
+    )
+    .unwrap();
+    let entry = |name: &str, rec: &str| {
+        format!(
+            "[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = {}\niq = true\n\
+             record_iq = \"{rec}\"\n\n",
+            toml_str(&wav)
+        )
+    };
+    let several = dir.path().join("several.toml");
+    std::fs::write(&several, entry("a", "a.cf32") + &entry("b", "b.cf32")).unwrap();
+    for (cfg, env) in [(&typed, None), (&typed, Some("env.cf32")), (&several, None)] {
+        let mut cmd = manta();
+        cmd.current_dir(dir.path())
+            .args(["run", "--json", "--source"])
+            .arg(&wav)
+            .args(["--source-iq", "--config"])
+            .arg(cfg);
+        if let Some(env) = env {
+            cmd.env("MANTA_INPUT_RECORD_IQ", env);
+        }
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        assert!(!stderr.contains("recording IQ to"), "{stderr}");
+        for rec in ["typed.cf32", "env.cf32", "a.cf32", "b.cf32"] {
+            let rec = dir.path().join(rec);
+            assert!(!rec.exists(), "{}: {stderr}", rec.display());
+            assert!(!metadata_path(&rec).exists(), "{}", rec.display());
+        }
+    }
+}
+
+#[test]
+fn recorded_gaps_replay_through_run_and_decode_without_splicing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, manifest) = v1_fixture(dir.path());
+    let samples = wav_samples(&wav);
+    let header = RecordingHeader {
+        schema: "manta-iq.v1".into(),
+        sample_format: "cf32_le".into(),
+        sample_rate_hz: manifest.fs,
+        center_freq_hz: manifest.center_freq_hz,
+        start_unix_seconds: 1_792_407_600,
+        start_nanoseconds: 0,
+        rf_passband_hz: [-manifest.fs / 2.0, manifest.fs / 2.0],
+        trusted_band_hz: None,
+        analytic_guard_hz: 0.0,
+    };
+    let write = |name: &str, gap: Option<(u64, u64)>| {
+        let p = dir.path().join(name);
+        std::fs::write(&p, cf32_bytes(&samples)).unwrap();
+        let mut meta = MetadataRecord::Header(header.clone()).to_line();
+        if let Some((before_sample, missing_samples)) = gap {
+            meta += &MetadataRecord::Gap {
+                before_sample,
+                missing_samples,
+            }
+            .to_line();
+        }
+        meta += &MetadataRecord::End {
+            sample_count: samples.len() as u64,
+            reason: EndReason::Stopped,
+        }
+        .to_line();
+        std::fs::write(metadata_path(&p), meta).unwrap();
+        p
+    };
+    let fs = manifest.fs as u64;
+    let gapped = write("gapped.cf32", Some((15 * fs, 10 * fs)));
+    let smooth = write("smooth.cf32", None);
+    let replay = |p: &Path| {
+        run_ok(&[
+            "run".as_ref(),
+            "--source".as_ref(),
+            p.as_os_str(),
+            "--source-iq".as_ref(),
+            "--json".as_ref(),
+        ])
+        .stdout
+    };
+    let first = replay(&gapped);
+    assert!(!first.is_empty());
+    assert_eq!(replay(&gapped), first);
+    assert_eq!(replay(&gapped), first);
+    // The outage is not spliced away: the events differ from the gap-free
+    // recording of the same samples.
+    assert_ne!(replay(&smooth), first);
+
+    // `decode` segments at the gap too: the same bytes on every run, a
+    // spot in them, and not the gap-free recording's report.
+    let decode = |p: &Path| run_ok(&["decode".as_ref(), p.as_os_str(), "--json".as_ref()]).stdout;
+    let report = decode(&gapped);
+    assert!(String::from_utf8_lossy(&report).contains("W1AW"));
+    assert_eq!(decode(&gapped), report);
+    assert_eq!(decode(&gapped), report);
+    assert_ne!(decode(&smooth), report);
+
+    // `oracle` reads a gap-free recording as it reads the WAV, and refuses
+    // to splice a gapped one.
+    let csv = dir.path().join("rbn.csv");
+    std::fs::write(
+        &csv,
+        "callsign,de_pfx,de_cont,freq,band,dx,dx_pfx,dx_cont,mode,db,date,speed,tx_mode\n",
+    )
+    .unwrap();
+    let oracle = |p: &Path| {
+        manta()
+            .args([
+                "oracle".as_ref(),
+                p.as_os_str(),
+                csv.as_os_str(),
+                "--capture-start".as_ref(),
+                "2026-10-19T00:00:00Z".as_ref(),
+            ])
+            .output()
+            .unwrap()
+    };
+    let from_wav = oracle(&wav);
+    assert!(from_wav.status.success());
+    assert_eq!(oracle(&smooth).stdout, from_wav.stdout);
+    let out = oracle(&gapped);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("has input gaps"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (code, stderr) = stderr_of(&[
+        "run".as_ref(),
+        "--source".as_ref(),
+        gapped.as_os_str(),
+        "--source-iq".as_ref(),
+        "--capture-rate-hz".as_ref(),
+        "48000".as_ref(),
+    ]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(
+            "cannot decimate an IQ recording with gaps; replay at its recorded sample rate"
+        ),
+        "{stderr}"
+    );
+    // Asking for the recorded rate is no rate change; a gap-free recording
+    // still decimates.
+    let rate = format!("{}", manifest.fs);
+    let same_rate = run_ok(&[
+        "run".as_ref(),
+        "--source".as_ref(),
+        gapped.as_os_str(),
+        "--source-iq".as_ref(),
+        "--json".as_ref(),
+        "--capture-rate-hz".as_ref(),
+        rate.as_ref(),
+    ])
+    .stdout;
+    assert_eq!(same_rate, first);
+    let decimated = run_ok(&[
+        "run".as_ref(),
+        "--source".as_ref(),
+        smooth.as_os_str(),
+        "--source-iq".as_ref(),
+        "--json".as_ref(),
+        "--capture-rate-hz".as_ref(),
+        "48000".as_ref(),
+    ])
+    .stdout;
+    assert!(String::from_utf8_lossy(&decimated).contains("W1AW"));
+
+    // A centre override moves only the RF origin: the recording's gap
+    // still segments `decode`, and still refuses decimation under `run`.
+    let moved = format!("{}", manifest.center_freq_hz + 1_000.0);
+    let decode_at = |p: &Path| {
+        run_ok(&[
+            "decode".as_ref(),
+            p.as_os_str(),
+            "--json".as_ref(),
+            "--center-freq-hz".as_ref(),
+            moved.as_ref(),
+        ])
+        .stdout
+    };
+    let moved_report = decode_at(&gapped);
+    assert!(String::from_utf8_lossy(&moved_report).contains("W1AW"));
+    assert_ne!(moved_report, report);
+    assert_ne!(decode_at(&smooth), moved_report);
+    let (code, stderr) = stderr_of(&[
+        "run".as_ref(),
+        "--source".as_ref(),
+        gapped.as_os_str(),
+        "--source-iq".as_ref(),
+        "--dial-freq-hz".as_ref(),
+        moved.as_ref(),
+        "--capture-rate-hz".as_ref(),
+        "48000".as_ref(),
+    ]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("cannot decimate an IQ recording with gaps"),
+        "{stderr}"
+    );
+
+    // Headerless cf32 (the same samples without metadata) decimates too.
+    let raw = dir.path().join("raw.cf32");
+    std::fs::write(&raw, cf32_bytes(&samples)).unwrap();
+    let centre = format!("{}", manifest.center_freq_hz);
+    let raw_decimated = run_ok(&[
+        "run".as_ref(),
+        "--source".as_ref(),
+        raw.as_os_str(),
+        "--source-iq".as_ref(),
+        "--iq-format".as_ref(),
+        "cf32".as_ref(),
+        "--sample-rate-hz".as_ref(),
+        rate.as_ref(),
+        "--dial-freq-hz".as_ref(),
+        centre.as_ref(),
+        "--json".as_ref(),
+        "--capture-rate-hz".as_ref(),
+        "48000".as_ref(),
+    ])
+    .stdout;
+    assert!(String::from_utf8_lossy(&raw_decimated).contains("W1AW"));
+}
+
+#[test]
+fn an_existing_destination_fails_startup_and_is_left_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, _) = v1_fixture(dir.path());
+    let rec = dir.path().join("session.cf32");
+    std::fs::write(&rec, b"keep").unwrap();
+    let (code, stderr) = stderr_of(&[
+        "run".as_ref(),
+        "--source".as_ref(),
+        wav.as_os_str(),
+        "--source-iq".as_ref(),
+        "--record-iq".as_ref(),
+        rec.as_os_str(),
+    ]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(&format!(
+            "error: IQ recording destination already exists: {}",
+            rec.display()
+        )),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(&rec).unwrap(), b"keep");
+    assert!(!metadata_path(&rec).exists());
+}
+
+#[test]
+fn headerless_cf32_and_ci16_decode_like_the_equivalent_wavs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, manifest) = v1_fixture(dir.path());
+    let samples = wav_samples(&wav);
+    let rate = format!("{}", manifest.fs);
+    let centre = format!("{}", manifest.center_freq_hz);
+
+    let raw = dir.path().join("external.cf32");
+    std::fs::write(&raw, cf32_bytes(&samples)).unwrap();
+    let decode_raw = |p: &Path, format: &str| {
+        run_ok(&[
+            "decode".as_ref(),
+            p.as_os_str(),
+            "--iq-format".as_ref(),
+            format.as_ref(),
+            "--sample-rate-hz".as_ref(),
+            rate.as_ref(),
+            "--center-freq-hz".as_ref(),
+            centre.as_ref(),
+            "--json".as_ref(),
+        ])
+        .stdout
+    };
+    let wav_report = run_ok(&[
+        "decode".as_ref(),
+        wav.as_os_str(),
+        "--center-freq-hz".as_ref(),
+        centre.as_ref(),
+        "--json".as_ref(),
+    ])
+    .stdout;
+    assert!(String::from_utf8_lossy(&wav_report).contains("W1AW"));
+    assert_eq!(decode_raw(&raw, "cf32"), wav_report);
+
+    // ci16 against the same samples quantized into a PCM16 WAV.
+    let q = |v: f32| (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
+    let pcm = dir.path().join("pcm16.wav");
+    let mut w = hound::WavWriter::create(
+        &pcm,
+        hound::WavSpec {
+            channels: 2,
+            sample_rate: manifest.fs as u32,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        },
+    )
+    .unwrap();
+    let mut ci16 = Vec::new();
+    for s in &samples {
+        for v in [q(s.re), q(s.im)] {
+            w.write_sample(v).unwrap();
+            ci16.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    w.finalize().unwrap();
+    let raw16 = dir.path().join("external.ci16");
+    std::fs::write(&raw16, ci16).unwrap();
+    let pcm_report = run_ok(&[
+        "decode".as_ref(),
+        pcm.as_os_str(),
+        "--center-freq-hz".as_ref(),
+        centre.as_ref(),
+        "--json".as_ref(),
+    ])
+    .stdout;
+    assert_eq!(decode_raw(&raw16, "ci16"), pcm_report);
+
+    // run takes the same file with --dial-freq-hz as its centre.
+    let run_raw = |extra: &[&std::ffi::OsStr]| {
+        let mut args: Vec<&std::ffi::OsStr> = vec![
+            "run".as_ref(),
+            "--source".as_ref(),
+            raw.as_os_str(),
+            "--source-iq".as_ref(),
+            "--iq-format".as_ref(),
+            "cf32".as_ref(),
+            "--sample-rate-hz".as_ref(),
+            rate.as_ref(),
+            "--json".as_ref(),
+        ];
+        args.extend_from_slice(extra);
+        args.iter().map(|a| a.to_os_string()).collect::<Vec<_>>()
+    };
+    let with_dial = run_raw(&["--dial-freq-hz".as_ref(), centre.as_ref()]);
+    let out = manta().args(&with_dial).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("W1AW"));
+    // ci16 through run: the same as the equivalent PCM16 WAV through run.
+    let run16 = |p: &Path, extra: &[&std::ffi::OsStr]| {
+        let mut args: Vec<&std::ffi::OsStr> = vec![
+            "run".as_ref(),
+            "--source".as_ref(),
+            p.as_os_str(),
+            "--source-iq".as_ref(),
+            "--dial-freq-hz".as_ref(),
+            centre.as_ref(),
+            "--json".as_ref(),
+        ];
+        args.extend_from_slice(extra);
+        run_ok(&args).stdout
+    };
+    let ci16_run = run16(
+        &raw16,
+        &[
+            "--iq-format".as_ref(),
+            "ci16".as_ref(),
+            "--sample-rate-hz".as_ref(),
+            rate.as_ref(),
+        ],
+    );
+    assert!(String::from_utf8_lossy(&ci16_run).contains("W1AW"));
+    assert_eq!(ci16_run, run16(&pcm, &[]));
+
+    // The same file described by `[input]` keys (relative to the config)
+    // runs exactly as the flags describe it; `config check` reports them.
+    let cfg = dir.path().join("manta.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[input]\ntype = \"file\"\npath = \"external.cf32\"\niq = true\n\
+             iq_format = \"cf32\"\nsample_rate_hz = {rate}\ncenter_freq_hz = {centre}\n"
+        ),
+    )
+    .unwrap();
+    let from_config = run_ok(&[
+        "run".as_ref(),
+        "--config".as_ref(),
+        cfg.as_os_str(),
+        "--json".as_ref(),
+    ]);
+    assert_eq!(from_config.stdout, out.stdout);
+    let check = run_ok(&[
+        "config".as_ref(),
+        "check".as_ref(),
+        "--config".as_ref(),
+        cfg.as_os_str(),
+    ]);
+    let check = String::from_utf8_lossy(&check.stdout).into_owned()
+        + &String::from_utf8_lossy(&check.stderr);
+    assert!(
+        check.contains(&format!("iq_format=cf32 sample_rate_hz={rate}")),
+        "{check}"
+    );
+
+    // Missing metadata: the command-specific message.
+    let (code, stderr) = stderr_of(&[
+        "decode".as_ref(),
+        raw.as_os_str(),
+        "--iq-format".as_ref(),
+        "cf32".as_ref(),
+    ]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("error: headerless IQ requires --sample-rate-hz and --center-freq-hz"),
+        "{stderr}"
+    );
+    let out = manta().args(run_raw(&[])).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error: headerless IQ requires --sample-rate-hz and --dial-freq-hz"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_service_config_records_relative_to_its_file_and_config_check_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = dir.path().join("svc");
+    std::fs::create_dir(&svc).unwrap();
+    let (wav, manifest) = v1_fixture(&svc);
+    let toml = svc.join("manta.toml");
+    std::fs::write(
+        &toml,
+        "[input]\ntype = \"file\"\npath = \"v1.wav\"\niq = true\nrecord_iq = \"cap.cf32\"\n",
+    )
+    .unwrap();
+    let rec = svc.join("cap.cf32");
+
+    let check = run_ok(&[
+        "config".as_ref(),
+        "check".as_ref(),
+        "--config".as_ref(),
+        toml.as_os_str(),
+    ]);
+    let summary = String::from_utf8_lossy(&check.stdout).into_owned()
+        + &String::from_utf8_lossy(&check.stderr);
+    assert!(
+        summary.contains(&format!("record_iq={}", rec.display())),
+        "{summary}"
+    );
+    assert!(!rec.exists());
+    assert!(!manta_input::partial_metadata_path(&rec).exists());
+
+    // `check` reads the input but only `run` records: it says so and
+    // creates nothing.
+    let check = run_ok(&[
+        "check".as_ref(),
+        "--duration".as_ref(),
+        "1".as_ref(),
+        "--config".as_ref(),
+        toml.as_os_str(),
+    ]);
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        stderr.contains("check does not record IQ; ignoring input.record_iq"),
+        "{stderr}"
+    );
+    assert!(!rec.exists());
+    assert!(!manta_input::partial_metadata_path(&rec).exists());
+
+    // Run from another directory: the path is the config file's, not the
+    // working directory's.
+    let out = manta()
+        .current_dir(dir.path())
+        .args(["run", "--json", "--config"])
+        .arg(&toml)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let recs = records(&rec);
+    assert_eq!(
+        recs.last().unwrap(),
+        &MetadataRecord::End {
+            sample_count: (manifest.fs * manifest.duration_s) as u64,
+            reason: EndReason::Eof
+        }
+    );
+    assert_eq!(std::fs::read(&rec).unwrap(), cf32_bytes(&wav_samples(&wav)));
+    // A restart with the same destination fails and touches neither file.
+    let before = std::fs::read(metadata_path(&rec)).unwrap();
+    let payload_before = std::fs::read(&rec).unwrap();
+    let out = manta()
+        .args(["run", "--json", "--config"])
+        .arg(&toml)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(std::fs::read(metadata_path(&rec)).unwrap(), before);
+    assert_eq!(std::fs::read(&rec).unwrap(), payload_before);
+}
+
+#[test]
+fn recording_destinations_reject_generated_path_collisions_before_opening() {
+    let dir = tempfile::tempdir().unwrap();
+    v1_fixture(dir.path());
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    for other in [
+        "capture.meta.jsonl",
+        "capture.meta.jsonl.partial",
+        "sub/../CAPTURE.META.JSONL",
+        "sub/../CAPTURE.META.JSONL.PARTIAL",
+    ] {
+        for paths in [["capture", other], [other, "capture"]] {
+            let config = dir.path().join("collision.toml");
+            let entries: String = paths.iter().enumerate().map(|(i, path)| {
+                format!(
+                    "[[input]]\nname = \"rx{i}\"\ntype = \"file\"\npath = \"v1.wav\"\niq = true\nrecord_iq = \"{path}\"\n"
+                )
+            }).collect();
+            std::fs::write(&config, entries).unwrap();
+            let out = manta()
+                .args(["run", "--config"])
+                .arg(&config)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{paths:?}: {stderr}");
+            assert!(
+                stderr.contains("give each its own record_iq"),
+                "{paths:?}: {stderr}"
+            );
+            for path in paths {
+                let path = dir.path().join(path);
+                assert!(!path.exists());
+                assert!(!metadata_path(&path).exists());
+                assert!(!manta_input::partial_metadata_path(&path).exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn each_input_of_a_multi_input_daemon_records_its_own_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, manifest) = v1_fixture(dir.path());
+    let entry = |name: &str, rec: &str| {
+        format!(
+            "[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = {}\niq = true\n\
+             record_iq = \"{rec}\"\n\n",
+            toml_str(&wav)
+        )
+    };
+    let toml = dir.path().join("multi.toml");
+    std::fs::write(&toml, entry("a", "a.cf32") + &entry("b", "b.cf32")).unwrap();
+    let out = manta()
+        .args(["run", "--json", "--config"])
+        .arg(&toml)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let n = (manifest.fs * manifest.duration_s) as u64;
+    for rec in ["a.cf32", "b.cf32"] {
+        let rec = dir.path().join(rec);
+        assert!(
+            stderr.contains(&format!(
+                "recording finished: {}, {n} samples",
+                rec.display()
+            )),
+            "{stderr}"
+        );
+        assert_eq!(std::fs::read(&rec).unwrap(), cf32_bytes(&wav_samples(&wav)));
+    }
+
+    // The two recordings replay as a two-input daemon (MAN-13's zero-offset
+    // file policy) to the same bytes on every run.
+    let replay_toml = dir.path().join("replay.toml");
+    let replay_entry = |name: &str, rec: &str| {
+        format!("[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = \"{rec}\"\niq = true\n\n")
+    };
+    std::fs::write(
+        &replay_toml,
+        replay_entry("a", "a.cf32") + &replay_entry("b", "b.cf32"),
+    )
+    .unwrap();
+    let replay = || {
+        run_ok(&[
+            "run".as_ref(),
+            "--json".as_ref(),
+            "--config".as_ref(),
+            replay_toml.as_os_str(),
+        ])
+        .stdout
+    };
+    let first = replay();
+    assert!(String::from_utf8_lossy(&first).contains("W1AW"));
+    assert_eq!(replay(), first);
+    assert_eq!(replay(), first);
+
+    // Two inputs on one destination, or --record-iq with several inputs,
+    // fail before anything opens.
+    let dup = dir.path().join("dup.toml");
+    std::fs::write(&dup, entry("a", "same.cf32") + &entry("b", "same.cf32")).unwrap();
+    let out = manta()
+        .args(["run", "--config"])
+        .arg(&dup)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("give each its own record_iq"));
+    assert!(!dir.path().join("same.cf32").exists());
+    // Two spellings of one destination are the same destination, case
+    // included (a case-insensitive filesystem would open one file).
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    for other in ["sub/../same.cf32", "SAME.cf32"] {
+        let alias = dir.path().join("alias.toml");
+        std::fs::write(&alias, entry("a", "same.cf32") + &entry("b", other)).unwrap();
+        let out = manta()
+            .args(["run", "--config"])
+            .arg(&alias)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{other}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("give each its own record_iq"),
+            "{other}"
+        );
+        assert!(!dir.path().join("same.cf32").exists());
+        assert!(!dir.path().join("SAME.cf32").exists());
+    }
+    let out = manta()
+        .args(["run", "--record-iq", "x.cf32", "--config"])
+        .arg(&toml)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--record-iq records one input"));
+}
+
+/// A multi-input startup that fails after its inputs opened (here, an
+/// occupied telnet port) removes the empty recordings its openers created,
+/// so the next start is not refused by them.
+#[test]
+fn a_failed_multi_input_startup_leaves_no_recording_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, _) = v1_fixture(dir.path());
+    let entry = |name: &str, rec: &str| {
+        format!(
+            "[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = {}\niq = true\n\
+             record_iq = \"{rec}\"\n\n",
+            toml_str(&wav)
+        )
+    };
+    let inputs = entry("a", "a.cf32") + &entry("b", "b.cf32");
+    let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let toml = dir.path().join("busy.toml");
+    std::fs::write(
+        &toml,
+        format!(
+            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
+             telnet_port = {}\njson_port = 0\nmetrics_port = 0\n\n{inputs}",
+            busy.local_addr().unwrap().port()
+        ),
+    )
+    .unwrap();
+    let out = manta()
+        .args(["run", "--json", "--config"])
+        .arg(&toml)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    for rec in ["a.cf32", "b.cf32"] {
+        let rec = dir.path().join(rec);
+        assert!(
+            stderr.contains(&format!("recording IQ to {}", rec.display())),
+            "{stderr}"
+        );
+        assert!(!rec.exists(), "{}: {stderr}", rec.display());
+        assert!(!metadata_path(&rec).exists(), "{}", rec.display());
+        assert!(!manta_input::partial_metadata_path(&rec).exists());
+    }
+    drop(busy);
+
+    let restart = dir.path().join("restart.toml");
+    std::fs::write(&restart, inputs).unwrap();
+    run_ok(&[
+        "run".as_ref(),
+        "--json".as_ref(),
+        "--config".as_ref(),
+        restart.as_os_str(),
+    ]);
+    for rec in ["a.cf32", "b.cf32"] {
+        assert!(metadata_path(&dir.path().join(rec)).exists());
+    }
+}
+
+/// `dir/v1.wav` rendered for `seconds`.
+#[cfg(unix)]
+fn v1_fixture_secs(dir: &Path, seconds: f64) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    let spec = manta_testkit::vectors::VectorSpec {
+        duration_s: seconds,
+        ..manta_testkit::vectors::v1()
+    };
+    manta_testkit::vectors::write_fixture_set(&spec, dir).unwrap();
+    dir.join("v1.wav")
+}
+
+/// `manta` limited to writing files of at most `bytes` (a write past it
+/// fails with EFBIG instead of raising SIGXFSZ): a storage failure for the
+/// recorder only, since stdout and stderr are pipes.
+#[cfg(unix)]
+fn manta_with_file_size_limit(bytes: u64) -> Command {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = manta();
+    // SAFETY: async-signal-safe libc calls only, between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let limit = libc::rlimit {
+                rlim_cur: bytes as libc::rlim_t,
+                rlim_max: bytes as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd
+}
+
+/// A recording that cannot be written warns once, leaves decoding exactly
+/// as without it, publishes no complete pair and makes `run` exit 1.
+#[cfg(unix)]
+#[test]
+fn a_recording_write_failure_keeps_decoding_and_fails_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture_secs(&dir.path().join("long"), 30.0);
+    let args = |extra: &[&std::ffi::OsStr]| {
+        let mut a: Vec<std::ffi::OsString> = vec![
+            "run".into(),
+            "--source".into(),
+            wav.as_os_str().into(),
+            "--source-iq".into(),
+            "--json".into(),
+        ];
+        a.extend(extra.iter().map(|s| s.to_os_string()));
+        a
+    };
+    let plain = run_ok(&args(&[]).iter().map(|a| a.as_os_str()).collect::<Vec<_>>());
+    assert!(String::from_utf8_lossy(&plain.stdout).contains("W1AW"));
+
+    let rec = dir.path().join("session.cf32");
+    let out = manta_with_file_size_limit(1 << 20)
+        .args(args(&["--record-iq".as_ref(), rec.as_os_str()]))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert_eq!(out.stdout, plain.stdout, "decoding changed: {stderr}");
+    let warning = format!("IQ recording stopped: write failed for {}", rec.display());
+    assert_eq!(stderr.matches(&warning).count(), 1, "{stderr}");
+    assert!(stderr.contains("decoding continues"), "{stderr}");
+    assert!(!stderr.contains("recording finished:"), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "error: IQ recording {} is incomplete: it stopped early",
+            rec.display()
+        )),
+        "{stderr}"
+    );
+    assert!(!metadata_path(&rec).exists());
+    assert!(manta_input::partial_metadata_path(&rec).exists());
+}
+
+/// In a two-input daemon one recording failing leaves the other input's
+/// recording to finish, and the run still exits 1.
+#[cfg(unix)]
+#[test]
+fn one_failing_recording_of_a_multi_input_daemon_leaves_the_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let short = v1_fixture_secs(&dir.path().join("short"), 2.0);
+    let long = v1_fixture_secs(&dir.path().join("long"), 30.0);
+    let entry = |name: &str, wav: &Path, rec: &str| {
+        format!(
+            "[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = {}\niq = true\n\
+             record_iq = \"{rec}\"\n\n",
+            toml_str(wav)
+        )
+    };
+    let toml = dir.path().join("multi.toml");
+    std::fs::write(
+        &toml,
+        entry("a", &short, "a.cf32") + &entry("b", &long, "b.cf32"),
+    )
+    .unwrap();
+    // 2 s at 96 kS/s is 1.5 MB of cf32; 30 s is 23 MB.
+    let out = manta_with_file_size_limit(4 << 20)
+        .args(["run", "--json", "--config"])
+        .arg(&toml)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    let (a, b) = (dir.path().join("a.cf32"), dir.path().join("b.cf32"));
+    assert!(
+        stderr.contains(&format!(
+            "recording finished: {}, 192000 samples",
+            a.display()
+        )),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(&a).unwrap(), cf32_bytes(&wav_samples(&short)));
+    assert!(
+        stderr.contains(&format!(
+            "IQ recording stopped: write failed for {}",
+            b.display()
+        )),
+        "{stderr}"
+    );
+    assert!(!metadata_path(&b).exists());
+}
+
+/// A stop signal ends a never-ending (looping, paced) input through `run`'s
+/// shutdown path, which finalizes the recording as `stopped`.
+#[cfg(unix)]
+#[test]
+fn a_stop_signal_finalizes_the_recording() {
+    use std::io::BufRead;
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture_secs(&dir.path().join("fixture"), 30.0);
+    let rec = dir.path().join("live.cf32");
+    let mut child = manta()
+        .args([
+            "run".as_ref(),
+            "--source".as_ref(),
+            wav.as_os_str(),
+            "--source-iq".as_ref(),
+            "--loop".as_ref(),
+            "--json".as_ref(),
+            "--record-iq".as_ref(),
+            rec.as_os_str(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut all = String::new();
+        for line in std::io::BufReader::new(stderr).lines() {
+            let line = line.unwrap();
+            let _ = tx.send(line.clone());
+            all.push_str(&line);
+            all.push('\n');
+        }
+        all
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let line = rx
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("run never started recording");
+        if line.contains("recording IQ to") {
+            break;
+        }
+    }
+    // Some paced samples, then a stop.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let status = child.wait().unwrap();
+    let stderr = reader.join().unwrap();
+    assert!(status.success(), "{status:?}: {stderr}");
+    assert!(
+        stderr.contains(&format!("recording finished: {}", rec.display())),
+        "{stderr}"
+    );
+    let records = records(&rec);
+    let Some(MetadataRecord::End {
+        sample_count,
+        reason,
+    }) = records.last()
+    else {
+        panic!("no end record: {records:?}");
+    };
+    assert_eq!(*reason, EndReason::Stopped);
+    assert!(*sample_count > 0);
+    assert_eq!(std::fs::metadata(&rec).unwrap().len(), sample_count * 8);
+}
+
+/// The live path: a (fake) KiwiSDR drops its connection and comes back.
+/// `run` keeps decoding through the reconnect, and its recording holds the
+/// receiver's rate, centre and passband and the outage as a gap record at
+/// the stored sample where the stream resumed.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_input_outage_is_recorded_as_a_gap() {
+    use common::{
+        accept_kiwi_session, expect_line, line_channel, send_snd_frames, wait_bounded, KillOnDrop,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const WAIT: Duration = Duration::from_secs(60);
+    let dir = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    let done = Arc::new(AtomicBool::new(false));
+    let fake = std::thread::spawn({
+        let done = done.clone();
+        move || -> Result<(), String> {
+            // Past the 2 s calibration, then a hang-up; the second session
+            // streams until the test ends.
+            for secs in [4, 120] {
+                let mut ws = accept_kiwi_session(&listener, &done)?;
+                let until = Instant::now() + Duration::from_secs(secs);
+                send_snd_frames(&mut ws, || {
+                    done.load(Ordering::Relaxed) || Instant::now() >= until
+                });
+            }
+            Ok(())
+        }
+    });
+    let rec = dir.path().join("kiwi.cf32");
+    let launched = std::time::SystemTime::now();
+    let mut child = KillOnDrop(
+        manta()
+            .args([
+                "run".as_ref(),
+                "--kiwi-host".as_ref(),
+                "127.0.0.1".as_ref(),
+                "--kiwi-port".as_ref(),
+                port.as_ref(),
+                "--kiwi-freq-hz".as_ref(),
+                "14025000".as_ref(),
+                "--json".as_ref(),
+                "--record-iq".as_ref(),
+                rec.as_os_str(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = line_channel(child.0.stderr.take().unwrap());
+    expect_line(&stderr, &["recording IQ to"], WAIT);
+    expect_line(&stderr, &["reconnected after"], WAIT);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(unsafe { libc::kill(child.0.id() as i32, libc::SIGINT) }, 0);
+    let finished = expect_line(&stderr, &["recording finished:"], WAIT);
+    assert!(finished.contains(&rec.display().to_string()), "{finished}");
+    let status = wait_bounded(&mut child.0, WAIT).expect("run did not exit");
+    assert!(status.success(), "{status:?}");
+    done.store(true, Ordering::Relaxed);
+    let _ = fake.join();
+
+    let records = records(&rec);
+    let Some(MetadataRecord::Header(header)) = records.first() else {
+        panic!("no header: {records:?}");
+    };
+    assert_eq!(header.center_freq_hz, 14_025_000.0);
+    assert!(header.sample_rate_hz > 0.0);
+    // Sample zero was taken during this run.
+    let start = header.start_time().expect("a start time");
+    assert!(
+        start >= launched - Duration::from_secs(1) && start <= std::time::SystemTime::now(),
+        "{header:?}"
+    );
+    let (lo, hi) = (header.rf_passband_hz[0], header.rf_passband_hz[1]);
+    assert!(
+        hi - lo < header.sample_rate_hz,
+        "a KiwiSDR carries less than its Nyquist span: {header:?}"
+    );
+    let gaps: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            MetadataRecord::Gap { before_sample, .. } => Some(*before_sample),
+            _ => None,
+        })
+        .collect();
+    let Some(MetadataRecord::End {
+        sample_count,
+        reason,
+    }) = records.last()
+    else {
+        panic!("no end record: {records:?}");
+    };
+    assert_eq!(*reason, EndReason::Stopped);
+    // The reconnect inside the stream; a stop can add an outage at the end
+    // (MAN-258), recorded as a terminal gap at `sample_count`.
+    let inside = gaps.iter().filter(|&&g| g > 0 && g < *sample_count).count();
+    assert_eq!(inside, 1, "{records:?}");
+    assert!(
+        gaps.iter().all(|&g| g > 0 && g <= *sample_count),
+        "{records:?}"
+    );
+    assert_eq!(std::fs::metadata(&rec).unwrap().len(), sample_count * 8);
+}
+
+/// The headerless-IQ flags refuse a bad format or rate, and a rate without
+/// a format, at parse time (exit 2), before any file is read.
+#[test]
+fn headerless_iq_flags_refuse_bad_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = dir.path().join("x.cf32");
+    std::fs::write(&raw, [0u8; 80]).unwrap();
+    let raw = raw.as_os_str();
+    for (args, want) in [
+        (
+            vec![
+                "decode".as_ref(),
+                raw,
+                "--iq-format".as_ref(),
+                "cs8".as_ref(),
+            ],
+            "cs8",
+        ),
+        (
+            vec![
+                "decode".as_ref(),
+                raw,
+                "--iq-format".as_ref(),
+                "cf32".as_ref(),
+                "--sample-rate-hz".as_ref(),
+                "0".as_ref(),
+            ],
+            "--sample-rate-hz must be above 0",
+        ),
+        (
+            vec![
+                "decode".as_ref(),
+                raw,
+                "--iq-format".as_ref(),
+                "ci16".as_ref(),
+                "--sample-rate-hz".as_ref(),
+                "10000001".as_ref(),
+            ],
+            "--sample-rate-hz must be above 0",
+        ),
+        (
+            vec![
+                "decode".as_ref(),
+                raw,
+                "--sample-rate-hz".as_ref(),
+                "96000".as_ref(),
+            ],
+            "--iq-format",
+        ),
+        (
+            vec![
+                "run".as_ref(),
+                "--source".as_ref(),
+                raw,
+                "--iq-format".as_ref(),
+                "cf32".as_ref(),
+            ],
+            "--source-iq",
+        ),
+    ] {
+        let (code, stderr) = stderr_of(&args);
+        assert_eq!(code, 2, "{args:?}: {stderr}");
+        assert!(stderr.contains(want), "{args:?}: {stderr}");
+    }
+}
