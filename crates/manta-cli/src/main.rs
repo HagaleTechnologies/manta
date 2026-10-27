@@ -2167,6 +2167,7 @@ fn hpsdr_config(
         ddc_count: 1,
         sample_rate_hz: rate,
         center_freq_hz: vec![freq],
+        auto_attenuation: hpsdr.auto_attenuation.clone(),
     }
 }
 

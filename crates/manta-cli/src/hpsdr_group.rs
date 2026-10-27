@@ -718,6 +718,7 @@ pub(crate) fn prepare(
                         ddc_count: 1,
                         sample_rate_hz: allocation.rate,
                         center_freq_hz: allocation.frequencies.clone(),
+                        auto_attenuation: None,
                     },
                     allocation.protocol,
                 )?;
@@ -744,6 +745,7 @@ pub(crate) fn prepare(
                 ddc_count: allocation.members.len(),
                 sample_rate_hz: allocation.rate,
                 center_freq_hz: allocation.frequencies.clone(),
+                auto_attenuation: None,
             })?;
             let session = raw[0].session();
             let started_at = session.started_at();

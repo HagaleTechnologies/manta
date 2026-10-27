@@ -1082,6 +1082,7 @@ fn validate_hpsdr_allocations(inputs: &[NamedInput], origin: &str) -> Result<()>
             ddc_count: group.members.len(),
             sample_rate_hz: group.rate,
             center_freq_hz: group.frequencies.clone(),
+            auto_attenuation: None,
         }
         .validate()
         .map_err(|e| anyhow!("{origin}: [[input]] \"{first}\": {e}"))?;

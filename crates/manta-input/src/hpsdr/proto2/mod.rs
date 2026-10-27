@@ -5,8 +5,13 @@
 //! D4 port map and receives every datagram the radio sends back; `read()`
 //! demultiplexes by source port, keeps DDC0's IQ, accounts for sequence
 //! gaps (D10/D11), drives the keepalive (D8) and bounds stalls (D13).
+//! With automatic attenuation on, it also reads the high-priority status
+//! datagram and drives ADC0's step attenuator (MAN-308).
 
+pub mod attenuator;
 pub mod wire;
+
+use attenuator::{AttenuationChange, AttenuationStep, AutoAttenuation, Controller, Timing};
 
 use super::{
     GapStats, HpsdrConfig, INITIAL_BURST_REPEATS, MAX_CONSECUTIVE_MALFORMED,
@@ -44,8 +49,12 @@ const MAX_CENTRE_FREQ_HZ: f64 = wire::ADC_CLOCK_HZ / 2.0;
 const DDC0_PORT_OFFSET: u16 = 11;
 
 /// Highest radio source port, relative to `port`, that is read and ignored
-/// (command response, high-priority status, mic, wideband; D4/D5).
+/// (command response, high-priority status, mic, wideband; D4/D5), except
+/// high-priority status when automatic attenuation is on (MAN-308).
 const LAST_IGNORED_PORT_OFFSET: u16 = 10;
+
+/// The radio's high-priority status port, relative to `port` (D4; MAN-308).
+const STATUS_PORT_OFFSET: u16 = 1;
 
 /// Waits after each bring-up burst (D6: "let the FPGA digest").
 const AFTER_GENERAL: Duration = Duration::from_millis(100);
@@ -153,6 +162,13 @@ pub(crate) fn validate_protocol2(cfg: &HpsdrConfig) -> Result<(u16, f64)> {
     Ok((rate_khz, f))
 }
 
+/// MAN-308: one open's automatic attenuation, the shared handle plus the
+/// controller that decides each step.
+struct Attenuation {
+    handle: Arc<AutoAttenuation>,
+    controller: Controller,
+}
+
 /// A protocol-2 radio's DDC0 as an [`IqSource`].
 pub struct Protocol2IqSource {
     socket: UdpSocket,
@@ -196,6 +212,8 @@ pub struct Protocol2IqSource {
     pub(crate) stall_after: Duration,
     /// Consecutive malformed datagrams before `read()` errors (D13).
     pub(crate) max_consecutive_malformed: u32,
+    /// MAN-308: `Some` with `input.auto_attenuation`.
+    attenuation: Option<Attenuation>,
 }
 
 impl Protocol2IqSource {
@@ -253,6 +271,12 @@ impl Protocol2IqSource {
             health_counters: Arc::new(InputHealthCounters::new()),
             stall_after: STALL_AFTER,
             max_consecutive_malformed: MAX_CONSECUTIVE_MALFORMED,
+            // Engaged before the bring-up sends, so a reopen's restored
+            // level goes out with run = 1 (MAN-308 D6).
+            attenuation: cfg.auto_attenuation.as_ref().map(|h| Attenuation {
+                controller: Controller::new(h.engage(), now, Timing::default()),
+                handle: h.clone(),
+            }),
         };
 
         // D6 order: general, rx-specific, tx-specific, each twice with the
@@ -304,9 +328,14 @@ impl Protocol2IqSource {
             Stream::General => wire::general_packet(seq, &self.board).to_vec(),
             Stream::RxSpecific => wire::rx_specific_packet(seq, &self.board, self.rate_khz),
             Stream::TxSpecific => wire::tx_specific_packet(seq).to_vec(),
-            Stream::HighPriority => {
-                wire::high_priority_packet(seq, run, self.phase_word, self.alex0, self.alex1)
-            }
+            Stream::HighPriority => wire::high_priority_packet(
+                seq,
+                run,
+                self.phase_word,
+                self.alex0,
+                self.alex1,
+                self.attenuation.as_ref().map_or(0, |a| a.controller.db()),
+            ),
         };
         let to = SocketAddrV4::new(self.radio_ip, self.port + stream as u16);
         self.socket.send_to(&packet, to).map(|_| ())
@@ -333,6 +362,53 @@ impl Protocol2IqSource {
                 .context("send HPSDR protocol 2 general keepalive")?;
         }
         Ok(())
+    }
+
+    /// MAN-308: one high-priority status datagram. Without automatic
+    /// attenuation it is ignored, as before; a datagram of another length is
+    /// ignored too, not counted malformed.
+    fn handle_status(&mut self, len: usize) -> Result<()> {
+        let Some(att) = self.attenuation.as_mut() else {
+            return Ok(());
+        };
+        let Some(bits) = wire::adc_overload_bits(&self.recv_buf[..len]) else {
+            return Ok(());
+        };
+        match att
+            .controller
+            .observe(bits & wire::ADC0_OVERLOAD != 0, Instant::now())
+        {
+            Some(step) => self.apply_step(step),
+            None => Ok(()),
+        }
+    }
+
+    /// MAN-308: lower the attenuator once the band has been quiet long
+    /// enough.
+    fn tick_attenuation(&mut self) -> Result<()> {
+        let Some(att) = self.attenuation.as_mut() else {
+            return Ok(());
+        };
+        match att.controller.tick(Instant::now()) {
+            Some(step) => self.apply_step(step),
+            None => Ok(()),
+        }
+    }
+
+    /// MAN-308: record and log one step, and send it to the radio now rather
+    /// than at the next keepalive.
+    fn apply_step(&mut self, step: AttenuationStep) -> Result<()> {
+        if let Some(att) = &self.attenuation {
+            att.handle.record(&AttenuationChange {
+                radio: format!("{}:{}", self.host, self.port),
+                from_db: step.from_db,
+                to_db: step.to_db,
+                cause: step.cause,
+            });
+        }
+        self.last_high_priority = Instant::now();
+        self.send(Stream::HighPriority, true)
+            .context("send HPSDR protocol 2 high-priority attenuation change")
     }
 
     /// Count one malformed datagram and enforce the D13 flood bound.
@@ -427,6 +503,7 @@ impl Protocol2IqSource {
                 );
             }
             self.send_keepalive_if_due()?;
+            self.tick_attenuation()?;
             let (len, from) = match self.socket.recv_from(&mut self.recv_buf) {
                 Ok(got) => got,
                 Err(e) => match classify_recv_error(&e) {
@@ -447,6 +524,8 @@ impl Protocol2IqSource {
             let offset = u32::from(from.port()).wrapping_sub(u32::from(self.port));
             if from.port() >= self.port && offset == u32::from(DDC0_PORT_OFFSET) {
                 self.handle_iq(len)?;
+            } else if from.port() >= self.port && offset == u32::from(STATUS_PORT_OFFSET) {
+                self.handle_status(len)?;
             } else if from.port() >= self.port && offset <= u32::from(LAST_IGNORED_PORT_OFFSET) {
                 // Command response, status, mic or wideband: not counted.
             } else {
@@ -546,6 +625,9 @@ pub(crate) mod fake {
         log: Arc<Mutex<Vec<Record>>>,
         stop: Arc<AtomicBool>,
         threads: Vec<JoinHandle<()>>,
+        /// Records before this index are ignored by `wait_for_run`, so a
+        /// reopen streams to the new socket (MAN-308).
+        run_floor: Mutex<usize>,
     }
 
     /// Stops a background sender when dropped.
@@ -628,6 +710,7 @@ pub(crate) mod fake {
                 log,
                 stop,
                 threads,
+                run_floor: Mutex::new(0),
             }
         }
 
@@ -660,6 +743,7 @@ pub(crate) mod fake {
                 ddc_count: 1,
                 sample_rate_hz: 192_000.0,
                 center_freq_hz: vec![7_030_000.0],
+                auto_attenuation: None,
             }
         }
 
@@ -680,17 +764,24 @@ pub(crate) mod fake {
         /// address it came from: manta's streaming socket.
         pub(crate) fn wait_for_run(&self) -> SocketAddr {
             let deadline = Instant::now() + Duration::from_secs(3);
+            let floor = *self.run_floor.lock().unwrap();
             loop {
-                if let Some(r) = self
-                    .records()
-                    .into_iter()
-                    .find(|r| r.0 == 3 && r.1.len() == wire::HIGH_PRIORITY_LEN && r.1[4] & 1 == 1)
+                if let Some(r) =
+                    self.records().into_iter().skip(floor).find(|r| {
+                        r.0 == 3 && r.1.len() == wire::HIGH_PRIORITY_LEN && r.1[4] & 1 == 1
+                    })
                 {
                     return r.2;
                 }
                 assert!(Instant::now() < deadline, "no run = 1 from manta");
                 thread::sleep(Duration::from_millis(5));
             }
+        }
+
+        /// Make `wait_for_run` (and every sender) wait for a run = 1 sent
+        /// after now: the next open's, once the last source has dropped.
+        pub(crate) fn forget_runs(&self) {
+            *self.run_floor.lock().unwrap() = self.records().len();
         }
 
         /// Send `bytes` from the IQ port, only once run = 1 was seen.
@@ -720,11 +811,21 @@ pub(crate) mod fake {
 
         /// Send a status datagram from `base + 1` every `every` until dropped.
         pub(crate) fn stream_status(&self, every: Duration) -> Background {
+            self.stream_status_bytes(every, [0u8; 60])
+        }
+
+        /// Send `status` from `base + 1` every `every` until dropped.
+        pub(crate) fn stream_status_bytes(&self, every: Duration, status: [u8; 60]) -> Background {
             let to = self.wait_for_run();
             let sock = self.cmd[1].try_clone().unwrap();
             self.background(every, move |_| {
-                let _ = sock.send_to(&[0u8; 60], to);
+                let _ = sock.send_to(&status, to);
             })
+        }
+
+        /// Send one status datagram (any length) from `base + 1`.
+        pub(crate) fn send_status(&self, status: &[u8]) {
+            self.send_from(1, status);
         }
 
         fn background<F: FnMut(u32) + Send + 'static>(
@@ -764,6 +865,7 @@ mod tests {
     use super::fake::{iq_datagram, FakeP2Radio};
     use super::*;
     use std::net::SocketAddr;
+    use std::sync::Mutex;
 
     /// A read buffer larger than any datagram, so a read that returned more
     /// than one datagram's samples would show.
@@ -815,8 +917,8 @@ mod tests {
             (1, wire::rx_specific_packet(1, &board, 192)),
             (2, wire::tx_specific_packet(0).to_vec()),
             (2, wire::tx_specific_packet(1).to_vec()),
-            (3, wire::high_priority_packet(0, true, phase, a0, a1)),
-            (3, wire::high_priority_packet(1, true, phase, a0, a1)),
+            (3, wire::high_priority_packet(0, true, phase, a0, a1, 0)),
+            (3, wire::high_priority_packet(1, true, phase, a0, a1, 0)),
         ];
         assert_eq!(first, expected);
         drop(src);
@@ -1144,6 +1246,241 @@ mod tests {
         assert!(err.contains("stalled: no IQ datagram"), "{err}");
     }
 
+    /// MAN-308: a handle whose notice records every change.
+    fn recording_handle() -> (Arc<AutoAttenuation>, Arc<Mutex<Vec<AttenuationChange>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let handle = Arc::new(AutoAttenuation::new(Box::new(move |c| {
+            s.lock().unwrap().push(c.clone())
+        })));
+        (handle, seen)
+    }
+
+    /// MAN-308: open with `handle` and test timings (trip after `trip`,
+    /// release after `release`).
+    fn open_attenuating(
+        fake: &FakeP2Radio,
+        handle: &Arc<AutoAttenuation>,
+        trip: Duration,
+        release: Duration,
+    ) -> Protocol2IqSource {
+        let cfg = HpsdrConfig {
+            auto_attenuation: Some(handle.clone()),
+            ..fake.cfg()
+        };
+        let mut src = Protocol2IqSource::open(&cfg, wire::board_info(Some(4))).unwrap();
+        src.attenuation.as_mut().unwrap().controller.timing = Timing {
+            hold: Duration::from_millis(100),
+            trip_after: trip,
+            release_after: release,
+        };
+        src
+    }
+
+    /// Read until `done` holds (3 s deadline), then `extra` more.
+    fn read_until(src: &mut Protocol2IqSource, done: impl Fn() -> bool, extra: Duration) {
+        let mut buf = vec![Complex32::new(0.0, 0.0); BIG];
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !done() {
+            assert!(Instant::now() < deadline, "condition not reached in 3 s");
+            src.read(&mut buf).unwrap();
+        }
+        let until = Instant::now() + extra;
+        while Instant::now() < until {
+            src.read(&mut buf).unwrap();
+        }
+    }
+
+    /// A status datagram with `bits` in byte 5.
+    fn status(bits: u8) -> [u8; 60] {
+        let mut d = [0u8; 60];
+        d[5] = bits;
+        d
+    }
+
+    /// Byte 1443 (ADC0's step attenuator) of every high-priority packet
+    /// with run = 1, in send order; asserts byte 1442 stays 0.
+    fn adc0_attenuation_sent(fake: &FakeP2Radio) -> Vec<u8> {
+        let hp: Vec<Vec<u8>> = fake
+            .received(3)
+            .into_iter()
+            .filter(|p| p[4] & 1 == 1)
+            .collect();
+        assert!(hp.iter().all(|p| p[1442] == 0), "ADC1 attenuator moved");
+        hp.iter().map(|p| p[1443]).collect()
+    }
+
+    fn high_priority_seqs(fake: &FakeP2Radio) -> Vec<u32> {
+        fake.received(3)
+            .iter()
+            .map(|p| u32::from_be_bytes([p[0], p[1], p[2], p[3]]))
+            .collect()
+    }
+
+    fn radio(fake: &FakeP2Radio) -> String {
+        format!("127.0.0.1:{}", fake.base)
+    }
+
+    #[test]
+    fn sustained_overload_raises_adc0_attenuation_on_the_wire() {
+        let fake = FakeP2Radio::start();
+        let (handle, seen) = recording_handle();
+        let mut src = open_attenuating(
+            &fake,
+            &handle,
+            Duration::from_millis(300),
+            Duration::from_secs(600),
+        );
+        let _iq = fake.stream_iq(Duration::from_millis(2));
+        let _status = fake.stream_status_bytes(Duration::from_millis(20), status(0x01));
+        let h = handle.clone();
+        read_until(&mut src, move || h.db() == 6, Duration::from_millis(200));
+        drop(_status);
+        drop(_iq);
+        thread::sleep(Duration::from_millis(20));
+        let sent = adc0_attenuation_sent(&fake);
+        let first_six = sent.iter().position(|&b| b == 6).expect("6 dB sent");
+        assert!(first_six > 0, "{sent:?}");
+        assert!(sent[..first_six].iter().all(|&b| b == 0), "{sent:?}");
+        assert!(sent[first_six..].iter().all(|&b| b == 6), "{sent:?}");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![AttenuationChange {
+                radio: radio(&fake),
+                from_db: 0,
+                to_db: 6,
+                cause: attenuator::AttenuationCause::Overload,
+            }]
+        );
+        assert_eq!(handle.changes(), 1);
+        let seqs = high_priority_seqs(&fake);
+        assert_eq!(seqs, (0..seqs.len() as u32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn reopen_restores_the_learned_level_and_quiet_lowers_it() {
+        let fake = FakeP2Radio::start();
+        let (handle, seen) = recording_handle();
+        let mut src = open_attenuating(
+            &fake,
+            &handle,
+            Duration::from_millis(200),
+            Duration::from_secs(600),
+        );
+        {
+            let _iq = fake.stream_iq(Duration::from_millis(2));
+            let _status = fake.stream_status_bytes(Duration::from_millis(20), status(0x01));
+            let h = handle.clone();
+            read_until(&mut src, move || h.db() == 12, Duration::ZERO);
+        }
+        drop(src);
+        thread::sleep(Duration::from_millis(50));
+        let before_reopen = fake.received(3).len();
+        fake.forget_runs();
+
+        let mut src = open_attenuating(
+            &fake,
+            &handle,
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+        );
+        fake.wait_for_run();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let bring_up: Vec<Vec<u8>> = loop {
+            let runs: Vec<Vec<u8>> = fake.received(3)[before_reopen..]
+                .iter()
+                .filter(|p| p[4] & 1 == 1)
+                .take(2)
+                .cloned()
+                .collect();
+            if runs.len() == 2 {
+                break runs;
+            }
+            assert!(Instant::now() < deadline, "no bring-up after the reopen");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(
+            bring_up.iter().all(|p| p[1443] == 12),
+            "the reopen restores 12 dB"
+        );
+        let _iq = fake.stream_iq(Duration::from_millis(2));
+        let _status = fake.stream_status_bytes(Duration::from_millis(20), status(0x00));
+        let h = handle.clone();
+        read_until(&mut src, move || h.db() == 6, Duration::from_millis(100));
+        drop(_status);
+        drop(_iq);
+        thread::sleep(Duration::from_millis(20));
+        let after: Vec<u8> = fake.received(3)[before_reopen..]
+            .iter()
+            .filter(|p| p[4] & 1 == 1)
+            .map(|p| p[1443])
+            .collect();
+        let first_six = after.iter().position(|&b| b == 6).expect("6 dB sent");
+        assert!(after[..first_six].iter().all(|&b| b == 12), "{after:?}");
+        assert!(after[first_six..].iter().all(|&b| b == 6), "{after:?}");
+        let changes = seen.lock().unwrap().clone();
+        assert_eq!(changes.len(), 3);
+        assert_eq!(
+            changes[2],
+            AttenuationChange {
+                radio: radio(&fake),
+                from_db: 12,
+                to_db: 6,
+                cause: attenuator::AttenuationCause::Quiet,
+            }
+        );
+        assert_eq!(handle.changes(), 3);
+        drop(src);
+    }
+
+    #[test]
+    fn overload_changes_nothing_without_auto_attenuation() {
+        let fake = FakeP2Radio::start();
+        let mut src = open(&fake);
+        let _iq = fake.stream_iq(Duration::from_millis(2));
+        let _status = fake.stream_status_bytes(Duration::from_millis(20), status(0x01));
+        let start = Instant::now();
+        let mut buf = vec![Complex32::new(0.0, 0.0); BIG];
+        while start.elapsed() < Duration::from_millis(500) {
+            src.read(&mut buf).unwrap();
+        }
+        drop(_status);
+        drop(_iq);
+        thread::sleep(Duration::from_millis(20));
+        let hp = fake.received(3);
+        assert!(hp.iter().all(|p| p[1442] == 0 && p[1443] == 0));
+        assert_eq!(src.gap_stats(), GapStats::default());
+    }
+
+    #[test]
+    fn a_status_datagram_of_another_length_is_ignored() {
+        let fake = FakeP2Radio::start();
+        let (handle, seen) = recording_handle();
+        let mut src = open_attenuating(
+            &fake,
+            &handle,
+            Duration::from_millis(200),
+            Duration::from_secs(600),
+        );
+        let _iq = fake.stream_iq(Duration::from_millis(2));
+        let mut short = [0u8; 59];
+        short[5] = 0x01;
+        let start = Instant::now();
+        let mut buf = vec![Complex32::new(0.0, 0.0); BIG];
+        let mut last_status = Instant::now() - Duration::from_secs(1);
+        while start.elapsed() < Duration::from_millis(500) {
+            if last_status.elapsed() >= Duration::from_millis(20) {
+                fake.send_status(&short);
+                last_status = Instant::now();
+            }
+            src.read(&mut buf).unwrap();
+        }
+        assert_eq!(handle.db(), 0);
+        assert_eq!(handle.changes(), 0);
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(src.gap_stats().malformed_packets, 0);
+    }
+
     #[test]
     fn malformed_flood_errors_after_the_bound() {
         assert_eq!(MAX_CONSECUTIVE_MALFORMED, 10_000);
@@ -1237,6 +1574,7 @@ mod tests {
             ddc_count: 1,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![7_030_000.0],
+            auto_attenuation: None,
         };
         assert_eq!(validate_protocol2(&ok).unwrap(), (192, 7_030_000.0));
         for rate in [48_000.0, 96_000.0, 384_000.0] {
@@ -1295,6 +1633,7 @@ mod tests {
             ddc_count: 1,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![14_000_000.0],
+            auto_attenuation: None,
         };
         let mut src = Protocol2IqSource::open(&cfg, wire::board_info(None)).unwrap();
         let mut buf = vec![Complex32::new(0.0, 0.0); BIG];
