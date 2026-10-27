@@ -2048,15 +2048,20 @@ fn attenuation_line(c: &manta_input::hpsdr::AttenuationChange) -> String {
     use manta_input::hpsdr::proto2::attenuator::{MAX_DB, RELEASE_AFTER, TRIP_AFTER};
     use manta_input::hpsdr::AttenuationCause;
     let (why, verb) = match c.cause {
-        AttenuationCause::Overload => {
-            (format!("ADC overload for {} s", TRIP_AFTER.as_secs()), "raised")
-        }
+        AttenuationCause::Overload => (
+            format!("ADC overload for {} s", TRIP_AFTER.as_secs()),
+            "raised",
+        ),
         AttenuationCause::Quiet => (
             format!("no ADC overload for {} min", RELEASE_AFTER.as_secs() / 60),
             "lowered",
         ),
     };
-    let tail = if c.to_db == MAX_DB { ", its maximum" } else { "" };
+    let tail = if c.to_db == MAX_DB {
+        ", its maximum"
+    } else {
+        ""
+    };
     format!(
         "note: HPSDR radio {}: {why}; automatic attenuation {verb} the step attenuator from {} dB \
          to {} dB{tail}",

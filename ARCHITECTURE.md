@@ -148,7 +148,10 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
   native-library dependency. The wire facts are pinned against reference
   sources (`docs/DECISIONS/2026-09-02-hpsdr-hermes-protocol-spike.md`,
   `docs/DECISIONS/2026-10-19-man305-hpsdr-protocol-2-input.md`), not yet
-  confirmed against live hardware.
+  confirmed against live hardware. With `[input].auto_attenuation`, the
+  protocol-2 source also reads the radio's high-priority status datagram and
+  drives ADC0's step attenuator on overload
+  (`docs/DECISIONS/2026-10-27-man308-hpsdr-auto-attenuation.md`).
 - **ka9q-radio (radiod) channel** (RTP over UDP multicast, no feature gate):
   joins the multicast data group of one existing radiod IQ channel and reads
   its sample rate, encoding, frequency and filter edges from the per-channel

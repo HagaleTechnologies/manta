@@ -97,6 +97,11 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-308: `[input].auto_attenuation` (default `false`) lets manta set a
+  protocol-2 openHPSDR radio's ADC0 step attenuator: 2 s of reported ADC
+  overload adds 6 dB (up to 30 dB) and 10 minutes without removes 6 dB.
+  Each change is logged, and `/metrics` gains `manta_input_attenuation_db`
+  and `manta_input_attenuation_changes_total`.
 - MAN-307: several HPSDR inputs can share one radio, with one independently
   tuned receiver per band, capacity probing for HL2, and an optional
   `receivers` declaration for other gateware. Each radio reconnects as a

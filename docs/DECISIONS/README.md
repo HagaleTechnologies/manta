@@ -11,6 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-27 | MAN-308 | [MAN-308: automatic step attenuation on a protocol-2 openHPSDR radio's ADC overload](2026-10-27-man308-hpsdr-auto-attenuation.md) |
 | 2026-10-26 | MAN-290 | [MAN-290: shadow-compare requires the RBN archive's `tx_mode` column](2026-10-26-man290-shadow-compare-requires-tx-mode.md) |
 | 2026-10-25 | MAN-402 | [MAN-402: a unimodal speed bootstrap reads its marks as dahs when the gaps between them say so](2026-10-25-man402-dah-heavy-bootstrap.md) |
 | 2026-10-25 | MAN-288 | [MAN-288: planned windows absorb counter-attributed downtime](2026-10-25-man288-planned-outage-counter-overlap.md) |

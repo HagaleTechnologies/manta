@@ -1482,7 +1482,10 @@ fn validate_input(
             auto_attenuation: match t.auto_attenuation {
                 Some(true)
                     if matches!(
-                        t.protocol.as_ref().map(ProtocolValue::protocol).transpose()?,
+                        t.protocol
+                            .as_ref()
+                            .map(ProtocolValue::protocol)
+                            .transpose()?,
                         Some(manta_input::hpsdr::HpsdrProtocol::One)
                     ) =>
                 {

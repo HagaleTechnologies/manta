@@ -3131,19 +3131,16 @@ mod tests {
         assert!(text.contains("# TYPE manta_input_attenuation_db gauge\n"));
         assert!(text.contains("# TYPE manta_input_attenuation_changes_total counter\n"));
         assert!(!text.contains("manta_input_attenuation_db{"), "{text}");
-        assert!(!text.contains("manta_input_attenuation_changes_total{"), "{text}");
+        assert!(
+            !text.contains("manta_input_attenuation_changes_total{"),
+            "{text}"
+        );
     }
 
     #[test]
     fn input_attenuation_renders_gauge_and_counter_per_source() {
         let m = Metrics::new();
-        m.set_input_attenuation(
-            "hpsdr",
-            InputAttenuation {
-                db: 12,
-                changes: 2,
-            },
-        );
+        m.set_input_attenuation("hpsdr", InputAttenuation { db: 12, changes: 2 });
         m.set_input_attenuation("40m", InputAttenuation { db: 0, changes: 0 });
         let text = m.render_prometheus_text();
         assert!(text.contains("\nmanta_input_attenuation_db{source=\"hpsdr\"} 12\n"));
@@ -3151,13 +3148,7 @@ mod tests {
         assert!(text.contains("\nmanta_input_attenuation_db{source=\"40m\"} 0\n"));
         assert!(text.contains("\nmanta_input_attenuation_changes_total{source=\"40m\"} 0\n"));
         // A second set overwrites rather than adds.
-        m.set_input_attenuation(
-            "hpsdr",
-            InputAttenuation {
-                db: 6,
-                changes: 3,
-            },
-        );
+        m.set_input_attenuation("hpsdr", InputAttenuation { db: 6, changes: 3 });
         let text = m.render_prometheus_text();
         assert!(text.contains("\nmanta_input_attenuation_db{source=\"hpsdr\"} 6\n"));
         assert!(text.contains("\nmanta_input_attenuation_changes_total{source=\"hpsdr\"} 3\n"));

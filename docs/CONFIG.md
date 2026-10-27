@@ -288,6 +288,37 @@ datagrams by the radio's source port.
 
 See [DECISIONS/2026-10-19-man305-hpsdr-protocol-2-input.md](DECISIONS/2026-10-19-man305-hpsdr-protocol-2-input.md).
 
+#### Automatic attenuation
+
+MAN-308: with `auto_attenuation = true`, manta reads the radio's
+high-priority status datagram (from `port + 1`) and drives ADC0's step
+attenuator:
+
+- ADC overload reported for 2 s (reports no more than 500 ms apart count as
+  one overload) adds 6 dB, up to 30 dB. Overload that continues adds
+  another 6 dB every 2 s.
+- 10 minutes with no overload reported removes 6 dB, and every further quiet
+  10 minutes another 6 dB, down to 0 dB.
+
+It writes to the radio, so it is off by default. Another program driving
+the same radio's attenuator would fight it. It needs protocol 2: config
+load refuses it with `protocol = "1"` and on a radio that several
+`[[input]]` entries share, and under `"auto"` a radio that answers as
+protocol 1 gets a warning naming the key and is left alone.
+
+Each change prints one line, for example:
+
+```
+note: HPSDR radio 192.0.2.10:1024: ADC overload for 2 s; automatic attenuation raised the step attenuator from 0 dB to 6 dB
+note: HPSDR radio 192.0.2.10:1024: no ADC overload for 10 min; automatic attenuation lowered the step attenuator from 12 dB to 6 dB
+```
+
+With a `[server]` table, `/metrics` carries `manta_input_attenuation_db` and
+`manta_input_attenuation_changes_total` (see [METRICS.md](METRICS.md)). A
+reconnect keeps the level manta had learned; a manta restart starts at
+0 dB. See
+[DECISIONS/2026-10-27-man308-hpsdr-auto-attenuation.md](DECISIONS/2026-10-27-man308-hpsdr-auto-attenuation.md).
+
 ### Band plans: bands
 
 `bands` names what a receiver skims instead of one centre (MAN-310). Write
