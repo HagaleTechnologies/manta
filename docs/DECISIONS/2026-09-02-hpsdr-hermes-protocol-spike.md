@@ -8,7 +8,7 @@
 reference-implementation source code, not from real hardware.** MAN-10's own
 acceptance criterion calls for exercising discovery framing, IQ framing,
 sample rates, and DDC support "against real hardware," and explicitly says
-George (K5TR) has an idle Hermes-Lite 2 and two Red-Pitaya-family units
+a volunteer operator has an idle Hermes-Lite 2 and two Red-Pitaya-family units
 available. Neither this session nor its research agent has network access to
 that hardware. Per MAN-10's own instruction to scope down rather than guess
 when hardware access isn't available, this doc:
@@ -28,7 +28,7 @@ are fine — the recommendation section below says what to do about that.
 **Target OpenHPSDR Protocol 1 (Metis) as the sole wire dialect for MAN-11's
 initial driver.** All three in-scope devices are Protocol 1 today; Protocol 2
 support exists only on a *different* Red Pitaya firmware (the transceiver
-build, not the receiver build George would actually run) and only as of a
+build, not the receiver build the operator would actually run) and only as of a
 2026-08 release. Protocol 2's per-DDC framing is architecturally nicer for a
 demux+loss/reorder handler (see below), so it's worth tracking as a future
 migration, but nothing in scope for MAN-11 speaks it today.
@@ -58,7 +58,7 @@ Per MAN-10's comment thread, three Hermes-compatible devices, not two:
 
 ### 2. Red Pitaya, Pavel Demin firmware — two separate projects
 
-Pavel Demin ships **two different HPSDR-family Red Pitaya images**; George's
+Pavel Demin ships **two different HPSDR-family Red Pitaya images**; the operator's
 skimming use case maps to the second one, not the first:
 
 - `sdr_transceiver_hpsdr` (full TX+RX): **5 DDC + 1 DUC**, but only **3 DDCs
@@ -69,7 +69,7 @@ skimming use case maps to the second one, not the first:
 - `sdr_receiver_hpsdr` (RX-only "Alpine" image): **8 identical DDCs**,
   48/96/192 kHz (**no 384 kHz** on this image), 0–490 MHz. Its own docs have
   a "Running CW Skimmer Server and RBN Aggregator" section — **this is the
-  image George's Red Pitaya skimming setup is actually running.**
+  image the operator's Red Pitaya skimming setup is actually running.**
   [Project page](http://pavel-demin.github.io/red-pitaya-notes/sdr-receiver/)
 
 **Correction to MAN-10/MAN-15's prior research note:** "two independent
@@ -169,7 +169,7 @@ Protocol 2 support did **not** first appear in the August 2026 release —
 it's existed since **v21.7.18 (2021-07-18)**. What the Aug 2026 release
 (`v26.8.9.1`) actually added was **Protocol-2 support specifically for the
 Red Pitaya transceiver firmware** — device #2's *transceiver* image, not
-the *receiver* image George runs.
+the *receiver* image the operator runs.
 [Releases](https://github.com/k3it/HermesIntf/releases)
 
 ## Bandwidth math — MAN-10's "8 or 16 192 kHz segments" confirmed and resolved
@@ -211,8 +211,8 @@ above:
 |---|---|---|---|---|
 | HL2, stock gateware | 4 | 48/96/192/384 kHz | Metis UDP-1024 broadcast | — |
 | HL2, skimmer gateware | 9–10 | 48/96/192/384 kHz | Metis UDP-1024 broadcast | Needs WDT keepalive; exceeds 100 Mbps at 192 kHz above ~8 DDCs — cap in config |
-| Red Pitaya, `sdr_transceiver_hpsdr` | 3 independent RX (of 5 DDC) | 48/96/192/384 kHz | avahi/mDNS, app must be running | Not the image George runs for skimming — lower priority |
-| Red Pitaya, `sdr_receiver_hpsdr` (Alpine) | 8 | 48/96/192 kHz (no 384k) | avahi/mDNS, app must be running | This is George's actual skimming setup; 8 DDCs matches the bandwidth ceiling exactly |
+| Red Pitaya, `sdr_transceiver_hpsdr` | 3 independent RX (of 5 DDC) | 48/96/192/384 kHz | avahi/mDNS, app must be running | Not the image the operator runs for skimming — lower priority |
+| Red Pitaya, `sdr_receiver_hpsdr` (Alpine) | 8 | 48/96/192 kHz (no 384k) | avahi/mDNS, app must be running | This is the operator's actual skimming setup; 8 DDCs matches the bandwidth ceiling exactly |
 | QMTech + `qmtech-adc` (Pavel's own board) | Assumed 8 (unconfirmed) | Assumed same as above (unconfirmed) | Assumed avahi/mDNS (unconfirmed) | Same firmware lineage as the Red Pitaya receiver image; no primary-source confirmation of actual behavior |
 
 All three device families speak Protocol 1/Metis today — a single P1
@@ -224,7 +224,7 @@ table like the one above, not be assumed uniform.
 ## Needs real hardware — do not treat these as settled
 
 Spec-reading and reference-client source code cannot substitute for these;
-they need George's actual units in the loop before MAN-11 ships, not just
+they need the operator's actual units in the loop before MAN-11 ships, not just
 before it starts:
 
 - Whether HL2 stock and skimmer-gateware firmware actually report/negotiate
@@ -249,7 +249,7 @@ before it starts:
 **Recommendation:** MAN-11 can start against Protocol 1/Metis with the
 per-device table above as its config-validation baseline, but its
 acceptance criteria should require confirming the five items above against
-George's actual hardware before merge, not just before starting — this
+the operator's actual hardware before merge, not just before starting — this
 spike does not substitute for hardware-in-the-loop validation, it only
 removes the need to *start* from spec-reading alone.
 
@@ -273,5 +273,5 @@ removes the need to *start* from spec-reading alone.
 
 - No implementation work was done from this ticket.
 - MAN-11 remains blocked until this doc lands; it should not start from the
-  unresolved hardware-verification items above without George's hardware in
+  unresolved hardware-verification items above without the operator's hardware in
   the loop first.
