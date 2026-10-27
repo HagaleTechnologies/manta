@@ -896,4 +896,113 @@ mod tests {
         let rbn = format_line(&capture_spot(), "S53A", 2 * 3600 + 36 * 60, LineFormat::Rbn);
         assert_eq!(line[..41], rbn[..41]);
     }
+
+    fn relay(
+        spotter: &str,
+        call: &str,
+        freq_hz: f64,
+        mode: RelayMode,
+        snr_db: i32,
+        spot_type: SpotType,
+        unix_ts: i64,
+    ) -> RelaySpot {
+        RelaySpot {
+            spotter: std::sync::Arc::from(spotter),
+            callsign: call.to_string(),
+            freq_hz,
+            mode,
+            snr_db,
+            spot_type,
+            unix_ts,
+        }
+    }
+
+    /// MAN-320: a relayed CW spot with the capture's fields renders the
+    /// capture byte for byte -- one geometry for own and relayed spots.
+    #[test]
+    fn a_relayed_cw_spot_with_the_captures_fields_is_the_capture() {
+        let spot = relay(
+            "S53A",
+            "N8II",
+            14_011_900.0,
+            RelayMode::Cw { wpm: 25 },
+            21,
+            SpotType::Cq,
+            2 * 3600 + 36 * 60,
+        );
+        assert_eq!(format_relay_line(&spot), LIVE_RBN_CAPTURE);
+    }
+
+    /// MAN-320 D13 (MAN-90 C13, unverified): FT8 in the mode column, a
+    /// blank speed field, and the type/time columns where RBN puts them.
+    #[test]
+    fn a_relayed_ft8_cq_has_a_blank_speed_field_and_keeps_type_and_time_columns() {
+        let spot = relay(
+            "W1ABC",
+            "K2DEF",
+            14_075_520.0,
+            RelayMode::Ft8,
+            -12,
+            SpotType::Cq,
+            12 * 3600 + 34 * 60,
+        );
+        let line = format_relay_line(&spot);
+        assert_eq!(
+            line,
+            "DX de W1ABC-#:  14075.52  K2DEF          FT8   -12 dB         CQ      1234Z"
+        );
+        assert_eq!(col_of(&line, "CQ"), 63);
+        assert_eq!(col_of(&line, "1234Z"), 71);
+    }
+
+    #[test]
+    fn a_relayed_ft4_cq_renders_ft4() {
+        let spot = relay(
+            "W1ABC",
+            "JA1XYZ",
+            7_075_750.0,
+            RelayMode::Ft4,
+            3,
+            SpotType::Cq,
+            7 * 60,
+        );
+        assert_eq!(
+            format_relay_line(&spot),
+            "DX de W1ABC-#:   7075.75  JA1XYZ         FT4    3 dB          CQ      0007Z"
+        );
+    }
+
+    #[test]
+    fn a_relayed_beacon_on_the_ncdxf_roster_reads_ncdxf_b() {
+        let spot = relay(
+            "S53A",
+            "4U1UN",
+            14_100_000.0,
+            RelayMode::Cw { wpm: 25 },
+            21,
+            SpotType::Beacon,
+            2 * 3600 + 36 * 60,
+        );
+        assert_eq!(
+            format_relay_line(&spot),
+            "DX de S53A-#:   14100.00  4U1UN          CW    21 dB  25 WPM  NCDXF B 0236Z"
+        );
+    }
+
+    #[test]
+    fn a_relayed_ssid_spotter_keeps_its_ssid() {
+        let spot = relay(
+            "W3XYZ-2",
+            "JA1ABC",
+            14_027_100.0,
+            RelayMode::Cw { wpm: 28 },
+            30,
+            SpotType::Cq,
+            3 * 3600 + 12 * 60,
+        );
+        assert_eq!(
+            format_relay_line(&spot),
+            "DX de W3XYZ-2-#: 14027.10 JA1ABC         CW    30 dB  28 WPM  CQ      0312Z"
+        );
+    }
 }

@@ -1228,4 +1228,53 @@ mod tests {
         bus.publish(sample_spot(u64::MAX));
         assert_eq!(bus.recent(1).len(), 1);
     }
+
+    fn sample_relay() -> crate::relay::RelaySpot {
+        crate::relay::RelaySpot {
+            spotter: Arc::from("W3XYZ-2"),
+            callsign: "K5ARH".to_string(),
+            freq_hz: 14_027_100.0,
+            mode: crate::relay::RelayMode::Cw { wpm: 28 },
+            snr_db: 30,
+            spot_type: manta_spot::SpotType::Cq,
+            unix_ts: 1_700_000_000,
+        }
+    }
+
+    /// MAN-320 D4: a relayed spot reaches only `subscribe_relay()`.
+    #[tokio::test]
+    async fn a_relayed_spot_reaches_relay_subscribers_only() {
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
+        let mut own = bus.subscribe();
+        let mut json = bus.subscribe_json();
+        let mut live = bus.subscribe_live();
+        let mut relay = bus.subscribe_relay();
+        assert!(bus.publish_relay(sample_relay()));
+        assert_eq!(relay.try_recv().unwrap(), sample_relay());
+        assert!(own.try_recv().is_err());
+        assert!(json.try_recv().is_err());
+        assert!(live.try_recv().is_err());
+    }
+
+    #[test]
+    fn publish_relay_without_subscribers_is_not_an_error() {
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
+        assert!(!bus.publish_relay(sample_relay()));
+    }
+
+    /// A relayed spot leaves `recent()` and the occurrence counts alone: the
+    /// next own spot of the same call still counts as its first.
+    #[tokio::test]
+    async fn a_relayed_spot_does_not_touch_occurrence_counts_or_history() {
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
+        let _relay = bus.subscribe_relay();
+        let mut own = bus.subscribe();
+        bus.publish_relay(sample_relay());
+        bus.publish_relay(sample_relay());
+        assert!(bus.recent(10).is_empty());
+        let mut spot = sample_spot(0);
+        spot.callsign = "K5ARH".to_string();
+        bus.publish(spot);
+        assert_eq!(own.recv().await.unwrap().occurrence_count, 1);
+    }
 }

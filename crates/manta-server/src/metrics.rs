@@ -4732,4 +4732,57 @@ mod tests {
             .render_prometheus_text()
             .contains(r#"manta_list_last_success_timestamp_seconds{list="cty"} 1791795600"#));
     }
+
+    /// MAN-320: every relay renders all three families from the moment it
+    /// registers, with only the reasons that apply to its kind.
+    #[test]
+    fn relay_families_render_eagerly_per_kind() {
+        let m = Metrics::new();
+        m.register_relay("192.168.1.20:7300".to_string(), RelayKind::Skimmer);
+        m.register_relay("127.0.0.1:2237".to_string(), RelayKind::Wsjtx);
+        let text = m.render_prometheus_text();
+        let count = |needle: &str| text.lines().filter(|l| l.starts_with(needle)).count();
+        assert_eq!(
+            count("manta_relay_up{relay=\"192.168.1.20:7300\",kind=\"skimmer\"} 0"),
+            1
+        );
+        assert_eq!(count("manta_relay_spots_total{relay=\"127.0.0.1:2237\""), 1);
+        assert_eq!(
+            count("manta_relay_dropped_total{relay=\"192.168.1.20:7300\",kind=\"skimmer\""),
+            3
+        );
+        assert_eq!(
+            count("manta_relay_dropped_total{relay=\"127.0.0.1:2237\",kind=\"wsjtx\""),
+            9
+        );
+    }
+
+    #[test]
+    fn relay_labels_are_escaped() {
+        let m = Metrics::new();
+        m.register_relay("a\"b\\c".to_string(), RelayKind::Skimmer);
+        let text = m.render_prometheus_text();
+        assert!(
+            text.contains("manta_relay_up{relay=\"a\\\"b\\\\c\",kind=\"skimmer\"} 0"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn relay_counters_never_go_backwards() {
+        let m = Metrics::new();
+        let r = m.register_relay("h:1".to_string(), RelayKind::Skimmer);
+        let mut last = (0, 0);
+        for i in 0..5 {
+            r.record_spot();
+            if i % 2 == 0 {
+                r.record_dropped(DropReason::OtherSpotter);
+            }
+            r.set_up(i % 2 == 0);
+            let now = (r.spots_total(), r.dropped_total(DropReason::OtherSpotter));
+            assert!(now.0 >= last.0 && now.1 >= last.1, "{now:?} < {last:?}");
+            last = now;
+        }
+        assert_eq!(last, (5, 3));
+    }
 }
