@@ -190,6 +190,17 @@ pub struct InputHealth {
     pub malformed_packets: u64,
 }
 
+/// MAN-308: one input's automatic attenuation, translated by `manta-cli`
+/// (no `manta-input` dependency here, ARCHITECTURE §3/§8). Absolute values;
+/// `set_input_attenuation` overwrites.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InputAttenuation {
+    /// The step attenuation manta last set on the radio's ADC0, dB.
+    pub db: u8,
+    /// Changes automatic attenuation has made since the daemon started.
+    pub changes: u64,
+}
+
 /// Escapes a Prometheus label VALUE (not a label name, which is always one
 /// of this codebase's own `&'static str`s). MAN-128: the uplink target
 /// label is the first one in this codebase derived from operator-supplied
@@ -703,6 +714,10 @@ pub struct Metrics {
     /// with silence (NaN, infinite, or beyond `MAX_SAMPLE_MAGNITUDE`).
     /// Unlike `input_health`, every source publishes it, at 0 from startup.
     input_bad_samples: RwLock<BTreeMap<String, u64>>,
+    /// MAN-308: automatic attenuation per source, fed by `manta-cli`'s
+    /// 1 Hz poller. Only an hpsdr input with `auto_attenuation` that opened
+    /// as protocol 2 publishes, so every other source has no series.
+    input_attenuation: RwLock<BTreeMap<String, InputAttenuation>>,
     /// MAN-14: each input's hearing -- spots, distinct calls, cross-input
     /// dedupe withholds, silence -- in registration (config) order. Only
     /// the multi-input daemon registers rows, so a one-input `/metrics`,
@@ -1467,6 +1482,15 @@ impl Metrics {
             .insert(source.to_string(), health);
     }
 
+    /// MAN-308: `source`'s automatic attenuation level and change count.
+    /// Overwrites: the values are absolute.
+    pub fn set_input_attenuation(&self, source: &str, attenuation: InputAttenuation) {
+        self.input_attenuation
+            .write()
+            .expect("input_attenuation lock poisoned")
+            .insert(source.to_string(), attenuation);
+    }
+
     /// MAN-234: the engine's running count of replaced input samples for
     /// `source`. Keeps the maximum, so a stale or out-of-order injection
     /// can never make the counter go backwards.
@@ -2145,6 +2169,35 @@ impl Metrics {
                 "manta_input_bad_samples_total{{source=\"{source}\"}} {n}\n"
             ));
         }
+
+        // MAN-308: automatic attenuation, only for inputs that run it.
+        let attenuation = self
+            .input_attenuation
+            .read()
+            .expect("input_attenuation lock poisoned");
+        out.push_str(
+            "# HELP manta_input_attenuation_db Step attenuation automatic attenuation has set on the radio's ADC0, in dB, per source.\n",
+        );
+        out.push_str("# TYPE manta_input_attenuation_db gauge\n");
+        for (source, a) in attenuation.iter() {
+            out.push_str(&format!(
+                "manta_input_attenuation_db{{source=\"{}\"}} {}\n",
+                escape_label_value(source),
+                a.db
+            ));
+        }
+        out.push_str(
+            "# HELP manta_input_attenuation_changes_total Step attenuator changes automatic attenuation has made, per source.\n",
+        );
+        out.push_str("# TYPE manta_input_attenuation_changes_total counter\n");
+        for (source, a) in attenuation.iter() {
+            out.push_str(&format!(
+                "manta_input_attenuation_changes_total{{source=\"{}\"}} {}\n",
+                escape_label_value(source),
+                a.changes
+            ));
+        }
+        drop(attenuation);
 
         // MAN-14: each input's hearing, multi-input only, 0 from startup.
         // One read for all four families. `[[input]]` names are
@@ -3071,6 +3124,45 @@ mod tests {
     }
 
     // MAN-56: input-layer packet loss/malformed counters.
+
+    #[test]
+    fn input_attenuation_has_no_samples_until_set() {
+        let text = Metrics::new().render_prometheus_text();
+        assert!(text.contains("# TYPE manta_input_attenuation_db gauge\n"));
+        assert!(text.contains("# TYPE manta_input_attenuation_changes_total counter\n"));
+        assert!(!text.contains("manta_input_attenuation_db{"), "{text}");
+        assert!(!text.contains("manta_input_attenuation_changes_total{"), "{text}");
+    }
+
+    #[test]
+    fn input_attenuation_renders_gauge_and_counter_per_source() {
+        let m = Metrics::new();
+        m.set_input_attenuation(
+            "hpsdr",
+            InputAttenuation {
+                db: 12,
+                changes: 2,
+            },
+        );
+        m.set_input_attenuation("40m", InputAttenuation { db: 0, changes: 0 });
+        let text = m.render_prometheus_text();
+        assert!(text.contains("\nmanta_input_attenuation_db{source=\"hpsdr\"} 12\n"));
+        assert!(text.contains("\nmanta_input_attenuation_changes_total{source=\"hpsdr\"} 2\n"));
+        assert!(text.contains("\nmanta_input_attenuation_db{source=\"40m\"} 0\n"));
+        assert!(text.contains("\nmanta_input_attenuation_changes_total{source=\"40m\"} 0\n"));
+        // A second set overwrites rather than adds.
+        m.set_input_attenuation(
+            "hpsdr",
+            InputAttenuation {
+                db: 6,
+                changes: 3,
+            },
+        );
+        let text = m.render_prometheus_text();
+        assert!(text.contains("\nmanta_input_attenuation_db{source=\"hpsdr\"} 6\n"));
+        assert!(text.contains("\nmanta_input_attenuation_changes_total{source=\"hpsdr\"} 3\n"));
+        assert!(!text.contains("manta_input_attenuation_db{source=\"hpsdr\"} 12"));
+    }
 
     #[test]
     fn renders_per_source_input_health_as_labeled_counters() {

@@ -1435,6 +1435,9 @@ struct HpsdrOpts {
     protocol: manta_input::hpsdr::HpsdrProtocol,
     freq: Option<f64>,
     rate: Option<f64>,
+    /// MAN-308: `input.auto_attenuation`; one handle shared by every
+    /// reopen of this input.
+    auto_attenuation: Option<std::sync::Arc<manta_input::hpsdr::AutoAttenuation>>,
 }
 
 impl HpsdrOpts {
@@ -1580,6 +1583,15 @@ impl LiveSourceSpec {
         }
     }
 
+    /// MAN-308: the input's automatic attenuation handle, `Some` only for an
+    /// hpsdr input with `input.auto_attenuation`.
+    fn auto_attenuation(&self) -> Option<std::sync::Arc<manta_input::hpsdr::AutoAttenuation>> {
+        match self {
+            LiveSourceSpec::Hpsdr(hpsdr) => hpsdr.auto_attenuation.clone(),
+            _ => None,
+        }
+    }
+
     /// MAN-234: how the bad-sample warnings name this input -- the file's
     /// path, or `the <kind> input` for a live source.
     fn input_label(&self) -> String {
@@ -1688,6 +1700,7 @@ impl LiveSourceSpec {
                 // MAN-305 D2/D17: run, listen, soak, calibrate, check and
                 // doctor all open here, so each prints the same §4 line.
                 log_hpsdr_open_line(&cfg.host, cfg.port, &opened);
+                warn_if_attenuation_needs_protocol_2(&cfg, &opened);
                 opened.source
             }
             LiveSourceSpec::Ka9q(ka9q) => {
@@ -2028,6 +2041,51 @@ fn soapy_overflow_warning(driver: &str) -> String {
          manta_input_gaps_detected_total{{source=\"soapy\"}} (this warning is \
          rate-limited to once per 60 s)"
     )
+}
+
+/// MAN-308 D8: the `note:` line for one automatic attenuation change.
+fn attenuation_line(c: &manta_input::hpsdr::AttenuationChange) -> String {
+    use manta_input::hpsdr::proto2::attenuator::{MAX_DB, RELEASE_AFTER, TRIP_AFTER};
+    use manta_input::hpsdr::AttenuationCause;
+    let (why, verb) = match c.cause {
+        AttenuationCause::Overload => {
+            (format!("ADC overload for {} s", TRIP_AFTER.as_secs()), "raised")
+        }
+        AttenuationCause::Quiet => (
+            format!("no ADC overload for {} min", RELEASE_AFTER.as_secs() / 60),
+            "lowered",
+        ),
+    };
+    let tail = if c.to_db == MAX_DB { ", its maximum" } else { "" };
+    format!(
+        "note: HPSDR radio {}: {why}; automatic attenuation {verb} the step attenuator from {} dB \
+         to {} dB{tail}",
+        c.radio, c.from_db, c.to_db
+    )
+}
+
+/// MAN-308 D1: `input.auto_attenuation` on a radio `"auto"` found speaking
+/// protocol 1.
+fn protocol_1_attenuation_warning(host: &str, port: u16) -> String {
+    format!(
+        "warning: HPSDR radio {host}:{port} speaks openHPSDR protocol 1; input.auto_attenuation \
+         needs protocol 2, so manta leaves this radio's attenuator alone"
+    )
+}
+
+/// MAN-308 D1: once per open, warn when automatic attenuation is on but the
+/// radio opened as protocol 1, and zero the published level (manta sets
+/// nothing on that radio).
+pub(crate) fn warn_if_attenuation_needs_protocol_2(
+    cfg: &manta_input::hpsdr::HpsdrConfig,
+    opened: &manta_input::hpsdr::OpenedHpsdr,
+) {
+    if let Some(handle) = &cfg.auto_attenuation {
+        if opened.protocol == manta_input::hpsdr::HpsdrProtocol::One {
+            handle.clear();
+            logging::warning(&protocol_1_attenuation_warning(&cfg.host, cfg.port));
+        }
+    }
 }
 
 /// MAN-140 D18: a radiod channel with AGC on rescales every signal in its
@@ -3711,6 +3769,46 @@ fn input_health_of(
     }
 }
 
+/// MAN-308: `manta-input`'s attenuation snapshot as `manta-server`'s type,
+/// the one place the two meet (as `input_health_of`).
+fn input_attenuation_of(
+    s: manta_input::hpsdr::AttenuationSnapshot,
+) -> manta_server::metrics::InputAttenuation {
+    manta_server::metrics::InputAttenuation {
+        db: s.db,
+        changes: s.changes,
+    }
+}
+
+/// MAN-308: publish `a` under `source` once a protocol-2 open has engaged
+/// it; before that (or on a protocol-1 radio) the input has no series.
+fn publish_attenuation(
+    metrics: &manta_server::metrics::Metrics,
+    source: &str,
+    a: &manta_input::hpsdr::AutoAttenuation,
+) {
+    if let Some(s) = a.snapshot() {
+        metrics.set_input_attenuation(source, input_attenuation_of(s));
+    }
+}
+
+/// MAN-308: sample `a` into `/metrics` now and then every
+/// `INPUT_HEALTH_POLL_INTERVAL`, the MAN-56 poller shape.
+fn spawn_attenuation_poller(
+    rt: &tokio::runtime::Runtime,
+    metrics: std::sync::Arc<manta_server::metrics::Metrics>,
+    source: String,
+    a: std::sync::Arc<manta_input::hpsdr::AutoAttenuation>,
+) {
+    publish_attenuation(&metrics, &source, &a);
+    rt.spawn(async move {
+        loop {
+            tokio::time::sleep(INPUT_HEALTH_POLL_INTERVAL).await;
+            publish_attenuation(&metrics, &source, &a);
+        }
+    });
+}
+
 /// MAN-128: feeds `manta_build_info`. `git_sha` comes from `build.rs`
 /// (`MANTA_GIT_SHA`, "unknown" with no `.git` -- e.g. a Docker build
 /// context, which `.dockerignore` excludes it from). MAN-83: the values are
@@ -4416,6 +4514,7 @@ impl CliOverrides {
                 protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
                 freq: None,
                 rate: None,
+                auto_attenuation: None,
             },
             ka9q: Ka9qOpts::unset(),
             freq_correction_ppm: None,
@@ -4913,6 +5012,7 @@ fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Resul
             protocol,
             freq_hz,
             rate_hz,
+            auto_attenuation,
             ..
         } => LiveSourceSpec::Hpsdr(HpsdrOpts {
             host: host.clone(),
@@ -4925,6 +5025,13 @@ fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Resul
             protocol: *protocol,
             freq: Some(*freq_hz),
             rate: Some(*rate_hz),
+            // MAN-308: built once here; every reopen clones the spec and so
+            // shares it.
+            auto_attenuation: auto_attenuation.then(|| {
+                std::sync::Arc::new(manta_input::hpsdr::AutoAttenuation::new(Box::new(|c| {
+                    logging::note(&attenuation_line(c))
+                })))
+            }),
         }),
         config::SourceFromFile::Ka9q {
             group,
@@ -6156,6 +6263,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     protocol: hpsdr_protocol.into(),
                     freq: hpsdr_freq_hz,
                     rate: hpsdr_rate_hz,
+                    auto_attenuation: None,
                 },
                 ka9q: Ka9qOpts {
                     group: ka9q_group,
@@ -6695,6 +6803,18 @@ fn run_command() -> Result<std::process::ExitCode> {
                     }
                 });
             }
+            // MAN-308: automatic attenuation's level and change count, from
+            // the handle every reopen shares.
+            if let (Some(rt), Some(server), Some(attenuation)) =
+                (&server_runtime, &spot_server, spec.auto_attenuation())
+            {
+                spawn_attenuation_poller(
+                    rt,
+                    server.metrics.clone(),
+                    source_name.to_string(),
+                    attenuation,
+                );
+            }
 
             // A plain stderr line in text mode rather than `tracing::info!`,
             // so `-q`/`RUST_LOG` never hide it there; under `--log-format
@@ -7146,6 +7266,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                         protocol: hpsdr_protocol.into(),
                         freq: hpsdr_freq_hz,
                         rate: hpsdr_rate_hz,
+                        auto_attenuation: None,
                     },
                     ka9q: Ka9qOpts {
                         group: ka9q_group,
@@ -7347,6 +7468,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                         protocol: hpsdr_protocol.into(),
                         freq: hpsdr_freq_hz,
                         rate: hpsdr_rate_hz,
+                        auto_attenuation: None,
                     },
                     ka9q: Ka9qOpts {
                         group: ka9q_group,
@@ -7555,6 +7677,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     protocol: hpsdr_protocol.into(),
                     freq: hpsdr_freq_hz,
                     rate: hpsdr_rate_hz,
+                    auto_attenuation: None,
                 },
                 ka9q: Ka9qOpts {
                     group: ka9q_group,
@@ -10245,6 +10368,7 @@ mod tests {
                 protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
                 freq,
                 rate,
+                auto_attenuation: None,
             })
         };
         assert_eq!(
@@ -10309,6 +10433,7 @@ mod tests {
                 protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
                 freq,
                 rate,
+                auto_attenuation: None,
             })
         };
         assert_eq!(
@@ -10350,6 +10475,7 @@ mod tests {
             protocol: manta_input::hpsdr::HpsdrProtocol::Two,
             freq: Some(100_000_000.0),
             rate: Some(48_000.0),
+            auto_attenuation: None,
         });
         assert_eq!(protocol2.configured_center_and_passband(None, None), None);
         let protocol2 = LiveSourceSpec::Hpsdr(HpsdrOpts {
@@ -10359,6 +10485,7 @@ mod tests {
             protocol: manta_input::hpsdr::HpsdrProtocol::Two,
             freq: Some(7_030_000.0),
             rate: Some(48_000.0),
+            auto_attenuation: None,
         });
         assert_eq!(
             protocol2.configured_center_and_passband(None, None),
@@ -10844,6 +10971,25 @@ mod tests {
             &wrapped.confirmed_live_handle().unwrap(),
             &live
         ));
+    }
+
+    #[test]
+    fn input_attenuation_of_translates_a_snapshot() {
+        assert_eq!(
+            input_attenuation_of(manta_input::hpsdr::AttenuationSnapshot { db: 12, changes: 2 }),
+            manta_server::metrics::InputAttenuation { db: 12, changes: 2 }
+        );
+    }
+
+    #[test]
+    fn publish_attenuation_skips_a_handle_no_protocol_2_open_engaged() {
+        let metrics = manta_server::metrics::Metrics::new();
+        let handle = manta_input::hpsdr::AutoAttenuation::new(Box::new(|_| {}));
+        assert_eq!(handle.snapshot(), None);
+        publish_attenuation(&metrics, "hpsdr", &handle);
+        let text = metrics.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_input_attenuation_db gauge\n"));
+        assert!(!text.contains("manta_input_attenuation_db{"), "{text}");
     }
 
     #[test]
@@ -11662,7 +11808,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 port: Some(1024),
                 protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
                 freq: Some(7e6),
-                rate: Some(48e3)
+                rate: Some(48e3),
+                auto_attenuation: None,
             })
             .name(),
             "hpsdr"
@@ -11696,6 +11843,63 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert_eq!(h.freq, Some(7_030_000.0));
         assert_eq!(h.rate, Some(48_000.0));
         assert_eq!(r.replaced_file_source, None);
+    }
+
+    #[test]
+    fn spec_from_file_carries_an_attenuation_handle_only_when_asked() {
+        let body = "[input]\ntype = \"hpsdr\"\nhost = \"receiver.invalid\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n";
+        let loaded = loaded_from(&format!("{body}auto_attenuation = true\n"));
+        let r = resolve(cli_overrides(), &loaded).unwrap();
+        let handle = r.spec.auto_attenuation().expect("a handle with the key");
+        let reopened = r.spec.clone();
+        assert!(std::sync::Arc::ptr_eq(
+            &handle,
+            &reopened.auto_attenuation().expect("the clone shares it")
+        ));
+        let r = resolve(cli_overrides(), &loaded_from(body)).unwrap();
+        assert!(r.spec.auto_attenuation().is_none());
+        // A `--hpsdr-host` spec replaces [input] whole, key included.
+        let mut cli = cli_overrides();
+        cli.hpsdr.host = Some("192.0.2.10".into());
+        cli.hpsdr.freq = Some(7_030_000.0);
+        cli.hpsdr.rate = Some(192_000.0);
+        assert!(cli.into_spec().auto_attenuation().is_none());
+    }
+
+    #[test]
+    fn attenuation_line_names_the_radio_cause_and_levels() {
+        use manta_input::hpsdr::{AttenuationCause, AttenuationChange};
+        let change = |from_db, to_db, cause| AttenuationChange {
+            radio: "192.0.2.10:1024".into(),
+            from_db,
+            to_db,
+            cause,
+        };
+        assert_eq!(
+            attenuation_line(&change(0, 6, AttenuationCause::Overload)),
+            "note: HPSDR radio 192.0.2.10:1024: ADC overload for 2 s; automatic attenuation \
+             raised the step attenuator from 0 dB to 6 dB"
+        );
+        assert_eq!(
+            attenuation_line(&change(24, 30, AttenuationCause::Overload)),
+            "note: HPSDR radio 192.0.2.10:1024: ADC overload for 2 s; automatic attenuation \
+             raised the step attenuator from 24 dB to 30 dB, its maximum"
+        );
+        assert_eq!(
+            attenuation_line(&change(12, 6, AttenuationCause::Quiet)),
+            "note: HPSDR radio 192.0.2.10:1024: no ADC overload for 10 min; automatic \
+             attenuation lowered the step attenuator from 12 dB to 6 dB"
+        );
+    }
+
+    #[test]
+    fn protocol_1_attenuation_warning_names_the_key() {
+        assert_eq!(
+            protocol_1_attenuation_warning("192.0.2.10", 1024),
+            "warning: HPSDR radio 192.0.2.10:1024 speaks openHPSDR protocol 1; \
+             input.auto_attenuation needs protocol 2, so manta leaves this radio's attenuator \
+             alone"
+        );
     }
 
     #[test]

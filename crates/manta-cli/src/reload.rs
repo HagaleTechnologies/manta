@@ -814,6 +814,17 @@ blocklist_path = \"bl.txt\"
     }
 
     #[test]
+    fn changing_input_auto_attenuation_needs_a_restart() {
+        let body = "[input]\ntype = 'hpsdr'\nhost = 'h'\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n";
+        let old = table(body);
+        let new = table(&format!("{body}auto_attenuation = true\n"));
+        assert_eq!(
+            restart_only_changes(&old, &new),
+            vec!["input.auto_attenuation"]
+        );
+    }
+
+    #[test]
     fn digital_window_changes_need_a_restart() {
         let old = table("[detector]\ndigital_window_filter = true\n");
         let new = table("[detector]\ndigital_window_filter = false\n");

@@ -648,6 +648,17 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                     }
                 });
             }
+            // MAN-308: each input's automatic attenuation, keyed by its name.
+            for (name, input) in names.iter().zip(m.inputs) {
+                if let Some(attenuation) = input.spec.auto_attenuation() {
+                    crate::spawn_attenuation_poller(
+                        &rt,
+                        server.metrics.clone(),
+                        name.clone(),
+                        attenuation,
+                    );
+                }
+            }
             // MAN-128: the decode watchdog progresses while any input's
             // front end processes chunks (D9); the poller copies the shared
             // observers into `Metrics`, as the one-input path does.

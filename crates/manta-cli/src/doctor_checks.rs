@@ -1647,6 +1647,7 @@ mod tests {
                 protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
                 freq: Some(7e6),
                 rate: Some(48_000.0),
+                auto_attenuation: None,
             }),
             "could not open HPSDR radio 10.0.0.5:1024: outer: inner",
             &["--hpsdr-host", "powered on"],

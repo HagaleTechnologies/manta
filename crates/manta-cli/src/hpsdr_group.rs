@@ -654,6 +654,9 @@ pub(crate) fn prepare(
             .map(|&i| (inputs[i].capture_rate_hz, inputs[i].dial_freq_hz))
             .collect();
         let first_name = inputs[indices[0]].name.clone();
+        // MAN-308: a lone protocol-2 receiver's automatic attenuation; the
+        // config loader refuses the key on a shared radio.
+        let attenuation = inputs[indices[0]].spec.auto_attenuation();
         let endpoints = endpoints.clone();
         let worker_stop = stop.clone();
         let mut accepted = None;
@@ -711,18 +714,17 @@ pub(crate) fn prepare(
                 && allocation.protocol != manta_input::hpsdr::HpsdrProtocol::One
             {
                 let entered = Instant::now();
-                let opened = manta_input::hpsdr::open_receiver(
-                    &manta_input::HpsdrConfig {
-                        host: host.clone(),
-                        port,
-                        ddc_count: 1,
-                        sample_rate_hz: allocation.rate,
-                        center_freq_hz: allocation.frequencies.clone(),
-                        auto_attenuation: None,
-                    },
-                    allocation.protocol,
-                )?;
+                let cfg = manta_input::HpsdrConfig {
+                    host: host.clone(),
+                    port,
+                    ddc_count: 1,
+                    sample_rate_hz: allocation.rate,
+                    center_freq_hz: allocation.frequencies.clone(),
+                    auto_attenuation: attenuation.clone(),
+                };
+                let opened = manta_input::hpsdr::open_receiver(&cfg, allocation.protocol)?;
                 crate::log_hpsdr_open_line(&host, port, &opened);
+                crate::warn_if_attenuation_needs_protocol_2(&cfg, &opened);
                 // MAN-259: the open call's runtime before the radio started
                 // streaming is outage, not samples.
                 let started_at = entered + opened.source.acquisition_start_offset();
