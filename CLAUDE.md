@@ -101,7 +101,8 @@ docs/DECISIONS/2026-10-19-man14-per-receiver-hearing-visibility.md.
 - SNR is 2500 Hz-referenced in the pipeline and testkit (whose own AWGN
   stands in until coppa's `awgn_ref_bw()` reconciles it with the benchmark's
   3 kHz); telnet and RBN uplink quote 500 Hz; JSON keeps 2500 Hz plus
-  `snrRefHz` (broad-review D3).
+  `snrRefHz` (broad-review D3); a relayed WSJT-X spot keeps WSJT-X's own
+  2500 Hz figure (MAN-320 D8).
 - `AudioIqSource` needs exactly 48000 Hz input (M1 pins record, pin 3).
 - JSON spot schema: `dispensa` ADR-0011 `spots.v1` (`docs/SPOT-SCHEMA.md`
   in-repo). No GUI; telnet :7300, JSON Lines/WebSocket :7301.
