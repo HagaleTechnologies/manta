@@ -3,9 +3,10 @@
 //! loader and atomically replaces the file. MAN-13: with `[[input]]`
 //! entries, the value goes into the entry `calibrate --input NAME` names.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::hash::{BuildHasher, Hasher, RandomState};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -148,6 +149,46 @@ impl Drop for TempGuard {
     }
 }
 
+/// Temp names a save tries before it gives up.
+const TEMP_ATTEMPTS: usize = 16;
+
+/// Common filesystems cap a file name at 255 bytes (`NAME_MAX`); a longer
+/// temp basename would fail the open with an error the retry cannot mend.
+const TEMP_NAME_MAX: usize = 255;
+
+/// `.{name}.calibrate-{pid}-{suffix}.tmp`, beside the config. A `name` that
+/// would push the basename past `TEMP_NAME_MAX` is truncated (on a char
+/// boundary): a valid long config name must not cost the save, and the
+/// random suffix keeps even truncated names from colliding.
+fn temp_path(dir: &Path, name: &OsStr, suffix: u64) -> PathBuf {
+    let name = name.to_string_lossy();
+    let temp = format!(
+        ".{}.calibrate-{}-{suffix:016x}.tmp",
+        name,
+        std::process::id()
+    );
+    let temp = if temp.len() <= TEMP_NAME_MAX {
+        temp
+    } else {
+        let mut end = name.len() - (temp.len() - TEMP_NAME_MAX);
+        while end > 0 && !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!(
+            ".{}.calibrate-{}-{suffix:016x}.tmp",
+            &name[..end],
+            std::process::id()
+        )
+    };
+    dir.join(temp)
+}
+
+/// A random temp-name suffix, from std's randomly keyed SipHash: a run that
+/// gets an earlier run's PID (PID 1 in a container) still picks new names.
+fn random_suffix() -> u64 {
+    RandomState::new().build_hasher().finish()
+}
+
 /// A config file as calibrate read it before measuring.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ReadBefore {
@@ -181,7 +222,7 @@ pub(crate) fn save_freq_correction_ppm(
     input: Option<&str>,
 ) -> Result<Option<f64>> {
     let vars: Vec<(OsString, OsString)> = std::env::vars_os().collect();
-    save_with_env(path, ppm, expected, input, &vars)
+    save_with_env(path, ppm, expected, input, &vars, &mut random_suffix)
 }
 
 const PPM_ENV_VAR: &str = "MANTA_INPUT_FREQ_CORRECTION_PPM";
@@ -192,6 +233,7 @@ fn save_with_env(
     expected: Option<&ReadBefore>,
     input: Option<&str>,
     vars: &[(OsString, OsString)],
+    suffix: &mut dyn FnMut() -> u64,
 ) -> Result<Option<f64>> {
     let target = fs::canonicalize(path)
         .with_context(|| format!("cannot resolve config file {}", path.display()))?;
@@ -227,11 +269,6 @@ fn save_with_env(
     let name = target
         .file_name()
         .ok_or_else(|| anyhow!("config file {} has no file name", target.display()))?;
-    let temp = dir.join(format!(
-        ".{}.calibrate-{}.tmp",
-        name.to_string_lossy(),
-        std::process::id()
-    ));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     // Owner-only until the original's owner and mode are copied over: the
@@ -247,9 +284,21 @@ fn save_with_env(
         use windows_sys::Win32::{Foundation::GENERIC_WRITE, Storage::FileSystem::WRITE_DAC};
         options.access_mode(GENERIC_WRITE | WRITE_DAC).share_mode(0);
     }
-    let mut file = options
-        .open(&temp)
-        .with_context(|| format!("creating temp file {}", temp.display()))?;
+    // A name already taken is left alone and another tried: it may be a
+    // killed save's leftover, which nothing else removes, or another save's.
+    let mut attempts = 1;
+    let (temp, mut file) = loop {
+        let temp = temp_path(dir, name, suffix());
+        match options.open(&temp) {
+            Ok(file) => break (temp, file),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists && attempts < TEMP_ATTEMPTS => {
+                attempts += 1;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("creating temp file {}", temp.display()))
+            }
+        }
+    };
     let mut guard = TempGuard {
         path: temp.clone(),
         armed: true,
@@ -784,17 +833,90 @@ mod tests {
         // Valid only with the environment's station callsign.
         let p = write(dir.path(), "manta.toml", "[input]\n\n[server]\n");
         let var = |k: &str, v: &str| (OsString::from(k), OsString::from(v));
-        assert!(save_with_env(&p, -1.42, None, None, &[]).is_err());
+        assert!(save_with_env(&p, -1.42, None, None, &[], &mut random_suffix).is_err());
         let vars = [
             var("MANTA_SERVER_STATION_CALLSIGN", "W1AW"),
             // Ignored: it would mask the value just written.
             var(PPM_ENV_VAR, "3.0"),
         ];
-        assert_eq!(save_with_env(&p, -1.42, None, None, &vars).unwrap(), None);
+        assert_eq!(
+            save_with_env(&p, -1.42, None, None, &vars, &mut random_suffix).unwrap(),
+            None
+        );
         assert_eq!(
             fs::read_to_string(&p).unwrap(),
             "[input]\nfreq_correction_ppm = -1.42\n\n[server]\n"
         );
+    }
+
+    /// MAN-335: a killed save's leftover (same PID, as under PID 1 in a
+    /// container) holds the first name tried; the save takes the next one
+    /// and leaves the leftover byte-identical.
+    #[test]
+    fn save_skips_a_temp_name_already_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "manta.toml", "[input]\n");
+        let leftover = temp_path(dir.path(), OsStr::new("manta.toml"), 7);
+        fs::write(&leftover, "half-written").unwrap();
+        let mut suffixes = [7, 8].into_iter();
+        let mut suffix = || suffixes.next().unwrap();
+        assert_eq!(
+            save_with_env(&p, -1.42, None, None, &[], &mut suffix).unwrap(),
+            None
+        );
+        assert_eq!(
+            fs::read_to_string(&p).unwrap(),
+            "[input]\nfreq_correction_ppm = -1.42\n"
+        );
+        assert_eq!(fs::read_to_string(&leftover).unwrap(), "half-written");
+        let leftover_name = leftover.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(entries(dir.path()), [leftover_name.as_str(), "manta.toml"]);
+    }
+
+    #[test]
+    fn save_gives_up_when_every_temp_name_is_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "manta.toml", "[input]\n");
+        let leftover = temp_path(dir.path(), OsStr::new("manta.toml"), 7);
+        fs::write(&leftover, "half-written").unwrap();
+        let mut calls = 0;
+        let mut suffix = || {
+            calls += 1;
+            7
+        };
+        let err = save_with_env(&p, -1.42, None, None, &[], &mut suffix).unwrap_err();
+        assert!(format!("{err:#}").contains("creating temp file"), "{err:#}");
+        assert_eq!(calls, TEMP_ATTEMPTS);
+        assert_eq!(fs::read_to_string(&p).unwrap(), "[input]\n");
+        assert_eq!(fs::read_to_string(&leftover).unwrap(), "half-written");
+    }
+
+    /// MAN-335: a config name long enough that the old PID-only temp name
+    /// fit but the 16-hex-digit suffix does not still saves: the embedded
+    /// name is truncated within the filesystem's `NAME_MAX`, not abandoned.
+    #[test]
+    fn save_truncates_a_temp_name_past_name_max() {
+        let dir = tempfile::tempdir().unwrap();
+        // 234 bytes: `.{name}.calibrate-{pid}.tmp` fit, the suffixed form
+        // overflows a 255-byte file name for every PID length.
+        let long = format!("{}.toml", "a".repeat(229));
+        let p = write(dir.path(), &long, "[input]\n");
+        let mut suffixes = [7].into_iter();
+        let mut suffix = || suffixes.next().unwrap();
+        assert_eq!(
+            save_with_env(&p, -1.42, None, None, &[], &mut suffix).unwrap(),
+            None
+        );
+        assert_eq!(
+            fs::read_to_string(&p).unwrap(),
+            "[input]\nfreq_correction_ppm = -1.42\n"
+        );
+        assert_eq!(entries(dir.path()), [long.as_str()]);
+    }
+
+    #[test]
+    fn temp_suffixes_are_random() {
+        assert_ne!(random_suffix(), random_suffix());
     }
 
     #[test]

@@ -797,8 +797,8 @@ impl ReceiverKind {
                  radio; install its SoapySDR module if it does not"
             }
             ReceiverKind::Hpsdr => {
-                "check --hpsdr-host/input.host, and that the radio is powered on and on this \
-                 network"
+                "let manta discover the radio, pin it with --hpsdr-mac/input.mac, or check \
+                 --hpsdr-host/input.host; the radio must be powered on and on this network"
             }
             ReceiverKind::Ka9q => {
                 "check --ka9q-group/input.group and --ka9q-ssrc/input.ssrc against the radiod \
@@ -846,6 +846,7 @@ pub(crate) fn signal_check(e: &anyhow::Error) -> Check {
 mod tests {
     use super::*;
     use crate::config::{self, Env};
+    use crate::test_ports::free_port;
     use std::net::TcpListener;
 
     fn loaded(body: &str) -> (tempfile::TempDir, std::path::PathBuf, Loaded) {
@@ -860,14 +861,6 @@ mod tests {
     fn server(lines: &str) -> ServerConfig {
         let (_dir, _path, l) = loaded(&format!("[server]\nstation_callsign = \"W1AW\"\n{lines}"));
         l.server.unwrap()
-    }
-
-    fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
     }
 
     fn uplinks(body: &str) -> Vec<RbnUplinkConfig> {
@@ -1651,7 +1644,8 @@ mod tests {
         cases.push((
             crate::LiveSourceSpec::Hpsdr(crate::HpsdrOpts {
                 host: Some("10.0.0.5".into()),
-                port: 1024,
+                mac: None,
+                port: Some(1024),
                 protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
                 freq: Some(7e6),
                 rate: Some(48_000.0),

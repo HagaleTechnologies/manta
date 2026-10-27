@@ -49,25 +49,48 @@ use std::path::{Path, PathBuf};
 /// discard whole packets on the wire (MAN-56, following MAN-22's
 /// malformed-packet counting).
 ///
-/// Shared by packet-based sources, including HPSDR and KiwiSDR, through
+/// Transport atomics can be shared across receivers while each receiver
+/// retains its own bounded-queue loss counter. Shared by packet-based
+/// sources, including HPSDR and KiwiSDR, through
 /// `IqSource::health_counters`.
 ///
 /// Atomic rather than mutex-guarded for the same reason
 /// `HpsdrIqSource::confirmed_live` is (MAN-55): a metrics reader must
 /// never take the packet-pump's lock just to read counters. Reading all
-/// three is not one atomic snapshot -- these are independent monotonic
+/// four is not one atomic snapshot -- these are independent monotonic
 /// counters sampled on a timer, where a straddled read is
 /// indistinguishable from a sample taken a microsecond earlier.
 #[derive(Debug, Default)]
 pub struct InputHealthCounters {
-    dropped_packets: std::sync::atomic::AtomicU64,
-    gaps_detected: std::sync::atomic::AtomicU64,
-    malformed_packets: std::sync::atomic::AtomicU64,
+    queue_dropped_samples: std::sync::atomic::AtomicU64,
+    dropped_packets: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    gaps_detected: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    malformed_packets: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl InputHealthCounters {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Complex hardware-rate samples evicted from this receiver's queue.
+    pub fn queue_dropped_samples(&self) -> u64 {
+        self.queue_dropped_samples
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_queue_dropped(&self, n: u64) {
+        self.queue_dropped_samples
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn with_shared_transport(&self) -> Self {
+        Self {
+            dropped_packets: self.dropped_packets.clone(),
+            gaps_detected: self.gaps_detected.clone(),
+            malformed_packets: self.malformed_packets.clone(),
+            queue_dropped_samples: Default::default(),
+        }
     }
 
     /// `n` packets are estimated to have been lost in transit.

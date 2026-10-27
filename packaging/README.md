@@ -104,9 +104,11 @@ service, not while it runs. See
 
 **Uplinks.** Leave the `[[rbn_uplink]]` block commented out. If you enable
 an uplink later, `dry_run` defaults to `true`: it connects and logs in but
-sends no spots until you set `dry_run = false`. The uplink is experimental:
-its login and spot format are unverified against RBN's real ingest. To reach
-RBN, let an RBN Aggregator read the telnet server.
+sends no spots until you set `dry_run = false`. Going live also needs
+`[server].operator_grid` set to a 6-character Maidenhead locator (e.g.
+`"FN03ab"`); `config check` refuses the flip without one. The uplink is
+experimental: its login and spot format are unverified against RBN's real
+ingest. To reach RBN, let an RBN Aggregator read the telnet server.
 
 **If `N0CALL` is left in place**, manta refuses to start:
 

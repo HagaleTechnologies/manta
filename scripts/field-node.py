@@ -465,10 +465,24 @@ class Watchdog:
         return rec
 
 
+# --interval-s is how often `sample` samples and, for `report`, the interval the
+# ledger was sampled at, so both take the same bound. NaN compares false against
+# everything, so a plain `<= 0` passes it. NaN, inf and huge values then crash
+# `sample --loop` in sleep() (a restart loop under Restart=always: PR #219 review,
+# MAN-277) and overflow report's gap arithmetic, turning a failing ledger into a PASS.
+MAX_INTERVAL_S = 86400.0
+
+
+def validate_interval_s(v):
+    if not math.isfinite(v):
+        raise UsageError("--interval-s must be a finite number")
+    if not 0 < v <= MAX_INTERVAL_S:
+        raise UsageError("--interval-s must be > 0 and <= %s" % _fmt_num(MAX_INTERVAL_S))
+
+
 def cmd_sample(args, sleep=time.sleep, clock=time.time, max_iterations=None):
     base = validate_http_url(args.metrics_url)
-    if args.interval_s <= 0:
-        raise UsageError("--interval-s must be > 0")
+    validate_interval_s(args.interval_s)
     watchdog = None
     if args.recover_cmd:
         if not shlex.split(args.recover_cmd):
@@ -520,7 +534,8 @@ def parse_host_port(text):
 
 def validate_spot_line(line):
     """Return the spot dict if `line` (bytes, no newline) is a SpotMessage
-    with dxCall/frequency/timestamp; else raise ValueError."""
+    with dxCall/frequency/timestamp and a nonempty deCall; else raise
+    ValueError."""
     try:
         obj = json.loads(line.decode("utf-8"))
     except Exception as e:  # noqa: BLE001
@@ -537,6 +552,9 @@ def validate_spot_line(line):
         _utc_day(float(obj["timestamp"]))
     except (OverflowError, OSError, ValueError) as e:
         raise ValueError("bad timestamp: %s" % e)
+    de = obj.get("deCall")
+    if not isinstance(de, str) or not de.strip():
+        raise ValueError("missing deCall")
     return obj
 
 
@@ -866,7 +884,11 @@ def summarize(records, params=None):
     # From the note until the node is healthy again, capped. "Again": the
     # first up sample after the restart was observed (a not-up sample or a
     # start_time change), so a sample taken between writing the note and
-    # actually restarting does not close the window early.
+    # actually restarting does not close the window early. The window counts
+    # only if the process restarted: a sample up to its end (past the cap, up
+    # to the first up sample) carries a start_time other than the last one
+    # before the note, so a cancelled maintenance cannot hide an outage from
+    # D-A (MAN-279).
     planned = []
     for n in notes:
         if n.get("note") != "planned":
@@ -876,19 +898,24 @@ def summarize(records, params=None):
         before = [s.get("start_time") for s in samples if s["ts"] <= t and s.get("start_time") is not None]
         st_before = before[-1] if before else None
         w_end = cap
-        went_down = False
+        went_down = restarted = False
         for s in samples:
             if s["ts"] <= t:
                 continue
+            st = s.get("start_time")
+            if st_before is not None and st is not None and st != st_before:
+                restarted = True
             if s["ts"] >= cap:
-                break
+                if _is_up(s):
+                    break
+                continue
             if not _is_up(s):
                 went_down = True
-            elif went_down or (s.get("start_time") is not None and s.get("start_time") != st_before):
+            elif went_down or (st is not None and st != st_before):
                 w_end = s["ts"]
                 break
         lo, hi = max(t, start), min(w_end, end)
-        if hi > lo:
+        if restarted and hi > lo:
             planned.append((lo, hi))
     planned_merged = _merge(planned)
     planned_excluded = sum(b - a for a, b in planned_merged)
@@ -901,11 +928,13 @@ def summarize(records, params=None):
         a, b = max(a, start), min(b, end)
         if b <= a:
             return
-        length = (b - a) - _overlap(a, b, planned_merged)
+        overlap = _overlap(a, b, planned_merged)
+        length = (b - a) - overlap
         if length <= 0:
             return
         if state == "up":
-            moved = min(extra_down, length)
+            # Counters carry duration, not timestamps: credit planned overlap first.
+            moved = min(max(0.0, extra_down - overlap), length)
             up_s += length - moved
             down_s += moved
             counter_down_s += moved
@@ -915,9 +944,12 @@ def summarize(records, params=None):
             unobserved_s += length
 
     first, last = samples[0], samples[-1]
+    # No sample at or before the window start: nothing observed the node
+    # before the first one, however soon it came, so that prefix is
+    # unobserved (D-A). D-F's jitter bridge needs a sample at both ends
+    # (PRRT_kwDOTQvU8M6qhuV8, MAN-284).
     if first["ts"] > start:
-        account(start, first["ts"],
-                "unobserved" if first["ts"] - start > gap_limit else ("up" if _is_up(first) else "down"))
+        account(start, first["ts"], "unobserved")
     # Pair intervals as [a.ts, b.ts, state, extra_down, same_process],
     # accounted after the walk so a later pair can move counter-reported
     # down time into an earlier healthy interval.
@@ -992,8 +1024,22 @@ def summarize(records, params=None):
     # count and (if the recorder missed them) the archive, so spots_missed
     # cannot be counted and the D-I gate must not GO (PR #219 review).
     tail_restart = False
-    after = [s for s in reach if s["ts"] > end]
-    if seq and after and after[0].get("spots_total") is not None:
+    # A last sample exactly at the window end leaves no tail. Any other tail
+    # needs a reachable sample after the window with a spot counter; a report
+    # run before that scrape (right at END) cannot count it, so spots_missed
+    # is incomplete and ledger integrity fails (PRRT_kwDOTQvU8M6qmtCB, MAN-291).
+    # Only the first reachable sample after the window may count it. Its delta
+    # can already include spots emitted after the window end, which the
+    # archive (cut at the window end) leaves out, and a later sample would add
+    # more of them as missed. If that first sample lacks a counter, the tail
+    # stays uncounted (PR #376).
+    tail_open = not seq or seq[-1]["ts"] < end
+    after = [s for s in samples if s.get("reachable") and s["ts"] > end]
+    post_window_lacks = [m for m, k in (("manta_spots_total", "spots_total"),
+                                        ("manta_start_time_seconds", "start_time"))
+                         if after and after[0].get(k) is None]
+    tail_missing = tail_open and (not after or bool(post_window_lacks))
+    if tail_open and seq and not tail_missing:
         a_, b_ = seq[-1], after[0]
         bs_, as_t = b_["spots_total"], a_.get("spots_total")
         if a_["start_time"] == b_["start_time"] and as_t is not None:
@@ -1120,6 +1166,7 @@ def summarize(records, params=None):
     coverage = None
     spots_missed = None
     spots_missed_indeterminate = False
+    spots_missed_incomplete = False
     if recorded is not None:
         recorded_total = sum(v for k, v in recorded.items())
         # Emitted spots the archive lacks. Stage 1's D-I gate counts them as
@@ -1140,7 +1187,23 @@ def summarize(records, params=None):
             warnings.append(
                 "spots missed by the recorder are indeterminate: %s, so Stage 1 (D-I) cannot GO; "
                 "pass --missed-spots indeterminate to shadow-compare.py" % "; ".join(why))
-        else:
+        if tail_missing and after:
+            spots_missed_incomplete = True
+            warnings.append(
+                "the first reachable sample after the window end (%s), at %s, lacks %s: the spots "
+                "emitted after the last reachable sample (%s) are uncounted, so spots missed by the "
+                "recorder are incomplete and ledger integrity fails; a later sample would count more "
+                "spots emitted after the window end as missed, so no rerun completes the count"
+                % (_iso(end), _iso(after[0]["ts"]), " and ".join(post_window_lacks),
+                   _iso(seq[-1]["ts"]) if seq else "none"))
+        elif tail_missing:
+            spots_missed_incomplete = True
+            warnings.append(
+                "no reachable sample after the window end (%s) yet: the spots emitted after the last "
+                "reachable sample (%s) are uncounted, so spots missed by the recorder are incomplete "
+                "and ledger integrity fails; run report again after the next scrape"
+                % (_iso(end), _iso(seq[-1]["ts"]) if seq else "none"))
+        if not why and not tail_missing:
             spots_missed = max(0, spots_emitted_total + tail_emitted - recorded_total)
         if spots_emitted_total > 0:
             coverage = recorded_total / float(spots_emitted_total)
@@ -1168,7 +1231,8 @@ def summarize(records, params=None):
     # blind to what that family detects (a restart without start_time, an
     # outage without the outage counters), so no verdict can rest on it:
     # an integrity failure fails the run, like unobserved time (D-F).
-    integrity_ok = not missing_counts and not int(p["interior_unparseable_lines"])
+    integrity_ok = (not missing_counts and not int(p["interior_unparseable_lines"])
+                    and not spots_missed_incomplete)
     if not all(c["pass"] for c in criteria) or not integrity_ok:
         verdict = "FAIL"
     elif in_progress:
@@ -1205,6 +1269,7 @@ def summarize(records, params=None):
         "recorded_coverage": coverage,
         "spots_missed": spots_missed,
         "spots_missed_indeterminate": spots_missed_indeterminate,
+        "spots_missed_incomplete": spots_missed_incomplete,
         "builds": builds,
         "notes": [{"at": _iso(n["ts"]), "ts": n["ts"], "note": n.get("note"), "reason": n.get("reason")}
                   for n in win_notes],
@@ -1214,6 +1279,8 @@ def summarize(records, params=None):
                       "samples": len(win_samples),
                       "reachable_samples": len(reachable_win),
                       "missing_metrics": missing_counts,
+                      "missing_post_window_sample": spots_missed_incomplete and not after,
+                      "post_window_sample_missing_metrics": spots_missed_incomplete and bool(after),
                       "pass": integrity_ok},
         "warnings": warnings,
     }
@@ -1250,8 +1317,14 @@ def render_markdown(s):
     span_label = s["progress"] if s["in_progress"] else "PASS (span)"
     w("- Span: %.1f/%s days: %s" % (s["window"]["span_days"], _fmt_num(s["params"]["min_days"]), span_label))
     if not s["integrity"]["pass"]:
-        w("- Ledger integrity: required metrics missing or ledger lines lost (see Ledger integrity): "
-          "FAIL (integrity)")
+        integ = s["integrity"]
+        causes = [c for c, bad in (("required metrics missing", integ["missing_metrics"]),
+                                   ("ledger lines lost", integ["interior_unparseable_lines"]),
+                                   ("no reachable sample after the window end yet",
+                                    integ["missing_post_window_sample"]),
+                                   ("the first sample after the window end lacks a required metric",
+                                    integ["post_window_sample_missing_metrics"])) if bad]
+        w("- Ledger integrity: %s (see Ledger integrity): FAIL (integrity)" % ", ".join(causes))
     w("")
     w("## Window")
     w("")
@@ -1318,6 +1391,13 @@ def render_markdown(s):
         if s["spots_missed_indeterminate"]:
             w("Spots missed by the recorder: indeterminate, see the warnings "
               "(Stage 1: shadow-compare.py --missed-spots indeterminate; D-I cannot GO)")
+        elif s["integrity"]["post_window_sample_missing_metrics"]:
+            w("Spots missed by the recorder: incomplete, the first reachable sample after the window end "
+              "lacks a required metric, see the warnings (Stage 1: no rerun completes it; "
+              "shadow-compare.py --missed-spots indeterminate; D-I cannot GO)")
+        elif s["spots_missed_incomplete"]:
+            w("Spots missed by the recorder: incomplete, no reachable sample after the window end yet "
+              "(Stage 1: run report again after the next scrape; D-I cannot GO until then)")
         else:
             w("Spots missed by the recorder: %d (Stage 1: shadow-compare.py --missed-spots %d)"
               % (s["spots_missed"], s["spots_missed"]))
@@ -1349,18 +1429,11 @@ def render_markdown(s):
     return "\n".join(out) + "\n"
 
 
-# A NaN compares false against everything and inf/huge values overflow the gap
-# arithmetic, so either would turn a failing ledger into a PASS. Reject them up front.
-MAX_REPORT_INTERVAL_S = 86400.0
-
-
 def validate_report_thresholds(args):
     def finite(flag, v):
         if not math.isfinite(v):
             raise UsageError("%s must be a finite number" % flag)
-    finite("--interval-s", args.interval_s)
-    if not 0 < args.interval_s <= MAX_REPORT_INTERVAL_S:
-        raise UsageError("--interval-s must be > 0 and <= %s" % _fmt_num(MAX_REPORT_INTERVAL_S))
+    validate_interval_s(args.interval_s)
     finite("--min-days", args.min_days)
     if args.min_days <= 0:
         raise UsageError("--min-days must be > 0")
@@ -1462,7 +1535,9 @@ def build_parser():
     rep.add_argument("--ledger", required=True, help="ledger JSON Lines file written by `sample`/`note`")
     rep.add_argument("--spots-dir", default=None,
                      help="record-spots output directory, for recorded-vs-emitted coverage and the "
-                          "spots_missed count Stage 1 passes to shadow-compare.py --missed-spots")
+                          "spots_missed count Stage 1 passes to shadow-compare.py --missed-spots; "
+                          "unless a sample falls exactly on the window end, that count needs a "
+                          "reachable sample after it, else it is incomplete and integrity fails")
     rep.add_argument("--from", dest="from_", default=None, metavar="ISO",
                      help="ISO-8601 window start (default: the last `start` note, else the first sample)")
     rep.add_argument("--to", default=None, metavar="ISO",

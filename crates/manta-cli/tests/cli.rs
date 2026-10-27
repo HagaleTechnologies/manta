@@ -1551,7 +1551,7 @@ fn hpsdr_host_without_freq_and_rate_is_a_clean_error() {
     assert!(out.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "note: empty.toml has no [server] table; the telnet/JSON/metrics servers are not started\nerror: --hpsdr-freq-hz is required with --hpsdr-host\n"
+        "note: empty.toml has no [server] table; the telnet/JSON/metrics servers are not started\nerror: --hpsdr-freq-hz is required with the hpsdr source\n"
     );
 }
 
@@ -1617,9 +1617,10 @@ fn hpsdr_protocol_flag_is_recognized_by_run_listen_soak_calibrate_and_check() {
     }
 }
 
-/// MAN-305: `--hpsdr-protocol` means nothing without `--hpsdr-host`.
+/// MAN-305/MAN-306: `--hpsdr-protocol` means nothing without an HPSDR
+/// selector (a host, a MAC, or a hostless radio's flags).
 #[test]
-fn hpsdr_protocol_requires_hpsdr_host() {
+fn hpsdr_protocol_requires_an_hpsdr_selector() {
     for sub in ["run", "listen", "soak", "doctor", "calibrate", "check"] {
         let mut args = vec![sub];
         if sub == "soak" {
@@ -1631,7 +1632,8 @@ fn hpsdr_protocol_requires_hpsdr_host() {
         assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
         assert!(
             stderr.contains("the following required arguments were not provided")
-                && stderr.contains("--hpsdr-host <HPSDR_HOST>"),
+                && stderr.contains("--hpsdr-host <HPSDR_HOST>")
+                && stderr.contains("--hpsdr-mac <HPSDR_MAC>"),
             "{args:?}: {stderr}"
         );
     }
@@ -2966,6 +2968,32 @@ fn status_with_an_invalid_addr_fails_with_exit_code_two_not_one() {
     );
 }
 
+/// MAN-282: a clap-valid but absurd `--timeout-secs` (u64::MAX) must
+/// exit 2 with a plain "invalid --timeout-secs" message, not panic
+/// with exit 101 before ever dialing. The deadline is computed before
+/// any resolution or connect, so a closed port needs no listener and
+/// the test cannot race an ephemeral port.
+#[test]
+fn status_with_an_absurd_timeout_secs_exits_two_with_a_plain_message() {
+    let out = manta()
+        .args([
+            "status",
+            "--addr",
+            "127.0.0.1:1",
+            "--timeout-secs",
+            "18446744073709551615",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("invalid --timeout-secs"),
+        "expected a plain invalid --timeout-secs message, got: {stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "must not panic: {stderr}");
+}
+
 /// MAN-44 CR-A regression: an unreadable `--server-config` must exit 2, not
 /// 1, for the same reason -- this used to `?`-propagate out of `main` and
 /// exit 1, colliding with the "unhealthy uplink" code.
@@ -3377,4 +3405,58 @@ fn decode_minimal_config_spots_an_unlisted_pattern() {
     assert!(decode_spots(&minimal_out)
         .iter()
         .any(|s| s["callsign"] == "QQ9ZZZ"));
+}
+
+#[test]
+fn hpsdr_discovery_flags_exist_and_conflict_with_other_sources() {
+    for sub in ["run", "soak", "doctor", "calibrate", "check"] {
+        let help = manta().args([sub, "--help"]).output().unwrap();
+        assert!(help.status.success());
+        assert!(
+            String::from_utf8_lossy(&help.stdout).contains("--hpsdr-mac"),
+            "{sub}"
+        );
+        let pairs = [
+            (["--hpsdr-host", "h"], ["--hpsdr-mac", "001122334455"]),
+            (["--kiwi-host", "h"], ["--hpsdr-freq-hz", "7030000"]),
+            (["--source", "f.wav"], ["--hpsdr-mac", "001122334455"]),
+            (["--ka9q-group", "239.1.1.1"], ["--hpsdr-rate-hz", "192000"]),
+            (["--device", "D"], ["--hpsdr-port", "1024"]),
+        ];
+        for (a, b) in pairs {
+            for args in [[a, b], [b, a]] {
+                let out = manta()
+                    .arg(sub)
+                    .args(args.into_iter().flatten())
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    out.status.code(),
+                    Some(2),
+                    "{sub}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&out.stderr).contains("cannot be used with"),
+                    "{sub}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn hpsdr_discovery_freq_and_port_select_hpsdr_without_a_host() {
+    for (args, missing) in [
+        (["--hpsdr-freq-hz", "7030000"], "--hpsdr-rate-hz"),
+        (["--hpsdr-port", "1024"], "--hpsdr-freq-hz"),
+        (["--hpsdr-mac", "001122334455"], "--hpsdr-freq-hz"),
+        (["--hpsdr-rate-hz", "192000"], "--hpsdr-freq-hz"),
+    ] {
+        let out = manta().arg("run").args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&out.stderr)
+            .contains(&format!("{missing} is required with the hpsdr source")));
+    }
 }

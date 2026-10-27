@@ -89,17 +89,9 @@ impl DecimatingSource {
     /// constraint (or the minimum-channel-count floor) surfaces
     /// `Decimator::new`'s own error unchanged.
     pub fn new(inner: Box<dyn IqSource + Send>, target_rate_hz: f64) -> Result<Self> {
-        let fs_in = inner.sample_rate();
-        let factor = (fs_in / target_rate_hz).round() as usize;
-        if factor == 0 || (fs_in / factor as f64 - target_rate_hz).abs() > 1e-6 {
-            bail!(
-                "--capture-rate-hz {target_rate_hz} does not evenly divide the source's \
-                 native rate {fs_in} by a power of two"
-            );
-        }
-        let decimator = Decimator::new(fs_in, factor).map_err(|e| anyhow::anyhow!(e))?;
+        let (decimator, factor) = checked_decimator(inner.sample_rate(), target_rate_hz)?;
         let fs_out = decimator.fs_out();
-        let trusted_half = (factor >= 2).then(|| decimator.trusted_half_bandwidth_hz());
+        let trusted_half = trusted_half(&decimator, factor);
         Ok(DecimatingSource {
             inner,
             decimator,
@@ -111,6 +103,58 @@ impl DecimatingSource {
             gap: GapScaler::default(),
             missing: GapScaler::default(),
         })
+    }
+
+    /// MAN-334: the `rf_passband_hz` that `new(inner, target_rate_hz)` would
+    /// report for an inner source at `fs_in` delivering `inner_passband`,
+    /// without an inner source: `manta calibrate` plans its references on it
+    /// before the receiver opens. `Err` exactly when `new` refuses the rate.
+    pub fn passband_for(
+        fs_in: f64,
+        target_rate_hz: f64,
+        inner_passband: (f64, f64),
+    ) -> Result<(f64, f64)> {
+        let (decimator, factor) = checked_decimator(fs_in, target_rate_hz)?;
+        Ok(clip_passband(
+            inner_passband,
+            decimator.fs_out(),
+            trusted_half(&decimator, factor),
+        ))
+    }
+}
+
+/// The decimator `DecimatingSource::new` builds for an inner source at
+/// `fs_in`, and its factor -- or `new`'s refusal of `target_rate_hz`.
+/// Shared with `DecimatingSource::passband_for` (MAN-334), so the two
+/// refuse exactly the same rates.
+fn checked_decimator(fs_in: f64, target_rate_hz: f64) -> Result<(Decimator, usize)> {
+    let factor = (fs_in / target_rate_hz).round() as usize;
+    if factor == 0 || (fs_in / factor as f64 - target_rate_hz).abs() > 1e-6 {
+        bail!(
+            "--capture-rate-hz {target_rate_hz} does not evenly divide the source's \
+             native rate {fs_in} by a power of two"
+        );
+    }
+    let decimator = Decimator::new(fs_in, factor).map_err(|e| anyhow::anyhow!(e))?;
+    Ok((decimator, factor))
+}
+
+/// MAN-196: the decimator's <= 1 dB half-bandwidth, `None` for a factor-1
+/// pass-through (see `DecimatingSource::trusted_half`).
+fn trusted_half(decimator: &Decimator, factor: usize) -> Option<f64> {
+    (factor >= 2).then(|| decimator.trusted_half_bandwidth_hz())
+}
+
+/// `DecimatingSource::rf_passband_hz` for an inner source delivering
+/// `inner` (see the doc comment there), shared with
+/// `DecimatingSource::passband_for` (MAN-334) so the advertised passband
+/// and calibrate's pre-open plan cannot drift apart.
+fn clip_passband(inner: (f64, f64), fs_out: f64, trusted_half: Option<f64>) -> (f64, f64) {
+    let half = fs_out / 2.0;
+    let (lo, hi) = inner;
+    match trusted_half {
+        Some(t) => (lo.max(-half).max(-t), hi.min(half).min(t)),
+        None => (lo.max(-half), hi.min(half)),
     }
 }
 
@@ -139,12 +183,7 @@ impl IqSource for DecimatingSource {
     /// intersection, subsumed by the trusted clip (the trusted
     /// half-bandwidth is always below `fs_out / 2`).
     fn rf_passband_hz(&self) -> (f64, f64) {
-        let half = self.fs_out / 2.0;
-        let (lo, hi) = self.inner.rf_passband_hz();
-        match self.trusted_half {
-            Some(t) => (lo.max(-half).max(-t), hi.min(half).min(t)),
-            None => (lo.max(-half), hi.min(half)),
-        }
+        clip_passband(self.inner.rf_passband_hz(), self.fs_out, self.trusted_half)
     }
 
     /// MAN-196: the decimator's <= 1 dB trusted band, `(lo, hi)` Hz
@@ -174,6 +213,9 @@ impl IqSource for DecimatingSource {
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         while self.pending.is_empty() {
             let n = self.inner.read(&mut self.raw)?;
             // MAN-305: the inner reports describe the samples this inner
@@ -231,6 +273,73 @@ impl IqSource for DecimatingSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct GapChunks {
+        chunks: std::collections::VecDeque<(Vec<Complex32>, Option<u64>)>,
+        gap: Option<u64>,
+    }
+    impl IqSource for GapChunks {
+        fn sample_rate(&self) -> f64 {
+            192000.0
+        }
+        fn center_freq_hz(&self) -> f64 {
+            7e6
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            let Some((samples, gap)) = self.chunks.pop_front() else {
+                return Ok(0);
+            };
+            buf[..samples.len()].copy_from_slice(&samples);
+            self.gap = gap;
+            Ok(samples.len())
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            self.gap.take()
+        }
+    }
+
+    #[test]
+    fn gaps_reset_filter_and_are_latched_to_post_gap_samples() {
+        let before = vec![Complex32::new(1.0, 0.0); 128];
+        let after = vec![Complex32::new(-0.5, 0.0); 128];
+        let chunks = GapChunks {
+            chunks: [(before, None), (after.clone(), Some(7))].into(),
+            gap: None,
+        };
+        let mut src = DecimatingSource::new(Box::new(chunks), 48000.0).unwrap();
+        let mut buf = [Complex32::default(); 256];
+        assert_eq!(src.read(&mut buf).unwrap(), 32);
+        assert_eq!(src.take_discontinuity(), None);
+        let n = src.read(&mut buf).unwrap();
+        assert_eq!(src.take_discontinuity(), Some(1));
+        assert_eq!(src.take_discontinuity(), None);
+        let mut fresh = Decimator::new(192000.0, 4).unwrap();
+        assert_eq!(&buf[..n], fresh.process(&after));
+    }
+
+    #[test]
+    fn decimated_gaps_carry_remainders_and_survive_eof() {
+        let chunk = vec![Complex32::default(); 16];
+        let chunks = GapChunks {
+            chunks: [
+                (chunk.clone(), Some(3)),
+                (chunk, Some(3)),
+                (vec![], Some(2)),
+            ]
+            .into(),
+            gap: None,
+        };
+        let mut src = DecimatingSource::new(Box::new(chunks), 48000.0).unwrap();
+        let mut buf = [Complex32::default(); 256];
+        assert_eq!(src.read(&mut []).unwrap(), 0);
+        assert_eq!(src.take_discontinuity(), None);
+        assert_eq!(src.read(&mut buf).unwrap(), 4);
+        assert_eq!(src.take_discontinuity(), Some(0));
+        assert_eq!(src.read(&mut buf).unwrap(), 4);
+        assert_eq!(src.take_discontinuity(), Some(1));
+        assert_eq!(src.read(&mut buf).unwrap(), 0);
+        assert_eq!(src.take_discontinuity(), Some(1));
+    }
 
     /// A minimal in-memory IqSource test double, mirroring
     /// `manta-engine::listen`'s own `FixedFreqSource` test helper.
@@ -684,6 +793,76 @@ mod tests {
         assert_eq!(src.sample_rate(), 48_000.0);
         assert_eq!(src.trusted_band_hz(), None);
         assert_eq!(src.rf_passband_hz(), (-24_000.0, 24_000.0));
+    }
+
+    /// A source with a given rate and passband and no samples (MAN-334).
+    struct Fixed {
+        fs: f64,
+        passband: (f64, f64),
+    }
+
+    impl IqSource for Fixed {
+        fn sample_rate(&self) -> f64 {
+            self.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            14_000_000.0
+        }
+        fn rf_passband_hz(&self) -> (f64, f64) {
+            self.passband
+        }
+        fn read(&mut self, _buf: &mut [Complex32]) -> Result<usize> {
+            Ok(0)
+        }
+    }
+
+    /// MAN-334: what calibrate plans on before opening is what the built
+    /// source will report.
+    #[test]
+    fn passband_for_matches_what_a_built_source_reports() {
+        for (fs, target, inner) in [
+            (192_000.0, 48_000.0, (-96_000.0, 96_000.0)), // -> +/-21 724.8 (trusted band)
+            (192_000.0, 48_000.0, (300.0, 3_000.0)),      // rig audio, unclipped
+            (96_000.0, 12_000.0, (-5_000.0, 5_000.0)),    // KiwiSDR: trusted 5431.2 > 5000
+            (96_000.0, 6_000.0, (-5_000.0, 5_000.0)),     // KiwiSDR: clipped to +/-2715.6
+        ] {
+            let built = DecimatingSource::new(
+                Box::new(Fixed {
+                    fs,
+                    passband: inner,
+                }),
+                target,
+            )
+            .unwrap();
+            assert_eq!(
+                DecimatingSource::passband_for(fs, target, inner).unwrap(),
+                built.rf_passband_hz(),
+                "{fs} -> {target}"
+            );
+        }
+    }
+
+    /// MAN-334: `passband_for` refuses exactly the rates `new` refuses, with
+    /// the same message, so calibrate's preflight never refuses what opening
+    /// would not.
+    #[test]
+    fn passband_for_refuses_what_new_refuses() {
+        for (fs, target) in [(96_000.0, 50_000.0), (96_000.0, 32_000.0)] {
+            let new_err = DecimatingSource::new(
+                Box::new(Fixed {
+                    fs,
+                    passband: (-1.0, 1.0),
+                }),
+                target,
+            )
+            .err()
+            .unwrap()
+            .to_string();
+            let for_err = DecimatingSource::passband_for(fs, target, (-1.0, 1.0))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(for_err, new_err, "{fs} -> {target}");
+        }
     }
 
     /// An `InMemorySource` reporting a narrower RF passband than its

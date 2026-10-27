@@ -9,7 +9,7 @@
 //! the live-state stream (MAN-324, one `bandState` per input) work as with
 //! one input.
 
-use crate::reconnect::{HealthSink, InputHealthTotals, ReconnectingSource};
+use crate::reconnect::{InputHealthTotals, ReconnectingSource};
 use crate::stdio::errln;
 use crate::{
     fmt, logging, text_lines, wrap_file_replay, LiveSourceSpec, ReplayMode, ResolvedInput,
@@ -64,6 +64,7 @@ pub(crate) struct MultiRun<'a> {
     pub inputs: &'a [ResolvedInput],
     /// `--replay-epoch`/`input.replay_epoch`, for recordings' start times.
     pub replay_epoch: Option<i64>,
+    pub hpsdr_allocations: Vec<crate::config::HpsdrAllocation>,
     pub replay: ReplayMode,
     pub cfg: &'a PipelineConfig,
     pub json: bool,
@@ -207,7 +208,11 @@ struct InputHealthState {
 /// marks (its thread is blocked reconnecting, so it cannot publish them
 /// itself, MAN-45) and republishes the sums; every edge after the first
 /// report logs the `k of n inputs decoding` line.
-fn input_health_sink(index: usize, name: String, state: InputHealthState) -> HealthSink {
+fn input_health_sink(
+    index: usize,
+    name: String,
+    state: InputHealthState,
+) -> Box<dyn FnMut(bool) + Send> {
     let InputHealthState {
         healthy,
         tracks,
@@ -460,11 +465,25 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     let input_counters: Arc<Mutex<Vec<Option<Arc<InputHealthTotals>>>>> =
         Arc::new(Mutex::new(vec![None; n]));
 
+    let grouped =
+        crate::hpsdr_group::prepare(m.hpsdr_allocations, m.inputs, stop.clone(), |index| {
+            input_health_sink(
+                index,
+                m.inputs[index].name.clone(),
+                InputHealthState {
+                    healthy: healthy.clone(),
+                    tracks: tracks.clone(),
+                    rtty: rtty_marks.clone(),
+                    metrics: metrics_slot.clone(),
+                },
+            )
+        });
     let specs = m
         .inputs
         .iter()
         .enumerate()
-        .map(|(index, input)| {
+        .zip(grouped)
+        .map(|((index, input), grouped)| {
             let spec = input.spec.clone();
             let (capture, dial) = (input.capture_rate_hz, input.dial_freq_hz);
             let record_iq = input.record_iq.clone();
@@ -496,6 +515,18 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 open: Box::new(move || {
                     let record_stop = stop.clone();
                     let src = (move || -> Result<Box<dyn manta_input::IqSource>> {
+                        if let Some(member) = grouped {
+                            let source = member.open()?;
+                            // A member claimed after its siblings has still been
+                            // acquiring since the shared generation started.
+                            if let Ok(mut at) = opened_at.lock() {
+                                at[index] = Some(source.acquired_at());
+                            }
+                            if let Ok(mut slot) = input_counters.lock() {
+                                slot[index] = source.input_health();
+                            }
+                            return Ok(Box::new(source) as Box<dyn manta_input::IqSource>);
+                        }
                         let first = spec.open(capture, dial)?;
                         if let Ok(mut at) = opened_at.lock() {
                             at[index] = Some(Instant::now());

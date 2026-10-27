@@ -24,6 +24,12 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-402: looped dah-heavy text keyed at 25-40 WPM (`MO`, `OO`, `0000`,
+  `T0M`) now decodes as its own words. The speed tracker read five equal
+  dahs of 90-150 ms as dits, so `MO` at 33 WPM printed `H5555...` and `0000`
+  at 37.5 WPM printed nothing. When the gaps between those five marks are a
+  third of a mark long, the tracker now takes them as dahs. Text made only
+  of single-dah characters (`TT`) is unchanged.
 - MAN-108: a fading signal keeps one `track_id` through fades of up to
   15 s instead of respawning a new track each time the 5 s hang ran out.
   A track that has decoded goes DORMANT for `reacquire_ms` (10 s) after
@@ -31,6 +37,10 @@ the git history and `docs/DECISIONS/`.
   decodes is unchanged, its spots carry one id, and the validator's
   per-track state (RST, `QRL?`) survives the fade. A track whose signal
   really ends now closes 15 s after the drop instead of 5 s.
+- MAN-307: live HPSDR queue losses reset only the affected decode segment.
+  Decimation resets its filter and forwards converted gaps, and reconnect
+  wrappers preserve inner gaps, including an EOF with a pending gap. Clean
+  file replay remains unchanged.
 - MAN-265: a transmission that ends at the speed tracker's warm-up
   boundary (e.g. a beacon ID or a single exchange) now reports its
   gap-corrected WPM. The readiness mark's seed was computed before the
@@ -99,6 +109,17 @@ the git history and `docs/DECISIONS/`.
   unchanged; only sources that report gaps gain the segmented behaviour,
   and a recording of rig audio keeps its analytic guard under `decode`. See
   [docs/GUIDES/iq-recording.md](docs/GUIDES/iq-recording.md).
+- MAN-307: several HPSDR inputs can share one radio, with one independently
+  tuned receiver per band, capacity probing for HL2, and an optional
+  `receivers` declaration for other gateware. Each radio reconnects as a
+  group. Bounded per-receiver queues report exact discarded samples through
+  `manta_input_queue_dropped_samples_total`. A shared radio speaks protocol 1
+  (its entries' `protocol` must match, and `"2"` is refused); a radio with
+  one entry keeps MAN-305's protocol choice.
+- Rust API: `manta_input::hpsdr::probe_receiver_capacity`, radio session
+  retirement/timing handles, and `InputHealthCounters::queue_dropped_samples`.
+  Exhaustive `manta_server::metrics::InputHealth` literals must initialize the
+  new `queue_dropped_samples` field or use `Default`.
 - MAN-305: protocol-2 openHPSDR radios (ANAN-class: Hermes, Angelia,
   Orion, Orion II, Saturn/G2) as inputs, alongside protocol 1 (Hermes-Lite
   2). `--hpsdr-protocol auto|1|2`, `[input] protocol` (`"auto"`, `"1"`,
@@ -205,6 +226,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-319: a live `[[rbn_uplink]]` (`dry_run = false`) also needs
+  `[server].operator_grid` set to a 6-character Maidenhead locator (e.g.
+  `"FN03ab"`). `config check`, `run`, `doctor` and a SIGHUP reload refuse a
+  live uplink without one, naming the target and the key to set; dry-run
+  uplinks (the default) are unchanged. A 4-character grid is refused too.
+  `[server]` needs a restart, so a SIGHUP reload goes live only if the
+  daemon started with the grid. The registration/settings exchange itself
+  stays blocked on MAN-90's Aggregator→RBN capture (claims C8–C11).
 - IQ WAV input streams from disk: `manta decode`'s memory no longer grows
   with the recording's length (a 1 GB recording decodes in under 20 MiB), and
   `run --loop` re-opens a recording without re-reading it. A WAV whose data
@@ -227,6 +256,9 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-285: `manta status --json` now prints every field the daemon served,
+  including fields newer than this build, with object keys in alphabetical
+  order. The human-readable `manta status` summary and exit codes are unchanged.
 - `ReconnectingSource`, `DecimatingSource` and `manta doctor`'s
   `SampleBoundedSource` now forward the inner source's gap reports
   (`take_discontinuity()` and the new `take_missing_samples()`); they
@@ -243,6 +275,12 @@ the git history and `docs/DECISIONS/`.
   longer force-decodes the open tracks' last element or judges their
   pending beacons as if the signal had ended; they close as an outage
   (MAN-258).
+- `manta calibrate --write` no longer fails on every run with
+  `creating temp file …: File exists` after a save was killed before it
+  finished, as when manta runs as PID 1 in a container (MAN-335). Each save
+  now picks a random temp name and tries another if that one is taken. A
+  killed save's `.<config>.calibrate-*.tmp` file is left in place and is
+  safe to delete.
 
 ## [0.1.0] - 2026-10-11
 

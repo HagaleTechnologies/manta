@@ -219,7 +219,8 @@ the Aggregator operator stops all forwarding (Aggregator manual §5.6). So the q
 
 Start the three units, wait for the ledger's first scrape (one sample line in the ledger, about
 60 s), then write the start note. A start note before the first sample leaves the spots emitted
-before it uncounted, and `report` marks the missed-spot count indeterminate (NO-GO):
+before it uncounted, and `report` marks the missed-spot count indeterminate (NO-GO); the time
+between that note and the first sample also counts as unobserved against availability (D-A):
 
 ```sh
 sudo systemctl enable --now manta-field.service manta-field-ledger.service manta-field-spots.service
@@ -232,8 +233,9 @@ tail -n 1 /var/lib/manta-field/ledger.jsonl
 
 After 24 h, evaluate the ledger over the 24 h window. No Aggregator is connected in Stage 1, so
 pass `--min-aggregator 0` to switch off the D-B criterion. Wait at least one scrape interval (60 s)
-after `END` first: spots emitted between the last scrape and `END` only show on the next scrape,
-and without it the missed-spot count below can come out low (MAN-291 makes `report` enforce this):
+after `END` first: spots emitted between the last scrape and `END` only show on the next scrape.
+Until the ledger has a reachable sample after `END`, `report` cannot count them, so it fails ledger
+integrity (exit 1) and reads the missed-spot count below as `incomplete`:
 
 ```sh
 START=2026-11-01T12:00:00Z   # the stage 1 start note's time, UTC
@@ -251,12 +253,18 @@ If manta restarted in the window, or no sample precedes the start note, that lin
 `indeterminate` (the spot counter is per process, and spots before the first sample are unseen);
 pass `indeterminate` and Stage 1 is NO-GO.
 
+If it reads `incomplete, no reachable sample after the window end yet`, wait for the next scrape
+and run `report` again. `shadow-compare.py` refuses `--missed-spots incomplete`. If the node stays
+unreachable after `END`, or the line says the first reachable sample after the window end lacks a
+required metric, the count cannot complete: pass `indeterminate` and Stage 1 is NO-GO.
+
 ```sh
 MISSED=0   # N from "Spots missed by the recorder: N", or indeterminate
 ```
 
 Download the RBN daily archive for every UTC date the window touches. A day's file appears after
-that UTC day ends.
+that UTC day ends. Pass the zips as downloaded: `shadow-compare.py` compares CW rows only, by the
+archive's `tx_mode` column, and stops with exit 2 on a CSV without one.
 
 ```sh
 mkdir -p ~/rbn && cd ~/rbn
@@ -288,9 +296,10 @@ python3 /opt/manta/scripts/shadow-compare.py \
 | ≤ 10% of node spots uncorroborated | `shadow-compare`'s `## Agreement`, the **Uncorroborated** line's percentage (run with `--missed-spots`, so recorder gaps count against it) |
 
 "Uncorroborated" means no RBN spotter (other than this node, which `shadow-compare.py` excludes
-by every `deCall` it saw) reported that call within the tolerances. Look at the
-`## Node-only, uncorroborated` list too: repeated fixed-frequency busts point at a decoder or RF
-problem, not at stations only this node heard.
+by every `deCall` it saw) reported that call within the tolerances. A spot line with no `deCall`
+stops the run as a malformed record, because the node's own forwarded spots could otherwise
+corroborate it. Look at the `## Node-only, uncorroborated` list too: repeated fixed-frequency
+busts point at a decoder or RF problem, not at stations only this node heard.
 
 Frequency calibration: when the node's receiver can hear a time signal (WWV, WWVH, BPM, RWM) or an
 NCDXF beacon, prefer `manta calibrate`. It measures the correction against that carrier and, after
@@ -363,7 +372,15 @@ ROADMAP M2's 24 h live-SDR soak gate.
 Definitions (D-D, D-E, D-G):
 
 - **Planned restart.** Write the note *before* restarting. Its window runs from the note until
-  the first healthy sample after it, capped at 1800 s, and is excluded from availability.
+  the first healthy sample after it, capped at 1800 s, and is excluded from availability. It is
+  excluded only if the restart happens: a sample in the window, or up to the first healthy
+  sample after the cap, must show a new `manta_start_time_seconds`. A note with no restart
+  after it (a cancelled maintenance) excludes nothing, and any outage after it counts against
+  availability.
+
+  Within each sample interval, the report subtracts its registered planned-window overlap
+  from counter-attributed downtime, floored at zero. The source-outage totals still show
+  the full counter duration; the counters do not record exact outage timestamps.
 
   ```sh
   sudo -u manta python3 /opt/manta/scripts/field-node.py note \
@@ -410,6 +427,10 @@ What to do with what it shows:
   which never replays (resume is WebSocket-only), so spots emitted while the recorder is disconnected are lost to it. Check
   `systemctl status manta-field-spots` and `journalctl -u manta-field-spots`, and the
   `manta_spots_dropped_lagged_total` counter.
+- **Ledger integrity: no reachable sample after the window end yet.** With no `--to` and no end
+  note the window ends at the newest sample. If that sample is unreachable (the node is down
+  now), the spots emitted since the last reachable sample are uncounted. Run the check again
+  once the node answers.
 
 ## 8. Day 7: record the comparison (scenario 2)
 
@@ -446,6 +467,7 @@ section 10, with the "Timeline" and "Scenario 2 (day 7)" sections filled in and 
 ```sh
 sudo -u manta python3 /opt/manta/scripts/field-node.py note \
   --ledger /var/lib/manta-field/ledger.jsonl --kind end --reason "day 30"
+sleep 90   # one scrape after the end note; until then report fails ledger integrity
 python3 /opt/manta/scripts/field-node.py report \
   --ledger /var/lib/manta-field/ledger.jsonl --spots-dir /var/lib/manta-field/spots \
   --min-days 30 > ~/day30-report.md; echo "exit $?"
@@ -454,7 +476,9 @@ python3 /opt/manta/scripts/field-node.py report \
   --min-days 30 --format json > ~/day30-report.json
 ```
 
-Exit 0 is PASS. Then download the daily archives for the whole run and compare the full window:
+Exit 0 is PASS. If `## Verdict` says `Ledger integrity: no reachable sample after the window end
+yet`, the report ran before the ledger's next scrape: run both commands again. Then download the
+daily archives for the whole run and compare the full window:
 
 ```sh
 cd ~/rbn

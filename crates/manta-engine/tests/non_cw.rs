@@ -1,8 +1,8 @@
-//! MAN-313: SSB voice, wideband data, swept carriers and unkeyed carriers
-//! start no CW track (or close one that stops keying), while CW beside
-//! them, and every golden vector, decodes as before. Scenes come from
-//! `manta_testkit::noncw` at 96 kHz with noise seed 11. Measured counts
-//! print with `--nocapture`.
+//! MAN-313/MAN-372: SSB voice, wideband data, swept carriers and unkeyed
+//! carriers start no CW track (or close one that stops keying), while CW
+//! beside them, and every golden vector, decodes as before. Scenes come
+//! from `manta_testkit::noncw` at 96 kHz with noise seed 11. Measured
+//! counts print with `--nocapture`.
 
 use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_engine::{decode_samples, DecodeReport, PipelineConfig};
@@ -54,14 +54,22 @@ fn ssb_scene(snr: f32, duration_s: f64) -> Vec<Complex32> {
     iq
 }
 
-fn off() -> PipelineConfig {
+/// MAN-311: The 7000–7040 kHz sweep crosses the new WSPR window.
+/// Keep testing signal classification across the whole original fixture.
+fn classifier_config() -> PipelineConfig {
     let mut cfg = PipelineConfig::default();
+    cfg.detector.digital_window_filter = false;
+    cfg
+}
+
+fn off() -> PipelineConfig {
+    let mut cfg = classifier_config();
     cfg.detector.non_cw_filter = false;
     cfg
 }
 
 fn decode(iq: &[Complex32], center: f64) -> DecodeReport {
-    decode_samples(iq, FS, center, &PipelineConfig::default()).unwrap()
+    decode_samples(iq, FS, center, &classifier_config()).unwrap()
 }
 
 fn decode_off(iq: &[Complex32], center: f64) -> DecodeReport {
@@ -128,18 +136,17 @@ fn add_carrier(iq: &mut [Complex32], offset_hz: f64, snr: f32) {
     }
 }
 
-/// Scenario 1, strict: zero in-band tracks at +30 and +45 dB. Ignored:
-/// with this testkit voice model the co-modulation span (SPEC §2.8) forms
-/// late and covers only the strong lower harmonics, so a residual of
-/// tracks qualifies (measured 7 in band at +30 dB against 81 with the
-/// filter off). See the MAN-313 decision record's known limits.
+/// Scenario 1, strict: zero in-band tracks at +30 and +45 dB. MAN-372's
+/// speech-band veto (SPEC §2.8 E) closes the co-modulation span's
+/// coverage gaps: a voice harmonic sitting in the band's internal
+/// formant gap is marked by the band-level speech detector even when no
+/// span covers its channel.
 #[test]
-#[ignore = "MAN-372: 7 in-band tracks at +30 dB with this voice model; zero is MAN-372's goal"]
 fn ssb_voice_at_14040_starts_no_cw_track() {
     let (lo, hi) = (CENTER + 40_200.0, CENTER + 42_900.0);
     for snr in [30.0, 45.0] {
         let iq = ssb_scene(snr, 40.0);
-        let (p, _) = promotions_and_spots(&iq, CENTER, &PipelineConfig::default());
+        let (p, _) = promotions_and_spots(&iq, CENTER, &classifier_config());
         let inside = within(&p, lo, hi);
         println!(
             "SSB +{snr} dB, filter on: {} TrackPromoted in band",
@@ -155,7 +162,7 @@ fn ssb_voice_at_14040_starts_no_cw_track() {
 fn ssb_voice_at_14040_starts_far_fewer_cw_tracks() {
     let (lo, hi) = (CENTER + 40_200.0, CENTER + 42_900.0);
     let iq = ssb_scene(30.0, 40.0);
-    let (p, spots) = promotions_and_spots(&iq, CENTER, &PipelineConfig::default());
+    let (p, spots) = promotions_and_spots(&iq, CENTER, &classifier_config());
     let on = within(&p, lo, hi).len();
     let (p, _) = promotions_and_spots(&iq, CENTER, &off());
     let off_n = within(&p, lo, hi).len();
@@ -174,7 +181,7 @@ fn noise_like_data_signal_starts_no_cw_track() {
     for snr in [30.0, 45.0, 60.0] {
         let mut iq = scene(&[], 40.0);
         add_band_noise(&mut iq, FS, c, bw, snr, 5);
-        let (p, _) = promotions_and_spots(&iq, CENTER, &PipelineConfig::default());
+        let (p, _) = promotions_and_spots(&iq, CENTER, &classifier_config());
         let inside = within(&p, lo, hi);
         println!(
             "band noise +{snr} dB: {} TrackPromoted in band",
@@ -194,7 +201,7 @@ fn sweep_scene(rate: f64, snr: f32, ramp_ms: f64, duration_s: f64) -> Vec<Comple
 #[test]
 fn swept_carrier_7000_to_7040_starts_no_cw_track() {
     let iq = sweep_scene(2_000.0, 20.0, 0.0, 22.0);
-    let (on, _) = promotions_and_spots(&iq, SWEEP_CENTER, &PipelineConfig::default());
+    let (on, _) = promotions_and_spots(&iq, SWEEP_CENTER, &classifier_config());
     println!("sweep, filter on: {} TrackPromoted", on.len());
     assert!(on.is_empty(), "{on:?}");
     let (offp, _) = promotions_and_spots(&iq, SWEEP_CENTER, &off());
@@ -212,7 +219,7 @@ fn swept_carrier_7000_to_7040_starts_no_cw_track() {
 #[test]
 fn single_channel_sweep_bumps_do_not_qualify_as_short_transmissions() {
     let iq = sweep_scene(1_000.0, 20.0, 5.0, 22.0);
-    let (on, _) = promotions_and_spots(&iq, SWEEP_CENTER, &PipelineConfig::default());
+    let (on, _) = promotions_and_spots(&iq, SWEEP_CENTER, &classifier_config());
     println!(
         "1000 Hz/s sweep with 5 ms ramp, filter on: {} TrackPromoted",
         on.len()
@@ -353,7 +360,7 @@ fn weak_cw_beside_a_louder_signal_still_decodes() {
                 iq
             }
         };
-        for (label, cfg) in [("on", PipelineConfig::default()), ("off", off())] {
+        for (label, cfg) in [("on", classifier_config()), ("off", off())] {
             let report = decode_samples(&iq, FS, CENTER, &cfg).unwrap();
             let calls: Vec<(&str, f64)> = report
                 .spots
@@ -376,7 +383,7 @@ fn weak_cw_beside_a_louder_signal_still_decodes() {
 #[test]
 fn non_cw_only_input_reports_no_keyed_cw() {
     let iq = sweep_scene(2000.0, 20.0, 0.0, 22.0);
-    let Err(err) = decode_samples(&iq, FS, SWEEP_CENTER, &PipelineConfig::default()) else {
+    let Err(err) = decode_samples(&iq, FS, SWEEP_CENTER, &classifier_config()) else {
         panic!("sweep-only input decoded as CW");
     };
     assert_eq!(
@@ -388,7 +395,7 @@ fn non_cw_only_input_reports_no_keyed_cw() {
 /// Filter on and off agree on text, spot callsigns, spot frequencies
 /// (5 Hz) and the number of `TrackPromoted`.
 fn assert_on_off_equivalent(name: &str, iq: &[Complex32], fs: f64, center: f64) {
-    let on = decode_samples(iq, fs, center, &PipelineConfig::default()).unwrap();
+    let on = decode_samples(iq, fs, center, &classifier_config()).unwrap();
     let offr = decode_samples(iq, fs, center, &off()).unwrap();
     let (pon, poff) = (promotions(&on).len(), promotions(&offr).len());
     println!(
@@ -457,6 +464,17 @@ fn loud_cw_decodes_identically_with_the_filter() {
     }
 }
 
+/// Nearby loud CW carriers must not validate each other's speech-shaped
+/// skirts solely because both regions are inside the sibling distance.
+#[test]
+fn nearby_loud_cw_decodes_identically_with_the_filter() {
+    let mut spec = vectors::vr3();
+    spec.duration_s = 30.0;
+    spec.signals.push(cw(14_340.0, 45.0, 31.0, 5.0));
+    let iq = render_vector(&spec);
+    assert_on_off_equivalent("nearby loud CW", &iq, FS, CENTER);
+}
+
 #[test]
 #[ignore = "heavy: all 20 golden vectors at full length"]
 fn all_golden_vectors_decode_identically_with_the_filter() {
@@ -496,7 +514,7 @@ fn sweeps_across_rates_and_levels_start_no_cw_track() {
     for &rate in &rates {
         for snr in [10.0, 20.0, 40.0, 60.0] {
             let iq = sweep_scene(rate, snr, 5.0, 22.0);
-            let (p, _) = promotions_and_spots(&iq, SWEEP_CENTER, &PipelineConfig::default());
+            let (p, _) = promotions_and_spots(&iq, SWEEP_CENTER, &classifier_config());
             println!("{rate} Hz/s +{snr} dB 5 ms ramp: {} TrackPromoted", p.len());
             if !p.is_empty() {
                 failures.push(format!("ramped {rate} Hz/s +{snr} dB: {}", p.len()));
@@ -504,7 +522,7 @@ fn sweeps_across_rates_and_levels_start_no_cw_track() {
         }
         for snr in [10.0, 20.0] {
             let iq = sweep_scene(rate, snr, 0.0, 22.0);
-            let (p, _) = promotions_and_spots(&iq, SWEEP_CENTER, &PipelineConfig::default());
+            let (p, _) = promotions_and_spots(&iq, SWEEP_CENTER, &classifier_config());
             println!("{rate} Hz/s +{snr} dB abrupt: {} TrackPromoted", p.len());
             if !p.is_empty() {
                 failures.push(format!("abrupt {rate} Hz/s +{snr} dB: {}", p.len()));
@@ -514,7 +532,7 @@ fn sweeps_across_rates_and_levels_start_no_cw_track() {
         // promote a track, but must never yield a spot.
         for snr in [40.0, 60.0] {
             let iq = sweep_scene(rate, snr, 0.0, 22.0);
-            let (p, spots) = promotions_and_spots(&iq, SWEEP_CENTER, &PipelineConfig::default());
+            let (p, spots) = promotions_and_spots(&iq, SWEEP_CENTER, &classifier_config());
             println!(
                 "{rate} Hz/s +{snr} dB abrupt: {} TrackPromoted, {} spots",
                 p.len(),

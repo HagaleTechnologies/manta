@@ -120,7 +120,8 @@
 #login_callsign = "N0CALL"           # default: station_callsign from [server]
 
 # true: connect and log in, but send no spots. Set false only once you mean
-# to send spots to the collector.
+# to send spots to the collector; going live also needs [server]
+# operator_grid set to a 6-character Maidenhead locator (e.g. "FN03ab").
 #dry_run = true
 
 # Which spots to send: "cq_beacon" sends only stations calling CQ (or CQ
@@ -186,7 +187,8 @@
 
 # type = "kiwi", a KiwiSDR web receiver, and type = "hpsdr", an
 # HPSDR/Hermes radio (both inputs are included in every build):
-#host = "<your-receiver-host>"       # required for kiwi and hpsdr
+#host = "<your-receiver-host>"       # required for kiwi; optional for hpsdr (omit to discover)
+#mac = "02:11:22:33:44:55"           # hpsdr only: pin a discovered radio; cannot be combined with host
 #port = 8073                         # default 8073 for kiwi, 1024 for hpsdr, 5004 for ka9q
 #protocol = "auto"                   # hpsdr: "auto" asks the radio; "1" (Hermes-Lite 2) or "2" (ANAN) skips asking
 #password = ""                       # kiwi only; leave empty for public receivers
@@ -199,6 +201,9 @@
 #freq_hz = 7030000.0                 # required unless bands is set: the receiver's centre frequency, Hz
 #bands = ["40m"]                     # instead of freq_hz: "all", bands such as "40m", or centres in kHz such as "7030"
 #tuning_range_hz = [0.0, 30000000.0] # with bands: the receiver's tuning range, Hz; bands outside it are skipped
+# Optional HPSDR capacity declaration, only on the first input for a radio.
+# Shared HL2 receivers are probed at startup; other gateware needs this fallback.
+#receivers = 4
 #rate_hz = 192000.0                  # required for soapy and hpsdr: sample rate, Hz
 
 # type = "ka9q", a ka9q-radio (radiod) IQ channel over multicast. It reads
@@ -315,6 +320,10 @@
 # When a signal becomes a track that gets decoded, and when the track ends.
 
 [detector]
+
+# Skip the common HF FT8, FT4, WSPR and JS8 windows when starting CW tracks.
+# Set false to include these windows. Restart required.
+#digital_window_filter = true
 
 #on_snr_db = 12.0                    # signal-to-noise ratio, dB, that starts a track (0 to 100)
 #off_snr_db = 3.0                    # ratio below which a track counts as silent (0 to on_snr_db)

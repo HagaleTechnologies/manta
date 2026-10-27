@@ -1,5 +1,5 @@
 import csv, importlib.util, io, json, math, os, re, tempfile, unittest, zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(__file__)
 spec = importlib.util.spec_from_file_location("shadow_compare", os.path.join(HERE, "..", "shadow-compare.py"))
@@ -54,6 +54,8 @@ RBN_DAY2 = [
 
 PASSBANDS = ["--passband-khz", "14000-14070", "--passband-khz", "7000-7040"]
 WINDOW = ["--start", "2026-09-09T00:00:00Z", "--end", "2026-09-11T00:00:00Z"]
+OFFSET_WINDOW = ["--start", "2026-09-09T00:00:00-05:00", "--end", "2026-09-10T00:00:00-05:00"]
+SAME_INSTANTS_Z = ["--start", "2026-09-09T05:00:00Z", "--end", "2026-09-10T05:00:00Z"]
 
 
 def write_rbn_csv(path, rows):
@@ -192,6 +194,43 @@ class ShadowCompareTest(unittest.TestCase):
         self.assertEqual(s["inputs"]["rbn_rows"]["non_cw"], 1)
         self.assertIn("AB1CDE", self.unc_calls(s))   # the FT8 K5TR row does not confirm it
         self.assertNotIn("AB1CDE", [m["dxCall"] for m in s["primary_missed_calls"]])
+
+    def test_non_cw_row_neither_confirms_nor_corroborates(self):
+        # MAN-290 scenario 2: one FT8 row matching a node spot, from the primary or
+        # from another spotter, leaves it uncorroborated; the same row as CW does not.
+        npath, rpath = os.path.join(self.d, "ab1cde.jsonl"), os.path.join(self.d, "one.csv")
+        write_lines(npath, [NODE_DAY2[2]])
+        for spotter, mode, confirmed, corroborated in (
+                ("K5TR", "FT8", 0, 0), ("DL1ABC", "FT8", 0, 0),
+                ("K5TR", "CW", 1, 0), ("DL1ABC", "CW", 0, 1)):
+            with self.subTest(spotter=spotter, tx_mode=mode):
+                write_rbn_csv(rpath, [(spotter, "14050.0", "AB1CDE", "10",
+                                       "2026-09-10 10:00:30", "20", mode)])
+                code, _, _, s = self.run_tool(node=[npath], rbn=[rpath])
+                self.assertEqual(code, 0)
+                a = s["agreement"]
+                self.assertEqual((a["node_confirmed_by_primary"], a["node_only_corroborated"]),
+                                 (confirmed, corroborated))
+                self.assertEqual(a["uncorroborated"], 1 - confirmed - corroborated)
+                self.assertEqual(s["inputs"]["rbn_rows"]["non_cw"], int(mode != "CW"))
+
+    def test_rbn_csv_without_tx_mode_is_input_error_exit_2(self):
+        # PRRT_kwDOTQvU8M6qktNz (MAN-290): with no tx_mode column every row was kept,
+        # so an FT8 or RTTY row could confirm or corroborate a node spot (a false GO).
+        rpath, zpath = os.path.join(self.d, "no-mode.csv"), os.path.join(self.d, "no-mode.zip")
+        with open(rpath, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([c for c in RBN_HEADER if c != "tx_mode"])
+            w.writerow(["DL1ABC", "", "", "14050.0", "", "AB1CDE", "", "", "CQ", "10",
+                        "2026-09-10 10:00:30", "20"])
+        with zipfile.ZipFile(zpath, "w") as z:
+            z.write(rpath, "20260910.csv")
+        for path in (rpath, zpath):
+            with self.subTest(rbn=os.path.basename(path)):
+                code, md, err, _ = self.run_tool(rbn=[self.rbn1, path])
+                self.assertEqual(code, 2)
+                self.assertIn("%s: RBN CSV lacks column(s) tx_mode" % path, err)
+                self.assertEqual(md, "")
 
     def test_out_of_passband_and_out_of_window_ignored_both_sides(self):
         _, md, _, s = self.run_tool()
@@ -353,6 +392,34 @@ class ShadowCompareTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("bad-ts.jsonl line 1: malformed node spot record", err)
 
+    def test_node_spot_without_de_call_is_malformed(self):
+        # PRRT_kwDOTQvU8M6qkqnn (MAN-289): a spot with no deCall loaded with an empty
+        # identity, so self-exclusion missed the node's call and its own forwarded RBN
+        # rows corroborated its spots.
+        base = json.loads(NODE_DAY2[0])
+        bad = [{k: v for k, v in base.items() if k != "deCall"}]
+        bad += [dict(base, deCall=v) for v in (None, "", "   ", 5)]
+        npath = os.path.join(self.d, "no-de.jsonl")
+        for rec in bad:
+            with self.subTest(rec=rec.get("deCall", "<absent>")):
+                write_lines(npath, [NODE_DAY2[1], json.dumps(rec)])
+                code, md, err, _ = self.run_tool(node=[npath])
+                self.assertEqual(code, 2)
+                self.assertIn("no-de.jsonl line 2: malformed node spot record", err)
+                self.assertEqual(md, "")
+
+    def test_exclude_spotter_covers_a_forwarding_call_other_than_de_call(self):
+        # MAN-289 scenario 3: with every spot carrying a deCall, --exclude-spotter still
+        # excludes a call the node's spots reach RBN under that is not its deCall.
+        rpath = os.path.join(self.d, "fwd.csv")
+        write_rbn_csv(rpath, [("N0CALL-2", "14040.0", "W9XYZ", "10", "2026-09-10 08:00:30", "20", "CW")])
+        _, _, _, s = self.run_tool(rbn=[rpath])
+        self.assertNotIn("W9XYZ", self.unc_calls(s))
+        _, _, _, s = self.run_tool(rbn=[rpath], extra=["--exclude-spotter", "n0call-2"])
+        self.assertIn("W9XYZ", self.unc_calls(s))
+        self.assertEqual(s["excluded_spotters"]["manual"], ["N0CALL-2"])
+        self.assertEqual(s["agreement"]["rbn_rows_from_excluded_spotters"], 1)
+
     def test_torn_final_node_line_is_tolerated(self):
         npath = os.path.join(self.d, "torn.jsonl")
         with open(npath, "w", encoding="utf-8") as f:
@@ -418,6 +485,41 @@ class ShadowCompareTest(unittest.TestCase):
         self.assertEqual(int(m.group(1)), a["node_only_corroborated"])
         self.assertEqual(a["node_confirmed_by_primary"] + a["node_only_corroborated"] + a["uncorroborated"],
                          a["node_spots"])
+
+    def test_offset_window_recorded_as_its_utc_instant(self):
+        # PR #219 review comment 4223328415 (MAN-280): the window line and JSON inputs
+        # must name the window actually evaluated, not echo the stored wall clock with a Z.
+        code, out, err, summary = self.run_tool(window=OFFSET_WINDOW)
+        self.assertEqual(code, 0, err)
+        self.assertIn("- Window (UTC): 2026-09-09T05:00:00Z to 2026-09-10T05:00:00Z "
+                      "(start inclusive, end exclusive)", out)
+        self.assertEqual(summary["inputs"]["start"], "2026-09-09T05:00:00Z")
+        self.assertEqual(summary["inputs"]["end"], "2026-09-10T05:00:00Z")
+
+    def test_z_window_recorded_unchanged(self):
+        code, out, err, summary = self.run_tool(window=["--start", "2026-09-09T00:00:00Z",
+                                                        "--end", "2026-09-10T00:00:00Z"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("- Window (UTC): 2026-09-09T00:00:00Z to 2026-09-10T00:00:00Z "
+                      "(start inclusive, end exclusive)", out)
+        self.assertEqual(summary["inputs"]["start"], "2026-09-09T00:00:00Z")
+        self.assertEqual(summary["inputs"]["end"], "2026-09-10T00:00:00Z")
+
+    def test_offset_window_summary_equals_z_window_summary(self):
+        # Same instants in two spellings: identical evaluation, only the labels differ.
+        _, _, _, a = self.run_tool(window=OFFSET_WINDOW)
+        _, _, _, b = self.run_tool(window=SAME_INSTANTS_Z)
+        for k in ("start", "end"):
+            a["inputs"].pop(k); b["inputs"].pop(k)
+        self.assertEqual(a, b)
+
+    def test_iso_unit_converts_before_labelling(self):
+        self.assertEqual(sc._iso(datetime(2026, 9, 9, tzinfo=timezone(timedelta(hours=-5)))),
+                         "2026-09-09T05:00:00Z")
+        self.assertEqual(sc._iso(datetime(2026, 9, 9, tzinfo=timezone(timedelta(hours=5, minutes=30)))),
+                         "2026-09-08T18:30:00Z")  # date rolls back across +05:30
+        self.assertEqual(sc._iso(datetime(2026, 9, 9, tzinfo=timezone.utc)), "2026-09-09T00:00:00Z")
+        self.assertEqual(sc._iso(datetime(2026, 9, 9)), "2026-09-09T00:00:00Z")  # naive = UTC
 
 
 if __name__ == "__main__":

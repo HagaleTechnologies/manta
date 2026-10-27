@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-10-19T13:34:50Z",
+  "generated_at": "2026-10-22T14:52:00Z",
   "head_commit": "1826448",
   "pages": [
     {
@@ -66,7 +66,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:e3b1fb325833b66b57b7a4d0d3ad27a96fb653e74876b2c9af38914e24772901",
+      "hash": "sha256:38b9d762bee6eacbf2208ba206954b674e3a3725cdee6c0666d7fba84b97b6da",
       "id": "detector-tracks",
       "kind": "subsystem",
       "links": [
@@ -172,7 +172,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:bf44087476bbcc5b0804e515aa41f1e24f96e9118bdeeffeee4ee76ed0def60a",
+      "hash": "sha256:a5be19671c5e7f4b50b1165916e23bd242faad3e99a7e8439d23b4b6b5269628",
       "id": "live-hardware-field-testing",
       "kind": "howto",
       "links": [
@@ -267,7 +267,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:e88333e03827c806dde99f4c1d8950a6ec13f9bbd36f9f47276efe390cbc4c37",
+      "hash": "sha256:70e05a68528eae9a2cf1a799a43c8482e4e70b3a063d7f113b87cddc869fb9b8",
       "id": "source-reconnect",
       "kind": "gotcha",
       "links": [
@@ -284,16 +284,18 @@
         "crates/manta-input/src/lib.rs (IqSource::take_discontinuity)",
         "crates/manta-input/src/lib.rs (IqSource::acquisition_start_offset)",
         "docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md",
-        "docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md"
+        "docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md",
+        "docs/DECISIONS/2026-10-19-man307-hpsdr-multiple-receivers.md",
+        "crates/manta-cli/src/hpsdr_group.rs"
       ],
       "status": "current",
       "title": "What's the gotcha with a live source disconnecting?",
-      "verified_commit": "b8b9367",
-      "verified_date": "2026-10-16",
+      "verified_commit": "cdf8487",
+      "verified_date": "2026-10-19",
       "visibility": "public"
     },
     {
-      "hash": "sha256:07e3ff49bc362e6abe31f465492ef507ed13e471be9d6d82e5915658ca3426f6",
+      "hash": "sha256:98ad81e0b364655b1039dfd6a9d62e0aacd185dfa3f31ee83c1f8a800fa937be",
       "id": "spot-output-contract",
       "kind": "interface",
       "links": [
@@ -321,7 +323,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:70777e011e96d6b0797b03d61b2c1efa0babebe1a542a1d2b73043e72491b543",
+      "hash": "sha256:5ca169108ae1274e462ef60bd00032eb7c4e0bcfdf6b7b262f9185b03a8d9e60",
       "id": "spot-validation",
       "kind": "subsystem",
       "links": [
@@ -390,7 +392,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:9a2da65638fd93bd7dc66d89ef89b236fa4439ed1285102dec25872443b9ca0e",
+      "hash": "sha256:653613a0e8158c55a27e34757c1a1ef996f815b45aa95a2b9a5e1f5cc7b97d29",
       "id": "windows-build-setup",
       "kind": "howto",
       "links": [
