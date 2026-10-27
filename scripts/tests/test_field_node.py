@@ -1183,6 +1183,30 @@ class ReportTests(unittest.TestCase):
         s = summ(recs, interval_s=60, min_days=0.001, min_availability=0.20)
         self.assert_gap_buckets(s, up=70, down=50, counter=50)
 
+    def test_successive_gap_recoveries_union_their_backdated_excess(self):
+        # Samples at 0, 60, 400 and 740 s; both inputs fail at 10 s, A
+        # recovers in the first gap (390 s), B in the second (730 s). Both
+        # recoveries backdate the same 50 s into (0, 60]: it is down once
+        # (MAN-292 review round 3).
+        recs = make_ledger(days=3 * 60 / DAY, step=60)
+        samples = [r for r in recs if r["kind"] == "sample"]
+        for i, (sample, offset) in enumerate(zip(samples, (0, 60, 400, 740))):
+            sample["ts"] = T0 + offset
+            sample["source_down_s"] = {"a": 0, "b": 0}
+            sample["source_outages"] = {"a": 0, "b": 0}
+            if i in (1, 2):
+                sample.update(healthz=503, source_health={"a": 0, "b": 0})
+        samples[2].update(source_down_s={"a": 390, "b": 0}, source_outages={"a": 1, "b": 0},
+                          source_health={"a": 1, "b": 0})
+        samples[3].update(source_down_s={"a": 390, "b": 730}, source_outages={"a": 1, "b": 1})
+        recs[-1]["ts"] = T0 + 800
+        s = summ(recs, interval_s=60)
+        self.assertAlmostEqual(s["unobserved_s"], 680)
+        self.assertAlmostEqual(s["down_s"], 50)
+        self.assertAlmostEqual(s["counter_down_s"], 50)
+        # (0, 60] keeps 10 s; (740, 800] up to the end note is healthy.
+        self.assertAlmostEqual(s["up_s"], 70)
+
     def test_outage_reconciles_through_mixed_down_and_gap_run(self):
         for delta, extra in ((510, 50), (460, 0)):
             with self.subTest(delta=delta):
