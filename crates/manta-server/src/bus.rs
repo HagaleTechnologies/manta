@@ -12,7 +12,13 @@
 //! [`SpotBus::subscribe_json`], which carries every spot plus, with
 //! `[rbn_compare]` enabled, each `spotGrade` record in publish order. With
 //! no grades published the JSON channel carries exactly the spots.
+//!
+//! A fourth channel carries relayed spots (MAN-320) to the RBN uplink only:
+//! [`SpotBus::publish_relay`] / [`SpotBus::subscribe_relay`]. Telnet, the
+//! JSON stream and the live-state stream never read it, so another local
+//! program's spots never appear on manta's own outputs.
 
+use crate::relay::RelaySpot;
 use manta_spot::Spot;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -247,6 +253,8 @@ pub struct SpotBus {
     json_tx: broadcast::Sender<JsonItem>,
     /// MAN-324: the live-state stream's own channel.
     live_tx: broadcast::Sender<JsonItem>,
+    /// MAN-320: relayed spots, read by the RBN uplink only.
+    relay_tx: broadcast::Sender<RelaySpot>,
     epoch: SystemTime,
     session_nonce: u128,
     sample_rate_hz: f64,
@@ -276,10 +284,12 @@ impl SpotBus {
         let (tx, _rx) = broadcast::channel(CHANNEL_CAPACITY);
         let (json_tx, _json_rx) = broadcast::channel(CHANNEL_CAPACITY);
         let (live_tx, _live_rx) = broadcast::channel(LIVE_CHANNEL_CAPACITY);
+        let (relay_tx, _relay_rx) = broadcast::channel(CHANNEL_CAPACITY);
         Self {
             tx,
             json_tx,
             live_tx,
+            relay_tx,
             epoch,
             session_nonce,
             sample_rate_hz,
@@ -465,6 +475,20 @@ impl SpotBus {
 
     pub fn subscribe(&self) -> broadcast::Receiver<BusSpot> {
         self.tx.subscribe()
+    }
+
+    /// MAN-320: publishes one relayed spot to the RBN uplink's relay
+    /// receivers. No history, no occurrence count, no sequence number: a
+    /// relayed spot is another decoder's output and touches none of manta's
+    /// own spot state. Returns false (not an error) with no subscriber.
+    pub fn publish_relay(&self, spot: RelaySpot) -> bool {
+        self.relay_tx.send(spot).is_ok()
+    }
+
+    /// MAN-320: a receiver on the relay channel. Only the RBN uplink
+    /// subscribes.
+    pub fn subscribe_relay(&self) -> broadcast::Receiver<RelaySpot> {
+        self.relay_tx.subscribe()
     }
 
     /// Spots and grades in publish order: the JSON/WebSocket stream.
