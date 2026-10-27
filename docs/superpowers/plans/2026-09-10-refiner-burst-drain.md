@@ -17,7 +17,7 @@
 - Run local `codex exec review --uncommitted` before pushing, per this repo's convention for refiner-adjacent changes (MAN-168's PR #178 found three real bugs this way).
 - PR review convergence for this change: rounds 1-5 fix everything reasonable inline; rounds 6-15 fix P1s inline and ticket P2s (per explicit instruction for this ticket, overriding the repo's stricter round-2 default).
 - Auto-merge is on repo-wide for `manta`: run `gh pr merge --auto --squash` immediately after opening the PR.
-- Work happens in the existing worktree at `/Users/thagale/Code/manta-man194` on branch `fix/man194-refiner-burst-drain` (already created off `origin/main`). Do not touch the primary checkout at `/Users/thagale/Code/manta`.
+- Work happens in the existing worktree at `$HOME/Code/manta-man194` on branch `fix/man194-refiner-burst-drain` (already created off `origin/main`). Do not touch the primary checkout at `$HOME/Code/manta`.
 
 ---
 
@@ -496,7 +496,7 @@ Expected: PASS. (`decoder_input_does_not_reset_the_refiner_on_center_drift_alone
 - [ ] **Step 9: Commit**
 
 ```bash
-cd /Users/thagale/Code/manta-man194
+cd $HOME/Code/manta-man194
 git add crates/manta-dsp/src/refine.rs crates/manta-engine/src/track.rs
 git commit -m "$(cat <<'EOF'
 fix(manta-engine,manta-dsp): MAN-194 -- burst-capable decoder_input with delay-compensated hold-back
@@ -1114,12 +1114,12 @@ Expected: no diff. If it fails, run `cargo fmt` and re-run Steps 1-2.
 
 - [ ] **Step 4: Local Codex review**
 
-Run: `codex exec review --uncommitted` from `/Users/thagale/Code/manta-man194` (or against the full diff since branching from `origin/main`, per this repo's convention for refiner-adjacent changes — MAN-168's PR #178 found three real bugs this way). Address any findings before pushing; re-run Steps 1-3 after any fix.
+Run: `codex exec review --uncommitted` from `$HOME/Code/manta-man194` (or against the full diff since branching from `origin/main`, per this repo's convention for refiner-adjacent changes — MAN-168's PR #178 found three real bugs this way). Address any findings before pushing; re-run Steps 1-3 after any fix.
 
 - [ ] **Step 5: Push and open the PR**
 
 ```bash
-cd /Users/thagale/Code/manta-man194
+cd $HOME/Code/manta-man194
 git push -u origin fix/man194-refiner-burst-drain
 gh pr create --title "fix(manta-engine,manta-dsp): MAN-194 -- burst-capable decoder_input with delay-compensated drain" --body "$(cat <<'EOF'
 ## Summary

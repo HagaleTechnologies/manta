@@ -42,7 +42,7 @@
 - [ ] **Step 1: Re-verify the SND frame byte layout with a fresh live capture**
 
 Before writing the parser, confirm the byte layout independently (don't just trust the design spec's inferred layout — it was itself a correction of an earlier wrong assumption, and its own residual-risk note asks for this). Write a small throwaway Rust program (in a scratch directory, e.g. `/tmp` or your session's scratchpad — NOT committed to the repo) using `tungstenite` that:
-1. Connects to a real public KiwiSDR receiver (try `greatlakesreceiver.hopto.me:8073` first — public nodes come and go, if that one's down, search for a current one, e.g. via `http://kiwisdr.com/public/` or a websearch for "kiwisdr public receiver list").
+1. Connects to a real public KiwiSDR receiver (try `<public-kiwisdr-host>:8073` first — public nodes come and go, if that one's down, search for a current one, e.g. via `http://kiwisdr.com/public/` or a websearch for "kiwisdr public receiver list").
 2. Sends the handshake exactly as documented in the Global Constraints above (including keepalive).
 3. Captures several real `SND` frames and prints their exact byte length and a hex dump of the first ~30 bytes.
 4. Confirms: total frame length, whether it's constant across frames, and where the actual I/Q sample data starts (cross-check against the hypothesis: tag(3)+flags(1)+seq(4)+smeter(2)+gps(10)=20 header bytes, then N×4-byte big-endian I/Q pairs).
@@ -120,7 +120,7 @@ Write the actual implementation following this shape — the exact retry/bound p
 #[test]
 #[ignore]
 fn connects_to_a_real_public_receiver_and_streams_iq() {
-    let mut src = KiwiIqSource::connect("greatlakesreceiver.hopto.me", 8073, 14_025_000.0, "")
+    let mut src = KiwiIqSource::connect("<public-kiwisdr-host>", 8073, 14_025_000.0, "")
         .expect("connect to a real public KiwiSDR receiver");
     assert!(
         (src.sample_rate() - 96_000.0).abs() < 1.0,

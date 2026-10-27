@@ -386,8 +386,22 @@ fn oversized_frame_midstream_is_survived() {
             let mut oversized = Vec::with_capacity(64 * 1024 + 4096);
             oversized.extend_from_slice(b"SND");
             oversized.resize(64 * 1024 + 4096, 0);
-            ws.send(Message::binary(oversized))
-                .map_err(|e| format!("sending the oversized frame: {e}"))?;
+            // MAN-435: the client rejects the frame from its header and
+            // drops the connection with the body still unread, so this
+            // write can race that reset (ECONNRESET, os error 54, on
+            // macOS CI). A peer-close here is the expected rejection, not
+            // a fixture failure; the daemon's own assertions below decide.
+            match ws.send(Message::binary(oversized)) {
+                Ok(()) => {}
+                Err(tungstenite::Error::Io(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                    ) => {}
+                Err(e) => return Err(format!("sending the oversized frame: {e}")),
+            }
             // Ends when a send fails on the connection the client dropped.
             // How soon is up to the OS; the acceptor serves the reconnect
             // either way.
