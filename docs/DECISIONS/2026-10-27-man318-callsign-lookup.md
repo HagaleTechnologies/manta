@@ -130,3 +130,7 @@ logged; neither the password nor the session key appears in any log line.
 - Persisting the cache under `[spot].list_cache_dir` across restarts.
 - HTTPS for MAN-316's list downloads through `ureq`.
 - A `/status` field, if operators ask for one.
+- The Windows `+crt-static` comment in `.github/workflows/release-publish.yml`
+  still says `cargo build -p manta-cli` compiles no C code; since D4, ring
+  does. Left out of this change, with the `wiki/INDEX.md` entry for this
+  record, to keep the PR within its 40-file limit.

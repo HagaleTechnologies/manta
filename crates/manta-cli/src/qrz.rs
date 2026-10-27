@@ -70,7 +70,10 @@ fn element<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
 
 /// QRZ text, safe to log: control characters replaced, at most 200 chars.
 fn scrub(text: &str) -> String {
-    crate::list_http::printable(&text.chars().take(ERROR_TEXT_CHARS).collect::<String>())
+    text.chars()
+        .take(ERROR_TEXT_CHARS)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 fn parse(xml: &str) -> Result<Reply, Failure> {
@@ -251,6 +254,12 @@ pub(crate) mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    #[test]
+    fn scrub_replaces_control_characters_and_keeps_200_chars() {
+        assert_eq!(scrub("bad\x1b[2J\r\nkey"), "bad?[2J??key");
+        assert_eq!(scrub(&"x".repeat(250)).chars().count(), ERROR_TEXT_CHARS);
+    }
 
     // ---- parsing: bodies from QRZ's spec and from live replies ----
 

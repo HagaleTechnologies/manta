@@ -451,7 +451,7 @@ struct Head {
 /// `text` with every control character (an escape sequence's ESC, say)
 /// replaced by `?`. The status line and header values reach the log, and
 /// over plain HTTP anyone on the path can write them.
-pub(crate) fn printable(text: &str) -> String {
+fn printable(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { '?' } else { c })
         .collect()
