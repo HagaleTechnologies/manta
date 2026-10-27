@@ -19,8 +19,10 @@ are. See `docs/RUNBOOKS/uplink-health.md`.
 Everything above is inbound. manta's *outbound* connections are the
 `[[rbn_uplink]]` targets (covered by
 [MAN-23's threat model](../DECISIONS/2026-09-02-man23-threat-model.md)),
-the `[rbn_compare]` telnet feed and the MAN-316 cty.dat/MASTER.SCP
-refresh (plain `http://`, see `docs/CONFIG.md`'s `refresh_lists`) —
+the `[rbn_compare]` telnet feed, the MAN-316 cty.dat/MASTER.SCP
+refresh (plain `http://`, see `docs/CONFIG.md`'s `refresh_lists`), the
+`[callsign_lookup]` QRZ.com client (MAN-318: HTTPS to `xmldata.qrz.com:443`,
+honouring `HTTPS_PROXY`; allow that egress when the table is enabled) —
 and the KiwiSDR client (`--kiwi-host` / `[input] type = "kiwi"`),
 which connects to an operator-chosen, third-party-operated receiver
 over plaintext `ws://` — including its optional password. Follow the
@@ -128,7 +130,8 @@ or transport-integrity enforcement when paired with one of:
 
 If you want transport integrity (not just access restriction) for
 WebSocket consumers specifically, terminate TLS in a reverse proxy in
-front of the JSON/WS port — manta itself has no TLS support, matching the
+front of the JSON/WS port — manta's listeners have no TLS support (its only
+TLS is the outbound QRZ.com client of `[callsign_lookup]`, MAN-318), matching the
 DX-cluster ecosystem's own long-standing plaintext convention (see
 `docs/DECISIONS/2026-09-02-man23-threat-model.md`, finding 20) — **and
 block direct external access to manta's own plaintext port**, per the

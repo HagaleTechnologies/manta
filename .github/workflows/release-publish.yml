@@ -185,12 +185,12 @@ jobs:
             # that. Static CRT rather than bundling Microsoft's
             # redistributable installer: bundling adds a redistribution
             # question and an install step to the one path whose entire
-            # point is unpack-and-run. Safe for this dependency graph:
-            # `cargo build -p manta-cli` compiles no C code on Windows (the
-            # only cc-using crate in Cargo.lock, `alloca`, is reachable
-            # only through criterion, a dev-dependency), and Windows
-            # platform access goes through windows-sys import libraries
-            # against system DLLs.
+            # point is unpack-and-run. Since MAN-318, `cargo build -p
+            # manta-cli` compiles C and assembly on Windows: ring (rustls's
+            # crypto, for the QRZ.com callsign lookup's HTTPS). cc-rs builds
+            # it with `/MT` under `+crt-static`, and the static-CRT assertion
+            # step below checks the result. Windows platform access goes
+            # through windows-sys import libraries against system DLLs.
             #
             # Set as a per-matrix-entry RUSTFLAGS rather than
             # .cargo/config.toml: a repo-wide cargo config file changes

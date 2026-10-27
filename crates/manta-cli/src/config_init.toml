@@ -156,6 +156,21 @@
 #exclude_spotters = []                # never count these skimmers; your own callsign is always excluded
 
 
+# --- Callsign lookup (QRZ.com) ------------------------------------------------
+# Spots only callsigns QRZ.com lists. A call QRZ reports as not found is not
+# spotted; a lookup QRZ does not answer within 10 s spots anyway. Answers are
+# kept 24 h. Live sources only: a file replay looks nothing up. Calls on
+# [spot].allowlist are never looked up. Needs a QRZ.com account; QRZ says its
+# XML service needs a Logbook Data subscription beyond testing. Restart-only.
+
+#[callsign_lookup]
+
+#enabled = false
+#qrz_username = ""                    # your QRZ.com user name; required when enabled
+#qrz_password = ""                    # required when enabled; or MANTA_CALLSIGN_LOOKUP_QRZ_PASSWORD
+#qrz_url = "https://xmldata.qrz.com/xml/current/"  # https://; http:// only to a loopback test server
+
+
 # --- Receiver ----------------------------------------------------------------
 # With `type` and every receiver setting commented out, manta listens to
 # the system's default sound card, or to whatever source the command line

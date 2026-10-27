@@ -478,6 +478,7 @@ fn check_prints_one_summary_line_per_table() {
             "server",
             "rbn_uplink",
             "rbn_compare",
+            "callsign_lookup",
             "input",
             "spot",
             "detector",

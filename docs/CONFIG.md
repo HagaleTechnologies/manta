@@ -30,7 +30,8 @@ same seven commands apply the `MANTA_*` variables, though `status` and `health`
 apply them only when `--config` or `MANTA_CONFIG` names a file. `decode`,
 `oracle` and `bench sensitivity` read only the file `--config` names and never
 the environment, so their output does not depend on it. `[[rbn_uplink]]` cannot be
-set from the environment. An unknown table, key or `MANTA_*` variable is an
+set from the environment. `[callsign_lookup]` can, through
+`MANTA_CALLSIGN_LOOKUP_*`, so the QRZ.com password can stay out of the file. An unknown table, key or `MANTA_*` variable is an
 error that names it; `MANTA_GIT_SHA` and `MANTA_FEATURES` are build-time
 variables and are skipped at run time.
 
@@ -53,10 +54,10 @@ listed here change what the command does.
 
 | Command | Tables it applies | Environment |
 |---|---|---|
-| `run` (alias `listen`) | all seven | yes |
+| `run` (alias `listen`) | all eight | yes |
 | `soak` | `[input]` `[spot]` `[detector]` `[decode]`; `[server]` is ignored with a note | yes |
 | `doctor` | `[input]` `[spot]` `[detector]` `[decode]`, plus `[server]`, `[[rbn_uplink]]` and `[rbn_compare]` to check them without starting a server or logging in (MAN-126; see [RUNBOOKS/setup-checks.md](RUNBOOKS/setup-checks.md)) | yes |
-| `config check` | all seven, resolved exactly as `run` resolves them | yes |
+| `config check` | all eight, resolved exactly as `run` resolves them | yes |
 | `check` | `[input]`: the source, `capture_rate_hz` and `center_freq_hz` | yes |
 | `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes, but `MANTA_SERVER_*` only alongside a config file |
 | `health` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon's `/healthz`; a named config that resolves to no `[server]` table is an error | yes, but `MANTA_SERVER_*` only alongside a config file |
@@ -197,6 +198,45 @@ one TCP connection to `feed_host:feed_port`, sending nothing. See
 | `speed_tol_pct` | `20.0` | live: `run` with `[server]`; `grade` | ... and more than this percent of RBN's median speed. |
 | `spotters` | `[]` | live: `run` with `[server]`; `grade` | Only these RBN skimmers count. `--rbn-spotter` replaces it. |
 | `exclude_spotters` | `[]` | live: `run` with `[server]`; `grade` | Never count these skimmers. This station's own callsign is always excluded. |
+
+## [callsign_lookup]
+
+Spots only callsigns QRZ.com lists (MAN-318), off by default. A call QRZ.com
+reports as not found is not spotted on any surface (telnet, JSON/WebSocket,
+the RBN uplink, stdout); stderr says `callsign lookup: <CALL> not spotted:
+QRZ.com does not list it (answer kept 24 h)` and
+`manta_callsign_lookup_withheld_total` counts it. Validation runs every other
+check first and asks QRZ.com last, so a call it would reject anyway costs no
+lookup. A spot waits at most 10 s for an answer: one QRZ.com does not give in
+time, a network error or a refused login spots it anyway, counted in
+`manta_callsign_lookup_unverified_total` (see
+[METRICS.md](METRICS.md#metric-families)). Answers, found or not found, are
+kept 24 h in memory, so a call is looked up at most once a day per run;
+failures are never kept. A held spot is published up to 10 s after its
+`timestamp`, after spots decoded later.
+
+- **Live sources only.** A file replay prints `note: callsign lookup is off
+  for file replay, so the run is repeatable` and looks nothing up. Works with
+  or without `[server]` (without it, no metrics). Restart-only: a SIGHUP that
+  changes the table keeps the running values.
+- **Exempt calls.** Calls on `[spot].allowlist` are never looked up and spot
+  as before. QRZ.com does not list every licensed station: put known
+  exceptions on the allowlist.
+- **Account.** Needs a QRZ.com account; QRZ says its XML service needs a
+  Logbook Data subscription beyond testing. A wrong password makes QRZ.com
+  block the user name for 10 minutes, so manta tries a refused login again
+  only after 600 s (24 h after QRZ's `Connection refused`).
+- **Network.** Outbound HTTPS to `xmldata.qrz.com:443`, honouring
+  `HTTPS_PROXY`. The password and session key go only in TLS POST bodies,
+  never in a URL or a log line. At shutdown a stop waits up to 10 s more for
+  answers still in flight.
+
+| Key | Default | Wired | Notes |
+|---|---|---|---|
+| `enabled` | `false` | live: `run` | `true` withholds spots whose callsign QRZ.com does not list. |
+| `qrz_username` | `""` | live: `run` | Your QRZ.com user name; required when enabled. `MANTA_CALLSIGN_LOOKUP_QRZ_USERNAME` sets it. |
+| `qrz_password` | `""` | live: `run` | Required when enabled. `config check` prints only `set` or `none`. Keep it out of the file with `MANTA_CALLSIGN_LOOKUP_QRZ_PASSWORD`. |
+| `qrz_url` | `"https://xmldata.qrz.com/xml/current/"` | live: `run` | QRZ.com's XML service. Must be `https://`; `http://` is accepted only to a loopback address (`127.0.0.0/8`, `::1`, `localhost`), for tests and local proxies. |
 
 ## [input]
 

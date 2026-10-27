@@ -1665,7 +1665,9 @@ rules:
 1. **No RNG** anywhere in `manta-dsp` / `manta-decode`. (The testkit's
    jitter models use seeded `rand_chacha`; seeds are part of the test vector.)
 2. **No wall clock** in the decode path (§5). All timers are hop/sample
-   counters.
+   counters. The MAN-318 callsign lookup (`[callsign_lookup]`) reads a wall
+   clock and the network, but runs only for live sources, so a run from an
+   IQ file is unaffected.
 3. **Fixed iteration order:** tracks are processed in ascending birth order
    (track_id, a monotonic u32) each hop; channels in ascending index. Any map
    keyed by track/channel in an output-affecting path is a `BTreeMap` or
@@ -2162,8 +2164,8 @@ rather than normative constants of this spec, and
 **Precedence and the environment.** `run`, `soak`, `doctor` and
 `calibrate` resolve every key as: command-line flag, then
 `MANTA_<TABLE>_<KEY>` environment variable (`MANTA_INPUT_FREQ_CORRECTION_PPM` is `input.freq_correction_ppm`;
-`<TABLE>` is one of `SERVER`, `RBN_COMPARE`, `INPUT`, `SPOT`, `DETECTOR`,
-`DECODE`), then the config file, then the default above. `--config`
+`<TABLE>` is one of `SERVER`, `RBN_COMPARE`, `CALLSIGN_LOOKUP`, `INPUT`,
+`SPOT`, `DETECTOR`, `DECODE`), then the config file, then the default above. `--config`
 names the file; without it they read `MANTA_CONFIG`. An environment value is parsed as a
 TOML value (`9300` is an integer, `["W1AW","K1ABC"]` an array), falling
 back to a bare string -- except for the string-typed keys, which are
@@ -2174,14 +2176,16 @@ always taken verbatim: `server.station_callsign`, `server.bind_addr`,
 `input.password`, `input.driver`, `spot.blocklist_path`,
 `spot.notch_path`, `spot.cty_path`, `spot.scp_path`, `spot.pattern_path`,
 `spot.validation_level`, `decode.engine`,
-`detector.crash_filter`, `rbn_compare.feed_host` and
-`rbn_compare.login_callsign`. Relative
+`detector.crash_filter`, `rbn_compare.feed_host`,
+`rbn_compare.login_callsign`, `callsign_lookup.qrz_username`,
+`callsign_lookup.qrz_password` and `callsign_lookup.qrz_url`. Relative
 paths from the file resolve against the file's directory; those from a flag or the
 environment resolve against the working directory. `[[rbn_uplink]]`
 cannot be set from the environment. `[rbn_compare]` (MAN-301) is, like
 `[server]`, operational rather than a decode-core constant, so the key
 block above omits it; its keys and defaults are in
-`docs/RUNBOOKS/rbn-comparison.md`. `calibrate` is the only command that
+`docs/RUNBOOKS/rbn-comparison.md`. `[callsign_lookup]` (MAN-318) is another
+such operational table, documented in `docs/CONFIG.md`. `calibrate` is the only command that
 edits an existing config file, and it writes only `input.freq_correction_ppm`, after
 confirmation (MAN-127,
 `docs/DECISIONS/2026-10-11-man127-calibrate-command.md`).

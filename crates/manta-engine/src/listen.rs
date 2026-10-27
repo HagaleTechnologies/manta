@@ -107,6 +107,10 @@ pub struct ListenObservers {
     /// and steady-state chunk count. Use a fresh observer for each run.
     /// `None` skips all lifecycle reads and stores. Stores are relaxed atomics.
     pub track_lifecycle: Option<Arc<crate::TrackLifecycleObserver>>,
+    /// MAN-318: validation's last step asks it whether a call exists;
+    /// `None` (the default) skips the step, so `listen()`'s existing
+    /// callers pay nothing.
+    pub callsign_lookup: Option<Arc<dyn manta_spot::CallsignLookup>>,
 }
 
 /// MAN-314: the decode loop's currently marked RTTY signals, calibrated.
@@ -475,6 +479,23 @@ struct EmitCtx<'a> {
     references: Option<ReferenceWatch>,
 }
 
+/// MAN-318: when decoding ends, settles every spot still held for its
+/// callsign lookup (each waits at most its own deadline) and hands the
+/// released ones to `on_spot`, with their decisions.
+fn settle_lookups(
+    validator: &mut Validator,
+    ctx: &mut EmitCtx<'_>,
+    on_spot: &mut impl FnMut(&crate::Spot),
+) {
+    for spot in validator.finish_lookups() {
+        on_spot(&spot);
+    }
+    if let Some(tap) = ctx.live.as_mut() {
+        tap.decisions(validator.take_decisions());
+        tap.end_batch(validator);
+    }
+}
+
 fn emit(
     events: Vec<DecoderEvent>,
     validator: &mut Validator,
@@ -523,7 +544,13 @@ fn emit(
             }
         }
     }
+    // MAN-318: spots whose callsign lookup settled since the last batch,
+    // with their decisions, after the batch's own.
+    for spot in validator.poll_lookups() {
+        on_spot(&spot);
+    }
     if let Some(tap) = ctx.live.as_mut() {
+        tap.decisions(validator.take_decisions());
         tap.end_batch(validator);
     }
     // MAN-118: once per batch. The validator's repetition counts are
@@ -645,6 +672,9 @@ pub fn listen_with_observers(
     let guard_hz = effective_guard_hz(cfg.detector.guard_hz, src.analytic_guard_hz());
 
     let mut validator = cfg.validator(fs)?;
+    if let Some(lookup) = &observers.callsign_lookup {
+        validator.set_callsign_lookup(lookup.clone());
+    }
     let references = observers
         .reference_lists
         .clone()
@@ -911,6 +941,7 @@ pub fn listen_with_observers(
                     obs.clear_active();
                 }
                 rtty.restart(seg_base + seg_consumed);
+                settle_lookups(&mut validator, &mut ctx, &mut on_spot);
                 on_tracks(0);
                 return Err(e);
             }
@@ -1033,6 +1064,7 @@ pub fn listen_with_observers(
         &mut on_event,
         &mut on_spot,
     );
+    settle_lookups(&mut validator, &mut ctx, &mut on_spot);
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     report_bad_samples(bad_base + seg.ch.bad_samples());
     // `finish()` flushes and drops every decoder and closes every remaining
@@ -1106,6 +1138,9 @@ impl<'a> Back<'a> {
             .live_state
             .clone()
             .map(|sink| LiveTap::new(sink, rate_hz, 1.0));
+        if let Some(lookup) = &shared.callsign_lookup {
+            validator.set_callsign_lookup(lookup.clone());
+        }
         Self {
             validator,
             ctx: EmitCtx {
@@ -1187,6 +1222,12 @@ impl<'a> Back<'a> {
             tap.publish_band(band);
         }
         self.report_suppressions();
+    }
+
+    /// MAN-318: every input has ended: settles the spots still held for
+    /// their callsign lookups, as `listen_with_observers` does at its end.
+    pub(crate) fn finish_lookups(&mut self, on_spot: &mut impl FnMut(&crate::Spot)) {
+        settle_lookups(&mut self.validator, &mut self.ctx, on_spot);
     }
 
     /// An input has ended. One that errored or panicked sent no `finish()`

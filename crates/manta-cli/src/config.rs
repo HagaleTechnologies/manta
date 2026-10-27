@@ -26,6 +26,7 @@ pub(crate) const KNOWN_TABLES: &[&str] = &[
     "server",
     "rbn_uplink",
     "rbn_compare",
+    "callsign_lookup",
     "input",
     "spot",
     "detector",
@@ -59,6 +60,7 @@ pub(crate) const ENV_CONFIG: &str = "MANTA_CONFIG";
 const ENV_TABLES: &[(&str, &str)] = &[
     ("SERVER_", "server"),
     ("RBN_COMPARE_", "rbn_compare"),
+    ("CALLSIGN_LOOKUP_", "callsign_lookup"),
     ("INPUT_", "input"),
     ("SPOT_", "spot"),
     ("DETECTOR_", "detector"),
@@ -80,6 +82,10 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("server", "operator_grid"),
     ("rbn_compare", "feed_host"),
     ("rbn_compare", "login_callsign"),
+    // MAN-318: a numeric user name or password stays a string.
+    ("callsign_lookup", "qrz_username"),
+    ("callsign_lookup", "qrz_password"),
+    ("callsign_lookup", "qrz_url"),
     ("input", "type"),
     ("input", "device"),
     ("input", "path"),
@@ -145,6 +151,9 @@ pub(crate) struct Loaded {
     /// --config` reads its tolerances. `run` merges `--rbn-compare`/
     /// `--rbn-spotter` over it in `resolve`.
     pub rbn_compare: Option<RbnCompareConfig>,
+    /// MAN-318: `[callsign_lookup]` as written, validated (`None` when the
+    /// table is absent; present even when `enabled = false`).
+    pub callsign_lookup: Option<CallsignLookupConfig>,
     pub decode: DecodeConfig,
     pub detector: DetectorConfig,
     pub spot: SpotFile,
@@ -164,6 +173,108 @@ pub(crate) struct Loaded {
     /// Stderr notes about the file itself (an inert table), printed by the
     /// caller with `resolve`'s merge notes.
     pub notes: Vec<String>,
+}
+
+/// MAN-318: `[callsign_lookup]`: withhold a spot whose callsign QRZ.com does
+/// not list. Restart-only; live sources only. See
+/// docs/DECISIONS/2026-10-27-man318-callsign-lookup.md.
+#[derive(Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub(crate) struct CallsignLookupConfig {
+    pub enabled: bool,
+    pub qrz_username: String,
+    pub qrz_password: String,
+    pub qrz_url: String,
+}
+
+impl Default for CallsignLookupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            qrz_username: String::new(),
+            qrz_password: String::new(),
+            qrz_url: crate::qrz::DEFAULT_URL.to_string(),
+        }
+    }
+}
+
+/// Never prints the password.
+impl std::fmt::Debug for CallsignLookupConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallsignLookupConfig")
+            .field("enabled", &self.enabled)
+            .field("qrz_username", &self.qrz_username)
+            .field(
+                "qrz_password",
+                &if self.qrz_password.is_empty() {
+                    "none"
+                } else {
+                    "set"
+                },
+            )
+            .field("qrz_url", &self.qrz_url)
+            .finish()
+    }
+}
+
+impl CallsignLookupConfig {
+    /// D11: enabled needs both credentials; `qrz_url` is `https://`, or
+    /// `http://` to a loopback host only (the password must not cross a
+    /// network in cleartext).
+    pub(crate) fn validate(&self) -> std::result::Result<(), String> {
+        if self.enabled {
+            for (key, value) in [
+                ("qrz_username", &self.qrz_username),
+                ("qrz_password", &self.qrz_password),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(format!(
+                        "[callsign_lookup] is enabled but {key} is empty -- set your QRZ.com \
+                         user name and password (or MANTA_CALLSIGN_LOOKUP_QRZ_USERNAME / \
+                         MANTA_CALLSIGN_LOOKUP_QRZ_PASSWORD)"
+                    ));
+                }
+            }
+        }
+        if !qrz_url_allowed(&self.qrz_url) {
+            return Err(format!(
+                "[callsign_lookup].qrz_url must be an https:// URL (http:// only to a loopback \
+                 address such as 127.0.0.1), got {:?}",
+                self.qrz_url
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `https://<host>...`, or `http://` to `localhost`, `127.0.0.0/8` or `::1`.
+fn qrz_url_allowed(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("https://") {
+        return !rest.is_empty() && !rest.starts_with('/');
+    }
+    let Some(rest) = lower.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return false;
+    }
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        match v6.split_once(']') {
+            Some((h, _)) => h,
+            None => return false,
+        }
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+    if host == "localhost" {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
 }
 
 /// `[spot]`, with relative file paths already resolved (file values against
@@ -584,6 +695,12 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
                 .map_err(|e| anyhow!("{origin}: {e}{}", overlay.suffix("rbn_compare")))?,
         }
     }
+    let callsign_lookup =
+        take_typed::<CallsignLookupConfig>(&doc, "callsign_lookup", &origin, &overlay)?;
+    if let Some(cl) = &callsign_lookup {
+        cl.validate()
+            .map_err(|e| anyhow!("{origin}: {e}{}", overlay.suffix("callsign_lookup")))?;
+    }
     let decode_toml =
         take_typed::<DecodeConfigToml>(&doc, "decode", &origin, &overlay)?.unwrap_or_default();
     let decode = crate::validate_decode_config(decode_toml.into_decode_config(), &origin)?;
@@ -675,6 +792,7 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         server,
         rbn_uplink,
         rbn_compare,
+        callsign_lookup,
         decode,
         detector,
         spot,
@@ -1564,7 +1682,7 @@ fn apply_env_overlay(doc: &mut toml::Table, vars: &[(OsString, OsString)]) -> Re
         }) else {
             bail!(
                 "unrecognized environment variable {name} (manta reads {ENV_CONFIG} and \
-                 MANTA_<SERVER|RBN_COMPARE|INPUT|SPOT|DETECTOR|DECODE>_<KEY>)"
+                 MANTA_<SERVER|RBN_COMPARE|CALLSIGN_LOOKUP|INPUT|SPOT|DETECTOR|DECODE>_<KEY>)"
             );
         };
         let Some(value) = value.to_str() else {
@@ -3660,13 +3778,123 @@ mod tests {
         let err = err_of("[telemetry]\nx = 1\n");
         assert!(
             err.ends_with(
-                "-- manta reads [server], [[rbn_uplink]], [rbn_compare], [input], [spot], \
-                 [detector], [decode]"
+                "-- manta reads [server], [[rbn_uplink]], [rbn_compare], [callsign_lookup], \
+                 [input], [spot], [detector], [decode]"
             ),
             "{err}"
         );
         let err = err_of("[rbn_compar]\nenabled = true\n");
         assert!(err.contains("did you mean [rbn_compare]?"), "{err}");
+    }
+
+    // ---- MAN-318: [callsign_lookup] ----
+
+    const LOOKUP_ON: &str = "[callsign_lookup]\nenabled = true\nqrz_username = \"N1TEST\"\n\
+                             qrz_password = \"p&ss;w=rd\"\n";
+
+    #[test]
+    fn callsign_lookup_absent_is_none() {
+        assert!(load_env(Some(SERVER), &[])
+            .unwrap()
+            .callsign_lookup
+            .is_none());
+    }
+
+    #[test]
+    fn callsign_lookup_present_but_disabled_is_some() {
+        let loaded = load_env(Some("[callsign_lookup]\n"), &[]).unwrap();
+        assert_eq!(
+            loaded.callsign_lookup,
+            Some(CallsignLookupConfig::default())
+        );
+        assert_eq!(
+            loaded.callsign_lookup.unwrap().qrz_url,
+            "https://xmldata.qrz.com/xml/current/"
+        );
+        let on = load_env(Some(LOOKUP_ON), &[])
+            .unwrap()
+            .callsign_lookup
+            .unwrap();
+        assert!(on.enabled);
+        assert_eq!(on.qrz_username, "N1TEST");
+        assert_eq!(on.qrz_password, "p&ss;w=rd");
+        assert!(
+            !format!("{on:?}").contains("p&ss"),
+            "Debug hides the password"
+        );
+    }
+
+    #[test]
+    fn enabled_lookup_needs_a_username_and_password() {
+        let err = err_of("[callsign_lookup]\nenabled = true\nqrz_username = \"N1TEST\"\n");
+        assert!(
+            err.contains(
+                "[callsign_lookup] is enabled but qrz_password is empty -- set your QRZ.com \
+                 user name and password (or MANTA_CALLSIGN_LOOKUP_QRZ_USERNAME / \
+                 MANTA_CALLSIGN_LOOKUP_QRZ_PASSWORD)"
+            ),
+            "{err}"
+        );
+        let err = err_of("[callsign_lookup]\nenabled = true\nqrz_password = \"x\"\n");
+        assert!(err.contains("but qrz_username is empty"), "{err}");
+        // Disabled, empty credentials are fine.
+        assert!(load_env(Some("[callsign_lookup]\nenabled = false\n"), &[]).is_ok());
+    }
+
+    #[test]
+    fn qrz_url_must_be_https_or_loopback_http() {
+        for ok in [
+            "https://xmldata.qrz.com/xml/current/",
+            "http://127.0.0.1:9/x/",
+            "http://[::1]:9/",
+            "http://localhost:9/",
+        ] {
+            let body = format!("{LOOKUP_ON}qrz_url = \"{ok}\"\n");
+            assert!(load_env(Some(&body), &[]).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://xmldata.qrz.com/xml/current/",
+            "ftp://xmldata.qrz.com/",
+            "http://127.0.0.1@evil.example/",
+            "http://localhost.evil.example/",
+        ] {
+            let body = format!("{LOOKUP_ON}qrz_url = \"{bad}\"\n");
+            let err = err_of(&body);
+            assert!(
+                err.contains(&format!(
+                    "[callsign_lookup].qrz_url must be an https:// URL (http:// only to a \
+                     loopback address such as 127.0.0.1), got \"{bad}\""
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_environment_sets_the_qrz_password_verbatim() {
+        let loaded = load_env(
+            Some("[callsign_lookup]\nenabled = true\nqrz_username = \"N1TEST\"\n"),
+            &[("MANTA_CALLSIGN_LOOKUP_QRZ_PASSWORD", "12345678")],
+        )
+        .unwrap();
+        assert_eq!(loaded.callsign_lookup.unwrap().qrz_password, "12345678");
+        assert_eq!(
+            loaded.env_vars,
+            vec!["MANTA_CALLSIGN_LOOKUP_QRZ_PASSWORD".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_unknown_callsign_lookup_key_is_refused() {
+        let err = err_of("[callsign_lookup]\nservice = \"hamqth\"\n");
+        assert!(err.contains("[callsign_lookup]"), "{err}");
+        assert!(err.contains("unknown field `service`"), "{err}");
+    }
+
+    #[test]
+    fn unknown_table_message_lists_callsign_lookup() {
+        let err = err_of("[callsign_lookups]\nenabled = true\n");
+        assert!(err.contains("did you mean [callsign_lookup]?"), "{err}");
     }
 
     #[test]

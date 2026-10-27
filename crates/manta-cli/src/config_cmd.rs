@@ -400,6 +400,25 @@ fn rbn_compare_summary(rc: &manta_server::config::RbnCompareConfig, station: &st
     )
 }
 
+/// MAN-318: the password prints only as `set`/`none`.
+fn callsign_lookup_summary(cl: &crate::config::CallsignLookupConfig) -> String {
+    format!(
+        "callsign_lookup: enabled={} qrz_username={} qrz_password={} qrz_url={}",
+        cl.enabled,
+        if cl.qrz_username.is_empty() {
+            "none"
+        } else {
+            &cl.qrz_username
+        },
+        if cl.qrz_password.is_empty() {
+            "none"
+        } else {
+            "set"
+        },
+        cl.qrz_url
+    )
+}
+
 fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
     let mut lines = vec![origin_line.to_string()];
     lines.push(if loaded.env_vars.is_empty() {
@@ -513,6 +532,11 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
     lines.push(match &loaded.rbn_compare {
         None => "rbn_compare: none".to_string(),
         Some(rc) => rbn_compare_summary(rc, station),
+    });
+
+    lines.push(match &loaded.callsign_lookup {
+        None => "callsign_lookup: none".to_string(),
+        Some(cl) => callsign_lookup_summary(cl),
     });
 
     // MAN-13: one `input <name>:` line per entry when there are several;
@@ -1224,6 +1248,24 @@ mod tests {
         for l in &lines {
             assert!(!l.contains("hunter2secret"), "{l}");
         }
+    }
+
+    #[test]
+    fn summary_never_prints_the_qrz_password() {
+        let lines = lines_of(
+            "[callsign_lookup]\nenabled = true\nqrz_username = \"N1TEST\"\n\
+             qrz_password = \"hunter2secret\"\n",
+        );
+        assert_eq!(
+            line(&lines, "callsign_lookup:"),
+            "callsign_lookup: enabled=true qrz_username=N1TEST qrz_password=set \
+             qrz_url=https://xmldata.qrz.com/xml/current/"
+        );
+        for l in &lines {
+            assert!(!l.contains("hunter2secret"), "{l}");
+        }
+        let lines = lines_of("[input]\ntype = \"audio\"\n");
+        assert_eq!(line(&lines, "callsign_lookup:"), "callsign_lookup: none");
     }
 
     #[test]

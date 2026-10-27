@@ -263,6 +263,53 @@ impl ListRefreshOutcome {
     }
 }
 
+/// MAN-318: one callsign request's result -- the `outcome` label of
+/// `manta_callsign_lookups_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallsignLookupOutcome {
+    /// QRZ.com lists the call.
+    Found,
+    /// QRZ.com answered that it does not list the call.
+    NotFound,
+    /// No answer: a timeout, a network or HTTP error, a refused login, or
+    /// skipped while lookups pause after one of those.
+    Failed,
+}
+
+impl CallsignLookupOutcome {
+    /// Render order of `manta_callsign_lookups_total`'s outcomes.
+    const ALL: [CallsignLookupOutcome; 3] = [
+        CallsignLookupOutcome::Found,
+        CallsignLookupOutcome::NotFound,
+        CallsignLookupOutcome::Failed,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CallsignLookupOutcome::Found => "found",
+            CallsignLookupOutcome::NotFound => "not_found",
+            CallsignLookupOutcome::Failed => "failed",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            CallsignLookupOutcome::Found => 0,
+            CallsignLookupOutcome::NotFound => 1,
+            CallsignLookupOutcome::Failed => 2,
+        }
+    }
+}
+
+/// MAN-318: the `manta_callsign_lookup*` series, once the lookup is on.
+#[derive(Debug, Default, Clone, Copy)]
+struct CallsignLookupCounts {
+    /// `manta_callsign_lookups_total`, by `CallsignLookupOutcome::index`.
+    totals: [u64; 3],
+    withheld: u64,
+    unverified: u64,
+}
+
 /// MAN-316: one reference list's series across the three `manta_list_*`
 /// families. Each field is `None` until its setter first runs, so a list
 /// the refresher does not manage publishes no refresh series rather than
@@ -712,6 +759,9 @@ pub struct Metrics {
     /// startup resolution and list refresher. Ordered so `/metrics`
     /// renders the lists in a stable order.
     lists: Mutex<BTreeMap<&'static str, ListMetrics>>,
+    /// MAN-318: `None` until `enable_callsign_lookup`, so a run without
+    /// `[callsign_lookup]` publishes no samples.
+    callsign_lookup: Mutex<Option<CallsignLookupCounts>>,
     /// MAN-128: one handle per configured `[[rbn_uplink]]` target,
     /// registered in config order before `uplink::serve` is spawned for it
     /// (so a never-connected or disabled target still renders). The seven
@@ -1593,6 +1643,41 @@ impl Metrics {
         }
     }
 
+    /// MAN-318: the callsign lookup is on for this run, so its three
+    /// families publish, starting at 0. Idempotent.
+    pub fn enable_callsign_lookup(&self) {
+        self.callsign_lookup_counts()
+            .get_or_insert_with(Default::default);
+    }
+
+    /// MAN-318: counts one callsign request's outcome.
+    pub fn record_callsign_lookup(&self, outcome: CallsignLookupOutcome) {
+        self.callsign_lookup_counts()
+            .get_or_insert_with(Default::default)
+            .totals[outcome.index()] += 1;
+    }
+
+    /// MAN-318: `n` more spots withheld because QRZ.com does not list the call.
+    pub fn record_callsign_lookup_withheld(&self, n: u64) {
+        self.callsign_lookup_counts()
+            .get_or_insert_with(Default::default)
+            .withheld += n;
+    }
+
+    /// MAN-318: `n` more spots published without a QRZ.com answer.
+    pub fn record_callsign_lookup_unverified(&self, n: u64) {
+        self.callsign_lookup_counts()
+            .get_or_insert_with(Default::default)
+            .unverified += n;
+    }
+
+    /// MAN-318: tolerating a poisoned lock, as `list_metrics` does.
+    fn callsign_lookup_counts(&self) -> std::sync::MutexGuard<'_, Option<CallsignLookupCounts>> {
+        self.callsign_lookup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// MAN-316: `list` was last confirmed current at `at` without an
     /// attempt in this run -- the cache's `checked_at`, read at startup.
     pub fn set_list_confirmed_at(&self, list: &'static str, at: SystemTime) {
@@ -2233,6 +2318,41 @@ impl Metrics {
             }
         }
         drop(lists);
+
+        let lookup = *self.callsign_lookup_counts();
+        out.push_str(
+            "# HELP manta_callsign_lookups_total Callsign lookups by outcome: found and not_found are QRZ.com's answers; failed is no answer (none within 10 s, a network or HTTP error, a refused login, or skipped while lookups pause after one of those).\n",
+        );
+        out.push_str("# TYPE manta_callsign_lookups_total counter\n");
+        if let Some(c) = &lookup {
+            for outcome in CallsignLookupOutcome::ALL {
+                out.push_str(&format!(
+                    "manta_callsign_lookups_total{{outcome=\"{}\"}} {}\n",
+                    outcome.label(),
+                    c.totals[outcome.index()]
+                ));
+            }
+        }
+        out.push_str(
+            "# HELP manta_callsign_lookup_withheld_total Spots not published because QRZ.com does not list the callsign (a fresh or a cached answer).\n",
+        );
+        out.push_str("# TYPE manta_callsign_lookup_withheld_total counter\n");
+        if let Some(c) = &lookup {
+            out.push_str(&format!(
+                "manta_callsign_lookup_withheld_total {}\n",
+                c.withheld
+            ));
+        }
+        out.push_str(
+            "# HELP manta_callsign_lookup_unverified_total Spots published without a QRZ.com answer: the lookup failed, was unanswered 10 s after the spot was held, or the lookup queue was full.\n",
+        );
+        out.push_str("# TYPE manta_callsign_lookup_unverified_total counter\n");
+        if let Some(c) = &lookup {
+            out.push_str(&format!(
+                "manta_callsign_lookup_unverified_total {}\n",
+                c.unverified
+            ));
+        }
 
         out.push_str("# HELP manta_uplink_sent_total Spots forwarded to the RBN uplink target.\n");
         out.push_str("# TYPE manta_uplink_sent_total counter\n");
@@ -4372,6 +4492,67 @@ mod tests {
         text.lines()
             .filter(|l| l.starts_with(&format!("{family}{{")))
             .collect()
+    }
+
+    fn callsign_lookup_samples(text: &str) -> Vec<&str> {
+        text.lines()
+            .filter(|l| l.starts_with("manta_callsign_lookup"))
+            .collect()
+    }
+
+    #[test]
+    fn callsign_lookup_families_render_help_without_samples_until_enabled() {
+        let text = Metrics::new().render_prometheus_text();
+        for family in [
+            "manta_callsign_lookups_total",
+            "manta_callsign_lookup_withheld_total",
+            "manta_callsign_lookup_unverified_total",
+        ] {
+            assert!(
+                text.contains(&format!("# TYPE {family} counter\n")),
+                "{family}"
+            );
+        }
+        assert!(callsign_lookup_samples(&text).is_empty());
+    }
+
+    #[test]
+    fn callsign_lookup_series_start_at_zero_when_enabled() {
+        let m = Metrics::new();
+        m.enable_callsign_lookup();
+        assert_eq!(
+            callsign_lookup_samples(&m.render_prometheus_text()),
+            [
+                r#"manta_callsign_lookups_total{outcome="found"} 0"#,
+                r#"manta_callsign_lookups_total{outcome="not_found"} 0"#,
+                r#"manta_callsign_lookups_total{outcome="failed"} 0"#,
+                "manta_callsign_lookup_withheld_total 0",
+                "manta_callsign_lookup_unverified_total 0",
+            ]
+        );
+    }
+
+    #[test]
+    fn callsign_lookup_counts_accumulate() {
+        let m = Metrics::new();
+        m.enable_callsign_lookup();
+        m.record_callsign_lookup(CallsignLookupOutcome::Found);
+        m.record_callsign_lookup(CallsignLookupOutcome::Found);
+        m.record_callsign_lookup(CallsignLookupOutcome::NotFound);
+        m.record_callsign_lookup(CallsignLookupOutcome::Failed);
+        m.record_callsign_lookup_withheld(3);
+        m.record_callsign_lookup_unverified(2);
+        m.enable_callsign_lookup(); // idempotent: keeps the counts
+        assert_eq!(
+            callsign_lookup_samples(&m.render_prometheus_text()),
+            [
+                r#"manta_callsign_lookups_total{outcome="found"} 2"#,
+                r#"manta_callsign_lookups_total{outcome="not_found"} 1"#,
+                r#"manta_callsign_lookups_total{outcome="failed"} 1"#,
+                "manta_callsign_lookup_withheld_total 3",
+                "manta_callsign_lookup_unverified_total 2",
+            ]
+        );
     }
 
     #[test]

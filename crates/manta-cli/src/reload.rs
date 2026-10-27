@@ -922,6 +922,37 @@ blocklist_path = \"bl.txt\"
         );
     }
 
+    /// MAN-318: every `[callsign_lookup]` key needs a restart.
+    #[test]
+    fn callsign_lookup_changes_need_a_restart() {
+        let f = start(
+            &format!("{BASE}\n[callsign_lookup]\nenabled = false\n"),
+            CliOverrides::none(),
+        );
+        write(
+            &f.path("manta.toml"),
+            &format!(
+                "{BASE}\n[callsign_lookup]\nenabled = true\nqrz_username = \"N1TEST\"\n\
+                 qrz_password = \"pw\"\n"
+            ),
+        );
+        let report = applied(&f.ctx);
+        assert_eq!(
+            report.restart_needed,
+            vec![
+                "callsign_lookup.enabled",
+                "callsign_lookup.qrz_password",
+                "callsign_lookup.qrz_username"
+            ]
+        );
+        let old = table("[callsign_lookup]\nenabled = true\n");
+        let new = table("[callsign_lookup]\nenabled = false\n");
+        assert_eq!(
+            restart_only_changes(&old, &new),
+            vec!["callsign_lookup.enabled"]
+        );
+    }
+
     #[test]
     fn restart_only_changes_reports_a_server_key() {
         let old = table("[server]\ntelnet_port = 7300\n");
