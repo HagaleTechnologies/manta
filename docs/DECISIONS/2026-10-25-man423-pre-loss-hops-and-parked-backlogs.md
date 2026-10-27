@@ -106,9 +106,16 @@ unaccounted pause as missing would run every later timestamp ahead by what
 they hold (and count a later overflow gap again). On a restart while a
 window is open, `restart_outage` receives the socket's backlog without
 blocking (at most `MAX_BUFFERED_DATAGRAMS`, kept in `look_ahead` and handled
-next as if just received), takes how far DDC0's increasing sequence runs past
-the restart, and reports `(now - from) - accounted / fs` less that many
-datagrams' time. Outside a window the estimate is the old `since_last`.
+next as if just received), counts the radio time every queued DDC0
+datagram represents -- judged by a copy of the sequence tracker, so a
+plausible gap counts its lost datagrams, a stale one nothing, and a further
+restart in the backlog only itself -- and reports `(now - from) - accounted /
+fs` less that time. A later restart among those datagrams measures the same
+way over what is still queued, so the pause is assigned once however many
+restarts it holds (second review round:
+`two_restarts_behind_a_park_assign_the_pause_once`, two 60-datagram runs; the
+first version counted only the run up to the next restart, leaving the
+second run's 14,280 samples ahead). Outside a window the estimate is the old `since_last`.
 Test `an_early_restart_behind_a_park_does_not_count_its_backlog_twice`: five
 pre-restart datagrams, then 0..=119 with 20 lost, behind a 0.5 s pause; every
 sample accounted after the pause adds up to the pause's wall clock (before:

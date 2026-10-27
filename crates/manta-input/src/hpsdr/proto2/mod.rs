@@ -421,7 +421,7 @@ impl Protocol2IqSource {
             wire::SeqEvent::Gap(k)
                 if u64::from(k) > plausible_lost_datagrams(since_last, self.sample_rate_hz) =>
             {
-                let outage = self.restart_outage(since_last, seq);
+                let outage = self.restart_outage(since_last);
                 self.report_restart(outage)
             }
             wire::SeqEvent::Gap(k) => {
@@ -436,7 +436,7 @@ impl Protocol2IqSource {
                 missing
             }
             wire::SeqEvent::Restart => {
-                let outage = self.restart_outage(since_last, seq);
+                let outage = self.restart_outage(since_last);
                 self.report_restart(outage)
             }
         };
@@ -467,38 +467,38 @@ impl Protocol2IqSource {
         }
     }
 
-    /// MAN-423 review: the outage a restart at `seq` reports. Outside a
-    /// park it is `since_last`. While a parked backlog drains, the pause is
-    /// only an upper bound: a radio that restarted early in the pause kept
-    /// streaming, and its post-restart datagrams still wait on the socket,
-    /// so the whole pause read as missing would run every later timestamp
-    /// ahead by what they hold (and count a later overflow gap twice). The
-    /// backlog is received now, without blocking: the highest sequence of
-    /// its increasing post-restart run says how many datagrams the radio has
-    /// sent since `seq`, and only the unaccounted time beyond those is the
-    /// outage. The datagrams are handled afterwards as if just received.
-    fn restart_outage(&mut self, since_last: Duration, seq: u32) -> Duration {
+    /// MAN-423 review: the outage a restart reports. Outside a park it is
+    /// `since_last`. While a parked backlog drains, the pause is only an
+    /// upper bound: a radio that restarted early in the pause kept
+    /// streaming, and what it sent since still waits on the socket (or in
+    /// `look_ahead`), so the whole pause read as missing would run every
+    /// later timestamp ahead by what that backlog holds (and count a later
+    /// overflow gap twice). The backlog is received now, without blocking,
+    /// and the radio time it represents -- every queued datagram, across any
+    /// further restarts in it -- comes off the unaccounted pause. The
+    /// datagrams are handled afterwards as if just received; a later
+    /// restart among them measures the same way, so the pause is assigned
+    /// exactly once.
+    fn restart_outage(&mut self, since_last: Duration) -> Duration {
         if self.parked.is_none() {
             return since_last;
         }
-        let sent_since = self.receive_backlog(seq);
+        self.receive_backlog();
+        let bound = self.unaccounted(Instant::now());
         let covered = Duration::from_secs_f64(
-            sent_since as f64 * wire::SAMPLES_PER_DATAGRAM as f64 / self.sample_rate_hz,
+            self.backlog_datagrams(bound) as f64 * wire::SAMPLES_PER_DATAGRAM as f64
+                / self.sample_rate_hz,
         );
-        self.unaccounted(Instant::now()).saturating_sub(covered)
+        bound.saturating_sub(covered)
     }
 
-    /// Receive what the socket already holds into `look_ahead` (at most
-    /// [`MAX_BUFFERED_DATAGRAMS`]) and return how far DDC0's sequence runs
-    /// past `restart_seq` while it keeps increasing. A socket that cannot be
-    /// made non-blocking reads as no backlog (the pause bound then stands).
-    fn receive_backlog(&mut self, restart_seq: u32) -> u64 {
+    /// Receive what the socket already holds into `look_ahead`, up to
+    /// [`MAX_BUFFERED_DATAGRAMS`] queued. A socket that cannot be made
+    /// non-blocking adds nothing (the pause bound then stands).
+    fn receive_backlog(&mut self) {
         if self.socket.set_nonblocking(true).is_err() {
-            return 0;
+            return;
         }
-        let mut last = restart_seq;
-        let mut increasing = true;
-        let mut scratch = Vec::with_capacity(wire::SAMPLES_PER_DATAGRAM);
         let mut buf = vec![0u8; RECV_BUF_LEN];
         while self.look_ahead.len() < MAX_BUFFERED_DATAGRAMS as usize {
             let Ok((len, from)) = self.socket.recv_from(&mut buf) else {
@@ -506,22 +506,39 @@ impl Protocol2IqSource {
                 // next blocking receive.
                 break;
             };
-            if increasing && self.is_ddc0(from) {
-                scratch.clear();
-                if let Ok(s) = wire::parse_iq_datagram(&buf[..len], &mut scratch) {
-                    if (s.wrapping_sub(last) as i32) > 0 {
-                        last = s;
-                    } else {
-                        increasing = false;
-                    }
-                }
-            }
             self.look_ahead.push_back((buf[..len].to_vec(), from));
         }
         // A failure here leaves the socket non-blocking; the next receive
         // reports it as an error rather than waiting.
         let _ = self.socket.set_nonblocking(false);
-        u64::from(last.wrapping_sub(restart_seq))
+    }
+
+    /// The datagrams of radio time `look_ahead`'s DDC0 IQ represents after
+    /// the current one, judged as `handle_iq` will judge them (a copy of the
+    /// tracker): each accepted datagram is one, a plausible gap also counts
+    /// its lost datagrams, a stale one counts nothing. A jump `bound` cannot
+    /// explain is a restart, as in `handle_iq`, and counts only itself.
+    fn backlog_datagrams(&self, bound: Duration) -> u64 {
+        let plausible = plausible_lost_datagrams(bound, self.sample_rate_hz);
+        let mut tracker = self.tracker.clone();
+        let mut scratch = Vec::with_capacity(wire::SAMPLES_PER_DATAGRAM);
+        let mut total = 0u64;
+        for (bytes, from) in &self.look_ahead {
+            if !self.is_ddc0(*from) {
+                continue;
+            }
+            scratch.clear();
+            let Ok(seq) = wire::parse_iq_datagram(bytes, &mut scratch) else {
+                continue;
+            };
+            total += match tracker.observe(seq) {
+                wire::SeqEvent::InOrder | wire::SeqEvent::Restart => 1,
+                wire::SeqEvent::Stale => 0,
+                wire::SeqEvent::Gap(k) if u64::from(k) > plausible => 1,
+                wire::SeqEvent::Gap(k) => u64::from(k) + 1,
+            };
+        }
+        total
     }
 
     /// Whether `from` is the radio's DDC0 IQ port.
@@ -1549,6 +1566,58 @@ mod tests {
         let stats = src.gap_stats();
         assert_eq!(stats.dropped_packets, 20);
         assert_eq!(stats.gaps_detected, 2);
+        assert_wall_clock_discontinuity(accounted, before_read - pause, after_read - before_pause);
+    }
+
+    /// MAN-423 review: two restarts in one pause queue two runs, 0..60 and
+    /// 0..60. The first restart's look-ahead holds both, and both are radio
+    /// time, so the pause is assigned once: everything accounted after it
+    /// adds up to its wall clock (before: the second run, 14,280 samples,
+    /// ahead), and the second restart reports no more than the drift.
+    #[test]
+    fn two_restarts_behind_a_park_assign_the_pause_once() {
+        let fake = FakeP2Radio::start();
+        let mut src = open(&fake);
+        for s in 0..5 {
+            fake.send_iq(s);
+        }
+        for _ in 0..4 {
+            read_one(&mut src);
+        }
+        let before_pause = Instant::now();
+        read_one(&mut src);
+        let pause = Instant::now();
+        for s in 5..10 {
+            fake.send_iq(s);
+        }
+        thread::sleep(Duration::from_millis(20));
+        for s in 0..60 {
+            fake.send_iq(s);
+        }
+        thread::sleep(Duration::from_millis(20));
+        for s in 0..60 {
+            fake.send_iq(s);
+        }
+        thread::sleep(Duration::from_millis(500));
+        let before_read = Instant::now();
+        let mut accounted = 0u64;
+        let mut discontinuities = Vec::new();
+        for _ in 0..125 {
+            let (_, n) = read_one(&mut src);
+            accounted += n as u64;
+            accounted += src.take_missing_samples().unwrap_or(0);
+            if let Some(d) = src.take_discontinuity() {
+                discontinuities.push(d);
+                accounted += d;
+            }
+        }
+        let after_read = Instant::now();
+        assert_eq!(discontinuities.len(), 2, "{discontinuities:?}");
+        // The second restart finds the pause already assigned: what is left
+        // is the time spent reading, well under one 10 ms datagram budget.
+        assert!(discontinuities[1] < 1_920, "{discontinuities:?}");
+        assert_eq!(src.gap_stats().gaps_detected, 2);
+        assert_eq!(src.gap_stats().dropped_packets, 0);
         assert_wall_clock_discontinuity(accounted, before_read - pause, after_read - before_pause);
     }
 
