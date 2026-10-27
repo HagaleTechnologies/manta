@@ -972,7 +972,7 @@ def summarize(records, params=None):
             else:
                 segs.append([a["ts"], b["ts"], "down", 0.0, False])
             continue
-        delta, _ = _counter_delta(a.get("source_down_s"), b.get("source_down_s")) if same else (0.0, {})
+        delta, per = _counter_delta(a.get("source_down_s"), b.get("source_down_s")) if same else (0.0, {})
         if not long_gap and _is_up(a):
             seg = [a["ts"], b["ts"], "up", delta, same]
         else:
@@ -994,7 +994,13 @@ def summarize(records, params=None):
                     edge = segs[j][0]
                     j -= 1
                 if j >= 0 and segs[j][2] == "up" and segs[j][4] and segs[j][1] == edge:
-                    segs[j][3] += max(0.0, delta - run)
+                    # Per source: each outage is one wall-clock interval
+                    # ending in the run, so only a source whose own delta
+                    # exceeds the run began before it, and those spills all
+                    # end at the run's edge -- their union is the longest.
+                    # The summed delta counts overlapping source-seconds,
+                    # not elapsed time (MAN-292 review).
+                    segs[j][3] += max([d - run for d in per.values()] + [0.0])
         segs.append(seg)
     for a_ts, b_ts, state, extra, _same in segs:
         account(a_ts, b_ts, state, extra)

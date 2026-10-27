@@ -1165,6 +1165,24 @@ class ReportTests(unittest.TestCase):
                 s = summ(self.gap_outage_ledger(delta), interval_s=60)
                 self.assert_gap_buckets(s, up=120, down=0, counter=0)
 
+    def test_overlapping_source_outages_inside_a_gap_are_not_backdated(self):
+        # Two inputs each report a completed 200 s outage wholly inside the
+        # 340 s gap: their 400 s sum exceeds the gap, but no wall-clock
+        # second of it precedes the gap (MAN-292 review).
+        recs = self.gap_outage_ledger()
+        samples = [r for r in recs if r["kind"] == "sample"]
+        for sample in samples:
+            sample["source_down_s"] = {"soapy": 0, "kiwi": 0}
+            sample["source_outages"] = {"soapy": 0, "kiwi": 0}
+        samples[-1].update(source_down_s={"soapy": 200, "kiwi": 200},
+                           source_outages={"soapy": 1, "kiwi": 1})
+        s = summ(recs, interval_s=60)
+        self.assert_gap_buckets(s, up=120, down=0, counter=0)
+        # One source past the gap backdates only its own excess.
+        samples[-1].update(source_down_s={"soapy": 390, "kiwi": 200})
+        s = summ(recs, interval_s=60, min_days=0.001, min_availability=0.20)
+        self.assert_gap_buckets(s, up=70, down=50, counter=50)
+
     def test_outage_reconciles_through_mixed_down_and_gap_run(self):
         for delta, extra in ((510, 50), (460, 0)):
             with self.subTest(delta=delta):
