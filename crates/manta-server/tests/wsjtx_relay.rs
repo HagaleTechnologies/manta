@@ -420,7 +420,6 @@ async fn the_instance_map_is_bounded() {
 ///   Then it is forwarded as a digital-mode spot
 /// ```
 #[tokio::test]
-#[ignore = "needs the uplink relay arm"]
 async fn a_wsjtx_decode_reaches_the_collector_as_a_digital_spot() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
