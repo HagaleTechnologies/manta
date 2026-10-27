@@ -15,7 +15,9 @@ use manta_decode::config_file::DecodeConfigToml;
 use manta_decode::decoder::DecodeConfig;
 use manta_engine::config_file::DetectorConfigToml;
 use manta_engine::DetectorConfig;
-use manta_server::config::{RbnCompareConfig, RbnUplinkConfig, ServerConfig};
+use manta_server::config::{
+    RbnCompareConfig, RbnUplinkConfig, ServerConfig, SkimmerRelayConfig, WsjtxRelayConfig,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::net::Ipv4Addr;
@@ -26,6 +28,8 @@ pub(crate) const KNOWN_TABLES: &[&str] = &[
     "server",
     "rbn_uplink",
     "rbn_compare",
+    "skimmer_relay",
+    "wsjtx_relay",
     "input",
     "spot",
     "detector",
@@ -145,6 +149,12 @@ pub(crate) struct Loaded {
     /// --config` reads its tolerances. `run` merges `--rbn-compare`/
     /// `--rbn-spotter` over it in `resolve`.
     pub rbn_compare: Option<RbnCompareConfig>,
+    /// MAN-320: `[[skimmer_relay]]` blocks as written, validated
+    /// (disabled ones included). Restart-only.
+    pub skimmer_relay: Vec<SkimmerRelayConfig>,
+    /// MAN-320: `[[wsjtx_relay]]` blocks as written, validated (disabled
+    /// ones included). Restart-only.
+    pub wsjtx_relay: Vec<WsjtxRelayConfig>,
     pub decode: DecodeConfig,
     pub detector: DetectorConfig,
     pub spot: SpotFile,
@@ -571,6 +581,15 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
             }
         }
     }
+    let skimmer_relay = take_relays::<SkimmerRelayConfig>(&doc, "skimmer_relay", &origin)?;
+    let wsjtx_relay = take_relays::<WsjtxRelayConfig>(&doc, "wsjtx_relay", &origin)?;
+    check_relays(
+        &origin,
+        server.as_ref(),
+        &rbn_uplink,
+        &skimmer_relay,
+        &wsjtx_relay,
+    )?;
     let mut notes = Vec::new();
     let rbn_compare = take_typed::<RbnCompareConfig>(&doc, "rbn_compare", &origin, &overlay)?;
     if let Some(rc) = &rbn_compare {
@@ -675,6 +694,8 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         server,
         rbn_uplink,
         rbn_compare,
+        skimmer_relay,
+        wsjtx_relay,
         decode,
         detector,
         spot,
@@ -706,7 +727,7 @@ fn known_tables_list() -> String {
     KNOWN_TABLES
         .iter()
         .map(|t| match *t {
-            "rbn_uplink" => format!("[[{t}]]"),
+            "rbn_uplink" | "skimmer_relay" | "wsjtx_relay" => format!("[[{t}]]"),
             _ => format!("[{t}]"),
         })
         .collect::<Vec<_>>()
@@ -748,9 +769,9 @@ fn check_top_level(doc: &toml::Table, origin: &str) -> Result<()> {
             );
         }
         match (key.as_str(), value) {
-            ("rbn_uplink", toml::Value::Array(_)) => {}
-            ("rbn_uplink", _) => {
-                bail!("{origin}: rbn_uplink must be written [[rbn_uplink]] (an array of tables)")
+            ("rbn_uplink" | "skimmer_relay" | "wsjtx_relay", toml::Value::Array(_)) => {}
+            (name @ ("rbn_uplink" | "skimmer_relay" | "wsjtx_relay"), _) => {
+                bail!("{origin}: {name} must be written [[{name}]] (an array of tables)")
             }
             // MAN-13: several receivers, one entry each.
             ("input", toml::Value::Array(_)) => {}
@@ -804,6 +825,81 @@ fn take_typed<T: serde::de::DeserializeOwned>(
         .try_into::<T>()
         .map(Some)
         .map_err(|e| anyhow!("{origin}: [{table}]: {e}{}", overlay.suffix(table)))
+}
+
+/// MAN-320: a `[[skimmer_relay]]`/`[[wsjtx_relay]]` array, typed, as
+/// `take_uplinks` reads `[[rbn_uplink]]`.
+fn take_relays<T: serde::de::DeserializeOwned>(
+    doc: &toml::Table,
+    table: &str,
+    origin: &str,
+) -> Result<Vec<T>> {
+    let Some(value) = doc.get(table) else {
+        return Ok(Vec::new());
+    };
+    value
+        .clone()
+        .try_into::<Vec<T>>()
+        .map_err(|e| anyhow!("{origin}: [[{table}]]: {e}"))
+}
+
+/// MAN-320 (D3/D12): the cross-table rules for both relay tables.
+fn check_relays(
+    origin: &str,
+    server: Option<&ServerConfig>,
+    rbn_uplink: &[RbnUplinkConfig],
+    skimmer_relay: &[SkimmerRelayConfig],
+    wsjtx_relay: &[WsjtxRelayConfig],
+) -> Result<()> {
+    for r in skimmer_relay {
+        r.validate().map_err(|e| anyhow!("{origin}: {e}"))?;
+    }
+    for r in wsjtx_relay {
+        r.validate().map_err(|e| anyhow!("{origin}: {e}"))?;
+    }
+    let uplink_on = server.is_some() && rbn_uplink.iter().any(|u| u.enabled);
+    let needs_uplink = |table: &str, label: &str| {
+        anyhow!(
+            "{origin}: [[{table}]] {label} forwards spots only through [[rbn_uplink]] -- add an              enabled [[rbn_uplink]] block, or set enabled = false on this relay"
+        )
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for r in skimmer_relay {
+        let label = r.label();
+        if !seen.insert(label.clone()) {
+            bail!("{origin}: [[skimmer_relay]] {label} is listed twice");
+        }
+        if r.enabled && !uplink_on {
+            return Err(needs_uplink("skimmer_relay", &label));
+        }
+        if let Some(server) = server {
+            let own = std::iter::once(server.station_callsign.as_str()).chain(
+                rbn_uplink
+                    .iter()
+                    .filter_map(|u| u.login_callsign.as_deref()),
+            );
+            for call in own {
+                if call.eq_ignore_ascii_case(&r.callsign) {
+                    bail!(
+                        "{origin}: [[skimmer_relay]] {label} has callsign = \"{}\", this                          station's own call -- a skimmer relay forwards another skimmer's spots                          under that skimmer's own call (e.g. \"{}-2\"); manta already forwards                          its own",
+                        r.callsign,
+                        manta_server::config::strip_ssid(&r.callsign),
+                    );
+                }
+            }
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for r in wsjtx_relay {
+        let label = r.label();
+        if !seen.insert(label.clone()) {
+            bail!("{origin}: [[wsjtx_relay]] {label} is listed twice");
+        }
+        if r.enabled && !uplink_on {
+            return Err(needs_uplink("wsjtx_relay", &label));
+        }
+    }
+    Ok(())
 }
 
 fn take_uplinks(doc: &toml::Table, origin: &str) -> Result<Vec<RbnUplinkConfig>> {
@@ -1556,6 +1652,16 @@ fn apply_env_overlay(doc: &mut toml::Table, vars: &[(OsString, OsString)]) -> Re
         let rest = &name[ENV_PREFIX.len()..];
         if rest.starts_with("RBN_UPLINK_") {
             bail!("{name}: [[rbn_uplink]] cannot be set from the environment; use the config file");
+        }
+        for (prefix, table) in [
+            ("SKIMMER_RELAY_", "skimmer_relay"),
+            ("WSJTX_RELAY_", "wsjtx_relay"),
+        ] {
+            if rest.starts_with(prefix) {
+                bail!(
+                    "{name}: [[{table}]] cannot be set from the environment; use the config file"
+                );
+            }
         }
         let Some((table, key)) = ENV_TABLES.iter().find_map(|(prefix, table)| {
             rest.strip_prefix(prefix)

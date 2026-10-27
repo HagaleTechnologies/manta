@@ -515,6 +515,26 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
         Some(rc) => rbn_compare_summary(rc, station),
     });
 
+    // MAN-320: one line per relay block, in table order (devex 2).
+    if loaded.skimmer_relay.is_empty() {
+        lines.push("skimmer_relay: none".to_string());
+    }
+    for r in &loaded.skimmer_relay {
+        lines.push(format!(
+            "skimmer_relay: host={} port={} callsign={} enabled={}",
+            r.host, r.port, r.callsign, r.enabled
+        ));
+    }
+    if loaded.wsjtx_relay.is_empty() {
+        lines.push("wsjtx_relay: none".to_string());
+    }
+    for r in &loaded.wsjtx_relay {
+        lines.push(format!(
+            "wsjtx_relay: listen={} callsign={} enabled={}",
+            r.listen, r.callsign, r.enabled
+        ));
+    }
+
     // MAN-13: one `input <name>:` line per entry when there are several;
     // the single-input line is unchanged.
     if loaded.inputs.len() >= 2 {
@@ -1049,6 +1069,31 @@ mod tests {
             "server: none (manta run starts no servers)"
         );
         assert_eq!(line(&lines, "rbn_uplink:"), "rbn_uplink: none");
+    }
+
+    #[test]
+    fn config_check_prints_relay_summaries() {
+        let lines = lines_of(
+            "[server]\nstation_callsign = \"W1ABC\"\n[[rbn_uplink]]\nenabled = true\n\
+             target_host = \"127.0.0.1\"\ntarget_port = 7550\n\
+             [[skimmer_relay]]\nhost = \"192.168.1.20\"\nport = 7300\ncallsign = \"w1abc-2\"\n\
+             [[wsjtx_relay]]\ncallsign = \"W1ABC\"\n",
+        );
+        assert_eq!(
+            line(&lines, "skimmer_relay:"),
+            "skimmer_relay: host=192.168.1.20 port=7300 callsign=W1ABC-2 enabled=true"
+        );
+        assert_eq!(
+            line(&lines, "wsjtx_relay:"),
+            "wsjtx_relay: listen=127.0.0.1:2237 callsign=W1ABC enabled=true"
+        );
+        let at = |p: &str| lines.iter().position(|l| l.starts_with(p)).unwrap();
+        assert!(at("rbn_compare:") < at("skimmer_relay:"));
+        assert!(at("skimmer_relay:") < at("wsjtx_relay:"));
+        assert!(at("wsjtx_relay:") < at("input:"));
+        let lines = lines_of("[decode]\nengine = \"legacy\"\n");
+        assert_eq!(line(&lines, "skimmer_relay:"), "skimmer_relay: none");
+        assert_eq!(line(&lines, "wsjtx_relay:"), "wsjtx_relay: none");
     }
 
     #[test]

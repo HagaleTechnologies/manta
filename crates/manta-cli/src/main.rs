@@ -41,6 +41,7 @@ mod live_state;
 mod logging;
 mod multi_run;
 mod reconnect;
+mod relay_socket;
 mod reload;
 mod silent;
 mod source_check;
@@ -3914,6 +3915,14 @@ fn start_list_refresh(
     Ok(Some(lists))
 }
 
+/// MAN-320: the `[[skimmer_relay]]`/`[[wsjtx_relay]]` blocks
+/// `start_spot_server` runs (`Default` = none).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RelayConfigs {
+    pub skimmer: Vec<manta_server::config::SkimmerRelayConfig>,
+    pub wsjtx: Vec<manta_server::config::WsjtxRelayConfig>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_spot_server(
     cfg: manta_server::config::ServerConfig,
@@ -3924,8 +3933,21 @@ fn start_spot_server(
     session_nonce: u128,
     lists: std::sync::Arc<manta_engine::ReferenceLists>,
     pipeline: &PipelineConfig,
+    relays: RelayConfigs,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
     let validation_level = pipeline.validation_level;
+    // MAN-320 (D11): every enabled `[[wsjtx_relay]]` socket is bound before
+    // anything is spawned, so a taken UDP port fails startup with the
+    // relay's own message instead of leaving a half-started daemon.
+    let wsjtx_sockets = relays
+        .wsjtx
+        .iter()
+        .map(|r| {
+            r.enabled
+                .then(|| relay_socket::bind_wsjtx_socket(r.listen))
+                .transpose()
+        })
+        .collect::<Result<Vec<Option<std::net::UdpSocket>>>>()?;
     // MAN-59 connection/rejection events below are logged at `info`/
     // `warn`. `start_spot_server` no longer installs the subscriber:
     // `logging::init` does, at the top of `run` (MAN-124), and its module
@@ -4239,6 +4261,28 @@ fn start_spot_server(
             if rbn_compare_cfg.is_some() {
                 metrics.enable_rbn_compare();
             }
+            // MAN-320: one relay series per configured block (disabled ones
+            // included, reading 0), registered before the metrics endpoint
+            // spawns for MAN-44's reason. Workers spawn after the uplinks.
+            let skimmer_relays: Vec<_> = relays
+                .skimmer
+                .into_iter()
+                .map(|r| {
+                    let stats = metrics
+                        .register_relay(r.label(), manta_server::metrics::RelayKind::Skimmer);
+                    (r, stats)
+                })
+                .collect();
+            let wsjtx_relays: Vec<_> = relays
+                .wsjtx
+                .into_iter()
+                .zip(wsjtx_sockets)
+                .map(|(r, socket)| {
+                    let stats =
+                        metrics.register_relay(r.label(), manta_server::metrics::RelayKind::Wsjtx);
+                    (r, socket, stats)
+                })
+                .collect();
             let metrics_ip_request_limiter =
                 manta_server::rate_limit::IpRateLimiter::new_with_override(
                     manta_server::metrics_http::MAX_METRICS_REQUESTS_PER_IP,
@@ -4281,6 +4325,46 @@ fn start_spot_server(
                     bus.clone(),
                     target,
                     dry_run.flag,
+                    shutdown_rx.clone(),
+                ));
+            }
+            // MAN-320: relay workers for the enabled blocks only. They
+            // publish onto the bus's relay channel, which only the uplinks
+            // read (D4).
+            for (r, stats) in skimmer_relays {
+                if !r.enabled {
+                    continue;
+                }
+                tokio::spawn(manta_server::relay::skimmer::run(
+                    manta_server::relay::skimmer::SkimmerRelay {
+                        host: r.host,
+                        port: r.port,
+                        callsign: r.callsign,
+                    },
+                    manta_server::rbn_compare::system_clock(),
+                    bus.clone(),
+                    stats,
+                    shutdown_rx.clone(),
+                ));
+            }
+            for (r, socket, stats) in wsjtx_relays {
+                let Some(socket) = socket else {
+                    continue;
+                };
+                // The label names the address actually bound, so
+                // `listen = "127.0.0.1:0"` logs its real port (devex 4).
+                let label = socket
+                    .local_addr()
+                    .map_or_else(|_| r.label(), |a| a.to_string());
+                tokio::spawn(manta_server::relay::wsjtx::run(
+                    manta_server::relay::wsjtx::WsjtxRelay {
+                        label,
+                        callsign: r.callsign,
+                    },
+                    socket,
+                    manta_server::rbn_compare::system_clock(),
+                    bus.clone(),
+                    stats,
                     shutdown_rx.clone(),
                 ));
             }
@@ -6230,6 +6314,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                     Some(server_cfg) => Some(multi_run::ServerSetup {
                         cfg: server_cfg,
                         rbn_uplink: loaded.rbn_uplink.clone(),
+                        relays: RelayConfigs {
+                            skimmer: loaded.skimmer_relay.clone(),
+                            wsjtx: loaded.wsjtx_relay.clone(),
+                        },
                         rbn_compare: resolved.rbn_compare.clone(),
                         replay_epoch: resolved.replay_epoch,
                     }),
@@ -6480,6 +6568,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                         session_nonce,
                         lists.clone(),
                         &cfg,
+                        RelayConfigs {
+                            skimmer: loaded.skimmer_relay.clone(),
+                            wsjtx: loaded.wsjtx_relay.clone(),
+                        },
                     )?;
                     // MAN-45 (round-9 finding): the daemon's own copy of the
                     // gauge `manta_engine::listen_with_observers` updates as
@@ -8336,6 +8428,7 @@ mod tests {
                 cty: Some(table.clone()),
                 ..Default::default()
             },
+            RelayConfigs::default(),
         )
         .unwrap();
         let cty = server.lists.cty.load();
@@ -8381,6 +8474,7 @@ mod tests {
             0,
             lists.clone(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         )
         .unwrap();
         let cty = server.lists.cty.load();
@@ -8803,6 +8897,7 @@ mod tests {
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         )
         .unwrap();
 
@@ -8865,6 +8960,7 @@ mod tests {
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         )
         .unwrap();
 
@@ -9721,6 +9817,7 @@ mod tests {
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         )
         .unwrap();
 
@@ -9784,6 +9881,7 @@ mod tests {
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         )
         .unwrap();
 
@@ -9845,6 +9943,7 @@ mod tests {
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         );
         assert!(
             result.is_ok(),
@@ -9882,6 +9981,7 @@ mod tests {
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         )
         .unwrap();
 
@@ -9994,6 +10094,7 @@ mod tests {
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         ) else {
             panic!("half a lat/lon pair must not start the servers");
         };
@@ -10054,6 +10155,7 @@ mod tests {
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         )
         .unwrap();
 
@@ -12461,6 +12563,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         )
         .unwrap();
 
@@ -12512,6 +12615,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         )
         .unwrap();
 
