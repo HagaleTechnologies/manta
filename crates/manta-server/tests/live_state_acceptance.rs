@@ -4,7 +4,9 @@
 //!
 //! Scenario 4: "A slow subscriber never slows decoding" -- given a
 //! subscriber that stops reading, when its buffer fills, then it is
-//! dropped and publishing (the decode loop's side) is unaffected.
+//! dropped and publishing (the decode loop's side) is unaffected. MAN-353
+//! runs it again with the other client reading slowly: that client is not
+//! dropped.
 
 use futures_util::StreamExt;
 use manta_server::bus::{SpotBus, LIVE_CHANNEL_CAPACITY};
@@ -210,8 +212,19 @@ async fn the_spot_stream_never_carries_live_records_and_the_live_stream_never_ca
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_live_client_that_stops_reading_is_dropped_and_publishing_never_blocks() {
+/// MAN-353: a cap on the reading client below the ~15 MB/s (of these
+/// ~1 KiB lines) that `windows-latest` loopback carried for the clock-paced
+/// test #302 replaced, so every leg runs a reader slower than a
+/// free-running publisher -- the condition that dropped the reading client
+/// on Windows only.
+const SLOW_READER_LINES_PER_SEC: u32 = 10_000;
+
+/// MAN-324 scenario 4, shared with MAN-353's slow reader: one live client
+/// never reads and one keeps reading, at most `reader_lines_per_sec` lines
+/// a second when that is set. The burst overflows the stalled client; only
+/// it is dropped, the reading client gets every record in order and is
+/// still connected afterwards, and no `publish_live` call blocks.
+async fn only_the_stalled_live_client_is_dropped(reader_lines_per_sec: Option<u32>) {
     let node = spawn_node(16).await;
     // A client that never reads, and one reading concurrently.
     let mut stalled = TcpStream::connect(node.live).await.unwrap();
@@ -234,7 +247,16 @@ async fn a_live_client_that_stops_reading_is_dropped_and_publishing_never_blocks
             let mut reader = BufReader::new(reader_stream);
             let mut got = 0usize;
             let mut line = String::new();
+            let start = tokio::time::Instant::now();
             while got < total {
+                if let Some(rate) = reader_lines_per_sec {
+                    // Deadlines from `start`, so a coarse timer (Windows)
+                    // late on one batch does not slow the average.
+                    if got.is_multiple_of(64) {
+                        tokio::time::sleep_until(start + Duration::from_secs(got as u64) / rate)
+                            .await;
+                    }
+                }
                 line.clear();
                 let n = tokio::time::timeout(Duration::from_secs(30), reader.read_line(&mut line))
                     .await
@@ -249,7 +271,7 @@ async fn a_live_client_that_stops_reading_is_dropped_and_publishing_never_blocks
                 got += 1;
                 consumed.store(got, Ordering::Release);
             }
-            got
+            reader
         }
     });
 
@@ -290,7 +312,8 @@ async fn a_live_client_that_stops_reading_is_dropped_and_publishing_never_blocks
         "publishing took {publishing:?}"
     );
 
-    assert_eq!(reader.await.unwrap(), total);
+    // Every record arrived (the reader returns only after `total`).
+    let mut reader = reader.await.unwrap();
 
     // The stalled socket, read now, reaches EOF: the server dropped it.
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -306,6 +329,9 @@ async fn a_live_client_that_stops_reading_is_dropped_and_publishing_never_blocks
             Err(_) => panic!("the stalled client was never dropped"),
         }
     }
+    // ...and only it: the reading client still gets the next record.
+    node.bus.publish_live(Arc::from(format!("{total} end")));
+    assert_eq!(read_line(&mut reader).await, format!("{total} end\n"));
     assert!(node.metrics.live_records_dropped() > 0);
     let text = node.metrics.render_prometheus_text();
     assert!(
@@ -314,6 +340,20 @@ async fn a_live_client_that_stops_reading_is_dropped_and_publishing_never_blocks
     );
     assert_eq!(node.metrics.spots_dropped_write_failed_total(), 0);
     assert_eq!(node.metrics.spots_dropped_shutdown_total(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_client_that_stops_reading_is_dropped_and_publishing_never_blocks() {
+    only_the_stalled_live_client_is_dropped(None).await;
+}
+
+/// MAN-353: a client that keeps reading, but slower than the publisher
+/// could run, is not dropped with the stalled one. The clock-paced test
+/// #302 replaced fails this way on every host ("the reading client was
+/// disconnected after N lines"), not only on `windows-latest`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_client_that_reads_slowly_stays_connected_while_a_stalled_one_is_dropped() {
+    only_the_stalled_live_client_is_dropped(Some(SLOW_READER_LINES_PER_SEC)).await;
 }
 
 #[tokio::test]
