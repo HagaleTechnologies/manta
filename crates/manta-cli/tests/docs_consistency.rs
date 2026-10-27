@@ -2995,7 +2995,9 @@ fn decision_records_have_indexable_names_and_headings() {
         let mut lines = md.lines();
         let first = lines.next().unwrap_or("");
         assert!(
-            first.len() > 2 && first.starts_with("# "),
+            first
+                .strip_prefix("# ")
+                .is_some_and(|title| !title.trim().is_empty()),
             "docs/DECISIONS/{file}: line 1 must be the record's `# ` title"
         );
         assert!(

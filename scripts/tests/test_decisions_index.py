@@ -12,6 +12,7 @@ import contextlib
 import glob
 import importlib.util
 import io
+import json
 import os
 import re
 import shutil
@@ -251,7 +252,17 @@ class ListedCheckTests(unittest.TestCase):
             with self.subTest(new=new):
                 problems, _ = di.check(self.edited(old, new), self.records, strict=False)
                 self.assertEqual(len(problems), 1, problems)
-                self.assertIn("the file name says 2026-10-27 | MAN-5", problems[0])
+                self.assertIn("the record says 2026-10-27 | MAN-5", problems[0])
+
+    def test_heading_ticket_change_passes_default_fails_strict(self):
+        # A ticketless name's ticket comes from its heading, so a heading edit may change it.
+        names = {**THREE, "2026-10-26-spike.md": "spike (MAN-53)"}
+        readme = generated(parsed(names))
+        edited = parsed({**THREE, "2026-10-26-spike.md": "spike (MAN-54)"})
+        self.assertEqual(di.check(readme, edited, strict=False), ([], []))
+        problems, _ = di.check(readme, edited, strict=True)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("2026-10-26-spike.md: row says 2026-10-26 | MAN-53", problems[0])
 
     def test_stale_title_passes_default_fails_strict(self):
         readme = self.edited("[MAN-5: a]", "[MAN-5: an older heading]")
@@ -545,10 +556,16 @@ class RefreshWorkflowShapeTests(unittest.TestCase):
         self.assertIn("Decisions Index", watched)
 
 
+# The contents PUT's --input file is copied to $PUT_BODY so a test can read the JSON it sent.
 GH_STUB = """
 case "$1 $2" in
   "pr list") printf '%s' "${PR_LIST_OUT:-}"; exit "${PR_LIST_RC:-0}" ;;
-  "api -X") if [ "$3" = PATCH ]; then exit "${PATCH_RC:-0}"; fi ;;
+  "api -X")
+    if [ "$3" = PATCH ]; then exit "${PATCH_RC:-0}"; fi
+    if [ "$3" = PUT ]; then
+      prev=""
+      for a in "$@"; do if [ "$prev" = --input ]; then cp "$a" "$PUT_BODY"; fi; prev=$a; done
+    fi ;;
 esac
 exit 0
 """
@@ -563,9 +580,13 @@ class RefreshStepBehaviourTests(unittest.TestCase):
         step = named_step("Open the refresh PR")
         env = {name: wf.field(wf.sub(step, "env"), name).strip('"')
                for name in ("BRANCH", "README", "TITLE", "BODY")}
-        env.update(GH_TOKEN="x", REPO=REPO, BASE_SHA=BASE_SHA, OLD_BLOB=OLD_BLOB, **stub_env)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        self.put_body = os.path.join(tmp.name, "put-body.json")
+        # run_step's PATH is the stub dir, /usr/bin and /bin; the body also runs python3.
+        path = f"{os.path.join(tmp.name, 'bin')}:{os.path.dirname(sys.executable)}:/usr/bin:/bin"
+        env.update(GH_TOKEN="x", REPO=REPO, BASE_SHA=BASE_SHA, OLD_BLOB=OLD_BLOB, PATH=path,
+                   PUT_BODY=self.put_body, **stub_env)
         os.makedirs(os.path.join(tmp.name, "docs", "DECISIONS"))
         with open(os.path.join(tmp.name, env["README"]), "w", encoding="utf-8") as f:
             f.write(self.README_TEXT)
@@ -573,11 +594,13 @@ class RefreshStepBehaviourTests(unittest.TestCase):
 
     def assert_create_sequence(self, calls):
         ref = f"repos/{REPO}/git/refs/heads/{BRANCH}"
-        content = base64.b64encode(self.README_TEXT.encode()).decode()
         patch = next(i for i, c in enumerate(calls) if gates.has_call([c], "PATCH", ref, f"sha={BASE_SHA}", "force=true"))
         put = next(i for i, c in enumerate(calls)
-                   if gates.has_call([c], "PUT", f"repos/{REPO}/contents/docs/DECISIONS/README.md", f"branch={BRANCH}",
-                                     f"sha={OLD_BLOB}", f"message={TITLE}", f"content={content}"))
+                   if gates.has_call([c], "PUT", f"repos/{REPO}/contents/docs/DECISIONS/README.md", "--input"))
+        with open(self.put_body, encoding="utf-8") as f:
+            sent = json.load(f)
+        self.assertEqual(sent, {"message": TITLE, "branch": BRANCH, "sha": OLD_BLOB,
+                                "content": base64.b64encode(self.README_TEXT.encode()).decode()})
         create = next(i for i, c in enumerate(calls)
                       if gates.has_call([c], "pr", "create", "--base", "main", "--head", BRANCH, "--title", TITLE))
         self.assertLess(patch, put)

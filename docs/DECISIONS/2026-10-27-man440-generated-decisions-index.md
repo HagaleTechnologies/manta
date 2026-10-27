@@ -61,8 +61,9 @@ conflicts and the merge queue ejects it.
    - `python3 scripts/decisions-index.py` (the default check, and
      `RealIndexTests` in CI) requires every listed row to link an existing
      record with the right date and ticket, in order, with no duplicates.
-     It names unlisted records and passes. It does not compare titles, so a
-     PR that edits an old record's heading is not forced to edit the table.
+     It names unlisted records and passes. It does not compare titles, or a
+     ticket read from a heading, so a PR that edits an old record's heading
+     is not forced to edit the table.
    - `--strict` requires the README to equal what `--write` produces. The
      refresh PR meets it.
    - `reference_docs_relative_links_resolve` still fails on a row whose
@@ -148,6 +149,9 @@ conflicts and the merge queue ejects it.
   `main is red: Decisions Index`.
 - A refresh PR stalls, for example on a Codex findings review: close it, and
   the next run (push, schedule or `workflow_dispatch`) opens a fresh one.
+- A record deleted or renamed while an open refresh PR still lists it
+  leaves that PR failing CI on a dangling row without conflicting, so the
+  workflow leaves it alone: close it, and the next run replaces it.
 - The PAT's user turns out not to be `thagale`: the refresh PR is then
   authored off the trusted list. It still gets CI through the native
   `pull_request` path, but not auto-merge, and a maintainer arms it by hand.

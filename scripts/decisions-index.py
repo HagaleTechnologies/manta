@@ -160,8 +160,10 @@ def listed_rows(readme: str) -> list[str]:
 
 def check(readme: str, records: list[Record], *, strict: bool) -> tuple[list[str], list[str]]:
     """(problems, unlisted record files). D6: the default check passes an index that lags the
-    records (unlisted files are returned, not problems) but fails a wrong, stale-dated, dangling,
-    duplicated or out-of-order row. strict also requires the README to equal --write's output."""
+    records (unlisted files are returned, not problems) but fails a dangling, duplicated or
+    out-of-order row, or one whose date or name-derived ticket disagrees with its file name.
+    strict also compares heading-derived tickets and titles, and requires the README to equal
+    --write's output."""
     by_name = {r.filename: r for r in records}
     order = {r.filename: i for i, r in enumerate(records)}
     problems, seen, last = [], set(), -1
@@ -179,8 +181,11 @@ def check(readme: str, records: list[Record], *, strict: bool) -> tuple[list[str
             problems.append(f"{target} is listed twice")
             continue
         seen.add(target)
-        if date != record.date or ticket != record.ticket_cell():
-            problems.append(f"{target}: row says {date} | {ticket}, the file name says "
+        # A ticket read from the heading (no manNNN in the name) can change with a heading
+        # edit, like a title, so only --strict compares it.
+        name_ticket = NAME.match(target).group(2) is not None
+        if date != record.date or (ticket != record.ticket_cell() and (name_ticket or strict)):
+            problems.append(f"{target}: row says {date} | {ticket}, the record says "
                             f"{record.date} | {record.ticket_cell()}")
         if order[target] < last:
             problems.append(f"{target} is out of order: newest first, then ticket highest first")

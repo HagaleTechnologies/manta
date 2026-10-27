@@ -82,7 +82,16 @@ jobs:
           if ! gh api -X PATCH "repos/$REPO/git/refs/heads/$BRANCH" -f sha="$BASE_SHA" -F force=true >/dev/null 2>&1; then
             gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$BASE_SHA" >/dev/null
           fi
-          gh api -X PUT "repos/$REPO/contents/$README" -f branch="$BRANCH" -f sha="$OLD_BLOB" \
-            -f message="$TITLE" -f content="$(base64 -w0 "$README")" >/dev/null
+          # The body goes through a file: the README base64-encoded as one argument would hit
+          # Linux's 128 KiB per-argument limit once the table passes about 96 KB.
+          put_body=$(mktemp)
+          python3 - "$README" "$BRANCH" "$OLD_BLOB" "$TITLE" > "$put_body" <<'PY'
+          import base64, json, sys
+          path, branch, sha, message = sys.argv[1:]
+          with open(path, "rb") as f:
+              content = base64.b64encode(f.read()).decode("ascii")
+          print(json.dumps({"message": message, "content": content, "branch": branch, "sha": sha}))
+          PY
+          gh api -X PUT "repos/$REPO/contents/$README" --input "$put_body" >/dev/null
           gh pr create --repo "$REPO" --base main --head "$BRANCH" --title "$TITLE" \
             --body "$BODY Built from main at $BASE_SHA."

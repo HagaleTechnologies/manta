@@ -10,7 +10,8 @@ Linux/ARM/headless platforms it has no native build for.
 Needs Rust 1.98.0 (`rust-toolchain.toml`), `git`, and on Linux `libasound2-dev`
 and `pkg-config`. Before pushing, run what `ci-full.yml`'s `test`/`test-hpsdr`
 jobs run (on Windows CI runs only `test_package_release` of the script suites;
-`ci_gates` and `verify_dependabot_diff_safe` run on Linux only):
+`ci_gates`, `decisions_index` and `verify_dependabot_diff_safe` run on Linux
+only):
 
 ```sh
 bash scripts/check-rust-toolchain-pin.sh && cargo fmt --all --check
