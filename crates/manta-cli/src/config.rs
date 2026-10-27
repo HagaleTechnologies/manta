@@ -239,7 +239,7 @@ impl CallsignLookupConfig {
         if !qrz_url_allowed(&self.qrz_url) {
             return Err(format!(
                 "[callsign_lookup].qrz_url must be an https:// URL (http:// only to a loopback \
-                 address such as 127.0.0.1), got {:?}",
+                 address such as 127.0.0.1), got \"{}\"",
                 self.qrz_url
             ));
         }

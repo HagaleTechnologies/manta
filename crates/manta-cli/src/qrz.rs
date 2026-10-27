@@ -236,7 +236,7 @@ fn failure(e: ureq::Error) -> Failure {
     match e {
         ureq::Error::Timeout(_) => Failure::Timeout,
         ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => Failure::Timeout,
-        ureq::Error::Io(io) => Failure::Transport(format!("network error ({:?})", io.kind())),
+        ureq::Error::Io(io) => Failure::Transport(format!("network error ({})", io.kind())),
         ureq::Error::HostNotFound => Failure::Transport("host not found".into()),
         ureq::Error::ConnectionFailed => Failure::Transport("connection failed".into()),
         ureq::Error::BodyExceedsLimit(_) => Failure::Protocol("the reply is over 64 KiB".into()),
