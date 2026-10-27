@@ -1961,6 +1961,92 @@ fn man319_decision_record_rescopes_the_wire_scenarios_on_man90() {
     );
 }
 
+/// MAN-302: the clean-room note pins the allowed inputs and gate, and the STOP
+/// verdict keeps UberSDR input code out of the tree until a GO record exists.
+#[test]
+fn man302_clean_room_note_records_inputs_gate_and_spec_pin() {
+    let records: Vec<String> = md_files_in("docs/DECISIONS")
+        .into_iter()
+        .filter(|name| name.contains("-man302-"))
+        .collect();
+    let notes: Vec<&String> = records
+        .iter()
+        .filter(|name| name.ends_with("-man302-ubersdr-iq-clean-room.md"))
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "want one MAN-302 clean-room note, found {notes:?}"
+    );
+
+    let rel = format!("docs/DECISIONS/{}", notes[0]);
+    let raw = doc(&rel);
+    let text = squash_whitespace(&raw);
+    for needle in [
+        "No AGPL/GPL source was read.",
+        "a26ebc87ac6e83d743d7f223c3ba953c7aba5615",
+        "1f2b38ed571c1144f5dac471cca1e5dbd1fe549014bd72b088d5964423ca2aab",
+        "CC BY-SA 4.0",
+    ] {
+        assert!(text.contains(needle), "{rel} does not contain {needle:?}");
+    }
+    for id in ["G1", "G2", "G3", "G4", "G5"] {
+        assert!(
+            raw.lines()
+                .any(|line| line.starts_with(&format!("| {id} |"))),
+            "{rel} has no {id} gate row"
+        );
+    }
+
+    let verdicts = |body: &str| {
+        (
+            body.lines().any(|line| line.trim() == "**Verdict: GO**"),
+            body.lines().any(|line| line.trim() == "**Verdict: STOP**"),
+        )
+    };
+    let (go, stop) = verdicts(&raw);
+    assert!(go ^ stop, "{rel} must carry exactly one verdict line");
+    let any_go = records
+        .iter()
+        .any(|name| verdicts(&doc(&format!("docs/DECISIONS/{name}"))).0);
+    assert!(
+        any_go || !repo_root().join("crates/manta-input/src/ubersdr").exists(),
+        "UberSDR input code exists but no MAN-302 record says **Verdict: GO** (stop rule)"
+    );
+
+    // A future GO record must tie every observed transport fact to a trace.
+    for name in &records {
+        let body = doc(&format!("docs/DECISIONS/{name}"));
+        for row in body.lines().filter(|line| {
+            line.split('|')
+                .nth(1)
+                .map(str::trim)
+                .and_then(|id| id.strip_prefix('T'))
+                .is_some_and(|number| {
+                    !number.is_empty() && number.bytes().all(|c| c.is_ascii_digit())
+                })
+        }) {
+            let status = row
+                .trim_end()
+                .trim_end_matches('|')
+                .rsplit('|')
+                .next()
+                .unwrap()
+                .trim();
+            if status == "open" {
+                continue;
+            }
+            let path = status.strip_prefix("observed: ").unwrap_or_else(|| {
+                panic!("{name}: T-row status must be `open` or `observed: <path>`: {row}")
+            });
+            assert!(
+                repo_root().join(path).exists(),
+                "{name}: {row} cites a missing trace"
+            );
+        }
+    }
+}
+
 /// MAN-319: the four new claims sit in MAN-90's table, all still open.
 #[test]
 fn man90_claims_table_carries_the_man319_claims() {
