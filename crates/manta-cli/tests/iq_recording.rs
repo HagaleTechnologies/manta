@@ -78,6 +78,18 @@ fn records(payload: &Path) -> Vec<MetadataRecord> {
         .collect()
 }
 
+/// `p` as a quoted TOML basic string with backslashes and quotes escaped,
+/// so a Windows temp path's `\U` is not read as a unicode escape.
+fn toml_str(p: &Path) -> String {
+    format!(
+        "\"{}\"",
+        p.display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    )
+}
+
 #[test]
 fn a_run_records_its_input_and_decodes_exactly_as_without_recording() {
     let dir = tempfile::tempdir().unwrap();
@@ -278,8 +290,8 @@ fn record_iq_precedence_is_cli_then_environment_then_file() {
     std::fs::write(
         &cfg,
         format!(
-            "[input]\ntype = \"file\"\npath = \"{}\"\niq = true\nrecord_iq = \"file.cf32\"\n",
-            wav.display()
+            "[input]\ntype = \"file\"\npath = {}\niq = true\nrecord_iq = \"file.cf32\"\n",
+            toml_str(&wav)
         ),
     )
     .unwrap();
@@ -328,16 +340,16 @@ fn a_source_flag_drops_the_replaced_inputs_record_iq() {
     std::fs::write(
         &typed,
         format!(
-            "[input]\ntype = \"file\"\npath = \"{}\"\niq = true\nrecord_iq = \"typed.cf32\"\n",
-            wav.display()
+            "[input]\ntype = \"file\"\npath = {}\niq = true\nrecord_iq = \"typed.cf32\"\n",
+            toml_str(&wav)
         ),
     )
     .unwrap();
     let entry = |name: &str, rec: &str| {
         format!(
-            "[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = \"{}\"\niq = true\n\
+            "[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = {}\niq = true\n\
              record_iq = \"{rec}\"\n\n",
-            wav.display()
+            toml_str(&wav)
         )
     };
     let several = dir.path().join("several.toml");
@@ -879,9 +891,9 @@ fn each_input_of_a_multi_input_daemon_records_its_own_file() {
     let (wav, manifest) = v1_fixture(dir.path());
     let entry = |name: &str, rec: &str| {
         format!(
-            "[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = \"{}\"\niq = true\n\
+            "[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = {}\niq = true\n\
              record_iq = \"{rec}\"\n\n",
-            wav.display()
+            toml_str(&wav)
         )
     };
     let toml = dir.path().join("multi.toml");
@@ -980,9 +992,9 @@ fn a_failed_multi_input_startup_leaves_no_recording_behind() {
     let (wav, _) = v1_fixture(dir.path());
     let entry = |name: &str, rec: &str| {
         format!(
-            "[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = \"{}\"\niq = true\n\
+            "[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = {}\niq = true\n\
              record_iq = \"{rec}\"\n\n",
-            wav.display()
+            toml_str(&wav)
         )
     };
     let inputs = entry("a", "a.cf32") + &entry("b", "b.cf32");
@@ -1119,9 +1131,9 @@ fn one_failing_recording_of_a_multi_input_daemon_leaves_the_other() {
     let long = v1_fixture_secs(&dir.path().join("long"), 30.0);
     let entry = |name: &str, wav: &Path, rec: &str| {
         format!(
-            "[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = \"{}\"\niq = true\n\
+            "[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = {}\niq = true\n\
              record_iq = \"{rec}\"\n\n",
-            wav.display()
+            toml_str(wav)
         )
     };
     let toml = dir.path().join("multi.toml");
