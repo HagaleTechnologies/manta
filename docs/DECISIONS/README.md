@@ -11,6 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-26 | MAN-436 | [MAN-436: same-input dedupe decides against the station's newest spot across a bucket edge](2026-10-26-man436-dedupe-edge-newest-spot.md) |
 | 2026-10-26 | MAN-302 | [MAN-302: UberSDR wide IQ, clean-room provenance; the input waits on a hardware-free local receiver](2026-10-26-man302-ubersdr-iq-clean-room.md) |
 | 2026-10-26 | MAN-393 | [MAN-393: a one-entry `[[input]]` already loads and takes `MANTA_INPUT_*` like `[input]`](2026-10-26-man393-one-entry-input-array.md) |
 | 2026-10-26 | MAN-289 | [MAN-289: a node spot without a `deCall` is malformed](2026-10-26-man289-node-spot-needs-decall.md) |
