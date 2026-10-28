@@ -11,6 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-28 | MAN-374 | [MAN-374: the startup calibration fill runs through process_hops in read-sized chunks, so a short unkeyed timeout keeps its callsign](2026-10-28-man374-chunked-calibration-fill.md) |
 | 2026-10-25 | MAN-423 | [MAN-423: hops buffered before a spliced loss keep their timestamps; a parked protocol-2 backlog keeps its anchor](2026-10-25-man423-pre-loss-hops-and-parked-backlogs.md) |
 | 2026-10-26 | MAN-249 | [MAN-249: public docs name roles, not machines, people or receiver hosts](2026-10-26-man249-public-disclosure.md) |
 | 2026-10-26 | MAN-292 | [Reconcile completed outages across long sample gaps](2026-10-26-man292-outage-deltas-across-sample-gaps.md) |

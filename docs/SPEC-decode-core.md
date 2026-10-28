@@ -934,7 +934,9 @@ unkeyed_close_hops` and no callsign was read.
 
 - `last_rise_hop` is the promotion hop, then each HANG → ACTIVE.
 - `last_char_hop` is set from each batch's `CharDecoded` events (batch
-  granularity, like the garbage-collect timer's reset).
+  granularity, like the garbage-collect timer's reset). A batch is one
+  `process_hops` call: one `listen` read of at most 2048 samples, the 2 s
+  startup fill included (MAN-374), or 4096 samples in file decode.
 - A callsign is read when the current word passes
   `manta_spot::grammar::is_plausible`. The word is built from
   `CharDecoded` glyph text and ends at a space, a prosign or a
