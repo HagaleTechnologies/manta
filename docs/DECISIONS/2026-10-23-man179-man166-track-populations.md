@@ -47,8 +47,8 @@ channels (`track_cap=4`: 407,433 spawns; `track_cap=40`: 3,613); and a 30 s,
 (its distinct `track_id`s) against 62,464 closes, the same kind of gap.
 
 **Not re-measured on B2.** Only the RBN ground-truth CSV is in the tree; the
-audio stays out of git and off public hosts until K5TR's redistribution
-permission is recorded. Today's tree would not reproduce September's numbers
+audio stays out of git and off public hosts until the volunteer operator's
+redistribution permission is recorded. Today's tree would not reproduce September's numbers
 anyway: `track_cap` is now 1200, and MAN-313 defers a promoted track's decoder
 lease and `TrackPromoted` until it qualifies as CW. A like-for-like run
 takes both counts from the PCM16 conversion (SHA-256 `d2ea5247…d4d4a621`)

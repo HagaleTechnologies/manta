@@ -104,8 +104,8 @@ whose files would pass the 2 GiB limit (FU-5).
 **D5 — Rights gate.** This change uploads nothing. Redistribution rights are
 not established for any recording (corpus README, *Provenance and
 licensing*). `corpus.yml`'s job runs only when `MANTA_CORPUS_BASE_URL` is set,
-and the runbook makes recording George K5TR's permission in the corpus README
-the step before any upload or variable change.
+and the runbook makes recording the volunteer operator's permission in the
+corpus README the step before any upload or variable change.
 
 **D6 — Consumption.** A dedicated `.github/workflows/corpus.yml` runs
 nightly at `41 7 * * *` and on `workflow_dispatch`. It is not a required
@@ -211,8 +211,8 @@ capture against it: spot precision, call recall and word recall, within
 These are not done and cannot be done from a container. They are not
 acceptance criteria for this change.
 
-- **E1.** Obtain George K5TR's redistribution permission and record it in the
-  corpus README's *Provenance and licensing* section.
+- **E1.** Obtain the volunteer operator's redistribution permission and record
+  it in the corpus README's *Provenance and licensing* section.
 - **E2.** Upload the as-received B2 source (and WPX, after pinning its hash in
   `manifest.json`) to the `corpus-v1` prerelease, set the
   `MANTA_CORPUS_BASE_URL` repository variable, and trigger `corpus.yml` once
