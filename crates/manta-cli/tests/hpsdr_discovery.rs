@@ -42,7 +42,11 @@ impl FakeDiscoveryRadio {
                             reply[3..9].copy_from_slice(mac);
                             reply[9] = 43;
                             reply[10] = 6;
-                            socket.send_to(&reply, addr).unwrap();
+                            // Discovery probes several addresses, so it answers more than once.
+                            // Under conntrack (Docker networks) two mirror-image loopback flows can
+                            // collide and the kernel drops one send with EPERM; a real radio would
+                            // just lose that duplicate reply, so the fake must not panic on it.
+                            let _ = socket.send_to(&reply, addr);
                         }
                     } else if n == 60 && buf[..4] == [0xef, 0xfe, 4, 1] {
                         client = Some(addr);
