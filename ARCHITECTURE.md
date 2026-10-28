@@ -515,7 +515,8 @@ transmission may never produce again).
    through `manta_spot::CallsignLookup`. A call QRZ.com does not list is
    withheld (`lookupNotFound`); one without an answer yet is held
    (`lookupPending`) for at most 10 s, then published, unverified if QRZ.com
-   never answered. Answers are cached 24 h; `[spot].allowlist` calls skip
+   never answered, unless a SIGHUP reload has since blocklisted or notched
+   it. Answers are cached 24 h; `[spot].allowlist` calls skip
    the step. A file replay never runs it. See
    `docs/DECISIONS/2026-10-27-man318-callsign-lookup.md`.
 
@@ -1116,7 +1117,8 @@ non-blocking send plus shared atomics and short locks between them.
   threads that hand the validator new lists: `manta-reload` (SIGHUP, through
   `OperatorListsUpdate`) and `manta-lists` (`[spot].refresh_lists`, through
   `ReferenceLists`). The decode thread picks those up before it feeds the
-  validator its next event. `manta-lookup` (`[callsign_lookup]`, MAN-318)
+  validator its next event, and a reload's lists before it releases spots
+  held for their callsign lookup. `manta-lookup` (`[callsign_lookup]`, MAN-318)
   does QRZ.com's HTTPS requests and hands answers back through a channel
   the decode thread polls once per batch, never waiting on it; only after
   decoding ends does the decode thread wait for answers still in flight,

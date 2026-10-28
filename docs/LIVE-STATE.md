@@ -266,7 +266,7 @@ candidate's later decision can follow its track's closure.
 | `withheld` | `"beaconSpeed"` | A deferred beacon rejected when its track ended: its speed was never confirmed, or is above 45 WPM. |
 | `withheld` | `"beaconOverflow"` | A deferred beacon evicted, oldest first, because a ninth was deferred on its track (at most 8 wait at once). |
 | `withheld` | `"beaconDiscarded"` | A deferred beacon dropped because its track closed for bookkeeping with no survivor. |
-| `deferred` | `"lookupPending"` | `[callsign_lookup]` is on and QRZ.com has not answered for this call yet. A later decision settles it: `spotted`, or `withheld`/`lookupNotFound`. That later decision keeps the decode's `timestamp` and can arrive after the track's `trackClosed`. |
+| `deferred` | `"lookupPending"` | `[callsign_lookup]` is on and QRZ.com has not answered for this call yet. A later decision settles it: `spotted`, or `withheld`/`lookupNotFound`, or `withheld`/`blocklist` or `notch` when a SIGHUP reload has changed those lists since. That later decision keeps the decode's `timestamp` and can arrive after the track's `trackClosed`. |
 | `withheld` | `"lookupNotFound"` | QRZ.com does not list the call (a fresh or a cached answer). |
 
 The fourteen `reason` strings are `blocklist`, `notch`, `grammar`, `cty`,
