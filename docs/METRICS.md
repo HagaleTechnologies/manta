@@ -68,11 +68,7 @@ in `RUNBOOKS/monitoring/`; see
 
 ## Metric families
 
-<<<<<<< HEAD
-All 75 families, in the order `/metrics` renders them. Every family's
-=======
-All 76 families, in the order `/metrics` renders them. Every family's
->>>>>>> d84356c11b622449d188f55c040d17759f8e78fb
+All 79 families, in the order `/metrics` renders them. Every family's
 `# HELP` and `# TYPE` lines are always rendered, except two groups at the
 end of the table: the ten RBN comparison families (MAN-301), rendered only
 when `[rbn_compare]` is enabled, and the three live-state families
