@@ -21,8 +21,6 @@ regenerate it: `python3 scripts/decisions-index.py --write`. See
 
 | Date | Ticket | Title |
 |---|---|---|
-| 2026-10-26 | MAN-139 | [MAN-139: decode, run and doctor `--json` use the JSON stream's camelCase names](2026-10-26-man139-cli-json-dialect.md) |
-| 2026-10-28 | MAN-374 | [MAN-374: the startup calibration fill runs through process_hops in read-sized chunks, so a short unkeyed timeout keeps its callsign](2026-10-28-man374-chunked-calibration-fill.md) |
 | 2026-10-28 | MAN-374 | [MAN-374: the startup calibration fill runs through `process_hops` in read-sized chunks, so a short unkeyed timeout keeps its callsign](2026-10-28-man374-chunked-calibration-fill.md) |
 | 2026-10-27 | MAN-440 | [MAN-440: the decision-record index is generated; record PRs add only their file](2026-10-27-man440-generated-decisions-index.md) |
 | 2026-10-27 | MAN-353 | [MAN-353: a reading live client is dropped only past the lag allowance; the stall test runs a slow reader on every leg](2026-10-27-man353-slow-reading-live-client.md) |
@@ -35,6 +33,7 @@ regenerate it: `python3 scripts/decisions-index.py --write`. See
 | 2026-10-26 | MAN-290 | [MAN-290: shadow-compare requires the RBN archive's `tx_mode` column](2026-10-26-man290-shadow-compare-requires-tx-mode.md) |
 | 2026-10-26 | MAN-289 | [MAN-289: a node spot without a `deCall` is malformed](2026-10-26-man289-node-spot-needs-decall.md) |
 | 2026-10-26 | MAN-249 | [MAN-249: public docs name roles, not machines, people or receiver hosts](2026-10-26-man249-public-disclosure.md) |
+| 2026-10-26 | MAN-139 | [MAN-139: decode, run and doctor `--json` use the JSON stream's camelCase names](2026-10-26-man139-cli-json-dialect.md) |
 | 2026-10-25 | MAN-423 | [MAN-423: hops buffered before a spliced loss keep their timestamps; a parked protocol-2 backlog keeps its anchor](2026-10-25-man423-pre-loss-hops-and-parked-backlogs.md) |
 | 2026-10-25 | MAN-402 | [MAN-402: a unimodal speed bootstrap reads its marks as dahs when the gaps between them say so](2026-10-25-man402-dah-heavy-bootstrap.md) |
 | 2026-10-25 | MAN-392 | [MAN-392: calibrate reports a standalone receiver's measurement beside several inputs](2026-10-25-man392-calibrate-source-beside-several-inputs.md) |
