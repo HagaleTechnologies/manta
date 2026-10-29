@@ -183,8 +183,8 @@ fn v5_passes_end_to_end_from_wav() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|s| s["callsign"].as_str() == Some("ZL2XYZ"))
-        .map(|s| s["sample_ts"].as_u64().unwrap() as f64)
+        .find(|s| s["dxCall"].as_str() == Some("ZL2XYZ"))
+        .map(|s| s["sampleTs"].as_u64().unwrap() as f64)
         .expect("ZL2XYZ never validated as a spot");
     assert!(
         validated_ts <= 90.0 * manifest.fs,
@@ -220,7 +220,7 @@ fn v6_passes_end_to_end_from_wav() {
     let half_ts = (manifest.duration_s / 2.0 * manifest.fs) as u64;
     let survives_past_half = events.iter().any(|ev| {
         ev["event"].as_str() == Some("CharDecoded")
-            && ev["sample_ts"].as_u64().unwrap_or(0) > half_ts
+            && ev["sampleTs"].as_u64().unwrap_or(0) > half_ts
     });
     assert!(
         survives_past_half,
@@ -301,8 +301,8 @@ fn v5_passes_end_to_end_with_hsmm_engine() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|s| s["callsign"].as_str() == Some("ZL2XYZ"))
-        .map(|s| s["sample_ts"].as_u64().unwrap() as f64)
+        .find(|s| s["dxCall"].as_str() == Some("ZL2XYZ"))
+        .map(|s| s["sampleTs"].as_u64().unwrap() as f64)
         .expect("ZL2XYZ never validated as a spot");
     assert!(
         validated_ts <= 90.0 * manifest.fs,
@@ -329,7 +329,7 @@ fn v6_passes_end_to_end_with_hsmm_engine() {
     let half_ts = (manifest.duration_s / 2.0 * manifest.fs) as u64;
     let survives_past_half = events.iter().any(|ev| {
         ev["event"].as_str() == Some("CharDecoded")
-            && ev["sample_ts"].as_u64().unwrap_or(0) > half_ts
+            && ev["sampleTs"].as_u64().unwrap_or(0) > half_ts
     });
     assert!(
         survives_past_half,

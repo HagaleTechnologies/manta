@@ -41,6 +41,21 @@ fn section<'a>(md: &'a str, heading: &str) -> &'a str {
     &rest[..end]
 }
 
+/// Text between a `### <heading>` and the next `### ` or `## ` heading.
+fn subsection<'a>(md: &'a str, heading: &str) -> &'a str {
+    let start = md
+        .find(&format!("\n### {heading}"))
+        .unwrap_or_else(|| panic!("no `### {heading}` subsection"));
+    let rest = &md[start + 1..];
+    let end = ["\n## ", "\n### "]
+        .iter()
+        .filter_map(|h| rest[4..].find(h))
+        .min()
+        .map(|i| i + 4)
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
 fn workspace_members() -> Vec<String> {
     let manifest: toml::Value = toml::from_str(&doc("Cargo.toml")).expect("parse Cargo.toml");
     manifest["workspace"]["members"]
@@ -3197,6 +3212,7 @@ fn reference_docs_relative_links_resolve() {
         METRICS_REF,
         "docs/SPOT-SCHEMA.md",
         "docs/LIVE-STATE.md",
+        CLI_JSON_REF,
         "docs/COMPARISON.md",
         DOCS_INDEX,
         DECISIONS_INDEX,
@@ -3325,6 +3341,210 @@ fn spot_schema_transport_points_at_the_stream_contract() {
         .unwrap();
     assert!(transport.contains("contracts/spots/stream.v1.md"));
     assert!(!transport.contains("no history"));
+}
+
+// ---- MAN-139: docs/CLI-JSON.md lists every field of the CLI JSON ----
+
+const CLI_JSON_REF: &str = "docs/CLI-JSON.md";
+
+/// The keys of one serialized JSON object (not its children's).
+fn object_keys(v: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    v.as_object()
+        .unwrap_or_else(|| panic!("not a JSON object: {v}"))
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// Every serialized key has a `` | `key` | `` row in `md`, and every such
+/// row names a serialized key.
+fn assert_cli_json_rows(where_: &str, md: &str, serialized: &std::collections::BTreeSet<String>) {
+    let rows: std::collections::BTreeSet<String> = backticked_rows(md)
+        .iter()
+        .map(|row| {
+            first_code_span(&row[0])
+                .unwrap_or_else(|| panic!("{CLI_JSON_REF} {where_}: a row with no field name"))
+                .to_string()
+        })
+        .collect();
+    for key in serialized {
+        assert!(
+            rows.contains(key),
+            "{CLI_JSON_REF} {where_} has no `| `{key}` |` row"
+        );
+    }
+    for row in &rows {
+        assert!(
+            serialized.contains(row),
+            "{CLI_JSON_REF} documents `{row}` under {where_}, which is not serialized"
+        );
+    }
+}
+
+/// MAN-139: `decode --json`, `run --json` and `doctor --json` print these
+/// types' serde form, and docs/CLI-JSON.md lists every key of it. A key the
+/// page lacks, or a row for a key no longer printed, fails here, as
+/// `every_live_record_field_is_documented` does for docs/LIVE-STATE.md.
+#[test]
+fn cli_json_doc_lists_every_field_both_ways() {
+    use manta_decode::events::{ClosureKind, DecoderEvent};
+    use manta_decode::timing::{ClassEstimate, TimingEstimates};
+    use manta_decode::tree::{Glyph, Prosign};
+    use manta_engine::{DecodeReport, DoctorReport, RttySignalReport, Spot, SpotType};
+
+    let class = Some(ClassEstimate {
+        mean_dits: 1.0,
+        var_dits2: 0.01,
+        n: 3,
+    });
+    let timing = TimingEstimates {
+        dit_ms: 60.0,
+        dot: class,
+        dash: class,
+        element_gap: class,
+        char_gap: class,
+        word_gap: class,
+    };
+    let events = vec![
+        DecoderEvent::CharDecoded {
+            track_id: 1,
+            sample_ts: 59_392,
+            glyph: Glyph::Prosign(Prosign::Ar),
+            confidence: 0.9,
+            alternatives: vec![(Glyph::Char('D'), 0.41)],
+        },
+        DecoderEvent::WordBoundary {
+            track_id: 1,
+            sample_ts: 151_552,
+            confidence: 1.0,
+        },
+        DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 20.0,
+        },
+        DecoderEvent::TrackMeta {
+            track_id: 1,
+            sample_ts: 102_656,
+            snr_2500_db: 22.6,
+            freq_hz: 14_012_341.5,
+        },
+        DecoderEvent::TimingUpdate {
+            track_id: 1,
+            sample_ts: 102_656,
+            timing: timing.clone(),
+        },
+        DecoderEvent::TrackPromoted {
+            track_id: 1,
+            sample_ts: 6_912,
+            freq_hz: 14_012_340.0,
+        },
+        DecoderEvent::TrackClosed {
+            track_id: 2,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(1),
+            },
+        },
+    ];
+    // Exhaustive on purpose: a new variant stops this compiling until it
+    // has a sample above, and so a subsection on the page.
+    for event in &events {
+        match event {
+            DecoderEvent::CharDecoded { .. }
+            | DecoderEvent::WordBoundary { .. }
+            | DecoderEvent::SpeedUpdate { .. }
+            | DecoderEvent::TrackMeta { .. }
+            | DecoderEvent::TimingUpdate { .. }
+            | DecoderEvent::TrackPromoted { .. }
+            | DecoderEvent::TrackClosed { .. } => {}
+        }
+    }
+    let report = DecodeReport {
+        freq_hz: 14_012_341.0,
+        wpm: Some(20.0),
+        text: "CQ".into(),
+        events: events[..1].to_vec(),
+        spots: vec![Spot {
+            callsign: "W1AW".into(),
+            freq_hz: 14_012_341.0,
+            snr_db: 21.0,
+            wpm: 20.0,
+            spot_type: SpotType::Cq,
+            confidence: 0.55,
+            track_id: 1,
+            sample_ts: 2_006_272,
+            rst: Some("599".into()),
+            qrl_query: true,
+        }],
+        timing: Some(timing),
+        rtty: vec![RttySignalReport {
+            mark_hz: 14_080_170.0,
+            space_hz: 14_080_000.0,
+            shift_hz: 170.0,
+            measured_shift_hz: 170.5,
+            marked_sample_ts: 96_000,
+            cleared_sample_ts: Some(192_000),
+            id: 1,
+        }],
+        bad_samples: 1,
+        sample_rate_hz: 96_000.0,
+    };
+    let doctor = DoctorReport {
+        sample_rate_hz: 96_000.0,
+        center_freq_hz: 14_000_000.0,
+        duration: std::time::Duration::from_secs(10),
+        tracks_promoted: 1,
+        detector_confirmations: 1,
+        track_meta_count: 9,
+        tracks_closed: 1,
+        snr_db_min: Some(21.0),
+        snr_db_median: Some(21.5),
+        snr_db_max: Some(22.6),
+        chars_decoded: 12,
+        distinct_chars: 9,
+        spots_confirmed: 0,
+        bad_samples: 1,
+    };
+
+    let md = doc(CLI_JSON_REF);
+    let events_md = section(&md, "Events");
+    let mut names = std::collections::BTreeSet::new();
+    for event in &events {
+        let v = serde_json::to_value(event).unwrap();
+        let name = v["event"].as_str().expect("an `event` name").to_string();
+        let heading = format!("`{name}`");
+        assert_cli_json_rows(
+            &format!("`### {heading}`"),
+            subsection(events_md, &heading),
+            &object_keys(&v),
+        );
+        names.insert(heading);
+    }
+    let subsections: std::collections::BTreeSet<String> = events_md
+        .lines()
+        .filter_map(|l| l.strip_prefix("### "))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        subsections, names,
+        "{CLI_JSON_REF} `## Events` must have one `### `<Event>`` subsection per event"
+    );
+
+    let report = serde_json::to_value(&report).unwrap();
+    let doctor = serde_json::to_value(&doctor).unwrap();
+    let mut doctor_keys = object_keys(&doctor);
+    doctor_keys.extend(["verdict", "checks", "checksStatus"].map(String::from));
+    let checks_keys = ["name", "status", "detail", "fix"].map(String::from).into();
+    for (heading, keys) in [
+        ("`decode --json`", object_keys(&report)),
+        ("Spots", object_keys(&report["spots"][0])),
+        ("`timing`", object_keys(&report["timing"])),
+        ("Timing classes", object_keys(&report["timing"]["dot"])),
+        ("`rtty` entries", object_keys(&report["rtty"][0])),
+        ("`doctor --json`", doctor_keys),
+        ("`checks` entries", checks_keys),
+    ] {
+        assert_cli_json_rows(&format!("`## {heading}`"), section(&md, heading), &keys);
+    }
 }
 
 /// SPEC §5 is the normative event schema, and `TrackClosed` carries a

@@ -37,11 +37,11 @@ fn stderr_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
-/// The report's `freq_hz` from `decode --json`'s single stdout object.
+/// The report's `frequency` from `decode --json`'s single stdout object.
 fn report_freq_hz(out: &Output) -> f64 {
     let report: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("decode --json prints one JSON object");
-    report["freq_hz"].as_f64().expect("freq_hz is a number")
+    report["frequency"].as_f64().expect("frequency is a number")
 }
 
 #[test]

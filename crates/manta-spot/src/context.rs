@@ -19,7 +19,11 @@ use std::sync::LazyLock;
 
 /// The context a decoded callsign was found in. Carried on `Spot` as the
 /// RBN spot-type flag (ARCHITECTURE §7).
+///
+/// JSON: `cq`, `de`, `beacon`, `unknown`, the live-state `spotType` and
+/// `/metrics` `type` labels (MAN-139).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SpotType {
     Cq,
     De,

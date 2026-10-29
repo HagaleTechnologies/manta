@@ -848,7 +848,7 @@ fn decode_with_a_cache_pin_is_repeatable_and_uses_the_pinned_bytes() {
             .as_array()
             .expect("decode --json output must include a 'spots' array")
             .iter()
-            .map(|s| s["callsign"].as_str().unwrap().to_string())
+            .map(|s| s["dxCall"].as_str().unwrap().to_string())
             .collect()
     };
 

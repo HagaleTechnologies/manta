@@ -148,7 +148,7 @@ fn decode(wav: &Path) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
-/// `(callsign, spot_type, sample_ts_s)` for every spot.
+/// `(dxCall, spotType, sampleTs in seconds)` for every spot.
 fn spots(report: &serde_json::Value) -> Vec<(String, String, f64)> {
     report["spots"]
         .as_array()
@@ -156,9 +156,9 @@ fn spots(report: &serde_json::Value) -> Vec<(String, String, f64)> {
         .iter()
         .map(|s| {
             (
-                s["callsign"].as_str().unwrap().to_string(),
-                s["spot_type"].as_str().unwrap().to_string(),
-                s["sample_ts"].as_f64().unwrap() / 96_000.0,
+                s["dxCall"].as_str().unwrap().to_string(),
+                s["spotType"].as_str().unwrap().to_string(),
+                s["sampleTs"].as_f64().unwrap() / 96_000.0,
             )
         })
         .collect()
@@ -171,13 +171,13 @@ fn joined_track_text(report: &serde_json::Value) -> String {
     let mut freqs: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
     let mut texts: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     for ev in report["events"].as_array().unwrap() {
-        let tid = match ev["track_id"].as_u64() {
+        let tid = match ev["trackId"].as_u64() {
             Some(t) => t,
             None => continue,
         };
         match ev["event"].as_str().unwrap() {
             "CharDecoded" => {
-                if let Some(c) = ev["glyph"]["Char"].as_str() {
+                if let Some(c) = ev["glyph"].as_str().filter(|g| g.chars().count() == 1) {
                     texts.entry(tid).or_default().push_str(c);
                 }
             }
@@ -188,7 +188,7 @@ fn joined_track_text(report: &serde_json::Value) -> String {
                 }
             }
             "TrackMeta" => {
-                freqs.insert(tid, ev["freq_hz"].as_f64().unwrap());
+                freqs.insert(tid, ev["frequency"].as_f64().unwrap());
             }
             _ => {}
         }
@@ -221,7 +221,7 @@ fn beacon_spots_exactly_once_under_watterson_poor() {
     let report = decode(fade);
     let spots = spots(&report);
     let beacons: Vec<&(String, String, f64)> =
-        spots.iter().filter(|(_, ty, _)| ty == "Beacon").collect();
+        spots.iter().filter(|(_, ty, _)| ty == "beacon").collect();
     assert_eq!(
         beacons.len(),
         1,
@@ -244,7 +244,7 @@ fn awgn_control_spots_the_beacon_once() {
     let report = decode(awgn);
     let spots = spots(&report);
     let beacons: Vec<&(String, String, f64)> =
-        spots.iter().filter(|(_, ty, _)| ty == "Beacon").collect();
+        spots.iter().filter(|(_, ty, _)| ty == "beacon").collect();
     assert_eq!(
         beacons.len(),
         1,

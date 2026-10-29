@@ -51,10 +51,12 @@ When a run asked for less than 60 s (`--duration`, default 10) reads
 looking for another cause. The line is not printed with `--json`.
 
 All check lines go to stdout. With `--json`, doctor prints one JSON object
-instead: the signal report's keys, plus `checks` (one object per line, with
-`name`, `status`, `detail` and `fix`) and `checks_status` (`fail` if any
-check failed, else `warn` if any warned, else `pass`). When the receiver does
-not open, the object holds only `checks` and `checks_status`.
+instead: the signal report's keys and `verdict`, plus `checks` (one object
+per line, with `name`, `status`, `detail` and `fix`; `status` is `PASS`,
+`WARN`, `FAIL` or `SKIP`, as the line prints it) and `checksStatus` (`FAIL`
+if any check failed, else `WARN` if any warned, else `PASS`). When the
+receiver does not open, the object holds only `checks` and `checksStatus`.
+Every key is listed in [CLI-JSON.md](../CLI-JSON.md#doctor---json).
 
 ## The checks
 

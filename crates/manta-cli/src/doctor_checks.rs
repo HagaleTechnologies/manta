@@ -15,8 +15,10 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// JSON: `PASS`, `WARN`, `FAIL`, `SKIP`, the word `render()` prints
+/// (MAN-139).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "UPPERCASE")]
 pub(crate) enum Status {
     Pass,
     Warn,
@@ -980,15 +982,30 @@ mod tests {
     }
 
     #[test]
-    fn check_serializes_with_lowercase_status_and_null_fix() {
+    fn check_serializes_with_the_text_status_word() {
         assert_eq!(
             serde_json::to_value(Check::pass("config", "ok")).unwrap(),
-            serde_json::json!({"name": "config", "status": "pass", "detail": "ok", "fix": null})
+            serde_json::json!({"name": "config", "status": "PASS", "detail": "ok", "fix": null})
         );
         assert_eq!(
             serde_json::to_value(Check::fail("x", "d", "f")).unwrap(),
-            serde_json::json!({"name": "x", "status": "fail", "detail": "d", "fix": "f"})
+            serde_json::json!({"name": "x", "status": "FAIL", "detail": "d", "fix": "f"})
         );
+    }
+
+    /// MAN-139: `doctor --json`'s status is the word the text line starts
+    /// with.
+    #[test]
+    fn status_json_is_the_render_word() {
+        for status in [Status::Pass, Status::Warn, Status::Fail, Status::Skip] {
+            let check = Check::new("x", status, "d", Some("f".into()));
+            let word = render(&check)
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .to_string();
+            assert_eq!(serde_json::to_value(status).unwrap(), word);
+        }
     }
 
     // --- config ---------------------------------------------------------

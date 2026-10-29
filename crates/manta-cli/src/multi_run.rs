@@ -899,7 +899,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 }
             }
             if json {
-                stdout_lines.line(format_args!("{}", serde_json::json!({ "spot": spot })));
+                stdout_lines.line(format_args!("{}", fmt::spot_json(spot)));
             } else {
                 stdout_lines.line(format_args!("{}", fmt::spot_line(spot)));
             }
