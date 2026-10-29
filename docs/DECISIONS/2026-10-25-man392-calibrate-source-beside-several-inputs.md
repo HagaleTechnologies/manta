@@ -68,10 +68,8 @@ loopback ports. When both are new at once, Linux conntrack keeps one and
 drops the other, and the dropped send returns EPERM. Whether it happens
 depends on timing, so the tests failed intermittently, on the base too.
 
-The MAN-450 decision chose a fix outside this change: reorder
-`broadcast_destinations`, or make the two fakes tolerate a dropped reply.
-This session can push only this branch, so the fake-side fix rides here.
-Both fakes ignore a failed reply, like the stream fake already does.
-Discovery sends four rounds to all three destinations, so another reply
-still arrives. `broadcast_destinations` is unchanged: the client already
-tolerates its own dropped probes.
+The MAN-450 decision put the fix on main, outside this change: both
+fakes now ignore a failed reply send (manta#450, 62e2d747). An earlier
+push of this branch carried the same fake-side fix; merging main dropped
+it, so this branch no longer touches `devices.rs` or
+`tests/hpsdr_discovery.rs`.
