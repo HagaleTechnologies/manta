@@ -572,6 +572,39 @@ fn calibrate_write_saves_into_the_named_input_entry() {
     );
 }
 
+/// MAN-392: a source flag beside several `[[input]]` entries measures a
+/// standalone receiver; calibrate reports the measurement in both output
+/// forms, says nothing is configured for it, and leaves the file as it is.
+#[test]
+fn calibrate_a_source_flag_beside_several_inputs_reports_the_measurement() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = fixture(dir.path(), Some(CARRIER_2_5_PPM), CENTRE);
+    let original = "[[input]]\nname = \"20m\"\ntype = \"file\"\npath = \"ref.wav\"\niq = true\n\n\
+                    [[input]]\nname = \"40m\"\ntype = \"file\"\npath = \"ref.wav\"\niq = true\n";
+    let cfg = write_cfg(dir.path(), original);
+    let source = ["--source-iq", "--source", wav.to_str().unwrap()];
+
+    let out = calibrate(&cfg, &source);
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));
+    for needle in [
+        "correction: freq_correction_ppm = +2.50",
+        "configured: 0.00 ppm, nothing set",
+        "not saved: input overrides were in effect (--source, --source-iq)",
+    ] {
+        assert!(stdout.contains(needle), "no {needle:?} in {stdout}");
+    }
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+
+    let out = calibrate(&cfg, &[&source[..], &["--json"]].concat());
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ppm = v["result"]["freq_correction_ppm"].as_f64().unwrap();
+    assert!((ppm - 2.5).abs() < 0.02, "{ppm}");
+    assert_eq!(v["written"], false);
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+}
+
 /// MAN-334: the retune hint for a KiwiSDR window centred at 7.030 MHz
 /// (+/-5 kHz).
 const KIWI_7030_HINT: &str = "no known reference frequency is usable in this receiver's \
