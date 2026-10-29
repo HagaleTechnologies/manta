@@ -11,6 +11,13 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-27 | MAN-304 | [MAN-304: manta as an UberSDR add-on; the receiver's add-on contract, and packaging waits on the UberSDR input](2026-10-27-man304-ubersdr-addon-gate.md) |
+| 2026-10-25 | MAN-423 | [MAN-423: hops buffered before a spliced loss keep their timestamps; a parked protocol-2 backlog keeps its anchor](2026-10-25-man423-pre-loss-hops-and-parked-backlogs.md) |
+| 2026-10-26 | MAN-249 | [MAN-249: public docs name roles, not machines, people or receiver hosts](2026-10-26-man249-public-disclosure.md) |
+| 2026-10-26 | MAN-292 | [Reconcile completed outages across long sample gaps](2026-10-26-man292-outage-deltas-across-sample-gaps.md) |
+| 2026-10-26 | MAN-436 | [MAN-436: same-input dedupe decides against the station's newest spot across a bucket edge](2026-10-26-man436-dedupe-edge-newest-spot.md) |
+| 2026-10-26 | MAN-302 | [MAN-302: UberSDR wide IQ, clean-room provenance; the input waits on a hardware-free local receiver](2026-10-26-man302-ubersdr-iq-clean-room.md) |
+| 2026-10-26 | MAN-393 | [MAN-393: a one-entry `[[input]]` already loads and takes `MANTA_INPUT_*` like `[input]`](2026-10-26-man393-one-entry-input-array.md) |
 | 2026-10-26 | MAN-289 | [MAN-289: a node spot without a `deCall` is malformed](2026-10-26-man289-node-spot-needs-decall.md) |
 | 2026-10-26 | MAN-290 | [MAN-290: shadow-compare requires the RBN archive's `tx_mode` column](2026-10-26-man290-shadow-compare-requires-tx-mode.md) |
 | 2026-10-25 | MAN-392 | [MAN-392: calibrate reports a standalone receiver's measurement beside several inputs](2026-10-25-man392-calibrate-source-beside-several-inputs.md) |
@@ -41,6 +48,7 @@ Add a row here in the same change that adds a record:
 | 2026-10-19 | MAN-14 | [MAN-14: each receiver's hearing on /metrics, the status line and /status](2026-10-19-man14-per-receiver-hearing-visibility.md) |
 | 2026-10-19 | MAN-307 | [MAN-307: several bands from one HPSDR radio](2026-10-19-man307-hpsdr-multiple-receivers.md) |
 | 2026-10-19 | MAN-305 | [MAN-305: protocol-2 openHPSDR radios are inputs; the protocol is discovered, and lost datagrams reach the decoder as missing input](2026-10-19-man305-hpsdr-protocol-2-input.md) |
+| 2026-10-19 | MAN-309 | [MAN-309: record the decoded IQ to a file and replay it deterministically](2026-10-19-man309-iq-recording-and-replay.md) |
 | 2026-10-19 | MAN-306 | [Discover an openHPSDR radio when no address is configured](2026-10-19-man306-openhpsdr-discovery.md) |
 | 2026-10-18 | MAN-398 | [MAN-398: gap-corroborated recovery from a fragment-seeded speed lock](2026-10-18-man398-gap-corroborated-badlock-recovery.md) |
 | 2026-10-17 | MAN-108 | [MAN-108: a fading signal keeps its track through the fade (DORMANT re-acquisition)](2026-10-17-man108-dormant-track-reacquisition.md) |

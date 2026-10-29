@@ -42,9 +42,10 @@ impl FakeDiscoveryRadio {
                             reply[3..9].copy_from_slice(mac);
                             reply[9] = 43;
                             reply[10] = 6;
-                            // Conntrack can drop this reply with EPERM when it
-                            // races the client's own probe to 127.0.0.1 (MAN-450);
-                            // discovery asks every destination again each round.
+                            // Discovery probes several addresses, so it answers more than once.
+                            // Under conntrack (Docker networks) two mirror-image loopback flows can
+                            // collide and the kernel drops one send with EPERM; a real radio would
+                            // just lose that duplicate reply, so the fake must not panic on it.
                             let _ = socket.send_to(&reply, addr);
                         }
                     } else if n == 60 && buf[..4] == [0xef, 0xfe, 4, 1] {

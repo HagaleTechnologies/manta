@@ -16,9 +16,10 @@ an Aggregator ([secondary-skimmer field-node runbook](secondary-skimmer-field-no
 - **A manta developer**, who receives the files privately and does the
   comparison.
 
-First candidate: George, K5TR, who runs SkimSrv and supplied manta's
-real-signal audio corpus (`crates/manta-testkit/audio-corpus/README.md`). He
-had not been asked as of 2026-10-11.
+First candidate: the volunteer operator who runs SkimSrv and supplied
+manta's real-signal audio corpus
+(`crates/manta-testkit/audio-corpus/README.md`); the maintainers hold the
+contact. Not yet asked as of 2026-10-11.
 
 ## Asking for consent
 
