@@ -156,6 +156,35 @@
 #exclude_spotters = []                # never count these skimmers; your own callsign is always excluded
 
 
+# --- Relay another skimmer's spots ---------------------------------------------
+# Forwards the spots of another CW skimmer on your network (CW Skimmer,
+# SkimSrv or a second manta) through [[rbn_uplink]], under that skimmer's own
+# call. Only lines the skimmer spotted under `callsign` are forwarded. Needs an
+# enabled [[rbn_uplink]]; the uplink's dry_run, spot_types and
+# max_spots_per_minute apply. Restart-only. Repeat the block per skimmer.
+
+#[[skimmer_relay]]
+
+#host = "<skimmer-host>"              # no default: the skimmer's host name or address
+#port = 7300                          # no default: the skimmer's telnet port
+#callsign = "N0CALL-2"                # no default: the call that skimmer spots under
+#enabled = true                       # false keeps the block but does not connect
+
+
+# --- Relay WSJT-X FT8/FT4 decodes ----------------------------------------------
+# Listens for WSJT-X/JTDX decodes by UDP (in WSJT-X: Settings > Reporting >
+# UDP Server) and forwards new FT8/FT4 CQ decodes through [[rbn_uplink]] as
+# digital spots. Anything that can send to `listen` can put spots on the
+# uplink under `callsign`, so keep it on 127.0.0.1 unless WSJT-X runs
+# elsewhere. Needs an enabled [[rbn_uplink]]. Restart-only.
+
+#[[wsjtx_relay]]
+
+#callsign = "N0CALL"                  # no default: the call these spots go out under
+#listen = "127.0.0.1:2237"            # WSJT-X's default UDP server; or a multicast group such as 224.0.0.1:2237
+#enabled = true                       # false keeps the block but does not listen
+
+
 # --- Receiver ----------------------------------------------------------------
 # With `type` and every receiver setting commented out, manta listens to
 # the system's default sound card, or to whatever source the command line

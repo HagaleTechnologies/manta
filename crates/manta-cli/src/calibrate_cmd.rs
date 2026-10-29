@@ -517,10 +517,14 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
     }
 
     // The file's own value, read from its text: the loaded config already
-    // carries the environment overlay.
-    let file_value = match config_text {
-        Some(text) => config_edit::set_freq_correction_ppm(text, 0.0, input_name.as_deref())?.1,
-        None => None,
+    // carries the environment overlay. None when a source flag replaced the
+    // file's receiver: the value is not the measured receiver's, and with
+    // several [[input]] entries there is no entry to read it from (MAN-392).
+    let file_value = match (config_text, resolved.replaced_file_source) {
+        (Some(text), None) => {
+            config_edit::set_freq_correction_ppm(text, 0.0, input_name.as_deref())?.1
+        }
+        _ => None,
     };
     let origin = configured_origin(&resolved, &loaded, config_path.as_deref(), file_value);
     let configured = resolved.freq_correction_ppm;

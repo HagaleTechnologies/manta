@@ -2153,6 +2153,53 @@ fn man90_claims_table_carries_the_man319_claims() {
     }
 }
 
+/// MAN-320 D13: the two relay claims (a per-spot spotter other than the
+/// login call on one connection, and the FT8/FT4 line layout) are open rows
+/// in MAN-90's table until a capture settles them.
+#[test]
+fn man90_claims_table_carries_the_man320_claims() {
+    let decision = doc(MAN90_DECISION);
+    for id in ["C12", "C13"] {
+        let row = decision
+            .lines()
+            .find(|l| l.contains(&format!("| {id} |")))
+            .unwrap_or_else(|| panic!("decision record has no {id} row"));
+        assert!(
+            row.trim_end().ends_with("| open |"),
+            "{id} row is not open: {row}"
+        );
+    }
+}
+
+/// MAN-320 D1: the relays narrowed two README non-goals rather than
+/// deleting them. Both lines must stay, and both must name MAN-320, so the
+/// narrowing stays visible.
+#[test]
+fn readme_non_goals_name_the_relay_scope() {
+    let readme = doc("README.md");
+    let start = readme
+        .find("\n## Non-goals\n")
+        .expect("README has a ## Non-goals section");
+    let rest = &readme[start + 1..];
+    let end = rest[1..].find("\n## ").map_or(rest.len(), |i| i + 1);
+    let section = &rest[..end];
+    // Each bullet runs to the next "\n- " (bullets wrap over several lines).
+    let bullets: Vec<&str> = section.split("\n- ").collect();
+    for lead in [
+        "Not a cluster network",
+        "Not a general digital-mode skimmer",
+    ] {
+        let bullet = bullets
+            .iter()
+            .find(|b| b.starts_with(lead))
+            .unwrap_or_else(|| panic!("README Non-goals has no \"{lead}\" bullet"));
+        assert!(
+            bullet.contains("MAN-320"),
+            "README Non-goals \"{lead}\" bullet does not name MAN-320: {bullet}"
+        );
+    }
+}
+
 /// MAN-90: every relative link in the two records resolves.
 #[test]
 fn man90_records_relative_links_resolve() {
@@ -3111,15 +3158,35 @@ fn docs_index_links_every_runbook() {
     }
 }
 
+/// MAN-440: scripts/decisions-index.py builds each docs/DECISIONS/README.md row from the
+/// record's file name (date, ticket) and its one-line `# ` heading (title), so a record PR
+/// adds only its file. Keep this equal to NAME in scripts/decisions-index.py;
+/// scripts/tests/test_decisions_index.py checks the two match.
+const DECISION_RECORD_NAME: &str =
+    r"^([0-9]{4}-[0-9]{2}-[0-9]{2})-(?:man-?([0-9]+)-)?[a-z0-9][a-z0-9-]*\.md$";
+
 #[test]
-fn decisions_index_links_every_record() {
-    let targets = link_targets(&doc(DECISIONS_INDEX));
+fn decision_records_have_indexable_names_and_headings() {
+    let name = regex::Regex::new(DECISION_RECORD_NAME).unwrap();
     let records = md_files_in("docs/DECISIONS");
     assert!(!records.is_empty(), "docs/DECISIONS has no records");
-    for name in records {
+    for file in records {
         assert!(
-            targets.iter().any(|t| t.split('#').next() == Some(name.as_str())),
-            "{DECISIONS_INDEX} does not link {name}: add a `| date | ticket | [title]({name}) |` row"
+            name.is_match(&file),
+            "docs/DECISIONS/{file}: name it YYYY-MM-DD-manNNN-slug.md (lowercase slug); the index reads the date and ticket from the name"
+        );
+        let md = doc(&format!("docs/DECISIONS/{file}"));
+        let mut lines = md.lines();
+        let first = lines.next().unwrap_or("");
+        assert!(
+            first
+                .strip_prefix("# ")
+                .is_some_and(|title| !title.trim().is_empty()),
+            "docs/DECISIONS/{file}: line 1 must be the record's `# ` title"
+        );
+        assert!(
+            lines.next().is_none_or(|l| l.trim().is_empty()),
+            "docs/DECISIONS/{file}: line 2 must be blank; a `# ` heading is one line and the index title is that line"
         );
     }
 }

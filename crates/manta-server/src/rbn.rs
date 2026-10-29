@@ -7,6 +7,7 @@
 //! byte-for-byte (see `LIVE_RBN_CAPTURE` in the tests below and
 //! `docs/DECISIONS/2026-09-06-man88-ak1a-column-layout.md`).
 
+use crate::relay::{RelayMode, RelaySpot};
 use manta_spot::{Spot, SpotType};
 
 /// MAN-102 / decision D3 (2026-09-06 broad review): RBN and CW Skimmer
@@ -171,12 +172,70 @@ pub fn format_line(
     unix_ts_secs: i64,
     line_format: LineFormat,
 ) -> String {
-    let freq_khz = spot.freq_hz / 1000.0;
-    let secs_of_day = unix_ts_secs.rem_euclid(86_400);
+    render(&LineFields {
+        spotter_call,
+        freq_hz: spot.freq_hz,
+        callsign: &spot.callsign,
+        mode: match line_format {
+            LineFormat::Rbn => "CW",
+            LineFormat::Skimmer => "",
+        },
+        snr_db: (spot.snr_db + RBN_REF_BW_CORRECTION_DB).round() as i32,
+        wpm: Some(spot.wpm.round() as i32),
+        type_label: spot_type_label(spot.spot_type, &spot.callsign),
+        unix_ts_secs,
+    })
+}
+
+/// MAN-320: renders a relayed spot, always in `LineFormat::Rbn` (the
+/// uplink's layout, MAN-88 D1), under the relay's own spotter call. The SNR
+/// is forwarded as the source quoted it (MAN-320 D8: no 2500 -> 500 Hz
+/// correction). An FT8/FT4 spot puts `FT8`/`FT4` in the mode column and
+/// leaves the speed field blank; the type and time fields keep their RBN
+/// columns 63 and 71 (MAN-90 claim C13, unverified).
+pub fn format_relay_line(spot: &RelaySpot) -> String {
+    let (mode, wpm) = match spot.mode {
+        RelayMode::Cw { wpm } => ("CW", Some(i32::try_from(wpm).unwrap_or(i32::MAX))),
+        RelayMode::Ft8 => ("FT8", None),
+        RelayMode::Ft4 => ("FT4", None),
+    };
+    render(&LineFields {
+        spotter_call: &spot.spotter,
+        freq_hz: spot.freq_hz,
+        callsign: &spot.callsign,
+        mode,
+        snr_db: spot.snr_db,
+        wpm,
+        type_label: spot_type_label(spot.spot_type, &spot.callsign),
+        unix_ts_secs: spot.unix_ts,
+    })
+}
+
+/// The fields one AK1A line carries, already converted to their wire
+/// values. `mode` is the mode column's text: `"CW"`, `"FT8"` or `"FT4"`
+/// in the RBN layout (padded to its 6 columns), or `""` for the Skimmer
+/// layout's 2-wide field. `wpm` is `None` for a digital spot, which leaves
+/// the speed field blank.
+struct LineFields<'a> {
+    spotter_call: &'a str,
+    freq_hz: f64,
+    callsign: &'a str,
+    mode: &'a str,
+    snr_db: i32,
+    wpm: Option<i32>,
+    type_label: &'static str,
+    unix_ts_secs: i64,
+}
+
+/// The shared column geometry of [`format_line`] and [`format_relay_line`]
+/// (MAN-88): see `format_line`'s doc comment for the anchoring rules.
+fn render(fields: &LineFields<'_>) -> String {
+    let freq_khz = fields.freq_hz / 1000.0;
+    let secs_of_day = fields.unix_ts_secs.rem_euclid(86_400);
     let hour = secs_of_day / 3600;
     let minute = (secs_of_day % 3600) / 60;
 
-    let identity = format!("DX de {spotter_call}-#:");
+    let identity = format!("DX de {}-#:", fields.spotter_call);
     // `{:.2}` is a *minimum* width: a 2 m frequency (`144110.00`, 9 chars)
     // widens the field rather than losing a digit. Where the identity's
     // own padding cannot absorb that extra column, the callsign gap below
@@ -196,7 +255,7 @@ pub fn format_line(
     // spotter, or a 6-character one on 2 m) does not push the callsign
     // and everything after it one column right.
     let call_gap = CALL_START_COL.saturating_sub(freq_end_col + 1).max(1);
-    let call_end_col = freq_end_col + call_gap + spot.callsign.chars().count();
+    let call_end_col = freq_end_col + call_gap + fields.callsign.chars().count();
     // Same rule for the mode column, with one refinement the review of PR
     // #114 asked for: the callsign column is exactly 15 wide (27-41), so a
     // call that *fills* it is a fit, not an overflow -- the gap before the
@@ -215,9 +274,10 @@ pub fn format_line(
     };
     // The mode field's own trailing padding is the separator to the SNR
     // field -- there is no extra gap in the RBN layout (columns 42-47).
-    let mode = match line_format {
-        LineFormat::Rbn => "CW    ",
-        LineFormat::Skimmer => "  ",
+    let mode = if fields.mode.is_empty() {
+        "  ".to_string()
+    } else {
+        format!("{:<6}", fields.mode)
     };
     let mode_end_col = call_end_col + mode_gap + mode.chars().count();
 
@@ -229,29 +289,37 @@ pub fn format_line(
     // frequency and callsign fields above do -- so a wide SNR (or a wide
     // WPM) widens only its own field instead of walking the type and time
     // fields off the columns a fixed-column parser reads.
-    let snr = format!(
-        "{}",
-        (spot.snr_db + RBN_REF_BW_CORRECTION_DB).round() as i32
-    );
+    let snr = format!("{}", fields.snr_db);
     let snr_gap = SNR_END_OFFSET.saturating_sub(snr.chars().count());
     let snr_end_col = mode_end_col + snr_gap + snr.chars().count();
     // ` dB` is part of the SNR field, not a separator.
     let db_end_col = snr_end_col + " dB".len();
 
-    let wpm = format!("{}", spot.wpm.round() as i32);
-    let wpm_gap = (mode_end_col + WPM_END_OFFSET)
-        .saturating_sub(db_end_col + wpm.chars().count())
-        .max(1);
-    let wpm_end_col = db_end_col + wpm_gap + wpm.chars().count();
-    // ` WPM` is part of the WPM field, not a separator.
-    let wpm_unit_end_col = wpm_end_col + " WPM".len();
+    // MAN-320: a digital spot has no speed; its field is left blank and the
+    // type gap below is computed from the end of ` dB`, so the type and
+    // time fields keep their anchors.
+    let (wpm_field, wpm_unit_end_col) = match fields.wpm {
+        Some(wpm) => {
+            let wpm = format!("{wpm}");
+            let wpm_gap = (mode_end_col + WPM_END_OFFSET)
+                .saturating_sub(db_end_col + wpm.chars().count())
+                .max(1);
+            let wpm_end_col = db_end_col + wpm_gap + wpm.chars().count();
+            // ` WPM` is part of the WPM field, not a separator.
+            (
+                format!("{:wpm_gap$}{wpm} WPM", ""),
+                wpm_end_col + " WPM".len(),
+            )
+        }
+        None => (String::new(), db_end_col),
+    };
 
     // The type field is left-justified in a 6-column MINIMUM; `BEACON`
     // fills it exactly. MAN-94's `NCDXF B` is 7 characters and runs one
     // column past it, into the two-column gap before the time field, so
     // one separating space remains and the time keeps its anchor. The time
     // anchor below is computed from the rendered width either way.
-    let ctx = format!("{:<6}", spot_type_label(spot.spot_type, &spot.callsign));
+    let ctx = format!("{:<6}", fields.type_label);
     let type_gap = (mode_end_col + TYPE_START_OFFSET)
         .saturating_sub(wpm_unit_end_col + 1)
         .max(1);
@@ -262,7 +330,7 @@ pub fn format_line(
 
     format!(
         "{identity}{:freq_gap$}{freq}{:call_gap$}{call}{:mode_gap$}{mode}\
-         {:snr_gap$}{snr} dB{:wpm_gap$}{wpm} WPM{:type_gap$}{ctx}\
+         {:snr_gap$}{snr} dB{wpm_field}{:type_gap$}{ctx}\
          {:time_gap$}{hour:02}{minute:02}Z",
         "",
         "",
@@ -270,8 +338,7 @@ pub fn format_line(
         "",
         "",
         "",
-        "",
-        call = spot.callsign,
+        call = fields.callsign,
     )
 }
 
@@ -828,5 +895,114 @@ mod tests {
         // Columns 1-41 are identical to the RBN layout.
         let rbn = format_line(&capture_spot(), "S53A", 2 * 3600 + 36 * 60, LineFormat::Rbn);
         assert_eq!(line[..41], rbn[..41]);
+    }
+
+    fn relay(
+        spotter: &str,
+        call: &str,
+        freq_hz: f64,
+        mode: RelayMode,
+        snr_db: i32,
+        spot_type: SpotType,
+        unix_ts: i64,
+    ) -> RelaySpot {
+        RelaySpot {
+            spotter: std::sync::Arc::from(spotter),
+            callsign: call.to_string(),
+            freq_hz,
+            mode,
+            snr_db,
+            spot_type,
+            unix_ts,
+        }
+    }
+
+    /// MAN-320: a relayed CW spot with the capture's fields renders the
+    /// capture byte for byte -- one geometry for own and relayed spots.
+    #[test]
+    fn a_relayed_cw_spot_with_the_captures_fields_is_the_capture() {
+        let spot = relay(
+            "S53A",
+            "N8II",
+            14_011_900.0,
+            RelayMode::Cw { wpm: 25 },
+            21,
+            SpotType::Cq,
+            2 * 3600 + 36 * 60,
+        );
+        assert_eq!(format_relay_line(&spot), LIVE_RBN_CAPTURE);
+    }
+
+    /// MAN-320 D13 (MAN-90 C13, unverified): FT8 in the mode column, a
+    /// blank speed field, and the type/time columns where RBN puts them.
+    #[test]
+    fn a_relayed_ft8_cq_has_a_blank_speed_field_and_keeps_type_and_time_columns() {
+        let spot = relay(
+            "W1ABC",
+            "K2DEF",
+            14_075_520.0,
+            RelayMode::Ft8,
+            -12,
+            SpotType::Cq,
+            12 * 3600 + 34 * 60,
+        );
+        let line = format_relay_line(&spot);
+        assert_eq!(
+            line,
+            "DX de W1ABC-#:  14075.52  K2DEF          FT8   -12 dB         CQ      1234Z"
+        );
+        assert_eq!(col_of(&line, "CQ"), 63);
+        assert_eq!(col_of(&line, "1234Z"), 71);
+    }
+
+    #[test]
+    fn a_relayed_ft4_cq_renders_ft4() {
+        let spot = relay(
+            "W1ABC",
+            "JA1XYZ",
+            7_075_750.0,
+            RelayMode::Ft4,
+            3,
+            SpotType::Cq,
+            7 * 60,
+        );
+        assert_eq!(
+            format_relay_line(&spot),
+            "DX de W1ABC-#:   7075.75  JA1XYZ         FT4    3 dB          CQ      0007Z"
+        );
+    }
+
+    #[test]
+    fn a_relayed_beacon_on_the_ncdxf_roster_reads_ncdxf_b() {
+        let spot = relay(
+            "S53A",
+            "4U1UN",
+            14_100_000.0,
+            RelayMode::Cw { wpm: 25 },
+            21,
+            SpotType::Beacon,
+            2 * 3600 + 36 * 60,
+        );
+        assert_eq!(
+            format_relay_line(&spot),
+            "DX de S53A-#:   14100.00  4U1UN          CW    21 dB  25 WPM  NCDXF B 0236Z"
+        );
+    }
+
+    #[test]
+    fn a_relayed_ssid_spotter_keeps_its_ssid() {
+        let spot = relay(
+            "W3XYZ-2",
+            "JA1ABC",
+            14_027_100.0,
+            RelayMode::Cw { wpm: 28 },
+            30,
+            SpotType::Cq,
+            3 * 3600 + 12 * 60,
+        );
+        assert_eq!(
+            format_relay_line(&spot),
+            "DX de W3XYZ-2-#: 14027.10 JA1ABC         CW    30 dB  28 WPM  CQ      0312Z"
+        );
     }
 }

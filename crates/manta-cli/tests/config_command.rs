@@ -478,6 +478,8 @@ fn check_prints_one_summary_line_per_table() {
             "server",
             "rbn_uplink",
             "rbn_compare",
+            "skimmer_relay",
+            "wsjtx_relay",
             "input",
             "spot",
             "detector",
@@ -1412,4 +1414,120 @@ fn hpsdr_discovery_config_check_normalizes_mac_without_opening_a_radio() {
         .output()
         .unwrap();
     assert!(succeeds(&overridden).contains("mac=00:11:22:33:44:55"));
+}
+
+// ---- MAN-320: [[skimmer_relay]] / [[wsjtx_relay]]
+
+const RELAY_BASE: &str = "[server]\nstation_callsign = \"W1ABC\"\noperator_grid = \"FN42ab\"\n\
+                          bind_addr = \"127.0.0.1\"\n\
+                          [[rbn_uplink]]\nenabled = true\ntarget_host = \"127.0.0.1\"\n\
+                          target_port = 7550\ndry_run = true\n";
+const SKIMMER_TOML: &str =
+    "[[skimmer_relay]]\nhost = \"192.168.1.20\"\nport = 7300\ncallsign = \"W1ABC-2\"\n";
+const WSJTX_TOML: &str = "[[wsjtx_relay]]\nlisten = \"127.0.0.1:2237\"\ncallsign = \"W1ABC\"\n";
+
+#[test]
+fn check_prints_the_relay_summary_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cfg(
+        dir.path(),
+        "manta.toml",
+        &format!("{RELAY_BASE}{SKIMMER_TOML}{WSJTX_TOML}"),
+    );
+    let out = succeeds(&check_file(&path));
+    let lines: Vec<&str> = out.lines().collect();
+    let at = |line: &str| {
+        lines
+            .iter()
+            .position(|l| *l == line)
+            .unwrap_or_else(|| panic!("no {line:?} in {out}"))
+    };
+    let compare = at("rbn_compare: none");
+    let skimmer = at("skimmer_relay: host=192.168.1.20 port=7300 callsign=W1ABC-2 enabled=true");
+    let wsjtx = at("wsjtx_relay: listen=127.0.0.1:2237 callsign=W1ABC enabled=true");
+    assert_eq!((skimmer, wsjtx), (compare + 1, compare + 2), "{out}");
+    assert!(lines[wsjtx + 1].starts_with("input: "), "{out}");
+
+    let path = write_cfg(dir.path(), "plain.toml", RELAY_BASE);
+    let out = succeeds(&check_file(&path));
+    assert!(
+        out.contains("\nskimmer_relay: none\nwsjtx_relay: none\n"),
+        "{out}"
+    );
+}
+
+#[test]
+fn check_rejects_each_relay_error_with_its_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let no_uplink = "[server]\nstation_callsign = \"W1ABC\"\nbind_addr = \"127.0.0.1\"\n";
+    let cases: Vec<(String, &str)> = vec![
+        (
+            format!("{no_uplink}{SKIMMER_TOML}"),
+            "[[skimmer_relay]] 192.168.1.20:7300 forwards spots only through [[rbn_uplink]] -- \
+             add an enabled [[rbn_uplink]] block, or set enabled = false on this relay",
+        ),
+        (
+            format!("{no_uplink}{WSJTX_TOML}"),
+            "[[wsjtx_relay]] 127.0.0.1:2237 forwards spots only through [[rbn_uplink]] -- add \
+             an enabled [[rbn_uplink]] block, or set enabled = false on this relay",
+        ),
+        (
+            format!("{RELAY_BASE}{}", SKIMMER_TOML.replace("W1ABC-2", "W1ABC")),
+            "[[skimmer_relay]] 192.168.1.20:7300 has callsign = \"W1ABC\", this station's own \
+             call -- a skimmer relay forwards another skimmer's spots under that skimmer's own \
+             call (e.g. \"W1ABC-2\"); manta already forwards its own",
+        ),
+        (
+            format!("{RELAY_BASE}{SKIMMER_TOML}{SKIMMER_TOML}"),
+            "[[skimmer_relay]] 192.168.1.20:7300 is listed twice",
+        ),
+        (
+            format!("{RELAY_BASE}{WSJTX_TOML}{WSJTX_TOML}"),
+            "[[wsjtx_relay]] 127.0.0.1:2237 is listed twice",
+        ),
+        (
+            format!(
+                "{RELAY_BASE}[skimmer_relay]\nhost = \"h\"\nport = 1\ncallsign = \"W1ABC-2\"\n"
+            ),
+            "skimmer_relay must be written [[skimmer_relay]] (an array of tables)",
+        ),
+        (
+            format!(
+                "{RELAY_BASE}[[wsjtx_relay]]\nlisten = \"[ff02::1]:2237\"\ncallsign = \"W1ABC\"\n"
+            ),
+            "[[wsjtx_relay]]: listen \"[ff02::1]:2237\" is an IPv6 multicast group -- use an \
+             IPv4 group such as \"224.0.0.1:2237\", or a unicast address",
+        ),
+        (
+            format!(
+                "{RELAY_BASE}{}",
+                SKIMMER_TOML.replace("W1ABC-2", "W1ABC-100")
+            ),
+            "[[skimmer_relay]]: callsign \"W1ABC-100\" is not a plausible callsign (an SSID must \
+             be -1 through -99)",
+        ),
+        (
+            format!(
+                "{RELAY_BASE}{}",
+                SKIMMER_TOML.replace("192.168.1.20", "<skimmer-host>")
+            ),
+            "[[skimmer_relay]]: host \"<skimmer-host>\" is the scaffold placeholder -- set the \
+             skimmer's host name or address",
+        ),
+    ];
+    for (i, (body, message)) in cases.iter().enumerate() {
+        let path = write_cfg(dir.path(), &format!("relay{i}.toml"), body);
+        let err = fails(&check_file(&path));
+        assert!(
+            err.contains(&format!("{}: {message}", path.display())),
+            "case {i}: {err}"
+        );
+    }
+    // The unrecognized-table list names both relay tables.
+    let path = write_cfg(dir.path(), "unknown.toml", "[relay_source]\nx = 1\n");
+    let err = fails(&check_file(&path));
+    assert!(
+        err.contains("[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [input], "),
+        "{err}"
+    );
 }

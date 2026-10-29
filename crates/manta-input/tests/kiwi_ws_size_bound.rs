@@ -41,7 +41,22 @@ fn frame_larger_than_the_bound_is_rejected_not_buffered() {
         let mut oversized = Vec::with_capacity(64 * 1024 + 4096);
         oversized.extend_from_slice(b"SND");
         oversized.resize(64 * 1024 + 4096, 0);
-        ws.send(Message::binary(oversized)).unwrap();
+        match ws.send(Message::binary(oversized)) {
+            Ok(()) => {}
+            // The client rejects the frame from its header and drops the
+            // connection with the body still unread, so this write can race
+            // that reset (WSAECONNABORTED/WSAECONNRESET on Windows, EPIPE on
+            // macOS). A peer-close here is the expected rejection; the
+            // client-side assertions below decide.
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                ) => {}
+            Err(e) => panic!("sending the oversized frame: {e}"),
+        }
         // Park until the client hangs up (its read errors on the oversized
         // frame, then it drops the socket): drain every SET it sends, so
         // neither a close nor a reset from this side can be what ends the
