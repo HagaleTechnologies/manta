@@ -1571,11 +1571,7 @@ fn validate_input(
 /// D5: every source key set belongs to `input.type`, and a source key
 /// needs a type.
 fn check_input_keys(t: &InputToml) -> std::result::Result<(), String> {
-<<<<<<< HEAD
-    let set: [(&str, bool); 21] = [
-=======
-    let set: [(&str, bool); 22] = [
->>>>>>> 62e2d747901c83d0bc3c0ac6b26d0656c7617085
+    let set: [(&str, bool); 23] = [
         ("receivers", t.receivers.is_some()),
         ("device", t.device.is_some()),
         ("path", t.path.is_some()),

@@ -658,17 +658,7 @@ impl Protocol2IqSource {
                 );
             }
             self.send_keepalive_if_due()?;
-<<<<<<< HEAD
             self.tick_attenuation()?;
-            let (len, from) = match self.socket.recv_from(&mut self.recv_buf) {
-                Ok(got) => got,
-                Err(e) => match classify_recv_error(&e) {
-                    RecvErrorAction::Retry | RecvErrorAction::Timeout => continue,
-                    RecvErrorAction::Fatal => {
-                        return Err(e).context("receive from HPSDR protocol 2 radio");
-                    }
-                },
-=======
             let (len, from) = if let Some((bytes, from)) = self.look_ahead.pop_front() {
                 self.recv_buf[..bytes.len()].copy_from_slice(&bytes);
                 (bytes.len(), from)
@@ -682,7 +672,6 @@ impl Protocol2IqSource {
                         }
                     },
                 }
->>>>>>> 62e2d747901c83d0bc3c0ac6b26d0656c7617085
             };
             let from_radio = match from {
                 SocketAddr::V4(v4) => *v4.ip() == self.radio_ip,
