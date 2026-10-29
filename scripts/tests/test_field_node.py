@@ -432,6 +432,21 @@ class RecordSpotsTests(unittest.TestCase):
         self.assertEqual(self.read("spots-2026-10-01.jsonl"), good + b"\n")
         self.assertEqual(sum(1 for m in logs if m.startswith("invalid line")), 5)
 
+    def test_spot_without_de_call_is_invalid(self):
+        # PRRT_kwDOTQvU8M6qkqnn (MAN-289): a spot with no deCall was archived, and
+        # shadow-compare.py then had no node identity to exclude from corroboration.
+        ts = int(datetime(2026, 10, 1, 12, tzinfo=timezone.utc).timestamp())
+        good = spot_line("W1AW", ts)
+        base = json.loads(good)
+        bad = [json.dumps({k: v for k, v in base.items() if k != "deCall"}).encode()]
+        bad += [json.dumps(dict(base, deCall=v)).encode() for v in (None, "", "   ", 5)]
+        srv = LineServer([b"\n".join(bad + [good]) + b"\n"])
+        logs = []
+        stats = self.run_until(srv, 1, logs=logs)
+        self.assertEqual((stats["invalid"], stats["written"]), (5, 1))
+        self.assertEqual(self.read("spots-2026-10-01.jsonl"), good + b"\n")
+        self.assertEqual(sum(1 for m in logs if m.startswith("invalid line skipped (missing deCall)")), 5)
+
     def test_record_spots_archives_grades_separately(self):
         spot_ts = int(datetime(2026, 10, 11, 23, 58, tzinfo=timezone.utc).timestamp())
         spot = spot_line("W1AW", spot_ts)
@@ -1086,6 +1101,152 @@ class ReportTests(unittest.TestCase):
         s = summ(recs)
         self.assertAlmostEqual(s["down_s"], 1200.0)
         self.assertAlmostEqual(s["counter_down_s"], 0.0)
+
+    def gap_outage_ledger(self, delta=390, mixed=False):
+        offsets = [0, 60, 120, 460, 520] if mixed else [0, 60, 400]
+        recs = make_ledger(days=(len(offsets) - 1) * 60 / DAY, step=60)
+        samples = [r for r in recs if r["kind"] == "sample"]
+        for i, (sample, offset) in enumerate(zip(samples, offsets)):
+            sample["ts"] = T0 + offset
+            if 0 < i < len(samples) - 1:
+                sample.update(healthz=503, source_health={"soapy": 0})
+        samples[-1].update(source_down_s={"soapy": delta}, source_outages={"soapy": 1})
+        recs[-1]["ts"] = T0 + offsets[-1] + 60
+        recs[0]["reason"] = recs[-1]["reason"] = "MAN-292"
+        return recs
+
+    def assert_gap_buckets(self, summary, up, down, counter):
+        self.assertAlmostEqual(summary["up_s"], up)
+        self.assertAlmostEqual(summary["down_s"], down)
+        self.assertAlmostEqual(summary["unobserved_s"], 340)
+        self.assertAlmostEqual(summary["counter_down_s"], counter)
+        self.assertAlmostEqual(
+            summary["up_s"] + summary["down_s"] + summary["unobserved_s"],
+            summary["window"]["span_s"] - summary["planned_excluded_s"])
+
+    def test_outage_completing_across_long_gap_reconciles(self):
+        recs = self.gap_outage_ledger()
+        s = summ(recs, interval_s=60, min_days=0.001, min_availability=0.20)
+        self.assert_gap_buckets(s, up=70, down=50, counter=50)
+        self.assertAlmostEqual(s["availability"], 70 / 460)
+        self.assertEqual(s["source_outages"]["down_s"], 390)
+        self.assertFalse(crit(s, "D-A")["pass"])
+        self.assertEqual(s["verdict"], "FAIL")
+        # The excess belongs to the preceding healthy interval; the gap
+        # itself remains unobserved, even when reporting only that interval.
+        before = summ(recs, interval_s=60, from_ts=T0, to_ts=T0 + 60)
+        self.assertEqual((before["up_s"], before["down_s"]), (10, 50))
+
+    def test_long_gap_outage_report_json_and_markdown(self):
+        recs = self.gap_outage_ledger()
+        for fmt in ("json", "markdown"):
+            with self.subTest(format=fmt):
+                r = self.report(recs, "--interval-s", "60", "--min-days", "0.001",
+                                "--min-availability", "0.20", "--format", fmt)
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertEqual(r.stderr, "")
+                if fmt == "json":
+                    s = json.loads(r.stdout)
+                    self.assert_gap_buckets(s, up=70, down=50, counter=50)
+                    self.assertAlmostEqual(s["availability"], 70 / 460)
+                    self.assertEqual(s["source_outages"]["down_s"], 390)
+                    self.assertFalse(crit(s, "D-A")["pass"])
+                    self.assertEqual(s["verdict"], "FAIL")
+                else:
+                    self.assertIn("**Overall: FAIL**", r.stdout)
+                    self.assertIn("Availability: 15.22% (min 20.00%): FAIL (D-A)", r.stdout)
+                    self.assertIn("Up 70 s, down 50 s (of which 50 s from source-outage counters), "
+                                  "unobserved 340 s", r.stdout)
+                    self.assertIn("Source outages: 1, down 390 s", r.stdout)
+
+    def test_outage_covered_by_long_gap_not_double_counted(self):
+        for delta in (300, 340):
+            with self.subTest(delta=delta):
+                s = summ(self.gap_outage_ledger(delta), interval_s=60)
+                self.assert_gap_buckets(s, up=120, down=0, counter=0)
+
+    def test_overlapping_source_outages_inside_a_gap_are_not_backdated(self):
+        # Two inputs each report a completed 200 s outage wholly inside the
+        # 340 s gap: their 400 s sum exceeds the gap, but no wall-clock
+        # second of it precedes the gap (MAN-292 review).
+        recs = self.gap_outage_ledger()
+        samples = [r for r in recs if r["kind"] == "sample"]
+        for sample in samples:
+            sample["source_down_s"] = {"soapy": 0, "kiwi": 0}
+            sample["source_outages"] = {"soapy": 0, "kiwi": 0}
+        samples[-1].update(source_down_s={"soapy": 200, "kiwi": 200},
+                           source_outages={"soapy": 1, "kiwi": 1})
+        s = summ(recs, interval_s=60)
+        self.assert_gap_buckets(s, up=120, down=0, counter=0)
+        # One source past the gap backdates only its own excess.
+        samples[-1].update(source_down_s={"soapy": 390, "kiwi": 200})
+        s = summ(recs, interval_s=60, min_days=0.001, min_availability=0.20)
+        self.assert_gap_buckets(s, up=70, down=50, counter=50)
+
+    def test_successive_gap_recoveries_union_their_backdated_excess(self):
+        # Samples at 0, 60, 400 and 740 s; both inputs fail at 10 s, A
+        # recovers in the first gap (390 s), B in the second (730 s). Both
+        # recoveries backdate the same 50 s into (0, 60]: it is down once
+        # (MAN-292 review round 3).
+        recs = make_ledger(days=3 * 60 / DAY, step=60)
+        samples = [r for r in recs if r["kind"] == "sample"]
+        for i, (sample, offset) in enumerate(zip(samples, (0, 60, 400, 740))):
+            sample["ts"] = T0 + offset
+            sample["source_down_s"] = {"a": 0, "b": 0}
+            sample["source_outages"] = {"a": 0, "b": 0}
+            if i in (1, 2):
+                sample.update(healthz=503, source_health={"a": 0, "b": 0})
+        samples[2].update(source_down_s={"a": 390, "b": 0}, source_outages={"a": 1, "b": 0},
+                          source_health={"a": 1, "b": 0})
+        samples[3].update(source_down_s={"a": 390, "b": 730}, source_outages={"a": 1, "b": 1})
+        recs[-1]["ts"] = T0 + 800
+        s = summ(recs, interval_s=60)
+        self.assertAlmostEqual(s["unobserved_s"], 680)
+        self.assertAlmostEqual(s["down_s"], 50)
+        self.assertAlmostEqual(s["counter_down_s"], 50)
+        # (0, 60] keeps 10 s; (740, 800] up to the end note is healthy.
+        self.assertAlmostEqual(s["up_s"], 70)
+
+    def test_outage_reconciles_through_mixed_down_and_gap_run(self):
+        for delta, extra in ((510, 50), (460, 0)):
+            with self.subTest(delta=delta):
+                s = summ(self.gap_outage_ledger(delta, mixed=True), interval_s=60)
+                self.assert_gap_buckets(s, up=120 - extra, down=120 + extra, counter=extra)
+
+    def test_long_gap_reconciliation_stops_at_process_boundaries(self):
+        for mixed in (False, True):
+            # Include both gap endpoints, the preceding up pair, and the
+            # short down pairs on either side of the gap in the mixed run.
+            for index in range(5 if mixed else 3):
+                for identity in (None, T0 - 1):
+                    with self.subTest(mixed=mixed, index=index, identity=identity):
+                        recs = self.gap_outage_ledger(510 if mixed else 390, mixed=mixed)
+                        samples = [r for r in recs if r["kind"] == "sample"]
+                        if identity is None:
+                            samples[index].pop("start_time")
+                        else:
+                            samples[index]["start_time"] = identity
+                        s = summ(recs, interval_s=60)
+                        self.assertEqual(s["counter_down_s"], 0)
+                        self.assertEqual(s["unobserved_s"], 340)
+                        self.assertAlmostEqual(s["up_s"] + s["down_s"] + s["unobserved_s"],
+                                               s["window"]["span_s"] - s["planned_excluded_s"])
+
+    def test_long_gap_missing_or_decreasing_counters_add_no_down_time(self):
+        for previous, current in ((None, 390), (0, None), (400, 390)):
+            with self.subTest(previous=previous, current=current):
+                recs = self.gap_outage_ledger()
+                samples = [r for r in recs if r["kind"] == "sample"]
+                for sample, value in zip(samples, (previous, previous, current)):
+                    if value is None:
+                        sample.pop("source_down_s")
+                    else:
+                        sample["source_down_s"] = {"soapy": value}
+                self.assert_gap_buckets(summ(recs, interval_s=60), up=120, down=0, counter=0)
+
+    def test_long_gap_excess_delta_is_capped_to_preceding_healthy_time(self):
+        s = summ(self.gap_outage_ledger(1000), interval_s=60)
+        self.assert_gap_buckets(s, up=60, down=60, counter=60)
 
     def test_aggregator_fraction_below_95_fails_d_b(self):
         ov = {i: {"telnet_clients": 0} for i in range(0, 4321, 10)}  # 10% without

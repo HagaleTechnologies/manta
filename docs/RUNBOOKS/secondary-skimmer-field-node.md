@@ -296,9 +296,10 @@ python3 /opt/manta/scripts/shadow-compare.py \
 | ≤ 10% of node spots uncorroborated | `shadow-compare`'s `## Agreement`, the **Uncorroborated** line's percentage (run with `--missed-spots`, so recorder gaps count against it) |
 
 "Uncorroborated" means no RBN spotter (other than this node, which `shadow-compare.py` excludes
-by every `deCall` it saw) reported that call within the tolerances. Look at the
-`## Node-only, uncorroborated` list too: repeated fixed-frequency busts point at a decoder or RF
-problem, not at stations only this node heard.
+by every `deCall` it saw) reported that call within the tolerances. A spot line with no `deCall`
+stops the run as a malformed record, because the node's own forwarded spots could otherwise
+corroborate it. Look at the `## Node-only, uncorroborated` list too: repeated fixed-frequency
+busts point at a decoder or RF problem, not at stations only this node heard.
 
 Frequency calibration: when the node's receiver can hear a time signal (WWV, WWVH, BPM, RWM) or an
 NCDXF beacon, prefer `manta calibrate`. It measures the correction against that carrier and, after

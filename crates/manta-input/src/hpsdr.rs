@@ -11,8 +11,8 @@
 //! itself doc/source-verified against piHPSDR's `old_protocol.c` — **not**
 //! against live hardware (none was reachable in that session or this one).
 //! Per that doc's own "Needs real hardware" section, MAN-11's acceptance
-//! criteria require confirming these against George's (K5TR) actual units
-//! before merge:
+//! criteria require confirming these against a volunteer operator's actual
+//! units before merge:
 //!
 //! - Metis packet framing, IQ demux stride, and 24-bit sample decoding
 //!   (below) — **spike-pinned**, high confidence.
@@ -2516,8 +2516,8 @@ mod tests {
 
     /// Real, live integration test against actual hardware. #[ignore]'d:
     /// no HPSDR device is reachable in this session (spike doc's "Needs
-    /// real hardware" section) — run manually against George's HL2/Red
-    /// Pitaya before this driver ships.
+    /// real hardware" section) — run manually against the volunteer
+    /// operator's HL2/Red Pitaya before this driver ships.
     #[test]
     #[ignore]
     fn connects_to_a_real_device_and_streams_iq() {

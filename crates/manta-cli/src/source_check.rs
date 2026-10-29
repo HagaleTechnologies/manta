@@ -220,7 +220,9 @@ fn parse_duration(value: &str) -> std::result::Result<f64, String> {
 }
 
 pub(crate) fn run(args: Args) -> Result<i32> {
-    let SourcePrepared { resolved, .. } = prepare_source(
+    let SourcePrepared {
+        resolved, loaded, ..
+    } = prepare_source(
         CliOverrides {
             device: args.device,
             source: args.path.or(args.source),
@@ -264,6 +266,10 @@ pub(crate) fn run(args: Args) -> Result<i32> {
             name: args.input.as_deref(),
         },
     )?;
+    // MAN-309: only `run` records; say so rather than ignore it silently.
+    if let Some(note) = crate::record_iq_ignored_note("check", &loaded) {
+        crate::logging::note(&note);
+    }
     let options = CheckOptions {
         duration_seconds: args.duration,
         zero_read_is_transient: matches!(resolved.spec, LiveSourceSpec::AudioDevice(_)),

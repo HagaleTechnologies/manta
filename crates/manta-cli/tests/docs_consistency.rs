@@ -1962,6 +1962,92 @@ fn man319_decision_record_rescopes_the_wire_scenarios_on_man90() {
     );
 }
 
+/// MAN-302: the clean-room note pins the allowed inputs and gate, and the STOP
+/// verdict keeps UberSDR input code out of the tree until a GO record exists.
+#[test]
+fn man302_clean_room_note_records_inputs_gate_and_spec_pin() {
+    let records: Vec<String> = md_files_in("docs/DECISIONS")
+        .into_iter()
+        .filter(|name| name.contains("-man302-"))
+        .collect();
+    let notes: Vec<&String> = records
+        .iter()
+        .filter(|name| name.ends_with("-man302-ubersdr-iq-clean-room.md"))
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "want one MAN-302 clean-room note, found {notes:?}"
+    );
+
+    let rel = format!("docs/DECISIONS/{}", notes[0]);
+    let raw = doc(&rel);
+    let text = squash_whitespace(&raw);
+    for needle in [
+        "No AGPL/GPL source was read.",
+        "a26ebc87ac6e83d743d7f223c3ba953c7aba5615",
+        "1f2b38ed571c1144f5dac471cca1e5dbd1fe549014bd72b088d5964423ca2aab",
+        "CC BY-SA 4.0",
+    ] {
+        assert!(text.contains(needle), "{rel} does not contain {needle:?}");
+    }
+    for id in ["G1", "G2", "G3", "G4", "G5"] {
+        assert!(
+            raw.lines()
+                .any(|line| line.starts_with(&format!("| {id} |"))),
+            "{rel} has no {id} gate row"
+        );
+    }
+
+    let verdicts = |body: &str| {
+        (
+            body.lines().any(|line| line.trim() == "**Verdict: GO**"),
+            body.lines().any(|line| line.trim() == "**Verdict: STOP**"),
+        )
+    };
+    let (go, stop) = verdicts(&raw);
+    assert!(go ^ stop, "{rel} must carry exactly one verdict line");
+    let any_go = records
+        .iter()
+        .any(|name| verdicts(&doc(&format!("docs/DECISIONS/{name}"))).0);
+    assert!(
+        any_go || !repo_root().join("crates/manta-input/src/ubersdr").exists(),
+        "UberSDR input code exists but no MAN-302 record says **Verdict: GO** (stop rule)"
+    );
+
+    // A future GO record must tie every observed transport fact to a trace.
+    for name in &records {
+        let body = doc(&format!("docs/DECISIONS/{name}"));
+        for row in body.lines().filter(|line| {
+            line.split('|')
+                .nth(1)
+                .map(str::trim)
+                .and_then(|id| id.strip_prefix('T'))
+                .is_some_and(|number| {
+                    !number.is_empty() && number.bytes().all(|c| c.is_ascii_digit())
+                })
+        }) {
+            let status = row
+                .trim_end()
+                .trim_end_matches('|')
+                .rsplit('|')
+                .next()
+                .unwrap()
+                .trim();
+            if status == "open" {
+                continue;
+            }
+            let path = status.strip_prefix("observed: ").unwrap_or_else(|| {
+                panic!("{name}: T-row status must be `open` or `observed: <path>`: {row}")
+            });
+            assert!(
+                repo_root().join(path).exists(),
+                "{name}: {row} cites a missing trace"
+            );
+        }
+    }
+}
+
 /// MAN-319: the four new claims sit in MAN-90's table, all still open.
 #[test]
 fn man90_claims_table_carries_the_man319_claims() {
@@ -3355,4 +3441,85 @@ fn shared_hpsdr_docs_describe_capacity_and_queue_loss_and_example_checks_offline
     assert!(doc("docs/METRICS.md").contains("| `manta_input_queue_dropped_samples_total` |"));
     assert!(guide.contains("has 4 receivers; 6 bands are configured"));
     assert!(guide.contains("not a measured"));
+}
+
+// ---- MAN-249: internal machine names stay out of the public docs ----
+
+/// FNV-1a 64 of each internal fleet host name, lowercase. The names are kept
+/// out of the tree: a plain-text deny-list would publish what it guards.
+const INTERNAL_HOST_FNV1A: [u64; 5] = [
+    0xa0a3_3c22_a179_5c43,
+    0x76cf_9c53_5733_dc78,
+    0x61e7_8d4c_2055_7f92,
+    0x66fd_ea01_023f_f308,
+    0x602c_5552_1693_98cc,
+];
+
+fn fnv1a_64(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// The 1-based line of each ASCII-alphanumeric word whose lowercase FNV-1a
+/// is in `deny`.
+fn denied_word_lines(text: &str, deny: &[u64]) -> Vec<usize> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            line.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|w| !w.is_empty() && deny.contains(&fnv1a_64(&w.to_ascii_lowercase())))
+        })
+        .map(|(i, _)| i + 1)
+        .collect()
+}
+
+/// Every file under a directory, recursively.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display())) {
+        let p = e.expect("dir entry").path();
+        if p.is_dir() {
+            out.extend(files_under(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn deny_list_matches_whole_words_in_any_case() {
+    let deny = [fnv1a_64("examplehost")];
+    assert_eq!(
+        denied_word_lines("ok\nran on ExampleHost.local\n", &deny),
+        [2]
+    );
+    assert!(denied_word_lines("examplehosts, example host", &deny).is_empty());
+}
+
+#[test]
+fn public_docs_name_no_internal_machine() {
+    let root = repo_root();
+    let mut found = Vec::new();
+    for dir in ["docs", "wiki"] {
+        for path in files_under(&root.join(dir)) {
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in denied_word_lines(&text, &INTERNAL_HOST_FNV1A) {
+                found.push(format!(
+                    "{}:{line}",
+                    path.strip_prefix(&root).unwrap().display()
+                ));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "an internal machine name is in the public docs (MAN-249); name its role \
+         instead (\"the CI host\", \"the Pi 4 under test\"):\n{}",
+        found.join("\n")
+    );
 }
