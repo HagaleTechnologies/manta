@@ -301,7 +301,9 @@ mod tests {
                         reply[3..9].copy_from_slice(&[2, 17, 34, 51, 68, 85]);
                         reply[9] = 43;
                         reply[10] = 6;
-                        socket.send_to(&reply, peer).unwrap();
+                        // Discovery probes several addresses; a reply dropped with EPERM by
+                        // conntrack (Docker networks) is a lost duplicate, as on a real radio.
+                        let _ = socket.send_to(&reply, peer);
                     }
                 }
             }
