@@ -338,3 +338,6 @@ ignores the config's entries.
   output has one station identity; per-receiver hearing is on `/metrics`,
   the status line and `/status` instead (MAN-14).
 - Adding or removing receivers without a restart.
+- One `--record-iq` file for all receivers: set `record_iq` in each
+  `[[input]]` entry instead, one file per receiver
+  ([iq-recording.md](iq-recording.md)).

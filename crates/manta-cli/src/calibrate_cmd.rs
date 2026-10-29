@@ -463,6 +463,10 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
             name: args.input.as_deref(),
         },
     )?;
+    // MAN-309: only `run` records; say so rather than ignore it silently.
+    if let Some(note) = crate::record_iq_ignored_note("calibrate", &loaded) {
+        crate::logging::note(&note);
+    }
     // MAN-310: a stream of a band plan saves into the entry it came from.
     let input_name = save_entry_name(&loaded.inputs, args.input.as_deref());
     let opts = CalibrateOptions {
@@ -513,10 +517,14 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
     }
 
     // The file's own value, read from its text: the loaded config already
-    // carries the environment overlay.
-    let file_value = match config_text {
-        Some(text) => config_edit::set_freq_correction_ppm(text, 0.0, input_name.as_deref())?.1,
-        None => None,
+    // carries the environment overlay. None when a source flag replaced the
+    // file's receiver: the value is not the measured receiver's, and with
+    // several [[input]] entries there is no entry to read it from (MAN-392).
+    let file_value = match (config_text, resolved.replaced_file_source) {
+        (Some(text), None) => {
+            config_edit::set_freq_correction_ppm(text, 0.0, input_name.as_deref())?.1
+        }
+        _ => None,
     };
     let origin = configured_origin(&resolved, &loaded, config_path.as_deref(), file_value);
     let configured = resolved.freq_correction_ppm;
@@ -1034,6 +1042,7 @@ mod tests {
         let mut r = resolved_with(LiveSourceSpec::File {
             path: "x.wav".into(),
             source_iq: true,
+            raw: None,
         });
         let e = apply_tune_hz(&mut r, 9_998_500.0).unwrap_err();
         assert!(e.to_string().contains("cannot retune a recording"), "{e}");

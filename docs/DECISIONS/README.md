@@ -12,6 +12,22 @@ Add a row here in the same change that adds a record:
 | Date | Ticket | Title |
 |---|---|---|
 | 2026-10-26 | MAN-139 | [MAN-139: decode, run and doctor `--json` use the JSON stream's camelCase names](2026-10-26-man139-cli-json-dialect.md) |
+| 2026-10-28 | MAN-374 | [MAN-374: the startup calibration fill runs through process_hops in read-sized chunks, so a short unkeyed timeout keeps its callsign](2026-10-28-man374-chunked-calibration-fill.md) |
+| 2026-10-27 | MAN-353 | [MAN-353: a reading live client is dropped only past the lag allowance; the stall test runs a slow reader on every leg](2026-10-27-man353-slow-reading-live-client.md) |
+| 2026-10-27 | MAN-343 | [MAN-343: manta grade reads each input file once, however it is named](2026-10-27-man343-grade-reads-each-file-once.md) |
+| 2026-10-27 | MAN-304 | [MAN-304: manta as an UberSDR add-on; the receiver's add-on contract, and packaging waits on the UberSDR input](2026-10-27-man304-ubersdr-addon-gate.md) |
+| 2026-10-25 | MAN-423 | [MAN-423: hops buffered before a spliced loss keep their timestamps; a parked protocol-2 backlog keeps its anchor](2026-10-25-man423-pre-loss-hops-and-parked-backlogs.md) |
+| 2026-10-26 | MAN-249 | [MAN-249: public docs name roles, not machines, people or receiver hosts](2026-10-26-man249-public-disclosure.md) |
+| 2026-10-26 | MAN-292 | [Reconcile completed outages across long sample gaps](2026-10-26-man292-outage-deltas-across-sample-gaps.md) |
+| 2026-10-26 | MAN-436 | [MAN-436: same-input dedupe decides against the station's newest spot across a bucket edge](2026-10-26-man436-dedupe-edge-newest-spot.md) |
+| 2026-10-26 | MAN-302 | [MAN-302: UberSDR wide IQ, clean-room provenance; the input waits on a hardware-free local receiver](2026-10-26-man302-ubersdr-iq-clean-room.md) |
+| 2026-10-26 | MAN-393 | [MAN-393: a one-entry `[[input]]` already loads and takes `MANTA_INPUT_*` like `[input]`](2026-10-26-man393-one-entry-input-array.md) |
+| 2026-10-26 | MAN-289 | [MAN-289: a node spot without a `deCall` is malformed](2026-10-26-man289-node-spot-needs-decall.md) |
+| 2026-10-26 | MAN-290 | [MAN-290: shadow-compare requires the RBN archive's `tx_mode` column](2026-10-26-man290-shadow-compare-requires-tx-mode.md) |
+| 2026-10-25 | MAN-392 | [MAN-392: calibrate reports a standalone receiver's measurement beside several inputs](2026-10-25-man392-calibrate-source-beside-several-inputs.md) |
+| 2026-10-25 | MAN-402 | [MAN-402: a unimodal speed bootstrap reads its marks as dahs when the gaps between them say so](2026-10-25-man402-dah-heavy-bootstrap.md) |
+| 2026-10-25 | MAN-288 | [MAN-288: planned windows absorb counter-attributed downtime](2026-10-25-man288-planned-outage-counter-overlap.md) |
+| 2026-10-24 | MAN-284 | [MAN-284: `field-node.py report` counts the time before the first sample as unobserved](2026-10-24-man284-unsampled-prefix-unobserved.md) |
 | 2026-10-24 | MAN-285 | [MAN-285: status JSON preserves every served field](2026-10-24-man285-status-json-every-served-field.md) |
 | 2026-10-24 | MAN-282 | [MAN-282: an absurd `--timeout-secs` fails with a plain error — 2 for `manta status`, 1 for `manta health` — instead of a panic](2026-10-24-man282-timeout-secs-overflow.md) |
 | 2026-10-24 | MAN-281 | [MAN-281: `manta status` saturates a spoofed endpoint's json/ws client count](2026-10-24-man281-status-client-count-overflow.md) |
@@ -27,6 +43,7 @@ Add a row here in the same change that adds a record:
 | 2026-10-23 | MAN-120 | [MAN-120: dedupe edge hysteresis, a beacon fading regression, the σ invariance pin, and shared frequency-joined CER](2026-10-23-man120-dedupe-beacon-sigma-cer-cleanup.md) |
 | 2026-10-23 | MAN-173 | [MAN-173: a word-boundary gate fails a decode that adds word breaks](2026-10-23-man173-word-boundaries-count-extra-splits.md) |
 | 2026-10-22 | MAN-94 | [MAN-94: an NCDXF/IARU beacon spot reads `NCDXF B` on the wire](2026-10-22-man94-ncdxf-beacon-label.md) |
+| 2026-10-21 | MAN-372 | [MAN-372: zero in-band tracks from SSB voice at +30/+45 dB; narrow sibling regions require shared modulation](2026-10-21-man372-speech-band-veto.md) |
 | 2026-10-20 | MAN-340 | [MAN-340: a dispatched CI run tests the PR head merged with the main commit its workflow came from](2026-10-20-man340-dispatched-ci-tests-the-merge-with-main.md) |
 | 2026-10-19 | MAN-334 | [MAN-334: calibrate plans its references before it opens the receiver](2026-10-19-man334-calibrate-plans-before-opening.md) |
 | 2026-10-19 | MAN-319 | [MAN-319: the live uplink needs a 6-character locator now; the registration exchange waits for MAN-90's capture](2026-10-19-man319-uplink-registration-exchange.md) |
@@ -35,6 +52,7 @@ Add a row here in the same change that adds a record:
 | 2026-10-19 | MAN-14 | [MAN-14: each receiver's hearing on /metrics, the status line and /status](2026-10-19-man14-per-receiver-hearing-visibility.md) |
 | 2026-10-19 | MAN-307 | [MAN-307: several bands from one HPSDR radio](2026-10-19-man307-hpsdr-multiple-receivers.md) |
 | 2026-10-19 | MAN-305 | [MAN-305: protocol-2 openHPSDR radios are inputs; the protocol is discovered, and lost datagrams reach the decoder as missing input](2026-10-19-man305-hpsdr-protocol-2-input.md) |
+| 2026-10-19 | MAN-309 | [MAN-309: record the decoded IQ to a file and replay it deterministically](2026-10-19-man309-iq-recording-and-replay.md) |
 | 2026-10-19 | MAN-306 | [Discover an openHPSDR radio when no address is configured](2026-10-19-man306-openhpsdr-discovery.md) |
 | 2026-10-18 | MAN-398 | [MAN-398: gap-corroborated recovery from a fragment-seeded speed lock](2026-10-18-man398-gap-corroborated-badlock-recovery.md) |
 | 2026-10-17 | MAN-108 | [MAN-108: a fading signal keeps its track through the fade (DORMANT re-acquisition)](2026-10-17-man108-dormant-track-reacquisition.md) |

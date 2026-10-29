@@ -693,15 +693,19 @@ the live channels in ascending index order. It consumes one channelizer
 hop at a time, so its state and every output are independent of how the
 input is chunked (§6); `crash_state_is_chunk_invariant` checks 256-,
 4096- and 65536-sample chunks.
-### 2.8 Non-CW rejection (MAN-313)
+### 2.8 Non-CW rejection (MAN-313, MAN-372)
 
 MAN-313, `manta-dsp::comod::CoModDetector` plus per-track keying evidence
 in `manta-engine::track`, see
-docs/DECISIONS/2026-10-13-man313-non-cw-rejection.md. Every rule here
+docs/DECISIONS/2026-10-13-man313-non-cw-rejection.md; MAN-372 added the
+speech-band marking (C′ below,
+docs/DECISIONS/2026-10-21-man372-speech-band-veto.md). Every rule here
 applies only with `detector.non_cw_filter = true` (the default).
-Noise-like wideband data and swept carriers start no CW track, speech
-(SSB) starts far fewer (a measured residual, not zero: see the decision
-record's known limits and MAN-372), and a track that stops keying closes. `non_cw_filter = false` builds no
+Noise-like wideband data, swept carriers and speech (SSB voice) start no
+CW track — zero in-band tracks at +30 and +45 dB on the testkit voice,
+seed 1 (the scope the zero was measured in; a different voice may still
+start tracks, and CW *inside* an SSB passband stays unprotected, the
+accepted MAN-313 limit) — and a track that stops keying closes. `non_cw_filter = false` builds no
 classifier and runs none of the rules below: decoder and `TrackPromoted`
 at promotion, no qualification, veto, timeout or unkeyed close.
 
@@ -717,7 +721,7 @@ Constants (compile-time; `COMOD_*` in `manta-dsp::comod`, the rest in
 | `COMOD_EVAL_HOPS` | 75 | evaluation cadence, 0.2 s |
 | `COMOD_MIN_FILL_HOPS` | 188 | first evaluation once this many hops are stored |
 | `COMOD_HOT_DB` | 6.0 | a channel is hot when its window-mean SNR reaches this |
-| `COMOD_LAG_MIN`, `COMOD_LAG_MAX` | 3, 16 | pair distances in channels, inclusive |
+| `COMOD_LAG_MIN`, `COMOD_LAG_MAX` | 3, 30 | pair distances in channels, inclusive (MAN-372 re-measured the maximum against the testkit voice: the voice's 2.6 kHz band spans 28 channels, so partners beyond 16 are what mark its span from the first evaluation) |
 | `COMOD_RHO` | 0.5 | Pearson ρ of a hot pair's per-hop SNR must be ≥ this |
 | `COMOD_COUNT` | 4 | a channel with ≥ 4 co-modulated partners joins a span |
 | `COMOD_SPAN_MIN_WIDTH` | 8 | span width, first to last channel inclusive |
@@ -725,6 +729,12 @@ Constants (compile-time; `COMOD_*` in `manta-dsp::comod`, the rest in
 | `COMOD_SPAN_STRONG_DB` | 10.0 | … is within 10 dB of that range's strongest window peak |
 | `COMOD_SPAN_GUARD` | 1 | marked span = `[first − 1, last + 1]` |
 | `COMOD_HOLD_HOPS` | 1875 | a span stays marked 5 s after the evaluation that found it |
+| `COMOD_HOPS_PER_S` | 375.0 | the channelizer's hop rate (4 × its channel spacing); every `COMOD_*` constant above assumes it |
+| `COMOD_SPEECH_GAP` | 2 | speech-band hot regions bridge hot runs this many cold channels apart (MAN-372) |
+| `COMOD_SPEECH_MIN_HOT` | 3 | C′: fewest hot channels in a speech-shaped region (kill regions measure 3; every control's ≤ 2) |
+| `COMOD_SPEECH_RATIO` | 2.2 | C′: the region's aggregate-envelope 1–5 Hz DFT magnitude must be ≥ 2.2× its 8–30 Hz magnitude (kills 2.53–3.59; the hardest keep alone reaches 2.92, which is why C′ also needs the structure clauses) |
+| `COMOD_SPEECH_MIN_WIDTH` | 9 | C′: a region this wide (first to last) is a band on its own (voice sub-bands 10–11 wide; controls ≤ 7) |
+| `COMOD_SPEECH_MAX_GAP` | 30 | C′: maximum edge-to-edge gap for a speech-shaped sibling; their aggregate envelopes must also have Pearson rho ≥ `COMOD_RHO` |
 | `MAX_MARK_HOPS` | 1125 | longest ACTIVE run (3 s) that still counts as a keying cycle |
 | `QUALIFY_MIN_ACTIVE_HOPS` | 8 | ACTIVE hops needed since the previous evaluation |
 | `SLOPE_MIN_SAMPLES` | 20 | key-down hops needed for the slope |
@@ -803,12 +813,47 @@ Lags start at 3 so a tone's own ±1/±2 key-click splatter never counts.
 There is no per-track taint: a high count at a track's channel never
 closes it.
 
+**C′. Speech-band marking** (MAN-372,
+docs/DECISIONS/2026-10-21-man372-speech-band-veto.md). At the same
+evaluations, the classifier also judges the band as a whole — the
+co-modulation span's coverage has gaps a voice harmonic exploits (it can
+sit in the band's internal formant gap, hot with no correlated partner
+in range):
+
+1. **Hot regions**: maximal runs of hot channels, bridging gaps of at
+   most `COMOD_SPEECH_GAP` cold channels, holding at least 2 hot
+   channels.
+2. **Speech-shaped**: a region with at least `COMOD_SPEECH_MIN_HOT` hot
+   channels whose aggregate envelope — the sum of its hot channels' ring
+   rows — carries at least `COMOD_SPEECH_RATIO` times more DFT
+   magnitude at 1–5 Hz (speech: phrase pauses, syllables; computed at
+   `COMOD_HOPS_PER_S`, explicit index-order `f64` sums) than at 8–30 Hz
+   (CW keying: 8 elements/s at 20 WPM to ~30 Hz at 35 WPM).
+3. **A speech band** is a speech-shaped region at least
+   `COMOD_SPEECH_MIN_WIDTH` channels wide, or with another
+   speech-shaped region within `COMOD_SPEECH_MAX_GAP` edge to edge
+   whose aggregate envelope has Pearson rho ≥ `COMOD_RHO` with its own.
+   Correlation uses the current window's hot-channel sums, centred and
+   normalized with index-order `f64` sums. A constant envelope supplies
+   no correlation evidence. The voice's sub-bands can share modulation
+   across a formant gap; two nearby CW skirts can each look
+   speech-shaped, so proximity alone is insufficient. This correlation
+   threshold is evidence of shared modulation, not proof of one source.
+4. Each speech band marks `[first − COMOD_SPAN_GUARD, last +
+   COMOD_SPAN_GUARD]` until `hop + COMOD_HOLD_HOPS`. `in_speech_band(k)`
+   is true while `k` is marked. Like span marking this is
+   per-evaluation evidence over the current window, never a per-track
+   taint, and it closes nothing: an existing or already-qualified track
+   inside a later-marked band keeps its decoder until `NotCw`/`Unkeyed`
+   close it.
+
 **D. Qualification.** At each evaluation, each promoted, unqualified
 track (`k = round(c)`) qualifies when all hold:
 
 - `cycles ≥ 1`;
 - `active_hops ≥ QUALIFY_MIN_ACTIVE_HOPS`;
 - `!in_span(k)`;
+- `!in_speech_band(k)` (MAN-372, C′): one clause gates D and D′ alike;
 - `!comodulated_with_span(k)`: channel `k`'s window does not correlate
   (Pearson ρ ≥ `COMOD_RHO`) with any marked span channel at least
   `COMOD_LAG_MIN` channels away. A voice's weaker harmonics outside the
@@ -836,7 +881,8 @@ track qualifies when all hold:
 - the track's state is HANG and it dropped ACTIVE → HANG since the
   previous evaluation (`dropped_since_eval`);
 - `active_run ≤ MAX_MARK_HOPS` (the drop ends one mark, not a carrier);
-- `!in_span(k)` and `!comodulated_with_span(k)`, exactly as D;
+- `!in_span(k)` and `!comodulated_with_span(k)`, exactly as D, and
+  `!in_speech_band(k)` (C′), exactly as D;
 - key-down hops `n ≥ SLOPE_MIN_SAMPLES`;
 - `|slope| ≤ MAX_SWEEP_HZ_PER_S · (KEYDOWN_SPAN_MIN_HOPS / max(t_last,
   1))^1.5` when `t_last < KEYDOWN_SPAN_MIN_HOPS`, else
@@ -873,8 +919,9 @@ the deferred `TrackPromoted` exactly as D does. A track still unqualified
 at end of input is dropped with no events, unchanged.
 
 **E. Spawn veto.** A spawn decision at `k`, and the same-hop `k+1`
-pairing (§2.5), is vetoed while `in_span(k)`, next to the RTTY veto
-(§2.6).
+pairing (§2.5), is vetoed while `in_span(k)` or `in_speech_band(k)`
+(C′), next to the RTTY veto (§2.6). Spawns only (MAN-314's lesson): a
+veto closes nothing.
 
 **F. Merge preference.** When two converging tracks merge (§2.5) and
 exactly one is qualified, the qualified one survives. Otherwise §2.5's
@@ -887,7 +934,9 @@ unkeyed_close_hops` and no callsign was read.
 
 - `last_rise_hop` is the promotion hop, then each HANG → ACTIVE.
 - `last_char_hop` is set from each batch's `CharDecoded` events (batch
-  granularity, like the garbage-collect timer's reset).
+  granularity, like the garbage-collect timer's reset). A batch is one
+  `process_hops` call: one `listen` read of at most 2048 samples, the 2 s
+  startup fill included (MAN-374), or 4096 samples in file decode.
 - A callsign is read when the current word passes
   `manta_spot::grammar::is_plausible`. The word is built from
   `CharDecoded` glyph text and ends at a space, a prosign or a
@@ -1053,6 +1102,41 @@ Special case: an all-dah opening (plausible for `CQ` at the margin) corrects
 itself via the constraint clamp below the first time a real dit arrives —
 the dit falls far below `μ_dit`, gets assigned to the dit cluster, drags it
 down, and the clamp re-anchors `μ_dah`.
+
+Unimodal direction prior (pinned decision 20): when the one cluster's mean
+exceeds the `150 ms` dit clamp ceiling below, it cannot be dits, so the
+marks are taken as dahs instead: `μ_dah = mean`, `μ_dit = mean / 3`
+provisionally, unconfirmed until a mark lands ≤ `0.5·μ_dah` (then
+`μ_dit = that duration`). At or under `150 ms` the cluster is still assumed
+to be dits. The prior applies to marks only; §4.2's gap ratios keep the
+plain dit-assumed rule.
+
+**[DEVIATION] (MAN-402)** — dahs of 90–150 ms (24–40 WPM) are also
+plausible dits, and a stream of equal dahs (`MO`, `OO`, `0000`, `T0M`)
+never supplies the long mark that confirms a dit-assumed cluster: every dah
+decodes as a dit, character gaps read as element gaps and word gaps as
+character gaps.
+So when the 5-mark initialization lands in that dit-assumed unimodal case
+(ready, unconfirmed, `μ_dit` the observed mean `m`, and `m ≥ 60 ms` — a
+shorter dah would put the dit under the `20 ms` clamp), the decoder hands the
+tracker the completed spaces between those five marks — only spaces
+bounded by a mark on both sides, before the buffered runs replay; leading
+silence and an unfinished trailing space are excluded, and the gaps are not
+classified first. The gaps with `m/6 ≤ g < m/√3` (finite, positive) are
+dah-scale element gaps: a dah is three element gaps long, `1/√3` is the
+log-space midpoint between ratios 1/3 and 1, and `1/6` the shortest gap any
+dash/dot ratio within the `6.0` ceiling allows. If at least **two** remain
+and their population coefficient of variation is `< 0.35`, the marks are
+dahs: `μ_dah = m`, `μ_dit = m / 3` provisionally (the pinned-decision-20
+direction above, still unconfirmed, so the first genuine dit re-anchors
+it), the constraints apply, and the WPM reporting EMA is re-seeded from the
+corrected `dit_estimate`. Two gaps, not more: five marks can straddle two
+character or word boundaries and leave only two element gaps. The check
+runs once, at the ordinary 5-mark readiness; it never runs on a confirmed
+split, on the over-ceiling dah-assumed case, at the MAN-271 finish-time
+bootstrap below, or later in the stream. Text whose characters are single
+dahs (`TT`) has no element gaps and keeps the dit assumption. See
+docs/DECISIONS/2026-10-25-man402-dah-heavy-bootstrap.md.
 
 **[DEVIATION] (MAN-271)** — at a **genuine end-of-signal** `finish()`
 (stream EOF, or a HangExpired/Silent closure, where a sustained real

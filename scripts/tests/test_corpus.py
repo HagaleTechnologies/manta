@@ -154,7 +154,11 @@ class ManifestTests(unittest.TestCase):
                     self.assertRegex(rec["sha256"], r"^[0-9a-f]{64}$")
                 if rec["kind"] == "iq":
                     self.assertIn(rec["bits_per_sample"], {16, 24, 32})
-                if rec.get("truth"):
+                # RBN truth is third-party data, rebuilt locally and ignored by git
+                # (MAN-249), so only its path is checked; transcripts are tracked.
+                if (rec.get("truth") or {}).get("kind") == "rbn":
+                    self.assertRegex(rec["truth"]["path"], r"^ground-truth/[^/]+\.rbn\.csv$")
+                elif rec.get("truth"):
                     self.assertTrue(os.path.isfile(os.path.join(CORPUS, rec["truth"]["path"])),
                                     rec["truth"]["path"])
 
@@ -166,7 +170,7 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(b2["capture_start"], "2025-11-29T00:00:00Z")
         self.assertEqual(b2["truth"]["kind"], "rbn")
         self.assertEqual(b2["truth"]["spotter"], "K5TR")
-        self.assertTrue(os.path.isfile(os.path.join(CORPUS, b2["truth"]["path"])))
+        self.assertEqual(b2["truth"]["path"], "ground-truth/B2_20251129_000000_7080kHz.rbn.csv")
         self.assertEqual(b2["floors"], {"min_spots": 50, "min_precision": 0.20, "min_recall": 0.02})
 
     def test_wpx_and_vp8geo_are_unpinned(self):

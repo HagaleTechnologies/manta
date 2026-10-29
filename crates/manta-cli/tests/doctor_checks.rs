@@ -40,28 +40,49 @@ fn silent_48k_wav(dir: &Path, seconds: u32) -> PathBuf {
     path
 }
 
-/// The private band every "nothing is here" port below is drawn from:
-/// 20000-20255. It sits below the kernel's ephemeral range on every
-/// default (Linux starts at 32768, macOS and Windows at 49152), so no
-/// sibling test's `bind(…, 0)` — which the OS feeds from that ephemeral
-/// pool — can ever be handed a number this file has handed out, and
-/// nothing else in the suite binds this band (MAN-333). A runner that
-/// runs test *binaries* in parallel (cargo-nextest, unused in this repo)
-/// would run this binary twice at once and needs a per-binary offset
-/// into the band.
-const BAND_START: u16 = 20_000;
-const BAND_LEN: u16 = 256;
+/// The private 20512-22559 band for "nothing is here" ports is below every
+/// default ephemeral range and disjoint from `src/test_ports.rs`'s
+/// 20256-20511 band (MAN-333). Other processes running this binary start
+/// their own cursor at the first port, so each issued port is claimed on
+/// its unused protocol until process exit (MAN-383). A full run uses 70
+/// ports; 2048 ports leave headroom for about 28 concurrent processes.
+const BAND_START: u16 = 20_512;
+const BAND_LEN: u16 = 2_048;
+
+/// The protocol a band port is issued to stay unbound on.
+#[derive(Clone, Copy)]
+enum Unbound {
+    Tcp,
+    Udp,
+}
+
+/// The socket that keeps an issued port from other processes.
+enum Claim {
+    Udp(UdpSocket),
+    Tcp(TcpListener),
+}
+
+impl Claim {
+    fn port(&self) -> u16 {
+        match self {
+            Claim::Udp(s) => s.local_addr().unwrap().port(),
+            Claim::Tcp(l) => l.local_addr().unwrap().port(),
+        }
+    }
+}
 
 /// Allocation state for the band: a monotonic cursor, so each band port
 /// is issued at most once per process, behind a process-global mutex.
 struct Band {
     next: u16,
     range_checked: bool,
+    claims: Vec<Claim>,
 }
 
 static BAND: Mutex<Band> = Mutex::new(Band {
     next: 0,
     range_checked: false,
+    claims: Vec::new(),
 });
 
 impl Band {
@@ -98,13 +119,10 @@ impl Band {
     }
 }
 
-/// The next unissued band port whose `free` probe succeeds. Candidates a
-/// foreign listener already holds are skipped (bind errors, including the
-/// port ranges Windows excludes); a port is never issued twice, so two
-/// tests in this binary cannot be handed the same number. Exhaustion
-/// panics: one full binary run needs 26 ports (8 `Setup` tests × 3, one
-/// uplink, one NTP), so the 256-port band holds ~10× headroom.
-fn next_band_port(free: impl Fn(u16) -> bool) -> u16 {
+/// Bind UDP first so another process cannot momentarily bind TCP on a port
+/// already claimed for TCP use. Keep the socket for the other protocol;
+/// skip candidates held by another process or excluded by Windows.
+fn next_band_port(unbound: Unbound) -> u16 {
     let mut band = BAND.lock().unwrap();
     band.check_ephemeral_range_once();
     loop {
@@ -117,9 +135,17 @@ fn next_band_port(free: impl Fn(u16) -> bool) -> u16 {
         }
         let port = BAND_START + band.next;
         band.next += 1;
-        if free(port) {
-            return port;
-        }
+        let Ok(udp) = UdpSocket::bind(("127.0.0.1", port)) else {
+            continue;
+        };
+        let Ok(tcp) = TcpListener::bind(("127.0.0.1", port)) else {
+            continue;
+        };
+        band.claims.push(match unbound {
+            Unbound::Tcp => Claim::Udp(udp),
+            Unbound::Udp => Claim::Tcp(tcp),
+        });
+        return port;
     }
 }
 
@@ -132,25 +158,24 @@ fn free_port() -> u16 {
 /// `N` distinct TCP ports nothing listens on. They come from the private
 /// band above — distinct by construction (one cursor under one mutex
 /// hands out each port at most once, where a released ephemeral port can
-/// be handed straight to the next `bind(0)`, as Windows does), and never
-/// from the kernel's ephemeral pool, so no concurrently running test can
-/// claim one between allocation and the moment `manta doctor` probes it.
+/// be handed straight to the next `bind(0)`, as Windows does), outside
+/// the kernel's ephemeral pool and claimed against other processes.
 /// Holding a socket instead cannot express "nothing here": a
 /// listening-but-never-accepted socket still accepts connections, and a
 /// held listener is exactly what doctor's own bind probe reports as
 /// already in use.
 fn free_ports<const N: usize>() -> [u16; N] {
-    std::array::from_fn(|_| next_band_port(|p| TcpListener::bind(("127.0.0.1", p)).is_ok()))
+    std::array::from_fn(|_| next_band_port(Unbound::Tcp))
 }
 
 /// A UDP port nothing answers on, for an NTP server that refuses — same
 /// band contract as `free_ports`, so the port stays unanswered until the
-/// check runs. The socket is not held: a bound-but-unread UDP socket
+/// check runs. No UDP socket is held: a bound-but-unread UDP socket
 /// swallows the request and would cost doctor's clock check its full 3 s
 /// budget where nothing bound gets the instant ICMP refusal this test
 /// wants.
 fn closed_port() -> u16 {
-    next_band_port(|p| UdpSocket::bind(("127.0.0.1", p)).is_ok())
+    next_band_port(Unbound::Udp)
 }
 
 const NTP_UNIX_OFFSET: f64 = 2_208_988_800.0;
@@ -334,11 +359,10 @@ fn healthy_setup_passes_every_check() {
     assert!(!stderr.contains("ignoring [server]"), "{stderr}");
 }
 
-#[test]
-fn a_held_port_is_named_with_its_fix() {
+fn assert_held_port_is_named(slot: usize, name: &str, key: &str) {
     let mut setup = Setup::new();
     let held = TcpListener::bind("127.0.0.1:0").unwrap();
-    setup.ports[0] = held.local_addr().unwrap().port();
+    setup.ports[slot] = held.local_addr().unwrap().port();
     let cfg = setup.config(setup.uplink_port());
     let (ntp, _h) = fake_sntp(0.0);
     let out = setup.doctor(&cfg, ntp, &[]);
@@ -349,19 +373,38 @@ fn a_held_port_is_named_with_its_fix() {
         "stdout={stdout}\nstderr={stderr}"
     );
     let line = format!(
-        "FAIL  telnet port: 127.0.0.1:{} is already in use",
-        setup.ports[0]
+        "FAIL  {name}: 127.0.0.1:{} is already in use",
+        setup.ports[slot]
     );
     assert!(stdout.contains(&line), "{stdout}");
     let fix = line_after(&stdout, &line);
-    assert!(
-        fix.starts_with("      fix: ") && fix.contains("telnet_port"),
-        "{fix}"
-    );
-    assert!(stdout.contains("failed: telnet port"), "{stdout}");
+    assert!(fix.starts_with("      fix: ") && fix.contains(key), "{fix}");
+    let summary = stdout
+        .lines()
+        .find(|line| line.starts_with("doctor: ") && line.contains("failed: "))
+        .expect("doctor failed-check summary");
+    let failed = summary
+        .split_once("failed: ")
+        .unwrap()
+        .1
+        .split(" (")
+        .next()
+        .unwrap();
+    assert!(failed.split(", ").any(|check| check == name), "{stdout}");
     assert!(stdout.contains("verdict: "), "{stdout}");
     assert!(!stderr.contains("Error:"), "{stderr}");
     drop(held);
+}
+
+#[test]
+fn a_held_port_is_named_with_its_fix() {
+    assert_held_port_is_named(0, "telnet port", "telnet_port");
+}
+
+/// MAN-383 scenario 2: the json port held for the whole run still fails.
+#[test]
+fn a_held_json_port_is_named_with_its_fix() {
+    assert_held_port_is_named(1, "json port", "json_port");
 }
 
 #[test]
@@ -780,4 +823,54 @@ fn concurrent_port_handouts_are_distinct_and_inside_the_band() {
     ports.sort_unstable();
     ports.dedup();
     assert_eq!(ports.len(), total, "a port was handed out twice");
+}
+
+/// Set in the copy of this test binary spawned below.
+const PORTS_CHILD: &str = "MANTA_DOCTOR_CHECKS_PORTS_CHILD";
+
+/// MAN-383: another process running this binary must skip ports issued here.
+#[test]
+fn another_process_is_never_issued_a_port_this_one_holds() {
+    const NAME: &str = "another_process_is_never_issued_a_port_this_one_holds";
+    if std::env::var_os(PORTS_CHILD).is_some() {
+        let [a, b, c] = free_ports::<3>();
+        let closed = closed_port();
+        println!("child ports={a},{b},{c},{closed}");
+        return;
+    }
+
+    free_ports::<3>();
+    closed_port();
+    let held: Vec<u16> = BAND
+        .lock()
+        .unwrap()
+        .claims
+        .iter()
+        .map(Claim::port)
+        .collect();
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", NAME, "--nocapture"])
+        .env(PORTS_CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let child: Option<Vec<u16>> = stdout
+        .split("child ports=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(|ports| ports.split(',').map(str::parse).collect::<Result<_, _>>())
+        .and_then(Result::ok);
+    let Some(child) = child.filter(|ports| out.status.success() && ports.len() == 4) else {
+        panic!(
+            "child: {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    for port in child {
+        assert!(
+            !held.contains(&port),
+            "the child was issued {port}, which this process holds: {held:?}"
+        );
+    }
 }

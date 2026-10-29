@@ -79,7 +79,7 @@ call).
   callers should read the discovery reply rather than assume.
 
 Per this project's established policy (MAN-10, MAN-11), this remains
-hardware-control code pending confirmation against George's (K5TR) real
+hardware-control code pending confirmation against a volunteer operator's real
 HPSDR units before shipping as verified.
 
 ## Addendum: PR #79 review, round 2 (2026-09-03)

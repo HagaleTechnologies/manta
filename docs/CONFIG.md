@@ -27,7 +27,10 @@ A value comes from the first of these that sets it:
 `--config FILE` names the file. Without it, `run`, `soak`, `doctor`, `check`,
 `status`, `health` and `config check` read the path from `MANTA_CONFIG`. The
 same seven commands apply the `MANTA_*` variables, though `status` and `health`
-apply them only when `--config` or `MANTA_CONFIG` names a file. `decode`,
+apply them only when `--config` or `MANTA_CONFIG` names a file. Given
+`--addr`, `status` and `health` load no config file and apply no `MANTA_*`
+variable: they dial that address even when `MANTA_CONFIG` names a missing or
+invalid file, and check neither the file nor the variables. `decode`,
 `oracle` and `bench sensitivity` read only the file `--config` names and never
 the environment, so their output does not depend on it. `[[rbn_uplink]]` cannot be
 set from the environment. An unknown table, key or `MANTA_*` variable is an
@@ -58,8 +61,8 @@ listed here change what the command does.
 | `doctor` | `[input]` `[spot]` `[detector]` `[decode]`, plus `[server]`, `[[rbn_uplink]]` and `[rbn_compare]` to check them without starting a server or logging in (MAN-126; see [RUNBOOKS/setup-checks.md](RUNBOOKS/setup-checks.md)) | yes |
 | `config check` | all seven, resolved exactly as `run` resolves them | yes |
 | `check` | `[input]`: the source, `capture_rate_hz` and `center_freq_hz` | yes |
-| `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes, but `MANTA_SERVER_*` only alongside a config file |
-| `health` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon's `/healthz`; a named config that resolves to no `[server]` table is an error | yes, but `MANTA_SERVER_*` only alongside a config file |
+| `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes, but `MANTA_SERVER_*` only alongside a config file; `--addr` loads no config file and applies no `MANTA_*` variable |
+| `health` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon's `/healthz`; a named config that resolves to no `[server]` table is an error | yes, but `MANTA_SERVER_*` only alongside a config file; `--addr` loads no config file and applies no `MANTA_*` variable |
 | `decode` | `[decode]` `[detector]` `[spot]` and `input.freq_correction_ppm`; several `[[input]]` entries that disagree on it need `--freq-correction-ppm` | no |
 | `oracle` | `[decode]` | no |
 | `bench sensitivity` | `[decode]` `[detector]` | no |
@@ -143,7 +146,7 @@ the config for both. The table needs `station_callsign`.
 | `metrics_bind_addr` | `"127.0.0.1"` | live: `run` with `[server]`, `status` and `health` | Address of `/metrics` and `/healthz`, which have no password. See [DECISIONS/2026-10-08-man132-metrics-loopback-bind.md](DECISIONS/2026-10-08-man132-metrics-loopback-bind.md). |
 | `telnet_port` | `7300` | live: `run` with `[server]` | DX-cluster telnet port. |
 | `json_port` | `7301` | live: `run` with `[server]` | JSON Lines and WebSocket spot stream; both share this port. |
-| `metrics_port` | `7302` | live: `run` with `[server]`, `status` and `health` | Prometheus metrics port; `manta status` and `manta health` dial it when given `--config` or `MANTA_CONFIG`. |
+| `metrics_port` | `7302` | live: `run` with `[server]`, `status` and `health` | Prometheus metrics port; `manta status` and `manta health` dial it when given `--config` or `MANTA_CONFIG` and no `--addr`. |
 | `live_port` | none; example `7303`; unset runs no live-state listener | live: `run` with `[server]`; restart required | Live-state stream port; see [LIVE-STATE.md](LIVE-STATE.md). |
 | `live_bind_addr` | `"127.0.0.1"` | live: `run` with `[server]` and `live_port`; restart required | Address of the live-state listener, which has no password. The stream carries every track's decoded text; set `"0.0.0.0"` only for a dashboard on another machine, and firewall `live_port`. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
 | `line_format` | `"rbn"` | live: `run` with `[server]` | Telnet spot-line layout, `"rbn"` or `"skimmer"`. The uplink always sends the `"rbn"` layout. |
@@ -213,7 +216,10 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `name` | none; example `"20m"`; unset uses the input's `type` (`audio` when untyped) | live: `run`, `soak`, `doctor`, `calibrate`, `check` | The input's name in log lines and in `--input NAME`. Letters, digits, `.`, `_` and `-`, starting with a letter or digit, at most 32 characters. Required on every entry when there are several `[[input]]` entries (MAN-13). |
 | `device` | none; example `"USB Audio"`; unset uses the system's default input | live: `type = "audio"` | Part of the device's name; `manta devices` lists them. `--device` overrides it. |
 | `path` | none; example `"capture.wav"`; required for `type = "file"` | live: `type = "file"` | WAV recording replayed as if live. A relative path set in the file is relative to the file's directory; from `--source`, which overrides it, or `MANTA_INPUT_PATH` it is relative to the working directory. |
-| `iq` | `false` | live: `type = "file"` | `true` for a two-channel IQ recording. `--source-iq` sets it. |
+| `record_iq` | none; example `"captures/session.cf32"`; unset records nothing | `run` only; any type | Records this input's IQ while decoding: little-endian cf32 at this path plus `PATH.meta.jsonl`. Never overwrites, so a restart needs a new name; the directory must exist. A relative path set in the file is relative to the file's directory; from `MANTA_INPUT_RECORD_IQ` or `--record-iq`, which overrides it for a single input, it is relative to the working directory. Each `[[input]]` takes its own; two inputs, or the streams of one `bands` plan, cannot share one. See [GUIDES/iq-recording.md](GUIDES/iq-recording.md). |
+| `iq` | `false` | live: `type = "file"` | `true` for a two-channel IQ recording or a manta IQ recording (`run --record-iq`, found by its `PATH.meta.jsonl`). `--source-iq` sets it. See [GUIDES/iq-recording.md](GUIDES/iq-recording.md). |
+| `iq_format` | none; example `"cf32"`; unset reads a WAV or a manta recording | live: `type = "file"` with `iq = true` | Reads `path` as headerless little-endian IQ: `cf32` (float32 I, Q) or `ci16` (int16 I, Q, divided by 32768). Needs `sample_rate_hz` and a centre (`center_freq_hz` or `--dial-freq-hz`). `--iq-format` overrides it. Omit it for a manta recording, whose metadata describes it. |
+| `sample_rate_hz` | none; example `96000`; required with `iq_format` | live: `type = "file"` with `iq_format` | The headerless file's stored sample rate, above 0 and at most 10 MS/s; `capture_rate_hz` still decimates after it. `--sample-rate-hz` overrides it. |
 | `realtime` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` paces the replay to the recording's own clock, so telnet/JSON clients can watch it. `--realtime` sets it; a live source refuses it. See [DECISIONS/2026-10-10-man269-paced-looping-replay.md](DECISIONS/2026-10-10-man269-paced-looping-replay.md). |
 | `loop` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` replays the file again from the start each time it ends, until stopped; implies `realtime`. `--loop` sets it; a live source refuses it. |
 | `host` | none; example `"<your-receiver-host>"`; required for kiwi; optional for hpsdr | live: `type = "kiwi"` or `"hpsdr"` | Receiver host name. `--kiwi-host` or `--hpsdr-host` overrides it. For hpsdr, set host or mac, or neither to discover the only available radio. An explicit host skips the LAN broadcast, though under `protocol = "auto"` the protocol probe still goes to that host; host and mac together are refused. |
@@ -459,7 +465,7 @@ milliseconds, 0 to 3600000.
 | `rtty_filter` | `true` | live | Recognise RTTY (two-tone FSK) signals and start no CW track on them or their keying sidebands; `false` restores the previous behaviour. See [SPEC §2.6](SPEC-decode-core.md#26-two-tone-fsk-rtty-recognition) and [MAN-314](DECISIONS/2026-10-11-man314-rtty-recognition.md). |
 | `rtty_dwell_ms` | `20000.0` | live | How long an FSK signal must last before it is marked as RTTY; 1000 to 3600000 (1 h), counted in whole 1000 ms detector blocks. |
 | `digital_window_filter` | `true` | live | Skip the common HF FT8, FT4, WSPR and JS8 windows when starting CW tracks. Set `false` to include them. Applies to file decoding and every service input. Restart required. |
-| `non_cw_filter` | `true` | live | A new track is decoded only once it shows CW keying. Noise-like wideband data and swept carriers start no CW track and strong SSB voice starts far fewer (7 against 81 at +30 dB with the testkit voice, none spotted; zero is MAN-372), and a track whose signal stops keying closes after `unkeyed_close_ms`. `false` restores the pre-MAN-313 behaviour. See [SPEC §2.8](SPEC-decode-core.md#28-non-cw-rejection-man-313) and [MAN-313](DECISIONS/2026-10-13-man313-non-cw-rejection.md). Restart required (every `[detector]` key is). |
+| `non_cw_filter` | `true` | live | A new track is decoded only once it shows CW keying. Noise-like wideband data, swept carriers and strong SSB voice start no CW track (0 in-band tracks at +15 to +45 dB is not yet universal: 8 at +15 dB and 2 at +20 dB remain, none spotted; 0 at +30/+45 dB, against 81 at +30 dB with the filter off, testkit voice seed 1), and a track whose signal stops keying closes after `unkeyed_close_ms`. `false` restores the pre-MAN-313 behaviour. See [SPEC §2.8](SPEC-decode-core.md#28-non-cw-rejection-man-313), [MAN-313](DECISIONS/2026-10-13-man313-non-cw-rejection.md) and [MAN-372](DECISIONS/2026-10-21-man372-speech-band-veto.md). Restart required (every `[detector]` key is). |
 | `unkeyed_close_ms` | `10000.0` | live | With `non_cw_filter` on, two limits: how long a qualified track may stay key-down with no keying, no decoded character and no callsign read before it closes; and how long a new track may take to show CW keying. Range 1000 to 3600000 (1 h). |
 
 ### Digital-mode windows

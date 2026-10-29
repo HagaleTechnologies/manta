@@ -1610,6 +1610,7 @@ mod tests {
         let file = desc(crate::LiveSourceSpec::File {
             path: "/x.wav".into(),
             source_iq: false,
+            raw: None,
         });
         assert_eq!(
             render(&receiver_check(&file, Ok(48_000.0))),
@@ -1635,6 +1636,7 @@ mod tests {
                 crate::LiveSourceSpec::File {
                     path: "/x.wav".into(),
                     source_iq: true,
+                    raw: None,
                 },
                 "could not open the WAV file /x.wav: outer: inner",
                 &["--source", "input.path"],

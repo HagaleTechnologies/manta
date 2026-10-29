@@ -100,6 +100,25 @@ const BOOTSTRAP_MIN_MARKS: usize = 2;
 /// midpoint, the rule `ClusterPair::boundary` uses between mark clusters.
 const BADLOCK_DAH_GAP_FRAC: f32 = 0.577_35;
 
+/// MAN-402: the bounds, as fractions of a unimodal bootstrap's mark centroid,
+/// of a completed gap that says those marks are dahs. A dah is three element
+/// gaps long, so such a gap sits near 1/3 of the mark; under dits it sits
+/// near 1. The upper bound (exclusive) is the log-space midpoint 1/sqrt(3),
+/// the value `BADLOCK_DAH_GAP_FRAC` also uses, named separately because the
+/// two rules compare different things. The lower bound (inclusive) is
+/// 1/`RATIO_MAX`: no supported dash/dot ratio puts an element gap below it,
+/// so a shorter gap is a glitch, not timing evidence.
+const UNIMODAL_DAH_GAP_MIN_FRAC: f32 = 1.0 / RATIO_MAX;
+const UNIMODAL_DAH_GAP_MAX_FRAC: f32 = 0.577_35;
+/// MAN-402: in-range gaps a unimodal bootstrap needs before it reads its marks
+/// as dahs. Two, not more: five marks can straddle two character or word
+/// boundaries and leave only two element gaps (looped "MO" attached at M's
+/// second dah).
+const UNIMODAL_DAH_GAP_MIN_COUNT: usize = 2;
+/// MAN-402: the in-range gaps must agree (population CV under this), the
+/// value `DRIFT_CV_MAX` uses for a homogeneous streak, applied here to gaps.
+const UNIMODAL_DAH_GAP_CV_MAX: f64 = 0.35;
+
 fn mean(xs: &[f32]) -> f32 {
     let mut acc = 0.0f64;
     for &x in xs {
@@ -517,6 +536,67 @@ impl SpeedTracker {
         if self.ready() {
             self.wpm_ema = Some(1200.0 / self.dit_estimate_ms());
         }
+    }
+
+    /// MAN-402 (SPEC §4.1 **\[DEVIATION\]**): resolve an ambiguous unimodal
+    /// bootstrap with the completed gaps between its five marks, before the
+    /// decoder's `pending` replay consumes them. Five same-length marks at or
+    /// under the 150 ms dit ceiling are assumed dits, and a stream of
+    /// same-length dahs ("MO", "0000" at 30-40 WPM) never supplies the longer
+    /// mark that would re-anchor that guess. When at least
+    /// `UNIMODAL_DAH_GAP_MIN_COUNT` consistent gaps sit in the dah-scale band
+    /// (`unimodal_gaps_say_dahs`), flip to the dah-assumed direction the
+    /// ceiling branch of `ClusterPair::initialize` uses: the marks become the
+    /// real `hi`, `lo` a provisional `hi / 3` that the first genuine dit
+    /// re-anchors. Returns true when it flipped; a second call never flips
+    /// again, since the direction changed. `gaps_ms` holds only gaps bounded
+    /// by two marks, unclassified: the dit-assumed scale would read the
+    /// character gaps of dahs as element gaps. See
+    /// docs/DECISIONS/2026-10-25-man402-dah-heavy-bootstrap.md.
+    pub(crate) fn resolve_unimodal_bootstrap(&mut self, gaps_ms: &[f32]) -> bool {
+        if !self.unimodal_gaps_say_dahs(gaps_ms) {
+            return false;
+        }
+        let observed_dah_ms = self.pair.lo;
+        self.pair.hi = observed_dah_ms;
+        self.pair.lo = observed_dah_ms / 3.0;
+        self.pair.placeholder_is_lo = true;
+        self.pair.confirmed = false;
+        self.apply_constraints();
+        self.wpm_ema = Some(1200.0 / self.dit_estimate_ms());
+        true
+    }
+
+    /// MAN-402: whether `gaps_ms` say an unresolved, dit-assumed unimodal
+    /// bootstrap's marks are dahs. Reads only; see `resolve_unimodal_bootstrap`.
+    fn unimodal_gaps_say_dahs(&self, gaps_ms: &[f32]) -> bool {
+        let p = &self.pair;
+        if !p.ready || p.confirmed || p.placeholder_is_lo {
+            return false;
+        }
+        let observed_ms = p.lo;
+        // Dahs under 60 ms would put the dit under the 20 ms clamp (over
+        // 60 WPM): such marks are dits, however short their gaps (a heavily
+        // weighted keyer at 30 WPM keys 52 ms dits with 28 ms gaps).
+        if !observed_ms.is_finite() || observed_ms < 3.0 * DIT_CLAMP_MS.0 {
+            return false;
+        }
+        let lo = observed_ms * UNIMODAL_DAH_GAP_MIN_FRAC;
+        let hi = observed_ms * UNIMODAL_DAH_GAP_MAX_FRAC;
+        let in_band = || {
+            gaps_ms
+                .iter()
+                .copied()
+                .filter(move |g| g.is_finite() && *g >= lo && *g < hi)
+                .map(f64::from)
+        };
+        let n = in_band().count();
+        if n < UNIMODAL_DAH_GAP_MIN_COUNT {
+            return false;
+        }
+        let mean = in_band().sum::<f64>() / n as f64;
+        let var = in_band().map(|g| (g - mean) * (g - mean)).sum::<f64>() / n as f64;
+        var.sqrt() / mean < UNIMODAL_DAH_GAP_CV_MAX
     }
 
     fn apply_constraints(&mut self) {
@@ -1746,6 +1826,153 @@ mod tests {
         }
         assert!(!t.take_badlock_recovered());
         assert!(t.mu_dit_ms() < 80.0, "mu_dit {}", t.mu_dit_ms());
+    }
+
+    /// MAN-402: five equal `m` ms marks: the unresolved unimodal bootstrap
+    /// (dit-assumed, unconfirmed), checked before any correction is tried.
+    fn unresolved_unimodal(m: f32) -> SpeedTracker {
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[m; 5]);
+        assert!(t.ready());
+        assert!(!t.pair.confirmed && !t.pair.placeholder_is_lo, "{m} ms");
+        assert_eq!(t.pair.lo_n, 0, "{m} ms: not a bimodal split");
+        assert!((t.mu_dit_ms() - m).abs() < 1e-3, "{m} ms: assumed dits");
+        t
+    }
+
+    /// MAN-402: the state a rejected correction must leave untouched.
+    fn tracker_state(t: &SpeedTracker) -> (f32, f32, bool, bool, bool, Option<f32>) {
+        (
+            t.mu_dit_ms(),
+            t.mu_dah_ms(),
+            t.ready(),
+            t.pair.confirmed,
+            t.pair.placeholder_is_lo,
+            t.wpm(),
+        )
+    }
+
+    fn assert_rejected(m: f32, gaps: &[f32], why: &str) {
+        let mut t = unresolved_unimodal(m);
+        let before = tracker_state(&t);
+        assert!(
+            !t.resolve_unimodal_bootstrap(gaps),
+            "{m} ms, {why}: {gaps:?}"
+        );
+        assert_eq!(tracker_state(&t), before, "{m} ms, {why}: state moved");
+    }
+
+    #[test]
+    fn unimodal_bootstrap_with_dah_scale_gaps_flips_to_dahs() {
+        // MAN-402: "MO"-shaped openings at 40 (90 ms dahs) down to 24 WPM
+        // (150 ms, still at the dit ceiling): two one-third element gaps among
+        // a character gap and a word gap.
+        for m in [90.0f32, 108.0, 120.0, 144.0, 150.0] {
+            let mut t = unresolved_unimodal(m);
+            let gaps = [m / 3.0, m, m / 3.0, 7.0 * m / 3.0];
+            assert!(t.resolve_unimodal_bootstrap(&gaps), "{m} ms");
+            assert!((t.mu_dah_ms() - m).abs() < 1e-3, "{m} ms: mu_dah");
+            assert!((t.mu_dit_ms() - m / 3.0).abs() < 1e-3, "{m} ms: mu_dit");
+            assert!(t.pair.placeholder_is_lo && !t.pair.confirmed, "{m} ms");
+            assert!(t.boundary_ms() < m, "{m} ms: the marks are dahs now");
+            let wpm = t.wpm().unwrap();
+            assert!((wpm - 3600.0 / m).abs() < 0.01, "{m} ms: wpm {wpm}");
+            // Exactly once: the direction changed, so nothing flips back or
+            // re-seeds.
+            let after = tracker_state(&t);
+            assert!(!t.resolve_unimodal_bootstrap(&gaps), "{m} ms: second call");
+            assert_eq!(tracker_state(&t), after, "{m} ms: second call moved");
+            // The observed marks keep classifying as dahs.
+            t.on_mark(m);
+            assert!(t.boundary_ms() < m && (t.mu_dah_ms() - m).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn unimodal_bootstrap_without_dah_scale_gaps_is_kept() {
+        for m in [90.0f32, 108.0, 120.0, 144.0, 150.0] {
+            // Dits: element gaps as long as the marks.
+            assert_rejected(m, &[m; 4], "equal gaps");
+            assert_rejected(m, &[m, 3.0 * m, m, 7.0 * m], "dit-text gaps");
+            assert_rejected(m, &[3.0 * m, 7.0 * m], "long gaps");
+            assert_rejected(m, &[], "no gaps");
+            assert_rejected(m, &[m / 3.0, m, 3.0 * m, 7.0 * m], "one gap");
+            assert_rejected(m, &[m / 7.0, m / 8.0, m], "glitch gaps");
+        }
+        // Two in-band gaps that disagree: CV exactly 0.35 (26 / 54 ms around a
+        // 40 ms mean) is at the limit and rejected, as is a wider spread.
+        assert_rejected(120.0, &[26.0, 54.0], "cv 0.35");
+        assert_rejected(120.0, &[20.0, 66.0, 120.0], "cv 0.53");
+        // Marks under 60 ms cannot be dahs (the dit would be under the 20 ms
+        // clamp): "5" from a heavily weighted keyer at 30 WPM, 52 ms dits and
+        // 28 ms gaps, stays dits; 60 ms is the shortest dah accepted.
+        assert_rejected(52.0, &[28.0; 4], "weighted dits");
+        assert!(unresolved_unimodal(60.0).resolve_unimodal_bootstrap(&[20.0, 20.0]));
+    }
+
+    #[test]
+    fn unimodal_bootstrap_gap_band_edges() {
+        let m = 120.0f32;
+        let lo = m * UNIMODAL_DAH_GAP_MIN_FRAC;
+        let hi = m * UNIMODAL_DAH_GAP_MAX_FRAC;
+        assert_eq!(lo, 20.0);
+        // Lower bound inclusive, upper exclusive.
+        assert!(unresolved_unimodal(m).resolve_unimodal_bootstrap(&[lo, lo]));
+        assert_rejected(m, &[lo - 0.01, lo - 0.01], "under the lower bound");
+        assert!(unresolved_unimodal(m).resolve_unimodal_bootstrap(&[hi - 0.01, hi - 0.01]));
+        assert_rejected(m, &[hi, hi], "at the upper bound");
+        // Values that are not durations supply no evidence, alongside one real
+        // gap (one is not enough).
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -40.0] {
+            assert_rejected(m, &[40.0, bad, bad], "non-duration gaps");
+        }
+    }
+
+    #[test]
+    fn resolved_bootstraps_are_not_reinterpreted() {
+        let dah_gaps = [40.0f32, 120.0, 40.0, 280.0];
+        // A confirmed dit/dah split.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[40.0, 120.0, 40.0, 40.0, 120.0]);
+        assert!(t.pair.confirmed);
+        let before = tracker_state(&t);
+        assert!(!t.resolve_unimodal_bootstrap(&dah_gaps));
+        assert_eq!(tracker_state(&t), before);
+        // Over the 150 ms ceiling the bootstrap already assumed dahs.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[180.0; 5]);
+        assert!(t.pair.placeholder_is_lo);
+        let before = tracker_state(&t);
+        assert!(!t.resolve_unimodal_bootstrap(&[60.0, 180.0, 60.0, 420.0]));
+        assert_eq!(tracker_state(&t), before);
+        // Not ready: nothing to resolve.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[120.0; 4]);
+        assert!(!t.resolve_unimodal_bootstrap(&dah_gaps));
+        assert!(!t.ready());
+    }
+
+    #[test]
+    fn flipped_bootstrap_reanchors_on_a_genuine_dit() {
+        // MAN-402: after the flip, mu_dit is a provisional m / 3; the first
+        // genuine dit re-anchors and confirms it, as on the ceiling branch.
+        let mut t = unresolved_unimodal(120.0);
+        assert!(t.resolve_unimodal_bootstrap(&[40.0, 120.0, 40.0, 280.0]));
+        t.on_mark(36.0);
+        assert!(t.pair.confirmed);
+        assert!(
+            (t.mu_dit_ms() - 36.0).abs() < 1e-3,
+            "mu_dit {}",
+            t.mu_dit_ms()
+        );
+        assert!(
+            (t.mu_dah_ms() - 120.0).abs() < 1e-3,
+            "mu_dah {}",
+            t.mu_dah_ms()
+        );
+        let before = tracker_state(&t);
+        assert!(!t.resolve_unimodal_bootstrap(&[40.0, 40.0]));
+        assert_eq!(tracker_state(&t), before);
     }
 
     #[test]
