@@ -4,7 +4,9 @@
 
 use crate::doctor_checks::Check;
 use std::fmt;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+#[cfg(test)]
+use std::net::Ipv4Addr;
+use std::net::{Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const DEFAULT_NTP_SERVER: &str = "pool.ntp.org";
@@ -198,11 +200,7 @@ fn query_addrs(addrs: &[SocketAddr], budget: Duration, deadline: Instant) -> Res
 
 /// `Err(None)` is a timeout, worded by the caller.
 fn query_addr(addr: SocketAddr, timeout: Duration) -> Result<f64, Option<String>> {
-    let local: SocketAddr = if addr.is_ipv4() {
-        (Ipv4Addr::UNSPECIFIED, 0).into()
-    } else {
-        (Ipv6Addr::UNSPECIFIED, 0).into()
-    };
+    let local = SocketAddr::new(manta_input::local_bind::udp_local_addr(addr.ip()), 0);
     let io = |e: std::io::Error| Some(format!("could not be reached ({e})"));
     let sock = UdpSocket::bind(local).map_err(io)?;
     // Connected, so only this server's replies are read, and an ICMP

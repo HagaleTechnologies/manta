@@ -4,6 +4,8 @@
 
 pub mod devices;
 
+pub mod local_bind;
+
 pub mod audio;
 pub use audio::{AudioIqSource, AUDIO_PASSBAND_HI_HZ, AUDIO_PASSBAND_LO_HZ, TARGET_RATE_HZ};
 

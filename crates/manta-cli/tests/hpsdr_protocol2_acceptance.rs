@@ -209,8 +209,8 @@ impl FakeP2Radio {
         Self::start_on([127, 0, 0, 1], stream, done)
     }
 
-    /// As [`Self::start`], bound on `ip`: `[0, 0, 0, 0]` also hears the
-    /// broadcast discovery a hostless input sends (MAN-306).
+    /// As [`Self::start`], bound on `ip`. Hostless discovery includes a
+    /// loopback-unicast destination to reach local fakes (MAN-306).
     fn start_on(ip: [u8; 4], stream: Stream, done: mpsc::Sender<()>) -> Self {
         let (base, cmd, iq) = Self::bind(ip);
         let stop = Arc::new(AtomicBool::new(false));
@@ -626,7 +626,7 @@ fn check_discovers_a_protocol2_radio_without_an_address() {
     samples.truncate(3 * RATE as usize);
     let (done_tx, _done_rx) = mpsc::channel();
     let fake = FakeP2Radio::start_on(
-        [0, 0, 0, 0],
+        [127, 0, 0, 1],
         Stream {
             samples: Arc::new(samples),
             speed: 1.0,
