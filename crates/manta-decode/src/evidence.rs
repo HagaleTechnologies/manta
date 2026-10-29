@@ -1964,6 +1964,61 @@ mod tests {
         assert_eq!(ids, sorted, "hop ids ordered and unique");
     }
 
+    /// MAN-385: at the largest accepted hold window, every center must
+    /// survive retention trimming and the EOF flush exactly once.
+    #[test]
+    fn max_hold_window_finalizes_every_center_exactly_once() {
+        let n = 3 * MAX_RETAIN + 77;
+        let cfg = cfg_h(MAX_RETAIN - 1);
+        let scene: Vec<(f32, f32)> = seeded_amps(n, 385)
+            .into_iter()
+            .zip(seeded_amps(n, 77).iter().map(|v| v * 0.2))
+            .collect();
+        let mut e = Evidence::new(cfg.clone());
+        let mut out = Vec::new();
+        for (i, &(amp, noise)) in scene.iter().enumerate() {
+            e.record(amp, noise, i as u64 * 512);
+            while let Some(ev) = e.drain_one() {
+                out.push(ev);
+            }
+        }
+        while let Some(ev) = e.flush_one() {
+            out.push(ev);
+        }
+        check_stream_invariants(&out, &scene, &cfg);
+    }
+
+    /// MAN-385: growing the window from 15 to 4095 after input 4106's
+    /// drain must preserve every center through the ensuing backlog.
+    #[test]
+    fn growing_to_the_max_hold_window_mid_stream_skips_no_center() {
+        let n = 3 * MAX_RETAIN + 77;
+        let cfg = EvidenceConfig {
+            hold_dits: 1.0,
+            u_init_hops: 15.0,
+            ..EvidenceConfig::default()
+        };
+        let scene: Vec<(f32, f32)> = seeded_amps(n, 385)
+            .into_iter()
+            .zip(seeded_amps(n, 77).iter().map(|v| v * 0.2))
+            .collect();
+        let mut e = Evidence::new(cfg.clone());
+        let mut out = Vec::new();
+        for (i, &(amp, noise)) in scene.iter().enumerate() {
+            e.record(amp, noise, i as u64 * 512);
+            while let Some(ev) = e.drain_one() {
+                out.push(ev);
+            }
+            if i == 4106 {
+                e.set_u_ref((MAX_RETAIN - 1) as f32);
+            }
+        }
+        while let Some(ev) = e.flush_one() {
+            out.push(ev);
+        }
+        check_stream_invariants(&out, &scene, &cfg);
+    }
+
     #[test]
     fn shrinking_the_hold_window_drains_the_whole_backlog_in_one_call() {
         // Codex review, PR #161 round 9: a speed increase (`set_u_ref`
