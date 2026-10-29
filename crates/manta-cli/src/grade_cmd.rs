@@ -22,11 +22,13 @@ use crate::config;
 pub(crate) struct Args {
     /// SpotMessage JSON Lines files, or directories of them (their
     /// `spots-*.jsonl` files, sorted): the `field-node.py record-spots`
-    /// archive. Repeatable.
+    /// archive. Repeatable. A file named twice, directly, through its
+    /// directory or through a symlink, is read once.
     #[arg(long, value_name = "PATH", required = true, num_args = 1..)]
     spots: Vec<PathBuf>,
     /// RBN daily-dump CSVs, or directories of them (their `*.csv` files,
-    /// sorted). Unzip RBN's `.zip` first. Repeatable.
+    /// sorted). Unzip RBN's `.zip` first. Repeatable. A file named twice,
+    /// directly, through its directory or through a symlink, is read once.
     #[arg(long, value_name = "PATH", required = true, num_args = 1..)]
     rbn: Vec<PathBuf>,
     /// Count only this RBN skimmer's reports, for example a co-located
@@ -419,15 +421,20 @@ fn grade_config(args: &Args) -> Result<(GradeConfig, Vec<String>)> {
 }
 
 /// Files and directories to a file list: a directory contributes its files
-/// that `keep` accepts, sorted by name; a file is taken as given.
+/// that `keep` accepts, sorted by name; a file is taken as given. A file
+/// reached twice (directly and through its directory, with `./` or `..`,
+/// or through a symlink) is listed once, as first spelled, keyed by its
+/// canonical path (MAN-343); a path with no canonical path, such as a
+/// missing file, keys as given, so the loader's error names it as typed.
 fn expand_paths(
     paths: &[PathBuf],
     what: &str,
     keep: impl Fn(&str) -> bool,
 ) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
+    let mut seen = BTreeSet::new();
     for p in paths {
-        if p.is_dir() {
+        let found = if p.is_dir() {
             let mut found: Vec<PathBuf> = std::fs::read_dir(p)
                 .with_context(|| format!("cannot read directory {}", p.display()))?
                 .filter_map(|e| e.ok().map(|e| e.path()))
@@ -438,9 +445,15 @@ fn expand_paths(
                 bail!("{} has no {what} files", p.display());
             }
             found.sort();
-            files.extend(found);
+            found
         } else {
-            files.push(p.clone());
+            vec![p.clone()]
+        };
+        for f in found {
+            let key = std::fs::canonicalize(&f).unwrap_or_else(|_| f.clone());
+            if seen.insert(key) {
+                files.push(f);
+            }
         }
     }
     Ok(files)
@@ -682,5 +695,20 @@ mod tests {
     #[test]
     fn split_csv_handles_quotes_and_crlf() {
         assert_eq!(split_csv("a, \"b,c\" ,d\r"), vec!["a", "b,c", "d"]);
+    }
+
+    #[test]
+    fn expand_paths_keeps_each_file_once_at_its_first_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.csv"), dir.path().join("b.csv"));
+        std::fs::write(&a, "").unwrap();
+        std::fs::write(&b, "").unwrap();
+        let args = [
+            b.clone(),
+            dir.path().to_path_buf(),
+            dir.path().join(".").join("a.csv"),
+        ];
+        let files = expand_paths(&args, "*.csv", |n| n.ends_with(".csv")).unwrap();
+        assert_eq!(files, vec![b, a]);
     }
 }
