@@ -945,7 +945,10 @@ fn take_input_array(
         };
         check_input_name(&name).map_err(|e| anyhow!("{origin}: {e}"))?;
         let quoted = crate::fmt::quoted(&name);
-        if inputs.iter().any(|n| n.name == name) {
+        if inputs
+            .iter()
+            .any(|n| n.name == name || n.entry.as_deref() == Some(name.as_str()))
+        {
             bail!("{origin}: [[input]] name {quoted} is used twice");
         }
         if t.kind.is_none() {
@@ -2089,6 +2092,21 @@ mod tests {
         let err = err_of(&format!("{KA9Q_20}{KA9Q_20}"));
         assert!(
             err.ends_with(": [[input]] name \"20m\" is used twice"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn band_expansion_does_not_hide_a_duplicate_entry_name() {
+        // MAN-413 (Codex review, PR #345): the first entry expands to
+        // labelled streams, so comparing stream names alone used to
+        // let a second entry named "x" through.
+        let err = err_of(
+            "[[input]]\nname = \"x\"\ntype = \"kiwi\"\nhost = \"a\"\nbands = \"60m\"\n\n\
+             [[input]]\nname = \"x\"\ntype = \"kiwi\"\nhost = \"b\"\nfreq_hz = 7030000.0\n",
+        );
+        assert!(
+            err.ends_with(": [[input]] name \"x\" is used twice"),
             "{err}"
         );
     }
