@@ -35,6 +35,7 @@ regenerate it: `python3 scripts/decisions-index.py --write`. See
 | 2026-10-26 | MAN-249 | [MAN-249: public docs name roles, not machines, people or receiver hosts](2026-10-26-man249-public-disclosure.md) |
 | 2026-10-25 | MAN-423 | [MAN-423: hops buffered before a spliced loss keep their timestamps; a parked protocol-2 backlog keeps its anchor](2026-10-25-man423-pre-loss-hops-and-parked-backlogs.md) |
 | 2026-10-25 | MAN-402 | [MAN-402: a unimodal speed bootstrap reads its marks as dahs when the gaps between them say so](2026-10-25-man402-dah-heavy-bootstrap.md) |
+| 2026-10-25 | MAN-392 | [MAN-392: calibrate reports a standalone receiver's measurement beside several inputs](2026-10-25-man392-calibrate-source-beside-several-inputs.md) |
 | 2026-10-25 | MAN-288 | [MAN-288: planned windows absorb counter-attributed downtime](2026-10-25-man288-planned-outage-counter-overlap.md) |
 | 2026-10-24 | MAN-285 | [MAN-285: status JSON preserves every served field](2026-10-24-man285-status-json-every-served-field.md) |
 | 2026-10-24 | MAN-284 | [MAN-284: `field-node.py report` counts the time before the first sample as unobserved](2026-10-24-man284-unsampled-prefix-unobserved.md) |
