@@ -1363,6 +1363,21 @@ fn generated_stream_names_must_fit_and_be_unique() {
 }
 
 #[test]
+fn band_expansion_does_not_hide_a_duplicate_entry_name() {
+    // MAN-413 (Codex review, PR #345): an entry whose bands expand to
+    // labelled streams must still own its base name.
+    let err = fails(&check_body(
+        "[[input]]\nname = \"kiwi\"\ntype = \"kiwi\"\nhost = \"kiwi.example.net\"\n\
+         bands = \"60m\"\n\n[[input]]\nname = \"kiwi\"\ntype = \"kiwi\"\n\
+         host = \"other.example.net\"\nfreq_hz = 7030000.0\n",
+    ));
+    assert!(
+        err.ends_with("m.toml: [[input]] name \"kiwi\" is used twice\n"),
+        "{err}"
+    );
+}
+
+#[test]
 fn nothing_in_range_is_refused() {
     let err = fails(&check_body(&format!(
         "{KIWI}bands = \"160m\"\ntuning_range_hz = [3000000.0, 30000000.0]\n"
