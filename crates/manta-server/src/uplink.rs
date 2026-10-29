@@ -7,6 +7,14 @@
 //! its ingest accepts, and this module has only run against in-process mock
 //! collectors. Open claims C1-C7:
 //! docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md.
+//!
+//! MAN-320 D6: the uplink also forwards relayed spots (`crate::relay`,
+//! the bus's relay channel) from the operator's other local skimmers and
+//! WSJT-X. A relayed spot takes the same `spot_types` -> `dry_run` ->
+//! ceiling gates as manta's own, shares the target's ceiling, and goes out
+//! under its own spotter call (`rbn::format_relay_line`), not the login
+//! call. That a collector accepts other spotters on one connection (C12)
+//! and the FT8/FT4 digital line (C13) are open MAN-90 claims.
 
 use crate::backoff::{next_backoff, AttemptOutcome as ConnectAttemptError, INITIAL_BACKOFF};
 use crate::bounded_io::{read_line_bounded, read_line_bounded_with_timeout};
@@ -15,6 +23,7 @@ use crate::config::{RbnUplinkConfig, UplinkSpotTypes};
 use crate::metrics::UplinkTarget;
 use crate::rate_limit::RateLimiter;
 use crate::rbn;
+use crate::relay::RelaySpot;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -421,7 +430,10 @@ async fn connect_and_forward(
     // Subscribe before completing login, matching telnet.rs's own
     // "subscribe before handshake" rule -- a spot published mid-login
     // must not be lost to the broadcast channel's no-history semantics.
-    let mut rx = bus.subscribe();
+    let mut rx = Feeds {
+        own: bus.subscribe(),
+        relay: bus.subscribe_relay(),
+    };
 
     // Bounded (MAX_LINE_BYTES cap, via bounded_io) AND raced against
     // shutdown (MAN-58 finding 1): the prior bare `.await` had neither --
@@ -504,7 +516,7 @@ async fn connect_and_forward(
 /// write failures.
 fn record_write_failure_loss(
     target: &UplinkTarget,
-    rx: &mut broadcast::Receiver<crate::bus::BusSpot>,
+    rx: &mut Feeds,
     extra: u64,
     spot_types: UplinkSpotTypes,
 ) {
@@ -525,7 +537,8 @@ fn record_write_failure_loss(
 ///
 /// Every early return out of `forward_loop`'s select loop, and out of
 /// `connect_and_forward`'s pre-login connect/prompt-read loops once `rx`
-/// has been subscribed, MUST call one of these two helpers first (PR #80
+/// (both receivers, MAN-320) has been subscribed, MUST call one of these
+/// two helpers first, which drain both (PR #80
 /// review, rounds 3-8): this exact accounting gap recurred at a NEW exit
 /// path across five consecutive review rounds -- the "same code region
 /// keeps breaking" signal that ad-hoc inline `rx.len()` at each call site
@@ -534,7 +547,7 @@ fn record_write_failure_loss(
 /// least resistance at any exit site added in the future.
 fn record_disconnect_loss(
     target: &UplinkTarget,
-    rx: &mut broadcast::Receiver<crate::bus::BusSpot>,
+    rx: &mut Feeds,
     extra: u64,
     spot_types: UplinkSpotTypes,
 ) {
@@ -544,22 +557,41 @@ fn record_disconnect_loss(
     }
 }
 
-/// Classify the backlog present when teardown starts. Bound the drain by
-/// that snapshot so ongoing publishers cannot delay disconnect indefinitely.
-/// Overwritten entries have no recoverable type and count as lagged; retained
-/// entries excluded by the target's type policy count as suppressed.
+/// MAN-320: the two bus channels one connection reads -- manta's own
+/// spots and relayed spots. Subscribed together at the subscribe-before-
+/// handshake point, and drained together by every loss helper.
+struct Feeds {
+    own: broadcast::Receiver<crate::bus::BusSpot>,
+    relay: broadcast::Receiver<RelaySpot>,
+}
+
+/// Classify the backlog present when teardown starts, on both receivers.
+/// Bound each drain by its snapshot so ongoing publishers cannot delay
+/// disconnect indefinitely. Overwritten entries have no recoverable type and
+/// count as lagged; retained entries excluded by the target's type policy
+/// count as suppressed (a relayed spot's own `spot_type` decides, D6).
 fn count_unsuppressed_backlog(
     target: &UplinkTarget,
-    rx: &mut broadcast::Receiver<crate::bus::BusSpot>,
+    rx: &mut Feeds,
     spot_types: UplinkSpotTypes,
+) -> u64 {
+    drain_backlog(target, &mut rx.own, spot_types, |s| s.spot.spot_type)
+        + drain_backlog(target, &mut rx.relay, spot_types, |s| s.spot_type)
+}
+
+fn drain_backlog<T: Clone>(
+    target: &UplinkTarget,
+    rx: &mut broadcast::Receiver<T>,
+    spot_types: UplinkSpotTypes,
+    spot_type: impl Fn(&T) -> manta_spot::SpotType,
 ) -> u64 {
     let mut remaining = rx.len() as u64;
     let mut unsuppressed = 0;
     while remaining > 0 {
         match rx.try_recv() {
-            Ok(bus_spot) => {
+            Ok(item) => {
                 remaining -= 1;
-                if spot_types.forwards(bus_spot.spot.spot_type) {
+                if spot_types.forwards(spot_type(&item)) {
                     unsuppressed += 1;
                 } else {
                     target.record_suppressed();
@@ -578,11 +610,88 @@ fn count_unsuppressed_backlog(
     unsuppressed
 }
 
+/// What `forward_loop` does after one spot went through `gate_and_write`.
+enum Forwarded {
+    /// Sent, or held back by a gate: read the next one.
+    Next,
+    /// The connection ends; the loss helpers have already run.
+    End(std::io::Result<()>),
+}
+
+/// MAN-320 D6: the one gate sequence both of `forward_loop`'s spot arms
+/// share. `spot_types` -> `dry_run` -> ceiling, then the write raced
+/// against shutdown. `line` renders the spot only once it passed the
+/// gates.
+#[allow(clippy::too_many_arguments)]
+async fn gate_and_write(
+    spot_type: manta_spot::SpotType,
+    line: impl FnOnce() -> String,
+    wr: &mut tokio::net::tcp::OwnedWriteHalf,
+    rx: &mut Feeds,
+    dry_run: &AtomicBool,
+    spot_types: UplinkSpotTypes,
+    target: &Arc<UplinkTarget>,
+    forward_budget: &mut RateLimiter,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Forwarded {
+    // MAN-91: RBN only takes CQ/TEST callers and beacons, so by default
+    // other types stop here. Local telnet/JSON have their own
+    // subscriptions and still see this spot. Its own parameter, not
+    // `config.spot_types`, so it stays independent of where `dry_run` is
+    // read from (MAN-78).
+    if !spot_types.forwards(spot_type) {
+        target.record_suppressed();
+        return Forwarded::Next;
+    }
+    if dry_run.load(Ordering::Relaxed) {
+        target.record_suppressed();
+        return Forwarded::Next;
+    }
+    // MAN-248: the forwarding ceiling, checked where the spot is about to
+    // be written. Deliberately AFTER the dry-run check: a dry-run spot is
+    // never "about to be written", and `dry_run` flips live via SIGHUP
+    // (MAN-78) -- dry-run periods must not consume forwarding budget. Over
+    // budget: count and skip. No disconnect, no queue, no error -- the
+    // connection stays up by design, the opposite of `response_limiter`'s
+    // overrun handling in `forward_loop`. Shared by own and relayed spots
+    // (MAN-320 D6): it bounds the total sent to one target.
+    if !forward_budget.allow() {
+        target.record_ceiling_suppressed();
+        return Forwarded::Next;
+    }
+    let wire_line = format!("{}\r\n", line());
+    // Raced against shutdown too, not just bounded by WRITE_TIMEOUT (PR #80
+    // review, round 3): once inside this branch, the outer select! is no
+    // longer polling its own `shutdown.changed()` arm -- without this inner
+    // race, a target that stopped reading would leave shutdown unobserved
+    // for up to the full WRITE_TIMEOUT (10s), which can exceed a service
+    // manager's graceful-shutdown window.
+    tokio::select! {
+        write_result = write_with_timeout(wr, wire_line.as_bytes()) => {
+            if let Err(e) = write_result {
+                record_write_failure_loss(target, rx, 1, spot_types);
+                return Forwarded::End(Err(e));
+            }
+            target.record_sent();
+            Forwarded::Next
+        }
+        _ = shutdown.changed() => {
+            if *shutdown.borrow() {
+                record_disconnect_loss(target, rx, 1, spot_types);
+                return Forwarded::End(Ok(()));
+            }
+            // A spurious wakeup cancelled the write; the spot is gone like
+            // any spot this connection never wrote (pre-MAN-320 behaviour).
+            Forwarded::Next
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward_loop(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
     wr: &mut tokio::net::tcp::OwnedWriteHalf,
-    rx: &mut broadcast::Receiver<crate::bus::BusSpot>,
+    rx: &mut Feeds,
     dry_run: &AtomicBool,
     spot_types: UplinkSpotTypes,
     spotter_call: &str,
@@ -596,70 +705,47 @@ async fn forward_loop(
         RateLimiter::new(MAX_TARGET_RESPONSE_LINES, TARGET_RESPONSE_RATE_WINDOW);
     loop {
         tokio::select! {
-            recv = rx.recv() => {
+            recv = rx.own.recv() => {
                 match recv {
                     Ok(bus_spot) => {
-                        // MAN-91: RBN only takes CQ/TEST callers and
-                        // beacons, so by default other types stop here.
-                        // Local telnet/JSON have their own subscriptions
-                        // and still see this spot. Its own parameter, not
-                        // `config.spot_types`, so it stays independent of
-                        // where `dry_run` is read from (MAN-78).
-                        if !spot_types.forwards(bus_spot.spot.spot_type) {
-                            target.record_suppressed();
-                            continue;
-                        }
-                        if dry_run.load(Ordering::Relaxed) {
-                            target.record_suppressed();
-                            continue;
-                        }
-                        // MAN-248: the forwarding ceiling, checked where
-                        // the spot is about to be written. Deliberately
-                        // AFTER the dry-run check: a dry-run spot is never
-                        // "about to be written", and `dry_run` flips live
-                        // via SIGHUP (MAN-78) -- dry-run periods must not
-                        // consume forwarding budget. Over budget: count
-                        // and skip. No disconnect, no queue, no error --
-                        // the connection stays up by design, the opposite
-                        // of `response_limiter`'s overrun handling below.
-                        if !forward_budget.allow() {
-                            target.record_ceiling_suppressed();
-                            continue;
-                        }
                         let unix_ts = bus.unix_ts_for(bus_spot.spot.sample_ts);
                         // MAN-88 Decision 1: the uplink always emits the RBN
                         // relay layout, independent of [server].line_format
                         // -- see that key's doc comment in config.rs.
-                        let line = rbn::format_line(
-                            &bus_spot.spot,
-                            spotter_call,
-                            unix_ts,
-                            rbn::LineFormat::Rbn,
-                        );
-                        let wire_line = format!("{line}\r\n");
-                        // Raced against shutdown too, not just bounded by
-                        // WRITE_TIMEOUT (PR #80 review, round 3): once
-                        // inside this branch, the outer select! is no
-                        // longer polling its own `shutdown.changed()` arm
-                        // -- without this inner race, a target that
-                        // stopped reading would leave shutdown
-                        // unobserved for up to the full WRITE_TIMEOUT
-                        // (10s), which can exceed a service manager's
-                        // graceful-shutdown window.
-                        tokio::select! {
-                            write_result = write_with_timeout(wr, wire_line.as_bytes()) => {
-                                if write_result.is_err() {
-                                    record_write_failure_loss(target, rx, 1, spot_types);
-                                    write_result?;
-                                }
-                                target.record_sent();
-                            }
-                            _ = shutdown.changed() => {
-                                if *shutdown.borrow() {
-                                    record_disconnect_loss(target, rx, 1, spot_types);
-                                    return Ok(());
-                                }
-                            }
+                        let line = || {
+                            rbn::format_line(&bus_spot.spot, spotter_call, unix_ts, rbn::LineFormat::Rbn)
+                        };
+                        let spot_type = bus_spot.spot.spot_type;
+                        if let Forwarded::End(result) = gate_and_write(
+                            spot_type, line, wr, rx, dry_run, spot_types, target, forward_budget, shutdown,
+                        )
+                        .await
+                        {
+                            return result;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        target.record_lagged(n);
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        record_disconnect_loss(target, rx, 0, spot_types);
+                        return Ok(());
+                    }
+                }
+            }
+            // MAN-320 D6: a relayed spot, through the same gates, under its
+            // own spotter call.
+            recv = rx.relay.recv() => {
+                match recv {
+                    Ok(relay) => {
+                        let line = || rbn::format_relay_line(&relay);
+                        if let Forwarded::End(result) = gate_and_write(
+                            relay.spot_type, line, wr, rx, dry_run, spot_types, target, forward_budget, shutdown,
+                        )
+                        .await
+                        {
+                            return result;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -753,15 +839,32 @@ mod tests {
         }
     }
 
+    fn sample_relay_for_loss_tests(spot_type: manta_spot::SpotType) -> RelaySpot {
+        RelaySpot {
+            spotter: Arc::from("W3XYZ-2"),
+            callsign: "JA1ABC".to_string(),
+            freq_hz: 14_027_100.0,
+            mode: crate::relay::RelayMode::Cw { wpm: 28 },
+            snr_db: 30,
+            spot_type,
+            unix_ts: 1_700_000_000,
+        }
+    }
+
+    /// MAN-320: the backlog holds own and relayed spots of each type; a
+    /// relayed spot's own `spot_type` decides suppressed vs. lost, relay
+    /// lag counts as lagged, and both receivers end empty.
     #[test]
     fn teardown_separates_filtered_backlog_from_transport_loss() {
         for (spot_types, suppressed, lost) in [
-            (UplinkSpotTypes::CqBeacon, 2, 3),
-            (UplinkSpotTypes::All, 0, 5),
+            (UplinkSpotTypes::CqBeacon, 4, 5),
+            (UplinkSpotTypes::All, 0, 9),
         ] {
             for write_failed in [false, true] {
                 for lagged in [0, 1] {
-                    let (tx, mut rx) = broadcast::channel(4);
+                    let (tx, own) = broadcast::channel(4);
+                    let (relay_tx, relay) = broadcast::channel(4);
+                    let mut rx = Feeds { own, relay };
                     let target = Metrics::new().register_uplink_target("t".to_string(), false);
                     // This optional entry is overwritten before teardown can inspect its type.
                     for _ in 0..lagged {
@@ -770,6 +873,9 @@ mod tests {
                             occurrence_count: 1,
                         })
                         .unwrap();
+                        relay_tx
+                            .send(sample_relay_for_loss_tests(manta_spot::SpotType::Cq))
+                            .unwrap();
                     }
                     for spot_type in [
                         manta_spot::SpotType::De,
@@ -785,6 +891,9 @@ mod tests {
                             occurrence_count: 1,
                         })
                         .unwrap();
+                        relay_tx
+                            .send(sample_relay_for_loss_tests(spot_type))
+                            .unwrap();
                     }
                     if write_failed {
                         record_write_failure_loss(&target, &mut rx, 1, spot_types);
@@ -792,7 +901,7 @@ mod tests {
                         record_disconnect_loss(&target, &mut rx, 1, spot_types);
                     }
                     assert_eq!(target.suppressed_total(), suppressed);
-                    assert_eq!(target.lagged_total(), lagged);
+                    assert_eq!(target.lagged_total(), 2 * lagged);
                     assert_eq!(
                         target.write_failed_total(),
                         if write_failed { lost } else { 0 }
@@ -801,10 +910,34 @@ mod tests {
                         target.disconnected_total(),
                         if write_failed { 0 } else { lost }
                     );
-                    assert!(rx.is_empty(), "teardown must consume the accounted backlog");
+                    assert!(
+                        rx.own.is_empty(),
+                        "teardown must consume the accounted backlog"
+                    );
+                    assert!(
+                        rx.relay.is_empty(),
+                        "teardown must consume the relayed backlog"
+                    );
                 }
             }
         }
+    }
+
+    #[test]
+    fn record_loss_helpers_record_nothing_when_both_receivers_are_empty() {
+        let epoch = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let bus = crate::bus::SpotBus::new(96_000.0, epoch, 0);
+        let mut rx = Feeds {
+            own: bus.subscribe(),
+            relay: bus.subscribe_relay(),
+        };
+        let target = Metrics::new().register_uplink_target("t".to_string(), false);
+        record_write_failure_loss(&target, &mut rx, 0, UplinkSpotTypes::default());
+        record_disconnect_loss(&target, &mut rx, 0, UplinkSpotTypes::default());
+        assert_eq!(target.write_failed_total(), 0);
+        assert_eq!(target.disconnected_total(), 0);
+        assert_eq!(target.suppressed_total(), 0);
+        assert_eq!(target.lagged_total(), 0);
     }
 
     /// PR #80 review, rounds 3-8: `record_write_failure_loss` and
@@ -819,7 +952,10 @@ mod tests {
     fn record_write_failure_loss_counts_extra_plus_backlog() {
         let epoch = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let bus = crate::bus::SpotBus::new(96_000.0, epoch, 0);
-        let mut rx = bus.subscribe();
+        let mut rx = Feeds {
+            own: bus.subscribe(),
+            relay: bus.subscribe_relay(),
+        };
         let target = Metrics::new().register_uplink_target("t".to_string(), true);
 
         // 3 spots queued in the backlog, none yet drained by `rx`.
@@ -827,7 +963,7 @@ mod tests {
         bus.publish(spot.clone());
         bus.publish(spot.clone());
         bus.publish(spot);
-        assert_eq!(rx.len(), 3);
+        assert_eq!(rx.own.len(), 3);
 
         record_write_failure_loss(&target, &mut rx, 1, UplinkSpotTypes::default()); // the failed spot + backlog
         assert_eq!(target.write_failed_total(), 4);
@@ -845,13 +981,16 @@ mod tests {
     fn record_disconnect_loss_counts_extra_plus_backlog_separately_from_write_failures() {
         let epoch = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let bus = crate::bus::SpotBus::new(96_000.0, epoch, 0);
-        let mut rx = bus.subscribe();
+        let mut rx = Feeds {
+            own: bus.subscribe(),
+            relay: bus.subscribe_relay(),
+        };
         let target = Metrics::new().register_uplink_target("t".to_string(), true);
 
         let spot = sample_spot_for_loss_tests();
         bus.publish(spot.clone());
         bus.publish(spot);
-        assert_eq!(rx.len(), 2);
+        assert_eq!(rx.own.len(), 2);
 
         record_disconnect_loss(&target, &mut rx, 0, UplinkSpotTypes::default()); // e.g. a rate-limit disconnect: no single spot to blame
         assert_eq!(target.disconnected_total(), 2);
@@ -869,7 +1008,10 @@ mod tests {
     fn record_loss_helpers_record_nothing_when_extra_and_backlog_are_both_zero() {
         let epoch = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let bus = crate::bus::SpotBus::new(96_000.0, epoch, 0);
-        let mut rx = bus.subscribe();
+        let mut rx = Feeds {
+            own: bus.subscribe(),
+            relay: bus.subscribe_relay(),
+        };
         let target = Metrics::new().register_uplink_target("t".to_string(), true);
 
         record_write_failure_loss(&target, &mut rx, 0, UplinkSpotTypes::default());

@@ -1143,6 +1143,123 @@ pub struct DaemonConfigFile {
     pub rbn_uplink: Vec<RbnUplinkConfig>,
 }
 
+/// MAN-320: `[[skimmer_relay]]` and `[[wsjtx_relay]]` default to enabled:
+/// adding the block is the opt-in.
+fn default_true() -> bool {
+    true
+}
+
+/// MAN-320: WSJT-X's own default UDP server address.
+fn default_wsjtx_listen() -> std::net::SocketAddr {
+    std::net::SocketAddr::from(([127, 0, 0, 1], 2237))
+}
+
+/// MAN-320: a relay's `callsign`, in the station grammar (MAN-89),
+/// uppercased so config casing never reaches the uplink wire.
+fn deserialize_relay_callsign<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let call = String::deserialize(deserializer)?;
+    check_operator_callsign(&call)
+        .map_err(|e| serde::de::Error::custom(format!("callsign {e}")))?;
+    Ok(call.to_ascii_uppercase())
+}
+
+/// The scaffold's example callsign, which a relay may not keep.
+const RELAY_EXAMPLE_CALLSIGN: &str = "N0CALL";
+
+fn check_relay_example_callsign(table: &str, call: &str) -> Result<(), String> {
+    if strip_ssid(call).eq_ignore_ascii_case(RELAY_EXAMPLE_CALLSIGN) {
+        return Err(format!(
+            "[[{table}]]: callsign {} is still the example -- set the real call",
+            crate::human::quoted(call)
+        ));
+    }
+    Ok(())
+}
+
+/// MAN-320: another CW skimmer whose telnet spots are forwarded through
+/// `[[rbn_uplink]]` under that skimmer's own call. Restart-only.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkimmerRelayConfig {
+    /// `false` keeps the block but does not connect.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// The skimmer's host name or address.
+    pub host: String,
+    /// The skimmer's telnet port.
+    pub port: u16,
+    /// The call the skimmer spots under; also the relay's login.
+    #[serde(deserialize_with = "deserialize_relay_callsign")]
+    pub callsign: String,
+}
+
+impl SkimmerRelayConfig {
+    /// `host:port`, the relay's label in logs, metrics and errors.
+    pub fn label(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    /// Rejects an empty host, the scaffold's `<...>` placeholder host and
+    /// the `N0CALL` example callsign.
+    pub fn validate(&self) -> Result<(), String> {
+        let host = self.host.trim();
+        if host.is_empty() {
+            return Err(
+                "[[skimmer_relay]]: host is empty -- set the skimmer's host name or address"
+                    .to_string(),
+            );
+        }
+        if host.starts_with('<') && host.ends_with('>') {
+            return Err(format!(
+                "[[skimmer_relay]]: host {} is the scaffold placeholder -- set the skimmer's \
+                 host name or address",
+                crate::human::quoted(&self.host)
+            ));
+        }
+        check_relay_example_callsign("skimmer_relay", &self.callsign)
+    }
+}
+
+/// MAN-320: a WSJT-X/JTDX UDP listener whose new FT8/FT4 CQ decodes are
+/// forwarded through `[[rbn_uplink]]` as digital spots. Restart-only.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WsjtxRelayConfig {
+    /// `false` keeps the block but does not listen.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// `IP:port`; an IPv4 multicast group binds `0.0.0.0:port` and joins it.
+    #[serde(default = "default_wsjtx_listen")]
+    pub listen: std::net::SocketAddr,
+    /// The spotter on every forwarded FT8/FT4 line.
+    #[serde(deserialize_with = "deserialize_relay_callsign")]
+    pub callsign: String,
+}
+
+impl WsjtxRelayConfig {
+    /// The `listen` address, the relay's label in logs, metrics and errors.
+    pub fn label(&self) -> String {
+        self.listen.to_string()
+    }
+
+    /// Rejects an IPv6 multicast `listen` and the `N0CALL` example callsign.
+    pub fn validate(&self) -> Result<(), String> {
+        if let std::net::SocketAddr::V6(v6) = self.listen {
+            if v6.ip().is_multicast() {
+                return Err(format!(
+                    "[[wsjtx_relay]]: listen \"{}\" is an IPv6 multicast group -- use an IPv4 \
+                     group such as \"224.0.0.1:2237\", or a unicast address",
+                    self.listen
+                ));
+            }
+        }
+        check_relay_example_callsign("wsjtx_relay", &self.callsign)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2399,5 +2516,115 @@ mod tests {
             .unwrap_err();
             assert!(error.to_string().contains("history_minutes"));
         }
+    }
+
+    // ---- MAN-320: relay tables
+
+    #[test]
+    fn skimmer_relay_deserializes_with_enabled_defaulting_true() {
+        let r: SkimmerRelayConfig =
+            toml::from_str("host = \"192.168.1.20\"\nport = 7300\ncallsign = \"W1ABC-2\"\n")
+                .unwrap();
+        assert!(r.enabled);
+        assert_eq!(r.label(), "192.168.1.20:7300");
+        assert_eq!(r.validate(), Ok(()));
+    }
+
+    #[test]
+    fn missing_host_port_or_callsign_is_an_error() {
+        for body in [
+            "port = 7300\ncallsign = \"W1ABC-2\"\n",
+            "host = \"h\"\ncallsign = \"W1ABC-2\"\n",
+            "host = \"h\"\nport = 7300\n",
+        ] {
+            assert!(
+                toml::from_str::<SkimmerRelayConfig>(body).is_err(),
+                "{body}"
+            );
+        }
+        assert!(toml::from_str::<WsjtxRelayConfig>("listen = \"127.0.0.1:2237\"\n").is_err());
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected() {
+        let e = toml::from_str::<SkimmerRelayConfig>(
+            "host = \"h\"\nport = 1\ncallsign = \"W1ABC\"\nname = \"x\"\n",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("unknown field"), "{e}");
+        let e = toml::from_str::<WsjtxRelayConfig>("callsign = \"W1ABC\"\nport = 1\n").unwrap_err();
+        assert!(e.to_string().contains("unknown field"), "{e}");
+    }
+
+    #[test]
+    fn wsjtx_relay_listen_defaults_to_127_0_0_1_2237() {
+        let r: WsjtxRelayConfig = toml::from_str("callsign = \"W1ABC\"\n").unwrap();
+        assert!(r.enabled);
+        assert_eq!(r.label(), "127.0.0.1:2237");
+    }
+
+    #[test]
+    fn ipv6_multicast_listen_is_rejected() {
+        let r: WsjtxRelayConfig =
+            toml::from_str("callsign = \"W1ABC\"\nlisten = \"[ff02::1]:2237\"\n").unwrap();
+        assert_eq!(
+            r.validate().unwrap_err(),
+            "[[wsjtx_relay]]: listen \"[ff02::1]:2237\" is an IPv6 multicast group -- use an \
+             IPv4 group such as \"224.0.0.1:2237\", or a unicast address"
+        );
+    }
+
+    #[test]
+    fn ipv4_multicast_listen_is_accepted() {
+        let r: WsjtxRelayConfig =
+            toml::from_str("callsign = \"W1ABC\"\nlisten = \"224.0.0.1:2237\"\n").unwrap();
+        assert_eq!(r.validate(), Ok(()));
+    }
+
+    #[test]
+    fn listen_port_0_is_accepted() {
+        let r: WsjtxRelayConfig =
+            toml::from_str("callsign = \"W1ABC\"\nlisten = \"127.0.0.1:0\"\n").unwrap();
+        assert_eq!(r.validate(), Ok(()));
+        assert_eq!(r.listen.port(), 0);
+    }
+
+    #[test]
+    fn relay_callsigns_use_the_station_grammar_and_are_uppercased() {
+        let r: SkimmerRelayConfig =
+            toml::from_str("host = \"h\"\nport = 1\ncallsign = \"w1abc-2\"\n").unwrap();
+        assert_eq!(r.callsign, "W1ABC-2");
+        let w: WsjtxRelayConfig = toml::from_str("callsign = \"w1abc\"\n").unwrap();
+        assert_eq!(w.callsign, "W1ABC");
+        let e = toml::from_str::<SkimmerRelayConfig>(
+            "host = \"h\"\nport = 1\ncallsign = \"W1ABC-100\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string().contains(
+                "callsign \"W1ABC-100\" is not a plausible callsign (an SSID must be -1 through -99)"
+            ),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn the_placeholder_host_and_n0call_are_rejected() {
+        let r: SkimmerRelayConfig =
+            toml::from_str("host = \"<skimmer-host>\"\nport = 1\ncallsign = \"W1ABC-2\"\n")
+                .unwrap();
+        assert_eq!(
+            r.validate().unwrap_err(),
+            "[[skimmer_relay]]: host \"<skimmer-host>\" is the scaffold placeholder -- set the \
+             skimmer's host name or address"
+        );
+        let r: SkimmerRelayConfig =
+            toml::from_str("host = \" \"\nport = 1\ncallsign = \"W1ABC-2\"\n").unwrap();
+        assert!(r.validate().is_err());
+        let r: SkimmerRelayConfig =
+            toml::from_str("host = \"h\"\nport = 1\ncallsign = \"N0CALL-2\"\n").unwrap();
+        assert!(r.validate().unwrap_err().contains("still the example"));
+        let w: WsjtxRelayConfig = toml::from_str("callsign = \"n0call\"\n").unwrap();
+        assert!(w.validate().unwrap_err().contains("still the example"));
     }
 }
