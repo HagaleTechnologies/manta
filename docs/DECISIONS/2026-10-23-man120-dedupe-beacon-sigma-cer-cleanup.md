@@ -1,5 +1,4 @@
-# MAN-120: dedupe edge hysteresis, a beacon fading regression, the σ
-invariance pin, and shared frequency-joined CER
+# MAN-120: dedupe edge hysteresis, a beacon fading regression, the σ invariance pin, and shared frequency-joined CER
 
 Date: 2026-10-23. Ticket: MAN-120 — four small decode/validation findings
 from the 2026-09-05 broad review (lens 3, rows #30/#28/#31/#22), bundled

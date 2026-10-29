@@ -10,7 +10,8 @@ Linux/ARM/headless platforms it has no native build for.
 Needs Rust 1.98.0 (`rust-toolchain.toml`), `git`, and on Linux `libasound2-dev`
 and `pkg-config`. Before pushing, run what `ci-full.yml`'s `test`/`test-hpsdr`
 jobs run (on Windows CI runs only `test_package_release` of the script suites;
-`ci_gates` and `verify_dependabot_diff_safe` run on Linux only):
+`ci_gates`, `decisions_index` and `verify_dependabot_diff_safe` run on Linux
+only):
 
 ```sh
 bash scripts/check-rust-toolchain-pin.sh && cargo fmt --all --check
@@ -18,7 +19,8 @@ cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --w
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --locked
 bash scripts/tests/release-version.test.sh && bash scripts/tests/release-ancestry.test.sh
 python3 -m unittest -v scripts.tests.test_{ci_trust_boundary,release_checksums,soapy_release,\
-packaging,package_release,score_against_rbn_replay,ci_gates,verify_dependabot_diff_safe}
+packaging,package_release,score_against_rbn_replay,ci_gates,verify_dependabot_diff_safe,\
+decisions_index}
 cargo clippy -p manta-input -p manta-cli --all-targets --features hpsdr --locked -- -D warnings
 cargo test -p manta-input -p manta-cli --features hpsdr --locked
 ```
@@ -30,8 +32,9 @@ open (ROADMAP.md): both CPU-budget legs, the 24 h live-SDR soak and the
 VR1–VR8 gate. The V5/V8w fading gap is classical-DSP work before M4 (D8,
 docs/DECISIONS/2026-09-06-broad-review-decisions.md). `decode.engine` stays
 `legacy` (`hsmm` is not promoted); `manta-dsp::single`/`freqest` are
-deprecated in place and stay. A ticket's outcome goes in its decision record
-and docs/DECISIONS/README.md row, not here. The log this section held until
+deprecated in place and stay. A ticket's outcome goes in its decision record,
+not here; its docs/DECISIONS/README.md row is generated after it lands
+(MAN-440). The log this section held until
 2026-10-16 is docs/DECISIONS/2026-10-16-man238-standing-brief.md.
 
 MAN-272 (replaces MAN-33): each spot carries its track's latest RST (`5NN`
