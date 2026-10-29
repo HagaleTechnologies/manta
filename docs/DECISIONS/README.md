@@ -11,6 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-28 | MAN-374 | [MAN-374: the startup calibration fill runs through process_hops in read-sized chunks, so a short unkeyed timeout keeps its callsign](2026-10-28-man374-chunked-calibration-fill.md) |
 | 2026-10-27 | MAN-353 | [MAN-353: a reading live client is dropped only past the lag allowance; the stall test runs a slow reader on every leg](2026-10-27-man353-slow-reading-live-client.md) |
 | 2026-10-27 | MAN-343 | [MAN-343: manta grade reads each input file once, however it is named](2026-10-27-man343-grade-reads-each-file-once.md) |
 | 2026-10-27 | MAN-304 | [MAN-304: manta as an UberSDR add-on; the receiver's add-on contract, and packaging waits on the UberSDR input](2026-10-27-man304-ubersdr-addon-gate.md) |
