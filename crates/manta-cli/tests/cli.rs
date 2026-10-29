@@ -882,7 +882,7 @@ fn doctor_accepts_and_applies_dial_freq_hz_for_an_audio_source() {
         panic!("doctor --json not JSON ({e}): stdout={stdout} stderr={stderr}")
     });
     assert_eq!(
-        report["centerFreqHz"].as_f64(),
+        report["center_freq_hz"].as_f64(),
         Some(14_030_000.0),
         "report: {report}"
     );
@@ -2675,7 +2675,7 @@ fn doctor_reports_center_freq_hz_from_the_config_file() {
         panic!("doctor --json not JSON ({e}): stdout={stdout} stderr={stderr}")
     });
     assert_eq!(
-        report["centerFreqHz"].as_f64(),
+        report["center_freq_hz"].as_f64(),
         Some(7_030_000.0),
         "report: {report}"
     );
@@ -2759,7 +2759,7 @@ fn soak_notes_an_ignored_server_table_and_doctor_checks_its_ports() {
             .iter()
             .find(|c| c["name"] == name)
             .unwrap_or_else(|| panic!("no {name} row in {report}"));
-        assert_eq!(row["status"], "SKIP", "{row}");
+        assert_eq!(row["status"], "skip", "{row}");
     }
 }
 
