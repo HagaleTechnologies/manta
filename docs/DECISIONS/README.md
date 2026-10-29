@@ -12,6 +12,7 @@ Add a row here in the same change that adds a record:
 | Date | Ticket | Title |
 |---|---|---|
 | 2026-10-27 | MAN-320 | [MAN-320: manta relays a local skimmer's own spots and WSJT-X's FT8/FT4 CQs through the uplink](2026-10-27-man320-relay-local-skimmers-and-wsjtx.md) |
+| 2026-10-27 | MAN-343 | [MAN-343: manta grade reads each input file once, however it is named](2026-10-27-man343-grade-reads-each-file-once.md) |
 | 2026-10-27 | MAN-304 | [MAN-304: manta as an UberSDR add-on; the receiver's add-on contract, and packaging waits on the UberSDR input](2026-10-27-man304-ubersdr-addon-gate.md) |
 | 2026-10-25 | MAN-423 | [MAN-423: hops buffered before a spliced loss keep their timestamps; a parked protocol-2 backlog keeps its anchor](2026-10-25-man423-pre-loss-hops-and-parked-backlogs.md) |
 | 2026-10-26 | MAN-249 | [MAN-249: public docs name roles, not machines, people or receiver hosts](2026-10-26-man249-public-disclosure.md) |
