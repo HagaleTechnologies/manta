@@ -1506,20 +1506,17 @@ mod tests {
     }
 
     #[test]
-    fn sustained_overload_raises_adc0_attenuation_on_the_wire() {
+    fn overload_raises_adc0_attenuation_on_the_wire() {
         let fake = FakeP2Radio::start();
         let (handle, seen) = recording_handle();
-        let mut src = open_attenuating(
-            &fake,
-            &handle,
-            Duration::from_millis(300),
-            Duration::from_secs(600),
-        );
+        let mut src = open_attenuating(&fake, &handle, Duration::ZERO, Duration::from_secs(600));
         let _iq = fake.stream_iq(Duration::from_millis(2));
-        let _status = fake.stream_status_bytes(Duration::from_millis(20), status(0x01));
+        // The pure controller tests pin the hold and trip boundaries. Here
+        // one report trips immediately, so scheduler delays cannot break a
+        // shortened overload run or add an unintended second step.
+        fake.send_status(&status(0x01));
         let h = handle.clone();
         read_until(&mut src, move || h.db() == 6, Duration::from_millis(200));
-        drop(_status);
         drop(_iq);
         thread::sleep(Duration::from_millis(20));
         let sent = adc0_attenuation_sent(&fake);
@@ -1545,17 +1542,15 @@ mod tests {
     fn reopen_restores_the_learned_level_and_quiet_lowers_it() {
         let fake = FakeP2Radio::start();
         let (handle, seen) = recording_handle();
-        let mut src = open_attenuating(
-            &fake,
-            &handle,
-            Duration::from_millis(200),
-            Duration::from_secs(600),
-        );
+        let mut src = open_attenuating(&fake, &handle, Duration::ZERO, Duration::from_secs(600));
         {
             let _iq = fake.stream_iq(Duration::from_millis(2));
-            let _status = fake.stream_status_bytes(Duration::from_millis(20), status(0x01));
-            let h = handle.clone();
-            read_until(&mut src, move || h.db() == 12, Duration::ZERO);
+            // Drive each step explicitly, as in the on-wire raise test.
+            for db in [6, 12] {
+                fake.send_status(&status(0x01));
+                let h = handle.clone();
+                read_until(&mut src, move || h.db() == db, Duration::ZERO);
+            }
         }
         drop(src);
         thread::sleep(Duration::from_millis(50));
