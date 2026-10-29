@@ -4,7 +4,7 @@
 //! the freed number to a sibling test before the caller probes it. Use
 //! the private band 20256-20511 instead, below the default ephemeral
 //! ranges on Linux (32768) and macOS/Windows (49152), and disjoint from
-//! the 20000-20255 integration-test band in `tests/doctor_checks.rs`.
+//! the 20512-22559 integration-test band in `tests/doctor_checks.rs`.
 //! Holding a listener cannot express an unbound port: connections would
 //! succeed, and doctor's bind probe would report it as in use.
 //!
@@ -18,9 +18,9 @@
 //! UDP socket bound to the same number on 127.0.0.1. TCP and UDP ports
 //! are separate, so the TCP port stays unbound (the UDP one does not),
 //! and another process using this allocator fails to bind the claim and
-//! skips the port. The claim
-//! excludes only processes that use this allocator; the integration-test
-//! band in `tests/doctor_checks.rs` has none.
+//! skips the port. The claim excludes only processes that use this
+//! allocator or the same UDP-first claim; the integration-test band in
+//! `tests/doctor_checks.rs` claims its ports the same way.
 
 use std::net::{TcpListener, UdpSocket};
 use std::sync::Mutex;
