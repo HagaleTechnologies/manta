@@ -52,8 +52,8 @@ const MAX_PENDING_BEACONS: usize = 8;
 /// `manta-server` boundary (SPEC-decode-core.md §5), not here.
 ///
 /// Serialized only by the CLI (`decode --json`'s `spots`, `run --json`'s
-/// `{"spot": …}`); field names follow the JSON spot stream (MAN-139,
-/// docs/CLI-JSON.md). manta-server builds its own `SpotMessage` instead.
+/// `{"spot": …}`); field names follow the JSON spot stream (MAN-139).
+/// manta-server builds its own `SpotMessage` instead.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Spot {

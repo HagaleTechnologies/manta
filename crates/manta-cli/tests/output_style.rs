@@ -211,10 +211,7 @@ fn command_reports_own_their_streams_and_json_preserves_measurements() {
     let src = manta_input::WavIqSource::open(&wav).unwrap();
     let report =
         manta_engine::doctor(Box::new(src), &cfg, std::time::Duration::from_secs(10)).unwrap();
-    // Parsed back from the report's own JSON text, the path the binary's
-    // output takes, so f32 values compare as the same short text.
-    let mut expected: serde_json::Value =
-        serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+    let mut expected = serde_json::to_value(&report).unwrap();
     expected["verdict"] = serde_json::to_value(report.verdict()).unwrap();
     let out = manta()
         .args(["doctor", "--source-iq", "--source"])
@@ -224,25 +221,21 @@ fn command_reports_own_their_streams_and_json_preserves_measurements() {
         .unwrap();
     assert!(out.status.success());
     assert!(out.stderr.is_empty());
-    let stdout = String::from_utf8(out.stdout).unwrap();
-    // MAN-139: a struct, not a key-sorted `Map`, so the report's keys come
-    // first in declaration order.
-    assert!(stdout.starts_with(r#"{"sampleRateHz":"#), "{stdout}");
-    // Every report key keeps its exact value; MAN-126's `checks` and
-    // `checksStatus` are the only additions.
-    let actual = serde_json::from_str::<serde_json::Value>(&stdout).unwrap();
+    // Every pre-existing key keeps its exact value; MAN-126's `checks` and
+    // `checks_status` are the only additions.
+    let actual = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap();
+    let expected = serde_json::from_str::<serde_json::Value>(&expected.to_string()).unwrap();
     let actual = actual.as_object().unwrap();
-    let expected = expected.as_object().unwrap();
-    for (key, value) in expected {
+    for (key, value) in expected.as_object().unwrap() {
         assert_eq!(actual.get(key), Some(value), "{key}");
     }
     let mut extra: Vec<&str> = actual
         .keys()
         .map(String::as_str)
-        .filter(|k| !expected.contains_key(*k))
+        .filter(|k| !expected.as_object().unwrap().contains_key(*k))
         .collect();
     extra.sort_unstable();
-    assert_eq!(extra, ["checks", "checksStatus"]);
+    assert_eq!(extra, ["checks", "checks_status"]);
     let out = manta()
         .args(["doctor", "--source-iq", "--source"])
         .arg(&wav)

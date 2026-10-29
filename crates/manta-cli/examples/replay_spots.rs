@@ -39,7 +39,7 @@
 //! flags, this one must NEVER be passed through, even if the original run
 //! used it (Codex review, PR #133 round 5): `decode_samples`
 //! (`manta-engine/src/lib.rs`) mutates every serialized `TrackMeta`/
-//! `TrackPromoted` `frequency` by the calibration factor AFTER its own
+//! `TrackPromoted` `freq_hz` by the calibration factor AFTER its own
 //! `Validator` pass, specifically so the JSON report's events already
 //! carry corrected frequencies -- applying the same correction again here
 //! would double it, moving notch/dedupe buckets and producing a spot list
@@ -51,16 +51,14 @@
 //! silently drift out of sync with the enum's own additive fields (e.g.
 //! `CharDecoded::alternatives`, `WordBoundary::confidence`,
 //! `TrackMeta::sample_ts`, `TrackClosed::closure`) every time it gained
-//! one, exactly the failure mode this rewrite closes. A report saved
-//! before MAN-139 (snake_case keys, `{"Char":"A"}` glyphs) no longer
-//! loads: regenerate it with `manta decode --json`.
+//! one, exactly the failure mode this rewrite closes.
 
 use manta_decode::events::DecoderEvent;
 use manta_spot::{Blocklist, NotchList, Validator};
 use std::collections::BTreeSet;
 use std::time::Instant;
 
-/// The `sampleTs` values in a saved report are raw-IQ sample indices at
+/// The `sample_ts` values in a saved report are raw-IQ sample indices at
 /// the WAV's own sample rate -- see the module doc's `[sample_rate_hz]`
 /// note for why this can't just be read out of the report itself.
 const DEFAULT_FS: f64 = 96_000.0;
@@ -149,17 +147,7 @@ fn main() {
         .as_array()
         .expect("report must have an \"events\" array")
         .iter()
-        .enumerate()
-        .map(|(i, v)| {
-            serde_json::from_value(v.clone()).unwrap_or_else(|e| {
-                eprintln!(
-                    "replay_spots: {} events[{i}] is not this build's decode --json event \
-                     shape ({e}); re-run `manta decode --json` with this build to regenerate it",
-                    args.report_path
-                );
-                std::process::exit(2);
-            })
-        })
+        .map(|v| serde_json::from_value(v.clone()).expect("valid DecoderEvent JSON"))
         .collect();
 
     let known_calls: BTreeSet<String> = std::fs::read_to_string(&args.calls_path)

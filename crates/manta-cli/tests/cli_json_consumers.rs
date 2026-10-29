@@ -191,11 +191,11 @@ fn summarize_listen_jsonl_reads_real_run_json() {
         .count();
     assert!(chars > 0, "the capture decoded no characters");
     assert_eq!(
-        field(&stdout, "charsDecoded:"),
+        field(&stdout, "chars_decoded:"),
         chars.to_string(),
         "{stdout}"
     );
-    let distinct: usize = field(&stdout, "distinctChars:").parse().unwrap();
+    let distinct: usize = field(&stdout, "distinct_chars:").parse().unwrap();
     assert!(distinct >= 1, "{stdout}");
 
     let number = r"-?\d+(\.\d+)?";
