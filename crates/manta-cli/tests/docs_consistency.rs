@@ -1961,6 +1961,181 @@ fn man319_decision_record_rescopes_the_wire_scenarios_on_man90() {
     );
 }
 
+/// MAN-302: the clean-room note pins the allowed inputs and gate, and the STOP
+/// verdict keeps UberSDR input code out of the tree until a GO record exists.
+#[test]
+fn man302_clean_room_note_records_inputs_gate_and_spec_pin() {
+    let records: Vec<String> = md_files_in("docs/DECISIONS")
+        .into_iter()
+        .filter(|name| name.contains("-man302-"))
+        .collect();
+    let notes: Vec<&String> = records
+        .iter()
+        .filter(|name| name.ends_with("-man302-ubersdr-iq-clean-room.md"))
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "want one MAN-302 clean-room note, found {notes:?}"
+    );
+
+    let rel = format!("docs/DECISIONS/{}", notes[0]);
+    let raw = doc(&rel);
+    let text = squash_whitespace(&raw);
+    for needle in [
+        "No AGPL/GPL source was read.",
+        "a26ebc87ac6e83d743d7f223c3ba953c7aba5615",
+        "1f2b38ed571c1144f5dac471cca1e5dbd1fe549014bd72b088d5964423ca2aab",
+        "CC BY-SA 4.0",
+    ] {
+        assert!(text.contains(needle), "{rel} does not contain {needle:?}");
+    }
+    for id in ["G1", "G2", "G3", "G4", "G5"] {
+        assert!(
+            raw.lines()
+                .any(|line| line.starts_with(&format!("| {id} |"))),
+            "{rel} has no {id} gate row"
+        );
+    }
+
+    let (go, stop) = verdict_lines(&raw);
+    assert!(go ^ stop, "{rel} must carry exactly one verdict line");
+    let any_go = records
+        .iter()
+        .any(|name| verdict_lines(&doc(&format!("docs/DECISIONS/{name}"))).0);
+    assert!(
+        any_go || !repo_root().join("crates/manta-input/src/ubersdr").exists(),
+        "UberSDR input code exists but no MAN-302 record says **Verdict: GO** (stop rule)"
+    );
+
+    // A future GO record must tie every observed transport fact to a trace.
+    for name in &records {
+        let body = doc(&format!("docs/DECISIONS/{name}"));
+        for row in id_rows(&body, 'T') {
+            let status = row
+                .trim_end()
+                .trim_end_matches('|')
+                .rsplit('|')
+                .next()
+                .unwrap()
+                .trim();
+            if status == "open" {
+                continue;
+            }
+            let path = status.strip_prefix("observed: ").unwrap_or_else(|| {
+                panic!("{name}: T-row status must be `open` or `observed: <path>`: {row}")
+            });
+            assert!(
+                repo_root().join(path).exists(),
+                "{name}: {row} cites a missing trace"
+            );
+        }
+    }
+}
+
+/// MAN-304: the add-on note pins the receiver documents it read and its gate,
+/// and the STOP verdict keeps add-on packaging out of the tree until a GO
+/// record exists, which itself needs MAN-302's GO.
+#[test]
+fn man304_addon_note_records_sources_gate_and_stop_rule() {
+    let records: Vec<String> = md_files_in("docs/DECISIONS")
+        .into_iter()
+        .filter(|name| name.contains("-man304-"))
+        .collect();
+    let notes: Vec<&String> = records
+        .iter()
+        .filter(|name| name.ends_with("-man304-ubersdr-addon-gate.md"))
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "want one MAN-304 add-on gate note, found {notes:?}"
+    );
+
+    let rel = format!("docs/DECISIONS/{}", notes[0]);
+    let raw = doc(&rel);
+    let text = squash_whitespace(&raw);
+    for needle in [
+        "No UberSDR source code was read.",
+        "5a261df82b5e491d9717239fb3e50dc49a4e93a6",
+        // addon_mqtt.md and static/extensions/cw-spots/README.md at that commit.
+        "686aadbfab614278efa6d51a600dac77fbc6ad2a1d74158858a3929c9a7467c6",
+        "a03991527a90fcab06d5643248056d4fa07a194b33fe7e7c9df5da36cc473392",
+        "2026-10-26-man302-ubersdr-iq-clean-room.md",
+    ] {
+        assert!(text.contains(needle), "{rel} does not contain {needle:?}");
+    }
+    let has_row = |id: &str| {
+        raw.lines()
+            .any(|line| line.starts_with(&format!("| {id} |")))
+    };
+    for id in ["A1", "A2", "A3", "A4", "A5", "A6"] {
+        assert!(has_row(id), "{rel} has no {id} gate row");
+    }
+    for id in ["C1", "C2", "C3", "C4", "C5", "C6", "C7"] {
+        assert!(has_row(id), "{rel} has no {id} claim row");
+    }
+
+    let (go, stop) = verdict_lines(&raw);
+    assert!(go ^ stop, "{rel} must carry exactly one verdict line");
+    let man302_go = md_files_in("docs/DECISIONS")
+        .iter()
+        .filter(|name| name.contains("-man302-"))
+        .any(|name| verdict_lines(&doc(&format!("docs/DECISIONS/{name}"))).0);
+    // A later GO record may sit beside this note, as MAN-302's test allows.
+    let mut any_go = false;
+    for name in &records {
+        if verdict_lines(&doc(&format!("docs/DECISIONS/{name}"))).0 {
+            any_go = true;
+            assert!(
+                man302_go,
+                "docs/DECISIONS/{name} says **Verdict: GO** but no MAN-302 record does: the add-on needs the UberSDR input"
+            );
+        }
+    }
+    assert!(
+        any_go || !repo_root().join("packaging/ubersdr").exists(),
+        "packaging/ubersdr exists but {rel} says **Verdict: STOP** and no MAN-304 record says **Verdict: GO** (stop rule)"
+    );
+
+    // A claim leaves `open` only by citing a pinned document or a trace in the repo.
+    for name in &records {
+        let rec = format!("docs/DECISIONS/{name}");
+        let body = doc(&rec);
+        for row in id_rows(&body, 'C') {
+            let status = row
+                .trim_end()
+                .trim_end_matches('|')
+                .rsplit('|')
+                .next()
+                .unwrap()
+                .trim();
+            if status == "open" {
+                continue;
+            }
+            if let Some(path) = status.strip_prefix("observed: ") {
+                assert!(
+                    repo_root().join(path).exists(),
+                    "{rec}: {row} cites a missing trace"
+                );
+                continue;
+            }
+            let url = status.strip_prefix("documented: ").unwrap_or_else(|| {
+                panic!("{rec}: C-row status must be `open`, `documented: <url>` or `observed: <path>`: {row}")
+            });
+            // D1: only the receiver's published Markdown, at a pinned commit.
+            assert!(
+                url.starts_with("https://raw.githubusercontent.com/madpsy/")
+                    && url.ends_with(".md")
+                    && url
+                        .split('/')
+                        .any(|seg| seg.len() == 40 && seg.bytes().all(|c| c.is_ascii_hexdigit())),
+                "{rec}: {row} must cite a raw Markdown document at a pinned 40-hex commit"
+            );
+        }
+    }
+}
+
 /// MAN-319: the four new claims sit in MAN-90's table, all still open.
 #[test]
 fn man90_claims_table_carries_the_man319_claims() {
@@ -2919,6 +3094,26 @@ fn md_files_in(dir: &str) -> Vec<String> {
     names
 }
 
+/// Whether a decision record has a `**Verdict: GO**` line and a
+/// `**Verdict: STOP**` line, as `(go, stop)`.
+fn verdict_lines(body: &str) -> (bool, bool) {
+    (
+        body.lines().any(|line| line.trim() == "**Verdict: GO**"),
+        body.lines().any(|line| line.trim() == "**Verdict: STOP**"),
+    )
+}
+
+/// The table rows whose first cell is `prefix` followed by one or more digits.
+fn id_rows(body: &str, prefix: char) -> impl Iterator<Item = &str> {
+    body.lines().filter(move |line| {
+        line.split('|')
+            .nth(1)
+            .map(str::trim)
+            .and_then(|id| id.strip_prefix(prefix))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+    })
+}
+
 #[test]
 fn docs_index_links_every_runbook() {
     let targets = link_targets(&doc(DOCS_INDEX));
@@ -3401,4 +3596,85 @@ fn shared_hpsdr_docs_describe_capacity_and_queue_loss_and_example_checks_offline
     assert!(doc("docs/METRICS.md").contains("| `manta_input_queue_dropped_samples_total` |"));
     assert!(guide.contains("has 4 receivers; 6 bands are configured"));
     assert!(guide.contains("not a measured"));
+}
+
+// ---- MAN-249: internal machine names stay out of the public docs ----
+
+/// FNV-1a 64 of each internal fleet host name, lowercase. The names are kept
+/// out of the tree: a plain-text deny-list would publish what it guards.
+const INTERNAL_HOST_FNV1A: [u64; 5] = [
+    0xa0a3_3c22_a179_5c43,
+    0x76cf_9c53_5733_dc78,
+    0x61e7_8d4c_2055_7f92,
+    0x66fd_ea01_023f_f308,
+    0x602c_5552_1693_98cc,
+];
+
+fn fnv1a_64(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// The 1-based line of each ASCII-alphanumeric word whose lowercase FNV-1a
+/// is in `deny`.
+fn denied_word_lines(text: &str, deny: &[u64]) -> Vec<usize> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            line.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|w| !w.is_empty() && deny.contains(&fnv1a_64(&w.to_ascii_lowercase())))
+        })
+        .map(|(i, _)| i + 1)
+        .collect()
+}
+
+/// Every file under a directory, recursively.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display())) {
+        let p = e.expect("dir entry").path();
+        if p.is_dir() {
+            out.extend(files_under(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn deny_list_matches_whole_words_in_any_case() {
+    let deny = [fnv1a_64("examplehost")];
+    assert_eq!(
+        denied_word_lines("ok\nran on ExampleHost.local\n", &deny),
+        [2]
+    );
+    assert!(denied_word_lines("examplehosts, example host", &deny).is_empty());
+}
+
+#[test]
+fn public_docs_name_no_internal_machine() {
+    let root = repo_root();
+    let mut found = Vec::new();
+    for dir in ["docs", "wiki"] {
+        for path in files_under(&root.join(dir)) {
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in denied_word_lines(&text, &INTERNAL_HOST_FNV1A) {
+                found.push(format!(
+                    "{}:{line}",
+                    path.strip_prefix(&root).unwrap().display()
+                ));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "an internal machine name is in the public docs (MAN-249); name its role \
+         instead (\"the CI host\", \"the Pi 4 under test\"):\n{}",
+        found.join("\n")
+    );
 }

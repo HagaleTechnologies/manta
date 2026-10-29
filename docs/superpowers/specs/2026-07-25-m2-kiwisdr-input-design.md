@@ -21,7 +21,7 @@ workspace yet. The protocol itself is community-reverse-engineered, with
 
 Rather than implement blind against documentation, this was verified with a
 real, live WebSocket connection to a real public receiver
-(`greatlakesreceiver.hopto.me:8073`, confirmed reachable and consented to as
+(`<public-kiwisdr-host>:8073`, confirmed reachable and consented to as
 a brief, light test connection — KiwiSDR's whole public-directory model
 exists for exactly this kind of use) using a scratch `tungstenite` client:
 
@@ -244,7 +244,7 @@ tests should include real, live integration coverage, not just error-path
 coverage:
 
 - A `#[ignore]`d test that connects to a real public receiver (pick one
-  from the live-verified list, e.g. `greatlakesreceiver.hopto.me:8073`, or
+  from the live-verified list, e.g. `<public-kiwisdr-host>:8073`, or
   let Task 1 pick a fresh one if that node isn't up by then — public nodes
   come and go), completes the full handshake, and asserts real `SND` frames
   with the expected byte-count/sample-count arrive. `#[ignore]`d because

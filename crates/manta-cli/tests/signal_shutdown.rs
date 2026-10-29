@@ -471,6 +471,8 @@ fn oracle_exits_141_without_a_panic_when_stdout_is_closed() {
         "oracle".as_ref(),
         wav.as_os_str(),
         csv.as_os_str(),
+        "--spotter".as_ref(),
+        "N0ABC".as_ref(),
         "--capture-start".as_ref(),
         "2025-11-29T00:00:00Z".as_ref(),
     ];
