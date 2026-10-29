@@ -259,6 +259,11 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-343: `manta grade` reads each `--spots`/`--rbn` file once, however it
+  is named (directly and through its directory, with `./` or `..`, or
+  through a symlink). Before, a file named twice was graded twice, and a
+  partly duplicated RBN archive could move the modal frequency or median
+  WPM and flip a grade. A hard link is still a different file.
 - MAN-423: with a protocol-2 openHPSDR radio, decodes from just before a
   lost datagram run are no longer stamped late by the lost samples (up to
   ~11,900 samples, 62 ms, for 50 datagrams at 192 kS/s); only events at or
