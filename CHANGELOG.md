@@ -157,8 +157,8 @@ the git history and `docs/DECISIONS/`.
 
 - MAN-235: `manta doctor --strict` exits 3 when no check failed but the
   verdict is not `DECODING`; without it every verdict still exits 0.
-- MAN-234: a `badSamples` field in `decode --json` and `doctor --json` and
-  a `bad_samples` field in `calibrate --json` (omitted when 0); a
+- MAN-234: a `badSamples` field in `decode --json` and a `bad_samples`
+  field in `doctor --json` and `calibrate --json` (omitted when 0); a
   `warning: … bad sample(s) …` stderr line from `decode`, `calibrate` and
   `run`/`listen` (at the first bad sample, plus a total at the end if more
   followed); an `input: N bad sample(s) … replaced with silence` line in
@@ -193,8 +193,8 @@ the git history and `docs/DECISIONS/`.
 - `[detector] non_cw_filter` (default `true`) and `unkeyed_close_ms`
   (default 10000, at least 1000), also as `MANTA_DETECTOR_NON_CW_FILTER`/
   `MANTA_DETECTOR_UNKEYED_CLOSE_MS`; a `NOT_CW` verdict and a
-  `detectorConfirmations` count in `manta doctor --json` for a band with
-  signals but no keyed CW (MAN-313).
+  `detector_confirmations` count in `manta doctor` for a band with signals
+  but no keyed CW (MAN-313).
 - A Grafana dashboard (spot rate, active tracks, source health, per-target
   uplink status) and Prometheus alert rules (node down, node unhealthy, no
   spots for 30 minutes, uplink target down or flapping) for a node's
@@ -210,25 +210,21 @@ the git history and `docs/DECISIONS/`.
 ### Changed
 
 - MAN-139: **breaking for scripts that parse `--json`.**
-  `manta decode --json`, `manta run --json`/`listen --json` and
-  `manta doctor --json` name fields as the JSON spot stream does:
-  camelCase, with the stream's names for shared concepts. `freq_hz` is
-  `frequency`. The SNR is `snr` on events and spots (it was `snr_2500_db`
-  and `snr_db`) and `snrMin`/`snrMedian`/`snrMax` in doctor, still
-  2500 Hz-referenced. A spot's `callsign` is
-  `dxCall` and its `confidence` is `decodeConfidence`. `track_id`,
-  `sample_ts`, `spot_type` and the other snake_case keys are camelCase. A
-  glyph is its character or prosign token (`"A"`, `"<AR>"`) instead of
-  `{"Char":"A"}`; `closure` is `signalEnded` or `bookkeeping` beside
-  `survivorTrackId`; `spotType` is `cq`, `de`, `beacon` or `unknown`.
-  doctor's `duration` is `durationS`, a number of seconds; its verdict and
-  check statuses use the text report's spelling (`WEAK_NO_DECODE`, `PASS`);
-  `checks_status` is `checksStatus`. Event names and the `{"spot": …}`
-  wrapper are unchanged. Every field, and the old names, are in
-  `docs/CLI-JSON.md`; the scripts under `scripts/` read the new names, and
-  `examples/replay_spots.rs` needs a report regenerated with this build.
-  The JSON spot stream (`source` is still `"skimmer"`), the live-state
-  stream, telnet and the RBN uplink are unchanged.
+  `manta decode --json` and `manta run --json`/`listen --json` name fields
+  as the JSON spot stream does: camelCase, with the stream's names for
+  shared concepts. `freq_hz` is `frequency`. The SNR is `snr` on events
+  and spots (it was `snr_2500_db` and `snr_db`), still 2500 Hz-referenced.
+  A spot's `callsign` is `dxCall` and its `confidence` is
+  `decodeConfidence`. `track_id`, `sample_ts`, `spot_type`, `bad_samples`
+  and the other snake_case keys are camelCase. A glyph is its character
+  or prosign token (`"A"`, `"<AR>"`) instead of `{"Char":"A"}`; `closure`
+  is `signalEnded` or `bookkeeping` beside `survivorTrackId`; `spotType`
+  is `cq`, `de`, `beacon` or `unknown`. Event names and the `{"spot": …}`
+  wrapper are unchanged. The scripts under `scripts/` read the new names,
+  and `examples/replay_spots.rs` needs a report regenerated with this
+  build. `doctor --json` is not changed here. The JSON spot stream
+  (`source` is still `"skimmer"`), the live-state stream, telnet and the
+  RBN uplink are unchanged.
 - MAN-319: a live `[[rbn_uplink]]` (`dry_run = false`) also needs
   `[server].operator_grid` set to a 6-character Maidenhead locator (e.g.
   `"FN03ab"`). `config check`, `run`, `doctor` and a SIGHUP reload refuse a
