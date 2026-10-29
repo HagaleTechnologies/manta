@@ -17,14 +17,13 @@ pass/fail for either leg — both need a clean re-measurement.
 
 ## No Pi4-class hardware was reachable this session
 
-Checked `~/.ssh/config` and `~/.ssh/known_hosts` across the fleet
-(aldebaran, rigel, sophon, vega, pandora, plus the network-appliance hosts).
-Result: no Raspberry Pi or other Linux/aarch64 SBC. The only aarch64 hosts
-in reach are Apple Silicon Macs (sophon, vega — both M-series, same class
-as aldebaran) — those are the *other* leg of this gate (see below for why
-"already-passing" turned out not to be a safe assumption), not a
-substitute for a real Pi4 either way. Per MAN-18's own instructions, this
-is reported explicitly rather than silently substituted.
+No Raspberry Pi 4 or other Linux/aarch64 board was reachable from this
+session. The only aarch64 machines in reach were Apple Silicon Macs
+(M-series, the same class as the session's build host); those are the
+*other* leg of this gate (see below for why "already-passing" turned out
+not to be a safe assumption), not a substitute for a real Pi4 either way.
+Per MAN-18's own instructions, this is reported explicitly rather than
+silently substituted.
 
 No cloud ARM instance was provisioned either — that would cost money
 (guardrail: ask before spending) and, more importantly, server-class ARM
@@ -34,8 +33,8 @@ question.
 
 ## What was measured instead: a reconfirmed Mac baseline
 
-Re-ran the existing gate test on this session's machine (aldebaran, Apple
-M4 Pro, `cargo test --release`, per
+Re-ran the existing gate test on this session's build host (Apple M4
+Pro, `cargo test --release`, per
 `crates/manta-engine/tests/cpu_budget.rs`).
 
 First pass used wall-clock timing only, same as the test originally did:
@@ -86,7 +85,7 @@ roughly **1.2x-1.25x parallelism** inside `decode_samples` itself, not the
    different parallelism factor is unknown; the runbook now has the
    instrumented test so that's answered directly on real hardware instead
    of assumed.
-3. **That ~6-9% headroom is not robust to realistic contention.** aldebaran
+3. **That ~6-9% headroom is not robust to realistic contention.** The build host
    (this session's machine) is a shared, multi-tenant dev host, not a
    dedicated benchmark box — `uptime` showed 12 logged-in users and a load
    average of 10-14 on its 12 cores while re-running this test later in

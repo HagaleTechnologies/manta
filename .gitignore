@@ -48,11 +48,13 @@ thoughts/
 # without LFS, or pending confirmed redistribution rights from the source.
 # The recordings are pinned by SHA-256 in
 # crates/manta-testkit/audio-corpus/manifest.json and fetched with
-# scripts/corpus.py (MAN-119); ground-truth/ is tracked, not ignored.
-# See crates/manta-testkit/audio-corpus/README.md.
+# scripts/corpus.py (MAN-119). In ground-truth/, hand transcripts are
+# tracked; RBN archive extracts are third-party data, rebuilt locally
+# (MAN-249). See crates/manta-testkit/audio-corpus/README.md.
 crates/manta-testkit/audio-corpus/wpx_cw_iq_96khz.wav
 crates/manta-testkit/audio-corpus/vp8geo_cw.mp3
 crates/manta-testkit/audio-corpus/vp8geo_cw_48khz.wav
 crates/manta-testkit/audio-corpus/B2_20251129_000000_7080kHz.wav
 crates/manta-testkit/audio-corpus/B2_20251129_000000_7080kHz.json
 crates/manta-testkit/audio-corpus/B2_20251129_000000_7080kHz.source.wav
+crates/manta-testkit/audio-corpus/ground-truth/*.rbn.csv

@@ -678,7 +678,7 @@ Both must be clean/passing (they should already be, from Tasks 1 and 3's own ver
 
 - [ ] **Step 3: Validate YAML syntax**
 
-Run: `cd /Users/thagale/Code/manta/.claude/worktrees/m2-soapysdr-input && python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))" ` (or any available YAML linter) to catch indentation errors before pushing — GitHub Actions failures from bad YAML are otherwise only visible after a push.
+Run: `cd $HOME/Code/manta/.claude/worktrees/m2-soapysdr-input && python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))" ` (or any available YAML linter) to catch indentation errors before pushing — GitHub Actions failures from bad YAML are otherwise only visible after a push.
 
 - [ ] **Step 4: Commit**
 
