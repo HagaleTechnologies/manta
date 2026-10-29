@@ -1663,6 +1663,23 @@ fn apply_env_overlay(doc: &mut toml::Table, vars: &[(OsString, OsString)]) -> Re
             );
         }
     }
+    // Remove inherited tuning selectors before inserting any environment values,
+    // so two explicit environment selectors still reach the conflict check.
+    if let Some(toml::Value::Table(input)) = doc.get_mut("input") {
+        if entries
+            .iter()
+            .any(|(_, table, key, _)| *table == "input" && key == "bands")
+        {
+            input.remove("freq_hz");
+        }
+        if entries
+            .iter()
+            .any(|(_, table, key, _)| *table == "input" && key == "freq_hz")
+            && input.remove("bands").is_some()
+        {
+            input.remove("tuning_range_hz");
+        }
+    }
     let mut overlay = EnvOverlay::default();
     for (name, table, key, raw) in entries {
         let string_typed = STRING_TYPED_ENV_KEYS.contains(&(table, key.as_str()));
@@ -3554,6 +3571,154 @@ mod tests {
         )
         .unwrap();
         assert_eq!(loaded.input.shared.freq_correction_ppm, Some(2.5));
+    }
+
+    #[test]
+    fn env_bands_replace_file_frequency_for_both_single_input_forms() {
+        for section in ["[input]", "[[input]]"] {
+            let file = format!(
+                "{section}\nname = \"receiver\"\ntype = \"kiwi\"\nhost = \"example\"\n\
+                 freq_hz = 7040000\nfreq_correction_ppm = 2.5\n"
+            );
+            let loaded = load_env(Some(&file), &[("MANTA_INPUT_BANDS", "7030")]).unwrap();
+            assert_eq!(
+                loaded.input.source.as_ref().unwrap().freq_hz(),
+                Some(7030000.0)
+            );
+            assert_eq!(loaded.inputs.len(), 1);
+            assert_eq!(loaded.inputs[0].name, "receiver");
+            assert_eq!(loaded.input.shared.freq_correction_ppm, Some(2.5));
+            let raw = loaded.raw["input"].as_table().unwrap();
+            assert_eq!(raw["host"].as_str(), Some("example"));
+            assert_eq!(raw["bands"], toml::Value::Integer(7030));
+            assert!(!raw.contains_key("freq_hz"));
+            assert_eq!(loaded.env_vars, ["MANTA_INPUT_BANDS"]);
+        }
+    }
+
+    #[test]
+    fn env_frequency_replaces_file_bands_and_their_range_for_both_single_input_forms() {
+        for section in ["[input]", "[[input]]"] {
+            for range in ["", "tuning_range_hz = [3000000, 30000000]\n"] {
+                let file = format!(
+                    "{section}\nname = \"receiver\"\ntype = \"kiwi\"\nhost = \"example\"\n\
+                     bands = \"7030\"\nfreq_correction_ppm = 2.5\n{range}"
+                );
+                let loaded = load_env(Some(&file), &[("MANTA_INPUT_FREQ_HZ", "7040000")]).unwrap();
+                assert_eq!(
+                    loaded.input.source.as_ref().unwrap().freq_hz(),
+                    Some(7040000.0)
+                );
+                assert_eq!(loaded.inputs.len(), 1);
+                assert_eq!(loaded.inputs[0].name, "receiver");
+                assert_eq!(loaded.input.shared.freq_correction_ppm, Some(2.5));
+                let raw = loaded.raw["input"].as_table().unwrap();
+                assert_eq!(raw["host"].as_str(), Some("example"));
+                assert_eq!(raw["freq_hz"], toml::Value::Integer(7040000));
+                assert!(!raw.contains_key("bands"));
+                assert!(!raw.contains_key("tuning_range_hz"));
+                assert_eq!(loaded.env_vars, ["MANTA_INPUT_FREQ_HZ"]);
+            }
+        }
+    }
+
+    #[test]
+    fn env_tuning_selectors_still_conflict_with_each_other() {
+        for file_selector in ["freq_hz = 7020000", "bands = \"7020\""] {
+            let file = format!("[input]\ntype = \"kiwi\"\nhost = \"example\"\n{file_selector}\n");
+            let mut env = [
+                ("MANTA_INPUT_BANDS", "7030"),
+                ("MANTA_INPUT_FREQ_HZ", "7040000"),
+            ];
+            for _ in 0..2 {
+                let err = load_env(Some(&file), &env).unwrap_err().to_string();
+                assert!(
+                    err.contains("input.bands and input.freq_hz both set"),
+                    "{err}"
+                );
+                assert!(
+                    err.contains("environment: MANTA_INPUT_BANDS, MANTA_INPUT_FREQ_HZ"),
+                    "{err}"
+                );
+                env.reverse();
+            }
+        }
+    }
+
+    #[test]
+    fn empty_env_tuning_selectors_leave_file_settings_intact() {
+        for file_selector in [
+            "freq_hz = 7040000\n",
+            "bands = \"7030\"\ntuning_range_hz = [3000000, 30000000]\n",
+        ] {
+            let file = format!("[input]\ntype = \"kiwi\"\nhost = \"example\"\n{file_selector}");
+            let loaded = load_env(
+                Some(&file),
+                &[("MANTA_INPUT_BANDS", ""), ("MANTA_INPUT_FREQ_HZ", "")],
+            )
+            .unwrap();
+            assert_eq!(loaded.raw, load_file(&file).unwrap().raw);
+            assert!(loaded.env_vars.is_empty());
+        }
+    }
+
+    #[test]
+    fn invalid_env_tuning_selectors_are_rejected_with_attribution() {
+        for (file_selector, name, value, diagnostic) in [
+            (
+                "freq_hz = 7040000",
+                "MANTA_INPUT_BANDS",
+                "not-a-band",
+                "input.bands",
+            ),
+            (
+                "bands = \"7030\"",
+                "MANTA_INPUT_FREQ_HZ",
+                "-1",
+                "input.freq_hz",
+            ),
+        ] {
+            let file = format!("[input]\ntype = \"kiwi\"\nhost = \"example\"\n{file_selector}\n");
+            let err = load_env(Some(&file), &[(name, value)])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(diagnostic), "{err}");
+            assert!(err.contains(&format!("environment: {name}")), "{err}");
+            assert!(!err.contains("both set"), "{err}");
+        }
+    }
+
+    #[test]
+    fn env_frequency_does_not_hide_an_explicit_or_orphan_tuning_range() {
+        let file = "[input]\ntype = \"kiwi\"\nhost = \"example\"\n\
+                    bands = \"7030\"\ntuning_range_hz = [3000000, 30000000]\n";
+        let err = load_env(
+            Some(file),
+            &[
+                ("MANTA_INPUT_FREQ_HZ", "7040000"),
+                ("MANTA_INPUT_TUNING_RANGE_HZ", "[3000000, 30000000]"),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("input.tuning_range_hz applies only with input.bands"),
+            "{err}"
+        );
+        assert!(
+            err.contains("environment: MANTA_INPUT_FREQ_HZ, MANTA_INPUT_TUNING_RANGE_HZ"),
+            "{err}"
+        );
+
+        let file = file.replace("bands = \"7030\"", "freq_hz = 7020000");
+        let err = load_env(Some(&file), &[("MANTA_INPUT_FREQ_HZ", "7040000")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("input.tuning_range_hz applies only with input.bands"),
+            "{err}"
+        );
+        assert!(err.contains("environment: MANTA_INPUT_FREQ_HZ"), "{err}");
     }
 
     #[test]

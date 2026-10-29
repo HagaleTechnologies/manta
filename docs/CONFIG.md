@@ -365,7 +365,25 @@ Raspberry Pi 4 core per 192 kS/s stream, 14 streams at 96 kS/s need about
 seven cores.
 
 **Environment.** `MANTA_INPUT_BANDS=all`, `MANTA_INPUT_BANDS=7030` or
-`MANTA_INPUT_BANDS='["40m","20m"]'`.
+`MANTA_INPUT_BANDS='["40m","20m"]'`. For a single `[input]` or one-entry
+`[[input]]`, a nonempty environment selector replaces the file's tuning
+mode:
+
+```sh
+# File sets freq_hz = 7040000; skim 7030 kHz instead.
+MANTA_INPUT_BANDS=7030 manta config check --config manta.toml
+# File sets bands = "7030"; tune to 7040000 Hz instead.
+MANTA_INPUT_FREQ_HZ=7040000 manta config check --config manta.toml
+```
+
+The first drops the file's `freq_hz`. The second drops the file's `bands`
+and its `tuning_range_hz`, if present. Other input settings stay in place.
+Setting both environment selectors to nonempty values is an error naming
+both variables. Empty values count as unset and leave file settings in
+place. An explicit `MANTA_INPUT_TUNING_RANGE_HZ` still needs bands; it is
+not discarded with the file's range. With two or more `[[input]]` entries,
+`MANTA_INPUT_*` overrides remain ambiguous and are refused. Tuning changes
+need a restart. See [the MAN-414 decision](DECISIONS/2026-10-29-man414-environment-tuning-mode.md).
 
 `config check` and `run` print the plan and every skipped or clipped band
 as notes before their output:

@@ -11,6 +11,7 @@ Add a row here in the same change that adds a record:
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-10-29 | MAN-414 | [MAN-414: environment overrides switch between frequency and bands](2026-10-29-man414-environment-tuning-mode.md) |
 | 2026-10-27 | MAN-343 | [MAN-343: manta grade reads each input file once, however it is named](2026-10-27-man343-grade-reads-each-file-once.md) |
 | 2026-10-27 | MAN-304 | [MAN-304: manta as an UberSDR add-on; the receiver's add-on contract, and packaging waits on the UberSDR input](2026-10-27-man304-ubersdr-addon-gate.md) |
 | 2026-10-25 | MAN-423 | [MAN-423: hops buffered before a spliced loss keep their timestamps; a parked protocol-2 backlog keeps its anchor](2026-10-25-man423-pre-loss-hops-and-parked-backlogs.md) |
